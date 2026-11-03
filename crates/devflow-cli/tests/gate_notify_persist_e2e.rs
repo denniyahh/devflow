@@ -367,6 +367,7 @@ fn resume_with(notify: NotifyEnv<'_>) -> Option<String> {
     init_start_repo(root, phase);
     let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
     state.gate_notify_cmd = Some("old".to_string());
+    state.verification_baseline_captured = true;
     devflow_core::workflow::save_state(&state).unwrap();
     let fake_bin = fake_bin_dir();
     let _reaper = MarkedReaper(root.to_string_lossy().into_owned());
@@ -471,10 +472,13 @@ fn agent_environment_after_define(
         .arg(root)
         .output()
         .expect("run gate approve");
+    // A fast waiter can consume the answer and close its gate before the writer's re-check,
+    // which reports a closed gate for an applied answer (backlog 999.177). The launch below
+    // decides whether it was applied.
+    let approve_stderr = String::from_utf8_lossy(&approve.stderr);
     assert!(
-        approve.status.success(),
-        "approve failed: {}",
-        String::from_utf8_lossy(&approve.stderr)
+        approve.status.success() || approve_stderr.contains("published after that gate closed"),
+        "approve failed: {approve_stderr}"
     );
     let marker = root.to_string_lossy().into_owned();
     let _reaper = MarkedReaper(marker.clone());

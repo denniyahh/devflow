@@ -165,9 +165,9 @@ const REAP_EXIT_WAIT: Duration = Duration::from_secs(15);
 /// still alive after that wait. The state cannot name every one: a stop that
 /// lands while an advance is launching the next stage leaves that next
 /// supervisor spawned but never recorded, with the stop flagged. It records
-/// its own stop under the per-phase lock a moment later, and taking that lock
+/// its own stop under the state write lock a moment later, and taking that lock
 /// recreates `<root>/.devflow/` when the root's `TempDir` has already been
-/// removed, leaving `/tmp/.tmpXXXXXX/.devflow/.lock-NN.coord` behind.
+/// removed, leaving `/tmp/.tmpXXXXXX/.devflow/.state-NN.lock` behind.
 pub struct LaunchedRunReaper {
     root: PathBuf,
     phase: PhaseId,

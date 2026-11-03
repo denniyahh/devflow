@@ -1,9 +1,9 @@
-//! End-to-end coverage for `start`'s per-phase writer lock.
+//! End-to-end coverage for `start`'s launch reservation.
 //!
-//! These tests deliberately hold the lock from the test process, then drive
-//! the compiled CLI as a separate process. That makes the refusal observable
-//! at the same boundary an operator uses, rather than coupling the test to
-//! `commands::start`'s implementation details.
+//! These tests deliberately hold a reservation's liveness lock from the test
+//! process, then drive the compiled CLI as a separate process. That makes the
+//! refusal observable at the same boundary an operator uses, rather than coupling
+//! the test to `commands::start`'s implementation details.
 //!
 //! Every `devflow` child runs through `common::hermetic_devflow`, so its
 //! registry entries land in a tempdir `HOME`, never the operator's real
@@ -15,8 +15,9 @@ use devflow_core::gates::{GateResponse, Gates};
 use devflow_core::mode::Mode;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
-use devflow_core::state::{AgentKind, State};
+use devflow_core::state::{AgentKind, PendingSupervisor, State};
 use devflow_core::supervisor::{self, Liveness, ShutdownOutcome};
+use devflow_core::test_support::gate_answer_files;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output};
@@ -81,15 +82,30 @@ fn child(
 }
 
 #[test]
-fn start_refuses_while_another_process_holds_the_phase_lock() {
+fn start_refuses_while_another_launcher_holds_the_phases_reservation() {
+    const LAUNCH_ID: &str = "aaaa0000aaaa0090";
     let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     let phase = PhaseId::new(90);
     init_repo(root, phase);
     let fake_bin = common::fake_bin_dir("exit 0");
-    let holder = devflow_core::lock::acquire(root, phase).expect("test holds phase lock");
-    let holder_pid = std::process::id();
+    let liveness_path = devflow_core::liveness::launch_liveness_path(root, LAUNCH_ID).unwrap();
+    fs::create_dir_all(liveness_path.parent().unwrap()).unwrap();
+    let holder = devflow_core::liveness::Hold::take(&liveness_path).expect("test holds the lock");
+    let mut reserved = State::new(
+        phase,
+        AgentKind::Claude,
+        Mode::Supervise,
+        root.to_path_buf(),
+    );
+    reserved.pending_supervisor = Some(PendingSupervisor::new(
+        LAUNCH_ID.to_string(),
+        root.join(".devflow/never-published.sock"),
+        liveness_path,
+    ));
+    devflow_core::workflow::save_state(&reserved).unwrap();
+    let state_before = fs::read(devflow_core::workflow::state_path(root, phase)).unwrap();
     let worktrees_before = devflow_core::test_support::git_command(root)
         .args(["worktree", "list", "--porcelain"])
         .output()
@@ -102,22 +118,28 @@ fn start_refuses_while_another_process_holds_the_phase_lock() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !output.status.success(),
-        "start must refuse a held lock\nstdout: {}\nstderr: {stderr}",
+        "start must refuse a held reservation\nstdout: {}\nstderr: {stderr}",
         String::from_utf8_lossy(&output.stdout)
     );
+    for expected in [
+        format!("devflow stop --phase {phase}"),
+        LAUNCH_ID.to_string(),
+    ] {
+        assert!(stderr.contains(&expected), "missing {expected:?}: {stderr}");
+    }
     assert!(
-        stderr.contains(&phase.to_string()),
-        "stderr must name phase: {stderr}"
+        !stderr.contains("devflow resume"),
+        "no resume hint while the reservation's lock is held: {stderr}"
     );
-    assert!(
-        stderr.contains(&holder_pid.to_string()),
-        "stderr must name holder pid {holder_pid}: {stderr}"
-    );
-    assert!(
-        !root
-            .join(format!(".devflow/state-{}.json", phase.padded()))
-            .exists(),
+    assert_eq!(
+        fs::read(devflow_core::workflow::state_path(root, phase)).unwrap(),
+        state_before,
         "a refused start must not write phase state"
+    );
+    assert_eq!(
+        liveness_files(root),
+        vec![format!("supervisor-{LAUNCH_ID}.live")],
+        "a refused start must leave no liveness file of its own"
     );
     let worktrees = devflow_core::test_support::git_command(root)
         .args(["worktree", "list", "--porcelain"])
@@ -141,7 +163,7 @@ fn start_refuses_while_another_process_holds_the_phase_lock() {
 }
 
 #[test]
-fn start_proceeds_when_no_process_holds_the_phase_lock() {
+fn start_proceeds_when_no_reservation_is_held() {
     let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
@@ -168,28 +190,31 @@ fn start_proceeds_when_no_process_holds_the_phase_lock() {
                 .contains("\"workflow_started\""),
         "an uncontended start must write state or its workflow_started event"
     );
+    assert_eq!(
+        pending_launch(root, phase),
+        None,
+        "a finished start leaves no reservation"
+    );
 }
 
 #[test]
-fn start_clears_leftover_gate_files_after_taking_the_lock() {
+fn start_clears_leftover_gate_files_after_reserving() {
     let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     let phase = PhaseId::new(92);
     init_repo(root, phase);
     let fake_bin = common::fake_bin_dir("sleep 60");
-    let response_path = Gates::response_path(root, phase, Stage::Define);
+    // A legacy unkeyed answer: the one form no gate id can keep from a new gate.
+    let response_path = Gates::dir(root).join(format!("{}-define.response.json", phase.padded()));
     fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-    fs::write(
-        &response_path,
-        serde_json::to_vec(&GateResponse {
-            approved: false,
-            note: Some("abort: planted stale response".into()),
-            responded_by: Some("start-lock-e2e-planted-response".into()),
-        })
-        .unwrap(),
-    )
+    let planted = serde_json::to_vec(&GateResponse {
+        approved: false,
+        note: Some("abort: planted stale response".into()),
+        responded_by: Some("start-lock-e2e-planted-response".into()),
+    })
     .unwrap();
+    fs::write(&response_path, &planted).unwrap();
     let _reaper = common::LaunchedRunReaper::new(root, phase, vec![]);
 
     let mut process = child(&home, root, phase, &fake_bin, "auto")
@@ -221,9 +246,125 @@ fn start_clears_leftover_gate_files_after_taking_the_lock() {
     );
     assert!(
         !response_path.exists(),
-        "the planted response must be removed"
+        "the planted response must be gone from its old name"
+    );
+    let set_aside: Vec<_> = Gates::quarantined(root)
+        .into_iter()
+        .filter(|answer| fs::read(&answer.path).is_ok_and(|bytes| bytes == planted))
+        .collect();
+    assert_eq!(
+        set_aside.len(),
+        1,
+        "a quarantine file must hold the planted response's bytes: {:?}",
+        Gates::quarantined(root)
     );
     common::kill_and_reap(&mut process);
+}
+
+/// D-06, at the boundary an operator reads: `devflow resume` prints the answer it set
+/// aside. The route is the Auto refusal that opens the rerun's gate in the foreground, so
+/// nothing is left running, and the gate's short timeout is what ends the command.
+#[test]
+fn resume_prints_the_answer_it_set_aside() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let phase = PhaseId::new(93);
+    init_repo(root, phase);
+    let fake_bin = common::fake_bin_dir("exit 0");
+    let planted = plant_leftover_run(root, phase, None);
+    let existing = std::env::var_os("PATH").unwrap_or_default();
+    let path = format!("{}:{}", fake_bin.path.display(), existing.to_string_lossy());
+
+    let output = common::hermetic_devflow(&home)
+        .args([
+            "resume",
+            "--phase",
+            &phase.to_string(),
+            "--legacy-claude-launch",
+        ])
+        .arg(root)
+        .current_dir(root)
+        .env("PATH", path)
+        .env("DEVFLOW_GATE_TIMEOUT_SECS", "1")
+        .output()
+        .expect("run devflow resume");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !planted.response.exists(),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    let set_aside = Gates::quarantined(root);
+    assert_eq!(set_aside.len(), 1, "stdout: {stdout}\nstderr: {stderr}");
+    let line = format!(
+        "resume: set aside an unused answer for the code gate (gate {}): {} — the rerun asks again",
+        set_aside[0].label,
+        set_aside[0].path.display()
+    );
+    assert!(
+        stdout.lines().any(|printed| printed == line),
+        "{line} not on stdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
+/// D-05, at the boundary an operator reads: the real `status`, `doctor` and `doctor --json`
+/// each name a set-aside answer, and the control run before it names none.
+#[test]
+fn status_and_doctor_name_a_set_aside_answer_on_stdout() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let phase = PhaseId::new(94);
+    init_repo(root, phase);
+    let run = |args: &[&str]| {
+        let output = common::hermetic_devflow(&home)
+            .args(args)
+            .arg(root)
+            .current_dir(root)
+            .output()
+            .expect("run devflow");
+        assert!(
+            output.status.success(),
+            "devflow {args:?}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    for args in [&["status"][..], &["doctor"][..]] {
+        let stdout = run(args);
+        assert!(
+            !stdout.contains("set-aside gate answers"),
+            "control: nothing to report in {args:?}: {stdout}"
+        );
+    }
+
+    plant_code_gate(root, phase);
+    Gates::close(root, phase, Stage::Code).expect("set the planted answer aside");
+    let set_aside = Gates::quarantined(root);
+    assert_eq!(set_aside.len(), 1, "{set_aside:?}");
+    let full = set_aside[0].path.display().to_string();
+    let relative = set_aside[0]
+        .path
+        .strip_prefix(root)
+        .unwrap()
+        .display()
+        .to_string();
+
+    let status = run(&["status"]);
+    assert!(status.contains("set-aside gate answers:"), "{status}");
+    assert!(status.contains(&full), "{status}");
+    let doctor = run(&["doctor"]);
+    assert!(doctor.contains("set-aside gate answers:"), "{doctor}");
+    assert!(doctor.contains(&relative), "{doctor}");
+    let body: serde_json::Value = serde_json::from_str(&run(&["doctor", "--json"])).unwrap();
+    let listed = body["set_aside_gate_answers"].as_array().unwrap();
+    assert_eq!(listed.len(), 1, "{body}");
+    assert!(
+        listed[0]["detail"].as_str().unwrap().contains(&relative),
+        "{body}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -394,24 +535,26 @@ fn plant_leftover_run(root: &Path, phase: PhaseId, agent_pid: Option<u32>) -> Pl
     plant_code_gate(root, phase)
 }
 
-/// A Code gate request and an aborting response, as a leftover run leaves
-/// them.
+/// A Code gate and an aborting answer bound to it, as a leftover run leaves them.
 fn plant_code_gate(root: &Path, phase: PhaseId) -> PlantedGate {
-    let request = Gates::write_gate(root, phase, Stage::Code, "planted leftover Code gate")
+    let opened = Gates::open_gate(root, phase, Stage::Code, "planted leftover Code gate")
         .expect("plant Code gate request");
-    let response = Gates::response_path(root, phase, Stage::Code);
-    fs::create_dir_all(response.parent().unwrap()).unwrap();
-    fs::write(
-        &response,
-        serde_json::to_vec(&GateResponse {
+    let response = Gates::answer(
+        root,
+        phase,
+        Stage::Code,
+        &opened.gate_id,
+        &GateResponse {
             approved: false,
             note: Some("abort: planted leftover response".into()),
             responded_by: Some("start-lock-e2e-planted-leftover".into()),
-        })
-        .unwrap(),
+        },
     )
     .expect("plant Code gate response");
-    PlantedGate { request, response }
+    PlantedGate {
+        request: opened.path,
+        response,
+    }
 }
 
 fn write_agent_pid(root: &Path, phase: PhaseId, pid: u32) {
@@ -447,6 +590,28 @@ fn phase_file_snapshot(root: &Path, phase: PhaseId) -> Vec<(PathBuf, Vec<u8>)> {
             (path, bytes)
         })
         .collect()
+}
+
+/// The launch id the phase's state names as pending, if its state loads.
+fn pending_launch(root: &Path, phase: PhaseId) -> Option<String> {
+    devflow_core::workflow::load_state(root, phase)
+        .ok()?
+        .pending_supervisor
+        .map(|pending| pending.launch_id)
+}
+
+/// The names of the liveness files under `root`'s `.devflow/`.
+fn liveness_files(root: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(root.join(".devflow"))
+        .map(|entries| {
+            entries
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with("supervisor-") && name.ends_with(".live"))
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
 }
 
 fn snapshot_paths(snapshot: &[(PathBuf, Vec<u8>)]) -> Vec<&Path> {
@@ -546,13 +711,16 @@ fn assert_start_refuses_live_run(
     refusal: &str,
 ) {
     let fake_bin = common::fake_bin_dir("exit 0");
+    let liveness_before = liveness_files(root);
     let before = phase_file_snapshot(root, phase);
     // Negative control on the snapshot itself: it must cover the planted
     // state and both planted gate files, or byte-identity would prove nothing.
+    let answers = gate_answer_files(root, phase, Stage::Code);
+    assert_eq!(answers.len(), 1, "the planted answer: {answers:?}");
     for required in [
         devflow_core::workflow::state_path(root, phase),
         Gates::gate_path(root, phase, Stage::Code),
-        Gates::response_path(root, phase, Stage::Code),
+        answers[0].clone(),
     ] {
         assert!(
             snapshot_paths(&before).contains(&required.as_path()),
@@ -609,11 +777,15 @@ fn assert_start_refuses_live_run(
         snapshot_paths(&before),
         snapshot_paths(&after)
     );
-    let lock = root.join(format!(".devflow/lock-{}", phase.padded()));
-    assert!(
-        !lock.exists(),
-        "a refused start must not leave {}",
-        lock.display()
+    assert_eq!(
+        pending_launch(root, phase),
+        None,
+        "a refused start must leave no reservation"
+    );
+    assert_eq!(
+        liveness_files(root),
+        liveness_before,
+        "a refused start must leave no liveness file of its own"
     );
     assert_eq!(
         phase_branches(root, phase),
@@ -740,8 +912,13 @@ fn start_replaces_a_leftover_state_whose_recorded_processes_are_dead() {
     );
     assert!(
         !planted.response.exists(),
-        "the leftover Code gate response must be cleared: {}",
+        "the leftover Code gate response must be out of its slot: {}",
         planted.response.display()
+    );
+    assert_eq!(
+        Gates::quarantined(root).len(),
+        1,
+        "the leftover response is set aside, not deleted"
     );
     assert!(
         events_contain_workflow_started(root),
@@ -878,6 +1055,7 @@ fn assert_resume_refuses_live_run(
     fake_bin: &common::FakeBin,
     case: &RefusalCase,
 ) {
+    let liveness_before = liveness_files(root);
     let before = phase_file_snapshot(root, phase);
     for required in &case.required {
         assert!(
@@ -900,7 +1078,6 @@ fn assert_resume_refuses_live_run(
         case.refusal
     );
 
-    let padded = phase.padded();
     let common = [
         "refusing to resume; nothing was written".to_string(),
         format!(
@@ -934,9 +1111,15 @@ fn assert_resume_refuses_live_run(
         after, before,
         "a refused resume must leave phase files byte-identical"
     );
-    assert!(
-        !root.join(format!(".devflow/lock-{padded}")).exists(),
-        "a refused resume must not leave a phase lock"
+    assert_eq!(
+        pending_launch(root, phase),
+        None,
+        "a refused resume must leave no reservation"
+    );
+    assert_eq!(
+        liveness_files(root),
+        liveness_before,
+        "a refused resume must leave no liveness file of its own"
     );
     assert_eq!(
         stage_launched_count(root),
@@ -963,7 +1146,7 @@ fn stage_launched_count(root: &Path) -> usize {
 fn resume_agent_fragments(phase: PhaseId) -> Vec<String> {
     vec![
         "A state already marked stopped does not mean these processes have exited".to_string(),
-        "`devflow status` names `devflow resume` for a phase whose supervisor is GONE even while its agent is still alive".to_string(),
+        "with no live supervisor, `devflow status` names a live agent's pid and the manual kill".to_string(),
         "resume refuses until every named process has exited".to_string(),
         "If a named pid is live but is not this phase's process (a recycled pid), `resume` refuses again".to_string(),
         "no DevFlow verb clears a recorded pid while keeping the phase's work".to_string(),

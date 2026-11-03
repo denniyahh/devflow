@@ -3,22 +3,27 @@
 //!
 //! The file pins both drivers:
 //! - the `start_*` arms cover criterion 4's shape: a foreground `devflow
-//!   start` parked at its Define preflight gate holds lock-NN itself;
+//!   start` parked at its Define preflight gate holds no lock-NN. It is that
+//!   gate's registered waiter, and it holds its launch reservation;
 //! - the `advance_*` arms cover a foreground `devflow advance` parked at a
 //!   Code gate.
 
 mod common;
 
-use devflow_core::gates::Gates;
+use devflow_core::gates::{GateFile, GateId, Gates, WaiterStatus};
 use devflow_core::mode::Mode;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
+use devflow_core::test_support::gate_answer_files;
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
+
+/// A lock file as an older binary left it, naming a pid that is not running.
+const DEAD_LOCK_HOLDER: &str = "2147483646";
 
 fn git(root: &Path, args: &[&str]) {
     let output = devflow_core::test_support::git_command(root)
@@ -71,12 +76,23 @@ fn spawn_gated_advance(home: &common::HermeticHome, root: &Path, phase: PhaseId)
         .spawn()
         .expect("spawn foreground advance");
     wait_for(
-        || devflow_core::lock::holder(root, phase).is_some(),
-        "advance lock",
-    );
-    wait_for(
         || Gates::gate_path(root, phase, Stage::Code).exists(),
         "Code gate",
+    );
+    let gate = GateId::parse(
+        &Gates::list_open(root)
+            .into_iter()
+            .find(|gate| gate.phase == phase && gate.stage == Stage::Code)
+            .expect("the advance's Code gate is listed")
+            .gate_id,
+    )
+    .expect("the advance's gate has a gate id");
+    wait_for(
+        || {
+            Gates::waiter_status(root, phase, Stage::Code, &gate)
+                .is_ok_and(|status| status == WaiterStatus::Live)
+        },
+        "the advance's registration at its Code gate",
     );
     child
 }
@@ -264,8 +280,9 @@ fn advance_wedge_arm_killed_advance_leaves_a_code_gate_that_reject_reports_hones
         "wedge reject unexpectedly succeeded: {}",
         String::from_utf8_lossy(&output.stdout)
     );
-    assert!(
-        !Gates::response_path(root, phase, Stage::Code).exists(),
+    assert_eq!(
+        gate_answer_files(root, phase, Stage::Code),
+        Vec::<PathBuf>::new(),
         "a wedged gate must receive no stale response"
     );
     let output_text = format!(
@@ -274,15 +291,21 @@ fn advance_wedge_arm_killed_advance_leaves_a_code_gate_that_reject_reports_hones
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        output_text.contains("no confirmed waiter"),
+        output_text.contains("no registered waiter"),
         "unexpected output: {output_text}"
     );
+
+    let leftover_lock = root
+        .join(".devflow")
+        .join(format!("lock-{}", phase.padded()));
+    fs::write(&leftover_lock, DEAD_LOCK_HOLDER).unwrap();
+    assert!(leftover_lock.exists(), "precondition: the leftover lock");
 
     let recovery = common::hermetic_devflow(&home)
         .args(["recover", "--clean", "--phase", &phase.to_string()])
         .arg(root)
         .output()
-        .expect("recover lock-free wedge");
+        .expect("recover the wedge");
     assert!(
         recovery.status.success(),
         "recover --clean failed: {}",
@@ -318,11 +341,8 @@ fn advance_wedge_arm_killed_advance_leaves_a_code_gate_that_reject_reports_hones
         "recovery must remove orphaned temporary files"
     );
     assert!(
-        !root
-            .join(".devflow")
-            .join(format!("lock-{}", phase.padded()))
-            .exists(),
-        "recovery must not leave its own lock behind"
+        !leftover_lock.exists(),
+        "recovery must remove a lock file an older binary left"
     );
 }
 
@@ -373,14 +393,11 @@ fn dry_run_sweep_reports_no_waiter_gates_as_left_alone() {
     let live_ship_phase = PhaseId::new(4820);
     Gates::write_gate(root, phase, Stage::Code, "abandoned").unwrap();
     Gates::write_gate(root, ship_phase, Stage::Ship, "release").unwrap();
-    let pid = std::process::id();
-    let start = devflow_core::agent::process_start_time(pid).expect("test process start time");
-    let lock_path = root
-        .join(".devflow")
-        .join(format!("lock-{}", live_ship_phase.padded()));
-    std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
-    std::fs::write(lock_path, format!("{pid}\n{start}")).unwrap();
-    Gates::write_gate(root, live_ship_phase, Stage::Ship, "live poller").unwrap();
+    let live_ship_gate = Gates::open_gate(root, live_ship_phase, Stage::Ship, "live poller")
+        .unwrap()
+        .gate_id;
+    let _live_ship_waiter =
+        Gates::register_waiter(root, live_ship_phase, Stage::Ship, &live_ship_gate).unwrap();
 
     let output = common::hermetic_devflow(&home)
         .args([
@@ -410,23 +427,59 @@ fn dry_run_sweep_reports_no_waiter_gates_as_left_alone() {
     );
     assert!(
         stdout.contains(&format!("left phase {ship_phase} ship alone")),
-        "no-holder Ship gate must also be left alone: {stdout}"
+        "a no-waiter Ship gate must also be left alone: {stdout}"
     );
     assert!(
         !stdout.contains(&format!("would reap phase {ship_phase} ship")),
-        "no-holder dry-run must not claim it would reap the Ship gate: {stdout}"
+        "a no-waiter dry-run must not claim it would reap the Ship gate: {stdout}"
     );
     assert!(
         stdout.contains(&format!("would reap phase {live_ship_phase} ship")),
-        "a live Ship holder must remain the positive would-reap control: {stdout}"
+        "a registered Ship waiter must remain the positive would-reap control: {stdout}"
     );
     assert!(
         stdout.contains("1 would be reaped"),
         "summary must count only the confirmed-live would-reap decision: {stdout}"
     );
-    assert!(
-        !Gates::response_path(root, phase, Stage::Code).exists(),
+    assert_eq!(
+        gate_answer_files(root, phase, Stage::Code),
+        Vec::<PathBuf>::new(),
         "dry-run sweep must not write a response"
+    );
+}
+
+/// The id of the phase's parked Define gate.
+fn define_gate_id(root: &Path, phase: PhaseId) -> GateId {
+    let gate =
+        fs::read(Gates::gate_path(root, phase, Stage::Define)).expect("read the Define gate");
+    let gate: GateFile = serde_json::from_slice(&gate).expect("parse the Define gate");
+    GateId::parse(&gate.gate_id).expect("the Define gate has a gate id")
+}
+
+/// The parked start is the Define gate's registered waiter, at once: every gate
+/// wait registers before it publishes, so `gate reject` will find it. The
+/// reservation is asserted beside that, never instead of it: it predates the gate.
+fn assert_parked_start_is_the_define_gates_waiter(root: &Path, phase: PhaseId, start_pid: u32) {
+    let gate_id = define_gate_id(root, phase);
+    assert_eq!(
+        Gates::waiter_status(root, phase, Stage::Define, &gate_id).unwrap(),
+        WaiterStatus::Live,
+        "the parked start must be registered on its Define gate"
+    );
+    assert!(
+        Gates::live_waiter_holders(root)
+            .iter()
+            .any(|(pid, _)| *pid == start_pid),
+        "the Define gate's waiter must be the parked start, pid {start_pid}"
+    );
+    let pending = devflow_core::workflow::load_state(root, phase)
+        .unwrap()
+        .pending_supervisor
+        .expect("the parked start holds its reservation");
+    assert_eq!(
+        devflow_core::liveness::probe(&pending.liveness_path).unwrap(),
+        devflow_core::liveness::Held::Live,
+        "the parked start holds its reservation's lock"
     );
 }
 
@@ -440,11 +493,8 @@ fn start_wedge_arm_interrupted_start_leaves_a_define_gate_nothing_answers() {
     let fake_bin = fake_bin_dir("sleep 60");
     let mut start = spawn_parked_start(&home, root, phase, &fake_bin, "30");
 
-    assert_eq!(
-        devflow_core::lock::holder_identity(root, phase).map(|(pid, _)| pid),
-        Some(start.0.id()),
-        "the parked start must hold its own phase lock"
-    );
+    assert_parked_start_is_the_define_gates_waiter(root, phase, start.0.id());
+    let gate_id = define_gate_id(root, phase);
 
     start.0.kill().expect("kill foreground start");
     start.0.wait().expect("reap foreground start");
@@ -464,16 +514,17 @@ fn start_wedge_arm_interrupted_start_leaves_a_define_gate_nothing_answers() {
         "reject against an interrupted start unexpectedly succeeded: {output_text}"
     );
     assert!(
-        output_text.contains("no confirmed waiter"),
-        "reject must say no confirmed waiter: {output_text}"
+        output_text.contains("no registered waiter"),
+        "reject must say no registered waiter: {output_text}"
     );
     let recovery_hint = format!("devflow recover --clean --phase {phase}");
     assert!(
         output_text.contains(&recovery_hint),
         "reject must name `{recovery_hint}`: {output_text}"
     );
-    assert!(
-        !Gates::response_path(root, phase, Stage::Define).exists(),
+    assert_eq!(
+        gate_answer_files(root, phase, Stage::Define),
+        Vec::<PathBuf>::new(),
         "an unanswerable Define gate must receive no response"
     );
 
@@ -489,6 +540,7 @@ fn start_wedge_arm_interrupted_start_leaves_a_define_gate_nothing_answers() {
     let gates_dir = Gates::dir(root);
     let state_path = devflow_core::workflow::state_path(root, phase);
     let lock_path = devflow_dir.join(format!("lock-{}", phase.padded()));
+    fs::write(&lock_path, DEAD_LOCK_HOLDER).unwrap();
     let state_temp = devflow_dir.join(format!(
         ".{}.1.0.tmp",
         state_path.file_name().unwrap().to_string_lossy()
@@ -502,13 +554,32 @@ fn start_wedge_arm_interrupted_start_leaves_a_define_gate_nothing_answers() {
     ));
     fs::write(&state_temp, b"orphaned state write").unwrap();
     fs::write(&gate_temp, b"orphaned gate write").unwrap();
-    for precondition in [&state_temp, &gate_temp, &state_path, &lock_path] {
+    let waiter_path = Gates::waiter_path(root, phase, Stage::Define, &gate_id);
+    for precondition in [
+        &state_temp,
+        &gate_temp,
+        &state_path,
+        &waiter_path,
+        &lock_path,
+    ] {
         assert!(
             precondition.exists(),
             "precondition: {} must exist before recovery, or its removal proves nothing",
             precondition.display()
         );
     }
+    assert_eq!(
+        Gates::waiter_status(root, phase, Stage::Define, &gate_id).unwrap(),
+        WaiterStatus::Absent,
+        "precondition: the killed start's registration must be unheld"
+    );
+    assert!(
+        devflow_core::workflow::load_state(root, phase)
+            .unwrap()
+            .pending_supervisor
+            .is_some(),
+        "precondition: the killed start must leave its reservation in the state"
+    );
 
     let recovery = common::hermetic_devflow(&home)
         .args(["recover", "--clean", "--phase", &phase.to_string()])
@@ -540,7 +611,7 @@ fn start_wedge_arm_interrupted_start_leaves_a_define_gate_nothing_answers() {
     }
     assert!(
         !lock_path.exists(),
-        "recovery must not leave lock-{} behind",
+        "recovery must remove the lock-{} an older binary left",
         phase.padded()
     );
 }
@@ -555,11 +626,7 @@ fn start_self_resolving_arm_live_start_consumes_the_define_rejection() {
     let fake_bin = fake_bin_dir("sleep 60");
     let mut start = spawn_parked_start(&home, root, phase, &fake_bin, "60");
 
-    assert_eq!(
-        devflow_core::lock::holder_identity(root, phase).map(|(pid, _)| pid),
-        Some(start.0.id()),
-        "the parked start must hold its own phase lock"
-    );
+    assert_parked_start_is_the_define_gates_waiter(root, phase, start.0.id());
 
     let before = Instant::now();
     let output = reject_define(&home, root, phase);
@@ -569,16 +636,16 @@ fn start_self_resolving_arm_live_start_consumes_the_define_rejection() {
         "live reject failed\nstdout: {stdout}\nstderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    // `gate_respond` re-checks the holder after publishing: a start that has
-    // already consumed the answer and released its lock yields the no-holder
+    // `gate_respond` re-checks the waiter after publishing: a start that has
+    // already consumed the answer and finished its registration yields the no-waiter
     // wording. That is accepted only because the start must then be seen to
     // exit successfully below.
-    let reject_wording = if stdout.contains("a live lock holder may pick up this response") {
+    let reject_wording = if stdout.contains("a registered waiter may pick up this response") {
         "live"
-    } else if stdout.contains("response was written, but no confirmed live holder will act") {
-        "no_holder_after_exit"
+    } else if stdout.contains("response was written, but no registered waiter will act") {
+        "no_waiter_after_exit"
     } else {
-        panic!("reject reported neither a live holder nor a post-exit no-holder: {stdout}");
+        panic!("reject reported neither a registered waiter nor a post-exit no-waiter: {stdout}");
     };
     println!("reject_wording={reject_wording}");
 

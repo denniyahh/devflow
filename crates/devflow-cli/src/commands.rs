@@ -26,17 +26,21 @@ use devflow_core::agent_result;
 use devflow_core::agents;
 use devflow_core::config::{self, DEVELOP, FEATURE_PREFIX, MAIN};
 use devflow_core::events;
-use devflow_core::gates::{GateAction, GateError, GateResponse, Gates, OpenGate};
+use devflow_core::gates::{
+    AnswerRead, GateAction, GateError, GateFile, GateId, GateResponse, Gates, OpenGate,
+    QuarantinedAnswer, WaiterStatus, is_gate_id,
+};
 use devflow_core::git::{GitFlow, git_command, hermetic_command};
 use devflow_core::history;
-use devflow_core::lock;
+use devflow_core::liveness;
 use devflow_core::mode::Mode;
+use devflow_core::monitor;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::recover;
 use devflow_core::registry;
 use devflow_core::ship_evidence;
 use devflow_core::stage::Stage;
-use devflow_core::state::{AgentKind, State, SupervisorRecord};
+use devflow_core::state::{AgentKind, PendingSupervisor, State, SupervisorRecord};
 use devflow_core::supervisor;
 use devflow_core::version;
 use devflow_core::workflow;
@@ -303,6 +307,42 @@ fn carried_phase_failures(
     }
 }
 
+/// Close every stage's leftover gate before a new run starts. An unused answer is set
+/// aside, never deleted, and each one is named on `warnings`. A close that fails only
+/// warns: a leftover answer cannot decide the new run's gate anyway, because that gate
+/// opens under a new id and sets aside whatever is in the stage's slots (D-05, D-06).
+fn set_aside_leftover_gates(
+    project_root: &Path,
+    phase: PhaseId,
+    warnings: &mut dyn std::io::Write,
+) {
+    for stage in [
+        Stage::Define,
+        Stage::Plan,
+        Stage::Code,
+        Stage::Validate,
+        Stage::Ship,
+    ] {
+        match Gates::close(project_root, phase, stage) {
+            Ok(report) => {
+                for path in report.quarantined {
+                    let _ = writeln!(
+                        warnings,
+                        "warning: set aside an unused answer for phase {phase} {stage}: {}",
+                        path.display()
+                    );
+                }
+            }
+            Err(err) => {
+                let _ = writeln!(
+                    warnings,
+                    "warning: could not clear stale gate files for phase {phase} {stage}: {err}"
+                );
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start(
     project_root: &Path,
@@ -325,7 +365,7 @@ pub(crate) fn start(
     // non-default value. Provenance (D-12, `28-CONTEXT.md`): the typed
     // `--yes-ship` CLI flag OR a standing `yes_ship = true` in
     // `devflow.toml`, combined here with logical OR since the flag has no
-    // negative form. Combined before the first `save_state` below, so the
+    // negative form. Combined before `create_run_state` below, so the
     // persisted authorization exists before the detached monitor that will
     // later consult it is ever spawned. `run_gate_with_timeout` must never
     // re-derive this from `state` itself — see its own comment.
@@ -340,15 +380,15 @@ pub(crate) fn start(
     }
     state.yes_ship = yes_ship || config_yes_ship;
     // Persist the operator's gate notify hook for the processes that outlive
-    // this one (monitor chain, rate-limit resume), on the same "before the
-    // first `save_state`" idiom. Captured here rather than in `State::new`
+    // this one (monitor chain, rate-limit resume), on the same "before
+    // `create_run_state`" idiom. Captured here rather than in `State::new`
     // so constructing a state never reads the environment (49-REVIEW.md
     // WR-01); `resume` and `advance` apply the same rule (CR-03).
     state.gate_notify_cmd = devflow_core::gates::apply_notify_env(state.gate_notify_cmd.take());
 
     // D-11's opt-out (31-04), combined on the same shape and for the same
     // reasons as `yes_ship` directly above: OR-ed with an environment override
-    // rather than replacing it, before the first `save_state` below so the
+    // rather than replacing it, before `create_run_state` below so the
     // persisted value exists before any detached monitor consults it, and with
     // a notice when the environment ALONE supplied it — a standing default is
     // never a silent one.
@@ -364,28 +404,51 @@ pub(crate) fn start(
         return Ok(());
     }
 
-    let _phase_lock = match lock::acquire(project_root, phase) {
-        Ok(guard) => guard,
-        Err(lock::LockError::Contended { pid, .. }) => {
-            return Err(CliError::Message(format!(
-                "phase {phase}: another devflow process (pid {pid}) holds the per-phase lock \
-                 — refusing to start; nothing was written"
-            )));
-        }
-        Err(err) => return Err(CliError::Message(err.to_string())),
-    };
-    refuse_start_over_a_live_run(project_root, phase)?;
-    for stage in [
-        Stage::Define,
-        Stage::Plan,
-        Stage::Code,
-        Stage::Validate,
-        Stage::Ship,
-    ] {
-        if let Err(err) = Gates::cleanup(project_root, phase, stage) {
-            eprintln!("warning: could not clear stale gate files for phase {phase} {stage}: {err}");
-        }
-    }
+    // D-17: hold the phase from before the reservation until this returns, so `stop`
+    // reaches this process before its spawn. A launcher refused here has reserved nothing,
+    // so a racing holder's own launch never meets a pending record left by it.
+    let _phase_holder = claim_foreground_holder(project_root, phase)?;
+
+    // D-01, D-08: the reservation excludes a second launcher. Its guard runs before
+    // any gate cleanup, git mutation or run state, so a refusal changes nothing.
+    let reserved = reserve_launch(
+        project_root,
+        phase,
+        LaunchVerb::Start,
+        Some(&state),
+        registry::cache_dir().as_deref(),
+    )?;
+    let launch_id = reserved.reservation.launch_id().to_string();
+    let mut created = reserved.created;
+    crate::pipeline_launch::hold_reservation(reserved.reservation);
+    #[cfg(test)]
+    crate::pipeline_launch::launch_test_hold("holder_claimed");
+    let result = start_reserved(
+        project_root,
+        state,
+        force,
+        worktree,
+        &launch_id,
+        &mut created,
+    );
+    crate::pipeline_launch::abandon_reservation(project_root, phase, created);
+    result
+}
+
+/// [`start`] after its reservation: everything that can fail or return without
+/// launching, so `start` gives the reservation back whichever way this ends.
+/// `created` goes `false` once the state file holds this run, not only the
+/// reservation.
+fn start_reserved(
+    project_root: &Path,
+    mut state: State,
+    force: bool,
+    worktree: bool,
+    launch_id: &str,
+    created: &mut bool,
+) -> Result<(), CliError> {
+    let (phase, agent, mode) = (state.phase, state.agent, state.mode);
+    set_aside_leftover_gates(project_root, phase, &mut std::io::stderr());
 
     // 14-CR-05: fail on a missing agent binary BEFORE any branch/worktree is
     // scaffolded (launch_stage re-checks for the advance-time launch paths).
@@ -412,7 +475,7 @@ pub(crate) fn start(
         ensure_base_is_a_local_branch(project_root, base)?;
     }
     // CR-02 (45-REVIEW.md): persist the resolved trunk on the same "before
-    // the first `save_state`" idiom `yes_ship` uses directly above, and for
+    // `create_run_state`" idiom `yes_ship` uses directly above, and for
     // the same reason — `advance`, `resume` and the checkout hooks that
     // merge this phase branch all run in SEPARATE processes whose
     // environment need not carry `DEVFLOW_BASE_BRANCH`. Without this the
@@ -570,9 +633,9 @@ pub(crate) fn start(
     // `if worktree { ... }` fork above, because that fork is what creates the
     // worktree and sets `state.worktree_path` — the repair targets the copy of
     // `.planning/config.json` the agent will actually read, and before the fork
-    // that copy does not exist (F-10). It sits BEFORE the first
-    // `workflow::save_state` below, matching this function's own
-    // "combine before the first save_state" idiom for `yes_ship` and D-11's
+    // that copy does not exist (F-10). It sits BEFORE
+    // `create_run_state` below, matching this function's own
+    // "combine before `create_run_state`" idiom for `yes_ship` and D-11's
     // opt-out.
     //
     // Why `start` needs this at all, and not just `resume`: a freshly forked
@@ -623,8 +686,8 @@ pub(crate) fn start(
     // Validate agent runs in the worktree, so the artifact lands on
     // `feature/phase-{N}` inside the worktree and is invisible from the main
     // checkout; reading the project root here is exactly the defect plan 33-05
-    // closed (CR-01) and must not be reintroduced. Persisted by the
-    // `workflow::save_state` below rather than by a second write.
+    // closed (CR-01) and must not be reintroduced. Persisted by
+    // `create_run_state` below rather than by a second write.
     let evidence_root: PathBuf = state
         .worktree_path
         .clone()
@@ -658,7 +721,7 @@ pub(crate) fn start(
     // checkout"; placing the call above the worktree fork would silently
     // break that promise.
     //
-    // Placement is also deliberately BEFORE `workflow::save_state` below: a
+    // Placement is also deliberately BEFORE `create_run_state` below: a
     // refusal here must never leave persisted state behind for a run that
     // is not going to start (mirroring the same "don't persist a run that
     // will never launch" reasoning `ensure_agent_binary` and
@@ -697,7 +760,11 @@ pub(crate) fn start(
     // an in-progress state nothing would ever advance. Save first; if the
     // launch fails, clear the just-saved state so `devflow status`/`recover`
     // don't report a phantom run (the failure WR-11 originally targeted).
-    workflow::save_state(&state)?;
+    // That holds even for a supervisor that did not confirm a stop: with no
+    // state the next launch sweeps the sockets, which finds it, and a state
+    // naming neither record would skip that sweep.
+    create_run_state(project_root, phase, &mut state, launch_id)?;
+    *created = false;
     events::emit(
         project_root,
         phase,
@@ -705,10 +772,24 @@ pub(crate) fn start(
         workflow_started_payload(&state),
     );
     if let Err(err) = launch_stage(&mut state, None, None) {
+        // A stop at a safe point is recorded and ends the launch with an error; a stopped
+        // run keeps its state for `devflow resume`.
+        if state.stopped {
+            return Err(err);
+        }
         if let Err(clear_err) = workflow::clear_state(project_root, phase) {
             eprintln!("warning: could not clear state after failed launch: {clear_err}");
         }
         return Err(err);
+    }
+    // A stop honoured before the spawn is an `Ok` from `launch_stage`, with nothing running.
+    if state.stopped {
+        println!(
+            "phase {phase} stopped before anything was launched ({}); run `devflow resume --phase \
+             {phase}` to continue it",
+            state.stop_reason.as_deref().unwrap_or("no reason recorded")
+        );
+        return Ok(());
     }
     println!(
         "started phase {} in {mode} mode at {} — monitor will auto-advance",
@@ -716,6 +797,282 @@ pub(crate) fn start(
     );
     println!("  watch live: devflow logs -f --phase {phase}");
     Ok(())
+}
+
+/// Whether a Ship answer waits for `devflow ship`: `state` is at Ship and the gate's slot
+/// holds an answer bound to that gate, not yet claimed. `Gates::list_open` hides such a gate.
+fn ship_answer_stored(state: &State) -> bool {
+    let (root, phase, stage) = (&state.project_root, state.phase, Stage::Ship);
+    if state.stage != stage {
+        return false;
+    }
+    let Ok(Some(id)) = gate_file_id(root, phase, stage) else {
+        return false;
+    };
+    let Ok(gate_id) = GateId::parse(&id) else {
+        return false;
+    };
+    matches!(
+        Gates::read_answer(root, phase, stage, &gate_id),
+        AnswerRead::Bound(_)
+    ) && !Gates::claim_path(root, phase, stage, &gate_id).exists()
+}
+
+/// Whether `state` is only what a `start`'s reservation wrote: that `start` died before
+/// preparing the run, so no worktree was forked, no base resolved and none of its guards
+/// passed. Every prepared run captures its verification baseline in [`start_reserved`], and
+/// nothing resets it. `worktree_path` cannot say this, because `--no-worktree` leaves it
+/// `None` for a prepared run.
+pub(crate) fn run_never_prepared(state: &State) -> bool {
+    state.stage == Stage::Define && !state.verification_baseline_captured
+}
+
+/// The `start` that prepares what [`run_never_prepared`] says is missing. A worktree already
+/// at the phase's path makes a plain `start` refuse, so that case names `--force`, with what
+/// it costs after a `#` so the line still pastes into a shell.
+fn restart_verb(state: &State) -> String {
+    let verb = format!(
+        "devflow start --phase {} --agent {} --mode {}",
+        state.phase, state.agent, state.mode
+    );
+    let worktree_path = worktree::phase_path(&state.project_root, state.phase);
+    if worktree_path.exists() {
+        format!(
+            "{verb} --force  # recreates {} from the base, discarding what is in it",
+            worktree_path.display()
+        )
+    } else {
+        verb
+    }
+}
+
+/// `resume`'s and a hand-run `advance`'s refusal of a run [`run_never_prepared`] names.
+/// Launching it would run the agent in the primary checkout, on whatever branch is
+/// checked out.
+pub(crate) fn refuse_unprepared_run(state: &State) -> Result<(), CliError> {
+    if !run_never_prepared(state) {
+        return Ok(());
+    }
+    Err(CliError::Message(format!(
+        "phase {phase}: its `devflow start` never finished preparing the run, so there is \
+         nothing to continue; run `{verb}`",
+        phase = state.phase,
+        verb = restart_verb(state),
+    )))
+}
+
+/// Write a fresh run's state for `start`, under the write lock, over the state its
+/// reservation left. This is the one documented write of a whole state: it replaces
+/// what is on disk, keeping the reservation, and only while the state still names
+/// `launch_id`. If it no longer does, the reservation was cleared, and nothing launches.
+fn create_run_state(
+    project_root: &Path,
+    phase: PhaseId,
+    state: &mut State,
+    launch_id: &str,
+) -> Result<(), CliError> {
+    workflow::update_state_with(project_root, phase, |existing| {
+        let pending = match existing {
+            workflow::Existing::Loaded(reserved) => reserved.pending_supervisor,
+            _ => None,
+        }
+        .filter(|pending| pending.launch_id == launch_id);
+        if pending.is_none() {
+            return Err(CliError::Message(format!(
+                "phase {phase}: launch reservation {launch_id} was cleared while `start` \
+                 prepared the run — nothing was launched"
+            )));
+        }
+        state.pending_supervisor = pending;
+        Ok::<_, CliError>((Some(state.clone()), ()))
+    })
+}
+
+/// Copy a state file that does not load aside before a reservation replaces it, since a
+/// refused `start` then removes what the reservation wrote. A copy that cannot be made
+/// refuses the launch. Its name does not read as a state ([`workflow::list_states`]).
+fn keep_unloadable_state(state_file: &Path, kept: &Path) -> Result<(), CliError> {
+    std::fs::copy(state_file, kept)
+        .map(|_| ())
+        .map_err(|error| {
+            CliError::Message(format!(
+                "could not keep a copy of the state file {} at {}, which does not load, so it was \
+             not replaced: {error}",
+                state_file.display(),
+                kept.display()
+            ))
+        })
+}
+
+/// A launch's reservation, made at the top of `start` and `resume`.
+pub(crate) struct Reserved {
+    /// The launch id and held liveness lock the supervisor will take over.
+    pub(crate) reservation: monitor::Reservation,
+    /// Whether the reservation's write created the state file, so that giving the
+    /// reservation back removes it.
+    pub(crate) created: bool,
+    /// The state as the reservation wrote it.
+    pub(crate) state: State,
+}
+
+/// Record the launch before its supervisor exists (D-01): take a reservation, then
+/// in one write-lock closure run the live-run guard and write
+/// `state.pending_supervisor`, so two launchers cannot both pass the guard (V-05).
+/// `fresh` is `start`'s new state, written when none loads; `resume` passes `None`
+/// and gets its missing-state or load error once the guard has passed.
+///
+/// A refused launch gives the reservation back, so it leaves no liveness file and
+/// changes no state. The closure's only I/O is the guard's bounded probes: no spawn,
+/// hook or gate wait happens under the write lock (D-08).
+pub(crate) fn reserve_launch(
+    project_root: &Path,
+    phase: PhaseId,
+    verb: LaunchVerb,
+    fresh: Option<&State>,
+    cache_dir: Option<&Path>,
+) -> Result<Reserved, CliError> {
+    let ctx = crate::pipeline_launch::launch_context()?;
+    let reservation =
+        monitor::Reservation::for_phase(&ctx, project_root, phase).map_err(|err| {
+            CliError::Message(format!(
+                "could not reserve a launch of phase {phase}: {err}"
+            ))
+        })?;
+    let pending = reservation.pending_record();
+    let kept_unloadable_path = project_root.join(".devflow").join(format!(
+        "unloadable-state-{}-{}.json",
+        phase.padded(),
+        reservation.launch_id()
+    ));
+    let written = workflow::update_state_with(project_root, phase, |existing| {
+        refuse_launch_over_a_live_run(project_root, phase, verb, &existing, cache_dir)?;
+        if fresh.is_some() {
+            refuse_stateless_launch_beside_a_live_lock(
+                project_root,
+                phase,
+                reservation.launch_id(),
+                &existing,
+            )?;
+        }
+        #[cfg(test)]
+        crate::pipeline_launch::launch_test_hold("guarded");
+        let state_file = workflow::state_path(project_root, phase);
+        let (mut next, created, replaced) = match (existing, fresh) {
+            (workflow::Existing::Loaded(state), _) => (state, false, false),
+            (workflow::Existing::Missing, Some(fresh)) => (fresh.clone(), true, false),
+            (workflow::Existing::Unloadable(_), Some(fresh)) => {
+                keep_unloadable_state(&state_file, &kept_unloadable_path)?;
+                (fresh.clone(), true, true)
+            }
+            (workflow::Existing::Missing, None) => {
+                return Err(workflow::WorkflowError::MissingState(state_file).into());
+            }
+            (workflow::Existing::Unloadable(error), None) => return Err(error.into()),
+        };
+        // The guard has passed, so a reservation still here is abandoned.
+        let abandoned = next.pending_supervisor.replace(pending);
+        if let Some(abandoned) = &abandoned {
+            remove_abandoned_liveness_file(project_root, abandoned);
+        }
+        let outcome = ReserveOutcome {
+            state: next.clone(),
+            created,
+            replaced: replaced.then(|| (state_file, kept_unloadable_path.clone())),
+            abandoned: abandoned.map(|abandoned| abandoned.launch_id),
+        };
+        Ok::<_, CliError>((Some(next), outcome))
+    });
+    let outcome = match written {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            reservation.discard();
+            return Err(err);
+        }
+    };
+    if let Some((path, kept)) = outcome.replaced {
+        println!(
+            "note: replaced the state file {}, which did not load, with this launch's \
+             reservation; its bytes are kept at {}",
+            path.display(),
+            kept.display()
+        );
+    }
+    if let Some(launch_id) = outcome.abandoned {
+        println!("cleared an abandoned launch reservation {launch_id}");
+    }
+    #[cfg(test)]
+    crate::pipeline_launch::launch_test_hold("reserved");
+    Ok(Reserved {
+        reservation,
+        created: outcome.created,
+        state: outcome.state,
+    })
+}
+
+/// A state that is missing or does not load names no pending launch, and a supervisor
+/// that has not published shows in no socket sweep, so creating or replacing the state
+/// could launch a second one beside it. Only its held liveness lock shows. That file
+/// names no phase, so a lock another phase's loadable state records is that phase's;
+/// any other held lock refuses: fail closed, naming its holder. A lock that cannot be
+/// probed counts as held (T-50-40).
+fn refuse_stateless_launch_beside_a_live_lock(
+    project_root: &Path,
+    phase: PhaseId,
+    own_launch_id: &str,
+    existing: &workflow::Existing,
+) -> Result<(), CliError> {
+    let condition = match existing {
+        workflow::Existing::Loaded(_) => return Ok(()),
+        workflow::Existing::Missing => "is missing",
+        workflow::Existing::Unloadable(_) => "does not load",
+    };
+    let live = recover::unrecorded_live_launches(project_root, phase, Some(own_launch_id))
+        .map_err(|error| {
+            CliError::Message(format!(
+                "phase {phase}: its state file {condition}, and {} could not be listed for live \
+                 launches ({error}); nothing was launched",
+                project_root.join(".devflow").display()
+            ))
+        })?;
+    match live.first() {
+        None => Ok(()),
+        Some(launch) => Err(CliError::Message(format!(
+            "phase {phase}: its state file {condition}, so it cannot name its launch, and {}. \
+             Nothing was launched. Retry once it has published or exited; `devflow stop` never \
+             signals an unpublished launch, so if it stays, end that process yourself",
+            launch.describe()
+        ))),
+    }
+}
+
+/// What [`reserve_launch`]'s write-lock closure hands back to print and return.
+struct ReserveOutcome {
+    state: State,
+    created: bool,
+    /// The state file a reservation replaced because it did not load, and the copy of
+    /// its bytes.
+    replaced: Option<(PathBuf, PathBuf)>,
+    /// The launch id of the abandoned reservation this one replaced.
+    abandoned: Option<String>,
+}
+
+/// Remove an abandoned reservation's liveness file, best effort: `recover --clean`
+/// sweeps one left behind. Only the path this project's launch id derives to, and only
+/// while nothing holds it, because the path was read from a state file. An unheld hold
+/// file can never read live again, so removing it races no holder.
+pub(crate) fn remove_abandoned_liveness_file(project_root: &Path, abandoned: &PendingSupervisor) {
+    let path = &abandoned.liveness_path;
+    if liveness::launch_liveness_path(project_root, &abandoned.launch_id).as_ref() != Some(path)
+        || !matches!(liveness::probe(path), Ok(liveness::Held::Abandoned))
+    {
+        return;
+    }
+    if let Err(err) = std::fs::remove_file(path) {
+        eprintln!(
+            "warning: could not remove the abandoned liveness file {}: {err}",
+            path.display()
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -932,9 +1289,16 @@ pub(crate) fn cleanup(project_root: &Path, force: bool) -> Result<(), CliError> 
 
         // Fail-closed on a live run: refuse whenever the agent is alive
         // (whatever the supervisor's liveness) OR the supervisor answers
-        // ALIVE, `--force` or not. The verb that ends a live run is `stop`
-        // (50-14); `resume` refuses while one is live.
-        if agent_alive || matches!(phase_liveness, PhaseLiveness::Alive { .. }) {
+        // ALIVE or is a live pending launch, `--force` or not. The verb that
+        // ends a live run is `stop` (50-14); `resume` refuses while one is live.
+        if agent_alive
+            || matches!(
+                phase_liveness,
+                PhaseLiveness::Alive { .. }
+                    | PhaseLiveness::LaunchPending { .. }
+                    | PhaseLiveness::HeldNoSocket { .. }
+            )
+        {
             let phase_label = phase
                 .map(|p| p.to_string())
                 .unwrap_or_else(|| "?".to_string());
@@ -1036,6 +1400,21 @@ pub(crate) enum PhaseLiveness {
     /// The probe could not answer; a path-free summary of why (see
     /// [`probe_error_summary`]). Neither ALIVE nor GONE is guessed.
     ProbeFailed(String),
+    /// The state names a pending supervisor that is live: its liveness lock is held,
+    /// or its socket is not GONE (D-02). It may not be the recorded one yet, so this
+    /// comes first, and its one repair is `devflow stop`.
+    LaunchPending {
+        /// The reserved launch's id.
+        launch_id: String,
+        /// Whether its socket has appeared.
+        published: bool,
+    },
+    /// The recorded socket is gone, but a process still holds the launch's liveness
+    /// lock, so `stop` cannot reach it and `resume` refuses it.
+    HeldNoSocket {
+        /// The holder's pid, when its record can be read.
+        pid: Option<u32>,
+    },
 }
 
 impl PhaseLiveness {
@@ -1057,6 +1436,24 @@ impl PhaseLiveness {
             }
             PhaseLiveness::NotLaunched => "not launched (no supervisor recorded)".to_string(),
             PhaseLiveness::ProbeFailed(why) => format!("UNKNOWN — the probe failed: {why}"),
+            PhaseLiveness::LaunchPending {
+                launch_id,
+                published,
+            } => {
+                let published = if *published {
+                    "published"
+                } else {
+                    "not yet published"
+                };
+                format!(
+                    "PENDING — launch {launch_id} is reserved and its supervisor has {published}; \
+                     it is not yet the recorded supervisor"
+                )
+            }
+            PhaseLiveness::HeldNoSocket { pid } => {
+                let holder = pid.map_or("a process".to_string(), |pid| format!("pid {pid}"));
+                format!("HELD — its socket is gone, but {holder} holds its liveness lock")
+            }
         }
     }
 
@@ -1069,6 +1466,8 @@ impl PhaseLiveness {
             PhaseLiveness::GoneWhileActive => "gone_while_active",
             PhaseLiveness::NotLaunched => "not_launched",
             PhaseLiveness::ProbeFailed(_) => "probe_failed",
+            PhaseLiveness::LaunchPending { .. } => "launch_pending",
+            PhaseLiveness::HeldNoSocket { .. } => "held_no_socket",
         }
     }
 }
@@ -1116,34 +1515,88 @@ fn probe_error_summary(error: &supervisor::ProbeError) -> String {
     }
 }
 
-/// Probe the socket `state.supervisor` records, once, and map the answer.
-/// The only I/O half of [`phase_liveness`]; reads no pid.
+/// A pending record as [`PhaseLiveness::LaunchPending`], or `None` when its
+/// reservation is abandoned. The launch guard's own predicate
+/// ([`pending_live_socket`]), so `status` and a refusal cannot disagree.
+fn pending_liveness(pending: &PendingSupervisor) -> Option<PhaseLiveness> {
+    pending_live_socket(pending).map(|live| PhaseLiveness::LaunchPending {
+        launch_id: pending.launch_id.clone(),
+        published: live.pending == PendingKind::Published,
+    })
+}
+
+/// A phase's supervisor liveness: a live pending supervisor first (D-02), else the
+/// socket `state.supervisor` records, probed once and mapped by [`phase_liveness`].
+/// Reads no pid. A reservation whose supervisor is gone left a launch behind, so with
+/// no record it reads GONE, not "not launched".
 fn probe_phase(state: &State) -> PhaseLiveness {
+    let pending = state.pending_supervisor.as_ref();
+    if let Some(live) = pending.and_then(pending_liveness) {
+        return live;
+    }
     let record = state.supervisor.as_ref();
     let probe = record.map(|record| supervisor::probe(&record.socket_path));
-    phase_liveness(record, probe, state.stopped)
+    match phase_liveness(record, probe, state.stopped) {
+        PhaseLiveness::Gone | PhaseLiveness::GoneWhileActive
+            if record.is_some_and(|record| {
+                held_without_socket(&state.project_root, record).is_some()
+            }) =>
+        {
+            let path = record.and_then(|record| {
+                liveness::launch_liveness_path(&state.project_root, &record.launch_id)
+            });
+            let holder = path.and_then(|path| liveness::live_holder(&path).ok().flatten());
+            PhaseLiveness::HeldNoSocket {
+                pid: holder.map(|(pid, _)| pid),
+            }
+        }
+        PhaseLiveness::NotLaunched if pending.is_some() && state.stopped => PhaseLiveness::Gone,
+        PhaseLiveness::NotLaunched if pending.is_some() => PhaseLiveness::GoneWhileActive,
+        liveness => liveness,
+    }
 }
+
+/// The repair for [`PhaseLiveness::HeldNoSocket`], whose text names the process.
+const HELD_NO_SOCKET_REPAIR: &str =
+    "`devflow stop` cannot reach that process and `devflow resume` refuses it; end it first";
 
 /// Recovery verbs discoverable from a phase's liveness (21a, D-03; 50-12) —
 /// the pure, testable counterpart to `status`'s hints. STALE names
 /// `devflow stop` (it ends the orphaned agent group and removes the socket)
 /// and then `devflow resume`; GONE while active names `devflow resume`, plus
-/// `devflow advance` when the phase is gate-pending (answer the gate, then
-/// advance — widening that predicate risks suggesting `advance` where
-/// nothing proves it is right, per 21-CONTEXT.md's Review Incorporation); a
-/// failed probe names the socket to inspect. Empty for ALIVE, a stopped
-/// GONE and NotLaunched.
+/// `devflow ship` when the Ship gate is pending, the one stage whose stored answer
+/// `ship_override` applies (D-06). No hint names `devflow advance`: its gate open sets
+/// an earlier answer aside, so answering and then advancing loses the answer. A
+/// failed probe names the socket to inspect. A live pending supervisor names only
+/// `devflow stop` (criterion 2). A stopped phase names `devflow resume`, since nothing
+/// else continues it; a phase that never launched and is not stopped names nothing, and
+/// neither does ALIVE. A `start` that died before its run was prepared names `start`, as
+/// `resume` would refuse it ([`run_never_prepared`]). A stored Ship answer names `ship`
+/// instead of the `resume` that would set it aside ([`ship_answer_stored`]).
 fn recovery_hints(state: &State, liveness: &PhaseLiveness) -> Vec<String> {
     let phase = state.phase;
+    if run_never_prepared(state)
+        && matches!(
+            liveness,
+            PhaseLiveness::GoneWhileActive | PhaseLiveness::Gone | PhaseLiveness::NotLaunched
+        )
+    {
+        return vec![restart_verb(state)];
+    }
+    let stored = ship_answer_stored(state);
+    let continue_verb = if stored {
+        format!("devflow ship --phase {phase}")
+    } else {
+        format!("devflow resume --phase {phase}")
+    };
     match liveness {
-        PhaseLiveness::Stale => vec![
-            format!("devflow stop --phase {phase}"),
-            format!("devflow resume --phase {phase}"),
-        ],
+        PhaseLiveness::LaunchPending { .. } => vec![format!("devflow stop --phase {phase}")],
+        PhaseLiveness::HeldNoSocket { .. } => vec![HELD_NO_SOCKET_REPAIR.to_string()],
+        PhaseLiveness::Stale => vec![format!("devflow stop --phase {phase}"), continue_verb],
         PhaseLiveness::GoneWhileActive => {
-            let mut hints = vec![format!("devflow resume --phase {phase}")];
-            if state.gate_pending {
-                hints.push(format!("devflow advance --phase {phase}"));
+            let mut hints = vec![continue_verb];
+            if !stored && state.gate_pending && state.stage == Stage::Ship {
+                hints.push(format!("devflow ship --phase {phase}"));
             }
             hints
         }
@@ -1156,6 +1609,9 @@ fn recovery_hints(state: &State, liveness: &PhaseLiveness) -> Vec<String> {
             vec![format!(
                 "the probe failed ({why}); inspect the socket at {socket}"
             )]
+        }
+        PhaseLiveness::Gone | PhaseLiveness::NotLaunched if state.stopped => {
+            vec![continue_verb]
         }
         PhaseLiveness::Alive { .. } | PhaseLiveness::Gone | PhaseLiveness::NotLaunched => {
             Vec::new()
@@ -1174,6 +1630,154 @@ fn render_stage_progress_line(stage: Stage, stage_launched_ts: Option<u64>) -> S
             recover::format_age(&ts.to_string())
         ),
         None => format!("  in stage {stage}"),
+    }
+}
+
+/// `status`'s lines about a phase's supervisor. 50-12: liveness comes from the
+/// recorded socket, never a pid, and a live pending supervisor is named by its own
+/// socket. `status` speaks only about the operator's own project, so it names the
+/// socket path (doctor does not, T-18-01). An abandoned reservation gets a note.
+fn status_supervisor_lines(
+    project_root: &Path,
+    state: &State,
+    liveness: &PhaseLiveness,
+) -> Vec<String> {
+    let pending = state.pending_supervisor.as_ref();
+    let live_pending = matches!(liveness, PhaseLiveness::LaunchPending { .. });
+    let socket = pending
+        .filter(|_| live_pending)
+        .map(|pending| &pending.socket_path)
+        .or(state.supervisor.as_ref().map(|record| &record.socket_path))
+        .map_or_else(|| "none".to_string(), |path| path.display().to_string());
+    let mut lines = vec![format!("  supervisor: {socket} — {}", liveness.describe())];
+    if let Some(pending) = pending.filter(|_| !live_pending) {
+        lines.push(format!(
+            "  note: launch reservation {} is abandoned (no process holds it); the next launch \
+             clears it",
+            pending.launch_id
+        ));
+    }
+    match workflow::write_lock_status(project_root, state.phase) {
+        Ok(status) => lines.extend(write_lock_line(&status)),
+        Err(error) => lines.push(format!("  state write lock: could not be read ({error})")),
+    }
+    lines
+}
+
+/// `status`'s repair lines for a phase. The live agent is looked up only when no
+/// supervisor of the phase is live (D-19).
+fn status_hint_lines(project_root: &Path, state: &State, liveness: &PhaseLiveness) -> Vec<String> {
+    let live_agent = no_supervisor_live(liveness)
+        .then(|| live_phase_agent(project_root, state))
+        .flatten();
+    status_hints(state, liveness, live_agent.as_ref())
+        .into_iter()
+        .map(|hint| format!("    → {hint}"))
+        .collect()
+}
+
+/// Whether `liveness` says no supervisor of the phase is live: the states D-19 names.
+fn no_supervisor_live(liveness: &PhaseLiveness) -> bool {
+    matches!(
+        liveness,
+        PhaseLiveness::Gone | PhaseLiveness::GoneWhileActive | PhaseLiveness::NotLaunched
+    )
+}
+
+/// A phase's agent still running with no live supervisor (D-19).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LiveAgent {
+    /// The agent's pid, which leads its own process group.
+    pub(crate) pid: u32,
+    /// Whether the recorded start time confirms it is this phase's agent. An
+    /// unconfirmed pid comes only from the agent pid file and may have been reused.
+    pub(crate) confirmed: bool,
+}
+
+/// The phase's agent, if it runs: the recorded supervisor's agent group in this boot,
+/// confirmed by its start time; else a live pid in the agent pid file, the launch guard's
+/// own predicate, which a reused pid can satisfy. Reads no socket, so callers ask only
+/// when no supervisor is live. Pid 0 or 1 is never returned, because the caller prints it
+/// as a process group to signal.
+pub(crate) fn live_phase_agent(project_root: &Path, state: &State) -> Option<LiveAgent> {
+    let is_group = |pid: &u32| *pid > 1;
+    if let Some(record) = &state.supervisor
+        && is_group(&record.agent_pgid)
+        && supervisor::boot_id().as_deref() == Some(record.boot_id.as_str())
+        && agent::agent_running(record.agent_pgid)
+        && agent::is_same_process(record.agent_pgid, record.agent_start_time)
+    {
+        return Some(LiveAgent {
+            pid: record.agent_pgid,
+            confirmed: true,
+        });
+    }
+    agent_pid_from_file(project_root, state.phase)
+        .filter(is_group)
+        .filter(|&pid| agent::agent_running(pid))
+        .map(|pid| LiveAgent {
+            pid,
+            confirmed: false,
+        })
+}
+
+/// What to do about a live agent with no live supervisor (D-19). Only the operator
+/// signals it; an unconfirmed pid comes with the check to run first.
+pub(crate) fn orphaned_agent_line(phase: PhaseId, agent: &LiveAgent) -> String {
+    let pid = agent.pid;
+    if agent.confirmed {
+        format!(
+            "phase {phase}'s agent (pid {pid}) is still running with no live supervisor (its \
+             supervisor was killed or its socket is gone); `devflow stop` cannot end it (backlog \
+             999.170) — end its process group by hand with `kill -TERM -- -{pid}`, then run \
+             `devflow status`"
+        )
+    } else {
+        format!(
+            "pid {pid} from .devflow/phase-{padded}-agent-pid is alive and no supervisor of phase \
+             {phase} is live; it may be the phase's orphaned agent or an unrelated process that \
+             reused the pid — check it with `ps -o pid,pgid,lstart,args -p {pid}`, and if it is \
+             the agent end its process group with `kill -TERM -- -{pid}`; `devflow stop` cannot \
+             end it (backlog 999.170), and `devflow start`/`resume` refuse while it lives",
+            padded = phase.padded()
+        )
+    }
+}
+
+/// The repairs `status` prints: the manual kill while an agent outlives its supervisor
+/// (D-19), since the launch guard refuses the `resume` it would otherwise name; else
+/// [`recovery_hints`].
+fn status_hints(
+    state: &State,
+    liveness: &PhaseLiveness,
+    live_agent: Option<&LiveAgent>,
+) -> Vec<String> {
+    match live_agent {
+        Some(agent) if no_supervisor_live(liveness) => {
+            vec![orphaned_agent_line(state.phase, agent)]
+        }
+        _ => recovery_hints(state, liveness),
+    }
+}
+
+/// How to judge one reading of the state write lock, which `status` and `doctor` take
+/// once and do not time. The bounds are the holds D-08 allows (R2-12).
+const WRITE_LOCK_HOLD_NOTE: &str = "a state write usually takes milliseconds, but a stalled gate \
+     lock or a socket dying mid-ping can stretch it to about 10 s in a gate answer, 13 s while \
+     `recover` decides a phase and 16 s in a reservation; a hold past 20 s is the fault";
+
+/// `status`'s line for a held state write lock (R-03); `None` when it is free.
+pub(crate) fn write_lock_line(status: &workflow::WriteLockStatus) -> Option<String> {
+    match status {
+        workflow::WriteLockStatus::Free => None,
+        workflow::WriteLockStatus::Held { pid: Some(pid) } => Some(format!(
+            "  state write lock: held by pid {pid} — {WRITE_LOCK_HOLD_NOTE}: that process is \
+             stuck (`ps -p {pid}`)"
+        )),
+        workflow::WriteLockStatus::Held { pid: None } => Some(format!(
+            "  state write lock: held by an unknown holder — {WRITE_LOCK_HOLD_NOTE}: that process \
+             is stuck"
+        )),
     }
 }
 
@@ -1232,15 +1836,10 @@ pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
                 }
                 None => println!("  agent_pid: none"),
             }
-            // 50-12: liveness comes from the recorded socket, never a pid.
-            // `status` speaks only about the operator's own project, so it
-            // names the socket path (doctor does not, T-18-01).
             let phase_liveness = probe_phase(state);
-            let socket = state.supervisor.as_ref().map_or_else(
-                || "none".to_string(),
-                |record| record.socket_path.display().to_string(),
-            );
-            println!("  supervisor: {socket} — {}", phase_liveness.describe());
+            for line in status_supervisor_lines(project_root, state, &phase_liveness) {
+                println!("{line}");
+            }
             let phase_summary = last_events.remove(&state.phase);
             println!(
                 "{}",
@@ -1249,8 +1848,8 @@ pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
                     phase_summary.as_ref().and_then(|s| s.stage_launched_ts)
                 )
             );
-            for hint in recovery_hints(state, &phase_liveness) {
-                println!("    → {hint}");
+            for line in status_hint_lines(project_root, state, &phase_liveness) {
+                println!("{line}");
             }
             if let Some(summary) = phase_summary {
                 let ago = summary
@@ -1269,6 +1868,9 @@ pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
         .as_secs();
     if let Some(banner) = render_pending_gate_banner(&Gates::list_open(project_root), now) {
         println!("\n{banner}");
+    }
+    if let Some(block) = render_set_aside_answers(&Gates::quarantined(project_root)) {
+        println!("\n{block}");
     }
     print_open_branches(project_root);
     print_worktrees(project_root, current_worktree.as_deref());
@@ -1410,21 +2012,42 @@ pub(crate) fn gate_list(project_root: &Path, all_roots: bool) -> Result<(), CliE
         println!("no open gates");
         return Ok(());
     }
-    println!("{:<6} {:<9} {:<9} CONTEXT", "PHASE", "STAGE", "AGE");
-    for gate in &open {
+    println!("{}", render_gate_list(&open));
+    println!(
+        "\nanswer with: devflow gate approve <phase> [--gate-id <id>] [--note ...] | \
+         devflow gate reject <phase> [--gate-id <id>] --note ... (note with \"abort\" ends the phase)"
+    );
+    Ok(())
+}
+
+/// Pure render of [`gate_list`]'s table, so what it shows is testable without
+/// capturing process stdout.
+fn render_gate_list(open: &[OpenGate]) -> String {
+    let mut table = format!(
+        "{:<6} {:<9} {:<9} {:<16} CONTEXT",
+        "PHASE", "STAGE", "AGE", "GATE ID"
+    );
+    for gate in open {
         let context = render_gate_context(&gate.context, 100);
-        println!(
-            "{:<6} {:<9} {:<9} {context}",
+        table.push_str(&format!(
+            "\n{:<6} {:<9} {:<9} {:<16} {context}",
             gate.phase,
             gate.stage.to_string(),
             recover::format_age(&gate.timestamp),
-        );
+            printable_gate_id(gate),
+        ));
     }
-    println!(
-        "\nanswer with: devflow gate approve <phase> [--note ...] | \
-         devflow gate reject <phase> --note ... (note with \"abort\" ends the phase)"
-    );
-    Ok(())
+    table
+}
+
+/// A gate's id for display. The gate file is untrusted text, so only a well-formed
+/// id reaches the terminal; `-` stands for a missing or malformed one.
+fn printable_gate_id(gate: &OpenGate) -> &str {
+    if is_gate_id(&gate.gate_id) {
+        &gate.gate_id
+    } else {
+        "-"
+    }
 }
 
 /// The `--all-roots` half of [`gate_list`]: fan out `Gates::list_open`
@@ -1446,7 +2069,10 @@ fn gate_list_all_roots() -> Result<(), CliError> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    println!("{:<6} {:<9} {:<9} ROOT / CONTEXT", "PHASE", "STAGE", "AGE");
+    println!(
+        "{:<6} {:<9} {:<9} {:<16} ROOT / CONTEXT",
+        "PHASE", "STAGE", "AGE", "GATE ID"
+    );
     for (root, gate) in &rows {
         println!("{}", render_all_roots_gate_row(root, gate, now));
     }
@@ -1460,10 +2086,11 @@ fn gate_list_all_roots() -> Result<(), CliError> {
 fn render_all_roots_gate_row(root: &Path, gate: &OpenGate, now: u64) -> String {
     let context = render_gate_context(&gate.context, 100);
     format!(
-        "{:<6} {:<9} {:<9} {}\n           {context}",
+        "{:<6} {:<9} {:<9} {:<16} {}\n           {context}",
         gate.phase,
         gate.stage.to_string(),
         render_gate_age(&gate.timestamp, now),
+        printable_gate_id(gate),
         root.display(),
     )
 }
@@ -1521,28 +2148,32 @@ fn resolve_single_open_gate_stage(open: &[OpenGate], phase: PhaseId) -> Result<S
     }
 }
 
+/// Answer the gate the operator observed: the id they passed, or the id of the
+/// stage's open gate in this command's one [`Gates::list_open`] read. The id is
+/// fixed here and only re-checked afterwards, so a decision about one gate cannot
+/// land on the next (D-04).
 pub(crate) fn gate_respond(
     project_root: &Path,
     phase: PhaseId,
     stage: Option<Stage>,
     approved: bool,
     note: Option<String>,
+    observed_gate_id: Option<String>,
 ) -> Result<(), CliError> {
+    // A malformed id is refused before anything is read, so it can never name a
+    // path (T-50.1-42).
+    let given_gate_id = observed_gate_id.as_deref().map(GateId::parse).transpose()?;
+    let open = Gates::list_open(project_root);
     let stage = match stage {
         Some(stage) => stage,
-        None => resolve_single_open_gate_stage(&Gates::list_open(project_root), phase)?,
+        None => resolve_single_open_gate_stage(&open, phase)?,
     };
-    let holder_before_response = lock::holder_status(project_root, phase);
-    // Ship's stored-response exception is for `NoHolder` alone (T-48-16-03);
-    // a recycled pid is an unrelated process, not manual-recovery territory.
-    let ship_without_holder =
-        stage == Stage::Ship && matches!(holder_before_response, lock::HolderStatus::NoHolder);
-    if !holder_before_response.may_be_waiting() && !ship_without_holder {
-        return Err(CliError::Message(format!(
-            "no confirmed waiter holds phase {phase}'s lock for {stage}; no response was written. {}",
-            no_waiter_repair(phase, stage)
-        )));
-    }
+    let observed = match given_gate_id {
+        Some(gate_id) => gate_id,
+        None => open_gate_id_at_stage(&open, phase, stage)?,
+    };
+    require_gate_file_names(project_root, phase, stage, &observed)?;
+    refuse_a_gate_with_no_waiter(project_root, phase, stage, &observed)?;
     let responded_by = std::env::var("USER")
         .ok()
         .filter(|user| !user.is_empty())
@@ -1552,26 +2183,26 @@ pub(crate) fn gate_respond(
         note,
         responded_by: Some(responded_by),
     };
-    let path = Gates::respond(project_root, phase, stage, &response)?;
+    let path = Gates::answer(project_root, phase, stage, &observed, &response)
+        .map_err(gate_answer_error)?;
     events::emit(
         project_root,
         phase,
         "gate_response_written",
         serde_json::json!({
             "stage": stage.to_string(),
+            "gate_id": observed.as_str(),
             "approved": approved,
             "via": "cli",
         }),
     );
-    let holder_after_response = lock::holder_status(project_root, phase);
-    let pickup = match holder_after_response {
-        lock::HolderStatus::Live { .. } => {
-            response_pickup_message(stage, holder_after_response).to_owned()
-        }
-        _ => format!(
-            "response was written, but no confirmed live holder will act. {}",
+    let pickup = if waiter_is_live(project_root, phase, stage, &observed) {
+        response_pickup_message(stage, WaiterStatus::Live).to_owned()
+    } else {
+        format!(
+            "response was written, but no registered waiter will act. {}",
             no_waiter_repair(phase, stage)
-        ),
+        )
     };
     println!(
         "{} gate for phase {phase} {stage} — response was written; {pickup} (response at {})",
@@ -1581,8 +2212,173 @@ pub(crate) fn gate_respond(
     Ok(())
 }
 
+/// The id of the open gate at `phase` + `stage`, from an already-fetched listing.
+fn open_gate_id_at_stage(
+    open: &[OpenGate],
+    phase: PhaseId,
+    stage: Stage,
+) -> Result<GateId, CliError> {
+    let gate = open
+        .iter()
+        .find(|gate| gate.phase == phase && gate.stage == stage)
+        .ok_or(GateError::NoOpenGate { phase, stage })?;
+    GateId::parse(&gate.gate_id).map_err(|_| {
+        CliError::Message(format!(
+            "phase {phase} {stage}'s gate file has no valid gate id, so it cannot be answered; \
+             no response was written. {}",
+            no_waiter_repair(phase, stage)
+        ))
+    })
+}
+
+/// The id the stage's gate file names, or `None` with no gate file.
+pub(crate) fn gate_file_id(
+    project_root: &Path,
+    phase: PhaseId,
+    stage: Stage,
+) -> Result<Option<String>, GateError> {
+    match std::fs::read_to_string(Gates::gate_path(project_root, phase, stage)) {
+        Ok(contents) => Ok(Some(serde_json::from_str::<GateFile>(&contents)?.gate_id)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Refuse unless the gate file still names `observed`. This runs before any
+/// liveness read: a stale id's registration is normally gone once its gate closed
+/// (its waiter finishes it, and `close` removes only abandoned ones), so reading
+/// liveness first would report a changed gate as a missing waiter, or, while the
+/// old waiter still lives, as a live one.
+fn require_gate_file_names(
+    project_root: &Path,
+    phase: PhaseId,
+    stage: Stage,
+    observed: &GateId,
+) -> Result<(), CliError> {
+    match gate_file_id(project_root, phase, stage)? {
+        None => Err(GateError::NoOpenGate { phase, stage }.into()),
+        Some(current) if current == observed.as_str() => Ok(()),
+        Some(current) => Err(CliError::Message(gate_changed_message(
+            phase,
+            stage,
+            observed.as_str(),
+            &current,
+        ))),
+    }
+}
+
+fn gate_changed_message(phase: PhaseId, stage: Stage, observed: &str, current: &str) -> String {
+    format!(
+        "phase {phase} {stage} is at gate {current}, not gate {observed}; nothing was written — \
+         run `devflow gate list` and answer again"
+    )
+}
+
+/// What a writer that listed a gate may do with that listing.
+enum ListedGate {
+    /// The gate file still names this id: it may answer it.
+    Current(GateId),
+    /// The listing's id is empty or malformed (a gate file with no id at all does
+    /// not parse, so it is never listed): no answer can bind to it.
+    NoValidId,
+    /// The gate file no longer names the listed id, or cannot be read.
+    Changed,
+}
+
+/// Compare a listed gate with the gate file, before any liveness read (see
+/// [`require_gate_file_names`] for why).
+fn classify_listed_gate(project_root: &Path, gate: &OpenGate) -> ListedGate {
+    let Ok(listed) = GateId::parse(&gate.gate_id) else {
+        return ListedGate::NoValidId;
+    };
+    match gate_file_id(project_root, gate.phase, gate.stage) {
+        Ok(Some(current)) if current == listed.as_str() => ListedGate::Current(listed),
+        Ok(_) => ListedGate::Changed,
+        Err(error) => {
+            eprintln!(
+                "warning: could not read phase {} {}'s gate file: {error}",
+                gate.phase, gate.stage
+            );
+            ListedGate::Changed
+        }
+    }
+}
+
+/// The liveness half of [`gate_respond`] (D-04). With no registered waiter, a Ship
+/// answer is still stored for `devflow ship`; any other stage has nothing to act on it.
+fn refuse_a_gate_with_no_waiter(
+    project_root: &Path,
+    phase: PhaseId,
+    stage: Stage,
+    observed: &GateId,
+) -> Result<(), CliError> {
+    if stage == Stage::Ship || waiter_is_live(project_root, phase, stage, observed) {
+        return Ok(());
+    }
+    Err(CliError::Message(format!(
+        "no registered waiter for phase {phase} {stage}; no response was written. {}",
+        no_waiter_repair(phase, stage)
+    )))
+}
+
+/// What the operator is told when [`Gates::answer`] refuses or sets aside.
+fn gate_answer_error(error: GateError) -> CliError {
+    match error {
+        GateError::GateIdMismatch {
+            phase,
+            stage,
+            observed,
+            current,
+        } => CliError::Message(gate_changed_message(phase, stage, &observed, &current)),
+        GateError::GateClosedAfterPublish {
+            phase,
+            stage,
+            observed,
+        } => CliError::Message(format!(
+            "the answer for gate {observed} at phase {phase} {stage} was published after that \
+             gate closed: it has been set aside; nothing will act on it, unless that gate's \
+             waiter consumed it before it closed — run `devflow gate list`"
+        )),
+        other => other.into(),
+    }
+}
+
+/// Whether `observed`'s gate has a live waiter: its registration reads live, and
+/// nothing else counts (D-04).
+///
+/// A writer may read the registration the instant it sees a gate file, because
+/// every waiter registers before it publishes ([`Gates::open_registered`], which
+/// every gate wait uses from 50.1-14).
+fn waiter_is_live(project_root: &Path, phase: PhaseId, stage: Stage, observed: &GateId) -> bool {
+    match Gates::waiter_status(project_root, phase, stage, observed) {
+        Ok(status) => status == WaiterStatus::Live,
+        Err(error) => {
+            eprintln!(
+                "warning: could not probe the waiter registration of phase {phase} {stage} \
+                 gate {observed}: {error}"
+            );
+            false
+        }
+    }
+}
+
 /// Operator recovery for a gate with no confirmed consumer. Ship is special:
 /// its answer remains the input to the explicit `devflow ship` workflow.
+/// [`no_waiter_repair`] for `stop`'s own lines. `stop` goes on to the supervisor's socket,
+/// and while a supervisor of the phase is live a `resume` would refuse (criterion 2).
+fn stop_no_waiter_repair(project_root: &Path, phase: PhaseId, stage: Stage) -> String {
+    let supervisor_live = workflow::load_state(project_root, phase).is_ok_and(|state| {
+        matches!(
+            probe_phase(&state),
+            PhaseLiveness::Alive { .. } | PhaseLiveness::LaunchPending { .. }
+        )
+    });
+    if supervisor_live && stage != Stage::Ship {
+        return format!("Stopping phase {phase}'s live supervisor through its socket instead.");
+    }
+    no_waiter_repair(phase, stage)
+}
+
 fn no_waiter_repair(phase: PhaseId, stage: Stage) -> String {
     match stage {
         Stage::Ship => {
@@ -1596,15 +2392,12 @@ fn no_waiter_repair(phase: PhaseId, stage: Stage) -> String {
 
 /// Conservative post-publication wording. The second status observation only
 /// narrows the message race; it cannot establish a waiter's lifetime.
-fn response_pickup_message(stage: Stage, status: lock::HolderStatus) -> &'static str {
+fn response_pickup_message(stage: Stage, status: WaiterStatus) -> &'static str {
     match status {
-        lock::HolderStatus::Live { .. } => {
-            "a live lock holder may pick up this response; this is not a lifetime guarantee"
+        WaiterStatus::Live => {
+            "a registered waiter may pick up this response; this is not a lifetime guarantee"
         }
-        lock::HolderStatus::Unconfirmable { .. } => {
-            "a process holds the lock but its identity cannot be confirmed; no waiter is claimed"
-        }
-        lock::HolderStatus::NoHolder | lock::HolderStatus::Recycled { .. } => {
+        WaiterStatus::Absent => {
             if stage == Stage::Ship {
                 "no confirmed waiter remains; use `devflow ship --phase` for Ship recovery"
             } else {
@@ -1616,7 +2409,7 @@ fn response_pickup_message(stage: Stage, status: lock::HolderStatus) -> &'static
 
 /// Answer or report every aged, unattended gate across every registered root
 /// (or a single `root`, when given) — the acting half of 23b's bound gate
-/// lifetime. Never signals any process; `Gates::reap` (structurally
+/// lifetime. Never signals any process; `Gates::reap_answer` (structurally
 /// incapable of approving, T-23-41) is the ONLY write path, so the sweep's
 /// sole effect on the world is written bytes a live poller was already
 /// watching for.
@@ -1624,8 +2417,8 @@ fn response_pickup_message(stage: Stage, status: lock::HolderStatus) -> &'static
 /// `GateError::NoOpenGate`/`AlreadyResponded` are treated as benign races —
 /// a human or `--yes-ship` may have answered the same gate between
 /// `list_open` and `reap` — and counted as skipped rather than returned as
-/// an error; `Gates::respond`'s own refusal to clobber an unconsumed
-/// response is the first-writer-wins resolution that makes this safe with
+/// an error; `Gates::reap_answer`'s own refusal to clobber an unconsumed
+/// answer is the first-writer-wins resolution that makes this safe with
 /// no new coordination code. Every successful reap emits `gate_reaped` in
 /// this process (the audit trail half — `run_gate_with_timeout`'s own
 /// `gate_resolved` fires independently in the target process when it picks
@@ -1674,70 +2467,17 @@ pub(crate) fn gate_sweep(
                 left_alone += 1;
                 continue;
             }
-            let holder_before_reap = lock::holder_status(project_root, gate.phase);
-            if !gate_sweep_may_reap(gate.stage, holder_before_reap) {
-                left_alone += 1;
-                println!(
-                    "left phase {} {} alone at {} — no confirmed waiter; {}",
-                    gate.phase,
-                    gate.stage,
-                    project_root.display(),
-                    no_waiter_repair(gate.phase, gate.stage)
-                );
-                continue;
-            }
-            if dry_run {
-                reaped += 1;
-                println!(
-                    "would reap phase {} {} (age {age}s) at {}",
-                    gate.phase,
-                    gate.stage,
-                    project_root.display()
-                );
-                continue;
-            }
-            match Gates::reap(
-                project_root,
-                gate.phase,
-                gate.stage,
-                "abort: reaped by devflow gate sweep (unattended gate exceeded max age)",
-                "devflow-reap",
-            ) {
-                Ok(_) => {
-                    reaped += 1;
-                    events::emit(
-                        project_root,
-                        gate.phase,
-                        "gate_reaped",
-                        serde_json::json!({
-                            "stage": gate.stage.to_string(),
-                            "age_secs": age,
-                            "max_age_secs": threshold,
-                        }),
-                    );
-                    println!(
-                        "reaped phase {} {} (age {age}s) at {}",
-                        gate.phase,
-                        gate.stage,
-                        project_root.display()
-                    );
-                }
-                Err(err) => {
-                    skipped += 1;
-                    println!(
-                        "skipped phase {} {} at {} — already answered ({err})",
-                        gate.phase,
-                        gate.stage,
-                        project_root.display()
-                    );
-                }
+            match sweep_one_gate(project_root, &gate, age, threshold, dry_run)? {
+                SweepStep::Reaped => reaped += 1,
+                SweepStep::Skipped => skipped += 1,
+                SweepStep::LeftAlone => left_alone += 1,
             }
         }
     }
 
     // 999.44/DEN-68: opt-in only. Registry-independent, so this pass is NOT
     // scoped to `roots` above — a stray by definition has no project root
-    // for any registry entry, lock file, or state file to name, which is
+    // for any registry entry, held file, or state file to name, which is
     // exactly why the census above cannot see it either. Extends the SAME
     // reaped/skipped/left-alone counters and dry-run summary line rather
     // than printing a second, separate report.
@@ -1754,7 +2494,8 @@ pub(crate) fn gate_sweep(
         if !explicit_root.is_empty() {
             println!(
                 "note: --root does not scope this stray pass -- a stray has no project root \
-                 for any registry entry, lock file, or state file to name, so discovery and \
+                 for any registry entry, held liveness, gate-registration or foreground-holder \
+                 file, or state file to name, so discovery and \
                  reaping are always machine-wide; the reachability safety filter is also \
                  computed across every registered root regardless of --root, deliberately, \
                  because narrowing it would leave other projects' live processes unprotected"
@@ -1854,8 +2595,103 @@ pub(crate) fn gate_sweep(
     Ok(())
 }
 
-fn gate_sweep_may_reap(_stage: Stage, holder: lock::HolderStatus) -> bool {
-    matches!(holder, lock::HolderStatus::Live { .. })
+fn gate_sweep_may_reap(_stage: Stage, waiter_live: bool) -> bool {
+    waiter_live
+}
+
+/// What the sweep did with one aged gate it listed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SweepStep {
+    /// Answered with an abort, or, under `--dry-run`, would have been.
+    Reaped,
+    /// Not answered: answered already, changed since it was listed, or unanswerable.
+    Skipped,
+    /// Not answered: nothing is waiting on it.
+    LeftAlone,
+}
+
+/// The sweep's per-gate step, for the gate as it was listed: compare its id with
+/// the gate file, read its waiter, then answer that id and no other.
+///
+/// A held gate lock ends the sweep rather than being reported as a skip, and so does an
+/// answer published while the lock stayed held: later gates are never reported reaped
+/// past one the sweep could not settle.
+fn sweep_one_gate(
+    project_root: &Path,
+    gate: &OpenGate,
+    age: u64,
+    threshold: u64,
+    dry_run: bool,
+) -> Result<SweepStep, CliError> {
+    let at = project_root.display();
+    let (phase, stage) = (gate.phase, gate.stage);
+    let observed = match classify_listed_gate(project_root, gate) {
+        ListedGate::Current(observed) => observed,
+        ListedGate::NoValidId => {
+            println!(
+                "skipped phase {phase} {stage} at {at} — its gate file has no valid gate id; not reaped"
+            );
+            return Ok(SweepStep::Skipped);
+        }
+        ListedGate::Changed => {
+            println!(
+                "skipped phase {phase} {stage} at {at} — gate changed since it was listed; not reaped"
+            );
+            return Ok(SweepStep::Skipped);
+        }
+    };
+    let waiter_live = waiter_is_live(project_root, phase, stage, &observed);
+    if !gate_sweep_may_reap(stage, waiter_live) {
+        println!(
+            "left phase {phase} {stage} alone at {at} — no confirmed waiter; {}",
+            no_waiter_repair(phase, stage)
+        );
+        return Ok(SweepStep::LeftAlone);
+    }
+    if dry_run {
+        println!("would reap phase {phase} {stage} (age {age}s) at {at}");
+        return Ok(SweepStep::Reaped);
+    }
+    match Gates::reap_answer(
+        project_root,
+        phase,
+        stage,
+        &observed,
+        "abort: reaped by devflow gate sweep (unattended gate exceeded max age)",
+        "devflow-reap",
+    ) {
+        Ok(_) => {
+            events::emit(
+                project_root,
+                phase,
+                "gate_reaped",
+                serde_json::json!({
+                    "stage": stage.to_string(),
+                    "age_secs": age,
+                    "max_age_secs": threshold,
+                }),
+            );
+            println!("reaped phase {phase} {stage} (age {age}s) at {at}");
+            Ok(SweepStep::Reaped)
+        }
+        Err(err @ GateError::GateIdMismatch { .. }) => {
+            println!(
+                "skipped phase {phase} {stage} at {at} — gate changed since it was listed; not reaped ({err})"
+            );
+            Ok(SweepStep::Skipped)
+        }
+        Err(err @ (GateError::AlreadyResponded { .. } | GateError::NoOpenGate { .. })) => {
+            println!("skipped phase {phase} {stage} at {at} — already answered ({err})");
+            Ok(SweepStep::Skipped)
+        }
+        Err(err @ (GateError::GateLockTimeout { .. } | GateError::PublishedUnconfirmed { .. })) => {
+            Err(err.into())
+        }
+        Err(err) => {
+            println!("skipped phase {phase} {stage} at {at} — {err}");
+            Ok(SweepStep::Skipped)
+        }
+    }
 }
 
 /// What became of one [`agent::StrayProcess`] candidate the opt-in
@@ -1931,7 +2767,7 @@ fn reap_stray_candidates(
         .map(|candidate| {
             // Re-confirm identity immediately before acting, closing the
             // discovery-to-signal TOCTOU window (999.47's "Related
-            // TOCTOU") — copies `stop_via_lock`'s fail-closed posture:
+            // TOCTOU") — copies `stop_via_holder`'s fail-closed posture:
             // refuse on any uncertainty, never signal on a mismatch.
             if !agent::is_same_process(candidate.pid, candidate.start_time) {
                 return StrayReapResult {
@@ -1980,7 +2816,11 @@ fn reap_stray_candidates(
         .collect()
 }
 
-type AnsweredGate = (Stage, lock::HolderStatus, Option<(u32, Option<u64>)>);
+/// The gate [`stop_via_gate`] answered, and the launch the state named as that run's
+/// supervisor when it read the gate as current. `stop` keeps the launch id in its list of
+/// launches it addressed. The flag says the abort was published but its gate may have
+/// closed first, so no waiter may ever act on it.
+type AnsweredGate = (Stage, GateId, Option<String>, bool);
 
 /// End a running phase cleanly (23c, D-04, D-06): the one teardown verb, at
 /// every point of a run, that never claims a stop it did not perform.
@@ -1991,11 +2831,18 @@ type AnsweredGate = (Stage, lock::HolderStatus, Option<(u32, Option<u64>)>);
 ///    ([`stop_via_socket`]): the state's `supervisor` record names it, or,
 ///    when the state records none, is missing or does not load, the one live
 ///    sidecar-found socket for this root and phase. Its probe picks the arm:
-///    ALIVE gets a `shutdown`, which ends a run that holds no per-phase lock
-///    (999.138).
+///    ALIVE gets a `shutdown` (999.138).
 /// 3. Only when no live socket remains (GONE, or nothing recorded) does the
-///    identity-confirmed per-phase lock holder get signalled
-///    ([`stop_via_lock`]).
+///    identity-confirmed foreground holder of `.devflow/.holder-NN` get signalled
+///    ([`stop_via_holder`]). It catches the signal and ends at its next safe point
+///    (D-18), so `stop` waits for it, boundedly, and marks nothing while it runs. With no
+///    holder either, a phase agent that still runs is named with its manual kill, and
+///    nothing is signalled or marked (D-19).
+///
+/// A pending supervisor comes after the recorded one, whose own safe point 3 ends an
+/// unpublished successor: only its socket reaches it ([`stop_pending_launch`]), an
+/// abandoned reservation is cleared with a report, and a launcher still busy before its
+/// spawn is reached through the holder file ([`stop_pending_launcher`]).
 ///
 /// No pid read from state is ever signalled. `stopped` is recorded only for
 /// a stop performed or confirmed not live, and never into a state file that
@@ -2007,27 +2854,304 @@ pub(crate) fn stop(project_root: &Path, phase: PhaseId) -> Result<(), CliError> 
 /// [`stop`] with the cache dir whose `sock/` holds the sidecars it may
 /// search, so tests never sweep the operator's real cache.
 fn stop_in(project_root: &Path, phase: PhaseId, cache_dir: Option<&Path>) -> Result<(), CliError> {
-    let (gate_answered, gate_holder) = stop_via_gate(project_root, phase)?;
-    if gate_answered {
-        return persist_stopped_state(project_root, phase, gate_holder, false);
-    }
-    match stop_via_socket(project_root, phase, cache_dir)? {
-        SocketStop::NoLiveSocket => {
-            let signal_sent = stop_via_lock(project_root, phase)?;
-            persist_stopped_state(project_root, phase, None, signal_sent)
-        }
-        // The supervisor may still be releasing the per-phase lock as it
-        // exits, so wait it out like a signalled holder.
-        SocketStop::Ended => persist_stopped_state(project_root, phase, None, true),
-        SocketStop::EndedStateUnloadable(state_file) => {
-            println!(
-                "stop: phase {phase}'s state file {} does not load, so `stopped` was not \
-                 recorded — repair or remove it before `devflow resume --phase {phase}`",
-                state_file.display()
+    // The launches this stop ended, answered, cleared or found not live, and only those:
+    // no state read seeds it, so a launch none of the arms addressed blocks the mark.
+    let mut known_launches = Vec::new();
+    if let Some((_, _, run_launch, unconfirmed)) = stop_via_gate(project_root, phase)? {
+        if unconfirmed {
+            // Only the socket: signalling a foreground holder here would be a second
+            // action on top of the published abort (R2-04). The launch counts as addressed
+            // only if this arm addresses it.
+            note_socket_stop(
+                stop_via_socket(project_root, phase, cache_dir)?,
+                &mut known_launches,
             );
-            Ok(())
+        } else {
+            known_launches.extend(run_launch);
+        }
+        return persist_stopped_state(project_root, phase, false, &known_launches);
+    }
+    let socket_stop = stop_via_socket(project_root, phase, cache_dir)?;
+    if let SocketStop::EndedStateUnloadable(state_file) = &socket_stop {
+        println!(
+            "stop: phase {phase}'s state file {} does not load, so `stopped` was not \
+             recorded — repair or remove it before `devflow resume --phase {phase}`",
+            state_file.display()
+        );
+        return Ok(());
+    }
+    let mut ended = note_socket_stop(socket_stop, &mut known_launches);
+    let mut launcher_signalled = false;
+    if let Some(pending) = stop_pending_launch(project_root, phase, &mut known_launches)? {
+        ended |= pending == PendingStop::SupervisorEnded;
+        launcher_signalled = pending == PendingStop::LauncherSignalled;
+        // A launch promoted while `stop` waited on it is the recorded supervisor now.
+        ended |= note_socket_stop(
+            stop_via_socket(project_root, phase, cache_dir)?,
+            &mut known_launches,
+        );
+    }
+    if launcher_signalled {
+        return persist_stopped_state(project_root, phase, true, &known_launches);
+    }
+    if ended {
+        return persist_stopped_state(project_root, phase, false, &known_launches);
+    }
+    let signal_sent = stop_via_holder(project_root, phase)?;
+    persist_stopped_state(project_root, phase, signal_sent, &known_launches)
+}
+
+/// Add what one socket stop addressed to `known_launches`; whether it ended a run.
+fn note_socket_stop(stop: SocketStop, known_launches: &mut Vec<String>) -> bool {
+    match stop {
+        SocketStop::NoLiveSocket { gone } => {
+            known_launches.extend(gone);
+            false
+        }
+        SocketStop::Ended { launch_id } => {
+            known_launches.extend(launch_id);
+            true
+        }
+        SocketStop::EndedStateUnloadable(_) => true,
+    }
+}
+
+/// What the pending half of [`stop`] did about a launch the state names.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PendingStop {
+    /// No supervisor was ended and nothing was signalled, such as an abandoned reservation
+    /// that was cleared.
+    NothingEnded,
+    /// A pending supervisor was ended through its socket.
+    SupervisorEnded,
+    /// The launcher holding the reservation was signalled through the holder file, and it
+    /// has exited.
+    LauncherSignalled,
+}
+
+/// How long `stop` waits for a live pending supervisor to publish its socket: the
+/// supervisor's own publish wait (10 s, `PUBLISH_WAIT`, private to `devflow_core::monitor`)
+/// and a margin, so it outlasts a launch that is going to publish.
+const PENDING_PUBLISH_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// How often `stop` looks again during [`PENDING_PUBLISH_WAIT`].
+const PENDING_PUBLISH_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The pending half of [`stop`] (D-02), on a fresh read each pass: a socket that answers
+/// gets a `shutdown`; a held liveness lock with no answering socket is waited for
+/// (`Live`, never signalled, Phase 50 D-05/D-06); a STALE socket no lock vouches for goes
+/// to the backstop; with neither left, the reservation is abandoned and cleared. A live
+/// lock beats a STALE socket because the backstop is for a supervisor that is gone. When
+/// the wait expires, the launcher may simply be busy before its spawn, so it is reached
+/// through the holder file ([`stop_pending_launcher`]).
+///
+/// `Ok(None)` when the state names no pending launch, else what was done about it. The
+/// caller looks at the recorded socket again, since the record can end by promotion. A
+/// launch this ended or cleared joins `known_launches`.
+fn stop_pending_launch(
+    project_root: &Path,
+    phase: PhaseId,
+    known_launches: &mut Vec<String>,
+) -> Result<Option<PendingStop>, CliError> {
+    let mut outcome = None;
+    let mut ended = false;
+    let mut handed_off = 0;
+    let mut deadline = None;
+    loop {
+        let Some(pending) = workflow::load_state(project_root, phase)
+            .ok()
+            .and_then(|state| state.pending_supervisor)
+        else {
+            return Ok(outcome);
+        };
+        outcome = Some(if ended {
+            PendingStop::SupervisorEnded
+        } else {
+            PendingStop::NothingEnded
+        });
+        let located = LocatedSocket {
+            socket: pending.socket_path.clone(),
+            launch_id: Some(pending.launch_id.clone()),
+            record: None,
+            unloadable_state: None,
+            pending_recorded: true,
+        };
+        let socket = supervisor::probe(&located.socket)
+            .map_err(|error| probe_refusal(phase, &located.socket, &error))?;
+        let held = liveness::probe(&pending.liveness_path).map_err(|error| {
+            CliError::Message(format!(
+                "stop: could not read launch {}'s liveness lock ({error}); nothing was signalled \
+                 or recorded",
+                pending.launch_id
+            ))
+        })?;
+        match (socket, held) {
+            (supervisor::Liveness::Alive(_), _) => match shutdown_supervisor(phase, &located)? {
+                ShutdownResult::Ended => {
+                    ended = true;
+                    deadline = None;
+                    known_launches.push(pending.launch_id.clone());
+                }
+                ShutdownResult::AcceptedPending => {
+                    known_launches.push(pending.launch_id.clone());
+                    return Ok(Some(PendingStop::SupervisorEnded));
+                }
+                ShutdownResult::Relocate => {}
+                ShutdownResult::HandedOff => {
+                    handed_off += 1;
+                    if handed_off >= MAX_SHUTDOWN_REQUESTS {
+                        return Err(CliError::Message(format!(
+                            "stop: launch {} answered `handed_off` to {handed_off} shutdown \
+                             requests; nothing was recorded — run `devflow status` and `devflow \
+                             stop --phase {phase}` again",
+                            pending.launch_id
+                        )));
+                    }
+                    std::thread::sleep(PENDING_PUBLISH_POLL);
+                }
+            },
+            (_, liveness::Held::Live) => {
+                let until = *deadline
+                    .get_or_insert_with(|| std::time::Instant::now() + PENDING_PUBLISH_WAIT);
+                if std::time::Instant::now() >= until {
+                    return if ended {
+                        Ok(Some(PendingStop::SupervisorEnded))
+                    } else {
+                        stop_pending_launcher(project_root, phase, &pending).map(Some)
+                    };
+                }
+                std::thread::sleep(PENDING_PUBLISH_POLL);
+            }
+            (supervisor::Liveness::Stale, _) => {
+                stop_stale_socket(phase, &located)?;
+                ended = true;
+                known_launches.push(pending.launch_id.clone());
+            }
+            (supervisor::Liveness::Gone, _) => {
+                if clear_abandoned_reservation(project_root, phase, &pending)? {
+                    known_launches.push(pending.launch_id.clone());
+                }
+                return Ok(Some(if ended {
+                    PendingStop::SupervisorEnded
+                } else {
+                    PendingStop::NothingEnded
+                }));
+            }
         }
     }
+}
+
+/// The expiry of [`stop_pending_launch`]'s wait: no socket came, and the pending liveness
+/// lock is still held. If a foreground launcher holds the phase, it is signalled, and it
+/// stops at safe point 2, before its spawn, or at safe point 3, shutting an unpublished
+/// supervisor down (D-02, D-18). The pending supervisor itself is reached only through
+/// its socket: the process signalled here is its launcher. With no holder, nothing is
+/// signalled and [`pending_not_published`] stands.
+fn stop_pending_launcher(
+    project_root: &Path,
+    phase: PhaseId,
+    pending: &PendingSupervisor,
+) -> Result<PendingStop, CliError> {
+    let unheld = matches!(
+        liveness::probe(&liveness::phase_holder_path(project_root, phase)),
+        Ok(liveness::Held::Abandoned | liveness::Held::Missing)
+    );
+    if unheld || !stop_via_holder(project_root, phase)? {
+        return Err(pending_not_published(phase, pending));
+    }
+    let launch_id = &pending.launch_id;
+    if !wait_for_holder_release(project_root, phase) {
+        return Err(CliError::Message(format!(
+            "{}; it gives its reservation for launch {launch_id} back itself at its next safe \
+             point, before its supervisor is spawned",
+            holder_still_running(project_root, phase)
+        )));
+    }
+    // The launcher has exited. Its own safe point gave the reservation back, or its exit
+    // released a lock that now reads abandoned. A lock still held belongs to a supervisor
+    // it spawned, and that is no stop to claim.
+    let fresh = workflow::load_state(project_root, phase)
+        .ok()
+        .and_then(|state| state.pending_supervisor)
+        .filter(|fresh| fresh.launch_id == *launch_id);
+    if let Some(fresh) = fresh {
+        let held = liveness::probe(&fresh.liveness_path);
+        if !matches!(
+            held,
+            Ok(liveness::Held::Abandoned | liveness::Held::Missing)
+        ) {
+            return Err(CliError::Message(format!(
+                "stop: phase {phase}'s signalled foreground holder exited, but launch {launch_id} \
+                 still holds its liveness lock and has not published a supervisor; phase state \
+                 was not marked stopped — run `devflow stop --phase {phase}` again"
+            )));
+        }
+        clear_abandoned_reservation(project_root, phase, &fresh)?;
+    }
+    Ok(PendingStop::LauncherSignalled)
+}
+
+/// `stop`'s refusal over a live pending lock with no socket by the end of the wait and
+/// no foreground launcher to reach. `stop` never signals an unpublished launch, so
+/// running it again repeats this while the holder lives: name the holder, from the
+/// lock's record, and the manual route instead.
+fn pending_not_published(phase: PhaseId, pending: &PendingSupervisor) -> CliError {
+    let launch_id = &pending.launch_id;
+    let lock = pending.liveness_path.display();
+    let holder = match liveness::live_holder(&pending.liveness_path) {
+        Ok(Some((pid, _))) => format!(
+            "pid {pid} holds its liveness lock {lock}; inspect it with `ps -o pid,lstart,args -p \
+             {pid}` and, if it is a stuck `devflow __monitor`, end it yourself, then run \
+             `devflow stop --phase {phase}` again to clear the reservation"
+        ),
+        _ => format!(
+            "its liveness lock {lock} is held, by a process its record does not name; end that \
+             process yourself, then run `devflow stop --phase {phase}` again to clear the \
+             reservation"
+        ),
+    };
+    CliError::Message(format!(
+        "stop: launch {launch_id} for phase {phase} is reserved by a live process and has not \
+         published a supervisor, and no foreground launcher holds the phase; nothing was \
+         signalled or recorded, because `stop` never signals an unpublished launch. {holder}"
+    ))
+}
+
+/// Clear a reservation nothing holds, if the fresh read still names it, then remove its
+/// liveness file and say so. R-03: `stop` is a repair verb, so a held write lock ends it
+/// within the bound, naming the holder, with nothing cleared. `true` when it cleared it.
+fn clear_abandoned_reservation(
+    project_root: &Path,
+    phase: PhaseId,
+    pending: &PendingSupervisor,
+) -> Result<bool, CliError> {
+    let cleared = workflow::update_state_with_within(
+        project_root,
+        phase,
+        workflow::WRITE_LOCK_REPAIR_WAIT,
+        |existing| {
+            let workflow::Existing::Loaded(mut state) = existing else {
+                return Ok::<_, CliError>((None, false));
+            };
+            let names_it = state
+                .pending_supervisor
+                .as_ref()
+                .is_some_and(|fresh| fresh.launch_id == pending.launch_id);
+            if !names_it {
+                return Ok((None, false));
+            }
+            state.pending_supervisor = None;
+            Ok((Some(state), true))
+        },
+    )?;
+    if cleared {
+        remove_abandoned_liveness_file(project_root, pending);
+        println!(
+            "stop: cleared the abandoned launch reservation {} (no process held it)",
+            pending.launch_id
+        );
+    }
+    Ok(cleared)
 }
 
 /// `devflow stop --phase N --launch <id>` (D-06): tear down only the
@@ -2039,7 +3163,7 @@ fn stop_in(project_root: &Path, phase: PhaseId, cache_dir: Option<&Path>) -> Res
 /// is missing or does not parse, whose file name carries it (RV-05b). If this
 /// project's state loads and records that same launch, the plain [`stop`]
 /// runs. Otherwise only that socket is acted on: no gate is answered, no
-/// lock holder signalled and no state written.
+/// holder signalled and no state written.
 pub(crate) fn stop_launch(
     project_root: &Path,
     phase: PhaseId,
@@ -2189,16 +3313,16 @@ fn shutdown_one_launch(subject: &str, entry: &supervisor::SweepEntry) -> Result<
         Ok(supervisor::ShutdownOutcome::Stopped {
             exit_code,
             advance_suppressed,
+            group_signalled,
         }) => {
-            let advance = if advance_suppressed {
-                "advance suppressed"
-            } else {
-                "advance not suppressed"
-            };
             println!(
-                "stop: stopped {subject} through its supervisor (agent group ended, exit code \
-                 {exit_code}, {advance})"
+                "{}",
+                stopped_line(subject, exit_code, advance_suppressed, group_signalled)
             );
+            return Ok(());
+        }
+        Ok(supervisor::ShutdownOutcome::AcceptedPending { owner }) => {
+            println!("{}", accepted_pending_line(subject, &owner));
             return Ok(());
         }
         Ok(supervisor::ShutdownOutcome::HandedOff) => {
@@ -2247,9 +3371,45 @@ fn stop_stale_launch(subject: &str, entry: &supervisor::SweepEntry) -> Result<()
     run_backstop(subject, &socket, sidecar, None, None)
 }
 
+/// `stop`'s line for a stop its supervisor confirmed (D-13 item 6). It claims a group ended
+/// only when the supervisor signalled one; otherwise the stop was honoured at an advance
+/// safe point and nothing was signalled.
+pub(crate) fn stopped_line(
+    subject: &str,
+    exit_code: i32,
+    advance_suppressed: bool,
+    group_signalled: bool,
+) -> String {
+    if !group_signalled {
+        return format!(
+            "stop: stopped {subject} through its supervisor (honoured at an advance safe point; \
+             nothing was signalled; exit code {exit_code})"
+        );
+    }
+    let advance = if advance_suppressed {
+        "advance suppressed"
+    } else {
+        "advance not suppressed"
+    };
+    format!(
+        "stop: stopped {subject} through its supervisor (agent group ended, exit code \
+         {exit_code}, {advance})"
+    )
+}
+
+/// `stop`'s line for a stop the supervisor accepted and has not confirmed yet (D-13 item 1).
+fn accepted_pending_line(subject: &str, owner: &str) -> String {
+    format!(
+        "stop: {subject}'s supervisor accepted the stop (owner {owner}) and its final answer did \
+         not arrive within {secs}s; it will honour the stop at its next safe point — `devflow \
+         status` shows when it has",
+        secs = shutdown_final_timeout().as_secs()
+    )
+}
+
 /// How long `stop` waits for a supervisor's final shutdown line: the
 /// supervisor's own terminate-and-verify wait, twice, then its wait for the
-/// per-phase lock before it records its stop and answers
+/// state write lock before it records its stop and answers
 /// ([`crate::pipeline_launch::SUPERVISOR_STOP_WAIT`]), plus time to persist.
 /// Shorter, and a busy lock reads a supervisor that did stop as one that did
 /// not answer.
@@ -2266,10 +3426,14 @@ const MAX_SHUTDOWN_REQUESTS: usize = 4;
 
 /// What [`stop_via_socket`] did.
 enum SocketStop {
-    /// No live supervisor socket: nothing recorded, or its probe says GONE.
-    NoLiveSocket,
-    /// The run was ended through its socket; record `stopped`.
-    Ended,
+    /// No live supervisor socket: nothing recorded, or its probe says GONE. `gone` is the
+    /// launch the GONE socket names, which this stop found not live; `None` when no socket
+    /// was located or it names no launch.
+    NoLiveSocket { gone: Option<String> },
+    /// The run was ended through its socket; record `stopped`. `None` when the socket
+    /// names no launch: nothing joins the known list, so a state that names the launch is
+    /// refused and the second `stop` finds it GONE.
+    Ended { launch_id: Option<String> },
     /// The run was ended through a sidecar-found socket, but the state file
     /// at this path exists and does not load, so nothing can be recorded.
     EndedStateUnloadable(PathBuf),
@@ -2278,12 +3442,18 @@ enum SocketStop {
 /// The supervisor socket `stop` addresses for a phase, and its provenance.
 struct LocatedSocket {
     socket: PathBuf,
+    /// The launch this socket belongs to: the state's record, else the sidecar, else the
+    /// socket's file name. `None` when none of them names one.
+    launch_id: Option<String>,
     /// The state's record, when the socket came from it (the backstop
     /// cross-checks the sidecar against it).
     record: Option<SupervisorRecord>,
     /// The state file, when it exists but does not load and the socket came
     /// from its sidecar.
     unloadable_state: Option<PathBuf>,
+    /// Whether the state names a pending launch. Until that is dealt with, no line
+    /// about this socket may call the phase resumable (criterion 2).
+    pending_recorded: bool,
 }
 
 /// Find the socket for a bare `stop`: the loaded state's `supervisor` record;
@@ -2295,26 +3465,29 @@ struct LocatedSocket {
 /// A loaded state with no record is swept because a `start` launcher saves
 /// the record only after its spawned supervisor has published: a stop in
 /// that window must end the supervisor through its socket, not signal the
-/// launcher (the lock holder), whose death would leave the supervisor and
+/// launcher (the foreground holder), whose death would leave the supervisor and
 /// its agent running unrecorded.
 fn locate_phase_socket(
     project_root: &Path,
     phase: PhaseId,
     cache_dir: Option<&Path>,
 ) -> Result<Option<LocatedSocket>, CliError> {
-    let unloadable_state = match workflow::load_state(project_root, phase) {
-        Ok(state) => match state.supervisor {
-            Some(record) => {
+    let (unloadable_state, pending_recorded) = match workflow::load_state(project_root, phase) {
+        Ok(state) => {
+            let pending_recorded = state.pending_supervisor.is_some();
+            if let Some(record) = state.supervisor {
                 return Ok(Some(LocatedSocket {
                     socket: record.socket_path.clone(),
+                    launch_id: Some(record.launch_id.clone()),
                     record: Some(record),
                     unloadable_state: None,
+                    pending_recorded,
                 }));
             }
-            None => None,
-        },
-        Err(workflow::WorkflowError::MissingState(_)) => None,
-        Err(_) => Some(workflow::state_path(project_root, phase)),
+            (None, pending_recorded)
+        }
+        Err(workflow::WorkflowError::MissingState(_)) => (None, false),
+        Err(_) => (Some(workflow::state_path(project_root, phase)), false),
     };
     let Some(cache_dir) = cache_dir else {
         return Ok(None);
@@ -2330,8 +3503,14 @@ fn locate_phase_socket(
         [] => Ok(None),
         [entry] => Ok(Some(LocatedSocket {
             socket: entry.socket_path.clone(),
+            launch_id: entry
+                .sidecar
+                .as_ref()
+                .map(|sidecar| sidecar.launch_id.clone())
+                .or_else(|| entry.launch_id_in_name.clone()),
             record: None,
             unloadable_state,
+            pending_recorded,
         })),
         several => Err(several_sockets_refusal(
             phase,
@@ -2407,7 +3586,7 @@ fn sweep_entry_stop_line(phase: PhaseId, entry: &supervisor::SweepEntry) -> Stri
 
 /// The socket arm of [`stop`]. Probes the located socket and acts on its
 /// state: ALIVE → `shutdown`; STALE → [`stop_stale_socket`]; GONE → nothing
-/// here (the caller falls back to the lock holder); a probe error → a
+/// here (the caller falls back to the foreground holder); a probe error → a
 /// refusal that reaches no teardown (R-6).
 ///
 /// A `handed_off` reply means the run moved to its successor: the state is
@@ -2422,17 +3601,22 @@ fn stop_via_socket(
     let mut handed_off = 0;
     for _ in 0..MAX_SHUTDOWN_REQUESTS {
         let Some(located) = locate_phase_socket(project_root, phase, cache_dir)? else {
-            return Ok(SocketStop::NoLiveSocket);
+            return Ok(SocketStop::NoLiveSocket { gone: None });
         };
         let ended = match supervisor::probe(&located.socket) {
-            Ok(supervisor::Liveness::Gone) => return Ok(SocketStop::NoLiveSocket),
+            Ok(supervisor::Liveness::Gone) => {
+                refuse_stop_beside_a_held_lock(project_root, phase, &located)?;
+                return Ok(SocketStop::NoLiveSocket {
+                    gone: located.launch_id,
+                });
+            }
             Err(error) => return Err(probe_refusal(phase, &located.socket, &error)),
             Ok(supervisor::Liveness::Stale) => {
                 stop_stale_socket(phase, &located)?;
                 true
             }
             Ok(supervisor::Liveness::Alive(_)) => match shutdown_supervisor(phase, &located)? {
-                ShutdownResult::Ended => true,
+                ShutdownResult::Ended | ShutdownResult::AcceptedPending => true,
                 ShutdownResult::Relocate => false,
                 ShutdownResult::HandedOff => {
                     handed_off += 1;
@@ -2443,7 +3627,9 @@ fn stop_via_socket(
         if ended {
             return Ok(match located.unloadable_state {
                 Some(state_file) => SocketStop::EndedStateUnloadable(state_file),
-                None => SocketStop::Ended,
+                None => SocketStop::Ended {
+                    launch_id: located.launch_id,
+                },
             });
         }
     }
@@ -2455,10 +3641,44 @@ fn stop_via_socket(
     )))
 }
 
+/// How long `stop` and the launch guards let a GONE socket's supervisor release its liveness
+/// lock: it unlinks its socket before it exits, and a shutdown just sent can land in that gap.
+const STOP_LOCK_RELEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Refuse to count a launch as gone while it still holds its liveness lock. `stop` has no
+/// socket to end it through, and marking the run `stopped` would claim it had.
+fn refuse_stop_beside_a_held_lock(
+    project_root: &Path,
+    phase: PhaseId,
+    located: &LocatedSocket,
+) -> Result<(), CliError> {
+    let Some(launch_id) = located.launch_id.as_deref() else {
+        return Ok(());
+    };
+    let Some(path) = liveness::launch_liveness_path(project_root, launch_id) else {
+        return Ok(());
+    };
+    let deadline = std::time::Instant::now() + STOP_LOCK_RELEASE_WAIT;
+    while let Some(holder) = held_liveness_holder(&path) {
+        if std::time::Instant::now() >= deadline {
+            return Err(CliError::Message(format!(
+                "stop: phase {phase} launch {launch_id} ({holder}): `devflow stop` cannot reach \
+                 it; nothing was signalled or recorded. End that process, then run `devflow \
+                 stop --phase {phase}` again"
+            )));
+        }
+        std::thread::sleep(PENDING_PUBLISH_POLL);
+    }
+    Ok(())
+}
+
 /// What one shutdown attempt in [`stop_via_socket`] came to.
 enum ShutdownResult {
     /// The supervisor (or, after it died, the backstop) ended the run.
     Ended,
+    /// The supervisor accepted the stop and will honour it at its next safe point; it has
+    /// not confirmed it yet. Asking again would only wait again.
+    AcceptedPending,
     /// The supervisor had handed the run to its successor.
     HandedOff,
     /// The socket went away under the request: locate the run again.
@@ -2482,17 +3702,25 @@ fn shutdown_supervisor(
         Ok(supervisor::ShutdownOutcome::Stopped {
             exit_code,
             advance_suppressed,
+            group_signalled,
         }) => {
-            let advance = if advance_suppressed {
-                "advance suppressed"
-            } else {
-                "advance not suppressed"
-            };
             println!(
-                "stop: stopped phase {phase} through its supervisor (agent group ended, exit \
-                 code {exit_code}, {advance})"
+                "{}",
+                stopped_line(
+                    &format!("phase {phase}"),
+                    exit_code,
+                    advance_suppressed,
+                    group_signalled
+                )
             );
             return Ok(ShutdownResult::Ended);
+        }
+        Ok(supervisor::ShutdownOutcome::AcceptedPending { owner }) => {
+            println!(
+                "{}",
+                accepted_pending_line(&format!("phase {phase}"), &owner)
+            );
+            return Ok(ShutdownResult::AcceptedPending);
         }
         Ok(supervisor::ShutdownOutcome::HandedOff) => return Ok(ShutdownResult::HandedOff),
         Ok(supervisor::ShutdownOutcome::Refused(reason)) => {
@@ -2565,7 +3793,7 @@ fn stop_stale_socket(phase: PhaseId, located: &LocatedSocket) -> Result<(), CliE
         &socket,
         &sidecar,
         located.record.as_ref(),
-        Some(phase),
+        (!located.pending_recorded).then_some(phase),
     )
 }
 
@@ -2666,217 +3894,309 @@ fn run_backstop(
 /// `GateAction::Abort` rather than `LoopBack(Code)` — looping back would
 /// relaunch an agent on a phase the operator just asked to stop.
 ///
-/// Returns `Ok(true)` when a gate was found and handled — either reaped
+/// Returns the [`AnsweredGate`] when a gate was found and handled — either reaped
 /// here, or discovered already answered by a race — telling the caller not
-/// to fall through to [`stop_via_lock`]. Returns `Ok(false)` when there is
-/// no open gate for `phase` at all, including the race where `Gates::reap`
+/// to fall through to [`stop_via_holder`]. Returns `Ok(None)` when there is
+/// no open gate for `phase` at all, including the race where `Gates::reap_answer`
 /// reports `NoOpenGate` after this function's own `Gates::list_open` scan
 /// found one; that is the signal to fall through, not an error (cross-AI
 /// review 23-10).
-fn stop_via_gate(
-    project_root: &Path,
-    phase: PhaseId,
-) -> Result<(bool, Option<AnsweredGate>), CliError> {
+fn stop_via_gate(project_root: &Path, phase: PhaseId) -> Result<Option<AnsweredGate>, CliError> {
     let Some(gate) = Gates::list_open(project_root)
         .into_iter()
         .find(|g| g.phase == phase)
     else {
-        return Ok((false, None));
+        return Ok(None);
     };
-    let holder_before_reap = lock::holder_status(project_root, phase);
-    let holder_identity_before_reap = lock::holder_identity(project_root, phase);
-    let gate_is_current = workflow::load_state(project_root, phase)
-        .is_ok_and(|state| state.gate_pending && state.stage == gate.stage);
-    if !gate_is_current {
+    stop_reap_observed_gate(project_root, phase, &gate)
+}
+
+/// [`stop_via_gate`]'s reap of the gate as it was listed: compare its id with the
+/// gate file, read its waiter, then answer that id and no other. A gate it cannot
+/// answer falls through to the socket path.
+///
+/// A gate whose answer a consumer already claimed is declined before anything else: a
+/// finalizing `devflow ship` took it, and only the holder arm reaches that process.
+fn stop_reap_observed_gate(
+    project_root: &Path,
+    phase: PhaseId,
+    gate: &OpenGate,
+) -> Result<Option<AnsweredGate>, CliError> {
+    let observed = match classify_listed_gate(project_root, gate) {
+        ListedGate::Current(observed) => observed,
+        ListedGate::NoValidId => {
+            println!(
+                "stop: phase {phase} {} has a gate file with no valid gate id; no response was written. {}",
+                gate.stage,
+                stop_no_waiter_repair(project_root, phase, gate.stage)
+            );
+            return Ok(None);
+        }
+        ListedGate::Changed => {
+            println!(
+                "stop: phase {phase} {} gate changed since it was listed; not reaped",
+                gate.stage
+            );
+            return Ok(None);
+        }
+    };
+    if Gates::claim_path(project_root, phase, gate.stage, &observed).exists() {
+        println!(
+            "stop: phase {phase}'s {} gate (gate {observed}) was already answered and its answer \
+             claimed by its consumer; stop did not answer it",
+            gate.stage
+        );
+        return Ok(None);
+    }
+    let run = workflow::load_state(project_root, phase)
+        .ok()
+        .filter(|state| state.gate_pending && state.stage == gate.stage);
+    let Some(run) = run else {
         println!(
             "stop: phase {phase} {} has a stale gate request; no response was written. {}",
             gate.stage,
-            no_waiter_repair(phase, gate.stage)
+            stop_no_waiter_repair(project_root, phase, gate.stage)
         );
-        return Ok((false, None));
-    }
-    let ship_without_holder =
-        gate.stage == Stage::Ship && matches!(holder_before_reap, lock::HolderStatus::NoHolder);
-    if !matches!(holder_before_reap, lock::HolderStatus::Live { .. }) && !ship_without_holder {
+        return Ok(None);
+    };
+    let run_launch = run.supervisor.map(|record| record.launch_id);
+    // With no registered waiter, a Ship answer is still stored for `devflow ship` (D-04).
+    if !waiter_is_live(project_root, phase, gate.stage, &observed) && gate.stage != Stage::Ship {
         println!(
             "stop: phase {phase} {} has no confirmed live waiter; no response was written. {}",
             gate.stage,
-            no_waiter_repair(phase, gate.stage)
+            stop_no_waiter_repair(project_root, phase, gate.stage)
         );
-        return Ok((
-            false,
-            Some((gate.stage, holder_before_reap, holder_identity_before_reap)),
-        ));
+        return Ok(None);
     }
-    match Gates::reap(
+    match Gates::reap_answer(
         project_root,
         phase,
         gate.stage,
+        &observed,
         "abort: stopped by `devflow stop`",
         "devflow-stop",
     ) {
         Ok(path) => {
+            let waiter = if waiter_is_live(project_root, phase, gate.stage, &observed) {
+                WaiterStatus::Live
+            } else {
+                WaiterStatus::Absent
+            };
             println!(
                 "stop: wrote a rejection for phase {phase} {} at {} — {}",
                 gate.stage,
                 path.display(),
-                response_pickup_message(gate.stage, lock::holder_status(project_root, phase))
+                response_pickup_message(gate.stage, waiter)
             );
-            Ok((
-                true,
-                Some((gate.stage, holder_before_reap, holder_identity_before_reap)),
-            ))
+            Ok(Some((gate.stage, observed, run_launch, false)))
         }
         // A human, `--yes-ship`, or `devflow gate sweep` answered this gate
         // between our scan and this reap. Read its action: an approval or
         // loop-back is not `stop`'s outcome and must fall through to the
-        // lock path; only an abort response can be treated as the requested
-        // stop action, and only with a still-live holder.
-        Err(GateError::AlreadyResponded { .. }) => stop_with_existing_response(
-            project_root,
-            phase,
-            gate.stage,
-            holder_before_reap,
-            holder_identity_before_reap,
-        ),
-        Err(GateError::NoOpenGate { .. }) => Ok((
-            false,
-            Some((gate.stage, holder_before_reap, holder_identity_before_reap)),
-        )),
+        // socket and holder arms; only an abort response can be treated as the
+        // requested stop action, and only with a still-live waiter.
+        Err(GateError::AlreadyResponded { .. }) => {
+            stop_with_existing_response(project_root, phase, gate.stage, &observed, run_launch)
+        }
+        Err(GateError::NoOpenGate { .. }) => Ok(None),
+        // The gate this stop observed is gone or replaced: the stop itself still has
+        // to happen, through the socket path.
+        Err(err @ GateError::GateIdMismatch { .. }) => {
+            println!("stop: gate changed since it was listed; not reaped ({err})");
+            Ok(None)
+        }
+        Err(err @ GateError::GateClosedAfterPublish { .. }) => {
+            println!("stop: {err}");
+            Ok(None)
+        }
+        // A wedged gate-lock holder, such as a suspended `gate approve`, must not leave
+        // the run unstoppable: nothing was published, so the other arms may still act.
+        Err(err @ GateError::GateLockTimeout { .. }) => {
+            println!(
+                "stop: phase {phase}'s {} gate was not answered — {err}; trying its supervisor \
+                 socket and foreground holder",
+                gate.stage
+            );
+            Ok(None)
+        }
+        // The abort is out, so the holder arm stays out of it: one `stop`, one action
+        // (R2-04). If the gate had in fact closed, nothing reads the persisted `stopped` flag
+        // at a safe point (999.172), so the caller still shuts a supervisor down.
+        Err(err @ GateError::PublishedUnconfirmed { .. }) => {
+            println!(
+                "stop: phase {phase}'s {} gate (gate {observed}): the abort was published, but \
+                 stop could not confirm the gate was still open — {err}",
+                gate.stage
+            );
+            Ok(Some((gate.stage, observed, run_launch, true)))
+        }
         Err(err) => Err(err.into()),
     }
 }
 
-/// Classify a response which appeared after `stop_via_gate` saw an open gate.
+/// Classify an answer which appeared after `stop_via_gate` saw an open gate.
 /// An approval or loop-back is not attributable to `stop`, so that path must
-/// fall through to the lock holder. An abort can be the requested action only
-/// while the original holder is still confirmed live.
+/// fall through to the socket and holder arms. An abort can be the requested action
+/// only while a waiter is registered. `run_launch` rides along in the [`AnsweredGate`].
 fn stop_with_existing_response(
     project_root: &Path,
     phase: PhaseId,
     stage: Stage,
-    holder_before_reap: lock::HolderStatus,
-    holder_identity_before_reap: Option<(u32, Option<u64>)>,
-) -> Result<(bool, Option<AnsweredGate>), CliError> {
-    let response_path = Gates::response_path(project_root, phase, stage);
-    let response_text = std::fs::read_to_string(&response_path).map_err(|err| {
-        CliError::Message(format!(
-            "stop: phase {phase} {stage} already has an unreadable response at {}: {err}",
-            response_path.display()
-        ))
-    })?;
-    let response: GateResponse = serde_json::from_str(&response_text).map_err(|err| {
-        CliError::Message(format!(
-            "stop: phase {phase} {stage} already has an unreadable response at {}: {err}",
-            response_path.display()
-        ))
-    })?;
-    match GateAction::from_response(&response) {
-        GateAction::Abort(_) if matches!(holder_before_reap, lock::HolderStatus::Live { .. }) => {
+    observed: &GateId,
+    run_launch: Option<String>,
+) -> Result<Option<AnsweredGate>, CliError> {
+    let answer = match Gates::read_answer(project_root, phase, stage, observed) {
+        AnswerRead::Bound(answer) => answer,
+        AnswerRead::Unbound(reason) => {
             println!(
-                "stop: phase {phase} {stage} already has an abort response awaiting a live lock holder; stop did not write it"
+                "stop: phase {phase} {stage} has an answer that will be set aside ({reason}); stop did not write it"
             );
-            Ok((
-                true,
-                Some((stage, holder_before_reap, holder_identity_before_reap)),
-            ))
+            return Ok(None);
+        }
+        AnswerRead::None => {
+            println!(
+                "stop: phase {phase} {stage}'s answer is gone, so its gate was decided; stop did not write it"
+            );
+            return Ok(None);
+        }
+    };
+    match GateAction::from_response(&answer.response) {
+        GateAction::Abort(_) if waiter_is_live(project_root, phase, stage, observed) => {
+            println!(
+                "stop: phase {phase} {stage} already has an abort response awaiting its registered waiter; stop did not write it"
+            );
+            Ok(Some((stage, observed.clone(), run_launch, false)))
         }
         GateAction::Abort(_) => {
             println!(
-                "stop: phase {phase} {stage} already has an abort response, but no confirmed live holder will act; stop did not write it. {}",
-                no_waiter_repair(phase, stage)
+                "stop: phase {phase} {stage} already has an abort response, but no registered waiter will act; stop did not write it. {}",
+                stop_no_waiter_repair(project_root, phase, stage)
             );
-            Ok((false, None))
+            Ok(None)
         }
         GateAction::Advance | GateAction::LoopBack(_) => {
             println!(
                 "stop: phase {phase} {stage} already has a non-abort response; stop did not write it or claim its outcome"
             );
-            Ok((false, None))
+            Ok(None)
         }
     }
 }
 
-/// The fallback once no live supervisor socket remains (GONE, or none
-/// recorded): signal the process recorded in `phase`'s per-phase lock file,
-/// such as a foreground `advance()` holding the lock. Fail-closed on
-/// identity (T-23-52): the pid is signalled only when it matches the start
-/// time the lock recorded, since the lock may be stale with a recycled pid.
-/// The lock file is the only place this reads a pid from; state is never
-/// one.
-fn stop_via_lock(project_root: &Path, phase: PhaseId) -> Result<bool, CliError> {
-    let Some((pid_str, _path)) = lock::holder(project_root, phase) else {
-        println!(
-            "stop: no live supervisor socket and no lock held for phase {phase} — nothing is \
-             running"
-        );
-        return Ok(false);
-    };
-    let Ok(pid) = pid_str.parse::<u32>() else {
-        println!(
-            "stop: phase {phase}'s lock file holds a corrupt pid ({pid_str}) — treating it \
-             as stale"
-        );
-        return Ok(false);
-    };
-    if !agent::agent_running(pid) {
-        println!(
-            "stop: phase {phase}'s lock names pid {pid}, which is not alive — stale lock, \
-             nothing to signal"
-        );
-        return Ok(false);
-    }
-    // Identity must be MATCHED against what the lock recorded, never inferred
-    // from /proc (999.47). A bare cmdline-basename check alone returns true
-    // for any freshly forked child of a devflow process that has not finished
-    // execve — during that window the child carries its parent's cmdline and
-    // exe — so it would authorise signalling an unrelated process. Confirmed
-    // in CI, not theorised.
+/// The fallback once no live supervisor socket remains (GONE, or none recorded): signal
+/// the process that holds `phase`'s holder file (D-17), a foreground `start`, `resume`,
+/// `devflow ship` or hand-run `advance`. Fail-closed on identity (T-23-52): the pid is
+/// signalled only while the lock is held and only when it still has the start time the
+/// record names, since a record can name a recycled pid. The holder file is the only
+/// place this reads a pid from; state is never one.
+///
+/// `Ok(true)` when a holder was signalled.
+fn stop_via_holder(project_root: &Path, phase: PhaseId) -> Result<bool, CliError> {
+    let padded = phase.padded();
+    let holder = liveness::live_holder(&liveness::phase_holder_path(project_root, phase));
+    // Identity must be MATCHED against what the holder recorded, never inferred from
+    // /proc (999.47). A bare cmdline-basename check alone returns true for any freshly
+    // forked child of a devflow process that has not finished execve — during that window
+    // the child carries its parent's cmdline and exe — so it would authorise signalling
+    // an unrelated process. Confirmed in CI, not theorised.
     //
-    // `(pid, starttime)` is unique for the life of a boot: a recycled pid
-    // necessarily starts later than the one it replaced, and a mid-execve
-    // child has its own start time distinct from its parent's.
-    match lock::holder_identity(project_root, phase) {
-        Some((recorded_pid, Some(recorded_start))) if recorded_pid == pid => {
+    // `(pid, starttime)` is unique for the life of a boot: a recycled pid necessarily
+    // starts later than the one it replaced, and a mid-execve child has its own start
+    // time distinct from its parent's.
+    let pid = match holder {
+        Ok(None) => {
+            // D-19: with no supervisor left to ask, the phase's agent may still run. This
+            // signals nothing, and `stopped` is not written beside an agent that still edits
+            // the worktree; once the operator ends it, `devflow stop` records the stop.
+            if let Ok(state) = workflow::load_state(project_root, phase)
+                && let Some(agent) = live_phase_agent(project_root, &state)
+            {
+                return Err(CliError::Message(format!(
+                    "stop: no live supervisor socket, pending launch or foreground holder for \
+                     phase {phase}, but {}; phase state was not marked stopped",
+                    orphaned_agent_line(phase, &agent)
+                )));
+            }
+            println!(
+                "stop: no live supervisor socket, pending launch or foreground holder for phase \
+                 {phase} — nothing is running"
+            );
+            return Ok(false);
+        }
+        Ok(Some((pid, None))) => {
+            return Err(CliError::Message(format!(
+                "refusing to signal pid {pid} for phase {phase} — .devflow/.holder-{padded} \
+                 records no start time, so this process's identity cannot be confirmed. If the \
+                 run is genuinely stuck, inspect the pid manually (e.g. `ps -p {pid}`) before \
+                 ending it yourself."
+            )));
+        }
+        Ok(Some((pid, Some(recorded_start)))) => {
             if !agent::is_same_process(pid, recorded_start) {
                 return Err(CliError::Message(format!(
-                    "refusing to signal pid {pid} for phase {phase} — it is not the \
-                     process that took the lock. The lock recorded start time \
-                     {recorded_start}, but pid {pid} now reports {:?}, so the pid has \
-                     been recycled and belongs to something else. Inspect it manually \
-                     (e.g. `ps -p {pid}`) before proceeding.",
+                    "refusing to signal pid {pid} for phase {phase} — it is not the process that \
+                     claimed .devflow/.holder-{padded}. The record names start time \
+                     {recorded_start}, but pid {pid} now reports {:?}, so the pid has been \
+                     recycled and belongs to something else. Inspect it manually (e.g. `ps -p \
+                     {pid}`) before proceeding.",
                     agent::process_start_time(pid)
                 )));
             }
+            pid
         }
-        Some((_, None)) => {
-            // Legacy single-line lock, written before start times were
-            // recorded. Identity cannot be confirmed, so fail closed rather
-            // than fall back to the unsound cmdline check.
+        Err(err) => {
             return Err(CliError::Message(format!(
-                "refusing to signal pid {pid} for phase {phase} — the lock file records \
-                 no start time, so this process's identity cannot be confirmed. The lock \
-                 predates identity recording; if the run is genuinely stuck, inspect the \
-                 pid manually (e.g. `ps -p {pid}`) and remove \
-                 .devflow/lock-{padded} once you are satisfied.",
-                padded = phase.padded()
+                "refusing to signal anything for phase {phase} — .devflow/.holder-{padded} could \
+                 not be read back for identity confirmation ({err}), so nothing was signalled. \
+                 Run `devflow stop --phase {phase}` again, or inspect the process holding it."
             )));
         }
-        _ => {
-            return Err(CliError::Message(format!(
-                "refusing to signal pid {pid} for phase {phase} — the lock file's holder \
-                 could not be read back for identity confirmation. Inspect it manually \
-                 (e.g. `ps -p {pid}`) before proceeding."
-            )));
-        }
-    }
+    };
     if agent::terminate(pid) {
-        println!("stop: signalled pid {pid}, phase {phase}'s lock holder");
+        println!("stop: signalled pid {pid}, phase {phase}'s foreground holder");
         Ok(true)
     } else {
         println!("stop: pid {pid} could not be signalled (it may have just exited)");
         Ok(false)
     }
+}
+
+/// Wait up to [`agent::TERMINATE_VERIFY_WAIT`] for `phase`'s holder file to stop reading
+/// live: `true` once nothing holds it. A probe that fails counts as held.
+fn wait_for_holder_release(project_root: &Path, phase: PhaseId) -> bool {
+    let path = liveness::phase_holder_path(project_root, phase);
+    let released = || {
+        matches!(
+            liveness::probe(&path),
+            Ok(liveness::Held::Abandoned | liveness::Held::Missing)
+        )
+    };
+    let deadline = std::time::Instant::now() + agent::TERMINATE_VERIFY_WAIT;
+    while std::time::Instant::now() < deadline {
+        if released() {
+            return true;
+        }
+        std::thread::sleep(agent::TERMINATE_VERIFY_POLL);
+    }
+    released()
+}
+
+/// `stop`'s report over a signalled holder that is still running (D-18): the expected
+/// case while it finishes a hook or a git step, and no stop `stop` can claim.
+fn holder_still_running(project_root: &Path, phase: PhaseId) -> String {
+    let pid = liveness::live_holder(&liveness::phase_holder_path(project_root, phase))
+        .ok()
+        .flatten()
+        .map_or_else(|| "unknown".to_string(), |(pid, _)| pid.to_string());
+    format!(
+        "stop: signalled pid {pid}, phase {phase}'s foreground holder, which is still running \
+         {secs}s later, so phase state was not marked stopped. A DevFlow foreground process ends \
+         at its next safe point and records the stop itself, except a `devflow ship` that has \
+         started its finalization pass: it runs the pass to the end and, if the pass succeeds, \
+         ships instead of stopping",
+        secs = agent::TERMINATE_VERIFY_WAIT.as_secs()
+    )
 }
 
 /// Persist the operator's intent: mark `stopped` and record why, preserving
@@ -2887,115 +4207,136 @@ fn stop_via_lock(project_root: &Path, phase: PhaseId) -> Result<bool, CliError> 
 /// at all — never started, or already cleared by a completed abort — is
 /// already stopped; that is success, not an error.
 ///
-/// `answered_gate` is the stage and holder status [`stop_via_gate`] observed
-/// when it answered a gate, or `None` when no gate was answered.
+/// `signal_sent` means one fact: [`stop_via_holder`] signalled a foreground holder. A
+/// supervisor ended through its socket is not that, because a supervisor claims no holder
+/// (D-17). It decides both the wait for the holder's release and the line printed over a
+/// missing state.
+///
+/// `known_launches` holds the launches this stop ended, answered, cleared or found not
+/// live. The fresh read under the write lock decides: a launch outside it writes nothing
+/// ([`unaddressed_launch_refusal`]), so a run never reads `stopped` beside a supervisor
+/// that keeps working. R-03: `stop` is a repair verb, so a held write lock ends it within
+/// the bound, naming the holder.
 fn persist_stopped_state(
     project_root: &Path,
     phase: PhaseId,
-    answered_gate: Option<AnsweredGate>,
     signal_sent: bool,
+    known_launches: &[String],
 ) -> Result<(), CliError> {
-    let _phase_lock = if signal_sent {
-        lock::acquire_blocking(project_root, phase, agent::TERMINATE_VERIFY_WAIT)
-    } else {
-        lock::acquire(project_root, phase)
-    };
-    let _phase_lock = match (_phase_lock, answered_gate) {
-        (Ok(guard), _) => guard,
-        (Err(lock::LockError::Contended { pid, .. }), Some((stage, holder, identity))) => {
-            println!(
-                "{}",
-                answered_gate_contention_message(
-                    phase,
-                    stage,
-                    holder,
-                    identity,
-                    lock::holder_status(project_root, phase),
-                    lock::holder_identity(project_root, phase),
-                    &pid,
-                )?
-            );
-            return Ok(());
-        }
-        (Err(lock::LockError::Contended { pid, .. }), None) => {
-            return Err(CliError::Message(format!(
-                "stop: phase {phase}'s lock holder (pid {pid}) is still alive; phase state \
-                 was not marked stopped"
-            )));
-        }
-        (Err(err), _) => return Err(CliError::Message(err.to_string())),
-    };
-    let mut state = match workflow::load_state(project_root, phase) {
-        Ok(state) => state,
-        Err(workflow::WorkflowError::MissingState(_)) => {
-            println!("stop: no persisted state for phase {phase} — already stopped");
-            return Ok(());
-        }
-        Err(err) => return Err(err.into()),
-    };
-    state.stopped = true;
-    let reason = "stopped via `devflow stop`".to_string();
-    state.stop_reason = Some(match state.stop_reason.take() {
-        Some(existing) if !existing.is_empty() => format!("{existing}; {reason}"),
-        _ => reason,
-    });
-    workflow::save_state(&state)?;
+    if signal_sent && !wait_for_holder_release(project_root, phase) {
+        return Err(CliError::Message(holder_still_running(project_root, phase)));
+    }
+    let found_state = workflow::update_state_with_within(
+        project_root,
+        phase,
+        workflow::WRITE_LOCK_REPAIR_WAIT,
+        |existing| {
+            let mut state = match existing {
+                workflow::Existing::Loaded(state) => state,
+                workflow::Existing::Missing => return Ok((None, false)),
+                workflow::Existing::Unloadable(err) => return Err(CliError::from(err)),
+            };
+            if let Some(refusal) = unaddressed_launch_refusal(&state, known_launches) {
+                return Err(refusal);
+            }
+            state.stopped = true;
+            let reason = "stopped via `devflow stop`".to_string();
+            state.stop_reason = Some(match state.stop_reason.take() {
+                Some(existing) if !existing.is_empty() => format!("{existing}; {reason}"),
+                _ => reason,
+            });
+            Ok((Some(state), true))
+        },
+    )?;
+    if !found_state {
+        println!("{}", missing_state_line(phase, signal_sent));
+    }
     Ok(())
 }
 
-/// What `stop` can honestly say after answering a gate whose lock it then
-/// cannot take (D-05; T-48-16-02, T-48-16-03). Lock contention alone is not
-/// evidence of a waiter: only a `Live` holder is described as one. A recycled
-/// pid still blocking the lock is an unrelated process that will never clear
-/// phase state, so that is a failure with the gate's repair command. Anything
-/// else — an unconfirmable identity, or a different process that took the
-/// lock after `stop_via_gate` looked — claims neither a waiter nor its absence.
-fn answered_gate_contention_message(
+/// The refusal over a launch `state` names and this stop did not address: one a signalled
+/// holder published before releasing, one started after the addressed launch exited, or
+/// one that was pending when `stop` began and promoted while no arm addressed it. A dead
+/// one is refused the same way, and the second `stop` finds it gone (T-50.1-159).
+fn unaddressed_launch_refusal(state: &State, known_launches: &[String]) -> Option<CliError> {
+    let recorded = state
+        .supervisor
+        .as_ref()
+        .map(|record| (record.launch_id.as_str(), "supervisor"));
+    let pending = state
+        .pending_supervisor
+        .as_ref()
+        .map(|pending| (pending.launch_id.as_str(), "pending_supervisor"));
+    let (id, field) = [recorded, pending]
+        .into_iter()
+        .flatten()
+        .find(|(id, _)| !known_launches.iter().any(|known| known == id))?;
+    let phase = state.phase;
+    Some(CliError::Message(format!(
+        "stop: phase {phase}'s state records launch {id} in its {field} field, a launch this \
+         stop did not end, answer, clear or find not running; phase state was not marked \
+         stopped — run `devflow stop --phase {phase}` again: it stops that launch if it still \
+         runs, and if it does not, finds it gone or clears its reservation, then marks the \
+         phase stopped"
+    )))
+}
+
+/// What `stop` prints when the fresh read finds no state. With a signalled holder that
+/// exited, the run ended on its own rather than at a safe point: a `devflow ship` already
+/// in its pass shipped and cleared it, or it aborted. Nobody stopped it (D-18).
+fn missing_state_line(phase: PhaseId, signal_sent: bool) -> String {
+    if signal_sent {
+        format!(
+            "stop: phase {phase}'s signalled foreground holder exited and left no phase state: \
+             the run ended on its own rather than at a safe point (a `devflow ship` that had \
+             started its finalization pass runs it to the end and ships), so nothing was marked \
+             stopped"
+        )
+    } else {
+        format!("stop: no persisted state for phase {phase} — already stopped")
+    }
+}
+
+/// Hold `phase` for this foreground process's lifetime (D-17), with the stop handler in
+/// place first (D-18), so no recorded holder is ever a default-disposition SIGTERM target.
+/// The one path all four foreground entry points claim through. A supervisor never calls
+/// it: it has its own signal pipe, and its process holds a liveness file, not this.
+///
+/// Passing once through the state write lock after the claim is a barrier against a
+/// recovery: one already past its liveness check, under that lock, could not see this
+/// holder and may be deleting the state, so it finishes first and a state read after this
+/// returns sees what it left. Any later recovery sees the holder. Bounded, because a
+/// stuck lock holder must not hang a foreground verb, and refusing then releases the claim.
+pub(crate) fn claim_foreground_holder(
+    project_root: &Path,
     phase: PhaseId,
-    stage: Stage,
-    observed_holder: lock::HolderStatus,
-    observed_identity: Option<(u32, Option<u64>)>,
-    current_holder: lock::HolderStatus,
-    current_identity: Option<(u32, Option<u64>)>,
-    contending_pid: &str,
-) -> Result<String, CliError> {
-    match (
-        observed_holder,
-        observed_identity,
-        current_holder,
-        current_identity,
-    ) {
-        (
-            lock::HolderStatus::Live { pid: observed_pid },
-            Some((observed_identity_pid, Some(observed_start))),
-            lock::HolderStatus::Live { pid: current_pid },
-            Some((current_identity_pid, Some(current_start))),
-        ) if observed_pid == observed_identity_pid
-            && observed_pid == current_pid
-            && observed_pid == current_identity_pid
-            && observed_start == current_start
-            && current_pid.to_string() == contending_pid =>
-        {
-            Ok(format!(
-                "stop: phase {phase}'s lock holder (pid {contending_pid}) is waiting on the gate \
-                 and will clear phase state as it aborts"
+) -> Result<liveness::Hold, CliError> {
+    liveness::install_holder_stop_handler().map_err(|err| {
+        CliError::Message(format!(
+            "phase {phase}: could not install the stop handler ({err}); refusing to run, \
+             because `devflow stop` could then end this process inside a finalization hook"
+        ))
+    })?;
+    let holder = liveness::claim_phase_holder(project_root, phase).map_err(|err| match err {
+        liveness::HolderError::Held { holder } => {
+            let pid = holder.map_or_else(|| "unknown".to_string(), |(pid, _)| pid.to_string());
+            CliError::Message(format!(
+                "phase {phase} is held by a foreground DevFlow process (pid {pid}); run \
+                 `devflow stop --phase {phase}`"
             ))
         }
-        (_, _, lock::HolderStatus::Recycled { pid }, Some((current_pid, _)))
-            if pid == current_pid && pid.to_string() == contending_pid =>
-        {
-            Err(CliError::Message(format!(
-                "stop: nothing is waiting on phase {phase}'s {stage} gate — pid {pid} is not its \
-                 lock holder; phase state was not marked stopped. {}",
-                no_waiter_repair(phase, stage)
-            )))
-        }
-        _ => Err(CliError::Message(format!(
-            "stop: phase {phase}'s lock is held by pid {contending_pid}, whose identity \
-             cannot be confirmed as the gate's waiter; phase state was not marked stopped. {}",
-            no_waiter_repair(phase, stage)
-        ))),
-    }
+        liveness::HolderError::Io(err) => CliError::Message(format!(
+            "phase {phase}: could not claim the holder file {}: {err}",
+            liveness::phase_holder_path(project_root, phase).display()
+        )),
+    })?;
+    workflow::update_state_with_within(
+        project_root,
+        phase,
+        workflow::WRITE_LOCK_REPAIR_WAIT,
+        |_| Ok::<_, CliError>((None, ())),
+    )?;
+    Ok(holder)
 }
 
 /// Print an open gate's full, untruncated (but sanitized) context — the
@@ -3033,10 +4374,11 @@ pub(crate) fn gate_show(
 /// process stdout.
 fn render_gate_show(gate: &OpenGate) -> String {
     format!(
-        "phase {} {} ({})\n{}",
+        "phase {} {} ({})\ngate id: {}\n{}",
         gate.phase,
         gate.stage,
         recover::format_age(&gate.timestamp),
+        printable_gate_id(gate),
         render_gate_context(&gate.context, usize::MAX),
     )
 }
@@ -3072,8 +4414,10 @@ pub(crate) fn logs(
     // poll produced no new bytes — the natural end of a run. (An operator
     // can always Ctrl-C sooner.)
     let exit_path = agent_result::exit_code_path(project_root, phase);
+    let state_path = workflow::state_path(project_root, phase);
     loop {
         std::thread::sleep(std::time::Duration::from_millis(500));
+        let state_exists = state_path.exists();
         // 14-CR-03: a stage transition archives and recreates the capture
         // file (launch_stage → archive_phase_files), so a shrunken file
         // means the next stage started — reset to the top instead of
@@ -3088,6 +4432,14 @@ pub(crate) fn logs(
             if let Ok(code) = std::fs::read_to_string(&exit_path) {
                 eprintln!("== agent exited with code {} ==", code.trim());
             }
+            return Ok(());
+        }
+        // A supervisor whose state vanished writes no exit file (D-03) and has no
+        // successor, so none will come. A state that was gone before the first poll is
+        // the same case: every launch saves its state before it spawns (D-01), so there
+        // is no run still to start here.
+        if !state_exists && base == offset && new_offset == offset {
+            eprintln!("== phase {phase}'s state is gone and no exit code was recorded ==");
             return Ok(());
         }
         offset = new_offset;
@@ -3182,55 +4534,8 @@ fn default_logs_phase(project_root: &Path) -> Result<PhaseId, CliError> {
     })
 }
 
-/// Refuse `start` while the phase's run is live (criterion 2, D-01: one
-/// writer per phase). `start` calls this under the per-phase lock and before
-/// any gate cleanup, git mutation or `save_state`, so a refusal writes
-/// nothing. `--force` does not bypass it. See
-/// [`refuse_launch_over_a_live_run`] for what counts as live.
-///
-/// No-state carve-out (operator-approved 2026-09-22, unchanged by D-12):
-/// without a state file the agent pid file is not read, so a live process it
-/// names does not refuse, because `recover --clean` leaves that file behind
-/// and a recycled pid would otherwise block `start` with no DevFlow repair.
-/// The supervisor sockets of this root and phase are still swept.
-///
-/// Out of scope: the lock-free window between agent exit and `advance` taking
-/// the lock stays backlog 999.136. This check says nothing about a gate waiter.
-fn refuse_start_over_a_live_run(project_root: &Path, phase: PhaseId) -> Result<(), CliError> {
-    refuse_launch_over_a_live_run(
-        project_root,
-        phase,
-        LaunchVerb::Start,
-        registry::cache_dir().as_deref(),
-    )
-}
-
-/// Criterion 2, D-01 and D-02's `resume` half, promoted by the operator on
-/// 2026-09-23 as backlog 999.140: `pipeline_launch::resume` calls this just
-/// after it has acquired its phase lock and before it loads or writes state.
-/// The `devflow resume` CLI arm is resume's only production caller; no monitor
-/// or advance path calls resume. An agent that runs `devflow resume` for its
-/// own phase is refused correctly.
-///
-/// Liveness is shared with `start` ([`refuse_launch_over_a_live_run`]).
-/// Without a state file, resume still reports its own missing-state error.
-/// For a state that will not load, the guard finds the run through its
-/// sidecar (R-12, 999.139), and resume then cannot launch anyway because its
-/// own `load_state` fails immediately afterwards.
-pub(crate) fn refuse_resume_over_a_live_run(
-    project_root: &Path,
-    phase: PhaseId,
-) -> Result<(), CliError> {
-    refuse_launch_over_a_live_run(
-        project_root,
-        phase,
-        LaunchVerb::Resume,
-        registry::cache_dir().as_deref(),
-    )
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LaunchVerb {
+pub(crate) enum LaunchVerb {
     Start,
     Resume,
 }
@@ -3270,24 +4575,46 @@ impl LaunchVerb {
 /// - **Agent pid file** (unchanged, D-12): a live pid there is live. Pid
 ///   liveness, not identity: a recycled pid gives a fail-closed false
 ///   refusal (Option A, 2026-09-22). Not read without a state file (the
-///   no-state carve-out on [`refuse_start_over_a_live_run`]).
+///   no-state carve-out below).
 ///
-/// A loaded state with no record over a live supervisor (a launcher that
-/// died before saving it, T-50-90/T-50-91) is accepted until Phase 50.1.
+/// A loaded state's `pending_supervisor` (D-01, T-50-90) counts too, from the moment
+/// it is reserved: a held liveness lock is live, with or without a socket, and its
+/// refusal names only `devflow stop`. An unheld or missing lock is an abandoned
+/// reservation, which does not refuse and which [`reserve_launch`] replaces.
+///
+/// Runs on the state [`reserve_launch`]'s closure read (criterion 2, D-01: one
+/// writer per phase), before any gate cleanup, git mutation or state write, so a
+/// refusal writes nothing. `--force` does not bypass it. `resume`'s missing-state
+/// error comes after it; so does its load error, for a state the guard could only
+/// find through its sidecar (R-12, 999.139). Only the `devflow resume` CLI arm
+/// reaches this for `resume`, and an agent that runs it for its own phase is refused
+/// correctly.
+///
+/// No-state carve-out (operator-approved 2026-09-22, unchanged by D-12): without a
+/// state file the agent pid file is not read, so a live process it names does not
+/// refuse, because `recover --clean` leaves that file behind and a recycled pid would
+/// otherwise block `start` with no DevFlow repair. The supervisor sockets of this
+/// root and phase are still swept.
+///
+/// Out of scope: the window between agent exit and `advance` taking over stays backlog
+/// 999.136. This check says nothing about a gate waiter.
 fn refuse_launch_over_a_live_run(
     project_root: &Path,
     phase: PhaseId,
     verb: LaunchVerb,
+    existing: &workflow::Existing,
     cache_dir: Option<&Path>,
 ) -> Result<(), CliError> {
     let state_file = workflow::state_path(project_root, phase);
-    let state = workflow::load_state(project_root, phase).ok();
-    let no_state = state.is_none() && !state_file.exists();
-    let sockets = possibly_live_sockets(project_root, phase, state.as_ref(), cache_dir).map_err(
-        |(dir, why)| {
+    let state = match existing {
+        workflow::Existing::Loaded(state) => Some(state),
+        _ => None,
+    };
+    let no_state = matches!(existing, workflow::Existing::Missing);
+    let sockets =
+        possibly_live_sockets(project_root, phase, state, cache_dir).map_err(|(dir, why)| {
             unlistable_socket_dir_refusal(phase, verb, (&state_file, no_state, &dir), &why)
-        },
-    )?;
+        })?;
     let agent = (!no_state)
         .then(|| agent_pid_from_file(project_root, phase))
         .flatten()
@@ -3297,6 +4624,83 @@ fn refuse_launch_over_a_live_run(
     }
     Err(CliError::Message(live_run_refusal(
         phase, verb, &sockets, agent,
+    )))
+}
+
+/// What a foreground process's live-supervisor check found: the phase's recorded and
+/// pending supervisors, read as [`refuse_launch_over_a_live_run`] reads them, as refusal
+/// text and launch ids. `None` when none is live. A socket directory that cannot be listed
+/// cannot rule one out, so it refuses too (fail closed). It only reads: the
+/// abandoned-reservation clearing stays in [`reserve_launch`], and it reads no agent pid
+/// file, because the property here is "no live supervisor".
+fn find_live_supervisors(project_root: &Path, phase: PhaseId) -> Option<(String, Vec<String>)> {
+    let state = workflow::load_state(project_root, phase).ok();
+    let cache_dir = registry::cache_dir();
+    match possibly_live_sockets(project_root, phase, state.as_ref(), cache_dir.as_deref()) {
+        Ok(sockets) if sockets.is_empty() => None,
+        Ok(sockets) => {
+            let listed: Vec<String> = sockets
+                .iter()
+                .map(|socket| format!("launch {} ({})", socket.launch_id, socket.liveness))
+                .collect();
+            Some((
+                format!("has a live supervisor ({})", listed.join(", ")),
+                sockets.into_iter().map(|socket| socket.launch_id).collect(),
+            ))
+        }
+        Err((dir, why)) => Some((
+            format!(
+                "may have a live supervisor: the socket directory {} could not be listed ({why})",
+                dir.display()
+            ),
+            Vec::new(),
+        )),
+    }
+}
+
+/// D-08, D-17: a hand-run `devflow advance` refuses beside a live supervisor of its phase.
+/// The long advance lock gave this exclusion until it was deleted. It writes no state.
+pub(crate) fn refuse_advance_over_a_live_supervisor(
+    project_root: &Path,
+    phase: PhaseId,
+) -> Result<(), CliError> {
+    let Some((found, launch_ids)) = find_live_supervisors(project_root, phase) else {
+        return Ok(());
+    };
+    events::emit(
+        project_root,
+        phase,
+        "advance_failed",
+        serde_json::json!({ "reason": "live supervisor", "launch_ids": launch_ids }),
+    );
+    Err(CliError::Message(format!(
+        "advance refused: phase {phase} {found}; a hand-run advance would run beside it. Run \
+         `devflow stop --phase {phase}` to end it"
+    )))
+}
+
+/// R-17: `devflow ship` drives a Ship answer only when the monitor that would consume it
+/// is dead, so it refuses beside a live supervisor of its phase. It would otherwise win
+/// that answer from it and, on a loop-back, launch a second supervisor beside it. It
+/// writes no state.
+pub(crate) fn refuse_ship_over_a_live_supervisor(
+    project_root: &Path,
+    phase: PhaseId,
+) -> Result<(), CliError> {
+    let Some((found, launch_ids)) = find_live_supervisors(project_root, phase) else {
+        return Ok(());
+    };
+    events::emit(
+        project_root,
+        phase,
+        "ship_override_refused",
+        serde_json::json!({ "reason": "live supervisor", "launch_ids": launch_ids }),
+    );
+    Err(CliError::Message(format!(
+        "ship refused: phase {phase} {found}; `devflow ship` drives a Ship answer only when the \
+         monitor that would consume it is dead. Answer the Ship gate with `devflow gate approve` \
+         or `devflow gate reject` and the live supervisor consumes it, or run `devflow stop \
+         --phase {phase}` first"
     )))
 }
 
@@ -3316,8 +4720,16 @@ fn possibly_live_sockets(
         return Ok(state
             .supervisor
             .as_ref()
-            .and_then(recorded_live_socket)
+            .and_then(|record| {
+                recorded_live_socket(record).or_else(|| held_without_socket(project_root, record))
+            })
             .into_iter()
+            .chain(
+                state
+                    .pending_supervisor
+                    .as_ref()
+                    .and_then(pending_live_socket),
+            )
             .collect());
     }
     let Some(cache_dir) = cache_dir else {
@@ -3338,17 +4750,46 @@ struct LiveSocket {
     /// The record's or sidecar's launch id; for a socket with no usable
     /// sidecar, its file name's, else its ping reply's, else `unknown`.
     launch_id: String,
-    /// `ALIVE`, `STALE`, or why the socket could not be probed.
+    /// `ALIVE`, `STALE`, [`PENDING_NO_SOCKET`], or why it could not be probed.
     liveness: String,
     /// Why the sidecar cannot be used, for a socket with none that parses:
     /// `stop --launch` cannot validate it, so the refusal names bare `stop`.
     sidecar_problem: Option<String>,
+    /// How the state names this supervisor, if it does.
+    pending: PendingKind,
 }
+
+/// Whether a [`LiveSocket`] is a state's pending supervisor. While one is live, no
+/// refusal suggests `devflow resume` (ROADMAP 50.1 criterion 2).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PendingKind {
+    /// Not pending: a recorded or swept supervisor.
+    No,
+    /// Pending, with a socket that was probed.
+    Published,
+    /// Pending, with no socket yet: only its held liveness lock says it is live.
+    Reserved,
+    /// Recorded, with its socket gone: only its held liveness lock says it is live, and
+    /// `stop` has no socket to reach it through.
+    RecordedNoSocket,
+}
+
+/// The liveness a refusal names for a pending supervisor with no socket yet.
+const PENDING_NO_SOCKET: &str = "PENDING (reserved, no socket yet)";
 
 impl LiveSocket {
     /// The refusal line that names this socket's repair.
     fn repair_line(&self, phase: PhaseId) -> String {
         let (id, liveness, socket) = (&self.launch_id, &self.liveness, self.socket.display());
+        // No `--launch`: `stop --launch` validates a sidecar, and this has none yet.
+        if self.pending == PendingKind::Reserved {
+            return format!("launch {id} ({liveness}): run `devflow stop --phase {phase}` first");
+        }
+        if self.pending == PendingKind::RecordedNoSocket {
+            return format!(
+                "launch {id} ({liveness}): `devflow stop` cannot reach it; end that process first"
+            );
+        }
         match &self.sidecar_problem {
             None => format!(
                 "launch {id} ({liveness}, socket {socket}): run \
@@ -3368,20 +4809,94 @@ impl LiveSocket {
 /// The loaded state's record as a [`LiveSocket`], or `None` when its socket
 /// is GONE or STALE over a group the backstop proves gone.
 fn recorded_live_socket(record: &SupervisorRecord) -> Option<LiveSocket> {
-    let live = |liveness: &str, sidecar_problem: Option<String>| LiveSocket {
+    socket_live_socket(&record.socket_path, &record.launch_id, Some(record))
+}
+
+/// The live supervisor `record` names when its GONE socket cannot say so: it holds its
+/// launch's liveness file for its whole life. It unlinks its socket before it exits, so a
+/// release within [`STOP_LOCK_RELEASE_WAIT`] is one exiting. `None` when nothing holds that
+/// file. A probe that fails is live (fail closed, T-50-40).
+fn held_without_socket(project_root: &Path, record: &SupervisorRecord) -> Option<LiveSocket> {
+    let path = liveness::launch_liveness_path(project_root, &record.launch_id)?;
+    let deadline = std::time::Instant::now() + STOP_LOCK_RELEASE_WAIT;
+    let holder = loop {
+        let holder = held_liveness_holder(&path)?;
+        if std::time::Instant::now() >= deadline {
+            break holder;
+        }
+        std::thread::sleep(PENDING_PUBLISH_POLL);
+    };
+    Some(LiveSocket {
         socket: record.socket_path.clone(),
         launch_id: record.launch_id.clone(),
+        liveness: holder,
+        sidecar_problem: None,
+        pending: PendingKind::RecordedNoSocket,
+    })
+}
+
+/// Who holds the liveness file at `path`, in words, or `None` when nothing does.
+fn held_liveness_holder(path: &Path) -> Option<String> {
+    match liveness::probe(path) {
+        Ok(liveness::Held::Abandoned | liveness::Held::Missing) => None,
+        Ok(liveness::Held::Live) => Some(match liveness::live_holder(path) {
+            Ok(Some((pid, _))) => format!("socket gone, pid {pid} holds {}", path.display()),
+            _ => format!("socket gone, {} is held", path.display()),
+        }),
+        Err(error) => Some(format!("liveness probe failed ({error})")),
+    }
+}
+
+/// A state's pending supervisor as a [`LiveSocket`], or `None` when its reservation
+/// is abandoned. A published socket is probed as a recorded one is, and with or
+/// without one, a held liveness lock is live: only the lock and the socket decide,
+/// never a pid (D-01). A probe that fails is live (fail closed, T-50-40).
+fn pending_live_socket(pending: &PendingSupervisor) -> Option<LiveSocket> {
+    if pending.socket_path.exists()
+        && let Some(live) = socket_live_socket(&pending.socket_path, &pending.launch_id, None)
+    {
+        return Some(LiveSocket {
+            pending: PendingKind::Published,
+            ..live
+        });
+    }
+    let liveness = match liveness::probe(&pending.liveness_path) {
+        Ok(liveness::Held::Live) => PENDING_NO_SOCKET.to_string(),
+        Ok(liveness::Held::Abandoned | liveness::Held::Missing) => return None,
+        Err(error) => format!("liveness probe failed ({error})"),
+    };
+    Some(LiveSocket {
+        socket: pending.socket_path.clone(),
+        launch_id: pending.launch_id.clone(),
+        liveness,
+        sidecar_problem: None,
+        pending: PendingKind::Reserved,
+    })
+}
+
+/// The supervisor at `socket` as a [`LiveSocket`], or `None` when it is GONE or
+/// STALE over a group the backstop proves gone. `record` is the state's record of
+/// it, when the state has published one.
+fn socket_live_socket(
+    socket: &Path,
+    launch_id: &str,
+    record: Option<&SupervisorRecord>,
+) -> Option<LiveSocket> {
+    let live = |liveness: &str, sidecar_problem: Option<String>| LiveSocket {
+        socket: socket.to_path_buf(),
+        launch_id: launch_id.to_string(),
         liveness: liveness.to_string(),
         sidecar_problem,
+        pending: PendingKind::No,
     };
-    match supervisor::probe(&record.socket_path) {
+    match supervisor::probe(socket) {
         Ok(supervisor::Liveness::Gone) => None,
         Ok(supervisor::Liveness::Alive(_)) => Some(live("ALIVE", None)),
         Err(error) => Some(live(&probe_failure(&error), None)),
         Ok(supervisor::Liveness::Stale) => {
-            match supervisor::read_sidecar(&record.socket_path.with_extension("json")) {
+            match supervisor::read_sidecar(&socket.with_extension("json")) {
                 Ok(sidecar) => {
-                    let decision = supervisor::backstop::assess(&sidecar, Some(record));
+                    let decision = supervisor::backstop::assess(&sidecar, record);
                     stale_group_may_live(&decision).then(|| live("STALE", None))
                 }
                 Err(supervisor::SidecarError::Io(error))
@@ -3431,6 +4946,7 @@ fn swept_live_socket(entry: &supervisor::SweepEntry) -> Option<LiveSocket> {
         launch_id,
         liveness,
         sidecar_problem,
+        pending: PendingKind::No,
     })
 }
 
@@ -3479,8 +4995,7 @@ fn unlistable_socket_dir_refusal(
     ))
 }
 
-/// The refusal text for [`refuse_launch_over_a_live_run`]. It fires while the
-/// launcher holds the lock: each live socket is named with the `stop` line
+/// The refusal text for [`refuse_launch_over_a_live_run`]: each live socket is named with the `stop` line
 /// that ends it (50-14), and a live agent pid with the identity checks the
 /// operator must make before signalling it.
 fn live_run_refusal(
@@ -3510,14 +5025,26 @@ fn live_run_refusal(
             text.push_str(&live.repair_line(phase));
         }
     }
-    if let Some(pid) = agent {
+    // Criterion 2: `resume`'s own lines name `devflow resume`, and while a pending
+    // supervisor is live none of them may be printed. Once it is gone, `status` says
+    // what is next. A live agent is named above, and `stop` ends a supervisor's agent.
+    let pending_blocks_resume =
+        verb == LaunchVerb::Resume && sockets.iter().any(|live| live.pending != PendingKind::No);
+    if let Some(pid) = agent.filter(|_| !pending_blocks_resume) {
         text.push('\n');
         text.push_str(&agent_refusal_guidance(phase, verb, pid));
     }
-    text.push_str(&format!(
-        "\nOnce every supervisor and process named above is gone, run `{}` again.",
-        verb.rerun(phase)
-    ));
+    if pending_blocks_resume {
+        text.push_str(
+            "\nOnce every supervisor and process named above is gone, `devflow status` names \
+             what to do next.",
+        );
+    } else {
+        text.push_str(&format!(
+            "\nOnce every supervisor and process named above is gone, run `{}` again.",
+            verb.rerun(phase)
+        ));
+    }
     text
 }
 
@@ -3529,9 +5056,8 @@ fn agent_refusal_guidance(phase: PhaseId, verb: LaunchVerb, pid: u32) -> String 
         LaunchVerb::Start => "",
         LaunchVerb::Resume => {
             " A state already marked stopped does not mean these processes have exited: \
-             `devflow status` names `devflow resume` for a phase whose supervisor is GONE even \
-             while its agent is still alive, and resume refuses until every named process has \
-             exited."
+             with no live supervisor, `devflow status` names a live agent's pid and the manual \
+             kill, and resume refuses until every named process has exited."
         }
     };
     let recycled = match verb {
@@ -3565,7 +5091,7 @@ fn agent_refusal_guidance(phase: PhaseId, verb: LaunchVerb, pid: u32) -> String 
 }
 
 /// Read the launched agent PID the monitor recorded for `phase`, if present.
-fn agent_pid_from_file(project_root: &Path, phase: PhaseId) -> Option<u32> {
+pub(crate) fn agent_pid_from_file(project_root: &Path, phase: PhaseId) -> Option<u32> {
     let path = agent_result::agent_pid_path(project_root, phase);
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
@@ -3752,24 +5278,14 @@ pub(crate) fn recover_cmd(
 ) -> Result<(), CliError> {
     if do_clean {
         match phase {
-            // Explicit phase: cleaned when its lock holder is dead or its pid
-            // was recycled (a live pid whose start time differs from the one
-            // recorded, 999.128). A live, identity-confirmed holder still
-            // refuses, so a wedged live run needs `devflow stop` first.
+            // Explicit phase: cleaned unless its supervisor, pending supervisor, gate
+            // waiter or foreground holder may be live, so a wedged live run needs
+            // `devflow stop` first. This guard is the one that can read a STALE socket
+            // through the backstop; `clean_phase_report` decides again under the write
+            // lock, with what is on disk by then.
             Some(phase) => {
                 refuse_a_live_supervisor(project_root, phase, registry::cache_dir().as_deref())?;
-                let report = match recover::clean_phase_report(project_root, phase) {
-                    Ok(report) => report,
-                    Err(recover::RecoverError::Lock(lock::LockError::Contended {
-                        pid, ..
-                    })) => {
-                        return Err(CliError::Message(format!(
-                            "phase {phase} is live or contended by pid {pid}; recover --clean \
-                             deleted neither state nor gate files — nothing was cleaned"
-                        )));
-                    }
-                    Err(err) => return Err(err.into()),
-                };
+                let report = recover::clean_phase_report(project_root, phase)?;
                 for warning in &report.warnings {
                     println!("warning: {warning}");
                 }
@@ -3824,15 +5340,21 @@ pub(crate) fn recover_cmd(
                         join(&report.orphan_cron_records_removed)
                     );
                 }
-                if report.corrupt_legacy_state_removed {
-                    println!("removed unparsable legacy state.json");
+                for path in &report.markers_removed {
+                    println!("removed abandoned marker {}", path.display());
                 }
                 if report.cleared.is_empty()
                     && report.orphan_gates_cleared.is_empty()
                     && report.orphan_cron_records_removed.is_empty()
-                    && !report.corrupt_legacy_state_removed
+                    && report.markers_removed.is_empty()
                 {
                     println!("no stale workflow state was cleaned");
+                }
+                if !report.quarantined.is_empty() {
+                    println!("set-aside gate answers kept (D-05; remove each by hand once read):");
+                    for path in &report.quarantined {
+                        println!("  {}", path.display());
+                    }
                 }
                 if report.removal_failed {
                     return Err(CliError::Message(
@@ -3879,6 +5401,9 @@ pub(crate) fn recover_cmd(
                 }
             }
             None => println!("  agent_pid: none"),
+        }
+        if let Some(reason) = &status.live {
+            println!("  may be live: {reason}");
         }
         if status.is_stale {
             any_stale = true;
@@ -4133,6 +5658,7 @@ fn doctor_in(project_root: &Path, json: bool, cache_dir: Option<&Path>) -> Resul
         .map(|cache| collect_orphan_supervisors(project_root, cache))
         .unwrap_or_default();
     let sweep_unlistable = cache_dir.and_then(socket_dir_unlistable);
+    let set_aside = set_aside_answer_findings(project_root, &Gates::quarantined(project_root));
 
     if json {
         // WR-01 (18-fix): a single top-level JSON document —
@@ -4152,6 +5678,7 @@ fn doctor_in(project_root: &Path, json: bool, cache_dir: Option<&Path>) -> Resul
             &doc_findings,
             &stray_findings,
             (&orphans, sweep_unlistable.as_deref()),
+            &set_aside,
         );
         println!(
             "{}",
@@ -4176,6 +5703,7 @@ fn doctor_in(project_root: &Path, json: bool, cache_dir: Option<&Path>) -> Resul
             println!();
         }
         print!("{}", render_reconciliation_text(&facts));
+        print!("{}", render_set_aside_findings_text(&set_aside));
         print!("{}", render_planning_doc_text(&doc_findings));
         print!("{}", render_stray_process_text(&stray_findings));
         print!(
@@ -4717,6 +6245,7 @@ fn check_sync_done(project_root: &Path) -> Check {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Severity {
     Ok,
+    Info,
     Warn,
     Problem,
 }
@@ -4725,6 +6254,7 @@ impl Severity {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Severity::Ok => "ok",
+            Severity::Info => "info",
             Severity::Warn => "warn",
             Severity::Problem => "problem",
         }
@@ -4738,9 +6268,12 @@ pub(crate) struct PhaseFacts {
     pub(crate) phase: PhaseId,
     pub(crate) stage: Stage,
     pub(crate) gate_pending: bool,
-    /// Read-only phase-lock status, computed in `build_phase_facts`; all
-    /// lock I/O stays there so reconciliation remains pure.
-    pub(crate) waiter: lock::HolderStatus,
+    /// Whether the phase's open gate has a held registration, computed in
+    /// `build_phase_facts`; all its I/O stays there so reconciliation remains pure.
+    pub(crate) waiter: WaiterStatus,
+    /// The stage and id of the open gate [`PhaseFacts::waiter`] describes; `None` when
+    /// the phase has no open gate. The id is the gate file's, unchecked.
+    pub(crate) waiter_gate: Option<(Stage, String)>,
     pub(crate) agent_pid: Option<u32>,
     pub(crate) agent_alive: bool,
     /// The supervisor's liveness, from one probe of the socket
@@ -4764,11 +6297,25 @@ pub(crate) struct PhaseFacts {
     /// marker instead of reporting a `Problem` (review: Codex HIGH — the
     /// doctor gap is bigger than `check_dead_agent` alone).
     pub(crate) stopped: bool,
+    /// [`ship_answer_stored`]: `devflow ship` applies it and `resume` would set it aside.
+    pub(crate) stored_ship_answer: bool,
+    /// The `start` to run instead of `resume` when [`run_never_prepared`] holds.
+    pub(crate) unprepared_restart: Option<String>,
+    /// The pending launch's id and liveness, from `state.pending_supervisor`. The
+    /// liveness is `LaunchPending` while it lives and a GONE state once abandoned.
+    pub(crate) pending: Option<(String, PhaseLiveness)>,
+    /// The phase's agent, when no supervisor is live and it still runs (D-19).
+    pub(crate) live_agent: Option<LiveAgent>,
+    /// The state write lock, read once without waiting (R-03).
+    pub(crate) write_lock: workflow::WriteLockStatus,
+    /// Why [`PhaseFacts::write_lock`] could not be read; it then reads free.
+    pub(crate) write_lock_error: Option<String>,
 }
 
 /// One diagnostic finding for a phase, with a copy-pasteable repair command
-/// when one exists. Never carries a filesystem path or username (T-18-01) —
-/// only phase numbers, stage names, and pids identify the disagreement.
+/// when one exists. Never carries an absolute filesystem path or username
+/// (T-18-01): phase numbers, stage names and pids identify the disagreement, and
+/// a set-aside answer names its file from the project root (D-05).
 pub(crate) struct PhaseFinding {
     pub(crate) phase: PhaseId,
     pub(crate) severity: Severity,
@@ -4786,19 +6333,47 @@ fn check_gate_pending_without_gate(facts: &PhaseFacts) -> Option<PhaseFinding> {
     Some(PhaseFinding {
         phase: facts.phase,
         severity: Severity::Problem,
-        detail: format!(
-            "phase {}: gate_pending is true at stage {} but no gate file is open",
-            facts.phase, facts.stage
-        ),
-        repair: Some(format!("devflow resume --phase {}", facts.phase)),
+        detail: if facts.stored_ship_answer {
+            format!(
+                "phase {}: gate_pending is true at stage {} and its gate holds a stored answer",
+                facts.phase, facts.stage
+            )
+        } else {
+            format!(
+                "phase {}: gate_pending is true at stage {} but no gate file is open",
+                facts.phase, facts.stage
+            )
+        },
+        repair: Some(repair_instead_of_resume(
+            facts,
+            format!("devflow resume --phase {}", facts.phase),
+        )),
     })
+}
+
+/// A repair that would send the operator to `devflow resume`, unless the launch guard
+/// would refuse it: `stop` while a supervisor of the phase is live (criterion 2), and the
+/// manual kill while an agent outlives its supervisor (D-19). An ALIVE supervisor may be
+/// healthy and between stages, so `stop` is offered, not prescribed.
+fn repair_instead_of_resume(facts: &PhaseFacts, resume: String) -> String {
+    let phase = facts.phase;
+    match (&facts.supervisor, &facts.live_agent) {
+        (PhaseLiveness::LaunchPending { .. }, _) => format!("devflow stop --phase {phase}"),
+        (PhaseLiveness::HeldNoSocket { .. }, _) => HELD_NO_SOCKET_REPAIR.to_string(),
+        (PhaseLiveness::Alive { .. }, _) => {
+            format!("wait for its live supervisor, or `devflow stop --phase {phase}`")
+        }
+        (_, Some(agent)) => orphaned_agent_line(phase, agent),
+        _ if facts.stored_ship_answer => format!("devflow ship --phase {phase}"),
+        _ => facts.unprepared_restart.clone().unwrap_or(resume),
+    }
 }
 
 /// An open gate has no process that may still be waiting to consume an
 /// answer. Report the same recovery command the gate verbs already name;
 /// doctor remains report-only.
 fn check_open_gate_without_waiter(facts: &PhaseFacts) -> Option<PhaseFinding> {
-    if facts.open_gate_stages.is_empty() || facts.waiter.may_be_waiting() {
+    if facts.open_gate_stages.is_empty() || facts.waiter == WaiterStatus::Live {
         return None;
     }
     let gate_stage = facts.open_gate_stages[0];
@@ -4809,14 +6384,19 @@ fn check_open_gate_without_waiter(facts: &PhaseFacts) -> Option<PhaseFinding> {
             "phase {}: gate open for stage {} but no waiter may still be waiting",
             facts.phase, gate_stage
         ),
-        repair: Some(no_waiter_repair(facts.phase, gate_stage)),
+        repair: Some(if gate_stage == Stage::Ship {
+            no_waiter_repair(facts.phase, gate_stage)
+        } else {
+            repair_instead_of_resume(facts, no_waiter_repair(facts.phase, gate_stage))
+        }),
     })
 }
 
 /// An open gate file exists but `gate_pending` is false — an unanswered
 /// operator question that `status`/`doctor` isn't surfacing as pending.
 fn check_orphan_gate(facts: &PhaseFacts) -> Option<PhaseFinding> {
-    if facts.gate_pending || facts.open_gate_stages.is_empty() || !facts.waiter.may_be_waiting() {
+    if facts.gate_pending || facts.open_gate_stages.is_empty() || facts.waiter != WaiterStatus::Live
+    {
         return None;
     }
     let gate_stage = facts.open_gate_stages[0];
@@ -4849,7 +6429,10 @@ fn check_dead_agent(facts: &PhaseFacts) -> Option<PhaseFinding> {
             "phase {}: agent pid {pid} recorded but not running at stage {}",
             facts.phase, facts.stage
         ),
-        repair: Some(format!("devflow resume --phase {}", facts.phase)),
+        repair: Some(repair_instead_of_resume(
+            facts,
+            format!("devflow resume --phase {}", facts.phase),
+        )),
     })
 }
 
@@ -4859,23 +6442,52 @@ fn check_dead_agent(facts: &PhaseFacts) -> Option<PhaseFinding> {
 /// answer. Reuses [`phase_liveness`]'s result from the facts rather than
 /// re-deriving it, so `status` and `doctor` cannot drift. ALIVE, a stopped
 /// GONE and NotLaunched are never findings (T-18-11: an unrecorded
-/// supervisor is never a problem). Identifies the supervisor by phase and
-/// launch id, never by its socket path (T-18-01).
+/// supervisor is never a problem), unless its agent still runs (D-19). A live
+/// pending launch is [`check_pending_launch`]'s. Identifies the supervisor by phase
+/// and launch id, never by its socket path (T-18-01).
 fn check_supervisor(facts: &PhaseFacts) -> Option<PhaseFinding> {
     let phase = facts.phase;
+    if let (PhaseLiveness::Gone | PhaseLiveness::NotLaunched, Some(agent)) =
+        (&facts.supervisor, &facts.live_agent)
+    {
+        return Some(PhaseFinding {
+            phase,
+            severity: Severity::Problem,
+            detail: format!(
+                "phase {phase}: no supervisor is live but its agent (pid {}) still runs",
+                agent.pid
+            ),
+            repair: Some(orphaned_agent_line(phase, agent)),
+        });
+    }
     let repair = match &facts.supervisor {
         PhaseLiveness::Stale => {
-            format!("devflow stop --phase {phase} && devflow resume --phase {phase}")
+            let verb = if facts.stored_ship_answer {
+                "ship"
+            } else {
+                "resume"
+            };
+            format!("devflow stop --phase {phase} && devflow {verb} --phase {phase}")
         }
-        PhaseLiveness::GoneWhileActive => format!("devflow resume --phase {phase}"),
+        PhaseLiveness::GoneWhileActive => {
+            repair_instead_of_resume(facts, format!("devflow resume --phase {phase}"))
+        }
+        PhaseLiveness::HeldNoSocket { .. } => HELD_NO_SOCKET_REPAIR.to_string(),
         // `status` prints the operator's own socket path, which doctor
         // must not.
         PhaseLiveness::ProbeFailed(_) => "devflow status".to_string(),
-        PhaseLiveness::Alive { .. } | PhaseLiveness::Gone | PhaseLiveness::NotLaunched => {
+        PhaseLiveness::Alive { .. }
+        | PhaseLiveness::Gone
+        | PhaseLiveness::NotLaunched
+        | PhaseLiveness::LaunchPending { .. } => {
             return None;
         }
     };
-    let launch = facts.supervisor_launch_id.as_deref().unwrap_or("?");
+    let launch = facts
+        .supervisor_launch_id
+        .as_deref()
+        .or(facts.pending.as_ref().map(|(id, _)| id.as_str()))
+        .unwrap_or("?");
     Some(PhaseFinding {
         phase,
         severity: Severity::Problem,
@@ -4885,6 +6497,74 @@ fn check_supervisor(facts: &PhaseFacts) -> Option<PhaseFinding> {
             facts.supervisor.describe()
         ),
         repair: Some(repair),
+    })
+}
+
+/// A reservation the state names (D-02). While its supervisor lives, `stop` is the
+/// repair. A `Warn`, since a healthy launch reads this way until it is promoted. Once
+/// abandoned it blocks nothing, so it is a note with no repair of its own.
+fn check_pending_launch(facts: &PhaseFacts) -> Option<PhaseFinding> {
+    let phase = facts.phase;
+    let (launch_id, liveness) = facts.pending.as_ref()?;
+    let (detail, repair) = if matches!(liveness, PhaseLiveness::LaunchPending { .. }) {
+        (
+            format!("phase {phase}: {}", liveness.describe()),
+            Some(format!("devflow stop --phase {phase}")),
+        )
+    } else {
+        (
+            format!(
+                "phase {phase}: launch reservation {launch_id} is abandoned (no process holds \
+                 it); the next launch or `devflow stop --phase {phase}` clears it"
+            ),
+            None,
+        )
+    };
+    Some(PhaseFinding {
+        phase,
+        severity: Severity::Warn,
+        detail,
+        repair,
+    })
+}
+
+/// A held state write lock (R-03), from one reading that did not wait; a lock that could
+/// not be read is named too. A `Warn`, because a single reading cannot tell a brief hold
+/// from a stuck one: [`WRITE_LOCK_HOLD_NOTE`] says how to judge it.
+fn check_write_lock(facts: &PhaseFacts) -> Option<PhaseFinding> {
+    let phase = facts.phase;
+    let (detail, repair) = if let Some(error) = &facts.write_lock_error {
+        (
+            format!("phase {phase}: could not read the state write lock ({error})"),
+            None,
+        )
+    } else {
+        let workflow::WriteLockStatus::Held { pid } = facts.write_lock else {
+            return None;
+        };
+        let give_up = "`devflow stop` and `devflow recover --clean` give up after 10 s naming it";
+        match pid {
+            Some(pid) => (
+                format!(
+                    "phase {phase}: the state write lock is held by pid {pid} — \
+                     {WRITE_LOCK_HOLD_NOTE}"
+                ),
+                Some(format!("inspect it with `ps -p {pid}`; {give_up}")),
+            ),
+            None => (
+                format!(
+                    "phase {phase}: the state write lock is held by an unknown holder — \
+                     {WRITE_LOCK_HOLD_NOTE}"
+                ),
+                Some(give_up.to_string()),
+            ),
+        }
+    };
+    Some(PhaseFinding {
+        phase,
+        severity: Severity::Warn,
+        detail,
+        repair,
     })
 }
 
@@ -4940,8 +6620,10 @@ fn reconcile_phase(facts: &PhaseFacts) -> Vec<PhaseFinding> {
         check_orphan_gate(facts),
         check_dead_agent(facts),
         check_supervisor(facts),
+        check_pending_launch(facts),
         check_stage_event_drift(facts),
         check_missing_branch(facts),
+        check_write_lock(facts),
     ]
     .into_iter()
     .flatten()
@@ -4980,10 +6662,30 @@ fn build_phase_facts(
 ) -> PhaseFacts {
     let phase = state.phase;
     let stopped = state.stopped;
-    let waiter = lock::holder_status(project_root, phase);
+    let unprepared_restart = run_never_prepared(&state).then(|| restart_verb(&state));
+    let stored_ship_answer = ship_answer_stored(&state);
+    let (waiter, waiter_gate) = phase_gate_waiter(project_root, phase, open_gates);
     let agent_pid = agent_pid_from_file(project_root, phase);
     let agent_alive = agent_pid.is_some_and(agent::agent_running);
     let supervisor = probe_phase(&state);
+    let pending = state.pending_supervisor.as_ref().map(|pending| {
+        let gone = if stopped {
+            PhaseLiveness::Gone
+        } else {
+            PhaseLiveness::GoneWhileActive
+        };
+        (
+            pending.launch_id.clone(),
+            pending_liveness(pending).unwrap_or(gone),
+        )
+    });
+    let live_agent = no_supervisor_live(&supervisor)
+        .then(|| live_phase_agent(project_root, &state))
+        .flatten();
+    let (write_lock, write_lock_error) = match workflow::write_lock_status(project_root, phase) {
+        Ok(status) => (status, None),
+        Err(error) => (workflow::WriteLockStatus::Free, Some(error.to_string())),
+    };
     let supervisor_launch_id = state
         .supervisor
         .as_ref()
@@ -5009,6 +6711,7 @@ fn build_phase_facts(
         stage: state.stage,
         gate_pending: state.gate_pending,
         waiter,
+        waiter_gate,
         agent_pid,
         agent_alive,
         supervisor,
@@ -5018,7 +6721,39 @@ fn build_phase_facts(
         open_gate_stages,
         feature_branch_exists,
         stopped,
+        stored_ship_answer,
+        unprepared_restart,
+        pending,
+        live_agent,
+        write_lock,
+        write_lock_error,
     }
+}
+
+/// [`PhaseFacts::waiter`] and [`PhaseFacts::waiter_gate`]: `Live` and the gate, while
+/// one of the phase's open gates has a held registration; else `Absent` and the
+/// phase's first open gate, the one its findings name. The doctor reads this the way
+/// a writer reads [`waiter_is_live`].
+fn phase_gate_waiter(
+    project_root: &Path,
+    phase: PhaseId,
+    open_gates: &[OpenGate],
+) -> (WaiterStatus, Option<(Stage, String)>) {
+    let mut phase_gates = open_gates.iter().filter(|gate| gate.phase == phase);
+    let first = phase_gates.clone().next();
+    let live = phase_gates.find(|gate| {
+        GateId::parse(&gate.gate_id)
+            .is_ok_and(|id| waiter_is_live(project_root, phase, gate.stage, &id))
+    });
+    let status = if live.is_some() {
+        WaiterStatus::Live
+    } else {
+        WaiterStatus::Absent
+    };
+    let gate = live
+        .or(first)
+        .map(|gate| (gate.stage, gate.gate_id.clone()));
+    (status, gate)
 }
 
 /// Derive the stage named by an event's `stage` field, but only when the
@@ -5051,9 +6786,97 @@ fn findings_for_display(facts: &PhaseFacts) -> Vec<PhaseFinding> {
     }]
 }
 
+/// The heading `status` and `doctor` print over set-aside answers (D-05).
+const SET_ASIDE_ANSWERS_HEADING: &str = "set-aside gate answers:";
+
+/// One info finding per set-aside answer (D-05). The path is relative to the project
+/// root: a finding never carries a username (T-18-01), and `doctor` already says which
+/// project it reads.
+fn set_aside_answer_findings(
+    project_root: &Path,
+    answers: &[QuarantinedAnswer],
+) -> Vec<PhaseFinding> {
+    answers
+        .iter()
+        .map(|answer| {
+            let relative = answer
+                .path
+                .strip_prefix(project_root)
+                .unwrap_or(&answer.path)
+                .display();
+            PhaseFinding {
+                phase: answer.phase,
+                severity: Severity::Info,
+                detail: format!(
+                    "phase {}: an unused answer for the {} gate (gate {}) was set aside: {relative}",
+                    answer.phase, answer.stage, answer.label
+                ),
+                repair: Some(
+                    "inspect it; answer the live gate with `devflow gate approve|reject`"
+                        .to_string(),
+                ),
+            }
+        })
+        .collect()
+}
+
+/// `doctor`'s set-aside section: nothing when there are none.
+fn render_set_aside_findings_text(findings: &[PhaseFinding]) -> String {
+    if findings.is_empty() {
+        return String::new();
+    }
+    let mut out = format!("\n{SET_ASIDE_ANSWERS_HEADING}\n");
+    for finding in findings {
+        out.push_str(&format!("  {}\n", finding.detail));
+        if let Some(repair) = &finding.repair {
+            out.push_str(&format!("    repair: {repair}\n"));
+        }
+    }
+    out
+}
+
+/// `doctor --json`'s `"set_aside_gate_answers"` array.
+fn render_set_aside_findings_json(findings: &[PhaseFinding]) -> serde_json::Value {
+    serde_json::Value::Array(
+        findings
+            .iter()
+            .map(|finding| {
+                serde_json::json!({
+                    "phase": finding.phase,
+                    "severity": finding.severity.label(),
+                    "detail": finding.detail,
+                    "repair": finding.repair,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// `status`'s block of set-aside answers, one group per phase (D-05), or `None` when there
+/// are none. [`Gates::quarantined`] sorts by path, which keeps each phase's answers
+/// together. `status` speaks only about the operator's own project, so it names full paths.
+fn render_set_aside_answers(answers: &[QuarantinedAnswer]) -> Option<String> {
+    if answers.is_empty() {
+        return None;
+    }
+    let mut block = SET_ASIDE_ANSWERS_HEADING.to_string();
+    for group in answers.chunk_by(|a, b| a.phase == b.phase) {
+        block.push_str(&format!("\n  phase {}:", group[0].phase));
+        for answer in group {
+            block.push_str(&format!(
+                "\n    {} gate (gate {}): {}",
+                answer.stage,
+                answer.label,
+                answer.path.display()
+            ));
+        }
+    }
+    Some(block)
+}
+
 /// Build `doctor`'s per-phase reconciliation section (after the existing
-/// tool/env checks), read-only: it never calls `workflow::save_state`,
-/// `events::emit`, `Gates::cleanup`/`Gates::write`, or any `recover::clean*`
+/// tool/env checks), read-only: it never writes state or calls
+/// `events::emit`, `Gates::close`/`Gates::open_gate`, or any `recover::clean*`
 /// function (T-18-02). A pure string builder (not a direct `println!`) so
 /// it's directly assertable in tests without capturing process stdout.
 fn render_reconciliation_text(facts: &[PhaseFacts]) -> String {
@@ -5096,6 +6919,7 @@ fn render_reconciliation_json(facts: &[PhaseFacts]) -> serde_json::Value {
                     "repair": finding.repair,
                     "last_event": phase_facts.last_event,
                     "supervisor": supervisor_json(phase_facts),
+                    "gate_waiter": gate_waiter_json(phase_facts),
                 })
             })
             .collect(),
@@ -5103,8 +6927,9 @@ fn render_reconciliation_json(facts: &[PhaseFacts]) -> serde_json::Value {
 }
 
 /// A phase's supervisor facts for `doctor --json` (50-12): its liveness
-/// label, the owner and launch shape an ALIVE ping reported, and the
-/// recorded launch id. Never the socket path (T-18-01, T-50-32).
+/// label, the owner and launch shape an ALIVE ping reported, the recorded
+/// launch id, and the pending launch (`null`, or its id and liveness label, R2-01).
+/// Never a socket or liveness-file path (T-18-01, T-50-32).
 fn supervisor_json(facts: &PhaseFacts) -> serde_json::Value {
     let (owner, launch) = match &facts.supervisor {
         PhaseLiveness::Alive { owner, launch } => (Some(owner), Some(launch)),
@@ -5115,6 +6940,29 @@ fn supervisor_json(facts: &PhaseFacts) -> serde_json::Value {
         "owner": owner,
         "launch": launch,
         "launch_id": facts.supervisor_launch_id,
+        "pending": facts.pending.as_ref().map(|(launch_id, liveness)| {
+            serde_json::json!({"launch_id": launch_id, "liveness": liveness.label()})
+        }),
+    })
+}
+
+/// A phase's open gate and its waiter for `doctor --json` (R2-01, D-04), the fact the
+/// Phase 50 fault arm reads: `stage` and `gate_id` are `null` and `status` is `absent`
+/// with no open gate; else the gate's stage label, its id, and `live` or `absent` from
+/// its registration. Ids and labels only, never a path (T-18-01): the id comes from
+/// the gate file unchecked, so one [`GateId::parse`] refuses reads `null`.
+fn gate_waiter_json(facts: &PhaseFacts) -> serde_json::Value {
+    let Some((stage, gate_id)) = &facts.waiter_gate else {
+        return serde_json::json!({"stage": null, "gate_id": null, "status": "absent"});
+    };
+    let status = match facts.waiter {
+        WaiterStatus::Live => "live",
+        WaiterStatus::Absent => "absent",
+    };
+    serde_json::json!({
+        "stage": stage.to_string(),
+        "gate_id": GateId::parse(gate_id).is_ok().then_some(gate_id),
+        "status": status,
     })
 }
 
@@ -5151,13 +6999,14 @@ fn checks_json_value(checks: &[Check]) -> serde_json::Value {
 /// 50-12 adds `"orphan_supervisors"` (the socket sweep's findings) and
 /// `"orphan_supervisor_sweep_error"` (`null`, or why the socket directory
 /// could not be listed, so an empty array is never mistaken for a clean
-/// sweep).
+/// sweep). D-05 adds `"set_aside_gate_answers"`, an empty array when there are none.
 fn doctor_json_body(
     checks: &[Check],
     facts: &[PhaseFacts],
     doc_findings: &[PlanningDocFinding],
     stray_findings: &[StrayProcessFinding],
     (orphans, sweep_unlistable): (&[OrphanSupervisorFinding], Option<&str>),
+    set_aside: &[PhaseFinding],
 ) -> serde_json::Value {
     serde_json::json!({
         "environment": checks_json_value(checks),
@@ -5166,6 +7015,7 @@ fn doctor_json_body(
         "stray_processes": render_stray_process_findings_json(stray_findings),
         "orphan_supervisors": render_orphan_supervisors_json(orphans),
         "orphan_supervisor_sweep_error": sweep_unlistable,
+        "set_aside_gate_answers": render_set_aside_findings_json(set_aside),
     })
 }
 
@@ -5415,19 +7265,18 @@ fn stray_layer_label(layer: agent::StrayLayer) -> &'static str {
     }
 }
 
-/// The set of pids that a live registry entry still reaches: every lock
-/// holder pid for the phases of `roots` (listed via
-/// [`workflow::list_states`], read via [`lock::holder_identity`]). A pid in
-/// this set is by definition not a stray (CR-01, 25-15-PLAN.md) — a live
-/// lock file still names it.
+/// The set of pids that a live registry entry still reaches: the holder of every held
+/// launch-liveness file, gate-registration file and phase holder file (D-17) under
+/// `roots`. A pid in this set is by definition not a stray (CR-01, 25-15-PLAN.md): it
+/// holds one of those files now. An unheld file's pid is not in it.
 ///
-/// Lock holders only (50-22). A 3.x supervisor needs no entry: the `/proc`
-/// census this set filters ([`agent::discover_stray_devflow_processes`])
-/// matches only the 2.x monitor-wrapper and `devflow advance` argv shapes
-/// and cannot match a supervisor's (50-12, pinned by
-/// `agent::tests::the_stray_census_matches_only_the_2x_process_shapes` and
-/// by `census_never_sees_a_live_supervisor` in the supervisor e2e), so a
-/// supervisor's pid can never reach a reap through this filter.
+/// A 3.x supervisor is covered through its liveness file, though it needs no entry: the
+/// `/proc` census this set filters ([`agent::discover_stray_devflow_processes`]) matches
+/// only the 2.x monitor-wrapper and `devflow advance` argv shapes and cannot match a
+/// supervisor's (50-12, pinned by
+/// `agent::tests::the_stray_census_matches_only_the_2x_process_shapes` and by
+/// `census_never_sees_a_live_supervisor` in the supervisor e2e), so a supervisor's pid can
+/// never reach a reap through this filter.
 ///
 /// Deliberately excludes the per-phase agent pid file: the `/proc` census
 /// this set filters ([`agent::discover_stray_devflow_processes`]) can only
@@ -5436,13 +7285,11 @@ fn stray_layer_label(layer: agent::StrayLayer) -> &'static str {
 /// would widen the safety set with pids the census structurally cannot
 /// produce.
 ///
-/// Read-only, always: uses [`lock::holder_identity`] (a pure read), never
-/// [`lock::holder`] (which deletes an empty lock file — a write this
-/// function must never perform, since it also runs on `doctor`'s strictly
-/// read-only path).
+/// Read-only, always: it probes and reads these files and never writes one, since it also
+/// runs on `doctor`'s strictly read-only path.
 ///
 /// RESIDUAL (T-25-15-08, not eliminated): this is a point-in-time read. A
-/// root registered, or a lock taken, between this read and a caller's later
+/// root registered, or a file taken, between this read and a caller's later
 /// signal is not covered by it. The untouched
 /// `agent::is_same_process` identity re-confirmation and
 /// [`agent::STRAY_MIN_AGE`] age floor downstream remain the last line of
@@ -5452,18 +7299,45 @@ pub(crate) fn registry_reachable_pids(roots: &[PathBuf]) -> HashSet<u32> {
     let mut scanned = HashSet::new();
     for root in roots {
         if !scanned.insert(root.clone()) {
-            // One root with N phases yields N registry entries;
-            // `list_states` already covers every phase in one pass, so a
-            // second entry for the same root would only repeat the scan.
+            // One root with N phases yields N registry entries, and one pass over its
+            // `.devflow/` already covers every phase.
             continue;
         }
-        for state in workflow::list_states(root) {
-            if let Some((pid, _start_time)) = lock::holder_identity(root, state.phase) {
-                reachable.insert(pid);
-            }
-        }
+        reachable.extend(held_launch_and_phase_holders(root));
+        reachable.extend(
+            Gates::live_waiter_holders(root)
+                .into_iter()
+                .map(|(pid, _start_time)| pid),
+        );
     }
     reachable
+}
+
+/// The pid recorded by each held `.devflow/supervisor-*.live` and `.devflow/.holder-*`
+/// under `root`. A file whose record cannot be read is reported and left out.
+fn held_launch_and_phase_holders(root: &Path) -> Vec<u32> {
+    let Ok(entries) = std::fs::read_dir(root.join(".devflow")) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            (name.starts_with("supervisor-") && name.ends_with(".live"))
+                || name.starts_with(".holder-")
+        })
+        .filter_map(|entry| match liveness::live_holder(&entry.path()) {
+            Ok(holder) => holder.map(|(pid, _start_time)| pid),
+            Err(error) => {
+                eprintln!(
+                    "warning: could not read {}: {error}",
+                    entry.path().display()
+                );
+                None
+            }
+        })
+        .collect()
 }
 
 /// Pure filter: the entries in `strays` whose pid is absent from
@@ -5520,7 +7394,7 @@ fn unreachable_stray_candidates(extra_roots: &[PathBuf]) -> Vec<agent::StrayProc
 
 /// One `doctor` finding for a state-orphaned process (999.44): a process
 /// [`agent::discover_stray_devflow_processes`] matched structurally, but
-/// that no registry entry, lock file, or state file can reach — that
+/// that no registry entry, held file, or state file can reach — that
 /// absence is exactly why the existing per-phase [`PhaseFinding`]s cannot
 /// describe it. Machine-scoped, not phase-scoped: a stray by definition has
 /// no project root, so this finding is never attached to any
@@ -5553,8 +7427,9 @@ pub(crate) fn build_stray_process_findings(
                 severity: Severity::Problem,
                 detail: format!(
                     "pid {} ({layer}) matches DevFlow's monitor-wrapper or advance-child \
-                     argv shape, is owned by the calling user, and is named by no \
-                     registered project root's state file or lock file",
+                     argv shape, is owned by the calling user, and is named by no registered \
+                     project root's state file and held by none of its live liveness, \
+                     gate-registration or foreground-holder files",
                     stray.pid
                 ),
                 repair: Some(
@@ -5644,7 +7519,7 @@ pub(crate) struct OrphanSupervisorFinding {
 /// Every ALIVE or STALE supervisor socket under `cache_dir` that nothing
 /// claims (50-12, D-06): (1) this root's sockets whose phase has no loadable
 /// state, or whose state records no supervisor or another launch
-/// (superseded); (2) machine-wide, sockets whose sidecar names a project
+/// (superseded) and does not name it as pending; (2) machine-wide, sockets whose sidecar names a project
 /// root that no longer exists (the 999.44 deleted-root class the 2.x `/proc`
 /// census used to cover); (3) (R5-I3) sockets of this root whose sidecar is
 /// missing or does not parse, attributed by file name through
@@ -5756,7 +7631,9 @@ impl OrphanReason {
 }
 
 /// Whether this root's state for `phase` claims `launch_id`; the reason
-/// when it does not. Reads the state file only.
+/// when it does not. A launch the state names as pending is claimed, since it may
+/// be the next stage's supervisor before its promotion (D-01). Reads the state file
+/// only.
 fn unclaimed_by_state(
     project_root: &Path,
     phase: PhaseId,
@@ -5765,6 +7642,14 @@ fn unclaimed_by_state(
     match workflow::load_state(project_root, phase) {
         Err(workflow::WorkflowError::MissingState(_)) => Some(OrphanReason::NoState),
         Err(_) => Some(OrphanReason::StateUnloadable),
+        Ok(state)
+            if state
+                .pending_supervisor
+                .as_ref()
+                .is_some_and(|pending| pending.launch_id == launch_id) =>
+        {
+            None
+        }
         Ok(state) => match state.supervisor {
             None => Some(OrphanReason::NoRecord),
             Some(record) if record.launch_id != launch_id => Some(OrphanReason::Superseded),
@@ -5871,12 +7756,15 @@ mod tests {
     use super::*;
     use crate::{Cli, Command, GateCmd};
     use clap::Parser;
+    use devflow_core::gates::WaiterRegistration;
+    use devflow_core::test_support::{gate_answer_files, with_answer_before_publish};
 
     #[test]
-    fn gate_response_message_does_not_claim_pickup_after_live_becomes_no_holder() {
-        let live = response_pickup_message(Stage::Code, lock::HolderStatus::Live { pid: 42 });
+    fn gate_response_message_does_not_claim_pickup_after_the_waiter_goes() {
+        let live = response_pickup_message(Stage::Code, WaiterStatus::Live);
         assert!(live.contains("may pick up"), "live message: {live}");
-        let gone = response_pickup_message(Stage::Code, lock::HolderStatus::NoHolder);
+        assert!(!live.contains("lock"), "live message: {live}");
+        let gone = response_pickup_message(Stage::Code, WaiterStatus::Absent);
         assert!(
             gone.contains("no confirmed waiter"),
             "no-holder message: {gone}"
@@ -5900,8 +7788,8 @@ mod tests {
         let root = dir.path();
         let phase = PhaseId::new(4801);
         Gates::write_gate(root, phase, Stage::Code, "paused").unwrap();
-        assert!(!stop_via_gate(root, phase).unwrap().0);
-        assert!(!Gates::response_path(root, phase, Stage::Code).exists());
+        assert!(stop_via_gate(root, phase).unwrap().is_none());
+        assert!(gate_answer_files(root, phase, Stage::Code).is_empty());
     }
 
     #[test]
@@ -5913,16 +7801,10 @@ mod tests {
         state.stage = Stage::Code;
         state.gate_pending = true;
         workflow::save_state(&state).unwrap();
-        let pid = std::process::id();
-        let start = agent::process_start_time(pid).unwrap();
-        let path = root
-            .join(".devflow")
-            .join(format!("lock-{}", phase.padded()));
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, format!("{pid}\n{start}")).unwrap();
-        Gates::write_gate(root, phase, Stage::Code, "paused").unwrap();
-        assert!(stop_via_gate(root, phase).unwrap().0);
-        assert!(Gates::response_path(root, phase, Stage::Code).exists());
+        let (_, registration) = Gates::open_registered(root, phase, Stage::Code, "paused").unwrap();
+        assert!(stop_via_gate(root, phase).unwrap().is_some());
+        assert!(!gate_answer_files(root, phase, Stage::Code).is_empty());
+        registration.finish();
     }
 
     #[test]
@@ -5932,31 +7814,15 @@ mod tests {
         let phase = PhaseId::new(4802);
         Gates::write_gate(root, phase, Stage::Code, "paused").unwrap();
         gate_sweep(Some(0), false, Some(root.to_path_buf()), false).unwrap();
-        assert!(!Gates::response_path(root, phase, Stage::Code).exists());
+        assert!(gate_answer_files(root, phase, Stage::Code).is_empty());
     }
 
     #[test]
     fn gate_sweep_preview_uses_the_no_waiter_matrix() {
-        assert!(!gate_sweep_may_reap(
-            Stage::Code,
-            lock::HolderStatus::NoHolder
-        ));
-        assert!(!gate_sweep_may_reap(
-            Stage::Code,
-            lock::HolderStatus::Recycled { pid: 42 }
-        ));
-        assert!(!gate_sweep_may_reap(
-            Stage::Ship,
-            lock::HolderStatus::NoHolder
-        ));
-        assert!(!gate_sweep_may_reap(
-            Stage::Ship,
-            lock::HolderStatus::Unconfirmable { pid: 42 }
-        ));
-        assert!(gate_sweep_may_reap(
-            Stage::Code,
-            lock::HolderStatus::Live { pid: 42 }
-        ));
+        for stage in [Stage::Code, Stage::Ship] {
+            assert!(!gate_sweep_may_reap(stage, false), "{stage} with no waiter");
+            assert!(gate_sweep_may_reap(stage, true), "{stage} with a waiter");
+        }
     }
 
     #[test]
@@ -5965,106 +7831,34 @@ mod tests {
         let root = dir.path();
         let phase = PhaseId::new(4803);
         Gates::write_gate(root, phase, Stage::Ship, "merge").unwrap();
-        gate_respond(root, phase, Some(Stage::Ship), true, None).unwrap();
-        assert!(Gates::response_path(root, phase, Stage::Ship).exists());
+        gate_respond(root, phase, Some(Stage::Ship), true, None, None).unwrap();
+        assert!(!gate_answer_files(root, phase, Stage::Ship).is_empty());
         assert!(no_waiter_repair(phase, Stage::Ship).contains("devflow ship --phase 4803"));
     }
 
     #[test]
-    fn gate_respond_with_a_recycled_lock_pid_at_a_non_ship_gate_writes_nothing() {
+    fn gate_respond_with_no_registered_waiter_at_a_non_ship_gate_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(4804);
-        let pid = std::process::id();
-        let start = agent::process_start_time(pid).unwrap();
-        let path = root
-            .join(".devflow")
-            .join(format!("lock-{}", phase.padded()));
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, format!("{pid}\n{}", start + 1)).unwrap();
         Gates::write_gate(root, phase, Stage::Code, "paused").unwrap();
-        let err = gate_respond(root, phase, Some(Stage::Code), false, Some("abort".into()))
-            .expect_err("a recycled non-Ship holder must not receive a response");
+        let err = gate_respond(
+            root,
+            phase,
+            Some(Stage::Code),
+            false,
+            Some("abort".into()),
+            None,
+        )
+        .expect_err("an unregistered non-Ship gate must not receive a response");
         assert!(
             err.to_string().contains("devflow resume --phase 4804"),
             "repair must name the concrete phase: {err}"
         );
-        assert!(!Gates::response_path(root, phase, Stage::Code).exists());
+        assert!(gate_answer_files(root, phase, Stage::Code).is_empty());
     }
 
-    /// T-48-16-03 at the `gate` verbs, not only at `stop`: Ship's
-    /// stored-response exception is for `NoHolder` alone. A recycled pid is
-    /// an unrelated live process, and a response left for it cannot be
-    /// consumed by `devflow ship` while that pid holds the lock.
-    /// `gate_approve_with_no_waiter_at_the_ship_gate_writes_and_names_ship`
-    /// is the `NoHolder` control that must still write.
-    #[test]
-    fn gate_respond_with_a_recycled_lock_pid_at_the_ship_gate_writes_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(4848);
-        let pid = std::process::id();
-        let start = agent::process_start_time(pid).unwrap();
-        let path = root
-            .join(".devflow")
-            .join(format!("lock-{}", phase.padded()));
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, format!("{pid}\n{}", start + 1)).unwrap();
-        assert!(matches!(
-            lock::holder_status(root, phase),
-            lock::HolderStatus::Recycled { .. }
-        ));
-        Gates::write_gate(root, phase, Stage::Ship, "merge").unwrap();
-        let err = gate_respond(root, phase, Some(Stage::Ship), true, None)
-            .expect_err("a recycled Ship holder must not receive a response");
-        assert!(
-            err.to_string().contains("no response was written"),
-            "the refusal must say nothing was written: {err}"
-        );
-        assert!(!Gates::response_path(root, phase, Stage::Ship).exists());
-    }
-
-    #[test]
-    fn stop_at_a_ship_gate_with_a_recycled_holder_claims_no_waiter() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(4806);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Ship;
-        state.gate_pending = true;
-        workflow::save_state(&state).unwrap();
-        let pid = std::process::id();
-        let start = agent::process_start_time(pid).unwrap();
-        let path = root
-            .join(".devflow")
-            .join(format!("lock-{}", phase.padded()));
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, format!("{pid}\n{}", start + 1)).unwrap();
-        Gates::write_gate(root, phase, Stage::Ship, "merge").unwrap();
-        // A recycled pid is an unrelated process, not Ship's manual-recovery
-        // no-holder case. `stop` must not leave it an abort response that no
-        // legitimate waiter can consume.
-        let err = stop(root, phase).unwrap_err().to_string();
-        assert!(
-            err.contains("refusing to signal") && err.contains("recycled"),
-            "{err}"
-        );
-        assert!(
-            !Gates::response_path(root, phase, Stage::Ship).exists(),
-            "a recycled holder must not receive an unconsumable Ship abort response"
-        );
-        assert!(
-            workflow::load_state(root, phase).unwrap().gate_pending,
-            "without a confirmed waiter, stop must leave the live phase state untouched"
-        );
-        assert!(
-            response_pickup_message(Stage::Ship, lock::HolderStatus::Recycled { pid: 42 })
-                .contains("no confirmed waiter")
-        );
-    }
-
-    /// The Ship exception is intentionally narrow: no holder permits a stored
-    /// response for manual recovery, but a recycled live PID does not.
+    /// D-04: with no registered waiter, a Ship abort is stored for `devflow ship`.
     #[test]
     fn stop_at_a_ship_gate_without_a_holder_keeps_manual_recovery_available() {
         let dir = tempfile::tempdir().unwrap();
@@ -6079,7 +7873,7 @@ mod tests {
         stop(root, phase).expect("Ship with no holder may retain its abort response");
 
         assert!(
-            Gates::response_path(root, phase, Stage::Ship).exists(),
+            !gate_answer_files(root, phase, Stage::Ship).is_empty(),
             "the manual-recovery Ship exception must remain available"
         );
         assert!(
@@ -6097,180 +7891,1610 @@ mod tests {
         state.stage = Stage::Code;
         state.gate_pending = true;
         workflow::save_state(&state).unwrap();
-        let pid = std::process::id();
-        let path = root
-            .join(".devflow")
-            .join(format!("lock-{}", phase.padded()));
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, pid.to_string()).unwrap();
         Gates::write_gate(root, phase, Stage::Code, "paused").unwrap();
-        let error = stop(root, phase).unwrap_err().to_string();
-        assert!(!Gates::response_path(root, phase, Stage::Code).exists());
+        // Not the test process: a broken identity check signals this child, not the runner.
+        let (mut holder, _) = sleep_child_with_start();
+        let _hold = hold_phase_with_record(root, phase, holder.id(), None);
+        let result = stop(root, phase);
+        let holder_alive = devflow_core::test_support::process_is_live(holder.id());
+        let _ = holder.kill();
+        let _ = holder.wait();
+        let error = result.unwrap_err().to_string();
+        assert!(holder_alive, "a record with no start time signals nothing");
+        assert!(gate_answer_files(root, phase, Stage::Code).is_empty());
         assert!(error.contains("refusing to signal"), "{error}");
-        let message =
-            response_pickup_message(Stage::Code, lock::HolderStatus::Unconfirmable { pid: 42 });
-        assert!(message.contains("cannot be confirmed"));
-        assert!(!message.contains("waiting monitor"));
-    }
-
-    /// T-48-16-02 / T-48-16-03: after `stop` answers a gate it cannot take the
-    /// lock for, a waiter is claimed only when the process blocking the lock
-    /// is the live holder `stop_via_gate` observed. A queued `advance` can take
-    /// the lock after the real waiter aborts; that process is not the waiter.
-    #[test]
-    fn answered_gate_contention_claims_a_waiter_only_for_the_observed_live_holder() {
-        const WAITING: &str = "is waiting on the gate";
-        let phase = PhaseId::new(4808);
-        let message = |observed_holder,
-                       observed_identity,
-                       current_holder,
-                       current_identity,
-                       contending_pid| {
-            answered_gate_contention_message(
-                phase,
-                Stage::Code,
-                observed_holder,
-                observed_identity,
-                current_holder,
-                current_identity,
-                contending_pid,
-            )
-        };
-
-        // Opposite-result control: exactly the observed live holder, including
-        // its recorded start time, still holds the lock.
-        let same = message(
-            lock::HolderStatus::Live { pid: 7 },
-            Some((7, Some(700))),
-            lock::HolderStatus::Live { pid: 7 },
-            Some((7, Some(700))),
-            "7",
-        )
-        .unwrap();
-        assert!(same.contains(WAITING), "{same}");
-
-        for (
-            observed_holder,
-            observed_identity,
-            current_holder,
-            current_identity,
-            contending_pid,
-        ) in [
-            // The regression: the original waiter exited and a queued
-            // `advance` acquired the lock. A fresh read alone makes this look
-            // like a valid waiter unless its identity is compared with what
-            // `stop_via_gate` observed before writing the abort response.
-            (
-                lock::HolderStatus::Live { pid: 7 },
-                Some((7, Some(700))),
-                lock::HolderStatus::Live { pid: 8 },
-                Some((8, Some(800))),
-                "8",
-            ),
-            (
-                lock::HolderStatus::Unconfirmable { pid: 7 },
-                Some((7, None)),
-                lock::HolderStatus::Live { pid: 7 },
-                Some((7, Some(700))),
-                "7",
-            ),
-            (
-                lock::HolderStatus::NoHolder,
-                None,
-                lock::HolderStatus::Live { pid: 8 },
-                Some((8, Some(800))),
-                "8",
-            ),
-        ] {
-            let neutral = message(
-                observed_holder,
-                observed_identity,
-                current_holder,
-                current_identity,
-                contending_pid,
-            )
-            .expect_err("only the observed live holder can consume stop's rejection")
-            .to_string();
-            assert!(
-                !neutral.contains(WAITING)
-                    && neutral.contains("not marked stopped")
-                    && neutral.contains("devflow resume --phase 4808"),
-                "{observed_holder:?} with pid {contending_pid} blocking: {neutral}"
-            );
-        }
-
-        let recycled = answered_gate_contention_message(
-            phase,
-            Stage::Ship,
-            lock::HolderStatus::Live { pid: 7 },
-            Some((7, Some(700))),
-            lock::HolderStatus::Recycled { pid: 7 },
-            Some((7, Some(701))),
-            "7",
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(
-            recycled.contains("not marked stopped")
-                && recycled.contains("devflow ship --phase 4808"),
-            "{recycled}"
-        );
     }
 
     #[test]
-    fn existing_response_stops_only_for_a_live_abort_holder() {
+    fn existing_response_stops_only_for_an_abort_with_a_registered_waiter() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(4809);
         let stage = Stage::Code;
-        let path = Gates::response_path(root, phase, stage);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
 
-        let write_response = |approved, note: Option<&str>| {
-            std::fs::write(
-                &path,
-                serde_json::to_string(&GateResponse {
-                    approved,
-                    note: note.map(str::to_owned),
-                    responded_by: Some("test".into()),
-                })
-                .unwrap(),
-            )
-            .unwrap();
+        // A new gate per case: a gate keeps its first answer.
+        let answered_gate = |approved, note: Option<&str>| {
+            let gate = Gates::open_gate(root, phase, stage, "g").unwrap().gate_id;
+            let response = GateResponse {
+                approved,
+                note: note.map(str::to_owned),
+                responded_by: Some("test".into()),
+            };
+            Gates::answer(root, phase, stage, &gate, &response).unwrap();
+            gate
         };
 
-        write_response(true, None);
-        let non_abort = stop_with_existing_response(
-            root,
-            phase,
-            stage,
-            lock::HolderStatus::Live { pid: 7 },
-            None,
-        )
-        .unwrap();
-        assert_eq!(non_abort, (false, None));
+        let approved = answered_gate(true, None);
+        let registration = Gates::register_waiter(root, phase, stage, &approved).unwrap();
+        let non_abort = stop_with_existing_response(root, phase, stage, &approved, None).unwrap();
+        assert_eq!(non_abort, None);
+        registration.finish();
 
-        write_response(false, Some("abort"));
-        let no_holder =
-            stop_with_existing_response(root, phase, stage, lock::HolderStatus::NoHolder, None)
+        let no_waiter = answered_gate(false, Some("abort"));
+        let unregistered =
+            stop_with_existing_response(root, phase, stage, &no_waiter, None).unwrap();
+        assert_eq!(unregistered, None, "nothing on disk is no waiter");
+
+        let live = answered_gate(false, Some("abort"));
+        let registration = Gates::register_waiter(root, phase, stage, &live).unwrap();
+        let live_abort =
+            stop_with_existing_response(root, phase, stage, &live, Some("launch-a".to_string()))
                 .unwrap();
-        assert_eq!(no_holder, (false, None));
+        assert_eq!(
+            live_abort,
+            Some((stage, live.clone(), Some("launch-a".to_string()), false))
+        );
+        registration.finish();
+    }
 
-        let live_abort = stop_with_existing_response(
-            root,
+    /// State at `stage` with its gate pending, the shape `stop` treats as current.
+    fn state_pending_at(root: &Path, phase: PhaseId, stage: Stage) {
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = stage;
+        state.gate_pending = true;
+        workflow::save_state(&state).unwrap();
+    }
+
+    /// The open gate of `phase` as `Gates::list_open` shows it, as a writer holds
+    /// it after listing.
+    fn listed_gate(root: &Path, phase: PhaseId) -> OpenGate {
+        Gates::list_open(root)
+            .into_iter()
+            .find(|gate| gate.phase == phase)
+            .expect("the gate is listed")
+    }
+
+    #[test]
+    fn gate_sweep_reaps_only_the_observed_gate_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, stage) = (PhaseId::new(4911), Stage::Code);
+        Gates::open_gate(root, phase, stage, "g1").unwrap();
+        let g1_entry = listed_gate(root, phase);
+        Gates::close(root, phase, stage).unwrap();
+        let (g2, registration) = Gates::open_registered(root, phase, stage, "g2").unwrap();
+        let g2 = g2.gate_id;
+
+        assert_eq!(
+            sweep_one_gate(root, &g1_entry, 1, 0, false).unwrap(),
+            SweepStep::Skipped,
+            "a gate changed since it was listed is reported, not left as waiterless"
+        );
+        assert_eq!(
+            Gates::read_answer(root, phase, stage, &g2),
+            AnswerRead::None
+        );
+        assert_eq!(listed_gate(root, phase).gate_id, g2.as_str());
+
+        let g2_entry = listed_gate(root, phase);
+        assert_eq!(
+            sweep_one_gate(root, &g2_entry, 1, 0, false).unwrap(),
+            SweepStep::Reaped
+        );
+        let AnswerRead::Bound(answer) = Gates::read_answer(root, phase, stage, &g2) else {
+            panic!("the sweep answers the gate it observed");
+        };
+        assert!(!answer.response.approved, "a reap never approves (T-23-41)");
+        registration.finish();
+    }
+
+    /// A gate file naming an empty id can be reported, and nothing else: no answer
+    /// can bind to it. Both writers skip it before reading liveness.
+    #[test]
+    fn a_gate_with_no_gate_id_is_reported_and_never_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, stage) = (PhaseId::new(4912), Stage::Code);
+        state_pending_at(root, phase, stage);
+        Gates::open_gate(root, phase, stage, "g").unwrap();
+        let mut entry = listed_gate(root, phase);
+        entry.gate_id = String::new();
+        let file = GateFile {
             phase,
             stage,
-            lock::HolderStatus::Live { pid: 7 },
-            None,
+            context: entry.context.clone(),
+            timestamp: entry.timestamp.clone(),
+            gate_id: String::new(),
+        };
+        std::fs::write(
+            Gates::gate_path(root, phase, stage),
+            serde_json::to_string_pretty(&file).unwrap(),
         )
         .unwrap();
+
+        assert_eq!(
+            sweep_one_gate(root, &entry, 1, 0, false).unwrap(),
+            SweepStep::Skipped
+        );
+        assert_eq!(stop_reap_observed_gate(root, phase, &entry).unwrap(), None);
+        assert!(gate_answer_files(root, phase, stage).is_empty());
+    }
+
+    #[test]
+    fn stop_answers_only_the_observed_gate_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, stage) = (PhaseId::new(4913), Stage::Code);
+        state_pending_at(root, phase, stage);
+        Gates::open_gate(root, phase, stage, "g1").unwrap();
+        let g1_entry = listed_gate(root, phase);
+        Gates::close(root, phase, stage).unwrap();
+        let (g2, registration) = Gates::open_registered(root, phase, stage, "g2").unwrap();
+        let g2 = g2.gate_id;
+
+        assert_eq!(
+            stop_reap_observed_gate(root, phase, &g1_entry).unwrap(),
+            None,
+            "a stale entry falls through to the socket path"
+        );
+        assert_eq!(
+            Gates::read_answer(root, phase, stage, &g2),
+            AnswerRead::None
+        );
+
+        // Control: with G2's own entry the same waiter is answered, so the refusal
+        // above was the id comparison, not a missing waiter.
+        let g2_entry = listed_gate(root, phase);
+        assert!(
+            stop_reap_observed_gate(root, phase, &g2_entry)
+                .unwrap()
+                .is_some()
+        );
+        let AnswerRead::Bound(answer) = Gates::read_answer(root, phase, stage, &g2) else {
+            panic!("stop answers the gate it observed");
+        };
         assert!(matches!(
-            live_abort,
-            (
-                true,
-                Some((Stage::Code, lock::HolderStatus::Live { pid: 7 }, None))
-            )
+            GateAction::from_response(&answer.response),
+            GateAction::Abort(_)
         ));
+        registration.finish();
+    }
+
+    #[test]
+    fn stop_reads_an_existing_answer_for_the_observed_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, stage) = (PhaseId::new(4914), Stage::Code);
+        state_pending_at(root, phase, stage);
+        let answer_with = |approved, note: &str| {
+            let (opened, registration) = Gates::open_registered(root, phase, stage, "g").unwrap();
+            let entry = listed_gate(root, phase);
+            let response = GateResponse {
+                approved,
+                note: Some(note.to_owned()),
+                responded_by: Some("human".into()),
+            };
+            Gates::answer(root, phase, stage, &opened.gate_id, &response).unwrap();
+            (opened.gate_id, entry, registration)
+        };
+
+        let (gate, entry, registration) = answer_with(false, "abort: by a human");
+        let answered = stop_reap_observed_gate(root, phase, &entry).unwrap();
+        assert_eq!(
+            answered,
+            Some((stage, gate.clone(), None, false)),
+            "a live abort is the requested stop"
+        );
+        let AnswerRead::Bound(kept) = Gates::read_answer(root, phase, stage, &gate) else {
+            panic!("the first answer stays");
+        };
+        assert_eq!(kept.response.responded_by.as_deref(), Some("human"));
+        registration.finish();
+        Gates::close(root, phase, stage).unwrap();
+
+        let (gate, entry, registration) = answer_with(true, "approved by a human");
+        assert_eq!(
+            stop_reap_observed_gate(root, phase, &entry).unwrap(),
+            None,
+            "an approval is not stop's outcome"
+        );
+        assert!(matches!(
+            Gates::read_answer(root, phase, stage, &gate),
+            AnswerRead::Bound(kept) if kept.response.approved
+        ));
+        registration.finish();
+    }
+
+    /// Open G1, close it, and open G2 at the same stage with a held registration:
+    /// the shape in which a writer that observed G1 could answer G2.
+    fn g1_replaced_by_registered_g2(
+        root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+    ) -> (GateId, GateId, WaiterRegistration) {
+        let g1 = Gates::open_gate(root, phase, stage, "g1").unwrap().gate_id;
+        Gates::close(root, phase, stage).unwrap();
+        let (g2, registration) = Gates::open_registered(root, phase, stage, "g2").unwrap();
+        (g1, g2.gate_id, registration)
+    }
+
+    #[test]
+    fn gate_respond_publishes_only_for_the_observed_gate_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, stage) = (PhaseId::new(4901), Stage::Code);
+        let (g1, g2, registration) = g1_replaced_by_registered_g2(root, phase, stage);
+
+        let err = gate_respond(root, phase, Some(stage), true, None, Some(g1.to_string()))
+            .expect_err("an answer about G1 must not land while G2 is open")
+            .to_string();
+
+        assert!(
+            err.contains(g1.as_str()) && err.contains(g2.as_str()),
+            "the refusal must name both gates: {err}"
+        );
+        assert!(err.contains("devflow gate list"), "{err}");
+        assert!(
+            !err.contains("no registered waiter"),
+            "a changed gate must not read as a missing waiter: {err}"
+        );
+        assert_eq!(
+            Gates::read_answer(root, phase, stage, &g2),
+            AnswerRead::None
+        );
+        assert!(!Gates::answer_path(root, phase, stage, &g1).exists());
+
+        gate_respond(root, phase, Some(stage), true, None, None).unwrap();
+
+        let AnswerRead::Bound(answer) = Gates::read_answer(root, phase, stage, &g2) else {
+            panic!("with no id given, the command answers the gate open now");
+        };
+        assert_eq!(answer.gate_id, g2.as_str());
+        assert!(answer.response.approved);
+        registration.finish();
+    }
+
+    /// T-50.1-42: a malformed `--gate-id` is refused before it can name a path.
+    #[test]
+    fn gate_respond_refuses_a_malformed_gate_id_before_touching_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, stage) = (PhaseId::new(4902), Stage::Code);
+        let (opened, registration) = Gates::open_registered(root, phase, stage, "g").unwrap();
+
+        let err = gate_respond(
+            root,
+            phase,
+            Some(stage),
+            true,
+            None,
+            Some("../../etc".into()),
+        )
+        .expect_err("a malformed gate id must be refused")
+        .to_string();
+
+        assert!(err.contains("is not a gate id"), "{err}");
+        assert_eq!(
+            Gates::read_answer(root, phase, stage, &opened.gate_id),
+            AnswerRead::None
+        );
+        assert!(gate_answer_files(root, phase, stage).is_empty());
+        registration.finish();
+    }
+
+    /// The window this mapping covers, the gate changing between `gate_respond`'s
+    /// comparison and `Gates::answer`'s re-check, has no seam, so the mapping is
+    /// tested on its own.
+    #[test]
+    fn a_gate_changed_at_publish_is_reported_like_one_changed_before_it() {
+        let message = gate_answer_error(GateError::GateIdMismatch {
+            phase: PhaseId::new(4907),
+            stage: Stage::Code,
+            observed: "g1".into(),
+            current: "g2".into(),
+        })
+        .to_string();
+
+        assert_eq!(
+            message,
+            gate_changed_message(PhaseId::new(4907), Stage::Code, "g1", "g2")
+        );
+        assert!(message.contains("nothing was written"), "{message}");
+    }
+
+    #[test]
+    fn gate_list_and_show_print_the_gate_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let opened = Gates::open_gate(root, PhaseId::new(4903), Stage::Ship, "ctx").unwrap();
+        let open = Gates::list_open(root);
+
+        let list = render_gate_list(&open);
+        let show = render_gate_show(&open[0]);
+
+        assert!(list.contains(opened.gate_id.as_str()), "{list}");
+        assert!(
+            show.contains(&format!("gate id: {}", opened.gate_id)),
+            "{show}"
+        );
+    }
+
+    #[test]
+    fn doctor_facts_read_a_registered_waiter_as_the_live_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, stage) = (PhaseId::new(4906), Stage::Code);
+        let (_, registration) = Gates::open_registered(root, phase, stage, "g").unwrap();
+        let open = Gates::list_open(root);
+
+        assert_eq!(phase_gate_waiter(root, phase, &open).0, WaiterStatus::Live);
+        registration.finish();
+        assert_eq!(
+            phase_gate_waiter(root, phase, &open).0,
+            WaiterStatus::Absent
+        );
+    }
+
+    /// A process recorded in a per-phase lock file, as no waiter records itself any more.
+    fn plant_live_lock_record(root: &Path, phase: PhaseId) {
+        let pid = std::process::id();
+        let start = agent::process_start_time(pid).unwrap();
+        let path = root
+            .join(".devflow")
+            .join(format!("lock-{}", phase.padded()));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, format!("{pid}\n{start}")).unwrap();
+    }
+
+    /// D-04: a registered waiter's gate is answered with no lock file anywhere, and with
+    /// none registered it is refused even beside a live lock record. A Ship answer is
+    /// still stored for `devflow ship`.
+    #[test]
+    fn gate_respond_answers_a_registered_waiter_and_refuses_when_none_is_registered() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let (registered, stage) = (PhaseId::new(5001), Stage::Code);
+        let (opened, registration) = Gates::open_registered(root, registered, stage, "g").unwrap();
+        gate_respond(root, registered, Some(stage), true, None, None)
+            .expect("a registered waiter's gate is answered");
+        assert!(
+            matches!(
+                Gates::read_answer(root, registered, stage, &opened.gate_id),
+                AnswerRead::Bound(answer) if answer.response.approved
+            ),
+            "the answer binds to the observed gate"
+        );
+        assert!(
+            !root
+                .join(".devflow")
+                .join(format!("lock-{}", registered.padded()))
+                .exists(),
+            "no lock file played any part"
+        );
+        registration.finish();
+
+        let beside_a_lock = PhaseId::new(5003);
+        Gates::open_gate(root, beside_a_lock, stage, "g").unwrap();
+        plant_live_lock_record(root, beside_a_lock);
+        let refused = gate_respond(root, beside_a_lock, Some(stage), true, None, None)
+            .expect_err("a live lock record is no waiter")
+            .to_string();
+        assert!(refused.contains("no registered waiter"), "{refused}");
+        assert!(gate_answer_files(root, beside_a_lock, stage).is_empty());
+
+        let released = PhaseId::new(5002);
+        let (_, registration) = Gates::open_registered(root, released, stage, "g").unwrap();
+        registration.finish();
+        let refused = gate_respond(root, released, Some(stage), true, None, None)
+            .expect_err("a finished registration is no waiter")
+            .to_string();
+        assert!(refused.contains("no registered waiter"), "{refused}");
+        assert!(refused.contains("no response was written"), "{refused}");
+        assert!(gate_answer_files(root, released, stage).is_empty());
+
+        let ship = PhaseId::new(5004);
+        let gate = Gates::open_gate(root, ship, Stage::Ship, "g")
+            .unwrap()
+            .gate_id;
+        gate_respond(root, ship, Some(Stage::Ship), true, None, None)
+            .expect("a Ship answer is stored for `devflow ship`");
+        assert!(matches!(
+            Gates::read_answer(root, ship, Stage::Ship, &gate),
+            AnswerRead::Bound(answer) if answer.response.approved
+        ));
+        assert!(no_waiter_repair(ship, Stage::Ship).contains("devflow ship --phase 5004"));
+    }
+
+    /// Hold `phase`'s gate lock through a separate open, as a suspended writer would.
+    fn hold_gate_lock(root: &Path, phase: PhaseId) -> std::fs::File {
+        let path = root
+            .join(".devflow")
+            .join(format!(".gates-{}.lock", phase.padded()));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)
+            .unwrap();
+        file.lock().unwrap();
+        file
+    }
+
+    /// Whether `child` ends within `within`, reaping it if it does.
+    fn child_exits_within(child: &mut std::process::Child, within: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + within;
+        while std::time::Instant::now() < deadline {
+            if child.try_wait().unwrap().is_some() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        child.try_wait().unwrap().is_some()
+    }
+
+    /// A `sleep` child that is killed and reaped when this drops, on a failed assertion too.
+    struct SleepingChild {
+        child: std::process::Child,
+        start: u64,
+    }
+
+    impl SleepingChild {
+        fn spawn() -> Self {
+            let (child, start) = sleep_child_with_start();
+            Self { child, start }
+        }
+
+        fn pid(&self) -> u32 {
+            self.child.id()
+        }
+
+        fn is_live(&self) -> bool {
+            devflow_core::test_support::process_is_live(self.pid())
+        }
+    }
+
+    impl Drop for SleepingChild {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    /// `GateLockTimeout`: a gate writer gives up within the bound and writes nothing,
+    /// and is never told there is no waiter. `stop` goes on to the arms that reach the
+    /// run without the gate. Control: with the lock free, the same answer lands.
+    #[test]
+    fn a_gate_writer_gives_up_on_a_held_gate_lock_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let stage = Stage::Code;
+
+        let phase = PhaseId::new(5005);
+        let (opened, registration) = Gates::open_registered(root, phase, stage, "g").unwrap();
+        let gate_lock = hold_gate_lock(root, phase);
+        let started = std::time::Instant::now();
+        let error = gate_respond(
+            root,
+            phase,
+            Some(stage),
+            true,
+            None,
+            Some(opened.gate_id.to_string()),
+        )
+        .expect_err("a held gate lock ends the writer");
+        let took = started.elapsed();
+        assert!(
+            took >= devflow_core::gates::GATE_LOCK_WAIT,
+            "gave up after {took:?}"
+        );
+        assert!(
+            took < devflow_core::gates::GATE_LOCK_WAIT + std::time::Duration::from_secs(2),
+            "waited {took:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            matches!(error, CliError::Gate(GateError::GateLockTimeout { .. })),
+            "{message}"
+        );
+        assert!(message.contains(".gates-"), "{message}");
+        assert!(message.contains("nothing was changed"), "{message}");
+        assert!(gate_answer_files(root, phase, stage).is_empty());
+
+        let stopping = PhaseId::new(5006);
+        state_pending_at(root, stopping, stage);
+        let (_, stop_registration) = Gates::open_registered(root, stopping, stage, "g").unwrap();
+        let stop_gate_lock = hold_gate_lock(root, stopping);
+        let mut holder = SleepingChild::spawn();
+        let _hold = hold_phase_with_record(root, stopping, holder.pid(), Some(holder.start));
+        let cache = tempfile::tempdir().unwrap();
+        let stopped = stop_in(root, stopping, Some(cache.path()));
+        assert!(
+            child_exits_within(&mut holder.child, agent::TERMINATE_VERIFY_WAIT),
+            "stop reaches the holder past a gate it could not answer: {stopped:?}"
+        );
+        assert!(stopped.is_err(), "the test's hold outlives its child");
+        assert!(
+            gate_answer_files(root, stopping, stage).is_empty(),
+            "stop wrote no answer under the held lock"
+        );
+        stop_registration.finish();
+        drop(stop_gate_lock);
+
+        drop(gate_lock);
+        gate_respond(
+            root,
+            phase,
+            Some(stage),
+            true,
+            None,
+            Some(opened.gate_id.to_string()),
+        )
+        .expect("with the lock free the same answer lands");
+        assert!(matches!(
+            Gates::read_answer(root, phase, stage, &opened.gate_id),
+            AnswerRead::Bound(_)
+        ));
+        registration.finish();
+    }
+
+    /// Wait, boundedly, for `path` to read unheld: another test's fork keeps a released
+    /// flock held until its exec.
+    fn wait_until_unheld(path: &Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while matches!(liveness::probe(path), Ok(liveness::Held::Live)) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{} still reads held",
+                path.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// D-04, T-50.1-67/68: a registered waiter's aged gate is reaped, and a crashed
+    /// waiter's, whose registration file is there but unheld, is left alone.
+    #[test]
+    fn gate_sweep_reaps_only_a_gate_with_a_registered_waiter() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let stage = Stage::Code;
+        let (live, crashed) = (PhaseId::new(5011), PhaseId::new(5012));
+        let (live_gate, registration) = Gates::open_registered(root, live, stage, "g").unwrap();
+        let (crashed_gate, crashed_registration) =
+            Gates::open_registered(root, crashed, stage, "g").unwrap();
+        drop(crashed_registration);
+        let crashed_file = Gates::waiter_path(root, crashed, stage, &crashed_gate.gate_id);
+        wait_until_unheld(&crashed_file);
+        assert!(crashed_file.exists(), "a crash leaves its file behind");
+
+        gate_sweep(Some(0), false, Some(root.to_path_buf()), false).unwrap();
+
+        assert!(
+            matches!(
+                Gates::read_answer(root, live, stage, &live_gate.gate_id),
+                AnswerRead::Bound(answer) if !answer.response.approved
+            ),
+            "a registered waiter's gate is reaped with an abort"
+        );
+        assert_eq!(
+            Gates::read_answer(root, crashed, stage, &crashed_gate.gate_id),
+            AnswerRead::None,
+            "a crashed waiter's gate is reported, not reaped"
+        );
+        registration.finish();
+    }
+
+    /// D-04, T-50.1-69: a foreground waiter is reached by its gate, and no process is
+    /// signalled: the holder arm never runs once the gate arm has answered.
+    #[test]
+    fn stop_answers_a_gate_whose_waiter_is_registered() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, stage) = (PhaseId::new(5013), Stage::Code);
+        state_pending_at(root, phase, stage);
+        let (opened, registration) = Gates::open_registered(root, phase, stage, "g").unwrap();
+        let holder = SleepingChild::spawn();
+        let _hold = hold_phase_with_record(root, phase, holder.pid(), Some(holder.start));
+        let cache = tempfile::tempdir().unwrap();
+
+        stop_in(root, phase, Some(cache.path())).expect("the answered gate is the stop");
+
+        let AnswerRead::Bound(answer) = Gates::read_answer(root, phase, stage, &opened.gate_id)
+        else {
+            panic!("stop answers the observed gate");
+        };
+        assert!(matches!(
+            GateAction::from_response(&answer.response),
+            GateAction::Abort(_)
+        ));
+        assert!(workflow::load_state(root, phase).unwrap().stopped);
+        assert!(holder.is_live(), "no process is signalled at a gate");
+        registration.finish();
+    }
+
+    /// D-04: `doctor`'s fact is the registration. A lock record plays no part.
+    #[test]
+    fn doctor_reads_the_waiter_from_the_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, stage) = (PhaseId::new(5014), Stage::Code);
+        state_pending_at(root, phase, stage);
+        plant_live_lock_record(root, phase);
+        let (_, registration) = Gates::open_registered(root, phase, stage, "g").unwrap();
+
+        let held = collect_phase_facts(root);
+        assert_eq!(held[0].waiter, WaiterStatus::Live);
+        assert!(check_open_gate_without_waiter(&held[0]).is_none());
+
+        registration.finish();
+        let released = collect_phase_facts(root);
+        assert_eq!(released[0].waiter, WaiterStatus::Absent);
+        assert!(check_open_gate_without_waiter(&released[0]).is_some());
+    }
+
+    /// The `gate_waiter` of every `doctor --json` entry for the states under `root`.
+    /// A missing key panics here, so it can never read as a `null`.
+    fn doctor_json_gate_waiters(root: &Path) -> Vec<serde_json::Value> {
+        let body = render_reconciliation_json(&collect_phase_facts(root));
+        let waiters: Vec<serde_json::Value> = body
+            .as_array()
+            .expect("an array")
+            .iter()
+            .map(|entry| {
+                entry
+                    .get("gate_waiter")
+                    .unwrap_or_else(|| panic!("an entry has no gate_waiter: {entry}"))
+                    .clone()
+            })
+            .collect();
+        assert!(!waiters.is_empty(), "a saved state must produce an entry");
+        waiters
+    }
+
+    /// R2-01: every entry names the open gate and its registration, and with no gate
+    /// open both ids are `null`. `finish` removes the registration file, so the
+    /// released read finds it missing, with no wait on a lock's release.
+    #[test]
+    fn doctor_json_reports_the_open_gates_waiter() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5016);
+        state_pending_at(root, phase, Stage::Define);
+        let (opened, registration) =
+            Gates::open_registered(root, phase, Stage::Define, "g").unwrap();
+        let gate_id = opened.gate_id.as_str();
+
+        for waiter in doctor_json_gate_waiters(root) {
+            assert_eq!(
+                waiter,
+                serde_json::json!({"stage": "define", "gate_id": gate_id, "status": "live"})
+            );
+        }
+
+        registration.finish();
+        for waiter in doctor_json_gate_waiters(root) {
+            assert_eq!(
+                waiter,
+                serde_json::json!({"stage": "define", "gate_id": gate_id, "status": "absent"})
+            );
+        }
+
+        let no_gate = tempfile::tempdir().unwrap();
+        state_pending_at(no_gate.path(), phase, Stage::Define);
+        for waiter in doctor_json_gate_waiters(no_gate.path()) {
+            assert_eq!(
+                waiter,
+                serde_json::json!({"stage": null, "gate_id": null, "status": "absent"})
+            );
+        }
+    }
+
+    /// With several gates open, the status describes the gate named beside it: the one
+    /// with a live registration, and once none has one, the first the findings name.
+    #[test]
+    fn doctor_json_names_the_live_gate_among_several_open_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5017);
+        state_pending_at(root, phase, Stage::Validate);
+        let unwaited = Gates::open_gate(root, phase, Stage::Code, "no waiter").unwrap();
+        let (waited, registration) =
+            Gates::open_registered(root, phase, Stage::Validate, "waiter").unwrap();
+
+        for waiter in doctor_json_gate_waiters(root) {
+            assert_eq!(
+                waiter,
+                serde_json::json!({
+                    "stage": "validate",
+                    "gate_id": waited.gate_id.as_str(),
+                    "status": "live",
+                })
+            );
+        }
+
+        registration.finish();
+        for waiter in doctor_json_gate_waiters(root) {
+            assert_eq!(
+                waiter,
+                serde_json::json!({
+                    "stage": "code",
+                    "gate_id": unwaited.gate_id.as_str(),
+                    "status": "absent",
+                })
+            );
+        }
+    }
+
+    /// T-50.1-70: each of the three held files protects its holder from the stray reaper,
+    /// and an unheld one protects nothing.
+    #[test]
+    fn registry_reachable_pids_includes_held_reservation_and_waiter_holders() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let (phase, stage) = (PhaseId::new(5015), Stage::Code);
+        let pid = std::process::id();
+        let roots = std::slice::from_ref(&root);
+        assert!(
+            !registry_reachable_pids(roots).contains(&pid),
+            "nothing held"
+        );
+
+        let live_path = liveness::launch_liveness_path(&root, "aaaa0000aaaa5015").unwrap();
+        std::fs::create_dir_all(live_path.parent().unwrap()).unwrap();
+        let reservation = liveness::Hold::take(&live_path).unwrap();
+        assert!(registry_reachable_pids(roots).contains(&pid), "reservation");
+        drop(reservation);
+        wait_until_unheld(&live_path);
+        assert!(live_path.exists(), "the file outlives its holder");
+        assert!(
+            !registry_reachable_pids(roots).contains(&pid),
+            "unheld file"
+        );
+
+        let gate = Gates::open_gate(&root, phase, stage, "g").unwrap().gate_id;
+        let waiter = Gates::register_waiter(&root, phase, stage, &gate).unwrap();
+        assert!(registry_reachable_pids(roots).contains(&pid), "waiter");
+        drop(waiter);
+        let waiter_path = Gates::waiter_path(&root, phase, stage, &gate);
+        wait_until_unheld(&waiter_path);
+        assert!(waiter_path.exists(), "the file outlives its holder");
+        assert!(
+            !registry_reachable_pids(roots).contains(&pid),
+            "unheld file"
+        );
+
+        let holder = liveness::claim_phase_holder(&root, phase).unwrap();
+        assert!(registry_reachable_pids(roots).contains(&pid), "holder");
+        drop(holder);
+        let holder_path = liveness::phase_holder_path(&root, phase);
+        wait_until_unheld(&holder_path);
+        assert!(holder_path.exists(), "the file outlives its holder");
+        assert!(
+            !registry_reachable_pids(roots).contains(&pid),
+            "unheld file"
+        );
+    }
+
+    /// A child killed and reaped when this drops, on a failed assertion too.
+    struct KilledOnDrop(std::process::Child);
+
+    impl Drop for KilledOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Wait up to 10 s for `path` to exist.
+    fn wait_for_file(path: &Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !path.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{} never appeared",
+                path.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// R-03: a stopped write-lock holder ends `stop` within the bound, naming the holder,
+    /// with nothing written. Control: once the holder is dead the same `stop` records it.
+    #[test]
+    fn stop_names_a_stopped_write_lock_holder_and_returns_within_its_bound() {
+        const NAME: &str = "commands::tests::\
+                            stop_names_a_stopped_write_lock_holder_and_returns_within_its_bound";
+        let phase = PhaseId::new(5016);
+        if devflow_core::test_support::in_child_test(NAME) {
+            let root = holder_child_root();
+            workflow::update_state(&root, phase, |_| {
+                std::fs::write(root.join("holder.ready"), "").unwrap();
+                std::thread::sleep(std::time::Duration::from_secs(60));
+                Ok::<(), workflow::WorkflowError>(())
+            })
+            .unwrap();
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let path_dir = tempfile::tempdir().unwrap();
+        workflow::save_state(&State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Auto,
+            root.clone(),
+        ))
+        .unwrap();
+        let mut holder = KilledOnDrop(devflow_core::test_support::spawn_test_in_child(
+            NAME,
+            path_dir.path(),
+            &[(HOLDER_ROOT_ENV, root.as_os_str())],
+        ));
+        let holder_pid = holder.0.id();
+        wait_for_file(&root.join("holder.ready"));
+        let raw_pid = libc::pid_t::try_from(holder_pid).unwrap();
+        // SAFETY: kill reads no memory, and the pid is this test's own unreaped child.
+        assert_eq!(unsafe { libc::kill(raw_pid, libc::SIGSTOP) }, 0);
+        let before = std::fs::read(workflow::state_path(&root, phase)).unwrap();
+        let cache = tempfile::tempdir().unwrap();
+
+        // On a thread, so a `stop` that does not give up fails here rather than hanging.
+        let (finished, wait_finished) = std::sync::mpsc::channel();
+        let (stop_root, stop_cache) = (root.clone(), cache.path().to_path_buf());
+        let started = std::time::Instant::now();
+        std::thread::spawn(move || {
+            let result = stop_in(&stop_root, phase, Some(&stop_cache));
+            let _ = finished.send((result, started.elapsed()));
+        });
+        let (result, took) = wait_finished
+            .recv_timeout(workflow::WRITE_LOCK_REPAIR_WAIT + std::time::Duration::from_secs(5))
+            .expect("stop returns within its bound over a stopped holder");
+
+        let error = result.expect_err("nothing can be written under the held lock");
+        assert!(
+            took >= workflow::WRITE_LOCK_REPAIR_WAIT,
+            "gave up after {took:?}"
+        );
+        assert!(
+            took < workflow::WRITE_LOCK_REPAIR_WAIT + std::time::Duration::from_secs(2),
+            "waited {took:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            matches!(
+                error,
+                CliError::Workflow(workflow::WorkflowError::WriteLockTimeout {
+                    holder: Some(pid),
+                    ..
+                }) if pid == holder_pid
+            ),
+            "{message}"
+        );
+        assert!(message.contains(&format!("pid {holder_pid}")), "{message}");
+        assert!(message.contains("nothing was written"), "{message}");
+        assert_eq!(
+            std::fs::read(workflow::state_path(&root, phase)).unwrap(),
+            before,
+            "nothing is written"
+        );
+
+        holder.0.kill().unwrap();
+        holder.0.wait().unwrap();
+        stop_in(&root, phase, Some(cache.path())).expect("the lock is free once it is dead");
+        assert!(workflow::load_state(&root, phase).unwrap().stopped);
+    }
+
+    /// Every file under [`Gates::dir`], with its bytes.
+    fn gate_files(root: &Path) -> std::collections::BTreeMap<std::ffi::OsString, Vec<u8>> {
+        std::fs::read_dir(Gates::dir(root))
+            .unwrap()
+            .flatten()
+            .map(|entry| (entry.file_name(), std::fs::read(entry.path()).unwrap()))
+            .collect()
+    }
+
+    /// A Ship gate with its gate file, an approval and that approval's claim: a finalizing
+    /// `devflow ship`, as its registration has finished.
+    fn claimed_ship_gate(root: &Path, phase: PhaseId) -> GateId {
+        state_pending_at(root, phase, Stage::Ship);
+        let (opened, registration) = Gates::open_registered(root, phase, Stage::Ship, "g").unwrap();
+        registration.finish();
+        let response = GateResponse {
+            approved: true,
+            note: None,
+            responded_by: Some("human".into()),
+        };
+        Gates::answer(root, phase, Stage::Ship, &opened.gate_id, &response).unwrap();
+        assert!(matches!(
+            Gates::claim(root, phase, Stage::Ship, &opened.gate_id).unwrap(),
+            devflow_core::gates::Claim::Claimed
+        ));
+        opened.gate_id
+    }
+
+    /// `stop` over `phase` with a holder child: it adds nothing under the gate directory,
+    /// reaches the child, and reports the not-marked outcome because this hold outlives it.
+    fn assert_stop_reaches_the_holder_and_writes_no_gate_file(root: &Path, phase: PhaseId) {
+        let mut holder = SleepingChild::spawn();
+        let _hold = hold_phase_with_record(root, phase, holder.pid(), Some(holder.start));
+        let before = gate_files(root);
+        let cache = tempfile::tempdir().unwrap();
+
+        let stopped = stop_in(root, phase, Some(cache.path()));
+
+        assert_eq!(gate_files(root), before, "no answer, claim or other file");
+        assert!(
+            child_exits_within(&mut holder.child, agent::TERMINATE_VERIFY_WAIT),
+            "the holder is reached: {stopped:?}"
+        );
+        let error = stopped
+            .expect_err("this test's hold outlives its child")
+            .to_string();
+        assert!(error.contains("not marked stopped"), "{error}");
+    }
+
+    /// Planner C1's MUST-DO for the D-18 fixture: a gate whose answer a consumer claimed is
+    /// never answered again, and `stop` reaches that consumer through the holder. Control:
+    /// an unclaimed Ship gate with no waiter still gets the abort stored for `devflow ship`.
+    #[test]
+    fn stop_reaches_the_holder_past_a_claimed_ship_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Listed by no one: `list_open` hides a gate whose live answer exists.
+        let claimed = PhaseId::new(5017);
+        claimed_ship_gate(root, claimed);
+        assert_stop_reaches_the_holder_and_writes_no_gate_file(root, claimed);
+
+        // A partial close: the answer is gone, so the gate is listed, and the claim is all
+        // that tells `stop` a consumer took it.
+        let partly_closed = PhaseId::new(5018);
+        let gate = claimed_ship_gate(root, partly_closed);
+        std::fs::remove_file(Gates::answer_path(root, partly_closed, Stage::Ship, &gate)).unwrap();
+        assert!(
+            Gates::list_open(root)
+                .iter()
+                .any(|open| open.phase == partly_closed),
+            "the fixture reaches the claim check"
+        );
+        assert_stop_reaches_the_holder_and_writes_no_gate_file(root, partly_closed);
+
+        let unclaimed = PhaseId::new(5019);
+        state_pending_at(root, unclaimed, Stage::Ship);
+        let gate = Gates::open_gate(root, unclaimed, Stage::Ship, "g")
+            .unwrap()
+            .gate_id;
+        let holder = SleepingChild::spawn();
+        let _hold = hold_phase_with_record(root, unclaimed, holder.pid(), Some(holder.start));
+        let cache = tempfile::tempdir().unwrap();
+        stop_in(root, unclaimed, Some(cache.path())).expect("the stored abort is the stop");
+        assert!(matches!(
+            Gates::read_answer(root, unclaimed, Stage::Ship, &gate),
+            AnswerRead::Bound(answer) if !answer.response.approved
+        ));
+        assert!(holder.is_live(), "the control signals no holder");
+    }
+
+    /// The stable parts of `persist_stopped_state`'s refusal over a launch it did not address.
+    fn assert_names_an_unaddressed_launch(error: &str, launch: &str, field: &str, phase: u32) {
+        assert!(
+            error.contains("this stop did not end, answer, clear or find not running"),
+            "{error}"
+        );
+        assert!(
+            error.contains(&format!("launch {launch} in its {field} field")),
+            "{error}"
+        );
+        assert!(
+            error.contains(&format!("devflow stop --phase {phase}")),
+            "{error}"
+        );
+    }
+
+    /// The holder-release window: `stop` never marks a run `stopped` beside a launch none of
+    /// its arms addressed. Control: a state naming only the launch it found GONE is marked.
+    #[test]
+    fn stop_does_not_mark_stopped_beside_a_supervisor_it_never_saw() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let known = ["launch-a".to_string()];
+
+        let recorded = PhaseId::new(5020);
+        save_state_naming(root, recorded, &root.join("b.sock"), "launch-b");
+        let before = std::fs::read(workflow::state_path(root, recorded)).unwrap();
+        let error = persist_stopped_state(root, recorded, false, &known)
+            .expect_err("launch-b was never addressed")
+            .to_string();
+        assert_names_an_unaddressed_launch(&error, "launch-b", "supervisor", 5020);
+        assert_eq!(
+            std::fs::read(workflow::state_path(root, recorded)).unwrap(),
+            before
+        );
+
+        let pending = PhaseId::new(5021);
+        save_state_naming(root, pending, &root.join("a.sock"), "launch-a");
+        let mut state = workflow::load_state(root, pending).unwrap();
+        state.pending_supervisor = Some(PendingSupervisor::new(
+            "launch-b".to_string(),
+            root.join("b.sock"),
+            root.join("b.live"),
+        ));
+        workflow::save_state(&state).unwrap();
+        let before = std::fs::read(workflow::state_path(root, pending)).unwrap();
+        let error = persist_stopped_state(root, pending, false, &known)
+            .expect_err("launch-b was never addressed")
+            .to_string();
+        assert_names_an_unaddressed_launch(&error, "launch-b", "pending_supervisor", 5021);
+        assert_eq!(
+            std::fs::read(workflow::state_path(root, pending)).unwrap(),
+            before
+        );
+
+        let found_gone = PhaseId::new(5022);
+        save_state_naming(root, found_gone, &root.join("a.sock"), "launch-a");
+        persist_stopped_state(root, found_gone, false, &known).unwrap();
+        assert!(workflow::load_state(root, found_gone).unwrap().stopped);
+    }
+
+    /// The reply of a supervisor that stops when asked, then takes its socket away.
+    fn stopped_and_gone() -> ShutdownScript {
+        ShutdownScript {
+            lines: vec![ACCEPTED_LINE.to_string(), STOPPED_LINE.to_string()],
+            unlink_after: true,
+        }
+    }
+
+    type SharedBytes = std::sync::Arc<std::sync::Mutex<Vec<u8>>>;
+
+    /// Rewrite `phase`'s state as a concurrent launcher would and keep the resulting bytes.
+    fn rewrite_state_keeping_bytes(
+        root: &Path,
+        phase: PhaseId,
+        kept: &SharedBytes,
+        change: impl FnOnce(&mut State),
+    ) {
+        workflow::update_state(root, phase, |state| {
+            change(state);
+            Ok::<(), workflow::WorkflowError>(())
+        })
+        .unwrap();
+        *kept.lock().unwrap() = std::fs::read(workflow::state_path(root, phase)).unwrap();
+    }
+
+    /// R2-06: a launch that appears after the addressed one exited is never marked. One
+    /// recorded as the supervisor reaches the write and is refused there. One reserved and
+    /// held reaches `stop`'s pending branch first, which ends in its own not-recorded
+    /// refusal. Control: with no replacement the run is marked.
+    #[test]
+    fn a_socket_stop_never_marks_a_replacement_launch_stopped() {
+        const A: &str = "aaaa0000aaaa5023";
+        const B: &str = "bbbb0000bbbb5023";
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let (_base, sock) = stop_socket_dir();
+        let cache = tempfile::tempdir().unwrap();
+
+        let recorded = PhaseId::new(5023);
+        let a_path = sock.join("a23.sock");
+        save_state_naming(&root, recorded, &a_path, A);
+        let kept = SharedBytes::default();
+        let a = ScriptedSupervisor::serve(&a_path, A, recorded, "agent_running", {
+            let (root, kept) = (root.clone(), kept.clone());
+            move |_| {
+                rewrite_state_keeping_bytes(&root, recorded, &kept, |state| {
+                    state.supervisor = Some(SupervisorRecord::new(
+                        root.join("b.sock"),
+                        B.to_string(),
+                        1,
+                        0,
+                        "boot".to_string(),
+                    ));
+                });
+                stopped_and_gone()
+            }
+        });
+        let error = stop_in(&root, recorded, Some(cache.path()))
+            .expect_err("the replacement was never addressed")
+            .to_string();
+        assert_eq!(a.shutdowns(), 1, "the addressed launch was ended");
+        assert_names_an_unaddressed_launch(&error, B, "supervisor", 5023);
+        assert_eq!(
+            std::fs::read(workflow::state_path(&root, recorded)).unwrap(),
+            *kept.lock().unwrap(),
+            "nothing is written over the replacement"
+        );
+
+        let reserved = PhaseId::new(5024);
+        let a_path = sock.join("a24.sock");
+        save_state_naming(&root, reserved, &a_path, A);
+        let b_liveness = liveness::launch_liveness_path(&root, B).unwrap();
+        let b_hold = liveness::Hold::take(&b_liveness).unwrap();
+        let kept = SharedBytes::default();
+        let a = ScriptedSupervisor::serve(&a_path, A, reserved, "agent_running", {
+            let (root, kept) = (root.clone(), kept.clone());
+            move |_| {
+                rewrite_state_keeping_bytes(&root, reserved, &kept, |state| {
+                    state.pending_supervisor = Some(PendingSupervisor::new(
+                        B.to_string(),
+                        root.join("never-published.sock"),
+                        liveness::launch_liveness_path(&root, B).unwrap(),
+                    ));
+                });
+                stopped_and_gone()
+            }
+        });
+        let error = stop_in(&root, reserved, Some(cache.path()))
+            .expect_err("the reservation is live")
+            .to_string();
+        assert_eq!(a.shutdowns(), 1, "the addressed launch was ended");
+        assert!(error.contains(B), "{error}");
+        assert!(error.contains("devflow stop --phase 5024"), "{error}");
+        assert_eq!(
+            std::fs::read(workflow::state_path(&root, reserved)).unwrap(),
+            *kept.lock().unwrap(),
+            "nothing is written over the reservation"
+        );
+        drop(b_hold);
+
+        let control = PhaseId::new(5025);
+        let a_path = sock.join("a25.sock");
+        save_state_naming(&root, control, &a_path, A);
+        let a =
+            ScriptedSupervisor::serve(&a_path, A, control, "agent_running", |_| stopped_and_gone());
+        stop_in(&root, control, Some(cache.path())).expect("nothing replaced the launch");
+        assert_eq!(a.shutdowns(), 1);
+        assert!(workflow::load_state(&root, control).unwrap().stopped);
+    }
+
+    /// A saved state naming a dead recorded launch (its socket does not exist) beside a
+    /// pending launch served at `socket`, the shape a resume leaves after a crash.
+    fn state_with_dead_recorded_and_pending(
+        root: &Path,
+        phase: PhaseId,
+        dead: &str,
+        pending: &str,
+        socket: &Path,
+    ) {
+        save_state_naming(root, phase, &root.join("gone.sock"), dead);
+        let mut state = workflow::load_state(root, phase).unwrap();
+        state.pending_supervisor = Some(PendingSupervisor::new(
+            pending.to_string(),
+            socket.to_path_buf(),
+            liveness::launch_liveness_path(root, pending).unwrap(),
+        ));
+        workflow::save_state(&state).unwrap();
+    }
+
+    /// T-50.1-157: `stop` ends a live pending supervisor beside a dead recorded one and marks
+    /// the run, because its socket arm found the dead one GONE. Control: a launch published
+    /// during that shutdown, still reserved and unaddressed, is refused.
+    #[test]
+    fn stop_marks_stopped_after_ending_a_pending_supervisor_beside_a_dead_recorded_one() {
+        const A: &str = "aaaa0000aaaa5026";
+        const B: &str = "bbbb0000bbbb5026";
+        const C: &str = "cccc0000cccc5026";
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let (_base, sock) = stop_socket_dir();
+        let cache = tempfile::tempdir().unwrap();
+
+        let marked = PhaseId::new(5026);
+        let b_path = sock.join("b26.sock");
+        state_with_dead_recorded_and_pending(&root, marked, A, B, &b_path);
+        let mut b_hold =
+            Some(liveness::Hold::take(&liveness::launch_liveness_path(&root, B).unwrap()).unwrap());
+        let b = ScriptedSupervisor::serve(&b_path, B, marked, "agent_running", move |_| {
+            b_hold.take();
+            stopped_and_gone()
+        });
+        stop_in(&root, marked, Some(cache.path())).expect("both launches were addressed");
+        assert_eq!(b.shutdowns(), 1, "the pending launch was ended");
+        assert!(workflow::load_state(&root, marked).unwrap().stopped);
+
+        // Its lock outlives its reply, so the reservation is still recorded when `stop` writes.
+        let lingering = PhaseId::new(5030);
+        let (b3, b_path) = ("bbbb0000bbbb5030", sock.join("b30.sock"));
+        state_with_dead_recorded_and_pending(&root, lingering, A, b3, &b_path);
+        let _lingering_hold =
+            liveness::Hold::take(&liveness::launch_liveness_path(&root, b3).unwrap()).unwrap();
+        let b = ScriptedSupervisor::serve(&b_path, b3, lingering, "agent_running", |_| {
+            stopped_and_gone()
+        });
+        stop_in(&root, lingering, Some(cache.path())).expect("this stop ended the reservation");
+        assert_eq!(b.shutdowns(), 1, "the pending launch was ended");
+        assert!(workflow::load_state(&root, lingering).unwrap().stopped);
+
+        let refused = PhaseId::new(5027);
+        let (b2, b_path) = ("bbbb0000bbbb5027", sock.join("b27.sock"));
+        state_with_dead_recorded_and_pending(&root, refused, A, b2, &b_path);
+        let _b_hold =
+            liveness::Hold::take(&liveness::launch_liveness_path(&root, b2).unwrap()).unwrap();
+        // Held, so the pending branch waits on it and does not clear it as abandoned.
+        let _c_hold =
+            liveness::Hold::take(&liveness::launch_liveness_path(&root, C).unwrap()).unwrap();
+        let kept = SharedBytes::default();
+        let b = ScriptedSupervisor::serve(&b_path, b2, refused, "agent_running", {
+            let (root, kept) = (root.clone(), kept.clone());
+            move |_| {
+                rewrite_state_keeping_bytes(&root, refused, &kept, |state| {
+                    state.pending_supervisor = Some(PendingSupervisor::new(
+                        C.to_string(),
+                        root.join("never-published.sock"),
+                        liveness::launch_liveness_path(&root, C).unwrap(),
+                    ));
+                });
+                stopped_and_gone()
+            }
+        });
+        let error = stop_in(&root, refused, Some(cache.path()))
+            .expect_err("the published launch was never addressed")
+            .to_string();
+        assert_eq!(b.shutdowns(), 1, "the pending launch was ended");
+        assert_names_an_unaddressed_launch(&error, C, "pending_supervisor", 5027);
+        assert_eq!(
+            std::fs::read(workflow::state_path(&root, refused)).unwrap(),
+            *kept.lock().unwrap(),
+            "nothing is written over the new reservation"
+        );
+    }
+
+    /// Plan-check iteration 2: a launch pending when `stop` began that promotes while no arm
+    /// addresses it is refused, since no state read seeds the list. Control: the run whose
+    /// gate the arm answered is marked.
+    #[test]
+    fn stop_refuses_to_mark_stopped_beside_a_pending_launch_that_promoted_unaddressed() {
+        const A: &str = "aaaa0000aaaa5028";
+        const B: &str = "bbbb0000bbbb5028";
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let stage = Stage::Code;
+        let cache = tempfile::tempdir().unwrap();
+        let at_gate = |phase: PhaseId| {
+            state_pending_at(&root, phase, stage);
+            save_state_naming(&root, phase, &root.join("a.sock"), A);
+        };
+
+        let promoted = PhaseId::new(5028);
+        at_gate(promoted);
+        let mut state = workflow::load_state(&root, promoted).unwrap();
+        state.pending_supervisor = Some(PendingSupervisor::new(
+            B.to_string(),
+            root.join("b.sock"),
+            root.join("b.live"),
+        ));
+        workflow::save_state(&state).unwrap();
+        let (opened, registration) = Gates::open_registered(&root, promoted, stage, "g").unwrap();
+        let kept = SharedBytes::default();
+        let hook = {
+            let (root, kept) = (root.clone(), kept.clone());
+            move || {
+                rewrite_state_keeping_bytes(&root, promoted, &kept, |state| {
+                    state.supervisor = Some(SupervisorRecord::new(
+                        root.join("b.sock"),
+                        B.to_string(),
+                        1,
+                        0,
+                        "boot".to_string(),
+                    ));
+                    state.pending_supervisor = None;
+                });
+            }
+        };
+        let error =
+            with_answer_before_publish(hook, || stop_in(&root, promoted, Some(cache.path())))
+                .expect_err("the promoted launch was never addressed")
+                .to_string();
+        assert!(matches!(
+            Gates::read_answer(&root, promoted, stage, &opened.gate_id),
+            AnswerRead::Bound(answer) if !answer.response.approved
+        ));
+        assert_names_an_unaddressed_launch(&error, B, "supervisor", 5028);
+        assert_eq!(
+            std::fs::read(workflow::state_path(&root, promoted)).unwrap(),
+            *kept.lock().unwrap(),
+            "nothing is written over the promotion"
+        );
+        registration.finish();
+
+        let answered = PhaseId::new(5029);
+        at_gate(answered);
+        let (_, registration) = Gates::open_registered(&root, answered, stage, "g").unwrap();
+        stop_in(&root, answered, Some(cache.path())).expect("the answered run is the only one");
+        assert!(workflow::load_state(&root, answered).unwrap().stopped);
+        registration.finish();
+    }
+
+    /// `gate sweep` stops at a gate lock it cannot take, rather than skipping that gate
+    /// and reporting the rest. Control: with the lock free, the same sweep reaps it.
+    #[test]
+    fn gate_sweep_ends_on_a_held_gate_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, stage) = (PhaseId::new(5008), Stage::Code);
+        let (opened, registration) = Gates::open_registered(root, phase, stage, "g").unwrap();
+        let gate_lock = hold_gate_lock(root, phase);
+
+        let error = gate_sweep(Some(0), false, Some(root.to_path_buf()), false)
+            .expect_err("a held gate lock ends the sweep");
+
+        assert!(
+            matches!(error, CliError::Gate(GateError::GateLockTimeout { .. })),
+            "{error}"
+        );
+        assert!(gate_answer_files(root, phase, stage).is_empty());
+
+        drop(gate_lock);
+        gate_sweep(Some(0), false, Some(root.to_path_buf()), false).unwrap();
+        assert!(matches!(
+            Gates::read_answer(root, phase, stage, &opened.gate_id),
+            AnswerRead::Bound(answer) if !answer.response.approved
+        ));
+        registration.finish();
+    }
+
+    /// R2-04: a writer whose answer was published but could not be confirmed exits
+    /// non-zero and never says nothing changed, and the answer stays where it is.
+    #[test]
+    fn gate_writers_report_a_published_but_unconfirmed_answer() {
+        let check = |phase: PhaseId, write: &dyn Fn(&Path) -> Result<(), CliError>| {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let (opened, registration) =
+                Gates::open_registered(root, phase, Stage::Code, "g").unwrap();
+            let parked = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let (hook_root, hook_parked) = (root.to_path_buf(), parked.clone());
+            let error = with_answer_before_publish(
+                move || {
+                    *hook_parked.borrow_mut() = Some(hold_gate_lock(&hook_root, phase));
+                },
+                || write(root),
+            )
+            .expect_err("an unconfirmed answer exits non-zero");
+            let message = error.to_string();
+            assert!(
+                matches!(
+                    error,
+                    CliError::Gate(GateError::PublishedUnconfirmed { .. })
+                ),
+                "{message}"
+            );
+            assert!(message.contains("published"), "{message}");
+            assert!(!message.contains("nothing was changed"), "{message}");
+            drop(parked.borrow_mut().take());
+            assert!(matches!(
+                Gates::read_answer(root, phase, Stage::Code, &opened.gate_id),
+                AnswerRead::Bound(_)
+            ));
+            registration.finish();
+        };
+        let responding = PhaseId::new(5009);
+        check(responding, &|root| {
+            gate_respond(root, responding, Some(Stage::Code), true, None, None)
+        });
+        check(PhaseId::new(5010), &|root| {
+            gate_sweep(Some(0), false, Some(root.to_path_buf()), false)
+        });
+    }
+
+    /// R2-04: one `stop`, one action. An abort published with its re-check timed out is
+    /// answered: `stop` goes on to record the stop and never reaches the holder.
+    #[test]
+    fn stop_treats_a_published_but_unconfirmed_abort_as_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, stage) = (PhaseId::new(5007), Stage::Code);
+        state_pending_at(root, phase, stage);
+        let (opened, registration) = Gates::open_registered(root, phase, stage, "g").unwrap();
+        let holder = SleepingChild::spawn();
+        let _hold = hold_phase_with_record(root, phase, holder.pid(), Some(holder.start));
+        let cache = tempfile::tempdir().unwrap();
+        let parked = std::rc::Rc::new(std::cell::RefCell::new(None));
+
+        let started = std::time::Instant::now();
+        let hook_root = root.to_path_buf();
+        let hook_parked = parked.clone();
+        let stopped = with_answer_before_publish(
+            move || {
+                *hook_parked.borrow_mut() = Some(hold_gate_lock(&hook_root, phase));
+            },
+            || stop_in(root, phase, Some(cache.path())),
+        );
+        let took = started.elapsed();
+
+        stopped.expect("a published abort is the requested stop");
+        assert!(
+            took >= devflow_core::gates::GATE_LOCK_WAIT,
+            "the re-check waited for the lock: {took:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        assert!(holder.is_live(), "the holder arm never ran");
+        assert!(workflow::load_state(root, phase).unwrap().stopped);
+        drop(parked.borrow_mut().take());
+        assert!(matches!(
+            Gates::read_answer(root, phase, stage, &opened.gate_id),
+            AnswerRead::Bound(answer) if !answer.response.approved
+        ));
+        registration.finish();
+    }
+
+    /// An unconfirmed abort may have reached no waiter, so `stop` still shuts a recorded
+    /// supervisor down through its socket rather than record `stopped` beside it.
+    #[test]
+    fn stop_shuts_the_supervisor_down_after_a_published_but_unconfirmed_abort() {
+        const LAUNCH: &str = "aaaa0000aaaa5306";
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, stage) = (PhaseId::new(5306), Stage::Code);
+        state_pending_at(root, phase, stage);
+        let socket = root.join("a.sock");
+        save_state_naming(root, phase, &socket, LAUNCH);
+        let supervisor = ScriptedSupervisor::serve(&socket, LAUNCH, phase, "agent_running", |_| {
+            stopped_and_gone()
+        });
+        let (_, registration) = Gates::open_registered(root, phase, stage, "g").unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let parked = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let (hook_root, hook_parked) = (root.to_path_buf(), parked.clone());
+
+        with_answer_before_publish(
+            move || {
+                *hook_parked.borrow_mut() = Some(hold_gate_lock(&hook_root, phase));
+            },
+            || stop_in(root, phase, Some(cache.path())),
+        )
+        .unwrap();
+
+        assert_eq!(supervisor.shutdowns(), 1, "the socket arm ran");
+        assert!(workflow::load_state(root, phase).unwrap().stopped);
+        drop(parked.borrow_mut().take());
+        registration.finish();
+    }
+
+    /// D-04: only the registration counts. A live lock record alone reads not live.
+    #[test]
+    fn a_waiter_is_live_only_by_its_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, stage) = (PhaseId::new(4904), Stage::Code);
+        let gate = Gates::open_gate(root, phase, stage, "g").unwrap().gate_id;
+        assert!(!waiter_is_live(root, phase, stage, &gate), "nothing at all");
+
+        let registration = Gates::register_waiter(root, phase, stage, &gate).unwrap();
+        assert!(waiter_is_live(root, phase, stage, &gate), "registration");
+        registration.finish();
+        assert!(!waiter_is_live(root, phase, stage, &gate), "finished");
+
+        plant_live_lock_record(root, phase);
+        assert!(!waiter_is_live(root, phase, stage, &gate), "a lock record");
+    }
+
+    #[test]
+    fn a_gate_answer_published_as_its_gate_closed_is_reported_as_set_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, stage) = (PhaseId::new(4905), Stage::Code);
+        let (opened, registration) = Gates::open_registered(root, phase, stage, "g1").unwrap();
+        let g1 = opened.gate_id;
+
+        let hook_root = root.to_path_buf();
+        let err = with_answer_before_publish(
+            move || {
+                Gates::close(&hook_root, phase, stage).unwrap();
+                Gates::open_gate(&hook_root, phase, stage, "g2").unwrap();
+            },
+            || gate_respond(root, phase, Some(stage), true, None, Some(g1.to_string())),
+        )
+        .expect_err("an answer set aside must exit non-zero")
+        .to_string();
+
+        assert!(err.contains(g1.as_str()), "{err}");
+        assert!(err.contains("has been set aside"), "{err}");
+        assert!(err.contains("nothing will act on it"), "{err}");
+        let quarantined = Gates::quarantined(root);
+        assert_eq!(quarantined.len(), 1, "{quarantined:?}");
+        assert_eq!(quarantined[0].label, g1.as_str());
+        assert!(!Gates::answer_path(root, phase, stage, &g1).exists());
+        registration.finish();
+    }
+
+    /// D-05: a set-aside answer is reported per phase by `status` and `doctor`, and nothing
+    /// is said when there is none. `status` names the full path; `doctor`'s findings name it
+    /// from the project root, because they never carry a username (T-18-01).
+    #[test]
+    fn status_and_doctor_list_quarantined_gate_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(7);
+        let doctor_json = |findings: &[PhaseFinding]| {
+            doctor_json_body(&[], &[], &[], &[], (&[], None), findings)["set_aside_gate_answers"]
+                .as_array()
+                .unwrap()
+                .clone()
+        };
+
+        let none = Gates::quarantined(root);
+        assert_eq!(render_set_aside_answers(&none), None);
+        let no_findings = set_aside_answer_findings(root, &none);
+        assert!(no_findings.is_empty());
+        assert_eq!(render_set_aside_findings_text(&no_findings), "");
+        assert_eq!(doctor_json(&no_findings), Vec::<serde_json::Value>::new());
+
+        let opened = Gates::open_gate(root, phase, Stage::Code, "ctx").unwrap();
+        let response = GateResponse {
+            approved: true,
+            note: None,
+            responded_by: None,
+        };
+        Gates::answer(root, phase, Stage::Code, &opened.gate_id, &response).unwrap();
+        Gates::close(root, phase, Stage::Code).unwrap();
+        // A legacy unkeyed answer: the form that names no gate.
+        std::fs::write(
+            Gates::dir(root).join(format!("{}-plan.response.json", phase.padded())),
+            serde_json::to_vec(&response).unwrap(),
+        )
+        .unwrap();
+        Gates::close(root, phase, Stage::Plan).unwrap();
+        let answers = Gates::quarantined(root);
+        let mut labels: Vec<&str> = answers.iter().map(|a| a.label.as_str()).collect();
+        labels.sort_unstable();
+        let mut expected = vec![opened.gate_id.as_str(), "noid"];
+        expected.sort_unstable();
+        assert_eq!(labels, expected, "one for a gate id, one with none");
+
+        let block = render_set_aside_answers(&answers).expect("two answers are listed");
+        assert!(block.starts_with("set-aside gate answers:"), "{block}");
+        assert!(block.contains("phase 7:"), "{block}");
+        for answer in &answers {
+            assert!(
+                block.contains(&format!("{}", answer.path.display())),
+                "{block}"
+            );
+        }
+
+        let findings = set_aside_answer_findings(root, &answers);
+        assert_eq!(findings.len(), 2);
+        let root_text = root.display().to_string();
+        let text = render_set_aside_findings_text(&findings);
+        assert!(text.contains("set-aside gate answers:"), "{text}");
+        let json = doctor_json(&findings);
+        assert_eq!(json.len(), 2, "{json:?}");
+        for (index, answer) in answers.iter().enumerate() {
+            let relative = answer
+                .path
+                .strip_prefix(root)
+                .unwrap()
+                .display()
+                .to_string();
+            let finding = &findings[index];
+            assert_eq!(finding.phase, phase);
+            assert_eq!(finding.severity, Severity::Info);
+            assert!(finding.detail.contains(&relative), "{}", finding.detail);
+            assert!(!finding.detail.contains(&root_text), "{}", finding.detail);
+            assert!(text.contains(&relative), "{text}");
+            assert_eq!(
+                finding.repair.as_deref(),
+                Some("inspect it; answer the live gate with `devflow gate approve|reject`")
+            );
+            assert_eq!(json[index]["severity"], "info");
+            assert_eq!(json[index]["phase"], serde_json::json!(phase));
+            assert!(
+                json[index]["detail"].as_str().unwrap().contains(&relative),
+                "{json:?}"
+            );
+        }
+        assert!(!text.contains(&root_text), "{text}");
     }
 
     /// The doctor check's rendering maps the `pi list` capability probe onto a
@@ -6567,6 +9791,38 @@ mod tests {
         };
         assert_eq!(phase, PhaseId::new(15));
         assert_eq!(stage, Some(Stage::Ship));
+    }
+
+    #[test]
+    fn gate_id_flag_is_taken_by_approve_and_reject() {
+        let approve =
+            Cli::try_parse_from(["devflow", "gate", "approve", "15", "--gate-id", "abc"]).unwrap();
+        let Command::Gate {
+            action: GateCmd::Approve { gate_id, .. },
+        } = approve.command
+        else {
+            panic!("expected gate approve");
+        };
+        assert_eq!(gate_id.as_deref(), Some("abc"));
+
+        let reject = Cli::try_parse_from([
+            "devflow",
+            "gate",
+            "reject",
+            "15",
+            "--note",
+            "n",
+            "--gate-id",
+            "abc",
+        ])
+        .unwrap();
+        let Command::Gate {
+            action: GateCmd::Reject { gate_id, .. },
+        } = reject.command
+        else {
+            panic!("expected gate reject");
+        };
+        assert_eq!(gate_id.as_deref(), Some("abc"));
     }
 
     #[test]
@@ -6988,18 +10244,161 @@ mod tests {
     /// 15a: `devflow gate approve` resolves the stage automatically when a
     /// phase has exactly one open gate and writes a response the workflow's
     /// poller will consume.
+    /// A saved Define-stage state with both kinds of answer an earlier run can leave:
+    /// a keyed answer for its gate, which an abort, and an unkeyed approval from before
+    /// gate ids. Returns the state and the two answers' bytes.
+    fn plant_leftover_define_answers(root: &Path, phase: PhaseId) -> (State, Vec<Vec<u8>>) {
+        let mut state = State::new(
+            phase,
+            devflow_core::state::AgentKind::Claude,
+            devflow_core::mode::Mode::Auto,
+            root.to_path_buf(),
+        );
+        state.gate_notify_cmd = Some("true".to_string());
+        workflow::save_state(&state).unwrap();
+
+        let old = Gates::open_gate(root, phase, Stage::Define, "the earlier run's gate").unwrap();
+        let keyed = Gates::answer(
+            root,
+            phase,
+            Stage::Define,
+            &old.gate_id,
+            &GateResponse {
+                approved: false,
+                note: Some("abort: the earlier run".into()),
+                responded_by: Some("test".into()),
+            },
+        )
+        .unwrap();
+        let unkeyed = Gates::dir(root).join(format!("{}-define.response.json", phase.padded()));
+        std::fs::write(
+            &unkeyed,
+            br#"{"approved":true,"note":"legacy","responded_by":"test"}"#,
+        )
+        .unwrap();
+        let bytes = vec![
+            std::fs::read(&keyed).unwrap(),
+            std::fs::read(&unkeyed).unwrap(),
+        ];
+        (state, bytes)
+    }
+
+    /// The bytes of every answer that was set aside, sorted, to compare with what was
+    /// planted.
+    fn quarantined_bytes(root: &Path) -> Vec<Vec<u8>> {
+        let mut bytes: Vec<Vec<u8>> = Gates::quarantined(root)
+            .iter()
+            .map(|answer| std::fs::read(&answer.path).unwrap())
+            .collect();
+        bytes.sort();
+        bytes
+    }
+
+    /// V-20 (D-05): with `start`'s own close skipped, as if it had failed, neither kind
+    /// of leftover decides the new run's gate. It times out and both are set aside. The
+    /// control is the same wait with an answer that does bind: it decides.
+    #[test]
+    fn a_leftover_answer_start_could_not_delete_never_decides_the_new_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(4910);
+        let (mut state, mut planted) = plant_leftover_define_answers(root, phase);
+        planted.sort();
+
+        let err = crate::pipeline_gate::run_gate_with_timeout(
+            root,
+            &mut state,
+            Stage::Define,
+            "the new run's gate",
+            1,
+            None,
+        )
+        .expect_err("a leftover must not decide the new run's gate");
+        assert!(
+            err.to_string().contains("timed out awaiting a response"),
+            "{err}"
+        );
+        assert_eq!(quarantined_bytes(root), planted, "both leftovers set aside");
+        assert_eq!(
+            gate_answer_files(root, phase, Stage::Define),
+            Vec::<std::path::PathBuf>::new()
+        );
+
+        devflow_core::test_support::preanswer_gate(
+            root,
+            phase,
+            Stage::Define,
+            &GateResponse {
+                approved: true,
+                note: None,
+                responded_by: Some("test".into()),
+            },
+        );
+        let action = crate::pipeline_gate::run_gate_with_timeout(
+            root,
+            &mut state,
+            Stage::Define,
+            "control: an answer that binds",
+            1,
+            None,
+        )
+        .expect("control: an answer that binds decides the gate");
+        assert_eq!(action, GateAction::Advance);
+    }
+
+    /// D-05 / T-50.1-48: `start`'s leftover step deletes no answer, and names each one
+    /// it set aside.
+    #[test]
+    fn start_sets_leftover_answers_aside_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(4911);
+        let (_state, mut planted) = plant_leftover_define_answers(root, phase);
+        planted.sort();
+
+        let mut warnings = Vec::new();
+        set_aside_leftover_gates(root, phase, &mut warnings);
+        let warnings = String::from_utf8(warnings).unwrap();
+
+        assert_eq!(quarantined_bytes(root), planted, "no leftover was deleted");
+        for answer in Gates::quarantined(root) {
+            let line = format!(
+                "warning: set aside an unused answer for phase {phase} define: {}",
+                answer.path.display()
+            );
+            assert!(warnings.contains(&line), "{line} not in: {warnings}");
+        }
+        assert!(!Gates::gate_path(root, phase, Stage::Define).exists());
+        assert_eq!(
+            gate_answer_files(root, phase, Stage::Define),
+            Vec::<std::path::PathBuf>::new()
+        );
+    }
+
     #[test]
     fn gate_respond_auto_resolves_single_open_gate() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         Gates::write_gate(root, PhaseId::new(15), Stage::Ship, "approve merge?").unwrap();
 
-        gate_respond(root, PhaseId::new(15), None, true, Some("lgtm".into())).unwrap();
+        gate_respond(
+            root,
+            PhaseId::new(15),
+            None,
+            true,
+            Some("lgtm".into()),
+            None,
+        )
+        .unwrap();
 
-        let polled = Gates::poll_response(root, PhaseId::new(15), Stage::Ship, 1)
-            .expect("response readable");
-        assert!(polled.approved);
-        assert_eq!(polled.note.as_deref(), Some("lgtm"));
+        let gate = crate::test_support::live_gate_id(root, PhaseId::new(15), Stage::Ship);
+        let AnswerRead::Bound(answer) =
+            Gates::read_answer(root, PhaseId::new(15), Stage::Ship, &gate)
+        else {
+            panic!("the live gate holds the answer gate_respond wrote");
+        };
+        assert!(answer.response.approved);
+        assert_eq!(answer.response.note.as_deref(), Some("lgtm"));
         let event = devflow_core::events::last_event_for_phase(root, PhaseId::new(15)).unwrap();
         assert_eq!(event["event"], "gate_response_written");
         assert_eq!(event["stage"], "ship");
@@ -7010,13 +10409,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        let err = gate_respond(root, PhaseId::new(15), None, true, None).unwrap_err();
+        let err = gate_respond(root, PhaseId::new(15), None, true, None, None).unwrap_err();
         assert!(err.to_string().contains("no open gate"), "{err}");
 
         Gates::write_gate(root, PhaseId::new(15), Stage::Validate, "a").unwrap();
         Gates::write_gate(root, PhaseId::new(15), Stage::Ship, "b").unwrap();
-        let err =
-            gate_respond(root, PhaseId::new(15), None, false, Some("nope".into())).unwrap_err();
+        let err = gate_respond(
+            root,
+            PhaseId::new(15),
+            None,
+            false,
+            Some("nope".into()),
+            None,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("--stage"), "{err}");
 
         // Explicit Ship disambiguates. Non-Ship gates need a confirmed
@@ -7027,13 +10433,14 @@ mod tests {
             Some(Stage::Ship),
             false,
             Some("gaps".into()),
+            None,
         )
         .unwrap();
         assert!(
-            Gates::response_path(root, PhaseId::new(15), Stage::Ship).exists(),
+            !gate_answer_files(root, PhaseId::new(15), Stage::Ship).is_empty(),
             "explicit-stage rejection must land"
         );
-        assert!(!Gates::response_path(root, PhaseId::new(15), Stage::Validate).exists());
+        assert!(gate_answer_files(root, PhaseId::new(15), Stage::Validate).is_empty());
     }
 
     /// Backdate an already-written gate's `timestamp` so it reads as
@@ -7059,36 +10466,41 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let gate = devflow_core::gates::GateFile {
-            phase,
-            stage,
-            context: "ctx".to_string(),
-            timestamp: now.saturating_sub(age_secs).to_string(),
-        };
-        std::fs::write(
-            Gates::gate_path(root, phase, stage),
-            serde_json::to_string_pretty(&gate).unwrap(),
-        )
-        .unwrap();
+        let path = Gates::gate_path(root, phase, stage);
+        let mut gate: GateFile =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        gate.timestamp = now.saturating_sub(age_secs).to_string();
+        std::fs::write(path, serde_json::to_string_pretty(&gate).unwrap()).unwrap();
     }
 
     /// Task 2 behavior: `--dry-run` computes and prints every decision but
-    /// writes nothing — the aged gate stays open with no response file.
+    /// writes nothing: an aged gate with a live waiter, which the sweep would
+    /// otherwise answer, stays open with no response file. The second sweep is
+    /// the control: without `--dry-run` the same gate is reaped.
     #[test]
     fn gate_sweep_dry_run_does_not_write_a_response() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        Gates::write_gate(root, PhaseId::new(30), Stage::Ship, "ctx").unwrap();
-        backdate_gate(root, PhaseId::new(30), Stage::Ship, aged_past_threshold());
+        let (phase, stage) = (PhaseId::new(30), Stage::Ship);
+        let (_, registration) = Gates::open_registered(root, phase, stage, "ctx").unwrap();
+        backdate_gate(root, phase, stage, aged_past_threshold());
 
         gate_sweep(None, true, Some(root.to_path_buf()), false).unwrap();
 
         assert!(
-            !Gates::response_path(root, PhaseId::new(30), Stage::Ship).exists(),
+            gate_answer_files(root, phase, stage).is_empty(),
             "dry-run must never write a response file"
         );
         let open = Gates::list_open(root);
         assert_eq!(open.len(), 1, "dry-run must leave the gate open");
+
+        gate_sweep(None, false, Some(root.to_path_buf()), false).unwrap();
+        assert_eq!(
+            gate_answer_files(root, phase, stage).len(),
+            1,
+            "the control: without --dry-run the same gate and waiter are reaped"
+        );
+        registration.finish();
     }
 
     /// Task 2 behavior: a gate that already has a response is a benign race
@@ -7099,28 +10511,29 @@ mod tests {
     fn gate_sweep_skips_already_responded_gate_without_clobbering() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        Gates::write_gate(root, PhaseId::new(31), Stage::Ship, "ctx").unwrap();
-        backdate_gate(root, PhaseId::new(31), Stage::Ship, aged_past_threshold());
+        let (phase, stage) = (PhaseId::new(31), Stage::Ship);
+        let (opened, registration) = Gates::open_registered(root, phase, stage, "ctx").unwrap();
+        backdate_gate(root, phase, stage, aged_past_threshold());
+        let listed_before_the_answer = listed_gate(root, phase);
         let response = GateResponse {
             approved: true,
             note: None,
             responded_by: Some("human".into()),
         };
-        Gates::respond(root, PhaseId::new(31), Stage::Ship, &response).unwrap();
-        let before =
-            std::fs::read_to_string(Gates::response_path(root, PhaseId::new(31), Stage::Ship))
-                .unwrap();
+        let path = Gates::answer(root, phase, stage, &opened.gate_id, &response).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
 
         let result = gate_sweep(None, false, Some(root.to_path_buf()), false);
+        let raced = sweep_one_gate(root, &listed_before_the_answer, 1, 0, false).unwrap();
 
         assert!(result.is_ok(), "an already-answered gate must not error");
-        let after =
-            std::fs::read_to_string(Gates::response_path(root, PhaseId::new(31), Stage::Ship))
-                .unwrap();
+        assert_eq!(raced, SweepStep::Skipped, "the race is a skip");
+        let after = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
             before, after,
             "the pre-existing response must be byte-identical afterwards"
         );
+        registration.finish();
     }
 
     /// Task 2 behavior (T-23-43 audit trail): a successful reap emits
@@ -7131,14 +10544,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(32);
-        let pid = std::process::id();
-        let start = agent::process_start_time(pid).unwrap();
-        let lock_path = root
-            .join(".devflow")
-            .join(format!("lock-{}", phase.padded()));
-        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
-        std::fs::write(lock_path, format!("{pid}\n{start}")).unwrap();
-        Gates::write_gate(root, phase, Stage::Ship, "ctx").unwrap();
+        let (_, registration) = Gates::open_registered(root, phase, Stage::Ship, "ctx").unwrap();
         backdate_gate(root, phase, Stage::Ship, aged_past_threshold());
 
         gate_sweep(None, false, Some(root.to_path_buf()), false).unwrap();
@@ -7146,6 +10552,7 @@ mod tests {
         let event = devflow_core::events::last_event_for_phase(root, phase).unwrap();
         assert_eq!(event["event"], "gate_reaped");
         assert_eq!(event["stage"], "ship");
+        registration.finish();
     }
 
     /// Wrap a real, test-owned pid as the `agent::StrayProcess` shape
@@ -7389,11 +10796,8 @@ mod tests {
     /// requires `/proc/uptime` or `sysconf(_SC_CLK_TCK)` to fail while
     /// `/proc/<pid>/stat` succeeds for the SAME live pid — a combination
     /// no black-box process fixture in this suite can construct without
-    /// faking `/proc`. Left uncovered by assertion, following this file's
-    /// own established precedent for an unreachable-by-black-box-test
-    /// match arm (`stop_via_lock`'s wildcard arm, documented above this
-    /// test group rather than faked). Covered by source reasoning
-    /// instead: `reap_stray_candidates`'s age check —
+    /// faking `/proc`. Left uncovered by assertion rather than faked. Covered
+    /// by source reasoning instead: `reap_stray_candidates`'s age check —
     /// `agent::process_age(candidate.pid).is_some_and(|age| age >= min_age)`
     /// — treats `None` as `false` by construction of `Option::is_some_and`,
     /// so an unresolvable age can never accidentally satisfy the `>=`
@@ -7499,204 +10903,110 @@ mod tests {
         let _ = child.wait();
     }
 
-    /// Retargeted (999.47/D-13). This test used to spawn a real `sleep`
-    /// child and assert `stop()` refused to signal it, instrumented with
-    /// the now-deprecated cmdline-basename predicate and a page of
-    /// `/proc`-forensics helpers built to diagnose a CI flake
-    /// ("MECHANISM CONFIRMED 2026-07-26": between `spawn()` returning and
-    /// the child completing `execve`, its cmdline transiently reads as its
-    /// parent's, which is what made a cmdline-based guard race). It is the
-    /// serious one of 999.47's two tests: in CI it panicked on the error
-    /// expectation, meaning the identity guard passed and `devflow stop`
-    /// sent `SIGTERM` to an unrelated process — the guard's stated purpose
-    /// failing end-to-end, not merely inferred.
+    /// V-30: a held record with no start time cannot be confirmed, so `stop` refuses and
+    /// signals nothing. `(pid, starttime)` is the guard because a cmdline check races a
+    /// forked child that has not finished `execve` (999.47/D-13). The child is a real,
+    /// live `sleep`, so a `stop` that signalled it would be seen.
     ///
-    /// The retarget removes the race by construction rather than making it
-    /// rarer: it asserts the `(pid, starttime)` guard `stop_via_lock`
-    /// ACTUALLY uses today (the deprecated predicate is no longer even
-    /// consulted for a decision — the cmdline-based mechanism it embodied
-    /// was superseded before this retarget, and D-13 records that
-    /// tightening it further to a single argv position was considered and
-    /// rejected as ineffective, since the breaking marker sits inside the
-    /// same inherited data). A LEGACY lock file — recording a pid with no
-    /// start time at all, the format every lock file had before identity
-    /// recording existed — must be refused, because identity cannot be
-    /// confirmed for it. Uses this test's own pid, which is genuinely alive
-    /// throughout, so there is no `spawn()` and therefore no `execve` to
-    /// race.
-    ///
-    /// This is one of `stop_via_lock`'s three fail-closed match arms. The
-    /// other two:
-    /// - a recorded start time that no longer matches — covered
-    ///   deterministically, no-spawn, by
-    ///   `stop_refuses_when_the_recorded_start_time_does_not_match` below.
-    /// - the match's final wildcard arm ("the lock file's holder could not
-    ///   be read back for identity confirmation") — NOT exercised by any
-    ///   test in this file. Source analysis: by the time `stop_via_lock`
-    ///   reaches this match, `lock::holder()` has already confirmed this
-    ///   SAME lock file's first line parses as a pid, via the identical
-    ///   `read_holder_pid` helper `lock::holder_identity` calls again
-    ///   moments later over UNCHANGED file content — so `holder_identity`'s
-    ///   `recorded_pid` is guaranteed to equal the pid already in hand, and
-    ///   its `Option<u64>` half is caught by the `Some((_, None))` arm
-    ///   whenever it's absent. The wildcard arm is reachable only if the
-    ///   lock file's content changes between those two sequential reads —
-    ///   a genuine external race that no deterministic black-box test of
-    ///   `stop()` can construct without reintroducing exactly the class of
-    ///   flake this retarget exists to remove. Recorded here rather than
-    ///   faked with a timing-dependent fixture.
+    /// This is one of `stop_via_holder`'s three fail-closed arms. The others:
+    /// - a recorded start time that no longer matches, covered by
+    ///   `stop_e2e::stop_refuses_to_signal_a_holder_whose_start_time_does_not_match`.
+    /// - a held record that does not read. `liveness::live_holder` returns `InvalidData`
+    ///   for an empty record, which a reader racing the rewrite can get, so that arm is
+    ///   reachable from a black box and the second half here reaches it.
     #[test]
-    fn stop_refuses_to_signal_a_live_pid_that_fails_the_identity_check() {
+    fn stop_refuses_a_holder_record_with_no_start_time() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(200);
+        workflow::save_state(&State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Auto,
+            root.to_path_buf(),
+        ))
+        .unwrap();
+        let (mut child, _) = sleep_child_with_start();
+        let pid = child.id();
+        let hold = hold_phase_with_record(root, phase, pid, None);
 
-        // Our own pid is genuinely alive throughout — no spawn, so no
-        // execve to race. The lock records ONLY the pid, matching every
-        // lock file written before start times were recorded (999.47).
-        let pid = std::process::id();
-        let lock_path = root
-            .join(".devflow")
-            .join(format!("lock-{padded}", padded = phase.padded()));
-        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
-        std::fs::write(&lock_path, pid.to_string()).unwrap();
-
-        // Confirm the fixture is genuinely the legacy shape this test
-        // exercises — `lock::holder_identity` (what `stop_via_lock` itself
-        // consults) must report the pid with NO recorded start time, the
-        // exact input that drives `stop_via_lock`'s `Some((_, None))` arm.
-        assert_eq!(
-            lock::holder_identity(root, phase),
-            Some((pid, None)),
-            "the fixture must be a legacy lock (pid recorded, no start time) — the shape \
-             stop_via_lock's identity guard treats as unconfirmable"
-        );
-
-        let err = stop_with_an_empty_cache(root, phase)
-            .expect_err("a legacy lock with no recorded start time must be refused");
-        let message = err.to_string();
-        assert!(
-            message.contains(&pid.to_string()),
-            "error must name the pid it refused to signal, got: {message}"
-        );
-        assert!(
-            message.contains("records no start time"),
-            "error must say identity cannot be confirmed for a legacy lock, got: {message}"
-        );
-        assert!(
-            lock_path.exists(),
-            "the lock file must be untouched — stop must not signal anything"
-        );
-    }
-
-    /// 999.47: a lock recording a start time that does not match the live
-    /// process must be refused. This is the pid-recycling case — the lock
-    /// named pid N, N died, and something unrelated now holds it.
-    ///
-    /// Unlike the cmdline check this replaced, the verdict does not depend
-    /// on what the process *looks* like, so a `sleep` and a real devflow
-    /// binary are rejected identically.
-    #[test]
-    fn stop_refuses_when_the_recorded_start_time_does_not_match() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(201);
-
-        // Our own pid is genuinely alive and genuinely devflow-named, so the
-        // old cmdline check would have happily signalled it. Only the start
-        // time distinguishes "this process" from "whatever holds this pid".
-        let pid = std::process::id();
-        let real_start = devflow_core::agent::process_start_time(pid)
-            .expect("read our own start time from /proc");
-        let wrong_start = real_start + 1;
-
-        let lock_path = root
-            .join(".devflow")
-            .join(format!("lock-{padded}", padded = phase.padded()));
-        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
-        std::fs::write(&lock_path, format!("{pid}\n{wrong_start}")).unwrap();
-
-        let err = stop_with_an_empty_cache(root, phase)
-            .expect_err("a start-time mismatch must be refused");
-        let message = err.to_string();
-        assert!(
-            message.contains(&pid.to_string()),
-            "error must name the pid it refused to signal, got: {message}"
-        );
-        assert!(
-            message.contains("not the process that took the lock"),
-            "error must say the identity did not match, got: {message}"
-        );
-        assert!(
-            lock_path.exists(),
-            "the lock file must be untouched — stop must not signal anything"
-        );
-    }
-
-    /// The positive case: when the lock's recorded identity matches the live
-    /// process, `stop` proceeds. Without this, the refusal test above would
-    /// pass equally well against a `stop` that refused unconditionally.
-    #[test]
-    fn stop_signals_the_holder_when_the_recorded_identity_matches() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(202);
-
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .expect("spawn sleep");
-        let child_pid = child.id();
-
-        // Record the child's OWN identity — the honest case, where the lock
-        // holder really is the process named. Poll for the start time: a
-        // freshly forked child may not have exec'd yet (999.47).
-        let mut child_start = None;
-        for _ in 0..100 {
-            child_start = devflow_core::agent::process_start_time(child_pid);
-            if child_start.is_some() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let child_start = child_start.expect("read the child's start time");
-
-        let lock_path = root
-            .join(".devflow")
-            .join(format!("lock-{padded}", padded = phase.padded()));
-        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
-        std::fs::write(&lock_path, format!("{child_pid}\n{child_start}")).unwrap();
-
-        let result = stop_with_an_empty_cache(root, phase);
-
+        let no_start = stop_with_an_empty_cache(root, phase);
+        let live_after_no_start = devflow_core::test_support::process_is_live(pid);
+        std::fs::write(liveness::phase_holder_path(root, phase), "").unwrap();
+        let unreadable = stop_with_an_empty_cache(root, phase);
+        let live_after_unreadable = devflow_core::test_support::process_is_live(pid);
+        drop(hold);
         let _ = child.kill();
         let _ = child.wait();
 
+        let message = no_start.expect_err("no start time refuses").to_string();
         assert!(
-            result.is_ok(),
-            "a matching identity must be signalled, not refused: {result:?}"
+            message.contains(&pid.to_string()),
+            "names the pid: {message}"
+        );
+        assert!(message.contains("records no start time"), "{message}");
+        assert!(live_after_no_start, "the child is not signalled");
+        let message = unreadable.expect_err("an empty record refuses").to_string();
+        assert!(message.contains("could not be read back"), "{message}");
+        assert!(live_after_unreadable, "the child is not signalled");
+        assert!(
+            !workflow::load_state(root, phase).unwrap().stopped,
+            "the state is not marked stopped"
         );
     }
 
-    /// Task 2 behavior: a lock file naming a dead pid is stale — reclaimed
-    /// silently, never signalled, and never an error. An explicit state
-    /// file is present so this test exercises only the lock-fallback path
-    /// under test, not Task 3's separate missing-state tolerance.
+    /// V-30: with no process holding the file, nothing is signalled, even though the
+    /// record names a live process with its correct start time: the record a held file
+    /// would have `stop` signal. No file at all is the other case.
     #[test]
-    fn stop_is_a_success_no_op_when_the_lock_names_a_dead_pid() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(202);
-        let lock_path = root
-            .join(".devflow")
-            .join(format!("lock-{padded}", padded = phase.padded()));
-        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
-        // Above default kernel pid_max — guaranteed not alive.
-        std::fs::write(&lock_path, "9999999").unwrap();
-        let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        workflow::save_state(&state).unwrap();
+    fn stop_signals_nothing_when_no_process_holds_the_phase() {
+        const NAME: &str = "commands::tests::stop_signals_nothing_when_no_process_holds_the_phase";
+        // A released flock could still read held while another test forks.
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = tempfile::tempdir().unwrap();
+            let path = std::env::var_os("PATH").expect("PATH is set");
+            let output = crate::test_support::run_hermetic_test_in_child(
+                NAME,
+                path_dir.path(),
+                &[("PATH", path.as_os_str())],
+            );
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        for planted in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = PhaseId::new(202);
+            workflow::save_state(&State::new(
+                phase,
+                AgentKind::Claude,
+                Mode::Auto,
+                root.to_path_buf(),
+            ))
+            .unwrap();
+            let (mut child, start) = sleep_child_with_start();
+            let pid = child.id();
+            if planted {
+                drop(hold_phase_with_record(root, phase, pid, Some(start)));
+                assert_eq!(
+                    liveness::probe(&liveness::phase_holder_path(root, phase)).unwrap(),
+                    liveness::Held::Abandoned,
+                    "the file is there and unheld"
+                );
+            }
 
-        stop(root, phase).expect("stop against a stale lock must succeed, not error");
+            let result = stop_with_an_empty_cache(root, phase);
+            let child_alive = devflow_core::test_support::process_is_live(pid);
+            let _ = child.kill();
+            let _ = child.wait();
+
+            result.unwrap_or_else(|err| panic!("planted={planted}: nothing to stop: {err}"));
+            assert!(child_alive, "planted={planted}: nothing is signalled");
+            assert!(
+                workflow::load_state(root, phase).unwrap().stopped,
+                "planted={planted}: `stopped` is recorded as today"
+            );
+        }
     }
 
     /// Task 3 behavior: no open gate, no lock file, and no persisted state
@@ -8228,6 +11538,7 @@ mod tests {
             stage: Stage::Ship,
             context: "ctx".to_string(),
             timestamp: "not-a-number".to_string(),
+            gate_id: String::new(),
         };
 
         let row = render_all_roots_gate_row(Path::new("/tmp/some-root"), &gate, 10_000);
@@ -8237,27 +11548,36 @@ mod tests {
     }
 
     /// 21a / 50-12: `recovery_hints` returns a `resume` hint for a phase
-    /// whose supervisor is GONE while it is not stopped, additionally an
-    /// `advance` hint when the phase is gate-pending (answer the gate, then
-    /// advance), `stop` then `resume` for a STALE socket, and nothing for an
-    /// ALIVE, stopped or unlaunched phase.
+    /// whose supervisor is GONE while it is not stopped, additionally a
+    /// `ship` hint when its Ship gate is pending (D-06), `stop` then `resume` for
+    /// a STALE socket, and nothing for an ALIVE or unlaunched phase.
     #[test]
     fn recovery_hints_includes_resume_for_gone_while_active() {
         let dir = tempfile::tempdir().unwrap();
-        let state = State::new(
+        let mut state = State::new(
             PhaseId::new(7),
             AgentKind::Claude,
             Mode::Auto,
             dir.path().to_path_buf(),
         );
+        state.verification_baseline_captured = true;
 
         let hints = recovery_hints(&state, &PhaseLiveness::GoneWhileActive);
 
         assert_eq!(hints, vec!["devflow resume --phase 7".to_string()]);
     }
 
+    /// Whether a hint list sends the operator through a hand-run `advance`, whose gate open
+    /// sets an earlier answer aside (D-06).
+    fn hint_routes_an_answer_through_advance(hints: &[String]) -> bool {
+        hints.iter().any(|hint| hint.contains("devflow advance"))
+    }
+
+    /// V-33, D-06: a gate-pending phase whose supervisor is gone is repaired by `resume`, which
+    /// asks again, plus `devflow ship` at Ship, the one stage whose stored answer it applies.
+    /// No liveness, gate state or stage names `advance`.
     #[test]
-    fn recovery_hints_includes_advance_when_gone_while_active_and_gate_pending() {
+    fn recovery_hints_for_a_gone_gate_pending_phase_name_resume_or_ship_not_advance() {
         let dir = tempfile::tempdir().unwrap();
         let mut state = State::new(
             PhaseId::new(7),
@@ -8267,14 +11587,56 @@ mod tests {
         );
         state.gate_pending = true;
 
-        let hints = recovery_hints(&state, &PhaseLiveness::GoneWhileActive);
-
+        state.stage = Stage::Code;
         assert_eq!(
-            hints,
+            recovery_hints(&state, &PhaseLiveness::GoneWhileActive),
+            vec!["devflow resume --phase 7".to_string()]
+        );
+        state.stage = Stage::Ship;
+        assert_eq!(
+            recovery_hints(&state, &PhaseLiveness::GoneWhileActive),
             vec![
                 "devflow resume --phase 7".to_string(),
-                "devflow advance --phase 7".to_string(),
+                "devflow ship --phase 7".to_string(),
             ]
+        );
+
+        let every_liveness = [
+            PhaseLiveness::Alive {
+                owner: "gate_wait".to_string(),
+                launch: "stream".to_string(),
+            },
+            PhaseLiveness::Stale,
+            PhaseLiveness::Gone,
+            PhaseLiveness::GoneWhileActive,
+            PhaseLiveness::NotLaunched,
+            PhaseLiveness::LaunchPending {
+                launch_id: "launch".to_string(),
+                published: true,
+            },
+            PhaseLiveness::ProbeFailed("no reply".to_string()),
+        ];
+        for liveness in &every_liveness {
+            for gate_pending in [false, true] {
+                for stage in [Stage::Code, Stage::Ship] {
+                    state.gate_pending = gate_pending;
+                    state.stage = stage;
+                    let hints = recovery_hints(&state, liveness);
+                    assert!(
+                        !hint_routes_an_answer_through_advance(&hints),
+                        "{liveness:?} gate_pending={gate_pending} {stage}: {hints:?}"
+                    );
+                }
+            }
+        }
+
+        let hints_before_this_rule = [
+            "devflow resume --phase 7".to_string(),
+            "devflow advance --phase 7".to_string(),
+        ];
+        assert!(
+            hint_routes_an_answer_through_advance(&hints_before_this_rule),
+            "the check must catch the list that sent an answer through advance"
         );
     }
 
@@ -8298,25 +11660,54 @@ mod tests {
     }
 
     #[test]
-    fn recovery_hints_empty_for_alive_stopped_and_unlaunched() {
+    fn recovery_hints_empty_for_alive_and_unlaunched() {
         let dir = tempfile::tempdir().unwrap();
-        let state = State::new(
+        let mut state = State::new(
             PhaseId::new(7),
             AgentKind::Claude,
             Mode::Auto,
             dir.path().to_path_buf(),
         );
+        state.verification_baseline_captured = true;
         let alive = PhaseLiveness::Alive {
             owner: "agent_running".to_string(),
             launch: "stream".to_string(),
         };
 
-        for liveness in [alive, PhaseLiveness::Gone, PhaseLiveness::NotLaunched] {
+        for liveness in [alive, PhaseLiveness::NotLaunched] {
             assert!(
                 recovery_hints(&state, &liveness).is_empty(),
                 "{liveness:?} needs no repair"
             );
         }
+    }
+
+    /// Once `stop` has ended a run nothing else continues it, so `status` names `resume`,
+    /// with or without a record. A stopped phase whose supervisor still answers does not.
+    #[test]
+    fn recovery_hints_names_resume_for_a_stopped_phase() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::new(
+            PhaseId::new(7),
+            AgentKind::Claude,
+            Mode::Auto,
+            dir.path().to_path_buf(),
+        );
+        state.verification_baseline_captured = true;
+        state.stopped = true;
+
+        for liveness in [PhaseLiveness::Gone, PhaseLiveness::NotLaunched] {
+            assert_eq!(
+                recovery_hints(&state, &liveness),
+                vec!["devflow resume --phase 7".to_string()],
+                "{liveness:?}"
+            );
+        }
+        let alive = PhaseLiveness::Alive {
+            owner: "agent_running".to_string(),
+            launch: "stream".to_string(),
+        };
+        assert!(recovery_hints(&state, &alive).is_empty(), "control");
     }
 
     /// 21a / 999.30 IN-01: the shared one-pass event summary's
@@ -8480,6 +11871,9 @@ mod tests {
         /// The launch id every fixture's supervisor record carries.
         const SUPERVISOR_LAUNCH_ID: &str = "0123456789abcdef";
 
+        /// A path a damaged gate file could name where its gate id belongs.
+        const PATH_AS_GATE_ID: &str = "/home/someone/.devflow/gates/x";
+
         /// Every string anywhere inside `value`.
         fn strings_in(value: &serde_json::Value, out: &mut Vec<String>) {
             match value {
@@ -8590,6 +11984,7 @@ mod tests {
         /// in the reconciliation section holds a path.
         #[test]
         fn doctor_json_reports_supervisor_liveness_without_paths() {
+            let gate_id = GateId::new().to_string();
             let record = devflow_core::state::SupervisorRecord::new(
                 PathBuf::from("/home/someone/.cache/devflow/sock/x.sock"),
                 SUPERVISOR_LAUNCH_ID.to_string(),
@@ -8604,11 +11999,27 @@ mod tests {
                 ))),
                 false,
             );
+            let pending = PhaseLiveness::LaunchPending {
+                launch_id: SUPERVISOR_LAUNCH_ID.to_string(),
+                published: false,
+            };
             let facts = vec![
                 agreeing_facts(PhaseId::new(27)),
                 PhaseFacts {
                     supervisor: failed,
+                    pending: Some((SUPERVISOR_LAUNCH_ID.to_string(), pending)),
                     ..agreeing_facts(PhaseId::new(28))
+                },
+                PhaseFacts {
+                    waiter: WaiterStatus::Live,
+                    waiter_gate: Some((Stage::Define, gate_id.clone())),
+                    open_gate_stages: vec![Stage::Define],
+                    ..agreeing_facts(PhaseId::new(29))
+                },
+                PhaseFacts {
+                    waiter_gate: Some((Stage::Define, PATH_AS_GATE_ID.to_string())),
+                    open_gate_stages: vec![Stage::Define],
+                    ..agreeing_facts(PhaseId::new(30))
                 },
             ];
             let body = render_reconciliation_json(&facts);
@@ -8623,19 +12034,69 @@ mod tests {
                 .find(|entry| entry["phase"] == 28)
                 .expect("phase 28's finding")["supervisor"];
             assert_eq!(failed["liveness"], "probe_failed", "{body}");
+            assert_eq!(failed["pending"]["liveness"], "launch_pending", "{body}");
             assert!(failed["owner"].is_null(), "{body}");
             let mut strings = Vec::new();
             strings_in(&body, &mut strings);
             assert!(!strings.is_empty(), "the scan must see strings: {body}");
+            assert!(
+                strings.contains(&gate_id),
+                "the scan must read a gate id, not only nulls: {strings:?}"
+            );
             assert!(
                 strings.iter().all(|text| !text.contains('/')),
                 "no string in the reconciliation section may hold a path: {strings:?}"
             );
         }
 
+        /// A gate file's id is unchecked, so one that is no gate id reads `null`: the
+        /// JSON cannot carry a path in it (T-50.1-156). The stage still names the gate.
+        #[test]
+        fn doctor_json_gives_a_refused_gate_id_as_null() {
+            let facts = vec![PhaseFacts {
+                waiter_gate: Some((Stage::Define, PATH_AS_GATE_ID.to_string())),
+                open_gate_stages: vec![Stage::Define],
+                ..agreeing_facts(PhaseId::new(31))
+            }];
+            let body = render_reconciliation_json(&facts);
+            let entries = body.as_array().expect("an array");
+            assert!(!entries.is_empty(), "{body}");
+            for entry in entries {
+                assert_eq!(
+                    entry["gate_waiter"],
+                    serde_json::json!({"stage": "define", "gate_id": null, "status": "absent"}),
+                    "{body}"
+                );
+            }
+        }
+
+        /// A phase with several findings repeats one `gate_waiter`, so a consumer that
+        /// reads any entry for the phase reads the phase's fact.
+        #[test]
+        fn doctor_json_repeats_the_gate_waiter_on_every_finding_of_a_phase() {
+            let gate_id = GateId::new().to_string();
+            let facts = vec![PhaseFacts {
+                agent_pid: Some(999_999),
+                agent_alive: false,
+                waiter_gate: Some((Stage::Code, gate_id.clone())),
+                open_gate_stages: vec![Stage::Code],
+                ..agreeing_facts(PhaseId::new(32))
+            }];
+            let body = render_reconciliation_json(&facts);
+            let entries = body.as_array().expect("an array");
+            assert!(entries.len() >= 2, "needs several findings: {body}");
+            for entry in entries {
+                assert_eq!(
+                    entry["gate_waiter"],
+                    serde_json::json!({"stage": "code", "gate_id": gate_id, "status": "absent"}),
+                    "{body}"
+                );
+            }
+        }
+
         /// A short cache dir directly under `/tmp`, so every socket path
         /// below it fits `sun_path`.
-        fn short_cache() -> tempfile::TempDir {
+        pub(super) fn short_cache() -> tempfile::TempDir {
             tempfile::Builder::new()
                 .prefix("dfs")
                 .tempdir_in("/tmp")
@@ -8644,7 +12105,7 @@ mod tests {
 
         /// Publish the socket for `(root, phase, launch_id)` under `cache`.
         /// Dropping the returned listener leaves the socket STALE.
-        fn publish_launch(
+        pub(super) fn publish_launch(
             cache: &Path,
             root: &Path,
             phase: u32,
@@ -8659,7 +12120,12 @@ mod tests {
 
         /// A complete sidecar for `(root, phase, launch_id)`, as a supervisor
         /// writes it.
-        fn write_sidecar_for(socket: &supervisor::SocketPath, root: &Path, phase: u32, id: &str) {
+        pub(super) fn write_sidecar_for(
+            socket: &supervisor::SocketPath,
+            root: &Path,
+            phase: u32,
+            id: &str,
+        ) {
             let sidecar = serde_json::json!({
                 "launch_id": id,
                 "project_root": root,
@@ -8681,7 +12147,7 @@ mod tests {
 
         /// A loadable state for `phase` whose supervisor record carries
         /// `launch_id`.
-        fn save_state_with_launch(root: &Path, phase: u32, launch_id: &str) {
+        pub(super) fn save_state_with_launch(root: &Path, phase: u32, launch_id: &str) {
             let mut state = State::new(
                 PhaseId::new(phase),
                 AgentKind::Claude,
@@ -8950,7 +12416,7 @@ mod tests {
                 text.contains("could not be listed") && text.contains(&why),
                 "{text}"
             );
-            let body = doctor_json_body(&[], &[], &[], &[], (&[], Some(&why)));
+            let body = doctor_json_body(&[], &[], &[], &[], (&[], Some(&why)), &[]);
             assert_eq!(body["orphan_supervisor_sweep_error"], why.as_str());
         }
 
@@ -9053,7 +12519,8 @@ mod tests {
                 phase,
                 stage: Stage::Code,
                 gate_pending: false,
-                waiter: lock::HolderStatus::NoHolder,
+                waiter: WaiterStatus::Absent,
+                waiter_gate: None,
                 agent_pid: Some(4242),
                 agent_alive: true,
                 supervisor: PhaseLiveness::Alive {
@@ -9064,8 +12531,14 @@ mod tests {
                 last_event: Some("stage_launched".into()),
                 last_launched_stage: Some(Stage::Code),
                 open_gate_stages: Vec::new(),
+                unprepared_restart: None,
+                stored_ship_answer: false,
                 feature_branch_exists: true,
                 stopped: false,
+                pending: None,
+                live_agent: None,
+                write_lock: workflow::WriteLockStatus::Free,
+                write_lock_error: None,
             }
         }
 
@@ -9080,6 +12553,7 @@ mod tests {
             let facts = PhaseFacts {
                 gate_pending: true,
                 open_gate_stages: Vec::new(),
+                supervisor: PhaseLiveness::NotLaunched,
                 ..agreeing_facts(PhaseId::new(2))
             };
             let findings = reconcile_phase(&facts);
@@ -9097,6 +12571,7 @@ mod tests {
             let facts = PhaseFacts {
                 gate_pending: false,
                 open_gate_stages: vec![Stage::Validate],
+                supervisor: PhaseLiveness::NotLaunched,
                 ..agreeing_facts(PhaseId::new(3))
             };
             let findings = reconcile_phase(&facts);
@@ -9114,7 +12589,8 @@ mod tests {
             let phase = PhaseId::new(13);
             let facts = PhaseFacts {
                 open_gate_stages: vec![Stage::Validate],
-                waiter: lock::HolderStatus::NoHolder,
+                waiter: WaiterStatus::Absent,
+                supervisor: PhaseLiveness::NotLaunched,
                 ..agreeing_facts(phase)
             };
 
@@ -9133,7 +12609,7 @@ mod tests {
             let phase = PhaseId::new(14);
             let facts = PhaseFacts {
                 open_gate_stages: vec![Stage::Ship],
-                waiter: lock::HolderStatus::NoHolder,
+                waiter: WaiterStatus::Absent,
                 ..agreeing_facts(phase)
             };
 
@@ -9153,29 +12629,11 @@ mod tests {
         }
 
         #[test]
-        fn reconcile_phase_flags_open_gate_with_a_recycled_waiter_as_no_waiter() {
-            let phase = PhaseId::new(15);
-            let facts = PhaseFacts {
-                open_gate_stages: vec![Stage::Validate],
-                waiter: lock::HolderStatus::Recycled { pid: 1234 },
-                ..agreeing_facts(phase)
-            };
-
-            let findings = reconcile_phase(&facts);
-
-            assert_eq!(findings.len(), 1);
-            assert_eq!(
-                findings[0].repair.as_deref(),
-                Some(no_waiter_repair(phase, Stage::Validate).as_str())
-            );
-        }
-
-        #[test]
         fn reconcile_phase_open_gate_with_a_live_waiter_is_not_a_no_waiter_finding() {
             let phase = PhaseId::new(16);
             let facts = PhaseFacts {
                 open_gate_stages: vec![Stage::Validate],
-                waiter: lock::HolderStatus::Live { pid: 1234 },
+                waiter: WaiterStatus::Live,
                 ..agreeing_facts(phase)
             };
 
@@ -9186,11 +12644,80 @@ mod tests {
             }));
         }
 
+        /// Criterion 2 for the doctor repairs that name `resume`: none does while a
+        /// supervisor of the phase is live or an agent outlives its supervisor (D-19).
+        /// Control: with neither, each one does.
+        #[test]
+        fn no_repair_names_resume_while_a_supervisor_or_agent_lives() {
+            let phase = PhaseId::new(29);
+            let gate_pending = |facts: PhaseFacts| PhaseFacts {
+                gate_pending: true,
+                ..facts
+            };
+            let dead_agent = |facts: PhaseFacts| PhaseFacts {
+                agent_pid: Some(999_999),
+                agent_alive: false,
+                ..facts
+            };
+            let open_gate = |facts: PhaseFacts| PhaseFacts {
+                gate_pending: true,
+                open_gate_stages: vec![Stage::Code],
+                ..facts
+            };
+            let shapes: [&dyn Fn(PhaseFacts) -> PhaseFacts; 3] =
+                [&gate_pending, &dead_agent, &open_gate];
+            let pending = PhaseLiveness::LaunchPending {
+                launch_id: SUPERVISOR_LAUNCH_ID.to_string(),
+                published: true,
+            };
+            let agent = LiveAgent {
+                pid: 4242,
+                confirmed: true,
+            };
+            for (index, shape) in shapes.iter().enumerate() {
+                for (case, supervisor, live_agent) in [
+                    ("alive", agreeing_facts(phase).supervisor, None),
+                    ("pending", pending.clone(), None),
+                    (
+                        "orphan",
+                        PhaseLiveness::GoneWhileActive,
+                        Some(agent.clone()),
+                    ),
+                ] {
+                    let findings = reconcile_phase(&shape(PhaseFacts {
+                        supervisor,
+                        live_agent,
+                        ..agreeing_facts(phase)
+                    }));
+                    assert!(!findings.is_empty(), "shape {index}, {case}");
+                    for finding in &findings {
+                        let repair = finding.repair.as_deref().unwrap_or_default();
+                        assert!(
+                            !repair.contains("devflow resume"),
+                            "shape {index}, {case}: {repair}"
+                        );
+                    }
+                }
+                let findings = reconcile_phase(&shape(PhaseFacts {
+                    supervisor: PhaseLiveness::NotLaunched,
+                    ..agreeing_facts(phase)
+                }));
+                assert!(
+                    findings.iter().any(|finding| finding
+                        .repair
+                        .as_deref()
+                        .is_some_and(|repair| repair.contains("devflow resume"))),
+                    "control, shape {index}"
+                );
+            }
+        }
+
         #[test]
         fn reconcile_phase_flags_dead_agent_at_agent_stage() {
             let facts = PhaseFacts {
                 agent_pid: Some(999_999),
                 agent_alive: false,
+                supervisor: PhaseLiveness::NotLaunched,
                 ..agreeing_facts(PhaseId::new(4))
             };
             let findings = reconcile_phase(&facts);
@@ -9226,6 +12753,8 @@ mod tests {
             let facts = PhaseFacts {
                 stage: Stage::Plan,
                 last_launched_stage: Some(Stage::Plan),
+                unprepared_restart: None,
+                stored_ship_answer: false,
                 feature_branch_exists: false,
                 ..agreeing_facts(PhaseId::new(6))
             };
@@ -9358,6 +12887,8 @@ mod tests {
                 supervisor: PhaseLiveness::GoneWhileActive,
                 last_launched_stage: Some(Stage::Validate),
                 open_gate_stages: Vec::new(),
+                unprepared_restart: None,
+                stored_ship_answer: false,
                 feature_branch_exists: false,
                 ..agreeing_facts(PhaseId::new(7))
             };
@@ -9400,7 +12931,7 @@ mod tests {
         }
 
         #[test]
-        fn collect_phase_facts_preserves_empty_and_corrupt_lock_records() {
+        fn doctor_reads_no_lock_file() {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path();
             let empty_phase = PhaseId::new(93);
@@ -9422,11 +12953,7 @@ mod tests {
             let facts = collect_phase_facts(root);
 
             assert_eq!(facts.len(), 2);
-            assert!(
-                facts
-                    .iter()
-                    .all(|fact| fact.waiter == lock::HolderStatus::NoHolder)
-            );
+            assert!(facts.iter().all(|fact| fact.waiter == WaiterStatus::Absent));
             assert_eq!(
                 std::fs::read_to_string(root.join(".devflow/lock-93")).unwrap(),
                 ""
@@ -9480,7 +13007,7 @@ mod tests {
             workflow::save_state(&state).unwrap();
             let facts = collect_phase_facts(root);
 
-            let body = doctor_json_body(&checks, &facts, &[], &[], (&[], None));
+            let body = doctor_json_body(&checks, &facts, &[], &[], (&[], None), &[]);
             let serialized = serde_json::to_string(&body).unwrap();
             let reparsed: serde_json::Value = serde_json::from_str(&serialized)
                 .expect("doctor --json must be single-document JSON, not two concatenated arrays");
@@ -9509,8 +13036,8 @@ mod tests {
             );
             assert_eq!(
                 reparsed.as_object().unwrap().len(),
-                6,
-                "doctor --json must have exactly six top-level keys: {reparsed}"
+                7,
+                "doctor --json must have exactly seven top-level keys: {reparsed}"
             );
             assert!(reparsed["environment"].is_array());
             assert!(reparsed["reconciliation"].is_array());
@@ -9685,9 +13212,9 @@ mod tests {
                 detail: "detail".to_string(),
                 repair: None,
             }];
-            let body = doctor_json_body(&checks, &facts, &[], &stray_findings, (&[], None));
+            let body = doctor_json_body(&checks, &facts, &[], &stray_findings, (&[], None), &[]);
             let obj = body.as_object().unwrap();
-            assert_eq!(obj.len(), 6, "must be exactly six top-level keys: {body}");
+            assert_eq!(obj.len(), 7, "must be exactly seven top-level keys: {body}");
             assert!(obj.contains_key("stray_processes"));
             let strays = obj["stray_processes"].as_array().unwrap();
             assert_eq!(strays.len(), 1);
@@ -9779,7 +13306,7 @@ mod tests {
     /// Task 2 (CR-01/T-25-15-02): the rewritten `detail` states only
     /// what the code actually checked — matched DevFlow's structural
     /// argv shape, owned by the caller, named by no registered root's
-    /// state file or lock file — and no longer asserts a conclusion
+    /// state file and held by none of its live files — and no longer asserts a conclusion
     /// (unqualified "reachable through no registry entry, lock file, or
     /// state file") the code never established.
     #[test]
@@ -9797,9 +13324,10 @@ mod tests {
         assert!(finding.detail.contains("monitor-wrapper"));
         assert!(finding.detail.contains("owned by the calling user"));
         assert!(
-            finding
-                .detail
-                .contains("named by no registered project root's state file or lock file"),
+            finding.detail.contains(
+                "named by no registered project root's state file and held by none of its live \
+                 liveness, gate-registration or foreground-holder files"
+            ),
             "the detail must name the specific checked absence, not an unqualified \
              conclusion: {}",
             finding.detail
@@ -9858,14 +13386,14 @@ mod tests {
     }
 
     /// Task 1's tracer (CR-01, 999.44/DEN-68): one discovery pass names
-    /// a live lock-holder pid and a genuine orphan under no registered root
+    /// a live holder pid and a genuine orphan under no registered root
     /// at all. Only the orphan may survive `unreachable_stray_candidates`'s
     /// filter. Both pids are real, spawned processes crossed through
     /// `wait_for_exec_visibility` — not synthesised numbers — so the
     /// census and the filter are both exercised for real, in one pass.
     ///
     /// A third, state-recorded fixture (a pid in the state's monitor-pid
-    /// field) was removed with that input (50-22): lock holders are the
+    /// field) was removed with that input (50-22): held files are the
     /// only reachable source, because the census cannot match a 3.x
     /// supervisor (`agent::tests::the_stray_census_matches_only_the_2x_process_shapes`).
     #[test]
@@ -9879,7 +13407,7 @@ mod tests {
         let project_root_guard = tempfile::tempdir().unwrap();
         let project_root = project_root_guard.path().to_path_buf();
 
-        // Phase 1: a real `State` with no lock, the registered phase.
+        // Phase 1: a real `State` with nothing held, the registered phase.
         let state = State::new(
             PhaseId::new(1),
             AgentKind::Claude,
@@ -9888,38 +13416,23 @@ mod tests {
         );
         workflow::save_state(&state).unwrap();
 
-        // Phase 2: a real `State` (so `list_states` enumerates the
-        // phase at all — mirrors real operation, where a phase with an
-        // active lock also has a persisted state), whose only path into
-        // the reachable set is the lock file below.
-        let state_2 = State::new(
-            PhaseId::new(2),
-            AgentKind::Claude,
-            Mode::Auto,
-            project_root.clone(),
-        );
-        workflow::save_state(&state_2).unwrap();
-
-        // A lock file for phase 2, written directly in the documented
-        // `.devflow/lock-{phase:02}` shape (lock.rs:4, :236) — pid on
-        // line 1, start time on line 2 — naming `lock_pid` as holder.
+        // Phase 2's holder file, held here with its record naming `lock_pid`. This test's
+        // own process really holds it; the record is what the set reads.
         let lock_start_time = agent::process_start_time(lock_pid)
-            .expect("must read the lock fixture's own recorded start time");
-        let devflow_dir = project_root.join(".devflow");
-        std::fs::create_dir_all(&devflow_dir).unwrap();
-        std::fs::write(
-            devflow_dir.join("lock-02"),
-            format!("{lock_pid}\n{lock_start_time}"),
-        )
-        .unwrap();
-        // Load-bearing: turns the implicit lock-file-format coupling
-        // into a self-checking one — a future format change fails this
-        // test loudly instead of silently exercising only half of it.
+            .expect("must read the holder fixture's own recorded start time");
+        let _hold = hold_phase_with_record(
+            &project_root,
+            PhaseId::new(2),
+            lock_pid,
+            Some(lock_start_time),
+        );
+        // Load-bearing: a record format change fails this test loudly instead of silently
+        // exercising only half of it.
         assert_eq!(
-            lock::holder_identity(&project_root, PhaseId::new(2)),
+            liveness::live_holder(&liveness::phase_holder_path(&project_root, PhaseId::new(2)))
+                .unwrap(),
             Some((lock_pid, Some(lock_start_time))),
-            "the directly-written lock file must read back through holder_identity exactly \
-             as one lock::acquire itself wrote would"
+            "the rewritten record must read back as a claim's own record would"
         );
 
         registry::register_in(cache_dir.path(), &project_root, PhaseId::new(1)).unwrap();
@@ -9931,11 +13444,11 @@ mod tests {
         let reachable = registry_reachable_pids(&registered_roots);
         assert!(
             reachable.contains(&lock_pid),
-            "lock_pid must be reachable via the lock file's holder_identity"
+            "lock_pid must be reachable through the held holder file"
         );
         assert!(
             !reachable.contains(&orphan_pid),
-            "orphan_pid is named by no state file and no lock file, so it must not be \
+            "orphan_pid is named by no state file and holds no file, so it must not be \
              reachable"
         );
 
@@ -9956,7 +13469,7 @@ mod tests {
         );
         assert!(
             !retained.iter().any(|p| p.pid == lock_pid),
-            "the lock-held pid must be filtered out"
+            "the holder's pid must be filtered out"
         );
 
         let findings = build_stray_process_findings(&retained);
@@ -9966,7 +13479,7 @@ mod tests {
         );
         assert!(
             !findings.iter().any(|f| f.pid == lock_pid),
-            "the lock-held pid must produce no finding"
+            "the holder's pid must produce no finding"
         );
 
         // Reap both with a VERIFIED signal, never a bare one
@@ -9986,7 +13499,7 @@ mod tests {
     /// 999.44's originating case, as an executable assertion rather than
     /// prose (see `25-15-PLAN.md`'s `<why_this_does_not_violate_d17>`):
     /// once a registered root is deleted off disk, its state file and
-    /// lock file are gone with it, so it contributes ZERO pids to the
+    /// held files are gone with it, so it contributes ZERO pids to the
     /// reachable set — even while the OS process it named is still
     /// alive. The filter is therefore structurally incapable of hiding
     /// this population.
@@ -10001,19 +13514,14 @@ mod tests {
 
         let state = State::new(PhaseId::new(1), AgentKind::Claude, Mode::Auto, root.clone());
         workflow::save_state(&state).unwrap();
-        // The pid's path into the reachable set: a lock file naming it as
-        // holder, in the `.devflow/lock-{phase:02}` shape (pid, start time).
+        // The pid's path into the reachable set: a held holder file whose record names it.
         let start_time = agent::process_start_time(pid)
-            .expect("must read the lock fixture's own recorded start time");
-        std::fs::write(
-            root.join(".devflow").join("lock-01"),
-            format!("{pid}\n{start_time}"),
-        )
-        .unwrap();
+            .expect("must read the holder fixture's own recorded start time");
+        let _hold = hold_phase_with_record(&root, PhaseId::new(1), pid, Some(start_time));
 
         assert!(
             registry_reachable_pids(std::slice::from_ref(&root)).contains(&pid),
-            "the pid must be reachable while its root, state file and lock file still exist"
+            "the pid must be reachable while its root, state file and holder file still exist"
         );
 
         std::fs::remove_dir_all(&root).unwrap();
@@ -10026,7 +13534,7 @@ mod tests {
         let reachable_after_deletion = registry_reachable_pids(std::slice::from_ref(&root));
         assert!(
             reachable_after_deletion.is_empty(),
-            "a deleted root's state file and lock file are gone with it, so it must \
+            "a deleted root's state file and held files are gone with it, so it must \
              contribute nothing to the reachable set: got {reachable_after_deletion:?}"
         );
 
@@ -10445,13 +13953,14 @@ mod tests {
                 detail: "detail".to_string(),
                 repair: None,
             }];
-            let body = doctor_json_body(&checks, &facts, &doc_findings, &[], (&[], None));
+            let body = doctor_json_body(&checks, &facts, &doc_findings, &[], (&[], None), &[]);
             let obj = body.as_object().unwrap();
             assert_eq!(
                 obj.len(),
-                6,
+                7,
                 "must be exactly {{environment, reconciliation, planning_doc_staleness, \
-                 stray_processes, orphan_supervisors, orphan_supervisor_sweep_error}}: {body}"
+                 stray_processes, orphan_supervisors, orphan_supervisor_sweep_error, \
+                 set_aside_gate_answers}}: {body}"
             );
             assert!(obj.contains_key("environment"));
             assert!(obj.contains_key("reconciliation"));
@@ -10743,6 +14252,7 @@ mod tests {
             let (thread_log, thread_done, path) = (log.clone(), done.clone(), socket.to_path_buf());
             let thread = std::thread::spawn(move || {
                 let mut shutdowns = 0;
+                let mut parked = Vec::new();
                 while !thread_done.load(Ordering::SeqCst) {
                     let Some(mut stream) =
                         accept_within(&listener, std::time::Duration::from_millis(50))
@@ -10761,6 +14271,16 @@ mod tests {
                     let script = on_shutdown(shutdowns);
                     for line in &script.lines {
                         let _ = writeln!(stream, "{line}");
+                    }
+                    // A supervisor with a stop pending keeps the connection for its final
+                    // line, so a script that ends on `accepted` does too.
+                    if script
+                        .lines
+                        .last()
+                        .is_some_and(|line| line.contains("\"accepted\":true"))
+                    {
+                        parked.push(stream);
+                        continue;
                     }
                     if script.unlink_after {
                         let _ = std::fs::remove_file(&path);
@@ -10815,9 +14335,199 @@ mod tests {
     }
 
     const HANDED_OFF_LINE: &str = r#"{"ok":false,"error":"handed_off"}"#;
+    const ACCEPTED_ADVANCING_LINE: &str = r#"{"ok":true,"accepted":true,"owner":"advancing"}"#;
     const ACCEPTED_LINE: &str = r#"{"ok":true,"accepted":true,"owner":"agent_running"}"#;
-    const STOPPED_LINE: &str =
-        r#"{"ok":true,"stopped":true,"exit_code":143,"advance_suppressed":true}"#;
+    const STOPPED_LINE: &str = r#"{"ok":true,"stopped":true,"exit_code":143,"advance_suppressed":true,"group_signalled":true}"#;
+
+    /// D-16 / D-13 item 6: the success line says what the supervisor did. A safe-point
+    /// stop signalled nothing and says so; only a signalled group is "ended".
+    #[test]
+    fn the_stop_line_names_the_safe_point_when_no_agent_group_was_signalled() {
+        let safe_point = stopped_line("phase 7", 143, true, false);
+        assert_eq!(
+            safe_point,
+            "stop: stopped phase 7 through its supervisor (honoured at an advance safe point; \
+             nothing was signalled; exit code 143)"
+        );
+        assert!(!safe_point.contains("agent group ended"), "{safe_point}");
+        let signalled = stopped_line("launch abc", 143, true, true);
+        assert_eq!(
+            signalled,
+            "stop: stopped launch abc through its supervisor (agent group ended, exit code 143, \
+             advance suppressed)"
+        );
+    }
+
+    /// D-13 item 1: a supervisor that accepted the stop and has not sent its final line
+    /// within `stop`'s wait will still honour it. `stop` says so, records `stopped` as for a
+    /// confirmed stop, and does not report a failure.
+    #[test]
+    fn stop_reports_an_accepted_stop_it_could_not_confirm_as_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let phase = PhaseId::new(1420);
+        let (base, sock) = stop_socket_dir();
+        let socket = sock.join("pending.sock");
+        save_state_naming(&root, phase, &socket, "launch-pending");
+        let supervisor =
+            ScriptedSupervisor::serve(&socket, "launch-pending", phase, "advancing", |_| {
+                ShutdownScript {
+                    lines: vec![ACCEPTED_ADVANCING_LINE.to_string()],
+                    unlink_after: false,
+                }
+            });
+
+        let started = std::time::Instant::now();
+        let result = stop_in(&root, phase, Some(base.path()));
+
+        assert!(result.is_ok(), "an accepted stop is no failure: {result:?}");
+        assert!(
+            started.elapsed() >= shutdown_final_timeout(),
+            "stop gave the final line its whole wait: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(supervisor.shutdowns(), 1, "one stop, one request");
+        let state = workflow::load_state(&root, phase).unwrap();
+        assert!(state.stopped, "recorded as for a confirmed stop");
+        assert!(
+            state
+                .stop_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("devflow stop")),
+            "{:?}",
+            state.stop_reason
+        );
+
+        let line = accepted_pending_line(&format!("phase {phase}"), "advancing");
+        for fragment in [
+            "accepted the stop",
+            "advancing",
+            "next safe point",
+            "`devflow status`",
+        ] {
+            assert!(line.contains(fragment), "missing {fragment:?}: {line}");
+        }
+        assert!(!line.contains("nothing was signalled"), "{line}");
+    }
+
+    /// A process of its own that is killed and reaped on every exit path.
+    struct OwnGroupSleep(std::process::Child);
+
+    impl OwnGroupSleep {
+        fn spawn() -> Self {
+            use std::os::unix::process::CommandExt as _;
+            Self(
+                std::process::Command::new("sleep")
+                    .arg("60")
+                    .process_group(0)
+                    .spawn()
+                    .expect("spawn the agent stand-in"),
+            )
+        }
+    }
+
+    impl Drop for OwnGroupSleep {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// D-19, `stop`'s half: a GONE socket, no pending record and no holder, with the phase's
+    /// agent still running. `stop` names it and the manual kill, signals nothing and writes
+    /// nothing. Control: once the agent is dead, today's path records `stopped`.
+    #[test]
+    fn stop_names_an_orphaned_agent_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let phase = PhaseId::new(1421);
+        let (base, sock) = stop_socket_dir();
+        let mut agent = OwnGroupSleep::spawn();
+        let pid = agent.0.id();
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.clone());
+        state.supervisor = Some(SupervisorRecord::new(
+            sock.join("missing.sock"),
+            "launch-gone".to_string(),
+            pid,
+            agent::process_start_time(pid).expect("the agent's start time"),
+            supervisor::boot_id().expect("this host has a boot id"),
+        ));
+        workflow::save_state(&state).unwrap();
+        let before = std::fs::read(workflow::state_path(&root, phase)).unwrap();
+
+        let error = stop_in(&root, phase, Some(base.path()))
+            .expect_err("stop must not report a stop beside a live agent")
+            .to_string();
+
+        for fragment in [
+            pid.to_string(),
+            format!("kill -TERM -- -{pid}"),
+            "999.170".to_string(),
+        ] {
+            assert!(error.contains(&fragment), "missing {fragment:?}: {error}");
+        }
+        assert!(!error.contains("nothing is running"), "{error}");
+        assert!(!error.contains("devflow resume"), "{error}");
+        assert_eq!(
+            std::fs::read(workflow::state_path(&root, phase)).unwrap(),
+            before,
+            "nothing is written"
+        );
+        assert!(
+            matches!(agent.0.try_wait(), Ok(None)),
+            "the agent is not signalled"
+        );
+
+        agent.0.kill().unwrap();
+        agent.0.wait().unwrap();
+        stop_in(&root, phase, Some(base.path())).expect("control: nothing runs now");
+        assert!(workflow::load_state(&root, phase).unwrap().stopped);
+    }
+
+    /// D-19's other source: no supervisor record, and a live pid in the agent pid file,
+    /// which a reused pid can satisfy. `stop` names it with the `ps` check to run first,
+    /// signals nothing and writes nothing. Control: once it is dead, `stopped` is recorded.
+    #[test]
+    fn stop_names_an_unconfirmed_agent_pid_with_the_check_to_run_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let phase = PhaseId::new(1422);
+        let (base, _sock) = stop_socket_dir();
+        let mut agent = OwnGroupSleep::spawn();
+        let pid = agent.0.id();
+        let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.clone());
+        workflow::save_state(&state).unwrap();
+        std::fs::write(
+            devflow_core::agent_result::agent_pid_path(&root, phase),
+            format!("{pid}\n"),
+        )
+        .unwrap();
+        let before = std::fs::read(workflow::state_path(&root, phase)).unwrap();
+
+        let error = stop_in(&root, phase, Some(base.path()))
+            .expect_err("stop must not report a stop beside a live pid")
+            .to_string();
+
+        assert!(
+            error.contains(&format!("ps -o pid,pgid,lstart,args -p {pid}")),
+            "{error}"
+        );
+        assert!(!error.contains("nothing is running"), "{error}");
+        assert_eq!(
+            std::fs::read(workflow::state_path(&root, phase)).unwrap(),
+            before,
+            "nothing is written"
+        );
+        assert!(
+            matches!(agent.0.try_wait(), Ok(None)),
+            "the pid is not signalled"
+        );
+
+        agent.0.kill().unwrap();
+        agent.0.wait().unwrap();
+        stop_in(&root, phase, Some(base.path())).expect("control: nothing runs now");
+        assert!(workflow::load_state(&root, phase).unwrap().stopped);
+    }
 
     /// Crash row C13 (V-57): the state names supervisor A; A answers the
     /// shutdown by saving the state naming B (N+1's record is saved before N
@@ -11042,39 +14752,21 @@ mod tests {
         );
     }
 
-    /// A `sleep` child recorded as the holder of `root`'s lock for `phase`,
-    /// with its own pid and start time: the identity `stop_via_lock`
-    /// signals. Returns the child and the lock file.
-    fn hold_lock_by_a_child(root: &Path, phase: PhaseId) -> (std::process::Child, PathBuf) {
-        let child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .expect("spawn sleep");
-        let pid = child.id();
-        let mut start = None;
-        for _ in 0..100 {
-            start = agent::process_start_time(pid);
-            if start.is_some() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let start = start.expect("read the child's start time");
-        let lock_path = root
-            .join(".devflow")
-            .join(format!("lock-{padded}", padded = phase.padded()));
-        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
-        std::fs::write(&lock_path, format!("{pid}\n{start}")).unwrap();
-        (child, lock_path)
+    /// `root`'s holder file for `phase` held here, its record naming a `sleep` child with
+    /// its real pid and start time: the identity `stop_via_holder` would signal. Returns
+    /// the child and the hold.
+    fn hold_lock_by_a_child(root: &Path, phase: PhaseId) -> (std::process::Child, liveness::Hold) {
+        let (child, start) = sleep_child_with_start();
+        let hold = hold_phase_with_record(root, phase, child.id(), Some(start));
+        (child, hold)
     }
 
     /// `stop` during a `start` launcher's publish wait: the state loads but
     /// records no supervisor yet, the spawned supervisor already serves its
-    /// socket, and the launcher holds the lock. `stop` must end that
-    /// supervisor through its socket, not signal the launcher (which would
-    /// die and leave the supervisor and its agent running unrecorded). The
-    /// scripted supervisor drops the lock as it stops, as the launcher does
-    /// once its supervisor is gone.
+    /// socket, and the launcher holds the phase. `stop` must end that
+    /// supervisor through its socket, not signal the launcher. The scripted
+    /// supervisor drops the hold as it stops, as the launcher does once its
+    /// supervisor is gone.
     #[test]
     fn stop_ends_an_unrecorded_supervisor_through_its_socket_not_the_launcher() {
         let dir = tempfile::tempdir().unwrap();
@@ -11091,12 +14783,12 @@ mod tests {
         let launch_id = "aaaa0000aaaa1405";
         let socket = supervisor::SocketPath::for_launch(base.path(), &root, phase, launch_id)
             .expect("socket path fits sun_path");
-        let (mut launcher, lock_path) = hold_lock_by_a_child(&root, phase);
-        let released = lock_path.clone();
+        let (mut launcher, hold) = hold_lock_by_a_child(&root, phase);
+        let mut hold = Some(hold);
         let unrecorded =
             ScriptedSupervisor::serve(socket.as_path(), launch_id, phase, "agent_running", {
                 move |_| {
-                    let _ = std::fs::remove_file(&released);
+                    drop(hold.take());
                     ShutdownScript {
                         lines: vec![ACCEPTED_LINE.to_string(), STOPPED_LINE.to_string()],
                         unlink_after: true,
@@ -11121,9 +14813,77 @@ mod tests {
         );
     }
 
+    /// D-18 (V-83): a socket stop is not a signalled holder. The launcher keeps its hold
+    /// for the whole `stop`, as one still in its publish wait does, and the run leaves no
+    /// state: `stop` neither waits on the holder nor calls its pid signalled. The planted
+    /// holder reads `Live` before and after, so a release wait could not have passed.
+    ///
+    /// Limit: an in-process test cannot read `stop`'s printed line. Which line prints is
+    /// pinned by `a_holder_that_ended_its_run_after_the_signal_is_not_reported_as_stopped`.
+    #[test]
+    fn a_supervisor_stopped_through_its_socket_is_never_reported_as_a_signalled_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let phase = PhaseId::new(1407);
+        workflow::save_state(&State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Auto,
+            root.clone(),
+        ))
+        .unwrap();
+        let (base, _sock) = stop_socket_dir();
+        let launch_id = "aaaa0000aaaa1407";
+        let socket = supervisor::SocketPath::for_launch(base.path(), &root, phase, launch_id)
+            .expect("socket path fits sun_path");
+        let (mut launcher, _hold) = hold_lock_by_a_child(&root, phase);
+        let holder_path = liveness::phase_holder_path(&root, phase);
+        assert_eq!(
+            liveness::probe(&holder_path).unwrap(),
+            liveness::Held::Live,
+            "the planted holder reads live before `stop`"
+        );
+        let unrecorded =
+            ScriptedSupervisor::serve(socket.as_path(), launch_id, phase, "agent_running", {
+                let root = root.clone();
+                move |_| {
+                    workflow::clear_state(&root, phase).expect("the run ends and leaves no state");
+                    ShutdownScript {
+                        lines: vec![ACCEPTED_LINE.to_string(), STOPPED_LINE.to_string()],
+                        unlink_after: true,
+                    }
+                }
+            });
+
+        let started = std::time::Instant::now();
+        let result = stop_in(&root, phase, Some(base.path()));
+        let elapsed = started.elapsed();
+        let launcher_alive = devflow_core::test_support::process_is_live(launcher.id());
+        let after = liveness::probe(&holder_path).unwrap();
+        let _ = launcher.kill();
+        let _ = launcher.wait();
+
+        result.unwrap_or_else(|err| panic!("after {elapsed:?}: {err}"));
+        assert!(
+            elapsed < agent::TERMINATE_VERIFY_WAIT,
+            "`stop` does not wait on a holder it did not signal: {elapsed:?}"
+        );
+        assert_eq!(unrecorded.shutdowns(), 1, "exactly one shutdown");
+        assert!(launcher_alive, "the launcher is never signalled");
+        assert_eq!(
+            after,
+            liveness::Held::Live,
+            "a holder wait would have bitten"
+        );
+        assert!(
+            !workflow::state_path(&root, phase).exists(),
+            "nothing is written over the cleared state"
+        );
+    }
+
     /// The several-sockets refusal also covers a loaded state with no
     /// record: with two live sockets for the phase, `stop` cannot tell which
-    /// is the run, so it asks neither and signals no lock holder.
+    /// is the run, so it asks neither and signals no holder.
     #[test]
     fn stop_refuses_several_unrecorded_sockets_and_signals_nothing() {
         let dir = tempfile::tempdir().unwrap();
@@ -11148,7 +14908,7 @@ mod tests {
             })
         };
         let (a, b) = (serve("aaaa0000aaaa140a"), serve("aaaa0000aaaa140b"));
-        let (mut launcher, _lock_path) = hold_lock_by_a_child(&root, phase);
+        let (mut launcher, _hold) = hold_lock_by_a_child(&root, phase);
 
         let result = stop_in(&root, phase, Some(base.path()));
         let launcher_alive = launcher.try_wait().unwrap().is_none();
@@ -11162,7 +14922,7 @@ mod tests {
             "{text}"
         );
         assert_eq!((a.shutdowns(), b.shutdowns()), (0, 0), "neither is asked");
-        assert!(launcher_alive, "no lock holder is signalled");
+        assert!(launcher_alive, "no holder is signalled");
     }
 
     /// 50-15: the start/resume guard over a state file that will not load
@@ -11171,6 +14931,21 @@ mod tests {
     mod launch_guard {
         use super::*;
         use supervisor::backstop::BackstopDecision;
+
+        /// The guard over what is on disk now, as `reserve_launch`'s closure sees it.
+        fn refuse_launch_on_disk(
+            root: &Path,
+            phase: PhaseId,
+            verb: LaunchVerb,
+            cache: &Path,
+        ) -> Result<(), CliError> {
+            let existing = match workflow::load_state(root, phase) {
+                Ok(state) => workflow::Existing::Loaded(state),
+                Err(workflow::WorkflowError::MissingState(_)) => workflow::Existing::Missing,
+                Err(error) => workflow::Existing::Unloadable(error),
+            };
+            refuse_launch_over_a_live_run(root, phase, verb, &existing, Some(cache))
+        }
 
         /// A project root whose phase state file exists and will not load.
         fn root_with_an_unloadable_state(phase: PhaseId) -> tempfile::TempDir {
@@ -11199,12 +14974,7 @@ mod tests {
             let (listable, result) = without_dac_override(|| {
                 (
                     std::fs::read_dir(&sock).is_ok(),
-                    refuse_launch_over_a_live_run(
-                        root.path(),
-                        phase,
-                        LaunchVerb::Start,
-                        Some(cache.path()),
-                    ),
+                    refuse_launch_on_disk(root.path(), phase, LaunchVerb::Start, cache.path()),
                 )
             });
             std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -11235,12 +15005,8 @@ mod tests {
             let root = root_with_an_unloadable_state(phase);
             let cache = tempfile::tempdir().unwrap();
             assert!(!registry::socket_dir_in(cache.path()).exists());
-            let result = refuse_launch_over_a_live_run(
-                root.path(),
-                phase,
-                LaunchVerb::Resume,
-                Some(cache.path()),
-            );
+            let result =
+                refuse_launch_on_disk(root.path(), phase, LaunchVerb::Resume, cache.path());
             assert!(
                 result.is_ok(),
                 "a missing socket dir is not a refusal: {result:?}"
@@ -11297,12 +15063,7 @@ mod tests {
             assert!(!workflow::state_path(root.path(), phase).exists());
             let (base, _sock) = stop_socket_dir();
             let _alive = serve_unrecorded(base.path(), root.path(), phase);
-            let result = refuse_launch_over_a_live_run(
-                root.path(),
-                phase,
-                LaunchVerb::Start,
-                Some(base.path()),
-            );
+            let result = refuse_launch_on_disk(root.path(), phase, LaunchVerb::Start, base.path());
             let Err(CliError::Message(text)) = result else {
                 panic!("a live socket with no state file must refuse: {result:?}");
             };
@@ -11328,12 +15089,7 @@ mod tests {
             let (listable, result) = without_dac_override(|| {
                 (
                     std::fs::read_dir(&sock).is_ok(),
-                    refuse_launch_over_a_live_run(
-                        root.path(),
-                        phase,
-                        LaunchVerb::Start,
-                        Some(cache.path()),
-                    ),
+                    refuse_launch_on_disk(root.path(), phase, LaunchVerb::Start, cache.path()),
                 )
             });
             std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -11361,14 +15117,8 @@ mod tests {
             let phase = PhaseId::new(1505);
             let root = tempfile::tempdir().unwrap();
             let cache = tempfile::tempdir().unwrap();
-            let guard = || {
-                refuse_launch_over_a_live_run(
-                    root.path(),
-                    phase,
-                    LaunchVerb::Start,
-                    Some(cache.path()),
-                )
-            };
+            let guard =
+                || refuse_launch_on_disk(root.path(), phase, LaunchVerb::Start, cache.path());
             assert!(guard().is_ok(), "no socket directory: {:?}", guard());
             std::fs::create_dir_all(registry::socket_dir_in(cache.path())).unwrap();
             assert!(guard().is_ok(), "an empty socket directory: {:?}", guard());
@@ -11507,6 +15257,42 @@ mod tests {
             );
         }
 
+        /// 50.1-16: a pending supervisor holding its reservation, with no socket yet,
+        /// refuses `recover`. Control: released, the same call lets it through.
+        #[test]
+        fn recover_refuses_a_live_pending_supervisor() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = PhaseId::new(1604);
+            let id = "aaaa0000aaaa1604".to_string();
+            let liveness_path = root.join(format!(".devflow/supervisor-{id}.live"));
+            let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+            state.pending_supervisor = Some(PendingSupervisor::new(
+                id.clone(),
+                root.join("no-such.sock"),
+                liveness_path.clone(),
+            ));
+            workflow::save_state(&state).unwrap();
+            let hold = liveness::Hold::take(&liveness_path).unwrap();
+
+            let result = refuse_a_live_supervisor(root, phase, None);
+            let Err(CliError::Message(text)) = result else {
+                panic!("a live pending supervisor must refuse: {result:?}");
+            };
+            assert!(
+                text.contains("recover --clean deleted nothing") && text.contains(&id),
+                "{text}"
+            );
+
+            // A released flock can read held while another test's fork is before its exec.
+            drop(hold);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while let Err(error) = refuse_a_live_supervisor(root, phase, None) {
+                assert!(std::time::Instant::now() < deadline, "{error:?}");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+
         /// Controls: a GONE socket, and a STALE one whose group the backstop
         /// proves gone (a previous boot), let `recover` through.
         #[test]
@@ -11522,5 +15308,3192 @@ mod tests {
             let stale = refuse_a_live_supervisor(dir.path(), phase, None);
             assert!(stale.is_ok(), "a previous boot's group is gone: {stale:?}");
         }
+    }
+
+    /// How long a test leaves a writer blocked on the write lock before it lets the
+    /// holder go. Long enough that a writer not taking the lock has finished.
+    const BLOCKED_WRITER_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
+    const HOLDER_ENTERS_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// The state file as JSON, without the two fields `stop` owns.
+    fn state_file_without_stop_fields(root: &Path, phase: PhaseId) -> serde_json::Value {
+        let contents = std::fs::read_to_string(workflow::state_path(root, phase)).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        let fields = value.as_object_mut().unwrap();
+        fields.remove("stopped").unwrap();
+        fields.remove("stop_reason");
+        value
+    }
+
+    /// D-08: `stop` appends to the reason on disk when it writes, not to one it read
+    /// earlier. A writer holds the write lock while `stop` runs, then records a
+    /// `--until` reason, so a `stop` that does not wait loses its write to that writer.
+    #[test]
+    fn persist_stopped_state_appends_its_reason_on_the_current_state() {
+        const UNTIL_REASON: &str = "stopped after code completed (--until code)";
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(4901);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        state.yes_ship = true;
+        state.infra_failures = 2;
+        workflow::save_state(&state).unwrap();
+        let others_before = state_file_without_stop_fields(root, phase);
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(move || {
+                workflow::update_state(root, phase, |on_disk| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    on_disk.stop_reason = Some(UNTIL_REASON.to_string());
+                    Ok::<(), workflow::WorkflowError>(())
+                })
+                .unwrap();
+            });
+            entered_rx.recv_timeout(HOLDER_ENTERS_WITHIN).unwrap();
+            let stopper = scope.spawn(move || {
+                persist_stopped_state(root, phase, false, &[]).unwrap();
+            });
+            std::thread::sleep(BLOCKED_WRITER_GRACE);
+            release_tx.send(()).unwrap();
+            writer.join().unwrap();
+            stopper.join().unwrap();
+        });
+
+        let after = workflow::load_state(root, phase).unwrap();
+        assert!(after.stopped, "stop's write landed after the writer's");
+        assert_eq!(
+            after.stop_reason.as_deref(),
+            Some("stopped after code completed (--until code); stopped via `devflow stop`")
+        );
+        assert_eq!(
+            state_file_without_stop_fields(root, phase),
+            others_before,
+            "every other field is byte-identical"
+        );
+    }
+
+    // The launch reservation (50.1-16, D-01). Every test here runs its launch in a
+    // child: `launch_context` needs a hermetic DEVFLOW_CACHE_DIR, and the test holds
+    // read their variables from that child's environment.
+
+    const LAUNCH_HOLD_ENV: &str = "DEVFLOW_TEST_LAUNCH_HOLD";
+    /// Names which arm of a case-split reservation test a child runs. Not a DevFlow
+    /// setting, so it carries no `DEVFLOW_` prefix the doc check would require
+    /// documented.
+    const RESERVE_CASE_ENV: &str = "P50_1_16_CASE";
+    /// How long a test waits for a launcher to reach a hold point.
+    const REACH_HOLD_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// `<point>:<release path>`, with the release path in `dir`.
+    fn launch_hold_spec(point: &str, dir: &Path) -> std::ffi::OsString {
+        format!("{point}:{}", dir.join("release").display()).into()
+    }
+
+    /// The release path this child's [`LAUNCH_HOLD_ENV`] names.
+    fn launch_hold_release() -> PathBuf {
+        let spec = std::env::var(LAUNCH_HOLD_ENV).expect("the parent sets the hold");
+        let (_point, release) = spec.split_once(':').expect("<point>:<path>");
+        PathBuf::from(release)
+    }
+
+    /// `release`'s marker file, which a hold writes when it is reached.
+    fn held_marker(release: &Path) -> PathBuf {
+        let mut held = release.as_os_str().to_os_string();
+        held.push(".held");
+        PathBuf::from(held)
+    }
+
+    /// Wait until the hold on `release` is reached: `true`, or `false` once `worker`
+    /// has finished without reaching it or [`REACH_HOLD_WITHIN`] has passed.
+    fn reached_hold<T>(release: &Path, worker: &std::thread::ScopedJoinHandle<'_, T>) -> bool {
+        let deadline = std::time::Instant::now() + REACH_HOLD_WITHIN;
+        let held = held_marker(release);
+        while !held.exists() {
+            if worker.is_finished() || std::time::Instant::now() > deadline {
+                return held.exists();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        true
+    }
+
+    /// A repo `start` can launch from: `develop` carries a ROADMAP naming `phase`.
+    fn init_start_repo(root: &Path, phase: PhaseId) {
+        crate::test_support::init_repo(root);
+        std::fs::create_dir_all(root.join(".planning")).unwrap();
+        std::fs::write(
+            root.join(".planning/ROADMAP.md"),
+            format!("# Roadmap\n\n### Phase {phase}: reservation fixture\n"),
+        )
+        .unwrap();
+        for args in [
+            &["add", ".planning/ROADMAP.md"][..],
+            &["commit", "-q", "-m", "roadmap"][..],
+        ] {
+            let status = devflow_core::test_support::git_command(root)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        }
+    }
+
+    /// `start` as these tests run it: Supervise, no worktree, the capture shape.
+    fn start_for_test(root: &Path, phase: PhaseId) -> Result<(), String> {
+        start(
+            root,
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            false,
+            false,
+            false,
+            None,
+            false,
+            true,
+        )
+        .map_err(|err| err.to_string())
+    }
+
+    /// The names of `root`'s liveness files.
+    fn liveness_files(root: &Path) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(root.join(".devflow")) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = entries
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("supervisor-") && name.ends_with(".live"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// D-01's tracer: `start` names its supervisor before that supervisor exists,
+    /// the supervisor publishes under that id, and the publish save promotes it.
+    #[test]
+    fn start_reserves_then_its_supervisor_is_promoted_and_the_reservation_cleared() {
+        const NAME: &str = "commands::tests::\
+                            start_reserves_then_its_supervisor_is_promoted_and_the_reservation_cleared";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = crate::test_support::go_waiting_claude_dir();
+            let hold = tempfile::tempdir().unwrap();
+            let spec = launch_hold_spec("reserved", hold.path());
+            let output = crate::test_support::run_hermetic_test_in_child(
+                NAME,
+                path_dir.path(),
+                &[(LAUNCH_HOLD_ENV, spec.as_os_str())],
+            );
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5016);
+        init_start_repo(root, phase);
+        let release = launch_hold_release();
+
+        let (observed, result) = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| start_for_test(root, phase));
+            let observed =
+                reached_hold(&release, &worker).then(|| workflow::load_state(root, phase).unwrap());
+            std::fs::write(&release, "").unwrap();
+            (observed, worker.join().unwrap())
+        });
+        let finished = workflow::load_state(root, phase).unwrap();
+        let _reap = crate::test_support::ReapMonitorOnDrop::after_launch(&finished);
+        result.expect("the start launches");
+
+        let observed = observed.expect("start returned without reaching its reservation hold");
+        let pending = observed
+            .pending_supervisor
+            .expect("the state names the reservation before anything is spawned");
+        assert_eq!(observed.supervisor, None, "nothing is published yet");
+        assert_eq!(
+            finished.supervisor.as_ref().map(|r| r.launch_id.as_str()),
+            Some(pending.launch_id.as_str()),
+            "the supervisor publishes under the reserved id"
+        );
+        assert_eq!(
+            finished.pending_supervisor, None,
+            "the publish save promotes the reservation"
+        );
+        assert_eq!(
+            liveness::probe(&pending.liveness_path).unwrap(),
+            liveness::Held::Live,
+            "the supervisor holds the reserved lock after the launcher has returned"
+        );
+    }
+
+    /// The launcher keeps its copy of the lock until the publish save has returned, so
+    /// a supervisor that dies before it is recorded still reads live, and the launcher
+    /// decides what happens next. Once `start` has returned, the launcher's copy is gone
+    /// too, and the same file reads abandoned.
+    #[test]
+    fn the_launcher_keeps_its_lock_until_the_publish_save() {
+        const NAME: &str = "commands::tests::the_launcher_keeps_its_lock_until_the_publish_save";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = crate::test_support::go_waiting_claude_dir();
+            let hold = tempfile::tempdir().unwrap();
+            let spec = launch_hold_spec("before_publish_save", hold.path());
+            let output = crate::test_support::run_hermetic_test_in_child(
+                NAME,
+                path_dir.path(),
+                &[(LAUNCH_HOLD_ENV, spec.as_os_str())],
+            );
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5024);
+        init_start_repo(root, phase);
+        let release = launch_hold_release();
+
+        let (at_hold, result) = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| start_for_test(root, phase));
+            assert!(reached_hold(&release, &worker), "start reached the publish");
+            let pending = workflow::load_state(root, phase)
+                .unwrap()
+                .pending_supervisor
+                .expect("nothing has promoted the reservation yet");
+            let sidecar =
+                supervisor::read_sidecar(&pending.socket_path.with_extension("json")).unwrap();
+            // Only the launcher's copy is left once the supervisor is dead, and the
+            // agent never held one.
+            let supervisor_pid = libc::pid_t::try_from(sidecar.supervisor_pid).unwrap();
+            let agent_pgid = libc::pid_t::try_from(sidecar.agent_pgid).unwrap();
+            // SAFETY: both name processes this test's own start just launched, read
+            // from the sidecar they wrote while they are still running.
+            unsafe {
+                libc::kill(supervisor_pid, libc::SIGKILL);
+                libc::kill(-agent_pgid, libc::SIGKILL);
+            }
+            let deadline = std::time::Instant::now() + REACH_HOLD_WITHIN;
+            while agent::agent_running(sidecar.supervisor_pid)
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            // A SIGKILLed process's leader reads gone before its other threads have
+            // closed its files, so watch for a while: the lock must stay held throughout.
+            let watch_until = std::time::Instant::now() + std::time::Duration::from_millis(500);
+            let mut at_hold = liveness::probe(&pending.liveness_path).unwrap();
+            while at_hold == liveness::Held::Live && std::time::Instant::now() < watch_until {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                at_hold = liveness::probe(&pending.liveness_path).unwrap();
+            }
+            std::fs::write(&release, "").unwrap();
+            (at_hold, (worker.join().unwrap(), pending.liveness_path))
+        });
+        let (result, liveness_path) = result;
+        result.expect("the publish save itself succeeds");
+
+        assert_eq!(
+            at_hold,
+            liveness::Held::Live,
+            "the launcher still holds its copy before the publish save"
+        );
+        assert_eq!(
+            liveness::probe(&liveness_path).unwrap(),
+            liveness::Held::Abandoned,
+            "the launcher released its copy once the publish was done"
+        );
+    }
+
+    /// What a `start`'s reservation does over a state file that does not load. On success
+    /// the reservation's lock is released and the state it wrote stays.
+    fn reserve_over_an_unloadable_state(root: &Path, phase: PhaseId) -> Result<(), String> {
+        let path = workflow::state_path(root, phase);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{ this is not a state").unwrap();
+        let fresh = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let cache_dir = registry::cache_dir();
+        reserve_launch(
+            root,
+            phase,
+            LaunchVerb::Start,
+            Some(&fresh),
+            cache_dir.as_deref(),
+        )
+        .map(|reserved| reserved.reservation.discard())
+        .map_err(|err| err.to_string())
+    }
+
+    /// No state names a pending launch when the state does not load, and a supervisor that
+    /// has not published shows in no socket sweep: only its held lock says it is there. A
+    /// `start` must not overwrite the state and launch a second one beside it.
+    #[test]
+    fn a_start_refuses_an_unloadable_state_beside_an_unpublished_supervisors_lock() {
+        const NAME: &str = "commands::tests::a_start_refuses_an_unloadable_state_beside_an_unpublished_supervisors_lock";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = crate::test_support::go_waiting_claude_dir();
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5035);
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        let launch_id = supervisor::new_launch_id();
+        let lock = liveness::launch_liveness_path(root, &launch_id).unwrap();
+        let _unpublished = liveness::Hold::take(&lock).unwrap();
+
+        let error = reserve_over_an_unloadable_state(root, phase)
+            .expect_err("a live lock no state can account for refuses the start");
+
+        assert!(error.contains(&launch_id), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(workflow::state_path(root, phase)).unwrap(),
+            "{ this is not a state",
+            "the refused start left the state file as it was"
+        );
+        assert_eq!(
+            liveness_files(root),
+            vec![format!("supervisor-{launch_id}.live")],
+            "the refused reservation left no liveness file"
+        );
+    }
+
+    fn reserve_over_a_missing_state(root: &Path, phase: PhaseId) -> Result<(), String> {
+        assert!(!workflow::state_path(root, phase).exists());
+        let fresh = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let cache_dir = registry::cache_dir();
+        reserve_launch(
+            root,
+            phase,
+            LaunchVerb::Start,
+            Some(&fresh),
+            cache_dir.as_deref(),
+        )
+        .map(|reserved| reserved.reservation.discard())
+        .map_err(|err| err.to_string())
+    }
+
+    /// A `recover --clean` that removed a state beside an unpublished supervisor leaves
+    /// that supervisor's held lock as the only sign of it. A `start` over the missing
+    /// state must refuse, naming the holder, rather than launch a second one. Control:
+    /// the same lock recorded by another phase's state is that phase's and refuses nothing.
+    #[test]
+    fn a_start_refuses_a_missing_state_beside_an_unrecorded_live_lock() {
+        const NAME: &str =
+            "commands::tests::a_start_refuses_a_missing_state_beside_an_unrecorded_live_lock";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = crate::test_support::go_waiting_claude_dir();
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5037);
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        let launch_id = supervisor::new_launch_id();
+        let lock = liveness::launch_liveness_path(root, &launch_id).unwrap();
+        let _unpublished = liveness::Hold::take(&lock).unwrap();
+
+        let error = reserve_over_a_missing_state(root, phase)
+            .expect_err("a live lock no state records refuses the start");
+
+        assert!(error.contains(&launch_id), "{error}");
+        assert!(
+            error.contains(&format!("pid {}", std::process::id())),
+            "the refusal names the holder: {error}"
+        );
+        assert!(!error.contains("recover --clean"), "{error}");
+        assert!(!workflow::state_path(root, phase).exists(), "nothing saved");
+
+        let mut recorder = State::new(
+            PhaseId::new(5038),
+            AgentKind::Claude,
+            Mode::Auto,
+            root.to_path_buf(),
+        );
+        recorder.pending_supervisor = Some(PendingSupervisor::new(
+            launch_id.clone(),
+            root.join("unused.sock"),
+            lock.clone(),
+        ));
+        workflow::save_state(&recorder).unwrap();
+        reserve_over_a_missing_state(root, phase)
+            .expect("control: a live lock another phase records refuses nothing");
+    }
+
+    /// The control: with no live lock, or only a released one, a `start` still replaces a
+    /// state file that does not load, the repair the reservation's note names.
+    #[test]
+    fn a_start_replaces_an_unloadable_state_beside_a_released_lock() {
+        const NAME: &str =
+            "commands::tests::a_start_replaces_an_unloadable_state_beside_a_released_lock";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = crate::test_support::go_waiting_claude_dir();
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5036);
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        let lock = liveness::launch_liveness_path(root, &supervisor::new_launch_id()).unwrap();
+        drop(liveness::Hold::take(&lock).unwrap());
+
+        reserve_over_an_unloadable_state(root, phase).expect("a released lock refuses nothing");
+
+        assert!(
+            workflow::load_state(root, phase).is_ok(),
+            "the reservation replaced the state file"
+        );
+    }
+
+    /// What [`start_failing_its_publish_save`] left. Dropping it ends the supervisor and
+    /// its agent, so a failed assertion leaks neither.
+    struct FailedStart {
+        error: String,
+        launch_id: String,
+        socket: PathBuf,
+        supervisor_pid: libc::pid_t,
+        agent_pgid: libc::pid_t,
+        state_left: bool,
+    }
+
+    impl Drop for FailedStart {
+        fn drop(&mut self) {
+            // SAFETY: both name processes this test's own start launched; a SIGKILL also
+            // ends a stopped process. A group already gone only makes these fail.
+            unsafe {
+                libc::kill(self.supervisor_pid, libc::SIGKILL);
+                libc::kill(-self.agent_pgid, libc::SIGKILL);
+            }
+        }
+    }
+
+    /// A `start` whose publish save fails, with `stop_supervisor` deciding whether the
+    /// launcher can get a confirmed stop out of the supervisor it spawned. The reservation
+    /// is cleared at the hold, which is what fails the save.
+    fn start_failing_its_publish_save(
+        root: &Path,
+        phase: PhaseId,
+        stop_supervisor: bool,
+    ) -> FailedStart {
+        init_start_repo(root, phase);
+        let release = launch_hold_release();
+        let (result, pending, sidecar) = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| start_for_test(root, phase));
+            assert!(reached_hold(&release, &worker), "start reached the publish");
+            let pending = workflow::load_state(root, phase)
+                .unwrap()
+                .pending_supervisor
+                .expect("nothing has promoted the reservation yet");
+            let sidecar =
+                supervisor::read_sidecar(&pending.socket_path.with_extension("json")).unwrap();
+            if stop_supervisor {
+                // SAFETY: names the supervisor this test's own start just launched, read
+                // from the sidecar it wrote while it is still running.
+                unsafe {
+                    libc::kill(
+                        libc::pid_t::try_from(sidecar.supervisor_pid).unwrap(),
+                        libc::SIGSTOP,
+                    );
+                }
+            }
+            workflow::update_state_with(root, phase, |existing| {
+                let workflow::Existing::Loaded(mut state) = existing else {
+                    panic!("the reservation's state loads");
+                };
+                state.pending_supervisor = None;
+                Ok::<_, CliError>((Some(state), ()))
+            })
+            .unwrap();
+            std::fs::write(&release, "").unwrap();
+            (worker.join().unwrap(), pending, sidecar)
+        });
+        FailedStart {
+            error: result.expect_err("the publish save fails"),
+            launch_id: pending.launch_id,
+            socket: pending.socket_path,
+            supervisor_pid: libc::pid_t::try_from(sidecar.supervisor_pid).unwrap(),
+            agent_pgid: libc::pid_t::try_from(sidecar.agent_pgid).unwrap(),
+            state_left: workflow::state_path(root, phase).exists(),
+        }
+    }
+
+    /// The `start --force` an operator runs after a failed one: the failed start left its
+    /// feature branch, which a plain `start` refuses only after the live-run guard has passed.
+    fn start_again_with_force(root: &Path, phase: PhaseId) -> Result<(), String> {
+        start(
+            root,
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            true,
+            false,
+            false,
+            None,
+            false,
+            true,
+        )
+        .map_err(|err| err.to_string())
+    }
+
+    /// Run the test `name` in a hermetic child with the publish hold set, returning `true`
+    /// in the parent, whose work is done, and `false` in the child.
+    fn parent_of_a_failed_publish_child(name: &str) -> bool {
+        if devflow_core::test_support::in_child_test(name) {
+            return false;
+        }
+        let path_dir = crate::test_support::go_waiting_claude_dir();
+        let hold = tempfile::tempdir().unwrap();
+        let spec = launch_hold_spec("before_publish_save", hold.path());
+        let output = crate::test_support::run_hermetic_test_in_child(
+            name,
+            path_dir.path(),
+            &[(LAUNCH_HOLD_ENV, spec.as_os_str())],
+        );
+        devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, name);
+        true
+    }
+
+    /// A failed `start` whose supervisor never confirmed a stop leaves no state, so the
+    /// next `start` reads `Missing` and sweeps the sockets. A state naming neither the record
+    /// nor the reservation would skip that sweep and launch beside the supervisor.
+    #[test]
+    fn a_second_start_refuses_beside_a_failed_starts_stopped_supervisor() {
+        const NAME: &str =
+            "commands::tests::a_second_start_refuses_beside_a_failed_starts_stopped_supervisor";
+        if parent_of_a_failed_publish_child(NAME) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (root, phase) = (dir.path(), PhaseId::new(5033));
+        let failed = start_failing_its_publish_save(root, phase, true);
+        assert!(
+            failed.error.contains("did not confirm a stop"),
+            "{}",
+            failed.error
+        );
+        // Only the supervisor is left, so its socket is all that can refuse: a live agent
+        // would also trip the agent pid file check on any state that kept that check on.
+        // SAFETY: names the agent group this test's own start launched.
+        unsafe { libc::kill(-failed.agent_pgid, libc::SIGKILL) };
+
+        let second = start_again_with_force(root, phase);
+        let _reap = workflow::load_state(root, phase)
+            .ok()
+            .map(|state| crate::test_support::ReapMonitorOnDrop::after_launch(&state));
+
+        let refused = second.expect_err("a second supervisor was launched beside the first");
+        assert!(refused.contains(&failed.launch_id), "{refused}");
+    }
+
+    /// With the socket and sidecar gone the sweep has nothing to find, but the stopped
+    /// supervisor still holds its liveness lock, which no state records: the same second
+    /// `start` refuses through that lock, naming the supervisor's pid, instead of
+    /// launching a second supervisor beside it.
+    #[test]
+    fn a_second_start_refuses_through_the_held_lock_when_the_sweep_has_nothing_to_find() {
+        const NAME: &str = "commands::tests::a_second_start_refuses_through_the_held_lock_when_the_sweep_has_nothing_to_find";
+        if parent_of_a_failed_publish_child(NAME) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (root, phase) = (dir.path(), PhaseId::new(5037));
+        let failed = start_failing_its_publish_save(root, phase, true);
+        std::fs::remove_file(&failed.socket).unwrap();
+        std::fs::remove_file(failed.socket.with_extension("json")).unwrap();
+
+        let second = start_again_with_force(root, phase);
+        let _reap = workflow::load_state(root, phase)
+            .ok()
+            .map(|state| crate::test_support::ReapMonitorOnDrop::after_launch(&state));
+
+        let refused = second.expect_err("a second supervisor was launched beside the first");
+        assert!(refused.contains(&failed.launch_id), "{refused}");
+        assert!(
+            refused.contains(&format!("held by pid {}", failed.supervisor_pid)),
+            "the refusal comes from the held lock and names its holder: {refused}"
+        );
+        // SAFETY: names the agent group and supervisor this test's own start launched.
+        unsafe {
+            libc::kill(-failed.agent_pgid, libc::SIGKILL);
+            libc::kill(failed.supervisor_pid, libc::SIGKILL);
+        }
+    }
+
+    /// The sidecar alone is not what the sweep needs: the socket's name still attributes it
+    /// to this root and phase, so a missing sidecar refuses too.
+    #[test]
+    fn a_second_start_refuses_when_only_the_sidecar_is_gone() {
+        const NAME: &str = "commands::tests::a_second_start_refuses_when_only_the_sidecar_is_gone";
+        if parent_of_a_failed_publish_child(NAME) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (root, phase) = (dir.path(), PhaseId::new(5038));
+        let failed = start_failing_its_publish_save(root, phase, true);
+        std::fs::remove_file(failed.socket.with_extension("json")).unwrap();
+
+        let second = start_again_with_force(root, phase);
+        let _reap = workflow::load_state(root, phase)
+            .ok()
+            .map(|state| crate::test_support::ReapMonitorOnDrop::after_launch(&state));
+
+        let refused = second.expect_err("the socket's name still attributes it");
+        assert!(refused.contains(&failed.launch_id), "{refused}");
+    }
+
+    /// A known limit, and what the failed `start`'s error has to stay true about: `stop`
+    /// finds a suspended supervisor with no state file but cannot get an answer out of it,
+    /// so it refuses and changes nothing. The error names the way out.
+    #[test]
+    fn the_stop_a_failed_start_names_refuses_over_a_suspended_supervisor() {
+        const NAME: &str =
+            "commands::tests::the_stop_a_failed_start_names_refuses_over_a_suspended_supervisor";
+        if parent_of_a_failed_publish_child(NAME) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (root, phase) = (dir.path(), PhaseId::new(5039));
+        let failed = start_failing_its_publish_save(root, phase, true);
+        assert!(!failed.state_left, "the run's state is gone");
+        for named in [
+            format!("devflow stop --phase {phase} --launch {}", failed.launch_id),
+            format!("kill -CONT {}", failed.supervisor_pid),
+        ] {
+            assert!(failed.error.contains(&named), "{named}: {}", failed.error);
+        }
+
+        let refused = stop_launch(root, phase, &failed.launch_id)
+            .expect_err("no answer comes from a suspended supervisor")
+            .to_string();
+
+        assert!(refused.contains("could not probe socket"), "{refused}");
+        assert!(refused.contains("nothing was signalled"), "{refused}");
+    }
+
+    /// Once a suspended supervisor runs again it ends. Which way is a race and not asserted:
+    /// the shutdown still queued from the failed `start` can end it under this `stop`, which
+    /// then returns Ok, or an error when its sidecar has gone mid-lookup.
+    #[test]
+    fn a_failed_starts_suspended_supervisor_ends_once_it_runs_and_is_stopped() {
+        const NAME: &str = "commands::tests::a_failed_starts_suspended_supervisor_ends_once_it_runs_and_is_stopped";
+        if parent_of_a_failed_publish_child(NAME) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (root, phase) = (dir.path(), PhaseId::new(5040));
+        let failed = start_failing_its_publish_save(root, phase, true);
+        // SAFETY: names the supervisor this test's own start launched.
+        unsafe { libc::kill(failed.supervisor_pid, libc::SIGCONT) };
+
+        let _either_outcome = stop_launch(root, phase, &failed.launch_id);
+
+        let deadline = std::time::Instant::now() + REACH_HOLD_WITHIN;
+        while agent::agent_running(u32::try_from(failed.supervisor_pid).unwrap()) {
+            assert!(std::time::Instant::now() < deadline, "the supervisor ended");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// The same failed publish, with a supervisor that confirms its stop, still leaves no
+    /// phantom run. This is what shows the check above reads the supervisor, not the
+    /// failure.
+    #[test]
+    fn a_start_clears_the_state_when_its_supervisor_confirmed_the_stop() {
+        const NAME: &str =
+            "commands::tests::a_start_clears_the_state_when_its_supervisor_confirmed_the_stop";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = crate::test_support::go_waiting_claude_dir();
+            let hold = tempfile::tempdir().unwrap();
+            let spec = launch_hold_spec("before_publish_save", hold.path());
+            let output = crate::test_support::run_hermetic_test_in_child(
+                NAME,
+                path_dir.path(),
+                &[(LAUNCH_HOLD_ENV, spec.as_os_str())],
+            );
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let failed = start_failing_its_publish_save(dir.path(), PhaseId::new(5034), false);
+        assert!(
+            failed.error.contains("was shut down through its socket"),
+            "{}",
+            failed.error
+        );
+        assert!(
+            !failed.state_left,
+            "no supervisor is left: {}",
+            failed.error
+        );
+    }
+
+    /// A `start` that fails after reserving gives the reservation back: a state it
+    /// created is gone, an earlier run's state is as it was, and no liveness file is
+    /// left. The hold shows the reservation was really made, or a start that never
+    /// reserved would pass every check after it.
+    #[test]
+    fn a_start_that_fails_after_reserving_gives_the_reservation_back() {
+        const NAME: &str =
+            "commands::tests::a_start_that_fails_after_reserving_gives_the_reservation_back";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            // No `claude` on this PATH, so `ensure_agent_binary` refuses the start.
+            let path_dir = crate::test_support::agent_free_git_only_path_dir();
+            for case in ["no_state", "dead_run"] {
+                let hold = tempfile::tempdir().unwrap();
+                let spec = launch_hold_spec("reserved", hold.path());
+                let output = crate::test_support::run_hermetic_test_in_child(
+                    NAME,
+                    path_dir.path(),
+                    &[
+                        (LAUNCH_HOLD_ENV, spec.as_os_str()),
+                        (RESERVE_CASE_ENV, std::ffi::OsStr::new(case)),
+                    ],
+                );
+                devflow_core::test_support::assert_child_ran_exactly_one_passing_test(
+                    &output, NAME,
+                );
+            }
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5017);
+        let dead_run = std::env::var(RESERVE_CASE_ENV).unwrap() == "dead_run";
+        let state_file = workflow::state_path(root, phase);
+        if dead_run {
+            let mut old = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+            old.stage = Stage::Code;
+            old.stopped = true;
+            workflow::save_state(&old).unwrap();
+        }
+        let before = std::fs::read(&state_file).ok();
+        let release = launch_hold_release();
+
+        let (observed, result) = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| start_for_test(root, phase));
+            let observed =
+                reached_hold(&release, &worker).then(|| workflow::load_state(root, phase).unwrap());
+            std::fs::write(&release, "").unwrap();
+            (observed, worker.join().unwrap())
+        });
+
+        let observed = observed.expect("start returned without reaching its reservation hold");
+        assert!(observed.pending_supervisor.is_some(), "the start reserved");
+        let err = result.expect_err("no agent binary resolves");
+        assert!(err.contains("not found"), "{err}");
+        assert_eq!(
+            std::fs::read(&state_file).ok(),
+            before,
+            "the state file is back as it was before the start"
+        );
+        assert_eq!(liveness_files(root), Vec::<String>::new());
+    }
+
+    /// The state of a run whose recorded supervisor's socket is gone, with the launch's
+    /// liveness file taken as that supervisor would hold it.
+    fn state_with_a_held_lock_and_no_socket(
+        root: &Path,
+        phase: PhaseId,
+    ) -> (State, liveness::Hold) {
+        let mut state = state_with_pending(root, phase, true);
+        state.pending_supervisor = None;
+        state.verification_baseline_captured = true;
+        workflow::save_state(&state).unwrap();
+        let launch_id = &state.supervisor.as_ref().unwrap().launch_id;
+        let path = liveness::launch_liveness_path(root, launch_id).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let hold = liveness::Hold::take(&path).unwrap();
+        (state, hold)
+    }
+
+    /// A supervisor whose state vanished ends with no exit file and no successor, so a
+    /// follower must end too, saying why. Control: while the state exists it keeps following.
+    #[test]
+    fn logs_follow_ends_when_the_followed_state_is_gone_and_no_exit_file_will_come() {
+        const WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let phase = PhaseId::new(5306);
+        let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.clone());
+        workflow::save_state(&state).unwrap();
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let follower_root = root.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(logs(&follower_root, Some(phase), true, false));
+        });
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(1500))
+                .is_err(),
+            "control: a follower keeps following while the state exists"
+        );
+        std::fs::remove_file(workflow::state_path(&root, phase)).unwrap();
+        receiver
+            .recv_timeout(WAIT)
+            .expect("the follower ends once the state is gone")
+            .unwrap();
+    }
+
+    /// A follower started after the state is already gone, with no exit file, has no run
+    /// to wait for and must end too: no state is ever observed, so nothing may hinge on
+    /// having seen one. Control: the test above keeps following while the state exists.
+    #[test]
+    fn logs_follow_ends_when_no_state_exists_from_the_start_and_no_exit_file_will_come() {
+        const WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let phase = PhaseId::new(5307);
+        let capture = agent_result::stdout_path(&root, phase);
+        std::fs::create_dir_all(capture.parent().unwrap()).unwrap();
+        std::fs::write(&capture, "earlier output\n").unwrap();
+        assert!(!workflow::state_path(&root, phase).exists());
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let follower_root = root.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(logs(&follower_root, Some(phase), true, false));
+        });
+        receiver
+            .recv_timeout(WAIT)
+            .expect("the follower ends when there was never a state to follow")
+            .unwrap();
+    }
+
+    /// The launch guard refuses beside a recorded supervisor that holds its liveness file
+    /// with its socket gone, names that process rather than a `stop` that cannot reach it,
+    /// and stops refusing once the lock is released.
+    #[test]
+    fn a_launch_refuses_beside_a_held_lock_with_its_socket_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5304);
+        let (state, hold) = state_with_a_held_lock_and_no_socket(root, phase);
+        let existing = workflow::Existing::Loaded(state);
+
+        let refusal =
+            refuse_launch_over_a_live_run(root, phase, LaunchVerb::Resume, &existing, None)
+                .unwrap_err()
+                .to_string();
+        assert!(refusal.contains("aaaa0000aaaa5018"), "{refusal}");
+        assert!(
+            refusal.contains(&format!("pid {}", std::process::id())),
+            "{refusal}"
+        );
+        assert!(refusal.contains("cannot reach it"), "{refusal}");
+        assert!(
+            !refusal.contains("devflow stop --phase 5304 --launch"),
+            "{refusal}"
+        );
+
+        let path = hold.path().to_path_buf();
+        drop(hold);
+        wait_until_unheld(&path);
+        refuse_launch_over_a_live_run(root, phase, LaunchVerb::Resume, &existing, None).unwrap();
+    }
+
+    /// A supervisor unlinks its socket before it exits, so a lock released a moment later
+    /// is one exiting, not a live run: the guard waits it out rather than refuse.
+    #[test]
+    fn a_launch_waits_out_a_supervisor_exiting_with_its_socket_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5305);
+        let (state, hold) = state_with_a_held_lock_and_no_socket(root, phase);
+        let existing = workflow::Existing::Loaded(state);
+
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(hold);
+        });
+        let guarded =
+            refuse_launch_over_a_live_run(root, phase, LaunchVerb::Resume, &existing, None);
+        releaser.join().unwrap();
+        guarded.expect("a lock released within the wait is not a live supervisor");
+    }
+
+    /// `stop` does not record `stopped` and exit 0 beside a supervisor whose socket is
+    /// gone, which it could not have ended. Control: with the lock released, it does.
+    #[test]
+    fn stop_refuses_a_held_lock_with_its_socket_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5305);
+        let (_state, hold) = state_with_a_held_lock_and_no_socket(root, phase);
+        let cache = tempfile::tempdir().unwrap();
+
+        let err = stop_in(root, phase, Some(cache.path()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot reach it"), "{err}");
+        assert!(!workflow::load_state(root, phase).unwrap().stopped);
+
+        let path = hold.path().to_path_buf();
+        drop(hold);
+        wait_until_unheld(&path);
+        stop_in(root, phase, Some(cache.path())).unwrap();
+        assert!(workflow::load_state(root, phase).unwrap().stopped);
+    }
+
+    /// `status` and `doctor` report a held liveness lock with no socket as a process holding
+    /// the lock, by pid, and name no `resume`, which refuses it. Control: with the lock
+    /// released, both read the run as gone and name `resume` again.
+    #[test]
+    fn status_and_doctor_name_the_process_holding_a_lock_with_no_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5306);
+        let (state, hold) = state_with_a_held_lock_and_no_socket(root, phase);
+        let pid = format!("pid {}", std::process::id());
+        let resume = format!("devflow resume --phase {phase}");
+        let doctor = |state: &State| {
+            reconcile_phase(&facts_for(root, state))
+                .iter()
+                .map(|finding| format!("{} -> {:?}", finding.detail, finding.repair))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let status = rendered_status(&state);
+        assert!(status.contains("holds its liveness lock"), "{status}");
+        assert!(status.contains(&pid), "{status}");
+        assert!(!status.contains(&resume), "{status}");
+        let found = doctor(&state);
+        assert!(found.contains("holds its liveness lock"), "{found}");
+        assert!(found.contains(&pid), "{found}");
+        assert!(!found.contains(&resume), "{found}");
+
+        let path = hold.path().to_path_buf();
+        drop(hold);
+        wait_until_unheld(&path);
+        let status = rendered_status(&state);
+        assert!(status.contains(&resume), "{status}");
+        assert!(!status.contains("holds its liveness lock"), "{status}");
+        assert!(doctor(&state).contains(&resume), "{}", doctor(&state));
+    }
+
+    /// A stored Ship answer with a dead supervisor is `devflow ship`'s: `status` and `doctor`
+    /// name it and never the `resume` that sets the answer aside. Controls: with no answer,
+    /// and with the answer already claimed, both name `resume` as before.
+    #[test]
+    fn status_and_doctor_name_ship_for_a_stored_ship_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5307);
+        state_pending_at(root, phase, Stage::Ship);
+        let opened = Gates::open_gate(root, phase, Stage::Ship, "g").unwrap();
+        let state = workflow::load_state(root, phase).unwrap();
+        let ship = format!("devflow ship --phase {phase}");
+        let resume = format!("devflow resume --phase {phase}");
+        let stop = format!("devflow stop --phase {phase}");
+
+        assert!(
+            recovery_hints(&state, &PhaseLiveness::GoneWhileActive).contains(&resume),
+            "control: nothing stored yet"
+        );
+
+        gate_respond(root, phase, Some(Stage::Ship), true, None, None).unwrap();
+
+        assert_eq!(
+            recovery_hints(&state, &PhaseLiveness::GoneWhileActive),
+            vec![ship.clone()]
+        );
+        assert_eq!(
+            recovery_hints(&state, &PhaseLiveness::Stale),
+            vec![stop, ship.clone()]
+        );
+        let mut stopped = state.clone();
+        stopped.stopped = true;
+        assert_eq!(
+            recovery_hints(&stopped, &PhaseLiveness::Gone),
+            vec![ship.clone()]
+        );
+        let open_gates = Gates::list_open(root);
+        let facts = build_phase_facts(
+            root,
+            state.clone(),
+            &mut std::collections::HashMap::new(),
+            &open_gates,
+        );
+        let findings = reconcile_phase(&facts);
+        let gate_finding = findings
+            .iter()
+            .find(|finding| finding.detail.contains("gate_pending"))
+            .expect("the finding about gate_pending");
+        assert!(
+            gate_finding.detail.contains("holds a stored answer"),
+            "{}",
+            gate_finding.detail
+        );
+        assert_eq!(gate_finding.repair.as_deref(), Some(ship.as_str()));
+        for finding in &findings {
+            let repair = finding.repair.as_deref().unwrap_or_default();
+            assert!(!repair.contains("devflow resume"), "{repair}");
+        }
+
+        std::fs::write(
+            Gates::claim_path(root, phase, Stage::Ship, &opened.gate_id),
+            "",
+        )
+        .unwrap();
+        assert!(
+            recovery_hints(&state, &PhaseLiveness::GoneWhileActive).contains(&resume),
+            "control: a claimed answer is out of `devflow ship`'s reach"
+        );
+    }
+
+    /// The state a `start` leaves when it is killed during preparation: its real
+    /// reservation, with the lock released as a dead process's is.
+    fn state_of_a_start_killed_during_preparation(root: &Path, phase: PhaseId) -> State {
+        state_of_a_start_killed_in_mode(root, phase, Mode::Auto)
+    }
+
+    /// [`state_of_a_start_killed_during_preparation`] for a start in `mode`.
+    fn state_of_a_start_killed_in_mode(root: &Path, phase: PhaseId, mode: Mode) -> State {
+        let fresh = State::new(phase, AgentKind::Claude, mode, root.to_path_buf());
+        let cache = tempfile::tempdir().unwrap();
+        let reserved = reserve_launch(
+            root,
+            phase,
+            LaunchVerb::Start,
+            Some(&fresh),
+            Some(cache.path()),
+        )
+        .unwrap();
+        reserved.reservation.discard();
+        workflow::load_state(root, phase).unwrap()
+    }
+
+    /// `resume` over a `start` killed during preparation refuses before anything is
+    /// written, and names `start`: the state has no worktree, so a launch would run the
+    /// agent in the primary checkout. Control: the same state once preparation has run
+    /// gets past the refusal to the agent binary check, so the refusal is about this
+    /// state and not about every `resume`.
+    #[test]
+    fn resume_refuses_a_start_killed_during_preparation() {
+        const NAME: &str = "commands::tests::resume_refuses_a_start_killed_during_preparation";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            // No `claude` on this PATH, so a resume that gets past the refusal fails
+            // on the binary check and spawns nothing.
+            let path_dir = crate::test_support::agent_free_git_only_path_dir();
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5301);
+        let killed = state_of_a_start_killed_during_preparation(root, phase);
+        assert!(killed.pending_supervisor.is_some(), "the start reserved");
+
+        let err = crate::pipeline_launch::resume(root, phase, None, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("never finished preparing"), "{err}");
+        assert!(
+            err.contains(&format!(
+                "devflow start --phase {phase} --agent claude --mode auto"
+            )),
+            "{err}"
+        );
+        let after = workflow::load_state(root, phase).unwrap();
+        assert_eq!(after.stage, Stage::Define);
+        assert!(after.supervisor.is_none());
+        assert!(!after.stopped, "the refusal marks nothing");
+
+        let err = crate::pipeline_launch::advance_command(root, Some(phase), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("never finished preparing"), "{err}");
+        assert_eq!(
+            workflow::load_state(root, phase).unwrap().stage,
+            Stage::Define,
+            "a hand-run advance launched nothing"
+        );
+
+        let prepared = PhaseId::new(5302);
+        let mut state = State::new(prepared, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.verification_baseline_captured = true;
+        workflow::save_state(&state).unwrap();
+        let err = crate::pipeline_launch::resume(root, prepared, None, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not found"), "{err}");
+    }
+
+    /// A real `start` of what a killed one's refusal names, over `root`: a worktree start
+    /// in Supervise mode with a stub agent, which returns once it has launched.
+    fn start_as_refusal_names(root: &Path, phase: PhaseId, force: bool) -> Result<(), String> {
+        start(
+            root,
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            force,
+            true,
+            false,
+            None,
+            false,
+            true,
+        )
+        .map_err(|err| err.to_string())
+    }
+
+    /// With no worktree, the refusal names a plain `start`, and that start launches.
+    #[test]
+    fn a_killed_start_with_no_worktree_names_a_plain_start_that_launches() {
+        const NAME: &str =
+            "commands::tests::a_killed_start_with_no_worktree_names_a_plain_start_that_launches";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = crate::test_support::go_waiting_claude_dir();
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (root, phase) = (dir.path(), PhaseId::new(5304));
+        init_start_repo(root, phase);
+        let killed = state_of_a_start_killed_in_mode(root, phase, Mode::Supervise);
+
+        let err = refuse_unprepared_run(&killed).unwrap_err().to_string();
+        assert!(
+            err.contains(&format!(
+                "run `devflow start --phase {phase} --agent claude --mode supervise`"
+            )),
+            "{err}"
+        );
+
+        let result = start_as_refusal_names(root, phase, false);
+        let launched = workflow::load_state(root, phase).unwrap();
+        let _reap = crate::test_support::ReapMonitorOnDrop::after_launch(&launched);
+        result.expect("the start the refusal names launches");
+    }
+
+    /// With a worktree already there, a plain `start` refuses, so the refusal and the hints
+    /// name `--force` and say what it discards, and that start launches.
+    #[test]
+    fn a_killed_start_with_a_worktree_names_a_force_start_that_launches() {
+        const NAME: &str =
+            "commands::tests::a_killed_start_with_a_worktree_names_a_force_start_that_launches";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = crate::test_support::go_waiting_claude_dir();
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (root, phase) = (dir.path(), PhaseId::new(5305));
+        init_start_repo(root, phase);
+        let killed = state_of_a_start_killed_in_mode(root, phase, Mode::Supervise);
+        let worktree_path = ensure_phase_worktree(root, phase, false, DEVELOP).unwrap();
+
+        let err = refuse_unprepared_run(&killed).unwrap_err().to_string();
+        let verb = format!("devflow start --phase {phase} --agent claude --mode supervise --force");
+        assert!(err.contains(&format!("run `{verb}")), "{err}");
+        assert!(err.contains("discard"), "{err}");
+        assert!(err.contains(&*worktree_path.to_string_lossy()), "{err}");
+        assert!(!err.contains("no worktree"), "{err}");
+        let hints = recovery_hints(&killed, &PhaseLiveness::NotLaunched);
+        assert!(hints[0].starts_with(&verb), "{hints:?}");
+
+        let refused = start_as_refusal_names(root, phase, false).unwrap_err();
+        assert!(refused.contains("use --force"), "{refused}");
+
+        let result = start_as_refusal_names(root, phase, true);
+        let launched = workflow::load_state(root, phase).unwrap();
+        let _reap = crate::test_support::ReapMonitorOnDrop::after_launch(&launched);
+        result.expect("the start the refusal names launches");
+    }
+
+    /// `status` and `doctor` name `start`, never `resume`, for a `start` killed during
+    /// preparation, stopped or not. Control: with preparation done, both name `resume`.
+    #[test]
+    fn status_and_doctor_name_start_for_a_start_killed_during_preparation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5303);
+        let start_verb = format!("devflow start --phase {phase} --agent claude --mode supervise");
+        let resume_verb = format!("devflow resume --phase {phase}");
+        let killed = state_with_pending(root, phase, false);
+        let mut stopped = killed.clone();
+        stopped.stopped = true;
+        let mut unreserved = killed.clone();
+        unreserved.pending_supervisor = None;
+
+        for (case, state) in [
+            ("killed", &killed),
+            ("stopped after", &stopped),
+            ("a refused resume after", &unreserved),
+        ] {
+            let liveness = probe_phase(state);
+            assert_eq!(
+                recovery_hints(state, &liveness),
+                vec![start_verb.clone()],
+                "{case}"
+            );
+        }
+        let findings = reconcile_phase(&facts_for(root, &killed));
+        let repairs: Vec<&str> = findings
+            .iter()
+            .filter_map(|finding| finding.repair.as_deref())
+            .collect();
+        assert!(repairs.contains(&start_verb.as_str()), "{repairs:?}");
+        assert!(
+            !repairs
+                .iter()
+                .any(|repair| repair.contains("devflow resume")),
+            "{repairs:?}"
+        );
+
+        let mut prepared = killed.clone();
+        prepared.verification_baseline_captured = true;
+        assert_eq!(
+            recovery_hints(&prepared, &probe_phase(&prepared)),
+            vec![resume_verb.clone()]
+        );
+        let findings = reconcile_phase(&facts_for(root, &prepared));
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.repair.as_deref() == Some(resume_verb.as_str())),
+            "control: a prepared run names resume"
+        );
+    }
+
+    /// A `start` refused during preparation, over a state file that does not load, leaves
+    /// that file's bytes on disk. Nothing else keeps them: its reservation replaced the file,
+    /// and giving the reservation back removes what it wrote.
+    #[test]
+    fn a_start_refused_during_preparation_keeps_an_unloadable_states_bytes() {
+        const NAME: &str =
+            "commands::tests::a_start_refused_during_preparation_keeps_an_unloadable_states_bytes";
+        const BYTES: &[u8] = b"{ damaged by hand";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            // No `claude` on this PATH, so `ensure_agent_binary` refuses the start.
+            let path_dir = crate::test_support::agent_free_git_only_path_dir();
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5308);
+        let state_file = workflow::state_path(root, phase);
+        std::fs::create_dir_all(state_file.parent().unwrap()).unwrap();
+        std::fs::write(&state_file, BYTES).unwrap();
+
+        let err = start_for_test(root, phase).expect_err("no agent binary resolves");
+        assert!(err.contains("not found"), "{err}");
+
+        let kept: Vec<Vec<u8>> = std::fs::read_dir(state_file.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains("unloadable")
+            })
+            .map(|path| std::fs::read(path).unwrap())
+            .collect();
+        assert_eq!(
+            kept,
+            vec![BYTES.to_vec()],
+            "the bytes survive under one name"
+        );
+        assert_eq!(
+            workflow::list_states(root).len(),
+            0,
+            "the copy is not a state"
+        );
+    }
+
+    /// RESEARCH Pitfall 7: a socket whose launch id is the state's pending supervisor is
+    /// claimed, with or without a recorded supervisor beside it, so `doctor` does not
+    /// call a legitimate next supervisor an orphan. Controls: the same socket with no
+    /// pending record, the state naming another launch, is reported as superseded; and
+    /// with the pending record naming another launch, too.
+    #[test]
+    fn doctor_does_not_call_a_pending_next_supervisor_superseded() {
+        use doctor_reconciliation::{
+            publish_launch, save_state_with_launch, short_cache, write_sidecar_for,
+        };
+        const RECORDED: &str = "aaaa0000aaaa1709";
+        const NEXT: &str = "bbbb0000bbbb1709";
+        const OTHER: &str = "cccc0000cccc1709";
+        const PHASE: u32 = 1709;
+        let cache = short_cache();
+        let cache = cache.path();
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        let phase = PhaseId::new(PHASE);
+        let (next, _) = publish_launch(cache, root, PHASE, NEXT);
+        write_sidecar_for(&next, root, PHASE, NEXT);
+        save_state_with_launch(root, PHASE, RECORDED);
+        let set_pending = |id: Option<&str>| {
+            workflow::update_state(root, phase, |state| {
+                state.pending_supervisor = id.map(|id| {
+                    PendingSupervisor::new(
+                        id.to_string(),
+                        next.as_path().to_path_buf(),
+                        root.join(format!("{id}.live")),
+                    )
+                });
+                Ok::<(), workflow::WorkflowError>(())
+            })
+            .unwrap();
+        };
+        let details = || -> Vec<String> {
+            collect_orphan_supervisors(root, cache)
+                .into_iter()
+                .map(|orphan| orphan.finding.detail)
+                .collect()
+        };
+
+        set_pending(Some(NEXT));
+        assert_eq!(details(), Vec::<String>::new(), "beside a recorded one");
+        workflow::update_state(root, phase, |state| {
+            state.supervisor = None;
+            Ok::<(), workflow::WorkflowError>(())
+        })
+        .unwrap();
+        assert_eq!(details(), Vec::<String>::new(), "with no recorded one");
+
+        save_state_with_launch(root, PHASE, RECORDED);
+        for (case, pending) in [("no pending record", None), ("another's", Some(OTHER))] {
+            set_pending(pending);
+            let listed = details();
+            assert_eq!(listed.len(), 1, "control, {case}: {listed:?}");
+            assert!(
+                listed[0].contains(NEXT) && listed[0].contains("superseded"),
+                "control, {case}: {listed:?}"
+            );
+        }
+    }
+
+    const AGENT_SPAWN_HOLD_ENV: &str = "DEVFLOW_TEST_AGENT_SPAWN_HOLD";
+    /// Carries a fixture's project root to its children. Not a DevFlow setting.
+    const RESERVE_ROOT_ENV: &str = "P50_1_16_ROOT";
+
+    /// `verb` as the second launcher in these tests runs it.
+    fn launch_for_test(root: &Path, phase: PhaseId, verb: LaunchVerb) -> Result<(), String> {
+        match verb {
+            LaunchVerb::Start => start_for_test(root, phase),
+            LaunchVerb::Resume => crate::pipeline_launch::resume(root, phase, None, true)
+                .map_err(|err| err.to_string()),
+        }
+    }
+
+    /// A supervisor held before its agent spawn, ended through its socket by
+    /// [`HeldSupervisor::end`] or, if an assertion fails first, on drop.
+    struct HeldSupervisor {
+        release: PathBuf,
+        cache: PathBuf,
+    }
+
+    impl HeldSupervisor {
+        /// Release the hold, wait for the supervisor to publish and stop it through
+        /// its socket. Whether a supervisor confirmed a stop.
+        fn end(&self) -> bool {
+            let _ = std::fs::write(&self.release, "");
+            let deadline = std::time::Instant::now() + REACH_HOLD_WITHIN;
+            while std::time::Instant::now() < deadline {
+                let alive: Vec<PathBuf> = supervisor::sweep_in(&self.cache)
+                    .into_iter()
+                    .filter(|entry| matches!(entry.liveness, Ok(supervisor::Liveness::Alive(_))))
+                    .map(|entry| entry.socket_path)
+                    .collect();
+                if !alive.is_empty() {
+                    return alive.iter().fold(true, |stopped, socket| {
+                        let outcome = supervisor::request_shutdown(socket, REACH_HOLD_WITHIN);
+                        stopped
+                            && matches!(outcome, Ok(supervisor::ShutdownOutcome::Stopped { .. }))
+                    });
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            false
+        }
+    }
+
+    impl Drop for HeldSupervisor {
+        fn drop(&mut self) {
+            if !self.release.exists() {
+                self.end();
+            }
+        }
+    }
+
+    /// V-01: a launcher SIGKILLed during its publish wait leaves a live supervisor
+    /// that the state names only as pending. It is held before its agent spawn, so
+    /// the agent pid file cannot be what refuses the second launch.
+    fn second_launch_refuses_over_a_dead_launchers_supervisor(
+        name: &str,
+        phase: PhaseId,
+        verb: LaunchVerb,
+    ) {
+        if devflow_core::test_support::in_child_test(name) {
+            let root = PathBuf::from(std::env::var_os(RESERVE_ROOT_ENV).unwrap());
+            match std::env::var(RESERVE_CASE_ENV).unwrap().as_str() {
+                "launcher" => {
+                    // Killed by the parent while it waits for the publish.
+                    let _ = launch_for_test(&root, phase, verb);
+                }
+                _ => assert_second_launch_is_refused(&root, phase, verb),
+            }
+            return;
+        }
+        let path_dir = crate::test_support::go_waiting_claude_dir();
+        let cache = crate::test_support::hermetic_cache_dir();
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        init_start_repo(root, phase);
+        if verb == LaunchVerb::Resume {
+            let mut stopped = State::new(
+                phase,
+                AgentKind::Claude,
+                Mode::Supervise,
+                root.to_path_buf(),
+            );
+            stopped.stopped = true;
+            stopped.verification_baseline_captured = true;
+            stopped.legacy_claude_launch = true;
+            workflow::save_state(&stopped).unwrap();
+        }
+        let hold = tempfile::tempdir().unwrap();
+        let release = hold.path().join("release");
+        let spawn_hold: std::ffi::OsString = format!("define:{}", release.display()).into();
+        let mut launcher = devflow_core::test_support::spawn_test_in_child(
+            name,
+            path_dir.path(),
+            &[
+                ("DEVFLOW_CACHE_DIR", cache.path().as_os_str()),
+                (RESERVE_ROOT_ENV, root.as_os_str()),
+                (RESERVE_CASE_ENV, std::ffi::OsStr::new("launcher")),
+                (AGENT_SPAWN_HOLD_ENV, spawn_hold.as_os_str()),
+            ],
+        );
+        let supervisor = HeldSupervisor {
+            release: release.clone(),
+            cache: cache.path().to_path_buf(),
+        };
+        let held = held_marker(&release);
+        let deadline = std::time::Instant::now() + REACH_HOLD_WITHIN;
+        while !held.exists() {
+            let launcher_ended = launcher.try_wait().unwrap().is_some();
+            assert!(
+                !launcher_ended && std::time::Instant::now() < deadline,
+                "the launcher's supervisor never reached its hold (launcher ended: \
+                 {launcher_ended})"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        launcher.kill().expect("SIGKILL the launcher");
+        launcher.wait().expect("reap the launcher");
+
+        assert!(
+            agent_pid_from_file(root, phase).is_none_or(|pid| !agent::agent_running(pid)),
+            "the agent pid file must not be able to cause the refusal"
+        );
+        let second = devflow_core::test_support::run_test_in_child(
+            name,
+            path_dir.path(),
+            &[
+                ("DEVFLOW_CACHE_DIR", cache.path().as_os_str()),
+                (RESERVE_ROOT_ENV, root.as_os_str()),
+                (RESERVE_CASE_ENV, std::ffi::OsStr::new("second")),
+            ],
+        );
+        devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&second, name);
+        assert!(
+            supervisor.end(),
+            "the held supervisor stops through its socket once it publishes"
+        );
+    }
+
+    /// The second launcher's half of the V-01 fixture.
+    fn assert_second_launch_is_refused(root: &Path, phase: PhaseId, verb: LaunchVerb) {
+        let state_file = workflow::state_path(root, phase);
+        let before = std::fs::read(&state_file).unwrap();
+        let live_before = liveness_files(root);
+        let pending = workflow::load_state(root, phase)
+            .unwrap()
+            .pending_supervisor
+            .expect("the dead launcher's reservation names its supervisor");
+        assert_eq!(
+            liveness::probe(&pending.liveness_path).unwrap(),
+            liveness::Held::Live,
+            "the supervisor kept the lock after its launcher died"
+        );
+
+        let result = launch_for_test(root, phase, verb);
+        // A launch that wrongly proceeded is ended before the assertions below fail.
+        let after = workflow::load_state(root, phase).ok();
+        let _reap = after
+            .as_ref()
+            .map(crate::test_support::ReapMonitorOnDrop::after_launch);
+
+        let text = result.expect_err("a second launch must refuse a live pending supervisor");
+        for expected in [
+            format!("devflow stop --phase {phase}"),
+            pending.launch_id.clone(),
+            PENDING_NO_SOCKET.to_string(),
+        ] {
+            assert!(text.contains(&expected), "missing {expected:?}: {text}");
+        }
+        assert!(
+            !text.contains("devflow resume"),
+            "no resume hint while its lock is held: {text}"
+        );
+        assert!(
+            !text.contains("agent pid"),
+            "the refusal must not come from the agent pid file: {text}"
+        );
+        assert_eq!(
+            std::fs::read(&state_file).unwrap(),
+            before,
+            "a refused launch writes no state"
+        );
+        assert_eq!(
+            liveness_files(root),
+            live_before,
+            "a refused launch leaves no liveness file of its own"
+        );
+    }
+
+    #[test]
+    fn start_refuses_over_a_pending_supervisor_whose_launcher_died() {
+        second_launch_refuses_over_a_dead_launchers_supervisor(
+            "commands::tests::start_refuses_over_a_pending_supervisor_whose_launcher_died",
+            PhaseId::new(5018),
+            LaunchVerb::Start,
+        );
+    }
+
+    #[test]
+    fn resume_refuses_over_a_pending_supervisor_whose_launcher_died() {
+        second_launch_refuses_over_a_dead_launchers_supervisor(
+            "commands::tests::resume_refuses_over_a_pending_supervisor_whose_launcher_died",
+            PhaseId::new(5019),
+            LaunchVerb::Resume,
+        );
+    }
+
+    /// Criterion 2: while a pending supervisor is live, a refused `resume` never
+    /// suggests `devflow resume`, even when an agent is live beside it. The control is
+    /// the same refusal over a recorded supervisor, which does name it.
+    #[test]
+    fn a_resume_refused_over_a_pending_supervisor_never_names_resume() {
+        let phase = PhaseId::new(5022);
+        let live = |pending| LiveSocket {
+            socket: PathBuf::from("/s.sock"),
+            launch_id: "aaaa0000aaaa5022".to_string(),
+            liveness: PENDING_NO_SOCKET.to_string(),
+            sidecar_problem: None,
+            pending,
+        };
+        for pending in [PendingKind::Published, PendingKind::Reserved] {
+            let text = live_run_refusal(phase, LaunchVerb::Resume, &[live(pending)], Some(77));
+            assert!(!text.contains("devflow resume"), "{text}");
+            assert!(text.contains("agent pid 77 alive"), "{text}");
+            assert!(text.contains("`devflow status` names"), "{text}");
+        }
+        let text = live_run_refusal(phase, LaunchVerb::Resume, &[live(PendingKind::No)], None);
+        assert!(text.contains("devflow resume"), "control: {text}");
+    }
+
+    /// How long the second launcher gets to reach the guard if the write lock lets it.
+    const SECOND_LAUNCHER_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
+
+    /// V-05: the guard and the pending write are one step. Two launchers held between
+    /// them: under the write lock the second never reaches the hold and is refused once
+    /// the first has written. The control skips the lock and both reserve, which is
+    /// what shows the lock, not the hold's timing, is what excludes the second.
+    #[test]
+    fn two_launchers_cannot_both_reserve() {
+        const NAME: &str = "commands::tests::two_launchers_cannot_both_reserve";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = crate::test_support::agent_free_git_only_path_dir();
+            for case in ["lock", "control"] {
+                let hold = tempfile::tempdir().unwrap();
+                let spec = launch_hold_spec("guarded", hold.path());
+                let mut env = vec![
+                    (LAUNCH_HOLD_ENV, spec.as_os_str()),
+                    (RESERVE_CASE_ENV, std::ffi::OsStr::new(case)),
+                ];
+                if case == "control" {
+                    env.push(("DEVFLOW_TEST_SKIP_WRITE_LOCK", std::ffi::OsStr::new("1")));
+                }
+                let output =
+                    crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &env);
+                devflow_core::test_support::assert_child_ran_exactly_one_passing_test(
+                    &output, NAME,
+                );
+            }
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5023);
+        let control = std::env::var(RESERVE_CASE_ENV).unwrap() == "control";
+        let release = launch_hold_release();
+        let held = held_marker(&release);
+        let arrivals = || {
+            std::fs::read_to_string(&held)
+                .map(|text| text.lines().count())
+                .unwrap_or(0)
+        };
+        let fresh = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        // A saved state, so neither launcher meets the stateless check for a lock no
+        // state records, which would refuse the control's second launcher too: the lock
+        // must be the only thing that can tell the two cases apart.
+        workflow::save_state(&fresh).unwrap();
+        let cache = std::env::var_os("DEVFLOW_CACHE_DIR").map(PathBuf::from);
+        let reserve = || {
+            reserve_launch(
+                root,
+                phase,
+                LaunchVerb::Start,
+                Some(&fresh),
+                cache.as_deref(),
+            )
+            .map_err(|err| err.to_string())
+        };
+
+        let (first, second, arrived) = std::thread::scope(|scope| {
+            let first = scope.spawn(reserve);
+            assert!(
+                reached_hold(&release, &first),
+                "the first launcher reached its hold"
+            );
+            let second = scope.spawn(reserve);
+            let deadline = std::time::Instant::now() + REACH_HOLD_WITHIN;
+            while control && arrivals() < 2 && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if !control {
+                std::thread::sleep(SECOND_LAUNCHER_GRACE);
+            }
+            let arrived = arrivals();
+            std::fs::write(&release, "").unwrap();
+            // The first keeps its reservation, and so its lock, until the second has
+            // answered: joining hands back the value without dropping it first.
+            let second = second.join().unwrap();
+            (first.join().unwrap(), second, arrived)
+        });
+
+        println!(
+            "V-05 {}: {arrived} at the hold, first ok: {}, second ok: {}",
+            std::env::var(RESERVE_CASE_ENV).unwrap(),
+            first.is_ok(),
+            second.is_ok()
+        );
+        if control {
+            assert_eq!(arrived, 2, "with no lock, both launchers pass the guard");
+            assert!(
+                first.is_ok() && second.is_ok(),
+                "with no lock, both reserve: {:?} {:?}",
+                first.as_ref().map(|r| r.reservation.launch_id()),
+                second.as_ref().map(|r| r.reservation.launch_id()),
+            );
+        } else {
+            assert_eq!(arrived, 1, "the second launcher is held at the write lock");
+            let (won, refusal) = match (&first, &second) {
+                (Ok(won), Err(refusal)) | (Err(refusal), Ok(won)) => (won, refusal),
+                _ => panic!(
+                    "exactly one launcher reserves: {:?} {:?}",
+                    first.as_ref().map(|r| r.reservation.launch_id()),
+                    second.as_ref().map(|r| r.reservation.launch_id()),
+                ),
+            };
+            assert!(
+                refusal.contains(&format!("devflow stop --phase {phase}")),
+                "{refusal}"
+            );
+            assert_eq!(
+                workflow::load_state(root, phase)
+                    .unwrap()
+                    .pending_supervisor
+                    .map(|pending| pending.launch_id),
+                Some(won.reservation.launch_id().to_string()),
+                "the state names the launcher that reserved"
+            );
+            assert_eq!(
+                liveness_files(root).len(),
+                1,
+                "the refused one left no file"
+            );
+        }
+        for reserved in [first, second].into_iter().flatten() {
+            reserved.reservation.discard();
+        }
+    }
+
+    /// V-03: a reservation whose lock nothing holds, or whose file is gone, is
+    /// abandoned. It blocks nothing, and the next launch replaces it and says so.
+    #[test]
+    fn an_abandoned_reservation_does_not_block_start() {
+        const NAME: &str = "commands::tests::an_abandoned_reservation_does_not_block_start";
+        const ABANDONED: &str = "aaaa0000aaaa5020";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = crate::test_support::agent_free_git_only_path_dir();
+            for case in ["unheld", "missing"] {
+                let output = crate::test_support::run_hermetic_test_in_child(
+                    NAME,
+                    path_dir.path(),
+                    &[
+                        (RESERVE_CASE_ENV, std::ffi::OsStr::new(case)),
+                        // libtest would otherwise swallow the line this test is about.
+                        ("RUST_TEST_NOCAPTURE", std::ffi::OsStr::new("1")),
+                    ],
+                );
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                assert!(
+                    output.status.success() && stdout.contains("1 passed"),
+                    "{case}: {stdout}\n{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let line = format!("cleared an abandoned launch reservation {ABANDONED}");
+                assert!(stdout.contains(&line), "{case}: {stdout}");
+            }
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5020);
+        let liveness_path = liveness::launch_liveness_path(root, ABANDONED).unwrap();
+        std::fs::create_dir_all(liveness_path.parent().unwrap()).unwrap();
+        let unheld = std::env::var(RESERVE_CASE_ENV).unwrap() == "unheld";
+        if unheld {
+            drop(liveness::Hold::take(&liveness_path).unwrap());
+        }
+        let mut abandoned = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        abandoned.stage = Stage::Code;
+        abandoned.pending_supervisor = Some(devflow_core::state::PendingSupervisor::new(
+            ABANDONED.to_string(),
+            root.join("never-published.sock"),
+            liveness_path.clone(),
+        ));
+        workflow::save_state(&abandoned).unwrap();
+        let fresh = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+
+        let cache = std::env::var_os("DEVFLOW_CACHE_DIR").map(PathBuf::from);
+        let reserved = reserve_launch(
+            root,
+            phase,
+            LaunchVerb::Start,
+            Some(&fresh),
+            cache.as_deref(),
+        )
+        .unwrap_or_else(|err| panic!("an abandoned reservation blocks nothing: {err}"));
+
+        let on_disk = workflow::load_state(root, phase).unwrap();
+        assert_eq!(
+            on_disk
+                .pending_supervisor
+                .as_ref()
+                .map(|p| p.launch_id.as_str()),
+            Some(reserved.reservation.launch_id()),
+            "the new reservation replaces the abandoned one"
+        );
+        assert_eq!(
+            on_disk.stage,
+            Stage::Code,
+            "the earlier run's state is kept"
+        );
+        assert!(
+            !liveness_path.exists(),
+            "the abandoned liveness file is gone"
+        );
+        reserved.reservation.discard();
+    }
+
+    /// V-04: a live agent named by the pid file still refuses, with the agent
+    /// guidance. It is the control for V-01's fixture, which rules that cause out.
+    #[test]
+    fn a_live_agent_pid_still_refuses_start() {
+        const NAME: &str = "commands::tests::a_live_agent_pid_still_refuses_start";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = crate::test_support::go_waiting_claude_dir();
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5021);
+        let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        workflow::save_state(&state).unwrap();
+        let before = std::fs::read(workflow::state_path(root, phase)).unwrap();
+        let mut agent_process = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn the live agent stand-in");
+        let pid = agent_process.id();
+        std::fs::write(
+            agent_result::agent_pid_path(root, phase),
+            format!("{pid}\n"),
+        )
+        .unwrap();
+
+        let result = start_for_test(root, phase);
+        let _ = agent_process.kill();
+        let _ = agent_process.wait();
+
+        let text = result.expect_err("a live agent refuses the start");
+        for expected in [
+            format!("agent pid {pid} alive"),
+            "The agent pid file names a live process".to_string(),
+        ] {
+            assert!(text.contains(&expected), "missing {expected:?}: {text}");
+        }
+        assert_eq!(
+            std::fs::read(workflow::state_path(root, phase)).unwrap(),
+            before,
+            "a refused start writes no state"
+        );
+    }
+
+    /// `start` writes a fresh run's state only while holding the write lock: with
+    /// another writer holding it, the create returns after that writer is done.
+    #[test]
+    fn start_creates_its_state_under_the_write_lock() {
+        const HOLDER_RELEASES: &str = "holder releases";
+        const CREATE_RETURNS: &str = "create returns";
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(4902);
+        let launch_id = "aaaa0000aaaa4902";
+        let mut reserved = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        reserved.pending_supervisor = Some(devflow_core::state::PendingSupervisor::new(
+            launch_id.to_string(),
+            root.join("reserved.sock"),
+            root.join("reserved.live"),
+        ));
+        workflow::save_state(&reserved).unwrap();
+        let mut fresh = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        let log = std::sync::Mutex::new(Vec::new());
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            let log = &log;
+            let fresh = &mut fresh;
+            let holder = scope.spawn(move || {
+                workflow::update_state_with(root, phase, |_existing| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    log.lock().unwrap().push(HOLDER_RELEASES);
+                    Ok::<_, workflow::WorkflowError>((None, ()))
+                })
+                .unwrap();
+            });
+            entered_rx.recv_timeout(HOLDER_ENTERS_WITHIN).unwrap();
+            let creator = scope.spawn(move || {
+                create_run_state(root, phase, fresh, launch_id).unwrap();
+                log.lock().unwrap().push(CREATE_RETURNS);
+            });
+            std::thread::sleep(BLOCKED_WRITER_GRACE);
+            release_tx.send(()).unwrap();
+            holder.join().unwrap();
+            creator.join().unwrap();
+        });
+
+        assert_eq!(
+            log.into_inner().unwrap(),
+            vec![HOLDER_RELEASES, CREATE_RETURNS]
+        );
+        assert_eq!(
+            serde_json::to_value(workflow::load_state(root, phase).unwrap()).unwrap(),
+            serde_json::to_value(&fresh).unwrap(),
+            "the file holds the fresh state"
+        );
+        assert_eq!(fresh.mode, Mode::Supervise, "the fresh state replaced it");
+        assert_eq!(
+            fresh.pending_supervisor, reserved.pending_supervisor,
+            "the fresh state keeps the reservation"
+        );
+    }
+
+    /// The reservation was cleared while `start` prepared the run: the create refuses
+    /// and writes nothing, for a state naming another launch and for no state at all.
+    #[test]
+    fn a_fresh_run_is_refused_once_its_reservation_was_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(4903);
+        let mut fresh = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+
+        let err = create_run_state(root, phase, &mut fresh, "aaaa0000aaaa4903").unwrap_err();
+        assert!(err.to_string().contains("was cleared"), "{err}");
+        assert!(!workflow::state_path(root, phase).exists());
+
+        let mut other = fresh.clone();
+        other.pending_supervisor = Some(devflow_core::state::PendingSupervisor::new(
+            "bbbb0000bbbb4903".to_string(),
+            root.join("other.sock"),
+            root.join("other.live"),
+        ));
+        workflow::save_state(&other).unwrap();
+        let before = std::fs::read(workflow::state_path(root, phase)).unwrap();
+        let err = create_run_state(root, phase, &mut fresh, "aaaa0000aaaa4903").unwrap_err();
+        assert!(err.to_string().contains("was cleared"), "{err}");
+        assert_eq!(
+            std::fs::read(workflow::state_path(root, phase)).unwrap(),
+            before
+        );
+    }
+
+    // ---- 50.1-18: status, doctor and stop see the pending supervisor (D-02) ----
+
+    const PENDING_LAUNCH: &str = "bbbb0000bbbb5018";
+
+    /// A saved, not-stopped state naming `PENDING_LAUNCH` as pending, its socket never
+    /// published and its liveness file not yet created. With `recorded`, it also names
+    /// a supervisor whose socket does not exist (GONE).
+    fn state_with_pending(root: &Path, phase: PhaseId, recorded: bool) -> State {
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        if recorded {
+            state.supervisor = Some(SupervisorRecord::new(
+                root.join("gone.sock"),
+                "aaaa0000aaaa5018".to_string(),
+                1,
+                0,
+                "boot".to_string(),
+            ));
+        }
+        let liveness_path = liveness::launch_liveness_path(root, PENDING_LAUNCH).unwrap();
+        std::fs::create_dir_all(liveness_path.parent().unwrap()).unwrap();
+        state.pending_supervisor = Some(PendingSupervisor::new(
+            PENDING_LAUNCH.to_string(),
+            root.join("never-published.sock"),
+            liveness_path,
+        ));
+        workflow::save_state(&state).unwrap();
+        state
+    }
+
+    /// Take the lock a live pending supervisor would hold.
+    fn hold_pending(state: &State) -> liveness::Hold {
+        let pending = state.pending_supervisor.as_ref().unwrap();
+        liveness::Hold::take(&pending.liveness_path).unwrap()
+    }
+
+    /// The lines `status` prints about `state`'s supervisor and its repair.
+    fn rendered_status(state: &State) -> String {
+        let phase_liveness = probe_phase(state);
+        let root = &state.project_root;
+        let mut lines = status_supervisor_lines(root, state, &phase_liveness);
+        lines.extend(status_hint_lines(root, state, &phase_liveness));
+        lines.join("\n")
+    }
+
+    /// V-07 (criterion 2): while the pending supervisor's lock is held, `status` names
+    /// `stop` and never `resume`, whether the state records a GONE supervisor or none.
+    #[test]
+    fn status_names_stop_not_resume_for_a_live_pending_supervisor() {
+        for (case, recorded) in [("a GONE record", true), ("no record", false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let phase = PhaseId::new(5180);
+            let state = state_with_pending(dir.path(), phase, recorded);
+            let _hold = hold_pending(&state);
+
+            let phase_liveness = probe_phase(&state);
+            assert_eq!(
+                phase_liveness,
+                PhaseLiveness::LaunchPending {
+                    launch_id: PENDING_LAUNCH.to_string(),
+                    published: false,
+                },
+                "{case}"
+            );
+            assert_eq!(phase_liveness.label(), "launch_pending", "{case}");
+            assert_eq!(
+                recovery_hints(&state, &phase_liveness),
+                vec![format!("devflow stop --phase {phase}")],
+                "{case}"
+            );
+            let rendered = rendered_status(&state);
+            assert!(
+                rendered.contains(&format!("devflow stop --phase {phase}")),
+                "{case}: {rendered}"
+            );
+            assert!(rendered.contains(PENDING_LAUNCH), "{case}: {rendered}");
+            assert!(!rendered.contains("devflow resume"), "{case}: {rendered}");
+        }
+    }
+
+    /// V-08, criterion 2's negative control: the same state once the pending
+    /// supervisor is gone (its lock released) suggests `resume` again and notes the
+    /// abandoned reservation.
+    #[test]
+    fn status_suggests_resume_once_the_pending_supervisor_is_gone() {
+        for (case, recorded) in [("a GONE record", true), ("no record", false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let phase = PhaseId::new(5181);
+            let mut state = state_with_pending(dir.path(), phase, recorded);
+            state.verification_baseline_captured = true;
+            drop(hold_pending(&state));
+
+            let phase_liveness = probe_phase(&state);
+            assert_eq!(phase_liveness, PhaseLiveness::GoneWhileActive, "{case}");
+            let resume = format!("devflow resume --phase {phase}");
+            assert_eq!(
+                recovery_hints(&state, &phase_liveness),
+                vec![resume.clone()],
+                "{case}"
+            );
+            let rendered = rendered_status(&state);
+            assert!(rendered.contains(&resume), "{case}: {rendered}");
+            assert!(rendered.contains(PENDING_LAUNCH), "{case}: {rendered}");
+            assert!(rendered.contains("abandoned"), "{case}: {rendered}");
+        }
+    }
+
+    /// V-09: `stop` over an abandoned reservation clears it, removes its liveness file
+    /// and says what it cleared, whether the file is unheld or already gone.
+    #[test]
+    fn stop_clears_an_abandoned_reservation_and_says_so() {
+        const NAME: &str = "commands::tests::stop_clears_an_abandoned_reservation_and_says_so";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = crate::test_support::agent_free_git_only_path_dir();
+            for case in ["unheld", "missing"] {
+                let output = crate::test_support::run_hermetic_test_in_child(
+                    NAME,
+                    path_dir.path(),
+                    &[
+                        (RESERVE_CASE_ENV, std::ffi::OsStr::new(case)),
+                        // libtest would otherwise swallow the line this test is about.
+                        ("RUST_TEST_NOCAPTURE", std::ffi::OsStr::new("1")),
+                    ],
+                );
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                assert!(
+                    output.status.success() && stdout.contains("1 passed"),
+                    "{case}: {stdout}\n{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let line = format!(
+                    "stop: cleared the abandoned launch reservation {PENDING_LAUNCH} (no process \
+                     held it)"
+                );
+                assert!(stdout.contains(&line), "{case}: {stdout}");
+            }
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5182);
+        let state = state_with_pending(root, phase, false);
+        let liveness_path = state
+            .pending_supervisor
+            .as_ref()
+            .unwrap()
+            .liveness_path
+            .clone();
+        if std::env::var(RESERVE_CASE_ENV).unwrap() == "unheld" {
+            drop(hold_pending(&state));
+            assert!(
+                liveness_path.exists(),
+                "precondition: the unheld file is there"
+            );
+        }
+
+        let cache = std::env::var_os("DEVFLOW_CACHE_DIR").map(PathBuf::from);
+        stop_in(root, phase, cache.as_deref()).unwrap();
+
+        let after = workflow::load_state(root, phase).unwrap();
+        assert_eq!(after.pending_supervisor, None, "the reservation is cleared");
+        assert!(after.stopped, "the phase is marked stopped as today");
+        assert!(!liveness_path.exists(), "its liveness file is removed");
+    }
+
+    /// `stop` never claims a stop it did not perform: a pending lock held with no socket
+    /// ever appearing ends it non-zero after the bounded wait, naming the launch, with
+    /// nothing written and the lock's file left alone.
+    #[test]
+    fn stop_waits_for_an_unpublished_pending_supervisor_then_reports_honestly() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5183);
+        let state = state_with_pending(root, phase, false);
+        let _hold = hold_pending(&state);
+        let liveness_path = state
+            .pending_supervisor
+            .as_ref()
+            .unwrap()
+            .liveness_path
+            .clone();
+        let before = std::fs::read(workflow::state_path(root, phase)).unwrap();
+        let cache = tempfile::tempdir().unwrap();
+
+        let started = std::time::Instant::now();
+        let error = stop_in(root, phase, Some(cache.path()))
+            .expect_err("stop must not claim a stop it did not perform")
+            .to_string();
+
+        assert!(
+            started.elapsed() >= PENDING_PUBLISH_WAIT,
+            "stop gives the supervisor the whole wait: {:?}",
+            started.elapsed()
+        );
+        assert!(error.contains(PENDING_LAUNCH), "{error}");
+        assert!(
+            error.contains("nothing was signalled or recorded"),
+            "{error}"
+        );
+        assert!(!error.contains("devflow resume"), "{error}");
+        assert!(
+            error.contains(&format!(
+                "pid {} holds its liveness lock",
+                std::process::id()
+            )),
+            "a repeat of stop cannot end it, so the holder is named: {error}"
+        );
+        assert_eq!(
+            std::fs::read(workflow::state_path(root, phase)).unwrap(),
+            before,
+            "nothing is written"
+        );
+        assert!(liveness_path.exists(), "a held lock's file stays");
+    }
+
+    /// R-03: clearing an abandoned reservation gives up on a held write lock within the
+    /// bound, naming the holder and clearing nothing.
+    #[test]
+    fn stop_gives_up_clearing_a_reservation_under_a_held_write_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let phase = PhaseId::new(5184);
+        let state = state_with_pending(&root, phase, false);
+        drop(hold_pending(&state));
+        let before = std::fs::read(workflow::state_path(&root, phase)).unwrap();
+        let (holding, wait_holding) = std::sync::mpsc::channel();
+        let (release, wait_release) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let root = root.clone();
+            std::thread::spawn(move || {
+                workflow::update_state(&root, phase, |_| {
+                    holding.send(()).unwrap();
+                    // Bounded, so a `stop` that blocks on the lock fails below, not hangs.
+                    let _ = wait_release.recv_timeout(std::time::Duration::from_secs(20));
+                    Ok::<(), workflow::WorkflowError>(())
+                })
+                .unwrap();
+            })
+        };
+        wait_holding.recv().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+
+        let started = std::time::Instant::now();
+        let result = stop_in(&root, phase, Some(cache.path()));
+        let elapsed = started.elapsed();
+        drop(release);
+        holder.join().unwrap();
+
+        let error = result
+            .expect_err("a held write lock must end stop")
+            .to_string();
+        assert!(error.contains(&std::process::id().to_string()), "{error}");
+        assert!(
+            elapsed < workflow::WRITE_LOCK_REPAIR_WAIT + std::time::Duration::from_secs(2),
+            "{elapsed:?}"
+        );
+        assert_eq!(
+            std::fs::read(workflow::state_path(&root, phase)).unwrap(),
+            before,
+            "nothing is cleared"
+        );
+    }
+
+    /// A launcher still running can promote its launch while `stop` waits on it, which
+    /// ends the pending record and not the supervisor. `stop` must look at the record
+    /// again: here a STALE one, whose socket only that second look removes.
+    #[test]
+    fn stop_addresses_a_launch_promoted_during_its_wait() {
+        const PROMOTED: &str = "cccc0000cccc5186";
+        /// Above any pid, so the backstop proves the group gone and signals nothing.
+        const NO_SUCH_PGID: u32 = 99_999_997;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let phase = PhaseId::new(5186);
+        let state = state_with_pending(&root, phase, false);
+        let hold = hold_pending(&state);
+        let socket = root.join("promoted.sock");
+        drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+        let boot = supervisor::boot_id().expect("a readable boot id");
+        let sidecar = serde_json::json!({
+            "launch_id": PROMOTED,
+            "project_root": root,
+            "phase": phase,
+            "stage": "define",
+            "agent": "claude",
+            "launch": "stream",
+            "agent_pid": NO_SUCH_PGID,
+            "agent_pgid": NO_SUCH_PGID,
+            "agent_start_time": 1,
+            "boot_id": boot,
+            "supervisor_pid": 99_999_998,
+            "supervisor_start_time": 1,
+            "created_at": "2026-11-02T00:00:00Z",
+        });
+        std::fs::write(socket.with_extension("json"), sidecar.to_string()).unwrap();
+        let promoter = {
+            let (root, socket) = (root.clone(), socket.clone());
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                workflow::update_state(&root, phase, |state| {
+                    state.pending_supervisor = None;
+                    state.supervisor = Some(SupervisorRecord::new(
+                        socket,
+                        PROMOTED.to_string(),
+                        NO_SUCH_PGID,
+                        1,
+                        boot,
+                    ));
+                    Ok::<(), workflow::WorkflowError>(())
+                })
+                .unwrap();
+                hold
+            })
+        };
+        let cache = tempfile::tempdir().unwrap();
+
+        let result = stop_in(&root, phase, Some(cache.path()));
+        drop(promoter.join().unwrap());
+
+        result.unwrap();
+        assert!(
+            !socket.exists(),
+            "the promoted launch's socket is addressed"
+        );
+        assert!(workflow::load_state(&root, phase).unwrap().stopped);
+    }
+
+    /// The one phase's facts `doctor` would gather for `state`.
+    fn facts_for(root: &Path, state: &State) -> PhaseFacts {
+        build_phase_facts(
+            root,
+            state.clone(),
+            &mut std::collections::HashMap::new(),
+            &[],
+        )
+    }
+
+    /// `doctor` names a live pending launch and its repair, in text and `--json`, and
+    /// never `resume`, including over a recorded STALE socket (whose own repair is
+    /// `stop && resume`); released, the finding is the abandoned note.
+    #[test]
+    fn doctor_reports_a_pending_launch_and_names_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5187);
+        let stop_verb = format!("devflow stop --phase {phase}");
+        let mut state = state_with_pending(root, phase, true);
+        let hold = hold_pending(&state);
+
+        let assert_names_stop_only = |state: &State, case: &str| {
+            let facts = facts_for(root, state);
+            let findings = reconcile_phase(&facts);
+            let finding = findings
+                .iter()
+                .find(|finding| finding.detail.contains(PENDING_LAUNCH))
+                .unwrap_or_else(|| panic!("{case}: no finding names the launch"));
+            assert_eq!(
+                finding.repair.as_deref(),
+                Some(stop_verb.as_str()),
+                "{case}"
+            );
+            for finding in &findings {
+                let repair = finding.repair.as_deref().unwrap_or_default();
+                assert!(!repair.contains("devflow resume"), "{case}: {repair}");
+            }
+            let body = render_reconciliation_json(std::slice::from_ref(&facts));
+            let pending = &body[0]["supervisor"]["pending"];
+            assert_eq!(pending["launch_id"], PENDING_LAUNCH, "{case}: {body}");
+            assert_eq!(pending["liveness"], "launch_pending", "{case}: {body}");
+        };
+        assert_names_stop_only(&state, "a GONE record");
+
+        let stale = root.join("stale.sock");
+        drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
+        state.supervisor.as_mut().unwrap().socket_path = stale;
+        assert_names_stop_only(&state, "a STALE record");
+
+        drop(hold);
+        let facts = facts_for(root, &state);
+        let findings = reconcile_phase(&facts);
+        let note = findings
+            .iter()
+            .find(|finding| finding.detail.contains(PENDING_LAUNCH))
+            .expect("the abandoned reservation is noted");
+        assert!(note.detail.contains("abandoned"), "{}", note.detail);
+
+        state.pending_supervisor = None;
+        let body = render_reconciliation_json(std::slice::from_ref(&facts_for(root, &state)));
+        assert!(body[0]["supervisor"]["pending"].is_null(), "{body}");
+    }
+
+    /// Ends and reaps the fixture's stand-in agent if an assertion fails first.
+    struct StandInAgent(std::process::Child);
+
+    impl StandInAgent {
+        /// A `sleep` leading its own process group, as an agent does.
+        fn spawn() -> Self {
+            use std::os::unix::process::CommandExt as _;
+            let child = std::process::Command::new("sleep")
+                .arg("60")
+                .process_group(0)
+                .spawn()
+                .expect("spawn the stand-in agent");
+            Self(child)
+        }
+
+        fn pid(&self) -> u32 {
+            self.0.id()
+        }
+
+        fn kill_and_reap(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    impl Drop for StandInAgent {
+        fn drop(&mut self) {
+            self.kill_and_reap();
+        }
+    }
+
+    // The phase holder (50.1-29, D-17, D-18). A holder that `stop` signals runs as its own
+    // process: `stop` would otherwise be signalling the test runner.
+
+    /// Names a holder-test child's project root. Not a DevFlow setting, so it carries no
+    /// `DEVFLOW_` prefix the doc check would require documented.
+    const HOLDER_ROOT_ENV: &str = "P50_1_29_ROOT";
+
+    /// The project root a holder-test child was given.
+    fn holder_child_root() -> PathBuf {
+        PathBuf::from(std::env::var_os(HOLDER_ROOT_ENV).expect("the parent names the root"))
+    }
+
+    /// A process of this test binary, on the test named `name`, parked at the launch hold
+    /// point `holder_claimed`. It is killed and reaped when this drops, on a failed
+    /// assertion too.
+    struct ParkedHolder {
+        child: Option<std::process::Child>,
+        release: PathBuf,
+        _dirs: (tempfile::TempDir, tempfile::TempDir),
+    }
+
+    impl ParkedHolder {
+        /// Spawn it and wait until it reaches the hold. `path_dir` is the child's PATH.
+        fn spawn(name: &str, root: &Path, path_dir: tempfile::TempDir) -> Self {
+            let hold_dir = crate::test_support::hermetic_cache_dir();
+            let release = hold_dir.path().join("release");
+            let spec: std::ffi::OsString = format!("holder_claimed:{}", release.display()).into();
+            let mut child = devflow_core::test_support::spawn_test_in_child(
+                name,
+                path_dir.path(),
+                &[
+                    ("DEVFLOW_CACHE_DIR", hold_dir.path().as_os_str()),
+                    (LAUNCH_HOLD_ENV, spec.as_os_str()),
+                    (HOLDER_ROOT_ENV, root.as_os_str()),
+                    // libtest would otherwise swallow what a child prints.
+                    ("RUST_TEST_NOCAPTURE", std::ffi::OsStr::new("1")),
+                ],
+            );
+            let held = held_marker(&release);
+            let deadline = std::time::Instant::now() + REACH_HOLD_WITHIN;
+            while !held.exists() {
+                if std::time::Instant::now() > deadline || child.try_wait().unwrap().is_some() {
+                    let _ = child.kill();
+                    panic!(
+                        "the child never reached holder_claimed: {:?}",
+                        child.wait_with_output()
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Self {
+                child: Some(child),
+                release,
+                _dirs: (hold_dir, path_dir),
+            }
+        }
+
+        fn pid(&self) -> u32 {
+            self.child.as_ref().expect("not yet finished").id()
+        }
+
+        /// Release the hold and wait for the child to end, within `REACH_HOLD_WITHIN`.
+        fn release_and_finish(&mut self) -> std::process::Output {
+            std::fs::write(&self.release, "").unwrap();
+            let mut child = self.child.take().expect("finished once");
+            let deadline = std::time::Instant::now() + REACH_HOLD_WITHIN;
+            while child.try_wait().unwrap().is_none() {
+                if std::time::Instant::now() > deadline {
+                    let _ = child.kill();
+                    panic!(
+                        "the child did not end after its release: {:?}",
+                        child.wait_with_output()
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            child.wait_with_output().unwrap()
+        }
+    }
+
+    impl Drop for ParkedHolder {
+        fn drop(&mut self) {
+            if let Some(child) = &mut self.child {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    /// A `sleep` child with its own start time, read once it is readable: a freshly forked
+    /// child may not have exec'd yet (999.47).
+    fn sleep_child_with_start() -> (std::process::Child, u64) {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let mut start = None;
+        for _ in 0..100 {
+            start = agent::process_start_time(pid);
+            if start.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        (child, start.expect("read the child's start time"))
+    }
+
+    /// Hold `phase`'s holder file in this process, with its record naming `pid`. The
+    /// record is rewritten through a separate truncating open, never the hold's own
+    /// descriptor, whose offset sits past the claim's record. Bind the hold to a named
+    /// local: `_` would drop it at once.
+    fn hold_phase_with_record(
+        root: &Path,
+        phase: PhaseId,
+        pid: u32,
+        start: Option<u64>,
+    ) -> liveness::Hold {
+        let hold = liveness::claim_phase_holder(root, phase).unwrap();
+        let record = match start {
+            Some(start) => format!("{pid} {start}\n"),
+            None => format!("{pid}\n"),
+        };
+        std::fs::write(liveness::phase_holder_path(root, phase), record).unwrap();
+        hold
+    }
+
+    /// The `name` events of `root`'s event log, parsed.
+    fn holder_events_named(root: &Path, name: &str) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(events::events_path(root))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|event| event["event"] == name)
+            .collect()
+    }
+
+    /// D-17 (V-29), D-18: `stop` reaches a hand-run `advance` through its holder after the
+    /// identity check. The holder catches the signal, so it is still running when `stop`
+    /// gives up and marks nothing; released, it stops at safe point 1 and records it.
+    #[test]
+    fn stop_signals_a_hand_run_advance_through_its_phase_holder() {
+        use std::os::unix::process::ExitStatusExt;
+        const NAME: &str =
+            "commands::tests::stop_signals_a_hand_run_advance_through_its_phase_holder";
+        let phase = PhaseId::new(2902);
+        if devflow_core::test_support::in_child_test(NAME) {
+            crate::pipeline_launch::advance_command(
+                &holder_child_root(),
+                Some(phase),
+                Some(Stage::Define),
+            )
+            .unwrap();
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.verification_baseline_captured = true;
+        workflow::save_state(&state).unwrap();
+        let mut child = ParkedHolder::spawn(NAME, root, tempfile::tempdir().unwrap());
+        let pid = child.pid();
+        let holder_path = liveness::phase_holder_path(root, phase);
+        assert_eq!(
+            liveness::live_holder(&holder_path).unwrap(),
+            Some((pid, agent::process_start_time(pid))),
+            "the holder names the child"
+        );
+        let before = std::fs::read(workflow::state_path(root, phase)).unwrap();
+
+        let error = stop_with_an_empty_cache(root, phase)
+            .expect_err("a holder still running is not a stop")
+            .to_string();
+        eprintln!("stop: {error}");
+
+        assert!(error.contains(&format!("signalled pid {pid}")), "{error}");
+        assert!(error.contains("foreground holder"), "{error}");
+        assert!(error.contains("not marked"), "{error}");
+        assert!(error.contains("next safe point"), "{error}");
+        assert_eq!(
+            std::fs::read(workflow::state_path(root, phase)).unwrap(),
+            before,
+            "`stop` writes no state"
+        );
+        assert!(
+            devflow_core::test_support::process_is_live(pid),
+            "the signal was caught, not fatal"
+        );
+
+        let output = child.release_and_finish();
+        assert_eq!(output.status.signal(), None, "{output:?}");
+        devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+        let state = workflow::load_state(root, phase).unwrap();
+        assert_eq!(state.stage, Stage::Define, "the stage does not move");
+        assert!(state.stopped, "the holder records the stop");
+        assert_eq!(
+            state.stop_reason.as_deref(),
+            Some(crate::pipeline_launch::HOLDER_STOP_REASON)
+        );
+        let stopped = holder_events_named(root, "advance_stopped");
+        assert_eq!(stopped.len(), 1, "{stopped:?}");
+        assert_eq!(stopped[0]["safe_point"], 1, "{}", stopped[0]);
+        assert_eq!(stopped[0]["source"], "foreground_holder", "{}", stopped[0]);
+    }
+
+    /// D-17 (V-31): `start` refuses while another process holds the phase, before it
+    /// reserves. The control is the same fixture through `reserve_launch` alone: the
+    /// reservation write the byte comparison would see from a `start` that claimed late.
+    #[test]
+    fn start_refuses_while_another_process_holds_the_phase_before_reserving() {
+        const NAME: &str =
+            "commands::tests::start_refuses_while_another_process_holds_the_phase_before_reserving";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = crate::test_support::agent_free_dir_with_agent_stub("claude");
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let assert_refused = |error: &str, phase: PhaseId| {
+            assert!(
+                error.contains(&format!("(pid {})", std::process::id())),
+                "the refusal names the holder's pid: {error}"
+            );
+            assert!(
+                error.contains(&format!("devflow stop --phase {phase}")),
+                "{error}"
+            );
+            assert!(!error.contains("devflow resume"), "{error}");
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(2907);
+        init_start_repo(root, phase);
+        let mut dead = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        dead.stage = Stage::Plan;
+        workflow::save_state(&dead).unwrap();
+        let _hold = liveness::claim_phase_holder(root, phase).unwrap();
+        let state_file = workflow::state_path(root, phase);
+        let before = std::fs::read(&state_file).unwrap();
+
+        let error = start_for_test(root, phase).expect_err("a held phase refuses");
+
+        assert_refused(&error, phase);
+        assert_eq!(
+            std::fs::read(&state_file).unwrap(),
+            before,
+            "byte-identical"
+        );
+        assert_eq!(
+            workflow::load_state(root, phase)
+                .unwrap()
+                .pending_supervisor,
+            None
+        );
+        assert!(liveness_files(root).is_empty(), "no liveness file is made");
+
+        let no_state = tempfile::tempdir().unwrap();
+        let empty = no_state.path();
+        init_start_repo(empty, phase);
+        let _empty_hold = liveness::claim_phase_holder(empty, phase).unwrap();
+        let error = start_for_test(empty, phase).expect_err("a held phase refuses");
+        assert_refused(&error, phase);
+        assert!(
+            !workflow::state_path(empty, phase).exists(),
+            "with no state, none is created"
+        );
+
+        let cache = std::env::var_os("DEVFLOW_CACHE_DIR").map(PathBuf::from);
+        let reserved = reserve_launch(
+            root,
+            phase,
+            LaunchVerb::Start,
+            Some(&dead),
+            cache.as_deref(),
+        )
+        .unwrap_or_else(|err| panic!("the control reserves: {err}"));
+        assert_ne!(
+            std::fs::read(&state_file).unwrap(),
+            before,
+            "control: a reservation changes the file, so the comparison would see one"
+        );
+        assert!(
+            workflow::load_state(root, phase)
+                .unwrap()
+                .pending_supervisor
+                .is_some(),
+            "control: the reservation is written while the holder is held"
+        );
+        let created = reserved.created;
+        crate::pipeline_launch::hold_reservation(reserved.reservation);
+        crate::pipeline_launch::abandon_reservation(root, phase, created);
+    }
+
+    /// D-17 (V-29), D-02, D-18: a `start` busy before its spawn is reached once the bounded
+    /// wait for a socket expires. The launcher catches the signal, so `stop` marks nothing;
+    /// released, it stops at safe point 2 and gives its reservation back.
+    #[test]
+    fn stop_signals_a_start_that_has_not_spawned_its_supervisor() {
+        use std::os::unix::process::ExitStatusExt;
+        const NAME: &str =
+            "commands::tests::stop_signals_a_start_that_has_not_spawned_its_supervisor";
+        let phase = PhaseId::new(2911);
+        if devflow_core::test_support::in_child_test(NAME) {
+            start_for_test(&holder_child_root(), phase).unwrap();
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_start_repo(root, phase);
+        let mut child = ParkedHolder::spawn(
+            NAME,
+            root,
+            crate::test_support::agent_free_dir_with_agent_stub("claude"),
+        );
+        let pid = child.pid();
+        let pending = workflow::load_state(root, phase)
+            .unwrap()
+            .pending_supervisor
+            .expect("its reservation is pending");
+        assert_eq!(
+            liveness::probe(&pending.liveness_path).unwrap(),
+            liveness::Held::Live,
+            "the launcher holds its own reservation"
+        );
+        let before = std::fs::read(workflow::state_path(root, phase)).unwrap();
+
+        let error = stop_with_an_empty_cache(root, phase)
+            .expect_err("a launcher still running is not a stop")
+            .to_string();
+        eprintln!("stop: {error}");
+
+        assert!(error.contains(&format!("signalled pid {pid}")), "{error}");
+        assert!(error.contains("not marked"), "{error}");
+        assert!(
+            error.contains(&format!(
+                "gives its reservation for launch {} back itself at its next safe point",
+                pending.launch_id
+            )),
+            "{error}"
+        );
+        assert!(!error.contains("devflow resume"), "{error}");
+        assert_eq!(
+            std::fs::read(workflow::state_path(root, phase)).unwrap(),
+            before,
+            "`stop` writes no state"
+        );
+        assert!(
+            devflow_core::test_support::process_is_live(pid),
+            "the signal was caught, not fatal"
+        );
+
+        let output = child.release_and_finish();
+        assert_eq!(output.status.signal(), None, "{output:?}");
+        devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+        let printed = String::from_utf8_lossy(&output.stdout);
+        assert!(!printed.contains("monitor will auto-advance"), "{printed}");
+        assert!(
+            printed.contains(&format!(
+                "phase {phase} stopped before anything was launched"
+            )),
+            "{printed}"
+        );
+        assert!(
+            printed.contains(&format!("devflow resume --phase {phase}")),
+            "{printed}"
+        );
+        let state = workflow::load_state(root, phase).unwrap();
+        assert_eq!(
+            state.pending_supervisor, None,
+            "the reservation is given back"
+        );
+        assert!(!pending.liveness_path.exists(), "and its liveness file");
+        assert_eq!(state.supervisor, None, "no supervisor was spawned");
+        assert!(state.stopped, "the launcher records the stop");
+        assert_eq!(
+            state.stop_reason.as_deref(),
+            Some(crate::pipeline_launch::HOLDER_STOP_REASON)
+        );
+        let stopped = holder_events_named(root, "advance_stopped");
+        assert_eq!(stopped.len(), 1, "{stopped:?}");
+        assert_eq!(stopped[0]["safe_point"], 2, "{}", stopped[0]);
+        assert_eq!(stopped[0]["source"], "foreground_holder", "{}", stopped[0]);
+        assert!(
+            holder_events_named(root, "stage_launched").is_empty(),
+            "nothing was launched"
+        );
+    }
+
+    /// A foreground `start` parked at a preflight gate and then signalled records a stop at
+    /// safe point 4, and that stop survives its own launch error, so `resume` has a state to
+    /// continue. The preflight fails because an Auto run needs a GSD config this repo lacks.
+    #[test]
+    fn a_signal_to_a_start_parked_at_a_preflight_gate_keeps_the_resumable_state() {
+        use std::os::unix::process::ExitStatusExt;
+        const NAME: &str = "commands::tests::\
+                            a_signal_to_a_start_parked_at_a_preflight_gate_keeps_the_resumable_state";
+        let phase = PhaseId::new(5309);
+        if devflow_core::test_support::in_child_test(NAME) {
+            let err = start(
+                &holder_child_root(),
+                phase,
+                AgentKind::Claude,
+                Mode::Auto,
+                false,
+                false,
+                false,
+                None,
+                false,
+                true,
+            )
+            .expect_err("a stop at a safe point during the gate wait is an error")
+            .to_string();
+            assert!(err.contains("gate wait"), "{err}");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_start_repo(root, phase);
+        let path_dir = crate::test_support::agent_free_dir_with_agent_stub("claude");
+        let cache = crate::test_support::hermetic_cache_dir();
+        let mut child = devflow_core::test_support::spawn_test_in_child(
+            NAME,
+            path_dir.path(),
+            &[
+                ("DEVFLOW_CACHE_DIR", cache.path().as_os_str()),
+                (HOLDER_ROOT_ENV, root.as_os_str()),
+            ],
+        );
+        let gate = Gates::gate_path(root, phase, Stage::Define);
+        let deadline = std::time::Instant::now() + REACH_HOLD_WITHIN;
+        while !gate.exists() {
+            if std::time::Instant::now() > deadline || child.try_wait().unwrap().is_some() {
+                let _ = child.kill();
+                panic!(
+                    "the start never parked at its gate: {:?}",
+                    child.wait_with_output()
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // SAFETY: `kill` on the pid of a child this test has not reaped.
+        assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+        let deadline = std::time::Instant::now() + REACH_HOLD_WITHIN;
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                panic!(
+                    "the signalled start did not end: {:?}",
+                    child.wait_with_output()
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.signal(), None, "{output:?}");
+        devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+
+        let stopped = holder_events_named(root, "advance_stopped");
+        assert_eq!(stopped.len(), 1, "{stopped:?}");
+        assert_eq!(stopped[0]["safe_point"], 4, "{}", stopped[0]);
+        let state = workflow::load_state(root, phase).expect("the stop keeps the state");
+        assert!(state.stopped);
+        assert_eq!(state.supervisor, None);
+        assert_eq!(state.pending_supervisor, None);
+    }
+
+    /// A signalled launcher's child half: hold the phase, and with `pending` the launch's
+    /// liveness lock too, with no D-18 handler, so the signal ends this process.
+    fn hold_as_a_launcher_child(phase: PhaseId, pending: bool) {
+        let root = holder_child_root();
+        let _holder = liveness::claim_phase_holder(&root, phase).unwrap();
+        let _pending = pending.then(|| {
+            liveness::Hold::take(&liveness::launch_liveness_path(&root, PENDING_LAUNCH).unwrap())
+                .unwrap()
+        });
+        std::thread::sleep(std::time::Duration::from_secs(60));
+        panic!("the launcher child was never signalled");
+    }
+
+    /// This test binary re-run on `name`, once it holds the phase and `liveness_path` reads
+    /// live, whoever holds that.
+    fn spawn_launcher_child(
+        name: &str,
+        root: &Path,
+        phase: PhaseId,
+        liveness_path: &Path,
+    ) -> std::process::Child {
+        let path_dir = tempfile::tempdir().unwrap();
+        let mut child = devflow_core::test_support::spawn_test_in_child(
+            name,
+            path_dir.path(),
+            &[(HOLDER_ROOT_ENV, root.as_os_str())],
+        );
+        let holder_path = liveness::phase_holder_path(root, phase);
+        let deadline = std::time::Instant::now() + REACH_HOLD_WITHIN;
+        while !matches!(liveness::live_holder(&holder_path), Ok(Some((pid, _))) if pid == child.id())
+            || !matches!(liveness::probe(liveness_path), Ok(liveness::Held::Live))
+        {
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                panic!(
+                    "the launcher child never got ready: {:?}",
+                    child.wait_with_output()
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        child
+    }
+
+    /// D-02, D-18: a signalled launcher that exits within `stop`'s wait leaves its
+    /// reservation abandoned, so `stop` clears it and records the stop itself.
+    #[test]
+    fn stop_records_the_stop_when_a_signalled_launcher_exits_within_the_wait() {
+        use std::os::unix::process::ExitStatusExt;
+        const NAME: &str = "commands::tests::stop_records_the_stop_when_a_signalled_launcher_exits_within_the_wait";
+        let phase = PhaseId::new(2912);
+        if devflow_core::test_support::in_child_test(NAME) {
+            hold_as_a_launcher_child(phase, true);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let state = state_with_pending(root, phase, false);
+        let liveness_path = state
+            .pending_supervisor
+            .as_ref()
+            .unwrap()
+            .liveness_path
+            .clone();
+        let mut child = spawn_launcher_child(NAME, root, phase, &liveness_path);
+
+        let result = stop_with_an_empty_cache(root, phase);
+        let _ = child.kill();
+        let status = child.wait().unwrap();
+
+        result.unwrap_or_else(|err| panic!("the launcher exited, so this is a stop: {err}"));
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGTERM),
+            "the launcher was signalled"
+        );
+        let after = workflow::load_state(root, phase).unwrap();
+        assert_eq!(after.pending_supervisor, None, "its reservation is cleared");
+        assert!(!liveness_path.exists(), "and its liveness file removed");
+        assert!(after.stopped, "the stop is recorded");
+        assert!(
+            after
+                .stop_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("devflow stop")),
+            "by `stop`: {:?}",
+            after.stop_reason
+        );
+    }
+
+    /// D-02: if the launch's lock outlives the signalled launcher, a supervisor it spawned
+    /// holds it, so `stop` claims no stop and writes nothing.
+    #[test]
+    fn stop_claims_no_stop_when_a_launch_outlives_its_signalled_launcher() {
+        use std::os::unix::process::ExitStatusExt;
+        const NAME: &str =
+            "commands::tests::stop_claims_no_stop_when_a_launch_outlives_its_signalled_launcher";
+        let phase = PhaseId::new(2913);
+        if devflow_core::test_support::in_child_test(NAME) {
+            hold_as_a_launcher_child(phase, false);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let state = state_with_pending(root, phase, false);
+        let _hold = hold_pending(&state);
+        let liveness_path = state
+            .pending_supervisor
+            .as_ref()
+            .unwrap()
+            .liveness_path
+            .clone();
+        let mut child = spawn_launcher_child(NAME, root, phase, &liveness_path);
+        let before = std::fs::read(workflow::state_path(root, phase)).unwrap();
+
+        let result = stop_with_an_empty_cache(root, phase);
+        let _ = child.kill();
+        let status = child.wait().unwrap();
+
+        let error = result.expect_err("a live launch is no stop").to_string();
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGTERM),
+            "the launcher was signalled"
+        );
+        assert!(error.contains("still holds its liveness lock"), "{error}");
+        assert!(error.contains(PENDING_LAUNCH), "{error}");
+        assert!(!error.contains("devflow resume"), "{error}");
+        assert_eq!(
+            std::fs::read(workflow::state_path(root, phase)).unwrap(),
+            before,
+            "nothing is written"
+        );
+    }
+
+    /// D-18: over a missing state, a signalled holder ended its run on its own, which is
+    /// not "already stopped". With nothing signalled, the line is today's.
+    #[test]
+    fn a_holder_that_ended_its_run_after_the_signal_is_not_reported_as_stopped() {
+        let phase = PhaseId::new(2903);
+        let signalled = missing_state_line(phase, true);
+        assert!(signalled.contains("ended on its own"), "{signalled}");
+        assert!(
+            signalled.contains("nothing was marked stopped"),
+            "{signalled}"
+        );
+        assert!(!signalled.contains("already stopped"), "{signalled}");
+        let not_signalled = missing_state_line(phase, false);
+        assert_eq!(
+            not_signalled,
+            format!("stop: no persisted state for phase {phase} — already stopped"),
+            "control: with no signal sent the line is today's"
+        );
+    }
+
+    /// D-19: no supervisor is live and the agent still runs, so `status` and `doctor`
+    /// name its pid and the manual kill, not a `resume` the launch guard would refuse.
+    /// Control: with the agent dead, they suggest `resume` again. Nothing under test
+    /// signals the agent: it is alive until the test ends it.
+    #[test]
+    fn status_and_doctor_name_an_orphaned_agent_not_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5188);
+        let mut agent = StandInAgent::spawn();
+        let pid = agent.pid();
+        let kill_line = format!("kill -TERM -- -{pid}");
+        let resume = format!("devflow resume --phase {phase}");
+
+        let mut confirmed = State::new(phase, AgentKind::Claude, Mode::Supervise, root.into());
+        confirmed.verification_baseline_captured = true;
+        confirmed.supervisor = Some(SupervisorRecord::new(
+            root.join("gone.sock"),
+            "aaaa0000aaaa5188".to_string(),
+            pid,
+            agent::process_start_time(pid).expect("the agent's start time"),
+            supervisor::boot_id().expect("a readable boot id"),
+        ));
+        assert_eq!(probe_phase(&confirmed), PhaseLiveness::GoneWhileActive);
+        let live = live_phase_agent(root, &confirmed);
+        assert_eq!(
+            live,
+            Some(LiveAgent {
+                pid,
+                confirmed: true
+            }),
+            "confirmed"
+        );
+        let hints = status_hints(&confirmed, &probe_phase(&confirmed), live.as_ref());
+        assert_eq!(hints.len(), 1, "{hints:?}");
+        assert!(hints[0].contains(&format!("pid {pid}")), "{hints:?}");
+        assert!(hints[0].contains(&kill_line), "{hints:?}");
+        assert!(hints[0].contains("999.170"), "{hints:?}");
+        assert!(!hints[0].contains("devflow resume"), "{hints:?}");
+        let finding = check_supervisor(&facts_for(root, &confirmed)).expect("a finding");
+        assert_eq!(finding.repair.as_ref(), Some(&hints[0]), "doctor's repair");
+
+        let unrecorded = State::new(phase, AgentKind::Claude, Mode::Supervise, root.into());
+        let pid_file = agent_result::agent_pid_path(root, phase);
+        std::fs::create_dir_all(pid_file.parent().unwrap()).unwrap();
+        std::fs::write(&pid_file, pid.to_string()).unwrap();
+        assert_eq!(probe_phase(&unrecorded), PhaseLiveness::NotLaunched);
+        let live = live_phase_agent(root, &unrecorded);
+        assert_eq!(
+            live,
+            Some(LiveAgent {
+                pid,
+                confirmed: false
+            }),
+            "unconfirmed"
+        );
+        let hints = status_hints(&unrecorded, &probe_phase(&unrecorded), live.as_ref());
+        assert_eq!(hints.len(), 1, "{hints:?}");
+        assert!(
+            hints[0].contains(&format!("ps -o pid,pgid,lstart,args -p {pid}")),
+            "{hints:?}"
+        );
+        assert!(hints[0].contains(&kill_line), "{hints:?}");
+        assert!(!hints[0].contains("devflow resume"), "{hints:?}");
+        let finding = check_supervisor(&facts_for(root, &unrecorded)).expect("a finding");
+        assert_eq!(finding.severity, Severity::Problem);
+        assert!(
+            finding.detail.contains(&format!("pid {pid}")),
+            "{}",
+            finding.detail
+        );
+        assert_eq!(finding.repair.as_ref(), Some(&hints[0]), "doctor's repair");
+
+        assert!(agent::agent_running(pid), "nothing under test signalled it");
+        agent.kill_and_reap();
+        assert_eq!(live_phase_agent(root, &confirmed), None, "control: dead");
+        assert_eq!(live_phase_agent(root, &unrecorded), None, "control: dead");
+        assert_eq!(
+            status_hints(&confirmed, &probe_phase(&confirmed), None),
+            vec![resume.clone()],
+            "control"
+        );
+        let finding = check_supervisor(&facts_for(root, &confirmed)).expect("a finding");
+        assert_eq!(finding.repair.as_ref(), Some(&resume), "control");
+    }
+
+    /// R-03: `status` and `doctor` read the write lock without waiting and name a held
+    /// one, in wording that tells the operator how to judge a single reading. Control:
+    /// once it is released, neither says anything.
+    #[test]
+    fn status_and_doctor_name_a_held_state_write_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let phase = PhaseId::new(5189);
+        let state = State::new(phase, AgentKind::Claude, Mode::Supervise, root.clone());
+        workflow::save_state(&state).unwrap();
+        let (holding, wait_holding) = std::sync::mpsc::channel();
+        let (release, wait_release) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let root = root.clone();
+            std::thread::spawn(move || {
+                workflow::update_state(&root, phase, |_| {
+                    holding.send(()).unwrap();
+                    let _ = wait_release.recv_timeout(std::time::Duration::from_secs(30));
+                    Ok::<(), workflow::WorkflowError>(())
+                })
+                .unwrap();
+            })
+        };
+        wait_holding.recv().unwrap();
+        let pid = std::process::id();
+
+        let line = write_lock_line(&workflow::write_lock_status(&root, phase).unwrap())
+            .expect("a held lock is named");
+        for expected in [
+            format!("pid {pid}"),
+            "about 10 s in a gate answer".to_string(),
+            "13 s while".to_string(),
+            "16 s in a reservation".to_string(),
+            "past 20 s".to_string(),
+        ] {
+            assert!(line.contains(&expected), "missing {expected:?}: {line}");
+        }
+        assert!(!line.contains("takes milliseconds;"), "{line}");
+        let rendered = rendered_status(&state);
+        assert!(rendered.contains(&line), "status prints it: {rendered}");
+        let held = reconcile_phase(&facts_for(&root, &state));
+        let finding = held
+            .iter()
+            .find(|finding| finding.detail.contains("state write lock"))
+            .expect("doctor names a held lock");
+        assert_eq!(finding.severity, Severity::Warn);
+        assert!(
+            finding.detail.contains(&format!("pid {pid}")),
+            "{}",
+            finding.detail
+        );
+        assert!(finding.detail.contains("past 20 s"), "{}", finding.detail);
+
+        drop(release);
+        holder.join().unwrap();
+        assert_eq!(
+            write_lock_line(&workflow::write_lock_status(&root, phase).unwrap()),
+            None,
+            "control: released"
+        );
+        assert!(
+            !rendered_status(&state).contains("state write lock"),
+            "control"
+        );
+        let free = reconcile_phase(&facts_for(&root, &state));
+        assert!(
+            !free
+                .iter()
+                .any(|finding| finding.detail.contains("state write lock")),
+            "control: released"
+        );
+    }
+
+    /// Criterion 2 at a gate nothing waits on: `stop`'s own line names no `resume` while
+    /// a pending supervisor lives, and names it again once that supervisor is gone.
+    #[test]
+    fn stop_names_no_resume_at_a_waiterless_gate_while_a_supervisor_lives() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5185);
+        let state = state_with_pending(root, phase, false);
+        let hold = hold_pending(&state);
+        let live = stop_no_waiter_repair(root, phase, Stage::Code);
+        assert!(!live.contains("devflow resume"), "{live}");
+        drop(hold);
+        let gone = stop_no_waiter_repair(root, phase, Stage::Code);
+        assert_eq!(gone, no_waiter_repair(phase, Stage::Code), "control");
+        assert!(gone.contains("devflow resume"), "control: {gone}");
     }
 }

@@ -11,11 +11,12 @@
 
 mod common;
 
-use devflow_core::gates::{GateAction, GateFile, Gates};
+use devflow_core::gates::{AwaitOutcome, GateAction, GateFile, GateId, Gates};
 use devflow_core::mode::Mode;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
+use devflow_core::test_support::gate_answer_files;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -71,7 +72,7 @@ fn wait_for(mut predicate: impl FnMut() -> bool, timeout_secs: u64, what: &str) 
 /// `DEVFLOW_E2E_CHILD_TIMEOUT_SECS` (test-only, read here — never by
 /// production code): how long this test's patience with the spawned child
 /// extends before the bounded wait below panics instead of hanging CI
-/// indefinitely. Defaults comfortably above `Gates::poll_response`'s 60s
+/// indefinitely. Defaults comfortably above `Gates::await_answer`'s 60s
 /// backoff cap; tighten via the env var in CI if 90s is too generous.
 fn e2e_child_timeout() -> Duration {
     let secs: u64 = std::env::var("DEVFLOW_E2E_CHILD_TIMEOUT_SECS")
@@ -104,15 +105,19 @@ fn wait_for_child_exit(
         }
         if start.elapsed() >= deadline {
             let pid = child.id();
-            let lock_present = devflow_core::lock::holder(root, phase).is_some();
+            let open_gate_waiter = Gates::list_open(root)
+                .into_iter()
+                .find(|gate| gate.phase == phase && gate.stage == Stage::Code)
+                .and_then(|gate| GateId::parse(&gate.gate_id).ok())
+                .map(|gate| Gates::waiter_status(root, phase, Stage::Code, &gate));
             let gate_present = Gates::gate_path(root, phase, Stage::Code).exists();
-            let response_present = Gates::response_path(root, phase, Stage::Code).exists();
+            let response_present = !gate_answer_files(root, phase, Stage::Code).is_empty();
             // Reap before panicking — see doc comment above for why this
             // stays bounded without ever signalling the child.
             let _ = child.wait();
             panic!(
                 "devflow advance (pid {pid}) did not exit within {deadline:?}; \
-                 on disk: lock_present={lock_present} gate_present={gate_present} \
+                 on disk: open_gate_waiter={open_gate_waiter:?} gate_present={gate_present} \
                  response_present={response_present}"
             );
         }
@@ -129,17 +134,12 @@ fn backdate_gate(root: &Path, phase: PhaseId, stage: Stage, age_secs: u64) {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let gate = GateFile {
-        phase,
-        stage,
-        context: "abandoned run".to_string(),
-        timestamp: now.saturating_sub(age_secs).to_string(),
-    };
-    std::fs::write(
-        Gates::gate_path(root, phase, stage),
-        serde_json::to_string_pretty(&gate).unwrap(),
-    )
-    .unwrap();
+    let path = Gates::gate_path(root, phase, stage);
+    let mut gate: GateFile =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    gate.context = "abandoned run".to_string();
+    gate.timestamp = now.saturating_sub(age_secs).to_string();
+    std::fs::write(path, serde_json::to_string_pretty(&gate).unwrap()).unwrap();
 }
 
 /// An age past any plausible `DEVFLOW_GATE_MAX_UNATTENDED_AGE_SECS` default.
@@ -154,7 +154,7 @@ fn backdate_gate(root: &Path, phase: PhaseId, stage: Stage, age_secs: u64) {
 const AGED_WELL_PAST_DEFAULT_THRESHOLD_SECS: u64 = 30 * 24 * 60 * 60;
 
 /// The plan's core claim: a gate older than the default threshold is answered
-/// with a rejection, and a real `Gates::poll_response` thread — the exact
+/// with a rejection, and a real `Gates::await_answer` thread — the exact
 /// live-poller seam `run_gate_with_timeout` blocks on in production — picks
 /// it up and resolves to `GateAction::Abort`.
 #[test]
@@ -165,22 +165,19 @@ fn sweep_reaps_an_aged_gate_and_a_real_poller_resolves_to_abort() {
     let phase = PhaseId::new(91);
     let stage = Stage::Ship;
 
-    // The poller runs in this test process. Record that live process as the
-    // gate holder so sweep has evidence that a consumer exists before it
-    // writes an abort response.
-    let pid = std::process::id();
-    let start = devflow_core::agent::process_start_time(pid).unwrap();
-    let lock_path = root
-        .join(".devflow")
-        .join(format!("lock-{}", phase.padded()));
-    std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
-    std::fs::write(lock_path, format!("{pid}\n{start}")).unwrap();
-
-    Gates::write_gate(root, phase, stage, "approve merge?").unwrap();
+    // Registered before the gate file exists, as every production gate wait is, and held
+    // by the poller while it awaits, so the sweep can never see the gate before its waiter.
+    let (opened, registration) =
+        Gates::open_registered(root, phase, stage, "approve merge?").unwrap();
+    let gate = opened.gate_id;
     backdate_gate(root, phase, stage, AGED_WELL_PAST_DEFAULT_THRESHOLD_SECS);
 
     std::thread::scope(|scope| {
-        let poller = scope.spawn(move || Gates::poll_response(root, phase, stage, 30));
+        let waiter = scope.spawn(move || {
+            let outcome = Gates::await_answer(root, phase, stage, &gate, 30, || false);
+            registration.finish();
+            outcome
+        });
 
         let output = common::hermetic_devflow(&home)
             .args(["gate", "sweep", "--root"])
@@ -194,10 +191,13 @@ fn sweep_reaps_an_aged_gate_and_a_real_poller_resolves_to_abort() {
             String::from_utf8_lossy(&output.stderr)
         );
 
-        let response = poller
-            .join()
-            .expect("poller thread")
-            .expect("a live Gates::poll_response must observe the sweep's response within 30s");
+        let outcome = waiter.join().expect("waiter thread");
+        let AwaitOutcome::Answered(answer) = outcome else {
+            panic!(
+                "a live Gates::await_answer must observe the sweep's answer within 30s: {outcome:?}"
+            );
+        };
+        let response = answer.response;
         assert!(
             !response.approved,
             "a reap must never write an approval (T-23-41)"
@@ -210,8 +210,10 @@ fn sweep_reaps_an_aged_gate_and_a_real_poller_resolves_to_abort() {
 }
 
 /// The fail-safe counterpart: a gate younger than the threshold is left
-/// completely untouched by an invoked sweep — no response file, no state
-/// change.
+/// completely untouched by an invoked sweep, even with a live waiter the sweep
+/// would otherwise answer. The second sweep is the control: with the age limit
+/// at zero the same gate is reaped, so the first sweep's silence came from the
+/// age and from nothing else.
 #[test]
 fn sweep_leaves_a_fresh_gate_untouched() {
     let home = common::HermeticHome::new();
@@ -220,20 +222,26 @@ fn sweep_leaves_a_fresh_gate_untouched() {
     let phase = PhaseId::new(92);
     let stage = Stage::Validate;
 
-    // Freshly written — `unix_now()`'s age is ~0s, well under the 6h default.
-    Gates::write_gate(root, phase, stage, "review gaps").unwrap();
+    // Freshly written, so its age is about 0 s, and the registration stays held: only
+    // the age filter stands between this gate and a reap.
+    let (_, registration) = Gates::open_registered(root, phase, stage, "review gaps").unwrap();
 
-    let output = common::hermetic_devflow(&home)
-        .args(["gate", "sweep", "--root"])
-        .arg(root)
-        .output()
-        .expect("run devflow gate sweep");
-    assert!(
-        output.status.success(),
-        "devflow gate sweep failed\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let sweep = |extra: &[&str]| {
+        let output = common::hermetic_devflow(&home)
+            .args(["gate", "sweep", "--root"])
+            .arg(root)
+            .args(extra)
+            .output()
+            .expect("run devflow gate sweep");
+        assert!(
+            output.status.success(),
+            "devflow gate sweep failed\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    sweep(&[]);
 
     let open = Gates::list_open(root);
     assert_eq!(
@@ -244,9 +252,17 @@ fn sweep_leaves_a_fresh_gate_untouched() {
     assert_eq!(open[0].phase, phase);
     assert_eq!(open[0].stage, stage);
     assert!(
-        !Gates::response_path(root, phase, stage).exists(),
+        gate_answer_files(root, phase, stage).is_empty(),
         "a fresh gate must get no response file at all"
     );
+
+    sweep(&["--max-age-secs", "0"]);
+    assert_eq!(
+        gate_answer_files(root, phase, stage).len(),
+        1,
+        "the control: with no age limit the same gate and waiter are reaped"
+    );
+    registration.finish();
 }
 
 /// CLI discoverability: `--max-age-secs` and `--dry-run` must be documented
@@ -272,7 +288,7 @@ fn sweep_help_documents_max_age_and_dry_run() {
 
 /// Task 3's strongest proof: a **real, separate `devflow advance` process**
 /// parked on a gate is ended by a file write, unwinds through its own
-/// `abort()` path, releases its per-phase lock, and leaves an audit record —
+/// `abort()` path, finishes its gate registration, and leaves an audit record —
 /// the orphan class `23-ORPHAN-FORENSICS.md` documented, now remedied
 /// without `kill(1)`.
 ///
@@ -308,40 +324,45 @@ fn sweep_ends_a_real_advance_process_through_its_own_abort_path() {
         .spawn()
         .expect("spawn devflow advance");
 
-    // Wait for the child to acquire the per-phase lock (proves it is
-    // genuinely inside `advance()`, holding it across the gate wait) and to
-    // write the Code gate (proves it reached `run_gate_with_timeout` and is
-    // now polling for a response) — the two on-disk facts the plan's
-    // objective names as the "live poller" evidence.
-    wait_for(
-        || devflow_core::lock::holder(root, phase).is_some(),
-        10,
-        "the child to acquire .devflow/lock-95",
-    );
+    // Wait for the child to write the Code gate (proves it reached
+    // `run_gate_with_timeout`) and for that gate's waiter registration to read
+    // live (proves it is now waiting for a response): the two on-disk facts that
+    // are the "live poller" evidence.
     let gate_path = Gates::gate_path(root, phase, Stage::Code);
     wait_for(
         || gate_path.exists(),
         10,
         "the child to write the Code gate",
     );
-    assert!(
-        devflow_core::lock::holder(root, phase).is_some(),
-        "lock must still be held once the gate is written — this is the \
-         proof that a live poller is genuinely blocking on it"
+    let listed = Gates::list_open(root)
+        .into_iter()
+        .find(|gate| gate.phase == phase && gate.stage == Stage::Code)
+        .expect("the child's Code gate is listed");
+    let gate_id = GateId::parse(&listed.gate_id).expect("the child's gate has a gate id");
+    wait_for(
+        || {
+            Gates::waiter_status(root, phase, Stage::Code, &gate_id)
+                .is_ok_and(|status| status == devflow_core::gates::WaiterStatus::Live)
+        },
+        10,
+        "the child's registration at the Code gate",
     );
-
-    // The reap itself: the same `Gates::reap` primitive Task 1/2's tests
-    // exercise against a thread-based live poller. This test's job is to
-    // prove the OTHER end of that same write — a real, separate process
-    // consuming it.
-    Gates::reap(
-        root,
-        phase,
-        Stage::Code,
-        "abort: reaped by devflow gate sweep (unattended gate exceeded max age)",
-        "devflow-reap",
-    )
-    .expect("reap the aged Code gate");
+    // The reap itself: the real `devflow gate sweep`, with the age limit at zero because
+    // this gate is seconds old. Its own age and waiter checks are on this path. Whether it
+    // reports "reaped" depends on a race it tolerates (the child can consume the answer and
+    // close the gate before the sweep's re-check), so the proof is what the child records
+    // below, not the sweep's line.
+    let swept = common::hermetic_devflow(&home)
+        .args(["gate", "sweep", "--max-age-secs", "0", "--root"])
+        .arg(root)
+        .output()
+        .expect("run devflow gate sweep");
+    assert!(
+        swept.status.success(),
+        "devflow gate sweep failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&swept.stdout),
+        String::from_utf8_lossy(&swept.stderr)
+    );
 
     let status = wait_for_child_exit(&mut child, root, phase, e2e_child_timeout());
 
@@ -350,13 +371,20 @@ fn sweep_ends_a_real_advance_process_through_its_own_abort_path() {
         "devflow advance must exit cleanly once its own abort() path runs, got {status:?}"
     );
     assert!(
-        devflow_core::lock::holder(root, phase).is_none(),
-        "LockGuard's Drop must have released the per-phase lock — proof the \
-         process unwound cleanly through its own code, not by being \
-         terminated from outside"
+        !Gates::waiter_path(root, phase, Stage::Code, &gate_id).exists(),
+        "the waiter must have finished its registration, removing the file: proof the \
+         process unwound cleanly through its own code, since one ended from outside \
+         leaves it in place"
     );
 
     let events = std::fs::read_to_string(devflow_core::events::events_path(root)).unwrap();
+    assert!(
+        events
+            .lines()
+            .any(|line| line.contains("\"gate_resolved\"") && line.contains("devflow-reap")),
+        "the target process must have resolved its gate on the sweep's own answer\n\
+         events:\n{events}"
+    );
     assert!(
         events
             .lines()
@@ -366,8 +394,8 @@ fn sweep_ends_a_real_advance_process_through_its_own_abort_path() {
     );
 
     // The negative that separates this plan from a reaper that terminates
-    // processes: neither the sweep's write path (`Gates::reap`, exercised
-    // above) nor this test itself ever sent the child a signal. Checked
+    // processes: neither the sweep run above nor this test itself ever sent
+    // the child a signal. Checked
     // mechanically by this file's own acceptance grep for signalling call
     // forms (must be zero), not asserted at runtime — there is no API
     // surface here that could send one.

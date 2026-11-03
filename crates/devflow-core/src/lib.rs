@@ -58,12 +58,14 @@ pub mod canary;
 pub mod config;
 #[cfg(test)]
 mod doc_check;
+pub(crate) mod durable;
 pub mod events;
 pub mod gates;
 pub mod git;
 pub mod gsd_config;
 pub mod history;
 pub mod hooks;
+pub mod liveness;
 pub mod lock;
 pub mod mode;
 pub mod monitor;

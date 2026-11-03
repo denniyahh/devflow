@@ -14,10 +14,85 @@
 //! rather than inside any one cluster.
 
 use devflow_core::agents;
+use devflow_core::gates::{GateFile, GateId, GateResponse, Gates};
 use devflow_core::phase_id::PhaseId;
+use devflow_core::stage::Stage;
 use devflow_core::state::{State, SupervisorRecord};
+use devflow_core::workflow;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+
+/// Run `handler` on another thread until it opens `stage`'s gate, read the state on
+/// disk at that moment, then answer the gate with an abort and wait for `handler`.
+///
+/// An abort clears the state file, so a handler that gates cannot show what it
+/// committed any other way: the state is read while the handler is held at its gate.
+pub(crate) fn state_on_disk_at_gate(
+    root: &Path,
+    phase: PhaseId,
+    stage: Stage,
+    handler: impl FnOnce() + Send,
+) -> State {
+    const GATE_OPENS_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
+    const POLL: std::time::Duration = std::time::Duration::from_millis(10);
+    std::thread::scope(|scope| {
+        let waiter = scope.spawn(handler);
+        let started = std::time::Instant::now();
+        while !Gates::gate_path(root, phase, stage).exists() {
+            assert!(
+                !waiter.is_finished(),
+                "the handler returned without opening the {stage} gate"
+            );
+            assert!(
+                started.elapsed() < GATE_OPENS_WITHIN,
+                "the {stage} gate did not open within {GATE_OPENS_WITHIN:?}"
+            );
+            std::thread::sleep(POLL);
+        }
+        let on_disk = workflow::load_state(root, phase).unwrap();
+        devflow_core::test_support::answer_open_gate(
+            root,
+            phase,
+            stage,
+            &GateResponse {
+                approved: false,
+                note: Some("abort: test cleanup".into()),
+                responded_by: Some("test".into()),
+            },
+        )
+        .unwrap();
+        waiter.join().unwrap();
+        on_disk
+    })
+}
+
+/// The id the stage's gate file names right now, as a test reads the gate it sees.
+pub(crate) fn live_gate_id(root: &Path, phase: PhaseId, stage: Stage) -> GateId {
+    let gate: GateFile =
+        serde_json::from_slice(&std::fs::read(Gates::gate_path(root, phase, stage)).unwrap())
+            .unwrap();
+    GateId::parse(&gate.gate_id).unwrap()
+}
+
+/// The ack and claim files of a stage, in either layout: the unkeyed
+/// `NN-{stage}.ack.json` and each keyed `NN-{stage}.{id}.ack.json`, sorted.
+pub(crate) fn gate_claim_files(root: &Path, phase: PhaseId, stage: Stage) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(Gates::dir(root)) else {
+        return Vec::new();
+    };
+    let prefix = format!("{}-{stage}.", phase.padded());
+    let mut files: Vec<PathBuf> = entries
+        .map(|entry| entry.expect("read a gates directory entry").path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .and_then(|name| name.strip_prefix(&prefix))
+                .is_some_and(|rest| rest == "ack.json" || rest.ends_with(".ack.json"))
+        })
+        .collect();
+    files.sort();
+    files
+}
 
 /// Serializes tests that mutate process-global env vars (`set_var`/
 /// `remove_var` are process-wide and `cargo test` runs in parallel by
@@ -194,7 +269,7 @@ pub(crate) fn commit_on_feature_branch(root: &Path, phase: PhaseId, label: &str)
 /// (`mode::MAX_PREFLIGHT_RETRIES`) bounds the recursion regardless, so
 /// an unconditionally-failing preflight now terminates in a logged
 /// `abort` instead of blocking forever on a second gate's
-/// `poll_response`.
+/// `Gates::await_answer`.
 pub(crate) struct AlwaysFailAdapter;
 
 impl agents::AgentDriver for AlwaysFailAdapter {
@@ -223,7 +298,7 @@ impl agents::AgentDriver for AlwaysFailAdapter {
 /// pass. An adapter that fails unconditionally would make a recursive
 /// `launch_stage` retry fail its OWN preflight check too, recursing into
 /// a second gate this test never seeds a response for — blocking on
-/// `poll_response` instead of asserting.
+/// `Gates::await_answer` instead of asserting.
 pub(crate) struct FailOnceAdapter {
     failed_once: std::cell::Cell<bool>,
 }
@@ -516,6 +591,26 @@ pub(crate) fn agent_free_dir_with_agent_stub(program: &str) -> tempfile::TempDir
     dir
 }
 
+/// A `claude` stand-in that answers `--version`, then waits for `go` in
+/// its working directory (the project root) and exits 0, with `sleep`
+/// linked beside it so the wait works under the replaced PATH.
+pub(crate) fn go_waiting_claude_dir() -> tempfile::TempDir {
+    let path_dir = agent_free_dir_with_agent_stub("claude");
+    std::fs::write(
+        path_dir.path().join("claude"),
+        "#!/bin/sh\ncase \"$1\" in --version) exit 0 ;; esac\n\
+         while [ ! -e go ]; do sleep 0.05; done\nexit 0\n",
+    )
+    .unwrap();
+    let real_sleep = ["/usr/bin/sleep", "/bin/sleep"]
+        .into_iter()
+        .map(Path::new)
+        .find(|path| path.is_file())
+        .expect("sleep must exist to run this test");
+    std::os::unix::fs::symlink(real_sleep, path_dir.path().join("sleep")).unwrap();
+    path_dir
+}
+
 /// Count `stage_launched` events recorded for `phase` across the WHOLE
 /// event log — `last_event_for_phase` only sees the most recent line and
 /// cannot distinguish one launch from two.
@@ -722,6 +817,7 @@ fn run_monitor_harness_entry(advance: bool) {
         launch,
         socket,
         launch_id,
+        liveness_fd,
         keep_env,
         prompt_file,
         idle_timeout_secs,
@@ -739,6 +835,7 @@ fn run_monitor_harness_entry(advance: bool) {
         launch,
         socket,
         launch_id,
+        liveness_fd,
         keep_env,
         prompt_file,
         idle_timeout_secs,

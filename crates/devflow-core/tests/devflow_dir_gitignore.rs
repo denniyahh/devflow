@@ -20,7 +20,7 @@
 use devflow_core::agent_result;
 use devflow_core::events;
 use devflow_core::gates::Gates;
-use devflow_core::lock;
+use devflow_core::liveness;
 use devflow_core::monitor;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::ship;
@@ -115,6 +115,14 @@ fn all_seven_devflow_constructors_produce_the_gitignore() {
             root.to_path_buf(),
         );
         let ctx = launch_context();
+        // The reservation creates `.devflow/` too, so its `.gitignore` goes
+        // before the spawn: this case stays about `spawn_monitor`'s own write.
+        let reservation =
+            monitor::Reservation::new(&ctx.context, &state).expect("take the reservation");
+        if !gitignore_is_star(root) {
+            failures.push("monitor::Reservation::new (monitor.rs)");
+        }
+        std::fs::remove_file(root.join(".devflow").join(".gitignore")).unwrap();
         let result = monitor::spawn_monitor(
             &state,
             "sh",
@@ -122,6 +130,7 @@ fn all_seven_devflow_constructors_produce_the_gitignore() {
             &[],
             monitor::MonitorLaunch::Legacy,
             &ctx.context,
+            &reservation,
         );
         assert!(
             matches!(result, Err(monitor::MonitorError::NotReady(_))),
@@ -176,13 +185,28 @@ fn all_seven_devflow_constructors_produce_the_gitignore() {
         }
     }
 
-    // 7. lock::acquire -> lock.rs acquire_path
+    // 7. workflow::update_state_with -> workflow.rs lock_for_write, whose lock file
+    // `.devflow/.state-NN.lock` it creates before any state exists.
     {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let _guard = lock::acquire(root, PhaseId::new(1)).expect("lock::acquire");
+        workflow::update_state_with(root, PhaseId::new(1), |_| {
+            Ok::<_, workflow::WorkflowError>((None, ()))
+        })
+        .expect("update_state_with");
         if !gitignore_is_star(root) {
-            failures.push("lock::acquire (lock.rs)");
+            failures.push("workflow::update_state_with (workflow.rs)");
+        }
+    }
+
+    // 8. liveness::claim_phase_holder -> liveness.rs, `.devflow/.holder-NN` (D-17)
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let _hold =
+            liveness::claim_phase_holder(root, PhaseId::new(1)).expect("claim_phase_holder");
+        if !gitignore_is_star(root) {
+            failures.push("liveness::claim_phase_holder (liveness.rs)");
         }
     }
 

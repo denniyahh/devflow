@@ -138,7 +138,7 @@ pub fn new_launch_id() -> String {
 /// launch id read from disk (a sidecar, a socket name) is printed into
 /// copy-paste `devflow stop --launch <id>` lines, so this is the one rule
 /// every reader applies before trusting one.
-fn is_launch_id(id: &str) -> bool {
+pub(crate) fn is_launch_id(id: &str) -> bool {
     const LAUNCH_ID_LEN: usize = 16;
     id.len() == LAUNCH_ID_LEN
         && id
@@ -325,6 +325,8 @@ pub enum ProbeError {
 /// 3. A refused connect is `Stale`. Every other connect error is
 ///    [`ProbeError::Connect`], NotFound included: a socket removed between
 ///    the stat and the connect is reported, never guessed to be `Gone`.
+///    A connect still waiting after [`protocol::IO_TIMEOUT`], on a listener
+///    whose backlog is full (a stopped supervisor), is one of those errors.
 /// 4. A connect is not proof of life (a listen backlog accepts it with
 ///    nobody serving): only a valid ping reply makes it `Alive`.
 /// 5. A ping whose connection is closed under it (a reset or a broken pipe)
@@ -341,7 +343,7 @@ pub fn probe(path: &Path) -> Result<Liveness, ProbeError> {
         if !own_socket_at(path)? {
             return Ok(Liveness::Gone);
         }
-        let stream = match UnixStream::connect(path) {
+        let stream = match connect_within(path, protocol::IO_TIMEOUT) {
             Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
                 return Ok(Liveness::Stale);
             }
@@ -352,6 +354,74 @@ pub fn probe(path: &Path) -> Result<Liveness, ProbeError> {
             Ok(reply) => return Ok(Liveness::Alive(reply)),
             Err(error) if error.closed && !connected_again => connected_again = true,
             Err(error) => return Err(ProbeError::NoReply(error.message)),
+        }
+    }
+}
+
+/// How often [`connect_within`] retries while a listener's backlog is full.
+const CONNECT_RETRY: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// [`UnixStream::connect`], except that a listener whose backlog stays full yields an
+/// [`io::ErrorKind::TimedOut`] after `limit` instead of waiting for as long as the listener
+/// lives. A nonblocking connect fails `EAGAIN` there and is retried. A helper thread around
+/// the blocking connect would be shorter, but it stays blocked, with its socket, after the
+/// timeout, and this runs in long-lived supervisors. The stream comes back blocking.
+fn connect_within(path: &Path, limit: std::time::Duration) -> io::Result<UnixStream> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    use std::os::unix::ffi::OsStrExt as _;
+    // Refuses a path too long or with a NUL in it, as `UnixStream::connect` does.
+    std::os::unix::net::SocketAddr::from_pathname(path)?;
+    let bytes = path.as_os_str().as_bytes();
+    // SAFETY: all zeroes is a valid `sockaddr_un`, a plain C struct.
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (slot, byte) in address.sun_path.iter_mut().zip(bytes) {
+        *slot = *byte as libc::c_char;
+    }
+    let length = std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
+    #[cfg(target_os = "linux")]
+    let kind = libc::SOCK_STREAM | libc::SOCK_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let kind = libc::SOCK_STREAM;
+    // SAFETY: no pointers; the result is checked before it is used.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, kind, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just created by `socket` and nothing else owns it.
+    let stream = UnixStream::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    #[cfg(not(target_os = "linux"))]
+    // SAFETY: a flag set on a descriptor `stream` owns.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    stream.set_nonblocking(true)?;
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        // SAFETY: `address` is live and initialized, and `length` covers its family, the
+        // path and the path's NUL, which `from_pathname` above showed fit in `sun_path`.
+        let connected = unsafe {
+            libc::connect(
+                stream.as_raw_fd(),
+                (&raw const address).cast(),
+                length as libc::socklen_t,
+            )
+        };
+        if connected == 0 {
+            stream.set_nonblocking(false)?;
+            return Ok(stream);
+        }
+        let error = io::Error::last_os_error();
+        match error.kind() {
+            io::ErrorKind::Interrupted => {}
+            io::ErrorKind::WouldBlock if std::time::Instant::now() >= deadline => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("the backlog stayed full for {limit:?}"),
+                ));
+            }
+            io::ErrorKind::WouldBlock => std::thread::sleep(CONNECT_RETRY),
+            _ => return Err(error),
         }
     }
 }
@@ -461,7 +531,8 @@ pub(crate) fn rfc3339_now() -> String {
 /// sidecar there (another launch's) fails the link with
 /// [`io::ErrorKind::AlreadyExists`] and is left as it was. The socket
 /// directory is created `0700` if absent and refused if it is unsafe, as
-/// [`publish`] does.
+/// [`publish`] does. The directory is fsynced after the link, so a crash
+/// cannot lose the entry (D-09); a failed link fsyncs nothing.
 pub(crate) fn write_sidecar(socket: &SocketPath, sidecar: &Sidecar) -> io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
@@ -505,7 +576,8 @@ pub(crate) fn write_sidecar(socket: &SocketPath, sidecar: &Sidecar) -> io::Resul
             temp.display()
         );
     }
-    written
+    written?;
+    crate::durable::fsync_dir(dir)
 }
 
 /// Read and parse the sidecar at `path`. Read-only.
@@ -708,6 +780,15 @@ pub enum ShutdownOutcome {
         exit_code: i32,
         /// Whether the stage advance was suppressed by the stop.
         advance_suppressed: bool,
+        /// Whether the supervisor signalled the agent's process group for this stop.
+        /// `false` for a stop honoured at an advance safe point.
+        group_signalled: bool,
+    },
+    /// The supervisor accepted the stop, and its final line did not arrive within the wait:
+    /// its next safe point is further away. The stop is flagged and it will honour it.
+    AcceptedPending {
+        /// The owner phase when the supervisor accepted the stop.
+        owner: String,
     },
     /// The supervisor had already handed the run off and did not stop it.
     HandedOff,
@@ -722,8 +803,10 @@ pub enum ShutdownOutcome {
 ///
 /// Only a final `stopped` line is [`ShutdownOutcome::Stopped`]; a
 /// `handed_off` answer is [`ShutdownOutcome::HandedOff`] and any other
-/// refusal is [`ShutdownOutcome::Refused`]. A missing, late or malformed
-/// line is an error, never a stop.
+/// refusal is [`ShutdownOutcome::Refused`]. An `accepted` line with no final
+/// line within `final_timeout` is [`ShutdownOutcome::AcceptedPending`], since
+/// the supervisor still holds that stop. A connection closed before the final
+/// line, or a missing or malformed line, is an error, never a stop.
 pub fn request_shutdown(
     path: &Path,
     final_timeout: std::time::Duration,
@@ -735,7 +818,7 @@ pub fn request_shutdown(
             format!("no socket at {}", path.display()),
         )));
     }
-    let stream = UnixStream::connect(path).map_err(ProbeError::Connect)?;
+    let stream = connect_within(path, protocol::IO_TIMEOUT).map_err(ProbeError::Connect)?;
     let timeout_error =
         |error: io::Error| ProbeError::NoReply(format!("could not set socket timeouts: {error}"));
     stream
@@ -749,25 +832,44 @@ pub fn request_shutdown(
         .map_err(|error| ProbeError::NoReply(format!("could not send shutdown: {error}")))?;
     // One reader across both lines: it may already hold the final line.
     let mut reader = io::BufReader::new(&stream);
-    match read_shutdown_line(&mut reader, "accepted")? {
-        ShutdownLine::Accepted => {}
+    let line = protocol::read_line(&mut reader)
+        .map_err(|error| ProbeError::NoReply(format!("no accepted shutdown line: {error}")))?;
+    let owner = match parse_shutdown_line(&line, "accepted")? {
+        ShutdownLine::Accepted(accepted) => accepted.owner,
         ShutdownLine::Refused(error) => return Ok(refusal(error)),
         ShutdownLine::Stopped(_) => {
             return Err(ProbeError::NoReply(
                 "a stopped line arrived before the accepted line".to_string(),
             ));
         }
-    }
+    };
     stream
         .set_read_timeout(Some(final_timeout))
         .map_err(timeout_error)?;
-    match read_shutdown_line(&mut reader, "final")? {
+    let line = match protocol::read_line(&mut reader) {
+        Ok(line) => line,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ) =>
+        {
+            return Ok(ShutdownOutcome::AcceptedPending { owner });
+        }
+        Err(error) => {
+            return Err(ProbeError::NoReply(format!(
+                "no final shutdown line: {error}"
+            )));
+        }
+    };
+    match parse_shutdown_line(&line, "final")? {
         ShutdownLine::Stopped(stopped) => Ok(ShutdownOutcome::Stopped {
             exit_code: stopped.exit_code,
             advance_suppressed: stopped.advance_suppressed,
+            group_signalled: stopped.group_signalled,
         }),
         ShutdownLine::Refused(error) => Ok(refusal(error)),
-        ShutdownLine::Accepted => Err(ProbeError::NoReply(
+        ShutdownLine::Accepted(_) => Err(ProbeError::NoReply(
             "a second accepted line arrived instead of the final line".to_string(),
         )),
     }
@@ -775,7 +877,7 @@ pub fn request_shutdown(
 
 /// One parsed shutdown reply line.
 enum ShutdownLine {
-    Accepted,
+    Accepted(protocol::ShutdownAccepted),
     Stopped(protocol::ShutdownStopped),
     Refused(String),
 }
@@ -789,16 +891,11 @@ fn refusal(error: String) -> ShutdownOutcome {
     }
 }
 
-/// Read and classify one shutdown reply line. A missing, oversized or
-/// malformed line, `"ok":true` with neither marker, and `"ok":false` with no
+/// Classify one shutdown reply line. A malformed line, `"ok":true` with
+/// neither marker, or a marker without its fields, and `"ok":false` with no
 /// error string are all errors.
-fn read_shutdown_line(
-    reader: &mut impl io::BufRead,
-    which: &str,
-) -> Result<ShutdownLine, ProbeError> {
-    let line = protocol::read_line(reader)
-        .map_err(|error| ProbeError::NoReply(format!("no {which} shutdown line: {error}")))?;
-    let value: serde_json::Value = serde_json::from_str(&line).map_err(|error| {
+fn parse_shutdown_line(line: &str, which: &str) -> Result<ShutdownLine, ProbeError> {
+    let value: serde_json::Value = serde_json::from_str(line).map_err(|error| {
         ProbeError::NoReply(format!(
             "{which} shutdown line is not JSON ({error}): {line}"
         ))
@@ -823,7 +920,13 @@ fn read_shutdown_line(
             });
     }
     if ok && accepted {
-        return Ok(ShutdownLine::Accepted);
+        return serde_json::from_value(value)
+            .map(ShutdownLine::Accepted)
+            .map_err(|error| {
+                ProbeError::NoReply(format!(
+                    "{which} shutdown line is missing fields ({error}): {line}"
+                ))
+            });
     }
     Err(ProbeError::NoReply(format!(
         "{which} shutdown line is neither accepted nor stopped: {line}"
@@ -908,6 +1011,118 @@ mod tests {
         match probe(path) {
             Ok(Liveness::Alive(reply)) => assert_eq!(reply.launch_id, launch_id),
             other => panic!("expected Alive with launch id {launch_id}, got {other:?}"),
+        }
+    }
+
+    /// A listener that never accepts, whose backlog is full: the next connect would wait
+    /// for room for as long as the listener lives. Linux lets `backlog + 1` connections
+    /// wait, so one is enough at a backlog of 0.
+    #[cfg(target_os = "linux")]
+    fn listener_with_a_full_backlog(path: &Path) -> (UnixListener, UnixStream) {
+        use std::os::fd::AsRawFd as _;
+        let listener = UnixListener::bind(path).unwrap();
+        // SAFETY: a plain listen on a socket this function owns.
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+        let waiting = UnixStream::connect(path).unwrap();
+        (listener, waiting)
+    }
+
+    /// Run `call` on a thread, so a call that never returns fails the test on the bound
+    /// rather than hanging it. Returns what it returned and how long it took.
+    #[cfg(target_os = "linux")]
+    fn within_connect_bound<T: Send + 'static>(
+        call: impl FnOnce() -> T + Send + 'static,
+    ) -> (T, std::time::Duration) {
+        let bound = protocol::IO_TIMEOUT + std::time::Duration::from_secs(2);
+        let started = std::time::Instant::now();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(call());
+        });
+        let returned = receiver
+            .recv_timeout(bound)
+            .unwrap_or_else(|_| panic!("the call did not return within {bound:?}"));
+        (returned, started.elapsed())
+    }
+
+    /// A socket going away mid-ping is the slowest way to read GONE: a connect that waited
+    /// for room in the backlog, a ping left unanswered, then a closed connection and a
+    /// second look at a path that has gone. This is what `recover`'s worst case charges
+    /// each socket probe for.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn probe_can_read_gone_after_a_slow_connect_and_a_closed_ping() {
+        const EACH_STALL: std::time::Duration = std::time::Duration::from_secs(1);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dying.sock");
+        let (listener, waiting) = listener_with_a_full_backlog(&path);
+        let target = path.clone();
+        let started = std::time::Instant::now();
+        let prober = std::thread::spawn(move || probe(&target));
+
+        std::thread::sleep(EACH_STALL);
+        let accepted = listener.accept().unwrap();
+        std::thread::sleep(EACH_STALL);
+        std::fs::remove_file(&path).unwrap();
+        drop(listener);
+
+        let outcome = prober.join().unwrap();
+        let took = started.elapsed();
+        drop((accepted, waiting));
+        assert!(matches!(outcome, Ok(Liveness::Gone)), "{outcome:?}");
+        assert!(
+            took >= EACH_STALL * 2,
+            "the probe outlasted both stalls: {took:?}"
+        );
+        assert!(
+            took < protocol::IO_TIMEOUT * 2,
+            "one connect wait and one reply wait: {took:?}"
+        );
+    }
+
+    /// A full backlog is what a SIGSTOPped supervisor shows, and it means "cannot tell":
+    /// neither GONE nor STALE, and not a wait that outlives the caller's write lock.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn probe_of_a_full_backlog_is_a_connect_error_within_the_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("full.sock");
+        let (listener, waiting) = listener_with_a_full_backlog(&path);
+        let target = path.clone();
+        let (outcome, took) = within_connect_bound(move || probe(&target));
+        match outcome {
+            Err(ProbeError::Connect(error)) => {
+                assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+            }
+            other => panic!("expected a timed-out connect, got {other:?}"),
+        }
+        assert!(took >= protocol::IO_TIMEOUT, "it gave up early: {took:?}");
+
+        // Control: room in the same backlog, and the connect goes through to no reply.
+        let _accepted = listener.accept().unwrap();
+        drop(waiting);
+        let (outcome, _) = within_connect_bound(move || probe(&path));
+        assert!(
+            matches!(outcome, Err(ProbeError::NoReply(_))),
+            "with room, the connect succeeds: {outcome:?}"
+        );
+    }
+
+    /// `stop` meets the same full backlog through its shutdown request.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn request_shutdown_to_a_full_backlog_is_a_connect_error_within_the_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("full.sock");
+        let (_listener, _waiting) = listener_with_a_full_backlog(&path);
+        let (outcome, _) = within_connect_bound(move || {
+            request_shutdown(&path, std::time::Duration::from_secs(1))
+        });
+        match outcome {
+            Err(ProbeError::Connect(error)) => {
+                assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+            }
+            other => panic!("expected a timed-out connect, got {other:?}"),
         }
     }
 
@@ -1618,6 +1833,35 @@ mod tests {
     }
 
     #[test]
+    fn the_sidecar_publish_fsyncs_its_directory() {
+        use crate::durable::{Synced, take_synced};
+
+        let cache = short_cache();
+        let root = Path::new(ROOT);
+        let phase = PhaseId::new(7);
+        let launch_id = new_launch_id();
+        let socket = SocketPath::for_launch(cache.path(), root, phase, &launch_id)
+            .expect("socket path fits sun_path");
+        let sidecar = sample_sidecar(&launch_id, root, phase);
+        let target = socket.sidecar_path();
+        let socket_dir = target.parent().expect("a socket directory").to_path_buf();
+        take_synced();
+
+        write_sidecar(&socket, &sidecar).expect("write a sidecar");
+        assert!(target.exists(), "the link is what the fsync makes durable");
+        assert_eq!(take_synced(), [Synced::Dir(socket_dir)]);
+
+        let refused = write_sidecar(&socket, &sidecar);
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|error| error.kind() == io::ErrorKind::AlreadyExists),
+            "a second write is refused, got {refused:?}"
+        );
+        assert_eq!(take_synced(), [], "a refused write published nothing");
+    }
+
+    #[test]
     fn sidecar_round_trips_and_is_owner_only() {
         let cache = short_cache();
         let root = Path::new(ROOT);
@@ -2025,6 +2269,7 @@ mod tests {
                     &Reply::Stopped(protocol::ShutdownStopped {
                         exit_code: 143,
                         advance_suppressed: true,
+                        group_signalled: true,
                     }),
                 )
                 .expect("write stopped");
@@ -2036,7 +2281,8 @@ mod tests {
                 stopped,
                 Ok(ShutdownOutcome::Stopped {
                     exit_code: 143,
-                    advance_suppressed: true
+                    advance_suppressed: true,
+                    group_signalled: true
                 })
             ),
             "accepted then stopped is Stopped, got {stopped:?}"
@@ -2090,21 +2336,6 @@ mod tests {
             "a close after accepted is an error, never Stopped, got {closed:?}"
         );
 
-        let silent = run(
-            Box::new(move |stream| {
-                use std::io::Read;
-                protocol::write_reply(stream, &accepted()).expect("write accepted");
-                // Hold the connection open until the client gives up and
-                // closes it, past its final timeout.
-                let _ = (&mut &*stream).read(&mut [0_u8; 1]);
-            }),
-            Duration::from_millis(300),
-        );
-        assert!(
-            matches!(silent, Err(ProbeError::NoReply(_))),
-            "no final line within the timeout is an error, got {silent:?}"
-        );
-
         let malformed = run(
             Box::new(move |stream| {
                 protocol::write_reply(stream, &accepted()).expect("write accepted");
@@ -2127,6 +2358,44 @@ mod tests {
         assert!(
             matches!(not_a_socket, Err(ProbeError::NotASocket(_))),
             "a regular file is NotASocket, got {not_a_socket:?}"
+        );
+    }
+
+    /// D-13 item 1: a supervisor that accepted a stop and whose final line is late still
+    /// holds that stop, so `request_shutdown` reports it pending and not as a failure.
+    /// Control: with no `accepted` line either, nothing was accepted, and it stays an error.
+    #[test]
+    fn request_shutdown_reports_an_accepted_stop_whose_final_line_is_late() {
+        use std::io::Read;
+        use std::time::Duration;
+        let cache = short_cache();
+        let (socket, _, listener) = published(cache.path());
+        let server = serve_shutdown(listener, |stream| {
+            let accepted = Reply::Accepted(protocol::ShutdownAccepted {
+                owner: "advancing".to_string(),
+            });
+            protocol::write_reply(stream, &accepted).expect("write accepted");
+            // Hold the connection open until the client gives up and closes it.
+            let _ = (&mut &*stream).read(&mut [0_u8; 1]);
+        });
+        let late = request_shutdown(socket.as_path(), Duration::from_millis(300));
+        server.join().expect("scripted server thread");
+        assert_eq!(
+            late.ok(),
+            Some(ShutdownOutcome::AcceptedPending {
+                owner: "advancing".to_string()
+            })
+        );
+
+        let (socket, _, listener) = published(cache.path());
+        let server = serve_shutdown(listener, |stream| {
+            let _ = (&mut &*stream).read(&mut [0_u8; 1]);
+        });
+        let unanswered = request_shutdown(socket.as_path(), Duration::from_millis(300));
+        server.join().expect("scripted server thread");
+        assert!(
+            matches!(unanswered, Err(ProbeError::NoReply(_))),
+            "no accepted line is still an error, got {unanswered:?}"
         );
     }
 

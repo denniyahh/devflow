@@ -162,25 +162,63 @@ four layers, tried in order:
 
 State is per-phase (`crates/devflow-core/src/workflow.rs`): each active
 phase persists to `.devflow/state-{phase:02}.json`, so `devflow parallel`
-sibling phases never clobber one another. A legacy single-slot
-`.devflow/state.json` from a pre-14a binary is migrated to its per-phase
-name on first read.
+sibling phases never clobber one another. A single-slot
+`.devflow/state.json` left by a pre-14a binary is not read, renamed or
+removed.
 
-Two independent lock levels (`crates/devflow-core/src/lock.rs`), both
-file-based (`O_EXCL` create, PID written into the file, stale-holder
-reclaim if the recorded PID is dead):
+Coordination is split by what each step needs, and no lock is held across a
+gate wait (D-08):
 
-- **Per-phase advance lock** (`.devflow/lock-{phase:02}`) — held by
-  `advance()` across a gate's potentially multi-day blocking wait. Scoped
-  per-phase (not per-project) so one phase blocked on a gate never starves
-  `devflow parallel`'s sibling phases.
+- **State write lock** (`.devflow/.state-{phase:02}.lock`, `workflow.rs`) — a
+  `flock` taken for one read-modify-write of the state file, so it is short:
+  usually milliseconds. A stalled gate lock or a socket dying mid-ping can stretch
+  it to about 10 s in a gate answer, 13 s while `recover` decides a phase and 16 s
+  in a reservation that loads a state. The 16 s is counted from the code's timeouts,
+  not measured: two socket probes at 8 s, or a 6 s probe that finds a dead group, the
+  2 s wait for a supervisor exiting, then an 8 s probe. A missing or unloadable state
+  instead probes each socket left for the phase, up to 8 s each. The file is never replaced or removed, because a `flock`
+  belongs to an inode. Repair verbs (`devflow stop`, `devflow recover --clean`)
+  wait at most `WRITE_LOCK_REPAIR_WAIT` (10 s), then name the holder and write
+  nothing, so a hold that long costs them a refusal, not a hang.
+- **Launch reservation** (`state.pending_supervisor` and
+  `.devflow/supervisor-<launch_id>.live`, `liveness.rs`) — a launcher takes the
+  `flock` before it saves the pending record, and the spawned supervisor inherits
+  and holds it for life, so a pending supervisor is probeable before its socket
+  exists. A reservation whose launcher died holds nothing and reads abandoned.
+- **Gate registration** (`.devflow/gates/{phase:02}-{stage}.{gate_id}.waiter`,
+  `gates.rs`) — a `flock` a waiter holds for the length of its wait, which is what
+  "something waits on this gate" means. `.devflow/.gates-{phase:02}.lock` guards a
+  few file operations at a time (at most `GATE_LOCK_WAIT`, 5 s) and is never
+  removed.
+- **Foreground holder** (`.devflow/.holder-{phase:02}`, `liveness.rs`) — held for
+  its lifetime by a `start`/`resume` before its spawn, `devflow ship` or a hand-run
+  `devflow advance`, recording its pid and start time. It is the only pid
+  `devflow stop` signals, and only when the holder's start time still matches.
 - **Project-wide checkout lock** (`.devflow/lock-project`,
-  `lock::acquire_project_blocking`) — a coarse, seconds-scale lock that
-  serializes mutations of the shared primary checkout (hook batches) across
-  concurrently finishing phases. It must never be held across a gate wait; on timeout
+  `lock::acquire_project_blocking`, `crates/devflow-core/src/lock.rs`) — a coarse,
+  seconds-scale, file-based lock (`O_EXCL` create, PID written into the file,
+  stale-holder reclaim if the recorded PID is dead) that serializes mutations of
+  the shared primary checkout (hook batches) across concurrently finishing phases.
+  It must never be held across a gate wait; on timeout
   (`DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS`, default 120s) the hook batch is
-  **skipped** (loudly, via `events.jsonl`) rather than ever run
-  unserialized.
+  **skipped** (loudly, via `events.jsonl`) rather than ever run unserialized.
+
+A `.devflow/lock-{phase:02}` left by an older binary means nothing now and blocks
+nothing; `devflow recover --clean` removes it once the pid it names has exited.
+
+State and gate files are written through the durable helpers in
+`crates/devflow-core/src/durable.rs` (D-09), and a source scan
+(`durable::tests::state_and_gate_modules_mutate_files_only_through_the_durable_helpers`)
+holds `workflow.rs` and `gates.rs` to them. The scan is a text scan, and power
+loss itself is not tested: the fsyncs are covered in code, not proven against a
+real power cut.
+
+That scope covers state and gate files only. `supervisor-*.live`, `*.waiter`,
+`.holder-NN`, `.state-NN.lock`, `.gates-NN.lock`, `*.hold-tmp` and
+`.devflow/.gitignore` are each an advisory marker deliberately outside D-09: no
+state lives in them, a held lock rather than the file's presence decides liveness,
+and no holder survives a power loss, so a marker a crash resurrects or loses reads
+abandoned. This is chosen, not overlooked.
 
 ## Events log
 
@@ -206,47 +244,69 @@ integrating with DevFlow internals. `devflow logs`/`status` read it via
 ## Gate protocol
 
 A gate is a pause point where DevFlow writes a request to
-`.devflow/gates/` and blocks until a human (or the Hermes cron poller) drops
-a response file (`crates/devflow-core/src/gates.rs`, struct `Gates`). Three
-files per gated stage, all written atomically (temp file + rename):
+`.devflow/gates/` and waits for a human (or the Hermes cron poller) to drop an
+answer (`crates/devflow-core/src/gates.rs`, struct `Gates`). Phase and stage are
+a gate's location; its `gate_id`, fresh for every gate opened, is its identity.
+Files per gate (the waiter's registration is an advisory marker, the rest are
+written durably):
 
-- `.devflow/gates/{phase:02}-{stage}.json` — the request (`GateFile`),
-  written by `Gates::write_gate()`.
-- `.devflow/gates/{phase:02}-{stage}.response.json` — the human's answer
-  (`GateResponse { approved, note, responded_by }`), written by
-  `Gates::respond()` (the `devflow gate approve|reject` CLI path) or by
-  hand/Hermes.
-- `.devflow/gates/{phase:02}-{stage}.ack.json` — DevFlow's receipt
-  (`Gates::ack()`) once the response is consumed, so a poller knows to clean
-  up.
+- `.devflow/gates/{phase:02}-{stage}.json` — the request (`GateFile`, which must
+  name the `gate_id`), written by `Gates::open_gate()` and its path-returning form
+  `Gates::write_gate()`.
+- `.devflow/gates/{phase:02}-{stage}.{gate_id}.response.json` — the answer
+  (`GateAnswer { gate_id, approved, note, responded_by }`), written by
+  `Gates::answer()` (the `devflow gate approve|reject` CLI path) or by hand/Hermes.
+- `.devflow/gates/{phase:02}-{stage}.{gate_id}.ack.json` — the consumption claim
+  (`GateAck`, `Gates::claim()`): the first process to publish it consumes the
+  answer.
+- `.devflow/gates/{phase:02}-{stage}.{gate_id}.waiter` — the waiter's registration
+  (`Gates::register_waiter()`).
+- `.devflow/gates/{phase:02}-{stage}.{gate_id|noid}.{secs}.{pid}.{seq}.quarantined.json`
+  — an answer set aside rather than consumed or deleted (`Gates::quarantined()`):
+  a missing or other id, an unparsable body, a legacy unkeyed
+  `{phase:02}-{stage}.response.json`, or one left unused when its gate closed. It
+  stays until removed by hand, and `devflow status`, `devflow doctor` and
+  `devflow recover --clean` list it.
+
+`devflow gate approve|reject` answer the gate open now, or with `--gate-id <ID>`
+the one `gate list` or `gate show` displayed, and first move aside an answer in
+that gate's own slot that does not bind to it, so a refused answer never blocks a
+valid one. A hand-written answer copies `gate_id` from the gate file into the keyed
+path and body.
 
 `run_gate()` (`crates/devflow-cli/src/pipeline_gate.rs`) writes the gate,
 fires the notify hook (`fire_gate_notify()` — runs `$DEVFLOW_GATE_NOTIFY_CMD`
 via `sh -c` with gate metadata as environment variables, never interpolated
 into the command string; a silent no-op when the variable is unset), then
 waits in `wait_for_gate_response()` (`crates/devflow-cli/src/pipeline_launch.rs`),
-which polls the response file one of two ways:
+which holds no write lock and waits through `Gates::await_answer()`. That reads
+the gate's answer slot with a backoff (1s → 2s → … capped at 60s) and checks for a
+stop at least once a second, one of two ways:
 
 - **Inside a supervisor's advance** (its stop token is engaged, 50-13): the
   run's owner reads `gate_wait` in a `ping` reply for the length of the wait,
-  and `Gates::poll_response_cancellable()` reads the response file about once
-  a second (every sleep is capped at 1s) and checks the stop token before each
-  sleep. A stop — a `shutdown` request on the supervisor's socket, or
-  SIGTERM/SIGINT to the supervisor — ends the wait within about a second: the
-  gate's files are removed, `stopped` is recorded in the state, which is kept
-  for `devflow resume` (not an abort), and the advance unwinds without acting
-  on the gate. A response already on disk wins over a stop.
+  and the stop token is what is checked. A stop — a `shutdown` request on the
+  supervisor's socket, or SIGTERM/SIGINT to the supervisor — ends the wait within
+  about a second: the gate is closed, `stopped` is recorded in the state, which is
+  kept for `devflow resume` (not an abort), and the advance unwinds without acting
+  on the gate. A stop accepted in the same second as an answer wins.
 - **Anywhere else** (no stop token: the hidden `devflow advance` run from a
-  shell, or a gate a foreground command fires): `Gates::poll_response()` with
-  exponential backoff (1s → 2s → … capped at 60s), which nothing cancels.
+  shell, or a gate a foreground command fires): the foreground holder's stop flag
+  is checked instead, so `devflow stop`'s signal ends the wait the same way (safe
+  point 4).
 
-Either wait ends when a response appears or `DEVFLOW_GATE_TIMEOUT_SECS`
+A file in the slot that does not bind to the gate is set aside and the wait goes
+on with the time left. Either wait ends when a bound answer appears or
+`DEVFLOW_GATE_TIMEOUT_SECS`
 (default 259200 = 3 days, held equal to
 `DEVFLOW_GATE_MAX_UNATTENDED_AGE_SECS` so `devflow gate sweep` cannot reap a
-gate this poll is still watching) elapses. `GateAction::from_response()` turns an
+gate this wait is still watching) elapses, and past that the run has ended at the
+gate. `devflow resume` then reruns the stage and asks again, reporting any unused
+answer it set aside; a stored Ship approval is applied without a rerun by
+`devflow ship`. `GateAction::from_response()` turns an
 approval into `Advance`, a rejection into `LoopBack(Code)`, or — when the
 rejection note contains "abort" — `Abort(reason)`. `devflow gate list`
-(`Gates::list_open()`) enumerates requests with no response file yet,
+(`Gates::list_open()`) enumerates requests with no answer bound to them yet,
 skipping unparsable entries rather than failing.
 
 ## Monitor daemon
@@ -277,10 +337,16 @@ The supervisor (`run_supervised_stage()`):
 3. Answers `ping` and `shutdown` on the socket, and treats SIGTERM and SIGINT
    sent to it as a `shutdown`: the agent's group is ended and no advance runs.
 4. Waits for the agent to exit and records its exit code to
-   `.devflow/phase-NN-exit`. A stream supervisor stops reading when the agent
-   exits, not when its stdout closes: when a process the agent started still
-   holds that stdout, it waits at most 3 s for its pipe threads, closes the
-   capture file, records a `stream_wait_bounded` event, and signals nothing.
+   `.devflow/phase-NN-exit`. A stream supervisor's reader keeps draining the
+   agent's stdout until the pipe closes, and a process the agent started can
+   hold that stdout open after the agent exits. The supervisor then waits up
+   to `READER_DRAIN_WAIT` (3 s) for its pipe threads, then takes the capture
+   file from the reader, within one more `READER_DRAIN_WAIT` when a capture
+   write is blocked, so at most 6 s in all (plus a poll interval per wait). A
+   write still blocked after that keeps the capture file. It detaches the
+   unfinished threads, records a `stream_wait_bounded` event, and signals
+   nothing. The detached reader keeps draining the pipe, discarding what it
+   reads, until the supervisor exits.
 5. On the agent's natural exit, runs the advance in-process. The phase is
    threaded in at spawn time, so the advance's identity never depends on a
    shared state singleton — under `devflow parallel`, each phase's supervisor
@@ -341,8 +407,9 @@ other stage plus a mandatory terminal gate:
 3. A human answers via `devflow gate approve <phase> --stage ship [--note
    ...]` or `devflow gate reject <phase> --note "..." [--stage ship]`
    (`GateCmd::Approve`/`GateCmd::Reject`, `crates/devflow-cli/src/main.rs`).
-   Approval runs `finish_workflow()`: the `VersionBump` + `BranchCleanup`
-   hooks, gate cleanup, and `workflow::clear_state()`. A rejection loops
+   Approval runs `finish_workflow()`: the `Merge`, `VersionBump`,
+   `ChangelogAppend` and `BranchCleanup` hooks, gate cleanup, and
+   `workflow::clear_state()`. A rejection loops
    back to Code (or aborts, if the note contains "abort").
 4. A Ship-stage **agent crash** (vs. a review rejection) is routed through
    the same never-silent gate path as any other stage failure
@@ -395,8 +462,8 @@ Key modules log via `tracing`'s `info!`/`warn!`/`debug!` macros:
 - **`main.rs`** — `advance`/`transition`/`run_gate` print human-readable
   progress to stdout and emit structured events to `events.jsonl` at every
   step (see [Events log](#events-log)).
-- **`workflow.rs`** — state I/O (`save_state`, `load_state`, legacy
-  migration) logs at `DEBUG`; unreadable/corrupt state files warn at `WARN`
+- **`workflow.rs`** — state I/O (`update_state`, `load_state`) logs at `DEBUG`;
+  unreadable/corrupt state files warn at `WARN`
   rather than aborting a listing.
 - **`git.rs`** — branch operations (`feature_start`, `feature_finish`,
   `tag`, `push`) log at `INFO`; checkout/rebase/commit operations log at

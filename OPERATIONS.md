@@ -29,29 +29,30 @@ Define → Plan → Code → Validate → Ship
 | Command | Purpose |
 |---|---|
 | `devflow start --phase N --agent claude\|codex\|opencode --mode auto\|supervise [--force] [--no-worktree] [--dry-run] [--until define\|plan\|code\|validate]` | Begin a phase; a detached monitor owns the agent and auto-advances. `--until <stage>` runs through `<stage>` then halts cleanly (no orphaned monitor, no `doctor` false positive) instead of continuing to Ship; `--until ship` is rejected (a no-op — Ship is already terminal). Refuses before scaffolding anything if phase N is not reachable from `develop` (see Preflight refusals below) |
-| `devflow resume --phase N` | Resume a rate-limited or infra-paused phase from its saved stage (loads `state-NN.json`, does not recreate the branch/worktree or reset to Define) — the command a primary-loop rate-limit auto-resume cron invokes. Also clears a `--until`-stopped phase's stop marker, so the phase advances past its old stop point instead of re-stopping immediately |
-| `devflow status` | All active phases: stage, gate state, supervisor liveness (ALIVE / STALE / GONE, with the repair; see [Run liveness](#run-liveness)), elapsed, last action |
+| `devflow resume --phase N` | Resume a rate-limited or infra-paused phase from its saved stage (loads `state-NN.json`, does not recreate the branch/worktree or reset to Define) — the command a primary-loop rate-limit auto-resume cron invokes. Also clears a `--until`-stopped phase's stop marker, so the phase advances past its old stop point instead of re-stopping immediately. It reruns the stage, so a pending gate is asked again: it sets any unused answer aside and reports it, and reports an answer that was claimed with no record that it was applied (see [Answering gates](#answering-gates)) |
+| `devflow status` | All active phases: stage, gate state, supervisor liveness (ALIVE / STALE / GONE, with the repair; see [Run liveness](#run-liveness)), elapsed, last action. Also shows a held state write lock with its holder, names a live agent that has no supervisor with the manual kill, and lists set-aside gate answers |
 | `devflow logs [-f] [--phase N] [--stderr]` | Print/follow a phase's captured agent output |
 | `devflow history [N]` | Show chronological events with retained capture and review evidence for a phase |
 | `devflow gate list` | Gates awaiting a response |
-| `devflow gate approve <phase> [--stage S] [--note ...]` | Approve a gate — the workflow advances |
-| `devflow gate reject <phase> --note ... [--stage S]` | Reject — loops back to Code; a note containing `abort` ends the phase |
+| `devflow gate approve <phase> [--stage S] [--note ...] [--gate-id ID]` | Approve a gate — the workflow advances |
+| `devflow gate reject <phase> --note ... [--stage S] [--gate-id ID]` | Reject — loops back to Code; a note containing `abort` ends the phase |
 | `devflow gate sweep [--max-age-secs N] [--dry-run] [--root PATH]` | Answer or report aged, unattended gates across every registered root (or one `--root`) — bounds an abandoned run's lifetime without `kill(1)`. On-demand only; nothing schedules it. Never writes an approval |
 | `devflow parallel --phases 7,8 [--agents claude,codex] [--mode M] [--force]` | Run phases concurrently, each in its own worktree + monitor |
 | `devflow list` | Feature branches with divergence from develop |
 | `devflow reference [--branch B] [--refresh]` | Static snapshot worktree at `.worktrees/reference/` |
-| `devflow stop --phase N [PROJECT] [--root PATH] [--launch ID]` | End a running phase cleanly (23c). In this order: **(1)** an open gate with a confirmed live waiter is answered with a rejection — the waiter unwinds through its own abort path, no signal sent. **(2)** Otherwise the run's supervisor socket is probed: the one `.devflow/state-NN.json` records, or, when that file records none (a `start` still waiting for its supervisor to publish), is missing or does not load, the one live socket found through its sidecar for this project and phase. **ALIVE** → a `shutdown` request: the supervisor ends the agent's process group (exit code 143) and runs no advance. **STALE** → the guarded backstop: it signals (SIGTERM, then SIGKILL) only an agent group whose leader is still present with the recorded start time and still leads the group; a socket from a previous boot, an empty group or a recycled leader pid has its socket and sidecar removed with nothing signalled; a group whose leader is gone is refused and its members listed, with `ps -o pid,pgid,sid,lstart,args -p "$(pgrep -d, -g <pgid>)"` to inspect them (residual limit: nothing proves those members are the agent's, so `stop` never signals them — end them yourself). A probe that cannot answer is refused, nothing signalled. **(3)** Only when no live socket remains (**GONE**, or nothing recorded) is the process holding `.devflow/lock-{phase:02}` signalled, after confirming it is alive and its pid and start time match the identity the lock recorded (a recycled pid, or a lock that records no start time, is refused). No pid read from the state file is ever signalled. Idempotent; records `stopped`/`stop_reason`, except after arm (1) while the gate's waiter still holds the phase lock: that waiter ends the phase through its abort path, which clears the state instead. Either way `cleanup`'s fail-closed refusal recognizes the phase as no longer live — `stop` then `cleanup --force` compose in that order. When the state file does not load, `stop` still ends the run, says `stopped` was not recorded and leaves the file untouched; several live sockets with no usable state are refused, with one `devflow stop --phase N --launch <id>` line each. `--launch <id>` tears down only the socket with that launch id — the form `devflow doctor` prints for an orphan, usable from any directory — and answers no gate, signals no lock holder and writes no state |
+| `devflow stop --phase N [PROJECT] [--root PATH] [--launch ID]` | End a running phase cleanly (23c). In this order: **(1)** an open gate with a registered live waiter is answered with an abort rejection — the waiter unwinds through its own abort path, no signal sent. A Ship gate with no waiter stores that rejection for `devflow ship`. A gate whose answer a consumer already claimed is left alone. If `.devflow/.gates-NN.lock` stays held past 5 s, `stop` says so, answers nothing and goes on to the next arms, so a wedged `gate approve` cannot leave a run unstoppable. **(2)** Otherwise the run's supervisor socket is probed: the one `.devflow/state-NN.json` records, or, when that file records none (a `start` still waiting for its supervisor to publish), is missing or does not load, the one live socket found through its sidecar for this project and phase. **ALIVE** → a `shutdown` request: the supervisor ends the agent's process group (exit code 143) and runs no advance. A stop honoured at an advance safe point is named as that, since nothing was signalled, and the exit file then records 143 too. A supervisor that accepted the stop but whose final answer did not arrive in time is reported as accepted, not confirmed: it honours the stop at its next safe point, and `devflow status` shows when it has. **STALE** → the guarded backstop: it signals (SIGTERM, then SIGKILL) only an agent group whose leader is still present with the recorded start time and still leads the group; a socket from a previous boot, an empty group or a recycled leader pid has its socket and sidecar removed with nothing signalled; a group whose leader is gone is refused and its members listed, with `ps -o pid,pgid,sid,lstart,args -p "$(pgrep -d, -g <pgid>)"` to inspect them (residual limit: nothing proves those members are the agent's, so `stop` never signals them — end them yourself). A probe that cannot answer is refused, nothing signalled. A launch the state names as pending comes next, and only its socket reaches it: `stop` waits up to 15 s for an unpublished one and never signals it. If it never publishes, a foreground launcher still holding the phase is reached through arm (3), and with none `stop` reports the launch and the pid its liveness lock records, records nothing and names the manual route: end that process yourself, then run `stop` again to clear the reservation. A reservation nothing holds is abandoned: `stop` clears it and says so. **(3)** Only when no socket answers (**GONE**, or nothing recorded) is the phase's foreground holder signalled — a `start`/`resume` before its spawn, `devflow ship`, or a hand-run `devflow advance`, which holds `.devflow/.holder-NN` for its lifetime — after confirming its pid and start time match the identity that file recorded (a recycled pid, or a record with no start time, is refused). No pid read from the state file is ever signalled. The holder catches the signal and ends at its next safe point (1–6; a foreground gate wait at 4), recording `stopped by devflow stop at a foreground safe point` and logging `advance_stopped` with `source: foreground_holder`. A holder still running 3 s later is reported as not marked, exit non-zero, and it records the stop itself. **Finalization.** The boundary is before `Merge`, or after the pass ends: `devflow ship` reads a stop only at safe point 6, before a finalization pass. Once the pass starts it runs `Merge`, `VersionBump`, `ChangelogAppend` and `BranchCleanup` to the end; a failed pass's retry gate then honours the stop at safe point 4, and a successful pass ships. So a stop that arrives after the pass started lets the run finish shipping. What you see: `stop` prints its not-marked message (the pid was signalled, phase state was not marked stopped, and a `devflow ship` that has started its finalization pass runs it to the end and, if the pass succeeds, ships instead of stopping) and exits non-zero; or, when the ship finishes within the 3 s wait, `stop` says the signalled holder exited and left no phase state, that the run ended on its own, and that nothing was marked stopped. Afterwards the record is the shipped run's (`workflow_shipped`, `workflow_finished`, no state file) with no `advance_stopped`: nothing records that the stop arrived. There is no safe point between hooks and no resume path that skips a hook already run. Limit: a terminal Ctrl-C sends SIGINT to the whole foreground process group, so a hook's own `git` child receives it directly; this covers `devflow stop` and signals sent to the holder pid only. **An agent with no supervisor.** With no socket, pending launch or holder left but the phase's agent still alive, `stop` names the agent's pid and the manual kill (`kill -TERM -- -<pid>`, after `ps -o pid,pgid,lstart,args -p <pid>` when the pid is unconfirmed), writes nothing and exits non-zero. `devflow stop` cannot end that agent (backlog 999.170). The pid is unconfirmed when it comes only from `.devflow/phase-NN-agent-pid`: a pid reused by an unrelated process makes `stop` exit non-zero until that process ends, and the way out is to end it or remove the pid file. **What it records.** Idempotent; records `stopped`/`stop_reason`. After arm (1) the waiter's abort path then clears the state. Either way `cleanup`'s fail-closed refusal recognizes the phase as no longer live — `stop` then `cleanup --force` compose in that order. `stop` does not mark a run `stopped` when, by the time it writes, the state names a launch none of its arms ended, answered, cleared or found not running: one a signalled holder published, a pending launch that promoted while `stop` ran, or one started meanwhile. Run `stop` again: a launch that turns out dead is found not running by that second `stop`, which then marks the run. `stop` waits at most 10 s for the state write lock, then names its holder and writes nothing. When the state file does not load, `stop` still ends the run, says `stopped` was not recorded and leaves the file untouched; several live sockets with no usable state are refused, with one `devflow stop --phase N --launch <id>` line each. `--launch <id>` tears down only the socket with that launch id — the form `devflow doctor` prints for an orphan, usable from any directory — and answers no gate, signals no holder and writes no state. `stop` adds no exit codes |
 | `devflow cleanup [--force]` | Remove phase worktrees + their feature branches |
-| `devflow recover [--clean] [--phase N]` | Inspect state; `--clean` sweeps stale phases only; `--clean --phase N` clears one phase, refusing while its supervisor may be live (ALIVE, a STALE socket whose agent group may live, or a failed probe) |
+| `devflow recover [--clean] [--phase N]` | Inspect state; `--clean` sweeps stale phases only; `--clean --phase N` clears one phase. Either form keeps a phase whose recorded or pending supervisor, gate waiter or foreground holder may be live, deciding on a fresh read under the state write lock, so a run that starts while it works is kept. It waits at most 10 s for that lock, then keeps the phase and names the holder. The `--clean` sweep also removes abandoned `supervisor-*.live` and `*.waiter` markers and orphan `*.hold-tmp` temps, and lists set-aside gate answers as kept; both forms remove stale `lock-NN` leftovers. Neither ever removes `.holder-NN`, `.state-NN.lock`, `.gates-NN.lock` or a set-aside answer |
 | `devflow test` | cargo test + clippy + fmt --check |
 | `devflow doctor [--json]` | Environment audit (agents installed, versions, RUST_LOG) plus per-phase reconciliation, including each phase's supervisor liveness and a read-only sweep for orphan supervisor sockets (see [Run liveness](#run-liveness)); `--json` emits one object with the keys `environment`, `reconciliation`, `planning_doc_staleness`, `stray_processes`, `orphan_supervisors` and `orphan_supervisor_sweep_error` |
 | `devflow release --check` | Read-only release-cut preflight: workspace self-pin, develop/main divergence (no `git fetch` — reads already-fetched refs), crates.io publish order, and changelog-version agreement (999.96). `--check` is required; a bare `devflow release` is rejected toward the deferred release-cut executor (merge/tag/sync/publish, DEN-50) |
-| `devflow ship --phase N [--force]` | **Dead-monitor recovery.** `devflow gate approve` only *writes* the Ship gate's response file — a live monitor polling for it is what actually advances the workflow. If that monitor died before consuming the response (e.g. the machine restarted mid-pipeline), the approval sits unconsumed forever. `devflow ship` reads the already-written Ship response directly and drives the phase through the same terminal path (`finish_workflow`) the live monitor would have — requires `state.stage == Stage::Ship` and an existing request+response pair with no prior ack. `--force` is accepted for explicit operator intent but never skips the stage check, the per-phase lock, the gate-existence check, or the ack check — it can never be used to skip Validate or jump ahead of a healthy pipeline. If the Ship response routes to a rejection that loops back to Code, `devflow ship` launches a **new, detached monitor agent** to drive the retry — the command prints this explicitly so it is never a silently long-running process. |
+| `devflow ship --phase N [--force]` | **Dead-monitor recovery.** `devflow gate approve` only *writes* the Ship gate's answer — a live supervisor waiting on it is what actually advances the workflow. If that supervisor died before claiming the answer (e.g. the machine restarted mid-pipeline), the approval sits unconsumed forever. `devflow ship` claims the stored answer exclusively and drives the phase through the same terminal path (`finish_workflow`) the live supervisor would have — requires `state.stage == Stage::Ship` and an open Ship gate holding an answer bound to it, not yet claimed. It holds `.devflow/.holder-NN` for its lifetime, and because it is dead-monitor recovery it refuses while a recorded or pending supervisor of the phase is live, logging `ship_override_refused` and naming `devflow stop --phase N`. `--force` is accepted for explicit operator intent but never skips the stage check, the foreground holder, that refusal, the gate-existence check, or the answer claim — it can never be used to skip Validate or jump ahead of a healthy pipeline. If the Ship answer routes to a rejection that loops back to Code, `devflow ship` launches a **new, detached monitor agent** to drive the retry — the command prints this explicitly so it is never a silently long-running process. For what `devflow stop` does to a running `devflow ship`, see its row above |
 | `devflow evidence --phase N [--json] [--require-shipped] [--root PATH]` | **Read-only structural oracle (23-06):** reports DevFlow's own append-only record of whether a phase actually shipped, instead of trusting an agent-authored attestation document. `shipped` is strictly true only after the terminal-only `workflow_shipped` event has been emitted (the last step inside `finish_workflow_with_gate_timeout`, once the entire post-Ship hook batch has succeeded) — a phase halted by `--until <stage>` always reports `shipped: false`, even though it emits the older, ambiguous `workflow_finished` event too (surfaced separately as `workflow_finished_seen`/`finished_reason` for corroboration, never consulted by `shipped`). `--require-shipped` exits non-zero unless `shipped` is true, so it is declarable as a `verify::external_verify_commands` Layer 0 probe (opt-in per phase; a phase's PLAN must declare it and the operator must approve it via `DEVFLOW_TRUST_EXTERNAL_VERIFY`) — a failed declared probe outranks every agent-controlled signal. |
 
 (`devflow advance` is internal and takes `--phase N`. A supervisor does not
-run it as a command; it advances in-process. `devflow status` names it as a
-repair only for a gate-pending phase whose supervisor is GONE.)
+run it as a command; it advances in-process. `devflow status` does not suggest
+it, because answering a gate and then running it sets the answer aside, and a
+hand-run advance refuses while a supervisor of the phase is live.)
 
 (`devflow monitor` is internal and registered as the hidden `__monitor`
 subcommand — it is the stage supervisor's own process body. Every stage
@@ -81,22 +82,33 @@ and one `ping`) and get one of three answers:
 |---|---|---|
 | **ALIVE** | The socket answered the ping. The reply names the current owner (agent running, advancing, gate wait, …) and the launch shape. A moment between stages is ALIVE, because the supervisor advances in-process | None needed. To end the run: `devflow stop --phase N` |
 | **STALE** | The socket file is still there and owned by you, but nothing accepts the connect: the supervisor died without cleaning up, and its agent group may still be running | `devflow stop --phase N` (the backstop ends a validated agent group and removes the socket and sidecar), then `devflow resume --phase N` |
-| **GONE** | No file at the recorded path: the supervisor has exited. Normal when the phase is stopped; when it is not, nothing will advance the phase | `devflow resume --phase N` (when a gate is pending, answer it and run `devflow advance --phase N`) |
+| **GONE** | No file at the recorded path: the supervisor has exited. Normal when the phase is stopped; when it is not, nothing will advance the phase | `devflow resume --phase N`, which reruns the stage and asks again. When the Ship gate is pending, answer it and run `devflow ship --phase N`; any other pending gate is asked again by `resume`. When the agent is still running with no supervisor, `resume` refuses: `status` and `stop` name its pid and the manual kill (`kill -TERM -- -<pid>`, after `ps -o pid,pgid,lstart,args -p <pid>` when the pid is unconfirmed). `devflow stop` cannot end it (backlog 999.170), so end it by hand first |
 
 How each command shows them:
 
 - **`devflow status`** prints `supervisor: <socket path> — <state>` for each
   phase, and under it the repair: `devflow stop --phase N` then
-  `devflow resume --phase N` for STALE; `devflow resume --phase N` (plus
-  `devflow advance --phase N` when a gate is pending) for GONE while the phase
-  is not stopped. A phase with no supervisor recorded reads `not launched`.
+  `devflow resume --phase N` for STALE; for GONE while the phase is not
+  stopped, `devflow resume --phase N`, plus `devflow ship --phase N` when the
+  Ship gate is pending: when the Ship gate is pending, answer it and run
+  `devflow ship --phase N`; any other pending gate is asked again by `resume`.
+  When the supervisor is gone but the phase's agent still runs, it names the
+  agent's pid and the manual kill (`kill -TERM -- -<pid>`, after
+  `ps -o pid,pgid,lstart,args -p <pid>` when the pid is unconfirmed) instead of
+  `resume`, which refuses while that agent lives; `devflow stop` cannot end it
+  (backlog 999.170), so end it by hand first. The pid is unconfirmed when it
+  comes only from `.devflow/phase-NN-agent-pid`, which an unrelated process can
+  have reused; if `ps` shows that, end that process or remove the pid file. A
+  phase with no supervisor recorded reads `not launched`.
 - **`devflow doctor`** reports STALE, GONE-while-not-stopped and a failed probe
   as problems, naming the phase and launch id but no path. Its repairs:
   `devflow stop --phase N && devflow resume --phase N` for STALE,
   `devflow resume --phase N` for GONE, `devflow status` for a failed probe.
   ALIVE, a stopped GONE and an unlaunched phase are silent. `doctor --json`
   gives each phase a `supervisor` object (`liveness`, `owner`, `launch`,
-  `launch_id`).
+  `launch_id`). It also warns about a held state write lock, naming its holder,
+  names a live agent that has no supervisor with the manual kill, and lists
+  set-aside gate answers.
 - **"probe failed".** A probe that cannot decide (the path is not a socket,
   belongs to another user, cannot be stat'ed or connected to, or the peer
   gives no valid ping reply) reads `UNKNOWN — the probe failed: …`. It is
@@ -113,13 +125,26 @@ How each command shows them:
   gone, or a probe that fails, searching the socket directory when the state
   file is missing or does not load (and refusing when that directory exists
   but cannot be listed). It does not read the agent pid file. The refusal
-  names a `devflow stop` line for each such socket.
+  names a `devflow stop` line for each such socket. It then decides again on a
+  fresh read under the state write lock, and that decision keeps any STALE
+  socket, even one this guard lets through, printing `kept phase N` with
+  `run \`devflow stop --phase N\` first` and exiting non-zero. So for a STALE
+  socket, `stop` comes first: it removes the socket. When the state file is
+  missing or does not load, it also keeps the phase while a launch liveness
+  file (`supervisor-<id>.live`) is held that no other phase's state records,
+  naming its holder pid: that may be the phase's supervisor before it publishes.
 - **`devflow start` / `devflow resume`** refuse while a run is live: an ALIVE
   socket, a STALE one unless the backstop's checks prove its agent group gone,
   or a probe that fails. When the state file is missing or does not load,
   they search the socket directory for this project and phase instead, and
   refuse when that directory exists but cannot be listed. The refusal names a
-  `devflow stop` line for each live socket.
+  `devflow stop` line for each live socket. They also refuse while a live pid
+  sits in `.devflow/phase-NN-agent-pid`, until that process is ended, and while
+  another foreground process holds `.devflow/.holder-NN`. A `start` over a
+  state file that is missing or does not load also refuses while a launch
+  liveness file is held that no other phase's state records, naming its holder
+  pid; a launch between its reservation and its record can show this for a
+  moment, so retry.
 
 **Orphan sockets.** `devflow doctor` also lists, read-only, under
 `supervisor sockets no state claims:`, each socket of this project whose state
@@ -131,6 +156,27 @@ repaired by `devflow stop --phase N --launch <id>`. `doctor` changes nothing;
 it cannot list as `orphan_supervisor_sweep_error` rather than as no orphans.
 A launch caught between publishing its socket and saving its record can be
 listed this way for a moment.
+
+**Superseded supervisors.** A supervisor the state no longer records, or whose
+promotion never came within its 15 s wait, writes no state or exit file and cannot
+record its own stop. When the state records another launch it also leaves
+`workflow._auto_chain_active` to that launch; otherwise it clears the flag as usual.
+`devflow logs --follow` ends on an exit file, or once the phase has no state file
+(including one gone before it started); while the state stays, it keeps following
+until Ctrl-C. It ends its agent's group if the agent still runs and logs
+`supervisor_superseded`, whose `agent_group` field says `ended` or
+`already_exited`. A promoted supervisor keeps reading the state once a second
+until its agent exits, so editing the state to name another launch or none, or
+deleting it for more than 3 s, ends a running agent. A state that does not load, or names the
+launch only as pending, ends nothing: the supervisor logs a warning at most once
+a minute, and its agent keeps running.
+
+**`git clean -fdx` under `--no-worktree`.** It removes `.devflow`, with the state,
+capture and history in it. If the file stays gone for 3 s the supervisor ends the
+agent's group and logs `supervisor_superseded` with `recorded: null`. If the agent
+exits first, the exit file has nowhere to go and it logs `supervisor_failed`. Both land
+in a `.devflow/events.jsonl` recreated at that moment, which is then all that remains
+of the run's log. A clean after that event removes it too, with nothing left to say why.
 
 **Where the sockets live.** Under `registry::cache_dir()/sock`: the cache
 directory is `DEVFLOW_CACHE_DIR` when set, then `$XDG_CACHE_HOME/devflow`,
@@ -150,7 +196,8 @@ deep.
 `devflow stop`'s ALIVE arm does: a running agent's group is ended, no next
 stage is launched, and `stopped` is recorded. A supervisor parked at a gate
 clears the gate and records `stopped` rather than aborting the phase, so the
-phase stays resumable.
+phase stays resumable. A foreground holder handles them as `devflow stop`'s
+third arm describes.
 
 **Platform.** Socket supervision is unverified on macOS: the 103-byte macOS
 `sun_path` limit is enforced by a constant only, and no macOS host or CI has
@@ -185,11 +232,55 @@ devflow gate reject 15 --note "abort: wrong direction"             # ends the ph
 ```
 
 `--stage` is only needed when one phase somehow has several open gates.
-Under the hood this writes `.devflow/gates/NN-<stage>.response.json`
-atomically; the supervisor parked at the gate checks for it about once a
-second (a gate waited on outside a supervisor, such as `devflow ship`'s
-foreground wait, backs off up to ~60s), acks, and moves on. The CLI refuses to
-overwrite an unconsumed response.
+`--gate-id <ID>` binds the answer to the gate `gate list` or `gate show`
+displayed, and a gate opened since is refused; without it the command answers
+the gate open now.
+
+Every gate opened gets a fresh `gate_id`, named in its request file
+`.devflow/gates/NN-<stage>.json`. An answer belongs to that one gate. `gate
+approve` and `gate reject` write it to
+`.devflow/gates/NN-{stage}.{gate_id}.response.json`. Before they publish, they
+move an answer in that gate's own slot that does not bind to it aside, so a
+refused answer never blocks a valid one, and they refuse to overwrite an
+unconsumed answer that does bind. At a stage other than Ship with no registered
+waiter they write nothing and name the repair; a Ship answer with no waiter is
+stored for `devflow ship`.
+
+To answer by hand, copy `gate_id` from the gate file and publish the same path
+with the same body, renaming it into place so no reader sees it half written:
+
+```json
+{"gate_id": "<copied from the gate file>", "approved": true, "note": "lgtm"}
+```
+
+`approved` is `true` or `false`, and `note` is optional. A rejection loops back
+to Code, or ends the phase when its note contains `abort`. `devflow gate list`
+stops listing a gate once an answer bound to it is in its slot. A
+process waiting at the gate reads its answer slot with a backoff (1s, 2s, … capped
+at 60s, so a long wait costs few reads, and a stop is still seen within about a
+second), claims the answer with `.devflow/gates/NN-{stage}.{gate_id}.ack.json`,
+and moves on. The first process to publish that claim consumes the answer.
+
+**Answers that do not bind.** An answer with a missing or other id, an
+unparsable one, a legacy unkeyed `NN-<stage>.response.json`, or one left unused
+when its gate closes is never consumed or deleted. It is set aside as
+`NN-{stage}.{gate_id|noid}.{secs}.{pid}.{seq}.quarantined.json` and logged as
+`gate_answer_quarantined` with its reason. `status`, `doctor` and
+`recover --clean` list it. A set-aside file persists until removed by hand:
+nothing in DevFlow deletes it, so remove it once read.
+
+**A late answer.** `DEVFLOW_GATE_TIMEOUT_SECS` ends the wait, not the gate, and
+a run that timed out has ended at that gate. `devflow resume --phase N` reruns
+the stage and asks again. It reports any unused answer it set aside, and any
+answer that "was claimed, with no record that it was applied" (logged
+`resume_found_unapplied_answer`; the event's name means that record is missing,
+and the closed gate's claim is logged `gate_claimed_answer_removed`). The
+answer's consumer may have ended before acting on it, or it may have acted with
+the gate left open, so the line says only what is known, and the rerun asks
+again either way. At Ship the line adds that a merge, version bump or tag may
+already have run, so check them before answering again. A stored Ship approval
+is applied without a rerun by `devflow ship --phase N`; once `resume` has set
+that answer aside, `devflow ship` cannot apply it.
 
 ## Notify hook (never miss a gate)
 
@@ -226,7 +317,7 @@ never receives the variable.
 | Variable | Default | Purpose |
 |---|---|---|
 | `DEVFLOW_GATE_NOTIFY_CMD` | unset | Shell command fired when a gate is written |
-| `DEVFLOW_GATE_TIMEOUT_SECS` | 259200 (3d) | How long a monitor stays alive holding the phase lock while parked at a gate. Not a deadline for answering: the gate request and phase state are files that never expire, and timing out is a clean resumable stop — past it you answer the gate and run `devflow resume` instead of the answer being picked up automatically |
+| `DEVFLOW_GATE_TIMEOUT_SECS` | 259200 (3d) | How long a monitor waits at a gate, holding its gate registration rather than a lock. Not a deadline for answering: the gate request and phase state are files that never expire, and timing out is a clean resumable stop. Past it the run has ended at that gate: `devflow resume` reruns the stage and asks again, setting any unused answer aside (a stored Ship approval is applied without a rerun by `devflow ship --phase N`) |
 | `DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS` | 60 | How long `devflow ship --phase`'s foreground manual override waits for a reopened Ship gate (terminal-hook failure) before failing fast, instead of `DEVFLOW_GATE_TIMEOUT_SECS`' multi-day default |
 | `DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS` | 120 | Wait on the shared-checkout lock; on timeout the hook batch is skipped (loudly), never run unserialized |
 | `DEVFLOW_GATE_MAX_UNATTENDED_AGE_SECS` | 259200 (3d) | Age threshold `devflow gate sweep` uses to decide a gate is abandoned. Held **equal to** `DEVFLOW_GATE_TIMEOUT_SECS`, never shorter: `gate sweep` writes an `abort:` response, so a threshold below the poll timeout lets a sweep reap gates a live monitor is still polling — turning a clean resumable timeout into an `abort()` that clears state, machine-wide across every registered root. An unparsable value or explicit `0` falls back to the default rather than reaping every gate on the machine |
@@ -248,11 +339,20 @@ never receives the variable.
 | File | What it is |
 |---|---|
 | `state-NN.json` | A phase's persisted stage-machine state (per phase since 14a) |
-| `lock-NN` | Per-phase advance lock (held across gate waits) |
+| `.state-NN.lock` | The phase's short state write lock: held for one state write, usually milliseconds and never across a gate wait, and never removed |
+| `.gates-NN.lock` | The per-phase gate lock: held for a few file operations, never removed |
+| `.holder-NN` | D-17 foreground holder: held for its lifetime by a `start`/`resume` before its spawn, `devflow ship` or a hand-run `advance`, recording its pid and start time. `stop`'s third arm signals it; never removed by `recover --clean` |
+| `supervisor-<launch_id>.live` | Launch reservation: its lock is taken before the pending record is saved and held by the spawned supervisor for life. An abandoned one is removed by `recover --clean` |
+| `*.hold-tmp` | A hold being taken, here or under `gates/`. An orphan is removed by `recover --clean` |
+| `lock-NN` | A leftover from an older binary. Nothing takes it now and it blocks nothing; `recover --clean` removes it, keeping it with a notice while the pid it names is alive |
 | `lock-project` | Coarse checkout lock (held seconds, around shared-git mutations) |
 | `phase-NN-stdout` / `phase-NN-stderr.log` | Agent capture files (what `logs` tails) |
 | `phase-NN-exit` / `phase-NN-agent-pid` | Exit code + PID the supervisor records |
-| `gates/NN-<stage>.json` (+ `.response.json`, `.ack.json`) | Gate request / answer / receipt |
+| `gates/NN-<stage>.json` | Gate request, naming its `gate_id` |
+| `gates/NN-{stage}.{gate_id}.response.json` | The answer to that one gate |
+| `gates/NN-{stage}.{gate_id}.ack.json` | The claim: the first process to publish it consumes the answer |
+| `gates/NN-{stage}.{gate_id}.waiter` | The waiter's registration: its held lock says something waits on that gate. An abandoned one is removed by `recover --clean` |
+| `gates/NN-{stage}.{gate_id\|noid}.{secs}.{pid}.{seq}.quarantined.json` | An answer set aside. It persists until removed by hand |
 | `events.jsonl` | Append-only event log (schema v1, one JSON object per line, phase id on every line) — tail it from any tool |
 | `cron-instructions-NN.json` | Rate-limit resume record naming `devflow resume --phase N` for a paused run |
 | `history/phase-NN/` | Bounded archive of prior stage stdout/exit captures |
@@ -275,4 +375,5 @@ devflow status                       # idle — phase shipped, version tagged
 When something wedges: `devflow recover` to inspect,
 `devflow recover --clean` (stale phases, plus gate files whose phase has no
 state; exits non-zero if anything could not be removed) or
-`devflow recover --clean --phase N` to reset one phase, then re-`start`.
+`devflow recover --clean --phase N` to reset one phase, then re-`start`. Both
+keep a phase that may still be live, and name `devflow stop --phase N` first.

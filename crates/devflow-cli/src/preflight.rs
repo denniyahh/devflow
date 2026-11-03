@@ -20,18 +20,20 @@
 use crate::CliError;
 use crate::commands::phase_artifact_on_base;
 use crate::pipeline_gate::{abort, run_gate};
+use crate::pipeline_launch::close_gate;
+use crate::pipeline_launch::commit;
 use crate::pipeline_launch::launch_stage;
 use crate::pipeline_launch::launch_stage_inner;
 use crate::pipeline_launch::stream_launch_enabled;
 use crate::pipeline_outcomes::truncate_reason;
-use devflow_core::gates::{GateAction, Gates};
+use devflow_core::gates::GateAction;
 use devflow_core::git::git_command;
 use devflow_core::gsd_config::{self, GsdConfigError};
 use devflow_core::mode::{self, Mode};
 use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, CheckpointApproval, State};
-use devflow_core::{agents, events, verify, version, workflow};
+use devflow_core::{agents, events, verify, version};
 use std::path::{Path, PathBuf};
 
 /// The sandbox writable roots a worktree-hosted agent needs to commit: the
@@ -1291,8 +1293,8 @@ pub(crate) fn generic_preflight_checks(project_root: &Path, state: &State) -> Re
     }
 }
 
-/// Record the human-only checkpoint set for a Code evaluation, read from the
-/// EXECUTION root.
+/// The approval recording the human-only checkpoint set for a Code evaluation, read
+/// from the EXECUTION root, or `None` when nothing is to be recorded.
 ///
 /// The root is `state.worktree_path` when set, else `state.project_root` —
 /// NOT `project_root` — because `.planning/` is tracked content: an in-flight
@@ -1312,19 +1314,27 @@ pub(crate) fn generic_preflight_checks(project_root: &Path, state: &State) -> Re
 /// run whose first Code evaluation predates this field has an unobserved set,
 /// and recording it later would bless whatever the agent had already written.
 ///
-/// Callers own their own `save_state` so this can sit inside an arm that
-/// already saves once.
-fn record_checkpoint_set_for_code_evaluation(state: &mut State) -> Result<(), CliError> {
+/// This scans plan files, so it runs before the commit that records its answer,
+/// outside the write lock; [`fill_pending_approval`] applies that answer in the commit.
+fn approval_for_code_evaluation(state: &State) -> Option<CheckpointApproval> {
     if state.checkpoint_approval != CheckpointApproval::Pending {
-        return Ok(());
+        return None;
     }
     let execution_root = state
         .worktree_path
         .clone()
         .unwrap_or_else(|| state.project_root.clone());
     let current = verify::phase_checkpoint_declarations(&execution_root, state.phase);
-    state.checkpoint_approval = crate::pipeline_launch::recorded_approval(&current);
-    Ok(())
+    Some(crate::pipeline_launch::recorded_approval(&current))
+}
+
+/// Record `approval` on the state re-read under the write lock, where the
+/// only-from-`Pending` rule of [`approval_for_code_evaluation`] is applied again:
+/// a set recorded since the scan stands.
+fn fill_pending_approval(state: &mut State, approval: CheckpointApproval) {
+    if state.checkpoint_approval == CheckpointApproval::Pending {
+        state.checkpoint_approval = approval;
+    }
 }
 
 /// Gate a stage launch on readiness (17c, D-13-D-16): the generic universal
@@ -1394,8 +1404,9 @@ pub(crate) fn run_preflight(
             abort(project_root, state, &ceiling_reason)?;
             return Ok(false);
         }
-        state.preflight_retries = state.preflight_retries.saturating_add(1);
-        workflow::save_state(state)?;
+        commit(state, |s| {
+            s.preflight_retries = s.preflight_retries.saturating_add(1)
+        })?;
 
         let context = format!(
             "[never-silent] preflight failed for stage {stage}: {} — human review needed \
@@ -1407,9 +1418,7 @@ pub(crate) fn run_preflight(
                 // D-18f: approval is an explicit override — skip the
                 // just-adjudicated check on the retry (see the function
                 // doc comment above).
-                let _ = Gates::cleanup(project_root, state.phase, stage);
-                state.gate_pending = false;
-                state.preflight_retries = 0;
+                let _ = close_gate(project_root, state.phase, stage);
                 // 48-15 / R-8, T-48-15-01, T-48-07-02: in Auto mode a Code
                 // launch whose plans declare a human-only checkpoint is
                 // REFUSED, so the pass path below never runs for it. THIS is
@@ -1431,16 +1440,24 @@ pub(crate) fn run_preflight(
                 // The LoopBack arm below deliberately records nothing: "I will
                 // fix it and retry" is not approval, and treating it as
                 // approval is the repudiation path T-48-15-03 names.
-                if stage == Stage::Code {
-                    record_checkpoint_set_for_code_evaluation(state)?;
-                }
-                workflow::save_state(state)?;
+                let approval = if stage == Stage::Code {
+                    approval_for_code_evaluation(state)
+                } else {
+                    None
+                };
+                commit(state, |s| {
+                    s.gate_pending = false;
+                    s.preflight_retries = 0;
+                    if let Some(approval) = approval {
+                        fill_pending_approval(s, approval);
+                    }
+                })?;
                 launch_stage_inner(state, None, None)?;
             }
             GateAction::LoopBack(_) => {
                 // D-18f: "I will fix it, then retry" — re-check deliberately,
                 // bounded by the ceiling above.
-                let _ = Gates::cleanup(project_root, state.phase, stage);
+                let _ = close_gate(project_root, state.phase, stage);
                 launch_stage(state, None, None)?;
             }
             GateAction::Abort(reason) => abort(project_root, state, &reason)?,
@@ -1459,9 +1476,10 @@ pub(crate) fn run_preflight(
     // happened under the old binary has an unobserved set, and letting a
     // later loop-back or relaunched evaluation record it would bless
     // whatever the agent had already written by then.
-    if stage == Stage::Code && state.checkpoint_approval == CheckpointApproval::Pending {
-        record_checkpoint_set_for_code_evaluation(state)?;
-        workflow::save_state(state)?;
+    if stage == Stage::Code
+        && let Some(approval) = approval_for_code_evaluation(state)
+    {
+        commit(state, |s| fill_pending_approval(s, approval))?;
     }
 
     // Preflight passed: reset the retry counter, persisted (the wedge this
@@ -1470,8 +1488,7 @@ pub(crate) fn run_preflight(
     // passing preflight on an already-zero counter does not rewrite state
     // on every single launch.
     if state.preflight_retries != 0 {
-        state.preflight_retries = 0;
-        workflow::save_state(state)?;
+        commit(state, |s| s.preflight_retries = 0)?;
     }
     Ok(true)
 }
@@ -1480,6 +1497,9 @@ pub(crate) fn run_preflight(
 mod tests {
     use super::*;
     use crate::test_support::*;
+    use devflow_core::gates::Gates;
+    use devflow_core::test_support::preanswer_gate;
+    use devflow_core::workflow;
     // Named only by the recording assertions below; importing it at module
     // scope would be an unused import in a non-test build.
     use devflow_core::state::ApprovedCheckpoint;
@@ -1943,13 +1963,15 @@ mod tests {
         state.yes_ship = true;
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Ship);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
-        )
-        .unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Ship,
+            &serde_json::from_str(
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap(),
+        );
 
         let adapter = agents::driver_for(AgentKind::Claude);
         let should_continue = run_preflight(root, &mut state, adapter.as_ref()).unwrap();
@@ -2103,13 +2125,15 @@ mod tests {
         state.stage = Stage::Define;
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Define);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
-        )
-        .unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Define,
+            &serde_json::from_str(
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap(),
+        );
 
         let adapter = agents::driver_for(AgentKind::Codex);
         let should_continue = run_preflight(root, &mut state, adapter.as_ref()).unwrap();
@@ -2148,13 +2172,15 @@ mod tests {
         state.stage = Stage::Plan;
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Plan);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
-        )
-        .unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Plan,
+            &serde_json::from_str(
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap(),
+        );
 
         let should_continue = run_preflight(root, &mut state, &AlwaysFailAdapter).unwrap();
 
@@ -2209,9 +2235,12 @@ mod tests {
         state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Plan);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(&response_path, r#"{"approved":true,"responded_by":"test"}"#).unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Plan,
+            &serde_json::from_str(r#"{"approved":true,"responded_by":"test"}"#).unwrap(),
+        );
 
         let adapter = FailOnceAdapter::new();
         let preflight = run_preflight(root, &mut state, &adapter);
@@ -2282,13 +2311,13 @@ mod tests {
         state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Plan);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":false,"note":"retry","responded_by":"test"}"#,
-        )
-        .unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Plan,
+            &serde_json::from_str(r#"{"approved":false,"note":"retry","responded_by":"test"}"#)
+                .unwrap(),
+        );
 
         let adapter = FailOnceAdapter::new();
         let preflight = run_preflight(root, &mut state, &adapter);
@@ -2396,9 +2425,12 @@ mod tests {
         state.stage = Stage::Define;
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Define);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(&response_path, r#"{"approved":true,"responded_by":"test"}"#).unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Define,
+            &serde_json::from_str(r#"{"approved":true,"responded_by":"test"}"#).unwrap(),
+        );
 
         let result = run_preflight(root, &mut state, &AlwaysFailAdapter);
 
@@ -2451,7 +2483,7 @@ mod tests {
     /// separately. `state.preflight_retries` starts one below the ceiling —
     /// exercising the bound via a REAL recursive `run_preflight` call
     /// (through `launch_stage`) rather than simulating multiple cycles: with
-    /// only ONE gate response ever seeded, and `Gates::poll_response`
+    /// only ONE gate response ever seeded, and the gate wait
     /// blocking synchronously in this same thread, nothing could seed a
     /// SECOND response file mid-recursion inside one call stack — deferring
     /// to the ceiling on the very next cycle instead genuinely exercises
@@ -2483,13 +2515,13 @@ mod tests {
         state.preflight_retries = mode::MAX_PREFLIGHT_RETRIES - 1;
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Define);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":false,"note":"retry","responded_by":"test"}"#,
-        )
-        .unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Define,
+            &serde_json::from_str(r#"{"approved":false,"note":"retry","responded_by":"test"}"#)
+                .unwrap(),
+        );
 
         let result = run_preflight(root, &mut state, &AlwaysFailAdapter);
 
@@ -2746,9 +2778,12 @@ mod tests {
         approve_state.canary = Some(devflow_core::canary::CanaryOutcome::Confirmed);
         workflow::save_state(&approve_state).unwrap();
 
-        let response_path = Gates::response_path(approve_root, approve_phase, Stage::Code);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(&response_path, r#"{"approved":true,"responded_by":"test"}"#).unwrap();
+        preanswer_gate(
+            approve_root,
+            approve_phase,
+            Stage::Code,
+            &serde_json::from_str(r#"{"approved":true,"responded_by":"test"}"#).unwrap(),
+        );
 
         let approve_result = run_preflight(
             approve_root,
@@ -2814,14 +2849,16 @@ mod tests {
         loopback_state.canary = Some(devflow_core::canary::CanaryOutcome::Confirmed);
         workflow::save_state(&loopback_state).unwrap();
 
-        let loopback_response = Gates::response_path(loopback_root, loopback_phase, Stage::Code);
-        std::fs::create_dir_all(loopback_response.parent().unwrap()).unwrap();
         // Not approved, and the note does NOT say "abort" — LoopBack.
-        std::fs::write(
-            &loopback_response,
-            r#"{"approved":false,"note":"I will fix the plan first","responded_by":"test"}"#,
-        )
-        .unwrap();
+        preanswer_gate(
+            loopback_root,
+            loopback_phase,
+            Stage::Code,
+            &serde_json::from_str(
+                r#"{"approved":false,"note":"I will fix the plan first","responded_by":"test"}"#,
+            )
+            .unwrap(),
+        );
 
         // SAFETY: serialized under ENV_MUTEX (the guard is still held).
         unsafe {
@@ -2842,7 +2879,7 @@ mod tests {
         }
 
         // The terminus is deliberately NOT asserted as Ok. LoopBack re-enters
-        // `run_preflight`, which refuses again; its own `Gates::cleanup` has
+        // `run_preflight`, which refuses again; its own `Gates::close` has
         // removed the one seeded response, so the next cycle's gate reaches
         // the bounded 2s timeout and that Err propagates. Which terminus the
         // recursion reaches is `run_preflight_loopback_bounds_recursion`'s
@@ -2942,9 +2979,12 @@ mod tests {
         assert_eq!(state.checkpoint_approval, CheckpointApproval::Pending);
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Code);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(&response_path, r#"{"approved":true,"responded_by":"test"}"#).unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Code,
+            &serde_json::from_str(r#"{"approved":true,"responded_by":"test"}"#).unwrap(),
+        );
 
         let adapter = FailOnceAdapter::new();
         let approved = run_preflight(root, &mut state, &adapter);
@@ -3030,9 +3070,12 @@ mod tests {
         state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, stage);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(&response_path, r#"{"approved":true,"responded_by":"test"}"#).unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            stage,
+            &serde_json::from_str(r#"{"approved":true,"responded_by":"test"}"#).unwrap(),
+        );
 
         let adapter = FailOnceAdapter::new();
         let result = run_preflight(root, &mut state, &adapter);
@@ -3136,16 +3179,15 @@ mod tests {
         refusal_state.canary = Some(devflow_core::canary::CanaryOutcome::Confirmed);
         workflow::save_state(&refusal_state).unwrap();
 
-        let refusal_response = Gates::response_path(refusal_root, refusal_phase, Stage::Code);
-        std::fs::create_dir_all(refusal_response.parent().unwrap()).unwrap();
         // APPROVED — the strongest answer a human can give. Even this must not
         // upgrade an Unrecorded set: nobody ever observed what this run's Code
         // stage started from, so there is no set to approve.
-        std::fs::write(
-            &refusal_response,
-            r#"{"approved":true,"responded_by":"test"}"#,
-        )
-        .unwrap();
+        preanswer_gate(
+            refusal_root,
+            refusal_phase,
+            Stage::Code,
+            &serde_json::from_str(r#"{"approved":true,"responded_by":"test"}"#).unwrap(),
+        );
 
         // No second `env_lock()` here: this test already holds it from its
         // first line, and the mutex is not reentrant — re-acquiring it
@@ -4694,5 +4736,32 @@ mod tests {
             );
             assert!(!reason.contains("never starts"), "{reason}");
         }
+    }
+
+    /// D-08: a failing preflight increments the retry counter on disk, not the
+    /// caller's copy. The state is read while the handler is held at its gate, because
+    /// the abort that ends the test clears the file.
+    #[test]
+    fn a_preflight_retry_counter_commits_on_the_re_read_state() {
+        const NAME: &str =
+            "preflight::tests::a_preflight_retry_counter_commits_on_the_re_read_state";
+        enter_path_isolated_child!(NAME, agent_free_git_only_path_dir());
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(63);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Plan;
+        workflow::save_state(&state).unwrap();
+        workflow::update_state(root, phase, |on_disk| {
+            on_disk.preflight_retries = 1;
+            Ok::<(), workflow::WorkflowError>(())
+        })
+        .unwrap();
+
+        let on_disk = state_on_disk_at_gate(root, phase, Stage::Plan, || {
+            run_preflight(root, &mut state, &AlwaysFailAdapter).unwrap();
+        });
+
+        assert_eq!(on_disk.preflight_retries, 2);
     }
 }

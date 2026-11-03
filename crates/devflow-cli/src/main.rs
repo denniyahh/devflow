@@ -163,6 +163,9 @@ enum Command {
         /// Per-launch id the launcher waits to see in this supervisor's ping reply.
         #[arg(long)]
         launch_id: String,
+        /// The inherited descriptor holding this launch's liveness lock.
+        #[arg(long)]
+        liveness_fd: Option<i32>,
         /// Adapter env var NAME to re-apply to the agent (repeatable; the value stays off argv).
         #[arg(long = "keep-env")]
         keep_env: Vec<String>,
@@ -336,16 +339,18 @@ enum Command {
     ///
     /// A second, out-of-process trigger of the SAME terminal effect
     /// (`finish_workflow`) the live poll loop would have run (20e, D-01) —
-    /// requires `state.stage == Stage::Ship` and an existing Ship gate
-    /// request+response pair with no prior ack; `--force` never skips an
-    /// earlier stage, the lock, or those existence checks (D-02).
+    /// requires `state.stage == Stage::Ship` and an open Ship gate holding an
+    /// answer bound to it, not yet claimed; `--force` never skips an earlier
+    /// stage, the foreground holder, the refusal while a supervisor of the
+    /// phase is live, the answer claim, or those existence checks (D-02).
     Ship {
         /// Phase to ship.
         #[arg(long)]
         phase: PhaseId,
         /// Accepted for explicit, auditable operator intent. Does NOT skip
-        /// the stage, lock, gate-existence, or ack checks (D-02) — see
-        /// `pipeline_gate::ship_override`'s doc comment for exact scope.
+        /// the stage, holder, live-supervisor, gate-existence, or answer-claim
+        /// checks (D-02) — see `pipeline_gate::ship_override`'s doc comment for
+        /// exact scope.
         #[arg(long)]
         force: bool,
         /// Project root.
@@ -353,9 +358,12 @@ enum Command {
         project: PathBuf,
     },
     /// End a running phase cleanly: answers its open gate with a rejection
-    /// when a live waiter holds it; otherwise addresses the run's supervisor
-    /// socket — `shutdown` when ALIVE, the guarded backstop when STALE, the
-    /// per-phase lock holder when GONE. `--launch <id>` tears down only the
+    /// when a live waiter holds it (a Ship gate with no waiter stores the
+    /// rejection for `devflow ship`); otherwise addresses the run's supervisor
+    /// socket — `shutdown` when ALIVE, the guarded backstop when STALE. When
+    /// no socket answers, it signals the phase's foreground holder (a `start`
+    /// or `resume` before its spawn, `devflow ship`, a hand-run `advance`)
+    /// once its identity is confirmed. `--launch <id>` tears down only the
     /// socket with that launch id (the form `devflow doctor` prints for an
     /// orphan). Never signals a pid recorded in state. Idempotent: safe to
     /// run against an already-stopped, never-started, or already-dead
@@ -365,7 +373,7 @@ enum Command {
         #[arg(long)]
         phase: PhaseId,
         /// Tear down only the supervisor socket with this launch id; answers
-        /// no gate, signals no lock holder and writes no state.
+        /// no gate, signals no holder and writes no state.
         #[arg(long)]
         launch: Option<String>,
         /// Project root. Overrides the positional argument when supplied.
@@ -427,6 +435,10 @@ enum GateCmd {
         /// Optional free-text note recorded with the approval.
         #[arg(long)]
         note: Option<String>,
+        /// The gate id `gate list` showed. Without it the command answers the
+        /// gate open now; with it, a gate opened since is refused.
+        #[arg(long = "gate-id")]
+        gate_id: Option<String>,
         /// Project root.
         #[arg(long, default_value = ".")]
         project: PathBuf,
@@ -451,6 +463,10 @@ enum GateCmd {
         /// the phase instead of looping back to Code).
         #[arg(long)]
         note: String,
+        /// The gate id `gate list` showed. Without it the command answers the
+        /// gate open now; with it, a gate opened since is refused.
+        #[arg(long = "gate-id")]
+        gate_id: Option<String>,
         /// Project root.
         #[arg(long, default_value = ".")]
         project: PathBuf,
@@ -492,14 +508,15 @@ enum GateCmd {
         root: Option<PathBuf>,
         /// Also discover and clear devflow 2.x processes shaped like a
         /// monitor wrapper or an `advance` child (999.44), by scanning the OS
-        /// process table directly rather than trusting a lock file the
+        /// process table directly rather than trusting a record the
         /// process itself wrote. Both shapes are 2.x only: a 3.x binary
         /// starts neither, so this never matches a 3.x supervisor, which
         /// `devflow doctor` reports through its socket and
         /// `devflow stop --phase N --launch <id>` ends. Matches only two
         /// structural argv shapes, owned by the calling user, older than the
         /// minimum age, and NOT named by any registered root's state file or
-        /// lock file (CR-01, 25-15) — a pid a live registry entry still
+        /// held by one of its live liveness, gate-registration or foreground-holder files
+        /// (CR-01, 25-15) — a pid a live registry entry still
         /// reaches is never touched. Discovery itself stays
         /// registry-independent, so this still catches a 2.x process whose
         /// project root no longer exists on disk (`devflow stop`/the default
@@ -603,7 +620,7 @@ fn run() -> Result<(), CliError> {
             project,
             phase,
             stage,
-        } => pipeline_launch::advance_for_stage(&project_root(project)?, phase, stage),
+        } => pipeline_launch::advance_command(&project_root(project)?, phase, stage),
         Command::Monitor {
             project,
             phase,
@@ -613,6 +630,7 @@ fn run() -> Result<(), CliError> {
             launch,
             socket,
             launch_id,
+            liveness_fd,
             keep_env,
             prompt_file,
             idle_timeout_secs,
@@ -627,6 +645,7 @@ fn run() -> Result<(), CliError> {
                 launch,
                 socket,
                 launch_id,
+                liveness_fd,
                 keep_env,
                 prompt_file,
                 idle_timeout_secs,
@@ -648,11 +667,12 @@ fn run() -> Result<(), CliError> {
                 legacy_project,
                 stage_option,
                 note,
+                gate_id,
                 project,
             } => {
                 let (stage, project) =
                     resolve_gate_target(stage, legacy_project, stage_option, project)?;
-                gate_respond(&project_root(project)?, phase, stage, true, note)
+                gate_respond(&project_root(project)?, phase, stage, true, note, gate_id)
             }
             GateCmd::Reject {
                 phase,
@@ -660,11 +680,19 @@ fn run() -> Result<(), CliError> {
                 legacy_project,
                 stage_option,
                 note,
+                gate_id,
                 project,
             } => {
                 let (stage, project) =
                     resolve_gate_target(stage, legacy_project, stage_option, project)?;
-                gate_respond(&project_root(project)?, phase, stage, false, Some(note))
+                gate_respond(
+                    &project_root(project)?,
+                    phase,
+                    stage,
+                    false,
+                    Some(note),
+                    gate_id,
+                )
             }
             GateCmd::Show {
                 phase,

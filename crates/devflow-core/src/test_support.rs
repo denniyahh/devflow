@@ -272,6 +272,84 @@ pub fn assert_child_ran_exactly_one_passing_test(output: &std::process::Output, 
     );
 }
 
+/// The answer files of a stage: keyed `.response.json` files and the legacy
+/// unkeyed response, sorted. Not quarantine, gate, claim or waiter files.
+pub fn gate_answer_files(
+    root: &std::path::Path,
+    phase: crate::phase_id::PhaseId,
+    stage: crate::stage::Stage,
+) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(crate::gates::Gates::dir(root)) else {
+        return Vec::new();
+    };
+    let prefix = format!("{}-{stage}.", phase.padded());
+    let mut files: Vec<std::path::PathBuf> = entries
+        .map(|entry| entry.expect("read a gates directory entry").path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .and_then(|name| name.strip_prefix(&prefix))
+                .is_some_and(|rest| rest == "response.json" || rest.ends_with(".response.json"))
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// Answer a gate that has not opened yet: the next gate opened at this stage gets
+/// `response` as its answer. Only for tests whose subject is what an answer leads
+/// to, never for the binding itself.
+pub fn preanswer_gate(
+    root: &std::path::Path,
+    phase: crate::phase_id::PhaseId,
+    stage: crate::stage::Stage,
+    response: &crate::gates::GateResponse,
+) {
+    crate::workflow::ensure_devflow_dir(&crate::gates::Gates::dir(root))
+        .expect("create the gates directory");
+    let body = serde_json::to_string_pretty(response).expect("serialize the response");
+    let path = crate::gates::Gates::preanswer_path(root, phase, stage);
+    crate::durable::replace_durably(&path, body.as_bytes()).expect("write the pre-answer");
+}
+
+/// Answer the gate the gate file names, as a human answering the gate they see.
+///
+/// # Errors
+/// [`crate::gates::GateError::NoOpenGate`] with no gate file, or whatever
+/// [`crate::gates::Gates::answer`] returns.
+pub fn answer_open_gate(
+    root: &std::path::Path,
+    phase: crate::phase_id::PhaseId,
+    stage: crate::stage::Stage,
+    response: &crate::gates::GateResponse,
+) -> Result<std::path::PathBuf, crate::gates::GateError> {
+    let Some(live) = crate::gates::Gates::current_gate_id(root, phase, stage)? else {
+        return Err(crate::gates::GateError::NoOpenGate { phase, stage });
+    };
+    let gate = crate::gates::GateId::parse(&live)?;
+    crate::gates::Gates::answer(root, phase, stage, &gate, response)
+}
+
+/// Run `body` with `hook` installed for this thread, to run once inside the first
+/// answer `body` publishes, after its id check and before its publish. That is the
+/// only point at which a gate can close under a writer's publish, so a CLI test of how
+/// a writer reports `GateClosedAfterPublish` installs it here; a hook run before
+/// `Gates::answer` yields `GateIdMismatch` instead. No gate lock is held when it runs,
+/// so it may close and open gates. A hook `body` never reached is dropped unrun.
+pub fn with_answer_before_publish<R>(hook: impl FnOnce() + 'static, body: impl FnOnce() -> R) -> R {
+    /// Clears the slot however `body` ends, so a later answer on this thread runs
+    /// no hook.
+    struct ClearOnDrop;
+    impl Drop for ClearOnDrop {
+        fn drop(&mut self) {
+            crate::gates::set_answer_publish_hook(None);
+        }
+    }
+    crate::gates::set_answer_publish_hook(Some(Box::new(hook)));
+    let _clear = ClearOnDrop;
+    body()
+}
+
 // ## Why there is no in-process absent-`git` harness in THIS crate
 //
 // 35-01 planned one empty-`PATH` guard per crate, so that criterion 6's tests
@@ -325,6 +403,161 @@ pub fn assert_child_ran_exactly_one_passing_test(output: &std::process::Output, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gates::{AnswerRead, GateError, GateFile, GateId, GateResponse, Gates};
+    use crate::phase_id::PhaseId;
+    use crate::stage::Stage;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    const PHASE: PhaseId = PhaseId::new(7);
+    const STAGE: Stage = Stage::Code;
+
+    fn approved() -> GateResponse {
+        GateResponse {
+            approved: true,
+            note: None,
+            responded_by: Some("human".into()),
+        }
+    }
+
+    fn live_gate(root: &std::path::Path) -> GateId {
+        let body = std::fs::read_to_string(Gates::gate_path(root, PHASE, STAGE)).unwrap();
+        GateId::parse(&serde_json::from_str::<GateFile>(&body).unwrap().gate_id).unwrap()
+    }
+
+    fn close_and_open(root: &std::path::Path) {
+        Gates::close(root, PHASE, STAGE).unwrap();
+        Gates::open_gate(root, PHASE, STAGE, "next").unwrap();
+    }
+
+    #[test]
+    fn with_answer_before_publish_runs_between_the_check_and_the_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = Gates::open_gate(dir.path(), PHASE, STAGE, "first")
+            .unwrap()
+            .gate_id;
+        let root = dir.path().to_path_buf();
+        let runs = Rc::new(Cell::new(0));
+        let hook_runs = runs.clone();
+
+        let refused = with_answer_before_publish(
+            move || {
+                hook_runs.set(hook_runs.get() + 1);
+                close_and_open(&root);
+            },
+            || Gates::answer(dir.path(), PHASE, STAGE, &first, &approved()),
+        );
+
+        assert!(
+            matches!(
+                &refused,
+                Err(GateError::GateClosedAfterPublish { observed, .. }) if observed == first.as_str()
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(runs.get(), 1);
+        assert_eq!(
+            Gates::read_answer(dir.path(), PHASE, STAGE, &live_gate(dir.path())),
+            AnswerRead::None,
+            "a late answer never decides the next gate"
+        );
+
+        // The control: run just before `answer`, the same step fails its id check,
+        // so the hook above ran after that check.
+        let before = tempfile::tempdir().unwrap();
+        let observed = Gates::open_gate(before.path(), PHASE, STAGE, "first")
+            .unwrap()
+            .gate_id;
+        close_and_open(before.path());
+        let refused = Gates::answer(before.path(), PHASE, STAGE, &observed, &approved());
+        assert!(
+            matches!(&refused, Err(GateError::GateIdMismatch { .. })),
+            "{refused:?}"
+        );
+    }
+
+    #[test]
+    fn with_answer_before_publish_runs_its_hook_once_and_never_after_its_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = Gates::open_gate(dir.path(), PHASE, STAGE, "ctx")
+            .unwrap()
+            .gate_id;
+        let runs = Rc::new(Cell::new(0));
+        let counted = |runs: &Rc<Cell<i32>>| {
+            let runs = runs.clone();
+            move || runs.set(runs.get() + 1)
+        };
+
+        with_answer_before_publish(counted(&runs), || ());
+        Gates::answer(dir.path(), PHASE, STAGE, &gate, &approved()).unwrap();
+        assert_eq!(runs.get(), 0, "an answer after the body runs no hook");
+
+        with_answer_before_publish(counted(&runs), || {
+            let again = Gates::answer(dir.path(), PHASE, STAGE, &gate, &approved());
+            assert!(matches!(again, Err(GateError::AlreadyResponded { .. })));
+            let once_more = Gates::answer(dir.path(), PHASE, STAGE, &gate, &approved());
+            assert!(matches!(once_more, Err(GateError::AlreadyResponded { .. })));
+        });
+        assert_eq!(runs.get(), 1, "the hook runs once");
+    }
+
+    /// `stop` publishes through `reap_answer`, so the hook runs there too (R2-04).
+    #[test]
+    fn with_answer_before_publish_also_runs_inside_reap_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = Gates::open_gate(dir.path(), PHASE, STAGE, "ctx")
+            .unwrap()
+            .gate_id;
+        let runs = Rc::new(Cell::new(0));
+        let hook_runs = runs.clone();
+
+        with_answer_before_publish(
+            move || hook_runs.set(hook_runs.get() + 1),
+            || Gates::reap_answer(dir.path(), PHASE, STAGE, &gate, "abort", "stop").unwrap(),
+        );
+
+        assert_eq!(runs.get(), 1);
+    }
+
+    #[test]
+    fn gate_answer_files_lists_keyed_and_legacy_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = Gates::open_gate(dir.path(), PHASE, STAGE, "ctx")
+            .unwrap()
+            .gate_id;
+        let keyed = Gates::answer(dir.path(), PHASE, STAGE, &gate, &approved()).unwrap();
+        let legacy = Gates::dir(dir.path()).join("07-code.response.json");
+        std::fs::write(&legacy, "{}").unwrap();
+        Gates::claim(dir.path(), PHASE, STAGE, &gate).unwrap();
+        let _registration = Gates::register_waiter(dir.path(), PHASE, STAGE, &gate).unwrap();
+        let gates_dir = Gates::dir(dir.path());
+        std::fs::write(gates_dir.join("07-code.noid.1.2.0.quarantined.json"), "{}").unwrap();
+        std::fs::write(gates_dir.join("07-validate.response.json"), "{}").unwrap();
+
+        let mut expected = vec![keyed, legacy];
+        expected.sort();
+        assert_eq!(gate_answer_files(dir.path(), PHASE, STAGE), expected);
+    }
+
+    #[test]
+    fn answer_open_gate_answers_the_live_gate_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let refused = answer_open_gate(dir.path(), PHASE, STAGE, &approved());
+        assert!(
+            matches!(&refused, Err(GateError::NoOpenGate { .. })),
+            "{refused:?}"
+        );
+
+        Gates::write_gate(dir.path(), PHASE, STAGE, "ctx").unwrap();
+        let live = live_gate(dir.path());
+        let path = answer_open_gate(dir.path(), PHASE, STAGE, &approved()).unwrap();
+
+        assert_eq!(path, Gates::answer_path(dir.path(), PHASE, STAGE, &live));
+        assert!(matches!(
+            Gates::read_answer(dir.path(), PHASE, STAGE, &live),
+            AnswerRead::Bound(answer) if answer.response == approved()
+        ));
+    }
 
     #[test]
     fn child_with_an_empty_path_dir_cannot_spawn_git_while_the_parent_can() {

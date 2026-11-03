@@ -1,16 +1,15 @@
-//! File-based lock to prevent concurrent `devflow advance` invocations for
-//! the same phase.
+//! The short, project-wide checkout lock.
 //!
-//! Creates `.devflow/lock-{phase:02}` with the PID of the lock holder.
-//! Uses O_EXCL for atomic acquisition — if the file already exists,
-//! the lock is contended.
+//! [`acquire_project`] creates `.devflow/lock-project` with the holder's PID and
+//! serializes mutations of the primary checkout across concurrently finishing
+//! phases. It is held for seconds, never across a gate wait.
 //!
-//! The lock is scoped per-phase (not per-project): `advance()` holds it
-//! across a gate's multi-day blocking wait, and every phase run ends at a
-//! mandatory Ship gate, so a project-wide lock would starve `devflow
-//! parallel`'s sibling phases with no retry (CR-03, 13-REVIEW.md).
+//! There is no per-phase lock. A phase's state writes take
+//! `workflow::update_state`'s write lock, and whether its run is live is read from
+//! the supervisor socket, the launch reservation, the gate registration and D-17's
+//! per-phase holder file. [`remove_stale_locks`] also removes the `lock-NN` files
+//! an older binary left, by the same dead-holder rule.
 
-use crate::phase_id::PhaseId;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -36,69 +35,17 @@ pub enum LockError {
     Io(#[from] io::Error),
 }
 
-/// What a read-only inspection can establish about a phase lock's holder.
-///
-/// A [`Recycled`](Self::Recycled) PID is not a waiter: the lock file names a
-/// process instance that has exited, even though that numeric PID now belongs
-/// to another live process. [`Unconfirmable`](Self::Unconfirmable) remains
-/// conservatively waiter-like because the process exists but its identity
-/// cannot be established from the lock record and `/proc` together.
+/// What a lock record establishes about its holder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HolderStatus {
-    /// No readable lock record names a currently running process.
+enum HolderClass {
+    /// No running process has the recorded pid.
     NoHolder,
     /// A running process matches both recorded halves of its identity.
-    Live { pid: u32 },
+    Live,
     /// A running process has reused the recorded PID with a different start time.
-    Recycled { pid: u32 },
+    Recycled,
     /// A process is running but its identity cannot be checked safely.
-    Unconfirmable { pid: u32 },
-}
-
-impl HolderStatus {
-    /// Whether this status may still describe a process waiting on a gate.
-    ///
-    /// Command responses can treat [`Recycled`](Self::Recycled) as no waiter,
-    /// while destructive recovery must still use lock acquisition instead of
-    /// this observational result to serialize any cleanup.
-    pub fn may_be_waiting(self) -> bool {
-        match self {
-            Self::NoHolder | Self::Recycled { .. } => false,
-            Self::Live { .. } | Self::Unconfirmable { .. } => true,
-        }
-    }
-}
-
-/// Acquire an exclusive lock for the given project root and phase.
-///
-/// Writes the current PID into `.devflow/lock-{phase:02}`. Returns a guard
-/// that releases the lock when dropped.
-pub fn acquire(project_root: &Path, phase: PhaseId) -> Result<LockGuard, LockError> {
-    acquire_path(lock_path(project_root, phase))
-}
-
-/// Blocking variant of [`acquire`]: waits out a live phase-lock holder,
-/// retrying acquisition so a stale lock is reclaimed by [`acquire`].
-pub fn acquire_blocking(
-    project_root: &Path,
-    phase: PhaseId,
-    timeout: std::time::Duration,
-) -> Result<LockGuard, LockError> {
-    let start = std::time::Instant::now();
-    let mut backoff = std::time::Duration::from_millis(100);
-    loop {
-        match acquire(project_root, phase) {
-            Ok(guard) => return Ok(guard),
-            Err(err @ LockError::Contended { .. }) => {
-                if start.elapsed() >= timeout {
-                    return Err(err);
-                }
-                std::thread::sleep(backoff.min(timeout.saturating_sub(start.elapsed())));
-                backoff = (backoff * 2).min(std::time::Duration::from_secs(2));
-            }
-            Err(err) => return Err(err),
-        }
-    }
+    Unconfirmable,
 }
 
 /// Acquire the short-held, project-wide lock that serializes mutations of the
@@ -106,10 +53,8 @@ pub fn acquire_blocking(
 /// integration/cleanup) across concurrently finishing phases
 /// (13-DEFERRED-CR-03 fix shape #3).
 ///
-/// This is the second level of the two-level model: per-phase locks guard a
-/// phase's own advance (held across gate-days), while this coarse lock guards
-/// the shared git checkout and is held for seconds. It must NEVER be held
-/// across a gate wait.
+/// It guards the shared git checkout and is held for seconds. It must NEVER be
+/// held across a gate wait.
 pub fn acquire_project(project_root: &Path) -> Result<LockGuard, LockError> {
     acquire_path(project_lock_path(project_root))
 }
@@ -245,26 +190,25 @@ fn acquire_after_existing(
     let Some(record) = read_holder_record(&path) else {
         return Err(contended(path));
     };
-    // 999.128 (D-08): reclaim through the same holder classifier `holder_status`
-    // uses, so a live pid whose start time differs from the recorded one (the
+    // 999.128 (D-08): a live pid whose start time differs from the recorded one (the
     // recorded holder exited and its pid was reused) counts as stale. Only an
-    // identity-confirmed live holder, or one whose identity cannot be checked,
-    // keeps the lock.
+    // identity-confirmed live holder, or one whose identity cannot be checked, keeps
+    // the lock.
     let is_running = crate::agent::agent_running(record.pid);
     let observed_start_time = crate::agent::process_start_time(record.pid);
+    let pid = record.pid;
     match classify_holder_record(record, is_running, observed_start_time) {
-        HolderStatus::Live { .. } | HolderStatus::Unconfirmable { .. } => {
+        HolderClass::Live | HolderClass::Unconfirmable => {
             return Err(LockError::Contended {
-                pid: record.pid.to_string(),
+                pid: pid.to_string(),
                 path,
             });
         }
-        HolderStatus::NoHolder => tracing::warn!(
-            "reclaiming stale devflow lock at {} (holder pid {} is not alive)",
+        HolderClass::NoHolder => tracing::warn!(
+            "reclaiming stale devflow lock at {} (holder pid {pid} is not alive)",
             path.display(),
-            record.pid
         ),
-        HolderStatus::Recycled { pid } => {
+        HolderClass::Recycled => {
             let show =
                 |start: Option<u64>| start.map_or_else(|| "unknown".into(), |s| s.to_string());
             tracing::warn!(
@@ -345,18 +289,6 @@ fn read_holder_pid(path: &Path) -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
-/// The holder's recorded start time, if the lock file carries one. `None`
-/// for a legacy single-line lock, or when the value is unparseable.
-fn read_holder_start_time(path: &Path) -> Option<u64> {
-    fs::read_to_string(path)
-        .ok()?
-        .lines()
-        .nth(1)?
-        .trim()
-        .parse::<u64>()
-        .ok()
-}
-
 #[derive(Debug, Clone, Copy)]
 struct HolderRecord {
     pid: u32,
@@ -364,10 +296,6 @@ struct HolderRecord {
 }
 
 /// Read a lock record without changing the file.
-///
-/// This parser belongs only to [`holder_status`]. Unlike [`holder`], status
-/// inspection must let doctor report empty and corrupt artifacts without
-/// deleting them.
 fn parse_holder_record(text: &str) -> Option<HolderRecord> {
     let mut lines = text.lines();
     let pid = lines.next()?.trim().parse::<u32>().ok()?;
@@ -386,67 +314,16 @@ fn classify_holder_record(
     record: HolderRecord,
     is_running: bool,
     observed_start_time: Option<u64>,
-) -> HolderStatus {
+) -> HolderClass {
     if !is_running {
-        return HolderStatus::NoHolder;
+        return HolderClass::NoHolder;
     }
 
     match (record.recorded_start_time, observed_start_time) {
-        (Some(recorded), Some(observed)) if recorded == observed => {
-            HolderStatus::Live { pid: record.pid }
-        }
-        (Some(_), Some(_)) => HolderStatus::Recycled { pid: record.pid },
-        _ => HolderStatus::Unconfirmable { pid: record.pid },
+        (Some(recorded), Some(observed)) if recorded == observed => HolderClass::Live,
+        (Some(_), Some(_)) => HolderClass::Recycled,
+        _ => HolderClass::Unconfirmable,
     }
-}
-
-/// Read the current phase lock without changing it and classify its holder.
-///
-/// Empty, unreadable, corrupt, and dead-holder records are all
-/// [`HolderStatus::NoHolder`]. A live PID is only [`HolderStatus::Live`] when
-/// the recorded start time matches the observed process start time; missing
-/// identity data is [`HolderStatus::Unconfirmable`] rather than an unsafe
-/// guess.
-pub fn holder_status(project_root: &Path, phase: PhaseId) -> HolderStatus {
-    let path = lock_path(project_root, phase);
-    let Some(record) = read_holder_record(&path) else {
-        return HolderStatus::NoHolder;
-    };
-    classify_holder_record(
-        record,
-        crate::agent::agent_running(record.pid),
-        crate::agent::process_start_time(record.pid),
-    )
-}
-
-/// The recorded identity of a phase lock's holder: its pid, and its start
-/// time when the lock records one.
-///
-/// Callers that intend to **signal** the holder must require the start time
-/// to be present and to match [`crate::agent::process_start_time`] for that
-/// pid. A `None` start time means the lock predates identity recording and
-/// the holder cannot be confirmed — refuse, do not guess.
-pub fn holder_identity(project_root: &Path, phase: PhaseId) -> Option<(u32, Option<u64>)> {
-    let path = lock_path(project_root, phase);
-    let pid = read_holder_pid(&path).parse::<u32>().ok()?;
-    Some((pid, read_holder_start_time(&path)))
-}
-
-/// Check whether a lock is currently held for this project/phase,
-/// returning the PID of the holder if the file exists.
-pub fn holder(project_root: &Path, phase: PhaseId) -> Option<(String, PathBuf)> {
-    let path = lock_path(project_root, phase);
-    // First line only: lock files now carry the holder's start time on line
-    // 2, and reading the whole file would yield "1234\n5678" as the "pid".
-    fs::read_to_string(&path).ok()?;
-    let pid = read_holder_pid(&path);
-    let pid = if pid == "unknown" { String::new() } else { pid };
-    if pid.is_empty() {
-        // Stale empty lock file — clean it up
-        let _ = fs::remove_file(&path);
-        return None;
-    }
-    Some((pid, path))
 }
 
 /// Release a lock by removing the lock file, ignoring errors
@@ -470,22 +347,14 @@ impl Drop for LockGuard {
     }
 }
 
-/// Filename prefix shared by every per-phase lock file. Owned here so
-/// sweepers (e.g. `recover --clean`) never hardcode the naming scheme.
-/// The project-wide checkout lock (`lock-project`) shares the prefix
-/// deliberately: the same stale-holder sweep covers it.
+/// Filename prefix of the checkout lock (`lock-project`) and of the `lock-NN` files an
+/// older binary left. Owned here so sweepers (e.g. `recover --clean`) never hardcode the
+/// naming scheme, and shared deliberately: the same stale-holder sweep covers both.
 const LOCK_FILE_PREFIX: &str = "lock-";
 
 pub(crate) enum StaleLockRemovalOutcome {
     Notice(String),
     Failure(String),
-}
-
-pub(crate) fn lock_path(project_root: &Path, phase: PhaseId) -> PathBuf {
-    project_root.join(".devflow").join(format!(
-        "{LOCK_FILE_PREFIX}{padded}",
-        padded = phase.padded()
-    ))
 }
 
 pub(crate) fn project_lock_path(project_root: &Path) -> PathBuf {
@@ -494,10 +363,10 @@ pub(crate) fn project_lock_path(project_root: &Path) -> PathBuf {
         .join(format!("{LOCK_FILE_PREFIX}project"))
 }
 
-/// Remove this project's per-phase lock files, skipping any whose recorded
-/// holder PID is still alive — deleting a live holder's lock would let a
-/// duplicate `advance` acquire it, after which the original holder's
-/// `LockGuard::Drop` deletes the NEW holder's file.
+/// Remove this project's `lock-*` files, skipping any whose recorded holder PID
+/// is still alive — deleting a live holder's checkout lock would let a second
+/// holder acquire it, after which the original holder's `LockGuard::Drop` deletes
+/// the NEW holder's file.
 ///
 /// Returns human-readable warnings for anything skipped or that failed to
 /// delete, so callers surface problems instead of reporting a clean sweep
@@ -575,14 +444,22 @@ pub(crate) fn remove_stale_locks_with_outcomes(
 mod tests {
     use super::*;
 
+    fn lock_in(dir: &Path) -> PathBuf {
+        project_lock_path(dir)
+    }
+
+    /// A pid the lock file names, read back through its first line.
+    fn recorded_pid(path: &Path) -> String {
+        read_holder_pid(path)
+    }
+
     #[test]
     fn acquire_creates_lock_and_records_pid() {
         let dir = tempfile::tempdir().unwrap();
-        let guard = acquire(dir.path(), PhaseId::new(1)).expect("acquire");
+        let guard = acquire_project(dir.path()).expect("acquire");
 
-        let (pid, path) = holder(dir.path(), PhaseId::new(1)).expect("holder present");
-        assert_eq!(pid, std::process::id().to_string());
-        assert!(path.exists());
+        let path = lock_in(dir.path());
+        assert_eq!(recorded_pid(&path), std::process::id().to_string());
         drop(guard);
     }
 
@@ -590,16 +467,16 @@ mod tests {
     fn acquire_creates_devflow_directory_when_absent() {
         let dir = tempfile::tempdir().unwrap();
         assert!(!dir.path().join(".devflow").exists());
-        let _guard = acquire(dir.path(), PhaseId::new(1)).expect("acquire");
+        let _guard = acquire_project(dir.path()).expect("acquire");
         assert!(dir.path().join(".devflow").exists());
     }
 
     #[test]
     fn second_acquire_is_contended() {
         let dir = tempfile::tempdir().unwrap();
-        let _guard = acquire(dir.path(), PhaseId::new(1)).expect("first acquire");
+        let _guard = acquire_project(dir.path()).expect("first acquire");
 
-        match acquire(dir.path(), PhaseId::new(1)) {
+        match acquire_project(dir.path()) {
             Err(LockError::Contended { pid, .. }) => {
                 assert_eq!(pid, std::process::id().to_string());
             }
@@ -608,33 +485,20 @@ mod tests {
         }
     }
 
-    /// CR-03 (13-REVIEW.md): the lock is scoped per-phase, so a different
-    /// phase in the same project must never contend on another phase's lock
-    /// — this is what lets `devflow parallel`'s sibling phases keep making
-    /// progress while one phase blocks on a multi-day gate wait.
-    #[test]
-    fn different_phases_do_not_contend() {
-        let dir = tempfile::tempdir().unwrap();
-        let _guard_a = acquire(dir.path(), PhaseId::new(1)).expect("acquire phase 1");
-        let _guard_b =
-            acquire(dir.path(), PhaseId::new(2)).expect("acquire phase 2 must not contend");
-    }
-
     #[test]
     fn dropping_guard_releases_lock() {
         let dir = tempfile::tempdir().unwrap();
-        let path = lock_path(dir.path(), PhaseId::new(1));
+        let path = lock_in(dir.path());
         {
-            let _guard = acquire(dir.path(), PhaseId::new(1)).expect("acquire");
-            assert!(holder(dir.path(), PhaseId::new(1)).is_some());
+            let _guard = acquire_project(dir.path()).expect("acquire");
+            assert!(path.exists());
         }
         // After the guard drops the lock file is gone and re-acquiring works.
         assert!(
             !path.exists(),
             "dropping the guard must remove the public lock path before another acquirer runs"
         );
-        assert!(holder(dir.path(), PhaseId::new(1)).is_none());
-        let _again = acquire(dir.path(), PhaseId::new(1)).expect("re-acquire after release");
+        let _again = acquire_project(dir.path()).expect("re-acquire after release");
     }
 
     /// Hold `path`'s coordination lock through a separate open file
@@ -655,20 +519,20 @@ mod tests {
     /// CI failure of `dropping_guard_releases_lock`: a child forked by another
     /// test thread while a guard was live kept a duplicate of the coordination
     /// fd, so the flock outlived the guard. With the public lock path already
-    /// removed, `acquire` reported `Contended { pid: "unknown" }` for a phase
+    /// removed, an acquire reported `Contended { pid: "unknown" }` for a lock
     /// nobody holds. A coordination hold with no lock record behind it is a
-    /// release in progress, and `acquire` must wait it out.
+    /// release in progress, and an acquire must wait it out.
     #[test]
     fn acquire_waits_out_a_coordination_hold_left_after_release() {
         let dir = tempfile::tempdir().unwrap();
-        let path = lock_path(dir.path(), PhaseId::new(1));
+        let path = lock_in(dir.path());
         let held = hold_coordination_elsewhere(&path);
         assert!(!path.exists(), "the public lock path must already be gone");
         let releaser = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(50));
             drop(held);
         });
-        let acquired = acquire(dir.path(), PhaseId::new(1));
+        let acquired = acquire_project(dir.path());
         releaser.join().unwrap();
         assert!(
             acquired.is_ok(),
@@ -681,10 +545,10 @@ mod tests {
     #[test]
     fn acquire_still_refuses_a_coordination_hold_that_does_not_end() {
         let dir = tempfile::tempdir().unwrap();
-        let path = lock_path(dir.path(), PhaseId::new(1));
+        let path = lock_in(dir.path());
         let _held = hold_coordination_elsewhere(&path);
         let started = std::time::Instant::now();
-        let refused = acquire(dir.path(), PhaseId::new(1));
+        let refused = acquire_project(dir.path());
         assert!(
             matches!(refused, Err(LockError::Contended { .. })),
             "a hold that never ends must still be contended, got {refused:?}"
@@ -697,33 +561,13 @@ mod tests {
     }
 
     #[test]
-    fn holder_is_none_without_lock_file() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(holder(dir.path(), PhaseId::new(1)).is_none());
-    }
-
-    #[test]
-    fn holder_cleans_up_empty_lock_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = lock_path(dir.path(), PhaseId::new(1));
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, "   \n").unwrap();
-
-        assert!(holder(dir.path(), PhaseId::new(1)).is_none());
-        // Empty/stale lock should be removed so a fresh acquire succeeds.
-        assert!(!path.exists());
-        let _guard = acquire(dir.path(), PhaseId::new(1)).expect("acquire after stale cleanup");
-    }
-
-    #[test]
     fn acquire_treats_an_empty_lock_record_as_contended_without_deleting_it() {
         let dir = tempfile::tempdir().unwrap();
-        let phase = PhaseId::new(1);
-        let path = lock_path(dir.path(), phase);
+        let path = lock_in(dir.path());
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, "").unwrap();
 
-        let err = acquire(dir.path(), phase)
+        let err = acquire_project(dir.path())
             .expect_err("an unreadable lock record must not be reclaimed");
         assert!(matches!(err, LockError::Contended { .. }));
         assert_eq!(fs::read(&path).unwrap(), b"");
@@ -732,8 +576,7 @@ mod tests {
     #[test]
     fn complete_record_publication_loses_cleanly_to_a_concurrent_acquirer() {
         let dir = tempfile::tempdir().unwrap();
-        let phase = PhaseId::new(1);
-        let path = lock_path(dir.path(), phase);
+        let path = lock_in(dir.path());
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let temp_ready = std::sync::Arc::new(std::sync::Barrier::new(2));
         let allow_publish = std::sync::Arc::new(std::sync::Barrier::new(2));
@@ -751,26 +594,20 @@ mod tests {
 
         temp_ready.wait();
         let guard =
-            acquire(dir.path(), phase).expect("second acquirer publishes the complete record");
+            acquire_project(dir.path()).expect("second acquirer publishes the complete record");
         allow_publish.wait();
         assert!(matches!(
             first.join().unwrap(),
             LockPublication::AlreadyExists
         ));
-        assert_eq!(
-            holder_status(dir.path(), phase),
-            HolderStatus::Live {
-                pid: std::process::id()
-            }
-        );
+        assert_eq!(recorded_pid(&path), std::process::id().to_string());
         drop(guard);
     }
 
     #[test]
     fn stale_reclaim_is_serialized_before_it_removes_the_lock_path() {
         let dir = tempfile::tempdir().unwrap();
-        let phase = PhaseId::new(1);
-        let path = lock_path(dir.path(), phase);
+        let path = lock_in(dir.path());
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, "9999999\n1").unwrap();
         let reclaim_ready = std::sync::Arc::new(std::sync::Barrier::new(2));
@@ -789,27 +626,21 @@ mod tests {
         });
 
         reclaim_ready.wait();
-        let second = acquire(dir.path(), phase).expect_err("second reclaimer must contend");
+        let second = acquire_project(dir.path()).expect_err("second reclaimer must contend");
         assert!(matches!(second, LockError::Contended { .. }));
         allow_reclaim.wait();
         let guard = first
             .join()
             .expect("first reclaimer thread")
             .expect("first reclaimer acquires the replacement lock");
-        assert_eq!(
-            holder_status(dir.path(), phase),
-            HolderStatus::Live {
-                pid: std::process::id()
-            }
-        );
+        assert_eq!(recorded_pid(&path), std::process::id().to_string());
         drop(guard);
     }
 
     #[test]
     fn stale_sweeper_keeps_a_dead_lock_while_reclaim_coordination_is_busy() {
         let dir = tempfile::tempdir().unwrap();
-        let phase = PhaseId::new(1);
-        let path = lock_path(dir.path(), phase);
+        let path = dir.path().join(".devflow/lock-01");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, "9999999\n1").unwrap();
         let coordination = acquire_coordination(&path).expect("hold reclaim coordination");
@@ -830,91 +661,21 @@ mod tests {
     }
 
     #[test]
-    fn holder_status_reports_no_holder_and_preserves_empty_lock_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let phase = PhaseId::new(1);
-        let path = lock_path(dir.path(), phase);
-
-        assert_eq!(holder_status(dir.path(), phase), HolderStatus::NoHolder);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-
-        fs::write(&path, "not-a-pid").unwrap();
-        assert_eq!(holder_status(dir.path(), phase), HolderStatus::NoHolder);
-
-        fs::write(&path, "9999999").unwrap();
-        assert_eq!(holder_status(dir.path(), phase), HolderStatus::NoHolder);
-
-        fs::write(&path, "   \n").unwrap();
-        assert_eq!(holder_status(dir.path(), phase), HolderStatus::NoHolder);
-        assert!(
-            path.exists(),
-            "holder status inspection must preserve an empty lock file"
-        );
-    }
-
-    #[test]
-    fn holder_status_reports_live_for_an_identity_matched_lock() {
-        let dir = tempfile::tempdir().unwrap();
-        let phase = PhaseId::new(1);
-        let _guard = acquire(dir.path(), phase).expect("acquire");
-
-        assert_eq!(
-            holder_status(dir.path(), phase),
-            HolderStatus::Live {
-                pid: std::process::id()
-            }
-        );
-    }
-
-    #[test]
-    fn holder_status_distinguishes_recycled_and_unconfirmable() {
-        let dir = tempfile::tempdir().unwrap();
-        let phase = PhaseId::new(1);
-        let path = lock_path(dir.path(), phase);
+    fn a_live_pid_without_an_observed_start_time_is_unconfirmable() {
         let pid = std::process::id();
-        let start = crate::agent::process_start_time(pid)
-            .expect("the test process must expose its start time");
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-
-        fs::write(&path, format!("{pid}\n{}", start.saturating_add(1))).unwrap();
+        let record = HolderRecord {
+            pid,
+            recorded_start_time: Some(1),
+        };
         assert_eq!(
-            holder_status(dir.path(), phase),
-            HolderStatus::Recycled { pid }
+            classify_holder_record(record, true, None),
+            HolderClass::Unconfirmable
         );
-
-        fs::write(&path, pid.to_string()).unwrap();
         assert_eq!(
-            holder_status(dir.path(), phase),
-            HolderStatus::Unconfirmable { pid }
+            classify_holder_record(record, false, None),
+            HolderClass::NoHolder,
+            "control: a pid not running has no holder, identity or not"
         );
-
-        fs::write(&path, format!("{pid}\nnot-a-start-time")).unwrap();
-        assert_eq!(
-            holder_status(dir.path(), phase),
-            HolderStatus::Unconfirmable { pid }
-        );
-
-        assert_eq!(
-            classify_holder_record(
-                HolderRecord {
-                    pid,
-                    recorded_start_time: Some(start),
-                },
-                true,
-                None,
-            ),
-            HolderStatus::Unconfirmable { pid },
-            "a live pid with an unavailable observed start time is unconfirmable"
-        );
-    }
-
-    #[test]
-    fn holder_status_may_be_waiting_only_for_live_and_unconfirmable() {
-        let pid = std::process::id();
-        assert!(!HolderStatus::NoHolder.may_be_waiting());
-        assert!(HolderStatus::Live { pid }.may_be_waiting());
-        assert!(!HolderStatus::Recycled { pid }.may_be_waiting());
-        assert!(HolderStatus::Unconfirmable { pid }.may_be_waiting());
     }
 
     /// 13-06 dogfood regression: a killed poller's abandoned lock wedged
@@ -923,14 +684,13 @@ mod tests {
     #[test]
     fn acquire_reclaims_lock_from_dead_holder() {
         let dir = tempfile::tempdir().unwrap();
-        let path = lock_path(dir.path(), PhaseId::new(1));
+        let path = lock_in(dir.path());
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         // Above default kernel pid_max (4194304) — guaranteed not alive.
         fs::write(&path, "9999999").unwrap();
 
-        let guard = acquire(dir.path(), PhaseId::new(1)).expect("stale lock must be reclaimed");
-        let (pid, _) = holder(dir.path(), PhaseId::new(1)).expect("holder present");
-        assert_eq!(pid, std::process::id().to_string());
+        let guard = acquire_project(dir.path()).expect("stale lock must be reclaimed");
+        assert_eq!(recorded_pid(&path), std::process::id().to_string());
         drop(guard);
     }
 
@@ -939,10 +699,9 @@ mod tests {
     /// observed start time of this process, and the lock path.
     fn write_own_pid_lock(
         dir: &Path,
-        phase: PhaseId,
         recorded_start: impl FnOnce(u64) -> Option<u64>,
     ) -> (u32, u64, PathBuf) {
-        let path = lock_path(dir, phase);
+        let path = lock_in(dir);
         let pid = std::process::id();
         let observed = crate::agent::process_start_time(pid)
             .expect("the test process must expose its start time");
@@ -961,18 +720,16 @@ mod tests {
     #[test]
     fn acquire_reclaims_a_lock_whose_live_pid_has_a_different_start_time() {
         let dir = tempfile::tempdir().unwrap();
-        let phase = PhaseId::new(1);
         let (pid, observed, path) =
-            write_own_pid_lock(dir.path(), phase, |start| Some(start.saturating_add(1)));
+            write_own_pid_lock(dir.path(), |start| Some(start.saturating_add(1)));
 
-        let guard = acquire(dir.path(), phase).expect("a recycled-pid lock must be reclaimed");
+        let guard = acquire_project(dir.path()).expect("a recycled-pid lock must be reclaimed");
 
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
             format!("{pid}\n{observed}"),
             "the reclaimed lock must name the caller with its real start time"
         );
-        assert_eq!(holder_status(dir.path(), phase), HolderStatus::Live { pid });
         drop(guard);
     }
 
@@ -981,11 +738,10 @@ mod tests {
     #[test]
     fn acquire_never_reclaims_a_live_holder_whose_start_time_matches() {
         let dir = tempfile::tempdir().unwrap();
-        let phase = PhaseId::new(1);
-        let (pid, _, path) = write_own_pid_lock(dir.path(), phase, Some);
+        let (pid, _, path) = write_own_pid_lock(dir.path(), Some);
         let before = fs::read(&path).unwrap();
 
-        let err = acquire(dir.path(), phase).expect_err("a live matched holder must contend");
+        let err = acquire_project(dir.path()).expect_err("a live matched holder must contend");
 
         match err {
             LockError::Contended { pid: holder, .. } => assert_eq!(holder, pid.to_string()),
@@ -1003,11 +759,10 @@ mod tests {
     #[test]
     fn acquire_never_reclaims_a_live_holder_with_no_recorded_start_time() {
         let dir = tempfile::tempdir().unwrap();
-        let phase = PhaseId::new(1);
-        let (pid, _, path) = write_own_pid_lock(dir.path(), phase, |_| None);
+        let (pid, _, path) = write_own_pid_lock(dir.path(), |_| None);
         let before = fs::read(&path).unwrap();
 
-        let err = acquire(dir.path(), phase).expect_err("an unconfirmable holder must contend");
+        let err = acquire_project(dir.path()).expect_err("an unconfirmable holder must contend");
 
         match err {
             LockError::Contended { pid: holder, .. } => assert_eq!(holder, pid.to_string()),
@@ -1023,24 +778,23 @@ mod tests {
     #[test]
     fn acquire_treats_a_corrupt_lock_record_as_contended_without_deleting_it() {
         let dir = tempfile::tempdir().unwrap();
-        let phase = PhaseId::new(1);
-        let path = lock_path(dir.path(), phase);
+        let path = lock_in(dir.path());
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, "not-a-pid").unwrap();
 
-        let err = acquire(dir.path(), phase).expect_err("corrupt lock must not be reclaimed");
+        let err = acquire_project(dir.path()).expect_err("corrupt lock must not be reclaimed");
         assert!(matches!(err, LockError::Contended { .. }));
         assert_eq!(fs::read(&path).unwrap(), b"not-a-pid");
     }
 
     /// `remove_stale_locks` must sweep dead-holder locks but never a live
-    /// holder's — deleting a held lock lets a duplicate advance acquire it,
+    /// holder's — deleting a held lock lets a duplicate holder acquire it,
     /// and the original guard's Drop then removes the new holder's file.
     #[test]
     fn remove_stale_locks_keeps_live_holder_and_sweeps_dead() {
         let dir = tempfile::tempdir().unwrap();
-        let live = lock_path(dir.path(), PhaseId::new(1));
-        let dead = lock_path(dir.path(), PhaseId::new(2));
+        let live = dir.path().join(".devflow/lock-01");
+        let dead = dir.path().join(".devflow/lock-02");
         fs::create_dir_all(live.parent().unwrap()).unwrap();
         fs::write(&live, std::process::id().to_string()).unwrap();
         fs::write(&dead, "9999999").unwrap();
@@ -1053,15 +807,28 @@ mod tests {
         assert!(warnings[0].contains("still alive"));
     }
 
-    /// Two-level locking (13-DEFERRED-CR-03): the coarse checkout lock is
-    /// independent of every per-phase lock — holding a phase's advance lock
-    /// (potentially for gate-days) must not block another phase's
-    /// seconds-long checkout mutation, and vice versa.
+    /// D-08: there is no per-phase lock any more, so the `lock-NN` an older binary left
+    /// (a dead pid, two lines) is only a stale file. `.state-NN.lock`, `.gates-NN.lock`
+    /// and `.holder-NN` share no prefix with it and stay.
     #[test]
-    fn project_lock_is_independent_of_phase_locks() {
+    fn a_leftover_phase_lock_file_is_removed_as_stale() {
         let dir = tempfile::tempdir().unwrap();
-        let _phase = acquire(dir.path(), PhaseId::new(1)).expect("phase lock");
-        let _project = acquire_project(dir.path()).expect("project lock must not contend");
+        let devflow = dir.path().join(".devflow");
+        fs::create_dir_all(&devflow).unwrap();
+        let leftover = devflow.join("lock-07");
+        fs::write(&leftover, "9999999\n1").unwrap();
+        let kept =
+            [".state-07.lock", ".gates-07.lock", ".holder-07"].map(|name| devflow.join(name));
+        for path in &kept {
+            fs::write(path, "9999999\n1").unwrap();
+        }
+
+        let warnings = remove_stale_locks(dir.path());
+
+        assert!(!leftover.exists(), "{warnings:?}");
+        for path in &kept {
+            assert!(path.exists(), "{} must stay", path.display());
+        }
     }
 
     #[test]
@@ -1105,35 +872,6 @@ mod tests {
         assert!(matches!(err, LockError::Contended { .. }));
     }
 
-    #[test]
-    fn phase_lock_blocking_waits_for_release() {
-        let dir = tempfile::tempdir().unwrap();
-        let phase = PhaseId::new(1);
-        let held = acquire(dir.path(), phase).expect("first acquire");
-        let root = dir.path().to_path_buf();
-
-        std::thread::scope(|scope| {
-            let waiter = scope
-                .spawn(move || acquire_blocking(&root, phase, std::time::Duration::from_secs(10)));
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            drop(held);
-            waiter
-                .join()
-                .expect("waiter thread")
-                .expect("blocking acquire must succeed once the holder releases");
-        });
-    }
-
-    #[test]
-    fn phase_lock_blocking_times_out_against_live_holder() {
-        let dir = tempfile::tempdir().unwrap();
-        let phase = PhaseId::new(1);
-        let _held = acquire(dir.path(), phase).expect("first acquire");
-        let err = acquire_blocking(dir.path(), phase, std::time::Duration::from_millis(300))
-            .expect_err("must time out while the live holder keeps the lock");
-        assert!(matches!(err, LockError::Contended { .. }));
-    }
-
     /// A lock file containing "0" parses as a valid u32, but `kill -0 0`
     /// probes the caller's own process group and always succeeds — the old
     /// subprocess-based check treated it as a live holder forever, wedging
@@ -1141,10 +879,10 @@ mod tests {
     #[test]
     fn acquire_reclaims_lock_with_pid_zero() {
         let dir = tempfile::tempdir().unwrap();
-        let path = lock_path(dir.path(), PhaseId::new(1));
+        let path = lock_in(dir.path());
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, "0").unwrap();
 
-        acquire(dir.path(), PhaseId::new(1)).expect("pid-0 lock must be reclaimed");
+        acquire_project(dir.path()).expect("pid-0 lock must be reclaimed");
     }
 }

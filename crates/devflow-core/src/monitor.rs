@@ -18,11 +18,12 @@ use crate::phase_id::PhaseId;
 use crate::stage::Stage;
 use crate::state::{AgentKind, State};
 use crate::supervisor::SocketPath;
-use crate::supervisor::runtime::{AgentOutcome, Supervisor};
+use crate::supervisor::runtime::{AgentGroupEnd, AgentOutcome, Supervisor};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, TryLockError, mpsc};
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -63,6 +64,15 @@ pub enum MonitorError {
     /// that never published its socket (it and what it started were ended).
     #[error("supervision shape not ready: {0}")]
     NotReady(String),
+    /// This launch's liveness lock could not be taken or adopted (D-01), so
+    /// the launch ended before any agent existed.
+    #[error("liveness lock of launch {launch_id}: {reason}")]
+    Liveness {
+        /// The launch's id, as it was given.
+        launch_id: String,
+        /// What went wrong.
+        reason: String,
+    },
 }
 
 /// Idle-timeout default in seconds (D-02): the measured constraint-8 floor.
@@ -383,6 +393,112 @@ pub(crate) fn strip_notify_env(child_cmd: &mut std::process::Command) {
     child_cmd.env_remove(crate::gates::GATE_NOTIFY_CMD_ENV);
 }
 
+/// A launch's reservation (D-01): the launch id, socket path and held liveness
+/// file a launcher creates before it spawns anything, so the launch can be
+/// recorded before its supervisor exists.
+///
+/// [`spawn_monitor`] uses this id and socket and passes the lock to the
+/// `__monitor` process at [`crate::liveness::INHERITED_FD`]. Drop the reservation
+/// only after the publish: dropping it is the only release of the launcher's
+/// copy, and the spawned supervisor keeps its own.
+#[derive(Debug)]
+pub struct Reservation {
+    launch_id: String,
+    socket: SocketPath,
+    liveness: crate::liveness::Hold,
+}
+
+impl Reservation {
+    /// Create a launch id for `state`'s phase and take its liveness lock under
+    /// the project's `.devflow/`.
+    ///
+    /// # Errors
+    /// The socket path does not fit, or the lock could not be taken.
+    pub fn new(ctx: &LaunchContext, state: &State) -> Result<Self, MonitorError> {
+        Self::for_phase(ctx, &state.project_root, state.phase)
+    }
+
+    /// [`Reservation::new`] for a launcher that has no state yet: it reserves
+    /// before it reads one (D-01).
+    ///
+    /// # Errors
+    /// The socket path does not fit, or the lock could not be taken.
+    pub fn for_phase(
+        ctx: &LaunchContext,
+        project_root: &Path,
+        phase: PhaseId,
+    ) -> Result<Self, MonitorError> {
+        let launch_id = crate::supervisor::new_launch_id();
+        let socket = SocketPath::for_launch(&ctx.cache_dir, project_root, phase, &launch_id)?;
+        let path = liveness_path_of(project_root, &launch_id)?;
+        let failed = |err: std::io::Error| liveness_error(&launch_id, err);
+        if let Some(dir) = path.parent() {
+            crate::workflow::ensure_devflow_dir(dir).map_err(failed)?;
+        }
+        let liveness = crate::liveness::Hold::take(&path).map_err(failed)?;
+        Ok(Self {
+            launch_id,
+            socket,
+            liveness,
+        })
+    }
+
+    /// The launch id the spawned supervisor will publish.
+    pub fn launch_id(&self) -> &str {
+        &self.launch_id
+    }
+
+    /// The socket the spawned supervisor will publish.
+    pub fn socket_path(&self) -> &Path {
+        self.socket.as_path()
+    }
+
+    /// The liveness file this reservation holds.
+    pub fn liveness_path(&self) -> &Path {
+        self.liveness.path()
+    }
+
+    /// This reservation as the record a launcher saves before it spawns.
+    pub fn pending_record(&self) -> crate::state::PendingSupervisor {
+        crate::state::PendingSupervisor::new(
+            self.launch_id.clone(),
+            self.socket_path().to_path_buf(),
+            self.liveness_path().to_path_buf(),
+        )
+    }
+
+    /// Give back a reservation nothing was spawned from: remove its liveness file,
+    /// then drop the hold. Never `unlock()`: only dropping releases the lock.
+    pub fn discard(self) {
+        if let Err(err) = std::fs::remove_file(self.liveness_path())
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(
+                "could not remove the liveness file {}: {err}",
+                self.liveness_path().display()
+            );
+        }
+    }
+}
+
+/// `launch_id`'s liveness file under `project_root`; an id that is not a launch
+/// id never builds a path.
+fn liveness_path_of(project_root: &Path, launch_id: &str) -> Result<PathBuf, MonitorError> {
+    crate::liveness::launch_liveness_path(project_root, launch_id).ok_or_else(|| {
+        MonitorError::Liveness {
+            launch_id: launch_id.to_string(),
+            reason: "not a launch id".to_string(),
+        }
+    })
+}
+
+fn liveness_error(launch_id: &str, err: std::io::Error) -> MonitorError {
+    MonitorError::Liveness {
+        launch_id: launch_id.to_string(),
+        reason: err.to_string(),
+    }
+}
+
 /// A supervisor [`spawn_monitor`] started and saw publish: the record the
 /// caller persists in [`State::supervisor`] and the supervisor's pid.
 #[non_exhaustive]
@@ -408,6 +524,10 @@ pub struct Published {
 /// `__monitor` process's environment and only their names on its argv
 /// (`--keep-env NAME`), so a value is never visible in the process table.
 ///
+/// The launch id and socket are `reservation`'s, and its liveness lock crosses
+/// the exec at [`crate::liveness::INHERITED_FD`], so the new process holds the
+/// lock from before it runs. The caller keeps `reservation` until the publish.
+///
 /// Returns only after the new supervisor answers a ping with this launch's
 /// id, through [`wait_for_publish`]. A supervisor that exits first, or does
 /// not publish within [`PUBLISH_WAIT`], is ended with what it started and
@@ -422,6 +542,7 @@ pub fn spawn_monitor(
     envs: &[(String, String)],
     launch: MonitorLaunch,
     ctx: &LaunchContext,
+    reservation: &Reservation,
 ) -> Result<Published, MonitorError> {
     let project_root = state
         .project_root
@@ -455,9 +576,8 @@ pub fn spawn_monitor(
         .unwrap_or(&state.project_root);
     let workdir = workdir_path.to_str().ok_or(MonitorError::NonUtf8Path)?;
 
-    let launch_id = crate::supervisor::new_launch_id();
-    let socket =
-        SocketPath::for_launch(&ctx.cache_dir, &state.project_root, state.phase, &launch_id)?;
+    let launch_id = reservation.launch_id.clone();
+    let socket = &reservation.socket;
     let socket_str = socket.as_path().to_str().ok_or(MonitorError::NonUtf8Path)?;
 
     let stream = match launch {
@@ -499,6 +619,7 @@ pub fn spawn_monitor(
         workdir,
         socket: socket_str,
         launch_id: &launch_id,
+        liveness_fd: Some(crate::liveness::INHERITED_FD),
         keep_env: &keep_env,
         stream: stream
             .as_ref()
@@ -515,6 +636,7 @@ pub fn spawn_monitor(
     let mut child_cmd = monitor_command(&ctx.exec, &binary, workdir_path, &monitor_argv)?;
     child_cmd.envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     strip_notify_env(&mut child_cmd);
+    crate::liveness::pass_to_child(&mut child_cmd, &reservation.liveness);
 
     // RESEARCH Finding 6: the supervisor leads its own process group, so it
     // never sits in the operator's shell job and a terminal Ctrl-C to a
@@ -528,7 +650,7 @@ pub fn spawn_monitor(
     let supervisor_pid = child.id();
     info!("monitor spawned with pid {supervisor_pid}; waiting for its socket");
 
-    let reply = wait_for_publish(&mut child, &socket, &launch_id, PUBLISH_WAIT)?;
+    let reply = wait_for_publish(&mut child, socket, &launch_id, PUBLISH_WAIT)?;
     info!(
         "supervisor {supervisor_pid} published {} ({})",
         socket.as_path().display(),
@@ -553,6 +675,9 @@ struct MonitorArgs<'a> {
     workdir: &'a str,
     socket: &'a str,
     launch_id: &'a str,
+    /// The descriptor number the `__monitor` process inherits its liveness
+    /// lock at.
+    liveness_fd: Option<std::os::fd::RawFd>,
     /// The adapter env NAMES the supervisor re-applies to the agent.
     keep_env: &'a [&'a str],
     /// The stream shape's prompt file and idle timeout in seconds; `None`
@@ -590,6 +715,10 @@ fn monitor_args(args: &MonitorArgs<'_>) -> Vec<String> {
     .iter()
     .map(ToString::to_string)
     .collect();
+    if let Some(fd) = args.liveness_fd {
+        argv.push("--liveness-fd".to_string());
+        argv.push(fd.to_string());
+    }
     for name in args.keep_env {
         argv.push("--keep-env".to_string());
         argv.push((*name).to_string());
@@ -1402,6 +1531,12 @@ pub struct StageSpec {
     pub socket: SocketPath,
     /// The per-launch id the sidecar records.
     pub launch_id: String,
+    /// The inherited per-launch liveness descriptor to adopt, if any.
+    pub liveness_fd: Option<std::os::fd::RawFd>,
+    /// How long, from serving, this supervisor may stay only pending before it reads
+    /// [`Promotion::OrphanedPending`]. `None` starts no watch, and
+    /// [`StageRun::promotion`] is `None`.
+    pub promotion_wait: Option<Duration>,
 }
 
 impl StageSpec {
@@ -1428,8 +1563,24 @@ impl StageSpec {
             io,
             socket,
             launch_id,
+            liveness_fd: None,
+            promotion_wait: None,
         }
     }
+}
+
+/// What a supervisor's promotion watch decided about its launch (D-15).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Promotion {
+    /// The state records this launch as its supervisor.
+    Recorded,
+    /// The state names this launch nowhere, or no readable state names it.
+    Superseded {
+        /// The launch the state records instead, if any.
+        recorded: Option<String>,
+    },
+    /// The wait passed with this launch still only pending: its promoter died.
+    OrphanedPending,
 }
 
 /// A supervised stage whose agent has exited.
@@ -1441,11 +1592,37 @@ pub struct StageRun {
     /// The still-published supervisor. The caller owns
     /// [`Supervisor::hand_off`] and [`Supervisor::finish`].
     pub supervisor: Supervisor,
+    /// The launch's liveness lock, when this process adopted one. The caller
+    /// keeps it until its last act.
+    pub liveness: Option<crate::liveness::Hold>,
+    /// The promotion watch's verdict: its last, so `Superseded` when a launch recorded
+    /// first was superseded while its agent ran. `None` when no watch ran
+    /// ([`StageSpec::promotion_wait`]), or a stop ended it before it had one.
+    pub promotion: Option<Promotion>,
+    /// What ending the agent's group did, when the promotion watch's verdict led it to
+    /// end the group (a verdict other than [`Promotion::Recorded`]).
+    pub agent_group_end: Option<AgentGroupEnd>,
 }
 
 /// How long [`confirm_own_group`] waits for a just-spawned agent's
 /// `setpgid` to become visible before it declares a mismatch.
 const PGID_SETTLE_WAIT: Duration = Duration::from_millis(100);
+
+/// How often the promotion watch reads the state, and looks for its agent's exit.
+const PROMOTION_POLL: Duration = Duration::from_millis(20);
+
+/// How often the watch reads the state once it records this launch. Slower than
+/// [`PROMOTION_POLL`] because each read loads the whole state file, for as long as the
+/// agent runs.
+const RECORDED_READ_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How long consecutive reads must find a recorded launch's state file absent before the
+/// watch believes it is gone. Something that renames the file away and back during a save
+/// reads as absent for a moment, and a false verdict would end a healthy agent.
+const STATE_GONE_CONFIRM_WAIT: Duration = Duration::from_secs(3);
+
+/// The least time between two warnings that a recorded launch's state does not confirm it.
+const RECORDED_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Supervise one stage's agent under an addressed [`Supervisor`], in either
 /// supervision shape, and return once the agent has exited.
@@ -1453,7 +1630,10 @@ const PGID_SETTLE_WAIT: Duration = Duration::from_millis(100);
 /// The order is the contract:
 /// 1. [`install_signal_pipe`](crate::supervisor::runtime::install_signal_pipe),
 ///    so SIGTERM and SIGINT to this process become stop events, never a
-///    death that orphans the agent (D-05, 999.134).
+///    death that orphans the agent (D-05, 999.134). Then adopt the inherited
+///    liveness descriptor ([`StageSpec::liveness_fd`]), which marks it
+///    close-on-exec, so the agent never inherits it (D-01). A failed adoption
+///    is [`MonitorError::Liveness`], before any agent exists.
 /// 2. Spawn the agent through `hermetic_command` (the adapter env re-applied
 ///    after its scrub, the gate notify command stripped) with
 ///    `process_group(0)`, then require that it leads its own process group
@@ -1471,17 +1651,58 @@ const PGID_SETTLE_WAIT: Duration = Duration::from_millis(100);
 ///    process it started still holds its stdout (WR-03). An idle-timeout
 ///    group kill is a natural outcome, `Completed(128 + n)` with the
 ///    idle-timeout verdict file, never a stop.
-/// 5. [`Supervisor::wait_agent`], then the exit file: the agent's code for
-///    [`AgentOutcome::Completed`], `143` for [`AgentOutcome::Stopped`]. For
+/// 5. When [`StageSpec::promotion_wait`] is set, a promotion watch has run since
+///    `serve` returned, beside the agent, so its deadline never waits for the
+///    agent (R-12). It reads the state every [`PROMOTION_POLL`] until it has a
+///    [`Promotion`] verdict: `Recorded` or `Superseded` at once, `OrphanedPending`
+///    when the wait has passed with this launch still only pending. A state file
+///    that is gone is `Superseded { recorded: None }` at once. Any other load error
+///    is retried, and still failing at the deadline ends the same way: no readable
+///    state names this launch. A `Superseded` or `OrphanedPending` verdict while the
+///    agent still runs ends the agent's group through
+///    `end_group_while_running` (the leader is unreaped, so the signal reaches only
+///    the agent's own group, R-13); the agent then exits as a stop. The deadline
+///    therefore runs from serving: an orphan whose agent never exits ends that agent
+///    at the deadline. A verdict reached after the agent exited signals nothing.
+///    After `Recorded` the watch keeps reading, every [`RECORDED_READ_INTERVAL`],
+///    until the agent's exit is observed, and that ends it with `Recorded`. A state
+///    that names another launch or none, or stays gone for
+///    [`STATE_GONE_CONFIRM_WAIT`] of consecutive reads, makes the verdict `Superseded`
+///    and ends the group the same way (SUPV-04). A state that does not load, or names this
+///    launch only as pending, ends nothing: neither says another launch owns the run, and
+///    a false verdict would kill a healthy agent, so the watch warns at most every
+///    [`RECORDED_WARN_INTERVAL`] and keeps reading. If the agent exits meanwhile, the
+///    ownership fence still refuses this supervisor's next guarded side effect. No
+///    healthy path changes the record while its agent runs: the supervisor's own advance
+///    writes it only after the agent has exited, and every launch route, a hand-run
+///    `devflow advance` and `devflow ship` refuse over a live supervisor. So only an
+///    operator's hand edit or a misread liveness probe reaches this.
+/// 6. [`Supervisor::wait_agent`], then wait for the watch's verdict, for
+///    [`StageRun::promotion`]. It ends by its deadline at the latest, and a watch past
+///    `Recorded` has ended at the agent's exit, after one last read that can only find it
+///    superseded. A stop ends the wait early: the run is over, and a
+///    stopped supervisor must not sit out the deadline before it answers. On every
+///    early return the watch is ended first, before the agent is reaped outside
+///    [`Supervisor::wait_agent`], so it can never act on a reaped leader's number
+///    (R-13).
+/// 7. The exit file: the agent's code for [`AgentOutcome::Completed`], `143` for
+///    [`AgentOutcome::Stopped`], and no write at all on a `Superseded` or
+///    `OrphanedPending` verdict (D-03). The file then says nothing about this launch, so
+///    `devflow logs --follow` waits for the next run's. A takeover after the last read is
+///    not seen here, and the ownership fence refuses what comes next. For
 ///    either outcome the stream threads are then waited for at most
 ///    [`READER_DRAIN_WAIT`]; at the bound the capture is closed, the
 ///    unfinished threads are detached (nothing is signalled), and the bound
 ///    is recorded as a `stream_wait_bounded` event.
 ///
 /// The caller owns [`Supervisor::hand_off`] and [`Supervisor::finish`], and
-/// advances only on [`AgentOutcome::Completed`].
+/// advances only on [`AgentOutcome::Completed`] with [`Promotion::Recorded`] when a
+/// watch ran.
 pub fn run_supervised_stage(spec: StageSpec) -> Result<StageRun, MonitorError> {
     crate::supervisor::runtime::install_signal_pipe()?;
+    let liveness = adopt_liveness(&spec)?;
+    #[cfg(any(test, feature = "test-support"))]
+    agent_spawn_test_hold(&spec);
 
     let stdout_file = crate::agent_result::stdout_path(&spec.project_root, spec.phase);
     let exit_file = crate::agent_result::exit_code_path(&spec.project_root, spec.phase);
@@ -1506,6 +1727,11 @@ pub fn run_supervised_stage(spec: StageSpec) -> Result<StageRun, MonitorError> {
     #[cfg(test)]
     monitor_test_hold("after_sidecar");
     let supervisor = Supervisor::serve_written(spec.socket.clone(), sidecar)?;
+    // Before the disarm, so a watch that cannot start still ends the agent's group.
+    let watch = spec
+        .promotion_wait
+        .map(|wait| PromotionWatch::start(&spec, wait, supervisor.token(), pid))
+        .transpose()?;
     let mut child = guard.disarm();
 
     let threads = match (&spec.io, stream_capture) {
@@ -1523,6 +1749,7 @@ pub fn run_supervised_stage(spec: StageSpec) -> Result<StageRun, MonitorError> {
             match driven {
                 Ok(threads) => Some(threads),
                 Err(err) => {
+                    drop(watch);
                     abandon_agent(&mut child);
                     return Err(err);
                 }
@@ -1534,6 +1761,7 @@ pub fn run_supervised_stage(spec: StageSpec) -> Result<StageRun, MonitorError> {
     let outcome = match supervisor.wait_agent(&mut child) {
         Ok(outcome) => outcome,
         Err(err) => {
+            drop(watch);
             abandon_agent(&mut child);
             return Err(err.into());
         }
@@ -1542,7 +1770,17 @@ pub fn run_supervised_stage(spec: StageSpec) -> Result<StageRun, MonitorError> {
         AgentOutcome::Completed(code) => code,
         AgentOutcome::Stopped => crate::supervisor::runtime::STOPPED_EXIT_CODE,
     };
-    std::fs::write(&exit_file, format!("{code}\n"))?;
+    // The verdict comes first: a supervisor the state does not record leaves the file to
+    // whichever run does (D-03).
+    let (promotion, agent_group_end) = watch
+        .map(|watch| watch.finish(&supervisor.token()))
+        .unwrap_or_default();
+    if !matches!(
+        promotion,
+        Some(Promotion::Superseded { .. } | Promotion::OrphanedPending)
+    ) {
+        std::fs::write(&exit_file, format!("{code}\n"))?;
+    }
     if let Some(threads) = threads {
         // Test-only (50-26): park here, after the exit file and before the
         // stream threads are waited for. Compiled out of release builds.
@@ -1557,7 +1795,217 @@ pub fn run_supervised_stage(spec: StageSpec) -> Result<StageRun, MonitorError> {
     Ok(StageRun {
         outcome,
         supervisor,
+        liveness,
+        promotion,
+        agent_group_end,
     })
+}
+
+/// The thread that decides a supervisor's [`Promotion`], beside its agent (R-12), and
+/// ends the agent's group on a verdict other than [`Promotion::Recorded`], including a
+/// later one while the agent runs. Dropping it tells the thread to quit and joins it.
+struct PromotionWatch {
+    quit: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<PromotionEnd>>,
+}
+
+/// The watch's verdict, and what ending the agent's group did, if it tried.
+type PromotionEnd = (Option<Promotion>, Option<AgentGroupEnd>);
+
+impl PromotionWatch {
+    /// Start the watch. `wait` runs from now, the moment the supervisor serves. `pgid` is
+    /// the agent's, confirmed as its group leader's pid before the supervisor served.
+    fn start(
+        spec: &StageSpec,
+        wait: Duration,
+        token: crate::supervisor::runtime::StopToken,
+        pgid: u32,
+    ) -> Result<Self, std::io::Error> {
+        let quit = Arc::new(AtomicBool::new(false));
+        let (project_root, phase, launch_id) = (
+            spec.project_root.clone(),
+            spec.phase,
+            spec.launch_id.clone(),
+        );
+        let thread_quit = Arc::clone(&quit);
+        let thread = std::thread::Builder::new()
+            .name("promotion-watch".to_string())
+            .spawn(move || {
+                let promotion =
+                    await_promotion(&project_root, phase, &launch_id, wait, &thread_quit);
+                let promotion = match promotion {
+                    Some(Promotion::Recorded) => Some(watch_recorded(
+                        &project_root,
+                        phase,
+                        &launch_id,
+                        &token,
+                        &thread_quit,
+                    )),
+                    other => other,
+                };
+                // The leader is unreaped while the agent runs, so this reaches only its
+                // group (R-13). A verdict reached after the agent exited signals nothing.
+                let group_end = match promotion {
+                    Some(Promotion::Superseded { .. } | Promotion::OrphanedPending) => Some(
+                        crate::supervisor::runtime::end_group_while_running(&token, pgid),
+                    ),
+                    _ => None,
+                };
+                (promotion, group_end)
+            })?;
+        Ok(Self {
+            quit,
+            thread: Some(thread),
+        })
+    }
+
+    /// The watch's result once it has one. A stop tells a watch without a verdict to quit.
+    /// A watch past `Recorded` has already ended, or ends within one [`PROMOTION_POLL`]: it
+    /// ends at the exit [`Supervisor::wait_agent`] observed before this is called.
+    fn finish(mut self, token: &crate::supervisor::runtime::StopToken) -> PromotionEnd {
+        let Some(thread) = self.thread.take() else {
+            return (None, None);
+        };
+        while !thread.is_finished() {
+            if token.stop_requested() {
+                self.quit.store(true, Ordering::Release);
+            }
+            std::thread::sleep(PROMOTION_POLL);
+        }
+        thread.join().unwrap_or_else(|_| {
+            warn!("the promotion watch panicked; no verdict");
+            (None, None)
+        })
+    }
+}
+
+impl Drop for PromotionWatch {
+    fn drop(&mut self) {
+        self.quit.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Read the state until it gives `launch_id` a verdict (see [`run_supervised_stage`]).
+/// `None` only when told to quit first.
+fn await_promotion(
+    project_root: &Path,
+    phase: PhaseId,
+    launch_id: &str,
+    wait: Duration,
+    quit: &AtomicBool,
+) -> Option<Promotion> {
+    let deadline = std::time::Instant::now() + wait;
+    while !quit.load(Ordering::Acquire) {
+        let expired = std::time::Instant::now() >= deadline;
+        match crate::workflow::load_state(project_root, phase) {
+            Ok(state) => match crate::workflow::ownership(&state, launch_id) {
+                crate::workflow::Ownership::Recorded => return Some(Promotion::Recorded),
+                crate::workflow::Ownership::Superseded { recorded } => {
+                    return Some(Promotion::Superseded { recorded });
+                }
+                crate::workflow::Ownership::PendingOnly if expired => {
+                    return Some(Promotion::OrphanedPending);
+                }
+                crate::workflow::Ownership::PendingOnly => {}
+            },
+            Err(crate::workflow::WorkflowError::MissingState(_)) => {
+                return Some(Promotion::Superseded { recorded: None });
+            }
+            Err(err) if expired => {
+                warn!("launch {launch_id}: the state still does not load at the deadline: {err}");
+                return Some(Promotion::Superseded { recorded: None });
+            }
+            Err(_) => {}
+        }
+        std::thread::sleep(PROMOTION_POLL);
+    }
+    None
+}
+
+/// Keep reading the state of a launch it recorded, until the agent's exit has been
+/// observed or the watch is told to quit: `Recorded`, unless a read finds this launch
+/// definitely superseded first, or the state stays absent for
+/// [`STATE_GONE_CONFIRM_WAIT`] (see [`run_supervised_stage`]). It wakes every
+/// [`PROMOTION_POLL`] so the agent's exit never waits for a state read.
+fn watch_recorded(
+    project_root: &Path,
+    phase: PhaseId,
+    launch_id: &str,
+    token: &crate::supervisor::runtime::StopToken,
+    quit: &AtomicBool,
+) -> Promotion {
+    let mut next_read = std::time::Instant::now() + RECORDED_READ_INTERVAL;
+    let mut last_warned = None;
+    let mut absent_since = None;
+    while !quit.load(Ordering::Acquire)
+        && token.phase() == crate::supervisor::runtime::OwnerPhase::AgentRunning
+    {
+        let now = std::time::Instant::now();
+        if now >= next_read {
+            next_read = now + RECORDED_READ_INTERVAL;
+            let loaded = crate::workflow::load_state(project_root, phase);
+            if !matches!(loaded, Err(crate::workflow::WorkflowError::MissingState(_))) {
+                absent_since = None;
+            }
+            let doubt = match loaded {
+                Ok(state) => match crate::workflow::ownership(&state, launch_id) {
+                    crate::workflow::Ownership::Recorded => None,
+                    crate::workflow::Ownership::Superseded { recorded } => {
+                        return Promotion::Superseded { recorded };
+                    }
+                    crate::workflow::Ownership::PendingOnly => {
+                        Some("the state names it only as pending".to_string())
+                    }
+                },
+                Err(crate::workflow::WorkflowError::MissingState(_)) => {
+                    let since = *absent_since.get_or_insert(now);
+                    if now.duration_since(since) >= STATE_GONE_CONFIRM_WAIT {
+                        return Promotion::Superseded { recorded: None };
+                    }
+                    Some("the state file is absent".to_string())
+                }
+                Err(err) => Some(format!("the state does not load: {err}")),
+            };
+            if let Some(doubt) = doubt
+                && warn_is_due(&mut last_warned, now)
+            {
+                warn!("launch {launch_id}: {doubt}; its agent keeps running");
+            }
+        }
+        std::thread::sleep(PROMOTION_POLL);
+    }
+    if !quit.load(Ordering::Acquire)
+        && let Ok(state) = crate::workflow::load_state(project_root, phase)
+        && let crate::workflow::Ownership::Superseded { recorded } =
+            crate::workflow::ownership(&state, launch_id)
+    {
+        return Promotion::Superseded { recorded };
+    }
+    Promotion::Recorded
+}
+
+/// Whether a warning may go out at `now`, at most one every [`RECORDED_WARN_INTERVAL`].
+/// Records it in `last_warned` when it may.
+fn warn_is_due(last_warned: &mut Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    let due = last_warned.is_none_or(|last| now.duration_since(last) >= RECORDED_WARN_INTERVAL);
+    if due {
+        *last_warned = Some(now);
+    }
+    due
+}
+
+/// Take over the liveness descriptor `spec` names, if it names one.
+fn adopt_liveness(spec: &StageSpec) -> Result<Option<crate::liveness::Hold>, MonitorError> {
+    let Some(fd) = spec.liveness_fd else {
+        return Ok(None);
+    };
+    let path = liveness_path_of(&spec.project_root, &spec.launch_id)?;
+    crate::liveness::adopt_inherited(fd, path)
+        .map(Some)
+        .map_err(|err| liveness_error(&spec.launch_id, err))
 }
 
 /// Owns a just-spawned agent's unreaped `Child` from the moment its pgid
@@ -1661,6 +2109,37 @@ fn stream_wait_test_hold(token: &crate::supervisor::runtime::StopToken) {
     let _ = std::fs::write(&held, "");
     let deadline = std::time::Instant::now() + STREAM_WAIT_HOLD_WAIT;
     while !release.exists() && !token.stop_requested() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// How long [`agent_spawn_test_hold`] waits for its release file.
+#[cfg(any(test, feature = "test-support"))]
+const AGENT_SPAWN_HOLD_WAIT: Duration = Duration::from_secs(60);
+
+/// Test-only hold (50.1-16). When `DEVFLOW_TEST_AGENT_SPAWN_HOLD` is
+/// `<stage>:<path>` for `spec`'s stage: create `<path>.held`, then wait, polling
+/// every 20 ms and bounded by [`AGENT_SPAWN_HOLD_WAIT`], until `<path>` exists. So a
+/// test can hold a supervisor that has adopted its liveness lock and has no agent and
+/// no socket, the window a pending record exists for; scoped to a stage so a handoff
+/// fixture holds only the next stage's supervisor. Returns at once when the variable
+/// is absent or names another stage. Compiled only under `cfg(test)` or the
+/// `test-support` feature, together with its one call.
+#[cfg(any(test, feature = "test-support"))]
+fn agent_spawn_test_hold(spec: &StageSpec) {
+    let Ok(hold) = std::env::var("DEVFLOW_TEST_AGENT_SPAWN_HOLD") else {
+        return;
+    };
+    let Some((stage, path)) = hold.split_once(':') else {
+        return;
+    };
+    if spec.stage.map(|stage| stage.to_string()).as_deref() != Some(stage) {
+        return;
+    }
+    let _ = std::fs::write(format!("{path}.held"), "");
+    let release = Path::new(path);
+    let deadline = std::time::Instant::now() + AGENT_SPAWN_HOLD_WAIT;
+    while !release.exists() && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
@@ -2529,6 +3008,7 @@ mod tests {
                 workdir: "/workdir",
                 socket: "/cache/sock/x.sock",
                 launch_id: "0123456789abcdef",
+                liveness_fd: Some(crate::liveness::INHERITED_FD),
                 keep_env: &keep_env,
                 stream,
             })
@@ -2583,6 +3063,23 @@ mod tests {
         );
         assert_eq!(value_after(&capture, "--prompt-file"), None);
         assert_eq!(value_after(&capture, "--idle-timeout-secs"), None);
+
+        // The liveness descriptor's number crosses the exec in both shapes.
+        for argv in [&stream, &capture] {
+            assert_eq!(value_after(argv, "--liveness-fd").as_deref(), Some("3"));
+        }
+        // Control: a launch with no descriptor carries no flag.
+        let without = monitor_args(&MonitorArgs {
+            project_root: "/project",
+            state: &state,
+            workdir: "/workdir",
+            socket: "/cache/sock/x.sock",
+            launch_id: "0123456789abcdef",
+            liveness_fd: None,
+            keep_env: &keep_env,
+            stream: None,
+        });
+        assert_eq!(value_after(&without, "--liveness-fd"), None);
     }
 
     /// WR-07 (49-REVIEW.md): the chain's command never carries the variable.
@@ -2640,6 +3137,157 @@ mod tests {
                 .iter()
                 .any(|line| line.contains(gate)),
         )
+    }
+
+    /// One warning for a state that stays in doubt, then none until the interval has passed.
+    #[test]
+    fn a_doubtful_state_warns_at_most_once_an_interval() {
+        let start = std::time::Instant::now();
+        let mut last_warned = None;
+        assert!(warn_is_due(&mut last_warned, start), "the first warns");
+        assert!(
+            !warn_is_due(&mut last_warned, start + RECORDED_WARN_INTERVAL / 2),
+            "inside the interval it does not"
+        );
+        assert!(
+            warn_is_due(&mut last_warned, start + RECORDED_WARN_INTERVAL),
+            "at the interval it warns again"
+        );
+        assert!(
+            !warn_is_due(
+                &mut last_warned,
+                start + RECORDED_WARN_INTERVAL + Duration::from_secs(1)
+            ),
+            "the interval runs from the last warning"
+        );
+    }
+
+    /// A state naming `recorded` as supervisor and `pending` as pending.
+    fn promotion_state(root: &Path, phase: PhaseId, recorded: Option<&str>, pending: Option<&str>) {
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.supervisor = recorded.map(|id| {
+            crate::state::SupervisorRecord::new(
+                root.join("r.sock"),
+                id.to_string(),
+                4_294_967_000,
+                1,
+                String::new(),
+            )
+        });
+        state.pending_supervisor = pending.map(|id| {
+            crate::state::PendingSupervisor::new(
+                id.to_string(),
+                root.join("p.sock"),
+                root.join("p.live"),
+            )
+        });
+        crate::workflow::save_state(&state).unwrap();
+    }
+
+    /// The verdicts the state gives at once: its own record, another launch's record or
+    /// reservation (a reservation that is not this launch's is no reason to wait), and a
+    /// state that is gone. None waits out the long wait this passes.
+    #[test]
+    fn the_promotion_watch_decides_at_once_unless_only_pending() {
+        const OURS: &str = "aaaa0000aaaa1912";
+        const LONG: Duration = Duration::from_secs(60);
+        let dir = tempfile::tempdir().unwrap();
+        let (root, phase) = (dir.path(), PhaseId::new(1912));
+        let quit = AtomicBool::new(false);
+        let started = std::time::Instant::now();
+
+        let verdict = || await_promotion(root, phase, OURS, LONG, &quit);
+        assert_eq!(
+            verdict(),
+            Some(Promotion::Superseded { recorded: None }),
+            "a state that is gone names no launch"
+        );
+        promotion_state(root, phase, Some(OURS), None);
+        assert_eq!(verdict(), Some(Promotion::Recorded));
+        promotion_state(root, phase, Some("x"), None);
+        assert_eq!(
+            verdict(),
+            Some(Promotion::Superseded {
+                recorded: Some("x".to_string())
+            })
+        );
+        promotion_state(root, phase, None, Some("y"));
+        assert_eq!(
+            verdict(),
+            Some(Promotion::Superseded { recorded: None }),
+            "another launch's reservation"
+        );
+        assert!(started.elapsed() < LONG / 2, "none of them waited");
+    }
+
+    /// Only pending is a wait (D-15, Pitfall 5): the promotion ends it with `Recorded`,
+    /// an expired deadline with `OrphanedPending` and no earlier, and a quit with no
+    /// verdict.
+    #[test]
+    fn the_promotion_watch_waits_while_only_pending() {
+        const OURS: &str = "aaaa0000aaaa1913";
+        const SHORT: Duration = Duration::from_millis(300);
+        let dir = tempfile::tempdir().unwrap();
+        let (root, phase) = (dir.path(), PhaseId::new(1913));
+        promotion_state(root, phase, Some("n"), Some(OURS));
+
+        let quit = AtomicBool::new(false);
+        let started = std::time::Instant::now();
+        assert_eq!(
+            await_promotion(root, phase, OURS, SHORT, &quit),
+            Some(Promotion::OrphanedPending)
+        );
+        assert!(started.elapsed() >= SHORT, "it waited out its deadline");
+
+        let running = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let watch = scope
+                .spawn(|| await_promotion(root, phase, OURS, Duration::from_secs(60), &running));
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(!watch.is_finished(), "only pending is a wait");
+            promotion_state(root, phase, Some(OURS), None);
+            assert_eq!(watch.join().unwrap(), Some(Promotion::Recorded));
+        });
+
+        promotion_state(root, phase, Some("n"), Some(OURS));
+        let quit = AtomicBool::new(true);
+        assert_eq!(
+            await_promotion(root, phase, OURS, Duration::from_secs(60), &quit),
+            None,
+            "told to quit, it has no verdict"
+        );
+    }
+
+    /// A state that does not load is retried, because a repair may be under way, and
+    /// still failing at the deadline ends as `Superseded`: no readable state names this
+    /// launch. A state that loads again in time gets its real verdict.
+    #[test]
+    fn the_promotion_watch_retries_an_unreadable_state_until_its_deadline() {
+        const OURS: &str = "aaaa0000aaaa1914";
+        const SHORT: Duration = Duration::from_millis(300);
+        let dir = tempfile::tempdir().unwrap();
+        let (root, phase) = (dir.path(), PhaseId::new(1914));
+        promotion_state(root, phase, Some(OURS), None);
+        let path = crate::workflow::state_path(root, phase);
+        let good = std::fs::read(&path).unwrap();
+        std::fs::write(&path, "{ not json").unwrap();
+
+        let quit = AtomicBool::new(false);
+        let started = std::time::Instant::now();
+        assert_eq!(
+            await_promotion(root, phase, OURS, SHORT, &quit),
+            Some(Promotion::Superseded { recorded: None })
+        );
+        assert!(started.elapsed() >= SHORT, "it retried until the deadline");
+
+        let running = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let watch = scope
+                .spawn(|| await_promotion(root, phase, OURS, Duration::from_secs(60), &running));
+            std::thread::sleep(Duration::from_millis(100));
+            std::fs::write(&path, &good).unwrap();
+            assert_eq!(watch.join().unwrap(), Some(Promotion::Recorded));
+        });
     }
 
     /// T-50-26: the test-only monitor entry cannot exist in a release build,
@@ -6112,6 +6760,497 @@ exit 0
         assert_eq!(parsed.pgid, unsafe { libc::getpgrp() });
     }
 
+    // ---- 50.1-07: adopting the liveness descriptor ----------------------
+
+    /// Supervise an agent that would record that it ran, with `liveness_fd`
+    /// and `launch_id` set as given, and return what the supervisor did and
+    /// whether the agent ever started. Run in a child process of its own
+    /// because `run_supervised_stage` installs the signal pipe.
+    fn supervise_with_liveness(
+        launch_id: &str,
+        liveness_fd: std::os::fd::RawFd,
+    ) -> (Result<StageRun, MonitorError>, bool) {
+        let fixture = StageFixture::new();
+        let ran = fixture.path("agent-ran");
+        let socket = SocketPath::for_launch(
+            fixture.cache.path(),
+            &fixture.root,
+            STAGE_PHASE,
+            &crate::supervisor::new_launch_id(),
+        )
+        .expect("socket path fits sun_path");
+        let mut spec = StageSpec::new(
+            fixture.root.clone(),
+            STAGE_PHASE,
+            AgentKind::Codex,
+            "/bin/sh".to_string(),
+            StageIo::Capture,
+            socket,
+            launch_id.to_string(),
+        );
+        spec.args = vec!["-c".to_string(), format!("echo ran > {}", ran.display())];
+        spec.liveness_fd = Some(liveness_fd);
+        let result = run_supervised_stage(spec);
+        (result, ran.exists())
+    }
+
+    const NEVER_SUPERSEDED_TEST: &str =
+        "monitor::tests::a_never_superseded_supervisor_reports_recorded_and_returns_promptly";
+
+    /// The most `run_supervised_stage` may take past the exit file it writes at the agent's
+    /// exit. Well under the wait a full read interval would add for this agent's run.
+    const PROMPT_FINISH_BOUND: Duration = Duration::from_millis(500);
+
+    /// A promoted supervisor that nothing supersedes reports `Recorded`, signals nothing and
+    /// lets its agent end by itself. The agent runs past one read of the slower poll and
+    /// ends well before the next, so waiting for that read would take most of a second.
+    #[test]
+    fn a_never_superseded_supervisor_reports_recorded_and_returns_promptly() {
+        if !crate::test_support::in_child_test(NEVER_SUPERSEDED_TEST) {
+            run_in_own_process(NEVER_SUPERSEDED_TEST);
+            return;
+        }
+        const OURS: &str = "aaaa0000aaaa1937";
+        let fixture = StageFixture::new();
+        promotion_state(&fixture.root, STAGE_PHASE, Some(OURS), None);
+        let socket = SocketPath::for_launch(fixture.cache.path(), &fixture.root, STAGE_PHASE, OURS)
+            .expect("socket path fits sun_path");
+        let mut spec = StageSpec::new(
+            fixture.root.clone(),
+            STAGE_PHASE,
+            AgentKind::Codex,
+            "/bin/sh".to_string(),
+            StageIo::Capture,
+            socket,
+            OURS.to_string(),
+        );
+        spec.args = vec!["-c".to_string(), "exec sleep 1.2".to_string()];
+        spec.promotion_wait = Some(Duration::from_secs(60));
+
+        let run = run_supervised_stage(spec)
+            .unwrap_or_else(|err| panic!("run_supervised_stage failed: {err}"));
+        let returned = std::time::SystemTime::now();
+
+        let exit_file = crate::agent_result::exit_code_path(&fixture.root, STAGE_PHASE);
+        let exited = std::fs::metadata(&exit_file)
+            .and_then(|meta| meta.modified())
+            .expect("the exit file exists");
+        let past_exit = returned.duration_since(exited).unwrap_or_default();
+        assert!(
+            past_exit < PROMPT_FINISH_BOUND,
+            "returned {past_exit:?} after the agent's exit"
+        );
+        assert!(
+            matches!(run.outcome, AgentOutcome::Completed(0)),
+            "{:?}",
+            run.outcome
+        );
+        assert_eq!(run.promotion, Some(Promotion::Recorded));
+        assert!(run.agent_group_end.is_none(), "{:?}", run.agent_group_end);
+        run.supervisor.finish();
+    }
+
+    /// Run a stage for the launch [`SUPERSEDED_OURS`] in its own process's fixture, which
+    /// `setup` prepares, with `script` as its agent. Returns the run and the fixture.
+    fn supervise_for_exit_file(
+        setup: impl FnOnce(&Path),
+        script: impl FnOnce(&Path) -> String,
+    ) -> (StageRun, StageFixture) {
+        let fixture = StageFixture::new();
+        setup(&fixture.root);
+        let socket = SocketPath::for_launch(
+            fixture.cache.path(),
+            &fixture.root,
+            STAGE_PHASE,
+            SUPERSEDED_OURS,
+        )
+        .expect("socket path fits sun_path");
+        let mut spec = StageSpec::new(
+            fixture.root.clone(),
+            STAGE_PHASE,
+            AgentKind::Codex,
+            "/bin/sh".to_string(),
+            StageIo::Capture,
+            socket,
+            SUPERSEDED_OURS.to_string(),
+        );
+        spec.args = vec!["-c".to_string(), script(&fixture.root)];
+        spec.promotion_wait = Some(Duration::from_secs(60));
+        let run = run_supervised_stage(spec)
+            .unwrap_or_else(|err| panic!("run_supervised_stage failed: {err}"));
+        (run, fixture)
+    }
+
+    const SUPERSEDED_OURS: &str = "aaaa0000aaaa1939";
+    const SUPERSEDED_BY: &str = "bbbb0000bbbb1939";
+
+    fn superseded_by_the_other_launch() -> Promotion {
+        Promotion::Superseded {
+            recorded: Some(SUPERSEDED_BY.to_string()),
+        }
+    }
+
+    const EXIT_FILE_KEPT_TEST: &str =
+        "monitor::tests::a_supervisor_superseded_while_its_agent_runs_leaves_the_exit_file";
+
+    /// D-03: the exit file belongs to the run that superseded this one, so ending the
+    /// agent leaves it byte for byte. `a_never_superseded_supervisor_reports_recorded_and_returns_promptly`
+    /// is the control: a recorded supervisor writes it.
+    #[test]
+    fn a_supervisor_superseded_while_its_agent_runs_leaves_the_exit_file() {
+        if !crate::test_support::in_child_test(EXIT_FILE_KEPT_TEST) {
+            run_in_own_process(EXIT_FILE_KEPT_TEST);
+            return;
+        }
+        let (run, fixture) = supervise_for_exit_file(
+            |root| {
+                promotion_state(root, STAGE_PHASE, Some(SUPERSEDED_BY), None);
+                let exit_file = crate::agent_result::exit_code_path(root, STAGE_PHASE);
+                std::fs::create_dir_all(exit_file.parent().unwrap()).unwrap();
+                std::fs::write(exit_file, "7\n").unwrap();
+            },
+            |_| "exec sleep 30".to_string(),
+        );
+        assert_eq!(run.promotion, Some(superseded_by_the_other_launch()));
+        assert_eq!(
+            std::fs::read_to_string(crate::agent_result::exit_code_path(
+                &fixture.root,
+                STAGE_PHASE
+            ))
+            .unwrap(),
+            "7\n",
+            "the successor's exit file is untouched"
+        );
+        run.supervisor.finish();
+    }
+
+    const NO_EXIT_FILE_PENDING_TEST: &str =
+        "monitor::tests::a_supervisor_superseded_after_its_agent_exited_writes_no_exit_file";
+
+    /// An agent that exits while its launch is only pending has no verdict yet. A takeover
+    /// that lands before the verdict still leaves no exit file behind.
+    #[test]
+    fn a_supervisor_superseded_after_its_agent_exited_writes_no_exit_file() {
+        if !crate::test_support::in_child_test(NO_EXIT_FILE_PENDING_TEST) {
+            run_in_own_process(NO_EXIT_FILE_PENDING_TEST);
+            return;
+        }
+        let takeover = std::sync::Mutex::new(None);
+        let (run, fixture) = supervise_for_exit_file(
+            |root| {
+                promotion_state(root, STAGE_PHASE, None, Some(SUPERSEDED_OURS));
+                let root = root.to_path_buf();
+                *takeover.lock().unwrap() = Some(std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(800));
+                    promotion_state(&root, STAGE_PHASE, Some(SUPERSEDED_BY), None);
+                }));
+            },
+            |_| "exit 0".to_string(),
+        );
+        takeover.lock().unwrap().take().unwrap().join().unwrap();
+        assert!(
+            matches!(run.outcome, AgentOutcome::Completed(0)),
+            "{:?}",
+            run.outcome
+        );
+        assert_eq!(run.promotion, Some(superseded_by_the_other_launch()));
+        assert!(
+            !crate::agent_result::exit_code_path(&fixture.root, STAGE_PHASE).exists(),
+            "no exit file for a superseded launch"
+        );
+        run.supervisor.finish();
+    }
+
+    const FINAL_READ_TEST: &str =
+        "monitor::tests::a_takeover_just_before_a_recorded_agents_exit_writes_no_exit_file";
+
+    /// A takeover between the watch's once-a-second reads and the agent's exit: the agent
+    /// itself moves the state naming another launch into place as its last act, after the
+    /// watch's first read, so only a read at the exit can see it.
+    #[test]
+    fn a_takeover_just_before_a_recorded_agents_exit_writes_no_exit_file() {
+        if !crate::test_support::in_child_test(FINAL_READ_TEST) {
+            run_in_own_process(FINAL_READ_TEST);
+            return;
+        }
+        let (run, fixture) = supervise_for_exit_file(
+            |root| {
+                let state = crate::workflow::state_path(root, STAGE_PHASE);
+                promotion_state(root, STAGE_PHASE, Some(SUPERSEDED_BY), None);
+                std::fs::rename(&state, root.join("takeover.json")).unwrap();
+                promotion_state(root, STAGE_PHASE, Some(SUPERSEDED_OURS), None);
+            },
+            |root| {
+                let state = crate::workflow::state_path(root, STAGE_PHASE);
+                format!(
+                    "sleep 1.2; exec mv '{}' '{}'",
+                    root.join("takeover.json").display(),
+                    state.display()
+                )
+            },
+        );
+        assert_eq!(run.promotion, Some(superseded_by_the_other_launch()));
+        assert!(
+            !crate::agent_result::exit_code_path(&fixture.root, STAGE_PHASE).exists(),
+            "no exit file for a superseded launch"
+        );
+        run.supervisor.finish();
+    }
+
+    const CLOSED_FD_TEST: &str = "monitor::tests::a_liveness_descriptor_that_cannot_be_adopted_ends_the_stage_before_any_agent";
+
+    /// A supervisor that cannot take over the lock it was handed would run an
+    /// agent nothing can probe, so the stage ends before any agent exists.
+    #[test]
+    fn a_liveness_descriptor_that_cannot_be_adopted_ends_the_stage_before_any_agent() {
+        if crate::test_support::in_child_test(CLOSED_FD_TEST) {
+            let (result, agent_ran) =
+                supervise_with_liveness(&crate::supervisor::new_launch_id(), -1);
+            assert!(
+                matches!(&result, Err(MonitorError::Liveness { .. })),
+                "got {result:?}"
+            );
+            assert!(!agent_ran, "no agent may start without the lock");
+            return;
+        }
+        run_in_own_process(CLOSED_FD_TEST);
+    }
+
+    const INVALID_ID_TEST: &str =
+        "monitor::tests::an_invalid_launch_id_ends_the_stage_before_any_agent";
+
+    /// A launch id from argv never builds a path outside `.devflow/`.
+    #[test]
+    fn an_invalid_launch_id_ends_the_stage_before_any_agent() {
+        if crate::test_support::in_child_test(INVALID_ID_TEST) {
+            let (result, agent_ran) = supervise_with_liveness("../x", -1);
+            assert!(
+                matches!(&result, Err(MonitorError::Liveness { launch_id, .. }) if launch_id == "../x"),
+                "got {result:?}"
+            );
+            assert!(!agent_ran, "no agent may start without the lock");
+            return;
+        }
+        run_in_own_process(INVALID_ID_TEST);
+    }
+
+    /// Run the named test alone in a child process and require that it ran
+    /// and passed.
+    fn run_in_own_process(test_name: &str) {
+        let path_dir = tempfile::tempdir().expect("create the child's PATH directory");
+        let path = std::env::var_os("PATH").expect("PATH is set");
+        let output = crate::test_support::run_test_in_child(
+            test_name,
+            path_dir.path(),
+            &[("PATH", path.as_os_str())],
+        );
+        crate::test_support::assert_child_ran_exactly_one_passing_test(&output, test_name);
+    }
+
+    // ---- 50.1-07: a reservation through spawn_monitor --------------------
+
+    /// The re-exec entry [`spawn_reserved_sleeper`] names.
+    const RESERVED_ENTRY: &str = "monitor::tests::supervise_the_monitor_argv";
+
+    /// `spawn_monitor`'s re-exec target in this crate, which has no `__monitor`
+    /// subcommand: supervise the capture shape from the argv it was given.
+    /// Returns at once without that argv, so an `--include-ignored` run is
+    /// harmless.
+    #[test]
+    #[ignore = "re-exec entry of the reservation tests; returns at once without its argv"]
+    fn supervise_the_monitor_argv() {
+        let Some(encoded) = std::env::var_os(MONITOR_ARGV_ENV) else {
+            return;
+        };
+        let argv: Vec<String> =
+            serde_json::from_str(encoded.to_str().expect("a UTF-8 argv")).expect("a JSON argv");
+        let value_after = |flag: &str| {
+            let at = argv.iter().position(|arg| arg == flag);
+            argv[at.unwrap_or_else(|| panic!("no {flag}: {argv:?}")) + 1].clone()
+        };
+        let separator = argv.iter().position(|arg| arg == "--").expect("a `--`");
+        let (program, args) = argv[separator + 1..].split_first().expect("a program");
+        let socket = SocketPath::new(PathBuf::from(value_after("--socket"))).expect("the socket");
+        let mut spec = StageSpec::new(
+            PathBuf::from(value_after("--project")),
+            STAGE_PHASE,
+            AgentKind::Codex,
+            program.clone(),
+            StageIo::Capture,
+            socket,
+            value_after("--launch-id"),
+        );
+        spec.args = args.to_vec();
+        spec.stage = Some(Stage::Code);
+        spec.liveness_fd = Some(value_after("--liveness-fd").parse().expect("a descriptor"));
+        let run = run_supervised_stage(spec)
+            .unwrap_or_else(|err| panic!("run_supervised_stage failed: {err}"));
+        run.supervisor.finish();
+    }
+
+    /// Reserve a launch and spawn its supervisor over `sh -c 'exec sleep 300'`.
+    fn spawn_reserved_sleeper(fixture: &StageFixture) -> (Reservation, Published) {
+        let state = State::new(
+            STAGE_PHASE,
+            AgentKind::Codex,
+            Mode::Supervise,
+            fixture.root.clone(),
+        );
+        let ctx = LaunchContext::new(
+            fixture.cache.path().to_path_buf(),
+            MonitorExec::HarnessEntry {
+                exe: std::env::current_exe().expect("current_exe for the re-exec entry"),
+                test_name: RESERVED_ENTRY.to_string(),
+            },
+        );
+        let reservation = Reservation::new(&ctx, &state).expect("reserve the launch");
+        let published = spawn_monitor(
+            &state,
+            "/bin/sh",
+            &["-c".to_string(), "exec sleep 300".to_string()],
+            &[],
+            MonitorLaunch::Legacy,
+            &ctx,
+            &reservation,
+        )
+        .expect("the supervisor publishes");
+        (reservation, published)
+    }
+
+    /// The supervisor `spawn_monitor` left as this process's unreaped child,
+    /// known only by the pid it recorded. Killed and reaped on every exit path.
+    struct RecordedSupervisor {
+        pid: libc::pid_t,
+        reaped: bool,
+    }
+
+    impl RecordedSupervisor {
+        fn of(pid: u32) -> Self {
+            let pid = libc::pid_t::try_from(pid).expect("pid fits pid_t");
+            assert!(pid > 1, "refusing to own pid {pid}");
+            Self { pid, reaped: false }
+        }
+
+        /// Whether it has exited and been reaped within `within`.
+        fn reaped_within(&mut self, within: Duration) -> bool {
+            self.reaped = self.reaped
+                || stage_wait_until(within, || {
+                    // SAFETY: `pid > 1` names this process's own unreaped child,
+                    // and a null status pointer is allowed.
+                    let reaped =
+                        unsafe { libc::waitpid(self.pid, std::ptr::null_mut(), libc::WNOHANG) };
+                    reaped == self.pid
+                });
+            self.reaped
+        }
+
+        fn kill_and_reap(&mut self) {
+            // SAFETY: `pid > 1` names this process's own child, unreaped, so
+            // the pid cannot have been recycled.
+            assert_eq!(unsafe { libc::kill(self.pid, libc::SIGKILL) }, 0);
+            assert!(
+                self.reaped_within(Duration::from_secs(5)),
+                "SIGKILL must end the supervisor"
+            );
+        }
+    }
+
+    impl Drop for RecordedSupervisor {
+        fn drop(&mut self) {
+            if !self.reaped {
+                // SAFETY: as in `kill_and_reap`.
+                unsafe { libc::kill(self.pid, libc::SIGKILL) };
+                let _ = self.reaped_within(Duration::from_secs(5));
+            }
+        }
+    }
+
+    /// The reservation's liveness is the supervisor's, never the agent's. An
+    /// agent that inherited the descriptor would keep the lock after its
+    /// supervisor died, so the probe would stay `Live` here and block every later
+    /// launch: that is this test's failing direction.
+    /// `liveness::tests::adopting_the_inherited_descriptor_marks_it_close_on_exec_and_records_the_adopter`
+    /// pins the mechanism.
+    #[test]
+    fn a_killed_supervisor_leaves_its_reservation_abandoned_while_its_agent_runs() {
+        use crate::liveness::{Held, live_holder, probe};
+        let fixture = StageFixture::new();
+        let (reservation, published) = spawn_reserved_sleeper(&fixture);
+        let mut supervisor = RecordedSupervisor::of(published.supervisor_pid);
+        let agent_pgid = published.record.agent_pgid;
+        let agent = LeaderGroup::of(agent_pgid);
+        let path = reservation.liveness_path().to_path_buf();
+
+        drop(reservation);
+        assert_eq!(probe(&path).expect("probe"), Held::Live);
+        let holder = live_holder(&path).expect("read the holder");
+        assert_eq!(holder.map(|(pid, _)| pid), Some(published.supervisor_pid));
+
+        supervisor.kill_and_reap();
+        let abandoned = stage_wait_until(Duration::from_secs(2), || {
+            probe(&path).expect("probe") == Held::Abandoned
+        });
+        assert!(
+            abandoned,
+            "a dead supervisor's reservation must read abandoned, reads {:?}",
+            probe(&path)
+        );
+        assert!(
+            crate::test_support::process_is_live(agent_pgid),
+            "the agent must outlive its supervisor here, or this proved nothing about it"
+        );
+
+        drop(agent);
+        assert!(
+            group_gone_within(agent_pgid, Duration::from_secs(5)),
+            "the agent group must end: {:?}",
+            crate::test_support::live_group_members(agent_pgid)
+        );
+    }
+
+    /// The launch id has to exist before the spawn, so that the launch can be
+    /// recorded first (D-01): `spawn_monitor` uses the reservation's, never its own.
+    #[test]
+    fn spawn_monitor_uses_the_reservations_launch_id_and_socket() {
+        let fixture = StageFixture::new();
+        let (reservation, published) = spawn_reserved_sleeper(&fixture);
+        let mut supervisor = RecordedSupervisor::of(published.supervisor_pid);
+        let agent_pgid = published.record.agent_pgid;
+        let _agent = LeaderGroup::of(agent_pgid);
+
+        assert_eq!(published.record.launch_id, reservation.launch_id());
+        assert_eq!(published.record.socket_path, reservation.socket_path());
+        assert_eq!(
+            reservation.pending_record(),
+            crate::state::PendingSupervisor::new(
+                published.record.launch_id.clone(),
+                published.record.socket_path.clone(),
+                crate::liveness::launch_liveness_path(&fixture.root, &published.record.launch_id)
+                    .expect("a launch id"),
+            ),
+            "the pending record names the launch that was spawned"
+        );
+
+        let stopped = crate::supervisor::request_shutdown(
+            &published.record.socket_path,
+            Duration::from_secs(10),
+        )
+        .expect("request the stop");
+        assert!(
+            matches!(stopped, crate::supervisor::ShutdownOutcome::Stopped { .. }),
+            "the supervisor stops: {stopped:?}"
+        );
+        assert!(
+            supervisor.reaped_within(Duration::from_secs(5)),
+            "the supervisor exits after its stop"
+        );
+        assert!(
+            group_gone_within(agent_pgid, Duration::from_secs(5)),
+            "the agent group must end: {:?}",
+            crate::test_support::live_group_members(agent_pgid)
+        );
+    }
+
     // ---- 50-24: run_supervised_stage before it publishes ----------------
 
     /// The cache dir the publish-wait child entry builds its socket under.
@@ -6230,10 +7369,7 @@ exit 0
         });
         assert!(
             stage_wait_until(Duration::from_secs(2), || {
-                let signed = libc::pid_t::try_from(agent).expect("pid fits pid_t");
-                // SAFETY: signal 0 only checks for existence.
-                let rc = unsafe { libc::kill(signed, 0) };
-                rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                !crate::test_support::process_is_live(agent)
             }),
             "no agent survives a publish error: {agent} is alive\n{entry_log}"
         );
@@ -6284,6 +7420,74 @@ exit 0
             "the child ran its one entry: {entry_log}"
         );
         assert!(group_gone_within(agent.pgid, Duration::from_secs(2)));
+    }
+
+    /// The full name of [`a_publish_failure_probe_sees_a_zombie_agent_as_gone`].
+    #[cfg(target_os = "linux")]
+    const ZOMBIE_PROBE_TEST: &str =
+        "monitor::tests::a_publish_failure_probe_sees_a_zombie_agent_as_gone";
+
+    /// Why a publish-failure probe must ask `process_is_live`: a supervisor
+    /// killed before publishing orphans its agent, and the launcher's kill
+    /// through the sidecar leaves it a zombie until its new parent reaps it.
+    /// A job container's PID 1 never does. This process stands in for that
+    /// PID 1 as a child subreaper that does not reap during the check, where
+    /// `kill(agent, 0)` still reports the agent and `process_is_live` does
+    /// not. Linux-only, as `PR_SET_CHILD_SUBREAPER` is; the subreaper call
+    /// runs only in the child test process, never in the shared one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_publish_failure_probe_sees_a_zombie_agent_as_gone() {
+        if !crate::test_support::in_child_test(ZOMBIE_PROBE_TEST) {
+            // The child's agent runs `sleep`, so it keeps this PATH.
+            let path = std::env::var_os("PATH").expect("the test process has a PATH");
+            let output = crate::test_support::run_test_in_child(
+                ZOMBIE_PROBE_TEST,
+                &std::env::temp_dir(),
+                &[("PATH", &path)],
+            );
+            crate::test_support::assert_child_ran_exactly_one_passing_test(
+                &output,
+                ZOMBIE_PROBE_TEST,
+            );
+            return;
+        }
+        // SAFETY: this prctl option reads only its integer argument.
+        let subreaper = unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1 as libc::c_ulong) };
+        assert_eq!(subreaper, 0, "become a child subreaper");
+
+        let fixture = StageFixture::new();
+        let run = kill_before_publishing(&fixture, |_, _| {});
+        let agent = run.agent.pgid;
+        assert!(
+            run.text.contains(&format!(
+                "ended the agent group {agent} its sidecar records"
+            )),
+            "the launcher killed the orphan: {}",
+            run.text
+        );
+        assert!(
+            stage_wait_until(Duration::from_secs(2), || {
+                !crate::test_support::process_is_live(agent)
+            }),
+            "the killed agent {agent} must not read as live"
+        );
+        let signed = libc::pid_t::try_from(agent).expect("pid fits pid_t");
+        // SAFETY: signal 0 only checks for existence.
+        let old_probe = unsafe { libc::kill(signed, 0) };
+        assert_eq!(old_probe, 0, "kill(agent, 0) reads the zombie as alive");
+
+        let mut status = 0;
+        // SAFETY: `status` is a live int; `signed` is this process's child.
+        let reaped = unsafe { libc::waitpid(signed, &mut status, 0) };
+        assert_eq!(reaped, signed, "the zombie is this subreaper's to reap");
+        assert!(
+            libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL,
+            "the launcher's SIGKILL ended the agent: status {status}"
+        );
+        // SAFETY: `status` is a live int; WNOHANG never blocks.
+        let leftover = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+        assert_eq!(leftover, -1, "this process has no child left to reap");
     }
 
     /// What one killed-before-publishing run left: the wait's text, the
@@ -7135,7 +8339,8 @@ exit 0
             stopped,
             Ok(crate::supervisor::ShutdownOutcome::Stopped {
                 exit_code: 143,
-                advance_suppressed: true
+                advance_suppressed: true,
+                group_signalled: true
             })
         ) {
             panic!(

@@ -28,17 +28,19 @@
 
 use super::protocol::{self, PingReply, Reply, Request, ShutdownAccepted, ShutdownStopped};
 use super::{PublishError, Sidecar, SocketPath};
+use std::cell::Cell;
 use std::io;
 use std::os::fd::AsRawFd;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 /// The exit code a stopped run reports: the shell convention for a death by
 /// SIGTERM, `128 + 15`. The monitor writes it to the exit file on
-/// [`AgentOutcome::Stopped`].
-pub(crate) const STOPPED_EXIT_CODE: i32 = 128 + libc::SIGTERM;
+/// [`AgentOutcome::Stopped`], and the CLI after a stop honoured at an advance safe point.
+pub const STOPPED_EXIT_CODE: i32 = 128 + libc::SIGTERM;
 
 /// Who owns the run right now. Its [`as_str`](Self::as_str) label is the
 /// `owner` field of a ping reply.
@@ -78,6 +80,18 @@ pub enum StopSource {
     Socket,
     /// A signal delivered to the supervisor, by number.
     Signal(i32),
+    /// The supervisor found it does not own the run (D-03, D-15).
+    Ownership,
+}
+
+/// What [`Supervisor::end_agent_group`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AgentGroupEnd {
+    /// The agent was running: its group was signalled.
+    Ended,
+    /// The agent had already exited: nothing was signalled.
+    AlreadyExited,
 }
 
 /// How the agent's run ended.
@@ -161,6 +175,8 @@ struct OwnerState {
     /// The run ended as a stop: [`AgentOutcome::Stopped`] or a safe point
     /// that returned [`SafePoint::StopHere`].
     ended_stopped: bool,
+    /// A stop signalled the agent's process group: the final `stopped` reply says so.
+    group_signalled: bool,
 }
 
 /// The owner mutex and the condition variable the control thread waits on
@@ -189,6 +205,7 @@ impl StopToken {
                     stop_source: None,
                     agent_exited: false,
                     ended_stopped: false,
+                    group_signalled: false,
                 }),
                 exited: Condvar::new(),
             }),
@@ -239,8 +256,15 @@ impl StopToken {
 
     /// Whether the run ended as a stop, so a parked shutdown caller may be
     /// told `stopped`.
-    fn ended_stopped(&self) -> bool {
+    pub fn ended_stopped(&self) -> bool {
         self.lock().ended_stopped
+    }
+
+    /// Record that this run's stop ended another supervisor's agent group, a successor's
+    /// or an unpublished next stage's, through its socket. The final `stopped` reply then
+    /// does not say nothing was signalled.
+    pub fn note_group_signalled(&self) {
+        self.lock().group_signalled = true;
     }
 
     /// The main thread's exit decision. Under the owner lock: mark the exit
@@ -262,6 +286,15 @@ impl StopToken {
         }
         Ok(outcome)
     }
+}
+
+/// The final `stopped` reply. `group_signalled` is what [`OwnerState`] recorded.
+fn stopped_reply(group_signalled: bool) -> Reply {
+    Reply::Stopped(ShutdownStopped {
+        exit_code: STOPPED_EXIT_CODE,
+        advance_suppressed: true,
+        group_signalled,
+    })
 }
 
 /// [`StopToken::request_stop`] on an already locked owner, so the control
@@ -299,6 +332,51 @@ fn signal_group(pgid: u32, signal: libc::c_int) -> bool {
     // SAFETY: `signed > 1`, so `-signed < -1`: neither our own group (`0`)
     // nor every process (`-1`).
     unsafe { libc::kill(-signed, signal) == 0 }
+}
+
+/// Wait up to [`crate::agent::TERMINATE_VERIFY_WAIT`] for the main thread to observe
+/// the agent's exit, then SIGKILL the group if it has not. Checked under the owner lock,
+/// so the signal reaches only an unreaped leader's group: see
+/// [`end_group_while_running`].
+fn kill_group_unless_exit_observed(token: &StopToken, pgid: u32) {
+    let state = token.lock();
+    let (state, _) = token
+        .owner
+        .exited
+        .wait_timeout_while(state, crate::agent::TERMINATE_VERIFY_WAIT, |state| {
+            !state.agent_exited
+        })
+        .unwrap_or_else(PoisonError::into_inner);
+    if !state.agent_exited {
+        tracing::warn!("agent group {pgid} outlived SIGTERM; sending SIGKILL");
+        signal_group(pgid, libc::SIGKILL);
+    }
+}
+
+/// End the agent's process group while the agent still runs, for a supervisor that
+/// found it does not own the run (D-03, D-15). The sequence is a socket stop's:
+/// SIGTERM, then up to [`crate::agent::TERMINATE_VERIFY_WAIT`] for the exit, then
+/// SIGKILL.
+///
+/// The rule (R-13): a group is signalled only under the owner lock, only while the
+/// phase is `AgentRunning` and the main thread has not observed the exit. Until then the
+/// leader is unreaped, so the kernel cannot have given its pid to another process, and
+/// the number still names only the agent's own group. Once [`Supervisor::wait_agent`]
+/// has reaped the leader, the number may name anyone's group, so this signals nothing
+/// and returns [`AgentGroupEnd::AlreadyExited`]. A process the agent left in its group is
+/// then not signalled, as for every completed agent (backstop rule 7 reports a leaderless
+/// group and never signals it).
+pub(crate) fn end_group_while_running(token: &StopToken, pgid: u32) -> AgentGroupEnd {
+    let mut state = token.lock();
+    if state.phase != OwnerPhase::AgentRunning || state.agent_exited {
+        return AgentGroupEnd::AlreadyExited;
+    }
+    request_stop_locked(&mut state, StopSource::Ownership);
+    tracing::info!("ending agent group {pgid}: this supervisor does not own the run");
+    state.group_signalled |= signal_group(pgid, libc::SIGTERM);
+    drop(state);
+    kill_group_unless_exit_observed(token, pgid);
+    AgentGroupEnd::Ended
 }
 
 /// Block until `pid` (a child of this process) has exited, without reaping
@@ -534,6 +612,8 @@ impl Supervisor {
                 sidecar: sidecar.clone(),
                 token: token.clone(),
                 quit: Arc::clone(&quit),
+                accept: UnixListener::accept,
+                accept_backoff: Cell::new(ACCEPT_BACKOFF_START),
             };
             let handle = std::thread::Builder::new()
                 .name("supervisor-control".to_string())
@@ -576,6 +656,14 @@ impl Supervisor {
         })
     }
 
+    /// End the agent's process group if the agent still runs, under the identity rule
+    /// [`end_group_while_running`] states: once [`wait_agent`](Self::wait_agent) has
+    /// reaped the leader, this signals nothing and returns
+    /// [`AgentGroupEnd::AlreadyExited`].
+    pub fn end_agent_group(&self) -> AgentGroupEnd {
+        end_group_while_running(&self.token, self.agent_pgid)
+    }
+
     /// A handle to this run's owner, for the CLI's safe points.
     pub fn token(&self) -> StopToken {
         self.token.clone()
@@ -597,10 +685,7 @@ impl Supervisor {
     pub fn finish(mut self) {
         let parked = self.close();
         let reply = if self.token.ended_stopped() {
-            Reply::Stopped(ShutdownStopped {
-                exit_code: STOPPED_EXIT_CODE,
-                advance_suppressed: true,
-            })
+            stopped_reply(self.token.lock().group_signalled)
         } else {
             Reply::Error("handed_off".to_string())
         };
@@ -665,12 +750,37 @@ fn drain_signal_pipe(fd: libc::c_int) -> Vec<i32> {
     }
 }
 
+/// How long the control thread first waits after a persistent `accept` error.
+const ACCEPT_BACKOFF_START: Duration = Duration::from_millis(10);
+/// The longest the control thread waits between `accept` attempts.
+const ACCEPT_BACKOFF_CAP: Duration = Duration::from_secs(1);
+
+/// How the control thread accepts a connection: `UnixListener::accept`, or a
+/// test's injected failure.
+type AcceptFn = fn(&UnixListener) -> io::Result<(UnixStream, SocketAddr)>;
+
+#[cfg(test)]
+thread_local! {
+    /// How many times [`log_accept_error`] ran on this thread.
+    static ACCEPT_ERROR_LOGS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Report a persistent `accept` error and the wait before the next attempt.
+fn log_accept_error(error: &io::Error, backoff: Duration) {
+    #[cfg(test)]
+    ACCEPT_ERROR_LOGS.with(|logs| logs.set(logs.get() + 1));
+    tracing::warn!("supervisor accept failed: {error}; retrying in {backoff:?}");
+}
+
 /// The control thread's state.
 struct Control {
     listener: UnixListener,
     sidecar: Sidecar,
     token: StopToken,
     quit: Arc<AtomicBool>,
+    accept: AcceptFn,
+    /// The wait before the next attempt after a persistent `accept` error.
+    accept_backoff: Cell<Duration>,
 }
 
 impl Control {
@@ -710,14 +820,29 @@ impl Control {
     }
 
     /// Serve every pending connection.
+    ///
+    /// A persistent `accept` error (EMFILE) leaves the listener readable, so
+    /// [`run`](Self::run)'s `poll` would wake again at once and spin a core.
+    /// The error is logged and this thread sleeps the current backoff before
+    /// returning, doubling it from [`ACCEPT_BACKOFF_START`] up to
+    /// [`ACCEPT_BACKOFF_CAP`]; a successful accept resets it. Only this
+    /// thread sleeps, and it serves only pings, stop requests and the quit
+    /// flag, so during such an error each of those waits at most the cap.
     fn accept_all(&self, parked: &mut Vec<UnixStream>) {
         loop {
-            match self.listener.accept() {
-                Ok((stream, _)) => self.serve_connection(stream, parked),
+            match (self.accept)(&self.listener) {
+                Ok((stream, _)) => {
+                    self.accept_backoff.set(ACCEPT_BACKOFF_START);
+                    self.serve_connection(stream, parked);
+                }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => return,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => {
-                    tracing::warn!("supervisor accept failed: {error}");
+                    let backoff = self.accept_backoff.get();
+                    log_accept_error(&error, backoff);
+                    std::thread::sleep(backoff);
+                    self.accept_backoff
+                        .set((backoff * 2).min(ACCEPT_BACKOFF_CAP));
                     return;
                 }
             }
@@ -749,7 +874,8 @@ impl Control {
     /// `shutdown`) and act on [`StopToken::request_stop`]'s decision.
     ///
     /// - `KillAgentGroup`: under the owner lock, and only while the exit has
-    ///   not been observed, SIGTERM the agent's group. Reply `accepted` and
+    ///   not been observed, SIGTERM the agent's group, recording whether that
+    ///   signal went out for the final reply. Reply `accepted` and
     ///   park the connection for [`Supervisor::finish`]'s final line. Then
     ///   wait up to [`crate::agent::TERMINATE_VERIFY_WAIT`] for the main
     ///   thread to observe the exit, and SIGKILL the group if it has not.
@@ -766,8 +892,9 @@ impl Control {
         let ended_stopped = state.ended_stopped;
         if action == StopAction::KillAgentGroup && !state.agent_exited {
             tracing::info!("stop requested by {source:?}: terminating agent group {pgid}");
-            signal_group(pgid, libc::SIGTERM);
+            state.group_signalled |= signal_group(pgid, libc::SIGTERM);
         }
+        let group_signalled = state.group_signalled;
         drop(state);
 
         let accepted = Reply::Accepted(ShutdownAccepted { owner });
@@ -776,13 +903,9 @@ impl Control {
                 std::slice::from_ref(&accepted)
             }
             StopAction::ReplyHandedOff => &[Reply::Error("handed_off".to_string())],
-            StopAction::AlreadyFinished if ended_stopped => &[
-                accepted.clone(),
-                Reply::Stopped(ShutdownStopped {
-                    exit_code: STOPPED_EXIT_CODE,
-                    advance_suppressed: true,
-                }),
-            ],
+            StopAction::AlreadyFinished if ended_stopped => {
+                &[accepted.clone(), stopped_reply(group_signalled)]
+            }
             StopAction::AlreadyFinished => &[Reply::Error("already_finished".to_string())],
         };
         if let Some(stream) = stream {
@@ -804,19 +927,7 @@ impl Control {
         }
 
         if action == StopAction::KillAgentGroup {
-            let state = self.token.lock();
-            let (state, _) = self
-                .token
-                .owner
-                .exited
-                .wait_timeout_while(state, crate::agent::TERMINATE_VERIFY_WAIT, |state| {
-                    !state.agent_exited
-                })
-                .unwrap_or_else(PoisonError::into_inner);
-            if !state.agent_exited {
-                tracing::warn!("agent group {pgid} outlived SIGTERM; sending SIGKILL");
-                signal_group(pgid, libc::SIGKILL);
-            }
+            kill_group_unless_exit_observed(&self.token, pgid);
         }
     }
 
@@ -1086,7 +1197,8 @@ mod tests {
             answer.as_ref().ok(),
             Some(&ShutdownOutcome::Stopped {
                 exit_code: 143,
-                advance_suppressed: true
+                advance_suppressed: true,
+                group_signalled: true
             }),
             "a socket shutdown must report the stop, got {answer:?}"
         );
@@ -1301,7 +1413,7 @@ mod tests {
                     action
                 })
             };
-            let reached = std::cell::Cell::new(false);
+            let reached = Cell::new(false);
             let verdict = run_stage(&token, Some(window), &|| {
                 reached.set(true);
                 ready.wait();
@@ -1596,7 +1708,8 @@ mod tests {
             answer.as_ref().ok(),
             Some(&ShutdownOutcome::Stopped {
                 exit_code: 143,
-                advance_suppressed: true
+                advance_suppressed: true,
+                group_signalled: true
             }),
             "the stop is reported, got {answer:?}"
         );
@@ -1617,7 +1730,7 @@ mod tests {
 
     /// A supervisor served from this test process for an agent that is
     /// never signalled: its sidecar pgid is `0`, which `signal_group`
-    /// refuses, and no test here stops it in `AgentRunning`.
+    /// refuses, so a stop in `AgentRunning` reaches no process.
     fn in_process_supervisor(cache: &Path) -> (Supervisor, PathBuf) {
         let socket = SocketPath::for_launch(
             cache,
@@ -1631,6 +1744,83 @@ mod tests {
         let path = socket.as_path().to_path_buf();
         let supervisor = Supervisor::serve(socket, sidecar).expect("serve the socket");
         (supervisor, path)
+    }
+
+    /// A process group this test spawned, unrelated to any supervisor's agent.
+    fn unrelated_group() -> (ChildGuard, GroupGuard, u32) {
+        let child = Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("spawn the unrelated group");
+        let pgid = child.id();
+        (ChildGuard(Some(child)), GroupGuard(pgid), pgid)
+    }
+
+    /// R-13: once its leader is reaped, a group's recorded number may name anyone's
+    /// group, so `end_agent_group` signals nothing, whatever group holds that number now.
+    /// Control: with the agent still running, the same call does end the group it names,
+    /// so the silence above is the rule and not a broken signal path.
+    #[test]
+    fn end_agent_group_never_signals_a_pgid_after_its_leader_is_reaped() {
+        let cache = tempfile::tempdir_in("/tmp").expect("cache dir");
+        let socket_for = || {
+            SocketPath::for_launch(
+                cache.path(),
+                Path::new("/project/runtime"),
+                PhaseId::new(50),
+                &new_launch_id(),
+            )
+            .expect("socket path fits sun_path")
+        };
+        let (_u_child, _u_guard, unrelated) = unrelated_group();
+        let mut reaped_agent = Command::new("true")
+            .process_group(0)
+            .spawn()
+            .expect("spawn the agent that exits");
+        let socket = socket_for();
+        let mut sidecar = test_sidecar(&socket, reaped_agent.id());
+        sidecar.agent_pgid = unrelated;
+        let supervisor = Supervisor::serve(socket, sidecar).expect("serve");
+        supervisor
+            .wait_agent(&mut reaped_agent)
+            .expect("the leader is observed and reaped");
+        assert_eq!(supervisor.end_agent_group(), AgentGroupEnd::AlreadyExited);
+        std::thread::sleep(Duration::from_secs(1));
+        assert!(
+            group_exists(unrelated),
+            "a group holding a reaped leader's number is not signalled"
+        );
+        supervisor.finish();
+
+        let (_u2_child, _u2_guard, named) = unrelated_group();
+        let mut running_agent = ChildGuard(Some(
+            Command::new("sleep")
+                .arg("60")
+                .process_group(0)
+                .spawn()
+                .expect("spawn the running agent"),
+        ));
+        let socket = socket_for();
+        let mut sidecar = test_sidecar(&socket, running_agent.child().id());
+        sidecar.agent_pgid = named;
+        let supervisor = Supervisor::serve(socket, sidecar).expect("serve");
+        assert_eq!(supervisor.end_agent_group(), AgentGroupEnd::Ended);
+        assert!(
+            wait_until(
+                crate::agent::TERMINATE_VERIFY_WAIT + Duration::from_secs(1),
+                || !group_exists(named)
+            ),
+            "control: a running agent's recorded group is ended"
+        );
+        assert!(
+            supervisor.token().stop_requested(),
+            "control: it is a stop, so the agent's exit never advances"
+        );
+        supervisor.finish();
     }
 
     /// A launch never replaces an existing sidecar at its socket's name, and
@@ -1695,6 +1885,7 @@ mod tests {
         let stopped = ShutdownOutcome::Stopped {
             exit_code: 143,
             advance_suppressed: true,
+            group_signalled: false,
         };
 
         // Taken while the CLI advances, then stopped at a safe point: the
@@ -1749,6 +1940,101 @@ mod tests {
         assert!(!supervisor.token().stop_requested());
         supervisor.finish();
         assert!(matches!(probe(&path), Ok(Liveness::Gone)));
+    }
+
+    /// What a parked shutdown caller hears: once its stop is taken, `end` ends the run, then
+    /// the supervisor finishes.
+    fn final_answer(
+        supervisor: Supervisor,
+        path: &Path,
+        end: impl FnOnce(&Supervisor),
+    ) -> Option<ShutdownOutcome> {
+        let caller = {
+            let path = path.to_path_buf();
+            std::thread::spawn(move || request_shutdown(&path, CHILD_WAIT).ok())
+        };
+        assert!(
+            wait_until(CHILD_WAIT, || supervisor.token().stop_requested()),
+            "the request is taken"
+        );
+        end(&supervisor);
+        supervisor.finish();
+        caller.join().expect("caller")
+    }
+
+    /// D-16 / D-13 item 6: the final reply says whether the agent's group was signalled.
+    /// A stop taken while the CLI advances and honoured at a safe point signalled nothing;
+    /// a stop taken while the agent runs signalled its group, and the agent dies of it.
+    #[test]
+    fn a_safe_point_stop_reply_says_no_group_was_signalled() {
+        let cache = short_cache();
+        let (supervisor, path) = in_process_supervisor(cache.path());
+        supervisor.token().enter(OwnerPhase::Advancing);
+        let answer = final_answer(supervisor, &path, |supervisor| {
+            assert_eq!(supervisor.token().safe_point(), SafePoint::StopHere);
+        });
+        assert_eq!(
+            answer,
+            Some(ShutdownOutcome::Stopped {
+                exit_code: 143,
+                advance_suppressed: true,
+                group_signalled: false,
+            }),
+            "a safe-point stop signals nothing"
+        );
+
+        let (mut agent, _group, pgid) = unrelated_group();
+        let socket = SocketPath::for_launch(
+            cache.path(),
+            Path::new("/project/runtime"),
+            PhaseId::new(50),
+            &new_launch_id(),
+        )
+        .expect("socket path fits sun_path");
+        let mut sidecar = test_sidecar(&socket, std::process::id());
+        sidecar.agent_pgid = pgid;
+        let path = socket.as_path().to_path_buf();
+        let supervisor = Supervisor::serve(socket, sidecar).expect("serve the socket");
+        let answer = final_answer(supervisor, &path, |supervisor| {
+            assert_eq!(
+                supervisor
+                    .wait_agent(agent.child())
+                    .expect("wait the agent"),
+                AgentOutcome::Stopped
+            );
+        });
+        assert_eq!(
+            answer,
+            Some(ShutdownOutcome::Stopped {
+                exit_code: 143,
+                advance_suppressed: true,
+                group_signalled: true,
+            }),
+            "a stop taken while the agent runs signals its group"
+        );
+    }
+
+    /// A stop in `AgentRunning` whose group signal was refused (the pgid is `0`) ended no
+    /// group, so its reply does not say one was signalled.
+    #[test]
+    fn a_refused_group_signal_is_not_reported_as_signalled() {
+        let cache = short_cache();
+        let (supervisor, path) = in_process_supervisor(cache.path());
+        let answer = final_answer(supervisor, &path, |supervisor| {
+            let token = supervisor.token();
+            assert_eq!(
+                token.observe_exit(|_| Ok(0)).expect("observe the exit"),
+                AgentOutcome::Stopped
+            );
+        });
+        assert_eq!(
+            answer,
+            Some(ShutdownOutcome::Stopped {
+                exit_code: 143,
+                advance_suppressed: true,
+                group_signalled: false,
+            })
+        );
     }
 
     // ---- 50-23 (R6-E): the stopped-outcome test hold stays test-only ----
@@ -1928,5 +2214,181 @@ mod tests {
             ],
             "the read, the hold and a decoy wait_agent only after the test-module cut"
         );
+    }
+
+    thread_local! {
+        /// How many times this test thread's accept seam ran.
+        static ACCEPT_ATTEMPTS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn count_accept_attempt() {
+        ACCEPT_ATTEMPTS.with(|attempts| attempts.set(attempts.get() + 1));
+    }
+
+    /// An accept seam that always fails as a process out of descriptors does.
+    fn accept_out_of_descriptors(_: &UnixListener) -> io::Result<(UnixStream, SocketAddr)> {
+        count_accept_attempt();
+        Err(io::Error::from_raw_os_error(libc::EMFILE))
+    }
+
+    /// An accept seam with nothing pending.
+    fn accept_would_block(_: &UnixListener) -> io::Result<(UnixStream, SocketAddr)> {
+        count_accept_attempt();
+        Err(io::ErrorKind::WouldBlock.into())
+    }
+
+    /// An accept seam interrupted once, then with nothing pending.
+    fn accept_interrupted_once(_: &UnixListener) -> io::Result<(UnixStream, SocketAddr)> {
+        count_accept_attempt();
+        if ACCEPT_ATTEMPTS.with(Cell::get) == 1 {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        Err(io::ErrorKind::WouldBlock.into())
+    }
+
+    /// A `Control` on a real, non-blocking listener with `accept` as its
+    /// seam, and one client connected, so `poll` keeps reporting the listener
+    /// readable until something accepts. The sidecar's agent pid numbers no
+    /// process: these tests never stop anything.
+    struct AcceptFixture {
+        control: Control,
+        _client: UnixStream,
+        _cache: tempfile::TempDir,
+    }
+
+    fn accept_fixture(accept: AcceptFn) -> AcceptFixture {
+        let cache = short_cache();
+        let path = cache.path().join("control.sock");
+        let listener = UnixListener::bind(&path).expect("bind the control socket");
+        listener
+            .set_nonblocking(true)
+            .expect("make the listener non-blocking");
+        let client = UnixStream::connect(&path).expect("connect the one client");
+        let socket = SocketPath::new(path).expect("socket path fits");
+        let control = Control {
+            listener,
+            sidecar: test_sidecar(&socket, u32::MAX),
+            token: StopToken::new(OwnerPhase::AgentRunning),
+            quit: Arc::new(AtomicBool::new(false)),
+            accept,
+            accept_backoff: Cell::new(ACCEPT_BACKOFF_START),
+        };
+        AcceptFixture {
+            control,
+            _client: client,
+            _cache: cache,
+        }
+    }
+
+    /// A correct loop makes about 7 attempts in a second (10 ms doubling to
+    /// a 1 s cap); the bound leaves room, and the old loop spun in the
+    /// thousands. The attempts are counted on this thread, so `run` runs here
+    /// and a helper thread tells it to quit.
+    #[test]
+    fn a_persistent_accept_error_backs_off_and_is_logged() {
+        const MAX_ATTEMPTS_IN_A_SECOND: usize = 25;
+        let AcceptFixture {
+            control,
+            _client,
+            _cache,
+        } = accept_fixture(accept_out_of_descriptors);
+        let quit = Arc::clone(&control.quit);
+        let quitter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(1));
+            quit.store(true, Ordering::Release);
+        });
+
+        let parked = control.run();
+        quitter.join().expect("the quitter thread");
+
+        let attempts = ACCEPT_ATTEMPTS.with(Cell::get);
+        let logged = ACCEPT_ERROR_LOGS.with(Cell::get);
+        assert!(parked.is_empty(), "no connection was served");
+        assert!(
+            attempts <= MAX_ATTEMPTS_IN_A_SECOND,
+            "an EMFILE must back off, not spin: {attempts} accept attempts in one second"
+        );
+        assert!(logged >= 1, "the persistent error is logged");
+        assert!(
+            logged <= attempts,
+            "logged {logged} times for {attempts} attempts"
+        );
+    }
+
+    /// A deliberately long backoff makes a sleep in the `WouldBlock` arm
+    /// visible against a margin no scheduling delay reaches.
+    #[test]
+    fn a_would_block_accept_returns_without_backing_off() {
+        const LONG_BACKOFF: Duration = Duration::from_secs(5);
+        let fixture = accept_fixture(accept_would_block);
+        let mut parked = Vec::new();
+
+        fixture.control.accept_all(&mut parked);
+        assert_eq!(ACCEPT_ATTEMPTS.with(Cell::get), 1);
+        assert_eq!(fixture.control.accept_backoff.get(), ACCEPT_BACKOFF_START);
+
+        fixture.control.accept_backoff.set(LONG_BACKOFF);
+        let started = Instant::now();
+        fixture.control.accept_all(&mut parked);
+        assert!(
+            started.elapsed() < LONG_BACKOFF / 2,
+            "a WouldBlock accept slept for {:?}",
+            started.elapsed()
+        );
+        assert_eq!(fixture.control.accept_backoff.get(), LONG_BACKOFF);
+        assert_eq!(ACCEPT_ERROR_LOGS.with(Cell::get), 0, "nothing to log");
+    }
+
+    #[test]
+    fn an_interrupted_accept_retries_without_backing_off() {
+        let fixture = accept_fixture(accept_interrupted_once);
+        fixture.control.accept_all(&mut Vec::new());
+        assert_eq!(
+            ACCEPT_ATTEMPTS.with(Cell::get),
+            2,
+            "an interrupted accept is retried at once"
+        );
+        assert_eq!(fixture.control.accept_backoff.get(), ACCEPT_BACKOFF_START);
+        assert_eq!(ACCEPT_ERROR_LOGS.with(Cell::get), 0, "nothing to log");
+    }
+
+    #[test]
+    fn the_accept_backoff_doubles_up_to_its_cap() {
+        let fixture = accept_fixture(accept_out_of_descriptors);
+        fixture.control.accept_all(&mut Vec::new());
+        assert_eq!(
+            fixture.control.accept_backoff.get(),
+            ACCEPT_BACKOFF_START * 2,
+            "one error doubles the wait"
+        );
+
+        // Doubling this would pass the cap, so it must clamp.
+        let near_cap = ACCEPT_BACKOFF_CAP.mul_f64(0.75);
+        fixture.control.accept_backoff.set(near_cap);
+        let started = Instant::now();
+        fixture.control.accept_all(&mut Vec::new());
+        assert!(
+            started.elapsed() >= near_cap,
+            "the error slept the current wait, {near_cap:?}: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(fixture.control.accept_backoff.get(), ACCEPT_BACKOFF_CAP);
+    }
+
+    /// The client's connection is accepted for real, then read to its close,
+    /// so the next accept finds nothing pending.
+    #[test]
+    fn a_successful_accept_resets_the_backoff() {
+        let AcceptFixture {
+            control,
+            _client: client,
+            _cache,
+        } = accept_fixture(UnixListener::accept);
+        drop(client);
+        control.accept_backoff.set(ACCEPT_BACKOFF_CAP);
+
+        control.accept_all(&mut Vec::new());
+
+        assert_eq!(control.accept_backoff.get(), ACCEPT_BACKOFF_START);
     }
 }

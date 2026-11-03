@@ -48,13 +48,18 @@ pub fn agent_running(pid: u32) -> bool {
 /// Classify a pid that `kill(0)` has just reported as existing, from the read
 /// of its `/proc/<pid>/status`.
 ///
-/// A zombie is not running. A NotFound read means the pid was reaped between
-/// `kill(0)` and the read, so it is gone. Any other unreadable status is
-/// "cannot tell", so `kill(0)`'s answer stands rather than an invented one.
+/// A zombie is not running, nor is a process shown as `X (dead)` while its parent
+/// reaps it. A NotFound read means the pid was reaped between
+/// `kill(0)` and the open, and `ESRCH` that it was reaped between the open and
+/// the read, so either way it is gone. Any other unreadable status is "cannot
+/// tell", so `kill(0)`'s answer stands rather than an invented one.
 fn running_per_status(status: std::io::Result<String>) -> bool {
     match status {
-        Ok(status) => !status_is_zombie(&status),
-        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+        Ok(status) => !status_is_zombie(&status) && !status_is_dead(&status),
+        Err(error) => {
+            error.kind() != std::io::ErrorKind::NotFound
+                && error.raw_os_error() != Some(libc::ESRCH)
+        }
     }
 }
 
@@ -67,11 +72,18 @@ fn is_zombie(pid: u32) -> bool {
 }
 
 fn status_is_zombie(status: &str) -> bool {
+    status_state(status) == Some("Z")
+}
+
+fn status_is_dead(status: &str) -> bool {
+    status_state(status) == Some("X")
+}
+
+fn status_state(status: &str) -> Option<&str> {
     status
         .lines()
         .find(|line| line.starts_with("State:"))
         .and_then(|line| line.split_whitespace().nth(1))
-        .is_some_and(|state| state == "Z")
 }
 
 /// Send SIGTERM to `pid` — the crate's one process-termination call, used by
@@ -786,6 +798,38 @@ mod tests {
         )));
     }
 
+    /// While a parent reaps a zombie, the kernel shows it as `X (dead)` for a
+    /// moment. It must not read as running between two answers that it is not.
+    #[test]
+    fn a_process_being_reaped_reads_as_not_running() {
+        assert!(!super::running_per_status(Ok(
+            "Name:\ttrue\nState:\tX (dead)\n".into()
+        )));
+    }
+
+    /// A status file opened before the reap and read after it fails `ESRCH`, not
+    /// `NotFound`. Reading that as "cannot tell" made `agent_running` answer true
+    /// for a pid it had just answered false for.
+    #[test]
+    fn a_status_read_that_outlives_the_reap_reads_as_not_running() {
+        use std::io::Read as _;
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn a child");
+        let mut status_file =
+            std::fs::File::open(format!("/proc/{}/status", child.id())).expect("open its status");
+        child.kill().expect("kill the child");
+        child.wait().expect("reap the child");
+        let mut status = String::new();
+        let read = status_file.read_to_string(&mut status);
+        let error = read
+            .as_ref()
+            .expect_err("the reaped status has nothing to read");
+        assert_eq!(error.raw_os_error(), Some(libc::ESRCH), "{error:?}");
+        assert!(!super::running_per_status(read.map(|_| status)));
+    }
+
     /// init can make a dead agent look permanently live.
     #[test]
     fn agent_running_is_false_for_an_unreaped_zombie() {
@@ -950,13 +994,20 @@ mod tests {
         // escalation, within the bounded wait.
         let mut child = std::process::Command::new("sh")
             .arg("-c")
-            .arg("trap '' TERM; sleep 30")
+            .arg("trap '' TERM; echo ready; sleep 30")
+            .stdout(std::process::Stdio::piped())
             .spawn()
             .expect("spawn TERM-ignoring child");
         let pid = child.id();
 
-        // Give the shell a moment to install its trap before signalling.
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        // A TERM that lands before the trap kills the shell, which is not this case.
+        let mut ready = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(child.stdout.as_mut().expect("the child's stdout")),
+            &mut ready,
+        )
+        .expect("read the child's ready line");
+        assert_eq!(ready, "ready\n");
 
         let cleared = terminate_and_verify(
             pid,

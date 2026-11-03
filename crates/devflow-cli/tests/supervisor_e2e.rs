@@ -586,6 +586,30 @@ fn status_reports_each_liveness_state_with_its_repair_verb() {
     );
 
     fs::remove_file(&socket).expect("remove the stale socket");
+    // D-19: the SIGKILL orphaned the agent, so `resume` would refuse.
+    let orphaned = run_status(&home, &root);
+    assert!(orphaned.contains("GONE"), "the run reads GONE:\n{orphaned}");
+    let kill_line = format!("kill -TERM -- -{}", record.agent_pgid);
+    assert!(
+        orphaned.contains(&kill_line),
+        "GONE beside a live agent names `{kill_line}`:\n{orphaned}"
+    );
+    assert!(
+        !orphaned.contains(&resume_verb),
+        "GONE beside a live agent names no resume:\n{orphaned}"
+    );
+
+    assert!(
+        devflow_core::agent::is_same_process(record.agent_pgid, record.agent_start_time),
+        "the record's agent {} is the orphan",
+        record.agent_pgid
+    );
+    common::signal_group(record.agent_pgid, libc::SIGKILL);
+    assert!(
+        holds_within(RUN_WAIT, || group_members(record.agent_pgid).is_empty()),
+        "the agent group {} is gone after SIGKILL",
+        record.agent_pgid
+    );
     let gone = run_status(&home, &root);
     assert!(gone.contains("GONE"), "the run reads GONE:\n{gone}");
     assert!(
@@ -649,6 +673,53 @@ fn census_never_sees_a_live_supervisor(supervisor_pid: u32) {
     drop(wrapper);
 }
 
+/// D-01 through the real binary: the `__monitor` re-exec adopts the reserved lock, so
+/// it reads live after the `devflow start` that took it has exited, and it reads
+/// not-live once that supervisor is gone (its last act removes the file).
+#[test]
+fn a_real_supervisor_holds_its_reserved_lock_after_its_launcher_exits() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    let phase = PhaseId::new(64);
+    init_repo(&root, phase);
+    let fake_bin = common::fake_bin_dir(WAITING_CLAUDE);
+    let _reaper = common::LaunchedRunReaper::new(&root, phase, vec![]);
+
+    let output = spawn_start(&home, &root, phase, &fake_bin)
+        .wait_with_output()
+        .expect("wait for the start");
+    assert!(
+        output.status.success(),
+        "start failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let state = devflow_core::workflow::load_state(&root, phase).unwrap();
+    assert_eq!(state.pending_supervisor, None, "the publish promoted it");
+    let record = state.supervisor.expect("the start recorded its supervisor");
+    let liveness_path =
+        devflow_core::liveness::launch_liveness_path(&root, &record.launch_id).unwrap();
+    assert_eq!(
+        devflow_core::liveness::probe(&liveness_path).unwrap(),
+        devflow_core::liveness::Held::Live,
+        "the launcher has exited, so only the supervisor can hold this"
+    );
+
+    let outcome = supervisor::request_shutdown(&record.socket_path, RUN_WAIT);
+    assert!(
+        matches!(outcome, Ok(ShutdownOutcome::Stopped { .. })),
+        "the supervisor stops through its socket: {outcome:?}"
+    );
+    assert!(
+        holds_within(RUN_WAIT, || {
+            devflow_core::liveness::probe(&liveness_path).unwrap()
+                != devflow_core::liveness::Held::Live
+        }),
+        "control: the lock does not outlive its supervisor"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 50-15 (R-1, V-12): two `devflow start` launches racing for one phase yield
 // exactly one live supervisor and one agent group.
@@ -659,8 +730,8 @@ const RACE_GATE_TIMEOUT_SECS: &str = "15";
 
 /// A spawned `devflow start` for `phase` with the arguments the 48-19
 /// live-run refusal tests use (supervise mode, `--no-worktree`, the capture
-/// shape), so a loser fails only at the per-phase lock or at the live-run
-/// guard, never at an earlier refusal.
+/// shape), so a loser fails only at the reservation's live-run guard, never at
+/// an earlier refusal.
 fn spawn_start(
     home: &common::HermeticHome,
     root: &Path,
@@ -752,22 +823,25 @@ fn two_concurrent_starts_yield_exactly_one_live_supervisor() {
         .find(|output| !output.status.success())
         .expect("one start lost");
     let stderr = String::from_utf8_lossy(&loser.stderr);
-    let lock_refusal = stderr.contains("holds the per-phase lock");
-    let live_refusal = stderr.contains(&format!("devflow stop --phase {phase}"))
-        && stderr.contains("a run is still live");
     assert!(
-        lock_refusal || live_refusal,
-        "the loser must be refused at the lock or at the live-run guard, nothing else\n{}",
+        stderr.contains(&format!("devflow stop --phase {phase}")),
+        "the loser's refusal must name `devflow stop`\n{}",
         report(loser)
     );
-    println!(
-        "V-12 loser refusal: {}",
-        if lock_refusal {
-            "per-phase lock"
-        } else {
-            "live-supervisor guard"
-        }
-    );
+    // While the winner is before its spawn its holder decides; once its supervisor is live
+    // the reservation's guard does. Either is a correct refusal, and which one depends on
+    // the timing of this run.
+    let refused_by = if stderr.contains("is held by a foreground DevFlow process") {
+        "the holder"
+    } else if stderr.contains("a run is still live") {
+        "the reservation's live-run guard"
+    } else {
+        panic!(
+            "the loser must be refused by the holder or the live-run guard\n{}",
+            report(loser)
+        );
+    };
+    println!("the loser was refused by {refused_by}");
 
     let (alive, pgids) = live_supervisors(&home);
     assert_eq!(
@@ -930,7 +1004,6 @@ impl HeldStdoutRun {
         state.stage = devflow_core::stage::Stage::Code;
         state.stop_until = Some(devflow_core::stage::Stage::Code);
         state.stopped = false;
-        devflow_core::workflow::save_state(&state).unwrap();
 
         let aux_path = aux.path().to_path_buf();
         let record = aux_path.join("holder");
@@ -960,6 +1033,16 @@ impl HeldStdoutRun {
         let socket =
             supervisor::SocketPath::for_launch(&home.cache_dir(), &root, phase, &launch_id)
                 .expect("the hermetic socket path fits sun_path");
+        // The state must record this launch, as a launcher's publish does: the monitor
+        // started directly has no launcher to promote it (D-15).
+        state.supervisor = Some(devflow_core::state::SupervisorRecord::new(
+            socket.as_path().to_path_buf(),
+            launch_id.clone(),
+            4_294_967_000,
+            1,
+            String::new(),
+        ));
+        devflow_core::workflow::save_state(&state).unwrap();
         let mut command = common::hermetic_devflow(&home);
         command
             .arg("__monitor")
@@ -1218,9 +1301,9 @@ fn a_completed_stream_run_reaches_its_advance_once_its_leftover_process_released
 /// with its agent's stdout held ends the run at advance safe point 1: no
 /// `--until` halt, no next stage, the socket removed, the supervisor gone.
 /// The hold parks the supervisor in `advancing` and releases on the stop
-/// request, so the stop lands there deterministically. The exit file keeps
-/// the agent's own `0` (backlog 999.166 item 6), asserted so the record says
-/// what happened.
+/// request, so the stop lands there deterministically. The exit file records
+/// the stop outcome, `143`, in place of the agent's own `0`, and `stop`'s line
+/// says nothing was signalled (D-16).
 #[test]
 fn a_stop_sent_while_a_completed_run_waits_on_a_held_stdout_ends_it_at_safe_point_1() {
     let phase = PhaseId::new(74);
@@ -1269,9 +1352,14 @@ fn a_stop_sent_while_a_completed_run_waits_on_a_held_stdout_ends_it_at_safe_poin
     }
     assert!(
         stop_stdout.contains(&format!(
-            "stop: stopped phase {phase} through its supervisor"
+            "stop: stopped phase {phase} through its supervisor (honoured at an advance safe \
+             point; nothing was signalled; exit code 143)"
         )),
         "stdout: {stop_stdout}\nstderr: {stop_stderr}"
+    );
+    assert!(
+        !stop_stdout.contains("agent group ended"),
+        "nothing was signalled: {stop_stdout}"
     );
 
     let Some(status) = run.wait_exit(Duration::from_secs(20)) else {
@@ -1310,7 +1398,7 @@ fn a_stop_sent_while_a_completed_run_waits_on_a_held_stdout_ends_it_at_safe_poin
     ));
     assert_eq!(
         run.exit_file(),
-        "0",
-        "the exit file keeps the agent's own code (999.166 item 6)"
+        "143",
+        "the exit file records the stop outcome, not the agent's own code (D-16)"
     );
 }
