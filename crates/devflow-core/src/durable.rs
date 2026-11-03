@@ -126,11 +126,12 @@ pub(crate) fn publish_exclusive_durably(
 /// directory fsync or the temp removal failed) withdraws the link before returning,
 /// so an `Err` always means nothing is published at `path`.
 ///
-/// Only for a target whose every publisher and reader that acts on it holds one lock
-/// the caller holds now, so no one can see the link before it is withdrawn: a gate's
-/// claim ack under the gate lock. An answer is read without that lock, so it does not
-/// qualify. The withdrawal is itself not known durable when the directory cannot be
-/// synced.
+/// Only for a target whose every publisher, and every reader that consumes it, holds
+/// one lock the caller holds now, so no consumer can act on the link before it is
+/// withdrawn: a gate's claim ack under the gate lock. Lock-free readers (`stop`'s
+/// already-claimed check, `status`'s hints) can still see it for that moment and read
+/// it as claimed. An answer is consumed without that lock, so it does not qualify. The
+/// withdrawal is itself not known durable when the directory cannot be synced.
 pub(crate) fn publish_exclusive_durably_or_withdraw(
     path: &Path,
     contents: &[u8],
