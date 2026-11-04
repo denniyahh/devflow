@@ -1031,6 +1031,26 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.182: `stop`'s "Not Marked" Message Can Name the Wrong Pid (BACKLOG)
+
+**Found:** 2026-11-02, Phase 50.1-29 (recorded in that phase's `deferred-items.md`); promoted 2026-11-04. Checked by reading the code, not reproduced.
+
+**Defect:** `holder_still_running` (`crates/devflow-cli/src/commands.rs`) reads the holder pid from the record after the `TERMINATE_VERIFY_WAIT` (3 s) wait. If the signalled holder exits and another foreground process claims the phase inside that wait, the message says it signalled the new pid.
+
+**Effect:** the message only. Nothing is signalled or written for the wrong pid. It needs two foreground commands racing inside 3 s.
+
+**Fix shape (not tested):** carry the pid `stop` actually signalled from the signal step to the message instead of re-reading the record; `signal_sent` is a bool today. Test with a holder replaced during the wait.
+
+### Phase 999.181: A `devflow stop` Signal to `devflow parallel` Also Stops Phases It Launches Later (BACKLOG)
+
+**Found:** 2026-11-02, Phase 50.1-29 (recorded in that phase's `deferred-items.md`); promoted 2026-11-04. Checked by reading `parallel.rs` and `stop_requested_at_safe_point`, not reproduced.
+
+**Defect:** `install_holder_stop_handler` (`crates/devflow-core/src/liveness.rs`) sets one process-wide flag that is never cleared (50.1 D-18 specifies one flag per process). `devflow parallel` runs `start` for each phase in one process, so after one stop signal every later `start` in that process stops at safe point 2.
+
+**Effect:** over-stopping. Each phase records its stop in its own state, and `devflow resume` continues it. No state is lost.
+
+**Fix shape (not decided):** scope the flag to the phase a `start` holds, or clear it when a phase's holder is released; test two phases in one `parallel` process with a signal between them.
+
 ### Phase 999.180: An Approved Validate Gate Is Not Closed Before Ship (BACKLOG)
 
 **Found:** 2026-11-03, Phase 50.1's external review round 4 (Antigravity); checked by reading the code, not reproduced. Already in `ee6ec79`.

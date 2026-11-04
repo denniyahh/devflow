@@ -30,5 +30,11 @@ Shapes that have shipped a false green, or a gate that fails correct work, here.
 - Use `scripts/phase-worktree.sh <phase>` to initialize or attach to a phase worktree.
 - Never run concurrent git operations on the main checkout while an executor holds the working tree.
 
+## Dogfooding (operator rule, 2026-11-04)
+- From Phase 51 on, DevFlow drives its own phases: run them with `devflow start --phase N --mode <auto|supervise>` and the pipeline's gates, not by hand-running GSD commands in an agent session. A stage run by hand is an exception: say so and give the reason in the phase's notes.
+- Run the installed release binary. Check `devflow --version` against the version you mean to test before a run, and reinstall (`cargo install --path crates/devflow-cli --locked --force`) after any source change the run depends on.
+- A defect the run hits is a DevFlow finding: log it as a `999.x` backlog entry. Do not work around it without recording it.
+- Phase 50.1 was executed with `/gsd-execute-phase` in a session, not by DevFlow. Its last live run used an earlier build, and no run has exercised the final 3.0.0 code.
+
 ## Development Setup Checklist
 - When modifying CI workflows, hooks, devcontainers, or tooling dependencies, keep `.planning/user/DEV-SETUP-CHECKLIST.md` updated in the same commit (warned by `scripts/hooks/post-commit`).

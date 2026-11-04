@@ -59,33 +59,13 @@ stale; it was restored from `9411158` on 2026-09-13. Do not reintroduce the bold
 
 ## Active Phase
 
-**Phase 48 — Survivable State Writes and Honest Gate Recovery is complete** (20/20 plans including gap
-closures 48-18..48-20; verification passed 7/7 on 2026-09-23 after the operator ruled 999.139 on
-`start` outside criterion 2) and **merged to `develop` via PR #218** (`1bf88b4`, 2026-09-24) after four CI timing-race fixes. Phase 49 is next. Milestone **v3.0.0 — Unattended Run Survivability** was
-declared 2026-09-03 and its roadmap created the same day: 6 phases (46-51), 5 waves, 10/10
-requirements mapped. Phase 46 is complete (9/9 plans, verification passed, merged via PR #208).
-Phase 47 is complete (7/7 plans) and integrated: merged to `develop` via PR #213 and into
-`workspace/denniyahh`. Its verification recorded `passed` 39/39 with one operator-accepted override, and now reads
-`stale`: `.planning/ROADMAP.md` is one of its 48 covered files, and `phase.complete`'s own write in
-`4bb9504` changed it (the covered digest recomputed with that file reverted to `3fa9206` matches the
-recorded one). Phase 49 is planned (12 plans, 6 waves, replanned 2026-09-29 after the re-scope); Phases 50-51 remain unplanned.
+**Phase 51 — Rate-Limit Agent Failover is next and unplanned.** Phase 50.1 (Split-Lock State-Handling Overhaul) is complete: 30/30 plans, verification passed 12/12 with one operator override (the live-run criterion), merged to `develop` via PR #229 and into `workspace/denniyahh` (2026-11-04). **v3.0.0 was released 2026-11-03/04**: `main` at `46064c6`, signed tag `v3.0.0`, `devflow-core` and `devflow` 3.0.0 on crates.io, GitHub Release and docs published. It carries Phases 46 to 50.1.
 
-**The wave order is the milestone's core design, not a preference.** Correctness (46, 47) →
-survivability (48) → the live `--mode auto` run that measures them (49) → the socket-addressable
-supervisor (50) → rate-limit failover on top of it (51). Phase 49 is the measuring instrument;
-landing it earlier would measure the defects rather than the chain.
+Milestone **v3.0.0 — Unattended Run Survivability**: 6 of 7 phases complete (46, 47, 48, 49, 50, 50.1). Phase 51 remains and is to ship as a minor release (3.1.0), per the operator's 2026-10-09 plan. The wave order is the milestone's design: correctness (46, 47) → survivability (48) → the live `--mode auto` run that measures them (49) → the socket-addressable supervisor (50, 50.1) → rate-limit failover on top (51).
 
-**Two open questions are deliberately carried, not closed on a source read:** DECN-03's behavioural
-arm — Phase 47 removed the prompt-level contradiction, for claude only; which instruction a model
-actually follows is still unobserved — resolves against Phase 49's live run under
-`47-PHASE49-OBSERVATION.md`'s evidence standard, and SURV-01's field arm (no state-write
-interleaving has ever been observed in the wild) is recorded — not settled — by that same run.
+**Dogfooding resumes with Phase 51** (operator rule 2026-11-04, `CLAUDE.md`): DevFlow drives its own phases. No run has exercised the final 3.0.0 code; Phase 50.1's last live attempt used an earlier build.
 
-**Carried forward from the v2.8.0 close, NOT in this milestone:** **999.120** (residual ambient
-`git_flow_for_project` re-resolution in the Validate loop-back) and **999.121** (OpenCode has no
-`devflow start`-level marker-less regression test). Filed by Phase 47 and **promoted on 2026-09-13**:
-**999.125** (preflight and resume disagree on where a `blocking-human` gate exists) and **999.126**
-(a checkpoint added after Code preflight is never re-scanned), along with **999.38** (test-suite PATH race).
+The text this section carried until 2026-11-04 described Phase 48 as the latest phase. It is in git history.
 
 ## Project Reference
 
@@ -97,12 +77,10 @@ pipeline, never silently corrupt state or lose a human's gate decision.
 
 ## Operator Next Steps
 
-- **Plan to the 3.0.0 release (operator decisions 2026-10-09):**
-  1. The declared-checkpoint fix (formerly Phase 49.1, 49-REVIEW CR-01) is done outside GSD, on a fix branch from
-     `develop` with an external adversarial review as the gate. Phase 49.1 was removed with `phase.remove`.
-  2. Phase 50 runs as a DevFlow dogfood run, after the fix merges and DevFlow is reinstalled from `develop`. Ship is
-     blocked during the run, and close-out is done by hand with `scripts/cut-pr-branch.sh`.
-  3. Release 3.0.0 after Phase 50. Then prune the backlog, then Phase 51 as a minor release (3.1.0).
+- **3.0.0 release plan (operator decisions 2026-10-09): steps 1 and 2 done, step 3 half done.**
+  1. The declared-checkpoint fix was done outside GSD and merged; Phase 49.1 was removed.
+  2. Phase 50 ran as a dogfood run; Phase 50.1 followed. 3.0.0 was released 2026-11-03/04.
+  3. **Still to do: prune the backlog, then Phase 51 as a minor release (3.1.0)**, run through DevFlow itself (see `CLAUDE.md`, Dogfooding).
 - Phase 47's `stale` verification is **left stale by operator decision (2026-09-13)** — re-verifying
   now would hold only until the next ROADMAP.md write. Re-run the verifier once near milestone
   close, when ROADMAP.md stops changing. Until then `roadmap.analyze` counts 47 as `partial` and
@@ -117,11 +95,9 @@ pipeline, never silently corrupt state or lose a human's gate decision.
   runs the harness inside `cargo test`. Record an override; do not restore the file.
 - **Retrospective review complete (2026-09-13):** `.planning/audits/2026-09-13-phase-47-retrospective.md` is CLOSED. Decisions resolved: D1 Option A (minimal-divergence workspace), D2 P1–P5 process improvements adopted (P1/P2 now, P3/P4 in Phase 48, P5 post-P1), D3 backlog items 999.125, 999.126, and 999.38 promoted now.
 - **Promoted into active roadmap (2026-09-13):** 999.125 and 999.126 (human-gate consistency between preflight and resume) scheduled into Wave 2 alongside Phase 48; 999.38 (test-suite PATH race) scheduled for test-suite isolation. Backlog items remaining unpromoted: 999.120, 999.121.
-- Phase 48 is complete and merged to `develop` via PR #218 (2026-09-24). Phase 49 context gathered 2026-09-24 (`49-CONTEXT.md`); planned 2026-09-25 and revised after adversarial reviews (`49-REVIEWS.md`, `a913495`), then re-scoped 2026-09-28 (ROADMAP `968b713`, context `066251f`): the 18 plans were retired (`bc73b1b`) and the phase replanned 2026-09-29 as 12 plans in 6 waves (`fe5bd3a`…`76c21ca`); next `/gsd-execute-phase 49`. After Phase 49 verification and transition, the orchestrating session owns the ROADMAP post-completion gate: merge `feature/phase-49` into `workspace/denniyahh`, run `scripts/sync-workspace.sh`, verify the divergence check and the pushed ref.
+- Phase 48 is complete and merged to `develop` via PR #218 (2026-09-24). Phase 49 context gathered 2026-09-24 (`49-CONTEXT.md`); planned 2026-09-25 and revised after adversarial reviews (`49-REVIEWS.md`, `a913495`), then re-scoped 2026-09-28 (ROADMAP `968b713`, context `066251f`): the 18 plans were retired (`bc73b1b`) and the phase replanned 2026-09-29 as 12 plans in 6 waves (`fe5bd3a`…`76c21ca`). Phases 49, 50 and 50.1 have since completed (see `## Active Phase`).
   Separate follow-up PR: the plan-linter P1 commits `5c18bc3`, `b9ee940`, `56f3466` (kept out of #218). The 48-20 code review's 4 warnings (test coverage
   and duplication, `48-REVIEW.md`) were left unfixed at close.
-- Phase 49 carries a **setup step**: this repository has no committed `devflow.toml`, so a
-  `base_branch` must be configured before the live `--mode auto` run is possible.
 
 ---
 
@@ -195,21 +171,13 @@ change earns 2.0.
 ## Current Position
 
 Phase: 51 — Rate-Limit Agent Failover
-Plans: 30 (50.1-01…50.1-30, 22 waves; 50.1-27 is the one live-attempt checkpoint) — execute via `/gsd-execute-phase 50.1` from `.worktrees/phase-50.1`
+Plans: none yet (Phase 51 is unplanned)
 Current Plan: Not started
-Total Plans in Phase: 30
-Completed Plans: 0 of 30
+Total Plans in Phase: 0
+Completed Plans: 0 of 0
 Status: Ready to plan
-Previous phase: 48 — complete, 20/20 plans; verification passed 7/7 on 2026-09-23 after gap closure 48-20, with the operator ruling 999.139 on `start` outside criterion 2. Before that, 47 — complete, 7/7 plans (47-01..47-05 across 4 waves plus gap closures 47-06 and
-47-07). Verification recorded passed 39/39 with one operator-accepted override; reads `stale` since
-`4bb9504` (see `## Active Phase`).
-The D-13 assumption was verified false and its two latent defects are now backlog entries 999.125
-and 999.126. DECN-03's unresolved behavioural arm has an explicit claude-only evidence standard
-for Phase 49; it is not settled by source inspection.
-Phase 46's own deferrals remain tracked: C-05/C-07 against GitHub #207, `cargo nextest` on the
-backlog, deferred-items.md #46-05-#2 (seven tracked plans fail the bashism scanner) grandfathered
-by the scanner's staged-only scope.
-Last activity: 2026-11-02 — Phase 50.1 complete, transitioned to Phase 51
+Previous phase: 50.1 — complete, 30/30 plans; verification passed 12/12 (one operator override, the live-run criterion); merged via PR #229; released in v3.0.0. Phase 47's verification still reads `stale` by operator decision (re-verify near milestone close).
+Last activity: 2026-11-04 — v3.0.0 released; Phase 50.1 merged into workspace/denniyahh; STATE refreshed; backlog 999.181-182 filed
 
 Progress: [████████░░] 86% (6 of 7 phases complete in the ROADMAP progress table — 46, 47, 48, 49, 50, 50.1; 49.1 inserted and removed 2026-10-09; 50.1 inserted 2026-10-10. `roadmap.analyze` reports 2 because it reads 47 and 48 as executed, and `progress.bar` counts plans, 48/48)
 
@@ -965,15 +933,13 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 
 ## Session
 
-**Last session:** 2026-10-23T20:11:43.795Z
-**Stopped at:** Phase 50.1 complete, ready to plan Phase 51
+**Last session:** 2026-11-04
+**Stopped at:** Phase 50.1 complete and released in v3.0.0; ready to plan Phase 51
 **Resume file:** .planning/phases/50.1-split-lock-state-handling-overhaul/50.1-CONTEXT.md
 
 ## Operator Next Steps
 
-- See `## Operator Next Steps` near the top of this file. Phase 47 is integrated and the Phase 48
-  worktree exists; Phase 48 is complete and merged via PR #218, and Phase 49 was re-scoped 2026-09-28 (disposable GSD project, one operator checkpoint per attempt) with its context updated and the phase replanned 2026-09-29 (12 plans, 6 waves); the next command is `/gsd-execute-phase 49`. Phase 47's verification stays
-  `stale` by operator decision until a re-verify near milestone close.
+- See `## Operator Next Steps` near the top of this file.
 
 ## Accumulated Context
 
