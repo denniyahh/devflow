@@ -1135,7 +1135,7 @@ already is), so committed evidence shows which turn carried which rule.
 
 **Fix shape (not tested):** have a safe point also read the state's `stopped` field.
 
-### Phase 999.171: `agent_running` Can Report a Just-Reaped Process as Running (BACKLOG)
+### Phase 999.171: `agent_running` Can Report a Just-Reaped Process as Running (RESOLVED 2026-11-04 — 0268976)
 
 **Found:** 2026-11-01, Phase 50.1 plan 50.1-06, full core test run.
 
@@ -1280,7 +1280,7 @@ can find the agent by `/proc/<pid>/environ` and verify it without a recorded pid
 Plans:
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
-### Phase 999.157: A Natural Agent Exit Leaves the Agent's Background Processes Running (BACKLOG)
+### Phase 999.157: A Natural Agent Exit Leaves the Agent's Background Processes Running (DUPLICATE of 999.164 item 5)
 
 **Found:** 2026-10-14, Phase 50 research, Open Question 3 (`50-RESEARCH.md`). It was a research idea, not an observed
 defect. Operator chose to file it on 2026-10-15.
@@ -1387,7 +1387,7 @@ on a planted wrong input; the shell versions are deleted, with their callers upd
 Plans:
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
-### Phase 999.162: A Gate Response Written During Cleanup Can Outlive Its Gate (BACKLOG)
+### Phase 999.162: A Gate Response Written During Cleanup Can Outlive Its Gate (RESOLVED 2026-11-04 — Phase 50.1 gate-id keying)
 
 **Found:** 2026-10-18, by code reading during the Phase 50 flake hunt (`96b457b`'s debugger); confirmed by reading
 `crates/devflow-core/src/gates.rs` on 2026-10-19. **Not reproduced.** Pre-dates Phase 50; applies to every gate.
@@ -1479,7 +1479,7 @@ explicitly accepted with a reason.
 Plans:
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
-### Phase 999.166: Supervisor Residuals From the Phase 50 Code Review (BACKLOG)
+### Phase 999.166: Supervisor Residuals From the Phase 50 Code Review (FOLDED INTO Phase 50.1)
 
 **Folded into Phase 50.1 (2026-10-24).** Landed by: item 1 and item 6, 50.1-24; item 2, 50.1-21; item 4 and item 7's core half, 50.1-08; item 5 and item 9, 50.1-02; item 7 and item 8, 50.1-22. Item 3 was fixed in Phase 50.
 
@@ -1650,7 +1650,7 @@ is ambiguous.
 exercises `cut-pr-branch.sh` today** (checked 2026-09-24: no file under `crates/` or `scripts/` except
 `check-workspace-divergence.sh` references it), so this needs the script's first harness.
 
-### Phase 999.145: `spawn_with_timeout_kills_a_silent_same_group_descendant_after_parent_exit` Flakes in the Container Gate (BACKLOG)
+### Phase 999.145: `spawn_with_timeout_kills_a_silent_same_group_descendant_after_parent_exit` Flakes in the Container Gate (RESOLVED 2026-11-04 — 0268976, same family as 999.135)
 
 **Found:** 2026-09-24, pinned-container pre-push gate for the tooling-upstream PR (the PR changed no Rust source).
 Failed once; not yet reproduced. Same family as the four Phase 48 races fixed in PR #218.
@@ -1716,7 +1716,7 @@ worktree and branch so `resume` can proceed; correct the 48-19/48-20 refusal tex
 **Acceptance:** not decided; set at promotion. Needs a failing test: a recorded agent pid reused by an
 unrelated live process, where the fix lets the phase resume without losing its work.
 
-### Phase 999.142: Hints Prescribe `devflow resume` Where the Live-Run Guard Refuses It (BACKLOG)
+### Phase 999.142: Hints Prescribe `devflow resume` Where the Live-Run Guard Refuses It (RESOLVED 2026-11-04 — Phase 50.1 criterion 2)
 
 **Found:** 2026-09-23 while planning 48-20 (48-20-PLAN.md "Hint inventory", H1-H10); the fix-shape half
 of 999.140 the promotion did not cover (48-REVIEW.md WR-04). **Operator decision 2026-09-23:** option (b),
@@ -1740,7 +1740,7 @@ and name the repair that works there, as the 48-19/48-20 refusal text does, inst
 **Acceptance:** not decided; set at promotion. Needs a test per lasting site: the hint never names
 `devflow resume` in a state where `resume` refuses, with a control that still names it for a dead leftover.
 
-### Phase 999.141: E2E Tests Write Real `~/.cache/devflow/roots` and Leak Monitors (BACKLOG)
+### Phase 999.141: E2E Tests Write Real `~/.cache/devflow/roots` and Leak Monitors (RESOLVED 2026-11-04 — test home isolation guard)
 
 **Folded 2026-10-10 into Phase 50** (operator decision, `50-CONTEXT.md` D-07). This entry stays as the evidence record; the work is tracked there.
 
@@ -1785,7 +1785,7 @@ the lock; decide whether `status` should stop suggesting `resume` while the agen
 
 **Acceptance:** not decided; set at promotion. Needs a failing e2e test: `resume` against a live agent pid.
 
-### Phase 999.139: A State File That Will Not Load Hides a Live Monitor From `start`'s Guard (BACKLOG)
+### Phase 999.139: A State File That Will Not Load Hides a Live Monitor From `start`'s Guard (RESOLVED 2026-11-04 — Phase 50.1, ef856e6)
 
 **Folded 2026-10-10 into Phase 50** (operator decision, `50-CONTEXT.md` D-09). This entry stays as the evidence record; the work is tracked there.
 
@@ -1809,7 +1809,7 @@ but will not load (fail closed, pointing at `recover --clean`), or recover the m
 **Acceptance:** not decided; set at promotion. Needs a failing test with a corrupt state file and a live
 recorded monitor.
 
-### Phase 999.138: `devflow stop` Cannot End a Run That Holds No Lock (BACKLOG)
+### Phase 999.138: `devflow stop` Cannot End a Run That Holds No Lock (RESOLVED 2026-11-04 — Phase 50, `stop` goes through the socket)
 
 **Folded 2026-10-10 into Phase 50** (operator decision, `50-CONTEXT.md` D-04 and D-10). This entry stays as the evidence record; the work is tracked there.
 
@@ -1862,7 +1862,7 @@ the unparsable-state case; restrict `phases_on_disk` to the canonical gate/respo
 
 **Acceptance:** not decided; set at promotion.
 
-### Phase 999.136: Recover Sweep Deletes a Live Run Between Agent Exit and Advance (BACKLOG)
+### Phase 999.136: Recover Sweep Deletes a Live Run Between Agent Exit and Advance (RESOLVED 2026-11-04 — Phase 50.1, `recover` rechecks liveness under the state lock)
 
 **Found:** 2026-09-22, Phase 48 scoped code review (`48-REVIEW.md` WR-05, reviewed at `2070a65`).
 **Reasoned from code only — not reproduced.**
@@ -1887,7 +1887,7 @@ re-run the staleness checks; treat an identity-checked live `state.monitor_pid` 
 **Acceptance:** not decided; set at promotion. Needs a failing test that holds the agent-exited /
 advance-not-yet-locked window open before any fix.
 
-### Phase 999.135: Probe Descendant Survives the Group Kill Under Full-Gate Load (BACKLOG)
+### Phase 999.135: Probe Descendant Survives the Group Kill Under Full-Gate Load (RESOLVED 2026-11-04 — 0268976 fixed the zero-poll signature; the original 2 s survivor was never root-caused)
 
 **Found:** 2026-09-22, in a full `scripts/check-in-container.sh all` at `1d93895`:
 `agents::opencode::tests::spawn_with_timeout_kills_a_hung_child` failed with `the timed-out probe's
@@ -1931,7 +1931,7 @@ from the next natural full-gate failure, or force it with ~15 repeated full-gate
 
 **Acceptance:** not decided; set at promotion.
 
-### Phase 999.134: PipeOwning Monitor Orphans Its Agent on TERM (BACKLOG)
+### Phase 999.134: PipeOwning Monitor Orphans Its Agent on TERM (RESOLVED 2026-11-04 — Phase 50, the supervisor handles TERM and INT)
 
 **Folded 2026-10-10 into Phase 50** (operator decision, `50-CONTEXT.md` D-05 and D-10). This entry stays as the evidence record; the work is tracked there.
 
@@ -2012,7 +2012,7 @@ directly, then delete `ENV_MUTEX`.
 
 **Acceptance:** not decided; set at promotion.
 
-### Phase 999.130: Split-Lock State-Handling Overhaul (BACKLOG)
+### Phase 999.130: Split-Lock State-Handling Overhaul (PROMOTED — Phase 50.1)
 
 **Promoted 2026-10-10 to Phase 50.1** (operator decision, `50-CONTEXT.md` D-11). This entry stays as the evidence record; the work is tracked there.
 
@@ -2075,7 +2075,7 @@ then `devflow ship --phase N`.
 
 **Acceptance:** not decided; set at promotion.
 
-### Phase 999.128: Lock Reclaim Ignores the Holder's Start Time (BACKLOG)
+### Phase 999.128: Lock Reclaim Ignores the Holder's Start Time (RESOLVED 2026-11-04 — Phase 50.1, `lock.rs` reclaims a recycled holder)
 
 **Folded 2026-10-10 into Phase 50** (operator decision, `50-CONTEXT.md` D-08). This entry stays as the evidence record; the work is tracked there.
 
@@ -2517,7 +2517,7 @@ planning branch, and the Ship merge target has never been observed at all. `devf
 absent from this repository (confirmed 2026-09-03), so the setup step this entry names is still
 outstanding.
 
-### Phase 999.118: `write_state_atomic` Uses a Fixed `.tmp` Filename, So Two Processes Saving the Same Phase Race (BACKLOG)
+### Phase 999.118: `write_state_atomic` Uses a Fixed `.tmp` Filename, So Two Processes Saving the Same Phase Race (RESOLVED 2026-11-04 — unique temp names in `durable.rs` (Phase 50.1))
 
 **Found:** 2026-09-02, phase 45 external adversarial code review (agy / gemini-3.1-pro-high;
 `45-EXTERNAL-REVIEW-agy.md`). Filed as its own entry rather than fixed in phase 45 because
@@ -2591,7 +2591,7 @@ non-member directory under `crates/`. Either makes the divergence reachable, and
 then need to parse `[workspace] members` and — critically — fail toward Stale on an unparseable
 manifest rather than toward Fresh.
 
-### Phase 999.116: `CODE_STAGE_POLICY` Contradicts `checkpoint_auto_decide_prompt` in the Same Resumed Session (BACKLOG)
+### Phase 999.116: `CODE_STAGE_POLICY` Contradicts `checkpoint_auto_decide_prompt` in the Same Resumed Session (RESOLVED 2026-11-04 — Phase 47-03)
 
 **Found:** 2026-09-02, phase 45 code review (CR-04, `45-REVIEW.md`), deferred by operator
 decision the same day so 45-01's two trunk-resolution blockers could land on their own.
@@ -2617,7 +2617,7 @@ phase added), and 45-03's own note that it deliberately preserved human-only han
 
 ---
 
-### Phase 999.115: The Unattended Decision Policy Never Reaches the Claude Loop-Back Code Prompt (BACKLOG)
+### Phase 999.115: The Unattended Decision Policy Never Reaches the Claude Loop-Back Code Prompt (RESOLVED 2026-11-04 — Phase 47)
 
 **Found:** 2026-09-02, phase 45 code review (CR-03, `45-REVIEW.md`), deferred with 999.116.
 
@@ -2658,7 +2658,7 @@ control that `GapsOnly`/`AuditFix` still carry nothing.
 
 ---
 
-### Phase 999.114: Test Binary Blanks Process-Global `PATH`, Failing Whichever Concurrent Test Happens to Spawn a Program (BACKLOG)
+### Phase 999.114: Test Binary Blanks Process-Global `PATH`, Failing Whichever Concurrent Test Happens to Spawn a Program (RESOLVED 2026-11-04 — Phase 46-07 deleted the process-global PATH guard)
 
 **Found:** 2026-09-02, phase 45, verifying the CR-01/CR-02 fixes.
 
@@ -2985,7 +2985,7 @@ runtime) exists. **Size:** M.
 
 ---
 
-### Phase 999.92: The 999.47 Regression Test Loses Its Own Fixture Shape Before It Asserts — Flaky, and Weak When Green (BACKLOG)
+### Phase 999.92: The 999.47 Regression Test Loses Its Own Fixture Shape Before It Asserts — Flaky, and Weak When Green (RESOLVED 2026-11-04 — trap-held shell fixture with a premise assert)
 
 **GitHub:** [#161](https://github.com/denniyahh/devflow/issues/161) (migrated from Linear DEN-113)
 **Found:** 2026-08-07 by `/gsd-validate-phase 35`. Surfaced as a one-off flake during the phase
@@ -3413,7 +3413,7 @@ the fix, and are not coverage.
 through `git.rs` against the measured inputs, not observed by running the command. The inputs are
 measured; the verdict is inferred from them.
 
-### Phase 999.85: Two Protected Comments Now Justify Themselves by a Mechanism Phase 34 Deleted (BACKLOG)
+### Phase 999.85: Two Protected Comments Now Justify Themselves by a Mechanism Phase 34 Deleted (RESOLVED 2026-11-04 — Phase 40 MAINT-01, f07ab99)
 
 **Linear:** [DEN-107](https://linear.app/denniskim/issue/DEN-107/99985-two-protected-comments-now-justify-themselves-by-a-mechanism)
 **Found:** 2026-08-06, Phase 34 security audit (`34-SECURITY.md` findings F-34-01 and F-34-02).
@@ -3595,7 +3595,7 @@ copies diverged; expose `phase_branch_name`. IN-04 — `commit_on_feature_branch
 (`test_support.rs:112-137`) never restores the prior checkout, benign for its two callers but a
 landmine for any future Validate→Ship pairing.
 
-### Phase 999.80: Three Test Sites Are Protected From Spawning a Real Agent Only by a Content-Dependent Gate Response, Not Structurally (BACKLOG)
+### Phase 999.80: Three Test Sites Are Protected From Spawning a Real Agent Only by a Content-Dependent Gate Response, Not Structurally (RESOLVED 2026-11-04 — Phase 48 TEST-01, child-only test helper)
 
 **Phase 48 (2026-09-14):** worked together with 999.38 as TEST-01
 
@@ -5030,7 +5030,7 @@ Plans:
 
 - [x] Promoted to Phase 26 — see the Phase 26 entry for the active tracking
 
-### Phase 999.53: CI Cannot Reproduce the Load Shape That Catches Exec-Visibility Races (BACKLOG)
+### Phase 999.53: CI Cannot Reproduce the Load Shape That Catches Exec-Visibility Races (RESOLVED 2026-11-04 — the `Sequential 2-CPU check` CI job)
 
 **Goal:** `.github/workflows/ci.yml` runs `fmt`, `clippy` and `test` as **three separate parallel jobs** on `ubuntu-24.04`, each invoking its own `scripts/check.sh <part>`; the `Test` job runs `scripts/check.sh test` alone. Every observed reproduction of 999.47 required the **sequential** `fmt → clippy → test` ordering on a loaded 2-core box — the shape `scripts/check-in-container.sh all` produces under `taskset -c 0,1`, which is what the `pre-push` hook runs. Splitting the checks into parallel jobs destroys exactly the condition that produces the race.
 
@@ -5128,7 +5128,7 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
-### Phase 999.58: The Pre-Push Container Gate Cannot Run From a Linked Worktree (BACKLOG)
+### Phase 999.58: The Pre-Push Container Gate Cannot Run From a Linked Worktree (RESOLVED 2026-11-04 — `check-in-container.sh` mounts the worktree and common gitdir)
 
 **Goal:** `scripts/check-in-container.sh` — the pinned-image gate wired in as `core.hooksPath=scripts/hooks`'s `pre-push` — **fails 100% of the time when the push originates from a linked worktree**, for reasons entirely unrelated to the code being pushed. Two tests fail, and one of them fails with a message that reads as a serious security regression. This collides directly with this project's standing practice of doing phase work in worktrees, so the trap is on the default path, not an edge case.
 
@@ -5387,7 +5387,7 @@ mode requires the `&dyn AgentAdapter` → `&dyn AgentDriver` signature migration
 regression-sensitive code in the repo; the four legacy structs and the `DriverShim` are deleted once
 every call site resolves through `AgentDriver`.
 
-### Phase 999.107: Two Pre-Existing Codex-Parser Defects Surfaced by the Phase 37 Code Review (BACKLOG)
+### Phase 999.107: Two Pre-Existing Codex-Parser Defects Surfaced by the Phase 37 Code Review (RESOLVED 2026-11-04 — both Codex-parser defects fixed)
 
 **Found:** 2026-08-16, the Phase 37 code review. Pre-existing (not introduced by Phase 37 — both
 functions predate the diff), but real:
@@ -5497,7 +5497,7 @@ reusable core.
 
 ---
 
-### Phase 999.104: Fix `release --check` Signing-Key Probe Target & Fingerprint Validation (BACKLOG)
+### Phase 999.104: Fix `release --check` Signing-Key Probe Target & Fingerprint Validation (RESOLVED 2026-11-04 — the signing-key probe was removed, not retargeted)
 
 **Refocused 2026-09-01.** Narrowed from an open-ended workflow discussion to a concrete probe and validation fix.
 
@@ -5803,7 +5803,7 @@ prompt builder emits (`/gsd-code-review {phase}`, `/gsd-ship {phase}`,
 made after first choosing widening over renumbering 35.1/35.2 to integers. Phase 35.1 could not
 start until it landed, and a phase to unblock a phase was not worth the ceremony.
 
-### Phase 999.96: `release --check` Cannot Catch a Forgotten Version Bump (BACKLOG)
+### Phase 999.96: `release --check` Cannot Catch a Forgotten Version Bump (RESOLVED 2026-11-04 — `check_changelog_version` in `release --check`)
 
 **Found:** 2026-08-07, during 35-verify-work, while dispositioning 35-06's deliberate
 version-vs-changelog skew.
@@ -5844,7 +5844,7 @@ memory. **Size:** S.
 
 ---
 
-### Phase 999.95: `cargo doc` Is Not in This Repo's Definition of Green, and Carries a 33-Warning Baseline (BACKLOG)
+### Phase 999.95: `cargo doc` Is Not in This Repo's Definition of Green, and Carries a 33-Warning Baseline (DUPLICATE of 999.91)
 
 **Found:** 2026-08-07, phase 35-06 verification, when the plan's acceptance criterion required
 `cargo doc` to complete without warnings and it did not. Disposition set during 35-verify-work.
