@@ -21,7 +21,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.0">
     
     
       
@@ -29,10 +29,10 @@
       
     
     
-      <link rel="stylesheet" href="../../assets/stylesheets/main.ec1eaa64.min.css">
+      <link rel="stylesheet" href="../../assets/stylesheets/main.57a0d79d.min.css">
       
         
-        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.fb2fffe2.min.css">
       
       
 
@@ -1156,12 +1156,12 @@ environment variables, not config file fields:</p>
 <tr>
 <td><code>DEVFLOW_GATE_NOTIFY_CMD</code></td>
 <td>unset</td>
-<td>Shell command fired when a gate is written (e.g. an <code>ntfy.sh</code>/desktop-notification call)</td>
+<td>Shell command fired when a gate is written (e.g. an <code>ntfy.sh</code>/desktop-notification call). Saved per run by <code>start</code>/<code>resume</code>/<code>advance</code>; empty turns it off for the run (see OPERATIONS.md)</td>
 </tr>
 <tr>
 <td><code>DEVFLOW_GATE_TIMEOUT_SECS</code></td>
 <td>259200 (3 days)</td>
-<td>How long a monitor stays alive holding the phase lock while parked at a gate. Not a deadline for answering — the gate file never expires; past the timeout the answer needs a <code>devflow resume</code> to be picked up</td>
+<td>How long a supervisor waits at a gate, registered as its waiter and holding no lock. Not a deadline for answering — the gate file never expires. Past the timeout the run ends at that gate, and <code>devflow resume</code> reruns the stage and asks again, setting any unused answer aside</td>
 </tr>
 <tr>
 <td><code>DEVFLOW_GATE_MAX_UNATTENDED_AGE_SECS</code></td>
@@ -1283,10 +1283,10 @@ inventory, and a worked dogfood session — see
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.tabs", "navigation.indexes", "navigation.top", "search.suggest", "search.highlight", "content.code.copy"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.tabs", "navigation.indexes", "navigation.top", "search.suggest", "search.highlight", "content.code.copy"], "search": "../../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
+      <script src="../../assets/javascripts/bundle.c21346df.min.js"></script>
       
         <script src="../../assets/extra.js"></script>
       

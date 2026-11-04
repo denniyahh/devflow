@@ -9,10 +9,10 @@
 <link href="../system/" rel="prev"/>
 <link href="../ship-flow/" rel="next"/>
 <link href="../../assets/images/favicon.png" rel="icon"/>
-<meta content="mkdocs-1.6.1, mkdocs-material-9.7.7" name="generator"/>
+<meta content="mkdocs-1.6.1, mkdocs-material-9.8.0" name="generator"/>
 <title>Agent Lifecycle - DevFlow Documentation</title>
-<link href="../../assets/stylesheets/main.ec1eaa64.min.css" rel="stylesheet"/>
-<link href="../../assets/stylesheets/palette.ab4e12ef.min.css" rel="stylesheet"/>
+<link href="../../assets/stylesheets/main.57a0d79d.min.css" rel="stylesheet"/>
+<link href="../../assets/stylesheets/palette.fb2fffe2.min.css" rel="stylesheet"/>
 <link crossorigin="" href="https://fonts.gstatic.com" rel="preconnect"/>
 <link href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&amp;display=fallback" rel="stylesheet"/>
 <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
@@ -472,8 +472,11 @@
 <div class="md-content" data-md-component="content">
 <article class="md-content__inner md-typeset">
 <h1 id="agent-lifecycle">Agent Lifecycle<a class="headerlink" href="#agent-lifecycle" title="Permanent link">¶</a></h1>
-<p>Each phase uses a detached monitor so the agent can finish after the invoking
-terminal exits.</p>
+<p>Each stage of a phase runs under a detached supervisor (the hidden <code>__monitor</code>
+process) so the agent can finish after the invoking terminal exits. The
+supervisor owns the agent, answers liveness and stop requests on its own
+socket, and when the agent exits runs the advance in-process: no separate
+command is started to advance the phase.</p>
 <div class="panzoom-box" data-key="alt" id="panzoom0" oncontextmenu="return false;">
 <nav class="panzoom-nav">
 <button class="panzoom-info panzoom-button">
@@ -489,18 +492,23 @@ terminal exits.</p>
 <pre class="mermaid"><code>sequenceDiagram
     actor User
     participant CLI as devflow
-    participant Monitor
+    participant Sup as Supervisor
     participant Agent
     participant Files as .devflow
+    participant Next as Next supervisor
 
     User-&gt;&gt;CLI: start phase 16
     CLI-&gt;&gt;Files: write state-16.json
-    CLI-&gt;&gt;Monitor: spawn with phase identity
-    Monitor-&gt;&gt;Agent: launch stage prompt
-    Agent--&gt;&gt;Monitor: exit
-    Monitor-&gt;&gt;Files: stdout, stderr, exit, PID state
-    Monitor-&gt;&gt;CLI: advance --phase 16
-    CLI-&gt;&gt;Files: archive prior evidence
+    CLI-&gt;&gt;Sup: re-exec as __monitor with phase identity
+    Sup-&gt;&gt;Agent: launch stage prompt (own process group)
+    Sup--&gt;&gt;CLI: socket published, answers ping
+    CLI-&gt;&gt;Files: record the socket in state-16.json
+    Agent--&gt;&gt;Sup: exit
+    Sup-&gt;&gt;Files: stdout, stderr, exit, PID state
+    Sup-&gt;&gt;Sup: advance in-process, archive prior evidence
+    Sup-&gt;&gt;Next: launch the next stage
+    Next--&gt;&gt;Sup: socket published
+    Sup-&gt;&gt;Files: record the next socket, then unlink its own
 </code></pre>
 <div class="panzoom-info-box panzoom-info-box-bottom panzoom-hidden">
 Hold "Alt" / "Option" to enable pan &amp; zoom
@@ -564,8 +572,8 @@ reviewed and supplied by the parent process. Validate additionally requires a
 <div class="md-dialog" data-md-component="dialog">
 <div class="md-dialog__inner md-typeset"></div>
 </div>
-<script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.tabs", "navigation.indexes", "navigation.top", "search.suggest", "search.highlight", "content.code.copy"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
-<script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
+<script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.tabs", "navigation.indexes", "navigation.top", "search.suggest", "search.highlight", "content.code.copy"], "search": "../../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+<script src="../../assets/javascripts/bundle.c21346df.min.js"></script>
 <script src="../../assets/extra.js"></script>
 <script src="../../assets/javascripts/panzoom.min.js"></script>
 <script src="../../assets/javascripts/zoompan.js"></script>

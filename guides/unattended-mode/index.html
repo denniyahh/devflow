@@ -19,7 +19,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.0">
     
     
       
@@ -27,10 +27,10 @@
       
     
     
-      <link rel="stylesheet" href="../../assets/stylesheets/main.ec1eaa64.min.css">
+      <link rel="stylesheet" href="../../assets/stylesheets/main.57a0d79d.min.css">
       
         
-        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.fb2fffe2.min.css">
       
       
 
@@ -1001,10 +1001,10 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#a-refusal-is-final" class="md-nav__link">
+  <a href="#a-parked-refusal-can-be-approved" class="md-nav__link">
     <span class="md-ellipsis">
       
-        A refusal is final
+        A parked refusal can be approved
       
     </span>
   </a>
@@ -1198,10 +1198,10 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#a-refusal-is-final" class="md-nav__link">
+  <a href="#a-parked-refusal-can-be-approved" class="md-nav__link">
     <span class="md-ellipsis">
       
-        A refusal is final
+        A parked refusal can be approved
       
     </span>
   </a>
@@ -1340,7 +1340,9 @@ is deliberately <em>not</em>:</p>
   <code>_auto_chain_active</code> key is ever written, and only that one key.</li>
 </ul>
 <p>Checkpoints marked <code>blocking-human</code>, and <code>checkpoint:human-action</code> tasks, are
-never auto-approved by any mode. A phase whose plans declare one is refused
+never auto-approved by any mode. The exception is an agent DevFlow resumed
+specifically to resolve a <code>blocking-human</code> gate after a human has approved the
+parked preflight gate. A phase whose plans declare one is otherwise refused
 before it starts — see the next section.</p>
 <h2 id="before-you-start-what-the-preflight-checks">Before you start: what the preflight checks<a class="headerlink" href="#before-you-start-what-the-preflight-checks" title="Permanent link">&para;</a></h2>
 <p>An unattended launch is checked before any agent is spawned. Three conditions
@@ -1358,17 +1360,20 @@ parse, DevFlow cannot tell whether writing to it would destroy something.</p>
 <p>A refusal here means your project is not GSD-configured, or its config file is
 malformed. Fix the file, or run in supervise mode.</p>
 <h3 id="2-the-code-stage-would-launch-on-the-pipe-owning-arm">2. The Code stage would launch on the pipe-owning arm<a class="headerlink" href="#2-the-code-stage-would-launch-on-the-pipe-owning-arm" title="Permanent link">&para;</a></h3>
-<p>The guard that bounds the flag's lifetime lives inside DevFlow's pipe-owning
-monitor, and only the Claude launch path starts one. So two launch shapes are
-refused in auto mode:</p>
+<p>Every stage runs under the same DevFlow supervisor process, in one of two
+launch shapes. The guard that bounds the flag's lifetime is engaged only by a
+supervisor on the stream shape, which Claude and Antigravity <code>stream-json</code>
+launches use; a supervisor on the capture shape never engages it, so a Code
+stage launched that way would have nothing bounding the flag. So two
+capture-shape launches are refused in auto mode:</p>
 <ul>
-<li><strong>A non-Claude agent.</strong> <code>--agent codex</code> and <code>--agent opencode</code> cannot run
-  <code>--mode auto</code>. This is a real capability removal introduced with this
-  feature; those agents still work in supervise mode.</li>
+<li><strong>A non-Claude agent.</strong> <code>--agent codex</code> and <code>--agent opencode</code> launch on the
+  capture shape and cannot run <code>--mode auto</code>. This is a real capability
+  removal introduced with this feature; those agents still work in supervise
+  mode. (Antigravity launches on the stream shape and is allowed.)</li>
 <li><strong>The legacy launch opt-out.</strong> <code>--legacy-claude-launch</code> (or
-  <code>DEVFLOW_CLAUDE_LEGACY_LAUNCH</code>) selects a detached shell monitor with no
-  process to bound the flag's lifetime. It is now mutually exclusive with
-  <code>--mode auto</code>.</li>
+  <code>DEVFLOW_CLAUDE_LEGACY_LAUNCH</code>) moves Claude onto the capture shape, which
+  never engages the guard. It is now mutually exclusive with <code>--mode auto</code>.</li>
 </ul>
 <p>The recovery for either is the same: drop the flag that caused it, or run in
 supervise mode.</p>
@@ -1382,20 +1387,21 @@ reports <code>[not yet applicable]</code> at Define rather than refusing. At Cod
 are expected — their absence is <code>[COULD NOT BE DETERMINED]</code>, and that refuses.</p>
 <p>A refusal here means replanning the phase without the human-only marker, or
 running in supervise mode and answering it yourself.</p>
-<h3 id="a-refusal-is-final">A refusal is final<a class="headerlink" href="#a-refusal-is-final" title="Permanent link">&para;</a></h3>
-<p>There is no <code>--force-unattended</code> flag and no environment variable that turns a
-refusal into a warning. Your options are to fix the condition or to run in
-supervise mode.</p>
-<p><strong>Both external review lanes objected to that, on record, and the decision
-stands.</strong> The objection is real and worth stating so you know it was heard: a
-preflight that false-positives makes unattended runs impossible with no
-in-product recovery, and one reviewer characterised that as a
-denial-of-service. The counter-argument that carried is DevFlow's standing
-principle — advance as far as the rules permit and stop at the first hard gate,
-never route around one — plus the asymmetry that adding an override later is
-easy while removing one after operators have built habits around it is not. If
-the preflight's own reliability turns out to be a problem in practice, that is
-grounds to reopen the decision, not to work around it.</p>
+<h3 id="a-parked-refusal-can-be-approved">A parked refusal can be approved<a class="headerlink" href="#a-parked-refusal-can-be-approved" title="Permanent link">&para;</a></h3>
+<p>A refusal for a human-only checkpoint parks the run at a gate. If an operator
+approves that gate, <code>GateAction::Advance</code> calls <code>launch_stage_inner</code> directly
+and skips the just-adjudicated check. The run stays in its existing mode, so it
+continues unattended afterwards and can reach the resume injection.</p>
+<p>The cost is deliberate: approving the parked gate accepts continuing without
+re-running the condition that refused the launch. Use that recovery only when
+you, as the operator, accept that responsibility.</p>
+<p><strong>Both external review lanes raised the tradeoff, and their concern remains on
+record.</strong> They warned that a false-positive preflight can block an unattended
+run. The accurate counterpoint is narrower than the old claim: DevFlow has a
+human-approved recovery through the parked gate, rather than an unattended
+opt-out. That preserves the standing principle — advance as far as the rules
+permit and stop at the first hard gate — while making the operator's explicit
+approval, and its cost, visible.</p>
 <h3 id="if-your-planning-artifacts-do-not-live-on-develop">If your planning artifacts do not live on <code>develop</code><a class="headerlink" href="#if-your-planning-artifacts-do-not-live-on-develop" title="Permanent link">&para;</a></h3>
 <p>The first preflight condition reads <code>.planning/config.json</code> <strong>from the phase
 worktree</strong>, and that worktree is forked from your project's base branch. If
@@ -1478,15 +1484,18 @@ decision, plan the phase interactively first and then start the unattended run
 — by the time <code>devflow start</code> reaches Plan with a plan already on disk, the
 stage is a no-op.</p>
 <h3 id="2-a-legacy-arm-or-non-claude-code-stage-gets-no-chain-flag-guard-at-all">2. A legacy-arm or non-Claude Code stage gets no chain-flag guard at all<a class="headerlink" href="#2-a-legacy-arm-or-non-claude-code-stage-gets-no-chain-flag-guard-at-all" title="Permanent link">&para;</a></h3>
-<p>There is no guard on those launch shapes, because the legacy arm is a detached
-shell script with no process whose lifetime could bound the flag.</p>
-<p><strong>Cause.</strong> The guard is bound inside the pipe-owning monitor, and only the
-Claude stream launch path starts one.</p>
+<p>There is no guard on those launch shapes, because they run on the capture
+shape, and a supervisor on the capture shape does not engage the chain-flag
+guard.</p>
+<p><strong>Cause.</strong> The guard is engaged only by a supervisor on the stream shape,
+which only the Claude and Antigravity <code>stream-json</code> launch paths use; <code>codex</code>,
+<code>opencode</code> and the legacy opt-out launch on the capture shape.</p>
 <p><strong>Fix owner: DevFlow, and as of this release the failure is loud rather than
 silent.</strong> Condition 2 of the preflight now <em>refuses</em> this combination in auto
 mode instead of letting the run start and stall later. That is an improvement
-in legibility, not a removal of the limitation: <code>--mode auto</code> remains
-Claude-only, and remains incompatible with the legacy launch opt-out.</p>
+in legibility, not a removal of the limitation: <code>--mode auto</code> remains limited
+to Claude and Antigravity, and remains incompatible with the legacy launch
+opt-out.</p>
 <h3 id="3-gsd-orchestrator-may-block-auto-approval-of-gateblocking-checkpoints">3. GSD orchestrator may block auto-approval of <code>gate="blocking"</code> checkpoints<a class="headerlink" href="#3-gsd-orchestrator-may-block-auto-approval-of-gateblocking-checkpoints" title="Permanent link">&para;</a></h3>
 <p>When a plan contains a <code>checkpoint:human-verify</code> task with <code>gate="blocking"</code>
 (as opposed to <code>blocking-human</code>), GSD's own rules say it should auto-approve
@@ -1577,10 +1586,10 @@ issue (#3370) where the orchestrator blocks auto-approval of correctly-authored
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.tabs", "navigation.indexes", "navigation.top", "search.suggest", "search.highlight", "content.code.copy"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.tabs", "navigation.indexes", "navigation.top", "search.suggest", "search.highlight", "content.code.copy"], "search": "../../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
+      <script src="../../assets/javascripts/bundle.c21346df.min.js"></script>
       
         <script src="../../assets/extra.js"></script>
       
