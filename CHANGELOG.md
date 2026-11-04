@@ -1,5 +1,101 @@
 # Changelog
 
+## 3.0.0 — 2026-11-03
+
+The first release since 2.12.0, collecting Phases 46 through 50.1. A run's liveness is now read from a
+supervisor socket recorded in the state, not from a pid, and the single per-phase lock is replaced by split
+locks, so every state write is durable and a gate answer can decide only the gate it was written for.
+
+### Changed — breaking
+
+`devflow-core` is a published library, and `cargo semver-checks` against 2.12.0 reports 7 major breaks:
+
+- the per-phase lock is gone: `lock::acquire`, `lock::holder` and `lock::holder_identity` are removed, as are
+  `State.monitor_pid` and `RecoveryStatus.lock_held`, `workflow::remove_corrupt_legacy_state` and
+  `monitor::run_pipe_owning_monitor`; `monitor::spawn_monitor` takes 7 parameters instead of 5
+- the gate response and ack API is replaced by one keyed on a gate id: `Gates::respond`, `poll_response`,
+  `ack`, `response_path`, `ack_path`, `reap` and `cleanup` are removed (see `Gates::answer`, `claim`, `close`
+  and `await_answer`); `OpenGate` and `GateFile` gain `gate_id`, `RecoveryStatus` gains `live` and
+  `AgentResult` gains `checkpoint`, which breaks exhaustive struct literals
+- `GateError` gains `InvalidGateId`, `GateIdMismatch`, `GateClosedAfterPublish`, `GateLockTimeout` and
+  `PublishedUnconfirmed`; `RecoverError`, `WorkflowError` and `MonitorError` become `#[non_exhaustive]`
+- a gate answer must carry the id of the gate it decides. An answer with no id, or another gate's id, is set
+  aside, not consumed, and a rerun of a stage asks again instead of reusing an earlier answer
+- no migration from 2.x: a 2.x `state.json` is not migrated, and 3.x makes no promise that it will load
+
+### Added
+
+Phase 50, addressable monitor liveness:
+
+- whether a run's supervisor is alive is answered from disk alone as GONE, STALE or ALIVE, from the socket
+  the state records under the cache directory; no pid is read, and an over-long socket path is refused by name
+- `devflow stop` on an ALIVE supervisor sends it a shutdown: its agent's process group is ended, the run
+  exits 143 and no next stage launches; a STALE socket goes through a guarded backstop that signals only a
+  group it has validated
+- `devflow doctor` lists orphan sockets, and `start` and `resume` refuse over a live socket when the state
+  does not load
+
+Phase 50.1, split-lock state handling:
+
+- state files are written under a short `flock` and are durable (the file and its directory are synced);
+  a supervisor holds a liveness lock for its whole life, and a launch records a pending supervisor before it
+  spawns one
+- a supervisor the state no longer records, or whose promotion never came, writes nothing and ends its
+  agent's process group while the agent still runs
+- `devflow stop` reaches a pending launch, names an orphaned agent and its manual kill, and never lands inside
+  a `devflow ship` finalization; `devflow doctor` and `status` name the repair for a held lock with no socket
+- `recover --clean` and `start` refuse beside a held launch lock that no other phase's state records,
+  naming its holder; `stop` over an unpublished launch with no foreground launcher names the holder and the
+  manual route
+
+Phase 48, survivable state writes and honest gate recovery:
+
+- a second writer to a state file is excluded or refused loudly instead of silently overwriting
+- `gate approve`, `reject`, `stop` and `sweep` check for a live waiter and, with none, say so and name the
+  repair that works
+- preflight and resume read checkpoints with one shared parser, and checkpoints added after Code's preflight
+  are re-scanned before the resume decision
+
+Phase 47, unattended decision policy:
+
+- the claude, opencode, hermes and antigravity Validate loop-back now carries the same merit-based decision
+  instruction as codex and pi, and an unattended agent is no longer handed two contradictory instructions
+  about who may resolve a `blocking-human` gate. One live sample on one model followed the wording; that is
+  all that was measured
+
+Phase 46, CI load shape and operator input:
+
+- a pinned sequential 2-CPU CI job reports beside the parallel jobs
+- `base_branch` refuses a computed revision, and `devflow stop` takes a positional project root and names the
+  argument when the root is wrong
+
+Phase 49 recorded a live unattended run against a disposable project as the measuring instrument for these
+changes; it adds no shipped behaviour.
+
+Repository tooling, with no runtime effect: a gitleaks pre-commit hook, weekly dependency checks, Dependabot
+configuration, a plan-lint for gate shapes and scripts for cutting phase PR branches.
+
+### Fixed
+
+- `agent_running` reported a just-reaped process as running (a race with an exit)
+- `logs --follow` hung when its state was already gone, or removed before the first poll
+- a gate claim whose directory sync failed reported "nothing was consumed" while the claim stayed on disk
+- a finalization retry resumes at the hook that failed, so a `VersionBump` that succeeded is not repeated
+  within one process (after a restart it still can: backlog 999.173)
+- further defects found by four rounds of external review (Codex and Antigravity) in Phase 50.1, each fixed
+  with a test that was seen failing first
+
+### Known gaps
+
+- a headless run can still stop short of Ship: a Validate gap gate and an auto-decided checkpoint can need
+  an operator (backlog 999.175, 999.176)
+- `devflow gate approve` can exit 1 for an approval that was applied (backlog 999.177); a `yes_ship` revoke
+  written during the Ship advance is ignored (999.178); a launch whose successor already ended still prints
+  "launched" (999.179); an approved Validate gate is not closed before Ship (999.180); a Ship retry after a
+  restart can bump the version twice (999.173)
+- the live run to Ship ran on an earlier build of Phase 50.1's code; the maintainer accepted it for the final
+  build (the fault-injection check passes on the final build)
+
 ## 2.12.0 — 2026-09-02
 
 Unattended auto-mode hardening (Phase 45). Makes `--mode auto` launchable and safe out of the box:
