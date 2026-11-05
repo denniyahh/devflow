@@ -1210,7 +1210,7 @@ entries make `gate sweep` and other root scans walk thousands of dead roots. Whi
 child a private `DEVFLOW_CACHE_DIR` (as `gate_notify_persist_e2e` does) or route library tests through `*_in(cache_dir)`.
 Add a guard test that fails when a suite run grows the real cache. Pruning the existing entries: done 2026-10-09, see 999.141.
 
-### Phase 999.154: Gate Notify Command — Remaining Gaps After the Phase 49 State-File Design (BACKLOG)
+### Phase 999.154: Gate Notify Command — Remaining Gaps After the Phase 49 State-File Design (PROMOTED — Phase 51, operator 2026-11-05)
 
 **Found:** 2026-10-09, Phase 49 final re-review of `b3f7fdf` (`49-REVIEW.md` WR-12, WR-13, IN-10). Phase 49 made the
 run's state file the single source of the gate notify command (operator decision 2026-10-09) and stopped fixing after
@@ -2961,7 +2961,7 @@ Plans:
 
 ---
 
-### Phase 999.108: GSD Subagent Dispatch Is Unavailable From the Pi Runtime (BACKLOG)
+### Phase 999.108: GSD Subagent Dispatch Is Unavailable From the Pi Runtime (CLOSED 2026-11-05 — upstream GSD limitation, not DevFlow code)
 
 **Linear:** [DEN-114](https://linear.app/denniskim/issue/DEN-114)
 
@@ -4352,7 +4352,7 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready — ideally soon after Phase 18 ships, while 18-05 is fresh)
 
-### Phase 999.9: Dependency Update Review (BACKLOG)
+### Phase 999.9: Dependency Update Review (RESOLVED 2026-11-05 — actions/checkout@v7 on all 7 uses; rust-toolchain.toml pinned to 1.97.1; no floating dtolnay action left)
 
 **Goal:** Triggered 2026-07-20 by a GitHub Actions annotation on the first all-branch CI run — `actions/checkout@v4` targets deprecated Node.js 20 and is being force-run on Node 24. Warning only, all jobs green, but it appears on 4 job definitions across both workflow files, so the eventual break lands everywhere at once. Broader than a one-line bump: the dependency surface is inconsistently pinned — `dtolnay/rust-toolchain@stable` and `rust-toolchain.toml`'s `channel = "stable"` float entirely (CI can break from upstream with no commit here, a reproducibility gap for a project premised on trustworthy pipelines), `devcontainers/ci@v0.3` is pre-1.0, the devcontainer base image pin was last verified in Phase 15, and neither `cargo audit` nor `cargo deny` runs in CI. Deliberately not folded into Phase 18 — a dependency bump mid-phase would confound that phase's test signal.
 **Priority:** Medium | **Size:** M — reviewed 2026-07-21: confirmed `actions/checkout@v4` still current pin. Nothing failing today; most of the scope is policy decisions (pin vs. float) rather than code. GitHub: [#197](https://github.com/denniyahh/devflow/issues/197) (migrated from Linear DEN-34).
@@ -5288,7 +5288,7 @@ Plans:
 
 - [x] Delivered as an out-of-band patch, 2026-07-31 (no phase — emergency unblock for the Phase 29 dogfood)
 
-### Phase 999.83: The Drain Gate Never Saw 8 Concurrent Sub-Agents — Its Fixture's Shape Is Not What Production Emits (BACKLOG)
+### Phase 999.83: The Drain Gate Never Saw 8 Concurrent Sub-Agents — Its Fixture's Shape Is Not What Production Emits (RESOLVED 2026-11-05 — monitor.rs documents production emits no background_tasks_changed and handles what it does emit; tests not re-run)
 
 **GitHub:** [#166](https://github.com/denniyahh/devflow/issues/166) (migrated from Linear DEN-104)
 **Found:** 2026-08-06, phase 34 plan 34-05's capture campaign (D-04: file capture-revealed defects,
@@ -5567,7 +5567,7 @@ that an operator can run unattended for nine hours believing they are covered.
 
 ---
 
-### Phase 999.102: The Idle-Timeout Verdict Discards Diagnostics That Are Already Sitting in the Capture (BACKLOG)
+### Phase 999.102: The Idle-Timeout Verdict Discards Diagnostics That Are Already Sitting in the Capture (PROMOTED — Phase 51, operator 2026-11-05)
 
 **Found:** 2026-08-09, while diagnosing why three stages of Phase 35.1 died with
 `error_during_execution`.
@@ -5894,7 +5894,7 @@ for the fix; the gating decision is separate and smaller.
 
 ---
 
-### Phase 999.94: An Unattended `decision` Checkpoint Takes the First Option Without Reading It (BACKLOG — HIGH)
+### Phase 999.94: An Unattended `decision` Checkpoint Takes the First Option Without Reading It (RESOLVED 2026-11-05 — prompt.rs tells Code/Validate to ignore "take the first option"; asserted by a test; not re-run)
 
 **Found:** 2026-08-07, phase 35 verify-work, while assessing the downsides of enabling GSD auto-mode
 for DevFlow's Code stage.
@@ -5933,7 +5933,7 @@ for the DevFlow-side prompt policy plus its tests; M if the upstream marker is p
 
 ---
 
-### Phase 999.71: Measure Whether the Capture Writer Actually Leaves Torn Terminal Lines (BACKLOG)
+### Phase 999.71: Measure Whether the Capture Writer Actually Leaves Torn Terminal Lines (PROMOTED — Phase 51, operator 2026-11-05)
 
 **GitHub:** [#169](https://github.com/denniyahh/devflow/issues/169) (migrated from Linear DEN-92)
 **Found:** 2026-08-02, phase 30 adversarial pass over the malformed-input defect class. Flagged as
