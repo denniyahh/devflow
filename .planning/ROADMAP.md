@@ -1031,6 +1031,16 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.183: `start --dry-run` Says Define Runs `/gsd-discuss-phase`, Which It Never Does (BACKLOG)
+
+**Found:** 2026-11-05, Phase 51 dogfood preflight (`devflow start --phase 51 --agent claude --mode supervise --until plan --dry-run`, v3.0.0).
+
+**The defect:** the dry run prints `define /gsd-discuss-phase 51`. `print_dry_run` (`crates/devflow-cli/src/pipeline_gate.rs`) takes each stage's label from `Stage::gsd_command` (`crates/devflow-core/src/stage.rs`, `Stage::Define => "/gsd-discuss-phase {N}"`), but the Define stage's real prompt (`define_stage_prompt`, `crates/devflow-core/src/prompt.rs`, D-14) never runs discuss, and `define_prompt_never_invokes_discuss_phase` enforces that. The preview tells an operator that DevFlow will gather context when it will not; an operator who trusts it skips the discuss step the run needs.
+
+**Fix shape (not decided):** have the dry run print what the Define prompt does (a no-op; the operator runs discuss before `start`), and check whether any other caller of `Stage::gsd_command` presents it as what runs.
+
+**Acceptance:** a test that fails if the dry-run line for Define names a command the Define prompt does not run.
+
 ### Phase 999.182: `stop`'s "Not Marked" Message Can Name the Wrong Pid (BACKLOG)
 
 **Found:** 2026-11-02, Phase 50.1-29 (recorded in that phase's `deferred-items.md`); promoted 2026-11-04. Checked by reading the code, not reproduced.
