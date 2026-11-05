@@ -98,3 +98,26 @@ entries.
 - Ordered fallback list
 - Widening the auto-mode launch-shape guard
 - Automatic switch back to the primary
+
+## Revisions after adversarial review (2026-11-05)
+
+Reviewers: codex (gpt-6.1-sol, high) and DeepSeek Flash via `pi`. agy was dropped: quota
+exhausted (HTTP 429, about 36 h to reset). Each finding below was checked against source before it
+changed a decision.
+
+| Decision | Finding | Change |
+|----------|---------|--------|
+| D-01 | `resume` refuses over a live run, so a fallback cannot be armed mid-flight | Scoped to `start` and resume of a non-live run; re-arming clears the consumed mark |
+| D-03 / D-07 | Preflight is stage-dependent, so launch validation cannot cover every handoff stage | Launch validation made best-effort; full check at handoff; accepted limit recorded |
+| D-04 | Recorded canary is reused across agents; relaunch failure after commit had no recovery | Invalidate canary on substitution; recovery to a gate or cron arm |
+| D-06 | Infra ceiling shared with `Ambiguous` re-drives; failover ordering unstated | Failover before the ceiling, not charged to it; boundary test |
+| D-09 | Plan's idempotent prompt accepts a partial PLAN.md; Code relaunch drops the audit-fix intent | Persist and replay the interrupted intent; falsifiable tests for both |
+| D-12 | No "liveness unavailable" switch; failover relaunch may not read liveness at all | Trace first, then controlled interventions; a trace showing no read is the result |
+| D-14 | No mechanism for the `n` verb check | Scan clap variants, names and aliases; negative-control fixture |
+| D-15 | `IdleTimeoutRecord` has no free-text field | Optional serde-default fields written by the monitor; pre-51 record test |
+| D-16 | Rate-limit classifier never sees `line_shapes` | Classifier receives the torn-line signal; measurement is not a gate |
+| D-17 | Phase 50.1 superseded part of WR-12/IN-10 | Reproduce first; WR-13 test kept |
+
+Not adopted: pi's claim that D-10 reverses the idle-timeout rule. Today's rate-limit cron arm
+already restarts on the left-over tree, and a rate limit is a reported stop, unlike an idle timeout.
+The distinction is now stated in D-10.
