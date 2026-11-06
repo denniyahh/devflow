@@ -667,21 +667,38 @@ and IN-10 (unparseable file silently rewritten) are both **likely** no longer re
 | A4 | The ROADMAP's "`n` verb" names nothing that ever existed (no commit matches) — likely a stand-in for `sequentagent` | Pattern 5 | None for the scan (D-14 covers both readings); worth a one-line note in the verification evidence |
 | A5 | Clearing `session_id` at handoff is harmless | Pitfall 1 | Low; checkpoint resume is Claude-only |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
-1. **Does the Plan/Code continuation also apply to the cron arm's `resume`?**
+1. **Does the Plan/Code continuation also apply to the cron arm's `resume`?** — RESOLVED: yes, for
+   both halves, by plans 51-07 and 51-08.
    - Known: the same two gaps exist on that arm today.
    - Unclear: whether fixing it is in SUPV-02's scope.
    - Recommendation: apply the persisted fix type to every relaunch (it is the same field); for the
      Plan prompt, apply it on failover only and file a `999.x` entry for the cron arm unless the
      plan makes it free.
-2. **Which arm after a post-commit relaunch failure — cron or gate?**
+   - Resolution: the plans made the cron arm free, so no `999.x` entry is needed for it. 51-07
+     persists the Code fix type and replays it on every no-override relaunch, the cron arm's
+     `devflow resume` included (`a_resume_mid_audit_fix_replays_audit_fix`). 51-08 records the stage a
+     rate limit interrupted (`State.rate_limited_stage`, written by the failover handoff and the cron
+     arm in commits they already make) and, only for a Plan stage so interrupted, selects the Plan
+     continuation prompt and refuses a Plan success whose plan files are still untracked or modified.
+     Ordinary Plan launches and successes are unchanged (operator ruling at the plan check, 2026-11-05);
+     the general ordinary-run case is a separate `999.x` entry the orchestrator files.
+2. **Which arm after a post-commit relaunch failure — cron or gate?** — RESOLVED: the cron arm, by
+   plan 51-06.
    - D-04 allows either. Recommendation: the cron arm (`handle_rate_limited_outcome`), because the
      limit still holds for the primary and the saved agent is the fallback; it already gates on an
      unparseable retry hint.
-3. **999.71 measurement deliverable shape.** Preliminary data gathered this session (see below).
+   - Resolution: 51-06 Task 3 adopts the recommendation: a non-`NotOwner` relaunch error after the
+     handoff commit emits `agent_handoff_relaunch_failed` and takes `handle_rate_limited_outcome`
+     (`a_handoff_whose_relaunch_fails_ends_in_the_cron_arm`).
+3. **999.71 measurement deliverable shape.** — RESOLVED: by plan 51-05. Preliminary data gathered
+   this session (see below).
    Recommendation: an `events.jsonl` record of the capture's final-line shape at each evaluation
    (cheap, continuous, read at the moment DevFlow reads) plus an archived measurements file.
+   - Resolution: 51-05 adopts the recommendation: a `capture_tail` event at the end of every
+     supervised stage, and `51-999.71-MEASUREMENTS.md` archived with the controlled result, the
+     preliminary sweep below and the production-rate method, each with its limits.
 
 **Preliminary 999.71 measurement (this session, read-only):** a probe classified the final
 non-empty line of every archived capture under the main checkout's `.devflow/history/`

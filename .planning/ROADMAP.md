@@ -35,7 +35,7 @@ note, the success criteria below deliberately claim no more than the evidence su
 | 49 | Live Unattended Run — The Milestone's Instrument | VERIFY-01 | 3 | Complete    |
 | 50 | Addressable Monitor Liveness | SUPV-01 | 4 | Complete    |
 | 50.1 | Split-Lock State-Handling Overhaul (INSERTED) | SUPV-03, SUPV-04, SUPV-05, SURV-03, SURV-04 | 4 (after 50) | Complete    |
-| 51 | Rate-Limit Agent Failover | SUPV-02 | 5 | Not started |
+| 51 | Rate-Limit Agent Failover | SUPV-02 | 5 | Planned |
 
 ### Phase 46: CI Load Shape and Operator Input Validation
 
@@ -647,7 +647,44 @@ be re-tested here rather than inherited from the issue's original design.
      rebase handoff were all removed (D-11, 23d) and none is reintroduced. Counted over source with
      comments stripped, since a grep over raw source counts comment prose (the Phase 35-01 lesson).
 
-**Plans**: TBD
+**Plans**: 0/12 plans executed (8 waves)
+
+Plans:
+**Wave 1**
+
+- [ ] 51-01-PLAN.md — Tracer: a rate-limited stage with a fallback continues under it in the same worktree and branch; with no fallback the cron arm still fires (wave 1)
+- [ ] 51-02-PLAN.md — The removed `rebase_in` / `Sequentagent` / `n` handoff stays dead: comment-stripped source scan with planted positives and decoys (wave 1)
+- [ ] 51-03-PLAN.md — 999.102: an idle-timeout failure names its cause (`terminal_reason`, `errors[]`, `origin.kind`) (wave 1)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
+- [ ] 51-04-PLAN.md — `--fallback-agent` on `start` and `resume`, validated at launch and persisted (wave 2)
+- [ ] 51-05-PLAN.md — 999.71: the idle-timeout rate-limit check sees a torn final line; `capture_tail` measurement (wave 2)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
+- [ ] 51-06-PLAN.md — Harden the hop: per-agent canary, handoff event fields, boundary tests, a failed relaunch is never silent (wave 3)
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
+- [ ] 51-07-PLAN.md — D-09 Code half: a same-stage relaunch continues the interrupted fix type (wave 4)
+- [ ] 51-12-PLAN.md — Auto-mode Claude to Antigravity failover end to end through the binary (wave 4)
+
+**Wave 5** *(blocked on Wave 4 completion)*
+
+- [ ] 51-09-PLAN.md — 999.154: resume with the gate-notify variable unset; WR-12 / IN-10 reproduced against current code (wave 5)
+
+**Wave 6** *(blocked on Wave 5 completion)*
+
+- [ ] 51-08-PLAN.md — D-09 Plan half: a Plan pass relaunched after a rate limit finishes the plan instead of accepting a partial one (wave 6)
+
+**Wave 7** *(blocked on Wave 6 completion)*
+
+- [ ] 51-10-PLAN.md — SUPV-01 dependency settled by observation: each liveness read withheld, with baseline and ordinary-launch controls (wave 7)
+
+**Wave 8** *(blocked on Wave 7 completion)*
+
+- [ ] 51-11-PLAN.md — Operator docs for the fallback surface and the full phase check suite (wave 8)
 
 ---
 
@@ -803,7 +840,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 49 | 12/12 | In Progress|  |
 | 50 | 29/29 | Complete | 2026-10-21 |
 | 50.1 | 30/30 | In Progress | — |
-| 51 | — | Not started | — |
+| 51 | 0/12 | Planned | — |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
 
@@ -1030,6 +1067,16 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
+
+### Phase 999.184: An Ordinary Plan Success Over Uncommitted Plan Files Still Advances to Code (BACKLOG)
+
+**Found:** 2026-11-05, Phase 51 plan check (iteration 2). Phase 51 plan 51-08 refuses this case only for a Plan pass relaunched after a rate limit; the general case was ruled out of Phase 51's scope and is recorded here. Checked by reading the code, not reproduced.
+
+**Defect:** on `Action::Advance`, `Stage::Plan => transition(project_root, &mut state, Stage::Code)` (`crates/devflow-cli/src/pipeline_launch.rs`) checks nothing about the phase's `PLAN.md` files being tracked and unmodified. The never-silent commit check in `agent_result.rs` counts commits ahead of `develop`, not commits made in this stage attempt. An earlier dogfood run hit this: a transient API 500 killed Plan before its commit step, the retry saw `PLAN.md` on disk and reported success, and the uncommitted plans reached Code.
+
+**Fix shape (not decided):** reuse 51-08's completeness predicate (plan files untracked or modified) on every Plan success, routing to the never-silent gate. Decide how to treat a project that leaves `.planning/` untracked but not ignored, which would gate on every Plan success.
+
+**Acceptance:** a test where an ordinary Plan run reports success over an untracked `PLAN.md` stops at a gate, with a committed-and-clean negative control that still advances.
 
 ### Phase 999.183: `start --dry-run` Says Define Runs `/gsd-discuss-phase`, Which It Never Does (BACKLOG)
 
