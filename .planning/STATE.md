@@ -4,18 +4,18 @@ milestone: v3.0.0
 milestone_name: milestone (ACTIVE — Unattended Run Survivability)
 current_phase: 51
 current_phase_name: Rate-Limit Agent Failover
-current_plan: 2
+current_plan: 3
 status: executing
-stopped_at: Completed 51-01-PLAN.md
-last_updated: "2026-11-06T15:56:36.192Z"
+stopped_at: Completed 51-02-PLAN.md
+last_updated: "2026-11-06T16:07:52.097Z"
 last_activity: 2026-11-06
 last_activity_desc: Phase 51 execution started
-state_head: da6d5b7c51af711db404db06b4841bcbba809738
+state_head: 71e73379085584335c87eb787c46f2b4661b118b
 progress:
   total_phases: 7
   completed_phases: 5
   total_plans: 120
-  completed_plans: 108
+  completed_plans: 109
   percent: 71
 ---
 
@@ -172,9 +172,9 @@ change earns 2.0.
 
 Phase: 51 (Rate-Limit Agent Failover) — EXECUTING
 Plans: 13 (51-01 … 51-14, no 51-08; 8 waves)
-Current Plan: 2
+Current Plan: 3
 Total Plans in Phase: 13
-Completed Plans: 1 of 13
+Completed Plans: 2 of 13
 Status: Ready to execute
 Previous phase: 50.1 — complete, 30/30 plans; verification passed 12/12 (one operator override, the live-run criterion); merged via PR #229; released in v3.0.0. Phase 47's verification still reads `stale` by operator decision (re-verify near milestone close).
 Last activity: 2026-11-06 — Phase 51 execution started
@@ -834,6 +834,7 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 49]: 49-12: DECN-03 outcome Followed (gate-derived from attempt 3 committed events/captures; claude only, D-15)
 - [Phase 49]: 49-12: attempt 2's two sanitizer-refused captures omitted whole by operator decision 2026-10-08 (option A)
 - [Phase 51]: 51-01: a refused failover handoff is a value (HandoffOutcome::Refused), mapped to resume --agent's unchanged refusal texts or to agent_handoff_refused plus the cron arm; failover is reachable only from an explicit AgentStatus::RateLimited arm and only at Code
+- [Phase 51]: 51-02: the removed-handoff attribute scan reads every #[command(...)] in the CLI sources and compares name/alias values whole (exact element equality), so name = "__monitor" is clean
 
 ## Roadmap Evolution
 
@@ -932,11 +933,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 49 P11 | 6h operator | 1 tasks | 1 files |
 | Phase 49 P12 | 24h 26m | 3 tasks | 255 files |
 | Phase 51 P01 | 16 min | 2 tasks | 2 files |
+| Phase 51 P02 | 6min | 2 tasks | 1 files |
 
 ## Session
 
-**Last session:** 2026-11-06T15:56:34.415Z
-**Stopped at:** Completed 51-01-PLAN.md
+**Last session:** 2026-11-06T16:07:50.357Z
+**Stopped at:** Completed 51-02-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
