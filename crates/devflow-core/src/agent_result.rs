@@ -2290,6 +2290,9 @@ pub struct IdleTimeoutRecord {
 
 /// Why the agent stopped, as the capture's last top-level `result` event
 /// recorded it at the moment the idle timeout fired (D-15, backlog 999.102).
+///
+/// Three Phase 35.1 failures were investigated as "the agent went quiet"
+/// before anyone read these keys, which the capture already held.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct IdleTimeoutCause {
     /// The event's `terminal_reason` string, for example `aborted_tools`.
@@ -2300,9 +2303,112 @@ pub(crate) struct IdleTimeoutCause {
     pub(crate) origin_kind: Option<String>,
 }
 
-/// Read the idle-timeout cause from the phase's capture.
-pub(crate) fn idle_timeout_cause(_project_root: &Path, _phase: PhaseId) -> IdleTimeoutCause {
-    IdleTimeoutCause::default()
+/// The idle-timeout record exactly as it sits on disk: the published
+/// [`IdleTimeoutRecord`] plus D-15's optional cause keys.
+///
+/// **Why a crate-private wrapper rather than new fields on
+/// `IdleTimeoutRecord` (operator ruling R-1).** That struct is all-pub and not
+/// `#[non_exhaustive]` in the published crate, so cargo-semver-checks reports
+/// adding any field to it as a major break. It stays byte-identical; the keys
+/// are added here, flattened beside its five. The monitor writes this type and
+/// [`parse_idle_timeout_side_channel`] reads it, so the two directions cannot
+/// drift apart.
+///
+/// Every cause key is optional on read, so a record written before Phase 51
+/// parses unchanged, and skipped when empty on write, so a record with no cause
+/// is byte-for-byte the old shape.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct IdleTimeoutRecordOnDisk {
+    /// The five published keys, flattened to the top level of the JSON object.
+    #[serde(flatten)]
+    pub(crate) record: IdleTimeoutRecord,
+    /// See [`IdleTimeoutCause::terminal_reason`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) terminal_reason: Option<String>,
+    /// See [`IdleTimeoutCause::errors`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) errors: Vec<String>,
+    /// See [`IdleTimeoutCause::origin_kind`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) origin_kind: Option<String>,
+}
+
+impl IdleTimeoutRecordOnDisk {
+    /// Join a record and the cause read from the capture.
+    pub(crate) fn new(record: IdleTimeoutRecord, cause: IdleTimeoutCause) -> Self {
+        Self {
+            record,
+            terminal_reason: cause.terminal_reason,
+            errors: cause.errors,
+            origin_kind: cause.origin_kind,
+        }
+    }
+
+    /// The `last result: …` segment of the reason's clause, short fields first
+    /// (`terminal_reason`, then `origin`, then `errors`), or `None` when the
+    /// record carries no cause.
+    fn last_result_segment(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if let Some(terminal_reason) = &self.terminal_reason {
+            parts.push(format!("terminal_reason {terminal_reason}"));
+        }
+        if let Some(origin_kind) = &self.origin_kind {
+            parts.push(format!("origin {origin_kind}"));
+        }
+        if !self.errors.is_empty() {
+            parts.push(format!("errors [{}]", self.errors.join(" | ")));
+        }
+        (!parts.is_empty()).then(|| format!("last result: {}", parts.join("; ")))
+    }
+}
+
+/// Read the idle-timeout cause from the phase's capture: `terminal_reason`,
+/// `errors` and `origin.kind` of the LAST top-level `result` event.
+///
+/// Selection goes through [`last_top_level_result`], the same selector the
+/// verdict uses, so a subagent `result` (one carrying `parent_tool_use_id`)
+/// cannot supply the cause and an earlier turn cannot outrank the final one.
+/// Fields are read with `Value::get` only, typed: a key of the wrong type reads
+/// as absent. A missing capture, or one with no top-level `result` event (a
+/// child killed before it reported anything), yields no cause, and the reason
+/// then reads exactly as it did before Phase 51.
+pub(crate) fn idle_timeout_cause(project_root: &Path, phase: PhaseId) -> IdleTimeoutCause {
+    let Some(raw) = read_capture(&stdout_path(project_root, phase)) else {
+        return IdleTimeoutCause::default();
+    };
+    let parsed = ParsedCapture::parse(&raw);
+    let Some(result) = last_top_level_result(&parsed.events) else {
+        return IdleTimeoutCause::default();
+    };
+    let text = |value: Option<&serde_json::Value>| {
+        value
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    IdleTimeoutCause {
+        terminal_reason: text(result.get("terminal_reason")),
+        errors: result
+            .get("errors")
+            .and_then(serde_json::Value::as_array)
+            .map(|errors| {
+                errors
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        origin_kind: text(result.get("origin").and_then(|origin| origin.get("kind"))),
+    }
+}
+
+/// The parenthesised clause that follows the reason's leading `idle timeout`
+/// words, assembled from ordered `segments`, or `None` when there are none.
+///
+/// The ONE place the clause is built. 51-05 prepends its torn-final-line
+/// segment here, so every segment shares one cap.
+fn idle_timeout_clause(segments: &[String]) -> Option<String> {
+    (!segments.is_empty()).then(|| segments.join("; "))
 }
 
 /// Read the monitor's own idle-timeout verdict, if it wrote one.
@@ -2382,7 +2488,7 @@ fn parse_idle_timeout_side_channel(project_root: &Path, phase: PhaseId) -> Optio
     let path = idle_timeout_path(project_root, phase);
     let raw = read_capture(&path)?;
 
-    let Ok(record) = serde_json::from_str::<IdleTimeoutRecord>(&raw) else {
+    let Ok(on_disk) = serde_json::from_str::<IdleTimeoutRecordOnDisk>(&raw) else {
         return Some(idle_timeout_result(
             format!(
                 "idle timeout: DevFlow's monitor recorded a timeout verdict at {} but the \
@@ -2394,6 +2500,7 @@ fn parse_idle_timeout_side_channel(project_root: &Path, phase: PhaseId) -> Optio
             None,
         ));
     };
+    let record = &on_disk.record;
 
     let named: Vec<String> = record
         .commits
@@ -2415,9 +2522,17 @@ fn parse_idle_timeout_side_channel(project_root: &Path, phase: PhaseId) -> Optio
         )
     };
 
+    // D-15: the cause clause sits directly after the leading words, so it is
+    // inside the gate context even when a long commit phrase is truncated away.
+    let segments: Vec<String> = on_disk.last_result_segment().into_iter().collect();
+    let lead = match idle_timeout_clause(&segments) {
+        Some(clause) => format!("idle timeout ({clause}):"),
+        None => "idle timeout:".to_string(),
+    };
+
     Some(idle_timeout_result(
         format!(
-            "idle timeout: the agent's output stream was silent for {}s, so DevFlow \
+            "{lead} the agent's output stream was silent for {}s, so DevFlow \
              terminated it (agent pid {}). {commit_phrase} Review the branch before deciding \
              what to keep — this run is TERMINAL and is not retried automatically.",
             record.idle_secs, record.agent_pid
