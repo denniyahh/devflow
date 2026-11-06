@@ -471,7 +471,7 @@ pub struct State {
     /// R-2): a rate limit at any other stage takes the cron arm and leaves the
     /// fallback unused. One handoff sets [`Self::fallback_consumed`], after
     /// which a later rate limit takes the cron arm too (D-05).
-    #[serde(skip)]
+    #[serde(default)]
     pub fallback_agent: Option<AgentKind>,
     /// Whether this run has already handed off to [`Self::fallback_agent`]
     /// (D-05). Set in the same state write that makes the fallback the run's
@@ -480,7 +480,7 @@ pub struct State {
     ///
     /// `false` means EITHER "the fallback has not been used" OR "the state was
     /// written by a binary predating this field" — both behave identically.
-    #[serde(skip)]
+    #[serde(default)]
     pub fallback_consumed: bool,
 }
 

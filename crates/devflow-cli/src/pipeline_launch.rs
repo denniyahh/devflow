@@ -2936,9 +2936,141 @@ pub(crate) fn handle_ambiguous_outcome(
 
 /// The agent a rate limit at `stage` hands off to (SUPV-02), or `None` when the
 /// cron-resume arm should run instead.
-#[allow(dead_code)]
-fn failover_target(_state: &State, _stage: Stage) -> Option<AgentKind> {
-    None
+///
+/// `stage` is the stage the supervisor launched. Only [`Stage::Code`] is
+/// eligible (operator ruling R-2): a Plan relaunch would meet the PLAN.md
+/// short-circuit in the idempotent stage prompt and could accept a partial plan
+/// (T-51-33), and no other stage was designed for a mid-stage driver change. The
+/// fallback must also be unused (D-05) and differ from the agent driving the run,
+/// since handing a stage to the agent that just hit the limit is no handoff.
+fn failover_target(state: &State, stage: Stage) -> Option<AgentKind> {
+    let fallback = state.fallback_agent?;
+    (stage == Stage::Code && !state.fallback_consumed && fallback != state.agent)
+        .then_some(fallback)
+}
+
+/// Why [`hand_off_agent`] substitutes the agent. Its wire text is the
+/// `agent_handoff` event's `reason`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandoffReason {
+    /// The operator's `devflow resume --agent`.
+    ResumeAgent,
+    /// A rate limit at Code with an unused fallback (SUPV-02).
+    RateLimited,
+}
+
+impl HandoffReason {
+    fn as_wire_str(self) -> &'static str {
+        match self {
+            HandoffReason::ResumeAgent => "resume --agent",
+            HandoffReason::RateLimited => "rate_limited",
+        }
+    }
+}
+
+/// A handoff [`hand_off_agent`] refused before writing anything. Distinct from a
+/// state-write error, which it returns as a `CliError`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HandoffRefusal {
+    /// The full generic preflight bundle refused the candidate state.
+    Preflight(String),
+    /// The target's binary is missing or its driver's health check failed.
+    Unavailable(String),
+}
+
+/// What [`hand_off_agent`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HandoffOutcome {
+    /// The state now names `to`; `from` is the agent it replaced.
+    HandedOff { from: AgentKind },
+    /// Nothing was written.
+    Refused(HandoffRefusal),
+}
+
+/// Substitute `to` for the run's agent at its current stage (D-04): the one
+/// function `devflow resume --agent` and rate-limit failover share.
+///
+/// Every check runs against a candidate copy before ANY mutation, so a refusal
+/// leaves the state byte-identical. It runs the FULL generic preflight bundle
+/// (major-bump, unattended-launch-shape, interactivity, gh-auth), not just
+/// interactivity: `launch_stage` runs this same bundle again via
+/// `run_preflight`, and it is stricter than plain interactivity — e.g. a
+/// Claude/Antigravity-only chain-flag guard means a same-stage handoff to any
+/// other agent in Auto mode fails the unattended-launch-shape check even though
+/// the target driver declares the stage headless-safe. Checking only
+/// interactivity here let such a handoff commit (`state.agent` mutated,
+/// `agent_handoff` emitted) and then immediately hit that later gate — leaving
+/// the phase "handed off" to a driver whose launch never actually ran
+/// (44-CORE-REVIEW-FINDINGS.md finding 2b).
+///
+/// Then ONE commit sets the agent and, for a rate-limit hop, marks the fallback
+/// consumed in the same write (D-05), and `agent_handoff` is emitted. The tree is
+/// handed over as it is (D-10): nothing here resets, stashes, cleans or checks
+/// out the worktree.
+fn hand_off_agent(
+    project_root: &Path,
+    state: &mut State,
+    to: AgentKind,
+    reason: HandoffReason,
+) -> Result<HandoffOutcome, CliError> {
+    let from = state.agent;
+    let mut candidate = state.clone();
+    candidate.agent = to;
+    if let Err(why) = generic_preflight_checks(project_root, &candidate) {
+        return Ok(HandoffOutcome::Refused(HandoffRefusal::Preflight(why)));
+    }
+    if let Err(err) = ensure_agent_binary(agent_program(to)) {
+        return Ok(HandoffOutcome::Refused(HandoffRefusal::Unavailable(
+            err.to_string(),
+        )));
+    }
+    if let Err(err) = agents::driver_for(to).health(&candidate) {
+        return Ok(HandoffOutcome::Refused(HandoffRefusal::Unavailable(err)));
+    }
+
+    commit(state, |s| {
+        s.agent = to;
+        if reason == HandoffReason::RateLimited {
+            s.fallback_consumed = true;
+        }
+    })?;
+    events::emit(
+        project_root,
+        state.phase,
+        "agent_handoff",
+        serde_json::json!({
+            "stage": state.stage.to_string(),
+            "from_agent": from.to_string(),
+            "to_agent": to.to_string(),
+            "reason": reason.as_wire_str(),
+        }),
+    );
+    Ok(HandoffOutcome::HandedOff { from })
+}
+
+/// Continue a rate-limited Code stage under the unused fallback `to` (SUPV-02).
+///
+/// Reached only from the explicit `RateLimited` arm of `advance_with`, after
+/// [`failover_target`] selected `to`, and BEFORE [`handle_rate_limited_outcome`]'s
+/// infra bump: a hop is not an infra fault, so a successful one leaves
+/// `infra_failures` alone (D-06). Once handed off, the same stage is relaunched
+/// under the new driver — the tail of [`handle_ambiguous_outcome`] without its
+/// bump and ceiling check. No commit-count precondition applies (D-08) and the
+/// worktree is handed over untouched (D-10).
+fn fail_over_on_rate_limit(
+    project_root: &Path,
+    state: &mut State,
+    phase: PhaseId,
+    stage: Stage,
+    to: AgentKind,
+    reason: Option<String>,
+) -> Result<(), CliError> {
+    match hand_off_agent(project_root, state, to, HandoffReason::RateLimited)? {
+        HandoffOutcome::HandedOff { .. } => launch_stage(state, None, Some(stage)),
+        HandoffOutcome::Refused(_) => {
+            handle_rate_limited_outcome(project_root, state, phase, stage, reason)
+        }
+    }
 }
 
 /// Resume a rate-limited or infra-paused phase from its saved stage (review
@@ -3181,48 +3313,27 @@ fn resume_loaded(
     if let Some(requested) = agent
         && requested != state.agent
     {
-        let from_agent = state.agent;
-        let mut candidate = state.clone();
-        candidate.agent = requested;
-        // Runs the FULL generic preflight bundle (major-bump, unattended-
-        // launch-shape, interactivity, gh-auth) against the candidate, not
-        // just interactivity. `launch_stage` runs this same bundle again a
-        // few lines below via `run_preflight`, and it is stricter than plain
-        // interactivity: e.g. a Claude/Antigravity-only chain-flag guard
-        // means a same-stage handoff to any other agent in Auto mode fails
-        // the unattended-launch-shape check even though the target driver
-        // declares the stage headless-safe. Checking only interactivity here
-        // let such a handoff commit (`state.agent` mutated, `agent_handoff`
-        // emitted) and then immediately hit that later gate — leaving the
-        // phase "handed off" to a driver whose launch never actually ran
-        // (44-CORE-REVIEW-FINDINGS.md finding 2b). Checking the full bundle
-        // up front refuses it before anything is mutated, same as the
-        // existing byte-identical-on-refusal guarantee below.
-        generic_preflight_checks(project_root, &candidate).map_err(|reason| {
-            CliError::Message(format!(
-                "handoff to {requested} refused at saved {} stage: {reason}",
-                state.stage
-            ))
-        })?;
-        ensure_agent_binary(agent_program(requested))
-            .map_err(|err| CliError::Message(format!("handoff to {requested} refused: {err}")))?;
-        agents::driver_for(requested)
-            .health(&candidate)
-            .map_err(|err| CliError::Message(format!("handoff to {requested} refused: {err}")))?;
-
-        commit(&mut state, |s| s.agent = requested)?;
-        events::emit(
+        // The shared substitution (D-04): every check runs before anything is
+        // mutated, so a refusal leaves the state byte-identical.
+        match hand_off_agent(
             project_root,
-            phase,
-            "agent_handoff",
-            serde_json::json!({
-                "stage": state.stage.to_string(),
-                "from_agent": from_agent.to_string(),
-                "to_agent": requested.to_string(),
-                "reason": "resume --agent",
-            }),
-        );
-        println!("handoff: {from_agent} → {requested}");
+            &mut state,
+            requested,
+            HandoffReason::ResumeAgent,
+        )? {
+            HandoffOutcome::HandedOff { from } => println!("handoff: {from} → {requested}"),
+            HandoffOutcome::Refused(HandoffRefusal::Preflight(reason)) => {
+                return Err(CliError::Message(format!(
+                    "handoff to {requested} refused at saved {} stage: {reason}",
+                    state.stage
+                )));
+            }
+            HandoffOutcome::Refused(HandoffRefusal::Unavailable(err)) => {
+                return Err(CliError::Message(format!(
+                    "handoff to {requested} refused: {err}"
+                )));
+            }
+        }
     }
     // Combined BEFORE the commit below, so the persisted value exists before the
     // detached monitor this relaunch spawns ever consults it.
@@ -3744,6 +3855,26 @@ pub(crate) fn advance_with(
             agent_result::AgentStatus::Ambiguous => {
                 handle_ambiguous_outcome(project_root, &mut state, stage, result.reason)
             }
+            // SUPV-02: the failover branch sits ahead of the cron arm's infra
+            // bump (D-06), and only `RateLimited` reaches it; the wildcard below
+            // never fails over.
+            agent_result::AgentStatus::RateLimited => match failover_target(&state, stage) {
+                Some(to) => fail_over_on_rate_limit(
+                    project_root,
+                    &mut state,
+                    phase,
+                    stage,
+                    to,
+                    result.reason,
+                ),
+                None => handle_rate_limited_outcome(
+                    project_root,
+                    &mut state,
+                    phase,
+                    stage,
+                    result.reason,
+                ),
+            },
             _ => handle_rate_limited_outcome(project_root, &mut state, phase, stage, result.reason),
         },
     }
@@ -10318,7 +10449,14 @@ mod tests {
         });
         let branch_before = git_out(&run.root, &["rev-parse", "--abbrev-ref", "HEAD"]);
         let branches_before = git_out(&run.root, &["branch", "--list", "--format=%(refname)"]);
-        let worktrees_before = git_out(&run.root, &["worktree", "list", "--porcelain"]);
+        let worktrees = |root: &Path| -> Vec<String> {
+            git_out(root, &["worktree", "list", "--porcelain"])
+                .lines()
+                .filter(|line| line.starts_with("worktree "))
+                .map(str::to_string)
+                .collect()
+        };
+        let worktrees_before = worktrees(&run.root);
         run.go();
 
         assert!(
@@ -10392,7 +10530,7 @@ mod tests {
             "no branch was added"
         );
         assert_eq!(
-            git_out(&run.root, &["worktree", "list", "--porcelain"]),
+            worktrees(&run.root),
             worktrees_before,
             "no worktree was added"
         );
