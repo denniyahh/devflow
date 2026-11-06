@@ -33,6 +33,23 @@ DeepSeek Flash via pi; agy dropped on a quota error). Every finding below marked
 checked against source before it changed a decision. The review files are not committed; the
 findings that changed something are summarised in `51-DISCUSSION-LOG.md`.
 
+### Operator rulings (2026-11-05) — these supersede the decisions they name
+The operator reviewed the auto-selected decisions after planning started and ruled:
+- **R-1 (D-15):** keep `IdleTimeoutRecord`'s public shape strict. It is all-pub and not
+  `#[non_exhaustive]` in the published `devflow-core`, so a new field is a semver break; the cause
+  fields live in a separate type or record, and the release stays 3.1.0.
+- **R-2 (D-09):** failover applies to the **Code stage only**. A `RateLimited` Plan stage takes the
+  cron arm even when a fallback is configured, and the fallback stays unused. The Plan half of
+  D-09 (finishing a partial plan) is dropped from this phase; Code's half (replay the interrupted
+  fix intent) stays.
+- **R-3 (D-01):** add a `devflow.toml` key for the fallback agent, combined with the
+  `--fallback-agent` flag the way `yes_ship` combines its key with `--yes-ship` (the flag wins
+  when given). No new environment variable.
+- **R-4 (D-16):** do the classifier fix (the rate-limit check sees a torn final line, tested) and
+  return the production-rate measurement (harness, controlled measurement, archived measurements
+  file) to backlog 999.71.
+- **R-5 (D-13):** stub-agent proof is enough for criterion 1; no live forced-rate-limit run.
+
 ### Fallback configuration surface
 - **D-01:** One fallback agent, given as `--fallback-agent <AGENT>` on `devflow start`, and on
   `devflow resume` of a run that is not live (stopped, or paused on the cron arm), persisted in
