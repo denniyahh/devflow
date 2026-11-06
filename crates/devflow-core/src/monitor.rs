@@ -12,7 +12,9 @@
 //! into the capture file and its exit code is still reaped after the CLI
 //! exits.
 
-use crate::agent_result::{IdleTimeoutCommit, IdleTimeoutRecord};
+use crate::agent_result::{
+    IdleTimeoutCause, IdleTimeoutCommit, IdleTimeoutRecord, IdleTimeoutRecordOnDisk,
+};
 use crate::git::hermetic_command;
 use crate::phase_id::PhaseId;
 use crate::stage::Stage;
@@ -2723,10 +2725,16 @@ fn fire_idle_timeout(
     //    aborts, because a missing commit list must not cost the verdict.
     let (commits, enumeration_note) = enumerate_phase_commits(project_root, workdir, phase);
 
+    // 1b. Read WHY the agent stopped, once, while the capture is still the
+    //     child's last word (D-15, backlog 999.102): `terminal_reason`,
+    //     `errors` and `origin.kind` of the last top-level `result` event. No
+    //     such event yields no cause, and the reason reads as it always did.
+    let cause = crate::agent_result::idle_timeout_cause(project_root, phase);
+
     // 2. Write, flush, fsync. This completing is the ONLY thing that stops
     //    Layer 2 from later scoring partial commits as Success.
     let write_error =
-        write_idle_timeout_record(project_root, phase, idle_secs, child_pid, &commits)
+        write_idle_timeout_record(project_root, phase, idle_secs, child_pid, &commits, cause)
             .err()
             .map(|err| err.to_string());
     if let Some(err) = &write_error {
@@ -2855,12 +2863,16 @@ fn enumerate_phase_commits(
 /// `sync_all` is not decoration: D-05's guarantee is that the result exists
 /// before anything can race it, and a buffered write that is still in the page
 /// cache when the process is signalled has not achieved that.
+///
+/// Serializes [`IdleTimeoutRecordOnDisk`], the same type the reader parses, so
+/// the cause keys (D-15) cannot drift between the two directions.
 fn write_idle_timeout_record(
     project_root: &Path,
     phase: PhaseId,
     idle_secs: u64,
     child_pid: u32,
     commits: &[IdleTimeoutCommit],
+    cause: IdleTimeoutCause,
 ) -> std::io::Result<()> {
     let record = IdleTimeoutRecord {
         status: crate::agent_result::AgentStatus::IdleTimeout
@@ -2874,7 +2886,7 @@ fn write_idle_timeout_record(
             .unwrap_or(0),
         commits: commits.to_vec(),
     };
-    let json = serde_json::to_string(&record)
+    let json = serde_json::to_string(&IdleTimeoutRecordOnDisk::new(record, cause))
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
 
     let path = crate::agent_result::idle_timeout_path(project_root, phase);
