@@ -649,12 +649,12 @@ be re-tested here rather than inherited from the issue's original design.
      rebase handoff were all removed (D-11, 23d) and none is reintroduced. Counted over source with
      comments stripped, since a grep over raw source counts comment prose (the Phase 35-01 lesson).
 
-**Plans**: 0/13 plans executed (8 waves)
+**Plans**: 1/13 plans executed (8 waves)
 
 Plans:
 **Wave 1**
 
-- [ ] 51-01-PLAN.md — Tracer: a rate-limited Code stage with a fallback continues under it in the same worktree and branch; with no fallback, or at any other stage, the cron arm still fires (wave 1)
+- [x] 51-01-PLAN.md — Tracer: a rate-limited Code stage with a fallback continues under it in the same worktree and branch; with no fallback, or at any other stage, the cron arm still fires (wave 1)
 - [ ] 51-02-PLAN.md — The removed `rebase_in` / `sequentagent` / `n` handoff stays dead: comment-stripped scan of every crate source and every subcommand enum, with planted positives and decoys (wave 1)
 - [ ] 51-03-PLAN.md — 999.102: an idle-timeout failure names its cause (`terminal_reason`, `errors[]`, `origin.kind`) from the last top-level result (wave 1)
 
@@ -845,7 +845,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 49 | 12/12 | In Progress|  |
 | 50 | 29/29 | Complete | 2026-10-21 |
 | 50.1 | 30/30 | In Progress | — |
-| 51 | 0/13 | Planned | — |
+| 51 | 1/13 | In Progress | — |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
 

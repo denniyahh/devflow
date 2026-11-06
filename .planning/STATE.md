@@ -4,18 +4,18 @@ milestone: v3.0.0
 milestone_name: milestone (ACTIVE — Unattended Run Survivability)
 current_phase: 51
 current_phase_name: Rate-Limit Agent Failover
-current_plan: 1
+current_plan: 2
 status: executing
-stopped_at: Phase 51 planned (13 plans, 8 waves; replanned after review)
-last_updated: "2026-11-06T15:37:18.493Z"
+stopped_at: Completed 51-01-PLAN.md
+last_updated: "2026-11-06T15:56:36.192Z"
 last_activity: 2026-11-06
 last_activity_desc: Phase 51 execution started
-state_head: 216dd8f421cc5593beb9c9419df191c5cb8fd29f
+state_head: da6d5b7c51af711db404db06b4841bcbba809738
 progress:
   total_phases: 7
   completed_phases: 5
   total_plans: 120
-  completed_plans: 107
+  completed_plans: 108
   percent: 71
 ---
 
@@ -172,10 +172,10 @@ change earns 2.0.
 
 Phase: 51 (Rate-Limit Agent Failover) — EXECUTING
 Plans: 13 (51-01 … 51-14, no 51-08; 8 waves)
-Current Plan: 1
+Current Plan: 2
 Total Plans in Phase: 13
-Completed Plans: 0 of 13
-Status: Executing Phase 51
+Completed Plans: 1 of 13
+Status: Ready to execute
 Previous phase: 50.1 — complete, 30/30 plans; verification passed 12/12 (one operator override, the live-run criterion); merged via PR #229; released in v3.0.0. Phase 47's verification still reads `stale` by operator decision (re-verify near milestone close).
 Last activity: 2026-11-06 — Phase 51 execution started
 
@@ -833,6 +833,7 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 49]: 49-12: VERIFY-01 written as met on attempt 3 (attempt gate verdict=shipped; committed copy positive 11/0, negative 5/0, pair 3/0); shipped binary is from unmerged fix-branch commit 084625c
 - [Phase 49]: 49-12: DECN-03 outcome Followed (gate-derived from attempt 3 committed events/captures; claude only, D-15)
 - [Phase 49]: 49-12: attempt 2's two sanitizer-refused captures omitted whole by operator decision 2026-10-08 (option A)
+- [Phase 51]: 51-01: a refused failover handoff is a value (HandoffOutcome::Refused), mapped to resume --agent's unchanged refusal texts or to agent_handoff_refused plus the cron arm; failover is reachable only from an explicit AgentStatus::RateLimited arm and only at Code
 
 ## Roadmap Evolution
 
@@ -930,12 +931,13 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 48 P20 | 16m | 2 tasks | 4 files |
 | Phase 49 P11 | 6h operator | 1 tasks | 1 files |
 | Phase 49 P12 | 24h 26m | 3 tasks | 255 files |
+| Phase 51 P01 | 16 min | 2 tasks | 2 files |
 
 ## Session
 
-**Last session:** 2026-11-05T23:26:59.508Z
-**Stopped at:** Phase 51 context gathered
-**Resume file:** .planning/phases/51-rate-limit-agent-failover/51-CONTEXT.md
+**Last session:** 2026-11-06T15:56:34.415Z
+**Stopped at:** Completed 51-01-PLAN.md
+**Resume file:** None
 
 ## Operator Next Steps
 

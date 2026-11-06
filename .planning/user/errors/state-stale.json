@@ -1,5 +1,5 @@
 {
-  "stale_since_commit": "3160bbf",
-  "summaries_landed": [".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-28-SUMMARY.md"],
+  "stale_since_commit": "da6d5b7",
+  "summaries_landed": [".planning/phases/51-rate-limit-agent-failover/51-01-SUMMARY.md"],
   "state_status_at_detection": "executing"
 }
