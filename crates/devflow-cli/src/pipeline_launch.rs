@@ -10546,6 +10546,203 @@ mod tests {
         );
     }
 
+    /// Write the rate-limit envelope as the phase's capture, for an advance
+    /// run with no agent.
+    fn write_rate_limit_capture(root: &Path, phase: PhaseId) {
+        let stdout = devflow_core::agent_result::stdout_path(root, phase);
+        std::fs::create_dir_all(stdout.parent().unwrap()).unwrap();
+        std::fs::write(&stdout, format!("{RATE_LIMIT_ENVELOPE}\n")).unwrap();
+    }
+
+    /// Assert `phase`'s cron instruction resumes it with `devflow resume
+    /// --phase N` on a real schedule.
+    fn assert_cron_resume_written(root: &Path, phase: PhaseId) {
+        let instructions = devflow_core::ship::load_cron_instructions(root, phase)
+            .expect("the cron arm writes cron-instructions-NN.json");
+        assert_eq!(instructions.resume.command, "devflow");
+        assert_eq!(
+            instructions.resume.args,
+            ["resume", "--phase", &phase.to_string()]
+        );
+        assert!(
+            !instructions.hermes_cron.schedule.is_empty(),
+            "the retry time yields a schedule"
+        );
+    }
+
+    /// D-11 criterion 2 (SUPV-02): with no fallback, a rate-limited Code stage
+    /// takes today's cron arm through the real supervisor: the cron
+    /// instruction resumes the phase with `devflow resume --phase N`, and
+    /// nothing hands off. Negative control: zero `agent_handoff` events, the
+    /// agent unchanged, and no stage launched after N's. Every successor is
+    /// launched from inside N's advance, so once N's socket is gone no later
+    /// one can appear; the launch count rules out one that came and went.
+    #[test]
+    fn a_rate_limit_without_a_fallback_writes_cron_instructions_and_never_hands_off() {
+        const NAME: &str = "pipeline_launch::tests::a_rate_limit_without_a_fallback_writes_cron_instructions_and_never_hands_off";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child_with_stubs(
+                NAME,
+                None,
+                SUCCESS_MARKER,
+                &[("claude", rate_limited_claude_script())],
+            );
+            return;
+        }
+        let _guard = env_lock();
+        let run = HandoffRun::launch_with(PhaseId::new(5102), |_, state| {
+            state.stage = Stage::Code;
+            state.stop_until = Some(Stage::Code);
+        });
+        run.go();
+
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || {
+                !events_named(&run.root, "rate_limit_resume_scheduled").is_empty()
+            }),
+            "the cron arm never ran; events:\n{}",
+            run.events()
+        );
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || {
+                devflow_core::supervisor::probe(&run.n.socket_path)
+                    .is_ok_and(|liveness| liveness == devflow_core::supervisor::Liveness::Gone)
+            }),
+            "N's supervisor ends once its advance has returned"
+        );
+
+        assert_cron_resume_written(&run.root, run.phase);
+        assert_eq!(
+            events_named(&run.root, "rate_limit_resume_scheduled").len(),
+            1,
+            "{}",
+            run.events()
+        );
+        assert!(
+            events_named(&run.root, "agent_handoff").is_empty(),
+            "no fallback, no handoff; events:\n{}",
+            run.events()
+        );
+        let state = run.state();
+        assert_eq!(state.agent, AgentKind::Claude);
+        assert_eq!(state.fallback_agent, None);
+        assert!(
+            run.other_sockets().is_empty(),
+            "no supervisor besides N's was published: {:?}",
+            run.other_sockets()
+        );
+        assert_eq!(
+            stage_launched_count(&run.root, run.phase),
+            1,
+            "only stage N launched; events:\n{}",
+            run.events()
+        );
+    }
+
+    /// D-07: a handoff refused at runtime — here the fallback's binary is
+    /// missing — says so in `agent_handoff_refused`, naming the fallback and
+    /// the refusal, then takes the cron arm unchanged with the original
+    /// retry time. The fallback stays unconsumed and the agent unchanged; the
+    /// cron arm's own bump is the only `infra_failures` change.
+    ///
+    /// Supervise mode: under Auto the candidate preflight refuses Codex at
+    /// Code on the unattended launch shape before the binary check runs, and
+    /// the reason would not name the missing binary.
+    #[test]
+    fn a_refused_handoff_takes_the_cron_arm_and_names_the_refusal() {
+        const NAME: &str =
+            "pipeline_launch::tests::a_refused_handoff_takes_the_cron_arm_and_names_the_refusal";
+        enter_agent_free_child!(NAME, "claude");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5103);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Code;
+        state.fallback_agent = Some(AgentKind::Codex);
+        workflow::save_state(&state).unwrap();
+        write_rate_limit_capture(root, phase);
+
+        advance(root, Some(phase)).unwrap();
+
+        let refused = events_named(root, "agent_handoff_refused");
+        assert_eq!(refused.len(), 1, "one refusal event: {refused:?}");
+        let refusal = &refused[0];
+        assert_eq!(refusal["stage"], "code", "{refusal}");
+        assert_eq!(refusal["from_agent"], "claude", "{refusal}");
+        assert_eq!(refusal["to_agent"], "codex", "{refusal}");
+        assert!(
+            refusal["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("not found")),
+            "the refusal names the missing binary: {refusal}"
+        );
+        assert_cron_resume_written(root, phase);
+        assert_eq!(events_named(root, "rate_limit_resume_scheduled").len(), 1);
+        assert!(
+            events_named(root, "agent_handoff").is_empty(),
+            "a refused handoff is not a handoff"
+        );
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        assert_eq!(reloaded.agent, AgentKind::Claude);
+        assert!(
+            !reloaded.fallback_consumed,
+            "only a committed hop consumes it"
+        );
+        assert_eq!(reloaded.infra_failures, 1, "the cron arm's own bump");
+    }
+
+    /// R-2: a rate limit at Plan with an unused fallback configured takes the
+    /// cron arm and leaves the fallback alone. A `codex` stub is on PATH, so
+    /// the absence of a hop is not explained by a missing binary.
+    ///
+    /// Supervise mode, so that with the stage term removed from
+    /// [`failover_target`] this run reaches a committed hop rather than a
+    /// preflight refusal (the RED-equivalent this control was checked with).
+    #[test]
+    fn a_rate_limit_at_plan_with_a_fallback_takes_the_cron_arm() {
+        const NAME: &str =
+            "pipeline_launch::tests::a_rate_limit_at_plan_with_a_fallback_takes_the_cron_arm";
+        enter_agent_free_child!(NAME, "codex");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5104);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Plan;
+        state.fallback_agent = Some(AgentKind::Codex);
+        workflow::save_state(&state).unwrap();
+        write_rate_limit_capture(root, phase);
+
+        advance(root, Some(phase)).unwrap();
+
+        // The hop checks come first so that a hop at Plan is the failure
+        // reported, not its knock-on missing cron file.
+        assert!(
+            events_named(root, "agent_handoff").is_empty(),
+            "no handoff at Plan: {:?}",
+            events_named(root, "agent_handoff")
+        );
+        assert!(
+            events_named(root, "agent_handoff_refused").is_empty(),
+            "Plan never attempts a handoff"
+        );
+        assert_cron_resume_written(root, phase);
+        assert_eq!(events_named(root, "rate_limit_resume_scheduled").len(), 1);
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        assert_eq!(reloaded.agent, AgentKind::Claude);
+        assert_eq!(reloaded.fallback_agent, Some(AgentKind::Codex));
+        assert!(!reloaded.fallback_consumed);
+    }
+
     /// Send `shutdown` to the supervisor at `socket` on the wire, wait for
     /// its `accepted` line (returned first), run `then`, and return the final
     /// line read within `final_wait`. Unlike `request_shutdown`, the caller
