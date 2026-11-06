@@ -2303,6 +2303,15 @@ pub(crate) struct IdleTimeoutCause {
     pub(crate) origin_kind: Option<String>,
 }
 
+/// At most this many `errors` entries are kept from the cause.
+const MAX_CAUSE_ERRORS: usize = 3;
+
+/// At most this many characters are kept from each cause field.
+const MAX_CAUSE_TEXT_CHARS: usize = 160;
+
+/// At most this many characters fit between the reason clause's parentheses.
+pub(crate) const MAX_IDLE_TIMEOUT_CLAUSE_CHARS: usize = 200;
+
 /// The idle-timeout record exactly as it sits on disk: the published
 /// [`IdleTimeoutRecord`] plus D-15's optional cause keys.
 ///
@@ -7317,6 +7326,230 @@ mod tests {
              before deciding what to keep — this run is TERMINAL and is not retried \
              automatically."
         );
+    }
+
+    /// A record written before Phase 51 has none of the cause keys. It must
+    /// parse into the ordinary reason, not fall into the unreadable branch.
+    #[test]
+    fn a_pre_51_idle_timeout_record_still_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        let pre_51 = PhaseId::new(65);
+        write_idle_timeout_record(dir.path(), pre_51, &[]);
+        let reason = evaluate_layer1(dir.path(), pre_51).unwrap().reason.unwrap();
+        assert!(
+            !reason.contains("record itself is unreadable"),
+            "a pre-51 record read as unreadable: {reason}"
+        );
+        assert!(reason.contains("silent for"), "got: {reason}");
+
+        // CONTROL: a record that really is malformed still says so, so the
+        // assertion above is not passing on a parser that accepts anything.
+        let malformed = PhaseId::new(66);
+        write_idle_timeout_record_with(
+            dir.path(),
+            malformed,
+            &[],
+            serde_json::json!({"idle_secs": "thirty"}),
+        );
+        let reason = evaluate_layer1(dir.path(), malformed)
+            .unwrap()
+            .reason
+            .unwrap();
+        assert!(
+            reason.contains("record itself is unreadable"),
+            "a non-numeric idle_secs must read as unreadable; got: {reason}"
+        );
+    }
+
+    fn json_keys(value: &serde_json::Value) -> std::collections::BTreeSet<String> {
+        value
+            .as_object()
+            .expect("a record serializes to a JSON object")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    fn sample_record() -> IdleTimeoutRecord {
+        IdleTimeoutRecord {
+            status: AgentStatus::IdleTimeout.as_wire_str().to_string(),
+            idle_secs: 30,
+            agent_pid: 4242,
+            written_at: 1_700_000_000,
+            commits: Vec::new(),
+        }
+    }
+
+    /// The flattened on-disk key set, pinned as literals.
+    ///
+    /// `#[serde(flatten)]` merges `IdleTimeoutRecord`'s keys with the cause
+    /// keys into one object. A future `IdleTimeoutRecord` field whose name
+    /// collides with a cause key would make every record unparseable, and a
+    /// new field anywhere would change the on-disk contract silently; both
+    /// fail here instead, naming the key. 51-05 adds `capture_torn_final_line`
+    /// to the pinned set in the same change that adds that key.
+    #[test]
+    fn the_on_disk_idle_timeout_record_key_set_is_pinned() {
+        let cause_keys: std::collections::BTreeSet<String> =
+            ["terminal_reason", "errors", "origin_kind"]
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+        let record_keys: std::collections::BTreeSet<String> =
+            ["status", "idle_secs", "agent_pid", "written_at", "commits"]
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+
+        let full = IdleTimeoutRecordOnDisk::new(
+            sample_record(),
+            IdleTimeoutCause {
+                terminal_reason: Some(CAUSE_TERMINAL_REASON.to_string()),
+                errors: vec![CAUSE_ERROR.to_string()],
+                origin_kind: Some(CAUSE_ORIGIN_KIND.to_string()),
+            },
+        );
+        let expected: std::collections::BTreeSet<String> =
+            record_keys.union(&cause_keys).cloned().collect();
+        assert_eq!(
+            json_keys(&serde_json::to_value(&full).unwrap()),
+            expected,
+            "the on-disk idle-timeout key set changed"
+        );
+
+        let published = json_keys(&serde_json::to_value(sample_record()).unwrap());
+        assert_eq!(
+            published, record_keys,
+            "IdleTimeoutRecord's own keys changed"
+        );
+        let collisions: Vec<&String> = published.intersection(&cause_keys).collect();
+        assert!(
+            collisions.is_empty(),
+            "IdleTimeoutRecord key(s) {collisions:?} collide with a flattened cause key"
+        );
+
+        // CONTROL: with no cause the record is exactly the five published
+        // keys (skip-when-empty), so a record with no cause is the old shape.
+        let bare = IdleTimeoutRecordOnDisk::new(sample_record(), IdleTimeoutCause::default());
+        assert_eq!(
+            json_keys(&serde_json::to_value(&bare).unwrap()),
+            record_keys
+        );
+    }
+
+    /// Agent-authored cause text is bounded and terminal-safe where it is
+    /// read, before it reaches the record, the reason, the gate context or the
+    /// notify hook's environment.
+    #[test]
+    fn idle_timeout_cause_text_is_bounded_and_control_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let hostile = format!("\u{1b}[31m{}\n", "x".repeat(10_000));
+        let event = serde_json::json!({
+            "type": "result",
+            "terminal_reason": hostile,
+            "errors": vec![hostile.clone(); 10],
+            "origin": {"kind": hostile},
+            "result": "no marker",
+        });
+        let phase = PhaseId::new(67);
+        write_capture_lines(root, phase, &[serde_json::to_string(&event).unwrap()]);
+
+        let cause = idle_timeout_cause(root, phase);
+        assert!(
+            cause.errors.len() <= 3,
+            "{} errors kept",
+            cause.errors.len()
+        );
+        assert!(
+            !cause.errors.is_empty(),
+            "the bound must not drop every error"
+        );
+        let fields = cause
+            .errors
+            .iter()
+            .chain(cause.terminal_reason.iter())
+            .chain(cause.origin_kind.iter());
+        for field in fields {
+            assert!(
+                field.chars().count() <= 160,
+                "a cause field kept {} characters",
+                field.chars().count()
+            );
+            assert!(
+                !field.chars().any(char::is_control),
+                "a cause field kept a control character: {field:?}"
+            );
+        }
+
+        // CONTROL: a short clean error passes through unchanged.
+        let clean = PhaseId::new(68);
+        write_capture_lines(
+            root,
+            clean,
+            &[serde_json::to_string(&serde_json::json!({
+                "type": "result",
+                "errors": [CAUSE_ERROR],
+            }))
+            .unwrap()],
+        );
+        assert_eq!(
+            idle_timeout_cause(root, clean).errors,
+            vec![CAUSE_ERROR.to_string()]
+        );
+    }
+
+    /// The whole clause is capped, so the largest cause the field bounds admit
+    /// still closes inside the 300-character gate context (contract with
+    /// 51-05, whose torn segment shares this cap).
+    #[test]
+    fn the_idle_timeout_clause_is_capped_at_the_cause_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        let clause_of = |reason: &str| -> String {
+            let rest = reason
+                .strip_prefix("idle timeout (")
+                .unwrap_or_else(|| panic!("no cause clause in: {reason}"));
+            let close = rest
+                .find(')')
+                .unwrap_or_else(|| panic!("the clause never closes in: {reason}"));
+            rest[..close].to_string()
+        };
+
+        let max_bound = PhaseId::new(69);
+        write_idle_timeout_record_with(
+            dir.path(),
+            max_bound,
+            &[],
+            serde_json::json!({
+                "terminal_reason": "t".repeat(MAX_CAUSE_TEXT_CHARS),
+                "origin_kind": "o".repeat(MAX_CAUSE_TEXT_CHARS),
+                "errors": vec!["e".repeat(MAX_CAUSE_TEXT_CHARS); MAX_CAUSE_ERRORS],
+            }),
+        );
+        let reason = evaluate_layer1(dir.path(), max_bound)
+            .unwrap()
+            .reason
+            .unwrap();
+        let clause = clause_of(&reason);
+        assert!(
+            clause.chars().count() <= MAX_IDLE_TIMEOUT_CLAUSE_CHARS,
+            "the clause is {} characters: {clause}",
+            clause.chars().count()
+        );
+        assert!(clause.contains("terminal_reason t"), "got: {clause}");
+
+        // CONTROL: the measured 999.102 cause is short and renders whole.
+        let measured = PhaseId::new(70);
+        write_idle_timeout_record_with(dir.path(), measured, &[], measured_cause_keys());
+        let reason = evaluate_layer1(dir.path(), measured)
+            .unwrap()
+            .reason
+            .unwrap();
+        let clause = clause_of(&reason);
+        assert!(!clause.contains('…'), "a short cause was cut: {clause}");
+        assert!(clause.contains(CAUSE_ERROR), "got: {clause}");
     }
 
     /// Last-result-wins. A session kept alive across turns emits one `result`
