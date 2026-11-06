@@ -5990,7 +5990,7 @@ for the DevFlow-side prompt policy plus its tests; M if the upstream marker is p
 
 ---
 
-### Phase 999.71: Measure Whether the Capture Writer Actually Leaves Torn Terminal Lines (PROMOTED — Phase 51, operator 2026-11-05)
+### Phase 999.71: Measure Whether the Capture Writer Actually Leaves Torn Terminal Lines (BACKLOG — Phase 51 takes only the rate-limit classifier's torn-line fix; the measurement stays here, operator 2026-11-05)
 
 **GitHub:** [#169](https://github.com/denniyahh/devflow/issues/169) (migrated from Linear DEN-92)
 **Found:** 2026-08-02, phase 30 adversarial pass over the malformed-input defect class. Flagged as
