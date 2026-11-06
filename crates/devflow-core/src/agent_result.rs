@@ -2303,14 +2303,55 @@ pub(crate) struct IdleTimeoutCause {
     pub(crate) origin_kind: Option<String>,
 }
 
-/// At most this many `errors` entries are kept from the cause.
+/// At most this many `errors` entries are kept from the cause (D-15,
+/// T-51-07): a multi-megabyte `errors` array must not bloat `.devflow/` or the
+/// reason.
 const MAX_CAUSE_ERRORS: usize = 3;
 
-/// At most this many characters are kept from each cause field.
+/// At most this many characters are kept from each cause field —
+/// `terminal_reason`, `origin_kind` and every `errors` entry (D-15, T-51-06).
+///
+/// These field bounds size the record on disk. What reaches the gate is sized
+/// separately by [`MAX_IDLE_TIMEOUT_CLAUSE_CHARS`]; the full bounded fields stay
+/// in the record.
 const MAX_CAUSE_TEXT_CHARS: usize = 160;
 
-/// At most this many characters fit between the reason clause's parentheses.
+/// At most this many characters sit between the reason clause's parentheses,
+/// counted in characters, not bytes; a longer clause is cut and ends in `…`
+/// inside the cap.
+///
+/// Derivation (cross-plan contract with 51-05, whose torn-final-line segment
+/// is the clause's first segment, inside this same cap):
+/// `render_gate_context(.., 300)` keeps the first 261 characters of a longer
+/// text (300 minus its 39-character truncation suffix). That happens twice: in
+/// `truncate_reason`, to the reason, and in the pending-gate banner, to the
+/// whole gate context, where the longest prefix,
+/// `[never-silent] stage validate failed: `, takes 38, leaving 223 for the
+/// reason. `idle timeout (` (14) + 200 + `): ` (3) = 217 ≤ 223, so the clause
+/// closes inside both renderings for any cause within the field bounds.
 pub(crate) const MAX_IDLE_TIMEOUT_CLAUSE_CHARS: usize = 200;
+
+/// Make agent-authored cause text bounded and terminal-safe: every control
+/// character becomes a space, and text longer than `max_chars` characters is
+/// cut to fit, ending in `…`.
+fn bound_text(text: &str, max_chars: usize) -> String {
+    let clean: String = text
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    if clean.chars().count() <= max_chars {
+        return clean;
+    }
+    let mut cut: String = clean.chars().take(max_chars.saturating_sub(1)).collect();
+    cut.push('…');
+    cut
+}
 
 /// The idle-timeout record exactly as it sits on disk: the published
 /// [`IdleTimeoutRecord`] plus D-15's optional cause keys.
@@ -2378,7 +2419,9 @@ impl IdleTimeoutRecordOnDisk {
 /// verdict uses, so a subagent `result` (one carrying `parent_tool_use_id`)
 /// cannot supply the cause and an earlier turn cannot outrank the final one.
 /// Fields are read with `Value::get` only, typed: a key of the wrong type reads
-/// as absent. A missing capture, or one with no top-level `result` event (a
+/// as absent. Every field is bounded HERE, by [`MAX_CAUSE_ERRORS`] and
+/// [`MAX_CAUSE_TEXT_CHARS`] with control characters replaced, so the record on
+/// disk and every consumer see the bounded text. A missing capture, or one with no top-level `result` event (a
 /// child killed before it reported anything), yields no cause, and the reason
 /// then reads exactly as it did before Phase 51.
 pub(crate) fn idle_timeout_cause(project_root: &Path, phase: PhaseId) -> IdleTimeoutCause {
@@ -2392,7 +2435,7 @@ pub(crate) fn idle_timeout_cause(project_root: &Path, phase: PhaseId) -> IdleTim
     let text = |value: Option<&serde_json::Value>| {
         value
             .and_then(serde_json::Value::as_str)
-            .map(str::to_string)
+            .map(|field| bound_text(field, MAX_CAUSE_TEXT_CHARS))
     };
     IdleTimeoutCause {
         terminal_reason: text(result.get("terminal_reason")),
@@ -2403,7 +2446,8 @@ pub(crate) fn idle_timeout_cause(project_root: &Path, phase: PhaseId) -> IdleTim
                 errors
                     .iter()
                     .filter_map(serde_json::Value::as_str)
-                    .map(str::to_string)
+                    .take(MAX_CAUSE_ERRORS)
+                    .map(|error| bound_text(error, MAX_CAUSE_TEXT_CHARS))
                     .collect()
             })
             .unwrap_or_default(),
@@ -2415,9 +2459,10 @@ pub(crate) fn idle_timeout_cause(project_root: &Path, phase: PhaseId) -> IdleTim
 /// words, assembled from ordered `segments`, or `None` when there are none.
 ///
 /// The ONE place the clause is built. 51-05 prepends its torn-final-line
-/// segment here, so every segment shares one cap.
+/// segment here, so every segment shares one cap,
+/// [`MAX_IDLE_TIMEOUT_CLAUSE_CHARS`].
 fn idle_timeout_clause(segments: &[String]) -> Option<String> {
-    (!segments.is_empty()).then(|| segments.join("; "))
+    (!segments.is_empty()).then(|| bound_text(&segments.join("; "), MAX_IDLE_TIMEOUT_CLAUSE_CHARS))
 }
 
 /// Read the monitor's own idle-timeout verdict, if it wrote one.
