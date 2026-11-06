@@ -448,6 +448,40 @@ pub struct State {
     /// field at each gate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_notify_cmd: Option<String>,
+    /// The agent a rate-limited Code stage hands off to (SUPV-02, D-01).
+    ///
+    /// `None` means EITHER "no fallback was configured" OR "the state was
+    /// written by a binary predating this field" — both behave identically: a
+    /// rate limit takes the cron-resume arm, which is the pre-existing
+    /// behaviour.
+    ///
+    /// Persisted rather than passed through the call stack for the reason
+    /// [`Self::yes_ship`] gives: each stage launch happens in a SEPARATE
+    /// `devflow` process (the detached monitor's own `advance` tail), and the
+    /// rate limit is observed by that process, long after the command that
+    /// configured the fallback has exited.
+    ///
+    /// Where it comes from: `devflow start --fallback-agent` and
+    /// `devflow resume --fallback-agent` (plan 51-04), or `devflow.toml`'s
+    /// `fallback_agent` key, which only `devflow start` reads (plan 51-14) and
+    /// which the flag overrides when both are given. It is never read from an
+    /// environment variable.
+    ///
+    /// It applies only to a rate limit at [`Stage::Code`] (operator ruling
+    /// R-2): a rate limit at any other stage takes the cron arm and leaves the
+    /// fallback unused. One handoff sets [`Self::fallback_consumed`], after
+    /// which a later rate limit takes the cron arm too (D-05).
+    #[serde(skip)]
+    pub fallback_agent: Option<AgentKind>,
+    /// Whether this run has already handed off to [`Self::fallback_agent`]
+    /// (D-05). Set in the same state write that makes the fallback the run's
+    /// agent, so a second rate limit can never hand off again; it takes the
+    /// cron arm instead. A refused handoff does not set it.
+    ///
+    /// `false` means EITHER "the fallback has not been used" OR "the state was
+    /// written by a binary predating this field" — both behave identically.
+    #[serde(skip)]
+    pub fallback_consumed: bool,
 }
 
 /// The persisted handle on a launch's supervisor ([`State::supervisor`]).
@@ -686,6 +720,8 @@ impl State {
             // Unrecorded (see the field's doc comment).
             checkpoint_approval: CheckpointApproval::Pending,
             gate_notify_cmd: None,
+            fallback_agent: None,
+            fallback_consumed: false,
         }
     }
 }
@@ -986,6 +1022,49 @@ mod tests {
             loaded.infra_failures, 4,
             "infra_failures must round-trip through serde"
         );
+    }
+
+    /// SUPV-02 (D-01): the configured fallback and its consumed flag are
+    /// persisted under their own keys and survive a round trip, and a state
+    /// file written before either field existed still loads, as "no fallback,
+    /// unused".
+    #[test]
+    fn fallback_fields_round_trip_and_tolerate_states_predating_them() {
+        let mut state = State::new(
+            PhaseId::new(1),
+            AgentKind::Claude,
+            Mode::Auto,
+            PathBuf::from("/repo"),
+        );
+        state.fallback_agent = Some(AgentKind::Codex);
+        state.fallback_consumed = true;
+        let json = serde_json::to_string(&state).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value.get("fallback_agent"),
+            Some(&serde_json::json!("codex")),
+            "fallback_agent must be persisted under its own key: {json}"
+        );
+        assert_eq!(
+            value.get("fallback_consumed"),
+            Some(&serde_json::json!(true)),
+            "fallback_consumed must be persisted under its own key: {json}"
+        );
+        let loaded: State = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.fallback_agent, Some(AgentKind::Codex));
+        assert!(loaded.fallback_consumed);
+
+        let predating = r#"{
+            "stage": "code",
+            "phase": 1,
+            "agent": "claude",
+            "mode": "auto",
+            "started_at": "0",
+            "project_root": "/repo"
+        }"#;
+        let loaded: State = serde_json::from_str(predating).unwrap();
+        assert_eq!(loaded.fallback_agent, None);
+        assert!(!loaded.fallback_consumed);
     }
 
     /// A serde-absent `infra_failures` (older persisted state.json without
