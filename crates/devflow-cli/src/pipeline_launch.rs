@@ -2978,6 +2978,15 @@ enum HandoffRefusal {
     Unavailable(String),
 }
 
+impl HandoffRefusal {
+    /// The refusal's text, without any prefix.
+    fn reason(&self) -> &str {
+        match self {
+            HandoffRefusal::Preflight(reason) | HandoffRefusal::Unavailable(reason) => reason,
+        }
+    }
+}
+
 /// What [`hand_off_agent`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum HandoffOutcome {
@@ -3057,6 +3066,12 @@ fn hand_off_agent(
 /// under the new driver — the tail of [`handle_ambiguous_outcome`] without its
 /// bump and ceiling check. No commit-count precondition applies (D-08) and the
 /// worktree is handed over untouched (D-10).
+///
+/// A refused handoff is never a silent skip (D-07): `agent_handoff_refused`
+/// names the fallback and the refusal, then the cron arm runs exactly as it
+/// would have with no fallback, given the ORIGINAL rate-limit reason so its
+/// retry time still parses. Only a committed hop consumes the fallback (D-05),
+/// so a refusal leaves it unused.
 fn fail_over_on_rate_limit(
     project_root: &Path,
     state: &mut State,
@@ -3067,7 +3082,18 @@ fn fail_over_on_rate_limit(
 ) -> Result<(), CliError> {
     match hand_off_agent(project_root, state, to, HandoffReason::RateLimited)? {
         HandoffOutcome::HandedOff { .. } => launch_stage(state, None, Some(stage)),
-        HandoffOutcome::Refused(_) => {
+        HandoffOutcome::Refused(refusal) => {
+            events::emit(
+                project_root,
+                phase,
+                "agent_handoff_refused",
+                serde_json::json!({
+                    "stage": stage.to_string(),
+                    "from_agent": state.agent.to_string(),
+                    "to_agent": to.to_string(),
+                    "reason": refusal.reason(),
+                }),
+            );
             handle_rate_limited_outcome(project_root, state, phase, stage, reason)
         }
     }
