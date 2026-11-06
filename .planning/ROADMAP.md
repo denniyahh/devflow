@@ -665,7 +665,7 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 51-06-PLAN.md — Harden the hop: per-agent canary, handoff event fields, boundary tests at Code, a failed relaunch is never silent inside a running supervisor (wave 3)
+- [ ] 51-06-PLAN.md — Harden the hop: per-agent canary, handoff event fields, boundary tests at Code, a relaunch that fails after the handoff ends at a gate (not the cron arm) inside a running supervisor (wave 3)
 - [ ] 51-14-PLAN.md — R-3: a `fallback_agent` key in `devflow.toml`, combined with `--fallback-agent` at `start` (flag wins), no environment variable (wave 3)
 
 **Wave 4** *(blocked on Wave 3 completion)*
@@ -679,11 +679,11 @@ Plans:
 
 **Wave 6** *(blocked on Wave 5 completion)*
 
-- [ ] 51-10-PLAN.md — SUPV-01 by observation, part 1: every liveness read traced; the publish wait and the cron arm's resume read withheld with controls (wave 6)
+- [ ] 51-10-PLAN.md — SUPV-01 by observation, part 1: every liveness read traced and checked row by row; the publish wait and the cron arm's recorded-socket resume read withheld with controls (wave 6)
 
 **Wave 7** *(blocked on Wave 6 completion)*
 
-- [ ] 51-13-PLAN.md — SUPV-01 by observation, part 2: the post-save probe and the pending-record lock probe withheld with controls; the per-arm conclusion (wave 7)
+- [ ] 51-13-PLAN.md — SUPV-01 by observation, part 2: the post-save probe, the pending-record lock probe and resume's two lock probes withheld with controls; the per-arm conclusion (wave 7)
 
 **Wave 8** *(blocked on Wave 7 completion)*
 
@@ -1072,6 +1072,16 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
+
+### Phase 999.185: A Superseded Supervisor Can Still Write the Rate-Limit Cron File (BACKLOG)
+
+**Found:** 2026-11-06, Phase 51 second external plan review (codex), confirmed by reading source at `0d80aac`.
+
+**The defect:** `handle_rate_limited_outcome` (`crates/devflow-cli/src/pipeline_outcomes.rs`) bumps `infra_failures` with an owned `commit`, then writes the cron instructions with `devflow_core::ship::write_cron_instructions` (`crates/devflow-core/src/ship.rs`), a plain filesystem write with no ownership check. A supervisor whose record is replaced between the two still creates or overwrites `cron-instructions-NN.json`. Present on today's no-fallback cron arm; not introduced by Phase 51. Phase 51 (51-06) narrowed its own "a superseded supervisor writes nothing" claim to exclude this window (threat T-51-40).
+
+**Fix shape (not decided):** run the cron write inside the existing `fenced` helper (`crates/devflow-cli/src/pipeline_launch.rs`), which checks ownership around a side effect. A bare `ensure_still_recorded` check before the write narrows the window but does not close it.
+
+**Acceptance:** a test that replaces the recorded supervisor between the counter commit and the cron write and asserts no cron file is written, with the unreplaced run as its control.
 
 ### Phase 999.184: An Ordinary Plan Success Over Uncommitted Plan Files Still Advances to Code (BACKLOG)
 

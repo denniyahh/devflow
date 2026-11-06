@@ -693,6 +693,10 @@ and IN-10 (unparseable file silently rewritten) are both **likely** no longer re
    - Resolution: 51-06 Task 3 adopts the recommendation: a non-`NotOwner` relaunch error after the
      handoff commit emits `agent_handoff_relaunch_failed` and takes `handle_rate_limited_outcome`
      (`a_handoff_whose_relaunch_fails_ends_in_the_cron_arm`).
+   - **Superseded by orchestrator decision R2-D1 (2026-11-06, `51-REVIEWS.md` Round 2):** a post-commit
+     relaunch failure ends at a gate via `handle_infra_outcome`, not the cron arm; the test is now
+     `…_ends_at_a_gate`. The cron-arm answer above (and the old test name in the validation table below) is
+     historical.
 3. **999.71 measurement deliverable shape.** — RESOLVED: by plan 51-05. Preliminary data gathered
    this session (see below).
    Recommendation: an `events.jsonl` record of the capture's final-line shape at each evaluation
