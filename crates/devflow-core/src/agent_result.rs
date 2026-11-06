@@ -2288,6 +2288,23 @@ pub struct IdleTimeoutRecord {
     pub commits: Vec<IdleTimeoutCommit>,
 }
 
+/// Why the agent stopped, as the capture's last top-level `result` event
+/// recorded it at the moment the idle timeout fired (D-15, backlog 999.102).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct IdleTimeoutCause {
+    /// The event's `terminal_reason` string, for example `aborted_tools`.
+    pub(crate) terminal_reason: Option<String>,
+    /// The event's `errors` array, string entries only.
+    pub(crate) errors: Vec<String>,
+    /// The event's `origin.kind` string, for example `task-notification`.
+    pub(crate) origin_kind: Option<String>,
+}
+
+/// Read the idle-timeout cause from the phase's capture.
+pub(crate) fn idle_timeout_cause(_project_root: &Path, _phase: PhaseId) -> IdleTimeoutCause {
+    IdleTimeoutCause::default()
+}
+
 /// Read the monitor's own idle-timeout verdict, if it wrote one.
 ///
 /// **This is consulted as the FIRST statement of [`evaluate_layer1`], before
@@ -7007,6 +7024,184 @@ mod tests {
             "an unreadable record must not invent a commit count"
         );
         assert!(result.reason.unwrap().contains("unreadable"));
+    }
+
+    // ---- idle-timeout cause (D-15, backlog 999.102) -----------------------
+
+    /// The measured 999.102 cause: what a real Claude CLI `result` event held
+    /// when three Phase 35.1 runs were misread as "the agent went quiet".
+    const CAUSE_TERMINAL_REASON: &str = "aborted_tools";
+    const CAUSE_ERROR: &str =
+        "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use";
+    const CAUSE_ORIGIN_KIND: &str = "task-notification";
+
+    /// Write an idle-timeout record carrying `extra` keys beside the five
+    /// `IdleTimeoutRecord` keys, built as plain JSON so the on-disk shape is
+    /// fixed by the test rather than by whichever Rust type writes it.
+    fn write_idle_timeout_record_with(
+        root: &Path,
+        phase: PhaseId,
+        commits: &[(&str, &str)],
+        extra: serde_json::Value,
+    ) {
+        write_idle_timeout_record(root, phase, commits);
+        let path = idle_timeout_path(root, phase);
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let object = value.as_object_mut().expect("the record is a JSON object");
+        for (key, field) in extra.as_object().expect("extra keys are a JSON object") {
+            object.insert(key.clone(), field.clone());
+        }
+        std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+    }
+
+    /// The three measured cause keys, as they appear in a record on disk.
+    fn measured_cause_keys() -> serde_json::Value {
+        serde_json::json!({
+            "terminal_reason": CAUSE_TERMINAL_REASON,
+            "errors": [CAUSE_ERROR],
+            "origin_kind": CAUSE_ORIGIN_KIND,
+        })
+    }
+
+    /// One JSONL `result` line with the given `terminal_reason`, made a
+    /// subagent result when `parent` names a tool use.
+    fn result_line(terminal_reason: &str, parent: Option<&str>) -> String {
+        let mut event = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "terminal_reason": terminal_reason,
+            "errors": [format!("error from {terminal_reason}")],
+            "origin": {"kind": format!("origin-{terminal_reason}")},
+            "result": "no marker",
+        });
+        if let Some(parent) = parent {
+            event["parent_tool_use_id"] = serde_json::Value::String(parent.to_string());
+        }
+        serde_json::to_string(&event).unwrap()
+    }
+
+    fn write_capture_lines(root: &Path, phase: PhaseId, lines: &[String]) {
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        let mut capture = lines.join("\n");
+        capture.push('\n');
+        std::fs::write(stdout_path(root, phase), capture).unwrap();
+    }
+
+    /// The cause comes from the session's FINAL top-level verdict: a later
+    /// top-level `result` displaces an earlier one, and a subagent `result`
+    /// (one carrying `parent_tool_use_id`) never displaces a top-level one.
+    #[test]
+    fn the_idle_timeout_cause_comes_from_the_last_top_level_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // (a) earlier and later top-level results: the later one wins.
+        let earlier_later = PhaseId::new(60);
+        write_capture_lines(
+            root,
+            earlier_later,
+            &[result_line("early", None), result_line("late", None)],
+        );
+        let cause = idle_timeout_cause(root, earlier_later);
+        assert_eq!(cause.terminal_reason.as_deref(), Some("late"));
+        assert_eq!(cause.errors, vec!["error from late".to_string()]);
+        assert_eq!(cause.origin_kind.as_deref(), Some("origin-late"));
+
+        // (b) a later subagent result does not displace the top-level one.
+        let parent_child = PhaseId::new(61);
+        write_capture_lines(
+            root,
+            parent_child,
+            &[
+                result_line("parent", None),
+                result_line("child", Some("toolu_child")),
+            ],
+        );
+        assert_eq!(
+            idle_timeout_cause(root, parent_child)
+                .terminal_reason
+                .as_deref(),
+            Some("parent"),
+            "a subagent result supplied the cause"
+        );
+
+        // (c) control: a capture whose only result is a subagent's has no
+        // top-level result, so no cause at all.
+        let child_only = PhaseId::new(62);
+        write_capture_lines(
+            root,
+            child_only,
+            &[result_line("child", Some("toolu_child"))],
+        );
+        assert_eq!(
+            idle_timeout_cause(root, child_only),
+            IdleTimeoutCause::default()
+        );
+    }
+
+    /// A record carrying the cause names it in the reason, directly after the
+    /// leading `idle timeout` words and short fields first, so the cause is
+    /// inside the 300-character gate context.
+    #[test]
+    fn an_idle_timeout_reason_names_the_last_result_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        let phase = PhaseId::new(63);
+        write_idle_timeout_record_with(
+            dir.path(),
+            phase,
+            &[("1111111abcdef0000000000000000000000000000", "feat: first")],
+            measured_cause_keys(),
+        );
+
+        let result = evaluate_layer1(dir.path(), phase).unwrap();
+        assert_eq!(result.status, AgentStatus::IdleTimeout);
+        let reason = result.reason.expect("an idle timeout must explain itself");
+        assert!(
+            reason.starts_with("idle timeout ("),
+            "the cause clause must follow the leading words; got: {reason}"
+        );
+        let head: String = reason.chars().take(300).collect();
+        let position = |needle: &str| {
+            head.find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} missing from the first 300 chars: {head}"))
+        };
+        let terminal = position(CAUSE_TERMINAL_REASON);
+        let origin = position(CAUSE_ORIGIN_KIND);
+        let errors = position("[ede_diagnostic]");
+        assert!(
+            terminal < origin && origin < errors,
+            "short fields must come first (terminal_reason, origin, errors); got: {reason}"
+        );
+    }
+
+    /// Without cause keys (an older CLI, or a child killed before any `result`
+    /// event) the reason is exactly the pre-Phase-51 text.
+    #[test]
+    fn an_idle_timeout_without_cause_fields_keeps_todays_message() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        let phase = PhaseId::new(64);
+        write_idle_timeout_record(
+            dir.path(),
+            phase,
+            &[("1111111abcdef0000000000000000000000000000", "feat: first")],
+        );
+
+        let reason = evaluate_layer1(dir.path(), phase)
+            .unwrap()
+            .reason
+            .expect("an idle timeout must explain itself");
+        assert_eq!(
+            reason,
+            "idle timeout: the agent's output stream was silent for 30s, so DevFlow \
+             terminated it (agent pid 4242). The agent made 1 commit(s) before going quiet \
+             and NONE of them were rolled back: 1111111 feat: first. Review the branch \
+             before deciding what to keep — this run is TERMINAL and is not retried \
+             automatically."
+        );
     }
 
     /// Last-result-wins. A session kept alive across turns emits one `result`
