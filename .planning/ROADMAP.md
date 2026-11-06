@@ -637,6 +637,8 @@ be re-tested here rather than inherited from the issue's original design.
   1. On `AgentStatus::RateLimited` with a fallback agent configured, the run continues under the
      fallback in the same worktree on the same branch, with no manual conflict resolution, and the
      resumed stage reaches a normal completion.
+     *Operator ruling R-2 (2026-11-05, `51-CONTEXT.md`): this applies to the Code stage only; a
+     rate-limited stage other than Code takes the cron arm even when a fallback is configured.*
   2. Both exhaustion answers coexist and each is asserted: fallback configured → agents switch;
      no fallback configured → `write_rate_limit_cron` still fires. A suite that only exercises the
      fallback arm does not satisfy this.
@@ -647,44 +649,47 @@ be re-tested here rather than inherited from the issue's original design.
      rebase handoff were all removed (D-11, 23d) and none is reintroduced. Counted over source with
      comments stripped, since a grep over raw source counts comment prose (the Phase 35-01 lesson).
 
-**Plans**: 0/12 plans executed (8 waves)
+**Plans**: 0/13 plans executed (8 waves)
 
 Plans:
 **Wave 1**
 
-- [ ] 51-01-PLAN.md — Tracer: a rate-limited stage with a fallback continues under it in the same worktree and branch; with no fallback the cron arm still fires (wave 1)
-- [ ] 51-02-PLAN.md — The removed `rebase_in` / `Sequentagent` / `n` handoff stays dead: comment-stripped source scan with planted positives and decoys (wave 1)
-- [ ] 51-03-PLAN.md — 999.102: an idle-timeout failure names its cause (`terminal_reason`, `errors[]`, `origin.kind`) (wave 1)
+- [ ] 51-01-PLAN.md — Tracer: a rate-limited Code stage with a fallback continues under it in the same worktree and branch; with no fallback, or at any other stage, the cron arm still fires (wave 1)
+- [ ] 51-02-PLAN.md — The removed `rebase_in` / `sequentagent` / `n` handoff stays dead: comment-stripped scan of every crate source and every subcommand enum, with planted positives and decoys (wave 1)
+- [ ] 51-03-PLAN.md — 999.102: an idle-timeout failure names its cause (`terminal_reason`, `errors[]`, `origin.kind`) from the last top-level result (wave 1)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 51-04-PLAN.md — `--fallback-agent` on `start` and `resume`, validated at launch and persisted (wave 2)
-- [ ] 51-05-PLAN.md — 999.71: the idle-timeout rate-limit check sees a torn final line; `capture_tail` measurement (wave 2)
+- [ ] 51-04-PLAN.md — `--fallback-agent` on `start` and `resume`, validated at launch and persisted; every refusal before any write (wave 2)
+- [ ] 51-05-PLAN.md — 999.71 classifier fix only: the idle-timeout rate-limit check sees a torn final line (wave 2)
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 51-06-PLAN.md — Harden the hop: per-agent canary, handoff event fields, boundary tests, a failed relaunch is never silent (wave 3)
+- [ ] 51-06-PLAN.md — Harden the hop: per-agent canary, handoff event fields, boundary tests at Code, a failed relaunch is never silent inside a running supervisor (wave 3)
+- [ ] 51-14-PLAN.md — R-3: a `fallback_agent` key in `devflow.toml`, combined with `--fallback-agent` at `start` (flag wins), no environment variable (wave 3)
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
-- [ ] 51-07-PLAN.md — D-09 Code half: a same-stage relaunch continues the interrupted fix type (wave 4)
-- [ ] 51-12-PLAN.md — Auto-mode Claude to Antigravity failover end to end through the binary (wave 4)
+- [ ] 51-07-PLAN.md — D-09 Code half: a same-stage relaunch delivers the interrupted fix type to the spawned agent (wave 4)
 
 **Wave 5** *(blocked on Wave 4 completion)*
 
 - [ ] 51-09-PLAN.md — 999.154: resume with the gate-notify variable unset; WR-12 / IN-10 reproduced against current code (wave 5)
+- [ ] 51-12-PLAN.md — Auto-mode Claude to Antigravity failover at Code end to end through the binary, after 51-07's prompt render (wave 5)
 
 **Wave 6** *(blocked on Wave 5 completion)*
 
-- [ ] 51-08-PLAN.md — D-09 Plan half: a Plan pass relaunched after a rate limit finishes the plan instead of accepting a partial one (wave 6)
+- [ ] 51-10-PLAN.md — SUPV-01 by observation, part 1: every liveness read traced; the publish wait and the cron arm's resume read withheld with controls (wave 6)
 
 **Wave 7** *(blocked on Wave 6 completion)*
 
-- [ ] 51-10-PLAN.md — SUPV-01 dependency settled by observation: each liveness read withheld, with baseline and ordinary-launch controls (wave 7)
+- [ ] 51-13-PLAN.md — SUPV-01 by observation, part 2: the post-save probe and the pending-record lock probe withheld with controls; the per-arm conclusion (wave 7)
 
 **Wave 8** *(blocked on Wave 7 completion)*
 
-- [ ] 51-11-PLAN.md — Operator docs for the fallback surface and the full phase check suite (wave 8)
+- [ ] 51-11-PLAN.md — Operator docs for the fallback surface and the `devflow.toml` key, and the full phase check suite (wave 8)
+
+*51-08 (D-09 Plan half) was dropped by operator ruling R-2 (2026-11-05): failover is Code-only.*
 
 ---
 
@@ -840,7 +845,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 49 | 12/12 | In Progress|  |
 | 50 | 29/29 | Complete | 2026-10-21 |
 | 50.1 | 30/30 | In Progress | — |
-| 51 | 0/12 | Planned | — |
+| 51 | 0/13 | Planned | — |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
 
@@ -1070,11 +1075,11 @@ already is), so committed evidence shows which turn carried which rule.
 
 ### Phase 999.184: An Ordinary Plan Success Over Uncommitted Plan Files Still Advances to Code (BACKLOG)
 
-**Found:** 2026-11-05, Phase 51 plan check (iteration 2). Phase 51 plan 51-08 refuses this case only for a Plan pass relaunched after a rate limit; the general case was ruled out of Phase 51's scope and is recorded here. Checked by reading the code, not reproduced.
+**Found:** 2026-11-05, Phase 51 plan check (iteration 2). Checked by reading the code, not reproduced. Phase 51 first planned a fix for the rate-limit case only (a Plan pass relaunched after a rate limit); operator ruling R-2 (2026-11-05) then made failover Code-only and dropped that plan, so Phase 51 handles no part of this. A Plan stage that a rate limit interrupts takes the cron arm, and its later `devflow resume` relaunches Plan with the default prompt, which treats any `PLAN.md` on disk as a finished stage, so a partial plan left by the interrupted agent can reach Code the same way.
 
 **Defect:** on `Action::Advance`, `Stage::Plan => transition(project_root, &mut state, Stage::Code)` (`crates/devflow-cli/src/pipeline_launch.rs`) checks nothing about the phase's `PLAN.md` files being tracked and unmodified. The never-silent commit check in `agent_result.rs` counts commits ahead of `develop`, not commits made in this stage attempt. An earlier dogfood run hit this: a transient API 500 killed Plan before its commit step, the retry saw `PLAN.md` on disk and reported success, and the uncommitted plans reached Code.
 
-**Fix shape (not decided):** reuse 51-08's completeness predicate (plan files untracked or modified) on every Plan success, routing to the never-silent gate. Decide how to treat a project that leaves `.planning/` untracked but not ignored, which would gate on every Plan success.
+**Fix shape (not decided):** on every Plan success, check the phase's `{padded}-*PLAN.md` files under `.planning/phases/{padded}-*/` with `git status --porcelain` at the launch root; any untracked or modified one, or git failing to answer, routes to the never-silent stage gate (`handle_stage_failure` at Plan) instead of `transition` to Code. Covers the rate-limited Plan resumed from the cron arm as well as the ordinary case. Decide how to treat a project that leaves `.planning/` untracked but not ignored, which would gate on every Plan success (an ignored `.planning/` never appears in `git status --porcelain` and is unaffected).
 
 **Acceptance:** a test where an ordinary Plan run reports success over an untracked `PLAN.md` stops at a gate, with a committed-and-clean negative control that still advances.
 

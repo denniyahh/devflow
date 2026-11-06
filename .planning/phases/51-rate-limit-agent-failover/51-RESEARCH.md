@@ -684,6 +684,7 @@ and IN-10 (unparseable file silently rewritten) are both **likely** no longer re
      continuation prompt and refuses a Plan success whose plan files are still untracked or modified.
      Ordinary Plan launches and successes are unchanged (operator ruling at the plan check, 2026-11-05);
      the general ordinary-run case is a separate `999.x` entry the orchestrator files.
+   - **Superseded in part by operator ruling R-2 (2026-11-05):** failover is Code-only, so 51-08 and `State.rate_limited_stage` are dropped; only the 51-07 (Code fix type) half of this resolution stands.
 2. **Which arm after a post-commit relaunch failure — cron or gate?** — RESOLVED: the cron arm, by
    plan 51-06.
    - D-04 allows either. Recommendation: the cron arm (`handle_rate_limited_outcome`), because the
@@ -699,6 +700,7 @@ and IN-10 (unparseable file silently rewritten) are both **likely** no longer re
    - Resolution: 51-05 adopts the recommendation: a `capture_tail` event at the end of every
      supervised stage, and `51-999.71-MEASUREMENTS.md` archived with the controlled result, the
      preliminary sweep below and the production-rate method, each with its limits.
+   - **Superseded by operator ruling R-4 (2026-11-05):** 51-05 delivers only the torn-line classifier fix; the `capture_tail` event, the harness and `51-999.71-MEASUREMENTS.md` returned to backlog 999.71.
 
 **Preliminary 999.71 measurement (this session, read-only):** a probe classified the final
 non-empty line of every archived capture under the main checkout's `.devflow/history/`
