@@ -2934,6 +2934,13 @@ pub(crate) fn handle_ambiguous_outcome(
     launch_stage(state, None, Some(stage))
 }
 
+/// The agent a rate limit at `stage` hands off to (SUPV-02), or `None` when the
+/// cron-resume arm should run instead.
+#[allow(dead_code)]
+fn failover_target(_state: &State, _stage: Stage) -> Option<AgentKind> {
+    None
+}
+
 /// Resume a rate-limited or infra-paused phase from its saved stage (review
 /// consensus #5). Loads the persisted `.devflow/state-{NN}.json` and
 /// relaunches its saved stage via [`launch_stage`] — unlike `start`, this
@@ -9159,7 +9166,26 @@ mod tests {
     /// the advance-running monitor entry, with `DEVFLOW_TEST_HOLD` naming
     /// `hold` (when given) and a release path in a parent-owned dir.
     fn run_handoff_child(name: &str, hold: Option<&str>, first_marker: &str) {
+        run_handoff_child_with_stubs(name, hold, first_marker, &[]);
+    }
+
+    /// [`run_handoff_child`], with each `(program, script)` in `stubs` written
+    /// into the child's PATH dir after the default `claude` stub, replacing
+    /// a stub of the same name. A second agent's stub lets a child hand a
+    /// stage over to another driver (SUPV-02).
+    fn run_handoff_child_with_stubs(
+        name: &str,
+        hold: Option<&str>,
+        first_marker: &str,
+        stubs: &[(&str, String)],
+    ) {
+        use std::os::unix::fs::PermissionsExt;
         let path_dir = handoff_claude_dir(first_marker);
+        for (program, script) in stubs {
+            let path = path_dir.path().join(program);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         let hold_dir = tempfile::Builder::new()
             .prefix("dfh")
             .tempdir_in("/tmp")
@@ -10156,6 +10182,230 @@ mod tests {
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
             .filter(|event| event["event"].as_str() == Some(name))
             .collect()
+    }
+
+    // ---- 51-01: rate-limit failover at Code (SUPV-02) ----
+
+    /// The capture-shape rate-limit envelope a rate-limited stub prints. Its
+    /// retry time is the one
+    /// `pipeline_outcomes::tests::primary_loop_rate_limited_writes_single_agent_cron_instructions`
+    /// shows yields a scheduled (non-empty) cron resume rather than a gate.
+    const RATE_LIMIT_ENVELOPE: &str =
+        r#"{"type":"result","subtype":"error_rate_limit","retry_after":"2026-06-18T15:45:30Z"}"#;
+
+    /// A `claude` stub that waits for `go` in its working directory, commits
+    /// once, records that commit's id in `primary-commit` and prints the
+    /// rate-limit envelope.
+    fn rate_limited_claude_script() -> String {
+        format!(
+            "#!/bin/sh\ncase \"$1\" in --version) exit 0 ;; esac\n\
+             i=0\nwhile [ ! -e go ] && [ \"$i\" -lt 1200 ]; do sleep 0.05; i=$((i+1)); done\n\
+             git commit -q --allow-empty -m 'primary work' || exit 1\n\
+             git rev-parse HEAD > primary-commit\n\
+             printf '%s\\n' '{RATE_LIMIT_ENVELOPE}'\nexit 0\n"
+        )
+    }
+
+    /// A stub for a second agent that commits once and prints the success
+    /// marker, which Layer 1 reads whichever driver launched it.
+    fn committing_success_script() -> String {
+        format!(
+            "#!/bin/sh\ncase \"$1\" in --version) exit 0 ;; esac\n\
+             git commit -q --allow-empty -m 'fallback work' || exit 1\n\
+             printf '%s\\n' '{SUCCESS_MARKER}'\nexit 0\n"
+        )
+    }
+
+    /// `git <args>` in `root`, trimmed stdout; panics on a failed git.
+    fn git_out(root: &Path, args: &[&str]) -> String {
+        let output = devflow_core::test_support::git_command(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?} failed: {output:?}");
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    /// Every event in the run's log, in order.
+    fn all_events(root: &Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(devflow_core::events::events_path(root))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .collect()
+    }
+
+    /// R-2: the fallback is selected only at Code, and only while it is set,
+    /// unused and different from the agent driving the run. Every `Stage` is
+    /// named in the match, so a new stage is a compile error here rather than
+    /// a case nobody decided.
+    #[test]
+    fn failover_target_selects_the_fallback_only_at_code() {
+        let mut state = State::new(
+            PhaseId::new(5100),
+            AgentKind::Claude,
+            Mode::Supervise,
+            PathBuf::from("/repo"),
+        );
+        state.fallback_agent = Some(AgentKind::Codex);
+        for stage in [
+            Stage::Define,
+            Stage::Plan,
+            Stage::Code,
+            Stage::Validate,
+            Stage::Ship,
+        ] {
+            let expected = match stage {
+                Stage::Code => Some(AgentKind::Codex),
+                Stage::Define | Stage::Plan | Stage::Validate | Stage::Ship => None,
+            };
+            assert_eq!(
+                failover_target(&state, stage),
+                expected,
+                "an unused fallback at {stage}"
+            );
+        }
+
+        let mut consumed = state.clone();
+        consumed.fallback_consumed = true;
+        assert_eq!(
+            failover_target(&consumed, Stage::Code),
+            None,
+            "a consumed fallback is never selected again"
+        );
+        let mut same = state.clone();
+        same.fallback_agent = Some(AgentKind::Claude);
+        assert_eq!(
+            failover_target(&same, Stage::Code),
+            None,
+            "a fallback equal to the run's agent is no handoff"
+        );
+        let mut absent = state;
+        absent.fallback_agent = None;
+        assert_eq!(failover_target(&absent, Stage::Code), None, "no fallback");
+    }
+
+    /// D-11 criterion 1 (SUPV-02), with D-04, D-05, D-06 and D-10: a Code
+    /// stage whose `claude` commits once and is then rate-limited is handed to
+    /// the unused Codex fallback by the stage's own supervisor, relaunched in
+    /// the same root on the same branch, and completes there. The fallback's
+    /// commit sits on the primary's, so nothing was reset or rebased, and no
+    /// branch or worktree was added. Negative control in the same run: no
+    /// cron instruction and no `rate_limit_resume_scheduled` event.
+    ///
+    /// Supervise mode, as `HandoffRun::launch_with` builds it: under Auto the
+    /// Code preflight refuses a Codex fallback on the unattended launch shape.
+    #[test]
+    fn a_rate_limit_with_a_fallback_hands_off_and_completes_the_same_stage() {
+        const NAME: &str = "pipeline_launch::tests::a_rate_limit_with_a_fallback_hands_off_and_completes_the_same_stage";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child_with_stubs(
+                NAME,
+                None,
+                SUCCESS_MARKER,
+                &[
+                    ("claude", rate_limited_claude_script()),
+                    ("codex", committing_success_script()),
+                ],
+            );
+            return;
+        }
+        let _guard = env_lock();
+        let run = HandoffRun::launch_with(PhaseId::new(5101), |_, state| {
+            state.stage = Stage::Code;
+            state.stop_until = Some(Stage::Code);
+            state.fallback_agent = Some(AgentKind::Codex);
+        });
+        let branch_before = git_out(&run.root, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        let branches_before = git_out(&run.root, &["branch", "--list", "--format=%(refname)"]);
+        let worktrees_before = git_out(&run.root, &["worktree", "list", "--porcelain"]);
+        run.go();
+
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || {
+                !events_named(&run.root, "workflow_finished").is_empty()
+                    || !events_named(&run.root, "rate_limit_resume_scheduled").is_empty()
+            }),
+            "the run neither finished nor scheduled a resume; events:\n{}",
+            run.events()
+        );
+
+        let handoffs = events_named(&run.root, "agent_handoff");
+        assert_eq!(handoffs.len(), 1, "one handoff; events:\n{}", run.events());
+        let handoff = &handoffs[0];
+        assert_eq!(handoff["stage"], "code", "{handoff}");
+        assert_eq!(handoff["from_agent"], "claude", "{handoff}");
+        assert_eq!(handoff["to_agent"], "codex", "{handoff}");
+        assert_eq!(handoff["reason"], "rate_limited", "{handoff}");
+
+        let events = all_events(&run.root);
+        let position = |name: &str| events.iter().position(|e| e["event"] == name);
+        let finished = position("workflow_finished").expect("the fallback's Code completes");
+        assert_eq!(
+            events[finished]["reason"], "stopped_at",
+            "{}",
+            events[finished]
+        );
+        assert!(
+            position("agent_handoff").is_some_and(|handed| handed < finished),
+            "the completion follows the handoff; events:\n{}",
+            run.events()
+        );
+
+        let state = run.state();
+        assert_eq!(
+            state.agent,
+            AgentKind::Codex,
+            "the fallback now drives the run"
+        );
+        assert!(state.fallback_consumed, "the hop is consumed (D-05)");
+        assert_eq!(state.stage, Stage::Code);
+        assert!(state.stopped, "the --until code stop fired");
+        assert!(
+            state
+                .stop_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("code completed")),
+            "{:?}",
+            state.stop_reason
+        );
+        assert_eq!(
+            state.infra_failures, 0,
+            "a handoff is not an infra fault (D-06)"
+        );
+
+        let primary = std::fs::read_to_string(run.root.join("primary-commit"))
+            .expect("the primary committed before it was rate-limited");
+        assert_eq!(git_out(&run.root, &["rev-parse", "HEAD^"]), primary.trim());
+        assert_ne!(
+            git_out(&run.root, &["rev-parse", "HEAD"]),
+            primary.trim(),
+            "the fallback committed on top of the primary's commit"
+        );
+        assert_eq!(
+            git_out(&run.root, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            branch_before
+        );
+        assert_eq!(
+            git_out(&run.root, &["branch", "--list", "--format=%(refname)"]),
+            branches_before,
+            "no branch was added"
+        );
+        assert_eq!(
+            git_out(&run.root, &["worktree", "list", "--porcelain"]),
+            worktrees_before,
+            "no worktree was added"
+        );
+
+        assert!(
+            !devflow_core::ship::cron_instructions_path(&run.root, run.phase).exists(),
+            "a handed-off rate limit writes no cron instruction"
+        );
+        assert!(
+            events_named(&run.root, "rate_limit_resume_scheduled").is_empty(),
+            "a handed-off rate limit schedules no resume; events:\n{}",
+            run.events()
+        );
     }
 
     /// Send `shutdown` to the supervisor at `socket` on the wire, wait for
