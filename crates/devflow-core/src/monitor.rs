@@ -4152,6 +4152,73 @@ exit 0
         );
     }
 
+    /// D-15 (backlog 999.102): the idle-timeout record carries the cause the
+    /// capture already held — `terminal_reason`, `errors` and `origin.kind` of
+    /// the last top-level `result` event — beside the five existing keys.
+    ///
+    /// The stub's `result` event is the measured 999.102 shape and carries no
+    /// `DEVFLOW_RESULT` marker, so stdin stays open and the stub's silence is
+    /// what fires the idle timeout.
+    ///
+    /// **What this does NOT establish:** that a real Claude CLI still emits
+    /// these keys under these names. It proves the monitor reads them from a
+    /// stub's event and writes them before the kill.
+    #[test]
+    fn the_idle_timeout_record_carries_the_last_result_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(57);
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+
+        let result = r#"{"type":"result","subtype":"success","is_error":false,"terminal_reason":"aborted_tools","errors":["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use"],"origin":{"kind":"task-notification"},"session_id":"s-1","uuid":"u-res-cause","result":"no marker"}"#;
+        let script = format!(
+            r#"
+set -u
+IFS= read -r _turn || exit 91
+printf '%s\n' '{INIT_LINE}'
+printf '%s\n' '{result}'
+sleep 3
+exit 0
+"#
+        );
+
+        let _ = supervise_stream_child(
+            root,
+            phase,
+            root,
+            "prompt",
+            Duration::from_secs(1),
+            "sh",
+            &["-c".to_string(), script],
+            &[],
+            AgentKind::Claude,
+        );
+
+        let raw = std::fs::read_to_string(crate::agent_result::idle_timeout_path(root, phase))
+            .expect("the silent stub must have produced an idle-timeout record");
+        let record: serde_json::Value = serde_json::from_str(&raw).expect("record must parse");
+        let object = record.as_object().expect("the record is a JSON object");
+        let key = |name: &str| {
+            object
+                .get(name)
+                .unwrap_or_else(|| panic!("record has no {name:?} key: {raw}"))
+        };
+        for existing in ["status", "idle_secs", "agent_pid", "written_at", "commits"] {
+            key(existing);
+        }
+        assert_eq!(key("terminal_reason").as_str(), Some("aborted_tools"));
+        let first_error = key("errors")
+            .as_array()
+            .and_then(|errors| errors.first())
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| panic!("errors is not a non-empty string array: {raw}"));
+        assert!(
+            first_error.starts_with("[ede_diagnostic]"),
+            "errors[0] = {first_error:?}"
+        );
+        assert_eq!(key("origin_kind").as_str(), Some("task-notification"));
+    }
+
     /// Negative control for the test above. Same stub, same silence, one line
     /// removed — the guard must still fire when nothing is outstanding, or it
     /// has simply been disabled rather than made accurate.
