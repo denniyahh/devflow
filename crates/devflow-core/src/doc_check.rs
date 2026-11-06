@@ -957,38 +957,484 @@ const REMOVED_VERB: &str = concat!("sequent", "agent");
 /// Both spellings criterion 4 names for the removed verb.
 const REMOVED_VERB_SPELLINGS: [&str; 2] = [REMOVED_VERB, "n"];
 
+/// The `#[command(...)]` keys whose value is a name the subcommand answers to.
+const COMMAND_NAME_KEYS: &[&str] = &[
+    "name",
+    "alias",
+    "visible_alias",
+    "aliases",
+    "visible_aliases",
+];
+
+/// The literal starting at `chars[start]`, as `(opening delimiter length, end
+/// index exclusive, closing delimiter length)`: a `"…"` string (with `\`
+/// escapes), an `r"…"` / `r#"…"#` raw string, or a char literal such as
+/// `'"'` or `'\''`. A lifetime or label (`'a`) is not a literal.
+fn literal_at(chars: &[char], start: usize) -> Option<(usize, usize, usize)> {
+    let at = |index: usize| chars.get(index).copied();
+    match chars[start] {
+        '"' => {
+            let mut index = start + 1;
+            while index < chars.len() {
+                match chars[index] {
+                    '\\' => index += 2,
+                    '"' => return Some((1, index + 1, 1)),
+                    _ => index += 1,
+                }
+            }
+            Some((1, chars.len(), 0))
+        }
+        'r' => {
+            let starts_token = |index: usize| index == 0 || !is_identifier_char(chars[index - 1]);
+            let byte_prefixed = start > 0 && chars[start - 1] == 'b' && starts_token(start - 1);
+            if !starts_token(start) && !byte_prefixed {
+                return None;
+            }
+            let hashes = chars[start + 1..]
+                .iter()
+                .take_while(|&&ch| ch == '#')
+                .count();
+            if at(start + 1 + hashes) != Some('"') {
+                return None;
+            }
+            let open = 2 + hashes;
+            let mut index = start + open;
+            while index < chars.len() {
+                if chars[index] == '"'
+                    && chars[index + 1..]
+                        .iter()
+                        .take(hashes)
+                        .filter(|&&ch| ch == '#')
+                        .count()
+                        == hashes
+                {
+                    return Some((open, index + 1 + hashes, 1 + hashes));
+                }
+                index += 1;
+            }
+            Some((open, chars.len(), 0))
+        }
+        '\'' => match at(start + 1) {
+            Some('\\') => {
+                let close = chars[start + 3..]
+                    .iter()
+                    .position(|&ch| ch == '\'')
+                    .map(|offset| start + 3 + offset)?;
+                Some((1, close + 1, 1))
+            }
+            Some(ch) if ch != '\'' && at(start + 2) == Some('\'') => Some((1, start + 3, 1)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The end (exclusive) of the block comment opening at `chars[start]`.
+/// Rust block comments nest; an unterminated one runs to the end.
+fn block_comment_end(chars: &[char], start: usize) -> usize {
+    let mut depth = 0_usize;
+    let mut index = start;
+    while index < chars.len() {
+        match (chars[index], chars.get(index + 1)) {
+            ('/', Some('*')) => {
+                depth += 1;
+                index += 2;
+            }
+            ('*', Some('/')) => {
+                depth -= 1;
+                index += 2;
+                if depth == 0 {
+                    return index;
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    chars.len()
+}
+
+/// One pass over Rust source that recognises comments and literals. Comments
+/// are dropped when `drop_comments` (a block comment leaves a space and its
+/// newlines); literal contents are blanked when `blank_literals`, each char
+/// replaced by spaces of the same byte length so offsets still line up with
+/// the input. Newlines always survive.
+fn rewrite_rust(text: &str, drop_comments: bool, blank_literals: bool) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut index = 0;
+    while index < chars.len() {
+        let next = chars.get(index + 1).copied();
+        if chars[index] == '/' && next == Some('/') {
+            let end = chars[index..]
+                .iter()
+                .position(|&ch| ch == '\n')
+                .map_or(chars.len(), |offset| index + offset);
+            if !drop_comments {
+                out.extend(&chars[index..end]);
+            }
+            index = end;
+        } else if chars[index] == '/' && next == Some('*') {
+            let end = block_comment_end(&chars, index);
+            if drop_comments {
+                out.push(' ');
+                out.extend(chars[index..end].iter().filter(|&&ch| ch == '\n'));
+            } else {
+                out.extend(&chars[index..end]);
+            }
+            index = end;
+        } else if let Some((open, end, close)) = literal_at(&chars, index) {
+            out.extend(&chars[index..index + open]);
+            for &ch in &chars[index + open..end - close] {
+                if !blank_literals || ch == '\n' {
+                    out.push(ch);
+                } else {
+                    out.extend(std::iter::repeat_n(' ', ch.len_utf8()));
+                }
+            }
+            out.extend(&chars[end - close..end]);
+            index = end;
+        } else {
+            out.push(chars[index]);
+            index += 1;
+        }
+    }
+    out
+}
+
 /// `text` with every `//` line comment (doc comments included) and every
 /// `/* … */` block comment removed. String and char literals are kept whole,
 /// so a `//` inside one is not a comment. Newlines survive, so line numbers
 /// still match the input.
 fn strip_rust_comments(text: &str) -> String {
-    text.to_owned()
+    rewrite_rust(text, true, false)
 }
 
 /// `text` with the contents of every string and char literal blanked, so a
-/// quoted spelling never counts as code.
+/// quoted spelling never counts as code. Byte offsets match the input, so a
+/// position found here slices the same span of `text`.
 fn strip_string_literal_contents(text: &str) -> String {
-    text.to_owned()
+    rewrite_rust(text, false, true)
+}
+
+/// Comment-stripped `text` and its literal-blanked twin, byte-aligned.
+fn code_and_mask(text: &str) -> (String, String) {
+    let code = strip_rust_comments(text);
+    let mask = strip_string_literal_contents(&code);
+    (code, mask)
+}
+
+/// The 1-based line holding byte `index` of `text`.
+fn line_at(text: &str, index: usize) -> usize {
+    text[..index].matches('\n').count() + 1
+}
+
+/// The index of the delimiter matching the opener at `bytes[open]`, counting
+/// every `(`, `[` and `{` pair. Run over literal-blanked text, so a delimiter
+/// inside a literal is never counted.
+fn matching_close(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0_usize;
+    for (index, &byte) in bytes.iter().enumerate().skip(open) {
+        match byte {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The `[start, end)` ranges of `mask[start..end]` split at `separator`
+/// bytes that sit outside any `()`, `[]` or `{}` nesting.
+fn split_top_level(mask: &str, start: usize, end: usize, separator: u8) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut depth = 0_usize;
+    let mut piece = start;
+    for (index, &byte) in mask.as_bytes()[start..end].iter().enumerate() {
+        let index = start + index;
+        match byte {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            byte if byte == separator && depth == 0 => {
+                ranges.push((piece, index));
+                piece = index + 1;
+            }
+            _ => {}
+        }
+    }
+    ranges.push((piece, end));
+    ranges
+}
+
+/// The outer attributes (`#[…]`, as written in `mask`) directly before the
+/// item whose keyword starts at `item_start`, after any visibility.
+fn outer_attributes_before(mask: &str, item_start: usize) -> Vec<&str> {
+    let mut rest = mask[..item_start].trim_end();
+    if rest.ends_with(')') {
+        let bytes = rest.as_bytes();
+        let open = (0..bytes.len()).rev().find(|&index| {
+            bytes[index] == b'(' && matching_close(bytes, index) == Some(bytes.len() - 1)
+        });
+        if let Some(open) = open
+            && rest[..open].trim_end().ends_with("pub")
+        {
+            rest = rest[..open].trim_end();
+        }
+    }
+    if let Some(before) = rest.strip_suffix("pub")
+        && before
+            .chars()
+            .next_back()
+            .is_none_or(|ch| !is_identifier_char(ch))
+    {
+        rest = before.trim_end();
+    }
+    let mut attributes = Vec::new();
+    while rest.ends_with(']') {
+        let bytes = rest.as_bytes();
+        let Some(open) = (0..bytes.len()).rev().find(|&index| {
+            bytes[index] == b'[' && matching_close(bytes, index) == Some(bytes.len() - 1)
+        }) else {
+            break;
+        };
+        let before = rest[..open].trim_end();
+        let Some(hash) = before.strip_suffix('#') else {
+            break;
+        };
+        attributes.push(&rest[hash.len()..]);
+        rest = hash.trim_end();
+    }
+    attributes
+}
+
+/// True when `attribute` (`#[…]`) is a `derive(…)` list naming `Subcommand`,
+/// bare or path-qualified.
+fn derives_subcommand(attribute: &str) -> bool {
+    let body = attribute
+        .trim_start_matches('#')
+        .trim_start()
+        .trim_start_matches('[')
+        .trim_start();
+    body.strip_prefix("derive")
+        .map(str::trim_start)
+        .and_then(|rest| rest.strip_prefix('('))
+        .is_some_and(|list| {
+            list.trim_end_matches(']')
+                .trim_end()
+                .trim_end_matches(')')
+                .split(',')
+                .any(|item| item.trim().rsplit("::").next() == Some("Subcommand"))
+        })
+}
+
+/// The variants directly inside the enum body opening at `mask[open]`, as
+/// `(name as written, line)`. Attributes, fields and discriminants nest
+/// deeper and are skipped.
+fn enum_body_variants(mask: &str, open: usize) -> Vec<(String, usize)> {
+    let bytes = mask.as_bytes();
+    let mut variants = Vec::new();
+    let mut depth = 0_usize;
+    let mut expect_variant = true;
+    let mut index = open + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+            }
+            b',' if depth == 0 => expect_variant = true,
+            byte if depth == 0
+                && expect_variant
+                && (byte.is_ascii_alphabetic() || byte == b'_') =>
+            {
+                let end = mask[index..]
+                    .find(|ch: char| !is_identifier_char(ch))
+                    .map_or(mask.len(), |offset| index + offset);
+                variants.push((mask[index..end].to_owned(), line_at(mask, index)));
+                expect_variant = false;
+                index = end;
+                continue;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    variants
+}
+
+/// Every enum in `mask` (comment-stripped, literal-blanked) whose outer
+/// attributes derive `Subcommand`, as `(name, variants)`.
+fn subcommand_enums(mask: &str) -> Vec<(String, Vec<(String, usize)>)> {
+    let mut enums = Vec::new();
+    for (start, _) in mask.match_indices("enum") {
+        let before = mask[..start].chars().next_back();
+        let rest = &mask[start + "enum".len()..];
+        if before.is_some_and(is_identifier_char) || !rest.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let name_start = start + "enum".len() + (rest.len() - rest.trim_start().len());
+        let name: String = mask[name_start..]
+            .chars()
+            .take_while(|&ch| is_identifier_char(ch))
+            .collect();
+        let Some(open) = mask[name_start..]
+            .find('{')
+            .map(|offset| name_start + offset)
+        else {
+            continue;
+        };
+        if name.is_empty()
+            || mask[name_start + name.len()..open].contains(';')
+            || !outer_attributes_before(mask, start)
+                .into_iter()
+                .any(derives_subcommand)
+        {
+            continue;
+        }
+        enums.push((name, enum_body_variants(mask, open)));
+    }
+    enums
 }
 
 /// The lowercased name of every enum in `source` that derives `Subcommand`.
-fn subcommand_enum_names(_source: &str) -> Vec<String> {
-    Vec::new()
+fn subcommand_enum_names(source: &str) -> Vec<String> {
+    let (_, mask) = code_and_mask(source);
+    subcommand_enums(&mask)
+        .into_iter()
+        .map(|(name, _)| name.to_ascii_lowercase())
+        .collect()
 }
 
-/// Every identifier-boundary use of the removed helper in code.
-fn rebase_in_findings(_files: &[(PathBuf, String)]) -> Vec<String> {
-    Vec::new()
+/// Every identifier-boundary use of the removed helper (definition or call)
+/// in comment-stripped, literal-blanked code.
+fn rebase_in_findings(files: &[(PathBuf, String)]) -> Vec<String> {
+    let token = REMOVED_HELPER;
+    let mut findings = Vec::new();
+    for (path, text) in files {
+        let (_, mask) = code_and_mask(text);
+        for (index, _) in mask.match_indices(token) {
+            let before = mask[..index].chars().next_back();
+            let after = mask[index + token.len()..].chars().next();
+            if before.is_none_or(|ch| !is_identifier_char(ch))
+                && after.is_none_or(|ch| !is_identifier_char(ch))
+            {
+                findings.push(format!(
+                    "{}:{}: `{token}` in code",
+                    path.display(),
+                    line_at(&mask, index)
+                ));
+            }
+        }
+    }
+    findings
 }
 
 /// Every `Subcommand` enum variant whose lowercased name is a removed spelling.
-fn removed_verb_findings(_cli_files: &[(PathBuf, String)]) -> Vec<String> {
-    Vec::new()
+fn removed_verb_findings(cli_files: &[(PathBuf, String)]) -> Vec<String> {
+    let mut findings = Vec::new();
+    for (path, text) in cli_files {
+        let (_, mask) = code_and_mask(text);
+        for (enum_name, variants) in subcommand_enums(&mask) {
+            for (variant, line) in variants {
+                let lowered = variant.to_ascii_lowercase();
+                if REMOVED_VERB_SPELLINGS.contains(&lowered.as_str()) {
+                    findings.push(format!(
+                        "{}:{line}: subcommand variant `{enum_name}::{variant}`",
+                        path.display()
+                    ));
+                }
+            }
+        }
+    }
+    findings
 }
 
-/// Every `#[command(...)]` attribute that names a removed spelling.
-fn removed_verb_attr_findings(_cli_files: &[(PathBuf, String)]) -> Vec<String> {
-    Vec::new()
+/// The contents of `value` when it is one whole string literal (`"…"` or a
+/// raw `r#"…"#`), else `None`.
+fn string_literal_value(value: &str) -> Option<&str> {
+    let unprefixed = value.strip_prefix('r').unwrap_or(value);
+    let hashes = unprefixed.len() - unprefixed.trim_start_matches('#').len();
+    let closing = "#".repeat(hashes);
+    unprefixed[hashes..]
+        .strip_suffix(closing.as_str())?
+        .strip_prefix('"')?
+        .strip_suffix('"')
+}
+
+/// The byte index just past `#[command(` when one opens at `mask[start]`,
+/// whitespace tolerated between the tokens.
+fn command_attribute_body_start(mask: &str, start: usize) -> Option<usize> {
+    let after_hash = mask[start..].strip_prefix('#')?.trim_start();
+    let after_bracket = after_hash.strip_prefix('[')?.trim_start();
+    let after_name = after_bracket.strip_prefix("command")?;
+    if after_name.starts_with(is_identifier_char) {
+        return None;
+    }
+    let after_paren = after_name.trim_start().strip_prefix('(')?;
+    Some(mask.len() - after_paren.len())
+}
+
+/// Every `#[command(...)]` attribute whose `name` or alias value equals a
+/// removed spelling: a string value, or one element of a bracketed list,
+/// compared whole after unquoting, never by substring. The body may span
+/// lines; the finding names the line the attribute opens on. `#[arg(...)]`
+/// is not a command name and is not read.
+fn removed_verb_attr_findings(cli_files: &[(PathBuf, String)]) -> Vec<String> {
+    let mut findings = Vec::new();
+    for (path, text) in cli_files {
+        let (code, mask) = code_and_mask(text);
+        for (start, _) in mask.match_indices('#') {
+            let Some(body_start) = command_attribute_body_start(&mask, start) else {
+                continue;
+            };
+            let Some(body_end) = matching_close(mask.as_bytes(), body_start - 1) else {
+                continue;
+            };
+            for (pair_start, pair_end) in split_top_level(&mask, body_start, body_end, b',') {
+                let Some(equals) = mask[pair_start..pair_end]
+                    .find('=')
+                    .map(|at| pair_start + at)
+                else {
+                    continue;
+                };
+                let key = mask[pair_start..equals].trim();
+                if !COMMAND_NAME_KEYS.contains(&key) {
+                    continue;
+                }
+                let value_mask = &mask[equals + 1..pair_end];
+                let value_start = equals + 1 + (value_mask.len() - value_mask.trim_start().len());
+                let value_end = equals + 1 + value_mask.trim_end().len();
+                let elements = if mask[value_start..value_end].starts_with('[')
+                    && mask[value_start..value_end].ends_with(']')
+                {
+                    split_top_level(&mask, value_start + 1, value_end - 1, b',')
+                } else {
+                    vec![(value_start, value_end)]
+                };
+                for (element_start, element_end) in elements {
+                    let Some(value) = string_literal_value(code[element_start..element_end].trim())
+                    else {
+                        continue;
+                    };
+                    if REMOVED_VERB_SPELLINGS.contains(&value) {
+                        findings.push(format!(
+                            "{}:{}: `#[command({key} = …)]` names removed verb `{value}`",
+                            path.display(),
+                            line_at(&mask, start)
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    findings
 }
 
 /// All three checks: the helper over every crate source, the verb over the
@@ -1039,7 +1485,11 @@ fn the_removed_sequentagent_handoff_stays_dead() {
         "#[command(alias = \"n\")]\nStart,".to_owned(),
     ] {
         let found = findings(&positive);
-        assert_eq!(found.len(), 1, "planted positive {positive:?} gave {found:?}");
+        assert_eq!(
+            found.len(),
+            1,
+            "planted positive {positive:?} gave {found:?}"
+        );
     }
 
     // Planted decoys: no finding.
@@ -1057,7 +1507,10 @@ fn the_removed_sequentagent_handoff_stays_dead() {
 
     // The real tree: every crate source, and every subcommand enum in the CLI.
     let files = read_labelled(rust_file_paths());
-    assert!(!files.is_empty(), "the walker must find Rust sources under crates/");
+    assert!(
+        !files.is_empty(),
+        "the walker must find Rust sources under crates/"
+    );
     let cli_root = workspace_root().join("crates/devflow-cli/src");
     let cli_files: Vec<_> = files
         .iter()
@@ -1078,11 +1531,12 @@ fn the_removed_sequentagent_handoff_stays_dead() {
             "the subcommand-enum finder missed `{expected}`: {enum_names:?}"
         );
     }
-    let command_variants = cli_files
+    let command_variants: usize = cli_files
         .iter()
-        .map(|(_, text)| enum_variants(&strip_rust_comments(text), command).len())
-        .max()
-        .unwrap_or(0);
+        .flat_map(|(_, text)| subcommand_enums(&code_and_mask(text).1))
+        .filter(|(name, _)| name == command)
+        .map(|(_, variants)| variants.len())
+        .sum();
     assert!(
         command_variants > 5,
         "only {command_variants} `Command` variants were read"
