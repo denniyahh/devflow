@@ -1483,6 +1483,18 @@ fn the_removed_sequentagent_handoff_stays_dead() {
             "#[derive(Subcommand)]\nenum {command} {{ #[command(name = \"{verb}\")] Handoff, Start }}"
         ),
         "#[command(alias = \"n\")]\nStart,".to_owned(),
+        // Every other declaration route, both spellings.
+        "#[command(alias=\"n\")]\nStart,".to_owned(),
+        "#[command(visible_alias = \"n\")]\nStart,".to_owned(),
+        "#[command(name = \"n\")]\nStart,".to_owned(),
+        "#[command(aliases = [\"x\", \"n\"])]\nStart,".to_owned(),
+        "#[command(aliases = [\"nn\", \"n\"])]\nStart,".to_owned(),
+        format!("#[command(alias = \"{verb}\")]\nStart,"),
+        format!("#[command(visible_aliases = [\"{verb}\"])]\nStart,"),
+        // A second subcommand enum: the scan is not limited to `Command`.
+        "#[derive(Debug, Subcommand)]\nenum GateCmd { List, N }".to_owned(),
+        // A `//` inside a literal is not a comment, so the call after it counts.
+        format!("let s = \"// x\"; git.{helper}(base)?;"),
     ] {
         let found = findings(&positive);
         assert_eq!(
@@ -1500,10 +1512,52 @@ fn the_removed_sequentagent_handoff_stays_dead() {
         format!("assert!(!s.contains(\"{verb}\"));"),
         "let hint = \"git rebase origin/develop\";".to_owned(),
         "#[derive(Debug)]\nenum Axis { N, S }".to_owned(),
+        "#[arg(short = 'n')]\nforce: bool,".to_owned(),
+        "#[arg(name = \"n\")]\ncount: u32,".to_owned(),
+        format!("let s = \"// {helper}\"; let t = s.len();"),
+        format!("/* multi-line\n {helper}\n */\nfn kept() {{}}"),
+        // Exact element equality: a value or element that merely contains a
+        // spelling is not that spelling.
+        format!(
+            "#[derive(Debug, Subcommand)]\nenum {command} {{\n    #[command(name = \"__monitor\", hide = true)]\n    Monitor,\n    Start,\n}}"
+        ),
+        "#[command(alias = \"nx\")]\nStart,".to_owned(),
+        "#[command(aliases = [\"nn\", \"x\"])]\nStart,".to_owned(),
+        format!("#[command(name = \"{verb}-old\")]\nStart,"),
     ] {
         let found = findings(&decoy);
         assert!(found.is_empty(), "planted decoy {decoy:?} gave {found:?}");
     }
+
+    // A variant and an attribute in one enum: two findings.
+    let combined = format!(
+        "#[derive(Subcommand)]\nenum {command} {{ N, #[command(name = \"{verb}\")] Handoff }}"
+    );
+    let found = findings(&combined);
+    assert_eq!(found.len(), 2, "combined enum gave {found:?}");
+
+    // Multi-line attributes (the real `#[command(` shape): one finding each,
+    // reported at the line the attribute opens on.
+    for multi_line in [
+        "Start,\n#[command(\n    alias = \"n\",\n)]\nProbe,".to_owned(),
+        format!("Start,\n#[command(\n    name = \"{verb}\",\n    about = \"x\"\n)]\nProbe,"),
+    ] {
+        let found = findings(&multi_line);
+        assert_eq!(found.len(), 1, "multi-line {multi_line:?} gave {found:?}");
+        assert!(
+            found[0].starts_with("planted.rs:2:"),
+            "multi-line {multi_line:?} reported the wrong line: {found:?}"
+        );
+    }
+
+    // The stripper keeps a `//` inside a literal and drops a trailing comment.
+    let url = strip_rust_comments("let u = \"https://example.invalid\";");
+    assert!(url.contains("\"https://example.invalid\""), "{url:?}");
+    let trailing = strip_rust_comments("let a = 1; // note");
+    assert!(
+        trailing.contains("let a = 1;") && !trailing.contains("note"),
+        "{trailing:?}"
+    );
 
     // The real tree: every crate source, and every subcommand enum in the CLI.
     let files = read_labelled(rust_file_paths());
