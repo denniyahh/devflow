@@ -946,3 +946,152 @@ fn docs_describe_the_socket_supervisor_not_the_shell_monitor() {
         "docs/guides/unattended-mode.md still describes a shell monitor or shell script"
     );
 }
+
+/// The helper removed with the rebase handoff (D-14), assembled from pieces
+/// so this file's code never holds it contiguously.
+const REMOVED_HELPER: &str = concat!("rebase", "_in");
+
+/// The removed verb's long spelling, assembled the same way.
+const REMOVED_VERB: &str = concat!("sequent", "agent");
+
+/// Both spellings criterion 4 names for the removed verb.
+const REMOVED_VERB_SPELLINGS: [&str; 2] = [REMOVED_VERB, "n"];
+
+/// `text` with every `//` line comment (doc comments included) and every
+/// `/* … */` block comment removed. String and char literals are kept whole,
+/// so a `//` inside one is not a comment. Newlines survive, so line numbers
+/// still match the input.
+fn strip_rust_comments(text: &str) -> String {
+    text.to_owned()
+}
+
+/// `text` with the contents of every string and char literal blanked, so a
+/// quoted spelling never counts as code.
+fn strip_string_literal_contents(text: &str) -> String {
+    text.to_owned()
+}
+
+/// The lowercased name of every enum in `source` that derives `Subcommand`.
+fn subcommand_enum_names(_source: &str) -> Vec<String> {
+    Vec::new()
+}
+
+/// Every identifier-boundary use of the removed helper in code.
+fn rebase_in_findings(_files: &[(PathBuf, String)]) -> Vec<String> {
+    Vec::new()
+}
+
+/// Every `Subcommand` enum variant whose lowercased name is a removed spelling.
+fn removed_verb_findings(_cli_files: &[(PathBuf, String)]) -> Vec<String> {
+    Vec::new()
+}
+
+/// Every `#[command(...)]` attribute that names a removed spelling.
+fn removed_verb_attr_findings(_cli_files: &[(PathBuf, String)]) -> Vec<String> {
+    Vec::new()
+}
+
+/// All three checks: the helper over every crate source, the verb over the
+/// CLI sources.
+fn removed_handoff_findings(
+    files: &[(PathBuf, String)],
+    cli_files: &[(PathBuf, String)],
+) -> Vec<String> {
+    let mut findings = rebase_in_findings(files);
+    findings.extend(removed_verb_findings(cli_files));
+    findings.extend(removed_verb_attr_findings(cli_files));
+    findings
+}
+
+/// Criterion 4 (D-14): the rebase handoff removed from issue #180 stays dead.
+///
+/// History: the removed verb was `Command::Sequentagent` (dbab01a), and the
+/// helper was `GitFlow::rebase_in` (0833a6c). No `n` verb ever existed under
+/// that spelling (`git log -G` finds none), but criterion 4 names it, so both
+/// readings are covered.
+///
+/// The scan reads declarations, not free text: a variant of any enum that
+/// derives `Subcommand`, and the `name` and alias keys of any
+/// `#[command(...)]` attribute, compared whole against each spelling. Free
+/// text would count the doc comments and messages that legitimately mention
+/// the history, this one included. Comments are stripped before any count, so
+/// this doc comment may name the tokens.
+#[test]
+fn the_removed_sequentagent_handoff_stays_dead() {
+    let helper = REMOVED_HELPER;
+    let verb = REMOVED_VERB;
+    let capital_verb = format!("S{}", &verb[1..]);
+    let command = "Command";
+    let planted = |text: &str| vec![(PathBuf::from("planted.rs"), text.to_owned())];
+    let findings = |text: &str| removed_handoff_findings(&planted(text), &planted(text));
+
+    // Planted positives: exactly one finding each.
+    for positive in [
+        format!("fn {helper}(base: &str) {{}}"),
+        format!("    git.{helper}(base)?;"),
+        format!(
+            "#[derive(Debug, Subcommand)]\nenum {command} {{ {capital_verb} {{ phase: u32 }}, Start }}"
+        ),
+        format!("#[derive(Debug, Subcommand)]\nenum {command} {{ N, Start }}"),
+        format!(
+            "#[derive(Subcommand)]\nenum {command} {{ #[command(name = \"{verb}\")] Handoff, Start }}"
+        ),
+        "#[command(alias = \"n\")]\nStart,".to_owned(),
+    ] {
+        let found = findings(&positive);
+        assert_eq!(found.len(), 1, "planted positive {positive:?} gave {found:?}");
+    }
+
+    // Planted decoys: no finding.
+    for decoy in [
+        format!("/// {helper}"),
+        format!("x(); // {helper}"),
+        format!("/* {helper} */"),
+        format!("assert!(!s.contains(\"{verb}\"));"),
+        "let hint = \"git rebase origin/develop\";".to_owned(),
+        "#[derive(Debug)]\nenum Axis { N, S }".to_owned(),
+    ] {
+        let found = findings(&decoy);
+        assert!(found.is_empty(), "planted decoy {decoy:?} gave {found:?}");
+    }
+
+    // The real tree: every crate source, and every subcommand enum in the CLI.
+    let files = read_labelled(rust_file_paths());
+    assert!(!files.is_empty(), "the walker must find Rust sources under crates/");
+    let cli_root = workspace_root().join("crates/devflow-cli/src");
+    let cli_files: Vec<_> = files
+        .iter()
+        .filter(|(path, _)| path.starts_with(&cli_root))
+        .cloned()
+        .collect();
+    assert!(
+        !cli_files.is_empty(),
+        "the walker must find Rust sources under crates/devflow-cli/src/"
+    );
+    let enum_names: Vec<String> = cli_files
+        .iter()
+        .flat_map(|(_, text)| subcommand_enum_names(text))
+        .collect();
+    for expected in ["command", "gatecmd"] {
+        assert!(
+            enum_names.iter().any(|name| name == expected),
+            "the subcommand-enum finder missed `{expected}`: {enum_names:?}"
+        );
+    }
+    let command_variants = cli_files
+        .iter()
+        .map(|(_, text)| enum_variants(&strip_rust_comments(text), command).len())
+        .max()
+        .unwrap_or(0);
+    assert!(
+        command_variants > 5,
+        "only {command_variants} `Command` variants were read"
+    );
+
+    let found = removed_handoff_findings(&files, &cli_files);
+    assert!(
+        found.is_empty(),
+        "the removed rebase handoff is back (D-14):\n{}",
+        found.join("\n")
+    );
+}
