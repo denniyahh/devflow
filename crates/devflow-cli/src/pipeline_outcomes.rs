@@ -913,16 +913,22 @@ pub(crate) fn render_gate_context(context: &str, max_chars: usize) -> String {
     format!("{head}{suffix}")
 }
 
+/// The never-silent gate context for a failed `stage`, with its `reason`
+/// capped by [`truncate_reason`].
+fn stage_failure_context(stage: Stage, reason: Option<String>) -> String {
+    format!(
+        "[never-silent] stage {stage} failed: {} — human review needed (retry, loop-to-code, or abort)",
+        truncate_reason(&reason.unwrap_or_else(|| "no details available".into()))
+    )
+}
+
 pub(crate) fn handle_stage_failure(
     project_root: &Path,
     state: &mut State,
     stage: Stage,
     reason: Option<String>,
 ) -> Result<(), CliError> {
-    let context = format!(
-        "[never-silent] stage {stage} failed: {} — human review needed (retry, loop-to-code, or abort)",
-        truncate_reason(&reason.unwrap_or_else(|| "no details available".into()))
-    );
+    let context = stage_failure_context(stage, reason);
     match run_gate(project_root, state, stage, &context)? {
         GateAction::Advance => {
             // CR-01: close the gate before retrying; its answer is spent.
@@ -5182,6 +5188,100 @@ mod tests {
         let capped = truncate_reason(&long);
         assert!(capped.chars().count() <= 300);
         assert!(capped.ends_with("[truncated; full output in .devflow/]"));
+    }
+
+    /// Write an idle-timeout record with `commits` long-subject commits and
+    /// the given cause keys, then return the reason Layer 1 builds from it.
+    fn idle_timeout_reason_with(cause: serde_json::Value, commits: usize) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        let phase = PhaseId::new(71);
+        let record = devflow_core::agent_result::IdleTimeoutRecord {
+            status: "idle_timeout".to_string(),
+            idle_secs: 120,
+            agent_pid: 4242,
+            written_at: 1_700_000_000,
+            commits: (0..commits)
+                .map(|n| devflow_core::agent_result::IdleTimeoutCommit {
+                    sha: format!("{n:040x}"),
+                    subject: format!("feat: partial work item number {n}"),
+                })
+                .collect(),
+        };
+        let mut value = serde_json::to_value(record).unwrap();
+        for (key, field) in cause.as_object().unwrap() {
+            value[key] = field.clone();
+        }
+        std::fs::write(
+            devflow_core::agent_result::idle_timeout_path(root, phase),
+            serde_json::to_string(&value).unwrap(),
+        )
+        .unwrap();
+        devflow_core::agent_result::evaluate_layer1(root, phase)
+            .expect("the record must produce a verdict")
+            .reason
+            .expect("an idle timeout must explain itself")
+    }
+
+    /// Whether `text` carries the reason's cause clause opened AND closed.
+    /// The fixtures' field text holds no `)`, so the close is the clause's.
+    fn holds_whole_clause(text: &str) -> bool {
+        text.find("idle timeout (")
+            .is_some_and(|open| text[open..].contains("): "))
+    }
+
+    /// D-15: the idle-timeout cause survives into what the operator sees —
+    /// `truncate_reason`'s 300 characters and the pending-gate banner's
+    /// 300-character rendering of the whole gate context — even behind a long
+    /// commit list, and even at the maximum bound of every cause field.
+    #[test]
+    fn an_idle_timeout_gate_context_names_the_last_result_cause() {
+        // (a) the measured 999.102 cause with 40 commits.
+        let measured = serde_json::json!({
+            "terminal_reason": "aborted_tools",
+            "errors": ["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use"],
+            "origin_kind": "task-notification",
+        });
+        let reason = idle_timeout_reason_with(measured, 40);
+        assert!(
+            truncate_reason(&reason).contains("aborted_tools"),
+            "the cause was truncated away: {}",
+            truncate_reason(&reason)
+        );
+
+        // CONTROL: the same reason with the clause moved to the end loses the
+        // cause to truncation, so the assertion above depends on placement.
+        let rest = reason
+            .strip_prefix("idle timeout (")
+            .expect("the reason opens with the clause");
+        let close = rest.find("): ").expect("the clause closes");
+        let moved = format!("idle timeout: {} ({})", &rest[close + 3..], &rest[..close]);
+        assert!(
+            !truncate_reason(&moved).contains("aborted_tools"),
+            "control is vacuous: a trailing clause also survived truncation"
+        );
+
+        // (b) every cause field at its bound: 160 characters each, 3 errors.
+        let max_bound = serde_json::json!({
+            "terminal_reason": "t".repeat(160),
+            "origin_kind": "o".repeat(160),
+            "errors": vec!["e".repeat(160); 3],
+        });
+        let reason = idle_timeout_reason_with(max_bound, 40);
+        let truncated = truncate_reason(&reason);
+        assert!(
+            holds_whole_clause(&truncated),
+            "truncate_reason cut the clause before it closed: {truncated}"
+        );
+        let banner = render_gate_context(
+            &stage_failure_context(Stage::Validate, Some(reason.clone())),
+            300,
+        );
+        assert!(
+            holds_whole_clause(&banner),
+            "the banner cut the clause before it closed: {banner}"
+        );
     }
 
     #[test]
