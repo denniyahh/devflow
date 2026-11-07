@@ -383,14 +383,23 @@ impl LaunchContext {
     }
 }
 
-/// Strip `DEVFLOW_GATE_NOTIFY_CMD` from a detached monitor chain
-/// (49-REVIEW.md WR-07). Every gate in the chain then resolves the command
-/// from the run's state file at the moment it fires, so editing
-/// `gate_notify_cmd` there changes or disables the hook for a run in flight,
-/// and the command (which may carry a webhook token) never reaches the coding
-/// agent's environment. Also applied wherever an agent process is spawned
-/// directly (the pipe-owning agent and the delivery canary). The foreground
-/// `devflow` process keeps the operator's own variable for the gates it fires.
+/// Remove `DEVFLOW_GATE_NOTIFY_CMD` from a child's environment (49-REVIEW.md
+/// WR-07): the command may carry a credential such as a webhook token, and it
+/// never reaches an agent's environment.
+///
+/// Called from `spawn_monitor`, `spawn_stage_agent` and `run_stream_canary`.
+///
+/// `spawn_monitor` strips it from the detached supervisor, so the chain does
+/// not carry the variable and its gates take the command from the run's state
+/// file. A gate's entry write reloads that file, so an on-disk edit of
+/// `gate_notify_cmd` made after the advance loaded its copy is the command the
+/// gate fires (`gate_entry_fires_a_notify_cmd_edited_after_the_advance_loaded`),
+/// and an edit made while the gate waits survives its resolution
+/// (`gate_resolution_keeps_a_notify_cmd_edited_during_the_wait`).
+/// `spawn_stage_agent` (the pipe-owning supervisor's agent) and
+/// `run_stream_canary` (the delivery canary) strip it from the agent they
+/// spawn directly. The foreground `devflow` process keeps the operator's own
+/// variable for the gates it fires.
 pub(crate) fn strip_notify_env(child_cmd: &mut std::process::Command) {
     child_cmd.env_remove(crate::gates::GATE_NOTIFY_CMD_ENV);
 }

@@ -444,8 +444,15 @@ pub struct State {
     /// `DEVFLOW_GATE_NOTIFY_CMD` to it (unset keeps, empty clears, set
     /// replaces; [`crate::gates::persisted_notify_cmd_after_env`]); never
     /// [`State::new`], so constructing a state never reads the environment.
-    /// The detached monitor chain does not carry the variable and reads this
-    /// field at each gate.
+    /// The unset arms of `resume` and `advance` are pinned by
+    /// `resume_with_the_variable_unset_keeps_the_saved_command` and
+    /// `advance_gate_runs_the_persisted_command_when_the_variable_is_unset`.
+    /// The detached monitor chain does not carry the variable. A gate takes
+    /// this field from the state file as it stands at gate entry, so an
+    /// on-disk edit made before the gate opens is the command it fires, and
+    /// an edit made while it waits survives its resolution. The stale-build
+    /// block's notify (`staleness.rs`) opens no gate and fires from the copy
+    /// its caller holds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_notify_cmd: Option<String>,
     /// The agent a rate-limited Code stage hands off to (SUPV-02, D-01).
