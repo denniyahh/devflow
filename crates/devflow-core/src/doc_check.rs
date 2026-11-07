@@ -1603,3 +1603,87 @@ fn the_removed_sequentagent_handoff_stays_dead() {
         found.join("\n")
     );
 }
+
+/// RED stub: the scan's contract is pinned by
+/// `no_environment_variable_selects_the_fallback_agent`.
+fn fallback_env_name_findings(_sources: &[(PathBuf, String)]) -> Vec<String> {
+    Vec::new()
+}
+
+/// A planted `DEVFLOW_`-prefixed name containing FALLBACK, split inside the
+/// word so this file never holds an env-shaped piece containing it (R2-11).
+const PLANTED_PREFIXED_NAME: &str = concat!("DEVFLOW_X_FALL", "BACK_AGENT");
+
+/// A planted unprefixed name containing FALLBACK, split the same way.
+const PLANTED_UNPREFIXED_NAME: &str = concat!("X_FALL", "BACK_MODE");
+
+/// R-3 (Phase 51): no environment variable selects the fallback agent. Over
+/// the comment-stripped source of every `.rs` file under `crates/` (tests
+/// included), no string literal is an environment-variable-shaped name (an
+/// ASCII uppercase letter, then only uppercase letters, digits and `_`)
+/// containing `FALLBACK`, whatever its prefix. Matching literals rather than
+/// call sites reaches a name held in a `const` and passed by identifier, the
+/// form most of this tree's environment reads use; `source_read_env_vars`
+/// sees only `DEVFLOW_` names written at the call.
+///
+/// Limit: a name assembled at runtime (`format!`, `concat!`) is not seen;
+/// this test's own planted names are built that way so the real-tree pass
+/// cannot report them.
+#[test]
+fn no_environment_variable_selects_the_fallback_agent() {
+    let planted = |text: String| vec![(PathBuf::from("planted.rs"), text)];
+
+    // Planted controls: a prefixed name read by literal, and an unprefixed
+    // name held in a `const` and read through it, are each reported once.
+    let by_literal = format!("fn f() {{ let _ = std::env::var(\"{PLANTED_PREFIXED_NAME}\"); }}\n");
+    assert_eq!(
+        fallback_env_name_findings(&planted(by_literal)).len(),
+        1,
+        "a literal read of a FALLBACK name is reported"
+    );
+    let by_const = format!(
+        "const E: &str = \"{PLANTED_UNPREFIXED_NAME}\";\nfn f() {{ let _ = std::env::var_os(E); }}\n"
+    );
+    let found = fallback_env_name_findings(&planted(by_const));
+    assert_eq!(
+        found.len(),
+        1,
+        "a const-held FALLBACK name is reported: {found:?}"
+    );
+    assert!(
+        found[0].contains("planted.rs:1"),
+        "a finding names the file and line: {found:?}"
+    );
+
+    // Decoys: the lowercase TOML key, `ship.rs`'s `FALLBACK` identifier, and
+    // a quoted name inside a `//` comment are not reported.
+    for decoy in [
+        "fn f() { let key = \"fallback_agent\"; }\n".to_string(),
+        "const FALLBACK: &str = \"- No changes recorded.\";\n".to_string(),
+        format!("// let _ = std::env::var(\"{PLANTED_PREFIXED_NAME}\");\nfn f() {{}}\n"),
+    ] {
+        assert!(
+            fallback_env_name_findings(&planted(decoy.clone())).is_empty(),
+            "decoy reported: {decoy}"
+        );
+    }
+
+    // R2-11 self-check: this file's own pieces are not findings, so the
+    // real-tree assertion below cannot be failed by this test.
+    let this_file = workspace_root().join("crates/devflow-core/src/doc_check.rs");
+    let own = fallback_env_name_findings(&read_labelled(vec![this_file]));
+    assert!(own.is_empty(), "doc_check.rs reports itself: {own:?}");
+
+    let sources = read_labelled(rust_file_paths());
+    assert!(
+        sources.len() > 1,
+        "the walker read {} Rust sources",
+        sources.len()
+    );
+    let found = fallback_env_name_findings(&sources);
+    assert!(
+        found.is_empty(),
+        "an environment-variable name containing FALLBACK exists (R-3):\n{}",
+        found.join("\n")
+    );
+}
