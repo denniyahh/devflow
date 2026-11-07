@@ -16986,4 +16986,203 @@ mod tests {
 
         agent_group_ended(&run, pgid);
     }
+
+    /// D-12's ordinary-launch control for the publish wait, observable only
+    /// (R2-9). An ordinary Plan → Code transition, no fallback, with the same
+    /// seam withholding the Code launch's probe (`claude:code`): Plan completes
+    /// and transitions, and no Code successor is published. What the run
+    /// leaves: the stage committed as Code, no supervisor record (WR-04's clear
+    /// after the failed launch), no socket but stage N's, no `stage_launched`
+    /// for `code`, and no live member in the Code agent's group (which had one
+    /// when it recorded itself). No cause text is asserted: an in-supervisor
+    /// launch failure on the ordinary path writes no event naming its cause.
+    /// Both withheld launches are Code launches, so this and
+    /// [`failover_with_the_publish_probe_withheld_ends_at_a_gate`] differ only
+    /// in failover.
+    #[test]
+    fn an_ordinary_transition_with_the_publish_probe_withheld_fails_the_same_way() {
+        const NAME: &str = "pipeline_launch::tests::an_ordinary_transition_with_the_publish_probe_withheld_fails_the_same_way";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_withheld_publish_child(
+                NAME,
+                &[(
+                    "claude",
+                    group_recording_script("claude", "go2", Some(SUCCESS_MARKER)),
+                )],
+                "claude:code",
+            );
+            return;
+        }
+        let _guard = env_lock();
+        let run = HandoffRun::launch_with(PhaseId::new(5196), |_, state| {
+            state.stage = Stage::Plan;
+            state.stop_until = Some(Stage::Code);
+        });
+        run.go();
+        let (_, pgid) = agent_group_was_live(&run, &run.root.join("claude-group"));
+        let settled = || {
+            workflow::load_state(&run.root, run.phase)
+                .is_ok_and(|state| state.stage == Stage::Code && state.supervisor.is_none())
+                && matches!(
+                    devflow_core::supervisor::probe(&run.n.socket_path),
+                    Ok(devflow_core::supervisor::Liveness::Gone)
+                )
+        };
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, settled),
+            "the run did not settle at Code with no supervisor record and stage N gone; \
+             state: {:?}; events:\n{}",
+            workflow::load_state(&run.root, run.phase).map(|s| (s.stage, s.supervisor)),
+            run.events()
+        );
+
+        let state = run.state();
+        assert_eq!(state.stage, Stage::Code, "the transition committed Code");
+        assert_eq!(
+            state.supervisor, None,
+            "WR-04: the failed launch's record is cleared"
+        );
+        assert_eq!(
+            run.other_sockets(),
+            Vec::<PathBuf>::new(),
+            "no Code supervisor socket remains"
+        );
+        assert!(
+            events_named(&run.root, "stage_launched")
+                .iter()
+                .all(|launched| launched["stage"] != "code"),
+            "no Code successor was published; events:\n{}",
+            run.events()
+        );
+        agent_group_ended(&run, pgid);
+    }
+
+    /// A socket path `supervisor::probe` cannot answer for: its parent is a
+    /// regular file, so the probe's `stat` fails with `ENOTDIR` (an error, not
+    /// GONE or STALE).
+    fn unprobeable_socket(dir: &Path) -> PathBuf {
+        let parent = dir.join("not-a-dir");
+        std::fs::write(&parent, "").unwrap();
+        parent.join("supervisor.sock")
+    }
+
+    /// A Code-stage run of `phase` under Claude on the capture shape, in a fresh repo at
+    /// `root`, whose state records a supervisor at `socket`.
+    fn code_run_recording(root: &Path, phase: PhaseId, socket: &Path) -> State {
+        init_repo(root);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Code;
+        state.legacy_claude_launch = true;
+        state.supervisor = Some(devflow_core::state::SupervisorRecord::new(
+            socket.to_path_buf(),
+            "18e5e63a18d5674f".to_string(),
+            u32::MAX,
+            0,
+            String::new(),
+        ));
+        state
+    }
+
+    /// The state the rate-limit cron arm leaves: not stopped, one infra fault
+    /// charged, a cron instruction to `devflow resume` it.
+    fn save_rate_limit_paused(root: &Path, mut state: State) {
+        state.infra_failures = 1;
+        workflow::save_state(&state).unwrap();
+        let record = devflow_core::ship::build_single_agent_cron_instructions(
+            root,
+            state.phase,
+            "2026-06-18T15:45:30Z",
+        );
+        devflow_core::ship::write_cron_instructions(root, &record).unwrap();
+    }
+
+    /// D-12 (the cron arm's recorded-socket read, withheld), with its
+    /// ordinary-resume control and healthy baseline. Non-vacuity first: the
+    /// fixture's recorded socket makes `supervisor::probe` return an error.
+    /// (b) A rate-limit-paused run (the cron arm's later `devflow resume`)
+    /// recording that socket is refused, naming it, and nothing is written.
+    /// (c) Control: an ordinary `resume` of a `--until`-stopped run recording
+    /// the same socket is refused with the same text. (a) Baseline: a paused
+    /// run whose recorded socket is GONE resumes and launches.
+    #[test]
+    fn a_cron_resume_and_an_ordinary_resume_refuse_alike_when_the_recorded_probe_cannot_answer() {
+        const NAME: &str = "pipeline_launch::tests::a_cron_resume_and_an_ordinary_resume_refuse_alike_when_the_recorded_probe_cannot_answer";
+        if parent_of_a_claude_and_codex_child(NAME, &[]) {
+            return;
+        }
+        let _guard = env_lock();
+        let sockets = tempfile::tempdir().unwrap();
+        let socket = unprobeable_socket(sockets.path());
+        let probed = devflow_core::supervisor::probe(&socket);
+        assert!(
+            probed.is_err(),
+            "non-vacuity: the fixture's recorded socket must make the probe fail, got {probed:?}"
+        );
+
+        let refused = |phase: PhaseId, save: &dyn Fn(&Path, State)| -> String {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            save(root, code_run_recording(root, phase, &socket));
+            let before = std::fs::read(workflow::state_path(root, phase)).unwrap();
+            let result = resume(root, phase, None, false);
+            let err = match result {
+                Err(err) => err.to_string(),
+                Ok(()) => panic!("phase {phase}: resume over an unprobeable record launched"),
+            };
+            assert_eq!(
+                std::fs::read(workflow::state_path(root, phase)).unwrap(),
+                before,
+                "phase {phase}: a refused resume writes nothing"
+            );
+            err
+        };
+
+        let paused = PhaseId::new(5197);
+        let cron = refused(paused, &|root, state| save_rate_limit_paused(root, state));
+        assert!(
+            cron.contains("refusing to resume")
+                && cron.contains(&socket.display().to_string())
+                && cron.contains("probe failed"),
+            "the cron arm's resume refuses naming the socket and its probe failure: {cron}"
+        );
+
+        let stopped = PhaseId::new(5198);
+        let ordinary = refused(stopped, &|_, mut state| {
+            state.stop_until = Some(Stage::Code);
+            state.stopped = true;
+            state.stop_reason = Some("stopped after code completed (--until code)".to_string());
+            workflow::save_state(&state).unwrap();
+        });
+        assert_eq!(
+            ordinary.replace(&stopped.to_string(), "N"),
+            cron.replace(&paused.to_string(), "N"),
+            "an ordinary resume refuses exactly as the cron arm's does"
+        );
+
+        let baseline = PhaseId::new(5199);
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let gone = sockets.path().join("gone.sock");
+        save_rate_limit_paused(root, code_run_recording(root, baseline, &gone));
+        let result = resume(root, baseline, None, false);
+        let reloaded_for_reap = workflow::load_state(root, baseline).ok();
+        let _reap_guard = reloaded_for_reap
+            .as_ref()
+            .map(ReapMonitorOnDrop::after_launch);
+        result.unwrap_or_else(|err| panic!("baseline: a GONE recorded socket resumes: {err}"));
+        let reloaded = workflow::load_state(root, baseline).unwrap();
+        assert!(
+            reloaded
+                .supervisor
+                .as_ref()
+                .is_some_and(|record| record.socket_path != gone),
+            "baseline: the resume recorded its own supervisor: {:?}",
+            reloaded.supervisor
+        );
+    }
 }
