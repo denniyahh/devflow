@@ -11150,22 +11150,24 @@ mod tests {
         git_out(root, &["commit", "-q", "-m", "ignore .devflow"]);
     }
 
-    /// A PATH dir holding a no-op `claude`, a `codex` that waits (bounded, about
-    /// 60 s) for a file that never appears, and `sleep` for that wait. A fallback
-    /// relaunched onto this `codex` stays running, so its supervisor makes no
-    /// further state write while the test reads the state.
-    fn waiting_codex_dir() -> tempfile::TempDir {
+    /// A PATH dir holding a `claude` and a `codex` that each wait (bounded, about
+    /// 60 s) for a file that never appears, and `sleep` for that wait. A stage
+    /// relaunched onto either stays running, so its supervisor makes no further
+    /// state write while the test reads the state.
+    fn waiting_agents_dir() -> tempfile::TempDir {
         use std::os::unix::fs::PermissionsExt;
         let path_dir = agent_free_dir_with_agent_stub("claude");
-        let codex = path_dir.path().join("codex");
-        std::fs::write(
-            &codex,
-            "#!/bin/sh\ncase \"$1\" in --version) exit 0 ;; esac\n\
-             i=0\nwhile [ ! -e never-released ] && [ \"$i\" -lt 1200 ]; do sleep 0.05; i=$((i+1)); done\n\
-             exit 0\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for program in ["claude", "codex"] {
+            let path = path_dir.path().join(program);
+            std::fs::write(
+                &path,
+                "#!/bin/sh\ncase \"$1\" in --version) exit 0 ;; esac\n\
+                 i=0\nwhile [ ! -e never-released ] && [ \"$i\" -lt 1200 ]; do sleep 0.05; i=$((i+1)); done\n\
+                 exit 0\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         let real_sleep = ["/usr/bin/sleep", "/bin/sleep"]
             .into_iter()
             .map(Path::new)
@@ -11315,7 +11317,7 @@ mod tests {
         const NAME: &str =
             "pipeline_launch::tests::a_rate_limit_before_any_commit_still_hands_off";
         if !devflow_core::test_support::in_child_test(NAME) {
-            let path_dir = waiting_codex_dir();
+            let path_dir = waiting_agents_dir();
             let output =
                 crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
@@ -11359,6 +11361,192 @@ mod tests {
         assert!(
             events_named(root, "rate_limit_resume_scheduled").is_empty(),
             "a handed-off rate limit schedules no resume"
+        );
+    }
+
+    /// A Supervise-mode Code run of `phase` under Claude in a fresh repo at `root`,
+    /// with `fallback` and `consumed` saved, its `infra_failures` at `infra`, and a
+    /// rate-limit capture for `advance` to read. The capture shape, so a Claude
+    /// relaunch needs no delivery canary.
+    fn save_rate_limited_code_run(
+        root: &Path,
+        phase: PhaseId,
+        fallback: Option<AgentKind>,
+        consumed: bool,
+        infra: u32,
+    ) {
+        init_repo(root);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Code;
+        state.fallback_agent = fallback;
+        state.fallback_consumed = consumed;
+        state.infra_failures = infra;
+        state.legacy_claude_launch = true;
+        workflow::save_state(&state).unwrap();
+        write_rate_limit_capture(root, phase);
+    }
+
+    /// D-06 at its boundary, at Code (R-2): a hop is not an infra fault. With
+    /// `infra_failures` one below the ceiling, a rate limit with an unused
+    /// fallback hands off and leaves the counter where it was. Control in the same
+    /// test: the same state with no fallback takes the cron arm's bump, reaches the
+    /// ceiling and aborts, which removes the run's state.
+    ///
+    /// Supervise mode with a Codex fallback, a pair the Code preflight admits;
+    /// `gate_or_abort_infra` aborts at the ceiling in every mode.
+    #[test]
+    fn an_unused_fallback_hands_off_one_below_the_infra_ceiling() {
+        const NAME: &str =
+            "pipeline_launch::tests::an_unused_fallback_hands_off_one_below_the_infra_ceiling";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = waiting_agents_dir();
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let _guard = env_lock();
+        let below_ceiling = mode::MAX_INFRA_FAILURES - 1;
+
+        let with_fallback = tempfile::tempdir().unwrap();
+        let root = with_fallback.path();
+        let phase = PhaseId::new(5164);
+        save_rate_limited_code_run(root, phase, Some(AgentKind::Codex), false, below_ceiling);
+        let result = advance(root, Some(phase));
+        let reloaded = workflow::load_state(root, phase);
+        let _reap_guard = reloaded.as_ref().ok().map(ReapMonitorOnDrop::after_launch);
+        result.unwrap();
+        let reloaded = reloaded.expect("a handed-off run keeps its state");
+        assert_eq!(
+            events_named(root, "agent_handoff").len(),
+            1,
+            "one handoff one below the ceiling"
+        );
+        assert_eq!(
+            reloaded.infra_failures, below_ceiling,
+            "the hop charged nothing to the infra counter (D-06)"
+        );
+        assert_eq!(reloaded.agent, AgentKind::Codex);
+
+        let without_fallback = tempfile::tempdir().unwrap();
+        let control_root = without_fallback.path();
+        let control_phase = PhaseId::new(5165);
+        save_rate_limited_code_run(control_root, control_phase, None, false, below_ceiling);
+        let outcome = advance(control_root, Some(control_phase));
+        assert!(
+            events_named(control_root, "agent_handoff").is_empty(),
+            "control: no fallback, no handoff"
+        );
+        assert!(
+            matches!(
+                workflow::load_state(control_root, control_phase),
+                Err(workflow::WorkflowError::MissingState(_))
+            ),
+            "control: the cron arm's bump reaches the ceiling and aborts (advance returned \
+             {outcome:?})"
+        );
+        outcome.unwrap();
+    }
+
+    /// D-05: one hop per run, no automatic switch back. Once the fallback is
+    /// consumed, a later Code rate limit takes the cron arm on the current agent.
+    /// Second fixture, the adjacency edge at runtime: an unconsumed fallback equal
+    /// to the agent is no handoff either. A `codex` stub is on PATH, so a missing
+    /// binary does not explain the absent hop.
+    #[test]
+    fn a_rate_limit_after_the_one_hop_takes_the_cron_arm() {
+        const NAME: &str =
+            "pipeline_launch::tests::a_rate_limit_after_the_one_hop_takes_the_cron_arm";
+        enter_agent_free_child!(NAME, "codex");
+        let _guard = env_lock();
+        for (phase, fallback, consumed) in [
+            (PhaseId::new(5166), AgentKind::Codex, true),
+            (PhaseId::new(5167), AgentKind::Claude, false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            save_rate_limited_code_run(root, phase, Some(fallback), consumed, 0);
+
+            advance(root, Some(phase)).unwrap();
+
+            assert!(
+                events_named(root, "agent_handoff").is_empty(),
+                "phase {phase}: no hop; events: {:?}",
+                events_named(root, "agent_handoff")
+            );
+            assert_cron_resume_written(root, phase);
+            assert_eq!(
+                events_named(root, "rate_limit_resume_scheduled").len(),
+                1,
+                "phase {phase}"
+            );
+            let reloaded = workflow::load_state(root, phase).unwrap();
+            assert_eq!(reloaded.agent, AgentKind::Claude, "phase {phase}");
+            assert_eq!(reloaded.fallback_consumed, consumed, "phase {phase}");
+        }
+    }
+
+    /// A transport cancel whose envelope still carries a success marker: the
+    /// Antigravity shape `agent_result` reads as [`agent_result::AgentStatus::Ambiguous`]
+    /// at Layer 1, whatever the run's agent.
+    const AMBIGUOUS_CANCEL_CAPTURE: &str = concat!(
+        r#"{"event":"init","model":"gemini-3.7-flash-high","inputFormat":"stream-json","outputFormat":"stream-json","printTimeout":"60m"}"#,
+        "\n",
+        r#"{"event":"result","result":{"status":"ERROR","response":"DEVFLOW_RESULT: {\"status\":\"success\"}\n","error":"context canceled"}}"#,
+        "\n"
+    );
+
+    /// The ordering edge: failover sits only inside the `RateLimited` arm. An
+    /// `Ambiguous` outcome at Code with an unused fallback re-drives the same
+    /// agent, emits no `agent_handoff`, and leaves the fallback unused. The
+    /// re-driven `claude` waits, so its supervisor writes nothing more before the
+    /// state is read.
+    #[test]
+    fn an_ambiguous_outcome_with_an_unused_fallback_re_drives_without_handing_off() {
+        const NAME: &str = "pipeline_launch::tests::an_ambiguous_outcome_with_an_unused_fallback_re_drives_without_handing_off";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = waiting_agents_dir();
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5168);
+        save_rate_limited_code_run(root, phase, Some(AgentKind::Codex), false, 0);
+        std::fs::write(
+            devflow_core::agent_result::stdout_path(root, phase),
+            AMBIGUOUS_CANCEL_CAPTURE,
+        )
+        .unwrap();
+
+        let result = advance(root, Some(phase));
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        let _reap_guard = ReapMonitorOnDrop::after_launch(&reloaded);
+        result.unwrap();
+
+        assert_eq!(
+            events_named(root, "ambiguous_transport_retry").len(),
+            1,
+            "the Ambiguous route ran"
+        );
+        assert!(
+            events_named(root, "agent_handoff").is_empty(),
+            "an Ambiguous outcome never hands off: {:?}",
+            events_named(root, "agent_handoff")
+        );
+        assert!(!reloaded.fallback_consumed, "the fallback stays unused");
+        assert_eq!(reloaded.agent, AgentKind::Claude);
+        assert!(
+            reloaded.supervisor.is_some(),
+            "the same agent was re-driven"
         );
     }
 
