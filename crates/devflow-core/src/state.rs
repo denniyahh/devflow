@@ -482,6 +482,9 @@ pub struct State {
     /// written by a binary predating this field" — both behave identically.
     #[serde(default)]
     pub fallback_consumed: bool,
+    /// RED stub (51-07): replaced by the persisted field in the GREEN commit.
+    #[serde(skip)]
+    pub code_fix: Option<crate::prompt::FixType>,
 }
 
 /// The persisted handle on a launch's supervisor ([`State::supervisor`]).
@@ -722,6 +725,7 @@ impl State {
             gate_notify_cmd: None,
             fallback_agent: None,
             fallback_consumed: false,
+            code_fix: None,
         }
     }
 }
@@ -1065,6 +1069,48 @@ mod tests {
         let loaded: State = serde_json::from_str(predating).unwrap();
         assert_eq!(loaded.fallback_agent, None);
         assert!(!loaded.fallback_consumed);
+    }
+
+    /// D-09 (Phase 51): the fix type of the Code pass in flight is persisted under
+    /// its own key with a snake_case value and survives a round trip; a state
+    /// written before the field existed loads as "no fix pass"; and a state with
+    /// no fix pass writes no key at all.
+    #[test]
+    fn code_fix_round_trips_and_defaults_to_none() {
+        let mut state = State::new(
+            PhaseId::new(1),
+            AgentKind::Claude,
+            Mode::Auto,
+            PathBuf::from("/repo"),
+        );
+        state.code_fix = Some(crate::prompt::FixType::AuditFix);
+        let json = serde_json::to_string(&state).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value.get("code_fix"),
+            Some(&serde_json::json!("audit_fix")),
+            "code_fix must be persisted under its own key: {json}"
+        );
+        let loaded: State = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.code_fix, Some(crate::prompt::FixType::AuditFix));
+
+        let predating = r#"{
+            "stage": "code",
+            "phase": 1,
+            "agent": "claude",
+            "mode": "auto",
+            "started_at": "0",
+            "project_root": "/repo"
+        }"#;
+        let loaded: State = serde_json::from_str(predating).unwrap();
+        assert_eq!(loaded.code_fix, None, "a pre-51 state has no fix pass");
+
+        state.code_fix = None;
+        let unset = serde_json::to_string(&state).unwrap();
+        assert!(
+            !unset.contains("code_fix"),
+            "a state with no fix pass writes no code_fix key: {unset}"
+        );
     }
 
     /// A serde-absent `infra_failures` (older persisted state.json without
