@@ -17829,4 +17829,337 @@ mod tests {
         let violations = supv01_evidence_violations(&text, false, &root);
         assert!(violations.is_empty(), "{}: {violations:#?}", path.display());
     }
+
+    // ---- 51-13: the post-save successor probe answered Gone (D-12, B-2, R2-8) ----
+
+    /// The test-only seam that answers [`publish_record`]'s post-save probe `Gone`
+    /// (`<agent>:<stage>:<marker-path>`), read by `successor_probe_for` under `cfg(test)`.
+    const WITHHOLD_SUCCESSOR_ENV: &str = "DEVFLOW_TEST_WITHHOLD_SUCCESSOR_PROBE";
+
+    /// The parent half of a 51-13 post-save probe test: run `name` with `stubs` and the
+    /// seam naming `agent_stage` and a marker path in a parent-owned dir; the marker is
+    /// the seam's proof that it answered. `None` runs the same child with the seam
+    /// unset (the intervention-removed run).
+    fn run_withheld_successor_child(
+        name: &str,
+        stubs: &[(&str, String)],
+        agent_stage: Option<&str>,
+    ) {
+        let marker_dir = tempfile::Builder::new()
+            .prefix("dfm")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let marker = marker_dir.path().join("withheld");
+        let value = agent_stage.map(|agent_stage| {
+            std::ffi::OsString::from(format!("{agent_stage}:{}", marker.display()))
+        });
+        let env: Vec<(&str, &std::ffi::OsStr)> = value
+            .as_ref()
+            .map(|value| (WITHHOLD_SUCCESSOR_ENV, value.as_os_str()))
+            .into_iter()
+            .collect();
+        run_handoff_child_with_stubs_and_env(name, None, SUCCESS_MARKER, stubs, &env);
+    }
+
+    /// The marker path the seam variable names in this child, if it is set.
+    fn withheld_successor_marker() -> Option<PathBuf> {
+        let value = std::env::var(WITHHOLD_SUCCESSOR_ENV).ok()?;
+        let mut parts = value.splitn(3, ':');
+        let (_, _, marker) = (parts.next()?, parts.next()?, parts.next()?);
+        Some(PathBuf::from(marker))
+    }
+
+    /// Poll until the run's state reads `stopped`, failing with the events otherwise.
+    fn wait_recorded_stopped(run: &HandoffRun) -> State {
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || {
+                workflow::load_state(&run.root, run.phase).is_ok_and(|state| state.stopped)
+            }),
+            "the run was never recorded stopped; state: {:?}; events:\n{}",
+            workflow::load_state(&run.root, run.phase).map(|s| (
+                s.stage,
+                s.agent,
+                s.stopped,
+                s.stop_reason,
+                s.supervisor
+            )),
+            run.events()
+        );
+        run.state()
+    }
+
+    /// The `stopped` shape both post-save experiments assert while their successor is
+    /// still held: the stop reason, a saved record naming the successor (not stage N),
+    /// the seam's marker and a live successor socket.
+    fn assert_recorded_stopped_while_the_successor_runs(run: &HandoffRun, state: &State) {
+        assert_eq!(
+            state.stop_reason.as_deref(),
+            Some(NEXT_STOPPED_BEFORE_SAVE_REASON),
+            "events:\n{}",
+            run.events()
+        );
+        let record = state
+            .supervisor
+            .as_ref()
+            .expect("the successor's record was saved before the probe");
+        assert_ne!(
+            record.launch_id, run.n.launch_id,
+            "the record names the successor, not stage N"
+        );
+        let marker = withheld_successor_marker().expect("this child runs with the seam set");
+        assert!(
+            marker.exists(),
+            "the seam's marker {} is missing: the seam never answered",
+            marker.display()
+        );
+        assert!(
+            !run.other_sockets().is_empty(),
+            "the successor the state calls stopped is still running, so its socket is there"
+        );
+    }
+
+    /// D-12 (SUPV-01 criterion 3, failover's post-save probe; review B-2, R2-8). The
+    /// primary Claude Code stage is rate-limited and hands off to the unused Codex
+    /// fallback; the seam answers the post-save probe of the fallback's Code relaunch
+    /// only (`codex:code`) `Gone`, the branch that flips the run's shape. While the
+    /// fallback's agent is still held on `go-fallback`, the state records the run
+    /// `stopped` with [`NEXT_STOPPED_BEFORE_SAVE_REASON`] under the successor's saved
+    /// record, after one rate-limited handoff, with no relaunch failure, no gate and no
+    /// cron arm. Healthy baseline (no intervention, same rig):
+    /// [`a_rate_limit_with_a_fallback_hands_off_and_completes_the_same_stage`].
+    #[test]
+    fn failover_with_the_post_save_probe_answering_gone_records_the_run_stopped() {
+        const NAME: &str = "pipeline_launch::tests::failover_with_the_post_save_probe_answering_gone_records_the_run_stopped";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_withheld_successor_child(
+                NAME,
+                &[
+                    ("claude", rate_limited_claude_script()),
+                    (
+                        "codex",
+                        group_recording_script("codex", "go-fallback", None),
+                    ),
+                ],
+                Some("codex:code"),
+            );
+            return;
+        }
+        let _guard = env_lock();
+        let run = HandoffRun::launch_with(PhaseId::new(5131), |_, state| {
+            state.stage = Stage::Code;
+            state.stop_until = Some(Stage::Code);
+            state.fallback_agent = Some(AgentKind::Codex);
+        });
+        run.go();
+        let state = wait_recorded_stopped(&run);
+
+        assert_recorded_stopped_while_the_successor_runs(&run, &state);
+        assert_eq!(state.agent, AgentKind::Codex, "the fallback drives the run");
+        assert!(state.fallback_consumed, "the hop is consumed");
+        let handoffs = events_named(&run.root, "agent_handoff");
+        assert_eq!(handoffs.len(), 1, "one handoff; events:\n{}", run.events());
+        assert_eq!(handoffs[0]["reason"], "rate_limited", "{}", handoffs[0]);
+        for absent in [
+            "agent_handoff_relaunch_failed",
+            "gate_fired",
+            "rate_limit_resume_scheduled",
+        ] {
+            assert!(
+                events_named(&run.root, absent).is_empty(),
+                "no `{absent}`; events:\n{}",
+                run.events()
+            );
+        }
+        assert!(
+            !devflow_core::ship::cron_instructions_path(&run.root, run.phase).exists(),
+            "no cron instruction"
+        );
+        std::fs::write(run.root.join("go-fallback"), "").unwrap();
+    }
+
+    /// D-12's ordinary-launch control for the post-save probe: an ordinary Plan → Code
+    /// transition, no fallback, with the same seam answering its Code launch's
+    /// post-save probe `Gone` (`claude:code`). While the Code agent is held on `go2`,
+    /// the run is recorded stopped the same way, with the same reason, at stage Code.
+    /// Both answered launches are Code launches, so this and
+    /// [`failover_with_the_post_save_probe_answering_gone_records_the_run_stopped`]
+    /// differ only in failover.
+    #[test]
+    fn an_ordinary_transition_with_the_post_save_probe_answering_gone_records_the_run_stopped() {
+        const NAME: &str = "pipeline_launch::tests::an_ordinary_transition_with_the_post_save_probe_answering_gone_records_the_run_stopped";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_withheld_successor_child(NAME, &[], Some("claude:code"));
+            return;
+        }
+        let _guard = env_lock();
+        let run = HandoffRun::launch_with(PhaseId::new(5132), |_, state| {
+            state.stage = Stage::Plan;
+            state.stop_until = Some(Stage::Code);
+        });
+        run.go();
+        let state = wait_recorded_stopped(&run);
+
+        assert_recorded_stopped_while_the_successor_runs(&run, &state);
+        assert_eq!(state.stage, Stage::Code, "the transition committed Code");
+        std::fs::write(run.root.join("go2"), "").unwrap();
+    }
+
+    const SUCCESSOR_SEAM_NO_LITERAL_READ: &str =
+        "no literal std::env::var read of DEVFLOW_TEST_WITHHOLD_SUCCESSOR_PROBE";
+    const SUCCESSOR_SEAM_FN_NOT_ONCE: &str = "fn successor_probe_for( is not defined exactly once";
+    const SUCCESSOR_SEAM_NOT_GATED: &str =
+        "fn successor_probe_for( is not directly under #[cfg(test)]";
+    const SUCCESSOR_SEAM_CALL_NOT_GATED: &str =
+        "a call to successor_probe_for( is not directly under #[cfg(test)]";
+    const SUCCESSOR_SEAM_READ_OUTSIDE: &str =
+        "DEVFLOW_TEST_WITHHOLD_SUCCESSOR_PROBE is named outside fn successor_probe_for(";
+
+    /// The post-save probe seam's layout over `source`'s non-test code (cut at its
+    /// first `mod tests {` line, whole-line `//` comments dropped): the variable is read
+    /// literally (the form the doc check sees) and only in the seam's body, the seam is
+    /// defined once directly under `#[cfg(test)]`, and every call is directly under
+    /// `#[cfg(test)]` too, so the release binding names neither.
+    fn successor_probe_seam_violations(source: &str) -> Vec<String> {
+        const GATE: &str = "#[cfg(test)]";
+        const DEFINITION: &str = "fn successor_probe_for(";
+        const VARIABLE: &str = "DEVFLOW_TEST_WITHHOLD_SUCCESSOR_PROBE";
+        let lines: Vec<&str> = source
+            .lines()
+            .take_while(|line| *line != "mod tests {")
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect();
+        let gated = |at: usize| {
+            at.checked_sub(1)
+                .is_some_and(|above| lines[above].trim() == GATE)
+        };
+        let mut violations = Vec::new();
+        if !lines
+            .iter()
+            .any(|line| line.contains(&format!("std::env::var(\"{VARIABLE}\")")))
+        {
+            violations.push(SUCCESSOR_SEAM_NO_LITERAL_READ.to_string());
+        }
+        let defined: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.trim_start().starts_with(DEFINITION))
+            .map(|(at, _)| at)
+            .collect();
+        match defined.as_slice() {
+            [at] => {
+                if !gated(*at) {
+                    violations.push(SUCCESSOR_SEAM_NOT_GATED.to_string());
+                }
+                // The body runs to the first line that is exactly `}`.
+                let end = lines[*at..]
+                    .iter()
+                    .position(|line| *line == "}")
+                    .map_or(lines.len(), |offset| at + offset);
+                let outside = lines
+                    .iter()
+                    .enumerate()
+                    .any(|(index, line)| line.contains(VARIABLE) && !(*at..=end).contains(&index));
+                if outside {
+                    violations.push(SUCCESSOR_SEAM_READ_OUTSIDE.to_string());
+                }
+            }
+            _ => violations.push(SUCCESSOR_SEAM_FN_NOT_ONCE.to_string()),
+        }
+        let ungated_call = lines.iter().enumerate().any(|(at, line)| {
+            line.contains("successor_probe_for(")
+                && !line.trim_start().starts_with(DEFINITION)
+                && !gated(at)
+        });
+        if ungated_call {
+            violations.push(SUCCESSOR_SEAM_CALL_NOT_GATED.to_string());
+        }
+        violations
+    }
+
+    /// T-51-37 (51-13, permanent source scan): a release build never compiles the
+    /// post-save probe seam or its call, so no environment variable can make a release
+    /// launcher read a successor as gone. The real file yields no violation; each
+    /// planted source yields the violation it plants, including an ungated decoy call
+    /// and an ungated decoy read.
+    #[test]
+    fn the_successor_probe_seam_is_compiled_out_of_non_test_builds() {
+        let gate = "#[cfg(test)]\n";
+        let read = "    let _ = std::env::var(\"DEVFLOW_TEST_WITHHOLD_SUCCESSOR_PROBE\");\n";
+        let seam = |attribute: &str, body: &str| {
+            format!("{attribute}fn successor_probe_for(state: &State) -> Probe {{\n{body}}}\n")
+        };
+        let caller = |attribute: &str| {
+            format!(
+                "fn publish_record() {{\n    // Test-only.\n    #[cfg(not(test))]\n    let probe = \
+                 devflow_core::supervisor::probe;\n    {attribute}    let probe = \
+                 successor_probe_for(state);\n}}\n"
+            )
+        };
+        let gated_call = format!("    {gate}");
+        let good = format!("{}{}", seam(gate, read), caller(&gated_call));
+        let only = |violation: &str| vec![violation.to_string()];
+
+        assert_eq!(
+            successor_probe_seam_violations(&good),
+            Vec::<String>::new(),
+            "a correct layout (the comment line above the gate is dropped)"
+        );
+        assert_eq!(
+            successor_probe_seam_violations(&format!("{}{}", seam("", read), caller(&gated_call))),
+            only(SUCCESSOR_SEAM_NOT_GATED),
+            "an ungated definition"
+        );
+        assert_eq!(
+            successor_probe_seam_violations(&format!("{}{}", seam(gate, read), caller(""))),
+            only(SUCCESSOR_SEAM_CALL_NOT_GATED),
+            "an ungated decoy call (a release binding naming the seam fn)"
+        );
+        assert_eq!(
+            successor_probe_seam_violations(&format!(
+                "{}{}fn decoy() {{\n{read}}}\n",
+                seam(gate, read),
+                caller(&gated_call)
+            )),
+            only(SUCCESSOR_SEAM_READ_OUTSIDE),
+            "an ungated decoy reading the variable outside the seam"
+        );
+        assert_eq!(
+            successor_probe_seam_violations(&format!(
+                "{}{}",
+                seam(gate, "    let _ = std::env::var(SEAM);\n"),
+                caller(&gated_call)
+            )),
+            only(SUCCESSOR_SEAM_NO_LITERAL_READ),
+            "a read through a constant"
+        );
+        assert_eq!(
+            successor_probe_seam_violations(&format!(
+                "{}{}{}",
+                seam(gate, read),
+                seam(gate, ""),
+                caller(&gated_call)
+            )),
+            only(SUCCESSOR_SEAM_FN_NOT_ONCE),
+            "two definitions"
+        );
+        assert_eq!(
+            successor_probe_seam_violations(&format!("mod tests {{\n{good}")),
+            vec![
+                SUCCESSOR_SEAM_NO_LITERAL_READ.to_string(),
+                SUCCESSOR_SEAM_FN_NOT_ONCE.to_string()
+            ],
+            "the read and the seam only after the test-module cut"
+        );
+
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/pipeline_launch.rs");
+        let source =
+            std::fs::read_to_string(path).unwrap_or_else(|err| panic!("read {path}: {err}"));
+        assert!(
+            source.lines().any(|line| line == "mod tests {"),
+            "pipeline_launch.rs must keep its `mod tests {{` line, or the scan would read its \
+             own controls"
+        );
+        let real = successor_probe_seam_violations(&source);
+        assert!(real.is_empty(), "{path}: {real:?}");
+    }
 }
