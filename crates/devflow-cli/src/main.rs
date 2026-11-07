@@ -110,8 +110,20 @@ enum Command {
         /// `devflow resume`; edit `.devflow/state-NN.json` to turn it off.
         #[arg(long)]
         legacy_claude_launch: bool,
-        /// RED scaffold: not yet a flag.
-        #[arg(skip)]
+        /// A second agent that takes over the Code stage once if the agent is
+        /// rate-limited there (D-01, `51-CONTEXT.md`). Failover happens only at
+        /// Code; at any other stage a rate limit takes the cron arm as before.
+        ///
+        /// Persisted in the run state (`state-NN.json`) before the first
+        /// supervisor spawns, and checked here as far as launch can tell: it
+        /// must differ from `--agent`, its binary must be installed and its
+        /// driver healthy, and in `--mode auto` it must be `claude` or
+        /// `antigravity` (the unattended launch shape). The full preflight runs
+        /// again at the handoff itself.
+        ///
+        /// Overrides a `fallback_agent` key in `devflow.toml` when both are
+        /// given. No environment variable selects it.
+        #[arg(long)]
         fallback_agent: Option<AgentKind>,
         /// Project root.
         #[arg(default_value = ".")]
