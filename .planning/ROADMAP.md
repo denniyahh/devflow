@@ -649,7 +649,7 @@ be re-tested here rather than inherited from the issue's original design.
      rebase handoff were all removed (D-11, 23d) and none is reintroduced. Counted over source with
      comments stripped, since a grep over raw source counts comment prose (the Phase 35-01 lesson).
 
-**Plans**: 7/13 plans executed (8 waves)
+**Plans**: 8/13 plans executed (8 waves)
 
 Plans:
 **Wave 1**
@@ -670,7 +670,7 @@ Plans:
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
-- [ ] 51-07-PLAN.md — D-09 Code half: a same-stage relaunch delivers the interrupted fix type to the spawned agent (wave 4)
+- [x] 51-07-PLAN.md — D-09 Code half: a same-stage relaunch delivers the interrupted fix type to the spawned agent (wave 4)
 
 **Wave 5** *(blocked on Wave 4 completion)*
 
@@ -845,7 +845,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 49 | 12/12 | In Progress|  |
 | 50 | 29/29 | Complete | 2026-10-21 |
 | 50.1 | 30/30 | In Progress | — |
-| 51 | 7/13 | In Progress | — |
+| 51 | 8/13 | In Progress | — |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
 
