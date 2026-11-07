@@ -1726,3 +1726,319 @@ fn no_environment_variable_selects_the_fallback_agent() {
         found.join("\n")
     );
 }
+
+/// A call of the notify-strip helper, assembled from pieces so this file never
+/// holds the call text contiguously and the scan below cannot report itself.
+const STRIP_NOTIFY_CALL: &str = concat!("strip_notify", "_env(");
+
+/// True when `line`'s first non-blank text opens a `mod tests {` block.
+fn opens_test_module(line: &str) -> bool {
+    line.trim_start().starts_with("mod tests {")
+}
+
+/// The name of the first `fn <name>` item declared on `line`, if any: `fn`
+/// as a whole word, then an identifier followed by `(` or `<`.
+fn declared_fn_name(line: &str) -> Option<&str> {
+    line.match_indices("fn ").find_map(|(start, _)| {
+        let word_start = line[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|ch| !is_identifier_char(ch));
+        let rest = &line[start + 3..];
+        let end = rest.find(|ch: char| !is_identifier_char(ch))?;
+        let after = rest[end..].chars().next();
+        (word_start && end > 0 && matches!(after, Some('(' | '<'))).then_some(&rest[..end])
+    })
+}
+
+/// Every call of the notify-strip helper outside test code, as (enclosing fn,
+/// `path:line`). Comments and string-literal contents are blanked first; the
+/// definition is not a call, and nothing from a file's first `mod tests {`
+/// line on is read. Each call is attributed to the nearest preceding
+/// `fn <name>` line.
+fn strip_notify_call_sites(files: &[(PathBuf, String)]) -> Vec<(String, String)> {
+    let mut sites = Vec::new();
+    for (path, text) in files {
+        let code = rewrite_rust(text, true, true);
+        let mut enclosing: Option<&str> = None;
+        for (index, line) in code.lines().enumerate() {
+            if opens_test_module(line) {
+                break;
+            }
+            if let Some(name) = declared_fn_name(line) {
+                enclosing = Some(name);
+            }
+            let calls = line.match_indices(STRIP_NOTIFY_CALL).any(|(start, _)| {
+                let before = &line[..start];
+                !before.ends_with("fn ")
+                    && before
+                        .chars()
+                        .next_back()
+                        .is_none_or(|ch| !is_identifier_char(ch))
+            });
+            if calls {
+                let name = enclosing.unwrap_or("<no enclosing fn>").to_string();
+                sites.push((name, format!("{}:{}", path.display(), index + 1)));
+            }
+        }
+    }
+    sites
+}
+
+/// The `///` comment directly above the first line `is_item` accepts, attribute
+/// lines skipped, as its lines in source order (the `///` prefix removed).
+/// `None` when no line is accepted.
+fn doc_comment_above(text: &str, is_item: impl Fn(&str) -> bool) -> Option<Vec<String>> {
+    let lines: Vec<&str> = text.lines().collect();
+    let item = lines.iter().position(|line| is_item(line))?;
+    let mut doc = Vec::new();
+    for line in lines[..item].iter().rev() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("#[") {
+            continue;
+        }
+        match trimmed.strip_prefix("///") {
+            Some(body) => doc.push(body.to_string()),
+            None => break,
+        }
+    }
+    doc.reverse();
+    Some(doc)
+}
+
+/// The backticked names on the `Called from` line of the doc comment above the
+/// notify-strip helper's definition, or `None` when there is no definition or
+/// no such line.
+fn called_from_names(files: &[(PathBuf, String)]) -> Option<Vec<String>> {
+    let definition = ["fn ", STRIP_NOTIFY_CALL].concat();
+    let doc = files
+        .iter()
+        .find_map(|(_, text)| doc_comment_above(text, |line| line.contains(&definition)))?;
+    let line = doc.iter().find(|line| line.contains("Called from"))?;
+    Some(
+        line.split('`')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+/// Where the helper's `Called from` line and its real callers disagree: a
+/// caller the line does not name, a name on the line that is not a caller, or
+/// no `Called from` line at all.
+fn call_site_doc_findings(files: &[(PathBuf, String)]) -> Vec<String> {
+    let sites = strip_notify_call_sites(files);
+    let Some(named) = called_from_names(files) else {
+        return vec!["no `Called from` line in the doc comment above the definition".to_string()];
+    };
+    let mut findings = Vec::new();
+    for (caller, location) in &sites {
+        if !named.contains(caller) {
+            findings.push(format!(
+                "`{caller}` ({location}) calls it, but the Called from line does not name it"
+            ));
+        }
+    }
+    for name in &named {
+        if !sites.iter().any(|(caller, _)| caller == name) {
+            findings.push(format!(
+                "the Called from line names `{name}`, which is not a caller outside test code"
+            ));
+        }
+    }
+    findings
+}
+
+/// The notify-strip helper's doc comment names exactly the functions that call
+/// it outside test code, so a new spawn path that strips the variable (or one
+/// that stops) fails here until the comment says so. Planted controls run
+/// through the same helper.
+#[test]
+fn strip_notify_env_doc_names_exactly_its_call_sites() {
+    let planted = |text: String| vec![(PathBuf::from("planted.rs"), text)];
+    let definition = |called_from: &str| {
+        [
+            "/// Strips the variable.\n/// Called from ",
+            called_from,
+            ".\npub(crate) fn ",
+            STRIP_NOTIFY_CALL,
+            "cmd: &mut Command) {}\n",
+        ]
+        .concat()
+    };
+    let caller = |name: &str| {
+        [
+            "fn ",
+            name,
+            "() {\n    ",
+            STRIP_NOTIFY_CALL,
+            "&mut c);\n}\n",
+        ]
+        .concat()
+    };
+
+    // An extra call site is reported as unnamed; this also proves the
+    // assembled needle matches real call text.
+    let extra = [
+        definition("`real_site`"),
+        caller("real_site"),
+        caller("extra_site"),
+    ]
+    .concat();
+    let found = call_site_doc_findings(&planted(extra));
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains("`extra_site`"), "{found:?}");
+
+    // A name that does not call it is reported as a non-caller.
+    let stale = [
+        definition("`real_site` and `not_a_caller`"),
+        caller("real_site"),
+    ]
+    .concat();
+    let found = call_site_doc_findings(&planted(stale));
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains("`not_a_caller`"), "{found:?}");
+
+    // A call inside a `mod tests {` block is not a call site.
+    let in_tests = [
+        definition("`real_site`"),
+        caller("real_site"),
+        "#[cfg(test)]\nmod tests {\n".to_string(),
+        caller("a_test"),
+        "}\n".to_string(),
+    ]
+    .concat();
+    let found = call_site_doc_findings(&planted(in_tests));
+    assert!(found.is_empty(), "{found:?}");
+
+    // A comment with no `Called from` line is reported.
+    let unlisted = [
+        "/// Strips the variable.\npub(crate) fn ",
+        STRIP_NOTIFY_CALL,
+        "cmd: &mut Command) {}\n",
+    ]
+    .concat();
+    assert_eq!(call_site_doc_findings(&planted(unlisted)).len(), 1);
+
+    // The real scan: every Rust file under crates/devflow-core/src (the helper
+    // is `pub(crate)`).
+    let core_src = workspace_root().join("crates/devflow-core/src");
+    let files = read_labelled(
+        rust_file_paths()
+            .into_iter()
+            .filter(|path| path.starts_with(&core_src))
+            .collect(),
+    );
+    assert!(
+        files.len() > 1,
+        "the walker read {} core sources",
+        files.len()
+    );
+    let sites = strip_notify_call_sites(&files);
+    assert!(!sites.is_empty(), "the scan must find the real call sites");
+    let found = call_site_doc_findings(&files);
+    assert!(
+        found.is_empty(),
+        "the notify-strip helper's Called from line does not match its call sites {sites:?}:\n{}",
+        found.join("\n")
+    );
+}
+
+/// The tests `gate_notify_cmd`'s doc comment must cite: they pin the `resume`
+/// and `advance` arms that keep the saved command when the variable is unset.
+const GATE_NOTIFY_CMD_PINNING_TESTS: &[&str] = &[
+    "resume_with_the_variable_unset_keeps_the_saved_command",
+    "advance_gate_runs_the_persisted_command_when_the_variable_is_unset",
+];
+
+/// For each of `required`, whether the `///` comment above `pub gate_notify_cmd:`
+/// in `state_source` cites it and `source` declares it as `fn <name>(`.
+fn gate_notify_cmd_citation_findings(
+    state_source: &str,
+    required: &[&str],
+    source: &str,
+) -> Vec<String> {
+    let Some(doc) = doc_comment_above(state_source, |line| {
+        line.trim_start().starts_with("pub gate_notify_cmd:")
+    }) else {
+        return vec!["no `pub gate_notify_cmd:` declaration".to_string()];
+    };
+    let doc = doc.join("\n");
+    let mut findings = Vec::new();
+    for name in required {
+        if !doc.contains(name) {
+            findings.push(format!("the comment does not cite `{name}`"));
+        } else if !source.contains(&format!("fn {name}(")) {
+            findings.push(format!(
+                "the comment cites `{name}`, which is absent from source"
+            ));
+        }
+    }
+    findings
+}
+
+/// `gate_notify_cmd`'s doc comment cites the tests that pin its unset-keeps
+/// arms for `resume` and `advance`, and each cited test exists, so a renamed
+/// or deleted pinning test fails here until the comment follows it.
+#[test]
+fn gate_notify_cmd_doc_cites_the_tests_that_pin_it() {
+    let declaration = "    pub gate_notify_cmd: Option<String>,\n";
+    let comment = |cites: &str| {
+        [
+            "    /// Pinned by ",
+            cites,
+            ".\n    #[serde(default)]\n",
+            declaration,
+        ]
+        .concat()
+    };
+    let cited = format!(
+        "`{}` and `{}`",
+        GATE_NOTIFY_CMD_PINNING_TESTS[0], GATE_NOTIFY_CMD_PINNING_TESTS[1]
+    );
+    let source = GATE_NOTIFY_CMD_PINNING_TESTS
+        .iter()
+        .map(|name| format!("fn {name}() {{}}\n"))
+        .collect::<String>();
+
+    // Control: both cited and both declared is clean.
+    let clean =
+        gate_notify_cmd_citation_findings(&comment(&cited), GATE_NOTIFY_CMD_PINNING_TESTS, &source);
+    assert!(clean.is_empty(), "{clean:?}");
+
+    // A comment missing one citation reports it.
+    let partial = format!("`{}`", GATE_NOTIFY_CMD_PINNING_TESTS[0]);
+    let found = gate_notify_cmd_citation_findings(
+        &comment(&partial),
+        GATE_NOTIFY_CMD_PINNING_TESTS,
+        &source,
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(
+        found[0].contains(GATE_NOTIFY_CMD_PINNING_TESTS[1]),
+        "{found:?}"
+    );
+
+    // A citation of a test no source declares reports it as absent.
+    let missing = ["no_such_test_anywhere"];
+    let found =
+        gate_notify_cmd_citation_findings(&comment("`no_such_test_anywhere`"), &missing, &source);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains("absent from source"), "{found:?}");
+
+    // The real comment against every Rust file under crates/.
+    let state_source =
+        std::fs::read_to_string(workspace_root().join("crates/devflow-core/src/state.rs"))
+            .expect("state.rs must be readable");
+    let found = gate_notify_cmd_citation_findings(
+        &state_source,
+        GATE_NOTIFY_CMD_PINNING_TESTS,
+        &rust_source(),
+    );
+    assert!(
+        found.is_empty(),
+        "gate_notify_cmd's doc comment and its pinning tests disagree:\n{}",
+        found.join("\n")
+    );
+}
