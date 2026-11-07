@@ -1,5 +1,5 @@
 {
-  "stale_since_commit": "720db2f",
-  "summaries_landed": [".planning/phases/51-rate-limit-agent-failover/51-05-SUMMARY.md"],
+  "stale_since_commit": "5514cf3",
+  "summaries_landed": [".planning/phases/51-rate-limit-agent-failover/51-06-SUMMARY.md"],
   "state_status_at_detection": "executing"
 }
