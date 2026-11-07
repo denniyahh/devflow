@@ -15596,6 +15596,101 @@ mod tests {
         assert!(state.supervisor.is_some(), "the run launched");
     }
 
+    /// Run the test `name` in a hermetic child whose `PATH` holds no agent binary, returning
+    /// `true` in the parent, whose work is done, and `false` in the child. A refusal test
+    /// runs there so that, were its refusal ever lost, the start it drives would stop at a
+    /// missing binary under a scratch cache rather than reach the host's.
+    fn run_in_an_agent_free_child(name: &str) -> bool {
+        if devflow_core::test_support::in_child_test(name) {
+            return false;
+        }
+        let path_dir = crate::test_support::agent_free_git_only_path_dir();
+        let output = crate::test_support::run_hermetic_test_in_child(name, path_dir.path(), &[]);
+        devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, name);
+        true
+    }
+
+    /// D-02: a fallback equal to the agent is refused before anything is written, and the
+    /// refusal names the agent in both roles.
+    #[test]
+    fn start_refuses_a_fallback_equal_to_the_agent() {
+        const NAME: &str = "commands::tests::start_refuses_a_fallback_equal_to_the_agent";
+        if run_in_an_agent_free_child(NAME) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5142);
+
+        let err = start_with_fallback(
+            root,
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            Some(AgentKind::Claude),
+        )
+        .expect_err("a fallback equal to the agent is refused")
+        .to_string();
+
+        assert!(
+            err.contains("--fallback-agent claude"),
+            "names the fallback: {err}"
+        );
+        assert!(
+            err.contains("run's own agent (claude)"),
+            "names the agent: {err}"
+        );
+        assert!(
+            !workflow::state_path(root, phase).exists(),
+            "no state was written"
+        );
+        assert!(
+            !root.join(".devflow").exists(),
+            "nothing was written under .devflow"
+        );
+    }
+
+    /// D-03: in `--mode auto` a fallback outside the unattended launch shape is refused
+    /// before anything is written, naming the fallback and the condition.
+    #[test]
+    fn start_in_auto_mode_refuses_a_fallback_outside_the_unattended_launch_shape() {
+        const NAME: &str = "commands::tests::\
+                            start_in_auto_mode_refuses_a_fallback_outside_the_unattended_launch_shape";
+        if run_in_an_agent_free_child(NAME) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5143);
+
+        let err = start_with_fallback(
+            root,
+            phase,
+            AgentKind::Claude,
+            Mode::Auto,
+            Some(AgentKind::Codex),
+        )
+        .expect_err("codex cannot take over an unattended Code stage")
+        .to_string();
+
+        assert!(
+            err.contains("--fallback-agent codex"),
+            "names the fallback: {err}"
+        );
+        assert!(
+            err.contains("unattended launch shape"),
+            "names the condition: {err}"
+        );
+        assert!(
+            !workflow::state_path(root, phase).exists(),
+            "no state was written"
+        );
+        assert!(
+            !root.join(".devflow").exists(),
+            "nothing was written under .devflow"
+        );
+    }
+
     /// The launcher keeps its copy of the lock until the publish save has returned, so
     /// a supervisor that dies before it is recorded still reads live, and the launcher
     /// decides what happens next. Once `start` has returned, the launcher's copy is gone

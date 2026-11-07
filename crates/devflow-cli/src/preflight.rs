@@ -4720,6 +4720,51 @@ mod tests {
         );
     }
 
+    /// D-03: a fallback is held to the Code-stage launch shape in `--mode auto` only, and
+    /// the check refuses exactly what `unattended_launch_shape_condition` refuses.
+    #[test]
+    fn the_fallback_launch_shape_check_refuses_only_in_auto_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |agent, mode| State::new(PhaseId::new(51), agent, mode, dir.path().to_path_buf());
+
+        let refusal =
+            fallback_launch_shape_refusal(&run(AgentKind::Claude, Mode::Auto), AgentKind::Codex)
+                .expect("codex cannot take over an unattended Code stage");
+        assert!(
+            refusal.contains("codex"),
+            "the refusal names the fallback: {refusal}"
+        );
+        assert!(
+            refusal.contains("not claude or antigravity"),
+            "the refusal names the launch-shape cause: {refusal}"
+        );
+
+        assert_eq!(
+            fallback_launch_shape_refusal(
+                &run(AgentKind::Claude, Mode::Auto),
+                AgentKind::Antigravity
+            ),
+            None,
+            "antigravity holds the unattended launch shape"
+        );
+        assert_eq!(
+            fallback_launch_shape_refusal(
+                &run(AgentKind::Claude, Mode::Supervise),
+                AgentKind::Codex
+            ),
+            None,
+            "a supervised run is not held to the unattended launch shape"
+        );
+        assert_eq!(
+            fallback_launch_shape_refusal(
+                &run(AgentKind::Antigravity, Mode::Auto),
+                AgentKind::Claude
+            ),
+            None,
+            "claude without the legacy opt-out holds the unattended launch shape"
+        );
+    }
+
     #[test]
     fn unattended_launch_shape_condition_claude_unchanged() {
         let dir = tempfile::tempdir().unwrap();
