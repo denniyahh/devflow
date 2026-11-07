@@ -16772,6 +16772,16 @@ mod tests {
 
     // ---- 51-10: SUPV-01 criterion 3, the publish wait and the cron arm's read (D-12) ----
 
+    /// How a withheld publish wait ends in a test build, as `wait_for_publish`'s
+    /// `NotReady` text words it. The successor stays only pending, so its own
+    /// promotion watch ends it, with its agent group, once `PROMOTION_WAIT` (5 s
+    /// in a test build) expires, before the launcher's 10 s `PUBLISH_WAIT` does:
+    /// the launcher then sees it exit by itself. In a release build the order is
+    /// the other way round (`PROMOTION_WAIT_RELEASE` is 15 s), and the launcher's
+    /// `end_unpublished_child` ends it ("did not publish within"), a path these
+    /// tests therefore do not reach.
+    const PUBLISH_WAIT_ENDED_IN_TEST_BUILDS: &str = "exited by itself before publishing";
+
     /// The test-only seam that withholds one publish wait's probe answer
     /// (`<agent>:<stage>`), read by `monitor::spawn_monitor` under the
     /// `test-support` gate.
@@ -16885,10 +16895,12 @@ mod tests {
     /// and R2-13. The primary Claude Code stage is rate-limited and hands off
     /// to the unused Codex fallback; the seam withholds the probe answer of
     /// the fallback's Code relaunch only (`codex:code`), so its one publish
-    /// wait expires. The hop then ends visibly: `agent_handoff_relaunch_failed`
-    /// naming the publish wait, then the never-silent Code gate, with no cron
-    /// arm. Nothing is orphaned: the fallback stub's group had a live member
-    /// when it recorded itself (positive control) and has none afterwards.
+    /// wait ends unpublished (in a test build, by the successor's own promotion
+    /// expiry: see [`PUBLISH_WAIT_ENDED_IN_TEST_BUILDS`]). The hop then ends
+    /// visibly: `agent_handoff_relaunch_failed` naming the publish wait's
+    /// `NotReady`, then the never-silent Code gate, with no cron arm. Nothing is
+    /// orphaned: the fallback stub's group had a live member when it recorded
+    /// itself (positive control) and has none afterwards.
     /// Healthy baseline (no intervention, same rig):
     /// [`a_rate_limit_with_a_fallback_hands_off_and_completes_the_same_stage`].
     #[test]
@@ -16946,10 +16958,11 @@ mod tests {
         assert_eq!(failure["stage"], "code", "{failure}");
         assert_eq!(failure["to_agent"], "codex", "{failure}");
         assert!(
-            failure["reason"]
-                .as_str()
-                .is_some_and(|reason| reason.contains("did not publish")),
-            "the failure names the publish wait: {failure}"
+            failure["reason"].as_str().is_some_and(|reason| {
+                reason.contains("supervision shape not ready")
+                    && reason.contains(PUBLISH_WAIT_ENDED_IN_TEST_BUILDS)
+            }),
+            "the failure names the publish wait's NotReady end: {failure}"
         );
         assert!(
             events_named(&run.root, "rate_limit_resume_scheduled").is_empty(),
