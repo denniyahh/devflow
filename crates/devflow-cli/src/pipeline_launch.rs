@@ -3013,9 +3013,13 @@ enum HandoffOutcome {
 /// (44-CORE-REVIEW-FINDINGS.md finding 2b).
 ///
 /// Then ONE commit sets the agent and, for a rate-limit hop, marks the fallback
-/// consumed in the same write (D-05), and `agent_handoff` is emitted. The tree is
-/// handed over as it is (D-10): nothing here resets, stashes, cleans or checks
-/// out the worktree.
+/// consumed in the same write (D-05). The same write clears the recorded delivery
+/// canary and session id (D-04): both are evidence about the previous agent, so
+/// the new one proves its own delivery path. Then `agent_handoff` is emitted with
+/// the tree it hands over: `tree_dirty` and the phase branch's `commit_count`,
+/// each `null` when it could not be measured. The tree is handed over as it is
+/// (D-10): nothing here resets, stashes, cleans or checks out the worktree, and no
+/// commit count is required (D-08).
 fn hand_off_agent(
     project_root: &Path,
     state: &mut State,
@@ -3037,11 +3041,28 @@ fn hand_off_agent(
         return Ok(HandoffOutcome::Refused(HandoffRefusal::Unavailable(err)));
     }
 
+    // D-10: what is handed over, measured before the commit and never touched.
+    // `None` (git could not answer) stays `null` in the event, never a made-up value.
+    let launch_root = state.worktree_path.as_deref().unwrap_or(project_root);
+    let tree_dirty = crate::staleness::run_git_stdout(launch_root, &["status", "--porcelain"])
+        .map(|porcelain| !porcelain.trim().is_empty());
+    let commit_count = agent_result::phase_commit_count(
+        project_root,
+        &devflow_core::config::git_flow_for_run(project_root, state.base_branch.as_deref()),
+        state.phase,
+    );
+
     commit(state, |s| {
         s.agent = to;
         if reason == HandoffReason::RateLimited {
             s.fallback_consumed = true;
         }
+        // D-04: the canary outcome and the session id are evidence about the
+        // agent that produced them. Cleared here, `canary_gate` runs the new
+        // agent's own canary on its first stream launch instead of admitting it
+        // on the previous agent's `Confirmed`.
+        s.canary = None;
+        s.session_id = None;
     })?;
     events::emit(
         project_root,
@@ -3052,6 +3073,8 @@ fn hand_off_agent(
             "from_agent": from.to_string(),
             "to_agent": to.to_string(),
             "reason": reason.as_wire_str(),
+            "tree_dirty": tree_dirty,
+            "commit_count": commit_count,
         }),
     );
     Ok(HandoffOutcome::HandedOff { from })
