@@ -422,7 +422,7 @@ pub(crate) fn apply_legacy_launch_opt_out(state: &mut State, flag: bool) -> bool
 /// Entry-point name recorded in the `auto_chain_flag_repaired` payload by
 /// [`commands::start`](crate::commands::start).
 pub(crate) const AUTO_CHAIN_REPAIR_FROM_START: &str = "start";
-/// Entry-point name recorded by [`resume`].
+/// Entry-point name recorded by [`resume_with_fallback`].
 pub(crate) const AUTO_CHAIN_REPAIR_FROM_RESUME: &str = "resume";
 
 /// Repair a leaked `workflow._auto_chain_active` before this launch spawns
@@ -3099,6 +3099,17 @@ fn fail_over_on_rate_limit(
     }
 }
 
+/// [`resume_with_fallback`] with no `--fallback-agent`: the shorthand the tests use.
+#[cfg(test)]
+pub(crate) fn resume(
+    project_root: &Path,
+    phase: PhaseId,
+    agent: Option<AgentKind>,
+    legacy_claude_launch: bool,
+) -> Result<(), CliError> {
+    resume_with_fallback(project_root, phase, agent, legacy_claude_launch, None)
+}
+
 /// Resume a rate-limited or infra-paused phase from its saved stage (review
 /// consensus #5). Loads the persisted `.devflow/state-{NN}.json` and
 /// relaunches its saved stage via [`launch_stage`] — unlike `start`, this
@@ -3139,12 +3150,14 @@ fn fail_over_on_rate_limit(
 /// D-06: a rerun asks again. Before it relaunches, `resume` closes the phase's gates and
 /// reports each answer it set aside and each claimed answer it found unapplied
 /// ([`close_gates_for_resume`]). It never applies a pending answer to the rerun's gate.
-pub(crate) fn resume(
+pub(crate) fn resume_with_fallback(
     project_root: &Path,
     phase: PhaseId,
     agent: Option<AgentKind>,
     legacy_claude_launch: bool,
+    fallback_agent: Option<AgentKind>,
 ) -> Result<(), CliError> {
+    let _ = fallback_agent;
     let _phase_holder = crate::commands::claim_foreground_holder(project_root, phase)?;
     let reserved = crate::commands::reserve_launch(
         project_root,
@@ -3323,7 +3336,7 @@ fn close_gates_for_resume(
     lines
 }
 
-/// [`resume`] after its reservation: `state` is the copy that wrote, which may already
+/// [`resume_with_fallback`] after its reservation: `state` is the copy that wrote, which may already
 /// be behind the file.
 fn resume_loaded(
     project_root: &Path,
@@ -5780,6 +5793,292 @@ mod tests {
         assert!(!reloaded.stopped);
         assert!(reloaded.supervisor.is_some());
         assert!(!devflow_core::ship::cron_instructions_path(root, phase).exists());
+    }
+
+    /// Run the test `name` in a hermetic child whose `PATH` holds `claude` and `codex`
+    /// stubs, with `extra_env` set on the child only, returning `true` in the parent,
+    /// whose work is done, and `false` in the child.
+    fn parent_of_a_claude_and_codex_child(
+        name: &str,
+        extra_env: &[(&str, &std::ffi::OsStr)],
+    ) -> bool {
+        if devflow_core::test_support::in_child_test(name) {
+            return false;
+        }
+        let path_dir = agent_free_dir_with_agent_stub("claude");
+        add_agent_stub(path_dir.path(), "codex");
+        let output =
+            crate::test_support::run_hermetic_test_in_child(name, path_dir.path(), extra_env);
+        devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, name);
+        true
+    }
+
+    /// A stopped Code-stage run of `phase` under Claude on the capture shape, in a fresh
+    /// repo at `root`, with `fallback` saved as its fallback and `consumed` as its spent mark.
+    fn save_stopped_code_run(
+        root: &Path,
+        phase: PhaseId,
+        fallback: Option<AgentKind>,
+        consumed: bool,
+    ) -> State {
+        init_repo(root);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Code;
+        state.stopped = true;
+        state.stop_reason = Some("rate limited".to_string());
+        state.fallback_agent = fallback;
+        state.fallback_consumed = consumed;
+        // The capture shape: a stub `claude` cannot answer the stream launch's canary.
+        state.legacy_claude_launch = true;
+        workflow::save_state(&state).unwrap();
+        state
+    }
+
+    /// D-01 (re-arm, stopped): `resume --fallback-agent` on a stopped run sets the
+    /// fallback and clears a spent mark.
+    #[test]
+    fn resume_with_a_fallback_agent_rearms_a_consumed_fallback() {
+        const NAME: &str =
+            "pipeline_launch::tests::resume_with_a_fallback_agent_rearms_a_consumed_fallback";
+        if parent_of_a_claude_and_codex_child(NAME, &[]) {
+            return;
+        }
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5144);
+        save_stopped_code_run(root, phase, Some(AgentKind::Codex), true);
+
+        let result = resume_with_fallback(root, phase, None, false, Some(AgentKind::Codex));
+        let reloaded_for_reap = workflow::load_state(root, phase).ok();
+        let _reap_guard = reloaded_for_reap
+            .as_ref()
+            .map(ReapMonitorOnDrop::after_launch);
+        result.unwrap();
+
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        assert!(!reloaded.fallback_consumed, "the spent mark is cleared");
+        assert_eq!(reloaded.fallback_agent, Some(AgentKind::Codex));
+        assert!(!reloaded.stopped);
+        assert!(reloaded.supervisor.is_some(), "the run relaunched");
+    }
+
+    /// D-01 (re-arm, cron-paused): a run the cron arm paused is not stopped, and still
+    /// names the supervisor that exited. `resume --fallback-agent` re-arms it all the same.
+    #[test]
+    fn resume_with_a_fallback_agent_rearms_a_consumed_fallback_on_a_cron_paused_run() {
+        const NAME: &str = "pipeline_launch::tests::\
+                            resume_with_a_fallback_agent_rearms_a_consumed_fallback_on_a_cron_paused_run";
+        if parent_of_a_claude_and_codex_child(NAME, &[]) {
+            return;
+        }
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(5148);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Code;
+        state.fallback_agent = Some(AgentKind::Codex);
+        state.fallback_consumed = true;
+        // The capture shape: a stub `claude` cannot answer the stream launch's canary.
+        state.legacy_claude_launch = true;
+        // The record of the supervisor that exited on the rate limit: the cron arm
+        // leaves it behind, and its socket is gone.
+        const EXITED_LAUNCH: &str = "exited-launch";
+        state.supervisor = Some(SupervisorRecord::new(
+            root.join("gone.sock"),
+            EXITED_LAUNCH.to_string(),
+            1,
+            0,
+            "boot".to_string(),
+        ));
+        workflow::save_state(&state).unwrap();
+        crate::pipeline_outcomes::handle_rate_limited_outcome(
+            root,
+            &mut state,
+            phase,
+            Stage::Code,
+            Some("rate limited until 2026-06-18T15:45:30Z".into()),
+        )
+        .unwrap();
+
+        let paused = workflow::load_state(root, phase).unwrap();
+        let cron = devflow_core::ship::load_cron_instructions(root, phase)
+            .expect("the cron arm wrote cron-instructions-5148.json");
+        assert!(
+            !cron.hermes_cron.schedule.is_empty(),
+            "the cron arm scheduled a resume"
+        );
+        assert!(!paused.stopped, "a cron-paused run is not stopped");
+        assert_eq!(paused.infra_failures, 1);
+        assert_eq!(
+            paused.supervisor.as_ref().map(|r| r.launch_id.as_str()),
+            Some(EXITED_LAUNCH),
+            "the exited supervisor's record is left behind"
+        );
+
+        let result = resume_with_fallback(root, phase, None, false, Some(AgentKind::Codex));
+        let reloaded_for_reap = workflow::load_state(root, phase).ok();
+        let _reap_guard = reloaded_for_reap
+            .as_ref()
+            .filter(|state| {
+                state.supervisor.as_ref().map(|r| r.launch_id.as_str()) != Some(EXITED_LAUNCH)
+            })
+            .map(ReapMonitorOnDrop::after_launch);
+        result.unwrap();
+
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        assert!(!reloaded.fallback_consumed, "the spent mark is cleared");
+        assert_eq!(reloaded.fallback_agent, Some(AgentKind::Codex));
+        assert_eq!(reloaded.agent, AgentKind::Claude);
+        let relaunched = reloaded.supervisor.expect("the run relaunched");
+        assert_ne!(
+            relaunched.launch_id, EXITED_LAUNCH,
+            "a new supervisor replaced the exited one's record"
+        );
+    }
+
+    /// D-05: a plain `resume` leaves a spent fallback spent.
+    #[test]
+    fn resume_without_a_fallback_flag_keeps_a_consumed_fallback_spent() {
+        const NAME: &str = "pipeline_launch::tests::resume_without_a_fallback_flag_keeps_a_consumed_fallback_spent";
+        if parent_of_a_claude_and_codex_child(NAME, &[]) {
+            return;
+        }
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5145);
+        save_stopped_code_run(root, phase, Some(AgentKind::Codex), true);
+
+        let result = resume(root, phase, None, false);
+        let reloaded_for_reap = workflow::load_state(root, phase).ok();
+        let _reap_guard = reloaded_for_reap
+            .as_ref()
+            .map(ReapMonitorOnDrop::after_launch);
+        result.unwrap();
+
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        assert!(reloaded.fallback_consumed, "a plain resume does not re-arm");
+        assert_eq!(reloaded.fallback_agent, Some(AgentKind::Codex));
+        assert!(reloaded.supervisor.is_some(), "the run relaunched");
+    }
+
+    /// The notify command a refusal test saves, and the different one its child's
+    /// environment carries: a refused resume must leave the saved one in place.
+    const SAVED_NOTIFY: &str = "old";
+    const ENV_NOTIFY: &str = "new";
+
+    /// D-02 through `resume --agent`: handing the run to its own unused fallback is
+    /// refused before any write, the notify command included (review B-3).
+    #[test]
+    fn resume_refuses_an_agent_equal_to_the_saved_unused_fallback() {
+        const NAME: &str =
+            "pipeline_launch::tests::resume_refuses_an_agent_equal_to_the_saved_unused_fallback";
+        if parent_of_a_claude_and_codex_child(
+            NAME,
+            &[(
+                devflow_core::gates::GATE_NOTIFY_CMD_ENV,
+                std::ffi::OsStr::new(ENV_NOTIFY),
+            )],
+        ) {
+            return;
+        }
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5146);
+        let mut state = save_stopped_code_run(root, phase, Some(AgentKind::Codex), false);
+        state.gate_notify_cmd = Some(SAVED_NOTIFY.to_string());
+        workflow::save_state(&state).unwrap();
+
+        let result = resume_with_fallback(root, phase, Some(AgentKind::Codex), false, None);
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        let _reap_guard = ReapMonitorOnDrop::after_launch(&reloaded);
+        let err = result
+            .expect_err("handing the run to its own unused fallback is refused")
+            .to_string();
+
+        assert!(
+            err.contains("--agent codex"),
+            "names the requested agent: {err}"
+        );
+        assert!(
+            err.contains("saved unused fallback (codex)"),
+            "names the saved fallback: {err}"
+        );
+        assert_eq!(reloaded.gate_notify_cmd.as_deref(), Some(SAVED_NOTIFY));
+        assert_eq!(reloaded.agent, AgentKind::Claude);
+        assert_eq!(reloaded.fallback_agent, Some(AgentKind::Codex));
+        assert!(!reloaded.fallback_consumed);
+        assert!(reloaded.stopped);
+        assert_eq!(reloaded.supervisor, None, "nothing launched");
+        assert_eq!(
+            reloaded.pending_supervisor, None,
+            "the reservation is given back"
+        );
+    }
+
+    /// D-02 through `resume --fallback-agent`: a fallback equal to the run's agent is
+    /// refused before any write, the notify command included (review B-3). The
+    /// reservation `reserve_launch` writes first is the one write, and it is given back.
+    #[test]
+    fn resume_refuses_a_fallback_equal_to_the_run_agent_before_any_write() {
+        const NAME: &str = "pipeline_launch::tests::\
+                            resume_refuses_a_fallback_equal_to_the_run_agent_before_any_write";
+        if parent_of_a_claude_and_codex_child(
+            NAME,
+            &[(
+                devflow_core::gates::GATE_NOTIFY_CMD_ENV,
+                std::ffi::OsStr::new(ENV_NOTIFY),
+            )],
+        ) {
+            return;
+        }
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5147);
+        let mut state = save_stopped_code_run(root, phase, None, false);
+        state.gate_notify_cmd = Some(SAVED_NOTIFY.to_string());
+        workflow::save_state(&state).unwrap();
+
+        let result = resume_with_fallback(root, phase, None, false, Some(AgentKind::Claude));
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        let _reap_guard = ReapMonitorOnDrop::after_launch(&reloaded);
+        let err = result
+            .expect_err("a fallback equal to the run's agent is refused")
+            .to_string();
+
+        assert!(
+            err.contains("--fallback-agent claude"),
+            "names the fallback: {err}"
+        );
+        assert!(
+            err.contains("run's own agent (claude)"),
+            "names the agent: {err}"
+        );
+        assert_eq!(reloaded.gate_notify_cmd.as_deref(), Some(SAVED_NOTIFY));
+        assert_eq!(reloaded.agent, AgentKind::Claude);
+        assert_eq!(reloaded.fallback_agent, None);
+        assert!(!reloaded.fallback_consumed);
+        assert!(reloaded.stopped);
+        assert_eq!(reloaded.supervisor, None, "nothing launched");
+        assert_eq!(
+            reloaded.pending_supervisor, None,
+            "the reservation is given back"
+        );
     }
 
     /// Regression for 44-CORE-REVIEW-FINDINGS.md finding 2a: `resume` clears
