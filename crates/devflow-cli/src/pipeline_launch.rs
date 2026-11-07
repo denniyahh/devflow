@@ -3104,7 +3104,11 @@ fn fail_over_on_rate_limit(
     reason: Option<String>,
 ) -> Result<(), CliError> {
     match hand_off_agent(project_root, state, to, HandoffReason::RateLimited)? {
-        HandoffOutcome::HandedOff { .. } => launch_stage(state, None, Some(stage)),
+        HandoffOutcome::HandedOff { .. } => {
+            #[cfg(test)]
+            test_hold("after_failover_commit");
+            launch_stage(state, None, Some(stage))
+        }
         HandoffOutcome::Refused(refusal) => {
             events::emit(
                 project_root,
@@ -11550,6 +11554,200 @@ mod tests {
         );
     }
 
+    /// Run `name` in a 50-13 handoff child whose `claude` commits once and is
+    /// rate-limited, beside an `agy` that exits 0 at once (its delivery canary
+    /// reads an empty capture, so `Absent`), held at `after_failover_commit`.
+    fn run_failover_relaunch_child(name: &str) {
+        run_handoff_child_with_stubs(
+            name,
+            Some("after_failover_commit"),
+            SUCCESS_MARKER,
+            &[
+                ("claude", rate_limited_claude_script()),
+                ("agy", "#!/bin/sh\nexit 0\n".to_string()),
+            ],
+        );
+    }
+
+    /// A stage-N Code run under Claude with an unused Antigravity fallback, launched
+    /// by the test and stopping after Code.
+    fn launch_code_run_with_an_antigravity_fallback(phase: PhaseId) -> HandoffRun {
+        HandoffRun::launch_with(phase, |_, state| {
+            state.stage = Stage::Code;
+            state.stop_until = Some(Stage::Code);
+            state.fallback_agent = Some(AgentKind::Antigravity);
+        })
+    }
+
+    /// D-04 (never silent) with R2-D1, inside a running supervisor with the D-03
+    /// fence active: a handoff commit followed by a relaunch that fails (the
+    /// fallback's own delivery canary reads `Absent`, a real production refusal)
+    /// emits `agent_handoff_relaunch_failed` and ends at the never-silent Code gate,
+    /// opened by the supervisor the state records. Not the cron arm: a recorded
+    /// `Absent` refuses every later launch, so a scheduled resume cannot succeed.
+    ///
+    /// Non-vacuity: `wait_held` returns only because `test_hold` reached
+    /// `after_failover_commit`, which it does only inside an engaged supervisor
+    /// advance, so the writes below were fenced.
+    #[test]
+    fn a_handoff_whose_relaunch_fails_ends_at_a_gate() {
+        const NAME: &str = "pipeline_launch::tests::a_handoff_whose_relaunch_fails_ends_at_a_gate";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_failover_relaunch_child(NAME);
+            return;
+        }
+        let _guard = env_lock();
+        let run = launch_code_run_with_an_antigravity_fallback(PhaseId::new(5169));
+        run.go();
+        run.wait_held();
+        run.release();
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || {
+                events_named(&run.root, "gate_fired")
+                    .iter()
+                    .any(|gate| gate["stage"] == "code")
+            }),
+            "no Code gate fired; events:\n{}",
+            run.events()
+        );
+
+        let events = all_events(&run.root);
+        let position = |name: &str| events.iter().position(|e| e["event"] == name);
+        let handed = position("agent_handoff").expect("the handoff committed");
+        let failed = position("agent_handoff_relaunch_failed")
+            .unwrap_or_else(|| panic!("no relaunch-failure event; events:\n{}", run.events()));
+        let gated = position("gate_fired").expect("polled above");
+        assert!(
+            handed < failed && failed < gated,
+            "handoff, then the failure, then the gate; events:\n{}",
+            run.events()
+        );
+        let handoff = &events[handed];
+        assert_eq!(handoff["stage"], "code", "{handoff}");
+        assert_eq!(handoff["to_agent"], "antigravity", "{handoff}");
+        assert_eq!(handoff["reason"], "rate_limited", "{handoff}");
+        let failure = &events[failed];
+        assert_eq!(failure["stage"], "code", "{failure}");
+        assert_eq!(failure["to_agent"], "antigravity", "{failure}");
+        assert!(
+            failure["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("ABSENT")),
+            "the failure names the canary's refusal: {failure}"
+        );
+        assert!(
+            events[gated]["context"]
+                .as_str()
+                .is_some_and(|context| context.contains("handoff to antigravity")),
+            "the gate names the fallback: {}",
+            events[gated]
+        );
+        assert!(
+            events[handed..]
+                .iter()
+                .all(|event| event["event"] != "stage_launched"),
+            "nothing launched after the handoff; events:\n{}",
+            run.events()
+        );
+        assert!(
+            events_named(&run.root, "rate_limit_resume_scheduled").is_empty(),
+            "a failed relaunch never takes the cron arm (R2-D1)"
+        );
+        assert!(
+            !devflow_core::ship::cron_instructions_path(&run.root, run.phase).exists(),
+            "a failed relaunch writes no cron instruction (R2-D1)"
+        );
+        assert!(
+            events_named(&run.root, "supervisor_superseded").is_empty(),
+            "the supervisor kept its own run; events:\n{}",
+            run.events()
+        );
+
+        let state = run.state();
+        assert_eq!(state.agent, AgentKind::Antigravity);
+        assert!(state.fallback_consumed);
+        assert_eq!(
+            state.infra_failures, 1,
+            "handle_infra_outcome's one bump; the hop itself charges nothing (D-06)"
+        );
+        assert_eq!(state.canary, Some(canary::CanaryOutcome::Absent));
+        assert!(state.gate_pending, "the never-silent gate is open");
+        assert!(Gates::gate_path(&run.root, run.phase, Stage::Code).exists());
+        assert_eq!(
+            state
+                .supervisor
+                .as_ref()
+                .map(|record| record.launch_id.as_str()),
+            Some(run.n.launch_id.as_str()),
+            "the supervisor waiting at the gate is the run's recorded owner"
+        );
+    }
+
+    /// Phase 50 D-03 is intact: a supervisor that another launch replaced between
+    /// the handoff commit and the relaunch writes nothing. Its relaunch's first
+    /// owned write is refused with `NotOwner`, which `fail_over_on_rate_limit`
+    /// returns unchanged, so it ends superseded naming the newer launch: no
+    /// relaunch-failure event, no gate, no cron arm, and the newer record intact.
+    /// Paired with [`a_handoff_whose_relaunch_fails_ends_at_a_gate`], this tells a
+    /// real replacement (`recorded` names another launch) from a self-inflicted one.
+    #[test]
+    fn a_failover_superseded_mid_relaunch_writes_nothing() {
+        const NAME: &str =
+            "pipeline_launch::tests::a_failover_superseded_mid_relaunch_writes_nothing";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_failover_relaunch_child(NAME);
+            return;
+        }
+        let _guard = env_lock();
+        const NEWER: &str = "newer-supervisor";
+        let run = launch_code_run_with_an_antigravity_fallback(PhaseId::new(5170));
+        run.go();
+        run.wait_held();
+        let mut newer = run.n.clone();
+        newer.launch_id = NEWER.to_string();
+        newer.socket_path = run.root.join("newer-supervisor.sock");
+        workflow::update_state(&run.root, run.phase, |s| {
+            s.supervisor = Some(newer);
+            Ok::<(), workflow::WorkflowError>(())
+        })
+        .unwrap();
+        run.release();
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || {
+                !events_named(&run.root, "supervisor_superseded").is_empty()
+            }),
+            "the replaced supervisor never ended superseded; events:\n{}",
+            run.events()
+        );
+
+        let superseded = events_named(&run.root, "supervisor_superseded");
+        assert_eq!(superseded.len(), 1, "{superseded:?}");
+        assert_eq!(superseded[0]["ours"], run.n.launch_id.as_str());
+        assert_eq!(superseded[0]["recorded"], NEWER);
+        for name in [
+            "agent_handoff_relaunch_failed",
+            "gate_fired",
+            "rate_limit_resume_scheduled",
+        ] {
+            assert!(
+                events_named(&run.root, name).is_empty(),
+                "a replaced supervisor emits no {name}; events:\n{}",
+                run.events()
+            );
+        }
+        assert!(!devflow_core::ship::cron_instructions_path(&run.root, run.phase).exists());
+        let state = run.state();
+        assert!(!state.gate_pending);
+        assert_eq!(
+            state
+                .supervisor
+                .as_ref()
+                .map(|record| record.launch_id.as_str()),
+            Some(NEWER),
+            "the newer launch's record is untouched"
+        );
+    }
+
     /// Send `shutdown` to the supervisor at `socket` on the wire, wait for
     /// its `accepted` line (returned first), run `then`, and return the final
     /// line read within `final_wait`. Unlike `request_shutdown`, the caller
@@ -13375,6 +13573,8 @@ mod tests {
     const CLEAR_REFUSE_NOT_FOUND: &str =
         "refuse_launch not found in the non-test code (or under 3 lines)";
     const CLEAR_REFUSE_NO_CLEAR: &str = "refuse_launch does not clear the supervisor record";
+    const CLEAR_GUARD_OUTSIDE_FAILOVER: &str =
+        "FailoverRelaunchGuard::engage( is called outside fail_over_on_rate_limit";
 
     /// 50-13's rule as a pure scan over `source` (R6-G4): in the non-test,
     /// comment-stripped code, `spawn_agent_and_record` never clears the
@@ -13474,6 +13674,40 @@ mod tests {
             )),
             only(CLEAR_SPAWN_NOT_FOUND),
             "a body under its floor"
+        );
+
+        // The failover guard keeps the record through one relaunch only, so it is
+        // engaged in `fail_over_on_rate_limit` and nowhere else. Only a line's code
+        // part counts: the text before its first `//` outside a string literal.
+        let good = format!("{good_spawn}{good_refuse}");
+        let engage = "FailoverRelaunchGuard::engage(";
+        assert_eq!(
+            launch_record_clear_violations(&format!(
+                "{good}fn fail_over_on_rate_limit(\n    let _keep = {engage});\n}}\n"
+            )),
+            Vec::<String>::new(),
+            "the one sanctioned site"
+        );
+        assert_eq!(
+            launch_record_clear_violations(&format!(
+                "{good}fn other() {{\n    let _keep = {engage});\n}}\n"
+            )),
+            only(CLEAR_GUARD_OUTSIDE_FAILOVER),
+            "an engage call in another fn"
+        );
+        assert_eq!(
+            launch_record_clear_violations(&format!(
+                "{good}fn other() {{\n    let u = \"http://x\"; {engage});\n}}\n"
+            )),
+            only(CLEAR_GUARD_OUTSIDE_FAILOVER),
+            "a `//` inside a string literal does not end the code part"
+        );
+        assert_eq!(
+            launch_record_clear_violations(&format!(
+                "{good}fn other() {{\n    let x = 1; // {engage} stays in failover\n}}\n"
+            )),
+            Vec::<String>::new(),
+            "a trailing comment is not a call"
         );
     }
 
