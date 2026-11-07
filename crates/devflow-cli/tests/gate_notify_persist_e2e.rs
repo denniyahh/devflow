@@ -6,7 +6,9 @@
 //! - `advance_*` arms: a gate fired by `devflow advance` runs the persisted
 //!   command when the variable is unset, an empty variable disables it, and a
 //!   set variable overrides it; each also checks what is saved afterwards.
-//! - `resume_*` arms: `devflow resume` replaces or clears the saved command.
+//! - `resume_*` arms: `devflow resume` replaces or clears the saved command,
+//!   and keeps it when the variable is unset (read after the first
+//!   `stage_launched` event, with an empty-variable control on that waiter).
 //! - `agent_*` arms: the coding agent never receives the variable. The legacy
 //!   arm reaches the agent through the detached `sh` monitor, so it also shows
 //!   that chain does not carry it; the default (pipe-owning) arm reaches the
@@ -356,19 +358,37 @@ fn advance_gate_with_an_empty_variable_skips_the_persisted_command() {
     );
 }
 
-/// CR-03 (49-REVIEW.md): `devflow resume` applies the variable to the run's
-/// persisted command, so a command exported (or emptied) after `start`
-/// reaches the chain it launches.
-fn resume_with(notify: NotifyEnv<'_>) -> Option<String> {
+/// The shared `devflow resume` fixture: a run saved in `mode` with
+/// `gate_notify_cmd = Some("old")` and `stopped == false`, resumed with
+/// `notify` applied to the spawned child only. `observe` runs while the child,
+/// its launched run and every marked process are still owned, and its result
+/// is returned once they are reaped.
+///
+/// In `Mode::Auto` this fixture (no `.planning/config.json`, legacy launch)
+/// parks at the Define preflight gate (D-07) before any stage is launched; in
+/// `Mode::Supervise` the same preflight reports and proceeds (D-08), so the
+/// stage launches and `stage_launched` is emitted.
+fn with_spawned_resume<T>(
+    mode: Mode,
+    notify: NotifyEnv<'_>,
+    observe: impl FnOnce(&Path, PhaseId, &mut ParkedChild) -> T,
+) -> T {
     let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(97);
     init_start_repo(root, phase);
-    let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+    let mut state = State::new(phase, AgentKind::Claude, mode, root.to_path_buf());
     state.gate_notify_cmd = Some("old".to_string());
     state.verification_baseline_captured = true;
     devflow_core::workflow::save_state(&state).unwrap();
+    // The post-commit waiter's marker must not be stale: nothing in the
+    // fixture has launched a stage before `resume` is spawned.
+    assert_eq!(
+        stage_launched_events(root),
+        0,
+        "the fixture must hold no stage_launched event before resume is spawned"
+    );
     let fake_bin = fake_bin_dir();
     let _reaper = MarkedReaper(root.to_string_lossy().into_owned());
     let existing = std::env::var_os("PATH").unwrap_or_default();
@@ -389,21 +409,84 @@ fn resume_with(notify: NotifyEnv<'_>) -> Option<String> {
     apply_notify_env(&mut command, notify);
     let mut resume = ParkedChild(command.spawn().expect("spawn resume"));
     let _run_reaper = common::LaunchedRunReaper::new(root, phase, Vec::new());
+    observe(root, phase, &mut resume)
+}
+
+/// CR-03 (49-REVIEW.md): `devflow resume` applies the variable to the run's
+/// persisted command, so a command exported (or emptied) after `start`
+/// reaches the chain it launches.
+fn resume_with(notify: NotifyEnv<'_>) -> Option<String> {
+    with_spawned_resume(Mode::Auto, notify, |root, phase, resume| {
+        let waited = Instant::now();
+        loop {
+            let saved = persisted_cmd(root, phase);
+            if saved.as_deref() != Some("old") {
+                return saved;
+            }
+            if let Some(status) = resume.0.try_wait().expect("poll resume") {
+                panic!("resume exited ({status:?}) without updating the persisted command");
+            }
+            assert!(
+                waited.elapsed() < Duration::from_secs(20),
+                "timed out waiting for resume to update the persisted command"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    })
+}
+
+/// The `stage_launched` events in the run's event log (none when the log does
+/// not exist yet).
+fn stage_launched_events(root: &Path) -> usize {
+    let events = root.join(".devflow").join("events.jsonl");
+    let Ok(text) = fs::read_to_string(&events) else {
+        return 0;
+    };
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|line| line["event"] == "stage_launched")
+        .count()
+}
+
+/// Waits (bounded, 20 s) for the first `stage_launched` event. `resume`
+/// emits it in `spawn_agent_and_record` after the successor's publish, which
+/// runs after `resume_loaded` has passed `commit_notify_env`, so a read after
+/// this returns sees whatever `resume` saved. A `resume` that exits without
+/// the event, or a marker that never appears, panics with the event log.
+fn wait_for_first_stage_launched(root: &Path, resume: &mut ParkedChild) {
+    let events = root.join(".devflow").join("events.jsonl");
+    let log = || fs::read_to_string(&events).unwrap_or_else(|err| format!("<unreadable: {err}>"));
     let waited = Instant::now();
     loop {
-        let saved = persisted_cmd(root, phase);
-        if saved.as_deref() != Some("old") {
-            return saved;
+        if stage_launched_events(root) > 0 {
+            return;
         }
         if let Some(status) = resume.0.try_wait().expect("poll resume") {
-            panic!("resume exited ({status:?}) without updating the persisted command");
+            // The event may land just before the exit; read once more.
+            if stage_launched_events(root) > 0 {
+                return;
+            }
+            panic!(
+                "resume exited ({status:?}) before any stage_launched event; events:\n{}",
+                log()
+            );
         }
         assert!(
             waited.elapsed() < Duration::from_secs(20),
-            "timed out waiting for resume to update the persisted command"
+            "timed out after 20s waiting for stage_launched; events:\n{}",
+            log()
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// The saved notify command, read once `resume` has launched its stage (in
+/// supervise mode, so the fixture's Define stage launches rather than parks).
+fn saved_after_first_stage_launched(notify: NotifyEnv<'_>) -> Option<String> {
+    with_spawned_resume(Mode::Supervise, notify, |root, phase, resume| {
+        wait_for_first_stage_launched(root, resume);
+        persisted_cmd(root, phase)
+    })
 }
 
 #[test]
@@ -414,6 +497,24 @@ fn resume_replaces_the_persisted_command_with_a_set_variable() {
 #[test]
 fn resume_with_an_empty_variable_clears_the_persisted_command() {
     assert_eq!(resume_with(NotifyEnv::Set("")), None);
+}
+
+/// 49-REVIEW.md WR-13: the arm a scheduled rate-limit resume takes. With the
+/// variable unset, `resume` keeps the run's saved command.
+#[test]
+fn resume_with_the_variable_unset_keeps_the_saved_command() {
+    assert_eq!(
+        saved_after_first_stage_launched(NotifyEnv::Unset).as_deref(),
+        Some("old"),
+        "resume with DEVFLOW_GATE_NOTIFY_CMD unset must keep the saved notify command"
+    );
+}
+
+/// Control for the waiter above: the same waiter sees an empty variable's
+/// clear, so it reads after `resume`'s save rather than before it.
+#[test]
+fn resume_with_an_empty_variable_is_seen_cleared_by_the_post_commit_waiter() {
+    assert_eq!(saved_after_first_stage_launched(NotifyEnv::Set("")), None);
 }
 
 /// Set on every spawned `start` to the fixture root, so the processes that
