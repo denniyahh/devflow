@@ -3026,6 +3026,84 @@ mod tests {
         assert_eq!(after.stage, Stage::Validate, "the transition's own write");
     }
 
+    /// A PATH dir whose `claude` waits (bounded, about 60 s) for a file that never
+    /// appears, with `sleep` for that wait, so a stage launched onto it stays
+    /// running and its supervisor writes no state while the test reads it.
+    fn waiting_claude_dir() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let path_dir = agent_free_dir_with_agent_stub("claude");
+        let path = path_dir.path().join("claude");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\ncase \"$1\" in --version) exit 0 ;; esac\n\
+             i=0\nwhile [ ! -e never-released ] && [ \"$i\" -lt 1200 ]; do sleep 0.05; i=$((i+1)); done\n\
+             exit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let real_sleep = ["/usr/bin/sleep", "/bin/sleep"]
+            .into_iter()
+            .map(Path::new)
+            .find(|path| path.is_file())
+            .expect("sleep must exist to run this test");
+        std::os::unix::fs::symlink(real_sleep, path_dir.path().join("sleep")).unwrap();
+        path_dir
+    }
+
+    /// D-09: a fix type lives exactly as long as its Code pass. Both of
+    /// `transition`'s commits clear it: (a) the `--until` stop after Code (a run
+    /// halted after its Code pass is no longer mid-fix) and (b) the ordinary move
+    /// to Validate, which then launches Validate.
+    #[test]
+    fn a_transition_clears_the_persisted_code_fix() {
+        const NAME: &str = "pipeline_gate::tests::a_transition_clears_the_persisted_code_fix";
+        enter_path_isolated_child!(NAME, waiting_claude_dir());
+        let _guard = env_lock();
+        let code_state = |root: &Path, phase: PhaseId| {
+            init_repo(root);
+            let mut state = State::new(
+                phase,
+                AgentKind::Claude,
+                Mode::Supervise,
+                root.to_path_buf(),
+            );
+            state.stage = Stage::Code;
+            state.code_fix = Some(FixType::GapsOnly);
+            state.legacy_claude_launch = true;
+            state
+        };
+
+        let until_dir = tempfile::tempdir().unwrap();
+        let until_root = until_dir.path();
+        let until_phase = PhaseId::new(5172);
+        let mut state = code_state(until_root, until_phase);
+        state.stop_until = Some(Stage::Code);
+        workflow::save_state(&state).unwrap();
+        transition(until_root, &mut state, Stage::Validate).unwrap();
+        let halted = workflow::load_state(until_root, until_phase).unwrap();
+        assert!(halted.stopped, "the --until stop fired");
+        assert_eq!(
+            halted.code_fix, None,
+            "a run halted after its Code pass is no longer mid-fix"
+        );
+
+        let moved_dir = tempfile::tempdir().unwrap();
+        let moved_root = moved_dir.path();
+        let moved_phase = PhaseId::new(5174);
+        let mut state = code_state(moved_root, moved_phase);
+        workflow::save_state(&state).unwrap();
+        let result = transition(moved_root, &mut state, Stage::Validate);
+        let moved = workflow::load_state(moved_root, moved_phase).unwrap();
+        let _reap_guard = ReapMonitorOnDrop::after_launch(&moved);
+        result.unwrap();
+        assert_eq!(moved.stage, Stage::Validate);
+        assert!(moved.supervisor.is_some(), "Validate was launched");
+        assert_eq!(
+            moved.code_fix, None,
+            "the transition out of Code clears the fix pass"
+        );
+    }
+
     /// A loop-back writes its stage move and the verification observation
     /// `select_loop_back_fix` recorded (F-11: this is the write that persists it), and
     /// keeps a field another writer changed since the caller loaded its copy.

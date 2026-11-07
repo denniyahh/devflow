@@ -14021,6 +14021,82 @@ mod tests {
         );
     }
 
+    /// Resume a stopped Code run of `phase` at `root` under Claude whose Code pass
+    /// was entered with `fix`, and return the argv the spawned `claude` received
+    /// and a reaper for its monitor. `legacy_claude_launch` puts the prompt in argv.
+    fn resume_code_run(
+        root: &Path,
+        phase: PhaseId,
+        fix: Option<prompt::FixType>,
+    ) -> (Vec<String>, ReapMonitorOnDrop) {
+        init_repo(root);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Code;
+        state.code_fix = fix;
+        state.legacy_claude_launch = true;
+        state.stopped = true;
+        state.stop_reason = Some("rate limited".to_string());
+        workflow::save_state(&state).unwrap();
+
+        let result = resume(root, phase, None, false);
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        let reap = ReapMonitorOnDrop::after_launch(&reloaded);
+        result.unwrap();
+        assert_eq!(reloaded.code_fix, fix, "a resume keeps the fix pass");
+        (recorded_argv(root, "claude"), reap)
+    }
+
+    /// D-09: a `devflow resume` in the middle of an audit-fix pass (the cron arm's
+    /// later resume) relaunches that pass, asserted on the argv the spawned
+    /// `claude` received. Control: the same resume with no fix pass recorded
+    /// delivers the plain execute-phase prompt.
+    #[test]
+    fn a_resume_mid_audit_fix_replays_audit_fix() {
+        const NAME: &str = "pipeline_launch::tests::a_resume_mid_audit_fix_replays_audit_fix";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = argv_recording_agents_dir();
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let _guard = env_lock();
+        let claude = agents::driver_for(AgentKind::Claude);
+        let code_prompt = |phase: PhaseId, fix: Option<prompt::FixType>| {
+            claude.render_prompt(&prompt::StageIntent::Code { phase, fix })
+        };
+
+        let fix_dir = tempfile::tempdir().unwrap();
+        let fix_phase = PhaseId::new(5173);
+        let (argv, _reap_fix) =
+            resume_code_run(fix_dir.path(), fix_phase, Some(prompt::FixType::AuditFix));
+        assert!(
+            argv.contains(&code_prompt(fix_phase, Some(prompt::FixType::AuditFix))),
+            "the resumed agent receives the audit-fix pass: {argv:?}"
+        );
+        assert!(
+            !argv.contains(&code_prompt(fix_phase, None)),
+            "the resumed agent does not receive the plain execute-phase prompt: {argv:?}"
+        );
+
+        let plain_dir = tempfile::tempdir().unwrap();
+        let plain_phase = PhaseId::new(5176);
+        let (argv, _reap_plain) = resume_code_run(plain_dir.path(), plain_phase, None);
+        assert!(
+            argv.contains(&code_prompt(plain_phase, None)),
+            "control: a plain resume delivers execute-phase: {argv:?}"
+        );
+        assert!(
+            !argv.contains(&code_prompt(plain_phase, Some(prompt::FixType::AuditFix))),
+            "control: a plain resume delivers no fix prompt: {argv:?}"
+        );
+    }
+
     // ---- 51-07: one place renders a no-override stage prompt (D-09, review B-1) ----
 
     const DEFAULT_RENDER_NEEDLE: &str = concat!("for_stage_in_", "project(");
