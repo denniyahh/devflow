@@ -482,8 +482,21 @@ pub struct State {
     /// written by a binary predating this field" — both behave identically.
     #[serde(default)]
     pub fallback_consumed: bool,
-    /// RED stub (51-07): replaced by the persisted field in the GREEN commit.
-    #[serde(skip)]
+    /// The fix type of the Code pass in flight (Phase 51 D-09).
+    ///
+    /// Set by a loop-back to Code in the same write that enters Code, and
+    /// cleared by every transition, so it lives exactly as long as its Code
+    /// pass. A same-stage relaunch with no prompt override (a rate-limit
+    /// failover, a `devflow resume`, an `Ambiguous` re-drive) replays it,
+    /// rendered by the CURRENT agent's driver.
+    ///
+    /// It holds the type, never a rendered prompt, because renderers differ
+    /// per driver: a Claude slash command must never reach Codex or Pi.
+    ///
+    /// `None` means EITHER "a plain Code pass, or not at Code" OR "the state was
+    /// written by a binary predating this field" — both relaunch the stage's
+    /// default prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_fix: Option<crate::prompt::FixType>,
 }
 

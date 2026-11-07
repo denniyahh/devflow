@@ -126,6 +126,30 @@ fn stamp_validate_dispatch_window(state: &mut State) {
     state.verification_baseline_captured = true;
 }
 
+/// The prompt a launch with no override gives the agent, rendered by `driver`
+/// (Phase 51 D-09). At Code it replays the persisted fix pass
+/// ([`State::code_fix`]), so a same-stage relaunch inside an audit-fix,
+/// gaps-only or full-execute pass continues that pass; every other stage gets
+/// its default intent. The fix TYPE is persisted and rendered here, at launch,
+/// so after a handoff the fallback's own renderer is used.
+///
+/// The only place a default stage prompt is rendered:
+/// [`launch_stage_inner`] (whose prompt the agent receives) and
+/// [`launch_stage`] (which resolves the program from it) both call this, which
+/// `every_no_override_launch_renders_through_default_stage_prompt` pins.
+fn default_stage_prompt(state: &State, driver: &dyn agents::AgentDriver) -> String {
+    let intent = match state.stage {
+        Stage::Code => prompt::StageIntent::Code {
+            phase: state.phase,
+            fix: state.code_fix,
+        },
+        stage => {
+            prompt::StageIntent::for_stage_in_project(stage, state.phase, Some(&state.project_root))
+        }
+    };
+    driver.render_prompt(&intent)
+}
+
 /// Recomputes `prompt`/`adapter`/`roots`/`program`/`args` from `state` and
 /// `prompt_override` — deliberately NOT threaded through as parameters.
 /// They are pure functions of `state` and the prompt override; recomputing
@@ -140,13 +164,7 @@ pub(crate) fn launch_stage_inner(
     archived_stage: Option<Stage>,
 ) -> Result<(), CliError> {
     let driver = agents::driver_for(state.agent);
-    let prompt = prompt_override.unwrap_or_else(|| {
-        driver.render_prompt(&prompt::StageIntent::for_stage_in_project(
-            state.stage,
-            state.phase,
-            Some(&state.project_root),
-        ))
-    });
+    let prompt = prompt_override.unwrap_or_else(|| default_stage_prompt(state, driver.as_ref()));
     // In worktree mode the agent's cwd is the linked worktree, but git
     // metadata for commits lives under the main repo's `.git/` — sandboxed
     // agents need it (and the worktree admin dir, which Codex read-only-
@@ -2923,13 +2941,9 @@ pub(crate) fn launch_stage(
     archived_stage: Option<Stage>,
 ) -> Result<(), CliError> {
     let driver = agents::driver_for(state.agent);
-    let prompt = prompt_override.clone().unwrap_or_else(|| {
-        driver.render_prompt(&prompt::StageIntent::for_stage_in_project(
-            state.stage,
-            state.phase,
-            Some(&state.project_root),
-        ))
-    });
+    let prompt = prompt_override
+        .clone()
+        .unwrap_or_else(|| default_stage_prompt(state, driver.as_ref()));
     let roots = state
         .worktree_path
         .as_deref()
