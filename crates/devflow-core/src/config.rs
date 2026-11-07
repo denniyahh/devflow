@@ -8,6 +8,8 @@
 
 use std::path::Path;
 
+use crate::state::AgentKind;
+
 /// Number of capture generations retained when not otherwise configured.
 ///
 /// **The number is arithmetic, not a round guess** (ROADMAP criterion 7).
@@ -480,6 +482,12 @@ pub fn git_flow_for_run(project_root: &Path, persisted_base: Option<&str>) -> Gi
         }
         None => git_flow_for_project(project_root),
     }
+}
+
+/// RED stub: the resolver's contract is pinned by
+/// `fallback_agent_key_resolves_from_devflow_toml`.
+pub fn fallback_agent(_project_root: &Path) -> Result<Option<AgentKind>, String> {
+    Ok(None)
 }
 
 fn env_value(key: &str) -> Option<String> {
@@ -1004,5 +1012,45 @@ mod tests {
         // everything and every `Err` assertion above would still pass.
         assert!(validate_base_branch("workspace/example").is_ok());
         assert!(validate_base_branch(DEVELOP).is_ok());
+    }
+
+    /// R-3 (Phase 51): the standing `fallback_agent` key. No file and no key
+    /// arm nothing; an agent name resolves; a value that names no agent, or a
+    /// file that does not parse, is an error naming the key and the file
+    /// rather than a silently unarmed fallback.
+    #[test]
+    fn fallback_agent_key_resolves_from_devflow_toml() {
+        let resolve = |contents: Option<&str>| {
+            let dir = tempfile::tempdir().unwrap();
+            if let Some(contents) = contents {
+                std::fs::write(dir.path().join("devflow.toml"), contents).unwrap();
+            }
+            fallback_agent(dir.path())
+        };
+
+        assert_eq!(resolve(None), Ok(None), "no devflow.toml arms nothing");
+        assert_eq!(
+            resolve(Some("yes_ship = true\n")),
+            Ok(None),
+            "a file without the key arms nothing"
+        );
+        assert_eq!(
+            resolve(Some("fallback_agent = \"codex\"\n")),
+            Ok(Some(AgentKind::Codex)),
+            "an agent name resolves to that agent"
+        );
+
+        let unknown = resolve(Some("fallback_agent = \"nosuch\"\n"))
+            .expect_err("a value naming no agent is refused");
+        assert!(
+            unknown.contains("fallback_agent") && unknown.contains("devflow.toml"),
+            "the refusal names the key and the file: {unknown}"
+        );
+
+        let unparseable = resolve(Some("fallback_agent = \n"));
+        assert!(
+            unparseable.is_err(),
+            "a file that does not parse is refused, not read as no key: {unparseable:?}"
+        );
     }
 }
