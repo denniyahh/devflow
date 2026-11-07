@@ -11116,6 +11116,229 @@ mod tests {
         assert!(!reloaded.fallback_consumed);
     }
 
+    // ---- 51-06: what crosses the hop, and its boundaries at Code ----
+
+    /// Ignore `.devflow/` in the repo at `root` and commit that on the current
+    /// branch, so the run's own state and capture files do not make the tree read
+    /// dirty: what `git status --porcelain` then reports is the agent's work alone.
+    fn ignore_devflow_dir(root: &Path) {
+        std::fs::write(root.join(".gitignore"), ".devflow/\n").unwrap();
+        git_out(root, &["add", ".gitignore"]);
+        git_out(root, &["commit", "-q", "-m", "ignore .devflow"]);
+    }
+
+    /// A PATH dir holding a no-op `claude`, a `codex` that waits (bounded, about
+    /// 60 s) for a file that never appears, and `sleep` for that wait. A fallback
+    /// relaunched onto this `codex` stays running, so its supervisor makes no
+    /// further state write while the test reads the state.
+    fn waiting_codex_dir() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let path_dir = agent_free_dir_with_agent_stub("claude");
+        let codex = path_dir.path().join("codex");
+        std::fs::write(
+            &codex,
+            "#!/bin/sh\ncase \"$1\" in --version) exit 0 ;; esac\n\
+             i=0\nwhile [ ! -e never-released ] && [ \"$i\" -lt 1200 ]; do sleep 0.05; i=$((i+1)); done\n\
+             exit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let real_sleep = ["/usr/bin/sleep", "/bin/sleep"]
+            .into_iter()
+            .map(Path::new)
+            .find(|path| path.is_file())
+            .expect("sleep must exist to run this test");
+        std::os::unix::fs::symlink(real_sleep, path_dir.path().join("sleep")).unwrap();
+        path_dir
+    }
+
+    /// D-04: delivery-canary evidence is per agent. The handoff commit clears the
+    /// recorded canary and Claude session id, so an Antigravity fallback whose own
+    /// canary reads `Absent` is refused, after exactly one canary run, instead of
+    /// launching on Claude's `Confirmed`. Control first: with no handoff, the same
+    /// recorded `Confirmed` admits an Antigravity launch without running a canary,
+    /// so the refusal below is the handoff's doing.
+    #[test]
+    fn a_handoff_reruns_the_delivery_canary_for_the_new_agent() {
+        const NAME: &str =
+            "pipeline_launch::tests::a_handoff_reruns_the_delivery_canary_for_the_new_agent";
+        enter_agent_free_child!(NAME, "agy");
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(5161);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Code;
+        state.canary = Some(canary::CanaryOutcome::Confirmed);
+        state.session_id = Some("s1".to_string());
+        workflow::save_state(&state).unwrap();
+
+        let calls = std::cell::Cell::new(0usize);
+        let mut without_handoff = state.clone();
+        without_handoff.agent = AgentKind::Antigravity;
+        canary_gate(
+            &mut without_handoff,
+            true,
+            counting_canary(&calls, canary::CanaryOutcome::Absent),
+        )
+        .expect("control: a recorded Confirmed admits the launch");
+        assert_eq!(
+            calls.get(),
+            0,
+            "control: a recorded outcome is reused, never re-run"
+        );
+
+        let outcome = hand_off_agent(
+            root,
+            &mut state,
+            AgentKind::Antigravity,
+            HandoffReason::RateLimited,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            HandoffOutcome::HandedOff {
+                from: AgentKind::Claude
+            }
+        );
+        let mut reloaded = workflow::load_state(root, phase).unwrap();
+        assert_eq!(reloaded.agent, AgentKind::Antigravity);
+        assert_eq!(
+            reloaded.canary, None,
+            "the primary's canary evidence does not cross the hop"
+        );
+        assert_eq!(
+            reloaded.session_id, None,
+            "the primary's session id does not cross the hop"
+        );
+
+        let refused = canary_gate(
+            &mut reloaded,
+            true,
+            counting_canary(&calls, canary::CanaryOutcome::Absent),
+        );
+        assert_eq!(calls.get(), 1, "the fallback's own canary ran once");
+        let message = refused
+            .expect_err("an Absent canary for the fallback refuses its launch")
+            .to_string();
+        assert!(message.contains("ABSENT"), "{message}");
+    }
+
+    /// D-10: the `agent_handoff` event records the tree it hands over, measured
+    /// before the commit: `tree_dirty` from `git status --porcelain` at the launch
+    /// root and `commit_count` from the phase branch. `.devflow/` is ignored, so
+    /// the dirt is the untracked file alone, and the handoff leaves that file in
+    /// place (nothing is reset, stashed or cleaned).
+    #[test]
+    fn the_handoff_event_records_the_tree_it_hands_over() {
+        const NAME: &str =
+            "pipeline_launch::tests::the_handoff_event_records_the_tree_it_hands_over";
+        enter_agent_free_child!(NAME, "codex");
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        ignore_devflow_dir(root);
+        let phase = PhaseId::new(5162);
+        let git_flow = devflow_core::config::git_flow_for_run(root, None);
+        let branch = format!("{}phase-{}", git_flow.feature_prefix, phase.padded());
+        git_out(root, &["checkout", "-q", "-b", &branch]);
+        git_out(root, &["commit", "-q", "--allow-empty", "-m", "first"]);
+        git_out(root, &["commit", "-q", "--allow-empty", "-m", "second"]);
+        let untracked = root.join("untracked-work.txt");
+        std::fs::write(&untracked, "half-done\n").unwrap();
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Code;
+        workflow::save_state(&state).unwrap();
+
+        let outcome =
+            hand_off_agent(root, &mut state, AgentKind::Codex, HandoffReason::RateLimited)
+                .unwrap();
+        assert_eq!(
+            outcome,
+            HandoffOutcome::HandedOff {
+                from: AgentKind::Claude
+            }
+        );
+
+        let handoffs = events_named(root, "agent_handoff");
+        assert_eq!(handoffs.len(), 1, "{handoffs:?}");
+        assert_eq!(handoffs[0]["tree_dirty"], true, "{}", handoffs[0]);
+        assert_eq!(handoffs[0]["commit_count"], 2, "{}", handoffs[0]);
+        assert_eq!(
+            std::fs::read_to_string(&untracked).unwrap(),
+            "half-done\n",
+            "the untracked file is handed over as it was"
+        );
+    }
+
+    /// D-08: a Code rate limit with nothing committed on the phase branch still
+    /// hands off, through a real `advance`, and the event says so: `commit_count:
+    /// 0` on a clean tree. The fallback's `codex` waits, so its supervisor writes
+    /// nothing more before the state is read.
+    #[test]
+    fn a_rate_limit_before_any_commit_still_hands_off() {
+        const NAME: &str =
+            "pipeline_launch::tests::a_rate_limit_before_any_commit_still_hands_off";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = waiting_codex_dir();
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        ignore_devflow_dir(root);
+        let phase = PhaseId::new(5163);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Code;
+        state.fallback_agent = Some(AgentKind::Codex);
+        workflow::save_state(&state).unwrap();
+        write_rate_limit_capture(root, phase);
+
+        let result = advance(root, Some(phase));
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        let _reap_guard = ReapMonitorOnDrop::after_launch(&reloaded);
+        result.unwrap();
+
+        let handoffs = events_named(root, "agent_handoff");
+        assert_eq!(handoffs.len(), 1, "one handoff: {handoffs:?}");
+        let handoff = &handoffs[0];
+        assert_eq!(handoff["stage"], "code", "{handoff}");
+        assert_eq!(handoff["to_agent"], "codex", "{handoff}");
+        assert_eq!(handoff["commit_count"], 0, "{handoff}");
+        assert_eq!(handoff["tree_dirty"], false, "{handoff}");
+        assert_eq!(reloaded.agent, AgentKind::Codex);
+        assert!(reloaded.fallback_consumed);
+        assert!(
+            reloaded.supervisor.is_some(),
+            "the fallback's relaunch is recorded"
+        );
+        assert!(
+            events_named(root, "rate_limit_resume_scheduled").is_empty(),
+            "a handed-off rate limit schedules no resume"
+        );
+    }
+
     /// Send `shutdown` to the supervisor at `socket` on the wire, wait for
     /// its `accepted` line (returned first), run `then`, and return the final
     /// line read within `final_wait`. Unlike `request_shutdown`, the caller
