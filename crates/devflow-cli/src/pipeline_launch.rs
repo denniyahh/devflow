@@ -17266,7 +17266,8 @@ mod tests {
     /// Every violation of the SUPV-01 evidence file's row contract in `text`,
     /// with cited files and tests resolved against `root` (R2-10). Trace mode
     /// (`complete == false`) accepts the pending marker `51-13`; complete mode
-    /// (51-13) rejects it and requires the two conclusion lines. Never panics on
+    /// (51-13) rejects it and requires the two conclusion lines and every
+    /// heading in [`SUPV01_COMPLETE_HEADINGS`]. Never panics on
     /// an unreadable file: that is a violation naming its path.
     fn supv01_evidence_violations(text: &str, complete: bool, root: &Path) -> Vec<String> {
         let mut violations = Vec::new();
@@ -17280,6 +17281,11 @@ mod tests {
             supv01_row_violations(row, complete, root, &mut violations);
         }
         if complete {
+            for heading in SUPV01_COMPLETE_HEADINGS {
+                if markdown_section(text, heading).is_none() {
+                    violations.push(format!("no `{heading}` heading"));
+                }
+            }
             let conclusion = markdown_section(text, "## Conclusion").unwrap_or_default();
             for label in SUPV01_CONCLUSION_LINES {
                 let Some(line) = conclusion.lines().find(|line| line.starts_with(label)) else {
