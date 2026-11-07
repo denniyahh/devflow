@@ -2384,7 +2384,11 @@ fn publish_record<E: Into<CliError>>(
         ));
     }
     promote_pending(state);
-    if successor_runs_on(&record.socket_path) {
+    #[cfg(not(test))]
+    let probe = devflow_core::supervisor::probe;
+    #[cfg(test)]
+    let probe = successor_probe_for(state);
+    if successor_runs_on(&record.socket_path, probe) {
         return Ok(PublishOutcome::HandedOff);
     }
     state.stopped = true;
@@ -2514,6 +2518,10 @@ fn shut_down_unrecorded(
     }
 }
 
+/// What [`successor_runs_on`]'s probe answers: [`devflow_core::supervisor::probe`]'s result.
+type SuccessorProbeAnswer =
+    Result<devflow_core::supervisor::Liveness, devflow_core::supervisor::ProbeError>;
+
 /// Whether the successor whose record was just saved is still running and
 /// can be handed off: Alive with owner `agent_running`, `advancing` or
 /// `gate_wait`. Gone, or Alive with any other owner (it finished without
@@ -2522,8 +2530,12 @@ fn shut_down_unrecorded(
 /// STALE is `true` (a crashed successor stays recorded and reads STALE, a
 /// real finding with its own repair). A probe error is `true`: the record
 /// stays and `status` reports the error.
-fn successor_runs_on(socket: &Path) -> bool {
-    use devflow_core::supervisor::{Liveness, probe};
+///
+/// `probe` is [`devflow_core::supervisor::probe`] in every release build; only the
+/// test build's [`successor_probe_for`] can substitute an answer (51-13, D-12), and
+/// these arms decide in both.
+fn successor_runs_on(socket: &Path, probe: impl Fn(&Path) -> SuccessorProbeAnswer) -> bool {
+    use devflow_core::supervisor::Liveness;
     let running = [
         OwnerPhase::AgentRunning,
         OwnerPhase::Advancing,
@@ -2548,6 +2560,34 @@ fn successor_runs_on(socket: &Path) -> bool {
                 return true;
             }
         }
+    }
+}
+
+/// Test-only seam (51-13, D-12, review B-2, R2-8): the probe [`publish_record`] hands
+/// [`successor_runs_on`] in a test build. When `DEVFLOW_TEST_WITHHOLD_SUCCESSOR_PROBE`
+/// is `<agent>:<stage>:<marker-path>` (lowercase, as `AgentKind` and `Stage` display)
+/// for `state`'s agent and stage, it writes the marker file and answers `Gone` without
+/// probing, so `successor_runs_on`'s own `Gone` arm records the run stopped while the
+/// successor still runs. Otherwise it is the real probe. Keyed by the launch being
+/// published, so a failover relaunch (`codex:code`) can be answered while the primary's
+/// launch is not. Compiled only under `cfg(test)`, together with its one call (pinned
+/// by `pipeline_launch::tests::the_successor_probe_seam_is_compiled_out_of_non_test_builds`).
+#[cfg(test)]
+fn successor_probe_for(state: &State) -> impl Fn(&Path) -> SuccessorProbeAnswer {
+    let marker = std::env::var("DEVFLOW_TEST_WITHHOLD_SUCCESSOR_PROBE")
+        .ok()
+        .and_then(|value| {
+            let mut parts = value.splitn(3, ':');
+            let (agent, stage, marker) = (parts.next()?, parts.next()?, parts.next()?);
+            (agent == state.agent.to_string() && stage == state.stage.to_string())
+                .then(|| PathBuf::from(marker))
+        });
+    move |socket| match &marker {
+        Some(marker) => {
+            let _ = std::fs::write(marker, "");
+            Ok(devflow_core::supervisor::Liveness::Gone)
+        }
+        None => devflow_core::supervisor::probe(socket),
     }
 }
 
