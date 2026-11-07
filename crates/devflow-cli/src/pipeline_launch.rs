@@ -30,8 +30,8 @@ use crate::pipeline_outcomes::{
     handle_validate_outcome, truncate_reason,
 };
 use crate::preflight::{
-    agent_program, ensure_agent_binary, generic_preflight_checks, run_preflight,
-    worktree_writable_roots,
+    agent_program, ensure_agent_binary, generic_preflight_checks, print_fallback_notice,
+    run_preflight, validate_fallback_agent, worktree_writable_roots,
 };
 use devflow_core::config::capture_retention;
 use devflow_core::gates::{
@@ -3157,7 +3157,6 @@ pub(crate) fn resume_with_fallback(
     legacy_claude_launch: bool,
     fallback_agent: Option<AgentKind>,
 ) -> Result<(), CliError> {
-    let _ = fallback_agent;
     let _phase_holder = crate::commands::claim_foreground_holder(project_root, phase)?;
     let reserved = crate::commands::reserve_launch(
         project_root,
@@ -3175,6 +3174,7 @@ pub(crate) fn resume_with_fallback(
         reserved.state,
         agent,
         legacy_claude_launch,
+        fallback_agent,
     );
     abandon_reservation(project_root, phase, reserved.created);
     result
@@ -3344,8 +3344,12 @@ fn resume_loaded(
     mut state: State,
     agent: Option<AgentKind>,
     legacy_claude_launch: bool,
+    fallback_agent: Option<AgentKind>,
 ) -> Result<(), CliError> {
     crate::commands::refuse_unprepared_run(&state)?;
+    // D-01, D-02, D-03: every fallback check runs here, BEFORE `commit_notify_env`
+    // below, so a refused resume commits nothing at all (review B-3).
+    refuse_fallback_for_resume(&state, agent, legacy_claude_launch, fallback_agent)?;
     // CR-03 (49-REVIEW.md): an exported (or emptied) notify command reaches
     // the chain this resume launches through the state file.
     commit_notify_env(&mut state)?;
@@ -3419,7 +3423,17 @@ fn resume_loaded(
         }
         s.gate_pending = false;
         s.legacy_claude_launch = legacy_claude_launch;
+        // D-01's re-arm, in the commit every resume makes, so it applies to a stopped
+        // run and a cron-paused one alike. A plain resume leaves a spent fallback
+        // spent (D-05).
+        if let Some(fallback) = fallback_agent {
+            s.fallback_agent = Some(fallback);
+            s.fallback_consumed = false;
+        }
     })?;
+    if let Some(fallback) = fallback_agent {
+        print_fallback_notice(fallback, state.agent);
+    }
     match launch_stage(&mut state, None, None) {
         Ok(()) => Ok(()),
         Err(err) => {
@@ -3443,6 +3457,40 @@ fn resume_loaded(
             });
             Err(err)
         }
+    }
+}
+
+/// The fallback checks `resume` makes before it writes anything (D-01, D-02, D-03).
+///
+/// The run is judged as it would launch: its agent after `--agent`, and its legacy
+/// opt-out after `--legacy-claude-launch` and the environment. Then:
+/// - a `--fallback-agent` is held to [`validate_fallback_agent`], as on `start`;
+/// - with none, a saved fallback that is still unused and equals that agent is refused
+///   (D-02): `--agent` onto the run's own fallback would leave the two coinciding.
+///
+/// Reads no file and writes nothing; `state` is the copy `resume` loaded.
+fn refuse_fallback_for_resume(
+    state: &State,
+    agent: Option<AgentKind>,
+    legacy_claude_launch: bool,
+    fallback_agent: Option<AgentKind>,
+) -> Result<(), CliError> {
+    let mut candidate = state.clone();
+    candidate.agent = agent.unwrap_or(state.agent);
+    // Only the combined value is read here; the notice is `resume_loaded`'s to print.
+    let _env_alone = apply_legacy_launch_opt_out(&mut candidate, legacy_claude_launch);
+    match fallback_agent {
+        Some(fallback) => validate_fallback_agent(&candidate, fallback),
+        None => match state.fallback_agent {
+            Some(saved) if !state.fallback_consumed && saved == candidate.agent => {
+                Err(CliError::Message(format!(
+                    "--agent {saved} is this run's saved unused fallback ({saved}); a run's agent \
+                     and its fallback must differ — pass --fallback-agent with another agent to \
+                     re-arm a different one"
+                )))
+            }
+            _ => Ok(()),
+        },
     }
 }
 
@@ -15252,7 +15300,7 @@ mod tests {
         })
         .unwrap();
 
-        let result = resume_loaded(root, phase, state, None, false);
+        let result = resume_loaded(root, phase, state, None, false, None);
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
