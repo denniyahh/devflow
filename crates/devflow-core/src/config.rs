@@ -484,10 +484,56 @@ pub fn git_flow_for_run(project_root: &Path, persisted_base: Option<&str>) -> Gi
     }
 }
 
-/// RED stub: the resolver's contract is pinned by
-/// `fallback_agent_key_resolves_from_devflow_toml`.
-pub fn fallback_agent(_project_root: &Path) -> Result<Option<AgentKind>, String> {
-    Ok(None)
+/// The one key [`fallback_agent`] reads from `devflow.toml`.
+///
+/// Crate-private and separate from [`DevflowConfig`] on purpose (R-3 / A-3,
+/// Phase 51): `DevflowConfig` is public with public fields and is not
+/// `#[non_exhaustive]`, so a new field there would break downstream struct
+/// literals. Unknown keys are ignored, so every other key in the file is
+/// invisible here.
+#[derive(serde::Deserialize)]
+struct FallbackAgentKey {
+    #[serde(default)]
+    fallback_agent: Option<AgentKind>,
+}
+
+/// Resolve the standing fallback agent from `devflow.toml`'s `fallback_agent`
+/// key (operator ruling R-3, Phase 51).
+///
+/// **No environment variable, by operator decision.** Unlike [`yes_ship`],
+/// this key has no `DEVFLOW_*` override: the fallback decides which binary a
+/// detached supervisor may launch later, unattended, and a tracked project
+/// file is the only standing source R-3 allows. `commands::start` combines
+/// it with `--fallback-agent` the way it combines [`yes_ship`] with
+/// `--yes-ship`: the flag wins when given, this value applies when the flag
+/// is absent, and `start` prints a notice naming `devflow.toml` when it
+/// does. It is read by `devflow start` only; `devflow resume` keeps the
+/// run's persisted fallback.
+///
+/// A missing file, or a file without the key, is `Ok(None)`. An unreadable
+/// file follows [`load_config`]'s warn-and-default path and is treated as no
+/// key. **A file that does not parse, or a value that names no agent, is an
+/// `Err` naming `devflow.toml` and the key** — fail-hard on an explicitly
+/// configured value, for the reason [`base_branch`] records: a silently
+/// ignored fallback would leave the operator believing a fallback is armed.
+pub fn fallback_agent(project_root: &Path) -> Result<Option<AgentKind>, String> {
+    let path = project_root.join("devflow.toml");
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "failed to read devflow config; no fallback_agent key read");
+            return Ok(None);
+        }
+    };
+    toml::from_str::<FallbackAgentKey>(&contents)
+        .map(|key| key.fallback_agent)
+        .map_err(|error| {
+            format!(
+                "devflow.toml: cannot read `fallback_agent`: {error}\nfix the file, or remove \
+                 the `fallback_agent` key"
+            )
+        })
 }
 
 fn env_value(key: &str) -> Option<String> {
