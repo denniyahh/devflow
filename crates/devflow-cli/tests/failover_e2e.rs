@@ -521,3 +521,56 @@ fn a_handoff_to_antigravity_that_fails_its_canary_ends_at_a_gate() {
     assert_eq!(state.canary, Some(CanaryOutcome::Absent));
     assert!(state.gate_pending, "the never-silent gate is open");
 }
+
+/// D-11 / criterion 2 under the same auto-mode rig: with no fallback, the same
+/// Claude rate limit at Code writes the cron resume instructions. Negative
+/// control: no handoff, and the `agy` stub on PATH is never launched for a
+/// canary or a stage.
+#[test]
+fn a_rate_limited_claude_run_in_auto_mode_without_a_fallback_writes_cron_instructions() {
+    let phase = PhaseId::new(5122);
+    let rig = Rig::new(phase, AgyCanary::ReturnsToken);
+    let _reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+
+    rig.start(&[]);
+    rig.wait_for_any(&[
+        "rate_limit_resume_scheduled",
+        "gate_fired",
+        "workflow_finished",
+    ]);
+    let log = rig.events_text();
+
+    let scheduled = rig.events_named("rate_limit_resume_scheduled");
+    assert_eq!(scheduled.len(), 1, "one scheduled resume; events:\n{log}");
+    assert_eq!(scheduled[0]["stage"], "code", "{}", scheduled[0]);
+
+    let cron: Value = serde_json::from_str(
+        &fs::read_to_string(rig.cron_file()).expect("the cron arm wrote its instructions"),
+    )
+    .expect("the cron instructions parse");
+    assert_eq!(
+        cron["resume"]["args"],
+        serde_json::json!(["resume", "--phase", "5122"]),
+        "{cron}"
+    );
+    assert!(
+        cron["hermes_cron"]["schedule"]
+            .as_str()
+            .is_some_and(|schedule| !schedule.is_empty()),
+        "the reset time parsed into a schedule: {cron}"
+    );
+
+    assert!(
+        rig.events_named("agent_handoff").is_empty(),
+        "no fallback, no handoff; events:\n{log}"
+    );
+    assert_eq!(
+        rig.invocations("agy"),
+        Vec::<String>::new(),
+        "agy is on PATH and never launched for a canary or a stage"
+    );
+
+    let state = rig.state();
+    assert_eq!(state.agent, AgentKind::Claude);
+    assert_eq!(state.fallback_agent, None);
+}
