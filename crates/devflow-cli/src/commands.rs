@@ -19,6 +19,7 @@ use crate::pipeline_launch::{launch_stage, single_active_phase};
 use crate::pipeline_outcomes::render_gate_context;
 use crate::preflight::{
     agent_program, ensure_agent_binary, ensure_base_ref_current, ensure_phase_reachable_on_base,
+    print_fallback_notice, validate_fallback_agent,
 };
 use crate::staleness::{enforce_build_staleness, run_git_stdout};
 use devflow_core::agent;
@@ -357,7 +358,6 @@ pub(crate) fn start(
     legacy_claude_launch: bool,
     fallback_agent: Option<AgentKind>,
 ) -> Result<(), CliError> {
-    let _ = fallback_agent; // RED scaffold: accepted, not yet persisted.
     // 999.78/A-11: NOT a bare `State::new`. See
     // `fresh_state_carrying_phase_failures` for why one field survives a
     // forced restart and every other counter does not.
@@ -399,6 +399,15 @@ pub(crate) fn start(
             "note: legacy Claude launch forced by DEVFLOW_CLAUDE_LEGACY_LAUNCH \
              (D-11, 31-CONTEXT.md) — a persisted default is never a silent one"
         );
+    }
+
+    // D-01, D-02, D-03: the fallback is checked against the state as combined above
+    // (agent, mode, legacy opt-out) and set before `dry_run`, the holder and the
+    // reservation, so a refused fallback changes nothing and a dry run shows it.
+    if let Some(fallback) = fallback_agent {
+        validate_fallback_agent(&state, fallback)?;
+        state.fallback_agent = Some(fallback);
+        print_fallback_notice(fallback, state.agent);
     }
 
     if dry_run {

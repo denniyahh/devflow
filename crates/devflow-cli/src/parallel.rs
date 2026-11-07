@@ -126,6 +126,9 @@ pub(crate) fn parallel(
         // shape whose delegated work the legacy path orphans (999.64). An
         // operator who genuinely wants it can still set
         // `DEVFLOW_CLAUDE_LEGACY_LAUNCH`, which `start` reads per phase.
+        //
+        // The trailing `None` is the fallback agent (51-04): `parallel` takes no
+        // `--fallback-agent`, so its runs carry none.
         start(
             project_root,
             phase,

@@ -1058,6 +1058,78 @@ fn unattended_launch_shape_condition(state: &State) -> ConditionState {
     ))
 }
 
+/// D-03's auto-mode half: the refusal detail when `fallback` could not take over the
+/// Code stage of an unattended run, `None` when it could or the run is not unattended.
+///
+/// Failover happens only at Code (R-2), so the question is the Code-stage launch
+/// shape: [`unattended_launch_shape_condition`] evaluated for a candidate whose agent
+/// is `fallback`. Only `--mode auto` asks it; a supervised run has no chain flag to
+/// guard. Deliberately not widened: the condition is the one `run_preflight` and
+/// `hand_off_agent` apply, so launch and handoff cannot disagree.
+pub(crate) fn fallback_launch_shape_refusal(state: &State, fallback: AgentKind) -> Option<String> {
+    if state.mode != Mode::Auto {
+        return None;
+    }
+    let mut candidate = state.clone();
+    candidate.agent = fallback;
+    let condition = unattended_launch_shape_condition(&candidate);
+    condition
+        .refuses()
+        .then(|| condition.detail().unwrap_or("no detail").to_string())
+}
+
+/// The launch-time checks on a fallback agent (D-02, D-03), shared by `start` and
+/// `resume`. `state` is the run as it would launch: its `agent` is the primary the
+/// fallback stands behind.
+///
+/// In order: the fallback must differ from the agent (D-02); in `--mode auto` it must
+/// hold the Code-stage launch shape ([`fallback_launch_shape_refusal`]); its binary
+/// must be installed; its driver must report healthy. Best effort by decision (D-03):
+/// stage-dependent preflight conditions cannot be evaluated at launch, and the full
+/// bundle runs again at the handoff.
+///
+/// Reads nothing from disk and writes nothing, so a caller can run it before any
+/// commit and a refusal leaves the run as it was.
+pub(crate) fn validate_fallback_agent(state: &State, fallback: AgentKind) -> Result<(), CliError> {
+    if fallback == state.agent {
+        return Err(CliError::Message(format!(
+            "--fallback-agent {fallback} is the run's own agent ({agent}); a fallback must be a \
+             different agent",
+            agent = state.agent
+        )));
+    }
+    if let Some(detail) = fallback_launch_shape_refusal(state, fallback) {
+        return Err(CliError::Message(format!(
+            "--fallback-agent {fallback} cannot take over an unattended (--mode auto) Code \
+             stage: the unattended launch shape does not hold for it ({detail})"
+        )));
+    }
+    ensure_agent_binary(agent_program(fallback))?;
+    let mut candidate = state.clone();
+    candidate.agent = fallback;
+    agents::driver_for(fallback)
+        .health(&candidate)
+        .map_err(|err| {
+            CliError::Message(format!("--fallback-agent {fallback} is not ready: {err}"))
+        })
+}
+
+/// Print the line `start` and `resume` show when they arm a fallback (T-51-11): it
+/// names the fallback and the agent it stands behind.
+///
+/// Written to [`std::io::stdout`] directly, as the unattended-launch report of
+/// [`preflight_unattended_launch_check`] is, not through `println!`: libtest captures
+/// `println!` from a test thread, and the tests that pin this line read it from a child
+/// test process's stdout. A failed write is ignored: the fallback is already in the run
+/// state, which is the record that counts.
+pub(crate) fn print_fallback_notice(fallback: AgentKind, agent: AgentKind) {
+    use std::io::Write as _;
+    let _ = writeln!(
+        std::io::stdout(),
+        "fallback agent: {fallback} takes over the Code stage once if {agent} is rate-limited"
+    );
+}
+
 /// C3: no plan for this phase declares a checkpoint GSD never auto-approves.
 ///
 /// Those two markers block in EVERY mode (`checkpoints.md` rule 6), so their
