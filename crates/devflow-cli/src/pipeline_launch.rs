@@ -9830,6 +9830,18 @@ mod tests {
         first_marker: &str,
         stubs: &[(&str, String)],
     ) {
+        run_handoff_child_with_stubs_and_env(name, hold, first_marker, stubs, &[]);
+    }
+
+    /// [`run_handoff_child_with_stubs`], with each `(name, value)` in
+    /// `extra_env` also passed to the child (51-10: a test seam variable).
+    fn run_handoff_child_with_stubs_and_env(
+        name: &str,
+        hold: Option<&str>,
+        first_marker: &str,
+        stubs: &[(&str, String)],
+        extra_env: &[(&str, &std::ffi::OsStr)],
+    ) {
         use std::os::unix::fs::PermissionsExt;
         let path_dir = handoff_claude_dir(first_marker);
         for (program, script) in stubs {
@@ -9854,6 +9866,7 @@ mod tests {
         if let Some(value) = &hold_value {
             env.push((HOLD_ENV, value.as_os_str()));
         }
+        env.extend_from_slice(extra_env);
         let output = run_hermetic_test_in_child(name, path_dir.path(), &env);
         devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, name);
     }
@@ -16755,5 +16768,209 @@ mod tests {
                 "{shape}"
             );
         }
+    }
+
+    // ---- 51-10: SUPV-01 criterion 3, the publish wait and the cron arm's read (D-12) ----
+
+    /// The test-only seam that withholds one publish wait's probe answer
+    /// (`<agent>:<stage>`), read by `monitor::spawn_monitor` under the
+    /// `test-support` gate.
+    const WITHHOLD_PUBLISH_ENV: &str = "DEVFLOW_TEST_WITHHOLD_PUBLISH_PROBE";
+
+    /// Where a group-recording stub writes `<pid> <pgid>`: the parent passes a
+    /// path in a dir it owns, so the R2-13 positive control's numbers outlive
+    /// the child (libtest discards a passing child's output).
+    const GROUP_REPORT_ENV: &str = "P51_GROUP_REPORT";
+
+    /// A stub for `program` that answers `--version`, then, on every other
+    /// run, records `<pid> <pgid>` (read from `/proc/$$/stat` with shell
+    /// builtins only) in `<program>-group` in its working directory, waits
+    /// (bounded, about 60 s) for `release` there, prints the success marker
+    /// and exits 0. `first_run_marker` set: the first run instead waits for
+    /// `go` and prints that marker without recording itself (a Plan stage).
+    fn group_recording_script(
+        program: &str,
+        release: &str,
+        first_run_marker: Option<&str>,
+    ) -> String {
+        let first = first_run_marker.map_or_else(String::new, |marker| {
+            format!(
+                "if [ ! -e first-done ]; then\n  : > first-done\n  \
+                 i=0\n  while [ ! -e go ] && [ \"$i\" -lt 1200 ]; do sleep 0.05; i=$((i+1)); done\n  \
+                 printf '%s\\n' '{marker}'\n  exit 0\nfi\n"
+            )
+        });
+        format!(
+            "#!/bin/sh\ncase \"$1\" in --version) exit 0 ;; esac\n{first}\
+             read -r stat < /proc/$$/stat\nrest=${{stat##*) }}\nset -- $rest\n\
+             printf '%s %s\\n' \"$$\" \"$3\" > {program}-group\n\
+             i=0\nwhile [ ! -e {release} ] && [ \"$i\" -lt 1200 ]; do sleep 0.05; i=$((i+1)); done\n\
+             printf '%s\\n' '{SUCCESS_MARKER}'\nexit 0\n"
+        )
+    }
+
+    /// The `(pid, pgid)` a [`group_recording_script`] stub recorded at `path`,
+    /// once the whole line is there.
+    fn recorded_group(path: &Path) -> Option<(u32, u32)> {
+        let text = std::fs::read_to_string(path).ok()?;
+        let line = text.strip_suffix('\n')?;
+        let (pid, pgid) = line.split_once(' ')?;
+        Some((pid.parse().ok()?, pgid.parse().ok()?))
+    }
+
+    /// R2-13's positive control: wait for the stub at `record` to record
+    /// itself, then require its group to have a live member. Returns the
+    /// recorded `(pid, pgid)` and writes them, with the live members, to the
+    /// parent's report path. Fails rather than passing vacuously when the stub
+    /// never recorded itself.
+    fn agent_group_was_live(run: &HandoffRun, record: &Path) -> (u32, u32) {
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || recorded_group(record).is_some()),
+            "the agent stub never recorded itself before the publish wait ended, so R2-13's \
+             positive control cannot run; events:\n{}",
+            run.events()
+        );
+        let (pid, pgid) = recorded_group(record).expect("polled above");
+        let members = devflow_core::test_support::live_group_members(pgid);
+        assert!(
+            !members.is_empty(),
+            "positive control: the agent's group {pgid} had no live member when it recorded \
+             itself (pid {pid})"
+        );
+        if let Some(report) = std::env::var_os(GROUP_REPORT_ENV) {
+            std::fs::write(report, format!("pid {pid} pgid {pgid} live {members:?}\n")).unwrap();
+        }
+        (pid, pgid)
+    }
+
+    /// R2-13: after the withheld publish, the agent group recorded at `pgid`
+    /// has no live member within a bounded poll.
+    fn agent_group_ended(run: &HandoffRun, pgid: u32) {
+        assert!(
+            poll_until(Duration::from_secs(10), || {
+                devflow_core::test_support::live_group_members(pgid).is_empty()
+            }),
+            "the unpublished launch's agent group {pgid} outlived it: live members {:?}; \
+             events:\n{}",
+            devflow_core::test_support::live_group_members(pgid),
+            run.events()
+        );
+    }
+
+    /// The parent half of a 51-10 publish-wait test: run `name` with `stubs`,
+    /// the seam set to `withhold`, and a report path for the R2-13 control;
+    /// print the report (visible under `--no-capture`) and require it.
+    fn run_withheld_publish_child(name: &str, stubs: &[(&str, String)], withhold: &str) {
+        let report_dir = tempfile::Builder::new()
+            .prefix("dfr")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let report = report_dir.path().join("group");
+        run_handoff_child_with_stubs_and_env(
+            name,
+            None,
+            SUCCESS_MARKER,
+            stubs,
+            &[
+                (WITHHOLD_PUBLISH_ENV, std::ffi::OsStr::new(withhold)),
+                (GROUP_REPORT_ENV, report.as_os_str()),
+            ],
+        );
+        let recorded = std::fs::read_to_string(&report)
+            .unwrap_or_else(|err| panic!("the child wrote no R2-13 report: {err}"));
+        println!("{name}: R2-13 positive control: {}", recorded.trim());
+    }
+
+    /// D-12 (SUPV-01 criterion 3, the failover arm's publish wait), with R2-D1
+    /// and R2-13. The primary Claude Code stage is rate-limited and hands off
+    /// to the unused Codex fallback; the seam withholds the probe answer of
+    /// the fallback's Code relaunch only (`codex:code`), so its one publish
+    /// wait expires. The hop then ends visibly: `agent_handoff_relaunch_failed`
+    /// naming the publish wait, then the never-silent Code gate, with no cron
+    /// arm. Nothing is orphaned: the fallback stub's group had a live member
+    /// when it recorded itself (positive control) and has none afterwards.
+    /// Healthy baseline (no intervention, same rig):
+    /// [`a_rate_limit_with_a_fallback_hands_off_and_completes_the_same_stage`].
+    #[test]
+    fn failover_with_the_publish_probe_withheld_ends_at_a_gate() {
+        const NAME: &str =
+            "pipeline_launch::tests::failover_with_the_publish_probe_withheld_ends_at_a_gate";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_withheld_publish_child(
+                NAME,
+                &[
+                    ("claude", rate_limited_claude_script()),
+                    (
+                        "codex",
+                        group_recording_script("codex", "never-released", None),
+                    ),
+                ],
+                "codex:code",
+            );
+            return;
+        }
+        let _guard = env_lock();
+        let run = HandoffRun::launch_with(PhaseId::new(5195), |_, state| {
+            state.stage = Stage::Code;
+            state.stop_until = Some(Stage::Code);
+            state.fallback_agent = Some(AgentKind::Codex);
+        });
+        run.go();
+        let (_, pgid) = agent_group_was_live(&run, &run.root.join("codex-group"));
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || {
+                events_named(&run.root, "gate_fired")
+                    .iter()
+                    .any(|gate| gate["stage"] == "code")
+            }),
+            "no Code gate fired; events:\n{}",
+            run.events()
+        );
+
+        let events = all_events(&run.root);
+        let position = |name: &str| events.iter().position(|e| e["event"] == name);
+        let handed = position("agent_handoff").expect("the handoff committed");
+        let failed = position("agent_handoff_relaunch_failed")
+            .unwrap_or_else(|| panic!("no relaunch-failure event; events:\n{}", run.events()));
+        let gated = position("gate_fired").expect("polled above");
+        assert!(
+            handed < failed && failed < gated,
+            "handoff, then the failure, then the gate; events:\n{}",
+            run.events()
+        );
+        let handoff = &events[handed];
+        assert_eq!(handoff["stage"], "code", "{handoff}");
+        assert_eq!(handoff["to_agent"], "codex", "{handoff}");
+        assert_eq!(handoff["reason"], "rate_limited", "{handoff}");
+        let failure = &events[failed];
+        assert_eq!(failure["stage"], "code", "{failure}");
+        assert_eq!(failure["to_agent"], "codex", "{failure}");
+        assert!(
+            failure["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("did not publish")),
+            "the failure names the publish wait: {failure}"
+        );
+        assert!(
+            events_named(&run.root, "rate_limit_resume_scheduled").is_empty(),
+            "a failed relaunch never takes the cron arm (R2-D1); events:\n{}",
+            run.events()
+        );
+        assert!(
+            !devflow_core::ship::cron_instructions_path(&run.root, run.phase).exists(),
+            "a failed relaunch writes no cron instruction (R2-D1)"
+        );
+        assert_eq!(
+            run.other_sockets(),
+            Vec::<PathBuf>::new(),
+            "no Codex supervisor socket remains"
+        );
+
+        let state = run.state();
+        assert_eq!(state.agent, AgentKind::Codex);
+        assert!(state.fallback_consumed);
+        assert!(state.gate_pending, "the never-silent gate is open");
+
+        agent_group_ended(&run, pgid);
     }
 }
