@@ -401,6 +401,16 @@ pub(crate) fn start(
         );
     }
 
+    // R-3: `devflow.toml`'s `fallback_agent` key, combined with the flag the way
+    // `yes_ship` is above: the flag wins when given, the key applies when it is
+    // absent. Resolved unconditionally, also when the flag is given, so a broken
+    // key refuses `start` whatever the flag says: the flag wins the value, it does
+    // not excuse a broken config file (stricter than `base_branch`, whose env
+    // override skips the file).
+    let config_fallback = config::fallback_agent(project_root).map_err(CliError::Message)?;
+    let from_config = fallback_agent.is_none() && config_fallback.is_some();
+    let fallback_agent = fallback_agent.or(config_fallback);
+
     // D-01, D-02, D-03: the fallback is checked against the state as combined above
     // (agent, mode, legacy opt-out) and set before `dry_run`, the holder and the
     // reservation, so a refused fallback changes nothing and a dry run shows it.
@@ -408,6 +418,14 @@ pub(crate) fn start(
         validate_fallback_agent(&state, fallback)?;
         state.fallback_agent = Some(fallback);
         print_fallback_notice(fallback, state.agent);
+        // A standing default is never a silent one: name the key when it alone
+        // supplied the fallback, as the `yes_ship` notice does.
+        if from_config {
+            println!(
+                "note: fallback agent {fallback} set by devflow.toml (fallback_agent) — pass \
+                 --fallback-agent to choose another"
+            );
+        }
     }
 
     if dry_run {
