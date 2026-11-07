@@ -649,7 +649,7 @@ be re-tested here rather than inherited from the issue's original design.
      rebase handoff were all removed (D-11, 23d) and none is reintroduced. Counted over source with
      comments stripped, since a grep over raw source counts comment prose (the Phase 35-01 lesson).
 
-**Plans**: 6/13 plans executed (8 waves)
+**Plans**: 7/13 plans executed (8 waves)
 
 Plans:
 **Wave 1**
@@ -666,7 +666,7 @@ Plans:
 **Wave 3** *(blocked on Wave 2 completion)*
 
 - [x] 51-06-PLAN.md — Harden the hop: per-agent canary, handoff event fields, boundary tests at Code, a relaunch that fails after the handoff ends at a gate (not the cron arm) inside a running supervisor (wave 3)
-- [ ] 51-14-PLAN.md — R-3: a `fallback_agent` key in `devflow.toml`, combined with `--fallback-agent` at `start` (flag wins), no environment variable (wave 3)
+- [x] 51-14-PLAN.md — R-3: a `fallback_agent` key in `devflow.toml`, combined with `--fallback-agent` at `start` (flag wins), no environment variable (wave 3)
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
@@ -845,7 +845,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 49 | 12/12 | In Progress|  |
 | 50 | 29/29 | Complete | 2026-10-21 |
 | 50.1 | 30/30 | In Progress | — |
-| 51 | 6/13 | In Progress | — |
+| 51 | 7/13 | In Progress | — |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
 

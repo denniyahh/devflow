@@ -4,18 +4,18 @@ milestone: v3.0.0
 milestone_name: milestone (ACTIVE — Unattended Run Survivability)
 current_phase: 51
 current_phase_name: Rate-Limit Agent Failover
-current_plan: 7
+current_plan: 8
 status: executing
-stopped_at: Completed 51-06-PLAN.md
-last_updated: "2026-11-07T22:06:34.018Z"
+stopped_at: Completed 51-14-PLAN.md
+last_updated: "2026-11-07T22:23:21.862Z"
 last_activity: 2026-11-06
 last_activity_desc: Phase 51 execution started
-state_head: 5514cf3df522f4b3d5686b2829bb521157a16ec4
+state_head: 0112c3d0abc8334c118b176ca6ba0ec9c74092d2
 progress:
   total_phases: 7
   completed_phases: 5
   total_plans: 120
-  completed_plans: 113
+  completed_plans: 114
   percent: 71
 ---
 
@@ -172,9 +172,9 @@ change earns 2.0.
 
 Phase: 51 (Rate-Limit Agent Failover) — EXECUTING
 Plans: 13 (51-01 … 51-14, no 51-08; 8 waves)
-Current Plan: 7
+Current Plan: 8
 Total Plans in Phase: 13
-Completed Plans: 6 of 13
+Completed Plans: 7 of 13
 Status: Ready to execute
 Previous phase: 50.1 — complete, 30/30 plans; verification passed 12/12 (one operator override, the live-run criterion); merged via PR #229; released in v3.0.0. Phase 47's verification still reads `stale` by operator decision (re-verify near milestone close).
 Last activity: 2026-11-06 — Phase 51 execution started
@@ -843,6 +843,8 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 51]: 51-05: crate-private CaptureDenial (Denied/NotDenied/TornAfterLastEvent); a torn tail writes the idle record flagged capture_torn_final_line and the reason leads its capped clause with 'torn final line, a quota denial cannot be ruled out'; the read side also re-checks the capture (EOF tee)
 - [Phase 51]: 51-06: a failover relaunch that fails after the handoff commit emits agent_handoff_relaunch_failed and calls handle_infra_outcome (gate, or abort at the ceiling), not the cron arm; FailoverRelaunchGuard keeps the supervisor record through that one relaunch so the writes stay owned under the Phase 50 D-03 fence
 - [Phase 51]: 51-06: hand_off_agent's commit clears canary and session_id; agent_handoff gains tree_dirty and commit_count (null when unmeasured)
+- [Phase 51]: 51-14: devflow.toml fallback_agent is resolved at start before the flag-first choice; an unparseable file or a value naming no agent refuses start even with a valid --fallback-agent (flag wins the value, not a broken file); devflow resume does not read the key
+- [Phase 51]: 51-14: a key-supplied fallback refused by validate_fallback_agent is wrapped to name devflow.toml's fallback_agent and the override (--fallback-agent <other> or remove the key); a flag refusal keeps 51-04's text
 
 ## Roadmap Evolution
 
@@ -946,11 +948,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 51 P04 | 15 min | 3 tasks | 6 files |
 | Phase 51 P05 | 15 min | 2 tasks | 2 files |
 | Phase 51 P06 | 14 min | 3 tasks | 1 files |
+| Phase 51 P14 | 12 min | 2 tasks | 4 files |
 
 ## Session
 
-**Last session:** 2026-11-07T22:06:32.193Z
-**Stopped at:** Completed 51-06-PLAN.md
+**Last session:** 2026-11-07T22:23:19.951Z
+**Stopped at:** Completed 51-14-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
