@@ -415,7 +415,19 @@ pub(crate) fn start(
     // (agent, mode, legacy opt-out) and set before `dry_run`, the holder and the
     // reservation, so a refused fallback changes nothing and a dry run shows it.
     if let Some(fallback) = fallback_agent {
-        validate_fallback_agent(&state, fallback)?;
+        // D-02 and D-03 apply to the key's value exactly as to the flag's; a refusal
+        // of a key-supplied fallback also names the key and how to override it.
+        validate_fallback_agent(&state, fallback).map_err(|refusal| {
+            if from_config {
+                CliError::Message(format!(
+                    "devflow.toml's fallback_agent ({fallback}) is refused: {refusal}\npass \
+                     --fallback-agent <other> to choose another fallback, or remove \
+                     fallback_agent from devflow.toml"
+                ))
+            } else {
+                refusal
+            }
+        })?;
         state.fallback_agent = Some(fallback);
         print_fallback_notice(fallback, state.agent);
         // A standing default is never a silent one: name the key when it alone
