@@ -82,6 +82,8 @@ pub(crate) fn transition(
             // that is gone.
             s.supervisor = None;
             s.gate_pending = false;
+            // D-09: a run halted after its stage is no longer mid-fix.
+            s.code_fix = None;
         })?;
         events::emit(
             project_root,
@@ -109,6 +111,9 @@ pub(crate) fn transition(
         }
         s.infra_failures = 0;
         s.gate_pending = false;
+        // D-09: a fix type lives exactly as long as its Code pass, so a later
+        // plain Code pass never replays a stale one.
+        s.code_fix = None;
     })?;
     events::emit(
         project_root,

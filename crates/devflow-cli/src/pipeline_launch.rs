@@ -14122,10 +14122,10 @@ mod tests {
         lines
             .iter()
             .map(|line| {
-                if !line.starts_with(char::is_whitespace) {
-                    if let Some(name) = top_level_fn_name(line) {
-                        current = Some(name);
-                    }
+                if !line.starts_with(char::is_whitespace)
+                    && let Some(name) = top_level_fn_name(line)
+                {
+                    current = Some(name);
                 }
                 let here = current;
                 if line.starts_with('}') {
