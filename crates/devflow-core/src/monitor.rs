@@ -13,7 +13,7 @@
 //! exits.
 
 use crate::agent_result::{
-    IdleTimeoutCause, IdleTimeoutCommit, IdleTimeoutRecord, IdleTimeoutRecordOnDisk,
+    CaptureDenial, IdleTimeoutCause, IdleTimeoutCommit, IdleTimeoutRecord, IdleTimeoutRecordOnDisk,
 };
 use crate::git::hermetic_command;
 use crate::phase_id::PhaseId;
@@ -2703,7 +2703,13 @@ fn fire_idle_timeout(
     //    written, the cascade reaches the rate-limit classifier and returns the
     //    right answer. Never silent — this is logged loudly and lands in the
     //    monitor log alongside the kill.
-    if crate::agent_result::capture_shows_rate_limit_denial(project_root, phase) {
+    //
+    //    D-16 (backlog 999.71): the answer has three values, not two. A capture
+    //    that ends in a torn JSON line after its last parsed event is neither
+    //    a proven denial (T-30-12: only a parsed top-level `rejected` event is)
+    //    nor a clean silence, so the record is written and flagged below.
+    let denial = crate::agent_result::capture_rate_limit_denial(project_root, phase);
+    if denial == CaptureDenial::Denied {
         warn!(
             "idle timeout after {idle_secs}s, but the capture carries an explicit quota \
              denial — NOT recording an idle-timeout verdict, so the rate-limit \
@@ -2731,12 +2737,40 @@ fn fire_idle_timeout(
     //     such event yields no cause, and the reason reads as it always did.
     let cause = crate::agent_result::idle_timeout_cause(project_root, phase);
 
+    // 1c. A torn final line is recorded, never suppressed: the write below is
+    //     still what stops Layer 2 scoring partial commits as success. The
+    //     flag puts the torn segment at the front of the reason's clause.
+    let torn = denial == CaptureDenial::TornAfterLastEvent;
+    if torn {
+        warn!(
+            "idle timeout after {idle_secs}s: the capture ends in a torn JSON line after its \
+             last parsed event, so a quota denial cannot be ruled out; recording the timeout \
+             with capture_torn_final_line"
+        );
+        append_monitor_log(
+            project_root,
+            phase,
+            &format!(
+                "[idle-timeout] after {idle_secs}s the capture ends in a torn final line; a \
+                 quota denial cannot be ruled out, so the record is flagged \
+                 capture_torn_final_line"
+            ),
+        );
+    }
+
     // 2. Write, flush, fsync. This completing is the ONLY thing that stops
     //    Layer 2 from later scoring partial commits as Success.
-    let write_error =
-        write_idle_timeout_record(project_root, phase, idle_secs, child_pid, &commits, cause)
-            .err()
-            .map(|err| err.to_string());
+    let write_error = write_idle_timeout_record(
+        project_root,
+        phase,
+        idle_secs,
+        child_pid,
+        &commits,
+        cause,
+        torn,
+    )
+    .err()
+    .map(|err| err.to_string());
     if let Some(err) = &write_error {
         warn!("idle timeout: could not persist the verdict: {err}");
     }
@@ -2873,6 +2907,7 @@ fn write_idle_timeout_record(
     child_pid: u32,
     commits: &[IdleTimeoutCommit],
     cause: IdleTimeoutCause,
+    capture_torn_final_line: bool,
 ) -> std::io::Result<()> {
     let record = IdleTimeoutRecord {
         status: crate::agent_result::AgentStatus::IdleTimeout
@@ -2886,7 +2921,9 @@ fn write_idle_timeout_record(
             .unwrap_or(0),
         commits: commits.to_vec(),
     };
-    let json = serde_json::to_string(&IdleTimeoutRecordOnDisk::new(record, cause))
+    let mut on_disk = IdleTimeoutRecordOnDisk::new(record, cause);
+    on_disk.capture_torn_final_line = capture_torn_final_line;
+    let json = serde_json::to_string(&on_disk)
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
 
     let path = crate::agent_result::idle_timeout_path(project_root, phase);
