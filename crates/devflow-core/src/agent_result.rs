@@ -2381,6 +2381,9 @@ pub(crate) struct IdleTimeoutRecordOnDisk {
     /// See [`IdleTimeoutCause::origin_kind`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) origin_kind: Option<String>,
+    /// RED scaffold (51-05): not yet written to disk.
+    #[serde(skip)]
+    pub(crate) capture_torn_final_line: bool,
 }
 
 impl IdleTimeoutRecordOnDisk {
@@ -2391,6 +2394,7 @@ impl IdleTimeoutRecordOnDisk {
             terminal_reason: cause.terminal_reason,
             errors: cause.errors,
             origin_kind: cause.origin_kind,
+            capture_torn_final_line: false,
         }
     }
 
@@ -2536,6 +2540,23 @@ pub fn capture_shows_rate_limit_denial(project_root: &Path, phase: PhaseId) -> b
         return false;
     };
     detect_claude_stream_rate_limit(&ParsedCapture::parse(&raw).events).is_some()
+}
+
+/// RED scaffold (51-05): the three-way answer, not yet able to say "torn".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CaptureDenial {
+    Denied,
+    NotDenied,
+    TornAfterLastEvent,
+}
+
+/// RED scaffold (51-05): today's boolean answer in the three-way type.
+pub(crate) fn capture_rate_limit_denial(project_root: &Path, phase: PhaseId) -> CaptureDenial {
+    if capture_shows_rate_limit_denial(project_root, phase) {
+        CaptureDenial::Denied
+    } else {
+        CaptureDenial::NotDenied
+    }
 }
 
 fn parse_idle_timeout_side_channel(project_root: &Path, phase: PhaseId) -> Option<AgentResult> {
@@ -7432,22 +7453,27 @@ mod tests {
     /// keys into one object. A future `IdleTimeoutRecord` field whose name
     /// collides with a cause key would make every record unparseable, and a
     /// new field anywhere would change the on-disk contract silently; both
-    /// fail here instead, naming the key. 51-05 adds `capture_torn_final_line`
-    /// to the pinned set in the same change that adds that key.
+    /// fail here instead, naming the key. `capture_torn_final_line` (51-05) is
+    /// written only when set, so a record with an intact capture keeps the
+    /// shape without it.
     #[test]
     fn the_on_disk_idle_timeout_record_key_set_is_pinned() {
-        let cause_keys: std::collections::BTreeSet<String> =
-            ["terminal_reason", "errors", "origin_kind"]
-                .into_iter()
-                .map(str::to_string)
-                .collect();
+        let cause_keys: std::collections::BTreeSet<String> = [
+            "terminal_reason",
+            "errors",
+            "origin_kind",
+            "capture_torn_final_line",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
         let record_keys: std::collections::BTreeSet<String> =
             ["status", "idle_secs", "agent_pid", "written_at", "commits"]
                 .into_iter()
                 .map(str::to_string)
                 .collect();
 
-        let full = IdleTimeoutRecordOnDisk::new(
+        let mut full = IdleTimeoutRecordOnDisk::new(
             sample_record(),
             IdleTimeoutCause {
                 terminal_reason: Some(CAUSE_TERMINAL_REASON.to_string()),
@@ -7455,6 +7481,7 @@ mod tests {
                 origin_kind: Some(CAUSE_ORIGIN_KIND.to_string()),
             },
         );
+        full.capture_torn_final_line = true;
         let expected: std::collections::BTreeSet<String> =
             record_keys.union(&cause_keys).cloned().collect();
         assert_eq!(
@@ -7474,13 +7501,160 @@ mod tests {
             "IdleTimeoutRecord key(s) {collisions:?} collide with a flattened cause key"
         );
 
-        // CONTROL: with no cause the record is exactly the five published
-        // keys (skip-when-empty), so a record with no cause is the old shape.
+        // CONTROL: with no cause and no torn flag the record is exactly the
+        // five published keys (skip-when-empty, skip-when-false), so such a
+        // record is the old shape.
         let bare = IdleTimeoutRecordOnDisk::new(sample_record(), IdleTimeoutCause::default());
+        assert!(!bare.capture_torn_final_line);
         assert_eq!(
             json_keys(&serde_json::to_value(&bare).unwrap()),
-            record_keys
+            record_keys,
+            "a record without the torn flag must not write `capture_torn_final_line`"
         );
+    }
+
+    /// A torn rate-limit line, as a killed child leaves it: the line opens
+    /// like an event and stops mid-key.
+    const TORN_RATE_LIMIT_LINE: &str = r#"{"type":"rate_limit_ev"#;
+
+    /// The torn segment's fixed text, pinned here as a literal so a change to
+    /// the production wording fails a test.
+    const TORN_SEGMENT_TEXT: &str = "torn final line, a quota denial cannot be ruled out";
+
+    /// D-16 (backlog 999.71, classifier half): a capture whose last line is a
+    /// torn JSON line is not a clean, non-rate-limited ending. The torn line
+    /// may be the denial itself, so the three-way answer says "torn", and the
+    /// idle-timeout reason says the denial cannot be ruled out. A torn line is
+    /// never proof of a denial, so the verdict stays `IdleTimeout` (T-30-12).
+    #[test]
+    fn a_torn_final_line_is_not_read_as_a_clean_silence() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+
+        // (a) The three-way answer names the torn tail.
+        let torn = PhaseId::new(71);
+        write_capture_lines(
+            root,
+            torn,
+            &[V3_INIT_EVENT.to_string(), TORN_RATE_LIMIT_LINE.to_string()],
+        );
+        assert_eq!(
+            capture_rate_limit_denial(root, torn),
+            CaptureDenial::TornAfterLastEvent,
+            "a capture ending in a torn rate-limit line read as a clean ending"
+        );
+
+        // (b) With a pre-51 record (no flag), the advance's read still sees
+        // the torn tail and says so first; it never classifies a rate limit.
+        write_idle_timeout_record(root, torn, &[]);
+        let verdict = evaluate_layer1(root, torn).expect("the record is a verdict");
+        assert_eq!(
+            verdict.status,
+            AgentStatus::IdleTimeout,
+            "a torn line is not proof of a denial"
+        );
+        let reason = verdict.reason.expect("an idle timeout explains itself");
+        assert!(
+            reason.starts_with(&format!("idle timeout ({TORN_SEGMENT_TEXT}")),
+            "the torn segment must open the clause; got: {reason}"
+        );
+        assert_eq!(
+            reason.matches("torn final line").count(),
+            1,
+            "the torn text belongs in one place; got: {reason}"
+        );
+
+        // (c) CONTROL: an intact `rejected` denial is still a denial.
+        let denied = PhaseId::new(72);
+        write_capture_lines(
+            root,
+            denied,
+            &[V3_INIT_EVENT.to_string(), v3_rate_limit_event("rejected")],
+        );
+        assert_eq!(
+            capture_rate_limit_denial(root, denied),
+            CaptureDenial::Denied
+        );
+
+        // (d) CONTROL: an intact, non-denied capture keeps today's reason.
+        let intact = PhaseId::new(73);
+        write_capture_lines(root, intact, &[V3_INIT_EVENT.to_string()]);
+        assert_eq!(
+            capture_rate_limit_denial(root, intact),
+            CaptureDenial::NotDenied
+        );
+        write_idle_timeout_record(
+            root,
+            intact,
+            &[("1111111abcdef0000000000000000000000000000", "feat: first")],
+        );
+        assert_eq!(
+            evaluate_layer1(root, intact).unwrap().reason.unwrap(),
+            "idle timeout: the agent's output stream was silent for 30s, so DevFlow \
+             terminated it (agent pid 4242). The agent made 1 commit(s) before going quiet \
+             and NONE of them were rolled back: 1111111 feat: first. Review the branch \
+             before deciding what to keep — this run is TERMINAL and is not retried \
+             automatically."
+        );
+    }
+
+    /// Cross-plan contract with 51-03: the torn segment leads the capped
+    /// clause, so at the largest cause the field bounds admit the clause still
+    /// starts with it, stays inside `MAX_IDLE_TIMEOUT_CLAUSE_CHARS`, and closes
+    /// within `idle timeout (` (14) + the cap + `): ` (3) characters.
+    #[test]
+    fn a_torn_clause_leads_the_capped_clause_at_the_cause_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        let max_cause = serde_json::json!({
+            "terminal_reason": "t".repeat(MAX_CAUSE_TEXT_CHARS),
+            "origin_kind": "o".repeat(MAX_CAUSE_TEXT_CHARS),
+            "errors": vec!["e".repeat(MAX_CAUSE_TEXT_CHARS); MAX_CAUSE_ERRORS],
+        });
+        const OPEN: &str = "idle timeout (";
+        let bound = OPEN.len() + MAX_IDLE_TIMEOUT_CLAUSE_CHARS + "): ".len();
+        let clause_within_bound = |reason: &str| -> String {
+            assert!(reason.starts_with(OPEN), "no clause in: {reason}");
+            let head: String = reason.chars().take(bound).collect();
+            let close = head.find("): ").unwrap_or_else(|| {
+                panic!("the clause does not close within {bound} characters: {reason}")
+            });
+            head[OPEN.len()..close].to_string()
+        };
+
+        let torn = PhaseId::new(74);
+        write_capture_lines(
+            root,
+            torn,
+            &[V3_INIT_EVENT.to_string(), TORN_RATE_LIMIT_LINE.to_string()],
+        );
+        write_idle_timeout_record_with(root, torn, &[], max_cause.clone());
+        let reason = evaluate_layer1(root, torn).unwrap().reason.unwrap();
+        let clause = clause_within_bound(&reason);
+        assert!(
+            clause.starts_with(TORN_SEGMENT_TEXT),
+            "the torn segment must lead the clause; got: {clause}"
+        );
+        assert!(
+            clause.chars().count() <= MAX_IDLE_TIMEOUT_CLAUSE_CHARS,
+            "the clause is {} characters: {clause}",
+            clause.chars().count()
+        );
+
+        // CONTROL: the same record over an intact capture renders the clause
+        // without the torn segment.
+        let intact = PhaseId::new(75);
+        write_capture_lines(root, intact, &[V3_INIT_EVENT.to_string()]);
+        write_idle_timeout_record_with(root, intact, &[], max_cause);
+        let reason = evaluate_layer1(root, intact).unwrap().reason.unwrap();
+        let clause = clause_within_bound(&reason);
+        assert!(
+            clause.starts_with("last result: terminal_reason t"),
+            "got: {clause}"
+        );
+        assert!(!reason.contains("torn final line"), "got: {reason}");
     }
 
     /// Agent-authored cause text is bounded and terminal-safe where it is
@@ -8565,6 +8739,105 @@ mod tests {
         assert!(
             !capture_shows_rate_limit_denial(root, absent),
             "a missing capture must read as no denial, never as one"
+        );
+    }
+
+    /// T-30-12 provenance (review R2-3): only TOP-LEVEL events decide a quota
+    /// denial. A subagent's `rate_limit_event` (one carrying
+    /// `parent_tool_use_id`) neither makes a denial nor masks one, and a
+    /// subagent's `result` does not move the final-turn boundary. An event
+    /// with the key absent or `null` is top-level, as [`is_top_level`] decides.
+    ///
+    /// Every case is checked and the wrong ones are reported together, so a
+    /// failure names each case that went wrong, not only the first.
+    #[test]
+    fn only_top_level_rate_limit_events_and_results_decide_a_denial() {
+        let with_parent = |line: &str, parent: serde_json::Value| -> String {
+            let mut event: serde_json::Value = serde_json::from_str(line).unwrap();
+            event["parent_tool_use_id"] = parent;
+            serde_json::to_string(&event).unwrap()
+        };
+        let subagent = |line: &str| with_parent(line, serde_json::json!("toolu_1"));
+        let init = V3_INIT_EVENT.to_string();
+        let rejected = v3_rate_limit_event("rejected");
+        let allowed = V3_RATE_LIMIT_EVENT_ALLOWED.to_string();
+        let turn_result =
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"no marker"}"#
+                .to_string();
+
+        let e1 = vec![init.clone(), subagent(&rejected)];
+        let e2 = vec![
+            init.clone(),
+            with_parent(&rejected, serde_json::Value::Null),
+            subagent(&allowed),
+        ];
+        let cases: Vec<(&str, Vec<String>, bool)> = vec![
+            ("(e1) a subagent `rejected` event alone", e1.clone(), false),
+            (
+                "(e2) a top-level `rejected` event, then a later subagent `allowed` one",
+                e2.clone(),
+                true,
+            ),
+            (
+                "(e3) a subagent `rejected` event, then a later top-level `allowed` one",
+                vec![init.clone(), subagent(&rejected), allowed.clone()],
+                false,
+            ),
+            (
+                "(b1) result, top-level `rejected`, subagent result, result",
+                vec![
+                    init.clone(),
+                    turn_result.clone(),
+                    rejected.clone(),
+                    subagent(&turn_result),
+                    turn_result.clone(),
+                ],
+                true,
+            ),
+            (
+                "(b2) control: top-level `rejected`, then two top-level results",
+                vec![
+                    init.clone(),
+                    rejected.clone(),
+                    turn_result.clone(),
+                    turn_result.clone(),
+                ],
+                false,
+            ),
+        ];
+        let mut wrong: Vec<String> = cases
+            .iter()
+            .filter_map(|(name, lines, expected)| {
+                let denied = detect_claude_stream_rate_limit(
+                    &ParsedCapture::parse(&lines.join("\n")).events,
+                )
+                .is_some();
+                (denied != *expected).then(|| format!("{name}: expected denied={expected}"))
+            })
+            .collect();
+
+        // Layer 1 shares the detector, so it agrees: a subagent's denial does
+        // not classify the stage `RateLimited` (and would not trigger 51-01's
+        // failover); a top-level one still does (the control that proves
+        // this Layer 1 check can see a denial at all).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for (phase, lines, expect_rate_limited) in [(76, &e1, false), (77, &e2, true)] {
+            let phase = PhaseId::new(phase);
+            write_capture_lines(root, phase, lines);
+            let rate_limited = evaluate_layer1(root, phase)
+                .is_some_and(|result| result.status == AgentStatus::RateLimited);
+            if rate_limited != expect_rate_limited {
+                wrong.push(format!(
+                    "Layer 1 on phase {phase}: expected RateLimited={expect_rate_limited}"
+                ));
+            }
+        }
+
+        assert!(
+            wrong.is_empty(),
+            "provenance was not enforced in these cases:\n{}",
+            wrong.join("\n")
         );
     }
 
