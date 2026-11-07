@@ -18202,4 +18202,392 @@ mod tests {
         let real = successor_probe_seam_violations(&source);
         assert!(real.is_empty(), "{path}: {real:?}");
     }
+
+    // ---- 51-13: the pending-record lock probe and resume's lock probes (D-12, R2-4) ----
+
+    /// The launch id a planted pending record names: real launch-id format, never one
+    /// the run itself mints.
+    const PLANTED_PENDING_ID: &str = "18e5e63a18d5bbbb";
+
+    /// A liveness lock path `liveness::probe` cannot answer for: its parent is a regular
+    /// file, so opening it fails with `ENOTDIR` (an error, not `Missing`). Asserted first.
+    fn unprobeable_lock(dir: &Path) -> PathBuf {
+        let parent = dir.join("not-a-dir");
+        std::fs::write(&parent, "").unwrap();
+        let lock = parent.join("supervisor.live");
+        let probed = devflow_core::liveness::probe(&lock);
+        assert!(
+            probed.is_err(),
+            "non-vacuity: the planted lock must make the probe fail, got {probed:?}"
+        );
+        lock
+    }
+
+    /// Write a pending record naming [`PLANTED_PENDING_ID`] and `lock` (with a socket
+    /// path that does not exist) into the run's state on disk, while stage N's agent is
+    /// still held on `go`, so no supervisor is writing.
+    fn plant_pending_record(run: &HandoffRun, dir: &Path, lock: &Path) {
+        let mut state = run.state();
+        state.pending_supervisor = Some(devflow_core::state::PendingSupervisor::new(
+            PLANTED_PENDING_ID.to_string(),
+            dir.join("pending.sock"),
+            lock.to_path_buf(),
+        ));
+        workflow::save_state(&state).unwrap();
+    }
+
+    /// What both in-supervisor refusals leave: read (3) refused the launch over the
+    /// planted record (`launch_refused_over_live_pending` naming it), the planted record
+    /// is still on disk (the refusal wrote nothing), no supervisor but stage N's
+    /// published a socket, and no `stage_launched` names `agent` at Code.
+    fn assert_refused_over_the_planted_record(run: &HandoffRun, agent: &str) {
+        let refusals = events_named(&run.root, "launch_refused_over_live_pending");
+        assert_eq!(
+            refusals.len(),
+            1,
+            "one refusal by commit_pending_record; events:\n{}",
+            run.events()
+        );
+        assert_eq!(refusals[0]["stage"], "code", "{}", refusals[0]);
+        assert_eq!(
+            refusals[0]["pending_launch_id"], PLANTED_PENDING_ID,
+            "{}",
+            refusals[0]
+        );
+        assert_eq!(
+            run.state()
+                .pending_supervisor
+                .map(|pending| pending.launch_id),
+            Some(PLANTED_PENDING_ID.to_string()),
+            "the refused launch left the planted record in place"
+        );
+        assert_eq!(
+            run.other_sockets(),
+            Vec::<PathBuf>::new(),
+            "no Code supervisor was published"
+        );
+        assert!(
+            events_named(&run.root, "stage_launched")
+                .iter()
+                .all(|launched| !(launched["stage"] == "code" && launched["agent"] == agent)),
+            "no {agent} Code successor was launched; events:\n{}",
+            run.events()
+        );
+    }
+
+    /// D-12 (SUPV-01 criterion 3, failover's pending-record lock probe, read (3)), with
+    /// R2-D1. A pending record naming another launch, whose liveness lock cannot be
+    /// probed, is planted after stage N is recorded. The primary's Code stage is
+    /// rate-limited and hands off to Codex; the relaunch's `commit_pending_record`
+    /// reads the lock as held and refuses the spawn after the handoff commit, and the
+    /// hop ends visibly: `agent_handoff`, `agent_handoff_relaunch_failed` naming the
+    /// pending launch, then the never-silent Code gate, with no cron arm and no Codex
+    /// supervisor. Healthy baseline: [`a_rate_limit_with_a_fallback_hands_off_and_completes_the_same_stage`].
+    #[test]
+    fn failover_over_an_unprobeable_pending_record_ends_at_a_gate() {
+        const NAME: &str =
+            "pipeline_launch::tests::failover_over_an_unprobeable_pending_record_ends_at_a_gate";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child_with_stubs(
+                NAME,
+                None,
+                SUCCESS_MARKER,
+                &[
+                    ("claude", rate_limited_claude_script()),
+                    ("codex", committing_success_script()),
+                ],
+            );
+            return;
+        }
+        let _guard = env_lock();
+        let planted = tempfile::tempdir().unwrap();
+        let lock = unprobeable_lock(planted.path());
+        let run = HandoffRun::launch_with(PhaseId::new(5133), |_, state| {
+            state.stage = Stage::Code;
+            state.stop_until = Some(Stage::Code);
+            state.fallback_agent = Some(AgentKind::Codex);
+        });
+        plant_pending_record(&run, planted.path(), &lock);
+        run.go();
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || {
+                events_named(&run.root, "gate_fired")
+                    .iter()
+                    .any(|gate| gate["stage"] == "code")
+            }),
+            "no Code gate fired; events:\n{}",
+            run.events()
+        );
+
+        let events = all_events(&run.root);
+        let position = |name: &str| events.iter().position(|e| e["event"] == name);
+        let handed = position("agent_handoff").expect("the handoff committed");
+        let failed = position("agent_handoff_relaunch_failed")
+            .unwrap_or_else(|| panic!("no relaunch-failure event; events:\n{}", run.events()));
+        let gated = position("gate_fired").expect("polled above");
+        assert!(
+            handed < failed && failed < gated,
+            "handoff, then the failure, then the gate; events:\n{}",
+            run.events()
+        );
+        assert_eq!(
+            events[handed]["reason"], "rate_limited",
+            "{}",
+            events[handed]
+        );
+        let failure = &events[failed];
+        assert_eq!(failure["to_agent"], "codex", "{failure}");
+        assert!(
+            failure["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains(PLANTED_PENDING_ID)),
+            "the failure names the pending launch: {failure}"
+        );
+        assert_refused_over_the_planted_record(&run, "codex");
+        assert!(
+            events_named(&run.root, "rate_limit_resume_scheduled").is_empty(),
+            "a failed relaunch never takes the cron arm (R2-D1); events:\n{}",
+            run.events()
+        );
+        assert!(
+            !devflow_core::ship::cron_instructions_path(&run.root, run.phase).exists(),
+            "a failed relaunch writes no cron instruction (R2-D1)"
+        );
+        let state = run.state();
+        assert_eq!(state.agent, AgentKind::Codex);
+        assert!(state.fallback_consumed);
+        assert!(state.gate_pending, "the never-silent gate is open");
+    }
+
+    /// D-12's ordinary-launch control for read (3), observable only (R2-9): an ordinary
+    /// Plan → Code transition, no fallback, over the same planted record. Plan completes
+    /// and transitions, and its Code launch is refused the same way: the stage is
+    /// committed as Code, the record cleared (WR-04), no Code socket and no Code
+    /// `stage_launched`. Both refused launches are Code launches, so this and
+    /// [`failover_over_an_unprobeable_pending_record_ends_at_a_gate`] differ only in
+    /// failover.
+    #[test]
+    fn an_ordinary_transition_over_an_unprobeable_pending_record_is_refused_the_same_way() {
+        const NAME: &str = "pipeline_launch::tests::an_ordinary_transition_over_an_unprobeable_pending_record_is_refused_the_same_way";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, None, SUCCESS_MARKER);
+            return;
+        }
+        let _guard = env_lock();
+        let planted = tempfile::tempdir().unwrap();
+        let lock = unprobeable_lock(planted.path());
+        let run = HandoffRun::launch_with(PhaseId::new(5134), |_, state| {
+            state.stage = Stage::Plan;
+            state.stop_until = Some(Stage::Code);
+        });
+        plant_pending_record(&run, planted.path(), &lock);
+        run.go();
+        let settled = || {
+            workflow::load_state(&run.root, run.phase)
+                .is_ok_and(|state| state.stage == Stage::Code && state.supervisor.is_none())
+                && matches!(
+                    devflow_core::supervisor::probe(&run.n.socket_path),
+                    Ok(devflow_core::supervisor::Liveness::Gone)
+                )
+        };
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, settled),
+            "the run did not settle at Code with no supervisor record and stage N gone; \
+             state: {:?}; events:\n{}",
+            workflow::load_state(&run.root, run.phase).map(|s| (s.stage, s.supervisor)),
+            run.events()
+        );
+        assert_refused_over_the_planted_record(&run, "claude");
+    }
+
+    /// The refusal `resume` gives for the run `save` writes at `phase`, after `plant`
+    /// prepares its root; the state file must be unchanged byte for byte.
+    fn resume_refusal(
+        phase: PhaseId,
+        state: impl FnOnce(&Path) -> State,
+        save: &dyn Fn(&Path, State),
+        plant: impl FnOnce(&Path),
+    ) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let state = state(root);
+        save(root, state);
+        plant(root);
+        let before = std::fs::read(workflow::state_path(root, phase)).unwrap();
+        let err = match resume(root, phase, None, false) {
+            Err(err) => err.to_string(),
+            Ok(()) => panic!("phase {phase}: resume over an unprobeable lock launched"),
+        };
+        assert_eq!(
+            std::fs::read(workflow::state_path(root, phase)).unwrap(),
+            before,
+            "phase {phase}: a refused resume writes nothing"
+        );
+        err
+    }
+
+    /// Save `state` as an ordinary `--until code`-stopped run.
+    fn save_until_stopped(_: &Path, mut state: State) {
+        state.stop_until = Some(Stage::Code);
+        state.stopped = true;
+        state.stop_reason = Some("stopped after code completed (--until code)".to_string());
+        workflow::save_state(&state).unwrap();
+    }
+
+    /// The baseline: `resume` of the paused run `state` builds at `phase` launches and
+    /// records its own supervisor (reaped on drop).
+    fn resume_launches(phase: PhaseId, state: impl FnOnce(&Path) -> State, recorded: &Path) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let state = state(root);
+        save_rate_limit_paused(root, state);
+        let result = resume(root, phase, None, false);
+        let reloaded_for_reap = workflow::load_state(root, phase).ok();
+        let _reap_guard = reloaded_for_reap
+            .as_ref()
+            .map(ReapMonitorOnDrop::after_launch);
+        result.unwrap_or_else(|err| panic!("baseline phase {phase}: resume refused: {err}"));
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        assert!(
+            reloaded
+                .supervisor
+                .as_ref()
+                .is_some_and(|record| record.socket_path != recorded),
+            "baseline phase {phase}: the resume recorded its own supervisor: {:?}",
+            reloaded.supervisor
+        );
+    }
+
+    /// The recorded launch id every resume fixture uses (`code_run_recording`'s).
+    const RECORDED_LAUNCH_ID: &str = "18e5e63a18d5674f";
+
+    /// D-12 / R2-4, read (6): the recorded supervisor's socket is gone, so `resume`
+    /// reads its liveness lock (`held_without_socket` → `held_liveness_holder`). Every
+    /// fixture records the same socket path, which does not exist. Non-vacuity first:
+    /// the record's lock is planted as a symlink to itself, and `liveness::probe`
+    /// returns an error for it. (b) A rate-limit-paused run is refused, naming the
+    /// launch and `liveness probe failed`; (c) control: an `--until`-stopped run is
+    /// refused with the same text; (a) baseline: the paused run with no lock file
+    /// resumes.
+    #[test]
+    fn a_cron_resume_and_an_ordinary_resume_refuse_alike_when_the_recorded_lock_cannot_be_probed() {
+        const NAME: &str = "pipeline_launch::tests::a_cron_resume_and_an_ordinary_resume_refuse_alike_when_the_recorded_lock_cannot_be_probed";
+        if parent_of_a_claude_and_codex_child(NAME, &[]) {
+            return;
+        }
+        let _guard = env_lock();
+        let sockets = tempfile::tempdir().unwrap();
+        let gone = sockets.path().join("gone.sock");
+        let plant_self_link = |root: &Path| {
+            let lock = devflow_core::liveness::launch_liveness_path(root, RECORDED_LAUNCH_ID)
+                .expect("a valid launch id derives a lock path, so read (6) runs");
+            std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&lock, &lock).unwrap();
+            let probed = devflow_core::liveness::probe(&lock);
+            assert!(
+                probed.is_err(),
+                "non-vacuity: the self-linked lock must make the probe fail, got {probed:?}"
+            );
+        };
+
+        let paused = PhaseId::new(5135);
+        let cron = resume_refusal(
+            paused,
+            |root| code_run_recording(root, paused, &gone),
+            &|root, state| save_rate_limit_paused(root, state),
+            plant_self_link,
+        );
+        assert!(
+            cron.contains("refusing to resume")
+                && cron.contains(RECORDED_LAUNCH_ID)
+                && cron.contains("liveness probe failed"),
+            "the cron arm's resume refuses naming the launch and its lock probe failure: {cron}"
+        );
+
+        let stopped = PhaseId::new(5136);
+        let ordinary = resume_refusal(
+            stopped,
+            |root| code_run_recording(root, stopped, &gone),
+            &save_until_stopped,
+            plant_self_link,
+        );
+        assert_eq!(
+            ordinary.replace(&stopped.to_string(), "N"),
+            cron.replace(&paused.to_string(), "N"),
+            "an ordinary resume refuses exactly as the cron arm's does"
+        );
+
+        let baseline = PhaseId::new(5137);
+        resume_launches(
+            baseline,
+            |root| code_run_recording(root, baseline, &gone),
+            &gone,
+        );
+    }
+
+    /// D-12 / R2-4, read (7): a pending record with no socket, whose lock `resume`
+    /// reads (`pending_live_socket`). Every fixture keeps the paused shape's recorded
+    /// supervisor with its socket gone and its lock missing (reads (5) and (6) find it
+    /// not live) and adds a pending record whose socket does not exist. Non-vacuity
+    /// first: its liveness path's parent is a regular file, and `liveness::probe`
+    /// returns an error for it. (b) A rate-limit-paused run is refused, naming the
+    /// pending launch and `liveness probe failed`; (c) control: an `--until`-stopped
+    /// run is refused with the same text; (a) baseline: the paused run whose pending
+    /// lock is a missing file in an existing directory resumes.
+    #[test]
+    fn a_cron_resume_and_an_ordinary_resume_refuse_alike_when_the_pending_lock_cannot_be_probed() {
+        const NAME: &str = "pipeline_launch::tests::a_cron_resume_and_an_ordinary_resume_refuse_alike_when_the_pending_lock_cannot_be_probed";
+        if parent_of_a_claude_and_codex_child(NAME, &[]) {
+            return;
+        }
+        let _guard = env_lock();
+        let sockets = tempfile::tempdir().unwrap();
+        let gone = sockets.path().join("gone.sock");
+        let lock = unprobeable_lock(sockets.path());
+        let with_pending = |root: &Path, phase: PhaseId, lock: &Path| {
+            let mut state = code_run_recording(root, phase, &gone);
+            state.pending_supervisor = Some(devflow_core::state::PendingSupervisor::new(
+                PLANTED_PENDING_ID.to_string(),
+                sockets.path().join("pending.sock"),
+                lock.to_path_buf(),
+            ));
+            state
+        };
+
+        let paused = PhaseId::new(5138);
+        let cron = resume_refusal(
+            paused,
+            |root| with_pending(root, paused, &lock),
+            &|root, state| save_rate_limit_paused(root, state),
+            |_| {},
+        );
+        assert!(
+            cron.contains("refusing to resume")
+                && cron.contains(PLANTED_PENDING_ID)
+                && cron.contains("liveness probe failed"),
+            "the cron arm's resume refuses naming the pending launch and its lock probe \
+             failure: {cron}"
+        );
+
+        let stopped = PhaseId::new(5139);
+        let ordinary = resume_refusal(
+            stopped,
+            |root| with_pending(root, stopped, &lock),
+            &save_until_stopped,
+            |_| {},
+        );
+        assert_eq!(
+            ordinary.replace(&stopped.to_string(), "N"),
+            cron.replace(&paused.to_string(), "N"),
+            "an ordinary resume refuses exactly as the cron arm's does"
+        );
+
+        let baseline = PhaseId::new(5140);
+        let missing = sockets.path().join("missing.live");
+        resume_launches(
+            baseline,
+            |root| with_pending(root, baseline, &missing),
+            &gone,
+        );
+    }
 }
