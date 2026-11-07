@@ -17220,8 +17220,279 @@ mod tests {
     /// (51-13) rejects it and requires the two conclusion lines. Never panics on
     /// an unreadable file: that is a violation naming its path.
     fn supv01_evidence_violations(text: &str, complete: bool, root: &Path) -> Vec<String> {
-        let _ = (text, complete, root);
-        Vec::new()
+        let mut violations = Vec::new();
+        let rows = supv01_trace_rows(text, &mut violations);
+        for read in SUPV01_REQUIRED_READS {
+            if !rows.iter().any(|row| row[0] == read) {
+                violations.push(format!("`{read}`: no row in the `## Trace` table"));
+            }
+        }
+        for row in &rows {
+            supv01_row_violations(row, complete, root, &mut violations);
+        }
+        if complete {
+            let conclusion = markdown_section(text, "## Conclusion").unwrap_or_default();
+            for label in SUPV01_CONCLUSION_LINES {
+                let Some(line) = conclusion.lines().find(|line| line.starts_with(label)) else {
+                    violations.push(format!("conclusion: no line starting `{}`", label.trim()));
+                    continue;
+                };
+                let tests = test_paths_in(line);
+                if tests.is_empty() {
+                    violations.push(format!("conclusion `{}`: names no test path", label.trim()));
+                }
+                for test in tests {
+                    if let Some(why) = unresolved_test(root, &test) {
+                        violations.push(format!("conclusion `{}`: {why}", label.trim()));
+                    }
+                }
+            }
+        }
+        violations
+    }
+
+    /// The lines under `heading` up to the next `## ` heading, or `None` when
+    /// no line is exactly `heading`.
+    fn markdown_section<'a>(text: &'a str, heading: &str) -> Option<String> {
+        let mut lines = text.lines().skip_while(|line| line.trim_end() != heading);
+        lines.next()?;
+        let body: Vec<&'a str> = lines.take_while(|line| !line.starts_with("## ")).collect();
+        Some(body.join("\n"))
+    }
+
+    /// The `## Trace` table's data rows as `[read, cells...]`: the row's
+    /// backticked read name, then its seven cells. A missing section, a wrong
+    /// header or a row with another cell count is a violation.
+    fn supv01_trace_rows(text: &str, violations: &mut Vec<String>) -> Vec<[String; 8]> {
+        let Some(section) = markdown_section(text, "## Trace") else {
+            violations.push("no `## Trace` heading".to_string());
+            return Vec::new();
+        };
+        let cells = |line: &str| -> Vec<String> {
+            let inner = line.trim().trim_start_matches('|').trim_end_matches('|');
+            inner
+                .split('|')
+                .map(|cell| cell.trim().to_string())
+                .collect()
+        };
+        let mut table = section
+            .lines()
+            .filter(|line| line.trim_start().starts_with('|'));
+        let Some(header) = table.next() else {
+            violations.push(format!(
+                "`## Trace` holds no table with the columns {}",
+                SUPV01_COLUMNS.join(" | ")
+            ));
+            return Vec::new();
+        };
+        if cells(header) != SUPV01_COLUMNS {
+            violations.push(format!(
+                "`## Trace` table header is `{}`, not `{}`",
+                header.trim(),
+                SUPV01_COLUMNS.join(" | ")
+            ));
+            return Vec::new();
+        }
+        let mut rows = Vec::new();
+        for line in table {
+            let row = cells(line);
+            if row
+                .iter()
+                .all(|cell| !cell.is_empty() && cell.chars().all(|c| matches!(c, '-' | ':')))
+            {
+                continue;
+            }
+            let Ok(row) = <[String; 7]>::try_from(row.clone()) else {
+                violations.push(format!(
+                    "`## Trace` row `{}` has {} cells, not 7",
+                    line.trim(),
+                    row.len()
+                ));
+                continue;
+            };
+            let read = row[0].split('`').nth(1).unwrap_or_default().to_string();
+            let [a, b, c, d, e, f, g] = row;
+            rows.push([read, a, b, c, d, e, f, g]);
+        }
+        rows
+    }
+
+    /// The tokens of `text` made of identifier, path and `::` characters.
+    fn evidence_tokens(text: &str) -> impl Iterator<Item = &str> {
+        text.split(|c: char| {
+            !(c.is_ascii_alphanumeric() || matches!(c, '_' | ':' | '.' | '/' | '-'))
+        })
+        .map(|token| token.trim_end_matches(['.', ':', ',', ';']))
+        .filter(|token| !token.is_empty())
+    }
+
+    /// Whether `token` is a test path: `<module>(::<module>)*::tests::<name>`,
+    /// every segment a lowercase identifier.
+    fn is_test_path(token: &str) -> bool {
+        let Some((module, name)) = token.split_once("::tests::") else {
+            return false;
+        };
+        let ident = |segment: &str| {
+            segment
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+                && segment
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        };
+        !module.is_empty() && module.split("::").all(ident) && ident(name)
+    }
+
+    /// Every test path in `text`.
+    fn test_paths_in(text: &str) -> Vec<String> {
+        evidence_tokens(text)
+            .filter(|token| is_test_path(token))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Every `crates/<path>.rs:<line>` in `text`, as `(path, line)`.
+    fn locations_in(text: &str) -> Vec<(String, usize)> {
+        evidence_tokens(text)
+            .filter(|token| token.starts_with("crates/"))
+            .filter_map(|token| {
+                let (path, line) = token.split_once(".rs:")?;
+                let line = line.parse().ok()?;
+                Some((format!("{path}.rs"), line))
+            })
+            .collect()
+    }
+
+    /// The lines of `source` before its first line that trims to `mod tests {`.
+    fn non_test_part(source: &str) -> String {
+        source
+            .lines()
+            .take_while(|line| line.trim() != "mod tests {")
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Why `test` does not resolve under `root`, or `None` when one of its
+    /// module's files declares `fn <name>(` after its first `mod tests {` line.
+    fn unresolved_test(root: &Path, test: &str) -> Option<String> {
+        let (module, name) = test.split_once("::tests::")?;
+        let relative = module.replace("::", "/");
+        let mut seen = Vec::new();
+        for krate in ["devflow-cli", "devflow-core"] {
+            let path = format!("crates/{krate}/src/{relative}.rs");
+            let file = root.join(&path);
+            if !file.exists() {
+                continue;
+            }
+            let source = match std::fs::read_to_string(&file) {
+                Ok(source) => source,
+                Err(err) => return Some(format!("test {test}: cannot read {path}: {err}")),
+            };
+            let declared = source
+                .lines()
+                .skip_while(|line| line.trim() != "mod tests {")
+                .any(|line| line.contains(&format!("fn {name}(")));
+            if declared {
+                return None;
+            }
+            seen.push(path);
+        }
+        Some(if seen.is_empty() {
+            format!("test {test}: no module file crates/devflow-{{cli,core}}/src/{relative}.rs")
+        } else {
+            format!(
+                "test {test} is not declared as `fn {name}(` after `mod tests {{` in {}",
+                seen.join(" or ")
+            )
+        })
+    }
+
+    /// One trace row's violations: its location, coverage and outcome cells,
+    /// each citation resolved against `root`.
+    fn supv01_row_violations(
+        row: &[String; 8],
+        complete: bool,
+        root: &Path,
+        violations: &mut Vec<String>,
+    ) {
+        let [read, _, location, _, _, _, covered, outcome] = row;
+        let read = if read.is_empty() {
+            "<unnamed>"
+        } else {
+            read.as_str()
+        };
+        let locations = locations_in(location);
+        if locations.is_empty() {
+            violations.push(format!(
+                "`{read}`: Location cites no `crates/…/*.rs:<line>`"
+            ));
+        }
+        let mut sources = Vec::new();
+        let mut all_present = true;
+        for (path, line) in &locations {
+            let file = root.join(path);
+            if !file.exists() {
+                violations.push(format!("`{read}`: cited file {path} does not exist"));
+                all_present = false;
+                continue;
+            }
+            match std::fs::read_to_string(&file) {
+                Ok(source) => {
+                    let count = source.lines().count();
+                    if *line == 0 || *line > count {
+                        violations.push(format!(
+                            "`{read}`: {path}:{line} is past the file's end ({count} lines)"
+                        ));
+                    }
+                    sources.push(source);
+                }
+                Err(err) => {
+                    violations.push(format!("`{read}`: cannot read {path}: {err}"));
+                    all_present = false;
+                }
+            }
+        }
+        if all_present
+            && !sources.is_empty()
+            && !sources
+                .iter()
+                .any(|source| non_test_part(source).contains(read))
+        {
+            violations.push(format!(
+                "`{read}`: no cited file names `{read}` in its non-test code"
+            ));
+        }
+
+        let covered = covered.trim().trim_matches('`').trim();
+        let pending = covered == "51-13";
+        let gap = covered
+            .strip_prefix("gap:")
+            .is_some_and(|reason| !reason.trim().is_empty());
+        if !pending && !gap {
+            let tests: Vec<&str> = covered
+                .split(',')
+                .map(|test| test.trim().trim_matches('`'))
+                .collect();
+            if tests.iter().all(|test| is_test_path(test)) {
+                for test in tests {
+                    if let Some(why) = unresolved_test(root, test) {
+                        violations.push(format!("`{read}`: {why}"));
+                    }
+                }
+            } else {
+                violations.push(format!(
+                    "`{read}`: Covered by `{covered}` is neither a test path, `gap: <reason>` \
+                     nor `51-13`"
+                ));
+            }
+        }
+        if outcome.trim().is_empty() {
+            violations.push(format!("`{read}`: empty Outcome"));
+        }
+        if complete && (pending || outcome.trim().starts_with("pending")) {
+            violations.push(format!("`{read}`: still pending (51-13) in complete mode"));
+        }
     }
 
     /// The `[read, location, covered by, outcome]` rows a planted trace holds,
