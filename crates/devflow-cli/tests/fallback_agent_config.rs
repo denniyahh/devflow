@@ -255,3 +255,118 @@ fn config_key_alone_is_persisted_in_the_run_state() {
         "a new fallback is unused: {saved:?}"
     );
 }
+
+/// A refused `start` whose `PATH` holds no agent but `codex`, so a lost
+/// refusal stops at the missing `claude` binary instead of launching.
+fn refused_start(root: &Path, phase: PhaseId) -> Output {
+    let home = common::HermeticHome::new();
+    let fake = stub_dir(&[("codex", AGENT_STUB)]);
+    let output = run_start(&home, root, phase, &fake.path.display().to_string(), &[]);
+    assert!(
+        !output.status.success(),
+        "start must refuse\nstdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert!(
+        !devflow_core::workflow::state_path(root, phase).exists(),
+        "a refused start writes no state"
+    );
+    output
+}
+
+/// D-02 applied to the key: a key equal to `--agent` refuses `start` before
+/// any state is written, naming the agent in both roles, the key, the file,
+/// and how to override it.
+#[test]
+fn config_key_equal_to_the_agent_refuses_start_and_names_the_key() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let phase = PhaseId::new(5154);
+    init_repo(root, phase);
+    fs::write(root.join("devflow.toml"), "fallback_agent = \"claude\"\n").unwrap();
+
+    let refused = stderr(&refused_start(root, phase));
+
+    assert!(
+        refused.contains("devflow.toml's fallback_agent (claude)"),
+        "the refusal names the key, its file and its value\nstderr: {refused}"
+    );
+    assert!(
+        refused.contains("own agent (claude)"),
+        "the refusal names claude as the run's agent\nstderr: {refused}"
+    );
+    assert!(
+        refused.contains("--fallback-agent <other>") && refused.contains("remove fallback_agent"),
+        "the refusal says how to override the key\nstderr: {refused}"
+    );
+}
+
+/// A key naming no agent refuses `start` before any state is written, naming
+/// the key and the file.
+#[test]
+fn config_key_with_an_invalid_value_refuses_start() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let phase = PhaseId::new(5155);
+    init_repo(root, phase);
+    fs::write(root.join("devflow.toml"), "fallback_agent = \"nosuch\"\n").unwrap();
+
+    let refused = stderr(&refused_start(root, phase));
+
+    assert!(
+        refused.contains("fallback_agent") && refused.contains("devflow.toml"),
+        "the refusal names the key and the file\nstderr: {refused}"
+    );
+}
+
+/// The flag wins the value; it does not excuse a broken config file. The same
+/// valid `--fallback-agent codex` dry run passes with no `devflow.toml` and is
+/// refused when the file names no agent or does not parse.
+#[test]
+fn a_valid_flag_does_not_mask_an_invalid_config_key() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let phase = PhaseId::new(5156);
+    init_repo(root, phase);
+    let fake = stub_dir(&[("codex", AGENT_STUB)]);
+    let flag = ["--fallback-agent", "codex"];
+
+    // Control: the flag alone is valid.
+    let control = dry_run(root, phase, &fake, &flag);
+    assert_success(&control, "the flag alone");
+    assert!(
+        stdout(&control).contains(&fallback_line("codex")),
+        "the flag arms codex\nstdout: {}",
+        stdout(&control)
+    );
+
+    for (contents, what, names) in [
+        (
+            "fallback_agent = \"nosuch\"\n",
+            "a key naming no agent",
+            &["fallback_agent", "devflow.toml"][..],
+        ),
+        (
+            "fallback_agent = \n",
+            "a file that does not parse",
+            &["devflow.toml"][..],
+        ),
+    ] {
+        fs::write(root.join("devflow.toml"), contents).unwrap();
+        let output = dry_run(root, phase, &fake, &flag);
+        assert!(
+            !output.status.success(),
+            "{what} refuses start even with a valid flag\nstdout: {}\nstderr: {}",
+            stdout(&output),
+            stderr(&output)
+        );
+        let refused = stderr(&output);
+        for name in names {
+            assert!(
+                refused.contains(name),
+                "{what}: the refusal names {name}\nstderr: {refused}"
+            );
+        }
+    }
+}
