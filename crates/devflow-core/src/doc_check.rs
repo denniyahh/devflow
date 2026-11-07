@@ -1604,10 +1604,49 @@ fn the_removed_sequentagent_handoff_stays_dead() {
     );
 }
 
-/// RED stub: the scan's contract is pinned by
-/// `no_environment_variable_selects_the_fallback_agent`.
-fn fallback_env_name_findings(_sources: &[(PathBuf, String)]) -> Vec<String> {
-    Vec::new()
+/// The word the R-3 scan looks for, split so this file's own needle is not
+/// an env-shaped literal the scan would report (R2-11).
+const FALLBACK_WORD: &str = concat!("FALL", "BACK");
+
+/// True when `text` is an environment-variable-shaped name: an ASCII
+/// uppercase letter, then only ASCII uppercase letters, digits and `_`.
+fn is_env_shaped(text: &str) -> bool {
+    let mut chars = text.chars();
+    chars.next().is_some_and(|ch| ch.is_ascii_uppercase())
+        && chars.all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+}
+
+/// Every string literal in the comment-stripped `sources` whose whole content
+/// is environment-variable-shaped and contains `FALLBACK`, as
+/// `path:line: "NAME"` (R-3). Char literals are skipped.
+fn fallback_env_name_findings(sources: &[(PathBuf, String)]) -> Vec<String> {
+    let mut findings = Vec::new();
+    for (path, text) in sources {
+        let code: Vec<char> = strip_rust_comments(text).chars().collect();
+        let mut line = 1;
+        let mut index = 0;
+        while index < code.len() {
+            // A char literal is skipped whole, so a `'"'` never opens a string.
+            let string_start = matches!(code[index], '"' | 'r');
+            match literal_at(&code, index) {
+                Some((open, end, close)) => {
+                    let content: String = code[index + open..end - close].iter().collect();
+                    if string_start && is_env_shaped(&content) && content.contains(FALLBACK_WORD) {
+                        findings.push(format!("{}:{line}: \"{content}\"", path.display()));
+                    }
+                    line += code[index..end].iter().filter(|&&ch| ch == '\n').count();
+                    index = end;
+                }
+                None => {
+                    if code[index] == '\n' {
+                        line += 1;
+                    }
+                    index += 1;
+                }
+            }
+        }
+    }
+    findings
 }
 
 /// A planted `DEVFLOW_`-prefixed name containing FALLBACK, split inside the
