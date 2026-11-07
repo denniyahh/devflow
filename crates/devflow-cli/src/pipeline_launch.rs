@@ -17254,6 +17254,15 @@ mod tests {
     /// The `## Conclusion` lines complete mode requires, each naming a test path.
     const SUPV01_CONCLUSION_LINES: [&str; 2] = ["Failover arm: ", "Cron arm: "];
 
+    /// The further `##` headings complete mode requires (51-13), besides `## Conclusion`.
+    const SUPV01_COMPLETE_HEADINGS: [&str; 5] = [
+        "## Experiments: post-save probe and pending-record lock probe",
+        "## Coverage check",
+        "## What this does not establish",
+        "## D-13: natural rate limit during the Phase 51 dogfood run",
+        "## Backlog findings",
+    ];
+
     /// Every violation of the SUPV-01 evidence file's row contract in `text`,
     /// with cited files and tests resolved against `root` (R2-10). Trace mode
     /// (`complete == false`) accepts the pending marker `51-13`; complete mode
@@ -17652,6 +17661,17 @@ mod tests {
     const PLANTED_CONCLUSION: &str = "\n## Conclusion\n\nFailover arm: pipeline_launch::tests::planted_test.\n\
                                       Cron arm: commands::tests::commands_test.\n";
 
+    /// The five further sections complete mode requires (51-13), planted with bodies.
+    const PLANTED_COMPLETE_SECTIONS: &str = "\n## Experiments: post-save probe and pending-record lock probe\n\nPlanted.\n\
+         \n## Coverage check\n\nPlanted.\n\n## What this does not establish\n\nPlanted.\n\
+         \n## D-13: natural rate limit during the Phase 51 dogfood run\n\nPlanted.\n\
+         \n## Backlog findings\n\nnone\n";
+
+    /// `rows` rendered as a complete-mode text: the five further sections, then `conclusion`.
+    fn render_complete(rows: &[[String; 4]], conclusion: &str) -> String {
+        render(rows, &format!("{PLANTED_COMPLETE_SECTIONS}{conclusion}"))
+    }
+
     /// `rows` with the row for `read` replaced by `edit` applied to it.
     fn with_row(
         rows: Vec<[String; 4]>,
@@ -17705,7 +17725,15 @@ mod tests {
         let trace = render(&planted_trace_rows(), "");
         assert_eq!(check(&trace, false), Vec::<String>::new(), "(b) trace mode");
         let violations = check(&trace, true);
-        assert_eq!(violations.len(), 7, "(b) complete mode: {violations:#?}");
+        assert_eq!(violations.len(), 12, "(b) complete mode: {violations:#?}");
+        for heading in SUPV01_COMPLETE_HEADINGS {
+            assert!(
+                violations
+                    .iter()
+                    .any(|v| v.contains(heading) && v.contains("heading")),
+                "(b) the missing `{heading}` heading is reported: {violations:#?}"
+            );
+        }
         for read in [
             "successor_runs_on",
             "commit_pending_record",
@@ -17730,7 +17758,7 @@ mod tests {
         }
 
         // (c) Complete, every citation resolving.
-        let complete_text = render(&planted_complete_rows(), PLANTED_CONCLUSION);
+        let complete_text = render_complete(&planted_complete_rows(), PLANTED_CONCLUSION);
         assert_eq!(
             check(&complete_text, false),
             Vec::<String>::new(),
@@ -17766,7 +17794,7 @@ mod tests {
         let no_path = "\n## Conclusion\n\nFailover arm: it works.\n\
                        Cron arm: commands::tests::commands_test.\n";
         exactly_one(
-            &check(&render(&planted_complete_rows(), no_path), true),
+            &check(&render_complete(&planted_complete_rows(), no_path), true),
             &["Failover arm", "no test path"],
             "(f)",
         );
@@ -17785,7 +17813,8 @@ mod tests {
             .collect();
         let fabricated_conclusion = "\n## Conclusion\n\nFailover arm: pipeline_launch::tests::no_such_test\n\
                                      Cron arm: pipeline_launch::tests::no_such_test\n";
-        let fabricated = render(&fabricated, fabricated_conclusion);
+        // Given the five further headings as well, so they cannot make it pass.
+        let fabricated = render_complete(&fabricated, fabricated_conclusion);
         let trace_mode = check(&fabricated, false);
         assert_eq!(trace_mode.len(), 14, "(g) trace mode: {trace_mode:#?}");
         let complete_mode = check(&fabricated, true);
@@ -17854,6 +17883,36 @@ mod tests {
             &["`held_liveness_holder`", "names"],
             "(k)",
         );
+
+        // (k) in complete mode: the same row in an otherwise complete text.
+        let rows = with_row(planted_complete_rows(), "held_liveness_holder", |row| {
+            row[1] = format!("{PL}:1");
+        });
+        exactly_one(
+            &check(&render_complete(&rows, PLANTED_CONCLUSION), true),
+            &["`held_liveness_holder`", "names"],
+            "(k) complete",
+        );
+
+        // (l) A complete text missing `## Coverage check`.
+        let without_coverage = complete_text.replace("\n## Coverage check\n\nPlanted.\n", "");
+        assert_ne!(
+            without_coverage, complete_text,
+            "(l) the heading was removed"
+        );
+        exactly_one(
+            &check(&without_coverage, true),
+            &["## Coverage check", "heading"],
+            "(l)",
+        );
+
+        // (m) A complete text whose conclusion has no `Cron arm: ` line.
+        let no_cron = "\n## Conclusion\n\nFailover arm: pipeline_launch::tests::planted_test.\n";
+        exactly_one(
+            &check(&render_complete(&planted_complete_rows(), no_cron), true),
+            &["Cron arm", "no line"],
+            "(m)",
+        );
     }
 
     /// R2-10 on the real file: `51-SUPV01-EVIDENCE.md`'s trace rows are
@@ -17867,6 +17926,21 @@ mod tests {
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
         let violations = supv01_evidence_violations(&text, false, &root);
+        assert!(violations.is_empty(), "{}: {violations:#?}", path.display());
+    }
+
+    /// R2-10 (51-13) on the real file, complete mode: no row is pending, every outcome
+    /// is filled, every heading 51-13 adds is there, both conclusion lines name a test
+    /// path, and every citation resolves against the workspace root.
+    #[test]
+    #[ignore = "reads Phase 51's .planning evidence file, which develop and main do not carry; the phase gate runs it with --run-ignored only"]
+    fn the_supv01_evidence_is_complete() {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = manifest.join("../..");
+        let path = root.join(".planning/phases/51-rate-limit-agent-failover/51-SUPV01-EVIDENCE.md");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+        let violations = supv01_evidence_violations(&text, true, &root);
         assert!(violations.is_empty(), "{}: {violations:#?}", path.display());
     }
 
