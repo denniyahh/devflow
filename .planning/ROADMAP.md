@@ -649,7 +649,7 @@ be re-tested here rather than inherited from the issue's original design.
      rebase handoff were all removed (D-11, 23d) and none is reintroduced. Counted over source with
      comments stripped, since a grep over raw source counts comment prose (the Phase 35-01 lesson).
 
-**Plans**: 4/13 plans executed (8 waves)
+**Plans**: 5/13 plans executed (8 waves)
 
 Plans:
 **Wave 1**
@@ -661,7 +661,7 @@ Plans:
 **Wave 2** *(blocked on Wave 1 completion)*
 
 - [x] 51-04-PLAN.md — `--fallback-agent` on `start` and `resume`, validated at launch and persisted; every refusal before any write (wave 2)
-- [ ] 51-05-PLAN.md — 999.71 classifier fix only: the idle-timeout rate-limit check sees a torn final line (wave 2)
+- [x] 51-05-PLAN.md — 999.71 classifier fix only: the idle-timeout rate-limit check sees a torn final line (wave 2)
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
@@ -845,7 +845,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 49 | 12/12 | In Progress|  |
 | 50 | 29/29 | Complete | 2026-10-21 |
 | 50.1 | 30/30 | In Progress | — |
-| 51 | 4/13 | In Progress | — |
+| 51 | 5/13 | In Progress | — |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
 

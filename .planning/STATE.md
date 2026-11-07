@@ -4,18 +4,18 @@ milestone: v3.0.0
 milestone_name: milestone (ACTIVE — Unattended Run Survivability)
 current_phase: 51
 current_phase_name: Rate-Limit Agent Failover
-current_plan: 5
+current_plan: 6
 status: executing
-stopped_at: Completed 51-04-PLAN.md
-last_updated: "2026-11-07T21:28:12.455Z"
+stopped_at: Completed 51-05-PLAN.md
+last_updated: "2026-11-07T21:46:48.487Z"
 last_activity: 2026-11-06
 last_activity_desc: Phase 51 execution started
-state_head: e66ad2f6d882b9f9ff735b5bd24829ea28077914
+state_head: 720db2fc1e7a77bd5f790c78352deb6814d0eb13
 progress:
   total_phases: 7
   completed_phases: 5
   total_plans: 120
-  completed_plans: 111
+  completed_plans: 112
   percent: 71
 ---
 
@@ -172,9 +172,9 @@ change earns 2.0.
 
 Phase: 51 (Rate-Limit Agent Failover) — EXECUTING
 Plans: 13 (51-01 … 51-14, no 51-08; 8 waves)
-Current Plan: 5
+Current Plan: 6
 Total Plans in Phase: 13
-Completed Plans: 4 of 13
+Completed Plans: 5 of 13
 Status: Ready to execute
 Previous phase: 50.1 — complete, 30/30 plans; verification passed 12/12 (one operator override, the live-run criterion); merged via PR #229; released in v3.0.0. Phase 47's verification still reads `stale` by operator decision (re-verify near milestone close).
 Last activity: 2026-11-06 — Phase 51 execution started
@@ -839,6 +839,8 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 51]: 51-03: cause bounded in the reader (3 errors, 160 chars, controls replaced); reason clause capped at 200 chars so it closes inside the 300-char gate context
 - [Phase 51]: 51-04: every fallback check on resume (D-02 both forms, D-03) runs in refuse_fallback_for_resume before commit_notify_env, so a refused resume writes nothing but the reservation it gives back (review B-3); the re-arm lives in the final commit every resume makes
 - [Phase 51]: 51-04: resume is now #[cfg(test)] (signature unchanged); main dispatches Resume to resume_with_fallback. The fallback notice goes through std::io::stdout() so child-process tests can read it
+- [Phase 51]: 51-05: detect_claude_stream_rate_limit picks its turn boundary and its rate_limit_event among is_top_level events only, so a subagent's quota event cannot classify RateLimited or trigger failover (T-30-12, R2-3)
+- [Phase 51]: 51-05: crate-private CaptureDenial (Denied/NotDenied/TornAfterLastEvent); a torn tail writes the idle record flagged capture_torn_final_line and the reason leads its capped clause with 'torn final line, a quota denial cannot be ruled out'; the read side also re-checks the capture (EOF tee)
 
 ## Roadmap Evolution
 
@@ -940,11 +942,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 51 P02 | 6min | 2 tasks | 1 files |
 | Phase 51 P03 | 12 min | 2 tasks | 3 files |
 | Phase 51 P04 | 15 min | 3 tasks | 6 files |
+| Phase 51 P05 | 15 min | 2 tasks | 2 files |
 
 ## Session
 
-**Last session:** 2026-11-07T21:28:10.386Z
-**Stopped at:** Completed 51-04-PLAN.md
+**Last session:** 2026-11-07T21:46:46.389Z
+**Stopped at:** Completed 51-05-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
