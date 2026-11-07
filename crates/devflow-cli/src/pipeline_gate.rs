@@ -195,6 +195,9 @@ pub(crate) fn prepare_loop_back_to_code(
         s.gate_pending = false;
         s.last_verification_fingerprint = observed_fingerprint;
         s.last_verification_mtime_nanos = observed_mtime_nanos;
+        // D-09: the fix pass this Code entry starts, so a same-stage relaunch
+        // (failover, resume, re-drive) replays it rather than plain execute.
+        s.code_fix = Some(fix);
     })?;
     events::emit(
         project_root,
