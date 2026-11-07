@@ -649,7 +649,7 @@ be re-tested here rather than inherited from the issue's original design.
      rebase handoff were all removed (D-11, 23d) and none is reintroduced. Counted over source with
      comments stripped, since a grep over raw source counts comment prose (the Phase 35-01 lesson).
 
-**Plans**: 8/13 plans executed (8 waves)
+**Plans**: 9/13 plans executed (8 waves)
 
 Plans:
 **Wave 1**
@@ -674,7 +674,7 @@ Plans:
 
 **Wave 5** *(blocked on Wave 4 completion)*
 
-- [ ] 51-09-PLAN.md — 999.154: resume with the gate-notify variable unset; WR-12 / IN-10 reproduced against current code (wave 5)
+- [x] 51-09-PLAN.md — 999.154: resume with the gate-notify variable unset; WR-12 / IN-10 reproduced against current code (wave 5)
 - [ ] 51-12-PLAN.md — Auto-mode Claude to Antigravity failover at Code end to end through the binary, after 51-07's prompt render (wave 5)
 
 **Wave 6** *(blocked on Wave 5 completion)*
@@ -845,7 +845,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 49 | 12/12 | In Progress|  |
 | 50 | 29/29 | Complete | 2026-10-21 |
 | 50.1 | 30/30 | In Progress | — |
-| 51 | 8/13 | In Progress | — |
+| 51 | 9/13 | In Progress | — |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
 
