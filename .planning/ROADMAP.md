@@ -1073,6 +1073,28 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.186: Nothing Acts on the Rate-Limit Cron Instructions, So a Paused Run Never Resumes (BACKLOG)
+
+**Found:** 2026-11-07, Phase 51 dogfood run (v3.0.0, supervise mode, no fallback agent). The Code stage hit a real
+Claude rate limit 52 minutes in (2026-11-06 11:27 EST, `advance_evaluated` status `ratelimited`, reason "rate limited
+until 1794085200"). DevFlow took the cron arm: `rate_limit_resume_scheduled` and `.devflow/cron-instructions-51.json`
+with `hermes_cron.schedule` `2026-11-07T21:00:00Z`, name `devflow-phase-51-resume`, `once: true`.
+
+**The defect:** nothing on the host acted on that file. At 2026-11-07 16:07 EST, after the reset time, `devflow status`
+showed the run with no supervisor and not stopped, the instructions file was still present (it is consumed only by a
+successful resume), and `hermes cron list` held no `devflow-phase-51-resume` job. The file is a manifest for a
+scheduler, but DevFlow neither registers the job nor tells the operator to: README says the file is written "for
+rescheduling" and OPERATIONS.md lists it as a record, and neither says who schedules it. `devflow status` prints
+`→ devflow resume --phase 51` with no reset time. The result is the outcome Phase 51 exists to prevent: a rate limit
+ends the night, with no signal past the `rate_limit_resume_scheduled` event.
+
+**Fix shape (not decided):** register the job (e.g. through `hermes cron` when available) and report whether
+registration succeeded; or, when no scheduler is registered, surface the pause through the never-silent gate/notify
+path and print the reset time and the exact resume command in `devflow status`. Document who acts on the file.
+
+**Acceptance:** a rate-limited run either has a registered resume job that a test can observe, or opens a gate/notify
+naming the reset time; `devflow status` shows the reset time for a rate-limit pause.
+
 ### Phase 999.185: A Superseded Supervisor Can Still Write the Rate-Limit Cron File (BACKLOG)
 
 **Found:** 2026-11-06, Phase 51 second external plan review (codex), confirmed by reading source at `0d80aac`.
