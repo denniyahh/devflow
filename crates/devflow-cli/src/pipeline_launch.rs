@@ -11857,6 +11857,154 @@ mod tests {
         );
     }
 
+    // ---- 51-07: a same-stage relaunch replays the interrupted fix pass (D-09) ----
+
+    /// [`waiting_agents_dir`] whose `claude` and `codex` first write their argv,
+    /// NUL-separated, to `<program>-argv.bin` in their working directory, then
+    /// create `<program>-argv.done`, then wait (bounded, about 60 s) like the
+    /// stubs they replace. The marker is created after the write completes, so a
+    /// reader that sees it reads the whole argv.
+    fn argv_recording_agents_dir() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let path_dir = waiting_agents_dir();
+        for program in ["claude", "codex"] {
+            let path = path_dir.path().join(program);
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\ncase \"$1\" in --version) exit 0 ;; esac\n\
+                     for arg in \"$@\"; do printf '%s\\0' \"$arg\"; done > {program}-argv.bin\n\
+                     : > {program}-argv.done\n\
+                     i=0\nwhile [ ! -e never-released ] && [ \"$i\" -lt 1200 ]; do sleep 0.05; i=$((i+1)); done\n\
+                     exit 0\n"
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path_dir
+    }
+
+    /// The argv the `program` stub from [`argv_recording_agents_dir`] recorded in
+    /// `workdir`, waiting (bounded) for its marker; panics naming the program if
+    /// the stub never ran.
+    fn recorded_argv(workdir: &Path, program: &str) -> Vec<String> {
+        const RECORD_WAIT: Duration = Duration::from_secs(30);
+        let done = workdir.join(format!("{program}-argv.done"));
+        let deadline = std::time::Instant::now() + RECORD_WAIT;
+        while !done.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the {program} stub recorded no argv within {RECORD_WAIT:?} in {}",
+                workdir.display()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let bytes = std::fs::read(workdir.join(format!("{program}-argv.bin"))).unwrap();
+        bytes
+            .split(|byte| *byte == 0)
+            .map(|arg| String::from_utf8_lossy(arg).into_owned())
+            .collect()
+    }
+
+    /// Run a Code rate limit through a real `advance` for a Supervise-mode Claude
+    /// run of `phase` at `root` with an unused Codex fallback, from a Code state
+    /// entered by a loop-back with `fix` (`None`: a plain Code state). Returns the
+    /// argv the spawned `codex` received and a reaper for its monitor.
+    fn fail_over_from_code(
+        root: &Path,
+        phase: PhaseId,
+        fix: Option<prompt::FixType>,
+    ) -> (Vec<String>, ReapMonitorOnDrop) {
+        init_repo(root);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = if fix.is_some() {
+            Stage::Validate
+        } else {
+            Stage::Code
+        };
+        state.fallback_agent = Some(AgentKind::Codex);
+        workflow::save_state(&state).unwrap();
+        if let Some(fix) = fix {
+            crate::pipeline_gate::prepare_loop_back_to_code(
+                root,
+                &mut state,
+                fix,
+                crate::pipeline_gate::LoopBackReason::GateResponse,
+            )
+            .unwrap();
+        }
+        let entered = workflow::load_state(root, phase).unwrap();
+        assert_eq!(entered.stage, Stage::Code);
+        assert_eq!(
+            entered.code_fix, fix,
+            "the Code pass records the fix type it was entered with"
+        );
+        write_rate_limit_capture(root, phase);
+
+        let result = advance(root, Some(phase));
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        let reap = ReapMonitorOnDrop::after_launch(&reloaded);
+        result.unwrap();
+        assert_eq!(reloaded.agent, AgentKind::Codex, "the run handed off");
+        (recorded_argv(root, "codex"), reap)
+    }
+
+    /// D-09 (Code, review B-1): a Code failover in the middle of an audit-fix pass
+    /// hands the fallback the audit-fix workflow, rendered by the FALLBACK's
+    /// driver, and the assertion is on the argv the spawned `codex` received.
+    /// Control in the same test: the same failover from a plain Code pass
+    /// delivers the plain execute-phase rendering.
+    #[test]
+    fn a_code_failover_during_an_audit_fix_pass_replays_audit_fix() {
+        const NAME: &str =
+            "pipeline_launch::tests::a_code_failover_during_an_audit_fix_pass_replays_audit_fix";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = argv_recording_agents_dir();
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let _guard = env_lock();
+        let codex = agents::driver_for(AgentKind::Codex);
+        let code_prompt = |phase: PhaseId, fix: Option<prompt::FixType>| {
+            codex.render_prompt(&prompt::StageIntent::Code { phase, fix })
+        };
+
+        let fix_dir = tempfile::tempdir().unwrap();
+        let fix_phase = PhaseId::new(5171);
+        let (argv, _reap_fix) =
+            fail_over_from_code(fix_dir.path(), fix_phase, Some(prompt::FixType::AuditFix));
+        let audit_fix = code_prompt(fix_phase, Some(prompt::FixType::AuditFix));
+        assert_ne!(audit_fix, code_prompt(fix_phase, None));
+        assert!(
+            argv.contains(&audit_fix),
+            "the fallback receives the audit-fix pass in Codex's own rendering: {argv:?}"
+        );
+        assert!(
+            !argv.contains(&code_prompt(fix_phase, None)),
+            "the fallback does not receive the plain execute-phase prompt: {argv:?}"
+        );
+
+        let plain_dir = tempfile::tempdir().unwrap();
+        let plain_phase = PhaseId::new(5175);
+        let (argv, _reap_plain) = fail_over_from_code(plain_dir.path(), plain_phase, None);
+        assert!(
+            argv.contains(&code_prompt(plain_phase, None)),
+            "control: a plain Code failover delivers execute-phase: {argv:?}"
+        );
+        assert!(
+            !argv.contains(&code_prompt(plain_phase, Some(prompt::FixType::AuditFix))),
+            "control: a plain Code failover delivers no fix prompt: {argv:?}"
+        );
+    }
+
     /// Send `shutdown` to the supervisor at `socket` on the wire, wait for
     /// its `accepted` line (returned first), run `then`, and return the final
     /// line read within `final_wait`. Unlike `request_shutdown`, the caller
@@ -13857,6 +14005,145 @@ mod tests {
             Vec::<String>::new(),
             "a trailing comment is not a call"
         );
+    }
+
+    // ---- 51-07: one place renders a no-override stage prompt (D-09, review B-1) ----
+
+    const DEFAULT_RENDER_NEEDLE: &str = concat!("for_stage_in_", "project(");
+    const DEFAULT_RENDER_NOT_ONCE: &str =
+        "a default intent is built more than once (or never) in the non-test code";
+    const DEFAULT_RENDER_OUTSIDE: &str = "a default intent is built outside default_stage_prompt";
+    const DEFAULT_RENDER_INNER_BYPASS: &str =
+        "launch_stage_inner does not call default_stage_prompt";
+    const DEFAULT_RENDER_OUTER_BYPASS: &str = "launch_stage does not call default_stage_prompt";
+
+    /// The fn named on a top-level line holding `fn <name>(` or `fn <name><`.
+    fn top_level_fn_name(line: &str) -> Option<&str> {
+        let after = code_part(line).split_once("fn ")?.1;
+        let end = after.find(['(', '<'])?;
+        Some(&after[..end])
+    }
+
+    /// For each of `lines`, the top-level fn whose item it lies in: from a
+    /// non-indented line naming a fn through the next line starting with `}`.
+    /// Lines in no top-level fn (an `impl` block's methods included) map to `None`.
+    fn enclosing_top_level_fns<'a>(lines: &[&'a str]) -> Vec<Option<&'a str>> {
+        let mut current = None;
+        lines
+            .iter()
+            .map(|line| {
+                if !line.starts_with(char::is_whitespace) {
+                    if let Some(name) = top_level_fn_name(line) {
+                        current = Some(name);
+                    }
+                }
+                let here = current;
+                if line.starts_with('}') {
+                    current = None;
+                }
+                here
+            })
+            .collect()
+    }
+
+    /// D-09's single-renderer rule as a pure scan over `source`, cut at its
+    /// `mod tests {` line with comment lines and trailing comments stripped: the
+    /// default stage intent is built exactly once, inside `default_stage_prompt`,
+    /// and both `launch_stage_inner` (whose prompt the agent receives) and
+    /// `launch_stage` (which resolves the program from it) call that fn.
+    fn default_render_violations(source: &str) -> Vec<String> {
+        let lines = non_test_code_lines(source);
+        let owners = enclosing_top_level_fns(&lines);
+        let mut violations = Vec::new();
+        let renders: Vec<Option<&str>> = lines
+            .iter()
+            .zip(&owners)
+            .filter(|(line, _)| code_part(line).contains(DEFAULT_RENDER_NEEDLE))
+            .map(|(_, owner)| *owner)
+            .collect();
+        if renders.len() != 1 {
+            violations.push(DEFAULT_RENDER_NOT_ONCE.to_string());
+        }
+        if renders
+            .iter()
+            .any(|owner| *owner != Some("default_stage_prompt"))
+        {
+            violations.push(DEFAULT_RENDER_OUTSIDE.to_string());
+        }
+        for (caller, violation) in [
+            ("launch_stage_inner", DEFAULT_RENDER_INNER_BYPASS),
+            ("launch_stage", DEFAULT_RENDER_OUTER_BYPASS),
+        ] {
+            let calls = lines.iter().zip(&owners).any(|(line, owner)| {
+                *owner == Some(caller) && code_part(line).contains("default_stage_prompt(")
+            });
+            if !calls {
+                violations.push(violation.to_string());
+            }
+        }
+        violations
+    }
+
+    /// D-09 (review B-1): every no-override launch renders its prompt through
+    /// `default_stage_prompt`, so a persisted fix type reaches the agent on every
+    /// path. Planted sources first, each carrying one defect, then the real file.
+    #[test]
+    fn every_no_override_launch_renders_through_default_stage_prompt() {
+        let render =
+            format!("    driver.render_prompt(&StageIntent::{DEFAULT_RENDER_NEEDLE}..));\n");
+        let default_fn =
+            format!("fn default_stage_prompt(state: &State) -> String {{\n{render}}}\n");
+        let caller = |header: &str, body: &str| format!("{header}\n{body}}}\n");
+        let calls = "    let prompt = default_stage_prompt(state, driver.as_ref());\n";
+        let inner = caller("pub(crate) fn launch_stage_inner(", calls);
+        let outer = caller("pub(crate) fn launch_stage(", calls);
+        let strings = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        assert_eq!(
+            default_render_violations(&format!("{default_fn}{inner}{outer}")),
+            Vec::<String>::new(),
+            "a correct layout"
+        );
+        assert_eq!(
+            default_render_violations(&format!(
+                "{default_fn}{inner}{outer}fn other() {{\n{render}}}\n"
+            )),
+            strings(&[DEFAULT_RENDER_NOT_ONCE, DEFAULT_RENDER_OUTSIDE]),
+            "a second render in another fn is reported"
+        );
+        assert_eq!(
+            default_render_violations(&format!(
+                "{default_fn}{}{outer}",
+                caller("pub(crate) fn launch_stage_inner(", &render)
+            )),
+            strings(&[
+                DEFAULT_RENDER_NOT_ONCE,
+                DEFAULT_RENDER_OUTSIDE,
+                DEFAULT_RENDER_INNER_BYPASS
+            ]),
+            "the delivered prompt rendered in launch_stage_inner itself (review B-1)"
+        );
+        assert_eq!(
+            default_render_violations(&format!(
+                "{default_fn}{inner}{}",
+                caller(
+                    "pub(crate) fn launch_stage(",
+                    "    let x = 1; // default_stage_prompt(\n"
+                )
+            )),
+            strings(&[DEFAULT_RENDER_OUTER_BYPASS]),
+            "a call in a trailing comment is not a call"
+        );
+        assert_eq!(
+            default_render_violations(&format!(
+                "{default_fn}{inner}{outer}mod tests {{\nfn other() {{\n{render}}}\n"
+            )),
+            Vec::<String>::new(),
+            "a render after the test-module cut does not count"
+        );
+
+        let real = default_render_violations(include_str!("pipeline_launch.rs"));
+        assert!(real.is_empty(), "pipeline_launch.rs: {real:?}");
     }
 
     /// A launch context's supervisor, spawned straight through
