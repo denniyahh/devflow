@@ -4,18 +4,18 @@ milestone: v3.0.0
 milestone_name: milestone (ACTIVE — Unattended Run Survivability)
 current_phase: 51
 current_phase_name: Rate-Limit Agent Failover
-current_plan: 11
+current_plan: 12
 status: executing
-stopped_at: Completed 51-12-PLAN.md
-last_updated: "2026-11-07T23:05:08.014Z"
+stopped_at: Completed 51-10-PLAN.md
+last_updated: "2026-11-07T23:35:27.701Z"
 last_activity: 2026-11-06
 last_activity_desc: Phase 51 execution started
-state_head: a7b143181b4e218cf43ff89b83aa93d4384609c2
+state_head: 9a752f98302bda3868af4f093ad86a7803584644
 progress:
   total_phases: 7
   completed_phases: 5
   total_plans: 120
-  completed_plans: 117
+  completed_plans: 118
   percent: 71
 ---
 
@@ -172,9 +172,9 @@ change earns 2.0.
 
 Phase: 51 (Rate-Limit Agent Failover) — EXECUTING
 Plans: 13 (51-01 … 51-14, no 51-08; 8 waves)
-Current Plan: 11
+Current Plan: 12
 Total Plans in Phase: 13
-Completed Plans: 10 of 13
+Completed Plans: 11 of 13
 Status: Ready to execute
 Previous phase: 50.1 — complete, 30/30 plans; verification passed 12/12 (one operator override, the live-run criterion); merged via PR #229; released in v3.0.0. Phase 47's verification still reads `stale` by operator decision (re-verify near milestone close).
 Last activity: 2026-11-06 — Phase 51 execution started
@@ -850,6 +850,8 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 51]: 51-09: WR-12 and IN-10 closed as no longer reproducing at gate entry (gate_entry_fires_a_notify_cmd_edited_after_the_advance_loaded, gate_entry_over_an_unparseable_state_does_not_rewrite_it; both fail under a blind save_state at entry); the unloadable-state error does not name the file path
 - [Phase 51]: 51-09: the WR-13 resume arm reads after the first stage_launched event and runs the resume fixture in supervise mode, because auto mode parks at the D-07 Define preflight gate before any launch; it fails on the apply_notify_env(None) mutant
 - [Phase 51]: 51-12: the auto-mode Claude to Antigravity failover at Code is pinned end to end through the binary; each failover_e2e test waits on any run-end event and then asserts which one, so a wrong end reports the event log at once
+- [Phase 51]: 51-10: a withheld publish wait fails the failover relaunch and an ordinary Plan to Code launch alike; in a test build the successor's 5 s promotion expiry ends it before the 10 s publish wait, so the release-only end_unpublished_child path is not reached by these tests
+- [Phase 51]: 51-10: the SUPV-01 trace adds live_holder, remove_abandoned_waiters and sweep_entry as gap rows; the ordinary path's missing cause record extends 51-06 backlog finding 2 (one 999.x entry for both)
 
 ## Roadmap Evolution
 
@@ -957,11 +959,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 51 P07 | 11 min | 2 tasks | 4 files |
 | Phase 51 P09 | 12 min | 3 tasks | 5 files |
 | Phase 51 P12 | 5 min | 2 tasks | 1 files |
+| Phase 51 P10 | 26 min | 3 tasks | 4 files |
 
 ## Session
 
-**Last session:** 2026-11-07T23:05:05.747Z
-**Stopped at:** Completed 51-12-PLAN.md
+**Last session:** 2026-11-07T23:35:24.625Z
+**Stopped at:** Completed 51-10-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
