@@ -7945,6 +7945,213 @@ exit 0
         );
     }
 
+    // ---- 51-10: the publish-probe seam (SUPV-01 experiment, D-12) --------
+
+    /// Why `source`'s non-test code does not hold exactly two
+    /// `wait_for_publish(` occurrences (the definition and the one call in
+    /// `spawn_monitor`), or `None` when it does. Counted by
+    /// [`launch_scan_counts`], so comments and the test module do not count.
+    fn publish_wait_count_violation(source: &str) -> Option<String> {
+        let (_, waits) = launch_scan_counts(source);
+        (waits != 2).then(|| {
+            format!(
+                "non-test code holds {waits} `wait_for_publish(` occurrences, not 2 (the \
+                 definition and the one call in `spawn_monitor`)"
+            )
+        })
+    }
+
+    /// Review B-7: a launch has exactly one publish wait, so the 51-10 seam
+    /// withholds the one wait a failover relaunch makes and cannot add a
+    /// second. The real file holds the definition and one call; a planted
+    /// source with a second call counts 3 and is reported.
+    #[test]
+    fn non_test_code_waits_for_publish_exactly_once() {
+        let planted = "fn wait_for_publish(child: &mut Child) {}\nfn spawn_monitor() {\n    \
+                       wait_for_publish(&mut child);\n    wait_for_publish(&mut child);\n}\n\
+                       mod tests {\n    wait_for_publish(\n}\n";
+        assert_eq!(launch_scan_counts(planted).1, 3, "planted control count");
+        let reported = publish_wait_count_violation(planted);
+        assert!(
+            reported.as_deref().is_some_and(|why| why.contains(" 3 ")),
+            "planted control: a second call is reported, got {reported:?}"
+        );
+        let single = "fn wait_for_publish(child: &mut Child) {}\nfn spawn_monitor() {\n    \
+                      wait_for_publish(&mut child);\n}\nmod tests {\n    wait_for_publish(\n}\n";
+        assert_eq!(publish_wait_count_violation(single), None, "one call");
+
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/monitor.rs");
+        let source =
+            std::fs::read_to_string(path).unwrap_or_else(|err| panic!("read {path}: {err}"));
+        if let Some(why) = publish_wait_count_violation(&source) {
+            panic!("{path}: {why}");
+        }
+    }
+
+    const PUBLISH_SEAM_NO_LITERAL_READ: &str =
+        "no literal std::env::var_os read of DEVFLOW_TEST_WITHHOLD_PUBLISH_PROBE";
+    const PUBLISH_SEAM_FN_NOT_ONCE: &str = "fn publish_probe_withheld( is not defined exactly once";
+    const PUBLISH_SEAM_NOT_GATED: &str = "fn publish_probe_withheld( is not directly under #[cfg(any(test, feature = \"test-support\"))]";
+    const PUBLISH_SEAM_CALL_NOT_GATED: &str = "a call to publish_probe_withheld( is not directly under #[cfg(any(test, feature = \"test-support\"))]";
+    const PUBLISH_SEAM_READ_OUTSIDE: &str =
+        "DEVFLOW_TEST_WITHHOLD_PUBLISH_PROBE is named outside fn publish_probe_withheld(";
+
+    /// The publish-probe seam's layout over `source`'s non-test code (cut at
+    /// its first `mod tests {` line, whole-line `//` comments dropped): the
+    /// variable is read literally (the form the doc check sees) and only in
+    /// the seam's body, the seam is defined once directly under the
+    /// test-support gate, and every call is directly under that gate too.
+    fn publish_probe_seam_violations(source: &str) -> Vec<String> {
+        const GATE: &str = r#"#[cfg(any(test, feature = "test-support"))]"#;
+        const DEFINITION: &str = "fn publish_probe_withheld(";
+        const VARIABLE: &str = "DEVFLOW_TEST_WITHHOLD_PUBLISH_PROBE";
+        let lines: Vec<&str> = source
+            .lines()
+            .take_while(|line| *line != "mod tests {")
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect();
+        let gated = |at: usize| {
+            at.checked_sub(1)
+                .is_some_and(|above| lines[above].trim() == GATE)
+        };
+        let mut violations = Vec::new();
+        if !lines
+            .iter()
+            .any(|line| line.contains(&format!("std::env::var_os(\"{VARIABLE}\")")))
+        {
+            violations.push(PUBLISH_SEAM_NO_LITERAL_READ.to_string());
+        }
+        let defined: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.trim_start().starts_with(DEFINITION))
+            .map(|(at, _)| at)
+            .collect();
+        match defined.as_slice() {
+            [at] => {
+                if !gated(*at) {
+                    violations.push(PUBLISH_SEAM_NOT_GATED.to_string());
+                }
+                // The body runs to the first line that is exactly `}`.
+                let end = lines[*at..]
+                    .iter()
+                    .position(|line| *line == "}")
+                    .map_or(lines.len(), |offset| at + offset);
+                let outside = lines
+                    .iter()
+                    .enumerate()
+                    .any(|(index, line)| line.contains(VARIABLE) && !(*at..=end).contains(&index));
+                if outside {
+                    violations.push(PUBLISH_SEAM_READ_OUTSIDE.to_string());
+                }
+            }
+            _ => violations.push(PUBLISH_SEAM_FN_NOT_ONCE.to_string()),
+        }
+        let ungated_call = lines.iter().enumerate().any(|(at, line)| {
+            line.contains("publish_probe_withheld(")
+                && !line.trim_start().starts_with(DEFINITION)
+                && !gated(at)
+        });
+        if ungated_call {
+            violations.push(PUBLISH_SEAM_CALL_NOT_GATED.to_string());
+        }
+        violations
+    }
+
+    /// T-51-24 (51-10, permanent source scan): a release build never
+    /// compiles the publish-probe seam or its call, so no environment
+    /// variable can make a release launcher ignore a publish. The real file
+    /// yields no violation; each planted source yields the violation it
+    /// plants, including an ungated decoy.
+    #[test]
+    fn the_publish_probe_seam_is_compiled_out_of_non_test_builds() {
+        let gate = "#[cfg(any(test, feature = \"test-support\"))]\n";
+        let read = "    std::env::var_os(\"DEVFLOW_TEST_WITHHOLD_PUBLISH_PROBE\").is_some()\n";
+        let seam = |attribute: &str, body: &str| {
+            format!("{attribute}fn publish_probe_withheld(state: &State) -> bool {{\n{body}}}\n")
+        };
+        let caller = |attribute: &str| {
+            format!(
+                "fn spawn_monitor() {{\n    // Test-only.\n    {attribute}    let withheld = \
+                 publish_probe_withheld(state);\n}}\n"
+            )
+        };
+        let gated_call = format!("    {gate}");
+        let good = format!("{}{}", seam(gate, read), caller(&gated_call));
+        let only = |violation: &str| vec![violation.to_string()];
+
+        assert_eq!(
+            publish_probe_seam_violations(&good),
+            Vec::<String>::new(),
+            "a correct layout (the comment line above the gate is dropped)"
+        );
+        assert_eq!(
+            publish_probe_seam_violations(&format!("{}{}", seam("", read), caller(&gated_call))),
+            only(PUBLISH_SEAM_NOT_GATED),
+            "an ungated definition"
+        );
+        assert_eq!(
+            publish_probe_seam_violations(&format!(
+                "{}{}",
+                seam("#[cfg(test)]\n", read),
+                caller(&gated_call)
+            )),
+            only(PUBLISH_SEAM_NOT_GATED),
+            "a definition gated by cfg(test) only (not compiled into the CLI test build)"
+        );
+        assert_eq!(
+            publish_probe_seam_violations(&format!("{}{}", seam(gate, read), caller(""))),
+            only(PUBLISH_SEAM_CALL_NOT_GATED),
+            "an ungated decoy call"
+        );
+        assert_eq!(
+            publish_probe_seam_violations(&format!(
+                "{}{}fn decoy() -> bool {{\n{read}}}\n",
+                seam(gate, read),
+                caller(&gated_call)
+            )),
+            only(PUBLISH_SEAM_READ_OUTSIDE),
+            "an ungated decoy reading the variable outside the seam"
+        );
+        assert_eq!(
+            publish_probe_seam_violations(&format!(
+                "{}{}",
+                seam(gate, "    let _ = std::env::var_os(SEAM);\n"),
+                caller(&gated_call)
+            )),
+            only(PUBLISH_SEAM_NO_LITERAL_READ),
+            "a read through a constant"
+        );
+        assert_eq!(
+            publish_probe_seam_violations(&format!(
+                "{}{}{}",
+                seam(gate, read),
+                seam(gate, ""),
+                caller(&gated_call)
+            )),
+            only(PUBLISH_SEAM_FN_NOT_ONCE),
+            "two definitions"
+        );
+        assert_eq!(
+            publish_probe_seam_violations(&format!("mod tests {{\n{good}")),
+            vec![
+                PUBLISH_SEAM_NO_LITERAL_READ.to_string(),
+                PUBLISH_SEAM_FN_NOT_ONCE.to_string()
+            ],
+            "the read and the seam only after the test-module cut"
+        );
+
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/monitor.rs");
+        let source =
+            std::fs::read_to_string(path).unwrap_or_else(|err| panic!("read {path}: {err}"));
+        assert!(
+            source.lines().any(|line| line == "mod tests {"),
+            "monitor.rs must keep its `mod tests {{` line, or the scan would read its own controls"
+        );
+        let real = publish_probe_seam_violations(&source);
+        assert!(real.is_empty(), "{path}: {real:?}");
+    }
+
     // ---- 50-26: WR-03 ---------------------------------------------------
     //
     // A stream supervisor whose agent exited while a process it started
