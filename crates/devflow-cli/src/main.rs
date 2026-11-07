@@ -214,8 +214,18 @@ enum Command {
         /// by a later plain `devflow resume`.
         #[arg(long)]
         legacy_claude_launch: bool,
-        /// RED scaffold: not yet a flag.
-        #[arg(skip)]
+        /// Re-arm the run's one-hop fallback for the Code stage (D-01,
+        /// `51-CONTEXT.md`): sets it to this agent and clears a spent mark, so a
+        /// run whose fallback was used can fail over once more. Accepted on a run
+        /// that is not live (stopped, or paused on the rate-limit cron arm);
+        /// refused over a live run like any resume.
+        ///
+        /// Checked as on `devflow start`: it must differ from the agent the run
+        /// resumes under, its binary must be installed and its driver healthy, and
+        /// in `--mode auto` it must be `claude` or `antigravity`. Omit it to keep
+        /// the saved fallback as it is, spent or not. `resume` does not re-read the
+        /// `devflow.toml` key; only `start` does.
+        #[arg(long)]
         fallback_agent: Option<AgentKind>,
         /// Project root.
         #[arg(default_value = ".")]
