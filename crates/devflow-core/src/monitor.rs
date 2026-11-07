@@ -661,7 +661,14 @@ pub fn spawn_monitor(
     let supervisor_pid = child.id();
     info!("monitor spawned with pid {supervisor_pid}; waiting for its socket");
 
-    let reply = wait_for_publish(&mut child, socket, &launch_id, PUBLISH_WAIT)?;
+    // 51-10 (D-12): a test can withhold this launch's publish probe answer,
+    // keyed by the launch's agent and stage. Release builds compile neither
+    // the seam nor its call, and wait as before.
+    #[cfg(any(test, feature = "test-support"))]
+    let probe_withheld = publish_probe_withheld(state);
+    #[cfg(not(any(test, feature = "test-support")))]
+    let probe_withheld = false;
+    let reply = wait_for_publish(&mut child, socket, &launch_id, PUBLISH_WAIT, probe_withheld)?;
     info!(
         "supervisor {supervisor_pid} published {} ({})",
         socket.as_path().display(),
@@ -2437,12 +2444,30 @@ fn end_unpublished_child(child: &mut std::process::Child, wait: Duration) -> Str
     )
 }
 
+/// Test-only seam (51-10, D-12). When `DEVFLOW_TEST_WITHHOLD_PUBLISH_PROBE`
+/// is `<agent>:<stage>` (lowercase, as `AgentKind` and `Stage` display) for
+/// `state`'s agent and stage, [`spawn_monitor`]'s one publish wait treats
+/// every probe of the new supervisor as not yet published, so the real
+/// expiry path runs ([`end_unpublished_child`], [`MonitorError::NotReady`]).
+/// Keyed by the launch being spawned, so a failover relaunch (`codex:code`)
+/// can be withheld while the primary's `claude:code` launch is not. Compiled
+/// only under `cfg(test)` or the `test-support` feature, together with its
+/// one call (pinned by
+/// `monitor::tests::the_publish_probe_seam_is_compiled_out_of_non_test_builds`).
+#[cfg(any(test, feature = "test-support"))]
+fn publish_probe_withheld(state: &State) -> bool {
+    std::env::var_os("DEVFLOW_TEST_WITHHOLD_PUBLISH_PROBE")
+        .is_some_and(|value| value.to_str() == Some(&format!("{}:{}", state.agent, state.stage)))
+}
+
 /// Wait up to `wait` for the supervisor `child` (spawned by this process
 /// with `process_group(0)`) to publish `socket` with `launch_id`.
 ///
 /// Polls every [`PUBLISH_POLL`]: a ping reply with this launch id returns
 /// it and leaves the child running; Gone, Stale, a probe error or another
-/// launch id count as not yet published. If the child exits first it is
+/// launch id count as not yet published. `probe_withheld` (only ever `true`
+/// through the test-only [`publish_probe_withheld`]) skips the probe, so
+/// nothing counts as published. If the child exits first it is
 /// reaped; if the wait expires it is ended with what it started
 /// ([`end_unpublished_child`]). Either way nothing can answer on this
 /// launch's address any more (its only server was the reaped child), so its
@@ -2453,6 +2478,7 @@ fn wait_for_publish(
     socket: &SocketPath,
     launch_id: &str,
     wait: Duration,
+    probe_withheld: bool,
 ) -> Result<crate::supervisor::protocol::PingReply, MonitorError> {
     let pid = child.id();
     let deadline = std::time::Instant::now() + wait;
@@ -2462,8 +2488,9 @@ fn wait_for_publish(
                 "exited by itself before publishing ({status}); 0 child process groups ended"
             );
         }
-        if let Ok(crate::supervisor::Liveness::Alive(reply)) =
-            crate::supervisor::probe(socket.as_path())
+        if !probe_withheld
+            && let Ok(crate::supervisor::Liveness::Alive(reply)) =
+                crate::supervisor::probe(socket.as_path())
             && reply.launch_id == launch_id
         {
             return Ok(reply);
@@ -6901,6 +6928,7 @@ exit 0
             &socket,
             "never-publishes",
             Duration::from_secs(1),
+            false,
         );
         let elapsed = started.elapsed();
         match &result {
@@ -7556,7 +7584,7 @@ exit 0
             .expect("socket path fits sun_path");
         let log = fixture.path("fail.log");
         let mut child = spawn_publish_entry(&bad_cache, &fixture, &launch_id, None, &log);
-        let result = wait_for_publish(&mut child.0, &socket, &launch_id, PUBLISH_WAIT);
+        let result = wait_for_publish(&mut child.0, &socket, &launch_id, PUBLISH_WAIT, false);
         let entry_log = std::fs::read_to_string(&log).unwrap_or_default();
         match &result {
             Err(MonitorError::NotReady(text)) => assert!(
@@ -7587,7 +7615,7 @@ exit 0
                 .expect("socket path fits sun_path");
         let log = fixture.path("ok.log");
         let mut child = spawn_publish_entry(fixture.cache.path(), &fixture, &launch_id, None, &log);
-        let reply = wait_for_publish(&mut child.0, &socket, &launch_id, PUBLISH_WAIT)
+        let reply = wait_for_publish(&mut child.0, &socket, &launch_id, PUBLISH_WAIT, false)
             .unwrap_or_else(|err| {
                 panic!(
                     "a published supervisor is returned: {err}\n{}",
@@ -7751,7 +7779,7 @@ exit 0
         assert!(agent.alive(), "the agent runs while the child is parked");
         tamper(&socket, &sidecar);
         child.0.kill().expect("SIGKILL the child by its own Child");
-        let result = wait_for_publish(&mut child.0, &socket, &launch_id, PUBLISH_WAIT);
+        let result = wait_for_publish(&mut child.0, &socket, &launch_id, PUBLISH_WAIT, false);
         let text = match result {
             Err(MonitorError::NotReady(text)) => text,
             other => panic!("expected NotReady, got {other:?}\n{}", entry_log()),
