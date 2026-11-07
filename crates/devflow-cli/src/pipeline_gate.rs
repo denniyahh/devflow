@@ -2661,6 +2661,131 @@ mod tests {
         );
     }
 
+    /// WR-12 (49-REVIEW.md), reproduced against the gate entry: an advance loads
+    /// its copy of the state, then the operator edits `gate_notify_cmd` on disk
+    /// before the gate opens. The gate fires the edited command, not the loaded
+    /// one, and the edit stays on disk. Its own child with the variable removed,
+    /// because `DEVFLOW_GATE_NOTIFY_CMD` in the runner's environment would replace
+    /// both commands.
+    #[test]
+    fn gate_entry_fires_a_notify_cmd_edited_after_the_advance_loaded() {
+        const NAME: &str =
+            "pipeline_gate::tests::gate_entry_fires_a_notify_cmd_edited_after_the_advance_loaded";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([NAME, "--exact", "--test-threads=1"])
+                .env(devflow_core::test_support::CHILD_TEST_ENV, NAME)
+                .env_remove(devflow_core::gates::GATE_NOTIFY_CMD_ENV)
+                .output()
+                .unwrap();
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let sentinels = tempfile::tempdir().unwrap();
+        let loaded_sentinel = sentinels.path().join("loaded-copy-fired");
+        let edited_sentinel = sentinels.path().join("on-disk-edit-fired");
+        let loaded_cmd = format!("touch {}", loaded_sentinel.display());
+        let edited_cmd = format!("touch {}", edited_sentinel.display());
+        let phase = PhaseId::new(5191);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        state.gate_notify_cmd = Some(loaded_cmd.clone());
+        workflow::save_state(&state).unwrap();
+
+        // The advance's copy, loaded before the edit.
+        let mut loaded = workflow::load_state(root, phase).unwrap();
+        let mut on_disk = workflow::load_state(root, phase).unwrap();
+        on_disk.gate_notify_cmd = Some(edited_cmd.clone());
+        workflow::save_state(&on_disk).unwrap();
+
+        let root_owned = root.to_path_buf();
+        let handle = std::thread::spawn(move || {
+            run_gate_with_timeout(&root_owned, &mut loaded, Stage::Code, "ctx", 30, None)
+                .map(|action| (action, loaded.gate_notify_cmd))
+        });
+        let gate_path = Gates::gate_path(root, phase, Stage::Code);
+        for _ in 0..500 {
+            if gate_path.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(gate_path.exists(), "the gate must be written");
+        answer_open_gate(
+            root,
+            phase,
+            Stage::Code,
+            &GateResponse {
+                approved: true,
+                note: None,
+                responded_by: Some("test".into()),
+            },
+        )
+        .unwrap();
+        let (action, in_memory) = handle.join().unwrap().expect("the gate resolves");
+
+        assert!(matches!(action, GateAction::Advance), "{action:?}");
+        assert!(
+            edited_sentinel.exists(),
+            "the gate must fire the command edited on disk after the advance loaded"
+        );
+        assert!(
+            !loaded_sentinel.exists(),
+            "the gate must not fire the advance's stale copy"
+        );
+        assert_eq!(in_memory.as_deref(), Some(edited_cmd.as_str()));
+        assert_eq!(
+            workflow::load_state(root, phase)
+                .unwrap()
+                .gate_notify_cmd
+                .as_deref(),
+            Some(edited_cmd.as_str()),
+            "the gate's entry save must not overwrite the on-disk edit"
+        );
+    }
+
+    /// IN-10 (49-REVIEW.md), reproduced against the gate entry: a state file left
+    /// unparseable after the advance loaded its copy is neither rewritten with that
+    /// copy nor passed over in silence. The gate reports the unloadable state, its
+    /// bytes are unchanged, and no gate is opened.
+    #[test]
+    fn gate_entry_over_an_unparseable_state_does_not_rewrite_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(5192);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        state.gate_notify_cmd = Some("true".to_string());
+        workflow::save_state(&state).unwrap();
+
+        let mut loaded = workflow::load_state(root, phase).unwrap();
+        let state_file = workflow::state_path(root, phase);
+        std::fs::write(&state_file, "{not json").unwrap();
+
+        let err = run_gate_with_timeout(root, &mut loaded, Stage::Code, "ctx", 30, None)
+            .expect_err("an unparseable state must fail the gate entry");
+
+        let text = err.to_string();
+        assert!(
+            text.contains("state JSON failed"),
+            "the error must say the state did not load: {text}"
+        );
+        assert_eq!(
+            std::fs::read(&state_file).unwrap(),
+            b"{not json",
+            "the unparseable state file must not be rewritten"
+        );
+        assert!(
+            !Gates::gate_path(root, phase, Stage::Code).exists(),
+            "no gate may open over an unloadable state"
+        );
+    }
+
     /// Runs one waiter on a saved state and answers its gate after `during_wait`.
     /// Returns what `during_wait` returned, once the waiter has finished.
     fn with_a_waiter_at_its_gate<T>(
