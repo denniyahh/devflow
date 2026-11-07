@@ -17185,4 +17185,377 @@ mod tests {
             reloaded.supervisor
         );
     }
+
+    // ---- 51-10: the SUPV-01 evidence file is checked row by row (R2-10) ----
+
+    /// The reads `51-SUPV01-EVIDENCE.md`'s `## Trace` table must hold a row for,
+    /// keyed by the backticked name in the row's `Read` cell.
+    const SUPV01_REQUIRED_READS: [&str; 7] = [
+        "wait_for_publish",
+        "successor_runs_on",
+        "commit_pending_record",
+        "remove_abandoned_liveness_file",
+        "recorded_live_socket",
+        "held_liveness_holder",
+        "pending_live_socket",
+    ];
+
+    /// The `## Trace` table's columns, in order.
+    const SUPV01_COLUMNS: [&str; 7] = [
+        "Read",
+        "Location",
+        "Probes",
+        "Unanswerable probe",
+        "Ordinary launch",
+        "Covered by",
+        "Outcome",
+    ];
+
+    /// The `## Conclusion` lines complete mode requires, each naming a test path.
+    const SUPV01_CONCLUSION_LINES: [&str; 2] = ["Failover arm: ", "Cron arm: "];
+
+    /// Every violation of the SUPV-01 evidence file's row contract in `text`,
+    /// with cited files and tests resolved against `root` (R2-10). Trace mode
+    /// (`complete == false`) accepts the pending marker `51-13`; complete mode
+    /// (51-13) rejects it and requires the two conclusion lines. Never panics on
+    /// an unreadable file: that is a violation naming its path.
+    fn supv01_evidence_violations(text: &str, complete: bool, root: &Path) -> Vec<String> {
+        let _ = (text, complete, root);
+        Vec::new()
+    }
+
+    /// The `[read, location, covered by, outcome]` rows a planted trace holds,
+    /// rendered into the three 51-10 headings with the table's other cells
+    /// filled.
+    fn planted_trace(rows: &[[&str; 4]], conclusion: &str) -> String {
+        let mut text = String::from("# SUPV-01 evidence\n\n## Trace\n\n");
+        text.push_str(&format!("| {} |\n", SUPV01_COLUMNS.join(" | ")));
+        text.push_str(&format!("|{}\n", "---|".repeat(SUPV01_COLUMNS.len())));
+        for [read, location, covered, outcome] in rows {
+            text.push_str(&format!(
+                "| `{read}` | {location} | successor | not published | yes | {covered} | {outcome} |\n"
+            ));
+        }
+        text.push_str(
+            "\n## Experiments: publish wait and cron-arm read\n\nPlanted.\n\n\
+             ## Never-silent findings from 51-10\n\nnone\n",
+        );
+        text.push_str(conclusion);
+        text
+    }
+
+    /// A planted source tree: the three files the trace cites, each naming the
+    /// reads that file really holds above its `mod tests {` line, with test
+    /// fns after it; `above_tests_only` is declared only above it, and the
+    /// `pipeline_launch.rs` stand-in names `held_liveness_holder` only inside
+    /// its test module.
+    fn planted_source_tree() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        for (path, body) in [
+            (
+                "crates/devflow-cli/src/pipeline_launch.rs",
+                "fn successor_runs_on() {}\nfn commit_pending_record() {}\nfn above_tests_only() {}\n\
+                 mod tests {\n    fn planted_test() {}\n    const READS: &str = \"held_liveness_holder\";\n}\n",
+            ),
+            (
+                "crates/devflow-cli/src/commands.rs",
+                "fn remove_abandoned_liveness_file() {}\nfn recorded_live_socket() {}\n\
+                 fn held_liveness_holder() {}\nfn pending_live_socket() {}\n\
+                 mod tests {\n    fn commands_test() {}\n}\n",
+            ),
+            (
+                "crates/devflow-core/src/monitor.rs",
+                "fn wait_for_publish() {}\nmod tests {\n    fn monitor_test() {}\n}\n",
+            ),
+        ] {
+            let file = root.path().join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, body).unwrap();
+        }
+        root
+    }
+
+    const PL: &str = "crates/devflow-cli/src/pipeline_launch.rs";
+    const CMDS: &str = "crates/devflow-cli/src/commands.rs";
+    const MON: &str = "crates/devflow-core/src/monitor.rs";
+
+    /// The well-formed trace-mode rows (b): every citation resolves in
+    /// [`planted_source_tree`], and five rows are left to 51-13.
+    fn planted_trace_rows() -> Vec<[String; 4]> {
+        let pending = |read: &str, location: String| {
+            [
+                read.to_string(),
+                location,
+                "51-13".to_string(),
+                "pending (51-13)".to_string(),
+            ]
+        };
+        vec![
+            [
+                "wait_for_publish".to_string(),
+                format!("{MON}:1"),
+                "monitor::tests::monitor_test".to_string(),
+                "refused".to_string(),
+            ],
+            pending("successor_runs_on", format!("{PL}:1")),
+            pending("commit_pending_record", format!("{PL}:2")),
+            pending("remove_abandoned_liveness_file", format!("{CMDS}:1")),
+            [
+                "recorded_live_socket".to_string(),
+                format!("{CMDS}:2"),
+                "commands::tests::commands_test, pipeline_launch::tests::planted_test".to_string(),
+                "refused alike".to_string(),
+            ],
+            pending("held_liveness_holder", format!("{CMDS}:3")),
+            pending("pending_live_socket", format!("{CMDS}:4")),
+        ]
+    }
+
+    /// The complete-mode rows (c): every row a test path or a gap.
+    fn planted_complete_rows() -> Vec<[String; 4]> {
+        planted_trace_rows()
+            .into_iter()
+            .map(|[read, location, covered, outcome]| {
+                if covered == "51-13" {
+                    let covered = if read == "remove_abandoned_liveness_file" {
+                        "gap: decides only a lock file's deletion".to_string()
+                    } else {
+                        "pipeline_launch::tests::planted_test".to_string()
+                    };
+                    [read, location, covered, "measured".to_string()]
+                } else {
+                    [read, location, covered, outcome]
+                }
+            })
+            .collect()
+    }
+
+    fn render(rows: &[[String; 4]], conclusion: &str) -> String {
+        let rows: Vec<[&str; 4]> = rows
+            .iter()
+            .map(|[a, b, c, d]| [a.as_str(), b.as_str(), c.as_str(), d.as_str()])
+            .collect();
+        planted_trace(&rows, conclusion)
+    }
+
+    const PLANTED_CONCLUSION: &str = "\n## Conclusion\n\nFailover arm: pipeline_launch::tests::planted_test.\n\
+                                      Cron arm: commands::tests::commands_test.\n";
+
+    /// `rows` with the row for `read` replaced by `edit` applied to it.
+    fn with_row(
+        rows: Vec<[String; 4]>,
+        read: &str,
+        edit: impl Fn(&mut [String; 4]),
+    ) -> Vec<[String; 4]> {
+        rows.into_iter()
+            .map(|mut row| {
+                if row[0] == read {
+                    edit(&mut row);
+                }
+                row
+            })
+            .collect()
+    }
+
+    /// Assert `violations` is exactly one, containing every fragment.
+    fn exactly_one(violations: &[String], fragments: &[&str], case: &str) {
+        assert_eq!(violations.len(), 1, "{case}: {violations:#?}");
+        for fragment in fragments {
+            assert!(
+                violations[0].contains(fragment),
+                "{case}: `{fragment}` missing from {violations:#?}"
+            );
+        }
+    }
+
+    /// R2-10: the evidence checker reads rows, not headings, and resolves every
+    /// citation. Planted texts against a planted source tree, never the real
+    /// one; runs in every build.
+    #[test]
+    fn the_supv01_evidence_check_rejects_a_stub() {
+        let tree = planted_source_tree();
+        let root = tree.path();
+        let check = |text: &str, complete: bool| supv01_evidence_violations(text, complete, root);
+
+        // (a) The shape the former `rg -q` gate accepted: headings and bare identifiers.
+        let stub = "## Trace\n\nsuccessor_runs_on remove_abandoned_liveness_file possibly_live_sockets\n\n\
+                    ## Experiments: publish wait and cron-arm read\n\n## Never-silent findings from 51-10\n";
+        let violations = check(stub, false);
+        for read in SUPV01_REQUIRED_READS {
+            assert!(
+                violations
+                    .iter()
+                    .any(|v| v.contains(&format!("`{read}`")) && v.contains("no row")),
+                "(a) `{read}` is reported as missing its row: {violations:#?}"
+            );
+        }
+
+        // (b) Well formed, five rows left to 51-13, no conclusion.
+        let trace = render(&planted_trace_rows(), "");
+        assert_eq!(check(&trace, false), Vec::<String>::new(), "(b) trace mode");
+        let violations = check(&trace, true);
+        assert_eq!(violations.len(), 7, "(b) complete mode: {violations:#?}");
+        for read in [
+            "successor_runs_on",
+            "commit_pending_record",
+            "remove_abandoned_liveness_file",
+            "held_liveness_holder",
+            "pending_live_socket",
+        ] {
+            assert!(
+                violations
+                    .iter()
+                    .any(|v| v.contains(&format!("`{read}`")) && v.contains("pending")),
+                "(b) `{read}` is reported pending: {violations:#?}"
+            );
+        }
+        for label in SUPV01_CONCLUSION_LINES {
+            assert!(
+                violations
+                    .iter()
+                    .any(|v| v.contains(label.trim()) && v.contains("no line")),
+                "(b) the missing `{label}` line is reported: {violations:#?}"
+            );
+        }
+
+        // (c) Complete, every citation resolving.
+        let complete_text = render(&planted_complete_rows(), PLANTED_CONCLUSION);
+        assert_eq!(
+            check(&complete_text, false),
+            Vec::<String>::new(),
+            "(c) trace"
+        );
+        assert_eq!(
+            check(&complete_text, true),
+            Vec::<String>::new(),
+            "(c) complete"
+        );
+
+        // (d) A Location without `:<line>`.
+        let rows = with_row(planted_trace_rows(), "wait_for_publish", |row| {
+            row[1] = MON.to_string();
+        });
+        exactly_one(
+            &check(&render(&rows, ""), false),
+            &["`wait_for_publish`", "Location"],
+            "(d)",
+        );
+
+        // (e) A Covered by cell of free words.
+        let rows = with_row(planted_trace_rows(), "wait_for_publish", |row| {
+            row[2] = "the publish wait test".to_string();
+        });
+        exactly_one(
+            &check(&render(&rows, ""), false),
+            &["`wait_for_publish`", "Covered by"],
+            "(e)",
+        );
+
+        // (f) A conclusion whose `Failover arm: ` line names no test path.
+        let no_path = "\n## Conclusion\n\nFailover arm: it works.\n\
+                       Cron arm: commands::tests::commands_test.\n";
+        exactly_one(
+            &check(&render(&planted_complete_rows(), no_path), true),
+            &["Failover arm", "no test path"],
+            "(f)",
+        );
+
+        // (g) Fabricated: well formed in every cell, nothing resolving.
+        let fabricated: Vec<[String; 4]> = SUPV01_REQUIRED_READS
+            .iter()
+            .map(|read| {
+                [
+                    (*read).to_string(),
+                    "crates/x.rs:1".to_string(),
+                    "pipeline_launch::tests::no_such_test".to_string(),
+                    "measured".to_string(),
+                ]
+            })
+            .collect();
+        let fabricated_conclusion = "\n## Conclusion\n\nFailover arm: pipeline_launch::tests::no_such_test\n\
+                                     Cron arm: pipeline_launch::tests::no_such_test\n";
+        let fabricated = render(&fabricated, fabricated_conclusion);
+        let trace_mode = check(&fabricated, false);
+        assert_eq!(trace_mode.len(), 14, "(g) trace mode: {trace_mode:#?}");
+        let complete_mode = check(&fabricated, true);
+        assert_eq!(
+            complete_mode.len(),
+            16,
+            "(g) complete mode: {complete_mode:#?}"
+        );
+        for read in SUPV01_REQUIRED_READS {
+            for kind in ["does not exist", "no_such_test"] {
+                assert_eq!(
+                    trace_mode
+                        .iter()
+                        .filter(|v| v.contains(&format!("`{read}`")) && v.contains(kind))
+                        .count(),
+                    1,
+                    "(g) `{read}` has one `{kind}` violation: {trace_mode:#?}"
+                );
+            }
+        }
+        for label in SUPV01_CONCLUSION_LINES {
+            assert!(
+                complete_mode
+                    .iter()
+                    .any(|v| v.contains(label.trim()) && v.contains("no_such_test")),
+                "(g) the `{label}` line's test is unresolved: {complete_mode:#?}"
+            );
+        }
+
+        // (h) A cited line past the file's last line.
+        let rows = with_row(planted_trace_rows(), "wait_for_publish", |row| {
+            row[1] = format!("{MON}:99");
+        });
+        exactly_one(
+            &check(&render(&rows, ""), false),
+            &["`wait_for_publish`", ":99", "past"],
+            "(h)",
+        );
+
+        // (i) A test declared only above `mod tests {`.
+        let rows = with_row(planted_trace_rows(), "wait_for_publish", |row| {
+            row[2] = "pipeline_launch::tests::above_tests_only".to_string();
+        });
+        exactly_one(
+            &check(&render(&rows, ""), false),
+            &["`wait_for_publish`", "above_tests_only"],
+            "(i)",
+        );
+
+        // (j) The only cited file exists but never names the read.
+        let rows = with_row(planted_trace_rows(), "wait_for_publish", |row| {
+            row[1] = format!("{CMDS}:1");
+        });
+        exactly_one(
+            &check(&render(&rows, ""), false),
+            &["`wait_for_publish`", "names"],
+            "(j)",
+        );
+
+        // (k) The only cited file names the read only inside its test module.
+        let rows = with_row(planted_trace_rows(), "held_liveness_holder", |row| {
+            row[1] = format!("{PL}:1");
+        });
+        exactly_one(
+            &check(&render(&rows, ""), false),
+            &["`held_liveness_holder`", "names"],
+            "(k)",
+        );
+    }
+
+    /// R2-10 on the real file: `51-SUPV01-EVIDENCE.md`'s trace rows are
+    /// complete and every citation resolves against the workspace root.
+    #[test]
+    #[ignore = "reads Phase 51's .planning evidence file, which develop and main do not carry; the phase gate runs it with --run-ignored only"]
+    fn the_supv01_evidence_trace_rows_are_complete() {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = manifest.join("../..");
+        let path = root.join(".planning/phases/51-rate-limit-agent-failover/51-SUPV01-EVIDENCE.md");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+        let violations = supv01_evidence_violations(&text, false, &root);
+        assert!(violations.is_empty(), "{}: {violations:#?}", path.display());
+    }
 }
