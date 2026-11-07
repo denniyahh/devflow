@@ -4231,6 +4231,84 @@ exit 0
         assert_eq!(key("origin_kind").as_str(), Some("task-notification"));
     }
 
+    /// D-16 (backlog 999.71, classifier half): a capture that ends in a torn
+    /// JSON line at the idle timeout is not a clean silence. The record is
+    /// still written (it is what stops Layer 2 scoring partial commits as
+    /// success), flagged `capture_torn_final_line`, and the monitor log names
+    /// the torn line.
+    ///
+    /// The stub prints a complete but malformed line, which is the only way a
+    /// torn line can reach the capture before the kill: the reader tees whole
+    /// lines, and a killed child's partial line arrives at EOF, after this
+    /// check (the read side covers that case).
+    #[test]
+    fn a_torn_final_line_at_the_idle_timeout_is_flagged_on_the_record() {
+        let run_silent_stub = |root: &Path, phase: PhaseId, last_line: Option<&str>| {
+            std::fs::create_dir_all(root.join(".devflow")).unwrap();
+            let last = last_line
+                .map(|line| format!("printf '%s\\n' '{line}'"))
+                .unwrap_or_default();
+            let script = format!(
+                r#"
+set -u
+IFS= read -r _turn || exit 91
+printf '%s\n' '{INIT_LINE}'
+{last}
+sleep 3
+exit 0
+"#
+            );
+            let _ = supervise_stream_child(
+                root,
+                phase,
+                root,
+                "prompt",
+                Duration::from_secs(1),
+                "sh",
+                &["-c".to_string(), script],
+                &[],
+                AgentKind::Claude,
+            );
+            let raw = std::fs::read_to_string(crate::agent_result::idle_timeout_path(root, phase))
+                .expect("a silent stub must produce an idle-timeout record");
+            let record: serde_json::Value =
+                serde_json::from_str(&raw).expect("the record must parse");
+            let log = std::fs::read_to_string(crate::agent_result::monitor_log_path(root, phase))
+                .unwrap_or_default();
+            (record, log)
+        };
+
+        let torn_dir = tempfile::tempdir().unwrap();
+        let (record, log) = run_silent_stub(
+            torn_dir.path(),
+            PhaseId::new(58),
+            Some(r#"{"type":"rate_limit_ev"#),
+        );
+        assert_eq!(
+            record.get("capture_torn_final_line"),
+            Some(&serde_json::Value::Bool(true)),
+            "a torn final line at the timeout must be flagged on the record: {record}"
+        );
+        assert!(
+            log.lines()
+                .any(|line| line.starts_with("[idle-timeout]") && line.contains("torn final line")),
+            "the monitor log must name the torn final line; log:\n{log}"
+        );
+
+        // CONTROL (separate fixture dir): an intact, init-only capture writes
+        // the record without the flag.
+        let intact_dir = tempfile::tempdir().unwrap();
+        let (record, log) = run_silent_stub(intact_dir.path(), PhaseId::new(59), None);
+        assert!(
+            record.get("capture_torn_final_line").is_none(),
+            "an intact capture must not carry the torn flag: {record}"
+        );
+        assert!(
+            !log.contains("torn final line"),
+            "an intact capture must not log a torn line; log:\n{log}"
+        );
+    }
+
     /// Negative control for the test above. Same stub, same silence, one line
     /// removed — the guard must still fire when nothing is outstanding, or it
     /// has simply been disabled rather than made accurate.
