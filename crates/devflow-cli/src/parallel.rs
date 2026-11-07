@@ -137,6 +137,7 @@ pub(crate) fn parallel(
             None,
             false,
             false,
+            None,
         )?;
     }
     Ok(())

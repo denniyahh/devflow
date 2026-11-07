@@ -110,6 +110,9 @@ enum Command {
         /// `devflow resume`; edit `.devflow/state-NN.json` to turn it off.
         #[arg(long)]
         legacy_claude_launch: bool,
+        /// RED scaffold: not yet a flag.
+        #[arg(skip)]
+        fallback_agent: Option<AgentKind>,
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
@@ -585,6 +588,7 @@ fn run() -> Result<(), CliError> {
             until,
             yes_ship,
             legacy_claude_launch,
+            fallback_agent,
             project,
         } => {
             // Worktree is now the default; the deprecated `--worktree` flag is
@@ -614,6 +618,7 @@ fn run() -> Result<(), CliError> {
                 until,
                 yes_ship,
                 legacy_claude_launch,
+                fallback_agent,
             )
         }
         Command::Advance {
@@ -843,5 +848,53 @@ mod tests {
         let missing = dir.path().join("missing");
         let error = project_root(missing).unwrap_err().to_string();
         assert!(error.contains("project path does not exist"));
+    }
+
+    /// The `fallback_agent` a `devflow start` command line parses to.
+    fn start_fallback(args: &[&str]) -> Result<Option<AgentKind>, clap::Error> {
+        let cli = Cli::try_parse_from(args)?;
+        let Command::Start { fallback_agent, .. } = cli.command else {
+            panic!(
+                "`devflow start` parsed to another command: {:?}",
+                cli.command
+            );
+        };
+        Ok(fallback_agent)
+    }
+
+    #[test]
+    fn start_accepts_a_fallback_agent_flag() {
+        let base = [
+            "devflow",
+            "start",
+            "--phase",
+            "51",
+            "--agent",
+            "claude",
+            "--mode",
+            "supervise",
+        ];
+        let with = |extra: &[&'static str]| {
+            let mut args = base.to_vec();
+            args.extend_from_slice(extra);
+            start_fallback(&args)
+        };
+        assert_eq!(
+            with(&["--fallback-agent", "codex"]).expect("a known agent parses"),
+            Some(AgentKind::Codex)
+        );
+        assert!(
+            with(&["--fallback-agent", ""]).is_err(),
+            "an empty fallback is a parse error"
+        );
+        assert!(
+            with(&["--fallback-agent", "nosuch"]).is_err(),
+            "an unknown fallback is a parse error"
+        );
+        assert_eq!(
+            with(&[]).expect("the flag is optional"),
+            None,
+            "omitting the flag leaves no fallback"
+        );
     }
 }

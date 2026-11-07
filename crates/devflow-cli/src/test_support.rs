@@ -591,6 +591,18 @@ pub(crate) fn agent_free_dir_with_agent_stub(program: &str) -> tempfile::TempDir
     dir
 }
 
+/// Add a second no-op agent stub, `program`, to a directory made by
+/// [`agent_free_dir_with_agent_stub`], for a test whose run names two agents
+/// (a primary and its fallback) and so needs both binaries resolvable.
+pub(crate) fn add_agent_stub(path_dir: &Path, program: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let path = path_dir.join(program);
+    std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).unwrap();
+}
+
 /// A `claude` stand-in that answers `--version`, then waits for `go` in
 /// its working directory (the project root) and exits 0, with `sleep`
 /// linked beside it so the wait works under the replaced PATH.

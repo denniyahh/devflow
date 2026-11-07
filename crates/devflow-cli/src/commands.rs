@@ -355,7 +355,9 @@ pub(crate) fn start(
     until: Option<Stage>,
     yes_ship: bool,
     legacy_claude_launch: bool,
+    fallback_agent: Option<AgentKind>,
 ) -> Result<(), CliError> {
+    let _ = fallback_agent; // RED scaffold: accepted, not yet persisted.
     // 999.78/A-11: NOT a bare `State::new`. See
     // `fresh_state_carrying_phase_failures` for why one field survives a
     // forced restart and every other counter does not.
@@ -15455,6 +15457,7 @@ mod tests {
             None,
             false,
             true,
+            None,
         )
         .map_err(|err| err.to_string())
     }
@@ -15526,6 +15529,62 @@ mod tests {
             liveness::Held::Live,
             "the supervisor holds the reserved lock after the launcher has returned"
         );
+    }
+
+    /// `start` as the fallback tests run it: Supervise, no worktree, the capture shape,
+    /// `agent` as the primary and `mode` and `fallback` as given.
+    fn start_with_fallback(
+        root: &Path,
+        phase: PhaseId,
+        agent: AgentKind,
+        mode: Mode,
+        fallback: Option<AgentKind>,
+    ) -> Result<(), CliError> {
+        start(
+            root, phase, agent, mode, false, false, false, None, false, true, fallback,
+        )
+    }
+
+    /// D-01: `start --fallback-agent` persists the fallback, unused, in the run state the
+    /// first supervisor reads, and says which agent it stands behind.
+    #[test]
+    fn start_persists_the_fallback_agent_in_the_run_state() {
+        const NAME: &str = "commands::tests::start_persists_the_fallback_agent_in_the_run_state";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = crate::test_support::go_waiting_claude_dir();
+            crate::test_support::add_agent_stub(path_dir.path(), "codex");
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            let printed = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                printed.contains(
+                    "fallback agent: codex takes over the Code stage once if claude is rate-limited"
+                ),
+                "start names the fallback and the primary: {printed}"
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5141);
+        init_start_repo(root, phase);
+
+        let result = start_with_fallback(
+            root,
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            Some(AgentKind::Codex),
+        );
+        let state = workflow::load_state(root, phase).unwrap();
+        let _reap = crate::test_support::ReapMonitorOnDrop::after_launch(&state);
+        result.expect("the start launches");
+
+        assert_eq!(state.agent, AgentKind::Claude);
+        assert_eq!(state.fallback_agent, Some(AgentKind::Codex));
+        assert!(!state.fallback_consumed, "a new fallback is unused");
+        assert!(state.supervisor.is_some(), "the run launched");
     }
 
     /// The launcher keeps its copy of the lock until the publish save has returned, so
@@ -15839,6 +15898,7 @@ mod tests {
             None,
             false,
             true,
+            None,
         )
         .map_err(|err| err.to_string())
     }
@@ -16444,6 +16504,7 @@ mod tests {
             None,
             false,
             true,
+            None,
         )
         .map_err(|err| err.to_string())
     }
@@ -18109,6 +18170,7 @@ mod tests {
                 None,
                 false,
                 true,
+                None,
             )
             .expect_err("a stop at a safe point during the gate wait is an error")
             .to_string();
