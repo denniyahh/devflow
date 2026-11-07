@@ -1732,14 +1732,28 @@ const CLAUDE_STREAM_RATE_LIMIT_DENIAL_STATUSES: &[&str] = &["rejected"];
 /// Over-classifying means a healthy stream is auto-resumed against a retry time
 /// the parser invented. The asymmetry is the whole reason this function reads
 /// one field instead of matching a shape.
+///
+/// **Provenance (T-30-12, review R2-3).** Both selections run over TOP-LEVEL
+/// events only, through [`is_top_level`]: the turn boundary is picked among
+/// top-level `result` events, and the deciding `rate_limit_event` is the last
+/// top-level one. A subagent's own quota event or `result` (one carrying
+/// `parent_tool_use_id`) decides nothing: it can neither make a denial, mask a
+/// later-reported top-level one, nor move the final-turn boundary. Both callers
+/// (Layer 1's [`parse_claude_event_result`] and the monitor's
+/// [`capture_rate_limit_denial`]) inherit this, so a subagent's denial cannot
+/// classify the stage `RateLimited` and trigger a failover.
 fn detect_claude_stream_rate_limit(events: &[serde_json::Value]) -> Option<String> {
-    // Index of the second-to-last `result` event: everything at or before it is
-    // previous-turn history. `None` (fewer than two results) means the whole
-    // stream is the final turn.
+    let is_top_level_of_type = |v: &serde_json::Value, kind: &str| {
+        v.get("type").and_then(serde_json::Value::as_str) == Some(kind) && is_top_level(v)
+    };
+
+    // Index of the second-to-last top-level `result` event: everything at or
+    // before it is previous-turn history. `None` (fewer than two top-level
+    // results) means the whole stream is the final turn.
     let boundary = events
         .iter()
         .enumerate()
-        .filter(|(_, v)| v.get("type").and_then(serde_json::Value::as_str) == Some("result"))
+        .filter(|(_, v)| is_top_level_of_type(v, "result"))
         .map(|(idx, _)| idx)
         .rev()
         .nth(1);
@@ -1748,11 +1762,12 @@ fn detect_claude_stream_rate_limit(events: &[serde_json::Value]) -> Option<Strin
         None => events,
     };
 
-    // Last eligible event wins, matching the last-`result`-wins convention.
+    // Last eligible top-level event wins, matching the last-`result`-wins
+    // convention.
     let event = eligible
         .iter()
         .rev()
-        .find(|v| v.get("type").and_then(serde_json::Value::as_str) == Some("rate_limit_event"))?;
+        .find(|v| is_top_level_of_type(v, "rate_limit_event"))?;
 
     let info = event.get("rate_limit_info")?;
     let status = info.get("status")?.as_str()?;
@@ -2381,8 +2396,10 @@ pub(crate) struct IdleTimeoutRecordOnDisk {
     /// See [`IdleTimeoutCause::origin_kind`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) origin_kind: Option<String>,
-    /// RED scaffold (51-05): not yet written to disk.
-    #[serde(skip)]
+    /// Set by the monitor when, at the idle timeout, the capture ended in a
+    /// torn JSON line after its last parsed event (D-16), so a quota denial
+    /// could not be ruled out. Written only when true.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) capture_torn_final_line: bool,
 }
 
@@ -2462,9 +2479,9 @@ pub(crate) fn idle_timeout_cause(project_root: &Path, phase: PhaseId) -> IdleTim
 /// The parenthesised clause that follows the reason's leading `idle timeout`
 /// words, assembled from ordered `segments`, or `None` when there are none.
 ///
-/// The ONE place the clause is built. 51-05 prepends its torn-final-line
-/// segment here, so every segment shares one cap,
-/// [`MAX_IDLE_TIMEOUT_CLAUSE_CHARS`].
+/// The ONE place the clause is built. The torn-final-line segment (51-05,
+/// [`TORN_FINAL_LINE_SEGMENT`]) is passed in first, so every segment shares
+/// one cap, [`MAX_IDLE_TIMEOUT_CLAUSE_CHARS`].
 fn idle_timeout_clause(segments: &[String]) -> Option<String> {
     (!segments.is_empty()).then(|| bound_text(&segments.join("; "), MAX_IDLE_TIMEOUT_CLAUSE_CHARS))
 }
@@ -2536,28 +2553,58 @@ fn idle_timeout_clause(segments: &[String]) -> Option<String> {
 /// would be free to disagree, and the disagreement would be invisible.
 #[must_use]
 pub fn capture_shows_rate_limit_denial(project_root: &Path, phase: PhaseId) -> bool {
-    let Some(raw) = read_capture(&stdout_path(project_root, phase)) else {
-        return false;
-    };
-    detect_claude_stream_rate_limit(&ParsedCapture::parse(&raw).events).is_some()
+    matches!(
+        capture_rate_limit_denial(project_root, phase),
+        CaptureDenial::Denied
+    )
 }
 
-/// RED scaffold (51-05): the three-way answer, not yet able to say "torn".
+/// What the phase's capture says about a quota denial, in three answers
+/// (D-16, the classifier half of backlog 999.71).
+///
+/// A boolean folded "the capture ends in a torn line" into "not denied", so a
+/// torn final `rate_limit_event` read as a clean silence. The torn answer keeps
+/// the two apart without promoting a torn line to a denial: only a parsed
+/// top-level `rate_limit_event` whose status is a denial is [`Self::Denied`]
+/// (T-30-12), so agent-authored partial text can never schedule a resume or
+/// trigger a failover.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CaptureDenial {
+    /// [`detect_claude_stream_rate_limit`] finds an explicit denial.
     Denied,
+    /// No denial, and no torn JSON line after the last parsed event (a missing
+    /// capture also answers this).
     NotDenied,
+    /// No parsed denial, but a torn JSON line sits after the last parsed
+    /// event, so the line that would have said "denied" may be the torn one.
     TornAfterLastEvent,
 }
 
-/// RED scaffold (51-05): today's boolean answer in the three-way type.
+/// The three-way denial answer for the phase's capture, from ONE parse.
+///
+/// The monitor's idle path calls this to decide between suppressing the
+/// idle-timeout record (`Denied`), writing it flagged (`TornAfterLastEvent`)
+/// and writing it as before (`NotDenied`); [`parse_idle_timeout_side_channel`]
+/// calls it again at read time, because the partial line of a killed child
+/// reaches the capture only at EOF, after the monitor's check.
 pub(crate) fn capture_rate_limit_denial(project_root: &Path, phase: PhaseId) -> CaptureDenial {
-    if capture_shows_rate_limit_denial(project_root, phase) {
+    let Some(raw) = read_capture(&stdout_path(project_root, phase)) else {
+        return CaptureDenial::NotDenied;
+    };
+    let capture = ParsedCapture::parse(&raw);
+    if detect_claude_stream_rate_limit(&capture.events).is_some() {
         CaptureDenial::Denied
+    } else if capture.torn_json_after_last_matching(|_| true) {
+        CaptureDenial::TornAfterLastEvent
     } else {
         CaptureDenial::NotDenied
     }
 }
+
+/// The torn-final-line segment of the idle-timeout reason's clause (D-16). It
+/// is fixed text shorter than [`MAX_IDLE_TIMEOUT_CLAUSE_CHARS`] and always
+/// the clause's FIRST segment, so the clause cap can never cut it.
+const TORN_FINAL_LINE_SEGMENT: &str = "torn final line, a quota denial cannot be ruled out";
 
 fn parse_idle_timeout_side_channel(project_root: &Path, phase: PhaseId) -> Option<AgentResult> {
     let path = idle_timeout_path(project_root, phase);
@@ -2599,7 +2646,16 @@ fn parse_idle_timeout_side_channel(project_root: &Path, phase: PhaseId) -> Optio
 
     // D-15: the cause clause sits directly after the leading words, so it is
     // inside the gate context even when a long commit phrase is truncated away.
-    let segments: Vec<String> = on_disk.last_result_segment().into_iter().collect();
+    // D-16: a torn final line, flagged by the monitor or found now (a killed
+    // child's partial line is teed at EOF, after the monitor checked), leads
+    // the clause. It changes the wording only; the verdict stays IdleTimeout.
+    let torn = on_disk.capture_torn_final_line
+        || capture_rate_limit_denial(project_root, phase) == CaptureDenial::TornAfterLastEvent;
+    let segments: Vec<String> = torn
+        .then(|| TORN_FINAL_LINE_SEGMENT.to_string())
+        .into_iter()
+        .chain(on_disk.last_result_segment())
+        .collect();
     let lead = match idle_timeout_clause(&segments) {
         Some(clause) => format!("idle timeout ({clause}):"),
         None => "idle timeout:".to_string(),
@@ -7596,6 +7652,22 @@ mod tests {
              and NONE of them were rolled back: 1111111 feat: first. Review the branch \
              before deciding what to keep — this run is TERMINAL and is not retried \
              automatically."
+        );
+
+        // (e) The monitor's flag alone also adds the segment: a record written
+        // with `capture_torn_final_line` over a capture that reads intact now.
+        let flagged = PhaseId::new(78);
+        write_capture_lines(root, flagged, &[V3_INIT_EVENT.to_string()]);
+        write_idle_timeout_record_with(
+            root,
+            flagged,
+            &[],
+            serde_json::json!({"capture_torn_final_line": true}),
+        );
+        let reason = evaluate_layer1(root, flagged).unwrap().reason.unwrap();
+        assert!(
+            reason.starts_with(&format!("idle timeout ({TORN_SEGMENT_TEXT}): ")),
+            "the record's torn flag must add the segment; got: {reason}"
         );
     }
 
