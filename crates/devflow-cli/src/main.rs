@@ -12,7 +12,7 @@ mod staleness;
 mod preflight;
 
 mod pipeline_launch;
-use pipeline_launch::{resume, run_monitor};
+use pipeline_launch::{resume_with_fallback, run_monitor};
 
 mod pipeline_outcomes;
 
@@ -214,6 +214,9 @@ enum Command {
         /// by a later plain `devflow resume`.
         #[arg(long)]
         legacy_claude_launch: bool,
+        /// RED scaffold: not yet a flag.
+        #[arg(skip)]
+        fallback_agent: Option<AgentKind>,
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
@@ -674,8 +677,15 @@ fn run() -> Result<(), CliError> {
             phase,
             agent,
             legacy_claude_launch,
+            fallback_agent,
             project,
-        } => resume(&project_root(project)?, phase, agent, legacy_claude_launch),
+        } => resume_with_fallback(
+            &project_root(project)?,
+            phase,
+            agent,
+            legacy_claude_launch,
+            fallback_agent,
+        ),
         Command::Gate { action } => match action {
             GateCmd::List { all_roots, project } => gate_list(&project_root(project)?, all_roots),
             GateCmd::Approve {
@@ -872,6 +882,35 @@ mod tests {
             );
         };
         Ok(fallback_agent)
+    }
+
+    #[test]
+    fn resume_accepts_a_fallback_agent_flag() {
+        let parse = |extra: &[&'static str]| {
+            let mut args = vec!["devflow", "resume", "--phase", "51"];
+            args.extend_from_slice(extra);
+            let cli = Cli::try_parse_from(args)?;
+            let Command::Resume { fallback_agent, .. } = cli.command else {
+                panic!(
+                    "`devflow resume` parsed to another command: {:?}",
+                    cli.command
+                );
+            };
+            Ok::<_, clap::Error>(fallback_agent)
+        };
+        assert_eq!(
+            parse(&["--fallback-agent", "antigravity"]).expect("a known agent parses"),
+            Some(AgentKind::Antigravity)
+        );
+        assert!(
+            parse(&["--fallback-agent", ""]).is_err(),
+            "an empty fallback is a parse error"
+        );
+        assert_eq!(
+            parse(&[]).expect("the flag is optional"),
+            None,
+            "omitting the flag re-arms nothing"
+        );
     }
 
     #[test]
