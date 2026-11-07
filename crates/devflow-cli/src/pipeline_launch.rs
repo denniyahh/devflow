@@ -619,8 +619,18 @@ where
 /// gone while active and send the operator to `devflow resume`, after the
 /// wrong problem entirely. With no record, the run reads not launched, and the
 /// right remedy is the message below.
+///
+/// One exception: a failover relaunch ([`FailoverRelaunchGuard`] engaged) keeps the
+/// record. WR-04's premise does not hold there, since that relaunch runs the same
+/// stage again after a handoff. Keeping the record lets the failover's never-silent
+/// end (the infra gate, or the abort at the infra ceiling) be written by the
+/// supervisor the state records, which then waits at the gate as the run's owner. The
+/// exemption lasts for the failover relaunch alone: a launch the gate's answer starts
+/// later runs unguarded and clears the record on failure as WR-04 says.
 fn refuse_launch(state: &mut State, message: String) -> Result<(), CliError> {
-    commit(state, |s| s.supervisor = None)?;
+    if !in_failover_relaunch() {
+        commit(state, |s| s.supervisor = None)?;
+    }
     Err(CliError::Message(message))
 }
 
@@ -2028,18 +2038,68 @@ pub(crate) fn launch_context() -> Result<monitor::LaunchContext, CliError> {
 /// launched, and the launch's own error message is the remedy.
 ///
 /// A reservation the failed launch made ends with it: a `pending_supervisor` naming
-/// this launch is cleared too (D-01).
+/// this launch is cleared too (D-01), always.
+///
+/// One exception to the record clear: a failover relaunch ([`FailoverRelaunchGuard`]
+/// engaged) keeps `supervisor`. WR-04's premise does not hold there, since that
+/// relaunch runs the same stage again after a handoff. Keeping the record lets the
+/// failover's never-silent end (the infra gate, or the abort at the infra ceiling) be
+/// written by the supervisor the state records, which then waits at the gate as the
+/// run's owner. The exemption lasts for the failover relaunch alone: a launch the
+/// gate's answer starts later runs unguarded and clears the record on failure as
+/// WR-04 says.
 ///
 /// Called only on a failure path, never before the save that records a new
 /// record (50-13's rule).
 fn record_failed_launch(state: &mut State) -> Result<(), CliError> {
     let failed = state.pending_supervisor.clone();
+    let keep_record = in_failover_relaunch();
     commit(state, |s| {
-        s.supervisor = None;
+        if !keep_record {
+            s.supervisor = None;
+        }
         if failed.is_some() && s.pending_supervisor == failed {
             s.pending_supervisor = None;
         }
     })
+}
+
+thread_local! {
+    /// Set only while a [`FailoverRelaunchGuard`] is alive. Per thread, like
+    /// [`ENGAGED_ADVANCE`]: the relaunch it covers runs on the advance's thread, and
+    /// parallel in-crate tests never share it.
+    static FAILOVER_RELAUNCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Marks the launch running on this thread as a failover relaunch (SUPV-02, D-04),
+/// for as long as the guard lives (RAII: an early return or a panic cannot leave it
+/// set). While it is engaged, [`refuse_launch`] and [`record_failed_launch`] keep
+/// `state.supervisor`, so the never-silent end that follows a failed relaunch is a
+/// set of owned writes by the supervisor the state records (Phase 50 D-03 unchanged).
+/// Engaged only around the `launch_stage` call in [`fail_over_on_rate_limit`].
+struct FailoverRelaunchGuard {
+    /// Keeps the guard on the thread whose flag it set.
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl FailoverRelaunchGuard {
+    fn engage() -> Self {
+        FAILOVER_RELAUNCH.with(|engaged| engaged.set(true));
+        Self {
+            _not_send: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for FailoverRelaunchGuard {
+    fn drop(&mut self) {
+        FAILOVER_RELAUNCH.with(|engaged| engaged.set(false));
+    }
+}
+
+/// Whether a [`FailoverRelaunchGuard`] is engaged on this thread.
+fn in_failover_relaunch() -> bool {
+    FAILOVER_RELAUNCH.with(std::cell::Cell::get)
 }
 
 thread_local! {
@@ -2151,7 +2211,11 @@ fn spawn_agent_and_record(
     // ends the launch with no supervisor record (see `record_failed_launch`),
     // so a failed relaunch never leaves `state.stage` advanced beside a
     // record naming the previous stage's supervisor; the success path below
-    // never clears the record before the save that replaces it.
+    // never clears the record before the save that replaces it. One exception:
+    // a failover relaunch (`FailoverRelaunchGuard` engaged) keeps the record,
+    // because it runs the same stage again after a handoff, so the failover's
+    // never-silent end (the infra gate, or the abort at the infra ceiling) is
+    // written by the supervisor the state records, which then waits at the gate.
     let SpawnedLaunch {
         published,
         reservation,
@@ -3095,6 +3159,17 @@ fn hand_off_agent(
 /// would have with no fallback, given the ORIGINAL rate-limit reason so its
 /// retry time still parses. Only a committed hop consumes the fallback (D-05),
 /// so a refusal leaves it unused.
+///
+/// A relaunch that fails AFTER the handoff commit is never silent either (D-04,
+/// R2-D1): `agent_handoff_relaunch_failed` names the stage, both agents and the
+/// error, then [`handle_infra_outcome`] bumps `infra_failures` once and opens the
+/// never-silent gate, or aborts at the ceiling. Not the cron arm: a refused canary
+/// stays recorded and refuses every later launch, so a scheduled resume could not
+/// succeed, and a successor whose shutdown was not confirmed may still run. The
+/// relaunch runs under [`FailoverRelaunchGuard`], so its failure keeps the
+/// supervisor record and those writes stay owned. A `NotOwner` from the relaunch
+/// means another launch owns the run: it is returned unchanged and nothing more
+/// is written.
 fn fail_over_on_rate_limit(
     project_root: &Path,
     state: &mut State,
@@ -3104,10 +3179,41 @@ fn fail_over_on_rate_limit(
     reason: Option<String>,
 ) -> Result<(), CliError> {
     match hand_off_agent(project_root, state, to, HandoffReason::RateLimited)? {
-        HandoffOutcome::HandedOff { .. } => {
+        HandoffOutcome::HandedOff { from } => {
             #[cfg(test)]
             test_hold("after_failover_commit");
-            launch_stage(state, None, Some(stage))
+            let relaunched = {
+                let _keep_record = FailoverRelaunchGuard::engage();
+                launch_stage(state, None, Some(stage))
+            };
+            match relaunched {
+                Ok(()) => Ok(()),
+                Err(err) if is_not_owner(&err) => Err(err),
+                Err(err) => {
+                    let error = err.to_string();
+                    events::emit(
+                        project_root,
+                        phase,
+                        "agent_handoff_relaunch_failed",
+                        serde_json::json!({
+                            "stage": stage.to_string(),
+                            "from_agent": from.to_string(),
+                            "to_agent": to.to_string(),
+                            "reason": error,
+                        }),
+                    );
+                    let rate_limit = reason.as_deref().unwrap_or("no reason given");
+                    handle_infra_outcome(
+                        project_root,
+                        state,
+                        stage,
+                        Some(format!(
+                            "the handoff to {to} could not relaunch the {stage} stage: {error} \
+                             (after the rate limit: {rate_limit})"
+                        )),
+                    )
+                }
+            }
         }
         HandoffOutcome::Refused(refusal) => {
             events::emit(
@@ -11291,9 +11397,13 @@ mod tests {
         state.stage = Stage::Code;
         workflow::save_state(&state).unwrap();
 
-        let outcome =
-            hand_off_agent(root, &mut state, AgentKind::Codex, HandoffReason::RateLimited)
-                .unwrap();
+        let outcome = hand_off_agent(
+            root,
+            &mut state,
+            AgentKind::Codex,
+            HandoffReason::RateLimited,
+        )
+        .unwrap();
         assert_eq!(
             outcome,
             HandoffOutcome::HandedOff {
@@ -11318,8 +11428,7 @@ mod tests {
     /// nothing more before the state is read.
     #[test]
     fn a_rate_limit_before_any_commit_still_hands_off() {
-        const NAME: &str =
-            "pipeline_launch::tests::a_rate_limit_before_any_commit_still_hands_off";
+        const NAME: &str = "pipeline_launch::tests::a_rate_limit_before_any_commit_still_hands_off";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = waiting_agents_dir();
             let output =
@@ -13565,6 +13674,27 @@ mod tests {
         Some(item)
     }
 
+    /// `line`'s code part: the text before its first `//` that lies outside a
+    /// `"…"` string literal, found by a quote scan honouring `\` escapes. A trailing
+    /// comment is not code, and a `//` inside a literal (`"http://x"`) is not one.
+    fn code_part(line: &str) -> &str {
+        let bytes = line.as_bytes();
+        let mut in_string = false;
+        let mut index = 0;
+        while index < bytes.len() {
+            match bytes[index] {
+                b'\\' if in_string => index += 1,
+                b'"' => in_string = !in_string,
+                b'/' if !in_string && bytes.get(index + 1) == Some(&b'/') => {
+                    return &line[..index];
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+        line
+    }
+
     const CLEAR_SPAWN_NOT_FOUND: &str =
         "spawn_agent_and_record not found in the non-test code (or under 40 lines)";
     const CLEAR_SPAWN_CLEARS: &str =
@@ -13579,7 +13709,9 @@ mod tests {
     /// 50-13's rule as a pure scan over `source` (R6-G4): in the non-test,
     /// comment-stripped code, `spawn_agent_and_record` never clears the
     /// supervisor record itself (only its failure helper does) and calls
-    /// `record_failed_launch`, and `refuse_launch` clears the record.
+    /// `record_failed_launch`, and `refuse_launch` clears the record. And
+    /// (51-06) every line whose code part engages `FailoverRelaunchGuard` lies
+    /// inside `fail_over_on_rate_limit`, the one relaunch allowed to keep the record.
     fn launch_record_clear_violations(source: &str) -> Vec<String> {
         let lines = non_test_code_lines(source);
         let has = |item: &[&str], needle: &str| item.iter().any(|line| line.contains(needle));
@@ -13602,6 +13734,22 @@ mod tests {
                 violations.push(CLEAR_REFUSE_NO_CLEAR.to_string());
             }
             Some(_) => {}
+        }
+        const FAILOVER_HEADER: &str = "fn fail_over_on_rate_limit(";
+        let failover = lines
+            .iter()
+            .position(|line| line.starts_with(FAILOVER_HEADER))
+            .map(|start| {
+                let len =
+                    item_lines(&lines[start..], FAILOVER_HEADER, "}").map_or(0, |item| item.len());
+                start..start + len
+            });
+        for (index, line) in lines.iter().enumerate() {
+            if code_part(line).contains("FailoverRelaunchGuard::engage(")
+                && !failover.as_ref().is_some_and(|span| span.contains(&index))
+            {
+                violations.push(CLEAR_GUARD_OUTSIDE_FAILOVER.to_string());
+            }
         }
         violations
     }
