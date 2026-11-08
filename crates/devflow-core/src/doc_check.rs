@@ -763,6 +763,131 @@ fn operations_md_documents_run_liveness_and_the_stop_arms() {
     );
 }
 
+/// For each `(prefix, fragment)`, a finding when no line of `text` starts with
+/// `prefix`, or when the FIRST line that does lacks `fragment`. Only that first
+/// line is read, so a fragment moved into another row does not count.
+fn row_findings(text: &str, rows: &[(&str, &str)]) -> Vec<String> {
+    rows.iter()
+        .filter_map(|&(prefix, fragment)| {
+            match text.lines().find(|line| line.starts_with(prefix)) {
+                None => Some(format!("no row starts with {prefix:?}")),
+                Some(row) if !row.contains(fragment) => {
+                    Some(format!("the row starting {prefix:?} lacks {fragment:?}"))
+                }
+                Some(_) => None,
+            }
+        })
+        .collect()
+}
+
+/// OPERATIONS.md rows that must name the fallback (51-11): the flag and the
+/// `devflow.toml` key on `start`, the flag on `resume`, and the cron record's
+/// fallback condition.
+const FALLBACK_ROW_FRAGMENTS: &[(&str, &str)] = &[
+    ("| `devflow start", "--fallback-agent"),
+    ("| `devflow start", "fallback_agent"),
+    ("| `devflow resume", "--fallback-agent"),
+    ("| `cron-instructions-NN.json`", "fallback"),
+];
+
+/// The failover events and keys an operator reads in `events.jsonl`, which
+/// OPERATIONS.md must name (51-11). Only events this phase emits: none whose
+/// producer was dropped from it.
+const FAILOVER_EVENT_FRAGMENTS: &[&str] = &[
+    "agent_handoff",
+    "agent_handoff_refused",
+    "agent_handoff_relaunch_failed",
+    "rate_limited",
+    "tree_dirty",
+    "commit_count",
+];
+
+/// The other operator docs and the fallback fragment each must hold (51-11).
+const FALLBACK_GUIDE_FRAGMENTS: &[(&str, &str)] = &[
+    ("README.md", "--fallback-agent"),
+    ("docs/guides/unattended-mode.md", "--fallback-agent"),
+    ("docs/guides/configuration.md", "fallback_agent"),
+];
+
+/// 51-11 (D-01, D-02, D-03, D-04, D-07, D-10, R-3): the operator docs document
+/// the rate-limit fallback. Outside HTML comments, OPERATIONS.md's `devflow
+/// start` row names `--fallback-agent` and the `fallback_agent` key, its
+/// `devflow resume` row names `--fallback-agent`, its `cron-instructions-NN.json`
+/// row says when a fallback applies, and the text names the failover events and
+/// their keys; README.md and the unattended-mode guide name the flag, and the
+/// configuration guide names the key.
+#[test]
+fn operations_md_documents_the_fallback_agent_and_its_events() {
+    // Planted controls, through the same helpers as the real checks.
+    let planted_table = "| `devflow start --phase N` | Begin |\n\
+                         | `devflow resume --phase N [--fallback-agent <agent>]` | Resume |\n\
+                         | `devflow start --fallback-agent x` fallback_agent | a later row |\n";
+    assert_eq!(
+        row_findings(
+            planted_table,
+            &[
+                ("| `devflow start", "--fallback-agent"),
+                ("| `devflow resume", "--fallback-agent"),
+            ],
+        ),
+        vec!["the row starting \"| `devflow start\" lacks \"--fallback-agent\"".to_string()],
+        "planted control: a start row lacking the flag is reported, and only it, even when \
+         a later row carries the flag"
+    );
+    assert_eq!(
+        row_findings(
+            planted_table,
+            &[("| `cron-instructions-NN.json`", "fallback")]
+        ),
+        vec!["no row starts with \"| `cron-instructions-NN.json`\"".to_string()],
+        "planted control: a missing row is reported"
+    );
+    let every_event = FAILOVER_EVENT_FRAGMENTS.join("\n");
+    assert_eq!(
+        missing_fragments(
+            &every_event.replace("tree_dirty", ""),
+            FAILOVER_EVENT_FRAGMENTS
+        ),
+        vec!["tree_dirty"],
+        "planted control: a text missing only tree_dirty must report exactly tree_dirty"
+    );
+    let flag_only_in_a_comment = "| `devflow resume --phase N <!-- --fallback-agent -->` |";
+    assert!(
+        row_findings(
+            flag_only_in_a_comment,
+            &[("| `devflow resume", "--fallback-agent")]
+        )
+        .is_empty(),
+        "planted control: before stripping, the commented flag still counts"
+    );
+    assert_eq!(
+        row_findings(
+            &strip_html_comments(flag_only_in_a_comment),
+            &[("| `devflow resume", "--fallback-agent")],
+        ),
+        vec!["the row starting \"| `devflow resume\" lacks \"--fallback-agent\"".to_string()],
+        "planted control: a flag only inside an HTML comment must be missing after stripping"
+    );
+
+    let operations = read_doc("OPERATIONS.md");
+    let mut findings = row_findings(&operations, FALLBACK_ROW_FRAGMENTS);
+    findings.extend(
+        missing_fragments(&operations, FAILOVER_EVENT_FRAGMENTS)
+            .into_iter()
+            .map(|fragment| format!("OPERATIONS.md does not name {fragment:?}")),
+    );
+    for &(relative, fragment) in FALLBACK_GUIDE_FRAGMENTS {
+        if !read_doc(relative).contains(fragment) {
+            findings.push(format!("{relative} does not name {fragment:?}"));
+        }
+    }
+    assert!(
+        findings.is_empty(),
+        "the operator docs do not document the fallback agent; outside HTML comments:\n{}",
+        findings.join("\n")
+    );
+}
+
 /// The lines of `text` from the line equal to `heading` up to, not
 /// including, the next line starting with `## `, or to the end. `None` when no
 /// line equals `heading`.
