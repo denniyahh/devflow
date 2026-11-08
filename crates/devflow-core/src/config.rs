@@ -491,10 +491,14 @@ pub fn git_flow_for_run(project_root: &Path, persisted_base: Option<&str>) -> Gi
 /// `#[non_exhaustive]`, so a new field there would break downstream struct
 /// literals. Unknown keys are ignored, so every other key in the file is
 /// invisible here.
+///
+/// The value is read as a string and parsed with `AgentKind`'s `FromStr`, the
+/// parser `--fallback-agent` uses, so the key accepts the same spellings as the
+/// flag (any case, and `open-code`).
 #[derive(serde::Deserialize)]
 struct FallbackAgentKey {
     #[serde(default)]
-    fallback_agent: Option<AgentKind>,
+    fallback_agent: Option<String>,
 }
 
 /// Resolve the standing fallback agent from `devflow.toml`'s `fallback_agent`
@@ -526,14 +530,16 @@ pub fn fallback_agent(project_root: &Path) -> Result<Option<AgentKind>, String> 
             return Ok(None);
         }
     };
-    toml::from_str::<FallbackAgentKey>(&contents)
-        .map(|key| key.fallback_agent)
-        .map_err(|error| {
-            format!(
-                "devflow.toml: cannot read `fallback_agent`: {error}\nfix the file, or remove \
-                 the `fallback_agent` key"
-            )
-        })
+    let refusal = |error: &dyn std::fmt::Display| {
+        format!(
+            "devflow.toml: cannot read `fallback_agent`: {error}\nfix the file, or remove \
+             the `fallback_agent` key"
+        )
+    };
+    let key = toml::from_str::<FallbackAgentKey>(&contents).map_err(|error| refusal(&error))?;
+    key.fallback_agent
+        .map(|value| value.parse::<AgentKind>().map_err(|error| refusal(&error)))
+        .transpose()
 }
 
 fn env_value(key: &str) -> Option<String> {
@@ -1084,6 +1090,17 @@ mod tests {
             resolve(Some("fallback_agent = \"codex\"\n")),
             Ok(Some(AgentKind::Codex)),
             "an agent name resolves to that agent"
+        );
+        // The spellings `--fallback-agent` accepts, through the same parser.
+        assert_eq!(
+            resolve(Some("fallback_agent = \"Codex\"\n")),
+            Ok(Some(AgentKind::Codex)),
+            "the key is case-insensitive, like the flag"
+        );
+        assert_eq!(
+            resolve(Some("fallback_agent = \"open-code\"\n")),
+            Ok(Some(AgentKind::OpenCode)),
+            "the key accepts `open-code`, like the flag"
         );
 
         let unknown = resolve(Some("fallback_agent = \"nosuch\"\n"))
