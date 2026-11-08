@@ -22,7 +22,7 @@ Per the dogfooding rule in CLAUDE.md, every stage or step run outside `devflow s
     `e4bf0c5` (X-06), `b94d356` (gate list context, X-08), `be243d3` (SUPV-01 evidence citations re-derived, X-04).
   - X-01 (denial followed by a torn line): the phase decisions did not settle which rule wins; operator chose option B
     (the torn line wins everywhere, the stage ends at a gate): `17a47cf`. Same round: `91e1b76` makes the worktree
-    handoff test assert DevFlow's `.planning/config.json` change is only the auto-chain flag (operator-approved).
+    handoff test assert DevFlow's `.planning/config.json` change is only the auto-chain flag (operator raised it; the session made the change).
   - Not fixed here, filed to backlog: X-02 → 999.194 (Phase 52, operator), X-07 → 999.195, X-09 → 999.196, X-10 → 999.197, X-11 → 999.198,
     X-12 → 999.199, suspected items → 999.200-999.202, 999.204, checker gap → 999.203.
 - **Why outside DevFlow:** same as exception 1 (999.189), and a reject would dispatch a full execute rather than gaps
