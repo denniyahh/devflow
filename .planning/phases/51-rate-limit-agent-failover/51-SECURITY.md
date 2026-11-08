@@ -119,3 +119,11 @@ Evidence was checked at ASVS L1 by two `gsd-security-auditor` passes (51-01..06 
 - [x] `status: verified` set in frontmatter
 
 **Approval:** verified 2026-11-07
+
+## Security Audit 2026-11-08
+
+| Metric | Count |
+|---|---|
+| Threats found | 35 |
+| Closed | 35 |
+| Open | 0 |
