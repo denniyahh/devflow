@@ -1073,6 +1073,81 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.217: Operator-Facing Output Is Noisy: Raw Tracing Lines, a Red ✗ for an Unset Log Level, and Warnings That Do Not Apply (BACKLOG)
+
+**Found:** 2026-11-08, live failover probe on the merged Phase 51 build (`fad00ff`), throwaway project; report `.planning/audits/2026-11-08-live-failover-probe.md`.
+`start`, `cleanup` and `gate reject` print `tracing` INFO/WARN lines (ANSI timestamps, module paths) mixed into their
+prose output. `doctor` marks `RUST_LOG` not set with a red ✗ although nothing is wrong. On a project with no remote,
+`start` prints two fetch/currency warnings and a "build provenance staleness check did not confirm a fresh build"
+warning that only concerns DevFlow's own workspace. A real problem is hard to see among them.
+
+**Fix shape:** route tracing to the monitor log (or behind `RUST_LOG`), keep stdout to the command's own sentences;
+`doctor` reports `RUST_LOG` as information, not a failure; skip the provenance warning outside DevFlow's own repo and
+collapse the two fetch warnings into one line when there is no remote. Stability phase.
+
+### Phase 999.216: `devflow --version` Does Not Show the Build's Commit (BACKLOG)
+
+**Found:** 2026-11-08, live failover probe on the merged Phase 51 build (`fad00ff`), throwaway project; report `.planning/audits/2026-11-08-live-failover-probe.md`.
+Every build from `develop` since 3.0.0 prints `devflow 3.0.0`; only the `workflow_started` event records the commit
+`build.rs` embeds. An operator cannot tell from the shell which build is installed, which the dogfooding rule (check
+`devflow --version` before a run) depends on.
+
+**Fix shape:** `--version` prints `3.0.0 (fad00ff, clean)` from the embedded values. Small; next fix branch.
+
+### Phase 999.215: After a Failover the Fallback Keeps the Run, but Every Message Says It Takes Over Only the Code Stage; Its Prompt Says Nothing About the Handoff (BACKLOG)
+
+**Found:** 2026-11-08, live failover probe on the merged Phase 51 build (`fad00ff`), throwaway project; report `.planning/audits/2026-11-08-live-failover-probe.md`.
+The start notice says "codex takes over the Code stage once if claude is rate-limited", and README/OPERATIONS say the
+fallback "takes over Code once". In the run, `state.agent` became codex at the handoff and Validate also ran on codex
+(and Ship would have). That may be the right behaviour (the primary is still limited), but nothing says so. The fallback
+also got the same prompt as the primary (`/gsd-execute-phase 1 --auto`), with no word that it is taking over an
+interrupted stage with uncommitted work. Codex coped here (GSD's own resume logic found the committed task, the
+uncommitted SUMMARY/STATE/ROADMAP changes, and finished), but that is the workflow's resilience, not a handoff contract.
+
+**Fix shape:** decide and document whether the run returns to the primary after Code (and when); make the notice say
+what happens; add a short handoff paragraph to the relaunched prompt (taking over from <agent> after a rate limit; the
+tree may hold uncommitted work from it; do not discard it). Phase 52 (failover).
+
+### Phase 999.214: Define Is a Paid No-Op: Every Run Launches a Full Agent Session That Does Nothing (BACKLOG)
+
+**Found:** 2026-11-08, live failover probe on the merged Phase 51 build (`fad00ff`), throwaway project; report `.planning/audits/2026-11-08-live-failover-probe.md`.
+Define launched real Claude twice in this probe; each took 12-15 s and about $0.33, and the agent's own answer was
+"This Define stage had no agent work, so I ran no discuss-phase or interview and changed no planning files." DevFlow
+never runs discuss there (D-14, `define_stage_prompt`), and the dry run still claims it does (999.183).
+
+**Fix shape:** drop Define from the pipeline (start at Plan), or make it a local check with no agent launch. Either
+removes a stage that costs money and time and can only fail. Stability phase.
+
+### Phase 999.213: `devflow cleanup` Misreports a Stopped Run as "Halted via --until", Contradicts Itself, and `--force` Leaves the State Behind (BACKLOG)
+
+**Found:** 2026-11-08, live failover probe on the merged Phase 51 build (`fad00ff`), throwaway project; report `.planning/audits/2026-11-08-live-failover-probe.md`.
+After `devflow stop --phase 1`, `devflow cleanup` printed: "keeping worktree … halted via --until; run `devflow resume`
+first, or pass --force", then "no worktrees to clean up", then a WARN that it could not delete the "merged" branch the
+kept worktree still used; exit 0. The first message is printed for any `state.stopped` run (`commands.rs` ~1346 reads
+only `stopped`, not why). `cleanup --force` then removed the worktree and branch but left `.devflow/state-01.json`:
+`devflow status` kept reporting phase 1 active at Code with a worktree that no longer existed, until the next `start`
+replaced the state without a word.
+
+**Not established:** whether leaving the state is deliberate (OPERATIONS.md says `stop` then `cleanup --force`
+compose); either way `status` should not show a removed run as active.
+
+**Fix shape:** name the stop's real cause (`stop_reason`); skip the merged-branch delete for a branch a kept worktree
+uses; `--force` clears the state of the run whose worktree it removed, or `status` marks such a state stale; `start`
+says when it replaces a stale state. Stability phase.
+
+### Phase 999.212: No Real Claude Quota Denial Has Ever Been Captured, and the Denial Fixtures Lag the Live Event Shape (BACKLOG)
+
+**Found:** 2026-11-08, live failover probe on the merged Phase 51 build (`fad00ff`), throwaway project; report `.planning/audits/2026-11-08-live-failover-probe.md`.
+A search of every archived capture on the operator's machine found no `rate_limit_event` with a status other than
+`allowed`; every denial DevFlow tests is constructed. The Agent SDK documents `rate_limit_info.status` as `allowed |
+allowed_warning | rejected`, so DevFlow's one denial token (`rejected`) is right on paper. Live events now also carry
+`utilization` and a nested `unifiedWindows` object (`five_hour`, `seven_day`, each with its own `status`) that no
+fixture has. The probe's denial used the live shape with `status` flipped and was classified correctly.
+
+**Fix shape:** when a stream capture carries any non-`allowed` `rate_limit_event`, copy that line to
+`.devflow/history/observed-rate-limit-events.jsonl` so the first real denial is kept; refresh the fixtures to the live
+shape; add `allowed_warning` as an explicit non-denial test. Phase 52 (failover).
+
 ### Phase 999.211: README and OPERATIONS.md Describe Rate-Limit Detection and the One-Hop Rule Loosely (BACKLOG)
 
 **Found:** 2026-11-08, graphify review of PR #234 (triage: `.planning/audits/2026-11-08-graphify-review-triage-pr234.md`).
