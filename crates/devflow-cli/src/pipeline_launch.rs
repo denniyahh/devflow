@@ -628,6 +628,27 @@ where
     }
 }
 
+/// The refusal [`canary_gate`] would give a launch of `state`'s stage under its agent
+/// from the canary outcome the run already recorded, described for an operator; `None`
+/// when the launch would not be refused for that reason. The same predicate as
+/// [`launch_stage_inner`]'s (the stream path, a recorded `Absent` or `Unverified`), read
+/// without running a canary or writing anything.
+pub(crate) fn recorded_canary_refusal(state: &State) -> Option<String> {
+    if !stream_launch_enabled(state.agent, state.stage, state.legacy_claude_launch) {
+        return None;
+    }
+    match state.canary.as_ref()? {
+        canary::CanaryOutcome::Confirmed => None,
+        canary::CanaryOutcome::Absent => {
+            Some("background-task notification delivery is ABSENT".to_string())
+        }
+        canary::CanaryOutcome::Unverified(reason) => Some(format!(
+            "the delivery canary could not run: {}",
+            truncate_reason(reason)
+        )),
+    }
+}
+
 /// Abort a launch the canary refused, leaving no half-launched stage behind.
 ///
 /// Clearing `supervisor` applies WR-04's rationale (see

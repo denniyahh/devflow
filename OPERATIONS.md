@@ -319,6 +319,7 @@ The failover events in `events.jsonl`:
 | `agent_handoff` | The run changed agent | `stage`, `from_agent`, `to_agent`, `reason` (`rate_limited` for a failover, `resume --agent` for `devflow resume --agent`), `tree_dirty` (the tree handed over had uncommitted changes), `commit_count` (commits on the phase branch). Each of the last two is `null` when it could not be measured |
 | `agent_handoff_refused` | The fallback was refused before the handoff; the cron arm follows | `stage`, `from_agent`, `to_agent`, `reason` |
 | `agent_handoff_relaunch_failed` | The handoff happened, but Code could not be relaunched under the fallback | `stage`, `from_agent`, `to_agent`, `reason` (the launch error) |
+| `gate_relaunch_refused` | A retry or loop-back answer to a stage's failure gate was not relaunched, because the delivery canary recorded for the run refuses its agent; the run is marked stopped | `stage`, `agent`, `reason` (the recorded refusal) |
 
 `agent_handoff_relaunch_failed` is followed by the never-silent Code gate
 (`gate_fired`), or by an abort when the run is at the infra ceiling, never by
@@ -328,20 +329,22 @@ refuses every later launch. And after a shutdown that could not be confirmed, a
 successor may still be running. The gate names the cause as
 `the handoff to <agent> could not relaunch the code stage: <error>`.
 
-The way on when the fallback's canary refused (read from the code, not from a
-live run):
+The way on when the fallback's canary refused:
 
 - Answering the gate with a retry (`devflow gate approve`, or a rejection
-  without `abort`) relaunches Code under the same agent. The recorded refusal
-  refuses it again, the supervisor exits, and the run is left not live with no
-  new gate.
+  without `abort`) does not relaunch Code, because the recorded refusal would
+  refuse it again. The supervisor marks the run stopped, with a stop reason
+  naming the refusal and `devflow resume --phase N --agent <other>`, writes a
+  `gate_relaunch_refused` event, and exits. The same applies to any stage's
+  failure gate whose run has a refusing canary recorded for its agent.
 - `devflow stop --phase N` answers the gate with an abort, which ends the run
   and removes its state.
 - To continue on another agent, answer the gate with a retry, wait until
   `devflow status` shows the run not live, then run
   `devflow resume --phase N --agent <agent>` naming an agent other than the
   run's current one. The handoff clears the recorded canary, so that agent
-  runs its own.
+  runs its own. A plain `devflow resume --phase N` is refused by the same
+  recorded canary.
 
 ## Notify hook (never miss a gate)
 

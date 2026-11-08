@@ -522,6 +522,108 @@ fn a_handoff_to_antigravity_that_fails_its_canary_ends_at_a_gate() {
     assert!(state.gate_pending, "the never-silent gate is open");
 }
 
+/// Drive a run whose fallback failed its canary to the Code gate, answer that gate with
+/// `answer` (`gate approve` or `gate reject`, plus its arguments), and wait for the
+/// supervisor's response. Returns the event log, parsed and as text.
+fn answer_the_failed_canary_gate(rig: &Rig, answer: &[&str]) -> (Vec<Value>, String) {
+    let phase = rig.phase;
+    rig.start(&["--fallback-agent", "antigravity"]);
+    rig.wait_for_any(&[
+        "gate_fired",
+        "workflow_finished",
+        "rate_limit_resume_scheduled",
+    ]);
+    assert!(
+        !rig.events_named("gate_fired").is_empty(),
+        "the run reached the Code gate first; events:\n{}",
+        rig.events_text()
+    );
+
+    let output = common::hermetic_devflow(&rig.home)
+        .args(["gate", answer[0], &phase.to_string(), "code"])
+        .args(&answer[1..])
+        .arg("--project")
+        .arg(&rig.root)
+        .output()
+        .expect("run devflow gate");
+    // A fast waiter can consume the answer and close its gate before the writer's
+    // re-check (backlog 999.177); the event below decides whether it was applied.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() || stderr.contains("published after that gate closed"),
+        "the gate answer failed: {stderr}"
+    );
+    rig.wait_for_any(&["gate_relaunch_refused", "workflow_finished"]);
+    (rig.events(), rig.events_text())
+}
+
+/// What a retry or loop-back answer leaves when the recorded canary refuses the run's
+/// agent: a stopped run naming the refusal and the resume that continues on another
+/// agent, a `gate_relaunch_refused` event, no open gate, and no second launch.
+fn assert_the_relaunch_was_refused_loudly(rig: &Rig, events: &[Value], log: &str) {
+    let refused = position(events, "gate_relaunch_refused", log);
+    assert_eq!(events[refused]["stage"], "code", "{}", events[refused]);
+    assert_eq!(
+        events[refused]["agent"], "antigravity",
+        "{}",
+        events[refused]
+    );
+    assert!(
+        events[refused]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("ABSENT")),
+        "the event names the recorded refusal: {}",
+        events[refused]
+    );
+
+    let state = rig.state();
+    assert!(
+        state.stopped,
+        "the run is marked stopped, not left live-looking"
+    );
+    let reason = state.stop_reason.as_deref().unwrap_or_default();
+    assert!(
+        reason.contains(&format!(
+            "run `devflow resume --phase {} --agent <other>`",
+            rig.phase
+        )),
+        "the stop reason names the way on: {reason}"
+    );
+    assert!(
+        reason.contains("the code stage cannot relaunch under antigravity"),
+        "the stop reason names the stage and the agent: {reason}"
+    );
+    assert!(!state.gate_pending, "no gate is left open");
+    assert_eq!(state.canary, Some(CanaryOutcome::Absent));
+    assert_eq!(
+        rig.invocations("agy"),
+        ["canary"],
+        "the refused relaunch spawned no second canary and no stage turn"
+    );
+}
+
+/// A retry answer (`gate approve`) to the gate after a failed-canary handoff ends the
+/// run loudly instead of relaunching into the recorded refusal and ending the
+/// supervisor with no record, gate or event (999.187 at this entry point).
+#[test]
+fn approving_the_failed_canary_gate_stops_the_run_and_names_the_way_on() {
+    let phase = PhaseId::new(5124);
+    let rig = Rig::new(phase, AgyCanary::WithholdsToken);
+    let _reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+    let (events, log) = answer_the_failed_canary_gate(&rig, &["approve"]);
+    assert_the_relaunch_was_refused_loudly(&rig, &events, &log);
+}
+
+/// The loop-back answer (`gate reject` without `abort`) ends the same way as a retry.
+#[test]
+fn rejecting_the_failed_canary_gate_stops_the_run_and_names_the_way_on() {
+    let phase = PhaseId::new(5125);
+    let rig = Rig::new(phase, AgyCanary::WithholdsToken);
+    let _reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+    let (events, log) = answer_the_failed_canary_gate(&rig, &["reject", "--note", "try again"]);
+    assert_the_relaunch_was_refused_loudly(&rig, &events, &log);
+}
+
 /// D-11 / criterion 2 under the same auto-mode rig: with no fallback, the same
 /// Claude rate limit at Code writes the cron resume instructions. Negative
 /// control: no handoff, and the `agy` stub on PATH is never launched for a
