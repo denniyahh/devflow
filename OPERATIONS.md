@@ -329,7 +329,10 @@ cron instructions. When the fallback's delivery canary refused, a scheduled
 resume would only fail again: the refusal stays recorded for the run and
 refuses every later launch. And after a shutdown that could not be confirmed, a
 successor may still be running. The gate names the cause as
-`the handoff to <agent> could not relaunch the code stage: <error>`.
+`the handoff to <agent> could not relaunch the code stage: <error>`. When the
+recorded canary refuses the agent, the gate context (and so the notify hook)
+also says that a retry or loop-back will not relaunch and names
+`devflow resume --phase N --agent <other>`.
 
 The way on when the fallback's canary refused:
 
