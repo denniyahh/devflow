@@ -9,7 +9,7 @@ findings:
     title: "The IN-03 \"way on\" sentence is always cut from the pending-gate banner and `gate list`"
   - id: WR-02
     severity: warning
-    disposition: fixed
+    disposition: deferred
     title: "The X-01 fix closes the monitor/verdict disagreement only for a torn line that is already in the capture; a killed child's partial line still reproduces it"
   - id: IN-01
     severity: info
@@ -37,7 +37,7 @@ recorded: 2026-11-08T19:51:53.647Z
 | Finding | Severity | Disposition | Source |
 |---------|----------|-------------|--------|
 | WR-01 | warning | fixed | 51-REVIEW-FIX.md |
-| WR-02 | warning | fixed | 51-REVIEW-FIX.md |
+| WR-02 | warning | deferred | docs-only in Phase 51 (ff649ff: residual documented); code fix deferred to 999.207 (operator, option A) |
 | IN-01 | info | fixed | 51-REVIEW-FIX.md |
 | IN-02 | info | fixed | 51-REVIEW-FIX.md |
 | IN-03 | info | fixed | 51-REVIEW-FIX.md |

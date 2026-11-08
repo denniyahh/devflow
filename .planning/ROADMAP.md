@@ -1105,15 +1105,26 @@ the child is alive. If the agent is killed mid-line, the partial line reaches th
 classified `Denied`, logged "classified as rate-limited (resumable)", wrote no idle-timeout record and killed the group.
 The verdict then returns an indeterminate `Failed` ("stream capture ends in an unparseable line").
 
-**Impact:** diagnostics only. The outcome is still a gate (no failover, no cron resume). Documented as a known residual
-in OPERATIONS.md and the code comments (`ff649ff`).
+**Impact:** diagnostics only, while the partial line reaches the capture: the outcome is then still a gate (no
+failover, no cron resume). Documented as a known residual in OPERATIONS.md and the code comments (`ff649ff`).
 
-**Not established:** never reproduced at runtime; the order is read from source.
+**Second case (Phase 51 re-verification `a3419e5`, advisory):** the partial line can fail to arrive at all. If a process
+outside the agent's process group still holds the agent's stdout (it escaped the group kill), the reader never sees a
+newline or EOF; after the bounded wait (`join_within` / `close_shared_capture`, monitor.rs) the capture is closed without
+that line. The verdict then sees a clean denial and returns `RateLimited`: a failover at Code, a cron resume elsewhere.
+That is the pre-Phase-51 behaviour on a capture that, as recorded, does prove a denial, but it makes OPERATIONS.md's
+residual sentence "The outcome is still a gate, with no failover and no cron resume" too strong. The EOF re-check below
+does not cover it (EOF never comes).
+
+**Not established:** neither case reproduced at runtime; both orders are read from source.
 
 **Fix shape:** have `fire_idle_timeout` return its suppression decision; after the reader drains to EOF, classify again
 and, if the answer is now `TornAfterLastEvent`, write the flagged idle-timeout record and log that the suppression was
 withdrawn. Test with a stub that prints the denial, then a partial line with no newline (`printf '%s'`), then sleeps;
-plant the old order as a failing control. Phase 52 (operator, 2026-11-08: option A).
+plant the old order as a failing control. For the second case: decide what the
+verdict should be when the reader was detached with its capture closed (the `stream_wait_bounded` event records it), and
+qualify OPERATIONS.md's residual sentence in the same change (left as is in Phase 51 because OPERATIONS.md is in the
+passed verification's fingerprint). Phase 52 (operator, 2026-11-08: option A).
 
 ### Phase 999.206: A Failure Gate Keeps Only 300 Characters of the Reason, and `gate show` Cannot Show the Rest (BACKLOG)
 

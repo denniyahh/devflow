@@ -42,3 +42,21 @@ Per the dogfooding rule in CLAUDE.md, every stage or step run outside `devflow s
   `fc92c6b` (IN-02), `744739a` (IN-03); fix report `e564570`; GSD disposition step `6443b82`.
 - **Next step inside DevFlow:** answer the Code failure gate without "abort"; Code re-runs its verify tail.
 
+## Exception 4: the verifier run by hand, at the Code failure gate (2026-11-08)
+
+- **Trigger:** after the third fix round, the operator approved Code gate `18e6265d44ff61fa`. Code re-ran execute-phase,
+  which found all 13 plans summarized and `51-VERIFICATION.md` still at `gaps_found`. GSD routes that to
+  `/gsd-plan-phase 51 --gaps` and exits without re-verifying, so Code failed again with no work done (gate
+  `18e62b75aee24efc`). No DevFlow route re-verifies a `gaps_found` report (999.205, 999.208).
+- **Operator chose option A:** run GSD's verifier by hand, then approve the Code gate.
+- **What ran by hand:** only GSD's `verifier_dispatch` step (`execute-phase/steps/verify-phase-goal.md`), as a
+  `gsd-verifier` agent with the prompt that step builds. The code review gate and the regression gate were not re-run:
+  the review and its disposition had already run on this code, and `scripts/check.sh all` passed after the third
+  fix round with no `crates/` change since `744739a`. Result: `a3419e5`, status `passed` (114 of 114 truths; 9 of 9
+  prohibitions, one with an advisory).
+- **Follow-ups from the verifier, done in the same session:** WR-02's disposition corrected from `fixed` to `deferred`
+  (only the docs changed; the code fix is 999.207); the verifier's advisory (a partial line that never reaches the
+  capture, so the verdict can still be `RateLimited`) added to 999.207. OPERATIONS.md was left unchanged because it is
+  in the passed report's fingerprint; its residual sentence is qualified under 999.207.
+- **Next step inside DevFlow:** approve the Code failure gate. Code re-runs execute-phase, which should now find the
+  verification `passed` and resume at its roadmap update step.
