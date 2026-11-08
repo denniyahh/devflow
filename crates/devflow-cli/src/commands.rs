@@ -2051,6 +2051,8 @@ pub(crate) fn evidence(
 /// gate list` show. The idle-timeout cause clause is budgeted to close inside
 /// this bound (`MAX_IDLE_TIMEOUT_CLAUSE_CHARS` in `devflow-core`), so both
 /// renderings must use it; `gate show` prints the context in full.
+/// `the_budgeted_idle_timeout_clause_closes_inside_the_gate_display_bound` pins
+/// the two together.
 const GATE_CONTEXT_DISPLAY_CHARS: usize = 300;
 
 /// Build the persistent status-side signal for gates awaiting an operator.
@@ -8389,6 +8391,57 @@ mod tests {
         assert!(
             !admitted.contains("will not relaunch") && !admitted.contains("--agent <other>"),
             "control: an admitting canary names no way on: {admitted}"
+        );
+    }
+
+    /// The idle-timeout cause clause, at the longest length `devflow-core` budgets for it
+    /// (`MAX_IDLE_TIMEOUT_CLAUSE_CHARS`), closes inside what the banner and `gate list`
+    /// show (`GATE_CONTEXT_DISPLAY_CHARS`) after the reason cap and behind the longest
+    /// failure prefix (the Validate stage), however long the text after it. The bound is
+    /// derived from the constants, so changing either one fails this test until the
+    /// budget is re-derived. Control: one character past the budget is cut.
+    #[test]
+    fn the_budgeted_idle_timeout_clause_closes_inside_the_gate_display_bound() {
+        let clause_close = |clause_chars: usize| {
+            let clause = "c".repeat(clause_chars);
+            let reason = format!(
+                "idle timeout ({clause}): no output for 900s {}",
+                "z".repeat(400)
+            );
+            let dir = tempfile::tempdir().unwrap();
+            let state = State::new(
+                PhaseId::new(9999),
+                AgentKind::Claude,
+                Mode::Auto,
+                dir.path().to_path_buf(),
+            );
+            let context = crate::pipeline_outcomes::failure_gate_context(
+                &state,
+                Stage::Validate,
+                Some(reason),
+            );
+            assert!(context.starts_with("[never-silent] stage validate failed: idle timeout ("));
+            Gates::write_gate(dir.path(), PhaseId::new(9999), Stage::Validate, &context).unwrap();
+            let open = Gates::list_open(dir.path());
+            let closed = format!("{clause}): ");
+            [
+                render_gate_list(&open),
+                render_all_roots_gate_row(Path::new("/tmp/some-root"), &open[0], 10_000),
+                render_pending_gate_banner(&open, 10_000).unwrap(),
+            ]
+            .map(|text| text.contains(&closed))
+        };
+
+        let budget = devflow_core::agent_result::MAX_IDLE_TIMEOUT_CLAUSE_CHARS;
+        assert_eq!(
+            clause_close(budget),
+            [true; 3],
+            "list, all-roots row, banner"
+        );
+        assert_eq!(
+            clause_close(budget + 24),
+            [false; 3],
+            "control: a clause past the budget is cut"
         );
     }
 

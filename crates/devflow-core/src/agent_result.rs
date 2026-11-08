@@ -2347,7 +2347,8 @@ const MAX_CAUSE_TEXT_CHARS: usize = 160;
 /// `[never-silent] stage validate failed: `, takes 38, leaving 223 for the
 /// reason. `idle timeout (` (14) + 200 + `): ` (3) = 217 ≤ 223, so the clause
 /// closes inside both renderings for any cause within the field bounds.
-pub(crate) const MAX_IDLE_TIMEOUT_CLAUSE_CHARS: usize = 200;
+/// Public so the CLI can pin this budget to its display bound in a test.
+pub const MAX_IDLE_TIMEOUT_CLAUSE_CHARS: usize = 200;
 
 /// Make agent-authored cause text bounded and terminal-safe: every control
 /// character becomes a space, and text longer than `max_chars` characters is
