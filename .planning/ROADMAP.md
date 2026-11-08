@@ -1073,6 +1073,24 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.189: A Gate Rejection's Note Never Reaches the Fix Pass, and Any Note Containing "abort" Aborts the Run (BACKLOG)
+
+**Found:** 2026-11-08, Phase 51 Validate gate, by reading v3.0.0 before answering it.
+
+**The defect:** two halves, both in 3.0.0.
+- The note is not part of the fix prompt. A rejection maps to `GateAction::LoopBack(Code)` (`gates.rs`
+  `GateAction::from_response`) and the loop-back runs `fix_prompt(fix_type, phase)` (`prompt.rs`), which takes no note:
+  `/gsd-audit-fix N`, `/gsd-execute-phase N --gaps-only` or a full execute. After a Validate that passed with a
+  VERIFICATION.md written this run, `select_loop_back_fix` picks `--gaps-only`, which matches no plan when the
+  verification has no gaps. So rejecting a passed Validate to get a review finding fixed reruns Code with nothing to do,
+  and the operator's instruction is dropped without a word.
+- `from_response` aborts on any rejection whose note contains `abort` case-insensitively, so a note such as "do not
+  abort, fix X" ends the run.
+
+**Fix shape:** carry the note into the fix pass's prompt (escaped, as `resume` already prints it), and make abort an
+explicit answer (a flag or a field), not a substring of free text. Tell the operator at `gate reject` time which fix
+pass the rejection will run.
+
 ### Phase 999.188: The Held-State-Write-Lock Status Test Fails Intermittently Under the Full Suite (BACKLOG)
 
 **Found:** 2026-11-08, the Phase 51 Validate gate check (`scripts/check.sh all` at `b6205b0`).
