@@ -342,11 +342,13 @@ The way on when the fallback's canary refused:
 - `devflow stop --phase N` answers the gate with an abort, which ends the run
   and removes its state.
 - To continue on another agent, answer the gate with a retry, wait until
-  `devflow status` shows the run not live, then run
+  `devflow status` shows the run not live (its hint then reads
+  `devflow resume --phase N --agent <other>`), then run
   `devflow resume --phase N --agent <agent>` naming an agent other than the
   run's current one. The handoff clears the recorded canary, so that agent
   runs its own. A plain `devflow resume --phase N` is refused by the same
-  recorded canary.
+  recorded canary before it changes anything, so the stop reason that names
+  the way on is kept.
 
 ## Notify hook (never miss a gate)
 

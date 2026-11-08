@@ -624,6 +624,150 @@ fn rejecting_the_failed_canary_gate_stops_the_run_and_names_the_way_on() {
     assert_the_relaunch_was_refused_loudly(&rig, &events, &log);
 }
 
+/// The way on after the refused relaunch, as an operator would take it. Once the
+/// supervisor has ended, `devflow status` names `resume --agent <other>`; a plain
+/// `devflow resume` is refused by the recorded canary and leaves the stop reason that
+/// names the way on as it was; `devflow resume --agent claude` hands off, which clears
+/// the recorded canary, and relaunches Code after Claude's own canary. Negative control
+/// for the plain resume: Antigravity ran no second canary or stage turn.
+#[test]
+fn after_the_refused_relaunch_status_and_resume_lead_to_another_agent() {
+    let phase = PhaseId::new(5126);
+    let rig = Rig::new(phase, AgyCanary::WithholdsToken);
+    let _reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+    let (events, log) = answer_the_failed_canary_gate(&rig, &["approve"]);
+    assert_the_relaunch_was_refused_loudly(&rig, &events, &log);
+
+    let hint = format!("devflow resume --phase {phase} --agent <other>");
+    let status = || {
+        let output = common::hermetic_devflow(&rig.home)
+            .arg("status")
+            .arg(&rig.root)
+            .output()
+            .expect("run devflow status");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    // `status` prints no hint while the supervisor still answers, so this also waits
+    // for it to end before `resume`, which refuses a live run.
+    common::wait_for(
+        || status().contains(&hint),
+        RUN_WAIT,
+        &format!("`{hint}` in devflow status"),
+    );
+    let shown = status();
+    assert!(
+        shown
+            .lines()
+            .filter(|line| line.contains(&format!("devflow resume --phase {phase}")))
+            .all(|line| line.contains("--agent <other>")),
+        "status does not also name the plain resume:\n{shown}"
+    );
+
+    let path = format!(
+        "{}:{}",
+        rig.fake_bin.path.display(),
+        std::env::var_os("PATH")
+            .unwrap_or_default()
+            .to_string_lossy()
+    );
+    let resume = |extra: &[&str]| {
+        common::hermetic_devflow(&rig.home)
+            .args(["resume", "--phase", &phase.to_string()])
+            .args(extra)
+            .arg(&rig.root)
+            .current_dir(&rig.root)
+            .env("PATH", &path)
+            .output()
+            .expect("run devflow resume")
+    };
+
+    let stop_reason = rig.state().stop_reason;
+    let plain = resume(&[]);
+    let stderr = String::from_utf8_lossy(&plain.stderr);
+    assert!(
+        !plain.status.success(),
+        "a plain resume is refused: {stderr}"
+    );
+    assert!(
+        stderr.contains(&hint),
+        "the refusal names the way on: {stderr}"
+    );
+    let after_plain = rig.state();
+    assert!(after_plain.stopped, "the run is still stopped");
+    assert_eq!(
+        after_plain.stop_reason, stop_reason,
+        "the refused resume left the stop reason that names the way on"
+    );
+    assert_eq!(after_plain.canary, Some(CanaryOutcome::Absent));
+    assert_eq!(
+        rig.invocations("agy"),
+        ["canary"],
+        "the refused resume launched nothing"
+    );
+
+    let handed = resume(&["--agent", "claude"]);
+    assert!(
+        handed.status.success(),
+        "resume --agent claude failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&handed.stdout),
+        String::from_utf8_lossy(&handed.stderr)
+    );
+    common::wait_for(
+        || {
+            let events = rig.events();
+            let Some(last_handoff) = events
+                .iter()
+                .rposition(|event| event["event"] == "agent_handoff")
+            else {
+                return false;
+            };
+            events[last_handoff..].iter().any(|event| {
+                [
+                    "rate_limit_resume_scheduled",
+                    "gate_fired",
+                    "workflow_finished",
+                ]
+                .iter()
+                .any(|end| event["event"] == *end)
+            })
+        },
+        RUN_WAIT,
+        &format!(
+            "an end after the resume's handoff in phase {phase}; events so far:\n{}",
+            rig.events_text()
+        ),
+    );
+    let log = rig.events_text();
+    let handoffs = rig.events_named("agent_handoff");
+    assert_eq!(
+        handoffs.len(),
+        2,
+        "the failover, then the resume's handoff; events:\n{log}"
+    );
+    assert_eq!(handoffs[1]["from_agent"], "antigravity", "{}", handoffs[1]);
+    assert_eq!(handoffs[1]["to_agent"], "claude", "{}", handoffs[1]);
+    assert_eq!(handoffs[1]["reason"], "resume --agent", "{}", handoffs[1]);
+    assert_eq!(
+        rig.invocations("claude"),
+        [
+            "canary",
+            "stage define",
+            "stage plan",
+            "stage code",
+            "canary",
+            "stage code"
+        ],
+        "Claude ran its own canary again, then relaunched Code"
+    );
+    let state = rig.state();
+    assert_eq!(state.agent, AgentKind::Claude);
+    assert_eq!(
+        state.canary,
+        Some(CanaryOutcome::Confirmed),
+        "the handoff cleared the recorded refusal and Claude's canary passed"
+    );
+}
+
 /// D-11 / criterion 2 under the same auto-mode rig: with no fallback, the same
 /// Claude rate limit at Code writes the cron resume instructions. Negative
 /// control: no handoff, and the `agy` stub on PATH is never launched for a

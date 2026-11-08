@@ -3563,6 +3563,7 @@ fn resume_loaded(
     // D-01, D-02, D-03: every fallback check runs here, BEFORE `commit_notify_env`
     // below, so a refused resume commits nothing at all (review B-3).
     refuse_fallback_for_resume(&state, agent, legacy_claude_launch, fallback_agent)?;
+    refuse_recorded_canary_for_resume(&state, agent, legacy_claude_launch)?;
     // CR-03 (49-REVIEW.md): an exported (or emptied) notify command reaches
     // the chain this resume launches through the state file.
     commit_notify_env(&mut state)?;
@@ -3670,6 +3671,43 @@ fn resume_loaded(
             });
             Err(err)
         }
+    }
+}
+
+/// Refuse a `resume` the run's recorded delivery canary would refuse, before it writes
+/// anything.
+///
+/// The run is judged as it would launch: its legacy opt-out after
+/// `--legacy-claude-launch` and the environment. A `--agent` naming another agent hands
+/// the run off, and the handoff clears the recorded canary, so it is never refused here.
+/// Otherwise a recorded refusal ([`recorded_canary_refusal`]) refuses every launch under
+/// the run's agent. Letting the resume go on would clear `stopped` and `stop_reason`,
+/// fail at [`canary_gate`], and re-mark the run stopped with a reason that no longer names
+/// the way on. Refused here, the stop reason that names it survives.
+///
+/// Reads no file and writes nothing; `state` is the copy `resume` loaded.
+fn refuse_recorded_canary_for_resume(
+    state: &State,
+    agent: Option<AgentKind>,
+    legacy_claude_launch: bool,
+) -> Result<(), CliError> {
+    if agent.is_some_and(|requested| requested != state.agent) {
+        return Ok(());
+    }
+    let mut candidate = state.clone();
+    // Only the combined value is read here; the notice is `resume_loaded`'s to print.
+    let _env_alone = apply_legacy_launch_opt_out(&mut candidate, legacy_claude_launch);
+    match recorded_canary_refusal(&candidate) {
+        None => Ok(()),
+        Some(refusal) => Err(CliError::Message(format!(
+            "resume refused: the delivery canary recorded for this run refuses {agent} at \
+             the {stage} stage ({refusal}), so the relaunch would be refused too; run \
+             `devflow resume --phase {phase} --agent <other>` to continue on another agent \
+             (the handoff clears the recorded canary). Nothing was changed.",
+            agent = state.agent,
+            stage = state.stage,
+            phase = state.phase,
+        ))),
     }
 }
 
