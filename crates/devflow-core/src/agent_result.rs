@@ -1905,7 +1905,10 @@ fn parse_claude_event_result(stdout: &str) -> Option<AgentResult> {
         return Some(indeterminate_capture_failure());
     }
 
-    if let Some(retry) = detect_claude_stream_rate_limit(&capture.events) {
+    // The torn guard above already returns for every capture the shared rule
+    // reads as torn; going through it anyway keeps one precedence rule for the
+    // verdict and the monitor (D-16).
+    if let (CaptureDenial::Denied, Some(retry)) = classify_capture_denial(&capture) {
         return Some(rate_limited_result(retry));
     }
 
@@ -2567,16 +2570,20 @@ pub fn capture_shows_rate_limit_denial(project_root: &Path, phase: PhaseId) -> b
 /// the two apart without promoting a torn line to a denial: only a parsed
 /// top-level `rate_limit_event` whose status is a denial is [`Self::Denied`]
 /// (T-30-12), so agent-authored partial text can never schedule a resume or
-/// trigger a failover.
+/// trigger a failover. A torn tail outranks a parsed denial
+/// ([`classify_capture_denial`]): the torn line may be a later event that
+/// replaced it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CaptureDenial {
-    /// [`detect_claude_stream_rate_limit`] finds an explicit denial.
+    /// [`detect_claude_stream_rate_limit`] finds an explicit denial, and no
+    /// torn JSON line follows the last parsed event.
     Denied,
     /// No denial, and no torn JSON line after the last parsed event (a missing
     /// capture also answers this).
     NotDenied,
-    /// No parsed denial, but a torn JSON line sits after the last parsed
-    /// event, so the line that would have said "denied" may be the torn one.
+    /// A torn JSON line sits after the last parsed event, whether or not a
+    /// denial was parsed before it: the torn line may be the one that said
+    /// "denied", or a later event that replaced an earlier denial.
     TornAfterLastEvent,
 }
 
@@ -2591,13 +2598,24 @@ pub(crate) fn capture_rate_limit_denial(project_root: &Path, phase: PhaseId) -> 
     let Some(raw) = read_capture(&stdout_path(project_root, phase)) else {
         return CaptureDenial::NotDenied;
     };
-    let capture = ParsedCapture::parse(&raw);
-    if detect_claude_stream_rate_limit(&capture.events).is_some() {
-        CaptureDenial::Denied
-    } else if capture.torn_json_after_last_matching(|_| true) {
-        CaptureDenial::TornAfterLastEvent
-    } else {
-        CaptureDenial::NotDenied
+    classify_capture_denial(&ParsedCapture::parse(&raw)).0
+}
+
+/// The one precedence rule for a capture's denial answer, shared by the
+/// monitor ([`capture_rate_limit_denial`]) and the verdict
+/// ([`parse_claude_event_result`]) so the two cannot disagree (D-16): a torn
+/// JSON line after the last parsed event wins over a parsed denial, because
+/// [`detect_claude_stream_rate_limit`] takes the last rate-limit event and the
+/// torn line may be a later one, or a result, that replaced the denial. Nothing
+/// that survives before the tear stands in for it. The retry text comes back
+/// only with [`CaptureDenial::Denied`].
+fn classify_capture_denial(capture: &ParsedCapture) -> (CaptureDenial, Option<String>) {
+    if capture.torn_json_after_last_matching(|_| true) {
+        return (CaptureDenial::TornAfterLastEvent, None);
+    }
+    match detect_claude_stream_rate_limit(&capture.events) {
+        Some(retry) => (CaptureDenial::Denied, Some(retry)),
+        None => (CaptureDenial::NotDenied, None),
     }
 }
 
@@ -7581,6 +7599,65 @@ mod tests {
     /// The torn segment's fixed text, pinned here as a literal so a change to
     /// the production wording fails a test.
     const TORN_SEGMENT_TEXT: &str = "torn final line after the last parsed event";
+
+    /// A torn line cut inside a `result` event's type, as a killed child
+    /// leaves it.
+    const TORN_RESULT_LINE: &str = r#"{"type":"res"#;
+
+    /// D-16: a quota denial followed by a torn final line is torn, not a
+    /// denial, for the monitor's answer and for the verdict alike: the torn
+    /// line may be a later event that replaced the denial. The verdict is
+    /// therefore never `RateLimited`, so no failover and no cron resume follow.
+    #[test]
+    fn a_denial_followed_by_a_torn_line_is_torn_for_the_monitor_and_the_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        let phase = PhaseId::new(74);
+        let lines = [
+            V3_INIT_EVENT.to_string(),
+            v3_rate_limit_event("rejected"),
+            TORN_RESULT_LINE.to_string(),
+        ];
+        write_capture_lines(root, phase, &lines);
+
+        assert_eq!(
+            capture_rate_limit_denial(root, phase),
+            CaptureDenial::TornAfterLastEvent,
+            "the monitor read a denial with a torn line after it as a proven denial"
+        );
+        let verdict = parse_claude_event_result(&lines.join("\n"))
+            .expect("a Claude stream capture yields a verdict");
+        assert_ne!(
+            verdict.status,
+            AgentStatus::RateLimited,
+            "the verdict read a denial with a torn line after it as a rate limit"
+        );
+        let layer1 = evaluate_layer1(root, phase).expect("the capture yields a verdict");
+        assert_ne!(layer1.status, AgentStatus::RateLimited, "{layer1:?}");
+    }
+
+    /// The control for the test above: the same denial with no torn tail is a
+    /// denial for the monitor and `RateLimited` for the verdict.
+    #[test]
+    fn a_denial_with_no_torn_tail_is_rate_limited_for_the_monitor_and_the_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        let phase = PhaseId::new(75);
+        let lines = [V3_INIT_EVENT.to_string(), v3_rate_limit_event("rejected")];
+        write_capture_lines(root, phase, &lines);
+
+        assert_eq!(
+            capture_rate_limit_denial(root, phase),
+            CaptureDenial::Denied
+        );
+        let verdict = parse_claude_event_result(&lines.join("\n"))
+            .expect("a Claude stream capture yields a verdict");
+        assert_eq!(verdict.status, AgentStatus::RateLimited, "{verdict:?}");
+        let layer1 = evaluate_layer1(root, phase).expect("the capture yields a verdict");
+        assert_eq!(layer1.status, AgentStatus::RateLimited, "{layer1:?}");
+    }
 
     /// D-16 (backlog 999.71, classifier half): a capture whose last line is a
     /// torn JSON line is not a clean, non-rate-limited ending. The torn line
