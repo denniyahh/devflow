@@ -632,7 +632,9 @@ where
 /// from the canary outcome the run already recorded, described for an operator; `None`
 /// when the launch would not be refused for that reason. The same predicate as
 /// [`launch_stage_inner`]'s (the stream path, a recorded `Absent` or `Unverified`), read
-/// without running a canary or writing anything.
+/// without running a canary or writing anything. It is a second copy of `canary_gate`'s
+/// mapping, so `recorded_canary_refusal_agrees_with_canary_gate_on_every_recorded_outcome`
+/// pins the two together: change one and that test fails until the other matches.
 pub(crate) fn recorded_canary_refusal(state: &State) -> Option<String> {
     if !stream_launch_enabled(state.agent, state.stage, state.legacy_claude_launch) {
         return None;
@@ -7327,6 +7329,82 @@ mod tests {
         assert_ne!(
             unverified, absent,
             "the two failure modes must not render the same diagnosis"
+        );
+    }
+
+    /// `recorded_canary_refusal` re-reads `canary_gate`'s decision without running a
+    /// canary, so the two must agree on every recorded outcome: it is `Some` exactly when
+    /// `canary_gate`, given the stream predicate `launch_stage_inner` computes for the
+    /// same state, refuses. Enumerates every agent, stage, legacy opt-out and recorded
+    /// outcome. With nothing recorded `canary_gate` runs a fresh canary, so the copy
+    /// reports no recorded refusal; that case is asserted on its own. Control: the
+    /// enumeration contains both an admitted and a refused launch, so agreement is not
+    /// "both always say the same thing".
+    #[test]
+    fn recorded_canary_refusal_agrees_with_canary_gate_on_every_recorded_outcome() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let base = canary_state(root, PhaseId::new(126));
+
+        let agents = [
+            AgentKind::Claude,
+            AgentKind::Codex,
+            AgentKind::OpenCode,
+            AgentKind::Pi,
+            AgentKind::Antigravity,
+        ];
+        let stages = [
+            Stage::Define,
+            Stage::Plan,
+            Stage::Code,
+            Stage::Validate,
+            Stage::Ship,
+        ];
+        let outcomes = [
+            canary::CanaryOutcome::Confirmed,
+            canary::CanaryOutcome::Absent,
+            canary::CanaryOutcome::Unverified("no binary".to_string()),
+        ];
+        let (mut admitted, mut refused) = (0usize, 0usize);
+        for agent in agents {
+            for stage in stages {
+                for legacy in [false, true] {
+                    let mut state = base.clone();
+                    state.agent = agent;
+                    state.stage = stage;
+                    state.legacy_claude_launch = legacy;
+                    state.canary = None;
+                    assert_eq!(
+                        recorded_canary_refusal(&state),
+                        None,
+                        "nothing recorded: {agent} {stage} legacy={legacy}"
+                    );
+                    for outcome in &outcomes {
+                        state.canary = Some(outcome.clone());
+                        let stream = stream_launch_enabled(agent, stage, legacy);
+                        let gate_refuses = canary_gate(&mut state.clone(), stream, || {
+                            unreachable!("a recorded outcome is never re-run")
+                        })
+                        .is_err();
+                        assert_eq!(
+                            recorded_canary_refusal(&state).is_some(),
+                            gate_refuses,
+                            "{agent} {stage} legacy={legacy} {outcome:?}"
+                        );
+                        if gate_refuses {
+                            refused += 1;
+                        } else {
+                            admitted += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            admitted > 0 && refused > 0,
+            "control: admitted {admitted}, refused {refused}"
         );
     }
 
