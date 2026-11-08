@@ -2743,7 +2743,11 @@ fn fire_idle_timeout(
     //    D-16 (backlog 999.71): the answer has three values, not two. A capture
     //    that ends in a torn JSON line after its last parsed event is neither
     //    a proven denial (T-30-12: only a parsed top-level `rejected` event is)
-    //    nor a clean silence, so the record is written and flagged below.
+    //    nor a clean silence, so the record is written and flagged below. A
+    //    torn tail outranks a denial parsed before it (the torn line may have
+    //    replaced it), by the same rule the verdict uses
+    //    (`agent_result::classify_capture_denial`), so such a capture is never
+    //    suppressed here as a rate limit.
     let denial = crate::agent_result::capture_rate_limit_denial(project_root, phase);
     if denial == CaptureDenial::Denied {
         warn!(
@@ -4386,6 +4390,69 @@ exit 0
         assert!(
             !log.contains("torn final line"),
             "an intact capture must not log a torn line; log:\n{log}"
+        );
+    }
+
+    /// D-16: a quota denial followed by a torn final line at the idle timeout
+    /// is recorded, flagged torn, and not suppressed as a rate limit, so the
+    /// monitor and the verdict agree: the advance reads an idle timeout, never
+    /// `RateLimited`, and no failover or cron resume follows.
+    #[test]
+    fn a_denial_followed_by_a_torn_line_at_the_idle_timeout_is_recorded_not_suppressed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(54);
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+
+        let denial = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1786222800,"rateLimitType":"seven_day","overageStatus":"rejected","overageDisabledReason":"out_of_credits","isUsingOverage":false},"uuid":"u-rl","session_id":"s-rl"}"#;
+        let torn = r#"{"type":"res"#;
+        let script = format!(
+            r#"
+set -u
+IFS= read -r _turn || exit 91
+printf '%s\n' '{INIT_LINE}'
+printf '%s\n' '{denial}'
+printf '%s\n' '{torn}'
+sleep 3
+exit 0
+"#
+        );
+
+        let _ = supervise_stream_child(
+            root,
+            phase,
+            root,
+            "prompt",
+            Duration::from_secs(1),
+            "sh",
+            &["-c".to_string(), script],
+            &[],
+            AgentKind::Claude,
+        );
+
+        let raw = std::fs::read_to_string(crate::agent_result::idle_timeout_path(root, phase))
+            .expect(
+                "a denial followed by a torn line was suppressed as a rate limit: the monitor \
+                 wrote no idle-timeout record",
+            );
+        let record: serde_json::Value = serde_json::from_str(&raw).expect("the record parses");
+        assert_eq!(
+            record.get("capture_torn_final_line"),
+            Some(&serde_json::Value::Bool(true)),
+            "the record must carry the torn flag: {record}"
+        );
+        let log = std::fs::read_to_string(crate::agent_result::monitor_log_path(root, phase))
+            .unwrap_or_default();
+        assert!(
+            !log.contains("classified as rate-limited"),
+            "the monitor logged a rate limit for a torn capture; log:\n{log}"
+        );
+        let verdict =
+            crate::agent_result::evaluate_layer1(root, phase).expect("the record is a verdict");
+        assert_eq!(
+            verdict.status,
+            crate::agent_result::AgentStatus::IdleTimeout,
+            "{verdict:?}"
         );
     }
 

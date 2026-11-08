@@ -312,7 +312,11 @@ When the capture ends in a torn final line, the clause starts with
 `torn final line after the last parsed event`, and the verdict stays an idle
 timeout. For a Claude capture the torn line may have been a quota denial; the
 classifier reads only Claude's denials, so for other agents it says nothing
-about one either way.
+about one either way. A torn final line outranks a quota denial parsed before
+it, because the torn line may be a later event that replaced the denial: the
+stage is never classified as rate-limited, so no failover and no cron resume
+follow. At an idle timeout it is recorded as one, flagged torn, and stops at a
+gate.
 
 The failover events in `events.jsonl`:
 
