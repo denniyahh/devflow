@@ -2604,7 +2604,12 @@ pub(crate) fn capture_rate_limit_denial(project_root: &Path, phase: PhaseId) -> 
 /// The torn-final-line segment of the idle-timeout reason's clause (D-16). It
 /// is fixed text shorter than [`MAX_IDLE_TIMEOUT_CLAUSE_CHARS`] and always
 /// the clause's FIRST segment, so the clause cap can never cut it.
-const TORN_FINAL_LINE_SEGMENT: &str = "torn final line, a quota denial cannot be ruled out";
+///
+/// Agent-neutral on purpose: a torn line is flagged for any agent's capture,
+/// but only Claude's `rate_limit_event` is a denial the classifier can read, so
+/// "a quota denial cannot be ruled out" would claim a gap that an Antigravity
+/// capture has whether or not its last line is torn.
+const TORN_FINAL_LINE_SEGMENT: &str = "torn final line after the last parsed event";
 
 fn parse_idle_timeout_side_channel(project_root: &Path, phase: PhaseId) -> Option<AgentResult> {
     let path = idle_timeout_path(project_root, phase);
@@ -7575,7 +7580,7 @@ mod tests {
 
     /// The torn segment's fixed text, pinned here as a literal so a change to
     /// the production wording fails a test.
-    const TORN_SEGMENT_TEXT: &str = "torn final line, a quota denial cannot be ruled out";
+    const TORN_SEGMENT_TEXT: &str = "torn final line after the last parsed event";
 
     /// D-16 (backlog 999.71, classifier half): a capture whose last line is a
     /// torn JSON line is not a clean, non-rate-limited ending. The torn line
