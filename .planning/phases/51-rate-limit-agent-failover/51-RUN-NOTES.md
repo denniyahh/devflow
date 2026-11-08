@@ -60,3 +60,14 @@ Per the dogfooding rule in CLAUDE.md, every stage or step run outside `devflow s
   in the passed report's fingerprint; its residual sentence is qualified under 999.207.
 - **Next step inside DevFlow:** approve the Code failure gate. Code re-runs execute-phase, which should now find the
   verification `passed` and resume at its roadmap update step.
+
+## Run end (2026-11-08)
+
+- After exception 4 the operator approved Code gate `18e62b75aee24efc`. Code re-ran execute-phase, found the verification
+  `passed` and the phase already marked complete (`3c7c6f7`, `b6205b0`), and succeeded with no commits. Validate re-ran
+  and passed (`de0bf98`); its gate `18e6310585119d8e` fired "Validation passed — approve to ship?".
+- Approving would have started Ship (`/gsd-ship` pushes and opens a PR before the Ship gate), so the operator rejected
+  the gate with an "abort" note: the only answer that ends a passed run without Ship (999.210). The event log records
+  `workflow_aborted`; the phase itself passed.
+- Defects filed from the end of the run: 999.209 (reproduced with a negative control), 999.210.
+- Close-out is by hand with `scripts/cut-pr-branch.sh`, per the Phase 51 conventions.
