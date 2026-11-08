@@ -60,8 +60,9 @@ const ANTIGRAVITY_SUCCESS_RESULT: &str = r#"{"event":"result","result":{"status"
 /// `stage define|plan|code` for a stage turn, told apart by the stage prompt
 /// (`render_claude_style`: Code runs `/gsd-execute-phase`, Plan
 /// `/gsd-plan-phase`, Define neither). Plan commits a minimal plan file with no
-/// checkpoint; Code commits once, records that commit, then reports a quota
-/// denial and exits.
+/// checkpoint; Code commits once, records that commit, runs `@CODE_TURN_DIRT@`
+/// (empty unless the rig leaves uncommitted work), then reports a quota denial
+/// and exits.
 const CLAUDE_STUB: &str = r#"log='@LOGS@/claude.log'
 if [ "$1" = "--version" ]; then echo health >> "$log"; echo "2.1.220 (Claude Code)"; exit 0; fi
 IFS= read -r turn
@@ -76,6 +77,7 @@ case "$turn" in
     echo 'stage code' >> "$log"
     git commit -q --allow-empty -m 'claude code-turn work' || exit 1
     git rev-parse HEAD > '@LOGS@/claude-code-commit'
+@CODE_TURN_DIRT@
     printf '%s\n' '@CLAUDE_INIT@'
     printf '%s\n' '@CLAUDE_RATE_LIMIT@'
     exit 0
@@ -98,8 +100,9 @@ exit 0"#;
 
 /// The `agy` stub. Each invocation appends one line to `agy.log`: `health`
 /// for `--version`, `canary` for the delivery canary, `stage` otherwise. The
-/// canary answer is `@CANARY_ANSWER@`; the stage turn commits once, records
-/// that commit and reports success in the Antigravity shape.
+/// canary answer is `@CANARY_ANSWER@`; the stage turn runs `@STAGE_PROBE@`
+/// (empty unless the rig records what the fallback inherited), commits once,
+/// records that commit and reports success in the Antigravity shape.
 const AGY_STUB: &str = r#"#!/bin/sh
 log='@LOGS@/agy.log'
 if [ "$1" = "--version" ]; then echo health >> "$log"; echo "agy 0.0.0-stub"; exit 0; fi
@@ -114,6 +117,7 @@ case "$turn" in
     ;;
 esac
 echo stage >> "$log"
+@STAGE_PROBE@
 git commit -q --allow-empty -m 'antigravity code work' || exit 1
 git rev-parse HEAD > '@LOGS@/agy-code-commit'
 printf '%s\n' '@ANTIGRAVITY_INIT@'
@@ -128,6 +132,24 @@ const AGY_CANARY_RETURNS_TOKEN: &str =
 
 /// A canary answer that completes the turn but withholds the token.
 const AGY_CANARY_WITHHOLDS_TOKEN: &str = r#"printf '%s\n' '{"event":"result","result":{"status":"SUCCESS","response":"The turn completed without the token."}}'"#;
+
+/// Uncommitted work the primary leaves in the tree when its Code turn is
+/// rate-limited: a staged new file, an unstaged edit to a tracked file and an
+/// untracked file.
+const CODE_TURN_LEAVES_UNCOMMITTED_WORK: &str = r#"    printf 'staged by claude\n' > staged.txt || exit 1
+    git add staged.txt || exit 1
+    printf 'unstaged edit by claude\n' >> README.md || exit 1
+    printf 'untracked by claude\n' > untracked.txt || exit 1"#;
+
+/// What the fallback's stage turn records, before it commits, about the tree
+/// it inherited: its working directory, branch, `git status --porcelain`, the
+/// staged blob and the two working-tree files.
+const AGY_RECORDS_WHAT_IT_INHERITED: &str = r#"pwd -P > '@LOGS@/agy-cwd'
+git rev-parse --abbrev-ref HEAD > '@LOGS@/agy-branch'
+git status --porcelain --untracked-files=all > '@LOGS@/agy-status'
+git show :staged.txt > '@LOGS@/agy-index-staged'
+cat README.md > '@LOGS@/agy-readme'
+cat untracked.txt > '@LOGS@/agy-untracked'"#;
 
 /// Hermetic `git` for fixture setup (999.37), never a bare `Command::new("git")`.
 fn git(root: &Path, args: &[&str]) {
@@ -218,6 +240,22 @@ struct Rig {
 
 impl Rig {
     fn new(phase: PhaseId, canary: AgyCanary) -> Self {
+        Self::build(phase, canary, "", "")
+    }
+
+    /// A rig whose Claude Code turn leaves uncommitted work behind
+    /// ([`CODE_TURN_LEAVES_UNCOMMITTED_WORK`]) and whose `agy` stage turn
+    /// records what it inherited ([`AGY_RECORDS_WHAT_IT_INHERITED`]).
+    fn with_uncommitted_work(phase: PhaseId) -> Self {
+        Self::build(
+            phase,
+            AgyCanary::ReturnsToken,
+            CODE_TURN_LEAVES_UNCOMMITTED_WORK,
+            AGY_RECORDS_WHAT_IT_INHERITED,
+        )
+    }
+
+    fn build(phase: PhaseId, canary: AgyCanary, code_turn_dirt: &str, stage_probe: &str) -> Self {
         let home = common::HermeticHome::new();
         let repo = tempfile::tempdir().unwrap();
         let root = repo.path().canonicalize().unwrap();
@@ -227,6 +265,7 @@ impl Rig {
         let padded = phase.padded();
 
         let claude = CLAUDE_STUB
+            .replace("@CODE_TURN_DIRT@", code_turn_dirt)
             .replace("@LOGS@", &logs_path)
             .replace("@PADDED@", &padded)
             .replace("@CLAUDE_INIT@", CLAUDE_INIT_EVENT)
@@ -239,6 +278,7 @@ impl Rig {
             AgyCanary::WithholdsToken => AGY_CANARY_WITHHOLDS_TOKEN,
         };
         let agy = AGY_STUB
+            .replace("@STAGE_PROBE@", stage_probe)
             .replace("@LOGS@", &logs_path)
             .replace("@CANARY_ANSWER@", answer)
             .replace("@ANTIGRAVITY_INIT@", ANTIGRAVITY_INIT_EVENT)
@@ -259,6 +299,16 @@ impl Rig {
     /// --until code`, plus `extra`, with the stubs first on PATH. Asserts the
     /// start itself succeeded.
     fn start(&self, extra: &[&str]) {
+        self.start_with(&[&["--no-worktree"], extra].concat());
+    }
+
+    /// [`Self::start`] without `--no-worktree`: the run gets its phase
+    /// worktree under `.worktrees/`, and every stage launches there.
+    fn start_in_worktree(&self, extra: &[&str]) {
+        self.start_with(extra);
+    }
+
+    fn start_with(&self, extra: &[&str]) {
         let existing = std::env::var_os("PATH").unwrap_or_default();
         let path = format!(
             "{}:{}",
@@ -274,7 +324,6 @@ impl Rig {
                 "claude",
                 "--mode",
                 "auto",
-                "--no-worktree",
                 "--until",
                 "code",
             ])
@@ -830,4 +879,87 @@ fn a_rate_limited_claude_run_in_auto_mode_without_a_fallback_writes_cron_instruc
     let state = rig.state();
     assert_eq!(state.agent, AgentKind::Claude);
     assert_eq!(state.fallback_agent, None);
+}
+
+/// Criterion 1 on the worktree arm (D-10): a run in its phase worktree whose
+/// Claude Code turn is rate-limited with a staged file, an unstaged edit and an
+/// untracked file in the tree hands off to Antigravity, which launches in the
+/// SAME worktree on the phase branch and finds all three exactly as Claude
+/// left them: nothing reset, stashed, cleaned or checked out.
+#[test]
+fn a_handoff_inside_a_phase_worktree_keeps_the_tree_branch_and_uncommitted_work() {
+    let phase = PhaseId::new(5124);
+    let rig = Rig::with_uncommitted_work(phase);
+    let _reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+
+    rig.start_in_worktree(&["--fallback-agent", "antigravity"]);
+    rig.wait_for_any(&[
+        "workflow_finished",
+        "gate_fired",
+        "rate_limit_resume_scheduled",
+    ]);
+    let log = rig.events_text();
+
+    // Where `start` puts the phase worktree, so a run that lost track of it
+    // still fails on the fallback's cwd rather than on the state.
+    let worktree = rig
+        .root
+        .join(".worktrees")
+        .join(format!("phase-{}", phase.padded()))
+        .canonicalize()
+        .expect("start created the phase worktree");
+    let branch = format!("feature/phase-{}", phase.padded());
+
+    let handoffs = rig.events_named("agent_handoff");
+    assert_eq!(handoffs.len(), 1, "exactly one handoff; events:\n{log}");
+    assert_eq!(handoffs[0]["stage"], "code", "{}", handoffs[0]);
+    assert_eq!(
+        handoffs[0]["tree_dirty"], true,
+        "the handoff measured the worktree's uncommitted work: {}",
+        handoffs[0]
+    );
+
+    let recorded = |name: &str| {
+        fs::read_to_string(rig.logs.path().join(name))
+            .unwrap_or_else(|err| panic!("the fallback did not record {name}: {err}"))
+    };
+    assert_eq!(
+        PathBuf::from(recorded("agy-cwd").trim()),
+        worktree,
+        "the fallback launched in the phase worktree"
+    );
+    assert_eq!(
+        recorded("agy-branch").trim(),
+        branch,
+        "the fallback launched on the phase branch"
+    );
+    // `.planning/config.json` is DevFlow's own auto-chain flag write
+    // (`gsd_config::set_auto_chain_active`), not the primary's work.
+    let inherited: Vec<String> = recorded("agy-status")
+        .lines()
+        .filter(|line| *line != " M .planning/config.json")
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        inherited,
+        [" M README.md", "A  staged.txt", "?? untracked.txt"],
+        "the staged, unstaged and untracked changes are all still there, as they were"
+    );
+    assert_eq!(recorded("agy-index-staged"), "staged by claude\n");
+    assert_eq!(recorded("agy-readme"), "base\nunstaged edit by claude\n");
+    assert_eq!(recorded("agy-untracked"), "untracked by claude\n");
+
+    assert!(
+        rig.events_named("workflow_finished")
+            .iter()
+            .any(|event| event["reason"] == "stopped_at"),
+        "Code completed under the fallback; events:\n{log}"
+    );
+    assert_eq!(rig.invocations("agy"), ["canary", "stage"]);
+
+    assert_eq!(
+        git_out(&worktree, &["rev-parse", "HEAD^"]),
+        rig.recorded_commit("claude-code-commit"),
+        "the fallback built on the primary's Code-turn commit in the worktree"
+    );
 }
