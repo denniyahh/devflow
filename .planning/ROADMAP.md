@@ -1073,6 +1073,48 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.193: The Validate Gate Says "Validation Passed — Approve to Ship?" While the Phase's Verification Reports `gaps_found` (BACKLOG)
+
+**Found:** 2026-11-08, Phase 51 re-validate after the review fix round. The Code stage's `/gsd-execute-phase` re-ran the
+verifier, which committed `51-VERIFICATION.md` with `status: gaps_found` (`fe1971a`: README.md:110 over-promises after
+the `devflow parallel` fix). Validate then ran `/gsd-validate-phase 51`, returned `verdict: pass` (it audits test coverage,
+not goal achievement, and said so in its final message), and DevFlow fired `gate_fired` with context "Validation passed —
+approve to ship?".
+
+**The defect:** no non-test code in 3.0.0 reads `{N}-VERIFICATION.md`'s `status` (`git grep gaps_found v3.0.0 -- 'crates/*.rs'`
+finds only tests and comments). The Validate verdict comes solely from the validate-phase agent, so a phase whose own
+verifier reports a gap reaches the Ship-approval gate labelled "passed". In supervise mode a human may catch it from the
+agent's message; with `--yes-ship` or in auto mode nothing would.
+
+**Not established:** whether Phase 50.1's or earlier phases' gates ever passed over a `gaps_found` verification.
+
+**Fix shape:** at the Validate outcome, read the evidence root's `{N}-VERIFICATION.md` frontmatter `status`; on
+`gaps_found` (or `human_needed` unanswered) treat the verdict as `gaps` or, at least, put the status in the gate context
+and refuse a `--yes-ship` auto-approval. Fits Phase 52 or the next fix branch.
+
+### Phase 999.192: A Verification Report Written During Code Is Read as Inherited, So a Validate Reject Re-Runs the Whole Phase (BACKLOG)
+
+**Found:** 2026-11-08, Phase 51. The operator rejected the Validate gate (note "re-validate after the review fixes");
+DevFlow emitted `loop_back` with `"fix":"FullExecute"` and launched `/gsd-execute-phase 51 --auto`, where the 3.0.0
+design intends `GapsOnly` once this run authored the verification.
+
+**The defect:** `stamp_validate_dispatch_window` (`pipeline_launch.rs`) records the VERIFICATION.md fingerprint and mtime
+when Validate launches, and `select_loop_back_fix` (`pipeline_outcomes.rs`) treats the report as this run's only if it
+changed after that stamp. But GSD's `/gsd-execute-phase` runs its own verifier at the end of Code, so the report is
+written BEFORE Validate launches (51: written 2026-11-07 20:13 in Code, Validate launched 2026-11-08 05:46 and did not
+rewrite it; the state's `last_verification_mtime_nanos` equals the file's mtime exactly). Every such phase's reject is
+therefore dispatched as a full execute.
+
+**Effect here:** harmless (all 13 plans complete, so execute-phase ran only its verify tail). On a phase with gap plans
+it would redo work instead of closing gaps.
+
+**Not established:** whether `/gsd-validate-phase` ever rewrites VERIFICATION.md in a normal run (if it never does, the
+GapsOnly arm is unreachable whenever Code runs execute-phase's verifier).
+
+**Fix shape:** stamp the baseline at Code launch (or at the run's first Code dispatch) rather than at Validate launch,
+or accept a report committed on the phase branch after the run started; a test with a verifier-written report from
+Code must dispatch GapsOnly. Fits Phase 52 or the next fix branch.
+
 ### Phase 999.191: `stop_ends_a_launch_its_running_launcher_promotes_during_the_wait` Fails Under Full-Suite Load (BACKLOG)
 
 **Found:** 2026-11-08, Phase 51 Validate stage (`/gsd-validate-phase 51`), full `cargo nextest run --workspace` at `fe1971a`.
