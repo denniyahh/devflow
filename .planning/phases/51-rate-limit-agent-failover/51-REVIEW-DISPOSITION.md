@@ -5,43 +5,43 @@ titles: json
 findings:
   - id: WR-01
     severity: warning
-    disposition: fixed
-    title: "After the WR-02 stop, `devflow status` sends the operator to the plain `devflow resume`, which is refused and overwrites the only record of the way on"
+    disposition: open
+    title: "The IN-03 \"way on\" sentence is always cut from the pending-gate banner and `gate list`"
   - id: WR-02
     severity: warning
-    disposition: fixed
-    title: "`devflow parallel` now silently ignores a configured `fallback_agent` key, including an invalid one"
+    disposition: open
+    title: "The X-01 fix closes the monitor/verdict disagreement only for a torn line that is already in the capture; a killed child's partial line still reproduces it"
   - id: IN-01
     severity: info
-    disposition: fixed
-    title: "`recorded_canary_refusal` is a second copy of `canary_gate`'s refusal mapping, and nothing pins the two together"
+    disposition: open
+    title: "The status hint ignores the environment's legacy opt-out, but `resume`'s refusal applies it"
   - id: IN-02
     severity: info
-    disposition: fixed
-    title: "A gate retry whose canary has not yet been recorded can still end the run silently (999.187 residual at the same entry point)"
+    disposition: open
+    title: "A stale \"100-char\" doc comment on `gate_show`"
   - id: IN-03
     severity: info
-    disposition: fixed
-    title: "The never-silent gate still offers \"retry, loop-to-code, or abort\" when the recorded canary has already decided that two of the three stop the run"
+    disposition: open
+    title: "Nothing ties `GATE_CONTEXT_DISPLAY_CHARS` to the 300 that `MAX_IDLE_TIMEOUT_CLAUSE_CHARS` was derived from"
   - id: IN-04
     severity: info
     disposition: fixed
     title: "The monitor's torn-line warning now says \"a Claude quota denial cannot be ruled out\" on every agent's run, including the Antigravity run IN-04 was about"
-open: 0
+open: 5
 total: 6
-recorded: 2026-11-08T17:26:38.705Z
+recorded: 2026-11-08T18:32:04.220Z
 ---
 
 # Phase 51: Code Review Disposition
 
 | Finding | Severity | Disposition | Source |
 |---------|----------|-------------|--------|
-| WR-01 | warning | fixed | 51-REVIEW-FIX.md |
-| WR-02 | warning | fixed | 51-REVIEW-FIX.md |
-| IN-01 | info | fixed | 51-REVIEW-FIX.md |
-| IN-02 | info | fixed | 51-REVIEW-FIX.md |
-| IN-03 | info | fixed | 51-REVIEW-FIX.md |
-| IN-04 | info | fixed | 51-REVIEW-FIX.md |
+| WR-01 | warning | open | - |
+| WR-02 | warning | open | - |
+| IN-01 | info | open | - |
+| IN-02 | info | open | - |
+| IN-03 | info | open | - |
+| IN-04 | info | fixed | 51-REVIEW-FIX.md (not in the current review) |
 
 Dispositions: `open` (recorded, not yet triaged), `fixed`, `skipped`, `deferred`.
 Set `deferred` by hand and put the reason in the Source cell; both are preserved. A `|` in the reason is kept as prose and escaped on the next run.
