@@ -914,34 +914,44 @@ pub(crate) fn render_gate_context(context: &str, max_chars: usize) -> String {
 }
 
 /// The never-silent gate context for a failed `stage`, with its `reason`
-/// capped by [`truncate_reason`].
-fn stage_failure_context(stage: Stage, reason: Option<String>) -> String {
+/// capped by [`truncate_reason`]. `lead` goes before the reason, so it
+/// survives the pending-gate banner's and `gate list`'s display bound whatever
+/// the reason's length.
+fn stage_failure_context(stage: Stage, lead: &str, reason: Option<String>) -> String {
     format!(
-        "[never-silent] stage {stage} failed: {} — human review needed (retry, loop-to-code, or abort)",
+        "[never-silent] stage {stage} failed: {lead}{} — human review needed (retry, loop-to-code, or abort)",
         truncate_reason(&reason.unwrap_or_else(|| "no details available".into()))
     )
 }
 
-/// The gate context names the way on when the run's recorded delivery canary already
-/// refuses its agent: both non-abort answers then stop the run instead of relaunching
-/// ([`relaunch_failed_stage`]), and the notify hook carries this context to an operator
-/// who decides from it alone.
+/// The gate context for a failed non-Validate stage. When the run's recorded delivery
+/// canary already refuses its agent, both non-abort answers stop the run instead of
+/// relaunching ([`relaunch_failed_stage`]), so the context names the way on. It leads,
+/// before the reason, because the notify hook carries this context to an operator who
+/// decides from it alone, and the banner and `gate list` show only its start.
+pub(crate) fn failure_gate_context(state: &State, stage: Stage, reason: Option<String>) -> String {
+    let lead = if recorded_canary_refusal(state).is_some() {
+        format!(
+            "a retry or loop-back will not relaunch under {agent} (its recorded delivery \
+             canary refuses it); answer the gate, then run `devflow resume --phase {phase} \
+             --agent <other>`. Cause: ",
+            agent = state.agent,
+            phase = state.phase,
+        )
+    } else {
+        String::new()
+    };
+    stage_failure_context(stage, &lead, reason)
+}
+
+/// Fire the never-silent failure gate with [`failure_gate_context`].
 pub(crate) fn handle_stage_failure(
     project_root: &Path,
     state: &mut State,
     stage: Stage,
     reason: Option<String>,
 ) -> Result<(), CliError> {
-    let mut context = stage_failure_context(stage, reason);
-    if recorded_canary_refusal(state).is_some() {
-        context.push_str(&format!(
-            "; a retry or loop-back will not relaunch under {agent} (the delivery canary \
-             recorded for this run refuses it): answer the gate, then run `devflow resume \
-             --phase {phase} --agent <other>`",
-            agent = state.agent,
-            phase = state.phase,
-        ));
-    }
+    let context = failure_gate_context(state, stage, reason);
     match run_gate(project_root, state, stage, &context)? {
         GateAction::Advance => {
             // CR-01: close the gate before retrying; its answer is spent.
@@ -5333,7 +5343,7 @@ mod tests {
             "truncate_reason cut the clause before it closed: {truncated}"
         );
         let banner = render_gate_context(
-            &stage_failure_context(Stage::Validate, Some(reason.clone())),
+            &stage_failure_context(Stage::Validate, "", Some(reason.clone())),
             300,
         );
         assert!(

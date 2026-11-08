@@ -549,9 +549,9 @@ fn a_handoff_to_antigravity_that_fails_its_canary_ends_at_a_gate() {
         events[gated]["context"]
             .as_str()
             .is_some_and(|context| context.contains(&format!(
-                "a retry or loop-back will not relaunch under antigravity (the delivery canary \
-             recorded for this run refuses it): answer the gate, then run `devflow resume \
-             --phase {phase} --agent <other>`"
+                "a retry or loop-back will not relaunch under antigravity (its recorded \
+             delivery canary refuses it); answer the gate, then run `devflow resume --phase \
+             {phase} --agent <other>`."
             ))),
         "the gate names the way on: {}",
         events[gated]
