@@ -1193,7 +1193,7 @@ or hand-editing `.devflow/` state; the Phase 51 remedy text points at `--agent <
 **Not established:** never hit live; read from source.
 
 **Fix shape:** a deliberate "re-check the canary" route (e.g. `resume --recheck-canary`, or treat `--agent <same>` as
-an explicit re-check), and make `--agent <same>` say what it did instead of nothing. Operator to choose fix timing.
+an explicit re-check), and make `--agent <same>` say what it did instead of nothing. **Target: Phase 52** (operator, 2026-11-08).
 
 ### Phase 999.193: The Validate Gate Says "Validation Passed — Approve to Ship?" While the Phase's Verification Reports `gaps_found` (BACKLOG)
 
