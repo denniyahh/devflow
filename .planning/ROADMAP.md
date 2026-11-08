@@ -1073,6 +1073,24 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.190: `devflow status` Never Shows Why a Stopped Run Stopped (BACKLOG)
+
+**Found:** 2026-11-08, Phase 51 review fix (WR-02, `7e8ee1a`). The fix stops a run whose gate answer would relaunch
+into a refusing canary and writes a `stop_reason` naming `devflow resume --phase N --agent <other>`, but nothing the
+operator runs shows it.
+
+**The defect:** `RunState.stop_reason` is written by every stop path (`--until`, `devflow stop`, safe-point stops, the
+supervisor stop, the WR-02 canary refusal), yet the only non-test reader in `crates/` is `start`'s "stopped before
+anything was launched" line (`commands.rs`). `devflow status` prints the generic `devflow resume --phase N` hint for a
+stopped run, so advice like "resume with another agent" is visible only in `.devflow/state-NN.json`, the event log and
+OPERATIONS.md.
+
+**Not established:** found by reading the code (`rg stop_reason crates/`), not by running `devflow status` on a stopped
+run; no test covers `devflow resume --agent` after the WR-02 stop.
+
+**Fix shape:** `status` (and `doctor`) print the recorded `stop_reason` for a stopped run beside the resume hint; a CLI
+test asserts the WR-02 reason text appears. Small; fits the next fix branch or Phase 52.
+
 ### Phase 999.189: A Gate Rejection's Note Never Reaches the Fix Pass, and Any Note Containing "abort" Aborts the Run (BACKLOG)
 
 **Found:** 2026-11-08, Phase 51 Validate gate, by reading v3.0.0 before answering it.
@@ -1128,6 +1146,11 @@ bumping the infra counter twice, and give the gate write a record-keeping exempt
 
 **Acceptance:** the two reproductions above end at an open gate whose context names the launch error, with the
 failover gate test as the unchanged control.
+
+**Partly addressed 2026-11-08 (Phase 51 review fix WR-02, `7e8ee1a`):** a retry or loop-back gate answer whose
+relaunch the recorded delivery canary refuses now stops the run with a named reason and a `gate_relaunch_refused`
+event. The two reproductions above, and a gate-answer relaunch that fails for any other reason, still end silently.
+Stays open.
 
 ### Phase 999.186: Nothing Acts on the Rate-Limit Cron Instructions, So a Paused Run Never Resumes (BACKLOG)
 
