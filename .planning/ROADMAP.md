@@ -1073,6 +1073,22 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.188: The Held-State-Write-Lock Status Test Fails Intermittently Under the Full Suite (BACKLOG)
+
+**Found:** 2026-11-08, the Phase 51 Validate gate check (`scripts/check.sh all` at `b6205b0`).
+
+**The defect:** `commands::tests::status_and_doctor_name_a_held_state_write_lock` (added in 50.1-18) failed once at its
+"control: released" assertion (`crates/devflow-cli/src/commands.rs:18661`): after the holder thread released the lock
+and was joined, `write_lock_status` still reported `held by an unknown holder`. It passed 15/15 run alone (nextest) and
+in 3/3 further full `cargo test -p devflow --bin devflow` runs, so it is load- or interleaving-dependent: 1 failure in 4
+full runs, a weak estimate of the rate.
+
+**Not established:** whether Phase 51 code made it reachable or it predates the phase, and what still holds the lock (a
+child process inheriting the lock's descriptor from a concurrently running test is one candidate, unverified).
+
+**Fix shape:** reproduce under load (loop the full binary, or run alongside a process-spawning test), find the holder,
+then fix the lock's release or the test's isolation. A green full run is not evidence of a fix.
+
 ### Phase 999.187: An In-Supervisor Launch Failure Outside Failover Ends the Run With No Gate and No Cause (BACKLOG)
 
 **Found:** 2026-11-07, Phase 51 execution. Plan 51-06 found it by reading the `Ambiguous` re-drive; plans 51-10 and
