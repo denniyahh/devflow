@@ -4424,7 +4424,7 @@ pub(crate) fn claim_foreground_holder(
 }
 
 /// Print an open gate's full, untruncated (but sanitized) context — the
-/// discoverability counterpart to `gate_list`'s 100-char table truncation
+/// discoverability counterpart to `gate_list`'s `GATE_CONTEXT_DISPLAY_CHARS` truncation
 /// (21a, D-03). Shares `resolve_single_open_gate_stage` with `gate_respond`
 /// (999.30 / DEN-55 WR-01) so the two commands' gate-resolution behavior
 /// cannot drift, and resolves/selects from one fetched open-gate collection
