@@ -1073,6 +1073,28 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.187: An In-Supervisor Launch Failure Outside Failover Ends the Run With No Gate and No Cause (BACKLOG)
+
+**Found:** 2026-11-07, Phase 51 execution. Plan 51-06 found it by reading the `Ambiguous` re-drive; plans 51-10 and
+51-13 reproduced it on the ordinary path (`pipeline_launch::tests::an_ordinary_transition_with_the_publish_probe_withheld_fails_the_same_way`
+and the 51-13 pending-record control). Details: `51-06-SUMMARY.md`, `51-10-SUMMARY.md` and `51-SUPV01-EVIDENCE.md`
+`## Backlog findings`.
+
+**The defect:** when a launch made inside a supervisor fails and the path is not failover (an `Ambiguous` re-drive via
+`handle_ambiguous_outcome` → `launch_stage`, or an ordinary stage transition whose launch is refused or never
+publishes), the failed launch clears the record, the error returns through `run_monitor`'s `other =>` arm, and the
+supervisor exits with stderr sent to `/dev/null`. The run is left at the stage with `supervisor: None`, not stopped, no
+gate and nothing scheduled, and no event names the cause (51-13's pending-record case leaves only
+`launch_refused_over_live_pending`, which nothing surfaces to the operator). Phase 51's failover path is gated
+(51-06); this is the same failure on every other in-supervisor launch.
+
+**Fix shape (not decided):** route a non-`NotOwner` in-supervisor launch failure to `gate_or_abort_infra`, without
+bumping the infra counter twice, and give the gate write a record-keeping exemption like 51-06's
+`FailoverRelaunchGuard` so it is not refused as `NotOwner`.
+
+**Acceptance:** the two reproductions above end at an open gate whose context names the launch error, with the
+failover gate test as the unchanged control.
+
 ### Phase 999.186: Nothing Acts on the Rate-Limit Cron Instructions, So a Paused Run Never Resumes (BACKLOG)
 
 **Found:** 2026-11-07, Phase 51 dogfood run (v3.0.0, supervise mode, no fallback agent). The Code stage hit a real
