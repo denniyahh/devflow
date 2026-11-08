@@ -19,7 +19,7 @@ use crate::pipeline_gate::{
     LoopBackReason, abort, finish_workflow, loop_back_to_code, run_gate, run_gate_with_timeout,
     transition,
 };
-use crate::pipeline_launch::{close_gate, commit, launch_stage};
+use crate::pipeline_launch::{close_gate, commit, launch_stage, recorded_canary_refusal};
 use devflow_core::gates::{GateAction, GateResponse};
 use devflow_core::hooks::{self, HookContext};
 use devflow_core::mode;
@@ -934,7 +934,7 @@ pub(crate) fn handle_stage_failure(
             // CR-01: close the gate before retrying; its answer is spent.
             let _ = close_gate(project_root, state.phase, stage);
             state.gate_pending = false;
-            launch_stage(state, None, Some(stage))
+            relaunch_failed_stage(project_root, state, stage)
         }
         GateAction::LoopBack(_) => {
             // Retry the SAME failed stage — Code is not a valid recovery
@@ -942,10 +942,55 @@ pub(crate) fn handle_stage_failure(
             // (Codex 13-01 MEDIUM). Only Ship's ReviewFailed path (handled
             // separately in `handle_ship_failure`) actually loops to Code.
             let _ = close_gate(project_root, state.phase, stage);
-            launch_stage(state, None, Some(stage))
+            relaunch_failed_stage(project_root, state, stage)
         }
         GateAction::Abort(reason) => abort(project_root, state, &reason),
     }
+}
+
+/// Relaunch `stage` for a retry or loop-back answer to its never-silent gate.
+///
+/// A delivery canary the run already recorded as refusing its agent refuses every
+/// relaunch under that agent, and that refusal would clear the supervisor record and end
+/// the supervisor with no gate, no event and no cause (backlog 999.187). The gate after
+/// a failover whose fallback failed its canary makes this routine. So the relaunch is not
+/// tried: the run is marked stopped, with a reason naming the refusal and
+/// `devflow resume --phase N --agent <other>` as the way on, a `gate_relaunch_refused`
+/// event is written, and the supervisor ends. Not a new gate: a supervisor waiting at a
+/// gate is live, and `resume` refuses over a live run. All of it is written while the
+/// supervisor is still the one the state records.
+fn relaunch_failed_stage(
+    project_root: &Path,
+    state: &mut State,
+    stage: Stage,
+) -> Result<(), CliError> {
+    let Some(refusal) = recorded_canary_refusal(state) else {
+        return launch_stage(state, None, Some(stage));
+    };
+    let phase = state.phase;
+    let agent = state.agent;
+    let stop_reason = format!(
+        "the {stage} stage cannot relaunch under {agent}: the delivery canary recorded for \
+         this run refuses it ({refusal}); run `devflow resume --phase {phase} --agent <other>` \
+         to continue on another agent"
+    );
+    commit(state, |s| {
+        s.stopped = true;
+        s.stop_reason = Some(stop_reason.clone());
+        s.gate_pending = false;
+    })?;
+    events::emit(
+        project_root,
+        phase,
+        "gate_relaunch_refused",
+        serde_json::json!({
+            "stage": stage.to_string(),
+            "agent": agent.to_string(),
+            "reason": refusal,
+        }),
+    );
+    tracing::warn!("phase {phase}: {stop_reason}");
+    Ok(())
 }
 
 /// Handle the Ship stage's failure outcome, distinguishing an agent crash
