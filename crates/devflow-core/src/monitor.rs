@@ -4318,7 +4318,10 @@ exit 0
     /// The stub prints a complete but malformed line, which is the only way a
     /// torn line can reach the capture before the kill: the reader tees whole
     /// lines, and a killed child's partial line arrives at EOF, after this
-    /// check (the read side covers that case).
+    /// check. The read side re-checks for it only when this check wrote a
+    /// record: after a complete denial this check suppresses the record, so
+    /// that order ends as an indeterminate `Failed` gate while the monitor log
+    /// says rate-limited (known residual, backlog 999.207; not tested here).
     #[test]
     fn a_torn_final_line_at_the_idle_timeout_is_flagged_on_the_record() {
         let run_silent_stub = |root: &Path, phase: PhaseId, last_line: Option<&str>| {

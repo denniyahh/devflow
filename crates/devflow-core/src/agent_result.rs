@@ -2593,7 +2593,9 @@ pub(crate) enum CaptureDenial {
 /// idle-timeout record (`Denied`), writing it flagged (`TornAfterLastEvent`)
 /// and writing it as before (`NotDenied`); [`parse_idle_timeout_side_channel`]
 /// calls it again at read time, because the partial line of a killed child
-/// reaches the capture only at EOF, after the monitor's check.
+/// reaches the capture only at EOF, after the monitor's check. That re-check
+/// runs only when the monitor wrote a record, so it does not cover a monitor
+/// that answered `Denied` (backlog 999.207).
 pub(crate) fn capture_rate_limit_denial(project_root: &Path, phase: PhaseId) -> CaptureDenial {
     let Some(raw) = read_capture(&stdout_path(project_root, phase)) else {
         return CaptureDenial::NotDenied;
@@ -2603,7 +2605,13 @@ pub(crate) fn capture_rate_limit_denial(project_root: &Path, phase: PhaseId) -> 
 
 /// The one precedence rule for a capture's denial answer, shared by the
 /// monitor ([`capture_rate_limit_denial`]) and the verdict
-/// ([`parse_claude_event_result`]) so the two cannot disagree (D-16): a torn
+/// ([`parse_claude_event_result`]) so the two answer alike for the same
+/// capture bytes (D-16). They can still disagree when the bytes differ: a
+/// killed child's partial line reaches the capture only at EOF, after the
+/// monitor already answered `Denied`, logged rate-limited and wrote no
+/// idle-timeout record, so the verdict sees the torn line and returns an
+/// indeterminate `Failed` (a gate, no failover, no cron; known residual,
+/// backlog 999.207). The rule itself: a torn
 /// JSON line after the last parsed event wins over a parsed denial, because
 /// [`detect_claude_stream_rate_limit`] takes the last rate-limit event and the
 /// torn line may be a later one, or a result, that replaced the denial. Nothing

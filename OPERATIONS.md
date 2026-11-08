@@ -316,7 +316,15 @@ about one either way. A torn final line outranks a quota denial parsed before
 it, because the torn line may be a later event that replaced the denial: the
 stage is never classified as rate-limited, so no failover and no cron resume
 follow. At an idle timeout it is recorded as one, flagged torn, and stops at a
-gate.
+gate, when the torn line reached the capture before the monitor's idle check.
+Known residual (backlog 999.207): the capture keeps whole lines only, so a
+partial line the agent was writing when it was killed reaches the capture only
+at end of output, after that check. If the capture held a complete quota denial
+at the check, the monitor logs the stage as rate-limited (resumable), writes no
+idle-timeout record and kills the agent; the verdict then reads the torn line
+and the gate shows an indeterminate failure (`stream capture ends in an
+unparseable line`), not an idle timeout. The outcome is still a gate, with no
+failover and no cron resume.
 
 The failover events in `events.jsonl`:
 
