@@ -143,13 +143,16 @@ const CODE_TURN_LEAVES_UNCOMMITTED_WORK: &str = r#"    printf 'staged by claude\
 
 /// What the fallback's stage turn records, before it commits, about the tree
 /// it inherited: its working directory, branch, `git status --porcelain`, the
-/// staged blob and the two working-tree files.
+/// staged blob, the two working-tree files, and `.planning/config.json` both
+/// as committed and as on disk.
 const AGY_RECORDS_WHAT_IT_INHERITED: &str = r#"pwd -P > '@LOGS@/agy-cwd'
 git rev-parse --abbrev-ref HEAD > '@LOGS@/agy-branch'
 git status --porcelain --untracked-files=all > '@LOGS@/agy-status'
 git show :staged.txt > '@LOGS@/agy-index-staged'
 cat README.md > '@LOGS@/agy-readme'
-cat untracked.txt > '@LOGS@/agy-untracked'"#;
+cat untracked.txt > '@LOGS@/agy-untracked'
+git show HEAD:.planning/config.json > '@LOGS@/agy-config-head'
+cat .planning/config.json > '@LOGS@/agy-config-worktree'"#;
 
 /// Hermetic `git` for fixture setup (999.37), never a bare `Command::new("git")`.
 fn git(root: &Path, args: &[&str]) {
@@ -933,17 +936,35 @@ fn a_handoff_inside_a_phase_worktree_keeps_the_tree_branch_and_uncommitted_work(
         branch,
         "the fallback launched on the phase branch"
     );
-    // `.planning/config.json` is DevFlow's own auto-chain flag write
-    // (`gsd_config::set_auto_chain_active`), not the primary's work.
-    let inherited: Vec<String> = recorded("agy-status")
-        .lines()
-        .filter(|line| *line != " M .planning/config.json")
-        .map(str::to_string)
-        .collect();
+    let inherited: Vec<String> = recorded("agy-status").lines().map(str::to_string).collect();
     assert_eq!(
         inherited,
-        [" M README.md", "A  staged.txt", "?? untracked.txt"],
-        "the staged, unstaged and untracked changes are all still there, as they were"
+        [
+            " M .planning/config.json",
+            " M README.md",
+            "A  staged.txt",
+            "?? untracked.txt"
+        ],
+        "the staged, unstaged and untracked changes are all still there, as they were, \
+         beside DevFlow's own config write"
+    );
+    // The config change is DevFlow's auto-chain flag write
+    // (`gsd_config::set_auto_chain_active`) and nothing else: with that one
+    // key removed, the on-disk config equals the committed one.
+    let without_auto_chain_flag = |name: &str| {
+        let mut config: Value = serde_json::from_str(&recorded(name))
+            .unwrap_or_else(|err| panic!("{name} is not JSON: {err}"));
+        let shown = config.to_string();
+        config["workflow"]
+            .as_object_mut()
+            .unwrap_or_else(|| panic!("{name} has no workflow object: {shown}"))
+            .remove("_auto_chain_active");
+        config
+    };
+    assert_eq!(
+        without_auto_chain_flag("agy-config-worktree"),
+        without_auto_chain_flag("agy-config-head"),
+        "`.planning/config.json` changed beyond the auto-chain flag"
     );
     assert_eq!(recorded("agy-index-staged"), "staged by claude\n");
     assert_eq!(recorded("agy-readme"), "base\nunstaged edit by claude\n");
