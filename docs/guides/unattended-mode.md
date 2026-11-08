@@ -59,7 +59,7 @@ Every stage runs under the same DevFlow supervisor process, in one of two
 launch shapes. The guard that bounds the flag's lifetime is engaged only by a
 supervisor on the stream shape, which Claude and Antigravity `stream-json`
 launches use; a supervisor on the capture shape never engages it, so a Code
-stage launched that way would have nothing bounding the flag. So two
+stage launched that way would have nothing bounding the flag. So these
 capture-shape launches are refused in auto mode:
 
 - **A non-Claude agent.** `--agent codex` and `--agent opencode` launch on the
@@ -69,9 +69,15 @@ capture-shape launches are refused in auto mode:
 - **The legacy launch opt-out.** `--legacy-claude-launch` (or
   `DEVFLOW_CLAUDE_LEGACY_LAUNCH`) moves Claude onto the capture shape, which
   never engages the guard. It is now mutually exclusive with `--mode auto`.
+- **A fallback outside the stream shape.** A `--fallback-agent` (or
+  `devflow.toml`'s `fallback_agent` key) runs the Code stage unattended after a
+  rate limit, so it must itself launch on the stream shape: `--mode auto`
+  accepts only `claude` or `antigravity` as a fallback. The check at launch is
+  best effort: the full preflight runs again at the handoff, and a refusal
+  there takes the cron arm. This guard is not widened for the fallback.
 
-The recovery for either is the same: drop the flag that caused it, or run in
-supervise mode.
+The recovery for each is the same: drop the flag that caused it (or name a
+fallback on the stream shape), or run in supervise mode.
 
 ### 3. No plan declares a checkpoint GSD never auto-approves
 
