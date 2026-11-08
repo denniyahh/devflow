@@ -1,6 +1,6 @@
 ---
 phase: 51-rate-limit-agent-failover
-fixed_at: 2026-11-08T14:55:00Z
+fixed_at: 2026-11-08T17:25:09Z
 review_path: .planning/phases/51-rate-limit-agent-failover/51-REVIEW.md
 iteration: 1
 findings_in_scope: 6
@@ -11,158 +11,162 @@ status: all_fixed
 
 # Phase 51: Code Review Fix Report
 
-**Fixed at:** 2026-11-08T14:55:00Z
+**Fixed at:** 2026-11-08T17:25:09Z
 **Source review:** .planning/phases/51-rate-limit-agent-failover/51-REVIEW.md
 **Iteration:** 1
 
 **Summary:**
 - Findings in scope: 6 (fix_scope `all`)
-- Fixed: 6. WR-01 and WR-02 change behavior and need a human to confirm the logic.
+- Fixed: 6. WR-01 and WR-02 change behavior and need a human to confirm the logic. IN-02 was
+  closed by the review's documentation option (recorded against backlog 999.187): the code path
+  it describes still ends silently.
 - Skipped: 0
 
 **Where verification ran:** in the phase worktree `.worktrees/phase-51` on `feature/phase-51`,
 which is the tree these commits are on. `workflow.use_worktrees` is `false`, so no separate
 review-fix worktree was created.
 
+**Checks run before each code commit:** `cargo fmt --all -- --check` and
+`cargo clippy --workspace --all-targets -- -D warnings` (both exit 0). Each new or changed test
+was run by exact name with `cargo nextest run --no-tests=fail -E 'test(=...)'`, and each has a
+negative control: the fix was reverted in place, the test failed with the expected message, and
+the fix was restored.
+
+**What this does not establish:** `scripts/check.sh all` and the container check were not run.
+The full `devflow` and `devflow-core` suites were not run. These ran: the related test files
+`failover_e2e`, `fallback_agent_config`, `gate_notify_persist_e2e`, `start_lock_e2e`,
+`auto_chain_leak_repair_e2e` and `phase7_cli`, the `doc_check` module, and filtered unit-test
+sets (`resume|recovery_hints|canary`, `stage_failure|failover|handoff|never_silent|gate_context`).
+All passed. The e2e stubs are DevFlow's own fixtures, not a live Claude or Antigravity CLI.
+
 ## Fixed Issues
 
-### WR-01: `devflow parallel` arms `devflow.toml`'s `fallback_agent`, contradicting its comment, and its refusal names a flag `parallel` lacks
+### WR-01: After the WR-02 stop, `devflow status` sends the operator to the plain `devflow resume`, which is refused and overwrites the only record of the way on
 
-**Files modified:** `crates/devflow-cli/src/commands.rs`, `crates/devflow-cli/src/main.rs`,
-`crates/devflow-cli/src/parallel.rs`, `crates/devflow-cli/tests/fallback_agent_config.rs`
-**Commit:** 9886a95
-**Status:** fixed: requires human verification (behavior choice)
-**Applied fix:** Option 1 from the review: `parallel` never arms a fallback. The configuration
-guide already says the key "is read by `devflow start` only". `start` now takes a
-`FallbackSource`. `devflow start` passes `FlagOrConfig(flag)`, which behaves as before. `parallel`
-passes `NoFallback`, which reads no key. The `parallel` comment now matches the code.
-**Test:** `fallback_agent_config::parallel_ignores_the_config_key` runs a real `devflow parallel`
-with `fallback_agent = "claude"` and agent claude. It asserts that the launch succeeds, that no
-fallback line is printed, and that the saved state has `fallback_agent: null`.
-**Negative control:** with `parallel` passing `FlagOrConfig(None)`, the test fails with
-`devflow.toml's fallback_agent (claude) is refused: ...`.
+**Files modified:** `crates/devflow-cli/src/commands.rs`, `crates/devflow-cli/src/pipeline_launch.rs`, `crates/devflow-cli/tests/failover_e2e.rs`, `OPERATIONS.md`
+**Commit:** 5ced4d8
+**Status:** fixed: requires human verification (behavior change)
+**Applied fix:**
+- `recovery_hints` now gives `devflow resume --phase N --agent <other>` as its continue verb
+  when `recorded_canary_refusal(state)` is `Some`, unless a stored Ship answer selects
+  `devflow ship`. This covers every hint that uses the continue verb (stale, gone while active,
+  stopped), not only the stopped case the review sketched, because a plain resume is refused in
+  all of them.
+- New `refuse_recorded_canary_for_resume` runs in `resume_loaded` right after
+  `refuse_fallback_for_resume`, before the first state write. When no `--agent` handoff to a
+  different agent is requested and the run, judged with its legacy opt-out applied, has a
+  recorded refusal, `resume` refuses with a message naming `--agent <other>` and writes
+  nothing. `stopped` and `stop_reason` are left as they were.
+- Unit test `commands::tests::recovery_hints_name_another_agent_when_the_recorded_canary_refuses_the_run`
+  checks `Absent` and `Unverified`, with a `Confirmed` control.
+- New e2e test `failover_e2e::after_the_refused_relaunch_status_and_resume_lead_to_another_agent`:
+  1. After the refused relaunch, `devflow status` shows the `--agent` hint and no plain-resume
+     line.
+  2. A plain `devflow resume` fails and names the hint. It leaves `stop_reason`, `stopped` and
+     the recorded `Absent` unchanged, and launches nothing.
+  3. `devflow resume --agent claude` hands off (`agent_handoff`, reason `resume --agent`), and
+     Claude reruns its canary (`Confirmed`) and Code.
+- Negative controls: with the resume refusal removed, the e2e failed at "the refusal names the
+  way on" (the old canary text came back). With the hint change disabled, the unit test failed
+  (`["devflow resume --phase 7"]`).
+- OPERATIONS.md's "way on" list now names the status hint and says a plain resume changes
+  nothing.
 
-### WR-02: The never-silent gate after a canary-refused failover offers retry and loop options that end the run with no gate (999.187, made reachable by this phase)
+### WR-02: `devflow parallel` now silently ignores a configured `fallback_agent` key, including an invalid one
 
-**Files modified:** `crates/devflow-cli/src/pipeline_launch.rs`,
-`crates/devflow-cli/src/pipeline_outcomes.rs`, `crates/devflow-cli/tests/failover_e2e.rs`,
-`OPERATIONS.md`
-**Commit:** 7e8ee1a
-**Status:** fixed: requires human verification (logic change)
-**Applied fix:** A retry or loop-back answer now goes through the new `relaunch_failed_stage` in
-`handle_stage_failure`. It checks `recorded_canary_refusal(state)` first. That check uses the
-same predicate as `canary_gate`: a stream launch and a recorded `Absent` or `Unverified`
-outcome. When the recorded canary refuses the run's agent, the stage is not relaunched. The
-supervisor still owns the record, and while it does it:
-- marks the run `stopped`, with a `stop_reason` that names the refusal and
-  `devflow resume --phase N --agent <other>`;
-- clears `gate_pending`;
-- emits a `gate_relaunch_refused` event (`stage`, `agent`, `reason`);
-- returns `Ok`.
+**Files modified:** `crates/devflow-cli/src/parallel.rs`, `crates/devflow-cli/src/commands.rs`, `crates/devflow-core/src/config.rs`, `crates/devflow-cli/tests/fallback_agent_config.rs`, `OPERATIONS.md`, `README.md`, `docs/guides/configuration.md`
+**Commit:** 1106d67
+**Status:** fixed: requires human verification (behavior change)
+**Applied fix:**
+- `parallel` reads `config::fallback_agent(project_root)` once, before it launches anything.
+  - An `Err` refuses `parallel`, as it refuses `start`.
+  - `Ok(Some(agent))` prints a note that the key is not armed by `devflow parallel` and that its
+    runs carry no fallback. The note names `devflow start --phase N --fallback-agent <agent>`,
+    or `devflow resume --phase N --fallback-agent <agent>` for a stopped or paused run.
+  - This differs from the review's suggested wording, which offered only `resume`: `resume` is
+    refused over a live run, so it cannot arm a run `parallel` just launched.
+- Runs still carry no fallback (`NoFallback` unchanged).
+- Docs updated to match: the comments in `parallel.rs` and `commands.rs`, the doc of
+  `config::fallback_agent` (doc-only, no public API change), README, the OPERATIONS.md
+  `parallel` row, and the configuration guide.
+- Tests:
+  - `parallel_ignores_the_config_key` now also asserts the note.
+  - New `parallel_refuses_a_config_key_that_names_no_agent`: the key `"nosuch"` refuses
+    `parallel`, the refusal names the key and the file, and no state file is written. Control:
+    with no `devflow.toml`, `parallel` succeeds and prints no note.
+  - Negative control: with the config read replaced by `None`, both tests failed.
 
-The review's first option, re-opening the gate, was not used. A supervisor waiting at a gate is
-live, `resume` refuses over a live run (`refuse_launch_over_a_live_run`), and `stop` aborts and
-deletes the state. A re-opened gate would therefore leave abort as the only way on.
-`FailoverRelaunchGuard` was not reused either, because a permanent source-scan test pins its
-use to `fail_over_on_rate_limit`. OPERATIONS.md documents the event and the new outcome.
-**Tests:** `failover_e2e::approving_the_failed_canary_gate_stops_the_run_and_names_the_way_on`
-and `failover_e2e::rejecting_the_failed_canary_gate_stops_the_run_and_names_the_way_on`. Each
-drives a real run to the gate left by `a_handoff_to_antigravity_that_fails_its_canary_ends_at_a_gate`,
-answers it, and asserts:
-- the event and its fields;
-- `stopped`, plus the exact `devflow resume --phase N --agent <other>` text in `stop_reason`;
-- no gate is pending;
-- `agy` was invoked only for its first canary.
-
-The existing gate test is unchanged and still passes.
-**Negative control:** with the pre-check disabled, the approve test fails after 120 s with
-`timed out ... waiting for one of ["gate_relaunch_refused", "workflow_finished"]`. That is the
-999.187 silent end.
-**Backlog 999.187:** this closes 999.187 only at this entry point: a gate answer whose relaunch
-the recorded canary refuses. It does not change the two reproductions 999.187's acceptance
-names. Those are the `Ambiguous` re-drive and an ordinary transition whose launch is refused or
-never publishes. A gate answer whose relaunch fails for another reason, such as a preflight
-error or a spawn failure, also still clears the record and ends the run silently. ROADMAP.md was
-not edited.
-
-### IN-01: The failover guard also covers `run_preflight`'s own gate and the relaunch its answer starts, contrary to its doc comments
+### IN-01: `recorded_canary_refusal` is a second copy of `canary_gate`'s refusal mapping, and nothing pins the two together
 
 **Files modified:** `crates/devflow-cli/src/pipeline_launch.rs`
-**Commit:** 982d443
-**Applied fix:** This is a comment-only change, with no code change. The doc comments on
-`refuse_launch`, `record_failed_launch` and `FailoverRelaunchGuard` now say what the code does.
-The guard lasts for the whole `launch_stage` call, including `run_preflight`. A preflight gate
-opened there, and the launch its answer starts, keep the record. A launch started by the
-failover's own infra gate runs unguarded. The claim was checked against `preflight.rs`: its
-gate arms call `launch_stage_inner` and `launch_stage`.
+**Commit:** 02a2af7
+**Applied fix:**
+- Took the review's test option instead of extracting a shared helper.
+- New `pipeline_launch::tests::recorded_canary_refusal_agrees_with_canary_gate_on_every_recorded_outcome`
+  enumerates 5 agents x 5 stages x legacy {false, true} x {Confirmed, Absent, Unverified}. For
+  each, it asserts that `recorded_canary_refusal(&s).is_some()` equals
+  `canary_gate(&mut s.clone(), stream_launch_enabled(..), || unreachable!()).is_err()`.
+- With nothing recorded, it asserts `recorded_canary_refusal` is `None` on its own, because
+  `canary_gate` runs a fresh canary there by design.
+- A control asserts that the enumeration contains both admitted and refused launches.
+- The doc comment of `recorded_canary_refusal` names the test.
+- Negative control: mapping `Unverified` to `None` in the copy failed the test
+  (`claude define legacy=false Unverified`).
+- Limit: the test derives the stream flag with the same `stream_launch_enabled` call that
+  `launch_stage_inner` makes. If that call site changes how it computes the flag, this test
+  does not catch it.
+- The commit subject uses `test(51)`, since the change is test and doc only.
 
-### IN-02: The `devflow.toml` key parses agent names more strictly than the `--fallback-agent` flag
+### IN-02: A gate retry whose canary has not yet been recorded can still end the run silently (999.187 residual at the same entry point)
 
-**Files modified:** `crates/devflow-core/src/config.rs`
-**Commit:** cd35c7a
-**Applied fix:** `FallbackAgentKey.fallback_agent` is now an `Option<String>`, parsed with
-`AgentKind::from_str`, the parser the flag uses. An invalid value maps into the existing
-`devflow.toml: cannot read \`fallback_agent\`` message. Only a private struct changed. The
-signature of `config::fallback_agent` did not.
-**Test:** `config::tests::fallback_agent_key_resolves_from_devflow_toml` now also asserts that
-`"Codex"` resolves to Codex and `"open-code"` resolves to OpenCode.
-**Negative control:** parsing with serde fails the test with
-`unknown variant \`Codex\``.
+**Files modified:** `.planning/ROADMAP.md`
+**Commit:** 1c77853
+**Applied fix:** took the review's third option and recorded the case against backlog 999.187.
+No code change. The 999.187 entry now has a paragraph that covers:
+- the canary-specific path: `hand_off_agent` clears the canary, the failover relaunch fails
+  before `canary_gate`, a retry passes the pre-check, and a fresh refusing canary clears the
+  record;
+- why Phase 51 does not fix it: writing the stop after the error needs the supervisor record
+  kept on gate-answer relaunches. That needs a second guard site beside
+  `FailoverRelaunchGuard`, whose single site a permanent source-scan test pins, and it is
+  999.187's own fix shape, which is still marked undecided;
+- the check the general fix should include.
 
-### IN-03: An unparseable `devflow.toml` is now reported as a `fallback_agent` problem even when the file has no such key
+The silent end this finding describes still happens. It is read from the code and was not
+reproduced at runtime.
 
-**Files modified:** `crates/devflow-core/src/config.rs`
-**Commit:** 0f6c79c
-**Applied fix:** The file is parsed as a `toml::Table` first. A syntax error now returns
-`devflow.toml: <error>`, the same text `base_branch` uses. The key-specific refusal is kept for
-a parseable file whose `fallback_agent` value does not name an agent, including a value that is
-not a string.
-**Test:** the same test now asserts two things:
-- a file with no key and a syntax error (`review_angles = ["security"`) starts with
-  `devflow.toml: ` and does not contain `fallback_agent`;
-- `fallback_agent = 3` still names the key.
+### IN-03: The never-silent gate still offers "retry, loop-to-code, or abort" when the recorded canary has already decided that two of the three stop the run
 
-**Negative control:** with the old error mapping, the test fails with
-`a parse error does not blame the fallback_agent key`.
+**Files modified:** `crates/devflow-cli/src/pipeline_outcomes.rs`, `crates/devflow-cli/tests/failover_e2e.rs`, `OPERATIONS.md`
+**Commit:** a722892
+**Applied fix:**
+- When `recorded_canary_refusal(state)` is `Some`, `handle_stage_failure` appends this to the
+  gate context: `; a retry or loop-back will not relaunch under {agent} (the delivery canary
+  recorded for this run refuses it): answer the gate, then run `devflow resume --phase {phase}
+  --agent <other>``.
+- The text is appended after the truncated reason, so the reason's truncation never cuts it.
+  The notify hook carries the same context.
+- `a_handoff_to_antigravity_that_fails_its_canary_ends_at_a_gate` now asserts the exact
+  sentence in the `gate_fired` context.
+- Negative control: with the append disabled, the test failed and showed the old context.
+- OPERATIONS.md says the same.
 
-### IN-04: The torn-final-line clause claims "a quota denial cannot be ruled out" for agents whose denials the classifier cannot detect at all
+### IN-04: The monitor's torn-line warning now says "a Claude quota denial cannot be ruled out" on every agent's run, including the Antigravity run IN-04 was about
 
-**Files modified:** `crates/devflow-core/src/agent_result.rs`, `crates/devflow-core/src/monitor.rs`,
-`OPERATIONS.md`
-**Commit:** c6e29e0
-**Applied fix:** This changes wording only. The clause segment now reads
-`torn final line after the last parsed event`, and the test's pinned literal was updated to
-match. The monitor's warn and log lines now say "a Claude quota denial cannot be ruled out".
-OPERATIONS.md explains that the classifier reads only Claude's denials. The verdict is
-unchanged.
-
-## Verification
-
-- Each commit was gated on `cargo fmt --all` and on a clean
-  `cargo clippy --workspace --all-targets -- -D warnings`. Each also passed its named tests, run
-  with `cargo nextest run --no-tests=fail -E 'test(=...)'`. The pre-commit hook, gitleaks,
-  passed on every commit, and none used `--no-verify`.
-- `cargo semver-checks check-release -p devflow-core`: 229 pass, 31 skip, "no semver update
-  required".
-- `scripts/check.sh all` passed and exited 0 (fmt, clippy, `cargo test --workspace`):
-  - 45 test binaries, all `ok`, and no `test result: FAILED` line;
-  - **2113 passed, 0 failed, 6 ignored**, summed from the `test result:` lines;
-  - a second count, of the per-test `... ok` lines, gives 2112. The one-line gap is probably a
-    line interleaved with other output, but this was not confirmed.
-
-  The known intermittent test `status_and_doctor_name_a_held_state_write_lock` (999.188) passed
-  in this run.
-
-**What this does not establish:**
-- The WR-02 tests use stub agents, not a live Claude or Antigravity CLI.
-- No test covers `devflow resume --phase N --agent <other>` after the new stop. That it works
-  is read from `resume_loaded`: it clears `stopped`, and `hand_off_agent` clears the canary.
-- `devflow status` shows the `devflow resume --phase N` continue hint for a stopped run, but it
-  does not print `stop_reason`. The way on is therefore in the state file, the event log and
-  OPERATIONS.md, but not in the status output.
+**Files modified:** `crates/devflow-core/src/monitor.rs`
+**Commit:** e0683ce
+**Applied fix:**
+- Took the review's conditional-wording option. The warn line now reads "so if the agent is
+  Claude a quota denial cannot be ruled out (only Claude's stream is classified for one)". The
+  `[idle-timeout]` monitor-log line now reads "if the agent is Claude a quota denial cannot be
+  ruled out".
+- No signature change, and no public API change (the function is private).
+- `monitor::tests::a_torn_final_line_at_the_idle_timeout_is_flagged_on_the_record` now asserts
+  the new log wording.
+- Negative control: restoring the old wording failed it.
 
 ---
 
-_Fixed: 2026-11-08T14:55:00Z_
+_Fixed: 2026-11-08T17:25:09Z_
 _Fixer: Claude (gsd-code-fixer)_
 _Iteration: 1_
