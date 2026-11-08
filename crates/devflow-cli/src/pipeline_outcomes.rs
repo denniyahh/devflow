@@ -922,13 +922,26 @@ fn stage_failure_context(stage: Stage, reason: Option<String>) -> String {
     )
 }
 
+/// The gate context names the way on when the run's recorded delivery canary already
+/// refuses its agent: both non-abort answers then stop the run instead of relaunching
+/// ([`relaunch_failed_stage`]), and the notify hook carries this context to an operator
+/// who decides from it alone.
 pub(crate) fn handle_stage_failure(
     project_root: &Path,
     state: &mut State,
     stage: Stage,
     reason: Option<String>,
 ) -> Result<(), CliError> {
-    let context = stage_failure_context(stage, reason);
+    let mut context = stage_failure_context(stage, reason);
+    if recorded_canary_refusal(state).is_some() {
+        context.push_str(&format!(
+            "; a retry or loop-back will not relaunch under {agent} (the delivery canary \
+             recorded for this run refuses it): answer the gate, then run `devflow resume \
+             --phase {phase} --agent <other>`",
+            agent = state.agent,
+            phase = state.phase,
+        ));
+    }
     match run_gate(project_root, state, stage, &context)? {
         GateAction::Advance => {
             // CR-01: close the gate before retrying; its answer is spent.
