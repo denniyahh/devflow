@@ -2780,16 +2780,17 @@ fn fire_idle_timeout(
     if torn {
         warn!(
             "idle timeout after {idle_secs}s: the capture ends in a torn JSON line after its \
-             last parsed event, so a Claude quota denial cannot be ruled out; recording the \
-             timeout with capture_torn_final_line"
+             last parsed event, so if the agent is Claude a quota denial cannot be ruled out \
+             (only Claude's stream is classified for one); recording the timeout with \
+             capture_torn_final_line"
         );
         append_monitor_log(
             project_root,
             phase,
             &format!(
-                "[idle-timeout] after {idle_secs}s the capture ends in a torn final line; a \
-                 Claude quota denial cannot be ruled out, so the record is flagged \
-                 capture_torn_final_line"
+                "[idle-timeout] after {idle_secs}s the capture ends in a torn final line; if \
+                 the agent is Claude a quota denial cannot be ruled out, so the record is \
+                 flagged capture_torn_final_line"
             ),
         );
     }
@@ -4366,6 +4367,12 @@ exit 0
             log.lines()
                 .any(|line| line.starts_with("[idle-timeout]") && line.contains("torn final line")),
             "the monitor log must name the torn final line; log:\n{log}"
+        );
+        assert!(
+            log.lines().any(|line| line.starts_with("[idle-timeout]")
+                && line.contains("if the agent is Claude a quota denial cannot be ruled out")),
+            "the monitor log scopes the denial gap to Claude, the one agent classified for \
+             one; log:\n{log}"
         );
 
         // CONTROL (separate fixture dir): an intact, init-only capture writes
