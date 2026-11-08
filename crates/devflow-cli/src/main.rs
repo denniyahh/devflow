@@ -643,7 +643,7 @@ fn run() -> Result<(), CliError> {
                 until,
                 yes_ship,
                 legacy_claude_launch,
-                fallback_agent,
+                commands::FallbackSource::FlagOrConfig(fallback_agent),
             )
         }
         Command::Advance {

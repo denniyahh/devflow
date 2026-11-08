@@ -9,7 +9,7 @@ use devflow_core::worktree;
 use std::path::{Path, PathBuf};
 
 use crate::CliError;
-use crate::commands::start;
+use crate::commands::{FallbackSource, start};
 use devflow_core::phase_id::PhaseId;
 
 /// Create the phase worktree at `.worktrees/phase-NN/` on `feature/phase-NN`,
@@ -127,8 +127,9 @@ pub(crate) fn parallel(
         // operator who genuinely wants it can still set
         // `DEVFLOW_CLAUDE_LEGACY_LAUNCH`, which `start` reads per phase.
         //
-        // The trailing `None` is the fallback agent (51-04): `parallel` takes no
-        // `--fallback-agent`, so its runs carry none.
+        // The trailing `NoFallback` is the fallback agent (51-04): `parallel` takes
+        // no `--fallback-agent` and does not read `devflow.toml`'s `fallback_agent`
+        // key, so its runs carry none.
         start(
             project_root,
             phase,
@@ -140,7 +141,7 @@ pub(crate) fn parallel(
             None,
             false,
             false,
-            None,
+            FallbackSource::NoFallback,
         )?;
     }
     Ok(())
