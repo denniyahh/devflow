@@ -116,6 +116,8 @@ rules out a live forced rate-limit run.
 
 **Approval:** validated 2026-11-07 by gsd-validate-phase (88/88 mapped tests green: `cargo nextest run --workspace --run-ignored all` over the map's exact names)
 
+**Re-validation 2026-11-08 (after the code-review fix round `9886a95`..`c6e29e0`, at `fe1971a`):** 88/88 mapped tests green again. `cargo nextest run --workspace --no-fail-fast` ran 2111 tests: 2110 passed and 1 failed. The failure is `pending_supervisor_e2e::stop_ends_a_launch_its_running_launcher_promotes_during_the_wait`, a Phase 50.1 test outside this map. It passed 10/10 alone and is filed as backlog 999.191. The two ignored evidence tests passed with `--run-ignored only`. Every mapped name was checked against `cargo nextest list`, and every one is in the run's PASS lines. The fix round's own tests also passed: `fallback_agent_config::parallel_ignores_the_config_key`, `failover_e2e::approving_the_failed_canary_gate_stops_the_run_and_names_the_way_on` and `failover_e2e::rejecting_the_failed_canary_gate_stops_the_run_and_names_the_way_on`. Out of scope here: the README.md:110 over-promise for `devflow parallel` (51-VERIFICATION.md gap). It is a docs-accuracy gap, not a missing test.
+
 ## Validation Audit 2026-11-08
 
 | Metric | Count |
