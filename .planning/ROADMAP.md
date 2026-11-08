@@ -649,7 +649,7 @@ be re-tested here rather than inherited from the issue's original design.
      rebase handoff were all removed (D-11, 23d) and none is reintroduced. Counted over source with
      comments stripped, since a grep over raw source counts comment prose (the Phase 35-01 lesson).
 
-**Plans**: 11/13 plans executed (8 waves)
+**Plans**: 12/13 plans executed (8 waves)
 
 Plans:
 **Wave 1**
@@ -683,7 +683,7 @@ Plans:
 
 **Wave 7** *(blocked on Wave 6 completion)*
 
-- [ ] 51-13-PLAN.md — SUPV-01 by observation, part 2: the post-save probe, the pending-record lock probe and resume's two lock probes withheld with controls; the per-arm conclusion (wave 7)
+- [x] 51-13-PLAN.md — SUPV-01 by observation, part 2: the post-save probe, the pending-record lock probe and resume's two lock probes withheld with controls; the per-arm conclusion (wave 7)
 
 **Wave 8** *(blocked on Wave 7 completion)*
 
@@ -845,7 +845,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 49 | 12/12 | In Progress|  |
 | 50 | 29/29 | Complete | 2026-10-21 |
 | 50.1 | 30/30 | In Progress | — |
-| 51 | 11/13 | In Progress | — |
+| 51 | 12/13 | In Progress | — |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
 
