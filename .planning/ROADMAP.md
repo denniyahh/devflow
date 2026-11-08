@@ -845,7 +845,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 49 | 12/12 | In Progress|  |
 | 50 | 29/29 | Complete | 2026-10-21 |
 | 50.1 | 30/30 | In Progress | — |
-| 51 | 13/13 | In Progress | — |
+| 51 | 13/13 | Complete | 2026-11-08 |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
 
@@ -1073,6 +1073,56 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.210: A Supervise Run Has No Way to End at Validate for a By-Hand Close-Out Except "Abort" (BACKLOG)
+
+**Found:** 2026-11-08, Phase 51 dogfood, Validate gate `18e6310585119d8e` ("Validation passed — approve to ship?").
+Phase 51's conventions keep Ship blocked and close out by hand with `scripts/cut-pr-branch.sh`. Approving the Validate
+gate advances to Ship, whose agent runs `/gsd-ship` (push, PR against `main`) before the Ship gate fires; `yes_ship =
+false` guards only the local merge, bump and tag after it. The only answer that ends the run without Ship is a
+rejection whose note contains "abort" (`gates.rs` `GateAction::Abort`), which runs `pipeline_gate::abort`: it closes
+the gate, clears the state, deregisters and logs `workflow_aborted`. So a run that passed every stage is recorded as
+aborted, and nothing in the event log says it finished.
+
+**Not established:** whether `devflow stop` at the gate records anything different (OPERATIONS.md says it answers a
+waited gate with an abort rejection, so likely the same).
+
+**Fix shape:** a gate answer (or `--until validate`) that ends a passed run as finished, logs `workflow_finished` with
+`shipped: false` and a reason, and leaves Ship to the operator. Small; overlaps the planned replacement of `devflow ship`
+by wsx, so keep it to the event and the answer. Proposed for Phase 52 (session recommendation; operator to confirm).
+
+### Phase 999.209: A Torn Line After a Quota Denial Is Lost When an Escaped Process Holds the Agent's Stdout, So the Stage Fails Over (BACKLOG)
+
+**Found:** 2026-11-08, Phase 51 re-verification (`a3419e5`, advisory, read from source); reproduced the same day.
+A stream stage's agent writes a complete quota denial, then a line it never finishes, then goes quiet. At the idle
+timeout the monitor classifies the capture as a denial, writes no idle-timeout record and kills the agent's process
+group. If a process outside that group (its own session) still holds the agent's stdout, the reader never gets a newline
+or EOF. After `READER_DRAIN_WAIT` (3 s) `join_within` detaches it and `close_shared_capture` closes the capture without
+the partial line. The verdict (`evaluate_layer1`, reading the capture file) sees a clean denial and returns
+`RateLimited`: at Code a failover to the fallback agent, elsewhere a cron resume. Phase 51's rule (option B, `17a47cf`)
+is that a torn line after a denial ends at a gate.
+
+**Evidence:** a snapshot of `21c7c70` with two added monitor tests that run the real monitor and then the real verdict,
+using a stub: init line, denial line, `{"type":"res` with no newline, silence, idle timeout 1 s.
+- With `setsid sleep 12 &` holding stdout: `RateLimited` ("rate limited until …"); the capture ends at the denial line;
+  one `stream_wait_bounded` event (waited 3006 ms, unfinished `["reader"]`, `capture_closed: true`).
+- Negative control, no holder: `Failed` ("stream capture ends in an unparseable line; the final verdict is
+  indeterminate"); the partial line reached the capture at EOF; no `stream_wait_bounded` event.
+Production runs the same order (`drive_stream_io` → `fire_idle_timeout` → `finish_stream_threads`, monitor.rs
+~1764-1807). OPERATIONS.md's residual paragraph ("The outcome is still a gate, with no failover and no cron resume") is
+therefore false for this case.
+
+**Not established:** that a real Claude ever writes a denial followed by a partial line; that an escaped stdout holder
+occurs in a DevFlow `claude -p` stream run (Claude Code's Bash tool shells run in their own session but write to a task
+file, not Claude's stdout; MCP servers and hooks were not inspected); the pipeline's failover itself was not run (inferred
+from the `RateLimited` verdict). One run per case.
+
+**Fix shape:** when `join_within` detaches a reader that holds unterminated bytes, write those bytes to the capture
+before closing it, or record the capture as torn (in the `stream_wait_bounded` event or a side file the verdict reads);
+the verdict treats a bounded close with an unfinished reader after a final denial as torn, not `RateLimited`. Pin both
+cases with the two tests above (holder → not `RateLimited`; no holder → unchanged), planting the current order as a
+failing control. Correct OPERATIONS.md's residual sentence in the same change. Related: 999.207 (the monitor log says
+"classified as rate-limited" before the partial line is read; seen in the control too). Proposed for Phase 52 with 999.207 (session recommendation; operator to confirm).
+
 ### Phase 999.208: A Code Re-Run After an Out-of-Band Fix Cannot Re-Verify a `gaps_found` Report (BACKLOG)
 
 **Found:** 2026-11-08, Phase 51, Code re-run after the third fix round (exception 3 in `51-RUN-NOTES.md`). The
@@ -1108,23 +1158,15 @@ The verdict then returns an indeterminate `Failed` ("stream capture ends in an u
 **Impact:** diagnostics only, while the partial line reaches the capture: the outcome is then still a gate (no
 failover, no cron resume). Documented as a known residual in OPERATIONS.md and the code comments (`ff649ff`).
 
-**Second case (Phase 51 re-verification `a3419e5`, advisory):** the partial line can fail to arrive at all. If a process
-outside the agent's process group still holds the agent's stdout (it escaped the group kill), the reader never sees a
-newline or EOF; after the bounded wait (`join_within` / `close_shared_capture`, monitor.rs) the capture is closed without
-that line. The verdict then sees a clean denial and returns `RateLimited`: a failover at Code, a cron resume elsewhere.
-That is the pre-Phase-51 behaviour on a capture that, as recorded, does prove a denial, but it makes OPERATIONS.md's
-residual sentence "The outcome is still a gate, with no failover and no cron resume" too strong. The EOF re-check below
-does not cover it (EOF never comes).
+**Second case:** a partial line that never reaches the capture (an escaped process holds stdout) ends `RateLimited`,
+not at a gate. Reproduced; filed separately as 999.209.
 
-**Not established:** neither case reproduced at runtime; both orders are read from source.
+**Not established:** never reproduced at runtime; the order is read from source.
 
 **Fix shape:** have `fire_idle_timeout` return its suppression decision; after the reader drains to EOF, classify again
 and, if the answer is now `TornAfterLastEvent`, write the flagged idle-timeout record and log that the suppression was
 withdrawn. Test with a stub that prints the denial, then a partial line with no newline (`printf '%s'`), then sleeps;
-plant the old order as a failing control. For the second case: decide what the
-verdict should be when the reader was detached with its capture closed (the `stream_wait_bounded` event records it), and
-qualify OPERATIONS.md's residual sentence in the same change (left as is in Phase 51 because OPERATIONS.md is in the
-passed verification's fingerprint). Phase 52 (operator, 2026-11-08: option A).
+plant the old order as a failing control. OPERATIONS.md's residual sentence is corrected under 999.209. Phase 52 (operator, 2026-11-08: option A).
 
 ### Phase 999.206: A Failure Gate Keeps Only 300 Characters of the Reason, and `gate show` Cannot Show the Rest (BACKLOG)
 
