@@ -1633,7 +1633,10 @@ const HELD_NO_SOCKET_REPAIR: &str =
 /// else continues it; a phase that never launched and is not stopped names nothing, and
 /// neither does ALIVE. A `start` that died before its run was prepared names `start`, as
 /// `resume` would refuse it ([`run_never_prepared`]). A stored Ship answer names `ship`
-/// instead of the `resume` that would set it aside ([`ship_answer_stored`]).
+/// instead of the `resume` that would set it aside ([`ship_answer_stored`]). A run whose
+/// recorded delivery canary refuses its agent names `resume --agent <other>`, since that
+/// canary refuses a plain `resume` and only a handoff clears it
+/// ([`recorded_canary_refusal`](crate::pipeline_launch::recorded_canary_refusal)).
 fn recovery_hints(state: &State, liveness: &PhaseLiveness) -> Vec<String> {
     let phase = state.phase;
     if run_never_prepared(state)
@@ -1647,6 +1650,8 @@ fn recovery_hints(state: &State, liveness: &PhaseLiveness) -> Vec<String> {
     let stored = ship_answer_stored(state);
     let continue_verb = if stored {
         format!("devflow ship --phase {phase}")
+    } else if crate::pipeline_launch::recorded_canary_refusal(state).is_some() {
+        format!("devflow resume --phase {phase} --agent <other>")
     } else {
         format!("devflow resume --phase {phase}")
     };
@@ -11769,6 +11774,44 @@ mod tests {
             launch: "stream".to_string(),
         };
         assert!(recovery_hints(&state, &alive).is_empty(), "control");
+    }
+
+    /// A stopped run whose recorded delivery canary refuses its agent names `resume
+    /// --agent <other>`, not the plain `resume` that canary would refuse. Control: the same
+    /// run with a recorded `Confirmed` names the plain `resume`.
+    #[test]
+    fn recovery_hints_name_another_agent_when_the_recorded_canary_refuses_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::new(
+            PhaseId::new(7),
+            AgentKind::Antigravity,
+            Mode::Auto,
+            dir.path().to_path_buf(),
+        );
+        state.verification_baseline_captured = true;
+        state.stopped = true;
+        state.stage = Stage::Code;
+
+        state.canary = Some(devflow_core::canary::CanaryOutcome::Confirmed);
+        assert_eq!(
+            recovery_hints(&state, &PhaseLiveness::Gone),
+            vec!["devflow resume --phase 7".to_string()],
+            "control: a recorded Confirmed keeps the plain resume"
+        );
+
+        for refusal in [
+            devflow_core::canary::CanaryOutcome::Absent,
+            devflow_core::canary::CanaryOutcome::Unverified("no binary".to_string()),
+        ] {
+            state.canary = Some(refusal.clone());
+            for liveness in [PhaseLiveness::Gone, PhaseLiveness::NotLaunched] {
+                assert_eq!(
+                    recovery_hints(&state, &liveness),
+                    vec!["devflow resume --phase 7 --agent <other>".to_string()],
+                    "{refusal:?} {liveness:?}"
+                );
+            }
+        }
     }
 
     /// 21a / 999.30 IN-01: the shared one-pass event summary's
