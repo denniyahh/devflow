@@ -1732,14 +1732,28 @@ const CLAUDE_STREAM_RATE_LIMIT_DENIAL_STATUSES: &[&str] = &["rejected"];
 /// Over-classifying means a healthy stream is auto-resumed against a retry time
 /// the parser invented. The asymmetry is the whole reason this function reads
 /// one field instead of matching a shape.
+///
+/// **Provenance (T-30-12, review R2-3).** Both selections run over TOP-LEVEL
+/// events only, through [`is_top_level`]: the turn boundary is picked among
+/// top-level `result` events, and the deciding `rate_limit_event` is the last
+/// top-level one. A subagent's own quota event or `result` (one carrying
+/// `parent_tool_use_id`) decides nothing: it can neither make a denial, mask a
+/// later-reported top-level one, nor move the final-turn boundary. Both callers
+/// (Layer 1's [`parse_claude_event_result`] and the monitor's
+/// [`capture_rate_limit_denial`]) inherit this, so a subagent's denial cannot
+/// classify the stage `RateLimited` and trigger a failover.
 fn detect_claude_stream_rate_limit(events: &[serde_json::Value]) -> Option<String> {
-    // Index of the second-to-last `result` event: everything at or before it is
-    // previous-turn history. `None` (fewer than two results) means the whole
-    // stream is the final turn.
+    let is_top_level_of_type = |v: &serde_json::Value, kind: &str| {
+        v.get("type").and_then(serde_json::Value::as_str) == Some(kind) && is_top_level(v)
+    };
+
+    // Index of the second-to-last top-level `result` event: everything at or
+    // before it is previous-turn history. `None` (fewer than two top-level
+    // results) means the whole stream is the final turn.
     let boundary = events
         .iter()
         .enumerate()
-        .filter(|(_, v)| v.get("type").and_then(serde_json::Value::as_str) == Some("result"))
+        .filter(|(_, v)| is_top_level_of_type(v, "result"))
         .map(|(idx, _)| idx)
         .rev()
         .nth(1);
@@ -1748,11 +1762,12 @@ fn detect_claude_stream_rate_limit(events: &[serde_json::Value]) -> Option<Strin
         None => events,
     };
 
-    // Last eligible event wins, matching the last-`result`-wins convention.
+    // Last eligible top-level event wins, matching the last-`result`-wins
+    // convention.
     let event = eligible
         .iter()
         .rev()
-        .find(|v| v.get("type").and_then(serde_json::Value::as_str) == Some("rate_limit_event"))?;
+        .find(|v| is_top_level_of_type(v, "rate_limit_event"))?;
 
     let info = event.get("rate_limit_info")?;
     let status = info.get("status")?.as_str()?;
@@ -1890,7 +1905,10 @@ fn parse_claude_event_result(stdout: &str) -> Option<AgentResult> {
         return Some(indeterminate_capture_failure());
     }
 
-    if let Some(retry) = detect_claude_stream_rate_limit(&capture.events) {
+    // The torn guard above already returns for every capture the shared rule
+    // reads as torn; going through it anyway keeps one precedence rule for the
+    // verdict and the monitor (D-16).
+    if let (CaptureDenial::Denied, Some(retry)) = classify_capture_denial(&capture) {
         return Some(rate_limited_result(retry));
     }
 
@@ -2288,6 +2306,190 @@ pub struct IdleTimeoutRecord {
     pub commits: Vec<IdleTimeoutCommit>,
 }
 
+/// Why the agent stopped, as the capture's last top-level `result` event
+/// recorded it at the moment the idle timeout fired (D-15, backlog 999.102).
+///
+/// Three Phase 35.1 failures were investigated as "the agent went quiet"
+/// before anyone read these keys, which the capture already held.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct IdleTimeoutCause {
+    /// The event's `terminal_reason` string, for example `aborted_tools`.
+    pub(crate) terminal_reason: Option<String>,
+    /// The event's `errors` array, string entries only.
+    pub(crate) errors: Vec<String>,
+    /// The event's `origin.kind` string, for example `task-notification`.
+    pub(crate) origin_kind: Option<String>,
+}
+
+/// At most this many `errors` entries are kept from the cause (D-15,
+/// T-51-07): a multi-megabyte `errors` array must not bloat `.devflow/` or the
+/// reason.
+const MAX_CAUSE_ERRORS: usize = 3;
+
+/// At most this many characters are kept from each cause field —
+/// `terminal_reason`, `origin_kind` and every `errors` entry (D-15, T-51-06).
+///
+/// These field bounds size the record on disk. What reaches the gate is sized
+/// separately by [`MAX_IDLE_TIMEOUT_CLAUSE_CHARS`]; the full bounded fields stay
+/// in the record.
+const MAX_CAUSE_TEXT_CHARS: usize = 160;
+
+/// At most this many characters sit between the reason clause's parentheses,
+/// counted in characters, not bytes; a longer clause is cut and ends in `…`
+/// inside the cap.
+///
+/// Derivation (cross-plan contract with 51-05, whose torn-final-line segment
+/// is the clause's first segment, inside this same cap):
+/// `render_gate_context(.., 300)` keeps the first 261 characters of a longer
+/// text (300 minus its 39-character truncation suffix). That happens twice: in
+/// `truncate_reason`, to the reason, and in the pending-gate banner, to the
+/// whole gate context, where the longest prefix,
+/// `[never-silent] stage validate failed: `, takes 38, leaving 223 for the
+/// reason. `idle timeout (` (14) + 200 + `): ` (3) = 217 ≤ 223, so the clause
+/// closes inside both renderings for any cause within the field bounds.
+/// Public so the CLI can pin this budget to its display bound in a test.
+pub const MAX_IDLE_TIMEOUT_CLAUSE_CHARS: usize = 200;
+
+/// Make agent-authored cause text bounded and terminal-safe: every control
+/// character becomes a space, and text longer than `max_chars` characters is
+/// cut to fit, ending in `…`.
+fn bound_text(text: &str, max_chars: usize) -> String {
+    let clean: String = text
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    if clean.chars().count() <= max_chars {
+        return clean;
+    }
+    let mut cut: String = clean.chars().take(max_chars.saturating_sub(1)).collect();
+    cut.push('…');
+    cut
+}
+
+/// The idle-timeout record exactly as it sits on disk: the published
+/// [`IdleTimeoutRecord`] plus D-15's optional cause keys.
+///
+/// **Why a crate-private wrapper rather than new fields on
+/// `IdleTimeoutRecord` (operator ruling R-1).** That struct is all-pub and not
+/// `#[non_exhaustive]` in the published crate, so cargo-semver-checks reports
+/// adding any field to it as a major break. It stays byte-identical; the keys
+/// are added here, flattened beside its five. The monitor writes this type and
+/// [`parse_idle_timeout_side_channel`] reads it, so the two directions cannot
+/// drift apart.
+///
+/// Every cause key is optional on read, so a record written before Phase 51
+/// parses unchanged, and skipped when empty on write, so a record with no cause
+/// is byte-for-byte the old shape.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct IdleTimeoutRecordOnDisk {
+    /// The five published keys, flattened to the top level of the JSON object.
+    #[serde(flatten)]
+    pub(crate) record: IdleTimeoutRecord,
+    /// See [`IdleTimeoutCause::terminal_reason`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) terminal_reason: Option<String>,
+    /// See [`IdleTimeoutCause::errors`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) errors: Vec<String>,
+    /// See [`IdleTimeoutCause::origin_kind`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) origin_kind: Option<String>,
+    /// Set by the monitor when, at the idle timeout, the capture ended in a
+    /// torn JSON line after its last parsed event (D-16), so a quota denial
+    /// could not be ruled out. Written only when true.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) capture_torn_final_line: bool,
+}
+
+impl IdleTimeoutRecordOnDisk {
+    /// Join a record and the cause read from the capture.
+    pub(crate) fn new(record: IdleTimeoutRecord, cause: IdleTimeoutCause) -> Self {
+        Self {
+            record,
+            terminal_reason: cause.terminal_reason,
+            errors: cause.errors,
+            origin_kind: cause.origin_kind,
+            capture_torn_final_line: false,
+        }
+    }
+
+    /// The `last result: …` segment of the reason's clause, short fields first
+    /// (`terminal_reason`, then `origin`, then `errors`), or `None` when the
+    /// record carries no cause.
+    fn last_result_segment(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if let Some(terminal_reason) = &self.terminal_reason {
+            parts.push(format!("terminal_reason {terminal_reason}"));
+        }
+        if let Some(origin_kind) = &self.origin_kind {
+            parts.push(format!("origin {origin_kind}"));
+        }
+        if !self.errors.is_empty() {
+            parts.push(format!("errors [{}]", self.errors.join(" | ")));
+        }
+        (!parts.is_empty()).then(|| format!("last result: {}", parts.join("; ")))
+    }
+}
+
+/// Read the idle-timeout cause from the phase's capture: `terminal_reason`,
+/// `errors` and `origin.kind` of the LAST top-level `result` event.
+///
+/// Selection goes through [`last_top_level_result`], the same selector the
+/// verdict uses, so a subagent `result` (one carrying `parent_tool_use_id`)
+/// cannot supply the cause and an earlier turn cannot outrank the final one.
+/// Fields are read with `Value::get` only, typed: a key of the wrong type reads
+/// as absent. Every field is bounded HERE, by [`MAX_CAUSE_ERRORS`] and
+/// [`MAX_CAUSE_TEXT_CHARS`] with control characters replaced, so the record on
+/// disk and every consumer see the bounded text. A missing capture, or one with no top-level `result` event (a
+/// child killed before it reported anything), yields no cause, and the reason
+/// then reads exactly as it did before Phase 51.
+pub(crate) fn idle_timeout_cause(project_root: &Path, phase: PhaseId) -> IdleTimeoutCause {
+    let Some(raw) = read_capture(&stdout_path(project_root, phase)) else {
+        return IdleTimeoutCause::default();
+    };
+    let parsed = ParsedCapture::parse(&raw);
+    let Some(result) = last_top_level_result(&parsed.events) else {
+        return IdleTimeoutCause::default();
+    };
+    let text = |value: Option<&serde_json::Value>| {
+        value
+            .and_then(serde_json::Value::as_str)
+            .map(|field| bound_text(field, MAX_CAUSE_TEXT_CHARS))
+    };
+    IdleTimeoutCause {
+        terminal_reason: text(result.get("terminal_reason")),
+        errors: result
+            .get("errors")
+            .and_then(serde_json::Value::as_array)
+            .map(|errors| {
+                errors
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .take(MAX_CAUSE_ERRORS)
+                    .map(|error| bound_text(error, MAX_CAUSE_TEXT_CHARS))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        origin_kind: text(result.get("origin").and_then(|origin| origin.get("kind"))),
+    }
+}
+
+/// The parenthesised clause that follows the reason's leading `idle timeout`
+/// words, assembled from ordered `segments`, or `None` when there are none.
+///
+/// The ONE place the clause is built. The torn-final-line segment (51-05,
+/// [`TORN_FINAL_LINE_SEGMENT`]) is passed in first, so every segment shares
+/// one cap, [`MAX_IDLE_TIMEOUT_CLAUSE_CHARS`].
+fn idle_timeout_clause(segments: &[String]) -> Option<String> {
+    (!segments.is_empty()).then(|| bound_text(&segments.join("; "), MAX_IDLE_TIMEOUT_CLAUSE_CHARS))
+}
+
 /// Read the monitor's own idle-timeout verdict, if it wrote one.
 ///
 /// **This is consulted as the FIRST statement of [`evaluate_layer1`], before
@@ -2355,17 +2557,92 @@ pub struct IdleTimeoutRecord {
 /// would be free to disagree, and the disagreement would be invisible.
 #[must_use]
 pub fn capture_shows_rate_limit_denial(project_root: &Path, phase: PhaseId) -> bool {
-    let Some(raw) = read_capture(&stdout_path(project_root, phase)) else {
-        return false;
-    };
-    detect_claude_stream_rate_limit(&ParsedCapture::parse(&raw).events).is_some()
+    matches!(
+        capture_rate_limit_denial(project_root, phase),
+        CaptureDenial::Denied
+    )
 }
+
+/// What the phase's capture says about a quota denial, in three answers
+/// (D-16, the classifier half of backlog 999.71).
+///
+/// A boolean folded "the capture ends in a torn line" into "not denied", so a
+/// torn final `rate_limit_event` read as a clean silence. The torn answer keeps
+/// the two apart without promoting a torn line to a denial: only a parsed
+/// top-level `rate_limit_event` whose status is a denial is [`Self::Denied`]
+/// (T-30-12), so agent-authored partial text can never schedule a resume or
+/// trigger a failover. A torn tail outranks a parsed denial
+/// ([`classify_capture_denial`]): the torn line may be a later event that
+/// replaced it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CaptureDenial {
+    /// [`detect_claude_stream_rate_limit`] finds an explicit denial, and no
+    /// torn JSON line follows the last parsed event.
+    Denied,
+    /// No denial, and no torn JSON line after the last parsed event (a missing
+    /// capture also answers this).
+    NotDenied,
+    /// A torn JSON line sits after the last parsed event, whether or not a
+    /// denial was parsed before it: the torn line may be the one that said
+    /// "denied", or a later event that replaced an earlier denial.
+    TornAfterLastEvent,
+}
+
+/// The three-way denial answer for the phase's capture, from ONE parse.
+///
+/// The monitor's idle path calls this to decide between suppressing the
+/// idle-timeout record (`Denied`), writing it flagged (`TornAfterLastEvent`)
+/// and writing it as before (`NotDenied`); [`parse_idle_timeout_side_channel`]
+/// calls it again at read time, because the partial line of a killed child
+/// reaches the capture only at EOF, after the monitor's check. That re-check
+/// runs only when the monitor wrote a record, so it does not cover a monitor
+/// that answered `Denied` (backlog 999.207).
+pub(crate) fn capture_rate_limit_denial(project_root: &Path, phase: PhaseId) -> CaptureDenial {
+    let Some(raw) = read_capture(&stdout_path(project_root, phase)) else {
+        return CaptureDenial::NotDenied;
+    };
+    classify_capture_denial(&ParsedCapture::parse(&raw)).0
+}
+
+/// The one precedence rule for a capture's denial answer, shared by the
+/// monitor ([`capture_rate_limit_denial`]) and the verdict
+/// ([`parse_claude_event_result`]) so the two answer alike for the same
+/// capture bytes (D-16). They can still disagree when the bytes differ: a
+/// killed child's partial line reaches the capture only at EOF, after the
+/// monitor already answered `Denied`, logged rate-limited and wrote no
+/// idle-timeout record, so the verdict sees the torn line and returns an
+/// indeterminate `Failed` (a gate, no failover, no cron; known residual,
+/// backlog 999.207). The rule itself: a torn
+/// JSON line after the last parsed event wins over a parsed denial, because
+/// [`detect_claude_stream_rate_limit`] takes the last rate-limit event and the
+/// torn line may be a later one, or a result, that replaced the denial. Nothing
+/// that survives before the tear stands in for it. The retry text comes back
+/// only with [`CaptureDenial::Denied`].
+fn classify_capture_denial(capture: &ParsedCapture) -> (CaptureDenial, Option<String>) {
+    if capture.torn_json_after_last_matching(|_| true) {
+        return (CaptureDenial::TornAfterLastEvent, None);
+    }
+    match detect_claude_stream_rate_limit(&capture.events) {
+        Some(retry) => (CaptureDenial::Denied, Some(retry)),
+        None => (CaptureDenial::NotDenied, None),
+    }
+}
+
+/// The torn-final-line segment of the idle-timeout reason's clause (D-16). It
+/// is fixed text shorter than [`MAX_IDLE_TIMEOUT_CLAUSE_CHARS`] and always
+/// the clause's FIRST segment, so the clause cap can never cut it.
+///
+/// Agent-neutral on purpose: a torn line is flagged for any agent's capture,
+/// but only Claude's `rate_limit_event` is a denial the classifier can read, so
+/// "a quota denial cannot be ruled out" would claim a gap that an Antigravity
+/// capture has whether or not its last line is torn.
+const TORN_FINAL_LINE_SEGMENT: &str = "torn final line after the last parsed event";
 
 fn parse_idle_timeout_side_channel(project_root: &Path, phase: PhaseId) -> Option<AgentResult> {
     let path = idle_timeout_path(project_root, phase);
     let raw = read_capture(&path)?;
 
-    let Ok(record) = serde_json::from_str::<IdleTimeoutRecord>(&raw) else {
+    let Ok(on_disk) = serde_json::from_str::<IdleTimeoutRecordOnDisk>(&raw) else {
         return Some(idle_timeout_result(
             format!(
                 "idle timeout: DevFlow's monitor recorded a timeout verdict at {} but the \
@@ -2377,6 +2654,7 @@ fn parse_idle_timeout_side_channel(project_root: &Path, phase: PhaseId) -> Optio
             None,
         ));
     };
+    let record = &on_disk.record;
 
     let named: Vec<String> = record
         .commits
@@ -2398,9 +2676,26 @@ fn parse_idle_timeout_side_channel(project_root: &Path, phase: PhaseId) -> Optio
         )
     };
 
+    // D-15: the cause clause sits directly after the leading words, so it is
+    // inside the gate context even when a long commit phrase is truncated away.
+    // D-16: a torn final line, flagged by the monitor or found now (a killed
+    // child's partial line is teed at EOF, after the monitor checked), leads
+    // the clause. It changes the wording only; the verdict stays IdleTimeout.
+    let torn = on_disk.capture_torn_final_line
+        || capture_rate_limit_denial(project_root, phase) == CaptureDenial::TornAfterLastEvent;
+    let segments: Vec<String> = torn
+        .then(|| TORN_FINAL_LINE_SEGMENT.to_string())
+        .into_iter()
+        .chain(on_disk.last_result_segment())
+        .collect();
+    let lead = match idle_timeout_clause(&segments) {
+        Some(clause) => format!("idle timeout ({clause}):"),
+        None => "idle timeout:".to_string(),
+    };
+
     Some(idle_timeout_result(
         format!(
-            "idle timeout: the agent's output stream was silent for {}s, so DevFlow \
+            "{lead} the agent's output stream was silent for {}s, so DevFlow \
              terminated it (agent pid {}). {commit_phrase} Review the branch before deciding \
              what to keep — this run is TERMINAL and is not retried automatically.",
             record.idle_secs, record.agent_pid
@@ -7009,6 +7304,636 @@ mod tests {
         assert!(result.reason.unwrap().contains("unreadable"));
     }
 
+    // ---- idle-timeout cause (D-15, backlog 999.102) -----------------------
+
+    /// The measured 999.102 cause: what a real Claude CLI `result` event held
+    /// when three Phase 35.1 runs were misread as "the agent went quiet".
+    const CAUSE_TERMINAL_REASON: &str = "aborted_tools";
+    const CAUSE_ERROR: &str =
+        "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use";
+    const CAUSE_ORIGIN_KIND: &str = "task-notification";
+
+    /// Write an idle-timeout record carrying `extra` keys beside the five
+    /// `IdleTimeoutRecord` keys, built as plain JSON so the on-disk shape is
+    /// fixed by the test rather than by whichever Rust type writes it.
+    fn write_idle_timeout_record_with(
+        root: &Path,
+        phase: PhaseId,
+        commits: &[(&str, &str)],
+        extra: serde_json::Value,
+    ) {
+        write_idle_timeout_record(root, phase, commits);
+        let path = idle_timeout_path(root, phase);
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let object = value.as_object_mut().expect("the record is a JSON object");
+        for (key, field) in extra.as_object().expect("extra keys are a JSON object") {
+            object.insert(key.clone(), field.clone());
+        }
+        std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+    }
+
+    /// The three measured cause keys, as they appear in a record on disk.
+    fn measured_cause_keys() -> serde_json::Value {
+        serde_json::json!({
+            "terminal_reason": CAUSE_TERMINAL_REASON,
+            "errors": [CAUSE_ERROR],
+            "origin_kind": CAUSE_ORIGIN_KIND,
+        })
+    }
+
+    /// One JSONL `result` line with the given `terminal_reason`, made a
+    /// subagent result when `parent` names a tool use.
+    fn result_line(terminal_reason: &str, parent: Option<&str>) -> String {
+        let mut event = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "terminal_reason": terminal_reason,
+            "errors": [format!("error from {terminal_reason}")],
+            "origin": {"kind": format!("origin-{terminal_reason}")},
+            "result": "no marker",
+        });
+        if let Some(parent) = parent {
+            event["parent_tool_use_id"] = serde_json::Value::String(parent.to_string());
+        }
+        serde_json::to_string(&event).unwrap()
+    }
+
+    fn write_capture_lines(root: &Path, phase: PhaseId, lines: &[String]) {
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        let mut capture = lines.join("\n");
+        capture.push('\n');
+        std::fs::write(stdout_path(root, phase), capture).unwrap();
+    }
+
+    /// The cause comes from the session's FINAL top-level verdict: a later
+    /// top-level `result` displaces an earlier one, and a subagent `result`
+    /// (one carrying `parent_tool_use_id`) never displaces a top-level one.
+    #[test]
+    fn the_idle_timeout_cause_comes_from_the_last_top_level_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // (a) earlier and later top-level results: the later one wins.
+        let earlier_later = PhaseId::new(60);
+        write_capture_lines(
+            root,
+            earlier_later,
+            &[result_line("early", None), result_line("late", None)],
+        );
+        let cause = idle_timeout_cause(root, earlier_later);
+        assert_eq!(cause.terminal_reason.as_deref(), Some("late"));
+        assert_eq!(cause.errors, vec!["error from late".to_string()]);
+        assert_eq!(cause.origin_kind.as_deref(), Some("origin-late"));
+
+        // (b) a later subagent result does not displace the top-level one.
+        let parent_child = PhaseId::new(61);
+        write_capture_lines(
+            root,
+            parent_child,
+            &[
+                result_line("parent", None),
+                result_line("child", Some("toolu_child")),
+            ],
+        );
+        assert_eq!(
+            idle_timeout_cause(root, parent_child)
+                .terminal_reason
+                .as_deref(),
+            Some("parent"),
+            "a subagent result supplied the cause"
+        );
+
+        // (c) control: a capture whose only result is a subagent's has no
+        // top-level result, so no cause at all.
+        let child_only = PhaseId::new(62);
+        write_capture_lines(
+            root,
+            child_only,
+            &[result_line("child", Some("toolu_child"))],
+        );
+        assert_eq!(
+            idle_timeout_cause(root, child_only),
+            IdleTimeoutCause::default()
+        );
+    }
+
+    /// A record carrying the cause names it in the reason, directly after the
+    /// leading `idle timeout` words and short fields first, so the cause is
+    /// inside the 300-character gate context.
+    #[test]
+    fn an_idle_timeout_reason_names_the_last_result_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        let phase = PhaseId::new(63);
+        write_idle_timeout_record_with(
+            dir.path(),
+            phase,
+            &[("1111111abcdef0000000000000000000000000000", "feat: first")],
+            measured_cause_keys(),
+        );
+
+        let result = evaluate_layer1(dir.path(), phase).unwrap();
+        assert_eq!(result.status, AgentStatus::IdleTimeout);
+        let reason = result.reason.expect("an idle timeout must explain itself");
+        assert!(
+            reason.starts_with("idle timeout ("),
+            "the cause clause must follow the leading words; got: {reason}"
+        );
+        let head: String = reason.chars().take(300).collect();
+        let position = |needle: &str| {
+            head.find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} missing from the first 300 chars: {head}"))
+        };
+        let terminal = position(CAUSE_TERMINAL_REASON);
+        let origin = position(CAUSE_ORIGIN_KIND);
+        let errors = position("[ede_diagnostic]");
+        assert!(
+            terminal < origin && origin < errors,
+            "short fields must come first (terminal_reason, origin, errors); got: {reason}"
+        );
+    }
+
+    /// Without cause keys (an older CLI, or a child killed before any `result`
+    /// event) the reason is exactly the pre-Phase-51 text.
+    #[test]
+    fn an_idle_timeout_without_cause_fields_keeps_todays_message() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        let phase = PhaseId::new(64);
+        write_idle_timeout_record(
+            dir.path(),
+            phase,
+            &[("1111111abcdef0000000000000000000000000000", "feat: first")],
+        );
+
+        let reason = evaluate_layer1(dir.path(), phase)
+            .unwrap()
+            .reason
+            .expect("an idle timeout must explain itself");
+        assert_eq!(
+            reason,
+            "idle timeout: the agent's output stream was silent for 30s, so DevFlow \
+             terminated it (agent pid 4242). The agent made 1 commit(s) before going quiet \
+             and NONE of them were rolled back: 1111111 feat: first. Review the branch \
+             before deciding what to keep — this run is TERMINAL and is not retried \
+             automatically."
+        );
+    }
+
+    /// A record written before Phase 51 has none of the cause keys. It must
+    /// parse into the ordinary reason, not fall into the unreadable branch.
+    #[test]
+    fn a_pre_51_idle_timeout_record_still_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        let pre_51 = PhaseId::new(65);
+        write_idle_timeout_record(dir.path(), pre_51, &[]);
+        let reason = evaluate_layer1(dir.path(), pre_51).unwrap().reason.unwrap();
+        assert!(
+            !reason.contains("record itself is unreadable"),
+            "a pre-51 record read as unreadable: {reason}"
+        );
+        assert!(reason.contains("silent for"), "got: {reason}");
+
+        // CONTROL: a record that really is malformed still says so, so the
+        // assertion above is not passing on a parser that accepts anything.
+        let malformed = PhaseId::new(66);
+        write_idle_timeout_record_with(
+            dir.path(),
+            malformed,
+            &[],
+            serde_json::json!({"idle_secs": "thirty"}),
+        );
+        let reason = evaluate_layer1(dir.path(), malformed)
+            .unwrap()
+            .reason
+            .unwrap();
+        assert!(
+            reason.contains("record itself is unreadable"),
+            "a non-numeric idle_secs must read as unreadable; got: {reason}"
+        );
+    }
+
+    fn json_keys(value: &serde_json::Value) -> std::collections::BTreeSet<String> {
+        value
+            .as_object()
+            .expect("a record serializes to a JSON object")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    fn sample_record() -> IdleTimeoutRecord {
+        IdleTimeoutRecord {
+            status: AgentStatus::IdleTimeout.as_wire_str().to_string(),
+            idle_secs: 30,
+            agent_pid: 4242,
+            written_at: 1_700_000_000,
+            commits: Vec::new(),
+        }
+    }
+
+    /// The flattened on-disk key set, pinned as literals.
+    ///
+    /// `#[serde(flatten)]` merges `IdleTimeoutRecord`'s keys with the cause
+    /// keys into one object. A future `IdleTimeoutRecord` field whose name
+    /// collides with a cause key would make every record unparseable, and a
+    /// new field anywhere would change the on-disk contract silently; both
+    /// fail here instead, naming the key. `capture_torn_final_line` (51-05) is
+    /// written only when set, so a record with an intact capture keeps the
+    /// shape without it.
+    #[test]
+    fn the_on_disk_idle_timeout_record_key_set_is_pinned() {
+        let cause_keys: std::collections::BTreeSet<String> = [
+            "terminal_reason",
+            "errors",
+            "origin_kind",
+            "capture_torn_final_line",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let record_keys: std::collections::BTreeSet<String> =
+            ["status", "idle_secs", "agent_pid", "written_at", "commits"]
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+
+        let mut full = IdleTimeoutRecordOnDisk::new(
+            sample_record(),
+            IdleTimeoutCause {
+                terminal_reason: Some(CAUSE_TERMINAL_REASON.to_string()),
+                errors: vec![CAUSE_ERROR.to_string()],
+                origin_kind: Some(CAUSE_ORIGIN_KIND.to_string()),
+            },
+        );
+        full.capture_torn_final_line = true;
+        let expected: std::collections::BTreeSet<String> =
+            record_keys.union(&cause_keys).cloned().collect();
+        assert_eq!(
+            json_keys(&serde_json::to_value(&full).unwrap()),
+            expected,
+            "the on-disk idle-timeout key set changed"
+        );
+
+        let published = json_keys(&serde_json::to_value(sample_record()).unwrap());
+        assert_eq!(
+            published, record_keys,
+            "IdleTimeoutRecord's own keys changed"
+        );
+        let collisions: Vec<&String> = published.intersection(&cause_keys).collect();
+        assert!(
+            collisions.is_empty(),
+            "IdleTimeoutRecord key(s) {collisions:?} collide with a flattened cause key"
+        );
+
+        // CONTROL: with no cause and no torn flag the record is exactly the
+        // five published keys (skip-when-empty, skip-when-false), so such a
+        // record is the old shape.
+        let bare = IdleTimeoutRecordOnDisk::new(sample_record(), IdleTimeoutCause::default());
+        assert!(!bare.capture_torn_final_line);
+        assert_eq!(
+            json_keys(&serde_json::to_value(&bare).unwrap()),
+            record_keys,
+            "a record without the torn flag must not write `capture_torn_final_line`"
+        );
+    }
+
+    /// A torn rate-limit line, as a killed child leaves it: the line opens
+    /// like an event and stops mid-key.
+    const TORN_RATE_LIMIT_LINE: &str = r#"{"type":"rate_limit_ev"#;
+
+    /// The torn segment's fixed text, pinned here as a literal so a change to
+    /// the production wording fails a test.
+    const TORN_SEGMENT_TEXT: &str = "torn final line after the last parsed event";
+
+    /// A torn line cut inside a `result` event's type, as a killed child
+    /// leaves it.
+    const TORN_RESULT_LINE: &str = r#"{"type":"res"#;
+
+    /// D-16: a quota denial followed by a torn final line is torn, not a
+    /// denial, for the monitor's answer and for the verdict alike: the torn
+    /// line may be a later event that replaced the denial. The verdict is
+    /// therefore never `RateLimited`, so no failover and no cron resume follow.
+    #[test]
+    fn a_denial_followed_by_a_torn_line_is_torn_for_the_monitor_and_the_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        let phase = PhaseId::new(74);
+        let lines = [
+            V3_INIT_EVENT.to_string(),
+            v3_rate_limit_event("rejected"),
+            TORN_RESULT_LINE.to_string(),
+        ];
+        write_capture_lines(root, phase, &lines);
+
+        assert_eq!(
+            capture_rate_limit_denial(root, phase),
+            CaptureDenial::TornAfterLastEvent,
+            "the monitor read a denial with a torn line after it as a proven denial"
+        );
+        let verdict = parse_claude_event_result(&lines.join("\n"))
+            .expect("a Claude stream capture yields a verdict");
+        assert_ne!(
+            verdict.status,
+            AgentStatus::RateLimited,
+            "the verdict read a denial with a torn line after it as a rate limit"
+        );
+        let layer1 = evaluate_layer1(root, phase).expect("the capture yields a verdict");
+        assert_ne!(layer1.status, AgentStatus::RateLimited, "{layer1:?}");
+    }
+
+    /// The control for the test above: the same denial with no torn tail is a
+    /// denial for the monitor and `RateLimited` for the verdict.
+    #[test]
+    fn a_denial_with_no_torn_tail_is_rate_limited_for_the_monitor_and_the_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        let phase = PhaseId::new(75);
+        let lines = [V3_INIT_EVENT.to_string(), v3_rate_limit_event("rejected")];
+        write_capture_lines(root, phase, &lines);
+
+        assert_eq!(
+            capture_rate_limit_denial(root, phase),
+            CaptureDenial::Denied
+        );
+        let verdict = parse_claude_event_result(&lines.join("\n"))
+            .expect("a Claude stream capture yields a verdict");
+        assert_eq!(verdict.status, AgentStatus::RateLimited, "{verdict:?}");
+        let layer1 = evaluate_layer1(root, phase).expect("the capture yields a verdict");
+        assert_eq!(layer1.status, AgentStatus::RateLimited, "{layer1:?}");
+    }
+
+    /// D-16 (backlog 999.71, classifier half): a capture whose last line is a
+    /// torn JSON line is not a clean, non-rate-limited ending. The torn line
+    /// may be the denial itself, so the three-way answer says "torn", and the
+    /// idle-timeout reason says the denial cannot be ruled out. A torn line is
+    /// never proof of a denial, so the verdict stays `IdleTimeout` (T-30-12).
+    #[test]
+    fn a_torn_final_line_is_not_read_as_a_clean_silence() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+
+        // (a) The three-way answer names the torn tail.
+        let torn = PhaseId::new(71);
+        write_capture_lines(
+            root,
+            torn,
+            &[V3_INIT_EVENT.to_string(), TORN_RATE_LIMIT_LINE.to_string()],
+        );
+        assert_eq!(
+            capture_rate_limit_denial(root, torn),
+            CaptureDenial::TornAfterLastEvent,
+            "a capture ending in a torn rate-limit line read as a clean ending"
+        );
+
+        // (b) With a pre-51 record (no flag), the advance's read still sees
+        // the torn tail and says so first; it never classifies a rate limit.
+        write_idle_timeout_record(root, torn, &[]);
+        let verdict = evaluate_layer1(root, torn).expect("the record is a verdict");
+        assert_eq!(
+            verdict.status,
+            AgentStatus::IdleTimeout,
+            "a torn line is not proof of a denial"
+        );
+        let reason = verdict.reason.expect("an idle timeout explains itself");
+        assert!(
+            reason.starts_with(&format!("idle timeout ({TORN_SEGMENT_TEXT}")),
+            "the torn segment must open the clause; got: {reason}"
+        );
+        assert_eq!(
+            reason.matches("torn final line").count(),
+            1,
+            "the torn text belongs in one place; got: {reason}"
+        );
+
+        // (c) CONTROL: an intact `rejected` denial is still a denial.
+        let denied = PhaseId::new(72);
+        write_capture_lines(
+            root,
+            denied,
+            &[V3_INIT_EVENT.to_string(), v3_rate_limit_event("rejected")],
+        );
+        assert_eq!(
+            capture_rate_limit_denial(root, denied),
+            CaptureDenial::Denied
+        );
+
+        // (d) CONTROL: an intact, non-denied capture keeps today's reason.
+        let intact = PhaseId::new(73);
+        write_capture_lines(root, intact, &[V3_INIT_EVENT.to_string()]);
+        assert_eq!(
+            capture_rate_limit_denial(root, intact),
+            CaptureDenial::NotDenied
+        );
+        write_idle_timeout_record(
+            root,
+            intact,
+            &[("1111111abcdef0000000000000000000000000000", "feat: first")],
+        );
+        assert_eq!(
+            evaluate_layer1(root, intact).unwrap().reason.unwrap(),
+            "idle timeout: the agent's output stream was silent for 30s, so DevFlow \
+             terminated it (agent pid 4242). The agent made 1 commit(s) before going quiet \
+             and NONE of them were rolled back: 1111111 feat: first. Review the branch \
+             before deciding what to keep — this run is TERMINAL and is not retried \
+             automatically."
+        );
+
+        // (e) The monitor's flag alone also adds the segment: a record written
+        // with `capture_torn_final_line` over a capture that reads intact now.
+        let flagged = PhaseId::new(78);
+        write_capture_lines(root, flagged, &[V3_INIT_EVENT.to_string()]);
+        write_idle_timeout_record_with(
+            root,
+            flagged,
+            &[],
+            serde_json::json!({"capture_torn_final_line": true}),
+        );
+        let reason = evaluate_layer1(root, flagged).unwrap().reason.unwrap();
+        assert!(
+            reason.starts_with(&format!("idle timeout ({TORN_SEGMENT_TEXT}): ")),
+            "the record's torn flag must add the segment; got: {reason}"
+        );
+    }
+
+    /// Cross-plan contract with 51-03: the torn segment leads the capped
+    /// clause, so at the largest cause the field bounds admit the clause still
+    /// starts with it, stays inside `MAX_IDLE_TIMEOUT_CLAUSE_CHARS`, and closes
+    /// within `idle timeout (` (14) + the cap + `): ` (3) characters.
+    #[test]
+    fn a_torn_clause_leads_the_capped_clause_at_the_cause_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        let max_cause = serde_json::json!({
+            "terminal_reason": "t".repeat(MAX_CAUSE_TEXT_CHARS),
+            "origin_kind": "o".repeat(MAX_CAUSE_TEXT_CHARS),
+            "errors": vec!["e".repeat(MAX_CAUSE_TEXT_CHARS); MAX_CAUSE_ERRORS],
+        });
+        const OPEN: &str = "idle timeout (";
+        let bound = OPEN.len() + MAX_IDLE_TIMEOUT_CLAUSE_CHARS + "): ".len();
+        let clause_within_bound = |reason: &str| -> String {
+            assert!(reason.starts_with(OPEN), "no clause in: {reason}");
+            let head: String = reason.chars().take(bound).collect();
+            let close = head.find("): ").unwrap_or_else(|| {
+                panic!("the clause does not close within {bound} characters: {reason}")
+            });
+            head[OPEN.len()..close].to_string()
+        };
+
+        let torn = PhaseId::new(74);
+        write_capture_lines(
+            root,
+            torn,
+            &[V3_INIT_EVENT.to_string(), TORN_RATE_LIMIT_LINE.to_string()],
+        );
+        write_idle_timeout_record_with(root, torn, &[], max_cause.clone());
+        let reason = evaluate_layer1(root, torn).unwrap().reason.unwrap();
+        let clause = clause_within_bound(&reason);
+        assert!(
+            clause.starts_with(TORN_SEGMENT_TEXT),
+            "the torn segment must lead the clause; got: {clause}"
+        );
+        assert!(
+            clause.chars().count() <= MAX_IDLE_TIMEOUT_CLAUSE_CHARS,
+            "the clause is {} characters: {clause}",
+            clause.chars().count()
+        );
+
+        // CONTROL: the same record over an intact capture renders the clause
+        // without the torn segment.
+        let intact = PhaseId::new(75);
+        write_capture_lines(root, intact, &[V3_INIT_EVENT.to_string()]);
+        write_idle_timeout_record_with(root, intact, &[], max_cause);
+        let reason = evaluate_layer1(root, intact).unwrap().reason.unwrap();
+        let clause = clause_within_bound(&reason);
+        assert!(
+            clause.starts_with("last result: terminal_reason t"),
+            "got: {clause}"
+        );
+        assert!(!reason.contains("torn final line"), "got: {reason}");
+    }
+
+    /// Agent-authored cause text is bounded and terminal-safe where it is
+    /// read, before it reaches the record, the reason, the gate context or the
+    /// notify hook's environment.
+    #[test]
+    fn idle_timeout_cause_text_is_bounded_and_control_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let hostile = format!("\u{1b}[31m{}\n", "x".repeat(10_000));
+        let event = serde_json::json!({
+            "type": "result",
+            "terminal_reason": hostile,
+            "errors": vec![hostile.clone(); 10],
+            "origin": {"kind": hostile},
+            "result": "no marker",
+        });
+        let phase = PhaseId::new(67);
+        write_capture_lines(root, phase, &[serde_json::to_string(&event).unwrap()]);
+
+        let cause = idle_timeout_cause(root, phase);
+        assert!(
+            cause.errors.len() <= 3,
+            "{} errors kept",
+            cause.errors.len()
+        );
+        assert!(
+            !cause.errors.is_empty(),
+            "the bound must not drop every error"
+        );
+        let fields = cause
+            .errors
+            .iter()
+            .chain(cause.terminal_reason.iter())
+            .chain(cause.origin_kind.iter());
+        for field in fields {
+            assert!(
+                field.chars().count() <= 160,
+                "a cause field kept {} characters",
+                field.chars().count()
+            );
+            assert!(
+                !field.chars().any(char::is_control),
+                "a cause field kept a control character: {field:?}"
+            );
+        }
+
+        // CONTROL: a short clean error passes through unchanged.
+        let clean = PhaseId::new(68);
+        write_capture_lines(
+            root,
+            clean,
+            &[serde_json::to_string(&serde_json::json!({
+                "type": "result",
+                "errors": [CAUSE_ERROR],
+            }))
+            .unwrap()],
+        );
+        assert_eq!(
+            idle_timeout_cause(root, clean).errors,
+            vec![CAUSE_ERROR.to_string()]
+        );
+    }
+
+    /// The whole clause is capped, so the largest cause the field bounds admit
+    /// still closes inside the 300-character gate context (contract with
+    /// 51-05, whose torn segment shares this cap).
+    #[test]
+    fn the_idle_timeout_clause_is_capped_at_the_cause_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        let clause_of = |reason: &str| -> String {
+            let rest = reason
+                .strip_prefix("idle timeout (")
+                .unwrap_or_else(|| panic!("no cause clause in: {reason}"));
+            let close = rest
+                .find(')')
+                .unwrap_or_else(|| panic!("the clause never closes in: {reason}"));
+            rest[..close].to_string()
+        };
+
+        let max_bound = PhaseId::new(69);
+        write_idle_timeout_record_with(
+            dir.path(),
+            max_bound,
+            &[],
+            serde_json::json!({
+                "terminal_reason": "t".repeat(MAX_CAUSE_TEXT_CHARS),
+                "origin_kind": "o".repeat(MAX_CAUSE_TEXT_CHARS),
+                "errors": vec!["e".repeat(MAX_CAUSE_TEXT_CHARS); MAX_CAUSE_ERRORS],
+            }),
+        );
+        let reason = evaluate_layer1(dir.path(), max_bound)
+            .unwrap()
+            .reason
+            .unwrap();
+        let clause = clause_of(&reason);
+        assert!(
+            clause.chars().count() <= MAX_IDLE_TIMEOUT_CLAUSE_CHARS,
+            "the clause is {} characters: {clause}",
+            clause.chars().count()
+        );
+        assert!(clause.contains("terminal_reason t"), "got: {clause}");
+
+        // CONTROL: the measured 999.102 cause is short and renders whole.
+        let measured = PhaseId::new(70);
+        write_idle_timeout_record_with(dir.path(), measured, &[], measured_cause_keys());
+        let reason = evaluate_layer1(dir.path(), measured)
+            .unwrap()
+            .reason
+            .unwrap();
+        let clause = clause_of(&reason);
+        assert!(!clause.contains('…'), "a short cause was cut: {clause}");
+        assert!(clause.contains(CAUSE_ERROR), "got: {clause}");
+    }
+
     /// Last-result-wins. A session kept alive across turns emits one `result`
     /// event per turn; only the final one is the session's verdict.
     ///
@@ -7977,6 +8902,105 @@ mod tests {
         assert!(
             !capture_shows_rate_limit_denial(root, absent),
             "a missing capture must read as no denial, never as one"
+        );
+    }
+
+    /// T-30-12 provenance (review R2-3): only TOP-LEVEL events decide a quota
+    /// denial. A subagent's `rate_limit_event` (one carrying
+    /// `parent_tool_use_id`) neither makes a denial nor masks one, and a
+    /// subagent's `result` does not move the final-turn boundary. An event
+    /// with the key absent or `null` is top-level, as [`is_top_level`] decides.
+    ///
+    /// Every case is checked and the wrong ones are reported together, so a
+    /// failure names each case that went wrong, not only the first.
+    #[test]
+    fn only_top_level_rate_limit_events_and_results_decide_a_denial() {
+        let with_parent = |line: &str, parent: serde_json::Value| -> String {
+            let mut event: serde_json::Value = serde_json::from_str(line).unwrap();
+            event["parent_tool_use_id"] = parent;
+            serde_json::to_string(&event).unwrap()
+        };
+        let subagent = |line: &str| with_parent(line, serde_json::json!("toolu_1"));
+        let init = V3_INIT_EVENT.to_string();
+        let rejected = v3_rate_limit_event("rejected");
+        let allowed = V3_RATE_LIMIT_EVENT_ALLOWED.to_string();
+        let turn_result =
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"no marker"}"#
+                .to_string();
+
+        let e1 = vec![init.clone(), subagent(&rejected)];
+        let e2 = vec![
+            init.clone(),
+            with_parent(&rejected, serde_json::Value::Null),
+            subagent(&allowed),
+        ];
+        let cases: Vec<(&str, Vec<String>, bool)> = vec![
+            ("(e1) a subagent `rejected` event alone", e1.clone(), false),
+            (
+                "(e2) a top-level `rejected` event, then a later subagent `allowed` one",
+                e2.clone(),
+                true,
+            ),
+            (
+                "(e3) a subagent `rejected` event, then a later top-level `allowed` one",
+                vec![init.clone(), subagent(&rejected), allowed.clone()],
+                false,
+            ),
+            (
+                "(b1) result, top-level `rejected`, subagent result, result",
+                vec![
+                    init.clone(),
+                    turn_result.clone(),
+                    rejected.clone(),
+                    subagent(&turn_result),
+                    turn_result.clone(),
+                ],
+                true,
+            ),
+            (
+                "(b2) control: top-level `rejected`, then two top-level results",
+                vec![
+                    init.clone(),
+                    rejected.clone(),
+                    turn_result.clone(),
+                    turn_result.clone(),
+                ],
+                false,
+            ),
+        ];
+        let mut wrong: Vec<String> = cases
+            .iter()
+            .filter_map(|(name, lines, expected)| {
+                let denied = detect_claude_stream_rate_limit(
+                    &ParsedCapture::parse(&lines.join("\n")).events,
+                )
+                .is_some();
+                (denied != *expected).then(|| format!("{name}: expected denied={expected}"))
+            })
+            .collect();
+
+        // Layer 1 shares the detector, so it agrees: a subagent's denial does
+        // not classify the stage `RateLimited` (and would not trigger 51-01's
+        // failover); a top-level one still does (the control that proves
+        // this Layer 1 check can see a denial at all).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for (phase, lines, expect_rate_limited) in [(76, &e1, false), (77, &e2, true)] {
+            let phase = PhaseId::new(phase);
+            write_capture_lines(root, phase, lines);
+            let rate_limited = evaluate_layer1(root, phase)
+                .is_some_and(|result| result.status == AgentStatus::RateLimited);
+            if rate_limited != expect_rate_limited {
+                wrong.push(format!(
+                    "Layer 1 on phase {phase}: expected RateLimited={expect_rate_limited}"
+                ));
+            }
+        }
+
+        assert!(
+            wrong.is_empty(),
+            "provenance was not enforced in these cases:\n{}",
+            wrong.join("\n")
         );
     }
 

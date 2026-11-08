@@ -444,10 +444,67 @@ pub struct State {
     /// `DEVFLOW_GATE_NOTIFY_CMD` to it (unset keeps, empty clears, set
     /// replaces; [`crate::gates::persisted_notify_cmd_after_env`]); never
     /// [`State::new`], so constructing a state never reads the environment.
-    /// The detached monitor chain does not carry the variable and reads this
-    /// field at each gate.
+    /// The unset arms of `resume` and `advance` are pinned by
+    /// `resume_with_the_variable_unset_keeps_the_saved_command` and
+    /// `advance_gate_runs_the_persisted_command_when_the_variable_is_unset`.
+    /// The detached monitor chain does not carry the variable. A gate takes
+    /// this field from the state file as it stands at gate entry, so an
+    /// on-disk edit made before the gate opens is the command it fires, and
+    /// an edit made while it waits survives its resolution. The stale-build
+    /// block's notify (`staleness.rs`) opens no gate and fires from the copy
+    /// its caller holds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_notify_cmd: Option<String>,
+    /// The agent a rate-limited Code stage hands off to (SUPV-02, D-01).
+    ///
+    /// `None` means EITHER "no fallback was configured" OR "the state was
+    /// written by a binary predating this field" — both behave identically: a
+    /// rate limit takes the cron-resume arm, which is the pre-existing
+    /// behaviour.
+    ///
+    /// Persisted rather than passed through the call stack for the reason
+    /// [`Self::yes_ship`] gives: each stage launch happens in a SEPARATE
+    /// `devflow` process (the detached monitor's own `advance` tail), and the
+    /// rate limit is observed by that process, long after the command that
+    /// configured the fallback has exited.
+    ///
+    /// Where it comes from: `devflow start --fallback-agent` and
+    /// `devflow resume --fallback-agent` (plan 51-04), or `devflow.toml`'s
+    /// `fallback_agent` key, which only `devflow start` reads (plan 51-14) and
+    /// which the flag overrides when both are given. It is never read from an
+    /// environment variable.
+    ///
+    /// It applies only to a rate limit at [`Stage::Code`] (operator ruling
+    /// R-2): a rate limit at any other stage takes the cron arm and leaves the
+    /// fallback unused. One handoff sets [`Self::fallback_consumed`], after
+    /// which a later rate limit takes the cron arm too (D-05).
+    #[serde(default)]
+    pub fallback_agent: Option<AgentKind>,
+    /// Whether this run has already handed off to [`Self::fallback_agent`]
+    /// (D-05). Set in the same state write that makes the fallback the run's
+    /// agent, so a second rate limit can never hand off again; it takes the
+    /// cron arm instead. A refused handoff does not set it.
+    ///
+    /// `false` means EITHER "the fallback has not been used" OR "the state was
+    /// written by a binary predating this field" — both behave identically.
+    #[serde(default)]
+    pub fallback_consumed: bool,
+    /// The fix type of the Code pass in flight (Phase 51 D-09).
+    ///
+    /// Set by a loop-back to Code in the same write that enters Code, and
+    /// cleared by every transition, so it lives exactly as long as its Code
+    /// pass. A same-stage relaunch with no prompt override (a rate-limit
+    /// failover, a `devflow resume`, an `Ambiguous` re-drive) replays it,
+    /// rendered by the CURRENT agent's driver.
+    ///
+    /// It holds the type, never a rendered prompt, because renderers differ
+    /// per driver: a Claude slash command must never reach Codex or Pi.
+    ///
+    /// `None` means EITHER "a plain Code pass, or not at Code" OR "the state was
+    /// written by a binary predating this field" — both relaunch the stage's
+    /// default prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_fix: Option<crate::prompt::FixType>,
 }
 
 /// The persisted handle on a launch's supervisor ([`State::supervisor`]).
@@ -686,6 +743,9 @@ impl State {
             // Unrecorded (see the field's doc comment).
             checkpoint_approval: CheckpointApproval::Pending,
             gate_notify_cmd: None,
+            fallback_agent: None,
+            fallback_consumed: false,
+            code_fix: None,
         }
     }
 }
@@ -985,6 +1045,91 @@ mod tests {
         assert_eq!(
             loaded.infra_failures, 4,
             "infra_failures must round-trip through serde"
+        );
+    }
+
+    /// SUPV-02 (D-01): the configured fallback and its consumed flag are
+    /// persisted under their own keys and survive a round trip, and a state
+    /// file written before either field existed still loads, as "no fallback,
+    /// unused".
+    #[test]
+    fn fallback_fields_round_trip_and_tolerate_states_predating_them() {
+        let mut state = State::new(
+            PhaseId::new(1),
+            AgentKind::Claude,
+            Mode::Auto,
+            PathBuf::from("/repo"),
+        );
+        state.fallback_agent = Some(AgentKind::Codex);
+        state.fallback_consumed = true;
+        let json = serde_json::to_string(&state).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value.get("fallback_agent"),
+            Some(&serde_json::json!("codex")),
+            "fallback_agent must be persisted under its own key: {json}"
+        );
+        assert_eq!(
+            value.get("fallback_consumed"),
+            Some(&serde_json::json!(true)),
+            "fallback_consumed must be persisted under its own key: {json}"
+        );
+        let loaded: State = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.fallback_agent, Some(AgentKind::Codex));
+        assert!(loaded.fallback_consumed);
+
+        let predating = r#"{
+            "stage": "code",
+            "phase": 1,
+            "agent": "claude",
+            "mode": "auto",
+            "started_at": "0",
+            "project_root": "/repo"
+        }"#;
+        let loaded: State = serde_json::from_str(predating).unwrap();
+        assert_eq!(loaded.fallback_agent, None);
+        assert!(!loaded.fallback_consumed);
+    }
+
+    /// D-09 (Phase 51): the fix type of the Code pass in flight is persisted under
+    /// its own key with a snake_case value and survives a round trip; a state
+    /// written before the field existed loads as "no fix pass"; and a state with
+    /// no fix pass writes no key at all.
+    #[test]
+    fn code_fix_round_trips_and_defaults_to_none() {
+        let mut state = State::new(
+            PhaseId::new(1),
+            AgentKind::Claude,
+            Mode::Auto,
+            PathBuf::from("/repo"),
+        );
+        state.code_fix = Some(crate::prompt::FixType::AuditFix);
+        let json = serde_json::to_string(&state).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value.get("code_fix"),
+            Some(&serde_json::json!("audit_fix")),
+            "code_fix must be persisted under its own key: {json}"
+        );
+        let loaded: State = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.code_fix, Some(crate::prompt::FixType::AuditFix));
+
+        let predating = r#"{
+            "stage": "code",
+            "phase": 1,
+            "agent": "claude",
+            "mode": "auto",
+            "started_at": "0",
+            "project_root": "/repo"
+        }"#;
+        let loaded: State = serde_json::from_str(predating).unwrap();
+        assert_eq!(loaded.code_fix, None, "a pre-51 state has no fix pass");
+
+        state.code_fix = None;
+        let unset = serde_json::to_string(&state).unwrap();
+        assert!(
+            !unset.contains("code_fix"),
+            "a state with no fix pass writes no code_fix key: {unset}"
         );
     }
 

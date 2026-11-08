@@ -12,7 +12,9 @@
 //! into the capture file and its exit code is still reaped after the CLI
 //! exits.
 
-use crate::agent_result::{IdleTimeoutCommit, IdleTimeoutRecord};
+use crate::agent_result::{
+    CaptureDenial, IdleTimeoutCause, IdleTimeoutCommit, IdleTimeoutRecord, IdleTimeoutRecordOnDisk,
+};
 use crate::git::hermetic_command;
 use crate::phase_id::PhaseId;
 use crate::stage::Stage;
@@ -381,14 +383,23 @@ impl LaunchContext {
     }
 }
 
-/// Strip `DEVFLOW_GATE_NOTIFY_CMD` from a detached monitor chain
-/// (49-REVIEW.md WR-07). Every gate in the chain then resolves the command
-/// from the run's state file at the moment it fires, so editing
-/// `gate_notify_cmd` there changes or disables the hook for a run in flight,
-/// and the command (which may carry a webhook token) never reaches the coding
-/// agent's environment. Also applied wherever an agent process is spawned
-/// directly (the pipe-owning agent and the delivery canary). The foreground
-/// `devflow` process keeps the operator's own variable for the gates it fires.
+/// Remove `DEVFLOW_GATE_NOTIFY_CMD` from a child's environment (49-REVIEW.md
+/// WR-07): the command may carry a credential such as a webhook token, and it
+/// never reaches an agent's environment.
+///
+/// Called from `spawn_monitor`, `spawn_stage_agent` and `run_stream_canary`.
+///
+/// `spawn_monitor` strips it from the detached supervisor, so the chain does
+/// not carry the variable and its gates take the command from the run's state
+/// file. A gate's entry write reloads that file, so an on-disk edit of
+/// `gate_notify_cmd` made after the advance loaded its copy is the command the
+/// gate fires (`gate_entry_fires_a_notify_cmd_edited_after_the_advance_loaded`),
+/// and an edit made while the gate waits survives its resolution
+/// (`gate_resolution_keeps_a_notify_cmd_edited_during_the_wait`).
+/// `spawn_stage_agent` (the pipe-owning supervisor's agent) and
+/// `run_stream_canary` (the delivery canary) strip it from the agent they
+/// spawn directly. The foreground `devflow` process keeps the operator's own
+/// variable for the gates it fires.
 pub(crate) fn strip_notify_env(child_cmd: &mut std::process::Command) {
     child_cmd.env_remove(crate::gates::GATE_NOTIFY_CMD_ENV);
 }
@@ -650,7 +661,14 @@ pub fn spawn_monitor(
     let supervisor_pid = child.id();
     info!("monitor spawned with pid {supervisor_pid}; waiting for its socket");
 
-    let reply = wait_for_publish(&mut child, socket, &launch_id, PUBLISH_WAIT)?;
+    // 51-10 (D-12): a test can withhold this launch's publish probe answer,
+    // keyed by the launch's agent and stage. Release builds compile neither
+    // the seam nor its call, and wait as before.
+    #[cfg(any(test, feature = "test-support"))]
+    let probe_withheld = publish_probe_withheld(state);
+    #[cfg(not(any(test, feature = "test-support")))]
+    let probe_withheld = false;
+    let reply = wait_for_publish(&mut child, socket, &launch_id, PUBLISH_WAIT, probe_withheld)?;
     info!(
         "supervisor {supervisor_pid} published {} ({})",
         socket.as_path().display(),
@@ -2426,12 +2444,30 @@ fn end_unpublished_child(child: &mut std::process::Child, wait: Duration) -> Str
     )
 }
 
+/// Test-only seam (51-10, D-12). When `DEVFLOW_TEST_WITHHOLD_PUBLISH_PROBE`
+/// is `<agent>:<stage>` (lowercase, as `AgentKind` and `Stage` display) for
+/// `state`'s agent and stage, [`spawn_monitor`]'s one publish wait treats
+/// every probe of the new supervisor as not yet published, so the real
+/// expiry path runs ([`end_unpublished_child`], [`MonitorError::NotReady`]).
+/// Keyed by the launch being spawned, so a failover relaunch (`codex:code`)
+/// can be withheld while the primary's `claude:code` launch is not. Compiled
+/// only under `cfg(test)` or the `test-support` feature, together with its
+/// one call (pinned by
+/// `monitor::tests::the_publish_probe_seam_is_compiled_out_of_non_test_builds`).
+#[cfg(any(test, feature = "test-support"))]
+fn publish_probe_withheld(state: &State) -> bool {
+    std::env::var_os("DEVFLOW_TEST_WITHHOLD_PUBLISH_PROBE")
+        .is_some_and(|value| value.to_str() == Some(&format!("{}:{}", state.agent, state.stage)))
+}
+
 /// Wait up to `wait` for the supervisor `child` (spawned by this process
 /// with `process_group(0)`) to publish `socket` with `launch_id`.
 ///
 /// Polls every [`PUBLISH_POLL`]: a ping reply with this launch id returns
 /// it and leaves the child running; Gone, Stale, a probe error or another
-/// launch id count as not yet published. If the child exits first it is
+/// launch id count as not yet published. `probe_withheld` (only ever `true`
+/// through the test-only [`publish_probe_withheld`]) skips the probe, so
+/// nothing counts as published. If the child exits first it is
 /// reaped; if the wait expires it is ended with what it started
 /// ([`end_unpublished_child`]). Either way nothing can answer on this
 /// launch's address any more (its only server was the reaped child), so its
@@ -2442,6 +2478,7 @@ fn wait_for_publish(
     socket: &SocketPath,
     launch_id: &str,
     wait: Duration,
+    probe_withheld: bool,
 ) -> Result<crate::supervisor::protocol::PingReply, MonitorError> {
     let pid = child.id();
     let deadline = std::time::Instant::now() + wait;
@@ -2451,8 +2488,9 @@ fn wait_for_publish(
                 "exited by itself before publishing ({status}); 0 child process groups ended"
             );
         }
-        if let Ok(crate::supervisor::Liveness::Alive(reply)) =
-            crate::supervisor::probe(socket.as_path())
+        if !probe_withheld
+            && let Ok(crate::supervisor::Liveness::Alive(reply)) =
+                crate::supervisor::probe(socket.as_path())
             && reply.launch_id == launch_id
         {
             return Ok(reply);
@@ -2701,7 +2739,17 @@ fn fire_idle_timeout(
     //    written, the cascade reaches the rate-limit classifier and returns the
     //    right answer. Never silent — this is logged loudly and lands in the
     //    monitor log alongside the kill.
-    if crate::agent_result::capture_shows_rate_limit_denial(project_root, phase) {
+    //
+    //    D-16 (backlog 999.71): the answer has three values, not two. A capture
+    //    that ends in a torn JSON line after its last parsed event is neither
+    //    a proven denial (T-30-12: only a parsed top-level `rejected` event is)
+    //    nor a clean silence, so the record is written and flagged below. A
+    //    torn tail outranks a denial parsed before it (the torn line may have
+    //    replaced it), by the same rule the verdict uses
+    //    (`agent_result::classify_capture_denial`), so such a capture is never
+    //    suppressed here as a rate limit.
+    let denial = crate::agent_result::capture_rate_limit_denial(project_root, phase);
+    if denial == CaptureDenial::Denied {
         warn!(
             "idle timeout after {idle_secs}s, but the capture carries an explicit quota \
              denial — NOT recording an idle-timeout verdict, so the rate-limit \
@@ -2723,12 +2771,47 @@ fn fire_idle_timeout(
     //    aborts, because a missing commit list must not cost the verdict.
     let (commits, enumeration_note) = enumerate_phase_commits(project_root, workdir, phase);
 
+    // 1b. Read WHY the agent stopped, once, while the capture is still the
+    //     child's last word (D-15, backlog 999.102): `terminal_reason`,
+    //     `errors` and `origin.kind` of the last top-level `result` event. No
+    //     such event yields no cause, and the reason reads as it always did.
+    let cause = crate::agent_result::idle_timeout_cause(project_root, phase);
+
+    // 1c. A torn final line is recorded, never suppressed: the write below is
+    //     still what stops Layer 2 scoring partial commits as success. The
+    //     flag puts the torn segment at the front of the reason's clause.
+    let torn = denial == CaptureDenial::TornAfterLastEvent;
+    if torn {
+        warn!(
+            "idle timeout after {idle_secs}s: the capture ends in a torn JSON line after its \
+             last parsed event, so if the agent is Claude a quota denial cannot be ruled out \
+             (only Claude's stream is classified for one); recording the timeout with \
+             capture_torn_final_line"
+        );
+        append_monitor_log(
+            project_root,
+            phase,
+            &format!(
+                "[idle-timeout] after {idle_secs}s the capture ends in a torn final line; if \
+                 the agent is Claude a quota denial cannot be ruled out, so the record is \
+                 flagged capture_torn_final_line"
+            ),
+        );
+    }
+
     // 2. Write, flush, fsync. This completing is the ONLY thing that stops
     //    Layer 2 from later scoring partial commits as Success.
-    let write_error =
-        write_idle_timeout_record(project_root, phase, idle_secs, child_pid, &commits)
-            .err()
-            .map(|err| err.to_string());
+    let write_error = write_idle_timeout_record(
+        project_root,
+        phase,
+        idle_secs,
+        child_pid,
+        &commits,
+        cause,
+        torn,
+    )
+    .err()
+    .map(|err| err.to_string());
     if let Some(err) = &write_error {
         warn!("idle timeout: could not persist the verdict: {err}");
     }
@@ -2855,12 +2938,17 @@ fn enumerate_phase_commits(
 /// `sync_all` is not decoration: D-05's guarantee is that the result exists
 /// before anything can race it, and a buffered write that is still in the page
 /// cache when the process is signalled has not achieved that.
+///
+/// Serializes [`IdleTimeoutRecordOnDisk`], the same type the reader parses, so
+/// the cause keys (D-15) cannot drift between the two directions.
 fn write_idle_timeout_record(
     project_root: &Path,
     phase: PhaseId,
     idle_secs: u64,
     child_pid: u32,
     commits: &[IdleTimeoutCommit],
+    cause: IdleTimeoutCause,
+    capture_torn_final_line: bool,
 ) -> std::io::Result<()> {
     let record = IdleTimeoutRecord {
         status: crate::agent_result::AgentStatus::IdleTimeout
@@ -2874,7 +2962,9 @@ fn write_idle_timeout_record(
             .unwrap_or(0),
         commits: commits.to_vec(),
     };
-    let json = serde_json::to_string(&record)
+    let mut on_disk = IdleTimeoutRecordOnDisk::new(record, cause);
+    on_disk.capture_torn_final_line = capture_torn_final_line;
+    let json = serde_json::to_string(&on_disk)
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
 
     let path = crate::agent_result::idle_timeout_path(project_root, phase);
@@ -4149,6 +4239,223 @@ exit 0
             "a quota denial was recorded as an idle timeout — the operator is told the \
              stream went silent when the truth is 'out of credits', and the run is \
              marked terminal instead of resumable"
+        );
+    }
+
+    /// D-15 (backlog 999.102): the idle-timeout record carries the cause the
+    /// capture already held — `terminal_reason`, `errors` and `origin.kind` of
+    /// the last top-level `result` event — beside the five existing keys.
+    ///
+    /// The stub's `result` event is the measured 999.102 shape and carries no
+    /// `DEVFLOW_RESULT` marker, so stdin stays open and the stub's silence is
+    /// what fires the idle timeout.
+    ///
+    /// **What this does NOT establish:** that a real Claude CLI still emits
+    /// these keys under these names. It proves the monitor reads them from a
+    /// stub's event and writes them before the kill.
+    #[test]
+    fn the_idle_timeout_record_carries_the_last_result_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(57);
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+
+        let result = r#"{"type":"result","subtype":"success","is_error":false,"terminal_reason":"aborted_tools","errors":["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use"],"origin":{"kind":"task-notification"},"session_id":"s-1","uuid":"u-res-cause","result":"no marker"}"#;
+        let script = format!(
+            r#"
+set -u
+IFS= read -r _turn || exit 91
+printf '%s\n' '{INIT_LINE}'
+printf '%s\n' '{result}'
+sleep 3
+exit 0
+"#
+        );
+
+        let _ = supervise_stream_child(
+            root,
+            phase,
+            root,
+            "prompt",
+            Duration::from_secs(1),
+            "sh",
+            &["-c".to_string(), script],
+            &[],
+            AgentKind::Claude,
+        );
+
+        let raw = std::fs::read_to_string(crate::agent_result::idle_timeout_path(root, phase))
+            .expect("the silent stub must have produced an idle-timeout record");
+        let record: serde_json::Value = serde_json::from_str(&raw).expect("record must parse");
+        let object = record.as_object().expect("the record is a JSON object");
+        let key = |name: &str| {
+            object
+                .get(name)
+                .unwrap_or_else(|| panic!("record has no {name:?} key: {raw}"))
+        };
+        for existing in ["status", "idle_secs", "agent_pid", "written_at", "commits"] {
+            key(existing);
+        }
+        assert_eq!(key("terminal_reason").as_str(), Some("aborted_tools"));
+        let first_error = key("errors")
+            .as_array()
+            .and_then(|errors| errors.first())
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| panic!("errors is not a non-empty string array: {raw}"));
+        assert!(
+            first_error.starts_with("[ede_diagnostic]"),
+            "errors[0] = {first_error:?}"
+        );
+        assert_eq!(key("origin_kind").as_str(), Some("task-notification"));
+    }
+
+    /// D-16 (backlog 999.71, classifier half): a capture that ends in a torn
+    /// JSON line at the idle timeout is not a clean silence. The record is
+    /// still written (it is what stops Layer 2 scoring partial commits as
+    /// success), flagged `capture_torn_final_line`, and the monitor log names
+    /// the torn line.
+    ///
+    /// The stub prints a complete but malformed line, which is the only way a
+    /// torn line can reach the capture before the kill: the reader tees whole
+    /// lines, and a killed child's partial line arrives at EOF, after this
+    /// check. The read side re-checks for it only when this check wrote a
+    /// record: after a complete denial this check suppresses the record, so
+    /// that order ends as an indeterminate `Failed` gate while the monitor log
+    /// says rate-limited (known residual, backlog 999.207; not tested here).
+    #[test]
+    fn a_torn_final_line_at_the_idle_timeout_is_flagged_on_the_record() {
+        let run_silent_stub = |root: &Path, phase: PhaseId, last_line: Option<&str>| {
+            std::fs::create_dir_all(root.join(".devflow")).unwrap();
+            let last = last_line
+                .map(|line| format!("printf '%s\\n' '{line}'"))
+                .unwrap_or_default();
+            let script = format!(
+                r#"
+set -u
+IFS= read -r _turn || exit 91
+printf '%s\n' '{INIT_LINE}'
+{last}
+sleep 3
+exit 0
+"#
+            );
+            let _ = supervise_stream_child(
+                root,
+                phase,
+                root,
+                "prompt",
+                Duration::from_secs(1),
+                "sh",
+                &["-c".to_string(), script],
+                &[],
+                AgentKind::Claude,
+            );
+            let raw = std::fs::read_to_string(crate::agent_result::idle_timeout_path(root, phase))
+                .expect("a silent stub must produce an idle-timeout record");
+            let record: serde_json::Value =
+                serde_json::from_str(&raw).expect("the record must parse");
+            let log = std::fs::read_to_string(crate::agent_result::monitor_log_path(root, phase))
+                .unwrap_or_default();
+            (record, log)
+        };
+
+        let torn_dir = tempfile::tempdir().unwrap();
+        let (record, log) = run_silent_stub(
+            torn_dir.path(),
+            PhaseId::new(58),
+            Some(r#"{"type":"rate_limit_ev"#),
+        );
+        assert_eq!(
+            record.get("capture_torn_final_line"),
+            Some(&serde_json::Value::Bool(true)),
+            "a torn final line at the timeout must be flagged on the record: {record}"
+        );
+        assert!(
+            log.lines()
+                .any(|line| line.starts_with("[idle-timeout]") && line.contains("torn final line")),
+            "the monitor log must name the torn final line; log:\n{log}"
+        );
+        assert!(
+            log.lines().any(|line| line.starts_with("[idle-timeout]")
+                && line.contains("if the agent is Claude a quota denial cannot be ruled out")),
+            "the monitor log scopes the denial gap to Claude, the one agent classified for \
+             one; log:\n{log}"
+        );
+
+        // CONTROL (separate fixture dir): an intact, init-only capture writes
+        // the record without the flag.
+        let intact_dir = tempfile::tempdir().unwrap();
+        let (record, log) = run_silent_stub(intact_dir.path(), PhaseId::new(59), None);
+        assert!(
+            record.get("capture_torn_final_line").is_none(),
+            "an intact capture must not carry the torn flag: {record}"
+        );
+        assert!(
+            !log.contains("torn final line"),
+            "an intact capture must not log a torn line; log:\n{log}"
+        );
+    }
+
+    /// D-16: a quota denial followed by a torn final line at the idle timeout
+    /// is recorded, flagged torn, and not suppressed as a rate limit, so the
+    /// monitor and the verdict agree: the advance reads an idle timeout, never
+    /// `RateLimited`, and no failover or cron resume follows.
+    #[test]
+    fn a_denial_followed_by_a_torn_line_at_the_idle_timeout_is_recorded_not_suppressed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(54);
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+
+        let denial = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1786222800,"rateLimitType":"seven_day","overageStatus":"rejected","overageDisabledReason":"out_of_credits","isUsingOverage":false},"uuid":"u-rl","session_id":"s-rl"}"#;
+        let torn = r#"{"type":"res"#;
+        let script = format!(
+            r#"
+set -u
+IFS= read -r _turn || exit 91
+printf '%s\n' '{INIT_LINE}'
+printf '%s\n' '{denial}'
+printf '%s\n' '{torn}'
+sleep 3
+exit 0
+"#
+        );
+
+        let _ = supervise_stream_child(
+            root,
+            phase,
+            root,
+            "prompt",
+            Duration::from_secs(1),
+            "sh",
+            &["-c".to_string(), script],
+            &[],
+            AgentKind::Claude,
+        );
+
+        let raw = std::fs::read_to_string(crate::agent_result::idle_timeout_path(root, phase))
+            .expect(
+                "a denial followed by a torn line was suppressed as a rate limit: the monitor \
+                 wrote no idle-timeout record",
+            );
+        let record: serde_json::Value = serde_json::from_str(&raw).expect("the record parses");
+        assert_eq!(
+            record.get("capture_torn_final_line"),
+            Some(&serde_json::Value::Bool(true)),
+            "the record must carry the torn flag: {record}"
+        );
+        let log = std::fs::read_to_string(crate::agent_result::monitor_log_path(root, phase))
+            .unwrap_or_default();
+        assert!(
+            !log.contains("classified as rate-limited"),
+            "the monitor logged a rate limit for a torn capture; log:\n{log}"
+        );
+        let verdict =
+            crate::agent_result::evaluate_layer1(root, phase).expect("the record is a verdict");
+        assert_eq!(
+            verdict.status,
+            crate::agent_result::AgentStatus::IdleTimeout,
+            "{verdict:?}"
         );
     }
 
@@ -6698,6 +7005,7 @@ exit 0
             &socket,
             "never-publishes",
             Duration::from_secs(1),
+            false,
         );
         let elapsed = started.elapsed();
         match &result {
@@ -7353,7 +7661,7 @@ exit 0
             .expect("socket path fits sun_path");
         let log = fixture.path("fail.log");
         let mut child = spawn_publish_entry(&bad_cache, &fixture, &launch_id, None, &log);
-        let result = wait_for_publish(&mut child.0, &socket, &launch_id, PUBLISH_WAIT);
+        let result = wait_for_publish(&mut child.0, &socket, &launch_id, PUBLISH_WAIT, false);
         let entry_log = std::fs::read_to_string(&log).unwrap_or_default();
         match &result {
             Err(MonitorError::NotReady(text)) => assert!(
@@ -7384,7 +7692,7 @@ exit 0
                 .expect("socket path fits sun_path");
         let log = fixture.path("ok.log");
         let mut child = spawn_publish_entry(fixture.cache.path(), &fixture, &launch_id, None, &log);
-        let reply = wait_for_publish(&mut child.0, &socket, &launch_id, PUBLISH_WAIT)
+        let reply = wait_for_publish(&mut child.0, &socket, &launch_id, PUBLISH_WAIT, false)
             .unwrap_or_else(|err| {
                 panic!(
                     "a published supervisor is returned: {err}\n{}",
@@ -7548,7 +7856,7 @@ exit 0
         assert!(agent.alive(), "the agent runs while the child is parked");
         tamper(&socket, &sidecar);
         child.0.kill().expect("SIGKILL the child by its own Child");
-        let result = wait_for_publish(&mut child.0, &socket, &launch_id, PUBLISH_WAIT);
+        let result = wait_for_publish(&mut child.0, &socket, &launch_id, PUBLISH_WAIT, false);
         let text = match result {
             Err(MonitorError::NotReady(text)) => text,
             other => panic!("expected NotReady, got {other:?}\n{}", entry_log()),
@@ -7740,6 +8048,213 @@ exit 0
             "{path}: non-test code must define `wait_for_publish(` and call it from \
              `spawn_monitor`; found {waits}"
         );
+    }
+
+    // ---- 51-10: the publish-probe seam (SUPV-01 experiment, D-12) --------
+
+    /// Why `source`'s non-test code does not hold exactly two
+    /// `wait_for_publish(` occurrences (the definition and the one call in
+    /// `spawn_monitor`), or `None` when it does. Counted by
+    /// [`launch_scan_counts`], so comments and the test module do not count.
+    fn publish_wait_count_violation(source: &str) -> Option<String> {
+        let (_, waits) = launch_scan_counts(source);
+        (waits != 2).then(|| {
+            format!(
+                "non-test code holds {waits} `wait_for_publish(` occurrences, not 2 (the \
+                 definition and the one call in `spawn_monitor`)"
+            )
+        })
+    }
+
+    /// Review B-7: a launch has exactly one publish wait, so the 51-10 seam
+    /// withholds the one wait a failover relaunch makes and cannot add a
+    /// second. The real file holds the definition and one call; a planted
+    /// source with a second call counts 3 and is reported.
+    #[test]
+    fn non_test_code_waits_for_publish_exactly_once() {
+        let planted = "fn wait_for_publish(child: &mut Child) {}\nfn spawn_monitor() {\n    \
+                       wait_for_publish(&mut child);\n    wait_for_publish(&mut child);\n}\n\
+                       mod tests {\n    wait_for_publish(\n}\n";
+        assert_eq!(launch_scan_counts(planted).1, 3, "planted control count");
+        let reported = publish_wait_count_violation(planted);
+        assert!(
+            reported.as_deref().is_some_and(|why| why.contains(" 3 ")),
+            "planted control: a second call is reported, got {reported:?}"
+        );
+        let single = "fn wait_for_publish(child: &mut Child) {}\nfn spawn_monitor() {\n    \
+                      wait_for_publish(&mut child);\n}\nmod tests {\n    wait_for_publish(\n}\n";
+        assert_eq!(publish_wait_count_violation(single), None, "one call");
+
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/monitor.rs");
+        let source =
+            std::fs::read_to_string(path).unwrap_or_else(|err| panic!("read {path}: {err}"));
+        if let Some(why) = publish_wait_count_violation(&source) {
+            panic!("{path}: {why}");
+        }
+    }
+
+    const PUBLISH_SEAM_NO_LITERAL_READ: &str =
+        "no literal std::env::var_os read of DEVFLOW_TEST_WITHHOLD_PUBLISH_PROBE";
+    const PUBLISH_SEAM_FN_NOT_ONCE: &str = "fn publish_probe_withheld( is not defined exactly once";
+    const PUBLISH_SEAM_NOT_GATED: &str = "fn publish_probe_withheld( is not directly under #[cfg(any(test, feature = \"test-support\"))]";
+    const PUBLISH_SEAM_CALL_NOT_GATED: &str = "a call to publish_probe_withheld( is not directly under #[cfg(any(test, feature = \"test-support\"))]";
+    const PUBLISH_SEAM_READ_OUTSIDE: &str =
+        "DEVFLOW_TEST_WITHHOLD_PUBLISH_PROBE is named outside fn publish_probe_withheld(";
+
+    /// The publish-probe seam's layout over `source`'s non-test code (cut at
+    /// its first `mod tests {` line, whole-line `//` comments dropped): the
+    /// variable is read literally (the form the doc check sees) and only in
+    /// the seam's body, the seam is defined once directly under the
+    /// test-support gate, and every call is directly under that gate too.
+    fn publish_probe_seam_violations(source: &str) -> Vec<String> {
+        const GATE: &str = r#"#[cfg(any(test, feature = "test-support"))]"#;
+        const DEFINITION: &str = "fn publish_probe_withheld(";
+        const VARIABLE: &str = "DEVFLOW_TEST_WITHHOLD_PUBLISH_PROBE";
+        let lines: Vec<&str> = source
+            .lines()
+            .take_while(|line| *line != "mod tests {")
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect();
+        let gated = |at: usize| {
+            at.checked_sub(1)
+                .is_some_and(|above| lines[above].trim() == GATE)
+        };
+        let mut violations = Vec::new();
+        if !lines
+            .iter()
+            .any(|line| line.contains(&format!("std::env::var_os(\"{VARIABLE}\")")))
+        {
+            violations.push(PUBLISH_SEAM_NO_LITERAL_READ.to_string());
+        }
+        let defined: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.trim_start().starts_with(DEFINITION))
+            .map(|(at, _)| at)
+            .collect();
+        match defined.as_slice() {
+            [at] => {
+                if !gated(*at) {
+                    violations.push(PUBLISH_SEAM_NOT_GATED.to_string());
+                }
+                // The body runs to the first line that is exactly `}`.
+                let end = lines[*at..]
+                    .iter()
+                    .position(|line| *line == "}")
+                    .map_or(lines.len(), |offset| at + offset);
+                let outside = lines
+                    .iter()
+                    .enumerate()
+                    .any(|(index, line)| line.contains(VARIABLE) && !(*at..=end).contains(&index));
+                if outside {
+                    violations.push(PUBLISH_SEAM_READ_OUTSIDE.to_string());
+                }
+            }
+            _ => violations.push(PUBLISH_SEAM_FN_NOT_ONCE.to_string()),
+        }
+        let ungated_call = lines.iter().enumerate().any(|(at, line)| {
+            line.contains("publish_probe_withheld(")
+                && !line.trim_start().starts_with(DEFINITION)
+                && !gated(at)
+        });
+        if ungated_call {
+            violations.push(PUBLISH_SEAM_CALL_NOT_GATED.to_string());
+        }
+        violations
+    }
+
+    /// T-51-24 (51-10, permanent source scan): a release build never
+    /// compiles the publish-probe seam or its call, so no environment
+    /// variable can make a release launcher ignore a publish. The real file
+    /// yields no violation; each planted source yields the violation it
+    /// plants, including an ungated decoy.
+    #[test]
+    fn the_publish_probe_seam_is_compiled_out_of_non_test_builds() {
+        let gate = "#[cfg(any(test, feature = \"test-support\"))]\n";
+        let read = "    std::env::var_os(\"DEVFLOW_TEST_WITHHOLD_PUBLISH_PROBE\").is_some()\n";
+        let seam = |attribute: &str, body: &str| {
+            format!("{attribute}fn publish_probe_withheld(state: &State) -> bool {{\n{body}}}\n")
+        };
+        let caller = |attribute: &str| {
+            format!(
+                "fn spawn_monitor() {{\n    // Test-only.\n    {attribute}    let withheld = \
+                 publish_probe_withheld(state);\n}}\n"
+            )
+        };
+        let gated_call = format!("    {gate}");
+        let good = format!("{}{}", seam(gate, read), caller(&gated_call));
+        let only = |violation: &str| vec![violation.to_string()];
+
+        assert_eq!(
+            publish_probe_seam_violations(&good),
+            Vec::<String>::new(),
+            "a correct layout (the comment line above the gate is dropped)"
+        );
+        assert_eq!(
+            publish_probe_seam_violations(&format!("{}{}", seam("", read), caller(&gated_call))),
+            only(PUBLISH_SEAM_NOT_GATED),
+            "an ungated definition"
+        );
+        assert_eq!(
+            publish_probe_seam_violations(&format!(
+                "{}{}",
+                seam("#[cfg(test)]\n", read),
+                caller(&gated_call)
+            )),
+            only(PUBLISH_SEAM_NOT_GATED),
+            "a definition gated by cfg(test) only (not compiled into the CLI test build)"
+        );
+        assert_eq!(
+            publish_probe_seam_violations(&format!("{}{}", seam(gate, read), caller(""))),
+            only(PUBLISH_SEAM_CALL_NOT_GATED),
+            "an ungated decoy call"
+        );
+        assert_eq!(
+            publish_probe_seam_violations(&format!(
+                "{}{}fn decoy() -> bool {{\n{read}}}\n",
+                seam(gate, read),
+                caller(&gated_call)
+            )),
+            only(PUBLISH_SEAM_READ_OUTSIDE),
+            "an ungated decoy reading the variable outside the seam"
+        );
+        assert_eq!(
+            publish_probe_seam_violations(&format!(
+                "{}{}",
+                seam(gate, "    let _ = std::env::var_os(SEAM);\n"),
+                caller(&gated_call)
+            )),
+            only(PUBLISH_SEAM_NO_LITERAL_READ),
+            "a read through a constant"
+        );
+        assert_eq!(
+            publish_probe_seam_violations(&format!(
+                "{}{}{}",
+                seam(gate, read),
+                seam(gate, ""),
+                caller(&gated_call)
+            )),
+            only(PUBLISH_SEAM_FN_NOT_ONCE),
+            "two definitions"
+        );
+        assert_eq!(
+            publish_probe_seam_violations(&format!("mod tests {{\n{good}")),
+            vec![
+                PUBLISH_SEAM_NO_LITERAL_READ.to_string(),
+                PUBLISH_SEAM_FN_NOT_ONCE.to_string()
+            ],
+            "the read and the seam only after the test-module cut"
+        );
+
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/monitor.rs");
+        let source =
+            std::fs::read_to_string(path).unwrap_or_else(|err| panic!("read {path}: {err}"));
+        assert!(
+            source.lines().any(|line| line == "mod tests {"),
+            "monitor.rs must keep its `mod tests {{` line, or the scan would read its own controls"
+        );
+        let real = publish_probe_seam_violations(&source);
+        assert!(real.is_empty(), "{path}: {real:?}");
     }
 
     // ---- 50-26: WR-03 ---------------------------------------------------

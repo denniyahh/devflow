@@ -107,7 +107,7 @@ DevFlow evaluates agent output in four layers:
 | 2. Exit code + commits | Exit 0 **and** commits on the feature branch = success; otherwise failed | Fallback |
 | 3. Commit heuristic | Exit code unknown: commits exist = probable success (with warning) | Last resort |
 
-Rate-limit detection: if an agent's stdout contains rate-limit messages (429), DevFlow writes a per-phase `.devflow/cron-instructions-{phase:02}.json` for rescheduling.
+Rate-limit detection: if an agent's stdout contains rate-limit messages (429), DevFlow answers in one of two ways. If the Code stage was rate-limited and a fallback agent is configured (`--fallback-agent`, or `fallback_agent` in `devflow.toml`; `devflow parallel` takes no fallback and ignores the key, with a note), that agent takes over Code once, in the same worktree on the same branch; a fallback that fails to relaunch stops at a gate, or aborts the run when it is at the infra-failure ceiling. Otherwise (a rate limit at any other stage, no fallback, a fallback refused before the handoff, or after that one hop) DevFlow writes a per-phase `.devflow/cron-instructions-{phase:02}.json` for rescheduling. See [OPERATIONS.md](OPERATIONS.md#rate-limit-failover).
 
 ## Commands
 

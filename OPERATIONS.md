@@ -28,8 +28,8 @@ Define → Plan → Code → Validate → Ship
 
 | Command | Purpose |
 |---|---|
-| `devflow start --phase N --agent claude\|codex\|opencode --mode auto\|supervise [--force] [--no-worktree] [--dry-run] [--until define\|plan\|code\|validate]` | Begin a phase; a detached monitor owns the agent and auto-advances. `--until <stage>` runs through `<stage>` then halts cleanly (no orphaned monitor, no `doctor` false positive) instead of continuing to Ship; `--until ship` is rejected (a no-op — Ship is already terminal). Refuses before scaffolding anything if phase N is not reachable from `develop` (see Preflight refusals below) |
-| `devflow resume --phase N` | Resume a rate-limited or infra-paused phase from its saved stage (loads `state-NN.json`, does not recreate the branch/worktree or reset to Define) — the command a primary-loop rate-limit auto-resume cron invokes. Also clears a `--until`-stopped phase's stop marker, so the phase advances past its old stop point instead of re-stopping immediately. It reruns the stage, so a pending gate is asked again: it sets any unused answer aside and reports it, and reports an answer that was claimed with no record that it was applied (see [Answering gates](#answering-gates)) |
+| `devflow start --phase N --agent claude\|codex\|opencode --mode auto\|supervise [--force] [--no-worktree] [--dry-run] [--until define\|plan\|code\|validate] [--fallback-agent <agent>]` | Begin a phase; a detached monitor owns the agent and auto-advances. `--until <stage>` runs through `<stage>` then halts cleanly (no orphaned monitor, no `doctor` false positive) instead of continuing to Ship; `--until ship` is rejected (a no-op — Ship is already terminal). Refuses before scaffolding anything if phase N is not reachable from `develop` (see Preflight refusals below). `--fallback-agent <agent>` names one agent that takes over if the Code stage is rate-limited: one hop per run, at Code only (a rate limit at any other stage takes the cron arm), relaunching Code in the same worktree on the same branch. It is saved in `state-NN.json`, and refused when it equals `--agent`, when its binary is missing or its driver unhealthy, and in `--mode auto` unless it is `claude` or `antigravity`. That launch check is best effort: the full preflight runs again at the handoff, a refusal there takes the cron arm, and a relaunch that fails after the handoff stops at a Code gate (see [Rate-limit failover](#rate-limit-failover)). Without the flag, `start` uses `devflow.toml`'s `fallback_agent` key and prints a note naming it; the flag wins the value, and no environment variable selects a fallback |
+| `devflow resume --phase N [--agent <agent>] [--fallback-agent <agent>]` | Resume a rate-limited or infra-paused phase from its saved stage (loads `state-NN.json`, does not recreate the branch/worktree or reset to Define) — the command a primary-loop rate-limit auto-resume cron invokes. Also clears a `--until`-stopped phase's stop marker, so the phase advances past its old stop point instead of re-stopping immediately. It reruns the stage, so a pending gate is asked again: it sets any unused answer aside and reports it, and reports an answer that was claimed with no record that it was applied (see [Answering gates](#answering-gates)). `--agent <agent>` hands the run to another agent (an `agent_handoff` event with reason `resume --agent`); naming the run's saved, unused fallback is refused unless `--fallback-agent` names another. `--fallback-agent <agent>` sets the fallback or re-arms a spent one, checked as on `start`; like any resume it is accepted only on a run that is not live. Without it the saved fallback is kept as it is, spent or not: `resume` does not re-read `devflow.toml` |
 | `devflow status` | All active phases: stage, gate state, supervisor liveness (ALIVE / STALE / GONE, with the repair; see [Run liveness](#run-liveness)), elapsed, last action. Also shows a held state write lock with its holder, names a live agent that has no supervisor with the manual kill, and lists set-aside gate answers |
 | `devflow logs [-f] [--phase N] [--stderr]` | Print/follow a phase's captured agent output |
 | `devflow history [N]` | Show chronological events with retained capture and review evidence for a phase |
@@ -37,7 +37,7 @@ Define → Plan → Code → Validate → Ship
 | `devflow gate approve <phase> [--stage S] [--note ...] [--gate-id ID]` | Approve a gate — the workflow advances |
 | `devflow gate reject <phase> --note ... [--stage S] [--gate-id ID]` | Reject — loops back to Code; a note containing `abort` ends the phase |
 | `devflow gate sweep [--max-age-secs N] [--dry-run] [--root PATH]` | Answer or report aged, unattended gates across every registered root (or one `--root`) — bounds an abandoned run's lifetime without `kill(1)`. On-demand only; nothing schedules it. Never writes an approval |
-| `devflow parallel --phases 7,8 [--agents claude,codex] [--mode M] [--force]` | Run phases concurrently, each in its own worktree + monitor |
+| `devflow parallel --phases 7,8 [--agents claude,codex] [--mode M] [--force]` | Run phases concurrently, each in its own worktree + monitor. Takes no fallback: it ignores `devflow.toml`'s `fallback_agent` and prints a note saying so, and refuses a key that names no agent or a file that does not parse, as `start` does |
 | `devflow list` | Feature branches with divergence from develop |
 | `devflow reference [--branch B] [--refresh]` | Static snapshot worktree at `.worktrees/reference/` |
 | `devflow stop --phase N [PROJECT] [--root PATH] [--launch ID]` | End a running phase cleanly (23c). In this order: **(1)** an open gate with a registered live waiter is answered with an abort rejection — the waiter unwinds through its own abort path, no signal sent. A Ship gate with no waiter stores that rejection for `devflow ship`. A gate whose answer a consumer already claimed is left alone. If `.devflow/.gates-NN.lock` stays held past 5 s, `stop` says so, answers nothing and goes on to the next arms, so a wedged `gate approve` cannot leave a run unstoppable. **(2)** Otherwise the run's supervisor socket is probed: the one `.devflow/state-NN.json` records, or, when that file records none (a `start` still waiting for its supervisor to publish), is missing or does not load, the one live socket found through its sidecar for this project and phase. **ALIVE** → a `shutdown` request: the supervisor ends the agent's process group (exit code 143) and runs no advance. A stop honoured at an advance safe point is named as that, since nothing was signalled, and the exit file then records 143 too. A supervisor that accepted the stop but whose final answer did not arrive in time is reported as accepted, not confirmed: it honours the stop at its next safe point, and `devflow status` shows when it has. **STALE** → the guarded backstop: it signals (SIGTERM, then SIGKILL) only an agent group whose leader is still present with the recorded start time and still leads the group; a socket from a previous boot, an empty group or a recycled leader pid has its socket and sidecar removed with nothing signalled; a group whose leader is gone is refused and its members listed, with `ps -o pid,pgid,sid,lstart,args -p "$(pgrep -d, -g <pgid>)"` to inspect them (residual limit: nothing proves those members are the agent's, so `stop` never signals them — end them yourself). A probe that cannot answer is refused, nothing signalled. A launch the state names as pending comes next, and only its socket reaches it: `stop` waits up to 15 s for an unpublished one and never signals it. If it never publishes, a foreground launcher still holding the phase is reached through arm (3), and with none `stop` reports the launch and the pid its liveness lock records, records nothing and names the manual route: end that process yourself, then run `stop` again to clear the reservation. A reservation nothing holds is abandoned: `stop` clears it and says so. **(3)** Only when no socket answers (**GONE**, or nothing recorded) is the phase's foreground holder signalled — a `start`/`resume` before its spawn, `devflow ship`, or a hand-run `devflow advance`, which holds `.devflow/.holder-NN` for its lifetime — after confirming its pid and start time match the identity that file recorded (a recycled pid, or a record with no start time, is refused). No pid read from the state file is ever signalled. The holder catches the signal and ends at its next safe point (1–6; a foreground gate wait at 4), recording `stopped by devflow stop at a foreground safe point` and logging `advance_stopped` with `source: foreground_holder`. A holder still running 3 s later is reported as not marked, exit non-zero, and it records the stop itself. **Finalization.** The boundary is before `Merge`, or after the pass ends: `devflow ship` reads a stop only at safe point 6, before a finalization pass. Once the pass starts it runs `Merge`, `VersionBump`, `ChangelogAppend` and `BranchCleanup` to the end; a failed pass's retry gate then honours the stop at safe point 4, and a successful pass ships. So a stop that arrives after the pass started lets the run finish shipping. What you see: `stop` prints its not-marked message (the pid was signalled, phase state was not marked stopped, and a `devflow ship` that has started its finalization pass runs it to the end and, if the pass succeeds, ships instead of stopping) and exits non-zero; or, when the ship finishes within the 3 s wait, `stop` says the signalled holder exited and left no phase state, that the run ended on its own, and that nothing was marked stopped. Afterwards the record is the shipped run's (`workflow_shipped`, `workflow_finished`, no state file) with no `advance_stopped`: nothing records that the stop arrived. There is no safe point between hooks and no resume path that skips a hook already run. Limit: a terminal Ctrl-C sends SIGINT to the whole foreground process group, so a hook's own `git` child receives it directly; this covers `devflow stop` and signals sent to the holder pid only. **An agent with no supervisor.** With no socket, pending launch or holder left but the phase's agent still alive, `stop` names the agent's pid and the manual kill (`kill -TERM -- -<pid>`, after `ps -o pid,pgid,lstart,args -p <pid>` when the pid is unconfirmed), writes nothing and exits non-zero. `devflow stop` cannot end that agent (backlog 999.170). The pid is unconfirmed when it comes only from `.devflow/phase-NN-agent-pid`: a pid reused by an unrelated process makes `stop` exit non-zero until that process ends, and the way out is to remove the pid file (end that process only if it is yours to end). **What it records.** Idempotent; records `stopped`/`stop_reason`. After arm (1) the waiter's abort path then clears the state. Either way `cleanup`'s fail-closed refusal recognizes the phase as no longer live — `stop` then `cleanup --force` compose in that order. `stop` does not mark a run `stopped` when, by the time it writes, the state names a launch none of its arms ended, answered, cleared or found not running: one a signalled holder published, a pending launch that promoted while `stop` ran, or one started meanwhile. Run `stop` again: a launch that turns out dead is found not running by that second `stop`, which then marks the run. `stop` waits at most 10 s for the state write lock, then names its holder and writes nothing. When the state file does not load, `stop` still ends the run, says `stopped` was not recorded and leaves the file untouched; several live sockets with no usable state are refused, with one `devflow stop --phase N --launch <id>` line each. `--launch <id>` tears down only the socket with that launch id — the form `devflow doctor` prints for an orphan, usable from any directory — and answers no gate, signals no holder and writes no state. `stop` adds no exit codes |
@@ -284,6 +284,87 @@ already have run, so check them before answering again. A stored Ship approval
 is applied without a rerun by `devflow ship --phase N`; once `resume` has set
 that answer aside, `devflow ship` cannot apply it.
 
+## Rate-limit failover
+
+A rate-limited stage gets one of two answers.
+
+- **Failover.** The run has an unused fallback agent (`--fallback-agent` on
+  `devflow start` or `devflow resume`, or `devflow.toml`'s `fallback_agent` key
+  at `devflow start`) and the rate limit hit the Code stage. The supervisor
+  hands the run to the fallback and relaunches Code in the same worktree, on the
+  same branch, with the tree as it is: nothing is reset, stashed or cleaned. The
+  hop happens once per run, because it marks the fallback used in
+  `state-NN.json`; `devflow resume --phase N --fallback-agent <agent>` re-arms it
+  on a run that is not live. A hop does not count toward the infra ceiling.
+- **Cron resume.** Otherwise DevFlow writes `cron-instructions-NN.json` naming
+  `devflow resume --phase N`: no fallback configured, the fallback already used,
+  a rate limit at any stage but Code, or a handoff refused before it happened.
+  The full preflight runs again at the handoff, because the check at launch is
+  best effort, so a fallback can still be refused there (its binary gone, say).
+
+Only top-level events decide a rate limit: a subagent's rate-limit event or
+`result` in the capture does not. A stage that went silent with no quota
+denial in its capture ends as an idle timeout, which takes neither answer. Its
+failure names the last top-level `result` event's `terminal_reason`, `origin`
+and `errors` when the capture carries them, as in
+`idle timeout (last result: terminal_reason aborted_tools; origin task-notification; …)`.
+When the capture ends in a torn final line, the clause starts with
+`torn final line after the last parsed event`, and the verdict stays an idle
+timeout. For a Claude capture the torn line may have been a quota denial; the
+classifier reads only Claude's denials, so for other agents it says nothing
+about one either way. A torn final line outranks a quota denial parsed before
+it, because the torn line may be a later event that replaced the denial: the
+stage is never classified as rate-limited, so no failover and no cron resume
+follow. At an idle timeout it is recorded as one, flagged torn, and stops at a
+gate, when the torn line reached the capture before the monitor's idle check.
+Known residual (backlog 999.207): the capture keeps whole lines only, so a
+partial line the agent was writing when it was killed reaches the capture only
+at end of output, after that check. If the capture held a complete quota denial
+at the check, the monitor logs the stage as rate-limited (resumable), writes no
+idle-timeout record and kills the agent; the verdict then reads the torn line
+and the gate shows an indeterminate failure (`stream capture ends in an
+unparseable line`), not an idle timeout. The outcome is still a gate, with no
+failover and no cron resume.
+
+The failover events in `events.jsonl`:
+
+| Event | When | Keys |
+|---|---|---|
+| `agent_handoff` | The run changed agent | `stage`, `from_agent`, `to_agent`, `reason` (`rate_limited` for a failover, `resume --agent` for `devflow resume --agent`), `tree_dirty` (the tree handed over had uncommitted changes), `commit_count` (commits on the phase branch). Each of the last two is `null` when it could not be measured |
+| `agent_handoff_refused` | The fallback was refused before the handoff; the cron arm follows | `stage`, `from_agent`, `to_agent`, `reason` |
+| `agent_handoff_relaunch_failed` | The handoff happened, but Code could not be relaunched under the fallback | `stage`, `from_agent`, `to_agent`, `reason` (the launch error) |
+| `gate_relaunch_refused` | A retry or loop-back answer to a stage's failure gate was not relaunched, because the delivery canary recorded for the run refuses its agent; the run is marked stopped | `stage`, `agent`, `reason` (the recorded refusal) |
+
+`agent_handoff_relaunch_failed` is followed by the never-silent Code gate
+(`gate_fired`), or by an abort when the run is at the infra ceiling, never by
+cron instructions. When the fallback's delivery canary refused, a scheduled
+resume would only fail again: the refusal stays recorded for the run and
+refuses every later launch. And after a shutdown that could not be confirmed, a
+successor may still be running. The gate names the cause as
+`the handoff to <agent> could not relaunch the code stage: <error>`. When the
+recorded canary refuses the agent, the gate context (and so the notify hook)
+also says that a retry or loop-back will not relaunch and names
+`devflow resume --phase N --agent <other>`.
+
+The way on when the fallback's canary refused:
+
+- Answering the gate with a retry (`devflow gate approve`, or a rejection
+  without `abort`) does not relaunch Code, because the recorded refusal would
+  refuse it again. The supervisor marks the run stopped, with a stop reason
+  naming the refusal and `devflow resume --phase N --agent <other>`, writes a
+  `gate_relaunch_refused` event, and exits. The same applies to any stage's
+  failure gate whose run has a refusing canary recorded for its agent.
+- `devflow stop --phase N` answers the gate with an abort, which ends the run
+  and removes its state.
+- To continue on another agent, answer the gate with a retry, wait until
+  `devflow status` shows the run not live (its hint then reads
+  `devflow resume --phase N --agent <other>`), then run
+  `devflow resume --phase N --agent <agent>` naming an agent other than the
+  run's current one. The handoff clears the recorded canary, so that agent
+  runs its own. A plain `devflow resume --phase N` is refused by the same
+  recorded canary before it changes anything, so the stop reason that names
+  the way on is kept.
+
 ## Notify hook (never miss a gate)
 
 Set `DEVFLOW_GATE_NOTIFY_CMD` to any shell command; it runs on every gate
@@ -310,9 +391,9 @@ it the same way.
 `resume` refuses while a run is live (an agent running or a gate waiting), so
 it changes the hook only for a stopped run. To change the hook of a live run,
 edit `gate_notify_cmd` in the state file. An edit made while a gate is waiting
-is kept when the gate is answered; an edit made while a stage is still running
-can be overwritten when its gate opens (backlog 999.154). The coding agent
-never receives the variable.
+is kept when the gate is answered. An edit made while a stage is still running
+is kept too: the gate reloads the state file when it opens and fires the edited
+command. The coding agent never receives the variable.
 
 ## Environment variables
 
@@ -356,7 +437,7 @@ never receives the variable.
 | `gates/NN-{stage}.{gate_id}.waiter` | The waiter's registration: its held lock says something waits on that gate. An abandoned one is removed by `recover --clean` |
 | `gates/NN-{stage}.{gate_id\|noid}.{secs}.{pid}.{seq}.quarantined.json` | An answer set aside. It persists until removed by hand |
 | `events.jsonl` | Append-only event log (schema v1, one JSON object per line, phase id on every line) — tail it from any tool |
-| `cron-instructions-NN.json` | Rate-limit resume record naming `devflow resume --phase N` for a paused run |
+| `cron-instructions-NN.json` | Rate-limit resume record naming `devflow resume --phase N` for a paused run. Written when no unused fallback applies: none configured, already used, the rate limit was not at Code, or the handoff was refused before it happened. Not written when the fallback's relaunch fails after the handoff: that run stops at a Code gate, or aborts at the infra ceiling. The cron arm itself writes no file when its infra count reaches the ceiling (the run aborts). When the retry time does not parse, it still writes the file, with an empty `hermes_cron.schedule` that schedules nothing, and the run stops at a gate: the file is a record, not a scheduled resume, so resume by hand |
 | `history/phase-NN/` | Bounded archive of prior stage stdout/exit captures |
 
 Everything under `.devflow/` and `.worktrees/` is runtime state
