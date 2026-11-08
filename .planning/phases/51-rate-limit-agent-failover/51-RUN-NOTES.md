@@ -28,3 +28,17 @@ Per the dogfooding rule in CLAUDE.md, every stage or step run outside `devflow s
 - **Why outside DevFlow:** same as exception 1 (999.189), and a reject would dispatch a full execute rather than gaps
   only (999.192).
 - **Next step inside DevFlow:** reject the Validate gate (note without "abort") so Validate re-runs on the fixed code.
+
+## Exception 3: third fix round, at the Code failure gate (2026-11-08)
+
+- **Trigger:** after the second reject, DevFlow re-ran Code as a full execute (999.192). All 13 plans were complete, so
+  only GSD's verify tail ran: the re-review (`4a23acf`, 5 findings) and the verifier (`7095b38`, `gaps_found`: OPERATIONS.md
+  over-promised the torn-line fix). Code failed and fired a failure gate (`18e6265d44ff61fa`). No DevFlow route plans gap
+  closure (999.205), so every gate answer re-runs the same verify tail.
+- **Operator chose option A:** document the killed-mid-line residual (WR-02) instead of fixing it in code, fix the four
+  small findings, and move the real fix to Phase 52 (999.207). The gate-reason truncation found here went to Phase 52
+  (999.206, operator).
+- **What ran by hand:** a fix agent: `ff649ff` (WR-02 residual documented), `cce00cc` (WR-01), `d149da8` (IN-01),
+  `fc92c6b` (IN-02), `744739a` (IN-03); fix report `e564570`; GSD disposition step `6443b82`.
+- **Next step inside DevFlow:** answer the Code failure gate without "abort"; Code re-runs its verify tail.
+

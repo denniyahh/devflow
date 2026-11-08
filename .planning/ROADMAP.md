@@ -1073,6 +1073,25 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.207: A Quota Denial Followed by a Line the Agent Was Killed Mid-Way Through Still Splits the Monitor and the Verdict (BACKLOG)
+
+**Found:** 2026-11-08, Phase 51 Code-stage re-review (51-REVIEW.md WR-02 at `7095b38`), confirmed against source.
+The Phase 51 fix `17a47cf` (a torn final line outranks a parsed quota denial) covers a torn line that is already in the
+capture. The monitor's reader tees whole lines only (`read_until(b'\n')`), and `fire_idle_timeout` classifies while
+the child is alive. If the agent is killed mid-line, the partial line reaches the capture only at EOF, after the monitor
+classified `Denied`, logged "classified as rate-limited (resumable)", wrote no idle-timeout record and killed the group.
+The verdict then returns an indeterminate `Failed` ("stream capture ends in an unparseable line").
+
+**Impact:** diagnostics only. The outcome is still a gate (no failover, no cron resume). Documented as a known residual
+in OPERATIONS.md and the code comments (`ff649ff`).
+
+**Not established:** never reproduced at runtime; the order is read from source.
+
+**Fix shape:** have `fire_idle_timeout` return its suppression decision; after the reader drains to EOF, classify again
+and, if the answer is now `TornAfterLastEvent`, write the flagged idle-timeout record and log that the suppression was
+withdrawn. Test with a stub that prints the denial, then a partial line with no newline (`printf '%s'`), then sleeps;
+plant the old order as a failing control. Phase 52 (operator, 2026-11-08: option A).
+
 ### Phase 999.206: A Failure Gate Keeps Only 300 Characters of the Reason, and `gate show` Cannot Show the Rest (BACKLOG)
 
 **Found:** 2026-11-08, Phase 51, Code failure gate `18e6265d44ff61fa`. The Code agent's reason was about 480 characters.
