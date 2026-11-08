@@ -9,7 +9,7 @@ use devflow_core::worktree;
 use std::path::{Path, PathBuf};
 
 use crate::CliError;
-use crate::commands::start;
+use crate::commands::{FallbackSource, start};
 use devflow_core::phase_id::PhaseId;
 
 /// Create the phase worktree at `.worktrees/phase-NN/` on `feature/phase-NN`,
@@ -111,6 +111,21 @@ pub(crate) fn parallel(
     force: bool,
 ) -> Result<(), CliError> {
     let pairs = parse_phase_agent_pairs(phases, agents)?;
+    // `parallel` arms no fallback (see `NoFallback` below), but a configured key is
+    // still read once, before anything launches: a key that names no agent, or a file
+    // that does not parse, refuses `parallel` as it refuses `start`, and a valid key
+    // gets a note that it is not armed. Ignoring it silently would leave the operator
+    // believing a fallback is armed (`config::fallback_agent`'s reason to fail hard).
+    if let Some(fallback) =
+        devflow_core::config::fallback_agent(project_root).map_err(CliError::Message)?
+    {
+        println!(
+            "note: devflow.toml's `fallback_agent` ({fallback}) is not armed by `devflow \
+             parallel`; its runs carry no fallback. To fail over a phase, run it with \
+             `devflow start --phase N --fallback-agent {fallback}`, or re-arm a stopped or \
+             paused run with `devflow resume --phase N --fallback-agent {fallback}`"
+        );
+    }
     println!("launching {} phase(s) in parallel worktrees", pairs.len());
     for (phase, agent) in pairs {
         println!("\n=== phase {phase} ({agent}) ===");
@@ -126,6 +141,10 @@ pub(crate) fn parallel(
         // shape whose delegated work the legacy path orphans (999.64). An
         // operator who genuinely wants it can still set
         // `DEVFLOW_CLAUDE_LEGACY_LAUNCH`, which `start` reads per phase.
+        //
+        // The trailing `NoFallback` is the fallback agent (51-04): `parallel` takes
+        // no `--fallback-agent` and does not arm `devflow.toml`'s `fallback_agent`
+        // key (it only checks and names it, above), so its runs carry none.
         start(
             project_root,
             phase,
@@ -137,6 +156,7 @@ pub(crate) fn parallel(
             None,
             false,
             false,
+            FallbackSource::NoFallback,
         )?;
     }
     Ok(())

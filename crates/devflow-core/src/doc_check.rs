@@ -763,6 +763,131 @@ fn operations_md_documents_run_liveness_and_the_stop_arms() {
     );
 }
 
+/// For each `(prefix, fragment)`, a finding when no line of `text` starts with
+/// `prefix`, or when the FIRST line that does lacks `fragment`. Only that first
+/// line is read, so a fragment moved into another row does not count.
+fn row_findings(text: &str, rows: &[(&str, &str)]) -> Vec<String> {
+    rows.iter()
+        .filter_map(|&(prefix, fragment)| {
+            match text.lines().find(|line| line.starts_with(prefix)) {
+                None => Some(format!("no row starts with {prefix:?}")),
+                Some(row) if !row.contains(fragment) => {
+                    Some(format!("the row starting {prefix:?} lacks {fragment:?}"))
+                }
+                Some(_) => None,
+            }
+        })
+        .collect()
+}
+
+/// OPERATIONS.md rows that must name the fallback (51-11): the flag and the
+/// `devflow.toml` key on `start`, the flag on `resume`, and the cron record's
+/// fallback condition.
+const FALLBACK_ROW_FRAGMENTS: &[(&str, &str)] = &[
+    ("| `devflow start", "--fallback-agent"),
+    ("| `devflow start", "fallback_agent"),
+    ("| `devflow resume", "--fallback-agent"),
+    ("| `cron-instructions-NN.json`", "fallback"),
+];
+
+/// The failover events and keys an operator reads in `events.jsonl`, which
+/// OPERATIONS.md must name (51-11). Only events this phase emits: none whose
+/// producer was dropped from it.
+const FAILOVER_EVENT_FRAGMENTS: &[&str] = &[
+    "agent_handoff",
+    "agent_handoff_refused",
+    "agent_handoff_relaunch_failed",
+    "rate_limited",
+    "tree_dirty",
+    "commit_count",
+];
+
+/// The other operator docs and the fallback fragment each must hold (51-11).
+const FALLBACK_GUIDE_FRAGMENTS: &[(&str, &str)] = &[
+    ("README.md", "--fallback-agent"),
+    ("docs/guides/unattended-mode.md", "--fallback-agent"),
+    ("docs/guides/configuration.md", "fallback_agent"),
+];
+
+/// 51-11 (D-01, D-02, D-03, D-04, D-07, D-10, R-3): the operator docs document
+/// the rate-limit fallback. Outside HTML comments, OPERATIONS.md's `devflow
+/// start` row names `--fallback-agent` and the `fallback_agent` key, its
+/// `devflow resume` row names `--fallback-agent`, its `cron-instructions-NN.json`
+/// row says when a fallback applies, and the text names the failover events and
+/// their keys; README.md and the unattended-mode guide name the flag, and the
+/// configuration guide names the key.
+#[test]
+fn operations_md_documents_the_fallback_agent_and_its_events() {
+    // Planted controls, through the same helpers as the real checks.
+    let planted_table = "| `devflow start --phase N` | Begin |\n\
+                         | `devflow resume --phase N [--fallback-agent <agent>]` | Resume |\n\
+                         | `devflow start --fallback-agent x` fallback_agent | a later row |\n";
+    assert_eq!(
+        row_findings(
+            planted_table,
+            &[
+                ("| `devflow start", "--fallback-agent"),
+                ("| `devflow resume", "--fallback-agent"),
+            ],
+        ),
+        vec!["the row starting \"| `devflow start\" lacks \"--fallback-agent\"".to_string()],
+        "planted control: a start row lacking the flag is reported, and only it, even when \
+         a later row carries the flag"
+    );
+    assert_eq!(
+        row_findings(
+            planted_table,
+            &[("| `cron-instructions-NN.json`", "fallback")]
+        ),
+        vec!["no row starts with \"| `cron-instructions-NN.json`\"".to_string()],
+        "planted control: a missing row is reported"
+    );
+    let every_event = FAILOVER_EVENT_FRAGMENTS.join("\n");
+    assert_eq!(
+        missing_fragments(
+            &every_event.replace("tree_dirty", ""),
+            FAILOVER_EVENT_FRAGMENTS
+        ),
+        vec!["tree_dirty"],
+        "planted control: a text missing only tree_dirty must report exactly tree_dirty"
+    );
+    let flag_only_in_a_comment = "| `devflow resume --phase N <!-- --fallback-agent -->` |";
+    assert!(
+        row_findings(
+            flag_only_in_a_comment,
+            &[("| `devflow resume", "--fallback-agent")]
+        )
+        .is_empty(),
+        "planted control: before stripping, the commented flag still counts"
+    );
+    assert_eq!(
+        row_findings(
+            &strip_html_comments(flag_only_in_a_comment),
+            &[("| `devflow resume", "--fallback-agent")],
+        ),
+        vec!["the row starting \"| `devflow resume\" lacks \"--fallback-agent\"".to_string()],
+        "planted control: a flag only inside an HTML comment must be missing after stripping"
+    );
+
+    let operations = read_doc("OPERATIONS.md");
+    let mut findings = row_findings(&operations, FALLBACK_ROW_FRAGMENTS);
+    findings.extend(
+        missing_fragments(&operations, FAILOVER_EVENT_FRAGMENTS)
+            .into_iter()
+            .map(|fragment| format!("OPERATIONS.md does not name {fragment:?}")),
+    );
+    for &(relative, fragment) in FALLBACK_GUIDE_FRAGMENTS {
+        if !read_doc(relative).contains(fragment) {
+            findings.push(format!("{relative} does not name {fragment:?}"));
+        }
+    }
+    assert!(
+        findings.is_empty(),
+        "the operator docs do not document the fallback agent; outside HTML comments:\n{}",
+        findings.join("\n")
+    );
+}
+
 /// The lines of `text` from the line equal to `heading` up to, not
 /// including, the next line starting with `## `, or to the end. `None` when no
 /// line equals `heading`.
@@ -944,5 +1069,1101 @@ fn docs_describe_the_socket_supervisor_not_the_shell_monitor() {
     assert!(
         !mentions_shell_monitor(&unattended),
         "docs/guides/unattended-mode.md still describes a shell monitor or shell script"
+    );
+}
+
+/// The helper removed with the rebase handoff (D-14), assembled from pieces
+/// so this file's code never holds it contiguously.
+const REMOVED_HELPER: &str = concat!("rebase", "_in");
+
+/// The removed verb's long spelling, assembled the same way.
+const REMOVED_VERB: &str = concat!("sequent", "agent");
+
+/// Both spellings criterion 4 names for the removed verb.
+const REMOVED_VERB_SPELLINGS: [&str; 2] = [REMOVED_VERB, "n"];
+
+/// The `#[command(...)]` keys whose value is a name the subcommand answers to.
+const COMMAND_NAME_KEYS: &[&str] = &[
+    "name",
+    "alias",
+    "visible_alias",
+    "aliases",
+    "visible_aliases",
+];
+
+/// The literal starting at `chars[start]`, as `(opening delimiter length, end
+/// index exclusive, closing delimiter length)`: a `"…"` string (with `\`
+/// escapes), an `r"…"` / `r#"…"#` raw string, or a char literal such as
+/// `'"'` or `'\''`. A lifetime or label (`'a`) is not a literal.
+fn literal_at(chars: &[char], start: usize) -> Option<(usize, usize, usize)> {
+    let at = |index: usize| chars.get(index).copied();
+    match chars[start] {
+        '"' => {
+            let mut index = start + 1;
+            while index < chars.len() {
+                match chars[index] {
+                    '\\' => index += 2,
+                    '"' => return Some((1, index + 1, 1)),
+                    _ => index += 1,
+                }
+            }
+            Some((1, chars.len(), 0))
+        }
+        'r' => {
+            let starts_token = |index: usize| index == 0 || !is_identifier_char(chars[index - 1]);
+            let byte_prefixed = start > 0 && chars[start - 1] == 'b' && starts_token(start - 1);
+            if !starts_token(start) && !byte_prefixed {
+                return None;
+            }
+            let hashes = chars[start + 1..]
+                .iter()
+                .take_while(|&&ch| ch == '#')
+                .count();
+            if at(start + 1 + hashes) != Some('"') {
+                return None;
+            }
+            let open = 2 + hashes;
+            let mut index = start + open;
+            while index < chars.len() {
+                if chars[index] == '"'
+                    && chars[index + 1..]
+                        .iter()
+                        .take(hashes)
+                        .filter(|&&ch| ch == '#')
+                        .count()
+                        == hashes
+                {
+                    return Some((open, index + 1 + hashes, 1 + hashes));
+                }
+                index += 1;
+            }
+            Some((open, chars.len(), 0))
+        }
+        '\'' => match at(start + 1) {
+            Some('\\') => {
+                let close = chars[start + 3..]
+                    .iter()
+                    .position(|&ch| ch == '\'')
+                    .map(|offset| start + 3 + offset)?;
+                Some((1, close + 1, 1))
+            }
+            Some(ch) if ch != '\'' && at(start + 2) == Some('\'') => Some((1, start + 3, 1)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The end (exclusive) of the block comment opening at `chars[start]`.
+/// Rust block comments nest; an unterminated one runs to the end.
+fn block_comment_end(chars: &[char], start: usize) -> usize {
+    let mut depth = 0_usize;
+    let mut index = start;
+    while index < chars.len() {
+        match (chars[index], chars.get(index + 1)) {
+            ('/', Some('*')) => {
+                depth += 1;
+                index += 2;
+            }
+            ('*', Some('/')) => {
+                depth -= 1;
+                index += 2;
+                if depth == 0 {
+                    return index;
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    chars.len()
+}
+
+/// One pass over Rust source that recognises comments and literals. Comments
+/// are dropped when `drop_comments` (a block comment leaves a space and its
+/// newlines); literal contents are blanked when `blank_literals`, each char
+/// replaced by spaces of the same byte length so offsets still line up with
+/// the input. Newlines always survive.
+fn rewrite_rust(text: &str, drop_comments: bool, blank_literals: bool) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut index = 0;
+    while index < chars.len() {
+        let next = chars.get(index + 1).copied();
+        if chars[index] == '/' && next == Some('/') {
+            let end = chars[index..]
+                .iter()
+                .position(|&ch| ch == '\n')
+                .map_or(chars.len(), |offset| index + offset);
+            if !drop_comments {
+                out.extend(&chars[index..end]);
+            }
+            index = end;
+        } else if chars[index] == '/' && next == Some('*') {
+            let end = block_comment_end(&chars, index);
+            if drop_comments {
+                out.push(' ');
+                out.extend(chars[index..end].iter().filter(|&&ch| ch == '\n'));
+            } else {
+                out.extend(&chars[index..end]);
+            }
+            index = end;
+        } else if let Some((open, end, close)) = literal_at(&chars, index) {
+            out.extend(&chars[index..index + open]);
+            for &ch in &chars[index + open..end - close] {
+                if !blank_literals || ch == '\n' {
+                    out.push(ch);
+                } else {
+                    out.extend(std::iter::repeat_n(' ', ch.len_utf8()));
+                }
+            }
+            out.extend(&chars[end - close..end]);
+            index = end;
+        } else {
+            out.push(chars[index]);
+            index += 1;
+        }
+    }
+    out
+}
+
+/// `text` with every `//` line comment (doc comments included) and every
+/// `/* … */` block comment removed. String and char literals are kept whole,
+/// so a `//` inside one is not a comment. Newlines survive, so line numbers
+/// still match the input.
+fn strip_rust_comments(text: &str) -> String {
+    rewrite_rust(text, true, false)
+}
+
+/// `text` with the contents of every string and char literal blanked, so a
+/// quoted spelling never counts as code. Byte offsets match the input, so a
+/// position found here slices the same span of `text`.
+fn strip_string_literal_contents(text: &str) -> String {
+    rewrite_rust(text, false, true)
+}
+
+/// Comment-stripped `text` and its literal-blanked twin, byte-aligned.
+fn code_and_mask(text: &str) -> (String, String) {
+    let code = strip_rust_comments(text);
+    let mask = strip_string_literal_contents(&code);
+    (code, mask)
+}
+
+/// The 1-based line holding byte `index` of `text`.
+fn line_at(text: &str, index: usize) -> usize {
+    text[..index].matches('\n').count() + 1
+}
+
+/// The index of the delimiter matching the opener at `bytes[open]`, counting
+/// every `(`, `[` and `{` pair. Run over literal-blanked text, so a delimiter
+/// inside a literal is never counted.
+fn matching_close(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0_usize;
+    for (index, &byte) in bytes.iter().enumerate().skip(open) {
+        match byte {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The `[start, end)` ranges of `mask[start..end]` split at `separator`
+/// bytes that sit outside any `()`, `[]` or `{}` nesting.
+fn split_top_level(mask: &str, start: usize, end: usize, separator: u8) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut depth = 0_usize;
+    let mut piece = start;
+    for (index, &byte) in mask.as_bytes()[start..end].iter().enumerate() {
+        let index = start + index;
+        match byte {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            byte if byte == separator && depth == 0 => {
+                ranges.push((piece, index));
+                piece = index + 1;
+            }
+            _ => {}
+        }
+    }
+    ranges.push((piece, end));
+    ranges
+}
+
+/// The outer attributes (`#[…]`, as written in `mask`) directly before the
+/// item whose keyword starts at `item_start`, after any visibility.
+fn outer_attributes_before(mask: &str, item_start: usize) -> Vec<&str> {
+    let mut rest = mask[..item_start].trim_end();
+    if rest.ends_with(')') {
+        let bytes = rest.as_bytes();
+        let open = (0..bytes.len()).rev().find(|&index| {
+            bytes[index] == b'(' && matching_close(bytes, index) == Some(bytes.len() - 1)
+        });
+        if let Some(open) = open
+            && rest[..open].trim_end().ends_with("pub")
+        {
+            rest = rest[..open].trim_end();
+        }
+    }
+    if let Some(before) = rest.strip_suffix("pub")
+        && before
+            .chars()
+            .next_back()
+            .is_none_or(|ch| !is_identifier_char(ch))
+    {
+        rest = before.trim_end();
+    }
+    let mut attributes = Vec::new();
+    while rest.ends_with(']') {
+        let bytes = rest.as_bytes();
+        let Some(open) = (0..bytes.len()).rev().find(|&index| {
+            bytes[index] == b'[' && matching_close(bytes, index) == Some(bytes.len() - 1)
+        }) else {
+            break;
+        };
+        let before = rest[..open].trim_end();
+        let Some(hash) = before.strip_suffix('#') else {
+            break;
+        };
+        attributes.push(&rest[hash.len()..]);
+        rest = hash.trim_end();
+    }
+    attributes
+}
+
+/// True when `attribute` (`#[…]`) is a `derive(…)` list naming `Subcommand`,
+/// bare or path-qualified.
+fn derives_subcommand(attribute: &str) -> bool {
+    let body = attribute
+        .trim_start_matches('#')
+        .trim_start()
+        .trim_start_matches('[')
+        .trim_start();
+    body.strip_prefix("derive")
+        .map(str::trim_start)
+        .and_then(|rest| rest.strip_prefix('('))
+        .is_some_and(|list| {
+            list.trim_end_matches(']')
+                .trim_end()
+                .trim_end_matches(')')
+                .split(',')
+                .any(|item| item.trim().rsplit("::").next() == Some("Subcommand"))
+        })
+}
+
+/// The variants directly inside the enum body opening at `mask[open]`, as
+/// `(name as written, line)`. Attributes, fields and discriminants nest
+/// deeper and are skipped.
+fn enum_body_variants(mask: &str, open: usize) -> Vec<(String, usize)> {
+    let bytes = mask.as_bytes();
+    let mut variants = Vec::new();
+    let mut depth = 0_usize;
+    let mut expect_variant = true;
+    let mut index = open + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+            }
+            b',' if depth == 0 => expect_variant = true,
+            byte if depth == 0
+                && expect_variant
+                && (byte.is_ascii_alphabetic() || byte == b'_') =>
+            {
+                let end = mask[index..]
+                    .find(|ch: char| !is_identifier_char(ch))
+                    .map_or(mask.len(), |offset| index + offset);
+                variants.push((mask[index..end].to_owned(), line_at(mask, index)));
+                expect_variant = false;
+                index = end;
+                continue;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    variants
+}
+
+/// Every enum in `mask` (comment-stripped, literal-blanked) whose outer
+/// attributes derive `Subcommand`, as `(name, variants)`.
+fn subcommand_enums(mask: &str) -> Vec<(String, Vec<(String, usize)>)> {
+    let mut enums = Vec::new();
+    for (start, _) in mask.match_indices("enum") {
+        let before = mask[..start].chars().next_back();
+        let rest = &mask[start + "enum".len()..];
+        if before.is_some_and(is_identifier_char) || !rest.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let name_start = start + "enum".len() + (rest.len() - rest.trim_start().len());
+        let name: String = mask[name_start..]
+            .chars()
+            .take_while(|&ch| is_identifier_char(ch))
+            .collect();
+        let Some(open) = mask[name_start..]
+            .find('{')
+            .map(|offset| name_start + offset)
+        else {
+            continue;
+        };
+        if name.is_empty()
+            || mask[name_start + name.len()..open].contains(';')
+            || !outer_attributes_before(mask, start)
+                .into_iter()
+                .any(derives_subcommand)
+        {
+            continue;
+        }
+        enums.push((name, enum_body_variants(mask, open)));
+    }
+    enums
+}
+
+/// The lowercased name of every enum in `source` that derives `Subcommand`.
+fn subcommand_enum_names(source: &str) -> Vec<String> {
+    let (_, mask) = code_and_mask(source);
+    subcommand_enums(&mask)
+        .into_iter()
+        .map(|(name, _)| name.to_ascii_lowercase())
+        .collect()
+}
+
+/// Every identifier-boundary use of the removed helper (definition or call)
+/// in comment-stripped, literal-blanked code.
+fn rebase_in_findings(files: &[(PathBuf, String)]) -> Vec<String> {
+    let token = REMOVED_HELPER;
+    let mut findings = Vec::new();
+    for (path, text) in files {
+        let (_, mask) = code_and_mask(text);
+        for (index, _) in mask.match_indices(token) {
+            let before = mask[..index].chars().next_back();
+            let after = mask[index + token.len()..].chars().next();
+            if before.is_none_or(|ch| !is_identifier_char(ch))
+                && after.is_none_or(|ch| !is_identifier_char(ch))
+            {
+                findings.push(format!(
+                    "{}:{}: `{token}` in code",
+                    path.display(),
+                    line_at(&mask, index)
+                ));
+            }
+        }
+    }
+    findings
+}
+
+/// Every `Subcommand` enum variant whose lowercased name is a removed spelling.
+fn removed_verb_findings(cli_files: &[(PathBuf, String)]) -> Vec<String> {
+    let mut findings = Vec::new();
+    for (path, text) in cli_files {
+        let (_, mask) = code_and_mask(text);
+        for (enum_name, variants) in subcommand_enums(&mask) {
+            for (variant, line) in variants {
+                let lowered = variant.to_ascii_lowercase();
+                if REMOVED_VERB_SPELLINGS.contains(&lowered.as_str()) {
+                    findings.push(format!(
+                        "{}:{line}: subcommand variant `{enum_name}::{variant}`",
+                        path.display()
+                    ));
+                }
+            }
+        }
+    }
+    findings
+}
+
+/// The contents of `value` when it is one whole string literal (`"…"` or a
+/// raw `r#"…"#`), else `None`.
+fn string_literal_value(value: &str) -> Option<&str> {
+    let unprefixed = value.strip_prefix('r').unwrap_or(value);
+    let hashes = unprefixed.len() - unprefixed.trim_start_matches('#').len();
+    let closing = "#".repeat(hashes);
+    unprefixed[hashes..]
+        .strip_suffix(closing.as_str())?
+        .strip_prefix('"')?
+        .strip_suffix('"')
+}
+
+/// The byte index just past `#[command(` when one opens at `mask[start]`,
+/// whitespace tolerated between the tokens.
+fn command_attribute_body_start(mask: &str, start: usize) -> Option<usize> {
+    let after_hash = mask[start..].strip_prefix('#')?.trim_start();
+    let after_bracket = after_hash.strip_prefix('[')?.trim_start();
+    let after_name = after_bracket.strip_prefix("command")?;
+    if after_name.starts_with(is_identifier_char) {
+        return None;
+    }
+    let after_paren = after_name.trim_start().strip_prefix('(')?;
+    Some(mask.len() - after_paren.len())
+}
+
+/// Every `#[command(...)]` attribute whose `name` or alias value equals a
+/// removed spelling: a string value, or one element of a bracketed list,
+/// compared whole after unquoting, never by substring. The body may span
+/// lines; the finding names the line the attribute opens on. `#[arg(...)]`
+/// is not a command name and is not read.
+fn removed_verb_attr_findings(cli_files: &[(PathBuf, String)]) -> Vec<String> {
+    let mut findings = Vec::new();
+    for (path, text) in cli_files {
+        let (code, mask) = code_and_mask(text);
+        for (start, _) in mask.match_indices('#') {
+            let Some(body_start) = command_attribute_body_start(&mask, start) else {
+                continue;
+            };
+            let Some(body_end) = matching_close(mask.as_bytes(), body_start - 1) else {
+                continue;
+            };
+            for (pair_start, pair_end) in split_top_level(&mask, body_start, body_end, b',') {
+                let Some(equals) = mask[pair_start..pair_end]
+                    .find('=')
+                    .map(|at| pair_start + at)
+                else {
+                    continue;
+                };
+                let key = mask[pair_start..equals].trim();
+                if !COMMAND_NAME_KEYS.contains(&key) {
+                    continue;
+                }
+                let value_mask = &mask[equals + 1..pair_end];
+                let value_start = equals + 1 + (value_mask.len() - value_mask.trim_start().len());
+                let value_end = equals + 1 + value_mask.trim_end().len();
+                let elements = if mask[value_start..value_end].starts_with('[')
+                    && mask[value_start..value_end].ends_with(']')
+                {
+                    split_top_level(&mask, value_start + 1, value_end - 1, b',')
+                } else {
+                    vec![(value_start, value_end)]
+                };
+                for (element_start, element_end) in elements {
+                    let Some(value) = string_literal_value(code[element_start..element_end].trim())
+                    else {
+                        continue;
+                    };
+                    if REMOVED_VERB_SPELLINGS.contains(&value) {
+                        findings.push(format!(
+                            "{}:{}: `#[command({key} = …)]` names removed verb `{value}`",
+                            path.display(),
+                            line_at(&mask, start)
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    findings
+}
+
+/// All three checks: the helper over every crate source, the verb over the
+/// CLI sources.
+fn removed_handoff_findings(
+    files: &[(PathBuf, String)],
+    cli_files: &[(PathBuf, String)],
+) -> Vec<String> {
+    let mut findings = rebase_in_findings(files);
+    findings.extend(removed_verb_findings(cli_files));
+    findings.extend(removed_verb_attr_findings(cli_files));
+    findings
+}
+
+/// Criterion 4 (D-14): the rebase handoff removed from issue #180 stays dead.
+///
+/// History: the removed verb was `Command::Sequentagent` (dbab01a), and the
+/// helper was `GitFlow::rebase_in` (0833a6c). No `n` verb ever existed under
+/// that spelling (`git log -G` finds none), but criterion 4 names it, so both
+/// readings are covered.
+///
+/// The scan reads declarations, not free text: a variant of any enum that
+/// derives `Subcommand`, and the `name` and alias keys of any
+/// `#[command(...)]` attribute, compared whole against each spelling. Free
+/// text would count the doc comments and messages that legitimately mention
+/// the history, this one included. Comments are stripped before any count, so
+/// this doc comment may name the tokens.
+#[test]
+fn the_removed_sequentagent_handoff_stays_dead() {
+    let helper = REMOVED_HELPER;
+    let verb = REMOVED_VERB;
+    let capital_verb = format!("S{}", &verb[1..]);
+    let command = "Command";
+    let planted = |text: &str| vec![(PathBuf::from("planted.rs"), text.to_owned())];
+    let findings = |text: &str| removed_handoff_findings(&planted(text), &planted(text));
+
+    // Planted positives: exactly one finding each.
+    for positive in [
+        format!("fn {helper}(base: &str) {{}}"),
+        format!("    git.{helper}(base)?;"),
+        format!(
+            "#[derive(Debug, Subcommand)]\nenum {command} {{ {capital_verb} {{ phase: u32 }}, Start }}"
+        ),
+        format!("#[derive(Debug, Subcommand)]\nenum {command} {{ N, Start }}"),
+        format!(
+            "#[derive(Subcommand)]\nenum {command} {{ #[command(name = \"{verb}\")] Handoff, Start }}"
+        ),
+        "#[command(alias = \"n\")]\nStart,".to_owned(),
+        // Every other declaration route, both spellings.
+        "#[command(alias=\"n\")]\nStart,".to_owned(),
+        "#[command(visible_alias = \"n\")]\nStart,".to_owned(),
+        "#[command(name = \"n\")]\nStart,".to_owned(),
+        "#[command(aliases = [\"x\", \"n\"])]\nStart,".to_owned(),
+        "#[command(aliases = [\"nn\", \"n\"])]\nStart,".to_owned(),
+        format!("#[command(alias = \"{verb}\")]\nStart,"),
+        format!("#[command(visible_aliases = [\"{verb}\"])]\nStart,"),
+        // A second subcommand enum: the scan is not limited to `Command`.
+        "#[derive(Debug, Subcommand)]\nenum GateCmd { List, N }".to_owned(),
+        // A `//` inside a literal is not a comment, so the call after it counts.
+        format!("let s = \"// x\"; git.{helper}(base)?;"),
+    ] {
+        let found = findings(&positive);
+        assert_eq!(
+            found.len(),
+            1,
+            "planted positive {positive:?} gave {found:?}"
+        );
+    }
+
+    // Planted decoys: no finding.
+    for decoy in [
+        format!("/// {helper}"),
+        format!("x(); // {helper}"),
+        format!("/* {helper} */"),
+        format!("assert!(!s.contains(\"{verb}\"));"),
+        "let hint = \"git rebase origin/develop\";".to_owned(),
+        "#[derive(Debug)]\nenum Axis { N, S }".to_owned(),
+        "#[arg(short = 'n')]\nforce: bool,".to_owned(),
+        "#[arg(name = \"n\")]\ncount: u32,".to_owned(),
+        format!("let s = \"// {helper}\"; let t = s.len();"),
+        format!("/* multi-line\n {helper}\n */\nfn kept() {{}}"),
+        // Exact element equality: a value or element that merely contains a
+        // spelling is not that spelling.
+        format!(
+            "#[derive(Debug, Subcommand)]\nenum {command} {{\n    #[command(name = \"__monitor\", hide = true)]\n    Monitor,\n    Start,\n}}"
+        ),
+        "#[command(alias = \"nx\")]\nStart,".to_owned(),
+        "#[command(aliases = [\"nn\", \"x\"])]\nStart,".to_owned(),
+        format!("#[command(name = \"{verb}-old\")]\nStart,"),
+    ] {
+        let found = findings(&decoy);
+        assert!(found.is_empty(), "planted decoy {decoy:?} gave {found:?}");
+    }
+
+    // A variant and an attribute in one enum: two findings.
+    let combined = format!(
+        "#[derive(Subcommand)]\nenum {command} {{ N, #[command(name = \"{verb}\")] Handoff }}"
+    );
+    let found = findings(&combined);
+    assert_eq!(found.len(), 2, "combined enum gave {found:?}");
+
+    // Multi-line attributes (the real `#[command(` shape): one finding each,
+    // reported at the line the attribute opens on.
+    for multi_line in [
+        "Start,\n#[command(\n    alias = \"n\",\n)]\nProbe,".to_owned(),
+        format!("Start,\n#[command(\n    name = \"{verb}\",\n    about = \"x\"\n)]\nProbe,"),
+    ] {
+        let found = findings(&multi_line);
+        assert_eq!(found.len(), 1, "multi-line {multi_line:?} gave {found:?}");
+        assert!(
+            found[0].starts_with("planted.rs:2:"),
+            "multi-line {multi_line:?} reported the wrong line: {found:?}"
+        );
+    }
+
+    // The stripper keeps a `//` inside a literal and drops a trailing comment.
+    let url = strip_rust_comments("let u = \"https://example.invalid\";");
+    assert!(url.contains("\"https://example.invalid\""), "{url:?}");
+    let trailing = strip_rust_comments("let a = 1; // note");
+    assert!(
+        trailing.contains("let a = 1;") && !trailing.contains("note"),
+        "{trailing:?}"
+    );
+
+    // The real tree: every crate source, and every subcommand enum in the CLI.
+    let files = read_labelled(rust_file_paths());
+    assert!(
+        !files.is_empty(),
+        "the walker must find Rust sources under crates/"
+    );
+    let cli_root = workspace_root().join("crates/devflow-cli/src");
+    let cli_files: Vec<_> = files
+        .iter()
+        .filter(|(path, _)| path.starts_with(&cli_root))
+        .cloned()
+        .collect();
+    assert!(
+        !cli_files.is_empty(),
+        "the walker must find Rust sources under crates/devflow-cli/src/"
+    );
+    let enum_names: Vec<String> = cli_files
+        .iter()
+        .flat_map(|(_, text)| subcommand_enum_names(text))
+        .collect();
+    for expected in ["command", "gatecmd"] {
+        assert!(
+            enum_names.iter().any(|name| name == expected),
+            "the subcommand-enum finder missed `{expected}`: {enum_names:?}"
+        );
+    }
+    let command_variants: usize = cli_files
+        .iter()
+        .flat_map(|(_, text)| subcommand_enums(&code_and_mask(text).1))
+        .filter(|(name, _)| name == command)
+        .map(|(_, variants)| variants.len())
+        .sum();
+    assert!(
+        command_variants > 5,
+        "only {command_variants} `Command` variants were read"
+    );
+
+    let found = removed_handoff_findings(&files, &cli_files);
+    assert!(
+        found.is_empty(),
+        "the removed rebase handoff is back (D-14):\n{}",
+        found.join("\n")
+    );
+}
+
+/// The word the R-3 scan looks for, split so this file's own needle is not
+/// an env-shaped literal the scan would report (R2-11).
+const FALLBACK_WORD: &str = concat!("FALL", "BACK");
+
+/// True when `text` is an environment-variable-shaped name: an ASCII
+/// uppercase letter, then only ASCII uppercase letters, digits and `_`.
+fn is_env_shaped(text: &str) -> bool {
+    let mut chars = text.chars();
+    chars.next().is_some_and(|ch| ch.is_ascii_uppercase())
+        && chars.all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+}
+
+/// Every string literal in the comment-stripped `sources` whose whole content
+/// is environment-variable-shaped and contains `FALLBACK`, as
+/// `path:line: "NAME"` (R-3). Char literals are skipped.
+fn fallback_env_name_findings(sources: &[(PathBuf, String)]) -> Vec<String> {
+    let mut findings = Vec::new();
+    for (path, text) in sources {
+        let code: Vec<char> = strip_rust_comments(text).chars().collect();
+        let mut line = 1;
+        let mut index = 0;
+        while index < code.len() {
+            // A char literal is skipped whole, so a `'"'` never opens a string.
+            let string_start = matches!(code[index], '"' | 'r');
+            match literal_at(&code, index) {
+                Some((open, end, close)) => {
+                    let content: String = code[index + open..end - close].iter().collect();
+                    if string_start && is_env_shaped(&content) && content.contains(FALLBACK_WORD) {
+                        findings.push(format!("{}:{line}: \"{content}\"", path.display()));
+                    }
+                    line += code[index..end].iter().filter(|&&ch| ch == '\n').count();
+                    index = end;
+                }
+                None => {
+                    if code[index] == '\n' {
+                        line += 1;
+                    }
+                    index += 1;
+                }
+            }
+        }
+    }
+    findings
+}
+
+/// A planted `DEVFLOW_`-prefixed name containing FALLBACK, split inside the
+/// word so this file never holds an env-shaped piece containing it (R2-11).
+const PLANTED_PREFIXED_NAME: &str = concat!("DEVFLOW_X_FALL", "BACK_AGENT");
+
+/// A planted unprefixed name containing FALLBACK, split the same way.
+const PLANTED_UNPREFIXED_NAME: &str = concat!("X_FALL", "BACK_MODE");
+
+/// R-3 (Phase 51): no environment variable selects the fallback agent. Over
+/// the comment-stripped source of every `.rs` file under `crates/` (tests
+/// included), no string literal is an environment-variable-shaped name (an
+/// ASCII uppercase letter, then only uppercase letters, digits and `_`)
+/// containing `FALLBACK`, whatever its prefix. Matching literals rather than
+/// call sites reaches a name held in a `const` and passed by identifier, the
+/// form most of this tree's environment reads use; `source_read_env_vars`
+/// sees only `DEVFLOW_` names written at the call.
+///
+/// Limit: a name assembled at runtime (`format!`, `concat!`) is not seen;
+/// this test's own planted names are built that way so the real-tree pass
+/// cannot report them.
+#[test]
+fn no_environment_variable_selects_the_fallback_agent() {
+    let planted = |text: String| vec![(PathBuf::from("planted.rs"), text)];
+
+    // Planted controls: a prefixed name read by literal, and an unprefixed
+    // name held in a `const` and read through it, are each reported once.
+    let by_literal = format!("fn f() {{ let _ = std::env::var(\"{PLANTED_PREFIXED_NAME}\"); }}\n");
+    assert_eq!(
+        fallback_env_name_findings(&planted(by_literal)).len(),
+        1,
+        "a literal read of a FALLBACK name is reported"
+    );
+    let by_const = format!(
+        "const E: &str = \"{PLANTED_UNPREFIXED_NAME}\";\nfn f() {{ let _ = std::env::var_os(E); }}\n"
+    );
+    let found = fallback_env_name_findings(&planted(by_const));
+    assert_eq!(
+        found.len(),
+        1,
+        "a const-held FALLBACK name is reported: {found:?}"
+    );
+    assert!(
+        found[0].contains("planted.rs:1"),
+        "a finding names the file and line: {found:?}"
+    );
+
+    // Decoys: the lowercase TOML key, `ship.rs`'s `FALLBACK` identifier, and
+    // a quoted name inside a `//` comment are not reported.
+    for decoy in [
+        "fn f() { let key = \"fallback_agent\"; }\n".to_string(),
+        "const FALLBACK: &str = \"- No changes recorded.\";\n".to_string(),
+        format!("// let _ = std::env::var(\"{PLANTED_PREFIXED_NAME}\");\nfn f() {{}}\n"),
+    ] {
+        assert!(
+            fallback_env_name_findings(&planted(decoy.clone())).is_empty(),
+            "decoy reported: {decoy}"
+        );
+    }
+
+    // R2-11 self-check: this file's own pieces are not findings, so the
+    // real-tree assertion below cannot be failed by this test.
+    let this_file = workspace_root().join("crates/devflow-core/src/doc_check.rs");
+    let own = fallback_env_name_findings(&read_labelled(vec![this_file]));
+    assert!(own.is_empty(), "doc_check.rs reports itself: {own:?}");
+
+    let sources = read_labelled(rust_file_paths());
+    assert!(
+        sources.len() > 1,
+        "the walker read {} Rust sources",
+        sources.len()
+    );
+    let found = fallback_env_name_findings(&sources);
+    assert!(
+        found.is_empty(),
+        "an environment-variable name containing FALLBACK exists (R-3):\n{}",
+        found.join("\n")
+    );
+}
+
+/// A call of the notify-strip helper, assembled from pieces so this file never
+/// holds the call text contiguously and the scan below cannot report itself.
+const STRIP_NOTIFY_CALL: &str = concat!("strip_notify", "_env(");
+
+/// True when `line`'s first non-blank text opens a `mod tests {` block.
+fn opens_test_module(line: &str) -> bool {
+    line.trim_start().starts_with("mod tests {")
+}
+
+/// The name of the first `fn <name>` item declared on `line`, if any: `fn`
+/// as a whole word, then an identifier followed by `(` or `<`.
+fn declared_fn_name(line: &str) -> Option<&str> {
+    line.match_indices("fn ").find_map(|(start, _)| {
+        let word_start = line[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|ch| !is_identifier_char(ch));
+        let rest = &line[start + 3..];
+        let end = rest.find(|ch: char| !is_identifier_char(ch))?;
+        let after = rest[end..].chars().next();
+        (word_start && end > 0 && matches!(after, Some('(' | '<'))).then_some(&rest[..end])
+    })
+}
+
+/// Every call of the notify-strip helper outside test code, as (enclosing fn,
+/// `path:line`). Comments and string-literal contents are blanked first; the
+/// definition is not a call, and nothing from a file's first `mod tests {`
+/// line on is read. Each call is attributed to the nearest preceding
+/// `fn <name>` line.
+fn strip_notify_call_sites(files: &[(PathBuf, String)]) -> Vec<(String, String)> {
+    let mut sites = Vec::new();
+    for (path, text) in files {
+        let code = rewrite_rust(text, true, true);
+        let mut enclosing: Option<&str> = None;
+        for (index, line) in code.lines().enumerate() {
+            if opens_test_module(line) {
+                break;
+            }
+            if let Some(name) = declared_fn_name(line) {
+                enclosing = Some(name);
+            }
+            let calls = line.match_indices(STRIP_NOTIFY_CALL).any(|(start, _)| {
+                let before = &line[..start];
+                !before.ends_with("fn ")
+                    && before
+                        .chars()
+                        .next_back()
+                        .is_none_or(|ch| !is_identifier_char(ch))
+            });
+            if calls {
+                let name = enclosing.unwrap_or("<no enclosing fn>").to_string();
+                sites.push((name, format!("{}:{}", path.display(), index + 1)));
+            }
+        }
+    }
+    sites
+}
+
+/// The `///` comment directly above the first line `is_item` accepts, attribute
+/// lines skipped, as its lines in source order (the `///` prefix removed).
+/// `None` when no line is accepted.
+fn doc_comment_above(text: &str, is_item: impl Fn(&str) -> bool) -> Option<Vec<String>> {
+    let lines: Vec<&str> = text.lines().collect();
+    let item = lines.iter().position(|line| is_item(line))?;
+    let mut doc = Vec::new();
+    for line in lines[..item].iter().rev() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("#[") {
+            continue;
+        }
+        match trimmed.strip_prefix("///") {
+            Some(body) => doc.push(body.to_string()),
+            None => break,
+        }
+    }
+    doc.reverse();
+    Some(doc)
+}
+
+/// The backticked names on the `Called from` line of the doc comment above the
+/// notify-strip helper's definition, or `None` when there is no definition or
+/// no such line.
+fn called_from_names(files: &[(PathBuf, String)]) -> Option<Vec<String>> {
+    let definition = ["fn ", STRIP_NOTIFY_CALL].concat();
+    let doc = files
+        .iter()
+        .find_map(|(_, text)| doc_comment_above(text, |line| line.contains(&definition)))?;
+    let line = doc.iter().find(|line| line.contains("Called from"))?;
+    Some(
+        line.split('`')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+/// Where the helper's `Called from` line and its real callers disagree: a
+/// caller the line does not name, a name on the line that is not a caller, or
+/// no `Called from` line at all.
+fn call_site_doc_findings(files: &[(PathBuf, String)]) -> Vec<String> {
+    let sites = strip_notify_call_sites(files);
+    let Some(named) = called_from_names(files) else {
+        return vec!["no `Called from` line in the doc comment above the definition".to_string()];
+    };
+    let mut findings = Vec::new();
+    for (caller, location) in &sites {
+        if !named.contains(caller) {
+            findings.push(format!(
+                "`{caller}` ({location}) calls it, but the Called from line does not name it"
+            ));
+        }
+    }
+    for name in &named {
+        if !sites.iter().any(|(caller, _)| caller == name) {
+            findings.push(format!(
+                "the Called from line names `{name}`, which is not a caller outside test code"
+            ));
+        }
+    }
+    findings
+}
+
+/// The notify-strip helper's doc comment names exactly the functions that call
+/// it outside test code, so a new spawn path that strips the variable (or one
+/// that stops) fails here until the comment says so. Planted controls run
+/// through the same helper.
+#[test]
+fn strip_notify_env_doc_names_exactly_its_call_sites() {
+    let planted = |text: String| vec![(PathBuf::from("planted.rs"), text)];
+    let definition = |called_from: &str| {
+        [
+            "/// Strips the variable.\n/// Called from ",
+            called_from,
+            ".\npub(crate) fn ",
+            STRIP_NOTIFY_CALL,
+            "cmd: &mut Command) {}\n",
+        ]
+        .concat()
+    };
+    let caller = |name: &str| {
+        [
+            "fn ",
+            name,
+            "() {\n    ",
+            STRIP_NOTIFY_CALL,
+            "&mut c);\n}\n",
+        ]
+        .concat()
+    };
+
+    // An extra call site is reported as unnamed; this also proves the
+    // assembled needle matches real call text.
+    let extra = [
+        definition("`real_site`"),
+        caller("real_site"),
+        caller("extra_site"),
+    ]
+    .concat();
+    let found = call_site_doc_findings(&planted(extra));
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains("`extra_site`"), "{found:?}");
+
+    // A name that does not call it is reported as a non-caller.
+    let stale = [
+        definition("`real_site` and `not_a_caller`"),
+        caller("real_site"),
+    ]
+    .concat();
+    let found = call_site_doc_findings(&planted(stale));
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains("`not_a_caller`"), "{found:?}");
+
+    // A call inside a `mod tests {` block is not a call site.
+    let in_tests = [
+        definition("`real_site`"),
+        caller("real_site"),
+        "#[cfg(test)]\nmod tests {\n".to_string(),
+        caller("a_test"),
+        "}\n".to_string(),
+    ]
+    .concat();
+    let found = call_site_doc_findings(&planted(in_tests));
+    assert!(found.is_empty(), "{found:?}");
+
+    // A comment with no `Called from` line is reported.
+    let unlisted = [
+        "/// Strips the variable.\npub(crate) fn ",
+        STRIP_NOTIFY_CALL,
+        "cmd: &mut Command) {}\n",
+    ]
+    .concat();
+    assert_eq!(call_site_doc_findings(&planted(unlisted)).len(), 1);
+
+    // The real scan: every Rust file under crates/devflow-core/src (the helper
+    // is `pub(crate)`).
+    let core_src = workspace_root().join("crates/devflow-core/src");
+    let files = read_labelled(
+        rust_file_paths()
+            .into_iter()
+            .filter(|path| path.starts_with(&core_src))
+            .collect(),
+    );
+    assert!(
+        files.len() > 1,
+        "the walker read {} core sources",
+        files.len()
+    );
+    let sites = strip_notify_call_sites(&files);
+    assert!(!sites.is_empty(), "the scan must find the real call sites");
+    let found = call_site_doc_findings(&files);
+    assert!(
+        found.is_empty(),
+        "the notify-strip helper's Called from line does not match its call sites {sites:?}:\n{}",
+        found.join("\n")
+    );
+}
+
+/// The tests `gate_notify_cmd`'s doc comment must cite: they pin the `resume`
+/// and `advance` arms that keep the saved command when the variable is unset.
+const GATE_NOTIFY_CMD_PINNING_TESTS: &[&str] = &[
+    "resume_with_the_variable_unset_keeps_the_saved_command",
+    "advance_gate_runs_the_persisted_command_when_the_variable_is_unset",
+];
+
+/// For each of `required`, whether the `///` comment above `pub gate_notify_cmd:`
+/// in `state_source` cites it and `source` declares it as `fn <name>(`.
+fn gate_notify_cmd_citation_findings(
+    state_source: &str,
+    required: &[&str],
+    source: &str,
+) -> Vec<String> {
+    let Some(doc) = doc_comment_above(state_source, |line| {
+        line.trim_start().starts_with("pub gate_notify_cmd:")
+    }) else {
+        return vec!["no `pub gate_notify_cmd:` declaration".to_string()];
+    };
+    let doc = doc.join("\n");
+    let mut findings = Vec::new();
+    for name in required {
+        if !doc.contains(name) {
+            findings.push(format!("the comment does not cite `{name}`"));
+        } else if !source.contains(&format!("fn {name}(")) {
+            findings.push(format!(
+                "the comment cites `{name}`, which is absent from source"
+            ));
+        }
+    }
+    findings
+}
+
+/// `gate_notify_cmd`'s doc comment cites the tests that pin its unset-keeps
+/// arms for `resume` and `advance`, and each cited test exists, so a renamed
+/// or deleted pinning test fails here until the comment follows it.
+#[test]
+fn gate_notify_cmd_doc_cites_the_tests_that_pin_it() {
+    let declaration = "    pub gate_notify_cmd: Option<String>,\n";
+    let comment = |cites: &str| {
+        [
+            "    /// Pinned by ",
+            cites,
+            ".\n    #[serde(default)]\n",
+            declaration,
+        ]
+        .concat()
+    };
+    let cited = format!(
+        "`{}` and `{}`",
+        GATE_NOTIFY_CMD_PINNING_TESTS[0], GATE_NOTIFY_CMD_PINNING_TESTS[1]
+    );
+    let source = GATE_NOTIFY_CMD_PINNING_TESTS
+        .iter()
+        .map(|name| format!("fn {name}() {{}}\n"))
+        .collect::<String>();
+
+    // Control: both cited and both declared is clean.
+    let clean =
+        gate_notify_cmd_citation_findings(&comment(&cited), GATE_NOTIFY_CMD_PINNING_TESTS, &source);
+    assert!(clean.is_empty(), "{clean:?}");
+
+    // A comment missing one citation reports it.
+    let partial = format!("`{}`", GATE_NOTIFY_CMD_PINNING_TESTS[0]);
+    let found = gate_notify_cmd_citation_findings(
+        &comment(&partial),
+        GATE_NOTIFY_CMD_PINNING_TESTS,
+        &source,
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(
+        found[0].contains(GATE_NOTIFY_CMD_PINNING_TESTS[1]),
+        "{found:?}"
+    );
+
+    // A citation of a test no source declares reports it as absent.
+    let missing = ["no_such_test_anywhere"];
+    let found =
+        gate_notify_cmd_citation_findings(&comment("`no_such_test_anywhere`"), &missing, &source);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains("absent from source"), "{found:?}");
+
+    // The real comment against every Rust file under crates/.
+    let state_source =
+        std::fs::read_to_string(workspace_root().join("crates/devflow-core/src/state.rs"))
+            .expect("state.rs must be readable");
+    let found = gate_notify_cmd_citation_findings(
+        &state_source,
+        GATE_NOTIFY_CMD_PINNING_TESTS,
+        &rust_source(),
+    );
+    assert!(
+        found.is_empty(),
+        "gate_notify_cmd's doc comment and its pinning tests disagree:\n{}",
+        found.join("\n")
     );
 }

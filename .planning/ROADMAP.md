@@ -35,7 +35,7 @@ note, the success criteria below deliberately claim no more than the evidence su
 | 49 | Live Unattended Run — The Milestone's Instrument | VERIFY-01 | 3 | Complete    |
 | 50 | Addressable Monitor Liveness | SUPV-01 | 4 | Complete    |
 | 50.1 | Split-Lock State-Handling Overhaul (INSERTED) | SUPV-03, SUPV-04, SUPV-05, SURV-03, SURV-04 | 4 (after 50) | Complete    |
-| 51 | Rate-Limit Agent Failover | SUPV-02 | 5 | Not started |
+| 51 | Rate-Limit Agent Failover | SUPV-02 | 5 | Complete    |
 
 ### Phase 46: CI Load Shape and Operator Input Validation
 
@@ -637,6 +637,8 @@ be re-tested here rather than inherited from the issue's original design.
   1. On `AgentStatus::RateLimited` with a fallback agent configured, the run continues under the
      fallback in the same worktree on the same branch, with no manual conflict resolution, and the
      resumed stage reaches a normal completion.
+     *Operator ruling R-2 (2026-11-05, `51-CONTEXT.md`): this applies to the Code stage only; a
+     rate-limited stage other than Code takes the cron arm even when a fallback is configured.*
   2. Both exhaustion answers coexist and each is asserted: fallback configured → agents switch;
      no fallback configured → `write_rate_limit_cron` still fires. A suite that only exercises the
      fallback arm does not satisfy this.
@@ -647,7 +649,47 @@ be re-tested here rather than inherited from the issue's original design.
      rebase handoff were all removed (D-11, 23d) and none is reintroduced. Counted over source with
      comments stripped, since a grep over raw source counts comment prose (the Phase 35-01 lesson).
 
-**Plans**: TBD
+**Plans**: 13/13 plans complete (8 waves)
+
+Plans:
+**Wave 1**
+
+- [x] 51-01-PLAN.md — Tracer: a rate-limited Code stage with a fallback continues under it in the same worktree and branch; with no fallback, or at any other stage, the cron arm still fires (wave 1)
+- [x] 51-02-PLAN.md — The removed `rebase_in` / `sequentagent` / `n` handoff stays dead: comment-stripped scan of every crate source and every subcommand enum, with planted positives and decoys (wave 1)
+- [x] 51-03-PLAN.md — 999.102: an idle-timeout failure names its cause (`terminal_reason`, `errors[]`, `origin.kind`) from the last top-level result (wave 1)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
+- [x] 51-04-PLAN.md — `--fallback-agent` on `start` and `resume`, validated at launch and persisted; every refusal before any write (wave 2)
+- [x] 51-05-PLAN.md — 999.71 classifier fix only: the idle-timeout rate-limit check sees a torn final line (wave 2)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
+- [x] 51-06-PLAN.md — Harden the hop: per-agent canary, handoff event fields, boundary tests at Code, a relaunch that fails after the handoff ends at a gate (not the cron arm) inside a running supervisor (wave 3)
+- [x] 51-14-PLAN.md — R-3: a `fallback_agent` key in `devflow.toml`, combined with `--fallback-agent` at `start` (flag wins), no environment variable (wave 3)
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
+- [x] 51-07-PLAN.md — D-09 Code half: a same-stage relaunch delivers the interrupted fix type to the spawned agent (wave 4)
+
+**Wave 5** *(blocked on Wave 4 completion)*
+
+- [x] 51-09-PLAN.md — 999.154: resume with the gate-notify variable unset; WR-12 / IN-10 reproduced against current code (wave 5)
+- [x] 51-12-PLAN.md — Auto-mode Claude to Antigravity failover at Code end to end through the binary, after 51-07's prompt render (wave 5)
+
+**Wave 6** *(blocked on Wave 5 completion)*
+
+- [x] 51-10-PLAN.md — SUPV-01 by observation, part 1: every liveness read traced and checked row by row; the publish wait and the cron arm's recorded-socket resume read withheld with controls (wave 6)
+
+**Wave 7** *(blocked on Wave 6 completion)*
+
+- [x] 51-13-PLAN.md — SUPV-01 by observation, part 2: the post-save probe, the pending-record lock probe and resume's two lock probes withheld with controls; the per-arm conclusion (wave 7)
+
+**Wave 8** *(blocked on Wave 7 completion)*
+
+- [x] 51-11-PLAN.md — Operator docs for the fallback surface and the `devflow.toml` key, and the full phase check suite (wave 8)
+
+*51-08 (D-09 Plan half) was dropped by operator ruling R-2 (2026-11-05): failover is Code-only.*
 
 ---
 
@@ -803,7 +845,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 49 | 12/12 | In Progress|  |
 | 50 | 29/29 | Complete | 2026-10-21 |
 | 50.1 | 30/30 | In Progress | — |
-| 51 | — | Not started | — |
+| 51 | 13/13 | Complete | 2026-11-08 |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
 
@@ -1030,6 +1072,466 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
+
+### Phase 999.211: README and OPERATIONS.md Describe Rate-Limit Detection and the One-Hop Rule Loosely (BACKLOG)
+
+**Found:** 2026-11-08, graphify review of PR #234 (triage: `.planning/audits/2026-11-08-graphify-review-triage-pr234.md`).
+README.md's "Rate-limit detection: if an agent's stdout contains rate-limit messages (429)" (pre-Phase-51 wording) does not
+describe the classifier: the Claude stream path reads only a top-level `rate_limit_event` whose `rate_limit_info.status`
+is `rejected` (the Agent SDK's documented denial value); the single-document path scans fields (999.196). OPERATIONS.md's
+"The hop happens once per run" sits beside the re-arm verb that makes it more than once.
+
+**Fix shape:** rewrite the README sentence to name what each launch shape reads, linking OPERATIONS.md; say "once per arming"
+in OPERATIONS.md. Docs only; next fix branch.
+
+### Phase 999.210: A Supervise Run Has No Way to End at Validate for a By-Hand Close-Out Except "Abort" (BACKLOG)
+
+**Found:** 2026-11-08, Phase 51 dogfood, Validate gate `18e6310585119d8e` ("Validation passed — approve to ship?").
+Phase 51's conventions keep Ship blocked and close out by hand with `scripts/cut-pr-branch.sh`. Approving the Validate
+gate advances to Ship, whose agent runs `/gsd-ship` (push, PR against `main`) before the Ship gate fires; `yes_ship =
+false` guards only the local merge, bump and tag after it. The only answer that ends the run without Ship is a
+rejection whose note contains "abort" (`gates.rs` `GateAction::Abort`), which runs `pipeline_gate::abort`: it closes
+the gate, clears the state, deregisters and logs `workflow_aborted`. So a run that passed every stage is recorded as
+aborted, and nothing in the event log says it finished.
+
+**Not established:** whether `devflow stop` at the gate records anything different (OPERATIONS.md says it answers a
+waited gate with an abort rejection, so likely the same).
+
+**Fix shape:** a gate answer (or `--until validate`) that ends a passed run as finished, logs `workflow_finished` with
+`shipped: false` and a reason, and leaves Ship to the operator. Small; overlaps the planned replacement of `devflow ship`
+by wsx, so keep it to the event and the answer. Proposed for Phase 52 (session recommendation; operator to confirm).
+
+### Phase 999.209: A Torn Line After a Quota Denial Is Lost When an Escaped Process Holds the Agent's Stdout, So the Stage Fails Over (BACKLOG)
+
+**Found:** 2026-11-08, Phase 51 re-verification (`a3419e5`, advisory, read from source); reproduced the same day.
+A stream stage's agent writes a complete quota denial, then a line it never finishes, then goes quiet. At the idle
+timeout the monitor classifies the capture as a denial, writes no idle-timeout record and kills the agent's process
+group. If a process outside that group (its own session) still holds the agent's stdout, the reader never gets a newline
+or EOF. After `READER_DRAIN_WAIT` (3 s) `join_within` detaches it and `close_shared_capture` closes the capture without
+the partial line. The verdict (`evaluate_layer1`, reading the capture file) sees a clean denial and returns
+`RateLimited`: at Code a failover to the fallback agent, elsewhere a cron resume. Phase 51's rule (option B, `17a47cf`)
+is that a torn line after a denial ends at a gate.
+
+**Evidence:** a snapshot of `21c7c70` with two added monitor tests that run the real monitor and then the real verdict,
+using a stub: init line, denial line, `{"type":"res` with no newline, silence, idle timeout 1 s.
+- With `setsid sleep 12 &` holding stdout: `RateLimited` ("rate limited until …"); the capture ends at the denial line;
+  one `stream_wait_bounded` event (waited 3006 ms, unfinished `["reader"]`, `capture_closed: true`).
+- Negative control, no holder: `Failed` ("stream capture ends in an unparseable line; the final verdict is
+  indeterminate"); the partial line reached the capture at EOF; no `stream_wait_bounded` event.
+Production runs the same order (`drive_stream_io` → `fire_idle_timeout` → `finish_stream_threads`, monitor.rs
+~1764-1807). OPERATIONS.md's residual paragraph ("The outcome is still a gate, with no failover and no cron resume") is
+therefore false for this case.
+
+**Not established:** that a real Claude ever writes a denial followed by a partial line; that an escaped stdout holder
+occurs in a DevFlow `claude -p` stream run (Claude Code's Bash tool shells run in their own session but write to a task
+file, not Claude's stdout; MCP servers and hooks were not inspected); the pipeline's failover itself was not run (inferred
+from the `RateLimited` verdict). One run per case.
+
+**Fix shape:** when `join_within` detaches a reader that holds unterminated bytes, write those bytes to the capture
+before closing it, or record the capture as torn (in the `stream_wait_bounded` event or a side file the verdict reads);
+the verdict treats a bounded close with an unfinished reader after a final denial as torn, not `RateLimited`. Pin both
+cases with the two tests above (holder → not `RateLimited`; no holder → unchanged), planting the current order as a
+failing control. Correct OPERATIONS.md's residual sentence in the same change. Related: 999.207 (the monitor log says
+"classified as rate-limited" before the partial line is read; seen in the control too). Proposed for Phase 52 with 999.207 (session recommendation; operator to confirm).
+
+### Phase 999.208: A Code Re-Run After an Out-of-Band Fix Cannot Re-Verify a `gaps_found` Report (BACKLOG)
+
+**Found:** 2026-11-08, Phase 51, Code re-run after the third fix round (exception 3 in `51-RUN-NOTES.md`). The
+operator answered the Code failure gate expecting Code to "re-run its verify tail". DevFlow issued
+`/gsd-execute-phase 51 --auto`. All 13 plans were summarized, and `51-VERIFICATION.md` (from `7095b38`) still read
+`gaps_found`, even though the fix commits `ff649ff`..`744739a` had changed seven of its covered files (OPERATIONS.md,
+commands.rs, pipeline_launch.rs, pipeline_outcomes.rs, failover_e2e.rs, agent_result.rs, monitor.rs).
+
+**The defect:** `readVerificationStatus` in gsd-core (`bin/lib/verification.cjs`, "gaps_found takes priority over
+stale") returns `gaps_found` before it runs the covered-digest check. So `verification status` routes to
+`/gsd-plan-phase 51 --gaps`, not `execute-phase`. execute-phase's all-plans-summarized branch then exits without
+running code review, the regression gate or the verifier. A gap fixed outside a plan can therefore never be
+re-verified by a DevFlow stage: Code exits with nothing done, and every gate answer repeats that. This corrects
+999.205's claim that `FullExecute` "re-verifies the unchanged code". That held for the earlier loop-back, but not when
+the report already says `gaps_found`.
+
+**Not established:** whether the gap the report names (OPERATIONS.md over-promising the torn-line fix) is closed by
+`ff649ff`. No verifier has run since.
+
+**Fix shape (not decided):** in DevFlow, when the report is `gaps_found` and its digest no longer matches, route Code to
+a re-verify step rather than to `FullExecute`. Or raise upstream that a report whose covered inputs changed should read
+`stale` even when its status is `gaps_found`. Relates to 999.192, 999.205.
+
+### Phase 999.207: A Quota Denial Followed by a Line the Agent Was Killed Mid-Way Through Still Splits the Monitor and the Verdict (BACKLOG)
+
+**Found:** 2026-11-08, Phase 51 Code-stage re-review (51-REVIEW.md WR-02 at `7095b38`), confirmed against source.
+The Phase 51 fix `17a47cf` (a torn final line outranks a parsed quota denial) covers a torn line that is already in the
+capture. The monitor's reader tees whole lines only (`read_until(b'\n')`), and `fire_idle_timeout` classifies while
+the child is alive. If the agent is killed mid-line, the partial line reaches the capture only at EOF, after the monitor
+classified `Denied`, logged "classified as rate-limited (resumable)", wrote no idle-timeout record and killed the group.
+The verdict then returns an indeterminate `Failed` ("stream capture ends in an unparseable line").
+
+**Impact:** diagnostics only, while the partial line reaches the capture: the outcome is then still a gate (no
+failover, no cron resume). Documented as a known residual in OPERATIONS.md and the code comments (`ff649ff`).
+
+**Second case:** a partial line that never reaches the capture (an escaped process holds stdout) ends `RateLimited`,
+not at a gate. Reproduced; filed separately as 999.209.
+
+**Not established:** never reproduced at runtime; the order is read from source.
+
+**Fix shape:** have `fire_idle_timeout` return its suppression decision; after the reader drains to EOF, classify again
+and, if the answer is now `TornAfterLastEvent`, write the flagged idle-timeout record and log that the suppression was
+withdrawn. Test with a stub that prints the denial, then a partial line with no newline (`printf '%s'`), then sleeps;
+plant the old order as a failing control. OPERATIONS.md's residual sentence is corrected under 999.209. Phase 52 (operator, 2026-11-08: option A).
+
+### Phase 999.206: A Failure Gate Keeps Only 300 Characters of the Reason, and `gate show` Cannot Show the Rest (BACKLOG)
+
+**Found:** 2026-11-08, Phase 51, Code failure gate `18e6265d44ff61fa`. The Code agent's reason was about 480 characters.
+`truncate_reason` (`pipeline_outcomes.rs`) capped it at 300 before it entered the `advance_evaluated` event, the gate
+context and the notification. The cut-off part was the actionable half: "execute-phase cannot close the new gap: it needs
+/gsd-plan-phase 51 --gaps plus an operator choice between docs-only and a monitor code fix. Filed 999.205".
+
+**The defect:** the cap is applied when the gate is written, not when it is displayed, so `devflow gate show` (whose help
+promises the "full, untruncated context") prints the same 300 characters. The full text survives only inside the 1.7 MB
+stream capture `.devflow/phase-NN-stdout`, JSON-escaped in the final `result` event; the gate's "[truncated; full output
+in .devflow/]" suffix names no file.
+
+**Not established:** how often reasons exceed 300 characters; this is one observed case.
+
+**Fix shape:** keep the 300-character cap for the notification and the gate banner (it exists because a multi-KB raw
+line once reached a desktop notification, 13-06), but store the full sanitized reason, bounded (for example 4 KB), in the
+gate file and the event, and have `gate show` print it. Name the exact file in the truncation suffix. Ask agents to put
+the actionable sentence first in their reason. Phase 52.
+
+### Phase 999.205: No Validate Loop-Back Plans Gap Closure, So a `gaps_found` Verification Cannot Be Closed by the Run (BACKLOG)
+
+**Found:** 2026-11-08, Phase 51, second Validate loop-back. DevFlow issued `/gsd-execute-phase 51 --auto` (`FullExecute`,
+as in 999.192). All 13 plans were already complete, so execute-phase ran only its verify tail: code review, regression
+gate, and the verifier. The verifier again reported `gaps_found` (`7095b38`), this time a docs over-promise from the
+torn-line fix. `verification.status` routes that to `/gsd-plan-phase 51 --gaps`.
+
+**The defect:** `fix_prompt` (`crates/devflow-core/src/prompt.rs`) has three arms: `AuditFix`, `GapsOnly` and
+`FullExecute`. None runs `/gsd-plan-phase {N} --gaps`, which is the only GSD step that writes the `gap_closure: true`
+plans `--gaps-only` selects. A complete phase whose verifier finds a gap therefore loops through one of two dead ends:
+- `FullExecute` re-verifies the unchanged code and finds the same class of gap.
+- `GapsOnly` matches zero plans (the mid-arc failure 999.65 described).
+
+Neither can change the code, so each round only re-verifies it. Fixing 999.192 alone would swap the first dead end for
+the second.
+
+**Not established:** whether a Validate verdict ever reaches `GapsOnly` with gap plans on disk in a real run.
+
+**Fix shape (not decided):** when the evidence root's `{N}-VERIFICATION.md` says `gaps_found` and its route is
+`plan-phase`, loop back through `/gsd-plan-phase {N} --gaps` and then `/gsd-execute-phase {N} --gaps-only`. Or stop at a
+gate that names that route, rather than re-running execute-phase. Relates to 999.192 and 999.193.
+
+### Phase 999.204: Phase 51 Failover Tests Miss a Non-Claude Primary, a Real Gate-Context Render, and a Failed Relaunch One Short of the Infra Ceiling (BACKLOG)
+
+**Found:** 2026-11-08, Phase 51 external adversarial review (DeepSeek lane), `51-EXTERNAL-CODE-REVIEW.md` "Suspected".
+
+**The gap:** no hop test starts from a non-Claude primary; the idle-timeout gate-context test composes its own rendering
+instead of asserting on the production render; no test drives a failed fallback relaunch at `MAX_INFRA_FAILURES - 1`
+(where the next failure aborts rather than gates).
+
+**Not established:** that any of the three paths is broken; only that no test would catch it.
+
+**Fix shape:** three tests, each with a planted mutation that must fail it. Take with the next failover fix branch.
+
+### Phase 999.203: The SUPV-01 Evidence Checker Accepts Stale Line Citations (BACKLOG)
+
+**Found:** 2026-11-08, Phase 51 external adversarial review (DeepSeek lane, X-04). `51-SUPV01-EVIDENCE.md` cited
+`pipeline_launch.rs` lines off by +26 (a cited line was a doc comment) and the checker passed it.
+
+**The defect:** the checker (`pipeline_launch::tests::the_supv01_evidence_trace_rows_are_complete` and
+`...::the_supv01_evidence_is_complete`, both `#[ignore]`d, run with `--run-ignored only`) checks only that each cited
+file exists, the line number is within the file, the name appears somewhere in the file's non-test code, and each cited
+test is declared. It never checks what the cited line holds, so it passed on the stale citations. 39 of 52 citations
+were re-derived at `b94d356` in the Phase 51 fix round; nothing stops them drifting again.
+
+**Fix shape:** cite by symbol (or symbol + line) and have the checker assert the named symbol is on the cited line, with
+a planted off-by-N citation as a failing control. Phase 52.
+
+### Phase 999.202: `devflow status` Shows Nothing About an Armed or Spent Fallback Agent (BACKLOG — enhancement)
+
+**Found:** 2026-11-08, Phase 51 external adversarial review (DeepSeek lane). `fallback_agent` / `fallback_consumed` in
+state have no reader outside the failover path, so an operator cannot tell from `status` whether a fallback is armed or
+already used. Adjacent to 999.190 (status never shows `stop_reason`).
+
+**Fix shape:** one `status` line, e.g. `fallback: antigravity (armed)` / `(used)`; take together with 999.190.
+
+### Phase 999.201: A Stream `result` With `subtype: error_rate_limit` Is Classified Failed, Not RateLimited (BACKLOG — suspected)
+
+**Found:** 2026-11-08, Phase 51 external adversarial review (codex lane, with a parser probe). The same result line
+returns `RateLimited` as a single document but `Failed` once a stream init event precedes it: the stream path reads
+only `rate_limit_event`. Failover requires `RateLimited`, so such a Code run would gate instead of failing over.
+
+**Not established:** whether any current Claude CLI emits that shape in stream mode. The parser inconsistency is
+reproduced; a live occurrence is not.
+
+**Fix shape:** recognise the authoritative quota fields on a top-level stream `result` before generic error
+classification; keep the single-document/stream pair as a regression test. Next failover fix branch.
+
+### Phase 999.200: A Hanging Fallback Health Check Can Park the Handoff Indefinitely (BACKLOG — suspected)
+
+**Found:** 2026-11-08, Phase 51 external adversarial review (codex lane). `hand_off_agent` calls the fallback driver's
+`health()` synchronously; pi's health runs `pi auth check --no-refresh` via `.output()` with no deadline. If it hangs,
+no refusal event is written and no cron recovery runs.
+
+**Not established:** no forced-hang experiment was run; the call path was read, not exercised.
+
+**Fix shape:** bound the health-check process (deadline, kill the process group), turn expiry into a named handoff
+refusal, and test that it reaches the cron arm. Next failover fix branch.
+
+### Phase 999.199: doc_check's Removed-Verb Guard Is Bypassed by an Escaped String Literal (BACKLOG)
+
+**Found:** 2026-11-08, Phase 51 external adversarial review (codex lane, probe). `string_literal_value`
+(`doc_check.rs`) strips quotes without decoding Rust escapes, so `#[command(alias = "\x6e")]` yields zero findings
+while Clap accepts `n`.
+
+**Not established:** low real-world risk (needs a deliberate obfuscation); the bypass itself is reproduced.
+
+**Fix shape:** decode escapes before comparing, or assert against the built Clap command; add the escaped alias as a
+planted failing control.
+
+### Phase 999.198: A Missing Fallback Binary Is Reported Without the `--fallback-agent` Prefix (BACKLOG)
+
+**Found:** 2026-11-08, Phase 51 external adversarial review (antigravity lane). `validate_fallback_agent`
+(`preflight.rs`) calls `ensure_agent_binary` unmapped, so the operator sees "agent binary `opencode` not found" and may
+think the primary `--agent` failed. Every other fallback refusal names `--fallback-agent`. Related: a `devflow.toml`
+key's refusal cites the CLI flag `--fallback-agent` though the operator used the config key.
+
+**Fix shape:** map the error with the `--fallback-agent <name>` prefix (and name the config key when it came from
+`devflow.toml`); assert the text in a test.
+
+### Phase 999.197: `resume --agent X --fallback-agent Y` Commits State Twice (BACKLOG)
+
+**Found:** 2026-11-08, Phase 51 external adversarial review (antigravity and DeepSeek lanes). `hand_off_agent` commits
+`agent = X`, then `resume_loaded` commits the new fallback. A kill between the two can leave `agent == fallback_agent`
+with `fallback_consumed = false`; the next plain `resume` is then refused.
+
+**Not established:** never observed. Recoverable: the refusal names the way out (`--fallback-agent <other>`), so the
+lane's "permanently unresumable" is overstated.
+
+**Fix shape:** apply the agent switch and the fallback re-arm in one state commit.
+
+### Phase 999.196: The Single-Document Rate-Limit Classifier Matches Nested Fields, Against OPERATIONS.md's Top-Level-Only Promise (BACKLOG)
+
+**Found:** 2026-11-08, Phase 51 external adversarial review (codex lane, probe). OPERATIONS.md (rate-limit section)
+says only top-level events decide a rate limit. The single-document classifier (`agent_result.rs`, `json_has_*` via the
+recursive `json_scan`) matches a nested `"tool_result":{"status_code":429}` and a quota result carrying
+`parent_tool_use_id`. With Phase 51 this can consume the run's only fallback on a subagent's evidence.
+
+**Not established:** pre-existing code (2026-07/08); it affects single-document captures only, not the stream launches
+DevFlow uses for Claude today.
+
+**Fix shape:** check envelope provenance and only the supported top-level quota fields; probe pair as a regression test.
+
+### Phase 999.195: `capture_shows_rate_limit_denial` Has No Production Caller and Gives the Two-Valued Answer D-16 Replaced (BACKLOG)
+
+**Found:** 2026-11-08, Phase 51 external adversarial review (DeepSeek lane). After Phase 51 the `pub fn` in
+`agent_result.rs` is called only by its own tests, and keeps a second notion of "is this a rate limit" beside
+`capture_rate_limit_denial`.
+
+**Fix shape:** remove it, or make it a thin wrapper over the three-valued function. It is `pub` in the published
+`devflow-core`, so removal is a semver change: deprecate first or batch with the next major.
+
+### Phase 999.194: After the Delivery Canary Refuses an Agent, Nothing Can Re-Run It for the Same Agent (BACKLOG)
+
+**Found:** 2026-11-08, Phase 51 external adversarial review (DeepSeek lane, X-02). A recorded canary refusal is cleared
+only by an agent handoff (`hand_off_agent` sets `canary = None`). `resume --agent <current agent>` is a silent no-op
+(no branch for `requested == state.agent`). So after a transient canary failure the only ways on are switching agents
+or hand-editing `.devflow/` state; the Phase 51 remedy text points at `--agent <other>`.
+
+**Not established:** never hit live; read from source.
+
+**Fix shape:** a deliberate "re-check the canary" route (e.g. `resume --recheck-canary`, or treat `--agent <same>` as
+an explicit re-check), and make `--agent <same>` say what it did instead of nothing. **Target: Phase 52** (operator, 2026-11-08).
+
+### Phase 999.193: The Validate Gate Says "Validation Passed — Approve to Ship?" While the Phase's Verification Reports `gaps_found` (BACKLOG)
+
+**Found:** 2026-11-08, Phase 51 re-validate after the review fix round. The Code stage's `/gsd-execute-phase` re-ran the
+verifier, which committed `51-VERIFICATION.md` with `status: gaps_found` (`fe1971a`: README.md:110 over-promises after
+the `devflow parallel` fix). Validate then ran `/gsd-validate-phase 51`, returned `verdict: pass` (it audits test coverage,
+not goal achievement, and said so in its final message), and DevFlow fired `gate_fired` with context "Validation passed —
+approve to ship?".
+
+**The defect:** no non-test code in 3.0.0 reads `{N}-VERIFICATION.md`'s `status` (`git grep gaps_found v3.0.0 -- 'crates/*.rs'`
+finds only tests and comments). The Validate verdict comes solely from the validate-phase agent, so a phase whose own
+verifier reports a gap reaches the Ship-approval gate labelled "passed". In supervise mode a human may catch it from the
+agent's message; with `--yes-ship` or in auto mode nothing would.
+
+**Not established:** whether Phase 50.1's or earlier phases' gates ever passed over a `gaps_found` verification.
+
+**Fix shape:** at the Validate outcome, read the evidence root's `{N}-VERIFICATION.md` frontmatter `status`; on
+`gaps_found` (or `human_needed` unanswered) treat the verdict as `gaps` or, at least, put the status in the gate context
+and refuse a `--yes-ship` auto-approval. Fits Phase 52 or the next fix branch.
+
+### Phase 999.192: A Verification Report Written During Code Is Read as Inherited, So a Validate Reject Re-Runs the Whole Phase (BACKLOG)
+
+**Found:** 2026-11-08, Phase 51. The operator rejected the Validate gate (note "re-validate after the review fixes");
+DevFlow emitted `loop_back` with `"fix":"FullExecute"` and launched `/gsd-execute-phase 51 --auto`, where the 3.0.0
+design intends `GapsOnly` once this run authored the verification.
+
+**The defect:** `stamp_validate_dispatch_window` (`pipeline_launch.rs`) records the VERIFICATION.md fingerprint and mtime
+when Validate launches, and `select_loop_back_fix` (`pipeline_outcomes.rs`) treats the report as this run's only if it
+changed after that stamp. But GSD's `/gsd-execute-phase` runs its own verifier at the end of Code, so the report is
+written BEFORE Validate launches (51: written 2026-11-07 20:13 in Code, Validate launched 2026-11-08 05:46 and did not
+rewrite it; the state's `last_verification_mtime_nanos` equals the file's mtime exactly). Every such phase's reject is
+therefore dispatched as a full execute.
+
+**Effect here:** harmless (all 13 plans complete, so execute-phase ran only its verify tail). On a phase with gap plans
+it would redo work instead of closing gaps.
+
+**Not established:** whether `/gsd-validate-phase` ever rewrites VERIFICATION.md in a normal run (if it never does, the
+GapsOnly arm is unreachable whenever Code runs execute-phase's verifier).
+
+**Fix shape:** stamp the baseline at Code launch (or at the run's first Code dispatch) rather than at Validate launch,
+or accept a report committed on the phase branch after the run started; a test with a verifier-written report from
+Code must dispatch GapsOnly. Fits Phase 52 or the next fix branch.
+
+### Phase 999.191: `stop_ends_a_launch_its_running_launcher_promotes_during_the_wait` Fails Under Full-Suite Load (BACKLOG)
+
+**Found:** 2026-11-08, Phase 51 Validate stage (`/gsd-validate-phase 51`), full `cargo nextest run --workspace` at `fe1971a`.
+
+**The defect:** `crates/devflow-cli/tests/pending_supervisor_e2e.rs:285` (`"its liveness file is gone"`) saw
+`Held::Live` where it expects `Held::Missing`, right after `devflow stop` returned and the supervisor socket probed
+`Gone`. 1 failure in 2111 tests; the test passed 10/10 when run alone afterwards. The test file is unchanged since
+Phase 50.1 (`1ac9c57`), so this is not a Phase 51 regression.
+
+**Not established:** the cause. One plausible reading: the supervisor's liveness lock is released after its socket
+stops answering, so a probe made immediately after can still see it held under load. Not reproduced or traced; 10
+isolated passes do not bound the rate.
+
+**Fix shape:** find out whether `stop` should wait for the liveness lock to go before it returns (a product defect) or the
+test should poll with a deadline (a test race). Then reproduce it under load (`--test-threads` stress or a looped full suite).
+
+### Phase 999.190: `devflow status` Never Shows Why a Stopped Run Stopped (BACKLOG)
+
+**Found:** 2026-11-08, Phase 51 review fix (WR-02, `7e8ee1a`). The fix stops a run whose gate answer would relaunch
+into a refusing canary and writes a `stop_reason` naming `devflow resume --phase N --agent <other>`, but nothing the
+operator runs shows it.
+
+**The defect:** `RunState.stop_reason` is written by every stop path (`--until`, `devflow stop`, safe-point stops, the
+supervisor stop, the WR-02 canary refusal), yet the only non-test reader in `crates/` is `start`'s "stopped before
+anything was launched" line (`commands.rs`). `devflow status` prints the generic `devflow resume --phase N` hint for a
+stopped run, so advice like "resume with another agent" is visible only in `.devflow/state-NN.json`, the event log and
+OPERATIONS.md.
+
+**Not established:** found by reading the code (`rg stop_reason crates/`), not by running `devflow status` on a stopped
+run; no test covers `devflow resume --agent` after the WR-02 stop.
+
+**Fix shape:** `status` (and `doctor`) print the recorded `stop_reason` for a stopped run beside the resume hint; a CLI
+test asserts the WR-02 reason text appears. Small; fits the next fix branch or Phase 52.
+
+### Phase 999.189: A Gate Rejection's Note Never Reaches the Fix Pass, and Any Note Containing "abort" Aborts the Run (BACKLOG)
+
+**Found:** 2026-11-08, Phase 51 Validate gate, by reading v3.0.0 before answering it.
+
+**The defect:** two halves, both in 3.0.0.
+- The note is not part of the fix prompt. A rejection maps to `GateAction::LoopBack(Code)` (`gates.rs`
+  `GateAction::from_response`) and the loop-back runs `fix_prompt(fix_type, phase)` (`prompt.rs`), which takes no note:
+  `/gsd-audit-fix N`, `/gsd-execute-phase N --gaps-only` or a full execute. After a Validate that passed with a
+  VERIFICATION.md written this run, `select_loop_back_fix` picks `--gaps-only`, which matches no plan when the
+  verification has no gaps. So rejecting a passed Validate to get a review finding fixed reruns Code with nothing to do,
+  and the operator's instruction is dropped without a word.
+- `from_response` aborts on any rejection whose note contains `abort` case-insensitively, so a note such as "do not
+  abort, fix X" ends the run.
+
+**Fix shape:** carry the note into the fix pass's prompt (escaped, as `resume` already prints it), and make abort an
+explicit answer (a flag or a field), not a substring of free text. Tell the operator at `gate reject` time which fix
+pass the rejection will run.
+
+### Phase 999.188: The Held-State-Write-Lock Status Test Fails Intermittently Under the Full Suite (BACKLOG)
+
+**Found:** 2026-11-08, the Phase 51 Validate gate check (`scripts/check.sh all` at `b6205b0`).
+
+**The defect:** `commands::tests::status_and_doctor_name_a_held_state_write_lock` (added in 50.1-18) failed once at its
+"control: released" assertion (`crates/devflow-cli/src/commands.rs:18661`): after the holder thread released the lock
+and was joined, `write_lock_status` still reported `held by an unknown holder`. It passed 15/15 run alone (nextest) and
+in 3/3 further full `cargo test -p devflow --bin devflow` runs, so it is load- or interleaving-dependent: 1 failure in 4
+full runs, a weak estimate of the rate.
+
+**Not established:** whether Phase 51 code made it reachable or it predates the phase, and what still holds the lock (a
+child process inheriting the lock's descriptor from a concurrently running test is one candidate, unverified).
+
+**Fix shape:** reproduce under load (loop the full binary, or run alongside a process-spawning test), find the holder,
+then fix the lock's release or the test's isolation. A green full run is not evidence of a fix.
+
+### Phase 999.187: An In-Supervisor Launch Failure Outside Failover Ends the Run With No Gate and No Cause (BACKLOG)
+
+**Found:** 2026-11-07, Phase 51 execution. Plan 51-06 found it by reading the `Ambiguous` re-drive; plans 51-10 and
+51-13 reproduced it on the ordinary path (`pipeline_launch::tests::an_ordinary_transition_with_the_publish_probe_withheld_fails_the_same_way`
+and the 51-13 pending-record control). Details: `51-06-SUMMARY.md`, `51-10-SUMMARY.md` and `51-SUPV01-EVIDENCE.md`
+`## Backlog findings`.
+
+**The defect:** when a launch made inside a supervisor fails and the path is not failover (an `Ambiguous` re-drive via
+`handle_ambiguous_outcome` → `launch_stage`, or an ordinary stage transition whose launch is refused or never
+publishes), the failed launch clears the record, the error returns through `run_monitor`'s `other =>` arm, and the
+supervisor exits with stderr sent to `/dev/null`. The run is left at the stage with `supervisor: None`, not stopped, no
+gate and nothing scheduled, and no event names the cause (51-13's pending-record case leaves only
+`launch_refused_over_live_pending`, which nothing surfaces to the operator). Phase 51's failover path is gated
+(51-06); this is the same failure on every other in-supervisor launch.
+
+**Fix shape (not decided):** route a non-`NotOwner` in-supervisor launch failure to `gate_or_abort_infra`, without
+bumping the infra counter twice, and give the gate write a record-keeping exemption like 51-06's
+`FailoverRelaunchGuard` so it is not refused as `NotOwner`.
+
+**Acceptance:** the two reproductions above end at an open gate whose context names the launch error, with the
+failover gate test as the unchanged control.
+
+**Partly addressed 2026-11-08 (Phase 51 review fix WR-02, `7e8ee1a`):** a retry or loop-back gate answer whose
+relaunch the recorded delivery canary refuses now stops the run with a named reason and a `gate_relaunch_refused`
+event. The two reproductions above, and a gate-answer relaunch that fails for any other reason, still end silently.
+Stays open.
+
+**Canary-specific residual at the same entry point (Phase 51 re-review IN-02, 2026-11-08):** the gate-answer
+pre-check (`relaunch_failed_stage` → `recorded_canary_refusal`) sees only a canary outcome already recorded.
+`hand_off_agent` clears the canary, so when a failover relaunch fails before `canary_gate` runs (a binary removed
+between the handoff's check and `ensure_agent_binary`, or a `run_preflight` error), the infra gate opens with
+`canary: None`. A retry answer then passes the pre-check and runs a fresh canary inside an unguarded `launch_stage`;
+if that canary refuses, `refuse_launch` clears the record and the run ends the 999.187 way. Not fixed in Phase 51:
+writing the stop after that error needs the record kept on the gate-answer relaunch (a guard variant beside
+`FailoverRelaunchGuard`, whose single sanctioned site the source-scan test
+`the_supervisor_record_is_cleared_only_on_launch_failure_paths` pins), which is this entry's undecided fix shape. The
+general fix should cover it: after a gate-answer relaunch fails, re-check `recorded_canary_refusal` and stop with
+`gate_relaunch_refused` as the pre-check does. Read from the code; not reproduced at runtime.
+
+### Phase 999.186: Nothing Acts on the Rate-Limit Cron Instructions, So a Paused Run Never Resumes (BACKLOG)
+
+**Found:** 2026-11-07, Phase 51 dogfood run (v3.0.0, supervise mode, no fallback agent). The Code stage hit a real
+Claude rate limit 52 minutes in (2026-11-06 11:27 EST, `advance_evaluated` status `ratelimited`, reason "rate limited
+until 1794085200"). DevFlow took the cron arm: `rate_limit_resume_scheduled` and `.devflow/cron-instructions-51.json`
+with `hermes_cron.schedule` `2026-11-07T21:00:00Z`, name `devflow-phase-51-resume`, `once: true`.
+
+**The defect:** nothing on the host acted on that file. At 2026-11-07 16:07 EST, after the reset time, `devflow status`
+showed the run with no supervisor and not stopped, the instructions file was still present (it is consumed only by a
+successful resume), and `hermes cron list` held no `devflow-phase-51-resume` job. The file is a manifest for a
+scheduler, but DevFlow neither registers the job nor tells the operator to: README says the file is written "for
+rescheduling" and OPERATIONS.md lists it as a record, and neither says who schedules it. `devflow status` prints
+`→ devflow resume --phase 51` with no reset time. The result is the outcome Phase 51 exists to prevent: a rate limit
+ends the night, with no signal past the `rate_limit_resume_scheduled` event.
+
+**Fix shape (not decided):** register the job (e.g. through `hermes cron` when available) and report whether
+registration succeeded; or, when no scheduler is registered, surface the pause through the never-silent gate/notify
+path and print the reset time and the exact resume command in `devflow status`. Document who acts on the file.
+
+**Acceptance:** a rate-limited run either has a registered resume job that a test can observe, or opens a gate/notify
+naming the reset time; `devflow status` shows the reset time for a rate-limit pause.
+
+### Phase 999.185: A Superseded Supervisor Can Still Write the Rate-Limit Cron File (BACKLOG)
+
+**Found:** 2026-11-06, Phase 51 second external plan review (codex), confirmed by reading source at `0d80aac`.
+
+**The defect:** `handle_rate_limited_outcome` (`crates/devflow-cli/src/pipeline_outcomes.rs`) bumps `infra_failures` with an owned `commit`, then writes the cron instructions with `devflow_core::ship::write_cron_instructions` (`crates/devflow-core/src/ship.rs`), a plain filesystem write with no ownership check. A supervisor whose record is replaced between the two still creates or overwrites `cron-instructions-NN.json`. Present on today's no-fallback cron arm; not introduced by Phase 51. Phase 51 (51-06) narrowed its own "a superseded supervisor writes nothing" claim to exclude this window (threat T-51-40).
+
+**Fix shape (not decided):** run the cron write inside the existing `fenced` helper (`crates/devflow-cli/src/pipeline_launch.rs`), which checks ownership around a side effect. A bare `ensure_still_recorded` check before the write narrows the window but does not close it.
+
+**Acceptance:** a test that replaces the recorded supervisor between the counter commit and the cron write and asserts no cron file is written, with the unreplaced run as its control.
+
+### Phase 999.184: An Ordinary Plan Success Over Uncommitted Plan Files Still Advances to Code (BACKLOG)
+
+**Found:** 2026-11-05, Phase 51 plan check (iteration 2). Checked by reading the code, not reproduced. Phase 51 first planned a fix for the rate-limit case only (a Plan pass relaunched after a rate limit); operator ruling R-2 (2026-11-05) then made failover Code-only and dropped that plan, so Phase 51 handles no part of this. A Plan stage that a rate limit interrupts takes the cron arm, and its later `devflow resume` relaunches Plan with the default prompt, which treats any `PLAN.md` on disk as a finished stage, so a partial plan left by the interrupted agent can reach Code the same way.
+
+**Defect:** on `Action::Advance`, `Stage::Plan => transition(project_root, &mut state, Stage::Code)` (`crates/devflow-cli/src/pipeline_launch.rs`) checks nothing about the phase's `PLAN.md` files being tracked and unmodified. The never-silent commit check in `agent_result.rs` counts commits ahead of `develop`, not commits made in this stage attempt. An earlier dogfood run hit this: a transient API 500 killed Plan before its commit step, the retry saw `PLAN.md` on disk and reported success, and the uncommitted plans reached Code.
+
+**Fix shape (not decided):** on every Plan success, check the phase's `{padded}-*PLAN.md` files under `.planning/phases/{padded}-*/` with `git status --porcelain` at the launch root; any untracked or modified one, or git failing to answer, routes to the never-silent stage gate (`handle_stage_failure` at Plan) instead of `transition` to Code. Covers the rate-limited Plan resumed from the cron arm as well as the ordinary case. Decide how to treat a project that leaves `.planning/` untracked but not ignored, which would gate on every Plan success (an ignored `.planning/` never appears in `git status --porcelain` and is unaffected).
+
+**Acceptance:** a test where an ordinary Plan run reports success over an untracked `PLAN.md` stops at a gate, with a committed-and-clean negative control that still advances.
 
 ### Phase 999.183: `start --dry-run` Says Define Runs `/gsd-discuss-phase`, Which It Never Does (BACKLOG)
 
@@ -5943,7 +6445,7 @@ for the DevFlow-side prompt policy plus its tests; M if the upstream marker is p
 
 ---
 
-### Phase 999.71: Measure Whether the Capture Writer Actually Leaves Torn Terminal Lines (PROMOTED — Phase 51, operator 2026-11-05)
+### Phase 999.71: Measure Whether the Capture Writer Actually Leaves Torn Terminal Lines (BACKLOG — Phase 51 takes only the rate-limit classifier's torn-line fix; the measurement stays here, operator 2026-11-05)
 
 **GitHub:** [#169](https://github.com/denniyahh/devflow/issues/169) (migrated from Linear DEN-92)
 **Found:** 2026-08-02, phase 30 adversarial pass over the malformed-input defect class. Flagged as

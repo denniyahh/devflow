@@ -19,7 +19,7 @@ use crate::pipeline_gate::{
     LoopBackReason, abort, finish_workflow, loop_back_to_code, run_gate, run_gate_with_timeout,
     transition,
 };
-use crate::pipeline_launch::{close_gate, commit, launch_stage};
+use crate::pipeline_launch::{close_gate, commit, launch_stage, recorded_canary_refusal};
 use devflow_core::gates::{GateAction, GateResponse};
 use devflow_core::hooks::{self, HookContext};
 use devflow_core::mode;
@@ -913,22 +913,51 @@ pub(crate) fn render_gate_context(context: &str, max_chars: usize) -> String {
     format!("{head}{suffix}")
 }
 
+/// The never-silent gate context for a failed `stage`, with its `reason`
+/// capped by [`truncate_reason`]. `lead` goes before the reason, so it
+/// survives the pending-gate banner's and `gate list`'s display bound whatever
+/// the reason's length.
+fn stage_failure_context(stage: Stage, lead: &str, reason: Option<String>) -> String {
+    format!(
+        "[never-silent] stage {stage} failed: {lead}{} — human review needed (retry, loop-to-code, or abort)",
+        truncate_reason(&reason.unwrap_or_else(|| "no details available".into()))
+    )
+}
+
+/// The gate context for a failed non-Validate stage. When the run's recorded delivery
+/// canary already refuses its agent, both non-abort answers stop the run instead of
+/// relaunching ([`relaunch_failed_stage`]), so the context names the way on. It leads,
+/// before the reason, because the notify hook carries this context to an operator who
+/// decides from it alone, and the banner and `gate list` show only its start.
+pub(crate) fn failure_gate_context(state: &State, stage: Stage, reason: Option<String>) -> String {
+    let lead = if recorded_canary_refusal(state).is_some() {
+        format!(
+            "a retry or loop-back will not relaunch under {agent} (its recorded delivery \
+             canary refuses it); answer the gate, then run `devflow resume --phase {phase} \
+             --agent <other>`. Cause: ",
+            agent = state.agent,
+            phase = state.phase,
+        )
+    } else {
+        String::new()
+    };
+    stage_failure_context(stage, &lead, reason)
+}
+
+/// Fire the never-silent failure gate with [`failure_gate_context`].
 pub(crate) fn handle_stage_failure(
     project_root: &Path,
     state: &mut State,
     stage: Stage,
     reason: Option<String>,
 ) -> Result<(), CliError> {
-    let context = format!(
-        "[never-silent] stage {stage} failed: {} — human review needed (retry, loop-to-code, or abort)",
-        truncate_reason(&reason.unwrap_or_else(|| "no details available".into()))
-    );
+    let context = failure_gate_context(state, stage, reason);
     match run_gate(project_root, state, stage, &context)? {
         GateAction::Advance => {
             // CR-01: close the gate before retrying; its answer is spent.
             let _ = close_gate(project_root, state.phase, stage);
             state.gate_pending = false;
-            launch_stage(state, None, Some(stage))
+            relaunch_failed_stage(project_root, state, stage)
         }
         GateAction::LoopBack(_) => {
             // Retry the SAME failed stage — Code is not a valid recovery
@@ -936,10 +965,55 @@ pub(crate) fn handle_stage_failure(
             // (Codex 13-01 MEDIUM). Only Ship's ReviewFailed path (handled
             // separately in `handle_ship_failure`) actually loops to Code.
             let _ = close_gate(project_root, state.phase, stage);
-            launch_stage(state, None, Some(stage))
+            relaunch_failed_stage(project_root, state, stage)
         }
         GateAction::Abort(reason) => abort(project_root, state, &reason),
     }
+}
+
+/// Relaunch `stage` for a retry or loop-back answer to its never-silent gate.
+///
+/// A delivery canary the run already recorded as refusing its agent refuses every
+/// relaunch under that agent, and that refusal would clear the supervisor record and end
+/// the supervisor with no gate, no event and no cause (backlog 999.187). The gate after
+/// a failover whose fallback failed its canary makes this routine. So the relaunch is not
+/// tried: the run is marked stopped, with a reason naming the refusal and
+/// `devflow resume --phase N --agent <other>` as the way on, a `gate_relaunch_refused`
+/// event is written, and the supervisor ends. Not a new gate: a supervisor waiting at a
+/// gate is live, and `resume` refuses over a live run. All of it is written while the
+/// supervisor is still the one the state records.
+fn relaunch_failed_stage(
+    project_root: &Path,
+    state: &mut State,
+    stage: Stage,
+) -> Result<(), CliError> {
+    let Some(refusal) = recorded_canary_refusal(state) else {
+        return launch_stage(state, None, Some(stage));
+    };
+    let phase = state.phase;
+    let agent = state.agent;
+    let stop_reason = format!(
+        "the {stage} stage cannot relaunch under {agent}: the delivery canary recorded for \
+         this run refuses it ({refusal}); run `devflow resume --phase {phase} --agent <other>` \
+         to continue on another agent"
+    );
+    commit(state, |s| {
+        s.stopped = true;
+        s.stop_reason = Some(stop_reason.clone());
+        s.gate_pending = false;
+    })?;
+    events::emit(
+        project_root,
+        phase,
+        "gate_relaunch_refused",
+        serde_json::json!({
+            "stage": stage.to_string(),
+            "agent": agent.to_string(),
+            "reason": refusal,
+        }),
+    );
+    tracing::warn!("phase {phase}: {stop_reason}");
+    Ok(())
 }
 
 /// Handle the Ship stage's failure outcome, distinguishing an agent crash
@@ -5182,6 +5256,100 @@ mod tests {
         let capped = truncate_reason(&long);
         assert!(capped.chars().count() <= 300);
         assert!(capped.ends_with("[truncated; full output in .devflow/]"));
+    }
+
+    /// Write an idle-timeout record with `commits` long-subject commits and
+    /// the given cause keys, then return the reason Layer 1 builds from it.
+    fn idle_timeout_reason_with(cause: serde_json::Value, commits: usize) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        let phase = PhaseId::new(71);
+        let record = devflow_core::agent_result::IdleTimeoutRecord {
+            status: "idle_timeout".to_string(),
+            idle_secs: 120,
+            agent_pid: 4242,
+            written_at: 1_700_000_000,
+            commits: (0..commits)
+                .map(|n| devflow_core::agent_result::IdleTimeoutCommit {
+                    sha: format!("{n:040x}"),
+                    subject: format!("feat: partial work item number {n}"),
+                })
+                .collect(),
+        };
+        let mut value = serde_json::to_value(record).unwrap();
+        for (key, field) in cause.as_object().unwrap() {
+            value[key] = field.clone();
+        }
+        std::fs::write(
+            devflow_core::agent_result::idle_timeout_path(root, phase),
+            serde_json::to_string(&value).unwrap(),
+        )
+        .unwrap();
+        devflow_core::agent_result::evaluate_layer1(root, phase)
+            .expect("the record must produce a verdict")
+            .reason
+            .expect("an idle timeout must explain itself")
+    }
+
+    /// Whether `text` carries the reason's cause clause opened AND closed.
+    /// The fixtures' field text holds no `)`, so the close is the clause's.
+    fn holds_whole_clause(text: &str) -> bool {
+        text.find("idle timeout (")
+            .is_some_and(|open| text[open..].contains("): "))
+    }
+
+    /// D-15: the idle-timeout cause survives into what the operator sees —
+    /// `truncate_reason`'s 300 characters and the pending-gate banner's
+    /// 300-character rendering of the whole gate context — even behind a long
+    /// commit list, and even at the maximum bound of every cause field.
+    #[test]
+    fn an_idle_timeout_gate_context_names_the_last_result_cause() {
+        // (a) the measured 999.102 cause with 40 commits.
+        let measured = serde_json::json!({
+            "terminal_reason": "aborted_tools",
+            "errors": ["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use"],
+            "origin_kind": "task-notification",
+        });
+        let reason = idle_timeout_reason_with(measured, 40);
+        assert!(
+            truncate_reason(&reason).contains("aborted_tools"),
+            "the cause was truncated away: {}",
+            truncate_reason(&reason)
+        );
+
+        // CONTROL: the same reason with the clause moved to the end loses the
+        // cause to truncation, so the assertion above depends on placement.
+        let rest = reason
+            .strip_prefix("idle timeout (")
+            .expect("the reason opens with the clause");
+        let close = rest.find("): ").expect("the clause closes");
+        let moved = format!("idle timeout: {} ({})", &rest[close + 3..], &rest[..close]);
+        assert!(
+            !truncate_reason(&moved).contains("aborted_tools"),
+            "control is vacuous: a trailing clause also survived truncation"
+        );
+
+        // (b) every cause field at its bound: 160 characters each, 3 errors.
+        let max_bound = serde_json::json!({
+            "terminal_reason": "t".repeat(160),
+            "origin_kind": "o".repeat(160),
+            "errors": vec!["e".repeat(160); 3],
+        });
+        let reason = idle_timeout_reason_with(max_bound, 40);
+        let truncated = truncate_reason(&reason);
+        assert!(
+            holds_whole_clause(&truncated),
+            "truncate_reason cut the clause before it closed: {truncated}"
+        );
+        let banner = render_gate_context(
+            &stage_failure_context(Stage::Validate, "", Some(reason.clone())),
+            300,
+        );
+        assert!(
+            holds_whole_clause(&banner),
+            "the banner cut the clause before it closed: {banner}"
+        );
     }
 
     #[test]

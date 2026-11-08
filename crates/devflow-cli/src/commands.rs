@@ -19,6 +19,7 @@ use crate::pipeline_launch::{launch_stage, single_active_phase};
 use crate::pipeline_outcomes::render_gate_context;
 use crate::preflight::{
     agent_program, ensure_agent_binary, ensure_base_ref_current, ensure_phase_reachable_on_base,
+    print_fallback_notice, validate_fallback_agent,
 };
 use crate::staleness::{enforce_build_staleness, run_git_stdout};
 use devflow_core::agent;
@@ -343,6 +344,17 @@ fn set_aside_leftover_gates(
     }
 }
 
+/// Where `start` takes the run's rate-limit fallback agent from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FallbackSource {
+    /// `devflow start`: the `--fallback-agent` flag when given, else
+    /// `devflow.toml`'s `fallback_agent` key (R-3).
+    FlagOrConfig(Option<AgentKind>),
+    /// `devflow parallel`, which takes no `--fallback-agent`: no fallback, and
+    /// `devflow.toml`'s key is not read (the key is read by `devflow start` only).
+    NoFallback,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start(
     project_root: &Path,
@@ -355,6 +367,7 @@ pub(crate) fn start(
     until: Option<Stage>,
     yes_ship: bool,
     legacy_claude_launch: bool,
+    fallback: FallbackSource,
 ) -> Result<(), CliError> {
     // 999.78/A-11: NOT a bare `State::new`. See
     // `fresh_state_carrying_phase_failures` for why one field survives a
@@ -397,6 +410,55 @@ pub(crate) fn start(
             "note: legacy Claude launch forced by DEVFLOW_CLAUDE_LEGACY_LAUNCH \
              (D-11, 31-CONTEXT.md) — a persisted default is never a silent one"
         );
+    }
+
+    // R-3: `devflow.toml`'s `fallback_agent` key, combined with the flag the way
+    // `yes_ship` is above: the flag wins when given, the key applies when it is
+    // absent. Resolved unconditionally, also when the flag is given, so a broken
+    // key refuses `start` whatever the flag says: the flag wins the value, it does
+    // not excuse a broken config file (stricter than `base_branch`, whose env
+    // override skips the file). `devflow parallel` passes `NoFallback`: it has no
+    // flag to override the key with, so it arms none, and checks and names the key
+    // itself before it launches anything.
+    let (fallback_agent, from_config) = match fallback {
+        FallbackSource::FlagOrConfig(flag) => {
+            let config_fallback =
+                config::fallback_agent(project_root).map_err(CliError::Message)?;
+            (
+                flag.or(config_fallback),
+                flag.is_none() && config_fallback.is_some(),
+            )
+        }
+        FallbackSource::NoFallback => (None, false),
+    };
+
+    // D-01, D-02, D-03: the fallback is checked against the state as combined above
+    // (agent, mode, legacy opt-out) and set before `dry_run`, the holder and the
+    // reservation, so a refused fallback changes nothing and a dry run shows it.
+    if let Some(fallback) = fallback_agent {
+        // D-02 and D-03 apply to the key's value exactly as to the flag's; a refusal
+        // of a key-supplied fallback also names the key and how to override it.
+        validate_fallback_agent(&state, fallback).map_err(|refusal| {
+            if from_config {
+                CliError::Message(format!(
+                    "devflow.toml's fallback_agent ({fallback}) is refused: {refusal}\npass \
+                     --fallback-agent <other> to choose another fallback, or remove \
+                     fallback_agent from devflow.toml"
+                ))
+            } else {
+                refusal
+            }
+        })?;
+        state.fallback_agent = Some(fallback);
+        print_fallback_notice(fallback, state.agent);
+        // A standing default is never a silent one: name the key when it alone
+        // supplied the fallback, as the `yes_ship` notice does.
+        if from_config {
+            println!(
+                "note: fallback agent {fallback} set by devflow.toml (fallback_agent) — pass \
+                 --fallback-agent to choose another"
+            );
+        }
     }
 
     if dry_run {
@@ -1572,8 +1634,16 @@ const HELD_NO_SOCKET_REPAIR: &str =
 /// else continues it; a phase that never launched and is not stopped names nothing, and
 /// neither does ALIVE. A `start` that died before its run was prepared names `start`, as
 /// `resume` would refuse it ([`run_never_prepared`]). A stored Ship answer names `ship`
-/// instead of the `resume` that would set it aside ([`ship_answer_stored`]).
-fn recovery_hints(state: &State, liveness: &PhaseLiveness) -> Vec<String> {
+/// instead of the `resume` that would set it aside ([`ship_answer_stored`]). A run whose
+/// recorded delivery canary refuses its agent names `resume --agent <other>`, since that
+/// canary refuses a plain `resume` and only a handoff clears it; that is judged as
+/// `resume` judges it, with the environment's legacy opt-out `env_legacy_opt_out`
+/// ([`resume_canary_refusal`](crate::pipeline_launch::resume_canary_refusal)).
+fn recovery_hints(
+    state: &State,
+    liveness: &PhaseLiveness,
+    env_legacy_opt_out: bool,
+) -> Vec<String> {
     let phase = state.phase;
     if run_never_prepared(state)
         && matches!(
@@ -1586,6 +1656,10 @@ fn recovery_hints(state: &State, liveness: &PhaseLiveness) -> Vec<String> {
     let stored = ship_answer_stored(state);
     let continue_verb = if stored {
         format!("devflow ship --phase {phase}")
+    } else if crate::pipeline_launch::resume_canary_refusal(state, false, env_legacy_opt_out)
+        .is_some()
+    {
+        format!("devflow resume --phase {phase} --agent <other>")
     } else {
         format!("devflow resume --phase {phase}")
     };
@@ -1756,7 +1830,11 @@ fn status_hints(
         Some(agent) if no_supervisor_live(liveness) => {
             vec![orphaned_agent_line(state.phase, agent)]
         }
-        _ => recovery_hints(state, liveness),
+        _ => recovery_hints(
+            state,
+            liveness,
+            devflow_core::config::claude_legacy_launch(),
+        ),
     }
 }
 
@@ -1969,6 +2047,14 @@ pub(crate) fn evidence(
     Ok(())
 }
 
+/// The characters of a gate's context the pending-gate banner and `devflow
+/// gate list` show. The idle-timeout cause clause is budgeted to close inside
+/// this bound (`MAX_IDLE_TIMEOUT_CLAUSE_CHARS` in `devflow-core`), so both
+/// renderings must use it; `gate show` prints the context in full.
+/// `the_budgeted_idle_timeout_clause_closes_inside_the_gate_display_bound` pins
+/// the two together.
+const GATE_CONTEXT_DISPLAY_CHARS: usize = 300;
+
 /// Build the persistent status-side signal for gates awaiting an operator.
 /// Context is agent-controlled, so it must use the same bounded rendering as
 /// gate notifications and failure events.
@@ -1984,7 +2070,7 @@ fn render_pending_gate_banner(open: &[OpenGate], now: u64) -> Option<String> {
             .and_then(|timestamp| now.checked_sub(timestamp))
             .is_some_and(|age| age >= GATE_ESCALATION_THRESHOLD_SECS);
         let marker = if escalated { "!!! ESCALATED" } else { "!!!" };
-        let context = render_gate_context(&gate.context, 300);
+        let context = render_gate_context(&gate.context, GATE_CONTEXT_DISPLAY_CHARS);
         let stage = gate.stage.to_string();
         banner.push_str(&format!(
             "{marker}: phase {} {stage} ({})\n  {context}\n  approve: devflow gate approve {} --stage {stage}\n  reject:  devflow gate reject {} --stage {stage} --note <reason>\n",
@@ -2028,7 +2114,7 @@ fn render_gate_list(open: &[OpenGate]) -> String {
         "PHASE", "STAGE", "AGE", "GATE ID"
     );
     for gate in open {
-        let context = render_gate_context(&gate.context, 100);
+        let context = render_gate_context(&gate.context, GATE_CONTEXT_DISPLAY_CHARS);
         table.push_str(&format!(
             "\n{:<6} {:<9} {:<9} {:<16} {context}",
             gate.phase,
@@ -2084,7 +2170,7 @@ fn gate_list_all_roots() -> Result<(), CliError> {
 /// `render_pending_gate_banner` already uses — so it's unit-testable
 /// without mutating wall-clock time.
 fn render_all_roots_gate_row(root: &Path, gate: &OpenGate, now: u64) -> String {
-    let context = render_gate_context(&gate.context, 100);
+    let context = render_gate_context(&gate.context, GATE_CONTEXT_DISPLAY_CHARS);
     format!(
         "{:<6} {:<9} {:<9} {:<16} {}\n           {context}",
         gate.phase,
@@ -4340,7 +4426,7 @@ pub(crate) fn claim_foreground_holder(
 }
 
 /// Print an open gate's full, untruncated (but sanitized) context — the
-/// discoverability counterpart to `gate_list`'s 100-char table truncation
+/// discoverability counterpart to `gate_list`'s `GATE_CONTEXT_DISPLAY_CHARS` truncation
 /// (21a, D-03). Shares `resolve_single_open_gate_stage` with `gate_respond`
 /// (999.30 / DEN-55 WR-01) so the two commands' gate-resolution behavior
 /// cannot drift, and resolves/selects from one fetched open-gate collection
@@ -4369,7 +4455,7 @@ pub(crate) fn gate_show(
 
 /// Pure render for `gate_show`'s output block — the FULL context via
 /// `render_gate_context(.., usize::MAX)` (sanitize, never truncate; contrast
-/// `gate_list`'s `render_gate_context(.., 100)`). Factored out of `gate_show`
+/// `gate_list`'s `render_gate_context(.., GATE_CONTEXT_DISPLAY_CHARS)`). Factored out of `gate_show`
 /// so the untruncated-context guarantee is unit-testable without capturing
 /// process stdout.
 fn render_gate_show(gate: &OpenGate) -> String {
@@ -8212,6 +8298,153 @@ mod tests {
         assert!(message.contains("nothing was written"), "{message}");
     }
 
+    /// `gate list` shows a gate's context as far as the pending-gate banner
+    /// does, so an idle-timeout cause clause past the 100th character is not cut
+    /// from the list; past the shared bound both truncate identically.
+    #[test]
+    fn gate_list_shows_the_context_as_far_as_the_banner_does() {
+        let cause =
+            "idle timeout (terminal_reason: max_turns; origin: tool_use; errors: quota exceeded)";
+        let context = format!(
+            "[never-silent] stage code failed: {}{cause}: no output for 900s",
+            "x".repeat(80)
+        );
+        assert!(context.chars().count() > 100 && context.chars().count() <= 261);
+        let dir = tempfile::tempdir().unwrap();
+        Gates::write_gate(dir.path(), PhaseId::new(5108), Stage::Code, &context).unwrap();
+        let open = Gates::list_open(dir.path());
+
+        let list = render_gate_list(&open);
+        let row = render_all_roots_gate_row(Path::new("/tmp/some-root"), &open[0], 10_000);
+        let banner = render_pending_gate_banner(&open, 10_000).unwrap();
+        for (rendering, text) in [
+            ("list", &list),
+            ("all-roots row", &row),
+            ("banner", &banner),
+        ] {
+            assert!(
+                text.contains(&context),
+                "{rendering} cut the cause clause: {text}"
+            );
+        }
+
+        let long = format!("{context} {}", "y".repeat(400));
+        Gates::write_gate(dir.path(), PhaseId::new(5108), Stage::Code, &long).unwrap();
+        let open = Gates::list_open(dir.path());
+        let shown = render_gate_context(&long, GATE_CONTEXT_DISPLAY_CHARS);
+        assert!(shown.contains(&context), "{shown}");
+        assert!(render_gate_list(&open).contains(&shown));
+        assert!(
+            render_pending_gate_banner(&open, 10_000)
+                .unwrap()
+                .contains(&shown)
+        );
+    }
+
+    /// When the recorded delivery canary refuses the run's agent, the failure gate's way
+    /// on (`devflow resume --phase N --agent <other>`) stays visible in the pending-gate
+    /// banner, `gate list` and the all-roots row even when the reason is long enough to be
+    /// capped. Control: a run whose recorded canary admits its agent carries no way on.
+    #[test]
+    fn the_failure_gate_way_on_survives_the_banner_and_gate_list_for_a_long_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::new(
+            PhaseId::new(9999),
+            AgentKind::Antigravity,
+            Mode::Auto,
+            dir.path().to_path_buf(),
+        );
+        state.canary = Some(devflow_core::canary::CanaryOutcome::Absent);
+        let reason = format!(
+            "the handoff to antigravity could not relaunch the code stage: {}",
+            "canary refusal detail ".repeat(20)
+        );
+        assert!(reason.chars().count() > 400);
+        let way_on = "`devflow resume --phase 9999 --agent <other>`";
+
+        let context = crate::pipeline_outcomes::failure_gate_context(
+            &state,
+            Stage::Code,
+            Some(reason.clone()),
+        );
+        assert!(context.contains(way_on), "{context}");
+        Gates::write_gate(dir.path(), PhaseId::new(9999), Stage::Code, &context).unwrap();
+        let open = Gates::list_open(dir.path());
+        let list = render_gate_list(&open);
+        let row = render_all_roots_gate_row(Path::new("/tmp/some-root"), &open[0], 10_000);
+        let banner = render_pending_gate_banner(&open, 10_000).unwrap();
+        for (rendering, text) in [
+            ("list", &list),
+            ("all-roots row", &row),
+            ("banner", &banner),
+        ] {
+            assert!(text.contains(way_on), "{rendering} cut the way on: {text}");
+            assert!(
+                text.contains("will not relaunch under antigravity"),
+                "{rendering} cut the way on: {text}"
+            );
+        }
+
+        state.canary = Some(devflow_core::canary::CanaryOutcome::Confirmed);
+        let admitted =
+            crate::pipeline_outcomes::failure_gate_context(&state, Stage::Code, Some(reason));
+        assert!(
+            !admitted.contains("will not relaunch") && !admitted.contains("--agent <other>"),
+            "control: an admitting canary names no way on: {admitted}"
+        );
+    }
+
+    /// The idle-timeout cause clause, at the longest length `devflow-core` budgets for it
+    /// (`MAX_IDLE_TIMEOUT_CLAUSE_CHARS`), closes inside what the banner and `gate list`
+    /// show (`GATE_CONTEXT_DISPLAY_CHARS`) after the reason cap and behind the longest
+    /// failure prefix (the Validate stage), however long the text after it. The bound is
+    /// derived from the constants, so changing either one fails this test until the
+    /// budget is re-derived. Control: one character past the budget is cut.
+    #[test]
+    fn the_budgeted_idle_timeout_clause_closes_inside_the_gate_display_bound() {
+        let clause_close = |clause_chars: usize| {
+            let clause = "c".repeat(clause_chars);
+            let reason = format!(
+                "idle timeout ({clause}): no output for 900s {}",
+                "z".repeat(400)
+            );
+            let dir = tempfile::tempdir().unwrap();
+            let state = State::new(
+                PhaseId::new(9999),
+                AgentKind::Claude,
+                Mode::Auto,
+                dir.path().to_path_buf(),
+            );
+            let context = crate::pipeline_outcomes::failure_gate_context(
+                &state,
+                Stage::Validate,
+                Some(reason),
+            );
+            assert!(context.starts_with("[never-silent] stage validate failed: idle timeout ("));
+            Gates::write_gate(dir.path(), PhaseId::new(9999), Stage::Validate, &context).unwrap();
+            let open = Gates::list_open(dir.path());
+            let closed = format!("{clause}): ");
+            [
+                render_gate_list(&open),
+                render_all_roots_gate_row(Path::new("/tmp/some-root"), &open[0], 10_000),
+                render_pending_gate_banner(&open, 10_000).unwrap(),
+            ]
+            .map(|text| text.contains(&closed))
+        };
+
+        let budget = devflow_core::agent_result::MAX_IDLE_TIMEOUT_CLAUSE_CHARS;
+        assert_eq!(
+            clause_close(budget),
+            [true; 3],
+            "list, all-roots row, banner"
+        );
+        assert_eq!(
+            clause_close(budget + 24),
+            [false; 3],
+            "control: a clause past the budget is cut"
+        );
+    }
+
     #[test]
     fn gate_list_and_show_print_the_gate_id() {
         let dir = tempfile::tempdir().unwrap();
@@ -11562,7 +11795,7 @@ mod tests {
         );
         state.verification_baseline_captured = true;
 
-        let hints = recovery_hints(&state, &PhaseLiveness::GoneWhileActive);
+        let hints = recovery_hints(&state, &PhaseLiveness::GoneWhileActive, false);
 
         assert_eq!(hints, vec!["devflow resume --phase 7".to_string()]);
     }
@@ -11589,12 +11822,12 @@ mod tests {
 
         state.stage = Stage::Code;
         assert_eq!(
-            recovery_hints(&state, &PhaseLiveness::GoneWhileActive),
+            recovery_hints(&state, &PhaseLiveness::GoneWhileActive, false),
             vec!["devflow resume --phase 7".to_string()]
         );
         state.stage = Stage::Ship;
         assert_eq!(
-            recovery_hints(&state, &PhaseLiveness::GoneWhileActive),
+            recovery_hints(&state, &PhaseLiveness::GoneWhileActive, false),
             vec![
                 "devflow resume --phase 7".to_string(),
                 "devflow ship --phase 7".to_string(),
@@ -11621,7 +11854,7 @@ mod tests {
                 for stage in [Stage::Code, Stage::Ship] {
                     state.gate_pending = gate_pending;
                     state.stage = stage;
-                    let hints = recovery_hints(&state, liveness);
+                    let hints = recovery_hints(&state, liveness, false);
                     assert!(
                         !hint_routes_an_answer_through_advance(&hints),
                         "{liveness:?} gate_pending={gate_pending} {stage}: {hints:?}"
@@ -11651,7 +11884,7 @@ mod tests {
         );
 
         assert_eq!(
-            recovery_hints(&state, &PhaseLiveness::Stale),
+            recovery_hints(&state, &PhaseLiveness::Stale, false),
             vec![
                 "devflow stop --phase 7".to_string(),
                 "devflow resume --phase 7".to_string(),
@@ -11676,7 +11909,7 @@ mod tests {
 
         for liveness in [alive, PhaseLiveness::NotLaunched] {
             assert!(
-                recovery_hints(&state, &liveness).is_empty(),
+                recovery_hints(&state, &liveness, false).is_empty(),
                 "{liveness:?} needs no repair"
             );
         }
@@ -11698,7 +11931,7 @@ mod tests {
 
         for liveness in [PhaseLiveness::Gone, PhaseLiveness::NotLaunched] {
             assert_eq!(
-                recovery_hints(&state, &liveness),
+                recovery_hints(&state, &liveness, false),
                 vec!["devflow resume --phase 7".to_string()],
                 "{liveness:?}"
             );
@@ -11707,7 +11940,83 @@ mod tests {
             owner: "agent_running".to_string(),
             launch: "stream".to_string(),
         };
-        assert!(recovery_hints(&state, &alive).is_empty(), "control");
+        assert!(recovery_hints(&state, &alive, false).is_empty(), "control");
+    }
+
+    /// A stopped run whose recorded delivery canary refuses its agent names `resume
+    /// --agent <other>`, not the plain `resume` that canary would refuse. Control: the same
+    /// run with a recorded `Confirmed` names the plain `resume`.
+    #[test]
+    fn recovery_hints_name_another_agent_when_the_recorded_canary_refuses_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::new(
+            PhaseId::new(7),
+            AgentKind::Antigravity,
+            Mode::Auto,
+            dir.path().to_path_buf(),
+        );
+        state.verification_baseline_captured = true;
+        state.stopped = true;
+        state.stage = Stage::Code;
+
+        state.canary = Some(devflow_core::canary::CanaryOutcome::Confirmed);
+        assert_eq!(
+            recovery_hints(&state, &PhaseLiveness::Gone, false),
+            vec!["devflow resume --phase 7".to_string()],
+            "control: a recorded Confirmed keeps the plain resume"
+        );
+
+        for refusal in [
+            devflow_core::canary::CanaryOutcome::Absent,
+            devflow_core::canary::CanaryOutcome::Unverified("no binary".to_string()),
+        ] {
+            state.canary = Some(refusal.clone());
+            for liveness in [PhaseLiveness::Gone, PhaseLiveness::NotLaunched] {
+                assert_eq!(
+                    recovery_hints(&state, &liveness, false),
+                    vec!["devflow resume --phase 7 --agent <other>".to_string()],
+                    "{refusal:?} {liveness:?}"
+                );
+            }
+        }
+    }
+
+    /// The status hint and `resume`'s refusal judge the environment's legacy opt-out
+    /// alike: a Claude run at Code with a recorded `Absent` canary, under the stream
+    /// launch, is refused, so the hint names `--agent <other>`; with the environment's
+    /// opt-out the relaunch takes the legacy path that `resume` admits, so the hint names
+    /// the plain `resume`. Both directions are asserted, so the hint is neither constant.
+    #[test]
+    fn recovery_hints_judge_the_environment_legacy_opt_out_as_resume_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::new(
+            PhaseId::new(7),
+            AgentKind::Claude,
+            Mode::Auto,
+            dir.path().to_path_buf(),
+        );
+        state.verification_baseline_captured = true;
+        state.stopped = true;
+        state.stage = Stage::Code;
+        state.legacy_claude_launch = false;
+        state.canary = Some(devflow_core::canary::CanaryOutcome::Absent);
+
+        for (env_opt_out, expected) in [
+            (false, "devflow resume --phase 7 --agent <other>"),
+            (true, "devflow resume --phase 7"),
+        ] {
+            let refused =
+                crate::pipeline_launch::resume_canary_refusal(&state, false, env_opt_out).is_some();
+            assert_eq!(
+                refused, !env_opt_out,
+                "resume's judgment, env {env_opt_out}"
+            );
+            assert_eq!(
+                recovery_hints(&state, &PhaseLiveness::Gone, env_opt_out),
+                vec![expected.to_string()],
+                "env opt-out {env_opt_out}"
+            );
+        }
     }
 
     /// 21a / 999.30 IN-01: the shared one-pass event summary's
@@ -15455,6 +15764,7 @@ mod tests {
             None,
             false,
             true,
+            FallbackSource::FlagOrConfig(None),
         )
         .map_err(|err| err.to_string())
     }
@@ -15525,6 +15835,167 @@ mod tests {
             liveness::probe(&pending.liveness_path).unwrap(),
             liveness::Held::Live,
             "the supervisor holds the reserved lock after the launcher has returned"
+        );
+    }
+
+    /// `start` as the fallback tests run it: Supervise, no worktree, the capture shape,
+    /// `agent` as the primary and `mode` and `fallback` as given.
+    fn start_with_fallback(
+        root: &Path,
+        phase: PhaseId,
+        agent: AgentKind,
+        mode: Mode,
+        fallback: Option<AgentKind>,
+    ) -> Result<(), CliError> {
+        start(
+            root,
+            phase,
+            agent,
+            mode,
+            false,
+            false,
+            false,
+            None,
+            false,
+            true,
+            FallbackSource::FlagOrConfig(fallback),
+        )
+    }
+
+    /// D-01: `start --fallback-agent` persists the fallback, unused, in the run state the
+    /// first supervisor reads, and says which agent it stands behind.
+    #[test]
+    fn start_persists_the_fallback_agent_in_the_run_state() {
+        const NAME: &str = "commands::tests::start_persists_the_fallback_agent_in_the_run_state";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = crate::test_support::go_waiting_claude_dir();
+            crate::test_support::add_agent_stub(path_dir.path(), "codex");
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            let printed = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                printed.contains(
+                    "fallback agent: codex takes over the Code stage once if claude is rate-limited"
+                ),
+                "start names the fallback and the primary: {printed}"
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5141);
+        init_start_repo(root, phase);
+
+        let result = start_with_fallback(
+            root,
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            Some(AgentKind::Codex),
+        );
+        let state = workflow::load_state(root, phase).unwrap();
+        let _reap = crate::test_support::ReapMonitorOnDrop::after_launch(&state);
+        result.expect("the start launches");
+
+        assert_eq!(state.agent, AgentKind::Claude);
+        assert_eq!(state.fallback_agent, Some(AgentKind::Codex));
+        assert!(!state.fallback_consumed, "a new fallback is unused");
+        assert!(state.supervisor.is_some(), "the run launched");
+    }
+
+    /// Run the test `name` in a hermetic child whose `PATH` holds no agent binary, returning
+    /// `true` in the parent, whose work is done, and `false` in the child. A refusal test
+    /// runs there so that, were its refusal ever lost, the start it drives would stop at a
+    /// missing binary under a scratch cache rather than reach the host's.
+    fn run_in_an_agent_free_child(name: &str) -> bool {
+        if devflow_core::test_support::in_child_test(name) {
+            return false;
+        }
+        let path_dir = crate::test_support::agent_free_git_only_path_dir();
+        let output = crate::test_support::run_hermetic_test_in_child(name, path_dir.path(), &[]);
+        devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, name);
+        true
+    }
+
+    /// D-02: a fallback equal to the agent is refused before anything is written, and the
+    /// refusal names the agent in both roles.
+    #[test]
+    fn start_refuses_a_fallback_equal_to_the_agent() {
+        const NAME: &str = "commands::tests::start_refuses_a_fallback_equal_to_the_agent";
+        if run_in_an_agent_free_child(NAME) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5142);
+
+        let err = start_with_fallback(
+            root,
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            Some(AgentKind::Claude),
+        )
+        .expect_err("a fallback equal to the agent is refused")
+        .to_string();
+
+        assert!(
+            err.contains("--fallback-agent claude"),
+            "names the fallback: {err}"
+        );
+        assert!(
+            err.contains("run's own agent (claude)"),
+            "names the agent: {err}"
+        );
+        assert!(
+            !workflow::state_path(root, phase).exists(),
+            "no state was written"
+        );
+        assert!(
+            !root.join(".devflow").exists(),
+            "nothing was written under .devflow"
+        );
+    }
+
+    /// D-03: in `--mode auto` a fallback outside the unattended launch shape is refused
+    /// before anything is written, naming the fallback and the condition.
+    #[test]
+    fn start_in_auto_mode_refuses_a_fallback_outside_the_unattended_launch_shape() {
+        const NAME: &str = "commands::tests::\
+                            start_in_auto_mode_refuses_a_fallback_outside_the_unattended_launch_shape";
+        if run_in_an_agent_free_child(NAME) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5143);
+
+        let err = start_with_fallback(
+            root,
+            phase,
+            AgentKind::Claude,
+            Mode::Auto,
+            Some(AgentKind::Codex),
+        )
+        .expect_err("codex cannot take over an unattended Code stage")
+        .to_string();
+
+        assert!(
+            err.contains("--fallback-agent codex"),
+            "names the fallback: {err}"
+        );
+        assert!(
+            err.contains("unattended launch shape"),
+            "names the condition: {err}"
+        );
+        assert!(
+            !workflow::state_path(root, phase).exists(),
+            "no state was written"
+        );
+        assert!(
+            !root.join(".devflow").exists(),
+            "nothing was written under .devflow"
         );
     }
 
@@ -15839,6 +16310,7 @@ mod tests {
             None,
             false,
             true,
+            FallbackSource::FlagOrConfig(None),
         )
         .map_err(|err| err.to_string())
     }
@@ -16296,24 +16768,24 @@ mod tests {
         let stop = format!("devflow stop --phase {phase}");
 
         assert!(
-            recovery_hints(&state, &PhaseLiveness::GoneWhileActive).contains(&resume),
+            recovery_hints(&state, &PhaseLiveness::GoneWhileActive, false).contains(&resume),
             "control: nothing stored yet"
         );
 
         gate_respond(root, phase, Some(Stage::Ship), true, None, None).unwrap();
 
         assert_eq!(
-            recovery_hints(&state, &PhaseLiveness::GoneWhileActive),
+            recovery_hints(&state, &PhaseLiveness::GoneWhileActive, false),
             vec![ship.clone()]
         );
         assert_eq!(
-            recovery_hints(&state, &PhaseLiveness::Stale),
+            recovery_hints(&state, &PhaseLiveness::Stale, false),
             vec![stop, ship.clone()]
         );
         let mut stopped = state.clone();
         stopped.stopped = true;
         assert_eq!(
-            recovery_hints(&stopped, &PhaseLiveness::Gone),
+            recovery_hints(&stopped, &PhaseLiveness::Gone, false),
             vec![ship.clone()]
         );
         let open_gates = Gates::list_open(root);
@@ -16345,7 +16817,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            recovery_hints(&state, &PhaseLiveness::GoneWhileActive).contains(&resume),
+            recovery_hints(&state, &PhaseLiveness::GoneWhileActive, false).contains(&resume),
             "control: a claimed answer is out of `devflow ship`'s reach"
         );
     }
@@ -16444,6 +16916,7 @@ mod tests {
             None,
             false,
             true,
+            FallbackSource::FlagOrConfig(None),
         )
         .map_err(|err| err.to_string())
     }
@@ -16504,7 +16977,7 @@ mod tests {
         assert!(err.contains("discard"), "{err}");
         assert!(err.contains(&*worktree_path.to_string_lossy()), "{err}");
         assert!(!err.contains("no worktree"), "{err}");
-        let hints = recovery_hints(&killed, &PhaseLiveness::NotLaunched);
+        let hints = recovery_hints(&killed, &PhaseLiveness::NotLaunched, false);
         assert!(hints[0].starts_with(&verb), "{hints:?}");
 
         let refused = start_as_refusal_names(root, phase, false).unwrap_err();
@@ -16538,7 +17011,7 @@ mod tests {
         ] {
             let liveness = probe_phase(state);
             assert_eq!(
-                recovery_hints(state, &liveness),
+                recovery_hints(state, &liveness, false),
                 vec![start_verb.clone()],
                 "{case}"
             );
@@ -16559,7 +17032,7 @@ mod tests {
         let mut prepared = killed.clone();
         prepared.verification_baseline_captured = true;
         assert_eq!(
-            recovery_hints(&prepared, &probe_phase(&prepared)),
+            recovery_hints(&prepared, &probe_phase(&prepared), false),
             vec![resume_verb.clone()]
         );
         let findings = reconcile_phase(&facts_for(root, &prepared));
@@ -17332,7 +17805,7 @@ mod tests {
             );
             assert_eq!(phase_liveness.label(), "launch_pending", "{case}");
             assert_eq!(
-                recovery_hints(&state, &phase_liveness),
+                recovery_hints(&state, &phase_liveness, false),
                 vec![format!("devflow stop --phase {phase}")],
                 "{case}"
             );
@@ -17362,7 +17835,7 @@ mod tests {
             assert_eq!(phase_liveness, PhaseLiveness::GoneWhileActive, "{case}");
             let resume = format!("devflow resume --phase {phase}");
             assert_eq!(
-                recovery_hints(&state, &phase_liveness),
+                recovery_hints(&state, &phase_liveness, false),
                 vec![resume.clone()],
                 "{case}"
             );
@@ -18109,6 +18582,7 @@ mod tests {
                 None,
                 false,
                 true,
+                FallbackSource::FlagOrConfig(None),
             )
             .expect_err("a stop at a safe point during the gate wait is an error")
             .to_string();

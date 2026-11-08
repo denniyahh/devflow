@@ -3,19 +3,18 @@ gsd_state_version: "1.0"
 milestone: v3.0.0
 milestone_name: milestone (ACTIVE — Unattended Run Survivability)
 current_phase: 51
-current_phase_name: Rate-Limit Agent Failover
 current_plan: Not started
-status: planning
-stopped_at: Phase 51 context gathered
-last_updated: "2026-11-05T23:27:01.254Z"
-last_activity: 2026-11-05
-last_activity_desc: Phase 51 context gathered (discuss --auto)
-state_head: b980749a60e693bd3ff43ff03734c209fe0e1f23
+status: completed
+stopped_at: Phase 51 complete — all phases complete
+last_updated: "2026-11-08T10:44:03.635Z"
+last_activity: 2026-11-08
+last_activity_desc: Phase 51 complete
+state_head: 54ca9bef30489d6c4dc59741c8d6fb0da6806a7a
 progress:
   total_phases: 7
   completed_phases: 5
-  total_plans: 107
-  completed_plans: 107
+  total_plans: 120
+  completed_plans: 120
   percent: 71
 ---
 
@@ -59,9 +58,9 @@ stale; it was restored from `9411158` on 2026-09-13. Do not reintroduce the bold
 
 ## Active Phase
 
-**Phase 51 — Rate-Limit Agent Failover is next and unplanned.** Phase 50.1 (Split-Lock State-Handling Overhaul) is complete: 30/30 plans, verification passed 12/12 with one operator override (the live-run criterion), merged to `develop` via PR #229 and into `workspace/denniyahh` (2026-11-04). **v3.0.0 was released 2026-11-03/04**: `main` at `46064c6`, signed tag `v3.0.0`, `devflow-core` and `devflow` 3.0.0 on crates.io, GitHub Release and docs published. It carries Phases 46 to 50.1.
+**Phase 51 — Rate-Limit Agent Failover is complete (2026-11-08)**: 13/13 plans (51-08 dropped by operator ruling), code review and security verification done, verification passed 114/114. It is the last phase of v3.0.0; close-out (PR via `scripts/cut-pr-branch.sh`, 3.1.0 release, milestone completion) is by hand per the Phase 51 conventions in `CLAUDE.md`. Phase 50.1 (Split-Lock State-Handling Overhaul) is complete: 30/30 plans, verification passed 12/12 with one operator override (the live-run criterion), merged to `develop` via PR #229 and into `workspace/denniyahh` (2026-11-04). **v3.0.0 was released 2026-11-03/04**: `main` at `46064c6`, signed tag `v3.0.0`, `devflow-core` and `devflow` 3.0.0 on crates.io, GitHub Release and docs published. It carries Phases 46 to 50.1.
 
-Milestone **v3.0.0 — Unattended Run Survivability**: 6 of 7 phases complete (46, 47, 48, 49, 50, 50.1). Phase 51 remains and is to ship as a minor release (3.1.0), per the operator's 2026-10-09 plan. The wave order is the milestone's design: correctness (46, 47) → survivability (48) → the live `--mode auto` run that measures them (49) → the socket-addressable supervisor (50, 50.1) → rate-limit failover on top (51).
+Milestone **v3.0.0 — Unattended Run Survivability**: 7 of 7 phases complete (46, 47, 48, 49, 50, 50.1, 51). Phase 51 is to ship as a minor release (3.1.0), per the operator's 2026-10-09 plan. The wave order is the milestone's design: correctness (46, 47) → survivability (48) → the live `--mode auto` run that measures them (49) → the socket-addressable supervisor (50, 50.1) → rate-limit failover on top (51).
 
 **Dogfooding resumes with Phase 51** (operator rule 2026-11-04, `CLAUDE.md`): DevFlow drives its own phases. No run has exercised the final 3.0.0 code; Phase 50.1's last live attempt used an earlier build.
 
@@ -69,11 +68,11 @@ The text this section carried until 2026-11-04 described Phase 48 as the latest 
 
 ## Project Reference
 
-See: `.planning/PROJECT.md` (updated 2026-09-23)
+See: `.planning/PROJECT.md` (updated 2026-11-08)
 
 **Core value:** `devflow start --phase N` and walk away — reliably drive the agent through the full
 pipeline, never silently corrupt state or lose a human's gate decision.
-**Current focus:** Phase 51 — Rate-Limit Agent Failover
+**Current focus:** v3.0.0 close-out — Phase 51 complete; next is the milestone audit/completion and the 3.1.0 release
 
 ## Operator Next Steps
 
@@ -170,16 +169,16 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 51 — Rate-Limit Agent Failover
-Plans: none yet (Phase 51 is unplanned)
+Phase: 51
+Plans: 13 (51-01 … 51-14, no 51-08; 8 waves)
 Current Plan: Not started
-Total Plans in Phase: 0
-Completed Plans: 0 of 0
-Status: Ready to plan
+Total Plans in Phase: 13
+Completed Plans: 13 of 13
+Status: All phases complete
 Previous phase: 50.1 — complete, 30/30 plans; verification passed 12/12 (one operator override, the live-run criterion); merged via PR #229; released in v3.0.0. Phase 47's verification still reads `stale` by operator decision (re-verify near milestone close).
-Last activity: 2026-11-04 — v3.0.0 released; Phase 50.1 merged into workspace/denniyahh; STATE refreshed; backlog 999.181-182 filed
+Last activity: 2026-11-08 — Phase 51 complete
 
-Progress: [████████░░] 86% (6 of 7 phases complete in the ROADMAP progress table — 46, 47, 48, 49, 50, 50.1; 49.1 inserted and removed 2026-10-09; 50.1 inserted 2026-10-10. `roadmap.analyze` reports 2 because it reads 47 and 48 as executed, and `progress.bar` counts plans, 48/48)
+Progress: [██████████] 100% (7 of 7 phases complete in the ROADMAP progress table — 46, 47, 48, 49, 50, 50.1, 51; 49.1 inserted and removed 2026-10-09; 50.1 inserted 2026-10-10. `roadmap.analyze` reports 2 because it reads 47 and 48 as executed, and `progress.bar` counts plans, 48/48)
 
 ## Recently Shipped
 
@@ -833,6 +832,29 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 49]: 49-12: VERIFY-01 written as met on attempt 3 (attempt gate verdict=shipped; committed copy positive 11/0, negative 5/0, pair 3/0); shipped binary is from unmerged fix-branch commit 084625c
 - [Phase 49]: 49-12: DECN-03 outcome Followed (gate-derived from attempt 3 committed events/captures; claude only, D-15)
 - [Phase 49]: 49-12: attempt 2's two sanitizer-refused captures omitted whole by operator decision 2026-10-08 (option A)
+- [Phase 51]: 51-01: a refused failover handoff is a value (HandoffOutcome::Refused), mapped to resume --agent's unchanged refusal texts or to agent_handoff_refused plus the cron arm; failover is reachable only from an explicit AgentStatus::RateLimited arm and only at Code
+- [Phase 51]: 51-02: the removed-handoff attribute scan reads every #[command(...)] in the CLI sources and compares name/alias values whole (exact element equality), so name = "__monitor" is clean
+- [Phase 51]: 51-03: idle-timeout cause keys live on a crate-private flattened wrapper (IdleTimeoutRecordOnDisk); the published IdleTimeoutRecord is unchanged (R-1)
+- [Phase 51]: 51-03: cause bounded in the reader (3 errors, 160 chars, controls replaced); reason clause capped at 200 chars so it closes inside the 300-char gate context
+- [Phase 51]: 51-04: every fallback check on resume (D-02 both forms, D-03) runs in refuse_fallback_for_resume before commit_notify_env, so a refused resume writes nothing but the reservation it gives back (review B-3); the re-arm lives in the final commit every resume makes
+- [Phase 51]: 51-04: resume is now #[cfg(test)] (signature unchanged); main dispatches Resume to resume_with_fallback. The fallback notice goes through std::io::stdout() so child-process tests can read it
+- [Phase 51]: 51-05: detect_claude_stream_rate_limit picks its turn boundary and its rate_limit_event among is_top_level events only, so a subagent's quota event cannot classify RateLimited or trigger failover (T-30-12, R2-3)
+- [Phase 51]: 51-05: crate-private CaptureDenial (Denied/NotDenied/TornAfterLastEvent); a torn tail writes the idle record flagged capture_torn_final_line and the reason leads its capped clause with 'torn final line, a quota denial cannot be ruled out'; the read side also re-checks the capture (EOF tee)
+- [Phase 51]: 51-06: a failover relaunch that fails after the handoff commit emits agent_handoff_relaunch_failed and calls handle_infra_outcome (gate, or abort at the ceiling), not the cron arm; FailoverRelaunchGuard keeps the supervisor record through that one relaunch so the writes stay owned under the Phase 50 D-03 fence
+- [Phase 51]: 51-06: hand_off_agent's commit clears canary and session_id; agent_handoff gains tree_dirty and commit_count (null when unmeasured)
+- [Phase 51]: 51-14: devflow.toml fallback_agent is resolved at start before the flag-first choice; an unparseable file or a value naming no agent refuses start even with a valid --fallback-agent (flag wins the value, not a broken file); devflow resume does not read the key
+- [Phase 51]: 51-14: a key-supplied fallback refused by validate_fallback_agent is wrapped to name devflow.toml's fallback_agent and the override (--fallback-agent <other> or remove the key); a flag refusal keeps 51-04's text
+- [Phase 51]: 51-07: State.code_fix holds the FixType of the Code pass in flight, never a rendered prompt; default_stage_prompt renders it with the current agent's driver at launch, and launch_stage_inner and launch_stage both render through it (D-09)
+- [Phase 51]: 51-07: code_fix is written only by prepare_loop_back_to_code's Code-entering commit and cleared by both transition commits (--until stop and stage move)
+- [Phase 51]: 51-09: WR-12 and IN-10 closed as no longer reproducing at gate entry (gate_entry_fires_a_notify_cmd_edited_after_the_advance_loaded, gate_entry_over_an_unparseable_state_does_not_rewrite_it; both fail under a blind save_state at entry); the unloadable-state error does not name the file path
+- [Phase 51]: 51-09: the WR-13 resume arm reads after the first stage_launched event and runs the resume fixture in supervise mode, because auto mode parks at the D-07 Define preflight gate before any launch; it fails on the apply_notify_env(None) mutant
+- [Phase 51]: 51-12: the auto-mode Claude to Antigravity failover at Code is pinned end to end through the binary; each failover_e2e test waits on any run-end event and then asserts which one, so a wrong end reports the event log at once
+- [Phase 51]: 51-10: a withheld publish wait fails the failover relaunch and an ordinary Plan to Code launch alike; in a test build the successor's 5 s promotion expiry ends it before the 10 s publish wait, so the release-only end_unpublished_child path is not reached by these tests
+- [Phase 51]: 51-10: the SUPV-01 trace adds live_holder, remove_abandoned_waiters and sweep_entry as gap rows; the ordinary path's missing cause record extends 51-06 backlog finding 2 (one 999.x entry for both)
+- [Phase 51]: 51-13: the post-save probe seam answers Gone (R2-8); its error arm returns the healthy branch's true and is recorded as settled by reading (pipeline_launch.rs:2555-2560), with no test
+- [Phase 51]: 51-13: criterion 3 rests on six experiments plus stated gaps; failover and an ordinary launch, and a cron resume and an ordinary resume, dispose every withheld read identically; only a failed ordinary in-supervisor launch is left ungated (backlog, with 51-06/51-10)
+- [Phase 51]: 51-11: the rate-limit failover is documented in a new OPERATIONS.md section (events, gate, 51-06 remedy, idle-timeout wording), pinned row-by-row by doc_check::operations_md_documents_the_fallback_agent_and_its_events
+- [Phase 51]: 51-11: the notify limit sentence (999.154) is reworded to WR-12's fixed behaviour — the gate reloads the state file when it opens
 
 ## Roadmap Evolution
 
@@ -930,12 +952,25 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 48 P20 | 16m | 2 tasks | 4 files |
 | Phase 49 P11 | 6h operator | 1 tasks | 1 files |
 | Phase 49 P12 | 24h 26m | 3 tasks | 255 files |
+| Phase 51 P01 | 16 min | 2 tasks | 2 files |
+| Phase 51 P02 | 6min | 2 tasks | 1 files |
+| Phase 51 P03 | 12 min | 2 tasks | 3 files |
+| Phase 51 P04 | 15 min | 3 tasks | 6 files |
+| Phase 51 P05 | 15 min | 2 tasks | 2 files |
+| Phase 51 P06 | 14 min | 3 tasks | 1 files |
+| Phase 51 P14 | 12 min | 2 tasks | 4 files |
+| Phase 51 P07 | 11 min | 2 tasks | 4 files |
+| Phase 51 P09 | 12 min | 3 tasks | 5 files |
+| Phase 51 P12 | 5 min | 2 tasks | 1 files |
+| Phase 51 P10 | 26 min | 3 tasks | 4 files |
+| Phase 51 P13 | 20 min | 3 tasks | 3 files |
+| Phase 51 P11 | 25 min | 2 tasks | 5 files |
 
 ## Session
 
-**Last session:** 2026-11-05T23:26:59.508Z
-**Stopped at:** Phase 51 context gathered
-**Resume file:** .planning/phases/51-rate-limit-agent-failover/51-CONTEXT.md
+**Last session:** 2026-11-08
+**Stopped at:** Phase 51 complete — last phase of v3.0.0; ready for milestone completion
+**Resume file:** None
 
 ## Operator Next Steps
 

@@ -30,8 +30,8 @@ use crate::pipeline_outcomes::{
     handle_validate_outcome, truncate_reason,
 };
 use crate::preflight::{
-    agent_program, ensure_agent_binary, generic_preflight_checks, run_preflight,
-    worktree_writable_roots,
+    agent_program, ensure_agent_binary, generic_preflight_checks, print_fallback_notice,
+    run_preflight, validate_fallback_agent, worktree_writable_roots,
 };
 use devflow_core::config::capture_retention;
 use devflow_core::gates::{
@@ -126,6 +126,30 @@ fn stamp_validate_dispatch_window(state: &mut State) {
     state.verification_baseline_captured = true;
 }
 
+/// The prompt a launch with no override gives the agent, rendered by `driver`
+/// (Phase 51 D-09). At Code it replays the persisted fix pass
+/// ([`State::code_fix`]), so a same-stage relaunch inside an audit-fix,
+/// gaps-only or full-execute pass continues that pass; every other stage gets
+/// its default intent. The fix TYPE is persisted and rendered here, at launch,
+/// so after a handoff the fallback's own renderer is used.
+///
+/// The only place a default stage prompt is rendered:
+/// [`launch_stage_inner`] (whose prompt the agent receives) and
+/// [`launch_stage`] (which resolves the program from it) both call this, which
+/// `every_no_override_launch_renders_through_default_stage_prompt` pins.
+fn default_stage_prompt(state: &State, driver: &dyn agents::AgentDriver) -> String {
+    let intent = match state.stage {
+        Stage::Code => prompt::StageIntent::Code {
+            phase: state.phase,
+            fix: state.code_fix,
+        },
+        stage => {
+            prompt::StageIntent::for_stage_in_project(stage, state.phase, Some(&state.project_root))
+        }
+    };
+    driver.render_prompt(&intent)
+}
+
 /// Recomputes `prompt`/`adapter`/`roots`/`program`/`args` from `state` and
 /// `prompt_override` — deliberately NOT threaded through as parameters.
 /// They are pure functions of `state` and the prompt override; recomputing
@@ -140,13 +164,7 @@ pub(crate) fn launch_stage_inner(
     archived_stage: Option<Stage>,
 ) -> Result<(), CliError> {
     let driver = agents::driver_for(state.agent);
-    let prompt = prompt_override.unwrap_or_else(|| {
-        driver.render_prompt(&prompt::StageIntent::for_stage_in_project(
-            state.stage,
-            state.phase,
-            Some(&state.project_root),
-        ))
-    });
+    let prompt = prompt_override.unwrap_or_else(|| default_stage_prompt(state, driver.as_ref()));
     // In worktree mode the agent's cwd is the linked worktree, but git
     // metadata for commits lives under the main repo's `.git/` — sandboxed
     // agents need it (and the worktree admin dir, which Codex read-only-
@@ -414,15 +432,31 @@ fn append_monitor_log(project_root: &Path, phase: PhaseId, entry: &str) {
 /// caller can print the "a persisted default is never a silent one" notice —
 /// `--yes-ship`'s shape, for the same reason.
 pub(crate) fn apply_legacy_launch_opt_out(state: &mut State, flag: bool) -> bool {
-    let env = devflow_core::config::claude_legacy_launch();
+    combine_legacy_launch_opt_out(state, flag, devflow_core::config::claude_legacy_launch())
+}
+
+/// [`apply_legacy_launch_opt_out`] with the environment's value passed in.
+fn combine_legacy_launch_opt_out(state: &mut State, flag: bool, env: bool) -> bool {
     state.legacy_claude_launch = state.legacy_claude_launch || flag || env;
     env && !flag
+}
+
+/// [`recorded_canary_refusal`] for a `devflow resume` of `state` on its own agent: the
+/// state judged as `resume` would launch it, with the legacy opt-out combined from
+/// `flag` and `env` as [`apply_legacy_launch_opt_out`] does. `resume`'s refusal and
+/// `status`'s hint both judge through it, so they cannot disagree on the environment's
+/// opt-out.
+pub(crate) fn resume_canary_refusal(state: &State, flag: bool, env: bool) -> Option<String> {
+    let mut candidate = state.clone();
+    // Only the combined value is read here; the notice is `resume_loaded`'s to print.
+    let _env_alone = combine_legacy_launch_opt_out(&mut candidate, flag, env);
+    recorded_canary_refusal(&candidate)
 }
 
 /// Entry-point name recorded in the `auto_chain_flag_repaired` payload by
 /// [`commands::start`](crate::commands::start).
 pub(crate) const AUTO_CHAIN_REPAIR_FROM_START: &str = "start";
-/// Entry-point name recorded by [`resume`].
+/// Entry-point name recorded by [`resume_with_fallback`].
 pub(crate) const AUTO_CHAIN_REPAIR_FROM_RESUME: &str = "resume";
 
 /// Repair a leaked `workflow._auto_chain_active` before this launch spawns
@@ -610,6 +644,29 @@ where
     }
 }
 
+/// The refusal [`canary_gate`] would give a launch of `state`'s stage under its agent
+/// from the canary outcome the run already recorded, described for an operator; `None`
+/// when the launch would not be refused for that reason. The same predicate as
+/// [`launch_stage_inner`]'s (the stream path, a recorded `Absent` or `Unverified`), read
+/// without running a canary or writing anything. It is a second copy of `canary_gate`'s
+/// mapping, so `recorded_canary_refusal_agrees_with_canary_gate_on_every_recorded_outcome`
+/// pins the two together: change one and that test fails until the other matches.
+pub(crate) fn recorded_canary_refusal(state: &State) -> Option<String> {
+    if !stream_launch_enabled(state.agent, state.stage, state.legacy_claude_launch) {
+        return None;
+    }
+    match state.canary.as_ref()? {
+        canary::CanaryOutcome::Confirmed => None,
+        canary::CanaryOutcome::Absent => {
+            Some("background-task notification delivery is ABSENT".to_string())
+        }
+        canary::CanaryOutcome::Unverified(reason) => Some(format!(
+            "the delivery canary could not run: {}",
+            truncate_reason(reason)
+        )),
+    }
+}
+
 /// Abort a launch the canary refused, leaving no half-launched stage behind.
 ///
 /// Clearing `supervisor` applies WR-04's rationale (see
@@ -619,8 +676,20 @@ where
 /// gone while active and send the operator to `devflow resume`, after the
 /// wrong problem entirely. With no record, the run reads not launched, and the
 /// right remedy is the message below.
+///
+/// One exception: a failover relaunch ([`FailoverRelaunchGuard`] engaged) keeps the
+/// record. WR-04's premise does not hold there, since that relaunch runs the same
+/// stage again after a handoff. Keeping the record lets the failover's never-silent
+/// end (the infra gate, or the abort at the infra ceiling) be written by the
+/// supervisor the state records, which then waits at the gate as the run's owner. The
+/// exemption lasts for the failover relaunch's `launch_stage` call. That call includes
+/// `run_preflight`, so a preflight gate opened inside it, and the launch that gate's
+/// answer starts, keep the record too. A launch the failover's own infra gate starts
+/// later runs unguarded and clears the record on failure as WR-04 says.
 fn refuse_launch(state: &mut State, message: String) -> Result<(), CliError> {
-    commit(state, |s| s.supervisor = None)?;
+    if !in_failover_relaunch() {
+        commit(state, |s| s.supervisor = None)?;
+    }
     Err(CliError::Message(message))
 }
 
@@ -2028,18 +2097,71 @@ pub(crate) fn launch_context() -> Result<monitor::LaunchContext, CliError> {
 /// launched, and the launch's own error message is the remedy.
 ///
 /// A reservation the failed launch made ends with it: a `pending_supervisor` naming
-/// this launch is cleared too (D-01).
+/// this launch is cleared too (D-01), always.
+///
+/// One exception to the record clear: a failover relaunch ([`FailoverRelaunchGuard`]
+/// engaged) keeps `supervisor`. WR-04's premise does not hold there, since that
+/// relaunch runs the same stage again after a handoff. Keeping the record lets the
+/// failover's never-silent end (the infra gate, or the abort at the infra ceiling) be
+/// written by the supervisor the state records, which then waits at the gate as the
+/// run's owner. The exemption lasts for the failover relaunch's `launch_stage` call.
+/// That call includes `run_preflight`, so a preflight gate opened inside it, and the
+/// launch that gate's answer starts, keep the record too. A launch the failover's own
+/// infra gate starts later runs unguarded and clears the record on failure as WR-04
+/// says.
 ///
 /// Called only on a failure path, never before the save that records a new
 /// record (50-13's rule).
 fn record_failed_launch(state: &mut State) -> Result<(), CliError> {
     let failed = state.pending_supervisor.clone();
+    let keep_record = in_failover_relaunch();
     commit(state, |s| {
-        s.supervisor = None;
+        if !keep_record {
+            s.supervisor = None;
+        }
         if failed.is_some() && s.pending_supervisor == failed {
             s.pending_supervisor = None;
         }
     })
+}
+
+thread_local! {
+    /// Set only while a [`FailoverRelaunchGuard`] is alive. Per thread, like
+    /// [`ENGAGED_ADVANCE`]: the relaunch it covers runs on the advance's thread, and
+    /// parallel in-crate tests never share it.
+    static FAILOVER_RELAUNCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Marks the launch running on this thread as a failover relaunch (SUPV-02, D-04),
+/// for as long as the guard lives (RAII: an early return or a panic cannot leave it
+/// set). While it is engaged, [`refuse_launch`] and [`record_failed_launch`] keep
+/// `state.supervisor`, so the never-silent end that follows a failed relaunch is a
+/// set of owned writes by the supervisor the state records (Phase 50 D-03 unchanged).
+/// Engaged only around the `launch_stage` call in [`fail_over_on_rate_limit`], which
+/// includes its `run_preflight` and any launch a preflight gate's answer starts there.
+struct FailoverRelaunchGuard {
+    /// Keeps the guard on the thread whose flag it set.
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl FailoverRelaunchGuard {
+    fn engage() -> Self {
+        FAILOVER_RELAUNCH.with(|engaged| engaged.set(true));
+        Self {
+            _not_send: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for FailoverRelaunchGuard {
+    fn drop(&mut self) {
+        FAILOVER_RELAUNCH.with(|engaged| engaged.set(false));
+    }
+}
+
+/// Whether a [`FailoverRelaunchGuard`] is engaged on this thread.
+fn in_failover_relaunch() -> bool {
+    FAILOVER_RELAUNCH.with(std::cell::Cell::get)
 }
 
 thread_local! {
@@ -2151,7 +2273,11 @@ fn spawn_agent_and_record(
     // ends the launch with no supervisor record (see `record_failed_launch`),
     // so a failed relaunch never leaves `state.stage` advanced beside a
     // record naming the previous stage's supervisor; the success path below
-    // never clears the record before the save that replaces it.
+    // never clears the record before the save that replaces it. One exception:
+    // a failover relaunch (`FailoverRelaunchGuard` engaged) keeps the record,
+    // because it runs the same stage again after a handoff, so the failover's
+    // never-silent end (the infra gate, or the abort at the infra ceiling) is
+    // written by the supervisor the state records, which then waits at the gate.
     let SpawnedLaunch {
         published,
         reservation,
@@ -2302,7 +2428,11 @@ fn publish_record<E: Into<CliError>>(
         ));
     }
     promote_pending(state);
-    if successor_runs_on(&record.socket_path) {
+    #[cfg(not(test))]
+    let probe = devflow_core::supervisor::probe;
+    #[cfg(test)]
+    let probe = successor_probe_for(state);
+    if successor_runs_on(&record.socket_path, probe) {
         return Ok(PublishOutcome::HandedOff);
     }
     state.stopped = true;
@@ -2432,6 +2562,10 @@ fn shut_down_unrecorded(
     }
 }
 
+/// What [`successor_runs_on`]'s probe answers: [`devflow_core::supervisor::probe`]'s result.
+type SuccessorProbeAnswer =
+    Result<devflow_core::supervisor::Liveness, devflow_core::supervisor::ProbeError>;
+
 /// Whether the successor whose record was just saved is still running and
 /// can be handed off: Alive with owner `agent_running`, `advancing` or
 /// `gate_wait`. Gone, or Alive with any other owner (it finished without
@@ -2440,8 +2574,12 @@ fn shut_down_unrecorded(
 /// STALE is `true` (a crashed successor stays recorded and reads STALE, a
 /// real finding with its own repair). A probe error is `true`: the record
 /// stays and `status` reports the error.
-fn successor_runs_on(socket: &Path) -> bool {
-    use devflow_core::supervisor::{Liveness, probe};
+///
+/// `probe` is [`devflow_core::supervisor::probe`] in every release build; only the
+/// test build's [`successor_probe_for`] can substitute an answer (51-13, D-12), and
+/// these arms decide in both.
+fn successor_runs_on(socket: &Path, probe: impl Fn(&Path) -> SuccessorProbeAnswer) -> bool {
+    use devflow_core::supervisor::Liveness;
     let running = [
         OwnerPhase::AgentRunning,
         OwnerPhase::Advancing,
@@ -2466,6 +2604,34 @@ fn successor_runs_on(socket: &Path) -> bool {
                 return true;
             }
         }
+    }
+}
+
+/// Test-only seam (51-13, D-12, review B-2, R2-8): the probe [`publish_record`] hands
+/// [`successor_runs_on`] in a test build. When `DEVFLOW_TEST_WITHHOLD_SUCCESSOR_PROBE`
+/// is `<agent>:<stage>:<marker-path>` (lowercase, as `AgentKind` and `Stage` display)
+/// for `state`'s agent and stage, it writes the marker file and answers `Gone` without
+/// probing, so `successor_runs_on`'s own `Gone` arm records the run stopped while the
+/// successor still runs. Otherwise it is the real probe. Keyed by the launch being
+/// published, so a failover relaunch (`codex:code`) can be answered while the primary's
+/// launch is not. Compiled only under `cfg(test)`, together with its one call (pinned
+/// by `pipeline_launch::tests::the_successor_probe_seam_is_compiled_out_of_non_test_builds`).
+#[cfg(test)]
+fn successor_probe_for(state: &State) -> impl Fn(&Path) -> SuccessorProbeAnswer {
+    let marker = std::env::var("DEVFLOW_TEST_WITHHOLD_SUCCESSOR_PROBE")
+        .ok()
+        .and_then(|value| {
+            let mut parts = value.splitn(3, ':');
+            let (agent, stage, marker) = (parts.next()?, parts.next()?, parts.next()?);
+            (agent == state.agent.to_string() && stage == state.stage.to_string())
+                .then(|| PathBuf::from(marker))
+        });
+    move |socket| match &marker {
+        Some(marker) => {
+            let _ = std::fs::write(marker, "");
+            Ok(devflow_core::supervisor::Liveness::Gone)
+        }
+        None => devflow_core::supervisor::probe(socket),
     }
 }
 
@@ -2859,13 +3025,9 @@ pub(crate) fn launch_stage(
     archived_stage: Option<Stage>,
 ) -> Result<(), CliError> {
     let driver = agents::driver_for(state.agent);
-    let prompt = prompt_override.clone().unwrap_or_else(|| {
-        driver.render_prompt(&prompt::StageIntent::for_stage_in_project(
-            state.stage,
-            state.phase,
-            Some(&state.project_root),
-        ))
-    });
+    let prompt = prompt_override
+        .clone()
+        .unwrap_or_else(|| default_stage_prompt(state, driver.as_ref()));
     let roots = state
         .worktree_path
         .as_deref()
@@ -2934,6 +3096,251 @@ pub(crate) fn handle_ambiguous_outcome(
     launch_stage(state, None, Some(stage))
 }
 
+/// The agent a rate limit at `stage` hands off to (SUPV-02), or `None` when the
+/// cron-resume arm should run instead.
+///
+/// `stage` is the stage the supervisor launched. Only [`Stage::Code`] is
+/// eligible (operator ruling R-2): a Plan relaunch would meet the PLAN.md
+/// short-circuit in the idempotent stage prompt and could accept a partial plan
+/// (T-51-33), and no other stage was designed for a mid-stage driver change. The
+/// fallback must also be unused (D-05) and differ from the agent driving the run,
+/// since handing a stage to the agent that just hit the limit is no handoff.
+fn failover_target(state: &State, stage: Stage) -> Option<AgentKind> {
+    let fallback = state.fallback_agent?;
+    (stage == Stage::Code && !state.fallback_consumed && fallback != state.agent)
+        .then_some(fallback)
+}
+
+/// Why [`hand_off_agent`] substitutes the agent. Its wire text is the
+/// `agent_handoff` event's `reason`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandoffReason {
+    /// The operator's `devflow resume --agent`.
+    ResumeAgent,
+    /// A rate limit at Code with an unused fallback (SUPV-02).
+    RateLimited,
+}
+
+impl HandoffReason {
+    fn as_wire_str(self) -> &'static str {
+        match self {
+            HandoffReason::ResumeAgent => "resume --agent",
+            HandoffReason::RateLimited => "rate_limited",
+        }
+    }
+}
+
+/// A handoff [`hand_off_agent`] refused before writing anything. Distinct from a
+/// state-write error, which it returns as a `CliError`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HandoffRefusal {
+    /// The full generic preflight bundle refused the candidate state.
+    Preflight(String),
+    /// The target's binary is missing or its driver's health check failed.
+    Unavailable(String),
+}
+
+impl HandoffRefusal {
+    /// The refusal's text, without any prefix.
+    fn reason(&self) -> &str {
+        match self {
+            HandoffRefusal::Preflight(reason) | HandoffRefusal::Unavailable(reason) => reason,
+        }
+    }
+}
+
+/// What [`hand_off_agent`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HandoffOutcome {
+    /// The state now names `to`; `from` is the agent it replaced.
+    HandedOff { from: AgentKind },
+    /// Nothing was written.
+    Refused(HandoffRefusal),
+}
+
+/// Substitute `to` for the run's agent at its current stage (D-04): the one
+/// function `devflow resume --agent` and rate-limit failover share.
+///
+/// Every check runs against a candidate copy before ANY mutation, so a refusal
+/// leaves the state byte-identical. It runs the FULL generic preflight bundle
+/// (major-bump, unattended-launch-shape, interactivity, gh-auth), not just
+/// interactivity: `launch_stage` runs this same bundle again via
+/// `run_preflight`, and it is stricter than plain interactivity — e.g. a
+/// Claude/Antigravity-only chain-flag guard means a same-stage handoff to any
+/// other agent in Auto mode fails the unattended-launch-shape check even though
+/// the target driver declares the stage headless-safe. Checking only
+/// interactivity here let such a handoff commit (`state.agent` mutated,
+/// `agent_handoff` emitted) and then immediately hit that later gate — leaving
+/// the phase "handed off" to a driver whose launch never actually ran
+/// (44-CORE-REVIEW-FINDINGS.md finding 2b).
+///
+/// Then ONE commit sets the agent and, for a rate-limit hop, marks the fallback
+/// consumed in the same write (D-05). The same write clears the recorded delivery
+/// canary and session id (D-04): both are evidence about the previous agent, so
+/// the new one proves its own delivery path. Then `agent_handoff` is emitted with
+/// the tree it hands over: `tree_dirty` and the phase branch's `commit_count`,
+/// each `null` when it could not be measured. The tree is handed over as it is
+/// (D-10): nothing here resets, stashes, cleans or checks out the worktree, and no
+/// commit count is required (D-08).
+fn hand_off_agent(
+    project_root: &Path,
+    state: &mut State,
+    to: AgentKind,
+    reason: HandoffReason,
+) -> Result<HandoffOutcome, CliError> {
+    let from = state.agent;
+    let mut candidate = state.clone();
+    candidate.agent = to;
+    if let Err(why) = generic_preflight_checks(project_root, &candidate) {
+        return Ok(HandoffOutcome::Refused(HandoffRefusal::Preflight(why)));
+    }
+    if let Err(err) = ensure_agent_binary(agent_program(to)) {
+        return Ok(HandoffOutcome::Refused(HandoffRefusal::Unavailable(
+            err.to_string(),
+        )));
+    }
+    if let Err(err) = agents::driver_for(to).health(&candidate) {
+        return Ok(HandoffOutcome::Refused(HandoffRefusal::Unavailable(err)));
+    }
+
+    // D-10: what is handed over, measured before the commit and never touched.
+    // `None` (git could not answer) stays `null` in the event, never a made-up value.
+    let launch_root = state.worktree_path.as_deref().unwrap_or(project_root);
+    let tree_dirty = crate::staleness::run_git_stdout(launch_root, &["status", "--porcelain"])
+        .map(|porcelain| !porcelain.trim().is_empty());
+    let commit_count = agent_result::phase_commit_count(
+        project_root,
+        &devflow_core::config::git_flow_for_run(project_root, state.base_branch.as_deref()),
+        state.phase,
+    );
+
+    commit(state, |s| {
+        s.agent = to;
+        if reason == HandoffReason::RateLimited {
+            s.fallback_consumed = true;
+        }
+        // D-04: the canary outcome and the session id are evidence about the
+        // agent that produced them. Cleared here, `canary_gate` runs the new
+        // agent's own canary on its first stream launch instead of admitting it
+        // on the previous agent's `Confirmed`.
+        s.canary = None;
+        s.session_id = None;
+    })?;
+    events::emit(
+        project_root,
+        state.phase,
+        "agent_handoff",
+        serde_json::json!({
+            "stage": state.stage.to_string(),
+            "from_agent": from.to_string(),
+            "to_agent": to.to_string(),
+            "reason": reason.as_wire_str(),
+            "tree_dirty": tree_dirty,
+            "commit_count": commit_count,
+        }),
+    );
+    Ok(HandoffOutcome::HandedOff { from })
+}
+
+/// Continue a rate-limited Code stage under the unused fallback `to` (SUPV-02).
+///
+/// Reached only from the explicit `RateLimited` arm of `advance_with`, after
+/// [`failover_target`] selected `to`, and BEFORE [`handle_rate_limited_outcome`]'s
+/// infra bump: a hop is not an infra fault, so a successful one leaves
+/// `infra_failures` alone (D-06). Once handed off, the same stage is relaunched
+/// under the new driver — the tail of [`handle_ambiguous_outcome`] without its
+/// bump and ceiling check. No commit-count precondition applies (D-08) and the
+/// worktree is handed over untouched (D-10).
+///
+/// A refused handoff is never a silent skip (D-07): `agent_handoff_refused`
+/// names the fallback and the refusal, then the cron arm runs exactly as it
+/// would have with no fallback, given the ORIGINAL rate-limit reason so its
+/// retry time still parses. Only a committed hop consumes the fallback (D-05),
+/// so a refusal leaves it unused.
+///
+/// A relaunch that fails AFTER the handoff commit is never silent either (D-04,
+/// R2-D1): `agent_handoff_relaunch_failed` names the stage, both agents and the
+/// error, then [`handle_infra_outcome`] bumps `infra_failures` once and opens the
+/// never-silent gate, or aborts at the ceiling. Not the cron arm: a refused canary
+/// stays recorded and refuses every later launch, so a scheduled resume could not
+/// succeed, and a successor whose shutdown was not confirmed may still run. The
+/// relaunch runs under [`FailoverRelaunchGuard`], so its failure keeps the
+/// supervisor record and those writes stay owned. A `NotOwner` from the relaunch
+/// means another launch owns the run: it is returned unchanged and nothing more
+/// is written.
+fn fail_over_on_rate_limit(
+    project_root: &Path,
+    state: &mut State,
+    phase: PhaseId,
+    stage: Stage,
+    to: AgentKind,
+    reason: Option<String>,
+) -> Result<(), CliError> {
+    match hand_off_agent(project_root, state, to, HandoffReason::RateLimited)? {
+        HandoffOutcome::HandedOff { from } => {
+            #[cfg(test)]
+            test_hold("after_failover_commit");
+            let relaunched = {
+                let _keep_record = FailoverRelaunchGuard::engage();
+                launch_stage(state, None, Some(stage))
+            };
+            match relaunched {
+                Ok(()) => Ok(()),
+                Err(err) if is_not_owner(&err) => Err(err),
+                Err(err) => {
+                    let error = err.to_string();
+                    events::emit(
+                        project_root,
+                        phase,
+                        "agent_handoff_relaunch_failed",
+                        serde_json::json!({
+                            "stage": stage.to_string(),
+                            "from_agent": from.to_string(),
+                            "to_agent": to.to_string(),
+                            "reason": error,
+                        }),
+                    );
+                    let rate_limit = reason.as_deref().unwrap_or("no reason given");
+                    handle_infra_outcome(
+                        project_root,
+                        state,
+                        stage,
+                        Some(format!(
+                            "the handoff to {to} could not relaunch the {stage} stage: {error} \
+                             (after the rate limit: {rate_limit})"
+                        )),
+                    )
+                }
+            }
+        }
+        HandoffOutcome::Refused(refusal) => {
+            events::emit(
+                project_root,
+                phase,
+                "agent_handoff_refused",
+                serde_json::json!({
+                    "stage": stage.to_string(),
+                    "from_agent": state.agent.to_string(),
+                    "to_agent": to.to_string(),
+                    "reason": refusal.reason(),
+                }),
+            );
+            handle_rate_limited_outcome(project_root, state, phase, stage, reason)
+        }
+    }
+}
+
+/// [`resume_with_fallback`] with no `--fallback-agent`: the shorthand the tests use.
+#[cfg(test)]
+pub(crate) fn resume(
+    project_root: &Path,
+    phase: PhaseId,
+    agent: Option<AgentKind>,
+    legacy_claude_launch: bool,
+) -> Result<(), CliError> {
+    resume_with_fallback(project_root, phase, agent, legacy_claude_launch, None)
+}
+
 /// Resume a rate-limited or infra-paused phase from its saved stage (review
 /// consensus #5). Loads the persisted `.devflow/state-{NN}.json` and
 /// relaunches its saved stage via [`launch_stage`] — unlike `start`, this
@@ -2974,11 +3381,12 @@ pub(crate) fn handle_ambiguous_outcome(
 /// D-06: a rerun asks again. Before it relaunches, `resume` closes the phase's gates and
 /// reports each answer it set aside and each claimed answer it found unapplied
 /// ([`close_gates_for_resume`]). It never applies a pending answer to the rerun's gate.
-pub(crate) fn resume(
+pub(crate) fn resume_with_fallback(
     project_root: &Path,
     phase: PhaseId,
     agent: Option<AgentKind>,
     legacy_claude_launch: bool,
+    fallback_agent: Option<AgentKind>,
 ) -> Result<(), CliError> {
     let _phase_holder = crate::commands::claim_foreground_holder(project_root, phase)?;
     let reserved = crate::commands::reserve_launch(
@@ -2997,6 +3405,7 @@ pub(crate) fn resume(
         reserved.state,
         agent,
         legacy_claude_launch,
+        fallback_agent,
     );
     abandon_reservation(project_root, phase, reserved.created);
     result
@@ -3158,7 +3567,7 @@ fn close_gates_for_resume(
     lines
 }
 
-/// [`resume`] after its reservation: `state` is the copy that wrote, which may already
+/// [`resume_with_fallback`] after its reservation: `state` is the copy that wrote, which may already
 /// be behind the file.
 fn resume_loaded(
     project_root: &Path,
@@ -3166,56 +3575,40 @@ fn resume_loaded(
     mut state: State,
     agent: Option<AgentKind>,
     legacy_claude_launch: bool,
+    fallback_agent: Option<AgentKind>,
 ) -> Result<(), CliError> {
     crate::commands::refuse_unprepared_run(&state)?;
+    // D-01, D-02, D-03: every fallback check runs here, BEFORE `commit_notify_env`
+    // below, so a refused resume commits nothing at all (review B-3).
+    refuse_fallback_for_resume(&state, agent, legacy_claude_launch, fallback_agent)?;
+    refuse_recorded_canary_for_resume(&state, agent, legacy_claude_launch)?;
     // CR-03 (49-REVIEW.md): an exported (or emptied) notify command reaches
     // the chain this resume launches through the state file.
     commit_notify_env(&mut state)?;
     if let Some(requested) = agent
         && requested != state.agent
     {
-        let from_agent = state.agent;
-        let mut candidate = state.clone();
-        candidate.agent = requested;
-        // Runs the FULL generic preflight bundle (major-bump, unattended-
-        // launch-shape, interactivity, gh-auth) against the candidate, not
-        // just interactivity. `launch_stage` runs this same bundle again a
-        // few lines below via `run_preflight`, and it is stricter than plain
-        // interactivity: e.g. a Claude/Antigravity-only chain-flag guard
-        // means a same-stage handoff to any other agent in Auto mode fails
-        // the unattended-launch-shape check even though the target driver
-        // declares the stage headless-safe. Checking only interactivity here
-        // let such a handoff commit (`state.agent` mutated, `agent_handoff`
-        // emitted) and then immediately hit that later gate — leaving the
-        // phase "handed off" to a driver whose launch never actually ran
-        // (44-CORE-REVIEW-FINDINGS.md finding 2b). Checking the full bundle
-        // up front refuses it before anything is mutated, same as the
-        // existing byte-identical-on-refusal guarantee below.
-        generic_preflight_checks(project_root, &candidate).map_err(|reason| {
-            CliError::Message(format!(
-                "handoff to {requested} refused at saved {} stage: {reason}",
-                state.stage
-            ))
-        })?;
-        ensure_agent_binary(agent_program(requested))
-            .map_err(|err| CliError::Message(format!("handoff to {requested} refused: {err}")))?;
-        agents::driver_for(requested)
-            .health(&candidate)
-            .map_err(|err| CliError::Message(format!("handoff to {requested} refused: {err}")))?;
-
-        commit(&mut state, |s| s.agent = requested)?;
-        events::emit(
+        // The shared substitution (D-04): every check runs before anything is
+        // mutated, so a refusal leaves the state byte-identical.
+        match hand_off_agent(
             project_root,
-            phase,
-            "agent_handoff",
-            serde_json::json!({
-                "stage": state.stage.to_string(),
-                "from_agent": from_agent.to_string(),
-                "to_agent": requested.to_string(),
-                "reason": "resume --agent",
-            }),
-        );
-        println!("handoff: {from_agent} → {requested}");
+            &mut state,
+            requested,
+            HandoffReason::ResumeAgent,
+        )? {
+            HandoffOutcome::HandedOff { from } => println!("handoff: {from} → {requested}"),
+            HandoffOutcome::Refused(HandoffRefusal::Preflight(reason)) => {
+                return Err(CliError::Message(format!(
+                    "handoff to {requested} refused at saved {} stage: {reason}",
+                    state.stage
+                )));
+            }
+            HandoffOutcome::Refused(HandoffRefusal::Unavailable(err)) => {
+                return Err(CliError::Message(format!(
+                    "handoff to {requested} refused: {err}"
+                )));
+            }
+        }
     }
     // Combined BEFORE the commit below, so the persisted value exists before the
     // detached monitor this relaunch spawns ever consults it.
@@ -3262,7 +3655,17 @@ fn resume_loaded(
         }
         s.gate_pending = false;
         s.legacy_claude_launch = legacy_claude_launch;
+        // D-01's re-arm, in the commit every resume makes, so it applies to a stopped
+        // run and a cron-paused one alike. A plain resume leaves a spent fallback
+        // spent (D-05).
+        if let Some(fallback) = fallback_agent {
+            s.fallback_agent = Some(fallback);
+            s.fallback_consumed = false;
+        }
     })?;
+    if let Some(fallback) = fallback_agent {
+        print_fallback_notice(fallback, state.agent);
+    }
     match launch_stage(&mut state, None, None) {
         Ok(()) => Ok(()),
         Err(err) => {
@@ -3286,6 +3689,78 @@ fn resume_loaded(
             });
             Err(err)
         }
+    }
+}
+
+/// Refuse a `resume` the run's recorded delivery canary would refuse, before it writes
+/// anything.
+///
+/// The run is judged as it would launch: its legacy opt-out after
+/// `--legacy-claude-launch` and the environment. A `--agent` naming another agent hands
+/// the run off, and the handoff clears the recorded canary, so it is never refused here.
+/// Otherwise a recorded refusal ([`recorded_canary_refusal`]) refuses every launch under
+/// the run's agent. Letting the resume go on would clear `stopped` and `stop_reason`,
+/// fail at [`canary_gate`], and re-mark the run stopped with a reason that no longer names
+/// the way on. Refused here, the stop reason that names it survives.
+///
+/// Reads no file and writes nothing; `state` is the copy `resume` loaded.
+fn refuse_recorded_canary_for_resume(
+    state: &State,
+    agent: Option<AgentKind>,
+    legacy_claude_launch: bool,
+) -> Result<(), CliError> {
+    if agent.is_some_and(|requested| requested != state.agent) {
+        return Ok(());
+    }
+    match resume_canary_refusal(
+        state,
+        legacy_claude_launch,
+        devflow_core::config::claude_legacy_launch(),
+    ) {
+        None => Ok(()),
+        Some(refusal) => Err(CliError::Message(format!(
+            "resume refused: the delivery canary recorded for this run refuses {agent} at \
+             the {stage} stage ({refusal}), so the relaunch would be refused too; run \
+             `devflow resume --phase {phase} --agent <other>` to continue on another agent \
+             (the handoff clears the recorded canary). Nothing was changed.",
+            agent = state.agent,
+            stage = state.stage,
+            phase = state.phase,
+        ))),
+    }
+}
+
+/// The fallback checks `resume` makes before it writes anything (D-01, D-02, D-03).
+///
+/// The run is judged as it would launch: its agent after `--agent`, and its legacy
+/// opt-out after `--legacy-claude-launch` and the environment. Then:
+/// - a `--fallback-agent` is held to [`validate_fallback_agent`], as on `start`;
+/// - with none, a saved fallback that is still unused and equals that agent is refused
+///   (D-02): `--agent` onto the run's own fallback would leave the two coinciding.
+///
+/// Reads no file and writes nothing; `state` is the copy `resume` loaded.
+fn refuse_fallback_for_resume(
+    state: &State,
+    agent: Option<AgentKind>,
+    legacy_claude_launch: bool,
+    fallback_agent: Option<AgentKind>,
+) -> Result<(), CliError> {
+    let mut candidate = state.clone();
+    candidate.agent = agent.unwrap_or(state.agent);
+    // Only the combined value is read here; the notice is `resume_loaded`'s to print.
+    let _env_alone = apply_legacy_launch_opt_out(&mut candidate, legacy_claude_launch);
+    match fallback_agent {
+        Some(fallback) => validate_fallback_agent(&candidate, fallback),
+        None => match state.fallback_agent {
+            Some(saved) if !state.fallback_consumed && saved == candidate.agent => {
+                Err(CliError::Message(format!(
+                    "--agent {saved} is this run's saved unused fallback ({saved}); a run's agent \
+                     and its fallback must differ — pass --fallback-agent with another agent to \
+                     re-arm a different one"
+                )))
+            }
+            _ => Ok(()),
+        },
     }
 }
 
@@ -3737,6 +4212,26 @@ pub(crate) fn advance_with(
             agent_result::AgentStatus::Ambiguous => {
                 handle_ambiguous_outcome(project_root, &mut state, stage, result.reason)
             }
+            // SUPV-02: the failover branch sits ahead of the cron arm's infra
+            // bump (D-06), and only `RateLimited` reaches it; the wildcard below
+            // never fails over.
+            agent_result::AgentStatus::RateLimited => match failover_target(&state, stage) {
+                Some(to) => fail_over_on_rate_limit(
+                    project_root,
+                    &mut state,
+                    phase,
+                    stage,
+                    to,
+                    result.reason,
+                ),
+                None => handle_rate_limited_outcome(
+                    project_root,
+                    &mut state,
+                    phase,
+                    stage,
+                    result.reason,
+                ),
+            },
             _ => handle_rate_limited_outcome(project_root, &mut state, phase, stage, result.reason),
         },
     }
@@ -5618,6 +6113,292 @@ mod tests {
         assert!(!devflow_core::ship::cron_instructions_path(root, phase).exists());
     }
 
+    /// Run the test `name` in a hermetic child whose `PATH` holds `claude` and `codex`
+    /// stubs, with `extra_env` set on the child only, returning `true` in the parent,
+    /// whose work is done, and `false` in the child.
+    fn parent_of_a_claude_and_codex_child(
+        name: &str,
+        extra_env: &[(&str, &std::ffi::OsStr)],
+    ) -> bool {
+        if devflow_core::test_support::in_child_test(name) {
+            return false;
+        }
+        let path_dir = agent_free_dir_with_agent_stub("claude");
+        add_agent_stub(path_dir.path(), "codex");
+        let output =
+            crate::test_support::run_hermetic_test_in_child(name, path_dir.path(), extra_env);
+        devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, name);
+        true
+    }
+
+    /// A stopped Code-stage run of `phase` under Claude on the capture shape, in a fresh
+    /// repo at `root`, with `fallback` saved as its fallback and `consumed` as its spent mark.
+    fn save_stopped_code_run(
+        root: &Path,
+        phase: PhaseId,
+        fallback: Option<AgentKind>,
+        consumed: bool,
+    ) -> State {
+        init_repo(root);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Code;
+        state.stopped = true;
+        state.stop_reason = Some("rate limited".to_string());
+        state.fallback_agent = fallback;
+        state.fallback_consumed = consumed;
+        // The capture shape: a stub `claude` cannot answer the stream launch's canary.
+        state.legacy_claude_launch = true;
+        workflow::save_state(&state).unwrap();
+        state
+    }
+
+    /// D-01 (re-arm, stopped): `resume --fallback-agent` on a stopped run sets the
+    /// fallback and clears a spent mark.
+    #[test]
+    fn resume_with_a_fallback_agent_rearms_a_consumed_fallback() {
+        const NAME: &str =
+            "pipeline_launch::tests::resume_with_a_fallback_agent_rearms_a_consumed_fallback";
+        if parent_of_a_claude_and_codex_child(NAME, &[]) {
+            return;
+        }
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5144);
+        save_stopped_code_run(root, phase, Some(AgentKind::Codex), true);
+
+        let result = resume_with_fallback(root, phase, None, false, Some(AgentKind::Codex));
+        let reloaded_for_reap = workflow::load_state(root, phase).ok();
+        let _reap_guard = reloaded_for_reap
+            .as_ref()
+            .map(ReapMonitorOnDrop::after_launch);
+        result.unwrap();
+
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        assert!(!reloaded.fallback_consumed, "the spent mark is cleared");
+        assert_eq!(reloaded.fallback_agent, Some(AgentKind::Codex));
+        assert!(!reloaded.stopped);
+        assert!(reloaded.supervisor.is_some(), "the run relaunched");
+    }
+
+    /// D-01 (re-arm, cron-paused): a run the cron arm paused is not stopped, and still
+    /// names the supervisor that exited. `resume --fallback-agent` re-arms it all the same.
+    #[test]
+    fn resume_with_a_fallback_agent_rearms_a_consumed_fallback_on_a_cron_paused_run() {
+        const NAME: &str = "pipeline_launch::tests::\
+                            resume_with_a_fallback_agent_rearms_a_consumed_fallback_on_a_cron_paused_run";
+        if parent_of_a_claude_and_codex_child(NAME, &[]) {
+            return;
+        }
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(5148);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Code;
+        state.fallback_agent = Some(AgentKind::Codex);
+        state.fallback_consumed = true;
+        // The capture shape: a stub `claude` cannot answer the stream launch's canary.
+        state.legacy_claude_launch = true;
+        // The record of the supervisor that exited on the rate limit: the cron arm
+        // leaves it behind, and its socket is gone.
+        const EXITED_LAUNCH: &str = "exited-launch";
+        state.supervisor = Some(SupervisorRecord::new(
+            root.join("gone.sock"),
+            EXITED_LAUNCH.to_string(),
+            1,
+            0,
+            "boot".to_string(),
+        ));
+        workflow::save_state(&state).unwrap();
+        crate::pipeline_outcomes::handle_rate_limited_outcome(
+            root,
+            &mut state,
+            phase,
+            Stage::Code,
+            Some("rate limited until 2026-06-18T15:45:30Z".into()),
+        )
+        .unwrap();
+
+        let paused = workflow::load_state(root, phase).unwrap();
+        let cron = devflow_core::ship::load_cron_instructions(root, phase)
+            .expect("the cron arm wrote cron-instructions-5148.json");
+        assert!(
+            !cron.hermes_cron.schedule.is_empty(),
+            "the cron arm scheduled a resume"
+        );
+        assert!(!paused.stopped, "a cron-paused run is not stopped");
+        assert_eq!(paused.infra_failures, 1);
+        assert_eq!(
+            paused.supervisor.as_ref().map(|r| r.launch_id.as_str()),
+            Some(EXITED_LAUNCH),
+            "the exited supervisor's record is left behind"
+        );
+
+        let result = resume_with_fallback(root, phase, None, false, Some(AgentKind::Codex));
+        let reloaded_for_reap = workflow::load_state(root, phase).ok();
+        let _reap_guard = reloaded_for_reap
+            .as_ref()
+            .filter(|state| {
+                state.supervisor.as_ref().map(|r| r.launch_id.as_str()) != Some(EXITED_LAUNCH)
+            })
+            .map(ReapMonitorOnDrop::after_launch);
+        result.unwrap();
+
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        assert!(!reloaded.fallback_consumed, "the spent mark is cleared");
+        assert_eq!(reloaded.fallback_agent, Some(AgentKind::Codex));
+        assert_eq!(reloaded.agent, AgentKind::Claude);
+        let relaunched = reloaded.supervisor.expect("the run relaunched");
+        assert_ne!(
+            relaunched.launch_id, EXITED_LAUNCH,
+            "a new supervisor replaced the exited one's record"
+        );
+    }
+
+    /// D-05: a plain `resume` leaves a spent fallback spent.
+    #[test]
+    fn resume_without_a_fallback_flag_keeps_a_consumed_fallback_spent() {
+        const NAME: &str = "pipeline_launch::tests::resume_without_a_fallback_flag_keeps_a_consumed_fallback_spent";
+        if parent_of_a_claude_and_codex_child(NAME, &[]) {
+            return;
+        }
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5145);
+        save_stopped_code_run(root, phase, Some(AgentKind::Codex), true);
+
+        let result = resume(root, phase, None, false);
+        let reloaded_for_reap = workflow::load_state(root, phase).ok();
+        let _reap_guard = reloaded_for_reap
+            .as_ref()
+            .map(ReapMonitorOnDrop::after_launch);
+        result.unwrap();
+
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        assert!(reloaded.fallback_consumed, "a plain resume does not re-arm");
+        assert_eq!(reloaded.fallback_agent, Some(AgentKind::Codex));
+        assert!(reloaded.supervisor.is_some(), "the run relaunched");
+    }
+
+    /// The notify command a refusal test saves, and the different one its child's
+    /// environment carries: a refused resume must leave the saved one in place.
+    const SAVED_NOTIFY: &str = "old";
+    const ENV_NOTIFY: &str = "new";
+
+    /// D-02 through `resume --agent`: handing the run to its own unused fallback is
+    /// refused before any write, the notify command included (review B-3).
+    #[test]
+    fn resume_refuses_an_agent_equal_to_the_saved_unused_fallback() {
+        const NAME: &str =
+            "pipeline_launch::tests::resume_refuses_an_agent_equal_to_the_saved_unused_fallback";
+        if parent_of_a_claude_and_codex_child(
+            NAME,
+            &[(
+                devflow_core::gates::GATE_NOTIFY_CMD_ENV,
+                std::ffi::OsStr::new(ENV_NOTIFY),
+            )],
+        ) {
+            return;
+        }
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5146);
+        let mut state = save_stopped_code_run(root, phase, Some(AgentKind::Codex), false);
+        state.gate_notify_cmd = Some(SAVED_NOTIFY.to_string());
+        workflow::save_state(&state).unwrap();
+
+        let result = resume_with_fallback(root, phase, Some(AgentKind::Codex), false, None);
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        let _reap_guard = ReapMonitorOnDrop::after_launch(&reloaded);
+        let err = result
+            .expect_err("handing the run to its own unused fallback is refused")
+            .to_string();
+
+        assert!(
+            err.contains("--agent codex"),
+            "names the requested agent: {err}"
+        );
+        assert!(
+            err.contains("saved unused fallback (codex)"),
+            "names the saved fallback: {err}"
+        );
+        assert_eq!(reloaded.gate_notify_cmd.as_deref(), Some(SAVED_NOTIFY));
+        assert_eq!(reloaded.agent, AgentKind::Claude);
+        assert_eq!(reloaded.fallback_agent, Some(AgentKind::Codex));
+        assert!(!reloaded.fallback_consumed);
+        assert!(reloaded.stopped);
+        assert_eq!(reloaded.supervisor, None, "nothing launched");
+        assert_eq!(
+            reloaded.pending_supervisor, None,
+            "the reservation is given back"
+        );
+    }
+
+    /// D-02 through `resume --fallback-agent`: a fallback equal to the run's agent is
+    /// refused before any write, the notify command included (review B-3). The
+    /// reservation `reserve_launch` writes first is the one write, and it is given back.
+    #[test]
+    fn resume_refuses_a_fallback_equal_to_the_run_agent_before_any_write() {
+        const NAME: &str = "pipeline_launch::tests::\
+                            resume_refuses_a_fallback_equal_to_the_run_agent_before_any_write";
+        if parent_of_a_claude_and_codex_child(
+            NAME,
+            &[(
+                devflow_core::gates::GATE_NOTIFY_CMD_ENV,
+                std::ffi::OsStr::new(ENV_NOTIFY),
+            )],
+        ) {
+            return;
+        }
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5147);
+        let mut state = save_stopped_code_run(root, phase, None, false);
+        state.gate_notify_cmd = Some(SAVED_NOTIFY.to_string());
+        workflow::save_state(&state).unwrap();
+
+        let result = resume_with_fallback(root, phase, None, false, Some(AgentKind::Claude));
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        let _reap_guard = ReapMonitorOnDrop::after_launch(&reloaded);
+        let err = result
+            .expect_err("a fallback equal to the run's agent is refused")
+            .to_string();
+
+        assert!(
+            err.contains("--fallback-agent claude"),
+            "names the fallback: {err}"
+        );
+        assert!(
+            err.contains("run's own agent (claude)"),
+            "names the agent: {err}"
+        );
+        assert_eq!(reloaded.gate_notify_cmd.as_deref(), Some(SAVED_NOTIFY));
+        assert_eq!(reloaded.agent, AgentKind::Claude);
+        assert_eq!(reloaded.fallback_agent, None);
+        assert!(!reloaded.fallback_consumed);
+        assert!(reloaded.stopped);
+        assert_eq!(reloaded.supervisor, None, "nothing launched");
+        assert_eq!(
+            reloaded.pending_supervisor, None,
+            "the reservation is given back"
+        );
+    }
+
     /// Regression for 44-CORE-REVIEW-FINDINGS.md finding 2a: `resume` clears
     /// and persists `stopped`/`stop_reason`/`stop_until` BEFORE calling
     /// `launch_stage` (needed so a reload mid-relaunch already sees the
@@ -6565,6 +7346,82 @@ mod tests {
         assert_ne!(
             unverified, absent,
             "the two failure modes must not render the same diagnosis"
+        );
+    }
+
+    /// `recorded_canary_refusal` re-reads `canary_gate`'s decision without running a
+    /// canary, so the two must agree on every recorded outcome: it is `Some` exactly when
+    /// `canary_gate`, given the stream predicate `launch_stage_inner` computes for the
+    /// same state, refuses. Enumerates every agent, stage, legacy opt-out and recorded
+    /// outcome. With nothing recorded `canary_gate` runs a fresh canary, so the copy
+    /// reports no recorded refusal; that case is asserted on its own. Control: the
+    /// enumeration contains both an admitted and a refused launch, so agreement is not
+    /// "both always say the same thing".
+    #[test]
+    fn recorded_canary_refusal_agrees_with_canary_gate_on_every_recorded_outcome() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let base = canary_state(root, PhaseId::new(126));
+
+        let agents = [
+            AgentKind::Claude,
+            AgentKind::Codex,
+            AgentKind::OpenCode,
+            AgentKind::Pi,
+            AgentKind::Antigravity,
+        ];
+        let stages = [
+            Stage::Define,
+            Stage::Plan,
+            Stage::Code,
+            Stage::Validate,
+            Stage::Ship,
+        ];
+        let outcomes = [
+            canary::CanaryOutcome::Confirmed,
+            canary::CanaryOutcome::Absent,
+            canary::CanaryOutcome::Unverified("no binary".to_string()),
+        ];
+        let (mut admitted, mut refused) = (0usize, 0usize);
+        for agent in agents {
+            for stage in stages {
+                for legacy in [false, true] {
+                    let mut state = base.clone();
+                    state.agent = agent;
+                    state.stage = stage;
+                    state.legacy_claude_launch = legacy;
+                    state.canary = None;
+                    assert_eq!(
+                        recorded_canary_refusal(&state),
+                        None,
+                        "nothing recorded: {agent} {stage} legacy={legacy}"
+                    );
+                    for outcome in &outcomes {
+                        state.canary = Some(outcome.clone());
+                        let stream = stream_launch_enabled(agent, stage, legacy);
+                        let gate_refuses = canary_gate(&mut state.clone(), stream, || {
+                            unreachable!("a recorded outcome is never re-run")
+                        })
+                        .is_err();
+                        assert_eq!(
+                            recorded_canary_refusal(&state).is_some(),
+                            gate_refuses,
+                            "{agent} {stage} legacy={legacy} {outcome:?}"
+                        );
+                        if gate_refuses {
+                            refused += 1;
+                        } else {
+                            admitted += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            admitted > 0 && refused > 0,
+            "control: admitted {admitted}, refused {refused}"
         );
     }
 
@@ -9159,7 +10016,38 @@ mod tests {
     /// the advance-running monitor entry, with `DEVFLOW_TEST_HOLD` naming
     /// `hold` (when given) and a release path in a parent-owned dir.
     fn run_handoff_child(name: &str, hold: Option<&str>, first_marker: &str) {
+        run_handoff_child_with_stubs(name, hold, first_marker, &[]);
+    }
+
+    /// [`run_handoff_child`], with each `(program, script)` in `stubs` written
+    /// into the child's PATH dir after the default `claude` stub, replacing
+    /// a stub of the same name. A second agent's stub lets a child hand a
+    /// stage over to another driver (SUPV-02).
+    fn run_handoff_child_with_stubs(
+        name: &str,
+        hold: Option<&str>,
+        first_marker: &str,
+        stubs: &[(&str, String)],
+    ) {
+        run_handoff_child_with_stubs_and_env(name, hold, first_marker, stubs, &[]);
+    }
+
+    /// [`run_handoff_child_with_stubs`], with each `(name, value)` in
+    /// `extra_env` also passed to the child (51-10: a test seam variable).
+    fn run_handoff_child_with_stubs_and_env(
+        name: &str,
+        hold: Option<&str>,
+        first_marker: &str,
+        stubs: &[(&str, String)],
+        extra_env: &[(&str, &std::ffi::OsStr)],
+    ) {
+        use std::os::unix::fs::PermissionsExt;
         let path_dir = handoff_claude_dir(first_marker);
+        for (program, script) in stubs {
+            let path = path_dir.path().join(program);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         let hold_dir = tempfile::Builder::new()
             .prefix("dfh")
             .tempdir_in("/tmp")
@@ -9177,6 +10065,7 @@ mod tests {
         if let Some(value) = &hold_value {
             env.push((HOLD_ENV, value.as_os_str()));
         }
+        env.extend_from_slice(extra_env);
         let output = run_hermetic_test_in_child(name, path_dir.path(), &env);
         devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, name);
     }
@@ -10156,6 +11045,1190 @@ mod tests {
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
             .filter(|event| event["event"].as_str() == Some(name))
             .collect()
+    }
+
+    // ---- 51-01: rate-limit failover at Code (SUPV-02) ----
+
+    /// The capture-shape rate-limit envelope a rate-limited stub prints. Its
+    /// retry time is the one
+    /// `pipeline_outcomes::tests::primary_loop_rate_limited_writes_single_agent_cron_instructions`
+    /// shows yields a scheduled (non-empty) cron resume rather than a gate.
+    const RATE_LIMIT_ENVELOPE: &str =
+        r#"{"type":"result","subtype":"error_rate_limit","retry_after":"2026-06-18T15:45:30Z"}"#;
+
+    /// A `claude` stub that waits for `go` in its working directory, commits
+    /// once, records that commit's id in `primary-commit` and prints the
+    /// rate-limit envelope.
+    fn rate_limited_claude_script() -> String {
+        format!(
+            "#!/bin/sh\ncase \"$1\" in --version) exit 0 ;; esac\n\
+             i=0\nwhile [ ! -e go ] && [ \"$i\" -lt 1200 ]; do sleep 0.05; i=$((i+1)); done\n\
+             git commit -q --allow-empty -m 'primary work' || exit 1\n\
+             git rev-parse HEAD > primary-commit\n\
+             printf '%s\\n' '{RATE_LIMIT_ENVELOPE}'\nexit 0\n"
+        )
+    }
+
+    /// A stub for a second agent that commits once and prints the success
+    /// marker, which Layer 1 reads whichever driver launched it.
+    fn committing_success_script() -> String {
+        format!(
+            "#!/bin/sh\ncase \"$1\" in --version) exit 0 ;; esac\n\
+             git commit -q --allow-empty -m 'fallback work' || exit 1\n\
+             printf '%s\\n' '{SUCCESS_MARKER}'\nexit 0\n"
+        )
+    }
+
+    /// `git <args>` in `root`, trimmed stdout; panics on a failed git.
+    fn git_out(root: &Path, args: &[&str]) -> String {
+        let output = devflow_core::test_support::git_command(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?} failed: {output:?}");
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    /// Every event in the run's log, in order.
+    fn all_events(root: &Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(devflow_core::events::events_path(root))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .collect()
+    }
+
+    /// R-2: the fallback is selected only at Code, and only while it is set,
+    /// unused and different from the agent driving the run. Every `Stage` is
+    /// named in the match, so a new stage is a compile error here rather than
+    /// a case nobody decided.
+    #[test]
+    fn failover_target_selects_the_fallback_only_at_code() {
+        let mut state = State::new(
+            PhaseId::new(5100),
+            AgentKind::Claude,
+            Mode::Supervise,
+            PathBuf::from("/repo"),
+        );
+        state.fallback_agent = Some(AgentKind::Codex);
+        for stage in [
+            Stage::Define,
+            Stage::Plan,
+            Stage::Code,
+            Stage::Validate,
+            Stage::Ship,
+        ] {
+            let expected = match stage {
+                Stage::Code => Some(AgentKind::Codex),
+                Stage::Define | Stage::Plan | Stage::Validate | Stage::Ship => None,
+            };
+            assert_eq!(
+                failover_target(&state, stage),
+                expected,
+                "an unused fallback at {stage}"
+            );
+        }
+
+        let mut consumed = state.clone();
+        consumed.fallback_consumed = true;
+        assert_eq!(
+            failover_target(&consumed, Stage::Code),
+            None,
+            "a consumed fallback is never selected again"
+        );
+        let mut same = state.clone();
+        same.fallback_agent = Some(AgentKind::Claude);
+        assert_eq!(
+            failover_target(&same, Stage::Code),
+            None,
+            "a fallback equal to the run's agent is no handoff"
+        );
+        let mut absent = state;
+        absent.fallback_agent = None;
+        assert_eq!(failover_target(&absent, Stage::Code), None, "no fallback");
+    }
+
+    /// D-11 criterion 1 (SUPV-02), with D-04, D-05, D-06 and D-10: a Code
+    /// stage whose `claude` commits once and is then rate-limited is handed to
+    /// the unused Codex fallback by the stage's own supervisor, relaunched in
+    /// the same root on the same branch, and completes there. The fallback's
+    /// commit sits on the primary's, so nothing was reset or rebased, and no
+    /// branch or worktree was added. Negative control in the same run: no
+    /// cron instruction and no `rate_limit_resume_scheduled` event.
+    ///
+    /// Supervise mode, as `HandoffRun::launch_with` builds it: under Auto the
+    /// Code preflight refuses a Codex fallback on the unattended launch shape.
+    #[test]
+    fn a_rate_limit_with_a_fallback_hands_off_and_completes_the_same_stage() {
+        const NAME: &str = "pipeline_launch::tests::a_rate_limit_with_a_fallback_hands_off_and_completes_the_same_stage";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child_with_stubs(
+                NAME,
+                None,
+                SUCCESS_MARKER,
+                &[
+                    ("claude", rate_limited_claude_script()),
+                    ("codex", committing_success_script()),
+                ],
+            );
+            return;
+        }
+        let _guard = env_lock();
+        let run = HandoffRun::launch_with(PhaseId::new(5101), |_, state| {
+            state.stage = Stage::Code;
+            state.stop_until = Some(Stage::Code);
+            state.fallback_agent = Some(AgentKind::Codex);
+        });
+        let branch_before = git_out(&run.root, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        let branches_before = git_out(&run.root, &["branch", "--list", "--format=%(refname)"]);
+        let worktrees = |root: &Path| -> Vec<String> {
+            git_out(root, &["worktree", "list", "--porcelain"])
+                .lines()
+                .filter(|line| line.starts_with("worktree "))
+                .map(str::to_string)
+                .collect()
+        };
+        let worktrees_before = worktrees(&run.root);
+        run.go();
+
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || {
+                !events_named(&run.root, "workflow_finished").is_empty()
+                    || !events_named(&run.root, "rate_limit_resume_scheduled").is_empty()
+            }),
+            "the run neither finished nor scheduled a resume; events:\n{}",
+            run.events()
+        );
+
+        let handoffs = events_named(&run.root, "agent_handoff");
+        assert_eq!(handoffs.len(), 1, "one handoff; events:\n{}", run.events());
+        let handoff = &handoffs[0];
+        assert_eq!(handoff["stage"], "code", "{handoff}");
+        assert_eq!(handoff["from_agent"], "claude", "{handoff}");
+        assert_eq!(handoff["to_agent"], "codex", "{handoff}");
+        assert_eq!(handoff["reason"], "rate_limited", "{handoff}");
+
+        let events = all_events(&run.root);
+        let position = |name: &str| events.iter().position(|e| e["event"] == name);
+        let finished = position("workflow_finished").expect("the fallback's Code completes");
+        assert_eq!(
+            events[finished]["reason"], "stopped_at",
+            "{}",
+            events[finished]
+        );
+        assert!(
+            position("agent_handoff").is_some_and(|handed| handed < finished),
+            "the completion follows the handoff; events:\n{}",
+            run.events()
+        );
+
+        let state = run.state();
+        assert_eq!(
+            state.agent,
+            AgentKind::Codex,
+            "the fallback now drives the run"
+        );
+        assert!(state.fallback_consumed, "the hop is consumed (D-05)");
+        assert_eq!(state.stage, Stage::Code);
+        assert!(state.stopped, "the --until code stop fired");
+        assert!(
+            state
+                .stop_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("code completed")),
+            "{:?}",
+            state.stop_reason
+        );
+        assert_eq!(
+            state.infra_failures, 0,
+            "a handoff is not an infra fault (D-06)"
+        );
+
+        let primary = std::fs::read_to_string(run.root.join("primary-commit"))
+            .expect("the primary committed before it was rate-limited");
+        assert_eq!(git_out(&run.root, &["rev-parse", "HEAD^"]), primary.trim());
+        assert_ne!(
+            git_out(&run.root, &["rev-parse", "HEAD"]),
+            primary.trim(),
+            "the fallback committed on top of the primary's commit"
+        );
+        assert_eq!(
+            git_out(&run.root, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            branch_before
+        );
+        assert_eq!(
+            git_out(&run.root, &["branch", "--list", "--format=%(refname)"]),
+            branches_before,
+            "no branch was added"
+        );
+        assert_eq!(
+            worktrees(&run.root),
+            worktrees_before,
+            "no worktree was added"
+        );
+
+        assert!(
+            !devflow_core::ship::cron_instructions_path(&run.root, run.phase).exists(),
+            "a handed-off rate limit writes no cron instruction"
+        );
+        assert!(
+            events_named(&run.root, "rate_limit_resume_scheduled").is_empty(),
+            "a handed-off rate limit schedules no resume; events:\n{}",
+            run.events()
+        );
+    }
+
+    /// Write the rate-limit envelope as the phase's capture, for an advance
+    /// run with no agent.
+    fn write_rate_limit_capture(root: &Path, phase: PhaseId) {
+        let stdout = devflow_core::agent_result::stdout_path(root, phase);
+        std::fs::create_dir_all(stdout.parent().unwrap()).unwrap();
+        std::fs::write(&stdout, format!("{RATE_LIMIT_ENVELOPE}\n")).unwrap();
+    }
+
+    /// Assert `phase`'s cron instruction resumes it with `devflow resume
+    /// --phase N` on a real schedule.
+    fn assert_cron_resume_written(root: &Path, phase: PhaseId) {
+        let instructions = devflow_core::ship::load_cron_instructions(root, phase)
+            .expect("the cron arm writes cron-instructions-NN.json");
+        assert_eq!(instructions.resume.command, "devflow");
+        assert_eq!(
+            instructions.resume.args,
+            ["resume", "--phase", &phase.to_string()]
+        );
+        assert!(
+            !instructions.hermes_cron.schedule.is_empty(),
+            "the retry time yields a schedule"
+        );
+    }
+
+    /// D-11 criterion 2 (SUPV-02): with no fallback, a rate-limited Code stage
+    /// takes today's cron arm through the real supervisor: the cron
+    /// instruction resumes the phase with `devflow resume --phase N`, and
+    /// nothing hands off. Negative control: zero `agent_handoff` events, the
+    /// agent unchanged, and no stage launched after N's. Every successor is
+    /// launched from inside N's advance, so once N's socket is gone no later
+    /// one can appear; the launch count rules out one that came and went.
+    #[test]
+    fn a_rate_limit_without_a_fallback_writes_cron_instructions_and_never_hands_off() {
+        const NAME: &str = "pipeline_launch::tests::a_rate_limit_without_a_fallback_writes_cron_instructions_and_never_hands_off";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child_with_stubs(
+                NAME,
+                None,
+                SUCCESS_MARKER,
+                &[("claude", rate_limited_claude_script())],
+            );
+            return;
+        }
+        let _guard = env_lock();
+        let run = HandoffRun::launch_with(PhaseId::new(5102), |_, state| {
+            state.stage = Stage::Code;
+            state.stop_until = Some(Stage::Code);
+        });
+        run.go();
+
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || {
+                !events_named(&run.root, "rate_limit_resume_scheduled").is_empty()
+            }),
+            "the cron arm never ran; events:\n{}",
+            run.events()
+        );
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || {
+                devflow_core::supervisor::probe(&run.n.socket_path)
+                    .is_ok_and(|liveness| liveness == devflow_core::supervisor::Liveness::Gone)
+            }),
+            "N's supervisor ends once its advance has returned"
+        );
+
+        assert_cron_resume_written(&run.root, run.phase);
+        assert_eq!(
+            events_named(&run.root, "rate_limit_resume_scheduled").len(),
+            1,
+            "{}",
+            run.events()
+        );
+        assert!(
+            events_named(&run.root, "agent_handoff").is_empty(),
+            "no fallback, no handoff; events:\n{}",
+            run.events()
+        );
+        let state = run.state();
+        assert_eq!(state.agent, AgentKind::Claude);
+        assert_eq!(state.fallback_agent, None);
+        assert!(
+            run.other_sockets().is_empty(),
+            "no supervisor besides N's was published: {:?}",
+            run.other_sockets()
+        );
+        assert_eq!(
+            stage_launched_count(&run.root, run.phase),
+            1,
+            "only stage N launched; events:\n{}",
+            run.events()
+        );
+    }
+
+    /// D-07: a handoff refused at runtime — here the fallback's binary is
+    /// missing — says so in `agent_handoff_refused`, naming the fallback and
+    /// the refusal, then takes the cron arm unchanged with the original
+    /// retry time. The fallback stays unconsumed and the agent unchanged; the
+    /// cron arm's own bump is the only `infra_failures` change.
+    ///
+    /// Supervise mode: under Auto the candidate preflight refuses Codex at
+    /// Code on the unattended launch shape before the binary check runs, and
+    /// the reason would not name the missing binary.
+    #[test]
+    fn a_refused_handoff_takes_the_cron_arm_and_names_the_refusal() {
+        const NAME: &str =
+            "pipeline_launch::tests::a_refused_handoff_takes_the_cron_arm_and_names_the_refusal";
+        enter_agent_free_child!(NAME, "claude");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5103);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Code;
+        state.fallback_agent = Some(AgentKind::Codex);
+        workflow::save_state(&state).unwrap();
+        write_rate_limit_capture(root, phase);
+
+        advance(root, Some(phase)).unwrap();
+
+        let refused = events_named(root, "agent_handoff_refused");
+        assert_eq!(refused.len(), 1, "one refusal event: {refused:?}");
+        let refusal = &refused[0];
+        assert_eq!(refusal["stage"], "code", "{refusal}");
+        assert_eq!(refusal["from_agent"], "claude", "{refusal}");
+        assert_eq!(refusal["to_agent"], "codex", "{refusal}");
+        assert!(
+            refusal["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("not found")),
+            "the refusal names the missing binary: {refusal}"
+        );
+        assert_cron_resume_written(root, phase);
+        assert_eq!(events_named(root, "rate_limit_resume_scheduled").len(), 1);
+        assert!(
+            events_named(root, "agent_handoff").is_empty(),
+            "a refused handoff is not a handoff"
+        );
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        assert_eq!(reloaded.agent, AgentKind::Claude);
+        assert!(
+            !reloaded.fallback_consumed,
+            "only a committed hop consumes it"
+        );
+        assert_eq!(reloaded.infra_failures, 1, "the cron arm's own bump");
+    }
+
+    /// R-2: a rate limit at Plan with an unused fallback configured takes the
+    /// cron arm and leaves the fallback alone. A `codex` stub is on PATH, so
+    /// the absence of a hop is not explained by a missing binary.
+    ///
+    /// Supervise mode, so that with the stage term removed from
+    /// [`failover_target`] this run reaches a committed hop rather than a
+    /// preflight refusal (the RED-equivalent this control was checked with).
+    #[test]
+    fn a_rate_limit_at_plan_with_a_fallback_takes_the_cron_arm() {
+        const NAME: &str =
+            "pipeline_launch::tests::a_rate_limit_at_plan_with_a_fallback_takes_the_cron_arm";
+        enter_agent_free_child!(NAME, "codex");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5104);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Plan;
+        state.fallback_agent = Some(AgentKind::Codex);
+        workflow::save_state(&state).unwrap();
+        write_rate_limit_capture(root, phase);
+
+        advance(root, Some(phase)).unwrap();
+
+        // The hop checks come first so that a hop at Plan is the failure
+        // reported, not its knock-on missing cron file.
+        assert!(
+            events_named(root, "agent_handoff").is_empty(),
+            "no handoff at Plan: {:?}",
+            events_named(root, "agent_handoff")
+        );
+        assert!(
+            events_named(root, "agent_handoff_refused").is_empty(),
+            "Plan never attempts a handoff"
+        );
+        assert_cron_resume_written(root, phase);
+        assert_eq!(events_named(root, "rate_limit_resume_scheduled").len(), 1);
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        assert_eq!(reloaded.agent, AgentKind::Claude);
+        assert_eq!(reloaded.fallback_agent, Some(AgentKind::Codex));
+        assert!(!reloaded.fallback_consumed);
+    }
+
+    // ---- 51-06: what crosses the hop, and its boundaries at Code ----
+
+    /// Ignore `.devflow/` in the repo at `root` and commit that on the current
+    /// branch, so the run's own state and capture files do not make the tree read
+    /// dirty: what `git status --porcelain` then reports is the agent's work alone.
+    fn ignore_devflow_dir(root: &Path) {
+        std::fs::write(root.join(".gitignore"), ".devflow/\n").unwrap();
+        git_out(root, &["add", ".gitignore"]);
+        git_out(root, &["commit", "-q", "-m", "ignore .devflow"]);
+    }
+
+    /// A PATH dir holding a `claude` and a `codex` that each wait (bounded, about
+    /// 60 s) for a file that never appears, and `sleep` for that wait. A stage
+    /// relaunched onto either stays running, so its supervisor makes no further
+    /// state write while the test reads the state.
+    fn waiting_agents_dir() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let path_dir = agent_free_dir_with_agent_stub("claude");
+        for program in ["claude", "codex"] {
+            let path = path_dir.path().join(program);
+            std::fs::write(
+                &path,
+                "#!/bin/sh\ncase \"$1\" in --version) exit 0 ;; esac\n\
+                 i=0\nwhile [ ! -e never-released ] && [ \"$i\" -lt 1200 ]; do sleep 0.05; i=$((i+1)); done\n\
+                 exit 0\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let real_sleep = ["/usr/bin/sleep", "/bin/sleep"]
+            .into_iter()
+            .map(Path::new)
+            .find(|path| path.is_file())
+            .expect("sleep must exist to run this test");
+        std::os::unix::fs::symlink(real_sleep, path_dir.path().join("sleep")).unwrap();
+        path_dir
+    }
+
+    /// D-04: delivery-canary evidence is per agent. The handoff commit clears the
+    /// recorded canary and Claude session id, so an Antigravity fallback whose own
+    /// canary reads `Absent` is refused, after exactly one canary run, instead of
+    /// launching on Claude's `Confirmed`. Control first: with no handoff, the same
+    /// recorded `Confirmed` admits an Antigravity launch without running a canary,
+    /// so the refusal below is the handoff's doing.
+    #[test]
+    fn a_handoff_reruns_the_delivery_canary_for_the_new_agent() {
+        const NAME: &str =
+            "pipeline_launch::tests::a_handoff_reruns_the_delivery_canary_for_the_new_agent";
+        enter_agent_free_child!(NAME, "agy");
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(5161);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Code;
+        state.canary = Some(canary::CanaryOutcome::Confirmed);
+        state.session_id = Some("s1".to_string());
+        workflow::save_state(&state).unwrap();
+
+        let calls = std::cell::Cell::new(0usize);
+        let mut without_handoff = state.clone();
+        without_handoff.agent = AgentKind::Antigravity;
+        canary_gate(
+            &mut without_handoff,
+            true,
+            counting_canary(&calls, canary::CanaryOutcome::Absent),
+        )
+        .expect("control: a recorded Confirmed admits the launch");
+        assert_eq!(
+            calls.get(),
+            0,
+            "control: a recorded outcome is reused, never re-run"
+        );
+
+        let outcome = hand_off_agent(
+            root,
+            &mut state,
+            AgentKind::Antigravity,
+            HandoffReason::RateLimited,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            HandoffOutcome::HandedOff {
+                from: AgentKind::Claude
+            }
+        );
+        let mut reloaded = workflow::load_state(root, phase).unwrap();
+        assert_eq!(reloaded.agent, AgentKind::Antigravity);
+        assert_eq!(
+            reloaded.canary, None,
+            "the primary's canary evidence does not cross the hop"
+        );
+        assert_eq!(
+            reloaded.session_id, None,
+            "the primary's session id does not cross the hop"
+        );
+
+        let refused = canary_gate(
+            &mut reloaded,
+            true,
+            counting_canary(&calls, canary::CanaryOutcome::Absent),
+        );
+        assert_eq!(calls.get(), 1, "the fallback's own canary ran once");
+        let message = refused
+            .expect_err("an Absent canary for the fallback refuses its launch")
+            .to_string();
+        assert!(message.contains("ABSENT"), "{message}");
+    }
+
+    /// D-10: the `agent_handoff` event records the tree it hands over, measured
+    /// before the commit: `tree_dirty` from `git status --porcelain` at the launch
+    /// root and `commit_count` from the phase branch. `.devflow/` is ignored, so
+    /// the dirt is the untracked file alone, and the handoff leaves that file in
+    /// place (nothing is reset, stashed or cleaned).
+    #[test]
+    fn the_handoff_event_records_the_tree_it_hands_over() {
+        const NAME: &str =
+            "pipeline_launch::tests::the_handoff_event_records_the_tree_it_hands_over";
+        enter_agent_free_child!(NAME, "codex");
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        ignore_devflow_dir(root);
+        let phase = PhaseId::new(5162);
+        let git_flow = devflow_core::config::git_flow_for_run(root, None);
+        let branch = format!("{}phase-{}", git_flow.feature_prefix, phase.padded());
+        git_out(root, &["checkout", "-q", "-b", &branch]);
+        git_out(root, &["commit", "-q", "--allow-empty", "-m", "first"]);
+        git_out(root, &["commit", "-q", "--allow-empty", "-m", "second"]);
+        let untracked = root.join("untracked-work.txt");
+        std::fs::write(&untracked, "half-done\n").unwrap();
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Code;
+        workflow::save_state(&state).unwrap();
+
+        let outcome = hand_off_agent(
+            root,
+            &mut state,
+            AgentKind::Codex,
+            HandoffReason::RateLimited,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            HandoffOutcome::HandedOff {
+                from: AgentKind::Claude
+            }
+        );
+
+        let handoffs = events_named(root, "agent_handoff");
+        assert_eq!(handoffs.len(), 1, "{handoffs:?}");
+        assert_eq!(handoffs[0]["tree_dirty"], true, "{}", handoffs[0]);
+        assert_eq!(handoffs[0]["commit_count"], 2, "{}", handoffs[0]);
+        assert_eq!(
+            std::fs::read_to_string(&untracked).unwrap(),
+            "half-done\n",
+            "the untracked file is handed over as it was"
+        );
+    }
+
+    /// D-08: a Code rate limit with nothing committed on the phase branch still
+    /// hands off, through a real `advance`, and the event says so: `commit_count:
+    /// 0` on a clean tree. The fallback's `codex` waits, so its supervisor writes
+    /// nothing more before the state is read.
+    #[test]
+    fn a_rate_limit_before_any_commit_still_hands_off() {
+        const NAME: &str = "pipeline_launch::tests::a_rate_limit_before_any_commit_still_hands_off";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = waiting_agents_dir();
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        ignore_devflow_dir(root);
+        let phase = PhaseId::new(5163);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Code;
+        state.fallback_agent = Some(AgentKind::Codex);
+        workflow::save_state(&state).unwrap();
+        write_rate_limit_capture(root, phase);
+
+        let result = advance(root, Some(phase));
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        let _reap_guard = ReapMonitorOnDrop::after_launch(&reloaded);
+        result.unwrap();
+
+        let handoffs = events_named(root, "agent_handoff");
+        assert_eq!(handoffs.len(), 1, "one handoff: {handoffs:?}");
+        let handoff = &handoffs[0];
+        assert_eq!(handoff["stage"], "code", "{handoff}");
+        assert_eq!(handoff["to_agent"], "codex", "{handoff}");
+        assert_eq!(handoff["commit_count"], 0, "{handoff}");
+        assert_eq!(handoff["tree_dirty"], false, "{handoff}");
+        assert_eq!(reloaded.agent, AgentKind::Codex);
+        assert!(reloaded.fallback_consumed);
+        assert!(
+            reloaded.supervisor.is_some(),
+            "the fallback's relaunch is recorded"
+        );
+        assert!(
+            events_named(root, "rate_limit_resume_scheduled").is_empty(),
+            "a handed-off rate limit schedules no resume"
+        );
+    }
+
+    /// A Supervise-mode Code run of `phase` under Claude in a fresh repo at `root`,
+    /// with `fallback` and `consumed` saved, its `infra_failures` at `infra`, and a
+    /// rate-limit capture for `advance` to read. The capture shape, so a Claude
+    /// relaunch needs no delivery canary.
+    fn save_rate_limited_code_run(
+        root: &Path,
+        phase: PhaseId,
+        fallback: Option<AgentKind>,
+        consumed: bool,
+        infra: u32,
+    ) {
+        init_repo(root);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Code;
+        state.fallback_agent = fallback;
+        state.fallback_consumed = consumed;
+        state.infra_failures = infra;
+        state.legacy_claude_launch = true;
+        workflow::save_state(&state).unwrap();
+        write_rate_limit_capture(root, phase);
+    }
+
+    /// D-06 at its boundary, at Code (R-2): a hop is not an infra fault. With
+    /// `infra_failures` one below the ceiling, a rate limit with an unused
+    /// fallback hands off and leaves the counter where it was. Control in the same
+    /// test: the same state with no fallback takes the cron arm's bump, reaches the
+    /// ceiling and aborts, which removes the run's state.
+    ///
+    /// Supervise mode with a Codex fallback, a pair the Code preflight admits;
+    /// `gate_or_abort_infra` aborts at the ceiling in every mode.
+    #[test]
+    fn an_unused_fallback_hands_off_one_below_the_infra_ceiling() {
+        const NAME: &str =
+            "pipeline_launch::tests::an_unused_fallback_hands_off_one_below_the_infra_ceiling";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = waiting_agents_dir();
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let _guard = env_lock();
+        let below_ceiling = mode::MAX_INFRA_FAILURES - 1;
+
+        let with_fallback = tempfile::tempdir().unwrap();
+        let root = with_fallback.path();
+        let phase = PhaseId::new(5164);
+        save_rate_limited_code_run(root, phase, Some(AgentKind::Codex), false, below_ceiling);
+        let result = advance(root, Some(phase));
+        let reloaded = workflow::load_state(root, phase);
+        let _reap_guard = reloaded.as_ref().ok().map(ReapMonitorOnDrop::after_launch);
+        result.unwrap();
+        let reloaded = reloaded.expect("a handed-off run keeps its state");
+        assert_eq!(
+            events_named(root, "agent_handoff").len(),
+            1,
+            "one handoff one below the ceiling"
+        );
+        assert_eq!(
+            reloaded.infra_failures, below_ceiling,
+            "the hop charged nothing to the infra counter (D-06)"
+        );
+        assert_eq!(reloaded.agent, AgentKind::Codex);
+
+        let without_fallback = tempfile::tempdir().unwrap();
+        let control_root = without_fallback.path();
+        let control_phase = PhaseId::new(5165);
+        save_rate_limited_code_run(control_root, control_phase, None, false, below_ceiling);
+        let outcome = advance(control_root, Some(control_phase));
+        assert!(
+            events_named(control_root, "agent_handoff").is_empty(),
+            "control: no fallback, no handoff"
+        );
+        assert!(
+            matches!(
+                workflow::load_state(control_root, control_phase),
+                Err(workflow::WorkflowError::MissingState(_))
+            ),
+            "control: the cron arm's bump reaches the ceiling and aborts (advance returned \
+             {outcome:?})"
+        );
+        outcome.unwrap();
+    }
+
+    /// D-05: one hop per run, no automatic switch back. Once the fallback is
+    /// consumed, a later Code rate limit takes the cron arm on the current agent.
+    /// Second fixture, the adjacency edge at runtime: an unconsumed fallback equal
+    /// to the agent is no handoff either. A `codex` stub is on PATH, so a missing
+    /// binary does not explain the absent hop.
+    #[test]
+    fn a_rate_limit_after_the_one_hop_takes_the_cron_arm() {
+        const NAME: &str =
+            "pipeline_launch::tests::a_rate_limit_after_the_one_hop_takes_the_cron_arm";
+        enter_agent_free_child!(NAME, "codex");
+        let _guard = env_lock();
+        for (phase, fallback, consumed) in [
+            (PhaseId::new(5166), AgentKind::Codex, true),
+            (PhaseId::new(5167), AgentKind::Claude, false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            save_rate_limited_code_run(root, phase, Some(fallback), consumed, 0);
+
+            advance(root, Some(phase)).unwrap();
+
+            assert!(
+                events_named(root, "agent_handoff").is_empty(),
+                "phase {phase}: no hop; events: {:?}",
+                events_named(root, "agent_handoff")
+            );
+            assert_cron_resume_written(root, phase);
+            assert_eq!(
+                events_named(root, "rate_limit_resume_scheduled").len(),
+                1,
+                "phase {phase}"
+            );
+            let reloaded = workflow::load_state(root, phase).unwrap();
+            assert_eq!(reloaded.agent, AgentKind::Claude, "phase {phase}");
+            assert_eq!(reloaded.fallback_consumed, consumed, "phase {phase}");
+        }
+    }
+
+    /// A transport cancel whose envelope still carries a success marker: the
+    /// Antigravity shape `agent_result` reads as [`agent_result::AgentStatus::Ambiguous`]
+    /// at Layer 1, whatever the run's agent.
+    const AMBIGUOUS_CANCEL_CAPTURE: &str = concat!(
+        r#"{"event":"init","model":"gemini-3.7-flash-high","inputFormat":"stream-json","outputFormat":"stream-json","printTimeout":"60m"}"#,
+        "\n",
+        r#"{"event":"result","result":{"status":"ERROR","response":"DEVFLOW_RESULT: {\"status\":\"success\"}\n","error":"context canceled"}}"#,
+        "\n"
+    );
+
+    /// The ordering edge: failover sits only inside the `RateLimited` arm. An
+    /// `Ambiguous` outcome at Code with an unused fallback re-drives the same
+    /// agent, emits no `agent_handoff`, and leaves the fallback unused. The
+    /// re-driven `claude` waits, so its supervisor writes nothing more before the
+    /// state is read.
+    #[test]
+    fn an_ambiguous_outcome_with_an_unused_fallback_re_drives_without_handing_off() {
+        const NAME: &str = "pipeline_launch::tests::an_ambiguous_outcome_with_an_unused_fallback_re_drives_without_handing_off";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = waiting_agents_dir();
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5168);
+        save_rate_limited_code_run(root, phase, Some(AgentKind::Codex), false, 0);
+        std::fs::write(
+            devflow_core::agent_result::stdout_path(root, phase),
+            AMBIGUOUS_CANCEL_CAPTURE,
+        )
+        .unwrap();
+
+        let result = advance(root, Some(phase));
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        let _reap_guard = ReapMonitorOnDrop::after_launch(&reloaded);
+        result.unwrap();
+
+        assert_eq!(
+            events_named(root, "ambiguous_transport_retry").len(),
+            1,
+            "the Ambiguous route ran"
+        );
+        assert!(
+            events_named(root, "agent_handoff").is_empty(),
+            "an Ambiguous outcome never hands off: {:?}",
+            events_named(root, "agent_handoff")
+        );
+        assert!(!reloaded.fallback_consumed, "the fallback stays unused");
+        assert_eq!(reloaded.agent, AgentKind::Claude);
+        assert!(
+            reloaded.supervisor.is_some(),
+            "the same agent was re-driven"
+        );
+    }
+
+    /// Run `name` in a 50-13 handoff child whose `claude` commits once and is
+    /// rate-limited, beside an `agy` that exits 0 at once (its delivery canary
+    /// reads an empty capture, so `Absent`), held at `after_failover_commit`.
+    fn run_failover_relaunch_child(name: &str) {
+        run_handoff_child_with_stubs(
+            name,
+            Some("after_failover_commit"),
+            SUCCESS_MARKER,
+            &[
+                ("claude", rate_limited_claude_script()),
+                ("agy", "#!/bin/sh\nexit 0\n".to_string()),
+            ],
+        );
+    }
+
+    /// A stage-N Code run under Claude with an unused Antigravity fallback, launched
+    /// by the test and stopping after Code.
+    fn launch_code_run_with_an_antigravity_fallback(phase: PhaseId) -> HandoffRun {
+        HandoffRun::launch_with(phase, |_, state| {
+            state.stage = Stage::Code;
+            state.stop_until = Some(Stage::Code);
+            state.fallback_agent = Some(AgentKind::Antigravity);
+        })
+    }
+
+    /// D-04 (never silent) with R2-D1, inside a running supervisor with the D-03
+    /// fence active: a handoff commit followed by a relaunch that fails (the
+    /// fallback's own delivery canary reads `Absent`, a real production refusal)
+    /// emits `agent_handoff_relaunch_failed` and ends at the never-silent Code gate,
+    /// opened by the supervisor the state records. Not the cron arm: a recorded
+    /// `Absent` refuses every later launch, so a scheduled resume cannot succeed.
+    ///
+    /// Non-vacuity: `wait_held` returns only because `test_hold` reached
+    /// `after_failover_commit`, which it does only inside an engaged supervisor
+    /// advance, so the writes below were fenced.
+    #[test]
+    fn a_handoff_whose_relaunch_fails_ends_at_a_gate() {
+        const NAME: &str = "pipeline_launch::tests::a_handoff_whose_relaunch_fails_ends_at_a_gate";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_failover_relaunch_child(NAME);
+            return;
+        }
+        let _guard = env_lock();
+        let run = launch_code_run_with_an_antigravity_fallback(PhaseId::new(5169));
+        run.go();
+        run.wait_held();
+        run.release();
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || {
+                events_named(&run.root, "gate_fired")
+                    .iter()
+                    .any(|gate| gate["stage"] == "code")
+            }),
+            "no Code gate fired; events:\n{}",
+            run.events()
+        );
+
+        let events = all_events(&run.root);
+        let position = |name: &str| events.iter().position(|e| e["event"] == name);
+        let handed = position("agent_handoff").expect("the handoff committed");
+        let failed = position("agent_handoff_relaunch_failed")
+            .unwrap_or_else(|| panic!("no relaunch-failure event; events:\n{}", run.events()));
+        let gated = position("gate_fired").expect("polled above");
+        assert!(
+            handed < failed && failed < gated,
+            "handoff, then the failure, then the gate; events:\n{}",
+            run.events()
+        );
+        let handoff = &events[handed];
+        assert_eq!(handoff["stage"], "code", "{handoff}");
+        assert_eq!(handoff["to_agent"], "antigravity", "{handoff}");
+        assert_eq!(handoff["reason"], "rate_limited", "{handoff}");
+        let failure = &events[failed];
+        assert_eq!(failure["stage"], "code", "{failure}");
+        assert_eq!(failure["to_agent"], "antigravity", "{failure}");
+        assert!(
+            failure["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("ABSENT")),
+            "the failure names the canary's refusal: {failure}"
+        );
+        assert!(
+            events[gated]["context"]
+                .as_str()
+                .is_some_and(|context| context.contains("handoff to antigravity")),
+            "the gate names the fallback: {}",
+            events[gated]
+        );
+        assert!(
+            events[handed..]
+                .iter()
+                .all(|event| event["event"] != "stage_launched"),
+            "nothing launched after the handoff; events:\n{}",
+            run.events()
+        );
+        assert!(
+            events_named(&run.root, "rate_limit_resume_scheduled").is_empty(),
+            "a failed relaunch never takes the cron arm (R2-D1)"
+        );
+        assert!(
+            !devflow_core::ship::cron_instructions_path(&run.root, run.phase).exists(),
+            "a failed relaunch writes no cron instruction (R2-D1)"
+        );
+        assert!(
+            events_named(&run.root, "supervisor_superseded").is_empty(),
+            "the supervisor kept its own run; events:\n{}",
+            run.events()
+        );
+
+        let state = run.state();
+        assert_eq!(state.agent, AgentKind::Antigravity);
+        assert!(state.fallback_consumed);
+        assert_eq!(
+            state.infra_failures, 1,
+            "handle_infra_outcome's one bump; the hop itself charges nothing (D-06)"
+        );
+        assert_eq!(state.canary, Some(canary::CanaryOutcome::Absent));
+        assert!(state.gate_pending, "the never-silent gate is open");
+        assert!(Gates::gate_path(&run.root, run.phase, Stage::Code).exists());
+        assert_eq!(
+            state
+                .supervisor
+                .as_ref()
+                .map(|record| record.launch_id.as_str()),
+            Some(run.n.launch_id.as_str()),
+            "the supervisor waiting at the gate is the run's recorded owner"
+        );
+    }
+
+    /// Phase 50 D-03 is intact: a supervisor that another launch replaced between
+    /// the handoff commit and the relaunch writes nothing. Its relaunch's first
+    /// owned write is refused with `NotOwner`, which `fail_over_on_rate_limit`
+    /// returns unchanged, so it ends superseded naming the newer launch: no
+    /// relaunch-failure event, no gate, no cron arm, and the newer record intact.
+    /// Paired with [`a_handoff_whose_relaunch_fails_ends_at_a_gate`], this tells a
+    /// real replacement (`recorded` names another launch) from a self-inflicted one.
+    #[test]
+    fn a_failover_superseded_mid_relaunch_writes_nothing() {
+        const NAME: &str =
+            "pipeline_launch::tests::a_failover_superseded_mid_relaunch_writes_nothing";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_failover_relaunch_child(NAME);
+            return;
+        }
+        let _guard = env_lock();
+        const NEWER: &str = "newer-supervisor";
+        let run = launch_code_run_with_an_antigravity_fallback(PhaseId::new(5170));
+        run.go();
+        run.wait_held();
+        let mut newer = run.n.clone();
+        newer.launch_id = NEWER.to_string();
+        newer.socket_path = run.root.join("newer-supervisor.sock");
+        workflow::update_state(&run.root, run.phase, |s| {
+            s.supervisor = Some(newer);
+            Ok::<(), workflow::WorkflowError>(())
+        })
+        .unwrap();
+        run.release();
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || {
+                !events_named(&run.root, "supervisor_superseded").is_empty()
+            }),
+            "the replaced supervisor never ended superseded; events:\n{}",
+            run.events()
+        );
+
+        let superseded = events_named(&run.root, "supervisor_superseded");
+        assert_eq!(superseded.len(), 1, "{superseded:?}");
+        assert_eq!(superseded[0]["ours"], run.n.launch_id.as_str());
+        assert_eq!(superseded[0]["recorded"], NEWER);
+        for name in [
+            "agent_handoff_relaunch_failed",
+            "gate_fired",
+            "rate_limit_resume_scheduled",
+        ] {
+            assert!(
+                events_named(&run.root, name).is_empty(),
+                "a replaced supervisor emits no {name}; events:\n{}",
+                run.events()
+            );
+        }
+        assert!(!devflow_core::ship::cron_instructions_path(&run.root, run.phase).exists());
+        let state = run.state();
+        assert!(!state.gate_pending);
+        assert_eq!(
+            state
+                .supervisor
+                .as_ref()
+                .map(|record| record.launch_id.as_str()),
+            Some(NEWER),
+            "the newer launch's record is untouched"
+        );
+    }
+
+    // ---- 51-07: a same-stage relaunch replays the interrupted fix pass (D-09) ----
+
+    /// [`waiting_agents_dir`] whose `claude` and `codex` first write their argv,
+    /// NUL-separated, to `<program>-argv.bin` in their working directory, then
+    /// create `<program>-argv.done`, then wait (bounded, about 60 s) like the
+    /// stubs they replace. The marker is created after the write completes, so a
+    /// reader that sees it reads the whole argv.
+    fn argv_recording_agents_dir() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let path_dir = waiting_agents_dir();
+        for program in ["claude", "codex"] {
+            let path = path_dir.path().join(program);
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\ncase \"$1\" in --version) exit 0 ;; esac\n\
+                     for arg in \"$@\"; do printf '%s\\0' \"$arg\"; done > {program}-argv.bin\n\
+                     : > {program}-argv.done\n\
+                     i=0\nwhile [ ! -e never-released ] && [ \"$i\" -lt 1200 ]; do sleep 0.05; i=$((i+1)); done\n\
+                     exit 0\n"
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path_dir
+    }
+
+    /// The argv the `program` stub from [`argv_recording_agents_dir`] recorded in
+    /// `workdir`, waiting (bounded) for its marker; panics naming the program if
+    /// the stub never ran.
+    fn recorded_argv(workdir: &Path, program: &str) -> Vec<String> {
+        const RECORD_WAIT: Duration = Duration::from_secs(30);
+        let done = workdir.join(format!("{program}-argv.done"));
+        let deadline = std::time::Instant::now() + RECORD_WAIT;
+        while !done.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the {program} stub recorded no argv within {RECORD_WAIT:?} in {}",
+                workdir.display()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let bytes = std::fs::read(workdir.join(format!("{program}-argv.bin"))).unwrap();
+        bytes
+            .split(|byte| *byte == 0)
+            .map(|arg| String::from_utf8_lossy(arg).into_owned())
+            .collect()
+    }
+
+    /// Run a Code rate limit through a real `advance` for a Supervise-mode Claude
+    /// run of `phase` at `root` with an unused Codex fallback, from a Code state
+    /// entered by a loop-back with `fix` (`None`: a plain Code state). Returns the
+    /// argv the spawned `codex` received and a reaper for its monitor.
+    fn fail_over_from_code(
+        root: &Path,
+        phase: PhaseId,
+        fix: Option<prompt::FixType>,
+    ) -> (Vec<String>, ReapMonitorOnDrop) {
+        init_repo(root);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = if fix.is_some() {
+            Stage::Validate
+        } else {
+            Stage::Code
+        };
+        state.fallback_agent = Some(AgentKind::Codex);
+        workflow::save_state(&state).unwrap();
+        if let Some(fix) = fix {
+            crate::pipeline_gate::prepare_loop_back_to_code(
+                root,
+                &mut state,
+                fix,
+                crate::pipeline_gate::LoopBackReason::GateResponse,
+            )
+            .unwrap();
+        }
+        let entered = workflow::load_state(root, phase).unwrap();
+        assert_eq!(entered.stage, Stage::Code);
+        assert_eq!(
+            entered.code_fix, fix,
+            "the Code pass records the fix type it was entered with"
+        );
+        write_rate_limit_capture(root, phase);
+
+        let result = advance(root, Some(phase));
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        let reap = ReapMonitorOnDrop::after_launch(&reloaded);
+        result.unwrap();
+        assert_eq!(reloaded.agent, AgentKind::Codex, "the run handed off");
+        (recorded_argv(root, "codex"), reap)
+    }
+
+    /// D-09 (Code, review B-1): a Code failover in the middle of an audit-fix pass
+    /// hands the fallback the audit-fix workflow, rendered by the FALLBACK's
+    /// driver, and the assertion is on the argv the spawned `codex` received.
+    /// Control in the same test: the same failover from a plain Code pass
+    /// delivers the plain execute-phase rendering.
+    #[test]
+    fn a_code_failover_during_an_audit_fix_pass_replays_audit_fix() {
+        const NAME: &str =
+            "pipeline_launch::tests::a_code_failover_during_an_audit_fix_pass_replays_audit_fix";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = argv_recording_agents_dir();
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let _guard = env_lock();
+        let codex = agents::driver_for(AgentKind::Codex);
+        let code_prompt = |phase: PhaseId, fix: Option<prompt::FixType>| {
+            codex.render_prompt(&prompt::StageIntent::Code { phase, fix })
+        };
+
+        let fix_dir = tempfile::tempdir().unwrap();
+        let fix_phase = PhaseId::new(5171);
+        let (argv, _reap_fix) =
+            fail_over_from_code(fix_dir.path(), fix_phase, Some(prompt::FixType::AuditFix));
+        let audit_fix = code_prompt(fix_phase, Some(prompt::FixType::AuditFix));
+        assert_ne!(audit_fix, code_prompt(fix_phase, None));
+        assert!(
+            argv.contains(&audit_fix),
+            "the fallback receives the audit-fix pass in Codex's own rendering: {argv:?}"
+        );
+        assert!(
+            !argv.contains(&code_prompt(fix_phase, None)),
+            "the fallback does not receive the plain execute-phase prompt: {argv:?}"
+        );
+
+        let plain_dir = tempfile::tempdir().unwrap();
+        let plain_phase = PhaseId::new(5175);
+        let (argv, _reap_plain) = fail_over_from_code(plain_dir.path(), plain_phase, None);
+        assert!(
+            argv.contains(&code_prompt(plain_phase, None)),
+            "control: a plain Code failover delivers execute-phase: {argv:?}"
+        );
+        assert!(
+            !argv.contains(&code_prompt(plain_phase, Some(prompt::FixType::AuditFix))),
+            "control: a plain Code failover delivers no fix prompt: {argv:?}"
+        );
     }
 
     /// Send `shutdown` to the supervisor at `socket` on the wire, wait for
@@ -11975,6 +14048,27 @@ mod tests {
         Some(item)
     }
 
+    /// `line`'s code part: the text before its first `//` that lies outside a
+    /// `"…"` string literal, found by a quote scan honouring `\` escapes. A trailing
+    /// comment is not code, and a `//` inside a literal (`"http://x"`) is not one.
+    fn code_part(line: &str) -> &str {
+        let bytes = line.as_bytes();
+        let mut in_string = false;
+        let mut index = 0;
+        while index < bytes.len() {
+            match bytes[index] {
+                b'\\' if in_string => index += 1,
+                b'"' => in_string = !in_string,
+                b'/' if !in_string && bytes.get(index + 1) == Some(&b'/') => {
+                    return &line[..index];
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+        line
+    }
+
     const CLEAR_SPAWN_NOT_FOUND: &str =
         "spawn_agent_and_record not found in the non-test code (or under 40 lines)";
     const CLEAR_SPAWN_CLEARS: &str =
@@ -11983,11 +14077,15 @@ mod tests {
     const CLEAR_REFUSE_NOT_FOUND: &str =
         "refuse_launch not found in the non-test code (or under 3 lines)";
     const CLEAR_REFUSE_NO_CLEAR: &str = "refuse_launch does not clear the supervisor record";
+    const CLEAR_GUARD_OUTSIDE_FAILOVER: &str =
+        "FailoverRelaunchGuard::engage( is called outside fail_over_on_rate_limit";
 
     /// 50-13's rule as a pure scan over `source` (R6-G4): in the non-test,
     /// comment-stripped code, `spawn_agent_and_record` never clears the
     /// supervisor record itself (only its failure helper does) and calls
-    /// `record_failed_launch`, and `refuse_launch` clears the record.
+    /// `record_failed_launch`, and `refuse_launch` clears the record. And
+    /// (51-06) every line whose code part engages `FailoverRelaunchGuard` lies
+    /// inside `fail_over_on_rate_limit`, the one relaunch allowed to keep the record.
     fn launch_record_clear_violations(source: &str) -> Vec<String> {
         let lines = non_test_code_lines(source);
         let has = |item: &[&str], needle: &str| item.iter().any(|line| line.contains(needle));
@@ -12010,6 +14108,22 @@ mod tests {
                 violations.push(CLEAR_REFUSE_NO_CLEAR.to_string());
             }
             Some(_) => {}
+        }
+        const FAILOVER_HEADER: &str = "fn fail_over_on_rate_limit(";
+        let failover = lines
+            .iter()
+            .position(|line| line.starts_with(FAILOVER_HEADER))
+            .map(|start| {
+                let len =
+                    item_lines(&lines[start..], FAILOVER_HEADER, "}").map_or(0, |item| item.len());
+                start..start + len
+            });
+        for (index, line) in lines.iter().enumerate() {
+            if code_part(line).contains("FailoverRelaunchGuard::engage(")
+                && !failover.as_ref().is_some_and(|span| span.contains(&index))
+            {
+                violations.push(CLEAR_GUARD_OUTSIDE_FAILOVER.to_string());
+            }
         }
         violations
     }
@@ -12083,6 +14197,255 @@ mod tests {
             only(CLEAR_SPAWN_NOT_FOUND),
             "a body under its floor"
         );
+
+        // The failover guard keeps the record through one relaunch only, so it is
+        // engaged in `fail_over_on_rate_limit` and nowhere else. Only a line's code
+        // part counts: the text before its first `//` outside a string literal.
+        let good = format!("{good_spawn}{good_refuse}");
+        let engage = "FailoverRelaunchGuard::engage(";
+        assert_eq!(
+            launch_record_clear_violations(&format!(
+                "{good}fn fail_over_on_rate_limit(\n    let _keep = {engage});\n}}\n"
+            )),
+            Vec::<String>::new(),
+            "the one sanctioned site"
+        );
+        assert_eq!(
+            launch_record_clear_violations(&format!(
+                "{good}fn other() {{\n    let _keep = {engage});\n}}\n"
+            )),
+            only(CLEAR_GUARD_OUTSIDE_FAILOVER),
+            "an engage call in another fn"
+        );
+        assert_eq!(
+            launch_record_clear_violations(&format!(
+                "{good}fn other() {{\n    let u = \"http://x\"; {engage});\n}}\n"
+            )),
+            only(CLEAR_GUARD_OUTSIDE_FAILOVER),
+            "a `//` inside a string literal does not end the code part"
+        );
+        assert_eq!(
+            launch_record_clear_violations(&format!(
+                "{good}fn other() {{\n    let x = 1; // {engage} stays in failover\n}}\n"
+            )),
+            Vec::<String>::new(),
+            "a trailing comment is not a call"
+        );
+    }
+
+    /// Resume a stopped Code run of `phase` at `root` under Claude whose Code pass
+    /// was entered with `fix`, and return the argv the spawned `claude` received
+    /// and a reaper for its monitor. `legacy_claude_launch` puts the prompt in argv.
+    fn resume_code_run(
+        root: &Path,
+        phase: PhaseId,
+        fix: Option<prompt::FixType>,
+    ) -> (Vec<String>, ReapMonitorOnDrop) {
+        init_repo(root);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Code;
+        state.code_fix = fix;
+        state.legacy_claude_launch = true;
+        state.stopped = true;
+        state.stop_reason = Some("rate limited".to_string());
+        workflow::save_state(&state).unwrap();
+
+        let result = resume(root, phase, None, false);
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        let reap = ReapMonitorOnDrop::after_launch(&reloaded);
+        result.unwrap();
+        assert_eq!(reloaded.code_fix, fix, "a resume keeps the fix pass");
+        (recorded_argv(root, "claude"), reap)
+    }
+
+    /// D-09: a `devflow resume` in the middle of an audit-fix pass (the cron arm's
+    /// later resume) relaunches that pass, asserted on the argv the spawned
+    /// `claude` received. Control: the same resume with no fix pass recorded
+    /// delivers the plain execute-phase prompt.
+    #[test]
+    fn a_resume_mid_audit_fix_replays_audit_fix() {
+        const NAME: &str = "pipeline_launch::tests::a_resume_mid_audit_fix_replays_audit_fix";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = argv_recording_agents_dir();
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let _guard = env_lock();
+        let claude = agents::driver_for(AgentKind::Claude);
+        let code_prompt = |phase: PhaseId, fix: Option<prompt::FixType>| {
+            claude.render_prompt(&prompt::StageIntent::Code { phase, fix })
+        };
+
+        let fix_dir = tempfile::tempdir().unwrap();
+        let fix_phase = PhaseId::new(5173);
+        let (argv, _reap_fix) =
+            resume_code_run(fix_dir.path(), fix_phase, Some(prompt::FixType::AuditFix));
+        assert!(
+            argv.contains(&code_prompt(fix_phase, Some(prompt::FixType::AuditFix))),
+            "the resumed agent receives the audit-fix pass: {argv:?}"
+        );
+        assert!(
+            !argv.contains(&code_prompt(fix_phase, None)),
+            "the resumed agent does not receive the plain execute-phase prompt: {argv:?}"
+        );
+
+        let plain_dir = tempfile::tempdir().unwrap();
+        let plain_phase = PhaseId::new(5176);
+        let (argv, _reap_plain) = resume_code_run(plain_dir.path(), plain_phase, None);
+        assert!(
+            argv.contains(&code_prompt(plain_phase, None)),
+            "control: a plain resume delivers execute-phase: {argv:?}"
+        );
+        assert!(
+            !argv.contains(&code_prompt(plain_phase, Some(prompt::FixType::AuditFix))),
+            "control: a plain resume delivers no fix prompt: {argv:?}"
+        );
+    }
+
+    // ---- 51-07: one place renders a no-override stage prompt (D-09, review B-1) ----
+
+    const DEFAULT_RENDER_NEEDLE: &str = concat!("for_stage_in_", "project(");
+    const DEFAULT_RENDER_NOT_ONCE: &str =
+        "a default intent is built more than once (or never) in the non-test code";
+    const DEFAULT_RENDER_OUTSIDE: &str = "a default intent is built outside default_stage_prompt";
+    const DEFAULT_RENDER_INNER_BYPASS: &str =
+        "launch_stage_inner does not call default_stage_prompt";
+    const DEFAULT_RENDER_OUTER_BYPASS: &str = "launch_stage does not call default_stage_prompt";
+
+    /// The fn named on a top-level line holding `fn <name>(` or `fn <name><`.
+    fn top_level_fn_name(line: &str) -> Option<&str> {
+        let after = code_part(line).split_once("fn ")?.1;
+        let end = after.find(['(', '<'])?;
+        Some(&after[..end])
+    }
+
+    /// For each of `lines`, the top-level fn whose item it lies in: from a
+    /// non-indented line naming a fn through the next line starting with `}`.
+    /// Lines in no top-level fn (an `impl` block's methods included) map to `None`.
+    fn enclosing_top_level_fns<'a>(lines: &[&'a str]) -> Vec<Option<&'a str>> {
+        let mut current = None;
+        lines
+            .iter()
+            .map(|line| {
+                if !line.starts_with(char::is_whitespace)
+                    && let Some(name) = top_level_fn_name(line)
+                {
+                    current = Some(name);
+                }
+                let here = current;
+                if line.starts_with('}') {
+                    current = None;
+                }
+                here
+            })
+            .collect()
+    }
+
+    /// D-09's single-renderer rule as a pure scan over `source`, cut at its
+    /// `mod tests {` line with comment lines and trailing comments stripped: the
+    /// default stage intent is built exactly once, inside `default_stage_prompt`,
+    /// and both `launch_stage_inner` (whose prompt the agent receives) and
+    /// `launch_stage` (which resolves the program from it) call that fn.
+    fn default_render_violations(source: &str) -> Vec<String> {
+        let lines = non_test_code_lines(source);
+        let owners = enclosing_top_level_fns(&lines);
+        let mut violations = Vec::new();
+        let renders: Vec<Option<&str>> = lines
+            .iter()
+            .zip(&owners)
+            .filter(|(line, _)| code_part(line).contains(DEFAULT_RENDER_NEEDLE))
+            .map(|(_, owner)| *owner)
+            .collect();
+        if renders.len() != 1 {
+            violations.push(DEFAULT_RENDER_NOT_ONCE.to_string());
+        }
+        if renders
+            .iter()
+            .any(|owner| *owner != Some("default_stage_prompt"))
+        {
+            violations.push(DEFAULT_RENDER_OUTSIDE.to_string());
+        }
+        for (caller, violation) in [
+            ("launch_stage_inner", DEFAULT_RENDER_INNER_BYPASS),
+            ("launch_stage", DEFAULT_RENDER_OUTER_BYPASS),
+        ] {
+            let calls = lines.iter().zip(&owners).any(|(line, owner)| {
+                *owner == Some(caller) && code_part(line).contains("default_stage_prompt(")
+            });
+            if !calls {
+                violations.push(violation.to_string());
+            }
+        }
+        violations
+    }
+
+    /// D-09 (review B-1): every no-override launch renders its prompt through
+    /// `default_stage_prompt`, so a persisted fix type reaches the agent on every
+    /// path. Planted sources first, each carrying one defect, then the real file.
+    #[test]
+    fn every_no_override_launch_renders_through_default_stage_prompt() {
+        let render =
+            format!("    driver.render_prompt(&StageIntent::{DEFAULT_RENDER_NEEDLE}..));\n");
+        let default_fn =
+            format!("fn default_stage_prompt(state: &State) -> String {{\n{render}}}\n");
+        let caller = |header: &str, body: &str| format!("{header}\n{body}}}\n");
+        let calls = "    let prompt = default_stage_prompt(state, driver.as_ref());\n";
+        let inner = caller("pub(crate) fn launch_stage_inner(", calls);
+        let outer = caller("pub(crate) fn launch_stage(", calls);
+        let strings = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        assert_eq!(
+            default_render_violations(&format!("{default_fn}{inner}{outer}")),
+            Vec::<String>::new(),
+            "a correct layout"
+        );
+        assert_eq!(
+            default_render_violations(&format!(
+                "{default_fn}{inner}{outer}fn other() {{\n{render}}}\n"
+            )),
+            strings(&[DEFAULT_RENDER_NOT_ONCE, DEFAULT_RENDER_OUTSIDE]),
+            "a second render in another fn is reported"
+        );
+        assert_eq!(
+            default_render_violations(&format!(
+                "{default_fn}{}{outer}",
+                caller("pub(crate) fn launch_stage_inner(", &render)
+            )),
+            strings(&[
+                DEFAULT_RENDER_NOT_ONCE,
+                DEFAULT_RENDER_OUTSIDE,
+                DEFAULT_RENDER_INNER_BYPASS
+            ]),
+            "the delivered prompt rendered in launch_stage_inner itself (review B-1)"
+        );
+        assert_eq!(
+            default_render_violations(&format!(
+                "{default_fn}{inner}{}",
+                caller(
+                    "pub(crate) fn launch_stage(",
+                    "    let x = 1; // default_stage_prompt(\n"
+                )
+            )),
+            strings(&[DEFAULT_RENDER_OUTER_BYPASS]),
+            "a call in a trailing comment is not a call"
+        );
+        assert_eq!(
+            default_render_violations(&format!(
+                "{default_fn}{inner}{outer}mod tests {{\nfn other() {{\n{render}}}\n"
+            )),
+            Vec::<String>::new(),
+            "a render after the test-module cut does not count"
+        );
+
+        let real = default_render_violations(include_str!("pipeline_launch.rs"));
+        assert!(real.is_empty(), "pipeline_launch.rs: {real:?}");
     }
 
     /// A launch context's supervisor, spawned straight through
@@ -14342,7 +16705,7 @@ mod tests {
         })
         .unwrap();
 
-        let result = resume_loaded(root, phase, state, None, false);
+        let result = resume_loaded(root, phase, state, None, false, None);
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -14604,5 +16967,1866 @@ mod tests {
                 "{shape}"
             );
         }
+    }
+
+    // ---- 51-10: SUPV-01 criterion 3, the publish wait and the cron arm's read (D-12) ----
+
+    /// How a withheld publish wait ends in a test build, as `wait_for_publish`'s
+    /// `NotReady` text words it. The successor stays only pending, so its own
+    /// promotion watch ends it, with its agent group, once `PROMOTION_WAIT` (5 s
+    /// in a test build) expires, before the launcher's 10 s `PUBLISH_WAIT` does:
+    /// the launcher then sees it exit by itself. In a release build the order is
+    /// the other way round (`PROMOTION_WAIT_RELEASE` is 15 s), and the launcher's
+    /// `end_unpublished_child` ends it ("did not publish within"), a path these
+    /// tests therefore do not reach.
+    const PUBLISH_WAIT_ENDED_IN_TEST_BUILDS: &str = "exited by itself before publishing";
+
+    /// The test-only seam that withholds one publish wait's probe answer
+    /// (`<agent>:<stage>`), read by `monitor::spawn_monitor` under the
+    /// `test-support` gate.
+    const WITHHOLD_PUBLISH_ENV: &str = "DEVFLOW_TEST_WITHHOLD_PUBLISH_PROBE";
+
+    /// Where a group-recording stub writes `<pid> <pgid>`: the parent passes a
+    /// path in a dir it owns, so the R2-13 positive control's numbers outlive
+    /// the child (libtest discards a passing child's output).
+    const GROUP_REPORT_ENV: &str = "P51_GROUP_REPORT";
+
+    /// A stub for `program` that answers `--version`, then, on every other
+    /// run, records `<pid> <pgid>` (read from `/proc/$$/stat` with shell
+    /// builtins only) in `<program>-group` in its working directory, waits
+    /// (bounded, about 60 s) for `release` there, prints the success marker
+    /// and exits 0. `first_run_marker` set: the first run instead waits for
+    /// `go` and prints that marker without recording itself (a Plan stage).
+    fn group_recording_script(
+        program: &str,
+        release: &str,
+        first_run_marker: Option<&str>,
+    ) -> String {
+        let first = first_run_marker.map_or_else(String::new, |marker| {
+            format!(
+                "if [ ! -e first-done ]; then\n  : > first-done\n  \
+                 i=0\n  while [ ! -e go ] && [ \"$i\" -lt 1200 ]; do sleep 0.05; i=$((i+1)); done\n  \
+                 printf '%s\\n' '{marker}'\n  exit 0\nfi\n"
+            )
+        });
+        format!(
+            "#!/bin/sh\ncase \"$1\" in --version) exit 0 ;; esac\n{first}\
+             read -r stat < /proc/$$/stat\nrest=${{stat##*) }}\nset -- $rest\n\
+             printf '%s %s\\n' \"$$\" \"$3\" > {program}-group\n\
+             i=0\nwhile [ ! -e {release} ] && [ \"$i\" -lt 1200 ]; do sleep 0.05; i=$((i+1)); done\n\
+             printf '%s\\n' '{SUCCESS_MARKER}'\nexit 0\n"
+        )
+    }
+
+    /// The `(pid, pgid)` a [`group_recording_script`] stub recorded at `path`,
+    /// once the whole line is there.
+    fn recorded_group(path: &Path) -> Option<(u32, u32)> {
+        let text = std::fs::read_to_string(path).ok()?;
+        let line = text.strip_suffix('\n')?;
+        let (pid, pgid) = line.split_once(' ')?;
+        Some((pid.parse().ok()?, pgid.parse().ok()?))
+    }
+
+    /// R2-13's positive control: wait for the stub at `record` to record
+    /// itself, then require its group to have a live member. Returns the
+    /// recorded `(pid, pgid)` and writes them, with the live members, to the
+    /// parent's report path. Fails rather than passing vacuously when the stub
+    /// never recorded itself.
+    fn agent_group_was_live(run: &HandoffRun, record: &Path) -> (u32, u32) {
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || recorded_group(record).is_some()),
+            "the agent stub never recorded itself before the publish wait ended, so R2-13's \
+             positive control cannot run; events:\n{}",
+            run.events()
+        );
+        let (pid, pgid) = recorded_group(record).expect("polled above");
+        let members = devflow_core::test_support::live_group_members(pgid);
+        assert!(
+            !members.is_empty(),
+            "positive control: the agent's group {pgid} had no live member when it recorded \
+             itself (pid {pid})"
+        );
+        if let Some(report) = std::env::var_os(GROUP_REPORT_ENV) {
+            std::fs::write(report, format!("pid {pid} pgid {pgid} live {members:?}\n")).unwrap();
+        }
+        (pid, pgid)
+    }
+
+    /// R2-13: after the withheld publish, the agent group recorded at `pgid`
+    /// has no live member within a bounded poll.
+    fn agent_group_ended(run: &HandoffRun, pgid: u32) {
+        assert!(
+            poll_until(Duration::from_secs(10), || {
+                devflow_core::test_support::live_group_members(pgid).is_empty()
+            }),
+            "the unpublished launch's agent group {pgid} outlived it: live members {:?}; \
+             events:\n{}",
+            devflow_core::test_support::live_group_members(pgid),
+            run.events()
+        );
+    }
+
+    /// The parent half of a 51-10 publish-wait test: run `name` with `stubs`,
+    /// the seam set to `withhold`, and a report path for the R2-13 control;
+    /// print the report (visible under `--no-capture`) and require it.
+    fn run_withheld_publish_child(name: &str, stubs: &[(&str, String)], withhold: &str) {
+        let report_dir = tempfile::Builder::new()
+            .prefix("dfr")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let report = report_dir.path().join("group");
+        run_handoff_child_with_stubs_and_env(
+            name,
+            None,
+            SUCCESS_MARKER,
+            stubs,
+            &[
+                (WITHHOLD_PUBLISH_ENV, std::ffi::OsStr::new(withhold)),
+                (GROUP_REPORT_ENV, report.as_os_str()),
+            ],
+        );
+        let recorded = std::fs::read_to_string(&report)
+            .unwrap_or_else(|err| panic!("the child wrote no R2-13 report: {err}"));
+        println!("{name}: R2-13 positive control: {}", recorded.trim());
+    }
+
+    /// D-12 (SUPV-01 criterion 3, the failover arm's publish wait), with R2-D1
+    /// and R2-13. The primary Claude Code stage is rate-limited and hands off
+    /// to the unused Codex fallback; the seam withholds the probe answer of
+    /// the fallback's Code relaunch only (`codex:code`), so its one publish
+    /// wait ends unpublished (in a test build, by the successor's own promotion
+    /// expiry: see [`PUBLISH_WAIT_ENDED_IN_TEST_BUILDS`]). The hop then ends
+    /// visibly: `agent_handoff_relaunch_failed` naming the publish wait's
+    /// `NotReady`, then the never-silent Code gate, with no cron arm. Nothing is
+    /// orphaned: the fallback stub's group had a live member when it recorded
+    /// itself (positive control) and has none afterwards.
+    /// Healthy baseline (no intervention, same rig):
+    /// [`a_rate_limit_with_a_fallback_hands_off_and_completes_the_same_stage`].
+    #[test]
+    fn failover_with_the_publish_probe_withheld_ends_at_a_gate() {
+        const NAME: &str =
+            "pipeline_launch::tests::failover_with_the_publish_probe_withheld_ends_at_a_gate";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_withheld_publish_child(
+                NAME,
+                &[
+                    ("claude", rate_limited_claude_script()),
+                    (
+                        "codex",
+                        group_recording_script("codex", "never-released", None),
+                    ),
+                ],
+                "codex:code",
+            );
+            return;
+        }
+        let _guard = env_lock();
+        let run = HandoffRun::launch_with(PhaseId::new(5195), |_, state| {
+            state.stage = Stage::Code;
+            state.stop_until = Some(Stage::Code);
+            state.fallback_agent = Some(AgentKind::Codex);
+        });
+        run.go();
+        let (_, pgid) = agent_group_was_live(&run, &run.root.join("codex-group"));
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || {
+                events_named(&run.root, "gate_fired")
+                    .iter()
+                    .any(|gate| gate["stage"] == "code")
+            }),
+            "no Code gate fired; events:\n{}",
+            run.events()
+        );
+
+        let events = all_events(&run.root);
+        let position = |name: &str| events.iter().position(|e| e["event"] == name);
+        let handed = position("agent_handoff").expect("the handoff committed");
+        let failed = position("agent_handoff_relaunch_failed")
+            .unwrap_or_else(|| panic!("no relaunch-failure event; events:\n{}", run.events()));
+        let gated = position("gate_fired").expect("polled above");
+        assert!(
+            handed < failed && failed < gated,
+            "handoff, then the failure, then the gate; events:\n{}",
+            run.events()
+        );
+        let handoff = &events[handed];
+        assert_eq!(handoff["stage"], "code", "{handoff}");
+        assert_eq!(handoff["to_agent"], "codex", "{handoff}");
+        assert_eq!(handoff["reason"], "rate_limited", "{handoff}");
+        let failure = &events[failed];
+        assert_eq!(failure["stage"], "code", "{failure}");
+        assert_eq!(failure["to_agent"], "codex", "{failure}");
+        assert!(
+            failure["reason"].as_str().is_some_and(|reason| {
+                reason.contains("supervision shape not ready")
+                    && reason.contains(PUBLISH_WAIT_ENDED_IN_TEST_BUILDS)
+            }),
+            "the failure names the publish wait's NotReady end: {failure}"
+        );
+        assert!(
+            events_named(&run.root, "rate_limit_resume_scheduled").is_empty(),
+            "a failed relaunch never takes the cron arm (R2-D1); events:\n{}",
+            run.events()
+        );
+        assert!(
+            !devflow_core::ship::cron_instructions_path(&run.root, run.phase).exists(),
+            "a failed relaunch writes no cron instruction (R2-D1)"
+        );
+        assert_eq!(
+            run.other_sockets(),
+            Vec::<PathBuf>::new(),
+            "no Codex supervisor socket remains"
+        );
+
+        let state = run.state();
+        assert_eq!(state.agent, AgentKind::Codex);
+        assert!(state.fallback_consumed);
+        assert!(state.gate_pending, "the never-silent gate is open");
+
+        agent_group_ended(&run, pgid);
+    }
+
+    /// D-12's ordinary-launch control for the publish wait, observable only
+    /// (R2-9). An ordinary Plan → Code transition, no fallback, with the same
+    /// seam withholding the Code launch's probe (`claude:code`): Plan completes
+    /// and transitions, and no Code successor is published. What the run
+    /// leaves: the stage committed as Code, no supervisor record (WR-04's clear
+    /// after the failed launch), no socket but stage N's, no `stage_launched`
+    /// for `code`, and no live member in the Code agent's group (which had one
+    /// when it recorded itself). No cause text is asserted: an in-supervisor
+    /// launch failure on the ordinary path writes no event naming its cause.
+    /// Both withheld launches are Code launches, so this and
+    /// [`failover_with_the_publish_probe_withheld_ends_at_a_gate`] differ only
+    /// in failover.
+    #[test]
+    fn an_ordinary_transition_with_the_publish_probe_withheld_fails_the_same_way() {
+        const NAME: &str = "pipeline_launch::tests::an_ordinary_transition_with_the_publish_probe_withheld_fails_the_same_way";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_withheld_publish_child(
+                NAME,
+                &[(
+                    "claude",
+                    group_recording_script("claude", "go2", Some(SUCCESS_MARKER)),
+                )],
+                "claude:code",
+            );
+            return;
+        }
+        let _guard = env_lock();
+        let run = HandoffRun::launch_with(PhaseId::new(5196), |_, state| {
+            state.stage = Stage::Plan;
+            state.stop_until = Some(Stage::Code);
+        });
+        run.go();
+        let (_, pgid) = agent_group_was_live(&run, &run.root.join("claude-group"));
+        let settled = || {
+            workflow::load_state(&run.root, run.phase)
+                .is_ok_and(|state| state.stage == Stage::Code && state.supervisor.is_none())
+                && matches!(
+                    devflow_core::supervisor::probe(&run.n.socket_path),
+                    Ok(devflow_core::supervisor::Liveness::Gone)
+                )
+        };
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, settled),
+            "the run did not settle at Code with no supervisor record and stage N gone; \
+             state: {:?}; events:\n{}",
+            workflow::load_state(&run.root, run.phase).map(|s| (s.stage, s.supervisor)),
+            run.events()
+        );
+
+        let state = run.state();
+        assert_eq!(state.stage, Stage::Code, "the transition committed Code");
+        assert_eq!(
+            state.supervisor, None,
+            "WR-04: the failed launch's record is cleared"
+        );
+        assert_eq!(
+            run.other_sockets(),
+            Vec::<PathBuf>::new(),
+            "no Code supervisor socket remains"
+        );
+        assert!(
+            events_named(&run.root, "stage_launched")
+                .iter()
+                .all(|launched| launched["stage"] != "code"),
+            "no Code successor was published; events:\n{}",
+            run.events()
+        );
+        agent_group_ended(&run, pgid);
+    }
+
+    /// A socket path `supervisor::probe` cannot answer for: its parent is a
+    /// regular file, so the probe's `stat` fails with `ENOTDIR` (an error, not
+    /// GONE or STALE).
+    fn unprobeable_socket(dir: &Path) -> PathBuf {
+        let parent = dir.join("not-a-dir");
+        std::fs::write(&parent, "").unwrap();
+        parent.join("supervisor.sock")
+    }
+
+    /// A Code-stage run of `phase` under Claude on the capture shape, in a fresh repo at
+    /// `root`, whose state records a supervisor at `socket`.
+    fn code_run_recording(root: &Path, phase: PhaseId, socket: &Path) -> State {
+        init_repo(root);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Code;
+        state.legacy_claude_launch = true;
+        state.supervisor = Some(devflow_core::state::SupervisorRecord::new(
+            socket.to_path_buf(),
+            "18e5e63a18d5674f".to_string(),
+            u32::MAX,
+            0,
+            String::new(),
+        ));
+        state
+    }
+
+    /// The state the rate-limit cron arm leaves: not stopped, one infra fault
+    /// charged, a cron instruction to `devflow resume` it.
+    fn save_rate_limit_paused(root: &Path, mut state: State) {
+        state.infra_failures = 1;
+        workflow::save_state(&state).unwrap();
+        let record = devflow_core::ship::build_single_agent_cron_instructions(
+            root,
+            state.phase,
+            "2026-06-18T15:45:30Z",
+        );
+        devflow_core::ship::write_cron_instructions(root, &record).unwrap();
+    }
+
+    /// D-12 (the cron arm's recorded-socket read, withheld), with its
+    /// ordinary-resume control and healthy baseline. Non-vacuity first: the
+    /// fixture's recorded socket makes `supervisor::probe` return an error.
+    /// (b) A rate-limit-paused run (the cron arm's later `devflow resume`)
+    /// recording that socket is refused, naming it, and nothing is written.
+    /// (c) Control: an ordinary `resume` of a `--until`-stopped run recording
+    /// the same socket is refused with the same text. (a) Baseline: a paused
+    /// run whose recorded socket is GONE resumes and launches.
+    #[test]
+    fn a_cron_resume_and_an_ordinary_resume_refuse_alike_when_the_recorded_probe_cannot_answer() {
+        const NAME: &str = "pipeline_launch::tests::a_cron_resume_and_an_ordinary_resume_refuse_alike_when_the_recorded_probe_cannot_answer";
+        if parent_of_a_claude_and_codex_child(NAME, &[]) {
+            return;
+        }
+        let _guard = env_lock();
+        let sockets = tempfile::tempdir().unwrap();
+        let socket = unprobeable_socket(sockets.path());
+        let probed = devflow_core::supervisor::probe(&socket);
+        assert!(
+            probed.is_err(),
+            "non-vacuity: the fixture's recorded socket must make the probe fail, got {probed:?}"
+        );
+
+        let refused = |phase: PhaseId, save: &dyn Fn(&Path, State)| -> String {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            save(root, code_run_recording(root, phase, &socket));
+            let before = std::fs::read(workflow::state_path(root, phase)).unwrap();
+            let result = resume(root, phase, None, false);
+            let err = match result {
+                Err(err) => err.to_string(),
+                Ok(()) => panic!("phase {phase}: resume over an unprobeable record launched"),
+            };
+            assert_eq!(
+                std::fs::read(workflow::state_path(root, phase)).unwrap(),
+                before,
+                "phase {phase}: a refused resume writes nothing"
+            );
+            err
+        };
+
+        let paused = PhaseId::new(5197);
+        let cron = refused(paused, &|root, state| save_rate_limit_paused(root, state));
+        assert!(
+            cron.contains("refusing to resume")
+                && cron.contains(&socket.display().to_string())
+                && cron.contains("probe failed"),
+            "the cron arm's resume refuses naming the socket and its probe failure: {cron}"
+        );
+
+        let stopped = PhaseId::new(5198);
+        let ordinary = refused(stopped, &|_, mut state| {
+            state.stop_until = Some(Stage::Code);
+            state.stopped = true;
+            state.stop_reason = Some("stopped after code completed (--until code)".to_string());
+            workflow::save_state(&state).unwrap();
+        });
+        assert_eq!(
+            ordinary.replace(&stopped.to_string(), "N"),
+            cron.replace(&paused.to_string(), "N"),
+            "an ordinary resume refuses exactly as the cron arm's does"
+        );
+
+        let baseline = PhaseId::new(5199);
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let gone = sockets.path().join("gone.sock");
+        save_rate_limit_paused(root, code_run_recording(root, baseline, &gone));
+        let result = resume(root, baseline, None, false);
+        let reloaded_for_reap = workflow::load_state(root, baseline).ok();
+        let _reap_guard = reloaded_for_reap
+            .as_ref()
+            .map(ReapMonitorOnDrop::after_launch);
+        result.unwrap_or_else(|err| panic!("baseline: a GONE recorded socket resumes: {err}"));
+        let reloaded = workflow::load_state(root, baseline).unwrap();
+        assert!(
+            reloaded
+                .supervisor
+                .as_ref()
+                .is_some_and(|record| record.socket_path != gone),
+            "baseline: the resume recorded its own supervisor: {:?}",
+            reloaded.supervisor
+        );
+    }
+
+    // ---- 51-10: the SUPV-01 evidence file is checked row by row (R2-10) ----
+
+    /// The reads `51-SUPV01-EVIDENCE.md`'s `## Trace` table must hold a row for,
+    /// keyed by the backticked name in the row's `Read` cell.
+    const SUPV01_REQUIRED_READS: [&str; 7] = [
+        "wait_for_publish",
+        "successor_runs_on",
+        "commit_pending_record",
+        "remove_abandoned_liveness_file",
+        "recorded_live_socket",
+        "held_liveness_holder",
+        "pending_live_socket",
+    ];
+
+    /// The `## Trace` table's columns, in order.
+    const SUPV01_COLUMNS: [&str; 7] = [
+        "Read",
+        "Location",
+        "Probes",
+        "Unanswerable probe",
+        "Ordinary launch",
+        "Covered by",
+        "Outcome",
+    ];
+
+    /// The `## Conclusion` lines complete mode requires, each naming a test path.
+    const SUPV01_CONCLUSION_LINES: [&str; 2] = ["Failover arm: ", "Cron arm: "];
+
+    /// The further `##` headings complete mode requires (51-13), besides `## Conclusion`.
+    const SUPV01_COMPLETE_HEADINGS: [&str; 5] = [
+        "## Experiments: post-save probe and pending-record lock probe",
+        "## Coverage check",
+        "## What this does not establish",
+        "## D-13: natural rate limit during the Phase 51 dogfood run",
+        "## Backlog findings",
+    ];
+
+    /// Every violation of the SUPV-01 evidence file's row contract in `text`,
+    /// with cited files and tests resolved against `root` (R2-10). Trace mode
+    /// (`complete == false`) accepts the pending marker `51-13`; complete mode
+    /// (51-13) rejects it and requires the two conclusion lines and every
+    /// heading in [`SUPV01_COMPLETE_HEADINGS`]. Never panics on
+    /// an unreadable file: that is a violation naming its path.
+    fn supv01_evidence_violations(text: &str, complete: bool, root: &Path) -> Vec<String> {
+        let mut violations = Vec::new();
+        let rows = supv01_trace_rows(text, &mut violations);
+        for read in SUPV01_REQUIRED_READS {
+            if !rows.iter().any(|row| row[0] == read) {
+                violations.push(format!("`{read}`: no row in the `## Trace` table"));
+            }
+        }
+        for row in &rows {
+            supv01_row_violations(row, complete, root, &mut violations);
+        }
+        if complete {
+            for heading in SUPV01_COMPLETE_HEADINGS {
+                if markdown_section(text, heading).is_none() {
+                    violations.push(format!("no `{heading}` heading"));
+                }
+            }
+            let conclusion = markdown_section(text, "## Conclusion").unwrap_or_default();
+            for label in SUPV01_CONCLUSION_LINES {
+                let Some(line) = conclusion.lines().find(|line| line.starts_with(label)) else {
+                    violations.push(format!("conclusion: no line starting `{}`", label.trim()));
+                    continue;
+                };
+                let tests = test_paths_in(line);
+                if tests.is_empty() {
+                    violations.push(format!("conclusion `{}`: names no test path", label.trim()));
+                }
+                for test in tests {
+                    if let Some(why) = unresolved_test(root, &test) {
+                        violations.push(format!("conclusion `{}`: {why}", label.trim()));
+                    }
+                }
+            }
+        }
+        violations
+    }
+
+    /// The lines under `heading` up to the next `## ` heading, or `None` when
+    /// no line is exactly `heading`.
+    fn markdown_section<'a>(text: &'a str, heading: &str) -> Option<String> {
+        let mut lines = text.lines().skip_while(|line| line.trim_end() != heading);
+        lines.next()?;
+        let body: Vec<&'a str> = lines.take_while(|line| !line.starts_with("## ")).collect();
+        Some(body.join("\n"))
+    }
+
+    /// The `## Trace` table's data rows as `[read, cells...]`: the row's
+    /// backticked read name, then its seven cells. A missing section, a wrong
+    /// header or a row with another cell count is a violation.
+    fn supv01_trace_rows(text: &str, violations: &mut Vec<String>) -> Vec<[String; 8]> {
+        let Some(section) = markdown_section(text, "## Trace") else {
+            violations.push("no `## Trace` heading".to_string());
+            return Vec::new();
+        };
+        let cells = |line: &str| -> Vec<String> {
+            let inner = line.trim().trim_start_matches('|').trim_end_matches('|');
+            inner
+                .split('|')
+                .map(|cell| cell.trim().to_string())
+                .collect()
+        };
+        let mut table = section
+            .lines()
+            .filter(|line| line.trim_start().starts_with('|'));
+        let Some(header) = table.next() else {
+            violations.push(format!(
+                "`## Trace` holds no table with the columns {}",
+                SUPV01_COLUMNS.join(" | ")
+            ));
+            return Vec::new();
+        };
+        if cells(header) != SUPV01_COLUMNS {
+            violations.push(format!(
+                "`## Trace` table header is `{}`, not `{}`",
+                header.trim(),
+                SUPV01_COLUMNS.join(" | ")
+            ));
+            return Vec::new();
+        }
+        let mut rows = Vec::new();
+        for line in table {
+            let row = cells(line);
+            if row
+                .iter()
+                .all(|cell| !cell.is_empty() && cell.chars().all(|c| matches!(c, '-' | ':')))
+            {
+                continue;
+            }
+            let Ok(row) = <[String; 7]>::try_from(row.clone()) else {
+                violations.push(format!(
+                    "`## Trace` row `{}` has {} cells, not 7",
+                    line.trim(),
+                    row.len()
+                ));
+                continue;
+            };
+            let read = row[0].split('`').nth(1).unwrap_or_default().to_string();
+            let [a, b, c, d, e, f, g] = row;
+            rows.push([read, a, b, c, d, e, f, g]);
+        }
+        rows
+    }
+
+    /// The tokens of `text` made of identifier, path and `::` characters.
+    fn evidence_tokens(text: &str) -> impl Iterator<Item = &str> {
+        text.split(|c: char| {
+            !(c.is_ascii_alphanumeric() || matches!(c, '_' | ':' | '.' | '/' | '-'))
+        })
+        .map(|token| token.trim_end_matches(['.', ':', ',', ';']))
+        .filter(|token| !token.is_empty())
+    }
+
+    /// Whether `token` is a test path: `<module>(::<module>)*::tests::<name>`,
+    /// every segment a lowercase identifier.
+    fn is_test_path(token: &str) -> bool {
+        let Some((module, name)) = token.split_once("::tests::") else {
+            return false;
+        };
+        let ident = |segment: &str| {
+            segment
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+                && segment
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        };
+        !module.is_empty() && module.split("::").all(ident) && ident(name)
+    }
+
+    /// Every test path in `text`.
+    fn test_paths_in(text: &str) -> Vec<String> {
+        evidence_tokens(text)
+            .filter(|token| is_test_path(token))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Every `crates/<path>.rs:<line>` in `text`, as `(path, line)`.
+    fn locations_in(text: &str) -> Vec<(String, usize)> {
+        evidence_tokens(text)
+            .filter(|token| token.starts_with("crates/"))
+            .filter_map(|token| {
+                let (path, line) = token.split_once(".rs:")?;
+                let line = line.parse().ok()?;
+                Some((format!("{path}.rs"), line))
+            })
+            .collect()
+    }
+
+    /// The lines of `source` before its first line that trims to `mod tests {`.
+    fn non_test_part(source: &str) -> String {
+        source
+            .lines()
+            .take_while(|line| line.trim() != "mod tests {")
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Why `test` does not resolve under `root`, or `None` when one of its
+    /// module's files declares `fn <name>(` after its first `mod tests {` line.
+    fn unresolved_test(root: &Path, test: &str) -> Option<String> {
+        let (module, name) = test.split_once("::tests::")?;
+        let relative = module.replace("::", "/");
+        let mut seen = Vec::new();
+        for krate in ["devflow-cli", "devflow-core"] {
+            let path = format!("crates/{krate}/src/{relative}.rs");
+            let file = root.join(&path);
+            if !file.exists() {
+                continue;
+            }
+            let source = match std::fs::read_to_string(&file) {
+                Ok(source) => source,
+                Err(err) => return Some(format!("test {test}: cannot read {path}: {err}")),
+            };
+            let declared = source
+                .lines()
+                .skip_while(|line| line.trim() != "mod tests {")
+                .any(|line| line.contains(&format!("fn {name}(")));
+            if declared {
+                return None;
+            }
+            seen.push(path);
+        }
+        Some(if seen.is_empty() {
+            format!("test {test}: no module file crates/devflow-{{cli,core}}/src/{relative}.rs")
+        } else {
+            format!(
+                "test {test} is not declared as `fn {name}(` after `mod tests {{` in {}",
+                seen.join(" or ")
+            )
+        })
+    }
+
+    /// One trace row's violations: its location, coverage and outcome cells,
+    /// each citation resolved against `root`.
+    fn supv01_row_violations(
+        row: &[String; 8],
+        complete: bool,
+        root: &Path,
+        violations: &mut Vec<String>,
+    ) {
+        let [read, _, location, _, _, _, covered, outcome] = row;
+        let read = if read.is_empty() {
+            "<unnamed>"
+        } else {
+            read.as_str()
+        };
+        let locations = locations_in(location);
+        if locations.is_empty() {
+            violations.push(format!(
+                "`{read}`: Location cites no `crates/…/*.rs:<line>`"
+            ));
+        }
+        let mut sources = Vec::new();
+        let mut all_present = true;
+        for (path, line) in &locations {
+            let file = root.join(path);
+            if !file.exists() {
+                violations.push(format!("`{read}`: cited file {path} does not exist"));
+                all_present = false;
+                continue;
+            }
+            match std::fs::read_to_string(&file) {
+                Ok(source) => {
+                    let count = source.lines().count();
+                    if *line == 0 || *line > count {
+                        violations.push(format!(
+                            "`{read}`: {path}:{line} is past the file's end ({count} lines)"
+                        ));
+                    }
+                    sources.push(source);
+                }
+                Err(err) => {
+                    violations.push(format!("`{read}`: cannot read {path}: {err}"));
+                    all_present = false;
+                }
+            }
+        }
+        if all_present
+            && !sources.is_empty()
+            && !sources
+                .iter()
+                .any(|source| non_test_part(source).contains(read))
+        {
+            violations.push(format!(
+                "`{read}`: no cited file names `{read}` in its non-test code"
+            ));
+        }
+
+        let covered = covered.trim().trim_matches('`').trim();
+        let pending = covered == "51-13";
+        let gap = covered
+            .strip_prefix("gap:")
+            .is_some_and(|reason| !reason.trim().is_empty());
+        if !pending && !gap {
+            let tests: Vec<&str> = covered
+                .split(',')
+                .map(|test| test.trim().trim_matches('`'))
+                .collect();
+            if tests.iter().all(|test| is_test_path(test)) {
+                for test in tests {
+                    if let Some(why) = unresolved_test(root, test) {
+                        violations.push(format!("`{read}`: {why}"));
+                    }
+                }
+            } else {
+                violations.push(format!(
+                    "`{read}`: Covered by `{covered}` is neither a test path, `gap: <reason>` \
+                     nor `51-13`"
+                ));
+            }
+        }
+        if outcome.trim().is_empty() {
+            violations.push(format!("`{read}`: empty Outcome"));
+        }
+        if complete && (pending || outcome.trim().starts_with("pending")) {
+            violations.push(format!("`{read}`: still pending (51-13) in complete mode"));
+        }
+    }
+
+    /// The `[read, location, covered by, outcome]` rows a planted trace holds,
+    /// rendered into the three 51-10 headings with the table's other cells
+    /// filled.
+    fn planted_trace(rows: &[[&str; 4]], conclusion: &str) -> String {
+        let mut text = String::from("# SUPV-01 evidence\n\n## Trace\n\n");
+        text.push_str(&format!("| {} |\n", SUPV01_COLUMNS.join(" | ")));
+        text.push_str(&format!("|{}\n", "---|".repeat(SUPV01_COLUMNS.len())));
+        for [read, location, covered, outcome] in rows {
+            text.push_str(&format!(
+                "| `{read}` | {location} | successor | not published | yes | {covered} | {outcome} |\n"
+            ));
+        }
+        text.push_str(
+            "\n## Experiments: publish wait and cron-arm read\n\nPlanted.\n\n\
+             ## Never-silent findings from 51-10\n\nnone\n",
+        );
+        text.push_str(conclusion);
+        text
+    }
+
+    /// A planted source tree: the three files the trace cites, each naming the
+    /// reads that file really holds above its `mod tests {` line, with test
+    /// fns after it; `above_tests_only` is declared only above it, and the
+    /// `pipeline_launch.rs` stand-in names `held_liveness_holder` only inside
+    /// its test module.
+    fn planted_source_tree() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        for (path, body) in [
+            (
+                "crates/devflow-cli/src/pipeline_launch.rs",
+                "fn successor_runs_on() {}\nfn commit_pending_record() {}\nfn above_tests_only() {}\n\
+                 mod tests {\n    fn planted_test() {}\n    const READS: &str = \"held_liveness_holder\";\n}\n",
+            ),
+            (
+                "crates/devflow-cli/src/commands.rs",
+                "fn remove_abandoned_liveness_file() {}\nfn recorded_live_socket() {}\n\
+                 fn held_liveness_holder() {}\nfn pending_live_socket() {}\n\
+                 mod tests {\n    fn commands_test() {}\n}\n",
+            ),
+            (
+                "crates/devflow-core/src/monitor.rs",
+                "fn wait_for_publish() {}\nmod tests {\n    fn monitor_test() {}\n}\n",
+            ),
+        ] {
+            let file = root.path().join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, body).unwrap();
+        }
+        root
+    }
+
+    const PL: &str = "crates/devflow-cli/src/pipeline_launch.rs";
+    const CMDS: &str = "crates/devflow-cli/src/commands.rs";
+    const MON: &str = "crates/devflow-core/src/monitor.rs";
+
+    /// The well-formed trace-mode rows (b): every citation resolves in
+    /// [`planted_source_tree`], and five rows are left to 51-13.
+    fn planted_trace_rows() -> Vec<[String; 4]> {
+        let pending = |read: &str, location: String| {
+            [
+                read.to_string(),
+                location,
+                "51-13".to_string(),
+                "pending (51-13)".to_string(),
+            ]
+        };
+        vec![
+            [
+                "wait_for_publish".to_string(),
+                format!("{MON}:1"),
+                "monitor::tests::monitor_test".to_string(),
+                "refused".to_string(),
+            ],
+            pending("successor_runs_on", format!("{PL}:1")),
+            pending("commit_pending_record", format!("{PL}:2")),
+            pending("remove_abandoned_liveness_file", format!("{CMDS}:1")),
+            [
+                "recorded_live_socket".to_string(),
+                format!("{CMDS}:2"),
+                "commands::tests::commands_test, pipeline_launch::tests::planted_test".to_string(),
+                "refused alike".to_string(),
+            ],
+            pending("held_liveness_holder", format!("{CMDS}:3")),
+            pending("pending_live_socket", format!("{CMDS}:4")),
+        ]
+    }
+
+    /// The complete-mode rows (c): every row a test path or a gap.
+    fn planted_complete_rows() -> Vec<[String; 4]> {
+        planted_trace_rows()
+            .into_iter()
+            .map(|[read, location, covered, outcome]| {
+                if covered == "51-13" {
+                    let covered = if read == "remove_abandoned_liveness_file" {
+                        "gap: decides only a lock file's deletion".to_string()
+                    } else {
+                        "pipeline_launch::tests::planted_test".to_string()
+                    };
+                    [read, location, covered, "measured".to_string()]
+                } else {
+                    [read, location, covered, outcome]
+                }
+            })
+            .collect()
+    }
+
+    fn render(rows: &[[String; 4]], conclusion: &str) -> String {
+        let rows: Vec<[&str; 4]> = rows
+            .iter()
+            .map(|[a, b, c, d]| [a.as_str(), b.as_str(), c.as_str(), d.as_str()])
+            .collect();
+        planted_trace(&rows, conclusion)
+    }
+
+    const PLANTED_CONCLUSION: &str = "\n## Conclusion\n\nFailover arm: pipeline_launch::tests::planted_test.\n\
+                                      Cron arm: commands::tests::commands_test.\n";
+
+    /// The five further sections complete mode requires (51-13), planted with bodies.
+    const PLANTED_COMPLETE_SECTIONS: &str = "\n## Experiments: post-save probe and pending-record lock probe\n\nPlanted.\n\
+         \n## Coverage check\n\nPlanted.\n\n## What this does not establish\n\nPlanted.\n\
+         \n## D-13: natural rate limit during the Phase 51 dogfood run\n\nPlanted.\n\
+         \n## Backlog findings\n\nnone\n";
+
+    /// `rows` rendered as a complete-mode text: the five further sections, then `conclusion`.
+    fn render_complete(rows: &[[String; 4]], conclusion: &str) -> String {
+        render(rows, &format!("{PLANTED_COMPLETE_SECTIONS}{conclusion}"))
+    }
+
+    /// `rows` with the row for `read` replaced by `edit` applied to it.
+    fn with_row(
+        rows: Vec<[String; 4]>,
+        read: &str,
+        edit: impl Fn(&mut [String; 4]),
+    ) -> Vec<[String; 4]> {
+        rows.into_iter()
+            .map(|mut row| {
+                if row[0] == read {
+                    edit(&mut row);
+                }
+                row
+            })
+            .collect()
+    }
+
+    /// Assert `violations` is exactly one, containing every fragment.
+    fn exactly_one(violations: &[String], fragments: &[&str], case: &str) {
+        assert_eq!(violations.len(), 1, "{case}: {violations:#?}");
+        for fragment in fragments {
+            assert!(
+                violations[0].contains(fragment),
+                "{case}: `{fragment}` missing from {violations:#?}"
+            );
+        }
+    }
+
+    /// R2-10: the evidence checker reads rows, not headings, and resolves every
+    /// citation. Planted texts against a planted source tree, never the real
+    /// one; runs in every build.
+    #[test]
+    fn the_supv01_evidence_check_rejects_a_stub() {
+        let tree = planted_source_tree();
+        let root = tree.path();
+        let check = |text: &str, complete: bool| supv01_evidence_violations(text, complete, root);
+
+        // (a) The shape the former `rg -q` gate accepted: headings and bare identifiers.
+        let stub = "## Trace\n\nsuccessor_runs_on remove_abandoned_liveness_file possibly_live_sockets\n\n\
+                    ## Experiments: publish wait and cron-arm read\n\n## Never-silent findings from 51-10\n";
+        let violations = check(stub, false);
+        for read in SUPV01_REQUIRED_READS {
+            assert!(
+                violations
+                    .iter()
+                    .any(|v| v.contains(&format!("`{read}`")) && v.contains("no row")),
+                "(a) `{read}` is reported as missing its row: {violations:#?}"
+            );
+        }
+
+        // (b) Well formed, five rows left to 51-13, no conclusion.
+        let trace = render(&planted_trace_rows(), "");
+        assert_eq!(check(&trace, false), Vec::<String>::new(), "(b) trace mode");
+        let violations = check(&trace, true);
+        assert_eq!(violations.len(), 12, "(b) complete mode: {violations:#?}");
+        for heading in SUPV01_COMPLETE_HEADINGS {
+            assert!(
+                violations
+                    .iter()
+                    .any(|v| v.contains(heading) && v.contains("heading")),
+                "(b) the missing `{heading}` heading is reported: {violations:#?}"
+            );
+        }
+        for read in [
+            "successor_runs_on",
+            "commit_pending_record",
+            "remove_abandoned_liveness_file",
+            "held_liveness_holder",
+            "pending_live_socket",
+        ] {
+            assert!(
+                violations
+                    .iter()
+                    .any(|v| v.contains(&format!("`{read}`")) && v.contains("pending")),
+                "(b) `{read}` is reported pending: {violations:#?}"
+            );
+        }
+        for label in SUPV01_CONCLUSION_LINES {
+            assert!(
+                violations
+                    .iter()
+                    .any(|v| v.contains(label.trim()) && v.contains("no line")),
+                "(b) the missing `{label}` line is reported: {violations:#?}"
+            );
+        }
+
+        // (c) Complete, every citation resolving.
+        let complete_text = render_complete(&planted_complete_rows(), PLANTED_CONCLUSION);
+        assert_eq!(
+            check(&complete_text, false),
+            Vec::<String>::new(),
+            "(c) trace"
+        );
+        assert_eq!(
+            check(&complete_text, true),
+            Vec::<String>::new(),
+            "(c) complete"
+        );
+
+        // (d) A Location without `:<line>`.
+        let rows = with_row(planted_trace_rows(), "wait_for_publish", |row| {
+            row[1] = MON.to_string();
+        });
+        exactly_one(
+            &check(&render(&rows, ""), false),
+            &["`wait_for_publish`", "Location"],
+            "(d)",
+        );
+
+        // (e) A Covered by cell of free words.
+        let rows = with_row(planted_trace_rows(), "wait_for_publish", |row| {
+            row[2] = "the publish wait test".to_string();
+        });
+        exactly_one(
+            &check(&render(&rows, ""), false),
+            &["`wait_for_publish`", "Covered by"],
+            "(e)",
+        );
+
+        // (f) A conclusion whose `Failover arm: ` line names no test path.
+        let no_path = "\n## Conclusion\n\nFailover arm: it works.\n\
+                       Cron arm: commands::tests::commands_test.\n";
+        exactly_one(
+            &check(&render_complete(&planted_complete_rows(), no_path), true),
+            &["Failover arm", "no test path"],
+            "(f)",
+        );
+
+        // (g) Fabricated: well formed in every cell, nothing resolving.
+        let fabricated: Vec<[String; 4]> = SUPV01_REQUIRED_READS
+            .iter()
+            .map(|read| {
+                [
+                    (*read).to_string(),
+                    "crates/x.rs:1".to_string(),
+                    "pipeline_launch::tests::no_such_test".to_string(),
+                    "measured".to_string(),
+                ]
+            })
+            .collect();
+        let fabricated_conclusion = "\n## Conclusion\n\nFailover arm: pipeline_launch::tests::no_such_test\n\
+                                     Cron arm: pipeline_launch::tests::no_such_test\n";
+        // Given the five further headings as well, so they cannot make it pass.
+        let fabricated = render_complete(&fabricated, fabricated_conclusion);
+        let trace_mode = check(&fabricated, false);
+        assert_eq!(trace_mode.len(), 14, "(g) trace mode: {trace_mode:#?}");
+        let complete_mode = check(&fabricated, true);
+        assert_eq!(
+            complete_mode.len(),
+            16,
+            "(g) complete mode: {complete_mode:#?}"
+        );
+        for read in SUPV01_REQUIRED_READS {
+            for kind in ["does not exist", "no_such_test"] {
+                assert_eq!(
+                    trace_mode
+                        .iter()
+                        .filter(|v| v.contains(&format!("`{read}`")) && v.contains(kind))
+                        .count(),
+                    1,
+                    "(g) `{read}` has one `{kind}` violation: {trace_mode:#?}"
+                );
+            }
+        }
+        for label in SUPV01_CONCLUSION_LINES {
+            assert!(
+                complete_mode
+                    .iter()
+                    .any(|v| v.contains(label.trim()) && v.contains("no_such_test")),
+                "(g) the `{label}` line's test is unresolved: {complete_mode:#?}"
+            );
+        }
+
+        // (h) A cited line past the file's last line.
+        let rows = with_row(planted_trace_rows(), "wait_for_publish", |row| {
+            row[1] = format!("{MON}:99");
+        });
+        exactly_one(
+            &check(&render(&rows, ""), false),
+            &["`wait_for_publish`", ":99", "past"],
+            "(h)",
+        );
+
+        // (i) A test declared only above `mod tests {`.
+        let rows = with_row(planted_trace_rows(), "wait_for_publish", |row| {
+            row[2] = "pipeline_launch::tests::above_tests_only".to_string();
+        });
+        exactly_one(
+            &check(&render(&rows, ""), false),
+            &["`wait_for_publish`", "above_tests_only"],
+            "(i)",
+        );
+
+        // (j) The only cited file exists but never names the read.
+        let rows = with_row(planted_trace_rows(), "wait_for_publish", |row| {
+            row[1] = format!("{CMDS}:1");
+        });
+        exactly_one(
+            &check(&render(&rows, ""), false),
+            &["`wait_for_publish`", "names"],
+            "(j)",
+        );
+
+        // (k) The only cited file names the read only inside its test module.
+        let rows = with_row(planted_trace_rows(), "held_liveness_holder", |row| {
+            row[1] = format!("{PL}:1");
+        });
+        exactly_one(
+            &check(&render(&rows, ""), false),
+            &["`held_liveness_holder`", "names"],
+            "(k)",
+        );
+
+        // (k) in complete mode: the same row in an otherwise complete text.
+        let rows = with_row(planted_complete_rows(), "held_liveness_holder", |row| {
+            row[1] = format!("{PL}:1");
+        });
+        exactly_one(
+            &check(&render_complete(&rows, PLANTED_CONCLUSION), true),
+            &["`held_liveness_holder`", "names"],
+            "(k) complete",
+        );
+
+        // (l) A complete text missing `## Coverage check`.
+        let without_coverage = complete_text.replace("\n## Coverage check\n\nPlanted.\n", "");
+        assert_ne!(
+            without_coverage, complete_text,
+            "(l) the heading was removed"
+        );
+        exactly_one(
+            &check(&without_coverage, true),
+            &["## Coverage check", "heading"],
+            "(l)",
+        );
+
+        // (m) A complete text whose conclusion has no `Cron arm: ` line.
+        let no_cron = "\n## Conclusion\n\nFailover arm: pipeline_launch::tests::planted_test.\n";
+        exactly_one(
+            &check(&render_complete(&planted_complete_rows(), no_cron), true),
+            &["Cron arm", "no line"],
+            "(m)",
+        );
+    }
+
+    /// R2-10 on the real file: `51-SUPV01-EVIDENCE.md`'s trace rows are
+    /// complete and every citation resolves against the workspace root.
+    #[test]
+    #[ignore = "reads Phase 51's .planning evidence file, which develop and main do not carry; the phase gate runs it with --run-ignored only"]
+    fn the_supv01_evidence_trace_rows_are_complete() {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = manifest.join("../..");
+        let path = root.join(".planning/phases/51-rate-limit-agent-failover/51-SUPV01-EVIDENCE.md");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+        let violations = supv01_evidence_violations(&text, false, &root);
+        assert!(violations.is_empty(), "{}: {violations:#?}", path.display());
+    }
+
+    /// R2-10 (51-13) on the real file, complete mode: no row is pending, every outcome
+    /// is filled, every heading 51-13 adds is there, both conclusion lines name a test
+    /// path, and every citation resolves against the workspace root.
+    #[test]
+    #[ignore = "reads Phase 51's .planning evidence file, which develop and main do not carry; the phase gate runs it with --run-ignored only"]
+    fn the_supv01_evidence_is_complete() {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = manifest.join("../..");
+        let path = root.join(".planning/phases/51-rate-limit-agent-failover/51-SUPV01-EVIDENCE.md");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+        let violations = supv01_evidence_violations(&text, true, &root);
+        assert!(violations.is_empty(), "{}: {violations:#?}", path.display());
+    }
+
+    // ---- 51-13: the post-save successor probe answered Gone (D-12, B-2, R2-8) ----
+
+    /// The test-only seam that answers [`publish_record`]'s post-save probe `Gone`
+    /// (`<agent>:<stage>:<marker-path>`), read by `successor_probe_for` under `cfg(test)`.
+    const WITHHOLD_SUCCESSOR_ENV: &str = "DEVFLOW_TEST_WITHHOLD_SUCCESSOR_PROBE";
+
+    /// The parent half of a 51-13 post-save probe test: run `name` with `stubs` and the
+    /// seam naming `agent_stage` and a marker path in a parent-owned dir; the marker is
+    /// the seam's proof that it answered. `None` runs the same child with the seam
+    /// unset (the intervention-removed run).
+    fn run_withheld_successor_child(
+        name: &str,
+        stubs: &[(&str, String)],
+        agent_stage: Option<&str>,
+    ) {
+        let marker_dir = tempfile::Builder::new()
+            .prefix("dfm")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let marker = marker_dir.path().join("withheld");
+        let value = agent_stage.map(|agent_stage| {
+            std::ffi::OsString::from(format!("{agent_stage}:{}", marker.display()))
+        });
+        let env: Vec<(&str, &std::ffi::OsStr)> = value
+            .as_ref()
+            .map(|value| (WITHHOLD_SUCCESSOR_ENV, value.as_os_str()))
+            .into_iter()
+            .collect();
+        run_handoff_child_with_stubs_and_env(name, None, SUCCESS_MARKER, stubs, &env);
+    }
+
+    /// The marker path the seam variable names in this child, if it is set.
+    fn withheld_successor_marker() -> Option<PathBuf> {
+        let value = std::env::var(WITHHOLD_SUCCESSOR_ENV).ok()?;
+        let mut parts = value.splitn(3, ':');
+        let (_, _, marker) = (parts.next()?, parts.next()?, parts.next()?);
+        Some(PathBuf::from(marker))
+    }
+
+    /// Poll until the run's state reads `stopped`, failing with the events otherwise.
+    fn wait_recorded_stopped(run: &HandoffRun) -> State {
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || {
+                workflow::load_state(&run.root, run.phase).is_ok_and(|state| state.stopped)
+            }),
+            "the run was never recorded stopped; state: {:?}; events:\n{}",
+            workflow::load_state(&run.root, run.phase).map(|s| (
+                s.stage,
+                s.agent,
+                s.stopped,
+                s.stop_reason,
+                s.supervisor
+            )),
+            run.events()
+        );
+        run.state()
+    }
+
+    /// The `stopped` shape both post-save experiments assert while their successor is
+    /// still held: the stop reason, a saved record naming the successor (not stage N),
+    /// the seam's marker and a live successor socket.
+    fn assert_recorded_stopped_while_the_successor_runs(run: &HandoffRun, state: &State) {
+        assert_eq!(
+            state.stop_reason.as_deref(),
+            Some(NEXT_STOPPED_BEFORE_SAVE_REASON),
+            "events:\n{}",
+            run.events()
+        );
+        let record = state
+            .supervisor
+            .as_ref()
+            .expect("the successor's record was saved before the probe");
+        assert_ne!(
+            record.launch_id, run.n.launch_id,
+            "the record names the successor, not stage N"
+        );
+        let marker = withheld_successor_marker().expect("this child runs with the seam set");
+        assert!(
+            marker.exists(),
+            "the seam's marker {} is missing: the seam never answered",
+            marker.display()
+        );
+        assert!(
+            !run.other_sockets().is_empty(),
+            "the successor the state calls stopped is still running, so its socket is there"
+        );
+    }
+
+    /// D-12 (SUPV-01 criterion 3, failover's post-save probe; review B-2, R2-8). The
+    /// primary Claude Code stage is rate-limited and hands off to the unused Codex
+    /// fallback; the seam answers the post-save probe of the fallback's Code relaunch
+    /// only (`codex:code`) `Gone`, the branch that flips the run's shape. While the
+    /// fallback's agent is still held on `go-fallback`, the state records the run
+    /// `stopped` with [`NEXT_STOPPED_BEFORE_SAVE_REASON`] under the successor's saved
+    /// record, after one rate-limited handoff, with no relaunch failure, no gate and no
+    /// cron arm. Healthy baseline (no intervention, same rig):
+    /// [`a_rate_limit_with_a_fallback_hands_off_and_completes_the_same_stage`].
+    #[test]
+    fn failover_with_the_post_save_probe_answering_gone_records_the_run_stopped() {
+        const NAME: &str = "pipeline_launch::tests::failover_with_the_post_save_probe_answering_gone_records_the_run_stopped";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_withheld_successor_child(
+                NAME,
+                &[
+                    ("claude", rate_limited_claude_script()),
+                    (
+                        "codex",
+                        group_recording_script("codex", "go-fallback", None),
+                    ),
+                ],
+                Some("codex:code"),
+            );
+            return;
+        }
+        let _guard = env_lock();
+        let run = HandoffRun::launch_with(PhaseId::new(5131), |_, state| {
+            state.stage = Stage::Code;
+            state.stop_until = Some(Stage::Code);
+            state.fallback_agent = Some(AgentKind::Codex);
+        });
+        run.go();
+        let state = wait_recorded_stopped(&run);
+
+        assert_recorded_stopped_while_the_successor_runs(&run, &state);
+        assert_eq!(state.agent, AgentKind::Codex, "the fallback drives the run");
+        assert!(state.fallback_consumed, "the hop is consumed");
+        let handoffs = events_named(&run.root, "agent_handoff");
+        assert_eq!(handoffs.len(), 1, "one handoff; events:\n{}", run.events());
+        assert_eq!(handoffs[0]["reason"], "rate_limited", "{}", handoffs[0]);
+        for absent in [
+            "agent_handoff_relaunch_failed",
+            "gate_fired",
+            "rate_limit_resume_scheduled",
+        ] {
+            assert!(
+                events_named(&run.root, absent).is_empty(),
+                "no `{absent}`; events:\n{}",
+                run.events()
+            );
+        }
+        assert!(
+            !devflow_core::ship::cron_instructions_path(&run.root, run.phase).exists(),
+            "no cron instruction"
+        );
+        std::fs::write(run.root.join("go-fallback"), "").unwrap();
+    }
+
+    /// D-12's ordinary-launch control for the post-save probe: an ordinary Plan → Code
+    /// transition, no fallback, with the same seam answering its Code launch's
+    /// post-save probe `Gone` (`claude:code`). While the Code agent is held on `go2`,
+    /// the run is recorded stopped the same way, with the same reason, at stage Code.
+    /// Both answered launches are Code launches, so this and
+    /// [`failover_with_the_post_save_probe_answering_gone_records_the_run_stopped`]
+    /// differ only in failover.
+    #[test]
+    fn an_ordinary_transition_with_the_post_save_probe_answering_gone_records_the_run_stopped() {
+        const NAME: &str = "pipeline_launch::tests::an_ordinary_transition_with_the_post_save_probe_answering_gone_records_the_run_stopped";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_withheld_successor_child(NAME, &[], Some("claude:code"));
+            return;
+        }
+        let _guard = env_lock();
+        let run = HandoffRun::launch_with(PhaseId::new(5132), |_, state| {
+            state.stage = Stage::Plan;
+            state.stop_until = Some(Stage::Code);
+        });
+        run.go();
+        let state = wait_recorded_stopped(&run);
+
+        assert_recorded_stopped_while_the_successor_runs(&run, &state);
+        assert_eq!(state.stage, Stage::Code, "the transition committed Code");
+        std::fs::write(run.root.join("go2"), "").unwrap();
+    }
+
+    const SUCCESSOR_SEAM_NO_LITERAL_READ: &str =
+        "no literal std::env::var read of DEVFLOW_TEST_WITHHOLD_SUCCESSOR_PROBE";
+    const SUCCESSOR_SEAM_FN_NOT_ONCE: &str = "fn successor_probe_for( is not defined exactly once";
+    const SUCCESSOR_SEAM_NOT_GATED: &str =
+        "fn successor_probe_for( is not directly under #[cfg(test)]";
+    const SUCCESSOR_SEAM_CALL_NOT_GATED: &str =
+        "a call to successor_probe_for( is not directly under #[cfg(test)]";
+    const SUCCESSOR_SEAM_READ_OUTSIDE: &str =
+        "DEVFLOW_TEST_WITHHOLD_SUCCESSOR_PROBE is named outside fn successor_probe_for(";
+
+    /// The post-save probe seam's layout over `source`'s non-test code (cut at its
+    /// first `mod tests {` line, whole-line `//` comments dropped): the variable is read
+    /// literally (the form the doc check sees) and only in the seam's body, the seam is
+    /// defined once directly under `#[cfg(test)]`, and every call is directly under
+    /// `#[cfg(test)]` too, so the release binding names neither.
+    fn successor_probe_seam_violations(source: &str) -> Vec<String> {
+        const GATE: &str = "#[cfg(test)]";
+        const DEFINITION: &str = "fn successor_probe_for(";
+        const VARIABLE: &str = "DEVFLOW_TEST_WITHHOLD_SUCCESSOR_PROBE";
+        let lines: Vec<&str> = source
+            .lines()
+            .take_while(|line| *line != "mod tests {")
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect();
+        let gated = |at: usize| {
+            at.checked_sub(1)
+                .is_some_and(|above| lines[above].trim() == GATE)
+        };
+        let mut violations = Vec::new();
+        if !lines
+            .iter()
+            .any(|line| line.contains(&format!("std::env::var(\"{VARIABLE}\")")))
+        {
+            violations.push(SUCCESSOR_SEAM_NO_LITERAL_READ.to_string());
+        }
+        let defined: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.trim_start().starts_with(DEFINITION))
+            .map(|(at, _)| at)
+            .collect();
+        match defined.as_slice() {
+            [at] => {
+                if !gated(*at) {
+                    violations.push(SUCCESSOR_SEAM_NOT_GATED.to_string());
+                }
+                // The body runs to the first line that is exactly `}`.
+                let end = lines[*at..]
+                    .iter()
+                    .position(|line| *line == "}")
+                    .map_or(lines.len(), |offset| at + offset);
+                let outside = lines
+                    .iter()
+                    .enumerate()
+                    .any(|(index, line)| line.contains(VARIABLE) && !(*at..=end).contains(&index));
+                if outside {
+                    violations.push(SUCCESSOR_SEAM_READ_OUTSIDE.to_string());
+                }
+            }
+            _ => violations.push(SUCCESSOR_SEAM_FN_NOT_ONCE.to_string()),
+        }
+        let ungated_call = lines.iter().enumerate().any(|(at, line)| {
+            line.contains("successor_probe_for(")
+                && !line.trim_start().starts_with(DEFINITION)
+                && !gated(at)
+        });
+        if ungated_call {
+            violations.push(SUCCESSOR_SEAM_CALL_NOT_GATED.to_string());
+        }
+        violations
+    }
+
+    /// T-51-37 (51-13, permanent source scan): a release build never compiles the
+    /// post-save probe seam or its call, so no environment variable can make a release
+    /// launcher read a successor as gone. The real file yields no violation; each
+    /// planted source yields the violation it plants, including an ungated decoy call
+    /// and an ungated decoy read.
+    #[test]
+    fn the_successor_probe_seam_is_compiled_out_of_non_test_builds() {
+        let gate = "#[cfg(test)]\n";
+        let read = "    let _ = std::env::var(\"DEVFLOW_TEST_WITHHOLD_SUCCESSOR_PROBE\");\n";
+        let seam = |attribute: &str, body: &str| {
+            format!("{attribute}fn successor_probe_for(state: &State) -> Probe {{\n{body}}}\n")
+        };
+        let caller = |attribute: &str| {
+            format!(
+                "fn publish_record() {{\n    // Test-only.\n    #[cfg(not(test))]\n    let probe = \
+                 devflow_core::supervisor::probe;\n    {attribute}    let probe = \
+                 successor_probe_for(state);\n}}\n"
+            )
+        };
+        let gated_call = format!("    {gate}");
+        let good = format!("{}{}", seam(gate, read), caller(&gated_call));
+        let only = |violation: &str| vec![violation.to_string()];
+
+        assert_eq!(
+            successor_probe_seam_violations(&good),
+            Vec::<String>::new(),
+            "a correct layout (the comment line above the gate is dropped)"
+        );
+        assert_eq!(
+            successor_probe_seam_violations(&format!("{}{}", seam("", read), caller(&gated_call))),
+            only(SUCCESSOR_SEAM_NOT_GATED),
+            "an ungated definition"
+        );
+        assert_eq!(
+            successor_probe_seam_violations(&format!("{}{}", seam(gate, read), caller(""))),
+            only(SUCCESSOR_SEAM_CALL_NOT_GATED),
+            "an ungated decoy call (a release binding naming the seam fn)"
+        );
+        assert_eq!(
+            successor_probe_seam_violations(&format!(
+                "{}{}fn decoy() {{\n{read}}}\n",
+                seam(gate, read),
+                caller(&gated_call)
+            )),
+            only(SUCCESSOR_SEAM_READ_OUTSIDE),
+            "an ungated decoy reading the variable outside the seam"
+        );
+        assert_eq!(
+            successor_probe_seam_violations(&format!(
+                "{}{}",
+                seam(gate, "    let _ = std::env::var(SEAM);\n"),
+                caller(&gated_call)
+            )),
+            only(SUCCESSOR_SEAM_NO_LITERAL_READ),
+            "a read through a constant"
+        );
+        assert_eq!(
+            successor_probe_seam_violations(&format!(
+                "{}{}{}",
+                seam(gate, read),
+                seam(gate, ""),
+                caller(&gated_call)
+            )),
+            only(SUCCESSOR_SEAM_FN_NOT_ONCE),
+            "two definitions"
+        );
+        assert_eq!(
+            successor_probe_seam_violations(&format!("mod tests {{\n{good}")),
+            vec![
+                SUCCESSOR_SEAM_NO_LITERAL_READ.to_string(),
+                SUCCESSOR_SEAM_FN_NOT_ONCE.to_string()
+            ],
+            "the read and the seam only after the test-module cut"
+        );
+
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/pipeline_launch.rs");
+        let source =
+            std::fs::read_to_string(path).unwrap_or_else(|err| panic!("read {path}: {err}"));
+        assert!(
+            source.lines().any(|line| line == "mod tests {"),
+            "pipeline_launch.rs must keep its `mod tests {{` line, or the scan would read its \
+             own controls"
+        );
+        let real = successor_probe_seam_violations(&source);
+        assert!(real.is_empty(), "{path}: {real:?}");
+    }
+
+    // ---- 51-13: the pending-record lock probe and resume's lock probes (D-12, R2-4) ----
+
+    /// The launch id a planted pending record names: real launch-id format, never one
+    /// the run itself mints.
+    const PLANTED_PENDING_ID: &str = "18e5e63a18d5bbbb";
+
+    /// A liveness lock path `liveness::probe` cannot answer for: its parent is a regular
+    /// file, so opening it fails with `ENOTDIR` (an error, not `Missing`). Asserted first.
+    fn unprobeable_lock(dir: &Path) -> PathBuf {
+        let parent = dir.join("not-a-dir");
+        std::fs::write(&parent, "").unwrap();
+        let lock = parent.join("supervisor.live");
+        let probed = devflow_core::liveness::probe(&lock);
+        assert!(
+            probed.is_err(),
+            "non-vacuity: the planted lock must make the probe fail, got {probed:?}"
+        );
+        lock
+    }
+
+    /// Write a pending record naming [`PLANTED_PENDING_ID`] and `lock` (with a socket
+    /// path that does not exist) into the run's state on disk, while stage N's agent is
+    /// still held on `go`, so no supervisor is writing.
+    fn plant_pending_record(run: &HandoffRun, dir: &Path, lock: &Path) {
+        let mut state = run.state();
+        state.pending_supervisor = Some(devflow_core::state::PendingSupervisor::new(
+            PLANTED_PENDING_ID.to_string(),
+            dir.join("pending.sock"),
+            lock.to_path_buf(),
+        ));
+        workflow::save_state(&state).unwrap();
+    }
+
+    /// What both in-supervisor refusals leave: read (3) refused the launch over the
+    /// planted record (`launch_refused_over_live_pending` naming it), the planted record
+    /// is still on disk (the refusal wrote nothing), no supervisor but stage N's
+    /// published a socket, and no `stage_launched` names `agent` at Code.
+    fn assert_refused_over_the_planted_record(run: &HandoffRun, agent: &str) {
+        let refusals = events_named(&run.root, "launch_refused_over_live_pending");
+        assert_eq!(
+            refusals.len(),
+            1,
+            "one refusal by commit_pending_record; events:\n{}",
+            run.events()
+        );
+        assert_eq!(refusals[0]["stage"], "code", "{}", refusals[0]);
+        assert_eq!(
+            refusals[0]["pending_launch_id"], PLANTED_PENDING_ID,
+            "{}",
+            refusals[0]
+        );
+        assert_eq!(
+            run.state()
+                .pending_supervisor
+                .map(|pending| pending.launch_id),
+            Some(PLANTED_PENDING_ID.to_string()),
+            "the refused launch left the planted record in place"
+        );
+        assert_eq!(
+            run.other_sockets(),
+            Vec::<PathBuf>::new(),
+            "no Code supervisor was published"
+        );
+        assert!(
+            events_named(&run.root, "stage_launched")
+                .iter()
+                .all(|launched| !(launched["stage"] == "code" && launched["agent"] == agent)),
+            "no {agent} Code successor was launched; events:\n{}",
+            run.events()
+        );
+    }
+
+    /// D-12 (SUPV-01 criterion 3, failover's pending-record lock probe, read (3)), with
+    /// R2-D1. A pending record naming another launch, whose liveness lock cannot be
+    /// probed, is planted after stage N is recorded. The primary's Code stage is
+    /// rate-limited and hands off to Codex; the relaunch's `commit_pending_record`
+    /// reads the lock as held and refuses the spawn after the handoff commit, and the
+    /// hop ends visibly: `agent_handoff`, `agent_handoff_relaunch_failed` naming the
+    /// pending launch, then the never-silent Code gate, with no cron arm and no Codex
+    /// supervisor. Healthy baseline: [`a_rate_limit_with_a_fallback_hands_off_and_completes_the_same_stage`].
+    #[test]
+    fn failover_over_an_unprobeable_pending_record_ends_at_a_gate() {
+        const NAME: &str =
+            "pipeline_launch::tests::failover_over_an_unprobeable_pending_record_ends_at_a_gate";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child_with_stubs(
+                NAME,
+                None,
+                SUCCESS_MARKER,
+                &[
+                    ("claude", rate_limited_claude_script()),
+                    ("codex", committing_success_script()),
+                ],
+            );
+            return;
+        }
+        let _guard = env_lock();
+        let planted = tempfile::tempdir().unwrap();
+        let lock = unprobeable_lock(planted.path());
+        let run = HandoffRun::launch_with(PhaseId::new(5133), |_, state| {
+            state.stage = Stage::Code;
+            state.stop_until = Some(Stage::Code);
+            state.fallback_agent = Some(AgentKind::Codex);
+        });
+        plant_pending_record(&run, planted.path(), &lock);
+        run.go();
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || {
+                events_named(&run.root, "gate_fired")
+                    .iter()
+                    .any(|gate| gate["stage"] == "code")
+            }),
+            "no Code gate fired; events:\n{}",
+            run.events()
+        );
+
+        let events = all_events(&run.root);
+        let position = |name: &str| events.iter().position(|e| e["event"] == name);
+        let handed = position("agent_handoff").expect("the handoff committed");
+        let failed = position("agent_handoff_relaunch_failed")
+            .unwrap_or_else(|| panic!("no relaunch-failure event; events:\n{}", run.events()));
+        let gated = position("gate_fired").expect("polled above");
+        assert!(
+            handed < failed && failed < gated,
+            "handoff, then the failure, then the gate; events:\n{}",
+            run.events()
+        );
+        assert_eq!(
+            events[handed]["reason"], "rate_limited",
+            "{}",
+            events[handed]
+        );
+        let failure = &events[failed];
+        assert_eq!(failure["to_agent"], "codex", "{failure}");
+        assert!(
+            failure["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains(PLANTED_PENDING_ID)),
+            "the failure names the pending launch: {failure}"
+        );
+        assert_refused_over_the_planted_record(&run, "codex");
+        assert!(
+            events_named(&run.root, "rate_limit_resume_scheduled").is_empty(),
+            "a failed relaunch never takes the cron arm (R2-D1); events:\n{}",
+            run.events()
+        );
+        assert!(
+            !devflow_core::ship::cron_instructions_path(&run.root, run.phase).exists(),
+            "a failed relaunch writes no cron instruction (R2-D1)"
+        );
+        let state = run.state();
+        assert_eq!(state.agent, AgentKind::Codex);
+        assert!(state.fallback_consumed);
+        assert!(state.gate_pending, "the never-silent gate is open");
+    }
+
+    /// D-12's ordinary-launch control for read (3), observable only (R2-9): an ordinary
+    /// Plan → Code transition, no fallback, over the same planted record. Plan completes
+    /// and transitions, and its Code launch is refused the same way: the stage is
+    /// committed as Code, the record cleared (WR-04), no Code socket and no Code
+    /// `stage_launched`. Both refused launches are Code launches, so this and
+    /// [`failover_over_an_unprobeable_pending_record_ends_at_a_gate`] differ only in
+    /// failover.
+    #[test]
+    fn an_ordinary_transition_over_an_unprobeable_pending_record_is_refused_the_same_way() {
+        const NAME: &str = "pipeline_launch::tests::an_ordinary_transition_over_an_unprobeable_pending_record_is_refused_the_same_way";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, None, SUCCESS_MARKER);
+            return;
+        }
+        let _guard = env_lock();
+        let planted = tempfile::tempdir().unwrap();
+        let lock = unprobeable_lock(planted.path());
+        let run = HandoffRun::launch_with(PhaseId::new(5134), |_, state| {
+            state.stage = Stage::Plan;
+            state.stop_until = Some(Stage::Code);
+        });
+        plant_pending_record(&run, planted.path(), &lock);
+        run.go();
+        let settled = || {
+            workflow::load_state(&run.root, run.phase)
+                .is_ok_and(|state| state.stage == Stage::Code && state.supervisor.is_none())
+                && matches!(
+                    devflow_core::supervisor::probe(&run.n.socket_path),
+                    Ok(devflow_core::supervisor::Liveness::Gone)
+                )
+        };
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, settled),
+            "the run did not settle at Code with no supervisor record and stage N gone; \
+             state: {:?}; events:\n{}",
+            workflow::load_state(&run.root, run.phase).map(|s| (s.stage, s.supervisor)),
+            run.events()
+        );
+        assert_refused_over_the_planted_record(&run, "claude");
+    }
+
+    /// The refusal `resume` gives for the run `save` writes at `phase`, after `plant`
+    /// prepares its root; the state file must be unchanged byte for byte.
+    fn resume_refusal(
+        phase: PhaseId,
+        state: impl FnOnce(&Path) -> State,
+        save: &dyn Fn(&Path, State),
+        plant: impl FnOnce(&Path),
+    ) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let state = state(root);
+        save(root, state);
+        plant(root);
+        let before = std::fs::read(workflow::state_path(root, phase)).unwrap();
+        let err = match resume(root, phase, None, false) {
+            Err(err) => err.to_string(),
+            Ok(()) => panic!("phase {phase}: resume over an unprobeable lock launched"),
+        };
+        assert_eq!(
+            std::fs::read(workflow::state_path(root, phase)).unwrap(),
+            before,
+            "phase {phase}: a refused resume writes nothing"
+        );
+        err
+    }
+
+    /// Save `state` as an ordinary `--until code`-stopped run.
+    fn save_until_stopped(_: &Path, mut state: State) {
+        state.stop_until = Some(Stage::Code);
+        state.stopped = true;
+        state.stop_reason = Some("stopped after code completed (--until code)".to_string());
+        workflow::save_state(&state).unwrap();
+    }
+
+    /// The baseline: `resume` of the paused run `state` builds at `phase` launches and
+    /// records its own supervisor (reaped on drop).
+    fn resume_launches(phase: PhaseId, state: impl FnOnce(&Path) -> State, recorded: &Path) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let state = state(root);
+        save_rate_limit_paused(root, state);
+        let result = resume(root, phase, None, false);
+        let reloaded_for_reap = workflow::load_state(root, phase).ok();
+        let _reap_guard = reloaded_for_reap
+            .as_ref()
+            .map(ReapMonitorOnDrop::after_launch);
+        result.unwrap_or_else(|err| panic!("baseline phase {phase}: resume refused: {err}"));
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        assert!(
+            reloaded
+                .supervisor
+                .as_ref()
+                .is_some_and(|record| record.socket_path != recorded),
+            "baseline phase {phase}: the resume recorded its own supervisor: {:?}",
+            reloaded.supervisor
+        );
+    }
+
+    /// The recorded launch id every resume fixture uses (`code_run_recording`'s).
+    const RECORDED_LAUNCH_ID: &str = "18e5e63a18d5674f";
+
+    /// D-12 / R2-4, read (6): the recorded supervisor's socket is gone, so `resume`
+    /// reads its liveness lock (`held_without_socket` → `held_liveness_holder`). Every
+    /// fixture records the same socket path, which does not exist. Non-vacuity first:
+    /// the record's lock is planted as a symlink to itself, and `liveness::probe`
+    /// returns an error for it. (b) A rate-limit-paused run is refused, naming the
+    /// launch and `liveness probe failed`; (c) control: an `--until`-stopped run is
+    /// refused with the same text; (a) baseline: the paused run with no lock file
+    /// resumes.
+    #[test]
+    fn a_cron_resume_and_an_ordinary_resume_refuse_alike_when_the_recorded_lock_cannot_be_probed() {
+        const NAME: &str = "pipeline_launch::tests::a_cron_resume_and_an_ordinary_resume_refuse_alike_when_the_recorded_lock_cannot_be_probed";
+        if parent_of_a_claude_and_codex_child(NAME, &[]) {
+            return;
+        }
+        let _guard = env_lock();
+        let sockets = tempfile::tempdir().unwrap();
+        let gone = sockets.path().join("gone.sock");
+        let plant_self_link = |root: &Path| {
+            let lock = devflow_core::liveness::launch_liveness_path(root, RECORDED_LAUNCH_ID)
+                .expect("a valid launch id derives a lock path, so read (6) runs");
+            std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&lock, &lock).unwrap();
+            let probed = devflow_core::liveness::probe(&lock);
+            assert!(
+                probed.is_err(),
+                "non-vacuity: the self-linked lock must make the probe fail, got {probed:?}"
+            );
+        };
+
+        let paused = PhaseId::new(5135);
+        let cron = resume_refusal(
+            paused,
+            |root| code_run_recording(root, paused, &gone),
+            &|root, state| save_rate_limit_paused(root, state),
+            plant_self_link,
+        );
+        assert!(
+            cron.contains("refusing to resume")
+                && cron.contains(RECORDED_LAUNCH_ID)
+                && cron.contains("liveness probe failed"),
+            "the cron arm's resume refuses naming the launch and its lock probe failure: {cron}"
+        );
+
+        let stopped = PhaseId::new(5136);
+        let ordinary = resume_refusal(
+            stopped,
+            |root| code_run_recording(root, stopped, &gone),
+            &save_until_stopped,
+            plant_self_link,
+        );
+        assert_eq!(
+            ordinary.replace(&stopped.to_string(), "N"),
+            cron.replace(&paused.to_string(), "N"),
+            "an ordinary resume refuses exactly as the cron arm's does"
+        );
+
+        let baseline = PhaseId::new(5137);
+        resume_launches(
+            baseline,
+            |root| code_run_recording(root, baseline, &gone),
+            &gone,
+        );
+    }
+
+    /// D-12 / R2-4, read (7): a pending record with no socket, whose lock `resume`
+    /// reads (`pending_live_socket`). Every fixture keeps the paused shape's recorded
+    /// supervisor with its socket gone and its lock missing (reads (5) and (6) find it
+    /// not live) and adds a pending record whose socket does not exist. Non-vacuity
+    /// first: its liveness path's parent is a regular file, and `liveness::probe`
+    /// returns an error for it. (b) A rate-limit-paused run is refused, naming the
+    /// pending launch and `liveness probe failed`; (c) control: an `--until`-stopped
+    /// run is refused with the same text; (a) baseline: the paused run whose pending
+    /// lock is a missing file in an existing directory resumes.
+    #[test]
+    fn a_cron_resume_and_an_ordinary_resume_refuse_alike_when_the_pending_lock_cannot_be_probed() {
+        const NAME: &str = "pipeline_launch::tests::a_cron_resume_and_an_ordinary_resume_refuse_alike_when_the_pending_lock_cannot_be_probed";
+        if parent_of_a_claude_and_codex_child(NAME, &[]) {
+            return;
+        }
+        let _guard = env_lock();
+        let sockets = tempfile::tempdir().unwrap();
+        let gone = sockets.path().join("gone.sock");
+        let lock = unprobeable_lock(sockets.path());
+        let with_pending = |root: &Path, phase: PhaseId, lock: &Path| {
+            let mut state = code_run_recording(root, phase, &gone);
+            state.pending_supervisor = Some(devflow_core::state::PendingSupervisor::new(
+                PLANTED_PENDING_ID.to_string(),
+                sockets.path().join("pending.sock"),
+                lock.to_path_buf(),
+            ));
+            state
+        };
+
+        let paused = PhaseId::new(5138);
+        let cron = resume_refusal(
+            paused,
+            |root| with_pending(root, paused, &lock),
+            &|root, state| save_rate_limit_paused(root, state),
+            |_| {},
+        );
+        assert!(
+            cron.contains("refusing to resume")
+                && cron.contains(PLANTED_PENDING_ID)
+                && cron.contains("liveness probe failed"),
+            "the cron arm's resume refuses naming the pending launch and its lock probe \
+             failure: {cron}"
+        );
+
+        let stopped = PhaseId::new(5139);
+        let ordinary = resume_refusal(
+            stopped,
+            |root| with_pending(root, stopped, &lock),
+            &save_until_stopped,
+            |_| {},
+        );
+        assert_eq!(
+            ordinary.replace(&stopped.to_string(), "N"),
+            cron.replace(&paused.to_string(), "N"),
+            "an ordinary resume refuses exactly as the cron arm's does"
+        );
+
+        let baseline = PhaseId::new(5140);
+        let missing = sockets.path().join("missing.live");
+        resume_launches(
+            baseline,
+            |root| with_pending(root, baseline, &missing),
+            &gone,
+        );
     }
 }

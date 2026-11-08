@@ -12,7 +12,7 @@ mod staleness;
 mod preflight;
 
 mod pipeline_launch;
-use pipeline_launch::{resume, run_monitor};
+use pipeline_launch::{resume_with_fallback, run_monitor};
 
 mod pipeline_outcomes;
 
@@ -110,6 +110,21 @@ enum Command {
         /// `devflow resume`; edit `.devflow/state-NN.json` to turn it off.
         #[arg(long)]
         legacy_claude_launch: bool,
+        /// A second agent that takes over the Code stage once if the agent is
+        /// rate-limited there (D-01, `51-CONTEXT.md`). Failover happens only at
+        /// Code; at any other stage a rate limit takes the cron arm as before.
+        ///
+        /// Persisted in the run state (`state-NN.json`) before the first
+        /// supervisor spawns, and checked here as far as launch can tell: it
+        /// must differ from `--agent`, its binary must be installed and its
+        /// driver healthy, and in `--mode auto` it must be `claude` or
+        /// `antigravity` (the unattended launch shape). The full preflight runs
+        /// again at the handoff itself.
+        ///
+        /// Overrides a `fallback_agent` key in `devflow.toml` when both are
+        /// given. No environment variable selects it.
+        #[arg(long)]
+        fallback_agent: Option<AgentKind>,
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
@@ -199,6 +214,19 @@ enum Command {
         /// by a later plain `devflow resume`.
         #[arg(long)]
         legacy_claude_launch: bool,
+        /// Re-arm the run's one-hop fallback for the Code stage (D-01,
+        /// `51-CONTEXT.md`): sets it to this agent and clears a spent mark, so a
+        /// run whose fallback was used can fail over once more. Accepted on a run
+        /// that is not live (stopped, or paused on the rate-limit cron arm);
+        /// refused over a live run like any resume.
+        ///
+        /// Checked as on `devflow start`: it must differ from the agent the run
+        /// resumes under, its binary must be installed and its driver healthy, and
+        /// in `--mode auto` it must be `claude` or `antigravity`. Omit it to keep
+        /// the saved fallback as it is, spent or not. `resume` does not re-read the
+        /// `devflow.toml` key; only `start` does.
+        #[arg(long)]
+        fallback_agent: Option<AgentKind>,
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
@@ -472,7 +500,7 @@ enum GateCmd {
         project: PathBuf,
     },
     /// Print an open gate's full, untruncated context (21a) — `gate list`
-    /// truncates context to 100 chars for the table view; this reads it in
+    /// truncates context to 300 chars, as the gate banner does; this reads it in
     /// full, control-char sanitized.
     Show {
         /// Phase whose gate to show.
@@ -585,6 +613,7 @@ fn run() -> Result<(), CliError> {
             until,
             yes_ship,
             legacy_claude_launch,
+            fallback_agent,
             project,
         } => {
             // Worktree is now the default; the deprecated `--worktree` flag is
@@ -614,6 +643,7 @@ fn run() -> Result<(), CliError> {
                 until,
                 yes_ship,
                 legacy_claude_launch,
+                commands::FallbackSource::FlagOrConfig(fallback_agent),
             )
         }
         Command::Advance {
@@ -657,8 +687,15 @@ fn run() -> Result<(), CliError> {
             phase,
             agent,
             legacy_claude_launch,
+            fallback_agent,
             project,
-        } => resume(&project_root(project)?, phase, agent, legacy_claude_launch),
+        } => resume_with_fallback(
+            &project_root(project)?,
+            phase,
+            agent,
+            legacy_claude_launch,
+            fallback_agent,
+        ),
         Command::Gate { action } => match action {
             GateCmd::List { all_roots, project } => gate_list(&project_root(project)?, all_roots),
             GateCmd::Approve {
@@ -843,5 +880,82 @@ mod tests {
         let missing = dir.path().join("missing");
         let error = project_root(missing).unwrap_err().to_string();
         assert!(error.contains("project path does not exist"));
+    }
+
+    /// The `fallback_agent` a `devflow start` command line parses to.
+    fn start_fallback(args: &[&str]) -> Result<Option<AgentKind>, clap::Error> {
+        let cli = Cli::try_parse_from(args)?;
+        let Command::Start { fallback_agent, .. } = cli.command else {
+            panic!(
+                "`devflow start` parsed to another command: {:?}",
+                cli.command
+            );
+        };
+        Ok(fallback_agent)
+    }
+
+    #[test]
+    fn resume_accepts_a_fallback_agent_flag() {
+        let parse = |extra: &[&'static str]| {
+            let mut args = vec!["devflow", "resume", "--phase", "51"];
+            args.extend_from_slice(extra);
+            let cli = Cli::try_parse_from(args)?;
+            let Command::Resume { fallback_agent, .. } = cli.command else {
+                panic!(
+                    "`devflow resume` parsed to another command: {:?}",
+                    cli.command
+                );
+            };
+            Ok::<_, clap::Error>(fallback_agent)
+        };
+        assert_eq!(
+            parse(&["--fallback-agent", "antigravity"]).expect("a known agent parses"),
+            Some(AgentKind::Antigravity)
+        );
+        assert!(
+            parse(&["--fallback-agent", ""]).is_err(),
+            "an empty fallback is a parse error"
+        );
+        assert_eq!(
+            parse(&[]).expect("the flag is optional"),
+            None,
+            "omitting the flag re-arms nothing"
+        );
+    }
+
+    #[test]
+    fn start_accepts_a_fallback_agent_flag() {
+        let base = [
+            "devflow",
+            "start",
+            "--phase",
+            "51",
+            "--agent",
+            "claude",
+            "--mode",
+            "supervise",
+        ];
+        let with = |extra: &[&'static str]| {
+            let mut args = base.to_vec();
+            args.extend_from_slice(extra);
+            start_fallback(&args)
+        };
+        assert_eq!(
+            with(&["--fallback-agent", "codex"]).expect("a known agent parses"),
+            Some(AgentKind::Codex)
+        );
+        assert!(
+            with(&["--fallback-agent", ""]).is_err(),
+            "an empty fallback is a parse error"
+        );
+        assert!(
+            with(&["--fallback-agent", "nosuch"]).is_err(),
+            "an unknown fallback is a parse error"
+        );
+        assert_eq!(
+            with(&[]).expect("the flag is optional"),
+            None,
+            "omitting the flag leaves no fallback"
+        );
     }
 }

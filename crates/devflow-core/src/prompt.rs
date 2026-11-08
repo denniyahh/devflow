@@ -241,7 +241,12 @@ impl StageIntent {
 /// therefore unaffected by the attribute — no wildcard arm is needed, here or
 /// anywhere else in the workspace, and none should be added to `fix_prompt`
 /// itself (see its doc comment).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Persisted in `State::code_fix` (snake_case names), so an interrupted fix
+/// pass is replayed by the next agent that relaunches the Code stage, rendered
+/// by that agent's own driver (Phase 51 D-09).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum FixType {
     /// Run the GSD audit-fix pipeline over review findings.
