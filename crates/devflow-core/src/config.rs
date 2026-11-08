@@ -517,9 +517,12 @@ struct FallbackAgentKey {
 /// A missing file, or a file without the key, is `Ok(None)`. An unreadable
 /// file follows [`load_config`]'s warn-and-default path and is treated as no
 /// key. **A file that does not parse, or a value that names no agent, is an
-/// `Err` naming `devflow.toml` and the key** — fail-hard on an explicitly
-/// configured value, for the reason [`base_branch`] records: a silently
-/// ignored fallback would leave the operator believing a fallback is armed.
+/// `Err`** — fail-hard on an explicitly configured value, for the reason
+/// [`base_branch`] records: a silently ignored fallback would leave the
+/// operator believing a fallback is armed. A file that does not parse gets the
+/// generic `devflow.toml: <error>` [`base_branch`] uses, since the file may
+/// have no `fallback_agent` key at all; only a parseable file whose
+/// `fallback_agent` value names no agent gets the key-specific refusal.
 pub fn fallback_agent(project_root: &Path) -> Result<Option<AgentKind>, String> {
     let path = project_root.join("devflow.toml");
     let contents = match std::fs::read_to_string(&path) {
@@ -536,7 +539,11 @@ pub fn fallback_agent(project_root: &Path) -> Result<Option<AgentKind>, String> 
              the `fallback_agent` key"
         )
     };
-    let key = toml::from_str::<FallbackAgentKey>(&contents).map_err(|error| refusal(&error))?;
+    let table = toml::from_str::<toml::Table>(&contents)
+        .map_err(|error| format!("devflow.toml: {error}"))?;
+    let key = toml::Value::Table(table)
+        .try_into::<FallbackAgentKey>()
+        .map_err(|error| refusal(&error))?;
     key.fallback_agent
         .map(|value| value.parse::<AgentKind>().map_err(|error| refusal(&error)))
         .transpose()
@@ -1114,6 +1121,29 @@ mod tests {
         assert!(
             unparseable.is_err(),
             "a file that does not parse is refused, not read as no key: {unparseable:?}"
+        );
+
+        // A syntax error elsewhere in a file with no `fallback_agent` key is a
+        // file problem, not a key problem: the refusal must not send the
+        // operator to remove a key they never set.
+        let broken = resolve(Some("review_angles = [\"security\"\n"))
+            .expect_err("a file that does not parse is refused");
+        assert!(
+            broken.starts_with("devflow.toml: "),
+            "the refusal names the file: {broken}"
+        );
+        assert!(
+            !broken.contains("fallback_agent"),
+            "a parse error does not blame the fallback_agent key: {broken}"
+        );
+
+        // A parseable file whose value is not an agent name keeps the
+        // key-specific refusal.
+        let not_a_string = resolve(Some("fallback_agent = 3\n"))
+            .expect_err("a value that is not a string is refused");
+        assert!(
+            not_a_string.contains("cannot read `fallback_agent`"),
+            "the refusal names the key: {not_a_string}"
         );
     }
 }
