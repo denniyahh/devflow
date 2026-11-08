@@ -35,7 +35,7 @@ note, the success criteria below deliberately claim no more than the evidence su
 | 49 | Live Unattended Run — The Milestone's Instrument | VERIFY-01 | 3 | Complete    |
 | 50 | Addressable Monitor Liveness | SUPV-01 | 4 | Complete    |
 | 50.1 | Split-Lock State-Handling Overhaul (INSERTED) | SUPV-03, SUPV-04, SUPV-05, SURV-03, SURV-04 | 4 (after 50) | Complete    |
-| 51 | Rate-Limit Agent Failover | SUPV-02 | 5 | Planned |
+| 51 | Rate-Limit Agent Failover | SUPV-02 | 5 | Complete    |
 
 ### Phase 46: CI Load Shape and Operator Input Validation
 
@@ -649,7 +649,7 @@ be re-tested here rather than inherited from the issue's original design.
      rebase handoff were all removed (D-11, 23d) and none is reintroduced. Counted over source with
      comments stripped, since a grep over raw source counts comment prose (the Phase 35-01 lesson).
 
-**Plans**: 13/13 plans executed (8 waves)
+**Plans**: 13/13 plans complete (8 waves)
 
 Plans:
 **Wave 1**
