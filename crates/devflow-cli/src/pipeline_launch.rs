@@ -432,9 +432,25 @@ fn append_monitor_log(project_root: &Path, phase: PhaseId, entry: &str) {
 /// caller can print the "a persisted default is never a silent one" notice —
 /// `--yes-ship`'s shape, for the same reason.
 pub(crate) fn apply_legacy_launch_opt_out(state: &mut State, flag: bool) -> bool {
-    let env = devflow_core::config::claude_legacy_launch();
+    combine_legacy_launch_opt_out(state, flag, devflow_core::config::claude_legacy_launch())
+}
+
+/// [`apply_legacy_launch_opt_out`] with the environment's value passed in.
+fn combine_legacy_launch_opt_out(state: &mut State, flag: bool, env: bool) -> bool {
     state.legacy_claude_launch = state.legacy_claude_launch || flag || env;
     env && !flag
+}
+
+/// [`recorded_canary_refusal`] for a `devflow resume` of `state` on its own agent: the
+/// state judged as `resume` would launch it, with the legacy opt-out combined from
+/// `flag` and `env` as [`apply_legacy_launch_opt_out`] does. `resume`'s refusal and
+/// `status`'s hint both judge through it, so they cannot disagree on the environment's
+/// opt-out.
+pub(crate) fn resume_canary_refusal(state: &State, flag: bool, env: bool) -> Option<String> {
+    let mut candidate = state.clone();
+    // Only the combined value is read here; the notice is `resume_loaded`'s to print.
+    let _env_alone = combine_legacy_launch_opt_out(&mut candidate, flag, env);
+    recorded_canary_refusal(&candidate)
 }
 
 /// Entry-point name recorded in the `auto_chain_flag_repaired` payload by
@@ -3696,10 +3712,11 @@ fn refuse_recorded_canary_for_resume(
     if agent.is_some_and(|requested| requested != state.agent) {
         return Ok(());
     }
-    let mut candidate = state.clone();
-    // Only the combined value is read here; the notice is `resume_loaded`'s to print.
-    let _env_alone = apply_legacy_launch_opt_out(&mut candidate, legacy_claude_launch);
-    match recorded_canary_refusal(&candidate) {
+    match resume_canary_refusal(
+        state,
+        legacy_claude_launch,
+        devflow_core::config::claude_legacy_launch(),
+    ) {
         None => Ok(()),
         Some(refusal) => Err(CliError::Message(format!(
             "resume refused: the delivery canary recorded for this run refuses {agent} at \

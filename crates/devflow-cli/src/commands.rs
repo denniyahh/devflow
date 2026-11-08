@@ -1636,9 +1636,14 @@ const HELD_NO_SOCKET_REPAIR: &str =
 /// `resume` would refuse it ([`run_never_prepared`]). A stored Ship answer names `ship`
 /// instead of the `resume` that would set it aside ([`ship_answer_stored`]). A run whose
 /// recorded delivery canary refuses its agent names `resume --agent <other>`, since that
-/// canary refuses a plain `resume` and only a handoff clears it
-/// ([`recorded_canary_refusal`](crate::pipeline_launch::recorded_canary_refusal)).
-fn recovery_hints(state: &State, liveness: &PhaseLiveness) -> Vec<String> {
+/// canary refuses a plain `resume` and only a handoff clears it; that is judged as
+/// `resume` judges it, with the environment's legacy opt-out `env_legacy_opt_out`
+/// ([`resume_canary_refusal`](crate::pipeline_launch::resume_canary_refusal)).
+fn recovery_hints(
+    state: &State,
+    liveness: &PhaseLiveness,
+    env_legacy_opt_out: bool,
+) -> Vec<String> {
     let phase = state.phase;
     if run_never_prepared(state)
         && matches!(
@@ -1651,7 +1656,9 @@ fn recovery_hints(state: &State, liveness: &PhaseLiveness) -> Vec<String> {
     let stored = ship_answer_stored(state);
     let continue_verb = if stored {
         format!("devflow ship --phase {phase}")
-    } else if crate::pipeline_launch::recorded_canary_refusal(state).is_some() {
+    } else if crate::pipeline_launch::resume_canary_refusal(state, false, env_legacy_opt_out)
+        .is_some()
+    {
         format!("devflow resume --phase {phase} --agent <other>")
     } else {
         format!("devflow resume --phase {phase}")
@@ -1823,7 +1830,11 @@ fn status_hints(
         Some(agent) if no_supervisor_live(liveness) => {
             vec![orphaned_agent_line(state.phase, agent)]
         }
-        _ => recovery_hints(state, liveness),
+        _ => recovery_hints(
+            state,
+            liveness,
+            devflow_core::config::claude_legacy_launch(),
+        ),
     }
 }
 
@@ -11731,7 +11742,7 @@ mod tests {
         );
         state.verification_baseline_captured = true;
 
-        let hints = recovery_hints(&state, &PhaseLiveness::GoneWhileActive);
+        let hints = recovery_hints(&state, &PhaseLiveness::GoneWhileActive, false);
 
         assert_eq!(hints, vec!["devflow resume --phase 7".to_string()]);
     }
@@ -11758,12 +11769,12 @@ mod tests {
 
         state.stage = Stage::Code;
         assert_eq!(
-            recovery_hints(&state, &PhaseLiveness::GoneWhileActive),
+            recovery_hints(&state, &PhaseLiveness::GoneWhileActive, false),
             vec!["devflow resume --phase 7".to_string()]
         );
         state.stage = Stage::Ship;
         assert_eq!(
-            recovery_hints(&state, &PhaseLiveness::GoneWhileActive),
+            recovery_hints(&state, &PhaseLiveness::GoneWhileActive, false),
             vec![
                 "devflow resume --phase 7".to_string(),
                 "devflow ship --phase 7".to_string(),
@@ -11790,7 +11801,7 @@ mod tests {
                 for stage in [Stage::Code, Stage::Ship] {
                     state.gate_pending = gate_pending;
                     state.stage = stage;
-                    let hints = recovery_hints(&state, liveness);
+                    let hints = recovery_hints(&state, liveness, false);
                     assert!(
                         !hint_routes_an_answer_through_advance(&hints),
                         "{liveness:?} gate_pending={gate_pending} {stage}: {hints:?}"
@@ -11820,7 +11831,7 @@ mod tests {
         );
 
         assert_eq!(
-            recovery_hints(&state, &PhaseLiveness::Stale),
+            recovery_hints(&state, &PhaseLiveness::Stale, false),
             vec![
                 "devflow stop --phase 7".to_string(),
                 "devflow resume --phase 7".to_string(),
@@ -11845,7 +11856,7 @@ mod tests {
 
         for liveness in [alive, PhaseLiveness::NotLaunched] {
             assert!(
-                recovery_hints(&state, &liveness).is_empty(),
+                recovery_hints(&state, &liveness, false).is_empty(),
                 "{liveness:?} needs no repair"
             );
         }
@@ -11867,7 +11878,7 @@ mod tests {
 
         for liveness in [PhaseLiveness::Gone, PhaseLiveness::NotLaunched] {
             assert_eq!(
-                recovery_hints(&state, &liveness),
+                recovery_hints(&state, &liveness, false),
                 vec!["devflow resume --phase 7".to_string()],
                 "{liveness:?}"
             );
@@ -11876,7 +11887,7 @@ mod tests {
             owner: "agent_running".to_string(),
             launch: "stream".to_string(),
         };
-        assert!(recovery_hints(&state, &alive).is_empty(), "control");
+        assert!(recovery_hints(&state, &alive, false).is_empty(), "control");
     }
 
     /// A stopped run whose recorded delivery canary refuses its agent names `resume
@@ -11897,7 +11908,7 @@ mod tests {
 
         state.canary = Some(devflow_core::canary::CanaryOutcome::Confirmed);
         assert_eq!(
-            recovery_hints(&state, &PhaseLiveness::Gone),
+            recovery_hints(&state, &PhaseLiveness::Gone, false),
             vec!["devflow resume --phase 7".to_string()],
             "control: a recorded Confirmed keeps the plain resume"
         );
@@ -11909,11 +11920,49 @@ mod tests {
             state.canary = Some(refusal.clone());
             for liveness in [PhaseLiveness::Gone, PhaseLiveness::NotLaunched] {
                 assert_eq!(
-                    recovery_hints(&state, &liveness),
+                    recovery_hints(&state, &liveness, false),
                     vec!["devflow resume --phase 7 --agent <other>".to_string()],
                     "{refusal:?} {liveness:?}"
                 );
             }
+        }
+    }
+
+    /// The status hint and `resume`'s refusal judge the environment's legacy opt-out
+    /// alike: a Claude run at Code with a recorded `Absent` canary, under the stream
+    /// launch, is refused, so the hint names `--agent <other>`; with the environment's
+    /// opt-out the relaunch takes the legacy path that `resume` admits, so the hint names
+    /// the plain `resume`. Both directions are asserted, so the hint is neither constant.
+    #[test]
+    fn recovery_hints_judge_the_environment_legacy_opt_out_as_resume_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::new(
+            PhaseId::new(7),
+            AgentKind::Claude,
+            Mode::Auto,
+            dir.path().to_path_buf(),
+        );
+        state.verification_baseline_captured = true;
+        state.stopped = true;
+        state.stage = Stage::Code;
+        state.legacy_claude_launch = false;
+        state.canary = Some(devflow_core::canary::CanaryOutcome::Absent);
+
+        for (env_opt_out, expected) in [
+            (false, "devflow resume --phase 7 --agent <other>"),
+            (true, "devflow resume --phase 7"),
+        ] {
+            let refused =
+                crate::pipeline_launch::resume_canary_refusal(&state, false, env_opt_out).is_some();
+            assert_eq!(
+                refused, !env_opt_out,
+                "resume's judgment, env {env_opt_out}"
+            );
+            assert_eq!(
+                recovery_hints(&state, &PhaseLiveness::Gone, env_opt_out),
+                vec![expected.to_string()],
+                "env opt-out {env_opt_out}"
+            );
         }
     }
 
@@ -16666,24 +16715,24 @@ mod tests {
         let stop = format!("devflow stop --phase {phase}");
 
         assert!(
-            recovery_hints(&state, &PhaseLiveness::GoneWhileActive).contains(&resume),
+            recovery_hints(&state, &PhaseLiveness::GoneWhileActive, false).contains(&resume),
             "control: nothing stored yet"
         );
 
         gate_respond(root, phase, Some(Stage::Ship), true, None, None).unwrap();
 
         assert_eq!(
-            recovery_hints(&state, &PhaseLiveness::GoneWhileActive),
+            recovery_hints(&state, &PhaseLiveness::GoneWhileActive, false),
             vec![ship.clone()]
         );
         assert_eq!(
-            recovery_hints(&state, &PhaseLiveness::Stale),
+            recovery_hints(&state, &PhaseLiveness::Stale, false),
             vec![stop, ship.clone()]
         );
         let mut stopped = state.clone();
         stopped.stopped = true;
         assert_eq!(
-            recovery_hints(&stopped, &PhaseLiveness::Gone),
+            recovery_hints(&stopped, &PhaseLiveness::Gone, false),
             vec![ship.clone()]
         );
         let open_gates = Gates::list_open(root);
@@ -16715,7 +16764,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            recovery_hints(&state, &PhaseLiveness::GoneWhileActive).contains(&resume),
+            recovery_hints(&state, &PhaseLiveness::GoneWhileActive, false).contains(&resume),
             "control: a claimed answer is out of `devflow ship`'s reach"
         );
     }
@@ -16875,7 +16924,7 @@ mod tests {
         assert!(err.contains("discard"), "{err}");
         assert!(err.contains(&*worktree_path.to_string_lossy()), "{err}");
         assert!(!err.contains("no worktree"), "{err}");
-        let hints = recovery_hints(&killed, &PhaseLiveness::NotLaunched);
+        let hints = recovery_hints(&killed, &PhaseLiveness::NotLaunched, false);
         assert!(hints[0].starts_with(&verb), "{hints:?}");
 
         let refused = start_as_refusal_names(root, phase, false).unwrap_err();
@@ -16909,7 +16958,7 @@ mod tests {
         ] {
             let liveness = probe_phase(state);
             assert_eq!(
-                recovery_hints(state, &liveness),
+                recovery_hints(state, &liveness, false),
                 vec![start_verb.clone()],
                 "{case}"
             );
@@ -16930,7 +16979,7 @@ mod tests {
         let mut prepared = killed.clone();
         prepared.verification_baseline_captured = true;
         assert_eq!(
-            recovery_hints(&prepared, &probe_phase(&prepared)),
+            recovery_hints(&prepared, &probe_phase(&prepared), false),
             vec![resume_verb.clone()]
         );
         let findings = reconcile_phase(&facts_for(root, &prepared));
@@ -17703,7 +17752,7 @@ mod tests {
             );
             assert_eq!(phase_liveness.label(), "launch_pending", "{case}");
             assert_eq!(
-                recovery_hints(&state, &phase_liveness),
+                recovery_hints(&state, &phase_liveness, false),
                 vec![format!("devflow stop --phase {phase}")],
                 "{case}"
             );
@@ -17733,7 +17782,7 @@ mod tests {
             assert_eq!(phase_liveness, PhaseLiveness::GoneWhileActive, "{case}");
             let resume = format!("devflow resume --phase {phase}");
             assert_eq!(
-                recovery_hints(&state, &phase_liveness),
+                recovery_hints(&state, &phase_liveness, false),
                 vec![resume.clone()],
                 "{case}"
             );
