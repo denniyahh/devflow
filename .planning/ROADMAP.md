@@ -1073,6 +1073,22 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.191: `stop_ends_a_launch_its_running_launcher_promotes_during_the_wait` Fails Under Full-Suite Load (BACKLOG)
+
+**Found:** 2026-11-08, Phase 51 Validate stage (`/gsd-validate-phase 51`), full `cargo nextest run --workspace` at `fe1971a`.
+
+**The defect:** `crates/devflow-cli/tests/pending_supervisor_e2e.rs:285` (`"its liveness file is gone"`) saw
+`Held::Live` where it expects `Held::Missing`, right after `devflow stop` returned and the supervisor socket probed
+`Gone`. 1 failure in 2111 tests; the test passed 10/10 when run alone afterwards. The test file is unchanged since
+Phase 50.1 (`1ac9c57`), so this is not a Phase 51 regression.
+
+**Not established:** the cause. One plausible reading: the supervisor's liveness lock is released after its socket
+stops answering, so a probe made immediately after can still see it held under load. Not reproduced or traced; 10
+isolated passes do not bound the rate.
+
+**Fix shape:** find out whether `stop` should wait for the liveness lock to go before it returns (a product defect) or the
+test should poll with a deadline (a test race). Then reproduce it under load (`--test-threads` stress or a looped full suite).
+
 ### Phase 999.190: `devflow status` Never Shows Why a Stopped Run Stopped (BACKLOG)
 
 **Found:** 2026-11-08, Phase 51 review fix (WR-02, `7e8ee1a`). The fix stops a run whose gate answer would relaunch
