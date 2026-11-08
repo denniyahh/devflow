@@ -1210,6 +1210,18 @@ relaunch the recorded delivery canary refuses now stops the run with a named rea
 event. The two reproductions above, and a gate-answer relaunch that fails for any other reason, still end silently.
 Stays open.
 
+**Canary-specific residual at the same entry point (Phase 51 re-review IN-02, 2026-11-08):** the gate-answer
+pre-check (`relaunch_failed_stage` → `recorded_canary_refusal`) sees only a canary outcome already recorded.
+`hand_off_agent` clears the canary, so when a failover relaunch fails before `canary_gate` runs (a binary removed
+between the handoff's check and `ensure_agent_binary`, or a `run_preflight` error), the infra gate opens with
+`canary: None`. A retry answer then passes the pre-check and runs a fresh canary inside an unguarded `launch_stage`;
+if that canary refuses, `refuse_launch` clears the record and the run ends the 999.187 way. Not fixed in Phase 51:
+writing the stop after that error needs the record kept on the gate-answer relaunch (a guard variant beside
+`FailoverRelaunchGuard`, whose single sanctioned site the source-scan test
+`the_supervisor_record_is_cleared_only_on_launch_failure_paths` pins), which is this entry's undecided fix shape. The
+general fix should cover it: after a gate-answer relaunch fails, re-check `recorded_canary_refusal` and stop with
+`gate_relaunch_refused` as the pre-check does. Read from the code; not reproduced at runtime.
+
 ### Phase 999.186: Nothing Acts on the Rate-Limit Cron Instructions, So a Paused Run Never Resumes (BACKLOG)
 
 **Found:** 2026-11-07, Phase 51 dogfood run (v3.0.0, supervise mode, no fallback agent). The Code stage hit a real
