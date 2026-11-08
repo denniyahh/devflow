@@ -2036,6 +2036,12 @@ pub(crate) fn evidence(
     Ok(())
 }
 
+/// The characters of a gate's context the pending-gate banner and `devflow
+/// gate list` show. The idle-timeout cause clause is budgeted to close inside
+/// this bound (`MAX_IDLE_TIMEOUT_CLAUSE_CHARS` in `devflow-core`), so both
+/// renderings must use it; `gate show` prints the context in full.
+const GATE_CONTEXT_DISPLAY_CHARS: usize = 300;
+
 /// Build the persistent status-side signal for gates awaiting an operator.
 /// Context is agent-controlled, so it must use the same bounded rendering as
 /// gate notifications and failure events.
@@ -2051,7 +2057,7 @@ fn render_pending_gate_banner(open: &[OpenGate], now: u64) -> Option<String> {
             .and_then(|timestamp| now.checked_sub(timestamp))
             .is_some_and(|age| age >= GATE_ESCALATION_THRESHOLD_SECS);
         let marker = if escalated { "!!! ESCALATED" } else { "!!!" };
-        let context = render_gate_context(&gate.context, 300);
+        let context = render_gate_context(&gate.context, GATE_CONTEXT_DISPLAY_CHARS);
         let stage = gate.stage.to_string();
         banner.push_str(&format!(
             "{marker}: phase {} {stage} ({})\n  {context}\n  approve: devflow gate approve {} --stage {stage}\n  reject:  devflow gate reject {} --stage {stage} --note <reason>\n",
@@ -2095,7 +2101,7 @@ fn render_gate_list(open: &[OpenGate]) -> String {
         "PHASE", "STAGE", "AGE", "GATE ID"
     );
     for gate in open {
-        let context = render_gate_context(&gate.context, 100);
+        let context = render_gate_context(&gate.context, GATE_CONTEXT_DISPLAY_CHARS);
         table.push_str(&format!(
             "\n{:<6} {:<9} {:<9} {:<16} {context}",
             gate.phase,
@@ -2151,7 +2157,7 @@ fn gate_list_all_roots() -> Result<(), CliError> {
 /// `render_pending_gate_banner` already uses — so it's unit-testable
 /// without mutating wall-clock time.
 fn render_all_roots_gate_row(root: &Path, gate: &OpenGate, now: u64) -> String {
-    let context = render_gate_context(&gate.context, 100);
+    let context = render_gate_context(&gate.context, GATE_CONTEXT_DISPLAY_CHARS);
     format!(
         "{:<6} {:<9} {:<9} {:<16} {}\n           {context}",
         gate.phase,
@@ -4436,7 +4442,7 @@ pub(crate) fn gate_show(
 
 /// Pure render for `gate_show`'s output block — the FULL context via
 /// `render_gate_context(.., usize::MAX)` (sanitize, never truncate; contrast
-/// `gate_list`'s `render_gate_context(.., 100)`). Factored out of `gate_show`
+/// `gate_list`'s `render_gate_context(.., GATE_CONTEXT_DISPLAY_CHARS)`). Factored out of `gate_show`
 /// so the untruncated-context guarantee is unit-testable without capturing
 /// process stdout.
 fn render_gate_show(gate: &OpenGate) -> String {
@@ -8277,6 +8283,49 @@ mod tests {
             gate_changed_message(PhaseId::new(4907), Stage::Code, "g1", "g2")
         );
         assert!(message.contains("nothing was written"), "{message}");
+    }
+
+    /// `gate list` shows a gate's context as far as the pending-gate banner
+    /// does, so an idle-timeout cause clause past the 100th character is not cut
+    /// from the list; past the shared bound both truncate identically.
+    #[test]
+    fn gate_list_shows_the_context_as_far_as_the_banner_does() {
+        let cause =
+            "idle timeout (terminal_reason: max_turns; origin: tool_use; errors: quota exceeded)";
+        let context = format!(
+            "[never-silent] stage code failed: {}{cause}: no output for 900s",
+            "x".repeat(80)
+        );
+        assert!(context.chars().count() > 100 && context.chars().count() <= 261);
+        let dir = tempfile::tempdir().unwrap();
+        Gates::write_gate(dir.path(), PhaseId::new(5108), Stage::Code, &context).unwrap();
+        let open = Gates::list_open(dir.path());
+
+        let list = render_gate_list(&open);
+        let row = render_all_roots_gate_row(Path::new("/tmp/some-root"), &open[0], 10_000);
+        let banner = render_pending_gate_banner(&open, 10_000).unwrap();
+        for (rendering, text) in [
+            ("list", &list),
+            ("all-roots row", &row),
+            ("banner", &banner),
+        ] {
+            assert!(
+                text.contains(&context),
+                "{rendering} cut the cause clause: {text}"
+            );
+        }
+
+        let long = format!("{context} {}", "y".repeat(400));
+        Gates::write_gate(dir.path(), PhaseId::new(5108), Stage::Code, &long).unwrap();
+        let open = Gates::list_open(dir.path());
+        let shown = render_gate_context(&long, GATE_CONTEXT_DISPLAY_CHARS);
+        assert!(shown.contains(&context), "{shown}");
+        assert!(render_gate_list(&open).contains(&shown));
+        assert!(
+            render_pending_gate_banner(&open, 10_000)
+                .unwrap()
+                .contains(&shown)
+        );
     }
 
     #[test]
