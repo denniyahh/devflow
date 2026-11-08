@@ -5,43 +5,43 @@ titles: json
 findings:
   - id: WR-01
     severity: warning
-    disposition: fixed
-    title: "`devflow parallel` arms `devflow.toml`'s `fallback_agent`, contradicting its comment, and its refusal names a flag `parallel` lacks"
+    disposition: open
+    title: "After the WR-02 stop, `devflow status` sends the operator to the plain `devflow resume`, which is refused and overwrites the only record of the way on"
   - id: WR-02
     severity: warning
-    disposition: fixed
-    title: "The never-silent gate after a canary-refused failover offers retry and loop options that end the run with no gate (999.187, made reachable by this phase)"
+    disposition: open
+    title: "`devflow parallel` now silently ignores a configured `fallback_agent` key, including an invalid one"
   - id: IN-01
     severity: info
-    disposition: fixed
-    title: "The failover guard also covers `run_preflight`'s own gate and the relaunch its answer starts, contrary to its doc comments"
+    disposition: open
+    title: "`recorded_canary_refusal` is a second copy of `canary_gate`'s refusal mapping, and nothing pins the two together"
   - id: IN-02
     severity: info
-    disposition: fixed
-    title: "The `devflow.toml` key parses agent names more strictly than the `--fallback-agent` flag"
+    disposition: open
+    title: "A gate retry whose canary has not yet been recorded can still end the run silently (999.187 residual at the same entry point)"
   - id: IN-03
     severity: info
-    disposition: fixed
-    title: "An unparseable `devflow.toml` is now reported as a `fallback_agent` problem even when the file has no such key"
+    disposition: open
+    title: "The never-silent gate still offers \"retry, loop-to-code, or abort\" when the recorded canary has already decided that two of the three stop the run"
   - id: IN-04
     severity: info
-    disposition: fixed
-    title: "The torn-final-line clause claims \"a quota denial cannot be ruled out\" for agents whose denials the classifier cannot detect at all"
-open: 0
+    disposition: open
+    title: "The monitor's torn-line warning now says \"a Claude quota denial cannot be ruled out\" on every agent's run, including the Antigravity run IN-04 was about"
+open: 6
 total: 6
-recorded: 2026-11-08T14:56:05.686Z
+recorded: 2026-11-08T15:14:44.948Z
 ---
 
 # Phase 51: Code Review Disposition
 
 | Finding | Severity | Disposition | Source |
 |---------|----------|-------------|--------|
-| WR-01 | warning | fixed | 51-REVIEW-FIX.md |
-| WR-02 | warning | fixed | 51-REVIEW-FIX.md |
-| IN-01 | info | fixed | 51-REVIEW-FIX.md |
-| IN-02 | info | fixed | 51-REVIEW-FIX.md |
-| IN-03 | info | fixed | 51-REVIEW-FIX.md |
-| IN-04 | info | fixed | 51-REVIEW-FIX.md |
+| WR-01 | warning | open | - |
+| WR-02 | warning | open | - |
+| IN-01 | info | open | - |
+| IN-02 | info | open | - |
+| IN-03 | info | open | - |
+| IN-04 | info | open | - |
 
 Dispositions: `open` (recorded, not yet triaged), `fixed`, `skipped`, `deferred`.
 Set `deferred` by hand and put the reason in the Source cell; both are preserved. A `|` in the reason is kept as prose and escaped on the next run.
