@@ -500,7 +500,7 @@ enum GateCmd {
         project: PathBuf,
     },
     /// Print an open gate's full, untruncated context (21a) — `gate list`
-    /// truncates context to 100 chars for the table view; this reads it in
+    /// truncates context to 300 chars, as the gate banner does; this reads it in
     /// full, control-char sanitized.
     Show {
         /// Phase whose gate to show.
