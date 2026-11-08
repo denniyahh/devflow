@@ -1073,6 +1073,25 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.206: A Failure Gate Keeps Only 300 Characters of the Reason, and `gate show` Cannot Show the Rest (BACKLOG)
+
+**Found:** 2026-11-08, Phase 51, Code failure gate `18e6265d44ff61fa`. The Code agent's reason was about 480 characters.
+`truncate_reason` (`pipeline_outcomes.rs`) capped it at 300 before it entered the `advance_evaluated` event, the gate
+context and the notification. The cut-off part was the actionable half: "execute-phase cannot close the new gap: it needs
+/gsd-plan-phase 51 --gaps plus an operator choice between docs-only and a monitor code fix. Filed 999.205".
+
+**The defect:** the cap is applied when the gate is written, not when it is displayed, so `devflow gate show` (whose help
+promises the "full, untruncated context") prints the same 300 characters. The full text survives only inside the 1.7 MB
+stream capture `.devflow/phase-NN-stdout`, JSON-escaped in the final `result` event; the gate's "[truncated; full output
+in .devflow/]" suffix names no file.
+
+**Not established:** how often reasons exceed 300 characters; this is one observed case.
+
+**Fix shape:** keep the 300-character cap for the notification and the gate banner (it exists because a multi-KB raw
+line once reached a desktop notification, 13-06), but store the full sanitized reason, bounded (for example 4 KB), in the
+gate file and the event, and have `gate show` print it. Name the exact file in the truncation suffix. Ask agents to put
+the actionable sentence first in their reason. Phase 52.
+
 ### Phase 999.205: No Validate Loop-Back Plans Gap Closure, So a `gaps_found` Verification Cannot Be Closed by the Run (BACKLOG)
 
 **Found:** 2026-11-08, Phase 51, second Validate loop-back. DevFlow issued `/gsd-execute-phase 51 --auto` (`FullExecute`,
