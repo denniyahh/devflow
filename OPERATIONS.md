@@ -309,8 +309,10 @@ failure names the last top-level `result` event's `terminal_reason`, `origin`
 and `errors` when the capture carries them, as in
 `idle timeout (last result: terminal_reason aborted_tools; origin task-notification; …)`.
 When the capture ends in a torn final line, the clause starts with
-`torn final line, a quota denial cannot be ruled out`, and the verdict stays an
-idle timeout.
+`torn final line after the last parsed event`, and the verdict stays an idle
+timeout. For a Claude capture the torn line may have been a quota denial; the
+classifier reads only Claude's denials, so for other agents it says nothing
+about one either way.
 
 The failover events in `events.jsonl`:
 
