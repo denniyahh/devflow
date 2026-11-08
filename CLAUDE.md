@@ -29,7 +29,7 @@ Shapes that have shipped a false green, or a gate that fails correct work, here.
 - Development phases run inside dedicated worktrees under `.worktrees/phase-N`.
 - Use `scripts/phase-worktree.sh <phase>` to initialize or attach to a phase worktree.
 - Never run concurrent git operations on the main checkout while an executor holds the working tree.
-- `graphify-out/graph.json` is a tracked snapshot on workspace branches, so the global graphify auto-refresh hook skips it here (a refresh would dirty the tree). Refresh it by hand with `graphify update .` (no LLM, about 40 s) and commit it as `chore(graphify)`. Do this at least before planning a phase and after a phase merges.
+- `graphify-out/` is ignored and never committed (since 2026-11-08). The operator's global auto-refresh hook rebuilds each checkout's graph after commits, and seeds a new worktree from the main checkout's graph. Do not delete the main checkout's `graphify-out/`: it holds the only copy of the LLM-derived semantic nodes.
 
 ## Dogfooding (operator rule, 2026-11-04)
 - From Phase 51 on, DevFlow drives its own phases: run them with `devflow start --phase N --mode <auto|supervise>` and the pipeline's gates, not by hand-running GSD commands in an agent session. A stage run by hand is an exception: say so and give the reason in the phase's notes.

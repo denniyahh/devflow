@@ -71,22 +71,14 @@ devflow.toml
 # Bytecode cache
 __pycache__/
 
-# Graphify knowledge graph. ALLOWLIST: ignore everything graphify writes into
-# graphify-out/, then re-include only the portable snapshot that CLAUDE.md's
-# graphify rule commits once per phase on this branch. A denylist kept missing
-# new outputs (.graphify_labels.json, .graphify_python, dated YYYY-MM-DD/ dumps).
-#
-# Why those three stay tracked (measured 2026-09-13): a fresh checkout WITH
-# graph.json regenerates in ~40s and keeps the 315 LLM-derived ("semantic")
-# nodes; WITHOUT it, `graphify update .` rebuilds code-only and every semantic
-# node is lost until a paid LLM pass. History cost of tracking is ~1.4 MB packed.
-#
-# Keep the `graphify-out/*` form: a directory-level `graphify-out/` ignore
-# cannot be negated and would silently ignore graph.json as well.
-graphify-out/*
-!graphify-out/graph.json
-!graphify-out/manifest.json
-!graphify-out/.graphify_analysis.json
+# Graphify knowledge graph: not tracked on any branch since 2026-11-08. Each
+# checkout keeps its own graphify-out/, refreshed after commits by the
+# operator's global graphify auto-refresh hook; a new phase worktree is seeded
+# from the main checkout's graph, which keeps the LLM-derived semantic nodes
+# that a code-only `graphify update .` cannot rebuild. (Until 2026-11-08 a
+# snapshot was tracked here; refreshing it meant an 18 MB commit and a
+# four-minute secret scan, and it went stale between phases.)
+graphify-out/
 # byte-identical duplicate of graphify-out/graph.json
 .planning/graphs/
 

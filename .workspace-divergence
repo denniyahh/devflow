@@ -10,5 +10,5 @@
 # Personal hook (develop removed its post-commit)
 only scripts/hooks/post-commit
 
-# Tracks .planning/ and graphify-out/ instead of ignoring them
+# Tracks .planning/ instead of ignoring it, and ignores graphify-out/ wholesale
 modified .gitignore
