@@ -126,21 +126,21 @@
     "semantic_hash": "0f813255b0b771223eb8c6ba24dcaed8"
   },
   "crates/devflow-cli/src/commands.rs": {
-    "mtime": 1792693844.9103825,
-    "seen": 1792749716.9484992,
-    "ast_hash": "55dd9ed5d950d4cd5d0959e2d3959227",
+    "mtime": 1793797727.867069,
+    "seen": 1794137672.5808244,
+    "ast_hash": "8967caf0b111fbcdd2e3326faf44d79a",
     "semantic_hash": ""
   },
   "crates/devflow-cli/src/config_parse.rs": {
-    "mtime": 1787397780.0881932,
-    "seen": 1788294958.7153473,
-    "ast_hash": "752d60e4500a9b2fd44095bd16355d4a",
-    "semantic_hash": "752d60e4500a9b2fd44095bd16355d4a"
+    "mtime": 1793797727.867069,
+    "seen": 1794137672.5808256,
+    "ast_hash": "0bf0619c2d227af341c6f27f82ad4657",
+    "semantic_hash": ""
   },
   "crates/devflow-cli/src/main.rs": {
-    "mtime": 1792693844.9113824,
-    "seen": 1792749716.9485116,
-    "ast_hash": "f3a6f718d762022ef2f125ee76dd788e",
+    "mtime": 1793797727.8700688,
+    "seen": 1794137672.5808272,
+    "ast_hash": "8f4e12edbd01c7918dd89497b044d7ef",
     "semantic_hash": ""
   },
   "crates/devflow-cli/src/parallel.rs": {
@@ -150,27 +150,27 @@
     "semantic_hash": ""
   },
   "crates/devflow-cli/src/pipeline_gate.rs": {
-    "mtime": 1792693844.9133825,
-    "seen": 1792749716.948523,
-    "ast_hash": "d3f93640871030a7c7007c8b1547d545",
+    "mtime": 1793797727.871069,
+    "seen": 1794137672.58083,
+    "ast_hash": "a423b143587021e00630230187efa8cf",
     "semantic_hash": ""
   },
   "crates/devflow-cli/src/pipeline_launch.rs": {
-    "mtime": 1792693844.9213824,
-    "seen": 1792749716.9485283,
-    "ast_hash": "a89345eb52d81c08908bc79f69f92c09",
+    "mtime": 1793797727.881069,
+    "seen": 1794137672.5808318,
+    "ast_hash": "edb056a4e17557f12311fbd6da2635fc",
     "semantic_hash": ""
   },
   "crates/devflow-cli/src/pipeline_outcomes.rs": {
-    "mtime": 1792693844.9253824,
-    "seen": 1792749716.948544,
-    "ast_hash": "a582a078f542cda74f0be531905a9504",
+    "mtime": 1793797727.884069,
+    "seen": 1794137672.580833,
+    "ast_hash": "00db34c40254cd6bb06274e6d5cc8b70",
     "semantic_hash": ""
   },
   "crates/devflow-cli/src/preflight.rs": {
-    "mtime": 1792693844.9273825,
-    "seen": 1792749716.9485497,
-    "ast_hash": "d98fcaa82c4d181818928a142603c1c0",
+    "mtime": 1793797727.8870687,
+    "seen": 1794137672.5808346,
+    "ast_hash": "e75c517face3bd3e272e6bcfa6e6041a",
     "semantic_hash": ""
   },
   "crates/devflow-cli/src/staleness.rs": {
@@ -180,21 +180,21 @@
     "semantic_hash": ""
   },
   "crates/devflow-cli/src/test_support.rs": {
-    "mtime": 1792693844.9301362,
-    "seen": 1792749716.948561,
-    "ast_hash": "ba20ab3e91b296899d7cdf950a658ae6",
+    "mtime": 1793797727.8900688,
+    "seen": 1794137672.5808375,
+    "ast_hash": "5ba50c1312475c5b00301b1d1cde1fa5",
     "semantic_hash": ""
   },
   "crates/devflow-cli/tests/auto_chain_flag_e2e.rs": {
-    "mtime": 1792693844.9303825,
-    "seen": 1792749716.9485664,
-    "ast_hash": "8b0aa5759e089132c9925b41c187f9ae",
+    "mtime": 1793797727.8920689,
+    "seen": 1794137672.5808403,
+    "ast_hash": "5d6cc13fb25198d75ca49f462fa65714",
     "semantic_hash": ""
   },
   "crates/devflow-cli/tests/auto_chain_leak_repair_e2e.rs": {
-    "mtime": 1792693844.9303825,
-    "seen": 1792749716.948572,
-    "ast_hash": "59cb28013eb6b77ed74f497e0a9ec88c",
+    "mtime": 1793797727.8930688,
+    "seen": 1794137672.580852,
+    "ast_hash": "4d94c3d093ca17d7ce1bc5ce71b41dfa",
     "semantic_hash": ""
   },
   "crates/devflow-cli/tests/build_provenance.rs": {
@@ -204,9 +204,9 @@
     "semantic_hash": "6f3dd7721ad597194da4cb7deb41a9d5"
   },
   "crates/devflow-cli/tests/ci_parity_guards.rs": {
-    "mtime": 1789321779.767416,
-    "seen": 1789321930.6386132,
-    "ast_hash": "6b8f45ec8eb247d5122b370d6a26ceaa",
+    "mtime": 1792751183.0895286,
+    "seen": 1794137672.5808551,
+    "ast_hash": "174c698f0b8df60749916377ef8f87bd",
     "semantic_hash": ""
   },
   "crates/devflow-cli/tests/cut_release_guard.rs": {
@@ -222,9 +222,9 @@
     "semantic_hash": ""
   },
   "crates/devflow-cli/tests/gate_sweep_e2e.rs": {
-    "mtime": 1792693844.9343824,
-    "seen": 1792749716.9486146,
-    "ast_hash": "caa081be0773bd191f991c09eaa6b998",
+    "mtime": 1793797727.895069,
+    "seen": 1794137672.5808733,
+    "ast_hash": "1aea181becd9c3f2bdb861cac3cf91cd",
     "semantic_hash": ""
   },
   "crates/devflow-cli/tests/git_env_hermeticity.rs": {
@@ -240,15 +240,15 @@
     "semantic_hash": ""
   },
   "crates/devflow-cli/tests/help_snapshot.rs": {
-    "mtime": 1792693844.9343824,
-    "seen": 1792749716.948638,
-    "ast_hash": "c0af4089ba058507cff428078260aeb2",
+    "mtime": 1793797727.8960688,
+    "seen": 1794137672.5808792,
+    "ast_hash": "92a3e0ae71213f28ae59fd507a3063cc",
     "semantic_hash": ""
   },
   "crates/devflow-cli/tests/log_format_env.rs": {
-    "mtime": 1792693844.9353824,
-    "seen": 1792749716.9486487,
-    "ast_hash": "79ab546e3450e19b0065d3594b730ffc",
+    "mtime": 1793797727.8960688,
+    "seen": 1794137672.5808818,
+    "ast_hash": "93edfeedbc7a586803b35abad728762d",
     "semantic_hash": ""
   },
   "crates/devflow-cli/tests/phase7_cli.rs": {
@@ -288,9 +288,9 @@
     "semantic_hash": ""
   },
   "crates/devflow-cli/tests/stop_e2e.rs": {
-    "mtime": 1792693844.944501,
-    "seen": 1792749716.9487107,
-    "ast_hash": "b4a760c79b73617f7195a47953a28b07",
+    "mtime": 1793797727.898069,
+    "seen": 1794137672.5809133,
+    "ast_hash": "f5e45dba62c9800602e29b1364bf2db8",
     "semantic_hash": ""
   },
   "crates/devflow-cli/tests/workspace_version_pin.rs": {
@@ -312,9 +312,9 @@
     "semantic_hash": ""
   },
   "crates/devflow-core/src/agent.rs": {
-    "mtime": 1792693844.9513824,
-    "seen": 1792749716.9487522,
-    "ast_hash": "94fc658ab22250e22e89bda355d77dcd",
+    "mtime": 1793797727.901069,
+    "seen": 1794137672.5809247,
+    "ast_hash": "aa565c57e42191947384a4f7617b10e7",
     "semantic_hash": ""
   },
   "crates/devflow-core/src/agent_result.rs": {
@@ -378,9 +378,9 @@
     "semantic_hash": ""
   },
   "crates/devflow-core/src/doc_check.rs": {
-    "mtime": 1792693844.9523823,
-    "seen": 1792749716.948821,
-    "ast_hash": "d924ef39bb902a05365ee76148004731",
+    "mtime": 1793797727.9040687,
+    "seen": 1794137672.5809429,
+    "ast_hash": "489fe3c58f3f1dca3a04bd48b3a3bbe4",
     "semantic_hash": ""
   },
   "crates/devflow-core/src/events.rs": {
@@ -390,9 +390,9 @@
     "semantic_hash": "5235a1cf0e586126a1d8e7af2165c4b4"
   },
   "crates/devflow-core/src/gates.rs": {
-    "mtime": 1792693844.9523823,
-    "seen": 1792749716.9488332,
-    "ast_hash": "2d8a03233c70dd2ab5034cb6b1bf6e02",
+    "mtime": 1793797727.908069,
+    "seen": 1794137672.5809474,
+    "ast_hash": "ee5fdd96666bbea1348aec09f45828fb",
     "semantic_hash": ""
   },
   "crates/devflow-core/src/git.rs": {
@@ -420,15 +420,15 @@
     "semantic_hash": ""
   },
   "crates/devflow-core/src/lib.rs": {
-    "mtime": 1792693844.9523823,
-    "seen": 1792749716.9488633,
-    "ast_hash": "1038bff85bfd6003b4d8fb2461dad3e2",
+    "mtime": 1793797727.908069,
+    "seen": 1794137672.5809548,
+    "ast_hash": "736f602bf7b8457d4e078eba06fc2094",
     "semantic_hash": ""
   },
   "crates/devflow-core/src/lock.rs": {
-    "mtime": 1792693844.9553823,
-    "seen": 1792749716.9488683,
-    "ast_hash": "08e955d30cacad0c3db23743091957b0",
+    "mtime": 1793797727.9150689,
+    "seen": 1794137672.5809581,
+    "ast_hash": "7bbe00d8029a9af419e3d950fbcb79c1",
     "semantic_hash": ""
   },
   "crates/devflow-core/src/mode.rs": {
@@ -438,9 +438,9 @@
     "semantic_hash": "f64d2e507be3f61083e91999997ca487"
   },
   "crates/devflow-core/src/monitor.rs": {
-    "mtime": 1792693844.9583824,
-    "seen": 1792749716.9488804,
-    "ast_hash": "736ff77c951681372f41012af1b9a1fe",
+    "mtime": 1793797727.9190688,
+    "seen": 1794137672.5809612,
+    "ast_hash": "a9a7b81d3670ece5dbb4a587a447b4d5",
     "semantic_hash": ""
   },
   "crates/devflow-core/src/outcome_policy.rs": {
@@ -462,9 +462,9 @@
     "semantic_hash": ""
   },
   "crates/devflow-core/src/recover.rs": {
-    "mtime": 1792693844.9623823,
-    "seen": 1792749716.9489043,
-    "ast_hash": "5ca9b8c32092fdf7727924beb0b161a3",
+    "mtime": 1793797727.9220688,
+    "seen": 1794137672.5809674,
+    "ast_hash": "441f57fcff82ab9a60510656f4b06e46",
     "semantic_hash": ""
   },
   "crates/devflow-core/src/registry.rs": {
@@ -492,15 +492,15 @@
     "semantic_hash": "6597ea2b99b80c21be0f55d8735afe5c"
   },
   "crates/devflow-core/src/state.rs": {
-    "mtime": 1792693844.9653728,
-    "seen": 1792749716.948932,
-    "ast_hash": "ab6c9b0bb56ddda125df0cf1cf6af83a",
+    "mtime": 1793797727.9260688,
+    "seen": 1794137672.580975,
+    "ast_hash": "b4fe24c33a6351d343e24449b3afc275",
     "semantic_hash": ""
   },
   "crates/devflow-core/src/test_support.rs": {
-    "mtime": 1792693844.9693823,
-    "seen": 1792749716.948958,
-    "ast_hash": "f1d1575f62b4669da005b99c4e728d73",
+    "mtime": 1793797727.9380686,
+    "seen": 1794137672.5809827,
+    "ast_hash": "de22da6309df27ac51349b24bccc4e03",
     "semantic_hash": ""
   },
   "crates/devflow-core/src/verify.rs": {
@@ -516,9 +516,9 @@
     "semantic_hash": "0fc09dae0cb7156ea7b1f3970d1d8b5b"
   },
   "crates/devflow-core/src/workflow.rs": {
-    "mtime": 1790209679.559661,
-    "seen": 1791724146.9582376,
-    "ast_hash": "bf89209a4229f79c632f8747bc2dc217",
+    "mtime": 1793797727.9400687,
+    "seen": 1794137672.5809875,
+    "ast_hash": "0cfbb38e71e223ea1871eb271e6081c2",
     "semantic_hash": ""
   },
   "crates/devflow-core/src/worktree.rs": {
@@ -534,21 +534,21 @@
     "semantic_hash": "44aa7e7657a804337b6bb71f2045327b"
   },
   "crates/devflow-core/tests/decimal_phase_paths.rs": {
-    "mtime": 1787397780.1261933,
-    "seen": 1788294958.7154124,
-    "ast_hash": "90126a7ba5b8f36a44b7a755c5f41f1a",
-    "semantic_hash": "90126a7ba5b8f36a44b7a755c5f41f1a"
+    "mtime": 1793797727.9400687,
+    "seen": 1794137672.5809925,
+    "ast_hash": "a44223dc249e4209cdaa3de69b5705a9",
+    "semantic_hash": ""
   },
   "crates/devflow-core/tests/devflow_dir_gitignore.rs": {
-    "mtime": 1792693844.9703822,
-    "seen": 1792749716.949001,
-    "ast_hash": "a4e4067c4994ab7c683b13dc4068ae5c",
+    "mtime": 1793797727.9410686,
+    "seen": 1794137672.5809941,
+    "ast_hash": "41d46d8f1f05e5a0a98b763db374e03c",
     "semantic_hash": ""
   },
   "crates/devflow-core/tests/monitor_e2e.rs": {
-    "mtime": 1792693844.9713824,
-    "seen": 1792749716.9490066,
-    "ast_hash": "7ec9a741d3b46ce8a09520cff1163cf9",
+    "mtime": 1793797727.9410686,
+    "seen": 1794137672.5809956,
+    "ast_hash": "46950cbe3d35abed5997301a4d82ff7f",
     "semantic_hash": ""
   },
   "docs/assets/extra.js": {
@@ -612,9 +612,9 @@
     "semantic_hash": ""
   },
   "scripts/hooks/pre-commit": {
-    "mtime": 1790269483.1014323,
-    "seen": 1791724146.9582593,
-    "ast_hash": "62b41acea1874d61a41a0b72c8af341c",
+    "mtime": 1792751183.0905285,
+    "seen": 1794137672.581019,
+    "ast_hash": "1d50b95d181622c89506219fd1e35b17",
     "semantic_hash": ""
   },
   "scripts/hooks/pre-push": {
@@ -660,15 +660,15 @@
     "semantic_hash": ""
   },
   ".planning/ROADMAP.md": {
-    "mtime": 1792716533.064892,
-    "seen": 1792749716.9492397,
-    "ast_hash": "61c4412b55422925f6c5d8848dcb8d56",
+    "mtime": 1793921297.1115806,
+    "seen": 1794137672.5810552,
+    "ast_hash": "881ae10a57f6471b59545afe96f70e68",
     "semantic_hash": ""
   },
   ".planning/STATE.md": {
-    "mtime": 1792693844.8253827,
-    "seen": 1792749716.9492452,
-    "ast_hash": "104efcc06654ccdee2da534e9deb13ad",
+    "mtime": 1793921227.6982226,
+    "seen": 1794137672.5810566,
+    "ast_hash": "d9c1f30a64427e1ae1cca1345a50c37b",
     "semantic_hash": ""
   },
   ".planning/WINDOWS.md": {
@@ -1698,15 +1698,15 @@
     "semantic_hash": "a66179f2c0d668798d30274f0382e6c7"
   },
   "ARCHITECTURE.md": {
-    "mtime": 1792693844.9013824,
-    "seen": 1792749716.9565284,
-    "ast_hash": "1839f696a39329d1531a91b0a01cf1dc",
+    "mtime": 1793797727.860069,
+    "seen": 1794137672.5839088,
+    "ast_hash": "c66c8104120ea427b22a533d41f61dc5",
     "semantic_hash": ""
   },
   "docs/guides/configuration.md": {
-    "mtime": 1791590556.6476622,
-    "seen": 1791724146.9599028,
-    "ast_hash": "2ac304b7ed26a6d7580c5860c45ef716",
+    "mtime": 1793797727.9440687,
+    "seen": 1794137672.5839558,
+    "ast_hash": "24e52750114ae5252fd9d43b9e017680",
     "semantic_hash": ""
   },
   "docs/guides/pi-subagent-dispatch.md": {
@@ -1794,15 +1794,15 @@
     "semantic_hash": ""
   },
   ".planning/PROJECT.md": {
-    "mtime": 1791590556.5816624,
-    "seen": 1791724146.9582853,
-    "ast_hash": "5197bc3391e806bd33e016fe42b8728b",
+    "mtime": 1793797727.6810694,
+    "seen": 1794137672.5810504,
+    "ast_hash": "0a4fdfe700e79f19f6cca282f76eaa75",
     "semantic_hash": ""
   },
   ".planning/REQUIREMENTS.md": {
-    "mtime": 1792693844.8193827,
-    "seen": 1792749716.949228,
-    "ast_hash": "b313ddb351a05f0c6d1dbf1260856633",
+    "mtime": 1793797727.6830695,
+    "seen": 1794137672.5810518,
+    "ast_hash": "eeff18514edc6f1e157c48f1499d4298",
     "semantic_hash": ""
   },
   ".planning/RETROSPECTIVE.md": {
@@ -6168,21 +6168,21 @@
     "semantic_hash": ""
   },
   ".planning/user/DEV-SETUP-CHECKLIST.md": {
-    "mtime": 1792693844.8973825,
-    "seen": 1792749716.9565217,
-    "ast_hash": "9f5917d0d1f9d8fe1aaefc631f340fc4",
+    "mtime": 1792776580.002029,
+    "seen": 1794137672.5839057,
+    "ast_hash": "b1a0c35e5aba34aaf8495caa6f8146d3",
     "semantic_hash": ""
   },
   "CHANGELOG.md": {
-    "mtime": 1788429861.062703,
-    "seen": 1788773909.6523414,
-    "ast_hash": "0efa92a7da4f616a827500b81b8bdd07",
+    "mtime": 1793797737.1150422,
+    "seen": 1794137672.5839105,
+    "ast_hash": "4918dda166a220139d7722d1885f5a87",
     "semantic_hash": ""
   },
   "CLAUDE.md": {
-    "mtime": 1792167260.9129035,
-    "seen": 1792749716.9571161,
-    "ast_hash": "1d186351e4518491e25eda33e486f924",
+    "mtime": 1794137336.272579,
+    "seen": 1794137672.5839121,
+    "ast_hash": "e98c27046c77afa1f7055cb2ef358fe9",
     "semantic_hash": ""
   },
   "CODE_OF_CONDUCT.md": {
@@ -6192,9 +6192,9 @@
     "semantic_hash": ""
   },
   "CONTRIBUTING.md": {
-    "mtime": 1790269483.1004324,
-    "seen": 1791724146.9598627,
-    "ast_hash": "958c716e3a1596a96aa351dfbf5f3c1f",
+    "mtime": 1792751183.0895286,
+    "seen": 1794137672.5839155,
+    "ast_hash": "b6eed6cdf222bd726fc3cd717607a611",
     "semantic_hash": ""
   },
   "DEPENDENCIES.md": {
@@ -6204,15 +6204,15 @@
     "semantic_hash": ""
   },
   "OPERATIONS.md": {
-    "mtime": 1792693844.9023826,
-    "seen": 1792749716.9571328,
-    "ast_hash": "631494093094dbc45b38d9654091c477",
+    "mtime": 1793797746.5210152,
+    "seen": 1794137672.5839188,
+    "ast_hash": "1795e161b45607dd1709e5abff1d682a",
     "semantic_hash": ""
   },
   "README.md": {
-    "mtime": 1787434735.2161496,
-    "seen": 1788773909.6523569,
-    "ast_hash": "a45911f3b596ab05db5b5ee724f71ab2",
+    "mtime": 1793797727.862069,
+    "seen": 1794137672.5839205,
+    "ast_hash": "2f41d57b31ccd360787c75477e43dc52",
     "semantic_hash": ""
   },
   "SECURITY.md": {
@@ -6306,9 +6306,9 @@
     "semantic_hash": ""
   },
   "crates/devflow-cli/tests/snapshots/devflow-help.txt": {
-    "mtime": 1792693844.9413824,
-    "seen": 1792749716.9572062,
-    "ast_hash": "c044b04c27bbbfe1eb9c8da2ab33c7b9",
+    "mtime": 1793797727.8970687,
+    "seen": 1794137672.5839393,
+    "ast_hash": "0fb1dff681a03b82c50e1bc6f1a802b3",
     "semantic_hash": ""
   },
   "docs/architecture/agent-model.md": {
@@ -6330,9 +6330,9 @@
     "semantic_hash": ""
   },
   "docs/architecture/state-machine.md": {
-    "mtime": 1787438875.9665864,
-    "seen": 1788773909.6524084,
-    "ast_hash": "9901bd87d128cddd00140c853f66810a",
+    "mtime": 1793797727.9430687,
+    "seen": 1794137672.5839453,
+    "ast_hash": "3f3da2e99a84ca8cbc7780aa9bee0e4d",
     "semantic_hash": ""
   },
   "docs/diagrams/agent-lifecycle.md": {
@@ -6546,9 +6546,9 @@
     "semantic_hash": ""
   },
   ".planning/phases/47-unattended-decision-policy-consistency/47-VERIFICATION.md": {
-    "mtime": 1790384780.295054,
-    "seen": 1791724146.9595277,
-    "ast_hash": "8b528eda01a3d8df2d554a6b1084942c",
+    "mtime": 1792776676.7789156,
+    "seen": 1794137672.5829031,
+    "ast_hash": "ff13ce409dd9e41ba6d75e64b9991ce0",
     "semantic_hash": ""
   },
   ".planning/phases/47-unattended-decision-policy-consistency/deferred-items.md": {
@@ -6798,9 +6798,9 @@
     "semantic_hash": ""
   },
   ".planning/phases/49-live-unattended-run-the-milestone-s-instrument/tools/check-evidence.sh": {
-    "mtime": 1791590556.6358943,
-    "seen": 1791724146.9581385,
-    "ast_hash": "8faeeff7f78ac4296ae361fa1c2dd118",
+    "mtime": 1793797727.6970694,
+    "seen": 1794137672.580683,
+    "ast_hash": "01f4ecdd500e2381cfd649b55690a6b8",
     "semantic_hash": ""
   },
   ".planning/phases/49-live-unattended-run-the-milestone-s-instrument/tools/collect-attempt.sh": {
@@ -6846,33 +6846,33 @@
     "semantic_hash": ""
   },
   ".planning/user/errors/state-stale.json": {
-    "mtime": 1792693844.8983824,
-    "seen": 1792749716.9484751,
-    "ast_hash": "381ce426a374b55a375aa9793a88285f",
+    "mtime": 1793797727.860069,
+    "seen": 1794137672.5808177,
+    "ast_hash": "d9a3bae681cf263979022a302d68245c",
     "semantic_hash": ""
   },
   "Cargo.toml": {
-    "mtime": 1789319792.1877775,
-    "seen": 1791724146.9581501,
-    "ast_hash": "0ff2d1a7a7594ccd264766e09ddf682c",
+    "mtime": 1793797737.1170423,
+    "seen": 1794137672.5808191,
+    "ast_hash": "d37fb652531df24b54c824add3dfcae1",
     "semantic_hash": ""
   },
   "crates/devflow-cli/tests/gate_notify_persist_e2e.rs": {
-    "mtime": 1792693844.9333825,
-    "seen": 1792749716.948609,
-    "ast_hash": "2b07a2e7de0d6ec5098087caee42b1b4",
+    "mtime": 1793797727.8940687,
+    "seen": 1794137672.5808716,
+    "ast_hash": "e508850190628519342e3d2f40b926bc",
     "semantic_hash": ""
   },
   "crates/devflow-cli/tests/gate_wedge_e2e.rs": {
-    "mtime": 1792693844.9343824,
-    "seen": 1792749716.94862,
-    "ast_hash": "fc79f1613a0efc6c91629c3a63726099",
+    "mtime": 1793797727.895069,
+    "seen": 1794137672.5808744,
+    "ast_hash": "028df514f3a2d25d52364b6aa1aed2bc",
     "semantic_hash": ""
   },
   "crates/devflow-cli/tests/recover_clean_e2e.rs": {
-    "mtime": 1792693844.9413824,
-    "seen": 1792749716.9486825,
-    "ast_hash": "fd84249dc9d45818639937010d3069e6",
+    "mtime": 1793797727.8970687,
+    "seen": 1794137672.5809038,
+    "ast_hash": "94746d909961e5e1423f208f88b9faf6",
     "semantic_hash": ""
   },
   "crates/devflow-cli/tests/script_modes.rs": {
@@ -6882,9 +6882,9 @@
     "semantic_hash": ""
   },
   "crates/devflow-cli/tests/start_lock_e2e.rs": {
-    "mtime": 1792693844.9413824,
-    "seen": 1792749716.9487,
-    "ast_hash": "c31bf7f5210dd165bdb2b5119f1f7ac5",
+    "mtime": 1793797727.8970687,
+    "seen": 1794137672.5809093,
+    "ast_hash": "7db45f8634024de88fae737808ae0b04",
     "semantic_hash": ""
   },
   "scripts/check-workspace-divergence.sh": {
@@ -7206,9 +7206,9 @@
     "semantic_hash": ""
   },
   ".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-SECURITY.md": {
-    "mtime": 1790384780.301054,
-    "seen": 1791724146.9595766,
-    "ast_hash": "78689e9b3b46a9da1e0f5718261dc79a",
+    "mtime": 1793797727.6960695,
+    "seen": 1794137672.5829816,
+    "ast_hash": "3f31622d14010cf7d9973e58856724b4",
     "semantic_hash": ""
   },
   ".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-TDD-OVERRIDE.md": {
@@ -7224,9 +7224,9 @@
     "semantic_hash": ""
   },
   ".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-VERIFICATION.md": {
-    "mtime": 1790384780.302054,
-    "seen": 1791724146.9595797,
-    "ast_hash": "af778d9c9fb2412f4af28f417107e4ea",
+    "mtime": 1792750748.295886,
+    "seen": 1794137672.5829866,
+    "ast_hash": "d1b832b1fa57e8692b17e8608172813e",
     "semantic_hash": ""
   },
   ".planning/phases/49-live-unattended-run-the-milestone-s-instrument/49-01-PLAN.md": {
@@ -7458,9 +7458,9 @@
     "semantic_hash": ""
   },
   ".planning/phases/49-live-unattended-run-the-milestone-s-instrument/49-VERIFICATION.md": {
-    "mtime": 1791590556.5956624,
-    "seen": 1791724146.9596176,
-    "ast_hash": "a1385ca472490f50cda169b019b59584",
+    "mtime": 1792751123.2817812,
+    "seen": 1794137672.5830495,
+    "ast_hash": "ef9b62384be50954868974a79f05a712",
     "semantic_hash": ""
   },
   ".planning/phases/49-live-unattended-run-the-milestone-s-instrument/49-evidence/attempt-1/collected/absent.txt": {
@@ -7968,9 +7968,9 @@
     "semantic_hash": ""
   },
   ".planning/reviews/48-code-review-2026-09-22/VERIFIED.md": {
-    "mtime": 1790384780.307649,
-    "seen": 1791724146.9597292,
-    "ast_hash": "048ec9ab345e052507508e6a693a6c6d",
+    "mtime": 1793797727.858069,
+    "seen": 1794137672.5837157,
+    "ast_hash": "57de8a7e96182328ee7fccf6f5f21a77",
     "semantic_hash": ""
   },
   ".planning/reviews/48-code-review-2026-09-22/fix-round/FIX-PROMPT.md": {
@@ -8454,15 +8454,15 @@
     "semantic_hash": ""
   },
   ".planning/phases/50-addressable-monitor-liveness/tools/check-supervisor-evidence.sh": {
-    "mtime": 1792693844.8968515,
-    "seen": 1792749716.948434,
-    "ast_hash": "1c98bb9593845bba937589ffb7dd3d9c",
+    "mtime": 1793797727.6990695,
+    "seen": 1794137672.5807521,
+    "ast_hash": "b133fc694fb100bedc7b99c8534c8b5a",
     "semantic_hash": ""
   },
   ".planning/phases/50-addressable-monitor-liveness/tools/fault-arm.sh": {
-    "mtime": 1792693844.8968515,
-    "seen": 1792749716.9484394,
-    "ast_hash": "d84f6520d56373799c0128c408f8271c",
+    "mtime": 1793797727.7000694,
+    "seen": 1794137672.5807536,
+    "ast_hash": "6a335684b5701c05081eecc6b065b1a7",
     "semantic_hash": ""
   },
   ".planning/phases/50-addressable-monitor-liveness/tools/semver-gate.sh": {
@@ -8478,9 +8478,9 @@
     "semantic_hash": ""
   },
   "crates/devflow-cli/tests/common/mod.rs": {
-    "mtime": 1792693844.9313824,
-    "seen": 1792749716.9485903,
-    "ast_hash": "8480cb986571ee1cf1fc09fb960af3cc",
+    "mtime": 1793797727.8930688,
+    "seen": 1794137672.5808563,
+    "ast_hash": "b971b3194240db59b95809dbe9156c90",
     "semantic_hash": ""
   },
   "crates/devflow-cli/tests/hermetic_spawn_sites.rs": {
@@ -8490,9 +8490,9 @@
     "semantic_hash": ""
   },
   "crates/devflow-cli/tests/supervisor_e2e.rs": {
-    "mtime": 1792693844.9453824,
-    "seen": 1792749716.9487157,
-    "ast_hash": "fe3e87b7cdf6de406897c20a71e382b7",
+    "mtime": 1793797727.8990688,
+    "seen": 1794137672.5809147,
+    "ast_hash": "f7a7320b14ae02fef3220eff9cbfece7",
     "semantic_hash": ""
   },
   "crates/devflow-cli/tests/test_home_isolation.rs": {
@@ -8502,9 +8502,9 @@
     "semantic_hash": ""
   },
   "crates/devflow-core/src/supervisor.rs": {
-    "mtime": 1792693844.9653823,
-    "seen": 1792749716.9489367,
-    "ast_hash": "bbafb761c9af45351065a436ee66193d",
+    "mtime": 1793797727.9300687,
+    "seen": 1794137672.5809767,
+    "ast_hash": "f40472d47ee4da01feae0adbab447241",
     "semantic_hash": ""
   },
   "crates/devflow-core/src/supervisor/backstop.rs": {
@@ -8514,15 +8514,15 @@
     "semantic_hash": ""
   },
   "crates/devflow-core/src/supervisor/protocol.rs": {
-    "mtime": 1792693844.9673824,
-    "seen": 1792749716.9489462,
-    "ast_hash": "5a66d582bb2836a5b942f404139248e5",
+    "mtime": 1793797727.9340687,
+    "seen": 1794137672.5809793,
+    "ast_hash": "a1a3af0a685c5a1735f8bb4734326209",
     "semantic_hash": ""
   },
   "crates/devflow-core/src/supervisor/runtime.rs": {
-    "mtime": 1792693844.9683824,
-    "seen": 1792749716.9489517,
-    "ast_hash": "0d767fb41fe17708c922b2e917c2c6c9",
+    "mtime": 1793797727.9370687,
+    "seen": 1794137672.580981,
+    "ast_hash": "606d3ea31911e1cb5fe9e3de883f7c34",
     "semantic_hash": ""
   },
   ".planning/audits/2026-10-22-graphify-review-triage-pr225.md": {
@@ -8886,9 +8886,9 @@
     "semantic_hash": ""
   },
   ".planning/phases/50-addressable-monitor-liveness/50-CRASH-TABLE.md": {
-    "mtime": 1792178498.9859354,
-    "seen": 1792749716.9557412,
-    "ast_hash": "65e9f3a1d55ba7813d91eee10058213c",
+    "mtime": 1793797727.6970694,
+    "seen": 1794137672.5832696,
+    "ast_hash": "84d064abdfcc27f658eae211945b4343",
     "semantic_hash": ""
   },
   ".planning/phases/50-addressable-monitor-liveness/50-LIVE-RUN.md": {
@@ -8946,9 +8946,9 @@
     "semantic_hash": ""
   },
   ".planning/phases/50-addressable-monitor-liveness/50-VERIFICATION.md": {
-    "mtime": 1792693844.8387125,
-    "seen": 1792749716.9557972,
-    "ast_hash": "186a0beb7725a7bd6a8c7976d349513e",
+    "mtime": 1792751143.1126974,
+    "seen": 1794137672.5832875,
+    "ast_hash": "d70bcf42acaed3138c44fcd09e542b15",
     "semantic_hash": ""
   },
   ".planning/phases/50-addressable-monitor-liveness/50-evidence/attempt-1/collected/absent.txt": {
@@ -9372,9 +9372,9 @@
     "semantic_hash": ""
   },
   ".planning/phases/50-addressable-monitor-liveness/tools/EVIDENCE-LAYOUT.md": {
-    "mtime": 1792693844.8963826,
-    "seen": 1792749716.9560025,
-    "ast_hash": "a76eeda0a1bf524003a5265cbe6fe8ad",
+    "mtime": 1793797727.6980693,
+    "seen": 1794137672.583407,
+    "ast_hash": "75690524862135faa67e958462e567d4",
     "semantic_hash": ""
   },
   ".planning/reviews/50-adversarial-2026-10-11-context/SUMMARY.md": {
@@ -9453,6 +9453,1350 @@
     "mtime": 1792178673.7366192,
     "seen": 1792749716.9562874,
     "ast_hash": "e882557e3f8e918b6492f529f7c62973",
+    "semantic_hash": ""
+  },
+  ".github/dependabot.yml": {
+    "mtime": 1792751183.0895286,
+    "seen": 1794137672.5805686,
+    "ast_hash": "1a8738d08291c0ff7dd880fcb0afa0c7",
+    "semantic_hash": ""
+  },
+  ".github/workflows/scheduled-deps.yml": {
+    "mtime": 1792751183.0895286,
+    "seen": 1794137672.5805762,
+    "ast_hash": "5eee207ccd5dabeab747ab2527736982",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/attempt.json": {
+    "mtime": 1793797727.7407413,
+    "seen": 1794137672.580758,
+    "ast_hash": "ebb4c55aec3a8fd2d1dd0d8e4a8feb4b",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/collected/evidence.json": {
+    "mtime": 1793797727.767069,
+    "seen": 1794137672.58076,
+    "ast_hash": "114713ba72c7b376974f990226bb8710",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/collected/pr.json": {
+    "mtime": 1793797727.767069,
+    "seen": 1794137672.5807617,
+    "ast_hash": "cc9d0dc7b8254bf8c298ecfb6371cbb3",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/gates/001-define/devflow/gates/01-define.json": {
+    "mtime": 1793797727.7691448,
+    "seen": 1794137672.580763,
+    "ast_hash": "c6eb93860db969287d988819e8db8b02",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/gates/001-define/devflow/state-01.json": {
+    "mtime": 1793797727.7691448,
+    "seen": 1794137672.5807648,
+    "ast_hash": "0ea7c017eae79651f7d62a492427f169",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/gates/002-code/devflow/gates/01-code.json": {
+    "mtime": 1793797727.7700791,
+    "seen": 1794137672.580766,
+    "ast_hash": "ac171348a771fb098698f33b467e3989",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/gates/002-code/devflow/state-01.json": {
+    "mtime": 1793797727.770475,
+    "seen": 1794137672.5807674,
+    "ast_hash": "dd43d248ce3f526133c20f2d12837cb2",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/gates/003-ship/devflow/gates/01-ship.json": {
+    "mtime": 1793797727.771524,
+    "seen": 1794137672.5807693,
+    "ast_hash": "dec8085b69152a0220f479cb5c08c760",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/gates/003-ship/devflow/state-01.json": {
+    "mtime": 1793797727.7820692,
+    "seen": 1794137672.5807707,
+    "ast_hash": "b60812a00fdce043a3d26ea777602275",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/gates/004-ship/devflow/gates/01-ship.json": {
+    "mtime": 1793797727.7840102,
+    "seen": 1794137672.5807722,
+    "ast_hash": "3a745a0ae49f07df37d0c7f9c3ad10dc",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/gates/004-ship/devflow/state-01.json": {
+    "mtime": 1793797727.797069,
+    "seen": 1794137672.5807736,
+    "ast_hash": "2e41a1bb83bfa317d6b18b6023229ea4",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/prelaunch/repo.json": {
+    "mtime": 1793797727.7988036,
+    "seen": 1794137672.5807753,
+    "ast_hash": "a817ee047a7a399427ba4f472127ded1",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/verdict.json": {
+    "mtime": 1793797727.800069,
+    "seen": 1794137672.5807762,
+    "ast_hash": "2f47e550325a1b2c6f5691e097d80702",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/attempt.json": {
+    "mtime": 1793797727.800069,
+    "seen": 1794137672.5807774,
+    "ast_hash": "68f3b4aec8dc39281612610c8179c77e",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/collected/evidence.json": {
+    "mtime": 1793797727.8190691,
+    "seen": 1794137672.5807788,
+    "ast_hash": "114713ba72c7b376974f990226bb8710",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/collected/pr.json": {
+    "mtime": 1793797727.8190691,
+    "seen": 1794137672.5807803,
+    "ast_hash": "c2520a55e60b768d2c425ba7dd54ad80",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/gates/001-define/devflow/gates/01-define.json": {
+    "mtime": 1793797727.8203795,
+    "seen": 1794137672.580782,
+    "ast_hash": "5528aeb1681ae013dff054c96b6d131d",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/gates/001-define/devflow/state-01.json": {
+    "mtime": 1793797727.8203795,
+    "seen": 1794137672.580783,
+    "ast_hash": "4ba9423eebaf1c8a7f5f0c3304935b74",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/gates/002-code/devflow/gates/01-code.json": {
+    "mtime": 1793797727.821162,
+    "seen": 1794137672.580784,
+    "ast_hash": "5b9ca6f07f68825c7ea7c6f7a59b264e",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/gates/002-code/devflow/state-01.json": {
+    "mtime": 1793797727.821678,
+    "seen": 1794137672.5807855,
+    "ast_hash": "baa859875b0972bc947147b210a06969",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/gates/003-code/devflow/gates/01-code.json": {
+    "mtime": 1793797727.8224642,
+    "seen": 1794137672.5807867,
+    "ast_hash": "1fb843288c80cadec4d83081a8f4e387",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/gates/003-code/devflow/state-01.json": {
+    "mtime": 1793797727.824069,
+    "seen": 1794137672.580788,
+    "ast_hash": "03773b6757efe04dd7450c3da6e76b1f",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/gates/004-code/devflow/gates/01-code.json": {
+    "mtime": 1793797727.82577,
+    "seen": 1794137672.5807893,
+    "ast_hash": "3b43164ece0902412db52b1bac5ddb36",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/gates/004-code/devflow/state-01.json": {
+    "mtime": 1793797727.831069,
+    "seen": 1794137672.5807905,
+    "ast_hash": "de44b93bf604f16ed1943a5f2b93a890",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/gates/005-ship/devflow/gates/01-ship.json": {
+    "mtime": 1793797727.833069,
+    "seen": 1794137672.580792,
+    "ast_hash": "2e61f81c6e061e4e3a81b0232fd48ad2",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/gates/005-ship/devflow/state-01.json": {
+    "mtime": 1793797727.850069,
+    "seen": 1794137672.5807934,
+    "ast_hash": "3869ccc888182718011211de99ead83a",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/prelaunch/repo.json": {
+    "mtime": 1793797727.8520772,
+    "seen": 1794137672.5807943,
+    "ast_hash": "ad5ae2c8e94e03a903e6b974a35ba296",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/verdict.json": {
+    "mtime": 1793797727.8531246,
+    "seen": 1794137672.5807958,
+    "ast_hash": "5e04a0e88e6b8acc6a90d791b86694aa",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/fault-1/case-alive-stop-capture.json": {
+    "mtime": 1793797727.854069,
+    "seen": 1794137672.5807972,
+    "ast_hash": "296d4eb8de6338083e8a96d8e2c6a579",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/fault-1/case-alive-stop-stream.json": {
+    "mtime": 1793797727.854069,
+    "seen": 1794137672.5807984,
+    "ast_hash": "9e9fc64fbfb79badf4ac476423078ed1",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/fault-1/case-kill9-at-gate.json": {
+    "mtime": 1793797727.854069,
+    "seen": 1794137672.5807998,
+    "ast_hash": "891f8105563fcde5979e518f8aad92c3",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/fault-1/case-kill9-stale-stop.json": {
+    "mtime": 1793797727.854069,
+    "seen": 1794137672.580801,
+    "ast_hash": "0166a34dbc4a9e21a182359dc8c1f203",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/fault-1/case-publish-unlink-window.json": {
+    "mtime": 1793797727.854069,
+    "seen": 1794137672.580802,
+    "ast_hash": "3b20e6199030ca48e4f944a8a91ebde4",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/fault-1/case-stop-races-completion.json": {
+    "mtime": 1793797727.854069,
+    "seen": 1794137672.5808034,
+    "ast_hash": "6da108a2d6178fda872a2dd500571294",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/fault-2/case-alive-stop-capture.json": {
+    "mtime": 1793797727.8561432,
+    "seen": 1794137672.5808046,
+    "ast_hash": "71743e9c279d292340bd5736621e8f49",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/fault-2/case-alive-stop-stream.json": {
+    "mtime": 1793797727.8561432,
+    "seen": 1794137672.5808055,
+    "ast_hash": "4a58d6e54a7dab815d31abc3fd257da6",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/fault-2/case-kill9-at-gate.json": {
+    "mtime": 1793797727.8561432,
+    "seen": 1794137672.580807,
+    "ast_hash": "b437e94c679c7d62dd90020d0df2183b",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/fault-2/case-kill9-stale-stop.json": {
+    "mtime": 1793797727.8561432,
+    "seen": 1794137672.5808082,
+    "ast_hash": "913e2dbf25ba087795bec80ac63e728f",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/fault-2/case-publish-unlink-window.json": {
+    "mtime": 1793797727.8561432,
+    "seen": 1794137672.5808094,
+    "ast_hash": "251b37de59ba5177733558c803ffc131",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/fault-2/case-stop-races-completion.json": {
+    "mtime": 1793797727.8561432,
+    "seen": 1794137672.5808108,
+    "ast_hash": "019211374e07071e1eb438db1100a0fc",
+    "semantic_hash": ""
+  },
+  "crates/devflow-cli/tests/architecture_wording.rs": {
+    "mtime": 1793797727.8900688,
+    "seen": 1794137672.580839,
+    "ast_hash": "b2255ed409924e41a6b0687cc97ce64a",
+    "semantic_hash": ""
+  },
+  "crates/devflow-cli/tests/doctor_json_e2e.rs": {
+    "mtime": 1793797727.8930688,
+    "seen": 1794137672.5808613,
+    "ast_hash": "7a91c1e7fcadf2b8d3f992c9b90f4d8d",
+    "semantic_hash": ""
+  },
+  "crates/devflow-cli/tests/pending_supervisor_e2e.rs": {
+    "mtime": 1793797727.8960688,
+    "seen": 1794137672.5808835,
+    "ast_hash": "d8e3c5050a2de6a0642ca2ef57337ce8",
+    "semantic_hash": ""
+  },
+  "crates/devflow-cli/tests/pre_commit_secret_scan.rs": {
+    "mtime": 1792751183.0904315,
+    "seen": 1794137672.5808985,
+    "ast_hash": "b4a070be0923d7bc1f86de8bf3fde0c8",
+    "semantic_hash": ""
+  },
+  "crates/devflow-core/src/durable.rs": {
+    "mtime": 1793797727.9050689,
+    "seen": 1794137672.5809443,
+    "ast_hash": "674c15e6f306e4ac8dd0684369ccb803",
+    "semantic_hash": ""
+  },
+  "crates/devflow-core/src/liveness.rs": {
+    "mtime": 1793797727.9120688,
+    "seen": 1794137672.5809567,
+    "ast_hash": "84c0bdb33816568bfa63408132de924c",
+    "semantic_hash": ""
+  },
+  ".planning/audits/2026-11-03-graphify-review-triage-pr229.md": {
+    "mtime": 1793797727.6950693,
+    "seen": 1794137672.5810757,
+    "ast_hash": "8e590aa73bfa0a5b9893f011c3caaf9a",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-01-PLAN.md": {
+    "mtime": 1793797727.7000694,
+    "seen": 1794137672.5834086,
+    "ast_hash": "71a8f03e1b128bed799ec539097bd793",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-01-SUMMARY.md": {
+    "mtime": 1793797727.7000694,
+    "seen": 1794137672.5834105,
+    "ast_hash": "b31b5c1185e18a5ebabd1565b293e6e0",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-02-PLAN.md": {
+    "mtime": 1793797727.7010694,
+    "seen": 1794137672.583412,
+    "ast_hash": "dc52dacd921ae40205a8398075a769d4",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-02-SUMMARY.md": {
+    "mtime": 1793797727.7010694,
+    "seen": 1794137672.5834134,
+    "ast_hash": "98545a6235d67dd2f67f2b021e9fc8a3",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-03-PLAN.md": {
+    "mtime": 1793797727.7010694,
+    "seen": 1794137672.5834148,
+    "ast_hash": "30075df1b57eece88bb8b3dca68ae9c6",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-03-SUMMARY.md": {
+    "mtime": 1793797727.7020693,
+    "seen": 1794137672.583416,
+    "ast_hash": "c7b097deedbb4ff11fb271c1407fe1fc",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-04-PLAN.md": {
+    "mtime": 1793797727.7020693,
+    "seen": 1794137672.5834177,
+    "ast_hash": "c17c2db53e739c9471e07998f32b5dc5",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-04-SUMMARY.md": {
+    "mtime": 1793797727.7030694,
+    "seen": 1794137672.5834188,
+    "ast_hash": "e3b70f12b8e09026f2f9df7908a9c3b2",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-05-PLAN.md": {
+    "mtime": 1793797727.7040694,
+    "seen": 1794137672.5834203,
+    "ast_hash": "27f548cd33a7be61115123b9fe70ca63",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-05-SUMMARY.md": {
+    "mtime": 1793797727.7050693,
+    "seen": 1794137672.5834215,
+    "ast_hash": "766570bd7b50628e1320768af289681a",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-06-PLAN.md": {
+    "mtime": 1793797727.7060695,
+    "seen": 1794137672.5834227,
+    "ast_hash": "c209fb56e2ac572f7ff78b7e37772fd6",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-06-SUMMARY.md": {
+    "mtime": 1793797727.7060695,
+    "seen": 1794137672.583424,
+    "ast_hash": "43bbfedad1abcbac9309a1dc1883f952",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-07-PLAN.md": {
+    "mtime": 1793797727.7070694,
+    "seen": 1794137672.5834255,
+    "ast_hash": "da1d55b9a7a5779cea470572bb1e1e76",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-07-SUMMARY.md": {
+    "mtime": 1793797727.7070694,
+    "seen": 1794137672.5834267,
+    "ast_hash": "07e73dc2d2f7d3b41b1ba6fd0f375adf",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-08-PLAN.md": {
+    "mtime": 1793797727.7080693,
+    "seen": 1794137672.5834281,
+    "ast_hash": "395e18b77de217de5d240c7a53291423",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-08-SUMMARY.md": {
+    "mtime": 1793797727.7080693,
+    "seen": 1794137672.5834293,
+    "ast_hash": "4277e0ecb212ab53c83f3c68370d1bd2",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-09-PLAN.md": {
+    "mtime": 1793797727.7080693,
+    "seen": 1794137672.5834312,
+    "ast_hash": "13feed16c22701a544097619e69d1da8",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-09-SUMMARY.md": {
+    "mtime": 1793797727.7090693,
+    "seen": 1794137672.5834324,
+    "ast_hash": "3149e130ec08b236eb75189b60afd8a6",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-10-PLAN.md": {
+    "mtime": 1793797727.7090693,
+    "seen": 1794137672.5834336,
+    "ast_hash": "a94d24fa9446dc8189228f3cdff6c89c",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-10-SUMMARY.md": {
+    "mtime": 1793797727.7090693,
+    "seen": 1794137672.583435,
+    "ast_hash": "4a65a99b9db6dd5b5ab47ff7d9ba6c2f",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-11-PLAN.md": {
+    "mtime": 1793797727.7100694,
+    "seen": 1794137672.5834363,
+    "ast_hash": "fd788fcffbd8a042b01c8f2f3ecec54d",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-11-SUMMARY.md": {
+    "mtime": 1793797727.7100694,
+    "seen": 1794137672.5834372,
+    "ast_hash": "6e78b085e4450e285a2ac552e4404049",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-12-PLAN.md": {
+    "mtime": 1793797727.7100694,
+    "seen": 1794137672.5834386,
+    "ast_hash": "398b8c420a57c8c2e58e7a90df662059",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-12-SUMMARY.md": {
+    "mtime": 1793797727.7110693,
+    "seen": 1794137672.5834396,
+    "ast_hash": "53d5afffcd934cd1a8a25cfc5f361549",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-13-PLAN.md": {
+    "mtime": 1793797727.7110693,
+    "seen": 1794137672.5834408,
+    "ast_hash": "d120904e41c24cdc7fedcb017d68e496",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-13-SUMMARY.md": {
+    "mtime": 1793797727.7110693,
+    "seen": 1794137672.5834424,
+    "ast_hash": "fefd2a4001d3864062065a375b1e2dbf",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-14-PLAN.md": {
+    "mtime": 1793797727.7120693,
+    "seen": 1794137672.5834434,
+    "ast_hash": "7196fe9b429ff03c2389fd0153a5b096",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-14-SUMMARY.md": {
+    "mtime": 1793797727.7120693,
+    "seen": 1794137672.5834448,
+    "ast_hash": "b273987676aaecdd916dc64495bdc4dd",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-15-PLAN.md": {
+    "mtime": 1793797727.7120693,
+    "seen": 1794137672.5834463,
+    "ast_hash": "e3d5398f9aa9cd95005dd325d73a8284",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-15-SUMMARY.md": {
+    "mtime": 1793797727.7130694,
+    "seen": 1794137672.5834475,
+    "ast_hash": "feb1784822154c2da5adcd1db92a6b16",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-16-PLAN.md": {
+    "mtime": 1793797727.7130694,
+    "seen": 1794137672.5834486,
+    "ast_hash": "c7e34554e75b5c0a4f546fe2a55fff18",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-16-SUMMARY.md": {
+    "mtime": 1793797727.7140694,
+    "seen": 1794137672.5834498,
+    "ast_hash": "0aa2082799b1a220b28032e76d613a00",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-17-PLAN.md": {
+    "mtime": 1793797727.7140694,
+    "seen": 1794137672.583452,
+    "ast_hash": "6bdc02562758f890a90e96afecc5d5d7",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-17-SUMMARY.md": {
+    "mtime": 1793797727.7150693,
+    "seen": 1794137672.5834532,
+    "ast_hash": "461645c48e7e93ab5c1bc5749086c07b",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-18-PLAN.md": {
+    "mtime": 1793797727.7160695,
+    "seen": 1794137672.5834546,
+    "ast_hash": "f75048b6548d6c535ff84685a872a00f",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-18-SUMMARY.md": {
+    "mtime": 1793797727.7160695,
+    "seen": 1794137672.583456,
+    "ast_hash": "61697f8a3c07f55d4ec4db24338d6bc9",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-19-PLAN.md": {
+    "mtime": 1793797727.7170694,
+    "seen": 1794137672.5834572,
+    "ast_hash": "e2f08157461fbbfa1b152c526ba6d26f",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-19-SUMMARY.md": {
+    "mtime": 1793797727.7180693,
+    "seen": 1794137672.5834587,
+    "ast_hash": "46e62730cf79b4d955ec515b49cc4db7",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-20-PLAN.md": {
+    "mtime": 1793797727.7190692,
+    "seen": 1794137672.5834599,
+    "ast_hash": "9cd5436ac2db25ee9cf7f1c1b494fd0d",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-20-SUMMARY.md": {
+    "mtime": 1793797727.7190692,
+    "seen": 1794137672.5834608,
+    "ast_hash": "da03f7ab9b2d61506fa4c440ac0461c5",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-21-PLAN.md": {
+    "mtime": 1793797727.7200694,
+    "seen": 1794137672.5834625,
+    "ast_hash": "7db7d71262e6f44b5abe6b237979a75b",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-21-SUMMARY.md": {
+    "mtime": 1793797727.7200694,
+    "seen": 1794137672.5834637,
+    "ast_hash": "0216f434abb4578028e266ffacb7a5a0",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-22-PLAN.md": {
+    "mtime": 1793797727.7210693,
+    "seen": 1794137672.5834649,
+    "ast_hash": "7fa1136641d6aac9a15da23dcfbb8d22",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-22-SUMMARY.md": {
+    "mtime": 1793797727.7210693,
+    "seen": 1794137672.5834663,
+    "ast_hash": "faf5feb6969064993f8339dd0b150b91",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-23-PLAN.md": {
+    "mtime": 1793797727.7210693,
+    "seen": 1794137672.5834672,
+    "ast_hash": "5c0bb05b6f20043bb197c8f47ad65d59",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-23-SUMMARY.md": {
+    "mtime": 1793797727.7220693,
+    "seen": 1794137672.5834684,
+    "ast_hash": "11ccbcdf98527c953c1ae36ffbed0b7f",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-24-PLAN.md": {
+    "mtime": 1793797727.7220693,
+    "seen": 1794137672.5834699,
+    "ast_hash": "4d126fd7c1b92deb3cec886c3a0699a7",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-24-SUMMARY.md": {
+    "mtime": 1793797727.7230694,
+    "seen": 1794137672.583471,
+    "ast_hash": "6c8e15d7b35cce3b654d7d2f6abd662a",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-25-PLAN.md": {
+    "mtime": 1793797727.7230694,
+    "seen": 1794137672.5834725,
+    "ast_hash": "a68c310d1a1dd2e3b3f86469775a1a92",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-25-SUMMARY.md": {
+    "mtime": 1793797727.7230694,
+    "seen": 1794137672.5834737,
+    "ast_hash": "d69c4e2560f24bd3ca88aa39659251d9",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-26-PLAN.md": {
+    "mtime": 1793797727.7240694,
+    "seen": 1794137672.583475,
+    "ast_hash": "c6fd278eb8bd184c913951101c7a0047",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-26-SUMMARY.md": {
+    "mtime": 1793797727.7240694,
+    "seen": 1794137672.5834765,
+    "ast_hash": "b0fa20a08c36fcc929e762768efc04fb",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-27-PLAN.md": {
+    "mtime": 1793797727.7240694,
+    "seen": 1794137672.5834777,
+    "ast_hash": "d94820c7bb961e7210749140690bb972",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-27-SUMMARY.md": {
+    "mtime": 1793797727.7250693,
+    "seen": 1794137672.583479,
+    "ast_hash": "8d6091afd32ef567f34c7addf32c5b91",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-28-PLAN.md": {
+    "mtime": 1793797727.7250693,
+    "seen": 1794137672.5834804,
+    "ast_hash": "04fd76ae16027854e00dbca4588bc0c7",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-28-SUMMARY.md": {
+    "mtime": 1793797727.7260692,
+    "seen": 1794137672.5834816,
+    "ast_hash": "7f25c6342a95d77161021ff54e835299",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-29-PLAN.md": {
+    "mtime": 1793797727.7270694,
+    "seen": 1794137672.583483,
+    "ast_hash": "d834aad6a34dd3d2a1fa1084428a7685",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-29-SUMMARY.md": {
+    "mtime": 1793797727.7280693,
+    "seen": 1794137672.5834842,
+    "ast_hash": "2689aa221442343b9c2e1f8440071525",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-30-PLAN.md": {
+    "mtime": 1793797727.7290692,
+    "seen": 1794137672.5834854,
+    "ast_hash": "8ecda44ee1ca8e5b48af3adf23ba3375",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-30-SUMMARY.md": {
+    "mtime": 1793797727.7290692,
+    "seen": 1794137672.5834868,
+    "ast_hash": "7a559fab9f3d8338e700881ef0ee91be",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-CONTEXT.md": {
+    "mtime": 1793797727.7300694,
+    "seen": 1794137672.5834994,
+    "ast_hash": "ee413dcdbfb3cf82d1c0c7aedd7f7276",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-DISCUSSION-LOG.md": {
+    "mtime": 1793797727.7300694,
+    "seen": 1794137672.5835018,
+    "ast_hash": "f7943c83d405c8c331ce0ac791f4b7ef",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-EXTERNAL-REVIEW.md": {
+    "mtime": 1793797727.7310693,
+    "seen": 1794137672.583503,
+    "ast_hash": "23d73b5e67f3aaa73afc0ef8e82d47c5",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-LIVE-RUN.md": {
+    "mtime": 1793797727.7310693,
+    "seen": 1794137672.5835047,
+    "ast_hash": "5d885afa8b89b2ac5f747f079489313d",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-PATTERNS.md": {
+    "mtime": 1793797727.7330692,
+    "seen": 1794137672.583506,
+    "ast_hash": "f1cc1462d5c7af7e6fef93a6081396e1",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-RESEARCH.md": {
+    "mtime": 1793797727.7340693,
+    "seen": 1794137672.5835075,
+    "ast_hash": "b0d4bf5080cb7d8a403758b9419251dc",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-REVIEW-DISPOSITION.md": {
+    "mtime": 1793797727.7350693,
+    "seen": 1794137672.5835087,
+    "ast_hash": "58ab3eef60d6869eeb2a15b8a68d6168",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-REVIEW.md": {
+    "mtime": 1793797727.7350693,
+    "seen": 1794137672.5835097,
+    "ast_hash": "c6483bcd861108f130a9bed2ce94785b",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-REVIEWS.md": {
+    "mtime": 1793797727.7360692,
+    "seen": 1794137672.5835114,
+    "ast_hash": "a51cd9052692dc2953b0642dad86caef",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-RUNBOOK.md": {
+    "mtime": 1793797727.7370694,
+    "seen": 1794137672.5835123,
+    "ast_hash": "5c6f2e94c079bb970fe7af3b0aa60d73",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-SECURITY.md": {
+    "mtime": 1793797727.7380693,
+    "seen": 1794137672.5835135,
+    "ast_hash": "c8fa9404a6ca8dc60e5102df0a821c64",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-UAT.md": {
+    "mtime": 1793797727.7380693,
+    "seen": 1794137672.583515,
+    "ast_hash": "97f3de40da4c0f01014f8053a1149e9c",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-VALIDATION.md": {
+    "mtime": 1793797727.7390692,
+    "seen": 1794137672.5835161,
+    "ast_hash": "354a6cf317c562486a4cc38b0b109466",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-VERIFICATION.md": {
+    "mtime": 1793797727.7390692,
+    "seen": 1794137672.5835176,
+    "ast_hash": "bba82e8f74e0c38fcdfb349b5836527b",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/collected/absent.txt": {
+    "mtime": 1793797727.7416306,
+    "seen": 1794137672.5835187,
+    "ast_hash": "d41d8cd98f00b204e9800998ecf8427e",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/collected/devflow/history/phase-01/1793620016071304144-0-REVIEW.md": {
+    "mtime": 1793797727.7520692,
+    "seen": 1794137672.58352,
+    "ast_hash": "9c990b21975a1bab0c481c88a7a02dbb",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/collected/devflow/history/phase-01/1793620108143675345-0-REVIEW.md": {
+    "mtime": 1793797727.7530692,
+    "seen": 1794137672.5835216,
+    "ast_hash": "9c990b21975a1bab0c481c88a7a02dbb",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/collected/devflow/history/phase-01/1793620858527908780-0-REVIEW.md": {
+    "mtime": 1793797727.7550693,
+    "seen": 1794137672.583523,
+    "ast_hash": "b794ece1282d5513892a9d4e0b9a1c8f",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/collected/git.txt": {
+    "mtime": 1793797727.767069,
+    "seen": 1794137672.5835245,
+    "ast_hash": "d51cfa7a9616acb932e9b6a29568314d",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/deviations.txt": {
+    "mtime": 1793797727.767069,
+    "seen": 1794137672.5835257,
+    "ast_hash": "6e3924c36c0656eada5a69da2b234e0f",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/gates/001-define/context.txt": {
+    "mtime": 1793797727.7688458,
+    "seen": 1794137672.5835268,
+    "ast_hash": "cf6582f272a69f1cb87d6e24f8794bb5",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/gates/001-define/env.txt": {
+    "mtime": 1793797727.7691448,
+    "seen": 1794137672.5835283,
+    "ast_hash": "bb03428877435e9cf859a1f3988e2503",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/gates/001-define/git.txt": {
+    "mtime": 1793797727.7691448,
+    "seen": 1794137672.5835407,
+    "ast_hash": "998591970d1b1f2ff99ff1239d7c59a3",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/gates/002-code/context.txt": {
+    "mtime": 1793797727.7697856,
+    "seen": 1794137672.5835454,
+    "ast_hash": "c0e25b5a27dc1ee34594d525d1aa973c",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/gates/002-code/env.txt": {
+    "mtime": 1793797727.770475,
+    "seen": 1794137672.5835474,
+    "ast_hash": "6d8044ca36c22ad5e8f10c9b12a7fb33",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/gates/002-code/git.txt": {
+    "mtime": 1793797727.770475,
+    "seen": 1794137672.5835488,
+    "ast_hash": "998591970d1b1f2ff99ff1239d7c59a3",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/gates/003-ship/context.txt": {
+    "mtime": 1793797727.7712507,
+    "seen": 1794137672.5835502,
+    "ast_hash": "5306510318bb5adbe44d84136c21703a",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/gates/003-ship/devflow/history/phase-01/1793620016071304144-0-REVIEW.md": {
+    "mtime": 1793797727.7730691,
+    "seen": 1794137672.5835514,
+    "ast_hash": "9c990b21975a1bab0c481c88a7a02dbb",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/gates/003-ship/devflow/history/phase-01/1793620108143675345-0-REVIEW.md": {
+    "mtime": 1793797727.7750692,
+    "seen": 1794137672.5835528,
+    "ast_hash": "9c990b21975a1bab0c481c88a7a02dbb",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/gates/003-ship/env.txt": {
+    "mtime": 1793797727.7820692,
+    "seen": 1794137672.5835543,
+    "ast_hash": "c0ba6a71ea7c1ae6803495fb8e93853b",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/gates/003-ship/git.txt": {
+    "mtime": 1793797727.7820692,
+    "seen": 1794137672.5835557,
+    "ast_hash": "c1bf2fb723dec879625939e0eca245b3",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/gates/004-ship/context.txt": {
+    "mtime": 1793797727.7834857,
+    "seen": 1794137672.583557,
+    "ast_hash": "6bcb86847ff5f323cad5bac60b86c7b3",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/gates/004-ship/devflow/history/phase-01/1793620016071304144-0-REVIEW.md": {
+    "mtime": 1793797727.7860692,
+    "seen": 1794137672.5835583,
+    "ast_hash": "9c990b21975a1bab0c481c88a7a02dbb",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/gates/004-ship/devflow/history/phase-01/1793620108143675345-0-REVIEW.md": {
+    "mtime": 1793797727.7860692,
+    "seen": 1794137672.58356,
+    "ast_hash": "9c990b21975a1bab0c481c88a7a02dbb",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/gates/004-ship/devflow/history/phase-01/1793620858527908780-0-REVIEW.md": {
+    "mtime": 1793797727.787069,
+    "seen": 1794137672.5835612,
+    "ast_hash": "b794ece1282d5513892a9d4e0b9a1c8f",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/gates/004-ship/env.txt": {
+    "mtime": 1793797727.797069,
+    "seen": 1794137672.5835626,
+    "ast_hash": "c0ba6a71ea7c1ae6803495fb8e93853b",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/gates/004-ship/git.txt": {
+    "mtime": 1793797727.797069,
+    "seen": 1794137672.583564,
+    "ast_hash": "23ea76e01ea8bddb58c27bdd9573997b",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/identity.txt": {
+    "mtime": 1793797727.797069,
+    "seen": 1794137672.5835655,
+    "ast_hash": "c0f346b37d5947f4de1accc4e57a7d26",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/prelaunch/auth-probe.txt": {
+    "mtime": 1793797727.798069,
+    "seen": 1794137672.5835671,
+    "ast_hash": "dcfcaae9d430ed32075ccb89628a475c",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/prelaunch/check-start.txt": {
+    "mtime": 1793797727.7988036,
+    "seen": 1794137672.5835686,
+    "ast_hash": "54456e25367b84f2921fe973a8c22434",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/prelaunch/check.txt": {
+    "mtime": 1793797727.7988036,
+    "seen": 1794137672.58357,
+    "ast_hash": "54456e25367b84f2921fe973a8c22434",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/prelaunch/fork-base.txt": {
+    "mtime": 1793797727.7988036,
+    "seen": 1794137672.5835712,
+    "ast_hash": "c28e8e29f6dad93d2bce6e1b973b95ba",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/prelaunch/gh-auth.txt": {
+    "mtime": 1793797727.7988036,
+    "seen": 1794137672.5835724,
+    "ast_hash": "fb36463f2b47280ee1bb5a4c890a793a",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/seam-checks.txt": {
+    "mtime": 1793797727.7988036,
+    "seen": 1794137672.583574,
+    "ast_hash": "d3588107d162ec38e92436f8556ae66b",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/supervisor/status.txt": {
+    "mtime": 1793797727.7990692,
+    "seen": 1794137672.5835752,
+    "ast_hash": "4788e8bfec5255e2d863a2092c17f524",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/surv/analysis.txt": {
+    "mtime": 1793797727.7990692,
+    "seen": 1794137672.5835767,
+    "ast_hash": "3d82cb65c9e04613cb2f8b7dc2cd6b0a",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/units.txt": {
+    "mtime": 1793797727.7998927,
+    "seen": 1794137672.583578,
+    "ast_hash": "fd3ac15f550169ce8c46b1826b026bfd",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/verdict-attempt-gate.txt": {
+    "mtime": 1793797727.7998927,
+    "seen": 1794137672.5835795,
+    "ast_hash": "b3eb418a391f9098fa04cac94846cfd0",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-1/verdict-attempt.txt": {
+    "mtime": 1793797727.7998927,
+    "seen": 1794137672.583581,
+    "ast_hash": "29e0ce63f934925819571c27e0db1879",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/collected/absent.txt": {
+    "mtime": 1793797727.8013566,
+    "seen": 1794137672.5835822,
+    "ast_hash": "d41d8cd98f00b204e9800998ecf8427e",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/collected/devflow/history/phase-01/1793645119873145349-0-REVIEW.md": {
+    "mtime": 1793797727.804069,
+    "seen": 1794137672.5835838,
+    "ast_hash": "83807355ce095c52950798f0eef4ced6",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/collected/devflow/history/phase-01/1793645595257523472-0-REVIEW.md": {
+    "mtime": 1793797727.805069,
+    "seen": 1794137672.583585,
+    "ast_hash": "83807355ce095c52950798f0eef4ced6",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/collected/devflow/history/phase-01/1793646199326976207-0-REVIEW.md": {
+    "mtime": 1793797727.8060691,
+    "seen": 1794137672.5835862,
+    "ast_hash": "7094487435a90bd7b813e98b7214ca7b",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/collected/devflow/history/phase-01/1793646283530531602-0-REVIEW.md": {
+    "mtime": 1793797727.810069,
+    "seen": 1794137672.5835876,
+    "ast_hash": "7094487435a90bd7b813e98b7214ca7b",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/collected/devflow/history/phase-01/1793647477822954641-0-REVIEW.md": {
+    "mtime": 1793797727.810069,
+    "seen": 1794137672.583589,
+    "ast_hash": "7094487435a90bd7b813e98b7214ca7b",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/collected/devflow/history/phase-01/1793647779531605788-0-REVIEW.md": {
+    "mtime": 1793797727.811069,
+    "seen": 1794137672.5835907,
+    "ast_hash": "e4cceb6226ee9c0e051b31c47f91b560",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/collected/devflow/history/phase-01/1793647861792709834-0-REVIEW.md": {
+    "mtime": 1793797727.813069,
+    "seen": 1794137672.5835922,
+    "ast_hash": "e4cceb6226ee9c0e051b31c47f91b560",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/collected/devflow/history/phase-01/1793647913587722565-0-REVIEW.md": {
+    "mtime": 1793797727.814069,
+    "seen": 1794137672.5835934,
+    "ast_hash": "e4cceb6226ee9c0e051b31c47f91b560",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/collected/git.txt": {
+    "mtime": 1793797727.8190691,
+    "seen": 1794137672.583595,
+    "ast_hash": "7f5ebc46da403b5ca81597570d75d324",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/deviations.txt": {
+    "mtime": 1793797727.8190691,
+    "seen": 1794137672.5835962,
+    "ast_hash": "eb24d23a827d6734267c17348281c03a",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/gates/001-define/context.txt": {
+    "mtime": 1793797727.820215,
+    "seen": 1794137672.583598,
+    "ast_hash": "cf6582f272a69f1cb87d6e24f8794bb5",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/gates/001-define/env.txt": {
+    "mtime": 1793797727.8203795,
+    "seen": 1794137672.583599,
+    "ast_hash": "bb03428877435e9cf859a1f3988e2503",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/gates/001-define/git.txt": {
+    "mtime": 1793797727.8203795,
+    "seen": 1794137672.5836003,
+    "ast_hash": "e4d398dcf1a62dff7950ea75bdb404bc",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/gates/002-code/context.txt": {
+    "mtime": 1793797727.8209422,
+    "seen": 1794137672.5836022,
+    "ast_hash": "c0e25b5a27dc1ee34594d525d1aa973c",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/gates/002-code/env.txt": {
+    "mtime": 1793797727.821678,
+    "seen": 1794137672.5836034,
+    "ast_hash": "6d8044ca36c22ad5e8f10c9b12a7fb33",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/gates/002-code/git.txt": {
+    "mtime": 1793797727.821678,
+    "seen": 1794137672.5836048,
+    "ast_hash": "e4d398dcf1a62dff7950ea75bdb404bc",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/gates/003-code/context.txt": {
+    "mtime": 1793797727.8222892,
+    "seen": 1794137672.583606,
+    "ast_hash": "c0e25b5a27dc1ee34594d525d1aa973c",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/gates/003-code/devflow/history/phase-01/1793645119873145349-0-REVIEW.md": {
+    "mtime": 1793797727.823069,
+    "seen": 1794137672.5836072,
+    "ast_hash": "83807355ce095c52950798f0eef4ced6",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/gates/003-code/env.txt": {
+    "mtime": 1793797727.824069,
+    "seen": 1794137672.5836086,
+    "ast_hash": "6d8044ca36c22ad5e8f10c9b12a7fb33",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/gates/003-code/git.txt": {
+    "mtime": 1793797727.824069,
+    "seen": 1794137672.5836096,
+    "ast_hash": "9e923f64c7f6f203081496b9c7f21869",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/gates/004-code/context.txt": {
+    "mtime": 1793797727.8253753,
+    "seen": 1794137672.5836108,
+    "ast_hash": "c0e25b5a27dc1ee34594d525d1aa973c",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/gates/004-code/devflow/history/phase-01/1793645119873145349-0-REVIEW.md": {
+    "mtime": 1793797727.826069,
+    "seen": 1794137672.5836124,
+    "ast_hash": "83807355ce095c52950798f0eef4ced6",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/gates/004-code/devflow/history/phase-01/1793645595257523472-0-REVIEW.md": {
+    "mtime": 1793797727.827069,
+    "seen": 1794137672.5836136,
+    "ast_hash": "83807355ce095c52950798f0eef4ced6",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/gates/004-code/devflow/history/phase-01/1793646199326976207-0-REVIEW.md": {
+    "mtime": 1793797727.827069,
+    "seen": 1794137672.583615,
+    "ast_hash": "7094487435a90bd7b813e98b7214ca7b",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/gates/004-code/devflow/history/phase-01/1793646283530531602-0-REVIEW.md": {
+    "mtime": 1793797727.830069,
+    "seen": 1794137672.5836163,
+    "ast_hash": "7094487435a90bd7b813e98b7214ca7b",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/gates/004-code/env.txt": {
+    "mtime": 1793797727.831069,
+    "seen": 1794137672.5836174,
+    "ast_hash": "6d8044ca36c22ad5e8f10c9b12a7fb33",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/gates/004-code/git.txt": {
+    "mtime": 1793797727.831069,
+    "seen": 1794137672.5836186,
+    "ast_hash": "80903018972e97a7349733ba623effe0",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/gates/005-ship/context.txt": {
+    "mtime": 1793797727.832069,
+    "seen": 1794137672.5836198,
+    "ast_hash": "6bcb86847ff5f323cad5bac60b86c7b3",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/gates/005-ship/devflow/history/phase-01/1793645119873145349-0-REVIEW.md": {
+    "mtime": 1793797727.835069,
+    "seen": 1794137672.5836213,
+    "ast_hash": "83807355ce095c52950798f0eef4ced6",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/gates/005-ship/devflow/history/phase-01/1793645595257523472-0-REVIEW.md": {
+    "mtime": 1793797727.835069,
+    "seen": 1794137672.583623,
+    "ast_hash": "83807355ce095c52950798f0eef4ced6",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/gates/005-ship/devflow/history/phase-01/1793646199326976207-0-REVIEW.md": {
+    "mtime": 1793797727.836069,
+    "seen": 1794137672.5836241,
+    "ast_hash": "7094487435a90bd7b813e98b7214ca7b",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/gates/005-ship/devflow/history/phase-01/1793646283530531602-0-REVIEW.md": {
+    "mtime": 1793797727.842069,
+    "seen": 1794137672.5836256,
+    "ast_hash": "7094487435a90bd7b813e98b7214ca7b",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/gates/005-ship/devflow/history/phase-01/1793647477822954641-0-REVIEW.md": {
+    "mtime": 1793797727.842069,
+    "seen": 1794137672.583627,
+    "ast_hash": "7094487435a90bd7b813e98b7214ca7b",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/gates/005-ship/devflow/history/phase-01/1793647779531605788-0-REVIEW.md": {
+    "mtime": 1793797727.843069,
+    "seen": 1794137672.5836282,
+    "ast_hash": "e4cceb6226ee9c0e051b31c47f91b560",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/gates/005-ship/devflow/history/phase-01/1793647861792709834-0-REVIEW.md": {
+    "mtime": 1793797727.8460689,
+    "seen": 1794137672.5836296,
+    "ast_hash": "e4cceb6226ee9c0e051b31c47f91b560",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/gates/005-ship/devflow/history/phase-01/1793647913587722565-0-REVIEW.md": {
+    "mtime": 1793797727.8460689,
+    "seen": 1794137672.5836308,
+    "ast_hash": "e4cceb6226ee9c0e051b31c47f91b560",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/gates/005-ship/env.txt": {
+    "mtime": 1793797727.850069,
+    "seen": 1794137672.5836322,
+    "ast_hash": "c0ba6a71ea7c1ae6803495fb8e93853b",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/gates/005-ship/git.txt": {
+    "mtime": 1793797727.851069,
+    "seen": 1794137672.5836334,
+    "ast_hash": "216bc2a6f63fde20eb7bb93694659da0",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/identity.txt": {
+    "mtime": 1793797727.851069,
+    "seen": 1794137672.5836346,
+    "ast_hash": "c26bea3cc577e97702b4284ee6ab6ef7",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/prelaunch/auth-probe.txt": {
+    "mtime": 1793797727.851069,
+    "seen": 1794137672.5836368,
+    "ast_hash": "0870f84fd535a4fbe8cebc7d16cd7d40",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/prelaunch/check-start.txt": {
+    "mtime": 1793797727.8520772,
+    "seen": 1794137672.583638,
+    "ast_hash": "54456e25367b84f2921fe973a8c22434",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/prelaunch/check.txt": {
+    "mtime": 1793797727.8520772,
+    "seen": 1794137672.5836394,
+    "ast_hash": "54456e25367b84f2921fe973a8c22434",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/prelaunch/fork-base.txt": {
+    "mtime": 1793797727.8520772,
+    "seen": 1794137672.5836406,
+    "ast_hash": "a076a863d9100899c3b175cdf2bfeb64",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/prelaunch/gh-auth.txt": {
+    "mtime": 1793797727.8520772,
+    "seen": 1794137672.5836418,
+    "ast_hash": "fb36463f2b47280ee1bb5a4c890a793a",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/seam-checks.txt": {
+    "mtime": 1793797727.8520772,
+    "seen": 1794137672.5836432,
+    "ast_hash": "988b96ba38e748be4896c3c2eafd15c3",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/supervisor/status.txt": {
+    "mtime": 1793797727.8520772,
+    "seen": 1794137672.5836444,
+    "ast_hash": "14dd1191e7cfdb5f102d7d98f1cb3fa6",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/surv/analysis.txt": {
+    "mtime": 1793797727.8520772,
+    "seen": 1794137672.583646,
+    "ast_hash": "27d553eb93a922ded42c1e31fa1dc43e",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/units.txt": {
+    "mtime": 1793797727.8531246,
+    "seen": 1794137672.5836473,
+    "ast_hash": "3ffab73df8bdacd940d29b32ed2c6570",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/verdict-attempt-gate.txt": {
+    "mtime": 1793797727.8531246,
+    "seen": 1794137672.5836484,
+    "ast_hash": "157a4830bcc58524d6808708fb707622",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/attempt-2/verdict-attempt.txt": {
+    "mtime": 1793797727.8531246,
+    "seen": 1794137672.58365,
+    "ast_hash": "4e50bb0595b64b31ed8a773e216b352f",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/fault-1/verdict-attempt-gate.txt": {
+    "mtime": 1793797727.855069,
+    "seen": 1794137672.5836513,
+    "ast_hash": "b3eb418a391f9098fa04cac94846cfd0",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/fault-1/verdict-fault.txt": {
+    "mtime": 1793797727.855069,
+    "seen": 1794137672.5836525,
+    "ast_hash": "8336567b111511c6313583ef1a7dedf6",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/fault-1/verdict-require-all.txt": {
+    "mtime": 1793797727.855069,
+    "seen": 1794137672.583654,
+    "ast_hash": "8336567b111511c6313583ef1a7dedf6",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/fault-2/verdict-attempt-gate.txt": {
+    "mtime": 1793797727.8561432,
+    "seen": 1794137672.583655,
+    "ast_hash": "157a4830bcc58524d6808708fb707622",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/fault-2/verdict-fault.txt": {
+    "mtime": 1793797727.8561432,
+    "seen": 1794137672.5836568,
+    "ast_hash": "e3a3fda188d3309e6036ce083d94c1f3",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-evidence/fault-2/verdict-require-all.txt": {
+    "mtime": 1793797727.8561432,
+    "seen": 1794137672.583658,
+    "ast_hash": "e3a3fda188d3309e6036ce083d94c1f3",
+    "semantic_hash": ""
+  },
+  ".planning/phases/50.1-split-lock-state-handling-overhaul/deferred-items.md": {
+    "mtime": 1793797727.8561432,
+    "seen": 1794137672.5836592,
+    "ast_hash": "f453372a4cb893ee875a0ec957566a24",
+    "semantic_hash": ""
+  },
+  ".planning/phases/51-rate-limit-agent-failover/51-CONTEXT.md": {
+    "mtime": 1793921687.8144476,
+    "seen": 1794137672.5836608,
+    "ast_hash": "c0dc8b50ae0b6187a7f87bfefd1fd15a",
+    "semantic_hash": ""
+  },
+  ".planning/phases/51-rate-limit-agent-failover/51-DISCUSSION-LOG.md": {
+    "mtime": 1793921707.5443904,
+    "seen": 1794137672.583662,
+    "ast_hash": "36256e46b5a5d20690dc978ff0212f10",
+    "semantic_hash": ""
+  },
+  ".planning/reviews/50.1-context-review-2026-10-23/SUMMARY.md": {
+    "mtime": 1793797727.858705,
+    "seen": 1794137672.5837994,
+    "ast_hash": "c0123a4467aae59a58a3e41d6e9af011",
+    "semantic_hash": ""
+  },
+  ".planning/reviews/50.1-context-review-2026-10-23/prompt.txt": {
+    "mtime": 1793797727.8591416,
+    "seen": 1794137672.5838008,
+    "ast_hash": "455c5838172f137a17bea6255b8ff3d3",
+    "semantic_hash": ""
+  },
+  ".planning/reviews/50.1-context-review-2026-10-23/review-agy.md": {
+    "mtime": 1793797727.8591416,
+    "seen": 1794137672.5838025,
+    "ast_hash": "73a5515485122f3cc10eb5a5530ca4f2",
+    "semantic_hash": ""
+  },
+  ".planning/reviews/50.1-context-review-2026-10-23/review-codex.md": {
+    "mtime": 1793797727.8591416,
+    "seen": 1794137672.5838037,
+    "ast_hash": "955611a62f3bd20191b257fea77722a4",
+    "semantic_hash": ""
+  },
+  ".planning/reviews/50.1-context-review-2026-10-23/review-pi.md": {
+    "mtime": 1793797727.860069,
+    "seen": 1794137672.5838048,
+    "ast_hash": "2d00376db8058f3aff9bef7bafdc4f64",
+    "semantic_hash": ""
+  },
+  ".opencode/package-lock.json": {
+    "mtime": 1788371018.6416762,
+    "seen": 1794137672.5839682,
+    "ast_hash": "bd46e01a9ce54a3f2bbc954132a8a4e6",
     "semantic_hash": ""
   }
 }
