@@ -1073,6 +1073,28 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.205: No Validate Loop-Back Plans Gap Closure, So a `gaps_found` Verification Cannot Be Closed by the Run (BACKLOG)
+
+**Found:** 2026-11-08, Phase 51, second Validate loop-back. DevFlow issued `/gsd-execute-phase 51 --auto` (`FullExecute`,
+as in 999.192). All 13 plans were already complete, so execute-phase ran only its verify tail: code review, regression
+gate, and the verifier. The verifier again reported `gaps_found` (`7095b38`), this time a docs over-promise from the
+torn-line fix. `verification.status` routes that to `/gsd-plan-phase 51 --gaps`.
+
+**The defect:** `fix_prompt` (`crates/devflow-core/src/prompt.rs`) has three arms: `AuditFix`, `GapsOnly` and
+`FullExecute`. None runs `/gsd-plan-phase {N} --gaps`, which is the only GSD step that writes the `gap_closure: true`
+plans `--gaps-only` selects. A complete phase whose verifier finds a gap therefore loops through one of two dead ends:
+- `FullExecute` re-verifies the unchanged code and finds the same class of gap.
+- `GapsOnly` matches zero plans (the mid-arc failure 999.65 described).
+
+Neither can change the code, so each round only re-verifies it. Fixing 999.192 alone would swap the first dead end for
+the second.
+
+**Not established:** whether a Validate verdict ever reaches `GapsOnly` with gap plans on disk in a real run.
+
+**Fix shape (not decided):** when the evidence root's `{N}-VERIFICATION.md` says `gaps_found` and its route is
+`plan-phase`, loop back through `/gsd-plan-phase {N} --gaps` and then `/gsd-execute-phase {N} --gaps-only`. Or stop at a
+gate that names that route, rather than re-running execute-phase. Relates to 999.192 and 999.193.
+
 ### Phase 999.204: Phase 51 Failover Tests Miss a Non-Claude Primary, a Real Gate-Context Render, and a Failed Relaunch One Short of the Infra Ceiling (BACKLOG)
 
 **Found:** 2026-11-08, Phase 51 external adversarial review (DeepSeek lane), `51-EXTERNAL-CODE-REVIEW.md` "Suspected".
