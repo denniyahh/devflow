@@ -344,6 +344,17 @@ fn set_aside_leftover_gates(
     }
 }
 
+/// Where `start` takes the run's rate-limit fallback agent from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FallbackSource {
+    /// `devflow start`: the `--fallback-agent` flag when given, else
+    /// `devflow.toml`'s `fallback_agent` key (R-3).
+    FlagOrConfig(Option<AgentKind>),
+    /// `devflow parallel`, which takes no `--fallback-agent`: no fallback, and
+    /// `devflow.toml`'s key is not read (the key is read by `devflow start` only).
+    NoFallback,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start(
     project_root: &Path,
@@ -356,7 +367,7 @@ pub(crate) fn start(
     until: Option<Stage>,
     yes_ship: bool,
     legacy_claude_launch: bool,
-    fallback_agent: Option<AgentKind>,
+    fallback: FallbackSource,
 ) -> Result<(), CliError> {
     // 999.78/A-11: NOT a bare `State::new`. See
     // `fresh_state_carrying_phase_failures` for why one field survives a
@@ -406,10 +417,19 @@ pub(crate) fn start(
     // absent. Resolved unconditionally, also when the flag is given, so a broken
     // key refuses `start` whatever the flag says: the flag wins the value, it does
     // not excuse a broken config file (stricter than `base_branch`, whose env
-    // override skips the file).
-    let config_fallback = config::fallback_agent(project_root).map_err(CliError::Message)?;
-    let from_config = fallback_agent.is_none() && config_fallback.is_some();
-    let fallback_agent = fallback_agent.or(config_fallback);
+    // override skips the file). `devflow parallel` passes `NoFallback` and reads
+    // no key: it has no flag to override one with.
+    let (fallback_agent, from_config) = match fallback {
+        FallbackSource::FlagOrConfig(flag) => {
+            let config_fallback =
+                config::fallback_agent(project_root).map_err(CliError::Message)?;
+            (
+                flag.or(config_fallback),
+                flag.is_none() && config_fallback.is_some(),
+            )
+        }
+        FallbackSource::NoFallback => (None, false),
+    };
 
     // D-01, D-02, D-03: the fallback is checked against the state as combined above
     // (agent, mode, legacy opt-out) and set before `dry_run`, the holder and the
@@ -15496,7 +15516,7 @@ mod tests {
             None,
             false,
             true,
-            None,
+            FallbackSource::FlagOrConfig(None),
         )
         .map_err(|err| err.to_string())
     }
@@ -15580,7 +15600,17 @@ mod tests {
         fallback: Option<AgentKind>,
     ) -> Result<(), CliError> {
         start(
-            root, phase, agent, mode, false, false, false, None, false, true, fallback,
+            root,
+            phase,
+            agent,
+            mode,
+            false,
+            false,
+            false,
+            None,
+            false,
+            true,
+            FallbackSource::FlagOrConfig(fallback),
         )
     }
 
@@ -16032,7 +16062,7 @@ mod tests {
             None,
             false,
             true,
-            None,
+            FallbackSource::FlagOrConfig(None),
         )
         .map_err(|err| err.to_string())
     }
@@ -16638,7 +16668,7 @@ mod tests {
             None,
             false,
             true,
-            None,
+            FallbackSource::FlagOrConfig(None),
         )
         .map_err(|err| err.to_string())
     }
@@ -18304,7 +18334,7 @@ mod tests {
                 None,
                 false,
                 true,
-                None,
+                FallbackSource::FlagOrConfig(None),
             )
             .expect_err("a stop at a safe point during the gate wait is an error")
             .to_string();

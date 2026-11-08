@@ -370,3 +370,52 @@ fn a_valid_flag_does_not_mask_an_invalid_config_key() {
         }
     }
 }
+
+/// `devflow parallel` takes no `--fallback-agent` and does not read the key:
+/// a key equal to the phase's agent, which refuses `start`, neither refuses
+/// `parallel` nor arms a fallback, and the launched run saves none.
+#[test]
+fn parallel_ignores_the_config_key() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    let phase = PhaseId::new(5158);
+    init_repo(&root, phase);
+    fs::write(root.join("devflow.toml"), "fallback_agent = \"claude\"\n").unwrap();
+    let fake = stub_dir(&[("claude", WAITING_CLAUDE)]);
+    let _reaper = common::LaunchedRunReaper::new(&root, phase, vec![]);
+    let state_path = devflow_core::workflow::state_path(&root, phase);
+
+    let host_path = std::env::var_os("PATH").unwrap_or_default();
+    let path = format!("{}:{}", fake.path.display(), host_path.to_string_lossy());
+    let output = common::hermetic_devflow(&home)
+        .args([
+            "parallel",
+            "--phases",
+            &phase.to_string(),
+            "--agents",
+            "claude",
+            "--mode",
+            "supervise",
+        ])
+        .arg(&root)
+        .current_dir(&root)
+        .env("PATH", path)
+        .output()
+        .expect("run devflow parallel");
+
+    assert_success(&output, "a parallel launch with the key set");
+    let printed = stdout(&output);
+    assert!(
+        !printed.contains("fallback agent"),
+        "parallel arms no fallback\nstdout: {printed}"
+    );
+    let saved: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&fs::read_to_string(&state_path).expect("parallel saved the state"))
+            .expect("the state is a JSON object");
+    assert_eq!(
+        saved["fallback_agent"],
+        serde_json::Value::Null,
+        "the parallel run carries no fallback: {saved:?}"
+    );
+}
