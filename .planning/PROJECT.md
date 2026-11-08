@@ -423,6 +423,16 @@ version is still derived automatically from conventional-commit classification a
   tests only; the checkpoint detector the run relied on is replaced in Phase 49.1 (CR-01), which
   is unmeasured live unless 49.1 re-runs; notify follow-ups in backlog 999.154, tooling hardening
   in 999.152.
+- ✓ **SUPV-02** (#180) — a Code-stage rate limit hands the same stage to a configured fallback agent
+  (`--fallback-agent` or `devflow.toml` `fallback_agent`) in the same worktree and branch, with no
+  reset, stash or rebase; the fallback reruns the delivery canary and gets no primary session id. A
+  refused handoff takes the rate-limit cron arm; a relaunch that fails after the handoff commit ends
+  at a gate. Folded in: idle-timeout failures keep their cause (999.102), a torn capture line is never
+  read as a rate limit (999.71), notify follow-ups (999.154). Verified 114/114 on 2026-11-08 — Phase
+  51, milestone v3.0.0. **Closure limits:** tests and fixtures only, no live failover run (the dogfood run hit a
+  real rate limit with no fallback configured, 999.186); Plan-stage
+  continuation was dropped from scope; open follow-ups in backlog 999.183-187 (999.186: nothing acts
+  on the cron instructions yet; 999.187: an ordinary in-supervisor launch failure ends ungated).
 
 ### Partially delivered
 
@@ -446,7 +456,6 @@ seven of the ten (#174, #204, #206, 999.115, 999.116, 999.118, #200), plus 999.1
 999.38 promoted into Phase 48; those moved to Validated.
 
 - [ ] Monitor liveness is answerable without a PID — GONE / STALE / ALIVE (#185)
-- [ ] Token exhaustion continues the run under a fallback agent (#180)
 
 Carried-forward follow-ups NOT in this milestone (backlog): **999.120** (one residual ambient
 `git_flow_for_project` re-resolution in the Validate loop-back), **999.121** (OpenCode has no
@@ -615,6 +624,8 @@ Research skipped by operator decision — every item is a verified defect in thi
 known fix direction, and the #185 socket design is already spike-proven.*
 
 ---
+*Last updated: 2026-11-08 after Phase 51 (Rate-Limit Agent Failover) — 13/13 plans (51-08 dropped by operator ruling); verification passed 114/114. A Code-stage rate limit continues under the configured fallback agent; SUPV-02 validated. Last phase of v3.0.0; no live failover run yet. Backlog 999.183-187 holds what stays open.*
+
 *Last updated: 2026-11-02 after Phase 50.1 (Split-Lock State-Handling Overhaul) — 30/30 plans; verification passed 12/12. Every state write takes one short lock and is durable, and a gate answer decides only the gate it names. SUPV-03, SUPV-04, SUPV-05, SURV-03 and SURV-04 validated. Live attempt 2 shipped on the final production source but was not unattended: the operator answered two extra Code gates. Backlog 999.172-177 holds what stays open, including 999.175 and 999.176, which can stop a headless run short of Ship.*
 
 *Last updated: 2026-10-09 after Phase 49 (Live Unattended Run) — 12/12 plans; verification passed
