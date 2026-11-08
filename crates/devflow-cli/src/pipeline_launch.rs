@@ -664,7 +664,9 @@ pub(crate) fn recorded_canary_refusal(state: &State) -> Option<String> {
 /// stage again after a handoff. Keeping the record lets the failover's never-silent
 /// end (the infra gate, or the abort at the infra ceiling) be written by the
 /// supervisor the state records, which then waits at the gate as the run's owner. The
-/// exemption lasts for the failover relaunch alone: a launch the gate's answer starts
+/// exemption lasts for the failover relaunch's `launch_stage` call. That call includes
+/// `run_preflight`, so a preflight gate opened inside it, and the launch that gate's
+/// answer starts, keep the record too. A launch the failover's own infra gate starts
 /// later runs unguarded and clears the record on failure as WR-04 says.
 fn refuse_launch(state: &mut State, message: String) -> Result<(), CliError> {
     if !in_failover_relaunch() {
@@ -2084,9 +2086,11 @@ pub(crate) fn launch_context() -> Result<monitor::LaunchContext, CliError> {
 /// relaunch runs the same stage again after a handoff. Keeping the record lets the
 /// failover's never-silent end (the infra gate, or the abort at the infra ceiling) be
 /// written by the supervisor the state records, which then waits at the gate as the
-/// run's owner. The exemption lasts for the failover relaunch alone: a launch the
-/// gate's answer starts later runs unguarded and clears the record on failure as
-/// WR-04 says.
+/// run's owner. The exemption lasts for the failover relaunch's `launch_stage` call.
+/// That call includes `run_preflight`, so a preflight gate opened inside it, and the
+/// launch that gate's answer starts, keep the record too. A launch the failover's own
+/// infra gate starts later runs unguarded and clears the record on failure as WR-04
+/// says.
 ///
 /// Called only on a failure path, never before the save that records a new
 /// record (50-13's rule).
@@ -2115,7 +2119,8 @@ thread_local! {
 /// set). While it is engaged, [`refuse_launch`] and [`record_failed_launch`] keep
 /// `state.supervisor`, so the never-silent end that follows a failed relaunch is a
 /// set of owned writes by the supervisor the state records (Phase 50 D-03 unchanged).
-/// Engaged only around the `launch_stage` call in [`fail_over_on_rate_limit`].
+/// Engaged only around the `launch_stage` call in [`fail_over_on_rate_limit`], which
+/// includes its `run_preflight` and any launch a preflight gate's answer starts there.
 struct FailoverRelaunchGuard {
     /// Keeps the guard on the thread whose flag it set.
     _not_send: std::marker::PhantomData<*const ()>,
