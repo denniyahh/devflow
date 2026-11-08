@@ -1073,6 +1073,128 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.204: Phase 51 Failover Tests Miss a Non-Claude Primary, a Real Gate-Context Render, and a Failed Relaunch One Short of the Infra Ceiling (BACKLOG)
+
+**Found:** 2026-11-08, Phase 51 external adversarial review (DeepSeek lane), `51-EXTERNAL-CODE-REVIEW.md` "Suspected".
+
+**The gap:** no hop test starts from a non-Claude primary; the idle-timeout gate-context test composes its own rendering
+instead of asserting on the production render; no test drives a failed fallback relaunch at `MAX_INFRA_FAILURES - 1`
+(where the next failure aborts rather than gates).
+
+**Not established:** that any of the three paths is broken; only that no test would catch it.
+
+**Fix shape:** three tests, each with a planted mutation that must fail it. Take with the next failover fix branch.
+
+### Phase 999.203: The SUPV-01 Evidence Checker Accepts Stale Line Citations (BACKLOG)
+
+**Found:** 2026-11-08, Phase 51 external adversarial review (DeepSeek lane, X-04). `51-SUPV01-EVIDENCE.md` cited
+`pipeline_launch.rs` lines off by +26 (a cited line was a doc comment) and the checker passed it.
+
+**The defect:** the checker (`pipeline_launch::tests::the_supv01_evidence_trace_rows_are_complete` and
+`...::the_supv01_evidence_is_complete`, both `#[ignore]`d, run with `--run-ignored only`) checks only that each cited
+file exists, the line number is within the file, the name appears somewhere in the file's non-test code, and each cited
+test is declared. It never checks what the cited line holds, so it passed on the stale citations. 39 of 52 citations
+were re-derived at `b94d356` in the Phase 51 fix round; nothing stops them drifting again.
+
+**Fix shape:** cite by symbol (or symbol + line) and have the checker assert the named symbol is on the cited line, with
+a planted off-by-N citation as a failing control. Phase 52.
+
+### Phase 999.202: `devflow status` Shows Nothing About an Armed or Spent Fallback Agent (BACKLOG — enhancement)
+
+**Found:** 2026-11-08, Phase 51 external adversarial review (DeepSeek lane). `fallback_agent` / `fallback_consumed` in
+state have no reader outside the failover path, so an operator cannot tell from `status` whether a fallback is armed or
+already used. Adjacent to 999.190 (status never shows `stop_reason`).
+
+**Fix shape:** one `status` line, e.g. `fallback: antigravity (armed)` / `(used)`; take together with 999.190.
+
+### Phase 999.201: A Stream `result` With `subtype: error_rate_limit` Is Classified Failed, Not RateLimited (BACKLOG — suspected)
+
+**Found:** 2026-11-08, Phase 51 external adversarial review (codex lane, with a parser probe). The same result line
+returns `RateLimited` as a single document but `Failed` once a stream init event precedes it: the stream path reads
+only `rate_limit_event`. Failover requires `RateLimited`, so such a Code run would gate instead of failing over.
+
+**Not established:** whether any current Claude CLI emits that shape in stream mode. The parser inconsistency is
+reproduced; a live occurrence is not.
+
+**Fix shape:** recognise the authoritative quota fields on a top-level stream `result` before generic error
+classification; keep the single-document/stream pair as a regression test. Next failover fix branch.
+
+### Phase 999.200: A Hanging Fallback Health Check Can Park the Handoff Indefinitely (BACKLOG — suspected)
+
+**Found:** 2026-11-08, Phase 51 external adversarial review (codex lane). `hand_off_agent` calls the fallback driver's
+`health()` synchronously; pi's health runs `pi auth check --no-refresh` via `.output()` with no deadline. If it hangs,
+no refusal event is written and no cron recovery runs.
+
+**Not established:** no forced-hang experiment was run; the call path was read, not exercised.
+
+**Fix shape:** bound the health-check process (deadline, kill the process group), turn expiry into a named handoff
+refusal, and test that it reaches the cron arm. Next failover fix branch.
+
+### Phase 999.199: doc_check's Removed-Verb Guard Is Bypassed by an Escaped String Literal (BACKLOG)
+
+**Found:** 2026-11-08, Phase 51 external adversarial review (codex lane, probe). `string_literal_value`
+(`doc_check.rs`) strips quotes without decoding Rust escapes, so `#[command(alias = "\x6e")]` yields zero findings
+while Clap accepts `n`.
+
+**Not established:** low real-world risk (needs a deliberate obfuscation); the bypass itself is reproduced.
+
+**Fix shape:** decode escapes before comparing, or assert against the built Clap command; add the escaped alias as a
+planted failing control.
+
+### Phase 999.198: A Missing Fallback Binary Is Reported Without the `--fallback-agent` Prefix (BACKLOG)
+
+**Found:** 2026-11-08, Phase 51 external adversarial review (antigravity lane). `validate_fallback_agent`
+(`preflight.rs`) calls `ensure_agent_binary` unmapped, so the operator sees "agent binary `opencode` not found" and may
+think the primary `--agent` failed. Every other fallback refusal names `--fallback-agent`. Related: a `devflow.toml`
+key's refusal cites the CLI flag `--fallback-agent` though the operator used the config key.
+
+**Fix shape:** map the error with the `--fallback-agent <name>` prefix (and name the config key when it came from
+`devflow.toml`); assert the text in a test.
+
+### Phase 999.197: `resume --agent X --fallback-agent Y` Commits State Twice (BACKLOG)
+
+**Found:** 2026-11-08, Phase 51 external adversarial review (antigravity and DeepSeek lanes). `hand_off_agent` commits
+`agent = X`, then `resume_loaded` commits the new fallback. A kill between the two can leave `agent == fallback_agent`
+with `fallback_consumed = false`; the next plain `resume` is then refused.
+
+**Not established:** never observed. Recoverable: the refusal names the way out (`--fallback-agent <other>`), so the
+lane's "permanently unresumable" is overstated.
+
+**Fix shape:** apply the agent switch and the fallback re-arm in one state commit.
+
+### Phase 999.196: The Single-Document Rate-Limit Classifier Matches Nested Fields, Against OPERATIONS.md's Top-Level-Only Promise (BACKLOG)
+
+**Found:** 2026-11-08, Phase 51 external adversarial review (codex lane, probe). OPERATIONS.md (rate-limit section)
+says only top-level events decide a rate limit. The single-document classifier (`agent_result.rs`, `json_has_*` via the
+recursive `json_scan`) matches a nested `"tool_result":{"status_code":429}` and a quota result carrying
+`parent_tool_use_id`. With Phase 51 this can consume the run's only fallback on a subagent's evidence.
+
+**Not established:** pre-existing code (2026-07/08); it affects single-document captures only, not the stream launches
+DevFlow uses for Claude today.
+
+**Fix shape:** check envelope provenance and only the supported top-level quota fields; probe pair as a regression test.
+
+### Phase 999.195: `capture_shows_rate_limit_denial` Has No Production Caller and Gives the Two-Valued Answer D-16 Replaced (BACKLOG)
+
+**Found:** 2026-11-08, Phase 51 external adversarial review (DeepSeek lane). After Phase 51 the `pub fn` in
+`agent_result.rs` is called only by its own tests, and keeps a second notion of "is this a rate limit" beside
+`capture_rate_limit_denial`.
+
+**Fix shape:** remove it, or make it a thin wrapper over the three-valued function. It is `pub` in the published
+`devflow-core`, so removal is a semver change: deprecate first or batch with the next major.
+
+### Phase 999.194: After the Delivery Canary Refuses an Agent, Nothing Can Re-Run It for the Same Agent (BACKLOG)
+
+**Found:** 2026-11-08, Phase 51 external adversarial review (DeepSeek lane, X-02). A recorded canary refusal is cleared
+only by an agent handoff (`hand_off_agent` sets `canary = None`). `resume --agent <current agent>` is a silent no-op
+(no branch for `requested == state.agent`). So after a transient canary failure the only ways on are switching agents
+or hand-editing `.devflow/` state; the Phase 51 remedy text points at `--agent <other>`.
+
+**Not established:** never hit live; read from source.
+
+**Fix shape:** a deliberate "re-check the canary" route (e.g. `resume --recheck-canary`, or treat `--agent <same>` as
+an explicit re-check), and make `--agent <same>` say what it did instead of nothing. Operator to choose fix timing.
+
 ### Phase 999.193: The Validate Gate Says "Validation Passed — Approve to Ship?" While the Phase's Verification Reports `gaps_found` (BACKLOG)
 
 **Found:** 2026-11-08, Phase 51 re-validate after the review fix round. The Code stage's `/gsd-execute-phase` re-ran the
