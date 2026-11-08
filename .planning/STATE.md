@@ -5,17 +5,17 @@ milestone_name: milestone (ACTIVE — Unattended Run Survivability)
 current_phase: 51
 current_phase_name: Rate-Limit Agent Failover
 current_plan: 13
-status: executing
-stopped_at: Completed 51-13-PLAN.md
-last_updated: "2026-11-08T00:00:36.274Z"
+status: verifying
+stopped_at: Completed 51-11-PLAN.md
+last_updated: "2026-11-08T00:28:44.467Z"
 last_activity: 2026-11-06
 last_activity_desc: Phase 51 execution started
-state_head: 9166f1f8fc52ee73cf16c8cc1578809a6bcc0690
+state_head: b6e47f38a118dc58cb7dbdc6f7f456dba1d8e5a8
 progress:
   total_phases: 7
   completed_phases: 5
   total_plans: 120
-  completed_plans: 119
+  completed_plans: 120
   percent: 71
 ---
 
@@ -174,8 +174,8 @@ Phase: 51 (Rate-Limit Agent Failover) — EXECUTING
 Plans: 13 (51-01 … 51-14, no 51-08; 8 waves)
 Current Plan: 13
 Total Plans in Phase: 13
-Completed Plans: 12 of 13
-Status: Ready to execute
+Completed Plans: 13 of 13
+Status: Phase complete — ready for verification
 Previous phase: 50.1 — complete, 30/30 plans; verification passed 12/12 (one operator override, the live-run criterion); merged via PR #229; released in v3.0.0. Phase 47's verification still reads `stale` by operator decision (re-verify near milestone close).
 Last activity: 2026-11-06 — Phase 51 execution started
 
@@ -854,6 +854,8 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 51]: 51-10: the SUPV-01 trace adds live_holder, remove_abandoned_waiters and sweep_entry as gap rows; the ordinary path's missing cause record extends 51-06 backlog finding 2 (one 999.x entry for both)
 - [Phase 51]: 51-13: the post-save probe seam answers Gone (R2-8); its error arm returns the healthy branch's true and is recorded as settled by reading (pipeline_launch.rs:2555-2560), with no test
 - [Phase 51]: 51-13: criterion 3 rests on six experiments plus stated gaps; failover and an ordinary launch, and a cron resume and an ordinary resume, dispose every withheld read identically; only a failed ordinary in-supervisor launch is left ungated (backlog, with 51-06/51-10)
+- [Phase 51]: 51-11: the rate-limit failover is documented in a new OPERATIONS.md section (events, gate, 51-06 remedy, idle-timeout wording), pinned row-by-row by doc_check::operations_md_documents_the_fallback_agent_and_its_events
+- [Phase 51]: 51-11: the notify limit sentence (999.154) is reworded to WR-12's fixed behaviour — the gate reloads the state file when it opens
 
 ## Roadmap Evolution
 
@@ -963,11 +965,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 51 P12 | 5 min | 2 tasks | 1 files |
 | Phase 51 P10 | 26 min | 3 tasks | 4 files |
 | Phase 51 P13 | 20 min | 3 tasks | 3 files |
+| Phase 51 P11 | 25 min | 2 tasks | 5 files |
 
 ## Session
 
-**Last session:** 2026-11-08T00:00:32.281Z
-**Stopped at:** Completed 51-13-PLAN.md
+**Last session:** 2026-11-08T00:28:41.989Z
+**Stopped at:** Completed 51-11-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps

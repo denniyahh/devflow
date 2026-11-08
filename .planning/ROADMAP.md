@@ -649,7 +649,7 @@ be re-tested here rather than inherited from the issue's original design.
      rebase handoff were all removed (D-11, 23d) and none is reintroduced. Counted over source with
      comments stripped, since a grep over raw source counts comment prose (the Phase 35-01 lesson).
 
-**Plans**: 12/13 plans executed (8 waves)
+**Plans**: 13/13 plans executed (8 waves)
 
 Plans:
 **Wave 1**
@@ -687,7 +687,7 @@ Plans:
 
 **Wave 8** *(blocked on Wave 7 completion)*
 
-- [ ] 51-11-PLAN.md — Operator docs for the fallback surface and the `devflow.toml` key, and the full phase check suite (wave 8)
+- [x] 51-11-PLAN.md — Operator docs for the fallback surface and the `devflow.toml` key, and the full phase check suite (wave 8)
 
 *51-08 (D-09 Plan half) was dropped by operator ruling R-2 (2026-11-05): failover is Code-only.*
 
@@ -845,7 +845,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 49 | 12/12 | In Progress|  |
 | 50 | 29/29 | Complete | 2026-10-21 |
 | 50.1 | 30/30 | In Progress | — |
-| 51 | 12/13 | In Progress | — |
+| 51 | 13/13 | In Progress | — |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
 

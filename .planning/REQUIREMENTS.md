@@ -154,7 +154,7 @@ The unattended merit-based decision policy DECN-01 shipped half-delivered in v2.
       live in the project tree; store its path in `state.json` and prefer `~/.cache/devflow/` over
       `$XDG_RUNTIME_DIR`, which systemd deletes at logout.
 
-- [ ] **SUPV-02**: An agent that exhausts its token budget mid-stage continues under a configured
+- [x] **SUPV-02**: An agent that exhausts its token budget mid-stage continues under a configured
       fallback agent, in the same worktree on the same branch, with no manual conflict resolution.
       *Traces to #180.* **The issue's "What exists today" is stale** — the `n` verb, `git.rebase_in`
       and the rebase handoff were all removed (D-11, 23d); zero occurrences remain. Detection is
@@ -266,7 +266,7 @@ Populated during roadmap creation (2026-09-03). Wave order is load-bearing — s
 | SUPV-05 | Phase 50.1 — Split-Lock State-Handling Overhaul | 4 (after 50) | Complete |
 | SURV-03 | Phase 50.1 — Split-Lock State-Handling Overhaul | 4 (after 50) | Complete |
 | SURV-04 | Phase 50.1 — Split-Lock State-Handling Overhaul | 4 (after 50) | Complete |
-| SUPV-02 | Phase 51 — Rate-Limit Agent Failover | 5 | Pending |
+| SUPV-02 | Phase 51 — Rate-Limit Agent Failover | 5 | Complete |
 
 **Coverage:**
 
