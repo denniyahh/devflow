@@ -1073,6 +1073,17 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.211: README and OPERATIONS.md Describe Rate-Limit Detection and the One-Hop Rule Loosely (BACKLOG)
+
+**Found:** 2026-11-08, graphify review of PR #234 (triage: `.planning/audits/2026-11-08-graphify-review-triage-pr234.md`).
+README.md's "Rate-limit detection: if an agent's stdout contains rate-limit messages (429)" (pre-Phase-51 wording) does not
+describe the classifier: the Claude stream path reads only a top-level `rate_limit_event` whose `rate_limit_info.status`
+is `rejected` (the Agent SDK's documented denial value); the single-document path scans fields (999.196). OPERATIONS.md's
+"The hop happens once per run" sits beside the re-arm verb that makes it more than once.
+
+**Fix shape:** rewrite the README sentence to name what each launch shape reads, linking OPERATIONS.md; say "once per arming"
+in OPERATIONS.md. Docs only; next fix branch.
+
 ### Phase 999.210: A Supervise Run Has No Way to End at Validate for a By-Hand Close-Out Except "Abort" (BACKLOG)
 
 **Found:** 2026-11-08, Phase 51 dogfood, Validate gate `18e6310585119d8e` ("Validation passed — approve to ship?").
