@@ -1073,6 +1073,29 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.208: A Code Re-Run After an Out-of-Band Fix Cannot Re-Verify a `gaps_found` Report (BACKLOG)
+
+**Found:** 2026-11-08, Phase 51, Code re-run after the third fix round (exception 3 in `51-RUN-NOTES.md`). The
+operator answered the Code failure gate expecting Code to "re-run its verify tail". DevFlow issued
+`/gsd-execute-phase 51 --auto`. All 13 plans were summarized, and `51-VERIFICATION.md` (from `7095b38`) still read
+`gaps_found`, even though the fix commits `ff649ff`..`744739a` had changed seven of its covered files (OPERATIONS.md,
+commands.rs, pipeline_launch.rs, pipeline_outcomes.rs, failover_e2e.rs, agent_result.rs, monitor.rs).
+
+**The defect:** `readVerificationStatus` in gsd-core (`bin/lib/verification.cjs`, "gaps_found takes priority over
+stale") returns `gaps_found` before it runs the covered-digest check. So `verification status` routes to
+`/gsd-plan-phase 51 --gaps`, not `execute-phase`. execute-phase's all-plans-summarized branch then exits without
+running code review, the regression gate or the verifier. A gap fixed outside a plan can therefore never be
+re-verified by a DevFlow stage: Code exits with nothing done, and every gate answer repeats that. This corrects
+999.205's claim that `FullExecute` "re-verifies the unchanged code". That held for the earlier loop-back, but not when
+the report already says `gaps_found`.
+
+**Not established:** whether the gap the report names (OPERATIONS.md over-promising the torn-line fix) is closed by
+`ff649ff`. No verifier has run since.
+
+**Fix shape (not decided):** in DevFlow, when the report is `gaps_found` and its digest no longer matches, route Code to
+a re-verify step rather than to `FullExecute`. Or raise upstream that a report whose covered inputs changed should read
+`stale` even when its status is `gaps_found`. Relates to 999.192, 999.205.
+
 ### Phase 999.207: A Quota Denial Followed by a Line the Agent Was Killed Mid-Way Through Still Splits the Monitor and the Verdict (BACKLOG)
 
 **Found:** 2026-11-08, Phase 51 Code-stage re-review (51-REVIEW.md WR-02 at `7095b38`), confirmed against source.
