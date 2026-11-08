@@ -417,8 +417,9 @@ pub(crate) fn start(
     // absent. Resolved unconditionally, also when the flag is given, so a broken
     // key refuses `start` whatever the flag says: the flag wins the value, it does
     // not excuse a broken config file (stricter than `base_branch`, whose env
-    // override skips the file). `devflow parallel` passes `NoFallback` and reads
-    // no key: it has no flag to override one with.
+    // override skips the file). `devflow parallel` passes `NoFallback`: it has no
+    // flag to override the key with, so it arms none, and checks and names the key
+    // itself before it launches anything.
     let (fallback_agent, from_config) = match fallback {
         FallbackSource::FlagOrConfig(flag) => {
             let config_fallback =
