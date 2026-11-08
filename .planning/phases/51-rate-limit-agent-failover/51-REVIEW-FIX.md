@@ -26,7 +26,7 @@ review-fix worktree was created.
 
 ## Fixed Issues
 
-### WR-01: `devflow parallel` arms `devflow.toml`'s `fallback_agent`
+### WR-01: `devflow parallel` arms `devflow.toml`'s `fallback_agent`, contradicting its comment, and its refusal names a flag `parallel` lacks
 
 **Files modified:** `crates/devflow-cli/src/commands.rs`, `crates/devflow-cli/src/main.rs`,
 `crates/devflow-cli/src/parallel.rs`, `crates/devflow-cli/tests/fallback_agent_config.rs`
@@ -42,7 +42,7 @@ fallback line is printed, and that the saved state has `fallback_agent: null`.
 **Negative control:** with `parallel` passing `FlagOrConfig(None)`, the test fails with
 `devflow.toml's fallback_agent (claude) is refused: ...`.
 
-### WR-02: A retry answer at the failed-canary gate ends the run with no gate (closes the gate-answer entry point of 999.187)
+### WR-02: The never-silent gate after a canary-refused failover offers retry and loop options that end the run with no gate (999.187, made reachable by this phase)
 
 **Files modified:** `crates/devflow-cli/src/pipeline_launch.rs`,
 `crates/devflow-cli/src/pipeline_outcomes.rs`, `crates/devflow-cli/tests/failover_e2e.rs`,
@@ -85,7 +85,7 @@ never publishes. A gate answer whose relaunch fails for another reason, such as 
 error or a spawn failure, also still clears the record and ends the run silently. ROADMAP.md was
 not edited.
 
-### IN-01: The failover guard also covers `run_preflight`'s gate, contrary to its doc comments
+### IN-01: The failover guard also covers `run_preflight`'s own gate and the relaunch its answer starts, contrary to its doc comments
 
 **Files modified:** `crates/devflow-cli/src/pipeline_launch.rs`
 **Commit:** 982d443
@@ -96,7 +96,7 @@ opened there, and the launch its answer starts, keep the record. A launch starte
 failover's own infra gate runs unguarded. The claim was checked against `preflight.rs`: its
 gate arms call `launch_stage_inner` and `launch_stage`.
 
-### IN-02: The `devflow.toml` key parses agent names more strictly than the flag
+### IN-02: The `devflow.toml` key parses agent names more strictly than the `--fallback-agent` flag
 
 **Files modified:** `crates/devflow-core/src/config.rs`
 **Commit:** cd35c7a
@@ -109,7 +109,7 @@ signature of `config::fallback_agent` did not.
 **Negative control:** parsing with serde fails the test with
 `unknown variant \`Codex\``.
 
-### IN-03: An unparseable `devflow.toml` is reported as a `fallback_agent` problem
+### IN-03: An unparseable `devflow.toml` is now reported as a `fallback_agent` problem even when the file has no such key
 
 **Files modified:** `crates/devflow-core/src/config.rs`
 **Commit:** 0f6c79c
@@ -125,7 +125,7 @@ not a string.
 **Negative control:** with the old error mapping, the test fails with
 `a parse error does not blame the fallback_agent key`.
 
-### IN-04: The torn-final-line clause claims a quota denial cannot be ruled out for every agent
+### IN-04: The torn-final-line clause claims "a quota denial cannot be ruled out" for agents whose denials the classifier cannot detect at all
 
 **Files modified:** `crates/devflow-core/src/agent_result.rs`, `crates/devflow-core/src/monitor.rs`,
 `OPERATIONS.md`
