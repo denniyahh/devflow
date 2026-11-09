@@ -632,19 +632,19 @@ fn classify(json: &serde_json::Value) -> Result<GsdStatus, ReaderFailure> {
 | A8 | No operator-created `hermes cron` jobs exist from old cron files | Runtime State | Stale external jobs could call `devflow resume` |
 | A9 | Function/type names in the Code Examples sketch | Code Examples | None — illustrative |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
-1. **What counts as "no progress" for D-25's three-round gate?** (needs an operator answer — it changes an existing guard)
+1. **What counts as "no progress" for D-25's three-round gate?** (needs an operator answer — it changes an existing guard) — **RESOLVED: D-34** (operator, 2026-11-09): only commits that change at least one path outside `.planning/` count as progress; this changes the 999.66 guard, and a docs-only Code fix also counts as no progress. Planned in 52-27.
    - Known: any new commit resets the streak to 1 (`pipeline_outcomes.rs:610-621`); every gap round commits `.planning/` files; D-25's control as written can pass with stub agents while real runs never trip it.
    - Options: (a) count only commits outside `.planning/` as progress, for gap rounds; (b) same rule for every Validate failure (also fixes the documented 33-RESEARCH weakness); (c) a separate gap-round counter that ignores commits.
    - Recommendation: (a) — smallest semantic change that makes the control honest; the per-phase 10 ceiling stays the backstop.
-2. **After `finish_run`, is the run's state kept (marked stopped, reason "finished") or cleared?**
+2. **After `finish_run`, is the run's state kept (marked stopped, reason "finished") or cleared?** — **RESOLVED: D-35** (operator, 2026-11-09): the state is kept, recorded stopped with reason `finished`; planned in 52-08 and 52-25.
    - Known: today the terminal finish clears state (`pipeline_gate.rs:355`); `cleanup` with no matching state removes the worktree without `--force` and tries to delete its branch (`commands.rs:1300-1418`), which would delete the worktree D-04 says to leave for the operator. OPS-02 wants cleanup to say why it keeps a worktree.
    - Recommendation: keep the state with `stopped: true` and a "finished" `stop_reason`; `resume` on a finished run refuses; `cleanup --force` clears it. Planner can decide (CUT-02/OPS-02 detail), but it must be decided before plan 5a.
-3. **Supervise mode with a `gaps_found` Validate: what does `gate approve` do?** (agy review lead)
+3. **Supervise mode with a `gaps_found` Validate: what does `gate approve` do?** (agy review lead) — **RESOLVED: D-36** (operator, 2026-11-09): approve runs the gap loop, reject with a note steers it, abort ends the run; finishing over gaps is not offered. Planned in 52-27.
    - Known: supervise gates every Validate (`mode.rs:250-257`); D-04 says approve finishes; criterion 4 says the gate never reads "passed" over gaps.
    - Recommendation: on a `gaps_found` gate, approve runs GSD's gaps route (approve "the proposed next step"), reject with note runs it with the note, abort ends; finishing over gaps is not offered. This is an operator decision.
-4. **Doctor's 2.x stray-process report** keeps detecting strays but its repair (`--reap-strays`) is cut. Claude's discretion: rewrite the hint to a manual `kill <pid>` after identity check, or drop the report. Recommend the rewrite (smaller).
+4. **Doctor's 2.x stray-process report** — **RESOLVED** (Claude's discretion, plan 52-03): the report stays and its hint is rewritten to a manual `ps -o args= -p <pid>` check then `kill <pid>`. The question as researched: the report keeps detecting strays but its repair (`--reap-strays`) is cut. Claude's discretion: rewrite the hint to a manual `kill <pid>` after identity check, or drop the report. Recommend the rewrite (smaller).
 
 ## Environment Availability
 

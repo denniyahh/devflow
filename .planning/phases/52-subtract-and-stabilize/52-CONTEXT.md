@@ -269,6 +269,36 @@ Source: the three open questions in `52-RESEARCH.md`, each checked against the c
   Finishing over open gaps is not offered, so a run never ends `finished` with a gaps report. Control: approving a
   gaps gate never records `workflow_finished`.
 
+### Gate-answer rule (operator, 2026-11-09, after plan checking)
+
+- **D-37: one uniform rule for answering a gate** (supersedes the per-kind routes and the 52-29 route checkpoint).
+  Plan checking kept finding gate kind × status × agent-verdict combinations no decision covered, for example
+  approving a failure-cap gate over a real pass. So the routes do not depend on the gate kind:
+  - **Approve** follows GSD's `verification status`:
+    - `passed` → finish (D-04, D-35), including a failure-cap gate over a real pass;
+    - `gaps_found` → the gap loop (D-09, D-36);
+    - `stale` or `missing` → a re-verify pass (D-08, D-32);
+    - a stale `gaps_found` (D-11), `human_needed`, or a reader failure (D-24) → approve is **not offered**: the
+      answer is refused with a message naming reject and abort.
+  - **Reject with a note** → `/gsd-quick` with the note on every Validate gate (D-10, D-21). On a rate-limit gate,
+    reject relaunches the same stage on the same agent with the note in the prompt.
+  - **Abort** → ends the run (D-13).
+
+  **Scope:** the rule covers the verification-verdict gates (every gate opened with a GSD status, or after a
+  failed GSD read) and the rate-limit gate. Gates that carry no GSD status keep today's answers: a Validate stage
+  *failure* gate (the agent failed to launch), the preflight gate, and the checkpoint-declaration gate. This
+  clarification is Claude's, from the rule's own basis (approve follows GSD's status); the operator may overrule it.
+  Consequences recorded at the operator's request:
+  - rejecting the gaps gate now runs `/gsd-quick` rather than steering the gap loop (approve still runs the loop);
+  - a `human_needed` report cannot finish inside a run: the human check happens outside, through GSD's UAT.
+  `gate_kind` stays as a structured field for display, events and tests. Routing reads only the status and, for
+  reject, whether the gate is a rate-limit gate, never free-text `context`. The routes are total: no gate leaves an
+  answer undefined.
+- **D-38: the automatic-relaunch claim is per gate** (amends D-16, D-27.3). A manual approve of a rate-limit gate
+  relaunches without spending the run's one automatic relaunch. A later denial with a known reset time still gets its
+  one automatic relaunch. Within one gate, the timer and an answer race through a single claim, so there is never a
+  double launch. `not_before` (sweep protection) is kept separate from whether a timer is armed.
+
 ### Claude's Discretion
 - How the note is framed inside the prompt: a delimited verbatim block, with control characters other than newline and
   tab stripped. It must stay byte-identical for printable text.
