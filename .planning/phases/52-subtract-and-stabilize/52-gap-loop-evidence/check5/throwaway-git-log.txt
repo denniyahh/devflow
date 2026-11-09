@@ -1,0 +1,13 @@
+b77ff4a feat: add calc_cli (uncovered file probe)
+fd58c00 docs(quick-261108-vet): restore STATE milestone_name after commit rewrite
+6f8987e docs(quick-261108-vet): add float approximate-equality test for calc.add
+381dc3c test(quick-261108-vet): assert calc.add(0.1, 0.2) is approximately 0.3
+02fe4c6 docs(phase-01): evolve project and state after phase transition
+f3d7f5c docs(phase-01): complete phase execution
+05b1811 docs(phase-01): add/update security threat verification
+e0886a1 docs(phase-01): restore STATE milestone_name after begin-phase rewrite
+1022e71 docs(01-01): complete calculator plan
+9984742 docs(01-01): add plan summary
+c2e1275 feat(01-01): add calc add/sub with unittest coverage
+a84d624 docs(01): add phase plan (hand-written fixture)
+914d2c2 chore: seed calc project

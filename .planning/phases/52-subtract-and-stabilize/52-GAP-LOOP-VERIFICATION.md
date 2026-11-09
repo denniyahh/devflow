@@ -2,8 +2,9 @@
 
 **Purpose:** show what GSD actually does before any plan builds D-08..D-11.
 **GSD version:** @opengsd/gsd-core 1.20.1 (`gsd-tools.cjs runtime-identity --raw`)
-**Status:** all four checks done (2026-11-08). None contradicts a decision, so D-08..D-11 may be planned. The limits
-below still bind the plans.
+**Status:** checks 1-5 done (2026-11-08). Checks 1-4 held. **Check 5 contradicts D-08/D-10 as written**: the
+`stale` → execute-phase re-verify is not reliable when an agent drives it, and a fix that only adds an uncovered file
+never goes stale. Per D-19, D-08's stale route and D-10 go back to the operator before planning continues.
 **Evidence:** `52-gap-loop-evidence/`: each launch's `.meta` (prompt, rc, git log before and after) and `.result.md`
 (the agent's final message, cost, turns), the throwaway repo's final `git log`, the gap-closure plan, and the final
 VERIFICATION.md.
@@ -77,3 +78,33 @@ Total: **$20.66**, about 50 minutes of agent time.
 - On this hand-written ROADMAP, `phase.complete` reported `roadmap_updated: true` while `roadmap.analyze` still said
   `roadmap_complete: false` (no phase checkbox). This is probably specific to the hand-written roadmap; not
   investigated.
+
+## Check 5: clean-reject route (`/gsd-quick`), D-21 (2026-11-08)
+
+**Project:** the same calc fixture, seeded with a **hand-written** `01-01-PLAN.md` (to skip the $5 plan launch), on
+`feature/phase-01`. Evidence is in `52-gap-loop-evidence/check5/`.
+
+| # | Launch / probe | Result | Cost |
+|---|---|---|---|
+| a | `/gsd-execute-phase 1 --auto` | built; verifier `passed` 3/3; covered `calc.py`, `test_calc.py` | $4.45 |
+| b | `/gsd-quick "Add a unittest … calc.add(0.1, 0.2) … Do not change calc.py."` | commits `381dc3c` (test_calc.py +3); status → **`stale` → execute-phase**, naming `test_calc.py` | $2.62 |
+| c | `/gsd-execute-phase 1 --auto` | **did NOT re-verify**: "PHASE 1 ALREADY COMPLETE … no files or commits changed"; report sha256 unchanged; status still **`stale`** | $0.55 |
+| — | probe, no agent: revert `test_calc.py` to its verified content | status → `passed` (control: the digest is content-based) | — |
+| — | probe, no agent: add a new uncovered `calc_cli.py`, before and after commit | status stays **`passed`** | — |
+
+Check 5 total: $7.62. Checks 1-5 total: $28.28.
+
+**Why c did not re-verify:** the orchestrating agent did not run the workflow's `verification status` block. It read
+`status: passed` from the report frontmatter, judged the change test-only, and exited. Its own words: "The change
+only adds a test and the whole suite passes, so I didn't re-verify the phase." GSD's workflow requires the opposite:
+`execute-phase.md` ~L395, route `execute-phase` → "resuming at the phase gates to re-run the verifier", "on both sides
+of `PHASE_MARKED`". So this is the agent skipping a required step, not documented GSD behaviour.
+
+**What this changes:**
+- **D-08 stale route:** 1 of 2 live attempts re-verified (check 4 yes, check 5c no), so DevFlow cannot assume a Code
+  relaunch closes `stale`. Check 4 also differed: its ROADMAP was never marked complete, while 5c's phase was.
+- **D-10 / D-21 uncovered files:** the status stays `passed` when a fix only adds a file the report does not cover,
+  so such a fix is never re-verified.
+
+**Not established:** both results are n=1. Whether the agent skips re-verification more often on a phase already
+marked complete was not measured.
