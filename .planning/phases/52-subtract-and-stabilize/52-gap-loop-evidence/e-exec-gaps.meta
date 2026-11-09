@@ -1,0 +1,18 @@
+start 2026-11-08T21:54:25-05:00
+prompt: /gsd-execute-phase 1 --gaps-only --auto
+e2c08a1 docs(01): create phase plan
+fa18d06 docs(phase-01): revert premature Complete requirements after gaps found
+675d876 docs(01): re-verify phase after source change — gaps found
+rc=0
+end 2026-11-08T22:02:41-05:00
+8358194 docs(phase-01): evolve project and state after transition
+78c43f0 docs(phase-01): complete phase execution
+2ee11fd docs(phase-01): add/update security threat verification
+9d62df6 docs(01-02): complete restore calc.sub and TestSub plan
+2e4a35b fix(01-02): restore calc.sub and TestSub removed in 60fcca2
+e2c08a1 docs(01): create phase plan
+fa18d06 docs(phase-01): revert premature Complete requirements after gaps found
+675d876 docs(01): re-verify phase after source change — gaps found
+c836153 docs(phase-01): add/update security threat verification
+60fcca2 refactor: drop sub (planted regression for gap-loop check)
+?? .planning/state.json
