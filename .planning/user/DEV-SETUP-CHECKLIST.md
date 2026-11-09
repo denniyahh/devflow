@@ -173,6 +173,13 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
     runs in the outer shell. An ordering rule ("`bash -c` appears first") accepts this.
   - `bash -c "echo ${PIPESTATUS[0]}"` — refused; double quotes open no single-quoted region and
     the outer shell expands before bash starts. Ordering accepts this too.
+- [ ] **[PATTERN]** **Archived plans are outside the staged scan (2026-11-08).** `--staged` skips any path under
+  `.planning/milestones/`: a milestone close moves every finished phase's PLAN.md there as a renamed destination
+  (the v3.0.0 close staged 120 files carrying 1,788 pre-rule flags and the commit was refused), and no executor
+  ever runs an archived plan. It is a path-prefix rule, not a filename rule — the same bytes under
+  `.planning/phases/` are still refused — and `plan_bashism_scanner.rs` pins both halves
+  (`archived_plan_is_skipped_by_the_staged_scan`, `the_same_plan_under_phases_is_still_refused`). Operator
+  decision 2026-11-08, chosen over an env override.
 - [ ] **[PATTERN]** **Command rules (2026-10-16).** The same scan splits each command in a block into
   words, reading inside a `bash -c '...'` region too, and refuses four shapes that shipped false
   greens or gates that failed correct work: `cargo test` (a filter matching nothing exits 0); a
