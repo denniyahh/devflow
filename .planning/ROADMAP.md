@@ -33,10 +33,214 @@ directories: `.planning/milestones/v3.0.0-phases/`.
 
 </details>
 
-## 🚧 Next: v4.0 (being declared with `/gsd-new-milestone`, direction decided 2026-11-08)
+## 🚧 v4.0 milestone (ACTIVE — Session Continuity)
 
-DevFlow becomes a detached runner plus an MCP decision channel; Define, Ship, the after-ship hooks, the cron-resume file
-and `devflow ship` are removed; GSD owns the workflow. Cut list: `.planning/user/V4-CUT-INVENTORY.md`.
+**Declared 2026-11-08.** A coding session that outlives any one agent. DevFlow becomes a detached runner for one agent
+stage plus a decision channel through which an agent asks DevFlow a question instead of a human; GSD owns the workflow.
+Define, Ship, the after-ship hooks, the cron-resume file and `devflow ship` are removed (cut list:
+`.planning/user/V4-CUT-INVENTORY.md`); the supervise gate loop is fixed; an MCP `devflow_ask` tool with an "operator via
+gate" answer path lands; a calibrated decision model then triages the questions; failover is generalized to any stage
+with a rotation. Phase numbering continues at 52 (Phase 51 closed v3.0.0 and ships inside 4.0.0; 3.1.0 skipped).
+**Major version** (4.0.0, operator 2026-11-08): the stage set and the CLI surface shrink, and `devflow-core` is a
+published crate, so the removed `pub` items are a semver-major change.
+
+**Sequencing.** The subtraction comes first and every later phase is smaller once it has landed: fewer stages to
+prompt (ASK-03), no Ship gate to redefine `supervise` around (ASK-02, GATE-01), no cron arm beside the rate-limit gate
+(FAIL-01). Phase 54 cannot start until Phase 53 has recorded real GSD discuss questions through the channel: the
+Jev-vs-Laya bake-off (TRIAGE-01) scores those recordings, not a synthetic corpus. Phase 55 depends only on Phase 52
+(the cron arm must be gone so an exhausted rotation ends at CUT-03's gate) and is sequenced last by the operator's
+shape, not by a dependency on 53 or 54. Research was skipped (operator, 2026-11-08): the two unknowns, how each agent
+consumes an MCP tool and Jev vs Laya, are spikes in the Phase 53 and Phase 54 discuss steps.
+
+**Success is measured on a project that is not DevFlow:** a month of runs with no by-hand exception. Remote operator
+replies (Telegram and similar) are a later milestone (REMOTE-01/02 under `REQUIREMENTS.md` § Future Requirements).
+
+| Phase | Name | Requirements | Depends on | Status |
+|---|---|---|---|---|
+| 52 | Subtract and Stabilize | CUT-01, CUT-02, CUT-03, CUT-04, GATE-01, GATE-02, GATE-03, GATE-04, OPS-01, OPS-02, OPS-03, OPS-04 | — (Phase 51, v3.0.0, merged) | Not started |
+| 53 | The Question Channel | ASK-01, ASK-02, ASK-03, ASK-04, ASK-05 | 52 | Not started |
+| 54 | Decision Triage | TRIAGE-01, TRIAGE-02, TRIAGE-03, TRIAGE-04 | 53 (its recorded questions are the bake-off corpus) | Not started |
+| 55 | Failover Generalized | FAIL-01, FAIL-02, FAIL-03, FAIL-04, FAIL-05, FAIL-06 | 52 (independent of 53-54; sequenced last) | Not started |
+
+### Phase 52: Subtract and Stabilize
+
+**Goal**: A run is Plan → Code → Validate and ends there as finished — no Define, no Ship, no after-ship hooks, no
+cron-resume file, no `devflow ship`, none of the confirmed cut rows — on a tree where `scripts/check.sh all` is green;
+the supervise gate loop carries the operator's rejection note to the relaunched agent verbatim and can drive a
+`gaps_found` verification to `passed` from inside the run; and `--version`, `cleanup`, `status`, `doctor` and the
+command output tell the operator what the run did and why it stopped.
+**Depends on**: Nothing in this milestone (first phase). Builds on Phase 51 (v3.0.0, merged to `develop` via PR #234).
+**Sequencing note**: The subtraction lands first inside the phase, as its own plan wave, before any GATE or OPS fix:
+every later fix is smaller on the cut tree (no Ship gate to redefine `supervise` around, no cron arm beside the
+rate-limit gate, no Define prompt to carry a reject note). The Phase 52 discuss step confirms which of the inventory's
+21 proposed `cut` rows join the 7 operator-decided ones (CUT-04). CUT-02 and GATE-02/GATE-03 are designed together
+because both decide what happens at the Validate gate once it is the last gate of the run. Kept as one phase rather
+than split: no requirement dependency forces a split, and the Validate-gate design is the seam the two halves share.
+**Requirements**: CUT-01, CUT-02, CUT-03, CUT-04, GATE-01, GATE-02, GATE-03, GATE-04, OPS-01, OPS-02, OPS-03, OPS-04
+**Success Criteria** (what must be TRUE):
+
+  1. `devflow start --dry-run --phase N` lists Plan → Code → Validate and nothing else — no Define, no Ship, no
+     after-ship hook — and a run that completes Validate records `workflow_finished` with `shipped: false` on
+     `events.jsonl`, reports itself finished, and leaves the worktree and branch in place for the operator. The
+     removed surface is gone, not hidden: `devflow ship`, `--yes-ship`, `DEVFLOW_YES_SHIP`, `parallel` and every
+     other cut row confirmed in the discuss step are rejected by clap as unknown and absent from `--help`.
+     **Control:** the same dry run on the installed 3.0.0 release binary lists Define and Ship (recorded once in the
+     phase notes), and the e2e test asserts the exact stage list, so an empty dry run cannot pass. (CUT-01, CUT-02,
+     CUT-04)
+  2. `scripts/check.sh all` — fmt, clippy, the workspace tests and `doc_check` — passes on the cut tree, with the cut
+     rows' tests, OPERATIONS.md rows, README/ARCHITECTURE/CONTRIBUTING mentions and `doc-check-allowlist.toml`
+     entries removed rather than allowlisted around; a source-scan Rust test asserts that no literal of the removed
+     surface (`cron-instructions`, `hermes_cron`, `yes_ship`, the four after-ship hook names, the removed `Stage`
+     variants) remains under `crates/`, `docs/` or the top-level docs, comments stripped. **Control:** the same test
+     fails on a planted stray literal, and the plant is removed before the phase closes. (CUT-03, CUT-04)
+  3. A rate limit with no usable fallback stops at a gate whose context names the reset time and the exact
+     `devflow resume --phase N ...` command to run after it, and no `cron-instructions-NN.json` exists under
+     `.devflow/` afterwards. **Control:** the Phase 51 fixture that asserted the cron file was written now asserts its
+     absence and the gate's presence — one fixture, both directions. (CUT-03)
+  4. `devflow gate reject <phase> --note "<text>"` relaunches the agent with `<text>` verbatim in its prompt — visible
+     in the launch record or captured prompt, not inferred — and a note containing the word "abort" does **not**
+     abort the run; only an explicit abort answer does. A Validate rejection relaunches GSD's gaps route for the
+     phase, not the whole phase; a verification that reports `gaps_found` is driven to `passed` inside the same run
+     (the relaunched agent is told to plan and close the gaps and re-verify), and the Validate gate never reads
+     "passed" while the report says otherwise. `devflow gate show` prints a failure gate's full reason untruncated,
+     and the banner and `gate list` cut keep the "way on" sentence first. **Controls:** the pre-fix prompt path, kept
+     as a fixture, fails the verbatim assertion; a `gaps_found` report with the gate forced to "passed" fails the
+     never-lies assertion; a note reading "do not abort, fix the test" leaves the run alive. (GATE-01, GATE-02,
+     GATE-03, GATE-04)
+  5. `devflow --version` prints the version with the embedded build commit and dirty flag; `devflow cleanup` says why
+     it keeps a worktree (the recorded stop reason, an `--until` halt, or a live run) and `cleanup --force` removes the
+     run's state together with the worktree; `devflow status` never reports a run whose worktree is gone as active,
+     shows a stopped run's stop reason and the fallback agent's state (armed, spent, none), and `devflow start` says
+     when it replaces a stale state; command output carries no `tracing` lines unless `RUST_LOG` is set, `doctor`
+     reports an unset `RUST_LOG` as information, and a project that is not DevFlow's own gets no build-provenance
+     warning and one line, not two, for a missing remote. **Controls:** with `RUST_LOG=debug` the tracing lines do
+     appear; on DevFlow's own checkout the provenance warning still fires; a run whose worktree is present still
+     reports as active. (OPS-01, OPS-02, OPS-03, OPS-04)
+
+**Plans**: TBD
+**UI hint**: no
+
+### Phase 53: The Question Channel
+
+**Goal**: An agent running under DevFlow asks DevFlow instead of a human. DevFlow serves an MCP tool, `devflow_ask`,
+over stdio; a call carries a question, typed options and context, blocks until an answer exists, and returns it to the
+agent in the same session. The one policy this phase ships, "operator via gate", turns each question into a gate the
+operator answers from the shell, with the notify hook firing as for any gate. Every stage prompt sends decision
+checkpoints, `blocking-human` gates and GSD discuss questions through the tool, and every question and answer is on
+the event log.
+**Depends on**: Phase 52 — the stage set must be final before every stage prompt is rewritten (ASK-03), and the
+checkpoint auto-decide relaunch that ASK-05 replaces is only worth replacing on the cut tree.
+**Sequencing note**: The first unknown of the milestone lives here: how each supported agent consumes an MCP tool
+(stdio server registration, tool discovery, blocking-call semantics). It is a spike in this phase's discuss step
+(operator, 2026-11-08), not research done up front. Only the agents the rotation needs are proven live; the rest are
+covered by the driver contract's conformance tests. The questions this phase records through ASK-04 are the corpus
+Phase 54's bake-off scores, so a run on a project that is not DevFlow, through real GSD discuss questions, is part of
+closing this phase.
+**Requirements**: ASK-01, ASK-02, ASK-03, ASK-04, ASK-05
+**Success Criteria** (what must be TRUE):
+
+  1. An agent launched by DevFlow calls `devflow_ask` over stdio with a question, typed options and context; the call
+     blocks until an answer exists and the answer comes back to the same agent session — proven live for the two
+     agents already proven live (claude, codex) and by an e2e test that drives the real binary with a stub agent for
+     the other launch shapes. **Control:** a call with a malformed payload (no options, or an option id the question
+     did not offer) is refused with a typed error and the agent is not left blocked. (ASK-01)
+  2. Under "operator via gate", an asked question appears in `devflow gate list` and `gate show` with its options;
+     `devflow gate answer <phase> --gate-id <id> --option <id>` (or a free-text answer) resolves it; the notify hook
+     fires and `notify_fired` is recorded exactly as for an approve/reject gate. **Control:** an answer addressed to a
+     gate id other than the open question's leaves the question open — one answer decides only the gate it names (the
+     v3.0.0 invariant, kept). (ASK-02)
+  3. Every stage prompt (Plan, Code, Validate) tells the agent to call the tool for decision checkpoints,
+     `blocking-human` gates and GSD discuss questions instead of self-resolving them positionally or stopping with a
+     report, and a `blocking-human` checkpoint reached under a one-shot launch is answered through the channel with
+     the stage continuing in the same session — no relaunch, no report-and-stop. **Controls:** a source-scan test
+     asserts the positional self-resolution instruction is gone from every prompt template and trips on a planted
+     copy; the Phase 49 checkpoint fixture that ended the stage now ends with the stage continued. (ASK-03, ASK-05;
+     closes 999.57, 999.127)
+  4. Every question and its answer are on `events.jsonl` with the answering policy or operator and the time, and
+     `devflow history` shows them in order with the rest of the run. **Control:** a question still open has no answer
+     record — the history view distinguishes "not yet answered" from an empty answer, and a run that asked nothing
+     shows no question rows. (ASK-04)
+
+**Plans**: TBD
+**UI hint**: no
+
+### Phase 54: Decision Triage
+
+**Goal**: DevFlow answers the questions a calibrated model can answer and escalates the rest. A decision model (Jev or
+Laya, chosen by a bake-off on the real GSD discuss questions Phase 53 recorded) scores each question's candidate
+answers; above the configured threshold — or on a `route` of `auto` — DevFlow answers, otherwise the question goes to
+the operator policy. Every decision, decided or escalated, is in a ledger the operator can list and override, and a
+missing or failing model never auto-decides.
+**Depends on**: Phase 53 — the channel is the only way a question reaches triage, and the bake-off corpus is the
+questions ASK-04 recorded. No corpus, no bake-off: the phase does not start until Phase 53's live run has recorded real
+discuss questions.
+**Sequencing note**: The second unknown of the milestone, Jev vs Laya, is a spike in this phase's discuss step
+(operator, 2026-11-08). The bake-off is scored on recordings, so the model choice is a measured result, not a
+preference; its record (corpus size, agreement with the operator's answers, calibration) is a phase artifact. The
+`typesafe-ai` skill is the reference for the System One primitives (`choice`, `score`, `noul`).
+**Requirements**: TRIAGE-01, TRIAGE-02, TRIAGE-03, TRIAGE-04
+**Success Criteria** (what must be TRUE):
+
+  1. The bake-off record names the chosen model and the corpus it was scored on (Phase 53's recorded questions, with
+     the operator's answers as the reference); in a run, a question whose top candidate scores above the configured
+     threshold, or whose `route` is `auto`, is answered by DevFlow without a gate, and one below the threshold goes to
+     the operator policy and appears as a gate. **Control:** the same question with the threshold set above any
+     attainable probability always reaches the operator; with `route: auto` it never does. (TRIAGE-01)
+  2. Every triaged decision is in the ledger with the question, the options, the chosen answer, the probability or
+     route, and the policy that decided; the ledger lists decided and escalated entries separately. **Control:** an
+     escalated question is listed as escalated with no chosen answer — absent, not an empty string — until the
+     operator answers it. (TRIAGE-02, TRIAGE-03)
+  3. The operator overrides one ledger decision from the shell, and on the agent's next launch the question is
+     re-opened to it with the overridden answer; the ledger shows both the original decision and the override.
+     **Control:** an override naming a decision that is not in the ledger is refused and changes nothing. (TRIAGE-03)
+  4. With the model unavailable or failing (binary or endpoint missing, call erroring, response unparseable), every
+     question goes to the operator policy, the run says so on the event log and in `status`, and nothing is
+     auto-decided. **Control:** the same fixture with the model available decides the above-threshold questions, so
+     the fallback is the model's absence, not triage switched off. (TRIAGE-04)
+
+**Plans**: TBD
+**UI hint**: no
+
+### Phase 55: Failover Generalized
+
+**Goal**: A quota denial at any stage — or rate-limit telemetry crossing a configured threshold before a denial —
+hands the run to the next agent in a configured rotation, as many times as the rotation allows; the agent taking over
+is told whose work it inherits and why; and the capture classifier never mistakes a torn line for a rate limit. Phase
+51's single hop at Code (R-2) becomes the degenerate case of a rotation of length one.
+**Depends on**: Phase 52 — the cron arm must be gone so an exhausted rotation ends at CUT-03's gate (reset time and
+resume command), and Phase 51's failover (v3.0.0) is the base. Independent of Phases 53 and 54: nothing here needs
+the question channel or the ledger. Sequenced last by the operator's shape.
+**Sequencing note**: FAIL-04 and FAIL-05 are classifier and fixture work with no dependency on the rotation; they can
+be the phase's first wave while the rotation and routing are designed. The live evidence to beat: one probe with a
+synthetic denial (claude → codex, 2026-11-08) and no surviving raw capture of a real denial (999.212).
+**Requirements**: FAIL-01, FAIL-02, FAIL-03, FAIL-04, FAIL-05, FAIL-06
+**Success Criteria** (what must be TRUE):
+
+  1. With a rotation configured as an ordered list (for example `claude, codex, antigravity`), a quota denial at
+     Plan, Code or Validate hands the run to the next agent in the same worktree on the same branch, a second denial
+     hands it again, and exhausting the rotation ends at CUT-03's gate naming the reset time and the resume command.
+     **Control:** with no rotation configured the first denial ends at that gate; Phase 51's single-hop test still
+     passes as a rotation of length one. (FAIL-01; supersedes Phase 51's R-2)
+  2. When the current agent's rate-limit telemetry (`utilization`, `unifiedWindows`) crosses the configured threshold
+     during a stage, the next stage launches on the next agent in the rotation before any denial, and the event log
+     records the handoff with utilization, not denial, as its reason. **Control:** telemetry below the threshold keeps
+     the next stage on the same agent. (FAIL-02)
+  3. The relaunched agent's prompt names the agent it is taking over from, why (denial, utilization, canary refusal),
+     and that the tree may hold that agent's uncommitted work which must not be discarded — verbatim in the captured
+     prompt. **Control:** a first launch with no handoff carries none of that text. (FAIL-03; closes 999.215)
+  4. Both torn-line orders classify as torn, never `RateLimited`: a partial line read only at EOF after the idle
+     check, and a partial line that never reaches the capture because an escaped process holds stdout — each with its
+     own named test. **Control:** each test has a paired case where the same line arrives complete and *does*
+     classify as `RateLimited`. (FAIL-04; closes 999.207, 999.209)
+  5. The first non-`allowed` `rate_limit_event` seen in a stream capture is archived under `.devflow/history/`, and
+     the denial fixtures match the live event shape (`utilization`, `unifiedWindows`); a delivery canary refusal can
+     be re-run for the same agent, and `devflow resume --agent <same>` says what it did. **Controls:** an `allowed`
+     event is not archived; the fixtures are checked against the recorded live event's field set, so a fixture in the
+     old shape fails; a second canary refusal for the same agent ends at a gate again, not in a loop. (FAIL-05,
+     FAIL-06; closes 999.212, 999.194)
+
+**Plans**: TBD
+**UI hint**: no
 
 ## ✅ v2.8.0 milestone (CLOSED 2026-09-03 — Remaining Harness Support + Pi Dogfood)
 
@@ -191,6 +395,10 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 50 | 29/29 | Complete | 2026-10-21 |
 | 50.1 | 30/30 | Complete | 2026-11-02 |
 | 51 | 13/13 | Complete | 2026-11-08 |
+| 52 | 0/? | Not started | — |
+| 53 | 0/? | Not started | — |
+| 54 | 0/? | Not started | — |
+| 55 | 0/? | Not started | — |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
 

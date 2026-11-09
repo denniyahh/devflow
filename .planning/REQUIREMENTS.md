@@ -114,16 +114,44 @@ Explicitly excluded. Documented to prevent scope creep.
 
 ## Traceability
 
-Which phases cover which requirements. Updated during roadmap creation.
+Populated during roadmap creation (2026-11-08). Phase order and dependencies: ROADMAP.md § v4.0 milestone.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
+| CUT-01 | Phase 52 — Subtract and Stabilize | Pending |
+| CUT-02 | Phase 52 — Subtract and Stabilize | Pending |
+| CUT-03 | Phase 52 — Subtract and Stabilize | Pending |
+| CUT-04 | Phase 52 — Subtract and Stabilize | Pending |
+| GATE-01 | Phase 52 — Subtract and Stabilize | Pending |
+| GATE-02 | Phase 52 — Subtract and Stabilize | Pending |
+| GATE-03 | Phase 52 — Subtract and Stabilize | Pending |
+| GATE-04 | Phase 52 — Subtract and Stabilize | Pending |
+| OPS-01 | Phase 52 — Subtract and Stabilize | Pending |
+| OPS-02 | Phase 52 — Subtract and Stabilize | Pending |
+| OPS-03 | Phase 52 — Subtract and Stabilize | Pending |
+| OPS-04 | Phase 52 — Subtract and Stabilize | Pending |
+| ASK-01 | Phase 53 — The Question Channel | Pending |
+| ASK-02 | Phase 53 — The Question Channel | Pending |
+| ASK-03 | Phase 53 — The Question Channel | Pending |
+| ASK-04 | Phase 53 — The Question Channel | Pending |
+| ASK-05 | Phase 53 — The Question Channel | Pending |
+| TRIAGE-01 | Phase 54 — Decision Triage | Pending |
+| TRIAGE-02 | Phase 54 — Decision Triage | Pending |
+| TRIAGE-03 | Phase 54 — Decision Triage | Pending |
+| TRIAGE-04 | Phase 54 — Decision Triage | Pending |
+| FAIL-01 | Phase 55 — Failover Generalized | Pending |
+| FAIL-02 | Phase 55 — Failover Generalized | Pending |
+| FAIL-03 | Phase 55 — Failover Generalized | Pending |
+| FAIL-04 | Phase 55 — Failover Generalized | Pending |
+| FAIL-05 | Phase 55 — Failover Generalized | Pending |
+| FAIL-06 | Phase 55 — Failover Generalized | Pending |
 
 **Coverage:**
 - v4.0 requirements: 27 total
-- Mapped to phases: 0
-- Unmapped: 27 ⚠️
+- Mapped to phases: 27
+- Unmapped: 0 ✓
+- Duplicates (a requirement owned by more than one phase): 0 ✓
 
 ---
 *Requirements defined: 2026-11-08*
-*Last updated: 2026-11-08 after initial definition*
+*Last updated: 2026-11-08 after roadmap creation (Phases 52-55)*

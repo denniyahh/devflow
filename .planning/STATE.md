@@ -65,13 +65,10 @@ stale; it was restored from `9411158` on 2026-09-13. Do not reintroduce the bold
 
 ## Active Phase
 
-**Phase 51 — Rate-Limit Agent Failover is complete (2026-11-08)**: 13/13 plans (51-08 dropped by operator ruling), code review and security verification done, verification passed 114/114. It is the last phase of v3.0.0; close-out (PR via `scripts/cut-pr-branch.sh`, 3.1.0 release, milestone completion) is by hand per the Phase 51 conventions in `CLAUDE.md`. Phase 50.1 (Split-Lock State-Handling Overhaul) is complete: 30/30 plans, verification passed 12/12 with one operator override (the live-run criterion), merged to `develop` via PR #229 and into `workspace/denniyahh` (2026-11-04). **v3.0.0 was released 2026-11-03/04**: `main` at `46064c6`, signed tag `v3.0.0`, `devflow-core` and `devflow` 3.0.0 on crates.io, GitHub Release and docs published. It carries Phases 46 to 50.1.
-
-Milestone **v3.0.0 — Unattended Run Survivability**: 7 of 7 phases complete (46, 47, 48, 49, 50, 50.1, 51). Phase 51 is to ship as a minor release (3.1.0), per the operator's 2026-10-09 plan. The wave order is the milestone's design: correctness (46, 47) → survivability (48) → the live `--mode auto` run that measures them (49) → the socket-addressable supervisor (50, 50.1) → rate-limit failover on top (51).
-
-**Dogfooding resumes with Phase 51** (operator rule 2026-11-04, `CLAUDE.md`): DevFlow drives its own phases. No run has exercised the final 3.0.0 code; Phase 50.1's last live attempt used an earlier build.
-
-The text this section carried until 2026-11-04 described Phase 48 as the latest phase. It is in git history.
+**Milestone v4.0 Session Continuity started 2026-11-08** — roadmap of 4 phases (52 Subtract and Stabilize, 53 The
+Question Channel, 54 Decision Triage, 55 Failover Generalized), 27 requirements, none started. Next: `/gsd-discuss-phase 52`.
+Phase 51 (Rate-Limit Agent Failover) closed v3.0.0 on 2026-11-08: see `.planning/MILESTONES.md` and
+`.planning/milestones/v3.0.0-ROADMAP.md`.
 
 ## Project Reference
 
@@ -86,7 +83,8 @@ decision channel; cut list in `.planning/user/V4-CUT-INVENTORY.md`. v3.0.0 close
 
 ## Operator Next Steps
 
-- Start the next milestone with /gsd-new-milestone
+- `/gsd-discuss-phase 52` — confirm the cut list (`.planning/user/V4-CUT-INVENTORY.md`) and the Validate-gate design, then plan.
+- Push `workspace/denniyahh` (the v3.0.0 close and v4.0 start are local until then).
 
 ### Historical — superseded phase notes
 
@@ -157,10 +155,10 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: Not started (defining requirements)
+Phase: 52 — Subtract and Stabilize (not started; first of four in v4.0, Phases 52-55)
 Plan: —
-Status: Defining requirements
-Last activity: 2026-11-08 — Milestone v4.0 started
+Status: Roadmap created — ready to plan Phase 52
+Last activity: 2026-11-08 — v4.0 roadmap written (Phases 52-55, 27/27 requirements mapped)
 
 
 ## Recently Shipped
@@ -841,6 +839,7 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 
 ## Roadmap Evolution
 
+- Phases 52-55 added (2026-11-08): **v4.0 Session Continuity** roadmapped the day the milestone was declared; dirs TBD, not yet planned. The operator's proposed shape was followed as-is (no requirement dependency forced a change): **Phase 52 Subtract and Stabilize** (CUT-01..04, GATE-01..04, OPS-01..04; kept as one phase because CUT-02 and GATE-02/03 both decide what happens at the Validate gate once it is the run's last gate, with the subtraction as the first plan wave inside it), **Phase 53 The Question Channel** (ASK-01..05, depends on 52), **Phase 54 Decision Triage** (TRIAGE-01..04, depends on 53: its recorded questions are the bake-off corpus), **Phase 55 Failover Generalized** (FAIL-01..06, depends on 52 only; sequenced last by the operator). Coverage 27/27, no duplicates. Placement: the two-line `## 🚧 Next: v4.0` placeholder was replaced by `## 🚧 v4.0 milestone (ACTIVE — Session Continuity)` with the four `### Phase N:` sections inside its window; the v3.0.0 summary above it and every section below it are unchanged, the `## Backlog` section byte-for-byte (sha256 `6ada1ff8…43ce3` before and after, 199 entries). Verified live: `roadmap.analyze` phase_count 45 (cross-milestone garbage matches, next_phase 26) → 4 (52-55, next_phase 52). Research skipped (operator); the two unknowns (how each agent consumes an MCP tool; Jev vs Laya) are spikes in the Phase 53 and 54 discuss steps.
 - Phase 33 + Phase 34 added (2026-08-04): **Resume Unattended Dogfooding** milestone (v2.4.0), declared and roadmapped the same day — dirs TBD, not yet planned. Operator-decided split (not re-derived): **Phase 33** bundles **999.65** (Validate→Code loop-back issues an impossible `--gaps-only` command on a mid-arc phase, High/S–M) and **999.66** (`consecutive_failures` never resets across a loop-back, false-gating any 3+ wave phase at wave 3, High/S–M) — 999.66's fix is independent of 999.65 but only *validatable* once a 3rd-wave loop-back actually works, so 999.65 lands first inside the phase. **Phase 34** bundles **999.73** (widen `STREAM_JSON_STAGES` beyond `Stage::Code`, needing real per-stage production captures and a re-derived drain-gate reasoning, not a flag flip) and **999.74** (`classify_validate_outcome` trusts the agent's self-reported `verdict` over its own derived status — same trust-inversion family as 999.67) — split OUT of Phase 33 because both are open-ended investigation rather than known mechanical fixes; Phase 31's own ROADMAP entry for 999.74 already deferred it on the same basis (wouldn't fit an M-capped phase). All four requirements (DOGFOOD-01..04) mapped 1:1, coverage 4/4. **Placement:** the new `## 🚧 v2.4.0 milestone (ACTIVE)` heading was inserted as the FIRST heading in ROADMAP.md (before the now-closed `## gsd-hygiene milestone` and `## v2.3.0 milestone` headings), with Phase 33/34's own `### Phase N:` detail sections landing inside that heading's own window — same durability fix Phase 32 established for 999.72, spot-checked live per CLAUDE.md's own convention (`roadmap.analyze` phase_count 0->2, next_phase "33", `milestone.complete v2.4.0 --dry-run` correctly scoped to 2 phases instead of the pass-all degrade).
 - Phase 32 added (2026-08-04): **ROADMAP Layout Hygiene** (dir TBD, not yet planned) — first phase of the new **GSD Workflow Hygiene** milestone (unversioned, `.planning/`-only). Closes backlog **999.72** (`roadmap.analyze` / `milestone.complete --dry-run` misfiring because the active milestone's own window had no `### Phase N:` heading inside it) and **999.72a** (missing `## Progress` table). Fix mechanism: a new `## ð§ GSD Workflow Hygiene milestone (ACTIVE)` heading was inserted as the FIRST heading in `ROADMAP.md` (before the existing `## v2.3.0 milestone (CLOSED...)` heading), with Phase 32's own `### Phase 32:` detail section landing inside that heading's own window, plus a `## Progress` table (30 rows, phases 1-25/27/28/30/31 Complete, 32 Not started; 26/29 excluded as never shipped). The three existing closed-milestone sections and the Backlog section are otherwise byte-for-byte unchanged (`git diff --stat`: insertions only, 0 deletions). Verified live, with negative controls against the pre-fix content (via `git stash`): `roadmap.analyze` phase_count went from 4 (garbage cross-milestone matches: 26, 29 x2, 30 — none belonging to this milestone) to 1 (Phase 32 only); `gsd-tools milestone complete Hygiene --dry-run` sweeps 0 directories (vs. the same command on the unfixed content erroring `no phases found`, and `milestone complete v2.3.0 --dry-run` on either version still sweeping all 17 backlog directories — confirming this fix is scoped to the ACTIVE milestone only, as required; the two already-closed milestones' own windows are unchanged and out of scope per REQUIREMENTS.md's Out of Scope table); a throwaway `32-test-throwaway/` phase directory was correctly picked up as belonging to phase 32 and removed after the check (positive control). `smart-entry --json`'s `signals.roadmap_total_phases`/`roadmap_completed_phases` went from `null`/`null` (legacy STATE.md-comparison fallback) to `30`/`29` (roadmap-derived path). See REQUIREMENTS.md HYGIENE-01/02/03.
 - Phase 31 added (2026-08-03): **Claude Adapter Launch Path — Pipe-Owning Monitor (999.64 arc close)** (dir `31-claude-adapter-launch-path-pipe-owning-monitor-999-64-arc-cl`) — the second half of the 999.64 arc, split off from Phase 30 under the operator's "no phase exceeds M" sizing cap. Created only because `30c-VERDICT.md` resolved `delivery: confirmed`; the locked precondition was that a refuted delivery premise **cancels this phase before it is planned**. Its ROADMAP entry is **compiled from existing sources, not newly authored** — Phase 30's "Next phase (31)" section, binding constraints 1/4/5/7/8/9, `30-H1-CONTEXT-FOR-31.md`, and `30d-MEASUREMENTS.md` — so discuss-phase still owns turning it into decisions. Two known-stale documents are flagged in the entry for correction before planning, because Phase 31 will read exactly those two (`30-VERIFICATION.md`'s deferred-items table lists constraint 9 items 1–2 as open when they were closed in Phase 30 by `a557805`; `30-05-SUMMARY.md` names the wrong gate predicate). **Placement note:** `gsd-tools query phase.add` inserted the stub at `lastIndexOf('\n---')`, which on this 3300-line roadmap landed it mid-prose inside the historical *Phase 29 (original scope)* section; it was moved by hand to sit directly after Phase 30, ahead of the shelved-phase block. Same class of document-order hazard recorded in Phase 27's entry below.
@@ -952,7 +951,7 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 ## Session
 
 **Last session:** 2026-11-08
-**Stopped at:** Phase 51 complete — last phase of v3.0.0; ready for milestone completion
+**Stopped at:** Milestone v4.0 declared and roadmapped (phases 52-55); nothing planned yet
 **Resume file:** None
 
 ## Operator Next Steps
