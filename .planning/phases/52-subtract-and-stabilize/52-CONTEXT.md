@@ -74,9 +74,10 @@ ahead of any GATE or OPS fix (ROADMAP sequencing note). New capabilities belong 
     verifier (gsd-core 1.20.1 `bin/lib/verification.cjs` L257-290, `STALE_REMEDY`), then Validate.
   - `human_needed` → a gate in both modes, with the status in the gate context.
 
-  The Validate gate never reads "passed" while GSD reports anything else. **Not established:** that execute-phase
-  re-verifies a stale `passed` report when every plan already has a SUMMARY. This rests on the gsd-core comments and
-  route table, not on a run. A test or the live run must show it.
+  The Validate gate never reads "passed" while GSD reports anything else. The stale route was shown live by check 4 in
+  `52-GAP-LOOP-VERIFICATION.md`: `execute-phase` re-ran the verifier with every plan summarized. Still untested live:
+  the Validate stage's pairing of the agent's verdict with this status. Amended by D-24 (reader failures, evidence
+  root).
 - **D-09:** The gap loop runs at stage level: a `gaps_found` Validate goes to **Plan** running
   `/gsd-plan-phase N --gaps`, then **Code** running `/gsd-execute-phase N --gaps-only` (whose verifier tail
   re-verifies), then Validate. Each step is its own launch with its own `DEVFLOW_RESULT` and commit checks. The
@@ -86,7 +87,8 @@ ahead of any GATE or OPS fix (ROADMAP sequencing note). New capabilities belong 
   (999.189 fix shape). After such a fix the report is `stale`, so D-08's `stale` route covers re-verification.
 - **D-11:** A `gaps_found` report whose covered files have changed since it was written (999.208) produces a **gate**
   whose context says the report is gaps_found but stale and that no GSD route re-verifies it. A gsd-core upstream
-  issue is filed for `gaps_found` taking priority over `stale` (`verification.cjs` L1537): open-gsd/gsd-core#6078. DevFlow does not drive a
+  issue is filed for `gaps_found` taking priority over `stale` (`verification.cjs` L1537): open-gsd/gsd-core#6078.
+  How the case is detected is set by D-22. DevFlow does not drive a
   verifier outside a GSD command (operator principle 2026-09-28, "operate within GSD's confines"). The in-run gap loop
   does not hit this case, because its own execute-phase run re-verifies.
 - **D-12:** No new cap. Each `gaps_found` round counts as a Validate failure, so `MAX_CONSECUTIVE_FAILURES` (3) and
@@ -137,7 +139,86 @@ ahead of any GATE or OPS fix (ROADMAP sequencing note). New capabilities belong 
   - `/gsd-execute-phase N` on a stale `passed` report with every plan summarized re-runs the verifier.
 
   The record lives at `52-GAP-LOOP-VERIFICATION.md`. If it contradicts a decision, that decision returns to the
-  operator before planning continues.
+  operator before planning continues. Checks 1-4 are done (all held). **Check 5 (D-21)** gates D-10: `/gsd-quick` on
+  a passed phase, once on a covered file and once on an uncovered one, then `verification status` and execute-phase
+  re-verify.
+
+### Amendments from the external review (2026-11-08)
+
+Source: adversarial review of this file by codex (GPT-6.1 Sol), agy (Gemini 3.8 Flash) and DeepSeek Flash, in
+`52-context-review/`. Every finding below was checked against the source before it was recorded. D-20..D-22 are
+operator decisions; D-23..D-31 are within Claude's remit and correct facts or fill gaps without changing intent.
+
+- **D-20 (operator): GATE-01 governs gate answers only.** A gate answer aborts a run only when it is an explicit abort
+  (D-13). DevFlow's own infra-ceiling abort (`gate_or_abort_infra`, `pipeline_outcomes.rs` L60-78) stays: it bounds
+  stuck loops and is never silent. GATE-01's text is amended to say this. Under D-15, a rate limit no longer counts
+  toward the infra ceiling: it goes to the rate-limit gate. Today it does count (`handle_rate_limited_outcome`, L91-102).
+- **D-21 (operator): GATE-02 is amended for D-10.** A `gaps_found` verdict runs GSD's gaps route. Rejecting a clean
+  pass runs `/gsd-quick` with the note. D-10 is also gated by a live check 5 under D-19: a quick fix makes GSD report
+  `stale`, and execute-phase then re-verifies. The check must include a quick fix that touches a file the report does
+  **not** cover, because staleness is only shown for covered files. If that case does not go stale, D-10 returns to
+  the operator.
+- **D-22 (operator): how the stale `gaps_found` case of D-11 is detected.** GSD's status reader cannot tell it apart
+  (#6078), so DevFlow uses GSD's own readers. It reads `covered_files` and `covered_digest` with
+  `gsd query frontmatter get <report> --field …`, recomputes the digest with
+  `gsd query verification fingerprint <phase_dir> <files…>`, and fires the D-11 gate on a mismatch. DevFlow never
+  parses the report itself. Both readers were confirmed on gsd-core 1.20.1 against the live run's final report. The
+  detection is removed once #6078 is fixed upstream.
+- **D-23: parts of cut modules that kept code uses are relocated, not deleted** (D-01):
+  - `parallel.rs`: `ensure_phase_worktree` (used by `start`, `commands.rs` L16) and `retry_after_from_reason`
+    (`pipeline_outcomes.rs` L17) move before the module goes, together with their tests.
+  - `ship.rs`: its reset-time parsing (`parse_rfc3339ish`, `hermes_schedule_from_retry_after`) is the starting point
+    for D-27. Adapt it before deleting the file. `ship::shell_quote` has only cron callers, which are cut.
+  - `lock.rs`: its callers (`recover.rs` L142 and L805, the stale-lock sweep; `run_checkout_hooks_from`,
+    `pipeline_outcomes.rs` L1144) are removed with it. `Hook::BranchCreate` has no production constructor, so the
+    planner checks whether the whole checkout-hook batch becomes dead code and removes it if so.
+  - `ship_evidence::is_stopped_at` is used only by `evidence` (`commands.rs` L2036), which is cut.
+- **D-24: Validate's GSD reader must never fail open** (D-08):
+  - A missing `gsd-tools`, a nonzero exit, unparseable output or an unknown status fires a never-silent gate that
+    names the failure. It is never a pass and never a silent retry.
+  - The phase dir is resolved against the **worktree evidence root**, as the existing VERIFICATION lookups do
+    (`pipeline_outcomes.rs` ~L515-530). Against `project_root` it would read `missing` and loop on execute-phase.
+  - Each failure class gets a control.
+- **D-25: gap rounds keep the consecutive-failure streak** (D-09, D-12). `transition_resets_consecutive_failures`
+  (`mode.rs` L142-143) resets on every transition except Code→Validate. The new Validate→Plan(gaps)→Code path would
+  therefore zero the streak on Plan→Code (`pipeline_gate.rs` L109-110), and `MAX_CONSECUTIVE_FAILURES` would never
+  fire. The predicate must keep the streak across a gap-closure pass. Control: three gap rounds with no progress force
+  the gate. The 10-per-phase ceiling stays as the backstop.
+- **D-26: a carrier for the note** (D-14). `GateAction::LoopBack(Stage)` (`gates.rs` L85-108) carries no note, and
+  every consumer drops it. The note must travel from the response to the relaunch prompt for every launch shape
+  (claude stream, and the capture drivers codex and others), asserted per shape. `GateAction` is `pub`; the change is
+  covered by the 4.0.0 major bump.
+- **D-27: rate-limit gate mechanics** (D-15, D-16):
+  1. `resetsAt` is free text today ("nothing parses this string", `agent_result.rs` L1778-1788). It must be parsed into
+     a timestamp; a missing or invalid value means a plain gate.
+  2. The waiting supervisor must not be ended before `resetsAt` + margin by `DEVFLOW_GATE_TIMEOUT_SECS` (default
+     3 days, `config_parse.rs`; a weekly window can be longer) or by `gate sweep`. The wait bound is the later of the
+     two, and sweep does not reap a rate-limit gate before its reset.
+  3. "Auto relaunch used" is persisted in state, so a supervisor takeover, stop, resume or manual approve cannot
+     re-arm it. A timer and an answer race through one durable claim, never two launches.
+  4. Approve-to-relaunch needs its own action: `GateAction::Advance` means advance (`pipeline_outcomes.rs` L556,
+     L742, L865).
+  5. The gate context presents `devflow resume …` as the command for when the waiter is gone; while it is alive,
+     resume is refused (`refuse_launch_over_a_live_run`, `commands.rs` ~L1010).
+
+  Controls: reset before timeout, reset after timeout, a second denial, and restart.
+- **D-28: abort-field schema** (D-13). `GateResponse` (`gates.rs` L54-63) gains the field with `#[serde(default)]`;
+  absent means "not an abort". An answer that both approves and aborts is refused when it is written. `gate abort` is
+  a `GateCmd` subcommand (`main.rs` L436), not a top-level `Command` variant; the planner checks what `doc_check`
+  requires for it. Old 3.x records get no migration (operator rule 2026-10-12). Close-out checks the operator's own
+  machine for pending 3.x answers.
+- **D-29: what "finished" fires on** (D-06). `workflow_finished` is emitted at two sites: the `--until` halt
+  (`pipeline_gate.rs` L88-96, `reason: stopped_at`) and the terminal finish. Notify fires for both, because both end the
+  run, and the payload carries the reason. The terminal finish payload is `{"reason":"finished","shipped":false}`, a
+  new shape that criterion 1 asserts.
+- **D-30: kept modules' fixtures are rewritten** (D-03, criterion 2). Literals of the removed surface inside kept code
+  fail the source scan: `history.rs` test fixtures (L263, L267), `tests/gitignore_coverage.rs` L38-39, `doc_check.rs`
+  L323-331. They are rewritten, not allowlisted. State files written by 3.x that hold a removed `Stage` will no longer
+  parse; there is no migration, and close-out clears the operator's own `.devflow/` of them.
+- **D-31: D-02 ports a whole command, not just pins.** `release_check` (`commands.rs` from ~L5816) has five e2e tests
+  (`tests/release_check.rs`) and depends on `version::read_workspace_self_pins`, which goes with `version.rs`. The
+  port covers the command's checks (pins, main divergence, absent-origin fallback, publish order) and keeps a
+  negative control for each.
 
 ### Claude's Discretion
 - How the note is framed inside the prompt: a delimited verbatim block, with control characters other than newline and
@@ -195,8 +276,11 @@ ahead of any GATE or OPS fix (ROADMAP sequencing note). New capabilities belong 
   Plan gains a `--gaps` prompt (D-09).
 - `resetsAt` is already parsed from the `rate_limit_event` (`crates/devflow-core/src/agent_result.rs` ~L1778-1786) for
   D-15.
-- `GATE_CONTEXT_DISPLAY_CHARS = 300` (`crates/devflow-cli/src/commands.rs` L2056) and `gate_show` (L4434): the 999.206
-  fix.
+- 999.206 is a **write-time** cap: `truncate_reason` = `render_gate_context(reason, 300)`
+  (`crates/devflow-cli/src/pipeline_outcomes.rs` L888, called at L553 and L923). The display constant
+  `GATE_CONTEXT_DISPLAY_CHARS` (`commands.rs` L2056) is a separate 300. `gate_show` already prints the stored context
+  untruncated (test `gate_show_renders_full_untruncated_sanitized_context`, `commands.rs` L10062). The fix therefore
+  belongs at write time, and criterion 4 needs a control: a reason longer than 300 chars survives to `gate show`.
 - `Stage` enum (`crates/devflow-core/src/stage.rs` L16): `Define` and `Ship` are removed (a semver-major `pub` change; run
   `cargo semver-checks` per CLAUDE.md).
 

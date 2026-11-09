@@ -28,10 +28,14 @@ requirement closes a backlog entry, the entry is named; `.planning/user/V4-CUT-I
 
 ### Supervise gate loop (GATE)
 
-- [ ] **GATE-01**: A gate rejection's note reaches the relaunched agent's prompt verbatim, and a run is aborted only by an
-      explicit abort answer, never by the word "abort" appearing in a note. Closes 999.189.
-- [ ] **GATE-02**: A Validate rejection relaunches only the gap-closure work (GSD's gaps route), not the whole phase.
-      Closes 999.192.
+- [ ] **GATE-01**: A gate rejection's note reaches the relaunched agent's prompt verbatim. A gate answer aborts the run
+      only when it is an explicit abort answer, never because the word "abort" appears in a note. DevFlow's own
+      infra-ceiling abort is out of this requirement's scope. Closes 999.189. (Amended 2026-11-08 by the operator after
+      the Phase 52 context review, 52-CONTEXT D-20.)
+- [ ] **GATE-02**: A Validate rejection relaunches only the fix work, not the whole phase. A `gaps_found` verdict runs
+      GSD's gaps route (`plan-phase --gaps`, then `execute-phase --gaps-only`). A rejection of a clean pass runs
+      `/gsd-quick` with the operator's note. Closes 999.192. (Amended 2026-11-08 by the operator after the Phase 52
+      context review, 52-CONTEXT D-21.)
 - [ ] **GATE-03**: A verification that reports `gaps_found` can be driven to `passed` from inside the run: the relaunched
       agent is told to plan and close the gaps and re-verify, and the Validate gate never says "passed" while the
       report says otherwise. Closes 999.193, 999.205, 999.208.

@@ -102,13 +102,16 @@ than split: no requirement dependency forces a split, and the Validate-gate desi
      not relaunched again. (CUT-03; amended 2026-11-08, 52-CONTEXT D-15..D-17)
   4. `devflow gate reject <phase> --note "<text>"` relaunches the agent with `<text>` verbatim in its prompt — visible
      in the launch record or captured prompt, not inferred — and a note containing the word "abort" does **not**
-     abort the run; only an explicit abort answer does. A Validate rejection relaunches GSD's gaps route for the
-     phase, not the whole phase; a verification that reports `gaps_found` is driven to `passed` inside the same run
+     abort the run; only an explicit abort answer does. A Validate rejection relaunches only the fix work: GSD's gaps
+     route for a `gaps_found` verdict, `/gsd-quick` with the note for a rejected clean pass (amended 2026-11-08,
+     52-CONTEXT D-21); never the whole phase; a verification that reports `gaps_found` is driven to `passed` inside the same run
      (the relaunched agent is told to plan and close the gaps and re-verify), and the Validate gate never reads
      "passed" while the report says otherwise. `devflow gate show` prints a failure gate's full reason untruncated,
      and the banner and `gate list` cut keep the "way on" sentence first. **Controls:** the pre-fix prompt path, kept
      as a fixture, fails the verbatim assertion; a `gaps_found` report with the gate forced to "passed" fails the
-     never-lies assertion; a note reading "do not abort, fix the test" leaves the run alive. (GATE-01, GATE-02,
+     never-lies assertion; a note reading "do not abort, fix the test" leaves the run alive; a failure reason longer than 300 characters
+     reaches `gate show` whole (the cap is applied at write time, 52-CONTEXT); three gap rounds with no progress force
+     the gate (52-CONTEXT D-25). (GATE-01, GATE-02,
      GATE-03, GATE-04)
   5. `devflow --version` prints the version with the embedded build commit and dirty flag; `devflow cleanup` says why
      it keeps a worktree (the recorded stop reason, an `--until` halt, or a live run) and `cleanup --force` removes the
