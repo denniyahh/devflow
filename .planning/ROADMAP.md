@@ -626,6 +626,22 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.218: The Plan-Bashism Scanner Drops the Finding Text When the File Path Is Long (BACKLOG)
+
+**Found:** 2026-11-08, running `crates/devflow-cli/tests/plan_bashism_scanner.rs` from a checkout under the session
+scratchpad (`/tmp/claude-1000/…/scratchpad/lintwt`, fixture path 199 characters): five `assert_blocked` tests failed
+because the refusal printed `<path>:` with nothing after it, while the same fixture at a 153-character path printed
+`<path>:9: ${PIPESTATUS[0]}`. Reproduced with `develop`'s unmodified `scripts/lint-plan-bashisms.sh` on a copied
+fixture, so it is not caused by the 2026-11-08 archive-skip change. The scanner still exits 1, so the hook still refuses;
+only the operator-facing line (file, line number, offending text) is lost, and the test suite fails on such checkouts.
+
+**Not established:** the exact cut-off length and the mechanism (not read; the report path in the script is the place
+to look). Whether CI's checkout paths can ever reach it (they have not).
+
+**Fix shape:** find the fixed-width or truncating step in the finding report and print the line untruncated; add a
+fixture test that runs the scanner on a copy of a fixture under a generated 250-character path and asserts the finding
+line, with the short path as the control. Next fix branch.
+
 ### Phase 999.217: Operator-Facing Output Is Noisy: Raw Tracing Lines, a Red ✗ for an Unset Log Level, and Warnings That Do Not Apply (BACKLOG)
 
 **Found:** 2026-11-08, live failover probe on the merged Phase 51 build (`fad00ff`), throwaway project; report `.planning/audits/2026-11-08-live-failover-probe.md`.
