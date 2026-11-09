@@ -1,20 +1,16 @@
 ---
 gsd_state_version: "1.0"
-milestone: v3.0.0
-milestone_name: milestone (ACTIVE — Unattended Run Survivability)
-status: Awaiting next milestone
-stopped_at: Phase 51 complete — all phases complete
-last_updated: "2026-11-09T00:10:42.648Z"
+milestone: v4.0
+milestone_name: Session Continuity
+status: planning
+last_updated: "2026-11-09T00:22:45.369Z"
 last_activity: 2026-11-08
-last_activity_desc: Milestone v3.0.0 completed and archived
-state_head: 73993e04dd0dfa9ee7081669f7f6e8a6baa4ab50
 progress:
-  total_phases: 7
-  completed_phases: 5
-  total_plans: 120
-  completed_plans: 120
-  percent: 71
-current_phase: 51
+  total_phases: 0
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+  percent: 0
 ---
 
 # DevFlow — Project State
@@ -161,10 +157,10 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: Milestone v3.0.0 complete
+Phase: Not started (defining requirements)
 Plan: —
-Status: Awaiting next milestone
-Last activity: 2026-11-08 — Milestone v3.0.0 completed and archived
+Status: Defining requirements
+Last activity: 2026-11-08 — Milestone v4.0 started
 
 
 ## Recently Shipped

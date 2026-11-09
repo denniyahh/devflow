@@ -24,6 +24,30 @@ asks a human only for the decisions nothing else can make. (Restated by the oper
 and walk away; never silently corrupt state or lose a gate decision" — stays true as a
 constraint, not as the point.)
 
+## Current Milestone: v4.0 Session Continuity
+
+**Declared 2026-11-08.**
+
+**Goal:** A coding session that outlives any one agent. DevFlow becomes a detached runner for one agent stage plus a
+decision channel through which an agent asks DevFlow a question instead of a human; GSD owns the workflow.
+
+**Target features:**
+- Subtract and stabilize: remove Define, Ship and the after-ship hooks, the cron-resume file and `devflow ship`; fix the
+  supervise gate loop (a rejection's note reaches the agent, no whole-phase re-run, a `gaps_found` verification can be
+  closed from inside the run) or narrow gates to approve/abort; `cleanup`, output noise and `--version` fixed. Cut list:
+  `.planning/user/V4-CUT-INVENTORY.md`.
+- The question channel: an MCP tool any supported agent calls to ask DevFlow a question, with an answer path and the
+  policy fixed to "operator via gate".
+- Decision triage: a calibrated decision model (Jev or Laya, chosen by a bake-off on real GSD discuss questions) scores
+  each question, decides above a threshold, records every decision in a ledger and escalates the residue.
+- Failover generalized: any stage, rotation across agents, utilization-aware routing, a handoff prompt, the torn-line
+  residuals (999.207, 999.209).
+
+**Key context:** phase numbering continues at 52. Success is measured on a project that is not DevFlow: a month of
+runs with no by-hand exception. Remote operator replies (Telegram and similar) are a later milestone. Research skipped
+(operator, 2026-11-08): the scope comes from the v3.0.0 dogfood evidence; the two unknowns (how each agent consumes an
+MCP tool; Jev vs Laya) are spikes in the Phase 53 and 54 discuss steps.
+
 ## Last Milestone: v3.0.0 Unattended Run Survivability (closed 2026-11-08)
 
 **Declared 2026-09-03; closed 2026-11-08** as an override closeout (five phases' verification digests were stale from later edits; all seven reports `passed`; no `/gsd-audit-milestone` run, by operator decision). Phases 46-50.1 were released as 3.0.0 on 2026-11-03/04; Phase 51 is merged to `develop` (PR #234) and ships inside 4.0.0 — 3.1.0 was skipped (operator, 2026-11-08).
@@ -473,9 +497,14 @@ version is still derived automatically from conventional-commit classification a
 seven of the ten (#174, #204, #206, 999.115, 999.116, 999.118, #200), plus 999.125, 999.126 and
 999.38 promoted into Phase 48; those moved to Validated.
 
-All ten delivered; #185 (SUPV-01) moved to Validated at the close. **No active milestone** —
-v4.0 is being declared with `/gsd-new-milestone` (direction decided 2026-11-08: pare DevFlow down to
-a detached runner plus an MCP decision channel; GSD owns the workflow; see `.planning/user/V4-CUT-INVENTORY.md`).
+**v4.0 Session Continuity** — declared 2026-11-08. Requirement IDs in `REQUIREMENTS.md`.
+
+- [ ] Subtract and stabilize (CUT, GATE, OPS)
+- [ ] The question channel: an MCP ask tool with an operator-gate answer path (ASK)
+- [ ] Decision triage with a calibrated model and a decision ledger (TRIAGE)
+- [ ] Failover generalized to any stage with rotation and utilization-aware routing (FAIL)
+
+v3.0.0's ten items were all delivered; #185 (SUPV-01) moved to Validated at its close.
 
 Carried-forward follow-ups NOT in this milestone (backlog): **999.120** (one residual ambient
 `git_flow_for_project` re-resolution in the Validate loop-back), **999.121** (OpenCode has no
@@ -653,6 +682,11 @@ delivered most of it. Major version chosen because #185 changes the monitor mech
 socket path to `state.json`, breaking state-file compatibility with 2.x on a published crate.
 Research skipped by operator decision — every item is a verified defect in this codebase with a
 known fix direction, and the #185 socket design is already spike-proven.*
+
+---
+*Last updated: 2026-11-08, same day, starting milestone **v4.0 Session Continuity** — scoped through
+conversation (research skipped, operator decision): pare DevFlow down to a detached runner plus an MCP
+decision channel, then calibrated decision triage and generalized failover. Phase numbering continues at 52.*
 
 ---
 *Last updated: 2026-11-08 after milestone **v3.0.0 Unattended Run Survivability** closed — 7 phases
