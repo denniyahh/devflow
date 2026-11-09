@@ -1138,8 +1138,10 @@ says when it replaces a stale state. Stability phase.
 ### Phase 999.212: No Real Claude Quota Denial Has Ever Been Captured, and the Denial Fixtures Lag the Live Event Shape (BACKLOG)
 
 **Found:** 2026-11-08, live failover probe on the merged Phase 51 build (`fad00ff`), throwaway project; report `.planning/audits/2026-11-08-live-failover-probe.md`.
-A search of every archived capture on the operator's machine found no `rate_limit_event` with a status other than
-`allowed`; every denial DevFlow tests is constructed. The Agent SDK documents `rate_limit_info.status` as `allowed |
+Real denials HAVE been classified live: eight `ratelimited` verdicts on Phase 43 (2026-08) and one on the Phase 51
+dogfood (2026-11-06, 999.186, stream path: reason "rate limited until <resetsAt>", so a real `status: rejected` event
+was read). But no raw capture of one survives in `.devflow/history/` (retention pruned them), so every denial fixture
+DevFlow tests is constructed. (Corrected 2026-11-08: an earlier wording said no real denial had ever been classified.) The Agent SDK documents `rate_limit_info.status` as `allowed |
 allowed_warning | rejected`, so DevFlow's one denial token (`rejected`) is right on paper. Live events now also carry
 `utilization` and a nested `unifiedWindows` object (`five_hour`, `seven_day`, each with its own `status`) that no
 fixture has. The probe's denial used the live shape with `status` flipped and was classified correctly.
