@@ -10,18 +10,23 @@ docs/changelog updates, and cleanup. It runs a 5-stage pipeline
 agents (Claude Code, OpenAI Codex, OpenCode, Pi, Antigravity, Hermes) through the modular
 `AgentDriver` contract — opinionated by design,
 not a universal agent platform — in either `auto` (unattended) or
-`supervise` (gated) mode.
+`supervise` (gated) mode. Since v3.0.0 each stage runs under a socket-addressed
+supervisor whose liveness is answerable without a PID, every state write takes one
+short lock, a gate answer decides only the gate it names, and a Code stage that hits a
+quota denial continues under a configured fallback agent in the same worktree.
 
 ## Core Value
 
-A developer should be able to run `devflow start --phase N` and walk away —
-DevFlow must reliably drive the agent through the full pipeline and never
-silently corrupt its own state or lose a human's gate decision, even under a
-mid-run crash or kill.
+A coding session that outlives any one agent: the session is the repository, so when
+one agent runs out of quota or budget another continues the same work, and the run
+asks a human only for the decisions nothing else can make. (Restated by the operator
+2026-11-08 at the v3.0.0 close; the earlier statement — "run `devflow start --phase N`
+and walk away; never silently corrupt state or lose a gate decision" — stays true as a
+constraint, not as the point.)
 
-## Current Milestone: v3.0.0 Unattended Run Survivability
+## Last Milestone: v3.0.0 Unattended Run Survivability (closed 2026-11-08)
 
-**Declared 2026-09-03.**
+**Declared 2026-09-03; closed 2026-11-08** as an override closeout (five phases' verification digests were stale from later edits; all seven reports `passed`; no `/gsd-audit-milestone` run, by operator decision). Phases 46-50.1 were released as 3.0.0 on 2026-11-03/04; Phase 51 is merged to `develop` (PR #234) and ships inside 4.0.0 — 3.1.0 was skipped (operator, 2026-11-08).
 
 **Goal:** Prove DevFlow's `--mode auto` chain end to end on a live run, close the decision-policy
 and persistence holes that would make such a run misbehave silently, then replace the
@@ -423,14 +428,27 @@ version is still derived automatically from conventional-commit classification a
   tests only; the checkpoint detector the run relied on is replaced in Phase 49.1 (CR-01), which
   is unmeasured live unless 49.1 re-runs; notify follow-ups in backlog 999.154, tooling hardening
   in 999.152.
+- ✓ **SUPV-01** (#185) — monitor liveness is answerable from disk state alone, without a PID, as
+  GONE / STALE / ALIVE: a per-launch Unix socket under the cache dir, probed by `status`, `stop`,
+  `cleanup` and `doctor`, each non-ALIVE answer naming its repair — Phase 50, milestone v3.0.0.
+  **Closure limits:** a real takeover of a stale supervisor was never driven live.
+- ✓ **SURV-03, SURV-04, SUPV-03, SUPV-04, SUPV-05** — every state change takes one short OS lock
+  with a re-read, so an update made while another writer waited is not lost; a gate answer decides
+  only the gate it names (fresh 16-hex ids, wrong answers quarantined, never consumed); a pending
+  supervisor is probeable before it is recorded and a superseded one writes nothing and ends its
+  agent; the Phase 50 review residuals are fixed or accepted with a recorded reason — Phase 50.1,
+  milestone v3.0.0. Verified 12/12 with one operator override (the live-run criterion: attempt 2
+  shipped on the final source but was not unattended). **Closure limits:** 999.172-177 open.
 - ✓ **SUPV-02** (#180) — a Code-stage rate limit hands the same stage to a configured fallback agent
   (`--fallback-agent` or `devflow.toml` `fallback_agent`) in the same worktree and branch, with no
   reset, stash or rebase; the fallback reruns the delivery canary and gets no primary session id. A
   refused handoff takes the rate-limit cron arm; a relaunch that fails after the handoff commit ends
   at a gate. Folded in: idle-timeout failures keep their cause (999.102), a torn capture line is never
   read as a rate limit (999.71), notify follow-ups (999.154). Verified 114/114 on 2026-11-08 — Phase
-  51, milestone v3.0.0. **Closure limits:** tests and fixtures only, no live failover run (the dogfood run hit a
-  real rate limit with no fallback configured, 999.186); Plan-stage
+  51, milestone v3.0.0. **Closure limits:** at verification, tests and fixtures only; on 2026-11-08 one live probe on the merged
+  build (`fad00ff`) failed over claude → codex on a synthetic denial and codex finished the interrupted
+  Code stage (`.planning/audits/2026-11-08-live-failover-probe.md`); the dogfood run's real rate
+  limit had no fallback configured (999.186); Plan-stage
   continuation was dropped from scope; open follow-ups in backlog 999.183-187 (999.186: nothing acts
   on the cron instructions yet; 999.187: an ordinary in-supervisor launch failure ends ungated).
 
@@ -455,7 +473,9 @@ version is still derived automatically from conventional-commit classification a
 seven of the ten (#174, #204, #206, 999.115, 999.116, 999.118, #200), plus 999.125, 999.126 and
 999.38 promoted into Phase 48; those moved to Validated.
 
-- [ ] Monitor liveness is answerable without a PID — GONE / STALE / ALIVE (#185)
+All ten delivered; #185 (SUPV-01) moved to Validated at the close. **No active milestone** —
+v4.0 is being declared with `/gsd-new-milestone` (direction decided 2026-11-08: pare DevFlow down to
+a detached runner plus an MCP decision channel; GSD owns the workflow; see `.planning/user/V4-CUT-INVENTORY.md`).
 
 Carried-forward follow-ups NOT in this milestone (backlog): **999.120** (one residual ambient
 `git_flow_for_project` re-resolution in the Validate loop-back), **999.121** (OpenCode has no
@@ -503,10 +523,13 @@ close), confirming the fix. See `.planning/milestones/gsd-hygiene-ROADMAP.md`.)*
   invokes `devflow advance` on completion. `tmux` is no longer a runtime
   dependency.
 - The CLI surface was substantially cut and rebuilt in Phase 11, then expanded
-  through Phase 16. Current operator commands include `start`, `gate`, `logs`,
-  `history`, `parallel`, `sequentagent`, `reference`, `cleanup`, `status`,
-  `list`, `recover`, `doctor`, and `test`; `advance` remains hidden/internal.
-- Workspace version is `2.6.0` (shipped 2026-08-16, tag `v2.6.0`, signed).
+  through Phase 16. Operator commands at the v3.0.0 close: `start`, `resume`, `stop`, `gate`
+  (`list`/`show`/`approve`/`reject`/`sweep`), `logs`, `history`, `parallel`, `reference`,
+  `cleanup`, `status`, `list`, `recover`, `doctor`, `test`, `release`, `ship`, `evidence`;
+  `advance` and `__monitor` are hidden/internal. `sequentagent` was removed (Phase 51 guards
+  against its return). Evidence tier and v4.0 disposition per command:
+  `.planning/user/V4-CUT-INVENTORY.md` (2026-11-08).
+- Workspace version is `3.0.0` (shipped 2026-11-03/04, tag `v3.0.0`, signed; `develop` carries Phase 51 untagged). Earlier: `2.6.0` shipped 2026-08-16.
   Code/docs historically over-claimed "v2.0.0" as current; Phase 12 corrected
   this. The `v2.0.0` label named an **open-ended** milestone rather than a
   bounded arc — decided 2026-07-23 (ROADMAP.md "Milestone stays open") — and
@@ -578,6 +601,14 @@ close), confirming the fix. See `.planning/milestones/gsd-hygiene-ROADMAP.md`.)*
 | `start` and `resume` share one live-run guard, run under the phase lock before state is loaded or written, keyed on recorded monitor/agent pid liveness (Phase 48, 48-19/48-20) | Two agents for one phase were reproduced live via `start --force` and then `resume`; pid-only liveness (Option A) accepts a recycled pid's false refusal as the cost of never launching beside a live run | ✓ Good — verified by live probe and a guard-removal mutant |
 | 999.139 (an unloadable state file hides a live monitor from `start`) is outside Phase 48's criterion 2 (operator ruling 2026-09-23) | The hole needs a dead agent beside a live monitor — the agent-exit → `advance` window already deferred as 999.136 | — Pending (backlog) |
 | TDD commit-shape audit overridden for Phase 48's sequential-worktree plans (operator, 2026-09-19, `48-TDD-OVERRIDE.md`) | The #4799 workaround made the orchestrator commit after verification, so the `test(…)`→`feat(…)` grep cannot see the recorded RED/GREEN evidence | ✓ Accepted; applies to the commit-shape gate only |
+| The live unattended run uses a throwaway GSD project in a private throwaway repo with one human-action checkpoint per attempt (Phase 49 re-scope, operator 2026-09-28) | The first 18-plan design bent GSD's own checkpoint semantics; the operator's principle is to operate within GSD's confines and analyse post hoc | ✓ Good — attempt 3 shipped; the same scaffold ran the 2026-11-08 failover probe |
+| Supervisor liveness comes from a per-launch socket, never a pid read (Phase 50, D-01) | A pid is recyclable and says nothing about who holds the pipe; a socket answers ALIVE/STALE/GONE and names the repair | ✓ Good — 12 live launches, 0 superseded |
+| One short OS lock per state write with a re-read; gate answers bound to fresh gate ids (Phase 50.1) | A held lock across a gate wait and an id-less answer were the two ways a run lost an operator's decision | ✓ Good — verified 12/12; live attempt 2 shipped |
+| Failover is Code-only and one hop per run; a Plan-stage rate limit takes the cron arm (Phase 51, R-2) | Keep the first delivery narrow; Plan continuation dropped from scope | ⚠️ Revisit — v4.0 generalizes to any stage with rotation (operator, 2026-11-08) |
+| A torn final capture line outranks a parsed quota denial everywhere; the stage ends at a gate (Phase 51, X-01 option B, operator 2026-11-08) | A torn line may be a later event that replaced the denial; a wrong failover is worse than a gate | ✓ Good — residuals 999.207/999.209 filed |
+| Dogfooding: DevFlow drives its own phases from Phase 51; every defect is filed as 999.x and never bypassed without approval (operator, 2026-11-04/08) | The point of dogfooding is the defects it produces | ✓ Good — Phase 51 filed 999.183-217; four hand-run exceptions recorded in `51-RUN-NOTES.md` |
+| v3.0.0 closed as an override closeout without a milestone audit; 3.1.0 skipped, Phase 51 ships in 4.0.0 (operator, 2026-11-08) | Five verification digests were stale from later edits while every report passed; v4.0 removes much of what an audit would check | ✓ Accepted |
+| v4.0 direction: DevFlow becomes a detached runner plus an MCP decision channel; Define, Ship, the after-ship hooks, the cron file and `devflow ship` are removed; GSD owns the workflow (operator, 2026-11-08) | Phase 51 by DevFlow needed four by-hand exceptions and produced 24 backlog entries about DevFlow itself; cross-agent continuation is the one thing neither Claude Code nor GSD provides | — Pending (v4.0) |
 
 ## Key Files
 
@@ -622,6 +653,15 @@ delivered most of it. Major version chosen because #185 changes the monitor mech
 socket path to `state.json`, breaking state-file compatibility with 2.x on a published crate.
 Research skipped by operator decision — every item is a verified defect in this codebase with a
 known fix direction, and the #185 socket design is already spike-proven.*
+
+---
+*Last updated: 2026-11-08 after milestone **v3.0.0 Unattended Run Survivability** closed — 7 phases
+(46, 47, 48, 49, 50, 50.1, 51), 120 plans, 2026-09-05 → 2026-11-07 (1,555 scoped commits). Closed
+`override_closeout`: all seven verifications `passed` but five digests stale from later edits; no
+milestone audit (operator). 48 historical audit items acknowledged as deferred. Phases 46-50.1 released
+as 3.0.0; Phase 51 merged to `develop` (PR #234), 3.1.0 skipped. Core Value restated; SUPV-01, SURV-03/04
+and SUPV-03/04/05 moved to Validated (their footers had claimed it without writing the rows). Next:
+`/gsd-new-milestone` v4.0.*
 
 ---
 *Last updated: 2026-11-08 after Phase 51 (Rate-Limit Agent Failover) — 13/13 plans (51-08 dropped by operator ruling); verification passed 114/114. A Code-stage rate limit continues under the configured fallback agent; SUPV-02 validated. Last phase of v3.0.0; no live failover run yet. Backlog 999.183-187 holds what stays open.*

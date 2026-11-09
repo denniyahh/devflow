@@ -271,6 +271,49 @@ blocker on a requirement's traceability row.
 - Adversarial review used on Phase 45 plans (2 rounds, both external lanes REJECT) and Phase 44 post-execution (3 external reviewers + canonical `/gsd-code-review`).
 - Milestone close did real remediation work: branch sync, register reconciliation, 3 Nyquist reconstructions, 2 new backlog filings (999.120/999.121).
 
+## Milestone: v3.0.0 — Unattended Run Survivability
+
+**Shipped:** 2026-11-08 (closed `override_closeout`) — Phases 46-50.1 released as 3.0.0 on 2026-11-03/04; Phase 51 merged to `develop`, 3.1.0 skipped
+**Phases:** 7 (46, 47, 48, 49, 50, 50.1, 51) | **Plans:** 120 | **Tasks:** 246 | **Timeline:** 2026-09-05 → 2026-11-07 (1,555 scoped commits)
+
+### What Was Built
+- 46: the sequential 2-CPU CI job, `base_branch` validated as a ref not a revision, empty-`PATH` test windows moved into child processes, the plan-bashism scanner over staged bytes.
+- 47: one `CODE_STAGE_POLICY` on every Code prompt including the Validate loop-back; a resumed agent's reasoning no longer reads as a new blocking-human checkpoint; `insta` baselines for all six adapters.
+- 48: collision-retrying state and gate writes, first-answer-wins gate responses, `start`/`resume` refuse beside a live run under the phase lock, `recover --clean` serialized, honest no-waiter gate recovery.
+- 49: the live `--mode auto` run on a throwaway project (attempt 3 shipped), the evidence collector, sanitizer and checker, the gate-notify snapshot hook.
+- 50: the socket-addressed supervisor (ALIVE / STALE / GONE, no pid read), one supervisor body for both launch shapes, the pidfd backstop, `stop` through the socket, `monitor_pid` deleted from the state file.
+- 50.1: one short OS lock per state write with a re-read, gate ids with quarantined wrong answers, pending-supervisor liveness lock, superseded supervisors end their agent, 30 plans of review residuals and e2e hygiene.
+- 51: a Code-stage quota denial hands the run to a configured fallback agent in the same worktree; a torn final capture line outranks a parsed denial; idle-timeout failures carry their cause; handoff events.
+
+### What Worked
+- Live runs as the instrument: Phase 49's throwaway-project rig was reused for Phase 50's fault arm, Phase 50.1's attempt and the 2026-11-08 failover probe, so every survivability claim has at least one real record.
+- Dogfooding Phase 51 through DevFlow itself produced 35 backlog entries (999.183-217) in four days — more defects than any review round, and each with a reproduction.
+- The adversarial-review loop (GSD review → fix → external lanes → fix) kept finding real defects in the failover path: the torn-line ordering (X-01), the worktree-arm test gap (X-03), the stale evidence citations (X-04).
+- Negative controls settled arguments that reading code could not: the escaped-stdout-holder case (999.209) and the Phase 46 2-CPU race were each confirmed by a paired run that had to produce the opposite result.
+
+### What Was Inefficient
+- Seven phases, 120 plans and 1,555 commits were spent making the tool survive itself; no phase in this milestone shipped software for anyone else, and Phase 51 by DevFlow needed four by-hand exceptions that a plain GSD session would not have.
+- Five of seven verifications were `stale` at close because later phases edited covered files; the digest mechanism (gsd-core#4623) turns every follow-on phase into an override at milestone close.
+- GSD's milestone-close audit read a resolved entry's evidence tables as ten open deferred items and could not acknowledge them; the close needed a hand edit and an incident entry.
+- The supervise-mode gate loop cannot carry an operator's note to the agent, re-runs the whole phase on a reject, and cannot close a `gaps_found` verification (999.189, 999.192, 999.205, 999.208) — the reason every fix round ran outside DevFlow.
+- Define launches a paid agent session that does nothing (999.214); Ship pushes before its gate fires, so a by-hand close-out can only end a passed run with "abort" (999.210).
+
+### Patterns Established
+- A throwaway GSD project with a one-task phase and a wrapper agent is the cheapest live test of a supervisor seam; the synthetic denial copied a live event's shape with one field flipped.
+- Every dogfood defect is filed as a `999.x` entry in the same session with evidence, what is not established and a fix shape; hand-run stages are recorded as numbered exceptions in the phase's run notes.
+- Reports to the operator sort into decision / awareness / handled, lead with impact, and name what a check does not establish.
+
+### Key Lessons
+- The product is the repository as the session: codex finished Claude's interrupted Code stage because GSD had written the state to disk, not because DevFlow carried context. Build on that; do not duplicate what GSD and Claude Code already orchestrate.
+- "Passed" on stub agents is not "works": the headline feature had never run against a real agent until the probe, and the only real denials on record (Phase 43, Phase 51) were classified live but never archived.
+- A monitoring filter that buffers (`cut` after `grep` without line buffering) delivers nothing; a gate fired 23 minutes before anyone saw it.
+- The ratio of backlog entries about the tool to work the tool shipped for others is the number to watch; for this milestone it was effectively infinite.
+
+### Cost Observations
+- Model mix: Opus for orchestration, planning and verification; Sonnet executors; codex, DeepSeek and Gemini as external review lanes; codex as the live fallback agent.
+- Sessions: multi-session across ~9 weeks; the Phase 51 close-out, probe, inventory and milestone close ran in one session on 2026-11-08.
+- Notable: two full `scripts/check.sh all` runs per fix round (~2,125 tests) plus three CI rounds per PR; the external review's agy lane timed out at 30 minutes and returned partial findings.
+
 ## Cross-Milestone Trends
 
 ### Process Evolution
@@ -280,6 +323,7 @@ blocker on a requirement's traceability row.
 | gsd-hygiene | 1 | 1 | First milestone closed by an interactive session end-to-end same-day; first use of a backfilled PLAN/SUMMARY pair to satisfy a completion-projection tooling gap; first unversioned/plain-label milestone archive |
 | v2.7.0 | 1 (multi-session) | 3 | First milestone driven end-to-end by pi — the agent DevFlow itself now supports; first live subagent-dispatch transcript as e2e evidence |
 | v2.8.0 | multi-session | 6 | All 6 harnesses on the `AgentDriver` contract; first driver verified by a real dogfood run rather than unit tests alone; released incrementally (v2.9.0–v2.12.0) instead of one milestone drop; Nyquist coverage reconstructed for half the phases at close |
+| v3.0.0 | multi-session (~9 weeks) | 7 | First milestone whose phases DevFlow drove itself (Phase 51 dogfood); live runs as the measuring instrument; the first milestone to close with a strategic re-direction (v4.0 pare-down) rather than a next feature |
 
 ### Cumulative Quality
 
@@ -288,6 +332,7 @@ blocker on a requirement's traceability row.
 | gsd-hygiene | N/A — no crates code | N/A | 0 |
 | v2.7.0 | 13 `agents::pi` tests + full workspace + `clippy -D warnings` | N/A | 0 |
 | v2.8.0 | 1235 workspace tests, 0 failed; 6-driver conformance suite + `BrokenDriver` control; per-driver marker-less regressions (pi/antigravity/hermes at CLI level) | N/A | 0 (serde/clap/thiserror/tracing only) |
+| v3.0.0 | ~2,125 tests in `scripts/check.sh all` (0 failed after round 3); 13 CI checks green on PR #234; two e2e tests flaky under full-suite load (999.188, 999.191) | N/A | 0 (pidfd via libc only) |
 
 ### Top Lessons (Verified Across Milestones)
 

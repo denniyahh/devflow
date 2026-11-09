@@ -2,20 +2,19 @@
 gsd_state_version: "1.0"
 milestone: v3.0.0
 milestone_name: milestone (ACTIVE — Unattended Run Survivability)
-current_phase: 51
-current_plan: Not started
-status: completed
+status: Awaiting next milestone
 stopped_at: Phase 51 complete — all phases complete
-last_updated: "2026-11-08T10:44:03.635Z"
+last_updated: "2026-11-09T00:10:42.648Z"
 last_activity: 2026-11-08
-last_activity_desc: Phase 51 complete
-state_head: 54ca9bef30489d6c4dc59741c8d6fb0da6806a7a
+last_activity_desc: Milestone v3.0.0 completed and archived
+state_head: 73993e04dd0dfa9ee7081669f7f6e8a6baa4ab50
 progress:
   total_phases: 7
   completed_phases: 5
   total_plans: 120
   completed_plans: 120
   percent: 71
+current_phase: 51
 ---
 
 # DevFlow — Project State
@@ -23,6 +22,18 @@ progress:
 > Last updated: 2026-09-13
 
 ## Deferred Items
+
+Items acknowledged and deferred at the v3.0.0 milestone close on 2026-11-08 (37 through `audit-open acknowledge`, 11 resolved in place; 9 earlier acknowledgements carried forward):
+
+| Category | Item | Status |
+|----------|------|--------|
+| debug_sessions | planner-wait-observability | diagnosed; heisenbug, left open |
+| debug_sessions | probe-sleep-survives-group-kill | investigating; not root-caused, left open |
+| deferred_items | Phase 47 deferred-items.md: 1 entry (PathGuard hides git/sh from concurrent tests) | acknowledged |
+| deferred_items | Phase 50 deferred-items.md: 13 entries (reap audit under nextest, sentinel-HOME leftovers, retired shell-monitor text, backstop message, stop_marker_path, /tmp leftovers, safe-point-3 stop, 2026-10-19 external review set, stale 47-49 verifications, sanitizer identity fragments, sock/ listability) | acknowledged; each marked resolved or fixed in its own text |
+| deferred_items | Phase 50.1 deferred-items.md: 19 entries (parallel stop reach, wrong pid in not-marked message, flaky liveness/hermes/stop tests, lock-name comments, RecoverError::Lock, recover guard vs STALE, resume wording, stopped flag during gate wait, live pid in pid file, six external-review defects, lock held with socket gone, superseded supervisor kept its agent, signal mask, launch beside exiting supervisor) | acknowledged; most marked resolved in their own text |
+| deferred_items | Phase 25 (archived v2.0.0) deferred-items.md: doc_check::documented_flags has no command context | acknowledged; open |
+| deferred_items | Phase 46 deferred-items.md: D-46-01-A (wr01_ under the 2-CPU pin) and its 10 evidence-table rows | resolved in place (status field set to the bare word; tables converted to bullets) — GSD read the tables as items and could not acknowledge them; see the GSD manual-fix incident log |
 
 Items acknowledged and deferred at milestone close on 2026-08-04:
 
@@ -70,35 +81,16 @@ The text this section carried until 2026-11-04 described Phase 48 as the latest 
 
 See: `.planning/PROJECT.md` (updated 2026-11-08)
 
-**Core value:** `devflow start --phase N` and walk away — reliably drive the agent through the full
-pipeline, never silently corrupt state or lose a human's gate decision.
-**Current focus:** v3.0.0 close-out — Phase 51 complete; next is the milestone audit/completion and the 3.1.0 release
+**Core value:** a coding session that outlives any one agent — the session is the repository, so another agent
+continues the same work when one runs out of quota or budget, and the run asks a human only for the decisions nothing
+else can make (restated by the operator 2026-11-08).
+**Current focus:** planning milestone v4.0 (`/gsd-new-milestone`): pare DevFlow down to a detached runner plus an MCP
+decision channel; cut list in `.planning/user/V4-CUT-INVENTORY.md`. v3.0.0 closed 2026-11-08 (override closeout);
+3.1.0 skipped, Phase 51 ships inside 4.0.0.
 
 ## Operator Next Steps
 
-- **3.0.0 release plan (operator decisions 2026-10-09): steps 1 and 2 done, step 3 half done.**
-  1. The declared-checkpoint fix was done outside GSD and merged; Phase 49.1 was removed.
-  2. Phase 50 ran as a dogfood run; Phase 50.1 followed. 3.0.0 was released 2026-11-03/04.
-  3. **Still to do: prune the backlog, then Phase 51 as a minor release (3.1.0)**, run through DevFlow itself (see `CLAUDE.md`, Dogfooding).
-- Phase 47's `stale` verification is **left stale by operator decision (2026-09-13)** — re-verifying
-  now would hold only until the next ROADMAP.md write. Re-run the verifier once near milestone
-  close, when ROADMAP.md stops changing. Until then `roadmap.analyze` counts 47 as `partial` and
-  `verification.status` names `/gsd-verify-work 47` as its next command. ROADMAP.md's `## Progress`
-  row was corrected by hand to `7/7 | Complete`: `phase.complete` left it at `5/5 | In Progress`, and
-  `roadmap update-plan-progress` cannot mark a stale phase Complete. Upstream, the mechanism is
-  already reported as open-gsd/gsd-core#4623 (`covered_digest` covers shared planning docs); here it
-  staled the very phase `phase.complete` was completing.
-- When that re-verification runs, expect its `check_script_run_test.rs` evidence to be missing.
-  `8c41c46` deleted that file deliberately: `develop`'s `scripts/check.sh` cannot call the
-  workspace-only worktree-guard harness, so `crates/devflow-cli/tests/worktree_guard_harness.rs` now
-  runs the harness inside `cargo test`. Record an override; do not restore the file.
-- **Retrospective review complete (2026-09-13):** `.planning/audits/2026-09-13-phase-47-retrospective.md` is CLOSED. Decisions resolved: D1 Option A (minimal-divergence workspace), D2 P1–P5 process improvements adopted (P1/P2 now, P3/P4 in Phase 48, P5 post-P1), D3 backlog items 999.125, 999.126, and 999.38 promoted now.
-- **Promoted into active roadmap (2026-09-13):** 999.125 and 999.126 (human-gate consistency between preflight and resume) scheduled into Wave 2 alongside Phase 48; 999.38 (test-suite PATH race) scheduled for test-suite isolation. Backlog items remaining unpromoted: 999.120, 999.121.
-- Phase 48 is complete and merged to `develop` via PR #218 (2026-09-24). Phase 49 context gathered 2026-09-24 (`49-CONTEXT.md`); planned 2026-09-25 and revised after adversarial reviews (`49-REVIEWS.md`, `a913495`), then re-scoped 2026-09-28 (ROADMAP `968b713`, context `066251f`): the 18 plans were retired (`bc73b1b`) and the phase replanned 2026-09-29 as 12 plans in 6 waves (`fe5bd3a`…`76c21ca`). Phases 49, 50 and 50.1 have since completed (see `## Active Phase`).
-  Separate follow-up PR: the plan-linter P1 commits `5c18bc3`, `b9ee940`, `56f3466` (kept out of #218). The 48-20 code review's 4 warnings (test coverage
-  and duplication, `48-REVIEW.md`) were left unfixed at close.
-
----
+- Start the next milestone with /gsd-new-milestone
 
 ### Historical — superseded phase notes
 
@@ -169,16 +161,11 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 51
-Plans: 13 (51-01 … 51-14, no 51-08; 8 waves)
-Current Plan: Not started
-Total Plans in Phase: 13
-Completed Plans: 13 of 13
-Status: All phases complete
-Previous phase: 50.1 — complete, 30/30 plans; verification passed 12/12 (one operator override, the live-run criterion); merged via PR #229; released in v3.0.0. Phase 47's verification still reads `stale` by operator decision (re-verify near milestone close).
-Last activity: 2026-11-08 — Phase 51 complete
+Phase: Milestone v3.0.0 complete
+Plan: —
+Status: Awaiting next milestone
+Last activity: 2026-11-08 — Milestone v3.0.0 completed and archived
 
-Progress: [██████████] 100% (7 of 7 phases complete in the ROADMAP progress table — 46, 47, 48, 49, 50, 50.1, 51; 49.1 inserted and removed 2026-10-09; 50.1 inserted 2026-10-10. `roadmap.analyze` reports 2 because it reads 47 and 48 as executed, and `progress.bar` counts plans, 48/48)
 
 ## Recently Shipped
 
