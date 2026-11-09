@@ -93,10 +93,13 @@ than split: no requirement dependency forces a split, and the Validate-gate desi
      surface (`cron-instructions`, `hermes_cron`, `yes_ship`, the four after-ship hook names, the removed `Stage`
      variants) remains under `crates/`, `docs/` or the top-level docs, comments stripped. **Control:** the same test
      fails on a planted stray literal, and the plant is removed before the phase closes. (CUT-03, CUT-04)
-  3. A rate limit with no usable fallback stops at a gate whose context names the reset time and the exact
-     `devflow resume --phase N ...` command to run after it, and no `cron-instructions-NN.json` exists under
-     `.devflow/` afterwards. **Control:** the Phase 51 fixture that asserted the cron file was written now asserts its
-     absence and the gate's presence — one fixture, both directions. (CUT-03)
+  3. A rate limit with no usable fallback waits at a gate whose context names the reset time and the exact
+     `devflow resume --phase N ...` command to run after it. Once the reset time passes, the supervisor relaunches the
+     stage exactly once by itself. A denial with no reset time, or a second denial, leaves the gate open for the
+     operator. No `cron-instructions-NN.json` exists under `.devflow/` afterwards. **Controls:** the Phase 51 fixture
+     that asserted the cron file was written now asserts its absence and the gate's presence — one fixture, both
+     directions. A denial whose reset time has passed is relaunched once, and a second denial in the same fixture is
+     not relaunched again. (CUT-03; amended 2026-11-08, 52-CONTEXT D-15..D-17)
   4. `devflow gate reject <phase> --note "<text>"` relaunches the agent with `<text>` verbatim in its prompt — visible
      in the launch record or captured prompt, not inferred — and a note containing the word "abort" does **not**
      abort the run; only an explicit abort answer does. A Validate rejection relaunches GSD's gaps route for the
@@ -218,7 +221,8 @@ synthetic denial (claude → codex, 2026-11-08) and no surviving raw capture of 
 
   1. With a rotation configured as an ordered list (for example `claude, codex, antigravity`), a quota denial at
      Plan, Code or Validate hands the run to the next agent in the same worktree on the same branch, a second denial
-     hands it again, and exhausting the rotation ends at CUT-03's gate naming the reset time and the resume command.
+     hands it again, and exhausting the rotation ends at CUT-03's gate, which names the reset time and the resume
+     command and relaunches once after the reset (amended 2026-11-08, 52-CONTEXT D-15..D-17).
      **Control:** with no rotation configured the first denial ends at that gate; Phase 51's single-hop test still
      passes as a rotation of length one. (FAIL-01; supersedes Phase 51's R-2)
   2. When the current agent's rate-limit telemetry (`utilization`, `unifiedWindows`) crosses the configured threshold

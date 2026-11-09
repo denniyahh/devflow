@@ -123,6 +123,22 @@ ahead of any GATE or OPS fix (ROADMAP sequencing note). New capabilities belong 
   They become "waits at a gate that relaunches at the reset time (once; no reset time → plain gate)". Phase 52's
   criterion 3 control keeps its "one fixture, both directions" shape and also asserts the single automatic relaunch.
 
+### How this phase is run (operator, 2026-11-08)
+- **D-18:** Phase 52 is **not dogfooded**. It runs with GSD commands in an agent session (`/gsd-plan-phase 52`,
+  `/gsd-execute-phase 52`, …), not with `devflow start`. This is an exception to the CLAUDE.md dogfooding rule, which
+  says DevFlow drives its own phases from Phase 51 on, and is recorded here as that rule requires. The criterion 1
+  control (a `--dry-run` of the installed 3.0.0 binary) is a dry run, not a dogfood run, and still applies.
+- **D-19:** **Verify the gap loop before building it.** No plan task may implement D-08..D-11 (the verdict from GSD's
+  status, the stage-level gap loop, the clean-reject route, the stale-gaps gate) until a recorded check on a throwaway
+  GSD project has shown what GSD actually does:
+  - `query verification status` returns `passed` / `stale` / `gaps_found` in the cases D-08 assumes;
+  - `/gsd-plan-phase N --gaps` writes `gap_closure` plans from a `gaps_found` report;
+  - `/gsd-execute-phase N --gaps-only` executes them and its verifier re-verifies to `passed`;
+  - `/gsd-execute-phase N` on a stale `passed` report with every plan summarized re-runs the verifier.
+
+  The record lives at `52-GAP-LOOP-VERIFICATION.md`. If it contradicts a decision, that decision returns to the
+  operator before planning continues.
+
 ### Claude's Discretion
 - How the note is framed inside the prompt: a delimited verbatim block, with control characters other than newline and
   tab stripped. It must stay byte-identical for printable text.
