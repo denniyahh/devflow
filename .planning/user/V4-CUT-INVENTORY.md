@@ -45,7 +45,7 @@ Live records cited: **[49]** `.planning/phases/49-live-unattended-run-the-milest
 | `logs [-f] [--phase]` | U | `commands.rs` `logs_follow_ends_when_the_followed_state_is_gone_and_no_exit_file_will_come`, `default_logs_phase_prefers_single_active_state` | core | Watching the capture |
 | `logs --stderr` | N | `rg '"--stderr' crates/*/tests` → none; no `commands.rs` test names `stderr` | core | Trivial switch; add a test or fold into `logs` |
 | `history [N]` | U | `devflow-core/src/history.rs` `timeline_orders_events_and_correlates_retained_captures`; `rg '"history"' crates/*/tests` → none | defer | A view over the event log; keep if cheap |
-| `parallel --phases [--agents] [--mode] [--force]` | E | `phase7_cli.rs` `parallel_creates_two_worktrees_and_spawns_two_monitors`; `fallback_agent_config.rs` `parallel_ignores_the_config_key` | cut | One run per phase; GSD owns multi-phase; closes 999.181 |
+| `parallel --phases [--agents] [--mode] [--force]` | E | `phase7_cli.rs` `parallel_creates_two_worktrees_and_spawns_two_monitors`; `fallback_agent_config.rs` `parallel_ignores_the_config_key` | cut | operator 2026-11-08; one run per phase; GSD owns multi-phase; closes 999.181, retires 999.26 |
 | `reference [--branch] [--refresh]` | E | `phase7_cli.rs` `reference_and_cleanup_worktree_cli_flow`; flags: `rg '"--branch'` and `rg '"--refresh'` over `crates/*/tests` → none | cut | A static snapshot worktree is `git worktree add` |
 | `cleanup [--force]` | L | [probe] 999.213 (`cleanup` after `stop` misreports; `--force` leaves state); E `phase7_cli.rs` `cleanup_force_removes_worktree_for_until_stopped_phase` | core-rework | Fix 999.213: remove state, say why it keeps |
 | `status` | L | [RM-186] `devflow status` after the real rate limit; [probe] 999.213; E `supervisor_e2e.rs` `status_reports_each_liveness_state_with_its_repair_verb` | core-rework | Show stop reason and fallback state (999.190, 999.202) |
@@ -122,7 +122,7 @@ Live records cited: **[49]** `.planning/phases/49-live-unattended-run-the-milest
 | `doc_check` source-scan tests | U | `doc_check.rs` `source_devflow_env_vars_and_subcommands_are_documented`, `allowlist_entries_require_reasons` | core-rework | Keep; allowlist and docs shrink with the cut |
 | Auto-chain flag writer (`gsd_config.rs`, `.planning/config.json`) + leak repair | E | `auto_chain_flag_e2e.rs` `auto_mode_code_stage_child_observes_the_flag_set`; `auto_chain_leak_repair_e2e.rs` | defer | GSD owns the workflow; decide with `gsd-autonomous` |
 | Legacy Claude launch path | E\* | see `--legacy-claude-launch` | cut | Above |
-| `parallel` orchestration (`parallel.rs`) | E | see `parallel` | cut | Above |
+| `parallel` orchestration (`parallel.rs`) | E | see `parallel` | cut | operator 2026-11-08 |
 | Shared checkout lock (`lock.rs`) | U | `acquire_creates_lock_and_records_pid` | cut | Serves the hook batch only |
 | Version detection (`version.rs`), `ship_evidence.rs`, `ship.rs` | U | `version.rs` `detect_prefers_cargo_then_pyproject_then_package_json` | cut | Serve VersionBump / Ship only |
 | Durable file ops (`durable.rs`) | U | `replace_fsyncs_the_file_and_its_directory` | core | State and gate records |

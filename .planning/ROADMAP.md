@@ -1211,7 +1211,9 @@ naming the reset time; `devflow status` shows the reset time for a rate-limit pa
 
 **Fix shape (not tested):** carry the pid `stop` actually signalled from the signal step to the message instead of re-reading the record; `signal_sent` is a bool today. Test with a holder replaced during the wait.
 
-### Phase 999.181: A `devflow stop` Signal to `devflow parallel` Also Stops Phases It Launches Later (BACKLOG)
+### Phase 999.181: A `devflow stop` Signal to `devflow parallel` Also Stops Phases It Launches Later (OBSOLETE with Phase 52 CUT-04 — `devflow parallel` removed)
+
+**Disposition (2026-11-08, v4.0 backlog prune):** `devflow parallel` is removed in v4.0 (operator decision 2026-11-08, CUT-04, which lists this entry as closed); one `start` per process leaves no later phase for a stray stop flag to reach.
 
 **Found:** 2026-11-02, Phase 50.1-29 (recorded in that phase's `deferred-items.md`); promoted 2026-11-04. Checked by reading `parallel.rs` and `stop_requested_at_safe_point`, not reproduced.
 
@@ -4802,7 +4804,9 @@ Plans:
 
 - [~] Attempted in Phase 26 — built, verified 11/11, then blocked by review (5 open Criticals). Code retained on `feature/phase-26` as a defective starting point; re-attempt gated on 999.39.
 
-### Phase 999.26: `devflow parallel` Git Object-Store Race (BACKLOG)
+### Phase 999.26: `devflow parallel` Git Object-Store Race (OBSOLETE with Phase 52 CUT-04 — `devflow parallel` removed)
+
+**Disposition (2026-11-08, v4.0 backlog prune):** `devflow parallel` is removed in v4.0 (operator decision 2026-11-08, CUT-04), so its concurrent-commit race has no product surface left.
 
 **Goal:** Confirm-or-refute whether `devflow parallel`'s concurrent per-worktree commits can hit the same git object-store corruption seen in Phase 20's 20b instance 2 (`invalid object` mid-commit-loop, a fsync-ordering flake fixed fixture-side per D-05), and fix it at the product level if the race is real. 20-RESEARCH.md assumption A1 flagged the analog as plausible but unconfirmed — `devflow parallel` has no DevFlow-level lock serializing its concurrent commits.
 **Priority:** Medium | **Size:** M — low likelihood but high severity: if the product shares the hole, the next occurrence is a corrupted user repo with an opaque `invalid object` error, not a re-runnable red CI job. Dominated by a deliberate reproduction attempt (a code read can't settle it); the fix if needed is bounded. Relates to 999.4 / DEN-29 (concurrent-ship contention — same concurrency family). Source: Phase 20 D-08 / 20-RESEARCH A1 (2026-07-22). GitHub: [#187](https://github.com/denniyahh/devflow/issues/187) (migrated from Linear DEN-51).

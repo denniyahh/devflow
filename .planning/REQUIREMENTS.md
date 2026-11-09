@@ -21,7 +21,7 @@ requirement closes a backlog entry, the entry is named; `.planning/user/V4-CUT-I
       999.185, 999.186; retires 999.137's R-2.
 - [ ] **CUT-04**: Every inventory row marked `cut` that the operator confirms in the Phase 52 discuss step is removed with
       its documentation, tests, allowlist entries and OPERATIONS.md rows, and `scripts/check.sh all` (including
-      `doc_check`) passes on the result. Closes 999.181 (`parallel`).
+      `doc_check`) passes on the result. `devflow parallel` is cut (operator 2026-11-08): closes 999.181, retires 999.26.
 
 ### Supervise gate loop (GATE)
 
