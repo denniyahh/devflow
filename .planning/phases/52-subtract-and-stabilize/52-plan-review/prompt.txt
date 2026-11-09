@@ -1,0 +1,47 @@
+You are an adversarial reviewer of a phase PLAN set for the DevFlow Rust repository. The working
+directory is a read-only snapshot of the repo (commit e6b3343, branch feature/phase-52). Do NOT
+modify any tracked file. You may read files and run read-only commands (rg, cargo check, etc.).
+
+TARGETS (the 32 plans):  .planning/phases/52-subtract-and-stabilize/52-01-PLAN.md .. 52-32-PLAN.md
+CONTEXT you must check plans against:
+  .planning/phases/52-subtract-and-stabilize/52-CONTEXT.md   (locked decisions D-NN)
+  .planning/phases/52-subtract-and-stabilize/52-RESEARCH.md
+  .planning/phases/52-subtract-and-stabilize/52-VALIDATION.md
+  .planning/phases/52-subtract-and-stabilize/52-PATTERNS.md
+  .planning/ROADMAP.md (Phase 52 section), .planning/REQUIREMENTS.md
+  .planning/user/V4-CUT-INVENTORY.md
+  CLAUDE.md (repo traps section is important), and the actual source under crates/.
+
+Phase goal (ROADMAP): a run is Plan -> Code -> Validate and ends there as finished; no Define, no
+Ship, no after-ship hooks, no cron-resume file, no `devflow ship`, none of the confirmed cut rows,
+on a tree where `scripts/check.sh all` is green.
+
+Attack the plans. Do not summarize or praise them. Find, with the exact file and the exact
+line/quoted text for each:
+1. Contradictions between plans, or between plans and CONTEXT decisions / requirements.
+2. Unstated assumptions that would break under real use or edge loads.
+3. Steps that do not survive contact with the actual codebase or tools: verify symbol names,
+   file paths, line references, test names and module paths against crates/ source. A gate that
+   names a test or symbol that does not exist (or will not exist after an earlier plan deletes
+   it) is a finding.
+4. Wave / depends_on errors: a plan deleting code another same-wave or earlier-wave plan edits;
+   intermediate commits that leave the workspace not compiling; wave numbers that are not the
+   depends_on DAG level.
+5. Acceptance criteria / <automated> verify gates that are not falsifiable or have no negative
+   control. Known repo traps: `cargo test <filter>` exits 0 when nothing matches (gates must use
+   `cargo nextest run -p <pkg> --lib --no-tests=fail -E 'test(=module::path::name)'`, one test per
+   command); `rg -c` prints nothing on zero matches; the CLI package is `devflow` not
+   `devflow-cli`; doc_check requires every DEVFLOW_* env read and Command variant to be documented
+   or allowlisted in the same change; devflow-core is published, so removed pub items are semver
+   changes needing `cargo semver-checks`.
+6. Scope leaks (work belonging to Phases 53-55 or not in the confirmed cut list), and requirements
+   (CUT-*, GATE-*) or CONTEXT decisions that no plan covers.
+7. Missing edge cases, concurrency hazards, or unhandled failure modes (state files written by
+   older binaries, in-flight runs, resume of a run stopped at a removed stage).
+
+Be specific and hostile. Prefer ~10 sharp, reproducible findings with file:line citations to 30
+vague ones. Label speculation as speculation. Output format:
+## CONFIRMED  (each: id, severity Critical/High/Medium/Low, file:line, quoted text, why it breaks,
+               evidence you checked in source, suggested fix)
+## SUSPECTED  (same fields, marked speculation)
+## COVERAGE   (which plans you actually read in full, and which you skimmed)
