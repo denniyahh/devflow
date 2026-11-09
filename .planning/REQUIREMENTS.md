@@ -15,10 +15,10 @@ requirement closes a backlog entry, the entry is named; `.planning/user/V4-CUT-I
       `--until`-style selection), and `--dry-run` shows no Define. Closes 999.183, 999.214.
 - [ ] **CUT-02**: A run ends after Validate as *finished*: there is no Ship stage, no after-ship hooks (Merge, VersionBump,
       ChangelogAppend, BranchCleanup), no `devflow ship` and no `--yes-ship`; the event log records `workflow_finished`
-      with `shipped: false` and the worktree and branch are left for the operator. Closes 999.180, 999.210.
+      with `shipped: false` and the worktree and branch are left for the operator. Closes 999.180, 999.210; retires 999.111, 999.129, 999.132, 999.173, 999.178.
 - [ ] **CUT-03**: A rate limit with no usable fallback stops at a gate whose context names the reset time and the exact
       resume command; no `cron-instructions-NN.json` is written and nothing in the tree or docs refers to it. Closes
-      999.185, 999.186.
+      999.185, 999.186; retires 999.137's R-2.
 - [ ] **CUT-04**: Every inventory row marked `cut` that the operator confirms in the Phase 52 discuss step is removed with
       its documentation, tests, allowlist entries and OPERATIONS.md rows, and `scripts/check.sh all` (including
       `doc_check`) passes on the result. Closes 999.181 (`parallel`).

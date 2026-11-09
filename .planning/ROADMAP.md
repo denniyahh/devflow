@@ -626,7 +626,9 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
-### Phase 999.218: The Plan-Bashism Scanner Drops the Finding Text When the File Path Is Long (BACKLOG)
+### Phase 999.218: The Plan-Bashism Scanner Drops the Finding Text When the File Path Is Long (DUPLICATE of 999.169)
+
+**Disposition (2026-11-08, v4.0 backlog prune):** Filed 2026-11-08 without checking the backlog: 999.169 (2026-10-22) records the same defect with its cause, the report being piped through `cut -c1-200`. This entry's 'mechanism not read' is superseded by that.
 
 **Found:** 2026-11-08, running `crates/devflow-cli/tests/plan_bashism_scanner.rs` from a checkout under the session
 scratchpad (`/tmp/claude-1000/…/scratchpad/lintwt`, fixture path 199 characters): five `assert_blocked` tests failed
@@ -677,7 +679,9 @@ uncommitted SUMMARY/STATE/ROADMAP changes, and finished), but that is the workfl
 what happens; add a short handoff paragraph to the relaunched prompt (taking over from <agent> after a rate limit; the
 tree may hold uncommitted work from it; do not discard it). Phase 52 (failover).
 
-### Phase 999.214: Define Is a Paid No-Op: Every Run Launches a Full Agent Session That Does Nothing (BACKLOG)
+### Phase 999.214: Define Is a Paid No-Op: Every Run Launches a Full Agent Session That Does Nothing (FOLDED INTO Phase 52 — CUT-01, Define removed)
+
+**Disposition (2026-11-08, v4.0 backlog prune):** v4.0 removes the Define stage (CUT-01).
 
 **Found:** 2026-11-08, live failover probe on the merged Phase 51 build (`fad00ff`), throwaway project; report `.planning/audits/2026-11-08-live-failover-probe.md`.
 Define launched real Claude twice in this probe; each took 12-15 s and about $0.33, and the agent's own answer was
@@ -730,7 +734,9 @@ is `rejected` (the Agent SDK's documented denial value); the single-document pat
 **Fix shape:** rewrite the README sentence to name what each launch shape reads, linking OPERATIONS.md; say "once per arming"
 in OPERATIONS.md. Docs only; next fix branch.
 
-### Phase 999.210: A Supervise Run Has No Way to End at Validate for a By-Hand Close-Out Except "Abort" (BACKLOG)
+### Phase 999.210: A Supervise Run Has No Way to End at Validate for a By-Hand Close-Out Except "Abort" (FOLDED INTO Phase 52 — CUT-02, Ship removed)
+
+**Disposition (2026-11-08, v4.0 backlog prune):** v4.0 ends a run after Validate as finished (CUT-02).
 
 **Found:** 2026-11-08, Phase 51 dogfood, Validate gate `18e6310585119d8e` ("Validation passed — approve to ship?").
 Phase 51's conventions keep Ship blocked and close out by hand with `scripts/cut-pr-branch.sh`. Approving the Validate
@@ -1137,7 +1143,9 @@ writing the stop after that error needs the record kept on the gate-answer relau
 general fix should cover it: after a gate-answer relaunch fails, re-check `recorded_canary_refusal` and stop with
 `gate_relaunch_refused` as the pre-check does. Read from the code; not reproduced at runtime.
 
-### Phase 999.186: Nothing Acts on the Rate-Limit Cron Instructions, So a Paused Run Never Resumes (BACKLOG)
+### Phase 999.186: Nothing Acts on the Rate-Limit Cron Instructions, So a Paused Run Never Resumes (FOLDED INTO Phase 52 — CUT-03, cron file removed)
+
+**Disposition (2026-11-08, v4.0 backlog prune):** v4.0 removes the cron-instructions file; a rate limit with no fallback stops at a gate (CUT-03).
 
 **Found:** 2026-11-07, Phase 51 dogfood run (v3.0.0, supervise mode, no fallback agent). The Code stage hit a real
 Claude rate limit 52 minutes in (2026-11-06 11:27 EST, `advance_evaluated` status `ratelimited`, reason "rate limited
@@ -1159,7 +1167,9 @@ path and print the reset time and the exact resume command in `devflow status`. 
 **Acceptance:** a rate-limited run either has a registered resume job that a test can observe, or opens a gate/notify
 naming the reset time; `devflow status` shows the reset time for a rate-limit pause.
 
-### Phase 999.185: A Superseded Supervisor Can Still Write the Rate-Limit Cron File (BACKLOG)
+### Phase 999.185: A Superseded Supervisor Can Still Write the Rate-Limit Cron File (FOLDED INTO Phase 52 — CUT-03, cron file removed)
+
+**Disposition (2026-11-08, v4.0 backlog prune):** v4.0 removes the cron-instructions file; a rate limit with no fallback stops at a gate (CUT-03).
 
 **Found:** 2026-11-06, Phase 51 second external plan review (codex), confirmed by reading source at `0d80aac`.
 
@@ -1179,7 +1189,9 @@ naming the reset time; `devflow status` shows the reset time for a rate-limit pa
 
 **Acceptance:** a test where an ordinary Plan run reports success over an untracked `PLAN.md` stops at a gate, with a committed-and-clean negative control that still advances.
 
-### Phase 999.183: `start --dry-run` Says Define Runs `/gsd-discuss-phase`, Which It Never Does (BACKLOG)
+### Phase 999.183: `start --dry-run` Says Define Runs `/gsd-discuss-phase`, Which It Never Does (FOLDED INTO Phase 52 — CUT-01, Define removed)
+
+**Disposition (2026-11-08, v4.0 backlog prune):** v4.0 removes the Define stage (CUT-01, which lists this entry as closed); the dry-run label goes with it.
 
 **Found:** 2026-11-05, Phase 51 dogfood preflight (`devflow start --phase 51 --agent claude --mode supervise --until plan --dry-run`, v3.0.0).
 
@@ -1209,7 +1221,9 @@ naming the reset time; `devflow status` shows the reset time for a rate-limit pa
 
 **Fix shape (not decided):** scope the flag to the phase a `start` holds, or clear it when a phase's holder is released; test two phases in one `parallel` process with a signal between them.
 
-### Phase 999.180: An Approved Validate Gate Is Not Closed Before Ship (BACKLOG)
+### Phase 999.180: An Approved Validate Gate Is Not Closed Before Ship (FOLDED INTO Phase 52 — CUT-02, Ship removed)
+
+**Disposition (2026-11-08, v4.0 backlog prune):** v4.0 removes the Ship stage, so no gate transitions to Ship (CUT-02).
 
 **Found:** 2026-11-03, Phase 50.1's external review round 4 (Antigravity); checked by reading the code, not reproduced. Already in `ee6ec79`.
 
@@ -1225,7 +1239,9 @@ naming the reset time; `devflow status` shows the reset time for a rate-limit pa
 
 **Fix shape (not tested):** return early from that arm with a line saying the next supervisor ended before its record was saved; extend `a_stop_sent_straight_to_the_next_supervisor_before_its_record_is_saved_is_recorded` to assert no `stage_launched` event and no "launched" line.
 
-### Phase 999.178: A `yes_ship` Revoke Written During the Ship Advance Is Ignored (BACKLOG)
+### Phase 999.178: A `yes_ship` Revoke Written During the Ship Advance Is Ignored (OBSOLETE with Phase 52 CUT-02 — `yes_ship` removed)
+
+**Disposition (2026-11-08, v4.0 backlog prune):** `--yes-ship`, `yes_ship` and `DEVFLOW_YES_SHIP` are removed with the Ship stage.
 
 **Found:** 2026-11-03, Phase 50.1's external review round 4 (Codex); checked by reading the code, not reproduced. Already in `ee6ec79`.
 
@@ -1257,7 +1273,9 @@ naming the reset time; `devflow status` shows the reset time for a rate-limit pa
 
 **Fix shape (not tested):** bound the audit by requirement for headless runs, or give the agent the operator's answer ahead of time. Separately decide whether a live run's agents should see the operator's global rules and real files at all.
 
-### Phase 999.175: An Approved Auto-Decided Checkpoint Can Still Park an Unattended Run at Ship (BACKLOG)
+### Phase 999.175: An Approved Auto-Decided Checkpoint Can Still Park an Unattended Run at Ship (FOLDED INTO Phase 53 — ASK-05; its Ship refusal goes with CUT-02)
+
+**Disposition (2026-11-08, v4.0 backlog prune):** The park-at-Ship symptom disappears with CUT-02. The defect underneath (an operator's checkpoint approval is not carried to the executor and verifier) is what ASK-05's question channel answers: the operator's answer becomes the recorded authority.
 
 **Found:** 2026-11-02, Phase 50.1's live attempt 1. Nothing in DevFlow failed; the gate fired as designed.
 
@@ -1269,7 +1287,9 @@ naming the reset time; `devflow status` shows the reset time for a rate-limit pa
 
 **Fix shape (not tested):** carry the operator's approval into the resume prompt and have the agent record it as the authority for the decision, so the record is true and the verifier can see it, without routing around `/gsd-ship`. Name `/gsd-verify-work` in the gate's choices. The payload's facts stay the fixture's own, so a real project's unverifiable figures should still reach a human.
 
-### Phase 999.173: A Ship Retry After a Restart Can Still Bump the Version Twice (BACKLOG)
+### Phase 999.173: A Ship Retry After a Restart Can Still Bump the Version Twice (OBSOLETE with Phase 52 CUT-02 — after-ship hooks removed)
+
+**Disposition (2026-11-08, v4.0 backlog prune):** VersionBump and ChangelogAppend leave DevFlow; release steps belong to `scripts/cut-release.sh` / wsx.
 
 **Found:** 2026-11-02, external review of Phase 50.1; the in-process half fixed in `8c1dd3d`.
 
@@ -1995,6 +2015,8 @@ lock-free run first.
 
 ### Phase 999.137: Recover Sweep Does Not Reach Every Artifact It Resets (BACKLOG)
 
+**Partial disposition (2026-11-08, v4.0 backlog prune):** R-2 (corrupt cron records) goes with the cron-instructions file (CUT-03); R-7 and R-8 remain.
+
 **Found:** 2026-09-22, external review of the Phase 48 review-fix diff (`69c3ada..4d119fb`; codex,
 agy and DeepSeek lanes). Records: `.planning/reviews/48-code-review-2026-09-22/review-fix-round/`.
 **Verified against source by reading; the DeepSeek and agy lanes reproduced R-2 in scratch copies.**
@@ -2143,7 +2165,9 @@ when the action it was asked for did not happen.
 
 **Acceptance:** not decided; set at promotion.
 
-### Phase 999.132: Gate List and Status Disagree After an Unwaited Ship Answer (BACKLOG)
+### Phase 999.132: Gate List and Status Disagree After an Unwaited Ship Answer (OBSOLETE with Phase 52 CUT-02 — Ship gate removed)
+
+**Disposition (2026-11-08, v4.0 backlog prune):** There is no Ship gate or `devflow ship` in v4.0.
 
 **Found:** Phase 48 discussion (`48-CONTEXT.md` `<deferred>`), filed 2026-09-22 on the operator's
 decision to track all five Phase 48 deferrals here. After a Ship-gate answer with nothing waiting,
@@ -2219,7 +2243,9 @@ record it as a Phase 48 limit and to fix it through this item's gate-waiter regi
 
 **Acceptance:** not decided; set at promotion.
 
-### Phase 999.129: Ship Finalization-Retry Gate Recovery Is Unverified (BACKLOG)
+### Phase 999.129: Ship Finalization-Retry Gate Recovery Is Unverified (OBSOLETE with Phase 52 CUT-02 — Ship finalization removed)
+
+**Disposition (2026-11-08, v4.0 backlog prune):** The finalization-retry gate goes with the Ship stage and its after-ship hooks.
 
 **Found:** Phase 48 D-05 (`48-CONTEXT.md` `<deferred>`), filed 2026-09-22 on the operator's
 decision. Nobody has verified whether `devflow ship --phase N`, or anything else, consumes an answer
@@ -2623,7 +2649,9 @@ computed against the configured base — with a negative control that the defaul
 unchanged. `rg -n 'git_flow_for_project' crates/devflow-cli/src/pipeline_outcomes.rs` returns only
 non-production (test) sites afterward.
 
-### Phase 999.119: Live `devflow start --mode auto` End-to-End Verification of the Configured-Base Fork/Preflight/Merge Chain (BACKLOG)
+### Phase 999.119: Live `devflow start --mode auto` End-to-End Verification of the Configured-Base Fork/Preflight/Merge Chain (RESOLVED 2026-10-09 — Phase 49 VERIFY-01; Ship merge-target clause obsolete with CUT-02)
+
+**Disposition (2026-11-08, v4.0 backlog prune):** The live `--mode auto` run recorded end to end against the configured base (fork point, `.planning/config.json`, unattended preflight) is VERIFY-01, validated by Phase 49 (`49-LIVE-RUN.md`, attempt 3). The remaining 'merge target at Ship' clause goes with the Ship stage.
 
 **Found:** 2026-09-02, phase 45 UAT (`45-UAT.md` test 1) and verification
 (`45-VERIFICATION.md` `behavior_unverified_items`). Phase 45 shipped AUTO-01 verified at
@@ -2917,7 +2945,9 @@ the A4 doc comment already flags.
 
 ---
 
-### Phase 999.111: `devflow` Never Detects or Runs the Security Verdict Before Ship — Discovers the Gap Only at Ship Time (BACKLOG)
+### Phase 999.111: `devflow` Never Detects or Runs the Security Verdict Before Ship — Discovers the Gap Only at Ship Time (OBSOLETE with Phase 52 CUT-02 — Ship and the Validate→Ship hook removed)
+
+**Disposition (2026-11-08, v4.0 backlog prune):** DevFlow no longer runs Ship or the Validate→Ship hook list, so it never reaches GSD's `ship:pre` security gate; that gate belongs to the by-hand or wsx close-out.
 
 **Found:** 2026-08-24, dogfooding Phase 43 through Ship. The Ship-stage agent's own preflight
 (`ship:pre` hooks) correctly refused to push/create a PR: `workflow.security_enforcement` is
@@ -6418,6 +6448,8 @@ unattended; the loop-back mechanism that exists specifically to enable that is w
 loop-back at all).
 
 ### Phase 999.61: Four Indirect Git-Reaching Spawn Edges a Literal Grep Cannot See (BACKLOG)
+
+**Partial disposition (2026-11-08, v4.0 backlog prune):** the `hooks.rs:222` site is the DocsUpdate hook, which v4.0 removes with the Validate→Ship hook list (CUT-02); three sites remain.
 
 **Goal:** Phase 27 scrubbed all 41 production `Command::new("git")` sites, but its own workspace census found **five** further spawn edges that reach `git` *indirectly* — through `sh`, through `cargo`, or through an operator-configured command — and are therefore invisible to a literal grep for `Command::new("git")`. One (`monitor.rs:148`, the agent spawn) was closed in-phase by `936b371`. **Four remain:**
 
