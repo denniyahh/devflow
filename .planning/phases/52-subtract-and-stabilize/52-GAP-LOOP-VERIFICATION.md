@@ -4,7 +4,8 @@
 **GSD version:** @opengsd/gsd-core 1.20.1 (`gsd-tools.cjs runtime-identity --raw`)
 **Status:** checks 1-5 done (2026-11-08). Checks 1-4 held. **Check 5 contradicts D-08/D-10 as written**: the
 `stale` → execute-phase re-verify is not reliable when an agent drives it, and a fix that only adds an uncovered file
-never goes stale. Per D-19, D-08's stale route and D-10 go back to the operator before planning continues.
+never goes stale. Per D-19 both went back to the operator, who resolved them with 52-CONTEXT D-32 (explicit prompt + post-check)
+and D-33 (uncovered changes count as stale). Upstream: open-gsd/gsd-core#6096.
 **Evidence:** `52-gap-loop-evidence/`: each launch's `.meta` (prompt, rc, git log before and after) and `.result.md`
 (the agent's final message, cost, turns), the throwaway repo's final `git log`, the gap-closure plan, and the final
 VERIFICATION.md.

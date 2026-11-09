@@ -139,9 +139,10 @@ ahead of any GATE or OPS fix (ROADMAP sequencing note). New capabilities belong 
   - `/gsd-execute-phase N` on a stale `passed` report with every plan summarized re-runs the verifier.
 
   The record lives at `52-GAP-LOOP-VERIFICATION.md`. If it contradicts a decision, that decision returns to the
-  operator before planning continues. Checks 1-4 are done (all held). **Check 5 (D-21)** gates D-10: `/gsd-quick` on
+  operator before planning continues. Checks 1-4 held. Check 5 contradicted D-08's stale route and D-10, and the operator resolved both with D-32 and D-33,
+  so D-08..D-11 may now be planned. (Check 5, D-21, was: `/gsd-quick` on
   a passed phase, once on a covered file and once on an uncovered one, then `verification status` and execute-phase
-  re-verify.
+  re-verify.)
 
 ### Amendments from the external review (2026-11-08)
 
@@ -219,6 +220,24 @@ operator decisions; D-23..D-31 are within Claude's remit and correct facts or fi
   (`tests/release_check.rs`) and depends on `version::read_workspace_self_pins`, which goes with `version.rs`. The
   port covers the command's checks (pins, main divergence, absent-origin fallback, publish order) and keeps a
   negative control for each.
+
+- **D-32 (operator, after check 5): `stale` routes get an explicit prompt and a post-check** (amends D-08, D-10).
+  Live check 5 showed the execute-phase agent can skip the required re-verify: it read `passed` from the frontmatter and
+  judged the change test-only (open-gsd/gsd-core#6096). So:
+  1. The relaunch prompt quotes GSD's status and route verbatim: "verification is stale … resume at the phase gates
+     and re-run the verifier (#4682)".
+  2. When Code ends, DevFlow re-reads `verification status`. If it is still `stale`, that Code pass counts as failed
+     and fires a gate, never a pass.
+
+  This makes a skipped re-verify visible; it does not prevent one. Control: a Code pass that leaves the report
+  `stale` ends at a gate, not at Validate's "passed".
+- **D-33 (operator, after check 5): uncovered changes count as stale** (amends D-10, D-21). A fix that only touches
+  files outside the report's `covered_files` leaves GSD's status `passed` (check 5 probe). After a clean-reject fix,
+  DevFlow lists the files the fix commits changed (git), minus `.planning/`, and subtracts GSD's `covered_files` (read
+  with `gsd query frontmatter get`). Anything left is treated as `stale`: the D-32 re-verify relaunch and post-check
+  run. This is a stopgap beside GSD's own rule; the upstream request is on #6096 (`/gsd-quick --phase N`), and the
+  check is removed once GSD links quick tasks to a phase. Controls: a fix to an uncovered new file triggers the
+  re-verify; a fix touching only `.planning/` does not.
 
 ### Claude's Discretion
 - How the note is framed inside the prompt: a delimited verbatim block, with control characters other than newline and
