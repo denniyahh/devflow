@@ -62,3 +62,4 @@ side from a bare `contains` to a match against the actual clap flag surface.
 
 **Not filed to the backlog** — no owning plan in Phase 25. Worth a backlog entry
 before this check is relied on as release evidence.
+  status: acknowledged

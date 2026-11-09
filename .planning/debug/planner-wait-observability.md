@@ -4,6 +4,10 @@ trigger: "GSD planner and revision agents repeatedly exceeded the manual ten-min
 created: 2026-09-15
 updated: 2026-09-15
 tracked_in: backlog 999.163 (upstream gsd-core; recorded 2026-10-19)
+audit_acknowledged:
+  milestone: v3.0.0
+  at: 2026-11-08
+  status: diagnosed
 ---
 
 # Debug: Planner Wait Observability

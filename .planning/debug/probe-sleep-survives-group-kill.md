@@ -4,6 +4,10 @@ trigger: "agents::opencode::tests::spawn_with_timeout_kills_a_hung_child failed 
 created: 2026-09-22
 updated: 2026-09-22
 tracked_in: backlog 999.151, "Related" note (recorded 2026-10-19)
+audit_acknowledged:
+  milestone: v3.0.0
+  at: 2026-11-08
+  status: investigating
 ---
 
 # Debug: Probe Sleep Survives the Group Kill

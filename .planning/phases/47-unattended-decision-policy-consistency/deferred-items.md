@@ -46,7 +46,7 @@
   passing run, not on an observed before and after.
 
 - devflow-core `PathGuard` (`agents/pi.rs`, `agents/opencode.rs`) hides `git`/`sh` from concurrent tests
-  status: open
+  status: acknowledged
   **What:** `PathGuard::set` replaces process-global `PATH` with a tempdir holding only a stub script
   (`pi.rs:284-307`, `opencode.rs:420-443`). Each file serializes its own callers with a module-local
   `static ENV_MUTEX` (`pi.rs:194`, `opencode.rs:355`), and the guard's SAFETY comment claims "no other
