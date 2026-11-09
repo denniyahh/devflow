@@ -813,6 +813,8 @@ the report already says `gaps_found`.
 a re-verify step rather than to `FullExecute`. Or raise upstream that a report whose covered inputs changed should read
 `stale` even when its status is `gaps_found`. Relates to 999.192, 999.205.
 
+**Upstream:** filed 2026-11-08 as https://github.com/open-gsd/gsd-core/issues/6078. It was reproduced on gsd-core 1.20.1: a covered-file change flips a `passed` report to `stale` but leaves a `gaps_found` report `gaps_found`. Phase 52 handles it with a gate (52-CONTEXT D-11).
+
 ### Phase 999.207: A Quota Denial Followed by a Line the Agent Was Killed Mid-Way Through Still Splits the Monitor and the Verdict (BACKLOG)
 
 **Found:** 2026-11-08, Phase 51 Code-stage re-review (51-REVIEW.md WR-02 at `7095b38`), confirmed against source.

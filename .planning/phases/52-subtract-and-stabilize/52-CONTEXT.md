@@ -86,7 +86,7 @@ ahead of any GATE or OPS fix (ROADMAP sequencing note). New capabilities belong 
   (999.189 fix shape). After such a fix the report is `stale`, so D-08's `stale` route covers re-verification.
 - **D-11:** A `gaps_found` report whose covered files have changed since it was written (999.208) produces a **gate**
   whose context says the report is gaps_found but stale and that no GSD route re-verifies it. A gsd-core upstream
-  issue is filed for `gaps_found` taking priority over `stale` (`verification.cjs` L1537). DevFlow does not drive a
+  issue is filed for `gaps_found` taking priority over `stale` (`verification.cjs` L1537): open-gsd/gsd-core#6078. DevFlow does not drive a
   verifier outside a GSD command (operator principle 2026-09-28, "operate within GSD's confines"). The in-run gap loop
   does not hit this case, because its own execute-phase run re-verifies.
 - **D-12:** No new cap. Each `gaps_found` round counts as a Validate failure, so `MAX_CONSECUTIVE_FAILURES` (3) and
@@ -234,7 +234,7 @@ ahead of any GATE or OPS fix (ROADMAP sequencing note). New capabilities belong 
   exists (operator, 2026-11-08).
 - **Upstream (gsd-core):** `readVerificationStatus` returns `gaps_found` before the staleness check
   (`verification.cjs` L1537), so a gaps report whose covered files changed cannot be routed to re-verification.
-  File it as a gsd-core issue (D-11).
+  Filed 2026-11-08 as https://github.com/open-gsd/gsd-core/issues/6078 (D-11), with a reproduction and a `passed` control.
 
 </deferred>
 
