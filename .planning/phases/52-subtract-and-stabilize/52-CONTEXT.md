@@ -239,6 +239,36 @@ operator decisions; D-23..D-31 are within Claude's remit and correct facts or fi
   check is removed once GSD links quick tasks to a phase. Controls: a fix to an uncovered new file triggers the
   re-verify; a fix touching only `.planning/` does not.
 
+### Decisions after research (operator, 2026-11-09)
+
+Source: the three open questions in `52-RESEARCH.md`, each checked against the code before it was put to the operator.
+
+- **D-34: only commits outside `.planning/` count as progress** (amends D-25). `consecutive_failures_made_progress`
+  (`mode.rs` L180-181, used at `pipeline_outcomes.rs` ~L610) treats any new commit on the phase branch as progress and
+  resets the streak to 1. Every gap round commits `.planning/` files (the gap plan, summaries, the re-verified report),
+  so the 3-in-a-row cap could never fire on a real gap loop. Progress is now commits that change at least one path
+  outside `.planning/`. This changes the 999.66 guard, and a docs-only Code fix also counts as no progress. Control:
+  three gap rounds that commit only `.planning/` files force the gate. One round that also changes a source file
+  resets the streak.
+- **D-35: finishing keeps the run's state** (amends D-04, D-29). Today the finish path deletes state
+  (`clear_run_state`, `pipeline_gate.rs` ~L355). That suited 3.0, where Ship merged and deleted the branch. In v4 the
+  branch and worktree stay, and `cleanup` removes a worktree with no state without `--force` (it keeps only a
+  `stopped` state, `commands.rs` ~L1330-1347). So the state stays, recorded as stopped with reason `finished`:
+  - `status` shows the run as finished;
+  - `cleanup` keeps the worktree and says why, and `cleanup --force` removes both (OPS-02);
+  - a new `start` on the phase says it replaces the finished state;
+  - the phase is still deregistered from the machine-global gate registry.
+
+  Control: after a finished run, `cleanup` without `--force` keeps the worktree.
+- **D-36: on a `gaps_found` Validate, `gate approve` runs the gap loop** (amends D-04 for that case). In supervise
+  mode, the Validate gate on a gaps verdict offers three answers:
+  - approve: close the gaps (D-09: Plan `--gaps` → Code `--gaps-only` → Validate);
+  - reject with a note: steer that fix;
+  - abort: end the run.
+
+  Finishing over open gaps is not offered, so a run never ends `finished` with a gaps report. Control: approving a
+  gaps gate never records `workflow_finished`.
+
 ### Claude's Discretion
 - How the note is framed inside the prompt: a delimited verbatim block, with control characters other than newline and
   tab stripped. It must stay byte-identical for printable text.
