@@ -130,7 +130,7 @@ ahead of any GATE or OPS fix (ROADMAP sequencing note). New capabilities belong 
   `/gsd-execute-phase 52`, …), not with `devflow start`. This is an exception to the CLAUDE.md dogfooding rule, which
   says DevFlow drives its own phases from Phase 51 on, and is recorded here as that rule requires. The criterion 1
   control (a `--dry-run` of the installed 3.0.0 binary) is a dry run, not a dogfood run, and still applies.
-- **D-19:** **Verify the gap loop before building it.** No plan task may implement D-08..D-11 (the verdict from GSD's
+- **D-19 [informational]:** (satisfied before planning: checks 1-5 recorded in `52-GAP-LOOP-VERIFICATION.md`; no plan implements it) **Verify the gap loop before building it.** No plan task may implement D-08..D-11 (the verdict from GSD's
   status, the stage-level gap loop, the clean-reject route, the stale-gaps gate) until a recorded check on a throwaway
   GSD project has shown what GSD actually does:
   - `query verification status` returns `passed` / `stale` / `gaps_found` in the cases D-08 assumes;
@@ -298,6 +298,25 @@ Source: the three open questions in `52-RESEARCH.md`, each checked against the c
   relaunches without spending the run's one automatic relaunch. A later denial with a known reset time still gets its
   one automatic relaunch. Within one gate, the timer and an answer race through a single claim, so there is never a
   double launch. `not_before` (sweep protection) is kept separate from whether a timer is armed.
+
+- **D-39 (operator, 2026-11-09): status-less gates get their own kinds in the same routers** (amends D-37's
+  Scope paragraph). Three gates fire for reasons unrelated to GSD's verification report:
+  - the stage-failure gate (an agent run failed to launch, crashed, reported failure or timed out, or the infra
+    ceiling was hit);
+  - the preflight gate (a pre-launch check failed);
+  - the checkpoint-declaration gate (Code found unapproved human-only checkpoints).
+
+  Each gets a gate kind (`StageFailure`, `Preflight`, `CheckpointDeclaration`), with today's meanings as explicit
+  arms in `approve_route` and `reject_route`:
+  - stage failure: approve retries the stage; reject relaunches the stage with the note (GATE-01);
+  - preflight: approve is an explicit override (D-18f);
+  - checkpoint declaration: approve means the checkpoints were seen;
+  - on preflight and checkpoint-declaration gates, reject is not offered (approve or abort);
+  - abort ends the run everywhere.
+
+  No gate is kindless. The routers are total over every gate, and every gate text is rendered from them (W3). They
+  never route these three by GSD's status: approving a Code launch failure over an old `passed` report would finish
+  the run without the Code work.
 
 ### Claude's Discretion
 - How the note is framed inside the prompt: a delimited verbatim block, with control characters other than newline and
