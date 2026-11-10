@@ -100,7 +100,7 @@ pub struct GitFlow {
     config: GitFlowConfig,
 }
 
-/// Summary of a feature branch for the `devflow list` command.
+/// Summary of a feature branch for `devflow status`'s open-branch list.
 #[derive(Debug, Clone)]
 pub struct BranchInfo {
     /// Branch name (e.g. "feature/phase-05").

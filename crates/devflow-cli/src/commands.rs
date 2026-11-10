@@ -5275,26 +5275,6 @@ fn describe_worktree_dir(name: &str) -> String {
     }
 }
 
-pub(crate) fn list(project_root: &Path) -> Result<(), CliError> {
-    let git = GitFlow::for_project(project_root);
-    let branches = git.list_feature_branches()?;
-    if branches.is_empty() {
-        println!("no open feature branches");
-        return Ok(());
-    }
-    println!(
-        "{:<25} {:>6} {:>7}  LAST COMMIT",
-        "BRANCH", "AHEAD", "BEHIND"
-    );
-    for b in &branches {
-        println!(
-            "{:<25} {:>6} {:>7}  {}",
-            b.name, b.ahead, b.behind, b.last_commit
-        );
-    }
-    Ok(())
-}
-
 fn print_open_branches(project_root: &Path) {
     let git = GitFlow::for_project(project_root);
     let base = config::git_flow_for_project(project_root).develop;

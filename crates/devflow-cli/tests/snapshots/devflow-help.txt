@@ -12,7 +12,6 @@ Commands:
   reference  Create or refresh a static reference worktree at `.worktrees/reference/`
   cleanup    Remove phase worktrees and their feature branches
   status     Show current workflow state
-  list       List all feature branches with divergence from develop
   recover    Recover or inspect stale/abandoned workflow state
   test       Run local quality checks: cargo test, clippy, and fmt --check
   doctor     Audit the environment and report what's installed, missing, or broken
