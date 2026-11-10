@@ -15,8 +15,8 @@
 use crate::CliError;
 use crate::config_parse::{checkout_lock_timeout, gate_timeout_secs};
 use crate::pipeline_gate::{
-    LoopBackReason, abort, finish_workflow, loop_back_to_code, run_gate, run_gate_with_timeout,
-    transition,
+    LoopBackReason, abort, finish_run, finish_workflow, loop_back_to_code, run_gate,
+    run_gate_with_timeout, transition,
 };
 use crate::pipeline_launch::{close_gate, commit, launch_stage, recorded_canary_refusal};
 use devflow_core::gates::{GateAction, GateResponse};
@@ -765,7 +765,8 @@ pub(crate) fn handle_validate_outcome(
     }
 
     match result {
-        ValidateResult::Passed => transition(project_root, state, Stage::Ship),
+        // D-05: auto mode finishes on a passing Validate, without a gate.
+        ValidateResult::Passed => finish_run(project_root, state),
         ValidateResult::Failed => {
             // The plain-Failed tail arm — the common auto-loop path, and the
             // one the Phase 29 dogfood actually hit. Evidence root: see the
@@ -1812,18 +1813,15 @@ mod tests {
     }
 
     /// D-18e's "two independent signals agreeing" arm: a probe pass plus an
-    /// explicit `verdict: pass` classify as `ValidateOutcome::Passed` and
-    /// drive straight through to Ship — no forced gate (Auto mode,
-    /// `consecutive_failures == 0`), no counter touched. PATH is
-    /// neutralized under `ENV_MUTEX` (matching
-    /// `consecutive_failures_reaches_ceiling_across_cycles`) so
-    /// `transition`'s own `launch_stage` call cannot spawn a real agent CLI;
-    /// its resulting `Err` (agent binary not found) is discarded, since
-    /// `transition` mutates `state.stage` to `Ship` before that call and the
-    /// mutation survives regardless of the launch outcome.
+    /// explicit `verdict: pass` classify as `ValidateOutcome::Passed` and, in
+    /// Auto mode with `consecutive_failures == 0`, finish the run through
+    /// `finish_run` (D-05): no forced gate, no counter touched, no transition
+    /// to Ship. PATH is neutralized under `ENV_MUTEX` (matching
+    /// `consecutive_failures_reaches_ceiling_across_cycles`) so a regression
+    /// back to a transition could not spawn a real agent CLI.
     #[test]
-    fn external_verify_agreement_advances_to_ship() {
-        const NAME: &str = "pipeline_outcomes::tests::external_verify_agreement_advances_to_ship";
+    fn external_verify_agreement_finishes_the_run() {
+        const NAME: &str = "pipeline_outcomes::tests::external_verify_agreement_finishes_the_run";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_git_only_path_dir();
             let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
@@ -1851,9 +1849,10 @@ mod tests {
         let outcome = classify_validate_outcome(&result);
         assert_eq!(outcome, ValidateOutcome::Passed);
 
-        let _ = handle_validate_outcome(root, &mut state, outcome);
+        handle_validate_outcome(root, &mut state, outcome).expect("the finish succeeds");
 
-        assert_eq!(state.stage, Stage::Ship);
+        assert_eq!(state.stage, Stage::Validate, "no transition to Ship");
+        assert!(state.finished && state.stopped, "{state:?}");
         assert_eq!(
             state.consecutive_failures, 0,
             "an agreeing outcome must never touch the failure counter"
@@ -2236,11 +2235,10 @@ mod tests {
     /// why criterion 3's structural fix does not and could not close criterion 4.
     ///
     /// **The routing half** is asserted here only for the gating direction (the
-    /// one criterion 4 claims). The `Passed` → `Stage::Ship` direction is pinned
-    /// by `external_verify_agreement_advances_to_ship`, which needs `ENV_MUTEX`
-    /// and a neutralized `PATH` to keep `transition`'s `launch_stage` from
-    /// spawning a real agent CLI; reproducing that here would add env mutation to
-    /// an otherwise pure test for no additional coverage.
+    /// one criterion 4 claims). The `Passed` → finish direction is pinned by
+    /// `external_verify_agreement_finishes_the_run`, which runs under a
+    /// neutralized `PATH`; reproducing that here would add a child-process
+    /// rerun to an otherwise pure test for no additional coverage.
     #[test]
     fn grafted_failure_shape_gates_instead_of_shipping() {
         const NAME: &str =

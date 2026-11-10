@@ -127,6 +127,79 @@ pub(crate) fn transition(
     launch_stage(state, None, Some(from))
 }
 
+/// The stop reason a run records when its Validate passes (D-35).
+pub(crate) const FINISHED_STOP_REASON: &str =
+    "finished: Validate passed; the worktree and branch are kept";
+
+/// End the run after a passing Validate (CUT-02; D-04, D-05, D-29, D-35).
+/// Validate is the last stage, so this is how every run that passes it ends:
+/// in auto mode on the pass, in supervise mode when the Validate gate is
+/// approved.
+///
+/// The state is kept, recorded `stopped` and `finished` with
+/// [`FINISHED_STOP_REASON`], and the supervisor record and `gate_pending` are
+/// cleared, as `transition`'s `--until` halt does, so `doctor` never reads the
+/// finished run as a crashed one. The phase leaves the machine-global gate
+/// registry. Nothing else is touched: no git call, no hook, no merge, push,
+/// tag or branch deletion, so the operator gets the tree as Validate left it.
+///
+/// It emits `workflow_finished` with `{"reason":"finished","shipped":false}`,
+/// then fires the notify command once and records `notify_fired`. It does not
+/// read `stop_until`: with `--until validate` a passing Validate is a finish,
+/// not a halt, because Validate is the last stage.
+pub(crate) fn finish_run(project_root: &Path, state: &mut State) -> Result<(), CliError> {
+    let _ = close_gate(project_root, state.phase, Stage::Validate);
+    commit(state, |s| {
+        s.stopped = true;
+        s.finished = true;
+        s.stop_reason = Some(FINISHED_STOP_REASON.to_string());
+        s.supervisor = None;
+        s.gate_pending = false;
+        s.code_fix = None;
+    })?;
+    registry::deregister(project_root, state.phase);
+    events::emit(
+        project_root,
+        state.phase,
+        "workflow_finished",
+        serde_json::json!({ "reason": "finished", "shipped": false }),
+    );
+    notify_run_end(
+        project_root,
+        state,
+        Stage::Validate,
+        "finished",
+        &format!(
+            "phase {} finished: Validate passed; the worktree and branch are kept",
+            state.phase
+        ),
+    );
+    println!(
+        "phase {} finished — Validate passed; the worktree and branch are kept",
+        state.phase
+    );
+    Ok(())
+}
+
+/// Fire the notify command once for a run that has ended at `stage`, then
+/// record `notify_fired` with the end's `reason` (D-06, D-29). Called after
+/// `workflow_finished`, by each site that emits it.
+fn notify_run_end(project_root: &Path, state: &State, stage: Stage, reason: &str, context: &str) {
+    gates::fire_gate_notify_with_fallback(
+        state.phase,
+        stage,
+        context,
+        false,
+        state.gate_notify_cmd.as_deref(),
+    );
+    events::emit(
+        project_root,
+        state.phase,
+        "notify_fired",
+        serde_json::json!({ "stage": stage.to_string(), "unexpected": false, "reason": reason }),
+    );
+}
+
 /// Why the pipeline is looping back to Code, recorded on the `loop_back`
 /// event so `events.jsonl` distinguishes cases that are indistinguishable
 /// from the counters alone (IN-02, 999.78).
