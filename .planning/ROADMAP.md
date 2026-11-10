@@ -637,6 +637,36 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.219: `devflow resume` (and `start --no-worktree`) Commits GSD's First Chain-Flag Write as a "Killed Run" Leak Repair (BACKLOG)
+
+**Found:** 2026-11-10, Phase 52 plan check after the round-5 review (`52-plan-review-5`), from source; not
+reproduced live. A project whose committed `.planning/config.json` has no `workflow._auto_chain_active` key gets
+`"_auto_chain_active": false` added, uncommitted, by GSD's own `/gsd-plan-phase` (`plan-phase/steps/auto-advance-check.md`
+L17; upstream open-gsd/gsd-core#6124). On the next `devflow resume`, `repair_leaked_auto_chain_flag`
+(`pipeline_launch.rs` L494, called at L3634) runs `force_clear_auto_chain` (`gsd_config.rs` L245): `set_auto_chain_active(false)`
+changes nothing, `probe_head` reports `Differs` (the key is absent in HEAD), `without_flag` makes the two copies equal,
+so `commit_path` commits GSD's write with `REPAIR_COMMIT_MESSAGE` ("A previous run for this phase was killed before its
+in-process guard could clear workflow._auto_chain_active …", L346-356), sets `committed_tree_repaired`, and the run
+prints the killed-run notice and emits `auto_chain_flag_repaired`.
+
+**The defect:** the repair cannot tell a leaked `true` from an absent key that GSD set to `false`. The commit itself is
+harmless (it records the value the absent key already meant), but its message and the notice are false: no run was
+killed and nothing leaked.
+
+**Not established:** a live run has not produced it. `devflow start` in worktree mode cannot hit it in the same run
+(its repair runs before that run's Plan, and an existing phase worktree makes `start` refuse). From source, not run:
+`devflow start --no-worktree` launches in the project checkout (`commands.rs` ~L705-719) with no dirty-tree refusal
+before the repair (~L714), so a checkout still holding an uncommitted GSD write from an earlier run or a hand-run
+`/gsd-plan-phase` gets it committed under the same false message, provided git carries the write across
+`feature_start`'s `git checkout <develop>` (`git.rs` ~L157-161; otherwise start fails first) and the flag is the file's
+only difference from develop (otherwise the repair declines with a warning).
+
+**Fix shape (not decided):** report and commit a repair only when HEAD or the working tree actually held `true`; when
+HEAD lacks the key and the working copy holds `false`, either commit with an accurate message ("record GSD's
+`_auto_chain_active: false`") or leave it to the operator, and say which. Add a fixture row: HEAD without the key,
+working tree `false` → no killed-run notice. Candidate: a fix branch after Phase 52, or fold into Phase 52 if the
+operator wants it beside D-46 (whose limit it touches).
+
 ### Phase 999.218: The Plan-Bashism Scanner Drops the Finding Text When the File Path Is Long (DUPLICATE of 999.169)
 
 **Disposition (2026-11-08, v4.0 backlog prune):** Filed 2026-11-08 without checking the backlog: 999.169 (2026-10-22) records the same defect with its cause, the report being piped through `cut -c1-200`. This entry's 'mechanism not read' is superseded by that.

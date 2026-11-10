@@ -420,6 +420,17 @@ Source: the three open questions in `52-RESEARCH.md`, each checked against the c
   records **no** PASS (`validate_pass_head` stays unset), so a later clean-up of the tree does not revive it and a
   finish needs another Validate over the clean tree. The dirty read lists untracked files whatever the git config
   says (`--untracked-files=all`).
+  Amended 2026-11-10 by the operator (plan review round 5, V1): GSD's own `/gsd-plan-phase` (run without `--auto`)
+  writes `workflow._auto_chain_active false` into the tracked `.planning/config.json` and never commits it, so in a
+  project whose committed config lacks that key, every Validate reads a dirty tree until the file is committed once.
+  This is accepted: D-46 stays exact (`.planning/` included), Phase 52 adds no DevFlow write for it, and the gate
+  names the file. OPERATIONS.md documents the one commit, and the cause is reported upstream as open-gsd/gsd-core#6124.
+  Correction (orchestrator, from source, 2026-11-10): an existing repair already reacts to this file. On
+  `devflow resume`, `force_clear_auto_chain` (35.1) commits GSD's added `false` with a message and notice claiming a
+  killed run leaked the flag; `devflow start --no-worktree` does the same on a checkout that still holds the
+  uncommitted write, when git carries it across start's branch checkout and the flag is the file's only difference
+  from develop (read from source, not run). The commit clears the dirty tree; the message is false. Logged as
+  backlog 999.219.
 
 ### Claude's Discretion
 - How the note is framed inside the prompt: a delimited verbatim block, with control characters other than newline and

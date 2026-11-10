@@ -465,3 +465,24 @@ replan applies the confirmed rows below; the refuted and plausible rows need no 
 - pi S2: one OPERATIONS.md line that a gate approve follows the same column in both modes.
 
 Simplification proposals in the round-4 SUMMARY are optional; take one only if it shrinks a plan touched above.
+
+## Round 5 review of D-46 and the round-4 fixes (2026-11-10)
+
+Source: `52-plan-review-5/SUMMARY.md` (agy, pi; codex dropped on a usage limit; host-verified). No lane found a path
+that finishes a run without `can_finish`. The operator accepted V1 as a documented limit (52-CONTEXT D-46, second
+amendment). The replan applies the rows below; refuted rows need no change.
+
+### Required changes (each MUST be addressed)
+
+| # | Plans | Change |
+|---|-------|--------|
+| V1 | 52-33 (OPERATIONS text), 52-29 (Limits) | Document that GSD's `/gsd-plan-phase` adds `workflow._auto_chain_active` to an uncommitted `.planning/config.json` in a project whose committed config lacks the key; the first Validate gate then names that file, and committing it once clears it. No code change, no exemption. |
+| V2 | 52-26 | State the stage-write scan rule: split at the existing `#[cfg(test)]` test-module marker (a file without it is all non-test text); drop each line from the first `//`; count `\b([A-Za-z_]\w*)\.stage\s*=(?![=>])` whose receiver is not `spec`; exactly 2 hits. Controls: planted `persisted.stage = Stage::Plan;` counts; `// state.stage = to`, `spec.stage = a`, `a.stage == b`, `!= state.stage =>` do not. Name the limits (struct literal, `mem::replace`, `&mut s.stage`). Do not borrow the split from 52-29 (a later plan): define it in 52-26. |
+| V3 | 52-29 | (i) The guard fix is required, not conditional: the no-key row fails at fe9ebd0 because `set_auto_chain_active` adds the key; make the guard restore the bytes. (ii) Correct the Limits line: a leaked `true` is repaired and committed at start/resume (`gsd_config.rs` L320-339); only a file that also carries the operator's own uncommitted edit stays dirty, and every gate then names it. |
+| V4 | 52-29 | One line at the ledger head: rows before Round 6 are history; where one conflicts with the body, the body and D-45 govern. |
+
+### Also apply (one line each, from the plausible rows)
+
+- pi C2: in 52-29, a refused answer re-enters the gate wait on the reopened gate.
+- pi C3: in 52-29, the dispatch owns the single `phase_failure_budget_reset` call (52-28's moves into it; one event).
+- host: in 52-29's Limits, a project that ignores `.planning/` keeps VERIFICATION.md outside both HEAD and the dirty read.
