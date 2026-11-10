@@ -50,8 +50,8 @@ fn init_repo(root: &Path) {
     // Pre-baked GSD context for every phase these tests launch — the
     // fresh-codex pre-flight (13-06) refuses codex runs on phases with no
     // CONTEXT.md on develop, and these fixtures exercise phases 7–9 with
-    // both agents.
-    for phase in ["07", "08", "09"] {
+    // both agents and phases 11–13 and 44 with codex.
+    for phase in ["07", "08", "09", "11", "12", "13", "44"] {
         let dir = root.join(format!(".planning/phases/{phase}-test"));
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join(format!("{phase}-CONTEXT.md")), "ctx\n").unwrap();
@@ -92,51 +92,6 @@ fn path_with_fake_bin(fake_bin: &Path) -> String {
 }
 
 fn run_devflow(home: &common::HermeticHome, root: &Path, fake_bin: &Path, args: &[&str]) -> Output {
-    run_devflow_inner(home, root, fake_bin, args, false)
-}
-
-/// [`run_devflow`] with D-11's legacy-launch opt-out forced on for the spawned
-/// process.
-///
-/// **This is the integration-suite counterpart of 34-06's in-process
-/// `state.legacy_claude_launch = true`, and it exists for the same reason: to
-/// state a test's launch-path premise explicitly instead of inheriting it from
-/// `STREAM_JSON_STAGES` membership.** A test whose subject is `start`'s own
-/// behaviour — which branch it forks from, whether it creates a worktree, where
-/// a `--until` cap halts it — is orthogonal to the transport the stage's agent
-/// is launched over. Left implicit, that premise silently depends on the
-/// stage's ABSENCE from `STREAM_JSON_STAGES`, and 34-05's widening destroys it:
-/// `canary_gate` then invokes the real `ClaudeCanaryLauncher` at `Stage::Define`
-/// and the launch dies on a delivery refusal that has nothing to do with the
-/// subject under test.
-///
-/// The variable is read by `devflow_core::config::claude_legacy_launch()` inside
-/// the child, folded into the persisted `state.legacy_claude_launch` by
-/// `commands::start`'s `apply_legacy_launch_opt_out`, and therefore survives to
-/// every later stage the DETACHED monitor launches — which is what these tests
-/// need, since the monitor chain, not this process, runs Plan and beyond.
-///
-/// **Do NOT reach for this to silence a canary refusal in a test whose subject
-/// IS the stream path.** Pinning such a test to the legacy transport deletes the
-/// coverage rather than stabilising it; see
-/// `parallel_creates_two_worktrees_and_spawns_two_monitors`, which deliberately
-/// does not use this helper.
-fn run_devflow_legacy_launch(
-    home: &common::HermeticHome,
-    root: &Path,
-    fake_bin: &Path,
-    args: &[&str],
-) -> Output {
-    run_devflow_inner(home, root, fake_bin, args, true)
-}
-
-fn run_devflow_inner(
-    home: &common::HermeticHome,
-    root: &Path,
-    fake_bin: &Path,
-    args: &[&str],
-    legacy_launch: bool,
-) -> Output {
     let mut command = common::hermetic_devflow(home);
     command
         .args(args)
@@ -144,9 +99,6 @@ fn run_devflow_inner(
         .env("PATH", path_with_fake_bin(fake_bin))
         .env("DEVFLOW_TEST_ROOT", root)
         .current_dir(root);
-    if legacy_launch {
-        command.env("DEVFLOW_CLAUDE_LEGACY_LAUNCH", "true");
-    }
     // HYG-01: bound the gate wait on the CHILD's env. Supervise-mode stages
     // that reach a gate (never-silent Define/Plan failures, Validate in
     // supervise) block `devflow advance` for the default 3-day gate timeout;
@@ -400,29 +352,29 @@ fn start_defaults_to_worktree() {
     let root = repo.path();
     init_repo(root);
     let fake_bin = fake_bin_dir(&[(
-        "claude",
+        "codex",
         "#!/bin/sh\nprintf 'DEVFLOW_RESULT: {\"status\":\"success\"}\\n'\n",
     )]);
 
     // No worktree flag at all — worktree-by-default (13d) means this must
     // create the isolated worktree without an explicit opt-in.
     //
-    // Legacy launch pinned deliberately (34-06b): the subject is where `start`
-    // puts the phase, not which transport its agent is launched over. See
-    // `run_devflow_legacy_launch`.
-    run_devflow_legacy_launch(
+    // A capture-shape agent (codex) pinned deliberately (34-06b): the subject
+    // is where `start` puts the phase, not which transport its agent is
+    // launched over.
+    run_devflow(
         &home,
         root,
         &fake_bin.path,
         &[
-            // `supervise` (35.1-03): the legacy opt-out pinned above is
+            // `supervise` (35.1-03): the capture shape pinned above is
             // exactly what C2 refuses in `Mode::Auto`, and where `start` puts
             // the phase is mode-independent.
             "start",
             "--phase",
             "11",
             "--agent",
-            "claude",
+            "codex",
             "--mode",
             "supervise",
         ],
@@ -478,7 +430,7 @@ fn start_worktree_mode_ignores_main_checkout_divergence() {
     git(root, &["checkout", "-q", "ancient"]);
 
     let fake_bin = fake_bin_dir(&[(
-        "claude",
+        "codex",
         "#!/bin/sh\nprintf 'DEVFLOW_RESULT: {\"status\":\"success\"}\\n'\n",
     )]);
 
@@ -486,22 +438,21 @@ fn start_worktree_mode_ignores_main_checkout_divergence() {
     // succeed (the helper asserts a zero exit status) despite the main
     // checkout being 51 commits behind develop.
     //
-    // Legacy launch pinned deliberately (34-06b): the subject is the
-    // divergence check's scope, not the launch transport. See
-    // `run_devflow_legacy_launch`.
-    run_devflow_legacy_launch(
+    // A capture-shape agent (codex) pinned deliberately (34-06b): the subject
+    // is the divergence check's scope, not the launch transport.
+    run_devflow(
         &home,
         root,
         &fake_bin.path,
         &[
             // `supervise` (35.1-03): same reason as phase 11 above — the
-            // legacy opt-out is refused in `Mode::Auto`, and this test's
+            // capture shape is refused in `Mode::Auto`, and this test's
             // subject (main-checkout divergence) is mode-independent.
             "start",
             "--phase",
             "13",
             "--agent",
-            "claude",
+            "codex",
             "--mode",
             "supervise",
         ],
@@ -524,14 +475,14 @@ fn start_no_worktree_uses_feature_branch() {
     let root = repo.path();
     init_repo(root);
     let fake_bin = fake_bin_dir(&[(
-        "claude",
+        "codex",
         "#!/bin/sh\nprintf 'DEVFLOW_RESULT: {\"status\":\"success\"}\\n'\n",
     )]);
 
-    // Legacy launch pinned deliberately (34-06b): the subject is that
-    // `--no-worktree` keeps the phase on its feature branch, not which
-    // transport its agent is launched over. See `run_devflow_legacy_launch`.
-    run_devflow_legacy_launch(
+    // A capture-shape agent (codex) pinned deliberately (34-06b): the subject
+    // is that `--no-worktree` keeps the phase on its feature branch, not which
+    // transport its agent is launched over.
+    run_devflow(
         &home,
         root,
         &fake_bin.path,
@@ -540,9 +491,9 @@ fn start_no_worktree_uses_feature_branch() {
             "--phase",
             "12",
             "--agent",
-            "claude",
-            // `supervise` (35.1-03): same reason as phase 11 — the legacy
-            // opt-out pinned above is refused in `Mode::Auto`, and
+            "codex",
+            // `supervise` (35.1-03): same reason as phase 11 — the capture
+            // shape pinned above is refused in `Mode::Auto`, and
             // `--no-worktree`'s branch placement is mode-independent.
             "--mode",
             "supervise",
@@ -582,28 +533,27 @@ fn start_until_plan_halts_cleanly() {
     let root = repo.path();
     init_repo(root);
     let fake_bin = fake_bin_dir(&[(
-        "claude",
+        "codex",
         "#!/bin/sh\nprintf 'DEVFLOW_RESULT: {\"status\":\"success\"}\\n'\n",
     )]);
 
-    // Legacy launch pinned deliberately (34-06b): the subject is WHERE the
-    // `--until` cap halts the stage machine, not which transport each stage's
-    // agent is launched over. The opt-out reaches Plan too — it is persisted
-    // into `state.legacy_claude_launch` by `start`, so the detached monitor
-    // that launches Plan reads it back. See `run_devflow_legacy_launch`.
-    run_devflow_legacy_launch(
+    // A capture-shape agent (codex) pinned deliberately (34-06b): the subject
+    // is WHERE the `--until` cap halts the stage machine, not which transport
+    // each stage's agent is launched over. Codex launches every stage, Plan
+    // included, in the capture shape.
+    run_devflow(
         &home,
         root,
         &fake_bin.path,
         &[
             // `supervise` (35.1-03): same reason as phase 11 above — the
-            // legacy opt-out is refused in `Mode::Auto`, and the `--until` cap
+            // capture shape is refused in `Mode::Auto`, and the `--until` cap
             // halts at Plan, well before supervise's Validate gate.
             "start",
             "--phase",
             "44",
             "--agent",
-            "claude",
+            "codex",
             "--mode",
             "supervise",
             "--until",
