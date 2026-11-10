@@ -10431,7 +10431,7 @@ mod tests {
     /// the same root on the same branch, and completes there. The fallback's
     /// commit sits on the primary's, so nothing was reset or rebased, and no
     /// branch or worktree was added. Negative control in the same run: no
-    /// cron instruction and no `rate_limit_resume_scheduled` event.
+    /// `rate_limit_resume_scheduled` event.
     ///
     /// Supervise mode, as `HandoffRun::launch_with` builds it: under Auto the
     /// Code preflight refuses a Codex fallback on the unattended launch shape.
@@ -10560,8 +10560,8 @@ mod tests {
     }
 
     /// Assert a rate limit with no usable fallback waited at `phase`'s `stage`
-    /// gate: one `gate_fired` there naming `devflow resume --phase N`, no
-    /// cron-instructions file and no `rate_limit_resume_scheduled` event.
+    /// gate: one `gate_fired` there naming `devflow resume --phase N`, and no
+    /// `rate_limit_resume_scheduled` event.
     fn assert_waited_at_the_gate(root: &Path, phase: PhaseId, stage: Stage) {
         let fired = events_named(root, "gate_fired");
         assert_eq!(fired.len(), 1, "one gate: {fired:?}");
