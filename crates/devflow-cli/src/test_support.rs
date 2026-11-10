@@ -110,10 +110,9 @@ pub(crate) fn gate_claim_files(root: &Path, phase: PhaseId, stage: Stage) -> Vec
 ///
 /// `PATH` is no longer process-global in this crate's tests: child fixtures
 /// supply a directory-only value through `run_test_in_child`. This mutex
-/// currently guards the four deferred process-global variables
-/// `DEVFLOW_GATE_TIMEOUT_SECS`, `DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS`,
-/// `DEVFLOW_GATE_NOTIFY_CMD`, and `DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS`
-/// (WR-02, phase 20 review). A future author adding another mutated variable to
+/// currently guards the three deferred process-global variables
+/// `DEVFLOW_GATE_TIMEOUT_SECS`, `DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS` and
+/// `DEVFLOW_GATE_NOTIFY_CMD`. A future author adding another mutated variable to
 /// this crate's tests is joining this set — guard it here, not with a new
 /// mutex (D-02: per-module mutexes were rejected on measured evidence that
 /// one process-global variable can span multiple future target clusters).

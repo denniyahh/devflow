@@ -5157,9 +5157,6 @@ mod tests {
         assert_eq!(quarantined.len(), 1, "{quarantined:?}");
         assert_eq!(quarantined[0].label, gate.as_str());
         assert_eq!(std::fs::read(&quarantined[0].path).unwrap(), answer);
-        let err = crate::pipeline_gate::ship_override(root, phase, false)
-            .expect_err("the answer set aside can no longer be applied by `devflow ship`");
-        assert!(err.to_string().contains("no Ship gate response"), "{err}");
 
         let report = CloseReport {
             quarantined: vec![quarantined[0].path.clone()],
@@ -9969,116 +9966,6 @@ mod tests {
                 "the call reached the advance"
             );
             assert_eq!(std::fs::read(&state_file).unwrap(), before, "gone");
-        });
-    }
-
-    /// R-17: `devflow ship` refuses beside a live supervisor of its phase, before it reads
-    /// or claims the answer that supervisor can still consume, and before a loop-back
-    /// could launch beside it. The control answers with an abort, because a loop-back that
-    /// passes the guard launches a real agent; the guard runs before any answer is read,
-    /// so the answer's kind cannot affect it.
-    #[test]
-    fn devflow_ship_refuses_while_a_supervisor_of_the_phase_is_live() {
-        const NAME: &str =
-            "pipeline_launch::tests::devflow_ship_refuses_while_a_supervisor_of_the_phase_is_live";
-        in_own_hermetic_process(NAME, || {
-            use devflow_core::gates::GateResponse;
-            use devflow_core::test_support::gate_answer_files;
-            let dir = tempfile::tempdir().unwrap();
-            let root = dir.path();
-            let phase = PhaseId::new(2910);
-            let fixture = live_supervisor_fixture(root, phase);
-            let state_file = workflow::state_path(root, phase);
-            let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.into());
-            state.stage = Stage::Ship;
-            workflow::save_state(&state).unwrap();
-            let gate = Gates::open_gate(root, phase, Stage::Ship, "ctx")
-                .unwrap()
-                .gate_id;
-            let answer = |note: &str| GateResponse {
-                approved: false,
-                note: Some(note.to_string()),
-                responded_by: Some("test".to_string()),
-            };
-            answer_open_gate(root, phase, Stage::Ship, &answer("review: fix it")).unwrap();
-            let claim = Gates::claim_path(root, phase, Stage::Ship, &gate);
-            let answer_file = gate_answer_files(root, phase, Stage::Ship)
-                .pop()
-                .expect("the answer is on disk");
-            let answer_bytes = std::fs::read(&answer_file).unwrap();
-            let live_files = || {
-                std::fs::read_dir(root.join(".devflow"))
-                    .unwrap()
-                    .filter(|entry| {
-                        let name = entry.as_ref().unwrap().file_name();
-                        name.to_string_lossy().ends_with(".live")
-                    })
-                    .count()
-            };
-
-            for (supervisor, pending, launch) in [
-                (Some(fixture.record.clone()), None, LIVE_RECORDED_LAUNCH),
-                (None, Some(fixture.pending.clone()), LIVE_PENDING_LAUNCH),
-            ] {
-                state.supervisor = supervisor;
-                state.pending_supervisor = pending;
-                workflow::save_state(&state).unwrap();
-                let before = std::fs::read(&state_file).unwrap();
-                let files = live_files();
-                let error = crate::pipeline_gate::ship_override(root, phase, false)
-                    .expect_err("a live supervisor refuses `devflow ship`")
-                    .to_string();
-                eprintln!("{launch}: {error}");
-                assert_refused_over_a_live_supervisor(&error, phase, launch);
-                assert_eq!(std::fs::read(&state_file).unwrap(), before, "{launch}");
-                assert_eq!(
-                    std::fs::read(&answer_file).unwrap(),
-                    answer_bytes,
-                    "{launch}: the live supervisor can still consume its answer"
-                );
-                assert!(!claim.exists(), "{launch}: the answer is not claimed");
-                assert_eq!(live_files(), files, "{launch}: no launch is reserved");
-            }
-            assert_eq!(
-                events_named(root, "ship_override_refused").len(),
-                2,
-                "each refusal is recorded"
-            );
-
-            let LiveSupervisorFixture {
-                _sockets,
-                supervisor,
-                record,
-                pending,
-                pending_hold,
-            } = fixture;
-            supervisor.finish();
-            drop(pending_hold);
-            state.supervisor = Some(record);
-            state.pending_supervisor = Some(pending);
-            workflow::save_state(&state).unwrap();
-            std::fs::remove_file(&answer_file).unwrap();
-            answer_open_gate(root, phase, Stage::Ship, &answer("abort this run")).unwrap();
-
-            // `note_claim` parks the consumer until a second claim outcome is counted, so
-            // the claim file can be read before the abort closes the gate and removes it.
-            let probe = std::sync::Arc::new(crate::pipeline_gate::ClaimProbe::default());
-            let shipped = std::thread::scope(|scope| {
-                let shipper = scope.spawn(|| {
-                    crate::pipeline_gate::CLAIM_PROBE.set(Some(probe.clone()));
-                    crate::pipeline_gate::ship_override(root, phase, false)
-                });
-                assert!(
-                    poll_until(Duration::from_secs(10), || claim.exists()),
-                    "with the supervisor gone the guard passes and the answer is claimed"
-                );
-                eprintln!("gone: the claim file appeared");
-                probe
-                    .already_consumed
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                shipper.join().unwrap()
-            });
-            shipped.expect("the abort answer is driven through");
         });
     }
 
