@@ -710,6 +710,73 @@ fn start_until_unknown_stage_is_rejected_by_clap() {
     assert!(!root.join(".worktrees/phase-46").exists());
 }
 
+/// Subcommands v4.0 removed (D-01). Later cut plans append to this list.
+const REMOVED_SUBCOMMANDS: &[&str] = &["list"];
+
+/// The subcommand names listed under `Commands:` in a `devflow --help` output.
+fn help_subcommand_names(help: &str) -> Vec<&str> {
+    help.lines()
+        .skip_while(|line| line.trim_end() != "Commands:")
+        .skip(1)
+        .take_while(|line| !line.trim().is_empty())
+        .filter_map(|line| line.split_whitespace().next())
+        .collect()
+}
+
+/// A removed subcommand fails loudly as an unknown verb instead of running
+/// something else, and `--help` no longer lists it. `status` is the control:
+/// the same checks must see a verb that still exists.
+#[test]
+fn removed_subcommands_are_unknown() {
+    let home = common::HermeticHome::new();
+    let scratch = tempfile::tempdir().unwrap();
+
+    let help = common::hermetic_devflow(&home)
+        .arg("--help")
+        .current_dir(scratch.path())
+        .output()
+        .expect("run devflow --help");
+    assert!(help.status.success());
+    let help = String::from_utf8_lossy(&help.stdout);
+    let names = help_subcommand_names(&help);
+    assert!(
+        names.contains(&"status"),
+        "control: the help parser must find `status`\n{help}"
+    );
+
+    for verb in REMOVED_SUBCOMMANDS {
+        let output = common::hermetic_devflow(&home)
+            .arg(verb)
+            .current_dir(scratch.path())
+            .output()
+            .expect("run devflow");
+        assert!(
+            !output.status.success(),
+            "`devflow {verb}` must be rejected"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("unrecognized subcommand"),
+            "`devflow {verb}` must be rejected by clap as unknown\nstderr: {stderr}"
+        );
+        assert!(
+            !names.contains(verb),
+            "`devflow --help` still lists `{verb}`\n{help}"
+        );
+    }
+
+    let status = common::hermetic_devflow(&home)
+        .args(["status", "--help"])
+        .current_dir(scratch.path())
+        .output()
+        .expect("run devflow status --help");
+    assert!(
+        status.status.success(),
+        "control: `devflow status --help` must still succeed\nstderr: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+}
+
 /// WR-01 (phase 20 review): `--dry-run` must reflect `--until` in its
 /// preview instead of always printing the full Define→Ship pipeline as if
 /// `--until` had not been passed.
