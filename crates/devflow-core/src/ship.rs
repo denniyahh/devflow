@@ -77,7 +77,7 @@ pub enum ShipError {
 
 /// Path to a phase's cron-instructions record. Per-phase since 14a
 /// (13-DEFERRED-CR-03): the old single-slot `cron-instructions.json` let one
-/// phase's rate-limit record clobber another's under `devflow parallel`.
+/// phase's rate-limit record clobber another's when phases ran at once.
 pub fn cron_instructions_path(project_root: &Path, phase: PhaseId) -> PathBuf {
     project_root.join(".devflow").join(format!(
         "cron-instructions-{padded}.json",

@@ -14,8 +14,7 @@ fallback_agent = "antigravity"   # optional: the rate-limit fallback for the Cod
 `fallback_agent` is armed by `devflow start` only, as the run's one-hop
 Code-stage fallback when `--fallback-agent` is not given; the flag overrides
 its value, `devflow resume` does not read it, and no environment variable sets
-it. `devflow parallel` arms no fallback: it prints a note naming a configured
-key as not armed, and refuses a key that names no agent. A key that names no agent, or a `devflow.toml` that does not
+it. A key that names no agent, or a `devflow.toml` that does not
 parse, still refuses `devflow start` even when `--fallback-agent` is given. See
 OPERATIONS.md's rate-limit failover section for what the fallback does.
 

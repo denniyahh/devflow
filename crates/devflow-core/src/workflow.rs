@@ -2,7 +2,7 @@
 //!
 //! State is per-phase: each active phase persists to
 //! `.devflow/state-{phase:02}.json` (mirroring the per-phase lock naming), so
-//! `devflow parallel` sibling phases never clobber one another
+//! phases running at the same time never clobber one another
 //! (13-DEFERRED-CR-03). A single-slot `.devflow/state.json` left by an older
 //! binary is not read, renamed or removed (Phase 50 D-20).
 

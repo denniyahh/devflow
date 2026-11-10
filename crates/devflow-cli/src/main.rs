@@ -19,9 +19,6 @@ mod pipeline_outcomes;
 mod pipeline_gate;
 use pipeline_gate::ship_override;
 
-mod parallel;
-use parallel::parallel;
-
 mod phase_worktree;
 
 mod commands;
@@ -226,24 +223,6 @@ enum Command {
     History {
         /// Phase to show (defaults to the single active phase).
         phase: Option<PhaseId>,
-        /// Project root.
-        #[arg(default_value = ".")]
-        project: PathBuf,
-    },
-    /// Run multiple phases concurrently, each in its own worktree + monitor.
-    Parallel {
-        /// Comma-separated phase numbers, e.g. `7,8`.
-        #[arg(long)]
-        phases: String,
-        /// Comma-separated agents matched positionally to phases (default claude).
-        #[arg(long)]
-        agents: Option<String>,
-        /// Pipeline mode for every phase.
-        #[arg(long, default_value = "auto")]
-        mode: Mode,
-        /// Recreate worktrees if they already exist.
-        #[arg(long)]
-        force: bool,
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
@@ -613,19 +592,6 @@ fn run() -> Result<(), CliError> {
             project,
         } => logs(&project_root(project)?, phase, follow, stderr),
         Command::History { phase, project } => history_cmd(&project_root(project)?, phase),
-        Command::Parallel {
-            phases,
-            agents,
-            mode,
-            force,
-            project,
-        } => parallel(
-            &project_root(project)?,
-            &phases,
-            agents.as_deref(),
-            mode,
-            force,
-        ),
         Command::Cleanup { project, force } => cleanup(&project_root(project)?, force),
         Command::Status { project } => status(&project_root(project)?),
         Command::Recover {

@@ -3634,8 +3634,8 @@ pub(crate) fn advance_command(
 /// The phase an advance acts on: the given one, or the sole active one.
 ///
 /// 13-DEFERRED-CR-03 fix shape #2: the phase is threaded in by the monitor (recorded at
-/// spawn time), so advance's identity never depends on a shared state singleton — under
-/// `devflow parallel`, each monitor advances exactly its own phase. The Option fallback
+/// spawn time), so advance's identity never depends on a shared state singleton — with
+/// several phases running, each monitor advances exactly its own phase. The Option fallback
 /// only serves monitors spawned by an older binary.
 fn resolve_advance_phase(project_root: &Path, phase: Option<PhaseId>) -> Result<PhaseId, CliError> {
     if let Some(phase) = phase {

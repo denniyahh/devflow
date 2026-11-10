@@ -161,8 +161,8 @@ four layers, tried in order:
 ## Per-phase state and locking
 
 State is per-phase (`crates/devflow-core/src/workflow.rs`): each active
-phase persists to `.devflow/state-{phase:02}.json`, so `devflow parallel`
-sibling phases never clobber one another. A single-slot
+phase persists to `.devflow/state-{phase:02}.json`, so phases running at
+the same time never clobber one another. A single-slot
 `.devflow/state.json` left by a pre-14a binary is not read, renamed or
 removed.
 
@@ -349,7 +349,7 @@ The supervisor (`run_supervised_stage()`):
    reads, until the supervisor exits.
 5. On the agent's natural exit, runs the advance in-process. The phase is
    threaded in at spawn time, so the advance's identity never depends on a
-   shared state singleton — under `devflow parallel`, each phase's supervisor
+   shared state singleton — with several phases running, each phase's supervisor
    advances exactly its own stage. When the advance launches the next stage,
    that stage's supervisor publishes its socket before this one unlinks its
    own, so the hand-off leaves no gap with neither socket published.
@@ -372,7 +372,6 @@ backs:
 
 - `start` (default) — run a single phase in its own worktree;
   `--no-worktree` runs directly in the primary checkout instead.
-- `parallel` — run multiple phases concurrently, each in its own worktree.
 
 Branch integration uses `GitFlow::ensure_branch()` (create at a start point
 without checking out).
