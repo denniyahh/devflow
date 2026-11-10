@@ -664,8 +664,9 @@ only difference from develop (otherwise the repair declines with a warning).
 **Fix shape (not decided):** report and commit a repair only when HEAD or the working tree actually held `true`; when
 HEAD lacks the key and the working copy holds `false`, either commit with an accurate message ("record GSD's
 `_auto_chain_active: false`") or leave it to the operator, and say which. Add a fixture row: HEAD without the key,
-working tree `false` → no killed-run notice. Candidate: a fix branch after Phase 52, or fold into Phase 52 if the
-operator wants it beside D-46 (whose limit it touches).
+working tree `false` → no killed-run notice.
+
+**Disposition (operator, 2026-11-10):** a separate fix branch after Phase 52, not folded into the phase.
 
 ### Phase 999.218: The Plan-Bashism Scanner Drops the Finding Text When the File Path Is Long (DUPLICATE of 999.169)
 
