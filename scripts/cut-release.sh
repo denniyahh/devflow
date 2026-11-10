@@ -20,7 +20,7 @@
 #   scripts/cut-release.sh publish        # cargo publish devflow-core then devflow
 #   scripts/cut-release.sh github-release # create GitHub Release with CHANGELOG notes
 #   scripts/cut-release.sh docs           # deploy documentation wiki to GitHub Pages
-#   scripts/cut-release.sh verify         # devflow release --verify (post-cut)
+#   scripts/cut-release.sh verify         # release-preflight verify (post-cut)
 #
 # Every step re-verifies its precondition and refuses with a fix hint rather
 # than silently proceeding out of order — the failure mode that made the
@@ -35,14 +35,6 @@ cd "$REPO_ROOT"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 note() { echo "[release] $*"; }
-
-run_devflow() {
-    if command -v devflow >/dev/null 2>&1; then
-        devflow "$@"
-    else
-        cargo run -q -- "$@"
-    fi
-}
 
 STEP="${1:-}"
 shift || true
@@ -256,8 +248,9 @@ step_tag() {
     fi
 
     # The tag MUST land on main's squash commit, not the develop release
-    # commit — enforced here, and re-checked by `release --verify`. Pass the
-    # tilde-expanded path so git does not rely on its own `~` handling.
+    # commit — enforced here, and re-checked by `release-preflight verify`.
+    # Pass the tilde-expanded path so git does not rely on its own `~`
+    # handling.
     git -c user.signingkey="$release_key_expanded" \
         tag -s "v$v" origin/main -m "release: v$v"
     git verify-tag "v$v"
@@ -333,7 +326,7 @@ step_docs() {
 
 step_verify() {
     git fetch origin develop main --quiet
-    run_devflow release --verify
+    cargo run -q -p release-preflight -- verify
 }
 
 # --- dispatch --------------------------------------------------------------
