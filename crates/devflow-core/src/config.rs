@@ -290,40 +290,6 @@ pub fn yes_ship(project_root: &Path) -> bool {
     load_config(project_root).yes_ship
 }
 
-/// Resolve D-11's legacy-launch opt-out (31-04) from
-/// `DEVFLOW_CLAUDE_LEGACY_LAUNCH`.
-///
-/// Environment only, deliberately: D-11 specifies one flag and one environment
-/// variable, and nothing else. There is no `devflow.toml` key, so this takes no
-/// `project_root` — a standing per-project default for an escape hatch is
-/// exactly the "used routinely, erodes what it protects" shape D-11 warns
-/// about. `--legacy-claude-launch` supplies the other half, OR-ed in
-/// `commands::start` / `pipeline_launch::resume`.
-///
-/// **The value is PARSED as a bool, not merely tested for presence (W4).** A
-/// naive `env::var(..).is_ok()` would make `DEVFLOW_CLAUDE_LEGACY_LAUNCH=false`
-/// *enable* the legacy path — an accidental-reach path D-11 forbids. Garbage
-/// warns and is ignored rather than enabling; the escape hatch fails CLOSED.
-///
-/// Read through [`env_value`] with the variable name as a literal, matching
-/// [`yes_ship`] and [`external_verify_enabled`]. A const-mediated read compiles
-/// and works identically but is INVISIBLE to
-/// `doc_check::source_read_env_vars`, which would then pass green while the
-/// variable went undocumented — the "by blindness" failure 31-02 recorded.
-pub fn claude_legacy_launch() -> bool {
-    if let Some(value) = env_value("DEVFLOW_CLAUDE_LEGACY_LAUNCH") {
-        match value.parse() {
-            Ok(enabled) => return enabled,
-            Err(error) => tracing::warn!(
-                value,
-                %error,
-                "invalid DEVFLOW_CLAUDE_LEGACY_LAUNCH; the legacy Claude launch stays OFF"
-            ),
-        }
-    }
-    false
-}
-
 /// Reject a base-branch value that must never reach a `git` argv or become
 /// this project's integration trunk (45-01, D-01).
 ///
@@ -381,8 +347,7 @@ pub fn validate_base_branch(value: &str) -> Result<(), String> {
 /// The variable name is written as a **string literal** rather than through a
 /// const: a const-mediated read is invisible to
 /// `doc_check::source_read_env_vars`, which would then pass green while the
-/// variable went undocumented (the failure recorded in
-/// [`claude_legacy_launch`]'s doc comment).
+/// variable went undocumented (the "by blindness" failure 31-02 recorded).
 pub fn base_branch(project_root: &Path) -> Result<ResolvedBaseBranch, String> {
     if let Some(value) = env_value("DEVFLOW_BASE_BRANCH") {
         return validate_base_branch(&value)

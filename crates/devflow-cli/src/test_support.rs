@@ -603,13 +603,14 @@ pub(crate) fn add_agent_stub(path_dir: &Path, program: &str) {
     std::fs::set_permissions(&path, perms).unwrap();
 }
 
-/// A `claude` stand-in that answers `--version`, then waits for `go` in
-/// its working directory (the project root) and exits 0, with `sleep`
-/// linked beside it so the wait works under the replaced PATH.
-pub(crate) fn go_waiting_claude_dir() -> tempfile::TempDir {
-    let path_dir = agent_free_dir_with_agent_stub("claude");
+/// An agent `program` stand-in that answers `--version`, then waits for `go`
+/// in its working directory (the project root) and exits 0, with `sleep`
+/// linked beside it so the wait works under the replaced PATH. A capture-shape
+/// test names `codex`, because a Claude launch takes the stream shape.
+pub(crate) fn go_waiting_agent_dir(program: &str) -> tempfile::TempDir {
+    let path_dir = agent_free_dir_with_agent_stub(program);
     std::fs::write(
-        path_dir.path().join("claude"),
+        path_dir.path().join(program),
         "#!/bin/sh\ncase \"$1\" in --version) exit 0 ;; esac\n\
          while [ ! -e go ]; do sleep 0.05; done\nexit 0\n",
     )
