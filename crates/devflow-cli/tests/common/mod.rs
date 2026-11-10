@@ -123,6 +123,13 @@ pub fn fake_bin_dir_for(program: &str, agent_body: &str) -> FakeBin {
     }
 }
 
+/// The file under a capture agent's `logs` dir that holds its argv, one
+/// argument per line.
+pub const AGENT_ARGV_LOG: &str = "agent-argv";
+
+/// The file under a capture agent's `logs` dir that holds its stdin.
+pub const AGENT_STDIN_LOG: &str = "agent-stdin";
+
 /// Poll `predicate` every 25ms until it is true, panicking with `what` once
 /// `timeout` elapses.
 pub fn wait_for(mut predicate: impl FnMut() -> bool, timeout: Duration, what: &str) {

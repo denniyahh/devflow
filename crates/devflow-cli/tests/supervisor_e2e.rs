@@ -38,7 +38,8 @@ fn git(root: &Path, args: &[&str]) {
     );
 }
 
-/// A repository on `develop` with a roadmap entry for `phase`.
+/// A repository on `develop` with a roadmap entry for `phase` and its
+/// CONTEXT.md, which `start` requires before it launches codex.
 fn init_repo(root: &Path, phase: PhaseId) {
     git(root, &["init", "-q"]);
     git(root, &["config", "user.email", "devflow@example.com"]);
@@ -53,7 +54,15 @@ fn init_repo(root: &Path, phase: PhaseId) {
         format!("# Roadmap\n\n### Phase {phase}: supervisor fixture\n"),
     )
     .unwrap();
-    git(root, &["add", "README.md", ".planning/ROADMAP.md"]);
+    let padded = phase.padded();
+    let phase_dir = format!(".planning/phases/{padded}-supervisor-fixture");
+    fs::create_dir_all(root.join(&phase_dir)).unwrap();
+    fs::write(
+        root.join(&phase_dir).join(format!("{padded}-CONTEXT.md")),
+        "# Context\n",
+    )
+    .unwrap();
+    git(root, &["add", "README.md", ".planning"]);
     git(root, &["commit", "-q", "-m", "base"]);
 }
 
@@ -78,9 +87,22 @@ sleep 120"#;
 enum Shape {
     /// The default Claude launch: the stream shape.
     Stream,
-    /// `--legacy-claude-launch`: the capture shape.
+    /// A capture-shape agent: `codex`, which gets its prompt as argv.
     Capture,
 }
+
+/// What a shape's fake agent does once launched.
+#[derive(Debug, Clone, Copy)]
+enum AgentRun {
+    /// Stays running until it is ended.
+    Waiting,
+    /// Commits one empty commit, reports success and exits 0.
+    Finishing,
+}
+
+/// A codex that prints nothing and exits 0. It stands in for the capture
+/// agent until one exists, and keeps the host's real `codex` off the launch.
+const SILENT_CODEX: &str = "exit 0";
 
 impl Shape {
     fn label(self) -> &'static str {
@@ -90,10 +112,21 @@ impl Shape {
         }
     }
 
-    fn start_flags(self) -> &'static [&'static str] {
+    /// The `--agent` value that selects this shape.
+    fn agent(self) -> &'static str {
         match self {
-            Shape::Stream => &[],
-            Shape::Capture => &["--legacy-claude-launch"],
+            Shape::Stream => "claude",
+            Shape::Capture => "codex",
+        }
+    }
+
+    /// This shape's fake agent doing `run`. A capture agent logs its argv and
+    /// stdin under `logs`.
+    fn fake_bin(self, _logs: &Path, run: AgentRun) -> common::FakeBin {
+        match (self, run) {
+            (Shape::Stream, AgentRun::Waiting) => common::fake_bin_dir(WAITING_CLAUDE),
+            (Shape::Stream, AgentRun::Finishing) => common::fake_bin_dir(FINISHING_CLAUDE),
+            (Shape::Capture, _) => common::fake_bin_dir_for("codex", SILENT_CODEX),
         }
     }
 }
@@ -126,12 +159,11 @@ fn run_start_with(
             "--phase",
             &phase.to_string(),
             "--agent",
-            "claude",
+            shape.agent(),
             "--mode",
             "supervise",
             "--no-worktree",
         ])
-        .args(shape.start_flags())
         .args(extra)
         .arg(root)
         .current_dir(root)
@@ -149,7 +181,8 @@ fn start_publishes_for(shape: Shape, phase: PhaseId) {
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path().canonicalize().unwrap();
     init_repo(&root, phase);
-    let fake_bin = common::fake_bin_dir(WAITING_CLAUDE);
+    let logs = tempfile::tempdir().unwrap();
+    let fake_bin = shape.fake_bin(logs.path(), AgentRun::Waiting);
     let _reaper = common::LaunchedRunReaper::new(&root, phase, vec![]);
 
     // Control: nothing names a supervisor before the launch, so an Alive
@@ -291,7 +324,8 @@ fn sigterm_stops_for(shape: Shape, phase: PhaseId) {
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path().canonicalize().unwrap();
     init_repo(&root, phase);
-    let fake_bin = common::fake_bin_dir(WAITING_CLAUDE);
+    let logs = tempfile::tempdir().unwrap();
+    let fake_bin = shape.fake_bin(logs.path(), AgentRun::Waiting);
     let _reaper = common::LaunchedRunReaper::new(&root, phase, vec![]);
 
     let output = run_start(&home, &root, phase, &fake_bin, shape);
@@ -370,7 +404,8 @@ fn finishing_run_advances_for(shape: Shape, phase: PhaseId) {
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path().canonicalize().unwrap();
     init_repo(&root, phase);
-    let fake_bin = common::fake_bin_dir(FINISHING_CLAUDE);
+    let logs = tempfile::tempdir().unwrap();
+    let fake_bin = shape.fake_bin(logs.path(), AgentRun::Finishing);
     let _reaper = common::LaunchedRunReaper::new(&root, phase, vec![]);
 
     let output = run_start_with(&home, &root, phase, &fake_bin, shape, &["--until", "plan"]);
@@ -427,7 +462,8 @@ fn capture_supervisor_owns_a_fake_agent_and_records_devflow_result() {
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path().canonicalize().unwrap();
     init_repo(&root, phase);
-    let fake_bin = common::fake_bin_dir(FINISHING_CLAUDE);
+    let logs = tempfile::tempdir().unwrap();
+    let fake_bin = Shape::Capture.fake_bin(logs.path(), AgentRun::Finishing);
     let _reaper = common::LaunchedRunReaper::new(&root, phase, vec![]);
 
     let output = run_start_with(
@@ -484,6 +520,19 @@ fn capture_supervisor_owns_a_fake_agent_and_records_devflow_result() {
                 && line.contains("\"status\":\"success\"")),
         "the supervisor's in-process advance evaluated the stage as success:\n{events}"
     );
+
+    // The fake codex ran with the codex driver's argv, and the capture shape
+    // gave it no stdin: the prompt travels as argv.
+    let argv = fs::read_to_string(logs.path().join(common::AGENT_ARGV_LOG))
+        .expect("the fake codex logs its argv");
+    let argv: Vec<&str> = argv.lines().collect();
+    assert!(
+        argv.contains(&"exec") && argv.contains(&"--json"),
+        "the fake codex got the codex driver's argv: {argv:?}"
+    );
+    let stdin = fs::read_to_string(logs.path().join(common::AGENT_STDIN_LOG))
+        .expect("the fake codex logs its stdin");
+    assert_eq!(stdin, "", "the capture shape gives the agent no stdin");
 }
 
 /// `devflow status` for `root`, as an operator runs it; its stdout.
