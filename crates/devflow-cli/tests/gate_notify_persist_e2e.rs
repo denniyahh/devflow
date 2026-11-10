@@ -569,7 +569,8 @@ fn agent_environment_after_define(
     fake_bin: &FakeBin,
 ) -> Vec<String> {
     let approve = common::hermetic_devflow(home)
-        .args(["gate", "approve", &phase.to_string(), "define"])
+        .args(["gate", "approve", &phase.to_string(), "--stage", "define"])
+        .arg("--project")
         .arg(root)
         .output()
         .expect("run gate approve");

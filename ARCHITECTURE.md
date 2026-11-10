@@ -367,8 +367,7 @@ Each agent gets an isolated working directory under
 `<project_root>/.worktrees/`, sharing the main repo's object database; state
 and capture files always live under the main `project_root` — only the
 agent's working directory moves. **Worktree isolation is the default**:
-`devflow start` creates a worktree unless `--no-worktree` is passed (the
-`--worktree` flag itself is a deprecated no-op kept for one release). This
+`devflow start` creates a worktree unless `--no-worktree` is passed. This
 backs:
 
 - `start` (default) — run a single phase in its own worktree;

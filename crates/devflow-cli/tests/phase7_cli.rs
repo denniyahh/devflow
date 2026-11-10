@@ -986,20 +986,13 @@ esac
 "#,
     )]);
 
-    // start --worktree — creates phase worktree
+    // start — creates the phase worktree by default
     let out = run_devflow(
         &home,
         root,
         &fake_bin.path,
         &[
-            "start",
-            "--phase",
-            "8",
-            "--agent",
-            "claude",
-            "--mode",
-            "auto",
-            "--worktree",
+            "start", "--phase", "8", "--agent", "claude", "--mode", "auto",
         ],
     );
     let _reaper = common::LaunchedRunReaper::new(root, PhaseId::new(8), Vec::new());
@@ -1057,6 +1050,8 @@ esac
             "validate",
             "--note",
             "abort test teardown",
+            // run_devflow appends the root, which now has to be --project's value.
+            "--project",
         ],
     );
     wait_for_state_cleared(root, PhaseId::new(8));

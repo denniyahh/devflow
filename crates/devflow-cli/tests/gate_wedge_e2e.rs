@@ -103,9 +103,11 @@ fn reject(home: &common::HermeticHome, root: &Path, phase: PhaseId) -> std::proc
             "gate",
             "reject",
             &phase.to_string(),
+            "--stage",
             "code",
             "--note",
             "abort: #200 e2e",
+            "--project",
         ])
         .arg(root)
         .output()
@@ -231,9 +233,11 @@ fn reject_define(home: &common::HermeticHome, root: &Path, phase: PhaseId) -> st
             "gate",
             "reject",
             &phase.to_string(),
+            "--stage",
             "define",
             "--note",
             "abort: #200 start e2e",
+            "--project",
         ])
         .arg(root)
         .output()

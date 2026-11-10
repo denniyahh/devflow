@@ -25,8 +25,7 @@ use parallel::parallel;
 mod commands;
 use commands::{
     cleanup, doctor, evidence, gate_list, gate_respond, gate_show, gate_sweep, history_cmd, logs,
-    recover_cmd, release_check, release_verify, resolve_gate_target, start, status, stop,
-    stop_launch,
+    recover_cmd, release_check, release_verify, start, status, stop, stop_launch,
 };
 use devflow_core::phase_id::PhaseId;
 
@@ -59,10 +58,6 @@ enum Command {
         /// Overwrite the feature branch if it already exists.
         #[arg(long)]
         force: bool,
-        /// Deprecated: a worktree is now created by default; this flag is a
-        /// no-op kept for one release for backward compatibility.
-        #[arg(long, hide = true)]
-        worktree: bool,
         /// Run the agent directly in the primary checkout instead of an
         /// isolated worktree (not recommended for unattended runs).
         #[arg(long)]
@@ -425,17 +420,10 @@ enum GateCmd {
     Approve {
         /// Phase whose gate to approve.
         phase: PhaseId,
-        /// Optional stage or legacy project path (`approve 15 ship` or
-        /// `approve 15 /repo`).
-        #[arg(value_name = "STAGE_OR_PROJECT")]
-        stage: Option<String>,
-        /// Legacy positional project path when a stage precedes it.
-        #[arg(value_name = "PROJECT")]
-        legacy_project: Option<PathBuf>,
         /// Stage of the gate (auto-resolved when the phase has exactly one
         /// open gate).
         #[arg(long = "stage")]
-        stage_option: Option<Stage>,
+        stage: Option<Stage>,
         /// Optional free-text note recorded with the approval.
         #[arg(long)]
         note: Option<String>,
@@ -452,17 +440,10 @@ enum GateCmd {
     Reject {
         /// Phase whose gate to reject.
         phase: PhaseId,
-        /// Optional stage or legacy project path (`reject 15 ship` or
-        /// `reject 15 /repo`).
-        #[arg(value_name = "STAGE_OR_PROJECT")]
-        stage: Option<String>,
-        /// Legacy positional project path when a stage precedes it.
-        #[arg(value_name = "PROJECT")]
-        legacy_project: Option<PathBuf>,
         /// Stage of the gate (auto-resolved when the phase has exactly one
         /// open gate).
         #[arg(long = "stage")]
-        stage_option: Option<Stage>,
+        stage: Option<Stage>,
         /// Required note explaining the rejection (include "abort" to end
         /// the phase instead of looping back to Code).
         #[arg(long)]
@@ -583,7 +564,6 @@ fn run() -> Result<(), CliError> {
             agent,
             mode,
             force,
-            worktree: _worktree,
             no_worktree,
             dry_run,
             until,
@@ -592,9 +572,7 @@ fn run() -> Result<(), CliError> {
             fallback_agent,
             project,
         } => {
-            // Worktree is now the default; the deprecated `--worktree` flag is
-            // an intentionally ignored no-op (see field doc comment above).
-            // `--no-worktree` is the only switch that changes behavior.
+            // Worktree is the default; `--no-worktree` is the only switch.
             let worktree = !no_worktree;
             // D-07: `--until ship` is a semantic no-op — `handle_ship_outcome`
             // calls `finish_workflow` directly and never calls `transition`,
@@ -677,36 +655,24 @@ fn run() -> Result<(), CliError> {
             GateCmd::Approve {
                 phase,
                 stage,
-                legacy_project,
-                stage_option,
                 note,
                 gate_id,
                 project,
-            } => {
-                let (stage, project) =
-                    resolve_gate_target(stage, legacy_project, stage_option, project)?;
-                gate_respond(&project_root(project)?, phase, stage, true, note, gate_id)
-            }
+            } => gate_respond(&project_root(project)?, phase, stage, true, note, gate_id),
             GateCmd::Reject {
                 phase,
                 stage,
-                legacy_project,
-                stage_option,
                 note,
                 gate_id,
                 project,
-            } => {
-                let (stage, project) =
-                    resolve_gate_target(stage, legacy_project, stage_option, project)?;
-                gate_respond(
-                    &project_root(project)?,
-                    phase,
-                    stage,
-                    false,
-                    Some(note),
-                    gate_id,
-                )
-            }
+            } => gate_respond(
+                &project_root(project)?,
+                phase,
+                stage,
+                false,
+                Some(note),
+                gate_id,
+            ),
             GateCmd::Show {
                 phase,
                 stage,
