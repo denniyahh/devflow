@@ -68,6 +68,22 @@ impl Fixture {
         );
     }
 
+    fn rev_parse(&self, rev: &str) -> String {
+        let output = hermetic("git", self.root(), self.home.path())
+            .args(["rev-parse", rev])
+            .output()
+            .expect("spawn git rev-parse");
+        assert!(output.status.success(), "git rev-parse {rev} failed");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// Point a remote-tracking ref (`refs/remotes/origin/<branch>`) at `rev`,
+    /// standing in for an already-fetched remote without a network.
+    fn set_remote_ref(&self, branch: &str, rev: &str) {
+        let sha = self.rev_parse(rev);
+        self.git(&["update-ref", &format!("refs/remotes/origin/{branch}"), &sha]);
+    }
+
     /// `git init` on a `develop` branch, with signing and hooks off.
     fn init_repo(&self) {
         self.git(&["init", "-q"]);
@@ -192,5 +208,262 @@ fn check_flags_self_pin_drift() {
     assert!(
         line.contains('✗') && line.contains("devflow-core pinned 1.6.0 != 1.7.0"),
         "the self-pin line must fail and name the drifted pin, got: {line}"
+    );
+}
+
+/// A workspace every `check` passes on: matching pins, two members where
+/// `devflow` depends on `devflow-core`, a `CHANGELOG.md` whose top heading is
+/// `changelog_version`, and `origin/main` at `HEAD`. Each negative control
+/// below changes one thing from this fixture, so the check it targets is the
+/// only one that can fail.
+fn release_ready_fixture(version: &str, changelog_version: &str) -> Fixture {
+    let fixture = Fixture::new();
+    fixture.init_repo();
+    fixture.write(
+        "Cargo.toml",
+        &format!(
+            "[workspace]\nmembers = [\n    \"crates/devflow-core\",\n    \"crates/devflow-cli\",\n]\n\n\
+             [workspace.package]\nversion = \"{version}\"\nedition = \"2024\"\n\n\
+             [workspace.dependencies]\n\
+             devflow-core = {{ path = \"crates/devflow-core\", version = \"{version}\" }}\n"
+        ),
+    );
+    fixture.write(
+        "crates/devflow-core/Cargo.toml",
+        "[package]\nname = \"devflow-core\"\nversion.workspace = true\n\n[dependencies]\n",
+    );
+    fixture.write(
+        "crates/devflow-cli/Cargo.toml",
+        "[package]\nname = \"devflow\"\nversion.workspace = true\n\n\
+         [dependencies]\ndevflow-core.workspace = true\n",
+    );
+    fixture.write(
+        "CHANGELOG.md",
+        &format!("# Changelog\n\n## [{changelog_version}] - 2026-11-10\n\n- notes\n"),
+    );
+    fixture.commit("base.txt");
+    fixture.set_remote_ref("main", "HEAD");
+    fixture
+}
+
+const DIVERGENCE: &str = "develop/main divergence";
+const PUBLISH_ORDER: &str = "crates.io publish order";
+const CHANGELOG: &str = "changelog version";
+const TAG_ON_MAIN: &str = "release tag on main";
+const SYNC: &str = "main→develop sync";
+
+/// The positive control for every `check` line: on a release-ready workspace
+/// each check is ok and the run exits 0.
+#[test]
+fn check_passes_on_a_release_ready_fixture() {
+    let fixture = release_ready_fixture("1.7.0", "1.7.0");
+
+    let run = fixture.run("check");
+
+    assert!(
+        run.passed(),
+        "a release-ready fixture must pass\n{}",
+        run.transcript()
+    );
+    for name in [SELF_PIN, DIVERGENCE, PUBLISH_ORDER, CHANGELOG] {
+        let line = run.line(name);
+        assert!(line.contains('✓'), "{name} must be ok, got: {line}");
+    }
+}
+
+/// `origin/main` resolves locally but is not an ancestor of `HEAD`: develop
+/// has diverged, and the fix is `scripts/sync-main-to-develop.sh`. No fetch is
+/// issued; the remote-tracking ref is set directly.
+#[test]
+fn check_reports_divergence_when_main_not_ancestor() {
+    let fixture = release_ready_fixture("1.7.0", "1.7.0");
+    fixture.git(&["checkout", "-q", "-b", "main-line"]);
+    fixture.commit("main-only.txt");
+    fixture.set_remote_ref("main", "HEAD");
+    fixture.git(&["checkout", "-q", "develop"]);
+    fixture.commit("develop-only.txt");
+
+    let run = fixture.run("check");
+
+    assert!(
+        !run.passed(),
+        "a real divergence must fail\n{}",
+        run.transcript()
+    );
+    let line = run.line(DIVERGENCE);
+    assert!(
+        line.contains('✗') && line.contains("NOT an ancestor"),
+        "the divergence line must fail, got: {line}"
+    );
+    assert!(
+        run.stdout().contains("sync-main-to-develop.sh"),
+        "the divergence failure must name the sync script\n{}",
+        run.transcript()
+    );
+}
+
+/// `origin/main` was never fetched: the check must degrade to a warning that
+/// says to fetch, never report a false divergence and never fetch itself.
+#[test]
+fn check_divergence_degrades_when_origin_main_absent() {
+    let fixture = release_ready_fixture("1.7.0", "1.7.0");
+    fixture.git(&["update-ref", "-d", "refs/remotes/origin/main"]);
+
+    let run = fixture.run("check");
+
+    let line = run.line(DIVERGENCE);
+    assert!(
+        line.contains('⚠') && line.contains("origin/main not fetched"),
+        "the divergence line must warn that origin/main is not fetched, got: {line}"
+    );
+    assert!(
+        run.stdout().contains("git fetch"),
+        "the warning must direct the operator to `git fetch`\n{}",
+        run.transcript()
+    );
+    assert!(
+        run.passed(),
+        "a warning alone must not fail the run\n{}",
+        run.transcript()
+    );
+}
+
+/// The publish order comes from the workspace's own members and their
+/// dependencies: `devflow` depends on `devflow-core`, so core goes first.
+#[test]
+fn check_states_publish_order() {
+    let fixture = release_ready_fixture("1.0.0", "1.0.0");
+
+    let run = fixture.run("check");
+
+    let line = run.line(PUBLISH_ORDER);
+    assert!(
+        line.contains("publish in order: devflow-core -> devflow")
+            && !line.contains("devflow -> devflow-core"),
+        "the publish order must state devflow-core before devflow, got: {line}"
+    );
+}
+
+/// When no member manifest can be read the order cannot be derived, and the
+/// check must say so as a warning rather than state an empty order as ok.
+#[test]
+fn check_warns_when_the_publish_order_cannot_be_derived() {
+    // `members` names `crates/devflow-core`, but the fixture writes no
+    // manifest there.
+    let fixture = workspace_fixture("1.7.0", "1.7.0");
+
+    let run = fixture.run("check");
+
+    let line = run.line(PUBLISH_ORDER);
+    assert!(
+        line.contains('⚠') && line.contains("could not determine workspace publish order"),
+        "an underivable publish order must warn, got: {line}"
+    );
+    assert!(
+        !run.stdout().contains("publish in order:"),
+        "no order may be stated when none can be derived\n{}",
+        run.transcript()
+    );
+}
+
+/// The top `## <version>` heading of `CHANGELOG.md` must equal the workspace
+/// version, so a forgotten bump cannot ship notes under the old version.
+#[test]
+fn check_flags_a_changelog_version_mismatch() {
+    let fixture = release_ready_fixture("1.7.0", "1.6.0");
+
+    let run = fixture.run("check");
+
+    assert!(
+        !run.passed(),
+        "a changelog version mismatch must fail\n{}",
+        run.transcript()
+    );
+    let line = run.line(CHANGELOG);
+    assert!(
+        line.contains('✗') && line.contains("changelog 1.6.0 != workspace 1.7.0"),
+        "the changelog line must fail and name both versions, got: {line}"
+    );
+}
+
+/// A released fixture: `v1.7.0` tagged on the commit `origin/main` points at,
+/// and `origin/develop` at that same commit (the sync has run).
+fn released_fixture() -> Fixture {
+    let fixture = release_ready_fixture("1.7.0", "1.7.0");
+    fixture.git(&["tag", "v1.7.0"]);
+    fixture.set_remote_ref("develop", "HEAD");
+    fixture
+}
+
+/// The positive control for both `verify` checks.
+#[test]
+fn verify_passes_on_a_tagged_synced_fixture() {
+    let fixture = released_fixture();
+
+    let run = fixture.run("verify");
+
+    assert!(
+        run.passed(),
+        "a tagged, synced release must verify\n{}",
+        run.transcript()
+    );
+    for name in [TAG_ON_MAIN, SYNC] {
+        let line = run.line(name);
+        assert!(line.contains('✓'), "{name} must be ok, got: {line}");
+    }
+    assert!(
+        run.stdout().contains("release verification passed"),
+        "expected a passing verification report\n{}",
+        run.transcript()
+    );
+}
+
+/// The v2.5.0 mistake: the tag sits on a develop-only commit that is not on
+/// `origin/main`.
+#[test]
+fn verify_flags_a_tag_not_on_main() {
+    let fixture = release_ready_fixture("1.7.0", "1.7.0");
+    fixture.commit("develop-release-commit.txt");
+    fixture.git(&["tag", "v1.7.0"]);
+    fixture.set_remote_ref("develop", "HEAD");
+
+    let run = fixture.run("verify");
+
+    assert!(
+        !run.passed(),
+        "a tag off main must fail verification\n{}",
+        run.transcript()
+    );
+    let line = run.line(TAG_ON_MAIN);
+    assert!(
+        line.contains('✗') && line.contains("v1.7.0 is NOT an ancestor of origin/main"),
+        "the tag line must fail, got: {line}"
+    );
+}
+
+/// `origin/main` carries a commit `origin/develop` does not: the main→develop
+/// sync was skipped.
+#[test]
+fn verify_flags_an_unsynced_develop() {
+    let fixture = release_ready_fixture("1.7.0", "1.7.0");
+    fixture.git(&["checkout", "-q", "-b", "main-line"]);
+    fixture.commit("squash-merge.txt");
+    fixture.git(&["tag", "v1.7.0"]);
+    fixture.set_remote_ref("main", "HEAD");
+    fixture.git(&["checkout", "-q", "develop"]);
+    fixture.commit("develop-only.txt");
+    fixture.set_remote_ref("develop", "HEAD");
+
+    let run = fixture.run("verify");
+
+    assert!(
+        !run.passed(),
+        "a skipped sync must fail verification\n{}",
+        run.transcript()
+    );
+    let line = run.line(SYNC);
+    assert!(
+        line.contains('✗') && line.contains("sync was skipped"),
+        "the sync line must fail, got: {line}"
     );
 }
