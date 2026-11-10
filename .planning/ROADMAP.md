@@ -127,12 +127,12 @@ than split: no requirement dependency forces a split, and the Validate-gate desi
      appear; on DevFlow's own checkout the provenance warning still fires; a run whose worktree is present still
      reports as active. (OPS-01, OPS-02, OPS-03, OPS-04)
 
-**Plans**: 4/33 plans executed
+**Plans**: 5/33 plans executed
 - [x] 52-01-PLAN.md
 - [x] 52-02-PLAN.md
 - [x] 52-03-PLAN.md
 - [x] 52-04-PLAN.md
-- [ ] 52-05-PLAN.md
+- [x] 52-05-PLAN.md
 - [ ] 52-06-PLAN.md
 - [ ] 52-07-PLAN.md
 - [ ] 52-08-PLAN.md
@@ -439,7 +439,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 50 | 29/29 | Complete | 2026-10-21 |
 | 50.1 | 30/30 | Complete | 2026-11-02 |
 | 51 | 13/13 | Complete | 2026-11-08 |
-| 52 | 4/33 | In Progress | — |
+| 52 | 5/33 | In Progress | — |
 | 53 | 0/? | Not started | — |
 | 54 | 0/? | Not started | — |
 | 55 | 0/? | Not started | — |
