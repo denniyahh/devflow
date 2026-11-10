@@ -993,7 +993,7 @@ pub(crate) fn is_not_owner(err: &CliError) -> bool {
 /// advance this is [`workflow::while_owner`], so the check and `op` share one hold of the
 /// state write lock: a supersession is itself a state write under that lock, and lands
 /// wholly before the check (`op` is refused with `NotOwner`) or wholly after `op`.
-/// Outside one (a hand-run `devflow advance`, the foreground `devflow ship`) it is `op`.
+/// Outside one (a hand-run `devflow advance`) it is `op`.
 ///
 /// `op` is a bounded file operation that calls `Gates::*` directly. The gate lock is the
 /// only lock it may take, as the D-08 ruling of 2026-10-26 allows (see
@@ -2569,8 +2569,7 @@ fn spawn_next_supervisor(
 /// A record already there is replaced when its lock is not held, and its file removed
 /// when it reads abandoned. A held one is a live launch this launcher knows nothing of,
 /// so this launch stops, naming both ids: `start` and `resume` are kept off a live
-/// supervisor by their guard, and a hand-run `advance` and `devflow ship`'s loop-back by
-/// theirs (50.1-29). A supervisor whose own promotion never came never reaches this: it
+/// supervisor by their guard, and a hand-run `advance` by its own (50.1-29). A supervisor whose own promotion never came never reaches this: it
 /// does not advance (D-15).
 ///
 /// Inside a supervisor's advance this is an owned write (D-03): a superseded supervisor
@@ -3260,7 +3259,6 @@ fn unapplied_answer_line(stage: Stage, claimed: &ClaimedAnswer) -> String {
 /// any other stage is the leftover of an answer the run acted on and moved past, so it gets
 /// no line here; `Gates::close` has logged its removal either way.
 fn resume_gate_lines(
-    phase: PhaseId,
     stage: Stage,
     gate_id: Option<&str>,
     report: &CloseReport,
@@ -3278,15 +3276,6 @@ fn resume_gate_lines(
             )
         })
         .collect();
-    // The answer just set aside is out of `devflow ship`'s reach, so this names only what
-    // is left: the rerun's gate, and `devflow ship` for a later stored approval (D-06).
-    if stage == Stage::Ship && !report.quarantined.is_empty() {
-        lines.push(format!(
-            "resume: the rerun's Ship gate asks again — answer it with `devflow gate approve \
-             {phase} ship`; next time, to apply a stored Ship approval without a rerun, run \
-             `devflow ship --phase {phase}` instead of `resume`"
-        ));
-    }
     if at_current_stage {
         lines.extend(
             report
@@ -3339,13 +3328,7 @@ fn close_gates_for_resume(
             .find(|(candidate, _)| candidate == stage)
             .and_then(|(_, gate_id)| gate_id.as_deref());
         let at_current_stage = *stage == current_stage;
-        lines.extend(resume_gate_lines(
-            phase,
-            *stage,
-            gate_id,
-            report,
-            at_current_stage,
-        ));
+        lines.extend(resume_gate_lines(*stage, gate_id, report, at_current_stage));
         if at_current_stage {
             for claimed in &report.claimed {
                 events::emit(
@@ -5040,7 +5023,7 @@ mod tests {
             ..CloseReport::default()
         };
         assert_eq!(
-            resume_gate_lines(phase, Stage::Code, Some(gate.as_str()), &unused, true),
+            resume_gate_lines(Stage::Code, Some(gate.as_str()), &unused, true),
             vec![format!(
                 "resume: set aside an unused answer for the code gate (gate {gate}): {} — the \
                  rerun asks again",
@@ -5048,7 +5031,7 @@ mod tests {
             )]
         );
         assert_eq!(
-            resume_gate_lines(phase, Stage::Code, None, &unused, true),
+            resume_gate_lines(Stage::Code, None, &unused, true),
             vec![format!(
                 "resume: set aside an unused answer for the code gate (gate {gate}): {} — the \
                  rerun asks again",
@@ -5069,7 +5052,7 @@ mod tests {
             response: gate_response(true, None),
         }));
         assert_eq!(
-            resume_gate_lines(phase, Stage::Code, Some("G1"), &approved, true),
+            resume_gate_lines(Stage::Code, Some("G1"), &approved, true),
             vec![
                 "resume: an answer for the code gate (gate G1: approved) was claimed, with no \
                  record that it was applied; the rerun asks again"
@@ -5077,7 +5060,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            resume_gate_lines(phase, Stage::Ship, Some("G1"), &approved, true),
+            resume_gate_lines(Stage::Ship, Some("G1"), &approved, true),
             vec![
                 "resume: an answer for the ship gate (gate G1: approved) was claimed, with no \
                  record that it was applied; a merge, version bump or tag may already have run, \
@@ -5087,7 +5070,7 @@ mod tests {
             "a kill during Ship finalization leaves a claim after its merge may have run"
         );
         assert_eq!(
-            resume_gate_lines(phase, Stage::Code, Some("G1"), &approved, false),
+            resume_gate_lines(Stage::Code, Some("G1"), &approved, false),
             Vec::<String>::new(),
             "a claimed pair at a stage the run left is an applied answer's leftover"
         );
@@ -5096,7 +5079,7 @@ mod tests {
             response: gate_response(false, Some("fix it")),
         }));
         assert_eq!(
-            resume_gate_lines(phase, Stage::Code, None, &rejected, true),
+            resume_gate_lines(Stage::Code, None, &rejected, true),
             vec![
                 "resume: an answer for the code gate (gate G1: rejected, note \"fix it\") was claimed, with no record that it was applied; the rerun asks again"
                     .to_string()
@@ -5104,83 +5087,16 @@ mod tests {
             "the claimed entry names itself, whatever the gate file said"
         );
         assert_eq!(
-            resume_gate_lines(phase, Stage::Code, None, &claimed(None), true),
+            resume_gate_lines(Stage::Code, None, &claimed(None), true),
             vec![
                 "resume: an answer of unknown content for the code gate (gate G1) was claimed, with no record that it was applied; the rerun asks again"
                     .to_string()
             ]
         );
         assert_eq!(
-            resume_gate_lines(phase, Stage::Code, None, &CloseReport::default(), true),
+            resume_gate_lines(Stage::Code, None, &CloseReport::default(), true),
             Vec::<String>::new(),
             "a stage with nothing to report prints nothing"
-        );
-    }
-
-    /// D-06: once `resume` has set a Ship answer aside, `devflow ship` cannot apply it, so
-    /// the report names what is still available. The Code lines above carry none of this.
-    #[test]
-    fn resume_names_only_the_actions_left_for_a_ship_answer_it_set_aside() {
-        const NAME: &str = "pipeline_launch::tests::resume_names_only_the_actions_left_for_a_ship_answer_it_set_aside";
-        if !devflow_core::test_support::in_child_test(NAME) {
-            let path_dir = agent_free_dir_with_agent_stub("codex");
-            let output = crate::test_support::run_hermetic_test_in_child(
-                NAME,
-                path_dir.path(),
-                &[("DEVFLOW_GATE_TIMEOUT_SECS", std::ffi::OsStr::new("1"))],
-            );
-            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
-            return;
-        }
-        let _guard = env_lock();
-
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        init_repo(root);
-        let phase = PhaseId::new(94);
-        let (gate, answer) = seed_gate_with_pending_answer(
-            root,
-            phase,
-            Stage::Ship,
-            Mode::Supervise,
-            &gate_response(true, None),
-        );
-
-        let result = resume(root, phase, None);
-        {
-            let reloaded = workflow::load_state(root, phase).ok();
-            let _reap_guard = reloaded.as_ref().map(ReapMonitorOnDrop::after_launch);
-        }
-        drop(result);
-
-        let quarantined = Gates::quarantined(root);
-        assert_eq!(quarantined.len(), 1, "{quarantined:?}");
-        assert_eq!(quarantined[0].label, gate.as_str());
-        assert_eq!(std::fs::read(&quarantined[0].path).unwrap(), answer);
-
-        let report = CloseReport {
-            quarantined: vec![quarantined[0].path.clone()],
-            ..CloseReport::default()
-        };
-        let lines = resume_gate_lines(phase, Stage::Ship, Some(gate.as_str()), &report, true);
-        assert_eq!(lines.len(), 2, "{lines:?}");
-        assert!(
-            lines[0].contains("the ship gate") && lines[0].contains("the rerun asks again"),
-            "{lines:?}"
-        );
-        assert_eq!(
-            lines[1],
-            format!(
-                "resume: the rerun's Ship gate asks again — answer it with `devflow gate approve \
-                 {phase} ship`; next time, to apply a stored Ship approval without a rerun, run \
-                 `devflow ship --phase {phase}` instead of `resume`"
-            )
-        );
-        assert!(
-            resume_gate_lines(phase, Stage::Code, Some(gate.as_str()), &report, true)
-                .iter()
-                .all(|line| !line.contains("devflow ship")),
-            "control: only a Ship answer gets the Ship line"
         );
     }
 

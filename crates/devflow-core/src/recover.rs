@@ -2057,7 +2057,7 @@ mod tests {
         assert!(!opened.path.exists());
     }
 
-    /// D-17: a foreground `start`, `resume`, `devflow ship` or hand-run `advance` is
+    /// D-17: a foreground `start`, `resume` or hand-run `advance` is
     /// what the long lock used to cover.
     #[test]
     fn clean_keeps_a_phase_whose_foreground_holder_is_live() {

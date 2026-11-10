@@ -730,7 +730,7 @@ pub(crate) fn run_gate_with_timeout(
                     registration.finish();
                     return Err(CliError::Message(format!(
                         "phase {}: the answer to {stage} gate {gate_id} was already consumed: \
-                         another consumer (`devflow ship`) acted on it, so this wait did nothing",
+                         another consumer acted on it, so this wait did nothing",
                         state.phase
                     )));
                 }

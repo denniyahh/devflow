@@ -210,7 +210,7 @@ impl GitFlow {
     /// Create or reset a release branch from the current `HEAD`.
     ///
     /// The release branch is cut from wherever the caller currently is — the
-    /// branch being shipped — not from `develop`. `devflow ship` writes the
+    /// branch being shipped — not from `develop`. Ship finalization writes the
     /// version bump into the working tree first, so branching from `HEAD`
     /// keeps any commits unique to the shipped branch in the release.
     pub fn release_start(&self, version: &str) -> Result<String, GitError> {
