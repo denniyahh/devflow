@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::phase_id::PhaseId;
-use crate::{agent_result, events, gates::Gates, lock, ship, workflow};
+use crate::{agent_result, events, gates::Gates, lock, workflow};
 
 const SCOPED_DOCS: &[&str] = &[
     "README.md",
@@ -321,14 +321,6 @@ fn gitignore_covers_all_devflow_paths() {
         ),
         ("Gates::dir", Gates::dir(root)),
         ("lock::project_lock_path", lock::project_lock_path(root)),
-        (
-            "ship::cron_instructions_path",
-            ship::cron_instructions_path(root, PhaseId::new(16)),
-        ),
-        (
-            "ship::legacy_cron_instructions_path",
-            ship::legacy_cron_instructions_path(root),
-        ),
     ];
     let ignore = std::fs::read_to_string(workspace_root().join(".gitignore"))
         .expect("workspace .gitignore must be readable");
@@ -781,13 +773,11 @@ fn row_findings(text: &str, rows: &[(&str, &str)]) -> Vec<String> {
 }
 
 /// OPERATIONS.md rows that must name the fallback (51-11): the flag and the
-/// `devflow.toml` key on `start`, the flag on `resume`, and the cron record's
-/// fallback condition.
+/// `devflow.toml` key on `start`, and the flag on `resume`.
 const FALLBACK_ROW_FRAGMENTS: &[(&str, &str)] = &[
     ("| `devflow start", "--fallback-agent"),
     ("| `devflow start", "fallback_agent"),
     ("| `devflow resume", "--fallback-agent"),
-    ("| `cron-instructions-NN.json`", "fallback"),
 ];
 
 /// The failover events and keys an operator reads in `events.jsonl`, which
@@ -812,9 +802,8 @@ const FALLBACK_GUIDE_FRAGMENTS: &[(&str, &str)] = &[
 /// 51-11 (D-01, D-02, D-03, D-04, D-07, D-10, R-3): the operator docs document
 /// the rate-limit fallback. Outside HTML comments, OPERATIONS.md's `devflow
 /// start` row names `--fallback-agent` and the `fallback_agent` key, its
-/// `devflow resume` row names `--fallback-agent`, its `cron-instructions-NN.json`
-/// row says when a fallback applies, and the text names the failover events and
-/// their keys; README.md and the unattended-mode guide name the flag, and the
+/// `devflow resume` row names `--fallback-agent`, and the text names the failover
+/// events and their keys; README.md and the unattended-mode guide name the flag, and the
 /// configuration guide names the key.
 #[test]
 fn operations_md_documents_the_fallback_agent_and_its_events() {
@@ -835,11 +824,8 @@ fn operations_md_documents_the_fallback_agent_and_its_events() {
          a later row carries the flag"
     );
     assert_eq!(
-        row_findings(
-            planted_table,
-            &[("| `cron-instructions-NN.json`", "fallback")]
-        ),
-        vec!["no row starts with \"| `cron-instructions-NN.json`\"".to_string()],
+        row_findings(planted_table, &[("| `devflow status", "fallback")]),
+        vec!["no row starts with \"| `devflow status\"".to_string()],
         "planted control: a missing row is reported"
     );
     let every_event = FAILOVER_EVENT_FRAGMENTS.join("\n");
