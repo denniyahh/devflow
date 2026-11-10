@@ -147,7 +147,7 @@ Task 1's commit also holds the test-site migration. The plan asked for this, bec
 | 1 | pipeline_launch.rs:4486 | launch_stage_persists_the_supervisor_record_for_reload | migrated to Codex |
 | 2 | pipeline_launch.rs:4608 | launch_publishes_the_socket_path_under_the_cache_dir_in_state | migrated to Codex |
 | 3 | pipeline_launch.rs:5057 | resume_clears_stop_marker_and_advances_past_stop_point | migrated to Codex |
-| 4 | pipeline_launch.rs:5116 | seed_gate_with_pending_answer (helper; 5 resume gate tests) | migrated to Codex |
+| 4 | pipeline_launch.rs:5116 | seed_gate_with_pending_answer (helper; 2 resume gate tests) | migrated to Codex |
 | 5 | pipeline_launch.rs:5501 | resume_reports_a_claimed_pair_whose_gate_file_is_gone | migrated to Codex |
 | 6 | pipeline_launch.rs:5652 | resume_preserves_unfired_until_cap | migrated to Codex |
 | 7 | pipeline_launch.rs:5726 | resume_without_a_cap_is_unchanged | migrated to Codex |
@@ -158,8 +158,8 @@ Task 1's commit also holds the test-site migration. The plan asked for this, bec
 | 12 | pipeline_launch.rs:7015 | a_validate_launch_commits_its_dispatch_stamp | migrated to Codex |
 | 13 | pipeline_launch.rs:7155 | canary_gate_only_applies_to_the_stream_launch_path | migrated to Codex (the discriminator is now the agent, with Claude as the control) |
 | 14 | pipeline_launch.rs:9689 | legacy_launch_skips_the_delivery_canary | deleted (legacy subject; #13 covers capture-skips-canary) |
-| 15 | pipeline_launch.rs:10109 | HandoffRun::launch_with (helper; ~15 handoff/failover tests) | Claude kept, canary recorded Confirmed |
-| 16 | pipeline_launch.rs:11728 | save_rate_limited_code_run (helper; 4 failover tests) | Claude kept, canary recorded Confirmed |
+| 15 | pipeline_launch.rs:10109 | HandoffRun::launch_with (helper; behind `HandoffRun::launch`, used by 50 tests) | Claude kept, canary recorded Confirmed |
+| 16 | pipeline_launch.rs:11728 | save_rate_limited_code_run (helper; 3 failover tests) | Claude kept, canary recorded Confirmed |
 | 17 | pipeline_launch.rs:13619 | a_next_stage_spawn_that_fails_clears_its_pending_record | migrated to Codex |
 | 18 | pipeline_launch.rs:13852 | a_launched_supervisor_holds_its_liveness_lock_after_the_launcher_drops_it | migrated to Codex |
 | 19 | pipeline_launch.rs:13973 | a_failed_monitor_spawn_clears_the_supervisor_record | migrated to Codex |
@@ -180,10 +180,10 @@ Task 1's commit also holds the test-site migration. The plan asked for this, bec
 | 34 | commands.rs:16514 | second_launch_refuses_over_a_dead_launchers_supervisor | migrated to Codex |
 | 35 | pipeline_gate.rs:3202 | a_transition_clears_the_persisted_code_fix | migrated to Codex (`waiting_claude_dir` became `waiting_codex_dir`) |
 
-Totals: 25 migrated to Codex, 4 kept on Claude with a recorded `Confirmed` canary, 1 deleted, and 5 partly edited (a legacy arm dropped or the failing condition swapped). Total 35, which equals the start-commit count.
+Totals: 24 migrated to Codex, 4 kept on Claude with a recorded `Confirmed` canary, 1 deleted, and 6 partly edited (#28 to #33: a line or legacy arm dropped, the failing condition swapped, or a state replaced). Total 35, which equals the start-commit count.
 
 **Other uses the field count did not include.** The compiler surfaced these, and each was handled:
-- `commands::start(.., legacy_claude_launch = true, ..)` in 5 test helpers: `start_for_test`, `start_with_fallback`, `start_again_with_force`, `start_as_refusal_names`, and the direct call in `a_signal_to_a_start_parked_at_a_preflight_gate_keeps_the_resumable_state`. The first three of these plus `start_as_refusal_names` now run Codex. `start_with_fallback` takes its agent from the caller: `start_persists_the_fallback_agent_in_the_run_state` became Codex primary with a Claude fallback, and its printed line was swapped. The other two callers are refused before any launch and were left alone. The parked-start test keeps Claude, because its preflight gate fires before the canary.
+- `commands::start(.., legacy_claude_launch = true, ..)` in 5 test helpers: `start_for_test`, `start_with_fallback`, `start_again_with_force`, `start_as_refusal_names`, and the direct call in `a_signal_to_a_start_parked_at_a_preflight_gate_keeps_the_resumable_state`. `start_for_test`, `start_again_with_force` and `start_as_refusal_names` now run Codex. `start_with_fallback` takes its agent from the caller: `start_persists_the_fallback_agent_in_the_run_state` became Codex primary with a Claude fallback, and its printed line was swapped. The other two callers are refused before any launch and were left alone. The parked-start test keeps Claude, because its preflight gate fires before the canary.
 - `resume(.., true)` / `resume(.., false)`: all 32 calls dropped the argument. That includes `commands::tests::launch_for_test` and four HandoffRun tests that passed `true`.
 - Deleted legacy-subject tests: `legacy_launch_flag_forces_the_single_document_path`, `legacy_launch_is_off_by_default`, `legacy_launch_use_is_recorded_in_provenance`, `legacy_launch_env_var_is_parsed_as_a_bool`, `resume_does_not_clear_a_persisted_legacy_launch`, `stream_launch_includes_antigravity_ignores_claude_legacy_opt_out` and `commands::tests::recovery_hints_judge_the_environment_legacy_opt_out_as_resume_does`. The helpers `LegacyEnvOverride` and `legacy_state` were also deleted. With site #14, that makes 8 deleted tests.
 - `parse_failure_does_not_trigger_a_fallback` was kept. It lost its env-var mutation (and the `#[expect(clippy::disallowed_methods)]` that came with it), and it lost its check for the removed `claude_legacy_launch_forced` event.
