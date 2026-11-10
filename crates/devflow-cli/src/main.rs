@@ -22,6 +22,8 @@ use pipeline_gate::ship_override;
 mod parallel;
 use parallel::parallel;
 
+mod phase_worktree;
+
 mod commands;
 use commands::{
     cleanup, doctor, evidence, gate_list, gate_respond, gate_show, gate_sweep, history_cmd, logs,

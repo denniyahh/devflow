@@ -13,7 +13,7 @@
 use crate::CliError;
 use crate::config_parse;
 use crate::config_parse::GATE_ESCALATION_THRESHOLD_SECS;
-use crate::parallel::ensure_phase_worktree;
+use crate::phase_worktree::ensure_phase_worktree;
 use crate::pipeline_gate::print_dry_run;
 use crate::pipeline_launch::{launch_stage, single_active_phase};
 use crate::pipeline_outcomes::render_gate_context;

@@ -14,7 +14,6 @@
 
 use crate::CliError;
 use crate::config_parse::{checkout_lock_timeout, gate_timeout_secs};
-use crate::parallel::retry_after_from_reason;
 use crate::pipeline_gate::{
     LoopBackReason, abort, finish_workflow, loop_back_to_code, run_gate, run_gate_with_timeout,
     transition,
@@ -75,6 +74,13 @@ pub(crate) fn gate_or_abort_infra(
         );
     }
     handle_stage_failure(project_root, state, stage, reason)
+}
+
+pub(crate) fn retry_after_from_reason(reason: Option<&str>) -> String {
+    reason
+        .and_then(|s| s.strip_prefix("rate limited until "))
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 /// Route a `RateLimited` outcome from the PRIMARY advance() monitor loop
@@ -6121,5 +6127,15 @@ mod tests {
             devflow_core::ship::load_cron_instructions(root, phase).is_err(),
             "no auto-resume is scheduled at the ceiling"
         );
+    }
+
+    #[test]
+    fn retry_after_from_reason_strips_prefix() {
+        assert_eq!(
+            retry_after_from_reason(Some("rate limited until 2026-06-18T15:45:30Z")),
+            "2026-06-18T15:45:30Z"
+        );
+        assert_eq!(retry_after_from_reason(Some("usage limit")), "unknown");
+        assert_eq!(retry_after_from_reason(None), "unknown");
     }
 }
