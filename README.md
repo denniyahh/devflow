@@ -117,7 +117,6 @@ Rate-limit detection: if an agent's stdout contains rate-limit messages (429), D
 |---|---|
 | `devflow start --phase N --agent X [--mode auto\|supervise] [--no-worktree]` | Begin a phase: branch/worktree → launch agent → monitor pipeline |
 | `devflow status` | Show current stage, phase, agent, PID, age |
-| `devflow list` | List all feature branches with divergence from develop |
 | `devflow gate list` | List gates awaiting a response |
 | `devflow gate approve\|reject <phase> [--stage STAGE] [--note "..."] [--gate-id ID]` | Answer a human gate — the pause points where the workflow waits for approval |
 | `devflow logs [--phase N] [--follow] [--stderr]` | Print or follow an agent's captured output for a phase |

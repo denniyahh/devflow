@@ -24,9 +24,9 @@ use parallel::parallel;
 
 mod commands;
 use commands::{
-    cleanup, doctor, evidence, gate_list, gate_respond, gate_show, gate_sweep, history_cmd, list,
-    logs, recover_cmd, reference, release_check, release_verify, resolve_gate_target, start,
-    status, stop, stop_launch, test_cmd,
+    cleanup, doctor, evidence, gate_list, gate_respond, gate_show, gate_sweep, history_cmd, logs,
+    recover_cmd, reference, release_check, release_verify, resolve_gate_target, start, status,
+    stop, stop_launch, test_cmd,
 };
 use devflow_core::phase_id::PhaseId;
 
@@ -302,12 +302,6 @@ enum Command {
     },
     /// Show current workflow state.
     Status {
-        /// Project root.
-        #[arg(default_value = ".")]
-        project: PathBuf,
-    },
-    /// List all feature branches with divergence from develop.
-    List {
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
@@ -770,7 +764,6 @@ fn run() -> Result<(), CliError> {
         } => reference(&project_root(project)?, branch, refresh),
         Command::Cleanup { project, force } => cleanup(&project_root(project)?, force),
         Command::Status { project } => status(&project_root(project)?),
-        Command::List { project } => list(&project_root(project)?),
         Command::Recover {
             project,
             clean,
