@@ -506,7 +506,7 @@ pub(crate) fn rfc3339_from_unix(unix_secs: u64) -> String {
     const SECS_PER_DAY: u64 = 24 * SECS_PER_HOUR;
     // u64::MAX / SECS_PER_DAY is below 2^48, so the day count fits i64.
     let days = i64::try_from(unix_secs / SECS_PER_DAY).unwrap_or(i64::MAX);
-    let (year, month, day) = crate::ship::civil_from_days(days);
+    let (year, month, day) = crate::reset_time::civil_from_days(days);
     let of_day = unix_secs % SECS_PER_DAY;
     format!(
         "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z",
