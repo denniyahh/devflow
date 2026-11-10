@@ -63,8 +63,7 @@ impl ClaudeDriver {
     /// The pre-31 single-document launch: `-p <prompt>` positionally with
     /// `--output-format json`.
     ///
-    /// **This is a live path, not a deprecated leftover.** Two things select
-    /// it, and both are deliberate:
+    /// **Kept, not a deprecated leftover.** One thing selects it, deliberately:
     ///
     /// - **D-09/D-10's sequencing gate.** The stream-json launch is rolled out
     ///   one stage at a time, starting at `Stage::Code`. Every stage not yet
@@ -72,10 +71,12 @@ impl ClaudeDriver {
     ///   rollout order, which constraint 1 permits — it is emphatically not a
     ///   prediction about which stages background work, which constraint 1
     ///   forbids.
-    /// - **D-11's opt-out.** An explicit flag (off by default) can force this
-    ///   shape back on for recovery without cutting a release. Automatic
-    ///   fallback on parse failure is rejected: a silent downgrade is the same
-    ///   invisible-degradation class as the bug Phase 31 exists to fix.
+    ///
+    /// D-11's opt-out (`--legacy-claude-launch`) was removed in Phase 52, so
+    /// with every stage widened nothing reaches this builder through
+    /// `launch_stage` today. Automatic fallback on parse failure stays
+    /// rejected: a silent downgrade is the same invisible-degradation class as
+    /// the bug Phase 31 exists to fix.
     ///
     /// The argv is the pre-31 single-document launch body verbatim, so
     /// the shipped capture shape (`CaptureKind::SingleDocEnvelope`) and the
@@ -190,11 +191,10 @@ mod tests {
         );
     }
 
-    /// The pre-31 shape must stay REACHABLE, not merely present. Two live
-    /// selectors depend on it: D-11's opt-out (recovery without a release) and
-    /// the D-09/D-10 sequencing gate (every stage the rollout has not reached
-    /// yet). If this builder silently drifted toward the stream-json shape,
-    /// both would land on a launch that is not pre-31 at all, and the D-12
+    /// The pre-31 shape must stay REACHABLE, not merely present. The D-09/D-10
+    /// sequencing gate (every stage the rollout has not reached yet) depends on
+    /// it. If this builder silently drifted toward the stream-json shape, that
+    /// gate would land on a launch that is not pre-31 at all, and the D-12
     /// isolation guarantee for the shipped single-document capture would go
     /// with it.
     #[test]
@@ -213,12 +213,12 @@ mod tests {
         );
         assert!(
             args.iter().any(|a| a == "--dangerously-skip-permissions"),
-            "the opt-out path is still headless: {args:?}"
+            "the single-document path is still headless: {args:?}"
         );
         assert!(
             !args.iter().any(|a| a == "--input-format"),
             "this builder must NOT drift toward the stream-json shape — that \
-             would leave D-11's opt-out with nothing to opt out to: {args:?}"
+             would leave the sequencing gate with no pre-31 shape: {args:?}"
         );
     }
 

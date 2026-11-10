@@ -262,8 +262,8 @@ fn resolve_launch_shape(
         let (program, args) = driver.build_command(phase, &prompt, roots);
         (program, args, monitor::MonitorLaunch::PipeOwning { prompt })
     } else if agent == AgentKind::Claude {
-        // Claude on a stage the rollout has not reached, or a run that took
-        // D-11's opt-out: the explicitly named pre-31 builder, NOT
+        // Claude on a stage the rollout has not reached (none today; Phase 52
+        // removed D-11's opt-out): the explicitly named pre-31 builder, NOT
         // `exec_command` — which now returns the stream-json shape for every
         // stage.
         let (program, args) = agents::ClaudeDriver::exec_command_single_document(&prompt);
@@ -429,8 +429,8 @@ where
 {
     // The guard protects one specific premise: that a live `stream-json`
     // session is woken back up when a background task finishes. A launch that
-    // resolved to the legacy single-document path does not rely on that
-    // premise, so checking it there would spend an agent invocation to answer a
+    // resolved to the capture shape does not rely on that premise, so checking
+    // it there would spend an agent invocation to answer a
     // question the launch never asks.
     if !stream_launch {
         return Ok(());
@@ -5386,8 +5386,8 @@ mod tests {
 
         let phase = PhaseId::new(67);
         // `Mode::Supervise` for the same 35.1-03 reason as
-        // `launch_stage_persists_the_supervisor_record_for_reload` above: the legacy
-        // opt-out set below is refused in `Mode::Auto` by
+        // `launch_stage_persists_the_supervisor_record_for_reload` above: a Codex
+        // Code stage is refused in `Mode::Auto` by
         // `preflight_unattended_launch_check`, and this test's subject — the
         // unfired `stop_until` cap surviving a resume — is mode-independent.
         let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
@@ -5456,7 +5456,7 @@ mod tests {
 
         let phase = PhaseId::new(68);
         // `Mode::Supervise` for the same 35.1-03 reason as the two tests
-        // above — the legacy opt-out below is refused in `Mode::Auto`, and the
+        // above — a Codex Code stage is refused in `Mode::Auto`, and the
         // absence of a `stop_until` cap is mode-independent.
         let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
         state.stop_until = None;
@@ -9061,7 +9061,7 @@ mod tests {
         assert!(!events_of_kind(root, "gate_fired").is_empty());
     }
 
-    // ---- D-11: the legacy-launch opt-out (31-04) -------------------------
+    // ---- launch-shape selection (D-11's opt-out was removed in Phase 52) ----
 
     /// D-03 (47-03): a resumed Claude session receives the gate rule in two
     /// separately delivered turns — the Code loop-back prompt as the stdin user

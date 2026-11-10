@@ -386,7 +386,7 @@ pub(crate) fn start(
     };
 
     // D-01, D-02, D-03: the fallback is checked against the state as combined above
-    // (agent, mode, legacy opt-out) and set before `dry_run`, the holder and the
+    // (agent and mode) and set before `dry_run`, the holder and the
     // reservation, so a refused fallback changes nothing and a dry run shows it.
     if let Some(fallback) = fallback_agent {
         // D-02 and D-03 apply to the key's value exactly as to the flag's; a refusal
