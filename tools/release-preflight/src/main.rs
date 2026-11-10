@@ -435,3 +435,95 @@ fn check_sync_done(project_root: &Path) -> Check {
         ),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A project root holding only a workspace version and a changelog.
+    fn changelog_fixture(workspace_version: &str, changelog: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("create fixture dir");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            format!("[workspace.package]\nversion = \"{workspace_version}\"\n"),
+        )
+        .expect("write Cargo.toml");
+        std::fs::write(dir.path().join("CHANGELOG.md"), changelog).expect("write CHANGELOG.md");
+        dir
+    }
+
+    #[test]
+    fn changelog_check_says_cargo_is_ahead_when_release_notes_are_missing() {
+        let dir = changelog_fixture("2.5.0", "## 2.4.0 — 2026-01-01\n");
+
+        let check = check_changelog_version(dir.path());
+
+        assert_eq!(check.status, Status::Fail);
+        assert!(
+            check.detail.contains("Cargo.toml ahead"),
+            "workspace 2.5.0 is newer than changelog 2.4.0, got: {}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn changelog_check_says_the_changelog_is_ahead_when_the_bump_is_missing() {
+        let dir = changelog_fixture("2.5.0", "## 2.6.0 — 2026-01-01\n");
+
+        let check = check_changelog_version(dir.path());
+
+        assert_eq!(check.status, Status::Fail);
+        assert!(
+            check.detail.contains("changelog ahead"),
+            "changelog 2.6.0 is newer than workspace 2.5.0, got: {}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn changelog_check_passes_on_a_plain_matching_heading() {
+        let dir = changelog_fixture("2.5.0", "## 2.5.0 — 2026-08-15\n");
+
+        assert_eq!(check_changelog_version(dir.path()).status, Status::Ok);
+    }
+
+    #[test]
+    fn changelog_check_reads_a_bracketed_keep_a_changelog_heading() {
+        let dir = changelog_fixture("2.5.0", "## [2.5.0] - 2026-08-15\n");
+
+        assert_eq!(check_changelog_version(dir.path()).status, Status::Ok);
+    }
+
+    #[test]
+    fn changelog_check_skips_a_numbered_section_heading() {
+        let dir = changelog_fixture("2.5.0", "## 1. Overview\n\n## 2.4.0\n");
+
+        let check = check_changelog_version(dir.path());
+
+        assert_eq!(check.status, Status::Fail);
+        assert!(
+            check.detail.contains("changelog 2.4.0"),
+            "`## 1. Overview` is not a version heading, got: {}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn changelog_check_warns_without_a_version_heading() {
+        let dir = changelog_fixture("2.5.0", "no heading here\n");
+
+        assert_eq!(check_changelog_version(dir.path()).status, Status::Warn);
+    }
+
+    #[test]
+    fn compare_versions_orders_a_release_after_its_prerelease() {
+        assert_eq!(
+            compare_versions("2.5.0", "2.5.0-rc.1"),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            compare_versions("2.5.0-rc.1", "2.5.0"),
+            Some(Ordering::Less)
+        );
+    }
+}
