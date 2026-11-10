@@ -333,7 +333,6 @@ pub(crate) fn start(
     dry_run: bool,
     until: Option<Stage>,
     yes_ship: bool,
-    legacy_claude_launch: bool,
     fallback: FallbackSource,
 ) -> Result<(), CliError> {
     // 999.78/A-11: NOT a bare `State::new`. See
@@ -365,19 +364,6 @@ pub(crate) fn start(
     // so constructing a state never reads the environment (49-REVIEW.md
     // WR-01); `resume` and `advance` apply the same rule (CR-03).
     state.gate_notify_cmd = devflow_core::gates::apply_notify_env(state.gate_notify_cmd.take());
-
-    // D-11's opt-out (31-04), combined on the same shape and for the same
-    // reasons as `yes_ship` directly above: OR-ed with an environment override
-    // rather than replacing it, before `create_run_state` below so the
-    // persisted value exists before any detached monitor consults it, and with
-    // a notice when the environment ALONE supplied it — a standing default is
-    // never a silent one.
-    if crate::pipeline_launch::apply_legacy_launch_opt_out(&mut state, legacy_claude_launch) {
-        println!(
-            "note: legacy Claude launch forced by DEVFLOW_CLAUDE_LEGACY_LAUNCH \
-             (D-11, 31-CONTEXT.md) — a persisted default is never a silent one"
-        );
-    }
 
     // R-3: `devflow.toml`'s `fallback_agent` key, combined with the flag the way
     // `yes_ship` is above: the flag wins when given, the key applies when it is
@@ -1559,13 +1545,9 @@ const HELD_NO_SOCKET_REPAIR: &str =
 /// instead of the `resume` that would set it aside ([`ship_answer_stored`]). A run whose
 /// recorded delivery canary refuses its agent names `resume --agent <other>`, since that
 /// canary refuses a plain `resume` and only a handoff clears it; that is judged as
-/// `resume` judges it, with the environment's legacy opt-out `env_legacy_opt_out`
-/// ([`resume_canary_refusal`](crate::pipeline_launch::resume_canary_refusal)).
-fn recovery_hints(
-    state: &State,
-    liveness: &PhaseLiveness,
-    env_legacy_opt_out: bool,
-) -> Vec<String> {
+/// `resume` judges it
+/// ([`recorded_canary_refusal`](crate::pipeline_launch::recorded_canary_refusal)).
+fn recovery_hints(state: &State, liveness: &PhaseLiveness) -> Vec<String> {
     let phase = state.phase;
     if run_never_prepared(state)
         && matches!(
@@ -1578,9 +1560,7 @@ fn recovery_hints(
     let stored = ship_answer_stored(state);
     let continue_verb = if stored {
         format!("devflow ship --phase {phase}")
-    } else if crate::pipeline_launch::resume_canary_refusal(state, false, env_legacy_opt_out)
-        .is_some()
-    {
+    } else if crate::pipeline_launch::recorded_canary_refusal(state).is_some() {
         format!("devflow resume --phase {phase} --agent <other>")
     } else {
         format!("devflow resume --phase {phase}")
@@ -1752,11 +1732,7 @@ fn status_hints(
         Some(agent) if no_supervisor_live(liveness) => {
             vec![orphaned_agent_line(state.phase, agent)]
         }
-        _ => recovery_hints(
-            state,
-            liveness,
-            devflow_core::config::claude_legacy_launch(),
-        ),
+        _ => recovery_hints(state, liveness),
     }
 }
 
@@ -11051,7 +11027,7 @@ mod tests {
         );
         state.verification_baseline_captured = true;
 
-        let hints = recovery_hints(&state, &PhaseLiveness::GoneWhileActive, false);
+        let hints = recovery_hints(&state, &PhaseLiveness::GoneWhileActive);
 
         assert_eq!(hints, vec!["devflow resume --phase 7".to_string()]);
     }
@@ -11078,12 +11054,12 @@ mod tests {
 
         state.stage = Stage::Code;
         assert_eq!(
-            recovery_hints(&state, &PhaseLiveness::GoneWhileActive, false),
+            recovery_hints(&state, &PhaseLiveness::GoneWhileActive),
             vec!["devflow resume --phase 7".to_string()]
         );
         state.stage = Stage::Ship;
         assert_eq!(
-            recovery_hints(&state, &PhaseLiveness::GoneWhileActive, false),
+            recovery_hints(&state, &PhaseLiveness::GoneWhileActive),
             vec![
                 "devflow resume --phase 7".to_string(),
                 "devflow ship --phase 7".to_string(),
@@ -11110,7 +11086,7 @@ mod tests {
                 for stage in [Stage::Code, Stage::Ship] {
                     state.gate_pending = gate_pending;
                     state.stage = stage;
-                    let hints = recovery_hints(&state, liveness, false);
+                    let hints = recovery_hints(&state, liveness);
                     assert!(
                         !hint_routes_an_answer_through_advance(&hints),
                         "{liveness:?} gate_pending={gate_pending} {stage}: {hints:?}"
@@ -11140,7 +11116,7 @@ mod tests {
         );
 
         assert_eq!(
-            recovery_hints(&state, &PhaseLiveness::Stale, false),
+            recovery_hints(&state, &PhaseLiveness::Stale),
             vec![
                 "devflow stop --phase 7".to_string(),
                 "devflow resume --phase 7".to_string(),
@@ -11165,7 +11141,7 @@ mod tests {
 
         for liveness in [alive, PhaseLiveness::NotLaunched] {
             assert!(
-                recovery_hints(&state, &liveness, false).is_empty(),
+                recovery_hints(&state, &liveness).is_empty(),
                 "{liveness:?} needs no repair"
             );
         }
@@ -11187,7 +11163,7 @@ mod tests {
 
         for liveness in [PhaseLiveness::Gone, PhaseLiveness::NotLaunched] {
             assert_eq!(
-                recovery_hints(&state, &liveness, false),
+                recovery_hints(&state, &liveness),
                 vec!["devflow resume --phase 7".to_string()],
                 "{liveness:?}"
             );
@@ -11196,7 +11172,7 @@ mod tests {
             owner: "agent_running".to_string(),
             launch: "stream".to_string(),
         };
-        assert!(recovery_hints(&state, &alive, false).is_empty(), "control");
+        assert!(recovery_hints(&state, &alive).is_empty(), "control");
     }
 
     /// A stopped run whose recorded delivery canary refuses its agent names `resume
@@ -11217,7 +11193,7 @@ mod tests {
 
         state.canary = Some(devflow_core::canary::CanaryOutcome::Confirmed);
         assert_eq!(
-            recovery_hints(&state, &PhaseLiveness::Gone, false),
+            recovery_hints(&state, &PhaseLiveness::Gone),
             vec!["devflow resume --phase 7".to_string()],
             "control: a recorded Confirmed keeps the plain resume"
         );
@@ -11229,49 +11205,11 @@ mod tests {
             state.canary = Some(refusal.clone());
             for liveness in [PhaseLiveness::Gone, PhaseLiveness::NotLaunched] {
                 assert_eq!(
-                    recovery_hints(&state, &liveness, false),
+                    recovery_hints(&state, &liveness),
                     vec!["devflow resume --phase 7 --agent <other>".to_string()],
                     "{refusal:?} {liveness:?}"
                 );
             }
-        }
-    }
-
-    /// The status hint and `resume`'s refusal judge the environment's legacy opt-out
-    /// alike: a Claude run at Code with a recorded `Absent` canary, under the stream
-    /// launch, is refused, so the hint names `--agent <other>`; with the environment's
-    /// opt-out the relaunch takes the legacy path that `resume` admits, so the hint names
-    /// the plain `resume`. Both directions are asserted, so the hint is neither constant.
-    #[test]
-    fn recovery_hints_judge_the_environment_legacy_opt_out_as_resume_does() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut state = State::new(
-            PhaseId::new(7),
-            AgentKind::Claude,
-            Mode::Auto,
-            dir.path().to_path_buf(),
-        );
-        state.verification_baseline_captured = true;
-        state.stopped = true;
-        state.stage = Stage::Code;
-        state.legacy_claude_launch = false;
-        state.canary = Some(devflow_core::canary::CanaryOutcome::Absent);
-
-        for (env_opt_out, expected) in [
-            (false, "devflow resume --phase 7 --agent <other>"),
-            (true, "devflow resume --phase 7"),
-        ] {
-            let refused =
-                crate::pipeline_launch::resume_canary_refusal(&state, false, env_opt_out).is_some();
-            assert_eq!(
-                refused, !env_opt_out,
-                "resume's judgment, env {env_opt_out}"
-            );
-            assert_eq!(
-                recovery_hints(&state, &PhaseLiveness::Gone, env_opt_out),
-                vec![expected.to_string()],
-                "env opt-out {env_opt_out}"
-            );
         }
     }
 
@@ -15008,8 +14946,13 @@ mod tests {
             format!("# Roadmap\n\n### Phase {phase}: reservation fixture\n"),
         )
         .unwrap();
+        // `start` refuses a Codex run without the phase's CONTEXT.md on the base.
+        let padded = phase.padded();
+        let context = format!(".planning/phases/{padded}-fixture/{padded}-CONTEXT.md");
+        std::fs::create_dir_all(root.join(&context).parent().unwrap()).unwrap();
+        std::fs::write(root.join(&context), "# Context\n").unwrap();
         for args in [
-            &["add", ".planning/ROADMAP.md"][..],
+            &["add", ".planning/ROADMAP.md", context.as_str()][..],
             &["commit", "-q", "-m", "roadmap"][..],
         ] {
             let status = devflow_core::test_support::git_command(root)
@@ -15020,19 +14963,18 @@ mod tests {
         }
     }
 
-    /// `start` as these tests run it: Supervise, no worktree, the capture shape.
+    /// `start` as these tests run it: Supervise, no worktree, the capture shape (Codex).
     fn start_for_test(root: &Path, phase: PhaseId) -> Result<(), String> {
         start(
             root,
             phase,
-            AgentKind::Claude,
+            AgentKind::Codex,
             Mode::Supervise,
             false,
             false,
             false,
             None,
             false,
-            true,
             FallbackSource::FlagOrConfig(None),
         )
         .map_err(|err| err.to_string())
@@ -15058,7 +15000,7 @@ mod tests {
         const NAME: &str = "commands::tests::\
                             start_reserves_then_its_supervisor_is_promoted_and_the_reservation_cleared";
         if !devflow_core::test_support::in_child_test(NAME) {
-            let path_dir = crate::test_support::go_waiting_claude_dir();
+            let path_dir = crate::test_support::go_waiting_agent_dir("codex");
             let hold = tempfile::tempdir().unwrap();
             let spec = launch_hold_spec("reserved", hold.path());
             let output = crate::test_support::run_hermetic_test_in_child(
@@ -15107,8 +15049,8 @@ mod tests {
         );
     }
 
-    /// `start` as the fallback tests run it: Supervise, no worktree, the capture shape,
-    /// `agent` as the primary and `mode` and `fallback` as given.
+    /// `start` as the fallback tests run it: no worktree, `agent` as the primary and
+    /// `mode` and `fallback` as given.
     fn start_with_fallback(
         root: &Path,
         phase: PhaseId,
@@ -15126,7 +15068,6 @@ mod tests {
             false,
             None,
             false,
-            true,
             FallbackSource::FlagOrConfig(fallback),
         )
     }
@@ -15137,15 +15078,15 @@ mod tests {
     fn start_persists_the_fallback_agent_in_the_run_state() {
         const NAME: &str = "commands::tests::start_persists_the_fallback_agent_in_the_run_state";
         if !devflow_core::test_support::in_child_test(NAME) {
-            let path_dir = crate::test_support::go_waiting_claude_dir();
-            crate::test_support::add_agent_stub(path_dir.path(), "codex");
+            let path_dir = crate::test_support::go_waiting_agent_dir("codex");
+            crate::test_support::add_agent_stub(path_dir.path(), "claude");
             let output =
                 crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
             let printed = String::from_utf8_lossy(&output.stdout);
             assert!(
                 printed.contains(
-                    "fallback agent: codex takes over the Code stage once if claude is rate-limited"
+                    "fallback agent: claude takes over the Code stage once if codex is rate-limited"
                 ),
                 "start names the fallback and the primary: {printed}"
             );
@@ -15159,16 +15100,16 @@ mod tests {
         let result = start_with_fallback(
             root,
             phase,
-            AgentKind::Claude,
+            AgentKind::Codex,
             Mode::Supervise,
-            Some(AgentKind::Codex),
+            Some(AgentKind::Claude),
         );
         let state = workflow::load_state(root, phase).unwrap();
         let _reap = crate::test_support::ReapMonitorOnDrop::after_launch(&state);
         result.expect("the start launches");
 
-        assert_eq!(state.agent, AgentKind::Claude);
-        assert_eq!(state.fallback_agent, Some(AgentKind::Codex));
+        assert_eq!(state.agent, AgentKind::Codex);
+        assert_eq!(state.fallback_agent, Some(AgentKind::Claude));
         assert!(!state.fallback_consumed, "a new fallback is unused");
         assert!(state.supervisor.is_some(), "the run launched");
     }
@@ -15276,7 +15217,7 @@ mod tests {
     fn the_launcher_keeps_its_lock_until_the_publish_save() {
         const NAME: &str = "commands::tests::the_launcher_keeps_its_lock_until_the_publish_save";
         if !devflow_core::test_support::in_child_test(NAME) {
-            let path_dir = crate::test_support::go_waiting_claude_dir();
+            let path_dir = crate::test_support::go_waiting_agent_dir("codex");
             let hold = tempfile::tempdir().unwrap();
             let spec = launch_hold_spec("before_publish_save", hold.path());
             let output = crate::test_support::run_hermetic_test_in_child(
@@ -15370,7 +15311,7 @@ mod tests {
     fn a_start_refuses_an_unloadable_state_beside_an_unpublished_supervisors_lock() {
         const NAME: &str = "commands::tests::a_start_refuses_an_unloadable_state_beside_an_unpublished_supervisors_lock";
         if !devflow_core::test_support::in_child_test(NAME) {
-            let path_dir = crate::test_support::go_waiting_claude_dir();
+            let path_dir = crate::test_support::go_waiting_agent_dir("codex");
             let output =
                 crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
@@ -15424,7 +15365,7 @@ mod tests {
         const NAME: &str =
             "commands::tests::a_start_refuses_a_missing_state_beside_an_unrecorded_live_lock";
         if !devflow_core::test_support::in_child_test(NAME) {
-            let path_dir = crate::test_support::go_waiting_claude_dir();
+            let path_dir = crate::test_support::go_waiting_agent_dir("codex");
             let output =
                 crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
@@ -15472,7 +15413,7 @@ mod tests {
         const NAME: &str =
             "commands::tests::a_start_replaces_an_unloadable_state_beside_a_released_lock";
         if !devflow_core::test_support::in_child_test(NAME) {
-            let path_dir = crate::test_support::go_waiting_claude_dir();
+            let path_dir = crate::test_support::go_waiting_agent_dir("codex");
             let output =
                 crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
@@ -15571,14 +15512,13 @@ mod tests {
         start(
             root,
             phase,
-            AgentKind::Claude,
+            AgentKind::Codex,
             Mode::Supervise,
             true,
             false,
             false,
             None,
             false,
-            true,
             FallbackSource::FlagOrConfig(None),
         )
         .map_err(|err| err.to_string())
@@ -15590,7 +15530,7 @@ mod tests {
         if devflow_core::test_support::in_child_test(name) {
             return false;
         }
-        let path_dir = crate::test_support::go_waiting_claude_dir();
+        let path_dir = crate::test_support::go_waiting_agent_dir("codex");
         let hold = tempfile::tempdir().unwrap();
         let spec = launch_hold_spec("before_publish_save", hold.path());
         let output = crate::test_support::run_hermetic_test_in_child(
@@ -15751,7 +15691,7 @@ mod tests {
         const NAME: &str =
             "commands::tests::a_start_clears_the_state_when_its_supervisor_confirmed_the_stop";
         if !devflow_core::test_support::in_child_test(NAME) {
-            let path_dir = crate::test_support::go_waiting_claude_dir();
+            let path_dir = crate::test_support::go_waiting_agent_dir("codex");
             let hold = tempfile::tempdir().unwrap();
             let spec = launch_hold_spec("before_publish_save", hold.path());
             let output = crate::test_support::run_hermetic_test_in_child(
@@ -16037,24 +15977,24 @@ mod tests {
         let stop = format!("devflow stop --phase {phase}");
 
         assert!(
-            recovery_hints(&state, &PhaseLiveness::GoneWhileActive, false).contains(&resume),
+            recovery_hints(&state, &PhaseLiveness::GoneWhileActive).contains(&resume),
             "control: nothing stored yet"
         );
 
         gate_respond(root, phase, Some(Stage::Ship), true, None, None).unwrap();
 
         assert_eq!(
-            recovery_hints(&state, &PhaseLiveness::GoneWhileActive, false),
+            recovery_hints(&state, &PhaseLiveness::GoneWhileActive),
             vec![ship.clone()]
         );
         assert_eq!(
-            recovery_hints(&state, &PhaseLiveness::Stale, false),
+            recovery_hints(&state, &PhaseLiveness::Stale),
             vec![stop, ship.clone()]
         );
         let mut stopped = state.clone();
         stopped.stopped = true;
         assert_eq!(
-            recovery_hints(&stopped, &PhaseLiveness::Gone, false),
+            recovery_hints(&stopped, &PhaseLiveness::Gone),
             vec![ship.clone()]
         );
         let open_gates = Gates::list_open(root);
@@ -16086,7 +16026,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            recovery_hints(&state, &PhaseLiveness::GoneWhileActive, false).contains(&resume),
+            recovery_hints(&state, &PhaseLiveness::GoneWhileActive).contains(&resume),
             "control: a claimed answer is out of `devflow ship`'s reach"
         );
     }
@@ -16136,7 +16076,7 @@ mod tests {
         let killed = state_of_a_start_killed_during_preparation(root, phase);
         assert!(killed.pending_supervisor.is_some(), "the start reserved");
 
-        let err = crate::pipeline_launch::resume(root, phase, None, false)
+        let err = crate::pipeline_launch::resume(root, phase, None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("never finished preparing"), "{err}");
@@ -16165,26 +16105,25 @@ mod tests {
         let mut state = State::new(prepared, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.verification_baseline_captured = true;
         workflow::save_state(&state).unwrap();
-        let err = crate::pipeline_launch::resume(root, prepared, None, false)
+        let err = crate::pipeline_launch::resume(root, prepared, None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("not found"), "{err}");
     }
 
     /// A real `start` of what a killed one's refusal names, over `root`: a worktree start
-    /// in Supervise mode with a stub agent, which returns once it has launched.
+    /// in Supervise mode with a stub `codex`, which returns once it has launched.
     fn start_as_refusal_names(root: &Path, phase: PhaseId, force: bool) -> Result<(), String> {
         start(
             root,
             phase,
-            AgentKind::Claude,
+            AgentKind::Codex,
             Mode::Supervise,
             force,
             true,
             false,
             None,
             false,
-            true,
             FallbackSource::FlagOrConfig(None),
         )
         .map_err(|err| err.to_string())
@@ -16196,7 +16135,7 @@ mod tests {
         const NAME: &str =
             "commands::tests::a_killed_start_with_no_worktree_names_a_plain_start_that_launches";
         if !devflow_core::test_support::in_child_test(NAME) {
-            let path_dir = crate::test_support::go_waiting_claude_dir();
+            let path_dir = crate::test_support::go_waiting_agent_dir("codex");
             let output =
                 crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
@@ -16228,7 +16167,7 @@ mod tests {
         const NAME: &str =
             "commands::tests::a_killed_start_with_a_worktree_names_a_force_start_that_launches";
         if !devflow_core::test_support::in_child_test(NAME) {
-            let path_dir = crate::test_support::go_waiting_claude_dir();
+            let path_dir = crate::test_support::go_waiting_agent_dir("codex");
             let output =
                 crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
@@ -16246,7 +16185,7 @@ mod tests {
         assert!(err.contains("discard"), "{err}");
         assert!(err.contains(&*worktree_path.to_string_lossy()), "{err}");
         assert!(!err.contains("no worktree"), "{err}");
-        let hints = recovery_hints(&killed, &PhaseLiveness::NotLaunched, false);
+        let hints = recovery_hints(&killed, &PhaseLiveness::NotLaunched);
         assert!(hints[0].starts_with(&verb), "{hints:?}");
 
         let refused = start_as_refusal_names(root, phase, false).unwrap_err();
@@ -16280,7 +16219,7 @@ mod tests {
         ] {
             let liveness = probe_phase(state);
             assert_eq!(
-                recovery_hints(state, &liveness, false),
+                recovery_hints(state, &liveness),
                 vec![start_verb.clone()],
                 "{case}"
             );
@@ -16301,7 +16240,7 @@ mod tests {
         let mut prepared = killed.clone();
         prepared.verification_baseline_captured = true;
         assert_eq!(
-            recovery_hints(&prepared, &probe_phase(&prepared), false),
+            recovery_hints(&prepared, &probe_phase(&prepared)),
             vec![resume_verb.clone()]
         );
         let findings = reconcile_phase(&facts_for(root, &prepared));
@@ -16433,8 +16372,9 @@ mod tests {
     fn launch_for_test(root: &Path, phase: PhaseId, verb: LaunchVerb) -> Result<(), String> {
         match verb {
             LaunchVerb::Start => start_for_test(root, phase),
-            LaunchVerb::Resume => crate::pipeline_launch::resume(root, phase, None, true)
-                .map_err(|err| err.to_string()),
+            LaunchVerb::Resume => {
+                crate::pipeline_launch::resume(root, phase, None).map_err(|err| err.to_string())
+            }
         }
     }
 
@@ -16497,21 +16437,17 @@ mod tests {
             }
             return;
         }
-        let path_dir = crate::test_support::go_waiting_claude_dir();
+        let path_dir = crate::test_support::go_waiting_agent_dir("codex");
         let cache = crate::test_support::hermetic_cache_dir();
         let repo = tempfile::tempdir().unwrap();
         let root = repo.path();
         init_start_repo(root, phase);
         if verb == LaunchVerb::Resume {
-            let mut stopped = State::new(
-                phase,
-                AgentKind::Claude,
-                Mode::Supervise,
-                root.to_path_buf(),
-            );
+            let mut stopped =
+                State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
             stopped.stopped = true;
             stopped.verification_baseline_captured = true;
-            stopped.legacy_claude_launch = true;
+
             workflow::save_state(&stopped).unwrap();
         }
         let hold = tempfile::tempdir().unwrap();
@@ -16868,7 +16804,7 @@ mod tests {
     fn a_live_agent_pid_still_refuses_start() {
         const NAME: &str = "commands::tests::a_live_agent_pid_still_refuses_start";
         if !devflow_core::test_support::in_child_test(NAME) {
-            let path_dir = crate::test_support::go_waiting_claude_dir();
+            let path_dir = crate::test_support::go_waiting_agent_dir("codex");
             let output =
                 crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
@@ -17074,7 +17010,7 @@ mod tests {
             );
             assert_eq!(phase_liveness.label(), "launch_pending", "{case}");
             assert_eq!(
-                recovery_hints(&state, &phase_liveness, false),
+                recovery_hints(&state, &phase_liveness),
                 vec![format!("devflow stop --phase {phase}")],
                 "{case}"
             );
@@ -17104,7 +17040,7 @@ mod tests {
             assert_eq!(phase_liveness, PhaseLiveness::GoneWhileActive, "{case}");
             let resume = format!("devflow resume --phase {phase}");
             assert_eq!(
-                recovery_hints(&state, &phase_liveness, false),
+                recovery_hints(&state, &phase_liveness),
                 vec![resume.clone()],
                 "{case}"
             );
@@ -17648,7 +17584,7 @@ mod tests {
         const NAME: &str =
             "commands::tests::start_refuses_while_another_process_holds_the_phase_before_reserving";
         if !devflow_core::test_support::in_child_test(NAME) {
-            let path_dir = crate::test_support::agent_free_dir_with_agent_stub("claude");
+            let path_dir = crate::test_support::agent_free_dir_with_agent_stub("codex");
             let output =
                 crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
@@ -17754,7 +17690,7 @@ mod tests {
         let mut child = ParkedHolder::spawn(
             NAME,
             root,
-            crate::test_support::agent_free_dir_with_agent_stub("claude"),
+            crate::test_support::agent_free_dir_with_agent_stub("codex"),
         );
         let pid = child.pid();
         let pending = workflow::load_state(root, phase)
@@ -17850,7 +17786,6 @@ mod tests {
                 false,
                 None,
                 false,
-                true,
                 FallbackSource::FlagOrConfig(None),
             )
             .expect_err("a stop at a safe point during the gate wait is an error")

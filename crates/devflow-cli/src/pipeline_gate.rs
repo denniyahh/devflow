@@ -3156,13 +3156,14 @@ mod tests {
         assert_eq!(after.stage, Stage::Validate, "the transition's own write");
     }
 
-    /// A PATH dir whose `claude` waits (bounded, about 60 s) for a file that never
+    /// A PATH dir whose `codex` waits (bounded, about 60 s) for a file that never
     /// appears, with `sleep` for that wait, so a stage launched onto it stays
     /// running and its supervisor writes no state while the test reads it.
-    fn waiting_claude_dir() -> tempfile::TempDir {
+    /// Codex is a capture-shape agent, so the launch spends no delivery canary.
+    fn waiting_codex_dir() -> tempfile::TempDir {
         use std::os::unix::fs::PermissionsExt;
-        let path_dir = agent_free_dir_with_agent_stub("claude");
-        let path = path_dir.path().join("claude");
+        let path_dir = agent_free_dir_with_agent_stub("codex");
+        let path = path_dir.path().join("codex");
         std::fs::write(
             &path,
             "#!/bin/sh\ncase \"$1\" in --version) exit 0 ;; esac\n\
@@ -3187,19 +3188,14 @@ mod tests {
     #[test]
     fn a_transition_clears_the_persisted_code_fix() {
         const NAME: &str = "pipeline_gate::tests::a_transition_clears_the_persisted_code_fix";
-        enter_path_isolated_child!(NAME, waiting_claude_dir());
+        enter_path_isolated_child!(NAME, waiting_codex_dir());
         let _guard = env_lock();
         let code_state = |root: &Path, phase: PhaseId| {
             init_repo(root);
-            let mut state = State::new(
-                phase,
-                AgentKind::Claude,
-                Mode::Supervise,
-                root.to_path_buf(),
-            );
+            let mut state =
+                State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
             state.stage = Stage::Code;
             state.code_fix = Some(FixType::GapsOnly);
-            state.legacy_claude_launch = true;
             state
         };
 

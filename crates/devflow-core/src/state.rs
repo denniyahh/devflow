@@ -384,28 +384,6 @@ pub struct State {
     /// in the run; it is not consumed by the first refusal.
     #[serde(default)]
     pub canary: Option<crate::canary::CanaryOutcome>,
-    /// D-11's opt-out: force the pre-31 single-document Claude launch
-    /// (positional prompt, `--output-format json`, the `sh` monitor) for this
-    /// run, off by default.
-    ///
-    /// `false` means EITHER "the operator did not ask for the legacy path" OR
-    /// "the state was written by a binary predating this field" — both cases
-    /// behave identically: the D-09/D-10 rollout decides the transport, which
-    /// is the pre-existing behaviour.
-    ///
-    /// Persisted rather than passed through the call stack for the reason
-    /// [`Self::yes_ship`] gives: each stage launch happens in a SEPARATE
-    /// `devflow` process (the detached monitor's own `advance` tail), so a
-    /// CLI-scoped value would be gone by the time the second stage launches
-    /// and the run would silently revert to the stream transport mid-flight.
-    ///
-    /// Only ever OR-ed, never cleared, once set — see
-    /// `pipeline_launch::apply_legacy_launch_opt_out`. Clearing it on a plain
-    /// `devflow resume` would be the same silent-drop class as `stop_until`'s
-    /// old unconditional clear (999.60). To turn it back off, edit
-    /// `.devflow/state-NN.json` or start a new run.
-    #[serde(default)]
-    pub legacy_claude_launch: bool,
     /// Provenance for the human-only checkpoint set DevFlow last checked at
     /// this phase's Code preflight (D-07, CHKPT-02 / 999.126).
     ///
@@ -736,7 +714,6 @@ impl State {
             yes_ship: false,
             base_branch: None,
             canary: None,
-            legacy_claude_launch: false,
             // Pending, not Unrecorded: this state was created by a binary
             // that knows how to record the set, so its Code evaluation is
             // allowed to. Only a state file from an older binary may read

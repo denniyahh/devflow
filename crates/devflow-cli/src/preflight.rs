@@ -1029,15 +1029,12 @@ fn unattended_config_condition(launch_root: &Path) -> ConditionState {
 /// Phase 42 has validated Antigravity with `DEVFLOW_ANTIGRAVITY_IDLE_TIMEOUT_SECS=300`.
 /// Antigravity joins Claude on the stream-json unattended launch path.
 fn unattended_launch_shape_condition(state: &State) -> ConditionState {
-    if stream_launch_enabled(state.agent, Stage::Code, state.legacy_claude_launch)
+    if stream_launch_enabled(state.agent, Stage::Code)
         && (state.agent == AgentKind::Claude || state.agent == AgentKind::Antigravity)
     {
         return ConditionState::Holds;
     }
     let mut causes = Vec::new();
-    if state.legacy_claude_launch {
-        causes.push("the legacy launch opt-out is active".to_string());
-    }
     if state.agent != AgentKind::Claude && state.agent != AgentKind::Antigravity {
         causes.push(format!(
             "the agent is `{}`, not claude or antigravity",
@@ -2282,7 +2279,7 @@ mod tests {
     fn run_preflight_advance_gate_launches_agent_exactly_once() {
         const NAME: &str =
             "preflight::tests::run_preflight_advance_gate_launches_agent_exactly_once";
-        enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("claude"));
+        enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("codex"));
         let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
@@ -2290,21 +2287,18 @@ mod tests {
         init_repo(root);
 
         let phase = PhaseId::new(63);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Auto, root.to_path_buf());
         // Plan is unaffected by the interactivity/gh-auth generic checks
         // (D-14) — only the injected adapter's `preflight` fails; the real
-        // Claude adapter's default (Ok) preflight passes every other check.
+        // Codex adapter's default (Ok) preflight passes every other check.
         state.stage = Stage::Plan;
-        // Premise moved off `STREAM_JSON_STAGES` membership deliberately
-        // (34-06); do not "simplify" this away. The subject is the launch
-        // COUNT through the Advance arm (CR-01's double-launch defect), not
-        // which launch path is taken. Stage::Plan was incidentally absent
-        // from the constant; 34-05's widening puts it on the stream path,
-        // where `canary_gate` invokes the real `ClaudeCanaryLauncher` and the
-        // launch fails on a delivery refusal unrelated to launch counting.
-        // The `launches == 1` and `supervisor.is_some()` assertions below
-        // are untouched, so a launch must still genuinely happen.
-        state.legacy_claude_launch = true;
+        // Codex, a capture-shape agent: the subject is the launch COUNT
+        // through the Advance arm (CR-01's double-launch defect), not which
+        // launch path is taken, and a Claude launch at Plan would take the
+        // stream path, where `canary_gate` invokes the real
+        // `ClaudeCanaryLauncher`. The `launches == 1` and
+        // `supervisor.is_some()` assertions below are untouched, so a launch
+        // must still genuinely happen.
         workflow::save_state(&state).unwrap();
 
         preanswer_gate(
@@ -2365,7 +2359,7 @@ mod tests {
     fn run_preflight_loopback_gate_launches_agent_exactly_once() {
         const NAME: &str =
             "preflight::tests::run_preflight_loopback_gate_launches_agent_exactly_once";
-        enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("claude"));
+        enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("codex"));
         let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
@@ -2373,14 +2367,12 @@ mod tests {
         init_repo(root);
 
         let phase = PhaseId::new(64);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Plan;
-        // Premise moved off `STREAM_JSON_STAGES` membership deliberately
-        // (34-06); do not "simplify" this away. Same reasoning as the Advance
-        // arm's sibling above: the subject is the launch COUNT through the
-        // LoopBack arm, not which launch path is taken, and the `launches == 1`
-        // and `supervisor.is_some()` assertions below are untouched.
-        state.legacy_claude_launch = true;
+        // Codex, for the Advance arm's sibling's reason: the subject is the
+        // launch COUNT through the LoopBack arm, not which launch path is
+        // taken, and the `launches == 1` and `supervisor.is_some()` assertions
+        // below are untouched.
         workflow::save_state(&state).unwrap();
 
         preanswer_gate(
@@ -2979,7 +2971,7 @@ mod tests {
     fn approving_a_non_code_preflight_refusal_records_nothing() {
         const NAME: &str =
             "preflight::tests::approving_a_non_code_preflight_refusal_records_nothing";
-        enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("claude"));
+        enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("codex"));
         let _guard = env_lock();
         assert_approving_a_refusal_never_widens_a_recorded_set(
             Stage::Validate,
@@ -2994,7 +2986,7 @@ mod tests {
     fn approving_a_supervise_code_preflight_refusal_records_nothing() {
         const NAME: &str =
             "preflight::tests::approving_a_supervise_code_preflight_refusal_records_nothing";
-        enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("claude"));
+        enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("codex"));
         let _guard = env_lock();
         assert_approving_a_refusal_never_widens_a_recorded_set(
             Stage::Code,
@@ -3010,7 +3002,7 @@ mod tests {
     fn approving_an_auto_code_preflight_refusal_never_widens_a_recorded_set() {
         const NAME: &str = "preflight::tests::\
                             approving_an_auto_code_preflight_refusal_never_widens_a_recorded_set";
-        enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("claude"));
+        enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("codex"));
         let _guard = env_lock();
         assert_approving_a_refusal_never_widens_a_recorded_set(
             Stage::Code,
@@ -3027,7 +3019,7 @@ mod tests {
     fn a_supervise_code_refusal_approval_records_the_pre_agent_set_once() {
         const NAME: &str =
             "preflight::tests::a_supervise_code_refusal_approval_records_the_pre_agent_set_once";
-        enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("claude"));
+        enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("codex"));
         let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
@@ -3039,15 +3031,9 @@ mod tests {
         // The planner's checkpoint, present before any Code agent runs.
         write_human_only_plan(&worktree, phase);
 
-        let mut state = State::new(
-            phase,
-            AgentKind::Claude,
-            Mode::Supervise,
-            root.to_path_buf(),
-        );
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
         state.stage = Stage::Code;
         state.worktree_path = Some(worktree.clone());
-        state.legacy_claude_launch = true;
         assert_eq!(state.checkpoint_approval, CheckpointApproval::Pending);
         workflow::save_state(&state).unwrap();
 
@@ -3133,13 +3119,10 @@ mod tests {
              would leave the set unchanged and nothing would be tested"
         );
 
-        let mut state = State::new(phase, AgentKind::Claude, mode, root.to_path_buf());
+        let mut state = State::new(phase, AgentKind::Codex, mode, root.to_path_buf());
         state.stage = stage;
         state.worktree_path = Some(worktree);
         state.checkpoint_approval = CheckpointApproval::Recorded(vec![]);
-        // Same launch path as `run_preflight_advance_gate_launches_agent_exactly_once`:
-        // the subject is what the Advance arm records, not the relaunch.
-        state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
 
         preanswer_gate(
@@ -4382,7 +4365,6 @@ mod tests {
             Mode::Auto,
             dir.path().to_path_buf(),
         );
-        state.legacy_claude_launch = true;
         for stage in [Stage::Plan, Stage::Validate, Stage::Ship] {
             state.stage = stage;
             assert!(
@@ -4404,7 +4386,7 @@ mod tests {
     #[test]
     fn unattended_check_reports_every_condition_in_both_modes() {
         let (dir, mut state) = viable_unattended_fixture(PhaseId::new(81));
-        state.legacy_claude_launch = true; // one condition failing, two holding
+        state.agent = AgentKind::Codex; // one condition failing, two holding
 
         let mut auto_report = Vec::new();
         let auto = unattended_launch_check_reporting_to(dir.path(), &state, &mut auto_report);
@@ -4502,18 +4484,9 @@ mod tests {
     /// accepted gap becoming a refusal. Every arm that cannot host the
     /// chain-flag guard is walked, then the viable arm is restored.
     #[test]
-    fn unattended_check_refuses_a_legacy_or_non_claude_launch_shape() {
+    fn unattended_check_refuses_a_non_stream_launch_shape() {
         let (dir, mut state) = viable_unattended_fixture(PhaseId::new(85));
 
-        state.legacy_claude_launch = true;
-        let err = preflight_unattended_launch_check(dir.path(), &state).unwrap_err();
-        assert!(err.contains("legacy launch opt-out"), "{err}");
-        assert!(
-            err.contains("Code would launch on the pipe-owning arm"),
-            "{err}"
-        );
-
-        state.legacy_claude_launch = false;
         for agent in [AgentKind::Codex, AgentKind::OpenCode] {
             state.agent = agent;
             let err = preflight_unattended_launch_check(dir.path(), &state).unwrap_err();
@@ -4521,12 +4494,16 @@ mod tests {
                 err.contains(&format!("the agent is `{agent}`")),
                 "agent {agent} must be named in its own refusal: {err}"
             );
+            assert!(
+                err.contains("Code would launch on the pipe-owning arm"),
+                "{err}"
+            );
         }
 
         state.agent = AgentKind::Claude;
         assert!(
             preflight_unattended_launch_check(dir.path(), &state).is_ok(),
-            "claude with the opt-out clear is the one viable shape and must pass"
+            "claude on the stream shape is a viable shape and must pass"
         );
     }
 
@@ -4596,7 +4573,7 @@ mod tests {
         let (dir, mut state) = viable_unattended_fixture(phase);
         std::fs::remove_file(dir.path().join(".planning/config.json")).unwrap();
         std::fs::remove_dir_all(dir.path().join(".planning/phases")).unwrap();
-        state.legacy_claude_launch = true;
+        state.agent = AgentKind::Codex;
 
         let err = preflight_unattended_launch_check(dir.path(), &state).unwrap_err();
         assert!(err.contains("GSD config can hold the chain flag"), "{err}");
@@ -4761,14 +4738,14 @@ mod tests {
                 AgentKind::Claude
             ),
             None,
-            "claude without the legacy opt-out holds the unattended launch shape"
+            "claude holds the unattended launch shape"
         );
     }
 
     #[test]
     fn unattended_launch_shape_condition_claude_unchanged() {
         let dir = tempfile::tempdir().unwrap();
-        let mut state = State::new(
+        let state = State::new(
             PhaseId::new(41),
             AgentKind::Claude,
             Mode::Auto,
@@ -4782,16 +4759,6 @@ mod tests {
                 ConditionState::Holds
             ),
             "claude must hold on the stream path"
-        );
-
-        // Claude under the legacy opt-out still refuses with the legacy cause.
-        state.legacy_claude_launch = true;
-        let ConditionState::DoesNotHold(reason) = unattended_launch_shape_condition(&state) else {
-            panic!("claude + legacy opt-out must refuse");
-        };
-        assert!(
-            reason.contains("legacy launch opt-out"),
-            "the legacy cause must survive: {reason}"
         );
     }
 
@@ -4826,20 +4793,19 @@ mod tests {
     #[test]
     fn unattended_launch_shape_refusal_names_the_capture_supervisor() {
         let dir = tempfile::tempdir().unwrap();
-        let mut legacy = State::new(
+        let pi = State::new(
             PhaseId::new(43),
-            AgentKind::Claude,
+            AgentKind::Pi,
             Mode::Auto,
             dir.path().to_path_buf(),
         );
-        legacy.legacy_claude_launch = true;
         let codex = State::new(
             PhaseId::new(44),
             AgentKind::Codex,
             Mode::Auto,
             dir.path().to_path_buf(),
         );
-        for state in [legacy, codex] {
+        for state in [pi, codex] {
             let ConditionState::DoesNotHold(reason) = unattended_launch_shape_condition(&state)
             else {
                 panic!("{} --mode auto must be refused", state.agent);

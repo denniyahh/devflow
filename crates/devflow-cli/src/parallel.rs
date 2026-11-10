@@ -136,12 +136,6 @@ pub(crate) fn parallel(
         // behavior — `false` here changes nothing about `parallel`'s
         // existing behavior.
         //
-        // The trailing `false` is D-11's legacy-launch opt-out, off for the
-        // same reason and one stronger: `parallel` is precisely the multi-run
-        // shape whose delegated work the legacy path orphans (999.64). An
-        // operator who genuinely wants it can still set
-        // `DEVFLOW_CLAUDE_LEGACY_LAUNCH`, which `start` reads per phase.
-        //
         // The trailing `NoFallback` is the fallback agent (51-04): `parallel` takes
         // no `--fallback-agent` and does not arm `devflow.toml`'s `fallback_agent`
         // key (it only checks and names it, above), so its runs carry none.
@@ -154,7 +148,6 @@ pub(crate) fn parallel(
             true,
             false,
             None,
-            false,
             false,
             FallbackSource::NoFallback,
         )?;

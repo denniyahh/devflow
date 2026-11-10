@@ -184,16 +184,7 @@ pub(crate) fn launch_stage_inner(
     // governs both the launch shape and the guard that protects it — the guard
     // must fire on exactly the launches whose premise it checks, and two
     // separate evaluations of "is this the stream path?" would be free to drift.
-    let stream_launch = stream_launch_enabled(state.agent, state.stage, state.legacy_claude_launch);
-
-    // D-11 (31-04): the opt-out is loud, on three channels. Fires only when the
-    // opt-out is what made the difference — forcing legacy on a stage the
-    // rollout has not reached changes nothing, and a notice there would imply
-    // it did. Placed ahead of the canary gate so the operator learns what the
-    // legacy path costs before anything else happens.
-    if !stream_launch && stream_launch_enabled(state.agent, state.stage, false) {
-        announce_forced_legacy_launch(state);
-    }
+    let stream_launch = stream_launch_enabled(state.agent, state.stage);
 
     // D-15: refuse before any launch work if the undocumented CLI behaviour
     // this transport depends on is not backed by observed behaviour. Placed
@@ -303,156 +294,6 @@ fn resume_launch_shape(phase: PhaseId, session_id: &str) -> (&'static str, Vec<S
     agents::ClaudeDriver::exec_resume_command(session_id, &instruction)
 }
 
-/// Where a forced legacy launch's authorization came from, for the provenance
-/// record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LegacyLaunchSource {
-    /// `DEVFLOW_CLAUDE_LEGACY_LAUNCH` is set in THIS process's environment.
-    Environment,
-    /// The persisted `state.legacy_claude_launch`, written at `start`/`resume`
-    /// time by the `--legacy-claude-launch` flag or by the environment variable
-    /// as it stood then.
-    PersistedState,
-}
-
-impl LegacyLaunchSource {
-    fn as_str(self) -> &'static str {
-        match self {
-            LegacyLaunchSource::Environment => "env:DEVFLOW_CLAUDE_LEGACY_LAUNCH",
-            LegacyLaunchSource::PersistedState => "state:legacy_claude_launch",
-        }
-    }
-}
-
-/// Which source is reporting the opt-out *in this process*.
-///
-/// Deliberately re-derived at launch time rather than persisted as a second
-/// field. The limit is worth stating: a stage launched from the DETACHED
-/// monitor's `advance` tail does not inherit the operator's shell environment,
-/// so it reports `PersistedState` even for a run originally authorized by the
-/// environment variable. That is accurate for the process doing the reporting —
-/// the persisted flag really is what it read — and the `start`-time notice
-/// already named the environment as the origin.
-fn legacy_launch_source() -> LegacyLaunchSource {
-    if devflow_core::config::claude_legacy_launch() {
-        LegacyLaunchSource::Environment
-    } else {
-        LegacyLaunchSource::PersistedState
-    }
-}
-
-/// The D-11 notice, as one string, so its required content is assertable
-/// without capturing stdout.
-///
-/// **The 999.64 sentence is required, not decorative (adversarial review B3).**
-/// The opt-out was questioned as a silent way to disable the D-15 delivery
-/// guard; it is not — `MonitorLaunch::Legacy` runs the child with stdin at
-/// `/dev/null`, so the task-notification mechanism the canary tests
-/// structurally does not exist there and running it would spend a real agent
-/// invocation answering a question the launch never asks. What the operator
-/// genuinely gives up is different and worse: the legacy path is *where a
-/// multi-plan wave orphans delegated work* — that is 999.64 itself. Taking the
-/// opt-out is an explicit acceptance of the limitation this phase exists to
-/// remove, and it has to say so in plain words.
-fn forced_legacy_launch_notice(stage: Stage, source: LegacyLaunchSource) -> String {
-    format!(
-        "legacy launch: DevFlow is forcing the pre-31 single-document Claude launch for \
-         stage {stage} (source: {}). This path cannot deliver background-task \
-         notifications, so a multi-plan wave may ORPHAN delegated work (999.64, unfixed \
-         on this path). The stream-json transport, the pipe-owning monitor, the idle \
-         timeout and the delivery canary are all inactive for this launch. Unset the \
-         opt-out to return to the Phase 31 transport.",
-        source.as_str()
-    )
-}
-
-/// Announce a forced legacy launch on all three channels.
-///
-/// **Three, not fewer.** D-11's "logged loudly" has to survive an unattended
-/// run where nobody is watching stdout: `println!` for an operator who is
-/// present, the monitor log because the detached monitor's own stdio is null,
-/// and `.devflow/events.jsonl` so the run's permanent record shows how often
-/// the escape hatch is actually reached. An escape hatch used routinely erodes
-/// what it protects, and only the ledger makes "routinely" visible.
-fn announce_forced_legacy_launch(state: &State) {
-    let source = legacy_launch_source();
-    let notice = forced_legacy_launch_notice(state.stage, source);
-
-    println!("warning: {notice}");
-    append_monitor_log(
-        &state.project_root,
-        state.phase,
-        &format!("[devflow] {notice}"),
-    );
-
-    events::emit(
-        &state.project_root,
-        state.phase,
-        "claude_legacy_launch_forced",
-        serde_json::json!({
-            "stage": state.stage.to_string(),
-            "source": source.as_str(),
-            "notice": truncate_reason(&notice),
-        }),
-    );
-}
-
-/// Append one line to the phase's monitor log, creating it if needed.
-///
-/// Best-effort: recording the notice must never abort the launch it describes.
-/// A local five-line helper rather than a widened `devflow-core` API — the core
-/// monitor has its own private equivalent for its own writes, and exporting it
-/// for one CLI caller would grow the crate's public surface for no other gain.
-fn append_monitor_log(project_root: &Path, phase: PhaseId, entry: &str) {
-    use std::io::Write;
-    let path = agent_result::monitor_log_path(project_root, phase);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        let _ = writeln!(file, "{entry}");
-    }
-}
-
-/// Combine D-11's two authorization sources into `state.legacy_claude_launch`.
-///
-/// **OR-only: this never clears a persisted opt-out (W5).** `devflow resume` is
-/// the recovery verb for a rate-limited or infra-paused phase, so an
-/// unconditional `state.legacy_claude_launch = flag || env` would silently flip
-/// a run that deliberately chose the legacy path back onto the stream transport
-/// mid-flight — the same silent-drop class as `stop_until`'s old unconditional
-/// clear (999.60), and invisible in exactly the same way. To turn the opt-out
-/// back off, edit `.devflow/state-NN.json` or start a new run.
-///
-/// Returns whether the environment ALONE supplied the authorization, so the
-/// caller can print the "a persisted default is never a silent one" notice —
-/// `--yes-ship`'s shape, for the same reason.
-pub(crate) fn apply_legacy_launch_opt_out(state: &mut State, flag: bool) -> bool {
-    combine_legacy_launch_opt_out(state, flag, devflow_core::config::claude_legacy_launch())
-}
-
-/// [`apply_legacy_launch_opt_out`] with the environment's value passed in.
-fn combine_legacy_launch_opt_out(state: &mut State, flag: bool, env: bool) -> bool {
-    state.legacy_claude_launch = state.legacy_claude_launch || flag || env;
-    env && !flag
-}
-
-/// [`recorded_canary_refusal`] for a `devflow resume` of `state` on its own agent: the
-/// state judged as `resume` would launch it, with the legacy opt-out combined from
-/// `flag` and `env` as [`apply_legacy_launch_opt_out`] does. `resume`'s refusal and
-/// `status`'s hint both judge through it, so they cannot disagree on the environment's
-/// opt-out.
-pub(crate) fn resume_canary_refusal(state: &State, flag: bool, env: bool) -> Option<String> {
-    let mut candidate = state.clone();
-    // Only the combined value is read here; the notice is `resume_loaded`'s to print.
-    let _env_alone = combine_legacy_launch_opt_out(&mut candidate, flag, env);
-    recorded_canary_refusal(&candidate)
-}
-
 /// Entry-point name recorded in the `auto_chain_flag_repaired` payload by
 /// [`commands::start`](crate::commands::start).
 pub(crate) const AUTO_CHAIN_REPAIR_FROM_START: &str = "start";
@@ -462,10 +303,9 @@ pub(crate) const AUTO_CHAIN_REPAIR_FROM_RESUME: &str = "resume";
 /// Repair a leaked `workflow._auto_chain_active` before this launch spawns
 /// anything, and say so on both channels when it found one (35.1 D-01/D-03).
 ///
-/// **One helper, two call sites**, for the reason
-/// [`apply_legacy_launch_opt_out`] gives about its own pair: `start` and
-/// `resume` must not be able to drift into repairing on different terms, and a
-/// second copy of the emit/print block is exactly how that drift happens.
+/// **One helper, two call sites**: `start` and `resume` must not be able to
+/// drift into repairing on different terms, and a second copy of the
+/// emit/print block is exactly how that drift happens.
 ///
 /// `35.1 D-01` — why the repair exists at all: the in-process `AutoChainGuard`
 /// covers a normal return, a `?` early-return and a panic-unwind, and
@@ -652,7 +492,7 @@ where
 /// mapping, so `recorded_canary_refusal_agrees_with_canary_gate_on_every_recorded_outcome`
 /// pins the two together: change one and that test fails until the other matches.
 pub(crate) fn recorded_canary_refusal(state: &State) -> Option<String> {
-    if !stream_launch_enabled(state.agent, state.stage, state.legacy_claude_launch) {
+    if !stream_launch_enabled(state.agent, state.stage) {
         return None;
     }
     match state.canary.as_ref()? {
@@ -856,13 +696,12 @@ const STREAM_JSON_STAGES: &[Stage] = &[
 /// Whether this launch should use the `stream-json` transport and the
 /// pipe-owning monitor.
 ///
-/// **Agent coverage (round-3 D-10):** Claude and Antigravity. The
-/// `legacy_opt_out` term applies ONLY to Claude — `DEVFLOW_CLAUDE_LEGACY_LAUNCH`
-/// is an escape hatch for Claude's pre-31 single-document launch, and
-/// Antigravity has no single-document format, so the variable must never route
-/// it to `MonitorLaunch::Legacy` (stdin would be `/dev/null` and the child
-/// would silently fail; antigravity reviewer notice (b)). Antigravity
-/// evaluates purely on `STREAM_JSON_STAGES` membership.
+/// **Agent coverage (round-3 D-10):** Claude and Antigravity, purely on
+/// `STREAM_JSON_STAGES` membership. Every other agent (codex, opencode, pi,
+/// hermes) takes the capture shape, `MonitorLaunch::Legacy`. There is no
+/// opt-out: Phase 52 removed Claude's pre-31 single-document launch and its
+/// flag and environment override, so one predicate governs the launch shape
+/// and the D-15 canary gate that protects it.
 ///
 /// **This is a SEQUENCING choice, not a behaviour prediction.** Constraint 1
 /// forbids deciding at launch time which stages will background work; it
@@ -879,22 +718,14 @@ const STREAM_JSON_STAGES: &[Stage] = &[
 /// Success" — the completion oracle already scored the orphaned Phase 29 stage
 /// as Success.
 ///
-/// **`legacy_opt_out` is D-11's escape hatch (31-04)**, and it is folded in
-/// HERE rather than checked separately at each use so that ONE predicate still
-/// governs the launch shape, the D-15 canary gate that protects it, and the
-/// loud notice. Two separate notions of "is this the stream path?" would be
-/// free to drift, and the drift would show up as a guard firing on a launch it
-/// does not protect — or, worse, not firing on one it does.
-///
-/// Note what the opt-out does NOT reach: `relaunch_checkpoint_session`
+/// Note what this predicate does NOT reach: `relaunch_checkpoint_session`
 /// hardcodes `MonitorLaunch::Legacy` and calls `spawn_agent_and_record`
 /// directly, so it never consults this predicate at all. That is a
-/// pre-existing, deliberate legacy route (see `MonitorLaunch::Legacy`'s own
+/// pre-existing, deliberate capture route (see `MonitorLaunch::Legacy`'s own
 /// doc), recorded rather than silently covered.
-pub(crate) fn stream_launch_enabled(agent: AgentKind, stage: Stage, legacy_opt_out: bool) -> bool {
+pub(crate) fn stream_launch_enabled(agent: AgentKind, stage: Stage) -> bool {
     matches!(agent, AgentKind::Claude | AgentKind::Antigravity)
         && STREAM_JSON_STAGES.contains(&stage)
-        && !(agent == AgentKind::Claude && legacy_opt_out)
 }
 
 /// The stages whose launch may set GSD's `workflow._auto_chain_active` flag
@@ -958,8 +789,8 @@ fn auto_chain_flag_eligible(stage: Stage, mode: Mode) -> bool {
 /// ineligible path is a genuine no-op on an already-`false` file and does not
 /// dirty a tracked file on every stage launch.
 ///
-/// **Diverges from `LegacyEnvOverride` deliberately.** That guard restores a
-/// caller-supplied PRIOR value, because the env var it owns may have had a
+/// **Does not restore a prior value, deliberately.** A guard over an env var
+/// restores the caller's PRIOR value, because the variable may have had a
 /// meaningful pre-existing state. This one does not restore anything: `false`
 /// is always the correct value on exit (D-06). A run that ends with the flag
 /// still set is the failure mode this type exists to prevent, and "put back
@@ -3336,9 +3167,8 @@ pub(crate) fn resume(
     project_root: &Path,
     phase: PhaseId,
     agent: Option<AgentKind>,
-    legacy_claude_launch: bool,
 ) -> Result<(), CliError> {
-    resume_with_fallback(project_root, phase, agent, legacy_claude_launch, None)
+    resume_with_fallback(project_root, phase, agent, None)
 }
 
 /// Resume a rate-limited or infra-paused phase from its saved stage (review
@@ -3366,11 +3196,6 @@ pub(crate) fn resume(
 /// "the cap is still pending" (leave it alone, or the run silently sails
 /// past a boundary the operator named). The save/relaunch ordering is
 /// unchanged either way.
-/// D-11 (31-04): `--legacy-claude-launch` is accepted here too, so an operator
-/// can force the pre-31 path onto a run already in flight without restarting
-/// it. The combination is OR-only — see [`apply_legacy_launch_opt_out`] for why
-/// a plain `devflow resume` must not clear an opt-out the operator already
-/// chose.
 ///
 /// The reservation at the top (D-01, D-08) refuses to resume while the phase's
 /// supervisor or agent remains live, and writes the pending record in one step with
@@ -3385,7 +3210,6 @@ pub(crate) fn resume_with_fallback(
     project_root: &Path,
     phase: PhaseId,
     agent: Option<AgentKind>,
-    legacy_claude_launch: bool,
     fallback_agent: Option<AgentKind>,
 ) -> Result<(), CliError> {
     let _phase_holder = crate::commands::claim_foreground_holder(project_root, phase)?;
@@ -3399,14 +3223,7 @@ pub(crate) fn resume_with_fallback(
     hold_reservation(reserved.reservation);
     #[cfg(test)]
     launch_test_hold("holder_claimed");
-    let result = resume_loaded(
-        project_root,
-        phase,
-        reserved.state,
-        agent,
-        legacy_claude_launch,
-        fallback_agent,
-    );
+    let result = resume_loaded(project_root, phase, reserved.state, agent, fallback_agent);
     abandon_reservation(project_root, phase, reserved.created);
     result
 }
@@ -3574,14 +3391,13 @@ fn resume_loaded(
     phase: PhaseId,
     mut state: State,
     agent: Option<AgentKind>,
-    legacy_claude_launch: bool,
     fallback_agent: Option<AgentKind>,
 ) -> Result<(), CliError> {
     crate::commands::refuse_unprepared_run(&state)?;
     // D-01, D-02, D-03: every fallback check runs here, BEFORE `commit_notify_env`
     // below, so a refused resume commits nothing at all (review B-3).
-    refuse_fallback_for_resume(&state, agent, legacy_claude_launch, fallback_agent)?;
-    refuse_recorded_canary_for_resume(&state, agent, legacy_claude_launch)?;
+    refuse_fallback_for_resume(&state, agent, fallback_agent)?;
+    refuse_recorded_canary_for_resume(&state, agent)?;
     // CR-03 (49-REVIEW.md): an exported (or emptied) notify command reaches
     // the chain this resume launches through the state file.
     commit_notify_env(&mut state)?;
@@ -3610,14 +3426,6 @@ fn resume_loaded(
             }
         }
     }
-    // Combined BEFORE the commit below, so the persisted value exists before the
-    // detached monitor this relaunch spawns ever consults it.
-    if apply_legacy_launch_opt_out(&mut state, legacy_claude_launch) {
-        println!(
-            "note: legacy Claude launch forced by DEVFLOW_CLAUDE_LEGACY_LAUNCH \
-             (D-11, 31-CONTEXT.md) — a persisted default is never a silent one"
-        );
-    }
     // 35.1 D-01, `resume`'s half: this is the entry point that catches a leak a
     // SIGKILLed run left behind in its own worktree — the case the in-process
     // guard structurally cannot cover, because `Drop` never runs on a kill.
@@ -3640,7 +3448,6 @@ fn resume_loaded(
     // The stopped test reads the file as it is now: the operator's `resume` is the
     // later word on a stop that landed after this copy loaded, and a run launched
     // while still marked stopped could never advance.
-    let legacy_claude_launch = state.legacy_claude_launch;
     // D-06: the rerun asks again, so the gate this run abandons is closed before the
     // relaunch and its unused answer set aside. After every refusal above, so a refused
     // resume leaves the gate as it found it.
@@ -3654,7 +3461,6 @@ fn resume_loaded(
             s.stop_until = None;
         }
         s.gate_pending = false;
-        s.legacy_claude_launch = legacy_claude_launch;
         // D-01's re-arm, in the commit every resume makes, so it applies to a stopped
         // run and a cron-paused one alike. A plain resume leaves a spent fallback
         // spent (D-05).
@@ -3695,9 +3501,8 @@ fn resume_loaded(
 /// Refuse a `resume` the run's recorded delivery canary would refuse, before it writes
 /// anything.
 ///
-/// The run is judged as it would launch: its legacy opt-out after
-/// `--legacy-claude-launch` and the environment. A `--agent` naming another agent hands
-/// the run off, and the handoff clears the recorded canary, so it is never refused here.
+/// A `--agent` naming another agent hands the run off, and the handoff clears the
+/// recorded canary, so it is never refused here.
 /// Otherwise a recorded refusal ([`recorded_canary_refusal`]) refuses every launch under
 /// the run's agent. Letting the resume go on would clear `stopped` and `stop_reason`,
 /// fail at [`canary_gate`], and re-mark the run stopped with a reason that no longer names
@@ -3707,16 +3512,11 @@ fn resume_loaded(
 fn refuse_recorded_canary_for_resume(
     state: &State,
     agent: Option<AgentKind>,
-    legacy_claude_launch: bool,
 ) -> Result<(), CliError> {
     if agent.is_some_and(|requested| requested != state.agent) {
         return Ok(());
     }
-    match resume_canary_refusal(
-        state,
-        legacy_claude_launch,
-        devflow_core::config::claude_legacy_launch(),
-    ) {
+    match recorded_canary_refusal(state) {
         None => Ok(()),
         Some(refusal) => Err(CliError::Message(format!(
             "resume refused: the delivery canary recorded for this run refuses {agent} at \
@@ -3732,8 +3532,7 @@ fn refuse_recorded_canary_for_resume(
 
 /// The fallback checks `resume` makes before it writes anything (D-01, D-02, D-03).
 ///
-/// The run is judged as it would launch: its agent after `--agent`, and its legacy
-/// opt-out after `--legacy-claude-launch` and the environment. Then:
+/// The run is judged as it would launch: its agent after `--agent`. Then:
 /// - a `--fallback-agent` is held to [`validate_fallback_agent`], as on `start`;
 /// - with none, a saved fallback that is still unused and equals that agent is refused
 ///   (D-02): `--agent` onto the run's own fallback would leave the two coinciding.
@@ -3742,13 +3541,10 @@ fn refuse_recorded_canary_for_resume(
 fn refuse_fallback_for_resume(
     state: &State,
     agent: Option<AgentKind>,
-    legacy_claude_launch: bool,
     fallback_agent: Option<AgentKind>,
 ) -> Result<(), CliError> {
     let mut candidate = state.clone();
     candidate.agent = agent.unwrap_or(state.agent);
-    // Only the combined value is read here; the notice is `resume_loaded`'s to print.
-    let _env_alone = apply_legacy_launch_opt_out(&mut candidate, legacy_claude_launch);
     match fallback_agent {
         Some(fallback) => validate_fallback_agent(&candidate, fallback),
         None => match state.fallback_agent {
@@ -4439,22 +4235,16 @@ mod tests {
     /// saves state BEFORE calling `launch_stage`, so the record must be saved
     /// again inside `launch_stage` or it is lost.
     ///
-    /// **Premise moved off `STREAM_JSON_STAGES` membership deliberately
-    /// (34-06); do not "simplify" the opt-out away.** This test's subject is
-    /// record persistence, not which launch path runs, so it previously relied on
-    /// its stage being ABSENT from `STREAM_JSON_STAGES` — an incidental
-    /// premise that 34-05's widening destroys, at which point `canary_gate`
-    /// invokes the real `ClaudeCanaryLauncher` and the launch fails on a
-    /// delivery refusal that has nothing to do with record persistence. Pinning
-    /// the legacy path via the opt-out makes the premise explicit and stable
-    /// under any contents of the constant, exactly as
-    /// `canary_gate_only_applies_to_the_stream_launch_path` does.
+    /// The run's agent is Codex, a capture-shape agent: this test's subject is
+    /// record persistence, not which launch path runs, and a capture launch spends
+    /// no delivery canary. Phase 52 removed the Claude legacy opt-out that pinned
+    /// this premise before.
     #[test]
     fn launch_stage_persists_the_supervisor_record_for_reload() {
         const NAME: &str =
             "pipeline_launch::tests::launch_stage_persists_the_supervisor_record_for_reload";
         if !devflow_core::test_support::in_child_test(NAME) {
-            let path_dir = agent_free_dir_with_agent_stub("claude");
+            let path_dir = agent_free_dir_with_agent_stub("codex");
             let output =
                 crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
@@ -4467,23 +4257,12 @@ mod tests {
         init_repo(root);
 
         let phase = PhaseId::new(65);
-        // `Mode::Supervise`, and the mode is now load-bearing (35.1-03): the
-        // legacy opt-out set below makes this a launch shape whose Code stage
-        // cannot bound the chain flag's lifetime, and
-        // `preflight_unattended_launch_check` refuses exactly that combination
-        // in `Mode::Auto`. This test's subject — record persistence — is
-        // mode-independent, so supervise keeps the premise the 34-06 note
-        // below establishes without asking the preflight to permit a launch
-        // D-07 exists to refuse.
-        let mut state = State::new(
-            phase,
-            AgentKind::Claude,
-            Mode::Supervise,
-            root.to_path_buf(),
-        );
-        // Not because this test wants legacy behaviour, but because its
-        // subject is orthogonal to the launch path (34-06).
-        state.legacy_claude_launch = true;
+        // `Mode::Supervise`, and the mode is load-bearing (35.1-03): a Codex
+        // run is a launch shape whose Code stage cannot bound the chain flag's
+        // lifetime, and `preflight_unattended_launch_check` refuses exactly that
+        // combination in `Mode::Auto`. This test's subject — record
+        // persistence — is mode-independent.
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
         workflow::save_state(&state).unwrap();
 
         let result = launch_stage(&mut state, None, None);
@@ -4551,7 +4330,7 @@ mod tests {
         if !devflow_core::test_support::in_child_test(NAME) {
             let mut recorded = Vec::new();
             for full in [true, false] {
-                let path_dir = go_waiting_claude_dir();
+                let path_dir = crate::test_support::go_waiting_agent_dir("codex");
                 let cache = crate::test_support::hermetic_cache_dir();
                 let out = path_dir.path().join("v07-socket-path");
                 let mut env: Vec<(&str, &std::ffi::OsStr)> = vec![
@@ -4597,15 +4376,7 @@ mod tests {
         let root = dir.path();
         init_repo(root);
         let phase = PhaseId::new(1107);
-        let mut state = State::new(
-            phase,
-            AgentKind::Claude,
-            Mode::Supervise,
-            root.to_path_buf(),
-        );
-        // The capture shape, for the same reason as
-        // `launch_stage_persists_the_supervisor_record_for_reload`: no delivery canary.
-        state.legacy_claude_launch = true;
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
         workflow::save_state(&state).unwrap();
 
         let result = launch_stage(&mut state, None, None);
@@ -5023,18 +4794,15 @@ mod tests {
     /// resume. Asserts on the persisted state (not just `resume`'s exit
     /// code), since `transition()` saves state before `launch_stage` runs.
     ///
-    /// **Premise moved off `STREAM_JSON_STAGES` membership deliberately
-    /// (34-06); do not "simplify" the opt-out away.** The subject is resume's
-    /// stop-marker semantics, not which launch path the relaunch takes. The
-    /// opt-out is persisted here rather than set on a local binding because
-    /// `resume()` loads its own `State` from disk; `apply_legacy_launch_opt_out`
-    /// ORs the persisted value, so it survives the reload.
+    /// The run's agent is Codex, a capture-shape agent, persisted because
+    /// `resume()` loads its own `State` from disk: the subject is resume's
+    /// stop-marker semantics, not which launch path the relaunch takes.
     #[test]
     fn resume_clears_stop_marker_and_advances_past_stop_point() {
         const NAME: &str =
             "pipeline_launch::tests::resume_clears_stop_marker_and_advances_past_stop_point";
         if !devflow_core::test_support::in_child_test(NAME) {
-            let path_dir = agent_free_dir_with_agent_stub("claude");
+            let path_dir = agent_free_dir_with_agent_stub("codex");
             let output =
                 crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
@@ -5047,17 +4815,14 @@ mod tests {
         init_repo(root);
 
         let phase = PhaseId::new(66);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Plan;
         state.stop_until = Some(Stage::Plan);
         state.stopped = true;
         state.stop_reason = Some("stopped after plan completed (--until plan)".to_string());
-        // Not because this test wants legacy behaviour, but because its
-        // subject is orthogonal to the launch path (34-06).
-        state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
 
-        let result = resume(root, phase, None, false);
+        let result = resume(root, phase, None);
 
         // `resume()` loads its own `State` from the state file and never writes the
         // spawned pid back into this test's local `state`, so binding the guard from
@@ -5108,12 +4873,11 @@ mod tests {
         mode: Mode,
         response: &devflow_core::gates::GateResponse,
     ) -> (devflow_core::gates::GateId, Vec<u8>) {
-        let mut state = State::new(phase, AgentKind::Claude, mode, root.to_path_buf());
+        let mut state = State::new(phase, AgentKind::Codex, mode, root.to_path_buf());
         state.stage = stage;
         state.gate_pending = true;
         state.stopped = true;
         state.stop_reason = Some("stage failed; gate open".to_string());
-        state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
 
         let opened = Gates::open_gate(
@@ -5187,7 +4951,7 @@ mod tests {
     #[test]
     fn a_resume_that_opens_no_gate_sets_the_pending_answer_aside_and_relaunches() {
         const NAME: &str = "pipeline_launch::tests::a_resume_that_opens_no_gate_sets_the_pending_answer_aside_and_relaunches";
-        enter_agent_free_child!(NAME, "claude");
+        enter_agent_free_child!(NAME, "codex");
         let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
@@ -5197,7 +4961,7 @@ mod tests {
         let (gate, answer_before) =
             seed_code_gate_with_pending_answer(root, phase, Mode::Supervise);
 
-        let result = resume(root, phase, None, false);
+        let result = resume(root, phase, None);
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -5257,7 +5021,7 @@ mod tests {
     fn resume_reports_the_answers_it_set_aside_for_the_closed_gate() {
         const NAME: &str =
             "pipeline_launch::tests::resume_reports_the_answers_it_set_aside_for_the_closed_gate";
-        enter_agent_free_child!(NAME, "claude");
+        enter_agent_free_child!(NAME, "codex");
         let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
@@ -5266,7 +5030,7 @@ mod tests {
         let phase = PhaseId::new(93);
         let (gate, answer) = seed_code_gate_with_pending_answer(root, phase, Mode::Supervise);
 
-        let result = resume(root, phase, None, false);
+        let result = resume(root, phase, None);
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -5379,7 +5143,7 @@ mod tests {
     fn resume_names_only_the_actions_left_for_a_ship_answer_it_set_aside() {
         const NAME: &str = "pipeline_launch::tests::resume_names_only_the_actions_left_for_a_ship_answer_it_set_aside";
         if !devflow_core::test_support::in_child_test(NAME) {
-            let path_dir = agent_free_dir_with_agent_stub("claude");
+            let path_dir = agent_free_dir_with_agent_stub("codex");
             let output = crate::test_support::run_hermetic_test_in_child(
                 NAME,
                 path_dir.path(),
@@ -5402,7 +5166,7 @@ mod tests {
             &gate_response(true, None),
         );
 
-        let result = resume(root, phase, None, false);
+        let result = resume(root, phase, None);
         {
             let reloaded = workflow::load_state(root, phase).ok();
             let _reap_guard = reloaded.as_ref().map(ReapMonitorOnDrop::after_launch);
@@ -5449,7 +5213,7 @@ mod tests {
     fn resume_says_nothing_of_a_claimed_pair_at_another_stage() {
         const NAME: &str =
             "pipeline_launch::tests::resume_says_nothing_of_a_claimed_pair_at_another_stage";
-        enter_agent_free_child!(NAME, "claude");
+        enter_agent_free_child!(NAME, "codex");
         let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
@@ -5459,7 +5223,7 @@ mod tests {
         seed_code_gate_with_pending_answer(root, phase, Mode::Supervise);
         let left_behind = plant_claimed_answer(root, phase, Stage::Plan);
 
-        let result = resume(root, phase, None, false);
+        let result = resume(root, phase, None);
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -5483,27 +5247,21 @@ mod tests {
     fn resume_reports_a_claimed_pair_whose_gate_file_is_gone() {
         const NAME: &str =
             "pipeline_launch::tests::resume_reports_a_claimed_pair_whose_gate_file_is_gone";
-        enter_agent_free_child!(NAME, "claude");
+        enter_agent_free_child!(NAME, "codex");
         let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
         let phase = PhaseId::new(96);
-        let mut state = State::new(
-            phase,
-            AgentKind::Claude,
-            Mode::Supervise,
-            root.to_path_buf(),
-        );
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
         state.stage = Stage::Code;
         state.stopped = true;
-        state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
         let gate = plant_claimed_answer(root, phase, Stage::Code);
         std::fs::remove_file(Gates::gate_path(root, phase, Stage::Code)).unwrap();
 
-        let result = resume(root, phase, None, false);
+        let result = resume(root, phase, None);
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -5528,7 +5286,7 @@ mod tests {
     fn resume_quarantines_an_unused_gate_answer_and_opens_a_new_gate_id() {
         const NAME: &str = "pipeline_launch::tests::resume_quarantines_an_unused_gate_answer_and_opens_a_new_gate_id";
         if !devflow_core::test_support::in_child_test(NAME) {
-            let path_dir = agent_free_dir_with_agent_stub("claude");
+            let path_dir = agent_free_dir_with_agent_stub("codex");
             let output = crate::test_support::run_hermetic_test_in_child(
                 NAME,
                 path_dir.path(),
@@ -5545,7 +5303,7 @@ mod tests {
         let phase = PhaseId::new(92);
         let (old_gate, old_answer) = seed_code_gate_with_pending_answer(root, phase, Mode::Auto);
 
-        let result = resume(root, phase, None, false);
+        let result = resume(root, phase, None);
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -5607,16 +5365,14 @@ mod tests {
     /// `transition()`'s `stop_until == Some(from)` interception only sees
     /// what was actually written to disk.
     ///
-    /// **Premise moved off `STREAM_JSON_STAGES` membership deliberately
-    /// (34-06); do not "simplify" the opt-out away.** The subject is the
-    /// unfired `--until` cap's survival, not which launch path the relaunch
-    /// takes. Persisted rather than set locally, for the same reason as the
-    /// sibling test above: `resume()` reloads its own `State`.
+    /// The run's agent is Codex, a capture-shape agent, persisted because
+    /// `resume()` reloads its own `State`: the subject is not which launch path
+    /// the relaunch takes.
     #[test]
     fn resume_preserves_unfired_until_cap() {
         const NAME: &str = "pipeline_launch::tests::resume_preserves_unfired_until_cap";
         if !devflow_core::test_support::in_child_test(NAME) {
-            let path_dir = agent_free_dir_with_agent_stub("claude");
+            let path_dir = agent_free_dir_with_agent_stub("codex");
             let output =
                 crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
@@ -5634,12 +5390,7 @@ mod tests {
         // opt-out set below is refused in `Mode::Auto` by
         // `preflight_unattended_launch_check`, and this test's subject — the
         // unfired `stop_until` cap surviving a resume — is mode-independent.
-        let mut state = State::new(
-            phase,
-            AgentKind::Claude,
-            Mode::Supervise,
-            root.to_path_buf(),
-        );
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
         // Current stage is earlier than the cap (Define < Plan), and the
         // phase was NOT stopped by the cap — this is the rate-limit/infra
         // recovery shape, not the "cap already fired" shape.
@@ -5647,12 +5398,9 @@ mod tests {
         state.verification_baseline_captured = true;
         state.stopped = false;
         state.stop_reason = None;
-        // Not because this test wants legacy behaviour, but because its
-        // subject is orthogonal to the launch path (34-06).
-        state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
 
-        let result = resume(root, phase, None, false);
+        let result = resume(root, phase, None);
 
         // Same reap-before-unwrap ordering as the sibling test above: read
         // the pid back from disk, since `resume()` loads its own `State`
@@ -5687,15 +5435,14 @@ mod tests {
     /// gating the clear on `state.stopped` — nothing to preserve, nothing to
     /// clear, and the relaunch must still happen.
     ///
-    /// **Premise moved off `STREAM_JSON_STAGES` membership deliberately
-    /// (34-06); do not "simplify" the opt-out away.** The subject is that the
-    /// no-cap resume path is undisturbed, not which launch path the relaunch
-    /// takes. Persisted rather than set locally, as in the two siblings above.
+    /// The run's agent is Codex, a capture-shape agent, persisted because
+    /// `resume()` reloads its own `State`: the subject is not which launch path
+    /// the relaunch takes.
     #[test]
     fn resume_without_a_cap_is_unchanged() {
         const NAME: &str = "pipeline_launch::tests::resume_without_a_cap_is_unchanged";
         if !devflow_core::test_support::in_child_test(NAME) {
-            let path_dir = agent_free_dir_with_agent_stub("claude");
+            let path_dir = agent_free_dir_with_agent_stub("codex");
             let output =
                 crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
@@ -5711,22 +5458,14 @@ mod tests {
         // `Mode::Supervise` for the same 35.1-03 reason as the two tests
         // above — the legacy opt-out below is refused in `Mode::Auto`, and the
         // absence of a `stop_until` cap is mode-independent.
-        let mut state = State::new(
-            phase,
-            AgentKind::Claude,
-            Mode::Supervise,
-            root.to_path_buf(),
-        );
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
         state.stop_until = None;
         state.verification_baseline_captured = true;
         state.stopped = false;
         state.stop_reason = None;
-        // Not because this test wants legacy behaviour, but because its
-        // subject is orthogonal to the launch path (34-06).
-        state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
 
-        let result = resume(root, phase, None, false);
+        let result = resume(root, phase, None);
 
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
@@ -5778,7 +5517,7 @@ mod tests {
         );
         devflow_core::ship::write_cron_instructions(root, &record).unwrap();
 
-        let result = resume(root, phase, Some(AgentKind::Codex), false);
+        let result = resume(root, phase, Some(AgentKind::Codex));
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -5806,7 +5545,7 @@ mod tests {
         const NAME: &str =
             "pipeline_launch::tests::resume_without_agent_leaves_the_saved_agent_untouched";
         if !devflow_core::test_support::in_child_test(NAME) {
-            let path_dir = agent_free_dir_with_agent_stub("claude");
+            let path_dir = agent_free_dir_with_agent_stub("codex");
             let output =
                 crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
@@ -5817,16 +5556,10 @@ mod tests {
         let root = dir.path();
         init_repo(root);
         let phase = PhaseId::new(75);
-        let mut state = State::new(
-            phase,
-            AgentKind::Claude,
-            Mode::Supervise,
-            root.to_path_buf(),
-        );
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
         state.stage = Stage::Code;
-        state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
-        let result = resume(root, phase, None, false);
+        let result = resume(root, phase, None);
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -5834,7 +5567,7 @@ mod tests {
         result.unwrap();
         assert_eq!(
             workflow::load_state(root, phase).unwrap().agent,
-            AgentKind::Claude
+            AgentKind::Codex
         );
     }
 
@@ -5854,7 +5587,7 @@ mod tests {
         let state_path = workflow::state_path(root, phase);
         let before = std::fs::read(&state_path).unwrap();
 
-        let err = resume(root, phase, Some(AgentKind::Codex), false).unwrap_err();
+        let err = resume(root, phase, Some(AgentKind::Codex)).unwrap_err();
 
         assert!(err.to_string().contains("refused"));
         assert_eq!(std::fs::read(&state_path).unwrap(), before);
@@ -5892,7 +5625,7 @@ mod tests {
         let state_path = workflow::state_path(root, phase);
         let before = std::fs::read(&state_path).unwrap();
 
-        let err = resume(root, phase, Some(AgentKind::Codex), false).unwrap_err();
+        let err = resume(root, phase, Some(AgentKind::Codex)).unwrap_err();
 
         assert!(err.to_string().contains("refused"), "{err}");
         assert!(err.to_string().contains("codex"), "{err}");
@@ -5912,7 +5645,7 @@ mod tests {
         const NAME: &str =
             "pipeline_launch::tests::resume_with_same_agent_is_an_ordinary_idempotent_resume";
         if !devflow_core::test_support::in_child_test(NAME) {
-            let path_dir = agent_free_dir_with_agent_stub("claude");
+            let path_dir = agent_free_dir_with_agent_stub("codex");
             let output =
                 crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
@@ -5923,16 +5656,10 @@ mod tests {
         let root = dir.path();
         init_repo(root);
         let phase = PhaseId::new(77);
-        let mut state = State::new(
-            phase,
-            AgentKind::Claude,
-            Mode::Supervise,
-            root.to_path_buf(),
-        );
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
         state.stage = Stage::Code;
-        state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
-        let result = resume(root, phase, Some(AgentKind::Claude), false);
+        let result = resume(root, phase, Some(AgentKind::Codex));
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -5967,7 +5694,7 @@ mod tests {
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Plan;
         workflow::save_state(&state).unwrap();
-        let result = resume(root, phase, Some(AgentKind::Codex), false);
+        let result = resume(root, phase, Some(AgentKind::Codex));
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -6007,7 +5734,7 @@ mod tests {
         state.infra_failures = 2;
         workflow::save_state(&state).unwrap();
         let mut before = serde_json::to_value(&state).unwrap();
-        let result = resume(root, phase, Some(AgentKind::Codex), false);
+        let result = resume(root, phase, Some(AgentKind::Codex));
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -6100,7 +5827,7 @@ mod tests {
             "2026-06-18T15:45:30Z",
         );
         devflow_core::ship::write_cron_instructions(root, &record).unwrap();
-        let result = resume(root, phase, Some(AgentKind::Codex), false);
+        let result = resume(root, phase, Some(AgentKind::Codex));
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -6131,8 +5858,10 @@ mod tests {
         true
     }
 
-    /// A stopped Code-stage run of `phase` under Claude on the capture shape, in a fresh
-    /// repo at `root`, with `fallback` saved as its fallback and `consumed` as its spent mark.
+    /// A stopped Code-stage run of `phase` under Claude, in a fresh repo at `root`, with
+    /// `fallback` saved as its fallback and `consumed` as its spent mark. Its delivery
+    /// canary is recorded `Confirmed`, so a stub `claude` relaunches on the stream shape
+    /// without running one.
     fn save_stopped_code_run(
         root: &Path,
         phase: PhaseId,
@@ -6151,8 +5880,9 @@ mod tests {
         state.stop_reason = Some("rate limited".to_string());
         state.fallback_agent = fallback;
         state.fallback_consumed = consumed;
-        // The capture shape: a stub `claude` cannot answer the stream launch's canary.
-        state.legacy_claude_launch = true;
+        // A stub `claude` cannot answer the stream launch's canary; a recorded outcome
+        // is reused, never re-run.
+        state.canary = Some(canary::CanaryOutcome::Confirmed);
         workflow::save_state(&state).unwrap();
         state
     }
@@ -6172,7 +5902,7 @@ mod tests {
         let phase = PhaseId::new(5144);
         save_stopped_code_run(root, phase, Some(AgentKind::Codex), true);
 
-        let result = resume_with_fallback(root, phase, None, false, Some(AgentKind::Codex));
+        let result = resume_with_fallback(root, phase, None, Some(AgentKind::Codex));
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -6209,8 +5939,9 @@ mod tests {
         state.stage = Stage::Code;
         state.fallback_agent = Some(AgentKind::Codex);
         state.fallback_consumed = true;
-        // The capture shape: a stub `claude` cannot answer the stream launch's canary.
-        state.legacy_claude_launch = true;
+        // A stub `claude` cannot answer the stream launch's canary; a recorded outcome
+        // is reused, never re-run.
+        state.canary = Some(canary::CanaryOutcome::Confirmed);
         // The record of the supervisor that exited on the rate limit: the cron arm
         // leaves it behind, and its socket is gone.
         const EXITED_LAUNCH: &str = "exited-launch";
@@ -6246,7 +5977,7 @@ mod tests {
             "the exited supervisor's record is left behind"
         );
 
-        let result = resume_with_fallback(root, phase, None, false, Some(AgentKind::Codex));
+        let result = resume_with_fallback(root, phase, None, Some(AgentKind::Codex));
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -6280,7 +6011,7 @@ mod tests {
         let phase = PhaseId::new(5145);
         save_stopped_code_run(root, phase, Some(AgentKind::Codex), true);
 
-        let result = resume(root, phase, None, false);
+        let result = resume(root, phase, None);
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -6321,7 +6052,7 @@ mod tests {
         state.gate_notify_cmd = Some(SAVED_NOTIFY.to_string());
         workflow::save_state(&state).unwrap();
 
-        let result = resume_with_fallback(root, phase, Some(AgentKind::Codex), false, None);
+        let result = resume_with_fallback(root, phase, Some(AgentKind::Codex), None);
         let reloaded = workflow::load_state(root, phase).unwrap();
         let _reap_guard = ReapMonitorOnDrop::after_launch(&reloaded);
         let err = result
@@ -6372,7 +6103,7 @@ mod tests {
         state.gate_notify_cmd = Some(SAVED_NOTIFY.to_string());
         workflow::save_state(&state).unwrap();
 
-        let result = resume_with_fallback(root, phase, None, false, Some(AgentKind::Claude));
+        let result = resume_with_fallback(root, phase, None, Some(AgentKind::Claude));
         let reloaded = workflow::load_state(root, phase).unwrap();
         let _reap_guard = ReapMonitorOnDrop::after_launch(&reloaded);
         let err = result
@@ -6425,7 +6156,7 @@ mod tests {
             // is resolvable anywhere on it and `ensure_agent_binary` inside
             // `launch_stage` fails deterministically regardless of what is
             // installed on the host running this test.
-            let err = resume(&root, phase, None, false).unwrap_err();
+            let err = resume(&root, phase, None).unwrap_err();
             assert!(err.to_string().contains("not found"), "{err}");
             let reloaded = workflow::load_state(&root, phase).unwrap();
             assert!(
@@ -6978,7 +6709,7 @@ mod tests {
     #[test]
     fn a_validate_launch_commits_its_dispatch_stamp() {
         const NAME: &str = "pipeline_launch::tests::a_validate_launch_commits_its_dispatch_stamp";
-        enter_agent_free_child!(NAME, "claude");
+        enter_agent_free_child!(NAME, "codex");
         let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -7003,16 +6734,9 @@ mod tests {
             "premise: the artifact has a fingerprint"
         );
 
-        let mut state = State::new(
-            phase,
-            AgentKind::Claude,
-            Mode::Supervise,
-            root.to_path_buf(),
-        );
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
         state.stage = Stage::Validate;
         state.worktree_path = Some(worktree);
-        // The capture shape: no delivery canary.
-        state.legacy_claude_launch = true;
         state.yes_ship = true;
         workflow::save_state(&state).unwrap();
         workflow::update_state(root, phase, |on_disk| {
@@ -7125,20 +6849,11 @@ mod tests {
     /// woken back up when a background task finishes. A launch that resolved to
     /// the legacy single-document path does not rely on that premise.
     ///
-    /// **The false-branch discriminator is D-11's legacy opt-out, deliberately —
-    /// NOT stage membership** (ROADMAP criterion 7). This test previously took
-    /// `Stage::Plan`'s absence from [`STREAM_JSON_STAGES`] as its premise. That
-    /// premise is destroyed by the very rollout the constant exists to
-    /// sequence: once all five stages are widened, no Claude stage yields
-    /// `false` and the test becomes unconstructible as written — it would have
-    /// had to be deleted or rewritten under the time pressure of the widening
-    /// commit. `legacy_opt_out` is a separate `&&` term that
-    /// `stream_launch_enabled` respects regardless of the constant's
-    /// contents, so a premise built on it survives full widening.
-    ///
-    /// Verified, not assumed: this pair was run against a temporarily
-    /// fully-widened `STREAM_JSON_STAGES` and stayed green, while the
-    /// pre-rebuild version failed on its `Stage::Plan` premise.
+    /// **The false-branch discriminator is the agent, NOT stage membership**
+    /// (ROADMAP criterion 7): a capture-shape agent (Codex) at a stage that is on
+    /// the stream path for Claude. A stage-membership premise would be destroyed by
+    /// the rollout [`STREAM_JSON_STAGES`] sequences; the agent term survives full
+    /// widening. Phase 52 removed the Claude legacy opt-out this test used before.
     #[test]
     fn canary_gate_only_applies_to_the_stream_launch_path() {
         let _guard = env_lock();
@@ -7150,26 +6865,24 @@ mod tests {
         let phase = PhaseId::new(121);
         let mut state = canary_state(root, phase);
         // `Stage::Code` is on the stream path today and stays on it. The
-        // variable under test is the opt-out, not the stage.
+        // variable under test is the agent, not the stage.
         state.stage = Stage::Code;
-        state.legacy_claude_launch = true;
+        state.agent = AgentKind::Codex;
 
         // Driven by the REAL predicate rather than a hardcoded `false`, so this
         // test tracks the rollout instead of a copy of it.
-        let stream_launch =
-            stream_launch_enabled(state.agent, state.stage, state.legacy_claude_launch);
+        let stream_launch = stream_launch_enabled(state.agent, state.stage);
         assert!(
             !stream_launch,
-            "the legacy opt-out must force this launch off the stream path for this test \
-             to mean anything"
+            "a capture-shape agent must be off the stream path for this test to mean anything"
         );
-        // Negative control: the SAME agent and the SAME stage, with only the
-        // opt-out cleared, DOES fire. Without this, the reading above would be
-        // a constant rather than a discrimination — and unlike a stage-
-        // membership control, this one cannot be invalidated by widening.
+        // Negative control: the SAME stage under Claude DOES fire. Without this,
+        // the reading above would be a constant rather than a discrimination — and
+        // unlike a stage-membership control, this one cannot be invalidated by
+        // widening.
         assert!(
-            stream_launch_enabled(AgentKind::Claude, state.stage, false),
-            "clearing the opt-out must flip the predicate back to true, or the check above \
+            stream_launch_enabled(AgentKind::Claude, state.stage),
+            "the same stage under Claude must be on the stream path, or the check above \
              is vacuous"
         );
 
@@ -7186,7 +6899,7 @@ mod tests {
         assert_eq!(
             calls.get(),
             0,
-            "a legacy launch must not spend an agent invocation on a premise it never relies on"
+            "a capture launch must not spend an agent invocation on a premise it never relies on"
         );
         assert_eq!(
             state.canary, None,
@@ -7194,11 +6907,11 @@ mod tests {
         );
     }
 
-    /// The other direction of the pair above: with the opt-out cleared, the
-    /// same fixture DOES run the guard and DOES record its outcome.
+    /// The other direction of the pair above: under Claude, the same fixture
+    /// DOES run the guard and DOES record its outcome.
     ///
     /// The refusal half alone cannot distinguish "the gate correctly skipped a
-    /// legacy launch" from "the gate is wired to nothing". This is the case
+    /// capture launch" from "the gate is wired to nothing". This is the case
     /// that must produce the opposite result, at the level of the gate's own
     /// effects rather than the predicate's return value.
     ///
@@ -7217,13 +6930,11 @@ mod tests {
         let phase = PhaseId::new(123);
         let mut state = canary_state(root, phase);
         state.stage = Stage::Code;
-        state.legacy_claude_launch = false;
 
-        let stream_launch =
-            stream_launch_enabled(state.agent, state.stage, state.legacy_claude_launch);
+        let stream_launch = stream_launch_enabled(state.agent, state.stage);
         assert!(
             stream_launch,
-            "without the opt-out this stage must be on the stream path, or this test is \
+            "under Claude this stage must be on the stream path, or this test is \
              asserting the sibling test's case a second time"
         );
 
@@ -7352,8 +7063,8 @@ mod tests {
     /// `recorded_canary_refusal` re-reads `canary_gate`'s decision without running a
     /// canary, so the two must agree on every recorded outcome: it is `Some` exactly when
     /// `canary_gate`, given the stream predicate `launch_stage_inner` computes for the
-    /// same state, refuses. Enumerates every agent, stage, legacy opt-out and recorded
-    /// outcome. With nothing recorded `canary_gate` runs a fresh canary, so the copy
+    /// same state, refuses. Enumerates every agent, stage and recorded outcome.
+    /// With nothing recorded `canary_gate` runs a fresh canary, so the copy
     /// reports no recorded refusal; that case is asserted on its own. Control: the
     /// enumeration contains both an admitted and a refused launch, so agreement is not
     /// "both always say the same thing".
@@ -7387,34 +7098,31 @@ mod tests {
         let (mut admitted, mut refused) = (0usize, 0usize);
         for agent in agents {
             for stage in stages {
-                for legacy in [false, true] {
-                    let mut state = base.clone();
-                    state.agent = agent;
-                    state.stage = stage;
-                    state.legacy_claude_launch = legacy;
-                    state.canary = None;
+                let mut state = base.clone();
+                state.agent = agent;
+                state.stage = stage;
+                state.canary = None;
+                assert_eq!(
+                    recorded_canary_refusal(&state),
+                    None,
+                    "nothing recorded: {agent} {stage}"
+                );
+                for outcome in &outcomes {
+                    state.canary = Some(outcome.clone());
+                    let stream = stream_launch_enabled(agent, stage);
+                    let gate_refuses = canary_gate(&mut state.clone(), stream, || {
+                        unreachable!("a recorded outcome is never re-run")
+                    })
+                    .is_err();
                     assert_eq!(
-                        recorded_canary_refusal(&state),
-                        None,
-                        "nothing recorded: {agent} {stage} legacy={legacy}"
+                        recorded_canary_refusal(&state).is_some(),
+                        gate_refuses,
+                        "{agent} {stage} {outcome:?}"
                     );
-                    for outcome in &outcomes {
-                        state.canary = Some(outcome.clone());
-                        let stream = stream_launch_enabled(agent, stage, legacy);
-                        let gate_refuses = canary_gate(&mut state.clone(), stream, || {
-                            unreachable!("a recorded outcome is never re-run")
-                        })
-                        .is_err();
-                        assert_eq!(
-                            recorded_canary_refusal(&state).is_some(),
-                            gate_refuses,
-                            "{agent} {stage} legacy={legacy} {outcome:?}"
-                        );
-                        if gate_refuses {
-                            refused += 1;
-                        } else {
-                            admitted += 1;
-                        }
+                    if gate_refuses {
+                        refused += 1;
+                    } else {
+                        admitted += 1;
                     }
                 }
             }
@@ -8373,7 +8081,7 @@ mod tests {
             "parking must leave no stale gate protocol files"
         );
 
-        resume(root, phase, None, false)
+        resume(root, phase, None)
             .expect("the parked phase must resume through the supervised path");
         let resumed = workflow::load_state(root, phase)
             .expect("Supervise resume must leave a live state for its monitor");
@@ -9355,90 +9063,6 @@ mod tests {
 
     // ---- D-11: the legacy-launch opt-out (31-04) -------------------------
 
-    /// Set `DEVFLOW_CLAUDE_LEGACY_LAUNCH` for the duration of a test, restoring
-    /// the prior value on drop. Every user holds `ENV_MUTEX`.
-    struct LegacyEnvOverride(Option<std::ffi::OsString>);
-
-    impl LegacyEnvOverride {
-        // D-09 (48-09): mutates `DEVFLOW_CLAUDE_LEGACY_LAUNCH` process-wide.
-        // Deferred deliberately, not overlooked: THIS process reads the value, so
-        // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
-        // race and the value is restored on every exit path, unwinding included.
-        #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
-        fn set(value: &str) -> Self {
-            let prior = std::env::var_os("DEVFLOW_CLAUDE_LEGACY_LAUNCH");
-            // SAFETY: serialized by ENV_MUTEX; restored on drop.
-            unsafe { std::env::set_var("DEVFLOW_CLAUDE_LEGACY_LAUNCH", value) };
-            Self(prior)
-        }
-    }
-
-    impl Drop for LegacyEnvOverride {
-        // D-09 (48-09): mutates `DEVFLOW_CLAUDE_LEGACY_LAUNCH` process-wide.
-        // Deferred deliberately, not overlooked: THIS process reads the value, so
-        // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
-        // race and the value is restored on every exit path, unwinding included.
-        #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
-        fn drop(&mut self) {
-            // SAFETY: same serialization as `set`.
-            unsafe {
-                match self.0.take() {
-                    Some(prior) => std::env::set_var("DEVFLOW_CLAUDE_LEGACY_LAUNCH", prior),
-                    None => std::env::remove_var("DEVFLOW_CLAUDE_LEGACY_LAUNCH"),
-                }
-            }
-        }
-    }
-
-    fn legacy_state(root: &Path, phase: PhaseId, opt_out: bool) -> State {
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Code;
-        state.legacy_claude_launch = opt_out;
-        state
-    }
-
-    /// D-11: one flag forces the pre-31 shape back on, even for a stage the
-    /// rollout HAS reached — otherwise the escape hatch is unreachable exactly
-    /// where it is needed.
-    #[test]
-    fn legacy_launch_flag_forces_the_single_document_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = legacy_state(dir.path(), PhaseId::new(130), true);
-
-        // Precondition: without the opt-out this stage IS in the rollout, so
-        // the assertion below is a real discrimination and not a stage that
-        // was going to be legacy anyway.
-        assert!(
-            stream_launch_enabled(state.agent, state.stage, false),
-            "Stage::Code must be in STREAM_JSON_STAGES for this test to mean anything"
-        );
-
-        assert!(!stream_launch_enabled(
-            state.agent,
-            state.stage,
-            state.legacy_claude_launch
-        ));
-
-        let driver = agents::driver_for(state.agent);
-        let (program, args, launch) = resolve_launch_shape(
-            state.agent,
-            driver.as_ref(),
-            state.phase,
-            "the stage prompt".to_string(),
-            &[],
-            false,
-        );
-
-        assert!(matches!(launch, monitor::MonitorLaunch::Legacy));
-        assert_eq!(program, "claude");
-        assert_eq!(
-            (program, args),
-            agents::ClaudeDriver::exec_command_single_document("the stage prompt"),
-            "the forced path must be exec_command_single_document byte-for-byte, \
-             not an approximation of it"
-        );
-    }
-
     /// D-03 (47-03): a resumed Claude session receives the gate rule in two
     /// separately delivered turns — the Code loop-back prompt as the stdin user
     /// turn (turn 1) and the checkpoint resume instruction positionally in argv
@@ -9458,7 +9082,7 @@ mod tests {
         let phase = PhaseId::new(47);
         let agent = AgentKind::Claude;
         let driver = agents::driver_for(agent);
-        let stream_launch = stream_launch_enabled(agent, Stage::Code, false);
+        let stream_launch = stream_launch_enabled(agent, Stage::Code);
         assert!(
             stream_launch,
             "Stage::Code must be stream-launch-enabled for Claude for this test to mean anything"
@@ -9554,7 +9178,7 @@ mod tests {
         // predicate instead of a stage that was going to be Legacy anyway
         // (phase-39 code review, finding 3).
         assert!(
-            !stream_launch_enabled(state.agent, state.stage, false),
+            !stream_launch_enabled(state.agent, state.stage),
             "Pi must never be stream-launch-enabled for this test to mean anything"
         );
 
@@ -9570,145 +9194,6 @@ mod tests {
         assert!(matches!(launch, monitor::MonitorLaunch::Legacy));
         assert_eq!(program, "pi");
         assert_eq!(args, vec!["-p", "--no-approve", "the stage prompt"]);
-    }
-
-    /// Off by default: nothing set anywhere leaves the run on the Phase 31
-    /// transport. An escape hatch that engaged on its own would be the silent
-    /// downgrade D-11 rejects.
-    #[test]
-    // D-09 (48-09): mutates `DEVFLOW_CLAUDE_LEGACY_LAUNCH` process-wide.
-    // Deferred deliberately, not overlooked: THIS process reads the value, so
-    // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
-    // race and the value is restored on every exit path, unwinding included.
-    #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
-    fn legacy_launch_is_off_by_default() {
-        let _guard = env_lock();
-        // SAFETY: serialized by ENV_MUTEX.
-        unsafe { std::env::remove_var("DEVFLOW_CLAUDE_LEGACY_LAUNCH") };
-
-        let dir = tempfile::tempdir().unwrap();
-        let state = legacy_state(dir.path(), PhaseId::new(131), false);
-
-        assert!(
-            !state.legacy_claude_launch,
-            "State::new must default the opt-out to off"
-        );
-        assert!(!devflow_core::config::claude_legacy_launch());
-
-        let stream_launch =
-            stream_launch_enabled(state.agent, state.stage, state.legacy_claude_launch);
-        assert!(stream_launch);
-
-        let driver = agents::driver_for(state.agent);
-        let (_program, _args, launch) = resolve_launch_shape(
-            state.agent,
-            driver.as_ref(),
-            state.phase,
-            "the stage prompt".to_string(),
-            &[],
-            stream_launch,
-        );
-        assert!(matches!(launch, monitor::MonitorLaunch::PipeOwning { .. }));
-    }
-
-    /// D-11's "logged loudly" has to survive an unattended run where nobody is
-    /// watching stdout, so the notice lands on THREE channels. This pins the
-    /// two durable ones — the monitor log (the detached monitor's stdio is
-    /// null) and the run's event ledger. Stdout is not asserted here; see the
-    /// summary's "what this does not establish".
-    #[test]
-    // D-09 (48-09): mutates `DEVFLOW_CLAUDE_LEGACY_LAUNCH` process-wide.
-    // Deferred deliberately, not overlooked: THIS process reads the value, so
-    // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
-    // race and the value is restored on every exit path, unwinding included.
-    #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
-    fn legacy_launch_use_is_recorded_in_provenance() {
-        let _guard = env_lock();
-        // SAFETY: serialized by ENV_MUTEX.
-        unsafe { std::env::remove_var("DEVFLOW_CLAUDE_LEGACY_LAUNCH") };
-
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        init_repo(root);
-        let state = legacy_state(root, PhaseId::new(132), true);
-
-        announce_forced_legacy_launch(&state);
-
-        let events = events_of_kind(root, "claude_legacy_launch_forced");
-        assert_eq!(events.len(), 1, "exactly one provenance record: {events:?}");
-        // Lowercase: `Stage`'s Display is the wire form, and every other event
-        // in this ledger records it the same way.
-        assert_eq!(events[0]["stage"].as_str(), Some("code"));
-        assert_eq!(
-            events[0]["source"].as_str(),
-            Some("state:legacy_claude_launch"),
-            "with no env var set in this process, the source is the persisted flag"
-        );
-
-        let log = std::fs::read_to_string(agent_result::monitor_log_path(root, PhaseId::new(132)))
-            .expect("the monitor log must exist — it is the only channel a detached run has");
-        assert!(log.contains("legacy launch"), "monitor log: {log}");
-
-        // The required message (B3): the opt-out is an explicit acceptance of
-        // 999.64, not an escape from a guard. Asserted on the pure notice so a
-        // reworded log line cannot quietly drop it.
-        let notice = forced_legacy_launch_notice(state.stage, LegacyLaunchSource::PersistedState);
-        assert!(notice.contains("999.64"), "notice: {notice}");
-        // Case-insensitive: the requirement is the WORD, not its emphasis.
-        assert!(
-            notice.to_ascii_lowercase().contains("orphan"),
-            "the notice must say delegated work may be orphaned, in plain words: {notice}"
-        );
-        assert!(
-            log.contains("999.64"),
-            "the durable channel must carry it too, not just stdout: {log}"
-        );
-    }
-
-    /// Tests SCOPING, not a permitted bypass (adversarial review B3,
-    /// downgraded on evidence).
-    ///
-    /// The D-15 canary asks whether a live `stream-json` session is woken back
-    /// up when a background task finishes. `MonitorLaunch::Legacy` runs the
-    /// child with stdin at `/dev/null`, so a task-notification turn has no
-    /// channel to arrive on — the mechanism the canary tests structurally does
-    /// not exist on that path. Running it there would spend a real agent
-    /// invocation on a 300s deadline answering a question the launch never
-    /// asks. What the operator loses instead is named in the loud notice: the
-    /// legacy path is where a multi-plan wave orphans delegated work (999.64).
-    #[test]
-    fn legacy_launch_skips_the_delivery_canary() {
-        let _guard = env_lock();
-
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        init_repo(root);
-
-        let phase = PhaseId::new(133);
-        let mut state = canary_state(root, phase);
-        state.legacy_claude_launch = true;
-
-        // Driven by the REAL predicate, so this tracks the wiring rather than
-        // a copy of it.
-        let stream_launch =
-            stream_launch_enabled(state.agent, state.stage, state.legacy_claude_launch);
-        assert!(!stream_launch);
-        // Negative control: the SAME stage and agent, opt-out off, does run the
-        // stream path — so the reading above is the opt-out's doing.
-        assert!(stream_launch_enabled(state.agent, state.stage, false));
-
-        let calls = std::cell::Cell::new(0usize);
-        // `Absent` deliberately: if the gate ran this canary at all, the call
-        // below returns Err and the unwrap fails.
-        canary_gate(
-            &mut state,
-            stream_launch,
-            counting_canary(&calls, canary::CanaryOutcome::Absent),
-        )
-        .unwrap();
-
-        assert_eq!(calls.get(), 0);
-        assert_eq!(state.canary, None);
     }
 
     /// D-11 rejects automatic fallback: a silent downgrade is the same
@@ -9730,22 +9215,16 @@ mod tests {
     /// 31-04-SUMMARY.md as a known un-migrated route, not something this test
     /// covers.
     #[test]
-    // D-09 (48-09): mutates `DEVFLOW_CLAUDE_LEGACY_LAUNCH` process-wide.
-    // Deferred deliberately, not overlooked: THIS process reads the value, so
-    // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
-    // race and the value is restored on every exit path, unwinding included.
-    #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
     fn parse_failure_does_not_trigger_a_fallback() {
         let _guard = env_lock();
-        // SAFETY: serialized by ENV_MUTEX.
-        unsafe { std::env::remove_var("DEVFLOW_CLAUDE_LEGACY_LAUNCH") };
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
 
         let phase = PhaseId::new(134);
-        let state = legacy_state(root, phase, false);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
         workflow::save_state(&state).unwrap();
 
         // A capture the stream parser cannot make sense of: JSONL-shaped enough
@@ -9772,11 +9251,10 @@ mod tests {
 
         // ...and the launch shape for the very same state is UNCHANGED by that
         // failure. Nothing consulted the capture to pick a transport.
-        let stream_launch =
-            stream_launch_enabled(state.agent, state.stage, state.legacy_claude_launch);
+        let stream_launch = stream_launch_enabled(state.agent, state.stage);
         assert!(
             stream_launch,
-            "a parse failure must not select the legacy path — D-11 rejects automatic fallback"
+            "a parse failure must not select the capture shape — D-11 rejects automatic fallback"
         );
         let driver = agents::driver_for(state.agent);
         let (_program, _args, launch) = resolve_launch_shape(
@@ -9788,125 +9266,38 @@ mod tests {
             stream_launch,
         );
         assert!(matches!(launch, monitor::MonitorLaunch::PipeOwning { .. }));
-
-        // And no provenance event claiming a forced legacy launch was written,
-        // which is what a silent fallback would have looked like from outside.
-        assert!(events_of_kind(root, "claude_legacy_launch_forced").is_empty());
-    }
-
-    /// W4: a naive `env::var(..).is_ok()` would make
-    /// `DEVFLOW_CLAUDE_LEGACY_LAUNCH=false` *enable* the legacy path — an
-    /// accidental-reach path D-11 forbids. The value is parsed as a bool.
-    #[test]
-    fn legacy_launch_env_var_is_parsed_as_a_bool() {
-        let _guard = env_lock();
-
-        {
-            let _env = LegacyEnvOverride::set("true");
-            assert!(devflow_core::config::claude_legacy_launch());
-        }
-        {
-            // The case that motivates the test: PRESENT but false.
-            let _env = LegacyEnvOverride::set("false");
-            assert!(
-                !devflow_core::config::claude_legacy_launch(),
-                "`=false` must not enable the legacy path"
-            );
-        }
-        {
-            // Garbage warns and is ignored — it does not silently enable.
-            let _env = LegacyEnvOverride::set("yes-please");
-            assert!(!devflow_core::config::claude_legacy_launch());
-        }
-        {
-            // Empty is treated as unset, matching `env_value`'s filter.
-            let _env = LegacyEnvOverride::set("");
-            assert!(!devflow_core::config::claude_legacy_launch());
-        }
-    }
-
-    /// W5: `devflow resume` must not silently flip a run back to the stream
-    /// path mid-flight. The persisted opt-out is OR-ed, never cleared — the
-    /// same silent-drop class as `stop_until`'s unconditional clear (999.60),
-    /// which was fixed by gating it.
-    #[test]
-    // D-09 (48-09): mutates `DEVFLOW_CLAUDE_LEGACY_LAUNCH` process-wide.
-    // Deferred deliberately, not overlooked: THIS process reads the value, so
-    // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
-    // race and the value is restored on every exit path, unwinding included.
-    #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
-    fn resume_does_not_clear_a_persisted_legacy_launch() {
-        let _guard = env_lock();
-        // SAFETY: serialized by ENV_MUTEX.
-        unsafe { std::env::remove_var("DEVFLOW_CLAUDE_LEGACY_LAUNCH") };
-
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        init_repo(root);
-
-        let phase = PhaseId::new(135);
-        let mut state = legacy_state(root, phase, true);
-        workflow::save_state(&state).unwrap();
-
-        // The exact combination `resume` applies, with no flag and no env var.
-        apply_legacy_launch_opt_out(&mut state, false);
-
-        assert!(
-            state.legacy_claude_launch,
-            "a plain `devflow resume` must not drop the operator's opt-out"
-        );
-
-        // Negative control: the combination is not a constant `true` — a state
-        // that never had the opt-out stays off.
-        let mut never_opted_out = legacy_state(root, PhaseId::new(phase.major() + 1), false);
-        apply_legacy_launch_opt_out(&mut never_opted_out, false);
-        assert!(!never_opted_out.legacy_claude_launch);
     }
 
     // ------------------------------------------------------------------
     // Phase 41 Task 3: the widened stream predicate (Antigravity joins
-    // Claude; the legacy opt-out stays Claude-only, D-10), the PipeOwning
+    // Claude, D-10), the PipeOwning
     // launch shape, the by-agent canary dispatch (B2/D-07), and the
     // AutoChainGuard comment correction.
     // ------------------------------------------------------------------
 
+    /// Claude and Antigravity take the stream shape at every stream stage, with no
+    /// opt-out; every other agent takes the capture shape (`MonitorLaunch::Legacy`).
     #[test]
     fn stream_launch_includes_antigravity_on_stream_stages() {
-        assert!(
-            stream_launch_enabled(AgentKind::Antigravity, Stage::Code, false),
-            "Antigravity is a stream agent on a stream stage (round-3 D-10)"
-        );
-        // Claude unchanged.
-        assert!(stream_launch_enabled(AgentKind::Claude, Stage::Code, false));
-        // The other adapters never stream.
-        for agent in [AgentKind::Codex, AgentKind::OpenCode, AgentKind::Pi] {
-            assert!(
-                !stream_launch_enabled(agent, Stage::Code, false),
-                "{agent:?} must stay off the stream path"
-            );
+        for stage in STREAM_JSON_STAGES.iter().copied() {
+            for agent in [AgentKind::Claude, AgentKind::Antigravity] {
+                assert!(
+                    stream_launch_enabled(agent, stage),
+                    "{agent:?} is a stream agent at {stage} (round-3 D-10)"
+                );
+            }
+            for agent in [
+                AgentKind::Codex,
+                AgentKind::OpenCode,
+                AgentKind::Pi,
+                AgentKind::Hermes,
+            ] {
+                assert!(
+                    !stream_launch_enabled(agent, stage),
+                    "{agent:?} must stay off the stream path at {stage}"
+                );
+            }
         }
-    }
-
-    /// D-10 (antigravity notice (b)): `DEVFLOW_CLAUDE_LEGACY_LAUNCH` is
-    /// Claude's escape hatch. It must force CLAUDE off the stream path but
-    /// never route ANTIGRAVITY to Legacy — Antigravity has no single-document
-    /// format, and Legacy stdin is `/dev/null`.
-    #[test]
-    fn stream_launch_includes_antigravity_ignores_claude_legacy_opt_out() {
-        assert!(
-            !stream_launch_enabled(AgentKind::Claude, Stage::Code, true),
-            "the legacy opt-out keeps its hold on Claude"
-        );
-        assert!(
-            stream_launch_enabled(AgentKind::Antigravity, Stage::Code, true),
-            "the legacy opt-out must NOT move Antigravity (D-10)"
-        );
-        // Same with the opt-out cleared, for the record.
-        assert!(stream_launch_enabled(
-            AgentKind::Antigravity,
-            Stage::Code,
-            false
-        ));
     }
 
     #[test]
@@ -9953,7 +9344,7 @@ mod tests {
     fn auto_chain_guard_antigravity_engages_on_auto_code() {
         let driver = devflow_core::agents::driver_for(AgentKind::Antigravity);
         assert!(
-            stream_launch_enabled(AgentKind::Antigravity, Stage::Code, false),
+            stream_launch_enabled(AgentKind::Antigravity, Stage::Code),
             "premise: Antigravity is on the stream path at Code"
         );
         let (_program, _args, launch) = resolve_launch_shape(
@@ -10083,8 +9474,8 @@ mod tests {
     }
 
     impl HandoffRun {
-        /// Launch stage Define for `phase` (capture shape, Supervise mode,
-        /// `--until plan`) and return once N is recorded.
+        /// Launch stage Define for `phase` (Claude with a recorded `Confirmed` canary,
+        /// Supervise mode, `--until plan`) and return once N is recorded.
         fn launch(phase: PhaseId) -> Self {
             Self::launch_with(phase, |_, _| {})
         }
@@ -10106,7 +9497,8 @@ mod tests {
             .unwrap();
             let mut state = State::new(phase, AgentKind::Claude, Mode::Supervise, root.clone());
             state.verification_baseline_captured = true;
-            state.legacy_claude_launch = true;
+            // A stub `claude` cannot answer the stream launch's canary.
+            state.canary = Some(canary::CanaryOutcome::Confirmed);
             state.stop_until = Some(Stage::Plan);
             configure(&root, &mut state);
             workflow::save_state(&state).unwrap();
@@ -10548,7 +9940,7 @@ mod tests {
         let _hold = devflow_core::liveness::claim_phase_holder(root, phase).unwrap();
         let before = std::fs::read(workflow::state_path(root, phase)).unwrap();
 
-        let error = resume(root, phase, None, true)
+        let error = resume(root, phase, None)
             .expect_err("a held phase refuses")
             .to_string();
 
@@ -11705,8 +11097,8 @@ mod tests {
 
     /// A Supervise-mode Code run of `phase` under Claude in a fresh repo at `root`,
     /// with `fallback` and `consumed` saved, its `infra_failures` at `infra`, and a
-    /// rate-limit capture for `advance` to read. The capture shape, so a Claude
-    /// relaunch needs no delivery canary.
+    /// rate-limit capture for `advance` to read. Its delivery canary is recorded
+    /// `Confirmed`, so a Claude relaunch runs none.
     fn save_rate_limited_code_run(
         root: &Path,
         phase: PhaseId,
@@ -11725,7 +11117,7 @@ mod tests {
         state.fallback_agent = fallback;
         state.fallback_consumed = consumed;
         state.infra_failures = infra;
-        state.legacy_claude_launch = true;
+        state.canary = Some(canary::CanaryOutcome::Confirmed);
         workflow::save_state(&state).unwrap();
         write_rate_limit_capture(root, phase);
     }
@@ -12715,7 +12107,7 @@ mod tests {
         assert_eq!(state.stage, Stage::Define);
         kill_supervisor_until_stale(&run);
 
-        resume(&run.root, run.phase, None, false).unwrap();
+        resume(&run.root, run.phase, None).unwrap();
 
         assert_resume_reported_the_claimed_approval(&run, &gate);
         let removed = events_named(&run.root, "gate_claimed_answer_removed");
@@ -12749,7 +12141,7 @@ mod tests {
         );
         kill_supervisor_until_stale(&run);
 
-        resume(&run.root, run.phase, None, false).unwrap();
+        resume(&run.root, run.phase, None).unwrap();
 
         assert_resume_reported_the_claimed_approval(&run, &gate);
     }
@@ -12890,7 +12282,7 @@ mod tests {
         assert_eq!(last["stopped"], true, "{last}");
         assert_eq!(exit_file_of(&run), "143", "{}", run.events());
 
-        resume(&run.root, run.phase, None, false).unwrap();
+        resume(&run.root, run.phase, None).unwrap();
 
         let evaluated = |status: &str| {
             events_named(&run.root, "advance_evaluated")
@@ -13304,7 +12696,7 @@ mod tests {
         let state_file = workflow::state_path(&run.root, run.phase);
         let before = std::fs::read(&state_file).unwrap();
 
-        let result = resume(&run.root, run.phase, None, true);
+        let result = resume(&run.root, run.phase, None);
         // A resume that wrongly launched is ended before the assertions below fail.
         let after = run.state();
         let _reap = ReapMonitorOnDrop::after_launch(&after);
@@ -13580,7 +12972,7 @@ mod tests {
             "pipeline_launch::tests::a_next_stage_spawn_that_fails_clears_its_pending_record";
         if !devflow_core::test_support::in_child_test(NAME) {
             for case in ["socket_path", "no_publish"] {
-                let path_dir = go_waiting_claude_dir();
+                let path_dir = crate::test_support::go_waiting_agent_dir("codex");
                 let short = crate::test_support::hermetic_cache_dir();
                 let cache = if case == "socket_path" {
                     let long = short.path().join("c".repeat(80));
@@ -13610,13 +13002,7 @@ mod tests {
         let root = dir.path();
         init_repo(root);
         let phase = PhaseId::new(1706);
-        let mut state = State::new(
-            phase,
-            AgentKind::Claude,
-            Mode::Supervise,
-            root.to_path_buf(),
-        );
-        state.legacy_claude_launch = true;
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
         state.supervisor = Some(fabricated_prior_record(root));
         workflow::save_state(&state).unwrap();
 
@@ -13708,7 +13094,7 @@ mod tests {
             "nothing else holds the dead launcher's lock"
         );
 
-        let result = resume(&run.root, run.phase, None, true);
+        let result = resume(&run.root, run.phase, None);
         let after = run.state();
         let _reap = ReapMonitorOnDrop::after_launch(&after);
         result.expect("an abandoned reservation blocks nothing");
@@ -13833,7 +13219,7 @@ mod tests {
         use devflow_core::liveness::{self, Held};
         const NAME: &str = "pipeline_launch::tests::a_launched_supervisor_holds_its_liveness_lock_after_the_launcher_drops_it";
         if !devflow_core::test_support::in_child_test(NAME) {
-            let path_dir = go_waiting_claude_dir();
+            let path_dir = crate::test_support::go_waiting_agent_dir("codex");
             let output =
                 crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
@@ -13845,11 +13231,10 @@ mod tests {
         init_repo(root);
         let mut state = State::new(
             PhaseId::new(5007),
-            AgentKind::Claude,
+            AgentKind::Codex,
             Mode::Supervise,
             root.to_path_buf(),
         );
-        state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
 
         let result = launch_stage(&mut state, None, None);
@@ -13934,7 +13319,7 @@ mod tests {
             "pipeline_launch::tests::a_failed_monitor_spawn_clears_the_supervisor_record";
         if !devflow_core::test_support::in_child_test(NAME) {
             for case in ["fail", "ok"] {
-                let path_dir = go_waiting_claude_dir();
+                let path_dir = crate::test_support::go_waiting_agent_dir("codex");
                 let short = crate::test_support::hermetic_cache_dir();
                 let cache = if case == "fail" {
                     let long = short.path().join("c".repeat(80));
@@ -13964,13 +13349,7 @@ mod tests {
         let root = dir.path();
         init_repo(root);
         let phase = PhaseId::new(2301);
-        let mut state = State::new(
-            phase,
-            AgentKind::Claude,
-            Mode::Supervise,
-            root.to_path_buf(),
-        );
-        state.legacy_claude_launch = true;
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
         let prior = fabricated_prior_record(root);
         state.supervisor = Some(prior.clone());
         workflow::save_state(&state).unwrap();
@@ -14233,39 +13612,33 @@ mod tests {
         );
     }
 
-    /// Resume a stopped Code run of `phase` at `root` under Claude whose Code pass
-    /// was entered with `fix`, and return the argv the spawned `claude` received
-    /// and a reaper for its monitor. `legacy_claude_launch` puts the prompt in argv.
+    /// Resume a stopped Code run of `phase` at `root` under Codex whose Code pass
+    /// was entered with `fix`, and return the argv the spawned `codex` received
+    /// and a reaper for its monitor. Codex takes the prompt in argv.
     fn resume_code_run(
         root: &Path,
         phase: PhaseId,
         fix: Option<prompt::FixType>,
     ) -> (Vec<String>, ReapMonitorOnDrop) {
         init_repo(root);
-        let mut state = State::new(
-            phase,
-            AgentKind::Claude,
-            Mode::Supervise,
-            root.to_path_buf(),
-        );
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
         state.stage = Stage::Code;
         state.code_fix = fix;
-        state.legacy_claude_launch = true;
         state.stopped = true;
         state.stop_reason = Some("rate limited".to_string());
         workflow::save_state(&state).unwrap();
 
-        let result = resume(root, phase, None, false);
+        let result = resume(root, phase, None);
         let reloaded = workflow::load_state(root, phase).unwrap();
         let reap = ReapMonitorOnDrop::after_launch(&reloaded);
         result.unwrap();
         assert_eq!(reloaded.code_fix, fix, "a resume keeps the fix pass");
-        (recorded_argv(root, "claude"), reap)
+        (recorded_argv(root, "codex"), reap)
     }
 
     /// D-09: a `devflow resume` in the middle of an audit-fix pass (the cron arm's
     /// later resume) relaunches that pass, asserted on the argv the spawned
-    /// `claude` received. Control: the same resume with no fix pass recorded
+    /// `codex` received. Control: the same resume with no fix pass recorded
     /// delivers the plain execute-phase prompt.
     #[test]
     fn a_resume_mid_audit_fix_replays_audit_fix() {
@@ -14278,9 +13651,9 @@ mod tests {
             return;
         }
         let _guard = env_lock();
-        let claude = agents::driver_for(AgentKind::Claude);
+        let codex = agents::driver_for(AgentKind::Codex);
         let code_prompt = |phase: PhaseId, fix: Option<prompt::FixType>| {
-            claude.render_prompt(&prompt::StageIntent::Code { phase, fix })
+            codex.render_prompt(&prompt::StageIntent::Code { phase, fix })
         };
 
         let fix_dir = tempfile::tempdir().unwrap();
@@ -14467,8 +13840,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().to_path_buf();
             init_repo(&root);
-            let mut state = State::new(phase, AgentKind::Claude, Mode::Supervise, root.clone());
-            state.legacy_claude_launch = true;
+            let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.clone());
             let prior = fabricated_prior_record(&root);
             state.supervisor = Some(prior.clone());
             workflow::save_state(&state).unwrap();
@@ -14480,7 +13852,7 @@ mod tests {
             workflow::save_state(&state).unwrap();
             let published = monitor::spawn_monitor(
                 &state,
-                "claude",
+                "codex",
                 &[],
                 &[],
                 monitor::MonitorLaunch::Legacy,
@@ -14541,7 +13913,7 @@ mod tests {
     /// The parent half of a publish-save test: a child on the supervise-only
     /// entry whose fake agent waits for `go` in its working directory.
     fn run_publish_child(name: &str) {
-        let path_dir = go_waiting_claude_dir();
+        let path_dir = crate::test_support::go_waiting_agent_dir("codex");
         let output = run_hermetic_test_in_child(name, path_dir.path(), &[]);
         devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, name);
     }
@@ -15274,7 +14646,7 @@ mod tests {
             "N+1 stays only pending"
         );
 
-        let resumed = resume(&run.root, run.phase, None, true);
+        let resumed = resume(&run.root, run.phase, None);
         let state = run.state();
         let _reap = ReapMonitorOnDrop::after_launch(&state);
         resumed.expect("resume clears the abandoned reservation and proceeds");
@@ -16678,22 +16050,15 @@ mod tests {
     fn resume_commits_its_unstop_and_keeps_a_concurrent_field() {
         const NAME: &str =
             "pipeline_launch::tests::resume_commits_its_unstop_and_keeps_a_concurrent_field";
-        enter_agent_free_child!(NAME, "claude");
+        enter_agent_free_child!(NAME, "codex");
         let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
         let phase = PhaseId::new(2405);
-        let mut state = State::new(
-            phase,
-            AgentKind::Claude,
-            Mode::Supervise,
-            root.to_path_buf(),
-        );
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
         state.stage = Stage::Code;
-        // The capture shape: no delivery canary.
-        state.legacy_claude_launch = true;
         state.stopped = true;
         state.stop_reason = Some("stopped after code completed (--until code)".to_string());
         state.stop_until = Some(Stage::Code);
@@ -16705,7 +16070,7 @@ mod tests {
         })
         .unwrap();
 
-        let result = resume_loaded(root, phase, state, None, false, None);
+        let result = resume_loaded(root, phase, state, None, None);
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -17265,18 +16630,12 @@ mod tests {
         parent.join("supervisor.sock")
     }
 
-    /// A Code-stage run of `phase` under Claude on the capture shape, in a fresh repo at
+    /// A Code-stage run of `phase` under Codex (the capture shape), in a fresh repo at
     /// `root`, whose state records a supervisor at `socket`.
     fn code_run_recording(root: &Path, phase: PhaseId, socket: &Path) -> State {
         init_repo(root);
-        let mut state = State::new(
-            phase,
-            AgentKind::Claude,
-            Mode::Supervise,
-            root.to_path_buf(),
-        );
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
         state.stage = Stage::Code;
-        state.legacy_claude_launch = true;
         state.supervisor = Some(devflow_core::state::SupervisorRecord::new(
             socket.to_path_buf(),
             "18e5e63a18d5674f".to_string(),
@@ -17328,7 +16687,7 @@ mod tests {
             let root = dir.path();
             save(root, code_run_recording(root, phase, &socket));
             let before = std::fs::read(workflow::state_path(root, phase)).unwrap();
-            let result = resume(root, phase, None, false);
+            let result = resume(root, phase, None);
             let err = match result {
                 Err(err) => err.to_string(),
                 Ok(()) => panic!("phase {phase}: resume over an unprobeable record launched"),
@@ -17368,7 +16727,7 @@ mod tests {
         let root = dir.path();
         let gone = sockets.path().join("gone.sock");
         save_rate_limit_paused(root, code_run_recording(root, baseline, &gone));
-        let result = resume(root, baseline, None, false);
+        let result = resume(root, baseline, None);
         let reloaded_for_reap = workflow::load_state(root, baseline).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -18653,7 +18012,7 @@ mod tests {
         save(root, state);
         plant(root);
         let before = std::fs::read(workflow::state_path(root, phase)).unwrap();
-        let err = match resume(root, phase, None, false) {
+        let err = match resume(root, phase, None) {
             Err(err) => err.to_string(),
             Ok(()) => panic!("phase {phase}: resume over an unprobeable lock launched"),
         };
@@ -18680,7 +18039,7 @@ mod tests {
         let root = dir.path();
         let state = state(root);
         save_rate_limit_paused(root, state);
-        let result = resume(root, phase, None, false);
+        let result = resume(root, phase, None);
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
