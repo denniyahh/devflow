@@ -2435,14 +2435,8 @@ pub(crate) fn gate_sweep(
     max_age_secs: Option<u64>,
     dry_run: bool,
     root: Option<PathBuf>,
-    reap_strays: bool,
 ) -> Result<(), CliError> {
     let threshold = max_age_secs.unwrap_or_else(config_parse::gate_max_unattended_age_secs);
-
-    // Cloned before the `match` below moves `root` into `roots` — the stray
-    // pass (below) needs it too, unioned into the machine-wide reachable-pid
-    // safety set rather than substituted for it (CR-01, 25-15).
-    let explicit_root: Vec<PathBuf> = root.clone().into_iter().collect();
 
     let roots: Vec<PathBuf> = match root {
         Some(root) => vec![root],
@@ -2479,116 +2473,6 @@ pub(crate) fn gate_sweep(
                 SweepStep::Reaped => reaped += 1,
                 SweepStep::Skipped => skipped += 1,
                 SweepStep::LeftAlone => left_alone += 1,
-            }
-        }
-    }
-
-    // 999.44/DEN-68: opt-in only. Registry-independent, so this pass is NOT
-    // scoped to `roots` above — a stray by definition has no project root
-    // for any registry entry, held file, or state file to name, which is
-    // exactly why the census above cannot see it either. Extends the SAME
-    // reaped/skipped/left-alone counters and dry-run summary line rather
-    // than printing a second, separate report.
-    //
-    // CR-01/25-15: the SAFETY half is likewise never narrowed by `--root`.
-    // `unreachable_stray_candidates` unions `explicit_root` into the
-    // machine-wide reachable-pid set rather than substituting it, because
-    // that set is what gets PROTECTED, not what gets acted on — scoping it
-    // to one root would leave every OTHER root's live processes unprotected
-    // while this pass still reaps machine-wide, a strictly larger blast
-    // radius than leaving it machine-wide (see `25-15-PLAN.md`'s
-    // `<resolved_decision>`).
-    if reap_strays {
-        if !explicit_root.is_empty() {
-            println!(
-                "note: --root does not scope this stray pass -- a stray has no project root \
-                 for any registry entry, held liveness, gate-registration or foreground-holder \
-                 file, or state file to name, so discovery and \
-                 reaping are always machine-wide; the reachability safety filter is also \
-                 computed across every registered root regardless of --root, deliberately, \
-                 because narrowing it would leave other projects' live processes unprotected"
-            );
-        }
-        let candidates = unreachable_stray_candidates(&explicit_root);
-        let results = reap_stray_candidates(&candidates, dry_run, agent::STRAY_MIN_AGE);
-        // The event's natural home: the explicit `--root`, when given
-        // (exactly 999.44's own reproduction shape — an operator who
-        // already knows which root's stray they're chasing), else the
-        // first registered root, arbitrarily but deterministically, so the
-        // audit trail lands somewhere tailable rather than nowhere. A
-        // stray has no root of its own to prefer instead.
-        let event_root = roots.first();
-        for result in &results {
-            let layer = stray_layer_label(result.layer);
-            match result.outcome {
-                StrayReapOutcome::Reaped if dry_run => {
-                    reaped += 1;
-                    println!("would reap stray pid {} ({layer})", result.pid);
-                }
-                StrayReapOutcome::Reaped => {
-                    reaped += 1;
-                    if let Some(event_root) = event_root {
-                        events::emit(
-                            event_root,
-                            // Machine-scoped, not phase-scoped (999.44): a
-                            // stray has no phase, so `0` is a sentinel
-                            // meaning "not tied to any specific phase" —
-                            // never a real phase number, which this
-                            // project's phases never assign.
-                            PhaseId::new(0),
-                            "stray_reaped",
-                            serde_json::json!({
-                                "pid": result.pid,
-                                "layer": layer,
-                            }),
-                        );
-                    }
-                    println!("reaped stray pid {} ({layer})", result.pid);
-                }
-                StrayReapOutcome::IdentityMismatch => {
-                    skipped += 1;
-                    println!(
-                        "skipped stray pid {} ({layer}) — identity could not be re-confirmed \
-                         immediately before signalling (the pid may have been recycled since \
-                         discovery); inspect it manually (e.g. `ps -p {}`) before assuming it \
-                         is safe",
-                        result.pid, result.pid
-                    );
-                }
-                StrayReapOutcome::ReapFailed => {
-                    skipped += 1;
-                    println!(
-                        "failed to verify death for stray pid {} ({layer}) even after SIGKILL \
-                         escalation — inspect it manually (e.g. `ps -p {}`)",
-                        result.pid, result.pid
-                    );
-                }
-                StrayReapOutcome::TooYoung => {
-                    // No `stray_reaped` event: nothing was reaped.
-                    skipped += 1;
-                    println!(
-                        "skipped stray pid {} ({layer}) — younger than the minimum age \
-                         ({:?}); it may be a process that has not finished starting. A \
-                         genuine stray will still be there on the next invocation",
-                        result.pid,
-                        agent::STRAY_MIN_AGE
-                    );
-                }
-            }
-        }
-        // Reap both layers together (999.44): clearing only the wrapper
-        // manufactures a fresh orphan out of its trailing advance child.
-        // Re-run discovery once more after the pass to report anything
-        // newly exposed rather than leaving it silently behind, instead of
-        // looping unboundedly within one invocation.
-        if !dry_run && !results.is_empty() {
-            let remaining = agent::discover_stray_devflow_processes();
-            if !remaining.is_empty() {
-                println!(
-                    "note: {} stray process(es) still discoverable after this pass — re-run \
-                     `devflow gate sweep --reap-strays` to clear them",
-                    remaining.len()
-                );
             }
         }
     }
@@ -2700,128 +2584,6 @@ fn sweep_one_gate(
             Ok(SweepStep::Skipped)
         }
     }
-}
-
-/// What became of one [`agent::StrayProcess`] candidate the opt-in
-/// stray-reaping pass considered.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StrayReapOutcome {
-    /// Signalled and verified dead (or, under `dry_run`, "would have been
-    /// signalled" — nothing is actually sent in that case).
-    Reaped,
-    /// The pid's start time no longer matched what discovery recorded, so
-    /// it was refused rather than signalled — 999.47's "Related TOCTOU":
-    /// the pid could have been recycled between the census and this pass.
-    IdentityMismatch,
-    /// Identity re-confirmed, but the process was still alive even after
-    /// [`agent::terminate_and_verify`]'s bounded `SIGKILL` escalation.
-    ReapFailed,
-    /// The candidate could be inside its own `fork()`->`execve()` window
-    /// (25-12/999.47, the production half of the defect class): between
-    /// `Command::spawn()` returning and the child completing `execve`,
-    /// `/proc/<pid>/cmdline` reports the PARENT's argv, so the structural
-    /// match [`agent::discover_stray_devflow_processes`] made was against
-    /// the wrong process's argv. [`agent::is_same_process`]'s
-    /// re-confirmation does NOT catch this — a mid-`execve` child is
-    /// genuinely the same process with genuinely the same recorded start
-    /// time as its parent, so that guard passes. [`agent::process_age`]
-    /// and [`agent::STRAY_MIN_AGE`] are the guard that does: a candidate
-    /// whose age is unknown, or below the floor, is refused rather than
-    /// signalled.
-    TooYoung,
-}
-
-/// One candidate's outcome, paired with its pid and layer so a caller can
-/// report it without re-deriving either from side effects.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct StrayReapResult {
-    pid: u32,
-    layer: agent::StrayLayer,
-    outcome: StrayReapOutcome,
-}
-
-/// The opt-in reaper's pure(-ish) core: given an already-discovered
-/// candidate list, re-confirm each one's identity immediately before acting
-/// and clear it with a verified, escalating signal — never a bare
-/// unverified one. Split from [`gate_sweep`] and injectable (a `&[..]`
-/// slice, not a live call to [`agent::discover_stray_devflow_processes`])
-/// the same way [`reconcile_planning_docs`] is split from
-/// `collect_planning_doc_findings`, so this is directly unit-testable
-/// against a synthetic or a real-but-fixture-owned candidate list, never
-/// the whole machine's live census.
-///
-/// Its only side effect (beyond the `dry_run` preview, which signals
-/// nothing) is [`agent::terminate_and_verify`]'s TERM→KILL escalation — a
-/// single unverified `SIGTERM` is exactly what makes the CURRENT recovery
-/// path report success while the process keeps running (999.44's own
-/// lesson), so this never calls the bare [`agent::terminate`].
-///
-/// `min_age` (25-12/999.47): a candidate whose [`agent::process_age`] is
-/// unknown or below this floor is refused (`TooYoung`) rather than
-/// signalled — see [`StrayReapOutcome::TooYoung`] for why
-/// `is_same_process` above does not already cover this. Taken as a
-/// parameter rather than read from [`agent::STRAY_MIN_AGE`] directly so
-/// the existing fixture-owned unit tests can drive this deterministically
-/// (`Duration::ZERO` to disable the floor) without sleeping past it, and
-/// so the real floor's value is visible at its one call site
-/// (`gate_sweep`) instead of being implicit.
-fn reap_stray_candidates(
-    candidates: &[agent::StrayProcess],
-    dry_run: bool,
-    min_age: std::time::Duration,
-) -> Vec<StrayReapResult> {
-    candidates
-        .iter()
-        .map(|candidate| {
-            // Re-confirm identity immediately before acting, closing the
-            // discovery-to-signal TOCTOU window (999.47's "Related
-            // TOCTOU") — copies `stop_via_holder`'s fail-closed posture:
-            // refuse on any uncertainty, never signal on a mismatch.
-            if !agent::is_same_process(candidate.pid, candidate.start_time) {
-                return StrayReapResult {
-                    pid: candidate.pid,
-                    layer: candidate.layer,
-                    outcome: StrayReapOutcome::IdentityMismatch,
-                };
-            }
-            // Evaluated AFTER identity re-confirmation and BEFORE the
-            // dry_run early return, so a dry run previews the same
-            // verdict a real run would produce rather than promising a
-            // reap the real path would refuse. `None` (age unresolvable)
-            // and "younger than the floor" are both refused — fail
-            // closed on uncertainty, matching `is_same_process`'s own
-            // posture above.
-            let old_enough = agent::process_age(candidate.pid).is_some_and(|age| age >= min_age);
-            if !old_enough {
-                return StrayReapResult {
-                    pid: candidate.pid,
-                    layer: candidate.layer,
-                    outcome: StrayReapOutcome::TooYoung,
-                };
-            }
-            if dry_run {
-                return StrayReapResult {
-                    pid: candidate.pid,
-                    layer: candidate.layer,
-                    outcome: StrayReapOutcome::Reaped,
-                };
-            }
-            let cleared = agent::terminate_and_verify(
-                candidate.pid,
-                agent::TERMINATE_VERIFY_WAIT,
-                agent::TERMINATE_VERIFY_POLL,
-            );
-            StrayReapResult {
-                pid: candidate.pid,
-                layer: candidate.layer,
-                outcome: if cleared {
-                    StrayReapOutcome::Reaped
-                } else {
-                    StrayReapOutcome::ReapFailed
-                },
-            }
-        })
-        .collect()
 }
 
 /// The gate [`stop_via_gate`] answered, and the launch the state named as that run's
@@ -7207,9 +6969,7 @@ fn render_planning_doc_text(findings: &[PlanningDocFinding]) -> String {
 // doctor stray-process finding (999.44 / DEN-68)
 // ---------------------------------------------------------------------------
 
-/// Human-readable label for a [`agent::StrayLayer`], shared between
-/// `doctor`'s finding and `gate_sweep`'s opt-in reaping path so the two
-/// surfaces never describe the same layer with different words.
+/// Human-readable label for a [`agent::StrayLayer`] in `doctor`'s finding.
 fn stray_layer_label(layer: agent::StrayLayer) -> &'static str {
     match layer {
         agent::StrayLayer::MonitorWrapper => "monitor wrapper",
@@ -7241,11 +7001,10 @@ fn stray_layer_label(layer: agent::StrayLayer) -> &'static str {
 /// runs on `doctor`'s strictly read-only path.
 ///
 /// RESIDUAL (T-25-15-08, not eliminated): this is a point-in-time read. A
-/// root registered, or a file taken, between this read and a caller's later
-/// signal is not covered by it. The untouched
-/// `agent::is_same_process` identity re-confirmation and
-/// [`agent::STRAY_MIN_AGE`] age floor downstream remain the last line of
-/// defence in that window.
+/// root registered, or a file taken, after it is not covered, so `doctor` can
+/// report a process as a stray that became reachable meanwhile. Nothing
+/// signals on this set: `doctor`'s repair has the operator confirm the pid
+/// with `ps` before ending it by hand.
 pub(crate) fn registry_reachable_pids(roots: &[PathBuf]) -> HashSet<u32> {
     let mut reachable = HashSet::new();
     let mut scanned = HashSet::new();
@@ -7333,9 +7092,8 @@ fn stray_safety_roots(extra: &[PathBuf]) -> Vec<PathBuf> {
     roots
 }
 
-/// The ONE composition both `doctor` and `gate sweep --reap-strays` route
-/// through, so the two surfaces' claim and action cannot drift apart
-/// (T-25-15-07): the registry-independent `/proc` census
+/// The composition `doctor`'s stray finding routes through: the
+/// registry-independent `/proc` census
 /// ([`agent::discover_stray_devflow_processes`]), filtered by
 /// [`retain_unreachable_strays`] against
 /// [`registry_reachable_pids`]`(&`[`stray_safety_roots`]`(extra_roots))`.
@@ -7384,11 +7142,11 @@ pub(crate) fn build_stray_process_findings(
                      gate-registration or foreground-holder files",
                     stray.pid
                 ),
-                repair: Some(
-                    "devflow gate sweep --reap-strays --dry-run (preview first; re-run \
-                     without --dry-run to reap)"
-                        .to_string(),
-                ),
+                repair: Some(format!(
+                    "confirm pid {pid} is the stray with `ps -o args= -p {pid}`, then end it \
+                     with `kill {pid}`",
+                    pid = stray.pid
+                )),
             }
         })
         .collect()
@@ -7765,7 +7523,7 @@ mod tests {
         let root = dir.path();
         let phase = PhaseId::new(4802);
         Gates::write_gate(root, phase, Stage::Code, "paused").unwrap();
-        gate_sweep(Some(0), false, Some(root.to_path_buf()), false).unwrap();
+        gate_sweep(Some(0), false, Some(root.to_path_buf())).unwrap();
         assert!(gate_answer_files(root, phase, Stage::Code).is_empty());
     }
 
@@ -8578,7 +8336,7 @@ mod tests {
         wait_until_unheld(&crashed_file);
         assert!(crashed_file.exists(), "a crash leaves its file behind");
 
-        gate_sweep(Some(0), false, Some(root.to_path_buf()), false).unwrap();
+        gate_sweep(Some(0), false, Some(root.to_path_buf())).unwrap();
 
         assert!(
             matches!(
@@ -9325,7 +9083,7 @@ mod tests {
         let (opened, registration) = Gates::open_registered(root, phase, stage, "g").unwrap();
         let gate_lock = hold_gate_lock(root, phase);
 
-        let error = gate_sweep(Some(0), false, Some(root.to_path_buf()), false)
+        let error = gate_sweep(Some(0), false, Some(root.to_path_buf()))
             .expect_err("a held gate lock ends the sweep");
 
         assert!(
@@ -9335,7 +9093,7 @@ mod tests {
         assert!(gate_answer_files(root, phase, stage).is_empty());
 
         drop(gate_lock);
-        gate_sweep(Some(0), false, Some(root.to_path_buf()), false).unwrap();
+        gate_sweep(Some(0), false, Some(root.to_path_buf())).unwrap();
         assert!(matches!(
             Gates::read_answer(root, phase, stage, &opened.gate_id),
             AnswerRead::Bound(answer) if !answer.response.approved
@@ -9383,7 +9141,7 @@ mod tests {
             gate_respond(root, responding, Some(Stage::Code), true, None, None)
         });
         check(PhaseId::new(5010), &|root| {
-            gate_sweep(Some(0), false, Some(root.to_path_buf()), false)
+            gate_sweep(Some(0), false, Some(root.to_path_buf()))
         });
     }
 
@@ -10541,7 +10299,7 @@ mod tests {
         let (_, registration) = Gates::open_registered(root, phase, stage, "ctx").unwrap();
         backdate_gate(root, phase, stage, aged_past_threshold());
 
-        gate_sweep(None, true, Some(root.to_path_buf()), false).unwrap();
+        gate_sweep(None, true, Some(root.to_path_buf())).unwrap();
 
         assert!(
             gate_answer_files(root, phase, stage).is_empty(),
@@ -10550,7 +10308,7 @@ mod tests {
         let open = Gates::list_open(root);
         assert_eq!(open.len(), 1, "dry-run must leave the gate open");
 
-        gate_sweep(None, false, Some(root.to_path_buf()), false).unwrap();
+        gate_sweep(None, false, Some(root.to_path_buf())).unwrap();
         assert_eq!(
             gate_answer_files(root, phase, stage).len(),
             1,
@@ -10579,7 +10337,7 @@ mod tests {
         let path = Gates::answer(root, phase, stage, &opened.gate_id, &response).unwrap();
         let before = std::fs::read_to_string(&path).unwrap();
 
-        let result = gate_sweep(None, false, Some(root.to_path_buf()), false);
+        let result = gate_sweep(None, false, Some(root.to_path_buf()));
         let raced = sweep_one_gate(root, &listed_before_the_answer, 1, 0, false).unwrap();
 
         assert!(result.is_ok(), "an already-answered gate must not error");
@@ -10603,7 +10361,7 @@ mod tests {
         let (_, registration) = Gates::open_registered(root, phase, Stage::Ship, "ctx").unwrap();
         backdate_gate(root, phase, Stage::Ship, aged_past_threshold());
 
-        gate_sweep(None, false, Some(root.to_path_buf()), false).unwrap();
+        gate_sweep(None, false, Some(root.to_path_buf())).unwrap();
 
         let event = devflow_core::events::last_event_for_phase(root, phase).unwrap();
         assert_eq!(event["event"], "gate_reaped");
@@ -10611,288 +10369,10 @@ mod tests {
         registration.finish();
     }
 
-    /// Wrap a real, test-owned pid as the `agent::StrayProcess` shape
-    /// `discover_stray_devflow_processes` would have produced for it,
-    /// WITHOUT actually scanning the whole machine's `/proc` — 999.44's own
-    /// per-test safety rule: a reaping test must never act on anything it
-    /// did not spawn itself, and this machine's live process table
-    /// legitimately contains other, unrelated devflow activity while these
-    /// tests run.
-    fn stray_candidate_for(pid: u32, layer: agent::StrayLayer) -> agent::StrayProcess {
-        agent::StrayProcess {
-            pid,
-            start_time: agent::process_start_time(pid)
-                .expect("must be able to read the fixture's own recorded start time"),
-            layer,
-        }
-    }
-
-    /// Task 2 behavior: `--dry-run` computes and reports the outcome but
-    /// signals nothing — mirrors the existing gate-reaping dry-run
-    /// contract, extended to strays.
+    /// `gate_sweep` never looks at the process table: a live stray-shaped
+    /// fixture is neither discovered nor touched.
     #[test]
-    fn reap_stray_candidates_dry_run_never_signals() {
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .expect("spawn sleep fixture");
-        let pid = child.id();
-        let candidate = stray_candidate_for(pid, agent::StrayLayer::MonitorWrapper);
-
-        // 25-12: floor deliberately disabled (Duration::ZERO) — this test
-        // asserts the dry-run signalling behavior, not the age gate,
-        // which Task 1's dedicated process_age tests cover.
-        let results = reap_stray_candidates(&[candidate], true, std::time::Duration::ZERO);
-
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].outcome, StrayReapOutcome::Reaped);
-        assert!(
-            agent::agent_running(pid),
-            "dry-run must never actually signal the candidate"
-        );
-
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-
-    /// Task 2 behavior: a real candidate is cleared with VERIFIED death —
-    /// counted as reaped only once `agent::terminate_and_verify` confirms
-    /// it, never on the basis of a signal alone (999.44's own lesson: an
-    /// unverified `SIGTERM` is what makes the CURRENT recovery path report
-    /// success while the process keeps running).
-    #[test]
-    fn reap_stray_candidates_clears_a_real_child_with_verified_death() {
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .expect("spawn sleep fixture");
-        let pid = child.id();
-        let candidate = stray_candidate_for(pid, agent::StrayLayer::AdvanceChild);
-
-        // 25-12: floor deliberately disabled (Duration::ZERO) — this test
-        // asserts the signalling behavior, not the age gate, which
-        // Task 1's dedicated process_age tests cover.
-        let results = reap_stray_candidates(&[candidate], false, std::time::Duration::ZERO);
-
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].outcome, StrayReapOutcome::Reaped);
-        assert!(
-            !agent::agent_running(pid),
-            "a successful reap must leave the candidate verified dead, not merely signalled"
-        );
-
-        let _ = child.wait();
-    }
-
-    /// D-17's escalation, exercised through `gate_sweep`'s own reaping
-    /// core (`reap_stray_candidates`) rather than the raw
-    /// `terminate_and_verify` primitive 25-02 already covers directly — a
-    /// `SIGTERM`-ignoring child must still be cleared, via `SIGKILL`,
-    /// within the bounded wait.
-    #[test]
-    fn reap_stray_candidates_escalates_to_kill_for_a_term_ignoring_child() {
-        let mut child = std::process::Command::new("sh")
-            .arg("-c")
-            .arg("trap '' TERM; sleep 30")
-            .spawn()
-            .expect("spawn TERM-ignoring fixture");
-        let pid = child.id();
-        // Give the shell a moment to install its trap before signalling.
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        let candidate = stray_candidate_for(pid, agent::StrayLayer::MonitorWrapper);
-
-        // 25-12: floor deliberately disabled (Duration::ZERO) — this test
-        // asserts the SIGKILL escalation behavior, not the age gate,
-        // which Task 1's dedicated process_age tests cover.
-        let results = reap_stray_candidates(&[candidate], false, std::time::Duration::ZERO);
-
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].outcome, StrayReapOutcome::Reaped);
-        assert!(
-            !agent::agent_running(pid),
-            "a TERM-ignoring candidate must still be cleared via SIGKILL escalation"
-        );
-
-        let _ = child.wait();
-    }
-
-    /// The safety-critical case (999.47's "Related TOCTOU"): a candidate
-    /// whose recorded start time no longer matches at signal time — the pid
-    /// could have been recycled between discovery and this pass — must be
-    /// refused, counted separately from a successful reap, and, the
-    /// assertion that actually matters, the live process behind that pid
-    /// must NOT be signalled.
-    #[test]
-    fn reap_stray_candidates_refuses_on_identity_mismatch_without_signalling() {
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .expect("spawn sleep fixture");
-        let pid = child.id();
-        let real_start = agent::process_start_time(pid).expect("read real start time");
-        let mismatched = agent::StrayProcess {
-            pid,
-            start_time: real_start.wrapping_add(1),
-            layer: agent::StrayLayer::MonitorWrapper,
-        };
-
-        // 25-12: floor deliberately disabled (Duration::ZERO) — this test
-        // asserts the identity re-confirmation, not the age gate, which
-        // Task 1's dedicated process_age tests cover.
-        let results = reap_stray_candidates(&[mismatched], false, std::time::Duration::ZERO);
-
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].outcome, StrayReapOutcome::IdentityMismatch);
-        assert!(
-            agent::agent_running(pid),
-            "an identity mismatch must never be signalled — the whole point of the \
-             re-confirmation"
-        );
-
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-
-    /// Task 1's whole point (25-12/999.47, production half): a candidate
-    /// caught inside its own `fork()`->`execve()` window is genuinely the
-    /// same process with genuinely the same recorded start time as its
-    /// parent, so `is_same_process` alone cannot refuse it — the age floor
-    /// must. The assertion that actually matters is not the outcome enum
-    /// alone (a `TooYoung` outcome that still signalled would satisfy an
-    /// enum-only check) but that the fixture is still alive afterwards.
-    #[test]
-    fn reap_stray_candidates_refuses_a_candidate_younger_than_the_minimum_age() {
-        let mut child = std::process::Command::new("sh")
-            .arg("-c")
-            .arg("trap cleanup TERM INT; sleep 30")
-            .spawn()
-            .expect("spawn monitor-wrapper-shaped fixture");
-        let pid = child.id();
-
-        // 999.47: cross the exec-visibility barrier before building the
-        // candidate from a cmdline-derived census, or this test races the
-        // fixture's own fork()->execve() window (25-11).
-        assert!(
-            devflow_core::test_support::wait_for_exec_visibility(
-                pid,
-                "sh",
-                devflow_core::test_support::EXEC_VISIBILITY_WAIT,
-                devflow_core::test_support::EXEC_VISIBILITY_POLL,
-            ),
-            "pid {pid}: exec visibility timed out before the fixture became discoverable"
-        );
-
-        let candidate = stray_candidate_for(pid, agent::StrayLayer::MonitorWrapper);
-
-        let results = reap_stray_candidates(&[candidate], false, agent::STRAY_MIN_AGE);
-
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].outcome, StrayReapOutcome::TooYoung);
-        assert!(
-            agent::agent_running(pid),
-            "a candidate refused for youth must never actually be signalled"
-        );
-
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-
-    /// The floor is a floor, not a blanket refusal: the same fixture shape
-    /// as the test above, but with the floor disabled, IS reaped — without
-    /// this, the test above would pass equally well against a reaper that
-    /// refused unconditionally.
-    #[test]
-    fn reap_stray_candidates_reaps_when_the_floor_is_zero() {
-        let mut child = std::process::Command::new("sh")
-            .arg("-c")
-            .arg("trap cleanup TERM INT; sleep 30")
-            .spawn()
-            .expect("spawn monitor-wrapper-shaped fixture");
-        let pid = child.id();
-
-        assert!(
-            devflow_core::test_support::wait_for_exec_visibility(
-                pid,
-                "sh",
-                devflow_core::test_support::EXEC_VISIBILITY_WAIT,
-                devflow_core::test_support::EXEC_VISIBILITY_POLL,
-            ),
-            "pid {pid}: exec visibility timed out before the fixture became discoverable"
-        );
-
-        let candidate = stray_candidate_for(pid, agent::StrayLayer::MonitorWrapper);
-
-        let results = reap_stray_candidates(&[candidate], false, std::time::Duration::ZERO);
-
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].outcome, StrayReapOutcome::Reaped);
-        assert!(
-            !agent::agent_running(pid),
-            "with the floor disabled, a genuine candidate must still be reaped and verified dead"
-        );
-
-        let _ = child.wait();
-    }
-
-    /// Task 2 behavior: fail-closed on an unresolvable age. Constructed
-    /// from a dead pid (the same shape
-    /// `stop_is_a_success_no_op_when_the_lock_names_a_dead_pid` uses:
-    /// above the default kernel `pid_max`, guaranteed not alive) — this
-    /// documents the actual interaction rather than assuming one:
-    /// `agent::process_age` DOES return `None` for it, but
-    /// `agent::is_same_process` is evaluated FIRST in
-    /// `reap_stray_candidates` and ALSO fails for the identical reason
-    /// (both derive from `agent::process_start_time`), so this candidate
-    /// is classified `IdentityMismatch`, not `TooYoung` — the age check is
-    /// never reached. That is not a design gap: an unconfirmable identity
-    /// is refused regardless of which guard catches it first.
-    ///
-    /// The `TooYoung`-via-unresolvable-age arm specifically (identity
-    /// re-confirmed alive, but `process_age` itself returns `None`)
-    /// requires `/proc/uptime` or `sysconf(_SC_CLK_TCK)` to fail while
-    /// `/proc/<pid>/stat` succeeds for the SAME live pid — a combination
-    /// no black-box process fixture in this suite can construct without
-    /// faking `/proc`. Left uncovered by assertion rather than faked. Covered
-    /// by source reasoning instead: `reap_stray_candidates`'s age check —
-    /// `agent::process_age(candidate.pid).is_some_and(|age| age >= min_age)`
-    /// — treats `None` as `false` by construction of `Option::is_some_and`,
-    /// so an unresolvable age can never accidentally satisfy the `>=`
-    /// comparison and fall through to `Reaped`.
-    #[test]
-    fn reap_stray_candidates_refuses_a_dead_pid_as_identity_mismatch_before_the_age_check_runs() {
-        let dead_pid = 9_999_999;
-        assert!(
-            agent::process_age(dead_pid).is_none(),
-            "precondition: a dead pid's age must be unresolvable"
-        );
-        let candidate = agent::StrayProcess {
-            pid: dead_pid,
-            start_time: 0,
-            layer: agent::StrayLayer::MonitorWrapper,
-        };
-
-        let results = reap_stray_candidates(&[candidate], false, agent::STRAY_MIN_AGE);
-
-        assert_eq!(results.len(), 1);
-        assert_eq!(
-            results[0].outcome,
-            StrayReapOutcome::IdentityMismatch,
-            "is_same_process is evaluated before the age check and fails first for a dead pid"
-        );
-    }
-
-    /// Flag wiring, exercised through the real `gate_sweep` entry point.
-    /// `--dry-run` is provably safe to run against the live machine (it
-    /// never signals anything, no matter what else is discovered) — this
-    /// is the one test in this file that drives the actual CLI-facing
-    /// function with `reap_strays: true` rather than the injectable core
-    /// directly, deliberately avoiding a non-dry-run invocation: this
-    /// machine's live process table legitimately contains other, unrelated
-    /// devflow activity (concurrent phases in sibling worktrees) while
-    /// these tests run, and a non-dry-run sweep is registry-independent by
-    /// design — it would act on that too, not just this fixture.
-    #[test]
-    fn gate_sweep_reap_strays_dry_run_discovers_a_real_stray_without_signalling() {
+    fn gate_sweep_ignores_a_live_stray() {
         let mut child = std::process::Command::new("sh")
             .arg("-c")
             .arg("trap cleanup TERM INT; sleep 30")
@@ -10901,58 +10381,11 @@ mod tests {
         let pid = child.id();
         let dir = tempfile::tempdir().unwrap();
 
-        // 999.47: `spawn()` returns after `fork()`, before `execve()` — cross
-        // the exec-visibility barrier before reading the cmdline-derived
-        // census, or this assertion races the child's own exec (25-11).
-        assert!(
-            devflow_core::test_support::wait_for_exec_visibility(
-                pid,
-                "sh",
-                devflow_core::test_support::EXEC_VISIBILITY_WAIT,
-                devflow_core::test_support::EXEC_VISIBILITY_POLL,
-            ),
-            "pid {pid}: exec visibility timed out before the fixture became discoverable"
-        );
-
-        assert!(
-            agent::discover_stray_devflow_processes()
-                .iter()
-                .any(|p| p.pid == pid),
-            "the fixture must be part of the real discovery census gate_sweep would use"
-        );
-
-        gate_sweep(None, true, Some(dir.path().to_path_buf()), true).unwrap();
+        gate_sweep(None, false, Some(dir.path().to_path_buf())).unwrap();
 
         assert!(
             agent::agent_running(pid),
-            "--dry-run must never signal a discovered stray, no matter what else the machine \
-             is running"
-        );
-
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-
-    /// Task 2 behavior: without the flag, `gate_sweep` never even looks at
-    /// the process table — a live stray-shaped fixture is neither
-    /// discovered nor touched, and `gate_sweep`'s existing behavior stays
-    /// byte-for-byte unchanged.
-    #[test]
-    fn gate_sweep_without_reap_strays_flag_ignores_a_live_stray() {
-        let mut child = std::process::Command::new("sh")
-            .arg("-c")
-            .arg("trap cleanup TERM INT; sleep 30")
-            .spawn()
-            .expect("spawn monitor-wrapper-shaped fixture");
-        let pid = child.id();
-        let dir = tempfile::tempdir().unwrap();
-
-        gate_sweep(None, false, Some(dir.path().to_path_buf()), false).unwrap();
-
-        assert!(
-            agent::agent_running(pid),
-            "gate_sweep without --reap-strays must never signal anything discoverable only \
-             via the process table"
+            "gate_sweep must never signal anything discoverable only via the process table"
         );
 
         let _ = child.kill();
@@ -13543,7 +12976,7 @@ mod tests {
     /// only reachable source, because the census cannot match a 3.x
     /// supervisor (`agent::tests::the_stray_census_matches_only_the_2x_process_shapes`).
     #[test]
-    fn reachable_pids_are_excluded_from_both_the_findings_and_the_reap_candidates() {
+    fn reachable_pids_are_excluded_from_the_stray_findings() {
         let mut lock_child = spawn_wrapper_shaped_fixture();
         let mut orphan_child = spawn_wrapper_shaped_fixture();
         let lock_pid = lock_child.id();
@@ -13628,9 +13061,8 @@ mod tests {
             "the holder's pid must produce no finding"
         );
 
-        // Reap both with a VERIFIED signal, never a bare one
-        // (mirrors `reap_strays_e2e.rs:202-223`'s own teardown), plus a
-        // final `wait()` on each to reclaim the zombie regardless.
+        // End both with a VERIFIED signal, never a bare one, plus a final
+        // `wait()` on each to reclaim the zombie regardless.
         for pid in [lock_pid, orphan_pid] {
             agent::terminate_and_verify(
                 pid,
@@ -13696,8 +13128,8 @@ mod tests {
             "with the reachable set empty, the pid must still be treated as a stray"
         );
 
-        // Verified reap (mirrors `reap_strays_e2e.rs:202-223`), plus a
-        // final `wait()` to reclaim the zombie regardless.
+        // End it with a verified signal, plus a final `wait()` to reclaim
+        // the zombie regardless.
         agent::terminate_and_verify(
             pid,
             agent::TERMINATE_VERIFY_WAIT,

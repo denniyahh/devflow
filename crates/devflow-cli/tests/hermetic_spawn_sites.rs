@@ -19,7 +19,6 @@ const HERMETIC_SUITES: &[&str] = &[
     "auto_chain_flag_e2e.rs",
     "yes_ship_config.rs",
     "release_check.rs",
-    "reap_strays_e2e.rs",
     "help_snapshot.rs",
 ];
 
