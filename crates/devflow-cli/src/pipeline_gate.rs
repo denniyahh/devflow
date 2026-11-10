@@ -976,13 +976,14 @@ mod tests {
         };
     }
 
-    /// `advance()` over a Ship-stage success with an approved Ship gate must run
-    /// the terminal `finish_workflow` path (after-ship hooks + gate cleanup +
-    /// state cleared) — the only non-spawning branch of `advance`'s orchestration
-    /// (11-VALIDATION.md 12f). The gate response is pre-seeded on disk so
-    /// `run_gate`'s poll returns immediately instead of blocking.
+    /// CUT-02 (D-01, D-23): an approved Ship gate, which only a state written by
+    /// an older binary can still reach, ends the run the way a passing Validate
+    /// does. No after-ship hook runs: no merge, version bump, changelog or branch
+    /// deletion, and nothing records the phase as shipped. The state is kept,
+    /// recorded finished, and the feature branch survives. The gate response is
+    /// pre-seeded on disk so `run_gate`'s poll returns at once.
     #[test]
-    fn advance_ship_success_runs_finish_workflow() {
+    fn an_approved_ship_gate_finishes_the_run_without_running_a_hook() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
@@ -1019,8 +1020,22 @@ mod tests {
 
         advance(root, Some(phase)).unwrap();
 
-        let err = workflow::load_state(root, phase).unwrap_err();
-        assert!(matches!(err, workflow::WorkflowError::MissingState(_)));
+        assert!(
+            events_named(root, "hook_run").is_empty(),
+            "no after-ship hook runs"
+        );
+        assert!(events_named(root, "workflow_shipped").is_empty());
+        let finished = events_named(root, "workflow_finished");
+        assert_eq!(finished.len(), 1, "{finished:?}");
+        assert_eq!(finished[0]["reason"], "finished", "{}", finished[0]);
+        let kept = workflow::load_state(root, phase).expect("the state is kept");
+        assert!(kept.finished && kept.stopped, "{kept:?}");
+        let branch_kept = devflow_core::test_support::git_command(root)
+            .args(["rev-parse", "--verify", "--quiet", &branch])
+            .status()
+            .unwrap()
+            .success();
+        assert!(branch_kept, "the feature branch is not deleted");
         assert!(!Gates::gate_path(root, phase, Stage::Ship).exists());
         assert!(gate_answer_files(root, phase, Stage::Ship).is_empty());
         assert!(gate_claim_files(root, phase, Stage::Ship).is_empty());
