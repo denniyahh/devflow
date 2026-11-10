@@ -1460,3 +1460,264 @@ fn a_stop_sent_while_a_completed_run_waits_on_a_held_stdout_ends_it_at_safe_poin
         "the exit file records the stop outcome, not the agent's own code (D-16)"
     );
 }
+
+// ---- 52-08: a run whose Validate passes ends as finished (CUT-02) ---------
+//
+// Validate is the last stage. A passing Validate ends the run through
+// `finish_run`: one `workflow_finished` with `{"reason":"finished",
+// "shipped":false}`, one notify, the state kept and marked finished, the
+// worktree and branch kept. The `--until plan` halt is the opposite case.
+
+/// [`FINISHING_CLAUDE`] whose marker also reports `"verdict":"pass"`, so its
+/// Validate pass reads as Layer 1 Success plus a Pass verdict.
+fn passing_claude() -> String {
+    FINISHING_CLAUDE.replace(
+        r#"{"status":"success","commits":1}"#,
+        r#"{"status":"success","commits":1,"verdict":"pass"}"#,
+    )
+}
+
+/// How long a finished run's supervisors get to exit before the events are
+/// counted. Counting earlier could miss a second notify still to come.
+const EXIT_WAIT: Duration = Duration::from_secs(30);
+
+/// One auto run's fixture: a hermetic home, a repository with the
+/// `.planning/config.json` auto mode's unattended check reads, a passing fake
+/// `claude` first on PATH, and a notify command that appends one line per
+/// call to a log outside the repository.
+struct FinishRig {
+    home: common::HermeticHome,
+    _repo: tempfile::TempDir,
+    root: std::path::PathBuf,
+    phase: PhaseId,
+    fake_bin: common::FakeBin,
+    notify: tempfile::TempDir,
+}
+
+impl FinishRig {
+    fn new(phase: PhaseId) -> Self {
+        let home = common::HermeticHome::new();
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        init_repo(&root, phase);
+        fs::write(
+            root.join(".planning/config.json"),
+            "{\n  \"workflow\": {\n    \"auto_advance\": true,\n    \"_auto_chain_active\": false\n  }\n}\n",
+        )
+        .unwrap();
+        // A pre-written plan with no checkpoint, so auto mode's unattended
+        // Code preflight has a plan to read.
+        let padded = phase.padded();
+        let plan = format!(".planning/phases/{padded}-fixture/{padded}-01-PLAN.md");
+        fs::write(
+            root.join(&plan),
+            format!(
+                "---\nphase: {padded}-fixture\nplan: 01\ntype: execute\nautonomous: true\n---\n\n<tasks>\n<task type=\"auto\"><name>stub</name></task>\n</tasks>\n"
+            ),
+        )
+        .unwrap();
+        git(&root, &["add", ".planning/config.json", &plan]);
+        git(&root, &["commit", "-q", "-m", "auto config and plan"]);
+        Self {
+            home,
+            _repo: repo,
+            root,
+            phase,
+            fake_bin: common::fake_bin_dir(&passing_claude()),
+            notify: tempfile::tempdir().unwrap(),
+        }
+    }
+
+    fn notify_log(&self) -> std::path::PathBuf {
+        self.notify.path().join("notify.log")
+    }
+
+    /// `devflow start --phase N --agent claude --mode auto`, plus `extra`, in
+    /// a phase worktree. Asserts the start itself succeeded.
+    fn start(&self, extra: &[&str]) {
+        let existing = std::env::var_os("PATH").unwrap_or_default();
+        let path = format!(
+            "{}:{}",
+            self.fake_bin.path.display(),
+            existing.to_string_lossy()
+        );
+        let notify_cmd = format!(
+            "printf 'notify stage=%s\\n' \"$DEVFLOW_GATE_STAGE\" >> '{}'",
+            self.notify_log().display()
+        );
+        let output = common::hermetic_devflow(&self.home)
+            .args([
+                "start",
+                "--phase",
+                &self.phase.to_string(),
+                "--agent",
+                "claude",
+                "--mode",
+                "auto",
+            ])
+            .args(extra)
+            .arg(&self.root)
+            .current_dir(&self.root)
+            .env("PATH", path)
+            .env("DEVFLOW_GATE_NOTIFY_CMD", notify_cmd)
+            .output()
+            .expect("run devflow start");
+        assert!(
+            output.status.success(),
+            "start failed\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn events(&self) -> Vec<serde_json::Value> {
+        fs::read_to_string(devflow_core::events::events_path(&self.root))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .collect()
+    }
+
+    fn events_text(&self) -> String {
+        fs::read_to_string(devflow_core::events::events_path(&self.root)).unwrap_or_default()
+    }
+
+    fn positions(&self, name: &str) -> Vec<usize> {
+        self.events()
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| event["event"] == name)
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// Wait until the run ends (a `workflow_finished` or a gate), then until
+    /// every supervisor it started has exited, so nothing can add an event. A
+    /// run that ends at a gate fails here: no run under test should gate.
+    fn wait_for_end(&self, reaper: &common::LaunchedRunReaper) {
+        common::wait_for(
+            || {
+                self.events().iter().any(|event| {
+                    event["event"] == "workflow_finished" || event["event"] == "gate_fired"
+                })
+            },
+            RUN_WAIT,
+            &format!("the run of phase {} to end", self.phase),
+        );
+        assert!(
+            self.positions("gate_fired").is_empty(),
+            "the run ended at a gate, not finished; events:\n{}",
+            self.events_text()
+        );
+        assert!(
+            reaper.supervisors_exited_within(EXIT_WAIT),
+            "the run's supervisors did not exit after it ended; events:\n{}",
+            self.events_text()
+        );
+    }
+
+    fn notify_lines(&self) -> Vec<String> {
+        fs::read_to_string(self.notify_log())
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn state(&self) -> devflow_core::state::State {
+        devflow_core::workflow::load_state(&self.root, self.phase).expect("the run's state")
+    }
+
+    fn git_out(&self, args: &[&str]) -> String {
+        let output = devflow_core::test_support::git_command(&self.root)
+            .args(args)
+            .output()
+            .expect("spawn git");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+}
+
+#[test]
+fn a_run_that_passes_validate_finishes_and_keeps_its_worktree() {
+    let phase = PhaseId::new(81);
+    let rig = FinishRig::new(phase);
+    let reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+
+    rig.start(&[]);
+    rig.wait_for_end(&reaper);
+    let log = rig.events_text();
+    let events = rig.events();
+
+    let finished = rig.positions("workflow_finished");
+    assert_eq!(finished.len(), 1, "one workflow_finished; events:\n{log}");
+    let finish = &events[finished[0]];
+    let payload: serde_json::Map<String, serde_json::Value> = finish
+        .as_object()
+        .unwrap()
+        .iter()
+        .filter(|(key, _)| !["event", "phase", "ts"].contains(&key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    assert_eq!(
+        serde_json::Value::Object(payload),
+        serde_json::json!({"reason": "finished", "shipped": false}),
+        "the terminal payload; events:\n{log}"
+    );
+
+    assert_eq!(
+        rig.notify_lines().len(),
+        1,
+        "notify fired exactly once: {:?}\nevents:\n{log}",
+        rig.notify_lines()
+    );
+    let notified = rig.positions("notify_fired");
+    assert_eq!(notified.len(), 1, "one notify_fired; events:\n{log}");
+    assert!(
+        notified[0] > finished[0],
+        "notify_fired follows workflow_finished; events:\n{log}"
+    );
+    assert_eq!(events[notified[0]]["reason"], "finished", "{log}");
+
+    for absent in ["workflow_shipped", "hook_run"] {
+        assert!(
+            rig.positions(absent).is_empty(),
+            "no {absent} event; events:\n{log}"
+        );
+    }
+
+    let state_file = devflow_core::workflow::state_path(&rig.root, phase);
+    let raw: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&state_file).unwrap_or_else(|err| {
+            panic!("the state file {} is kept: {err}", state_file.display())
+        }))
+        .expect("the kept state file parses");
+    assert_eq!(raw["stopped"], true, "the kept state is stopped: {raw}");
+    assert_eq!(raw["finished"], true, "the kept state is finished: {raw}");
+    let state = rig.state();
+    let worktree = state
+        .worktree_path
+        .clone()
+        .expect("the run used a phase worktree");
+    assert!(
+        worktree.is_dir(),
+        "the worktree {} is kept",
+        worktree.display()
+    );
+    let branch = format!("feature/phase-{}", phase.padded());
+    assert_eq!(
+        rig.git_out(&["branch", "--list", &branch])
+            .trim_start_matches(['*', '+', ' ']),
+        branch,
+        "the branch is kept"
+    );
+
+    let cache = rig.home.cache_dir();
+    assert!(
+        devflow_core::registry::roots_dir_in(&cache).is_dir(),
+        "control: the launch registered the phase in this registry directory"
+    );
+    assert!(
+        !devflow_core::registry::entry_path_in(&cache, &rig.root, phase).exists(),
+        "the finished phase is deregistered"
+    );
+}
