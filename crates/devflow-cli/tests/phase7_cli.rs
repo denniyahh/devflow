@@ -291,7 +291,7 @@ fn parallel_creates_two_worktrees_and_spawns_two_monitors() {
     // So the canary outcome is STUBBED rather than bypassed, through the seam
     // this suite already has across the process boundary: the fake `claude` on
     // PATH. The script below is the one
-    // `reference_and_cleanup_worktree_cli_flow` already uses — it models a CLI
+    // `cleanup_worktree_cli_flow` already uses — it models a CLI
     // that DOES deliver the planted token back inside a top-level `result`
     // event, so `run_delivery_canary` reaches a deterministic `Confirmed`
     // without any real agent invocation, and every step of the guard it is
@@ -711,7 +711,7 @@ fn start_until_unknown_stage_is_rejected_by_clap() {
 }
 
 /// Subcommands v4.0 removed (D-01). Later cut plans append to this list.
-const REMOVED_SUBCOMMANDS: &[&str] = &["list"];
+const REMOVED_SUBCOMMANDS: &[&str] = &["list", "reference", "test"];
 
 /// The subcommand names listed under `Commands:` in a `devflow --help` output.
 fn help_subcommand_names(help: &str) -> Vec<&str> {
@@ -899,8 +899,9 @@ fn status_prints_cron_hint_when_cron_instructions_exist() {
     );
 }
 
+/// `cleanup --force` removes a phase worktree once its run has ended.
 #[test]
-fn reference_and_cleanup_worktree_cli_flow() {
+fn cleanup_worktree_cli_flow() {
     let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
@@ -932,12 +933,6 @@ esac
 "#,
     )]);
 
-    // reference — creates static snapshot
-    let out = run_devflow(&home, root, &fake_bin.path, &["reference"]);
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("reference worktree"));
-    assert!(root.join(".worktrees/reference").is_dir());
-
     // start --worktree — creates phase worktree
     let out = run_devflow(
         &home,
@@ -965,10 +960,6 @@ esac
     // status — lists active worktrees
     let out = run_devflow(&home, root, &fake_bin.path, &["status"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains(".worktrees/reference"),
-        "status missing reference\n{stdout}"
-    );
     assert!(
         stdout.contains(".worktrees/phase-08"),
         "status missing phase worktree\n{stdout}"
@@ -1022,8 +1013,6 @@ esac
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("removed"));
 
-    // cleanup --force removes everything including reference
-    assert!(!root.join(".worktrees/reference").is_dir());
     assert!(!root.join(".worktrees/phase-08").is_dir());
 }
 
