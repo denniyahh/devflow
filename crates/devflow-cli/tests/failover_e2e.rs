@@ -7,7 +7,7 @@
 //! turn; the supervisor hands the stage to a stub `agy`, which must pass its
 //! OWN delivery canary inside the supervisor before its stage turn runs. A
 //! refused canary ends at the never-silent Code gate (R2-D1), and a run with
-//! no fallback takes the cron arm without ever invoking `agy`.
+//! no fallback waits at that gate without ever invoking `agy`.
 //!
 //! Every `devflow` child is built by `common::hermetic_devflow`, so its
 //! registry entries and sockets live under a tempdir `HOME`. The stubs log to
@@ -40,8 +40,7 @@ const CLAUDE_INIT_EVENT: &str = r#"{"type":"system","subtype":"init","cwd":"/tmp
 
 /// `v3_rate_limit_event("rejected")` from `devflow-core/src/agent_result.rs`:
 /// the archived `allowed` event with only its top-level `status` replaced. Its
-/// `resetsAt` epoch parses into a cron schedule
-/// (`ship::hermes_schedule_from_retry_after`).
+/// `resetsAt` epoch is the reset time the no-fallback gate names.
 const CLAUDE_REJECTED_RATE_LIMIT_EVENT: &str = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1785645600,"rateLimitType":"five_hour","overageStatus":"rejected","overageDisabledReason":"out_of_credits","isUsingOverage":false},"uuid":"e73e6774-a79d-4cdf-90bd-53a695f44f5a","session_id":"559fef4d-2053-459e-b7a7-f3200c3b3790"}"#;
 
 /// A Claude stream `result` carrying the success marker.

@@ -25,11 +25,11 @@ use devflow_core::mode;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::prompt::FixType;
 use devflow_core::stage::Stage;
-use devflow_core::state::State;
+use devflow_core::state::{AgentKind, State};
 use devflow_core::{
     agent_result,
     agent_result::{AgentStatus, Verdict},
-    events, lock,
+    events, lock, reset_time,
 };
 use std::path::{Path, PathBuf};
 
@@ -83,15 +83,18 @@ pub(crate) fn retry_after_from_reason(reason: Option<&str>) -> String {
         .to_string()
 }
 
-/// Route a `RateLimited` outcome from the PRIMARY advance() monitor loop
-/// (D-09): writes a single-agent cron-instructions resume record (`devflow
-/// resume --phase N`) and returns without firing a blocking gate — unlike
-/// `sequentagent`'s existing rate-limit handling, this path never called the
-/// cron machinery before this plan (Pitfall 3). Shares the same
-/// `infra_failures` ceiling as [`handle_infra_outcome`] (D-08's intentional
-/// shared infra counter): once bumping would reach the ceiling, auto-resume
-/// stops and the outcome instead routes through the infra gate/abort path.
-/// Never touches `consecutive_failures`.
+/// Route a `RateLimited` outcome that no fallback can take (CUT-03, D-15,
+/// D-20): the run waits at the never-silent gate for `stage`, which shows in
+/// `gate list`/`gate show` and fires the notify command. Its context leads with
+/// the way on ([`rate_limit_gate_context`]). Answers route as for any failed
+/// stage ([`answer_stage_failure_gate`]): approve or a plain reject relaunches
+/// the stage, a reject whose note says abort ends the run.
+///
+/// Not an infra failure: `infra_failures` is untouched, so the infra ceiling
+/// cannot abort a run that is only waiting for quota. No cron-instructions file
+/// is written and no `rate_limit_resume_scheduled` event is emitted; nothing
+/// ever acted on either (999.186). The one automatic relaunch at the reset time
+/// is not part of this path yet.
 pub(crate) fn handle_rate_limited_outcome(
     project_root: &Path,
     state: &mut State,
@@ -99,59 +102,37 @@ pub(crate) fn handle_rate_limited_outcome(
     stage: Stage,
     reason: Option<String>,
 ) -> Result<(), CliError> {
-    let retry_after = retry_after_from_reason(reason.as_deref());
-    commit(state, |s| {
-        s.infra_failures = s.infra_failures.saturating_add(1)
-    })?;
-    if state.infra_failures >= mode::MAX_INFRA_FAILURES {
-        return gate_or_abort_infra(project_root, state, stage, reason);
-    }
+    let context = rate_limit_gate_context(state, phase, stage, reason);
+    answer_stage_failure_gate(project_root, state, stage, &context)
+}
 
-    let instructions =
-        devflow_core::ship::build_single_agent_cron_instructions(project_root, phase, &retry_after);
-    devflow_core::ship::write_cron_instructions(project_root, &instructions)?;
-    // CR-03: an unparseable retry hint (e.g. the `"usage limit"` fallback for
-    // a 429 with no retry_after) leaves the schedule empty — and it must stay
-    // empty, since an empty cron expression would degrade into an
-    // every-minute resume. That means auto-resume cannot happen, so returning
-    // here would exit the detached monitor with the phase stalled and no
-    // operator signal at all (the println below is read by nobody). Route
-    // through the same gate/notify path the infra ceiling uses so the phase is
-    // never silently stalled (WR-11/D-15). `infra_failures` is already bumped
-    // above, so `gate_or_abort_infra` — which never bumps — is the correct
-    // entry point.
-    if instructions.hermes_cron.schedule.is_empty() {
-        return gate_or_abort_infra(
-            project_root,
-            state,
-            stage,
-            Some(format!(
-                "rate limited with no parseable retry time ({retry_after}) — auto-resume cron not scheduled; resume manually"
-            )),
-        );
-    }
-    println!(
-        "rate limited — wrote {}",
-        devflow_core::ship::cron_instructions_path(project_root, phase)
-            .strip_prefix(project_root)
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| {
-                devflow_core::ship::cron_instructions_path(project_root, phase)
-                    .display()
-                    .to_string()
-            })
+/// The never-silent gate context for a rate limit no fallback can take. Way on
+/// first, because the notify hook and the banner show only the start: the
+/// resume command (with `--agent` when the run is not on the default agent),
+/// then the reset time when the denial carried one, then the cause.
+fn rate_limit_gate_context(
+    state: &State,
+    phase: PhaseId,
+    stage: Stage,
+    reason: Option<String>,
+) -> String {
+    let agent = if state.agent == AgentKind::Claude {
+        String::new()
+    } else {
+        format!(" --agent {}", state.agent)
+    };
+    let retry_after = retry_after_from_reason(reason.as_deref());
+    let reset = if reset_time::parse_reset_time(&retry_after).is_some() {
+        format!("the limit resets at {retry_after}")
+    } else {
+        "the denial carried no reset time".to_string()
+    };
+    let lead = format!(
+        "rate limited with no usable fallback; once this waiting supervisor has ended, \
+         `devflow resume --phase {phase}{agent}` relaunches the stage; {reset}; approving \
+         this gate relaunches it now, rejecting with \"abort\" ends the run. Cause: "
     );
-    events::emit(
-        project_root,
-        phase,
-        "rate_limit_resume_scheduled",
-        serde_json::json!({
-            "stage": stage.to_string(),
-            "retry_after": retry_after,
-            "infra_failures": state.infra_failures,
-        }),
-    );
-    Ok(())
+    stage_failure_context(stage, &lead, reason)
 }
 
 /// The three-way outcome of a Validate stage evaluation (18e, D-18e).
@@ -961,7 +942,19 @@ pub(crate) fn handle_stage_failure(
     reason: Option<String>,
 ) -> Result<(), CliError> {
     let context = failure_gate_context(state, stage, reason);
-    match run_gate(project_root, state, stage, &context)? {
+    answer_stage_failure_gate(project_root, state, stage, &context)
+}
+
+/// Fire the never-silent gate for a failed `stage` with `context` and act on
+/// its answer: approve or a plain reject relaunches the stage
+/// ([`relaunch_failed_stage`]), an abort answer ends the run.
+fn answer_stage_failure_gate(
+    project_root: &Path,
+    state: &mut State,
+    stage: Stage,
+    context: &str,
+) -> Result<(), CliError> {
+    match run_gate(project_root, state, stage, context)? {
         GateAction::Advance => {
             // CR-01: close the gate before retrying; its answer is spent.
             let _ = close_gate(project_root, state.phase, stage);
