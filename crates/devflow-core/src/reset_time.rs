@@ -199,12 +199,23 @@ mod tests {
         assert_eq!(parse_reset_time("1785645600"), Some(1_785_645_600));
         assert_eq!(parse_reset_time(" 1785645600 "), Some(1_785_645_600));
         assert_eq!(parse_reset_time("1785645600.2"), Some(1_785_645_601));
+        // A zero fraction names the whole second itself: no rounding.
+        assert_eq!(parse_reset_time("1785645600.000"), Some(1_785_645_600));
     }
 
     /// Text that names no instant is `None`, never a guessed time.
     #[test]
     fn an_empty_or_invalid_reset_is_none() {
-        for input in ["", "   ", "soon", "-5", "99999999999999999999"] {
+        for input in [
+            "",
+            "   ",
+            "soon",
+            "-5",
+            "99999999999999999999",
+            "1785645600.",
+            "1785645600.5x",
+            "1785645600.-1",
+        ] {
             assert_eq!(parse_reset_time(input), None, "input {input:?}");
         }
     }
@@ -277,10 +288,63 @@ mod tests {
         assert_eq!(parse_offset_minutes("+abcd"), None);
     }
 
+    /// Each RFC 3339 field outside its range is `None`, at both ends; the
+    /// largest valid value of every field (a leap second included) still
+    /// parses.
+    #[test]
+    fn an_out_of_range_rfc3339_field_is_none() {
+        assert!(parse_reset_time("2026-12-31T23:59:60Z").is_some());
+        for input in [
+            "2026-00-15T12:00:00Z",
+            "2026-13-15T12:00:00Z",
+            "2026-08-00T12:00:00Z",
+            "2026-08-32T12:00:00Z",
+            "2026-08-15T24:00:00Z",
+            "2026-08-15T12:60:00Z",
+            "2026-08-15T12:00:61Z",
+        ] {
+            assert_eq!(parse_reset_time(input), None, "input {input:?}");
+        }
+    }
+
+    /// A seconds field with a non-digit or empty fraction is `None`, not a
+    /// rounded-up guess.
+    #[test]
+    fn a_malformed_seconds_fraction_is_none() {
+        for input in ["2026-08-02T00:00:00.4xZ", "2026-08-02T00:00:00.Z"] {
+            assert_eq!(parse_reset_time(input), None, "input {input:?}");
+        }
+    }
+
+    /// `civil_from_days` names the right date at the century and 400-year
+    /// boundaries of the Gregorian leap rule (day numbers from Python's
+    /// `datetime.date`), where a round trip alone cannot catch a skew.
+    #[test]
+    fn civil_from_days_names_leap_rule_boundaries() {
+        for (days, date) in [
+            (-25_509, (1900, 2, 28)),
+            (-25_508, (1900, 3, 1)),
+            (11_016, (2000, 2, 29)),
+            (47_540, (2100, 2, 28)),
+            (47_541, (2100, 3, 1)),
+            (157_113, (2400, 2, 29)),
+            (157_114, (2400, 3, 1)),
+        ] {
+            assert_eq!(civil_from_days(days), date, "day {days}");
+            assert_eq!(
+                days_from_civil(date.0, date.1, date.2),
+                days,
+                "date {date:?}"
+            );
+        }
+    }
+
     /// The relocated civil-date helpers are inverses of each other.
     #[test]
     fn civil_from_days_round_trips_days_from_civil() {
-        for days in [-1, 0, 1, 19_000, 2_932_896] {
+        // 11_016 is 2000-02-29 and 19_754 is 2024-02-01: the January/February
+        // branch of the March-based year.
+        for days in [-1, 0, 1, 11_016, 19_000, 19_754, 2_932_896] {
             let (year, month, day) = civil_from_days(days);
             assert_eq!(days_from_civil(year, month, day), days, "day {days}");
         }
