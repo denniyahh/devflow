@@ -5,16 +5,16 @@ milestone_name: Session Continuity
 current_phase: 52
 current_phase_name: Subtract and Stabilize
 status: executing
-stopped_at: Completed 52-01-PLAN.md
-last_updated: "2026-11-10T18:28:25.460Z"
+stopped_at: Completed 52-02-PLAN.md
+last_updated: "2026-11-10T18:45:04.648Z"
 last_activity: 2026-11-10
 last_activity_desc: Phase 52 execution started
-state_head: 4b1bb7ce065ea9c121ff695a7e0b25402e1f248b
+state_head: f93d67beaed0940fdf5827ced0ccf3bca9bff2b8
 progress:
   total_phases: 4
   completed_phases: 0
   total_plans: 33
-  completed_plans: 1
+  completed_plans: 2
   percent: 0
 ---
 
@@ -159,7 +159,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 52 (Subtract and Stabilize) — EXECUTING
-Plan: 2 of 33
+Plan: 3 of 33
 Status: Ready to execute
 Last activity: 2026-11-10 — Phase 52 execution started
 
@@ -840,6 +840,7 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 51]: 51-11: the rate-limit failover is documented in a new OPERATIONS.md section (events, gate, 51-06 remedy, idle-timeout wording), pinned row-by-row by doc_check::operations_md_documents_the_fallback_agent_and_its_events
 - [Phase 51]: 51-11: the notify limit sentence (999.154) is reworded to WR-12's fixed behaviour — the gate reloads the state file when it opens
 - [Phase 52]: 52-01: reset_time::parse_reset_time refuses signed epoch seconds and malformed offsets (None, never a UTC guess); the minute round-up is the hermes caller's job, not the parser's
+- [Phase 52]: 52-02: list, reference and test are removed (clap rejects them); worktree::reference_path and worktree::add_detached leave devflow-core with them; removal commits use feat(52-02)!: so cut-release reads a major bump
 
 ## Roadmap Evolution
 
@@ -952,11 +953,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 51 P13 | 20 min | 3 tasks | 3 files |
 | Phase 51 P11 | 25 min | 2 tasks | 5 files |
 | Phase 52 P01 | 38 min | 2 tasks | 4 files |
+| Phase 52 P02 | 13 min | 3 tasks | 12 files |
 
 ## Session
 
-**Last session:** 2026-11-10T18:28:25.292Z
-**Stopped at:** Completed 52-01-PLAN.md
+**Last session:** 2026-11-10T18:45:04.513Z
+**Stopped at:** Completed 52-02-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
