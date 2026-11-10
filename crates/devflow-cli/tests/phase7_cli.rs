@@ -771,41 +771,6 @@ fn start_dry_run_without_until_has_no_stop_annotation() {
     );
 }
 
-#[test]
-fn status_prints_cron_hint_when_cron_instructions_exist() {
-    let home = common::HermeticHome::new();
-    let repo = tempfile::tempdir().unwrap();
-    let root = repo.path();
-    init_repo(root);
-    let instructions = devflow_core::ship::build_single_agent_cron_instructions(
-        root,
-        PhaseId::new(7),
-        "2026-06-18T15:45:30Z",
-    );
-    devflow_core::ship::write_cron_instructions(root, &instructions).unwrap();
-    let fake_bin = fake_bin_dir(&[]);
-
-    let output = run_devflow(&home, root, &fake_bin.path, &["status"]);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    // D-10 (44-03) replaced the old `--from-devflow <root>` invocation with a
-    // runnable `hermes cron create` command carrying an ISO-8601 UTC instant
-    // schedule. Build the expected line from `instructions`' own fields
-    // (the exact values the CLI reads back off disk) rather than
-    // hand-duplicating cron_hint_line's quoting logic here.
-    let expected = format!(
-        "Cron instruction pending (phase 7): hermes cron create \"{}\" {} --repeat 1 --name {} (rate-limit resets: {})",
-        instructions.hermes_cron.schedule,
-        devflow_core::ship::shell_quote(&instructions.hermes_cron.command),
-        instructions.hermes_cron.name,
-        instructions.retry_after,
-    );
-    assert!(
-        stdout.contains(&expected),
-        "stdout was:\n{stdout}\nexpected substring:\n{expected}"
-    );
-}
-
 /// `cleanup --force` removes a phase worktree once its run has ended.
 #[test]
 fn cleanup_worktree_cli_flow() {

@@ -406,8 +406,13 @@ impl Rig {
         devflow_core::workflow::load_state(&self.root, self.phase).expect("the run's state")
     }
 
+    /// Where 3.x wrote its rate-limit cron record. Nothing writes or reads it
+    /// now (D-01), so the name is a literal: the absence check below stays a
+    /// control that fails if a writer of that file comes back.
     fn cron_file(&self) -> PathBuf {
-        devflow_core::ship::cron_instructions_path(&self.root, self.phase)
+        self.root
+            .join(".devflow")
+            .join(format!("cron-instructions-{}.json", self.phase.padded()))
     }
 }
 
@@ -422,7 +427,7 @@ fn position(events: &[Value], name: &str, log: &str) -> usize {
 /// D-11 / criterion 1 at Code (R-2) for the pair auto mode admits: a Claude
 /// run rate-limited at Code continues under Antigravity in the same tree on
 /// the same branch, after Antigravity's own delivery canary (D-04), and the
-/// Code stage completes. Negative control: the cron arm never fires.
+/// Code stage completes. Negative control: no resume is scheduled.
 #[test]
 fn a_rate_limited_claude_run_in_auto_mode_hands_off_to_antigravity_and_completes_code() {
     let phase = PhaseId::new(5121);
@@ -504,10 +509,6 @@ fn a_rate_limited_claude_run_in_auto_mode_hands_off_to_antigravity_and_completes
         rig.events_named("rate_limit_resume_scheduled").is_empty(),
         "the handoff arm schedules no resume; events:\n{log}"
     );
-    assert!(
-        !rig.cron_file().exists(),
-        "the handoff arm writes no cron instructions"
-    );
 }
 
 /// D-04 (never silent) with R2-D1: when the fallback's own canary refuses the
@@ -558,11 +559,7 @@ fn a_handoff_to_antigravity_that_fails_its_canary_ends_at_a_gate() {
 
     assert!(
         rig.events_named("rate_limit_resume_scheduled").is_empty(),
-        "a refused relaunch never takes the cron arm (R2-D1); events:\n{log}"
-    );
-    assert!(
-        !rig.cron_file().exists(),
-        "a refused relaunch writes no cron instructions (R2-D1)"
+        "a refused relaunch schedules no resume (R2-D1); events:\n{log}"
     );
     assert!(
         !rig.events_named("workflow_finished")
