@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/devflow-core",
     "crates/devflow-cli",
+    "tools/release-preflight",
 ]
 
 [workspace.package]
