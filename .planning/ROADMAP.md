@@ -670,6 +670,23 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.220: `cut-release.sh` Cannot See a `BREAKING CHANGE` Footer (BACKLOG)
+
+**Found:** 2026-11-10, Phase 52 plan 52-05 executor, confirmed from source by the orchestrator. `scripts/cut-release.sh`
+reads commits with `git log --no-merges <anchor>..HEAD --format=%s` (L128, L179): subject lines only. Its major-bump
+test (L132) checks `'!' in <type prefix> or 'BREAKING CHANGE' in c`, so the second half can never match: a Conventional
+Commits `BREAKING CHANGE:` footer is in the body, which the script never reads.
+
+**The defect:** a breaking change marked only by a footer is released as a minor bump. Phase 52 is not affected in
+practice, because its range also holds `feat(52-02)!:` commits, which the `!` test catches. Plan 52-05's own breaking
+commit (`39f6edc`) carries the marker only in its footer.
+
+**Not established:** not run against a real range; read from source only.
+
+**Fix shape:** read `--format=%B` (or `%s%n%b` with a record separator) and match `^BREAKING[ -]CHANGE:` on body lines;
+add a test case of a footer-only breaking commit that must produce a major bump. Small: fold into the Phase 52 close-out
+or the next fix branch.
+
 ### Phase 999.219: `devflow resume` (and `start --no-worktree`) Commits GSD's First Chain-Flag Write as a "Killed Run" Leak Repair (BACKLOG)
 
 **Found:** 2026-11-10, Phase 52 plan check after the round-5 review (`52-plan-review-5`), from source; not
