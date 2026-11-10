@@ -92,6 +92,58 @@ mod tests {
         }
     }
 
+    /// 2026-08-02T00:00:00Z in epoch seconds, computed from the calendar
+    /// rather than written as a literal so the tests do not trust hand
+    /// arithmetic.
+    fn august_2_2026_midnight_utc() -> i64 {
+        const SECS_PER_DAY: i64 = 86_400;
+        days_from_civil(2026, 8, 2) * SECS_PER_DAY
+    }
+
+    /// The same instant written as epoch seconds, as RFC 3339 UTC, and with a
+    /// positive or negative offset reads to one value.
+    #[test]
+    fn epoch_and_rfc3339_name_the_same_instant() {
+        let instant = august_2_2026_midnight_utc();
+        assert_eq!(parse_reset_time(&instant.to_string()), Some(instant));
+        for input in [
+            "2026-08-02T00:00:00Z",
+            "2026-08-02T02:00:00+02:00",
+            "2026-08-01T19:00:00-05:00",
+        ] {
+            assert_eq!(parse_reset_time(input), Some(instant), "input {input:?}");
+        }
+    }
+
+    /// A fractional RFC 3339 second is rounded UP, never down to an instant
+    /// earlier than the one reported.
+    #[test]
+    fn a_fractional_rfc3339_second_is_never_rounded_earlier() {
+        assert_eq!(
+            parse_reset_time("2026-08-02T00:00:00.4Z"),
+            Some(august_2_2026_midnight_utc() + 1)
+        );
+    }
+
+    /// A present but malformed offset is `None`, never the UTC reading of the
+    /// clock time; a valid offset in the same shape still parses.
+    #[test]
+    fn a_malformed_offset_is_none() {
+        for input in [
+            "2026-08-02T00:00:00+99:00",
+            "2026-08-02T00:00:00+05:60",
+            "2026-08-02T00:00:00+5",
+            "2026-08-02T00:00:00+abcd",
+        ] {
+            assert_eq!(parse_reset_time(input), None, "input {input:?}");
+        }
+        assert_eq!(
+            parse_reset_time("2026-08-02T05:30:00+05:30"),
+            Some(august_2_2026_midnight_utc()),
+            "a valid offset must not be refused"
+        );
+    }
+
     /// The relocated civil-date helpers are inverses of each other.
     #[test]
     fn civil_from_days_round_trips_days_from_civil() {
