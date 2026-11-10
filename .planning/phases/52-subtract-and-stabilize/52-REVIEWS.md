@@ -435,3 +435,33 @@ not patch R1-R10 or T1-T11 one by one.
 - R10: the answer check runs before `Gates::claim`, the `gate_pending` write and `gate_resolved`, so a refused answer claims nothing.
 
 All other R and T findings concern cut machinery and are dispositioned as removed by D-45.
+
+## Round 4 review of the D-45 redesign (2026-11-10)
+
+Source: `52-plan-review-4/SUMMARY.md` (codex, agy, pi; host-verified). No lane found a `finished` path that bypasses
+`can_finish`. The operator chose to close U3 with **52-CONTEXT D-46** (a PASS counts only on a clean tree). The
+replan applies the confirmed rows below; the refuted and plausible rows need no plan change unless a row says so.
+
+### Required changes (each MUST be addressed)
+
+| # | Plans | Change |
+|---|-------|--------|
+| U1 | 52-29, 52-31 | A rejected Code stage-failure gate's note travels in `relaunch_note` like Plan and Validate; drop the "at Code … `code_fix_note`" carve-outs (52-29:35, 52-31:36); a pending quick-fix note Q survives a later stage-failure reject R. Tests: a Code row and a Q→failure→R row asserting both notes reach the relaunched prompt. |
+| U2 | 52-28, 52-27 | An agent PASS over GSD `gaps_found` counts one Validate failure (D-12), in both modes: 52-28:26/:102 cover `gaps_found`, `stale` and `missing`; remove 52-28:256's "counts only an agent FAIL". Tests: an agent-PASS-over-`gaps_found` row; 52-27's three-round test also runs with agent PASS. |
+| U3 | 52-29 | D-46: `read_evidence` sets `agent_pass_on_head` only when the head matches and `git status --porcelain` (including `.planning/`) is empty; the gate names the dirty paths. Replace the 52-29:369 limit line. Test: a dirty row in `can_finish_needs_passed_and_a_pass_on_the_current_head`, and a proptest dimension for a dirty tree. |
+| U4 | 52-22, 52-29 | A supervise Validate over `stale`/`missing` gets a verification kind (e.g. `reverify_needed`) in 52-22's enum and writer test and in 52-29's family list; one supervise-`stale` test (gate, then approve → re-verify). |
+| U5 | 52-29 | Add `approving_a_gaps_gate_runs_the_gap_loop` (52-27) to the dispositions, rewritten to fresh-read stubs or its control deleted. |
+| U6 | 52-27 | Test the "newer than the report" rule: an old gap plan that predates the report gates; a newer one proceeds. |
+| U7 | 52-31 (and 52-32 wording) | Name `transition` as the `relaunch_note` clear site; assert it is `None` after leaving the relaunched stage. |
+| U8 | 52-31, 52-32 | When the timer wake and the gate lifetime coincide (reset later than the gate timeout), the wake wins; add one dispatcher row with a reset later than the timeout. |
+| U9 | 52-32 | Replace "one claude invocation" (52-32:141) with exactly one `stage code` invocation and one Code `stage_launched` event. |
+| U10 | 52-33 | For the verification family, the approve text states the rule (re-read; finish only on `passed` with a Validate pass on this clean commit), not a row predicted at open time. |
+
+### Also apply (one line each)
+
+- codex C4 nit: drop "the persisted observation" from 52-29:277-279.
+- codex S1: one line in 52-29's Limits about a commit landing between the Validate agent's exit and the HEAD read.
+- pi C3: one line in 52-27 on how `no_gap_closure_plan` is answered before 52-29 lands.
+- pi S2: one OPERATIONS.md line that a gate approve follows the same column in both modes.
+
+Simplification proposals in the round-4 SUMMARY are optional; take one only if it shrinks a plan touched above.

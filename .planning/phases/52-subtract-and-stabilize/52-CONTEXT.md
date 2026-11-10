@@ -409,6 +409,18 @@ Source: the three open questions in `52-RESEARCH.md`, each checked against the c
      kind, mode) asserts that `workflow_finished` is reached only when `can_finish` holds. **Control:** forcing the
      routing function to finish on `passed` without an agent PASS on HEAD fails the property.
 
+- **D-46 (operator, 2026-11-10): a Validate PASS counts only on a clean tree** (amends D-45 rule 1 and rule 4).
+  `agent_pass_on_head` holds only when the recorded PASS head equals HEAD **and** `git status --porcelain` over the
+  evidence root is empty, `.planning/` included. A dirty tree is not an agent PASS on HEAD: the routing table then
+  takes its "no PASS on HEAD" column, and the gate names the dirty paths (never silent), so approve runs Validate
+  again. One git call inside `read_evidence`; no new state, no file tracking. Raised by the round-4 plan review
+  (52-plan-review-4, U3), which showed that an uncommitted edit during a gate wait could let approve finish over code no
+  Validate agent examined.
+  Amended 2026-11-10 by the operator (plan check, round 4): a Validate whose own outcome reads a dirty tree
+  records **no** PASS (`validate_pass_head` stays unset), so a later clean-up of the tree does not revive it and a
+  finish needs another Validate over the clean tree. The dirty read lists untracked files whatever the git config
+  says (`--untracked-files=all`).
+
 ### Claude's Discretion
 - How the note is framed inside the prompt: a delimited verbatim block, with control characters other than newline and
   tab stripped. It must stay byte-identical for printable text.
