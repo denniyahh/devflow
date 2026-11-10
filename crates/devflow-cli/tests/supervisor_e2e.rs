@@ -1721,3 +1721,98 @@ fn a_run_that_passes_validate_finishes_and_keeps_its_worktree() {
         "the finished phase is deregistered"
     );
 }
+
+/// The `workflow_finished` events of `rig`'s run, payload fields only.
+fn finished_payloads(rig: &FinishRig) -> Vec<serde_json::Value> {
+    rig.events()
+        .into_iter()
+        .filter(|event| event["event"] == "workflow_finished")
+        .map(|event| {
+            serde_json::Value::Object(
+                event
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .filter(|(key, _)| !["v", "ts", "phase", "event"].contains(&key.as_str()))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+/// The kept state file of `rig`'s run, read as JSON so an absent field fails
+/// instead of reading as a default.
+fn raw_state(rig: &FinishRig) -> serde_json::Value {
+    let state_file = devflow_core::workflow::state_path(&rig.root, rig.phase);
+    serde_json::from_str(
+        &fs::read_to_string(&state_file)
+            .unwrap_or_else(|err| panic!("the state file {} is kept: {err}", state_file.display())),
+    )
+    .expect("the kept state file parses")
+}
+
+/// The opposite case of the finish: `--until plan` halts with `stopped_at`,
+/// notifies exactly once after `workflow_finished`, and is not finished.
+#[test]
+fn an_until_halt_finishes_with_stopped_at_and_notifies_once() {
+    let phase = PhaseId::new(82);
+    let rig = FinishRig::new(phase);
+    let reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+
+    rig.start(&["--until", "plan"]);
+    rig.wait_for_end(&reaper);
+    let log = rig.events_text();
+
+    assert_eq!(
+        finished_payloads(&rig),
+        vec![serde_json::json!({"reason": "stopped_at", "stage": "plan"})],
+        "one --until halt; events:\n{log}"
+    );
+    assert_eq!(
+        rig.notify_lines().len(),
+        1,
+        "the halt notified exactly once: {:?}\nevents:\n{log}",
+        rig.notify_lines()
+    );
+    let finished = rig.positions("workflow_finished");
+    let notified = rig.positions("notify_fired");
+    assert_eq!(notified.len(), 1, "one notify_fired; events:\n{log}");
+    assert!(
+        notified[0] > finished[0],
+        "notify_fired follows workflow_finished; events:\n{log}"
+    );
+    assert_eq!(rig.events()[notified[0]]["reason"], "stopped_at", "{log}");
+    let raw = raw_state(&rig);
+    assert_eq!(raw["stopped"], true, "{raw}");
+    assert_eq!(raw["finished"], false, "a halt is not a finish: {raw}");
+}
+
+/// Validate is the last stage, so `--until validate` on a run whose Validate
+/// passes ends as finished, exactly like a run without `--until`: it never
+/// reports `stopped_at` for Validate. [`an_until_halt_finishes_with_stopped_at_and_notifies_once`]
+/// is its opposite case on the same harness.
+#[test]
+fn an_until_validate_run_that_passes_finishes_as_finished() {
+    let phase = PhaseId::new(83);
+    let rig = FinishRig::new(phase);
+    let reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+
+    rig.start(&["--until", "validate"]);
+    rig.wait_for_end(&reaper);
+    let log = rig.events_text();
+
+    assert_eq!(
+        finished_payloads(&rig),
+        vec![serde_json::json!({"reason": "finished", "shipped": false})],
+        "one finish and no stopped_at; events:\n{log}"
+    );
+    assert_eq!(
+        rig.notify_lines().len(),
+        1,
+        "notify fired exactly once: {:?}\nevents:\n{log}",
+        rig.notify_lines()
+    );
+    let raw = raw_state(&rig);
+    assert_eq!(raw["finished"], true, "{raw}");
+}
