@@ -218,9 +218,10 @@ pub(crate) fn ensure_base_is_a_local_branch(
 /// **The two events that DO reset the total**, neither of which is "a new
 /// process started":
 ///
-/// 1. **Phase completion** — `finish_workflow_with_gate_timeout` calls
-///    `workflow::clear_state`, deleting `.devflow/state-{NN}.json`, so the
-///    next start for this phase finds nothing to carry. No code here.
+/// 1. **State removal** — `workflow::clear_state` deletes
+///    `.devflow/state-{NN}.json` (an abort does), so the next start for this
+///    phase finds nothing to carry. No code here. A finished run keeps its
+///    state.
 /// 2. **Operator approval at the ceiling gate** — `handle_validate_outcome`
 ///    zeroes the total when a human advances or loops back AND
 ///    `mode::phase_failure_ceiling_reached` is true.
@@ -1826,15 +1827,15 @@ pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
 /// here so the next person reading this code does not re-derive and
 /// re-attempt them:**
 ///
-/// 1. **Pre-gate merge check.** `hooks_after_ship` (`hooks.rs:105-112`) only
-///    runs from `finish_workflow_with_gate_timeout`, itself only reached from
+/// 1. **Pre-gate merge check.** The after-ship hooks (removed in 52-12) only
+///    ran from the finalization path, itself only reached from
 ///    `handle_ship_outcome`'s `GateAction::Advance` arm — i.e. AFTER the Ship
 ///    gate has already been approved. A check for a merge/tag/push placed
 ///    before gate approval would fail for every legitimate Ship; RESEARCH.md's
 ///    Question C / Pattern 3 recommendation to place it there was verified
 ///    wrong against live source.
-/// 2. **Post-batch ancestry check.** `BranchCleanup` runs immediately after
-///    `Merge` in that same `hooks_after_ship` batch and deletes the feature
+/// 2. **Post-batch ancestry check.** The branch cleanup ran immediately after
+///    the merge in that same after-ship batch and deleted the feature
 ///    branch. `GitFlow::is_merged_into_develop` fails closed on an absent
 ///    branch (`git.rs:89-97`: "an absent branch is not proof of a merge"), so
 ///    an ancestry check run after the batch completes returns `false` for
@@ -8826,8 +8827,8 @@ mod tests {
         assert_eq!(fresh.stop_until, None);
     }
 
-    /// A-11 reset event ONE: phase completion. `finish_workflow` calls
-    /// `workflow::clear_state`, which deletes the phase's state file — so the
+    /// A-11 reset event ONE: state removal. `workflow::clear_state` (an abort
+    /// calls it) deletes the phase's state file — so the
     /// next start for that phase finds nothing to carry and begins at zero.
     ///
     /// Written as clear-then-construct rather than never-write-at-all, so it is
@@ -8851,7 +8852,7 @@ mod tests {
              assertion below proves nothing about completion"
         );
 
-        // What `finish_workflow_with_gate_timeout` does on genuine completion.
+        // What an abort does to the state file.
         workflow::clear_state(root, phase).unwrap();
 
         assert_eq!(

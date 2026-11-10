@@ -1,5 +1,5 @@
 //! Pipeline seam B (D-06): deciding what happens after a stage produces a
-//! result — the `handle_*_outcome` family, checkout-hook execution, and the
+//! result — the `handle_*_outcome` family and the
 //! gate-context rendering helpers they share. Extracted mechanically
 //! (19-08, D-09 pure move) out of `main.rs` — every function below is
 //! byte-identical to its pre-move body modulo an added `pub(crate)` and
@@ -9,18 +9,16 @@
 //! cycle (19-RESEARCH.md Pattern 1):** it is called by
 //! [`crate::pipeline_launch::advance`] once an agent result has been
 //! classified, and it calls onward into [`crate::pipeline_gate`]'s
-//! `transition`, `loop_back_to_code`, `finish_workflow`, and `abort` to
+//! `transition`, `loop_back_to_code`, `finish_run`, and `abort` to
 //! actually move the state machine.
 
 use crate::CliError;
-use crate::config_parse::{checkout_lock_timeout, gate_timeout_secs};
+use crate::config_parse::gate_timeout_secs;
 use crate::pipeline_gate::{
-    LoopBackReason, abort, finish_run, finish_workflow, loop_back_to_code, run_gate,
-    run_gate_with_timeout,
+    LoopBackReason, abort, finish_run, loop_back_to_code, run_gate, run_gate_with_timeout,
 };
 use crate::pipeline_launch::{close_gate, commit, launch_stage, recorded_canary_refusal};
 use devflow_core::gates::{GateAction, GateResponse};
-use devflow_core::hooks::{self, HookContext};
 use devflow_core::mode;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::prompt::FixType;
@@ -29,7 +27,7 @@ use devflow_core::state::{AgentKind, State};
 use devflow_core::{
     agent_result,
     agent_result::{AgentStatus, Verdict},
-    events, lock, reset_time,
+    events, reset_time,
 };
 use std::path::{Path, PathBuf};
 
@@ -293,12 +291,10 @@ pub(crate) enum ValidateResult {
 /// in-flight duration (there is no merge-back, so this is the steady state,
 /// not a race). Callers resolve it from `state.worktree_path`, falling back
 /// to the project root — the same plain fallback idiom used at
-/// `staleness.rs:330`, `preflight.rs:733` and `agent_result.rs:2041`, and
-/// deliberately NOT `hook_context_root`'s `.exists()`-filtered variant below,
-/// which answers a different question (where to WRITE, so a vanished worktree
-/// must degrade to somewhere writable; here a vanished worktree means the
-/// evidence is gone with it, and falling back would resurrect a stale or
-/// other-branch artifact as this phase's). `--no-worktree` runs fall back to
+/// `staleness.rs:330`, `preflight.rs:733` and `agent_result.rs:2041`, with no
+/// `.exists()` filter: a vanished worktree means the evidence is gone with it,
+/// and falling back would resurrect a stale or other-branch artifact as this
+/// phase's. `--no-worktree` runs fall back to
 /// the project root and are unaffected. Passing the bare `project_root` here in worktree mode
 /// makes the predicate read `false` unconditionally, which is exactly the
 /// defect this parameter's name now guards against.
@@ -833,11 +829,12 @@ fn loop_back_reason(baseline_absent: bool) -> LoopBackReason {
 /// **The only site in the crate permitted to pass a non-`None` auto-response
 /// to `run_gate_with_timeout`.** This is the routine Ship approval — D-04's
 /// pre-authorization exists to answer exactly this gate. It must never be
-/// generalized into `run_gate_with_timeout`'s own body: the reopened
-/// finalization-retry gate in `finish_workflow_with_gate_timeout` is a
-/// *different call*, deliberately passing `None`, because auto-approving
-/// "the merge could not be completed" would retry a failing finalization
-/// forever with no human ever seeing it.
+/// generalized into `run_gate_with_timeout`'s own body.
+///
+/// An approval ends the run as a passing Validate does ([`finish_run`]): no
+/// stage follows Ship, and the after-ship hooks that merged, bumped, tagged
+/// and deleted the branch are gone (CUT-02, D-01, D-23). Only a state written
+/// by an older binary still reaches this gate.
 pub(crate) fn handle_ship_outcome(project_root: &Path, state: &mut State) -> Result<(), CliError> {
     let auto_response = state.yes_ship.then(|| GateResponse {
         approved: true,
@@ -852,7 +849,10 @@ pub(crate) fn handle_ship_outcome(project_root: &Path, state: &mut State) -> Res
         gate_timeout_secs(),
         auto_response.as_ref(),
     )? {
-        GateAction::Advance => finish_workflow(project_root, state),
+        GateAction::Advance => {
+            let _ = close_gate(project_root, state.phase, Stage::Ship);
+            finish_run(project_root, state)
+        }
         GateAction::LoopBack(_) => loop_back_to_code(
             project_root,
             state,
@@ -1054,185 +1054,6 @@ pub(crate) fn is_ship_review_failure(reason: &Option<String>) -> bool {
         .unwrap_or(false)
 }
 
-/// Run a batch of hooks against the primary checkout, serialized across
-/// phases by the coarse project lock (13-DEFERRED-CR-03 fix shape #3): the
-/// hooks commit/tag/delete branches in the shared main checkout, and two
-/// phases doing that concurrently race git's `index.lock`/`HEAD`. Held for
-/// seconds — never across a gate wait. Hook failures stay fail-soft (warn
-/// and continue), as before.
-///
-/// 14-CR-02: a lock timeout SKIPS the batch instead of running it
-/// unserialized — mutating the shared checkout concurrently is the exact
-/// race this lock exists to prevent, and the hooks are individually
-/// fail-soft for ordinary transitions. The return value lets terminal
-/// completion fail closed and preserve state when the batch was skipped or
-/// a required hook failed.
-/// Which tree a hook batch operates on.
-///
-/// The Validate→Ship transition batch (`DocsUpdate`) authors material *about
-/// the branch being shipped*, so it must write into that phase's worktree —
-/// otherwise its output is stranded on the base branch, uncommitted and
-/// divorced from the commits it describes (found live: Phase 17's changelog
-/// entry landed on `develop` while every one of its commits sat on
-/// `feature/phase-17`).
-///
-/// The terminal batch (`Merge`, `VersionBump`, `ChangelogAppend`,
-/// `BranchCleanup`) is the exact opposite: it merges the feature branch INTO
-/// the base branch, tags the base branch, and deletes the feature branch.
-/// Those are primary-checkout operations and retargeting them at the
-/// worktree would be a correctness regression. `ChangelogAppend` moved here
-/// in 17-12 (WR-04) — a release record naming a version only becomes true
-/// once `VersionBump` has tagged it, so the changelog entry belongs on the
-/// base branch alongside the tag, not in the worktree. Do not restore
-/// 17-10's worktree targeting to this hook.
-///
-/// Falls back to `project_root` whenever no worktree is configured, so
-/// `--no-worktree` runs are unaffected.
-pub(crate) fn hook_context_root(
-    project_root: &Path,
-    state: &State,
-    terminal_batch: bool,
-) -> PathBuf {
-    if terminal_batch {
-        return project_root.to_path_buf();
-    }
-    state
-        .worktree_path
-        .as_ref()
-        .filter(|path| path.exists())
-        .map(|path| path.to_path_buf())
-        .unwrap_or_else(|| project_root.to_path_buf())
-}
-
-pub(crate) fn run_checkout_hooks(
-    project_root: &Path,
-    state: &State,
-    batch: &[hooks::Hook],
-    stage: Stage,
-) -> bool {
-    run_checkout_hooks_from(
-        project_root,
-        state,
-        batch,
-        stage,
-        &mut BatchProgress::default(),
-    )
-}
-
-/// How far a batch got, kept in memory across the retry passes of one finalization: the
-/// hooks that succeeded, and what `VersionBump` handed forward. A retry that reran them
-/// would cut a second release. `Merge` always reruns: it detects an up-to-date branch, and
-/// a repair committed for the retry must land. A repair merged after the tag is cut is not
-/// in the tagged commit. A retry in a later process starts over.
-#[derive(Debug, Default)]
-pub(crate) struct BatchProgress {
-    completed: usize,
-    shipped_version: Option<String>,
-    shipped_changelog_body: Option<String>,
-}
-
-/// [`run_checkout_hooks`], skipping the hooks `progress` has done and recording those it
-/// finishes.
-pub(crate) fn run_checkout_hooks_from(
-    project_root: &Path,
-    state: &State,
-    batch: &[hooks::Hook],
-    stage: Stage,
-    progress: &mut BatchProgress,
-) -> bool {
-    if batch.is_empty() {
-        return true;
-    }
-    let _checkout_lock = match lock::acquire_project_blocking(project_root, checkout_lock_timeout())
-    {
-        Ok(guard) => guard,
-        Err(err) => {
-            println!(
-                "warning: could not acquire the checkout lock ({err}) — \
-                 SKIPPING hooks {batch:?} rather than mutating the checkout \
-                 unserialized. Re-run them once the holder finishes."
-            );
-            events::emit(
-                project_root,
-                state.phase,
-                "checkout_lock_timeout",
-                serde_json::json!({ "stage": stage.to_string(), "error": err.to_string() }),
-            );
-            for hook in batch {
-                events::emit(
-                    project_root,
-                    state.phase,
-                    "hook_run",
-                    serde_json::json!({
-                        "hook": format!("{hook:?}"),
-                        "ok": false,
-                        "skipped": "checkout lock timeout",
-                    }),
-                );
-            }
-            return false;
-        }
-    };
-    // The single production `HookContext` construction, and therefore the one
-    // point where the project-resolved branch model reaches every checkout
-    // hook (45-01 Task 3). Defaulted here, every hook silently re-defaulted
-    // the trunk regardless of what `start` forked from.
-    //
-    // CR-02: prefer the base THIS RUN persisted at `start` over re-resolving
-    // from ambient configuration — the merge below runs in a different
-    // process from the one that read `DEVFLOW_BASE_BRANCH`.
-    let git_flow =
-        devflow_core::config::git_flow_for_run(project_root, state.base_branch.as_deref());
-    let mut all_succeeded = true;
-    let terminal_batch = batch == hooks::hooks_after_ship().as_slice();
-    let hook_root = hook_context_root(project_root, state, terminal_batch);
-    // Hoisted out of the loop (GAP-7): these fields are loop-invariant, and
-    // VersionBump needs to hand shipped_version forward to ChangelogAppend
-    // within the same batch run, which a fresh per-iteration context would
-    // discard.
-    let mut ctx = HookContext {
-        phase: state.phase,
-        project_root: hook_root.clone(),
-        stage,
-        git_flow: git_flow.clone(),
-        shipped_version: progress.shipped_version.clone(),
-        shipped_changelog_body: progress.shipped_changelog_body.clone(),
-    };
-    for (index, hook) in batch.iter().enumerate() {
-        if index < progress.completed && *hook != hooks::Hook::Merge {
-            continue;
-        }
-        let outcome = hook.run(&mut ctx);
-        if let Err(ref err) = outcome {
-            println!("warning: hook {hook:?} failed: {err}");
-            all_succeeded = false;
-        }
-        if all_succeeded {
-            progress.completed = progress.completed.max(index + 1);
-        }
-        progress.shipped_version.clone_from(&ctx.shipped_version);
-        progress
-            .shipped_changelog_body
-            .clone_from(&ctx.shipped_changelog_body);
-        events::emit(
-            project_root,
-            state.phase,
-            "hook_run",
-            serde_json::json!({
-                "hook": format!("{hook:?}"),
-                "ok": outcome.is_ok(),
-            }),
-        );
-        // Terminal finalization is ordered and fail-fast. In particular, a
-        // failed version/tag operation must not delete the feature branch and
-        // destroy the evidence needed for a safe retry.
-        if terminal_batch && outcome.is_err() {
-            break;
-        }
-    }
-    all_succeeded
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1243,261 +1064,11 @@ mod tests {
     use crate::pipeline_launch::advance;
     use crate::test_support::*;
     use devflow_core::config::GitFlowConfig;
-    use devflow_core::git::GitFlow;
     use devflow_core::mode::Mode;
     use devflow_core::prompt;
     use devflow_core::state::AgentKind;
     use devflow_core::test_support::{answer_open_gate, gate_answer_files, preanswer_gate};
     use devflow_core::workflow;
-
-    /// 14-CR-02: when the checkout lock cannot be acquired, the hook batch
-    /// must be SKIPPED — never run unserialized against the shared checkout
-    /// — and the skip must be recorded in events.jsonl. `ChangelogAppend`
-    /// would observably create `CHANGELOG.md` if the batch ran; it moved
-    /// from the Validate→Ship batch into `hooks_after_ship()` in 17-12
-    /// (WR-04), so this test now drives that batch instead — none of its
-    /// hooks execute here regardless (the lock check short-circuits before
-    /// the first hook runs), so no real merge/version state is needed.
-    /// Env-mutating, so serialized under ENV_MUTEX; the "0" timeout only
-    /// affects a concurrent test if it is actually contended, which none are
-    /// (no other test holds the project lock).
-    #[test]
-    // D-09 (48-09): mutates `DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS` process-wide.
-    // Deferred deliberately, not overlooked: THIS process reads the value, so
-    // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
-    // race and the value is restored on every exit path, unwinding included.
-    #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
-    fn checkout_hooks_skip_instead_of_running_unserialized_on_lock_timeout() {
-        let _guard = env_lock();
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        // A live holder (this process) keeps the lock contended; the stale-
-        // holder reclaim cannot fire.
-        let _held = lock::acquire_project(root).expect("hold checkout lock");
-        unsafe {
-            std::env::set_var("DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS", "0");
-        }
-
-        let state = State::new(
-            PhaseId::new(33),
-            AgentKind::Claude,
-            Mode::Auto,
-            root.to_path_buf(),
-        );
-        run_checkout_hooks(root, &state, &hooks::hooks_after_ship(), Stage::Ship);
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            std::env::remove_var("DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS");
-        }
-
-        assert!(
-            !root.join("CHANGELOG.md").exists(),
-            "hooks must not run while the checkout lock is held elsewhere"
-        );
-        let last = devflow_core::events::last_event_for_phase(root, PhaseId::new(33))
-            .expect("skip must be recorded in events.jsonl");
-        assert_eq!(last["event"], "hook_run");
-        assert_eq!(last["ok"], false);
-        assert_eq!(last["skipped"], "checkout lock timeout");
-    }
-
-    #[test]
-    fn terminal_hook_failure_stops_before_branch_cleanup() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        init_repo(root);
-        let phase = PhaseId::new(34);
-        let branch = "feature/phase-34";
-        let git = |args: &[&str]| {
-            let output = devflow_core::test_support::git_command(root)
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(output.status.success(), "git {args:?} failed");
-        };
-        git(&["branch", branch, "develop"]);
-        // Force VersionBump to fail after Merge succeeds.
-        std::fs::remove_file(root.join("Cargo.toml")).unwrap();
-        std::fs::create_dir(root.join("Cargo.toml")).unwrap();
-
-        let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        let succeeded = run_checkout_hooks(root, &state, &hooks::hooks_after_ship(), Stage::Ship);
-
-        assert!(!succeeded);
-        assert!(
-            GitFlow::new(root).branch_exists(branch),
-            "a failed terminal batch must preserve the branch for retry"
-        );
-    }
-
-    /// GAP-8 (17-VALIDATION.md): GAP-7 fixed `HookContext.shipped_version`
-    /// forwarding `hooks_after_ship`'s `VersionBump` tag to `ChangelogAppend`
-    /// within the same batch — but only the `devflow-core::hooks` unit tests
-    /// exercised it directly by hand-rolling their own context and looping
-    /// over `hooks_after_ship()`. `run_checkout_hooks` is the ONLY production
-    /// caller of that batch, and it must construct the `HookContext` once,
-    /// above the hook loop, for the forwarding to survive into production.
-    /// This test drives `run_checkout_hooks` itself (not a hand-rolled loop)
-    /// against a repo with no version file, and asserts the changelog
-    /// heading names the actual tagged version rather than falling back to
-    /// the "unreleased" literal.
-    #[test]
-    fn run_checkout_hooks_keeps_changelog_in_sync_with_tag_when_no_version_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        init_repo_no_version_file(root);
-
-        let phase = PhaseId::new(47);
-        let branch = format!("feature/phase-{padded}", padded = phase.padded());
-        let git = |args: &[&str]| {
-            let output = devflow_core::test_support::git_command(root)
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(output.status.success(), "git {args:?} failed");
-        };
-        git(&["branch", &branch, "develop"]);
-        std::fs::write(root.join(".gitignore"), ".devflow/\n").unwrap();
-        git(&["checkout", &branch]);
-        std::fs::write(root.join("feature.txt"), "phase work\n").unwrap();
-        git(&["add", "."]);
-        git(&["commit", "-q", "-m", "phase work"]);
-        git(&["checkout", "develop"]);
-
-        let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        let succeeded = run_checkout_hooks(root, &state, &hooks::hooks_after_ship(), Stage::Ship);
-        assert!(
-            succeeded,
-            "after-ship batch must succeed against a clean repo"
-        );
-
-        let all_tags = devflow_core::test_support::git_command(root)
-            .arg("tag")
-            .output()
-            .unwrap();
-        let all_tags = String::from_utf8_lossy(&all_tags.stdout);
-        assert_eq!(all_tags.lines().count(), 1, "expected exactly one tag");
-        let tag = all_tags.trim().to_string();
-        let tag_version = tag
-            .strip_prefix('v')
-            .expect("tag should be prefixed with v")
-            .to_string();
-
-        let changelog = std::fs::read_to_string(root.join("CHANGELOG.md")).unwrap();
-        let changelog_version = changelog
-            .lines()
-            .find(|l| l.starts_with("## "))
-            .and_then(|l| l.trim_start_matches("## ").split(' ').next())
-            .unwrap()
-            .to_string();
-
-        assert_ne!(
-            changelog_version, "unreleased",
-            "changelog heading must name the tagged version, not fall back to the literal"
-        );
-        assert_eq!(
-            changelog_version, tag_version,
-            "changelog heading must match the git tag ({tag}) produced by the same \
-             run_checkout_hooks call, even with no version file"
-        );
-    }
-
-    /// CR-02 (45-REVIEW.md): the merge target must come from the base this
-    /// run PERSISTED at `start`, not from whatever the CURRENT process's
-    /// environment resolves. `DEVFLOW_BASE_BRANCH` lives in the shell that
-    /// ran `start`; the documented recovery path (`devflow resume` after a
-    /// monitor death) runs in a different process, and re-resolving there
-    /// merged the phase branch into `develop` while `is_merged_into_develop`
-    /// confirmed success against that same wrong branch.
-    ///
-    /// Neither fixture sets `DEVFLOW_BASE_BRANCH` or writes a `devflow.toml`
-    /// — ambient configuration resolves to `develop` in both halves, so the
-    /// only thing that differs is `State::base_branch`.
-    #[test]
-    fn checkout_hooks_merge_into_the_persisted_base_not_the_ambient_default() {
-        // This test shells out to `git`. Sibling fixtures now supply an empty
-        // PATH only on their child `Command`, so this parent cannot observe a
-        // concurrent PATH change. The retained shared lock follows the
-        // one-mutex-per-variable rule while other process-global mutations are
-        // still deferred.
-        let _env = crate::test_support::env_lock();
-
-        // Returns the branch the phase work actually landed on.
-        let merged_into = |persisted_base: Option<&str>| -> Vec<String> {
-            let dir = tempfile::tempdir().unwrap();
-            let root = dir.path();
-            init_repo_no_version_file(root);
-
-            let phase = PhaseId::new(48);
-            let branch = format!("feature/phase-{padded}", padded = phase.padded());
-            let git = |args: &[&str]| {
-                let output = devflow_core::test_support::git_command(root)
-                    .args(args)
-                    .output()
-                    .unwrap();
-                assert!(output.status.success(), "git {args:?} failed");
-            };
-
-            // The shape `start` would have produced: a planning branch off
-            // develop, with the phase branch forked from IT.
-            git(&["branch", "workspace/example", "develop"]);
-            git(&["branch", &branch, "workspace/example"]);
-            std::fs::write(root.join(".gitignore"), ".devflow/\n").unwrap();
-            git(&["checkout", &branch]);
-            std::fs::write(root.join("feature.txt"), "phase work\n").unwrap();
-            git(&["add", "."]);
-            git(&["commit", "-q", "-m", "phase work"]);
-
-            // Identify the phase work by COMMIT, not by branch name: the
-            // after-ship batch ends in `BranchCleanup`, which deletes the
-            // merged feature branch, so a branch-name probe reports "merged
-            // nowhere" for both halves and silently measures nothing.
-            // Resolve the branch by name rather than HEAD — HEAD moves with
-            // the checkout below and would capture develop's tip, making the
-            // ancestry check below trivially true for BOTH trunks.
-            let work = devflow_core::test_support::git_command(root)
-                .args(["rev-parse", &branch])
-                .output()
-                .unwrap();
-            let work = String::from_utf8_lossy(&work.stdout).trim().to_string();
-            git(&["checkout", "develop"]);
-
-            let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-            state.base_branch = persisted_base.map(str::to_string);
-            run_checkout_hooks(root, &state, &hooks::hooks_after_ship(), Stage::Ship);
-
-            // Which trunks now contain the phase work commit?
-            ["workspace/example", "develop"]
-                .into_iter()
-                .filter(|trunk| {
-                    devflow_core::test_support::git_command(root)
-                        .args(["merge-base", "--is-ancestor", &work, trunk])
-                        .status()
-                        .unwrap()
-                        .success()
-                })
-                .map(str::to_string)
-                .collect()
-        };
-
-        assert_eq!(
-            merged_into(Some("workspace/example")),
-            vec!["workspace/example".to_string()],
-            "a run that persisted `workspace/example` must merge there and NOT into develop"
-        );
-
-        // NEGATIVE CONTROL: same fixture, same ambient config, nothing
-        // persisted — the pre-existing resolver path must still target
-        // `develop`. Without this half the test passes against an
-        // implementation that hardcoded `workspace/example`, and against one
-        // that merged into every branch it could find.
-        assert_eq!(
-            merged_into(None),
-            vec!["develop".to_string()],
-            "with nothing persisted the resolver fallback must still target develop"
-        );
-    }
 
     /// Reaching `MAX_CONSECUTIVE_FAILURES` on a failed Validate must force a
     /// gate (even in Auto mode, which otherwise auto-loops), and an `abort`
@@ -5261,53 +4832,6 @@ mod tests {
         );
     }
 
-    /// The Validate→Ship content hook (`DocsUpdate`) authors material about
-    /// the branch being shipped, so it must run in that phase's worktree;
-    /// the terminal batch merges/tags/deletes against the primary checkout
-    /// and must NOT be retargeted. `ChangelogAppend` moved into the terminal
-    /// batch in 17-12 (WR-04) for exactly this reason — it now targets
-    /// `project_root`, not the worktree.
-    ///
-    /// Found live: `ChangelogAppend` wrote Phase 17's release note into
-    /// `develop`'s CHANGELOG.md while all of its commits sat on
-    /// `feature/phase-17`, stranding the entry on the wrong branch.
-    #[test]
-    fn content_hooks_target_the_worktree_while_terminal_hooks_stay_on_project_root() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let worktree = root.join(".worktrees/phase-70");
-        std::fs::create_dir_all(&worktree).unwrap();
-
-        let mut state = State::new(
-            PhaseId::new(70),
-            AgentKind::Claude,
-            Mode::Auto,
-            root.to_path_buf(),
-        );
-        state.worktree_path = Some(worktree.clone());
-
-        assert_eq!(
-            hook_context_root(root, &state, false),
-            worktree,
-            "content hooks must write into the phase's worktree"
-        );
-        assert_eq!(
-            hook_context_root(root, &state, true),
-            root.to_path_buf(),
-            "terminal hooks merge/tag/delete against the primary checkout"
-        );
-
-        // --no-worktree runs, and a worktree recorded but already removed,
-        // both fall back to the project root rather than writing nowhere.
-        let mut no_worktree = state.clone();
-        no_worktree.worktree_path = None;
-        assert_eq!(hook_context_root(root, &no_worktree, false), root);
-
-        let mut missing = state.clone();
-        missing.worktree_path = Some(root.join(".worktrees/gone"));
-        assert_eq!(hook_context_root(root, &missing, false), root);
-    }
-
     /// 13-06 dogfood regression: a multi-KB parser-derived reason reached
     /// the operator's desktop notification verbatim. Gate contexts must cap
     /// the reason to a readable headline.
@@ -5520,7 +5044,7 @@ mod tests {
 
         assert_eq!(state.stage, Stage::Code);
         assert!(!Gates::gate_path(root, phase, Stage::Ship).exists());
-        // Not finished — finish_workflow would have cleared state entirely.
+        // The run continues at Code, so its state is kept.
         assert!(workflow::load_state(root, phase).is_ok());
     }
 
@@ -5612,20 +5136,16 @@ mod tests {
 
         handle_ship_outcome(root, &mut state).unwrap();
 
-        // The workflow completed unattended — no human ever wrote a response.
+        // The run finished unattended — no human ever wrote a response.
         assert!(
-            matches!(
-                workflow::load_state(root, phase),
-                Err(workflow::WorkflowError::MissingState(_))
-            ),
-            "the pre-authorized gate must let the run reach a completed Ship without a human"
+            workflow::load_state(root, phase).is_ok_and(|kept| kept.finished),
+            "the pre-authorized gate must let the run finish without a human"
         );
         assert!(!Gates::gate_path(root, phase, Stage::Ship).exists());
         assert!(gate_answer_files(root, phase, Stage::Ship).is_empty());
         assert!(gate_claim_files(root, phase, Stage::Ship).is_empty());
 
-        // Exactly one gate_fired for this phase+stage — the retry-gate reopen
-        // path (a second gate_fired) must never have run.
+        // Exactly one gate_fired for this phase+stage — nothing reopened it.
         let contents =
             std::fs::read_to_string(devflow_core::events::events_path(root)).unwrap_or_default();
         let gate_fired_count = contents

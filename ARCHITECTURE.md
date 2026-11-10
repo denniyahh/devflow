@@ -3,8 +3,8 @@
 DevFlow is an opinionated CLI that drives a fixed 5-stage pipeline
 (Define → Plan → Code → Validate → Ship) end-to-end: it launches a coding
 agent per stage, evaluates whether the agent succeeded, fires human gates at
-Validate/Ship, and runs side-effecting hooks (branch/docs/changelog/version)
-at the mapped transitions. This document describes the implementation as it
+Validate/Ship, and ends the run when Validate passes, leaving the worktree and
+branch as Validate left them. This document describes the implementation as it
 actually exists; treat the named source files as the source of truth if this
 drifts.
 
@@ -14,7 +14,7 @@ DevFlow is a two-crate Cargo workspace (`Cargo.toml`):
 
 | Crate | Kind | Responsibility |
 |---|---|---|
-| `devflow-core` | Library (`crates/devflow-core`) | Stage machine, per-phase state, hooks, locking, events log, gate protocol, versioning, agent adapters, monitor daemon, worktrees, recovery. Returns structured data; no terminal formatting. |
+| `devflow-core` | Library (`crates/devflow-core`) | Stage machine, per-phase state, locking, events log, gate protocol, versioning, agent adapters, monitor daemon, worktrees, recovery. Returns structured data; no terminal formatting. |
 | `devflow-cli` | Binary (`crates/devflow-cli`) | Clap command parser and the user-facing `devflow` binary. Owns all printing and orchestration (`advance`, `transition`, `run_gate`); delegates primitives to `devflow-core`. |
 
 The split keeps workflow logic testable and independent of both the CLI surface
@@ -51,38 +51,6 @@ Define → Plan → Code → Validate → Ship
   `handle_ship_outcome()` for the two gate stages, or
   `handle_stage_failure()` for a never-silent failure gate (WR-11 — any
   non-Validate stage failure fires a gate rather than halting silently).
-
-## Hooks
-
-Creating/cleaning up branches, updating docs, appending the changelog, and
-bumping the version are **not** stages — they are side-effecting *hooks*
-that fire at specific stage transitions
-(`crates/devflow-core/src/hooks.rs`, `enum Hook`):
-
-| Hook | Effect |
-|---|---|
-| `BranchCreate` | Create `feature/phase-NN` from `develop` (`GitFlow::feature_start`) |
-| `BranchCleanup` | Delete the merged feature branch after Ship (non-force — never discards unmerged work) |
-| `DocsUpdate` | Run `cargo doc --no-deps` and commit any doc changes |
-| `ChangelogAppend` | Prepend a `CHANGELOG.md` entry for the computed version |
-| `VersionBump` | Compute the next version, write it to the version file, and tag `v{version}` |
-
-`hooks_for_transition(from, to)` maps a stage move to the hooks that should
-run; today the only non-empty mapping is `Validate → Ship`, which runs
-`DocsUpdate` + `ChangelogAppend` (docs/changelog are finalized before the
-Ship agent runs). `hooks_after_ship()` — `VersionBump` + `BranchCleanup` —
-fires once a human approves the Ship gate (`finish_workflow()`), not as a
-`hooks_for_transition` entry. Both hook batches run under the project-wide
-checkout lock (see [locking](#per-phase-state-and-locking)) and are
-individually fail-soft: a hook failure warns and the batch continues rather
-than aborting the workflow.
-
-`BranchCreate` is defined as a `Hook` variant but `hooks_for_transition`
-never returns it — branch/worktree creation for a phase actually happens
-directly in `start()` (`crates/devflow-cli/src/main.rs`) via
-`GitFlow::feature_start`/`feature_start_force` (branch-in-place mode) or
-`worktree::add` (the default, isolated-worktree mode), not through the hook
-dispatch table.
 
 ## Agent model
 
@@ -199,9 +167,7 @@ gate wait (D-08):
   seconds-scale, file-based lock (`O_EXCL` create, PID written into the file,
   stale-holder reclaim if the recorded PID is dead) that serializes mutations of
   the shared primary checkout (hook batches) across concurrently finishing phases.
-  It must never be held across a gate wait; on timeout
-  (`DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS`, default 120s) the hook batch is
-  **skipped** (loudly, via `events.jsonl`) rather than ever run unserialized.
+  It must never be held across a gate wait.
 
 A `.devflow/lock-{phase:02}` left by an older binary means nothing now and blocks
 nothing; `devflow recover --clean` removes it once the pid it names has exited.
@@ -235,8 +201,7 @@ warns and returns — never aborts the workflow it records), and appends are a
 single `write_all` on an `O_APPEND` handle so concurrent phase monitors'
 lines interleave without tearing. The CLI emits events at every meaningful
 step — `workflow_started`, `advance_evaluated`, `transition`, `gate_fired`,
-`notify_fired`, `loop_back`, `hook_run`, `checkout_lock_timeout`,
-`workflow_finished`, `advance_failed` — so any frontend (Hermes plugin, a
+`notify_fired`, `loop_back`, `workflow_finished`, `advance_failed` — so any frontend (Hermes plugin, a
 future TUI/web UI) can observe a running loop by tailing one file instead of
 integrating with DevFlow internals. `devflow logs`/`status` read it via
 `last_events_by_phase()` (one read+parse pass over the whole log).
@@ -391,8 +356,7 @@ standalone ship subcommand and no separate commands to finalize or undo a
 recorded ship — those do not exist in `enum Command`. Ship works like any
 other stage plus a mandatory terminal gate:
 
-1. `Validate → Ship` transition fires the `DocsUpdate` + `ChangelogAppend`
-   hooks, then launches the Ship agent with its dedicated prompt (code
+1. `Validate → Ship` transition launches the Ship agent with its dedicated prompt (code
    review gate, then `/gsd-ship {N}` — see [Agent
    model](#agent-model)). PR creation, if any, happens inside that GSD
    command, not in DevFlow's own git primitives.
@@ -402,9 +366,8 @@ other stage plus a mandatory terminal gate:
 3. A human answers via `devflow gate approve <phase> --stage ship [--note
    ...]` or `devflow gate reject <phase> --note "..." [--stage ship]`
    (`GateCmd::Approve`/`GateCmd::Reject`, `crates/devflow-cli/src/main.rs`).
-   Approval runs `finish_workflow()`: the `Merge`, `VersionBump`,
-   `ChangelogAppend` and `BranchCleanup` hooks, gate cleanup, and
-   `workflow::clear_state()`. A rejection loops
+   Approval ends the run as a passing Validate does (`finish_run()`):
+   nothing is merged, bumped, tagged or deleted. A rejection loops
    back to Code (or aborts, if the note contains "abort").
 4. A Ship-stage **agent crash** (vs. a review rejection) is routed through
    the same never-silent gate path as any other stage failure
@@ -432,7 +395,7 @@ Runtime state lives under `.devflow/` (git-ignored), keyed per-phase —
 locking](#per-phase-state-and-locking)). Tunable *runtime behavior* (not
 workflow options) is read from environment variables —
 `DEVFLOW_GATE_NOTIFY_CMD`, `DEVFLOW_GATE_TIMEOUT_SECS`,
-`DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS`, `DEVFLOW_CAPTURE_RETENTION`,
+`DEVFLOW_CAPTURE_RETENTION`,
 `DEVFLOW_REVIEW_ANGLES`, `DEVFLOW_EXTERNAL_VERIFY_ENABLED`, `RUST_LOG`,
 `DEVFLOW_LOG_FORMAT` — see
 [OPERATIONS.md](OPERATIONS.md) for the full operator-facing reference.
@@ -463,9 +426,6 @@ Key modules log via `tracing`'s `info!`/`warn!`/`debug!` macros:
 - **`git.rs`** — branch operations (`feature_start`, `feature_finish`,
   `tag`, `push`) log at `INFO`; checkout/rebase/commit operations log at
   `DEBUG`; force operations log at `WARN`.
-- **`hooks.rs`** — each hook run logs its outcome at `INFO` (success) or
-  `WARN` (fail-soft failure, e.g. an unmerged branch left in place by
-  `BranchCleanup`).
 - **`gates.rs`** — gate writes/polls log at `INFO`/`DEBUG`; a failed or
   unspawnable notify command warns at `WARN` (fail-soft — never aborts
   `run_gate`).

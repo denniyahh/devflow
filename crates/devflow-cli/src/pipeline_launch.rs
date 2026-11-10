@@ -3237,13 +3237,8 @@ fn unapplied_answer_line(stage: Stage, claimed: &ClaimedAnswer) -> String {
             format!("an answer for the {stage} gate (gate {gate_id}: {decision}{note})")
         }
     };
-    let ship_caution = if stage == Stage::Ship {
-        "; a merge, version bump or tag may already have run, so check them before answering again"
-    } else {
-        ""
-    };
     format!(
-        "resume: {subject} was claimed, with no record that it was applied{ship_caution}; the rerun asks again"
+        "resume: {subject} was claimed, with no record that it was applied; the rerun asks again"
     )
 }
 
@@ -3254,8 +3249,8 @@ fn unapplied_answer_line(stage: Stage, claimed: &ClaimedAnswer) -> String {
 /// `at_current_stage` is whether the run's state names this stage. A claimed pair there is
 /// usually an answer whose consumer ended before acting on it, whatever `gate_pending` reads:
 /// the consumer writes `gate_pending = false` before its caller acts (R2-05). It can also
-/// have been acted on with the gate left open (an `--until` stop, a kill during Ship
-/// finalization, a close that failed), so the line says only what is known. A claimed pair at
+/// have been acted on with the gate left open (an `--until` stop, a close that failed),
+/// so the line says only what is known. A claimed pair at
 /// any other stage is the leftover of an answer the run acted on and moved past, so it gets
 /// no line here; `Gates::close` has logged its removal either way.
 fn resume_gate_lines(
@@ -5063,11 +5058,10 @@ mod tests {
             resume_gate_lines(Stage::Ship, Some("G1"), &approved, true),
             vec![
                 "resume: an answer for the ship gate (gate G1: approved) was claimed, with no \
-                 record that it was applied; a merge, version bump or tag may already have run, \
-                 so check them before answering again; the rerun asks again"
+                 record that it was applied; the rerun asks again"
                     .to_string()
             ],
-            "a kill during Ship finalization leaves a claim after its merge may have run"
+            "nothing runs after a Ship approval, so the Ship line adds no caution"
         );
         assert_eq!(
             resume_gate_lines(Stage::Code, Some("G1"), &approved, false),
@@ -12112,11 +12106,11 @@ mod tests {
     }
 
     /// The body of the `--yes-ship` pair: stage N is Ship with `--yes-ship`
-    /// and a feature branch finalization can merge, and its advance is held
-    /// at the configured point. With `stop`, a socket stop is taken there
-    /// (owner `advancing`, so it is only flagged) before the release: the
-    /// advance must ship nothing, record the stop at `safe_point` and answer
-    /// the caller `stopped`. Without it (the control) the run ships.
+    /// and a feature branch, and its advance is held at the configured point.
+    /// With `stop`, a socket stop is taken there (owner `advancing`, so it is
+    /// only flagged) before the release: the advance must not finish, must
+    /// record the stop at `safe_point` and answer the caller `stopped`.
+    /// Without it (the control) the run finishes. Neither touches the branch.
     fn held_yes_ship_advance(phase: PhaseId, stop: bool, safe_point: u8) {
         let _guard = env_lock();
         let branch = format!("feature/phase-{}", phase.padded());
@@ -12142,13 +12136,13 @@ mod tests {
             );
             assert_eq!(accepted["owner"], "advancing", "{accepted}");
             assert!(
-                events_named(&run.root, "workflow_shipped").is_empty(),
-                "a stop accepted before the --yes-ship merge must ship nothing: {}",
+                events_named(&run.root, "workflow_finished").is_empty(),
+                "a stop accepted before the --yes-ship approval must not finish the run: {}",
                 run.events()
             );
             assert!(
                 branch_exists(&run.root, &branch),
-                "no after-ship hook may run: the feature branch is kept"
+                "the feature branch is kept"
             );
             let state = run.state();
             assert!(
@@ -12170,16 +12164,20 @@ mod tests {
             assert!(
                 poll_until(HANDOFF_STEP_WAIT, || events_named(
                     &run.root,
-                    "workflow_shipped"
+                    "workflow_finished"
                 )
                 .len()
                     == 1),
-                "control: without a stop the --yes-ship run ships: {}",
+                "control: without a stop the --yes-ship run finishes: {}",
                 run.events()
             );
             assert!(
-                !branch_exists(&run.root, &branch),
-                "control: the after-ship hooks ran (the feature branch is cleaned up)"
+                run.state().finished,
+                "control: the run is recorded finished"
+            );
+            assert!(
+                branch_exists(&run.root, &branch),
+                "control: the feature branch is kept"
             );
             assert!(events_named(&run.root, "advance_stopped").is_empty());
         }
@@ -12187,8 +12185,8 @@ mod tests {
 
     /// CR-01, safe point 5: a stop accepted after safe point 1 and before
     /// `--yes-ship` writes its approval stops the run there. The pre-written
-    /// approval would otherwise beat the stop in the gate wait and let
-    /// finalization merge, bump, tag and push.
+    /// approval would otherwise beat the stop in the gate wait and finish the
+    /// run.
     #[test]
     fn a_stop_after_safe_point_1_is_honoured_before_the_yes_ship_approval() {
         const NAME: &str = "pipeline_launch::tests::a_stop_after_safe_point_1_is_honoured_before_the_yes_ship_approval";
@@ -12200,42 +12198,16 @@ mod tests {
     }
 
     /// The control for safe point 5: the same hold and no stop, and the
-    /// `--yes-ship` run ships.
+    /// `--yes-ship` run finishes.
     #[test]
-    fn without_a_stop_after_safe_point_1_the_yes_ship_run_ships() {
+    fn without_a_stop_after_safe_point_1_the_yes_ship_run_finishes() {
         const NAME: &str =
-            "pipeline_launch::tests::without_a_stop_after_safe_point_1_the_yes_ship_run_ships";
+            "pipeline_launch::tests::without_a_stop_after_safe_point_1_the_yes_ship_run_finishes";
         if !devflow_core::test_support::in_child_test(NAME) {
             run_handoff_child(NAME, Some("after_safe_point_1"), SUCCESS_MARKER);
             return;
         }
         held_yes_ship_advance(PhaseId::new(1315), false, 5);
-    }
-
-    /// CR-01, safe point 6: a stop accepted after the Ship gate was answered
-    /// and before finalization stops the run before the merge.
-    #[test]
-    fn a_stop_before_finalization_is_honoured_before_the_merge() {
-        const NAME: &str =
-            "pipeline_launch::tests::a_stop_before_finalization_is_honoured_before_the_merge";
-        if !devflow_core::test_support::in_child_test(NAME) {
-            run_handoff_child(NAME, Some("before_finalization"), SUCCESS_MARKER);
-            return;
-        }
-        held_yes_ship_advance(PhaseId::new(1316), true, 6);
-    }
-
-    /// The control for safe point 6: the same hold and no stop, and
-    /// finalization ships.
-    #[test]
-    fn without_a_stop_before_finalization_the_run_ships() {
-        const NAME: &str =
-            "pipeline_launch::tests::without_a_stop_before_finalization_the_run_ships";
-        if !devflow_core::test_support::in_child_test(NAME) {
-            run_handoff_child(NAME, Some("before_finalization"), SUCCESS_MARKER);
-            return;
-        }
-        held_yes_ship_advance(PhaseId::new(1317), false, 6);
     }
 
     /// R-10: a SIGKILL of N between N+1's publish and N's unlink (N parked
@@ -14024,58 +13996,6 @@ mod tests {
             poll_until(HANDOFF_STEP_WAIT, || probes_gone(&run.n.socket_path)
                 && probes_gone(&pending.socket_path)),
             "N and its unpublished next both exit: {}",
-            run.events()
-        );
-        assert_eq!(std::fs::read(&path).unwrap(), before, "no state write");
-        superseded_event(&run, X, "superseded");
-    }
-
-    /// D-03: a hook can merge, bump, tag and push, so a supervisor the state no longer
-    /// records does not start one. Superseded at the last hold before finalization, it
-    /// ships nothing and keeps the feature branch.
-    #[test]
-    fn a_superseded_supervisor_runs_no_finalization_hooks() {
-        const NAME: &str =
-            "pipeline_launch::tests::a_superseded_supervisor_runs_no_finalization_hooks";
-        if !devflow_core::test_support::in_child_test(NAME) {
-            run_handoff_child(NAME, Some("before_finalization"), SUCCESS_MARKER);
-            return;
-        }
-        let _guard = env_lock();
-        const X: &str = "aaaa0000aaaa1915";
-        let phase = PhaseId::new(1915);
-        let branch = format!("feature/phase-{}", phase.padded());
-        let run = HandoffRun::launch_with(phase, |root, state| {
-            assert!(
-                devflow_core::test_support::git_command(root)
-                    .args(["branch", &branch, "develop"])
-                    .status()
-                    .unwrap()
-                    .success()
-            );
-            state.stage = Stage::Ship;
-            state.yes_ship = true;
-            state.stop_until = None;
-        });
-        run.go();
-        run.wait_held();
-        supersede(&run.root, run.phase, X);
-        let path = workflow::state_path(&run.root, run.phase);
-        let before = std::fs::read(&path).unwrap();
-        run.release();
-        assert!(
-            poll_until(HANDOFF_STEP_WAIT, || probes_gone(&run.n.socket_path)),
-            "it exits: {}",
-            run.events()
-        );
-        assert!(
-            branch_exists(&run.root, &branch),
-            "no after-ship hook ran: the feature branch is kept: {}",
-            run.events()
-        );
-        assert!(
-            events_named(&run.root, "workflow_shipped").is_empty(),
-            "{}",
             run.events()
         );
         assert_eq!(std::fs::read(&path).unwrap(), before, "no state write");
