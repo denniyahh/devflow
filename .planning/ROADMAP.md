@@ -91,11 +91,14 @@ than split: no requirement dependency forces a split, and the Validate-gate desi
      rows' tests, OPERATIONS.md rows, README/ARCHITECTURE/CONTRIBUTING mentions and `doc-check-allowlist.toml`
      entries removed rather than allowlisted around; a source-scan Rust test asserts that no literal of the removed
      surface (`cron-instructions`, `hermes_cron`, `yes_ship`, the four after-ship hook names, the removed `Stage`
-     variants) remains under `crates/`, `docs/` or the top-level docs, comments stripped. **Control:** the same test
-     fails on a planted stray literal, and the plant is removed before the phase closes. (CUT-03, CUT-04)
+     variants) remains under `crates/`, `docs/` or the top-level docs, comments stripped. `CHANGELOG.md` (release
+     history, which records the removal), `.planning/` and the operator-owned `CLAUDE.md` are outside the scan. **Control:** the same test
+     fails on a planted stray literal, and the plant is removed before the phase closes. (CUT-03, CUT-04; scan scope
+     amended 2026-11-09, 52-CONTEXT D-40)
   3. A rate limit with no usable fallback waits at a gate whose context names the reset time and the exact
      `devflow resume --phase N ...` command to run after it. Once the reset time passes, the supervisor relaunches the
-     stage exactly once by itself. A denial with no reset time, or a second denial, leaves the gate open for the
+     stage by itself, at most once: after a supervisor crash past the timer's claim, the operator runs the gate's
+     resume command (amended 2026-11-09, 52-CONTEXT D-45 rule 5). A denial with no reset time, or a second denial, leaves the gate open for the
      operator. No `cron-instructions-NN.json` exists under `.devflow/` afterwards. **Controls:** the Phase 51 fixture
      that asserted the cron file was written now asserts its absence and the gate's presence — one fixture, both
      directions. A denial whose reset time has passed is relaunched once, and a second denial in the same fixture is
@@ -106,7 +109,8 @@ than split: no requirement dependency forces a split, and the Validate-gate desi
      route for a `gaps_found` verdict, `/gsd-quick` with the note for a rejected clean pass (amended 2026-11-08,
      52-CONTEXT D-21); never the whole phase; a verification that reports `gaps_found` is driven to `passed` inside the same run
      (the relaunched agent is told to plan and close the gaps and re-verify), and the Validate gate never reads
-     "passed" while the report says otherwise. `devflow gate show` prints a failure gate's full reason untruncated,
+     "passed" while the report says otherwise; a run finishes only when GSD reports `passed` and the Validate agent
+     passed on the current commit (amended 2026-11-09, 52-CONTEXT D-45). `devflow gate show` prints a failure gate's full reason untruncated,
      and the banner and `gate list` cut keep the "way on" sentence first. **Controls:** the pre-fix prompt path, kept
      as a fixture, fails the verbatim assertion; a `gaps_found` report with the gate forced to "passed" fails the
      never-lies assertion; a note reading "do not abort, fix the test" leaves the run alive; a failure reason longer than 300 characters
@@ -817,6 +821,8 @@ a re-verify step rather than to `FullExecute`. Or raise upstream that a report w
 `stale` even when its status is `gaps_found`. Relates to 999.192, 999.205.
 
 **Upstream:** filed 2026-11-08 as https://github.com/open-gsd/gsd-core/issues/6078. It was reproduced on gsd-core 1.20.1: a covered-file change flips a `passed` report to `stale` but leaves a `gaps_found` report `gaps_found`. Phase 52 handles it with a gate (52-CONTEXT D-11).
+**Moved upstream (operator, 2026-11-09, 52-CONTEXT D-45):** Phase 52 no longer detects this case. A stale `gaps_found`
+report runs the gap loop, whose execute-phase re-verifies. The fix belongs in gsd-core #6078.
 
 ### Phase 999.207: A Quota Denial Followed by a Line the Agent Was Killed Mid-Way Through Still Splits the Monitor and the Verdict (BACKLOG)
 

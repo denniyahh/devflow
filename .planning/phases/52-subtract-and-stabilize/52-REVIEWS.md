@@ -407,3 +407,31 @@ Quoted: "answer any probe arguments the preflight sends (for example a version o
 - agy F-08: 52-02's gate failing when the 3.0.0 control is unavailable is the intended fail-closed behavior. The installed binary prints `devflow 3.0.0`.
 - pi F7: the mermaid node *labels* (`hooks`, `prompt`, …) are lowercase. Only the node ids are uppercase, so the rule does match them.
 - agy S-01: speculation about operator UX, not a plan defect.
+
+## Round 3 operator direction: cut and single check (2026-11-09)
+
+Source: reviews 2 and 3 (`52-plan-review-2/SUMMARY.md` R1-R10, `52-plan-review-3/SUMMARY.md` T1-T11). Of their 21
+confirmed findings, 9 came from tracking uncovered quick-fix files, 6 from combining verdicts per gate kind, and 6
+from DevFlow's own durability (timer, claim order, resume, counters). The operator chose **52-CONTEXT D-45**: cut the
+machinery that second-guesses GSD's report, and check "finished" in one function. This replan applies D-45. It does
+not patch R1-R10 or T1-T11 one by one.
+
+### Required changes (each MUST be addressed)
+
+| # | Plans | Change |
+|---|-------|--------|
+| D45-1 | 52-33 | Delete the plan. Everything in it (`code_fix_base`, `uncovered_paths`, the quick-pass diff collection, the D-41 accept gate) is cut. Rewire `depends_on` and renumber `wave` to the DAG level in the plans that depended on it. |
+| D45-2 | 52-29 | Replace the per-kind routers (`answer_basis`, the D-42/D-43/D-44 arms, re-check classifier) with one routing function implementing the D-45 rule 2 table, keyed on (fresh status, agent PASS on HEAD) and the answer, never on the gate kind. Add `can_finish` (D-45 rule 1) as the only path to `workflow_finished`. Keep D-39's status-less gate answers. Add the D-45 rule 6 `proptest` and its control. |
+| D45-3 | 52-28 | Remove the Code post-check of D-32 part 2 (the re-read after Code and its gates). Keep the D-32 part 1 re-verify prompt. The next Validate's fresh read covers a still-`stale` report. |
+| D45-4 | 52-20, 52-22, 52-27 | Remove the D-11 gate and D-22 digest detection (`covered_digest`, `stale_gaps_found`); a stale `gaps_found` takes the gap loop. Remove any reference to the cut decisions, the per-pass base or the uncovered set. Record the Validate agent PASS with the HEAD commit it ran on, for `can_finish`. |
+| D45-5 | 52-32 | At-most-once automatic relaunch (D-45 rule 5): write the flag durably before the timer claims; no crash recovery and no `rate_limit_timer_gate`; after a crash the operator runs the gate's `devflow resume` command. The armed timer wakes at reset plus margin, separately from the gate lifetime (fixes review 3 codex S1). Keep D-38's single per-gate claim. Remove "exactly once" wording. |
+| D45-6 | all | No plan cites D-11 (as a gate), D-22, D-32 part 2, D-33, D-41, D-42, D-43 or D-44 as a requirement to implement. They are superseded by D-45. |
+
+### Findings carried over (not removed by D-45; MUST still be addressed)
+
+- T4: a stop must not clear `code_fix` (`persist_stopped_state` keeps it; `a_resume_keeps_the_fix_pass` pins that). No plan may say stop clears it.
+- T10: the ceiling reset's event is `phase_failure_budget_reset`, not the function name; Plan/Code-pass gates must not be reported as "Validation has failed N time(s)".
+- R9: a rejection note at Plan/Validate needs the `relaunch_note` carrier from 52-31; order the test accordingly.
+- R10: the answer check runs before `Gates::claim`, the `gate_pending` write and `gate_resolved`, so a refused answer claims nothing.
+
+All other R and T findings concern cut machinery and are dispositioned as removed by D-45.

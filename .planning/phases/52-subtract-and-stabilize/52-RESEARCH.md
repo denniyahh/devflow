@@ -290,7 +290,7 @@ The GATE/OPS work has three integration hazards the CONTEXT does not fully settl
 |------------|-------------|----------------|-----------|
 | Stage machine (Plan→Code→Validate, finish) | `devflow-core` (`stage.rs`, `mode.rs`, `state.rs`) | CLI `pipeline_gate.rs::transition` | Enum + policy are library-owned; CLI only drives |
 | Validate verdict pairing (agent AND GSD status) | CLI `pipeline_outcomes.rs::handle_validate_outcome` | new core `gsd_reader` | Routing is pipeline policy; reading GSD is a reusable, unit-testable seam |
-| GSD reader invocation (status/frontmatter/fingerprint) | new `devflow-core::gsd_reader` | — | Deterministic subprocess + JSON parse; must be fail-closed and stub-able |
+| GSD reader invocation (status/frontmatter/fingerprint) | new `devflow-core::gsd_reader` | — | Deterministic subprocess + JSON parse; must be fail-closed and stub-able. **Superseded in part by D-45 rule 3 (2026-11-09):** the fingerprint read is cut (DevFlow does not recompute the covered digest); the reader serves status and frontmatter |
 | Gate answers (abort field, note) | `devflow-core::gates` | CLI `commands.rs::gate_respond`, `main.rs::GateCmd` | Schema lives with the gate protocol |
 | Note → prompt | `devflow-core::prompt` (`StageIntent`, `fix_prompt`, `render_workflow_style`) | every driver in `agents/` | One renderer per style, so all shapes get it |
 | Rate-limit wait + one auto relaunch | CLI `pipeline_outcomes.rs` / `pipeline_gate.rs` | core `gates.rs` (answer/claim), `state.rs` (used flag) | Reuses the existing first-writer-wins answer + claim protocol |
@@ -300,7 +300,7 @@ The GATE/OPS work has three integration hazards the CONTEXT does not fully settl
 
 ## Standard Stack
 
-No new external crates. The phase removes two.
+No new external crates. The phase removes two. **Superseded by the Package Legitimacy Audit addendum (2026-11-10):** D-45 rule 6 adds one dev-dependency, `proptest` 1.12.0 (52-29).
 
 | Item | Version | Purpose | Status |
 |------|---------|---------|--------|
@@ -308,21 +308,27 @@ No new external crates. The phase removes two.
 | serde / serde_json | workspace `1` | `#[serde(default)]` for the abort field, GSD JSON parse | keep |
 | tracing-subscriber (`env-filter`) | workspace | OPS-03 default filter change | keep |
 | `semver` `1`, `git-conventional` `1` | devflow-core deps | used **only** by `version.rs` (26 refs, all in that file) | **remove** with `version.rs`, or `cargo machete` (`scripts/check.sh deps`) flags them `[VERIFIED: rg 'semver::|git_conventional']` |
-| gsd-core | 1.20.1 | `query verification status`, `query frontmatter get`, `query verification fingerprint` | external runtime dep, see §GSD integration `[VERIFIED: runtime-identity --raw]` |
+| gsd-core | 1.20.1 | `query verification status`, `query frontmatter get`, `query verification fingerprint` (**superseded by D-45 rule 3:** fingerprint no longer used) | external runtime dep, see §GSD integration `[VERIFIED: runtime-identity --raw]` |
 | cargo-nextest | 0.9.151 (host) | named-test gates | `[VERIFIED: shell]` |
 | cargo-semver-checks | 0.51.0 (host); not in `check.sh` or CI | `check-release -p devflow-core` (`--release-type`, `--baseline-version` flags exist) | `[VERIFIED: --help]` |
 
-**Installation:** none.
+**Installation:** none. **Superseded by the Package Legitimacy Audit addendum (2026-11-10):** `proptest` 1.12.0 as a dev-dependency of `devflow`.
 
 ## Package Legitimacy Audit
 
-No packages are installed by this phase. Packages removed: `semver`, `git-conventional` (devflow-core). If the planner puts the release tool in its own crate and it needs semver parsing, reuse `semver = "1"` (already in `Cargo.lock`; no new name enters the tree).
+No packages are installed by this phase (**superseded by the addendum below, 2026-11-10:** one dev-dependency, `proptest` 1.12.0, is added). Packages removed: `semver`, `git-conventional` (devflow-core). If the planner puts the release tool in its own crate and it needs semver parsing, reuse `semver = "1"` (already in `Cargo.lock`; no new name enters the tree).
 
 | Package | Registry | Verdict | Disposition |
 |---------|----------|---------|-------------|
 | (none added) | — | — | — |
 
 **Packages removed due to [SLOP] verdict:** none. **Packages flagged [SUS]:** none.
+
+**Addendum 2026-11-10 (orchestrator, after D-45 rule 6 added a property test):** one dev-dependency is added.
+
+| Package | Registry | Verdict | Disposition |
+|---------|----------|---------|-------------|
+| `proptest` 1.12.0 (dev-dependency of `devflow`) | crates.io | [OK] verified | Install. Licence MIT OR Apache-2.0; repository proptest-rs/proptest; ~240M downloads; 1.12.0 published 2026-10-10, not yanked; `rust-version` 1.88 ≤ the pinned toolchain 1.97.1. `cargo deny check advisories licenses bans sources` passed on a scratch `git archive` copy of a44b8d1 with `proptest@1.12.0` added (transitive adds include `unarray`, `wait-timeout`). Control: the same check with `MIT` removed from `deny.toml`'s allow list printed `licenses FAILED`. The scratch copy was deleted. |
 
 ## The Cut's Dependency Graph (CUT-01..04)
 
@@ -520,7 +526,7 @@ Model on `doc_check::no_monitor_pid_field_json_key_or_help_mention_remains` (`do
 | Problem | Don't Build | Use Instead | Why |
 |---|---|---|---|
 | VERIFICATION.md status/staleness | frontmatter parse | `gsd query verification status` | D-08; GSD's staleness rules (digest versions, live artifacts) |
-| Covered-digest recompute | own hasher | `gsd query verification fingerprint` | v4 semantics include phase artifacts |
+| Covered-digest recompute | own hasher | `gsd query verification fingerprint` | v4 semantics include phase artifacts. **Superseded by D-45 rule 3 (2026-11-09):** DevFlow recomputes no digest, by either route |
 | Timer vs human race | second lock/flag protocol | `Gates::answer` first-writer-wins + `Gates::claim` | Already proven under the gate test suite (`gates.rs` ~96 tests) |
 | Reset-time parsing | new date code | relocated `ship.rs` parser (`:304-490`, with its unit tests) | Handles epoch + RFC 3339 + offsets |
 | "No literal left" | shell `rg -c` | doc_check-style Rust test | CLAUDE.md repo trap |

@@ -17,11 +17,14 @@ requirement closes a backlog entry, the entry is named; `.planning/user/V4-CUT-I
       ChangelogAppend, BranchCleanup), no `devflow ship` and no `--yes-ship`; the event log records `workflow_finished`
       with `shipped: false` and the worktree and branch are left for the operator. Closes 999.180, 999.210; retires 999.111, 999.129, 999.132, 999.173, 999.178.
 - [ ] **CUT-03**: A rate limit with no usable fallback waits at a gate whose context names the reset time and the exact
-      resume command. Once the reset time passes, the supervisor relaunches the stage by itself, exactly once. With no
+      resume command. Once the reset time passes, the supervisor relaunches the stage by itself, at most once (a supervisor crash
+      after the timer claims the gate leaves the relaunch to the gate's `devflow resume` command; amended 2026-11-09,
+      52-CONTEXT D-45 rule 5). With no
       reset time on the denial, or after a second denial, the gate stays open for the operator. No
-      `cron-instructions-NN.json` is written and nothing in the tree or docs refers to it. Closes 999.185, 999.186;
+      `cron-instructions-NN.json` is written and nothing in the tree or docs refers to it, except `CHANGELOG.md`
+      (release history, which records the removal), `.planning/` and the operator-owned `CLAUDE.md`. Closes 999.185, 999.186;
       retires 999.137's R-2. (Amended 2026-11-08 by the operator in the Phase 52 discuss step: auto-relaunch at reset,
-      52-CONTEXT D-15/D-16.)
+      52-CONTEXT D-15/D-16. Scan scope amended 2026-11-09 by the operator, 52-CONTEXT D-40.)
 - [ ] **CUT-04**: Every inventory row marked `cut` that the operator confirms in the Phase 52 discuss step is removed with
       its documentation, tests, allowlist entries and OPERATIONS.md rows, and `scripts/check.sh all` (including
       `doc_check`) passes on the result. `devflow parallel` is cut (operator 2026-11-08): closes 999.181, retires 999.26.
@@ -38,7 +41,9 @@ requirement closes a backlog entry, the entry is named; `.planning/user/V4-CUT-I
       context review, 52-CONTEXT D-21.)
 - [ ] **GATE-03**: A verification that reports `gaps_found` can be driven to `passed` from inside the run: the relaunched
       agent is told to plan and close the gaps and re-verify, and the Validate gate never says "passed" while the
-      report says otherwise. Closes 999.193, 999.205, 999.208.
+      report says otherwise. DevFlow follows GSD's routes and does not re-judge GSD's report: a run finishes only
+      when GSD reports `passed` and the Validate agent passed on the current commit. Closes 999.193, 999.205.
+      (Amended 2026-11-09 by the operator, 52-CONTEXT D-45: 999.208 moves to gsd-core #6078.)
 - [ ] **GATE-04**: `devflow gate show` prints a failure gate's full reason, and the banner and `gate list` cut keeps the
       "way on" sentence first. Closes 999.206.
 
