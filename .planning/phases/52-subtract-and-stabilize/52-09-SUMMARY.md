@@ -191,7 +191,7 @@ See key-decisions. The gate takes the existing failure-gate answers. A distinct 
 
 ## Issues Encountered
 
-- `bf8a884` (Task 1 GREEN) is not green on its own for the `--bin devflow` unit tests. The tests that still expected the cron file were updated in Task 2 (`b08ab01`), as the plan split them. Bisecting between those two commits will see those unit tests fail.
+- `bf8a884` (Task 1 GREEN) is most likely not green on its own for the `--bin devflow` unit tests. The tests that still expected the cron file were updated in Task 2 (`b08ab01`), as the plan split them. This is unverified: the unit suite was not run at `bf8a884`. Those tests assert a cron file that is no longer written, and the ones that call `advance` would block at the new gate. Expect failures or hangs if you bisect onto that commit.
 - OPERATIONS.md still describes the cron file in three places, left for 52-10 as the plan says: the `cron-instructions-NN.json` file row (~L479), the "scheduled rate-limit resume" sentence (~L427), and "never by cron instructions" after `agent_handoff_relaunch_failed` (~L348). The first of these says the file is written, which is now false.
 
 ## Verification
