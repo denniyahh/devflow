@@ -110,9 +110,8 @@ pub(crate) fn gate_claim_files(root: &Path, phase: PhaseId, stage: Stage) -> Vec
 ///
 /// `PATH` is no longer process-global in this crate's tests: child fixtures
 /// supply a directory-only value through `run_test_in_child`. This mutex
-/// currently guards the three deferred process-global variables
-/// `DEVFLOW_GATE_TIMEOUT_SECS`, `DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS` and
-/// `DEVFLOW_GATE_NOTIFY_CMD`. A future author adding another mutated variable to
+/// currently guards the two deferred process-global variables
+/// `DEVFLOW_GATE_TIMEOUT_SECS` and `DEVFLOW_GATE_NOTIFY_CMD`. A future author adding another mutated variable to
 /// this crate's tests is joining this set — guard it here, not with a new
 /// mutex (D-02: per-module mutexes were rejected on measured evidence that
 /// one process-global variable can span multiple future target clusters).
@@ -187,32 +186,6 @@ pub(crate) fn init_repo(root: &Path) {
     git(&["config", "tag.gpgsign", "false"]);
     git(&["config", "core.hooksPath", "/dev/null"]);
     std::fs::write(root.join("Cargo.toml"), "[package]\nversion = \"2.0.0\"\n").unwrap();
-    git(&["add", "."]);
-    git(&["commit", "-q", "-m", "init"]);
-    git(&["branch", "-M", "main"]);
-    git(&["checkout", "-q", "-b", "develop"]);
-}
-
-/// Same as [`init_repo`], but without a committed `Cargo.toml`, so
-/// `version_bump` takes its no-version-file branch. Mirrors
-/// `devflow_core::hooks`' `init_repo_with_options(root, false)`.
-pub(crate) fn init_repo_no_version_file(root: &Path) {
-    let git = |args: &[&str]| {
-        let ok = devflow_core::test_support::git_command(root)
-            .args(args)
-            .output()
-            .unwrap()
-            .status
-            .success();
-        assert!(ok, "git {args:?} failed");
-    };
-    git(&["init", "-q"]);
-    git(&["config", "user.email", "devflow@example.com"]);
-    git(&["config", "user.name", "DevFlow Tests"]);
-    git(&["config", "commit.gpgsign", "false"]);
-    git(&["config", "tag.gpgsign", "false"]);
-    git(&["config", "core.hooksPath", "/dev/null"]);
-    std::fs::write(root.join("README.md"), "no version file in this repo\n").unwrap();
     git(&["add", "."]);
     git(&["commit", "-q", "-m", "init"]);
     git(&["branch", "-M", "main"]);

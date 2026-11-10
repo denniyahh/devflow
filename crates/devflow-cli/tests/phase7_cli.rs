@@ -185,8 +185,8 @@ fn wait_for_pid(path: &Path) -> u32 {
     panic!("timed out waiting for a pid in {}", path.display());
 }
 
-/// Wait until a phase's persisted state is cleared (the pipeline reached
-/// Ship and `finish_workflow` called `clear_state`). 20b's new liveness
+/// Wait until a phase's persisted state is cleared (the run was aborted and
+/// `abort` called `clear_state`). 20b's new liveness
 /// guard in `cleanup` correctly refuses to remove a worktree whose monitor
 /// is still actively driving stages (`BetweenStages`/`Healthy`) — fixtures
 /// that call `cleanup` must first wait for the phase to actually finish,
@@ -465,7 +465,7 @@ fn start_until_plan_halts_cleanly() {
 }
 
 /// 20c (D-07): `--until ship` is a semantic no-op — Ship never calls
-/// `transition` (`handle_ship_outcome` calls `finish_workflow` directly), so
+/// `transition` (`handle_ship_outcome` ends the run itself), so
 /// the full pipeline already stops there today. It must be rejected before
 /// any stage runs, not silently accepted as if it intercepted anything.
 #[test]

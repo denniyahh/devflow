@@ -687,8 +687,8 @@ pub(crate) fn preflight_interactivity_check(
 /// D-14 (universal, generic layer): whether the gh-auth credential probe
 /// applies to `stage` — hardcoded to `Stage::Ship` rather than a dynamic
 /// hook-scan (review Plan 05 MEDIUM, Codex+OpenCode): Ship's terminal hooks
-/// (`hooks::hooks_after_ship()` = Merge/VersionBump/ChangelogAppend/BranchCleanup,
-/// `hooks.rs:99-106`) are the only hooks that push to a remote. Split out as
+/// were the only hooks that pushed to a remote (they are removed, 52-12;
+/// 52-13 removes this Ship check). Split out as
 /// its own pure predicate so "does not run for a non-Ship stage" is directly
 /// unit-testable without shelling out to `gh`.
 fn gh_auth_check_applies(stage: Stage) -> bool {

@@ -134,9 +134,9 @@ pub struct State {
     /// bound a `devflow start --force` resets does not bound the unattended
     /// case D-07 exists for. Exactly two events reset it to zero:
     ///
-    /// 1. **Phase completion** — `finish_workflow_with_gate_timeout` calls
-    ///    `workflow::clear_state`, deleting `.devflow/state-{NN}.json`, so the
-    ///    next start for that phase finds nothing to carry.
+    /// 1. **State removal** — `workflow::clear_state` deletes
+    ///    `.devflow/state-{NN}.json` (an abort does), so the next start for
+    ///    that phase finds nothing to carry. A finished run keeps its state.
     /// 2. **Operator approval at the ceiling gate** — the Validate gate
     ///    handling zeroes it when a human advances or loops back AND
     ///    [`crate::mode::phase_failure_ceiling_reached`] is true. Keyed on that

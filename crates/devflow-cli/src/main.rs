@@ -459,7 +459,7 @@ fn run() -> Result<(), CliError> {
             // Worktree is the default; `--no-worktree` is the only switch.
             let worktree = !no_worktree;
             // D-07: `--until ship` is a semantic no-op — `handle_ship_outcome`
-            // calls `finish_workflow` directly and never calls `transition`,
+            // ends the run itself and never calls `transition`,
             // so the pipeline already stops at Ship today regardless of this
             // flag. Reject before any stage runs rather than silently
             // accepting a flag that would never actually intercept anything.

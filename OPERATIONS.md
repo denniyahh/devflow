@@ -271,8 +271,7 @@ answer that "was claimed, with no record that it was applied" (logged
 and the closed gate's claim is logged `gate_claimed_answer_removed`). The
 answer's consumer may have ended before acting on it, or it may have acted with
 the gate left open, so the line says only what is known, and the rerun asks
-again either way. At Ship the line adds that a merge, version bump or tag may
-already have run, so check them before answering again.
+again either way.
 
 ## Rate-limit failover
 
@@ -432,7 +431,6 @@ command. The coding agent never receives the variable.
 |---|---|---|
 | `DEVFLOW_GATE_NOTIFY_CMD` | unset | Shell command fired when a gate is written, and once when a run ends |
 | `DEVFLOW_GATE_TIMEOUT_SECS` | 259200 (3d) | How long a monitor waits at a gate, holding its gate registration rather than a lock. Not a deadline for answering: the gate request and phase state are files that never expire, and timing out is a clean resumable stop. Past it the run has ended at that gate: `devflow resume` reruns the stage and asks again, setting any unused answer aside |
-| `DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS` | 120 | Wait on the shared-checkout lock; on timeout the hook batch is skipped (loudly), never run unserialized |
 | `DEVFLOW_GATE_MAX_UNATTENDED_AGE_SECS` | 259200 (3d) | Age threshold `devflow gate sweep` uses to decide a gate is abandoned. Held **equal to** `DEVFLOW_GATE_TIMEOUT_SECS`, never shorter: `gate sweep` writes an `abort:` response, so a threshold below the poll timeout lets a sweep reap gates a live monitor is still polling — turning a clean resumable timeout into an `abort()` that clears state, machine-wide across every registered root. An unparsable value or explicit `0` falls back to the default rather than reaping every gate on the machine |
 | `DEVFLOW_CACHE_DIR` | unset (falls back to `$XDG_CACHE_HOME/devflow`, then `$HOME/.cache/devflow`) | Test/override hook for the machine-global registry directory (`devflow gate list --all-roots`) |
 | `DEVFLOW_CAPTURE_RETENTION` | 5 | Capture generations retained per phase; overrides `devflow.toml` |

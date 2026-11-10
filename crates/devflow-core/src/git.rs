@@ -132,8 +132,8 @@ impl GitFlow {
 
     /// Create a git-flow helper with an explicitly supplied branch model.
     ///
-    /// The constructor the hooks use, so `HookContext.git_flow` reaches every
-    /// git operation inside a hook instead of being silently re-defaulted.
+    /// The constructor for a caller with a resolved branch model, so every
+    /// git operation it runs uses that model instead of a silent default.
     pub fn with_config(root: impl AsRef<Path>, config: GitFlowConfig) -> Self {
         Self {
             root: root.as_ref().to_path_buf(),
@@ -403,9 +403,9 @@ impl GitFlow {
     /// sweep in unrelated dirty state left by other hooks or the workflow.
     /// Returns Ok(()) whether or not the path had changes to commit. Unlike
     /// `commit_all`, a path with no changes produces **no commit** — it is a
-    /// genuine no-op, not a forced empty commit, so a caller such as
-    /// `hooks::version_bump` can never tag a release on a commit containing
-    /// nothing (19b/D-16).
+    /// genuine no-op, not a forced empty commit, so a caller that tags the
+    /// commit it last produced can never tag one containing nothing
+    /// (19b/D-16).
     pub fn commit_path(&self, relative_path: &str, message: &str) -> Result<(), GitError> {
         debug!("committing {relative_path}: {message}");
         // `add` first so a brand-new file is known to git — a pathspec-only
@@ -1113,9 +1113,9 @@ mod tests {
             .expect("rev-list --count HEAD must print an integer")
     }
 
-    /// 19b/D-16: `hooks::version_bump` (hooks.rs:242) calls `commit_path` and
-    /// then tags whatever commit it last produced (hooks.rs:249). If a
-    /// terminal-batch retry calls `commit_path` again with byte-identical
+    /// 19b/D-16: the removed version-bump hook called `commit_path` and then
+    /// tagged whatever commit it last produced. If a retry calls
+    /// `commit_path` again with byte-identical
     /// content (the file untouched since the first call), a forced commit
     /// here means the release tag can end up naming a commit that contains
     /// nothing new. This pins the exact retry scenario: two calls, unchanged
@@ -1147,11 +1147,9 @@ mod tests {
 
     /// 19b/D-16, T-19-11: separates the "no commit" claim from the "no
     /// error" claim so a future change can't satisfy one by breaking the
-    /// other. `hooks.rs` propagates `commit_path`'s `Result` with `?` at both
-    /// call sites (changelog_append:225, version_bump:242) -- turning a
-    /// genuine no-op into `Err` would stall the terminal hook batch (see
-    /// T-19-11 in this plan's threat model), so both properties must hold
-    /// simultaneously.
+    /// other: a caller that propagates `commit_path`'s `Result` with `?`
+    /// would stall on a genuine no-op turned into `Err` (T-19-11), so both
+    /// properties must hold simultaneously.
     #[test]
     fn commit_path_with_no_changes_returns_ok_without_committing() {
         let repo = init_repo();

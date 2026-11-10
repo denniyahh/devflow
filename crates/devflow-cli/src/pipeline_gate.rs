@@ -9,7 +9,7 @@
 //! both call [`crate::pipeline_launch::launch_stage`] at their final step —
 //! that call is what closes the cycle `pipeline_launch (advance) →
 //! pipeline_outcomes (handle_*_outcome) → pipeline_gate (transition/
-//! run_gate/finish_workflow) → pipeline_launch (launch_stage)` back to
+//! run_gate/finish_run) → pipeline_launch (launch_stage)` back to
 //! where it started. This cycle is the state machine's real control flow
 //! (Code → Validate → Ship, with loop-backs), and Rust permits cyclic
 //! module references — only the crate dependency graph must be acyclic —
@@ -25,11 +25,10 @@ use crate::pipeline_launch::{
     GateWaitEnd, clear_run_state, close_gate, commit, ensure_still_recorded, fenced, is_not_owner,
     launch_stage,
 };
-use crate::pipeline_outcomes::{run_checkout_hooks, truncate_reason};
+use crate::pipeline_outcomes::truncate_reason;
 #[cfg(test)]
 use devflow_core::gates::GateId;
 use devflow_core::gates::{self, Claim, GateAction, GateError, GateResponse, Gates};
-use devflow_core::hooks;
 use devflow_core::mode;
 #[cfg(test)]
 use devflow_core::phase_id::PhaseId;
@@ -42,7 +41,7 @@ use devflow_core::{events, registry};
 use std::path::Path;
 use tracing::{info, warn};
 
-/// Fire the hooks for `from → to`, persist the new stage, and launch its agent.
+/// Persist the new stage `to` and launch its agent.
 ///
 /// `infra_failures` resets unconditionally on every successful transition
 /// (CR-01, 17-06 gap closure). Without this, an infra-fault ceiling meant to
@@ -69,8 +68,8 @@ pub(crate) fn transition(
     // runs. `stop_until == Some(from)` means the JUST-COMPLETED stage (the
     // one whose outcome triggered this call) is the requested stop point;
     // checking `to` instead would halt BEFORE the target stage ever ran
-    // (review: Codex HIGH off-by-one). This bypasses the from→to checkout
-    // hooks, `state.stage = to`, the normal `"transition"` event, and
+    // (review: Codex HIGH off-by-one). This bypasses `state.stage = to`, the normal
+    // `"transition"` event, and
     // `launch_stage` — no new monitor is spawned, and `loop_back_to_code`
     // (a retry, not an advance) is untouched by this check.
     if state.stop_until == Some(from) {
@@ -114,12 +113,6 @@ pub(crate) fn transition(
     }
 
     ensure_still_recorded(project_root, state.phase)?;
-    let _ = run_checkout_hooks(
-        project_root,
-        state,
-        &hooks::hooks_for_transition(from, to),
-        to,
-    );
     commit(state, |s| {
         s.stage = to;
         if mode::transition_resets_consecutive_failures(from, to) {
@@ -247,8 +240,8 @@ pub(crate) enum LoopBackReason {
     /// signal that the failure budget had widened back to its full width.
     /// This reason is that signal.
     ValidateFailureNoBaseline,
-    /// A human answered a gate with a loop-back — a Ship `review:` rejection,
-    /// an ambiguous Validate adjudication, or a finalization retry. Makes no
+    /// A human answered a gate with a loop-back — a Ship `review:` rejection
+    /// or an ambiguous Validate adjudication. Makes no
     /// claim about the commit-count baseline, because none was consulted.
     GateResponse,
 }
@@ -330,143 +323,6 @@ pub(crate) fn prepare_loop_back_to_code(
             fix: Some(fix),
         },
     ))
-}
-
-/// Run the terminal hooks (version bump + branch cleanup) and clear state.
-///
-/// Uses [`gate_timeout_secs`]'s multi-day production default for the
-/// retry-gate wait below.
-pub(crate) fn finish_workflow(project_root: &Path, state: &mut State) -> Result<(), CliError> {
-    finish_workflow_with_gate_timeout(project_root, state, gate_timeout_secs())
-}
-
-/// `finish_workflow`'s body, parameterized on how long the retry-gate poll
-/// (below) waits for a response before failing fast. Production callers use
-/// `finish_workflow`'s multi-day default; tests pass a short bound so an
-/// unanswered retry gate fails in seconds (via `run_gate_with_timeout`'s
-/// timeout error) instead of days.
-pub(crate) fn finish_workflow_with_gate_timeout(
-    project_root: &Path,
-    state: &mut State,
-    gate_timeout_secs: u64,
-) -> Result<(), CliError> {
-    #[cfg(test)]
-    crate::pipeline_launch::test_hold("before_finalization");
-    let mut progress = crate::pipeline_outcomes::BatchProgress::default();
-    loop {
-        // Safe point 6 (CR-01, 50-REVIEW.md; D-13 item 7), before every pass: a stop taken
-        // during the advance after the Ship gate was answered, or during a retry after its
-        // gate was answered, is honoured before the merge, version bump, tag and push. The
-        // consumed approval is set aside with the gate (D-06), and a resumed run reruns Ship,
-        // whose new gate a saved `yes_ship` auto-approves. Outside a supervisor's advance no
-        // stop token is engaged, and the holder's stop flag decides (D-18).
-        //
-        // This is the last point a stop lands before finalization, and the only stop check
-        // around a pass (D-18). Once a pass starts every hook runs to the end: a failed
-        // pass's retry gate honours the stop at safe point 4, and a successful pass ships.
-        if crate::pipeline_launch::stop_requested_at_safe_point() {
-            let _ = close_gate(project_root, state.phase, Stage::Ship);
-            crate::pipeline_launch::record_advance_stop(state, 6)?;
-            return Err(CliError::Message(format!(
-                "finalization did not run: {}",
-                crate::pipeline_launch::safe_point_stop_reason()
-            )));
-        }
-        ensure_still_recorded(project_root, state.phase)?;
-        if crate::pipeline_outcomes::run_checkout_hooks_from(
-            project_root,
-            state,
-            &hooks::hooks_after_ship(),
-            Stage::Ship,
-            &mut progress,
-        ) {
-            break;
-        }
-        // The original Ship approval has already been consumed. Reopen an
-        // actionable gate and keep this monitor waiting so a terminal-hook
-        // failure cannot turn into an invisible stalled Ship state.
-        let _ = close_gate(project_root, state.phase, Stage::Ship);
-        let context = format!(
-            "[finalization failed] phase {} terminal hooks did not complete. Resolve the git/version error, then approve to retry; reject to loop back or abort.",
-            state.phase
-        );
-        // This is the reopened finalization-retry gate, NEVER the routine
-        // Ship approval — it must always pass `None` here. Auto-approving
-        // it would mean "the merge could not be completed" gets silently
-        // retried forever with no human ever seeing it (T-23-91). The one
-        // and only site permitted to pass a non-`None` auto-response is
-        // `handle_ship_outcome` in `pipeline_outcomes.rs`.
-        match run_gate_with_timeout(
-            project_root,
-            state,
-            Stage::Ship,
-            &context,
-            gate_timeout_secs,
-            None,
-        )? {
-            GateAction::Advance => {
-                let _ = close_gate(project_root, state.phase, Stage::Ship);
-            }
-            GateAction::LoopBack(_) => {
-                return loop_back_to_code(
-                    project_root,
-                    state,
-                    FixType::AuditFix,
-                    LoopBackReason::GateResponse,
-                );
-            }
-            GateAction::Abort(reason) => return abort(project_root, state, &reason),
-        }
-    }
-    // 23-06 / T-23-67: the ONLY site in the workspace permitted to emit
-    // `workflow_shipped`. This is the strict shipped predicate `ship_evidence`
-    // reads — deliberately NOT `workflow_finished` below, which is also
-    // emitted by `transition`'s `--until` clean-stop branch (`pipeline_gate.rs`,
-    // `state.stop_until == Some(from)` arm) with a `"stopped_at"` reason,
-    // before any hook, stage assignment, or launch runs. A phase halted after
-    // one stage must never read as shipped. Ordering here is load-bearing in
-    // three directions: after the hook-success loop `break` above, so it can
-    // only fire once the entire `hooks_after_ship` batch has succeeded; before
-    // the state is cleared below, so a kill between the two cannot leave a
-    // shipped run with no state and no record that it shipped; and before
-    // `workflow_finished` below, because existing tests assert a phase's event
-    // stream ENDS in `workflow_finished` — do not move this emission after
-    // either of them.
-    events::emit(
-        project_root,
-        state.phase,
-        "workflow_shipped",
-        serde_json::json!({
-            "stage": Stage::Ship.to_string(),
-        }),
-    );
-    let _ = close_gate(project_root, state.phase, Stage::Validate);
-    let _ = close_gate(project_root, state.phase, Stage::Ship);
-    #[cfg(test)]
-    if let Some(probe) = BEFORE_RUN_STATE_CLEAR.take() {
-        probe();
-    }
-    clear_run_state(project_root, state.phase)?;
-    // 23b: the workflow is genuinely over — deregister this (project_root,
-    // phase) from the machine-global registry so `devflow gate list
-    // --all-roots` stops naming a phase that no longer exists.
-    registry::deregister(project_root, state.phase);
-    events::emit(
-        project_root,
-        state.phase,
-        "workflow_finished",
-        serde_json::Value::Null,
-    );
-    println!("phase {} shipped — workflow complete", state.phase);
-    Ok(())
-}
-
-#[cfg(test)]
-thread_local! {
-    /// Run on this thread once, at the last instant before finalization removes the state,
-    /// standing in for a kill at that point.
-    static BEFORE_RUN_STATE_CLEAR: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
-        const { std::cell::Cell::new(None) };
 }
 
 // A gate wait is a plain call in a normal build. The test build routes it through
@@ -584,9 +440,8 @@ pub(crate) fn run_gate(
 }
 
 /// `run_gate`'s body, parameterized on the wait's timeout (WR-02, phase 20
-/// review) so [`finish_workflow_with_gate_timeout`]'s retry-gate wait can
-/// pass a bounded timeout instead of [`gate_timeout_secs`]'s multi-day
-/// production default.
+/// review) so a caller can pass a bounded timeout instead of
+/// [`gate_timeout_secs`]'s multi-day production default.
 ///
 /// The bound protocol (D-04, D-05): a fresh gate id with this waiter registered before
 /// the gate file is published, that registration held for the whole wait, a wait for
@@ -601,12 +456,8 @@ pub(crate) fn run_gate_with_timeout(
     // 23-09 (D-04/D-05/D-06): a pre-authorized response to write for this
     // gate, or `None` for a real human gate. This function must NEVER
     // derive this value from `state` (e.g. `state.yes_ship`) — the decision
-    // belongs to the caller precisely so the reopened finalization-retry
-    // gate in `finish_workflow_with_gate_timeout` cannot inherit an
-    // authorization meant only for the routine Ship approval. The regression
-    // test `finalization_retry_gate_never_auto_approves_even_with_yes_ship_set`
-    // (pipeline_outcomes.rs) fails loudly if a future refactor reads the
-    // flag from `state` inside this function instead of receiving it here.
+    // belongs to the caller, so no gate other than the routine Ship approval
+    // in `handle_ship_outcome` can inherit an authorization meant for it.
     auto_response: Option<&GateResponse>,
 ) -> Result<GateAction, CliError> {
     commit(state, |s| s.gate_pending = true)?;
@@ -918,12 +769,6 @@ pub(crate) fn print_dry_run(state: &State) {
             ""
         };
         println!("  {s:<9} {command}{gate}{phase_gate}{stop_marker}");
-        if let Some(next) = s.next() {
-            let transition_hooks = hooks::hooks_for_transition(s, next);
-            if !transition_hooks.is_empty() {
-                println!("            ↳ hooks: {transition_hooks:?}");
-            }
-        }
         stage = s.next();
     }
     if let Some(until) = state.stop_until {
@@ -944,7 +789,6 @@ pub(crate) fn print_dry_run(state: &State) {
             "not pre-authorized"
         }
     );
-    println!("\nafter ship: {:?}", hooks::hooks_after_ship());
 }
 
 #[cfg(test)]
@@ -1042,61 +886,6 @@ mod tests {
         assert!(!Gates::gate_path(root, phase, Stage::Validate).exists());
     }
 
-    /// 23-06 Task 1 acceptance: a real Ship finalization emits the
-    /// terminal-only `workflow_shipped` event, and
-    /// `ship_evidence::collect` reads it as `shipped: true` — proving the
-    /// event this module emits is exactly the one the oracle consumes.
-    #[test]
-    fn advance_ship_success_emits_workflow_shipped_and_ship_evidence_reports_shipped() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        init_repo(root);
-
-        let phase = PhaseId::new(23);
-        let branch = format!("feature/phase-{padded}", padded = phase.padded());
-        let branch_created = devflow_core::test_support::git_command(root)
-            .args(["branch", &branch, "develop"])
-            .status()
-            .unwrap()
-            .success();
-        assert!(branch_created);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Ship;
-        workflow::save_state(&state).unwrap();
-
-        std::fs::write(
-            agent_result::stdout_path(root, phase),
-            "DEVFLOW_RESULT: {\"status\":\"success\"}\n",
-        )
-        .unwrap();
-
-        preanswer_gate(
-            root,
-            phase,
-            Stage::Ship,
-            &serde_json::from_str(r#"{"approved":true,"note":null,"responded_by":"test"}"#)
-                .unwrap(),
-        );
-
-        advance(root, Some(phase)).unwrap();
-
-        assert!(
-            devflow_core::events::has_event_for_phase(root, phase, "workflow_shipped"),
-            "a real Ship finalization must emit the terminal-only workflow_shipped event"
-        );
-        let evidence = devflow_core::ship_evidence::collect(root, phase);
-        assert!(
-            evidence.shipped,
-            "ship_evidence must read the just-emitted workflow_shipped event as shipped"
-        );
-        // The pre-existing invariant several other tests in this module
-        // depend on: the phase's event stream still ends in
-        // workflow_finished, unmodified by this task's additive emission.
-        let last = devflow_core::events::last_event_for_phase(root, phase)
-            .expect("events recorded for phase");
-        assert_eq!(last["event"], "workflow_finished");
-    }
-
     /// 23-06 Task 1's named blocker regression guard (BLOCKER 1,
     /// cross-AI-review-caught): a phase halted cleanly by `devflow start
     /// --until <stage>` runs `transition`'s `stop_until` clean-stop branch,
@@ -1161,388 +950,6 @@ mod tests {
             reloaded.supervisor, None,
             "the --until stop clears the supervisor record"
         );
-    }
-
-    #[test]
-    fn terminal_merge_failure_reopens_actionable_gate_and_never_reports_finished() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        init_repo(root);
-        let git = |args: &[&str]| {
-            let output = devflow_core::test_support::git_command(root)
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(output.status.success(), "git {args:?} failed");
-        };
-        git(&["checkout", "-q", "-b", "feature/phase-22"]);
-        std::fs::write(root.join("conflict.txt"), "feature\n").unwrap();
-        git(&["add", "conflict.txt"]);
-        git(&["commit", "-q", "-m", "feature change"]);
-        git(&["checkout", "-q", "develop"]);
-        std::fs::write(root.join("conflict.txt"), "develop\n").unwrap();
-        git(&["add", "conflict.txt"]);
-        git(&["commit", "-q", "-m", "develop change"]);
-
-        let mut state = State::new(
-            PhaseId::new(22),
-            AgentKind::Claude,
-            Mode::Auto,
-            root.to_path_buf(),
-        );
-        state.stage = Stage::Ship;
-        workflow::save_state(&state).unwrap();
-
-        let root_owned = root.to_path_buf();
-        let handle = std::thread::spawn(move || {
-            let mut state = workflow::load_state(&root_owned, PhaseId::new(22)).unwrap();
-            finish_workflow(&root_owned, &mut state)
-        });
-        let gate_path = Gates::gate_path(root, PhaseId::new(22), Stage::Ship);
-        for _ in 0..100 {
-            if gate_path.exists() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-
-        assert!(
-            gate_path.exists(),
-            "finalization failure must reopen Ship gate"
-        );
-        assert!(
-            workflow::load_state(root, PhaseId::new(22))
-                .unwrap()
-                .gate_pending
-        );
-        answer_open_gate(
-            root,
-            PhaseId::new(22),
-            Stage::Ship,
-            &GateResponse {
-                approved: false,
-                note: Some("abort after merge conflict".into()),
-                responded_by: Some("test".into()),
-            },
-        )
-        .unwrap();
-        handle.join().unwrap().unwrap();
-
-        assert_ne!(
-            events::last_event_for_phase(root, PhaseId::new(22))
-                .and_then(|event| event["event"].as_str().map(str::to_owned))
-                .as_deref(),
-            Some("workflow_finished")
-        );
-        let tags = devflow_core::test_support::git_command(root)
-            .arg("tag")
-            .output()
-            .unwrap();
-        assert!(tags.stdout.is_empty());
-    }
-
-    /// 23-09 Task 2 (T-23-91's regression guard, cross-AI-review HIGH): with
-    /// `state.yes_ship` set, a terminal-hook failure that reopens the
-    /// finalization gate must NOT be auto-approved — the reopened gate is a
-    /// different call site (passing `None`) than the routine Ship approval
-    /// in `handle_ship_outcome` (passing `Some`), and this is the concrete
-    /// proof. If a future refactor folds `state.yes_ship` into
-    /// `run_gate_with_timeout`'s own body instead of threading it as a
-    /// caller argument (see that parameter's doc comment), this test fails
-    /// loudly: the reopened gate would then find an unexpected response and
-    /// never block for a human.
-    ///
-    /// `VersionBump` is failed deterministically via `version::compute_version`
-    /// itself refusing (D-10's `UnreachableBaseline`), rather than by
-    /// pre-creating a tag name for `git.tag(&tag)` to collide with
-    /// (`hooks.rs:286-287`).
-    ///
-    /// **Why not a tag-name collision (25-01 rewrite, D-07/D-08):** the prior
-    /// (pre-25-01) algorithm derived MINOR from a raw, reachability-blind git
-    /// tag *count*, so pre-creating one extra tag deterministically
-    /// incremented that count by exactly one, and the fixture could predict
-    /// and pre-create the exact resulting tag name. The 25-01 algorithm is
-    /// no longer count-based: `compute_version` derives its baseline from
-    /// the highest semver tag *reachable from HEAD*, and always bumps
-    /// strictly past that baseline (D-10's no-bump-collapses-to-patch floor
-    /// guarantees this even when nothing in the range warrants a bump — see
-    /// `apply_bump`'s doc comment in `version.rs`). Consequently, pre-creating
-    /// ANY tag reachable from HEAD makes it become the new baseline the next
-    /// time `compute_version` runs, and the recomputed result is
-    /// *unconditionally different* from (one patch past) whatever we just
-    /// created — there is no reachable tag this fixture could create that
-    /// `compute_version` would ever predict again, so a tag-name collision
-    /// can no longer be constructed this way. (Confirmed empirically during
-    /// this rewrite: pre-creating the tag `compute_version` returned before
-    /// any tag existed did not collide — `VersionBump`'s own later call saw
-    /// that tag as the new reachable baseline and computed the next patch
-    /// past it instead, so `finish_workflow` shipped successfully instead of
-    /// re-opening the gate this test exists to exercise.)
-    ///
-    /// Instead, this fixture tags an **unreachable** orphan commit
-    /// (`git tag` sees it via [`devflow_core::version::highest_semver_tag`]'s
-    /// reachability-blind repo-wide scan; `develop`'s own reachable baseline
-    /// stays `None` because the tag is not an ancestor of `develop`) — D-10's
-    /// refusal fires unconditionally in that state, independent of any
-    /// version arithmetic, so `VersionBump` fails deterministically before it
-    /// ever reaches its `git.tag(&tag)` call. `Merge` still runs first in
-    /// `hooks_after_ship` and succeeds — the feature branch is created
-    /// identical to `develop`, so `is_merged_into_develop` is immediately
-    /// true and `merge_feature` takes its already-merged no-op success
-    /// path — exactly the "Merge has already succeeded" state the reopened
-    /// gate exists for (no rollback policy, `hooks.rs` doc comment on
-    /// `merge_feature`).
-    #[test]
-    fn finalization_retry_gate_never_auto_approves_even_with_yes_ship_set() {
-        const NAME: &str = "pipeline_gate::tests::finalization_retry_gate_never_auto_approves_even_with_yes_ship_set";
-        enter_path_isolated_child!(NAME, agent_free_git_only_path_dir());
-        assert!(
-            std::env::var_os(devflow_core::test_support::CHILD_TEST_ENV).is_some(),
-            "abort-fixture test must run in a child with an agent-free PATH (999.80)"
-        );
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        init_repo(root);
-
-        // Tag an orphan commit unreachable from `develop` — this makes
-        // `version::compute_version` refuse unconditionally (D-10's
-        // `UnreachableBaseline`) once `VersionBump` calls it, regardless of
-        // any subsequent state. `develop` is where `init_repo` leaves HEAD
-        // checked out, and is restored as the checkout before continuing.
-        let git_cmd = |args: &[&str]| {
-            assert!(
-                devflow_core::test_support::git_command(root)
-                    .args(args)
-                    .output()
-                    .unwrap()
-                    .status
-                    .success(),
-                "git {args:?} failed"
-            );
-        };
-        git_cmd(&["checkout", "--orphan", "unreachable-release"]);
-        git_cmd(&["commit", "--allow-empty", "-q", "-m", "chore: orphan"]);
-        git_cmd(&["tag", "v9.9.9"]);
-        git_cmd(&["checkout", "develop"]);
-        assert!(
-            devflow_core::version::compute_version(root).is_err(),
-            "the orphan tag must make compute_version refuse (D-10) before \
-             VersionBump ever gets to its own git.tag(&tag) call"
-        );
-
-        let phase = PhaseId::new(60);
-        let branch = format!("feature/phase-{padded}", padded = phase.padded());
-        let branch_created = devflow_core::test_support::git_command(root)
-            .args(["branch", &branch, "develop"])
-            .status()
-            .unwrap()
-            .success();
-        assert!(branch_created);
-
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Ship;
-        state.yes_ship = true;
-        workflow::save_state(&state).unwrap();
-
-        let root_owned = root.to_path_buf();
-        let handle = std::thread::spawn(move || {
-            let mut state = workflow::load_state(&root_owned, phase).unwrap();
-            finish_workflow(&root_owned, &mut state)
-        });
-
-        let gate_path = Gates::gate_path(root, phase, Stage::Ship);
-        for _ in 0..150 {
-            if gate_path.exists() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        assert!(
-            gate_path.exists(),
-            "a terminal-hook failure must reopen the Ship gate even with yes_ship set"
-        );
-
-        // Give any (incorrect) auto-write a moment to have happened if it
-        // were ever going to.
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        assert!(
-            gate_answer_files(root, phase, Stage::Ship).is_empty(),
-            "yes_ship must NEVER auto-approve the reopened finalization-retry gate \
-             (T-23-91) — a failing finalization must wait for a human"
-        );
-        assert!(
-            workflow::load_state(root, phase).unwrap().gate_pending,
-            "the reopened gate must be recorded as pending, awaiting a human"
-        );
-        assert!(
-            devflow_core::events::has_event_for_phase(root, phase, "merge_result"),
-            "Merge must have succeeded before VersionBump failed — the reopened gate must be \
-             exercised in the state it actually occurs in"
-        );
-
-        // Unblock the poll (reject, not approve — this test's subject is
-        // that nothing auto-approves it) so the spawned thread can finish.
-        answer_open_gate(
-            root,
-            phase,
-            Stage::Ship,
-            &GateResponse {
-                approved: false,
-                note: Some("abort: test cleanup".into()),
-                responded_by: Some("test".into()),
-            },
-        )
-        .unwrap();
-        handle.join().unwrap().unwrap();
-    }
-
-    /// 13-DEFERRED-CR-03 acceptance: two phases advancing their Ship stages
-    /// CONCURRENTLY must each finish their own stage machine — per-phase
-    /// state files prevent cross-phase clobbering, and the coarse checkout
-    /// lock serializes both `finish_workflow`s' git operations on the shared
-    /// primary checkout. Gate responses are pre-seeded so neither advance
-    /// blocks polling on its *first* Ship gate.
-    ///
-    /// 17-09 gap closure (GAP-2): both phases compute their next version from
-    /// the same starting git state, and on some runs genuinely race to
-    /// create the same version tag — confirmed directly during this plan's
-    /// RED phase via temporary debug instrumentation, which caught both
-    /// threads inside `version_bump` with the identical computed version
-    /// (`2.0.1`) within ~1.8ms of each other, and the loser's `git tag`
-    /// failing with git's own "reference already exists". That failure
-    /// reopens the loser's Ship gate for human review (`finish_workflow`'s
-    /// retry loop) — but only ONE gate response was ever pre-written per
-    /// phase (consumed by its first gate open), so the reopened gate has
-    /// nothing to consume. Unbounded, the gate wait then waits on the
-    /// 7-day production default (`DEVFLOW_GATE_TIMEOUT_SECS`) with no
-    /// response ever arriving — that is the wedge this plan closes.
-    ///
-    /// The binding constraint is "never hangs," not "always both succeed."
-    /// This test does not try to make the race loser also succeed (that
-    /// would require re-answering a gate reactively and still not rule out
-    /// a second, equally rare collision) — instead it bounds the reopened
-    /// gate's poll to a few seconds via `DEVFLOW_GATE_TIMEOUT_SECS`
-    /// (overridden ONLY for this test's poll, under the established
-    /// `ENV_MUTEX` guard — the 7-day production default is never touched)
-    /// and asserts the loser's documented behavior: a bounded timeout error,
-    /// state left intact (not cleared), and an actionable Ship gate still on
-    /// disk awaiting a human. The common case (no collision) still asserts
-    /// both phases finish independently, exactly as before.
-    #[test]
-    // D-09 (48-09): mutates `DEVFLOW_GATE_TIMEOUT_SECS` process-wide.
-    // Deferred deliberately, not overlooked: THIS process reads the value, so
-    // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
-    // race and the value is restored on every exit path, unwinding included.
-    #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
-    fn concurrent_ship_advances_finish_both_phases_independently() {
-        let _guard = env_lock();
-        let original_gate_timeout = std::env::var_os("DEVFLOW_GATE_TIMEOUT_SECS");
-        // SAFETY: serialized under ENV_MUTEX. Bounds a reopened Ship gate's
-        // poll to a few seconds instead of the 7-day production default.
-        // Every OTHER test that reaches `run_gate` pre-writes its response
-        // before calling in, so the wait finds it on the very first
-        // read regardless of this value — only a *reopened*, unanswered
-        // gate (this test's race-loser path) ever actually waits it out.
-        unsafe {
-            std::env::set_var("DEVFLOW_GATE_TIMEOUT_SECS", "2");
-        }
-
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        init_repo(root);
-
-        let phases = [PhaseId::new(31), PhaseId::new(32)];
-        for &phase in &phases {
-            let branch = format!("feature/phase-{padded}", padded = phase.padded());
-            let branch_created = devflow_core::test_support::git_command(root)
-                .args(["branch", &branch, "develop"])
-                .status()
-                .unwrap()
-                .success();
-            assert!(branch_created);
-            let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-            state.stage = Stage::Ship;
-            workflow::save_state(&state).unwrap();
-            std::fs::write(
-                agent_result::stdout_path(root, phase),
-                "DEVFLOW_RESULT: {\"status\":\"success\"}\n",
-            )
-            .unwrap();
-            preanswer_gate(
-                root,
-                phase,
-                Stage::Ship,
-                &serde_json::from_str(r#"{"approved":true,"note":null,"responded_by":"test"}"#)
-                    .unwrap(),
-            );
-        }
-
-        let results: Vec<(PhaseId, Result<(), CliError>)> = std::thread::scope(|scope| {
-            let handles: Vec<_> = phases
-                .iter()
-                .map(|&phase| (phase, scope.spawn(move || advance(root, Some(phase)))))
-                .collect();
-            handles
-                .into_iter()
-                .map(|(phase, handle)| (phase, handle.join().expect("advance thread")))
-                .collect()
-        });
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_gate_timeout {
-                Some(value) => std::env::set_var("DEVFLOW_GATE_TIMEOUT_SECS", value),
-                None => std::env::remove_var("DEVFLOW_GATE_TIMEOUT_SECS"),
-            }
-        }
-
-        let succeeded = results.iter().filter(|(_, r)| r.is_ok()).count();
-        assert!(
-            succeeded == 1 || succeeded == 2,
-            "at least one phase must finish independently of the other; got {succeeded}/2 successes"
-        );
-
-        for (phase, result) in &results {
-            match result {
-                Ok(()) => {
-                    assert!(
-                        matches!(
-                            workflow::load_state(root, *phase),
-                            Err(workflow::WorkflowError::MissingState(_))
-                        ),
-                        "phase {phase} must be finished (state cleared)"
-                    );
-                    assert!(!Gates::gate_path(root, *phase, Stage::Ship).exists());
-                    let last = devflow_core::events::last_event_for_phase(root, *phase)
-                        .expect("events recorded for phase");
-                    assert_eq!(
-                        last["event"], "workflow_finished",
-                        "phase {phase}'s own event stream must end in workflow_finished"
-                    );
-                }
-                Err(err) => {
-                    // The documented loser behavior (GAP-2): a version-tag
-                    // race lost by VersionBump reopens the Ship gate for a
-                    // human; with no second response pre-written, the
-                    // bounded poll above times out rather than hanging.
-                    assert!(
-                        err.to_string().contains("timed out"),
-                        "phase {phase}'s only non-success outcome must be a bounded gate \
-                         timeout, not some other failure: {err}"
-                    );
-                    let state = workflow::load_state(root, *phase)
-                        .expect("a timed-out gate leaves state intact, not cleared");
-                    assert!(
-                        state.gate_pending,
-                        "phase {phase} must leave an actionable, still-open gate for a human"
-                    );
-                    assert!(
-                        Gates::gate_path(root, *phase, Stage::Ship).exists(),
-                        "phase {phase}'s reopened Ship gate file must remain on disk"
-                    );
-                }
-            }
-        }
     }
 
     /// An `abort` whose state cannot be removed says so, on the event a supervisor's
@@ -1769,7 +1176,7 @@ mod tests {
         assert_eq!(state.consecutive_failures, 2);
     }
 
-    /// A phase parked at Stage::Ship in a repo whose terminal hooks can finish it.
+    /// A phase parked at Stage::Ship, with its feature branch cut from `develop`.
     fn ship_ready_fixture(root: &Path, phase: PhaseId) {
         init_repo(root);
         let branch = format!("feature/phase-{padded}", padded = phase.padded());
@@ -1783,118 +1190,6 @@ mod tests {
         state.stage = Stage::Ship;
         state.gate_notify_cmd = Some("true".to_string());
         workflow::save_state(&state).unwrap();
-    }
-
-    /// Approve the Ship gate a live waiter is on. A waiter can consume the answer and close
-    /// the gate before the writer's re-check, which then reports the gate closed although the
-    /// answer was acted on. The caller's assertions on the outcome decide.
-    fn approve_a_gate_with_a_waiter(root: &Path, phase: PhaseId) {
-        match answer_open_gate(root, phase, Stage::Ship, &approval()) {
-            Ok(_) | Err(gates::GateError::GateClosedAfterPublish { .. }) => {}
-            Err(other) => panic!("the approval was not published: {other}"),
-        }
-    }
-
-    /// An approved finalization retry after `ChangelogAppend` failed must not cut a second
-    /// release: the hooks that succeeded stay done, and the changelog written by the retry
-    /// names the one tag and carries the body computed before that tag existed.
-    #[test]
-    fn a_finalization_retry_does_not_repeat_the_version_bump() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(93);
-        ship_ready_fixture(root, phase);
-        let git = |args: &[&str]| {
-            let output = devflow_core::test_support::git_command(root)
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(output.status.success(), "git {args:?} failed");
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
-        };
-        git(&["checkout", "-q", "feature/phase-93"]);
-        std::fs::write(root.join("work.txt"), "work\n").unwrap();
-        git(&["add", "work.txt"]);
-        git(&["commit", "-q", "-m", "feat: the phase's only change"]);
-        git(&["checkout", "-q", "develop"]);
-        // A directory where the changelog goes fails `ChangelogAppend` only.
-        std::fs::create_dir(root.join("CHANGELOG.md")).unwrap();
-
-        let finished = std::thread::scope(|scope| {
-            let finalizing = scope.spawn(|| {
-                let mut state = workflow::load_state(root, phase).unwrap();
-                finish_workflow_with_gate_timeout(root, &mut state, 30)
-            });
-            wait_for_open_gate(root, phase, Stage::Ship);
-            std::fs::remove_dir(root.join("CHANGELOG.md")).unwrap();
-            approve_a_gate_with_a_waiter(root, phase);
-            finalizing.join().unwrap()
-        });
-        finished.expect("the retry finishes the batch");
-
-        let tags = git(&["tag"]);
-        assert_eq!(tags.lines().count(), 1, "one release, got tags: {tags}");
-        assert_eq!(hook_runs(root, "VersionBump"), 1);
-        assert_eq!(hook_runs(root, "ChangelogAppend"), 2);
-        let changelog = std::fs::read_to_string(root.join("CHANGELOG.md")).unwrap();
-        let version = tags.strip_prefix('v').unwrap();
-        assert!(
-            changelog.contains(&format!("## {version} ")),
-            "the heading names the tag {tags}: {changelog}"
-        );
-        assert!(
-            changelog.contains("the phase's only change"),
-            "the body computed before the tag reaches the retry: {changelog}"
-        );
-    }
-
-    /// The retry gate asks the operator to resolve the failure and approve. A repair committed
-    /// to the feature branch must be merged by the retry, or the same failure comes back,
-    /// and it must still not cut a second release.
-    #[test]
-    fn a_finalization_retry_merges_a_repair_without_a_second_tag() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(92);
-        ship_ready_fixture(root, phase);
-        let git = |args: &[&str]| {
-            let output = devflow_core::test_support::git_command(root)
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(output.status.success(), "git {args:?} failed");
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
-        };
-        // A directory where the changelog goes fails `ChangelogAppend` only.
-        std::fs::create_dir(root.join("CHANGELOG.md")).unwrap();
-
-        let (finished, repair) = std::thread::scope(|scope| {
-            let finalizing = scope.spawn(|| {
-                let mut state = workflow::load_state(root, phase).unwrap();
-                finish_workflow_with_gate_timeout(root, &mut state, 30)
-            });
-            wait_for_open_gate(root, phase, Stage::Ship);
-            git(&["checkout", "-q", "feature/phase-92"]);
-            std::fs::write(root.join("repair.txt"), "repair\n").unwrap();
-            git(&["add", "repair.txt"]);
-            git(&["commit", "-q", "-m", "fix: the repair"]);
-            let repair = git(&["rev-parse", "HEAD"]);
-            git(&["checkout", "-q", "develop"]);
-            std::fs::remove_dir(root.join("CHANGELOG.md")).unwrap();
-            approve_a_gate_with_a_waiter(root, phase);
-            (finalizing.join().unwrap(), repair)
-        });
-        finished.expect("the retry finishes the batch");
-
-        let on_develop = devflow_core::test_support::git_command(root)
-            .args(["merge-base", "--is-ancestor", &repair, "develop"])
-            .status()
-            .unwrap()
-            .success();
-        assert!(on_develop, "the repair was never merged");
-        let tags = git(&["tag"]);
-        assert_eq!(tags.lines().count(), 1, "one release, got tags: {tags}");
-        assert_eq!(hook_runs(root, "VersionBump"), 1);
     }
 
     /// The wait for a recovery is bounded: a stuck write-lock holder refuses the claim and
@@ -1938,42 +1233,6 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-    }
-
-    /// A process killed between deleting the state and recording the ship must not leave a
-    /// shipped run that reads as not shipped: by the moment the state goes, the strict shipped
-    /// predicate is already on disk. Runs the whole finalization, reading the
-    /// evidence at the last instant before the state is removed.
-    #[test]
-    fn workflow_shipped_is_recorded_before_the_state_is_cleared() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(96);
-        ship_ready_fixture(root, phase);
-
-        let seen = std::rc::Rc::new(std::cell::Cell::new(None));
-        BEFORE_RUN_STATE_CLEAR.set(Some(Box::new({
-            let seen = seen.clone();
-            let root = root.to_path_buf();
-            move || {
-                let evidence = devflow_core::ship_evidence::collect(&root, phase);
-                seen.set(Some((evidence.state_present, evidence.shipped)));
-            }
-        })));
-        let mut state = workflow::load_state(root, phase).unwrap();
-        finish_workflow_with_gate_timeout(root, &mut state, 2).unwrap();
-
-        assert_eq!(
-            seen.get(),
-            Some((true, true)),
-            "(state_present, shipped) at the instant before the state is cleared"
-        );
-        let last = devflow_core::events::last_event_for_phase(root, phase).unwrap();
-        assert_eq!(
-            last["event"], "workflow_finished",
-            "the stream still ends in the finish"
-        );
-        assert_eq!(events_named(root, "workflow_shipped").len(), 1);
     }
 
     /// 18d concurrency edge: two concurrently-active phases' `consecutive_failures`
@@ -2687,7 +1946,7 @@ mod tests {
         assert_eq!(after.last_verification_mtime_nanos, Some(MTIME_NANOS));
     }
 
-    // ---- 50.1-22: where a stop lands around finalization (D-13 items 7 and 8, D-18) ----
+    // ---- 50.1-22: where a stop lands at an auto-answered Ship gate (D-13 item 8) ----
 
     /// A supervisor published in this process and recorded in `state`, so an advance
     /// engaged on it passes the ownership fence. Its agent group is 0: nothing here ever
@@ -2753,174 +2012,6 @@ mod tests {
                 .token()
                 .request_stop(devflow_core::supervisor::runtime::StopSource::Socket);
         }
-    }
-
-    /// A phase at Ship whose every finalization pass fails at `VersionBump`, after a
-    /// `Merge` that succeeds: a tag no branch reaches makes `compute_version` refuse
-    /// (D-10). The state records a supervisor.
-    fn finalization_that_fails_each_pass(root: &Path, phase: PhaseId) -> RecordedSupervisor {
-        init_repo(root);
-        let git = |args: &[&str]| {
-            let output = devflow_core::test_support::git_command(root)
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(output.status.success(), "git {args:?} failed: {output:?}");
-        };
-        git(&["checkout", "-q", "--orphan", "unreachable-release"]);
-        git(&["commit", "-q", "--allow-empty", "-m", "chore: orphan"]);
-        git(&["tag", "v9.9.9"]);
-        git(&["checkout", "-q", "develop"]);
-        git(&[
-            "branch",
-            &format!("feature/phase-{}", phase.padded()),
-            "develop",
-        ]);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Ship;
-        let engaged = RecordedSupervisor::serve(&mut state);
-        workflow::save_state(&state).unwrap();
-        engaged
-    }
-
-    /// Run finalization on a thread with `engaged` as its supervisor and `probe` counting
-    /// its claims, so a claim holds there until the test lets it go.
-    fn spawn_engaged_finalization(
-        root: &Path,
-        phase: PhaseId,
-        engaged: &RecordedSupervisor,
-        probe: &std::sync::Arc<ClaimProbe>,
-    ) -> std::thread::JoinHandle<Result<(), CliError>> {
-        let root = root.to_path_buf();
-        let token = engaged.supervisor.token();
-        let launch_id = engaged.launch_id.clone();
-        let probe = probe.clone();
-        std::thread::spawn(move || {
-            CLAIM_PROBE.set(Some(probe));
-            let _engaged = crate::pipeline_launch::StopTokenGuard::engage(token, launch_id);
-            let mut state = workflow::load_state(&root, phase).unwrap();
-            finish_workflow_with_gate_timeout(&root, &mut state, 30)
-        })
-    }
-
-    /// Answer the retry gate that is open now with an approval, and return once the
-    /// finalization thread has claimed it and holds in `note_claim`, before it has acted.
-    fn approve_the_retry_gate_and_hold_its_claim(
-        root: &Path,
-        phase: PhaseId,
-        probe: &ClaimProbe,
-    ) -> gates::GateId {
-        use std::sync::atomic::Ordering::SeqCst;
-        const CLAIMED_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
-        let gate = wait_for_open_gate(root, phase, Stage::Ship);
-        assert!(
-            gate_answer_files(root, phase, Stage::Ship).is_empty(),
-            "the retry gate is never auto-approved"
-        );
-        answer_open_gate(root, phase, Stage::Ship, &approval()).unwrap();
-        let started = std::time::Instant::now();
-        while probe.claimed.load(SeqCst) == 0 {
-            assert!(
-                started.elapsed() < CLAIMED_WITHIN,
-                "the retry gate's answer was not claimed within {CLAIMED_WITHIN:?}"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        gate
-    }
-
-    /// How many `hook` runs the event log records: one per finalization pass that reached it.
-    fn hook_runs(root: &Path, hook: &str) -> usize {
-        events_named(root, "hook_run")
-            .iter()
-            .filter(|event| event["hook"] == hook)
-            .count()
-    }
-
-    /// D-13 item 7: safe point 6 runs before every finalization pass. A stop that lands
-    /// while an approved retry is on its way back to the loop runs no second merge, version
-    /// bump, tag or push.
-    #[test]
-    fn a_stop_during_a_finalization_retry_is_honoured_before_the_next_pass() {
-        use std::sync::atomic::Ordering::SeqCst;
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(2211);
-        let engaged = finalization_that_fails_each_pass(root, phase);
-        let probe = std::sync::Arc::new(ClaimProbe::default());
-        let finalizing = spawn_engaged_finalization(root, phase, &engaged, &probe);
-
-        approve_the_retry_gate_and_hold_its_claim(root, phase, &probe);
-        engaged.request_stop();
-        probe.already_consumed.fetch_add(1, SeqCst);
-        let result = finalizing.join().unwrap();
-
-        assert_eq!(
-            hook_runs(root, "Merge"),
-            1,
-            "the stop ran no second pass: {result:?}"
-        );
-        let error = result
-            .expect_err("a stopped finalization does not ship")
-            .to_string();
-        assert!(error.contains("finalization did not run"), "{error}");
-        let stopped = events_named(root, "advance_stopped");
-        assert_eq!(stopped.len(), 1, "{stopped:?}");
-        assert_eq!(stopped[0]["safe_point"], 6, "{}", stopped[0]);
-        assert_eq!(stopped[0]["source"], "supervisor", "{}", stopped[0]);
-        assert!(events_named(root, "workflow_shipped").is_empty());
-        let state = workflow::load_state(root, phase).unwrap();
-        assert!(state.stopped);
-        assert_eq!(
-            state.stop_reason.as_deref(),
-            Some(crate::pipeline_launch::ADVANCE_STOP_REASON)
-        );
-        assert!(!state.gate_pending);
-        assert!(!Gates::gate_path(root, phase, Stage::Ship).exists());
-    }
-
-    /// The control for the stop above: the same approved retry with no stop runs the next
-    /// pass and reopens the gate, so the hook count above is one because of the stop.
-    #[test]
-    fn without_a_stop_an_approved_finalization_retry_runs_the_next_pass() {
-        use std::sync::atomic::Ordering::SeqCst;
-        const NEXT_PASS_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(2212);
-        let engaged = finalization_that_fails_each_pass(root, phase);
-        let probe = std::sync::Arc::new(ClaimProbe::default());
-        let finalizing = spawn_engaged_finalization(root, phase, &engaged, &probe);
-
-        let first_gate = approve_the_retry_gate_and_hold_its_claim(root, phase, &probe);
-        probe.already_consumed.fetch_add(1, SeqCst);
-
-        let started = std::time::Instant::now();
-        while hook_runs(root, "VersionBump") < 2
-            || !Gates::gate_path(root, phase, Stage::Ship).exists()
-            || live_gate_id(root, phase, Stage::Ship) == first_gate
-        {
-            assert!(
-                started.elapsed() < NEXT_PASS_WITHIN,
-                "the approved retry must run the next pass and reopen the gate"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert_eq!(hook_runs(root, "Merge"), 2);
-        assert!(events_named(root, "advance_stopped").is_empty());
-
-        answer_open_gate(
-            root,
-            phase,
-            Stage::Ship,
-            &GateResponse {
-                approved: false,
-                note: Some("abort: test cleanup".into()),
-                responded_by: Some("test".into()),
-            },
-        )
-        .unwrap();
-        finalizing.join().unwrap().unwrap();
     }
 
     /// One auto-answered Ship gate at `root`, with a stop token engaged on this thread and
@@ -3032,59 +2123,5 @@ mod tests {
         assert_eq!(action, GateAction::Advance);
         assert!(notify_marker(&running).exists(), "control: the notify runs");
         assert_eq!(events_named(&running, "gate_fired").len(), 1);
-    }
-
-    /// Comment text as it reads: each line's indent and comment marker dropped, the lines
-    /// joined, whitespace collapsed, so a sentence wrapped over two lines still matches.
-    fn comment_normal_form(source: &str) -> String {
-        source
-            .lines()
-            .map(|line| {
-                let line = line.trim_start();
-                ["///", "//!", "//"]
-                    .iter()
-                    .find_map(|marker| line.strip_prefix(marker))
-                    .unwrap_or(line)
-            })
-            .collect::<Vec<_>>()
-            .join(" ")
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-
-    /// D-13 item 8, the comment: under D-06 a resumed run reruns Ship, and a saved `yes_ship`
-    /// auto-approves its new gate, so it does not "ask again". The planted control is the
-    /// comment as it stood, whose sentence wraps, so a search of the raw text never finds it.
-    #[test]
-    fn the_safe_point_6_comment_states_what_a_resumed_run_does() {
-        const STALE: &str = "a resumed run asks again";
-        const WRAPPED_AS_IT_STOOD: &str = "    // bump, tag and push. The consumed approval is cleared with it, so a\n    // resumed run asks again. Outside a supervisor's advance (the foreground\n";
-        assert!(
-            !WRAPPED_AS_IT_STOOD.contains(STALE),
-            "control: the raw search misses the wrapped sentence"
-        );
-        assert!(
-            comment_normal_form(WRAPPED_AS_IT_STOOD).contains(STALE),
-            "control: the normal form catches it"
-        );
-
-        let (non_test, _) = include_str!("pipeline_gate.rs")
-            .split_once("\n#[cfg(test)]\nmod tests {")
-            .expect("this file has a test module");
-        assert!(
-            !comment_normal_form(non_test).contains(STALE),
-            "the stale sentence is gone"
-        );
-        let safe_point_6: Vec<&str> = non_test
-            .lines()
-            .skip_while(|line| !line.trim_start().starts_with("// Safe point 6"))
-            .take_while(|line| line.trim_start().starts_with("//"))
-            .collect();
-        assert!(!safe_point_6.is_empty(), "the safe point 6 comment exists");
-        assert!(
-            comment_normal_form(&safe_point_6.join("\n")).contains("`yes_ship`"),
-            "{safe_point_6:?}"
-        );
     }
 }
