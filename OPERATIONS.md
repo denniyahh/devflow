@@ -308,7 +308,7 @@ A rate-limited stage gets one of two answers.
   way on after the reset once that supervisor has ended. Waiting for quota
   does not count toward the infra ceiling, so it cannot abort the run, and
   DevFlow does not yet relaunch by itself at the reset time: answer the gate
-  or resume by hand. No `cron-instructions-NN.json` is written.
+  or resume by hand.
 
 Only top-level events decide a rate limit: a subagent's rate-limit event or
 `result` in the capture does not. A stage that went silent with no quota
@@ -344,10 +344,9 @@ The failover events in `events.jsonl`:
 | `gate_relaunch_refused` | A retry or loop-back answer to a stage's failure gate was not relaunched, because the delivery canary recorded for the run refuses its agent; the run is marked stopped | `stage`, `agent`, `reason` (the recorded refusal) |
 
 `agent_handoff_relaunch_failed` is followed by the never-silent Code gate
-(`gate_fired`), or by an abort when the run is at the infra ceiling, never by
-cron instructions. When the fallback's delivery canary refused, a scheduled
-resume would only fail again: the refusal stays recorded for the run and
-refuses every later launch. And after a shutdown that could not be confirmed, a
+(`gate_fired`), or by an abort when the run is at the infra ceiling. When the
+fallback's delivery canary refused, a resume would only fail again: the
+refusal stays recorded for the run and refuses every later launch. And after a shutdown that could not be confirmed, a
 successor may still be running. The gate names the cause as
 `the handoff to <agent> could not relaunch the code stage: <error>`. When the
 recorded canary refuses the agent, the gate context (and so the notify hook)
@@ -424,9 +423,7 @@ The command is saved in the run's state file (`gate_notify_cmd` in
 without your shell's environment. `devflow start`, `resume` and `advance`
 update the saved command from the variable: unset keeps it, a new value
 replaces it, and an empty value (`DEVFLOW_GATE_NOTIFY_CMD= devflow resume …`)
-turns notification off for the run. A scheduled rate-limit resume is itself a
-`devflow resume`, so a variable set in the scheduler's environment applies to
-it the same way.
+turns notification off for the run.
 
 `resume` refuses while a run is live (an agent running or a gate waiting), so
 it changes the hook only for a stopped run. To change the hook of a live run,
@@ -476,7 +473,6 @@ command. The coding agent never receives the variable.
 | `gates/NN-{stage}.{gate_id}.waiter` | The waiter's registration: its held lock says something waits on that gate. An abandoned one is removed by `recover --clean` |
 | `gates/NN-{stage}.{gate_id\|noid}.{secs}.{pid}.{seq}.quarantined.json` | An answer set aside. It persists until removed by hand |
 | `events.jsonl` | Append-only event log (schema v1, one JSON object per line, phase id on every line) — tail it from any tool |
-| `cron-instructions-NN.json` | Rate-limit resume record naming `devflow resume --phase N` for a paused run. Written when no unused fallback applies: none configured, already used, the rate limit was not at Code, or the handoff was refused before it happened. Not written when the fallback's relaunch fails after the handoff: that run stops at a Code gate, or aborts at the infra ceiling. The cron arm itself writes no file when its infra count reaches the ceiling (the run aborts). When the retry time does not parse, it still writes the file, with an empty `hermes_cron.schedule` that schedules nothing, and the run stops at a gate: the file is a record, not a scheduled resume, so resume by hand |
 | `history/phase-NN/` | Bounded archive of prior stage stdout/exit captures |
 
 Everything under `.devflow/` and `.worktrees/` is runtime state
