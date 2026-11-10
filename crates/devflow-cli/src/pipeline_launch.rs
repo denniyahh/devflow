@@ -12327,12 +12327,14 @@ mod tests {
         assert!(events_named(&run.root, "advance_stopped").is_empty());
     }
 
-    /// A stop that lands after a Validate gate was answered and its decision committed, while
-    /// the run still advances. The answer's one transition happens, the next safe point stops
-    /// the run before anything launches, and `stop`'s line and the exit file both say so.
+    /// A stop that lands after a Validate gate was approved and its decision committed, while
+    /// the run still advances. The approval would finish the run (Validate is the last
+    /// stage), but the stop is honoured first, at safe point 6: the run ends stopped at
+    /// Validate, not finished, nothing transitions or launches, and `stop`'s line and the
+    /// exit file both say so. A resume reruns Validate, which asks again (D-06).
     #[test]
-    fn a_stop_after_a_gate_answer_stops_after_its_transition_and_reports_it() {
-        const NAME: &str = "pipeline_launch::tests::a_stop_after_a_gate_answer_stops_after_its_transition_and_reports_it";
+    fn a_stop_after_a_gate_answer_stops_before_the_finish_and_reports_it() {
+        const NAME: &str = "pipeline_launch::tests::a_stop_after_a_gate_answer_stops_before_the_finish_and_reports_it";
         if !devflow_core::test_support::in_child_test(NAME) {
             run_handoff_child(NAME, Some("after_commit"), SUCCESS_MARKER);
             return;
@@ -12365,9 +12367,19 @@ mod tests {
         );
         assert_eq!(accepted["owner"], "advancing", "{accepted}");
         assert_eq!(last["stopped"], true, "{last}");
-        let transitions = events_named(&run.root, "transition");
-        assert_eq!(transitions.len(), 1, "{}", run.events());
-        assert_eq!(transitions[0]["to"], "ship", "{}", transitions[0]);
+        assert!(
+            events_named(&run.root, "transition").is_empty(),
+            "{}",
+            run.events()
+        );
+        assert!(
+            events_named(&run.root, "workflow_finished").is_empty(),
+            "the stop is honoured before the finish: {}",
+            run.events()
+        );
+        let stopped = events_named(&run.root, "advance_stopped");
+        assert_eq!(stopped.len(), 1, "{}", run.events());
+        assert_eq!(stopped[0]["safe_point"], 6, "{}", stopped[0]);
         assert_eq!(
             stage_launched_count(&run.root, run.phase),
             1,
@@ -12378,7 +12390,8 @@ mod tests {
         assert!(line.contains("honoured at an advance safe point"), "{line}");
         assert_eq!(exit_file_of(&run), "143", "{}", run.events());
         let state = run.state();
-        assert!(state.stopped, "{state:?}");
+        assert!(state.stopped && !state.finished, "{state:?}");
+        assert_eq!(state.stage, Stage::Validate, "{state:?}");
         assert_eq!(state.stop_reason.as_deref(), Some(ADVANCE_STOP_REASON));
     }
 
