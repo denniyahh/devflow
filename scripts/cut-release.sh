@@ -2,15 +2,16 @@
 #
 # scripts/cut-release.sh — the step-gated release cut.
 #
-# `devflow release --check` (pre-cut preflight) and `--verify` (post-cut
-# verification) are read-only; this script is the glue that runs the release
-# steps IN ORDER and refuses to proceed out of order. The two merge steps
+# `release-preflight check` (pre-cut preflight) and `release-preflight verify`
+# (post-cut verification), from the unpublished workspace tool in
+# tools/release-preflight, are read-only; this script is the glue that runs
+# the release steps IN ORDER and refuses to proceed out of order. The two merge steps
 # pause for a human (develop/main are PR-protected and merge on GitHub); the
 # tag, sync, and publish steps run here, each gated on the prior step's
 # invariant.
 #
 # Usage (one step at a time, strictly in order):
-#   scripts/cut-release.sh check          # devflow release --check (preflight)
+#   scripts/cut-release.sh check          # release-preflight check (preflight)
 #   scripts/cut-release.sh branch         # create release/vX.Y.Z off develop
 #   scripts/cut-release.sh pr-develop     # open the bump+changelog PR -> develop
 #   scripts/cut-release.sh pr-main        # open develop -> main (squash) PR
@@ -85,7 +86,7 @@ require_merged_to_develop() {
 step_check() {
     require_clean
     git fetch origin develop main --quiet
-    run_devflow release --check
+    cargo run -q -p release-preflight -- check
 }
 
 step_branch() {
