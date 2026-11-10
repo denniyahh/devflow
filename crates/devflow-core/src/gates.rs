@@ -3552,7 +3552,7 @@ mod tests {
     }
 
     /// R-08: a gate id is never reused, so once its gate file is gone or replaced no
-    /// claim of it can succeed: a paused `devflow ship` cannot finalize a second time.
+    /// claim of it can succeed: a paused consumer cannot act on it a second time.
     #[test]
     fn a_paused_consumer_cannot_claim_a_gate_that_closed_or_was_replaced() {
         let dir = tempfile::tempdir().unwrap();

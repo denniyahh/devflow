@@ -2142,11 +2142,11 @@ pub(crate) fn gate_respond(
         }),
     );
     let pickup = if waiter_is_live(project_root, phase, stage, &observed) {
-        response_pickup_message(stage, WaiterStatus::Live).to_owned()
+        response_pickup_message(WaiterStatus::Live).to_owned()
     } else {
         format!(
             "response was written, but no registered waiter will act. {}",
-            no_waiter_repair(phase, stage)
+            no_waiter_repair(phase)
         )
     };
     println!(
@@ -2171,7 +2171,7 @@ fn open_gate_id_at_stage(
         CliError::Message(format!(
             "phase {phase} {stage}'s gate file has no valid gate id, so it cannot be answered; \
              no response was written. {}",
-            no_waiter_repair(phase, stage)
+            no_waiter_repair(phase)
         ))
     })
 }
@@ -2250,7 +2250,8 @@ fn classify_listed_gate(project_root: &Path, gate: &OpenGate) -> ListedGate {
 }
 
 /// The liveness half of [`gate_respond`] (D-04). With no registered waiter, a Ship
-/// answer is still stored for `devflow ship`; any other stage has nothing to act on it.
+/// answer is still stored, though a run no longer reaches Ship and nothing consumes it;
+/// any other stage has nothing to act on it.
 fn refuse_a_gate_with_no_waiter(
     project_root: &Path,
     phase: PhaseId,
@@ -2262,7 +2263,7 @@ fn refuse_a_gate_with_no_waiter(
     }
     Err(CliError::Message(format!(
         "no registered waiter for phase {phase} {stage}; no response was written. {}",
-        no_waiter_repair(phase, stage)
+        no_waiter_repair(phase)
     )))
 }
 
@@ -2307,11 +2308,10 @@ fn waiter_is_live(project_root: &Path, phase: PhaseId, stage: Stage, observed: &
     }
 }
 
-/// Operator recovery for a gate with no confirmed consumer. Ship is special:
-/// its answer remains the input to the explicit `devflow ship` workflow.
+/// Operator recovery for a gate with no confirmed consumer.
 /// [`no_waiter_repair`] for `stop`'s own lines. `stop` goes on to the supervisor's socket,
 /// and while a supervisor of the phase is live a `resume` would refuse (criterion 2).
-fn stop_no_waiter_repair(project_root: &Path, phase: PhaseId, stage: Stage) -> String {
+fn stop_no_waiter_repair(project_root: &Path, phase: PhaseId) -> String {
     let supervisor_live = workflow::load_state(project_root, phase).is_ok_and(|state| {
         matches!(
             probe_phase(&state),
@@ -2321,33 +2321,24 @@ fn stop_no_waiter_repair(project_root: &Path, phase: PhaseId, stage: Stage) -> S
     if supervisor_live {
         return format!("Stopping phase {phase}'s live supervisor through its socket instead.");
     }
-    no_waiter_repair(phase, stage)
+    no_waiter_repair(phase)
 }
 
-fn no_waiter_repair(phase: PhaseId, stage: Stage) -> String {
-    match stage {
-        Stage::Ship => {
-            format!("run `devflow ship --phase {phase}` when you are ready to complete Ship")
-        }
-        _ => format!(
-            "run `devflow resume --phase {phase}` or `devflow recover --clean --phase {phase}` to establish recovery"
-        ),
-    }
+fn no_waiter_repair(phase: PhaseId) -> String {
+    format!(
+        "run `devflow resume --phase {phase}` or `devflow recover --clean --phase {phase}` to establish recovery"
+    )
 }
 
 /// Conservative post-publication wording. The second status observation only
 /// narrows the message race; it cannot establish a waiter's lifetime.
-fn response_pickup_message(stage: Stage, status: WaiterStatus) -> &'static str {
+fn response_pickup_message(status: WaiterStatus) -> &'static str {
     match status {
         WaiterStatus::Live => {
             "a registered waiter may pick up this response; this is not a lifetime guarantee"
         }
         WaiterStatus::Absent => {
-            if stage == Stage::Ship {
-                "no confirmed waiter remains; use `devflow ship --phase` for Ship recovery"
-            } else {
-                "no confirmed waiter remains; the response may be stale, so use the named recovery"
-            }
+            "no confirmed waiter remains; the response may be stale, so use the named recovery"
         }
     }
 }
@@ -2473,7 +2464,7 @@ fn sweep_one_gate(
     if !gate_sweep_may_reap(stage, waiter_live) {
         println!(
             "left phase {phase} {stage} alone at {at} — no confirmed waiter; {}",
-            no_waiter_repair(phase, stage)
+            no_waiter_repair(phase)
         );
         return Ok(SweepStep::LeftAlone);
     }
@@ -3635,7 +3626,7 @@ fn stop_reap_observed_gate(
             println!(
                 "stop: phase {phase} {} has a gate file with no valid gate id; no response was written. {}",
                 gate.stage,
-                stop_no_waiter_repair(project_root, phase, gate.stage)
+                stop_no_waiter_repair(project_root, phase)
             );
             return Ok(None);
         }
@@ -3662,7 +3653,7 @@ fn stop_reap_observed_gate(
         println!(
             "stop: phase {phase} {} has a stale gate request; no response was written. {}",
             gate.stage,
-            stop_no_waiter_repair(project_root, phase, gate.stage)
+            stop_no_waiter_repair(project_root, phase)
         );
         return Ok(None);
     };
@@ -3671,7 +3662,7 @@ fn stop_reap_observed_gate(
         println!(
             "stop: phase {phase} {} has no confirmed live waiter; no response was written. {}",
             gate.stage,
-            stop_no_waiter_repair(project_root, phase, gate.stage)
+            stop_no_waiter_repair(project_root, phase)
         );
         return Ok(None);
     }
@@ -3693,7 +3684,7 @@ fn stop_reap_observed_gate(
                 "stop: wrote a rejection for phase {phase} {} at {} — {}",
                 gate.stage,
                 path.display(),
-                response_pickup_message(gate.stage, waiter)
+                response_pickup_message(waiter)
             );
             Ok(Some((gate.stage, observed, run_launch, false)))
         }
@@ -3777,7 +3768,7 @@ fn stop_with_existing_response(
         GateAction::Abort(_) => {
             println!(
                 "stop: phase {phase} {stage} already has an abort response, but no registered waiter will act; stop did not write it. {}",
-                stop_no_waiter_repair(project_root, phase, stage)
+                stop_no_waiter_repair(project_root, phase)
             );
             Ok(None)
         }
@@ -3791,8 +3782,8 @@ fn stop_with_existing_response(
 }
 
 /// The fallback once no live supervisor socket remains (GONE, or none recorded): signal
-/// the process that holds `phase`'s holder file (D-17), a foreground `start`, `resume`,
-/// `devflow ship` or hand-run `advance`. Fail-closed on identity (T-23-52): the pid is
+/// the process that holds `phase`'s holder file (D-17), a foreground `start`, `resume`
+/// or hand-run `advance`. Fail-closed on identity (T-23-52): the pid is
 /// signalled only while the lock is held and only when it still has the start time the
 /// record names, since a record can name a recycled pid. The holder file is the only
 /// place this reads a pid from; state is never one.
@@ -3898,9 +3889,7 @@ fn holder_still_running(project_root: &Path, phase: PhaseId) -> String {
     format!(
         "stop: signalled pid {pid}, phase {phase}'s foreground holder, which is still running \
          {secs}s later, so phase state was not marked stopped. A DevFlow foreground process ends \
-         at its next safe point and records the stop itself, except a `devflow ship` that has \
-         started its finalization pass: it runs the pass to the end and, if the pass succeeds, \
-         ships instead of stopping",
+         at its next safe point and records the stop itself",
         secs = agent::TERMINATE_VERIFY_WAIT.as_secs()
     )
 }
@@ -3988,15 +3977,13 @@ fn unaddressed_launch_refusal(state: &State, known_launches: &[String]) -> Optio
 }
 
 /// What `stop` prints when the fresh read finds no state. With a signalled holder that
-/// exited, the run ended on its own rather than at a safe point: a `devflow ship` already
-/// in its pass shipped and cleared it, or it aborted. Nobody stopped it (D-18).
+/// exited, the run ended on its own rather than at a safe point: it aborted, which clears
+/// the state. Nobody stopped it (D-18).
 fn missing_state_line(phase: PhaseId, signal_sent: bool) -> String {
     if signal_sent {
         format!(
             "stop: phase {phase}'s signalled foreground holder exited and left no phase state: \
-             the run ended on its own rather than at a safe point (a `devflow ship` that had \
-             started its finalization pass runs it to the end and ships), so nothing was marked \
-             stopped"
+             the run ended on its own rather than at a safe point, so nothing was marked stopped"
         )
     } else {
         format!("stop: no persisted state for phase {phase} — already stopped")
@@ -5512,9 +5499,9 @@ fn check_open_gate_without_waiter(facts: &PhaseFacts) -> Option<PhaseFinding> {
             facts.phase, gate_stage
         ),
         repair: Some(if gate_stage == Stage::Ship {
-            no_waiter_repair(facts.phase, gate_stage)
+            no_waiter_repair(facts.phase)
         } else {
-            repair_instead_of_resume(facts, no_waiter_repair(facts.phase, gate_stage))
+            repair_instead_of_resume(facts, no_waiter_repair(facts.phase))
         }),
     })
 }
@@ -6877,10 +6864,10 @@ mod tests {
 
     #[test]
     fn gate_response_message_does_not_claim_pickup_after_the_waiter_goes() {
-        let live = response_pickup_message(Stage::Code, WaiterStatus::Live);
+        let live = response_pickup_message(WaiterStatus::Live);
         assert!(live.contains("may pick up"), "live message: {live}");
         assert!(!live.contains("lock"), "live message: {live}");
-        let gone = response_pickup_message(Stage::Code, WaiterStatus::Absent);
+        let gone = response_pickup_message(WaiterStatus::Absent);
         assert!(
             gone.contains("no confirmed waiter"),
             "no-holder message: {gone}"
@@ -6942,14 +6929,13 @@ mod tests {
     }
 
     #[test]
-    fn gate_approve_with_no_waiter_at_the_ship_gate_writes_and_names_ship() {
+    fn gate_approve_with_no_waiter_at_the_ship_gate_still_writes() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(4803);
         Gates::write_gate(root, phase, Stage::Ship, "merge").unwrap();
         gate_respond(root, phase, Some(Stage::Ship), true, None, None).unwrap();
         assert!(!gate_answer_files(root, phase, Stage::Ship).is_empty());
-        assert!(no_waiter_repair(phase, Stage::Ship).contains("devflow ship --phase 4803"));
     }
 
     #[test]
@@ -7497,7 +7483,7 @@ mod tests {
 
     /// D-04: a registered waiter's gate is answered with no lock file anywhere, and with
     /// none registered it is refused even beside a live lock record. A Ship answer is
-    /// still stored for `devflow ship`.
+    /// still stored.
     #[test]
     fn gate_respond_answers_a_registered_waiter_and_refuses_when_none_is_registered() {
         let dir = tempfile::tempdir().unwrap();
@@ -7547,12 +7533,11 @@ mod tests {
             .unwrap()
             .gate_id;
         gate_respond(root, ship, Some(Stage::Ship), true, None, None)
-            .expect("a Ship answer is stored for `devflow ship`");
+            .expect("a Ship answer is stored");
         assert!(matches!(
             Gates::read_answer(root, ship, Stage::Ship, &gate),
             AnswerRead::Bound(answer) if answer.response.approved
         ));
-        assert!(no_waiter_repair(ship, Stage::Ship).contains("devflow ship --phase 5004"));
     }
 
     /// Hold `phase`'s gate lock through a separate open, as a suspended writer would.
@@ -8044,8 +8029,8 @@ mod tests {
             .collect()
     }
 
-    /// A Ship gate with its gate file, an approval and that approval's claim: a finalizing
-    /// `devflow ship`, as its registration has finished.
+    /// A Ship gate with its gate file, an approval and that approval's claim: a consumer
+    /// that took the answer, as its registration has finished.
     fn claimed_ship_gate(root: &Path, phase: PhaseId) -> GateId {
         state_pending_at(root, phase, Stage::Ship);
         let (opened, registration) = Gates::open_registered(root, phase, Stage::Ship, "g").unwrap();
@@ -10315,8 +10300,7 @@ mod tests {
     }
 
     /// 21a / 50-12: `recovery_hints` returns a `resume` hint for a phase
-    /// whose supervisor is GONE while it is not stopped, additionally a
-    /// `ship` hint when its Ship gate is pending (D-06), `stop` then `resume` for
+    /// whose supervisor is GONE while it is not stopped, `stop` then `resume` for
     /// a STALE socket, and nothing for an ALIVE or unlaunched phase.
     #[test]
     fn recovery_hints_includes_resume_for_gone_while_active() {
@@ -11381,7 +11365,7 @@ mod tests {
             assert!(findings[0].detail.contains("gate open for stage validate"));
             assert_eq!(
                 findings[0].repair.as_deref(),
-                Some(no_waiter_repair(PhaseId::new(3), Stage::Validate).as_str())
+                Some(no_waiter_repair(PhaseId::new(3)).as_str())
             );
         }
 
@@ -11401,31 +11385,7 @@ mod tests {
             assert_eq!(findings[0].severity, Severity::Problem);
             assert_eq!(
                 findings[0].repair.as_deref(),
-                Some(no_waiter_repair(phase, Stage::Validate).as_str())
-            );
-        }
-
-        #[test]
-        fn reconcile_phase_open_ship_gate_with_no_waiter_names_ship() {
-            let phase = PhaseId::new(14);
-            let facts = PhaseFacts {
-                open_gate_stages: vec![Stage::Ship],
-                waiter: WaiterStatus::Absent,
-                ..agreeing_facts(phase)
-            };
-
-            let findings = reconcile_phase(&facts);
-
-            assert_eq!(findings.len(), 1);
-            assert_eq!(
-                findings[0].repair.as_deref(),
-                Some(no_waiter_repair(phase, Stage::Ship).as_str())
-            );
-            assert!(
-                findings[0]
-                    .repair
-                    .as_deref()
-                    .is_some_and(|repair| repair.contains("devflow ship --phase 14"))
+                Some(no_waiter_repair(phase).as_str())
             );
         }
 
@@ -11441,7 +11401,7 @@ mod tests {
             let findings = reconcile_phase(&facts);
 
             assert!(findings.iter().all(|finding| {
-                finding.repair.as_deref() != Some(no_waiter_repair(phase, Stage::Validate).as_str())
+                finding.repair.as_deref() != Some(no_waiter_repair(phase).as_str())
             }));
         }
 
@@ -17346,11 +17306,11 @@ mod tests {
         let phase = PhaseId::new(5185);
         let state = state_with_pending(root, phase, false);
         let hold = hold_pending(&state);
-        let live = stop_no_waiter_repair(root, phase, Stage::Code);
+        let live = stop_no_waiter_repair(root, phase);
         assert!(!live.contains("devflow resume"), "{live}");
         drop(hold);
-        let gone = stop_no_waiter_repair(root, phase, Stage::Code);
-        assert_eq!(gone, no_waiter_repair(phase, Stage::Code), "control");
+        let gone = stop_no_waiter_repair(root, phase);
+        assert_eq!(gone, no_waiter_repair(phase), "control");
         assert!(gone.contains("devflow resume"), "control: {gone}");
     }
 }

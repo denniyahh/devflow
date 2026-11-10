@@ -559,9 +559,8 @@ fn stop_does_not_treat_a_stale_gate_as_the_live_holders_wait() {
 }
 
 /// Finding E: persisting an answer is not evidence that a process will act on
-/// it. Ship permits the response for manual `devflow ship` recovery, but its
-/// CLI confirmation must not claim that the workflow will advance while no
-/// live holder exists.
+/// it. Ship still stores the response with no waiter, but its CLI confirmation
+/// must not claim that the workflow will advance while no live holder exists.
 #[test]
 fn gate_approve_with_no_registered_waiter_does_not_claim_advance() {
     let home = common::HermeticHome::new();
@@ -1125,7 +1124,7 @@ fn stop_then_cleanup_composes_refuse_then_force() {
 }
 
 /// Phase 46 / D-11 (VALID-02): `stop` must accept its project root as a
-/// POSITIONAL argument, the way `start`, `resume`, `status`, `ship` and
+/// POSITIONAL argument, the way `start`, `resume`, `status` and
 /// `approve` already do.
 ///
 /// Asserting only the exit code here would not prove the positional was USED:
