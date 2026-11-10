@@ -670,6 +670,23 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.221: `status_and_doctor_name_a_held_state_write_lock` Flakes on Its "Released" Control (BACKLOG)
+
+**Found:** 2026-11-10, Phase 52 wave 7 post-merge gate (`cargo test`, whole workspace). The test (added in
+`6f2a193`, Phase 50.1) failed once at `crates/devflow-cli/src/commands.rs` ~L17661 (`control: released`): after the
+holder thread dropped its lock and was joined, `write_lock_status` still read `Held` with an unknown holder.
+**Evidence:** 1 failure in the gate run; then 10/10 passes run alone under nextest and 3/3 whole-`--bin devflow` runs
+under in-process `cargo test` (669 passed each). Plan 52-08, the only change since the previous green gate, does not
+touch the lock code.
+
+**Not established:** the cause. Suspected: the lock is an `flock` on an open file description, and another test in the
+same process forking a child (before its `exec` closes the `O_CLOEXEC` fd) holds a duplicate of that description for a
+moment, so the lock outlives the release. Not reproduced on demand.
+
+**Fix shape:** make the control wait for the release with a short bounded poll (e.g. up to 2 s) instead of one read, or
+run the test in its own process; if the fork hypothesis is confirmed, note it beside `write_lock_status`, since
+`status`/`doctor` could show the same brief false "held" in a multi-threaded caller. Small: any fix branch.
+
 ### Phase 999.220: `cut-release.sh` Cannot See a `BREAKING CHANGE` Footer (BACKLOG)
 
 **Found:** 2026-11-10, Phase 52 plan 52-05 executor, confirmed from source by the orchestrator. `scripts/cut-release.sh`
