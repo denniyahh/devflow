@@ -559,7 +559,8 @@ pub(crate) fn handle_validate_outcome(
                 truncate_reason(&detail)
             );
             return match run_gate(project_root, state, Stage::Validate, &context)? {
-                GateAction::Advance => transition(project_root, state, Stage::Ship),
+                // D-04: Validate is the last stage, so an approval finishes the run.
+                GateAction::Advance => finish_run(project_root, state),
                 GateAction::LoopBack(_) => {
                     // Evidence root: see the single binding at the top.
                     let fix = select_loop_back_fix(&evidence_root, state.phase, state);
@@ -700,7 +701,8 @@ pub(crate) fn handle_validate_outcome(
             // ships, and removing an operator checkpoint is the riskier of the
             // two directions the review offered.
             ValidateResult::Passed => {
-                let mut message = "Validation passed — approve to ship?".to_string();
+                // D-04: approving finishes the run; nothing is merged or shipped.
+                let mut message = "Validation passed — approve to finish the run? The worktree and branch are kept.".to_string();
                 if ceiling_gate {
                     message.push_str(&format!(
                         " (This phase recorded {} Validate failure(s), at the per-phase ceiling of {} — that is why this gate fired. Answering it restarts the count.)",
@@ -747,7 +749,7 @@ pub(crate) fn handle_validate_outcome(
             // would kill a phase that may be one cycle from converging.
             GateAction::Advance => {
                 reset_phase_failures_at_ceiling(project_root, state, ceiling_gate)?;
-                transition(project_root, state, Stage::Ship)
+                finish_run(project_root, state)
             }
             GateAction::LoopBack(_) => {
                 // Evidence root: see the single binding at the top.
@@ -1808,7 +1810,7 @@ mod tests {
         );
         assert!(
             context.contains("Validation passed"),
-            "an explicit pass verdict must advance to Ship: {context}"
+            "an explicit pass verdict must reach the passed gate: {context}"
         );
     }
 
