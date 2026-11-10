@@ -13284,15 +13284,23 @@ mod tests {
             assert_eq!(finding.severity, Severity::Problem);
             assert!(finding.detail.contains("424242"));
             assert!(finding.detail.contains("monitor wrapper"));
+            let repair = finding.repair.as_deref().unwrap();
             assert!(
-                finding
-                    .repair
-                    .as_deref()
-                    .unwrap()
-                    .contains("--reap-strays --dry-run"),
-                "the repair must name the preview form first, not the destructive form alone: \
-                 {:?}",
-                finding.repair
+                repair.contains("pid 424242"),
+                "the repair must name the pid: {repair:?}"
+            );
+            assert!(
+                repair.contains("`ps -o args= -p 424242`"),
+                "the repair must have the operator confirm the process before ending it: \
+                 {repair:?}"
+            );
+            assert!(
+                repair.contains("`kill 424242`"),
+                "the repair must name the manual kill: {repair:?}"
+            );
+            assert!(
+                !repair.contains("--reap-strays"),
+                "the repair must not name the removed flag: {repair:?}"
             );
             assert!(
                 !finding.detail.contains('/'),
@@ -13330,7 +13338,13 @@ mod tests {
             }];
             let text = render_stray_process_text(&build_stray_process_findings(&strays));
             assert!(text.contains("555555"));
-            assert!(text.contains("repair: devflow gate sweep --reap-strays --dry-run"));
+            assert!(
+                text.contains("repair: confirm pid 555555"),
+                "the repair line must name the pid: {text}"
+            );
+            assert!(text.contains("`ps -o args= -p 555555`"), "{text}");
+            assert!(text.contains("`kill 555555`"), "{text}");
+            assert!(!text.contains("--reap-strays"), "{text}");
         }
 
         #[test]
@@ -13488,8 +13502,8 @@ mod tests {
                 .repair
                 .as_deref()
                 .unwrap()
-                .starts_with("devflow gate sweep --reap-strays --dry-run"),
-            "the repair must name the --dry-run preview form first: {:?}",
+                .contains("`ps -o args= -p 909090`"),
+            "the repair must have the operator confirm the process before ending it: {:?}",
             finding.repair
         );
     }

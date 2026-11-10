@@ -788,6 +788,13 @@ const REMOVED_FLAG_INVOCATIONS: &[(&[&str], &str)] = &[
     ),
     (&["gate", "approve", "1", "code"], "code"),
     (&["gate", "reject", "1", "code", "--note", "n"], "code"),
+    // `--dry-run` keeps this safe against a binary that still has the flag: a
+    // real pass on the hermetic builder would treat every 2.x-shaped process
+    // on the machine as a stray.
+    (
+        &["gate", "sweep", "--reap-strays", "--dry-run"],
+        "--reap-strays",
+    ),
 ];
 
 /// A removed flag or positional argument is refused by clap as unexpected
