@@ -237,7 +237,8 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
     `scripts/check-in-container.sh all`, with `DEVFLOW_SKIP_CONTAINER_CHECK=1` as an explicit,
     loudly-non-equivalent escape hatch.
 - [ ] **[PROJECT]** `scripts/hooks/post-commit`: warns (never auto-edits) when a `*-SUMMARY.md`
-  lands but `STATE.md`'s authored prose wasn't updated to match.
+  lands but `STATE.md`'s authored prose wasn't updated to match. Only a summary directly inside a
+  phase directory counts; a nested one (a plan review's `52-plan-review-N/SUMMARY.md`) does not.
 - [ ] **[PROJECT]** `scripts/hooks/post-commit` also warns when a dev-setup file changes without
   this checklist moving too. Its path lives in one variable, `checklist_path`, at the top of that
   block — **if this file ever moves again, change that variable**. From the move into

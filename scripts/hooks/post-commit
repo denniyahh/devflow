@@ -30,7 +30,10 @@ set -uo pipefail
 
 # `git show` (rather than diff-tree) so a root commit still reports its files.
 changed=$(git show --pretty=format: --name-only HEAD 2>/dev/null) || changed=""
-summaries=$(printf '%s\n' "$changed" | grep -E '^\.planning/phases/.*SUMMARY\.md$' || true)
+# Plan summaries sit directly in a phase directory (`NN-MM-SUMMARY.md`, or a bare
+# `SUMMARY.md` in old phases). A SUMMARY.md one level deeper, such as a plan
+# review's `52-plan-review-4/SUMMARY.md`, is not a plan summary and must not warn.
+summaries=$(printf '%s\n' "$changed" | grep -E '^\.planning/phases/[^/]+/[^/]*SUMMARY\.md$' || true)
 
 if [ -n "$summaries" ]; then
   root=$(git rev-parse --show-toplevel 2>/dev/null || echo .)
