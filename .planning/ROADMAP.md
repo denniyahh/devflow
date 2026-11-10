@@ -127,7 +127,40 @@ than split: no requirement dependency forces a split, and the Validate-gate desi
      appear; on DevFlow's own checkout the provenance warning still fires; a run whose worktree is present still
      reports as active. (OPS-01, OPS-02, OPS-03, OPS-04)
 
-**Plans**: TBD
+**Plans**: 1/33 plans executed
+- [x] 52-01-PLAN.md
+- [ ] 52-02-PLAN.md
+- [ ] 52-03-PLAN.md
+- [ ] 52-04-PLAN.md
+- [ ] 52-05-PLAN.md
+- [ ] 52-06-PLAN.md
+- [ ] 52-07-PLAN.md
+- [ ] 52-08-PLAN.md
+- [ ] 52-09-PLAN.md
+- [ ] 52-10-PLAN.md
+- [ ] 52-11-PLAN.md
+- [ ] 52-12-PLAN.md
+- [ ] 52-13-PLAN.md
+- [ ] 52-14-PLAN.md
+- [ ] 52-15-PLAN.md
+- [ ] 52-16-PLAN.md
+- [ ] 52-17-PLAN.md
+- [ ] 52-18-PLAN.md
+- [ ] 52-19-PLAN.md
+- [ ] 52-20-PLAN.md
+- [ ] 52-21-PLAN.md
+- [ ] 52-22-PLAN.md
+- [ ] 52-23-PLAN.md
+- [ ] 52-24-PLAN.md
+- [ ] 52-25-PLAN.md
+- [ ] 52-26-PLAN.md
+- [ ] 52-27-PLAN.md
+- [ ] 52-28-PLAN.md
+- [ ] 52-29-PLAN.md
+- [ ] 52-30-PLAN.md
+- [ ] 52-31-PLAN.md
+- [ ] 52-32-PLAN.md
+- [ ] 52-33-PLAN.md
 **UI hint**: no
 
 ### Phase 53: The Question Channel
@@ -406,7 +439,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 50 | 29/29 | Complete | 2026-10-21 |
 | 50.1 | 30/30 | Complete | 2026-11-02 |
 | 51 | 13/13 | Complete | 2026-11-08 |
-| 52 | 0/? | Not started | — |
+| 52 | 1/33 | In Progress | — |
 | 53 | 0/? | Not started | — |
 | 54 | 0/? | Not started | — |
 | 55 | 0/? | Not started | — |
