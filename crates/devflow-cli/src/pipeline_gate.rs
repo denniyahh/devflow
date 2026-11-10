@@ -20,22 +20,25 @@
 //! Pitfall 1).
 
 use crate::CliError;
-use crate::config_parse::{foreground_gate_timeout_secs, gate_timeout_secs};
+use crate::config_parse::gate_timeout_secs;
 use crate::pipeline_launch::{
     GateWaitEnd, clear_run_state, close_gate, commit, ensure_still_recorded, fenced, is_not_owner,
     launch_stage,
 };
 use crate::pipeline_outcomes::{run_checkout_hooks, truncate_reason};
-use devflow_core::gates::{
-    self, AnswerRead, Claim, GateAction, GateError, GateId, GateResponse, Gates,
-};
+#[cfg(test)]
+use devflow_core::gates::GateId;
+use devflow_core::gates::{self, Claim, GateAction, GateError, GateResponse, Gates};
 use devflow_core::hooks;
 use devflow_core::mode;
+#[cfg(test)]
 use devflow_core::phase_id::PhaseId;
 use devflow_core::prompt::FixType;
 use devflow_core::stage::Stage;
 use devflow_core::state::State;
-use devflow_core::{events, registry, workflow};
+#[cfg(test)]
+use devflow_core::workflow;
+use devflow_core::{events, registry};
 use std::path::Path;
 use tracing::{info, warn};
 
@@ -332,25 +335,16 @@ pub(crate) fn prepare_loop_back_to_code(
 /// Run the terminal hooks (version bump + branch cleanup) and clear state.
 ///
 /// Uses [`gate_timeout_secs`]'s multi-day production default for the
-/// retry-gate wait below — safe for every caller EXCEPT the foreground
-/// `ship_override` path (WR-02), which calls
-/// [`finish_workflow_with_gate_timeout`] directly with a bounded timeout
-/// instead.
+/// retry-gate wait below.
 pub(crate) fn finish_workflow(project_root: &Path, state: &mut State) -> Result<(), CliError> {
     finish_workflow_with_gate_timeout(project_root, state, gate_timeout_secs())
 }
 
 /// `finish_workflow`'s body, parameterized on how long the retry-gate poll
-/// (below) waits for a response before failing fast (WR-02, phase 20
-/// review). Every caller reached through a detached monitor process should
-/// keep using `finish_workflow`'s multi-day default — invisible to an
-/// operator's terminal by construction. `ship_override` is the one caller
-/// invoked directly from the foreground CLI, so it passes
-/// [`crate::config_parse::foreground_gate_timeout_secs`] here instead,
-/// bounding how long a terminal-hook failure can block the operator's shell
-/// without weakening the fail-closed terminal-Ship invariant: an unanswered
-/// gate still fails the operation entirely (via `run_gate_with_timeout`'s
-/// existing timeout error), just after seconds instead of days.
+/// (below) waits for a response before failing fast. Production callers use
+/// `finish_workflow`'s multi-day default; tests pass a short bound so an
+/// unanswered retry gate fails in seconds (via `run_gate_with_timeout`'s
+/// timeout error) instead of days.
 pub(crate) fn finish_workflow_with_gate_timeout(
     project_root: &Path,
     state: &mut State,
@@ -364,9 +358,8 @@ pub(crate) fn finish_workflow_with_gate_timeout(
         // during the advance after the Ship gate was answered, or during a retry after its
         // gate was answered, is honoured before the merge, version bump, tag and push. The
         // consumed approval is set aside with the gate (D-06), and a resumed run reruns Ship,
-        // whose new gate a saved `yes_ship` auto-approves. Outside a supervisor's advance (the
-        // foreground `ship_override`) no stop token is engaged, and the holder's stop flag
-        // decides (D-18).
+        // whose new gate a saved `yes_ship` auto-approves. Outside a supervisor's advance no
+        // stop token is engaged, and the holder's stop flag decides (D-18).
         //
         // This is the last point a stop lands before finalization, and the only stop check
         // around a pass (D-18). Once a pass starts every hook runs to the end: a failed
@@ -591,9 +584,9 @@ pub(crate) fn run_gate(
 }
 
 /// `run_gate`'s body, parameterized on the wait's timeout (WR-02, phase 20
-/// review) so [`finish_workflow_with_gate_timeout`]'s foreground retry-gate
-/// wait can pass a bounded timeout instead of [`gate_timeout_secs`]'s
-/// multi-day production default.
+/// review) so [`finish_workflow_with_gate_timeout`]'s retry-gate wait can
+/// pass a bounded timeout instead of [`gate_timeout_secs`]'s multi-day
+/// production default.
 ///
 /// The bound protocol (D-04, D-05): a fresh gate id with this waiter registered before
 /// the gate file is published, that registration held for the whole wait, a wait for
@@ -859,164 +852,6 @@ pub(crate) fn abort(project_root: &Path, state: &State, reason: &str) -> Result<
         serde_json::json!({ "reason": truncate_reason(reason) }),
     );
     Ok(())
-}
-
-/// Manual ship override (20e, D-01): a second, out-of-process consumer of the same
-/// Ship answer `run_gate`'s live wait consumes. `devflow gate approve` only WRITES an
-/// answer (`Gates::answer`); a live monitor waiting on the gate is what normally
-/// advances the workflow. If that monitor died before consuming the answer, the
-/// approval sits unconsumed forever; this function reads the answer directly, claims
-/// it, and on `GateAction::Advance` drives the SAME `finish_workflow` the live wait
-/// would have called (D-01) — not a reimplementation of the after-ship hook batch.
-///
-/// Guard order (D-02, D-04):
-/// 1. Claim the D-17 holder, with the D-18 stop handler installed first
-///    ([`crate::commands::claim_foreground_holder`]), so `stop` can reach this process and
-///    no other foreground process acts on the phase.
-/// 2. Refuse while a recorded or pending supervisor of the phase is live (R-17): its own
-///    wait can still consume the answer, and a loop-back here would launch beside it.
-///    After the claim, no `start` or `resume` can reserve, so none appears while this runs.
-/// 3. `state.stage` must be EXACTLY `Stage::Ship`; any earlier stage is refused, naming
-///    the stage to resolve first.
-/// 4. The live Ship gate must hold an answer bound to its id. A file that does not bind
-///    is refused and left where it is: this command reads and moves nothing (R-09).
-/// 5. The answer must be claimed before anything acts on it, and the claim excludes a live
-///    waiter's own consumption of it (D-08). A claim already there means
-///    another consumer took it and may have died mid-`finish_workflow`, and any claim
-///    error (the gate closed or was replaced since this command read it, R-08, or its
-///    lock was held too long) means nothing was consumed. All of them refuse here, so
-///    no claim error reaches `finish_workflow`, `loop_back_to_code` or `abort`.
-///
-/// `force` is accepted and echoed in the CLI output for explicit operator
-/// auditability (Hermes LOW: make `--force` semantics explicit), but is
-/// deliberately NOT consulted by any guard above — D-02 scopes `--force` to
-/// "skip Ship-gate re-verification," never to bypassing the stage, holder,
-/// gate-existence, or claim checks themselves. This design has no separate
-/// Ship-gate re-verification step beyond those guards, so `--force`
-/// currently changes no observable behavior; it exists so the flag is never
-/// silently ignored and cannot later be wired to widen scope without an
-/// explicit, reviewed change to this function.
-pub(crate) fn ship_override(
-    project_root: &Path,
-    phase: PhaseId,
-    force: bool,
-) -> Result<(), CliError> {
-    let _phase_holder = crate::commands::claim_foreground_holder(project_root, phase)?;
-    crate::commands::refuse_ship_over_a_live_supervisor(project_root, phase)?;
-
-    let mut state = workflow::load_state(project_root, phase)?;
-
-    if state.stage != Stage::Ship {
-        return Err(CliError::Message(format!(
-            "phase {phase} is at stage {} — `devflow ship` requires state.stage == Stage::Ship; \
-             resolve stage {} first (--force does not skip stages)",
-            state.stage, state.stage
-        )));
-    }
-
-    let response = claim_ship_answer(project_root, phase)?;
-
-    println!(
-        "phase {phase}: manual ship override (--force={force}) — driving the already-written \
-         Ship response through the same terminal path the live monitor would have used"
-    );
-
-    match GateAction::from_response(&response) {
-        GateAction::Advance => {
-            // WR-02 (phase 20 review): finish_workflow's retry-gate wait
-            // (on a terminal-hook failure) normally uses gate_timeout_secs'
-            // multi-day production default, invisible to an operator
-            // because every OTHER caller runs inside a detached monitor.
-            // ship_override runs in the FOREGROUND CLI — bound the wait so
-            // a hook failure fails fast with an actionable message instead
-            // of blocking this shell for days.
-            let timeout = foreground_gate_timeout_secs();
-            println!(
-                "phase {phase}: if terminal-hook finalization fails, this foreground command \
-                 will wait up to {timeout}s for the reopened Ship gate before failing (vs. the \
-                 multi-day background default) — set DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS to \
-                 change this"
-            );
-            finish_workflow_with_gate_timeout(project_root, &mut state, timeout)
-        }
-        GateAction::LoopBack(_) => {
-            // Antigravity LOW: `loop_back_to_code` → `launch_stage` forks a
-            // NEW detached monitor daemon — say so explicitly, so `devflow
-            // ship` is not a silently long-running process the operator
-            // can't account for.
-            println!(
-                "phase {phase}: Ship response loops back to Code — launching a new, detached \
-                 monitor agent to drive the retry"
-            );
-            loop_back_to_code(
-                project_root,
-                &mut state,
-                FixType::AuditFix,
-                LoopBackReason::GateResponse,
-            )
-        }
-        GateAction::Abort(reason) => abort(project_root, &state, &reason),
-    }
-}
-
-/// Read the live Ship gate's answer and claim it: guards 5 and 6 of [`ship_override`].
-/// Every refusal here consumes nothing.
-fn claim_ship_answer(project_root: &Path, phase: PhaseId) -> Result<GateResponse, CliError> {
-    let stage = Stage::Ship;
-    let no_answer = || {
-        CliError::Message(format!(
-            "phase {phase}: no Ship gate response written yet — nothing to ship (a dead monitor \
-             never wrote or received one; wait for `devflow gate approve` or resolve the pipeline first)"
-        ))
-    };
-    let gate_id = crate::commands::gate_file_id(project_root, phase, stage)?
-        .ok_or_else(no_answer)
-        .and_then(|id| {
-            GateId::parse(&id).map_err(|_| {
-                CliError::Message(format!(
-                    "phase {phase}: the Ship gate file has no valid gate id, so no answer can \
-                     bind to it; nothing was consumed. Run `devflow doctor`"
-                ))
-            })
-        })?;
-    let answer = match Gates::read_answer(project_root, phase, stage, &gate_id) {
-        AnswerRead::None => return Err(no_answer()),
-        AnswerRead::Unbound(reason) => {
-            return Err(CliError::Message(format!(
-                "phase {phase}: the file in Ship gate {gate_id}'s answer slot does not bind to it \
-                 ({reason}); nothing was consumed. `devflow gate approve` or `devflow gate reject` \
-                 sets that file aside before publishing a valid answer"
-            )));
-        }
-        AnswerRead::Bound(answer) => answer,
-    };
-    let claim = fenced(project_root, phase, || {
-        Ok(Gates::claim(project_root, phase, stage, &gate_id))
-    })?;
-    #[cfg(test)]
-    note_claim(&claim);
-    match claim {
-        Ok(Claim::Claimed) => Ok(answer.response),
-        Ok(Claim::AlreadyConsumed) => Err(CliError::Message(format!(
-            "phase {phase}: the Ship gate response was already consumed (gate {gate_id} has a \
-             claim) — the phase may be mid-finalization from a monitor that died partway through; \
-             run `devflow doctor` to inspect it rather than re-running terminal hooks"
-        ))),
-        Err(GateError::NoOpenGate { .. } | GateError::GateIdMismatch { .. }) => {
-            Err(CliError::Message(format!(
-                "phase {phase}: the Ship gate {gate_id} this command read was closed or replaced \
-                 before it could be claimed; nothing was consumed. Run `devflow status`"
-            )))
-        }
-        Err(GateError::GateLockTimeout { waited, .. }) => Err(CliError::Message(format!(
-            "phase {phase}: could not take the gate lock to claim Ship gate {gate_id} within \
-             {waited:?}; nothing was consumed. Run `devflow ship` again"
-        ))),
-        Err(err) => Err(CliError::Message(format!(
-            "phase {phase}: could not claim Ship gate {gate_id}'s answer; nothing was consumed: \
-             {err}"
-        ))),
-    }
 }
 
 /// Print the full pipeline that a `start` would run, without launching anything.
@@ -1919,327 +1754,6 @@ mod tests {
         assert_eq!(state.consecutive_failures, 2);
     }
 
-    /// 20e Task 1: the tracer end-to-end case — a phase parked at
-    /// `Stage::Ship` with a gate and its approved answer, no claim, and no live
-    /// process waiting. `ship_override` must reach the SAME terminal state
-    /// `finish_workflow` produces: state cleared, gate, answer and claim files gone,
-    /// `workflow_finished` emitted.
-    #[test]
-    fn ship_override_advances_via_written_response() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        init_repo(root);
-
-        let phase = PhaseId::new(90);
-        let branch = format!("feature/phase-{padded}", padded = phase.padded());
-        let branch_created = devflow_core::test_support::git_command(root)
-            .args(["branch", &branch, "develop"])
-            .status()
-            .unwrap()
-            .success();
-        assert!(branch_created);
-
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Ship;
-        workflow::save_state(&state).unwrap();
-
-        Gates::open_gate(root, phase, Stage::Ship, "Ship complete — approve merge?").unwrap();
-        answer_open_gate(
-            root,
-            phase,
-            Stage::Ship,
-            &GateResponse {
-                approved: true,
-                note: None,
-                responded_by: Some("test".into()),
-            },
-        )
-        .unwrap();
-
-        ship_override(root, phase, false).unwrap();
-
-        let err = workflow::load_state(root, phase).unwrap_err();
-        assert!(matches!(err, workflow::WorkflowError::MissingState(_)));
-        assert!(!Gates::gate_path(root, phase, Stage::Ship).exists());
-        assert!(gate_answer_files(root, phase, Stage::Ship).is_empty());
-        assert!(gate_claim_files(root, phase, Stage::Ship).is_empty());
-        let last = devflow_core::events::last_event_for_phase(root, phase)
-            .expect("events recorded for phase");
-        assert_eq!(last["event"], "workflow_finished");
-    }
-
-    /// WR-02 (phase 20 review): `ship_override` runs in the FOREGROUND CLI,
-    /// unlike every other `finish_workflow` caller (which runs inside a
-    /// detached monitor). A terminal-hook failure (merge conflict) reopens
-    /// the Ship gate; with no response ever written for the REOPENED gate,
-    /// this must fail fast within `DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS`
-    /// (bounded here to a couple seconds) rather than block the caller's
-    /// shell for `DEVFLOW_GATE_TIMEOUT_SECS`' multi-day production default —
-    /// which is left untouched, proving the two timeouts are genuinely
-    /// independent knobs.
-    #[test]
-    // D-09 (48-09): mutates `DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS` process-wide.
-    // Deferred deliberately, not overlooked: THIS process reads the value, so
-    // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
-    // race and the value is restored on every exit path, unwinding included.
-    #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
-    fn ship_override_bounds_foreground_wait_on_terminal_hook_failure() {
-        let _guard = env_lock();
-        let original_foreground_timeout = std::env::var_os("DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS");
-        // SAFETY: serialized under ENV_MUTEX. Bounds ONLY the foreground
-        // knob — DEVFLOW_GATE_TIMEOUT_SECS (the background default) is
-        // never touched by this test, so a regression that made
-        // `ship_override` fall back to the multi-day default would hang
-        // this test instead of silently passing.
-        unsafe {
-            std::env::set_var("DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS", "2");
-        }
-
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        init_repo(root);
-        let git = |args: &[&str]| {
-            let output = devflow_core::test_support::git_command(root)
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(output.status.success(), "git {args:?} failed");
-        };
-        let phase = PhaseId::new(96);
-        let branch = format!("feature/phase-{padded}", padded = phase.padded());
-        git(&["checkout", "-q", "-b", &branch]);
-        std::fs::write(root.join("conflict.txt"), "feature\n").unwrap();
-        git(&["add", "conflict.txt"]);
-        git(&["commit", "-q", "-m", "feature change"]);
-        git(&["checkout", "-q", "develop"]);
-        std::fs::write(root.join("conflict.txt"), "develop\n").unwrap();
-        git(&["add", "conflict.txt"]);
-        git(&["commit", "-q", "-m", "develop change"]);
-
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Ship;
-        workflow::save_state(&state).unwrap();
-
-        Gates::open_gate(root, phase, Stage::Ship, "Ship complete — approve merge?").unwrap();
-        answer_open_gate(
-            root,
-            phase,
-            Stage::Ship,
-            &GateResponse {
-                approved: true,
-                note: None,
-                responded_by: Some("test".into()),
-            },
-        )
-        .unwrap();
-
-        let started = std::time::Instant::now();
-        let result = ship_override(root, phase, false);
-        let elapsed = started.elapsed();
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_foreground_timeout {
-                Some(value) => {
-                    std::env::set_var("DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS", value);
-                }
-                None => std::env::remove_var("DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS"),
-            }
-        }
-
-        assert!(
-            result.is_err(),
-            "an unresolved reopened Ship gate must fail closed, not silently advance"
-        );
-        assert!(
-            elapsed < std::time::Duration::from_secs(30),
-            "the foreground wait must be bounded by DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS, \
-             not gate_timeout_secs' multi-day default — took {elapsed:?}"
-        );
-        assert!(
-            Gates::gate_path(root, phase, Stage::Ship).exists(),
-            "the merge failure must reopen an actionable Ship gate for a human, not silently \
-             drop the phase"
-        );
-        assert!(
-            workflow::load_state(root, phase).is_ok(),
-            "state must NOT be cleared — finish_workflow_with_gate_timeout must fail before \
-             reaching workflow::clear_state"
-        );
-    }
-
-    /// 20e Task 3: an `Abort`-routing Ship response (a rejection whose note
-    /// says "abort") must reach the SAME shared `abort` helper the live
-    /// `handle_ship_outcome` path uses — no special-cased branch inside
-    /// `ship_override`. Asserts the shared path's own effects: state
-    /// cleared, gate files cleaned up, `workflow_aborted` emitted.
-    #[test]
-    fn ship_override_abort_routes_through_abort() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(95);
-
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Ship;
-        workflow::save_state(&state).unwrap();
-
-        Gates::open_gate(root, phase, Stage::Ship, "Ship complete — approve merge?").unwrap();
-        answer_open_gate(
-            root,
-            phase,
-            Stage::Ship,
-            &GateResponse {
-                approved: false,
-                note: Some("abort: found a blocking regression during manual review".into()),
-                responded_by: Some("test".into()),
-            },
-        )
-        .unwrap();
-
-        ship_override(root, phase, false).unwrap();
-
-        let err = workflow::load_state(root, phase).unwrap_err();
-        assert!(matches!(err, workflow::WorkflowError::MissingState(_)));
-        assert!(!Gates::gate_path(root, phase, Stage::Ship).exists());
-        assert!(gate_answer_files(root, phase, Stage::Ship).is_empty());
-        assert!(gate_claim_files(root, phase, Stage::Ship).is_empty());
-        let last = devflow_core::events::last_event_for_phase(root, phase)
-            .expect("events recorded for phase");
-        assert_eq!(last["event"], "workflow_aborted");
-    }
-
-    /// 20e Task 2 (D-02, EoP regression): `--force` must never let
-    /// `ship_override` reach `finish_workflow` from a non-Ship stage. Checked
-    /// for every earlier `Stage` with `--force` both true and false.
-    #[test]
-    fn ship_override_refuses_when_not_at_ship_stage() {
-        for stage in [Stage::Define, Stage::Plan, Stage::Code, Stage::Validate] {
-            for force in [true, false] {
-                let dir = tempfile::tempdir().unwrap();
-                let root = dir.path();
-                let phase = PhaseId::new(91);
-
-                let mut state =
-                    State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-                state.stage = stage;
-                workflow::save_state(&state).unwrap();
-
-                let err = ship_override(root, phase, force).unwrap_err();
-                let msg = err.to_string();
-                assert!(
-                    msg.contains(&stage.to_string()),
-                    "error for stage {stage} (force={force}) must name the stage: {msg}"
-                );
-
-                // finish_workflow was never reached: state is untouched, not cleared.
-                let reloaded = workflow::load_state(root, phase)
-                    .expect("state must survive a stage-mismatch refusal, not be cleared");
-                assert_eq!(reloaded.stage, stage);
-            }
-        }
-    }
-
-    /// 20e Task 2 (edge-probe 20e/empty): `state.stage == Stage::Ship` but no
-    /// Ship gate request/response exists on disk — a dead monitor never
-    /// wrote or received one. Must fail-closed with a clear error, both with
-    /// `--force` true and false.
-    #[test]
-    fn ship_override_refuses_when_no_response_written() {
-        for force in [true, false] {
-            let dir = tempfile::tempdir().unwrap();
-            let root = dir.path();
-            let phase = PhaseId::new(92);
-
-            let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-            state.stage = Stage::Ship;
-            workflow::save_state(&state).unwrap();
-
-            // Neither request nor response written yet.
-            let err = ship_override(root, phase, force).unwrap_err();
-            assert!(
-                err.to_string().contains("no Ship gate response"),
-                "force={force}: {err}"
-            );
-
-            // A request written but no response yet is the same fail-closed case.
-            Gates::open_gate(root, phase, Stage::Ship, "ctx").unwrap();
-            let err = ship_override(root, phase, force).unwrap_err();
-            assert!(
-                err.to_string().contains("no Ship gate response"),
-                "force={force}: {err}"
-            );
-            let _ = Gates::close(root, phase, Stage::Ship);
-        }
-    }
-
-    /// 20e Task 2 (review: Hermes ack-race): a Ship answer that already has a claim
-    /// was already consumed, by a monitor that may have died mid-finalization.
-    /// `ship_override` refuses and directs to `devflow doctor` rather than re-running
-    /// terminal hooks, with `--force` both true and false. `finish_workflow` must never
-    /// be reached: state stays intact.
-    #[test]
-    fn ship_override_refuses_when_the_answer_was_already_claimed() {
-        for force in [true, false] {
-            let dir = tempfile::tempdir().unwrap();
-            let root = dir.path();
-            let phase = PhaseId::new(94);
-
-            let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-            state.stage = Stage::Ship;
-            workflow::save_state(&state).unwrap();
-
-            let gate = Gates::open_gate(root, phase, Stage::Ship, "ctx")
-                .unwrap()
-                .gate_id;
-            answer_open_gate(root, phase, Stage::Ship, &approval()).unwrap();
-            assert_eq!(
-                Gates::claim(root, phase, Stage::Ship, &gate).unwrap(),
-                gates::Claim::Claimed
-            );
-
-            let err = ship_override(root, phase, force).unwrap_err();
-            assert!(
-                err.to_string().contains("devflow doctor"),
-                "force={force}: {err}"
-            );
-
-            let reloaded = workflow::load_state(root, phase)
-                .expect("an already-claimed refusal must never clear state");
-            assert_eq!(reloaded.stage, Stage::Ship);
-        }
-    }
-
-    /// R-09: `ship_override` reads and moves nothing. A file in the live gate's slot
-    /// that does not bind is refused, named, and left for `devflow gate approve` or
-    /// `reject`, which set it aside before publishing a valid answer.
-    #[test]
-    fn ship_override_refuses_an_answer_that_does_not_bind_and_moves_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(98);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Ship;
-        workflow::save_state(&state).unwrap();
-        let gate = Gates::open_gate(root, phase, Stage::Ship, "ctx")
-            .unwrap()
-            .gate_id;
-        let slot = Gates::answer_path(root, phase, Stage::Ship, &gate);
-        std::fs::write(&slot, br#"{"approved": true}"#).unwrap();
-
-        let message = ship_override(root, phase, false).unwrap_err().to_string();
-        assert!(message.contains("missing_gate_id"), "{message}");
-        assert!(message.contains("devflow gate approve"), "{message}");
-        assert_eq!(std::fs::read(&slot).unwrap(), br#"{"approved": true}"#);
-        assert_eq!(
-            gate_claim_files(root, phase, Stage::Ship),
-            Vec::<std::path::PathBuf>::new()
-        );
-        assert_eq!(
-            workflow::load_state(root, phase).unwrap().stage,
-            Stage::Ship
-        );
-    }
-
     /// A phase parked at Stage::Ship in a repo whose terminal hooks can finish it.
     fn ship_ready_fixture(root: &Path, phase: PhaseId) {
         init_repo(root);
@@ -2254,67 +1768,6 @@ mod tests {
         state.stage = Stage::Ship;
         state.gate_notify_cmd = Some("true".to_string());
         workflow::save_state(&state).unwrap();
-    }
-
-    /// D-17 (V-31): `devflow ship` refuses while another process holds the phase, before
-    /// it reads or claims the answer, and writes nothing.
-    #[test]
-    fn ship_override_refuses_while_another_process_holds_the_phase() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(2906);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Ship;
-        workflow::save_state(&state).unwrap();
-        let gate = Gates::open_gate(root, phase, Stage::Ship, "ctx")
-            .unwrap()
-            .gate_id;
-        answer_open_gate(root, phase, Stage::Ship, &approval()).unwrap();
-        let _hold = devflow_core::liveness::claim_phase_holder(root, phase).unwrap();
-        let before = std::fs::read(workflow::state_path(root, phase)).unwrap();
-
-        let error = ship_override(root, phase, false)
-            .expect_err("a held phase refuses")
-            .to_string();
-
-        assert!(
-            error.contains(&format!("(pid {})", std::process::id())),
-            "the refusal names the holder's pid: {error}"
-        );
-        assert!(
-            error.contains(&format!("devflow stop --phase {phase}")),
-            "{error}"
-        );
-        assert!(!error.contains("devflow resume"), "{error}");
-        assert!(
-            !Gates::claim_path(root, phase, Stage::Ship, &gate).exists(),
-            "the answer is not claimed"
-        );
-        assert_eq!(
-            std::fs::read(workflow::state_path(root, phase)).unwrap(),
-            before,
-            "nothing is written"
-        );
-    }
-
-    /// The writer and the reader of a Ship approval agree: what `devflow gate approve`
-    /// publishes is what `devflow ship` finds, claims and finishes on.
-    #[test]
-    fn ship_override_ships_an_approval_written_by_gate_approve() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(99);
-        ship_ready_fixture(root, phase);
-        Gates::open_gate(root, phase, Stage::Ship, "Ship complete — approve merge?").unwrap();
-
-        crate::commands::gate_respond(root, phase, Some(Stage::Ship), true, None, None).unwrap();
-        ship_override(root, phase, false).unwrap();
-
-        assert!(matches!(
-            workflow::load_state(root, phase),
-            Err(workflow::WorkflowError::MissingState(_))
-        ));
-        assert_eq!(events_named(root, "workflow_shipped").len(), 1);
     }
 
     /// Approve the Ship gate a live waiter is on. A waiter can consume the answer and close
@@ -2429,63 +1882,6 @@ mod tests {
         assert_eq!(hook_runs(root, "VersionBump"), 1);
     }
 
-    /// A recovery that has passed its liveness check, holding the state write lock, cannot
-    /// see a holder claimed after that check. `devflow ship` must not read the state it is
-    /// about to delete and run hooks beside it: the recovery lands wholly first, and Ship
-    /// finds no run. The closure stands in for `recover --clean`'s decision and removal,
-    /// whose hold is in core and out of this crate's reach.
-    #[test]
-    fn ship_waits_out_a_recovery_past_its_liveness_check() {
-        /// Longer than this fixture's whole Ship takes without the wait, so a Ship that does
-        /// not wait has finished by the time the recovery deletes under it.
-        const RECOVERY_LINGERS: std::time::Duration = std::time::Duration::from_secs(2);
-        const CLAIM_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(95);
-        ship_ready_fixture(root, phase);
-        Gates::open_gate(root, phase, Stage::Ship, "ctx").unwrap();
-        answer_open_gate(root, phase, Stage::Ship, &approval()).unwrap();
-        let holder = devflow_core::liveness::phase_holder_path(root, phase);
-
-        let shipped = std::thread::scope(|scope| {
-            let (in_lock, recovery_holds) = std::sync::mpsc::channel();
-            let holder = &holder;
-            scope.spawn(move || {
-                workflow::update_state_with(root, phase, |_| {
-                    in_lock.send(()).unwrap();
-                    let deadline = std::time::Instant::now() + CLAIM_WITHIN;
-                    while !matches!(
-                        devflow_core::liveness::probe(holder),
-                        Ok(devflow_core::liveness::Held::Live)
-                    ) && std::time::Instant::now() < deadline
-                    {
-                        std::thread::sleep(std::time::Duration::from_millis(5));
-                    }
-                    std::thread::sleep(RECOVERY_LINGERS);
-                    std::fs::remove_file(workflow::state_path(root, phase)).unwrap();
-                    Ok::<_, CliError>((None, ()))
-                })
-                .unwrap();
-            });
-            recovery_holds.recv().unwrap();
-            let ship = scope.spawn(move || ship_override(root, phase, false));
-            ship.join().unwrap()
-        });
-
-        assert!(
-            events_named(root, "workflow_shipped").is_empty(),
-            "Ship ran its hooks beside the recovery: {shipped:?}"
-        );
-        assert!(
-            matches!(
-                shipped,
-                Err(CliError::Workflow(workflow::WorkflowError::MissingState(_)))
-            ),
-            "{shipped:?}"
-        );
-    }
-
     /// The wait for a recovery is bounded: a stuck write-lock holder refuses the claim and
     /// names itself, and the refused process keeps no hold on the phase.
     #[test]
@@ -2531,7 +1927,7 @@ mod tests {
 
     /// A process killed between deleting the state and recording the ship must not leave a
     /// shipped run that reads as not shipped: by the moment the state goes, the strict shipped
-    /// predicate is already on disk. Runs the whole foreground finalization, reading the
+    /// predicate is already on disk. Runs the whole finalization, reading the
     /// evidence at the last instant before the state is removed.
     #[test]
     fn workflow_shipped_is_recorded_before_the_state_is_cleared() {
@@ -2539,8 +1935,6 @@ mod tests {
         let root = dir.path();
         let phase = PhaseId::new(96);
         ship_ready_fixture(root, phase);
-        Gates::open_gate(root, phase, Stage::Ship, "Ship complete — approve merge?").unwrap();
-        crate::commands::gate_respond(root, phase, Some(Stage::Ship), true, None, None).unwrap();
 
         let seen = std::rc::Rc::new(std::cell::Cell::new(None));
         BEFORE_RUN_STATE_CLEAR.set(Some(Box::new({
@@ -2551,7 +1945,8 @@ mod tests {
                 seen.set(Some((evidence.state_present, evidence.shipped)));
             }
         })));
-        ship_override(root, phase, false).unwrap();
+        let mut state = workflow::load_state(root, phase).unwrap();
+        finish_workflow_with_gate_timeout(root, &mut state, 2).unwrap();
 
         assert_eq!(
             seen.get(),
@@ -2564,69 +1959,6 @@ mod tests {
             "the stream still ends in the finish"
         );
         assert_eq!(events_named(root, "workflow_shipped").len(), 1);
-    }
-
-    /// D-04's consumption claim (V-21), as a defence-in-depth backstop (R2-11). This
-    /// waiter is an in-process gate wait with no supervisor record, a state 50.1-29's
-    /// R-17 guard and D-17's holder leave no production path to; the test pins that the
-    /// claim alone still lets only one of the two consumers act on one approval, if a
-    /// waiter exists that neither guard sees.
-    #[test]
-    fn ship_override_and_a_live_waiter_cannot_both_consume_one_approval() {
-        use std::sync::atomic::Ordering::SeqCst;
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(97);
-        ship_ready_fixture(root, phase);
-        let probe = std::sync::Arc::new(ClaimProbe::default());
-
-        let waiter = {
-            let root = root.to_path_buf();
-            let probe = probe.clone();
-            std::thread::spawn(move || {
-                CLAIM_PROBE.set(Some(probe));
-                let mut state = workflow::load_state(&root, phase).unwrap();
-                // What `handle_ship_outcome` does with an approval.
-                match run_gate_with_timeout(&root, &mut state, Stage::Ship, "ctx", 30, None)? {
-                    GateAction::Advance => finish_workflow_with_gate_timeout(&root, &mut state, 2),
-                    other => panic!("the approval must read as an advance: {other:?}"),
-                }
-            })
-        };
-        wait_for_open_gate(root, phase, Stage::Ship);
-        answer_open_gate(root, phase, Stage::Ship, &approval()).unwrap();
-        let shipper = {
-            let root = root.to_path_buf();
-            let probe = probe.clone();
-            std::thread::spawn(move || {
-                CLAIM_PROBE.set(Some(probe));
-                ship_override(&root, phase, false)
-            })
-        };
-        let waited = waiter.join().unwrap();
-        let shipped = shipper.join().unwrap();
-
-        assert_eq!(
-            (
-                probe.claimed.load(SeqCst),
-                probe.already_consumed.load(SeqCst)
-            ),
-            (1, 1),
-            "exactly one consumer claims: waiter {waited:?}, ship {shipped:?}"
-        );
-        assert_eq!(
-            events_named(root, "workflow_shipped").len(),
-            1,
-            "finalization ran once: waiter {waited:?}, ship {shipped:?}"
-        );
-        let refused = match (&waited, &shipped) {
-            (Ok(()), Err(refused)) | (Err(refused), Ok(())) => refused,
-            _ => panic!("exactly one consumer acts: waiter {waited:?}, ship {shipped:?}"),
-        };
-        assert!(
-            refused.to_string().contains("consumed"),
-            "the other consumer says the answer was consumed: {refused}"
-        );
     }
 
     /// 18d concurrency edge: two concurrently-active phases' `consecutive_failures`
@@ -3739,398 +3071,5 @@ mod tests {
             comment_normal_form(&safe_point_6.join("\n")).contains("`yes_ship`"),
             "{safe_point_6:?}"
         );
-    }
-
-    /// Names the D-18 fixture's project root for its finalizing child. Not a DevFlow
-    /// setting, so it carries no `DEVFLOW_` prefix the doc check would require documented.
-    const MID_MERGE_ROOT_ENV: &str = "P50_1_22_ROOT";
-    /// Says which finalizing child this process is: [`MID_MERGE_SHIP`] or
-    /// [`MID_MERGE_NO_HANDLER`].
-    const MID_MERGE_ROLE_ENV: &str = "P50_1_22_ROLE";
-    /// `ship_override`, whose claim installs the D-18 stop handler.
-    const MID_MERGE_SHIP: &str = "ship";
-    /// A holder with no stop handler, so its SIGTERM has the default disposition.
-    const MID_MERGE_NO_HANDLER: &str = "no_handler";
-    /// The finalizing child's exit code when its call returned an error.
-    const MID_MERGE_CHILD_ERROR: i32 = 41;
-    /// The bound on each step the D-18 fixture waits for.
-    const MID_MERGE_STEP: std::time::Duration = std::time::Duration::from_secs(30);
-    /// The script's bound on its pause, as 0.05 s sleeps: 30 s.
-    const MID_MERGE_PAUSE_POLLS: u32 = 600;
-
-    /// One repo the whole after-ship batch succeeds on, with an answered Ship gate, whose
-    /// `post-checkout` hook pauses inside `Merge`, between its `git checkout` and `git merge`.
-    struct MidMergeFixture {
-        _dir: tempfile::TempDir,
-        root: PathBuf,
-        phase: PhaseId,
-        branch: String,
-        feature_tip: String,
-        tags_before: Vec<String>,
-        hook_dir: tempfile::TempDir,
-    }
-
-    impl MidMergeFixture {
-        fn new(phase: PhaseId) -> Self {
-            let dir = tempfile::tempdir().unwrap();
-            let root = dir.path().to_path_buf();
-            crate::test_support::init_repo_no_version_file(&root);
-            let branch = format!("feature/phase-{}", phase.padded());
-            let git = |args: &[&str]| {
-                let output = devflow_core::test_support::git_command(&root)
-                    .args(args)
-                    .output()
-                    .unwrap();
-                assert!(output.status.success(), "git {args:?} failed: {output:?}");
-            };
-            git(&["branch", &branch, "develop"]);
-            std::fs::write(root.join(".gitignore"), ".devflow/\n").unwrap();
-            git(&["checkout", "-q", &branch]);
-            std::fs::write(root.join("feature.txt"), "phase work\n").unwrap();
-            git(&["add", "."]);
-            git(&["commit", "-q", "-m", "phase work"]);
-            git(&["checkout", "-q", "develop"]);
-
-            let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.clone());
-            state.stage = Stage::Ship;
-            workflow::save_state(&state).unwrap();
-            Gates::open_gate(&root, phase, Stage::Ship, "Ship complete — approve merge?").unwrap();
-            answer_open_gate(&root, phase, Stage::Ship, &approval()).unwrap();
-
-            let hook_dir = tempfile::tempdir().unwrap();
-            let fixture = Self {
-                feature_tip: Self::git_stdout(&root, &["rev-parse", &branch]),
-                tags_before: Self::tags_in(&root),
-                _dir: dir,
-                root,
-                phase,
-                branch,
-                hook_dir,
-            };
-            // Last, so nothing above runs it.
-            fixture.install_pausing_hook();
-            fixture
-        }
-
-        fn git_stdout(root: &Path, args: &[&str]) -> String {
-            let output = devflow_core::test_support::git_command(root)
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(output.status.success(), "git {args:?} failed: {output:?}");
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
-        }
-
-        fn tags_in(root: &Path) -> Vec<String> {
-            Self::git_stdout(root, &["tag", "--list"])
-                .lines()
-                .map(str::to_string)
-                .collect()
-        }
-
-        /// The tags this run added.
-        fn new_tags(&self) -> Vec<String> {
-            Self::tags_in(&self.root)
-                .into_iter()
-                .filter(|tag| !self.tags_before.contains(tag))
-                .collect()
-        }
-
-        fn git_succeeds(&self, args: &[&str]) -> bool {
-            devflow_core::test_support::git_command(&self.root)
-                .args(args)
-                .output()
-                .unwrap()
-                .status
-                .success()
-        }
-
-        fn develop_has_the_feature(&self) -> bool {
-            self.git_succeeds(&["merge-base", "--is-ancestor", &self.feature_tip, "develop"])
-        }
-
-        fn marker(&self, name: &str) -> PathBuf {
-            self.hook_dir.path().join(name)
-        }
-
-        /// `post-checkout` marks that it runs, waits (bounded) for the release, and marks
-        /// that it is leaving. The script names `sleep` by path: the child's PATH holds only
-        /// `git`.
-        fn install_pausing_hook(&self) {
-            use std::os::unix::fs::PermissionsExt;
-            let sleep = ["/usr/bin/sleep", "/bin/sleep"]
-                .into_iter()
-                .find(|path| Path::new(path).is_file())
-                .expect("sleep must exist to run this test");
-            let hook = self.hook_dir.path().join("post-checkout");
-            std::fs::write(
-                &hook,
-                format!(
-                    "#!/bin/sh\n: > '{in_merge}'\ni=0\n\
-                     while [ ! -e '{release}' ] && [ \"$i\" -lt {MID_MERGE_PAUSE_POLLS} ]; do\n  \
-                     {sleep} 0.05\n  i=$((i+1))\ndone\n: > '{left}'\nexit 0\n",
-                    in_merge = self.marker("in-merge").display(),
-                    release = self.marker("release").display(),
-                    left = self.marker("left-merge").display(),
-                ),
-            )
-            .unwrap();
-            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
-            let hooks_path = self.hook_dir.path().display().to_string();
-            assert!(self.git_succeeds(&["config", "core.hooksPath", &hooks_path]));
-        }
-
-        /// Run the finalizing child `role`, and return it once it is inside `Merge`.
-        fn spawn_child_paused_in_merge(&self, test_name: &str, role: &str) -> MidMergeChild {
-            let path_dir = agent_free_git_only_path_dir();
-            let child = devflow_core::test_support::spawn_test_in_child(
-                test_name,
-                path_dir.path(),
-                &[
-                    (MID_MERGE_ROOT_ENV, self.root.as_os_str()),
-                    (MID_MERGE_ROLE_ENV, std::ffi::OsStr::new(role)),
-                ],
-            );
-            let mut child = MidMergeChild {
-                child: Some(child),
-                release: self.marker("release"),
-                _path_dir: path_dir,
-            };
-            let started = std::time::Instant::now();
-            while !self.marker("in-merge").exists() {
-                assert!(
-                    started.elapsed() < MID_MERGE_STEP && child.is_running(),
-                    "the child never paused inside Merge: {:?}",
-                    child.finish()
-                );
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            assert_eq!(
-                hook_runs(&self.root, "Merge"),
-                0,
-                "the pause is inside Merge, not after it"
-            );
-            child
-        }
-
-        /// Wait for the paused hook to leave, the one process here no one reaps once its
-        /// parent has died.
-        fn wait_for_the_hook_to_leave(&self) {
-            let started = std::time::Instant::now();
-            while !self.marker("left-merge").exists() {
-                assert!(
-                    started.elapsed() < MID_MERGE_STEP,
-                    "the paused hook never left after its release"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-        }
-
-        /// The `hook_run` events, in order, as `(hook, ok)`.
-        fn hook_results(&self) -> Vec<(String, bool)> {
-            events_named(&self.root, "hook_run")
-                .iter()
-                .map(|event| {
-                    (
-                        event["hook"].as_str().expect("names its hook").to_string(),
-                        event["ok"].as_bool().expect("says whether it passed"),
-                    )
-                })
-                .collect()
-        }
-
-        /// The version `CHANGELOG.md`'s newest heading names.
-        fn newest_changelog_version(&self) -> String {
-            let changelog = std::fs::read_to_string(self.root.join("CHANGELOG.md")).unwrap();
-            changelog
-                .lines()
-                .find(|line| line.starts_with("## "))
-                .and_then(|line| line.trim_start_matches("## ").split(' ').next())
-                .expect("the changelog has a version heading")
-                .to_string()
-        }
-    }
-
-    /// A finalizing child, and the release of the hook it pauses in. On a failed assertion
-    /// too, dropping this releases the hook, then kills and reaps the child.
-    struct MidMergeChild {
-        child: Option<std::process::Child>,
-        release: PathBuf,
-        _path_dir: tempfile::TempDir,
-    }
-
-    impl MidMergeChild {
-        fn pid(&self) -> u32 {
-            self.child.as_ref().expect("not yet finished").id()
-        }
-
-        fn is_running(&mut self) -> bool {
-            self.child
-                .as_mut()
-                .expect("not yet finished")
-                .try_wait()
-                .unwrap()
-                .is_none()
-        }
-
-        fn release_the_hook(&self) {
-            std::fs::write(&self.release, "").unwrap();
-        }
-
-        /// Wait for the child to end, within [`MID_MERGE_STEP`], and read its output. The
-        /// hook must already be released, or this waits out its pause.
-        fn finish(&mut self) -> std::process::Output {
-            let mut child = self.child.take().expect("finished once");
-            let started = std::time::Instant::now();
-            while child.try_wait().unwrap().is_none() {
-                if started.elapsed() > MID_MERGE_STEP {
-                    let _ = child.kill();
-                    panic!("the child did not end: {:?}", child.wait_with_output());
-                }
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            child.wait_with_output().unwrap()
-        }
-    }
-
-    impl Drop for MidMergeChild {
-        fn drop(&mut self) {
-            let _ = std::fs::write(&self.release, "");
-            if let Some(child) = &mut self.child {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-        }
-    }
-
-    /// The finalizing child of the D-18 fixture: exits 0 when its call returns `Ok`, and
-    /// [`MID_MERGE_CHILD_ERROR`] when it returns an error. Never returns.
-    fn run_the_finalizing_child(role: &std::ffi::OsStr, phase: PhaseId) -> ! {
-        let root = PathBuf::from(std::env::var_os(MID_MERGE_ROOT_ENV).expect("the parent sets it"));
-        let finished = if role == MID_MERGE_SHIP {
-            ship_override(&root, phase, false)
-        } else {
-            assert_eq!(role, MID_MERGE_NO_HANDLER);
-            let _hold = devflow_core::liveness::claim_phase_holder(&root, phase).unwrap();
-            let mut state = workflow::load_state(&root, phase).unwrap();
-            finish_workflow_with_gate_timeout(&root, &mut state, 2)
-        };
-        match finished {
-            Ok(()) => std::process::exit(0),
-            Err(err) => {
-                eprintln!("the finalizing child's call failed: {err}");
-                std::process::exit(MID_MERGE_CHILD_ERROR)
-            }
-        }
-    }
-
-    /// D-18 (operator, narrowed 2026-10-26): `devflow ship` reads the stop flag only before
-    /// `Merge`. Stopped inside `Merge`, a real `ship_override` survives the signal, runs
-    /// every hook of the pass and ships, through the real `stop` entry. Control: a holder
-    /// without the handler, sent the same signal at the same point, dies with the merge
-    /// not done, the cut D-18 forbids.
-    ///
-    /// The limit: the flag is set inside `Merge` only, which is before every later hook
-    /// boundary, so this shows no boundary check exists. It does not drive a stop that
-    /// arrives during `VersionBump`, `ChangelogAppend` or `BranchCleanup`.
-    #[test]
-    fn a_stop_inside_the_ship_finalization_pass_lands_after_the_pass_ends() {
-        use std::os::unix::process::ExitStatusExt;
-        const NAME: &str = "pipeline_gate::tests::a_stop_inside_the_ship_finalization_pass_lands_after_the_pass_ends";
-        const SHIP_PHASE: PhaseId = PhaseId::new(2213);
-        const NO_HANDLER_PHASE: PhaseId = PhaseId::new(2214);
-        // This outer child gives `stop` a hermetic cache dir to search.
-        enter_path_isolated_child!(NAME, agent_free_git_only_path_dir());
-        if let Some(role) = std::env::var_os(MID_MERGE_ROLE_ENV) {
-            let phase = if role == MID_MERGE_SHIP {
-                SHIP_PHASE
-            } else {
-                NO_HANDLER_PHASE
-            };
-            run_the_finalizing_child(&role, phase);
-        }
-
-        // Part 1: the stop lands after the pass.
-        let fixture = MidMergeFixture::new(SHIP_PHASE);
-        let (root, phase) = (fixture.root.clone(), fixture.phase);
-        let mut child = fixture.spawn_child_paused_in_merge(NAME, MID_MERGE_SHIP);
-        let pid = child.pid();
-
-        let error = crate::commands::stop(&root, phase)
-            .expect_err("a holder still running is not a stop")
-            .to_string();
-        eprintln!("stop returned: {error}");
-
-        assert!(error.contains(&format!("signalled pid {pid}")), "{error}");
-        assert!(error.contains("not marked"), "{error}");
-        assert!(error.contains("ships instead of stopping"), "{error}");
-        assert!(
-            child.is_running(),
-            "the signal was caught, not fatal: {error}"
-        );
-
-        child.release_the_hook();
-        let output = child.finish();
-        assert_eq!(output.status.signal(), None, "{output:?}");
-        assert_eq!(output.status.code(), Some(0), "{output:?}");
-
-        let hooks = fixture.hook_results();
-        eprintln!("hook_run results: {hooks:?}");
-        assert_eq!(
-            hooks,
-            ["Merge", "VersionBump", "ChangelogAppend", "BranchCleanup"]
-                .map(|hook| (hook.to_string(), true)),
-            "every hook of the pass ran to the end"
-        );
-        assert!(fixture.develop_has_the_feature());
-        let new_tags = fixture.new_tags();
-        eprintln!("new tags: {new_tags:?}");
-        assert_eq!(new_tags.len(), 1, "exactly one new tag: {new_tags:?}");
-        assert_eq!(
-            new_tags[0].strip_prefix('v'),
-            Some(fixture.newest_changelog_version().as_str()),
-            "the changelog names the tag's version"
-        );
-        assert!(
-            !fixture.git_succeeds(&[
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                &format!("refs/heads/{}", fixture.branch),
-            ]),
-            "the feature branch is gone"
-        );
-        assert_eq!(events_named(&root, "workflow_shipped").len(), 1);
-        assert_eq!(events_named(&root, "workflow_finished").len(), 1);
-        assert!(events_named(&root, "advance_stopped").is_empty());
-        assert!(matches!(
-            workflow::load_state(&root, phase),
-            Err(workflow::WorkflowError::MissingState(_))
-        ));
-
-        // Part 2, the control: without the handler the same signal cuts the merge.
-        let fixture = MidMergeFixture::new(NO_HANDLER_PHASE);
-        let mut child = fixture.spawn_child_paused_in_merge(NAME, MID_MERGE_NO_HANDLER);
-        assert!(devflow_core::agent::terminate(child.pid()));
-        let started = std::time::Instant::now();
-        while child.is_running() {
-            assert!(
-                started.elapsed() < MID_MERGE_STEP,
-                "a holder without the handler must die by the signal"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        child.release_the_hook();
-        fixture.wait_for_the_hook_to_leave();
-        let output = child.finish();
-        eprintln!("no-handler child's status: {:?}", output.status);
-        assert_eq!(output.status.signal(), Some(libc::SIGTERM), "{output:?}");
-        assert_eq!(
-            hook_runs(&fixture.root, "Merge"),
-            0,
-            "the child died before its Merge hook could report"
-        );
-        assert!(!fixture.develop_has_the_feature(), "the merge was cut");
-        assert_eq!(fixture.new_tags(), Vec::<String>::new(), "no new tag");
     }
 }

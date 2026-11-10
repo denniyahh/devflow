@@ -807,25 +807,6 @@ fn start_reserved(
     Ok(())
 }
 
-/// Whether a Ship answer waits for `devflow ship`: `state` is at Ship and the gate's slot
-/// holds an answer bound to that gate, not yet claimed. `Gates::list_open` hides such a gate.
-fn ship_answer_stored(state: &State) -> bool {
-    let (root, phase, stage) = (&state.project_root, state.phase, Stage::Ship);
-    if state.stage != stage {
-        return false;
-    }
-    let Ok(Some(id)) = gate_file_id(root, phase, stage) else {
-        return false;
-    };
-    let Ok(gate_id) = GateId::parse(&id) else {
-        return false;
-    };
-    matches!(
-        Gates::read_answer(root, phase, stage, &gate_id),
-        AnswerRead::Bound(_)
-    ) && !Gates::claim_path(root, phase, stage, &gate_id).exists()
-}
-
 /// Whether `state` is only what a `start`'s reservation wrote: that `start` died before
 /// preparing the run, so no worktree was forked, no base resolved and none of its guards
 /// passed. Every prepared run captures its verification baseline in [`start_reserved`], and
@@ -1527,16 +1508,14 @@ const HELD_NO_SOCKET_REPAIR: &str =
 /// Recovery verbs discoverable from a phase's liveness (21a, D-03; 50-12) —
 /// the pure, testable counterpart to `status`'s hints. STALE names
 /// `devflow stop` (it ends the orphaned agent group and removes the socket)
-/// and then `devflow resume`; GONE while active names `devflow resume`, plus
-/// `devflow ship` when the Ship gate is pending, the one stage whose stored answer
-/// `ship_override` applies (D-06). No hint names `devflow advance`: its gate open sets
+/// and then `devflow resume`; GONE while active names `devflow resume`. No hint names
+/// `devflow advance`: its gate open sets
 /// an earlier answer aside, so answering and then advancing loses the answer. A
 /// failed probe names the socket to inspect. A live pending supervisor names only
 /// `devflow stop` (criterion 2). A stopped phase names `devflow resume`, since nothing
 /// else continues it; a phase that never launched and is not stopped names nothing, and
 /// neither does ALIVE. A `start` that died before its run was prepared names `start`, as
-/// `resume` would refuse it ([`run_never_prepared`]). A stored Ship answer names `ship`
-/// instead of the `resume` that would set it aside ([`ship_answer_stored`]). A run whose
+/// `resume` would refuse it ([`run_never_prepared`]). A run whose
 /// recorded delivery canary refuses its agent names `resume --agent <other>`, since that
 /// canary refuses a plain `resume` and only a handoff clears it; that is judged as
 /// `resume` judges it
@@ -1551,10 +1530,7 @@ fn recovery_hints(state: &State, liveness: &PhaseLiveness) -> Vec<String> {
     {
         return vec![restart_verb(state)];
     }
-    let stored = ship_answer_stored(state);
-    let continue_verb = if stored {
-        format!("devflow ship --phase {phase}")
-    } else if crate::pipeline_launch::recorded_canary_refusal(state).is_some() {
+    let continue_verb = if crate::pipeline_launch::recorded_canary_refusal(state).is_some() {
         format!("devflow resume --phase {phase} --agent <other>")
     } else {
         format!("devflow resume --phase {phase}")
@@ -1563,13 +1539,7 @@ fn recovery_hints(state: &State, liveness: &PhaseLiveness) -> Vec<String> {
         PhaseLiveness::LaunchPending { .. } => vec![format!("devflow stop --phase {phase}")],
         PhaseLiveness::HeldNoSocket { .. } => vec![HELD_NO_SOCKET_REPAIR.to_string()],
         PhaseLiveness::Stale => vec![format!("devflow stop --phase {phase}"), continue_verb],
-        PhaseLiveness::GoneWhileActive => {
-            let mut hints = vec![continue_verb];
-            if !stored && state.gate_pending && state.stage == Stage::Ship {
-                hints.push(format!("devflow ship --phase {phase}"));
-            }
-            hints
-        }
+        PhaseLiveness::GoneWhileActive => vec![continue_verb],
         PhaseLiveness::ProbeFailed(why) => {
             let socket = state
                 .supervisor
@@ -2348,7 +2318,7 @@ fn stop_no_waiter_repair(project_root: &Path, phase: PhaseId, stage: Stage) -> S
             PhaseLiveness::Alive { .. } | PhaseLiveness::LaunchPending { .. }
         )
     });
-    if supervisor_live && stage != Stage::Ship {
+    if supervisor_live {
         return format!("Stopping phase {phase}'s live supervisor through its socket instead.");
     }
     no_waiter_repair(phase, stage)
@@ -3652,8 +3622,8 @@ fn stop_via_gate(project_root: &Path, phase: PhaseId) -> Result<Option<AnsweredG
 /// gate file, read its waiter, then answer that id and no other. A gate it cannot
 /// answer falls through to the socket path.
 ///
-/// A gate whose answer a consumer already claimed is declined before anything else: a
-/// finalizing `devflow ship` took it, and only the holder arm reaches that process.
+/// A gate whose answer a consumer already claimed is declined before anything else: its
+/// consumer is acting on it.
 fn stop_reap_observed_gate(
     project_root: &Path,
     phase: PhaseId,
@@ -3697,8 +3667,7 @@ fn stop_reap_observed_gate(
         return Ok(None);
     };
     let run_launch = run.supervisor.map(|record| record.launch_id);
-    // With no registered waiter, a Ship answer is still stored for `devflow ship` (D-04).
-    if !waiter_is_live(project_root, phase, gate.stage, &observed) && gate.stage != Stage::Ship {
+    if !waiter_is_live(project_root, phase, gate.stage, &observed) {
         println!(
             "stop: phase {phase} {} has no confirmed live waiter; no response was written. {}",
             gate.stage,
@@ -4434,31 +4403,6 @@ pub(crate) fn refuse_advance_over_a_live_supervisor(
     Err(CliError::Message(format!(
         "advance refused: phase {phase} {found}; a hand-run advance would run beside it. Run \
          `devflow stop --phase {phase}` to end it"
-    )))
-}
-
-/// R-17: `devflow ship` drives a Ship answer only when the monitor that would consume it
-/// is dead, so it refuses beside a live supervisor of its phase. It would otherwise win
-/// that answer from it and, on a loop-back, launch a second supervisor beside it. It
-/// writes no state.
-pub(crate) fn refuse_ship_over_a_live_supervisor(
-    project_root: &Path,
-    phase: PhaseId,
-) -> Result<(), CliError> {
-    let Some((found, launch_ids)) = find_live_supervisors(project_root, phase) else {
-        return Ok(());
-    };
-    events::emit(
-        project_root,
-        phase,
-        "ship_override_refused",
-        serde_json::json!({ "reason": "live supervisor", "launch_ids": launch_ids }),
-    );
-    Err(CliError::Message(format!(
-        "ship refused: phase {phase} {found}; `devflow ship` drives a Ship answer only when the \
-         monitor that would consume it is dead. Answer the Ship gate with `devflow gate approve` \
-         or `devflow gate reject` and the live supervisor consumes it, or run `devflow stop \
-         --phase {phase}` first"
     )))
 }
 
@@ -5490,8 +5434,6 @@ pub(crate) struct PhaseFacts {
     /// marker instead of reporting a `Problem` (review: Codex HIGH — the
     /// doctor gap is bigger than `check_dead_agent` alone).
     pub(crate) stopped: bool,
-    /// [`ship_answer_stored`]: `devflow ship` applies it and `resume` would set it aside.
-    pub(crate) stored_ship_answer: bool,
     /// The `start` to run instead of `resume` when [`run_never_prepared`] holds.
     pub(crate) unprepared_restart: Option<String>,
     /// The pending launch's id and liveness, from `state.pending_supervisor`. The
@@ -5526,17 +5468,10 @@ fn check_gate_pending_without_gate(facts: &PhaseFacts) -> Option<PhaseFinding> {
     Some(PhaseFinding {
         phase: facts.phase,
         severity: Severity::Problem,
-        detail: if facts.stored_ship_answer {
-            format!(
-                "phase {}: gate_pending is true at stage {} and its gate holds a stored answer",
-                facts.phase, facts.stage
-            )
-        } else {
-            format!(
-                "phase {}: gate_pending is true at stage {} but no gate file is open",
-                facts.phase, facts.stage
-            )
-        },
+        detail: format!(
+            "phase {}: gate_pending is true at stage {} but no gate file is open",
+            facts.phase, facts.stage
+        ),
         repair: Some(repair_instead_of_resume(
             facts,
             format!("devflow resume --phase {}", facts.phase),
@@ -5557,7 +5492,6 @@ fn repair_instead_of_resume(facts: &PhaseFacts, resume: String) -> String {
             format!("wait for its live supervisor, or `devflow stop --phase {phase}`")
         }
         (_, Some(agent)) => orphaned_agent_line(phase, agent),
-        _ if facts.stored_ship_answer => format!("devflow ship --phase {phase}"),
         _ => facts.unprepared_restart.clone().unwrap_or(resume),
     }
 }
@@ -5655,12 +5589,7 @@ fn check_supervisor(facts: &PhaseFacts) -> Option<PhaseFinding> {
     }
     let repair = match &facts.supervisor {
         PhaseLiveness::Stale => {
-            let verb = if facts.stored_ship_answer {
-                "ship"
-            } else {
-                "resume"
-            };
-            format!("devflow stop --phase {phase} && devflow {verb} --phase {phase}")
+            format!("devflow stop --phase {phase} && devflow resume --phase {phase}")
         }
         PhaseLiveness::GoneWhileActive => {
             repair_instead_of_resume(facts, format!("devflow resume --phase {phase}"))
@@ -5856,7 +5785,6 @@ fn build_phase_facts(
     let phase = state.phase;
     let stopped = state.stopped;
     let unprepared_restart = run_never_prepared(&state).then(|| restart_verb(&state));
-    let stored_ship_answer = ship_answer_stored(&state);
     let (waiter, waiter_gate) = phase_gate_waiter(project_root, phase, open_gates);
     let agent_pid = agent_pid_from_file(project_root, phase);
     let agent_alive = agent_pid.is_some_and(agent::agent_running);
@@ -5914,7 +5842,6 @@ fn build_phase_facts(
         open_gate_stages,
         feature_branch_exists,
         stopped,
-        stored_ship_answer,
         unprepared_restart,
         pending,
         live_agent,
@@ -7047,30 +6974,6 @@ mod tests {
         assert!(gate_answer_files(root, phase, Stage::Code).is_empty());
     }
 
-    /// D-04: with no registered waiter, a Ship abort is stored for `devflow ship`.
-    #[test]
-    fn stop_at_a_ship_gate_without_a_holder_keeps_manual_recovery_available() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(4810);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Ship;
-        state.gate_pending = true;
-        workflow::save_state(&state).unwrap();
-        Gates::write_gate(root, phase, Stage::Ship, "merge").unwrap();
-
-        stop(root, phase).expect("Ship with no holder may retain its abort response");
-
-        assert!(
-            !gate_answer_files(root, phase, Stage::Ship).is_empty(),
-            "the manual-recovery Ship exception must remain available"
-        );
-        assert!(
-            workflow::load_state(root, phase).unwrap().stopped,
-            "the stop request itself is still recorded"
-        );
-    }
-
     #[test]
     fn stop_at_a_non_ship_gate_with_an_unconfirmable_holder_refuses_success() {
         let dir = tempfile::tempdir().unwrap();
@@ -8183,7 +8086,7 @@ mod tests {
 
     /// Planner C1's MUST-DO for the D-18 fixture: a gate whose answer a consumer claimed is
     /// never answered again, and `stop` reaches that consumer through the holder. Control:
-    /// an unclaimed Ship gate with no waiter still gets the abort stored for `devflow ship`.
+    /// an unclaimed gate with a registered waiter gets the abort, and no holder is signalled.
     #[test]
     fn stop_reaches_the_holder_past_a_claimed_ship_gate() {
         let dir = tempfile::tempdir().unwrap();
@@ -8208,19 +8111,19 @@ mod tests {
         assert_stop_reaches_the_holder_and_writes_no_gate_file(root, partly_closed);
 
         let unclaimed = PhaseId::new(5019);
-        state_pending_at(root, unclaimed, Stage::Ship);
-        let gate = Gates::open_gate(root, unclaimed, Stage::Ship, "g")
-            .unwrap()
-            .gate_id;
+        state_pending_at(root, unclaimed, Stage::Validate);
+        let (opened, registration) =
+            Gates::open_registered(root, unclaimed, Stage::Validate, "g").unwrap();
         let holder = SleepingChild::spawn();
         let _hold = hold_phase_with_record(root, unclaimed, holder.pid(), Some(holder.start));
         let cache = tempfile::tempdir().unwrap();
-        stop_in(root, unclaimed, Some(cache.path())).expect("the stored abort is the stop");
+        stop_in(root, unclaimed, Some(cache.path())).expect("the abort is the stop");
         assert!(matches!(
-            Gates::read_answer(root, unclaimed, Stage::Ship, &gate),
+            Gates::read_answer(root, unclaimed, Stage::Validate, &opened.gate_id),
             AnswerRead::Bound(answer) if !answer.response.approved
         ));
         assert!(holder.is_live(), "the control signals no holder");
+        registration.finish();
     }
 
     /// The stable parts of `persist_stopped_state`'s refusal over a launch it did not address.
@@ -10438,10 +10341,10 @@ mod tests {
     }
 
     /// V-33, D-06: a gate-pending phase whose supervisor is gone is repaired by `resume`, which
-    /// asks again, plus `devflow ship` at Ship, the one stage whose stored answer it applies.
-    /// No liveness, gate state or stage names `advance`.
+    /// asks again, at Ship as at any other stage. No liveness, gate state or stage names
+    /// `advance`.
     #[test]
-    fn recovery_hints_for_a_gone_gate_pending_phase_name_resume_or_ship_not_advance() {
+    fn recovery_hints_for_a_gone_gate_pending_phase_name_resume_not_advance() {
         let dir = tempfile::tempdir().unwrap();
         let mut state = State::new(
             PhaseId::new(7),
@@ -10459,10 +10362,7 @@ mod tests {
         state.stage = Stage::Ship;
         assert_eq!(
             recovery_hints(&state, &PhaseLiveness::GoneWhileActive),
-            vec![
-                "devflow resume --phase 7".to_string(),
-                "devflow ship --phase 7".to_string(),
-            ]
+            vec!["devflow resume --phase 7".to_string()]
         );
 
         let every_liveness = [
@@ -11434,7 +11334,6 @@ mod tests {
                 last_launched_stage: Some(Stage::Code),
                 open_gate_stages: Vec::new(),
                 unprepared_restart: None,
-                stored_ship_answer: false,
                 feature_branch_exists: true,
                 stopped: false,
                 pending: None,
@@ -11656,7 +11555,6 @@ mod tests {
                 stage: Stage::Plan,
                 last_launched_stage: Some(Stage::Plan),
                 unprepared_restart: None,
-                stored_ship_answer: false,
                 feature_branch_exists: false,
                 ..agreeing_facts(PhaseId::new(6))
             };
@@ -11790,7 +11688,6 @@ mod tests {
                 last_launched_stage: Some(Stage::Validate),
                 open_gate_stages: Vec::new(),
                 unprepared_restart: None,
-                stored_ship_answer: false,
                 feature_branch_exists: false,
                 ..agreeing_facts(PhaseId::new(7))
             };
@@ -15311,76 +15208,6 @@ mod tests {
         assert!(status.contains(&resume), "{status}");
         assert!(!status.contains("holds its liveness lock"), "{status}");
         assert!(doctor(&state).contains(&resume), "{}", doctor(&state));
-    }
-
-    /// A stored Ship answer with a dead supervisor is `devflow ship`'s: `status` and `doctor`
-    /// name it and never the `resume` that sets the answer aside. Controls: with no answer,
-    /// and with the answer already claimed, both name `resume` as before.
-    #[test]
-    fn status_and_doctor_name_ship_for_a_stored_ship_answer() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(5307);
-        state_pending_at(root, phase, Stage::Ship);
-        let opened = Gates::open_gate(root, phase, Stage::Ship, "g").unwrap();
-        let state = workflow::load_state(root, phase).unwrap();
-        let ship = format!("devflow ship --phase {phase}");
-        let resume = format!("devflow resume --phase {phase}");
-        let stop = format!("devflow stop --phase {phase}");
-
-        assert!(
-            recovery_hints(&state, &PhaseLiveness::GoneWhileActive).contains(&resume),
-            "control: nothing stored yet"
-        );
-
-        gate_respond(root, phase, Some(Stage::Ship), true, None, None).unwrap();
-
-        assert_eq!(
-            recovery_hints(&state, &PhaseLiveness::GoneWhileActive),
-            vec![ship.clone()]
-        );
-        assert_eq!(
-            recovery_hints(&state, &PhaseLiveness::Stale),
-            vec![stop, ship.clone()]
-        );
-        let mut stopped = state.clone();
-        stopped.stopped = true;
-        assert_eq!(
-            recovery_hints(&stopped, &PhaseLiveness::Gone),
-            vec![ship.clone()]
-        );
-        let open_gates = Gates::list_open(root);
-        let facts = build_phase_facts(
-            root,
-            state.clone(),
-            &mut std::collections::HashMap::new(),
-            &open_gates,
-        );
-        let findings = reconcile_phase(&facts);
-        let gate_finding = findings
-            .iter()
-            .find(|finding| finding.detail.contains("gate_pending"))
-            .expect("the finding about gate_pending");
-        assert!(
-            gate_finding.detail.contains("holds a stored answer"),
-            "{}",
-            gate_finding.detail
-        );
-        assert_eq!(gate_finding.repair.as_deref(), Some(ship.as_str()));
-        for finding in &findings {
-            let repair = finding.repair.as_deref().unwrap_or_default();
-            assert!(!repair.contains("devflow resume"), "{repair}");
-        }
-
-        std::fs::write(
-            Gates::claim_path(root, phase, Stage::Ship, &opened.gate_id),
-            "",
-        )
-        .unwrap();
-        assert!(
-            recovery_hints(&state, &PhaseLiveness::GoneWhileActive).contains(&resume),
-            "control: a claimed answer is out of `devflow ship`'s reach"
-        );
     }
 
     /// The state a `start` leaves when it is killed during preparation: its real
