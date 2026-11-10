@@ -5,16 +5,16 @@ milestone_name: Session Continuity
 current_phase: 52
 current_phase_name: Subtract and Stabilize
 status: executing
-stopped_at: Completed 52-09-PLAN.md
-last_updated: "2026-11-10T22:27:16.368Z"
+stopped_at: Completed 52-10-PLAN.md
+last_updated: "2026-11-10T22:58:11.682Z"
 last_activity: 2026-11-10
 last_activity_desc: Phase 52 execution started
-state_head: f1df974764e54ac0a34eafd791fb38b63060a4f0
+state_head: 94f635d40547547582f58e7507f7e51d8edcc8bd
 progress:
   total_phases: 4
   completed_phases: 0
   total_plans: 33
-  completed_plans: 9
+  completed_plans: 10
   percent: 0
 ---
 
@@ -159,7 +159,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 52 (Subtract and Stabilize) — EXECUTING
-Plan: 10 of 33
+Plan: 11 of 33
 Status: Ready to execute
 Last activity: 2026-11-10 — Phase 52 execution started
 
@@ -849,6 +849,7 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 52]: 52-08: a passing Validate ends the run through pipeline_gate::finish_run (state kept stopped+finished, worktree/branch kept, workflow_finished {reason: finished, shipped: false}, one notify); finish_run ignores stop_until and honours a stop at safe point 6 first
 - [Phase 52]: 52-08: the --until halt notifies once with reason stopped_at; resume refuses a finished run inside reserve_launch, naming devflow start
 - [Phase 52]: A rate limit with no usable fallback waits at the never-silent stage gate and does not charge infra_failures; its context leads with devflow resume --phase N, then the reset time, then the cause (52-09)
+- [Phase 52]: The cron-instructions file has no reader, writer, cleaner, doc or ignore pattern left; ship.rs keeps only ShipError and prepend_changelog, recover has no cron arm, and workflow::clear_state_if lost its after_clear step (52-10)
 
 ## Roadmap Evolution
 
@@ -969,11 +970,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 52 P07 | 11 min | 2 tasks | 17 files |
 | Phase 52 P08 | 32 min | 3 tasks | 8 files |
 | Phase 52 P09 | 18 min | 2 tasks | 7 files |
+| Phase 52 P10 | 23 min | 2 tasks | 16 files |
 
 ## Session
 
-**Last session:** 2026-11-10T22:27:16.204Z
-**Stopped at:** Completed 52-09-PLAN.md
+**Last session:** 2026-11-10T22:58:11.513Z
+**Stopped at:** Completed 52-10-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
