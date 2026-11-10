@@ -288,6 +288,22 @@ impl LaunchedRunReaper {
             .collect()
     }
 
+    /// Whether every supervisor this run started has exited on its own within
+    /// `within`. Ends nothing: a run that is still live reads `false`, so a
+    /// caller can count a run's events only once nothing can add to them.
+    pub fn supervisors_exited_within(&self, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        loop {
+            if self.live_supervisors().is_empty() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// Wait for this phase's supervisors to exit, then end any left, so none
     /// of them writes under the root once this returns.
     fn wait_for_supervisors_to_exit(&self) {
