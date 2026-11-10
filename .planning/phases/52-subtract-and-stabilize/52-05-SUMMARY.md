@@ -49,7 +49,7 @@ key-files:
 key-decisions:
   - "Tests where Claude as the primary agent is the subject (fallback re-arm, rate-limit failover, the HandoffRun fixture) keep Claude and pre-record a Confirmed canary instead of moving to Codex: the rate-limit envelope is Claude-format and the assertions name the claude-to-codex handoff. This is the suite's existing pattern (preflight.rs, pipeline_launch.rs launch_stage_inner_resets_checkpoint_resumes_counter)"
   - "The `commands::start` test helpers run Codex, and `init_start_repo` now commits a phase CONTEXT.md, because `start` refuses Codex without one; a Claude start cannot pre-record a canary (start builds a fresh state)"
-  - "The breaking marker is a `BREAKING CHANGE:` footer on `feat(52-05): ...`, not `feat(cli)!:`, so the GSD TDD gate's `^feat\\(52-05\\):` match still finds the GREEN commit"
+  - "The breaking marker is a `BREAKING CHANGE:` footer on `feat(52-05): ...`, not `feat(cli)!:`, so the GSD TDD gate's `^feat\\(52-05\\):` match still finds the GREEN commit. cut-release.sh reads subjects only, so it does not see this footer; the major bump rests on 52-02's `!` commits"
   - "`resume_canary_refusal` is deleted; `recovery_hints` and `resume` both call `recorded_canary_refusal` directly, so they still judge through one function"
   - "The dead Claude arm of `resolve_launch_shape` and `ClaudeDriver::exec_command_single_document` are kept (plan: keep every capture-shape path); their comments now say nothing reaches them through `launch_stage` today"
 
@@ -212,8 +212,9 @@ Totals: 24 migrated to Codex, 4 kept on Claude with a recorded `Confirmed` canar
 
 **4. [Scope] Files outside `files_modified`:** `parallel.rs` (passed the flag to `start`), `test_support.rs` (`go_waiting_agent_dir`) and `agents/claude.rs` (see 3). `tests/start_lock_e2e.rs` was listed but needed no change.
 
-**5. [Convention] The breaking marker is a footer, not `feat(cli)!:`**
-- **Why:** the GSD TDD gate looks for `^feat\(52-05\):`. A `!` in the subject would hide the GREEN commit from it. The `BREAKING CHANGE:` footer is the other conventional-commit form of the marker.
+**5. [Convention, wrong call] The breaking marker is a footer, not `feat(cli)!:`**
+- **Why it was done:** the GSD TDD gate looks for `^feat\(52-05\):`, and a `!` in the subject would hide the GREEN commit from it. The `BREAKING CHANGE:` footer is the other conventional-commit form of the marker.
+- **Found after committing:** `scripts/cut-release.sh` reads `git log --format=%s` (subjects only). Its `'BREAKING CHANGE' in c` branch therefore can never see a footer, so `39f6edc` alone does not tell cut-release this is a major bump. The release still reads major, because 52-02's `feat(52-02)!:` commits are in the same range. The commit was not rewritten. The latent defect in cut-release.sh (a footer check that cannot fire) is reported to the operator.
 
 **Total deviations:** 5 (2 blocking, 1 stale docs, 1 scope, 1 convention). **Impact:** test churn was larger than the plan's field count suggested, but every assertion was kept apart from the deleted legacy-subject ones.
 
