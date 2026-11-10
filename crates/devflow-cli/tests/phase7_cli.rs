@@ -745,6 +745,17 @@ const REMOVED_FLAG_INVOCATIONS: &[(&[&str], &str)] = &[
         &["gate", "sweep", "--reap-strays", "--dry-run"],
         "--reap-strays",
     ),
+    // `--dry-run` keeps the start invocation from launching anything against
+    // a binary that still accepts the flag; the resume one runs in an empty
+    // scratch directory with no run to resume.
+    (
+        &["start", "--phase", "1", "--legacy-claude-launch", "--dry-run"],
+        "--legacy-claude-launch",
+    ),
+    (
+        &["resume", "--phase", "1", "--legacy-claude-launch"],
+        "--legacy-claude-launch",
+    ),
 ];
 
 /// A removed flag or positional argument is refused by clap as unexpected
