@@ -1816,3 +1816,76 @@ fn an_until_validate_run_that_passes_finishes_as_finished() {
     let raw = raw_state(&rig);
     assert_eq!(raw["finished"], true, "{raw}");
 }
+
+/// D-35: a finished run stays inspectable. `cleanup` without `--force` keeps
+/// its worktree, and `resume` refuses it, naming `devflow start`, without
+/// launching a stage that already passed.
+#[test]
+fn a_finished_run_is_kept_by_cleanup_and_refused_by_resume() {
+    let phase = PhaseId::new(84);
+    let rig = FinishRig::new(phase);
+    let reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+
+    rig.start(&[]);
+    rig.wait_for_end(&reaper);
+    let state = rig.state();
+    assert!(state.finished, "premise: the run finished: {state:?}");
+    let worktree = state
+        .worktree_path
+        .clone()
+        .expect("the run used a phase worktree");
+
+    let cleanup = common::hermetic_devflow(&rig.home)
+        .arg("cleanup")
+        .arg(&rig.root)
+        .current_dir(&rig.root)
+        .output()
+        .expect("run devflow cleanup");
+    assert!(
+        cleanup.status.success(),
+        "cleanup exits 0\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&cleanup.stdout),
+        String::from_utf8_lossy(&cleanup.stderr)
+    );
+    assert!(
+        worktree.is_dir(),
+        "cleanup without --force keeps the finished run's worktree {}\nstdout: {}",
+        worktree.display(),
+        String::from_utf8_lossy(&cleanup.stdout)
+    );
+
+    let launched_before = stage_launched_count(&rig.root, phase);
+    let existing = std::env::var_os("PATH").unwrap_or_default();
+    let path = format!(
+        "{}:{}",
+        rig.fake_bin.path.display(),
+        existing.to_string_lossy()
+    );
+    let resume = common::hermetic_devflow(&rig.home)
+        .args(["resume", "--phase", &phase.to_string()])
+        .arg(&rig.root)
+        .current_dir(&rig.root)
+        .env("PATH", path)
+        .output()
+        .expect("run devflow resume");
+    let stderr = String::from_utf8_lossy(&resume.stderr).to_string();
+    assert!(
+        !resume.status.success(),
+        "resume refuses a finished run\nstdout: {}\nstderr: {stderr}",
+        String::from_utf8_lossy(&resume.stdout)
+    );
+    assert!(
+        stderr.contains("devflow start"),
+        "the refusal names `devflow start`: {stderr}"
+    );
+    assert_eq!(
+        stage_launched_count(&rig.root, phase),
+        launched_before,
+        "resume launched nothing; events:\n{}",
+        rig.events_text()
+    );
+    assert!(
+        rig.state().finished,
+        "the refused resume leaves the finished state as it was"
+    );
+}
