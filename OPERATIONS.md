@@ -15,12 +15,14 @@ Define → Plan → Code → Validate → Ship
 - **Define / Plan / Code** launch a headless coding agent with the stage's
   GSD command.
 - **Validate** requires an explicit `verdict: pass` from the agent to
-  advance; gaps loop back to Code (after `MAX_CONSECUTIVE_FAILURES` = 3
-  failures a gate is forced).
-- **Ship always gates** — a human approves before the terminal hooks
-  (version bump, branch cleanup) run.
-- Modes: `--mode auto` (only the Ship gate, plus never-silent failure
-  gates) or `--mode supervise` (also gates every Validate).
+  pass; gaps loop back to Code (after `MAX_CONSECUTIVE_FAILURES` = 3
+  failures a gate is forced). Validate is the last stage that runs: a pass
+  ends the run as finished and leaves the worktree and branch in place
+  ([How a run ends](#how-a-run-ends)). No transition reaches Ship.
+- Modes: `--mode auto` (finishes on a passing Validate without a gate;
+  only never-silent failure gates and the failure caps stop it) or
+  `--mode supervise` (also gates every Validate; approving it finishes the
+  run).
 - Every run gets an isolated git worktree under `.worktrees/phase-NN/` by
   default (`--no-worktree` opts out).
 
@@ -359,10 +361,34 @@ The way on when the fallback's canary refused:
   recorded canary before it changes anything, so the stop reason that names
   the way on is kept.
 
+## How a run ends
+
+A run records how it ended with one `workflow_finished` event in
+`.devflow/events.jsonl`, followed by one `notify_fired` event carrying the
+same `reason`. The notify command runs once, between the two (see
+[Notify hook](#notify-hook-never-miss-a-gate)).
+
+| `workflow_finished` payload | When | State afterwards |
+|---|---|---|
+| `{"reason":"finished","shipped":false}` | Validate passed: on the pass in auto mode, on the approved Validate gate in supervise mode | kept, with `stopped: true`, `finished: true` and a stop reason naming the finish |
+| `{"reason":"stopped_at","stage":"<stage>"}` | `--until plan` or `--until code` halted the run after that stage | kept, with `stopped: true`, `finished: false` |
+
+Validate is the last stage, so `--until validate` ends a run whose Validate
+passes as `finished`, exactly like a run without `--until`; it never reports
+`stopped_at` for Validate.
+
+Finishing never merges, pushes, tags, deletes or resets anything and runs no
+hook: the worktree and the `feature/phase-NN` branch are left as Validate left
+them. The phase is removed from the machine-global gate registry. `cleanup`
+without `--force` keeps a finished run's worktree.
+
 ## Notify hook (never miss a gate)
 
 Set `DEVFLOW_GATE_NOTIFY_CMD` to any shell command; it runs on every gate
-with metadata in env vars — never interpolated into the command:
+with metadata in env vars — never interpolated into the command. It also
+runs once when a run ends ([How a run ends](#how-a-run-ends)): for a
+finish `DEVFLOW_GATE_STAGE` is `validate`, for an `--until` halt it is the
+stage the run stopped after, and `DEVFLOW_GATE_CONTEXT` names the end.
 
 ```bash
 # ntfy.sh example
@@ -393,7 +419,7 @@ command. The coding agent never receives the variable.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `DEVFLOW_GATE_NOTIFY_CMD` | unset | Shell command fired when a gate is written |
+| `DEVFLOW_GATE_NOTIFY_CMD` | unset | Shell command fired when a gate is written, and once when a run ends |
 | `DEVFLOW_GATE_TIMEOUT_SECS` | 259200 (3d) | How long a monitor waits at a gate, holding its gate registration rather than a lock. Not a deadline for answering: the gate request and phase state are files that never expire, and timing out is a clean resumable stop. Past it the run has ended at that gate: `devflow resume` reruns the stage and asks again, setting any unused answer aside (a stored Ship approval is applied without a rerun by `devflow ship --phase N`) |
 | `DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS` | 60 | How long `devflow ship --phase`'s foreground manual override waits for a reopened Ship gate (terminal-hook failure) before failing fast, instead of `DEVFLOW_GATE_TIMEOUT_SECS`' multi-day default |
 | `DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS` | 120 | Wait on the shared-checkout lock; on timeout the hook batch is skipped (loudly), never run unserialized |

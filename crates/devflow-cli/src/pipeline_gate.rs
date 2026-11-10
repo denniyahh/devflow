@@ -94,6 +94,19 @@ pub(crate) fn transition(
                 "stage": from.to_string(),
             }),
         );
+        // D-06/D-29: the halt ends the run too, so it notifies once, after
+        // `workflow_finished`. `finish_run` is the other end site; one run end
+        // reaches only one of them.
+        notify_run_end(
+            project_root,
+            state,
+            from,
+            "stopped_at",
+            &format!(
+                "phase {} stopped after {from} completed (--until {from})",
+                state.phase
+            ),
+        );
         return Ok(());
     }
 
