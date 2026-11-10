@@ -3354,6 +3354,114 @@ mod tests {
         );
     }
 
+    /// The response an operator gives to approve a gate.
+    const APPROVE_RESPONSE: &str = r#"{"approved":true,"note":null,"responded_by":"test"}"#;
+
+    /// D-04: in supervise mode a passing Validate ends at a gate, and approving
+    /// it finishes the run through `finish_run`: the state is recorded
+    /// finished and the stage stays Validate. The gate asks to approve
+    /// finishing, not shipping. Run in a child with an agent-free `PATH`, so a
+    /// regression back to a transition cannot launch a real agent.
+    #[test]
+    fn approving_a_passed_validate_gate_finishes_the_run() {
+        const NAME: &str =
+            "pipeline_outcomes::tests::approving_a_passed_validate_gate_finishes_the_run";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(97);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Validate;
+        workflow::save_state(&state).unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Validate,
+            &serde_json::from_str(APPROVE_RESPONSE).unwrap(),
+        );
+
+        let outcome = handle_validate_outcome(root, &mut state, ValidateOutcome::Passed);
+
+        let context = last_gate_context(root, phase)
+            .expect("premise: supervise gates on every Validate, a pass included");
+        assert_eq!(
+            state.stage,
+            Stage::Validate,
+            "an approved pass finishes the run; it never transitions to Ship ({outcome:?})"
+        );
+        assert!(outcome.is_ok(), "the finish succeeds: {outcome:?}");
+        let kept = workflow::load_state(root, phase).expect("a finished run keeps its state");
+        assert!(kept.finished && kept.stopped, "{kept:?}");
+        assert!(
+            !context.contains("approve to ship"),
+            "the gate no longer asks to ship: {context:?}"
+        );
+        assert!(
+            context.contains("finish"),
+            "the gate asks to approve finishing: {context:?}"
+        );
+    }
+
+    /// D-04, the ambiguous arm: approving an ambiguous Validate gate also
+    /// finishes the run, rather than transitioning to Ship.
+    #[test]
+    fn approving_an_ambiguous_validate_gate_finishes_the_run() {
+        const NAME: &str =
+            "pipeline_outcomes::tests::approving_an_ambiguous_validate_gate_finishes_the_run";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(98);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        workflow::save_state(&state).unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Validate,
+            &serde_json::from_str(APPROVE_RESPONSE).unwrap(),
+        );
+
+        let outcome = handle_validate_outcome(
+            root,
+            &mut state,
+            ValidateOutcome::Ambiguous(
+                "external verification passed but no agent verdict arrived".into(),
+            ),
+        );
+
+        assert!(
+            last_gate_context(root, phase).is_some(),
+            "premise: an ambiguous outcome gates"
+        );
+        assert_eq!(
+            state.stage,
+            Stage::Validate,
+            "an approved ambiguous outcome finishes the run ({outcome:?})"
+        );
+        assert!(outcome.is_ok(), "the finish succeeds: {outcome:?}");
+        assert!(state.finished && state.stopped, "{state:?}");
+    }
+
     /// WR-03 (35-REVIEW): the run's record of the ceiling being reached must
     /// carry the number that was reached.
     ///
