@@ -319,8 +319,8 @@ own process group that owns the agent**, for both launch shapes:
 - **capture** (`MonitorLaunch::Legacy`): the agent's stdin is `/dev/null` and
   its stdout and stderr go straight to the phase capture files (stderr is kept
   out of the stdout capture so it can never corrupt the `DEVFLOW_RESULT`
-  parse). Non-Claude adapters other than Antigravity, the legacy Claude launch
-  opt-out and a checkpoint resume use it.
+  parse). Adapters other than Claude and Antigravity, and a checkpoint resume,
+  use it.
 - **stream** (`MonitorLaunch::PipeOwning`): the supervisor owns the agent's
   stdin and stdout pipes, delivers the prompt as the first turn and applies the
   idle timeout. Claude and Antigravity `stream-json` launches use it.

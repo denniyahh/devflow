@@ -231,11 +231,11 @@ fn parallel_creates_two_worktrees_and_spawns_two_monitors() {
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
-    // 34-06b: this test does NOT take D-11's legacy opt-out, and that is the
+    // 34-06b: this test runs Claude on the stream shape, and that is the
     // whole point of it. It is the multi-plan wave test, and the D-15 delivery
     // canary exists precisely to guarantee that a concurrent wave does not
-    // silently orphan its dispatched work (999.64). Pinning it to the legacy
-    // single-document transport would make the wave it covers the one shape the
+    // silently orphan its dispatched work (999.64). Pinning it to the capture
+    // shape would make the wave it covers the one shape the
     // canary is not protecting — deleting the coverage instead of stabilising
     // it, which is the "repaired by the wrong mechanism" failure 34-06 declined
     // to commit on this test's behalf.
@@ -749,7 +749,13 @@ const REMOVED_FLAG_INVOCATIONS: &[(&[&str], &str)] = &[
     // a binary that still accepts the flag; the resume one runs in an empty
     // scratch directory with no run to resume.
     (
-        &["start", "--phase", "1", "--legacy-claude-launch", "--dry-run"],
+        &[
+            "start",
+            "--phase",
+            "1",
+            "--legacy-claude-launch",
+            "--dry-run",
+        ],
         "--legacy-claude-launch",
     ),
     (

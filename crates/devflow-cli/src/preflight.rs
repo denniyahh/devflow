@@ -4325,8 +4325,8 @@ mod tests {
         std::fs::write(dir.join(format!("{padded}-01-PLAN.md")), body).unwrap();
     }
 
-    /// A wholly VIABLE fixture: a parsing GSD config, Claude with no legacy
-    /// opt-out, and a plan declaring only an ordinary blocking checkpoint.
+    /// A wholly VIABLE fixture: a parsing GSD config, Claude (the stream shape),
+    /// and a plan declaring only an ordinary blocking checkpoint.
     /// Every test below starts from this and breaks exactly one thing, so a
     /// refusal is attributable to the condition under test.
     fn viable_unattended_fixture(phase: PhaseId) -> (tempfile::TempDir, State) {

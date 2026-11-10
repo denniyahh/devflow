@@ -66,9 +66,6 @@ capture-shape launches are refused in auto mode:
   capture shape and cannot run `--mode auto`. This is a real capability
   removal introduced with this feature; those agents still work in supervise
   mode. (Antigravity launches on the stream shape and is allowed.)
-- **The legacy launch opt-out.** `--legacy-claude-launch` (or
-  `DEVFLOW_CLAUDE_LEGACY_LAUNCH`) moves Claude onto the capture shape, which
-  never engages the guard. It is now mutually exclusive with `--mode auto`.
 - **A fallback outside the stream shape.** A `--fallback-agent` (or
   `devflow.toml`'s `fallback_agent` key) runs the Code stage unattended after a
   rate limit, so it must itself launch on the stream shape: `--mode auto`
@@ -206,22 +203,21 @@ decision, plan the phase interactively first and then start the unattended run
 — by the time `devflow start` reaches Plan with a plan already on disk, the
 stage is a no-op.
 
-### 2. A legacy-arm or non-Claude Code stage gets no chain-flag guard at all
+### 2. A non-Claude Code stage gets no chain-flag guard at all
 
 There is no guard on those launch shapes, because they run on the capture
 shape, and a supervisor on the capture shape does not engage the chain-flag
 guard.
 
 **Cause.** The guard is engaged only by a supervisor on the stream shape,
-which only the Claude and Antigravity `stream-json` launch paths use; `codex`,
-`opencode` and the legacy opt-out launch on the capture shape.
+which only the Claude and Antigravity `stream-json` launch paths use; `codex`
+and `opencode` launch on the capture shape.
 
 **Fix owner: DevFlow, and as of this release the failure is loud rather than
 silent.** Condition 2 of the preflight now *refuses* this combination in auto
 mode instead of letting the run start and stall later. That is an improvement
 in legibility, not a removal of the limitation: `--mode auto` remains limited
-to Claude and Antigravity, and remains incompatible with the legacy launch
-opt-out.
+to Claude and Antigravity.
 
 ### 3. GSD orchestrator may block auto-approval of `gate="blocking"` checkpoints
 
