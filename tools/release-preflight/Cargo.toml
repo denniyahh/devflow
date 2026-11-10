@@ -1,0 +1,23 @@
+[package]
+name = "release-preflight"
+version.workspace = true
+edition.workspace = true
+# Required even though the tool is never published: `deny.toml` sets
+# `[licenses.private] ignore = false`, so cargo-deny checks unpublished
+# workspace members too and reports an unlicensed one as `error[unlicensed]`.
+license.workspace = true
+repository.workspace = true
+# Repo tooling for `scripts/cut-release.sh`, never a crates.io package. This
+# also keeps it out of `devflow_core::git::publish_order`.
+publish = false
+description = "Read-only release-cut preflight (check) and post-cut verification (verify) for scripts/cut-release.sh"
+
+[lints]
+workspace = true
+
+[dependencies]
+devflow-core.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

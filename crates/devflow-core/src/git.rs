@@ -1557,6 +1557,47 @@ mod tests {
         );
     }
 
+    /// A workspace member whose manifest sets `publish = false` (repo tooling
+    /// such as `tools/release-preflight`) is never uploaded to crates.io, so
+    /// it has no place in the publish order, even though it depends on the
+    /// core crate and would otherwise sort after it.
+    #[test]
+    fn publish_order_skips_an_unpublished_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\n    \"crates/devflow-core\",\n    \"crates/devflow-cli\",\n    \
+             \"tools/release-preflight\",\n]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("crates/devflow-core")).unwrap();
+        std::fs::write(
+            root.join("crates/devflow-core/Cargo.toml"),
+            "[package]\nname = \"devflow-core\"\n\n[dependencies]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("crates/devflow-cli")).unwrap();
+        std::fs::write(
+            root.join("crates/devflow-cli/Cargo.toml"),
+            "[package]\nname = \"devflow\"\n\n[dependencies]\ndevflow-core.workspace = true\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("tools/release-preflight")).unwrap();
+        std::fs::write(
+            root.join("tools/release-preflight/Cargo.toml"),
+            "[package]\nname = \"release-preflight\"\npublish = false\n\n\
+             [dependencies]\ndevflow-core.workspace = true\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            publish_order(root),
+            vec!["devflow-core".to_string(), "devflow".to_string()],
+            "a `publish = false` member must not appear in the crates.io publish order"
+        );
+    }
+
     // -----------------------------------------------------------------
     // 20d: origin/main ancestor check (no fetch)
     // -----------------------------------------------------------------
