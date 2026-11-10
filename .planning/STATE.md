@@ -5,16 +5,16 @@ milestone_name: Session Continuity
 current_phase: 52
 current_phase_name: Subtract and Stabilize
 status: executing
-stopped_at: Completed 52-05-PLAN.md
-last_updated: "2026-11-10T20:25:49.349Z"
+stopped_at: Completed 52-06-PLAN.md
+last_updated: "2026-11-10T20:55:20.945Z"
 last_activity: 2026-11-10
 last_activity_desc: Phase 52 execution started
-state_head: 66a27bf80cfe7c628de5c0df72601ba2a14fb054
+state_head: 08db18fe26c922198f933d37211b70db85f81e87
 progress:
   total_phases: 4
   completed_phases: 0
   total_plans: 33
-  completed_plans: 5
+  completed_plans: 6
   percent: 0
 ---
 
@@ -159,7 +159,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 52 (Subtract and Stabilize) — EXECUTING
-Plan: 6 of 33
+Plan: 7 of 33
 Status: Ready to execute
 Last activity: 2026-11-10 — Phase 52 execution started
 
@@ -844,6 +844,7 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 52]: 52-03: removed gate approve/reject positionals, start --worktree and gate sweep --reap-strays; resolve_gate_target deleted; doctor's stray hint is now manual (ps -o args= -p <pid>, then kill <pid>)
 - [Phase 52]: 52-04: e2e suites get the capture shape from a fake codex (common::capture_agent_bin), not --legacy-claude-launch; the capture witness now asserts stage_launched launch == capture, because its stdout/exit-code assertions also pass for a stream launch
 - [Phase 52]: 52-05: removed --legacy-claude-launch, DEVFLOW_CLAUDE_LEGACY_LAUNCH and State.legacy_claude_launch; stream_launch_enabled(agent, stage) has no opt-out; capture-shape unit tests run Codex, and Claude-primary failover fixtures keep Claude with a recorded Confirmed canary
+- [Phase 52]: 52-06: devflow release is removed; tools/release-preflight (publish = false) runs the six release checks for scripts/cut-release.sh check|verify via cargo run -q -p release-preflight, and git::publish_order skips publish = false members
 
 ## Roadmap Evolution
 
@@ -960,11 +961,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 52 P03 | 21 min | 2 tasks | 10 files |
 | Phase 52 P04 | 22 min | 2 tasks | 8 files |
 | Phase 52 P05 | 31 min | 2 tasks | 14 files |
+| Phase 52 P06 | 19 min | 3 tasks | 19 files |
 
 ## Session
 
-**Last session:** 2026-11-10T20:25:49.155Z
-**Stopped at:** Completed 52-05-PLAN.md
+**Last session:** 2026-11-10T20:55:20.726Z
+**Stopped at:** Completed 52-06-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
