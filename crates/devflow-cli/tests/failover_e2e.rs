@@ -603,7 +603,7 @@ fn answer_the_failed_canary_gate(rig: &Rig, answer: &[&str]) -> (Vec<Value>, Str
     );
 
     let output = common::hermetic_devflow(&rig.home)
-        .args(["gate", answer[0], &phase.to_string(), "code"])
+        .args(["gate", answer[0], &phase.to_string(), "--stage", "code"])
         .args(&answer[1..])
         .arg("--project")
         .arg(&rig.root)

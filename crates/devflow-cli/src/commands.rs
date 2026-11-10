@@ -50,39 +50,6 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub(crate) fn resolve_gate_target(
-    positional: Option<String>,
-    legacy_project: Option<PathBuf>,
-    stage_option: Option<Stage>,
-    project: PathBuf,
-) -> Result<(Option<Stage>, PathBuf), CliError> {
-    let Some(positional) = positional else {
-        return Ok((stage_option, project));
-    };
-    if let Ok(positional_stage) = positional.parse::<Stage>() {
-        if let Some(flagged_stage) = stage_option
-            && flagged_stage != positional_stage
-        {
-            return Err(CliError::Message(format!(
-                "conflicting stages: positional {positional_stage} and --stage {flagged_stage}"
-            )));
-        }
-        let target = legacy_project.unwrap_or(project);
-        return Ok((Some(stage_option.unwrap_or(positional_stage)), target));
-    }
-    if legacy_project.is_some() {
-        return Err(CliError::Message(format!(
-            "unsupported stage `{positional}`; expected define, plan, code, validate, or ship"
-        )));
-    }
-    if project.as_path() != Path::new(".") {
-        return Err(CliError::Message(
-            "project was supplied both positionally and with --project".into(),
-        ));
-    }
-    Ok((stage_option, PathBuf::from(positional)))
-}
-
 // ---------------------------------------------------------------------------
 // start / pipeline driving
 // ---------------------------------------------------------------------------
@@ -9836,69 +9803,26 @@ mod tests {
     }
 
     #[test]
-    fn gate_approve_arg_parsing_accepts_positional_stage() {
-        let cli = Cli::try_parse_from(["devflow", "gate", "approve", "15", "ship"]).unwrap();
-        let Command::Gate {
-            action: GateCmd::Approve { stage, project, .. },
-        } = cli.command
-        else {
-            panic!("expected gate approve command");
-        };
-
-        assert_eq!(stage.as_deref(), Some("ship"));
-        assert_eq!(project, PathBuf::from("."));
-
+    fn gate_approve_arg_parsing_takes_the_stage_option() {
         let flagged =
             Cli::try_parse_from(["devflow", "gate", "approve", "15", "--stage", "ship"]).unwrap();
         let Command::Gate {
-            action:
-                GateCmd::Approve {
-                    stage,
-                    stage_option,
-                    ..
-                },
+            action: GateCmd::Approve { stage, project, .. },
         } = flagged.command
         else {
             panic!("expected flagged gate approve command");
         };
-        assert_eq!(stage, None);
-        assert_eq!(stage_option, Some(Stage::Ship));
+        assert_eq!(stage, Some(Stage::Ship));
+        assert_eq!(project, PathBuf::from("."));
 
         let bare = Cli::try_parse_from(["devflow", "gate", "approve", "15"]).unwrap();
         let Command::Gate {
-            action:
-                GateCmd::Approve {
-                    stage,
-                    stage_option,
-                    ..
-                },
+            action: GateCmd::Approve { stage, .. },
         } = bare.command
         else {
             panic!("expected bare gate approve command");
         };
         assert_eq!(stage, None);
-        assert_eq!(stage_option, None);
-
-        let legacy =
-            Cli::try_parse_from(["devflow", "gate", "approve", "15", "/tmp/example-project"])
-                .unwrap();
-        let Command::Gate {
-            action:
-                GateCmd::Approve {
-                    stage,
-                    legacy_project,
-                    stage_option,
-                    project,
-                    ..
-                },
-        } = legacy.command
-        else {
-            panic!("expected legacy gate approve command");
-        };
-        let (stage, project) =
-            resolve_gate_target(stage, legacy_project, stage_option, project).unwrap();
-        assert_eq!(stage, None);
-        assert_eq!(project, PathBuf::from("/tmp/example-project"));
     }
 
     #[test]
