@@ -356,6 +356,13 @@ through a PR.
 > on a branch" mandatory at the commit level rather than a convention an
 > inattentive release cut can skip.
 
+`scripts/cut-release.sh` runs the steps below in order. Its read-only checks
+come from the unpublished workspace tool in `tools/release-preflight`:
+`scripts/cut-release.sh check` (self-pin, `develop`/`main` divergence,
+crates.io publish order, changelog version) before the cut, and
+`scripts/cut-release.sh verify` (the tag is on `main`, the `main`→`develop`
+sync ran) after it. Both read already-fetched refs; the script fetches first.
+
 1. Bump the version in **two** places in the root `Cargo.toml`: `version`
    under `[workspace.package]`, **and** `devflow-core`'s `version` under
    `[workspace.dependencies]`. Bumping only the first is the easy miss;

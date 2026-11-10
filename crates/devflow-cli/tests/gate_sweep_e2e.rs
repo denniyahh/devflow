@@ -5,8 +5,8 @@
 //!
 //! `commands::gate_sweep` is `pub(crate)` inside the `devflow` BINARY crate
 //! (no `lib.rs`, so integration tests cannot link against it at all), so —
-//! like every other devflow-cli integration test (`phase7_cli.rs`,
-//! `release_check.rs`) — this drives the real compiled binary via
+//! like every other devflow-cli integration test (`phase7_cli.rs`) — this
+//! drives the real compiled binary via
 //! `Command::new`, not an in-process call.
 
 mod common;

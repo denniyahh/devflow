@@ -26,12 +26,12 @@ DevFlow handles all of this. You say `devflow start --phase 3 --agent claude --m
 
 > **Where the automation stops.** Steps 1–6 and 9 are automated end to end. The
 > release cut itself — opening the `develop` → `main` PR, tagging, and publishing
-> — is deliberately still manual; `devflow release --check` runs the preflight but
-> does not execute the release.
+> — is deliberately still manual; `scripts/cut-release.sh check` runs the preflight
+> but does not execute the release.
 >
 > **If you squash-merge `develop` → `main`,** be aware that the squash commit has
 > no parent link back to `develop`, so `develop` never learns `main` moved and your
-> *next* release will conflict against a stale merge-base. `devflow release --check`
+> *next* release will conflict against a stale merge-base. `scripts/cut-release.sh check`
 > detects this (`origin/main is NOT an ancestor of HEAD`), but DevFlow does not yet
 > ship the repair. Until it does, merge `main` back into `develop` after each
 > release with a real merge commit:

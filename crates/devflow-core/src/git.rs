@@ -615,7 +615,7 @@ pub fn origin_main_ancestor_status(project_root: &Path) -> AncestorStatus {
 /// Whether the `ancestor` ref is an ancestor of the `descendant` ref, against
 /// ALREADY-FETCHED local refs — issues NO `git fetch`. Generalises
 /// [`origin_main_ancestor_status`] to an arbitrary ref pair (used by
-/// `release --verify`'s post-cut checks: is the release tag on `main`, and
+/// `release-preflight verify`'s post-cut checks: is the release tag on `main`, and
 /// has the `main`→`develop` sync run). Distinguishes "not an ancestor"
 /// (exit 1) from "a ref is absent" (exit 128) so the caller can degrade to
 /// an actionable `git fetch` message instead of reporting a false
@@ -1649,7 +1649,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // release --verify: ref_is_ancestor (arbitrary ref pair)
+    // release-preflight verify: ref_is_ancestor (arbitrary ref pair)
     // -----------------------------------------------------------------
 
     #[test]
@@ -1682,7 +1682,7 @@ mod tests {
         );
     }
 
-    /// The case `release --verify` exists for: `main` and `develop` point at
+    /// The case `release-preflight verify` exists for: `main` and `develop` point at
     /// unrelated commits (main is a squash-merge lineage), so neither is an
     /// ancestor of the other — the "sync skipped" state that makes the next
     /// release PR conflict against a stale merge-base.
