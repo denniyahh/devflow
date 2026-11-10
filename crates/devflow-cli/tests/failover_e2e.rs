@@ -831,12 +831,14 @@ fn after_the_refused_relaunch_status_and_resume_lead_to_another_agent() {
     );
 }
 
-/// D-11 / criterion 2 under the same auto-mode rig: with no fallback, the same
-/// Claude rate limit at Code writes the cron resume instructions. Negative
-/// control: no handoff, and the `agy` stub on PATH is never launched for a
-/// canary or a stage.
+/// CUT-03 (interim) under the same auto-mode rig: with no fallback, the same
+/// Claude rate limit at Code waits at the never-silent Code gate, which names
+/// the resume command and the reset time from the denial. Both directions in
+/// one fixture: the cron-instructions file the old arm wrote is absent, and
+/// the gate is present. Negative control: no handoff, and the `agy` stub on
+/// PATH is never launched for a canary or a stage.
 #[test]
-fn a_rate_limited_claude_run_in_auto_mode_without_a_fallback_writes_cron_instructions() {
+fn a_rate_limited_claude_run_without_a_fallback_waits_at_a_gate() {
     let phase = PhaseId::new(5122);
     let rig = Rig::new(phase, AgyCanary::ReturnsToken);
     let _reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
@@ -849,24 +851,41 @@ fn a_rate_limited_claude_run_in_auto_mode_without_a_fallback_writes_cron_instruc
     ]);
     let log = rig.events_text();
 
-    let scheduled = rig.events_named("rate_limit_resume_scheduled");
-    assert_eq!(scheduled.len(), 1, "one scheduled resume; events:\n{log}");
-    assert_eq!(scheduled[0]["stage"], "code", "{}", scheduled[0]);
-
-    let cron: Value = serde_json::from_str(
-        &fs::read_to_string(rig.cron_file()).expect("the cron arm wrote its instructions"),
-    )
-    .expect("the cron instructions parse");
-    assert_eq!(
-        cron["resume"]["args"],
-        serde_json::json!(["resume", "--phase", "5122"]),
-        "{cron}"
+    assert!(
+        !rig.cron_file().exists(),
+        "no cron-instructions file is written; events:\n{log}"
     );
     assert!(
-        cron["hermes_cron"]["schedule"]
-            .as_str()
-            .is_some_and(|schedule| !schedule.is_empty()),
-        "the reset time parsed into a schedule: {cron}"
+        rig.events_named("rate_limit_resume_scheduled").is_empty(),
+        "no resume is scheduled; events:\n{log}"
+    );
+    let gated = rig.events_named("gate_fired");
+    assert_eq!(gated.len(), 1, "one gate; events:\n{log}");
+    assert_eq!(gated[0]["stage"], "code", "{}", gated[0]);
+    assert!(
+        devflow_core::gates::Gates::gate_path(&rig.root, phase, devflow_core::stage::Stage::Code)
+            .exists(),
+        "the Code gate file is open"
+    );
+
+    let shown = common::hermetic_devflow(&rig.home)
+        .args(["gate", "show", &phase.to_string(), "--stage", "code"])
+        .arg(&rig.root)
+        .output()
+        .expect("run devflow gate show");
+    let shown_text = String::from_utf8_lossy(&shown.stdout);
+    assert!(
+        shown.status.success(),
+        "gate show failed: {}",
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    assert!(
+        shown_text.contains("1785645600"),
+        "the gate names the reset time from the denial: {shown_text}"
+    );
+    assert!(
+        shown_text.contains(&format!("devflow resume --phase {phase}")),
+        "the gate names the resume command: {shown_text}"
     );
 
     assert!(
