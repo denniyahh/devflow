@@ -130,6 +130,53 @@ pub const AGENT_ARGV_LOG: &str = "agent-argv";
 /// The file under a capture agent's `logs` dir that holds its stdin.
 pub const AGENT_STDIN_LOG: &str = "agent-stdin";
 
+/// The codex `--json` event lines a finished turn prints: the stream DevFlow's
+/// codex driver parses, whose final `agent_message` carries a `DEVFLOW_RESULT`
+/// success line.
+const CODEX_SUCCESS_EVENTS: &str = r#"printf '%s\n' '{"type":"thread.started","thread_id":"t-fake"}'
+printf '%s\n' '{"type":"turn.started"}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"work done\nDEVFLOW_RESULT: {\"status\":\"success\",\"commits\":1}"}}'
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1}}'"#;
+
+/// A fake capture-shape agent: `codex`, which gets its prompt as argv. It
+/// answers `--version`, appends its argv (one argument per line) to
+/// `logs/`[`AGENT_ARGV_LOG`] and its stdin to `logs/`[`AGENT_STDIN_LOG`],
+/// commits one empty commit as its "work", prints a successful codex turn
+/// ([`CODEX_SUCCESS_EVENTS`]) and exits 0.
+pub fn capture_agent_bin(logs: &Path) -> FakeBin {
+    capture_agent_bin_ending(
+        logs,
+        &format!(
+            "git commit -q --allow-empty -m \"fake stage work\"\n{CODEX_SUCCESS_EVENTS}\nexit 0"
+        ),
+    )
+}
+
+/// [`capture_agent_bin`] that, after logging, stays running until it is
+/// ended instead of finishing its turn.
+pub fn waiting_capture_agent_bin(logs: &Path) -> FakeBin {
+    capture_agent_bin_ending(logs, "sleep 120")
+}
+
+/// The fake `codex` behind [`capture_agent_bin`]: answer `--version`, log
+/// argv and stdin under `logs`, then run `tail`.
+fn capture_agent_bin_ending(logs: &Path, tail: &str) -> FakeBin {
+    let logs = logs.to_str().expect("a UTF-8 logs path");
+    assert!(
+        !logs.contains('\''),
+        "the logs path is single-quoted in the stub: {logs}"
+    );
+    fake_bin_dir_for(
+        "codex",
+        &format!(
+            "if [ \"$1\" = \"--version\" ]; then echo \"codex-cli 0.0.0-fake\"; exit 0; fi\n\
+             for arg in \"$@\"; do printf '%s\\n' \"$arg\"; done >> '{logs}/{AGENT_ARGV_LOG}'\n\
+             cat >> '{logs}/{AGENT_STDIN_LOG}'\n\
+             {tail}"
+        ),
+    )
+}
+
 /// Poll `predicate` every 25ms until it is true, panicking with `what` once
 /// `timeout` elapses.
 pub fn wait_for(mut predicate: impl FnMut() -> bool, timeout: Duration, what: &str) {
