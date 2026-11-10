@@ -30,8 +30,8 @@ Define → Plan → Code → Validate → Ship
 
 | Command | Purpose |
 |---|---|
-| `devflow start --phase N --agent claude\|codex\|opencode --mode auto\|supervise [--force] [--no-worktree] [--dry-run] [--until define\|plan\|code\|validate] [--fallback-agent <agent>]` | Begin a phase; a detached monitor owns the agent and auto-advances. `--until <stage>` runs through `<stage>` then halts cleanly (no orphaned monitor, no `doctor` false positive) instead of continuing to Ship; `--until ship` is rejected (a no-op — Ship is already terminal). Refuses before scaffolding anything if phase N is not reachable from `develop` (see Preflight refusals below). `--fallback-agent <agent>` names one agent that takes over if the Code stage is rate-limited: one hop per run, at Code only (a rate limit at any other stage takes the cron arm), relaunching Code in the same worktree on the same branch. It is saved in `state-NN.json`, and refused when it equals `--agent`, when its binary is missing or its driver unhealthy, and in `--mode auto` unless it is `claude` or `antigravity`. That launch check is best effort: the full preflight runs again at the handoff, a refusal there takes the cron arm, and a relaunch that fails after the handoff stops at a Code gate (see [Rate-limit failover](#rate-limit-failover)). Without the flag, `start` uses `devflow.toml`'s `fallback_agent` key and prints a note naming it; the flag wins the value, and no environment variable selects a fallback |
-| `devflow resume --phase N [--agent <agent>] [--fallback-agent <agent>]` | Resume a rate-limited or infra-paused phase from its saved stage (loads `state-NN.json`, does not recreate the branch/worktree or reset to Define) — the command a primary-loop rate-limit auto-resume cron invokes. Also clears a `--until`-stopped phase's stop marker, so the phase advances past its old stop point instead of re-stopping immediately. A run that finished (its Validate passed) is refused, naming `devflow start`, and nothing is launched. It reruns the stage, so a pending gate is asked again: it sets any unused answer aside and reports it, and reports an answer that was claimed with no record that it was applied (see [Answering gates](#answering-gates)). `--agent <agent>` hands the run to another agent (an `agent_handoff` event with reason `resume --agent`); naming the run's saved, unused fallback is refused unless `--fallback-agent` names another. `--fallback-agent <agent>` sets the fallback or re-arms a spent one, checked as on `start`; like any resume it is accepted only on a run that is not live. Without it the saved fallback is kept as it is, spent or not: `resume` does not re-read `devflow.toml` |
+| `devflow start --phase N --agent claude\|codex\|opencode --mode auto\|supervise [--force] [--no-worktree] [--dry-run] [--until define\|plan\|code\|validate] [--fallback-agent <agent>]` | Begin a phase; a detached monitor owns the agent and auto-advances. `--until <stage>` runs through `<stage>` then halts cleanly (no orphaned monitor, no `doctor` false positive) instead of continuing to Ship; `--until ship` is rejected (a no-op — Ship is already terminal). Refuses before scaffolding anything if phase N is not reachable from `develop` (see Preflight refusals below). `--fallback-agent <agent>` names one agent that takes over if the Code stage is rate-limited: one hop per run, at Code only (a rate limit at any other stage waits at the stage's gate), relaunching Code in the same worktree on the same branch. It is saved in `state-NN.json`, and refused when it equals `--agent`, when its binary is missing or its driver unhealthy, and in `--mode auto` unless it is `claude` or `antigravity`. That launch check is best effort: the full preflight runs again at the handoff, a refusal there leaves the run waiting at the Code gate, and a relaunch that fails after the handoff stops at a Code gate (see [Rate-limit failover](#rate-limit-failover)). Without the flag, `start` uses `devflow.toml`'s `fallback_agent` key and prints a note naming it; the flag wins the value, and no environment variable selects a fallback |
+| `devflow resume --phase N [--agent <agent>] [--fallback-agent <agent>]` | Resume a rate-limited or infra-paused phase from its saved stage (loads `state-NN.json`, does not recreate the branch/worktree or reset to Define) — the command a rate-limit gate names for after the reset. Also clears a `--until`-stopped phase's stop marker, so the phase advances past its old stop point instead of re-stopping immediately. A run that finished (its Validate passed) is refused, naming `devflow start`, and nothing is launched. It reruns the stage, so a pending gate is asked again: it sets any unused answer aside and reports it, and reports an answer that was claimed with no record that it was applied (see [Answering gates](#answering-gates)). `--agent <agent>` hands the run to another agent (an `agent_handoff` event with reason `resume --agent`); naming the run's saved, unused fallback is refused unless `--fallback-agent` names another. `--fallback-agent <agent>` sets the fallback or re-arms a spent one, checked as on `start`; like any resume it is accepted only on a run that is not live. Without it the saved fallback is kept as it is, spent or not: `resume` does not re-read `devflow.toml` |
 | `devflow status` | All active phases: stage, gate state, supervisor liveness (ALIVE / STALE / GONE, with the repair; see [Run liveness](#run-liveness)), elapsed, last action. Also shows a held state write lock with its holder, names a live agent that has no supervisor with the manual kill, and lists set-aside gate answers |
 | `devflow logs [-f] [--phase N] [--stderr]` | Print/follow a phase's captured agent output |
 | `devflow history [N]` | Show chronological events with retained capture and review evidence for a phase |
@@ -292,11 +292,23 @@ A rate-limited stage gets one of two answers.
   hop happens once per run, because it marks the fallback used in
   `state-NN.json`; `devflow resume --phase N --fallback-agent <agent>` re-arms it
   on a run that is not live. A hop does not count toward the infra ceiling.
-- **Cron resume.** Otherwise DevFlow writes `cron-instructions-NN.json` naming
-  `devflow resume --phase N`: no fallback configured, the fallback already used,
-  a rate limit at any stage but Code, or a handoff refused before it happened.
-  The full preflight runs again at the handoff, because the check at launch is
-  best effort, so a fallback can still be refused there (its binary gone, say).
+- **Rate-limit gate.** Otherwise the run waits at the stage's never-silent
+  gate: no fallback configured, the fallback already used, a rate limit at any
+  stage but Code, or a handoff refused before it happened. The full preflight
+  runs again at the handoff, because the check at launch is best effort, so a
+  fallback can still be refused there (its binary gone, say). The gate shows in
+  `devflow gate list` and `devflow gate show`, and fires the notify command.
+  Its context leads with the way on: `devflow resume --phase N` (with
+  `--agent <agent>` when the run is not on `claude`), then the reset time when
+  the denial carried one (`the limit resets at <time>`, otherwise `the denial
+  carried no reset time`), then the cause. `devflow gate approve N` (or a
+  `gate reject` without "abort") relaunches the stage now, on the same agent;
+  `devflow gate reject N --note "abort …"` ends the run. `devflow resume
+  --phase N` is refused while the supervisor waits at the gate, so it is the
+  way on after the reset once that supervisor has ended. Waiting for quota
+  does not count toward the infra ceiling, so it cannot abort the run, and
+  DevFlow does not yet relaunch by itself at the reset time: answer the gate
+  or resume by hand. No `cron-instructions-NN.json` is written.
 
 Only top-level events decide a rate limit: a subagent's rate-limit event or
 `result` in the capture does not. A stage that went silent with no quota
@@ -310,8 +322,8 @@ timeout. For a Claude capture the torn line may have been a quota denial; the
 classifier reads only Claude's denials, so for other agents it says nothing
 about one either way. A torn final line outranks a quota denial parsed before
 it, because the torn line may be a later event that replaced the denial: the
-stage is never classified as rate-limited, so no failover and no cron resume
-follow. At an idle timeout it is recorded as one, flagged torn, and stops at a
+stage is never classified as rate-limited, so no failover and no rate-limit
+gate follow. At an idle timeout it is recorded as one, flagged torn, and stops at a
 gate, when the torn line reached the capture before the monitor's idle check.
 Known residual (backlog 999.207): the capture keeps whole lines only, so a
 partial line the agent was writing when it was killed reaches the capture only
@@ -320,14 +332,14 @@ at the check, the monitor logs the stage as rate-limited (resumable), writes no
 idle-timeout record and kills the agent; the verdict then reads the torn line
 and the gate shows an indeterminate failure (`stream capture ends in an
 unparseable line`), not an idle timeout. The outcome is still a gate, with no
-failover and no cron resume.
+failover and no rate-limit gate.
 
 The failover events in `events.jsonl`:
 
 | Event | When | Keys |
 |---|---|---|
 | `agent_handoff` | The run changed agent | `stage`, `from_agent`, `to_agent`, `reason` (`rate_limited` for a failover, `resume --agent` for `devflow resume --agent`), `tree_dirty` (the tree handed over had uncommitted changes), `commit_count` (commits on the phase branch). Each of the last two is `null` when it could not be measured |
-| `agent_handoff_refused` | The fallback was refused before the handoff; the cron arm follows | `stage`, `from_agent`, `to_agent`, `reason` |
+| `agent_handoff_refused` | The fallback was refused before the handoff; the rate-limit gate follows | `stage`, `from_agent`, `to_agent`, `reason` |
 | `agent_handoff_relaunch_failed` | The handoff happened, but Code could not be relaunched under the fallback | `stage`, `from_agent`, `to_agent`, `reason` (the launch error) |
 | `gate_relaunch_refused` | A retry or loop-back answer to a stage's failure gate was not relaunched, because the delivery canary recorded for the run refuses its agent; the run is marked stopped | `stage`, `agent`, `reason` (the recorded refusal) |
 

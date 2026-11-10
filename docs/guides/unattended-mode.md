@@ -71,7 +71,7 @@ capture-shape launches are refused in auto mode:
   rate limit, so it must itself launch on the stream shape: `--mode auto`
   accepts only `claude` or `antigravity` as a fallback. The check at launch is
   best effort: the full preflight runs again at the handoff, and a refusal
-  there takes the cron arm. This guard is not widened for the fallback.
+  there leaves the run waiting at the Code gate. This guard is not widened for the fallback.
 
 The recovery for each is the same: drop the flag that caused it (or name a
 fallback on the stream shape), or run in supervise mode.

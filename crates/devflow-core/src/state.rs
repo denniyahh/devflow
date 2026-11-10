@@ -464,15 +464,15 @@ pub struct State {
     /// environment variable.
     ///
     /// It applies only to a rate limit at [`Stage::Code`] (operator ruling
-    /// R-2): a rate limit at any other stage takes the cron arm and leaves the
-    /// fallback unused. One handoff sets [`Self::fallback_consumed`], after
-    /// which a later rate limit takes the cron arm too (D-05).
+    /// R-2): a rate limit at any other stage waits at the stage's gate and
+    /// leaves the fallback unused. One handoff sets [`Self::fallback_consumed`],
+    /// after which a later rate limit waits at the gate too (D-05).
     #[serde(default)]
     pub fallback_agent: Option<AgentKind>,
     /// Whether this run has already handed off to [`Self::fallback_agent`]
     /// (D-05). Set in the same state write that makes the fallback the run's
-    /// agent, so a second rate limit can never hand off again; it takes the
-    /// cron arm instead. A refused handoff does not set it.
+    /// agent, so a second rate limit can never hand off again; it waits at the
+    /// stage's gate instead. A refused handoff does not set it.
     ///
     /// `false` means EITHER "the fallback has not been used" OR "the state was
     /// written by a binary predating this field" — both behave identically.
