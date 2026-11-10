@@ -777,6 +777,59 @@ fn removed_subcommands_are_unknown() {
     );
 }
 
+/// Flag and argument forms v4.0 removed (D-01), each paired with the token
+/// clap must name as unexpected. Naming the token matters: before the removal
+/// `start --phase 1 --worktree x --dry-run` was already refused, for its missing
+/// `--mode`. Later cut plans append to this list.
+const REMOVED_FLAG_INVOCATIONS: &[(&[&str], &str)] = &[
+    (
+        &["start", "--phase", "1", "--worktree", "x", "--dry-run"],
+        "--worktree",
+    ),
+    (&["gate", "approve", "1", "code"], "code"),
+    (&["gate", "reject", "1", "code", "--note", "n"], "code"),
+];
+
+/// A removed flag or positional argument is refused by clap as unexpected
+/// instead of being accepted and ignored. `gate approve --help` is the
+/// control: the subcommand that lost its positional stage still parses.
+#[test]
+fn removed_flags_are_unknown() {
+    let home = common::HermeticHome::new();
+    let scratch = tempfile::tempdir().unwrap();
+
+    for (args, token) in REMOVED_FLAG_INVOCATIONS {
+        let output = common::hermetic_devflow(&home)
+            .args(*args)
+            .current_dir(scratch.path())
+            .output()
+            .expect("run devflow");
+        assert!(
+            !output.status.success(),
+            "`devflow {}` must be rejected",
+            args.join(" ")
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let expected = format!("unexpected argument '{token}'");
+        assert!(
+            stderr.contains(&expected),
+            "`devflow {}` must be rejected by clap with {expected:?}\nstderr: {stderr}",
+            args.join(" ")
+        );
+    }
+
+    let help = common::hermetic_devflow(&home)
+        .args(["gate", "approve", "--help"])
+        .current_dir(scratch.path())
+        .output()
+        .expect("run devflow gate approve --help");
+    assert!(
+        help.status.success(),
+        "control: `devflow gate approve --help` must still succeed\nstderr: {}",
+        String::from_utf8_lossy(&help.stderr)
+    );
+}
+
 /// WR-01 (phase 20 review): `--dry-run` must reflect `--until` in its
 /// preview instead of always printing the full Define→Ship pipeline as if
 /// `--until` had not been passed.
