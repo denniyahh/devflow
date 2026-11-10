@@ -289,7 +289,7 @@ crates/
 - `cargo fmt --check`
 - `Build + test in devcontainer`
 
-`devflow test` runs these checks locally, and
+`scripts/check.sh all` runs these checks locally, and
 [`scripts/hooks/pre-push`](scripts/hooks/pre-push) runs them before a push.
 The `--all-targets` scope is load-bearing: the narrower `cargo clippy -- -D
 warnings` does not compile test targets, so lints inside `#[cfg(test)]`

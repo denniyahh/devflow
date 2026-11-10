@@ -128,13 +128,6 @@ Rate-limit detection: if an agent's stdout contains rate-limit messages (429), D
 | Command | Description |
 |---|---|
 | `devflow parallel --phases 7,8 [--agents claude,codex]` | Run multiple phases concurrently in isolated worktrees |
-| `devflow reference [--refresh]` | Create a static reference worktree for multi-agent handoff |
-
-### Quality
-
-| Command | Description |
-|---|---|
-| `devflow test` | Run local quality checks: `cargo test`, clippy, and `fmt --check` |
 
 ### Setup & Recovery
 

@@ -374,8 +374,6 @@ backs:
 - `start` (default) — run a single phase in its own worktree;
   `--no-worktree` runs directly in the primary checkout instead.
 - `parallel` — run multiple phases concurrently, each in its own worktree.
-- `reference` — create or refresh a static snapshot worktree at
-  `.worktrees/reference/`.
 
 Branch integration uses `GitFlow::ensure_branch()` (create at a start point
 without checking out).

@@ -26,9 +26,6 @@
 //!   scope is asserted — plus a check that the workflow really does delegate
 //!   to the script, without which the scope guard would be guarding a file
 //!   CI no longer runs.
-//!
-//! * **WR-10 (17-REVIEW.md).** `devflow test` is documented as the local
-//!   mirror of CI, so its clippy scope must match. Unchanged.
 
 use std::path::{Path, PathBuf};
 
@@ -382,28 +379,6 @@ fn scheduled_deps_workflow_runs_the_pinned_image() {
     assert!(
         lines.iter().any(|l| l.trim() == "schedule:"),
         "scheduled-deps.yml must run on a schedule"
-    );
-}
-
-/// `devflow test` is documented as the local mirror of CI's quality gates,
-/// so its clippy invocation must match the workflows' scope. It ran the
-/// narrow pre-Phase-17 form until this fix (17-REVIEW.md WR-10), which made
-/// a local green weaker than a CI green — a false-green generator.
-#[test]
-fn devflow_test_clippy_matches_ci_scope() {
-    // 19-09: `test_cmd` (the `devflow test` handler) moved from `main.rs`
-    // into `commands.rs` as part of the main.rs decomposition — this
-    // regression guard's target path moved with it.
-    let path = repo_root().join("crates/devflow-cli/src/commands.rs");
-    let src = read(&path);
-
-    let has_narrow_form = src.contains("\"cargo clippy -- -D warnings\"");
-    assert!(
-        !has_narrow_form,
-        "`devflow test` must not use the narrow `cargo clippy -- -D warnings` \
-         form — it does not compile test targets, making a local green weaker \
-         than a CI green (17-REVIEW.md WR-10). See {}",
-        path.display()
     );
 }
 
