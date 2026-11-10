@@ -320,6 +320,13 @@ fn explicit_clean_of_a_phase_with_nothing_to_clean_says_so() {
         !text.contains("cleaned up workflow state"),
         "a no-op clean must not claim a cleanup: {text}"
     );
+    // The explicit clean names only what it looks for. There is no cron record
+    // to look for any more (D-01), so the no-op line does not claim one.
+    assert!(
+        text.lines()
+            .any(|line| line == "nothing to clean for phase 66: no workflow state or gate files"),
+        "the no-op line names exactly the state and gate files it looked for: {text}"
+    );
 }
 
 #[test]
