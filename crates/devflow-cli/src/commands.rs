@@ -316,9 +316,6 @@ pub(crate) enum FallbackSource {
     /// `devflow start`: the `--fallback-agent` flag when given, else
     /// `devflow.toml`'s `fallback_agent` key (R-3).
     FlagOrConfig(Option<AgentKind>),
-    /// `devflow parallel`, which takes no `--fallback-agent`: no fallback, and
-    /// `devflow.toml`'s key is not read (the key is read by `devflow start` only).
-    NoFallback,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -369,9 +366,7 @@ pub(crate) fn start(
     // absent. Resolved unconditionally, also when the flag is given, so a broken
     // key refuses `start` whatever the flag says: the flag wins the value, it does
     // not excuse a broken config file (stricter than `base_branch`, whose env
-    // override skips the file). `devflow parallel` passes `NoFallback`: it has no
-    // flag to override the key with, so it arms none, and checks and names the key
-    // itself before it launches anything.
+    // override skips the file).
     let (fallback_agent, from_config) = match fallback {
         FallbackSource::FlagOrConfig(flag) => {
             let config_fallback =
@@ -381,7 +376,6 @@ pub(crate) fn start(
                 flag.is_none() && config_fallback.is_some(),
             )
         }
-        FallbackSource::NoFallback => (None, false),
     };
 
     // D-01, D-02, D-03: the fallback is checked against the state as combined above
@@ -1139,7 +1133,7 @@ fn phase_from_worktree_path(worktrees_dir: &Path, path: &Path) -> Option<PhaseId
 }
 
 /// Join a `git worktree list` entry to its owning phase `State`, preferring
-/// the persisted `worktree_path` (set by `start`/`parallel`) and falling back
+/// the persisted `worktree_path` (set by `start`) and falling back
 /// to worktree-directory-name or branch-name matching only when no
 /// `worktree_path` match exists (review: Codex MEDIUM). Returns `None` when
 /// no owning state can be found at all (e.g. the phase already shipped and

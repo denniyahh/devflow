@@ -476,9 +476,8 @@ struct FallbackAgentKey {
 /// it with `--fallback-agent` the way it combines [`yes_ship`] with
 /// `--yes-ship`: the flag wins when given, this value applies when the flag
 /// is absent, and `start` prints a notice naming `devflow.toml` when it
-/// does. Only `devflow start` arms it. `devflow parallel` reads it to refuse a
-/// broken key and to print a note that the key is not armed, and arms no
-/// fallback; `devflow resume` keeps the run's persisted fallback.
+/// does. Only `devflow start` arms it; `devflow resume` keeps the run's
+/// persisted fallback.
 ///
 /// A missing file, or a file without the key, is `Ok(None)`. An unreadable
 /// file follows [`load_config`]'s warn-and-default path and is treated as no

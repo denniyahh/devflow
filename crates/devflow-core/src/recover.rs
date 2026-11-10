@@ -80,7 +80,7 @@ fn inspect_state(project_root: &Path, state: State) -> RecoveryStatus {
 /// 14-CR-01: only STALE phases are swept — a phase whose agent is still
 /// running, whose state is simply fresh, or whose supervisor, pending supervisor,
 /// gate waiter or foreground holder may be live is kept (with a warning naming the
-/// repair), so cleaning one dead phase under `devflow parallel` can never orphan a
+/// repair), so cleaning one dead phase beside running ones can never orphan a
 /// healthy sibling. Also removes lock files whose holder is dead (the sweep lives in
 /// [`crate::lock::remove_stale_locks`], which refuses to delete a live
 /// holder's lock), gate files whose phase has no state file, cron-instruction
@@ -1088,7 +1088,7 @@ mod tests {
     }
 
     /// 14-CR-01: `recover --clean` must never delete a phase whose agent is
-    /// still running — under `devflow parallel`, cleaning a stale phase must
+    /// still running — with several phases running, cleaning a stale phase must
     /// not orphan a healthy sibling.
     #[test]
     fn clean_keeps_phase_with_live_agent() {

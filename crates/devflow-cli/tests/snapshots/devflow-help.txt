@@ -8,7 +8,6 @@ Commands:
   gate      Inspect and answer human gates (the pause points where the workflow waits for approval)
   logs      Print or follow an agent's captured output for a phase
   history   Show a phase's chronological events and retained attempt evidence
-  parallel  Run multiple phases concurrently, each in its own worktree + monitor
   cleanup   Remove phase worktrees and their feature branches
   status    Show current workflow state
   recover   Recover or inspect stale/abandoned workflow state
