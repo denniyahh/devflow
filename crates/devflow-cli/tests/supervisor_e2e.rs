@@ -54,15 +54,11 @@ fn init_repo(root: &Path, phase: PhaseId) {
         format!("# Roadmap\n\n### Phase {phase}: supervisor fixture\n"),
     )
     .unwrap();
-    let padded = phase.padded();
-    let phase_dir = format!(".planning/phases/{padded}-supervisor-fixture");
-    fs::create_dir_all(root.join(&phase_dir)).unwrap();
-    fs::write(
-        root.join(&phase_dir).join(format!("{padded}-CONTEXT.md")),
-        "# Context\n",
-    )
-    .unwrap();
-    git(root, &["add", "README.md", ".planning"]);
+    let context = common::write_phase_context(root, phase);
+    git(
+        root,
+        &["add", "README.md", ".planning/ROADMAP.md", &context],
+    );
     git(root, &["commit", "-q", "-m", "base"]);
 }
 
@@ -743,7 +739,8 @@ fn a_real_supervisor_holds_its_reserved_lock_after_its_launcher_exits() {
     let root = repo.path().canonicalize().unwrap();
     let phase = PhaseId::new(64);
     init_repo(&root, phase);
-    let fake_bin = common::fake_bin_dir(WAITING_CLAUDE);
+    let logs = tempfile::tempdir().unwrap();
+    let fake_bin = Shape::Capture.fake_bin(logs.path(), AgentRun::Waiting);
     let _reaper = common::LaunchedRunReaper::new(&root, phase, vec![]);
 
     let output = spawn_start(&home, &root, phase, &fake_bin)
@@ -806,11 +803,10 @@ fn spawn_start(
             "--phase",
             &phase.to_string(),
             "--agent",
-            "claude",
+            Shape::Capture.agent(),
             "--mode",
             "supervise",
             "--no-worktree",
-            "--legacy-claude-launch",
         ])
         .arg(root)
         .current_dir(root)
@@ -847,7 +843,8 @@ fn two_concurrent_starts_yield_exactly_one_live_supervisor() {
     let root = repo.path().canonicalize().unwrap();
     let phase = PhaseId::new(63);
     init_repo(&root, phase);
-    let fake_bin = common::fake_bin_dir(WAITING_CLAUDE);
+    let logs = tempfile::tempdir().unwrap();
+    let fake_bin = Shape::Capture.fake_bin(logs.path(), AgentRun::Waiting);
     let _reaper = common::LaunchedRunReaper::new(&root, phase, vec![]);
 
     let first = spawn_start(&home, &root, phase, &fake_bin);
@@ -934,7 +931,8 @@ fn two_starts_for_different_phases_yield_two_live_supervisors() {
     for (root, phase) in roots.iter().zip(phases) {
         init_repo(root, phase);
     }
-    let fake_bin = common::fake_bin_dir(WAITING_CLAUDE);
+    let logs = tempfile::tempdir().unwrap();
+    let fake_bin = Shape::Capture.fake_bin(logs.path(), AgentRun::Waiting);
     let _reapers: Vec<common::LaunchedRunReaper> = roots
         .iter()
         .zip(phases)

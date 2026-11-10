@@ -131,7 +131,11 @@ fn init_start_repo(root: &Path, phase: PhaseId) {
         format!("# Roadmap\n\n### Phase {phase}: lock fixture\n"),
     )
     .unwrap();
-    git(root, &["add", "README.md", ".planning/ROADMAP.md"]);
+    let context = common::write_phase_context(root, phase);
+    git(
+        root,
+        &["add", "README.md", ".planning/ROADMAP.md", &context],
+    );
     git(root, &["commit", "-q", "-m", "base"]);
 }
 
@@ -142,11 +146,11 @@ struct FakeBin {
 
 fn fake_bin_dir(agent_body: &str) -> FakeBin {
     let dir = tempfile::tempdir().unwrap();
-    let claude = dir.path().join("claude");
-    fs::write(&claude, format!("#!/bin/sh\n{agent_body}\n")).unwrap();
-    let mut permissions = fs::metadata(&claude).unwrap().permissions();
+    let codex = dir.path().join("codex");
+    fs::write(&codex, format!("#!/bin/sh\n{agent_body}\n")).unwrap();
+    let mut permissions = fs::metadata(&codex).unwrap().permissions();
     permissions.set_mode(0o755);
-    fs::set_permissions(&claude, permissions).unwrap();
+    fs::set_permissions(&codex, permissions).unwrap();
     for program in ["git", "sh"] {
         symlink(format!("/usr/bin/{program}"), dir.path().join(program)).unwrap();
     }
@@ -173,11 +177,10 @@ fn start_child(
             "--phase",
             &phase.to_string(),
             "--agent",
-            "claude",
+            "codex",
             "--mode",
             "auto",
             "--no-worktree",
-            "--legacy-claude-launch",
         ])
         .arg(root)
         .current_dir(root)

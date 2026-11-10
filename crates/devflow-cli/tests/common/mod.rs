@@ -133,7 +133,7 @@ pub const AGENT_STDIN_LOG: &str = "agent-stdin";
 /// The codex `--json` event lines a finished turn prints: the stream DevFlow's
 /// codex driver parses, whose final `agent_message` carries a `DEVFLOW_RESULT`
 /// success line.
-const CODEX_SUCCESS_EVENTS: &str = r#"printf '%s\n' '{"type":"thread.started","thread_id":"t-fake"}'
+pub const CODEX_SUCCESS_EVENTS: &str = r#"printf '%s\n' '{"type":"thread.started","thread_id":"t-fake"}'
 printf '%s\n' '{"type":"turn.started"}'
 printf '%s\n' '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"work done\nDEVFLOW_RESULT: {\"status\":\"success\",\"commits\":1}"}}'
 printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1}}'"#;
@@ -144,7 +144,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_
 /// commits one empty commit as its "work", prints a successful codex turn
 /// ([`CODEX_SUCCESS_EVENTS`]) and exits 0.
 pub fn capture_agent_bin(logs: &Path) -> FakeBin {
-    capture_agent_bin_ending(
+    capture_agent_bin_then(
         logs,
         &format!(
             "git commit -q --allow-empty -m \"fake stage work\"\n{CODEX_SUCCESS_EVENTS}\nexit 0"
@@ -155,12 +155,12 @@ pub fn capture_agent_bin(logs: &Path) -> FakeBin {
 /// [`capture_agent_bin`] that, after logging, stays running until it is
 /// ended instead of finishing its turn.
 pub fn waiting_capture_agent_bin(logs: &Path) -> FakeBin {
-    capture_agent_bin_ending(logs, "sleep 120")
+    capture_agent_bin_then(logs, "sleep 120")
 }
 
 /// The fake `codex` behind [`capture_agent_bin`]: answer `--version`, log
-/// argv and stdin under `logs`, then run `tail`.
-fn capture_agent_bin_ending(logs: &Path, tail: &str) -> FakeBin {
+/// argv and stdin under `logs`, then run the shell lines `tail`.
+pub fn capture_agent_bin_then(logs: &Path, tail: &str) -> FakeBin {
     let logs = logs.to_str().expect("a UTF-8 logs path");
     assert!(
         !logs.contains('\''),
@@ -175,6 +175,18 @@ fn capture_agent_bin_ending(logs: &Path, tail: &str) -> FakeBin {
              {tail}"
         ),
     )
+}
+
+/// Write a CONTEXT.md for `phase` under `root` and return its path relative to
+/// `root`, for the caller to commit. `start` refuses to launch codex for a
+/// phase with no CONTEXT.md on the base branch.
+pub fn write_phase_context(root: &Path, phase: PhaseId) -> String {
+    let padded = phase.padded();
+    let relative = format!(".planning/phases/{padded}-fixture/{padded}-CONTEXT.md");
+    let path = root.join(&relative);
+    fs::create_dir_all(path.parent().expect("a phase dir")).unwrap();
+    fs::write(&path, "# Context\n").unwrap();
+    relative
 }
 
 /// Poll `predicate` every 25ms until it is true, panicking with `what` once

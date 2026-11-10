@@ -9,10 +9,11 @@
 //! - `resume_*` arms: `devflow resume` replaces or clears the saved command,
 //!   and keeps it when the variable is unset (read after the first
 //!   `stage_launched` event, with an empty-variable control on that waiter).
-//! - `agent_*` arms: the coding agent never receives the variable. The legacy
-//!   arm reaches the agent through the detached `sh` monitor, so it also shows
-//!   that chain does not carry it; the default (pipe-owning) arm reaches the
-//!   first agent process `start` launches, which is the delivery canary.
+//! - `agent_*` arms: the coding agent never receives the variable. The capture
+//!   arm (`codex`) reaches the agent through the detached monitor, so it also
+//!   shows that chain does not carry it; the default (pipe-owning, `claude`) arm
+//!   reaches the first agent process `start` launches, which is the delivery
+//!   canary.
 //!
 //! Not covered here: the pipe-owning `__monitor` re-exec and its agent spawn
 //! (reached only after the canary, which this fixture's agent never answers)
@@ -69,7 +70,11 @@ fn init_start_repo(root: &Path, phase: PhaseId) {
         format!("# Roadmap\n\n### Phase {phase}: notify fixture\n"),
     )
     .unwrap();
-    git(root, &["add", "README.md", ".planning/ROADMAP.md"]);
+    let context = common::write_phase_context(root, phase);
+    git(
+        root,
+        &["add", "README.md", ".planning/ROADMAP.md", &context],
+    );
     git(root, &["commit", "-q", "-m", "base"]);
 }
 
@@ -87,18 +92,29 @@ fn init_advance_repo(root: &Path, phase: PhaseId) {
     git(root, &["commit", "-q", "-m", "agent work"]);
 }
 
+/// The agent a run launches in the capture shape: codex gets its prompt as
+/// argv.
+const CAPTURE_AGENT: &str = "codex";
+
+/// The agent a run launches in the stream shape, through the delivery canary.
+const STREAM_AGENT: &str = "claude";
+
 struct FakeBin {
     _dir: tempfile::TempDir,
     path: PathBuf,
 }
 
+/// A fake `codex` (the capture-shape agent) and a fake `claude` (the stream
+/// shape), each of which sleeps.
 fn fake_bin_dir() -> FakeBin {
     let dir = tempfile::tempdir().unwrap();
-    let claude = dir.path().join("claude");
-    fs::write(&claude, "#!/bin/sh\nsleep 60\n").unwrap();
-    let mut permissions = fs::metadata(&claude).unwrap().permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&claude, permissions).unwrap();
+    for agent in [CAPTURE_AGENT, STREAM_AGENT] {
+        let script = dir.path().join(agent);
+        fs::write(&script, "#!/bin/sh\nsleep 60\n").unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+    }
     for program in ["git", "sh"] {
         symlink(format!("/usr/bin/{program}"), dir.path().join(program)).unwrap();
     }
@@ -174,7 +190,7 @@ fn spawn_parked_start(
     fake_bin: &FakeBin,
     notify: NotifyEnv<'_>,
 ) -> ParkedChild {
-    spawn_parked_start_with(home, root, phase, fake_bin, notify, true)
+    spawn_parked_start_with(home, root, phase, fake_bin, notify, CAPTURE_AGENT)
 }
 
 fn spawn_parked_start_with(
@@ -183,7 +199,7 @@ fn spawn_parked_start_with(
     phase: PhaseId,
     fake_bin: &FakeBin,
     notify: NotifyEnv<'_>,
-    legacy_launch: bool,
+    agent: &str,
 ) -> ParkedChild {
     let existing = std::env::var_os("PATH").unwrap_or_default();
     let path = format!("{}:{}", fake_bin.path.display(), existing.to_string_lossy());
@@ -194,12 +210,11 @@ fn spawn_parked_start_with(
             "--phase",
             &phase.to_string(),
             "--agent",
-            "claude",
+            agent,
             "--mode",
             "auto",
             "--no-worktree",
         ])
-        .args(legacy_launch.then_some("--legacy-claude-launch"))
         .arg(root)
         .current_dir(root)
         .env("PATH", path)
@@ -364,7 +379,7 @@ fn advance_gate_with_an_empty_variable_skips_the_persisted_command() {
 /// its launched run and every marked process are still owned, and its result
 /// is returned once they are reaped.
 ///
-/// In `Mode::Auto` this fixture (no `.planning/config.json`, legacy launch)
+/// In `Mode::Auto` this fixture (no `.planning/config.json`, capture launch)
 /// parks at the Define preflight gate (D-07) before any stage is launched; in
 /// `Mode::Supervise` the same preflight reports and proceeds (D-08), so the
 /// stage launches and `stage_launched` is emitted.
@@ -378,7 +393,7 @@ fn with_spawned_resume<T>(
     let root = dir.path();
     let phase = PhaseId::new(97);
     init_start_repo(root, phase);
-    let mut state = State::new(phase, AgentKind::Claude, mode, root.to_path_buf());
+    let mut state = State::new(phase, AgentKind::Codex, mode, root.to_path_buf());
     state.gate_notify_cmd = Some("old".to_string());
     state.verification_baseline_captured = true;
     devflow_core::workflow::save_state(&state).unwrap();
@@ -395,12 +410,7 @@ fn with_spawned_resume<T>(
     let path = format!("{}:{}", fake_bin.path.display(), existing.to_string_lossy());
     let mut command = common::hermetic_devflow(&home);
     command
-        .args([
-            "resume",
-            "--phase",
-            &phase.to_string(),
-            "--legacy-claude-launch",
-        ])
+        .args(["resume", "--phase", &phase.to_string()])
         .arg(root)
         .current_dir(root)
         .env("PATH", path)
@@ -567,6 +577,7 @@ fn agent_environment_after_define(
     root: &Path,
     phase: PhaseId,
     fake_bin: &FakeBin,
+    agent: &str,
 ) -> Vec<String> {
     let approve = common::hermetic_devflow(home)
         .args(["gate", "approve", &phase.to_string(), "--stage", "define"])
@@ -584,7 +595,7 @@ fn agent_environment_after_define(
     );
     let marker = root.to_string_lossy().into_owned();
     let _reaper = MarkedReaper(marker.clone());
-    let agent = fake_bin.path.join("claude").to_string_lossy().into_owned();
+    let agent = fake_bin.path.join(agent).to_string_lossy().into_owned();
     let waited = Instant::now();
     let environment = loop {
         if let Some((_, _, entries)) = marked_processes(&marker)
@@ -606,7 +617,7 @@ fn agent_environment_after_define(
     environment
 }
 
-fn assert_chain_has_no_notify_variable(legacy_launch: bool) {
+fn assert_chain_has_no_notify_variable(agent: &str) {
     let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -619,11 +630,11 @@ fn assert_chain_has_no_notify_variable(legacy_launch: bool) {
         phase,
         &fake_bin,
         NotifyEnv::Set("touch /nonexistent/notify-sentinel"),
-        legacy_launch,
+        agent,
     );
     let _run_reaper = common::LaunchedRunReaper::new(root, phase, Vec::new());
 
-    let environment = agent_environment_after_define(&home, root, phase, &fake_bin);
+    let environment = agent_environment_after_define(&home, root, phase, &fake_bin, agent);
 
     // Control: a variable set on `start` the same way does reach the agent,
     // so an absent entry below means stripped, not unread.
@@ -642,10 +653,10 @@ fn assert_chain_has_no_notify_variable(legacy_launch: bool) {
 
 #[test]
 fn agent_via_legacy_monitor_never_receives_the_notify_variable() {
-    assert_chain_has_no_notify_variable(true);
+    assert_chain_has_no_notify_variable(CAPTURE_AGENT);
 }
 
 #[test]
 fn agent_via_default_launch_canary_never_receives_the_notify_variable() {
-    assert_chain_has_no_notify_variable(false);
+    assert_chain_has_no_notify_variable(STREAM_AGENT);
 }
