@@ -25,8 +25,8 @@ use parallel::parallel;
 mod commands;
 use commands::{
     cleanup, doctor, evidence, gate_list, gate_respond, gate_show, gate_sweep, history_cmd, logs,
-    recover_cmd, reference, release_check, release_verify, resolve_gate_target, start, status,
-    stop, stop_launch, test_cmd,
+    recover_cmd, release_check, release_verify, resolve_gate_target, start, status, stop,
+    stop_launch,
 };
 use devflow_core::phase_id::PhaseId;
 
@@ -279,24 +279,12 @@ enum Command {
         #[arg(default_value = ".")]
         project: PathBuf,
     },
-    /// Create or refresh a static reference worktree at `.worktrees/reference/`.
-    Reference {
-        /// Branch to check out (defaults to develop).
-        #[arg(long)]
-        branch: Option<String>,
-        /// Update an existing reference snapshot in place.
-        #[arg(long)]
-        refresh: bool,
-        /// Project root.
-        #[arg(default_value = ".")]
-        project: PathBuf,
-    },
     /// Remove phase worktrees and their feature branches.
     Cleanup {
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
-        /// Also remove the reference worktree and force-remove dirty worktrees.
+        /// Force-remove dirty worktrees.
         #[arg(long)]
         force: bool,
     },
@@ -319,12 +307,6 @@ enum Command {
         /// Restrict the command to one phase.
         #[arg(long)]
         phase: Option<PhaseId>,
-    },
-    /// Run local quality checks: cargo test, clippy, and fmt --check.
-    Test {
-        /// Project root.
-        #[arg(default_value = ".")]
-        project: PathBuf,
     },
     /// Audit the environment and report what's installed, missing, or broken.
     Doctor {
@@ -757,11 +739,6 @@ fn run() -> Result<(), CliError> {
             mode,
             force,
         ),
-        Command::Reference {
-            branch,
-            refresh,
-            project,
-        } => reference(&project_root(project)?, branch, refresh),
         Command::Cleanup { project, force } => cleanup(&project_root(project)?, force),
         Command::Status { project } => status(&project_root(project)?),
         Command::Recover {
@@ -769,7 +746,6 @@ fn run() -> Result<(), CliError> {
             clean,
             phase,
         } => recover_cmd(&project_root(project)?, clean, phase),
-        Command::Test { project } => test_cmd(&project_root(project)?),
         Command::Doctor { json, project } => doctor(&project_root(project)?, json),
         Command::Release {
             check,

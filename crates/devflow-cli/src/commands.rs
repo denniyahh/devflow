@@ -31,7 +31,7 @@ use devflow_core::gates::{
     AnswerRead, GateAction, GateError, GateFile, GateId, GateResponse, Gates, OpenGate,
     QuarantinedAnswer, WaiterStatus, is_gate_id,
 };
-use devflow_core::git::{GitFlow, git_command, hermetic_command};
+use devflow_core::git::{GitFlow, git_command};
 use devflow_core::history;
 use devflow_core::liveness;
 use devflow_core::mode::Mode;
@@ -1163,54 +1163,15 @@ fn workflow_started_payload(state: &State) -> serde_json::Value {
 }
 
 // ---------------------------------------------------------------------------
-// reference / cleanup / list / status / recover
+// cleanup / status / recover
 // ---------------------------------------------------------------------------
-
-/// Create or refresh the static reference worktree.
-pub(crate) fn reference(
-    project_root: &Path,
-    branch: Option<String>,
-    refresh: bool,
-) -> Result<(), CliError> {
-    // Project-resolved (45-01, review round 2): defaulting to the DEVELOP
-    // constant snapshotted the wrong branch on a project whose trunk is
-    // configured elsewhere — and then printed a message naming the branch it
-    // snapshotted, so the operator was told the wrong thing confidently.
-    let branch = branch.unwrap_or_else(|| config::git_flow_for_project(project_root).develop);
-    let path = worktree::reference_path(project_root);
-
-    // Detached snapshot: `branch` may already be checked out in the main
-    // worktree, so we pin a detached HEAD at its tip rather than checking it out.
-    if path.exists() {
-        if !refresh {
-            println!(
-                "reference exists at {} (use --refresh to update it)",
-                path.display()
-            );
-            return Ok(());
-        }
-        worktree::remove(project_root, &path, true)?;
-        worktree::add_detached(project_root, &path, &branch)?;
-        println!(
-            "refreshed reference worktree at {} (snapshot of {branch})",
-            path.display()
-        );
-    } else {
-        worktree::add_detached(project_root, &path, &branch)?;
-        println!(
-            "created reference worktree at {} (snapshot of {branch})",
-            path.display()
-        );
-    }
-    Ok(())
-}
 
 /// Parse the phase number encoded in a `.worktrees/phase-NN[-agent]` path.
 /// Used only as a fallback join key when no persisted `State.worktree_path`
 /// matches the worktree entry (review: Codex MEDIUM — worktree->phase join).
-/// Returns `None` for paths that don't follow this naming (e.g. the static
-/// `reference` worktree), which correctly excludes it from the liveness
-/// guard — a snapshot has no owning phase/agent to be alive.
+/// Returns `None` for paths that don't follow this naming, which excludes
+/// them from the liveness guard: such a worktree has no owning phase/agent to
+/// be alive.
 fn phase_from_worktree_path(worktrees_dir: &Path, path: &Path) -> Option<PhaseId> {
     let name = path.strip_prefix(worktrees_dir).ok()?.to_str()?;
     let rest = name.strip_prefix("phase-")?;
@@ -1287,8 +1248,8 @@ fn remove_worktree_with_retry(
     Err(last_err.expect("loop runs ATTEMPTS >= 1 times"))
 }
 
-/// Remove phase worktrees (and the reference with --force), deleting their
-/// associated feature branches, then prune and clean up merged branches.
+/// Remove phase worktrees, deleting their associated feature branches,
+/// then prune and clean up merged branches.
 ///
 /// Hard-refuses (D-06, no override flag) removal of any worktree whose owning
 /// phase has a live agent (whatever its supervisor's liveness) or a
@@ -1303,7 +1264,6 @@ pub(crate) fn cleanup(project_root: &Path, force: bool) -> Result<(), CliError> 
     // one, or this sweep can delete a branch that was never merged.
     let git = GitFlow::for_project(project_root);
     let worktrees_dir = worktree::worktrees_dir(project_root);
-    let reference = worktree::reference_path(project_root);
     let states = workflow::list_states(project_root);
 
     let worktrees = worktree::list(project_root)?;
@@ -1311,10 +1271,6 @@ pub(crate) fn cleanup(project_root: &Path, force: bool) -> Result<(), CliError> 
     for wt in &worktrees {
         // Only touch worktrees under `.worktrees/` (never the main checkout).
         if !wt.path.starts_with(&worktrees_dir) {
-            continue;
-        }
-        if wt.path == reference && !force {
-            println!("keeping reference worktree (use --force to remove it)");
             continue;
         }
 
@@ -1335,8 +1291,7 @@ pub(crate) fn cleanup(project_root: &Path, force: bool) -> Result<(), CliError> 
         // below. Treat it the same way `doctor`'s `check_dead_agent`/
         // `check_supervisor` were taught about `facts.stopped`: an
         // intentionally-parked worktree is never implicitly safe to remove —
-        // require `--force`, mirroring the `reference` worktree's own
-        // precedent above.
+        // require `--force`.
         let stopped = matched_state.is_some_and(|s| s.stopped);
         if stopped && !force {
             let phase_label = phase
@@ -5485,42 +5440,6 @@ pub(crate) fn recover_cmd(
     }
 
     Ok(())
-}
-
-/// Run the local quality gate: cargo test, clippy, and fmt --check.
-pub(crate) fn test_cmd(project_root: &Path) -> Result<(), CliError> {
-    let checks = [
-        ("cargo test", "cargo test"),
-        (
-            "cargo clippy",
-            "cargo clippy --workspace --all-targets -- -D warnings",
-        ),
-        ("cargo fmt --check", "cargo fmt --check"),
-    ];
-    let mut failures = Vec::new();
-    for (label, cmd) in checks {
-        println!("=== {label} ===");
-        let status = hermetic_command("sh", project_root)
-            .arg("-c")
-            .arg(cmd)
-            .status()
-            .map_err(|err| CliError::Message(format!("could not run `{cmd}`: {err}")))?;
-        if status.success() {
-            println!("  ✓ {label}");
-        } else {
-            println!("  ✗ {label}");
-            failures.push(label);
-        }
-    }
-    if failures.is_empty() {
-        println!("\nall checks passed");
-        Ok(())
-    } else {
-        Err(CliError::Message(format!(
-            "quality checks failed: {}",
-            failures.join(", ")
-        )))
-    }
 }
 
 // ---------------------------------------------------------------------------
