@@ -85,7 +85,7 @@ enum Command {
         yes_ship: bool,
         /// A second agent that takes over the Code stage once if the agent is
         /// rate-limited there (D-01, `51-CONTEXT.md`). Failover happens only at
-        /// Code; at any other stage a rate limit takes the cron arm as before.
+        /// Code; at any other stage a rate limit waits at the stage's gate.
         ///
         /// Persisted in the run state (`state-NN.json`) before the first
         /// supervisor spawns, and checked here as far as launch can tell: it
@@ -183,7 +183,7 @@ enum Command {
         /// Re-arm the run's one-hop fallback for the Code stage (D-01,
         /// `51-CONTEXT.md`): sets it to this agent and clears a spent mark, so a
         /// run whose fallback was used can fail over once more. Accepted on a run
-        /// that is not live (stopped, or paused on the rate-limit cron arm);
+        /// that is not live (stopped, or whose supervisor has ended);
         /// refused over a live run like any resume.
         ///
         /// Checked as on `devflow start`: it must differ from the agent the run
