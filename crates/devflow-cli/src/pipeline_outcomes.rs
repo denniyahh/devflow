@@ -5165,16 +5165,18 @@ mod tests {
         assert_eq!(state.consecutive_failures, u32::MAX);
     }
 
-    /// D-09: a primary-loop `RateLimited` outcome writes the single-agent
-    /// cron-instructions record (`devflow resume --phase N`) and returns
-    /// without firing a blocking gate.
+    /// CUT-03 (interim): a primary-loop `RateLimited` outcome with no fallback
+    /// waits at the never-silent Code gate. At the gate the stage is unchanged
+    /// and neither counter moved; no cron-instructions file is written and no
+    /// resume is scheduled.
     #[test]
-    fn primary_loop_rate_limited_writes_single_agent_cron_instructions() {
+    fn primary_loop_rate_limited_waits_at_the_code_gate() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(76);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
+        state.gate_notify_cmd = Some("true".to_string());
         workflow::save_state(&state).unwrap();
         std::fs::create_dir_all(root.join(".devflow")).unwrap();
         std::fs::write(
@@ -5183,70 +5185,25 @@ mod tests {
         )
         .unwrap();
 
-        advance(root, Some(phase)).unwrap();
+        let at_gate = state_on_disk_at_gate(root, phase, Stage::Code, || {
+            advance(root, Some(phase)).unwrap();
+        });
 
-        let instructions = devflow_core::ship::load_cron_instructions(root, phase).unwrap();
-        assert_eq!(instructions.resume.command, "devflow");
-        assert_eq!(
-            instructions.resume.args,
-            ["resume", "--phase", &phase.to_string()]
-        );
-        assert!(
-            instructions
-                .hermes_cron
-                .command
-                .contains(&format!("devflow resume --phase {phase}"))
-        );
-
-        // No blocking gate — state persists, stage unchanged, not gate-pending.
-        let reloaded = workflow::load_state(root, phase).unwrap();
-        assert_eq!(reloaded.stage, Stage::Code);
-        assert!(!reloaded.gate_pending);
-        assert_eq!(reloaded.infra_failures, 1);
-        assert_eq!(reloaded.consecutive_failures, 0);
-        assert!(!Gates::gate_path(root, phase, Stage::Code).exists());
-    }
-
-    /// D-08/D-09: the RateLimited path at `infra_failures ==
-    /// MAX_INFRA_FAILURES - 1` bumps to the ceiling and stops auto-resuming —
-    /// it routes to the infra gate/abort path instead of writing a resume
-    /// record (bounded resume, no soft-loop).
-    #[test]
-    fn rate_limited_at_infra_ceiling_stops_resuming_and_aborts() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(77);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Code;
-        state.infra_failures = mode::MAX_INFRA_FAILURES - 1;
-        workflow::save_state(&state).unwrap();
-        std::fs::create_dir_all(root.join(".devflow")).unwrap();
-        std::fs::write(
-            agent_result::stdout_path(root, phase),
-            r#"{"type":"result","subtype":"error_rate_limit","retry_after":"2026-06-18T15:45:30Z"}"#,
-        )
-        .unwrap();
-
-        advance(root, Some(phase)).unwrap();
-
-        let err = workflow::load_state(root, phase).unwrap_err();
-        assert!(
-            matches!(err, workflow::WorkflowError::MissingState(_)),
-            "the infra ceiling must abort, clearing state"
-        );
-        assert!(
-            devflow_core::ship::load_cron_instructions(root, phase).is_err(),
-            "must not schedule an auto-resume once the infra ceiling stops resumption"
-        );
+        assert_eq!(at_gate.stage, Stage::Code);
+        assert_eq!(at_gate.infra_failures, 0);
+        assert_eq!(at_gate.consecutive_failures, 0);
+        assert!(!devflow_core::ship::cron_instructions_path(root, phase).exists());
+        let events =
+            std::fs::read_to_string(devflow_core::events::events_path(root)).unwrap_or_default();
+        assert!(events.contains("gate_fired"), "{events}");
+        assert!(!events.contains("rate_limit_resume_scheduled"), "{events}");
     }
 
     /// CR-03: a rate-limit reason whose retry hint is unparseable (e.g. the
     /// `"usage limit"` fallback `detect_claude_rate_limit` produces for a 429
-    /// with no retry_after) yields an EMPTY cron schedule — auto-resume is
-    /// impossible. That must not return `Ok(())` silently (the detached
-    /// monitor would exit with the phase stalled and zero operator signal);
-    /// it must fire the same never-silent gate + notify the infra path uses
-    /// (WR-11/D-15), and must never invent a schedule.
+    /// with no retry_after) still fires the never-silent gate and notify
+    /// (WR-11/D-15), and its context says no reset time is known rather than
+    /// inventing one.
     #[test]
     fn rate_limited_with_unparseable_retry_hint_gates_instead_of_stalling_silently() {
         const NAME: &str = "pipeline_outcomes::tests::rate_limited_with_unparseable_retry_hint_gates_instead_of_stalling_silently";
@@ -5300,10 +5257,14 @@ mod tests {
             "nothing was scheduled — emitting a resume-scheduled event would be a false signal: {events}"
         );
 
-        // The unparseable hint must never become a schedule (an empty cron
-        // expression would otherwise degrade into an every-minute resume).
-        let instructions = devflow_core::ship::load_cron_instructions(root, phase).unwrap();
-        assert!(instructions.hermes_cron.schedule.is_empty());
+        assert!(
+            events.contains("the denial carried no reset time"),
+            "the gate says no reset time is known, and guesses none: {events}"
+        );
+        assert!(
+            !devflow_core::ship::cron_instructions_path(root, phase).exists(),
+            "no cron-instructions file is written"
+        );
     }
 
     /// The Validate→Ship content hook (`DocsUpdate`) authors material about
@@ -6193,41 +6154,55 @@ mod tests {
         assert_eq!(on_disk.infra_failures, 3);
     }
 
-    /// The infra ceiling is read from the committed counter: a stale copy below it
-    /// does not schedule another auto-resume once the counter on disk has reached it.
+    /// D-20: a rate limit with no usable fallback is not an infra failure. One
+    /// below the infra ceiling, the outcome opens the Code gate instead of
+    /// aborting, and `infra_failures` is where it was. The gate context leads
+    /// with the resume command and names the reset time.
     #[test]
-    fn a_rate_limit_reads_the_infra_ceiling_from_the_committed_counter() {
+    fn a_rate_limit_without_a_fallback_does_not_count_as_an_infra_failure() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let (phase, mut stale) = stale_copy_after(
+        let below_ceiling = mode::MAX_INFRA_FAILURES - 1;
+        let (phase, mut state) = stale_copy_after(
             root,
             |state| {
                 state.stage = Stage::Code;
-                state.infra_failures = 1;
+                state.infra_failures = below_ceiling;
             },
-            |state| state.infra_failures = mode::MAX_INFRA_FAILURES - 1,
+            |_| {},
         );
 
-        handle_rate_limited_outcome(
-            root,
-            &mut stale,
-            phase,
-            Stage::Code,
-            Some("rate limited until 2026-06-18T15:45:30Z".into()),
-        )
-        .unwrap();
+        let at_gate = state_on_disk_at_gate(root, phase, Stage::Code, || {
+            handle_rate_limited_outcome(
+                root,
+                &mut state,
+                phase,
+                Stage::Code,
+                Some("rate limited until 2026-06-18T15:45:30Z".into()),
+            )
+            .unwrap();
+        });
 
-        assert!(
-            matches!(
-                workflow::load_state(root, phase),
-                Err(workflow::WorkflowError::MissingState(_))
-            ),
-            "the ceiling on disk must abort, clearing state"
-        );
-        assert!(
-            devflow_core::ship::load_cron_instructions(root, phase).is_err(),
-            "no auto-resume is scheduled at the ceiling"
-        );
+        assert_eq!(at_gate.infra_failures, below_ceiling);
+        let gate_fired: Vec<serde_json::Value> =
+            std::fs::read_to_string(devflow_core::events::events_path(root))
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter(|event| event["event"] == "gate_fired")
+                .collect();
+        assert_eq!(gate_fired.len(), 1, "{gate_fired:?}");
+        let context = gate_fired[0]["context"].as_str().unwrap_or_default();
+        let resume = context
+            .find(&format!("`devflow resume --phase {phase}`"))
+            .expect("the context names the resume command");
+        let reset = context
+            .find("the limit resets at 2026-06-18T15:45:30Z")
+            .expect("the context names the reset time");
+        let cause = context
+            .find("Cause: rate limited until")
+            .expect("the context names the cause");
+        assert!(resume < reset && reset < cause, "way on first: {context}");
     }
 
     #[test]
