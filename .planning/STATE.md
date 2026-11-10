@@ -5,16 +5,16 @@ milestone_name: Session Continuity
 current_phase: 52
 current_phase_name: Subtract and Stabilize
 status: executing
-stopped_at: Completed 52-07-PLAN.md
-last_updated: "2026-11-10T21:14:31.312Z"
+stopped_at: Completed 52-08-PLAN.md
+last_updated: "2026-11-10T21:55:19.771Z"
 last_activity: 2026-11-10
 last_activity_desc: Phase 52 execution started
-state_head: aca3ec7898b6864f75436be2ac550615e0258053
+state_head: ce58469187e242706fbfcb2298b4d974c4ae137c
 progress:
   total_phases: 4
   completed_phases: 0
   total_plans: 33
-  completed_plans: 7
+  completed_plans: 8
   percent: 0
 ---
 
@@ -159,7 +159,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 52 (Subtract and Stabilize) — EXECUTING
-Plan: 8 of 33
+Plan: 9 of 33
 Status: Ready to execute
 Last activity: 2026-11-10 — Phase 52 execution started
 
@@ -846,6 +846,8 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 52]: 52-05: removed --legacy-claude-launch, DEVFLOW_CLAUDE_LEGACY_LAUNCH and State.legacy_claude_launch; stream_launch_enabled(agent, stage) has no opt-out; capture-shape unit tests run Codex, and Claude-primary failover fixtures keep Claude with a recorded Confirmed canary
 - [Phase 52]: 52-06: devflow release is removed; tools/release-preflight (publish = false) runs the six release checks for scripts/cut-release.sh check|verify via cargo run -q -p release-preflight, and git::publish_order skips publish = false members
 - [Phase 52]: 52-07: devflow parallel is removed; ensure_phase_worktree moved to phase_worktree.rs and retry_after_from_reason to pipeline_outcomes.rs with their tests; FallbackSource::NoFallback deleted with its only constructor
+- [Phase 52]: 52-08: a passing Validate ends the run through pipeline_gate::finish_run (state kept stopped+finished, worktree/branch kept, workflow_finished {reason: finished, shipped: false}, one notify); finish_run ignores stop_until and honours a stop at safe point 6 first
+- [Phase 52]: 52-08: the --until halt notifies once with reason stopped_at; resume refuses a finished run inside reserve_launch, naming devflow start
 
 ## Roadmap Evolution
 
@@ -964,11 +966,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 52 P05 | 31 min | 2 tasks | 14 files |
 | Phase 52 P06 | 19 min | 3 tasks | 19 files |
 | Phase 52 P07 | 11 min | 2 tasks | 17 files |
+| Phase 52 P08 | 32 min | 3 tasks | 8 files |
 
 ## Session
 
-**Last session:** 2026-11-10T21:14:31.158Z
-**Stopped at:** Completed 52-07-PLAN.md
+**Last session:** 2026-11-10T21:55:19.561Z
+**Stopped at:** Completed 52-08-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
