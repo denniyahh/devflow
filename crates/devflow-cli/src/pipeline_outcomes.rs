@@ -16,7 +16,7 @@ use crate::CliError;
 use crate::config_parse::{checkout_lock_timeout, gate_timeout_secs};
 use crate::pipeline_gate::{
     LoopBackReason, abort, finish_run, finish_workflow, loop_back_to_code, run_gate,
-    run_gate_with_timeout, transition,
+    run_gate_with_timeout,
 };
 use crate::pipeline_launch::{close_gate, commit, launch_stage, recorded_canary_refusal};
 use devflow_core::gates::{GateAction, GateResponse};
@@ -1246,7 +1246,7 @@ mod tests {
     use devflow_core::gates::Gates;
     // Test-only: production code resolves its branch model from the
     // project (45-01), so the defaults survive here as fixture input only.
-    use crate::pipeline_gate::prepare_loop_back_to_code;
+    use crate::pipeline_gate::{prepare_loop_back_to_code, transition};
     use crate::pipeline_launch::advance;
     use crate::test_support::*;
     use devflow_core::config::GitFlowConfig;
