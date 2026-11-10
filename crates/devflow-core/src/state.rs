@@ -340,6 +340,17 @@ pub struct State {
     /// when `stopped` is `false`, or when the state predates this field.
     #[serde(default)]
     pub stop_reason: Option<String>,
+    /// Whether the run ended because its Validate passed (Phase 52 D-35):
+    /// Validate is the last stage, and a finished run keeps its state,
+    /// recorded with `stopped` set, so `status` and `cleanup` can say what
+    /// happened. Set once, in the write that ends the run; `devflow resume`
+    /// refuses a finished run, and a new `devflow start` replaces it.
+    ///
+    /// `false` means EITHER "the run has not finished" (in flight, halted by
+    /// `--until`, or stopped) OR "the state was written by a binary predating
+    /// this field" — both behave identically.
+    #[serde(default)]
+    pub finished: bool,
     /// Pre-authorization for the Ship gate (D-04/D-05/D-06, 23-09),
     /// set only from the `--yes-ship` CLI flag typed on `devflow start`.
     ///
@@ -711,6 +722,7 @@ impl State {
             stop_until: None,
             stopped: false,
             stop_reason: None,
+            finished: false,
             yes_ship: false,
             base_branch: None,
             canary: None,

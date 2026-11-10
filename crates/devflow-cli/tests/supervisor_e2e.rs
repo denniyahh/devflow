@@ -1655,7 +1655,7 @@ fn a_run_that_passes_validate_finishes_and_keeps_its_worktree() {
         .as_object()
         .unwrap()
         .iter()
-        .filter(|(key, _)| !["event", "phase", "ts"].contains(&key.as_str()))
+        .filter(|(key, _)| !["v", "ts", "phase", "event"].contains(&key.as_str()))
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
     assert_eq!(
