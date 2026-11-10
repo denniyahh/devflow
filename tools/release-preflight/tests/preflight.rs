@@ -68,15 +68,6 @@ impl Fixture {
         );
     }
 
-    fn rev_parse(&self, rev: &str) -> String {
-        let output = hermetic("git", self.root(), self.home.path())
-            .args(["rev-parse", rev])
-            .output()
-            .expect("spawn git rev-parse");
-        assert!(output.status.success(), "git rev-parse {rev} failed");
-        String::from_utf8_lossy(&output.stdout).trim().to_string()
-    }
-
     /// `git init` on a `develop` branch, with signing and hooks off.
     fn init_repo(&self) {
         self.git(&["init", "-q"]);

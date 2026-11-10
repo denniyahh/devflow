@@ -647,8 +647,10 @@ pub fn ref_is_ancestor(project_root: &Path, ancestor: &str, descendant: &str) ->
 /// (e.g. `devflow-core` before `devflow`) — sourced from the workspace's own
 /// `[workspace] members` list and each member's own `[dependencies]`
 /// section (which member depends on which), never a hardcoded prose string
-/// (20d). Read-only; returns an empty `Vec` (never panics) if the workspace
-/// Cargo.toml or a member manifest cannot be read.
+/// (20d). A member whose `[package]` sets `publish = false` (or `publish =
+/// []`, no registry) is never uploaded, so it is left out of the order. A
+/// member manifest that cannot be read is skipped; the result is empty (never
+/// a panic) when the workspace Cargo.toml cannot be read or no member can.
 pub fn publish_order(project_root: &Path) -> Vec<String> {
     let Ok(root_contents) = std::fs::read_to_string(project_root.join("Cargo.toml")) else {
         return Vec::new();
@@ -661,6 +663,9 @@ pub fn publish_order(project_root: &Path) -> Vec<String> {
         let Ok(contents) = std::fs::read_to_string(&manifest) else {
             continue;
         };
+        if package_publish_disabled(&contents) {
+            continue;
+        }
         let name = package_name(&contents).unwrap_or_else(|| path.clone());
         members.push((name, contents));
     }
@@ -720,6 +725,27 @@ fn package_name(contents: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Whether a member manifest's `[package]` sets `publish = false` or
+/// `publish = []`, the two spellings Cargo reads as "never publish".
+fn package_publish_disabled(contents: &str) -> bool {
+    let mut current = String::new();
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if let Some(inner) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            current = inner.trim().to_string();
+            continue;
+        }
+        if current == "package"
+            && let Some((key, value)) = trimmed.split_once('=')
+            && key.trim() == "publish"
+        {
+            let value = value.split('#').next().unwrap_or("").trim();
+            return value == "false" || value.replace(char::is_whitespace, "") == "[]";
+        }
+    }
+    false
 }
 
 /// Whether a member manifest's `[dependencies]` section references

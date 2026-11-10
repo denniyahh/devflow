@@ -560,8 +560,16 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
   a shell profile or CI image: `check.sh` neutralises both, but a bare `cargo test` does not.
 - [ ] `~/.cargo/credentials.toml` exists (crates.io publish auth) — contents not inspected here;
   needed to reproduce the publish step, not the dev-loop itself.
-- [ ] Publish order matters and is enforced by convention, not tooling: `devflow-core` before
-  `devflow`.
+- [ ] Publish order matters: `devflow-core` before `devflow`. `scripts/cut-release.sh publish`
+  runs them in that order, and the release preflight states the order it derives from the
+  workspace.
+- [ ] **[TRACKED]** Release preflight tool: `tools/release-preflight` (package `release-preflight`,
+  `publish = false`, so it is a workspace member that is never published and is left out of the
+  publish order). `scripts/cut-release.sh check` runs `cargo run -q -p release-preflight -- check`,
+  so the preflight needs only a Rust toolchain, not an installed `devflow`. It replaces
+  `devflow release --check` in Phase 52. Its tests run in `scripts/check.sh all`
+  (workspace-wide), and cargo-deny checks its license because `deny.toml` does not ignore
+  unpublished members.
 - [ ] **[GLOBAL / PROJECT]** Rust AI harness tooling: `cargo-deny` (`deny.toml`), `cargo-machete`,
   `cargo-semver-checks`, `cargo-mutants`, `cargo-llvm-cov`, `cargo-nextest`, and `miri` (via nightly).
   `cargo-deny` and `cargo-machete` are the two a gate runs: `scripts/check.sh deps`, with the versions
