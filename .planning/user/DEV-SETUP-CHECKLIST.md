@@ -565,9 +565,10 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
   workspace.
 - [ ] **[TRACKED]** Release preflight tool: `tools/release-preflight` (package `release-preflight`,
   `publish = false`, so it is a workspace member that is never published and is left out of the
-  publish order). `scripts/cut-release.sh check` runs `cargo run -q -p release-preflight -- check`,
-  so the preflight needs only a Rust toolchain, not an installed `devflow`. It replaces
-  `devflow release --check` in Phase 52. Its tests run in `scripts/check.sh all`
+  publish order). `scripts/cut-release.sh check` runs `cargo run -q -p release-preflight -- check`
+  and `scripts/cut-release.sh verify` runs `cargo run -q -p release-preflight -- verify`, so the
+  release cut needs only a Rust toolchain, not an installed `devflow`. It replaces
+  `devflow release --check`/`--verify` in Phase 52. Its tests run in `scripts/check.sh all`
   (workspace-wide), and cargo-deny checks its license because `deny.toml` does not ignore
   unpublished members.
 - [ ] **[GLOBAL / PROJECT]** Rust AI harness tooling: `cargo-deny` (`deny.toml`), `cargo-machete`,
