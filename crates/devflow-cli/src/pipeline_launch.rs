@@ -2157,26 +2157,6 @@ fn spawn_agent_and_record(
     drop(reservation);
     #[cfg(test)]
     test_hold("after_publish");
-    match devflow_core::ship::consume_cron_instructions(&state.project_root, state.phase) {
-        Ok(Some(path_kind)) => {
-            let path_kind = match path_kind {
-                devflow_core::ship::CronInstructionPathKind::PerPhase => "per-phase",
-                devflow_core::ship::CronInstructionPathKind::Legacy => "legacy",
-                devflow_core::ship::CronInstructionPathKind::Both => "both",
-            };
-            events::emit(
-                &state.project_root,
-                state.phase,
-                "cron_instructions_consumed",
-                serde_json::json!({
-                    "trigger": "resume_consumed",
-                    "path_kind": path_kind,
-                }),
-            );
-        }
-        Ok(None) => {}
-        Err(err) => warn!(phase = %state.phase, "could not consume cron instructions: {err}"),
-    }
     // 23b: register this (project_root, phase) in the machine-global
     // registry on the same code path that just recorded the supervisor, so a
     // running phase cannot be missing from `devflow gate list --all-roots`.
@@ -5510,12 +5490,6 @@ mod tests {
         );
         state.stage = Stage::Code;
         workflow::save_state(&state).unwrap();
-        let record = devflow_core::ship::build_single_agent_cron_instructions(
-            root,
-            phase,
-            "2026-06-18T15:45:30Z",
-        );
-        devflow_core::ship::write_cron_instructions(root, &record).unwrap();
 
         let result = resume(root, phase, Some(AgentKind::Codex));
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
@@ -5527,7 +5501,6 @@ mod tests {
         let reloaded = workflow::load_state(root, phase).unwrap();
         assert_eq!(reloaded.agent, AgentKind::Codex);
         assert!(reloaded.supervisor.is_some());
-        assert!(!devflow_core::ship::cron_instructions_path(root, phase).exists());
         let events = std::fs::read_to_string(devflow_core::events::events_path(root)).unwrap();
         let handoff = events
             .lines()
@@ -5821,12 +5794,6 @@ mod tests {
         state.stopped = true;
         state.stop_reason = Some("rate limited".to_string());
         workflow::save_state(&state).unwrap();
-        let record = devflow_core::ship::build_single_agent_cron_instructions(
-            root,
-            phase,
-            "2026-06-18T15:45:30Z",
-        );
-        devflow_core::ship::write_cron_instructions(root, &record).unwrap();
         let result = resume(root, phase, Some(AgentKind::Codex));
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
@@ -5837,7 +5804,6 @@ mod tests {
         assert_eq!(reloaded.agent, AgentKind::Codex);
         assert!(!reloaded.stopped);
         assert!(reloaded.supervisor.is_some());
-        assert!(!devflow_core::ship::cron_instructions_path(root, phase).exists());
     }
 
     /// Run the test `name` in a hermetic child whose `PATH` holds `claude` and `codex`
@@ -6300,72 +6266,6 @@ mod tests {
         );
     }
 
-    /// D-15 (44-02): a failed monitor relaunch must leave the phase cron
-    /// instructions available for a later retry. The invalid worktree is
-    /// deliberate: archive bookkeeping has no capture to process, while the
-    /// monitor's child spawn fails at its working-directory validation.
-    /// Consumption is after the successful spawn in `spawn_agent_and_record`,
-    /// so this test is the negative control for the successful resume tests.
-    #[test]
-    fn failed_relaunch_preserves_the_phase_cron_instructions_record() {
-        const NAME: &str =
-            "pipeline_launch::tests::failed_relaunch_preserves_the_phase_cron_instructions_record";
-        enter_agent_free_child!(NAME, "claude");
-        let _guard = env_lock();
-
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        init_repo(root);
-
-        let phase = PhaseId::new(144);
-        let missing_worktree = root.join("worktree-that-does-not-exist");
-        let mut state = State::new(
-            phase,
-            AgentKind::Claude,
-            Mode::Supervise,
-            root.to_path_buf(),
-        );
-        state.stage = Stage::Code;
-        state.worktree_path = Some(missing_worktree.clone());
-        workflow::save_state(&state).unwrap();
-
-        let record = devflow_core::ship::build_single_agent_cron_instructions(
-            root,
-            phase,
-            "2026-06-18T15:45:30Z",
-        );
-        devflow_core::ship::write_cron_instructions(root, &record).unwrap();
-        assert!(
-            devflow_core::ship::cron_instructions_path(root, phase).exists(),
-            "the fixture must contain a phase cron record before relaunch"
-        );
-        assert!(
-            !missing_worktree.exists(),
-            "the failure fixture must be absent"
-        );
-
-        let result = spawn_agent_and_record(
-            &mut state,
-            "claude",
-            &[],
-            &[],
-            None,
-            monitor::MonitorLaunch::Legacy,
-        );
-
-        assert!(
-            result.is_err(),
-            "monitor spawn must fail for an absent worktree"
-        );
-        assert!(
-            devflow_core::ship::cron_instructions_path(root, phase).exists(),
-            "a failed monitor relaunch must preserve the phase cron record"
-        );
-        assert!(
-            events_of_kind(root, "cron_instructions_consumed").is_empty(),
-            "a failed monitor relaunch must not emit cron_instructions_consumed"
-        );
-    }
     /// D-10: `advance_evaluated` emits `status` via `AgentStatus::as_wire_str()`
     /// (never the Debug-lowercase formatter that collapses `ResourceKilled`
     /// into `resourcekilled`) and carries the `decided_by_layer` evidence
@@ -10645,10 +10545,6 @@ mod tests {
         );
 
         assert!(
-            !devflow_core::ship::cron_instructions_path(&run.root, run.phase).exists(),
-            "a handed-off rate limit writes no cron instruction"
-        );
-        assert!(
             events_named(&run.root, "rate_limit_resume_scheduled").is_empty(),
             "a handed-off rate limit schedules no resume; events:\n{}",
             run.events()
@@ -10676,10 +10572,6 @@ mod tests {
                 .is_some_and(|context| context.contains(&format!("devflow resume --phase {phase}"))),
             "the gate names the resume command: {}",
             fired[0]
-        );
-        assert!(
-            !devflow_core::ship::cron_instructions_path(root, phase).exists(),
-            "no cron-instructions file is written"
         );
         assert!(
             events_named(root, "rate_limit_resume_scheduled").is_empty(),
@@ -11360,10 +11252,6 @@ mod tests {
             "a failed relaunch never takes the cron arm (R2-D1)"
         );
         assert!(
-            !devflow_core::ship::cron_instructions_path(&run.root, run.phase).exists(),
-            "a failed relaunch writes no cron instruction (R2-D1)"
-        );
-        assert!(
             events_named(&run.root, "supervisor_superseded").is_empty(),
             "the supervisor kept its own run; events:\n{}",
             run.events()
@@ -11441,7 +11329,6 @@ mod tests {
                 run.events()
             );
         }
-        assert!(!devflow_core::ship::cron_instructions_path(&run.root, run.phase).exists());
         let state = run.state();
         assert!(!state.gate_pending);
         assert_eq!(
@@ -16525,10 +16412,6 @@ mod tests {
             "a failed relaunch never takes the cron arm (R2-D1); events:\n{}",
             run.events()
         );
-        assert!(
-            !devflow_core::ship::cron_instructions_path(&run.root, run.phase).exists(),
-            "a failed relaunch writes no cron instruction (R2-D1)"
-        );
         assert_eq!(
             run.other_sockets(),
             Vec::<PathBuf>::new(),
@@ -16638,17 +16521,13 @@ mod tests {
         state
     }
 
-    /// The state the rate-limit cron arm leaves: not stopped, one infra fault
-    /// charged, a cron instruction to `devflow resume` it.
-    fn save_rate_limit_paused(root: &Path, mut state: State) {
+    /// The state the 3.x rate-limit cron arm left for a later `devflow resume`:
+    /// not stopped, one infra fault charged. The arm and its record are gone
+    /// (D-01); a run left in this state by an older binary still resumes, so the
+    /// refusal tests keep it as a fixture.
+    fn save_rate_limit_paused(_root: &Path, mut state: State) {
         state.infra_failures = 1;
         workflow::save_state(&state).unwrap();
-        let record = devflow_core::ship::build_single_agent_cron_instructions(
-            root,
-            state.phase,
-            "2026-06-18T15:45:30Z",
-        );
-        devflow_core::ship::write_cron_instructions(root, &record).unwrap();
     }
 
     /// D-12 (the cron arm's recorded-socket read, withheld), with its
@@ -17600,10 +17479,6 @@ mod tests {
                 run.events()
             );
         }
-        assert!(
-            !devflow_core::ship::cron_instructions_path(&run.root, run.phase).exists(),
-            "no cron instruction"
-        );
         std::fs::write(run.root.join("go-fallback"), "").unwrap();
     }
 
@@ -17938,10 +17813,6 @@ mod tests {
             events_named(&run.root, "rate_limit_resume_scheduled").is_empty(),
             "a failed relaunch never takes the cron arm (R2-D1); events:\n{}",
             run.events()
-        );
-        assert!(
-            !devflow_core::ship::cron_instructions_path(&run.root, run.phase).exists(),
-            "a failed relaunch writes no cron instruction (R2-D1)"
         );
         let state = run.state();
         assert_eq!(state.agent, AgentKind::Codex);

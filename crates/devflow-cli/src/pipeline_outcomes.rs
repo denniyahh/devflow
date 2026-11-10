@@ -5167,8 +5167,7 @@ mod tests {
 
     /// CUT-03 (interim): a primary-loop `RateLimited` outcome with no fallback
     /// waits at the never-silent Code gate. At the gate the stage is unchanged
-    /// and neither counter moved; no cron-instructions file is written and no
-    /// resume is scheduled.
+    /// and neither counter moved; no resume is scheduled.
     #[test]
     fn primary_loop_rate_limited_waits_at_the_code_gate() {
         let dir = tempfile::tempdir().unwrap();
@@ -5192,7 +5191,6 @@ mod tests {
         assert_eq!(at_gate.stage, Stage::Code);
         assert_eq!(at_gate.infra_failures, 0);
         assert_eq!(at_gate.consecutive_failures, 0);
-        assert!(!devflow_core::ship::cron_instructions_path(root, phase).exists());
         let events =
             std::fs::read_to_string(devflow_core::events::events_path(root)).unwrap_or_default();
         assert!(events.contains("gate_fired"), "{events}");
@@ -5260,10 +5258,6 @@ mod tests {
         assert!(
             events.contains("the denial carried no reset time"),
             "the gate says no reset time is known, and guesses none: {events}"
-        );
-        assert!(
-            !devflow_core::ship::cron_instructions_path(root, phase).exists(),
-            "no cron-instructions file is written"
         );
     }
 
