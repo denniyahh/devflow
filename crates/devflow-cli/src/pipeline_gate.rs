@@ -161,6 +161,21 @@ pub(crate) const FINISHED_STOP_REASON: &str =
 /// read `stop_until`: with `--until validate` a passing Validate is a finish,
 /// not a halt, because Validate is the last stage.
 pub(crate) fn finish_run(project_root: &Path, state: &mut State) -> Result<(), CliError> {
+    // A stop taken during the advance that reached this finish (after the
+    // Validate gate was approved, or while an auto pass advanced) is honoured
+    // here, at safe point 6, before the run is recorded finished. The run ends
+    // stopped at Validate rather than finished, and `devflow resume` reruns
+    // Validate, which asks again (D-06). Without this check the finish would
+    // run and the stop would be answered `handed_off`, which `devflow stop`
+    // reports as a run that moved on to a successor.
+    if crate::pipeline_launch::stop_requested_at_safe_point() {
+        let _ = close_gate(project_root, state.phase, Stage::Validate);
+        crate::pipeline_launch::record_advance_stop(state, 6)?;
+        return Err(CliError::Message(format!(
+            "the run did not finish: {}",
+            crate::pipeline_launch::safe_point_stop_reason()
+        )));
+    }
     let _ = close_gate(project_root, state.phase, Stage::Validate);
     commit(state, |s| {
         s.stopped = true;

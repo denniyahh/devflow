@@ -377,6 +377,12 @@ Validate is the last stage, so `--until validate` ends a run whose Validate
 passes as `finished`, exactly like a run without `--until`; it never reports
 `stopped_at` for Validate.
 
+A `devflow stop` taken while the run advances toward its finish (for example
+just after the Validate gate was approved) is honoured first, at safe point 6:
+the run ends stopped at Validate with `finished: false`, no
+`workflow_finished` is recorded, and `devflow resume` reruns Validate, which
+asks again.
+
 Finishing never merges, pushes, tags, deletes or resets anything and runs no
 hook: the worktree and the `feature/phase-NN` branch are left as Validate left
 them. The phase is removed from the machine-global gate registry. `cleanup`
