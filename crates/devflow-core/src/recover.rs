@@ -83,17 +83,15 @@ fn inspect_state(project_root: &Path, state: State) -> RecoveryStatus {
 /// repair), so cleaning one dead phase beside running ones can never orphan a
 /// healthy sibling. Also removes lock files whose holder is dead (the sweep lives in
 /// [`crate::lock::remove_stale_locks`], which refuses to delete a live
-/// holder's lock), gate files whose phase has no state file, cron-instruction
-/// records for phases that no longer have state — self-describing "auto-re-run
-/// this phase" records that must not survive an operator-driven reset — and the
-/// liveness files and hold temps crashes left. Returns warnings for anything kept or
+/// holder's lock), gate files whose phase has no state file, and the liveness
+/// files and hold temps crashes left. Returns warnings for anything kept or
 /// that could not be removed.
 pub fn clean(project_root: &Path) -> Result<Vec<String>, RecoverError> {
     clean_report(project_root).map(|report| report.warnings)
 }
 
 /// What [`clean_report`] did: the phases whose state it cleared, the
-/// stateless phases whose orphaned gate files or cron records it removed, the
+/// stateless phases whose orphaned gate files it removed, the
 /// abandoned markers it removed, the set-aside answers it left, and warnings for
 /// anything it kept or could not remove.
 #[derive(Debug, Default)]
@@ -102,8 +100,6 @@ pub struct CleanReport {
     pub cleared: Vec<PhaseId>,
     /// Phases with no state file whose leftover gate files were removed.
     pub orphan_gates_cleared: Vec<PhaseId>,
-    /// Phases with no state file whose leftover cron records were removed.
-    pub orphan_cron_records_removed: Vec<PhaseId>,
     /// Whether a removal the sweep attempted failed. Each failure is also
     /// described in `warnings`.
     pub removal_failed: bool,
@@ -147,7 +143,6 @@ pub fn clean_report(project_root: &Path) -> Result<CleanReport, RecoverError> {
             crate::lock::StaleLockRemovalOutcome::Failure(warning) => report.fail(warning),
         }
     }
-    sweep_orphan_cron_records(project_root, &mut report);
     sweep_abandoned_markers(project_root, &mut report);
     report.quarantined = crate::gates::Gates::quarantined(project_root)
         .into_iter()
@@ -220,54 +215,6 @@ fn remove_abandoned_holds(dir: &Path, is_hold: impl Fn(&str) -> bool, report: &m
     }
 }
 
-/// Drop cron records only for phases without surviving state, so a kept phase's pending
-/// re-run record is preserved. A phase with a state file is skipped at the listing: that
-/// read can only keep. The deletion is decided on a fresh read under the write lock, so
-/// a run that reserved after the listing keeps its record (R2-07).
-fn sweep_orphan_cron_records(project_root: &Path, report: &mut CleanReport) {
-    for instructions in crate::ship::list_cron_instructions(project_root) {
-        let phase = instructions.phase;
-        if workflow::state_path(project_root, phase).exists() {
-            continue;
-        }
-        #[cfg(test)]
-        recover_test_hook(RecoverPoint::CronListed, phase);
-        let swept = workflow::clear_state_if(
-            project_root,
-            phase,
-            Some(workflow::WRITE_LOCK_REPAIR_WAIT),
-            |existing| {
-                if matches!(existing, workflow::Existing::Missing) {
-                    remove_orphan_cron_record(project_root, phase, report);
-                }
-                Ok::<_, WorkflowError>(false)
-            },
-            || (),
-        );
-        if let Err(err) = swept {
-            report_a_lock_failure(&format!("phase {phase}'s cron record"), err, report);
-        }
-    }
-}
-
-fn remove_orphan_cron_record(project_root: &Path, phase: PhaseId, report: &mut CleanReport) {
-    let (removed, result) =
-        crate::ship::delete_cron_instructions_with_partial_result(project_root, phase);
-    if removed {
-        report.orphan_cron_records_removed.push(phase);
-    }
-    if let Err(err) = result {
-        let partial = if removed {
-            " after removing its per-phase record"
-        } else {
-            ""
-        };
-        report.fail(format!(
-            "could not remove cron-instructions for phase {phase}{partial}: {err}"
-        ));
-    }
-}
-
 /// Clear one listed phase if, on a fresh read under its write lock, it is stale and
 /// nothing about it may be live. The listing only names the phase: a run that reserved
 /// after it needs the same lock, so the decision sees that run (R-07). A lock still held
@@ -280,7 +227,6 @@ fn sweep_phase(project_root: &Path, phase: PhaseId, report: &mut CleanReport) {
         phase,
         Some(workflow::WRITE_LOCK_REPAIR_WAIT),
         |existing| Ok::<_, WorkflowError>(sweep_decision(project_root, phase, existing, report)),
-        || (),
     );
     let cleared = match cleared {
         Ok(cleared) => cleared,
@@ -405,7 +351,6 @@ fn sweep_orphan_gates(project_root: &Path, report: &mut CleanReport) {
                 }
                 Ok::<_, WorkflowError>(false)
             },
-            || (),
         );
         if let Err(err) = swept {
             report_a_lock_failure(&what, err, report);
@@ -718,10 +663,6 @@ enum RecoverPoint {
     SweepListed,
     /// `clean_report` listed a phase's gate files and has not decided them.
     OrphanGatesListed,
-    /// `clean_report` listed a phase's cron record and has not decided it.
-    CronListed,
-    /// `clean_phase_report`'s `clear_state_if` returned: the write lock is released.
-    ExplicitClearReturned,
 }
 
 /// Run the hook this thread installed, with its slot free so the hook may run anything.
@@ -735,8 +676,8 @@ fn recover_test_hook(point: RecoverPoint, phase: PhaseId) {
 }
 
 /// Explicitly clean ONE phase, regardless of staleness — the operator's
-/// escape hatch for a wedged-but-fresh run. Clears its state and cron
-/// record; warns (but proceeds) when the recorded agent still looks alive.
+/// escape hatch for a wedged-but-fresh run. Clears its state and gate
+/// files; warns (but proceeds) when the recorded agent still looks alive.
 /// Keeps everything, and says why among the warnings, when its supervisor,
 /// pending supervisor, gate waiter or foreground holder may be live; returns
 /// [`RecoverError::Workflow`] with [`WorkflowError::WriteLockTimeout`], having
@@ -749,8 +690,8 @@ pub fn clean_phase(project_root: &Path, phase: PhaseId) -> Result<Vec<String>, R
 /// What [`clean_phase_report`] did for one phase.
 #[derive(Debug, Default)]
 pub struct PhaseCleanReport {
-    /// Whether this call removed any of the phase's state, gate files, cron
-    /// record, or their orphaned write temps.
+    /// Whether this call removed any of the phase's state, gate files, or
+    /// their orphaned write temps.
     pub removed_anything: bool,
     /// Whether a removal failed or the phase was kept as live. Each is also in
     /// `warnings`.
@@ -764,11 +705,10 @@ pub struct PhaseCleanReport {
 /// so a caller claims neither a cleanup that did not happen nor "nothing to
 /// clean" after deleting something (48-REVIEW WR-03). A failure stops the
 /// clean where it is: gate files that could not go keep the state that
-/// explains them, and state that could not go keeps its cron record.
+/// explains them.
 ///
-/// The decision, the gate files, the state and the cron record share one hold of the
-/// write lock, on a fresh read (R-07, R2-07), so a `start` that reserves meanwhile loses
-/// nothing. Only the leftover `lock-*` files are swept outside it.
+/// The decision, the gate files and the state share one hold of the write lock, on a
+/// fresh read (R-07), so a `start` that reserves meanwhile loses nothing. Only the leftover `lock-*` files are swept outside it.
 pub fn clean_phase_report(
     project_root: &Path,
     phase: PhaseId,
@@ -786,21 +726,10 @@ pub fn clean_phase_report(
                 &mut report,
             ))
         },
-        || crate::ship::delete_cron_instructions_with_partial_result(project_root, phase),
     )?;
-    #[cfg(test)]
-    recover_test_hook(RecoverPoint::ExplicitClearReturned, phase);
     report.removed_anything |= cleared.removed;
     if let Err(err) = cleared.result {
-        report.fail(format!(
-            "kept phase {phase}'s cron record — could not clear its state: {err}"
-        ));
-    }
-    if let Some((cron_removed, cron_result)) = cleared.after {
-        report.removed_anything |= cron_removed;
-        if let Err(err) = cron_result {
-            report.fail(format!("could not remove cron-instructions: {err}"));
-        }
+        report.fail(format!("could not clear phase {phase}'s state: {err}"));
     }
     for outcome in crate::lock::remove_stale_locks_with_outcomes(project_root) {
         match outcome {
@@ -949,13 +878,8 @@ mod tests {
 
     fn write_phase_artifacts(root: &Path, phase: PhaseId) -> Vec<std::path::PathBuf> {
         workflow::save_state(&state_aged_phase(root, phase, 0, None)).unwrap();
-        let cron = crate::ship::build_single_agent_cron_instructions(root, phase, "");
-        crate::ship::write_cron_instructions(root, &cron).unwrap();
 
-        let mut paths = vec![
-            workflow::state_path(root, phase),
-            crate::ship::cron_instructions_path(root, phase),
-        ];
+        let mut paths = vec![workflow::state_path(root, phase)];
         for stage in [Stage::Validate, Stage::Ship] {
             let gate_id = Gates::open_gate(root, phase, stage, "wedged gate")
                 .unwrap()
@@ -1314,45 +1238,6 @@ mod tests {
             .map(|s| s.phase)
             .collect();
         assert_eq!(remaining, vec![PhaseId::new(5)]);
-    }
-
-    /// D-19: recover::clean remains a reset path, distinct from lifecycle
-    /// consumption, and deletes a deliberately unconsumed record.
-    #[test]
-    fn clean_still_deletes_unconsumed_cron_instructions() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(30);
-        let state = state_aged_phase(root, phase, STALE_THRESHOLD.as_secs() + 60, None);
-        crate::workflow::save_state(&state).unwrap();
-        let record = crate::ship::build_single_agent_cron_instructions(root, phase, "");
-        crate::ship::write_cron_instructions(root, &record).unwrap();
-        assert!(crate::ship::cron_instructions_path(root, phase).exists());
-
-        clean(root).unwrap();
-
-        assert!(!crate::ship::cron_instructions_path(root, phase).exists());
-    }
-
-    /// D-19: explicit clean_phase reset remains distinct from consumption and
-    /// deletes only the named phase's deliberately unconsumed record.
-    #[test]
-    fn clean_phase_deletes_only_the_named_phase_cron_record() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let first = PhaseId::new(31);
-        let second = PhaseId::new(32);
-        let first_state = state_aged_phase(root, first, 0, None);
-        crate::workflow::save_state(&first_state).unwrap();
-        let first_record = crate::ship::build_single_agent_cron_instructions(root, first, "");
-        let second_record = crate::ship::build_single_agent_cron_instructions(root, second, "");
-        crate::ship::write_cron_instructions(root, &first_record).unwrap();
-        crate::ship::write_cron_instructions(root, &second_record).unwrap();
-
-        clean_phase(root, first).unwrap();
-
-        assert!(!crate::ship::cron_instructions_path(root, first).exists());
-        assert!(crate::ship::cron_instructions_path(root, second).exists());
     }
 
     #[test]
@@ -1799,64 +1684,30 @@ mod tests {
         );
     }
 
-    /// R-1: the sweep must retain an orphan cron-record removal in its
-    /// report, so a caller can name that cleanup instead of claiming it did
-    /// nothing.
-    #[test]
-    fn clean_report_retains_a_removed_orphan_cron_record() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(69);
-        let record = crate::ship::build_single_agent_cron_instructions(root, phase, "");
-        crate::ship::write_cron_instructions(root, &record).unwrap();
-        let record_path = crate::ship::cron_instructions_path(root, phase);
-
-        let report = clean_report(root).expect("clean");
-
-        assert!(
-            !record_path.exists(),
-            "the valid orphan cron record must be removed"
-        );
-        assert_eq!(report.orphan_cron_records_removed, vec![phase]);
-    }
-
-    /// Control for the test below: a cron record the clean does remove is a
-    /// cleanup.
-    #[test]
-    fn clean_phase_report_counts_a_lone_cron_record() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(12);
-        let record = crate::ship::build_single_agent_cron_instructions(root, phase, "");
-        crate::ship::write_cron_instructions(root, &record).unwrap();
-
-        let report = clean_phase_report(root, phase).expect("clean");
-
-        assert!(!crate::ship::cron_instructions_path(root, phase).exists());
-        assert!(report.removed_anything && !report.removal_failed);
-    }
-
     /// WR-03: a removal that fails is not a cleanup. The only artifact here is
-    /// a cron record that cannot be removed (a directory in its place).
+    /// a state file that cannot be removed (a directory in its place).
     #[test]
     fn clean_phase_report_does_not_count_a_failed_removal() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(8);
-        std::fs::create_dir_all(crate::ship::cron_instructions_path(root, phase)).unwrap();
+        std::fs::create_dir_all(workflow::state_path(root, phase)).unwrap();
 
         let report = clean_phase_report(root, phase).expect("clean");
 
         assert!(
             !report.removed_anything,
-            "a cron record that could not be removed must not count as cleaned"
+            "a state file that could not be removed must not count as cleaned"
         );
         assert!(
             report.removal_failed,
             "a failed removal must be flagged, not only warned about"
         );
         assert!(
-            report.warnings.iter().any(|w| w.contains("cron")),
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("could not clear phase 8's state")),
             "the failed removal must be reported: {:?}",
             report.warnings
         );
@@ -2779,116 +2630,6 @@ mod tests {
         assert!(report.removed_anything, "{:?}", report.warnings);
         assert!(!state_path.exists());
         assert!(!gate.exists());
-    }
-
-    /// R2-07: a run that reserves right after the explicit clean let go of the write lock
-    /// writes its own rate-limit record. The clean's cron removal must already be done.
-    #[test]
-    fn explicit_clean_removes_the_cron_record_before_it_releases_the_write_lock() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().to_path_buf();
-        let (replaced, control) = (PhaseId::new(2127), PhaseId::new(2128));
-        for phase in [replaced, control] {
-            save_stale(&root, phase, |_| {});
-            let record = crate::ship::build_single_agent_cron_instructions(&root, phase, "run A");
-            crate::ship::write_cron_instructions(&root, &record).unwrap();
-        }
-        let run_b = std::rc::Rc::new(std::cell::RefCell::new(None));
-        let (hook_root, hook_run_b) = (root.clone(), run_b.clone());
-
-        let report = with_recover_hook(
-            move |point, phase| {
-                if point != RecoverPoint::ExplicitClearReturned || phase != replaced {
-                    return;
-                }
-                let root = hook_root.as_path();
-                workflow::update_state_with(root, phase, |_| {
-                    let run_b = state_aged_phase(root, phase, 0, None);
-                    Ok::<_, WorkflowError>((Some(run_b), ()))
-                })
-                .unwrap();
-                let record =
-                    crate::ship::build_single_agent_cron_instructions(root, phase, "run B");
-                crate::ship::write_cron_instructions(root, &record).unwrap();
-                *hook_run_b.borrow_mut() = Some((
-                    std::fs::read(workflow::state_path(root, phase)).unwrap(),
-                    std::fs::read(crate::ship::cron_instructions_path(root, phase)).unwrap(),
-                ));
-            },
-            || clean_phase_report(&root, replaced).expect("explicit clean"),
-        );
-
-        assert!(
-            report.removed_anything,
-            "run A was cleared: {:?}",
-            report.warnings
-        );
-        let (state_b, cron_b) = run_b.borrow_mut().take().expect("the hook ran");
-        assert_eq!(
-            std::fs::read(workflow::state_path(&root, replaced)).ok(),
-            Some(state_b),
-            "run B's state must survive"
-        );
-        assert_eq!(
-            std::fs::read(crate::ship::cron_instructions_path(&root, replaced)).ok(),
-            Some(cron_b),
-            "run B's cron record must survive"
-        );
-
-        // Control: with nothing in the gap, both of the phase's files go.
-        clean_phase_report(&root, control).expect("explicit clean");
-        assert!(!workflow::state_path(&root, control).exists());
-        assert!(!crate::ship::cron_instructions_path(&root, control).exists());
-    }
-
-    /// R2-07, the sweep side: a record listed with no state may be a new run's by the
-    /// time the sweep decides. Q's orphan record, with nothing in the gap, goes.
-    #[test]
-    fn the_orphan_cron_sweep_keeps_the_record_of_a_run_that_reserved_after_its_listing() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().to_path_buf();
-        let (started, control) = (PhaseId::new(2129), PhaseId::new(2130));
-        for phase in [started, control] {
-            let record = crate::ship::build_single_agent_cron_instructions(&root, phase, "orphan");
-            crate::ship::write_cron_instructions(&root, &record).unwrap();
-        }
-        let run_b = std::rc::Rc::new(std::cell::RefCell::new(None));
-        let (hook_root, hook_run_b) = (root.clone(), run_b.clone());
-
-        let report = with_recover_hook(
-            move |point, phase| {
-                if point != RecoverPoint::CronListed || phase != started {
-                    return;
-                }
-                let root = hook_root.as_path();
-                workflow::update_state_with(root, phase, |_| {
-                    let run_b = state_aged_phase(root, phase, 0, None);
-                    Ok::<_, WorkflowError>((Some(run_b), ()))
-                })
-                .unwrap();
-                let record =
-                    crate::ship::build_single_agent_cron_instructions(root, phase, "run B");
-                crate::ship::write_cron_instructions(root, &record).unwrap();
-                *hook_run_b.borrow_mut() = Some((
-                    std::fs::read(workflow::state_path(root, phase)).unwrap(),
-                    std::fs::read(crate::ship::cron_instructions_path(root, phase)).unwrap(),
-                ));
-            },
-            || clean_report(&root).expect("clean"),
-        );
-
-        let (state_b, cron_b) = run_b.borrow_mut().take().expect("the hook ran");
-        assert_eq!(
-            std::fs::read(workflow::state_path(&root, started)).ok(),
-            Some(state_b)
-        );
-        assert_eq!(
-            std::fs::read(crate::ship::cron_instructions_path(&root, started)).ok(),
-            Some(cron_b),
-            "run B's cron record must survive"
-        );
-        assert_eq!(report.orphan_cron_records_removed, vec![control]);
-        assert!(!crate::ship::cron_instructions_path(&root, control).exists());
     }
 
     /// pi S3: `recover` keeps every set-aside answer (D-05) and lists it, so an operator

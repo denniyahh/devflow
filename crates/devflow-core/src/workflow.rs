@@ -681,13 +681,11 @@ pub fn while_owner<T, E: From<WorkflowError>>(
 
 /// What [`clear_state_if`] did.
 #[derive(Debug)]
-pub(crate) struct Cleared<A> {
+pub(crate) struct Cleared {
     /// Whether a file was removed, by the removal or before its error.
     pub(crate) removed: bool,
     /// The removal's outcome; `Ok` when the decision kept the state.
     pub(crate) result: Result<(), WorkflowError>,
-    /// `after_clear`'s value, when it ran.
-    pub(crate) after: Option<A>,
 }
 
 /// Enumerate every active phase state, sorted by phase number.
@@ -796,14 +794,12 @@ pub fn clear_state_within(
 /// [`clear_state_if_owned`], which stays as it is.
 ///
 /// `decide` gets what is on disk: `Ok(false)` keeps it, `Ok(true)` removes the state and
-/// its orphaned write temps, and `Err` removes nothing and is returned as it is. After a
-/// removal that succeeded, `after_clear` runs still under the lock, for a step that must
-/// follow the removal with no reservation in between (R2-07); a failed removal skips it.
-/// With `wait` set, a lock still held then is [`WorkflowError::WriteLockTimeout`] with
-/// neither closure run.
+/// its orphaned write temps, and `Err` removes nothing and is returned as it is. With
+/// `wait` set, a lock still held then is [`WorkflowError::WriteLockTimeout`] with `decide`
+/// not run.
 ///
-/// Neither closure may take this lock: a second `flock` on the file from this process is
-/// a second open file description and blocks on the first. So neither calls
+/// `decide` may not take this lock: a second `flock` on the file from this process is
+/// a second open file description and blocks on the first. So it never calls
 /// [`update_state`], [`update_state_with`], [`update_owned_state`], [`clear_state`],
 /// [`while_owner`] or [`clear_state_if_owned`].
 ///
@@ -816,28 +812,21 @@ pub fn clear_state_within(
 /// [`WRITE_LOCK_REPAIR_WAIT`]; a repair verb then names the holder and writes nothing.
 /// That leaves fsync-bound file operations on a slow disk unmeasured, and a SIGSTOPped
 /// caller outside the bound, as for every writer.
-pub(crate) fn clear_state_if<E: From<WorkflowError>, A>(
+pub(crate) fn clear_state_if<E: From<WorkflowError>>(
     project_root: &Path,
     phase: PhaseId,
     wait: Option<Duration>,
     decide: impl FnOnce(Existing) -> Result<bool, E>,
-    after_clear: impl FnOnce() -> A,
-) -> Result<Cleared<A>, E> {
+) -> Result<Cleared, E> {
     let _lock = lock_for_write(project_root, phase, wait)?;
     if !decide(read_existing(project_root, phase))? {
         return Ok(Cleared {
             removed: false,
             result: Ok(()),
-            after: None,
         });
     }
     let (removed, result) = remove_state_files(project_root, phase, true);
-    let after = result.is_ok().then(after_clear);
-    Ok(Cleared {
-        removed,
-        result,
-        after,
-    })
+    Ok(Cleared { removed, result })
 }
 
 fn clear_state_with_partial_result_impl(
@@ -1683,7 +1672,7 @@ mod tests {
     }
 
     /// R-07's primitive: the decision sees what is on disk with the lock held, and the
-    /// removal and `after_clear` share that hold.
+    /// removal shares that hold.
     #[test]
     fn clear_state_if_decides_on_a_fresh_read_under_the_write_lock() {
         let dir = tempfile::tempdir().unwrap();
@@ -1696,48 +1685,34 @@ mod tests {
             pid: Some(std::process::id()),
         };
 
-        // `Ok(false)`: nothing removed, `after_clear` not run.
-        let after_ran = std::cell::Cell::new(false);
-        let kept = clear_state_if::<WorkflowError, ()>(
-            root,
-            phase,
-            None,
-            |existing| {
-                let Existing::Loaded(seen) = existing else {
-                    panic!("the saved state must read as loaded: {existing:?}");
-                };
-                let on_disk: serde_json::Value =
-                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-                assert_eq!(serde_json::to_value(&seen).unwrap(), on_disk);
-                assert_eq!(write_lock_status(root, phase).unwrap(), held_by_us);
-                Ok(false)
-            },
-            || after_ran.set(true),
-        )
+        // `Ok(false)`: nothing removed.
+        let kept = clear_state_if::<WorkflowError>(root, phase, None, |existing| {
+            let Existing::Loaded(seen) = existing else {
+                panic!("the saved state must read as loaded: {existing:?}");
+            };
+            let on_disk: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(serde_json::to_value(&seen).unwrap(), on_disk);
+            assert_eq!(write_lock_status(root, phase).unwrap(), held_by_us);
+            Ok(false)
+        })
         .unwrap();
         assert!(!kept.removed);
         assert!(kept.result.is_ok());
-        assert!(kept.after.is_none());
-        assert!(!after_ran.get());
         assert_eq!(std::fs::read(&path).unwrap(), before);
 
-        // `Err`: nothing removed, neither later step run.
-        let failed = clear_state_if::<WorkflowError, ()>(
-            root,
-            phase,
-            None,
-            |_| Err(WorkflowError::MissingState(PathBuf::from("the decision's"))),
-            || after_ran.set(true),
-        );
+        // `Err`: nothing removed.
+        let failed = clear_state_if::<WorkflowError>(root, phase, None, |_| {
+            Err(WorkflowError::MissingState(PathBuf::from("the decision's")))
+        });
         assert!(
             matches!(&failed, Err(WorkflowError::MissingState(path))
                 if path.as_path() == Path::new("the decision's")),
             "{failed:?}"
         );
-        assert!(!after_ran.get());
         assert_eq!(std::fs::read(&path).unwrap(), before);
 
-        // A held lock with a bound: neither step runs and nothing changes.
+        // A held lock with a bound: the decision does not run and nothing changes.
         let (entered, writer_is_inside) = std::sync::mpsc::channel();
         let (release, released) = std::sync::mpsc::channel::<()>();
         let decided = std::cell::Cell::new(false);
@@ -1749,7 +1724,7 @@ mod tests {
                 });
             });
             writer_is_inside.recv().unwrap();
-            let timed_out = clear_state_if::<WorkflowError, ()>(
+            let timed_out = clear_state_if::<WorkflowError>(
                 root,
                 phase,
                 Some(Duration::from_millis(200)),
@@ -1757,7 +1732,6 @@ mod tests {
                     decided.set(true);
                     Ok(true)
                 },
-                || after_ran.set(true),
             );
             release.send(()).unwrap();
             assert!(
@@ -1770,25 +1744,13 @@ mod tests {
             );
         });
         assert!(!decided.get(), "a timed-out clear must not decide");
-        assert!(!after_ran.get());
         assert_eq!(std::fs::read(&path).unwrap(), before);
 
-        // `Ok(true)`: removed, then `after_clear` with the lock still held.
-        let cleared = clear_state_if::<WorkflowError, &str>(
-            root,
-            phase,
-            None,
-            |_| Ok(true),
-            || {
-                assert!(!path.exists(), "the state goes before `after_clear` runs");
-                assert_eq!(write_lock_status(root, phase).unwrap(), held_by_us);
-                "after"
-            },
-        )
-        .unwrap();
+        // `Ok(true)`: removed.
+        let cleared = clear_state_if::<WorkflowError>(root, phase, None, |_| Ok(true)).unwrap();
         assert!(cleared.removed);
         assert!(cleared.result.is_ok());
-        assert_eq!(cleared.after, Some("after"));
+        assert!(!path.exists(), "an `Ok(true)` decision removes the state");
     }
 
     #[test]
