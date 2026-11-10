@@ -100,10 +100,6 @@ enum AgentRun {
     Finishing,
 }
 
-/// A codex that prints nothing and exits 0. It stands in for the capture
-/// agent until one exists, and keeps the host's real `codex` off the launch.
-const SILENT_CODEX: &str = "exit 0";
-
 impl Shape {
     fn label(self) -> &'static str {
         match self {
@@ -122,11 +118,12 @@ impl Shape {
 
     /// This shape's fake agent doing `run`. A capture agent logs its argv and
     /// stdin under `logs`.
-    fn fake_bin(self, _logs: &Path, run: AgentRun) -> common::FakeBin {
+    fn fake_bin(self, logs: &Path, run: AgentRun) -> common::FakeBin {
         match (self, run) {
             (Shape::Stream, AgentRun::Waiting) => common::fake_bin_dir(WAITING_CLAUDE),
             (Shape::Stream, AgentRun::Finishing) => common::fake_bin_dir(FINISHING_CLAUDE),
-            (Shape::Capture, _) => common::fake_bin_dir_for("codex", SILENT_CODEX),
+            (Shape::Capture, AgentRun::Waiting) => common::waiting_capture_agent_bin(logs),
+            (Shape::Capture, AgentRun::Finishing) => common::capture_agent_bin(logs),
         }
     }
 }
@@ -519,6 +516,20 @@ fn capture_supervisor_owns_a_fake_agent_and_records_devflow_result() {
             .any(|line| line.contains("\"advance_evaluated\"")
                 && line.contains("\"status\":\"success\"")),
         "the supervisor's in-process advance evaluated the stage as success:\n{events}"
+    );
+    // The assertions above hold for a stream launch too: a stream-shape
+    // supervisor also writes the stdout and exit-code files. This one is the
+    // shape check.
+    let launches: Vec<serde_json::Value> = events
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| event["event"].as_str() == Some("stage_launched"))
+        .map(|event| event["launch"].clone())
+        .collect();
+    assert_eq!(
+        launches,
+        vec![serde_json::Value::from(Shape::Capture.label())],
+        "the one launch ran in the capture shape:\n{events}"
     );
 
     // The fake codex ran with the codex driver's argv, and the capture shape
