@@ -5,7 +5,7 @@
 //! (CHANGELOG) used on ship completion.
 
 use crate::phase_id::PhaseId;
-use crate::reset_time::{civil_from_days, days_from_civil};
+use crate::reset_time::civil_from_days;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -304,160 +304,23 @@ pub fn build_single_agent_cron_instructions(
 }
 
 /// Convert a retry timestamp to an ISO-8601 UTC instant, rounding up to the
-/// nearest minute. Supports RFC3339-like timestamps and Unix epoch seconds.
+/// nearest minute. Supports RFC3339-like timestamps and Unix epoch seconds
+/// (parsed by [`crate::reset_time::parse_reset_time`]).
 pub fn hermes_schedule_from_retry_after(retry_after: &str) -> Option<String> {
+    const SECS_PER_MINUTE: i64 = 60;
+    const MINUTES_PER_HOUR: i64 = 60;
+    const MINUTES_PER_DAY: i64 = 24 * MINUTES_PER_HOUR;
     // WR-06: never turn unparseable agent output into an every-minute cron.
-    parse_retry_timestamp(retry_after).map(|ts| ts.round_up_minute().to_iso_utc())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RetryTimestamp {
-    year: i32,
-    month: u32,
-    day: u32,
-    hour: u32,
-    minute: u32,
-    second: u32,
-}
-
-impl RetryTimestamp {
-    fn round_up_minute(self) -> Self {
-        if self.second == 0 {
-            return self;
-        }
-        Self::from_epoch_minutes(self.to_epoch_minutes() + 1)
-    }
-
-    fn to_iso_utc(self) -> String {
-        format!(
-            "{:04}-{:02}-{:02}T{:02}:{:02}:00Z",
-            self.year, self.month, self.day, self.hour, self.minute
-        )
-    }
-
-    fn to_epoch_minutes(self) -> i64 {
-        let days = days_from_civil(self.year, self.month, self.day);
-        days * 24 * 60 + i64::from(self.hour) * 60 + i64::from(self.minute)
-    }
-
-    fn from_epoch_minutes(minutes: i64) -> Self {
-        let days = minutes.div_euclid(24 * 60);
-        let minute_of_day = minutes.rem_euclid(24 * 60);
-        let (year, month, day) = civil_from_days(days);
-        Self {
-            year,
-            month,
-            day,
-            hour: (minute_of_day / 60) as u32,
-            minute: (minute_of_day % 60) as u32,
-            second: 0,
-        }
-    }
-}
-
-fn parse_retry_timestamp(input: &str) -> Option<RetryTimestamp> {
-    parse_unix_seconds(input).or_else(|| parse_rfc3339ish(input))
-}
-
-fn parse_unix_seconds(input: &str) -> Option<RetryTimestamp> {
-    let seconds = input.trim().parse::<i64>().ok()?;
-    let minutes = seconds.div_euclid(60) + i64::from(seconds.rem_euclid(60) > 0);
-    Some(RetryTimestamp::from_epoch_minutes(minutes))
-}
-
-fn parse_rfc3339ish(input: &str) -> Option<RetryTimestamp> {
-    let input = input.trim();
-    let split_at = input.find('T').or_else(|| input.find(' '))?;
-    let (date, rest) = input.split_at(split_at);
-    let time = rest.get(1..)?;
-    let mut date_parts = date.split('-');
-    let year = date_parts.next()?.parse::<i32>().ok()?;
-    let month = date_parts.next()?.parse::<u32>().ok()?;
-    let day = date_parts.next()?.parse::<u32>().ok()?;
-    if date_parts.next().is_some() {
-        return None;
-    }
-
-    let (time, offset_minutes) = split_time_and_offset(time);
-    let mut time_parts = time.split(':');
-    let hour = time_parts.next()?.parse::<u32>().ok()?;
-    let minute = time_parts.next()?.parse::<u32>().ok()?;
-    let second = time_parts
-        .next()
-        .map(|s| s.split('.').next().unwrap_or_default().parse::<u32>().ok())
-        .unwrap_or(Some(0))?;
-    if month == 0 || month > 12 || day == 0 || day > 31 || hour > 23 || minute > 59 || second > 60 {
-        return None;
-    }
-
-    let ts = RetryTimestamp {
-        year,
-        month,
-        day,
-        hour,
-        minute,
-        second,
-    };
-    let utc_minutes = ts.to_epoch_minutes() - i64::from(offset_minutes);
-    let mut normalized = RetryTimestamp::from_epoch_minutes(utc_minutes);
-    // `to_epoch_minutes`/`from_epoch_minutes` normalize at whole-minute
-    // granularity (the offset subtraction above only ever shifts whole
-    // minutes, since `offset_minutes` is itself an integer minute count),
-    // so `from_epoch_minutes` always zeroes `second`. A timezone offset never
-    // carries a sub-minute component, so the original `second` is
-    // timezone-invariant and safe to restore verbatim here.
-    normalized.second = second;
-    Some(normalized)
-}
-
-fn split_time_and_offset(time: &str) -> (&str, i32) {
-    let trimmed = time.trim_end_matches('Z');
-    if trimmed.len() > 6 {
-        if let Some(idx) = trimmed.rfind('+') {
-            return (
-                &trimmed[..idx],
-                parse_offset_minutes(&trimmed[idx..]).unwrap_or(0),
-            );
-        }
-        if let Some(idx) = trimmed.rfind('-')
-            && idx > 0
-        {
-            return (
-                &trimmed[..idx],
-                parse_offset_minutes(&trimmed[idx..]).unwrap_or(0),
-            );
-        }
-    }
-    (trimmed, 0)
-}
-
-fn parse_offset_minutes(offset: &str) -> Option<i32> {
-    // WR-07 (13-REVIEW.md), revised: accept the three ISO-8601 offset forms
-    // — ±HH:MM, ±HHMM, and hour-only ±HH — with bound-checked values.
-    // Requiring a colon (the first WR-07 fix) silently rescheduled valid
-    // ±HH/±HHMM timestamps to UTC through the callers' `unwrap_or(0)`,
-    // firing the resume cron hours off; the original pre-WR-07 code misread
-    // ±HHMM as HHMM *hours*. Anything else (wrong digit count, out-of-range
-    // values) still fails safe as None. `retry_after` is raw agent output,
-    // so no producer guarantees one form.
-    const MAX_OFFSET_HOURS: i32 = 23;
-    const MAX_OFFSET_MINUTES: i32 = 59;
-    let sign = if offset.starts_with('-') { -1 } else { 1 };
-    let rest = offset.get(1..)?;
-    let (hours_part, minutes_part) = match rest.split_once(':') {
-        Some((hours, minutes)) => (hours, minutes),
-        None => match rest.len() {
-            2 => (rest, "0"),              // ±HH
-            4 => (&rest[..2], &rest[2..]), // ±HHMM
-            _ => return None,
-        },
-    };
-    let hours = hours_part.parse::<i32>().ok()?;
-    let minutes = minutes_part.parse::<i32>().ok()?;
-    if !(0..=MAX_OFFSET_HOURS).contains(&hours) || !(0..=MAX_OFFSET_MINUTES).contains(&minutes) {
-        return None;
-    }
-    Some(sign * (hours * 60 + minutes))
+    let seconds = crate::reset_time::parse_reset_time(retry_after)?;
+    let minutes =
+        seconds.div_euclid(SECS_PER_MINUTE) + i64::from(seconds.rem_euclid(SECS_PER_MINUTE) > 0);
+    let minute_of_day = minutes.rem_euclid(MINUTES_PER_DAY);
+    let (year, month, day) = civil_from_days(minutes.div_euclid(MINUTES_PER_DAY));
+    Some(format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:00Z",
+        hour = minute_of_day / MINUTES_PER_HOUR,
+        minute = minute_of_day % MINUTES_PER_HOUR
+    ))
 }
 
 /// Quote `value` as a single POSIX shell word if it contains any character
@@ -853,21 +716,6 @@ mod tests {
             hermes_schedule_from_retry_after("2026-06-18T15:45:30-05"),
             Some("2026-06-18T20:46:00Z".to_string())
         );
-    }
-
-    #[test]
-    fn parse_offset_minutes_bounds_and_forms() {
-        assert_eq!(parse_offset_minutes("+05:30"), Some(330));
-        assert_eq!(parse_offset_minutes("+0530"), Some(330));
-        assert_eq!(parse_offset_minutes("-0530"), Some(-330));
-        assert_eq!(parse_offset_minutes("+05"), Some(300));
-        assert_eq!(parse_offset_minutes("-05"), Some(-300));
-        // Out-of-range and wrong digit counts fail safe.
-        assert_eq!(parse_offset_minutes("+24"), None);
-        assert_eq!(parse_offset_minutes("+05:60"), None);
-        assert_eq!(parse_offset_minutes("+5"), None);
-        assert_eq!(parse_offset_minutes("+530"), None);
-        assert_eq!(parse_offset_minutes("+abcd"), None);
     }
 
     #[test]

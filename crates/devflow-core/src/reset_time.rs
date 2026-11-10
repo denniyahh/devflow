@@ -10,14 +10,27 @@
 //! reads a timestamp and owns the civil-date arithmetic other modules format
 //! timestamps with.
 
+const SECS_PER_MINUTE: i64 = 60;
+const SECS_PER_HOUR: i64 = 60 * SECS_PER_MINUTE;
+const SECS_PER_DAY: i64 = 24 * SECS_PER_HOUR;
+
 /// The exact UTC instant, in Unix epoch seconds, that `input` names.
 ///
-/// Accepts non-negative epoch seconds, optionally with a decimal fraction.
-/// A fraction is rounded UP to the next whole second, so the result is never
-/// earlier than the instant the input names. Anything else, including
-/// surrounding text, a sign, or a value that overflows `i64`, is `None`.
+/// Two forms are read, after trimming surrounding whitespace:
+///
+/// - non-negative epoch seconds, optionally with a decimal fraction;
+/// - an RFC 3339-like timestamp (`YYYY-MM-DDTHH:MM[:SS[.frac]]`, `T` or a
+///   space as the separator) with no offset, `Z`, or a `±HH:MM`, `±HHMM` or
+///   `±HH` offset, normalised to UTC.
+///
+/// A fractional second is rounded UP to the next whole second, so the result
+/// is never earlier than the instant the input names. Anything else is `None`,
+/// including a sign on epoch seconds, a value that overflows `i64`, and an
+/// offset that is present but malformed: that is refused rather than read as
+/// UTC.
 pub fn parse_reset_time(input: &str) -> Option<i64> {
-    parse_epoch_seconds(input.trim())
+    let input = input.trim();
+    parse_epoch_seconds(input).or_else(|| parse_rfc3339ish(input))
 }
 
 /// `digits` or `digits.digits` as whole epoch seconds, fraction rounded up.
@@ -41,6 +54,110 @@ fn parse_epoch_seconds(input: &str) -> Option<i64> {
 /// True when `text` is one or more ASCII digits and nothing else.
 fn is_ascii_digits(text: &str) -> bool {
     !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// An RFC 3339-like timestamp as UTC epoch seconds, fraction rounded up.
+fn parse_rfc3339ish(input: &str) -> Option<i64> {
+    let split_at = input.find('T').or_else(|| input.find(' '))?;
+    let (date, rest) = input.split_at(split_at);
+    let time = rest.get(1..)?;
+    let mut date_parts = date.split('-');
+    let year = date_parts.next()?.parse::<i32>().ok()?;
+    let month = date_parts.next()?.parse::<u32>().ok()?;
+    let day = date_parts.next()?.parse::<u32>().ok()?;
+    if date_parts.next().is_some() {
+        return None;
+    }
+
+    let (time, offset_minutes) = split_time_and_offset(time)?;
+    let mut time_parts = time.split(':');
+    let hour = time_parts.next()?.parse::<u32>().ok()?;
+    let minute = time_parts.next()?.parse::<u32>().ok()?;
+    let (second, round_up) = match time_parts.next() {
+        None => (0, false),
+        Some(seconds) => parse_seconds_field(seconds)?,
+    };
+    if time_parts.next().is_some() {
+        return None;
+    }
+    if month == 0 || month > 12 || day == 0 || day > 31 || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+
+    days_from_civil(year, month, day)
+        .checked_mul(SECS_PER_DAY)?
+        .checked_add(i64::from(hour) * SECS_PER_HOUR)?
+        .checked_add(i64::from(minute) * SECS_PER_MINUTE)?
+        .checked_add(i64::from(second))?
+        .checked_sub(i64::from(offset_minutes) * SECS_PER_MINUTE)?
+        .checked_add(i64::from(round_up))
+}
+
+/// `SS` or `SS.frac` as the whole second and whether a non-zero fraction
+/// requires rounding up.
+fn parse_seconds_field(field: &str) -> Option<(u32, bool)> {
+    let (whole, fraction) = match field.split_once('.') {
+        Some((whole, fraction)) => (whole, Some(fraction)),
+        None => (field, None),
+    };
+    if !is_ascii_digits(whole) {
+        return None;
+    }
+    let second = whole.parse::<u32>().ok()?;
+    match fraction {
+        None => Some((second, false)),
+        Some(fraction) if !is_ascii_digits(fraction) => None,
+        Some(fraction) => Some((second, fraction.bytes().any(|b| b != b'0'))),
+    }
+}
+
+/// Split the clock time from its UTC offset, in minutes.
+///
+/// No offset, or a bare `Z`, is a zero offset. An offset that is present but
+/// that [`parse_offset_minutes`] refuses is `None`: reading `+99:00` as UTC
+/// would invent a deadline the agent never reported (D-16, D-27.1).
+fn split_time_and_offset(time: &str) -> Option<(&str, i32)> {
+    let trimmed = time.trim_end_matches('Z');
+    if trimmed.len() > 6 {
+        if let Some(idx) = trimmed.rfind('+') {
+            return Some((&trimmed[..idx], parse_offset_minutes(&trimmed[idx..])?));
+        }
+        if let Some(idx) = trimmed.rfind('-')
+            && idx > 0
+        {
+            return Some((&trimmed[..idx], parse_offset_minutes(&trimmed[idx..])?));
+        }
+    }
+    Some((trimmed, 0))
+}
+
+fn parse_offset_minutes(offset: &str) -> Option<i32> {
+    // WR-07 (13-REVIEW.md), revised: accept the three ISO-8601 offset forms
+    // — ±HH:MM, ±HHMM, and hour-only ±HH — with bound-checked values.
+    // Requiring a colon (the first WR-07 fix) silently rescheduled valid
+    // ±HH/±HHMM timestamps to UTC through the callers' `unwrap_or(0)`,
+    // firing the resume cron hours off; the original pre-WR-07 code misread
+    // ±HHMM as HHMM *hours*. Anything else (wrong digit count, out-of-range
+    // values) still fails safe as None. `retry_after` is raw agent output,
+    // so no producer guarantees one form.
+    const MAX_OFFSET_HOURS: i32 = 23;
+    const MAX_OFFSET_MINUTES: i32 = 59;
+    let sign = if offset.starts_with('-') { -1 } else { 1 };
+    let rest = offset.get(1..)?;
+    let (hours_part, minutes_part) = match rest.split_once(':') {
+        Some((hours, minutes)) => (hours, minutes),
+        None => match rest.len() {
+            2 => (rest, "0"),              // ±HH
+            4 => (&rest[..2], &rest[2..]), // ±HHMM
+            _ => return None,
+        },
+    };
+    let hours = hours_part.parse::<i32>().ok()?;
+    let minutes = minutes_part.parse::<i32>().ok()?;
+    if !(0..=MAX_OFFSET_HOURS).contains(&hours) || !(0..=MAX_OFFSET_MINUTES).contains(&minutes) {
+        return None;
+    }
+    Some(sign * (hours * 60 + minutes))
 }
 
 /// The number of days from 1970-01-01 to the given proleptic-Gregorian date.
@@ -142,6 +259,22 @@ mod tests {
             Some(august_2_2026_midnight_utc()),
             "a valid offset must not be refused"
         );
+    }
+
+    /// Moved from `ship.rs` unchanged: the accepted offset spellings and bounds.
+    #[test]
+    fn parse_offset_minutes_bounds_and_forms() {
+        assert_eq!(parse_offset_minutes("+05:30"), Some(330));
+        assert_eq!(parse_offset_minutes("+0530"), Some(330));
+        assert_eq!(parse_offset_minutes("-0530"), Some(-330));
+        assert_eq!(parse_offset_minutes("+05"), Some(300));
+        assert_eq!(parse_offset_minutes("-05"), Some(-300));
+        // Out-of-range and wrong digit counts fail safe.
+        assert_eq!(parse_offset_minutes("+24"), None);
+        assert_eq!(parse_offset_minutes("+05:60"), None);
+        assert_eq!(parse_offset_minutes("+5"), None);
+        assert_eq!(parse_offset_minutes("+530"), None);
+        assert_eq!(parse_offset_minutes("+abcd"), None);
     }
 
     /// The relocated civil-date helpers are inverses of each other.
