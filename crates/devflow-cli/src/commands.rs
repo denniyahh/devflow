@@ -954,6 +954,7 @@ pub(crate) fn reserve_launch(
     ));
     let written = workflow::update_state_with(project_root, phase, |existing| {
         refuse_launch_over_a_live_run(project_root, phase, verb, &existing, cache_dir)?;
+        refuse_resume_of_a_finished_run(phase, verb, &existing)?;
         if fresh.is_some() {
             refuse_stateless_launch_beside_a_live_lock(
                 project_root,
@@ -4364,6 +4365,27 @@ fn refuse_launch_over_a_live_run(
     Err(CliError::Message(live_run_refusal(
         phase, verb, &sockets, agent,
     )))
+}
+
+/// D-35: `resume` refuses a run that finished, because its last stage already
+/// passed and there is nothing left to continue. Runs on the state
+/// [`reserve_launch`]'s closure read, so the refusal writes nothing and
+/// launches nothing. `start` is not refused: a new run replaces the state.
+fn refuse_resume_of_a_finished_run(
+    phase: PhaseId,
+    verb: LaunchVerb,
+    existing: &workflow::Existing,
+) -> Result<(), CliError> {
+    match (verb, existing) {
+        (LaunchVerb::Resume, workflow::Existing::Loaded(state)) if state.finished => {
+            Err(CliError::Message(format!(
+                "resume refused: phase {phase} finished (its Validate passed), so there is \
+                 nothing to resume; its worktree and branch are kept. Run `devflow start \
+                 --phase {phase}` to start a new run"
+            )))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// What a foreground process's live-supervisor check found: the phase's recorded and
