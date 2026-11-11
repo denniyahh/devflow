@@ -23,7 +23,6 @@ human decision before DevFlow performs terminal Git operations.
 - [System Architecture](diagrams/system.md) — Runtime components and boundaries
 - [State Machine](architecture/state-machine.md) — Stages, verdicts, and gates
 - [Agent Model](architecture/agent-model.md) — Adapters and completion evidence
-- [Ship Flow](diagrams/ship-flow.md) — Review, approval, and terminal hooks
 - [Quick Start](guides/quickstart.md) — Install and operate DevFlow
 
 ## Supported Agents
