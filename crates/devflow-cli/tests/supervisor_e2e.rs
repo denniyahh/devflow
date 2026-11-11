@@ -2558,3 +2558,125 @@ fn rejecting_a_clean_validate_pass_runs_gsd_quick_with_the_note() {
         rig.events_text()
     );
 }
+
+/// The sentence the way-on helper renders for every verification gate
+/// (GATE-04, U10): approve states the finish rule rather than a route chosen
+/// from the evidence the gate was opened over, reject runs `/gsd-quick` with
+/// the note, abort ends the run. The unit test
+/// `pipeline_outcomes::tests::every_gate_names_only_the_routes_its_answers_run`
+/// pins the helper to the routers; this copy pins what a live gate file says.
+const VERIFICATION_WAY_ON: &str = "Answers — approve: reads GSD's verification status again \
+     and finishes the run only on `passed` with a Validate pass on this commit over a clean \
+     tree, otherwise taking the route the fresh read names; reject with a note: runs \
+     `/gsd-quick` with the note, then Validate; abort: ends the run.";
+
+/// The answer files written under `rig`'s gates directory.
+fn response_files(rig: &FinishRig) -> Vec<String> {
+    fs::read_dir(devflow_core::gates::Gates::dir(&rig.root))
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.ends_with(".response.json"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// D-10, GATE-04: a supervise run whose GSD stub answers `passed` and whose
+/// Validate agent passes reaches a `clean_pass` gate whose context leads with
+/// the way-on sentence. A reject with a whitespace-only note is refused before
+/// anything is written: it exits non-zero, names the answers that apply,
+/// writes no response file, and the gate stays pending. That refused answer is
+/// the control, the same command with only the note changed. The reject with
+/// a note then exits 0 and prints the `/gsd-quick` route with the note, and the
+/// next Code prompt runs `/gsd-quick` with that note byte for byte: the
+/// printed route is the route run.
+#[test]
+fn a_validate_gate_names_the_route_its_reject_prints_and_runs() {
+    const NOTE: &str = "keep the --quiet alias and document it in the help";
+    let phase = PhaseId::new(94);
+    let rig = FinishRig::with_claude(phase, |dir| gap_loop_claude(dir, phase));
+    rig.stub_gsd(&always_passed());
+    let reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+    let reject = |note: &str| {
+        common::hermetic_devflow(&rig.home)
+            .args(["gate", "reject", &phase.to_string(), "--stage", "validate"])
+            .args(["--note", note])
+            .arg("--project")
+            .arg(&rig.root)
+            .output()
+            .expect("run devflow gate reject")
+    };
+
+    rig.start_in("supervise", &[]);
+    rig.wait_for_validate_gates(1);
+    let gate = rig.validate_gate();
+    assert_eq!(gate["gate_kind"], "clean_pass", "{gate}");
+    let context = gate["context"].as_str().unwrap_or_default();
+    assert!(
+        context.starts_with(VERIFICATION_WAY_ON),
+        "the gate leads with its way on: {context}"
+    );
+
+    let refused = reject(" \t ");
+    let refused_err = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        !refused.status.success(),
+        "a whitespace-only reject exits non-zero\nstdout: {}\nstderr: {refused_err}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    assert!(
+        refused_err.contains("refused") && refused_err.contains("devflow gate reject --note"),
+        "the refusal names the answers that apply: {refused_err}"
+    );
+    assert_eq!(
+        response_files(&rig),
+        Vec::<String>::new(),
+        "a refused reject writes no response file"
+    );
+    assert!(
+        rig.positions("gate_response_written").is_empty(),
+        "{}",
+        rig.events_text()
+    );
+    assert_eq!(
+        rig.validate_gate()["gate_id"],
+        gate["gate_id"],
+        "the gate stays pending"
+    );
+
+    let output = reject(NOTE);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "gate reject exits 0\nstdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("route: quick") && stdout.contains("`/gsd-quick`"),
+        "the reject prints the /gsd-quick route: {stdout}"
+    );
+    assert!(stdout.contains(NOTE), "the print carries the note: {stdout}");
+    rig.wait_for_validate_gates(2);
+    let prompts = logged_prompts(&rig);
+    let quick = prompts
+        .iter()
+        .find(|prompt| prompt.contains("/gsd-quick"))
+        .unwrap_or_else(|| panic!("a Code prompt runs /gsd-quick; prompts: {prompts:?}"));
+    assert!(quick.contains(NOTE), "the note, byte for byte: {quick}");
+
+    let abort = common::hermetic_devflow(&rig.home)
+        .args(["gate", "abort", &phase.to_string(), "--stage", "validate"])
+        .args(["--note", "test teardown"])
+        .arg("--project")
+        .arg(&rig.root)
+        .output()
+        .expect("run devflow gate abort");
+    assert!(abort.status.success(), "gate abort exits 0: {abort:?}");
+    assert!(
+        reaper.supervisors_exited_within(EXIT_WAIT),
+        "the aborted run's supervisors exit; events:\n{}",
+        rig.events_text()
+    );
+}
