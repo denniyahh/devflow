@@ -48,14 +48,11 @@ Thumbs.db
 # DevFlow own state (dogfooding) — per-phase since the 14a refactor
 .devflow/state.json
 .devflow/state-*.json
-.devflow/lock-*
 .devflow/phase-*-stdout
 .devflow/phase-*-stderr.log
 .devflow/phase-*-exit
 .devflow/phase-*-agent-pid
 .devflow/phase-*-monitor-stop
-.devflow/last-ship*.json
-.devflow/cron-instructions*.json
 .devflow/events.jsonl
 .devflow/gates/
 .devflow/history/

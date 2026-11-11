@@ -1,10 +1,10 @@
 # Architecture
 
-DevFlow is an opinionated CLI that drives a fixed 5-stage pipeline
-(Define → Plan → Code → Validate → Ship) end-to-end: it launches a coding
+DevFlow is an opinionated CLI that drives a fixed 3-stage pipeline
+(Plan → Code → Validate) end-to-end: it launches a coding
 agent per stage, evaluates whether the agent succeeded, fires human gates at
-Validate/Ship, and runs side-effecting hooks (branch/docs/changelog/version)
-at the mapped transitions. This document describes the implementation as it
+Validate, and ends the run when Validate passes, leaving the worktree and
+branch as Validate left them. This document describes the implementation as it
 actually exists; treat the named source files as the source of truth if this
 drifts.
 
@@ -14,7 +14,7 @@ DevFlow is a two-crate Cargo workspace (`Cargo.toml`):
 
 | Crate | Kind | Responsibility |
 |---|---|---|
-| `devflow-core` | Library (`crates/devflow-core`) | Stage machine, per-phase state, hooks, locking, events log, gate protocol, versioning, agent adapters, monitor daemon, worktrees, recovery. Returns structured data; no terminal formatting. |
+| `devflow-core` | Library (`crates/devflow-core`) | Stage machine, per-phase state, locking, events log, gate protocol, versioning, agent adapters, monitor daemon, worktrees, recovery. Returns structured data; no terminal formatting. |
 | `devflow-cli` | Binary (`crates/devflow-cli`) | Clap command parser and the user-facing `devflow` binary. Owns all printing and orchestration (`advance`, `transition`, `run_gate`); delegates primitives to `devflow-core`. |
 
 The split keeps workflow logic testable and independent of both the CLI surface
@@ -22,24 +22,22 @@ and any individual coding agent.
 
 ## The Stage machine
 
-The pipeline is a single linear chain of five stages
+The pipeline is a single linear chain of three stages
 (`crates/devflow-core/src/stage.rs`, `enum Stage`):
 
 ```
-Define → Plan → Code → Validate → Ship
+Plan → Code → Validate
 ```
 
-- `Stage::next()` defines the linear transitions; `Ship` is terminal
-  (`next()` returns `None`).
-- `Stage::is_agent_stage()` is true for `Define`, `Plan`, `Code` — these
+- `Stage::next()` defines the linear transitions; `Validate` is terminal
+  (`next()` returns `None`), and a passing Validate ends the run.
+- `Stage::is_agent_stage()` is true for `Plan` and `Code` — these
   launch a headless coding agent driven by a GSD slash command
-  (`Stage::gsd_command()`): `/gsd-discuss-phase {N}`, `/gsd-plan-phase {N}`,
-  `/gsd-execute-phase {N}`.
-- `Stage::is_gate()` is true for `Validate` and `Ship` — these may pause the
+  (`Stage::gsd_command()`): `/gsd-plan-phase {N}`, `/gsd-execute-phase {N}`.
+- `Stage::is_gate()` is true for `Validate` only — it may pause the
   workflow at a human gate (see [Gate protocol](#gate-protocol)) depending on
   the active `Mode`. Validate also launches an agent
-  (`/gsd-validate-phase {N}`) before its gate decision; Ship's agent step
-  (`/gsd-ship {N}`) is described in [Git and ship model](#git-and-ship-model).
+  (`/gsd-validate-phase {N}`) before its gate decision.
 - `State` (`crates/devflow-core/src/state.rs`) holds `stage`, `phase`,
   `agent`, `mode`, `gate_pending`, `consecutive_failures`, `project_root`,
   and an optional `worktree_path`. It is persisted per-phase — see
@@ -47,42 +45,10 @@ Define → Plan → Code → Validate → Ship
 - `crates/devflow-cli/src/main.rs`'s `advance()` function drives the
   machine: after an agent exits (or a gate resolves), it evaluates the
   result (see [Completion evaluation](#completion-evaluation)) and calls
-  `transition()` to move to the next stage, `handle_validate_outcome()` /
-  `handle_ship_outcome()` for the two gate stages, or
+  `transition()` to move to the next stage, `handle_validate_outcome()`
+  for the gate stage, or
   `handle_stage_failure()` for a never-silent failure gate (WR-11 — any
   non-Validate stage failure fires a gate rather than halting silently).
-
-## Hooks
-
-Creating/cleaning up branches, updating docs, appending the changelog, and
-bumping the version are **not** stages — they are side-effecting *hooks*
-that fire at specific stage transitions
-(`crates/devflow-core/src/hooks.rs`, `enum Hook`):
-
-| Hook | Effect |
-|---|---|
-| `BranchCreate` | Create `feature/phase-NN` from `develop` (`GitFlow::feature_start`) |
-| `BranchCleanup` | Delete the merged feature branch after Ship (non-force — never discards unmerged work) |
-| `DocsUpdate` | Run `cargo doc --no-deps` and commit any doc changes |
-| `ChangelogAppend` | Prepend a `CHANGELOG.md` entry for the computed version |
-| `VersionBump` | Compute the next version, write it to the version file, and tag `v{version}` |
-
-`hooks_for_transition(from, to)` maps a stage move to the hooks that should
-run; today the only non-empty mapping is `Validate → Ship`, which runs
-`DocsUpdate` + `ChangelogAppend` (docs/changelog are finalized before the
-Ship agent runs). `hooks_after_ship()` — `VersionBump` + `BranchCleanup` —
-fires once a human approves the Ship gate (`finish_workflow()`), not as a
-`hooks_for_transition` entry. Both hook batches run under the project-wide
-checkout lock (see [locking](#per-phase-state-and-locking)) and are
-individually fail-soft: a hook failure warns and the batch continues rather
-than aborting the workflow.
-
-`BranchCreate` is defined as a `Hook` variant but `hooks_for_transition`
-never returns it — branch/worktree creation for a phase actually happens
-directly in `start()` (`crates/devflow-cli/src/main.rs`) via
-`GitFlow::feature_start`/`feature_start_force` (branch-in-place mode) or
-`worktree::add` (the default, isolated-worktree mode), not through the hook
-dispatch table.
 
 ## Agent model
 
@@ -106,27 +72,21 @@ Agent backends are isolated behind a trait
   (surfaced by `devflow doctor`) — no stage-routing or launch logic consumes it
   yet. The signal is name-based (Pi has no `pi tools` command), not a
   tool-registry proof.
-- Prompts are built per-stage by `crate::prompt::stage_prompt(stage, phase)`
-  (or `stage_prompt_for_project` when the CLI applies project config),
+- Prompts are built per-stage by `crate::prompt::stage_prompt(stage, phase)`,
   not a single shared instruction template. Every prompt hands the agent its
   GSD slash command (`Stage::gsd_command()`) plus a `DEVFLOW_RESULT`
   completion contract (`DEVFLOW_RESULT: {"status": "success"}` /
   `{"status": "failed", "reason": "..."}`). Prompts using
   `COMPLETION_PROTOCOL` require that result as the last line of the agent's
-  final message, with any decision reasoning above it. Three stages get
+  final message, with any decision reasoning above it. Plan and Validate get
   dedicated prompts:
-  - **Define / Plan** — idempotent: if the stage's deliverable
-    (`CONTEXT.md` / `PLAN.md`) already exists, the agent reports success
+  - **Plan** — idempotent: if the stage's deliverable
+    (`PLAN.md`) already exists, the agent reports success
     without re-running the GSD command (headless Codex cannot answer GSD's
     interactive overwrite/append/cancel prompt).
   - **Validate** — REQUIRES a `verdict: "pass"` or `verdict: "gaps"` field
     distinct from `status`, so `advance()` can tell "the validation task
     ran" apart from "validation passed."
-  - **Ship** — runs `/gsd-code-review {N}` first; if `REVIEW.md` contains
-    any Critical-severity finding, the agent must NOT run `/gsd-ship {N}`
-    and instead reports a `review:`-prefixed failure (looped back to Code
-    with the audit-fix prompt, not gated as a crash). Only a clean review
-    proceeds to `/gsd-ship {N}`.
 
 ## Completion evaluation
 
@@ -150,9 +110,8 @@ four layers, tried in order:
    `feature/phase-NN` (`develop..feature/phase-NN`). `exit != 0` is always
    `Failed`, for every stage. On `exit == 0`, the "zero commits → failed"
    gate applies **only** to `Stage::Plan`/`Stage::Code` (checked explicitly,
-   not via `is_agent_stage()`, since that also includes `Define`, which
-   legitimately produces zero commits) — Define/Validate/Ship with
-   `exit == 0` succeed regardless of commit count; Validate's real pass
+   not via `is_agent_stage()`) — Validate with
+   `exit == 0` succeeds regardless of commit count; Validate's real pass
    signal is its `verdict`, not a commit count.
 3. **Layer 3 — process gone + commits exist (last resort).** If neither the
    marker nor the exit-code file is available, commit presence is used as a
@@ -161,8 +120,8 @@ four layers, tried in order:
 ## Per-phase state and locking
 
 State is per-phase (`crates/devflow-core/src/workflow.rs`): each active
-phase persists to `.devflow/state-{phase:02}.json`, so `devflow parallel`
-sibling phases never clobber one another. A single-slot
+phase persists to `.devflow/state-{phase:02}.json`, so phases running at
+the same time never clobber one another. A single-slot
 `.devflow/state.json` left by a pre-14a binary is not read, renamed or
 removed.
 
@@ -191,20 +150,9 @@ gate wait (D-08):
   few file operations at a time (at most `GATE_LOCK_WAIT`, 5 s) and is never
   removed.
 - **Foreground holder** (`.devflow/.holder-{phase:02}`, `liveness.rs`) — held for
-  its lifetime by a `start`/`resume` before its spawn, `devflow ship` or a hand-run
+  its lifetime by a `start`/`resume` before its spawn or a hand-run
   `devflow advance`, recording its pid and start time. It is the only pid
   `devflow stop` signals, and only when the holder's start time still matches.
-- **Project-wide checkout lock** (`.devflow/lock-project`,
-  `lock::acquire_project_blocking`, `crates/devflow-core/src/lock.rs`) — a coarse,
-  seconds-scale, file-based lock (`O_EXCL` create, PID written into the file,
-  stale-holder reclaim if the recorded PID is dead) that serializes mutations of
-  the shared primary checkout (hook batches) across concurrently finishing phases.
-  It must never be held across a gate wait; on timeout
-  (`DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS`, default 120s) the hook batch is
-  **skipped** (loudly, via `events.jsonl`) rather than ever run unserialized.
-
-A `.devflow/lock-{phase:02}` left by an older binary means nothing now and blocks
-nothing; `devflow recover --clean` removes it once the pid it names has exited.
 
 State and gate files are written through the durable helpers in
 `crates/devflow-core/src/durable.rs` (D-09), and a source scan
@@ -235,8 +183,7 @@ warns and returns — never aborts the workflow it records), and appends are a
 single `write_all` on an `O_APPEND` handle so concurrent phase monitors'
 lines interleave without tearing. The CLI emits events at every meaningful
 step — `workflow_started`, `advance_evaluated`, `transition`, `gate_fired`,
-`notify_fired`, `loop_back`, `hook_run`, `checkout_lock_timeout`,
-`workflow_finished`, `advance_failed` — so any frontend (Hermes plugin, a
+`notify_fired`, `loop_back`, `workflow_finished`, `advance_failed` — so any frontend (Hermes plugin, a
 future TUI/web UI) can observe a running loop by tailing one file instead of
 integrating with DevFlow internals. `devflow logs`/`status` read it via
 `last_events_by_phase()` (one read+parse pass over the whole log).
@@ -302,10 +249,9 @@ on with the time left. Either wait ends when a bound answer appears or
 `DEVFLOW_GATE_MAX_UNATTENDED_AGE_SECS` so `devflow gate sweep` cannot reap a
 gate this wait is still watching) elapses, and past that the run has ended at the
 gate. `devflow resume` then reruns the stage and asks again, reporting any unused
-answer it set aside; a stored Ship approval is applied without a rerun by
-`devflow ship`. `GateAction::from_response()` turns an
-approval into `Advance`, a rejection into `LoopBack(Code)`, or — when the
-rejection note contains "abort" — `Abort(reason)`. `devflow gate list`
+answer it set aside. `GateAction::from_response()` reads the answer's
+fields, never its note: `abort: true` is `Abort(reason)`, an approval is
+`Advance`, and any other rejection is `LoopBack(Code)`. `devflow gate list`
 (`Gates::list_open()`) enumerates requests with no answer bound to them yet,
 skipping unparsable entries rather than failing.
 
@@ -319,8 +265,8 @@ own process group that owns the agent**, for both launch shapes:
 - **capture** (`MonitorLaunch::Legacy`): the agent's stdin is `/dev/null` and
   its stdout and stderr go straight to the phase capture files (stderr is kept
   out of the stdout capture so it can never corrupt the `DEVFLOW_RESULT`
-  parse). Non-Claude adapters other than Antigravity, the legacy Claude launch
-  opt-out and a checkpoint resume use it.
+  parse). Adapters other than Claude and Antigravity, and a checkpoint resume,
+  use it.
 - **stream** (`MonitorLaunch::PipeOwning`): the supervisor owns the agent's
   stdin and stdout pipes, delivers the prompt as the first turn and applies the
   idle timeout. Claude and Antigravity `stream-json` launches use it.
@@ -349,7 +295,7 @@ The supervisor (`run_supervised_stage()`):
    reads, until the supervisor exits.
 5. On the agent's natural exit, runs the advance in-process. The phase is
    threaded in at spawn time, so the advance's identity never depends on a
-   shared state singleton — under `devflow parallel`, each phase's supervisor
+   shared state singleton — with several phases running, each phase's supervisor
    advances exactly its own stage. When the advance launches the next stage,
    that stage's supervisor publishes its socket before this one unlinks its
    own, so the hand-off leaves no gap with neither socket published.
@@ -367,68 +313,41 @@ Each agent gets an isolated working directory under
 `<project_root>/.worktrees/`, sharing the main repo's object database; state
 and capture files always live under the main `project_root` — only the
 agent's working directory moves. **Worktree isolation is the default**:
-`devflow start` creates a worktree unless `--no-worktree` is passed (the
-`--worktree` flag itself is a deprecated no-op kept for one release). This
+`devflow start` creates a worktree unless `--no-worktree` is passed. This
 backs:
 
 - `start` (default) — run a single phase in its own worktree;
   `--no-worktree` runs directly in the primary checkout instead.
-- `parallel` — run multiple phases concurrently, each in its own worktree.
-- `reference` — create or refresh a static snapshot worktree at
-  `.worktrees/reference/`.
 
-Branch integration uses `GitFlow::ensure_branch()` (create at a start point
-without checking out).
-
-## Git and ship model
+## Git model
 
 `crates/devflow-core/src/git.rs` (`GitFlow`) implements branch primitives:
 `feature_start(phase)`/`feature_start_force(phase)` (create
-`feature/phase-NN` from `develop`), `feature_finish(phase)` (merge into
-`develop` with `--no-ff` and delete), `push`, `has_remote`,
-`cleanup_merged`. `release_start`/`release_finish` also exist on `GitFlow`
-but are not called from any production CLI path today (only exercised in
-`git.rs`'s own tests) — cutting a `release/{version}` branch and opening a
-PR is not part of the current Ship flow.
+`feature/phase-NN` from `develop`), `push`, `has_remote`,
+`cleanup_merged`.
 
-The real Ship model is **gate-driven, not command-driven**: there is no
-standalone ship subcommand and no separate commands to finalize or undo a
-recorded ship — those do not exist in `enum Command`. Ship works like any
-other stage plus a mandatory terminal gate:
-
-1. `Validate → Ship` transition fires the `DocsUpdate` + `ChangelogAppend`
-   hooks, then launches the Ship agent with its dedicated prompt (code
-   review gate, then `/gsd-ship {N}` — see [Agent
-   model](#agent-model)). PR creation, if any, happens inside that GSD
-   command, not in DevFlow's own git primitives.
-2. When the Ship agent exits successfully, `handle_ship_outcome()` **always**
-   fires a Ship gate (`run_gate(..., Stage::Ship, "Ship complete — approve
-   merge?")`) — Ship is never auto-advanced past, regardless of `Mode`.
-3. A human answers via `devflow gate approve <phase> --stage ship [--note
-   ...]` or `devflow gate reject <phase> --note "..." [--stage ship]`
-   (`GateCmd::Approve`/`GateCmd::Reject`, `crates/devflow-cli/src/main.rs`).
-   Approval runs `finish_workflow()`: the `Merge`, `VersionBump`,
-   `ChangelogAppend` and `BranchCleanup` hooks, gate cleanup, and
-   `workflow::clear_state()`. A rejection loops
-   back to Code (or aborts, if the note contains "abort").
-4. A Ship-stage **agent crash** (vs. a review rejection) is routed through
-   the same never-silent gate path as any other stage failure
-   (`handle_stage_failure`) — WR-11: no non-Validate stage failure is ever
-   silent.
+DevFlow does not merge, open a pull request, bump a version, tag or delete a
+branch: there is no Ship stage. A passing Validate ends the run
+(`finish_run()`), leaving the worktree and `feature/phase-NN` as Validate left
+them; integrating the branch is the operator's step. `finish_run()` takes a
+`FinishPermit`, which only `can_finish` makes: GSD's fresh status is `passed`
+and the run's Validate agent PASS is recorded on the current commit over a
+clean tree (D-45, D-46). A permitted finish wins over a late `devflow stop`,
+which the supervisor answers `already_finished`.
 
 ## Configuration
 
 DevFlow has no initialization step. Workflow options remain CLI flags to
 `devflow start` (`crates/devflow-cli/src/main.rs`, `Command::Start`). An
 optional minimal `devflow.toml` contains only reliability knobs:
-`capture_retention`, `review_angles`, and `external_verify_enabled`.
+`capture_retention` and `external_verify_enabled`.
 
 | Flag | Purpose |
 |---|---|
 | `--phase N` | Phase number to work on |
 | `--agent claude\|codex\|opencode` | Agent to launch |
-| `--mode auto\|supervise` | `auto` gates only at Ship (plus never-silent failure gates); `supervise` also gates every Validate |
-| `--force` | Overwrite the feature branch if it already exists |
+| `--mode auto\|supervise` | `auto` runs unattended and finishes on a passing Validate (gating only on repeated Validate failure, plus never-silent failure gates); `supervise` also gates every Validate |
+| `--force` | Recreate the phase worktree and feature branch from the base if they exist; refused, with nothing removed, while the branch has commits not merged into the base |
 | `--no-worktree` | Run in the primary checkout instead of an isolated worktree |
 | `--dry-run` | Print the pipeline that would run without launching anything |
 
@@ -437,8 +356,8 @@ Runtime state lives under `.devflow/` (git-ignored), keyed per-phase —
 locking](#per-phase-state-and-locking)). Tunable *runtime behavior* (not
 workflow options) is read from environment variables —
 `DEVFLOW_GATE_NOTIFY_CMD`, `DEVFLOW_GATE_TIMEOUT_SECS`,
-`DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS`, `DEVFLOW_CAPTURE_RETENTION`,
-`DEVFLOW_REVIEW_ANGLES`, `DEVFLOW_EXTERNAL_VERIFY_ENABLED`, `RUST_LOG`,
+`DEVFLOW_CAPTURE_RETENTION`,
+`DEVFLOW_EXTERNAL_VERIFY_ENABLED`, `RUST_LOG`,
 `DEVFLOW_LOG_FORMAT` — see
 [OPERATIONS.md](OPERATIONS.md) for the full operator-facing reference.
 
@@ -452,7 +371,7 @@ for agent/system output and structured results.
 
 | Environment variable | Purpose | Default |
 |---|---|---|
-| `RUST_LOG` | Controls log verbosity via `tracing-subscriber::EnvFilter`. Accepts bare levels (`error`, `warn`, `info`, `debug`, `trace`) or targeted directives (`devflow_core=debug,devflow=info`). | `info` |
+| `RUST_LOG` | Controls log verbosity via `tracing-subscriber::EnvFilter`. Accepts bare levels (`error`, `warn`, `info`, `debug`, `trace`) or targeted directives (`devflow_core=debug,devflow=info`). Unset or empty prints no tracing lines. | `off` |
 | `DEVFLOW_LOG_FORMAT` | When set to `json`, enables JSON-structured log output (one JSON object per line on stderr). Any other value (or unset) produces human-readable plain-text logs. | plain text |
 
 ### Instrumentation
@@ -465,16 +384,11 @@ Key modules log via `tracing`'s `info!`/`warn!`/`debug!` macros:
 - **`workflow.rs`** — state I/O (`update_state`, `load_state`) logs at `DEBUG`;
   unreadable/corrupt state files warn at `WARN`
   rather than aborting a listing.
-- **`git.rs`** — branch operations (`feature_start`, `feature_finish`,
-  `tag`, `push`) log at `INFO`; checkout/rebase/commit operations log at
+- **`git.rs`** — branch operations (`feature_start`, `tag`, `push`) log at `INFO`; checkout/rebase/commit operations log at
   `DEBUG`; force operations log at `WARN`.
-- **`hooks.rs`** — each hook run logs its outcome at `INFO` (success) or
-  `WARN` (fail-soft failure, e.g. an unmerged branch left in place by
-  `BranchCleanup`).
 - **`gates.rs`** — gate writes/polls log at `INFO`/`DEBUG`; a failed or
   unspawnable notify command warns at `WARN` (fail-soft — never aborts
   `run_gate`).
-- **`lock.rs`** — reclaiming a stale (dead-holder) lock warns at `WARN`.
 - **`monitor.rs`** — agent spawn logs at `INFO`; PID/exit polling logs at
   `DEBUG`.
 
@@ -483,7 +397,7 @@ Key modules log via `tracing`'s `info!`/`warn!`/`debug!` macros:
 | Level | Usage |
 |---|---|
 | `ERROR` | Unrecoverable conditions that abort an operation. |
-| `WARN` | Recoverable anomalies (force operations, stale locks, fail-soft hook/notify failures). |
+| `WARN` | Recoverable anomalies (force operations, fail-soft notify failures). |
 | `INFO` | Stage transitions, agent lifecycle, branch/gate milestones. |
 | `DEBUG` | I/O details, merge/checkout operations, poll iterations. |
 | `TRACE` | Fine-grained execution tracing (rarely needed outside debugging). |
@@ -502,8 +416,9 @@ DEVFLOW_LOG_FORMAT=json RUST_LOG=info cargo run -- status 2>devflow.json
 head -1 devflow.json | python3 -m json.tool  # Should parse as valid JSON
 ```
 
-`devflow doctor` includes a `RUST_LOG` environment check that validates the
-variable is set to a parseable value and warns when it is missing or invalid.
+`devflow doctor` includes a `RUST_LOG` environment check: an unset or empty
+value is reported as information (tracing is off, and the row says how to turn
+it on), and a value that does not parse is a warning.
 
 ## Extension points — adding an agent
 

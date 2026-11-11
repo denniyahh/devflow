@@ -72,8 +72,14 @@ fn explicit_clean_with_a_registered_waiter_fails_and_cleans_nothing() {
     save_state_aged(root, phase, 60);
     let state_path = devflow_core::workflow::state_path(root, phase);
     let before = std::fs::read(&state_path).unwrap();
-    let (opened, registration) = Gates::open_registered(root, phase, Stage::Code, "waiting")
-        .expect("register as the gate's waiter");
+    let (opened, registration) = Gates::open_registered(
+        root,
+        phase,
+        Stage::Code,
+        devflow_core::gates::GateKind::StageFailure,
+        "waiting",
+    )
+    .expect("register as the gate's waiter");
     let gate_before = std::fs::read(&opened.path).unwrap();
 
     let output = recover_clean(root, Some(phase));
@@ -173,9 +179,14 @@ fn explicit_clean_with_an_unheld_registration_cleans() {
     init_repo(root);
     let phase = PhaseId::new(65);
     save_state_aged(root, phase, 60);
-    let (opened, registration) =
-        Gates::open_registered(root, phase, Stage::Code, "wedged at a crashed waiter")
-            .expect("register as the gate's waiter");
+    let (opened, registration) = Gates::open_registered(
+        root,
+        phase,
+        Stage::Code,
+        devflow_core::gates::GateKind::StageFailure,
+        "wedged at a crashed waiter",
+    )
+    .expect("register as the gate's waiter");
     let waiter = Gates::waiter_path(root, phase, Stage::Code, &opened.gate_id);
     drop(registration);
     assert!(waiter.exists(), "precondition: the crash leaves the file");
@@ -215,8 +226,14 @@ fn inspect_prints_why_a_phase_may_be_live() {
     let (waited, idle) = (PhaseId::new(73), PhaseId::new(74));
     save_state_aged(root, waited, 60);
     save_state_aged(root, idle, 60);
-    let (_opened, registration) = Gates::open_registered(root, waited, Stage::Code, "waiting")
-        .expect("register as the gate's waiter");
+    let (_opened, registration) = Gates::open_registered(
+        root,
+        waited,
+        Stage::Code,
+        devflow_core::gates::GateKind::StageFailure,
+        "waiting",
+    )
+    .expect("register as the gate's waiter");
     let home = common::HermeticHome::new();
 
     let output = common::hermetic_devflow(&home)
@@ -244,9 +261,15 @@ fn sweep_names_the_markers_it_removed_and_the_answers_it_kept() {
     let root = dir.path();
     init_repo(root);
     let phase = PhaseId::new(75);
-    let gate = Gates::open_gate(root, phase, Stage::Code, "ctx")
-        .unwrap()
-        .gate_id;
+    let gate = Gates::open_gate(
+        root,
+        phase,
+        Stage::Code,
+        devflow_core::gates::GateKind::StageFailure,
+        "ctx",
+    )
+    .unwrap()
+    .gate_id;
     Gates::answer(
         root,
         phase,
@@ -254,6 +277,7 @@ fn sweep_names_the_markers_it_removed_and_the_answers_it_kept() {
         &gate,
         &devflow_core::gates::GateResponse {
             approved: true,
+            abort: false,
             note: None,
             responded_by: Some("test".into()),
         },
@@ -319,6 +343,13 @@ fn explicit_clean_of_a_phase_with_nothing_to_clean_says_so() {
     assert!(
         !text.contains("cleaned up workflow state"),
         "a no-op clean must not claim a cleanup: {text}"
+    );
+    // The explicit clean names only what it looks for. There is no cron record
+    // to look for any more (D-01), so the no-op line does not claim one.
+    assert!(
+        text.lines()
+            .any(|line| line == "nothing to clean for phase 66: no workflow state or gate files"),
+        "the no-op line names exactly the state and gate files it looked for: {text}"
     );
 }
 
@@ -406,6 +437,7 @@ fn sweep_removes_and_names_orphan_gate_files() {
         root,
         phase,
         devflow_core::stage::Stage::Code,
+        devflow_core::gates::GateKind::StageFailure,
         "orphaned",
     )
     .unwrap();
@@ -423,64 +455,6 @@ fn sweep_removes_and_names_orphan_gate_files() {
         "a sweep that removed files must not say it cleaned nothing: {text}"
     );
     assert!(!gate.exists());
-}
-
-/// R-1: an orphan cron record is a cleanup the sweep must name, not an empty
-/// state sweep.
-#[test]
-fn sweep_removes_and_names_an_orphan_cron_record() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-    init_repo(root);
-    let phase = PhaseId::new(70);
-    let record = devflow_core::ship::build_single_agent_cron_instructions(root, phase, "");
-    devflow_core::ship::write_cron_instructions(root, &record).unwrap();
-    let record_path = devflow_core::ship::cron_instructions_path(root, phase);
-
-    let output = recover_clean(root, None);
-
-    let text = combined(&output);
-    assert!(output.status.success(), "sweep failed: {text}");
-    assert!(
-        !record_path.exists(),
-        "the valid orphan cron record must be removed"
-    );
-    assert!(
-        text.contains(&format!("phase {phase}"))
-            && text.contains("cron")
-            && text.contains("removed")
-            && !text.contains("no stale workflow state was cleaned"),
-        "a removed orphan cron record must be named as a cleanup, not an empty sweep: {text}"
-    );
-}
-
-/// A cron record still owned by a persisted state is neither removed nor
-/// reported as an orphan cleanup.
-#[test]
-fn sweep_keeps_a_cron_record_for_a_phase_that_still_has_state() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-    init_repo(root);
-    let phase = PhaseId::new(71);
-    save_state_aged(root, phase, 60);
-    let record = devflow_core::ship::build_single_agent_cron_instructions(root, phase, "");
-    devflow_core::ship::write_cron_instructions(root, &record).unwrap();
-    let record_path = devflow_core::ship::cron_instructions_path(root, phase);
-
-    let output = recover_clean(root, None);
-
-    let text = combined(&output);
-    assert!(output.status.success(), "sweep failed: {text}");
-    assert!(
-        record_path.exists(),
-        "a cron record still owned by state must be retained"
-    );
-    assert!(
-        !text
-            .lines()
-            .any(|line| line.contains("cron") && line.contains(&format!("phase {phase}"))),
-        "a retained cron record must not be reported as removed: {text}"
-    );
 }
 
 /// Phase 50 D-20: a `state.json` naming the phase is not that phase's state, so an

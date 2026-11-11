@@ -50,8 +50,8 @@ fn init_repo(root: &Path) {
     // Pre-baked GSD context for every phase these tests launch — the
     // fresh-codex pre-flight (13-06) refuses codex runs on phases with no
     // CONTEXT.md on develop, and these fixtures exercise phases 7–9 with
-    // both agents.
-    for phase in ["07", "08", "09"] {
+    // both agents and phases 11–13 and 44 with codex.
+    for phase in ["07", "08", "09", "11", "12", "13", "44"] {
         let dir = root.join(format!(".planning/phases/{phase}-test"));
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join(format!("{phase}-CONTEXT.md")), "ctx\n").unwrap();
@@ -92,51 +92,6 @@ fn path_with_fake_bin(fake_bin: &Path) -> String {
 }
 
 fn run_devflow(home: &common::HermeticHome, root: &Path, fake_bin: &Path, args: &[&str]) -> Output {
-    run_devflow_inner(home, root, fake_bin, args, false)
-}
-
-/// [`run_devflow`] with D-11's legacy-launch opt-out forced on for the spawned
-/// process.
-///
-/// **This is the integration-suite counterpart of 34-06's in-process
-/// `state.legacy_claude_launch = true`, and it exists for the same reason: to
-/// state a test's launch-path premise explicitly instead of inheriting it from
-/// `STREAM_JSON_STAGES` membership.** A test whose subject is `start`'s own
-/// behaviour — which branch it forks from, whether it creates a worktree, where
-/// a `--until` cap halts it — is orthogonal to the transport the stage's agent
-/// is launched over. Left implicit, that premise silently depends on the
-/// stage's ABSENCE from `STREAM_JSON_STAGES`, and 34-05's widening destroys it:
-/// `canary_gate` then invokes the real `ClaudeCanaryLauncher` at `Stage::Define`
-/// and the launch dies on a delivery refusal that has nothing to do with the
-/// subject under test.
-///
-/// The variable is read by `devflow_core::config::claude_legacy_launch()` inside
-/// the child, folded into the persisted `state.legacy_claude_launch` by
-/// `commands::start`'s `apply_legacy_launch_opt_out`, and therefore survives to
-/// every later stage the DETACHED monitor launches — which is what these tests
-/// need, since the monitor chain, not this process, runs Plan and beyond.
-///
-/// **Do NOT reach for this to silence a canary refusal in a test whose subject
-/// IS the stream path.** Pinning such a test to the legacy transport deletes the
-/// coverage rather than stabilising it; see
-/// `parallel_creates_two_worktrees_and_spawns_two_monitors`, which deliberately
-/// does not use this helper.
-fn run_devflow_legacy_launch(
-    home: &common::HermeticHome,
-    root: &Path,
-    fake_bin: &Path,
-    args: &[&str],
-) -> Output {
-    run_devflow_inner(home, root, fake_bin, args, true)
-}
-
-fn run_devflow_inner(
-    home: &common::HermeticHome,
-    root: &Path,
-    fake_bin: &Path,
-    args: &[&str],
-    legacy_launch: bool,
-) -> Output {
     let mut command = common::hermetic_devflow(home);
     command
         .args(args)
@@ -144,11 +99,8 @@ fn run_devflow_inner(
         .env("PATH", path_with_fake_bin(fake_bin))
         .env("DEVFLOW_TEST_ROOT", root)
         .current_dir(root);
-    if legacy_launch {
-        command.env("DEVFLOW_CLAUDE_LEGACY_LAUNCH", "true");
-    }
     // HYG-01: bound the gate wait on the CHILD's env. Supervise-mode stages
-    // that reach a gate (never-silent Define/Plan failures, Validate in
+    // that reach a gate (never-silent Plan/Code failures, Validate in
     // supervise) block `devflow advance` for the default 3-day gate timeout;
     // the sh monitor reaps cleanly but its advance child — spawned as the
     // script's last line — is orphaned and keeps polling. The tests finish
@@ -233,8 +185,8 @@ fn wait_for_pid(path: &Path) -> u32 {
     panic!("timed out waiting for a pid in {}", path.display());
 }
 
-/// Wait until a phase's persisted state is cleared (the pipeline reached
-/// Ship and `finish_workflow` called `clear_state`). 20b's new liveness
+/// Wait until a phase's persisted state is cleared (the run was aborted and
+/// `abort` called `clear_state`). 20b's new liveness
 /// guard in `cleanup` correctly refuses to remove a worktree whose monitor
 /// is still actively driving stages (`BetweenStages`/`Healthy`) — fixtures
 /// that call `cleanup` must first wait for the phase to actually finish,
@@ -274,155 +226,35 @@ fn seed_feature_branch(root: &Path, phase: PhaseId) {
 }
 
 #[test]
-fn parallel_creates_two_worktrees_and_spawns_two_monitors() {
-    let home = common::HermeticHome::new();
-    let repo = tempfile::tempdir().unwrap();
-    let root = repo.path();
-    init_repo(root);
-    // 34-06b: this test does NOT take D-11's legacy opt-out, and that is the
-    // whole point of it. It is the multi-plan wave test, and the D-15 delivery
-    // canary exists precisely to guarantee that a concurrent wave does not
-    // silently orphan its dispatched work (999.64). Pinning it to the legacy
-    // single-document transport would make the wave it covers the one shape the
-    // canary is not protecting — deleting the coverage instead of stabilising
-    // it, which is the "repaired by the wrong mechanism" failure 34-06 declined
-    // to commit on this test's behalf.
-    //
-    // So the canary outcome is STUBBED rather than bypassed, through the seam
-    // this suite already has across the process boundary: the fake `claude` on
-    // PATH. The script below is the one
-    // `reference_and_cleanup_worktree_cli_flow` already uses — it models a CLI
-    // that DOES deliver the planted token back inside a top-level `result`
-    // event, so `run_delivery_canary` reaches a deterministic `Confirmed`
-    // without any real agent invocation, and every step of the guard it is
-    // meant to exercise (declare, plant, capture, trust-decide) actually runs.
-    // No production code has a test-only escape hatch added for this.
-    //
-    // `read -r turn` takes exactly one line and returns: the monitor writes the
-    // user turn followed by a newline, and blocking on full EOF would hang
-    // against a pipe deliberately held open past the first turn. On the legacy
-    // stages stdin is `/dev/null`, so the read yields nothing and the ordinary
-    // marker branch runs, exactly as before this change — which is why phase 7
-    // behaves identically under the committed `&[Stage::Code]` constant and
-    // under 34-05's widening.
-    let fake_bin = fake_bin_dir(&[
-        (
-            "claude",
-            r#"#!/bin/sh
-read -r turn
-case "$turn" in
-  *DEVFLOW_DELIVERY_CANARY_*)
-    token=$(printf '%s' "$turn" | grep -o 'DEVFLOW_DELIVERY_CANARY_[0-9a-f]*' | head -1)
-    printf '{"type":"result","subtype":"success","is_error":false,"session_id":"s-fake","result":"%s"}\n' "$token"
-    ;;
-  *)
-    printf 'fake claude\nDEVFLOW_RESULT: {"status":"success"}\n'
-    ;;
-esac
-"#,
-        ),
-        (
-            "codex",
-            "#!/bin/sh\nprintf 'fake codex\\nDEVFLOW_RESULT: {\"status\":\"success\"}\\n'\n",
-        ),
-    ]);
-
-    // `--mode supervise` (35.1-03): phase 8 runs on `codex`, and
-    // `preflight_unattended_launch_check`'s C2 refuses a `Mode::Auto` launch on
-    // any agent that cannot host the chain-flag guard — the guard binds inside
-    // the pipe-owning monitor, which is the Claude stream path only. This
-    // test's subject is two worktrees and two monitors, which is
-    // mode-independent; the agent diversity is the point and is preserved.
-    let output = run_devflow(
-        &home,
-        root,
-        &fake_bin.path,
-        &[
-            "parallel",
-            "--phases",
-            "7,8",
-            "--agents",
-            "claude,codex",
-            "--mode",
-            "supervise",
-        ],
-    );
-    let _reaper7 = common::LaunchedRunReaper::new(root, PhaseId::new(7), Vec::new());
-    let _reaper8 = common::LaunchedRunReaper::new(root, PhaseId::new(8), Vec::new());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("phase 7"));
-    assert!(stdout.contains("phase 8"));
-
-    assert!(root.join(".worktrees/phase-07").is_dir());
-    assert!(root.join(".worktrees/phase-08").is_dir());
-
-    let phase7_pid = root.join(".devflow/phase-07-agent-pid");
-    let phase8_pid = root.join(".devflow/phase-08-agent-pid");
-    assert!(wait_for_pid(&phase7_pid) > 0);
-    assert!(wait_for_pid(&phase8_pid) > 0);
-
-    let phase7_stdout = root.join(".devflow/phase-07-stdout");
-    let phase8_stdout = root.join(".devflow/phase-08-stdout");
-    // WR-03: assert each capture immediately after the `wait_for` call that
-    // established it, not after both waits complete. Same mechanism as
-    // `wait_for_pid` above: each stage transition's `archive_phase_files`
-    // briefly deletes the capture before the next monitor recreates it. A
-    // combined assertion placed after both `wait_for` calls is still racy —
-    // the second `wait_for`'s own polling loop gives a fast monitor enough
-    // time to archive the first capture in the interim (observed directly:
-    // this exact ordering flaked at run 15/25 during 18-02 verification).
-    // Asserting inside each capture's own wait window closes that gap.
-    wait_for(&phase7_stdout);
-    assert!(phase7_stdout.exists());
-    wait_for(&phase8_stdout);
-    assert!(phase8_stdout.exists());
-
-    // 13-DEFERRED-CR-03: each parallel phase persists its own state file —
-    // the second start no longer clobbers the first phase's state.
-    let state7 = devflow_core::workflow::load_state(root, PhaseId::new(7)).expect("phase 7 state");
-    let state8 = devflow_core::workflow::load_state(root, PhaseId::new(8)).expect("phase 8 state");
-    assert_eq!(state7.phase, PhaseId::new(7));
-    assert_eq!(state8.phase, PhaseId::new(8));
-    assert!(
-        !root.join(".devflow/state.json").exists(),
-        "legacy single-slot state.json must not be written anymore"
-    );
-
-    // HYG-01: both parallel monitors are this test's to reap.
-    let _reap7 = MonitorReapGuard::after_launch(&state7);
-    let _reap8 = MonitorReapGuard::after_launch(&state8);
-}
-
-#[test]
 fn start_defaults_to_worktree() {
     let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
     let fake_bin = fake_bin_dir(&[(
-        "claude",
+        "codex",
         "#!/bin/sh\nprintf 'DEVFLOW_RESULT: {\"status\":\"success\"}\\n'\n",
     )]);
 
     // No worktree flag at all — worktree-by-default (13d) means this must
     // create the isolated worktree without an explicit opt-in.
     //
-    // Legacy launch pinned deliberately (34-06b): the subject is where `start`
-    // puts the phase, not which transport its agent is launched over. See
-    // `run_devflow_legacy_launch`.
-    run_devflow_legacy_launch(
+    // A capture-shape agent (codex) pinned deliberately (34-06b): the subject
+    // is where `start` puts the phase, not which transport its agent is
+    // launched over.
+    run_devflow(
         &home,
         root,
         &fake_bin.path,
         &[
-            // `supervise` (35.1-03): the legacy opt-out pinned above is
+            // `supervise` (35.1-03): the capture shape pinned above is
             // exactly what C2 refuses in `Mode::Auto`, and where `start` puts
             // the phase is mode-independent.
             "start",
             "--phase",
             "11",
             "--agent",
-            "claude",
+            "codex",
             "--mode",
             "supervise",
         ],
@@ -478,7 +310,7 @@ fn start_worktree_mode_ignores_main_checkout_divergence() {
     git(root, &["checkout", "-q", "ancient"]);
 
     let fake_bin = fake_bin_dir(&[(
-        "claude",
+        "codex",
         "#!/bin/sh\nprintf 'DEVFLOW_RESULT: {\"status\":\"success\"}\\n'\n",
     )]);
 
@@ -486,22 +318,21 @@ fn start_worktree_mode_ignores_main_checkout_divergence() {
     // succeed (the helper asserts a zero exit status) despite the main
     // checkout being 51 commits behind develop.
     //
-    // Legacy launch pinned deliberately (34-06b): the subject is the
-    // divergence check's scope, not the launch transport. See
-    // `run_devflow_legacy_launch`.
-    run_devflow_legacy_launch(
+    // A capture-shape agent (codex) pinned deliberately (34-06b): the subject
+    // is the divergence check's scope, not the launch transport.
+    run_devflow(
         &home,
         root,
         &fake_bin.path,
         &[
             // `supervise` (35.1-03): same reason as phase 11 above — the
-            // legacy opt-out is refused in `Mode::Auto`, and this test's
+            // capture shape is refused in `Mode::Auto`, and this test's
             // subject (main-checkout divergence) is mode-independent.
             "start",
             "--phase",
             "13",
             "--agent",
-            "claude",
+            "codex",
             "--mode",
             "supervise",
         ],
@@ -524,14 +355,14 @@ fn start_no_worktree_uses_feature_branch() {
     let root = repo.path();
     init_repo(root);
     let fake_bin = fake_bin_dir(&[(
-        "claude",
+        "codex",
         "#!/bin/sh\nprintf 'DEVFLOW_RESULT: {\"status\":\"success\"}\\n'\n",
     )]);
 
-    // Legacy launch pinned deliberately (34-06b): the subject is that
-    // `--no-worktree` keeps the phase on its feature branch, not which
-    // transport its agent is launched over. See `run_devflow_legacy_launch`.
-    run_devflow_legacy_launch(
+    // A capture-shape agent (codex) pinned deliberately (34-06b): the subject
+    // is that `--no-worktree` keeps the phase on its feature branch, not which
+    // transport its agent is launched over.
+    run_devflow(
         &home,
         root,
         &fake_bin.path,
@@ -540,9 +371,9 @@ fn start_no_worktree_uses_feature_branch() {
             "--phase",
             "12",
             "--agent",
-            "claude",
-            // `supervise` (35.1-03): same reason as phase 11 — the legacy
-            // opt-out pinned above is refused in `Mode::Auto`, and
+            "codex",
+            // `supervise` (35.1-03): same reason as phase 11 — the capture
+            // shape pinned above is refused in `Mode::Auto`, and
             // `--no-worktree`'s branch placement is mode-independent.
             "--mode",
             "supervise",
@@ -569,12 +400,13 @@ fn start_no_worktree_uses_feature_branch() {
 }
 
 /// 20c (D-09 + review: Codex HIGH off-by-one): `devflow start --until plan`
-/// must run Define AND Plan to completion, then halt BEFORE advancing to
-/// Code — not stop before Plan ever runs. The fake `claude` script always
-/// reports success, so the monitor chain runs Define→advance→Plan→advance;
-/// the second `advance` calls `transition(.., Stage::Code)` with
-/// `state.stage == Plan`, which is exactly the `stop_until == Some(from)`
-/// case this plan adds.
+/// must run Plan, the first stage, to completion, then halt BEFORE advancing
+/// to Code — not stop before Plan ever runs. The fake agent always reports
+/// success, so the monitor chain runs Plan→advance; that `advance` calls
+/// `transition(.., Stage::Code)` with `state.stage == Plan`, which is exactly
+/// the `stop_until == Some(from)` case this plan adds. A fresh run already
+/// sits at Plan, so the persisted stage alone cannot show Plan ran: the
+/// `stage_launched` event for Plan does.
 #[test]
 fn start_until_plan_halts_cleanly() {
     let home = common::HermeticHome::new();
@@ -582,28 +414,27 @@ fn start_until_plan_halts_cleanly() {
     let root = repo.path();
     init_repo(root);
     let fake_bin = fake_bin_dir(&[(
-        "claude",
+        "codex",
         "#!/bin/sh\nprintf 'DEVFLOW_RESULT: {\"status\":\"success\"}\\n'\n",
     )]);
 
-    // Legacy launch pinned deliberately (34-06b): the subject is WHERE the
-    // `--until` cap halts the stage machine, not which transport each stage's
-    // agent is launched over. The opt-out reaches Plan too — it is persisted
-    // into `state.legacy_claude_launch` by `start`, so the detached monitor
-    // that launches Plan reads it back. See `run_devflow_legacy_launch`.
-    run_devflow_legacy_launch(
+    // A capture-shape agent (codex) pinned deliberately (34-06b): the subject
+    // is WHERE the `--until` cap halts the stage machine, not which transport
+    // each stage's agent is launched over. Codex launches every stage, Plan
+    // included, in the capture shape.
+    run_devflow(
         &home,
         root,
         &fake_bin.path,
         &[
             // `supervise` (35.1-03): same reason as phase 11 above — the
-            // legacy opt-out is refused in `Mode::Auto`, and the `--until` cap
+            // capture shape is refused in `Mode::Auto`, and the `--until` cap
             // halts at Plan, well before supervise's Validate gate.
             "start",
             "--phase",
             "44",
             "--agent",
-            "claude",
+            "codex",
             "--mode",
             "supervise",
             "--until",
@@ -613,6 +444,13 @@ fn start_until_plan_halts_cleanly() {
     let _reaper = common::LaunchedRunReaper::new(root, PhaseId::new(44), Vec::new());
 
     let state = wait_for_stopped(root, PhaseId::new(44));
+    let events = fs::read_to_string(devflow_core::events::events_path(root)).unwrap_or_default();
+    assert!(
+        events
+            .lines()
+            .any(|line| line.contains("\"stage_launched\"") && line.contains("\"stage\":\"plan\"")),
+        "Plan must have launched before the halt\nevents:\n{events}"
+    );
     assert_eq!(
         state.stage,
         devflow_core::stage::Stage::Plan,
@@ -634,44 +472,84 @@ fn start_until_plan_halts_cleanly() {
     let _reap = MonitorReapGuard::after_launch(&state);
 }
 
-/// 20c (D-07): `--until ship` is a semantic no-op — Ship never calls
-/// `transition` (`handle_ship_outcome` calls `finish_workflow` directly), so
-/// the full pipeline already stops there today. It must be rejected before
-/// any stage runs, not silently accepted as if it intercepted anything.
+/// `--until` values for stages v4.0 removed (D-07), in every case spelling. Later cut
+/// plans append to this list.
+/// Split so the removed-surface scan does not read this control as a leftover.
+const REMOVED_UNTIL_STAGES: &[&str] = &[
+    concat!("sh", "ip"),
+    "Ship",
+    "SHIP",
+    concat!("def", "ine"),
+    "Define",
+    "DEFINE",
+];
+
+/// D-07 (CUT-01, CUT-02): the Ship and Define stages are gone, so no case spelling of
+/// `--until ship` or `--until define` is a stage value, and clap refuses each as an
+/// invalid value before `start` is dispatched. Control in the same test: every kept
+/// stage `--until` accepts still parses, and the dry run exits 0. The accepted values
+/// follow one case rule: whatever the parser does with `PLAN`, it does with `CODE` and
+/// `VALIDATE` too.
 #[test]
-fn start_until_ship_is_rejected() {
+fn until_rejects_removed_stages() {
     let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
-    let fake_bin = fake_bin_dir(&[(
-        "claude",
-        "#!/bin/sh\nprintf 'DEVFLOW_RESULT: {\"status\":\"success\"}\\n'\n",
-    )]);
+    let fake_bin = fake_bin_dir(&[]);
+    let dry_run_until = |stage: &str| {
+        common::hermetic_devflow(&home)
+            .args([
+                "start",
+                "--phase",
+                "1",
+                "--agent",
+                "claude",
+                "--mode",
+                "auto",
+                "--until",
+                stage,
+                "--dry-run",
+            ])
+            .arg(root)
+            .env("PATH", path_with_fake_bin(&fake_bin.path))
+            .current_dir(root)
+            .output()
+            .expect("run devflow")
+    };
 
-    let output = common::hermetic_devflow(&home)
-        .args([
-            "start", "--phase", "45", "--agent", "claude", "--mode", "auto", "--until", "ship",
-        ])
-        .arg(root)
-        .env("PATH", path_with_fake_bin(&fake_bin.path))
-        .current_dir(root)
-        .output()
-        .expect("run devflow");
-
-    assert!(
-        !output.status.success(),
-        "--until ship must be rejected, not silently accepted"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("ship") && stderr.contains("no-op"),
-        "the rejection must explain Ship is already terminal\nstderr: {stderr}"
-    );
-    assert!(
-        !root.join(".worktrees/phase-45").exists(),
-        "a rejected --until ship must not run any stage or create a worktree"
-    );
+    for removed in REMOVED_UNTIL_STAGES {
+        let output = dry_run_until(removed);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "--until {removed} must be rejected\nstderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("invalid value"),
+            "clap must refuse --until {removed} as an invalid value\nstderr: {stderr}"
+        );
+    }
+    for kept in ["plan", "code", "validate"] {
+        let output = dry_run_until(kept);
+        assert!(
+            output.status.success(),
+            "--until {kept} must be accepted\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let upper_plan_accepted = dry_run_until("PLAN").status.success();
+    for upper in ["CODE", "VALIDATE"] {
+        let output = dry_run_until(upper);
+        assert_eq!(
+            output.status.success(),
+            upper_plan_accepted,
+            "--until {upper} must follow the case rule `PLAN` follows (accepted: \
+             {upper_plan_accepted})\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert!(!root.join(".worktrees/phase-1").exists());
 }
 
 /// 20c edge-probe (20c/empty): `--until bogus` needs no new parsing surface —
@@ -710,8 +588,374 @@ fn start_until_unknown_stage_is_rejected_by_clap() {
     assert!(!root.join(".worktrees/phase-46").exists());
 }
 
+/// Subcommands v4.0 removed (D-01). Later cut plans append to this list.
+const REMOVED_SUBCOMMANDS: &[&str] = &[
+    "list",
+    "reference",
+    "test",
+    "release",
+    "parallel",
+    // Split so the removed-surface scan does not read this control as a leftover.
+    concat!("sh", "ip"),
+    "evidence",
+];
+
+/// The subcommand names listed under `Commands:` in a `devflow --help` output.
+fn help_subcommand_names(help: &str) -> Vec<&str> {
+    help.lines()
+        .skip_while(|line| line.trim_end() != "Commands:")
+        .skip(1)
+        .take_while(|line| !line.trim().is_empty())
+        .filter_map(|line| line.split_whitespace().next())
+        .collect()
+}
+
+/// A removed subcommand fails loudly as an unknown verb instead of running
+/// something else, and `--help` no longer lists it. `status` is the control:
+/// the same checks must see a verb that still exists.
+#[test]
+fn removed_subcommands_are_unknown() {
+    let home = common::HermeticHome::new();
+    let scratch = tempfile::tempdir().unwrap();
+
+    let help = common::hermetic_devflow(&home)
+        .arg("--help")
+        .current_dir(scratch.path())
+        .output()
+        .expect("run devflow --help");
+    assert!(help.status.success());
+    let help = String::from_utf8_lossy(&help.stdout);
+    let names = help_subcommand_names(&help);
+    assert!(
+        names.contains(&"status"),
+        "control: the help parser must find `status`\n{help}"
+    );
+
+    for verb in REMOVED_SUBCOMMANDS {
+        let output = common::hermetic_devflow(&home)
+            .arg(verb)
+            .current_dir(scratch.path())
+            .output()
+            .expect("run devflow");
+        assert!(
+            !output.status.success(),
+            "`devflow {verb}` must be rejected"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("unrecognized subcommand"),
+            "`devflow {verb}` must be rejected by clap as unknown\nstderr: {stderr}"
+        );
+        assert!(
+            !names.contains(verb),
+            "`devflow --help` still lists `{verb}`\n{help}"
+        );
+    }
+
+    let status = common::hermetic_devflow(&home)
+        .args(["status", "--help"])
+        .current_dir(scratch.path())
+        .output()
+        .expect("run devflow status --help");
+    assert!(
+        status.status.success(),
+        "control: `devflow status --help` must still succeed\nstderr: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+}
+
+/// Flag and argument forms v4.0 removed (D-01), each paired with the token
+/// clap must name as unexpected. Naming the token matters: before the removal
+/// `start --phase 1 --worktree x --dry-run` was already refused, for its missing
+/// `--mode`. Later cut plans append to this list.
+const REMOVED_FLAG_INVOCATIONS: &[(&[&str], &str)] = &[
+    (
+        &["start", "--phase", "1", "--worktree", "x", "--dry-run"],
+        "--worktree",
+    ),
+    (&["gate", "approve", "1", "code"], "code"),
+    (&["gate", "reject", "1", "code", "--note", "n"], "code"),
+    // `--dry-run` keeps this safe against a binary that still has the flag: a
+    // real pass on the hermetic builder would treat every 2.x-shaped process
+    // on the machine as a stray.
+    // Split so the removed-surface scan does not read this control as a leftover.
+    (
+        &["gate", "sweep", concat!("--reap", "-strays"), "--dry-run"],
+        concat!("--reap", "-strays"),
+    ),
+    // `--dry-run` keeps the start invocation from launching anything against
+    // a binary that still accepts the flag; the resume one runs in an empty
+    // scratch directory with no run to resume.
+    (
+        &[
+            "start",
+            "--phase",
+            "1",
+            concat!("--legacy-claude", "-launch"),
+            "--dry-run",
+        ],
+        concat!("--legacy-claude", "-launch"),
+    ),
+    (
+        &[
+            "resume",
+            "--phase",
+            "1",
+            concat!("--legacy-claude", "-launch"),
+        ],
+        concat!("--legacy-claude", "-launch"),
+    ),
+    (
+        &[
+            "start",
+            "--phase",
+            "1",
+            concat!("--yes", "-ship"),
+            "--dry-run",
+        ],
+        concat!("--yes", "-ship"),
+    ),
+];
+
+/// A removed flag or positional argument is refused by clap as unexpected
+/// instead of being accepted and ignored. `gate approve --help` is the
+/// control: the subcommand that lost its positional stage still parses.
+#[test]
+fn removed_flags_are_unknown() {
+    let home = common::HermeticHome::new();
+    let scratch = tempfile::tempdir().unwrap();
+
+    for (args, token) in REMOVED_FLAG_INVOCATIONS {
+        let output = common::hermetic_devflow(&home)
+            .args(*args)
+            .current_dir(scratch.path())
+            .output()
+            .expect("run devflow");
+        assert!(
+            !output.status.success(),
+            "`devflow {}` must be rejected",
+            args.join(" ")
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let expected = format!("unexpected argument '{token}'");
+        assert!(
+            stderr.contains(&expected),
+            "`devflow {}` must be rejected by clap with {expected:?}\nstderr: {stderr}",
+            args.join(" ")
+        );
+    }
+
+    let help = common::hermetic_devflow(&home)
+        .args(["gate", "approve", "--help"])
+        .current_dir(scratch.path())
+        .output()
+        .expect("run devflow gate approve --help");
+    assert!(
+        help.status.success(),
+        "control: `devflow gate approve --help` must still succeed\nstderr: {}",
+        String::from_utf8_lossy(&help.stderr)
+    );
+}
+
+/// The stage names a `start --dry-run` preview lists, in order: the first word of each line
+/// indented by exactly two spaces between the `stage pipeline:` header and the next blank line.
+/// Deeper-indented continuation lines (3.0.0's `↳ hooks:`) are not stage lines.
+fn dry_run_stage_names(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .skip_while(|line| line.trim() != "stage pipeline:")
+        .skip(1)
+        .take_while(|line| !line.trim().is_empty())
+        .filter(|line| line.starts_with("  ") && !line[2..].starts_with(' '))
+        .filter_map(|line| line.split_whitespace().next().map(str::to_string))
+        .collect()
+}
+
+/// `None` when the preview lists exactly `expected`, in order; otherwise what it listed.
+fn dry_run_stage_mismatch(stdout: &str, expected: &[&str]) -> Option<String> {
+    let listed = dry_run_stage_names(stdout);
+    (listed != expected).then(|| format!("listed {listed:?}, expected {expected:?}"))
+}
+
+/// What 3.0.0 printed for `devflow start --dry-run --phase 52 --mode supervise`, copied from
+/// `52-RUN-NOTES.md` (Run 2): a Define first line and a Ship last line. The hook names are
+/// split so the removed-surface scan does not read this control as a leftover.
+const DRY_RUN_3_0_0: &str = concat!(
+    "dry run — phase 52 | agent claude | mode supervise
+
+stage pipeline:
+  define /gsd-discuss-phase 52
+  plan /gsd-plan-phase 52
+  code /gsd-execute-phase 52
+  validate /gsd-validate-phase 52 [GATE]
+            ↳ hooks: [Docs",
+    "Update]
+  ship /gsd-ship 52 [GATE]
+
+ship gate: not pre-authorized
+
+after ship: [Merge, Version",
+    "Bump, Changelog",
+    "Append, Branch",
+    "Cleanup]
+"
+);
+
+/// CUT-01: a fresh run starts at Plan, so the dry run lists exactly plan, code and validate, in
+/// that order and nothing else. The comparison is checked against three outputs it must refuse:
+/// an empty preview, one missing a stage, and the 3.0.0 preview with Define and Ship.
+#[test]
+fn start_dry_run_lists_exactly_plan_code_validate() {
+    const EXPECTED: &[&str] = &["plan", "code", "validate"];
+
+    // Controls: the comparison must report each of these as a mismatch.
+    assert!(
+        dry_run_stage_mismatch("", EXPECTED).is_some(),
+        "control: an empty dry run must not compare equal"
+    );
+    let two_stages = "dry run — phase 1 | agent claude | mode supervise\n\nstage pipeline:\n  \
+                      plan /gsd-plan-phase 1\n  code /gsd-execute-phase 1\n";
+    assert!(
+        dry_run_stage_mismatch(two_stages, EXPECTED).is_some(),
+        "control: a dry run missing validate must not compare equal"
+    );
+    assert_eq!(
+        dry_run_stage_names(DRY_RUN_3_0_0),
+        // Split so the removed-surface scan does not read this control as a leftover.
+        [
+            concat!("def", "ine"),
+            "plan",
+            "code",
+            "validate",
+            concat!("sh", "ip")
+        ],
+        "control: the extraction must read every stage line of the 3.0.0 preview"
+    );
+    assert!(
+        dry_run_stage_mismatch(DRY_RUN_3_0_0, EXPECTED).is_some(),
+        "control: the 3.0.0 dry run (define … ship) must not compare equal"
+    );
+
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let fake_bin = fake_bin_dir(&[]);
+
+    let output = common::hermetic_devflow(&home)
+        .args(["start", "--dry-run", "--phase", "1", "--mode", "supervise"])
+        .arg(root)
+        .env("PATH", path_with_fake_bin(&fake_bin.path))
+        .current_dir(root)
+        .output()
+        .expect("run devflow");
+
+    assert!(
+        output.status.success(),
+        "dry-run must not fail\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        dry_run_stage_mismatch(&stdout, EXPECTED),
+        None,
+        "the dry run must list exactly plan, code, validate\nstdout: {stdout}"
+    );
+}
+
+/// OPS-02 / D-35: `devflow start` says when it replaces a phase's existing state,
+/// naming which: a finished run, a stopped run with its stop reason, or a state
+/// file that does not load. `--dry-run` reaches the point where `start` loads the
+/// state. Control: with no prior state, no replace line.
+#[test]
+fn start_says_when_it_replaces_a_finished_or_stale_state() {
+    const FINISHED: &str = "replaces the state of a finished run";
+    const STOPPED: &str = "replaces the state of a stopped run";
+    const UNREADABLE: &str = "replaces an unreadable state";
+    /// What a case writes before the dry run: a prior state, or nothing.
+    type Prior<'a> = Option<&'a dyn Fn(&Path, PhaseId)>;
+    let dry_run = |prior: Prior| -> String {
+        let home = common::HermeticHome::new();
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        init_repo(root);
+        let phase = PhaseId::new(7);
+        if let Some(prior) = prior {
+            prior(root, phase);
+        }
+        let fake_bin = fake_bin_dir(&[]);
+        let output = common::hermetic_devflow(&home)
+            .args(["start", "--dry-run", "--phase", "7", "--mode", "supervise"])
+            .arg(root)
+            .env("PATH", path_with_fake_bin(&fake_bin.path))
+            .current_dir(root)
+            .output()
+            .expect("run devflow");
+        let text = String::from_utf8_lossy(&output.stdout).to_string()
+            + &String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "dry run must not fail: {text}");
+        text
+    };
+    let saved = |shape: fn(&mut devflow_core::state::State)| {
+        move |root: &Path, phase: PhaseId| {
+            let mut state = devflow_core::state::State::new(
+                phase,
+                devflow_core::state::AgentKind::Claude,
+                devflow_core::mode::Mode::Supervise,
+                root.to_path_buf(),
+            );
+            shape(&mut state);
+            devflow_core::workflow::save_state(&state).unwrap();
+        }
+    };
+
+    let finished = saved(|state| {
+        state.stopped = true;
+        state.finished = true;
+        state.stop_reason = Some(FINISHED_REASON.to_string());
+    });
+    let text = dry_run(Some(&finished));
+    assert!(text.contains(FINISHED), "finished: {text}");
+    assert!(
+        !text.contains(STOPPED) && !text.contains(UNREADABLE),
+        "finished names only itself: {text}"
+    );
+
+    let stopped = saved(|state| {
+        state.stopped = true;
+        state.stop_reason = Some(UNTIL_PLAN_REASON.to_string());
+    });
+    let text = dry_run(Some(&stopped));
+    assert!(
+        text.contains(STOPPED) && text.contains(UNTIL_PLAN_REASON),
+        "stopped, with its reason: {text}"
+    );
+    assert!(
+        !text.contains(FINISHED) && !text.contains(UNREADABLE),
+        "stopped names only itself: {text}"
+    );
+
+    let unloadable = |root: &Path, phase: PhaseId| {
+        let path = devflow_core::workflow::state_path(root, phase);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "{ not a state").unwrap();
+    };
+    let text = dry_run(Some(&unloadable));
+    assert!(text.contains(UNREADABLE), "unloadable: {text}");
+    assert!(
+        !text.contains(FINISHED) && !text.contains(STOPPED),
+        "unloadable names only itself: {text}"
+    );
+
+    let text = dry_run(None);
+    assert!(
+        !text.contains("replaces"),
+        "control: a fresh start replaces nothing: {text}"
+    );
+}
+
 /// WR-01 (phase 20 review): `--dry-run` must reflect `--until` in its
-/// preview instead of always printing the full Define→Ship pipeline as if
+/// preview instead of always printing the full pipeline as if
 /// `--until` had not been passed.
 #[test]
 fn start_dry_run_annotates_until_stage() {
@@ -746,11 +990,20 @@ fn start_dry_run_annotates_until_stage() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout
-            .lines()
-            .any(|l| l.contains("plan") && l.contains("[STOPS HERE — --until]")),
-        "the plan stage line must be annotated as the --until stop point\nstdout: {stdout}"
+    assert_eq!(
+        dry_run_stage_mismatch(&stdout, &["plan", "code", "validate"]),
+        None,
+        "the --until preview must still list exactly plan, code, validate\nstdout: {stdout}"
+    );
+    let annotated: Vec<String> = stdout
+        .lines()
+        .filter(|l| l.contains("[STOPS HERE — --until]"))
+        .filter_map(|l| l.split_whitespace().next().map(str::to_string))
+        .collect();
+    assert_eq!(
+        annotated,
+        ["plan"],
+        "exactly the plan stage line must be annotated as the --until stop point\nstdout: {stdout}"
     );
     assert!(
         stdout.contains("--until plan"),
@@ -763,7 +1016,7 @@ fn start_dry_run_annotates_until_stage() {
 }
 
 /// WR-01 counterpart: without `--until`, the preview must NOT show any stop
-/// annotation — the full pipeline runs to Ship.
+/// annotation — the full pipeline runs to Validate.
 #[test]
 fn start_dry_run_without_until_has_no_stop_annotation() {
     let home = common::HermeticHome::new();
@@ -797,43 +1050,9 @@ fn start_dry_run_without_until_has_no_stop_annotation() {
     );
 }
 
+/// `cleanup --force` removes a phase worktree once its run has ended.
 #[test]
-fn status_prints_cron_hint_when_cron_instructions_exist() {
-    let home = common::HermeticHome::new();
-    let repo = tempfile::tempdir().unwrap();
-    let root = repo.path();
-    init_repo(root);
-    let instructions = devflow_core::ship::build_single_agent_cron_instructions(
-        root,
-        PhaseId::new(7),
-        "2026-06-18T15:45:30Z",
-    );
-    devflow_core::ship::write_cron_instructions(root, &instructions).unwrap();
-    let fake_bin = fake_bin_dir(&[]);
-
-    let output = run_devflow(&home, root, &fake_bin.path, &["status"]);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    // D-10 (44-03) replaced the old `--from-devflow <root>` invocation with a
-    // runnable `hermes cron create` command carrying an ISO-8601 UTC instant
-    // schedule. Build the expected line from `instructions`' own fields
-    // (the exact values the CLI reads back off disk) rather than
-    // hand-duplicating cron_hint_line's quoting logic here.
-    let expected = format!(
-        "Cron instruction pending (phase 7): hermes cron create \"{}\" {} --repeat 1 --name {} (rate-limit resets: {})",
-        instructions.hermes_cron.schedule,
-        devflow_core::ship::shell_quote(&instructions.hermes_cron.command),
-        instructions.hermes_cron.name,
-        instructions.retry_after,
-    );
-    assert!(
-        stdout.contains(&expected),
-        "stdout was:\n{stdout}\nexpected substring:\n{expected}"
-    );
-}
-
-#[test]
-fn reference_and_cleanup_worktree_cli_flow() {
+fn cleanup_worktree_cli_flow() {
     let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
@@ -865,26 +1084,25 @@ esac
 "#,
     )]);
 
-    // reference — creates static snapshot
-    let out = run_devflow(&home, root, &fake_bin.path, &["reference"]);
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("reference worktree"));
-    assert!(root.join(".worktrees/reference").is_dir());
+    // 52-22: Validate reads GSD's own verification status, so the run gets a
+    // `gsd_run` stub under its home and never a real GSD install. The agent
+    // reports no verdict (a fail) and GSD reports a stale report, so the auto
+    // loop back to Code runs to its cap; one reply per Validate, with room to
+    // spare. (52-27: `gaps_found` would take the gap-closure pass through
+    // Plan, whose post-check gates at Plan on this fixture, which writes no
+    // report and no gap plan.)
+    let gsd_logs = tempfile::tempdir().unwrap();
+    let stale =
+        devflow_core::test_support::gsd_status_json(devflow_core::gsd_reader::GsdStatus::Stale);
+    common::stub_gsd_run(&home, &[stale; 10], gsd_logs.path());
 
-    // start --worktree — creates phase worktree
+    // start — creates the phase worktree by default
     let out = run_devflow(
         &home,
         root,
         &fake_bin.path,
         &[
-            "start",
-            "--phase",
-            "8",
-            "--agent",
-            "claude",
-            "--mode",
-            "auto",
-            "--worktree",
+            "start", "--phase", "8", "--agent", "claude", "--mode", "auto",
         ],
     );
     let _reaper = common::LaunchedRunReaper::new(root, PhaseId::new(8), Vec::new());
@@ -899,10 +1117,6 @@ esac
     let out = run_devflow(&home, root, &fake_bin.path, &["status"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains(".worktrees/reference"),
-        "status missing reference\n{stdout}"
-    );
-    assert!(
         stdout.contains(".worktrees/phase-08"),
         "status missing phase worktree\n{stdout}"
     );
@@ -912,10 +1126,18 @@ esac
     // resolve the phase before cleaning it up, not race the still-running
     // monitor. This fixture's fake agent never produces real work, so
     // Validate always loops back and forces a gate after
-    // MAX_CONSECUTIVE_FAILURES; abort it (note containing "abort" —
-    // gates.rs::GateAction::from_response) so the monitor clears state,
+    // MAX_CONSECUTIVE_FAILURES; end it with `gate abort` (a rejection
+    // would loop back and keep the run alive) so the monitor clears state,
     // then wait for that to land before invoking cleanup.
     wait_for(&root.join(".devflow/gates/08-validate.json"));
+    let gate: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(root.join(".devflow/gates/08-validate.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        gate["gate_kind"], "failure_cap",
+        "the loop over GSD's stale report reaches its cap: {gate}"
+    );
 
     // 31-03: reaching the Validate gate already implies the Code stage's
     // delivery canary confirmed — but only implicitly. Asserted explicitly so
@@ -929,7 +1151,7 @@ esac
 
     // HYG-01 (41-02 review finding): `start --phase 8` spawned a monitor that
     // now blocks at the Validate gate. Bind a guard so the monitor is
-    // verified-reaped on EVERY exit path — the `gate reject` teardown below is
+    // verified-reaped on EVERY exit path — the `gate abort` teardown below is
     // the happy path, not a substitute for the guard.
     let settled = load_state(root, PhaseId::new(8)).expect("load state");
     let _reap = MonitorReapGuard::after_launch(&settled);
@@ -940,12 +1162,14 @@ esac
         &fake_bin.path,
         &[
             "gate",
-            "reject",
+            "abort",
             "8",
             "--stage",
             "validate",
             "--note",
-            "abort test teardown",
+            "test teardown",
+            // run_devflow appends the root, which now has to be --project's value.
+            "--project",
         ],
     );
     wait_for_state_cleared(root, PhaseId::new(8));
@@ -955,13 +1179,11 @@ esac
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("removed"));
 
-    // cleanup --force removes everything including reference
-    assert!(!root.join(".worktrees/reference").is_dir());
     assert!(!root.join(".worktrees/phase-08").is_dir());
 }
 
 /// 13-06 dogfood regression (Codex leg): a fresh headless Codex run can
-/// never pass Define, so `start --agent codex` on a phase with no CONTEXT.md
+/// never pass Plan, so `start --agent codex` on a phase with no CONTEXT.md
 /// on develop must fail fast in pre-flight — before any worktree, branch, or
 /// monitor is created.
 #[test]
@@ -1265,6 +1487,405 @@ fn cleanup_force_removes_worktree_for_until_stopped_phase() {
     );
 }
 
+/// A fixture repo for `cleanup`: phase `phase`'s worktree under `.worktrees/` on
+/// `feature/phase-NN`, and a saved state recording it, shaped by `shape`. With
+/// `merged`, the branch is forked at `develop` with no commit of its own, so
+/// `git branch --merged develop` lists it. Returns the worktree's path.
+fn cleanup_fixture(
+    root: &Path,
+    phase: PhaseId,
+    merged: bool,
+    shape: impl FnOnce(&mut devflow_core::state::State),
+) -> PathBuf {
+    init_repo(root);
+    let branch = format!("feature/phase-{padded}", padded = phase.padded());
+    if merged {
+        git(root, &["branch", &branch, "develop"]);
+    } else {
+        seed_feature_branch(root, phase);
+    }
+    let wt_path = root
+        .join(".worktrees")
+        .join(format!("phase-{padded}", padded = phase.padded()));
+    devflow_core::worktree::add(root, &wt_path, &branch, &branch, false).unwrap();
+    let mut state = devflow_core::state::State::new(
+        phase,
+        devflow_core::state::AgentKind::Claude,
+        devflow_core::mode::Mode::Auto,
+        root.to_path_buf(),
+    );
+    state.worktree_path = Some(wt_path.clone());
+    shape(&mut state);
+    devflow_core::workflow::save_state(&state).unwrap();
+    wt_path
+}
+
+/// `devflow cleanup` (plus `extra`) on `root`, in a hermetic home.
+fn run_cleanup(home: &common::HermeticHome, root: &Path, extra: &[&str]) -> Output {
+    let fake_bin = fake_bin_dir(&[]);
+    common::hermetic_devflow(home)
+        .arg("cleanup")
+        .args(extra)
+        .arg(root)
+        .env("PATH", path_with_fake_bin(&fake_bin.path))
+        .current_dir(root)
+        .output()
+        .expect("run devflow cleanup")
+}
+
+/// The stop reason a finished run records (D-35), as the CLI writes it.
+const FINISHED_REASON: &str = "finished: Validate passed; the worktree and branch are kept";
+/// The stop reason a `--until plan` halt records.
+const UNTIL_PLAN_REASON: &str = "stopped after plan completed (--until plan)";
+
+/// OPS-02 / D-35: `cleanup` says why it keeps a worktree, and each case names only
+/// its own reason: a finished run gives its stop reason and `--force` (never
+/// `resume`, which refuses a finished run); an `--until plan` halt gives that halt's
+/// reason and `resume`; a live run is refused with a non-zero exit naming that a run
+/// is live and `devflow stop`.
+#[test]
+fn cleanup_names_why_it_keeps_a_worktree() {
+    // A finished run.
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let phase = PhaseId::new(21);
+    let wt = cleanup_fixture(repo.path(), phase, false, |state| {
+        state.stopped = true;
+        state.finished = true;
+        state.stop_reason = Some(FINISHED_REASON.to_string());
+    });
+    let out = run_cleanup(&home, repo.path(), &[]);
+    let text =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{text}");
+    assert!(wt.is_dir(), "a finished run's worktree is kept: {text}");
+    assert!(
+        text.contains(FINISHED_REASON) && text.contains("--force"),
+        "names the finished run's reason and --force: {text}"
+    );
+    for other in ["devflow resume", "--until", "a run is live"] {
+        assert!(!text.contains(other), "finished names {other:?}: {text}");
+    }
+
+    // An `--until plan` halt.
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let phase = PhaseId::new(22);
+    let wt = cleanup_fixture(repo.path(), phase, false, |state| {
+        state.stopped = true;
+        state.stop_until = Some(Stage::Plan);
+        state.stop_reason = Some(UNTIL_PLAN_REASON.to_string());
+    });
+    let out = run_cleanup(&home, repo.path(), &[]);
+    let text =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{text}");
+    assert!(wt.is_dir(), "a halted run's worktree is kept: {text}");
+    assert!(
+        text.contains(UNTIL_PLAN_REASON) && text.contains("devflow resume --phase 22"),
+        "names the halt's reason and resume: {text}"
+    );
+    for other in ["finished", "a run is live"] {
+        assert!(!text.contains(other), "the halt names {other:?}: {text}");
+    }
+
+    // A live run: the agent pid file holds this test process's own pid.
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let phase = PhaseId::new(23);
+    let wt = cleanup_fixture(repo.path(), phase, false, |_| {});
+    let pid_path = devflow_core::agent_result::agent_pid_path(repo.path(), phase);
+    fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
+    fs::write(&pid_path, std::process::id().to_string()).unwrap();
+    let out = run_cleanup(&home, repo.path(), &[]);
+    let text =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "a live run is refused: {text}");
+    assert!(wt.is_dir(), "a live run's worktree is kept: {text}");
+    assert!(
+        text.contains("a run is live") && text.contains("devflow stop --phase 23"),
+        "names the live run and stop: {text}"
+    );
+    for other in ["finished", "--until", "devflow resume"] {
+        assert!(
+            !text.contains(other),
+            "the live refusal names {other:?}: {text}"
+        );
+    }
+}
+
+/// OPS-02 (999.213): `cleanup --force` removes the run's state file together with
+/// its worktree, and only that phase's state.
+#[test]
+fn cleanup_force_removes_the_run_state_with_the_worktree() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let phase = PhaseId::new(24);
+    let wt = cleanup_fixture(root, phase, false, |state| {
+        state.stopped = true;
+        state.finished = true;
+        state.stop_reason = Some(FINISHED_REASON.to_string());
+    });
+    // Another phase's state, with no worktree: `--force` must leave it alone.
+    let other = PhaseId::new(25);
+    let other_state = devflow_core::state::State::new(
+        other,
+        devflow_core::state::AgentKind::Claude,
+        devflow_core::mode::Mode::Auto,
+        root.to_path_buf(),
+    );
+    devflow_core::workflow::save_state(&other_state).unwrap();
+    let state_file = devflow_core::workflow::state_path(root, phase);
+    assert!(state_file.is_file(), "premise: the state file exists");
+
+    let out = run_cleanup(&home, root, &["--force"]);
+    let text =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{text}");
+    assert!(!wt.is_dir(), "the worktree is removed: {text}");
+    assert!(
+        !state_file.exists(),
+        "the run's state file is removed with its worktree: {text}"
+    );
+    assert!(
+        devflow_core::workflow::state_path(root, other).is_file(),
+        "another phase's state is untouched: {text}"
+    );
+}
+
+/// `cleanup` never deletes a merged branch that a kept worktree still has checked
+/// out: it skips the branch rather than leaving the refusal to git.
+#[test]
+fn cleanup_keeps_the_branch_of_a_kept_worktree() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let phase = PhaseId::new(26);
+    let branch = format!("feature/phase-{padded}", padded = phase.padded());
+    let wt = cleanup_fixture(root, phase, true, |state| {
+        state.stopped = true;
+        state.finished = true;
+        state.stop_reason = Some(FINISHED_REASON.to_string());
+    });
+    let merged = git(root, &["branch", "--merged", "develop"]);
+    assert!(
+        String::from_utf8_lossy(&merged.stdout).contains(&branch),
+        "premise: the branch reads as merged"
+    );
+
+    let out = run_cleanup(&home, root, &[]);
+    let text =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{text}");
+    assert!(wt.is_dir(), "premise: the worktree is kept: {text}");
+    let listed = git(root, &["branch", "--list", &branch]);
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).contains(&branch),
+        "the kept worktree's branch still exists: {text}"
+    );
+    assert!(
+        !text.contains(&format!("merged branch {branch}")),
+        "cleanup does not try to delete the kept worktree's branch: {text}"
+    );
+}
+
+/// Whether `branch` exists in `root`, and its tip when it does.
+fn branch_tip(root: &Path, branch: &str) -> Option<String> {
+    let out = devflow_core::test_support::git_command(root)
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ])
+        .output()
+        .expect("spawn git rev-parse");
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// A finished run's branch holds the only copy of its work until it is closed out, so
+/// `cleanup --force` keeps a branch with commits not merged into the base: it still
+/// removes the worktree and the run's state, and names the branch, why it was kept and
+/// the command that deletes it.
+#[test]
+fn cleanup_force_keeps_an_unmerged_branch_and_names_the_delete_command() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let phase = PhaseId::new(27);
+    let branch = format!("feature/phase-{padded}", padded = phase.padded());
+    let wt = cleanup_fixture(root, phase, false, |state| {
+        state.stopped = true;
+        state.finished = true;
+        state.stop_reason = Some(FINISHED_REASON.to_string());
+    });
+    let tip = branch_tip(root, &branch).expect("premise: the branch exists");
+    let state_file = devflow_core::workflow::state_path(root, phase);
+    assert!(state_file.is_file(), "premise: the state file exists");
+
+    let out = run_cleanup(&home, root, &["--force"]);
+    let text =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{text}");
+    assert!(!wt.is_dir(), "the worktree is removed: {text}");
+    assert!(!state_file.exists(), "the run's state is removed: {text}");
+    assert_eq!(
+        branch_tip(root, &branch).as_deref(),
+        Some(tip.as_str()),
+        "the unmerged branch is kept at its tip: {text}"
+    );
+    let kept_line = text
+        .lines()
+        .find(|line| line.contains(&format!("branch {branch} kept")))
+        .unwrap_or_else(|| panic!("a line names the kept branch: {text}"));
+    assert!(
+        kept_line.contains("1 commit not merged into `develop`"),
+        "the line says why, with the count: {kept_line}"
+    );
+    assert!(
+        kept_line.contains(&format!("git branch -D {branch}")),
+        "the line names the delete command: {kept_line}"
+    );
+}
+
+/// Control for the test above: `cleanup --force` still deletes a branch with no
+/// commit beyond the base.
+#[test]
+fn cleanup_force_deletes_a_merged_branch() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let phase = PhaseId::new(28);
+    let branch = format!("feature/phase-{padded}", padded = phase.padded());
+    let wt = cleanup_fixture(root, phase, true, |state| {
+        state.stopped = true;
+        state.finished = true;
+        state.stop_reason = Some(FINISHED_REASON.to_string());
+    });
+    assert!(
+        branch_tip(root, &branch).is_some(),
+        "premise: the branch exists"
+    );
+
+    let out = run_cleanup(&home, root, &["--force"]);
+    let text =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{text}");
+    assert!(!wt.is_dir(), "the worktree is removed: {text}");
+    assert_eq!(
+        branch_tip(root, &branch),
+        None,
+        "the merged branch is deleted: {text}"
+    );
+    assert!(!text.contains("git branch -D"), "{text}");
+}
+
+/// `devflow start` with `--force` (plus `extra`) for phase 12 over `root`, in a
+/// hermetic home, with its exit status left to the caller. A reaper is bound before the
+/// launch, so a start that does launch has its run ended when the test ends.
+fn force_start_phase_12(
+    home: &common::HermeticHome,
+    root: &Path,
+    extra: &[&str],
+) -> (Output, common::LaunchedRunReaper) {
+    let reaper = common::LaunchedRunReaper::new(root, PhaseId::new(12), Vec::new());
+    let fake_bin = fake_bin_dir(&[(
+        "codex",
+        "#!/bin/sh\nprintf 'DEVFLOW_RESULT: {\"status\":\"success\"}\\n'\n",
+    )]);
+    let output = common::hermetic_devflow(home)
+        .args([
+            "start",
+            "--phase",
+            "12",
+            "--agent",
+            "codex",
+            "--mode",
+            "supervise",
+            "--force",
+        ])
+        .args(extra)
+        .arg(root)
+        .env("PATH", path_with_fake_bin(&fake_bin.path))
+        .env("DEVFLOW_TEST_ROOT", root)
+        .env("DEVFLOW_GATE_TIMEOUT_SECS", "60")
+        .current_dir(root)
+        .output()
+        .expect("run devflow start --force");
+    (output, reaper)
+}
+
+/// `start --force` cannot recreate a phase branch with commits not merged into the base
+/// without deleting them, so it refuses before removing anything: the worktree and the
+/// branch are both left, and the refusal names the branch and both ways on.
+#[test]
+fn start_force_refuses_over_an_unmerged_phase_branch() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let phase = PhaseId::new(12);
+    let branch = format!("feature/phase-{padded}", padded = phase.padded());
+    seed_feature_branch(root, phase);
+    let wt = root.join(".worktrees/phase-12");
+    devflow_core::worktree::add(root, &wt, &branch, &branch, false).unwrap();
+    let tip = branch_tip(root, &branch).expect("premise: the branch exists");
+
+    let (out, _reaper) = force_start_phase_12(&home, root, &[]);
+    let text =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "start --force is refused: {text}");
+    assert!(wt.is_dir(), "the worktree is left in place: {text}");
+    assert_eq!(
+        branch_tip(root, &branch).as_deref(),
+        Some(tip.as_str()),
+        "the branch is left at its tip: {text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "`{branch}` has 1 commit not merged into `develop`"
+        )),
+        "names the branch and its unmerged commit: {text}"
+    );
+    assert!(
+        text.contains(&format!("git branch -D {branch}")),
+        "names the delete command: {text}"
+    );
+}
+
+/// The `--no-worktree` arm of the test above: `start --force` would reset the branch to
+/// the base in place, so it refuses an unmerged one too and leaves it at its tip.
+#[test]
+fn start_force_no_worktree_refuses_over_an_unmerged_phase_branch() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let phase = PhaseId::new(12);
+    let branch = format!("feature/phase-{padded}", padded = phase.padded());
+    seed_feature_branch(root, phase);
+    let tip = branch_tip(root, &branch).expect("premise: the branch exists");
+
+    let (out, _reaper) = force_start_phase_12(&home, root, &["--no-worktree"]);
+    let text =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "start --force is refused: {text}");
+    assert_eq!(
+        branch_tip(root, &branch).as_deref(),
+        Some(tip.as_str()),
+        "the branch is left at its tip: {text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "`{branch}` has 1 commit not merged into `develop`"
+        )),
+        "names the branch and its unmerged commit: {text}"
+    );
+}
+
 /// 20b instance 1 (probe 20b/idempotency): `cleanup` run twice succeeds —
 /// the second run finds the worktree already gone and does not error.
 #[test]
@@ -1381,10 +2002,9 @@ fn wait_for_gate(root: &Path, phase: PhaseId) -> devflow_core::state::State {
 }
 
 /// A Pi run that exits 0 without emitting a DEVFLOW_RESULT marker must not
-/// advance a commit-gated stage. Define (not commit-gated) legitimately
-/// advances on exit 0, but Plan — a commit-gated stage — runs the same
-/// marker-less stub, which produces no commits and no marker, so it is
-/// `Failed` and gates instead of advancing to Code.
+/// advance a commit-gated stage. Plan, the first stage and commit-gated,
+/// runs the marker-less stub, which produces no commits and no marker, so it
+/// is `Failed` and gates instead of advancing to Code.
 #[test]
 fn pi_marker_less_run_does_not_advance() {
     let home = common::HermeticHome::new();
@@ -1448,7 +2068,7 @@ fn pi_nonzero_exit_does_not_advance() {
     let state = wait_for_gate(root, PhaseId::new(7));
     assert_eq!(
         state.stage,
-        Stage::Define,
+        Stage::Plan,
         "a non-zero-exit run must not advance its stage"
     );
     assert!(state.gate_pending, "the never-silent gate must have fired");
@@ -1499,7 +2119,7 @@ fn pi_hung_process_is_detected_not_left_running() {
     let state = load_state(root, PhaseId::new(7)).expect("load state");
     assert_eq!(
         state.stage,
-        Stage::Define,
+        Stage::Plan,
         "the stage must not advance while pi is hung"
     );
 
@@ -1515,7 +2135,7 @@ fn pi_hung_process_is_detected_not_left_running() {
     let gated = wait_for_gate(root, PhaseId::new(7));
     assert_eq!(
         gated.stage,
-        Stage::Define,
+        Stage::Plan,
         "a hung-then-killed run must not advance its stage"
     );
     let _reap = MonitorReapGuard::after_launch(&gated);
@@ -1525,7 +2145,7 @@ fn pi_hung_process_is_detected_not_left_running() {
 // Phase 41 Task 8 (ANTG-03, F4, codex-3, antigravity notice (a)): the
 // Antigravity transport, end to end through `devflow start --agent
 // antigravity` with a stubbed `agy` on PATH. The canary-aware stub answers
-// the `DEVFLOW_DELIVERY_CANARY_` turn (AntigravityCanaryLauncher at Define),
+// the `DEVFLOW_DELIVERY_CANARY_` turn (AntigravityCanaryLauncher at Plan),
 // schema-checks every turn (codex-3), and then behaves per mode.
 // ---------------------------------------------------------------------------
 
@@ -1535,7 +2155,7 @@ fn pi_hung_process_is_detected_not_left_running() {
 /// `*DEVFLOW_DELIVERY_CANARY_*` turn (the common prefix; the enum is named
 /// without it) by echoing the token inside an antigravity-shaped
 /// `event:result.response`, so `run_delivery_canary` reaches `Confirmed` at
-/// Define; then:
+/// Plan; then:
 /// - `MarkerStream`: emits a marker stream for real stage turns — the happy
 ///   path.
 /// - `Quiet`: exits 0 with NO events — the marker-less control (ANTG-03).
@@ -1663,9 +2283,8 @@ impl Drop for MonitorReapGuard {
 }
 
 /// ANTG-03: a stubbed `agy` that exits 0 with no stream events must not
-/// advance a COMMIT-GATED stage. Define (not commit-gated) legitimately
-/// advances on exit 0; Plan — a commit-gated stage — produces no marker and
-/// no commits, so it gates instead of advancing to Code.
+/// advance a COMMIT-GATED stage. Plan — a commit-gated stage — produces no
+/// marker and no commits, so it gates instead of advancing to Code.
 #[test]
 fn marker_less_antigravity_never_advances() {
     let home = common::HermeticHome::new();
@@ -1856,7 +2475,7 @@ fn unguarded_monitor_is_detected_by_the_registry() {
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
-    // A HANGING pi keeps the Define monitor alive past the launch — the
+    // A HANGING pi keeps the Plan monitor alive past the launch — the
     // "leaked" shape this control must be able to see.
     let fake_bin = fake_bin_dir(&[("pi", &pi_stub("exec sleep 30\n"))]);
 
@@ -1918,7 +2537,7 @@ fi
 }
 
 /// HRMS-03: a stubbed `hermes` that exits 0 with no marker must not advance a
-/// commit-gated stage. Define advances on exit 0; Plan gates.
+/// commit-gated stage: Plan gates.
 #[test]
 fn hermes_marker_less_run_does_not_advance() {
     let home = common::HermeticHome::new();
@@ -1987,7 +2606,7 @@ fn hermes_nonzero_exit_does_not_advance() {
     let state = wait_for_gate(root, PhaseId::new(7));
     assert_eq!(
         state.stage,
-        Stage::Define,
+        Stage::Plan,
         "a non-zero-exit hermes run must not advance its stage"
     );
     assert!(state.gate_pending, "the never-silent gate must have fired");
@@ -2035,7 +2654,7 @@ fn hermes_hung_process_is_detected_not_left_running() {
     let state = load_state(root, PhaseId::new(7)).expect("load state");
     assert_eq!(
         state.stage,
-        Stage::Define,
+        Stage::Plan,
         "the stage must not advance while hermes is hung"
     );
 
@@ -2050,7 +2669,7 @@ fn hermes_hung_process_is_detected_not_left_running() {
     let gated = wait_for_gate(root, PhaseId::new(7));
     assert_eq!(
         gated.stage,
-        Stage::Define,
+        Stage::Plan,
         "a hung-then-killed hermes run must not advance its stage"
     );
     let _reap = MonitorReapGuard::after_launch(&gated);

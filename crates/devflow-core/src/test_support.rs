@@ -350,6 +350,108 @@ pub fn with_answer_before_publish<R>(hook: impl FnOnce() + 'static, body: impl F
     body()
 }
 
+/// The file under a GSD stub's `logs` dir that holds one line per call: the
+/// call's physical working directory, a tab, then its arguments joined by
+/// spaces.
+pub const GSD_RUN_LOG: &str = "gsd-run.log";
+
+/// The version the stub launcher answers `runtime-identity --raw` with.
+pub const GSD_STUB_VERSION: &str = "0.0.0-stub";
+
+/// Plant a stub GSD launcher at `<home>/.claude/gsd-core/bin/gsd_run`, the first
+/// place [`crate::gsd_reader::locate_launcher`] looks, so no test reaches a real
+/// GSD install.
+///
+/// Every call appends its working directory and argv to `logs/`[`GSD_RUN_LOG`].
+/// `runtime-identity` answers [`GSD_STUB_VERSION`] and consumes nothing.
+/// `query verification status <dir>` answers `missing` when `<dir>` is not a
+/// directory, consuming nothing. Every other call prints the next of
+/// `responses`, in order, one per call; once they are used up the stub prints
+/// an error and exits 97, so a test that reads more often than it scripted sees
+/// a reader failure, never a repeated answer.
+///
+/// The script uses shell builtins only, so it runs under an agent-free `PATH`.
+pub fn plant_gsd_run_stub(home: &std::path::Path, responses: &[&str], logs: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(logs).expect("create the GSD stub's logs dir");
+    let logs_text = logs.to_str().expect("a UTF-8 logs path");
+    assert!(
+        !logs_text.contains('\''),
+        "the logs path is single-quoted in the stub: {logs_text}"
+    );
+    for (index, response) in responses.iter().enumerate() {
+        std::fs::write(
+            logs.join(format!("gsd-response-{}", index + 1)),
+            format!("{response}\n"),
+        )
+        .expect("write a scripted GSD reply");
+    }
+    let launcher = home.join(".claude/gsd-core/bin/gsd_run");
+    std::fs::create_dir_all(launcher.parent().expect("a launcher dir"))
+        .expect("create the launcher dir");
+    let script = format!(
+        r#"#!/bin/sh
+logs='{logs_text}'
+printf '%s\t%s\n' "$(pwd -P)" "$*" >> "$logs/{GSD_RUN_LOG}"
+if [ "$1" = "runtime-identity" ]; then
+  printf '%s\n' '{{"packageName":"@opengsd/gsd-core","version":"{GSD_STUB_VERSION}"}}'
+  exit 0
+fi
+if [ "$1 $2 $3" = "query verification status" ] && [ ! -d "$4" ]; then
+  printf '%s\n' '{{"status":"missing","next_action":"No verification report found.","next_command":"","route":"execute-phase"}}'
+  exit 0
+fi
+n=1
+if [ -f "$logs/gsd-next" ]; then read -r n < "$logs/gsd-next"; fi
+if [ ! -f "$logs/gsd-response-$n" ]; then
+  printf 'gsd_run stub: no scripted reply %s\n' "$n" >&2
+  exit 97
+fi
+printf '%s\n' "$((n + 1))" > "$logs/gsd-next"
+while IFS= read -r line || [ -n "$line" ]; do printf '%s\n' "$line"; done < "$logs/gsd-response-$n"
+"#
+    );
+    std::fs::write(&launcher, script).expect("write the GSD stub launcher");
+    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))
+        .expect("make the GSD stub executable");
+}
+
+/// The calls a stub from [`plant_gsd_run_stub`] logged, as
+/// `(working directory, argv joined by spaces)`, in call order.
+pub fn gsd_run_calls(logs: &std::path::Path) -> Vec<(std::path::PathBuf, String)> {
+    std::fs::read_to_string(logs.join(GSD_RUN_LOG))
+        .unwrap_or_default()
+        .lines()
+        .map(|line| {
+            let (cwd, argv) = line.split_once('\t').expect("a cwd<TAB>argv log line");
+            (std::path::PathBuf::from(cwd), argv.to_string())
+        })
+        .collect()
+}
+
+/// GSD's `query verification status` JSON for `status` (gsd-core 1.20.1's
+/// shapes, as `gsd_reader`'s own tests record them).
+pub fn gsd_status_json(status: crate::gsd_reader::GsdStatus) -> &'static str {
+    use crate::gsd_reader::GsdStatus;
+    match status {
+        GsdStatus::Passed => {
+            r#"{"status":"passed","next_action":"Verification passed — continue.","next_command":"","route":""}"#
+        }
+        GsdStatus::GapsFound => {
+            r#"{"status":"gaps_found","next_action":"Gaps found. Plan the fixes, then re-run execute-phase before shipping.","next_command":"/gsd-plan-phase 01 --gaps","route":"plan-phase"}"#
+        }
+        GsdStatus::HumanNeeded => {
+            r#"{"status":"human_needed","next_action":"Human verification required.","next_command":"/gsd-verify-work 01","route":"verify-work"}"#
+        }
+        GsdStatus::Stale => {
+            r#"{"status":"stale","next_action":"Verification is stale — covered source files changed after the verifier last ran.","next_command":"/gsd-execute-phase 01","route":"execute-phase","moved_files":["a.txt"]}"#
+        }
+        GsdStatus::Missing => {
+            r#"{"status":"missing","next_action":"No verification report found — the verify step never completed.","next_command":"/gsd-execute-phase 01","route":"execute-phase"}"#
+        }
+    }
+}
+
 // ## Why there is no in-process absent-`git` harness in THIS crate
 //
 // 35-01 planned one empty-`PATH` guard per crate, so that criterion 6's tests
@@ -361,8 +463,8 @@ pub fn with_answer_before_publish<R>(hook: impl FnOnce() + 'static, body: impl F
 //
 // A `PATH`-replacing guard mutates process-global state, and `cargo test` runs
 // this crate's whole suite as threads in ONE process. `devflow-core` shells out
-// to `git` from eight modules (`git`, `version`, `worktree`, `agent_result`,
-// `monitor`, `ship_evidence`, `hooks`, and this one), and — decisively — its
+// to `git` from several modules (`git`, `worktree`, `agent_result`, `monitor`,
+// `gsd_config`, and this one), and — decisively — its
 // tests reach `git` by calling PRODUCTION code that spawns it, not only through
 // fixture helpers. So no fixture-level lock can cover them: serializing this
 // module's own `git()` helper still left
@@ -415,6 +517,7 @@ mod tests {
     fn approved() -> GateResponse {
         GateResponse {
             approved: true,
+            abort: false,
             note: None,
             responded_by: Some("human".into()),
         }
@@ -427,15 +530,28 @@ mod tests {
 
     fn close_and_open(root: &std::path::Path) {
         Gates::close(root, PHASE, STAGE).unwrap();
-        Gates::open_gate(root, PHASE, STAGE, "next").unwrap();
+        Gates::open_gate(
+            root,
+            PHASE,
+            STAGE,
+            crate::gates::GateKind::StageFailure,
+            "next",
+        )
+        .unwrap();
     }
 
     #[test]
     fn with_answer_before_publish_runs_between_the_check_and_the_publish() {
         let dir = tempfile::tempdir().unwrap();
-        let first = Gates::open_gate(dir.path(), PHASE, STAGE, "first")
-            .unwrap()
-            .gate_id;
+        let first = Gates::open_gate(
+            dir.path(),
+            PHASE,
+            STAGE,
+            crate::gates::GateKind::StageFailure,
+            "first",
+        )
+        .unwrap()
+        .gate_id;
         let root = dir.path().to_path_buf();
         let runs = Rc::new(Cell::new(0));
         let hook_runs = runs.clone();
@@ -465,9 +581,15 @@ mod tests {
         // The control: run just before `answer`, the same step fails its id check,
         // so the hook above ran after that check.
         let before = tempfile::tempdir().unwrap();
-        let observed = Gates::open_gate(before.path(), PHASE, STAGE, "first")
-            .unwrap()
-            .gate_id;
+        let observed = Gates::open_gate(
+            before.path(),
+            PHASE,
+            STAGE,
+            crate::gates::GateKind::StageFailure,
+            "first",
+        )
+        .unwrap()
+        .gate_id;
         close_and_open(before.path());
         let refused = Gates::answer(before.path(), PHASE, STAGE, &observed, &approved());
         assert!(
@@ -479,9 +601,15 @@ mod tests {
     #[test]
     fn with_answer_before_publish_runs_its_hook_once_and_never_after_its_body() {
         let dir = tempfile::tempdir().unwrap();
-        let gate = Gates::open_gate(dir.path(), PHASE, STAGE, "ctx")
-            .unwrap()
-            .gate_id;
+        let gate = Gates::open_gate(
+            dir.path(),
+            PHASE,
+            STAGE,
+            crate::gates::GateKind::StageFailure,
+            "ctx",
+        )
+        .unwrap()
+        .gate_id;
         let runs = Rc::new(Cell::new(0));
         let counted = |runs: &Rc<Cell<i32>>| {
             let runs = runs.clone();
@@ -505,9 +633,15 @@ mod tests {
     #[test]
     fn with_answer_before_publish_also_runs_inside_reap_answer() {
         let dir = tempfile::tempdir().unwrap();
-        let gate = Gates::open_gate(dir.path(), PHASE, STAGE, "ctx")
-            .unwrap()
-            .gate_id;
+        let gate = Gates::open_gate(
+            dir.path(),
+            PHASE,
+            STAGE,
+            crate::gates::GateKind::StageFailure,
+            "ctx",
+        )
+        .unwrap()
+        .gate_id;
         let runs = Rc::new(Cell::new(0));
         let hook_runs = runs.clone();
 
@@ -522,9 +656,15 @@ mod tests {
     #[test]
     fn gate_answer_files_lists_keyed_and_legacy_answers() {
         let dir = tempfile::tempdir().unwrap();
-        let gate = Gates::open_gate(dir.path(), PHASE, STAGE, "ctx")
-            .unwrap()
-            .gate_id;
+        let gate = Gates::open_gate(
+            dir.path(),
+            PHASE,
+            STAGE,
+            crate::gates::GateKind::StageFailure,
+            "ctx",
+        )
+        .unwrap()
+        .gate_id;
         let keyed = Gates::answer(dir.path(), PHASE, STAGE, &gate, &approved()).unwrap();
         let legacy = Gates::dir(dir.path()).join("07-code.response.json");
         std::fs::write(&legacy, "{}").unwrap();
@@ -548,7 +688,14 @@ mod tests {
             "{refused:?}"
         );
 
-        Gates::write_gate(dir.path(), PHASE, STAGE, "ctx").unwrap();
+        Gates::write_gate(
+            dir.path(),
+            PHASE,
+            STAGE,
+            crate::gates::GateKind::StageFailure,
+            "ctx",
+        )
+        .unwrap();
         let live = live_gate(dir.path());
         let path = answer_open_gate(dir.path(), PHASE, STAGE, &approved()).unwrap();
 

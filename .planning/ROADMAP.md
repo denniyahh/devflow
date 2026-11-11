@@ -57,7 +57,7 @@ replies (Telegram and similar) are a later milestone (REMOTE-01/02 under `REQUIR
 
 | Phase | Name | Requirements | Depends on | Status |
 |---|---|---|---|---|
-| 52 | Subtract and Stabilize | CUT-01, CUT-02, CUT-03, CUT-04, GATE-01, GATE-02, GATE-03, GATE-04, OPS-01, OPS-02, OPS-03, OPS-04 | — (Phase 51, v3.0.0, merged) | Not started |
+| 52 | Subtract and Stabilize | CUT-01, CUT-02, CUT-03, CUT-04, GATE-01, GATE-02, GATE-03, GATE-04, OPS-01, OPS-02, OPS-03, OPS-04 | — (Phase 51, v3.0.0, merged) | Complete |
 | 53 | The Question Channel | ASK-01, ASK-02, ASK-03, ASK-04, ASK-05 | 52 | Not started |
 | 54 | Decision Triage | TRIAGE-01, TRIAGE-02, TRIAGE-03, TRIAGE-04 | 53 (its recorded questions are the bake-off corpus) | Not started |
 | 55 | Failover Generalized | FAIL-01, FAIL-02, FAIL-03, FAIL-04, FAIL-05, FAIL-06 | 52 (independent of 53-54; sequenced last) | Not started |
@@ -91,11 +91,14 @@ than split: no requirement dependency forces a split, and the Validate-gate desi
      rows' tests, OPERATIONS.md rows, README/ARCHITECTURE/CONTRIBUTING mentions and `doc-check-allowlist.toml`
      entries removed rather than allowlisted around; a source-scan Rust test asserts that no literal of the removed
      surface (`cron-instructions`, `hermes_cron`, `yes_ship`, the four after-ship hook names, the removed `Stage`
-     variants) remains under `crates/`, `docs/` or the top-level docs, comments stripped. **Control:** the same test
-     fails on a planted stray literal, and the plant is removed before the phase closes. (CUT-03, CUT-04)
+     variants) remains under `crates/`, `docs/` or the top-level docs, comments stripped. `CHANGELOG.md` (release
+     history, which records the removal), `.planning/` and the operator-owned `CLAUDE.md` are outside the scan. **Control:** the same test
+     fails on a planted stray literal, and the plant is removed before the phase closes. (CUT-03, CUT-04; scan scope
+     amended 2026-11-09, 52-CONTEXT D-40)
   3. A rate limit with no usable fallback waits at a gate whose context names the reset time and the exact
      `devflow resume --phase N ...` command to run after it. Once the reset time passes, the supervisor relaunches the
-     stage exactly once by itself. A denial with no reset time, or a second denial, leaves the gate open for the
+     stage by itself, at most once: after a supervisor crash past the timer's claim, the operator runs the gate's
+     resume command (amended 2026-11-09, 52-CONTEXT D-45 rule 5). A denial with no reset time, or a second denial, leaves the gate open for the
      operator. No `cron-instructions-NN.json` exists under `.devflow/` afterwards. **Controls:** the Phase 51 fixture
      that asserted the cron file was written now asserts its absence and the gate's presence — one fixture, both
      directions. A denial whose reset time has passed is relaunched once, and a second denial in the same fixture is
@@ -106,7 +109,8 @@ than split: no requirement dependency forces a split, and the Validate-gate desi
      route for a `gaps_found` verdict, `/gsd-quick` with the note for a rejected clean pass (amended 2026-11-08,
      52-CONTEXT D-21); never the whole phase; a verification that reports `gaps_found` is driven to `passed` inside the same run
      (the relaunched agent is told to plan and close the gaps and re-verify), and the Validate gate never reads
-     "passed" while the report says otherwise. `devflow gate show` prints a failure gate's full reason untruncated,
+     "passed" while the report says otherwise; a run finishes only when GSD reports `passed` and the Validate agent
+     passed on the current commit (amended 2026-11-09, 52-CONTEXT D-45). `devflow gate show` prints a failure gate's full reason untruncated,
      and the banner and `gate list` cut keep the "way on" sentence first. **Controls:** the pre-fix prompt path, kept
      as a fixture, fails the verbatim assertion; a `gaps_found` report with the gate forced to "passed" fails the
      never-lies assertion; a note reading "do not abort, fix the test" leaves the run alive; a failure reason longer than 300 characters
@@ -123,7 +127,40 @@ than split: no requirement dependency forces a split, and the Validate-gate desi
      appear; on DevFlow's own checkout the provenance warning still fires; a run whose worktree is present still
      reports as active. (OPS-01, OPS-02, OPS-03, OPS-04)
 
-**Plans**: TBD
+**Plans**: 33/33 plans complete
+- [x] 52-01-PLAN.md
+- [x] 52-02-PLAN.md
+- [x] 52-03-PLAN.md
+- [x] 52-04-PLAN.md
+- [x] 52-05-PLAN.md
+- [x] 52-06-PLAN.md
+- [x] 52-07-PLAN.md
+- [x] 52-08-PLAN.md
+- [x] 52-09-PLAN.md
+- [x] 52-10-PLAN.md
+- [x] 52-11-PLAN.md
+- [x] 52-12-PLAN.md
+- [x] 52-13-PLAN.md
+- [x] 52-14-PLAN.md
+- [x] 52-15-PLAN.md
+- [x] 52-16-PLAN.md
+- [x] 52-17-PLAN.md
+- [x] 52-18-PLAN.md
+- [x] 52-19-PLAN.md
+- [x] 52-20-PLAN.md
+- [x] 52-21-PLAN.md
+- [x] 52-22-PLAN.md
+- [x] 52-23-PLAN.md
+- [x] 52-24-PLAN.md
+- [x] 52-25-PLAN.md
+- [x] 52-26-PLAN.md
+- [x] 52-27-PLAN.md
+- [x] 52-28-PLAN.md
+- [x] 52-29-PLAN.md
+- [x] 52-30-PLAN.md
+- [x] 52-31-PLAN.md
+- [x] 52-32-PLAN.md
+- [x] 52-33-PLAN.md
 **UI hint**: no
 
 ### Phase 53: The Question Channel
@@ -402,7 +439,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 50 | 29/29 | Complete | 2026-10-21 |
 | 50.1 | 30/30 | Complete | 2026-11-02 |
 | 51 | 13/13 | Complete | 2026-11-08 |
-| 52 | 0/? | Not started | — |
+| 52 | 33/33 | Complete | 2026-11-11 |
 | 53 | 0/? | Not started | — |
 | 54 | 0/? | Not started | — |
 | 55 | 0/? | Not started | — |
@@ -633,6 +670,224 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.231: `pre-push` Runs the Workspace Divergence Check Against the Checkout, Not the Pushed Ref (BACKLOG)
+
+**Found:** 2026-11-11, Phase 52 close-out. `git push -u origin feature/phase-52-pr` from the phase-52 worktree with
+`feature/phase-52` checked out was refused with about 100 "undeclared change to a develop file" lines.
+**Defect:** `scripts/hooks/pre-push` runs `scripts/check-workspace-divergence.sh` whenever the pushing checkout has a
+`.workspace-divergence` file, and the check diffs `origin/develop` against `HEAD`. Neither looks at the ref being
+pushed, so a clean PR branch pushed from a workspace-style checkout is judged as the checkout's own branch. The same
+push from a checkout of the PR branch itself (no manifest) passed.
+**Not established:** whether the reverse also happens (a workspace branch pushed from a develop-based checkout would
+skip the check: a fail-open shape). Read from source, not reproduced.
+**Fix shape:** run the check per pushed `local_sha` from the hook's stdin lines, only for `refs/heads/workspace/*`
+remote refs, reading the manifest from that commit (`git show <sha>:.workspace-divergence`) rather than the working
+tree. Add a test with both directions. Take it on the next fix branch.
+
+### Phase 999.230: `cut-pr-branch.sh` Phase Mode Drops Phase Work With a Non-Phase Scope, and Halts on the Conflict (BACKLOG)
+
+**Found:** 2026-11-11, Phase 52 close-out. The replay stopped with "unresolved code conflict in commit 8d1429d"
+(`feat(52-30)`) on three files.
+**Defect:** `bb8a0df feat(cli): print the route each gate answer runs` was Phase 52 work, made on the phase branch,
+with a `(cli)` scope. `SCOPE_RE` skipped it, so the later phase commit that built on it could not apply. Unlike the
+`(NN-review)` case in 999.167, the dropped commit is not reported after the fact: the run halts and deletes nothing
+useful, and the script has no way to name extra commits. Worked around by running the cut from a throwaway branch
+where only that commit's subject was re-scoped to `(52)` (identical tree, checked), so the phase branch's SHAs, which
+planning docs cite, were not rewritten.
+**Fix shape:** add `--include <sha>` (repeatable) and, before replaying, list every non-planning commit in the range
+the scope filter skips, so an unscoped phase commit is visible up front. Pair with 999.167. Next fix branch.
+
+### Phase 999.229: An Invalid `DEVFLOW_EXTERNAL_VERIFY_ENABLED` Is Ignored With No Operator-Visible Line (BACKLOG)
+
+**Found:** 2026-11-11, Phase 52 plan 52-23 (`.planning/phases/52-subtract-and-stabilize/deferred-items.md`). The variable is read only in the detached supervisor, so an invalid
+value falls back silently from the operator's point of view (the warning goes to the supervisor's tracing, which is
+off by default since 52-23). Breaks the fail-closed-observability rule.
+**Fix shape:** validate it once in the foreground at `devflow start`/`resume` and refuse or print a `warning:` line,
+or record an event the operator sees in `status`. Small: next phase or any fix branch.
+
+### Phase 999.228: `devflow doctor` Still Checks for the `gh` CLI (BACKLOG)
+
+**Found:** 2026-11-11, Phase 52 plan 52-15 (`.planning/phases/52-subtract-and-stabilize/deferred-items.md`). Nothing runs `gh` since Ship was removed, so the check reports a
+dependency the tool no longer has. **Fix shape:** drop the check and its doc row. Small: any fix branch.
+
+### Phase 999.227: Stale v3 Wording in Comments, Test Names and One Retention Count (BACKLOG)
+
+**Found:** 2026-11-11, Phase 52 plans 52-03, 52-10, 52-13, 52-15 (`.planning/phases/52-subtract-and-stabilize/deferred-items.md`). Comments and test names still describe the
+removed cron resume, the after-ship hooks (`test_support.rs` `init_repo`), and Ship as the stage after Validate;
+`gate_sweep_e2e::no_suite_on_the_common_builder_runs_a_real_reap_strays_pass` guards a flag that no longer exists;
+the capture-retention arithmetic still counts a five-stage run. The removed-surface scan (52-18) strips comments, so
+it does not see these.
+**Not established:** whether the five-stage retention count changes how many captures are kept (behaviour) or is only
+a comment; check first.
+**Fix shape:** one wording sweep plus the retention check; delete or rewrite the obsolete guard test. Small.
+
+### Phase 999.226: devflow-core Public Items With No Production Caller After the v4 Cuts (BACKLOG)
+
+**Found:** 2026-11-11, Phase 52 plans 52-03, 52-12, 52-15, 52-24 and the phase verifier (`.planning/phases/52-subtract-and-stabilize/deferred-items.md`, 52-VERIFICATION.md).
+Kept because each is `pub` in the published crate and its plan did not list it: the stray-reaping primitives (their
+only destructive caller, `gate sweep --reap-strays`, went in 52-03); `GitFlow::commit_all` and other uncalled
+`GitFlow` functions; `agent_result::phase_verification_fingerprint` and `phase_verification_mtime_nanos`;
+`reset_time::auto_relaunch_due` (only its own test calls it); the unused `project_root` parameter of
+`StageIntent::for_stage_in_project` and `prompt::stage_prompt_for_project`.
+**Fix shape:** remove them before 4.0.0 is published, so the removal rides the same major bump instead of forcing a
+5.0.0; record each `function_missing` from `cargo semver-checks`. Take it at Phase 52 close-out if the operator
+agrees, else first in the next phase.
+**Resolved:** 2026-11-11 at Phase 52 close-out, on the operator's answer (remove inside 4.0.0). Removed: `agent::process_age`,
+`agent::STRAY_MIN_AGE`, seven `GitFlow` methods (`commit_all`, `branch_tip`, `delete_remote_branch`, `ensure_branch`,
+`feature_finish`, `release_start`, `release_finish`), both `phase_verification_*` helpers, `reset_time::auto_relaunch_due`
+(new in Phase 52, never published), `prompt::stage_prompt_for_project` and `StageIntent::for_stage_in_project`
+(`for_stage` is now the one default builder). `cargo semver-checks` reports each as `function_missing`,
+`inherent_method_missing` or `pub_module_level_const_missing`. `discover_stray_devflow_processes` stays: `doctor` calls it.
+
+### Phase 999.225: `parse_reset_time` Accepts a Day Past the Month's End (BACKLOG)
+
+**Found:** 2026-11-11, Phase 52 plan 52-01 (`.planning/phases/52-subtract-and-stabilize/deferred-items.md`); deferred through 52-31 and 52-32. A reset such as Feb 31 parses
+instead of being refused. It always yields a later instant, never an earlier one, so a relaunch can only be late, not
+early (52-31 SUMMARY). **Fix shape:** validate the day against the month (and leap years) and return `None`, which
+leads to a plain gate; add the boundary tests. Small: any fix branch.
+
+### Phase 999.224: Replace the Overloaded `--force` Flags With Named Actions (BACKLOG)
+
+**Found:** 2026-11-11, Phase 52 code review (CR-02, IN-03) and the operator's question "what is the purpose of the
+--force flags? ... is this compensating for poor design?". Operator decision the same day: close the data-loss path in
+Phase 52 (no `--force` deletes an unmerged phase branch), and file the redesign here.
+
+**What is wrong:** one `--force` per command authorises several unrelated destructive actions at once, and DevFlow's
+own messages route the operator through it as the normal path.
+- `devflow start --force`: removes and recreates an existing phase worktree from the base (discards uncommitted work),
+  deletes `feature/phase-NN` (before the Phase 52 fix: `git branch -D`), and, in the primary-checkout path, overrides
+  the "base is >50 commits ahead" refusal.
+- `devflow cleanup --force`: removes a stopped or finished run's kept worktree, removes one whose supervisor is stale
+  or unprobeable (its agent may still be alive), force-removes a dirty worktree, deletes the branch, and removes the
+  run's state file.
+- The routine path: `resume` refuses a finished run and names `devflow start`; `start` refuses because the worktree
+  exists and names `--force` ("recreates ... discarding what is in it", `commands::restart_verb`). A hand-run
+  `devflow advance` over a finished run names `devflow resume`, which refuses it (review IN-03,
+  `pipeline_launch.rs` ~L3646-3660).
+- In 3.x a finished run had shipped, so the branch was usually merged; in v4 a finished run ends at Validate and its
+  branch is the only copy of the work until close-out.
+
+**Fix shape (recommendation, not decided):**
+1. `start` over a finished or stopped phase reuses its worktree and branch (continue on it) instead of demanding
+   `--force`; `resume`, `advance` and `status` name that verb.
+2. One explicit discard verb (e.g. `devflow discard --phase N`) that lists exactly what it will remove (worktree,
+   uncommitted changes, state, branch) and refuses an unmerged branch unless the operator names it.
+3. A stale or unprobeable supervisor goes through `devflow stop`, which already ends orphaned runs; `cleanup` stops
+   offering `--force` for it.
+4. The base-behind refusal gets an override named for what it overrides, or is dropped.
+5. Remove both `--force` flags; `cleanup` removes only what is provably safe (merged, clean, no live run).
+
+**Interim fix already in Phase 52 (3f0714f):** `start --force` refuses over a phase branch with commits not in the
+base (worktree and no-worktree paths) and `cleanup --force` keeps such a branch, naming the delete command. Left by
+it: `start --force` still discards uncommitted files in a merged branch's worktree; the "replaces the state of a
+finished run" notice may print before the refusal (unchecked); the `--no-worktree` refusal's `git branch -D` hint
+fails if the main checkout has the branch checked out; no test exercises a non-default base.
+
+**Not established:** whether any operator workflow depends on `start --force` recreating a phase from scratch beyond
+the discard case above. Removing a verb is a CLI break (4.x major, or fold into 4.0.0 if not yet released).
+
+**Take it in:** the next phase after Phase 52 (v4 operator-surface work), before any external user.
+
+### Phase 999.223: `stop_ends_a_launch_its_running_launcher_promotes_during_the_wait` Flakes on Its Liveness Check (BACKLOG)
+
+**Found:** 2026-11-11, Phase 52 plan 52-28, first full `cargo nextest run --workspace` (2010 tests, 1 failed). The test
+failed at `crates/devflow-cli/tests/pending_supervisor_e2e.rs` ~L309 (`its liveness file is gone`): `liveness::probe`
+read `Live`, not `Missing`, right after `stop` returned.
+**Evidence:** 1 failure; then 3/3 isolated reruns and the next two full runs passed. 52-28 touched no stop, supervisor or
+liveness code.
+
+**Not established:** the cause. Suspected: the fork-inherits-fd family of 999.221/999.222 (another test's child holding
+a duplicate of the liveness lock's open file description until its `exec`), or the ended supervisor's exit racing the
+probe under load. Not reproduced on demand. If it is the fd family, `stop` itself could briefly report a live run in a
+multi-threaded caller, not only in tests.
+
+**Fix shape:** make the assertion wait (bounded, ~2 s) for `Missing`, or fold into 999.221's fix; check whether the
+lock fds are `O_CLOEXEC` and whether test helpers fork without exec. Small: any fix branch, ideally with 999.221/222.
+
+### Phase 999.222: The GSD Test Stub Can Fail to Exec With "Text file busy" (BACKLOG)
+
+**Found:** 2026-11-11, Phase 52 plan 52-24, first `scripts/check.sh all` run (`cargo test --workspace`, devflow-core
+lib: 1062 passed, 1 failed). `gsd_reader::tests::a_gaps_found_report_reads_as_gaps_found` failed at
+`crates/devflow-core/src/gsd_reader.rs` ~L712 with `Spawn { message: "Text file busy (os error 26)" }`.
+**Evidence:** 1 failure; then 3/3 isolated reruns and the next full `check.sh all` passed. 52-24 touched neither
+`gsd_reader.rs` nor `test_support.rs`. `test_support::plant_gsd_run_stub` (~L374) writes the launcher script with
+`fs::write` and the reader executes it straight after, while other test threads fork children.
+
+**Not established:** the cause. Suspected: a child forked by another thread between the stub's open and close inherits
+the write fd until its own `exec`, so exec of the stub gets `ETXTBSY`. Same fork-inherits-fd family as 999.221. Not
+reproduced on demand.
+
+**Fix shape:** write the stub to a temp name in the same directory, close it, and `rename` it into place (the exec'd
+inode was never open for writing), or retry the spawn on `ETXTBSY` in test builds only. Small: the next Phase 52 plan
+that touches `plant_gsd_run_stub` (52-27 or 52-29), else any fix branch.
+
+### Phase 999.221: `status_and_doctor_name_a_held_state_write_lock` Flakes on Its "Released" Control (BACKLOG)
+
+**Found:** 2026-11-10, Phase 52 wave 7 post-merge gate (`cargo test`, whole workspace). The test (added in
+`6f2a193`, Phase 50.1) failed once at `crates/devflow-cli/src/commands.rs` ~L17661 (`control: released`): after the
+holder thread dropped its lock and was joined, `write_lock_status` still read `Held` with an unknown holder.
+**Evidence:** 1 failure in the gate run; then 10/10 passes run alone under nextest and 3/3 whole-`--bin devflow` runs
+under in-process `cargo test` (669 passed each). Plan 52-08, the only change since the previous green gate, does not
+touch the lock code.
+
+**Not established:** the cause. Suspected: the lock is an `flock` on an open file description, and another test in the
+same process forking a child (before its `exec` closes the `O_CLOEXEC` fd) holds a duplicate of that description for a
+moment, so the lock outlives the release. Not reproduced on demand.
+
+**Fix shape:** make the control wait for the release with a short bounded poll (e.g. up to 2 s) instead of one read, or
+run the test in its own process; if the fork hypothesis is confirmed, note it beside `write_lock_status`, since
+`status`/`doctor` could show the same brief false "held" in a multi-threaded caller. Small: any fix branch.
+
+### Phase 999.220: `cut-release.sh` Cannot See a `BREAKING CHANGE` Footer (BACKLOG)
+
+**Found:** 2026-11-10, Phase 52 plan 52-05 executor, confirmed from source by the orchestrator. `scripts/cut-release.sh`
+reads commits with `git log --no-merges <anchor>..HEAD --format=%s` (L128, L179): subject lines only. Its major-bump
+test (L132) checks `'!' in <type prefix> or 'BREAKING CHANGE' in c`, so the second half can never match: a Conventional
+Commits `BREAKING CHANGE:` footer is in the body, which the script never reads.
+
+**The defect:** a breaking change marked only by a footer is released as a minor bump. Phase 52 is not affected in
+practice, because its range also holds `feat(52-02)!:` commits, which the `!` test catches. Plan 52-05's own breaking
+commit (`39f6edc`) carries the marker only in its footer.
+
+**Not established:** not run against a real range; read from source only.
+
+**Fix shape:** read `--format=%B` (or `%s%n%b` with a record separator) and match `^BREAKING[ -]CHANGE:` on body lines;
+add a test case of a footer-only breaking commit that must produce a major bump. Small: fold into the Phase 52 close-out
+or the next fix branch.
+**Rescheduled:** 2026-11-11. The operator chose not to release at Phase 52 close-out (version `4.0.0-alpha.1`, unpublished),
+so this is needed only before the next real cut: take it at the v4.0 milestone close, before 4.0.0.
+
+### Phase 999.219: `devflow resume` (and `start --no-worktree`) Commits GSD's First Chain-Flag Write as a "Killed Run" Leak Repair (BACKLOG)
+
+**Found:** 2026-11-10, Phase 52 plan check after the round-5 review (`52-plan-review-5`), from source; not
+reproduced live. A project whose committed `.planning/config.json` has no `workflow._auto_chain_active` key gets
+`"_auto_chain_active": false` added, uncommitted, by GSD's own `/gsd-plan-phase` (`plan-phase/steps/auto-advance-check.md`
+L17; upstream open-gsd/gsd-core#6124). On the next `devflow resume`, `repair_leaked_auto_chain_flag`
+(`pipeline_launch.rs` L494, called at L3634) runs `force_clear_auto_chain` (`gsd_config.rs` L245): `set_auto_chain_active(false)`
+changes nothing, `probe_head` reports `Differs` (the key is absent in HEAD), `without_flag` makes the two copies equal,
+so `commit_path` commits GSD's write with `REPAIR_COMMIT_MESSAGE` ("A previous run for this phase was killed before its
+in-process guard could clear workflow._auto_chain_active …", L346-356), sets `committed_tree_repaired`, and the run
+prints the killed-run notice and emits `auto_chain_flag_repaired`.
+
+**The defect:** the repair cannot tell a leaked `true` from an absent key that GSD set to `false`. The commit itself is
+harmless (it records the value the absent key already meant), but its message and the notice are false: no run was
+killed and nothing leaked.
+
+**Not established:** a live run has not produced it. `devflow start` in worktree mode cannot hit it in the same run
+(its repair runs before that run's Plan, and an existing phase worktree makes `start` refuse). From source, not run:
+`devflow start --no-worktree` launches in the project checkout (`commands.rs` ~L705-719) with no dirty-tree refusal
+before the repair (~L714), so a checkout still holding an uncommitted GSD write from an earlier run or a hand-run
+`/gsd-plan-phase` gets it committed under the same false message, provided git carries the write across
+`feature_start`'s `git checkout <develop>` (`git.rs` ~L157-161; otherwise start fails first) and the flag is the file's
+only difference from develop (otherwise the repair declines with a warning).
+
+**Fix shape (not decided):** report and commit a repair only when HEAD or the working tree actually held `true`; when
+HEAD lacks the key and the working copy holds `false`, either commit with an accurate message ("record GSD's
+`_auto_chain_active: false`") or leave it to the operator, and say which. Add a fixture row: HEAD without the key,
+working tree `false` → no killed-run notice.
+
+**Disposition (operator, 2026-11-10):** a separate fix branch after Phase 52, not folded into the phase.
+
 ### Phase 999.218: The Plan-Bashism Scanner Drops the Finding Text When the File Path Is Long (DUPLICATE of 999.169)
 
 **Disposition (2026-11-08, v4.0 backlog prune):** Filed 2026-11-08 without checking the backlog: 999.169 (2026-10-22) records the same defect with its cause, the report being piped through `cut -c1-200`. This entry's 'mechanism not read' is superseded by that.
@@ -817,6 +1072,8 @@ a re-verify step rather than to `FullExecute`. Or raise upstream that a report w
 `stale` even when its status is `gaps_found`. Relates to 999.192, 999.205.
 
 **Upstream:** filed 2026-11-08 as https://github.com/open-gsd/gsd-core/issues/6078. It was reproduced on gsd-core 1.20.1: a covered-file change flips a `passed` report to `stale` but leaves a `gaps_found` report `gaps_found`. Phase 52 handles it with a gate (52-CONTEXT D-11).
+**Moved upstream (operator, 2026-11-09, 52-CONTEXT D-45):** Phase 52 no longer detects this case. A stale `gaps_found`
+report runs the gap loop, whose execute-phase re-verifies. The fix belongs in gsd-core #6078.
 
 ### Phase 999.207: A Quota Denial Followed by a Line the Agent Was Killed Mid-Way Through Still Splits the Monitor and the Verdict (BACKLOG)
 

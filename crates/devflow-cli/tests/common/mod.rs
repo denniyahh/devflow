@@ -123,6 +123,88 @@ pub fn fake_bin_dir_for(program: &str, agent_body: &str) -> FakeBin {
     }
 }
 
+/// The file under a capture agent's `logs` dir that holds its argv, one
+/// argument per line.
+pub const AGENT_ARGV_LOG: &str = "agent-argv";
+
+/// The file under a capture agent's `logs` dir that holds its stdin.
+pub const AGENT_STDIN_LOG: &str = "agent-stdin";
+
+/// The codex `--json` event lines a finished turn prints: the stream DevFlow's
+/// codex driver parses, whose final `agent_message` carries a `DEVFLOW_RESULT`
+/// success line.
+pub const CODEX_SUCCESS_EVENTS: &str = r#"printf '%s\n' '{"type":"thread.started","thread_id":"t-fake"}'
+printf '%s\n' '{"type":"turn.started"}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"work done\nDEVFLOW_RESULT: {\"status\":\"success\",\"commits\":1}"}}'
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1}}'"#;
+
+/// A fake capture-shape agent: `codex`, which gets its prompt as argv. It
+/// answers `--version`, appends its argv (one argument per line) to
+/// `logs/`[`AGENT_ARGV_LOG`] and its stdin to `logs/`[`AGENT_STDIN_LOG`],
+/// commits one empty commit as its "work", prints a successful codex turn
+/// ([`CODEX_SUCCESS_EVENTS`]) and exits 0.
+pub fn capture_agent_bin(logs: &Path) -> FakeBin {
+    capture_agent_bin_then(
+        logs,
+        &format!(
+            "git commit -q --allow-empty -m \"fake stage work\"\n{CODEX_SUCCESS_EVENTS}\nexit 0"
+        ),
+    )
+}
+
+/// [`capture_agent_bin`] that, after logging, stays running until it is
+/// ended instead of finishing its turn.
+pub fn waiting_capture_agent_bin(logs: &Path) -> FakeBin {
+    capture_agent_bin_then(logs, "sleep 120")
+}
+
+/// The fake `codex` behind [`capture_agent_bin`]: answer `--version`, log
+/// argv and stdin under `logs`, then run the shell lines `tail`.
+pub fn capture_agent_bin_then(logs: &Path, tail: &str) -> FakeBin {
+    let logs = logs.to_str().expect("a UTF-8 logs path");
+    assert!(
+        !logs.contains('\''),
+        "the logs path is single-quoted in the stub: {logs}"
+    );
+    fake_bin_dir_for(
+        "codex",
+        &format!(
+            "if [ \"$1\" = \"--version\" ]; then echo \"codex-cli 0.0.0-fake\"; exit 0; fi\n\
+             for arg in \"$@\"; do printf '%s\\n' \"$arg\"; done >> '{logs}/{AGENT_ARGV_LOG}'\n\
+             cat >> '{logs}/{AGENT_STDIN_LOG}'\n\
+             {tail}"
+        ),
+    )
+}
+
+/// Plant a `gsd_run` stub at `<home>/.claude/gsd-core/bin/gsd_run`, so a run
+/// under `home` reads GSD's verification status from `responses` (one reply
+/// per `query verification status` call, in order) and never from a real GSD
+/// install. Each call's working directory and argv land in `logs`; read them
+/// with [`gsd_run_calls`]. See `devflow_core::test_support::plant_gsd_run_stub`
+/// for what the stub answers.
+pub fn stub_gsd_run(home: &HermeticHome, responses: &[&str], logs: &Path) {
+    devflow_core::test_support::plant_gsd_run_stub(home.home(), responses, logs);
+}
+
+/// The calls a [`stub_gsd_run`] stub logged under `logs`, as
+/// `(working directory, argv)`, in call order.
+pub fn gsd_run_calls(logs: &Path) -> Vec<(PathBuf, String)> {
+    devflow_core::test_support::gsd_run_calls(logs)
+}
+
+/// Write a CONTEXT.md for `phase` under `root` and return its path relative to
+/// `root`, for the caller to commit. `start` refuses to launch codex for a
+/// phase with no CONTEXT.md on the base branch.
+pub fn write_phase_context(root: &Path, phase: PhaseId) -> String {
+    let padded = phase.padded();
+    let relative = format!(".planning/phases/{padded}-fixture/{padded}-CONTEXT.md");
+    let path = root.join(&relative);
+    fs::create_dir_all(path.parent().expect("a phase dir")).unwrap();
+    fs::write(&path, "# Context\n").unwrap();
+    relative
+}
+
 /// Poll `predicate` every 25ms until it is true, panicking with `what` once
 /// `timeout` elapses.
 pub fn wait_for(mut predicate: impl FnMut() -> bool, timeout: Duration, what: &str) {
@@ -220,6 +302,22 @@ impl LaunchedRunReaper {
                 devflow_core::agent::agent_running(pid).then_some((pid, start))
             })
             .collect()
+    }
+
+    /// Whether every supervisor this run started has exited on its own within
+    /// `within`. Ends nothing: a run that is still live reads `false`, so a
+    /// caller can count a run's events only once nothing can add to them.
+    pub fn supervisors_exited_within(&self, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        loop {
+            if self.live_supervisors().is_empty() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     /// Wait for this phase's supervisors to exit, then end any left, so none

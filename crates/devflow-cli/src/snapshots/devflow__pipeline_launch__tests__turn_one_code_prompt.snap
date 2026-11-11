@@ -8,7 +8,7 @@ Validation reported issues. Run the fix command for this loop:
 
 ## Advisory incremental self-review
 
-After each plan or wave lands, perform a quick, shallow self-check for doc accuracy, leaked data, CI/build correctness, and external-state claims. Record any drift in the working output and continue execution; the authoritative review happens during Ship. This check must not pause execution or request human input.
+After each plan or wave lands, perform a quick, shallow self-check for doc accuracy, leaked data, CI/build correctness, and external-state claims. Record any drift in the working output and continue execution; this self-check is not the authoritative review of the phase. This check must not pause execution or request human input.
 
 ## Unattended decision checkpoints
 

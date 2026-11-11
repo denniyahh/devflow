@@ -56,6 +56,7 @@ pub(crate) fn state_on_disk_at_gate(
             stage,
             &GateResponse {
                 approved: false,
+                abort: true,
                 note: Some("abort: test cleanup".into()),
                 responded_by: Some("test".into()),
             },
@@ -110,10 +111,8 @@ pub(crate) fn gate_claim_files(root: &Path, phase: PhaseId, stage: Stage) -> Vec
 ///
 /// `PATH` is no longer process-global in this crate's tests: child fixtures
 /// supply a directory-only value through `run_test_in_child`. This mutex
-/// currently guards the four deferred process-global variables
-/// `DEVFLOW_GATE_TIMEOUT_SECS`, `DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS`,
-/// `DEVFLOW_GATE_NOTIFY_CMD`, and `DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS`
-/// (WR-02, phase 20 review). A future author adding another mutated variable to
+/// currently guards the two deferred process-global variables
+/// `DEVFLOW_GATE_TIMEOUT_SECS` and `DEVFLOW_GATE_NOTIFY_CMD`. A future author adding another mutated variable to
 /// this crate's tests is joining this set — guard it here, not with a new
 /// mutex (D-02: per-module mutexes were rejected on measured evidence that
 /// one process-global variable can span multiple future target clusters).
@@ -194,36 +193,12 @@ pub(crate) fn init_repo(root: &Path) {
     git(&["checkout", "-q", "-b", "develop"]);
 }
 
-/// Same as [`init_repo`], but without a committed `Cargo.toml`, so
-/// `version_bump` takes its no-version-file branch. Mirrors
-/// `devflow_core::hooks`' `init_repo_with_options(root, false)`.
-pub(crate) fn init_repo_no_version_file(root: &Path) {
-    let git = |args: &[&str]| {
-        let ok = devflow_core::test_support::git_command(root)
-            .args(args)
-            .output()
-            .unwrap()
-            .status
-            .success();
-        assert!(ok, "git {args:?} failed");
-    };
-    git(&["init", "-q"]);
-    git(&["config", "user.email", "devflow@example.com"]);
-    git(&["config", "user.name", "DevFlow Tests"]);
-    git(&["config", "commit.gpgsign", "false"]);
-    git(&["config", "tag.gpgsign", "false"]);
-    git(&["config", "core.hooksPath", "/dev/null"]);
-    std::fs::write(root.join("README.md"), "no version file in this repo\n").unwrap();
-    git(&["add", "."]);
-    git(&["commit", "-q", "-m", "init"]);
-    git(&["branch", "-M", "main"]);
-    git(&["checkout", "-q", "-b", "develop"]);
-}
-
 /// Land one real commit on `feature/phase-{phase:02}`, creating the branch
 /// from the current `HEAD` if it does not already exist. Designed to be
 /// called repeatedly within one test, so each call adds exactly one commit
 /// to the `develop..branch` range — assumes [`init_repo`] has already run.
+/// The file it commits sits at the repository root, outside `.planning/`, so
+/// the commit is progress for the Validate failure streak (D-34, 52-27).
 ///
 /// Uses plain `checkout`, never `checkout -B`, when the branch already
 /// exists: `-B` resets an existing branch to `HEAD`, which would silently
@@ -603,13 +578,14 @@ pub(crate) fn add_agent_stub(path_dir: &Path, program: &str) {
     std::fs::set_permissions(&path, perms).unwrap();
 }
 
-/// A `claude` stand-in that answers `--version`, then waits for `go` in
-/// its working directory (the project root) and exits 0, with `sleep`
-/// linked beside it so the wait works under the replaced PATH.
-pub(crate) fn go_waiting_claude_dir() -> tempfile::TempDir {
-    let path_dir = agent_free_dir_with_agent_stub("claude");
+/// An agent `program` stand-in that answers `--version`, then waits for `go`
+/// in its working directory (the project root) and exits 0, with `sleep`
+/// linked beside it so the wait works under the replaced PATH. A capture-shape
+/// test names `codex`, because a Claude launch takes the stream shape.
+pub(crate) fn go_waiting_agent_dir(program: &str) -> tempfile::TempDir {
+    let path_dir = agent_free_dir_with_agent_stub(program);
     std::fs::write(
-        path_dir.path().join("claude"),
+        path_dir.path().join(program),
         "#!/bin/sh\ncase \"$1\" in --version) exit 0 ;; esac\n\
          while [ ! -e go ]; do sleep 0.05; done\nexit 0\n",
     )
@@ -873,6 +849,178 @@ fn monitor_entry_full() {
 #[ignore = "monitor re-exec entry; run only by spawn_monitor under cfg(test)"]
 fn monitor_entry_supervise_only() {
     run_monitor_harness_entry(false);
+}
+
+/// The child-process seam for GSD's home (52-22): a test that runs stages in
+/// spawned supervisor processes passes a stub home to its child through this
+/// variable, and every process the child starts inherits it. Read only by the
+/// test build; a release build reads `HOME`.
+pub(crate) const TEST_GSD_HOME_ENV: &str = "DEVFLOW_TEST_GSD_HOME";
+
+/// The GSD stub home registered for each evidence root by a live [`GsdStub`].
+/// Keyed by root, not by thread, so a read on any thread of this process (an
+/// `advance` a test runs on a scoped thread) finds the stub its test installed.
+static GSD_HOMES: Mutex<Vec<(PathBuf, PathBuf)>> = Mutex::new(Vec::new());
+
+/// The GSD home a test build reads under for `evidence_root`: the stub a
+/// [`GsdStub`] registered for that root, else the home named by
+/// [`TEST_GSD_HOME_ENV`]. With neither, `None`, so the read fails closed as a
+/// missing launcher and never reaches a real GSD install.
+pub(crate) fn test_gsd_home(evidence_root: &Path) -> Option<PathBuf> {
+    let registered = GSD_HOMES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .rev()
+        .find(|(root, _)| root == evidence_root)
+        .map(|(_, home)| home.clone());
+    registered.or_else(|| std::env::var_os(TEST_GSD_HOME_ENV).map(PathBuf::from))
+}
+
+/// A `gsd_run` stub (`devflow_core::test_support::plant_gsd_run_stub`) under a
+/// temp home, registered as the GSD home for one evidence root until dropped.
+/// Its replies answer that root's verification-status reads in order, one per
+/// read.
+pub(crate) struct GsdStub {
+    dir: tempfile::TempDir,
+    root: PathBuf,
+}
+
+impl GsdStub {
+    /// A stub answering `responses`, registered for `evidence_root`.
+    pub(crate) fn answering(evidence_root: &Path, responses: &[&str]) -> Self {
+        let dir = tempfile::tempdir().expect("create the GSD stub's temp dir");
+        let home = dir.path().join("home");
+        devflow_core::test_support::plant_gsd_run_stub(&home, responses, &dir.path().join("logs"));
+        GSD_HOMES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((evidence_root.to_path_buf(), home));
+        Self {
+            dir,
+            root: evidence_root.to_path_buf(),
+        }
+    }
+
+    /// The stub's home, for a child process's [`TEST_GSD_HOME_ENV`].
+    pub(crate) fn home(&self) -> PathBuf {
+        self.dir.path().join("home")
+    }
+
+    /// The calls the stub logged, as `(working directory, argv)`.
+    pub(crate) fn calls(&self) -> Vec<(PathBuf, String)> {
+        devflow_core::test_support::gsd_run_calls(&self.dir.path().join("logs"))
+    }
+}
+
+impl Drop for GsdStub {
+    fn drop(&mut self) {
+        let home = self.home();
+        GSD_HOMES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|(root, registered)| !(root == &self.root && registered == &home));
+    }
+}
+
+/// GSD's status JSON for `status`, one reply of a [`GsdStub`].
+pub(crate) fn gsd_says(status: devflow_core::gsd_reader::GsdStatus) -> &'static str {
+    devflow_core::test_support::gsd_status_json(status)
+}
+
+/// `phase`'s directory under `evidence_root` (`.planning/phases/NN-fixture`),
+/// created, so `gsd_reader::phase_dir` finds it.
+pub(crate) fn phase_dir_fixture(evidence_root: &Path, phase: PhaseId) -> PathBuf {
+    let dir = evidence_root
+        .join(".planning/phases")
+        .join(format!("{}-fixture", phase.padded()));
+    std::fs::create_dir_all(&dir).expect("create the phase dir fixture");
+    dir
+}
+
+/// Make `root` a git repository with one commit if it is not one already, so a
+/// Validate agent PASS there can be recorded against its HEAD. Returns HEAD.
+pub(crate) fn repo_with_head(root: &Path) -> String {
+    let git = |args: &[&str]| {
+        let output = devflow_core::test_support::git_command(root)
+            .args(args)
+            .output()
+            .expect("spawn git");
+        assert!(output.status.success(), "git {args:?} failed: {output:?}");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    };
+    if !root.join(".git").exists() {
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "devflow@example.com"]);
+        git(&["config", "user.name", "DevFlow Tests"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        git(&["config", "core.hooksPath", "/dev/null"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "evidence root"]);
+    }
+    git(&["rev-parse", "HEAD"])
+}
+
+/// A phase directory for `phase` under `evidence_root` and a GSD stub there
+/// answering `gaps_found` to each of `reads` status reads: what an agent-FAIL
+/// Validate outcome reads (no HEAD read) when a test's subject is the counters
+/// and the auto loop, not GSD's status.
+pub(crate) fn gsd_gaps_found(evidence_root: &Path, phase: PhaseId, reads: usize) -> GsdStub {
+    phase_dir_fixture(evidence_root, phase);
+    let gaps = gsd_says(devflow_core::gsd_reader::GsdStatus::GapsFound);
+    GsdStub::answering(evidence_root, &vec![gaps; reads])
+}
+
+/// Everything a Validate outcome reads in `evidence_root` for `phase`: a phase
+/// directory, a git HEAD, and this thread's GSD stub answering `responses`.
+pub(crate) fn validate_evidence(
+    evidence_root: &Path,
+    phase: PhaseId,
+    responses: &[&str],
+) -> GsdStub {
+    phase_dir_fixture(evidence_root, phase);
+    repo_with_head(evidence_root);
+    GsdStub::answering(evidence_root, responses)
+}
+
+/// Every gate kind, then a file with no kind (C11). The `match` has no
+/// wildcard, so a kind added later fails the build here until its row is
+/// written.
+pub(crate) fn every_gate_kind() -> Vec<Option<devflow_core::gates::GateKind>> {
+    use devflow_core::gates::GateKind;
+    let all = [
+        GateKind::CleanPass,
+        GateKind::GapsFound,
+        GateKind::ReverifyNeeded,
+        GateKind::HumanNeeded,
+        GateKind::DisagreementOverPassed,
+        GateKind::DisagreementOverHumanNeeded,
+        GateKind::ReaderFailure,
+        GateKind::AmbiguousVerdict,
+        GateKind::FailureCap,
+        GateKind::NoGapClosurePlan,
+        GateKind::StageFailure,
+        GateKind::RateLimit,
+        GateKind::Preflight,
+        GateKind::CheckpointDeclaration,
+    ];
+    let listed = |kind: GateKind| match kind {
+        GateKind::CleanPass
+        | GateKind::GapsFound
+        | GateKind::ReverifyNeeded
+        | GateKind::HumanNeeded
+        | GateKind::DisagreementOverPassed
+        | GateKind::DisagreementOverHumanNeeded
+        | GateKind::ReaderFailure
+        | GateKind::AmbiguousVerdict
+        | GateKind::FailureCap
+        | GateKind::NoGapClosurePlan
+        | GateKind::StageFailure
+        | GateKind::RateLimit
+        | GateKind::Preflight
+        | GateKind::CheckpointDeclaration => all.contains(&kind),
+    };
+    assert!(all.iter().all(|kind| listed(*kind)));
+    all.into_iter().map(Some).chain([None]).collect()
 }
 
 #[cfg(test)]

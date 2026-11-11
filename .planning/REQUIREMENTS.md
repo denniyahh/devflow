@@ -11,47 +11,52 @@ requirement closes a backlog entry, the entry is named; `.planning/user/V4-CUT-I
 
 ### Subtraction (CUT)
 
-- [ ] **CUT-01**: A run has no Define stage. `devflow start` begins at Plan (or at the stage the operator names with
+- [x] **CUT-01**: A run has no Define stage. `devflow start` begins at Plan (or at the stage the operator names with
       `--until`-style selection), and `--dry-run` shows no Define. Closes 999.183, 999.214.
-- [ ] **CUT-02**: A run ends after Validate as *finished*: there is no Ship stage, no after-ship hooks (Merge, VersionBump,
+- [x] **CUT-02**: A run ends after Validate as *finished*: there is no Ship stage, no after-ship hooks (Merge, VersionBump,
       ChangelogAppend, BranchCleanup), no `devflow ship` and no `--yes-ship`; the event log records `workflow_finished`
       with `shipped: false` and the worktree and branch are left for the operator. Closes 999.180, 999.210; retires 999.111, 999.129, 999.132, 999.173, 999.178.
-- [ ] **CUT-03**: A rate limit with no usable fallback waits at a gate whose context names the reset time and the exact
-      resume command. Once the reset time passes, the supervisor relaunches the stage by itself, exactly once. With no
+- [x] **CUT-03**: A rate limit with no usable fallback waits at a gate whose context names the reset time and the exact
+      resume command. Once the reset time passes, the supervisor relaunches the stage by itself, at most once (a supervisor crash
+      after the timer claims the gate leaves the relaunch to the gate's `devflow resume` command; amended 2026-11-09,
+      52-CONTEXT D-45 rule 5). With no
       reset time on the denial, or after a second denial, the gate stays open for the operator. No
-      `cron-instructions-NN.json` is written and nothing in the tree or docs refers to it. Closes 999.185, 999.186;
+      `cron-instructions-NN.json` is written and nothing in the tree or docs refers to it, except `CHANGELOG.md`
+      (release history, which records the removal), `.planning/` and the operator-owned `CLAUDE.md`. Closes 999.185, 999.186;
       retires 999.137's R-2. (Amended 2026-11-08 by the operator in the Phase 52 discuss step: auto-relaunch at reset,
-      52-CONTEXT D-15/D-16.)
-- [ ] **CUT-04**: Every inventory row marked `cut` that the operator confirms in the Phase 52 discuss step is removed with
+      52-CONTEXT D-15/D-16. Scan scope amended 2026-11-09 by the operator, 52-CONTEXT D-40.)
+- [x] **CUT-04**: Every inventory row marked `cut` that the operator confirms in the Phase 52 discuss step is removed with
       its documentation, tests, allowlist entries and OPERATIONS.md rows, and `scripts/check.sh all` (including
       `doc_check`) passes on the result. `devflow parallel` is cut (operator 2026-11-08): closes 999.181, retires 999.26.
 
 ### Supervise gate loop (GATE)
 
-- [ ] **GATE-01**: A gate rejection's note reaches the relaunched agent's prompt verbatim. A gate answer aborts the run
+- [x] **GATE-01**: A gate rejection's note reaches the relaunched agent's prompt verbatim. A gate answer aborts the run
       only when it is an explicit abort answer, never because the word "abort" appears in a note. DevFlow's own
       infra-ceiling abort is out of this requirement's scope. Closes 999.189. (Amended 2026-11-08 by the operator after
       the Phase 52 context review, 52-CONTEXT D-20.)
-- [ ] **GATE-02**: A Validate rejection relaunches only the fix work, not the whole phase. A `gaps_found` verdict runs
+- [x] **GATE-02**: A Validate rejection relaunches only the fix work, not the whole phase. A `gaps_found` verdict runs
       GSD's gaps route (`plan-phase --gaps`, then `execute-phase --gaps-only`). A rejection of a clean pass runs
       `/gsd-quick` with the operator's note. Closes 999.192. (Amended 2026-11-08 by the operator after the Phase 52
       context review, 52-CONTEXT D-21.)
-- [ ] **GATE-03**: A verification that reports `gaps_found` can be driven to `passed` from inside the run: the relaunched
+- [x] **GATE-03**: A verification that reports `gaps_found` can be driven to `passed` from inside the run: the relaunched
       agent is told to plan and close the gaps and re-verify, and the Validate gate never says "passed" while the
-      report says otherwise. Closes 999.193, 999.205, 999.208.
-- [ ] **GATE-04**: `devflow gate show` prints a failure gate's full reason, and the banner and `gate list` cut keeps the
+      report says otherwise. DevFlow follows GSD's routes and does not re-judge GSD's report: a run finishes only
+      when GSD reports `passed` and the Validate agent passed on the current commit. Closes 999.193, 999.205.
+      (Amended 2026-11-09 by the operator, 52-CONTEXT D-45: 999.208 moves to gsd-core #6078.)
+- [x] **GATE-04**: `devflow gate show` prints a failure gate's full reason, and the banner and `gate list` cut keeps the
       "way on" sentence first. Closes 999.206.
 
 ### Operator surface (OPS)
 
-- [ ] **OPS-01**: `devflow --version` prints the version with the embedded build commit and dirty flag. Closes 999.216.
-- [ ] **OPS-02**: `devflow cleanup` says why it keeps a worktree (the recorded stop reason, an `--until` halt, or a live
+- [x] **OPS-01**: `devflow --version` prints the version with the embedded build commit and dirty flag. Closes 999.216.
+- [x] **OPS-02**: `devflow cleanup` says why it keeps a worktree (the recorded stop reason, an `--until` halt, or a live
       run), `cleanup --force` removes the run's state together with its worktree, `devflow status` never reports a run
       whose worktree is gone as active, and `devflow start` says when it replaces a stale state. Closes 999.213.
-- [ ] **OPS-03**: Command output carries no `tracing` lines unless `RUST_LOG` is set; `devflow doctor` reports an unset
+- [x] **OPS-03**: Command output carries no `tracing` lines unless `RUST_LOG` is set; `devflow doctor` reports an unset
       `RUST_LOG` as information, not a failure; a project that is not DevFlow's own gets no build-provenance warning and
       one line, not two, for a missing remote. Closes 999.217.
-- [ ] **OPS-04**: `devflow status` shows a stopped run's stop reason and the fallback agent's state (armed, spent, none).
+- [x] **OPS-04**: `devflow status` shows a stopped run's stop reason and the fallback agent's state (armed, spent, none).
       Closes 999.190, 999.202.
 
 ### Question channel (ASK)
@@ -125,18 +130,18 @@ Populated during roadmap creation (2026-11-08). Phase order and dependencies: RO
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| CUT-01 | Phase 52 — Subtract and Stabilize | Pending |
-| CUT-02 | Phase 52 — Subtract and Stabilize | Pending |
-| CUT-03 | Phase 52 — Subtract and Stabilize | Pending |
-| CUT-04 | Phase 52 — Subtract and Stabilize | Pending |
-| GATE-01 | Phase 52 — Subtract and Stabilize | Pending |
-| GATE-02 | Phase 52 — Subtract and Stabilize | Pending |
-| GATE-03 | Phase 52 — Subtract and Stabilize | Pending |
-| GATE-04 | Phase 52 — Subtract and Stabilize | Pending |
-| OPS-01 | Phase 52 — Subtract and Stabilize | Pending |
-| OPS-02 | Phase 52 — Subtract and Stabilize | Pending |
-| OPS-03 | Phase 52 — Subtract and Stabilize | Pending |
-| OPS-04 | Phase 52 — Subtract and Stabilize | Pending |
+| CUT-01 | Phase 52 — Subtract and Stabilize | Complete |
+| CUT-02 | Phase 52 — Subtract and Stabilize | Complete |
+| CUT-03 | Phase 52 — Subtract and Stabilize | Complete |
+| CUT-04 | Phase 52 — Subtract and Stabilize | Complete |
+| GATE-01 | Phase 52 — Subtract and Stabilize | Complete |
+| GATE-02 | Phase 52 — Subtract and Stabilize | Complete |
+| GATE-03 | Phase 52 — Subtract and Stabilize | Complete |
+| GATE-04 | Phase 52 — Subtract and Stabilize | Complete |
+| OPS-01 | Phase 52 — Subtract and Stabilize | Complete |
+| OPS-02 | Phase 52 — Subtract and Stabilize | Complete |
+| OPS-03 | Phase 52 — Subtract and Stabilize | Complete |
+| OPS-04 | Phase 52 — Subtract and Stabilize | Complete |
 | ASK-01 | Phase 53 — The Question Channel | Pending |
 | ASK-02 | Phase 53 — The Question Channel | Pending |
 | ASK-03 | Phase 53 — The Question Channel | Pending |

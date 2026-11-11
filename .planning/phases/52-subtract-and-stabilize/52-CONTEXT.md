@@ -130,7 +130,7 @@ ahead of any GATE or OPS fix (ROADMAP sequencing note). New capabilities belong 
   `/gsd-execute-phase 52`, …), not with `devflow start`. This is an exception to the CLAUDE.md dogfooding rule, which
   says DevFlow drives its own phases from Phase 51 on, and is recorded here as that rule requires. The criterion 1
   control (a `--dry-run` of the installed 3.0.0 binary) is a dry run, not a dogfood run, and still applies.
-- **D-19:** **Verify the gap loop before building it.** No plan task may implement D-08..D-11 (the verdict from GSD's
+- **D-19 [informational]:** (satisfied before planning: checks 1-5 recorded in `52-GAP-LOOP-VERIFICATION.md`; no plan implements it) **Verify the gap loop before building it.** No plan task may implement D-08..D-11 (the verdict from GSD's
   status, the stage-level gap loop, the clean-reject route, the stale-gaps gate) until a recorded check on a throwaway
   GSD project has shown what GSD actually does:
   - `query verification status` returns `passed` / `stale` / `gaps_found` in the cases D-08 assumes;
@@ -159,7 +159,7 @@ operator decisions; D-23..D-31 are within Claude's remit and correct facts or fi
   `stale`, and execute-phase then re-verifies. The check must include a quick fix that touches a file the report does
   **not** cover, because staleness is only shown for covered files. If that case does not go stale, D-10 returns to
   the operator.
-- **D-22 (operator): how the stale `gaps_found` case of D-11 is detected.** GSD's status reader cannot tell it apart
+- **D-22 [informational] (superseded by D-45, not implemented; operator): how the stale `gaps_found` case of D-11 is detected.** GSD's status reader cannot tell it apart
   (#6078), so DevFlow uses GSD's own readers. It reads `covered_files` and `covered_digest` with
   `gsd query frontmatter get <report> --field …`, recomputes the digest with
   `gsd query verification fingerprint <phase_dir> <files…>`, and fires the D-11 gate on a mismatch. DevFlow never
@@ -231,13 +231,206 @@ operator decisions; D-23..D-31 are within Claude's remit and correct facts or fi
 
   This makes a skipped re-verify visible; it does not prevent one. Control: a Code pass that leaves the report
   `stale` ends at a gate, not at Validate's "passed".
-- **D-33 (operator, after check 5): uncovered changes count as stale** (amends D-10, D-21). A fix that only touches
+- **D-33 [informational] (superseded by D-45, not implemented; operator, after check 5): uncovered changes count as stale** (amends D-10, D-21). A fix that only touches
   files outside the report's `covered_files` leaves GSD's status `passed` (check 5 probe). After a clean-reject fix,
   DevFlow lists the files the fix commits changed (git), minus `.planning/`, and subtracts GSD's `covered_files` (read
   with `gsd query frontmatter get`). Anything left is treated as `stale`: the D-32 re-verify relaunch and post-check
   run. This is a stopgap beside GSD's own rule; the upstream request is on #6096 (`/gsd-quick --phase N`), and the
   check is removed once GSD links quick tasks to a phase. Controls: a fix to an uncovered new file triggers the
   re-verify; a fix touching only `.planning/` does not.
+
+### Decisions after research (operator, 2026-11-09)
+
+Source: the three open questions in `52-RESEARCH.md`, each checked against the code before it was put to the operator.
+
+- **D-34: only commits outside `.planning/` count as progress** (amends D-25). `consecutive_failures_made_progress`
+  (`mode.rs` L180-181, used at `pipeline_outcomes.rs` ~L610) treats any new commit on the phase branch as progress and
+  resets the streak to 1. Every gap round commits `.planning/` files (the gap plan, summaries, the re-verified report),
+  so the 3-in-a-row cap could never fire on a real gap loop. Progress is now commits that change at least one path
+  outside `.planning/`. This changes the 999.66 guard, and a docs-only Code fix also counts as no progress. Control:
+  three gap rounds that commit only `.planning/` files force the gate. One round that also changes a source file
+  resets the streak.
+- **D-35: finishing keeps the run's state** (amends D-04, D-29). Today the finish path deletes state
+  (`clear_run_state`, `pipeline_gate.rs` ~L355). That suited 3.0, where Ship merged and deleted the branch. In v4 the
+  branch and worktree stay, and `cleanup` removes a worktree with no state without `--force` (it keeps only a
+  `stopped` state, `commands.rs` ~L1330-1347). So the state stays, recorded as stopped with reason `finished`:
+  - `status` shows the run as finished;
+  - `cleanup` keeps the worktree and says why, and `cleanup --force` removes both (OPS-02);
+  - a new `start` on the phase says it replaces the finished state;
+  - the phase is still deregistered from the machine-global gate registry.
+
+  Control: after a finished run, `cleanup` without `--force` keeps the worktree.
+- **D-36: on a `gaps_found` Validate, `gate approve` runs the gap loop** (amends D-04 for that case). In supervise
+  mode, the Validate gate on a gaps verdict offers three answers:
+  - approve: close the gaps (D-09: Plan `--gaps` → Code `--gaps-only` → Validate);
+  - reject with a note: steer that fix;
+  - abort: end the run.
+
+  Finishing over open gaps is not offered, so a run never ends `finished` with a gaps report. Control: approving a
+  gaps gate never records `workflow_finished`.
+
+### Gate-answer rule (operator, 2026-11-09, after plan checking)
+
+- **D-37: one uniform rule for answering a gate** (supersedes the per-kind routes and the 52-29 route checkpoint).
+  Plan checking kept finding gate kind × status × agent-verdict combinations no decision covered, for example
+  approving a failure-cap gate over a real pass. So the routes do not depend on the gate kind:
+  - **Approve** follows GSD's `verification status`:
+    - `passed` → finish (D-04, D-35), including a failure-cap gate over a real pass;
+    - `gaps_found` → the gap loop (D-09, D-36);
+    - `stale` or `missing` → a re-verify pass (D-08, D-32);
+    - a stale `gaps_found` (D-11), `human_needed`, or a reader failure (D-24) → approve is **not offered**: the
+      answer is refused with a message naming reject and abort.
+  - **Reject with a note** → `/gsd-quick` with the note on every Validate gate (D-10, D-21). On a rate-limit gate,
+    reject relaunches the same stage on the same agent with the note in the prompt.
+  - **Abort** → ends the run (D-13).
+
+  **Scope:** the rule covers the verification-verdict gates (every gate opened with a GSD status, or after a
+  failed GSD read) and the rate-limit gate. Gates that carry no GSD status keep today's answers: a Validate stage
+  *failure* gate (the agent failed to launch), the preflight gate, and the checkpoint-declaration gate. This
+  clarification is Claude's, from the rule's own basis (approve follows GSD's status); the operator may overrule it.
+  Consequences recorded at the operator's request:
+  - rejecting the gaps gate now runs `/gsd-quick` rather than steering the gap loop (approve still runs the loop);
+  - a `human_needed` report cannot finish inside a run: the human check happens outside, through GSD's UAT.
+  `gate_kind` stays as a structured field for display, events and tests. Routing reads only the status and, for
+  reject, whether the gate is a rate-limit gate, never free-text `context`. The routes are total: no gate leaves an
+  answer undefined.
+- **D-38: the automatic-relaunch claim is per gate** (amends D-16, D-27.3). A manual approve of a rate-limit gate
+  relaunches without spending the run's one automatic relaunch. A later denial with a known reset time still gets its
+  one automatic relaunch. Within one gate, the timer and an answer race through a single claim, so there is never a
+  double launch. `not_before` (sweep protection) is kept separate from whether a timer is armed.
+
+- **D-39 (operator, 2026-11-09): status-less gates get their own kinds in the same routers** (amends D-37's
+  Scope paragraph). Three gates fire for reasons unrelated to GSD's verification report:
+  - the stage-failure gate (an agent run failed to launch, crashed, reported failure or timed out, or the infra
+    ceiling was hit);
+  - the preflight gate (a pre-launch check failed);
+  - the checkpoint-declaration gate (Code found unapproved human-only checkpoints).
+
+  Each gets a gate kind (`StageFailure`, `Preflight`, `CheckpointDeclaration`), with today's meanings as explicit
+  arms in `approve_route` and `reject_route`:
+  - stage failure: approve retries the stage; reject relaunches the stage with the note (GATE-01);
+  - preflight: approve is an explicit override (D-18f);
+  - checkpoint declaration: approve means the checkpoints were seen;
+  - on preflight and checkpoint-declaration gates, reject is not offered (approve or abort);
+  - abort ends the run everywhere.
+
+  No gate is kindless. The routers are total over every gate, and every gate text is rendered from them (W3). They
+  never route these three by GSD's status: approving a Code launch failure over an old `passed` report would finish
+  the run without the Code work.
+
+- **D-40 (operator, 2026-11-09): the removed-surface scan excludes release history, planning records and the
+  operator's own instructions file** (amends ROADMAP criterion 2 and CUT-03). `CHANGELOG.md` must name what was
+  removed, `.planning/` names it in order to plan its removal, and `CLAUDE.md` is operator-owned (agents do not edit
+  it; the operator updates its stale Define/Ship lines). So "the top-level docs" in criterion 2 and "nothing in the
+  tree or docs refers to it" in CUT-03 cover the tree and docs except `CHANGELOG.md`, `.planning/` and `CLAUDE.md`. The requirement text is amended to say so, the
+  way D-17 amended criterion 3, so that a literal reading at verification cannot fail correct work. Raised by the
+  Phase 52 plan review (52-REVIEWS.md, P6).
+
+- **D-41 [informational] (superseded by D-45, not implemented; operator, 2026-11-09): approving a fix that re-verify still leaves uncovered finishes the run** (amends D-33
+  for this one gate). When a quick fix's re-verify ran but GSD's report still does not list the fixed file in
+  `covered_files`, the gate that opens records GSD's status (`passed`), names the uncovered files in its context, and
+  `gate approve` finishes the run: the operator accepts the uncovered fix knowingly. It does not run another
+  re-verify, because gsd-core lists only the files its verifier agent chooses, so a re-verify that really ran may never
+  list the file, and the run could then never finish. Reject (fix with the note) and abort keep their D-37 meanings.
+  Raised by the Phase 52 plan check (52-29, review P2).
+
+- **D-42 [informational] (superseded by D-45, not implemented; operator, 2026-11-09): a disagreement gate never finishes** (keeps D-08; overrides 52-29's "`passed` → finish
+  for every verification kind" for these kinds). When the Validate agent says FAIL and GSD's report says `passed` or
+  `human_needed` (`disagreement_over_passed`, `disagreement_over_human_needed`), `gate approve` is refused before
+  anything is written, with a message naming reject and abort. Reject fixes with the note (D-37) and abort ends the run.
+  A finish always needs the agent's pass and GSD's `passed`. Raised by the second Phase 52 plan review (52-plan-review-2,
+  R3).
+
+- **D-43 [informational] (superseded by D-45, not implemented; operator, 2026-11-09): approve on a refused-approve gate re-checks** (amends D-37 for these gates). On a
+  `human_needed` gate, a stale `gaps_found` gate (D-11) and a `reader_failure` gate, `gate approve` means "re-read now".
+  The supervisor re-reads GSD's status (and, for `gaps_found`, the D-11 digest), launching no agent for the re-read, then
+  routes by the fresh read the way `approve_route` routes that status: `passed` finishes (still subject to D-33/D-41),
+  `gaps_found` with a matching digest runs the gap loop, `stale`/`missing` take the re-verify route (D-32). A fresh read
+  whose approve is still refused (still `human_needed`, a stale digest, a reader failure) reopens a gate of the matching
+  kind and counts no failure. Covers the operator who finished UAT outside the run, refreshed the report by hand, or
+  repaired the GSD install. Reject and abort keep their D-37 meanings. Raised by the second Phase 52 plan review
+  (52-plan-review-2, R4).
+  Clarified 2026-11-09 by the orchestrator, from D-08 and D-42 (no new operator choice): "`passed` finishes" applies
+  only to a gate opened over a Validate agent PASS on the current tree. On every other gate (one opened at the end of
+  a Code or re-verify pass, at a quick pass's end, at the gaps Plan, or over a Validate agent FAIL) a fresh `passed`
+  launches Validate instead of finishing, and so does a pickup reopen of such a gate. Raised by the round-5 plan check.
+
+- **D-44 [informational] (superseded by D-45, not implemented; operator, 2026-11-09): a failure-cap gate needs a Validate pass to finish** (amends D-37's "including a
+  failure-cap gate over a real pass" example; applies D-42's rule that a finish needs the agent's pass and GSD's
+  `passed`). Approving a failure-cap gate whose report says `passed` resets the cap count as today and runs Validate
+  once more; the run finishes only if the Validate agent then passes over `passed`. Its other answers keep their D-37
+  meanings. Raised by the round-5 plan check.
+
+### Cut and single check (operator, 2026-11-09, after the third plan review)
+
+- **D-45 (operator, 2026-11-09): DevFlow follows GSD's routes and checks "finished" in one place** (supersedes
+  D-11's gate and D-22, D-32 part 2, D-33, D-41, D-42, D-43, D-44; amends D-08, D-37, D-38, GATE-03). Three plan
+  reviews kept finding new criticals in the machinery that second-guesses GSD's report (uncovered-file tracking,
+  digest re-checks, re-check kinds, verdict combinations per gate kind) and in the rate-limit crash recovery. The
+  operator chose to cut that machinery rather than revise it again. The rules:
+  1. **One finish check.** `can_finish` = a fresh `gsd query verification status` read returns `passed` **and** the
+     run holds a Validate agent PASS recorded against the current HEAD commit. It is the only function that allows
+     `workflow_finished`, and every finish site calls it. No other code path writes a finish. (Clarified 2026-11-10
+     by the orchestrator, who wrote this rule: "finish" means a run that ends with reason `finished`. D-29's
+     `--until plan`/`--until code` halt is a halt, not a finish: it keeps emitting `workflow_finished` with reason
+     `stopped_at` and `finished: false`, needs no permit, and a source-scan test limits the event to those two sites.)
+  2. **Routing follows GSD's fresh status only.** The next step after a Validate, or after an approve, is a function
+     of the fresh status and whether the agent PASS is on HEAD, never of the gate's kind:
+
+     | Fresh GSD status | Agent PASS on HEAD | Auto mode, after Validate | Supervise `gate approve` |
+     |---|---|---|---|
+     | `passed` | yes | finish | finish |
+     | `passed` | no | gate | run Validate again |
+     | `gaps_found` | any | gap loop (D-09) | gap loop (D-09, D-36) |
+     | `stale` or `missing` | any | re-verify Code (D-08, D-32 part 1) | re-verify Code |
+     | `human_needed` | any | gate | re-read; reopen the gate with the fresh facts |
+     | reader failure (D-24) | any | gate | re-read; reopen the gate with the fresh facts |
+
+     In supervise mode every Validate ends at a gate (D-04); approve then takes the right-hand column. Reject with a
+     note runs `/gsd-quick` with the note, then Validate (D-10). Abort ends the run (D-13). A failure-cap gate's
+     approve resets the cap as today and then follows this table. The gate kind stays as a label for display, events
+     and tests (D-37). The status-less gates of D-39 (stage failure, preflight, checkpoint declaration) and the
+     rate-limit gate keep their own answers; none of them can finish a run.
+  3. **What is cut.** DevFlow does not recompute the report's digest (D-11 gate, D-22), track files a quick fix
+     changed that the report does not cover (D-33, D-41, `code_fix_base`, `uncovered_paths`), re-read the status after
+     Code (D-32 part 2: the next Validate's fresh read already refuses to finish over `stale`), or keep per-kind
+     approve rules (D-42, D-43, D-44; the table covers their cases). D-32 part 1, the re-verify prompt quoting GSD's
+     status and route, stays.
+  4. **Accepted limits, fixed upstream.** A `gaps_found` report gone stale (#6078) runs the gap loop, whose own
+     execute-phase re-verifies. A quick fix to a file the report does not cover can leave GSD's `passed` unchanged
+     (#6096); the run still needs a fresh Validate agent PASS on that commit to finish. 999.208 moves to gsd-core
+     #6078 and leaves GATE-03.
+  5. **Rate-limit relaunch is at-most-once.** The run's automatic-relaunch flag is written durably before the timer
+     claims the gate. A crash anywhere after that leaves no automatic relaunch: the operator runs the
+     `devflow resume` command the gate names. There is no crash recovery for the timer. The armed timer wakes at the
+     reset time plus the margin, separately from the gate's lifetime. D-38's per-gate claim stays.
+  6. **The rules are specified as a table and tested as a property.** The plan that implements rules 1 and 2 writes
+     the table above as code (one routing function), and a `proptest` over (status, agent PASS on HEAD, answer, gate
+     kind, mode) asserts that `workflow_finished` is reached only when `can_finish` holds. **Control:** forcing the
+     routing function to finish on `passed` without an agent PASS on HEAD fails the property.
+
+- **D-46 (operator, 2026-11-10): a Validate PASS counts only on a clean tree** (amends D-45 rule 1 and rule 4).
+  `agent_pass_on_head` holds only when the recorded PASS head equals HEAD **and** `git status --porcelain` over the
+  evidence root is empty, `.planning/` included. A dirty tree is not an agent PASS on HEAD: the routing table then
+  takes its "no PASS on HEAD" column, and the gate names the dirty paths (never silent), so approve runs Validate
+  again. One git call inside `read_evidence`; no new state, no file tracking. Raised by the round-4 plan review
+  (52-plan-review-4, U3), which showed that an uncommitted edit during a gate wait could let approve finish over code no
+  Validate agent examined.
+  Amended 2026-11-10 by the operator (plan check, round 4): a Validate whose own outcome reads a dirty tree
+  records **no** PASS (`validate_pass_head` stays unset), so a later clean-up of the tree does not revive it and a
+  finish needs another Validate over the clean tree. The dirty read lists untracked files whatever the git config
+  says (`--untracked-files=all`).
+  Amended 2026-11-10 by the operator (plan review round 5, V1): GSD's own `/gsd-plan-phase` (run without `--auto`)
+  writes `workflow._auto_chain_active false` into the tracked `.planning/config.json` and never commits it, so in a
+  project whose committed config lacks that key, every Validate reads a dirty tree until the file is committed once.
+  This is accepted: D-46 stays exact (`.planning/` included), Phase 52 adds no DevFlow write for it, and the gate
+  names the file. OPERATIONS.md documents the one commit, and the cause is reported upstream as open-gsd/gsd-core#6124.
+  Correction (orchestrator, from source, 2026-11-10): an existing repair already reacts to this file. On
+  `devflow resume`, `force_clear_auto_chain` (35.1) commits GSD's added `false` with a message and notice claiming a
+  killed run leaked the flag; `devflow start --no-worktree` does the same on a checkout that still holds the
+  uncommitted write, when git carries it across start's branch checkout and the flag is the file's only difference
+  from develop (read from source, not run). The commit clears the dirty tree; the message is false. Logged as
+  backlog 999.219.
 
 ### Claude's Discretion
 - How the note is framed inside the prompt: a delimited verbatim block, with control characters other than newline and

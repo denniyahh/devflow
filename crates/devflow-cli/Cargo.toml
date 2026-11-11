@@ -25,6 +25,8 @@ thiserror.workspace = true
 tempfile = "3"
 # Process-group signals in the test reapers' identity-confirmed fallback (50-11).
 libc = "0.2"
+# The D-45 rule 6 property: the routing reaches a finish only through can_finish (52-29).
+proptest = "1.12.0"
 # `test_support::git_command` for this crate's test targets (999.37).
 devflow-core = { workspace = true, features = ["test-support"] }
 # `insta::assert_snapshot!` for the prompt-text drift guard (47-CONTEXT.md D-14/D-15).

@@ -48,11 +48,6 @@ pub fn phase_agent_path(project_root: &Path, phase: PhaseId, agent: &str) -> Pat
     worktrees_dir(project_root).join(format!("phase-{padded}-{agent}", padded = phase.padded()))
 }
 
-/// Worktree path for the static reference snapshot: `.worktrees/reference`.
-pub fn reference_path(project_root: &Path) -> PathBuf {
-    worktrees_dir(project_root).join("reference")
-}
-
 /// Add a worktree.
 ///
 /// When `create_branch` is set, runs `git worktree add -b <branch> <path>
@@ -80,26 +75,6 @@ pub fn add(
     } else {
         run(project_root, &["worktree", "add", &path_str, branch])
     }
-}
-
-/// Add a worktree checked out at `commitish` in **detached HEAD** state.
-///
-/// Used for the static reference snapshot: a branch already checked out in the
-/// main worktree cannot be checked out again, but it can be snapshotted detached
-/// at its tip.
-pub fn add_detached(
-    project_root: &Path,
-    path: &Path,
-    commitish: &str,
-) -> Result<(), WorktreeError> {
-    if path.exists() {
-        return Err(WorktreeError::Exists(path.to_path_buf()));
-    }
-    let path_str = path.to_string_lossy();
-    run(
-        project_root,
-        &["worktree", "add", "--detach", &path_str, commitish],
-    )
 }
 
 /// Remove a worktree directory via `git worktree remove [--force] <path>`.
@@ -234,10 +209,6 @@ mod tests {
         assert_eq!(
             phase_agent_path(root, PhaseId::new(7), "claude"),
             Path::new("/repo/.worktrees/phase-07-claude")
-        );
-        assert_eq!(
-            reference_path(root),
-            Path::new("/repo/.worktrees/reference")
         );
     }
 

@@ -2,20 +2,20 @@
 gsd_state_version: "1.0"
 milestone: v4.0
 milestone_name: Session Continuity
-current_phase: 52
-current_phase_name: Subtract and Stabilize
+current_phase: 53
+current_phase_name: The Question Channel
 status: planning
-stopped_at: Phase 52 context gathered
-last_updated: "2026-11-09T01:59:32.077Z"
-last_activity: 2026-11-08
-last_activity_desc: v4.0 roadmap written (Phases 52-55, 27/27 requirements mapped)
-state_head: 0169b41ba8a2ec9743253dbc03c8946e2d27a3b1
+stopped_at: Phase 52 complete, ready to plan Phase 53
+last_updated: "2026-11-11T20:18:05.078Z"
+last_activity: 2026-11-11
+last_activity_desc: Phase 52 complete, transitioned to Phase 53
+state_head: bf1db36011e2b5e051c90c57f3c5ccfb8b8f5fc3
 progress:
   total_phases: 4
-  completed_phases: 0
-  total_plans: 0
-  completed_plans: 0
-  percent: 0
+  completed_phases: 1
+  total_plans: 33
+  completed_plans: 33
+  percent: 25
 ---
 
 # DevFlow — Project State
@@ -82,9 +82,7 @@ See: `.planning/PROJECT.md` (updated 2026-11-08)
 **Core value:** a coding session that outlives any one agent — the session is the repository, so another agent
 continues the same work when one runs out of quota or budget, and the run asks a human only for the decisions nothing
 else can make (restated by the operator 2026-11-08).
-**Current focus:** planning milestone v4.0 (`/gsd-new-milestone`): pare DevFlow down to a detached runner plus an MCP
-decision channel; cut list in `.planning/user/V4-CUT-INVENTORY.md`. v3.0.0 closed 2026-11-08 (override closeout);
-3.1.0 skipped, Phase 51 ships inside 4.0.0.
+**Current focus:** Phase 52 — Subtract and Stabilize
 
 ## Operator Next Steps
 
@@ -160,10 +158,10 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 52 — Subtract and Stabilize (not started; first of four in v4.0, Phases 52-55)
-Plan: —
-Status: Roadmap created — ready to plan Phase 52
-Last activity: 2026-11-08 — v4.0 roadmap written (Phases 52-55, 27/27 requirements mapped)
+Phase: 53 — The Question Channel
+Plan: Not started
+Status: Ready to plan
+Last activity: 2026-11-11 — Phase 52 complete, transitioned to Phase 53
 
 
 ## Recently Shipped
@@ -841,6 +839,64 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 51]: 51-13: criterion 3 rests on six experiments plus stated gaps; failover and an ordinary launch, and a cron resume and an ordinary resume, dispose every withheld read identically; only a failed ordinary in-supervisor launch is left ungated (backlog, with 51-06/51-10)
 - [Phase 51]: 51-11: the rate-limit failover is documented in a new OPERATIONS.md section (events, gate, 51-06 remedy, idle-timeout wording), pinned row-by-row by doc_check::operations_md_documents_the_fallback_agent_and_its_events
 - [Phase 51]: 51-11: the notify limit sentence (999.154) is reworded to WR-12's fixed behaviour — the gate reloads the state file when it opens
+- [Phase 52]: 52-01: reset_time::parse_reset_time refuses signed epoch seconds and malformed offsets (None, never a UTC guess); the minute round-up is the hermes caller's job, not the parser's
+- [Phase 52]: 52-02: list, reference and test are removed (clap rejects them); worktree::reference_path and worktree::add_detached leave devflow-core with them; removal commits use feat(52-02)!: so cut-release reads a major bump
+- [Phase 52]: 52-03: removed gate approve/reject positionals, start --worktree and gate sweep --reap-strays; resolve_gate_target deleted; doctor's stray hint is now manual (ps -o args= -p <pid>, then kill <pid>)
+- [Phase 52]: 52-04: e2e suites get the capture shape from a fake codex (common::capture_agent_bin), not --legacy-claude-launch; the capture witness now asserts stage_launched launch == capture, because its stdout/exit-code assertions also pass for a stream launch
+- [Phase 52]: 52-05: removed --legacy-claude-launch, DEVFLOW_CLAUDE_LEGACY_LAUNCH and State.legacy_claude_launch; stream_launch_enabled(agent, stage) has no opt-out; capture-shape unit tests run Codex, and Claude-primary failover fixtures keep Claude with a recorded Confirmed canary
+- [Phase 52]: 52-06: devflow release is removed; tools/release-preflight (publish = false) runs the six release checks for scripts/cut-release.sh check|verify via cargo run -q -p release-preflight, and git::publish_order skips publish = false members
+- [Phase 52]: 52-07: devflow parallel is removed; ensure_phase_worktree moved to phase_worktree.rs and retry_after_from_reason to pipeline_outcomes.rs with their tests; FallbackSource::NoFallback deleted with its only constructor
+- [Phase 52]: 52-08: a passing Validate ends the run through pipeline_gate::finish_run (state kept stopped+finished, worktree/branch kept, workflow_finished {reason: finished, shipped: false}, one notify); finish_run ignores stop_until and honours a stop at safe point 6 first
+- [Phase 52]: 52-08: the --until halt notifies once with reason stopped_at; resume refuses a finished run inside reserve_launch, naming devflow start
+- [Phase 52]: A rate limit with no usable fallback waits at the never-silent stage gate and does not charge infra_failures; its context leads with devflow resume --phase N, then the reset time, then the cause (52-09)
+- [Phase 52]: The cron-instructions file has no reader, writer, cleaner, doc or ignore pattern left; ship.rs keeps only ShipError and prepend_changelog, recover has no cron arm, and workflow::clear_state_if lost its after_clear step (52-10)
+- [Phase 52]: devflow ship is an unknown subcommand: ship_override, claim_ship_answer, ship_answer_stored, refuse_ship_over_a_live_supervisor, stop's Ship case and DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS are gone, and no message names devflow ship; gate approve still stores a no-waiter Ship answer until 52-15 (52-11)
+- [Phase 52]: An approved Ship gate (reachable only from a 3.x state) ends the run through finish_run, keeping state and branch; handle_ship_outcome goes with Stage::Ship in 52-15 (52-12)
+- [Phase 52]: devflow_core::hooks and devflow_core::lock are deleted (semver major, intended); git.rs commit_all is left uncalled and logged for 52-18 (52-12)
+- [Phase 52]: until_stop_never_emits_workflow_shipped is kept and reads the workflow_finished event directly instead of through ship_evidence (52-13)
+- [Phase 52]: semver stays in Cargo.lock (wasmparser, wit-parser); only git-conventional and unicase were removed (52-13)
+- [Phase 52]: generic_preflight_checks now runs the unattended-launch check first, then interactivity; the gh-auth and major-bump checks are gone (52-13)
+- [Phase 52]: Concurrent-write tests that used yes_ship as their stand-in field now use base_branch (52-14)
+- [Phase 52]: run_gate_with_timeout's auto_response and safe point 5 are kept with no production Some caller; 52-15 removes them with handle_ship_outcome (52-14)
+- [Phase 52]: devflow start --yes-ship, DEVFLOW_YES_SHIP, the devflow.toml yes_ship key and State.yes_ship are removed; a leftover key in devflow.toml or a 3.x state file is ignored (52-14)
+- [Phase 52]: Stage::Ship, StageIntent::Ship, the Ship prompts, review angles (DEVFLOW_REVIEW_ANGLES and the toml key) and FixType::AuditFix are removed; clap rejects --until ship (52-15)
+- [Phase 52]: run_gate_with_timeout's auto_response parameter and safe point 5 are removed with handle_ship_outcome; safe points 4 and 6 keep their numbers (52-15)
+- [Phase 52]: StageIntent::for_stage_in_project and stage_prompt_for_project are kept with an unread project_root, because 52-26/52-27 pin the one for_stage_in_project( call (52-15)
+- [Phase 52]: 52-16: preflight's first-stage checks (auto-mode CONTEXT.md, D-07 unattended check, not-yet-planned case) now key on Plan instead of Define; a Codex handoff or resume at Plan in auto mode is refused, as it was at Define before
+- [Phase 52]: 52-16: run_never_prepared is !verification_baseline_captured alone, so a state that never captured its baseline reads as never prepared at any stage; the pipeline_launch handoff fixture keeps an explicit stage N = Define for 52-17 to move
+- [Phase 52]: 52-17: the handoff fixture's stage N is Plan with --until code; its stub's DEVFLOW_RESULT success passes Layer 1 before the zero-commit gate
+- [Phase 52]: 52-17: gates::STAGES is three stages, so a 3.x NN-define gate file is no longer cleaned (T-52-20, no migration)
+- [Phase 52]: 52-17: controls that used Define as a non-first stage now use Code or Validate, which are weaker controls
+- [Phase 52]: 52-18: the removed-surface scan matches "ship"/"define" as whole Rust string literals in .rs files and as the quoted word in Markdown and snapshots; a letter after a backslash escape counts as a token boundary
+- [Phase 52]: 52-18: gate_sweep_e2e's reap-strays guard is split with concat! like the other controls, not deleted; its deletion stays in deferred-items.md
+- [Phase 52]: 52-19: a gate answer aborts only through its abort field (gate abort, gate sweep, devflow stop); a note never changes the action, and an answer that approves and aborts is refused when written and read as an abort
+- [Phase 52]: 52-20: gsd_reader runs gsd_run by argv in the evidence root (GIT_* removed, HOME set to the launcher home, 60 s kill-and-reap deadline); every answer is one of five GsdStatus values or a named ReaderFailure, exit 0 is not success, and events carry only ReaderFailure::label()
+- [Phase 52]: 52-21: the build-provenance Warn arm is silent on any project that is not DevFlow's own checkout; a project with no origin remote gets one line and skips the fetch, while a remote that exists but cannot be fetched keeps both lines
+- [Phase 52]: 52-22: Validate passes only when the agent says pass and gsd query verification status (read in the worktree) says passed; every other status and every reader failure routes through validate_route, a reader failure is a never-silent gate, an agent PASS records State.validate_pass_head, and every gate records a required GateKind
+- [Phase 52]: 52-23: an empty RUST_LOG is treated exactly as an unset one, in main.rs's filter and in doctor's row (both info, tracing off)
+- [Phase 52]: 52-23: a non-empty RUST_LOG that does not parse keeps the 3.0 info fallback; doctor still warns on it
+- [Phase 52]: 52-23: the never-silent audit adds two labels beside (a)/(b)/(c): (n) not a skip/refusal/failure or an unreachable guard, (h) advisory housekeeping; both are left
+- [Phase 52]: 52-23: gate list now also warns when a gate file cannot be read, not only when it does not parse
+- [Phase 52]: 52-24: Validate routes on GSD's verification status only; select_loop_back_fix, verification_authored_this_run and stamp_validate_dispatch_window are deleted, and 999.192's case is pinned by a_verifier_written_report_from_code_routes_by_gsd_status
+- [Phase 52]: 52-24: State loses last_verification_fingerprint, last_verification_mtime_nanos and verification_run_nonce (old state files load and drop them on save); verification_baseline_captured is kept because commands::run_never_prepared reads it
+- [Phase 52]: 52-25: status calls a run active only when it is not stopped and its recorded worktree exists; the active phases header lists only those, and other phases names each other phase's kind
+- [Phase 52]: 52-25: cleanup --force removes a run's state only when that state records the removed worktree or none; merged branches still checked out are skipped via the additive GitFlow::cleanup_merged_keeping
+- [Phase 52]: 52-25: whether a start over a finished state carries phase_validate_failures is left to the operator (deferred-items.md), recommendation: start at zero
+- [Phase 52]: 52-26: a rejection with no note keeps an earlier relaunch_note; a rejection with a note replaces it (record_relaunch_note)
+- [Phase 52]: 52-27: the gap-closure marker (State.gap_closure_pass) is set by the Validate->Plan transition and cleared only by a passed read, the finish, an abort or a non-gaps loop-back; the post-check compares file modified times (plan newer than VERIFICATION.md)
+- [Phase 52]: 52-28: a stale or missing Validate takes FixType::StaleReverify, whose prompt quotes GSD's status, route and next action from State.code_fix_report (set with code_fix); record_validate_failure is the one streak update and now also counts the no_gap_closure_plan gate
+- [Phase 52]: 52-29 (operator decision 2026-11-11): a permitted finish wins over a late stop; finish_run no longer stops at safe point 6, the supervisor answers the pending stop already_finished, and a stop without a finish permit keeps its handling
+- [Phase 52]: 52-29: can_finish (FinishPermit, private field) is the one finish check and next_step the one D-45 table; after Validate only a failure_cap label opens ahead of it, so an ambiguous verdict in auto over gaps_found/stale/missing follows the table; a rejected verification gate runs /gsd-quick (FixType::Quick) with the note
+- [Phase 52]: Operator 2026-11-11: a start over a FINISHED run resets phase_validate_failures to zero; a stopped unfinished run still carries it (96f90b1)
+- [Phase 52]: 52-33: every gate context leads with way_on_sentence, rendered from approve_route_by_kind/reject_route_by_kind (a verification approve clause states the finish rule, U10); gate approve/reject/abort refuse through screen_answer before writing and print the route (gate_respond_report); the gate display bound is 450
+- [Phase 52]: 52-33: GATE-03 never-lies checks read the cause after the way-on sentence, whose finish rule names `passed` on every verification gate
+- [Phase 52]: 52-30: the notify hook's DEVFLOW_GATE_CONTEXT is cut to the display bound (450 characters, one constant in devflow-core shared with the banner and gate list), not the plan's 300, which predates 52-33's raise
+- [Phase 52]: 52-30: a failure reason is stored whole up to GATE_CONTEXT_STORED_MAX_CHARS (4096 characters); the bound applies to each reason, so a context is at most 4096 plus its fixed lead
+- [Phase 52]: 52-31: the rate-limit gate is its own kind (gate_kind rate_limit) and records not_before = reset + 60 s when the denial named a reset; gate sweep spares it until then; approve runs relaunch_now, reject relaunch_with_note (canary unread); the live writer opens it, led by the way-on sentence
+- [Phase 52]: 52-31: Gates::rate_limit_timer_answer (no boolean, refuses a non-rate_limit gate, responded_by devflow-rate-limit-timer), GateAction::Relaunch with from_gate_answer, rate_limit_wait_bound and State.rate_limit_auto_relaunch_used exist with no production caller; 52-32 wires them
+- [Phase 52]: 52-32: the rate-limit timer lives in the gate wait and arms per gate open through rate_limit_timer_deadline only, so first open, resume and takeover decide it alike
+- [Phase 52]: 52-32: after the timer writes (or finds an operator's answer) the wait takes the answer before checking the lifetime, so a reset later than the gate timeout relaunches at the wake (U8 fix)
+- [Phase 52]: 52-32: a timer write failing other than AlreadyResponded keeps the automatic relaunch spent and reports rate_limit_timer_fired outcome failed
 
 ## Roadmap Evolution
 
@@ -952,12 +1008,45 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 51 P10 | 26 min | 3 tasks | 4 files |
 | Phase 51 P13 | 20 min | 3 tasks | 3 files |
 | Phase 51 P11 | 25 min | 2 tasks | 5 files |
+| Phase 52 P01 | 38 min | 2 tasks | 4 files |
+| Phase 52 P02 | 13 min | 3 tasks | 12 files |
+| Phase 52 P03 | 21 min | 2 tasks | 10 files |
+| Phase 52 P04 | 22 min | 2 tasks | 8 files |
+| Phase 52 P05 | 31 min | 2 tasks | 14 files |
+| Phase 52 P06 | 19 min | 3 tasks | 19 files |
+| Phase 52 P07 | 11 min | 2 tasks | 17 files |
+| Phase 52 P08 | 32 min | 3 tasks | 8 files |
+| Phase 52 P09 | 18 min | 2 tasks | 7 files |
+| Phase 52 P10 | 23 min | 2 tasks | 16 files |
+| Phase 52 P11 | 25 min | 2 tasks | 17 files |
+| Phase 52 P12 | 32 min | 2 tasks | 24 files |
+| Phase 52 P13 | 20 min | 2 tasks | 23 files |
+| Phase 52 P14 | 22 min | 2 tasks | 13 files |
+| Phase 52 P15 | 45 min | 3 tasks | 42 files |
+| Phase 52 P16 | 57 min | 3 tasks | 16 files |
+| Phase 52 P17 | 24 min | 3 tasks | 27 files |
+| Phase 52 P18 | 31 min | 3 tasks | 20 files |
+| Phase 52 P19 | 25 min | 3 tasks | 17 files |
+| Phase 52 P20 | 20 min | 3 tasks | 3 files |
+| Phase 52 P21 | 11 min | 2 tasks | 2 files |
+| Phase 52 P22 | 59 min | 4 tasks | 24 files |
+| Phase 52 P23 | 32 min | 3 tasks | 14 files |
+| Phase 52 P24 | 26 min | 2 tasks | 6 files |
+| Phase 52 P25 | 23 min | 3 tasks | 5 files |
+| Phase 52 P26 | 33 min | 3 tasks | 10 files |
+| Phase 52 P27 | 41 min | 3 tasks | 12 files |
+| Phase 52 P28 | 38 min | 3 tasks | 10 files |
+| Phase 52 P29 | 86 min | 3 tasks | 16 files |
+| Phase 52 P33 | 46 min | 3 tasks | 10 files |
+| Phase 52 P30 | 23 min | 2 tasks | 7 files |
+| Phase 52 P31 | 34 min | 3 tasks | 9 files |
+| Phase 52 P32 | 60min | 3 tasks | 7 files |
 
 ## Session
 
-**Last session:** 2026-11-09T01:59:31.863Z
-**Stopped at:** Phase 52 context gathered
-**Resume file:** .planning/phases/52-subtract-and-stabilize/52-CONTEXT.md
+**Last session:** 2026-11-11T16:32:03.526Z
+**Stopped at:** Phase 52 complete, ready to plan Phase 53
+**Resume file:** None
 
 ## Operator Next Steps
 

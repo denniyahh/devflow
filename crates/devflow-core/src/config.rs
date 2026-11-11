@@ -78,25 +78,8 @@ impl Default for GitFlowConfig {
 pub struct DevflowConfig {
     /// Number of capture generations to retain per pipeline stage.
     pub capture_retention: usize,
-    /// Custom Ship review angles; `None` keeps the built-in angle list.
-    pub review_angles: Option<Vec<String>>,
     /// Whether declared external verification commands may run.
     pub external_verify_enabled: bool,
-    /// Whether the Ship gate is standing pre-authorized for this project
-    /// (D-12, `28-CONTEXT.md`) — the gate's approval is supplied
-    /// automatically and attributed in the gate ledger, exactly as if
-    /// `--yes-ship` had been typed on every invocation. Deliberately
-    /// defaults to `false`, unlike `external_verify_enabled`: an absent
-    /// `devflow.toml`, or one that omits this key, must never pre-authorize
-    /// a Ship. This is a deliberate reversal of Phase 23's own D-05
-    /// (`--yes-ship` was a per-run flag only, never config-persistable, "so
-    /// a standing unattended auto-merge can never become the silent
-    /// default"). The reversal's stated cost, recorded twice: relaxing this
-    /// later is easy, but tightening it after operators depend on a
-    /// persisted setting is not. `commands::start` combines this value with
-    /// the CLI flag via logical OR rather than replacing it, because the
-    /// flag has no negative form — passing `--yes-ship` always wins.
-    pub yes_ship: bool,
     /// The branch this project's DevFlow phase lifecycle integrates on
     /// (45-01 decision D-01, AUTO-01). `None` means the built-in [`DEVELOP`]
     /// constant, which is what every project resolved before this key
@@ -146,9 +129,7 @@ impl Default for DevflowConfig {
     fn default() -> Self {
         Self {
             capture_retention: DEFAULT_CAPTURE_RETENTION,
-            review_angles: None,
             external_verify_enabled: true,
-            yes_ship: false,
             base_branch: None,
         }
     }
@@ -160,19 +141,9 @@ impl DevflowConfig {
         self.capture_retention
     }
 
-    /// Return configured review angles, or `None` to use built-in angles.
-    pub fn review_angles(&self) -> Option<&[String]> {
-        self.review_angles.as_deref()
-    }
-
     /// Return whether external verification is enabled.
     pub fn external_verify_enabled(&self) -> bool {
         self.external_verify_enabled
-    }
-
-    /// Return whether the Ship gate is standing pre-authorized (D-12).
-    pub fn yes_ship(&self) -> bool {
-        self.yes_ship
     }
 }
 
@@ -182,6 +153,13 @@ impl DevflowConfig {
 /// fail-soft: DevFlow warns and continues with defaults instead of aborting the
 /// workflow.
 pub fn load_config(project_root: &Path) -> DevflowConfig {
+    load_config_to(project_root, &mut std::io::stderr())
+}
+
+/// [`load_config`], writing its operator-facing warning lines to `err`. With
+/// tracing off by default, those lines are the operator's only sign that the
+/// file's settings were ignored.
+fn load_config_to(project_root: &Path, err: &mut dyn std::io::Write) -> DevflowConfig {
     let path = project_root.join("devflow.toml");
     let contents = match std::fs::read_to_string(&path) {
         Ok(contents) => contents,
@@ -190,6 +168,11 @@ pub fn load_config(project_root: &Path) -> DevflowConfig {
         }
         Err(error) => {
             tracing::warn!(path = %path.display(), %error, "failed to read devflow config; using defaults");
+            let _ = writeln!(
+                err,
+                "warning: could not read {} ({error}); using the built-in settings instead",
+                path.display()
+            );
             return DevflowConfig::default();
         }
     };
@@ -198,6 +181,12 @@ pub fn load_config(project_root: &Path) -> DevflowConfig {
         Ok(config) => config,
         Err(error) => {
             tracing::warn!(path = %path.display(), %error, "failed to parse devflow config; using defaults");
+            let _ = writeln!(
+                err,
+                "warning: {} does not parse ({}); using the built-in settings instead",
+                path.display(),
+                error.message()
+            );
             DevflowConfig::default()
         }
     }
@@ -222,35 +211,38 @@ fn config_parse_error(project_root: &Path) -> Option<String> {
 /// Resolve capture retention with `DEVFLOW_CAPTURE_RETENTION` taking
 /// precedence over `devflow.toml` and the built-in default.
 pub fn capture_retention(project_root: &Path) -> usize {
-    if let Some(value) = env_value("DEVFLOW_CAPTURE_RETENTION") {
-        match value.parse() {
-            Ok(retention) => return retention,
-            Err(error) => tracing::warn!(
-                value,
-                %error,
-                "invalid DEVFLOW_CAPTURE_RETENTION; using devflow.toml or default"
-            ),
-        }
-    }
-    load_config(project_root).capture_retention
+    capture_retention_with(
+        env_value("DEVFLOW_CAPTURE_RETENTION"),
+        project_root,
+        &mut std::io::stderr(),
+    )
 }
 
-/// Resolve Ship review angles with `DEVFLOW_REVIEW_ANGLES` taking precedence
-/// over `devflow.toml`. The environment value is a comma-separated list.
-pub fn review_angles(project_root: &Path) -> Option<Vec<String>> {
-    if let Some(value) = env_value("DEVFLOW_REVIEW_ANGLES") {
-        let angles: Vec<_> = value
-            .split(',')
-            .map(str::trim)
-            .filter(|angle| !angle.is_empty())
-            .map(str::to_owned)
-            .collect();
-        if !angles.is_empty() {
-            return Some(angles);
+/// [`capture_retention`] for an already-read `DEVFLOW_CAPTURE_RETENTION`
+/// value, writing the invalid-value warning line to `err`.
+fn capture_retention_with(
+    value: Option<String>,
+    project_root: &Path,
+    err: &mut dyn std::io::Write,
+) -> usize {
+    if let Some(value) = value {
+        match value.parse::<usize>() {
+            Ok(retention) => return retention,
+            Err(error) => {
+                tracing::warn!(
+                    value,
+                    %error,
+                    "invalid DEVFLOW_CAPTURE_RETENTION; using devflow.toml or default"
+                );
+                let _ = writeln!(
+                    err,
+                    "warning: DEVFLOW_CAPTURE_RETENTION={value:?} is not a count ({error}); \
+                     using devflow.toml or the default"
+                );
+            }
         }
-        tracing::warn!("DEVFLOW_REVIEW_ANGLES contains no review angles; using devflow.toml");
     }
-    load_config(project_root).review_angles
+    load_config_to(project_root, err).capture_retention
 }
 
 /// Resolve external verification with `DEVFLOW_EXTERNAL_VERIFY_ENABLED`
@@ -267,61 +259,6 @@ pub fn external_verify_enabled(project_root: &Path) -> bool {
         }
     }
     load_config(project_root).external_verify_enabled
-}
-
-/// Resolve the Ship gate's standing pre-authorization (D-12) with
-/// `DEVFLOW_YES_SHIP` taking precedence over `devflow.toml` and the
-/// built-in `false` default. Mirrors `external_verify_enabled`'s resolver
-/// shape exactly. Note that this resolver is not the only path by which
-/// `state.yes_ship` becomes `true` — `commands::start` also ORs in the
-/// `--yes-ship` CLI flag; this function reports only the config/env-derived
-/// half of that combination.
-pub fn yes_ship(project_root: &Path) -> bool {
-    if let Some(value) = env_value("DEVFLOW_YES_SHIP") {
-        match value.parse() {
-            Ok(enabled) => return enabled,
-            Err(error) => tracing::warn!(
-                value,
-                %error,
-                "invalid DEVFLOW_YES_SHIP; using devflow.toml or default"
-            ),
-        }
-    }
-    load_config(project_root).yes_ship
-}
-
-/// Resolve D-11's legacy-launch opt-out (31-04) from
-/// `DEVFLOW_CLAUDE_LEGACY_LAUNCH`.
-///
-/// Environment only, deliberately: D-11 specifies one flag and one environment
-/// variable, and nothing else. There is no `devflow.toml` key, so this takes no
-/// `project_root` — a standing per-project default for an escape hatch is
-/// exactly the "used routinely, erodes what it protects" shape D-11 warns
-/// about. `--legacy-claude-launch` supplies the other half, OR-ed in
-/// `commands::start` / `pipeline_launch::resume`.
-///
-/// **The value is PARSED as a bool, not merely tested for presence (W4).** A
-/// naive `env::var(..).is_ok()` would make `DEVFLOW_CLAUDE_LEGACY_LAUNCH=false`
-/// *enable* the legacy path — an accidental-reach path D-11 forbids. Garbage
-/// warns and is ignored rather than enabling; the escape hatch fails CLOSED.
-///
-/// Read through [`env_value`] with the variable name as a literal, matching
-/// [`yes_ship`] and [`external_verify_enabled`]. A const-mediated read compiles
-/// and works identically but is INVISIBLE to
-/// `doc_check::source_read_env_vars`, which would then pass green while the
-/// variable went undocumented — the "by blindness" failure 31-02 recorded.
-pub fn claude_legacy_launch() -> bool {
-    if let Some(value) = env_value("DEVFLOW_CLAUDE_LEGACY_LAUNCH") {
-        match value.parse() {
-            Ok(enabled) => return enabled,
-            Err(error) => tracing::warn!(
-                value,
-                %error,
-                "invalid DEVFLOW_CLAUDE_LEGACY_LAUNCH; the legacy Claude launch stays OFF"
-            ),
-        }
-    }
-    false
 }
 
 /// Reject a base-branch value that must never reach a `git` argv or become
@@ -365,8 +302,8 @@ pub fn validate_base_branch(value: &str) -> Result<(), String> {
 /// `devflow.toml`'s `base_branch` key and the built-in [`DEVELOP`] default.
 ///
 /// **This resolver is deliberately FAIL-HARD on an explicitly supplied
-/// value, unlike its [`yes_ship`] sibling — do not "fix" it to match.** A bad
-/// `yes_ship` bool falls back to `false`, which is the SAFER direction. A bad
+/// value, unlike its fail-soft siblings such as [`external_verify_enabled`] —
+/// do not "fix" it to match.** A bad bool there falls back to a default. A bad
 /// base branch falling back to [`DEVELOP`] would silently redirect the trunk
 /// to a value the operator did not ask for, and it would make this phase's
 /// own `main`-refusal unobservable for the most direct way to configure it:
@@ -381,8 +318,7 @@ pub fn validate_base_branch(value: &str) -> Result<(), String> {
 /// The variable name is written as a **string literal** rather than through a
 /// const: a const-mediated read is invisible to
 /// `doc_check::source_read_env_vars`, which would then pass green while the
-/// variable went undocumented (the failure recorded in
-/// [`claude_legacy_launch`]'s doc comment).
+/// variable went undocumented (the "by blindness" failure 31-02 recorded).
 pub fn base_branch(project_root: &Path) -> Result<ResolvedBaseBranch, String> {
     if let Some(value) = env_value("DEVFLOW_BASE_BRANCH") {
         return validate_base_branch(&value)
@@ -431,7 +367,16 @@ pub fn base_branch(project_root: &Path) -> Result<ResolvedBaseBranch, String> {
 /// those sites with an invalid configuration. If that refusal is ever
 /// removed, this fallback becomes one.
 pub fn git_flow_for_project(project_root: &Path) -> GitFlowConfig {
-    match base_branch(project_root) {
+    git_flow_from(base_branch(project_root), &mut std::io::stderr())
+}
+
+/// [`git_flow_for_project`] for an already-resolved base branch, writing the
+/// fallback warning line to `err`.
+fn git_flow_from(
+    resolved: Result<ResolvedBaseBranch, String>,
+    err: &mut dyn std::io::Write,
+) -> GitFlowConfig {
+    match resolved {
         Ok(resolved) => GitFlowConfig {
             develop: resolved.value,
             ..GitFlowConfig::default()
@@ -440,6 +385,11 @@ pub fn git_flow_for_project(project_root: &Path) -> GitFlowConfig {
             tracing::warn!(
                 %error,
                 "invalid base branch configuration; using the built-in git-flow defaults"
+            );
+            let _ = writeln!(
+                err,
+                "warning: the base branch configuration is invalid ({error}); using `{DEVELOP}` \
+                 as the trunk"
             );
             GitFlowConfig::default()
         }
@@ -504,16 +454,14 @@ struct FallbackAgentKey {
 /// Resolve the standing fallback agent from `devflow.toml`'s `fallback_agent`
 /// key (operator ruling R-3, Phase 51).
 ///
-/// **No environment variable, by operator decision.** Unlike [`yes_ship`],
-/// this key has no `DEVFLOW_*` override: the fallback decides which binary a
-/// detached supervisor may launch later, unattended, and a tracked project
-/// file is the only standing source R-3 allows. `commands::start` combines
-/// it with `--fallback-agent` the way it combines [`yes_ship`] with
-/// `--yes-ship`: the flag wins when given, this value applies when the flag
-/// is absent, and `start` prints a notice naming `devflow.toml` when it
-/// does. Only `devflow start` arms it. `devflow parallel` reads it to refuse a
-/// broken key and to print a note that the key is not armed, and arms no
-/// fallback; `devflow resume` keeps the run's persisted fallback.
+/// **No environment variable, by operator decision.** Unlike
+/// [`external_verify_enabled`], this key has no `DEVFLOW_*` override: the
+/// fallback decides which binary a detached supervisor may launch later,
+/// unattended, and a tracked project file is the only standing source R-3
+/// allows. `commands::start` combines it with `--fallback-agent`: the flag
+/// wins when given, this value applies when the flag is absent, and `start`
+/// prints a notice naming `devflow.toml` when it does. Only `devflow start`
+/// arms it; `devflow resume` keeps the run's persisted fallback.
 ///
 /// A missing file, or a file without the key, is `Ok(None)`. An unreadable
 /// file follows [`load_config`]'s warn-and-default path and is treated as no
@@ -525,12 +473,25 @@ struct FallbackAgentKey {
 /// have no `fallback_agent` key at all; only a parseable file whose
 /// `fallback_agent` value names no agent gets the key-specific refusal.
 pub fn fallback_agent(project_root: &Path) -> Result<Option<AgentKind>, String> {
+    fallback_agent_to(project_root, &mut std::io::stderr())
+}
+
+/// [`fallback_agent`], writing the unreadable-file warning line to `err`.
+fn fallback_agent_to(
+    project_root: &Path,
+    err: &mut dyn std::io::Write,
+) -> Result<Option<AgentKind>, String> {
     let path = project_root.join("devflow.toml");
     let contents = match std::fs::read_to_string(&path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             tracing::warn!(path = %path.display(), %error, "failed to read devflow config; no fallback_agent key read");
+            let _ = writeln!(
+                err,
+                "warning: could not read {} ({error}); no `fallback_agent` was read from it",
+                path.display()
+            );
             return Ok(None);
         }
     };
@@ -609,6 +570,116 @@ mod tests {
         }
     }
 
+    /// What a `_to`/`_with` seam wrote to its warning sink.
+    fn written(sink: Vec<u8>) -> String {
+        String::from_utf8(sink).expect("warning lines are UTF-8")
+    }
+
+    /// A project whose `devflow.toml` exists but cannot be read: it is a
+    /// directory, so the read fails with something other than NotFound.
+    fn project_with_unreadable_config() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("devflow.toml")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn an_unreadable_devflow_toml_is_reported_without_tracing() {
+        let dir = project_with_unreadable_config();
+        let mut sink = Vec::new();
+        assert_eq!(
+            load_config_to(dir.path(), &mut sink),
+            DevflowConfig::default()
+        );
+        let text = written(sink);
+        assert!(
+            text.starts_with("warning: could not read ") && text.contains("devflow.toml"),
+            "the operator must be told the file was ignored: {text:?}"
+        );
+    }
+
+    #[test]
+    fn an_unparsable_devflow_toml_is_reported_without_tracing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("devflow.toml"), "capture_retention = [\n").unwrap();
+        let mut sink = Vec::new();
+        assert_eq!(
+            load_config_to(dir.path(), &mut sink),
+            DevflowConfig::default()
+        );
+        let text = written(sink);
+        assert!(
+            text.starts_with("warning: ") && text.contains("does not parse"),
+            "the operator must be told the file was ignored: {text:?}"
+        );
+    }
+
+    #[test]
+    fn an_invalid_env_value_is_reported_without_tracing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = Vec::new();
+        assert_eq!(
+            capture_retention_with(Some("many".to_string()), dir.path(), &mut sink),
+            DEFAULT_CAPTURE_RETENTION
+        );
+        let text = written(sink);
+        assert!(
+            text.starts_with("warning: DEVFLOW_CAPTURE_RETENTION=\"many\""),
+            "the operator must be told the value was ignored: {text:?}"
+        );
+    }
+
+    #[test]
+    fn a_valid_config_writes_no_warning() {
+        // Control for the three tests above: a readable, parsable file and a
+        // valid value write nothing to the sink.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("devflow.toml"), "capture_retention = 3\n").unwrap();
+        let mut sink = Vec::new();
+        assert_eq!(
+            capture_retention_with(Some("4".to_string()), dir.path(), &mut sink),
+            4
+        );
+        assert_eq!(load_config_to(dir.path(), &mut sink).capture_retention(), 3);
+        assert_eq!(fallback_agent_to(dir.path(), &mut sink), Ok(None));
+        let _ = git_flow_from(
+            Ok(ResolvedBaseBranch {
+                value: DEVELOP.to_string(),
+                source: BaseBranchSource::Default,
+            }),
+            &mut sink,
+        );
+        assert_eq!(written(sink), "");
+    }
+
+    #[test]
+    fn an_invalid_base_branch_fallback_is_reported_without_tracing() {
+        let mut sink = Vec::new();
+        let config = git_flow_from(
+            Err("devflow.toml `base_branch`: `main` is not a trunk".to_string()),
+            &mut sink,
+        );
+        assert_eq!(config, GitFlowConfig::default());
+        let text = written(sink);
+        assert!(
+            text.starts_with("warning: the base branch configuration is invalid")
+                && text.contains("`develop`"),
+            "the operator must be told the trunk fell back: {text:?}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_devflow_toml_fallback_agent_is_reported_without_tracing() {
+        let dir = project_with_unreadable_config();
+        let mut sink = Vec::new();
+        assert_eq!(fallback_agent_to(dir.path(), &mut sink), Ok(None));
+        let text = written(sink);
+        assert!(
+            text.starts_with("warning: could not read ") && text.contains("fallback_agent"),
+            "the operator must be told no fallback was read: {text:?}"
+        );
+    }
+
     #[test]
     fn default_uses_hardcoded_constants() {
         let config = GitFlowConfig::default();
@@ -643,23 +714,6 @@ mod tests {
     }
 
     #[test]
-    fn env_overrides_file_review_angles() {
-        let _lock = ENV_MUTEX.lock().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("devflow.toml"),
-            "review_angles = [\"file angle\"]\n",
-        )
-        .unwrap();
-        let _env = EnvOverride::set("DEVFLOW_REVIEW_ANGLES", "security, docs accuracy");
-
-        assert_eq!(
-            review_angles(dir.path()),
-            Some(vec!["security".into(), "docs accuracy".into()])
-        );
-    }
-
-    #[test]
     fn env_overrides_file_external_verification() {
         let _lock = ENV_MUTEX.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -681,72 +735,64 @@ mod tests {
         assert_eq!(load_config(dir.path()), DevflowConfig::default());
     }
 
-    /// D-12: an absent `devflow.toml` must never pre-authorize a Ship — the
-    /// deliberate asymmetry with `external_verify_enabled`'s `true` default.
+    /// v4.0 removed the Ship gate's pre-authorization (D-01). A `devflow.toml`
+    /// written for 3.x may still carry `yes_ship`; it must load without error
+    /// and the key must change nothing. `capture_retention` sits beside it so
+    /// the file is known to have parsed: a parse failure would also return the
+    /// defaults, and that would make this test pass for the wrong reason.
     #[test]
-    fn yes_ship_defaults_to_false() {
-        assert!(!DevflowConfig::default().yes_ship());
+    fn a_leftover_yes_ship_key_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("devflow.toml"),
+            // Split so the removed-surface scan does not read this control as a leftover.
+            concat!("yes", "_ship = true\ncapture_retention = 9\n"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config_parse_error(dir.path()),
+            None,
+            concat!("a leftover yes", "_ship key must not fail the load")
+        );
+        assert_eq!(
+            load_config(dir.path()),
+            DevflowConfig {
+                capture_retention: 9,
+                ..DevflowConfig::default()
+            },
+            concat!(
+                "the file parsed (capture_retention is 9) and yes",
+                "_ship had no effect"
+            )
+        );
     }
 
-    /// D-12: no `devflow.toml` present → the resolver falls through to the
-    /// built-in `false` default.
+    /// v4.0 removed the Ship stage and its review angles (D-01). A
+    /// `devflow.toml` written for 3.x may still carry `review_angles`; it must
+    /// load without error, and the key changes nothing.
     #[test]
-    fn yes_ship_missing_file_returns_false() {
+    fn a_leftover_review_angles_key_is_ignored() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(!yes_ship(dir.path()));
-    }
+        std::fs::write(
+            dir.path().join("devflow.toml"),
+            "review_angles = [\"security\"]\ncapture_retention = 9\n",
+        )
+        .unwrap();
 
-    /// D-12: `devflow.toml` setting the key `true` → the resolver returns
-    /// `true`.
-    #[test]
-    fn yes_ship_file_sets_true() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("devflow.toml"), "yes_ship = true\n").unwrap();
-
-        assert!(yes_ship(dir.path()));
-    }
-
-    /// D-12: `devflow.toml` setting the key `false` → the resolver returns
-    /// `false`.
-    #[test]
-    fn yes_ship_file_sets_false() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("devflow.toml"), "yes_ship = false\n").unwrap();
-
-        assert!(!yes_ship(dir.path()));
-    }
-
-    /// D-12: a `devflow.toml` with unrelated keys still loads, and the
-    /// resolver returns the default.
-    #[test]
-    fn yes_ship_unrelated_keys_returns_default() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("devflow.toml"), "capture_retention = 9\n").unwrap();
-
-        assert!(!yes_ship(dir.path()));
-    }
-
-    /// D-12: an unparseable `DEVFLOW_YES_SHIP` value warns and falls back to
-    /// the file/default rather than panicking or returning true.
-    #[test]
-    fn yes_ship_unparseable_env_falls_back_to_file() {
-        let _lock = ENV_MUTEX.lock().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("devflow.toml"), "yes_ship = true\n").unwrap();
-        let _env = EnvOverride::set("DEVFLOW_YES_SHIP", "not-a-bool");
-
-        assert!(yes_ship(dir.path()));
-    }
-
-    /// D-12: env beats file, matching every sibling resolver.
-    #[test]
-    fn env_overrides_file_yes_ship() {
-        let _lock = ENV_MUTEX.lock().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("devflow.toml"), "yes_ship = false\n").unwrap();
-        let _env = EnvOverride::set("DEVFLOW_YES_SHIP", "true");
-
-        assert!(yes_ship(dir.path()));
+        assert_eq!(
+            config_parse_error(dir.path()),
+            None,
+            "a leftover review_angles key must not fail the load"
+        );
+        assert_eq!(
+            load_config(dir.path()),
+            DevflowConfig {
+                capture_retention: 9,
+                ..DevflowConfig::default()
+            },
+            "the file parsed (capture_retention is 9) and review_angles had no effect"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -1090,7 +1136,7 @@ mod tests {
 
         assert_eq!(resolve(None), Ok(None), "no devflow.toml arms nothing");
         assert_eq!(
-            resolve(Some("yes_ship = true\n")),
+            resolve(Some("capture_retention = 9\n")),
             Ok(None),
             "a file without the key arms nothing"
         );
@@ -1127,7 +1173,7 @@ mod tests {
         // A syntax error elsewhere in a file with no `fallback_agent` key is a
         // file problem, not a key problem: the refusal must not send the
         // operator to remove a key they never set.
-        let broken = resolve(Some("review_angles = [\"security\"\n"))
+        let broken = resolve(Some("capture_retention = [9\n"))
             .expect_err("a file that does not parse is refused");
         assert!(
             broken.starts_with("devflow.toml: "),

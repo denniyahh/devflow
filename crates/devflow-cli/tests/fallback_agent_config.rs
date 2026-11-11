@@ -1,8 +1,7 @@
 //! R-3 (Phase 51): CLI-boundary coverage of `devflow start`'s combined
 //! resolution of the `--fallback-agent` flag and a `fallback_agent` key in
-//! `devflow.toml`, mirroring `yes_ship_config.rs`. The flag wins when given;
-//! the key applies when the flag is absent, and a key-only fallback names
-//! `devflow.toml` as its source.
+//! `devflow.toml`. The flag wins when given; the key applies when the flag is
+//! absent, and a key-only fallback names `devflow.toml` as its source.
 //!
 //! Most cases run through `--dry-run`, which returns before the run is
 //! persisted, so `config_key_alone_is_persisted_in_the_run_state` is the one
@@ -233,7 +232,7 @@ fn config_key_alone_is_persisted_in_the_run_state() {
     // follows the stubs, as in `supervisor_e2e.rs`.
     let host_path = std::env::var_os("PATH").unwrap_or_default();
     let path = format!("{}:{}", fake.path.display(), host_path.to_string_lossy());
-    let output = run_start(&home, &root, phase, &path, &["--until", "define"]);
+    let output = run_start(&home, &root, phase, &path, &["--until", "plan"]);
 
     assert_success(&output, "a key-only start");
     assert!(
@@ -369,120 +368,4 @@ fn a_valid_flag_does_not_mask_an_invalid_config_key() {
             );
         }
     }
-}
-
-/// `devflow parallel` takes no `--fallback-agent` and does not arm the key: a
-/// key equal to the phase's agent, which refuses `start`, neither refuses
-/// `parallel` nor arms a fallback, and the launched run saves none. It is not
-/// ignored silently: `parallel` prints a note naming the key as not armed.
-#[test]
-fn parallel_ignores_the_config_key() {
-    let home = common::HermeticHome::new();
-    let repo = tempfile::tempdir().unwrap();
-    let root = repo.path().canonicalize().unwrap();
-    let phase = PhaseId::new(5158);
-    init_repo(&root, phase);
-    fs::write(root.join("devflow.toml"), "fallback_agent = \"claude\"\n").unwrap();
-    let fake = stub_dir(&[("claude", WAITING_CLAUDE)]);
-    let _reaper = common::LaunchedRunReaper::new(&root, phase, vec![]);
-    let state_path = devflow_core::workflow::state_path(&root, phase);
-
-    let host_path = std::env::var_os("PATH").unwrap_or_default();
-    let path = format!("{}:{}", fake.path.display(), host_path.to_string_lossy());
-    let output = common::hermetic_devflow(&home)
-        .args([
-            "parallel",
-            "--phases",
-            &phase.to_string(),
-            "--agents",
-            "claude",
-            "--mode",
-            "supervise",
-        ])
-        .arg(&root)
-        .current_dir(&root)
-        .env("PATH", path)
-        .output()
-        .expect("run devflow parallel");
-
-    assert_success(&output, "a parallel launch with the key set");
-    let printed = stdout(&output);
-    assert!(
-        !printed.contains("fallback agent"),
-        "parallel arms no fallback\nstdout: {printed}"
-    );
-    assert!(
-        printed.contains(
-            "note: devflow.toml's `fallback_agent` (claude) is not armed by `devflow parallel`"
-        ),
-        "parallel names the key it does not arm\nstdout: {printed}"
-    );
-    let saved: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_str(&fs::read_to_string(&state_path).expect("parallel saved the state"))
-            .expect("the state is a JSON object");
-    assert_eq!(
-        saved["fallback_agent"],
-        serde_json::Value::Null,
-        "the parallel run carries no fallback: {saved:?}"
-    );
-}
-
-/// A key that names no agent refuses `devflow parallel` as it refuses `start`,
-/// before any phase is launched: no state file is written. Control: with no
-/// `devflow.toml`, the same parallel launch prints no note about the key.
-#[test]
-fn parallel_refuses_a_config_key_that_names_no_agent() {
-    let home = common::HermeticHome::new();
-    let repo = tempfile::tempdir().unwrap();
-    let root = repo.path().canonicalize().unwrap();
-    let phase = PhaseId::new(5159);
-    init_repo(&root, phase);
-    let fake = stub_dir(&[("claude", WAITING_CLAUDE)]);
-    let _reaper = common::LaunchedRunReaper::new(&root, phase, vec![]);
-    let state_path = devflow_core::workflow::state_path(&root, phase);
-    let host_path = std::env::var_os("PATH").unwrap_or_default();
-    let path = format!("{}:{}", fake.path.display(), host_path.to_string_lossy());
-    let parallel = || {
-        common::hermetic_devflow(&home)
-            .args([
-                "parallel",
-                "--phases",
-                &phase.to_string(),
-                "--agents",
-                "claude",
-                "--mode",
-                "supervise",
-            ])
-            .arg(&root)
-            .current_dir(&root)
-            .env("PATH", &path)
-            .output()
-            .expect("run devflow parallel")
-    };
-
-    fs::write(root.join("devflow.toml"), "fallback_agent = \"nosuch\"\n").unwrap();
-    let output = parallel();
-    let refused = stderr(&output);
-    assert!(
-        !output.status.success(),
-        "a key naming no agent refuses parallel\nstdout: {}\nstderr: {refused}",
-        stdout(&output)
-    );
-    assert!(
-        refused.contains("fallback_agent") && refused.contains("devflow.toml"),
-        "the refusal names the key and the file\nstderr: {refused}"
-    );
-    assert!(
-        !state_path.exists(),
-        "the refusal came before any phase was launched"
-    );
-
-    fs::remove_file(root.join("devflow.toml")).unwrap();
-    let control = parallel();
-    assert_success(&control, "the control launch with no devflow.toml");
-    let printed = stdout(&control);
-    assert!(
-        !printed.contains("fallback_agent"),
-        "control: no key, no note\nstdout: {printed}"
-    );
 }

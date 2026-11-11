@@ -1,0 +1,38 @@
+You are an adversarial reviewer of four phase PLANs for the DevFlow Rust repository. The working directory is a
+read-only snapshot of the repo's working tree (feature/phase-52, including uncommitted plan revisions). Do NOT modify any
+tracked file. You may read files and run read-only commands (rg, git is not available, cargo check is allowed).
+
+TARGETS: .planning/phases/52-subtract-and-stabilize/52-28-PLAN.md, 52-29-PLAN.md, 52-33-PLAN.md, 52-32-PLAN.md
+These four were rewritten over four planning rounds after an earlier external review. 52-33 is new. No outside
+reviewer has seen these designs:
+  - 52-33: the D-33 "uncovered change" check after a quick fix (git diff <code_fix_base>..HEAD minus GSD's
+    covered_files), its fail-closed reader_failure gate, the re-verify post-check, the D-41 gate (approve finishes over
+    files the verifier never listed), the code_fix_base lifetime (kept across later quick rejects unless the base is
+    unusable), the pickup-time status re-read before an approve that finishes, reopen classification.
+  - 52-28: the re-verify ("stale") route and its post-check, with routes for every GSD status.
+  - 52-29: one rule for answering a gate (approve_route / reject_route over gate kind + recorded GSD status).
+  - 52-32: rate-limit gate auto-relaunch exactly once after the reset, crash recovery via State.rate_limit_timer_gate.
+CONTEXT to check against (locked decisions D-NN): .planning/phases/52-subtract-and-stabilize/52-CONTEXT.md — especially
+D-08, D-11, D-16, D-17, D-24, D-32, D-33, D-36, D-37, D-38, D-39, D-41. Also 52-22-PLAN.md (gate kinds, human_needed gate),
+52-27-PLAN.md (gap loop), 52-REVIEWS.md (earlier findings), CLAUDE.md (repo traps), and source under crates/.
+
+Attack the designs. Do not summarize or praise. Find, with exact file and line/quoted text:
+1. Any path where a run can FINISH or reach Validate without the operator knowingly accepting uncovered or stale
+   evidence (fail-open). Walk concrete sequences of gate answers (approve/reject/abort), stops/resumes, crashes,
+   rate limits and stage failures mid-sequence.
+2. Any gate whose offered answers contradict D-37's rule (e.g. approve offered over stale gaps_found/human_needed/reader
+   failure), or a gate a run can never leave except by abort.
+3. State fields (code_fix, code_fix_base, gap marker, relaunch_note, rate_limit_timer_gate, failure counters) whose
+   set/clear points disagree across 52-27/28/29/31/32/33, or that a 3.x state file / resume would leave inconsistent.
+4. Counter semantics: which gates count as a Validate failure; can a loop burn the failure ceiling or never reach it.
+5. Verify gates that cannot pass on correct code or cannot fail on the defect (repo traps in CLAUDE.md), and tests a gate
+   names that do not exist at that point in plan order (52-28 -> 29 -> 30 -> 33 -> 31 -> 32).
+6. Unnecessary complexity: mechanisms that could be removed or collapsed without losing a stated property.
+
+Be specific and hostile. Prefer ~8 sharp, reproducible findings with file:line citations. Label speculation.
+Output format:
+## CONFIRMED  (id, severity Critical/High/Medium/Low, file:line, quoted text, the concrete sequence that breaks it,
+               evidence checked, suggested fix)
+## SUSPECTED  (same fields, marked speculation)
+## SIMPLIFY   (what could be cut)
+## COVERAGE   (what you read in full vs skimmed)

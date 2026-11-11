@@ -26,8 +26,7 @@ use crate::pipeline_gate::transition;
 use crate::pipeline_gate::{abort, run_gate_with_timeout};
 use crate::pipeline_outcomes::{
     ValidateOutcome, classify_validate_outcome, gate_or_abort_infra, handle_infra_outcome,
-    handle_rate_limited_outcome, handle_ship_failure, handle_ship_outcome, handle_stage_failure,
-    handle_validate_outcome, truncate_reason,
+    handle_rate_limited_outcome, handle_stage_failure, handle_validate_outcome, truncate_reason,
 };
 use crate::preflight::{
     agent_program, ensure_agent_binary, generic_preflight_checks, print_fallback_notice,
@@ -35,7 +34,7 @@ use crate::preflight::{
 };
 use devflow_core::config::capture_retention;
 use devflow_core::gates::{
-    AwaitOutcome, ClaimedAnswer, CloseReport, GateAction, GateAnswer, GateId, Gates,
+    AwaitOutcome, ClaimedAnswer, CloseReport, GateAnswer, GateId, GateKind, Gates,
 };
 use devflow_core::mode::Mode;
 use devflow_core::outcome_policy::{self, Action};
@@ -93,6 +92,52 @@ const PROMOTION_WAIT: Duration = PROMOTION_WAIT_RELEASE;
 #[cfg(test)]
 const PROMOTION_WAIT: Duration = Duration::from_secs(5);
 
+/// The prompt a launch with no override gives the agent, rendered by `driver`
+/// (Phase 51 D-09). At Code it replays the persisted fix pass
+/// ([`State::code_fix`]), so a same-stage relaunch inside a gaps-only or
+/// full-execute pass continues that pass; every other stage gets
+/// its default intent. The fix TYPE is persisted and rendered here, at launch,
+/// so after a handoff the fallback's own renderer is used. The operator's notes
+/// ride the same way (GATE-01): the fix pass's [`State::code_fix_note`], only
+/// while a fix pass is in flight, and the stage's [`State::relaunch_note`],
+/// attached to the intent the default builder returns. In a gap-closure pass
+/// ([`State::gap_closure_pass`], GATE-03) Plan renders the gaps Plan intent
+/// and Code the gaps-only pass, so a stop and resume keeps the pass's commands.
+///
+/// The only place a default stage prompt is rendered:
+/// [`launch_stage_inner`] (whose prompt the agent receives) and
+/// [`launch_stage`] (which resolves the program from it) both call this, which
+/// `every_no_override_launch_renders_through_default_stage_prompt` pins.
+pub(crate) fn default_stage_prompt(state: &State, driver: &dyn agents::AgentDriver) -> String {
+    let intent = match state.stage {
+        // GATE-03 (review C6): a gap-closure pass's Plan runs `--gaps`, at its
+        // first launch and at every relaunch, a resume included.
+        Stage::Plan if state.gap_closure_pass => prompt::StageIntent::PlanGaps {
+            phase: state.phase,
+            relaunch_note: state.relaunch_note.clone(),
+        },
+        // The gaps-only pass is derived from the gap-closure marker when no
+        // fix pass is recorded, so an `--until code` halt, which clears
+        // `code_fix`, cannot turn a gaps Code pass into a full execute.
+        Stage::Code => prompt::StageIntent::Code {
+            phase: state.phase,
+            fix: state
+                .code_fix
+                .or(state.gap_closure_pass.then_some(prompt::FixType::GapsOnly)),
+            fix_note: state.code_fix.and(state.code_fix_note.clone()),
+            relaunch_note: state.relaunch_note.clone(),
+            // D-32 part 1: a resumed re-verify pass quotes GSD's recorded words.
+            reverify_report: state
+                .code_fix
+                .filter(|fix| *fix == prompt::FixType::StaleReverify)
+                .and(state.code_fix_report.clone()),
+        },
+        stage => prompt::StageIntent::for_stage(stage, state.phase)
+            .with_relaunch_note(state.relaunch_note.clone()),
+    };
+    driver.render_prompt(&intent)
+}
+
 /// The post-preflight body of [`launch_stage`]: capture archival/rollover
 /// and spawning the monitor. (25b, D-03: this function no longer performs
 /// self-dogfood build-staleness enforcement — that check is now adjudicated
@@ -103,53 +148,6 @@ const PROMOTION_WAIT: Duration = Duration::from_secs(5);
 /// other caller keeps going through [`launch_stage`]'s full path (readiness
 /// resolution, `ensure_agent_binary`, then `run_preflight`).
 ///
-/// 35.2 (999.89 / HARDEN-03, P-01/P-02): stamp the run-owned nonce and
-/// re-observe the artifact baseline into a window scoped to THIS Validate
-/// dispatch.
-///
-/// The stamp and the re-observation are ONE mechanism — do not separate.
-/// Extracted so the co-location is testable without spawning an agent.
-fn stamp_validate_dispatch_window(state: &mut State) {
-    if state.stage != Stage::Validate {
-        return;
-    }
-    let evidence_root = state
-        .worktree_path
-        .as_deref()
-        .unwrap_or(&state.project_root);
-    state.verification_run_nonce =
-        Some(state.verification_run_nonce.unwrap_or(0).saturating_add(1));
-    state.last_verification_fingerprint =
-        devflow_core::agent_result::phase_verification_fingerprint(evidence_root, state.phase);
-    state.last_verification_mtime_nanos =
-        devflow_core::agent_result::phase_verification_mtime_nanos(evidence_root, state.phase);
-    state.verification_baseline_captured = true;
-}
-
-/// The prompt a launch with no override gives the agent, rendered by `driver`
-/// (Phase 51 D-09). At Code it replays the persisted fix pass
-/// ([`State::code_fix`]), so a same-stage relaunch inside an audit-fix,
-/// gaps-only or full-execute pass continues that pass; every other stage gets
-/// its default intent. The fix TYPE is persisted and rendered here, at launch,
-/// so after a handoff the fallback's own renderer is used.
-///
-/// The only place a default stage prompt is rendered:
-/// [`launch_stage_inner`] (whose prompt the agent receives) and
-/// [`launch_stage`] (which resolves the program from it) both call this, which
-/// `every_no_override_launch_renders_through_default_stage_prompt` pins.
-fn default_stage_prompt(state: &State, driver: &dyn agents::AgentDriver) -> String {
-    let intent = match state.stage {
-        Stage::Code => prompt::StageIntent::Code {
-            phase: state.phase,
-            fix: state.code_fix,
-        },
-        stage => {
-            prompt::StageIntent::for_stage_in_project(stage, state.phase, Some(&state.project_root))
-        }
-    };
-    driver.render_prompt(&intent)
-}
-
 /// Recomputes `prompt`/`adapter`/`roots`/`program`/`args` from `state` and
 /// `prompt_override` — deliberately NOT threaded through as parameters.
 /// They are pure functions of `state` and the prompt override; recomputing
@@ -184,16 +182,7 @@ pub(crate) fn launch_stage_inner(
     // governs both the launch shape and the guard that protects it — the guard
     // must fire on exactly the launches whose premise it checks, and two
     // separate evaluations of "is this the stream path?" would be free to drift.
-    let stream_launch = stream_launch_enabled(state.agent, state.stage, state.legacy_claude_launch);
-
-    // D-11 (31-04): the opt-out is loud, on three channels. Fires only when the
-    // opt-out is what made the difference — forcing legacy on a stage the
-    // rollout has not reached changes nothing, and a notice there would imply
-    // it did. Placed ahead of the canary gate so the operator learns what the
-    // legacy path costs before anything else happens.
-    if !stream_launch && stream_launch_enabled(state.agent, state.stage, false) {
-        announce_forced_legacy_launch(state);
-    }
+    let stream_launch = stream_launch_enabled(state.agent, state.stage);
 
     // D-15: refuse before any launch work if the undocumented CLI behaviour
     // this transport depends on is not backed by observed behaviour. Placed
@@ -239,8 +228,6 @@ pub(crate) fn launch_stage_inner(
     // commit — no extra save needed here.
     state.checkpoint_resumes = 0;
 
-    stamp_validate_dispatch_window(state);
-
     spawn_agent_and_record(
         state,
         program,
@@ -271,8 +258,8 @@ fn resolve_launch_shape(
         let (program, args) = driver.build_command(phase, &prompt, roots);
         (program, args, monitor::MonitorLaunch::PipeOwning { prompt })
     } else if agent == AgentKind::Claude {
-        // Claude on a stage the rollout has not reached, or a run that took
-        // D-11's opt-out: the explicitly named pre-31 builder, NOT
+        // Claude on a stage the rollout has not reached (none today; Phase 52
+        // removed D-11's opt-out): the explicitly named pre-31 builder, NOT
         // `exec_command` — which now returns the stream-json shape for every
         // stage.
         let (program, args) = agents::ClaudeDriver::exec_command_single_document(&prompt);
@@ -303,156 +290,6 @@ fn resume_launch_shape(phase: PhaseId, session_id: &str) -> (&'static str, Vec<S
     agents::ClaudeDriver::exec_resume_command(session_id, &instruction)
 }
 
-/// Where a forced legacy launch's authorization came from, for the provenance
-/// record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LegacyLaunchSource {
-    /// `DEVFLOW_CLAUDE_LEGACY_LAUNCH` is set in THIS process's environment.
-    Environment,
-    /// The persisted `state.legacy_claude_launch`, written at `start`/`resume`
-    /// time by the `--legacy-claude-launch` flag or by the environment variable
-    /// as it stood then.
-    PersistedState,
-}
-
-impl LegacyLaunchSource {
-    fn as_str(self) -> &'static str {
-        match self {
-            LegacyLaunchSource::Environment => "env:DEVFLOW_CLAUDE_LEGACY_LAUNCH",
-            LegacyLaunchSource::PersistedState => "state:legacy_claude_launch",
-        }
-    }
-}
-
-/// Which source is reporting the opt-out *in this process*.
-///
-/// Deliberately re-derived at launch time rather than persisted as a second
-/// field. The limit is worth stating: a stage launched from the DETACHED
-/// monitor's `advance` tail does not inherit the operator's shell environment,
-/// so it reports `PersistedState` even for a run originally authorized by the
-/// environment variable. That is accurate for the process doing the reporting —
-/// the persisted flag really is what it read — and the `start`-time notice
-/// already named the environment as the origin.
-fn legacy_launch_source() -> LegacyLaunchSource {
-    if devflow_core::config::claude_legacy_launch() {
-        LegacyLaunchSource::Environment
-    } else {
-        LegacyLaunchSource::PersistedState
-    }
-}
-
-/// The D-11 notice, as one string, so its required content is assertable
-/// without capturing stdout.
-///
-/// **The 999.64 sentence is required, not decorative (adversarial review B3).**
-/// The opt-out was questioned as a silent way to disable the D-15 delivery
-/// guard; it is not — `MonitorLaunch::Legacy` runs the child with stdin at
-/// `/dev/null`, so the task-notification mechanism the canary tests
-/// structurally does not exist there and running it would spend a real agent
-/// invocation answering a question the launch never asks. What the operator
-/// genuinely gives up is different and worse: the legacy path is *where a
-/// multi-plan wave orphans delegated work* — that is 999.64 itself. Taking the
-/// opt-out is an explicit acceptance of the limitation this phase exists to
-/// remove, and it has to say so in plain words.
-fn forced_legacy_launch_notice(stage: Stage, source: LegacyLaunchSource) -> String {
-    format!(
-        "legacy launch: DevFlow is forcing the pre-31 single-document Claude launch for \
-         stage {stage} (source: {}). This path cannot deliver background-task \
-         notifications, so a multi-plan wave may ORPHAN delegated work (999.64, unfixed \
-         on this path). The stream-json transport, the pipe-owning monitor, the idle \
-         timeout and the delivery canary are all inactive for this launch. Unset the \
-         opt-out to return to the Phase 31 transport.",
-        source.as_str()
-    )
-}
-
-/// Announce a forced legacy launch on all three channels.
-///
-/// **Three, not fewer.** D-11's "logged loudly" has to survive an unattended
-/// run where nobody is watching stdout: `println!` for an operator who is
-/// present, the monitor log because the detached monitor's own stdio is null,
-/// and `.devflow/events.jsonl` so the run's permanent record shows how often
-/// the escape hatch is actually reached. An escape hatch used routinely erodes
-/// what it protects, and only the ledger makes "routinely" visible.
-fn announce_forced_legacy_launch(state: &State) {
-    let source = legacy_launch_source();
-    let notice = forced_legacy_launch_notice(state.stage, source);
-
-    println!("warning: {notice}");
-    append_monitor_log(
-        &state.project_root,
-        state.phase,
-        &format!("[devflow] {notice}"),
-    );
-
-    events::emit(
-        &state.project_root,
-        state.phase,
-        "claude_legacy_launch_forced",
-        serde_json::json!({
-            "stage": state.stage.to_string(),
-            "source": source.as_str(),
-            "notice": truncate_reason(&notice),
-        }),
-    );
-}
-
-/// Append one line to the phase's monitor log, creating it if needed.
-///
-/// Best-effort: recording the notice must never abort the launch it describes.
-/// A local five-line helper rather than a widened `devflow-core` API — the core
-/// monitor has its own private equivalent for its own writes, and exporting it
-/// for one CLI caller would grow the crate's public surface for no other gain.
-fn append_monitor_log(project_root: &Path, phase: PhaseId, entry: &str) {
-    use std::io::Write;
-    let path = agent_result::monitor_log_path(project_root, phase);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        let _ = writeln!(file, "{entry}");
-    }
-}
-
-/// Combine D-11's two authorization sources into `state.legacy_claude_launch`.
-///
-/// **OR-only: this never clears a persisted opt-out (W5).** `devflow resume` is
-/// the recovery verb for a rate-limited or infra-paused phase, so an
-/// unconditional `state.legacy_claude_launch = flag || env` would silently flip
-/// a run that deliberately chose the legacy path back onto the stream transport
-/// mid-flight — the same silent-drop class as `stop_until`'s old unconditional
-/// clear (999.60), and invisible in exactly the same way. To turn the opt-out
-/// back off, edit `.devflow/state-NN.json` or start a new run.
-///
-/// Returns whether the environment ALONE supplied the authorization, so the
-/// caller can print the "a persisted default is never a silent one" notice —
-/// `--yes-ship`'s shape, for the same reason.
-pub(crate) fn apply_legacy_launch_opt_out(state: &mut State, flag: bool) -> bool {
-    combine_legacy_launch_opt_out(state, flag, devflow_core::config::claude_legacy_launch())
-}
-
-/// [`apply_legacy_launch_opt_out`] with the environment's value passed in.
-fn combine_legacy_launch_opt_out(state: &mut State, flag: bool, env: bool) -> bool {
-    state.legacy_claude_launch = state.legacy_claude_launch || flag || env;
-    env && !flag
-}
-
-/// [`recorded_canary_refusal`] for a `devflow resume` of `state` on its own agent: the
-/// state judged as `resume` would launch it, with the legacy opt-out combined from
-/// `flag` and `env` as [`apply_legacy_launch_opt_out`] does. `resume`'s refusal and
-/// `status`'s hint both judge through it, so they cannot disagree on the environment's
-/// opt-out.
-pub(crate) fn resume_canary_refusal(state: &State, flag: bool, env: bool) -> Option<String> {
-    let mut candidate = state.clone();
-    // Only the combined value is read here; the notice is `resume_loaded`'s to print.
-    let _env_alone = combine_legacy_launch_opt_out(&mut candidate, flag, env);
-    recorded_canary_refusal(&candidate)
-}
-
 /// Entry-point name recorded in the `auto_chain_flag_repaired` payload by
 /// [`commands::start`](crate::commands::start).
 pub(crate) const AUTO_CHAIN_REPAIR_FROM_START: &str = "start";
@@ -462,10 +299,9 @@ pub(crate) const AUTO_CHAIN_REPAIR_FROM_RESUME: &str = "resume";
 /// Repair a leaked `workflow._auto_chain_active` before this launch spawns
 /// anything, and say so on both channels when it found one (35.1 D-01/D-03).
 ///
-/// **One helper, two call sites**, for the reason
-/// [`apply_legacy_launch_opt_out`] gives about its own pair: `start` and
-/// `resume` must not be able to drift into repairing on different terms, and a
-/// second copy of the emit/print block is exactly how that drift happens.
+/// **One helper, two call sites**: `start` and `resume` must not be able to
+/// drift into repairing on different terms, and a second copy of the
+/// emit/print block is exactly how that drift happens.
 ///
 /// `35.1 D-01` — why the repair exists at all: the in-process `AutoChainGuard`
 /// covers a normal return, a `?` early-return and a panic-unwind, and
@@ -589,8 +425,8 @@ where
 {
     // The guard protects one specific premise: that a live `stream-json`
     // session is woken back up when a background task finishes. A launch that
-    // resolved to the legacy single-document path does not rely on that
-    // premise, so checking it there would spend an agent invocation to answer a
+    // resolved to the capture shape does not rely on that premise, so checking
+    // it there would spend an agent invocation to answer a
     // question the launch never asks.
     if !stream_launch {
         return Ok(());
@@ -652,7 +488,7 @@ where
 /// mapping, so `recorded_canary_refusal_agrees_with_canary_gate_on_every_recorded_outcome`
 /// pins the two together: change one and that test fails until the other matches.
 pub(crate) fn recorded_canary_refusal(state: &State) -> Option<String> {
-    if !stream_launch_enabled(state.agent, state.stage, state.legacy_claude_launch) {
+    if !stream_launch_enabled(state.agent, state.stage) {
         return None;
     }
     match state.canary.as_ref()? {
@@ -764,7 +600,7 @@ fn emit_canary_outcome(state: &State, outcome: &canary::CanaryOutcome) {
 /// transport varies per stage.
 ///
 /// The consequence is what makes the capture campaign worth running. A capture
-/// taken at Define and a capture taken at Validate differ only in how the agent
+/// taken at Plan and a capture taken at Validate differ only in how the agent
 /// behaved under that stage's prompt — whether it backgrounded work, whether a
 /// `background_tasks_changed` event appears, whether the stream drains. Any
 /// difference between two stages' captures is a fact about agent behaviour. It
@@ -778,31 +614,29 @@ fn emit_canary_outcome(state: &State, outcome: &canary::CanaryOutcome) {
 ///
 /// # Per-stage evidence (ROADMAP criterion 1, phase 34)
 ///
-/// Every one of the five `Stage` variants is accounted for by name below —
+/// Every one of the three `Stage` variants is accounted for by name below —
 /// each entry names the capture that authorised it, or, for a stage left off
 /// the list, what was attempted and what specifically prevented the evidence.
-/// All five are currently ON the list, so no "recorded reason for staying
+/// All three are currently ON the list, so no "recorded reason for staying
 /// narrow" entry is live; the format is retained so that removing a stage
-/// requires writing one rather than deleting a line.
+/// requires writing one rather than deleting a line. The same run also
+/// captured the Define and Ship stages (`34-evidence/define/`,
+/// `34-evidence/ship/`); v4.0 removed both stages from [`Stage`] (D-01).
 ///
-/// All five captures come from a SINGLE run — `devflow start --phase 1
+/// All five of that run's captures come from a SINGLE run — `devflow start --phase 1
 /// --no-worktree --agent claude --mode auto` against a throwaway repo
 /// scaffolded by `scripts/scratch-dogfood-repo.sh`, on `claude` 2.1.222, driven
 /// by a binary whose digest was verified byte-identical to the build made from
 /// this tree after the widening. Evidence directories are under
 /// `.planning/phases/34-…/34-evidence/{stage}/`.
 ///
-/// - **`Stage::Define`** — WIDENED on `34-evidence/define/`. 8 top-level
-///   NDJSON events; `BackgroundTaskState::NeverAnnounced`, which
-///   [`monitor::CloseRule::should_close`] treats as vacuously drained by
-///   design. **Thin by construction:** the stage ran 1 turn in 2.3 s with no
-///   tool use, because the scratch scaffold pre-writes the plan and
-///   `/gsd-discuss-phase` had nothing to gather. It is evidence that Define
-///   takes the stream path and does not announce background tasks *on a
-///   workload with no work in it* — not that Define never backgrounds work.
 /// - **`Stage::Plan`** — WIDENED on `34-evidence/plan/`. 11 events, 2 turns,
-///   11.8 s, `NeverAnnounced`. Same thinness and the same cause: the agent
-///   reported "The deliverable already exists … No work performed".
+///   11.8 s, `NeverAnnounced`, which [`monitor::CloseRule::should_close`]
+///   treats as vacuously drained by design. **Thin by construction:** the
+///   scratch scaffold pre-writes the plan, and the agent reported "The
+///   deliverable already exists … No work performed". It is evidence that Plan
+///   takes the stream path and does not announce background tasks *on a
+///   workload with no work in it* — not that Plan never backgrounds work.
 /// - **`Stage::Code`** — WIDENED on `34-evidence/code/`. The substantive
 ///   capture of the run: 455 events, 49 turns, 695 s, 67 Bash / 22 Read /
 ///   5 Write / 3 Edit and **3 `Agent` sub-agent dispatches**. `NeverAnnounced`
@@ -820,49 +654,36 @@ fn emit_canary_outcome(state: &State, outcome: &canary::CanaryOutcome) {
 ///   still classified the stage as a `loop_back` to Code. That is the
 ///   validate trust boundary this phase exists to tighten, and the capture is
 ///   filed as an observation of it rather than as a defect.
-/// - **`Stage::Ship`** — WIDENED on `34-evidence/ship/`. 463 events, 31 turns,
-///   516 s, `NeverAnnounced`, with 5 further `Agent` dispatches. The stage
-///   launched and ran to a top-level `result` marker; its *work* stopped at
-///   preflight because the scratch repo has no git remote. The capture is
-///   evidence about the launch path, which is what membership here selects —
-///   it is NOT evidence that a real Ship completes.
 ///
 /// **What none of these establish (D-10, n=1).** Each capture shows the shape
 /// occurred ONCE. None of them shows it is the stage's steady behaviour across
 /// prompts, phase shapes or CLI versions — Phase 30 needed n=2–3 trials before
 /// its drain measurements meant anything. A `NeverAnnounced` reading from a
-/// 2.3-second no-op is the weakest form this evidence takes, and Define and
-/// Plan are both that form.
+/// near no-op is the weakest form this evidence takes, and Plan's is that
+/// form.
 ///
-/// **Criterion 7 — the D-15 canary refusal has MOVED, deliberately.** With
-/// `Stage::Define` on the stream path, [`canary_gate`] now runs at Define
-/// instead of Code. A run whose canary returns `Absent`/`Unverified` therefore
-/// refuses at the FIRST stage, instead of completing Define and Plan on the
-/// legacy path and only then refusing. This is a real change to unattended
-/// behaviour, accepted rather than mitigated: D-15 rejected both alternatives
-/// (warn-and-proceed fails unattended; falling back to the legacy path is a
-/// silent capability downgrade). On the capture run the canary returned
-/// `Confirmed` at Define, so the relocated refusal did not fire — the
-/// relocation is recorded here on the strength of the code path, not on the
-/// strength of having watched it refuse.
-const STREAM_JSON_STAGES: &[Stage] = &[
-    Stage::Define,
-    Stage::Plan,
-    Stage::Code,
-    Stage::Validate,
-    Stage::Ship,
-];
+/// **Criterion 7 — the D-15 canary refusal runs at the FIRST stage, Plan.**
+/// With every stage on the stream path, [`canary_gate`] runs at the run's
+/// first launch instead of at Code. A run whose canary returns
+/// `Absent`/`Unverified` therefore refuses before any stage completes on the
+/// legacy path. This is a real change to unattended behaviour, accepted rather
+/// than mitigated: D-15 rejected both alternatives (warn-and-proceed fails
+/// unattended; falling back to the legacy path is a silent capability
+/// downgrade). On the phase-34 capture run the canary returned `Confirmed` at
+/// its first stage (then Define), so the refusal did not fire — it is recorded
+/// here on the strength of the code path, not on the strength of having
+/// watched it refuse.
+const STREAM_JSON_STAGES: &[Stage] = &[Stage::Plan, Stage::Code, Stage::Validate];
 
 /// Whether this launch should use the `stream-json` transport and the
 /// pipe-owning monitor.
 ///
-/// **Agent coverage (round-3 D-10):** Claude and Antigravity. The
-/// `legacy_opt_out` term applies ONLY to Claude — `DEVFLOW_CLAUDE_LEGACY_LAUNCH`
-/// is an escape hatch for Claude's pre-31 single-document launch, and
-/// Antigravity has no single-document format, so the variable must never route
-/// it to `MonitorLaunch::Legacy` (stdin would be `/dev/null` and the child
-/// would silently fail; antigravity reviewer notice (b)). Antigravity
-/// evaluates purely on `STREAM_JSON_STAGES` membership.
+/// **Agent coverage (round-3 D-10):** Claude and Antigravity, purely on
+/// `STREAM_JSON_STAGES` membership. Every other agent (codex, opencode, pi,
+/// hermes) takes the capture shape, `MonitorLaunch::Legacy`. There is no
+/// opt-out: Phase 52 removed Claude's pre-31 single-document launch and its
+/// flag and environment override, so one predicate governs the launch shape
+/// and the D-15 canary gate that protects it.
 ///
 /// **This is a SEQUENCING choice, not a behaviour prediction.** Constraint 1
 /// forbids deciding at launch time which stages will background work; it
@@ -879,22 +700,14 @@ const STREAM_JSON_STAGES: &[Stage] = &[
 /// Success" — the completion oracle already scored the orphaned Phase 29 stage
 /// as Success.
 ///
-/// **`legacy_opt_out` is D-11's escape hatch (31-04)**, and it is folded in
-/// HERE rather than checked separately at each use so that ONE predicate still
-/// governs the launch shape, the D-15 canary gate that protects it, and the
-/// loud notice. Two separate notions of "is this the stream path?" would be
-/// free to drift, and the drift would show up as a guard firing on a launch it
-/// does not protect — or, worse, not firing on one it does.
-///
-/// Note what the opt-out does NOT reach: `relaunch_checkpoint_session`
+/// Note what this predicate does NOT reach: `relaunch_checkpoint_session`
 /// hardcodes `MonitorLaunch::Legacy` and calls `spawn_agent_and_record`
 /// directly, so it never consults this predicate at all. That is a
-/// pre-existing, deliberate legacy route (see `MonitorLaunch::Legacy`'s own
+/// pre-existing, deliberate capture route (see `MonitorLaunch::Legacy`'s own
 /// doc), recorded rather than silently covered.
-pub(crate) fn stream_launch_enabled(agent: AgentKind, stage: Stage, legacy_opt_out: bool) -> bool {
+pub(crate) fn stream_launch_enabled(agent: AgentKind, stage: Stage) -> bool {
     matches!(agent, AgentKind::Claude | AgentKind::Antigravity)
         && STREAM_JSON_STAGES.contains(&stage)
-        && !(agent == AgentKind::Claude && legacy_opt_out)
 }
 
 /// The stages whose launch may set GSD's `workflow._auto_chain_active` flag
@@ -958,13 +771,17 @@ fn auto_chain_flag_eligible(stage: Stage, mode: Mode) -> bool {
 /// ineligible path is a genuine no-op on an already-`false` file and does not
 /// dirty a tracked file on every stage launch.
 ///
-/// **Diverges from `LegacyEnvOverride` deliberately.** That guard restores a
-/// caller-supplied PRIOR value, because the env var it owns may have had a
-/// meaningful pre-existing state. This one does not restore anything: `false`
-/// is always the correct value on exit (D-06). A run that ends with the flag
-/// still set is the failure mode this type exists to prevent, and "put back
-/// whatever was there" would reproduce it exactly whenever what was there was a
-/// leaked `true`.
+/// **Restores only its own write (D-46, review 5 V3).** When [`Self::engage`]
+/// changed the file, the guard keeps the bytes it read before and the bytes it
+/// wrote. On drop, if the file still holds exactly its own write, the earlier
+/// bytes go back (temp write, then rename in the same directory), so a file it
+/// found without the key, or with the key `false` in another layout, is
+/// byte-identical after the stage and never reads as a dirty tree. Those
+/// earlier bytes never hold `true`: bytes whose flag reads `true` are not kept
+/// (a leaked `true` an ineligible launch clears stays cleared), so 35.1 D-06's
+/// `false` on exit stands. Otherwise (the guard wrote nothing,
+/// or the file changed during the stage) the drop clears the flag as before, so
+/// a leaked `true` is still cleared and an edit made during the stage is kept.
 ///
 /// Errors are logged, never propagated. A hand-edited or absent
 /// `.planning/config.json` must not abort a long unattended run — the guard
@@ -972,33 +789,74 @@ fn auto_chain_flag_eligible(stage: Stage, mode: Mode) -> bool {
 /// which is the conservative direction (T-35.1-03).
 struct AutoChainGuard {
     config_root: PathBuf,
+    /// The file's bytes before `engage` and the bytes `engage` wrote, when
+    /// `engage` changed it.
+    restore: Option<(Vec<u8>, Vec<u8>)>,
 }
 
 impl AutoChainGuard {
     fn engage(config_root: &Path, active: bool) -> Self {
+        let path = gsd_config::config_path(config_root);
+        // Bytes that hold a `true` flag are never kept for a restore: a leaked
+        // `true` that an ineligible launch clears stays cleared (F-3).
+        let before = std::fs::read(&path)
+            .ok()
+            .filter(|_| matches!(gsd_config::auto_chain_active(config_root), Ok(false)));
+        let mut restore = None;
         match gsd_config::set_auto_chain_active(config_root, active) {
             Ok(changed) => {
                 if changed {
                     info!(
                         "GSD chain flag set to {active} for this stage at {}",
-                        gsd_config::config_path(config_root).display()
+                        path.display()
                     );
+                    if let (Some(before), Ok(written)) = (before, std::fs::read(&path)) {
+                        restore = Some((before, written));
+                    }
                 }
             }
             Err(err) => warn!(
                 "could not set the GSD chain flag at {}: {err} — proceeding without \
                  checkpoint auto-approval",
-                gsd_config::config_path(config_root).display()
+                path.display()
             ),
         }
         Self {
             config_root: config_root.to_path_buf(),
+            restore,
+        }
+    }
+
+    /// Put `before` back when the file still holds exactly `written`. `true`
+    /// when it did.
+    fn restore_own_write(&self, before: &[u8], written: &[u8]) -> bool {
+        let path = gsd_config::config_path(&self.config_root);
+        if std::fs::read(&path).ok().as_deref() != Some(written) {
+            return false;
+        }
+        let temp = path.with_extension("json.devflow-restore");
+        let restored = std::fs::write(&temp, before).and_then(|()| std::fs::rename(&temp, &path));
+        match restored {
+            Ok(()) => true,
+            Err(err) => {
+                let _ = std::fs::remove_file(&temp);
+                warn!(
+                    "could not restore the GSD config at {}: {err}",
+                    path.display()
+                );
+                false
+            }
         }
     }
 }
 
 impl Drop for AutoChainGuard {
     fn drop(&mut self) {
+        if let Some((before, written)) = self.restore.take()
+            && self.restore_own_write(&before, &written)
+        {
+            return;
+        }
         if let Err(err) = gsd_config::set_auto_chain_active(&self.config_root, false) {
             warn!(
                 "could not clear the GSD chain flag at {}: {err}",
@@ -1162,7 +1020,7 @@ pub(crate) fn is_not_owner(err: &CliError) -> bool {
 /// advance this is [`workflow::while_owner`], so the check and `op` share one hold of the
 /// state write lock: a supersession is itself a state write under that lock, and lands
 /// wholly before the check (`op` is refused with `NotOwner`) or wholly after `op`.
-/// Outside one (a hand-run `devflow advance`, the foreground `devflow ship`) it is `op`.
+/// Outside one (a hand-run `devflow advance`) it is `op`.
 ///
 /// `op` is a bounded file operation that calls `Gates::*` directly. The gate lock is the
 /// only lock it may take, as the D-08 ruling of 2026-10-26 allows (see
@@ -1260,6 +1118,23 @@ pub(crate) fn commit(state: &mut State, apply: impl FnOnce(&mut State)) -> Resul
     })?;
     *state = committed;
     Ok(())
+}
+
+/// Commit a rejected gate's `note` as the run's relaunch note
+/// ([`State::relaunch_note`], GATE-01 / D-39), for the relaunch of the stage the
+/// gate stopped at. A rejection with a note replaces an earlier one; a rejection
+/// with none keeps it, so a second failure answered without a note does not
+/// drop what the operator already asked for at this stage. Writes nothing when
+/// there is no note. The note leaves with the stage (`transition`, the Validate
+/// loop-back to Code, `finish_run`).
+pub(crate) fn record_relaunch_note(
+    state: &mut State,
+    note: Option<String>,
+) -> Result<(), CliError> {
+    let Some(note) = note else {
+        return Ok(());
+    };
+    commit(state, |s| s.relaunch_note = Some(note))
 }
 
 /// CR-03 (49-REVIEW.md): commit the notify command this process's environment
@@ -1696,6 +1571,11 @@ pub(crate) fn run_monitor(invocation: &MonitorInvocation, advance: bool) -> Resu
                         if token.stop_requested() {
                             forward_stop_to_successor(&token, project_root, phase, &successor);
                         }
+                    } else if workflow::load_state(project_root, phase).is_ok_and(|s| s.finished) {
+                        // A permitted finish wins over a late stop (operator
+                        // decision 2026-11-11): a stop still pending is answered
+                        // `already_finished`, never `handed_off`.
+                        run.supervisor.token().enter(OwnerPhase::Finished);
                     }
                     drop(stop_guard);
                     match advanced {
@@ -2252,21 +2132,13 @@ fn spawn_agent_and_record(
     launch: monitor::MonitorLaunch,
 ) -> Result<(), CliError> {
     // Persist the caller's launch bookkeeping (`launch_stage_inner`'s
-    // `checkpoint_resumes` reset and Validate dispatch stamp) before
+    // `checkpoint_resumes` reset) before
     // anything is spawned, as this save always has. It once also cleared
     // the previous stage's monitor pid (WR-04, 18-fix); that field is gone
     // from the CLI (50-22), and the record keeps its own rule below.
     let checkpoint_resumes = state.checkpoint_resumes;
-    let verification_run_nonce = state.verification_run_nonce;
-    let last_verification_fingerprint = state.last_verification_fingerprint;
-    let last_verification_mtime_nanos = state.last_verification_mtime_nanos;
-    let verification_baseline_captured = state.verification_baseline_captured;
     commit(state, |s| {
         s.checkpoint_resumes = checkpoint_resumes;
-        s.verification_run_nonce = verification_run_nonce;
-        s.last_verification_fingerprint = last_verification_fingerprint;
-        s.last_verification_mtime_nanos = last_verification_mtime_nanos;
-        s.verification_baseline_captured = verification_baseline_captured;
     })?;
 
     // WR-04 (18-fix, 50-23 T-50-62): every error before the publish save
@@ -2326,26 +2198,6 @@ fn spawn_agent_and_record(
     drop(reservation);
     #[cfg(test)]
     test_hold("after_publish");
-    match devflow_core::ship::consume_cron_instructions(&state.project_root, state.phase) {
-        Ok(Some(path_kind)) => {
-            let path_kind = match path_kind {
-                devflow_core::ship::CronInstructionPathKind::PerPhase => "per-phase",
-                devflow_core::ship::CronInstructionPathKind::Legacy => "legacy",
-                devflow_core::ship::CronInstructionPathKind::Both => "both",
-            };
-            events::emit(
-                &state.project_root,
-                state.phase,
-                "cron_instructions_consumed",
-                serde_json::json!({
-                    "trigger": "resume_consumed",
-                    "path_kind": path_kind,
-                }),
-            );
-        }
-        Ok(None) => {}
-        Err(err) => warn!(phase = %state.phase, "could not consume cron instructions: {err}"),
-    }
     // 23b: register this (project_root, phase) in the machine-global
     // registry on the same code path that just recorded the supervisor, so a
     // running phase cannot be missing from `devflow gate list --all-roots`.
@@ -2467,7 +2319,7 @@ fn promote_pending(state: &mut State) {
 /// [`publish_record`] then shuts this supervisor down through its socket. Inside a
 /// supervisor's advance it is also an owned write (D-03), so a superseded supervisor
 /// promotes nothing.
-fn save_publish_fields(published: &State) -> Result<(), CliError> {
+pub(crate) fn save_publish_fields(published: &State) -> Result<(), CliError> {
     let launch_id = published.supervisor.as_ref().map(|r| r.launch_id.as_str());
     update_engaged_state(&published.project_root, published.phase, |s| {
         let pending_id = s.pending_supervisor.as_ref().map(|p| p.launch_id.as_str());
@@ -2758,8 +2610,7 @@ fn spawn_next_supervisor(
 /// A record already there is replaced when its lock is not held, and its file removed
 /// when it reads abandoned. A held one is a live launch this launcher knows nothing of,
 /// so this launch stops, naming both ids: `start` and `resume` are kept off a live
-/// supervisor by their guard, and a hand-run `advance` and `devflow ship`'s loop-back by
-/// theirs (50.1-29). A supervisor whose own promotion never came never reaches this: it
+/// supervisor by their guard, and a hand-run `advance` by its own (50.1-29). A supervisor whose own promotion never came never reaches this: it
 /// does not advance (D-15).
 ///
 /// Inside a supervisor's advance this is an owned write (D-03): a superseded supervisor
@@ -2840,85 +2691,35 @@ fn reservation_is_pending(state: &State, reservation: &monitor::Reservation) -> 
 /// can be arbitrarily long and the gate context is truncated for the notify
 /// payload, so quoting bodies would push the actionable part — which file to
 /// look at — past the cut.
-fn rescan_gate_context(unapproved: &[&CheckpointDeclaration], mode: Mode) -> String {
+pub(crate) fn rescan_gate_context(
+    phase: PhaseId,
+    stage: Stage,
+    unapproved: &[&CheckpointDeclaration],
+    mode: Mode,
+) -> String {
     let mut plan_files: Vec<&str> = unapproved
         .iter()
         .map(|declaration| declaration.plan_file.as_str())
         .collect();
     plan_files.sort_unstable();
     plan_files.dedup();
-    let next_step = match mode {
+    let repair = match mode {
         Mode::Auto => {
-            "approve, or switch this phase to Supervise for its remaining stages to repair, or abort"
+            " To repair them instead, switch this phase to Supervise for its remaining stages."
         }
-        Mode::Supervise => {
-            "approve then make a separate human Code decision, repair under Supervise, or abort"
-        }
+        Mode::Supervise => " Code then needs a separate human decision.",
     };
-    format!(
-        "[checkpoint re-scan] {} human-only checkpoint(s) in {} were added or changed after this \
-         phase's Code preflight — a human must review them before continuing ({next_step})",
-        unapproved.len(),
-        plan_files.join(", ")
+    crate::pipeline_outcomes::lead_with_way_on(
+        GateKind::CheckpointDeclaration,
+        (phase, stage),
+        None,
+        &format!(
+            "[checkpoint re-scan] {} human-only checkpoint(s) in {} were added or changed after \
+             this phase's Code preflight — a human must review them before continuing.{repair}",
+            unapproved.len(),
+            plan_files.join(", ")
+        ),
     )
-}
-
-/// A re-scan rejection in Auto mode is not an ordinary retry. The declaration
-/// remains unapproved, so an unattended Code launch correctly refuses it;
-/// routing through `GateAction::LoopBack` would open another unattended gate
-/// with no answer. Persist the human-requested handoff before cleanup, so a
-/// subsequent `resume` is supervised and cannot race a stale response file.
-fn park_auto_rescan_repair(
-    project_root: &Path,
-    state: &mut State,
-    stage: Stage,
-    unapproved_files: &[String],
-) -> Result<(), CliError> {
-    debug_assert_eq!(state.mode, Mode::Auto);
-    let reason = format!(
-        "checkpoint re-scan rejected in Auto mode; phase switched to Supervise for its remaining \
-         stages and parked for repair of {}",
-        unapproved_files.join(", ")
-    );
-    commit(state, |s| {
-        s.mode = Mode::Supervise;
-        s.stopped = true;
-        s.gate_pending = false;
-        s.stop_reason = Some(match s.stop_reason.take() {
-            Some(existing) if !existing.is_empty() => format!("{existing}; {reason}"),
-            _ => reason,
-        });
-    })?;
-    close_gate(project_root, state.phase, stage)?;
-    events::emit(
-        project_root,
-        state.phase,
-        "checkpoint_repair_parked",
-        serde_json::json!({
-            "stage": stage.to_string(),
-            "from_mode": "auto",
-            "to_mode": "supervise",
-            "plan_files": unapproved_files,
-        }),
-    );
-    println!(
-        "checkpoint re-scan rejected in Auto mode; phase {} is now Supervise for its remaining \
-         stages and parked for repair. Review the changed plan, then run `devflow resume --phase {}`.",
-        state.phase, state.phase
-    );
-    Ok(())
-}
-
-/// The distinct plan files among `unapproved`, sorted — the actionable part of
-/// both the gate context and the fall-through reason.
-fn unapproved_plan_files(unapproved: &[&CheckpointDeclaration]) -> Vec<String> {
-    let mut files: Vec<String> = unapproved
-        .iter()
-        .map(|declaration| declaration.plan_file.clone())
-        .collect();
-    files.sort_unstable();
-    files.dedup();
-    files
 }
 
 /// The `CheckpointApproval` that records `current`'s human-only declarations.
@@ -3006,6 +2807,15 @@ pub(crate) fn relaunch_checkpoint_session(
     )
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Set on a thread to record each [`launch_stage`] call made on it, as the
+    /// stage and agent it launches, before anything can refuse the launch: a
+    /// unit test's launch seam, where no agent binary is on `PATH`.
+    pub(crate) static LAUNCH_PROBE: std::cell::RefCell<Option<Vec<(Stage, AgentKind)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Spawn the background monitor that owns the agent for `state.stage`. The
 /// monitor calls `devflow advance` when the agent exits. An optional
 /// `prompt_override` is used for Code loop-backs (fix prompts).
@@ -3024,6 +2834,12 @@ pub(crate) fn launch_stage(
     prompt_override: Option<String>,
     archived_stage: Option<Stage>,
 ) -> Result<(), CliError> {
+    #[cfg(test)]
+    LAUNCH_PROBE.with_borrow_mut(|probe| {
+        if let Some(launches) = probe {
+            launches.push((state.stage, state.agent));
+        }
+    });
     let driver = agents::driver_for(state.agent);
     let prompt = prompt_override
         .clone()
@@ -3060,9 +2876,8 @@ pub(crate) fn launch_stage(
 /// than gated (the agent already succeeded) or advanced (a torn envelope is
 /// not proof of a clean finish).
 ///
-/// Bounded by the same shared `infra_failures` ceiling as
-/// [`handle_rate_limited_outcome`] (D-08's intentional shared infra counter):
-/// once bumping would reach the ceiling, the re-drive stops and the outcome
+/// Bounded by the shared `infra_failures` ceiling (D-08): once bumping would
+/// reach the ceiling, the re-drive stops and the outcome
 /// routes through the infra gate/abort path. Never touches
 /// `consecutive_failures`, and never advances.
 pub(crate) fn handle_ambiguous_outcome(
@@ -3097,7 +2912,8 @@ pub(crate) fn handle_ambiguous_outcome(
 }
 
 /// The agent a rate limit at `stage` hands off to (SUPV-02), or `None` when the
-/// cron-resume arm should run instead.
+/// run should wait at the rate-limit gate instead
+/// ([`handle_rate_limited_outcome`]).
 ///
 /// `stage` is the stage the supervisor launched. Only [`Stage::Code`] is
 /// eligible (operator ruling R-2): a Plan relaunch would meet the PLAN.md
@@ -3163,7 +2979,7 @@ enum HandoffOutcome {
 ///
 /// Every check runs against a candidate copy before ANY mutation, so a refusal
 /// leaves the state byte-identical. It runs the FULL generic preflight bundle
-/// (major-bump, unattended-launch-shape, interactivity, gh-auth), not just
+/// (unattended-launch-shape, interactivity), not just
 /// interactivity: `launch_stage` runs this same bundle again via
 /// `run_preflight`, and it is stricter than plain interactivity — e.g. a
 /// Claude/Antigravity-only chain-flag guard means a same-stage handoff to any
@@ -3245,25 +3061,25 @@ fn hand_off_agent(
 /// Continue a rate-limited Code stage under the unused fallback `to` (SUPV-02).
 ///
 /// Reached only from the explicit `RateLimited` arm of `advance_with`, after
-/// [`failover_target`] selected `to`, and BEFORE [`handle_rate_limited_outcome`]'s
-/// infra bump: a hop is not an infra fault, so a successful one leaves
+/// [`failover_target`] selected `to`, instead of [`handle_rate_limited_outcome`]'s
+/// gate. A hop is not an infra fault, so a successful one leaves
 /// `infra_failures` alone (D-06). Once handed off, the same stage is relaunched
 /// under the new driver — the tail of [`handle_ambiguous_outcome`] without its
 /// bump and ceiling check. No commit-count precondition applies (D-08) and the
 /// worktree is handed over untouched (D-10).
 ///
 /// A refused handoff is never a silent skip (D-07): `agent_handoff_refused`
-/// names the fallback and the refusal, then the cron arm runs exactly as it
-/// would have with no fallback, given the ORIGINAL rate-limit reason so its
-/// retry time still parses. Only a committed hop consumes the fallback (D-05),
+/// names the fallback and the refusal, then the run waits at the rate-limit
+/// gate exactly as it would have with no fallback, given the ORIGINAL
+/// rate-limit reason so the gate still names its reset time. Only a committed hop consumes the fallback (D-05),
 /// so a refusal leaves it unused.
 ///
 /// A relaunch that fails AFTER the handoff commit is never silent either (D-04,
 /// R2-D1): `agent_handoff_relaunch_failed` names the stage, both agents and the
 /// error, then [`handle_infra_outcome`] bumps `infra_failures` once and opens the
-/// never-silent gate, or aborts at the ceiling. Not the cron arm: a refused canary
-/// stays recorded and refuses every later launch, so a scheduled resume could not
-/// succeed, and a successor whose shutdown was not confirmed may still run. The
+/// never-silent gate, or aborts at the ceiling. Not the rate-limit gate: a refused
+/// canary stays recorded and refuses every later launch, so a resume after the
+/// reset could not succeed, and a successor whose shutdown was not confirmed may still run. The
 /// relaunch runs under [`FailoverRelaunchGuard`], so its failure keeps the
 /// supervisor record and those writes stay owned. A `NotOwner` from the relaunch
 /// means another launch owns the run: it is returned unchanged and nothing more
@@ -3336,9 +3152,8 @@ pub(crate) fn resume(
     project_root: &Path,
     phase: PhaseId,
     agent: Option<AgentKind>,
-    legacy_claude_launch: bool,
 ) -> Result<(), CliError> {
-    resume_with_fallback(project_root, phase, agent, legacy_claude_launch, None)
+    resume_with_fallback(project_root, phase, agent, None)
 }
 
 /// Resume a rate-limited or infra-paused phase from its saved stage (review
@@ -3347,7 +3162,7 @@ pub(crate) fn resume(
 /// does NOT call `State::new`, `feature_start`, or `ensure_phase_worktree`:
 /// the branch/worktree already exist and agent/mode are read from the saved
 /// state, so neither needs to be passed as a flag and the workflow is never
-/// reset to Define.
+/// reset to Plan.
 ///
 /// 20c (review: Codex MEDIUM — resume semantics): a phase halted by
 /// `devflow start --until <stage>` persists `stopped`/`stop_reason`/
@@ -3366,11 +3181,6 @@ pub(crate) fn resume(
 /// "the cap is still pending" (leave it alone, or the run silently sails
 /// past a boundary the operator named). The save/relaunch ordering is
 /// unchanged either way.
-/// D-11 (31-04): `--legacy-claude-launch` is accepted here too, so an operator
-/// can force the pre-31 path onto a run already in flight without restarting
-/// it. The combination is OR-only — see [`apply_legacy_launch_opt_out`] for why
-/// a plain `devflow resume` must not clear an opt-out the operator already
-/// chose.
 ///
 /// The reservation at the top (D-01, D-08) refuses to resume while the phase's
 /// supervisor or agent remains live, and writes the pending record in one step with
@@ -3385,7 +3195,6 @@ pub(crate) fn resume_with_fallback(
     project_root: &Path,
     phase: PhaseId,
     agent: Option<AgentKind>,
-    legacy_claude_launch: bool,
     fallback_agent: Option<AgentKind>,
 ) -> Result<(), CliError> {
     let _phase_holder = crate::commands::claim_foreground_holder(project_root, phase)?;
@@ -3399,14 +3208,7 @@ pub(crate) fn resume_with_fallback(
     hold_reservation(reserved.reservation);
     #[cfg(test)]
     launch_test_hold("holder_claimed");
-    let result = resume_loaded(
-        project_root,
-        phase,
-        reserved.state,
-        agent,
-        legacy_claude_launch,
-        fallback_agent,
-    );
+    let result = resume_loaded(project_root, phase, reserved.state, agent, fallback_agent);
     abandon_reservation(project_root, phase, reserved.created);
     result
 }
@@ -3441,13 +3243,8 @@ fn unapplied_answer_line(stage: Stage, claimed: &ClaimedAnswer) -> String {
             format!("an answer for the {stage} gate (gate {gate_id}: {decision}{note})")
         }
     };
-    let ship_caution = if stage == Stage::Ship {
-        "; a merge, version bump or tag may already have run, so check them before answering again"
-    } else {
-        ""
-    };
     format!(
-        "resume: {subject} was claimed, with no record that it was applied{ship_caution}; the rerun asks again"
+        "resume: {subject} was claimed, with no record that it was applied; the rerun asks again"
     )
 }
 
@@ -3458,12 +3255,11 @@ fn unapplied_answer_line(stage: Stage, claimed: &ClaimedAnswer) -> String {
 /// `at_current_stage` is whether the run's state names this stage. A claimed pair there is
 /// usually an answer whose consumer ended before acting on it, whatever `gate_pending` reads:
 /// the consumer writes `gate_pending = false` before its caller acts (R2-05). It can also
-/// have been acted on with the gate left open (an `--until` stop, a kill during Ship
-/// finalization, a close that failed), so the line says only what is known. A claimed pair at
+/// have been acted on with the gate left open (an `--until` stop, a close that failed),
+/// so the line says only what is known. A claimed pair at
 /// any other stage is the leftover of an answer the run acted on and moved past, so it gets
 /// no line here; `Gates::close` has logged its removal either way.
 fn resume_gate_lines(
-    phase: PhaseId,
     stage: Stage,
     gate_id: Option<&str>,
     report: &CloseReport,
@@ -3481,15 +3277,6 @@ fn resume_gate_lines(
             )
         })
         .collect();
-    // The answer just set aside is out of `devflow ship`'s reach, so this names only what
-    // is left: the rerun's gate, and `devflow ship` for a later stored approval (D-06).
-    if stage == Stage::Ship && !report.quarantined.is_empty() {
-        lines.push(format!(
-            "resume: the rerun's Ship gate asks again — answer it with `devflow gate approve \
-             {phase} ship`; next time, to apply a stored Ship approval without a rerun, run \
-             `devflow ship --phase {phase}` instead of `resume`"
-        ));
-    }
     if at_current_stage {
         lines.extend(
             report
@@ -3515,14 +3302,7 @@ fn close_gates_for_resume(
     current_stage: Stage,
 ) -> Vec<String> {
     // Read before the close, which removes the files that name them.
-    let gate_ids = [
-        Stage::Define,
-        Stage::Plan,
-        Stage::Code,
-        Stage::Validate,
-        Stage::Ship,
-    ]
-    .map(|stage| {
+    let gate_ids = [Stage::Plan, Stage::Code, Stage::Validate].map(|stage| {
         let gate_id = crate::commands::gate_file_id(project_root, phase, stage)
             .ok()
             .flatten();
@@ -3542,13 +3322,7 @@ fn close_gates_for_resume(
             .find(|(candidate, _)| candidate == stage)
             .and_then(|(_, gate_id)| gate_id.as_deref());
         let at_current_stage = *stage == current_stage;
-        lines.extend(resume_gate_lines(
-            phase,
-            *stage,
-            gate_id,
-            report,
-            at_current_stage,
-        ));
+        lines.extend(resume_gate_lines(*stage, gate_id, report, at_current_stage));
         if at_current_stage {
             for claimed in &report.claimed {
                 events::emit(
@@ -3574,14 +3348,13 @@ fn resume_loaded(
     phase: PhaseId,
     mut state: State,
     agent: Option<AgentKind>,
-    legacy_claude_launch: bool,
     fallback_agent: Option<AgentKind>,
 ) -> Result<(), CliError> {
     crate::commands::refuse_unprepared_run(&state)?;
     // D-01, D-02, D-03: every fallback check runs here, BEFORE `commit_notify_env`
     // below, so a refused resume commits nothing at all (review B-3).
-    refuse_fallback_for_resume(&state, agent, legacy_claude_launch, fallback_agent)?;
-    refuse_recorded_canary_for_resume(&state, agent, legacy_claude_launch)?;
+    refuse_fallback_for_resume(&state, agent, fallback_agent)?;
+    refuse_recorded_canary_for_resume(&state, agent)?;
     // CR-03 (49-REVIEW.md): an exported (or emptied) notify command reaches
     // the chain this resume launches through the state file.
     commit_notify_env(&mut state)?;
@@ -3610,14 +3383,6 @@ fn resume_loaded(
             }
         }
     }
-    // Combined BEFORE the commit below, so the persisted value exists before the
-    // detached monitor this relaunch spawns ever consults it.
-    if apply_legacy_launch_opt_out(&mut state, legacy_claude_launch) {
-        println!(
-            "note: legacy Claude launch forced by DEVFLOW_CLAUDE_LEGACY_LAUNCH \
-             (D-11, 31-CONTEXT.md) — a persisted default is never a silent one"
-        );
-    }
     // 35.1 D-01, `resume`'s half: this is the entry point that catches a leak a
     // SIGKILLed run left behind in its own worktree — the case the in-process
     // guard structurally cannot cover, because `Drop` never runs on a kill.
@@ -3640,7 +3405,6 @@ fn resume_loaded(
     // The stopped test reads the file as it is now: the operator's `resume` is the
     // later word on a stop that landed after this copy loaded, and a run launched
     // while still marked stopped could never advance.
-    let legacy_claude_launch = state.legacy_claude_launch;
     // D-06: the rerun asks again, so the gate this run abandons is closed before the
     // relaunch and its unused answer set aside. After every refusal above, so a refused
     // resume leaves the gate as it found it.
@@ -3654,9 +3418,8 @@ fn resume_loaded(
             s.stop_until = None;
         }
         s.gate_pending = false;
-        s.legacy_claude_launch = legacy_claude_launch;
         // D-01's re-arm, in the commit every resume makes, so it applies to a stopped
-        // run and a cron-paused one alike. A plain resume leaves a spent fallback
+        // run and one whose supervisor exited alike. A plain resume leaves a spent fallback
         // spent (D-05).
         if let Some(fallback) = fallback_agent {
             s.fallback_agent = Some(fallback);
@@ -3695,9 +3458,8 @@ fn resume_loaded(
 /// Refuse a `resume` the run's recorded delivery canary would refuse, before it writes
 /// anything.
 ///
-/// The run is judged as it would launch: its legacy opt-out after
-/// `--legacy-claude-launch` and the environment. A `--agent` naming another agent hands
-/// the run off, and the handoff clears the recorded canary, so it is never refused here.
+/// A `--agent` naming another agent hands the run off, and the handoff clears the
+/// recorded canary, so it is never refused here.
 /// Otherwise a recorded refusal ([`recorded_canary_refusal`]) refuses every launch under
 /// the run's agent. Letting the resume go on would clear `stopped` and `stop_reason`,
 /// fail at [`canary_gate`], and re-mark the run stopped with a reason that no longer names
@@ -3707,16 +3469,11 @@ fn resume_loaded(
 fn refuse_recorded_canary_for_resume(
     state: &State,
     agent: Option<AgentKind>,
-    legacy_claude_launch: bool,
 ) -> Result<(), CliError> {
     if agent.is_some_and(|requested| requested != state.agent) {
         return Ok(());
     }
-    match resume_canary_refusal(
-        state,
-        legacy_claude_launch,
-        devflow_core::config::claude_legacy_launch(),
-    ) {
+    match recorded_canary_refusal(state) {
         None => Ok(()),
         Some(refusal) => Err(CliError::Message(format!(
             "resume refused: the delivery canary recorded for this run refuses {agent} at \
@@ -3732,8 +3489,7 @@ fn refuse_recorded_canary_for_resume(
 
 /// The fallback checks `resume` makes before it writes anything (D-01, D-02, D-03).
 ///
-/// The run is judged as it would launch: its agent after `--agent`, and its legacy
-/// opt-out after `--legacy-claude-launch` and the environment. Then:
+/// The run is judged as it would launch: its agent after `--agent`. Then:
 /// - a `--fallback-agent` is held to [`validate_fallback_agent`], as on `start`;
 /// - with none, a saved fallback that is still unused and equals that agent is refused
 ///   (D-02): `--agent` onto the run's own fallback would leave the two coinciding.
@@ -3742,13 +3498,10 @@ fn refuse_recorded_canary_for_resume(
 fn refuse_fallback_for_resume(
     state: &State,
     agent: Option<AgentKind>,
-    legacy_claude_launch: bool,
     fallback_agent: Option<AgentKind>,
 ) -> Result<(), CliError> {
     let mut candidate = state.clone();
     candidate.agent = agent.unwrap_or(state.agent);
-    // Only the combined value is read here; the notice is `resume_loaded`'s to print.
-    let _env_alone = apply_legacy_launch_opt_out(&mut candidate, legacy_claude_launch);
     match fallback_agent {
         Some(fallback) => validate_fallback_agent(&candidate, fallback),
         None => match state.fallback_agent {
@@ -3838,8 +3591,8 @@ pub(crate) fn advance_command(
 /// The phase an advance acts on: the given one, or the sole active one.
 ///
 /// 13-DEFERRED-CR-03 fix shape #2: the phase is threaded in by the monitor (recorded at
-/// spawn time), so advance's identity never depends on a shared state singleton — under
-/// `devflow parallel`, each monitor advances exactly its own phase. The Option fallback
+/// spawn time), so advance's identity never depends on a shared state singleton — with
+/// several phases running, each monitor advances exactly its own phase. The Option fallback
 /// only serves monitors spawned by an older binary.
 fn resolve_advance_phase(project_root: &Path, phase: Option<PhaseId>) -> Result<PhaseId, CliError> {
     if let Some(phase) = phase {
@@ -3982,16 +3735,20 @@ pub(crate) fn advance_with(
     // through into the success arm below.
     match outcome_policy::decide_action(stage, result.status) {
         Action::Advance => match stage {
-            Stage::Define => transition(project_root, &mut state, Stage::Plan),
+            // GATE-03 (Pitfall 5): a gaps Plan pass must have written a new
+            // gap-closure plan before the gaps-only Code pass runs.
+            Stage::Plan if state.gap_closure_pass => {
+                crate::pipeline_outcomes::handle_gaps_plan_outcome(project_root, &mut state)
+            }
             Stage::Plan => transition(project_root, &mut state, Stage::Code),
             Stage::Code => transition(project_root, &mut state, Stage::Validate),
             Stage::Validate => {
                 // 13b verdict-vs-ran + 18e: the Validate prompt now REQUIRES
-                // a verdict, so ONLY an explicit `verdict: pass` advances to
-                // Ship. A missing verdict is a fail-safe (gate/loop), NOT a
+                // a verdict, so ONLY an explicit `verdict: pass` finishes
+                // the run. A missing verdict is a fail-safe (gate/loop), NOT a
                 // silent pass — closes the composition bug where a
-                // marker-less/verdict-less Validate could otherwise reach
-                // Ship. `classify_validate_outcome` additionally resolves
+                // marker-less/verdict-less Validate could otherwise finish
+                // it. `classify_validate_outcome` additionally resolves
                 // the `external_verify` three-way matrix (D-18e): agreement
                 // advances, disagreement/no-verdict gates immediately.
                 handle_validate_outcome(
@@ -4000,7 +3757,6 @@ pub(crate) fn advance_with(
                     classify_validate_outcome(&result),
                 )
             }
-            Stage::Ship => handle_ship_outcome(project_root, &mut state),
         },
         Action::GateReview => {
             // D-01/D-03/D-05 (28-03): before the ordinary per-stage failure
@@ -4066,24 +3822,15 @@ pub(crate) fn advance_with(
                         let current = verify::phase_checkpoint_declarations(execution_root, phase);
                         let unapproved = state.checkpoint_approval.unapproved(&current);
                         if !unapproved.is_empty() {
-                            let context = rescan_gate_context(&unapproved, state.mode);
-                            // The unapproved plan files, captured BEFORE the
-                            // gate: `unapproved` borrows `current`, and the
-                            // LoopBack arm needs these names after `&mut state`
-                            // has been handed to the gate.
-                            let unapproved_files = unapproved_plan_files(&unapproved);
-
-                            // `None` for the auto-response is load-bearing and
-                            // not a placeholder: this gate exists precisely
-                            // because a human has not seen these declarations,
-                            // so nothing may pre-authorize it.
+                            let context =
+                                rescan_gate_context(phase, stage, &unapproved, state.mode);
                             let action = run_gate_with_timeout(
                                 project_root,
                                 &mut state,
                                 stage,
+                                GateKind::CheckpointDeclaration,
                                 &context,
                                 gate_timeout_secs(),
-                                None,
                             )?;
                             match action {
                                 // R-8 / T-48-15-01: approval must become
@@ -4093,7 +3840,11 @@ pub(crate) fn advance_with(
                                 // — not the stale one the gate was opened about
                                 // — and persist it before relaunching, because
                                 // the next resume runs in a separate process.
-                                GateAction::Advance => {
+                                crate::pipeline_outcomes::Answer::Approve(
+                                    crate::pipeline_outcomes::ApproveRoute::StatusLess(
+                                        crate::pipeline_outcomes::StatusLessStep::RecordCheckpointSet,
+                                    ),
+                                ) => {
                                     // CR-01: close the gate now. The approval
                                     // was bound to this gate's id and is spent.
                                     let _ = close_gate(project_root, phase, stage);
@@ -4113,45 +3864,23 @@ pub(crate) fn advance_with(
                                         "Supervise mode requires a human decision for the declared blocking-human checkpoint",
                                     ));
                                 }
-                                // T-48-15-03: a rejection records NOTHING.
-                                // Widening the set here would mean the next
-                                // resume proceeded as though the human had said
-                                // yes. In Auto, it also cannot use the generic
-                                // loop-back: a second unattended Code preflight
-                                // correctly refuses the still-unapproved human
-                                // checkpoint. Park it for the explicitly
-                                // requested supervised repair instead.
-                                GateAction::LoopBack(_) => {
-                                    if state.mode == Mode::Auto {
-                                        return park_auto_rescan_repair(
-                                            project_root,
-                                            &mut state,
-                                            stage,
-                                            &unapproved_files,
-                                        );
-                                    }
-                                    // Supervise may use the ordinary repair
-                                    // loop: its next Code run is not
-                                    // unattended. D-07: this rejection answered
-                                    // "approve the changed checkpoint set?". The
-                                    // stage-failure gate that follows asks a
-                                    // different question, where any non-abort
-                                    // answer relaunches the stage, so it opens
-                                    // under its own id and waits for its own
-                                    // answer.
-                                    reason = Some(augment_unresolved_checkpoint_reason(
-                                        reason,
-                                        &format!(
-                                            "checkpoint added or changed after Code preflight in {}",
-                                            unapproved_files.join(", ")
-                                        ),
-                                    ));
-                                }
                                 // The same abort every other gate uses, so
                                 // cleanup, state clearing and deregistration
                                 // all happen exactly once and identically.
-                                GateAction::Abort(note) => {
+                                crate::pipeline_outcomes::Answer::Abort(note) => {
                                     return abort(project_root, &state, &note);
+                                }
+                                // T-48-15-03, D-39 (52-29): a reject is not an
+                                // answer to this gate and records nothing. The
+                                // answer screen refuses it before its claim and
+                                // reopens the gate, so no other route reaches
+                                // here.
+                                other => {
+                                    return Err(CliError::Message(format!(
+                                        "phase {phase}: the checkpoint gate's answer has no \
+                                         route here: {}",
+                                        other.resolved_fields()
+                                    )));
                                 }
                             }
                         } else if state.mode == Mode::Auto {
@@ -4189,9 +3918,6 @@ pub(crate) fn advance_with(
                 Stage::Validate => {
                     handle_validate_outcome(project_root, &mut state, ValidateOutcome::Failed)
                 }
-                // Ship distinguishes an agent crash (AgentFailed) from a
-                // review rejection (ReviewFailed, `review:`-prefixed reason).
-                Stage::Ship => handle_ship_failure(project_root, &mut state, reason),
                 // Every other non-Validate failure (incl. Unknown, D-06) is
                 // never silent (WR-11): it always fires a gate + notify
                 // instead of returning a bare error or silently advancing.
@@ -4203,18 +3929,18 @@ pub(crate) fn advance_with(
         // handle_validate_outcome/handle_ship_failure, which would bump
         // consecutive_failures (review consensus #4, D-08).
         Action::GateInfra => handle_infra_outcome(project_root, &mut state, stage, result.reason),
-        // RateLimited / Ambiguous: auto-resume via the primary loop (D-09 /
-        // A2). RateLimited schedules a cron resume; Ambiguous (a transport
-        // cancel whose own envelope still carried a success marker) re-drives
-        // the SAME stage immediately. Both bounded by the shared
-        // infra-failure ceiling (D-08).
+        // RateLimited / Ambiguous (D-09 / A2). RateLimited hands off to an
+        // unused fallback, or waits at the rate-limit gate without touching
+        // the infra counter (D-20); Ambiguous (a transport cancel whose own
+        // envelope still carried a success marker) re-drives the SAME stage
+        // immediately, bounded by the shared infra-failure ceiling (D-08).
         Action::AutoResume => match result.status {
             agent_result::AgentStatus::Ambiguous => {
                 handle_ambiguous_outcome(project_root, &mut state, stage, result.reason)
             }
-            // SUPV-02: the failover branch sits ahead of the cron arm's infra
-            // bump (D-06), and only `RateLimited` reaches it; the wildcard below
-            // never fails over.
+            // SUPV-02: the failover branch sits ahead of the rate-limit gate,
+            // and only `RateLimited` reaches it; the wildcard below never fails
+            // over.
             agent_result::AgentStatus::RateLimited => match failover_target(&state, stage) {
                 Some(to) => fail_over_on_rate_limit(
                     project_root,
@@ -4323,24 +4049,16 @@ mod tests {
         // Every other stage, under the mode that would otherwise qualify.
         // `Stage::Plan` is the load-bearing one: the same flag makes
         // `plan-phase.md` chain into `execute-phase.md` (ROADMAP criterion 3).
-        assert!(!auto_chain_flag_eligible(Stage::Define, Mode::Auto));
         assert!(!auto_chain_flag_eligible(Stage::Plan, Mode::Auto));
         assert!(!auto_chain_flag_eligible(Stage::Validate, Mode::Auto));
-        assert!(!auto_chain_flag_eligible(Stage::Ship, Mode::Auto));
 
-        // Exhaustiveness tripwire: this match names all five variants with no
+        // Exhaustiveness tripwire: this match names every variant with no
         // wildcard arm, so a new `Stage` fails to compile here rather than
-        // slipping past the five assertions above.
-        for stage in [
-            Stage::Define,
-            Stage::Plan,
-            Stage::Code,
-            Stage::Validate,
-            Stage::Ship,
-        ] {
+        // slipping past the assertions above.
+        for stage in [Stage::Plan, Stage::Code, Stage::Validate] {
             let expected = match stage {
                 Stage::Code => true,
-                Stage::Define | Stage::Plan | Stage::Validate | Stage::Ship => false,
+                Stage::Plan | Stage::Validate => false,
             };
             assert_eq!(auto_chain_flag_eligible(stage, Mode::Auto), expected);
         }
@@ -4370,6 +4088,94 @@ mod tests {
         };
         git(&["add", ".planning/config.json"]);
         git(&["commit", "-q", "-m", "add gsd config"]);
+    }
+
+    /// D-46 (review 5, V3): the chain-flag guard an auto Code stage on the
+    /// stream shape engages leaves `.planning/config.json` as it found it. Two
+    /// committed shapes: a file with no `workflow._auto_chain_active` key, and
+    /// one holding it `false` in 4-space indent (which `to_string_pretty` would
+    /// rewrite). After the drop the D-46 dirty-tree read lists nothing and the
+    /// bytes are the committed ones. Third row: an edit to another key made
+    /// while the guard is engaged is kept, and the flag reads `false` (the
+    /// guard restores only its own write). Control in the same test: while the
+    /// guard is engaged, the same read lists the config, so it sees the write.
+    #[test]
+    fn an_auto_code_stage_leaves_the_gsd_config_as_it_found_it() {
+        let active = auto_chain_flag_eligible(Stage::Code, Mode::Auto);
+        assert!(
+            active,
+            "premise: an auto Code stage engages the flag `true`"
+        );
+        let no_key = "{\n  \"workflow\": {\n    \"auto_advance\": true\n  }\n}\n";
+        let four_space_false =
+            "{\n    \"workflow\": {\n        \"_auto_chain_active\": false\n    }\n}\n";
+        let config_path = ".planning/config.json".to_string();
+        for (row, committed, edit_while_engaged) in [
+            ("no key", no_key, false),
+            ("false, 4-space", four_space_false, false),
+            ("no key, edited while engaged", no_key, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            init_repo(root);
+            std::fs::create_dir_all(root.join(".planning")).unwrap();
+            std::fs::write(root.join(&config_path), committed).unwrap();
+            let git = |args: &[&str]| {
+                let output = devflow_core::test_support::git_command(root)
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "git {args:?}: {output:?}");
+            };
+            git(&["add", &config_path]);
+            git(&["commit", "-q", "-m", "gsd config"]);
+            assert_eq!(
+                crate::pipeline_outcomes::read_tree(root),
+                crate::pipeline_outcomes::TreeRead::Clean,
+                "{row}: premise: the committed tree is clean"
+            );
+
+            let guard = AutoChainGuard::engage(root, active);
+            assert_eq!(
+                crate::pipeline_outcomes::read_tree(root),
+                crate::pipeline_outcomes::TreeRead::Dirty(vec![config_path.clone()]),
+                "{row}: control: the read sees the engaged guard's write"
+            );
+            if edit_while_engaged {
+                let mut value: serde_json::Value = serde_json::from_str(
+                    &std::fs::read_to_string(root.join(&config_path)).unwrap(),
+                )
+                .unwrap();
+                value["workflow"]["auto_advance"] = serde_json::Value::Bool(false);
+                std::fs::write(
+                    root.join(&config_path),
+                    serde_json::to_string_pretty(&value).unwrap(),
+                )
+                .unwrap();
+            }
+            drop(guard);
+
+            let after = std::fs::read_to_string(root.join(&config_path)).unwrap();
+            if edit_while_engaged {
+                let value: serde_json::Value = serde_json::from_str(&after).unwrap();
+                assert_eq!(
+                    value["workflow"]["auto_advance"],
+                    serde_json::Value::Bool(false),
+                    "{row}: the edit made while engaged is kept: {after}"
+                );
+                assert!(
+                    !gsd_config::auto_chain_active(root).unwrap(),
+                    "{row}: the flag reads false after the drop: {after}"
+                );
+            } else {
+                assert_eq!(after, committed, "{row}: the bytes are the committed ones");
+                assert_eq!(
+                    crate::pipeline_outcomes::read_tree(root),
+                    crate::pipeline_outcomes::TreeRead::Clean,
+                    "{row}: the drop leaves no dirty path"
+                );
+            }
+        }
     }
 
     /// Every `auto_chain_flag_repaired` line in a project's event log.
@@ -4439,22 +4245,16 @@ mod tests {
     /// saves state BEFORE calling `launch_stage`, so the record must be saved
     /// again inside `launch_stage` or it is lost.
     ///
-    /// **Premise moved off `STREAM_JSON_STAGES` membership deliberately
-    /// (34-06); do not "simplify" the opt-out away.** This test's subject is
-    /// record persistence, not which launch path runs, so it previously relied on
-    /// its stage being ABSENT from `STREAM_JSON_STAGES` — an incidental
-    /// premise that 34-05's widening destroys, at which point `canary_gate`
-    /// invokes the real `ClaudeCanaryLauncher` and the launch fails on a
-    /// delivery refusal that has nothing to do with record persistence. Pinning
-    /// the legacy path via the opt-out makes the premise explicit and stable
-    /// under any contents of the constant, exactly as
-    /// `canary_gate_only_applies_to_the_stream_launch_path` does.
+    /// The run's agent is Codex, a capture-shape agent: this test's subject is
+    /// record persistence, not which launch path runs, and a capture launch spends
+    /// no delivery canary. Phase 52 removed the Claude legacy opt-out that pinned
+    /// this premise before.
     #[test]
     fn launch_stage_persists_the_supervisor_record_for_reload() {
         const NAME: &str =
             "pipeline_launch::tests::launch_stage_persists_the_supervisor_record_for_reload";
         if !devflow_core::test_support::in_child_test(NAME) {
-            let path_dir = agent_free_dir_with_agent_stub("claude");
+            let path_dir = agent_free_dir_with_agent_stub("codex");
             let output =
                 crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
@@ -4467,23 +4267,12 @@ mod tests {
         init_repo(root);
 
         let phase = PhaseId::new(65);
-        // `Mode::Supervise`, and the mode is now load-bearing (35.1-03): the
-        // legacy opt-out set below makes this a launch shape whose Code stage
-        // cannot bound the chain flag's lifetime, and
-        // `preflight_unattended_launch_check` refuses exactly that combination
-        // in `Mode::Auto`. This test's subject — record persistence — is
-        // mode-independent, so supervise keeps the premise the 34-06 note
-        // below establishes without asking the preflight to permit a launch
-        // D-07 exists to refuse.
-        let mut state = State::new(
-            phase,
-            AgentKind::Claude,
-            Mode::Supervise,
-            root.to_path_buf(),
-        );
-        // Not because this test wants legacy behaviour, but because its
-        // subject is orthogonal to the launch path (34-06).
-        state.legacy_claude_launch = true;
+        // `Mode::Supervise`, and the mode is load-bearing (35.1-03): a Codex
+        // run is a launch shape whose Code stage cannot bound the chain flag's
+        // lifetime, and `preflight_unattended_launch_check` refuses exactly that
+        // combination in `Mode::Auto`. This test's subject — record
+        // persistence — is mode-independent.
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
         workflow::save_state(&state).unwrap();
 
         let result = launch_stage(&mut state, None, None);
@@ -4542,7 +4331,7 @@ mod tests {
     /// (`test_support::monitor_entry_full`, `DEVFLOW_TEST_MONITOR_FULL=1`) and
     /// proves it is reached: with the state moved on to Plan while the agent
     /// runs, its in-process advance records `advance_failed` naming the
-    /// launched stage (`define`). The second child, on the supervise-only
+    /// launched stage (`plan`). The second child, on the supervise-only
     /// entry, must record no advance event at all.
     #[test]
     fn launch_publishes_the_socket_path_under_the_cache_dir_in_state() {
@@ -4551,7 +4340,7 @@ mod tests {
         if !devflow_core::test_support::in_child_test(NAME) {
             let mut recorded = Vec::new();
             for full in [true, false] {
-                let path_dir = go_waiting_claude_dir();
+                let path_dir = crate::test_support::go_waiting_agent_dir("codex");
                 let cache = crate::test_support::hermetic_cache_dir();
                 let out = path_dir.path().join("v07-socket-path");
                 let mut env: Vec<(&str, &std::ffi::OsStr)> = vec![
@@ -4597,15 +4386,7 @@ mod tests {
         let root = dir.path();
         init_repo(root);
         let phase = PhaseId::new(1107);
-        let mut state = State::new(
-            phase,
-            AgentKind::Claude,
-            Mode::Supervise,
-            root.to_path_buf(),
-        );
-        // The capture shape, for the same reason as
-        // `launch_stage_persists_the_supervisor_record_for_reload`: no delivery canary.
-        state.legacy_claude_launch = true;
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
         workflow::save_state(&state).unwrap();
 
         let result = launch_stage(&mut state, None, None);
@@ -4657,7 +4438,7 @@ mod tests {
         };
         if full {
             let mut moved = workflow::load_state(root, phase).unwrap();
-            moved.stage = Stage::Plan;
+            moved.stage = Stage::Code;
             workflow::save_state(&moved).unwrap();
         }
         std::fs::write(root.join("go"), "").unwrap();
@@ -4674,7 +4455,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("monitor_entry_full must run the advance: {events:?}"));
             assert_eq!(failed["reason"], "stage mismatch", "{failed}");
             assert_eq!(
-                failed["expected"], "define",
+                failed["expected"], "plan",
                 "the advance is passed the launched stage: {failed}"
             );
         } else {
@@ -5023,18 +4804,17 @@ mod tests {
     /// resume. Asserts on the persisted state (not just `resume`'s exit
     /// code), since `transition()` saves state before `launch_stage` runs.
     ///
-    /// **Premise moved off `STREAM_JSON_STAGES` membership deliberately
-    /// (34-06); do not "simplify" the opt-out away.** The subject is resume's
+    /// The run's agent is Codex, a capture-shape agent, persisted because
+    /// `resume()` loads its own `State` from disk: the subject is resume's
     /// stop-marker semantics, not which launch path the relaunch takes. The
-    /// opt-out is persisted here rather than set on a local binding because
-    /// `resume()` loads its own `State` from disk; `apply_legacy_launch_opt_out`
-    /// ORs the persisted value, so it survives the reload.
+    /// mode is supervise because auto mode refuses Codex at Plan, the first
+    /// stage (D-07's unattended check and the CONTEXT.md check).
     #[test]
     fn resume_clears_stop_marker_and_advances_past_stop_point() {
         const NAME: &str =
             "pipeline_launch::tests::resume_clears_stop_marker_and_advances_past_stop_point";
         if !devflow_core::test_support::in_child_test(NAME) {
-            let path_dir = agent_free_dir_with_agent_stub("claude");
+            let path_dir = agent_free_dir_with_agent_stub("codex");
             let output =
                 crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
@@ -5047,17 +4827,15 @@ mod tests {
         init_repo(root);
 
         let phase = PhaseId::new(66);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
+        state.verification_baseline_captured = true;
         state.stage = Stage::Plan;
         state.stop_until = Some(Stage::Plan);
         state.stopped = true;
         state.stop_reason = Some("stopped after plan completed (--until plan)".to_string());
-        // Not because this test wants legacy behaviour, but because its
-        // subject is orthogonal to the launch path (34-06).
-        state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
 
-        let result = resume(root, phase, None, false);
+        let result = resume(root, phase, None);
 
         // `resume()` loads its own `State` from the state file and never writes the
         // spawned pid back into this test's local `state`, so binding the guard from
@@ -5108,18 +4886,19 @@ mod tests {
         mode: Mode,
         response: &devflow_core::gates::GateResponse,
     ) -> (devflow_core::gates::GateId, Vec<u8>) {
-        let mut state = State::new(phase, AgentKind::Claude, mode, root.to_path_buf());
+        let mut state = State::new(phase, AgentKind::Codex, mode, root.to_path_buf());
+        state.verification_baseline_captured = true;
         state.stage = stage;
         state.gate_pending = true;
         state.stopped = true;
         state.stop_reason = Some("stage failed; gate open".to_string());
-        state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
 
         let opened = Gates::open_gate(
             root,
             phase,
             stage,
+            devflow_core::gates::GateKind::StageFailure,
             "[never-silent] stage failed — human review needed",
         )
         .unwrap();
@@ -5139,7 +4918,7 @@ mod tests {
             phase,
             Stage::Code,
             mode,
-            &gate_response(false, Some("abort: stale answer nobody polled")),
+            &abort_response("abort: stale answer nobody polled"),
         )
     }
 
@@ -5150,7 +4929,14 @@ mod tests {
         phase: PhaseId,
         stage: Stage,
     ) -> devflow_core::gates::GateId {
-        let opened = Gates::open_gate(root, phase, stage, "planted claimed answer").unwrap();
+        let opened = Gates::open_gate(
+            root,
+            phase,
+            stage,
+            devflow_core::gates::GateKind::StageFailure,
+            "planted claimed answer",
+        )
+        .unwrap();
         Gates::answer(
             root,
             phase,
@@ -5187,7 +4973,7 @@ mod tests {
     #[test]
     fn a_resume_that_opens_no_gate_sets_the_pending_answer_aside_and_relaunches() {
         const NAME: &str = "pipeline_launch::tests::a_resume_that_opens_no_gate_sets_the_pending_answer_aside_and_relaunches";
-        enter_agent_free_child!(NAME, "claude");
+        enter_agent_free_child!(NAME, "codex");
         let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
@@ -5197,7 +4983,7 @@ mod tests {
         let (gate, answer_before) =
             seed_code_gate_with_pending_answer(root, phase, Mode::Supervise);
 
-        let result = resume(root, phase, None, false);
+        let result = resume(root, phase, None);
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -5257,7 +5043,7 @@ mod tests {
     fn resume_reports_the_answers_it_set_aside_for_the_closed_gate() {
         const NAME: &str =
             "pipeline_launch::tests::resume_reports_the_answers_it_set_aside_for_the_closed_gate";
-        enter_agent_free_child!(NAME, "claude");
+        enter_agent_free_child!(NAME, "codex");
         let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
@@ -5266,7 +5052,7 @@ mod tests {
         let phase = PhaseId::new(93);
         let (gate, answer) = seed_code_gate_with_pending_answer(root, phase, Mode::Supervise);
 
-        let result = resume(root, phase, None, false);
+        let result = resume(root, phase, None);
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -5296,7 +5082,7 @@ mod tests {
             ..CloseReport::default()
         };
         assert_eq!(
-            resume_gate_lines(phase, Stage::Code, Some(gate.as_str()), &unused, true),
+            resume_gate_lines(Stage::Code, Some(gate.as_str()), &unused, true),
             vec![format!(
                 "resume: set aside an unused answer for the code gate (gate {gate}): {} — the \
                  rerun asks again",
@@ -5304,7 +5090,7 @@ mod tests {
             )]
         );
         assert_eq!(
-            resume_gate_lines(phase, Stage::Code, None, &unused, true),
+            resume_gate_lines(Stage::Code, None, &unused, true),
             vec![format!(
                 "resume: set aside an unused answer for the code gate (gate {gate}): {} — the \
                  rerun asks again",
@@ -5325,7 +5111,7 @@ mod tests {
             response: gate_response(true, None),
         }));
         assert_eq!(
-            resume_gate_lines(phase, Stage::Code, Some("G1"), &approved, true),
+            resume_gate_lines(Stage::Code, Some("G1"), &approved, true),
             vec![
                 "resume: an answer for the code gate (gate G1: approved) was claimed, with no \
                  record that it was applied; the rerun asks again"
@@ -5333,17 +5119,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            resume_gate_lines(phase, Stage::Ship, Some("G1"), &approved, true),
-            vec![
-                "resume: an answer for the ship gate (gate G1: approved) was claimed, with no \
-                 record that it was applied; a merge, version bump or tag may already have run, \
-                 so check them before answering again; the rerun asks again"
-                    .to_string()
-            ],
-            "a kill during Ship finalization leaves a claim after its merge may have run"
-        );
-        assert_eq!(
-            resume_gate_lines(phase, Stage::Code, Some("G1"), &approved, false),
+            resume_gate_lines(Stage::Code, Some("G1"), &approved, false),
             Vec::<String>::new(),
             "a claimed pair at a stage the run left is an applied answer's leftover"
         );
@@ -5352,7 +5128,7 @@ mod tests {
             response: gate_response(false, Some("fix it")),
         }));
         assert_eq!(
-            resume_gate_lines(phase, Stage::Code, None, &rejected, true),
+            resume_gate_lines(Stage::Code, None, &rejected, true),
             vec![
                 "resume: an answer for the code gate (gate G1: rejected, note \"fix it\") was claimed, with no record that it was applied; the rerun asks again"
                     .to_string()
@@ -5360,86 +5136,16 @@ mod tests {
             "the claimed entry names itself, whatever the gate file said"
         );
         assert_eq!(
-            resume_gate_lines(phase, Stage::Code, None, &claimed(None), true),
+            resume_gate_lines(Stage::Code, None, &claimed(None), true),
             vec![
                 "resume: an answer of unknown content for the code gate (gate G1) was claimed, with no record that it was applied; the rerun asks again"
                     .to_string()
             ]
         );
         assert_eq!(
-            resume_gate_lines(phase, Stage::Code, None, &CloseReport::default(), true),
+            resume_gate_lines(Stage::Code, None, &CloseReport::default(), true),
             Vec::<String>::new(),
             "a stage with nothing to report prints nothing"
-        );
-    }
-
-    /// D-06: once `resume` has set a Ship answer aside, `devflow ship` cannot apply it, so
-    /// the report names what is still available. The Code lines above carry none of this.
-    #[test]
-    fn resume_names_only_the_actions_left_for_a_ship_answer_it_set_aside() {
-        const NAME: &str = "pipeline_launch::tests::resume_names_only_the_actions_left_for_a_ship_answer_it_set_aside";
-        if !devflow_core::test_support::in_child_test(NAME) {
-            let path_dir = agent_free_dir_with_agent_stub("claude");
-            let output = crate::test_support::run_hermetic_test_in_child(
-                NAME,
-                path_dir.path(),
-                &[("DEVFLOW_GATE_TIMEOUT_SECS", std::ffi::OsStr::new("1"))],
-            );
-            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
-            return;
-        }
-        let _guard = env_lock();
-
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        init_repo(root);
-        let phase = PhaseId::new(94);
-        let (gate, answer) = seed_gate_with_pending_answer(
-            root,
-            phase,
-            Stage::Ship,
-            Mode::Supervise,
-            &gate_response(true, None),
-        );
-
-        let result = resume(root, phase, None, false);
-        {
-            let reloaded = workflow::load_state(root, phase).ok();
-            let _reap_guard = reloaded.as_ref().map(ReapMonitorOnDrop::after_launch);
-        }
-        drop(result);
-
-        let quarantined = Gates::quarantined(root);
-        assert_eq!(quarantined.len(), 1, "{quarantined:?}");
-        assert_eq!(quarantined[0].label, gate.as_str());
-        assert_eq!(std::fs::read(&quarantined[0].path).unwrap(), answer);
-        let err = crate::pipeline_gate::ship_override(root, phase, false)
-            .expect_err("the answer set aside can no longer be applied by `devflow ship`");
-        assert!(err.to_string().contains("no Ship gate response"), "{err}");
-
-        let report = CloseReport {
-            quarantined: vec![quarantined[0].path.clone()],
-            ..CloseReport::default()
-        };
-        let lines = resume_gate_lines(phase, Stage::Ship, Some(gate.as_str()), &report, true);
-        assert_eq!(lines.len(), 2, "{lines:?}");
-        assert!(
-            lines[0].contains("the ship gate") && lines[0].contains("the rerun asks again"),
-            "{lines:?}"
-        );
-        assert_eq!(
-            lines[1],
-            format!(
-                "resume: the rerun's Ship gate asks again — answer it with `devflow gate approve \
-                 {phase} ship`; next time, to apply a stored Ship approval without a rerun, run \
-                 `devflow ship --phase {phase}` instead of `resume`"
-            )
-        );
-        assert!(
-            resume_gate_lines(phase, Stage::Code, Some(gate.as_str()), &report, true)
-                .iter()
-                .all(|line| !line.contains("devflow ship")),
-            "control: only a Ship answer gets the Ship line"
         );
     }
 
@@ -5449,7 +5155,7 @@ mod tests {
     fn resume_says_nothing_of_a_claimed_pair_at_another_stage() {
         const NAME: &str =
             "pipeline_launch::tests::resume_says_nothing_of_a_claimed_pair_at_another_stage";
-        enter_agent_free_child!(NAME, "claude");
+        enter_agent_free_child!(NAME, "codex");
         let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
@@ -5459,7 +5165,7 @@ mod tests {
         seed_code_gate_with_pending_answer(root, phase, Mode::Supervise);
         let left_behind = plant_claimed_answer(root, phase, Stage::Plan);
 
-        let result = resume(root, phase, None, false);
+        let result = resume(root, phase, None);
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -5483,27 +5189,22 @@ mod tests {
     fn resume_reports_a_claimed_pair_whose_gate_file_is_gone() {
         const NAME: &str =
             "pipeline_launch::tests::resume_reports_a_claimed_pair_whose_gate_file_is_gone";
-        enter_agent_free_child!(NAME, "claude");
+        enter_agent_free_child!(NAME, "codex");
         let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
         let phase = PhaseId::new(96);
-        let mut state = State::new(
-            phase,
-            AgentKind::Claude,
-            Mode::Supervise,
-            root.to_path_buf(),
-        );
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
+        state.verification_baseline_captured = true;
         state.stage = Stage::Code;
         state.stopped = true;
-        state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
         let gate = plant_claimed_answer(root, phase, Stage::Code);
         std::fs::remove_file(Gates::gate_path(root, phase, Stage::Code)).unwrap();
 
-        let result = resume(root, phase, None, false);
+        let result = resume(root, phase, None);
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -5528,7 +5229,7 @@ mod tests {
     fn resume_quarantines_an_unused_gate_answer_and_opens_a_new_gate_id() {
         const NAME: &str = "pipeline_launch::tests::resume_quarantines_an_unused_gate_answer_and_opens_a_new_gate_id";
         if !devflow_core::test_support::in_child_test(NAME) {
-            let path_dir = agent_free_dir_with_agent_stub("claude");
+            let path_dir = agent_free_dir_with_agent_stub("codex");
             let output = crate::test_support::run_hermetic_test_in_child(
                 NAME,
                 path_dir.path(),
@@ -5545,7 +5246,7 @@ mod tests {
         let phase = PhaseId::new(92);
         let (old_gate, old_answer) = seed_code_gate_with_pending_answer(root, phase, Mode::Auto);
 
-        let result = resume(root, phase, None, false);
+        let result = resume(root, phase, None);
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -5607,16 +5308,14 @@ mod tests {
     /// `transition()`'s `stop_until == Some(from)` interception only sees
     /// what was actually written to disk.
     ///
-    /// **Premise moved off `STREAM_JSON_STAGES` membership deliberately
-    /// (34-06); do not "simplify" the opt-out away.** The subject is the
-    /// unfired `--until` cap's survival, not which launch path the relaunch
-    /// takes. Persisted rather than set locally, for the same reason as the
-    /// sibling test above: `resume()` reloads its own `State`.
+    /// The run's agent is Codex, a capture-shape agent, persisted because
+    /// `resume()` reloads its own `State`: the subject is not which launch path
+    /// the relaunch takes.
     #[test]
     fn resume_preserves_unfired_until_cap() {
         const NAME: &str = "pipeline_launch::tests::resume_preserves_unfired_until_cap";
         if !devflow_core::test_support::in_child_test(NAME) {
-            let path_dir = agent_free_dir_with_agent_stub("claude");
+            let path_dir = agent_free_dir_with_agent_stub("codex");
             let output =
                 crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
@@ -5630,29 +5329,21 @@ mod tests {
 
         let phase = PhaseId::new(67);
         // `Mode::Supervise` for the same 35.1-03 reason as
-        // `launch_stage_persists_the_supervisor_record_for_reload` above: the legacy
-        // opt-out set below is refused in `Mode::Auto` by
+        // `launch_stage_persists_the_supervisor_record_for_reload` above: a Codex
+        // Code stage is refused in `Mode::Auto` by
         // `preflight_unattended_launch_check`, and this test's subject — the
         // unfired `stop_until` cap surviving a resume — is mode-independent.
-        let mut state = State::new(
-            phase,
-            AgentKind::Claude,
-            Mode::Supervise,
-            root.to_path_buf(),
-        );
-        // Current stage is earlier than the cap (Define < Plan), and the
-        // phase was NOT stopped by the cap — this is the rate-limit/infra
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
+        // Current stage is the cap's own stage (Plan), which has not yet
+        // completed, and the phase was NOT stopped by the cap — this is the rate-limit/infra
         // recovery shape, not the "cap already fired" shape.
         state.stop_until = Some(Stage::Plan);
         state.verification_baseline_captured = true;
         state.stopped = false;
         state.stop_reason = None;
-        // Not because this test wants legacy behaviour, but because its
-        // subject is orthogonal to the launch path (34-06).
-        state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
 
-        let result = resume(root, phase, None, false);
+        let result = resume(root, phase, None);
 
         // Same reap-before-unwrap ordering as the sibling test above: read
         // the pid back from disk, since `resume()` loads its own `State`
@@ -5687,15 +5378,14 @@ mod tests {
     /// gating the clear on `state.stopped` — nothing to preserve, nothing to
     /// clear, and the relaunch must still happen.
     ///
-    /// **Premise moved off `STREAM_JSON_STAGES` membership deliberately
-    /// (34-06); do not "simplify" the opt-out away.** The subject is that the
-    /// no-cap resume path is undisturbed, not which launch path the relaunch
-    /// takes. Persisted rather than set locally, as in the two siblings above.
+    /// The run's agent is Codex, a capture-shape agent, persisted because
+    /// `resume()` reloads its own `State`: the subject is not which launch path
+    /// the relaunch takes.
     #[test]
     fn resume_without_a_cap_is_unchanged() {
         const NAME: &str = "pipeline_launch::tests::resume_without_a_cap_is_unchanged";
         if !devflow_core::test_support::in_child_test(NAME) {
-            let path_dir = agent_free_dir_with_agent_stub("claude");
+            let path_dir = agent_free_dir_with_agent_stub("codex");
             let output =
                 crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
@@ -5709,24 +5399,16 @@ mod tests {
 
         let phase = PhaseId::new(68);
         // `Mode::Supervise` for the same 35.1-03 reason as the two tests
-        // above — the legacy opt-out below is refused in `Mode::Auto`, and the
+        // above — a Codex Code stage is refused in `Mode::Auto`, and the
         // absence of a `stop_until` cap is mode-independent.
-        let mut state = State::new(
-            phase,
-            AgentKind::Claude,
-            Mode::Supervise,
-            root.to_path_buf(),
-        );
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
         state.stop_until = None;
         state.verification_baseline_captured = true;
         state.stopped = false;
         state.stop_reason = None;
-        // Not because this test wants legacy behaviour, but because its
-        // subject is orthogonal to the launch path (34-06).
-        state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
 
-        let result = resume(root, phase, None, false);
+        let result = resume(root, phase, None);
 
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
@@ -5769,16 +5451,11 @@ mod tests {
             Mode::Supervise,
             root.to_path_buf(),
         );
+        state.verification_baseline_captured = true;
         state.stage = Stage::Code;
         workflow::save_state(&state).unwrap();
-        let record = devflow_core::ship::build_single_agent_cron_instructions(
-            root,
-            phase,
-            "2026-06-18T15:45:30Z",
-        );
-        devflow_core::ship::write_cron_instructions(root, &record).unwrap();
 
-        let result = resume(root, phase, Some(AgentKind::Codex), false);
+        let result = resume(root, phase, Some(AgentKind::Codex));
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -5788,7 +5465,6 @@ mod tests {
         let reloaded = workflow::load_state(root, phase).unwrap();
         assert_eq!(reloaded.agent, AgentKind::Codex);
         assert!(reloaded.supervisor.is_some());
-        assert!(!devflow_core::ship::cron_instructions_path(root, phase).exists());
         let events = std::fs::read_to_string(devflow_core::events::events_path(root)).unwrap();
         let handoff = events
             .lines()
@@ -5806,7 +5482,7 @@ mod tests {
         const NAME: &str =
             "pipeline_launch::tests::resume_without_agent_leaves_the_saved_agent_untouched";
         if !devflow_core::test_support::in_child_test(NAME) {
-            let path_dir = agent_free_dir_with_agent_stub("claude");
+            let path_dir = agent_free_dir_with_agent_stub("codex");
             let output =
                 crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
@@ -5817,16 +5493,11 @@ mod tests {
         let root = dir.path();
         init_repo(root);
         let phase = PhaseId::new(75);
-        let mut state = State::new(
-            phase,
-            AgentKind::Claude,
-            Mode::Supervise,
-            root.to_path_buf(),
-        );
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
+        state.verification_baseline_captured = true;
         state.stage = Stage::Code;
-        state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
-        let result = resume(root, phase, None, false);
+        let result = resume(root, phase, None);
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -5834,7 +5505,7 @@ mod tests {
         result.unwrap();
         assert_eq!(
             workflow::load_state(root, phase).unwrap().agent,
-            AgentKind::Claude
+            AgentKind::Codex
         );
     }
 
@@ -5848,13 +5519,13 @@ mod tests {
         init_repo(root);
         let phase = PhaseId::new(76);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Define;
+        state.stage = Stage::Plan;
         state.verification_baseline_captured = true;
         workflow::save_state(&state).unwrap();
         let state_path = workflow::state_path(root, phase);
         let before = std::fs::read(&state_path).unwrap();
 
-        let err = resume(root, phase, Some(AgentKind::Codex), false).unwrap_err();
+        let err = resume(root, phase, Some(AgentKind::Codex)).unwrap_err();
 
         assert!(err.to_string().contains("refused"));
         assert_eq!(std::fs::read(&state_path).unwrap(), before);
@@ -5887,12 +5558,13 @@ mod tests {
         init_repo(root);
         let phase = PhaseId::new(81);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.verification_baseline_captured = true;
         state.stage = Stage::Code;
         workflow::save_state(&state).unwrap();
         let state_path = workflow::state_path(root, phase);
         let before = std::fs::read(&state_path).unwrap();
 
-        let err = resume(root, phase, Some(AgentKind::Codex), false).unwrap_err();
+        let err = resume(root, phase, Some(AgentKind::Codex)).unwrap_err();
 
         assert!(err.to_string().contains("refused"), "{err}");
         assert!(err.to_string().contains("codex"), "{err}");
@@ -5912,7 +5584,7 @@ mod tests {
         const NAME: &str =
             "pipeline_launch::tests::resume_with_same_agent_is_an_ordinary_idempotent_resume";
         if !devflow_core::test_support::in_child_test(NAME) {
-            let path_dir = agent_free_dir_with_agent_stub("claude");
+            let path_dir = agent_free_dir_with_agent_stub("codex");
             let output =
                 crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
@@ -5923,16 +5595,11 @@ mod tests {
         let root = dir.path();
         init_repo(root);
         let phase = PhaseId::new(77);
-        let mut state = State::new(
-            phase,
-            AgentKind::Claude,
-            Mode::Supervise,
-            root.to_path_buf(),
-        );
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
+        state.verification_baseline_captured = true;
         state.stage = Stage::Code;
-        state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
-        let result = resume(root, phase, Some(AgentKind::Claude), false);
+        let result = resume(root, phase, Some(AgentKind::Codex));
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -5948,7 +5615,9 @@ mod tests {
         );
     }
 
-    /// Pitfall 1: Plan is deliberately not gated by the Define-only artifact check.
+    /// A handoff at Plan is allowed in supervise mode: Plan is the first stage, and its
+    /// artifact and unattended checks apply in auto mode only. The auto-mode refusal at Plan
+    /// is `resume_with_agent_refuses_before_touching_state_when_target_cannot_run_the_stage`.
     #[test]
     fn resume_with_agent_allows_plan_stage() {
         const NAME: &str = "pipeline_launch::tests::resume_with_agent_allows_plan_stage";
@@ -5964,10 +5633,16 @@ mod tests {
         let root = dir.path();
         init_repo(root);
         let phase = PhaseId::new(78);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.verification_baseline_captured = true;
         state.stage = Stage::Plan;
         workflow::save_state(&state).unwrap();
-        let result = resume(root, phase, Some(AgentKind::Codex), false);
+        let result = resume(root, phase, Some(AgentKind::Codex));
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -6002,12 +5677,13 @@ mod tests {
             Mode::Supervise,
             root.to_path_buf(),
         );
+        state.verification_baseline_captured = true;
         state.stage = Stage::Code;
         state.consecutive_failures = 3;
         state.infra_failures = 2;
         workflow::save_state(&state).unwrap();
         let mut before = serde_json::to_value(&state).unwrap();
-        let result = resume(root, phase, Some(AgentKind::Codex), false);
+        let result = resume(root, phase, Some(AgentKind::Codex));
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -6090,17 +5766,12 @@ mod tests {
             Mode::Supervise,
             root.to_path_buf(),
         );
+        state.verification_baseline_captured = true;
         state.stage = Stage::Code;
         state.stopped = true;
         state.stop_reason = Some("rate limited".to_string());
         workflow::save_state(&state).unwrap();
-        let record = devflow_core::ship::build_single_agent_cron_instructions(
-            root,
-            phase,
-            "2026-06-18T15:45:30Z",
-        );
-        devflow_core::ship::write_cron_instructions(root, &record).unwrap();
-        let result = resume(root, phase, Some(AgentKind::Codex), false);
+        let result = resume(root, phase, Some(AgentKind::Codex));
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -6110,7 +5781,6 @@ mod tests {
         assert_eq!(reloaded.agent, AgentKind::Codex);
         assert!(!reloaded.stopped);
         assert!(reloaded.supervisor.is_some());
-        assert!(!devflow_core::ship::cron_instructions_path(root, phase).exists());
     }
 
     /// Run the test `name` in a hermetic child whose `PATH` holds `claude` and `codex`
@@ -6131,8 +5801,10 @@ mod tests {
         true
     }
 
-    /// A stopped Code-stage run of `phase` under Claude on the capture shape, in a fresh
-    /// repo at `root`, with `fallback` saved as its fallback and `consumed` as its spent mark.
+    /// A stopped Code-stage run of `phase` under Claude, in a fresh repo at `root`, with
+    /// `fallback` saved as its fallback and `consumed` as its spent mark. Its delivery
+    /// canary is recorded `Confirmed`, so a stub `claude` relaunches on the stream shape
+    /// without running one.
     fn save_stopped_code_run(
         root: &Path,
         phase: PhaseId,
@@ -6146,13 +5818,15 @@ mod tests {
             Mode::Supervise,
             root.to_path_buf(),
         );
+        state.verification_baseline_captured = true;
         state.stage = Stage::Code;
         state.stopped = true;
         state.stop_reason = Some("rate limited".to_string());
         state.fallback_agent = fallback;
         state.fallback_consumed = consumed;
-        // The capture shape: a stub `claude` cannot answer the stream launch's canary.
-        state.legacy_claude_launch = true;
+        // A stub `claude` cannot answer the stream launch's canary; a recorded outcome
+        // is reused, never re-run.
+        state.canary = Some(canary::CanaryOutcome::Confirmed);
         workflow::save_state(&state).unwrap();
         state
     }
@@ -6172,7 +5846,7 @@ mod tests {
         let phase = PhaseId::new(5144);
         save_stopped_code_run(root, phase, Some(AgentKind::Codex), true);
 
-        let result = resume_with_fallback(root, phase, None, false, Some(AgentKind::Codex));
+        let result = resume_with_fallback(root, phase, None, Some(AgentKind::Codex));
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -6186,12 +5860,13 @@ mod tests {
         assert!(reloaded.supervisor.is_some(), "the run relaunched");
     }
 
-    /// D-01 (re-arm, cron-paused): a run the cron arm paused is not stopped, and still
-    /// names the supervisor that exited. `resume --fallback-agent` re-arms it all the same.
+    /// D-01 (re-arm, supervisor gone): a run whose supervisor exited without
+    /// stopping it is not stopped, and still names that supervisor.
+    /// `resume --fallback-agent` re-arms it all the same.
     #[test]
-    fn resume_with_a_fallback_agent_rearms_a_consumed_fallback_on_a_cron_paused_run() {
+    fn resume_with_a_fallback_agent_rearms_a_consumed_fallback_on_a_run_whose_supervisor_exited() {
         const NAME: &str = "pipeline_launch::tests::\
-                            resume_with_a_fallback_agent_rearms_a_consumed_fallback_on_a_cron_paused_run";
+                            resume_with_a_fallback_agent_rearms_a_consumed_fallback_on_a_run_whose_supervisor_exited";
         if parent_of_a_claude_and_codex_child(NAME, &[]) {
             return;
         }
@@ -6206,13 +5881,15 @@ mod tests {
             Mode::Supervise,
             root.to_path_buf(),
         );
+        state.verification_baseline_captured = true;
         state.stage = Stage::Code;
         state.fallback_agent = Some(AgentKind::Codex);
         state.fallback_consumed = true;
-        // The capture shape: a stub `claude` cannot answer the stream launch's canary.
-        state.legacy_claude_launch = true;
-        // The record of the supervisor that exited on the rate limit: the cron arm
-        // leaves it behind, and its socket is gone.
+        // A stub `claude` cannot answer the stream launch's canary; a recorded outcome
+        // is reused, never re-run.
+        state.canary = Some(canary::CanaryOutcome::Confirmed);
+        // The record of a supervisor that exited without stopping the run: it is
+        // left behind, and its socket is gone.
         const EXITED_LAUNCH: &str = "exited-launch";
         state.supervisor = Some(SupervisorRecord::new(
             root.join("gone.sock"),
@@ -6222,31 +5899,16 @@ mod tests {
             "boot".to_string(),
         ));
         workflow::save_state(&state).unwrap();
-        crate::pipeline_outcomes::handle_rate_limited_outcome(
-            root,
-            &mut state,
-            phase,
-            Stage::Code,
-            Some("rate limited until 2026-06-18T15:45:30Z".into()),
-        )
-        .unwrap();
 
         let paused = workflow::load_state(root, phase).unwrap();
-        let cron = devflow_core::ship::load_cron_instructions(root, phase)
-            .expect("the cron arm wrote cron-instructions-5148.json");
-        assert!(
-            !cron.hermes_cron.schedule.is_empty(),
-            "the cron arm scheduled a resume"
-        );
-        assert!(!paused.stopped, "a cron-paused run is not stopped");
-        assert_eq!(paused.infra_failures, 1);
+        assert!(!paused.stopped, "the run is not stopped");
         assert_eq!(
             paused.supervisor.as_ref().map(|r| r.launch_id.as_str()),
             Some(EXITED_LAUNCH),
             "the exited supervisor's record is left behind"
         );
 
-        let result = resume_with_fallback(root, phase, None, false, Some(AgentKind::Codex));
+        let result = resume_with_fallback(root, phase, None, Some(AgentKind::Codex));
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -6280,7 +5942,7 @@ mod tests {
         let phase = PhaseId::new(5145);
         save_stopped_code_run(root, phase, Some(AgentKind::Codex), true);
 
-        let result = resume(root, phase, None, false);
+        let result = resume(root, phase, None);
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -6321,7 +5983,7 @@ mod tests {
         state.gate_notify_cmd = Some(SAVED_NOTIFY.to_string());
         workflow::save_state(&state).unwrap();
 
-        let result = resume_with_fallback(root, phase, Some(AgentKind::Codex), false, None);
+        let result = resume_with_fallback(root, phase, Some(AgentKind::Codex), None);
         let reloaded = workflow::load_state(root, phase).unwrap();
         let _reap_guard = ReapMonitorOnDrop::after_launch(&reloaded);
         let err = result
@@ -6372,7 +6034,7 @@ mod tests {
         state.gate_notify_cmd = Some(SAVED_NOTIFY.to_string());
         workflow::save_state(&state).unwrap();
 
-        let result = resume_with_fallback(root, phase, None, false, Some(AgentKind::Claude));
+        let result = resume_with_fallback(root, phase, None, Some(AgentKind::Claude));
         let reloaded = workflow::load_state(root, phase).unwrap();
         let _reap_guard = ReapMonitorOnDrop::after_launch(&reloaded);
         let err = result
@@ -6425,7 +6087,7 @@ mod tests {
             // is resolvable anywhere on it and `ensure_agent_binary` inside
             // `launch_stage` fails deterministically regardless of what is
             // installed on the host running this test.
-            let err = resume(&root, phase, None, false).unwrap_err();
+            let err = resume(&root, phase, None).unwrap_err();
             assert!(err.to_string().contains("not found"), "{err}");
             let reloaded = workflow::load_state(&root, phase).unwrap();
             assert!(
@@ -6448,6 +6110,7 @@ mod tests {
             Mode::Supervise,
             root.to_path_buf(),
         );
+        state.verification_baseline_captured = true;
         state.stage = Stage::Code;
         state.stopped = true;
         state.stop_reason = Some("rate limited".to_string());
@@ -6526,7 +6189,7 @@ mod tests {
                 phase,
                 Stage::Code,
                 &serde_json::from_str(
-                    r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                    r#"{"approved":false,"abort":true,"note":"abort: test cleanup","responded_by":"test"}"#,
                 )
                 .unwrap(),
             )
@@ -6583,72 +6246,6 @@ mod tests {
         );
     }
 
-    /// D-15 (44-02): a failed monitor relaunch must leave the phase cron
-    /// instructions available for a later retry. The invalid worktree is
-    /// deliberate: archive bookkeeping has no capture to process, while the
-    /// monitor's child spawn fails at its working-directory validation.
-    /// Consumption is after the successful spawn in `spawn_agent_and_record`,
-    /// so this test is the negative control for the successful resume tests.
-    #[test]
-    fn failed_relaunch_preserves_the_phase_cron_instructions_record() {
-        const NAME: &str =
-            "pipeline_launch::tests::failed_relaunch_preserves_the_phase_cron_instructions_record";
-        enter_agent_free_child!(NAME, "claude");
-        let _guard = env_lock();
-
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        init_repo(root);
-
-        let phase = PhaseId::new(144);
-        let missing_worktree = root.join("worktree-that-does-not-exist");
-        let mut state = State::new(
-            phase,
-            AgentKind::Claude,
-            Mode::Supervise,
-            root.to_path_buf(),
-        );
-        state.stage = Stage::Code;
-        state.worktree_path = Some(missing_worktree.clone());
-        workflow::save_state(&state).unwrap();
-
-        let record = devflow_core::ship::build_single_agent_cron_instructions(
-            root,
-            phase,
-            "2026-06-18T15:45:30Z",
-        );
-        devflow_core::ship::write_cron_instructions(root, &record).unwrap();
-        assert!(
-            devflow_core::ship::cron_instructions_path(root, phase).exists(),
-            "the fixture must contain a phase cron record before relaunch"
-        );
-        assert!(
-            !missing_worktree.exists(),
-            "the failure fixture must be absent"
-        );
-
-        let result = spawn_agent_and_record(
-            &mut state,
-            "claude",
-            &[],
-            &[],
-            None,
-            monitor::MonitorLaunch::Legacy,
-        );
-
-        assert!(
-            result.is_err(),
-            "monitor spawn must fail for an absent worktree"
-        );
-        assert!(
-            devflow_core::ship::cron_instructions_path(root, phase).exists(),
-            "a failed monitor relaunch must preserve the phase cron record"
-        );
-        assert!(
-            events_of_kind(root, "cron_instructions_consumed").is_empty(),
-            "a failed monitor relaunch must not emit cron_instructions_consumed"
-        );
-    }
     /// D-10: `advance_evaluated` emits `status` via `AgentStatus::as_wire_str()`
     /// (never the Debug-lowercase formatter that collapses `ResourceKilled`
     /// into `resourcekilled`) and carries the `decided_by_layer` evidence
@@ -6676,7 +6273,7 @@ mod tests {
             phase,
             Stage::Code,
             &serde_json::from_str(
-                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                r#"{"approved":false,"abort":true,"note":"abort: test cleanup","responded_by":"test"}"#,
             )
             .unwrap(),
         );
@@ -6724,14 +6321,14 @@ mod tests {
         let state_path = workflow::state_path(root, phase);
         let before = std::fs::read(&state_path).unwrap();
 
-        let err = advance_with(root, phase, Some(Stage::Define))
+        let err = advance_with(root, phase, Some(Stage::Plan))
             .expect_err("advance must reject a stage that has moved on");
         assert!(err.to_string().contains("stage mismatch"));
         assert_eq!(std::fs::read(&state_path).unwrap(), before);
         let failed = events_of_kind(root, "advance_failed");
         assert_eq!(failed.len(), 1, "one durable refusal event: {failed:?}");
         assert_eq!(failed[0]["reason"], "stage mismatch");
-        assert_eq!(failed[0]["expected"], "define");
+        assert_eq!(failed[0]["expected"], "plan");
         assert_eq!(failed[0]["actual"], "code");
     }
 
@@ -6920,119 +6517,6 @@ mod tests {
         assert_eq!(reloaded.checkpoint_resumes, 0);
     }
 
-    /// 35.2 P-02: the nonce stamp and baseline re-observation are co-located
-    /// and gated on Validate. Both arms must disagree — a stamp on every
-    /// stage re-widens the window at the Code stage.
-    #[test]
-    fn launch_stage_inner_stamps_the_validate_dispatch_nonce_with_its_baseline() {
-        let _guard = env_lock();
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(92);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        let worktree = root.join(format!(".worktrees/phase-{phase}"));
-        std::fs::create_dir_all(&worktree).unwrap();
-        state.worktree_path = Some(worktree.clone());
-
-        // Write an artifact under the evidence root.
-        let phase_dir = worktree
-            .join(".planning/phases")
-            .join(format!("{padded}-stamp", padded = phase.padded()));
-        std::fs::create_dir_all(&phase_dir).unwrap();
-        std::fs::write(
-            phase_dir.join(format!("{padded}-VERIFICATION.md", padded = phase.padded())),
-            "verdict: pass\n",
-        )
-        .unwrap();
-
-        let fingerprint_before =
-            devflow_core::agent_result::phase_verification_fingerprint(&worktree, phase);
-
-        // Validate stage: nonce advances, fingerprint refreshed.
-        state.stage = Stage::Validate;
-        stamp_validate_dispatch_window(&mut state);
-        assert_eq!(state.verification_run_nonce, Some(1));
-        assert_eq!(
-            state.last_verification_fingerprint, fingerprint_before,
-            "fingerprint must match the on-disk artifact after stamp"
-        );
-        assert!(state.verification_baseline_captured);
-
-        // Non-Validate stage: nothing changes.
-        let nonce_after_validate = state.verification_run_nonce;
-        let fp_after_validate = state.last_verification_fingerprint;
-        state.stage = Stage::Code;
-        stamp_validate_dispatch_window(&mut state);
-        assert_eq!(
-            state.verification_run_nonce, nonce_after_validate,
-            "nonce must not change on non-Validate stages"
-        );
-        assert_eq!(
-            state.last_verification_fingerprint, fp_after_validate,
-            "fingerprint must not change on non-Validate stages"
-        );
-    }
-
-    /// A Validate launch's dispatch stamp reaches disk with its first commit, and only
-    /// its fields do: a revoke another writer made since the caller loaded is kept.
-    #[test]
-    fn a_validate_launch_commits_its_dispatch_stamp() {
-        const NAME: &str = "pipeline_launch::tests::a_validate_launch_commits_its_dispatch_stamp";
-        enter_agent_free_child!(NAME, "claude");
-        let _guard = env_lock();
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        init_repo(root);
-        let phase = PhaseId::new(93);
-        let worktree = root.join(format!(".worktrees/phase-{phase}"));
-        let phase_dir = worktree
-            .join(".planning/phases")
-            .join(format!("{padded}-stamp", padded = phase.padded()));
-        std::fs::create_dir_all(&phase_dir).unwrap();
-        std::fs::write(
-            phase_dir.join(format!("{padded}-VERIFICATION.md", padded = phase.padded())),
-            "verdict: pass\n",
-        )
-        .unwrap();
-        let observed = (
-            devflow_core::agent_result::phase_verification_fingerprint(&worktree, phase),
-            devflow_core::agent_result::phase_verification_mtime_nanos(&worktree, phase),
-        );
-        assert!(
-            observed.0.is_some(),
-            "premise: the artifact has a fingerprint"
-        );
-
-        let mut state = State::new(
-            phase,
-            AgentKind::Claude,
-            Mode::Supervise,
-            root.to_path_buf(),
-        );
-        state.stage = Stage::Validate;
-        state.worktree_path = Some(worktree);
-        // The capture shape: no delivery canary.
-        state.legacy_claude_launch = true;
-        state.yes_ship = true;
-        workflow::save_state(&state).unwrap();
-        workflow::update_state(root, phase, |on_disk| {
-            on_disk.yes_ship = false;
-            Ok::<(), workflow::WorkflowError>(())
-        })
-        .unwrap();
-
-        let result = launch_stage_inner(&mut state, None, None);
-        let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
-        result.unwrap();
-
-        let after = workflow::load_state(root, phase).unwrap();
-        assert_eq!(after.verification_run_nonce, Some(1));
-        assert_eq!(after.last_verification_fingerprint, observed.0);
-        assert_eq!(after.last_verification_mtime_nanos, observed.1);
-        assert!(after.verification_baseline_captured);
-        assert!(!after.yes_ship, "the concurrent revoke is kept");
-    }
-
     // ---- D-15 delivery-canary gate (31-03) ------------------------------
     //
     // Every case below except the last drives the gate with an INJECTED
@@ -7125,20 +6609,11 @@ mod tests {
     /// woken back up when a background task finishes. A launch that resolved to
     /// the legacy single-document path does not rely on that premise.
     ///
-    /// **The false-branch discriminator is D-11's legacy opt-out, deliberately —
-    /// NOT stage membership** (ROADMAP criterion 7). This test previously took
-    /// `Stage::Plan`'s absence from [`STREAM_JSON_STAGES`] as its premise. That
-    /// premise is destroyed by the very rollout the constant exists to
-    /// sequence: once all five stages are widened, no Claude stage yields
-    /// `false` and the test becomes unconstructible as written — it would have
-    /// had to be deleted or rewritten under the time pressure of the widening
-    /// commit. `legacy_opt_out` is a separate `&&` term that
-    /// `stream_launch_enabled` respects regardless of the constant's
-    /// contents, so a premise built on it survives full widening.
-    ///
-    /// Verified, not assumed: this pair was run against a temporarily
-    /// fully-widened `STREAM_JSON_STAGES` and stayed green, while the
-    /// pre-rebuild version failed on its `Stage::Plan` premise.
+    /// **The false-branch discriminator is the agent, NOT stage membership**
+    /// (ROADMAP criterion 7): a capture-shape agent (Codex) at a stage that is on
+    /// the stream path for Claude. A stage-membership premise would be destroyed by
+    /// the rollout [`STREAM_JSON_STAGES`] sequences; the agent term survives full
+    /// widening. Phase 52 removed the Claude legacy opt-out this test used before.
     #[test]
     fn canary_gate_only_applies_to_the_stream_launch_path() {
         let _guard = env_lock();
@@ -7150,26 +6625,24 @@ mod tests {
         let phase = PhaseId::new(121);
         let mut state = canary_state(root, phase);
         // `Stage::Code` is on the stream path today and stays on it. The
-        // variable under test is the opt-out, not the stage.
+        // variable under test is the agent, not the stage.
         state.stage = Stage::Code;
-        state.legacy_claude_launch = true;
+        state.agent = AgentKind::Codex;
 
         // Driven by the REAL predicate rather than a hardcoded `false`, so this
         // test tracks the rollout instead of a copy of it.
-        let stream_launch =
-            stream_launch_enabled(state.agent, state.stage, state.legacy_claude_launch);
+        let stream_launch = stream_launch_enabled(state.agent, state.stage);
         assert!(
             !stream_launch,
-            "the legacy opt-out must force this launch off the stream path for this test \
-             to mean anything"
+            "a capture-shape agent must be off the stream path for this test to mean anything"
         );
-        // Negative control: the SAME agent and the SAME stage, with only the
-        // opt-out cleared, DOES fire. Without this, the reading above would be
-        // a constant rather than a discrimination — and unlike a stage-
-        // membership control, this one cannot be invalidated by widening.
+        // Negative control: the SAME stage under Claude DOES fire. Without this,
+        // the reading above would be a constant rather than a discrimination — and
+        // unlike a stage-membership control, this one cannot be invalidated by
+        // widening.
         assert!(
-            stream_launch_enabled(AgentKind::Claude, state.stage, false),
-            "clearing the opt-out must flip the predicate back to true, or the check above \
+            stream_launch_enabled(AgentKind::Claude, state.stage),
+            "the same stage under Claude must be on the stream path, or the check above \
              is vacuous"
         );
 
@@ -7186,7 +6659,7 @@ mod tests {
         assert_eq!(
             calls.get(),
             0,
-            "a legacy launch must not spend an agent invocation on a premise it never relies on"
+            "a capture launch must not spend an agent invocation on a premise it never relies on"
         );
         assert_eq!(
             state.canary, None,
@@ -7194,11 +6667,11 @@ mod tests {
         );
     }
 
-    /// The other direction of the pair above: with the opt-out cleared, the
-    /// same fixture DOES run the guard and DOES record its outcome.
+    /// The other direction of the pair above: under Claude, the same fixture
+    /// DOES run the guard and DOES record its outcome.
     ///
     /// The refusal half alone cannot distinguish "the gate correctly skipped a
-    /// legacy launch" from "the gate is wired to nothing". This is the case
+    /// capture launch" from "the gate is wired to nothing". This is the case
     /// that must produce the opposite result, at the level of the gate's own
     /// effects rather than the predicate's return value.
     ///
@@ -7217,13 +6690,11 @@ mod tests {
         let phase = PhaseId::new(123);
         let mut state = canary_state(root, phase);
         state.stage = Stage::Code;
-        state.legacy_claude_launch = false;
 
-        let stream_launch =
-            stream_launch_enabled(state.agent, state.stage, state.legacy_claude_launch);
+        let stream_launch = stream_launch_enabled(state.agent, state.stage);
         assert!(
             stream_launch,
-            "without the opt-out this stage must be on the stream path, or this test is \
+            "under Claude this stage must be on the stream path, or this test is \
              asserting the sibling test's case a second time"
         );
 
@@ -7352,8 +6823,8 @@ mod tests {
     /// `recorded_canary_refusal` re-reads `canary_gate`'s decision without running a
     /// canary, so the two must agree on every recorded outcome: it is `Some` exactly when
     /// `canary_gate`, given the stream predicate `launch_stage_inner` computes for the
-    /// same state, refuses. Enumerates every agent, stage, legacy opt-out and recorded
-    /// outcome. With nothing recorded `canary_gate` runs a fresh canary, so the copy
+    /// same state, refuses. Enumerates every agent, stage and recorded outcome.
+    /// With nothing recorded `canary_gate` runs a fresh canary, so the copy
     /// reports no recorded refusal; that case is asserted on its own. Control: the
     /// enumeration contains both an admitted and a refused launch, so agreement is not
     /// "both always say the same thing".
@@ -7372,13 +6843,7 @@ mod tests {
             AgentKind::Pi,
             AgentKind::Antigravity,
         ];
-        let stages = [
-            Stage::Define,
-            Stage::Plan,
-            Stage::Code,
-            Stage::Validate,
-            Stage::Ship,
-        ];
+        let stages = [Stage::Plan, Stage::Code, Stage::Validate];
         let outcomes = [
             canary::CanaryOutcome::Confirmed,
             canary::CanaryOutcome::Absent,
@@ -7387,34 +6852,31 @@ mod tests {
         let (mut admitted, mut refused) = (0usize, 0usize);
         for agent in agents {
             for stage in stages {
-                for legacy in [false, true] {
-                    let mut state = base.clone();
-                    state.agent = agent;
-                    state.stage = stage;
-                    state.legacy_claude_launch = legacy;
-                    state.canary = None;
+                let mut state = base.clone();
+                state.agent = agent;
+                state.stage = stage;
+                state.canary = None;
+                assert_eq!(
+                    recorded_canary_refusal(&state),
+                    None,
+                    "nothing recorded: {agent} {stage}"
+                );
+                for outcome in &outcomes {
+                    state.canary = Some(outcome.clone());
+                    let stream = stream_launch_enabled(agent, stage);
+                    let gate_refuses = canary_gate(&mut state.clone(), stream, || {
+                        unreachable!("a recorded outcome is never re-run")
+                    })
+                    .is_err();
                     assert_eq!(
-                        recorded_canary_refusal(&state),
-                        None,
-                        "nothing recorded: {agent} {stage} legacy={legacy}"
+                        recorded_canary_refusal(&state).is_some(),
+                        gate_refuses,
+                        "{agent} {stage} {outcome:?}"
                     );
-                    for outcome in &outcomes {
-                        state.canary = Some(outcome.clone());
-                        let stream = stream_launch_enabled(agent, stage, legacy);
-                        let gate_refuses = canary_gate(&mut state.clone(), stream, || {
-                            unreachable!("a recorded outcome is never re-run")
-                        })
-                        .is_err();
-                        assert_eq!(
-                            recorded_canary_refusal(&state).is_some(),
-                            gate_refuses,
-                            "{agent} {stage} legacy={legacy} {outcome:?}"
-                        );
-                        if gate_refuses {
-                            refused += 1;
-                        } else {
-                            admitted += 1;
-                        }
+                    if gate_refuses {
+                        refused += 1;
+                    } else {
+                        admitted += 1;
                     }
                 }
             }
@@ -7691,7 +7153,7 @@ mod tests {
             phase,
             stage,
             &serde_json::from_str(
-                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                r#"{"approved":false,"abort":true,"note":"abort: test cleanup","responded_by":"test"}"#,
             )
             .unwrap(),
         );
@@ -7949,6 +7411,7 @@ mod tests {
         write_confirmed_checkpoint_capture(root, phase);
 
         let mut state = State::new(phase, AgentKind::Claude, mode, root.to_path_buf());
+        state.verification_baseline_captured = true;
         state.stage = Stage::Code;
         // A session id AND an unexhausted ceiling, so every one of these
         // tests lands in the `(Some(session_id), true)` arm where the
@@ -8011,28 +7474,35 @@ mod tests {
     fn gate_response(approved: bool, note: Option<&str>) -> devflow_core::gates::GateResponse {
         devflow_core::gates::GateResponse {
             approved,
+            abort: false,
             note: note.map(str::to_string),
             responded_by: Some("test".to_string()),
         }
     }
 
+    /// An abort answer, the shape `devflow gate abort` writes.
+    fn abort_response(note: &str) -> devflow_core::gates::GateResponse {
+        devflow_core::gates::GateResponse {
+            abort: true,
+            ..gate_response(false, Some(note))
+        }
+    }
+
     /// Pre-answer the next gate at `stage` so its wait returns immediately.
     ///
-    /// `GateAction::from_response` maps these three shapes: approved ->
-    /// `Advance`; not approved with a note containing "abort" -> `Abort`;
-    /// anything else not approved -> `LoopBack`.
+    /// `GateAction::from_response` maps the three shapes by their fields:
+    /// `abort` -> `Abort`; approved -> `Advance`; anything else -> `LoopBack`.
     fn preanswer_gate_response(
         root: &Path,
         phase: PhaseId,
         stage: Stage,
-        approved: bool,
-        note: Option<&str>,
+        response: &devflow_core::gates::GateResponse,
     ) {
         assert!(
             std::env::var_os(devflow_core::test_support::CHILD_TEST_ENV).is_some(),
             "preanswer_gate_response must run inside a child test with an agent-free PATH (999.80)"
         );
-        preanswer_gate(root, phase, stage, &gate_response(approved, note));
+        preanswer_gate(root, phase, stage, response);
     }
 
     /// Answer the gate that opens next at `stage`, as a human would once they see
@@ -8095,7 +7565,7 @@ mod tests {
         );
         let root = root.as_path();
 
-        preanswer_gate_response(root, phase, Stage::Code, true, None);
+        preanswer_gate_response(root, phase, Stage::Code, &gate_response(true, None));
 
         let first = advance_for_stage(root, Some(phase), Some(Stage::Code));
         let reloaded_first = workflow::load_state(root, phase).ok();
@@ -8196,7 +7666,7 @@ mod tests {
         );
         let root = root.as_path();
         let expected_approval = recorded_from_body(phase, &rescan_plan_body_rewritten());
-        preanswer_gate_response(root, phase, Stage::Code, true, None);
+        preanswer_gate_response(root, phase, Stage::Code, &gate_response(true, None));
 
         let writer_root = root.to_path_buf();
         let writer = std::thread::spawn(move || {
@@ -8213,12 +7683,7 @@ mod tests {
                 );
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
-            answer_the_next_open_gate(
-                &writer_root,
-                phase,
-                Stage::Code,
-                &gate_response(false, Some("abort")),
-            );
+            answer_the_next_open_gate(&writer_root, phase, Stage::Code, &abort_response("abort"));
         });
 
         let result = advance_for_stage(root, Some(phase), Some(Stage::Code));
@@ -8238,181 +7703,22 @@ mod tests {
         assert_eq!(code_gates, 2, "re-scan plus human-decision gates must fire");
     }
 
-    /// An Auto-mode rejection cannot reuse the ordinary failure loop-back: the
-    /// next unattended Code preflight correctly refuses the still-unapproved
-    /// human-only checkpoint. Park the phase in Supervise before cleaning the
-    /// response. The bounded writer feeds an abort only if the pre-fix third
-    /// gate appears; its marker and the exact one-gate assertion below make
-    /// both directions observable rather than treating a short run as proof.
+    /// T-48-15-03, D-39 (52-29): rejecting the supervise re-scan gate is
+    /// refused before its claim. The gate reopens never-silently, still
+    /// labelled `checkpoint_declaration`, naming approve and abort and still
+    /// showing the objected-to plan file; `checkpoint_approval` is
+    /// byte-identical; no Code launch and no follow-on stage-failure gate. A
+    /// bounded writer aborts the reopened gate.
     #[test]
-    fn auto_rescan_rejection_parks_for_supervised_repair() {
+    fn rejecting_the_rescan_gate_is_refused_and_widens_nothing() {
         const NAME: &str =
-            "pipeline_launch::tests::auto_rescan_rejection_parks_for_supervised_repair";
-        const ROOT_ENV: &str = "DEVFLOW_PIPELINE_LAUNCH_AUTO_RESCAN_REJECT_ROOT";
-        let phase = PhaseId::new(113);
-
-        if !devflow_core::test_support::in_child_test(NAME) {
-            let dir = tempfile::tempdir().unwrap();
-            let root = dir.path();
-            build_rescan_fixture(
-                root,
-                phase,
-                &rescan_plan_body_rewritten(),
-                recorded_from_body(phase, &rescan_plan_body()),
-                Mode::Auto,
-            );
-            let path_dir = agent_free_dir_with_agent_stub("claude");
-            let output = crate::test_support::run_hermetic_test_in_child(
-                NAME,
-                path_dir.path(),
-                &[(ROOT_ENV, root.as_os_str())],
-            );
-            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
-            return;
-        }
-
-        let root = PathBuf::from(
-            std::env::var_os(ROOT_ENV)
-                .expect("child test must receive its parent-built fixture root"),
-        );
-        let root = root.as_path();
-        let before = workflow::load_state(root, phase)
-            .unwrap()
-            .checkpoint_approval;
-        preanswer_gate_response(
-            root,
-            phase,
-            Stage::Code,
-            false,
-            Some("the rewritten task needs supervised repair"),
-        );
-
-        let writer_root = root.to_path_buf();
-        let third_gate_response_written =
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let writer_third_gate_response_written =
-            std::sync::Arc::clone(&third_gate_response_written);
-        let writer = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            loop {
-                // Check the response before the state. The park saves
-                // `stopped` before it removes the response, so a response the
-                // park removed is always seen with `stopped` set. Reading the
-                // state first let a whole park land between the two reads.
-                // The pre-answer is read before the answer files because the
-                // gate publishes the answer before it removes the pre-answer.
-                let response_gone = !Gates::preanswer_path(&writer_root, phase, Stage::Code)
-                    .exists()
-                    && gate_answer_files(&writer_root, phase, Stage::Code).is_empty();
-                let state = workflow::load_state(&writer_root, phase);
-                if state.as_ref().is_ok_and(|state| state.stopped) {
-                    return;
-                }
-                if response_gone
-                    && answer_open_gate(
-                        &writer_root,
-                        phase,
-                        Stage::Code,
-                        &gate_response(false, Some("abort")),
-                    )
-                    .is_ok()
-                {
-                    writer_third_gate_response_written
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                    return;
-                }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "the re-scan response was not consumed"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-        });
-
-        advance_for_stage(root, Some(phase), Some(Stage::Code)).unwrap();
-        writer.join().expect("third-gate negative-control writer");
-
-        let after = workflow::load_state(root, phase)
-            .expect("Auto rejection must park the phase instead of aborting it");
-        assert_eq!(after.mode, Mode::Supervise);
-        assert!(after.stopped, "the automatic run must be parked");
-        assert!(
-            after
-                .stop_reason
-                .as_deref()
-                .is_some_and(|reason| reason.contains("switched to Supervise")),
-            "the parked reason must explain why Auto did not retry: {:?}",
-            after.stop_reason
-        );
-        assert_eq!(
-            after.checkpoint_approval, before,
-            "a rejection must not bless the changed declaration"
-        );
-        let parked_code_gates = events_of_kind(root, "gate_fired")
-            .into_iter()
-            .filter(|event| event["stage"] == "code")
-            .count();
-        assert_eq!(
-            parked_code_gates, 1,
-            "only the re-scan gate may fire before supervised resume; a second gate is the \
-             pre-fix unattended loopback, not a successful park"
-        );
-        assert!(
-            !third_gate_response_written.load(std::sync::atomic::Ordering::SeqCst),
-            "the negative-control writer must stay inert unless the old third gate appears"
-        );
-        assert!(
-            events_of_kind(root, "checkpoint_auto_decided").is_empty(),
-            "a rejection must never relaunch Claude's checkpoint decision"
-        );
-        assert_eq!(events_of_kind(root, "checkpoint_repair_parked").len(), 1);
-        assert!(
-            !Gates::gate_path(root, phase, Stage::Code).exists()
-                && gate_answer_files(root, phase, Stage::Code).is_empty()
-                && gate_claim_files(root, phase, Stage::Code).is_empty(),
-            "parking must leave no stale gate protocol files"
-        );
-
-        resume(root, phase, None, false)
-            .expect("the parked phase must resume through the supervised path");
-        let resumed = workflow::load_state(root, phase)
-            .expect("Supervise resume must leave a live state for its monitor");
-        let _reap_guard = ReapMonitorOnDrop::after_launch(&resumed);
-        assert_eq!(resumed.mode, Mode::Supervise);
-        assert_eq!(
-            resumed.checkpoint_approval, before,
-            "a supervised repair launch must not reinterpret the rejected declaration as approved"
-        );
-        assert!(
-            !resumed.stopped,
-            "resume clears the park only after launching the supervised continuation"
-        );
-        assert!(
-            events_of_kind(root, "stage_launched")
-                .iter()
-                .any(|event| event["stage"] == "code"),
-            "resume must actually launch the parked Code stage"
-        );
-    }
-
-    /// D-07 (V-22) and 48-15 Task 1 / T-48-15-03. A non-abort rejection must record
-    /// NOTHING: widening the approved set on a rejection is the repudiation path. It
-    /// also no longer answers the stage-failure gate that follows. That gate asks a
-    /// different question ("stage failed: retry, loop to Code, or abort?") where any
-    /// non-abort answer relaunches the stage, so it opens with its own id and waits;
-    /// its short timeout is what ends this test. The plan file the operator objected
-    /// to has to appear in what that gate shows them.
-    #[test]
-    fn rejecting_the_rescan_gate_leaves_the_follow_on_gate_waiting_for_its_own_answer() {
-        const NAME: &str = "pipeline_launch::tests::rejecting_the_rescan_gate_leaves_the_follow_on_gate_waiting_for_its_own_answer";
+            "pipeline_launch::tests::rejecting_the_rescan_gate_is_refused_and_widens_nothing";
         const ROOT_ENV: &str = "DEVFLOW_PIPELINE_LAUNCH_RESCAN_REJECT_ROOT";
         let phase = PhaseId::new(102);
 
         if !devflow_core::test_support::in_child_test(NAME) {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path();
-            // Supervise: D-07's route. Auto parks for repair instead
-            // (`park_auto_rescan_repair`), with no follow-on gate.
             build_rescan_fixture(
                 root,
                 phase,
@@ -8426,7 +7732,7 @@ mod tests {
                 path_dir.path(),
                 &[
                     (ROOT_ENV, root.as_os_str()),
-                    ("DEVFLOW_GATE_TIMEOUT_SECS", std::ffi::OsStr::new("1")),
+                    ("DEVFLOW_GATE_TIMEOUT_SECS", std::ffi::OsStr::new("20")),
                 ],
             );
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
@@ -8438,102 +7744,267 @@ mod tests {
                 .expect("child test must receive its parent-built fixture root"),
         );
         let root = root.as_path();
+        let before = serde_json::to_string(
+            &workflow::load_state(root, phase)
+                .unwrap()
+                .checkpoint_approval,
+        )
+        .unwrap();
 
-        let before = workflow::load_state(root, phase)
-            .unwrap()
-            .checkpoint_approval;
+        let writer_root = root.to_path_buf();
+        let writer = std::thread::spawn(move || {
+            let gate_path = Gates::gate_path(&writer_root, phase, Stage::Code);
+            let mut seen: Vec<(serde_json::Value, State)> = Vec::new();
+            for answer in [
+                gate_response(false, Some("the rewritten task needs review first")),
+                devflow_core::gates::GateResponse {
+                    approved: false,
+                    abort: true,
+                    note: Some("test cleanup".into()),
+                    responded_by: Some("test".into()),
+                },
+            ] {
+                let started = std::time::Instant::now();
+                let gate = loop {
+                    let gate = std::fs::read_to_string(&gate_path)
+                        .ok()
+                        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+                    if let Some(gate) = gate
+                        && seen
+                            .last()
+                            .is_none_or(|(last, _)| last["gate_id"] != gate["gate_id"])
+                    {
+                        break gate;
+                    }
+                    assert!(
+                        started.elapsed() < Duration::from_secs(30),
+                        "gate {} did not open",
+                        seen.len() + 1
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                };
+                let at_gate = workflow::load_state(&writer_root, phase).unwrap();
+                answer_open_gate(&writer_root, phase, Stage::Code, &answer).unwrap();
+                seen.push((gate, at_gate));
+            }
+            seen
+        });
+        let result = advance_for_stage(root, Some(phase), Some(Stage::Code));
+        let gates = writer.join().expect("the bounded writer");
+        assert!(
+            result.is_ok(),
+            "the abort of the reopened gate ends the run: {result:?}"
+        );
 
-        // Not approved, and the note deliberately does NOT say "abort":
-        // `GateAction::from_response` maps that to LoopBack, the "I will fix the plan"
-        // answer.
-        preanswer_gate_response(
-            root,
+        // GATE-04: the live re-scan writer leads with the routers' sentence.
+        let sentence = crate::pipeline_outcomes::way_on_sentence(
+            GateKind::CheckpointDeclaration,
             phase,
             Stage::Code,
-            false,
-            Some("the rewritten task needs review first"),
+            None,
         );
-
-        let result = advance_for_stage(root, Some(phase), Some(Stage::Code));
-        let reloaded = workflow::load_state(root, phase).ok();
-        let _reap_guard = reloaded.as_ref().map(ReapMonitorOnDrop::after_launch);
-
-        // One answer decided one gate.
-        let resolved = events_of_kind(root, "gate_resolved");
-        assert_eq!(
-            resolved.len(),
-            1,
-            "the rejection decides the re-scan gate and nothing else: {resolved:?}"
-        );
-        assert_eq!(resolved[0]["action"], "loop_back");
-        let err = result.expect_err("the follow-on gate has no answer, so its wait times out");
+        let first = gates[0].0["context"].as_str().unwrap_or_default();
         assert!(
-            err.to_string().contains("timed out awaiting a response"),
-            "{err}"
+            first.starts_with(&sentence),
+            "the re-scan gate leads with its way on: {first}"
         );
-        assert_eq!(events_of_kind(root, "gate_timeout").len(), 1);
-
-        // The follow-on gate is its own gate, waiting.
-        let follow_on = live_gate_id(root, phase, Stage::Code);
-        assert_ne!(
-            resolved[0]["gate_id"],
-            follow_on.as_str(),
-            "the follow-on gate opens with its own id"
-        );
+        let refused = events_of_kind(root, "gate_answer_refused");
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(refused[0]["gate_kind"], "checkpoint_declaration");
+        assert_eq!(refused[0]["answer"], "reject");
+        let (reopened, at_reopened) = &gates[1];
         assert_eq!(
-            Gates::read_answer(root, phase, Stage::Code, &follow_on),
-            devflow_core::gates::AnswerRead::None,
-            "no answer is bound to the follow-on gate"
+            reopened["gate_kind"], "checkpoint_declaration",
+            "{reopened}"
+        );
+        let context = reopened["context"].as_str().unwrap_or_default();
+        assert!(
+            context.starts_with("[never-silent]")
+                && context.contains("devflow gate approve")
+                && context.contains("devflow gate abort"),
+            "the reopened gate names approve and abort: {context}"
+        );
+        let plan_file = rescan_plan_file_name(phase);
+        assert!(
+            context.contains(&plan_file),
+            "the reopened gate still shows `{plan_file}`: {context}"
+        );
+        assert!(at_reopened.gate_pending, "gate_pending stays set");
+        assert_eq!(
+            serde_json::to_string(&at_reopened.checkpoint_approval).unwrap(),
+            before,
+            "a refused reject leaves the approved set exactly as it was"
+        );
+        let first_id = GateId::parse(gates[0].0["gate_id"].as_str().unwrap()).unwrap();
+        assert!(
+            !Gates::claim_path(root, phase, Stage::Code, &first_id).exists(),
+            "the refused reject was never claimed"
         );
         assert_eq!(
             stage_launched_count(root, phase),
             0,
             "nothing relaunches on the plan the operator just rejected"
         );
-
-        let after = workflow::load_state(root, phase)
-            .unwrap()
-            .checkpoint_approval;
         assert_eq!(
-            after, before,
-            "a rejection must leave the approved set exactly as it was"
+            events_of_kind(root, "gate_fired").len(),
+            2,
+            "the re-scan gate and its reopening, no follow-on stage-failure gate"
         );
         assert!(
             events_of_kind(root, "checkpoint_auto_decided").is_empty(),
             "a rejection must never reach the relaunch path"
         );
-
-        // A rejection must REACH the existing non-auto-decide dispatch, not stop at the
-        // re-scan gate. `handle_stage_failure` is the only thing that emits a
-        // `[never-silent]` context, and the augmented reason it renders must name the
-        // plan file the human objected to: that gate is where they will actually read
-        // it.
-        //
-        // Asserting on the never-silent context specifically, NOT merely on "some gate
-        // mentions the plan file": the re-scan gate's own context already names it, so
-        // the weaker assertion would measure nothing.
-        let plan_file = rescan_plan_file_name(phase);
-        let gate_contexts: Vec<String> = events_of_kind(root, "gate_fired")
-            .iter()
-            .filter_map(|event| event["context"].as_str().map(str::to_string))
-            .collect();
-        assert!(
-            gate_contexts.iter().any(|context| {
-                context.contains("[never-silent]")
-                    && context.contains("could not auto-resolve")
-                    && context.contains(&plan_file)
-            }),
-            "the follow-on gate must name `{plan_file}` in an augmented \
-             unresolved-checkpoint reason; contexts were {gate_contexts:?}"
-        );
-        assert_eq!(
-            gate_contexts.len(),
-            2,
-            "the re-scan gate and the follow-on gate: {gate_contexts:?}"
-        );
     }
 
-    /// 48-15 Task 1: an abort note must terminate through the SAME
+    /// Run `handler` on another thread until it opens `stage`'s gate, read the
+    /// gate file's `gate_kind`, answer the gate with an abort and wait for
+    /// `handler`.
+    fn gate_kind_at_gate(
+        root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        handler: impl FnOnce() + Send,
+    ) -> serde_json::Value {
+        const GATE_OPENS_WITHIN: Duration = Duration::from_secs(30);
+        let gate_path = Gates::gate_path(root, phase, stage);
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(handler);
+            let started = std::time::Instant::now();
+            while !gate_path.exists() {
+                assert!(
+                    !waiter.is_finished(),
+                    "the handler returned without opening the {stage} gate"
+                );
+                assert!(
+                    started.elapsed() < GATE_OPENS_WITHIN,
+                    "the {stage} gate did not open within {GATE_OPENS_WITHIN:?}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let gate: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&gate_path).unwrap()).unwrap();
+            answer_open_gate(root, phase, stage, &abort_response("test cleanup")).unwrap();
+            waiter.join().unwrap();
+            gate
+        })
+    }
+
+    /// D-39: no gate is kindless. A stage failure at Plan and at Code and an
+    /// infra failure each record `stage_failure`, a failed preflight check
+    /// `preflight`, and an unapproved human-only checkpoint declaration at Code
+    /// `checkpoint_declaration`. Control in the same test: a stage-failure gate at
+    /// Validate and a Validate disagreement gate both have stage Validate and
+    /// record different kinds.
+    #[test]
+    fn each_status_less_gate_records_its_kind() {
+        const NAME: &str = "pipeline_launch::tests::each_status_less_gate_records_its_kind";
+        const ROOT_ENV: &str = "DEVFLOW_PIPELINE_LAUNCH_STATUS_LESS_KINDS_ROOT";
+        let rescan_phase = PhaseId::new(5260);
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let dir = tempfile::tempdir().unwrap();
+            build_rescan_fixture(
+                dir.path(),
+                rescan_phase,
+                &rescan_plan_body_rewritten(),
+                recorded_from_body(rescan_phase, &rescan_plan_body()),
+                Mode::Auto,
+            );
+            let path_dir = agent_free_dir_with_agent_stub("claude");
+            let output = crate::test_support::run_hermetic_test_in_child(
+                NAME,
+                path_dir.path(),
+                &[
+                    (ROOT_ENV, dir.path().as_os_str()),
+                    ("DEVFLOW_GATE_TIMEOUT_SECS", std::ffi::OsStr::new("20")),
+                ],
+            );
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let at = |phase: u32, stage: Stage| {
+            let dir = tempfile::tempdir().unwrap();
+            let phase = PhaseId::new(phase);
+            let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, dir.path().into());
+            state.stage = stage;
+            workflow::save_state(&state).unwrap();
+            (dir, phase, state)
+        };
+
+        let mut stage_failures = Vec::new();
+        for (number, stage) in [
+            (5261, Stage::Plan),
+            (5262, Stage::Code),
+            (5263, Stage::Validate),
+        ] {
+            let (dir, phase, mut state) = at(number, stage);
+            let gate = gate_kind_at_gate(dir.path(), phase, stage, || {
+                let _ = crate::pipeline_outcomes::handle_stage_failure(
+                    dir.path(),
+                    &mut state,
+                    stage,
+                    Some("the launch failed".into()),
+                );
+            });
+            assert_eq!(gate["gate_kind"], "stage_failure", "{stage}: {gate}");
+            stage_failures.push(gate);
+        }
+
+        let (dir, phase, mut state) = at(5264, Stage::Code);
+        let gate = gate_kind_at_gate(dir.path(), phase, Stage::Code, || {
+            let _ = crate::pipeline_outcomes::handle_infra_outcome(
+                dir.path(),
+                &mut state,
+                Stage::Code,
+                Some("the agent was killed".into()),
+            );
+        });
+        assert_eq!(gate["gate_kind"], "stage_failure", "infra: {gate}");
+
+        let (dir, phase, mut state) = at(5265, Stage::Code);
+        let gate = gate_kind_at_gate(dir.path(), phase, Stage::Code, || {
+            let _ = crate::preflight::run_preflight(dir.path(), &mut state, &AlwaysFailAdapter);
+        });
+        assert_eq!(gate["gate_kind"], "preflight", "preflight: {gate}");
+
+        let root = PathBuf::from(std::env::var_os(ROOT_ENV).expect("the parent's fixture root"));
+        let gate = gate_kind_at_gate(&root, rescan_phase, Stage::Code, || {
+            let result = advance_for_stage(&root, Some(rescan_phase), Some(Stage::Code));
+            let reloaded = workflow::load_state(&root, rescan_phase).ok();
+            let _reap_guard = reloaded.as_ref().map(ReapMonitorOnDrop::after_launch);
+            let _ = result;
+        });
+        assert_eq!(
+            gate["gate_kind"], "checkpoint_declaration",
+            "checkpoint: {gate}"
+        );
+
+        // Control: two gates at Validate, one a stage failure, one a disagreement.
+        let (dir, phase, mut state) = at(5266, Stage::Validate);
+        let _gsd = crate::test_support::validate_evidence(
+            dir.path(),
+            phase,
+            &[crate::test_support::gsd_says(
+                devflow_core::gsd_reader::GsdStatus::Passed,
+            )],
+        );
+        let disagreement = gate_kind_at_gate(dir.path(), phase, Stage::Validate, || {
+            let _ = crate::pipeline_outcomes::handle_validate_outcome(
+                dir.path(),
+                &mut state,
+                crate::pipeline_outcomes::ValidateOutcome::Failed,
+            );
+        });
+        let stage_failure = &stage_failures[2];
+        assert_eq!(stage_failure["stage"], "validate");
+        assert_eq!(disagreement["stage"], "validate");
+        assert_eq!(
+            disagreement["gate_kind"], "disagreement_over_passed",
+            "{disagreement}"
+        );
+        assert_ne!(stage_failure["gate_kind"], disagreement["gate_kind"]);
+    }
+
+    /// 48-15 Task 1: an abort answer must terminate through the SAME
     /// `pipeline_gate::abort` every other gate uses — not a bespoke exit
     /// path that skips gate cleanup, state clearing or deregistration.
     #[test]
@@ -8572,8 +8043,7 @@ mod tests {
             root,
             phase,
             Stage::Code,
-            false,
-            Some("abort: the agent rewrote its own gate"),
+            &abort_response("abort: the agent rewrote its own gate"),
         );
 
         let result = advance_for_stage(root, Some(phase), Some(Stage::Code));
@@ -8588,7 +8058,7 @@ mod tests {
         assert_eq!(
             events_of_kind(root, "workflow_aborted").len(),
             1,
-            "an abort note must terminate through pipeline_gate::abort"
+            "an abort answer must terminate through pipeline_gate::abort"
         );
         assert!(
             workflow::load_state(root, phase).is_err(),
@@ -9353,91 +8823,7 @@ mod tests {
         assert!(!events_of_kind(root, "gate_fired").is_empty());
     }
 
-    // ---- D-11: the legacy-launch opt-out (31-04) -------------------------
-
-    /// Set `DEVFLOW_CLAUDE_LEGACY_LAUNCH` for the duration of a test, restoring
-    /// the prior value on drop. Every user holds `ENV_MUTEX`.
-    struct LegacyEnvOverride(Option<std::ffi::OsString>);
-
-    impl LegacyEnvOverride {
-        // D-09 (48-09): mutates `DEVFLOW_CLAUDE_LEGACY_LAUNCH` process-wide.
-        // Deferred deliberately, not overlooked: THIS process reads the value, so
-        // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
-        // race and the value is restored on every exit path, unwinding included.
-        #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
-        fn set(value: &str) -> Self {
-            let prior = std::env::var_os("DEVFLOW_CLAUDE_LEGACY_LAUNCH");
-            // SAFETY: serialized by ENV_MUTEX; restored on drop.
-            unsafe { std::env::set_var("DEVFLOW_CLAUDE_LEGACY_LAUNCH", value) };
-            Self(prior)
-        }
-    }
-
-    impl Drop for LegacyEnvOverride {
-        // D-09 (48-09): mutates `DEVFLOW_CLAUDE_LEGACY_LAUNCH` process-wide.
-        // Deferred deliberately, not overlooked: THIS process reads the value, so
-        // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
-        // race and the value is restored on every exit path, unwinding included.
-        #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
-        fn drop(&mut self) {
-            // SAFETY: same serialization as `set`.
-            unsafe {
-                match self.0.take() {
-                    Some(prior) => std::env::set_var("DEVFLOW_CLAUDE_LEGACY_LAUNCH", prior),
-                    None => std::env::remove_var("DEVFLOW_CLAUDE_LEGACY_LAUNCH"),
-                }
-            }
-        }
-    }
-
-    fn legacy_state(root: &Path, phase: PhaseId, opt_out: bool) -> State {
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Code;
-        state.legacy_claude_launch = opt_out;
-        state
-    }
-
-    /// D-11: one flag forces the pre-31 shape back on, even for a stage the
-    /// rollout HAS reached — otherwise the escape hatch is unreachable exactly
-    /// where it is needed.
-    #[test]
-    fn legacy_launch_flag_forces_the_single_document_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = legacy_state(dir.path(), PhaseId::new(130), true);
-
-        // Precondition: without the opt-out this stage IS in the rollout, so
-        // the assertion below is a real discrimination and not a stage that
-        // was going to be legacy anyway.
-        assert!(
-            stream_launch_enabled(state.agent, state.stage, false),
-            "Stage::Code must be in STREAM_JSON_STAGES for this test to mean anything"
-        );
-
-        assert!(!stream_launch_enabled(
-            state.agent,
-            state.stage,
-            state.legacy_claude_launch
-        ));
-
-        let driver = agents::driver_for(state.agent);
-        let (program, args, launch) = resolve_launch_shape(
-            state.agent,
-            driver.as_ref(),
-            state.phase,
-            "the stage prompt".to_string(),
-            &[],
-            false,
-        );
-
-        assert!(matches!(launch, monitor::MonitorLaunch::Legacy));
-        assert_eq!(program, "claude");
-        assert_eq!(
-            (program, args),
-            agents::ClaudeDriver::exec_command_single_document("the stage prompt"),
-            "the forced path must be exec_command_single_document byte-for-byte, \
-             not an approximation of it"
-        );
-    }
+    // ---- launch-shape selection (D-11's opt-out was removed in Phase 52) ----
 
     /// D-03 (47-03): a resumed Claude session receives the gate rule in two
     /// separately delivered turns — the Code loop-back prompt as the stdin user
@@ -9458,7 +8844,7 @@ mod tests {
         let phase = PhaseId::new(47);
         let agent = AgentKind::Claude;
         let driver = agents::driver_for(agent);
-        let stream_launch = stream_launch_enabled(agent, Stage::Code, false);
+        let stream_launch = stream_launch_enabled(agent, Stage::Code);
         assert!(
             stream_launch,
             "Stage::Code must be stream-launch-enabled for Claude for this test to mean anything"
@@ -9469,6 +8855,9 @@ mod tests {
         let loop_back_prompt = driver.render_prompt(&prompt::StageIntent::Code {
             phase,
             fix: Some(prompt::FixType::FullExecute),
+            fix_note: None,
+            relaunch_note: None,
+            reverify_report: None,
         });
         let (_program, _args, launch) = resolve_launch_shape(
             agent,
@@ -9554,7 +8943,7 @@ mod tests {
         // predicate instead of a stage that was going to be Legacy anyway
         // (phase-39 code review, finding 3).
         assert!(
-            !stream_launch_enabled(state.agent, state.stage, false),
+            !stream_launch_enabled(state.agent, state.stage),
             "Pi must never be stream-launch-enabled for this test to mean anything"
         );
 
@@ -9570,145 +8959,6 @@ mod tests {
         assert!(matches!(launch, monitor::MonitorLaunch::Legacy));
         assert_eq!(program, "pi");
         assert_eq!(args, vec!["-p", "--no-approve", "the stage prompt"]);
-    }
-
-    /// Off by default: nothing set anywhere leaves the run on the Phase 31
-    /// transport. An escape hatch that engaged on its own would be the silent
-    /// downgrade D-11 rejects.
-    #[test]
-    // D-09 (48-09): mutates `DEVFLOW_CLAUDE_LEGACY_LAUNCH` process-wide.
-    // Deferred deliberately, not overlooked: THIS process reads the value, so
-    // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
-    // race and the value is restored on every exit path, unwinding included.
-    #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
-    fn legacy_launch_is_off_by_default() {
-        let _guard = env_lock();
-        // SAFETY: serialized by ENV_MUTEX.
-        unsafe { std::env::remove_var("DEVFLOW_CLAUDE_LEGACY_LAUNCH") };
-
-        let dir = tempfile::tempdir().unwrap();
-        let state = legacy_state(dir.path(), PhaseId::new(131), false);
-
-        assert!(
-            !state.legacy_claude_launch,
-            "State::new must default the opt-out to off"
-        );
-        assert!(!devflow_core::config::claude_legacy_launch());
-
-        let stream_launch =
-            stream_launch_enabled(state.agent, state.stage, state.legacy_claude_launch);
-        assert!(stream_launch);
-
-        let driver = agents::driver_for(state.agent);
-        let (_program, _args, launch) = resolve_launch_shape(
-            state.agent,
-            driver.as_ref(),
-            state.phase,
-            "the stage prompt".to_string(),
-            &[],
-            stream_launch,
-        );
-        assert!(matches!(launch, monitor::MonitorLaunch::PipeOwning { .. }));
-    }
-
-    /// D-11's "logged loudly" has to survive an unattended run where nobody is
-    /// watching stdout, so the notice lands on THREE channels. This pins the
-    /// two durable ones — the monitor log (the detached monitor's stdio is
-    /// null) and the run's event ledger. Stdout is not asserted here; see the
-    /// summary's "what this does not establish".
-    #[test]
-    // D-09 (48-09): mutates `DEVFLOW_CLAUDE_LEGACY_LAUNCH` process-wide.
-    // Deferred deliberately, not overlooked: THIS process reads the value, so
-    // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
-    // race and the value is restored on every exit path, unwinding included.
-    #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
-    fn legacy_launch_use_is_recorded_in_provenance() {
-        let _guard = env_lock();
-        // SAFETY: serialized by ENV_MUTEX.
-        unsafe { std::env::remove_var("DEVFLOW_CLAUDE_LEGACY_LAUNCH") };
-
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        init_repo(root);
-        let state = legacy_state(root, PhaseId::new(132), true);
-
-        announce_forced_legacy_launch(&state);
-
-        let events = events_of_kind(root, "claude_legacy_launch_forced");
-        assert_eq!(events.len(), 1, "exactly one provenance record: {events:?}");
-        // Lowercase: `Stage`'s Display is the wire form, and every other event
-        // in this ledger records it the same way.
-        assert_eq!(events[0]["stage"].as_str(), Some("code"));
-        assert_eq!(
-            events[0]["source"].as_str(),
-            Some("state:legacy_claude_launch"),
-            "with no env var set in this process, the source is the persisted flag"
-        );
-
-        let log = std::fs::read_to_string(agent_result::monitor_log_path(root, PhaseId::new(132)))
-            .expect("the monitor log must exist — it is the only channel a detached run has");
-        assert!(log.contains("legacy launch"), "monitor log: {log}");
-
-        // The required message (B3): the opt-out is an explicit acceptance of
-        // 999.64, not an escape from a guard. Asserted on the pure notice so a
-        // reworded log line cannot quietly drop it.
-        let notice = forced_legacy_launch_notice(state.stage, LegacyLaunchSource::PersistedState);
-        assert!(notice.contains("999.64"), "notice: {notice}");
-        // Case-insensitive: the requirement is the WORD, not its emphasis.
-        assert!(
-            notice.to_ascii_lowercase().contains("orphan"),
-            "the notice must say delegated work may be orphaned, in plain words: {notice}"
-        );
-        assert!(
-            log.contains("999.64"),
-            "the durable channel must carry it too, not just stdout: {log}"
-        );
-    }
-
-    /// Tests SCOPING, not a permitted bypass (adversarial review B3,
-    /// downgraded on evidence).
-    ///
-    /// The D-15 canary asks whether a live `stream-json` session is woken back
-    /// up when a background task finishes. `MonitorLaunch::Legacy` runs the
-    /// child with stdin at `/dev/null`, so a task-notification turn has no
-    /// channel to arrive on — the mechanism the canary tests structurally does
-    /// not exist on that path. Running it there would spend a real agent
-    /// invocation on a 300s deadline answering a question the launch never
-    /// asks. What the operator loses instead is named in the loud notice: the
-    /// legacy path is where a multi-plan wave orphans delegated work (999.64).
-    #[test]
-    fn legacy_launch_skips_the_delivery_canary() {
-        let _guard = env_lock();
-
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        init_repo(root);
-
-        let phase = PhaseId::new(133);
-        let mut state = canary_state(root, phase);
-        state.legacy_claude_launch = true;
-
-        // Driven by the REAL predicate, so this tracks the wiring rather than
-        // a copy of it.
-        let stream_launch =
-            stream_launch_enabled(state.agent, state.stage, state.legacy_claude_launch);
-        assert!(!stream_launch);
-        // Negative control: the SAME stage and agent, opt-out off, does run the
-        // stream path — so the reading above is the opt-out's doing.
-        assert!(stream_launch_enabled(state.agent, state.stage, false));
-
-        let calls = std::cell::Cell::new(0usize);
-        // `Absent` deliberately: if the gate ran this canary at all, the call
-        // below returns Err and the unwrap fails.
-        canary_gate(
-            &mut state,
-            stream_launch,
-            counting_canary(&calls, canary::CanaryOutcome::Absent),
-        )
-        .unwrap();
-
-        assert_eq!(calls.get(), 0);
-        assert_eq!(state.canary, None);
     }
 
     /// D-11 rejects automatic fallback: a silent downgrade is the same
@@ -9730,22 +8980,16 @@ mod tests {
     /// 31-04-SUMMARY.md as a known un-migrated route, not something this test
     /// covers.
     #[test]
-    // D-09 (48-09): mutates `DEVFLOW_CLAUDE_LEGACY_LAUNCH` process-wide.
-    // Deferred deliberately, not overlooked: THIS process reads the value, so
-    // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
-    // race and the value is restored on every exit path, unwinding included.
-    #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
     fn parse_failure_does_not_trigger_a_fallback() {
         let _guard = env_lock();
-        // SAFETY: serialized by ENV_MUTEX.
-        unsafe { std::env::remove_var("DEVFLOW_CLAUDE_LEGACY_LAUNCH") };
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
 
         let phase = PhaseId::new(134);
-        let state = legacy_state(root, phase, false);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
         workflow::save_state(&state).unwrap();
 
         // A capture the stream parser cannot make sense of: JSONL-shaped enough
@@ -9772,11 +9016,10 @@ mod tests {
 
         // ...and the launch shape for the very same state is UNCHANGED by that
         // failure. Nothing consulted the capture to pick a transport.
-        let stream_launch =
-            stream_launch_enabled(state.agent, state.stage, state.legacy_claude_launch);
+        let stream_launch = stream_launch_enabled(state.agent, state.stage);
         assert!(
             stream_launch,
-            "a parse failure must not select the legacy path — D-11 rejects automatic fallback"
+            "a parse failure must not select the capture shape — D-11 rejects automatic fallback"
         );
         let driver = agents::driver_for(state.agent);
         let (_program, _args, launch) = resolve_launch_shape(
@@ -9788,125 +9031,38 @@ mod tests {
             stream_launch,
         );
         assert!(matches!(launch, monitor::MonitorLaunch::PipeOwning { .. }));
-
-        // And no provenance event claiming a forced legacy launch was written,
-        // which is what a silent fallback would have looked like from outside.
-        assert!(events_of_kind(root, "claude_legacy_launch_forced").is_empty());
-    }
-
-    /// W4: a naive `env::var(..).is_ok()` would make
-    /// `DEVFLOW_CLAUDE_LEGACY_LAUNCH=false` *enable* the legacy path — an
-    /// accidental-reach path D-11 forbids. The value is parsed as a bool.
-    #[test]
-    fn legacy_launch_env_var_is_parsed_as_a_bool() {
-        let _guard = env_lock();
-
-        {
-            let _env = LegacyEnvOverride::set("true");
-            assert!(devflow_core::config::claude_legacy_launch());
-        }
-        {
-            // The case that motivates the test: PRESENT but false.
-            let _env = LegacyEnvOverride::set("false");
-            assert!(
-                !devflow_core::config::claude_legacy_launch(),
-                "`=false` must not enable the legacy path"
-            );
-        }
-        {
-            // Garbage warns and is ignored — it does not silently enable.
-            let _env = LegacyEnvOverride::set("yes-please");
-            assert!(!devflow_core::config::claude_legacy_launch());
-        }
-        {
-            // Empty is treated as unset, matching `env_value`'s filter.
-            let _env = LegacyEnvOverride::set("");
-            assert!(!devflow_core::config::claude_legacy_launch());
-        }
-    }
-
-    /// W5: `devflow resume` must not silently flip a run back to the stream
-    /// path mid-flight. The persisted opt-out is OR-ed, never cleared — the
-    /// same silent-drop class as `stop_until`'s unconditional clear (999.60),
-    /// which was fixed by gating it.
-    #[test]
-    // D-09 (48-09): mutates `DEVFLOW_CLAUDE_LEGACY_LAUNCH` process-wide.
-    // Deferred deliberately, not overlooked: THIS process reads the value, so
-    // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
-    // race and the value is restored on every exit path, unwinding included.
-    #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
-    fn resume_does_not_clear_a_persisted_legacy_launch() {
-        let _guard = env_lock();
-        // SAFETY: serialized by ENV_MUTEX.
-        unsafe { std::env::remove_var("DEVFLOW_CLAUDE_LEGACY_LAUNCH") };
-
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        init_repo(root);
-
-        let phase = PhaseId::new(135);
-        let mut state = legacy_state(root, phase, true);
-        workflow::save_state(&state).unwrap();
-
-        // The exact combination `resume` applies, with no flag and no env var.
-        apply_legacy_launch_opt_out(&mut state, false);
-
-        assert!(
-            state.legacy_claude_launch,
-            "a plain `devflow resume` must not drop the operator's opt-out"
-        );
-
-        // Negative control: the combination is not a constant `true` — a state
-        // that never had the opt-out stays off.
-        let mut never_opted_out = legacy_state(root, PhaseId::new(phase.major() + 1), false);
-        apply_legacy_launch_opt_out(&mut never_opted_out, false);
-        assert!(!never_opted_out.legacy_claude_launch);
     }
 
     // ------------------------------------------------------------------
     // Phase 41 Task 3: the widened stream predicate (Antigravity joins
-    // Claude; the legacy opt-out stays Claude-only, D-10), the PipeOwning
+    // Claude, D-10), the PipeOwning
     // launch shape, the by-agent canary dispatch (B2/D-07), and the
     // AutoChainGuard comment correction.
     // ------------------------------------------------------------------
 
+    /// Claude and Antigravity take the stream shape at every stream stage, with no
+    /// opt-out; every other agent takes the capture shape (`MonitorLaunch::Legacy`).
     #[test]
     fn stream_launch_includes_antigravity_on_stream_stages() {
-        assert!(
-            stream_launch_enabled(AgentKind::Antigravity, Stage::Code, false),
-            "Antigravity is a stream agent on a stream stage (round-3 D-10)"
-        );
-        // Claude unchanged.
-        assert!(stream_launch_enabled(AgentKind::Claude, Stage::Code, false));
-        // The other adapters never stream.
-        for agent in [AgentKind::Codex, AgentKind::OpenCode, AgentKind::Pi] {
-            assert!(
-                !stream_launch_enabled(agent, Stage::Code, false),
-                "{agent:?} must stay off the stream path"
-            );
+        for stage in STREAM_JSON_STAGES.iter().copied() {
+            for agent in [AgentKind::Claude, AgentKind::Antigravity] {
+                assert!(
+                    stream_launch_enabled(agent, stage),
+                    "{agent:?} is a stream agent at {stage} (round-3 D-10)"
+                );
+            }
+            for agent in [
+                AgentKind::Codex,
+                AgentKind::OpenCode,
+                AgentKind::Pi,
+                AgentKind::Hermes,
+            ] {
+                assert!(
+                    !stream_launch_enabled(agent, stage),
+                    "{agent:?} must stay off the stream path at {stage}"
+                );
+            }
         }
-    }
-
-    /// D-10 (antigravity notice (b)): `DEVFLOW_CLAUDE_LEGACY_LAUNCH` is
-    /// Claude's escape hatch. It must force CLAUDE off the stream path but
-    /// never route ANTIGRAVITY to Legacy — Antigravity has no single-document
-    /// format, and Legacy stdin is `/dev/null`.
-    #[test]
-    fn stream_launch_includes_antigravity_ignores_claude_legacy_opt_out() {
-        assert!(
-            !stream_launch_enabled(AgentKind::Claude, Stage::Code, true),
-            "the legacy opt-out keeps its hold on Claude"
-        );
-        assert!(
-            stream_launch_enabled(AgentKind::Antigravity, Stage::Code, true),
-            "the legacy opt-out must NOT move Antigravity (D-10)"
-        );
-        // Same with the opt-out cleared, for the record.
-        assert!(stream_launch_enabled(
-            AgentKind::Antigravity,
-            Stage::Code,
-            false
-        ));
     }
 
     #[test]
@@ -9953,7 +9109,7 @@ mod tests {
     fn auto_chain_guard_antigravity_engages_on_auto_code() {
         let driver = devflow_core::agents::driver_for(AgentKind::Antigravity);
         assert!(
-            stream_launch_enabled(AgentKind::Antigravity, Stage::Code, false),
+            stream_launch_enabled(AgentKind::Antigravity, Stage::Code),
             "premise: Antigravity is on the stream path at Code"
         );
         let (_program, _args, launch) = resolve_launch_shape(
@@ -10083,8 +9239,8 @@ mod tests {
     }
 
     impl HandoffRun {
-        /// Launch stage Define for `phase` (capture shape, Supervise mode,
-        /// `--until plan`) and return once N is recorded.
+        /// Launch stage Plan for `phase` (Claude with a recorded `Confirmed` canary,
+        /// Supervise mode, `--until code`) and return once N is recorded.
         fn launch(phase: PhaseId) -> Self {
             Self::launch_with(phase, |_, _| {})
         }
@@ -10104,10 +9260,31 @@ mod tests {
                 format!("# Roadmap\n\n### Phase {phase}: handoff fixture\n"),
             )
             .unwrap();
+            // D-46 (52-29): the fixture's files are committed and the stub
+            // agent's signal files are excluded, so a Validate here reads a
+            // clean tree.
+            std::fs::write(
+                root.join(".git/info/exclude"),
+                "go\ngo2\nfirst-done\ndescendant\n",
+            )
+            .unwrap();
+            let git = |args: &[&str]| {
+                let output = devflow_core::test_support::git_command(&root)
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "git {args:?}: {output:?}");
+            };
+            git(&["add", ".planning/ROADMAP.md"]);
+            git(&["commit", "-q", "-m", "handoff fixture roadmap"]);
             let mut state = State::new(phase, AgentKind::Claude, Mode::Supervise, root.clone());
+            // Stage N is Plan explicitly, a stand-in: these tests are about the handoff
+            // from stage N to N+1 (Code), not about which stage a run starts at.
+            state.stage = Stage::Plan;
             state.verification_baseline_captured = true;
-            state.legacy_claude_launch = true;
-            state.stop_until = Some(Stage::Plan);
+            // A stub `claude` cannot answer the stream launch's canary.
+            state.canary = Some(canary::CanaryOutcome::Confirmed);
+            state.stop_until = Some(Stage::Code);
             configure(&root, &mut state);
             workflow::save_state(&state).unwrap();
             let launched = launch_stage(&mut state, None, None);
@@ -10451,9 +9628,9 @@ mod tests {
                 &root,
                 &mut state,
                 Stage::Code,
+                devflow_core::gates::GateKind::StageFailure,
                 "a foreground gate",
                 300,
-                None,
             );
             let error = end.expect_err("a stopped wait is an error").to_string();
             assert!(error.contains(HOLDER_STOP_REASON), "{error}");
@@ -10548,7 +9725,7 @@ mod tests {
         let _hold = devflow_core::liveness::claim_phase_holder(root, phase).unwrap();
         let before = std::fs::read(workflow::state_path(root, phase)).unwrap();
 
-        let error = resume(root, phase, None, true)
+        let error = resume(root, phase, None)
             .expect_err("a held phase refuses")
             .to_string();
 
@@ -10623,7 +9800,7 @@ mod tests {
     }
 
     /// D-08, D-17 (V-32): a hand-run `advance` refuses beside a live supervisor of its
-    /// phase, recorded or pending. The state is at Plan and the advance binds to Define,
+    /// phase, recorded or pending. The state is at Plan and the advance binds to Validate,
     /// so the control proves that with the supervisor gone the same call reaches the
     /// advance's own stage check, which writes nothing either.
     #[test]
@@ -10636,11 +9813,12 @@ mod tests {
             let fixture = live_supervisor_fixture(root, phase);
             let state_file = workflow::state_path(root, phase);
             let advance = || {
-                advance_command(root, Some(phase), Some(Stage::Define))
+                advance_command(root, Some(phase), Some(Stage::Validate))
                     .expect_err("this advance never succeeds")
                     .to_string()
             };
             let mut state = State::new(phase, AgentKind::Claude, Mode::Supervise, root.into());
+            state.verification_baseline_captured = true;
             state.stage = Stage::Plan;
 
             state.supervisor = Some(fixture.record.clone());
@@ -10691,116 +9869,6 @@ mod tests {
                 "the call reached the advance"
             );
             assert_eq!(std::fs::read(&state_file).unwrap(), before, "gone");
-        });
-    }
-
-    /// R-17: `devflow ship` refuses beside a live supervisor of its phase, before it reads
-    /// or claims the answer that supervisor can still consume, and before a loop-back
-    /// could launch beside it. The control answers with an abort, because a loop-back that
-    /// passes the guard launches a real agent; the guard runs before any answer is read,
-    /// so the answer's kind cannot affect it.
-    #[test]
-    fn devflow_ship_refuses_while_a_supervisor_of_the_phase_is_live() {
-        const NAME: &str =
-            "pipeline_launch::tests::devflow_ship_refuses_while_a_supervisor_of_the_phase_is_live";
-        in_own_hermetic_process(NAME, || {
-            use devflow_core::gates::GateResponse;
-            use devflow_core::test_support::gate_answer_files;
-            let dir = tempfile::tempdir().unwrap();
-            let root = dir.path();
-            let phase = PhaseId::new(2910);
-            let fixture = live_supervisor_fixture(root, phase);
-            let state_file = workflow::state_path(root, phase);
-            let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.into());
-            state.stage = Stage::Ship;
-            workflow::save_state(&state).unwrap();
-            let gate = Gates::open_gate(root, phase, Stage::Ship, "ctx")
-                .unwrap()
-                .gate_id;
-            let answer = |note: &str| GateResponse {
-                approved: false,
-                note: Some(note.to_string()),
-                responded_by: Some("test".to_string()),
-            };
-            answer_open_gate(root, phase, Stage::Ship, &answer("review: fix it")).unwrap();
-            let claim = Gates::claim_path(root, phase, Stage::Ship, &gate);
-            let answer_file = gate_answer_files(root, phase, Stage::Ship)
-                .pop()
-                .expect("the answer is on disk");
-            let answer_bytes = std::fs::read(&answer_file).unwrap();
-            let live_files = || {
-                std::fs::read_dir(root.join(".devflow"))
-                    .unwrap()
-                    .filter(|entry| {
-                        let name = entry.as_ref().unwrap().file_name();
-                        name.to_string_lossy().ends_with(".live")
-                    })
-                    .count()
-            };
-
-            for (supervisor, pending, launch) in [
-                (Some(fixture.record.clone()), None, LIVE_RECORDED_LAUNCH),
-                (None, Some(fixture.pending.clone()), LIVE_PENDING_LAUNCH),
-            ] {
-                state.supervisor = supervisor;
-                state.pending_supervisor = pending;
-                workflow::save_state(&state).unwrap();
-                let before = std::fs::read(&state_file).unwrap();
-                let files = live_files();
-                let error = crate::pipeline_gate::ship_override(root, phase, false)
-                    .expect_err("a live supervisor refuses `devflow ship`")
-                    .to_string();
-                eprintln!("{launch}: {error}");
-                assert_refused_over_a_live_supervisor(&error, phase, launch);
-                assert_eq!(std::fs::read(&state_file).unwrap(), before, "{launch}");
-                assert_eq!(
-                    std::fs::read(&answer_file).unwrap(),
-                    answer_bytes,
-                    "{launch}: the live supervisor can still consume its answer"
-                );
-                assert!(!claim.exists(), "{launch}: the answer is not claimed");
-                assert_eq!(live_files(), files, "{launch}: no launch is reserved");
-            }
-            assert_eq!(
-                events_named(root, "ship_override_refused").len(),
-                2,
-                "each refusal is recorded"
-            );
-
-            let LiveSupervisorFixture {
-                _sockets,
-                supervisor,
-                record,
-                pending,
-                pending_hold,
-            } = fixture;
-            supervisor.finish();
-            drop(pending_hold);
-            state.supervisor = Some(record);
-            state.pending_supervisor = Some(pending);
-            workflow::save_state(&state).unwrap();
-            std::fs::remove_file(&answer_file).unwrap();
-            answer_open_gate(root, phase, Stage::Ship, &answer("abort this run")).unwrap();
-
-            // `note_claim` parks the consumer until a second claim outcome is counted, so
-            // the claim file can be read before the abort closes the gate and removes it.
-            let probe = std::sync::Arc::new(crate::pipeline_gate::ClaimProbe::default());
-            let shipped = std::thread::scope(|scope| {
-                let shipper = scope.spawn(|| {
-                    crate::pipeline_gate::CLAIM_PROBE.set(Some(probe.clone()));
-                    crate::pipeline_gate::ship_override(root, phase, false)
-                });
-                assert!(
-                    poll_until(Duration::from_secs(10), || claim.exists()),
-                    "with the supervisor gone the guard passes and the answer is claimed"
-                );
-                eprintln!("gone: the claim file appeared");
-                probe
-                    .already_consumed
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                shipper.join().unwrap()
-            });
-            shipped.expect("the abort answer is driven through");
         });
     }
 
@@ -11050,11 +10118,10 @@ mod tests {
     // ---- 51-01: rate-limit failover at Code (SUPV-02) ----
 
     /// The capture-shape rate-limit envelope a rate-limited stub prints. Its
-    /// retry time is the one
-    /// `pipeline_outcomes::tests::primary_loop_rate_limited_writes_single_agent_cron_instructions`
-    /// shows yields a scheduled (non-empty) cron resume rather than a gate.
+    /// retry time parses, so the no-fallback gate names it as the reset time
+    /// (`pipeline_outcomes::tests::primary_loop_rate_limited_waits_at_the_code_gate`).
     const RATE_LIMIT_ENVELOPE: &str =
-        r#"{"type":"result","subtype":"error_rate_limit","retry_after":"2026-06-18T15:45:30Z"}"#;
+        r#"{"type":"result","subtype":"error_rate_limit","retry_after":"2099-06-18T15:45:30Z"}"#;
 
     /// A `claude` stub that waits for `go` in its working directory, commits
     /// once, records that commit's id in `primary-commit` and prints the
@@ -11111,16 +10178,10 @@ mod tests {
             PathBuf::from("/repo"),
         );
         state.fallback_agent = Some(AgentKind::Codex);
-        for stage in [
-            Stage::Define,
-            Stage::Plan,
-            Stage::Code,
-            Stage::Validate,
-            Stage::Ship,
-        ] {
+        for stage in [Stage::Plan, Stage::Code, Stage::Validate] {
             let expected = match stage {
                 Stage::Code => Some(AgentKind::Codex),
-                Stage::Define | Stage::Plan | Stage::Validate | Stage::Ship => None,
+                Stage::Plan | Stage::Validate => None,
             };
             assert_eq!(
                 failover_target(&state, stage),
@@ -11154,7 +10215,7 @@ mod tests {
     /// the same root on the same branch, and completes there. The fallback's
     /// commit sits on the primary's, so nothing was reset or rebased, and no
     /// branch or worktree was added. Negative control in the same run: no
-    /// cron instruction and no `rate_limit_resume_scheduled` event.
+    /// `rate_limit_resume_scheduled` event.
     ///
     /// Supervise mode, as `HandoffRun::launch_with` builds it: under Auto the
     /// Code preflight refuses a Codex fallback on the unattended launch shape.
@@ -11268,10 +10329,6 @@ mod tests {
         );
 
         assert!(
-            !devflow_core::ship::cron_instructions_path(&run.root, run.phase).exists(),
-            "a handed-off rate limit writes no cron instruction"
-        );
-        assert!(
             events_named(&run.root, "rate_limit_resume_scheduled").is_empty(),
             "a handed-off rate limit schedules no resume; events:\n{}",
             run.events()
@@ -11286,32 +10343,34 @@ mod tests {
         std::fs::write(&stdout, format!("{RATE_LIMIT_ENVELOPE}\n")).unwrap();
     }
 
-    /// Assert `phase`'s cron instruction resumes it with `devflow resume
-    /// --phase N` on a real schedule.
-    fn assert_cron_resume_written(root: &Path, phase: PhaseId) {
-        let instructions = devflow_core::ship::load_cron_instructions(root, phase)
-            .expect("the cron arm writes cron-instructions-NN.json");
-        assert_eq!(instructions.resume.command, "devflow");
-        assert_eq!(
-            instructions.resume.args,
-            ["resume", "--phase", &phase.to_string()]
+    /// Assert a rate limit with no usable fallback waited at `phase`'s `stage`
+    /// gate: one `gate_fired` there naming `devflow resume --phase N`, and no
+    /// `rate_limit_resume_scheduled` event.
+    fn assert_waited_at_the_gate(root: &Path, phase: PhaseId, stage: Stage) {
+        let fired = events_named(root, "gate_fired");
+        assert_eq!(fired.len(), 1, "one gate: {fired:?}");
+        assert_eq!(fired[0]["stage"], stage.to_string(), "{}", fired[0]);
+        assert!(
+            fired[0]["context"]
+                .as_str()
+                .is_some_and(|context| context.contains(&format!("devflow resume --phase {phase}"))),
+            "the gate names the resume command: {}",
+            fired[0]
         );
         assert!(
-            !instructions.hermes_cron.schedule.is_empty(),
-            "the retry time yields a schedule"
+            events_named(root, "rate_limit_resume_scheduled").is_empty(),
+            "no resume is scheduled"
         );
     }
 
-    /// D-11 criterion 2 (SUPV-02): with no fallback, a rate-limited Code stage
-    /// takes today's cron arm through the real supervisor: the cron
-    /// instruction resumes the phase with `devflow resume --phase N`, and
-    /// nothing hands off. Negative control: zero `agent_handoff` events, the
-    /// agent unchanged, and no stage launched after N's. Every successor is
-    /// launched from inside N's advance, so once N's socket is gone no later
-    /// one can appear; the launch count rules out one that came and went.
+    /// CUT-03 (interim) through the real supervisor: with no fallback, a
+    /// rate-limited Code stage waits at the never-silent Code gate, which names
+    /// `devflow resume --phase N`, and nothing hands off. Negative control: zero
+    /// `agent_handoff` events, the agent unchanged, and no stage launched after
+    /// N's: N's supervisor is the one waiting at the gate.
     #[test]
-    fn a_rate_limit_without_a_fallback_writes_cron_instructions_and_never_hands_off() {
-        const NAME: &str = "pipeline_launch::tests::a_rate_limit_without_a_fallback_writes_cron_instructions_and_never_hands_off";
+    fn a_rate_limit_without_a_fallback_waits_at_a_gate_and_never_hands_off() {
+        const NAME: &str = "pipeline_launch::tests::a_rate_limit_without_a_fallback_waits_at_a_gate_and_never_hands_off";
         if !devflow_core::test_support::in_child_test(NAME) {
             run_handoff_child_with_stubs(
                 NAME,
@@ -11330,26 +10389,13 @@ mod tests {
 
         assert!(
             poll_until(HANDOFF_STEP_WAIT, || {
-                !events_named(&run.root, "rate_limit_resume_scheduled").is_empty()
+                !events_named(&run.root, "gate_fired").is_empty()
             }),
-            "the cron arm never ran; events:\n{}",
+            "the run never reached a gate; events:\n{}",
             run.events()
-        );
-        assert!(
-            poll_until(HANDOFF_STEP_WAIT, || {
-                devflow_core::supervisor::probe(&run.n.socket_path)
-                    .is_ok_and(|liveness| liveness == devflow_core::supervisor::Liveness::Gone)
-            }),
-            "N's supervisor ends once its advance has returned"
         );
 
-        assert_cron_resume_written(&run.root, run.phase);
-        assert_eq!(
-            events_named(&run.root, "rate_limit_resume_scheduled").len(),
-            1,
-            "{}",
-            run.events()
-        );
+        assert_waited_at_the_gate(&run.root, run.phase, Stage::Code);
         assert!(
             events_named(&run.root, "agent_handoff").is_empty(),
             "no fallback, no handoff; events:\n{}",
@@ -11373,17 +10419,17 @@ mod tests {
 
     /// D-07: a handoff refused at runtime — here the fallback's binary is
     /// missing — says so in `agent_handoff_refused`, naming the fallback and
-    /// the refusal, then takes the cron arm unchanged with the original
-    /// retry time. The fallback stays unconsumed and the agent unchanged; the
-    /// cron arm's own bump is the only `infra_failures` change.
+    /// the refusal, then waits at the Code gate as a run with no fallback
+    /// does. The fallback stays unconsumed, the agent unchanged and
+    /// `infra_failures` untouched (D-20).
     ///
     /// Supervise mode: under Auto the candidate preflight refuses Codex at
     /// Code on the unattended launch shape before the binary check runs, and
     /// the reason would not name the missing binary.
     #[test]
-    fn a_refused_handoff_takes_the_cron_arm_and_names_the_refusal() {
+    fn a_refused_handoff_waits_at_the_gate_and_names_the_refusal() {
         const NAME: &str =
-            "pipeline_launch::tests::a_refused_handoff_takes_the_cron_arm_and_names_the_refusal";
+            "pipeline_launch::tests::a_refused_handoff_waits_at_the_gate_and_names_the_refusal";
         enter_agent_free_child!(NAME, "claude");
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -11399,7 +10445,9 @@ mod tests {
         workflow::save_state(&state).unwrap();
         write_rate_limit_capture(root, phase);
 
-        advance(root, Some(phase)).unwrap();
+        let reloaded = state_on_disk_at_gate(root, phase, Stage::Code, || {
+            advance(root, Some(phase)).unwrap();
+        });
 
         let refused = events_named(root, "agent_handoff_refused");
         assert_eq!(refused.len(), 1, "one refusal event: {refused:?}");
@@ -11413,32 +10461,33 @@ mod tests {
                 .is_some_and(|reason| reason.contains("not found")),
             "the refusal names the missing binary: {refusal}"
         );
-        assert_cron_resume_written(root, phase);
-        assert_eq!(events_named(root, "rate_limit_resume_scheduled").len(), 1);
+        assert_waited_at_the_gate(root, phase, Stage::Code);
         assert!(
             events_named(root, "agent_handoff").is_empty(),
             "a refused handoff is not a handoff"
         );
-        let reloaded = workflow::load_state(root, phase).unwrap();
         assert_eq!(reloaded.agent, AgentKind::Claude);
         assert!(
             !reloaded.fallback_consumed,
             "only a committed hop consumes it"
         );
-        assert_eq!(reloaded.infra_failures, 1, "the cron arm's own bump");
+        assert_eq!(
+            reloaded.infra_failures, 0,
+            "a rate limit is not an infra fault"
+        );
     }
 
-    /// R-2: a rate limit at Plan with an unused fallback configured takes the
-    /// cron arm and leaves the fallback alone. A `codex` stub is on PATH, so
+    /// R-2: a rate limit at Plan with an unused fallback configured waits at
+    /// the Plan gate and leaves the fallback alone. A `codex` stub is on PATH, so
     /// the absence of a hop is not explained by a missing binary.
     ///
     /// Supervise mode, so that with the stage term removed from
     /// [`failover_target`] this run reaches a committed hop rather than a
     /// preflight refusal (the RED-equivalent this control was checked with).
     #[test]
-    fn a_rate_limit_at_plan_with_a_fallback_takes_the_cron_arm() {
+    fn a_rate_limit_at_plan_with_a_fallback_waits_at_the_plan_gate() {
         const NAME: &str =
-            "pipeline_launch::tests::a_rate_limit_at_plan_with_a_fallback_takes_the_cron_arm";
+            "pipeline_launch::tests::a_rate_limit_at_plan_with_a_fallback_waits_at_the_plan_gate";
         enter_agent_free_child!(NAME, "codex");
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -11454,10 +10503,12 @@ mod tests {
         workflow::save_state(&state).unwrap();
         write_rate_limit_capture(root, phase);
 
-        advance(root, Some(phase)).unwrap();
+        let reloaded = state_on_disk_at_gate(root, phase, Stage::Plan, || {
+            advance(root, Some(phase)).unwrap();
+        });
 
         // The hop checks come first so that a hop at Plan is the failure
-        // reported, not its knock-on missing cron file.
+        // reported, not its knock-on missing gate.
         assert!(
             events_named(root, "agent_handoff").is_empty(),
             "no handoff at Plan: {:?}",
@@ -11467,9 +10518,7 @@ mod tests {
             events_named(root, "agent_handoff_refused").is_empty(),
             "Plan never attempts a handoff"
         );
-        assert_cron_resume_written(root, phase);
-        assert_eq!(events_named(root, "rate_limit_resume_scheduled").len(), 1);
-        let reloaded = workflow::load_state(root, phase).unwrap();
+        assert_waited_at_the_gate(root, phase, Stage::Plan);
         assert_eq!(reloaded.agent, AgentKind::Claude);
         assert_eq!(reloaded.fallback_agent, Some(AgentKind::Codex));
         assert!(!reloaded.fallback_consumed);
@@ -11705,8 +10754,8 @@ mod tests {
 
     /// A Supervise-mode Code run of `phase` under Claude in a fresh repo at `root`,
     /// with `fallback` and `consumed` saved, its `infra_failures` at `infra`, and a
-    /// rate-limit capture for `advance` to read. The capture shape, so a Claude
-    /// relaunch needs no delivery canary.
+    /// rate-limit capture for `advance` to read. Its delivery canary is recorded
+    /// `Confirmed`, so a Claude relaunch runs none.
     fn save_rate_limited_code_run(
         root: &Path,
         phase: PhaseId,
@@ -11725,7 +10774,7 @@ mod tests {
         state.fallback_agent = fallback;
         state.fallback_consumed = consumed;
         state.infra_failures = infra;
-        state.legacy_claude_launch = true;
+        state.canary = Some(canary::CanaryOutcome::Confirmed);
         workflow::save_state(&state).unwrap();
         write_rate_limit_capture(root, phase);
     }
@@ -11733,8 +10782,8 @@ mod tests {
     /// D-06 at its boundary, at Code (R-2): a hop is not an infra fault. With
     /// `infra_failures` one below the ceiling, a rate limit with an unused
     /// fallback hands off and leaves the counter where it was. Control in the same
-    /// test: the same state with no fallback takes the cron arm's bump, reaches the
-    /// ceiling and aborts, which removes the run's state.
+    /// test: the same state with no fallback does not hand off; it waits at the
+    /// Code gate, with the counter also where it was (D-20).
     ///
     /// Supervise mode with a Codex fallback, a pair the Code preflight admits;
     /// `gate_or_abort_infra` aborts at the ceiling in every mode.
@@ -11776,31 +10825,33 @@ mod tests {
         let control_root = without_fallback.path();
         let control_phase = PhaseId::new(5165);
         save_rate_limited_code_run(control_root, control_phase, None, false, below_ceiling);
-        let outcome = advance(control_root, Some(control_phase));
+        let at_gate = state_on_disk_at_gate(control_root, control_phase, Stage::Code, || {
+            advance(control_root, Some(control_phase)).unwrap();
+        });
         assert!(
             events_named(control_root, "agent_handoff").is_empty(),
             "control: no fallback, no handoff"
         );
-        assert!(
-            matches!(
-                workflow::load_state(control_root, control_phase),
-                Err(workflow::WorkflowError::MissingState(_))
-            ),
-            "control: the cron arm's bump reaches the ceiling and aborts (advance returned \
-             {outcome:?})"
+        assert_eq!(
+            at_gate.agent,
+            AgentKind::Claude,
+            "control: the agent is unchanged"
         );
-        outcome.unwrap();
+        assert_eq!(
+            at_gate.infra_failures, below_ceiling,
+            "control: the rate limit charged nothing either (D-20)"
+        );
     }
 
     /// D-05: one hop per run, no automatic switch back. Once the fallback is
-    /// consumed, a later Code rate limit takes the cron arm on the current agent.
+    /// consumed, a later Code rate limit waits at the Code gate on the current agent.
     /// Second fixture, the adjacency edge at runtime: an unconsumed fallback equal
     /// to the agent is no handoff either. A `codex` stub is on PATH, so a missing
     /// binary does not explain the absent hop.
     #[test]
-    fn a_rate_limit_after_the_one_hop_takes_the_cron_arm() {
+    fn a_rate_limit_after_the_one_hop_waits_at_the_gate() {
         const NAME: &str =
-            "pipeline_launch::tests::a_rate_limit_after_the_one_hop_takes_the_cron_arm";
+            "pipeline_launch::tests::a_rate_limit_after_the_one_hop_waits_at_the_gate";
         enter_agent_free_child!(NAME, "codex");
         let _guard = env_lock();
         for (phase, fallback, consumed) in [
@@ -11811,20 +10862,16 @@ mod tests {
             let root = dir.path();
             save_rate_limited_code_run(root, phase, Some(fallback), consumed, 0);
 
-            advance(root, Some(phase)).unwrap();
+            let reloaded = state_on_disk_at_gate(root, phase, Stage::Code, || {
+                advance(root, Some(phase)).unwrap();
+            });
 
             assert!(
                 events_named(root, "agent_handoff").is_empty(),
                 "phase {phase}: no hop; events: {:?}",
                 events_named(root, "agent_handoff")
             );
-            assert_cron_resume_written(root, phase);
-            assert_eq!(
-                events_named(root, "rate_limit_resume_scheduled").len(),
-                1,
-                "phase {phase}"
-            );
-            let reloaded = workflow::load_state(root, phase).unwrap();
+            assert_waited_at_the_gate(root, phase, Stage::Code);
             assert_eq!(reloaded.agent, AgentKind::Claude, "phase {phase}");
             assert_eq!(reloaded.fallback_consumed, consumed, "phase {phase}");
         }
@@ -11989,10 +11036,6 @@ mod tests {
             "a failed relaunch never takes the cron arm (R2-D1)"
         );
         assert!(
-            !devflow_core::ship::cron_instructions_path(&run.root, run.phase).exists(),
-            "a failed relaunch writes no cron instruction (R2-D1)"
-        );
-        assert!(
             events_named(&run.root, "supervisor_superseded").is_empty(),
             "the supervisor kept its own run; events:\n{}",
             run.events()
@@ -12070,7 +11113,6 @@ mod tests {
                 run.events()
             );
         }
-        assert!(!devflow_core::ship::cron_instructions_path(&run.root, run.phase).exists());
         let state = run.state();
         assert!(!state.gate_pending);
         assert_eq!(
@@ -12142,6 +11184,17 @@ mod tests {
         phase: PhaseId,
         fix: Option<prompt::FixType>,
     ) -> (Vec<String>, ReapMonitorOnDrop) {
+        fail_over_from_code_with_note(root, phase, fix, None)
+    }
+
+    /// [`fail_over_from_code`] whose loop-back into Code carried the rejection
+    /// note `note` (GATE-01): the fix pass records it as `code_fix_note`.
+    fn fail_over_from_code_with_note(
+        root: &Path,
+        phase: PhaseId,
+        fix: Option<prompt::FixType>,
+        note: Option<&str>,
+    ) -> (Vec<String>, ReapMonitorOnDrop) {
         init_repo(root);
         let mut state = State::new(
             phase,
@@ -12161,6 +11214,8 @@ mod tests {
                 root,
                 &mut state,
                 fix,
+                note.map(str::to_string),
+                None,
                 crate::pipeline_gate::LoopBackReason::GateResponse,
             )
             .unwrap();
@@ -12181,15 +11236,15 @@ mod tests {
         (recorded_argv(root, "codex"), reap)
     }
 
-    /// D-09 (Code, review B-1): a Code failover in the middle of an audit-fix pass
-    /// hands the fallback the audit-fix workflow, rendered by the FALLBACK's
+    /// D-09 (Code, review B-1): a Code failover in the middle of a gaps-only pass
+    /// hands the fallback the gaps-only workflow, rendered by the FALLBACK's
     /// driver, and the assertion is on the argv the spawned `codex` received.
     /// Control in the same test: the same failover from a plain Code pass
     /// delivers the plain execute-phase rendering.
     #[test]
-    fn a_code_failover_during_an_audit_fix_pass_replays_audit_fix() {
+    fn a_code_failover_during_a_gaps_only_pass_replays_gaps_only() {
         const NAME: &str =
-            "pipeline_launch::tests::a_code_failover_during_an_audit_fix_pass_replays_audit_fix";
+            "pipeline_launch::tests::a_code_failover_during_a_gaps_only_pass_replays_gaps_only";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = argv_recording_agents_dir();
             let output =
@@ -12200,18 +11255,24 @@ mod tests {
         let _guard = env_lock();
         let codex = agents::driver_for(AgentKind::Codex);
         let code_prompt = |phase: PhaseId, fix: Option<prompt::FixType>| {
-            codex.render_prompt(&prompt::StageIntent::Code { phase, fix })
+            codex.render_prompt(&prompt::StageIntent::Code {
+                phase,
+                fix,
+                fix_note: None,
+                relaunch_note: None,
+                reverify_report: None,
+            })
         };
 
         let fix_dir = tempfile::tempdir().unwrap();
         let fix_phase = PhaseId::new(5171);
         let (argv, _reap_fix) =
-            fail_over_from_code(fix_dir.path(), fix_phase, Some(prompt::FixType::AuditFix));
-        let audit_fix = code_prompt(fix_phase, Some(prompt::FixType::AuditFix));
-        assert_ne!(audit_fix, code_prompt(fix_phase, None));
+            fail_over_from_code(fix_dir.path(), fix_phase, Some(prompt::FixType::GapsOnly));
+        let gaps_only = code_prompt(fix_phase, Some(prompt::FixType::GapsOnly));
+        assert_ne!(gaps_only, code_prompt(fix_phase, None));
         assert!(
-            argv.contains(&audit_fix),
-            "the fallback receives the audit-fix pass in Codex's own rendering: {argv:?}"
+            argv.contains(&gaps_only),
+            "the fallback receives the gaps-only pass in Codex's own rendering: {argv:?}"
         );
         assert!(
             !argv.contains(&code_prompt(fix_phase, None)),
@@ -12226,7 +11287,7 @@ mod tests {
             "control: a plain Code failover delivers execute-phase: {argv:?}"
         );
         assert!(
-            !argv.contains(&code_prompt(plain_phase, Some(prompt::FixType::AuditFix))),
+            !argv.contains(&code_prompt(plain_phase, Some(prompt::FixType::GapsOnly))),
             "control: a plain Code failover delivers no fix prompt: {argv:?}"
         );
     }
@@ -12449,7 +11510,7 @@ mod tests {
     /// 999.138 residual (A6): `advance_with` refuses a stopped state with an
     /// `advance_failed {reason: "stopped"}` event and an error naming
     /// `devflow resume`. Control: the same state with `stopped: false`
-    /// advances (here to its `--until define` stop, so nothing launches).
+    /// advances (here to its `--until plan` stop, so nothing launches).
     #[test]
     fn advance_refuses_a_stopped_state() {
         let _guard = env_lock();
@@ -12463,12 +11524,12 @@ mod tests {
                 Mode::Supervise,
                 root.to_path_buf(),
             );
-            state.stop_until = Some(Stage::Define);
+            state.stop_until = Some(Stage::Plan);
             state.stopped = stopped;
             workflow::save_state(&state).unwrap();
             write_success_capture(root, phase);
 
-            let result = advance_with(root, phase, Some(Stage::Define));
+            let result = advance_with(root, phase, Some(Stage::Plan));
             let failed = events_named(root, "advance_failed");
             if stopped {
                 let err = result.expect_err("a stopped state must not advance");
@@ -12547,7 +11608,7 @@ mod tests {
         }
     }
 
-    /// The marker a gate fixture's first agent prints: a failed Define,
+    /// The marker a gate fixture's first agent prints: a failed Plan,
     /// which the never-silent path parks at a human gate.
     const FAILED_MARKER: &str = r#"DEVFLOW_RESULT: {"status":"failed","reason":"gate fixture"}"#;
 
@@ -12574,25 +11635,25 @@ mod tests {
             .is_ok_and(|status| status != devflow_core::gates::WaiterStatus::Live)
     }
 
-    /// Launch a gate fixture and return once N is parked at its Define gate:
+    /// Launch a gate fixture and return once N is parked at its Plan gate:
     /// the gate file exists and N holds its registration (its owner phase is the
     /// control's assertion, not a precondition here).
     fn launch_parked_at_gate(phase: PhaseId) -> HandoffRun {
         let run = HandoffRun::launch(phase);
         run.go();
-        let gate = Gates::gate_path(&run.root, phase, Stage::Define);
+        let gate = Gates::gate_path(&run.root, phase, Stage::Plan);
         assert!(
             poll_until(HANDOFF_STEP_WAIT, || gate.exists()
                 && events_named(&run.root, "gate_fired").len() == 1),
-            "N parks at the Define gate: {}",
+            "N parks at the Plan gate: {}",
             run.events()
         );
         assert_eq!(
             Gates::waiter_status(
                 &run.root,
                 phase,
-                Stage::Define,
-                &gate_id_at(&run.root, phase, Stage::Define)
+                Stage::Plan,
+                &gate_id_at(&run.root, phase, Stage::Plan)
             )
             .unwrap(),
             devflow_core::gates::WaiterStatus::Live,
@@ -12615,10 +11676,10 @@ mod tests {
         }
         let _guard = env_lock();
         let run = launch_parked_at_gate(PhaseId::new(1310));
-        let gate = gate_id_at(&run.root, run.phase, Stage::Define);
+        let gate = gate_id_at(&run.root, run.phase, Stage::Plan);
         signal_supervisor(&run, libc::SIGTERM);
         let ended = poll_until(Duration::from_secs(5), || {
-            registration_ended(&run.root, run.phase, Stage::Define, &gate)
+            registration_ended(&run.root, run.phase, Stage::Plan, &gate)
                 && devflow_core::supervisor::probe(&run.n.socket_path)
                     .is_ok_and(|liveness| liveness == devflow_core::supervisor::Liveness::Gone)
         });
@@ -12641,15 +11702,15 @@ mod tests {
         assert_eq!(stopped[0]["safe_point"], 4, "{}", stopped[0]);
     }
 
-    /// Park N at its Define gate, approve the gate, and wait for N to reach the configured
+    /// Park N at its Plan gate, approve the gate, and wait for N to reach the configured
     /// hold with its claim published. Returns the run and the gate's id.
     fn parked_at_a_hold_with_the_gate_claimed(phase: PhaseId) -> (HandoffRun, GateId) {
         let run = launch_parked_at_gate(phase);
-        let gate = gate_id_at(&run.root, phase, Stage::Define);
-        answer_open_gate(&run.root, phase, Stage::Define, &gate_response(true, None)).unwrap();
+        let gate = gate_id_at(&run.root, phase, Stage::Plan);
+        answer_open_gate(&run.root, phase, Stage::Plan, &gate_response(true, None)).unwrap();
         run.wait_held();
         assert!(
-            Gates::claim_path(&run.root, phase, Stage::Define, &gate).exists(),
+            Gates::claim_path(&run.root, phase, Stage::Plan, &gate).exists(),
             "precondition: the claim is published: {}",
             run.events()
         );
@@ -12670,17 +11731,17 @@ mod tests {
     }
 
     /// What a kill-point fixture requires of `resume`: it reports the approval it found
-    /// claimed at Define, keeps no file for that gate, sets nothing aside for it (the
+    /// claimed at Plan, keeps no file for that gate, sets nothing aside for it (the
     /// answer was claimed, not unused), and reruns the stage.
     fn assert_resume_reported_the_claimed_approval(run: &HandoffRun, gate: &GateId) {
         let found = events_named(&run.root, "resume_found_unapplied_answer");
         assert_eq!(found.len(), 1, "{}", run.events());
-        assert_eq!(found[0]["stage"], "define", "{}", found[0]);
+        assert_eq!(found[0]["stage"], "plan", "{}", found[0]);
         assert_eq!(found[0]["gate_id"], gate.as_str(), "{}", found[0]);
         assert_eq!(found[0]["approved"], true, "{}", found[0]);
-        assert!(!Gates::gate_path(&run.root, run.phase, Stage::Define).exists());
-        assert!(!Gates::answer_path(&run.root, run.phase, Stage::Define, gate).exists());
-        assert!(!Gates::claim_path(&run.root, run.phase, Stage::Define, gate).exists());
+        assert!(!Gates::gate_path(&run.root, run.phase, Stage::Plan).exists());
+        assert!(!Gates::answer_path(&run.root, run.phase, Stage::Plan, gate).exists());
+        assert!(!Gates::claim_path(&run.root, run.phase, Stage::Plan, gate).exists());
         let quarantined = Gates::quarantined(&run.root);
         assert!(
             quarantined
@@ -12712,10 +11773,10 @@ mod tests {
         let (run, gate) = parked_at_a_hold_with_the_gate_claimed(PhaseId::new(1312));
         let state = run.state();
         assert!(state.gate_pending, "precondition: nothing recorded yet");
-        assert_eq!(state.stage, Stage::Define);
+        assert_eq!(state.stage, Stage::Plan);
         kill_supervisor_until_stale(&run);
 
-        resume(&run.root, run.phase, None, false).unwrap();
+        resume(&run.root, run.phase, None).unwrap();
 
         assert_resume_reported_the_claimed_approval(&run, &gate);
         let removed = events_named(&run.root, "gate_claimed_answer_removed");
@@ -12740,7 +11801,7 @@ mod tests {
             !state.gate_pending,
             "precondition: the decision is recorded"
         );
-        assert_eq!(state.stage, Stage::Define, "precondition: not yet acted on");
+        assert_eq!(state.stage, Stage::Plan, "precondition: not yet acted on");
         assert_eq!(
             stage_launched_count(&run.root, run.phase),
             1,
@@ -12749,7 +11810,7 @@ mod tests {
         );
         kill_supervisor_until_stale(&run);
 
-        resume(&run.root, run.phase, None, false).unwrap();
+        resume(&run.root, run.phase, None).unwrap();
 
         assert_resume_reported_the_claimed_approval(&run, &gate);
     }
@@ -12767,10 +11828,10 @@ mod tests {
         }
         let _guard = env_lock();
         let run = launch_parked_at_gate(PhaseId::new(1311));
-        let gate = gate_id_at(&run.root, run.phase, Stage::Define);
+        let gate = gate_id_at(&run.root, run.phase, Stage::Plan);
         std::thread::sleep(Duration::from_secs(3));
         assert!(
-            !registration_ended(&run.root, run.phase, Stage::Define, &gate),
+            !registration_ended(&run.root, run.phase, Stage::Plan, &gate),
             "control: still parked with its registration live after 3 s"
         );
         assert!(
@@ -12784,16 +11845,17 @@ mod tests {
         answer_open_gate(
             &run.root,
             run.phase,
-            Stage::Define,
+            Stage::Plan,
             &devflow_core::gates::GateResponse {
                 approved: false,
+                abort: true,
                 note: Some("abort: control answer".to_string()),
                 responded_by: Some("test".to_string()),
             },
         )
         .unwrap();
         let ended = poll_until(HANDOFF_STEP_WAIT, || {
-            registration_ended(&run.root, run.phase, Stage::Define, &gate)
+            registration_ended(&run.root, run.phase, Stage::Plan, &gate)
                 && devflow_core::supervisor::probe(&run.n.socket_path)
                     .is_ok_and(|liveness| liveness == devflow_core::supervisor::Liveness::Gone)
         });
@@ -12890,7 +11952,7 @@ mod tests {
         assert_eq!(last["stopped"], true, "{last}");
         assert_eq!(exit_file_of(&run), "143", "{}", run.events());
 
-        resume(&run.root, run.phase, None, false).unwrap();
+        resume(&run.root, run.phase, None).unwrap();
 
         let evaluated = |status: &str| {
             events_named(&run.root, "advance_evaluated")
@@ -12906,7 +11968,7 @@ mod tests {
         assert!(!evaluated("failed"), "{}", run.events());
     }
 
-    /// The control for V-28: the same hold and no stop, with an `--until define` halt ending
+    /// The control for V-28: the same hold and no stop, with an `--until plan` halt ending
     /// the run where it is, leaves the agent's own code.
     #[test]
     fn without_a_stop_the_exit_file_keeps_the_agents_code() {
@@ -12918,7 +11980,7 @@ mod tests {
         }
         let _guard = env_lock();
         let run = HandoffRun::launch_with(PhaseId::new(1319), |_, state| {
-            state.stop_until = Some(Stage::Define);
+            state.stop_until = Some(Stage::Plan);
         });
         run.go();
         run.wait_held();
@@ -12935,18 +11997,58 @@ mod tests {
         assert!(events_named(&run.root, "advance_stopped").is_empty());
     }
 
-    /// A stop that lands after a Validate gate was answered and its decision committed, while
-    /// the run still advances. The answer's one transition happens, the next safe point stops
-    /// the run before anything launches, and `stop`'s line and the exit file both say so.
+    /// Operator decision (2026-11-11): a finish wins over a late stop. A stop
+    /// taken after the Validate gate's approve was claimed, while the finish
+    /// is permitted (a fresh `passed` with the PASS on HEAD), no longer stops
+    /// the run at safe point 6: the run is recorded finished, one
+    /// `workflow_finished` `{"reason":"finished","shipped":false}`, and the
+    /// stop's final line says the run already finished, never `handed_off` and
+    /// never a stop. Control in the same test: the same late stop when the
+    /// approve's fresh read gives no finish permit (`gaps_found`, the gap
+    /// loop) still stops the run at an advance safe point, unfinished.
     #[test]
-    fn a_stop_after_a_gate_answer_stops_after_its_transition_and_reports_it() {
-        const NAME: &str = "pipeline_launch::tests::a_stop_after_a_gate_answer_stops_after_its_transition_and_reports_it";
+    fn a_stop_after_a_gate_answer_loses_to_a_permitted_finish() {
+        const NAME: &str =
+            "pipeline_launch::tests::a_stop_after_a_gate_answer_loses_to_a_permitted_finish";
+        const PASS_MARKER: &str = r#"DEVFLOW_RESULT: {"status":"success","verdict":"pass"}"#;
+        const FRESH_ENV: &str = "DEVFLOW_PIPELINE_LAUNCH_LATE_STOP_FRESH";
         if !devflow_core::test_support::in_child_test(NAME) {
-            run_handoff_child(NAME, Some("after_commit"), SUCCESS_MARKER);
+            for fresh in ["passed", "gaps_found"] {
+                let gsd = tempfile::tempdir().unwrap();
+                let home = gsd.path().join("home");
+                // Two reads: the Validate outcome's and the approve's own fresh
+                // read (D-45 rule 2), which decides whether the finish is
+                // permitted.
+                let fresh_status = if fresh == "passed" {
+                    devflow_core::gsd_reader::GsdStatus::Passed
+                } else {
+                    devflow_core::gsd_reader::GsdStatus::GapsFound
+                };
+                devflow_core::test_support::plant_gsd_run_stub(
+                    &home,
+                    &[
+                        crate::test_support::gsd_says(devflow_core::gsd_reader::GsdStatus::Passed),
+                        crate::test_support::gsd_says(fresh_status),
+                    ],
+                    &gsd.path().join("logs"),
+                );
+                run_handoff_child_with_stubs_and_env(
+                    NAME,
+                    Some("after_commit"),
+                    PASS_MARKER,
+                    &[],
+                    &[
+                        (crate::test_support::TEST_GSD_HOME_ENV, home.as_os_str()),
+                        (FRESH_ENV, std::ffi::OsStr::new(fresh)),
+                    ],
+                );
+            }
             return;
         }
+        let permitted = std::env::var(FRESH_ENV).expect("the parent names the row") == "passed";
         let _guard = env_lock();
-        let run = HandoffRun::launch_with(PhaseId::new(1320), |_, state| {
+        let run = HandoffRun::launch_with(PhaseId::new(1320), |root, state| {
+            crate::test_support::phase_dir_fixture(root, state.phase);
             state.stage = Stage::Validate;
             state.stop_until = None;
         });
@@ -12972,22 +12074,43 @@ mod tests {
             Duration::from_secs(30),
         );
         assert_eq!(accepted["owner"], "advancing", "{accepted}");
-        assert_eq!(last["stopped"], true, "{last}");
-        let transitions = events_named(&run.root, "transition");
-        assert_eq!(transitions.len(), 1, "{}", run.events());
-        assert_eq!(transitions[0]["to"], "ship", "{}", transitions[0]);
-        assert_eq!(
-            stage_launched_count(&run.root, run.phase),
-            1,
-            "nothing launches after the stop: {}",
-            run.events()
-        );
-        let line = stop_line_for(&run, &last);
-        assert!(line.contains("honoured at an advance safe point"), "{line}");
-        assert_eq!(exit_file_of(&run), "143", "{}", run.events());
         let state = run.state();
-        assert!(state.stopped, "{state:?}");
-        assert_eq!(state.stop_reason.as_deref(), Some(ADVANCE_STOP_REASON));
+        let finished = events_named(&run.root, "workflow_finished");
+        if permitted {
+            assert_eq!(
+                last,
+                serde_json::json!({"ok": false, "error": "already_finished"}),
+                "the stop is told the run already finished: {}",
+                run.events()
+            );
+            assert_eq!(finished.len(), 1, "{}", run.events());
+            assert_eq!(finished[0]["reason"], "finished", "{}", finished[0]);
+            assert_eq!(finished[0]["shipped"], false, "{}", finished[0]);
+            assert!(
+                events_named(&run.root, "advance_stopped").is_empty(),
+                "no safe-point stop: {}",
+                run.events()
+            );
+            assert!(state.stopped && state.finished, "{state:?}");
+            assert_eq!(
+                state.stop_reason.as_deref(),
+                Some(crate::pipeline_gate::FINISHED_STOP_REASON)
+            );
+            let line = crate::commands::already_finished_line(&format!("phase {}", run.phase));
+            assert!(
+                line.contains("already finished") && !line.contains("handed"),
+                "{line}"
+            );
+        } else {
+            // Control: no finish permit, so the stop keeps its handling.
+            assert_eq!(last["stopped"], true, "{last}");
+            assert!(finished.is_empty(), "{}", run.events());
+            let stopped = events_named(&run.root, "advance_stopped");
+            assert_eq!(stopped.len(), 1, "{}", run.events());
+            let line = stop_line_for(&run, &last);
+            assert!(line.contains("honoured at an advance safe point"), "{line}");
+            assert!(state.stopped && !state.finished, "{state:?}");
+        }
     }
 
     /// A socket stop taken during a gate wait ends the wait at safe point 4, so an answer
@@ -13016,7 +12139,7 @@ mod tests {
             answer_open_gate(
                 &run.root,
                 run.phase,
-                Stage::Define,
+                Stage::Plan,
                 &gate_response(true, None)
             )
             .is_err(),
@@ -13024,144 +12147,6 @@ mod tests {
         );
         assert!(events_named(&run.root, "transition").is_empty());
         assert_eq!(stage_launched_count(&run.root, run.phase), 1);
-    }
-
-    // ---- CR-01 (50-REVIEW.md): a stop before a `--yes-ship` merge ----
-
-    /// Whether `branch` exists in the repo at `root`.
-    fn branch_exists(root: &Path, branch: &str) -> bool {
-        devflow_core::test_support::git_command(root)
-            .args(["rev-parse", "--verify", "--quiet", branch])
-            .status()
-            .unwrap()
-            .success()
-    }
-
-    /// The body of the `--yes-ship` pair: stage N is Ship with `--yes-ship`
-    /// and a feature branch finalization can merge, and its advance is held
-    /// at the configured point. With `stop`, a socket stop is taken there
-    /// (owner `advancing`, so it is only flagged) before the release: the
-    /// advance must ship nothing, record the stop at `safe_point` and answer
-    /// the caller `stopped`. Without it (the control) the run ships.
-    fn held_yes_ship_advance(phase: PhaseId, stop: bool, safe_point: u8) {
-        let _guard = env_lock();
-        let branch = format!("feature/phase-{}", phase.padded());
-        let run = HandoffRun::launch_with(phase, |root, state| {
-            assert!(
-                devflow_core::test_support::git_command(root)
-                    .args(["branch", &branch, "develop"])
-                    .status()
-                    .unwrap()
-                    .success()
-            );
-            state.stage = Stage::Ship;
-            state.yes_ship = true;
-            state.stop_until = None;
-        });
-        run.go();
-        run.wait_held();
-        if stop {
-            let (accepted, last) = shutdown_accepted_then(
-                &run.n.socket_path,
-                || run.release(),
-                Duration::from_secs(30),
-            );
-            assert_eq!(accepted["owner"], "advancing", "{accepted}");
-            assert!(
-                events_named(&run.root, "workflow_shipped").is_empty(),
-                "a stop accepted before the --yes-ship merge must ship nothing: {}",
-                run.events()
-            );
-            assert!(
-                branch_exists(&run.root, &branch),
-                "no after-ship hook may run: the feature branch is kept"
-            );
-            let state = run.state();
-            assert!(
-                state.stopped,
-                "state.stopped after a stop at safe point {safe_point}"
-            );
-            assert_eq!(state.stop_reason.as_deref(), Some(ADVANCE_STOP_REASON));
-            assert!(!state.gate_pending, "no gate is left pending");
-            assert!(gate_answer_files(&run.root, run.phase, Stage::Ship).is_empty());
-            let stopped = events_named(&run.root, "advance_stopped");
-            assert_eq!(stopped.len(), 1, "{}", run.events());
-            assert_eq!(stopped[0]["safe_point"], safe_point, "{}", stopped[0]);
-            assert_eq!(
-                last["stopped"], true,
-                "the stop's caller reads stopped: {last}"
-            );
-        } else {
-            run.release();
-            assert!(
-                poll_until(HANDOFF_STEP_WAIT, || events_named(
-                    &run.root,
-                    "workflow_shipped"
-                )
-                .len()
-                    == 1),
-                "control: without a stop the --yes-ship run ships: {}",
-                run.events()
-            );
-            assert!(
-                !branch_exists(&run.root, &branch),
-                "control: the after-ship hooks ran (the feature branch is cleaned up)"
-            );
-            assert!(events_named(&run.root, "advance_stopped").is_empty());
-        }
-    }
-
-    /// CR-01, safe point 5: a stop accepted after safe point 1 and before
-    /// `--yes-ship` writes its approval stops the run there. The pre-written
-    /// approval would otherwise beat the stop in the gate wait and let
-    /// finalization merge, bump, tag and push.
-    #[test]
-    fn a_stop_after_safe_point_1_is_honoured_before_the_yes_ship_approval() {
-        const NAME: &str = "pipeline_launch::tests::a_stop_after_safe_point_1_is_honoured_before_the_yes_ship_approval";
-        if !devflow_core::test_support::in_child_test(NAME) {
-            run_handoff_child(NAME, Some("after_safe_point_1"), SUCCESS_MARKER);
-            return;
-        }
-        held_yes_ship_advance(PhaseId::new(1314), true, 5);
-    }
-
-    /// The control for safe point 5: the same hold and no stop, and the
-    /// `--yes-ship` run ships.
-    #[test]
-    fn without_a_stop_after_safe_point_1_the_yes_ship_run_ships() {
-        const NAME: &str =
-            "pipeline_launch::tests::without_a_stop_after_safe_point_1_the_yes_ship_run_ships";
-        if !devflow_core::test_support::in_child_test(NAME) {
-            run_handoff_child(NAME, Some("after_safe_point_1"), SUCCESS_MARKER);
-            return;
-        }
-        held_yes_ship_advance(PhaseId::new(1315), false, 5);
-    }
-
-    /// CR-01, safe point 6: a stop accepted after the Ship gate was answered
-    /// and before finalization stops the run before the merge.
-    #[test]
-    fn a_stop_before_finalization_is_honoured_before_the_merge() {
-        const NAME: &str =
-            "pipeline_launch::tests::a_stop_before_finalization_is_honoured_before_the_merge";
-        if !devflow_core::test_support::in_child_test(NAME) {
-            run_handoff_child(NAME, Some("before_finalization"), SUCCESS_MARKER);
-            return;
-        }
-        held_yes_ship_advance(PhaseId::new(1316), true, 6);
-    }
-
-    /// The control for safe point 6: the same hold and no stop, and
-    /// finalization ships.
-    #[test]
-    fn without_a_stop_before_finalization_the_run_ships() {
-        const NAME: &str =
-            "pipeline_launch::tests::without_a_stop_before_finalization_the_run_ships";
-        if !devflow_core::test_support::in_child_test(NAME) {
-            run_handoff_child(NAME, Some("before_finalization"), SUCCESS_MARKER);
-            return;
-        }
-        held_yes_ship_advance(PhaseId::new(1317), false, 6);
     }
 
     /// R-10: a SIGKILL of N between N+1's publish and N's unlink (N parked
@@ -13213,7 +12198,7 @@ mod tests {
     /// (50.1-16): liveness lock adopted, no socket, no agent.
     const AGENT_SPAWN_HOLD_ENV: &str = "DEVFLOW_TEST_AGENT_SPAWN_HOLD";
 
-    /// The parent half of a test whose next supervisor (Plan) is held before its
+    /// The parent half of a test whose next supervisor (Code) is held before its
     /// agent spawn, on the advance-running monitor entry.
     fn run_spawn_held_handoff_child(name: &str) {
         let path_dir = handoff_claude_dir(SUCCESS_MARKER);
@@ -13222,7 +12207,7 @@ mod tests {
             .tempdir_in("/tmp")
             .unwrap();
         let hold = std::ffi::OsString::from(format!(
-            "plan:{}",
+            "code:{}",
             hold_dir.path().join("release").display()
         ));
         let env: Vec<(&str, &std::ffi::OsStr)> = vec![
@@ -13304,7 +12289,7 @@ mod tests {
         let state_file = workflow::state_path(&run.root, run.phase);
         let before = std::fs::read(&state_file).unwrap();
 
-        let result = resume(&run.root, run.phase, None, true);
+        let result = resume(&run.root, run.phase, None);
         // A resume that wrongly launched is ended before the assertions below fail.
         let after = run.state();
         let _reap = ReapMonitorOnDrop::after_launch(&after);
@@ -13580,7 +12565,7 @@ mod tests {
             "pipeline_launch::tests::a_next_stage_spawn_that_fails_clears_its_pending_record";
         if !devflow_core::test_support::in_child_test(NAME) {
             for case in ["socket_path", "no_publish"] {
-                let path_dir = go_waiting_claude_dir();
+                let path_dir = crate::test_support::go_waiting_agent_dir("codex");
                 let short = crate::test_support::hermetic_cache_dir();
                 let cache = if case == "socket_path" {
                     let long = short.path().join("c".repeat(80));
@@ -13610,13 +12595,7 @@ mod tests {
         let root = dir.path();
         init_repo(root);
         let phase = PhaseId::new(1706);
-        let mut state = State::new(
-            phase,
-            AgentKind::Claude,
-            Mode::Supervise,
-            root.to_path_buf(),
-        );
-        state.legacy_claude_launch = true;
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
         state.supervisor = Some(fabricated_prior_record(root));
         workflow::save_state(&state).unwrap();
 
@@ -13708,7 +12687,7 @@ mod tests {
             "nothing else holds the dead launcher's lock"
         );
 
-        let result = resume(&run.root, run.phase, None, true);
+        let result = resume(&run.root, run.phase, None);
         let after = run.state();
         let _reap = ReapMonitorOnDrop::after_launch(&after);
         result.expect("an abandoned reservation blocks nothing");
@@ -13833,7 +12812,7 @@ mod tests {
         use devflow_core::liveness::{self, Held};
         const NAME: &str = "pipeline_launch::tests::a_launched_supervisor_holds_its_liveness_lock_after_the_launcher_drops_it";
         if !devflow_core::test_support::in_child_test(NAME) {
-            let path_dir = go_waiting_claude_dir();
+            let path_dir = crate::test_support::go_waiting_agent_dir("codex");
             let output =
                 crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
@@ -13845,11 +12824,10 @@ mod tests {
         init_repo(root);
         let mut state = State::new(
             PhaseId::new(5007),
-            AgentKind::Claude,
+            AgentKind::Codex,
             Mode::Supervise,
             root.to_path_buf(),
         );
-        state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
 
         let result = launch_stage(&mut state, None, None);
@@ -13934,7 +12912,7 @@ mod tests {
             "pipeline_launch::tests::a_failed_monitor_spawn_clears_the_supervisor_record";
         if !devflow_core::test_support::in_child_test(NAME) {
             for case in ["fail", "ok"] {
-                let path_dir = go_waiting_claude_dir();
+                let path_dir = crate::test_support::go_waiting_agent_dir("codex");
                 let short = crate::test_support::hermetic_cache_dir();
                 let cache = if case == "fail" {
                     let long = short.path().join("c".repeat(80));
@@ -13964,13 +12942,7 @@ mod tests {
         let root = dir.path();
         init_repo(root);
         let phase = PhaseId::new(2301);
-        let mut state = State::new(
-            phase,
-            AgentKind::Claude,
-            Mode::Supervise,
-            root.to_path_buf(),
-        );
-        state.legacy_claude_launch = true;
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
         let prior = fabricated_prior_record(root);
         state.supervisor = Some(prior.clone());
         workflow::save_state(&state).unwrap();
@@ -14233,43 +13205,49 @@ mod tests {
         );
     }
 
-    /// Resume a stopped Code run of `phase` at `root` under Claude whose Code pass
-    /// was entered with `fix`, and return the argv the spawned `claude` received
-    /// and a reaper for its monitor. `legacy_claude_launch` puts the prompt in argv.
+    /// Resume a stopped Code run of `phase` at `root` under Codex whose Code pass
+    /// was entered with `fix`, and return the argv the spawned `codex` received
+    /// and a reaper for its monitor. Codex takes the prompt in argv.
     fn resume_code_run(
         root: &Path,
         phase: PhaseId,
         fix: Option<prompt::FixType>,
     ) -> (Vec<String>, ReapMonitorOnDrop) {
+        resume_code_run_with_note(root, phase, fix, None)
+    }
+
+    /// [`resume_code_run`] whose fix pass holds the rejection note `note` as
+    /// `code_fix_note` (GATE-01).
+    fn resume_code_run_with_note(
+        root: &Path,
+        phase: PhaseId,
+        fix: Option<prompt::FixType>,
+        note: Option<&str>,
+    ) -> (Vec<String>, ReapMonitorOnDrop) {
         init_repo(root);
-        let mut state = State::new(
-            phase,
-            AgentKind::Claude,
-            Mode::Supervise,
-            root.to_path_buf(),
-        );
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
+        state.verification_baseline_captured = true;
         state.stage = Stage::Code;
         state.code_fix = fix;
-        state.legacy_claude_launch = true;
+        state.code_fix_note = note.map(str::to_string);
         state.stopped = true;
         state.stop_reason = Some("rate limited".to_string());
         workflow::save_state(&state).unwrap();
 
-        let result = resume(root, phase, None, false);
+        let result = resume(root, phase, None);
         let reloaded = workflow::load_state(root, phase).unwrap();
         let reap = ReapMonitorOnDrop::after_launch(&reloaded);
         result.unwrap();
         assert_eq!(reloaded.code_fix, fix, "a resume keeps the fix pass");
-        (recorded_argv(root, "claude"), reap)
+        (recorded_argv(root, "codex"), reap)
     }
 
-    /// D-09: a `devflow resume` in the middle of an audit-fix pass (the cron arm's
-    /// later resume) relaunches that pass, asserted on the argv the spawned
-    /// `claude` received. Control: the same resume with no fix pass recorded
+    /// D-09: a `devflow resume` in the middle of a gaps-only pass relaunches that pass, asserted on the argv the spawned
+    /// `codex` received. Control: the same resume with no fix pass recorded
     /// delivers the plain execute-phase prompt.
     #[test]
-    fn a_resume_mid_audit_fix_replays_audit_fix() {
-        const NAME: &str = "pipeline_launch::tests::a_resume_mid_audit_fix_replays_audit_fix";
+    fn a_resume_mid_gaps_only_pass_replays_gaps_only() {
+        const NAME: &str = "pipeline_launch::tests::a_resume_mid_gaps_only_pass_replays_gaps_only";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = argv_recording_agents_dir();
             let output =
@@ -14278,18 +13256,24 @@ mod tests {
             return;
         }
         let _guard = env_lock();
-        let claude = agents::driver_for(AgentKind::Claude);
+        let codex = agents::driver_for(AgentKind::Codex);
         let code_prompt = |phase: PhaseId, fix: Option<prompt::FixType>| {
-            claude.render_prompt(&prompt::StageIntent::Code { phase, fix })
+            codex.render_prompt(&prompt::StageIntent::Code {
+                phase,
+                fix,
+                fix_note: None,
+                relaunch_note: None,
+                reverify_report: None,
+            })
         };
 
         let fix_dir = tempfile::tempdir().unwrap();
         let fix_phase = PhaseId::new(5173);
         let (argv, _reap_fix) =
-            resume_code_run(fix_dir.path(), fix_phase, Some(prompt::FixType::AuditFix));
+            resume_code_run(fix_dir.path(), fix_phase, Some(prompt::FixType::GapsOnly));
         assert!(
-            argv.contains(&code_prompt(fix_phase, Some(prompt::FixType::AuditFix))),
-            "the resumed agent receives the audit-fix pass: {argv:?}"
+            argv.contains(&code_prompt(fix_phase, Some(prompt::FixType::GapsOnly))),
+            "the resumed agent receives the gaps-only pass: {argv:?}"
         );
         assert!(
             !argv.contains(&code_prompt(fix_phase, None)),
@@ -14304,14 +13288,472 @@ mod tests {
             "control: a plain resume delivers execute-phase: {argv:?}"
         );
         assert!(
-            !argv.contains(&code_prompt(plain_phase, Some(prompt::FixType::AuditFix))),
+            !argv.contains(&code_prompt(plain_phase, Some(prompt::FixType::GapsOnly))),
             "control: a plain resume delivers no fix prompt: {argv:?}"
+        );
+    }
+
+    /// Resume a stopped Codex run of `phase` at `root` at `stage`, with the
+    /// gap-closure marker `gap_pass` and the fix pass `code_fix`, stopped as
+    /// `devflow stop` leaves it. Returns the argv the spawned `codex` received,
+    /// the state on disk after the resume and a reaper for its monitor.
+    fn resume_gap_pass_run(
+        root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        gap_pass: bool,
+        code_fix: Option<prompt::FixType>,
+    ) -> (Vec<String>, State, ReapMonitorOnDrop) {
+        init_repo(root);
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
+        state.verification_baseline_captured = true;
+        state.stage = stage;
+        state.gap_closure_pass = gap_pass;
+        state.code_fix = code_fix;
+        state.stopped = true;
+        state.stop_reason = Some("stopped by `devflow stop`".to_string());
+        workflow::save_state(&state).unwrap();
+
+        let result = resume(root, phase, None);
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        let reap = ReapMonitorOnDrop::after_launch(&reloaded);
+        result.unwrap();
+        (recorded_argv(root, "codex"), reloaded, reap)
+    }
+
+    /// Review C6 (GATE-03): a gaps Plan pass that was stopped and is resumed
+    /// relaunches as the gaps Plan pass (`plan-phase --gaps`), and the resume
+    /// keeps the gap-closure marker. Asserted on the argv the spawned `codex`
+    /// received. Control in the same test: the same stopped Plan without the
+    /// marker resumes an ordinary Plan prompt without `--gaps`.
+    #[test]
+    fn a_stopped_gaps_plan_pass_resumes_with_gaps() {
+        const NAME: &str = "pipeline_launch::tests::a_stopped_gaps_plan_pass_resumes_with_gaps";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = argv_recording_agents_dir();
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let _guard = env_lock();
+        let codex = agents::driver_for(AgentKind::Codex);
+
+        let gaps_dir = tempfile::tempdir().unwrap();
+        let gaps_phase = PhaseId::new(5271);
+        let (argv, reloaded, _reap_gaps) =
+            resume_gap_pass_run(gaps_dir.path(), gaps_phase, Stage::Plan, true, None);
+        let gaps_prompt = codex.render_prompt(&prompt::StageIntent::PlanGaps {
+            phase: gaps_phase,
+            relaunch_note: None,
+        });
+        assert!(
+            gaps_prompt.contains(&format!("plan-phase.md for phase {gaps_phase} --gaps")),
+            "the fixture's gaps Plan prompt runs plan-phase --gaps: {gaps_prompt}"
+        );
+        assert!(
+            argv.contains(&gaps_prompt),
+            "the resumed agent receives the gaps Plan pass: {argv:?}"
+        );
+        assert!(
+            reloaded.gap_closure_pass,
+            "the resume keeps the gap-closure marker"
+        );
+
+        // Control: no marker, an ordinary Plan without --gaps.
+        let plain_dir = tempfile::tempdir().unwrap();
+        let plain_phase = PhaseId::new(5272);
+        let (argv, reloaded, _reap_plain) =
+            resume_gap_pass_run(plain_dir.path(), plain_phase, Stage::Plan, false, None);
+        assert!(
+            argv.contains(
+                &codex.render_prompt(&prompt::StageIntent::for_stage(Stage::Plan, plain_phase))
+            ),
+            "control: a plain resume delivers the ordinary Plan prompt: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|arg| arg.contains("--gaps")),
+            "control: a plain resume does not run --gaps: {argv:?}"
+        );
+        assert!(!reloaded.gap_closure_pass, "control: no marker appears");
+    }
+
+    /// Review C6 (GATE-03): a gaps Code pass whose `code_fix` was cleared (as
+    /// an `--until code` halt leaves it; a stop keeps `code_fix`), resumed with
+    /// the gap-closure marker still set, relaunches the gaps-only execute and
+    /// not the full one: the gaps-only intent is derived from the marker.
+    /// Control in the same test: the same state without the marker resumes a
+    /// full execute.
+    #[test]
+    fn a_stopped_gaps_code_pass_resumes_with_gaps_only() {
+        const NAME: &str =
+            "pipeline_launch::tests::a_stopped_gaps_code_pass_resumes_with_gaps_only";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = argv_recording_agents_dir();
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let _guard = env_lock();
+        let codex = agents::driver_for(AgentKind::Codex);
+        let code_prompt = |phase: PhaseId, fix: Option<prompt::FixType>| {
+            codex.render_prompt(&prompt::StageIntent::Code {
+                phase,
+                fix,
+                fix_note: None,
+                relaunch_note: None,
+                reverify_report: None,
+            })
+        };
+
+        let gaps_dir = tempfile::tempdir().unwrap();
+        let gaps_phase = PhaseId::new(5273);
+        let (argv, reloaded, _reap_gaps) =
+            resume_gap_pass_run(gaps_dir.path(), gaps_phase, Stage::Code, true, None);
+        assert!(
+            argv.contains(&code_prompt(gaps_phase, Some(prompt::FixType::GapsOnly))),
+            "the resumed agent receives the gaps-only execute: {argv:?}"
+        );
+        assert!(
+            !argv.contains(&code_prompt(gaps_phase, None)),
+            "the resumed agent does not receive the full execute: {argv:?}"
+        );
+        assert!(reloaded.gap_closure_pass, "the resume keeps the marker");
+
+        // Control: no marker and no fix pass, a full execute.
+        let plain_dir = tempfile::tempdir().unwrap();
+        let plain_phase = PhaseId::new(5274);
+        let (argv, _reloaded, _reap_plain) =
+            resume_gap_pass_run(plain_dir.path(), plain_phase, Stage::Code, false, None);
+        assert!(
+            argv.contains(&code_prompt(plain_phase, None)),
+            "control: a plain resume delivers the full execute: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|arg| arg.contains("--gaps-only")),
+            "control: a plain resume runs no gaps-only pass: {argv:?}"
+        );
+    }
+
+    // ---- GATE-01: a replayed or relaunched pass keeps the operator's note ----
+
+    /// A fix-pass note with a newline, a tab, quotes and a backtick.
+    const FIX_NOTE_Q: &str =
+        "Q: fix the gaps in\tparse.rs,\nthen run \"cargo test\" and `cargo fmt`";
+
+    /// A relaunch note with a newline and a tab.
+    const RELAUNCH_NOTE_R: &str = "R: the stage failed on a flaky step;\n\tretry it once";
+
+    /// Whether some argument in `argv` holds `note` byte for byte.
+    fn argv_holds(argv: &[String], note: &str) -> bool {
+        argv.iter().any(|arg| arg.contains(note))
+    }
+
+    /// GATE-01 / D-14: a fix pass entered with a rejection note keeps that note
+    /// when it is replayed, through `devflow resume` and through the rate-limit
+    /// failover handoff; the assertion is on the argv the spawned `codex`
+    /// received. Control in the same test: the same replays of a fix pass with
+    /// no note carry no note block.
+    #[test]
+    fn a_replayed_fix_pass_keeps_the_note() {
+        const NAME: &str = "pipeline_launch::tests::a_replayed_fix_pass_keeps_the_note";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = argv_recording_agents_dir();
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let _guard = env_lock();
+        let gaps = Some(prompt::FixType::GapsOnly);
+
+        let resume_dir = tempfile::tempdir().unwrap();
+        let (argv, _reap_resume) = resume_code_run_with_note(
+            resume_dir.path(),
+            PhaseId::new(5290),
+            gaps,
+            Some(FIX_NOTE_Q),
+        );
+        assert!(
+            argv_holds(&argv, FIX_NOTE_Q),
+            "a resumed fix pass hands the agent its note: {argv:?}"
+        );
+        let reloaded = workflow::load_state(resume_dir.path(), PhaseId::new(5290)).unwrap();
+        assert_eq!(reloaded.code_fix_note.as_deref(), Some(FIX_NOTE_Q));
+
+        let failover_dir = tempfile::tempdir().unwrap();
+        let (argv, _reap_failover) = fail_over_from_code_with_note(
+            failover_dir.path(),
+            PhaseId::new(5291),
+            gaps,
+            Some(FIX_NOTE_Q),
+        );
+        assert!(
+            argv_holds(&argv, FIX_NOTE_Q),
+            "the fallback's replay of the fix pass carries the note: {argv:?}"
+        );
+
+        // Control: the same two replays of a fix pass with no note.
+        let plain_dir = tempfile::tempdir().unwrap();
+        let (argv, _reap_plain) =
+            resume_code_run_with_note(plain_dir.path(), PhaseId::new(5292), gaps, None);
+        assert!(
+            !argv.iter().any(|arg| arg.contains("OPERATOR NOTE")),
+            "control: no note, no block: {argv:?}"
+        );
+        let plain_failover_dir = tempfile::tempdir().unwrap();
+        let (argv, _reap_plain_failover) = fail_over_from_code_with_note(
+            plain_failover_dir.path(),
+            PhaseId::new(5293),
+            gaps,
+            None,
+        );
+        assert!(
+            !argv.iter().any(|arg| arg.contains("OPERATOR NOTE")),
+            "control: no note, no block: {argv:?}"
+        );
+    }
+
+    /// A supervise-mode Codex run of `phase` at `root` at `stage`, saved.
+    fn failing_stage_state(root: &Path, phase: PhaseId, stage: Stage) -> State {
+        init_repo(root);
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
+        state.verification_baseline_captured = true;
+        state.stage = stage;
+        workflow::save_state(&state).unwrap();
+        state
+    }
+
+    /// Fail `state`'s stage through `fail` (which opens its stage-failure gate),
+    /// with that gate pre-answered as a rejection carrying `note`. Returns the
+    /// state as it is on disk afterwards and a reaper for any launch.
+    fn reject_stage_failure(
+        root: &Path,
+        state: &mut State,
+        note: &str,
+        fail: impl FnOnce(&Path, &mut State) -> Result<(), CliError>,
+    ) -> (State, ReapMonitorOnDrop) {
+        preanswer_gate_response(
+            root,
+            state.phase,
+            state.stage,
+            &gate_response(false, Some(note)),
+        );
+        let result = fail(root, state);
+        let reloaded = workflow::load_state(root, state.phase).unwrap();
+        let reap = ReapMonitorOnDrop::after_launch(&reloaded);
+        result.unwrap();
+        (reloaded, reap)
+    }
+
+    /// GATE-01 / D-39 (U1): a rejected stage-failure gate relaunches its stage
+    /// with the reject's note in the prompt, through `relaunch_note`, at Plan,
+    /// at Code (an ordinary Code pass) and at Validate (opened by the infra
+    /// path). Rows: a Code fix pass with fix note Q fails and its gate is
+    /// rejected with R, and the relaunch holds Q under the fix request's
+    /// introduction, then R under the relaunch's, with `code_fix_note` still Q;
+    /// and a run whose recorded delivery canary refuses its agent, where the
+    /// reject launches nothing, stops the run naming `devflow resume`, and keeps
+    /// R on disk for that resume. Control: the stage's first launch prompt does
+    /// not hold the reject's note.
+    #[test]
+    fn a_rejected_stage_failure_relaunches_the_stage_with_the_note() {
+        const NAME: &str =
+            "pipeline_launch::tests::a_rejected_stage_failure_relaunches_the_stage_with_the_note";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = argv_recording_agents_dir();
+            let output = crate::test_support::run_hermetic_test_in_child(
+                NAME,
+                path_dir.path(),
+                &[("DEVFLOW_GATE_TIMEOUT_SECS", std::ffi::OsStr::new("20"))],
+            );
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let _guard = env_lock();
+        let codex = agents::driver_for(AgentKind::Codex);
+
+        for (number, stage, infra) in [
+            (5294, Stage::Plan, false),
+            (5295, Stage::Code, false),
+            (5296, Stage::Validate, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let phase = PhaseId::new(number);
+            let mut state = failing_stage_state(dir.path(), phase, stage);
+            let first_launch = default_stage_prompt(&state, codex.as_ref());
+            assert!(
+                !first_launch.contains(RELAUNCH_NOTE_R),
+                "control: {stage}'s first launch prompt holds no reject note"
+            );
+            let (reloaded, _reap) =
+                reject_stage_failure(dir.path(), &mut state, RELAUNCH_NOTE_R, |root, state| {
+                    if infra {
+                        crate::pipeline_outcomes::handle_infra_outcome(
+                            root,
+                            state,
+                            stage,
+                            Some("the agent was killed".into()),
+                        )
+                    } else {
+                        crate::pipeline_outcomes::handle_stage_failure(
+                            root,
+                            state,
+                            stage,
+                            Some("the stage failed".into()),
+                        )
+                    }
+                });
+            assert_eq!(reloaded.stage, stage, "{stage}: the same stage relaunches");
+            assert_eq!(
+                reloaded.relaunch_note.as_deref(),
+                Some(RELAUNCH_NOTE_R),
+                "{stage}: the reject's note is the relaunch note"
+            );
+            assert_eq!(
+                reloaded.code_fix_note, None,
+                "{stage}: a stage-failure note is never the fix request"
+            );
+            let argv = recorded_argv(dir.path(), "codex");
+            assert!(
+                argv_holds(&argv, RELAUNCH_NOTE_R),
+                "{stage}: the relaunched agent's prompt holds the note: {argv:?}"
+            );
+        }
+
+        // Q -> failure -> R: a Code fix pass fails and its gate is rejected.
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(5297);
+        let mut state = failing_stage_state(dir.path(), phase, Stage::Code);
+        commit(&mut state, |s| {
+            s.code_fix = Some(prompt::FixType::GapsOnly);
+            s.code_fix_note = Some(FIX_NOTE_Q.to_string());
+        })
+        .unwrap();
+        let (reloaded, _reap_fix) =
+            reject_stage_failure(dir.path(), &mut state, RELAUNCH_NOTE_R, |root, state| {
+                crate::pipeline_outcomes::handle_stage_failure(
+                    root,
+                    state,
+                    Stage::Code,
+                    Some("the fix pass failed".into()),
+                )
+            });
+        assert_eq!(
+            reloaded.code_fix_note.as_deref(),
+            Some(FIX_NOTE_Q),
+            "the fix request is kept"
+        );
+        assert_eq!(reloaded.relaunch_note.as_deref(), Some(RELAUNCH_NOTE_R));
+        let argv = recorded_argv(dir.path(), "codex");
+        let relaunched = argv
+            .iter()
+            .find(|arg| arg.contains(RELAUNCH_NOTE_R))
+            .unwrap_or_else(|| panic!("the relaunch holds R: {argv:?}"));
+        let at = |needle: &str| {
+            relaunched
+                .find(needle)
+                .unwrap_or_else(|| panic!("the relaunch lacks {needle:?}:\n{relaunched}"))
+        };
+        assert!(
+            at(prompt::FIX_NOTE_INTRODUCTION) < at(FIX_NOTE_Q)
+                && at(FIX_NOTE_Q) < at(prompt::RELAUNCH_NOTE_INTRODUCTION)
+                && at(prompt::RELAUNCH_NOTE_INTRODUCTION) < at(RELAUNCH_NOTE_R),
+            "Q under the fix request's introduction, then R under the relaunch's:\n{relaunched}"
+        );
+
+        // 52-29 (U1), the `Quick` row: a quick pass carrying Q fails and its
+        // gate is rejected with R through `reject_route`. The relaunch runs
+        // `/gsd-quick` with Q under the fix request's introduction and R under
+        // the relaunch's, and Q is still the fix note on disk.
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(5299);
+        let mut state = failing_stage_state(dir.path(), phase, Stage::Code);
+        commit(&mut state, |s| {
+            s.code_fix = Some(prompt::FixType::Quick);
+            s.code_fix_note = Some(FIX_NOTE_Q.to_string());
+        })
+        .unwrap();
+        let (reloaded, _reap_quick) =
+            reject_stage_failure(dir.path(), &mut state, RELAUNCH_NOTE_R, |root, state| {
+                crate::pipeline_outcomes::handle_stage_failure(
+                    root,
+                    state,
+                    Stage::Code,
+                    Some("the quick pass failed".into()),
+                )
+            });
+        assert_eq!(
+            reloaded.code_fix,
+            Some(prompt::FixType::Quick),
+            "quick: kept"
+        );
+        assert_eq!(
+            reloaded.code_fix_note.as_deref(),
+            Some(FIX_NOTE_Q),
+            "quick: the pending quick-fix note is kept byte for byte"
+        );
+        let argv = recorded_argv(dir.path(), "codex");
+        let relaunched = argv
+            .iter()
+            .find(|arg| arg.contains(RELAUNCH_NOTE_R))
+            .unwrap_or_else(|| panic!("quick: the relaunch holds R: {argv:?}"));
+        let at = |needle: &str| {
+            relaunched
+                .find(needle)
+                .unwrap_or_else(|| panic!("quick: the relaunch lacks {needle:?}:\n{relaunched}"))
+        };
+        assert!(
+            at("/gsd-quick") < at(prompt::FIX_NOTE_INTRODUCTION)
+                && at(prompt::FIX_NOTE_INTRODUCTION) < at(FIX_NOTE_Q)
+                && at(FIX_NOTE_Q) < at(prompt::RELAUNCH_NOTE_INTRODUCTION)
+                && at(prompt::RELAUNCH_NOTE_INTRODUCTION) < at(RELAUNCH_NOTE_R),
+            "quick: `/gsd-quick`, Q under the fix request, then R:\n{relaunched}"
+        );
+
+        // A run whose recorded delivery canary refuses its agent.
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(5298);
+        init_repo(dir.path());
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Supervise, dir.path().into());
+        state.verification_baseline_captured = true;
+        state.stage = Stage::Code;
+        state.canary = Some(canary::CanaryOutcome::Absent);
+        workflow::save_state(&state).unwrap();
+        assert!(
+            recorded_canary_refusal(&state).is_some(),
+            "the canary refuses Claude"
+        );
+        let (reloaded, _reap_canary) =
+            reject_stage_failure(dir.path(), &mut state, RELAUNCH_NOTE_R, |root, state| {
+                crate::pipeline_outcomes::handle_stage_failure(
+                    root,
+                    state,
+                    Stage::Code,
+                    Some("the stage failed".into()),
+                )
+            });
+        assert!(
+            !dir.path().join("claude-argv.done").exists(),
+            "a refused relaunch launches nothing"
+        );
+        assert!(reloaded.stopped, "the refused relaunch stops the run");
+        let reason = reloaded.stop_reason.clone().unwrap_or_default();
+        assert!(
+            reason.contains(&format!("devflow resume --phase {phase} --agent <other>")),
+            "the stop names the resume: {reason}"
+        );
+        assert_eq!(
+            reloaded.relaunch_note.as_deref(),
+            Some(RELAUNCH_NOTE_R),
+            "the note is kept for that resume"
         );
     }
 
     // ---- 51-07: one place renders a no-override stage prompt (D-09, review B-1) ----
 
-    const DEFAULT_RENDER_NEEDLE: &str = concat!("for_stage_in_", "project(");
+    const DEFAULT_RENDER_NEEDLE: &str = concat!("StageIntent::for_", "stage(");
     const DEFAULT_RENDER_NOT_ONCE: &str =
         "a default intent is built more than once (or never) in the non-test code";
     const DEFAULT_RENDER_OUTSIDE: &str = "a default intent is built outside default_stage_prompt";
@@ -14391,8 +13833,7 @@ mod tests {
     /// path. Planted sources first, each carrying one defect, then the real file.
     #[test]
     fn every_no_override_launch_renders_through_default_stage_prompt() {
-        let render =
-            format!("    driver.render_prompt(&StageIntent::{DEFAULT_RENDER_NEEDLE}..));\n");
+        let render = format!("    driver.render_prompt(&{DEFAULT_RENDER_NEEDLE}..));\n");
         let default_fn =
             format!("fn default_stage_prompt(state: &State) -> String {{\n{render}}}\n");
         let caller = |header: &str, body: &str| format!("{header}\n{body}}}\n");
@@ -14467,8 +13908,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().to_path_buf();
             init_repo(&root);
-            let mut state = State::new(phase, AgentKind::Claude, Mode::Supervise, root.clone());
-            state.legacy_claude_launch = true;
+            let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.clone());
             let prior = fabricated_prior_record(&root);
             state.supervisor = Some(prior.clone());
             workflow::save_state(&state).unwrap();
@@ -14480,7 +13920,7 @@ mod tests {
             workflow::save_state(&state).unwrap();
             let published = monitor::spawn_monitor(
                 &state,
-                "claude",
+                "codex",
                 &[],
                 &[],
                 monitor::MonitorLaunch::Legacy,
@@ -14541,7 +13981,7 @@ mod tests {
     /// The parent half of a publish-save test: a child on the supervise-only
     /// entry whose fake agent waits for `go` in its working directory.
     fn run_publish_child(name: &str) {
-        let path_dir = go_waiting_claude_dir();
+        let path_dir = crate::test_support::go_waiting_agent_dir("codex");
         let output = run_hermetic_test_in_child(name, path_dir.path(), &[]);
         devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, name);
     }
@@ -14857,7 +14297,7 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), before, "no state write");
         assert_eq!(stage_launched_count(&run.root, run.phase), 1, "no launch");
         assert!(
-            !Gates::gate_path(&run.root, run.phase, Stage::Define).exists(),
+            !Gates::gate_path(&run.root, run.phase, Stage::Plan).exists(),
             "no gate opened: {}",
             run.events()
         );
@@ -14872,21 +14312,22 @@ mod tests {
         supersede(&gated.root, gated.phase, X);
         let path = workflow::state_path(&gated.root, gated.phase);
         let before = std::fs::read(&path).unwrap();
-        let gate_path = Gates::gate_path(&gated.root, gated.phase, Stage::Define);
+        let gate_path = Gates::gate_path(&gated.root, gated.phase, Stage::Plan);
         let gate_bytes = std::fs::read(&gate_path).unwrap();
-        let gate = gate_id_at(&gated.root, gated.phase, Stage::Define);
+        let gate = gate_id_at(&gated.root, gated.phase, Stage::Plan);
         answer_open_gate(
             &gated.root,
             gated.phase,
-            Stage::Define,
+            Stage::Plan,
             &devflow_core::gates::GateResponse {
                 approved: true,
+                abort: false,
                 note: None,
                 responded_by: Some("test".to_string()),
             },
         )
         .unwrap();
-        let answer = Gates::answer_path(&gated.root, gated.phase, Stage::Define, &gate);
+        let answer = Gates::answer_path(&gated.root, gated.phase, Stage::Plan, &gate);
         let answer_bytes = std::fs::read(&answer).unwrap();
         assert!(
             poll_until(HANDOFF_STEP_WAIT, || probes_gone(&gated.n.socket_path)),
@@ -14895,7 +14336,7 @@ mod tests {
         );
         assert_eq!(std::fs::read(&path).unwrap(), before, "no state write");
         assert!(
-            !Gates::claim_path(&gated.root, gated.phase, Stage::Define, &gate).exists(),
+            !Gates::claim_path(&gated.root, gated.phase, Stage::Plan, &gate).exists(),
             "no claim"
         );
         assert_eq!(std::fs::read(&gate_path).unwrap(), gate_bytes, "gate stays");
@@ -14976,58 +14417,6 @@ mod tests {
         superseded_event(&run, X, "superseded");
     }
 
-    /// D-03: a hook can merge, bump, tag and push, so a supervisor the state no longer
-    /// records does not start one. Superseded at the last hold before finalization, it
-    /// ships nothing and keeps the feature branch.
-    #[test]
-    fn a_superseded_supervisor_runs_no_finalization_hooks() {
-        const NAME: &str =
-            "pipeline_launch::tests::a_superseded_supervisor_runs_no_finalization_hooks";
-        if !devflow_core::test_support::in_child_test(NAME) {
-            run_handoff_child(NAME, Some("before_finalization"), SUCCESS_MARKER);
-            return;
-        }
-        let _guard = env_lock();
-        const X: &str = "aaaa0000aaaa1915";
-        let phase = PhaseId::new(1915);
-        let branch = format!("feature/phase-{}", phase.padded());
-        let run = HandoffRun::launch_with(phase, |root, state| {
-            assert!(
-                devflow_core::test_support::git_command(root)
-                    .args(["branch", &branch, "develop"])
-                    .status()
-                    .unwrap()
-                    .success()
-            );
-            state.stage = Stage::Ship;
-            state.yes_ship = true;
-            state.stop_until = None;
-        });
-        run.go();
-        run.wait_held();
-        supersede(&run.root, run.phase, X);
-        let path = workflow::state_path(&run.root, run.phase);
-        let before = std::fs::read(&path).unwrap();
-        run.release();
-        assert!(
-            poll_until(HANDOFF_STEP_WAIT, || probes_gone(&run.n.socket_path)),
-            "it exits: {}",
-            run.events()
-        );
-        assert!(
-            branch_exists(&run.root, &branch),
-            "no after-ship hook ran: the feature branch is kept: {}",
-            run.events()
-        );
-        assert!(
-            events_named(&run.root, "workflow_shipped").is_empty(),
-            "{}",
-            run.events()
-        );
-        assert_eq!(std::fs::read(&path).unwrap(), before, "no state write");
-        superseded_event(&run, X, "superseded");
-    }
-
     /// V-23's control: the same run with no rewrite writes, opens its gate, claims the
     /// answer and logs no refusal.
     #[test]
@@ -15043,7 +14432,7 @@ mod tests {
         run.go();
         run.wait_held();
         run.release();
-        let gate_path = Gates::gate_path(&run.root, run.phase, Stage::Define);
+        let gate_path = Gates::gate_path(&run.root, run.phase, Stage::Plan);
         assert!(
             poll_until(HANDOFF_STEP_WAIT, || gate_path.exists()),
             "control: the recorded supervisor opens its gate: {}",
@@ -15053,9 +14442,10 @@ mod tests {
         answer_open_gate(
             &run.root,
             run.phase,
-            Stage::Define,
+            Stage::Plan,
             &devflow_core::gates::GateResponse {
                 approved: false,
+                abort: true,
                 note: Some("abort: control answer".to_string()),
                 responded_by: Some("test".to_string()),
             },
@@ -15109,14 +14499,22 @@ mod tests {
         let _guard = env_lock();
         const X: &str = "aaaa0000aaaa1905";
         let run = launch_parked_at_gate(PhaseId::new(1905));
-        let (root, phase, stage) = (run.root.clone(), run.phase, Stage::Define);
+        let (root, phase, stage) = (run.root.clone(), run.phase, Stage::Plan);
         let g1 = gate_id_at(&root, phase, stage);
         supersede(&root, phase, X);
 
-        let (opened, registration) = Gates::open_registered(&root, phase, stage, "g2").unwrap();
+        let (opened, registration) = Gates::open_registered(
+            &root,
+            phase,
+            stage,
+            devflow_core::gates::GateKind::StageFailure,
+            "g2",
+        )
+        .unwrap();
         let g2 = opened.gate_id.clone();
         let response = devflow_core::gates::GateResponse {
             approved: true,
+            abort: false,
             note: None,
             responded_by: Some("test".to_string()),
         };
@@ -15274,7 +14672,7 @@ mod tests {
             "N+1 stays only pending"
         );
 
-        let resumed = resume(&run.root, run.phase, None, true);
+        let resumed = resume(&run.root, run.phase, None);
         let state = run.state();
         let _reap = ReapMonitorOnDrop::after_launch(&state);
         resumed.expect("resume clears the abandoned reservation and proceeds");
@@ -16649,7 +16047,7 @@ mod tests {
         let bytes_before = std::fs::read(&path).unwrap();
         let inode_before = std::fs::metadata(&path).unwrap().ino();
 
-        let err = advance_with(root, phase, Some(Stage::Define))
+        let err = advance_with(root, phase, Some(Stage::Plan))
             .expect_err("the stage mismatch fails the advance before any later write");
         assert!(err.to_string().contains("stage mismatch"), "{err}");
 
@@ -16678,34 +16076,27 @@ mod tests {
     fn resume_commits_its_unstop_and_keeps_a_concurrent_field() {
         const NAME: &str =
             "pipeline_launch::tests::resume_commits_its_unstop_and_keeps_a_concurrent_field";
-        enter_agent_free_child!(NAME, "claude");
+        enter_agent_free_child!(NAME, "codex");
         let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
         let phase = PhaseId::new(2405);
-        let mut state = State::new(
-            phase,
-            AgentKind::Claude,
-            Mode::Supervise,
-            root.to_path_buf(),
-        );
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
+        state.verification_baseline_captured = true;
         state.stage = Stage::Code;
-        // The capture shape: no delivery canary.
-        state.legacy_claude_launch = true;
         state.stopped = true;
         state.stop_reason = Some("stopped after code completed (--until code)".to_string());
         state.stop_until = Some(Stage::Code);
-        state.yes_ship = true;
         workflow::save_state(&state).unwrap();
         workflow::update_state(root, phase, |on_disk| {
-            on_disk.yes_ship = false;
+            on_disk.base_branch = Some("workspace/concurrent".to_string());
             Ok::<(), workflow::WorkflowError>(())
         })
         .unwrap();
 
-        let result = resume_loaded(root, phase, state, None, false, None);
+        let result = resume_loaded(root, phase, state, None, None);
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -16713,7 +16104,11 @@ mod tests {
         result.unwrap();
 
         let after = workflow::load_state(root, phase).unwrap();
-        assert!(!after.yes_ship, "the revoke survives the resume");
+        assert_eq!(
+            after.base_branch.as_deref(),
+            Some("workspace/concurrent"),
+            "the other writer's change survives the resume"
+        );
         assert!(!after.stopped);
         assert_eq!(after.stop_reason, None);
         assert_eq!(after.stop_until, None);
@@ -17168,10 +16563,6 @@ mod tests {
             "a failed relaunch never takes the cron arm (R2-D1); events:\n{}",
             run.events()
         );
-        assert!(
-            !devflow_core::ship::cron_instructions_path(&run.root, run.phase).exists(),
-            "a failed relaunch writes no cron instruction (R2-D1)"
-        );
         assert_eq!(
             run.other_sockets(),
             Vec::<PathBuf>::new(),
@@ -17265,18 +16656,13 @@ mod tests {
         parent.join("supervisor.sock")
     }
 
-    /// A Code-stage run of `phase` under Claude on the capture shape, in a fresh repo at
+    /// A Code-stage run of `phase` under Codex (the capture shape), in a fresh repo at
     /// `root`, whose state records a supervisor at `socket`.
     fn code_run_recording(root: &Path, phase: PhaseId, socket: &Path) -> State {
         init_repo(root);
-        let mut state = State::new(
-            phase,
-            AgentKind::Claude,
-            Mode::Supervise,
-            root.to_path_buf(),
-        );
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
+        state.verification_baseline_captured = true;
         state.stage = Stage::Code;
-        state.legacy_claude_launch = true;
         state.supervisor = Some(devflow_core::state::SupervisorRecord::new(
             socket.to_path_buf(),
             "18e5e63a18d5674f".to_string(),
@@ -17287,17 +16673,13 @@ mod tests {
         state
     }
 
-    /// The state the rate-limit cron arm leaves: not stopped, one infra fault
-    /// charged, a cron instruction to `devflow resume` it.
-    fn save_rate_limit_paused(root: &Path, mut state: State) {
+    /// The state the 3.x rate-limit cron arm left for a later `devflow resume`:
+    /// not stopped, one infra fault charged. The arm and its record are gone
+    /// (D-01); a run left in this state by an older binary still resumes, so the
+    /// refusal tests keep it as a fixture.
+    fn save_rate_limit_paused(_root: &Path, mut state: State) {
         state.infra_failures = 1;
         workflow::save_state(&state).unwrap();
-        let record = devflow_core::ship::build_single_agent_cron_instructions(
-            root,
-            state.phase,
-            "2026-06-18T15:45:30Z",
-        );
-        devflow_core::ship::write_cron_instructions(root, &record).unwrap();
     }
 
     /// D-12 (the cron arm's recorded-socket read, withheld), with its
@@ -17328,7 +16710,7 @@ mod tests {
             let root = dir.path();
             save(root, code_run_recording(root, phase, &socket));
             let before = std::fs::read(workflow::state_path(root, phase)).unwrap();
-            let result = resume(root, phase, None, false);
+            let result = resume(root, phase, None);
             let err = match result {
                 Err(err) => err.to_string(),
                 Ok(()) => panic!("phase {phase}: resume over an unprobeable record launched"),
@@ -17368,7 +16750,7 @@ mod tests {
         let root = dir.path();
         let gone = sockets.path().join("gone.sock");
         save_rate_limit_paused(root, code_run_recording(root, baseline, &gone));
-        let result = resume(root, baseline, None, false);
+        let result = resume(root, baseline, None);
         let reloaded_for_reap = workflow::load_state(root, baseline).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -18249,10 +17631,6 @@ mod tests {
                 run.events()
             );
         }
-        assert!(
-            !devflow_core::ship::cron_instructions_path(&run.root, run.phase).exists(),
-            "no cron instruction"
-        );
         std::fs::write(run.root.join("go-fallback"), "").unwrap();
     }
 
@@ -18588,10 +17966,6 @@ mod tests {
             "a failed relaunch never takes the cron arm (R2-D1); events:\n{}",
             run.events()
         );
-        assert!(
-            !devflow_core::ship::cron_instructions_path(&run.root, run.phase).exists(),
-            "a failed relaunch writes no cron instruction (R2-D1)"
-        );
         let state = run.state();
         assert_eq!(state.agent, AgentKind::Codex);
         assert!(state.fallback_consumed);
@@ -18653,7 +18027,7 @@ mod tests {
         save(root, state);
         plant(root);
         let before = std::fs::read(workflow::state_path(root, phase)).unwrap();
-        let err = match resume(root, phase, None, false) {
+        let err = match resume(root, phase, None) {
             Err(err) => err.to_string(),
             Ok(()) => panic!("phase {phase}: resume over an unprobeable lock launched"),
         };
@@ -18680,7 +18054,7 @@ mod tests {
         let root = dir.path();
         let state = state(root);
         save_rate_limit_paused(root, state);
-        let result = resume(root, phase, None, false);
+        let result = resume(root, phase, None);
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -18827,6 +18201,250 @@ mod tests {
             baseline,
             |root| with_pending(root, baseline, &missing),
             &gone,
+        );
+    }
+
+    // ---- 52-32: resume and takeover decide arming the same way ----
+
+    /// A `claude` stub that prints a rate-limit envelope whose retry time is long
+    /// past, so an armed timer would answer the gate at once.
+    fn past_reset_claude_script() -> String {
+        "#!/bin/sh\ncase \"$1\" in --version) exit 0 ;; esac\n\
+         printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"error_rate_limit\",\"retry_after\":\"1700000000\"}'\n\
+         exit 0\n"
+            .to_string()
+    }
+
+    /// Run `name` in a hermetic child whose `PATH` holds [`past_reset_claude_script`]
+    /// as `claude`, with the monitor's full advance on and a 20 s gate timeout so
+    /// no waiting supervisor outlives the test by long. `true` in the parent,
+    /// whose work is done.
+    fn parent_of_a_past_reset_claude_child(name: &str) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        if devflow_core::test_support::in_child_test(name) {
+            return false;
+        }
+        let path_dir = agent_free_dir_with_agent_stub("claude");
+        let stub = path_dir.path().join("claude");
+        std::fs::write(&stub, past_reset_claude_script()).unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let output = crate::test_support::run_hermetic_test_in_child(
+            name,
+            path_dir.path(),
+            &[
+                (TEST_MONITOR_FULL_ENV, std::ffi::OsStr::new("1")),
+                ("DEVFLOW_GATE_TIMEOUT_SECS", std::ffi::OsStr::new("20")),
+            ],
+        );
+        devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, name);
+        true
+    }
+
+    /// A Code-stage Claude run of `phase` at `root`, Supervise, with a recorded
+    /// `Confirmed` canary and `used` as its automatic-relaunch flag, saved.
+    fn save_rate_limit_run(root: &Path, phase: PhaseId, used: bool) -> State {
+        init_repo(root);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.verification_baseline_captured = true;
+        state.stage = Stage::Code;
+        state.canary = Some(canary::CanaryOutcome::Confirmed);
+        state.rate_limit_auto_relaunch_used = used;
+        workflow::save_state(&state).unwrap();
+        state
+    }
+
+    /// The phase's open Code gate file, once it exists (bounded).
+    fn the_open_code_gate(root: &Path, phase: PhaseId) -> devflow_core::gates::GateFile {
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || {
+                crate::pipeline_gate::read_gate_file(root, phase, Stage::Code).is_some()
+            }),
+            "no Code gate opened; events:\n{}",
+            std::fs::read_to_string(devflow_core::events::events_path(root)).unwrap_or_default()
+        );
+        crate::pipeline_gate::read_gate_file(root, phase, Stage::Code).unwrap()
+    }
+
+    /// How long a row watches for a timer that must not fire.
+    const NO_TIMER_WITHIN: Duration = Duration::from_secs(3);
+
+    /// Assert the run at `root` waits at a rate-limit gate with its not-before
+    /// time recorded and no timer: the arming function says so over the state
+    /// and gate on disk, and over a bounded wait the timer never fires and
+    /// nothing launches beyond `launches`.
+    fn assert_waits_with_no_timer(root: &Path, phase: PhaseId, launches: usize, row: &str) {
+        let gate = the_open_code_gate(root, phase);
+        assert_eq!(
+            gate.gate_kind,
+            Some(devflow_core::gates::GateKind::RateLimit),
+            "{row}: {gate:?}"
+        );
+        assert!(gate.not_before.is_some(), "{row}: not_before is recorded");
+        std::thread::sleep(NO_TIMER_WITHIN);
+        let state = workflow::load_state(root, phase).unwrap();
+        assert!(
+            state.rate_limit_auto_relaunch_used,
+            "{row}: the flag stays spent"
+        );
+        assert_eq!(
+            crate::pipeline_gate::rate_limit_timer_deadline(&state, &gate),
+            None,
+            "{row}: no timer is armed"
+        );
+        assert!(
+            events_named(root, "rate_limit_timer_fired").is_empty(),
+            "{row}: the timer never fired"
+        );
+        assert!(
+            events_named(root, "gate_resolved").is_empty(),
+            "{row}: nothing answered the gate"
+        );
+        assert_eq!(stage_launched_count(root, phase), launches, "{row}");
+        assert!(
+            crate::pipeline_gate::read_gate_file(root, phase, Stage::Code).is_some(),
+            "{row}: the gate is still open"
+        );
+    }
+
+    /// Wait, bounded, until the timer has answered `root`'s gate.
+    fn assert_the_timer_answers(root: &Path, row: &str) {
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || {
+                events_named(root, "rate_limit_timer_fired")
+                    .iter()
+                    .any(|event| event["outcome"] == "answered")
+            }),
+            "{row}: the armed timer never answered; events:\n{}",
+            std::fs::read_to_string(devflow_core::events::events_path(root)).unwrap_or_default()
+        );
+    }
+
+    /// D-27.3 / D-38: a resume after the automatic relaunch was used does not
+    /// re-arm it: the denied relaunch opens the gate with its not-before time
+    /// and no timer. The same after a stop (`stopped` with a reason, as `devflow
+    /// stop` leaves it) and then a resume. Control: the same resume over a run
+    /// whose flag is still false arms the timer, which answers the gate.
+    #[test]
+    fn resume_does_not_rearm_the_auto_relaunch() {
+        const NAME: &str = "pipeline_launch::tests::resume_does_not_rearm_the_auto_relaunch";
+        if parent_of_a_past_reset_claude_child(NAME) {
+            return;
+        }
+        let _guard = env_lock();
+        for (offset, (stopped, used)) in [(false, true), (true, true), (false, false)]
+            .into_iter()
+            .enumerate()
+        {
+            let row = format!("stopped {stopped}, flag used {used}");
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = PhaseId::new(5160 + u32::try_from(offset).unwrap());
+            let mut state = save_rate_limit_run(root, phase, used);
+            if stopped {
+                state.stopped = true;
+                state.stop_reason = Some("stopped by devflow stop".to_string());
+                workflow::save_state(&state).unwrap();
+            }
+            let result = resume(root, phase, None);
+            let reloaded_for_reap = workflow::load_state(root, phase).ok();
+            let _reap_guard = reloaded_for_reap
+                .as_ref()
+                .map(ReapMonitorOnDrop::after_launch);
+            result.unwrap();
+            if used {
+                assert_waits_with_no_timer(root, phase, 1, &row);
+            } else {
+                assert_the_timer_answers(root, &row);
+                let relaunched = workflow::load_state(root, phase).ok();
+                let _relaunch_reap = relaunched.as_ref().map(ReapMonitorOnDrop::after_launch);
+            }
+        }
+    }
+
+    /// D-27.3 / D-38 / D-45 rule 5: a supervisor that takes over a run whose
+    /// automatic relaunch was used finds the flag spent in the state on disk, the
+    /// only thing a takeover inherits, and arms nothing when its stage is denied
+    /// again. Crash row: the state a crash right after the flag commit leaves
+    /// (flag spent, the rate-limit gate open, no answer on it): the arming
+    /// function arms nothing over it, and over a bounded wait no answer is
+    /// written and nothing launches, while the gate still names `devflow resume`.
+    /// Controls: the same launch over a state whose flag is false arms the timer,
+    /// and the arming function arms the crash row's gate over an unspent flag.
+    #[test]
+    fn a_takeover_does_not_rearm_the_auto_relaunch() {
+        const NAME: &str = "pipeline_launch::tests::a_takeover_does_not_rearm_the_auto_relaunch";
+        if parent_of_a_past_reset_claude_child(NAME) {
+            return;
+        }
+        let _guard = env_lock();
+        for (offset, used) in [(0u32, true), (1, false)] {
+            let row = format!("takeover, flag used {used}");
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = PhaseId::new(5170 + offset);
+            let mut state = save_rate_limit_run(root, phase, used);
+            // As a takeover would: a supervisor that never set the flag is
+            // recorded, and it reads the flag from disk.
+            let launched = launch_stage(&mut state, None, None);
+            let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
+            launched.unwrap();
+            if used {
+                assert_waits_with_no_timer(root, phase, 1, &row);
+            } else {
+                assert_the_timer_answers(root, &row);
+                let relaunched = workflow::load_state(root, phase).ok();
+                let _relaunch_reap = relaunched.as_ref().map(ReapMonitorOnDrop::after_launch);
+            }
+        }
+
+        // The crash row: no process is waiting, the flag is spent and the gate open.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5172);
+        let state = save_rate_limit_run(root, phase, true);
+        Gates::open_gate(
+            root,
+            phase,
+            Stage::Code,
+            devflow_core::gates::GateLabel::rate_limit(Some(1_700_000_000)),
+            "[never-silent] stage code failed: rate limited with no usable fallback; once this \
+             waiting supervisor has ended, `devflow resume --phase 5172` relaunches the stage",
+        )
+        .unwrap();
+        let gate = crate::pipeline_gate::read_gate_file(root, phase, Stage::Code).unwrap();
+        assert_eq!(
+            crate::pipeline_gate::rate_limit_timer_deadline(&state, &gate),
+            None,
+            "crash row: a spent flag arms nothing"
+        );
+        std::thread::sleep(NO_TIMER_WITHIN);
+        assert!(
+            gate_answer_files(root, phase, Stage::Code).is_empty(),
+            "crash row: no answer was written"
+        );
+        assert_eq!(
+            stage_launched_count(root, phase),
+            0,
+            "crash row: nothing launched"
+        );
+        let still = crate::pipeline_gate::read_gate_file(root, phase, Stage::Code)
+            .expect("crash row: the gate is still open");
+        assert!(
+            still.context.contains("devflow resume --phase 5172"),
+            "crash row: the gate still names the resume command: {}",
+            still.context
+        );
+        let mut unspent = state.clone();
+        unspent.rate_limit_auto_relaunch_used = false;
+        assert_eq!(
+            crate::pipeline_gate::rate_limit_timer_deadline(&unspent, &gate),
+            gate.not_before,
+            "control: the same gate over an unspent flag is armed"
         );
     }
 }

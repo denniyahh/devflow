@@ -6,7 +6,6 @@ reliability knobs.
 
 ```toml
 capture_retention = 5
-review_angles = ["doc accuracy", "security", "CI correctness", "external state"]
 external_verify_enabled = true
 fallback_agent = "antigravity"   # optional: the rate-limit fallback for the Code stage
 ```
@@ -14,8 +13,7 @@ fallback_agent = "antigravity"   # optional: the rate-limit fallback for the Cod
 `fallback_agent` is armed by `devflow start` only, as the run's one-hop
 Code-stage fallback when `--fallback-agent` is not given; the flag overrides
 its value, `devflow resume` does not read it, and no environment variable sets
-it. `devflow parallel` arms no fallback: it prints a note naming a configured
-key as not armed, and refuses a key that names no agent. A key that names no agent, or a `devflow.toml` that does not
+it. A key that names no agent, or a `devflow.toml` that does not
 parse, still refuses `devflow start` even when `--fallback-agent` is given. See
 OPERATIONS.md's rate-limit failover section for what the fallback does.
 
@@ -25,8 +23,8 @@ OPERATIONS.md's rate-limit failover section for what the fallback does.
 |---|---|
 | `--phase N` | Phase number to execute |
 | `--agent claude\|codex\|opencode\|pi` | Agent to launch |
-| `--mode auto\|supervise` | `auto` advances through Ship unattended (gating only at Ship, plus never-silent failure gates); `supervise` also gates every Validate for human review |
-| `--force` | Overwrite the feature branch if it already exists |
+| `--mode auto\|supervise` | `auto` runs unattended and finishes on a passing Validate (gating only on repeated Validate failure, plus never-silent failure gates); `supervise` also gates every Validate for human review |
+| `--force` | Recreate the phase worktree and feature branch from the base if they exist; refused, with nothing removed, while the branch has commits not merged into the base |
 | `--no-worktree` | Run directly in the primary checkout instead of an isolated worktree (worktree is the default) |
 | `--dry-run` | Print the pipeline that would run without launching anything |
 
@@ -44,13 +42,10 @@ environment variables, not config file fields:
 | `DEVFLOW_GATE_NOTIFY_CMD` | unset | Shell command fired when a gate is written (e.g. an `ntfy.sh`/desktop-notification call). Saved per run by `start`/`resume`/`advance`; empty turns it off for the run (see OPERATIONS.md) |
 | `DEVFLOW_GATE_TIMEOUT_SECS` | 259200 (3 days) | How long a supervisor waits at a gate, registered as its waiter and holding no lock. Not a deadline for answering — the gate file never expires. Past the timeout the run ends at that gate, and `devflow resume` reruns the stage and asks again, setting any unused answer aside |
 | `DEVFLOW_GATE_MAX_UNATTENDED_AGE_SECS` | 259200 (3 days) | Age threshold `devflow gate sweep` uses to call a gate abandoned. Held equal to `DEVFLOW_GATE_TIMEOUT_SECS`, never shorter |
-| `DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS` | 60 | How long `devflow ship --phase`'s foreground manual override waits for a reopened Ship gate before failing fast, instead of `DEVFLOW_GATE_TIMEOUT_SECS`'s multi-day default |
-| `DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS` | 120 | How long to wait on the shared-checkout lock before skipping the hook batch rather than running it unserialized |
 | `DEVFLOW_CAPTURE_RETENTION` | 5 | Override capture generations retained per phase |
-| `DEVFLOW_REVIEW_ANGLES` | built-in list | Override Ship review angles with a comma-separated list |
 | `DEVFLOW_EXTERNAL_VERIFY_ENABLED` | true | Enable or disable PLAN-declared external probes |
 | `DEVFLOW_TRUST_EXTERNAL_VERIFY` | unset | Exact reviewed PLAN probe commands as a JSON string array; required in addition to enabling probes |
-| `RUST_LOG` | `info` | Log verbosity (stderr) |
+| `RUST_LOG` | `off` | Tracing verbosity (stderr). Unset or empty prints no tracing lines; set a level such as `info` or `debug` to see them |
 | `DEVFLOW_LOG_FORMAT` | plain text | Set to `json` for machine-readable log lines |
 
 Gate metadata (`DEVFLOW_GATE_PHASE`/`DEVFLOW_GATE_STAGE`/`DEVFLOW_GATE_CONTEXT`)

@@ -1692,8 +1692,8 @@ const RECORDED_WARN_INTERVAL: Duration = Duration::from_secs(60);
 ///    [`RECORDED_WARN_INTERVAL`] and keeps reading. If the agent exits meanwhile, the
 ///    ownership fence still refuses this supervisor's next guarded side effect. No
 ///    healthy path changes the record while its agent runs: the supervisor's own advance
-///    writes it only after the agent has exited, and every launch route, a hand-run
-///    `devflow advance` and `devflow ship` refuse over a live supervisor. So only an
+///    writes it only after the agent has exited, and every launch route and a hand-run
+///    `devflow advance` refuse over a live supervisor. So only an
 ///    operator's hand edit or a misread liveness probe reaches this.
 /// 6. [`Supervisor::wait_agent`], then wait for the watch's verdict, for
 ///    [`StageRun::promotion`]. It ends by its deadline at the latest, and a watch past
@@ -4871,7 +4871,7 @@ kill -9 $$
     }
 
     /// Build the fixture repositories through the scrubbing constructor, as
-    /// every other test module in this phase does (`version.rs:1102`).
+    /// the other git-touching test modules do.
     ///
     /// A bare `Command::new("git")` here would itself inherit an ambient
     /// hostile `GIT_DIR` — so under this phase's own acceptance command

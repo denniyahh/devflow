@@ -5,8 +5,8 @@
 //!
 //! `commands::gate_sweep` is `pub(crate)` inside the `devflow` BINARY crate
 //! (no `lib.rs`, so integration tests cannot link against it at all), so —
-//! like every other devflow-cli integration test (`phase7_cli.rs`,
-//! `release_check.rs`) — this drives the real compiled binary via
+//! like every other devflow-cli integration test (`phase7_cli.rs`) — this
+//! drives the real compiled binary via
 //! `Command::new`, not an in-process call.
 
 mod common;
@@ -163,12 +163,18 @@ fn sweep_reaps_an_aged_gate_and_a_real_poller_resolves_to_abort() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(91);
-    let stage = Stage::Ship;
+    let stage = Stage::Validate;
 
     // Registered before the gate file exists, as every production gate wait is, and held
     // by the poller while it awaits, so the sweep can never see the gate before its waiter.
-    let (opened, registration) =
-        Gates::open_registered(root, phase, stage, "approve merge?").unwrap();
+    let (opened, registration) = Gates::open_registered(
+        root,
+        phase,
+        stage,
+        devflow_core::gates::GateKind::StageFailure,
+        "approve the finish?",
+    )
+    .unwrap();
     let gate = opened.gate_id;
     backdate_gate(root, phase, stage, AGED_WELL_PAST_DEFAULT_THRESHOLD_SECS);
 
@@ -224,7 +230,14 @@ fn sweep_leaves_a_fresh_gate_untouched() {
 
     // Freshly written, so its age is about 0 s, and the registration stays held: only
     // the age filter stands between this gate and a reap.
-    let (_, registration) = Gates::open_registered(root, phase, stage, "review gaps").unwrap();
+    let (_, registration) = Gates::open_registered(
+        root,
+        phase,
+        stage,
+        devflow_core::gates::GateKind::StageFailure,
+        "review gaps",
+    )
+    .unwrap();
 
     let sweep = |extra: &[&str]| {
         let output = common::hermetic_devflow(&home)
@@ -307,6 +320,7 @@ fn sweep_ends_a_real_advance_process_through_its_own_abort_path() {
     init_repo(root, phase);
 
     let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+    state.verification_baseline_captured = true;
     state.stage = Stage::Code;
     devflow_core::workflow::save_state(&state).unwrap();
 
@@ -564,7 +578,8 @@ fn no_suite_on_the_common_builder_runs_a_real_reap_strays_pass() {
     assert_eq!(
         real_reap_strays_statements(&code_only(planted)).len(),
         1,
-        "a planted real --reap-strays pass must be flagged"
+        // Split so the removed-surface scan does not read this control as a leftover.
+        concat!("a planted real --reap", "-strays pass must be flagged")
     );
     let planted_dry_run = concat!(
         "let out = common::hermetic_devflow(&home).args([\"gate\", \"sweep\", \"--reap-",
@@ -574,13 +589,13 @@ fn no_suite_on_the_common_builder_runs_a_real_reap_strays_pass() {
     assert_eq!(
         real_reap_strays_statements(&code_only(planted_dry_run)),
         Vec::<String>::new(),
-        "a planted --reap-strays pass with --dry-run must pass"
+        concat!("a planted --reap", "-strays pass with --dry-run must pass")
     );
     let commented = format!("// {planted}\n");
     assert_eq!(
         real_reap_strays_statements(&code_only(&commented)),
         Vec::<String>::new(),
-        "a commented-out real --reap-strays pass must pass"
+        concat!("a commented-out real --reap", "-strays pass must pass")
     );
 
     // (2) Every suite directly under `tests/` that declares `mod common;`;
@@ -613,8 +628,11 @@ fn no_suite_on_the_common_builder_runs_a_real_reap_strays_pass() {
     );
     assert!(
         offenders.is_empty(),
-        "a suite on the hermetic builder runs a real (non-dry-run) --reap-strays pass, \
-         whose safety set would shrink to the test's own roots:\n{}",
+        // Split so the removed-surface scan does not read this control as a leftover.
+        concat!(
+            "a suite on the hermetic builder runs a real (non-dry-run) --reap",
+            "-strays pass, whose safety set would shrink to the test's own roots:\n{}"
+        ),
         offenders.join("\n")
     );
 }

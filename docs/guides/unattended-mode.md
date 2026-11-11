@@ -66,15 +66,12 @@ capture-shape launches are refused in auto mode:
   capture shape and cannot run `--mode auto`. This is a real capability
   removal introduced with this feature; those agents still work in supervise
   mode. (Antigravity launches on the stream shape and is allowed.)
-- **The legacy launch opt-out.** `--legacy-claude-launch` (or
-  `DEVFLOW_CLAUDE_LEGACY_LAUNCH`) moves Claude onto the capture shape, which
-  never engages the guard. It is now mutually exclusive with `--mode auto`.
 - **A fallback outside the stream shape.** A `--fallback-agent` (or
   `devflow.toml`'s `fallback_agent` key) runs the Code stage unattended after a
   rate limit, so it must itself launch on the stream shape: `--mode auto`
   accepts only `claude` or `antigravity` as a fallback. The check at launch is
   best effort: the full preflight runs again at the handoff, and a refusal
-  there takes the cron arm. This guard is not widened for the fallback.
+  there leaves the run waiting at the Code gate. This guard is not widened for the fallback.
 
 The recovery for each is the same: drop the flag that caused it (or name a
 fallback on the stream shape), or run in supervise mode.
@@ -87,7 +84,7 @@ design and no mode approves them, so an unattended run that reached one would
 simply stall. Better to say so at the start.
 
 Before the phase has been planned there is nothing to scan, and the condition
-reports `[not yet applicable]` at Define rather than refusing. At Code, plans
+reports `[not yet applicable]` at Plan rather than refusing. At Code, plans
 are expected — their absence is `[COULD NOT BE DETERMINED]`, and that refuses.
 
 A refusal here means replanning the phase without the human-only marker, or
@@ -163,7 +160,7 @@ So:
 
 - **That repair may write a commit.** If the leaked `true` had already reached
   the branch tip, the repair commits the corrected file so it cannot travel
-  onward through Ship into `develop`. You will see this subject in your
+  onward with the branch into `develop`. You will see this subject in your
   history:
 
   ```
@@ -186,8 +183,8 @@ buried in planning notes, because both are places an overnight run can stop.
 ### 1. An unattended run can still stall at a Plan-stage checkpoint
 
 Checkpoint auto-approval covers the Code stage and its fix loop. It does
-**not** cover Plan. Since DevFlow's Define stage does no agent work, Plan is
-the earliest stage where a run can stall — so unattended mode does not fully
+**not** cover Plan. Plan is the first stage, so it is the earliest stage where
+a run can stall — so unattended mode does not fully
 deliver "complete a phase with nobody present".
 
 **Cause.** The flag that would auto-approve a Plan-stage checkpoint is the same
@@ -206,22 +203,21 @@ decision, plan the phase interactively first and then start the unattended run
 — by the time `devflow start` reaches Plan with a plan already on disk, the
 stage is a no-op.
 
-### 2. A legacy-arm or non-Claude Code stage gets no chain-flag guard at all
+### 2. A non-Claude Code stage gets no chain-flag guard at all
 
 There is no guard on those launch shapes, because they run on the capture
 shape, and a supervisor on the capture shape does not engage the chain-flag
 guard.
 
 **Cause.** The guard is engaged only by a supervisor on the stream shape,
-which only the Claude and Antigravity `stream-json` launch paths use; `codex`,
-`opencode` and the legacy opt-out launch on the capture shape.
+which only the Claude and Antigravity `stream-json` launch paths use; `codex`
+and `opencode` launch on the capture shape.
 
 **Fix owner: DevFlow, and as of this release the failure is loud rather than
 silent.** Condition 2 of the preflight now *refuses* this combination in auto
 mode instead of letting the run start and stall later. That is an improvement
 in legibility, not a removal of the limitation: `--mode auto` remains limited
-to Claude and Antigravity, and remains incompatible with the legacy launch
-opt-out.
+to Claude and Antigravity.
 
 ### 3. GSD orchestrator may block auto-approval of `gate="blocking"` checkpoints
 

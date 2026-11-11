@@ -47,6 +47,117 @@ pub struct GateFile {
     /// The gate's identity. Required: a file without one does not parse, so nothing
     /// can list it or answer it.
     pub gate_id: String,
+    /// Which kind of gate this is, recorded by its writer (52-22, D-37, D-39): a
+    /// label for display, events and tests, never parsed out of `context`. Every
+    /// gate DevFlow opens records one; `None` only in a gate file written before
+    /// the field existed, which is why it stays an `Option`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_kind: Option<GateKind>,
+    /// GSD's verification status the gate was opened over (52-29), a label
+    /// like `gate_kind`: no answer is routed on it, since an approve reads the
+    /// status fresh (D-45 rule 2). `None` for a reader failure, a status-less
+    /// gate, and a gate file written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gsd_status: Option<crate::gsd_reader::GsdStatus>,
+    /// The not-before time of a rate-limit gate, in Unix epoch seconds (D-27.2,
+    /// D-38): the reported reset plus
+    /// [`crate::reset_time::RATE_LIMIT_RELAUNCH_MARGIN_SECS`], recorded whenever
+    /// the denial named a parseable reset, whether or not a timer is armed for
+    /// it. `gate sweep` never reaps the gate before it. `None` for every other
+    /// gate, a rate-limit gate whose denial named no reset (D-16), and a gate
+    /// file written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_before: Option<i64>,
+}
+
+/// What a gate's writer records about it beside its context: its required
+/// kind and, for a verification gate, the GSD status it was opened over
+/// (52-29). A [`GateKind`] alone converts into a label with no status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GateLabel {
+    /// The gate's kind.
+    pub kind: GateKind,
+    /// The GSD status the gate was opened over, if any.
+    pub gsd_status: Option<crate::gsd_reader::GsdStatus>,
+    /// The rate-limit gate's not-before time ([`GateFile::not_before`]);
+    /// `None` for every other gate.
+    pub not_before: Option<i64>,
+}
+
+impl From<GateKind> for GateLabel {
+    fn from(kind: GateKind) -> Self {
+        GateLabel {
+            kind,
+            gsd_status: None,
+            not_before: None,
+        }
+    }
+}
+
+impl GateLabel {
+    /// The label of a rate-limit gate whose denial named `reset_at`, the
+    /// reported reset in Unix epoch seconds, or no parseable reset (D-27.2,
+    /// D-16). It takes the reset time only, never whether a timer is armed or
+    /// the run's automatic relaunch is used, so the not-before time, and with
+    /// it sweep protection, depends on the reset alone (D-38).
+    pub fn rate_limit(reset_at: Option<i64>) -> GateLabel {
+        GateLabel {
+            kind: GateKind::RateLimit,
+            gsd_status: None,
+            not_before: reset_at.map(crate::reset_time::relaunch_not_before),
+        }
+    }
+}
+
+/// The kind of a gate, as its writer records it in [`GateFile::gate_kind`]. The
+/// open path takes one, so no gate is opened without a kind (D-39).
+///
+/// Deliberately not `#[non_exhaustive]`: a router that matches it has no wildcard
+/// arm, so a kind added later fails the build until it is classified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateKind {
+    /// The supervise Validate gate after an agent pass that GSD reports `passed`
+    /// (52-22).
+    CleanPass,
+    /// A Validate gate over a GSD `gaps_found` report, after either agent verdict
+    /// (52-22).
+    GapsFound,
+    /// The supervise Validate gate over a GSD `stale` or `missing` report, after
+    /// either agent verdict: the report must be re-verified (52-22).
+    ReverifyNeeded,
+    /// The Validate gate after an agent pass that GSD reports `human_needed`
+    /// (52-22).
+    HumanNeeded,
+    /// The Validate gate after an agent fail that GSD reports `passed`: the two
+    /// disagree (52-22).
+    DisagreementOverPassed,
+    /// The Validate gate after an agent fail that GSD reports `human_needed`
+    /// (52-22).
+    DisagreementOverHumanNeeded,
+    /// The never-silent Validate gate when GSD's status, or the HEAD a pass ran
+    /// on, could not be read (52-22, D-24).
+    ReaderFailure,
+    /// The never-silent Validate gate when the agent's verdict is ambiguous
+    /// (52-22).
+    AmbiguousVerdict,
+    /// A Validate gate fired because a failure counter reached its cap
+    /// (`MAX_CONSECUTIVE_FAILURES` or `MAX_PHASE_VALIDATE_FAILURES`, 52-22).
+    FailureCap,
+    /// The gate when a gaps pass produced no gap-closure plan (written by 52-27).
+    NoGapClosurePlan,
+    /// The never-silent gate for a failed stage at any stage: a launch failure, a
+    /// crash, a reported failure, a timeout or an infra failure (D-39; 52-22).
+    StageFailure,
+    /// The gate for a rate limit no fallback can take (CUT-03, D-15, D-27): it
+    /// keeps its own answers and can never finish a run. Its file records
+    /// [`GateFile::not_before`] when the denial named a reset (52-31).
+    RateLimit,
+    /// The gate for a failed preflight check before a stage launches (D-39; 52-22).
+    Preflight,
+    /// The gate for a human-only checkpoint declaration at Code that was not
+    /// approved (D-39; 52-22).
+    CheckpointDeclaration,
 }
 
 /// The human's response to a gate.
@@ -54,6 +165,11 @@ pub struct GateFile {
 pub struct GateResponse {
     /// Whether the gated work is approved to advance.
     pub approved: bool,
+    /// Whether the answer ends the run. Only an explicit `true` aborts: a record
+    /// without the field reads as not an abort, and a note's wording never
+    /// changes the action.
+    #[serde(default)]
+    pub abort: bool,
     /// Optional free-text note (e.g. what to fix on a rejection).
     #[serde(default)]
     pub note: Option<String>,
@@ -85,24 +201,79 @@ pub struct GateAck {
 pub enum GateAction {
     /// Approved — advance to the next stage.
     Advance,
-    /// Rejected with fixable feedback — loop back to the given stage.
-    LoopBack(Stage),
-    /// Rejected and aborted — stop the workflow with a reason.
+    /// Rejected with fixable feedback — loop back to `stage`. `note` is the
+    /// rejection's note, kept verbatim, so the relaunched agent's prompt can
+    /// carry the operator's words (GATE-01, D-14): every consumer that relaunches
+    /// an agent on a loop-back hands it on.
+    LoopBack {
+        /// The stage to loop back to.
+        stage: Stage,
+        /// The operator's note on the rejection, if any.
+        note: Option<String>,
+    },
+    /// Relaunch the gate's stage on the run's agent: the action of an approve
+    /// or a reject on a rate-limit gate (D-15, D-27.4, D-37). `note` is a
+    /// reject's note, kept byte for byte for the relaunched stage's prompt;
+    /// `None` for an approve. Only [`GateAction::from_gate_answer`] produces it.
+    Relaunch {
+        /// The operator's note on a reject, if any.
+        note: Option<String>,
+    },
+    /// Aborted — stop the workflow with a reason.
     Abort(String),
 }
 
+/// Who [`Gates::rate_limit_timer_answer`] records as the responder.
+pub const RATE_LIMIT_TIMER: &str = "devflow-rate-limit-timer";
+
+/// The abort reason when an abort answer carries no note.
+const ABORT_WITHOUT_NOTE: &str = "the gate answer was an abort";
+
+/// The abort reason for an answer that both approves and aborts. Such an answer
+/// is refused when written ([`GateError::ApprovedAndAborted`]), so one on disk
+/// was written by hand; it is read as an abort, never as an approval.
+const APPROVED_AND_ABORTED: &str =
+    "the gate answer both approves and aborts, which is invalid; it is read as an abort";
+
 impl GateAction {
-    /// Decide the action from a response: approval advances, a rejection loops
-    /// back to Code unless the note asks to abort.
+    /// Decide the action from a response's fields, never from its note: `abort`
+    /// ends the run, otherwise `approved` advances, and anything else loops back
+    /// to Code, carrying the response's note. The abort is checked first, so an
+    /// answer can never both abort and advance.
     pub fn from_response(response: &GateResponse) -> GateAction {
+        if response.abort && response.approved {
+            return GateAction::Abort(APPROVED_AND_ABORTED.to_string());
+        }
+        if response.abort {
+            let reason = response.note.as_deref().unwrap_or(ABORT_WITHOUT_NOTE);
+            return GateAction::Abort(reason.to_string());
+        }
         if response.approved {
             return GateAction::Advance;
         }
-        match response.note.as_deref() {
-            Some(note) if note.to_ascii_lowercase().contains("abort") => {
-                GateAction::Abort(note.to_string())
-            }
-            _ => GateAction::LoopBack(Stage::Code),
+        GateAction::LoopBack {
+            stage: Stage::Code,
+            note: response.note.clone(),
+        }
+    }
+
+    /// The action of `response` on a gate whose file records `kind`. On a
+    /// rate-limit gate an approve relaunches the stage with no note, a reject
+    /// relaunches it with its note, and an abort is the
+    /// [`from_response`](Self::from_response) abort, reason and all (D-27.4,
+    /// D-37); no answer to a rate-limit gate advances. Every other gate's answer
+    /// is [`from_response`](Self::from_response)'s.
+    pub fn from_gate_answer(kind: Option<GateKind>, response: &GateResponse) -> GateAction {
+        let action = Self::from_response(response);
+        if kind != Some(GateKind::RateLimit) {
+            return action;
+        }
+        match action {
+            abort @ GateAction::Abort(_) => abort,
+            GateAction::Advance => GateAction::Relaunch { note: None },
+            GateAction::LoopBack { note, .. } => GateAction::Relaunch { note },
+            // `from_response` never returns a relaunch; kept as it is.
+            relaunch @ GateAction::Relaunch { .. } => relaunch,
         }
     }
 }
@@ -111,8 +282,8 @@ impl GateAction {
 ///
 /// Whether a file was published matters to a caller deciding what to do next.
 /// Nothing was published on [`GateError::GateLockTimeout`],
-/// [`GateError::GateIdMismatch`], [`GateError::NoOpenGate`] and
-/// [`GateError::AlreadyResponded`]. A file was on
+/// [`GateError::GateIdMismatch`], [`GateError::NoOpenGate`],
+/// [`GateError::AlreadyResponded`] and [`GateError::ApprovedAndAborted`]. A file was on
 /// [`GateError::GateClosedAfterPublish`] (it was then set aside) and on
 /// [`GateError::PublishedUnconfirmed`] (it was left in place). [`GateError::Io`]
 /// and [`GateError::Json`] say neither: from `answer` they can come from either
@@ -131,6 +302,18 @@ pub enum GateError {
     /// Responding to a gate that already has a response on disk.
     #[error("gate for phase {phase} stage {stage} already has a response awaiting pickup")]
     AlreadyResponded { phase: PhaseId, stage: Stage },
+    /// The rate-limit relaunch timer was asked to answer a gate that is not a
+    /// rate-limit gate. Refused before anything is written (T-52-44).
+    #[error(
+        "phase {phase}'s {stage} gate is not a rate-limit gate, so the relaunch timer cannot answer it; nothing was written"
+    )]
+    NotARateLimitGate { phase: PhaseId, stage: Stage },
+    /// An answer that sets both `approved` and `abort`. Refused before anything
+    /// is read or written.
+    #[error(
+        "an answer cannot both approve and abort phase {phase}'s {stage} gate; nothing was written"
+    )]
+    ApprovedAndAborted { phase: PhaseId, stage: Stage },
     /// A gate id that does not have a gate id's format.
     #[error("`{0}` is not a gate id: expected 16 lowercase hex digits")]
     InvalidGateId(String),
@@ -342,6 +525,9 @@ pub struct OpenGate {
     /// The id the gate file names, unchecked: no answer can bind to one that
     /// [`GateId::parse`] refuses.
     pub gate_id: String,
+    /// The gate file's [`GateFile::not_before`]: a rate-limit gate's
+    /// not-before time, which `gate sweep` honours.
+    pub not_before: Option<i64>,
 }
 
 /// A waiter's registration: a held lock on `NN-{stage}.{gate_id}.waiter` (D-04).
@@ -465,13 +651,24 @@ impl Gates {
     /// For fixtures and any opener that is not a waiter. A waiter opens through
     /// [`open_registered`](Self::open_registered), so its gate file is never visible
     /// before its registration.
+    ///
+    /// `kind` is recorded in the gate file by the same atomic write as the rest of
+    /// the gate.
     pub fn open_gate(
         project_root: &Path,
         phase: PhaseId,
         stage: Stage,
+        label: impl Into<GateLabel>,
         context: &str,
     ) -> Result<OpenedGate, GateError> {
-        Self::open_gate_as(project_root, phase, stage, &GateId::new(), context)
+        Self::open_gate_as(
+            project_root,
+            phase,
+            stage,
+            &GateId::new(),
+            label.into(),
+            context,
+        )
     }
 
     /// Open a gate and register its waiter, in that order on disk: the registration
@@ -480,13 +677,25 @@ impl Gates {
     ///
     /// A crash between the two leaves no gate file, so no writer can learn the id,
     /// and an unheld registration the stage's next close removes.
+    ///
+    /// `kind` is recorded in the gate file by the same atomic write as the rest of
+    /// the gate.
     pub fn open_registered(
         project_root: &Path,
         phase: PhaseId,
         stage: Stage,
+        label: impl Into<GateLabel>,
         context: &str,
     ) -> Result<(OpenedGate, WaiterRegistration), GateError> {
-        Self::open_registered_with_hooks(project_root, phase, stage, context, || {}, || {})
+        Self::open_registered_with_hooks(
+            project_root,
+            phase,
+            stage,
+            label.into(),
+            context,
+            || {},
+            || {},
+        )
     }
 
     /// [`open_registered`](Self::open_registered)'s whole sequence, so the tests run
@@ -496,6 +705,7 @@ impl Gates {
         project_root: &Path,
         phase: PhaseId,
         stage: Stage,
+        kind: GateLabel,
         context: &str,
         before_publish: impl FnOnce(),
         after_publish: impl FnOnce(),
@@ -503,7 +713,7 @@ impl Gates {
         let gate_id = GateId::new();
         let registration = Self::register_waiter(project_root, phase, stage, &gate_id)?;
         before_publish();
-        let opened = match Self::open_gate_as(project_root, phase, stage, &gate_id, context) {
+        let opened = match Self::open_gate_as(project_root, phase, stage, &gate_id, kind, context) {
             Ok(opened) => opened,
             Err(error) => {
                 registration.finish();
@@ -527,7 +737,14 @@ impl Gates {
     ) -> Result<(OpenedGate, WaiterRegistration), GateError> {
         let gate_id = GateId::new();
         before_publish();
-        let opened = Self::open_gate_as(project_root, phase, stage, &gate_id, context)?;
+        let opened = Self::open_gate_as(
+            project_root,
+            phase,
+            stage,
+            &gate_id,
+            GateKind::StageFailure.into(),
+            context,
+        )?;
         after_publish();
         let registration = Self::register_waiter(project_root, phase, stage, &gate_id)?;
         Ok((opened, registration))
@@ -541,13 +758,14 @@ impl Gates {
         phase: PhaseId,
         stage: Stage,
         gate_id: &GateId,
+        kind: GateLabel,
         context: &str,
     ) -> Result<OpenedGate, GateError> {
         let _lock = gate_lock(project_root, phase)?;
         let (_, _, disposal) =
             Self::set_aside_stage_answers(project_root, phase, stage, &mut |_| {});
         disposal?;
-        let opened = Self::write_gate_file(project_root, phase, stage, gate_id, context)?;
+        let opened = Self::write_gate_file(project_root, phase, stage, gate_id, kind, context)?;
         consume_preanswer(project_root, phase, stage, gate_id)?;
         Ok(opened)
     }
@@ -592,6 +810,16 @@ impl Gates {
     /// the stray reaper's safety set. A holder whose record cannot be read is logged
     /// and left out.
     pub fn live_waiter_holders(project_root: &Path) -> Vec<(u32, Option<u64>)> {
+        Self::live_waiter_holders_to(project_root, &mut std::io::stderr())
+    }
+
+    /// [`Self::live_waiter_holders`], writing the line for each registration it
+    /// cannot read to `err`: a holder left out is a live waiter that `doctor`
+    /// can report as a stray process.
+    fn live_waiter_holders_to(
+        project_root: &Path,
+        err: &mut dyn std::io::Write,
+    ) -> Vec<(u32, Option<u64>)> {
         let Ok(entries) = std::fs::read_dir(Self::dir(project_root)) else {
             return Vec::new();
         };
@@ -604,10 +832,18 @@ impl Gates {
             match liveness::live_holder(&path) {
                 Ok(Some(holder)) => holders.push(holder),
                 Ok(None) => {}
-                Err(error) => warn!(
-                    "could not read the waiter registration {}: {error}",
-                    path.display()
-                ),
+                Err(error) => {
+                    warn!(
+                        "could not read the waiter registration {}: {error}",
+                        path.display()
+                    );
+                    let _ = writeln!(
+                        err,
+                        "warning: could not read the waiter registration {} ({error}); its \
+                         holder is not counted as a live waiter",
+                        path.display()
+                    );
+                }
             }
         }
         holders
@@ -628,6 +864,29 @@ impl Gates {
         timeout_secs: u64,
         cancel: impl Fn() -> bool,
     ) -> AwaitOutcome {
+        Self::await_answer_to(
+            project_root,
+            phase,
+            stage,
+            gate,
+            timeout_secs,
+            cancel,
+            &mut std::io::stderr(),
+        )
+    }
+
+    /// [`Self::await_answer`], writing the line for an answer it cannot read to
+    /// `err`, at the same rate the warning is logged: a waiter in the foreground
+    /// would otherwise sit silent over an answer the operator wrote.
+    fn await_answer_to(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        gate: &GateId,
+        timeout_secs: u64,
+        cancel: impl Fn() -> bool,
+        err: &mut dyn std::io::Write,
+    ) -> AwaitOutcome {
         let unreadable = RepeatLimit::default();
         let end = backoff_wait(Duration::from_secs(timeout_secs), cancel, || {
             #[cfg(test)]
@@ -642,6 +901,11 @@ impl Gates {
                     if unreadable.allow(std::time::Instant::now()) {
                         warn!(
                             "could not read gate answer {}: {error}; still waiting",
+                            path.display()
+                        );
+                        let _ = writeln!(
+                            err,
+                            "warning: could not read the gate answer {} ({error}); still waiting",
                             path.display()
                         );
                     }
@@ -668,14 +932,12 @@ impl Gates {
         Self::answer_with_hook(project_root, phase, stage, observed, response, || {})
     }
 
-    /// Answer an abandoned gate with a rejection, for the gate the caller observed.
+    /// Answer an abandoned gate with an abort, for the gate the caller observed.
     /// Mitigation for T-23-41 (Elevation of Privilege): this function takes **no**
-    /// boolean parameter and hard-codes `approved: false` at the literal below, so no
-    /// caller can ever make it write an approval.
-    ///
-    /// The caller-supplied `note`'s lowercase form MUST contain the abort keyword
-    /// [`GateAction::from_response`] matches on (`"abort"`), so the reap resolves to
-    /// `GateAction::Abort` and never relaunches an agent on an abandoned run. It
+    /// boolean parameter and hard-codes `approved: false` and `abort: true` at the
+    /// literal below, so no caller can ever make it write an approval, and the reap
+    /// always resolves to `GateAction::Abort`: it never relaunches an agent on an
+    /// abandoned run. `note` is only the reason recorded with the abort. It
     /// publishes the way [`answer`](Self::answer) does, with the same checks.
     pub fn reap_answer(
         project_root: &Path,
@@ -687,8 +949,54 @@ impl Gates {
     ) -> Result<PathBuf, GateError> {
         let response = GateResponse {
             approved: false,
+            abort: true,
             note: Some(note.to_string()),
             responded_by: Some(responded_by.to_string()),
+        };
+        Self::answer_with_hook(project_root, phase, stage, observed, &response, || {})
+    }
+
+    /// The rate-limit relaunch timer's answer to the gate the caller observed:
+    /// an approve, recorded as by [`RATE_LIMIT_TIMER`] (D-27.3). Mitigation for
+    /// T-52-44 (Elevation of Privilege): it takes **no** boolean parameter and
+    /// hard-codes the approve below, and it refuses, before anything is
+    /// written, any gate whose file does not record
+    /// [`GateKind::RateLimit`]. It publishes through the same first-writer-wins
+    /// path as [`answer`](Self::answer), so a human answer written first stands
+    /// and this call returns [`GateError::AlreadyResponded`]. It does not touch
+    /// the run's state: the used flag is the caller's (52-32).
+    pub fn rate_limit_timer_answer(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        observed: &GateId,
+    ) -> Result<PathBuf, GateError> {
+        // The kind is read for the observed id. A gate's kind and id are written
+        // in one atomic write, and `answer_with_hook` re-checks the id under the
+        // gate lock, so a gate replaced after this read is refused there.
+        let gate = match std::fs::read_to_string(Self::gate_path(project_root, phase, stage)) {
+            Ok(contents) => serde_json::from_str::<GateFile>(&contents)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(GateError::NoOpenGate { phase, stage });
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if gate.gate_id != observed.as_str() {
+            return Err(GateError::GateIdMismatch {
+                phase,
+                stage,
+                observed: observed.to_string(),
+                current: gate.gate_id,
+            });
+        }
+        if gate.gate_kind != Some(GateKind::RateLimit) {
+            return Err(GateError::NotARateLimitGate { phase, stage });
+        }
+        let response = GateResponse {
+            approved: true,
+            abort: false,
+            note: None,
+            responded_by: Some(RATE_LIMIT_TIMER.to_string()),
         };
         Self::answer_with_hook(project_root, phase, stage, observed, &response, || {})
     }
@@ -1054,6 +1362,9 @@ impl Gates {
         response: &GateResponse,
         before_publish: impl FnOnce(),
     ) -> Result<PathBuf, GateError> {
+        if response.approved && response.abort {
+            return Err(GateError::ApprovedAndAborted { phase, stage });
+        }
         if !Self::dir(project_root).is_dir() {
             return Err(GateError::NoOpenGate { phase, stage });
         }
@@ -1211,6 +1522,13 @@ impl Gates {
     /// logged and skipped — listing must degrade, not die. A gate is hidden once its
     /// own live answer is there. Only reads.
     pub fn list_open(project_root: &Path) -> Vec<OpenGate> {
+        Self::list_open_to(project_root, &mut std::io::stderr())
+    }
+
+    /// [`Self::list_open`], writing the line for each gate file it cannot list
+    /// to `err`: a gate left out of the listing is one the operator cannot see
+    /// to answer.
+    fn list_open_to(project_root: &Path, err: &mut dyn std::io::Write) -> Vec<OpenGate> {
         let mut open = Vec::new();
         let Ok(entries) = std::fs::read_dir(Self::dir(project_root)) else {
             return open;
@@ -1226,14 +1544,20 @@ impl Gates {
             if after_phase.contains('.') {
                 continue;
             }
-            let Ok(contents) = std::fs::read_to_string(entry.path()) else {
-                continue;
-            };
-            let gate = match serde_json::from_str::<GateFile>(&contents) {
+            let gate = match std::fs::read_to_string(entry.path())
+                .map_err(|error| error.to_string())
+                .and_then(|contents| {
+                    serde_json::from_str::<GateFile>(&contents).map_err(|error| error.to_string())
+                }) {
                 Ok(gate) => gate,
                 Err(error) => {
                     warn!(
                         "not listing {} as an open gate: {error}",
+                        entry.path().display()
+                    );
+                    let _ = writeln!(
+                        err,
+                        "warning: not listing {} as an open gate ({error})",
                         entry.path().display()
                     );
                     continue;
@@ -1254,6 +1578,7 @@ impl Gates {
                 context: gate.context,
                 timestamp: gate.timestamp,
                 gate_id: gate.gate_id,
+                not_before: gate.not_before,
             });
         }
         open.sort_by_key(|g| (g.phase, g.stage.to_string()));
@@ -1292,9 +1617,10 @@ impl Gates {
         project_root: &Path,
         phase: PhaseId,
         stage: Stage,
+        kind: impl Into<GateLabel>,
         context: &str,
     ) -> Result<PathBuf, GateError> {
-        Self::open_gate(project_root, phase, stage, context).map(|gate| gate.path)
+        Self::open_gate(project_root, phase, stage, kind, context).map(|gate| gate.path)
     }
 
     /// Write a gate file under `gate_id`. Disposes of nothing.
@@ -1303,6 +1629,7 @@ impl Gates {
         phase: PhaseId,
         stage: Stage,
         gate_id: &GateId,
+        label: GateLabel,
         context: &str,
     ) -> Result<OpenedGate, GateError> {
         let gate = GateFile {
@@ -1311,6 +1638,9 @@ impl Gates {
             context: context.to_string(),
             timestamp: unix_now(),
             gate_id: gate_id.to_string(),
+            gate_kind: Some(label.kind),
+            gsd_status: label.gsd_status,
+            not_before: label.not_before,
         };
         let path = Self::gate_path(project_root, phase, stage);
         info!("writing gate {} for phase {phase}", stage);
@@ -1460,7 +1790,7 @@ fn backoff_wait<T>(
 /// Reads `DEVFLOW_GATE_NOTIFY_CMD`; if unset or empty, this is a silent no-op
 /// (no notify command configured). Otherwise delegates to
 /// [`run_notify_command`]. `unexpected` marks a gate fired on a stage the
-/// active [`crate::mode::Mode`] would not normally gate (e.g. a Define/Plan/Code
+/// active [`crate::mode::Mode`] would not normally gate (e.g. a Plan/Code
 /// failure in Auto mode) — a never-silent gate per WR-11.
 ///
 /// This ignores a run's persisted command (`State::gate_notify_cmd`). DevFlow's
@@ -1489,6 +1819,47 @@ pub fn fire_gate_notify_with_fallback(
 
 /// The environment variable that configures the gate notify hook.
 pub const GATE_NOTIFY_CMD_ENV: &str = "DEVFLOW_GATE_NOTIFY_CMD";
+
+/// The characters of a gate's context an operator is shown: the pending-gate
+/// banner, `devflow gate list` and the notify hook's `DEVFLOW_GATE_CONTEXT`
+/// (GATE-04). The context is stored whole, up to the CLI's stored bound, and
+/// `devflow gate show` prints all of it; this bound keeps every other
+/// rendering, and a notification in particular, to a readable start. Every
+/// gate's context leads with its way-on sentence, so the bound holds that
+/// sentence and the cause after it. The idle-timeout cause clause is budgeted
+/// to close inside it behind the longest such sentence
+/// ([`crate::agent_result::MAX_IDLE_TIMEOUT_CLAUSE_CHARS`]); the CLI test
+/// `the_budgeted_idle_timeout_clause_closes_inside_the_gate_display_bound`
+/// pins the two together.
+pub const GATE_CONTEXT_DISPLAY_CHARS: usize = 450;
+
+/// Render agent-controlled gate text as one bounded, terminal-safe line: every
+/// control character becomes a space, and text longer than `max_chars`
+/// characters (counted in characters, never bytes) is cut at a character
+/// boundary to exactly `max_chars`, ending in a truncation suffix that names
+/// `.devflow/`. The CLI's gate renderings and the notify hook share it.
+pub fn render_gate_context(context: &str, max_chars: usize) -> String {
+    const TRUNCATED: &str = "… [truncated; full output in .devflow/]";
+    let sanitized: String = context
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    if sanitized.chars().count() <= max_chars {
+        return sanitized;
+    }
+
+    let suffix_len = TRUNCATED.chars().count().min(max_chars);
+    let head_len = max_chars.saturating_sub(suffix_len);
+    let head: String = sanitized.chars().take(head_len).collect();
+    let suffix: String = TRUNCATED.chars().take(suffix_len).collect();
+    format!("{head}{suffix}")
+}
 
 /// Apply the operator's `DEVFLOW_GATE_NOTIFY_CMD` to a run's persisted notify
 /// command. `devflow start`, `resume` and `advance` all call this, so the
@@ -1540,16 +1911,41 @@ pub fn resolve_gate_notify_cmd(
 /// Run the notify `cmd` via `sh -c`, passing gate metadata to the child as
 /// environment variables — never interpolated into the command string
 /// (WR-01 argv-not-shell precedent; `context` may contain agent-generated,
-/// untrusted text). Fail-soft: a non-zero exit or spawn error is logged via
+/// untrusted text). `DEVFLOW_GATE_CONTEXT` is `context` cut to
+/// [`GATE_CONTEXT_DISPLAY_CHARS`] characters (GATE-04, Pitfall 6): the gate
+/// file keeps the whole context, the notification only its start. Fail-soft: a non-zero exit or spawn error is logged via
 /// `warn!` and otherwise ignored — this must never propagate an error that
 /// could abort `run_gate`.
 fn run_notify_command(cmd: &str, phase: PhaseId, stage: Stage, context: &str, unexpected: bool) {
+    run_notify_command_to(
+        cmd,
+        phase,
+        stage,
+        context,
+        unexpected,
+        &mut std::io::stderr(),
+    );
+}
+
+/// [`run_notify_command`], writing the line for a failed hook to `err`: a
+/// failing hook is the operator's notification channel going quiet.
+fn run_notify_command_to(
+    cmd: &str,
+    phase: PhaseId,
+    stage: Stage,
+    context: &str,
+    unexpected: bool,
+    err: &mut dyn std::io::Write,
+) {
     let output = Command::new("sh")
         .arg("-c")
         .arg(cmd)
         .env("DEVFLOW_GATE_PHASE", phase.to_string())
         .env("DEVFLOW_GATE_STAGE", stage.to_string())
-        .env("DEVFLOW_GATE_CONTEXT", context)
+        .env(
+            "DEVFLOW_GATE_CONTEXT",
+            render_gate_context(context, GATE_CONTEXT_DISPLAY_CHARS),
+        )
         .env(
             "DEVFLOW_NON_SILENT_GATE",
             if unexpected { "1" } else { "0" },
@@ -1559,11 +1955,19 @@ fn run_notify_command(cmd: &str, phase: PhaseId, stage: Stage, context: &str, un
         Ok(out) if out.status.success() => {
             debug!("gate notify hook ran successfully");
         }
-        Ok(out) => warn!(
-            "gate notify hook exited with status {:?}: {}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stderr)
-        ),
+        Ok(out) => {
+            let status = out
+                .status
+                .code()
+                .map_or_else(|| "a signal".to_string(), |code| code.to_string());
+            let hook_stderr = String::from_utf8_lossy(&out.stderr);
+            warn!("gate notify hook exited with status {status}: {hook_stderr}");
+            let _ = writeln!(
+                err,
+                "warning: the gate notify hook exited with status {status}: {}",
+                hook_stderr.trim()
+            );
+        }
         Err(err) => warn!("gate notify hook could not be spawned: {err}"),
     }
 }
@@ -1840,13 +2244,7 @@ fn gate_lock(project_root: &Path, phase: PhaseId) -> Result<GateLock, GateError>
 /// The suffix of a waiter registration's file name.
 pub(crate) const WAITER_SUFFIX: &str = ".waiter";
 /// Every stage whose gate files a phase can leave behind.
-pub(crate) const STAGES: [Stage; 5] = [
-    Stage::Define,
-    Stage::Plan,
-    Stage::Code,
-    Stage::Validate,
-    Stage::Ship,
-];
+pub(crate) const STAGES: [Stage; 3] = [Stage::Plan, Stage::Code, Stage::Validate];
 /// An answer body that is not JSON, or lacks what an answer needs.
 const REASON_UNPARSABLE: &str = "unparsable";
 /// An answer body with no gate id.
@@ -1924,6 +2322,294 @@ mod tests {
     /// default) so they don't race each other.
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
+    /// 52-22: a gate's kind is a structured field of its file. A gate opened
+    /// with a kind reads back with it and its file holds the snake_case name. The
+    /// open path can no longer omit a kind, so the kindless case is a 3.x-shaped
+    /// file with no such key, which still loads and reads as `None`.
+    #[test]
+    fn a_gate_round_trips_its_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5222);
+
+        let opened = Gates::open_gate(
+            root,
+            phase,
+            Stage::Validate,
+            GateKind::DisagreementOverPassed,
+            "the agent and GSD disagree",
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&opened.path).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(raw["gate_kind"], "disagreement_over_passed", "{text}");
+        let back: GateFile = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.gate_kind, Some(GateKind::DisagreementOverPassed));
+
+        let old: GateFile = serde_json::from_str(
+            r#"{"phase":5222,"stage":"plan","context":"3.x","timestamp":"1750000000","gate_id":"g-3x"}"#,
+        )
+        .unwrap();
+        assert_eq!(old.gate_kind, None);
+    }
+
+    /// 52-29: a gate opened with a GSD status records it as GSD's own token
+    /// and reads it back; a gate opened without one writes no `gsd_status`
+    /// key; a 3.x-shaped file with no such key reads as `None`.
+    #[test]
+    fn a_gate_round_trips_its_gsd_status() {
+        use crate::gsd_reader::GsdStatus;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5291);
+
+        let opened = Gates::open_gate(
+            root,
+            phase,
+            Stage::Validate,
+            GateLabel {
+                kind: GateKind::GapsFound,
+                gsd_status: Some(GsdStatus::GapsFound),
+                not_before: None,
+            },
+            "GSD verification: gaps_found",
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&opened.path).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(raw["gsd_status"], "gaps_found", "{text}");
+        let back: GateFile = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.gsd_status, Some(GsdStatus::GapsFound));
+
+        let without = Gates::open_gate(
+            root,
+            phase,
+            Stage::Code,
+            GateKind::StageFailure,
+            "a status-less gate",
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&without.path).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(raw.get("gsd_status").is_none(), "no gsd_status key: {text}");
+
+        let old: GateFile = serde_json::from_str(
+            r#"{"phase":5291,"stage":"plan","context":"3.x","timestamp":"1750000000","gate_id":"g-3x"}"#,
+        )
+        .unwrap();
+        assert_eq!(old.gsd_status, None);
+    }
+
+    /// D-27.2, D-38, CUT-03 empty: a rate-limit gate opened with a reset time
+    /// records `gate_kind` `rate_limit` and `not_before` = reset + margin, and
+    /// `list_open` carries the not-before time to the sweep. One opened with no
+    /// parseable reset records the kind and no not-before time (D-16).
+    /// `GateLabel::rate_limit` takes the reset time only, so the not-before time
+    /// cannot depend on a timer or the run's used flag. Control: an ordinary
+    /// gate writes no `not_before` key.
+    #[test]
+    fn a_rate_limit_gate_records_its_not_before_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let reset = 1_785_645_600;
+        let expected = reset + crate::reset_time::RATE_LIMIT_RELAUNCH_MARGIN_SECS;
+
+        let (timed, untimed, ordinary) =
+            (PhaseId::new(5311), PhaseId::new(5312), PhaseId::new(5313));
+        let opened = Gates::open_gate(
+            root,
+            timed,
+            Stage::Code,
+            GateLabel::rate_limit(Some(reset)),
+            "rate limited",
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&opened.path).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(raw["gate_kind"], "rate_limit", "{text}");
+        assert_eq!(raw["not_before"], expected, "{text}");
+        let back: GateFile = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.gate_kind, Some(GateKind::RateLimit));
+        assert_eq!(back.not_before, Some(expected));
+        let listed = Gates::list_open(root);
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].not_before, Some(expected), "the sweep sees it");
+
+        let opened = Gates::open_gate(
+            root,
+            untimed,
+            Stage::Code,
+            GateLabel::rate_limit(None),
+            "rate limited, no reset time",
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&opened.path).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(raw["gate_kind"], "rate_limit", "{text}");
+        assert!(
+            raw.get("not_before").is_none(),
+            "no reset, no not-before: {text}"
+        );
+
+        let opened = Gates::open_gate(
+            root,
+            ordinary,
+            Stage::Code,
+            GateKind::StageFailure,
+            "failed",
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&opened.path).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(raw.get("not_before").is_none(), "control: {text}");
+    }
+
+    /// T-52-44: the relaunch timer refuses a gate that is not a rate-limit
+    /// gate, an ordinary stage-failure gate and a kindless 3.x file alike, and
+    /// writes nothing for either.
+    #[test]
+    fn the_relaunch_timer_writer_refuses_a_gate_that_is_not_a_rate_limit_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (ordinary, kindless) = (PhaseId::new(5314), PhaseId::new(5315));
+        let stage = Stage::Code;
+        let gate = Gates::open_gate(root, ordinary, stage, GateKind::StageFailure, "failed")
+            .unwrap()
+            .gate_id;
+        let refused = Gates::rate_limit_timer_answer(root, ordinary, stage, &gate);
+        assert!(
+            matches!(refused, Err(GateError::NotARateLimitGate { phase, stage: at }) if phase == ordinary && at == stage),
+            "{refused:?}"
+        );
+        assert!(!Gates::answer_path(root, ordinary, stage, &gate).exists());
+        assert_eq!(
+            Gates::read_answer(root, ordinary, stage, &gate),
+            AnswerRead::None
+        );
+
+        let opened = Gates::open_gate(root, kindless, stage, GateKind::RateLimit, "3.x").unwrap();
+        let mut raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&opened.path).unwrap()).unwrap();
+        raw.as_object_mut().unwrap().remove("gate_kind");
+        std::fs::write(&opened.path, serde_json::to_string(&raw).unwrap()).unwrap();
+        let refused = Gates::rate_limit_timer_answer(root, kindless, stage, &opened.gate_id);
+        assert!(
+            matches!(refused, Err(GateError::NotARateLimitGate { .. })),
+            "a kindless file is refused: {refused:?}"
+        );
+        assert!(!Gates::answer_path(root, kindless, stage, &opened.gate_id).exists());
+    }
+
+    /// D-27.3, T-52-45: the timer approves a rate-limit gate once, as the
+    /// timer; a second call is `AlreadyResponded`. A human answer written first
+    /// stands, and the timer's call is `AlreadyResponded`.
+    #[test]
+    fn the_relaunch_timer_writer_approves_a_rate_limit_gate_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (timed, human) = (PhaseId::new(5316), PhaseId::new(5317));
+        let stage = Stage::Code;
+        let gate = Gates::open_gate(
+            root,
+            timed,
+            stage,
+            GateLabel::rate_limit(Some(1_785_645_600)),
+            "rl",
+        )
+        .unwrap()
+        .gate_id;
+        Gates::rate_limit_timer_answer(root, timed, stage, &gate).unwrap();
+        let AnswerRead::Bound(answer) = Gates::read_answer(root, timed, stage, &gate) else {
+            panic!("the timer's answer is bound to its gate");
+        };
+        assert!(
+            answer.response.approved && !answer.response.abort,
+            "{answer:?}"
+        );
+        assert_eq!(answer.response.note, None);
+        assert_eq!(
+            answer.response.responded_by.as_deref(),
+            Some(RATE_LIMIT_TIMER)
+        );
+        let again = Gates::rate_limit_timer_answer(root, timed, stage, &gate);
+        assert!(
+            matches!(again, Err(GateError::AlreadyResponded { .. })),
+            "a second call: {again:?}"
+        );
+
+        let gate = Gates::open_gate(root, human, stage, GateLabel::rate_limit(None), "rl")
+            .unwrap()
+            .gate_id;
+        let operator = GateResponse {
+            approved: false,
+            abort: false,
+            note: Some("wait for the quota, then retry with a smaller diff".into()),
+            responded_by: Some("operator".into()),
+        };
+        Gates::answer(root, human, stage, &gate, &operator).unwrap();
+        let late = Gates::rate_limit_timer_answer(root, human, stage, &gate);
+        assert!(
+            matches!(late, Err(GateError::AlreadyResponded { .. })),
+            "the human answered first: {late:?}"
+        );
+        let AnswerRead::Bound(answer) = Gates::read_answer(root, human, stage, &gate) else {
+            panic!("the human's answer is bound");
+        };
+        assert_eq!(answer.response, operator, "the human's answer stands");
+    }
+
+    /// D-27.4, D-37, review C19: answers to a rate-limit gate map to a
+    /// relaunch or an abort. Approve relaunches with no note; a reject's note,
+    /// with a newline, a tab and quotes, reaches the relaunch byte for byte; an
+    /// abort, with and without a note, is `from_response`'s abort and reason.
+    /// Control in the same test: none of them advances, and the same answers
+    /// on a stage-failure gate keep `from_response`'s actions.
+    #[test]
+    fn rate_limit_gate_answers_map_to_relaunch_or_abort() {
+        let answer = |approved: bool, abort: bool, note: Option<&str>| GateResponse {
+            approved,
+            abort,
+            note: note.map(str::to_string),
+            responded_by: Some("operator".into()),
+        };
+        let note = "line one\n\tsay \"wait\" and 'then' retry";
+        let rate_limit = Some(GateKind::RateLimit);
+        let approve = answer(true, false, None);
+        let reject = answer(false, false, Some(note));
+        let aborts = [
+            answer(false, true, Some("stop: quota gone")),
+            answer(false, true, None),
+        ];
+
+        assert_eq!(
+            GateAction::from_gate_answer(rate_limit, &approve),
+            GateAction::Relaunch { note: None }
+        );
+        match GateAction::from_gate_answer(rate_limit, &reject) {
+            GateAction::Relaunch { note: Some(kept) } => {
+                assert_eq!(kept.as_bytes(), note.as_bytes(), "byte for byte");
+            }
+            other => panic!("a reject relaunches with its note: {other:?}"),
+        }
+        for abort in &aborts {
+            let mapped = GateAction::from_gate_answer(rate_limit, abort);
+            assert!(matches!(mapped, GateAction::Abort(_)), "{mapped:?}");
+            assert_eq!(mapped, GateAction::from_response(abort), "the same reason");
+        }
+        for response in [&approve, &reject, &aborts[0], &aborts[1]] {
+            assert_ne!(
+                GateAction::from_gate_answer(rate_limit, response),
+                GateAction::Advance,
+                "control: nothing advances on a rate-limit gate: {response:?}"
+            );
+            assert_eq!(
+                GateAction::from_gate_answer(Some(GateKind::StageFailure), response),
+                GateAction::from_response(response),
+                "control: another kind keeps from_response's action"
+            );
+        }
+    }
+
     #[test]
     fn gate_file_round_trips_through_serde() {
         let gate = GateFile {
@@ -1932,6 +2618,9 @@ mod tests {
             context: "review the validation".into(),
             timestamp: "1750000000".into(),
             gate_id: GateId::new().to_string(),
+            gate_kind: None,
+            gsd_status: None,
+            not_before: None,
         };
         let json = serde_json::to_string(&gate).unwrap();
         let back: GateFile = serde_json::from_str(&json).unwrap();
@@ -1941,7 +2630,14 @@ mod tests {
     #[test]
     fn write_gate_creates_file_with_correct_path() {
         let dir = tempfile::tempdir().unwrap();
-        let path = Gates::write_gate(dir.path(), PhaseId::new(11), Stage::Validate, "ctx").unwrap();
+        let path = Gates::write_gate(
+            dir.path(),
+            PhaseId::new(11),
+            Stage::Validate,
+            GateKind::StageFailure,
+            "ctx",
+        )
+        .unwrap();
         assert!(path.ends_with(".devflow/gates/11-validate.json"));
         assert!(path.exists());
         let gate: GateFile =
@@ -1957,10 +2653,11 @@ mod tests {
         let (phase, stage) = (PhaseId::new(11), Stage::Validate);
         let response = GateResponse {
             approved: true,
+            abort: false,
             note: None,
             responded_by: Some("human".into()),
         };
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         Gates::answer(dir.path(), phase, stage, &gate, &response).unwrap();
@@ -1986,10 +2683,13 @@ mod tests {
         let (phase, stage) = (PhaseId::new(12), Stage::Validate);
         let response = GateResponse {
             approved: true,
+            abort: false,
             note: None,
             responded_by: Some("human".into()),
         };
-        let gate = Gates::open_gate(root, phase, stage, "ctx").unwrap().gate_id;
+        let gate = Gates::open_gate(root, phase, stage, GateKind::StageFailure, "ctx")
+            .unwrap()
+            .gate_id;
         let slot = Gates::answer_path(root, phase, stage, &gate);
         std::fs::create_dir(&slot).unwrap();
 
@@ -2040,10 +2740,11 @@ mod tests {
         let (phase, stage) = (PhaseId::new(11), Stage::Validate);
         let response = GateResponse {
             approved: true,
+            abort: false,
             note: None,
             responded_by: Some("human".into()),
         };
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         Gates::answer(dir.path(), phase, stage, &gate, &response).unwrap();
@@ -2068,7 +2769,7 @@ mod tests {
             Gates::await_answer(
                 dir.path(),
                 PhaseId::new(11),
-                Stage::Ship,
+                Stage::Validate,
                 &GateId::new(),
                 0,
                 || false
@@ -2080,8 +2781,8 @@ mod tests {
     #[test]
     fn claim_writes_received_true() {
         let dir = tempfile::tempdir().unwrap();
-        let (phase, stage) = (PhaseId::new(11), Stage::Ship);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let (phase, stage) = (PhaseId::new(11), Stage::Validate);
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         Gates::claim(dir.path(), phase, stage, &gate).unwrap();
@@ -2096,8 +2797,8 @@ mod tests {
     #[test]
     fn a_claim_whose_directory_fsync_fails_leaves_no_ack_and_can_be_retried() {
         let dir = tempfile::tempdir().unwrap();
-        let (phase, stage) = (PhaseId::new(12), Stage::Ship);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let (phase, stage) = (PhaseId::new(12), Stage::Validate);
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         let path = Gates::claim_path(dir.path(), phase, stage, &gate);
@@ -2124,7 +2825,7 @@ mod tests {
     fn close_removes_a_claimed_gates_three_files_idempotently() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(11), Stage::Validate);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         Gates::answer(dir.path(), phase, stage, &gate, &approved()).unwrap();
@@ -2143,7 +2844,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let phase = PhaseId::new(12);
         let stage = Stage::Validate;
-        let opened = Gates::open_gate(dir.path(), phase, stage, "ctx").unwrap();
+        let opened =
+            Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx").unwrap();
         let answer = Gates::answer(dir.path(), phase, stage, &opened.gate_id, &approved()).unwrap();
         Gates::claim(dir.path(), phase, stage, &opened.gate_id).unwrap();
         let claim = Gates::claim_path(dir.path(), phase, stage, &opened.gate_id);
@@ -2203,11 +2905,23 @@ mod tests {
     #[test]
     fn list_open_shows_unanswered_gates_only() {
         let dir = tempfile::tempdir().unwrap();
-        Gates::write_gate(dir.path(), PhaseId::new(7), Stage::Ship, "approve merge?").unwrap();
-        let answered =
-            Gates::open_gate(dir.path(), PhaseId::new(8), Stage::Validate, "review gaps")
-                .unwrap()
-                .gate_id;
+        Gates::write_gate(
+            dir.path(),
+            PhaseId::new(7),
+            Stage::Validate,
+            GateKind::StageFailure,
+            "approve the finish?",
+        )
+        .unwrap();
+        let answered = Gates::open_gate(
+            dir.path(),
+            PhaseId::new(8),
+            Stage::Validate,
+            GateKind::StageFailure,
+            "review gaps",
+        )
+        .unwrap()
+        .gate_id;
         // Phase 8's gate gets answered; its answer/claim must hide it.
         Gates::answer(
             dir.path(),
@@ -2216,6 +2930,7 @@ mod tests {
             &answered,
             &GateResponse {
                 approved: true,
+                abort: false,
                 note: None,
                 responded_by: Some("test".into()),
             },
@@ -2229,8 +2944,8 @@ mod tests {
 
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].phase, PhaseId::new(7));
-        assert_eq!(open[0].stage, Stage::Ship);
-        assert_eq!(open[0].context, "approve merge?");
+        assert_eq!(open[0].stage, Stage::Validate);
+        assert_eq!(open[0].context, "approve the finish?");
     }
 
     #[test]
@@ -2243,7 +2958,14 @@ mod tests {
     fn list_open_ignores_a_planted_temp() {
         let dir = tempfile::tempdir().unwrap();
         let phase = PhaseId::new(48);
-        Gates::write_gate(dir.path(), phase, Stage::Code, "real gate").unwrap();
+        Gates::write_gate(
+            dir.path(),
+            phase,
+            Stage::Code,
+            GateKind::StageFailure,
+            "real gate",
+        )
+        .unwrap();
         let gate = Gates::gate_path(dir.path(), phase, Stage::Code);
         let orphan = gate.with_file_name(format!(
             ".{}.1.0.tmp",
@@ -2263,9 +2985,23 @@ mod tests {
     fn write_gate_still_overwrites_a_leftover_request() {
         let dir = tempfile::tempdir().unwrap();
         let phase = PhaseId::new(48);
-        Gates::write_gate(dir.path(), phase, Stage::Code, "old request").unwrap();
+        Gates::write_gate(
+            dir.path(),
+            phase,
+            Stage::Code,
+            GateKind::StageFailure,
+            "old request",
+        )
+        .unwrap();
 
-        Gates::write_gate(dir.path(), phase, Stage::Code, "replacement request").unwrap();
+        Gates::write_gate(
+            dir.path(),
+            phase,
+            Stage::Code,
+            GateKind::StageFailure,
+            "replacement request",
+        )
+        .unwrap();
 
         let gate: GateFile = serde_json::from_str(
             &std::fs::read_to_string(Gates::gate_path(dir.path(), phase, Stage::Code)).unwrap(),
@@ -2282,7 +3018,7 @@ mod tests {
         let stage = Stage::Code;
         let gates_dir = Synced::Dir(Gates::dir(dir.path()));
 
-        Gates::write_gate(dir.path(), phase, stage, "ctx").unwrap();
+        Gates::write_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx").unwrap();
         let synced = take_synced();
         assert!(synced.contains(&gates_dir), "write_gate: {synced:?}");
 
@@ -2319,12 +3055,14 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let rejected = serde_json::to_string(&GateResponse {
             approved: false,
+            abort: false,
             note: Some("first answer".into()),
             responded_by: None,
         })
         .unwrap();
         let approved = serde_json::to_string(&GateResponse {
             approved: true,
+            abort: false,
             note: Some("second answer".into()),
             responded_by: None,
         })
@@ -2356,12 +3094,19 @@ mod tests {
         let phase = PhaseId::new(48);
         let response = GateResponse {
             approved: true,
+            abort: false,
             note: None,
             responded_by: None,
         };
-        let gate = Gates::open_gate(dir.path(), phase, Stage::Code, "ctx")
-            .unwrap()
-            .gate_id;
+        let gate = Gates::open_gate(
+            dir.path(),
+            phase,
+            Stage::Code,
+            GateKind::StageFailure,
+            "ctx",
+        )
+        .unwrap()
+        .gate_id;
 
         Gates::answer(dir.path(), phase, Stage::Code, &gate, &response).unwrap();
 
@@ -2379,12 +3124,13 @@ mod tests {
     #[test]
     fn an_answer_round_trips_through_await_answer() {
         let dir = tempfile::tempdir().unwrap();
-        let (phase, stage) = (PhaseId::new(9), Stage::Ship);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let (phase, stage) = (PhaseId::new(9), Stage::Validate);
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         let response = GateResponse {
             approved: false,
+            abort: true,
             note: Some("abort: nope".into()),
             responded_by: Some("cli".into()),
         };
@@ -2408,13 +3154,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let response = GateResponse {
             approved: true,
+            abort: false,
             note: None,
             responded_by: None,
         };
         let err = Gates::answer(
             dir.path(),
             PhaseId::new(3),
-            Stage::Ship,
+            Stage::Validate,
             &GateId::new(),
             &response,
         )
@@ -2426,11 +3173,12 @@ mod tests {
     fn answer_refuses_to_clobber_an_unconsumed_answer() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(4), Stage::Validate);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         let response = GateResponse {
             approved: true,
+            abort: false,
             note: None,
             responded_by: None,
         };
@@ -2446,6 +3194,7 @@ mod tests {
     fn gate_action_advances_on_approval() {
         let response = GateResponse {
             approved: true,
+            abort: false,
             note: None,
             responded_by: None,
         };
@@ -2456,26 +3205,145 @@ mod tests {
     fn gate_action_loops_back_on_fixable_rejection() {
         let response = GateResponse {
             approved: false,
+            abort: false,
             note: Some("fix the failing test".into()),
             responded_by: None,
         };
         assert_eq!(
             GateAction::from_response(&response),
-            GateAction::LoopBack(Stage::Code)
+            GateAction::LoopBack {
+                stage: Stage::Code,
+                note: Some("fix the failing test".into()),
+            }
+        );
+    }
+
+    /// The rule `from_response` used before the `abort` field (999.189): any
+    /// rejection whose note contained "abort" ended the run. Kept only as the
+    /// control the tests below disagree with.
+    fn old_substring_rule(response: &GateResponse) -> GateAction {
+        if response.approved {
+            return GateAction::Advance;
+        }
+        match response.note.as_deref() {
+            Some(note) if note.to_ascii_lowercase().contains("abort") => {
+                GateAction::Abort(note.to_string())
+            }
+            _ => GateAction::LoopBack {
+                stage: Stage::Code,
+                note: response.note.clone(),
+            },
+        }
+    }
+
+    #[test]
+    fn a_note_containing_abort_does_not_abort() {
+        let response = GateResponse {
+            approved: false,
+            abort: false,
+            note: Some("do not abort, fix the test".into()),
+            responded_by: None,
+        };
+        assert_eq!(
+            GateAction::from_response(&response),
+            GateAction::LoopBack {
+                stage: Stage::Code,
+                note: Some("do not abort, fix the test".into()),
+            }
+        );
+        assert!(
+            matches!(old_substring_rule(&response), GateAction::Abort(_)),
+            "control: the note-substring rule must abort on this note, or the test shows nothing"
         );
     }
 
     #[test]
-    fn gate_action_aborts_when_note_says_abort() {
+    fn an_explicit_abort_field_aborts() {
         let response = GateResponse {
             approved: false,
-            note: Some("abort: requirements changed".into()),
+            abort: true,
+            note: None,
             responded_by: None,
         };
         assert!(matches!(
             GateAction::from_response(&response),
             GateAction::Abort(_)
         ));
+    }
+
+    #[test]
+    fn an_answer_that_approves_and_aborts_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
+            .unwrap()
+            .gate_id;
+        let both = GateResponse {
+            approved: true,
+            abort: true,
+            note: None,
+            responded_by: None,
+        };
+        let refused = Gates::answer(dir.path(), phase, stage, &gate, &both);
+        let message = refused
+            .as_ref()
+            .expect_err("an answer that approves and aborts must be refused")
+            .to_string();
+        assert!(
+            message.contains("both approve and abort"),
+            "the refusal must name both fields: {message}"
+        );
+        assert!(
+            !Gates::answer_path(dir.path(), phase, stage, &gate).exists(),
+            "a refused answer writes nothing"
+        );
+    }
+
+    #[test]
+    fn a_hand_written_approve_and_abort_reads_as_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
+            .unwrap()
+            .gate_id;
+        let hand_written = GateAnswer {
+            gate_id: gate.to_string(),
+            response: GateResponse {
+                approved: true,
+                abort: true,
+                note: Some("ship it".into()),
+                responded_by: Some("someone".into()),
+            },
+        };
+        std::fs::write(
+            Gates::answer_path(dir.path(), phase, stage, &gate),
+            serde_json::to_string(&hand_written).unwrap(),
+        )
+        .unwrap();
+        let AnswerRead::Bound(answer) = Gates::read_answer(dir.path(), phase, stage, &gate) else {
+            panic!("the hand-written file must read back as an answer to its gate");
+        };
+        let GateAction::Abort(reason) = GateAction::from_response(&answer.response) else {
+            panic!("an answer that approves and aborts must never advance");
+        };
+        assert!(
+            reason.contains("both approves and aborts"),
+            "the reason must name the invalid answer: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_record_without_the_abort_field_is_not_an_abort() {
+        let response: GateResponse =
+            serde_json::from_str(r#"{"approved":false,"note":"abort"}"#).unwrap();
+        assert!(!response.abort);
+        assert_eq!(
+            GateAction::from_response(&response),
+            GateAction::LoopBack {
+                stage: Stage::Code,
+                note: Some("abort".into()),
+            }
+        );
     }
 
     /// `run_notify_command` takes the command string as an argument (not an
@@ -2486,15 +3354,179 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sentinel = dir.path().join("sentinel");
         let cmd = format!("touch {}", sentinel.display());
-        run_notify_command(&cmd, PhaseId::new(11), Stage::Ship, "ctx", false);
+        run_notify_command(&cmd, PhaseId::new(11), Stage::Validate, "ctx", false);
         assert!(sentinel.exists());
+    }
+
+    /// GATE-04, Pitfall 6: a context stored whole must not put kilobytes into
+    /// a notification. The hook's `DEVFLOW_GATE_CONTEXT` is the context cut to
+    /// [`GATE_CONTEXT_DISPLAY_CHARS`] characters at a character boundary, with
+    /// the display's truncation suffix; a context of exactly the bound, with
+    /// multi-byte characters, arrives unchanged.
+    #[test]
+    fn notify_context_is_capped_at_the_display_bound() {
+        const SUFFIX: &str = "… [truncated; full output in .devflow/]";
+        let dir = tempfile::tempdir().unwrap();
+        let recorded = dir.path().join("context");
+        let cmd = format!(
+            "printf '%s' \"$DEVFLOW_GATE_CONTEXT\" > '{}'",
+            recorded.display()
+        );
+        let notified = |context: &str| {
+            run_notify_command(&cmd, PhaseId::new(11), Stage::Code, context, true);
+            std::fs::read_to_string(&recorded).expect("the hook recorded its context")
+        };
+
+        let long = "é".repeat(4000);
+        let sent = notified(&long);
+        assert_eq!(sent.chars().count(), GATE_CONTEXT_DISPLAY_CHARS, "{sent}");
+        assert!(sent.ends_with(SUFFIX), "{sent}");
+        assert_eq!(
+            sent.strip_suffix(SUFFIX).unwrap(),
+            "é".repeat(GATE_CONTEXT_DISPLAY_CHARS - SUFFIX.chars().count()),
+            "the cut keeps whole characters"
+        );
+
+        let at_bound: String = "aé…"
+            .chars()
+            .cycle()
+            .take(GATE_CONTEXT_DISPLAY_CHARS)
+            .collect();
+        assert_eq!(
+            notified(&at_bound),
+            at_bound,
+            "a context at the bound is unchanged"
+        );
+        let one_over = format!("{at_bound}x");
+        assert_eq!(
+            notified(&one_over).chars().count(),
+            GATE_CONTEXT_DISPLAY_CHARS,
+            "one character over is cut to the bound"
+        );
+    }
+
+    #[test]
+    fn a_failing_notify_hook_is_reported_without_tracing() {
+        let mut sink = Vec::new();
+        run_notify_command_to(
+            "echo hook-said-no >&2; exit 3",
+            PhaseId::new(11),
+            Stage::Validate,
+            "ctx",
+            false,
+            &mut sink,
+        );
+        let text = String::from_utf8(sink).unwrap();
+        assert!(
+            text.starts_with("warning: the gate notify hook exited with status 3")
+                && text.contains("hook-said-no"),
+            "the operator must be told the hook failed: {text:?}"
+        );
+    }
+
+    #[test]
+    fn a_succeeding_notify_hook_writes_no_warning() {
+        // Control for the test above.
+        let mut sink = Vec::new();
+        run_notify_command_to(
+            "true",
+            PhaseId::new(11),
+            Stage::Validate,
+            "ctx",
+            false,
+            &mut sink,
+        );
+        assert!(sink.is_empty());
+    }
+
+    #[test]
+    fn an_unparsable_gate_file_is_reported_without_tracing() {
+        let dir = tempfile::tempdir().unwrap();
+        let gates = Gates::dir(dir.path());
+        std::fs::create_dir_all(&gates).unwrap();
+        std::fs::write(gates.join("07-code.json"), "{ not a gate").unwrap();
+        let mut sink = Vec::new();
+        assert!(Gates::list_open_to(dir.path(), &mut sink).is_empty());
+        let text = String::from_utf8(sink).unwrap();
+        assert!(
+            text.starts_with("warning: not listing ") && text.contains("07-code.json"),
+            "the operator must be told the gate is hidden: {text:?}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_gate_file_is_reported_without_tracing() {
+        let dir = tempfile::tempdir().unwrap();
+        let gates = Gates::dir(dir.path());
+        // A directory where the gate file belongs: the read fails.
+        std::fs::create_dir_all(gates.join("07-code.json")).unwrap();
+        let mut sink = Vec::new();
+        assert!(Gates::list_open_to(dir.path(), &mut sink).is_empty());
+        let text = String::from_utf8(sink).unwrap();
+        assert!(
+            text.starts_with("warning: not listing ") && text.contains("07-code.json"),
+            "the operator must be told the gate is hidden: {text:?}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_waiter_registration_is_reported_without_tracing() {
+        let dir = tempfile::tempdir().unwrap();
+        let gates = Gates::dir(dir.path());
+        std::fs::create_dir_all(&gates).unwrap();
+        let path = gates.join(format!("07-code{WAITER_SUFFIX}"));
+        // Held, so it reads live, with a record that does not parse.
+        let held = std::fs::File::create(&path).unwrap();
+        std::io::Write::write_all(&mut &held, b"not-a-pid\n").unwrap();
+        held.lock().unwrap();
+        let mut sink = Vec::new();
+        assert!(Gates::live_waiter_holders_to(dir.path(), &mut sink).is_empty());
+        drop(held);
+        let text = String::from_utf8(sink).unwrap();
+        assert!(
+            text.starts_with("warning: could not read the waiter registration ")
+                && text.contains(WAITER_SUFFIX),
+            "the operator must be told a waiter was left out: {text:?}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_gate_answer_is_reported_without_tracing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(7);
+        let gate = GateId::new();
+        let answer = Gates::answer_path(root, phase, Stage::Code, &gate);
+        // A directory where the answer belongs: every read fails.
+        std::fs::create_dir_all(&answer).unwrap();
+        let reads = std::cell::Cell::new(0u32);
+        let mut sink = Vec::new();
+        let outcome = Gates::await_answer_to(
+            root,
+            phase,
+            Stage::Code,
+            &gate,
+            60,
+            || {
+                reads.set(reads.get() + 1);
+                reads.get() > 1
+            },
+            &mut sink,
+        );
+        assert!(matches!(outcome, AwaitOutcome::Cancelled));
+        let text = String::from_utf8(sink).unwrap();
+        assert!(
+            text.starts_with("warning: could not read the gate answer ")
+                && text.contains("still waiting"),
+            "the operator must be told the answer is unreadable: {text:?}"
+        );
     }
 
     #[test]
     fn notify_hook_failure_is_fail_soft() {
         // A command that always fails must not panic or otherwise abort the
         // caller — fail-soft per T-13-02.
-        run_notify_command("exit 1", PhaseId::new(11), Stage::Ship, "ctx", false);
+        run_notify_command("exit 1", PhaseId::new(11), Stage::Validate, "ctx", false);
     }
 
     #[test]
@@ -2514,7 +3546,13 @@ mod tests {
             "echo -n \"$DEVFLOW_NON_SILENT_GATE\" > {}",
             sentinel_expected.display()
         );
-        run_notify_command(&cmd_expected, PhaseId::new(11), Stage::Ship, "ctx", false);
+        run_notify_command(
+            &cmd_expected,
+            PhaseId::new(11),
+            Stage::Validate,
+            "ctx",
+            false,
+        );
         assert_eq!(std::fs::read_to_string(&sentinel_expected).unwrap(), "0");
     }
 
@@ -2591,7 +3629,7 @@ mod tests {
             std::env::remove_var("DEVFLOW_GATE_NOTIFY_CMD");
         }
         // Must return normally without touching the filesystem or panicking.
-        fire_gate_notify(PhaseId::new(11), Stage::Ship, "ctx", false);
+        fire_gate_notify(PhaseId::new(11), Stage::Validate, "ctx", false);
     }
 
     #[test]
@@ -2604,7 +3642,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sentinel = dir.path().join("sentinel");
         let cmd = format!("touch {}", sentinel.display());
-        fire_gate_notify_with_fallback(PhaseId::new(11), Stage::Ship, "ctx", false, Some(&cmd));
+        fire_gate_notify_with_fallback(PhaseId::new(11), Stage::Validate, "ctx", false, Some(&cmd));
         assert!(sentinel.exists());
     }
 
@@ -2625,7 +3663,7 @@ mod tests {
         let got = Gates::await_answer(
             dir.path(),
             PhaseId::new(13),
-            Stage::Define,
+            Stage::Plan,
             &GateId::new(),
             60,
             || cancelled.load(std::sync::atomic::Ordering::SeqCst),
@@ -2645,12 +3683,13 @@ mod tests {
     #[test]
     fn await_answer_returns_the_answer_when_not_cancelled() {
         let dir = tempfile::tempdir().unwrap();
-        let (phase, stage) = (PhaseId::new(13), Stage::Define);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let (phase, stage) = (PhaseId::new(13), Stage::Plan);
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         let response = GateResponse {
             approved: true,
+            abort: false,
             note: Some("go".into()),
             responded_by: Some("human".into()),
         };
@@ -2673,9 +3712,14 @@ mod tests {
         let empty = tempfile::tempdir().unwrap();
         let started = std::time::Instant::now();
         assert_eq!(
-            Gates::await_answer(empty.path(), phase, Stage::Ship, &GateId::new(), 1, || {
-                false
-            }),
+            Gates::await_answer(
+                empty.path(),
+                phase,
+                Stage::Validate,
+                &GateId::new(),
+                1,
+                || { false }
+            ),
             AwaitOutcome::TimedOut
         );
         assert!(
@@ -2687,6 +3731,7 @@ mod tests {
     fn approved() -> GateResponse {
         GateResponse {
             approved: true,
+            abort: false,
             note: None,
             responded_by: Some("human".into()),
         }
@@ -2749,7 +3794,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
 
-        let opened = Gates::open_gate(dir.path(), phase, stage, "ctx").unwrap();
+        let opened =
+            Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx").unwrap();
         let gate = opened.gate_id.clone();
         assert!(is_gate_id(gate.as_str()), "{gate} is not a gate id");
         assert_eq!(opened.path, Gates::gate_path(dir.path(), phase, stage));
@@ -2793,8 +3839,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
 
-        let first = Gates::open_gate(dir.path(), phase, stage, "first").unwrap();
-        let second = Gates::open_gate(dir.path(), phase, stage, "second").unwrap();
+        let first =
+            Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "first").unwrap();
+        let second =
+            Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "second").unwrap();
 
         assert_ne!(first.gate_id, second.gate_id);
         assert_eq!(
@@ -2808,7 +3856,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
 
-        let path = Gates::write_gate(dir.path(), phase, stage, "ctx").unwrap();
+        let path =
+            Gates::write_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx").unwrap();
 
         assert_eq!(path, Gates::gate_path(dir.path(), phase, stage));
         let gate = read_gate(dir.path(), phase, stage);
@@ -2834,11 +3883,11 @@ mod tests {
     fn write_gate_sets_aside_the_earlier_gates_unconsumed_answer() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        Gates::write_gate(dir.path(), phase, stage, "first").unwrap();
+        Gates::write_gate(dir.path(), phase, stage, GateKind::StageFailure, "first").unwrap();
         let first = GateId::parse(&read_gate(dir.path(), phase, stage).gate_id).unwrap();
         let answer = Gates::answer(dir.path(), phase, stage, &first, &approved()).unwrap();
 
-        Gates::write_gate(dir.path(), phase, stage, "second").unwrap();
+        Gates::write_gate(dir.path(), phase, stage, GateKind::StageFailure, "second").unwrap();
 
         assert_ne!(read_gate(dir.path(), phase, stage).gate_id, first.as_str());
         assert!(!answer.exists());
@@ -2851,7 +3900,7 @@ mod tests {
     fn an_answer_without_a_gate_id_is_quarantined_and_a_valid_one_is_then_accepted() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         let slot = Gates::answer_path(dir.path(), phase, stage, &gate);
@@ -2893,7 +3942,7 @@ mod tests {
     fn answer_sets_aside_an_unbound_answer_in_its_own_slot_before_publishing() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         let slot = Gates::answer_path(dir.path(), phase, stage, &gate);
@@ -2921,6 +3970,7 @@ mod tests {
         let bound = std::fs::read(&slot).unwrap();
         let rejection = GateResponse {
             approved: false,
+            abort: false,
             note: Some("second answer".into()),
             responded_by: None,
         };
@@ -2939,7 +3989,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
         let old = GateId::new();
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         let slot = Gates::answer_path(dir.path(), phase, stage, &gate);
@@ -2985,7 +4035,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
         let old = GateId::new();
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
 
@@ -3017,14 +4067,14 @@ mod tests {
     fn a_late_respond_after_cleanup_cannot_decide_the_next_gate() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let first = Gates::open_gate(dir.path(), phase, stage, "first")
+        let first = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "first")
             .unwrap()
             .gate_id;
         let mut next = None;
 
         let late = Gates::answer_with_hook(dir.path(), phase, stage, &first, &approved(), || {
             next = Some(
-                Gates::open_gate(dir.path(), phase, stage, "next")
+                Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "next")
                     .unwrap()
                     .gate_id,
             );
@@ -3056,7 +4106,7 @@ mod tests {
     fn a_hostile_gate_id_in_an_answer_is_quarantined_as_noid() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         std::fs::write(
@@ -3142,7 +4192,7 @@ mod tests {
     fn a_gate_operation_gives_up_on_a_held_gate_lock_after_its_bound() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         let slot = Gates::answer_path(dir.path(), phase, stage, &gate);
@@ -3178,7 +4228,7 @@ mod tests {
     fn every_stage_answered(root: &Path, phase: PhaseId) -> Vec<PathBuf> {
         let mut files = Vec::new();
         for stage in STAGES {
-            let gate = Gates::open_gate(root, phase, stage, "ctx").unwrap();
+            let gate = Gates::open_gate(root, phase, stage, GateKind::StageFailure, "ctx").unwrap();
             let answer = Gates::answer(root, phase, stage, &gate.gate_id, &approved()).unwrap();
             files.extend([gate.path, answer]);
         }
@@ -3271,7 +4321,7 @@ mod tests {
     fn an_answer_whose_recheck_cannot_take_the_gate_lock_is_published_unconfirmed() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         let mut parked = None;
@@ -3308,7 +4358,7 @@ mod tests {
 
         // The control: held before the call, the writer publishes nothing and says so.
         let other = Stage::Validate;
-        let second = Gates::open_gate(dir.path(), phase, other, "ctx")
+        let second = Gates::open_gate(dir.path(), phase, other, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         let holder = hold_gate_lock(dir.path(), phase);
@@ -3341,10 +4391,13 @@ mod tests {
     fn a_fenced_answers_two_gate_waits_reach_the_write_lock_repair_wait() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let (phase, stage) = (PhaseId::new(2102), Stage::Ship);
-        let gate = Gates::open_gate(root, phase, stage, "ctx").unwrap().gate_id;
+        let (phase, stage) = (PhaseId::new(2102), Stage::Validate);
+        let gate = Gates::open_gate(root, phase, stage, GateKind::StageFailure, "ctx")
+            .unwrap()
+            .gate_id;
         let response = GateResponse {
             approved: true,
+            abort: false,
             note: None,
             responded_by: Some("test".into()),
         };
@@ -3437,6 +4490,7 @@ mod tests {
     fn rejection() -> GateResponse {
         GateResponse {
             approved: false,
+            abort: false,
             note: Some("rejected".into()),
             responded_by: None,
         }
@@ -3465,7 +4519,7 @@ mod tests {
     fn closing_a_gate_sets_aside_unconsumed_answers_and_removes_consumed_ones() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         Gates::answer(dir.path(), phase, stage, &gate, &approved()).unwrap();
@@ -3520,7 +4574,7 @@ mod tests {
     fn a_claimed_body_that_does_not_bind_is_reported_and_set_aside_not_deleted() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         std::fs::write(
@@ -3552,12 +4606,12 @@ mod tests {
     }
 
     /// R-08: a gate id is never reused, so once its gate file is gone or replaced no
-    /// claim of it can succeed: a paused `devflow ship` cannot finalize a second time.
+    /// claim of it can succeed: a paused consumer cannot act on it a second time.
     #[test]
     fn a_paused_consumer_cannot_claim_a_gate_that_closed_or_was_replaced() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let first = Gates::open_gate(dir.path(), phase, stage, "first")
+        let first = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "first")
             .unwrap()
             .gate_id;
         Gates::answer(dir.path(), phase, stage, &first, &approved()).unwrap();
@@ -3573,7 +4627,7 @@ mod tests {
             Claim::Claimed
         );
         Gates::close(dir.path(), phase, stage).unwrap();
-        let next = Gates::open_gate(dir.path(), phase, stage, "next")
+        let next = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "next")
             .unwrap()
             .gate_id;
         let next_gate_file = std::fs::read(Gates::gate_path(dir.path(), phase, stage)).unwrap();
@@ -3598,7 +4652,7 @@ mod tests {
 
         // A gate closed with none opened after it.
         let other = Stage::Validate;
-        let closed = Gates::open_gate(dir.path(), phase, other, "ctx")
+        let closed = Gates::open_gate(dir.path(), phase, other, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         Gates::close(dir.path(), phase, other).unwrap();
@@ -3621,12 +4675,13 @@ mod tests {
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
         let kept = GateResponse {
             approved: true,
+            abort: false,
             note: Some("kept".into()),
             responded_by: None,
         };
         if crate::test_support::in_child_test(NAME) {
             let root = PathBuf::from(std::env::var_os("CLAIM_KILL_ROOT").unwrap());
-            let gate = Gates::open_gate(&root, phase, stage, "ctx")
+            let gate = Gates::open_gate(&root, phase, stage, GateKind::StageFailure, "ctx")
                 .unwrap()
                 .gate_id;
             Gates::answer(&root, phase, stage, &gate, &kept).unwrap();
@@ -3670,7 +4725,7 @@ mod tests {
         assert_eq!(events[0]["note"], "kept");
 
         // The control: an answer nobody claimed is never reported as claimed.
-        let unclaimed = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let unclaimed = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         Gates::answer(dir.path(), phase, stage, &unclaimed, &approved()).unwrap();
@@ -3695,7 +4750,7 @@ mod tests {
         let second = GateId::parse(SECOND).unwrap();
         if crate::test_support::in_child_test(NAME) {
             let root = PathBuf::from(std::env::var_os("CLOSE_KILL_ROOT").unwrap());
-            Gates::open_gate(&root, phase, stage, "ctx").unwrap();
+            Gates::open_gate(&root, phase, stage, GateKind::StageFailure, "ctx").unwrap();
             plant_claimed_pair(&root, phase, stage, &first);
             plant_claimed_pair(&root, phase, stage, &second);
             let mut hook = |step: DisposalStep| {
@@ -3759,14 +4814,14 @@ mod tests {
     fn opening_a_gate_sets_aside_the_previous_gates_unconsumed_answer() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let first = Gates::open_gate(dir.path(), phase, stage, "first")
+        let first = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "first")
             .unwrap()
             .gate_id;
         Gates::answer(dir.path(), phase, stage, &first, &approved()).unwrap();
         let legacy = legacy_response_path(dir.path(), phase, stage);
         std::fs::write(&legacy, "{\"approved\":true}").unwrap();
 
-        let next = Gates::open_gate(dir.path(), phase, stage, "next")
+        let next = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "next")
             .unwrap()
             .gate_id;
 
@@ -3789,9 +4844,15 @@ mod tests {
     fn quarantined_lists_every_set_aside_answer() {
         let dir = tempfile::tempdir().unwrap();
         let decimal: PhaseId = "50.1".parse().unwrap();
-        let first = Gates::open_gate(dir.path(), PhaseId::new(7), Stage::Code, "ctx")
-            .unwrap()
-            .gate_id;
+        let first = Gates::open_gate(
+            dir.path(),
+            PhaseId::new(7),
+            Stage::Code,
+            GateKind::StageFailure,
+            "ctx",
+        )
+        .unwrap()
+        .gate_id;
         Gates::answer(
             dir.path(),
             PhaseId::new(7),
@@ -3801,9 +4862,15 @@ mod tests {
         )
         .unwrap();
         Gates::close(dir.path(), PhaseId::new(7), Stage::Code).unwrap();
-        let second = Gates::open_gate(dir.path(), decimal, Stage::Validate, "ctx")
-            .unwrap()
-            .gate_id;
+        let second = Gates::open_gate(
+            dir.path(),
+            decimal,
+            Stage::Validate,
+            GateKind::StageFailure,
+            "ctx",
+        )
+        .unwrap()
+        .gate_id;
         std::fs::write(
             Gates::answer_path(dir.path(), decimal, Stage::Validate, &second),
             "not json",
@@ -3837,39 +4904,41 @@ mod tests {
     }
 
     #[test]
-    fn reap_answer_writes_a_rejection_for_the_observed_gate_only() {
+    fn reap_answer_writes_an_abort_for_the_observed_gate_only() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         let other = GateId::new();
 
-        let refused = Gates::reap_answer(dir.path(), phase, stage, &other, "abort: x", "sweep");
+        let refused = Gates::reap_answer(dir.path(), phase, stage, &other, "reaped", "sweep");
         assert!(
             matches!(refused, Err(GateError::GateIdMismatch { .. })),
             "{refused:?}"
         );
         assert!(!Gates::answer_path(dir.path(), phase, stage, &other).exists());
 
-        Gates::reap_answer(dir.path(), phase, stage, &gate, "abort: x", "sweep").unwrap();
+        // The note does not say "abort": the field alone must make it one.
+        Gates::reap_answer(dir.path(), phase, stage, &gate, "reaped", "sweep").unwrap();
 
         let AnswerRead::Bound(answer) = Gates::read_answer(dir.path(), phase, stage, &gate) else {
             panic!("the reap must be read back as an answer to its gate");
         };
         assert!(!answer.response.approved);
+        assert!(answer.response.abort, "a reap is an abort");
         assert_eq!(answer.response.responded_by.as_deref(), Some("sweep"));
-        assert!(matches!(
+        assert_eq!(
             GateAction::from_response(&answer.response),
-            GateAction::Abort(_)
-        ));
+            GateAction::Abort("reaped".to_string())
+        );
     }
 
     #[test]
     fn list_open_reports_the_gate_id_and_hides_a_gate_its_live_answer_decided() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         let open = Gates::list_open(dir.path());
@@ -3879,7 +4948,14 @@ mod tests {
         // What sits beside a gate file must not read as another request, even with a
         // gate-shaped body, in a decimal phase whose own name holds a dot.
         let decimal: PhaseId = "50.1".parse().unwrap();
-        let decimal_gate = Gates::open_gate(dir.path(), decimal, stage, "decimal").unwrap();
+        let decimal_gate = Gates::open_gate(
+            dir.path(),
+            decimal,
+            stage,
+            GateKind::StageFailure,
+            "decimal",
+        )
+        .unwrap();
         let gate_shaped = std::fs::read_to_string(&decimal_gate.path).unwrap();
         for name in [
             "50.1-code.noid.1.1.0.quarantined.json",
@@ -3922,7 +4998,7 @@ mod tests {
     fn close_reports_removed_for_a_lone_gate_file_and_for_a_lone_temp() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        Gates::open_gate(dir.path(), phase, stage, "ctx").unwrap();
+        Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx").unwrap();
         assert!(Gates::close(dir.path(), phase, stage).unwrap().removed);
 
         std::fs::write(Gates::dir(dir.path()).join(".07-code.json.1.0.tmp"), "temp").unwrap();
@@ -3949,7 +5025,7 @@ mod tests {
     fn a_claim_with_its_answer_already_gone_is_reported_without_one() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         assert_eq!(
@@ -3975,7 +5051,7 @@ mod tests {
     fn a_claimed_answer_that_cannot_be_read_stops_the_close_and_keeps_the_gate_file() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         let slot = Gates::answer_path(dir.path(), phase, stage, &gate);
@@ -4012,7 +5088,7 @@ mod tests {
     fn an_answer_slot_that_cannot_be_read_is_not_an_empty_slot() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         let slot = Gates::answer_path(dir.path(), phase, stage, &gate);
@@ -4132,7 +5208,7 @@ mod tests {
             .as_secs();
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         let slot = Gates::answer_path(dir.path(), phase, stage, &gate);
@@ -4255,7 +5331,7 @@ mod tests {
     fn a_registered_waiter_reads_live_and_its_answer_is_awaited_and_claimed() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         let registration = Gates::register_waiter(dir.path(), phase, stage, &gate).unwrap();
@@ -4307,7 +5383,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let path_dir = tempfile::tempdir().unwrap();
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
 
@@ -4348,7 +5424,7 @@ mod tests {
         const ID_LESS_BODY: &str = "{\"approved\":true}";
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         let slot = Gates::answer_path(dir.path(), phase, stage, &gate);
@@ -4526,6 +5602,7 @@ mod tests {
             shipped.path(),
             phase,
             stage,
+            GateKind::StageFailure.into(),
             "ctx",
             || {},
             || shipped_read = Some(answer_if_registered(shipped.path(), phase, stage)),
@@ -4587,6 +5664,7 @@ mod tests {
                 &root,
                 phase,
                 stage,
+                GateKind::StageFailure.into(),
                 "ctx",
                 || kill_at(BEFORE_PUBLISH),
                 || kill_at(AFTER_PUBLISH),
@@ -4652,6 +5730,7 @@ mod tests {
             dir.path(),
             phase,
             stage,
+            GateKind::StageFailure.into(),
             "ctx",
             || registered_at_publish = Some(waiter_files(dir.path()).len()),
             || panic!("the publish must fail"),
@@ -4692,7 +5771,7 @@ mod tests {
     fn await_answer_checks_cancellation_before_reading_an_answer() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         let slot = Gates::answer(dir.path(), phase, stage, &gate, &approved()).unwrap();
@@ -4714,7 +5793,7 @@ mod tests {
     fn await_answer_reads_once_more_at_its_deadline() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         let root = dir.path().to_path_buf();
@@ -4769,7 +5848,7 @@ mod tests {
         const MORE_READS_SEEN: u32 = 3;
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let first = Gates::open_gate(dir.path(), phase, stage, "first")
+        let first = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "first")
             .unwrap()
             .gate_id;
         let registration = Gates::register_waiter(dir.path(), phase, stage, &first).unwrap();
@@ -4786,7 +5865,7 @@ mod tests {
             })
         };
 
-        let current = Gates::open_gate(dir.path(), phase, stage, "second")
+        let current = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "second")
             .unwrap()
             .gate_id;
         Gates::answer(dir.path(), phase, stage, &current, &approved()).unwrap();
@@ -4846,7 +5925,7 @@ mod tests {
 
         let opened = tempfile::tempdir().unwrap();
         preanswer_gate(opened.path(), phase, stage, &rejection());
-        let gate = Gates::open_gate(opened.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(opened.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         assert_eq!(
@@ -4857,8 +5936,14 @@ mod tests {
 
         let registered = tempfile::tempdir().unwrap();
         preanswer_gate(registered.path(), phase, stage, &rejection());
-        let (opened_gate, registration) =
-            Gates::open_registered(registered.path(), phase, stage, "ctx").unwrap();
+        let (opened_gate, registration) = Gates::open_registered(
+            registered.path(),
+            phase,
+            stage,
+            GateKind::StageFailure,
+            "ctx",
+        )
+        .unwrap();
         assert_eq!(
             Gates::await_answer(
                 registered.path(),
@@ -4874,7 +5959,7 @@ mod tests {
 
         let written = tempfile::tempdir().unwrap();
         preanswer_gate(written.path(), phase, stage, &rejection());
-        Gates::write_gate(written.path(), phase, stage, "ctx").unwrap();
+        Gates::write_gate(written.path(), phase, stage, GateKind::StageFailure, "ctx").unwrap();
         let gate = GateId::parse(&read_gate(written.path(), phase, stage).gate_id).unwrap();
         assert_eq!(
             Gates::await_answer(written.path(), phase, stage, &gate, 5, || false),
@@ -4884,9 +5969,15 @@ mod tests {
         // The control: a pre-answer for another stage decides nothing here.
         let elsewhere = tempfile::tempdir().unwrap();
         preanswer_gate(elsewhere.path(), phase, Stage::Validate, &rejection());
-        let gate = Gates::open_gate(elsewhere.path(), phase, stage, "ctx")
-            .unwrap()
-            .gate_id;
+        let gate = Gates::open_gate(
+            elsewhere.path(),
+            phase,
+            stage,
+            GateKind::StageFailure,
+            "ctx",
+        )
+        .unwrap()
+        .gate_id;
         assert_eq!(
             Gates::read_answer(elsewhere.path(), phase, stage, &gate),
             AnswerRead::None
@@ -4906,7 +5997,7 @@ mod tests {
             || {
                 let dir = tempfile::tempdir().unwrap();
                 let (phase, stage) = (PhaseId::new(7), Stage::Code);
-                Gates::write_gate(dir.path(), phase, stage, "ctx").unwrap();
+                Gates::write_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx").unwrap();
                 let live = GateId::parse(&read_gate(dir.path(), phase, stage).gate_id).unwrap();
                 Gates::answer(dir.path(), phase, stage, &live, &approved()).unwrap();
                 assert_eq!(
@@ -5010,7 +6101,7 @@ mod tests {
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
         std::fs::create_dir_all(Gates::preanswer_path(dir.path(), phase, stage)).unwrap();
 
-        let opened = Gates::open_gate(dir.path(), phase, stage, "ctx");
+        let opened = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx");
 
         assert!(matches!(opened, Err(GateError::Io(_))), "{opened:?}");
     }
@@ -5298,9 +6389,15 @@ mod tests {
 
         let before_open = tempfile::tempdir().unwrap();
         let (path, body) = plant_legacy_answer(before_open.path(), phase, stage);
-        let gate = Gates::open_gate(before_open.path(), phase, stage, "ctx")
-            .unwrap()
-            .gate_id;
+        let gate = Gates::open_gate(
+            before_open.path(),
+            phase,
+            stage,
+            GateKind::StageFailure,
+            "ctx",
+        )
+        .unwrap()
+        .gate_id;
         assert!(!path.exists(), "the open sets the legacy answer aside");
         assert_eq!(quarantine_reasons(before_open.path()), ["legacy_unkeyed"]);
         let set_aside = quarantine_files(before_open.path());
@@ -5312,9 +6409,15 @@ mod tests {
         );
 
         let after_open = tempfile::tempdir().unwrap();
-        let live = Gates::open_gate(after_open.path(), phase, stage, "ctx")
-            .unwrap()
-            .gate_id;
+        let live = Gates::open_gate(
+            after_open.path(),
+            phase,
+            stage,
+            GateKind::StageFailure,
+            "ctx",
+        )
+        .unwrap()
+        .gate_id;
         let (path, body) = plant_legacy_answer(after_open.path(), phase, stage);
         let open = Gates::list_open(after_open.path());
         assert_eq!(open.len(), 1, "a legacy answer does not hide the gate");
@@ -5344,15 +6447,24 @@ mod tests {
     fn a_gate_file_without_an_id_is_not_listed_as_open() {
         let dir = tempfile::tempdir().unwrap();
         let phase = PhaseId::new(7);
-        let listed = Gates::open_gate(dir.path(), phase, Stage::Validate, "listed")
-            .unwrap()
-            .gate_id;
+        let listed = Gates::open_gate(
+            dir.path(),
+            phase,
+            Stage::Validate,
+            GateKind::StageFailure,
+            "listed",
+        )
+        .unwrap()
+        .gate_id;
         let mut idless = serde_json::to_value(GateFile {
             phase,
             stage: Stage::Code,
             context: "no id".into(),
             timestamp: "1750000000".into(),
             gate_id: GateId::new().to_string(),
+            gate_kind: None,
+            gsd_status: None,
+            not_before: None,
         })
         .unwrap();
         assert!(idless.as_object_mut().unwrap().remove("gate_id").is_some());

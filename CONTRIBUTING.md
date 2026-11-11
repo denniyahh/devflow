@@ -289,7 +289,7 @@ crates/
 - `cargo fmt --check`
 - `Build + test in devcontainer`
 
-`devflow test` runs these checks locally, and
+`scripts/check.sh all` runs these checks locally, and
 [`scripts/hooks/pre-push`](scripts/hooks/pre-push) runs them before a push.
 The `--all-targets` scope is load-bearing: the narrower `cargo clippy -- -D
 warnings` does not compile test targets, so lints inside `#[cfg(test)]`
@@ -330,9 +330,8 @@ does any of the following:
 4. Greps implementation text as a substitute for a runtime contract that
    could have been asserted directly.
 
-Enforcement lives at the existing review-before-Ship gate:
-`/gsd-code-review` runs before Ship and refuses to ship on Critical findings
-— this contract is applied there, not aspirational.
+Enforcement lives at code review: `/gsd-code-review` applies this contract to
+each change, so it is applied, not aspirational.
 
 The single source of truth for this contract is
 [`.claude/skills/ai-change-acceptance/`](.claude/skills/ai-change-acceptance/),
@@ -355,6 +354,13 @@ through a PR.
 > the fix is `git switch -c <branch>` first. This makes step 2's "put the work
 > on a branch" mandatory at the commit level rather than a convention an
 > inattentive release cut can skip.
+
+`scripts/cut-release.sh` runs the steps below in order. Its read-only checks
+come from the unpublished workspace tool in `tools/release-preflight`:
+`scripts/cut-release.sh check` (self-pin, `develop`/`main` divergence,
+crates.io publish order, changelog version) before the cut, and
+`scripts/cut-release.sh verify` (the tag is on `main`, the `main`→`develop`
+sync ran) after it. Both read already-fetched refs; the script fetches first.
 
 1. Bump the version in **two** places in the root `Cargo.toml`: `version`
    under `[workspace.package]`, **and** `devflow-core`'s `version` under
@@ -489,7 +495,7 @@ info!(before = %current, after = %next, phase = state.phase, "step_entered");
 
 | Variable | Purpose |
 |---|---|
-| `RUST_LOG` | Controls verbosity. Set to `error`, `warn`, `info`, `debug`, or `trace`. Use targeted directives like `devflow_core=debug,devflow=info` to filter by crate. |
+| `RUST_LOG` | Controls verbosity. Unset or empty means `off`: no tracing lines. Set to `error`, `warn`, `info`, `debug`, or `trace`. Use targeted directives like `devflow_core=debug,devflow=info` to filter by crate. |
 | `DEVFLOW_LOG_FORMAT` | Set to `json` for machine-readable JSON output (one JSON object per line on stderr). |
 
 ### Do's and Don'ts

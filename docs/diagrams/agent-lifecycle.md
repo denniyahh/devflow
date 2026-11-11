@@ -46,4 +46,4 @@ flowchart TD
 
 An external verification probe is allowed only when its exact command was
 reviewed and supplied by the parent process. Validate additionally requires a
-`pass` or `gaps` verdict; Ship reads its review artifact before it can proceed.
+`pass` or `gaps` verdict.
