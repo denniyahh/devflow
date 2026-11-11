@@ -2,7 +2,7 @@
 //!
 //! State is per-phase: each active phase persists to
 //! `.devflow/state-{phase:02}.json` (mirroring the per-phase lock naming), so
-//! `devflow parallel` sibling phases never clobber one another
+//! phases running at the same time never clobber one another
 //! (13-DEFERRED-CR-03). A single-slot `.devflow/state.json` left by an older
 //! binary is not read, renamed or removed (Phase 50 D-20).
 
@@ -169,10 +169,10 @@ fn find_devflow_marker(dir: &Path) -> Option<PathBuf> {
 /// The marker takes no temp file and no file fsync (R-15): this runs on every
 /// state write, and `.gitignore` is not a state or gate record.
 ///
-/// Returns `std::io::Result<()>`, not a crate-specific error enum: this
-/// plan's seven conversion sites each live in a different module with their
-/// own error enum (`WorkflowError`, `GateError`, `MonitorError`,
-/// `ResultError`, `ShipError`, `LockError`), and every one already carries an
+/// Returns `std::io::Result<()>`, not a crate-specific error enum: its
+/// conversion sites each live in a different module with their own error
+/// enum (`WorkflowError`, `GateError`, `MonitorError`, `ResultError`), and
+/// every one already carries an
 /// `Io(#[from] std::io::Error)` variant, so `?` converts at every call site
 /// with zero signature churn.
 ///
@@ -288,8 +288,7 @@ pub const WRITE_LOCK_REPAIR_WAIT: Duration = Duration::from_secs(10);
 /// The file the phase's state write lock lives on: `.devflow/.state-NN.lock`.
 ///
 /// DevFlow never replaces or removes it, because a `flock` belongs to an inode
-/// and `state-NN.json` is replaced on every write (D-08). Its name does not start
-/// with `lock-`, so `lock.rs`'s stale-lock sweep leaves it alone.
+/// and `state-NN.json` is replaced on every write (D-08).
 ///
 /// A holder records `"{pid} {start}\n"` in it for as long as it holds the lock.
 /// The record only names a process in a message: nothing signals or waits on it,
@@ -681,13 +680,11 @@ pub fn while_owner<T, E: From<WorkflowError>>(
 
 /// What [`clear_state_if`] did.
 #[derive(Debug)]
-pub(crate) struct Cleared<A> {
+pub(crate) struct Cleared {
     /// Whether a file was removed, by the removal or before its error.
     pub(crate) removed: bool,
     /// The removal's outcome; `Ok` when the decision kept the state.
     pub(crate) result: Result<(), WorkflowError>,
-    /// `after_clear`'s value, when it ran.
-    pub(crate) after: Option<A>,
 }
 
 /// Enumerate every active phase state, sorted by phase number.
@@ -696,6 +693,12 @@ pub(crate) struct Cleared<A> {
 /// whole listing — `status`/`recover` must degrade, not die, on one corrupt
 /// file.
 pub fn list_states(project_root: &Path) -> Vec<State> {
+    list_states_to(project_root, &mut std::io::stderr())
+}
+
+/// [`list_states`], writing the line for each skipped state file to `err`: a
+/// skipped file is a phase missing from `status`, `cleanup` and `gate list`.
+fn list_states_to(project_root: &Path, err: &mut dyn std::io::Write) -> Vec<State> {
     let mut states = Vec::new();
     let Ok(entries) = std::fs::read_dir(devflow_dir(project_root)) else {
         return states;
@@ -711,7 +714,15 @@ pub fn list_states(project_root: &Path) -> Vec<State> {
             .and_then(|c| Ok(serde_json::from_str::<State>(&c)?))
         {
             Ok(state) => states.push(state),
-            Err(err) => warn!("skipping unreadable state file {name}: {err}"),
+            Err(error) => {
+                warn!("skipping unreadable state file {name}: {error}");
+                let _ = writeln!(
+                    err,
+                    "warning: skipping the unreadable state file {} ({error}); its phase is \
+                     left out of this listing",
+                    entry.path().display()
+                );
+            }
         }
     }
     states.sort_by_key(|s| s.phase);
@@ -796,14 +807,12 @@ pub fn clear_state_within(
 /// [`clear_state_if_owned`], which stays as it is.
 ///
 /// `decide` gets what is on disk: `Ok(false)` keeps it, `Ok(true)` removes the state and
-/// its orphaned write temps, and `Err` removes nothing and is returned as it is. After a
-/// removal that succeeded, `after_clear` runs still under the lock, for a step that must
-/// follow the removal with no reservation in between (R2-07); a failed removal skips it.
-/// With `wait` set, a lock still held then is [`WorkflowError::WriteLockTimeout`] with
-/// neither closure run.
+/// its orphaned write temps, and `Err` removes nothing and is returned as it is. With
+/// `wait` set, a lock still held then is [`WorkflowError::WriteLockTimeout`] with `decide`
+/// not run.
 ///
-/// Neither closure may take this lock: a second `flock` on the file from this process is
-/// a second open file description and blocks on the first. So neither calls
+/// `decide` may not take this lock: a second `flock` on the file from this process is
+/// a second open file description and blocks on the first. So it never calls
 /// [`update_state`], [`update_state_with`], [`update_owned_state`], [`clear_state`],
 /// [`while_owner`] or [`clear_state_if_owned`].
 ///
@@ -816,28 +825,21 @@ pub fn clear_state_within(
 /// [`WRITE_LOCK_REPAIR_WAIT`]; a repair verb then names the holder and writes nothing.
 /// That leaves fsync-bound file operations on a slow disk unmeasured, and a SIGSTOPped
 /// caller outside the bound, as for every writer.
-pub(crate) fn clear_state_if<E: From<WorkflowError>, A>(
+pub(crate) fn clear_state_if<E: From<WorkflowError>>(
     project_root: &Path,
     phase: PhaseId,
     wait: Option<Duration>,
     decide: impl FnOnce(Existing) -> Result<bool, E>,
-    after_clear: impl FnOnce() -> A,
-) -> Result<Cleared<A>, E> {
+) -> Result<Cleared, E> {
     let _lock = lock_for_write(project_root, phase, wait)?;
     if !decide(read_existing(project_root, phase))? {
         return Ok(Cleared {
             removed: false,
             result: Ok(()),
-            after: None,
         });
     }
     let (removed, result) = remove_state_files(project_root, phase, true);
-    let after = result.is_ok().then(after_clear);
-    Ok(Cleared {
-        removed,
-        result,
-        after,
-    })
+    Ok(Cleared { removed, result })
 }
 
 fn clear_state_with_partial_result_impl(
@@ -918,6 +920,26 @@ fn remove_state_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_skipped_state_file_is_reported_without_tracing() {
+        let dir = tempfile::tempdir().unwrap();
+        let devflow = dir.path().join(".devflow");
+        std::fs::create_dir_all(&devflow).unwrap();
+        std::fs::write(
+            devflow.join(format!("{STATE_FILE_PREFIX}07.json")),
+            "{ not json",
+        )
+        .unwrap();
+        let mut sink = Vec::new();
+        assert!(list_states_to(dir.path(), &mut sink).is_empty());
+        let text = String::from_utf8(sink).unwrap();
+        assert!(
+            text.starts_with("warning: skipping the unreadable state file ")
+                && text.contains(&format!("{STATE_FILE_PREFIX}07.json")),
+            "the operator must be told a phase is missing from the listing: {text:?}"
+        );
+    }
 
     #[test]
     fn ensure_devflow_dir_writes_star_gitignore() {
@@ -1683,7 +1705,7 @@ mod tests {
     }
 
     /// R-07's primitive: the decision sees what is on disk with the lock held, and the
-    /// removal and `after_clear` share that hold.
+    /// removal shares that hold.
     #[test]
     fn clear_state_if_decides_on_a_fresh_read_under_the_write_lock() {
         let dir = tempfile::tempdir().unwrap();
@@ -1696,48 +1718,34 @@ mod tests {
             pid: Some(std::process::id()),
         };
 
-        // `Ok(false)`: nothing removed, `after_clear` not run.
-        let after_ran = std::cell::Cell::new(false);
-        let kept = clear_state_if::<WorkflowError, ()>(
-            root,
-            phase,
-            None,
-            |existing| {
-                let Existing::Loaded(seen) = existing else {
-                    panic!("the saved state must read as loaded: {existing:?}");
-                };
-                let on_disk: serde_json::Value =
-                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-                assert_eq!(serde_json::to_value(&seen).unwrap(), on_disk);
-                assert_eq!(write_lock_status(root, phase).unwrap(), held_by_us);
-                Ok(false)
-            },
-            || after_ran.set(true),
-        )
+        // `Ok(false)`: nothing removed.
+        let kept = clear_state_if::<WorkflowError>(root, phase, None, |existing| {
+            let Existing::Loaded(seen) = existing else {
+                panic!("the saved state must read as loaded: {existing:?}");
+            };
+            let on_disk: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(serde_json::to_value(&seen).unwrap(), on_disk);
+            assert_eq!(write_lock_status(root, phase).unwrap(), held_by_us);
+            Ok(false)
+        })
         .unwrap();
         assert!(!kept.removed);
         assert!(kept.result.is_ok());
-        assert!(kept.after.is_none());
-        assert!(!after_ran.get());
         assert_eq!(std::fs::read(&path).unwrap(), before);
 
-        // `Err`: nothing removed, neither later step run.
-        let failed = clear_state_if::<WorkflowError, ()>(
-            root,
-            phase,
-            None,
-            |_| Err(WorkflowError::MissingState(PathBuf::from("the decision's"))),
-            || after_ran.set(true),
-        );
+        // `Err`: nothing removed.
+        let failed = clear_state_if::<WorkflowError>(root, phase, None, |_| {
+            Err(WorkflowError::MissingState(PathBuf::from("the decision's")))
+        });
         assert!(
             matches!(&failed, Err(WorkflowError::MissingState(path))
                 if path.as_path() == Path::new("the decision's")),
             "{failed:?}"
         );
-        assert!(!after_ran.get());
         assert_eq!(std::fs::read(&path).unwrap(), before);
 
-        // A held lock with a bound: neither step runs and nothing changes.
+        // A held lock with a bound: the decision does not run and nothing changes.
         let (entered, writer_is_inside) = std::sync::mpsc::channel();
         let (release, released) = std::sync::mpsc::channel::<()>();
         let decided = std::cell::Cell::new(false);
@@ -1749,7 +1757,7 @@ mod tests {
                 });
             });
             writer_is_inside.recv().unwrap();
-            let timed_out = clear_state_if::<WorkflowError, ()>(
+            let timed_out = clear_state_if::<WorkflowError>(
                 root,
                 phase,
                 Some(Duration::from_millis(200)),
@@ -1757,7 +1765,6 @@ mod tests {
                     decided.set(true);
                     Ok(true)
                 },
-                || after_ran.set(true),
             );
             release.send(()).unwrap();
             assert!(
@@ -1770,25 +1777,13 @@ mod tests {
             );
         });
         assert!(!decided.get(), "a timed-out clear must not decide");
-        assert!(!after_ran.get());
         assert_eq!(std::fs::read(&path).unwrap(), before);
 
-        // `Ok(true)`: removed, then `after_clear` with the lock still held.
-        let cleared = clear_state_if::<WorkflowError, &str>(
-            root,
-            phase,
-            None,
-            |_| Ok(true),
-            || {
-                assert!(!path.exists(), "the state goes before `after_clear` runs");
-                assert_eq!(write_lock_status(root, phase).unwrap(), held_by_us);
-                "after"
-            },
-        )
-        .unwrap();
+        // `Ok(true)`: removed.
+        let cleared = clear_state_if::<WorkflowError>(root, phase, None, |_| Ok(true)).unwrap();
         assert!(cleared.removed);
         assert!(cleared.result.is_ok());
-        assert_eq!(cleared.after, Some("after"));
+        assert!(!path.exists(), "an `Ok(true)` decision removes the state");
     }
 
     #[test]
@@ -2116,7 +2111,7 @@ mod tests {
     fn clear_only_touches_its_own_phase() {
         let dir = tempfile::tempdir().unwrap();
         save_state(&state_in(dir.path(), PhaseId::new(13), Stage::Code)).unwrap();
-        save_state(&state_in(dir.path(), PhaseId::new(14), Stage::Ship)).unwrap();
+        save_state(&state_in(dir.path(), PhaseId::new(14), Stage::Validate)).unwrap();
 
         clear_state(dir.path(), PhaseId::new(13)).unwrap();
 
@@ -2228,7 +2223,7 @@ mod tests {
     #[test]
     fn list_states_enumerates_sorted_by_phase() {
         let dir = tempfile::tempdir().unwrap();
-        save_state(&state_in(dir.path(), PhaseId::new(14), Stage::Ship)).unwrap();
+        save_state(&state_in(dir.path(), PhaseId::new(14), Stage::Validate)).unwrap();
         save_state(&state_in(dir.path(), PhaseId::new(3), Stage::Code)).unwrap();
 
         let states = list_states(dir.path());

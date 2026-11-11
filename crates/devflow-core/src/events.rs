@@ -34,6 +34,19 @@ const SCHEMA_VERSION: u32 = 1;
 /// Append one event line. `fields` supplies the kind-specific payload and
 /// must be a JSON object (anything else is recorded under a `"data"` key).
 pub fn emit(project_root: &Path, phase: PhaseId, event: &str, fields: serde_json::Value) {
+    emit_to(project_root, phase, event, fields, &mut std::io::stderr());
+}
+
+/// [`emit`], writing the warning line for an event it could not record to
+/// `err`: with tracing off by default that line is the operator's only sign
+/// that the log is missing an event.
+fn emit_to(
+    project_root: &Path,
+    phase: PhaseId,
+    event: &str,
+    fields: serde_json::Value,
+    sink: &mut dyn Write,
+) {
     let mut line = serde_json::json!({
         "v": SCHEMA_VERSION,
         "ts": unix_now(),
@@ -59,6 +72,11 @@ pub fn emit(project_root: &Path, phase: PhaseId, event: &str, fields: serde_json
         && let Err(err) = crate::workflow::ensure_devflow_dir(parent)
     {
         warn!("could not create events dir: {err}");
+        let _ = writeln!(
+            sink,
+            "warning: could not record the `{event}` event: could not create {} ({err})",
+            parent.display()
+        );
         return;
     }
     let result = std::fs::OpenOptions::new()
@@ -68,6 +86,11 @@ pub fn emit(project_root: &Path, phase: PhaseId, event: &str, fields: serde_json
         .and_then(|mut f| f.write_all(format!("{line}\n").as_bytes()));
     if let Err(err) = result {
         warn!("could not append to {}: {err}", path.display());
+        let _ = writeln!(
+            sink,
+            "warning: could not record the `{event}` event in {} ({err})",
+            path.display()
+        );
     }
 }
 
@@ -144,9 +167,9 @@ pub fn last_event_for_phase(project_root: &Path, phase: PhaseId) -> Option<serde
 ///
 /// This is a targeted, single-event-kind scan, distinct from
 /// [`last_events_by_phase`]'s one-pass "latest event of any kind per phase"
-/// read — `ship_evidence::collect` needs the last occurrence of one
-/// *specific* event name, which the latest-of-any-kind index does not
-/// preserve once a later, different event overwrites it.
+/// read — a caller that needs the last occurrence of one *specific* event
+/// name cannot use that index, which does not preserve it once a later,
+/// different event overwrites it.
 pub fn last_event_of_kind_for_phase(
     project_root: &Path,
     phase: PhaseId,
@@ -209,6 +232,63 @@ mod tests {
     }
 
     #[test]
+    fn an_event_dir_that_cannot_be_created_is_reported_without_tracing() {
+        let dir = tempfile::tempdir().unwrap();
+        // `.devflow` is a file, so the events directory cannot be created.
+        std::fs::write(dir.path().join(".devflow"), "").unwrap();
+        let mut sink = Vec::new();
+        emit_to(
+            dir.path(),
+            PhaseId::new(7),
+            "probe",
+            serde_json::json!({}),
+            &mut sink,
+        );
+        let text = String::from_utf8(sink).unwrap();
+        assert!(
+            text.starts_with("warning: could not record the `probe` event"),
+            "the operator must be told the event was not recorded: {text:?}"
+        );
+    }
+
+    #[test]
+    fn an_event_log_that_cannot_be_appended_is_reported_without_tracing() {
+        let dir = tempfile::tempdir().unwrap();
+        // The log path is a directory, so the append cannot open it.
+        std::fs::create_dir_all(events_path(dir.path())).unwrap();
+        let mut sink = Vec::new();
+        emit_to(
+            dir.path(),
+            PhaseId::new(7),
+            "probe",
+            serde_json::json!({}),
+            &mut sink,
+        );
+        let text = String::from_utf8(sink).unwrap();
+        assert!(
+            text.starts_with("warning: could not record the `probe` event")
+                && text.contains("events.jsonl"),
+            "the operator must be told the event was not recorded: {text:?}"
+        );
+    }
+
+    #[test]
+    fn a_recorded_event_writes_no_warning() {
+        // Control for the two tests above.
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = Vec::new();
+        emit_to(
+            dir.path(),
+            PhaseId::new(7),
+            "probe",
+            serde_json::json!({}),
+            &mut sink,
+        );
+        assert_eq!(read_lines(dir.path()).len(), 1);
+        assert!(sink.is_empty());
+    }
+
+    #[test]
     fn emit_appends_parseable_lines_with_envelope_fields() {
         let dir = tempfile::tempdir().unwrap();
         emit(
@@ -221,7 +301,7 @@ mod tests {
             dir.path(),
             PhaseId::new(15),
             "gate_fired",
-            serde_json::json!({"stage": "ship"}),
+            serde_json::json!({"stage": "validate"}),
         );
 
         let lines = read_lines(dir.path());
@@ -235,7 +315,7 @@ mod tests {
         assert_eq!(lines[0]["phase"], 14);
         assert_eq!(lines[0]["from"], "code");
         assert_eq!(lines[1]["phase"], 15);
-        assert_eq!(lines[1]["stage"], "ship");
+        assert_eq!(lines[1]["stage"], "validate");
     }
 
     #[test]
@@ -310,7 +390,7 @@ mod tests {
             dir.path(),
             PhaseId::new(2),
             "gate_fired",
-            serde_json::json!({"stage": "ship"}),
+            serde_json::json!({"stage": "validate"}),
         );
 
         let latest = last_events_by_phase(dir.path());
@@ -345,7 +425,7 @@ mod tests {
             dir.path(),
             PhaseId::new(1),
             "stage_launched",
-            serde_json::json!({"stage": "define"}),
+            serde_json::json!({"stage": "plan"}),
         );
         let first_ts = last_events_by_phase(dir.path())[&PhaseId::new(1)]
             .stage_launched_ts
@@ -357,7 +437,7 @@ mod tests {
             dir.path(),
             PhaseId::new(1),
             "transition",
-            serde_json::json!({"to": "plan"}),
+            serde_json::json!({"to": "code"}),
         );
         let after_transition = last_events_by_phase(dir.path());
         assert_eq!(
@@ -374,7 +454,7 @@ mod tests {
             dir.path(),
             PhaseId::new(1),
             "stage_launched",
-            serde_json::json!({"stage": "plan"}),
+            serde_json::json!({"stage": "code"}),
         );
         let path = events_path(dir.path());
         let mut contents = std::fs::read_to_string(&path).unwrap();
@@ -411,8 +491,7 @@ mod tests {
 
     // These tests deliberately use a generic marker event name rather than
     // any production event literal, keeping this generic scanner's tests
-    // decoupled from any one caller's naming choice. `ship_evidence::tests`
-    // exercises this same scanner against its real, specific event name.
+    // decoupled from any one caller's naming choice.
     const MARKER_EVENT: &str = "marker_event";
 
     #[test]
@@ -428,18 +507,18 @@ mod tests {
             dir.path(),
             PhaseId::new(1),
             MARKER_EVENT,
-            serde_json::json!({"stage": "ship"}),
+            serde_json::json!({"stage": "validate"}),
         );
         emit(
             dir.path(),
             PhaseId::new(2),
             MARKER_EVENT,
-            serde_json::json!({"stage": "ship"}),
+            serde_json::json!({"stage": "validate"}),
         );
 
         let phase1 = last_event_of_kind_for_phase(dir.path(), PhaseId::new(1), MARKER_EVENT)
             .expect("phase 1 marker event exists");
-        assert_eq!(phase1["stage"], "ship");
+        assert_eq!(phase1["stage"], "validate");
         assert!(has_event_for_phase(
             dir.path(),
             PhaseId::new(1),
@@ -477,8 +556,8 @@ mod tests {
     #[test]
     fn describe_prefers_detail_fields() {
         assert_eq!(
-            describe(&serde_json::json!({"event": "transition", "to": "ship"})),
-            "transition (ship)"
+            describe(&serde_json::json!({"event": "transition", "to": "validate"})),
+            "transition (validate)"
         );
         assert_eq!(
             describe(&serde_json::json!({"event": "workflow_finished"})),

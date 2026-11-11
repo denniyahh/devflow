@@ -32,11 +32,12 @@ the agent, and persists that phase's progress to
 devflow status
 ```
 
-## Shipping
+## Finishing
 
-Shipping is not a separate command you run — Ship is the pipeline's final
-stage, driven automatically once Validate passes. It always pauses at a
-human gate before merging:
+A passing Validate ends the run. DevFlow keeps the worktree and the
+`feature/phase-NN` branch and does not merge, tag or open a pull request:
+integrating the branch is your step. In `--mode supervise` the run pauses at
+a human gate before it finishes:
 
 ```bash
 devflow gate list
@@ -50,7 +51,7 @@ for the full gate-answering reference.
 
 - **Rust** stable (build from source)
 - **git** 2.30+
-- **gh CLI** 2.0+ (for PR creation)
+- **gh CLI** 2.0+ (`devflow doctor` checks for it; no DevFlow command runs it)
 - An installed AI agent (Claude Code, Codex, or OpenCode)
 
 Verify your setup:

@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-/// Bounds the Define gate a launched supervise run parks at, so a reaper
+/// Bounds the Plan gate a launched supervise run parks at, so a reaper
 /// failure cannot leave an immortal monitor.
 const GATE_TIMEOUT_SECS: &str = "15";
 
@@ -61,7 +61,11 @@ fn init_repo(root: &Path, phase: PhaseId) {
         format!("# Roadmap\n\n### Phase {phase}: home isolation fixture\n"),
     )
     .unwrap();
-    git(root, &["add", "README.md", ".planning/ROADMAP.md"]);
+    let context = common::write_phase_context(root, phase);
+    git(
+        root,
+        &["add", "README.md", ".planning/ROADMAP.md", &context],
+    );
     git(root, &["commit", "-q", "-m", "base"]);
 }
 
@@ -75,11 +79,10 @@ fn add_start_args(command: &mut Command, root: &Path, phase: PhaseId, fake_bin: 
             "--phase",
             &phase.to_string(),
             "--agent",
-            "claude",
+            "codex",
             "--mode",
             "supervise",
             "--no-worktree",
-            "--legacy-claude-launch",
         ])
         .arg(root)
         .current_dir(root)
@@ -128,7 +131,7 @@ fn run_start_and_list(
 #[test]
 fn a_child_writing_outside_its_tempdir_home_fails() {
     let phase = PhaseId::new(89);
-    let fake_bin = common::fake_bin_dir("exec sleep 60");
+    let fake_bin = common::fake_bin_dir_for("codex", "exec sleep 60");
 
     // Hermetic arm: the builder must set HOME and every cache variable under
     // the hermetic home, and the run's registry entry must land there. The

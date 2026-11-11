@@ -85,6 +85,15 @@ pub fn git_command(repo: &Path) -> Command {
 /// redirect via an inherited variable — an operator who wants DevFlow to
 /// act on a different repository passes it a different path (D-01).
 pub fn hermetic_command(program: &str, dir: &Path) -> Command {
+    hermetic_command_at(Path::new(program), dir)
+}
+
+/// As [`hermetic_command`], for a program named by a path rather than a
+/// UTF-8 string: the GSD launcher found under the operator's home
+/// (`gsd_reader`). A path without a separator still resolves through `PATH`,
+/// exactly as [`hermetic_command`]'s `&str` does, so the two build the same
+/// command for the same program.
+pub(crate) fn hermetic_command_at(program: &Path, dir: &Path) -> Command {
     let mut cmd = Command::new(program);
     cmd.current_dir(dir);
     for var in REPO_LOCAL_GIT_VARS.iter().chain(ALSO_REDIRECTING_GIT_VARS) {
@@ -100,7 +109,7 @@ pub struct GitFlow {
     config: GitFlowConfig,
 }
 
-/// Summary of a feature branch for the `devflow list` command.
+/// Summary of a feature branch for `devflow status`'s open-branch list.
 #[derive(Debug, Clone)]
 pub struct BranchInfo {
     /// Branch name (e.g. "feature/phase-05").
@@ -132,8 +141,8 @@ impl GitFlow {
 
     /// Create a git-flow helper with an explicitly supplied branch model.
     ///
-    /// The constructor the hooks use, so `HookContext.git_flow` reaches every
-    /// git operation inside a hook instead of being silently re-defaulted.
+    /// The constructor for a caller with a resolved branch model, so every
+    /// git operation it runs uses that model instead of a silent default.
     pub fn with_config(root: impl AsRef<Path>, config: GitFlowConfig) -> Self {
         Self {
             root: root.as_ref().to_path_buf(),
@@ -171,13 +180,6 @@ impl GitFlow {
         Ok(branch)
     }
 
-    /// Merge a feature branch into develop and delete it.
-    pub fn feature_finish(&self, phase: PhaseId) -> Result<String, GitError> {
-        let branch = self.merge_feature_into_develop(phase)?;
-        self.git(["branch", "-d", &branch])?;
-        Ok(branch)
-    }
-
     /// Merge a feature branch into develop without deleting it.
     ///
     /// Default DevFlow runs keep the feature branch checked out in a linked
@@ -207,36 +209,22 @@ impl GitFlow {
             .unwrap_or(false)
     }
 
-    /// Create or reset a release branch from the current `HEAD`.
+    /// How many commits `branch` has that the trunk (`develop`, as configured)
+    /// does not: `0` means every commit on it is merged into the trunk, so
+    /// force-deleting it loses nothing.
     ///
-    /// The release branch is cut from wherever the caller currently is — the
-    /// branch being shipped — not from `develop`. `devflow ship` writes the
-    /// version bump into the working tree first, so branching from `HEAD`
-    /// keeps any commits unique to the shipped branch in the release.
-    pub fn release_start(&self, version: &str) -> Result<String, GitError> {
-        let branch = format!("release/{version}");
-        info!("creating release branch: {branch}");
-        self.git(["checkout", "-B", &branch])?;
-        Ok(branch)
-    }
-
-    /// Merge a release branch into main and develop, tag it, and delete it.
-    pub fn release_finish(&self, version: &str) -> Result<String, GitError> {
-        let branch = format!("release/{version}");
-        info!("finishing release branch: {branch}");
-        self.git(["checkout", &self.config.main])?;
-        self.git(["merge", "--no-ff", &branch])?;
-        // `-c tag.gpgSign=false` scopes the override to this invocation only
-        // (never the user's global/repo config) — without it, a global
-        // `tag.gpgsign=true` forces this lightweight tag into an
-        // annotated+signed one requiring a message, which blocks on
-        // `$EDITOR` in what must be a headless, unattended flow (Phase 13
-        // dogfood finding).
-        self.git(["-c", "tag.gpgSign=false", "tag", &format!("v{version}")])?;
-        self.git(["checkout", &self.config.develop])?;
-        self.git(["merge", "--no-ff", &branch])?;
-        self.git(["branch", "-d", &branch])?;
-        Ok(branch)
+    /// Takes the branch name rather than a phase, unlike
+    /// [`Self::is_merged_into_develop`], so a caller can ask about the branch a
+    /// worktree actually has checked out. An absent branch or trunk is an
+    /// error, never `0`: callers deciding whether to delete must fail closed.
+    pub fn commits_not_in_develop(&self, branch: &str) -> Result<usize, GitError> {
+        let range = format!("{}..{branch}", self.config.develop);
+        let count = self.git_output(["rev-list", "--count", &range, "--"])?;
+        count.trim().parse().map_err(|err| {
+            GitError::Command(format!(
+                "git rev-list --count {range} printed {count:?}, not a count: {err}"
+            ))
+        })
     }
 
     /// Create an annotated-free lightweight tag at the current `HEAD`.
@@ -286,30 +274,10 @@ impl GitFlow {
             .unwrap_or(false)
     }
 
-    /// The commit SHA at the tip of `branch`.
-    pub fn branch_tip(&self, branch: &str) -> Result<String, GitError> {
-        Ok(self.git_output(["rev-parse", branch])?.trim().to_string())
-    }
-
-    /// Create `branch` at `start_point` if it does not already exist, without
-    /// checking it out (leaves the current checkout untouched).
-    pub fn ensure_branch(&self, branch: &str, start_point: &str) -> Result<(), GitError> {
-        if self.branch_exists(branch) {
-            return Ok(());
-        }
-        self.git(["branch", branch, start_point])
-    }
-
     /// Check out an existing branch in the main worktree.
     pub fn checkout(&self, branch: &str) -> Result<(), GitError> {
         debug!("checking out branch: {branch}");
         self.git(["checkout", branch])
-    }
-
-    /// Delete `branch` on `origin` (best-effort; errors if no remote/branch).
-    pub fn delete_remote_branch(&self, branch: &str) -> Result<(), GitError> {
-        info!("deleting remote branch: {branch}");
-        self.git(["push", "origin", "--delete", branch])
     }
 
     /// Whether the repository has at least one configured remote.
@@ -341,6 +309,23 @@ impl GitFlow {
     /// checked out in a worktree) is logged and skipped so one failure
     /// doesn't abort the rest of the sweep.
     pub fn cleanup_merged(&self) -> Result<Vec<String>, GitError> {
+        self.cleanup_merged_to(&[], &mut std::io::stderr())
+    }
+
+    /// [`Self::cleanup_merged`], never touching a branch named in `keep`: a
+    /// caller that keeps a worktree passes the branch it has checked out, so
+    /// the sweep skips it instead of leaving the refusal to git.
+    pub fn cleanup_merged_keeping(&self, keep: &[String]) -> Result<Vec<String>, GitError> {
+        self.cleanup_merged_to(keep, &mut std::io::stderr())
+    }
+
+    /// [`Self::cleanup_merged_keeping`], writing the line for each branch git
+    /// refused to delete to `err`: the returned list names only the deleted ones.
+    fn cleanup_merged_to(
+        &self,
+        keep: &[String],
+        err: &mut dyn std::io::Write,
+    ) -> Result<Vec<String>, GitError> {
         let output = self.git_output(["branch", "--merged", &self.config.develop])?;
         // CR-01 (45-REVIEW.md): the configured trunk cannot be the SOLE
         // source of the protected set. Once `config.develop` became the
@@ -371,41 +356,36 @@ impl GitFlow {
                 .trim();
             // Skip blanks, protected trunks, and the detached-HEAD line
             // ("(HEAD detached at ...)"), which is not a branch name.
-            if branch.is_empty() || branch.starts_with('(') || protected.contains(&branch) {
+            if branch.is_empty()
+                || branch.starts_with('(')
+                || protected.contains(&branch)
+                || keep.iter().any(|kept| kept == branch)
+            {
                 continue;
             }
             info!("cleaning up merged branch: {branch}");
             match self.git(["branch", "-D", branch]) {
                 Ok(()) => deleted.push(branch.to_string()),
-                Err(err) => warn!("could not delete merged branch {branch}: {err}"),
+                Err(error) => {
+                    warn!("could not delete merged branch {branch}: {error}");
+                    let _ = writeln!(
+                        err,
+                        "warning: could not delete the merged branch {branch} ({error}); it was kept"
+                    );
+                }
             }
         }
         Ok(deleted)
     }
 
-    /// Stage all changes and commit with the given message.
-    /// Returns Ok(()) whether or not there were changes to commit.
-    pub fn commit_all(&self, message: &str) -> Result<(), GitError> {
-        debug!("committing all changes: {message}");
-        self.git(["add", "."])?;
-        // --allow-empty so we don't fail when there are no changes
-        match self.git_raw(&["commit", "--allow-empty", "-m", message]) {
-            Ok(()) => Ok(()),
-            // If the commit produced no changes and we used --allow-empty,
-            // this should still succeed. But just in case, ignore "nothing to commit".
-            Err(GitError::Command(ref msg)) if msg.contains("nothing to commit") => Ok(()),
-            Err(e) => Err(e),
-        }
-    }
-
     /// Stage a single relative path and commit with the given message.
-    /// Mirrors `commit_all`, but scoped to one path, for hooks that must not
-    /// sweep in unrelated dirty state left by other hooks or the workflow.
-    /// Returns Ok(()) whether or not the path had changes to commit. Unlike
-    /// `commit_all`, a path with no changes produces **no commit** — it is a
-    /// genuine no-op, not a forced empty commit, so a caller such as
-    /// `hooks::version_bump` can never tag a release on a commit containing
-    /// nothing (19b/D-16).
+    /// Scoped to one path, for callers that must not sweep in unrelated dirty
+    /// state left by other hooks or the workflow.
+    /// Returns Ok(()) whether or not the path had changes to commit. A path
+    /// with no changes produces **no commit** — it is a
+    /// genuine no-op, not a forced empty commit, so a caller that tags the
+    /// commit it last produced can never tag one containing nothing
+    /// (19b/D-16).
     pub fn commit_path(&self, relative_path: &str, message: &str) -> Result<(), GitError> {
         debug!("committing {relative_path}: {message}");
         // `add` first so a brand-new file is known to git — a pathspec-only
@@ -492,38 +472,20 @@ impl GitFlow {
             .and_then(|s| s.trim().parse().ok())
     }
 
-    fn git_raw(&self, args: &[&str]) -> Result<(), GitError> {
-        debug!("git {}", args.join(" "));
-        // Pin the subprocess locale to C (Antigravity review, 19b): commit_path's
-        // "nothing to commit" match arm above compares against git's own
-        // English-locale output, which a non-English LC_ALL/LANG would
-        // localize, silently defeating the match and reopening 19b under a
-        // localized environment (T-19-14). Scoped to this one call path only.
-        let output = git_command(&self.root)
-            .args(args)
-            .env("LC_ALL", "C")
-            .env("LANG", "C")
-            .output()?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(GitError::Command(stderr_or_status(&output)))
-        }
-    }
-
-    /// Like [`git_raw`](Self::git_raw), but the error text combines stdout
-    /// with stderr instead of inspecting stderr alone.
+    /// Run git, with an error text that combines stdout with stderr instead
+    /// of inspecting stderr alone.
     ///
     /// Discovered empirically while implementing 19b: `git commit`'s
     /// "nothing to commit, working tree clean" message is written to
     /// **stdout**, not stderr. `stderr_or_status` only ever inspects
-    /// `output.stderr`, so a plain `git_raw` error can never contain that
-    /// text — `commit_path`'s `nothing to commit` match arm (immediately
-    /// above its call site) would never fire, no matter how the arm itself
-    /// is written. This sibling exists solely so `commit_path` can see it;
-    /// `commit_all` keeps calling `git_raw` unchanged (D-17 out of scope),
-    /// and `git_raw`'s own error-mapping branch is untouched by this
-    /// addition.
+    /// `output.stderr`, so a stderr-only error can never contain that text —
+    /// `commit_path`'s `nothing to commit` match arm would never fire, no
+    /// matter how the arm itself is written.
+    ///
+    /// The subprocess locale is pinned to C (Antigravity review, 19b): that
+    /// match arm compares against git's own English-locale output, which a
+    /// non-English LC_ALL/LANG would localize, silently defeating the match
+    /// and reopening 19b under a localized environment (T-19-14).
     fn git_raw_combined(&self, args: &[&str]) -> Result<(), GitError> {
         debug!("git {}", args.join(" "));
         let output = git_command(&self.root)
@@ -615,7 +577,7 @@ pub fn origin_main_ancestor_status(project_root: &Path) -> AncestorStatus {
 /// Whether the `ancestor` ref is an ancestor of the `descendant` ref, against
 /// ALREADY-FETCHED local refs — issues NO `git fetch`. Generalises
 /// [`origin_main_ancestor_status`] to an arbitrary ref pair (used by
-/// `release --verify`'s post-cut checks: is the release tag on `main`, and
+/// `release-preflight verify`'s post-cut checks: is the release tag on `main`, and
 /// has the `main`→`develop` sync run). Distinguishes "not an ancestor"
 /// (exit 1) from "a ref is absent" (exit 128) so the caller can degrade to
 /// an actionable `git fetch` message instead of reporting a false
@@ -647,8 +609,10 @@ pub fn ref_is_ancestor(project_root: &Path, ancestor: &str, descendant: &str) ->
 /// (e.g. `devflow-core` before `devflow`) — sourced from the workspace's own
 /// `[workspace] members` list and each member's own `[dependencies]`
 /// section (which member depends on which), never a hardcoded prose string
-/// (20d). Read-only; returns an empty `Vec` (never panics) if the workspace
-/// Cargo.toml or a member manifest cannot be read.
+/// (20d). A member whose `[package]` sets `publish = false` (or `publish =
+/// []`, no registry) is never uploaded, so it is left out of the order. A
+/// member manifest that cannot be read is skipped; the result is empty (never
+/// a panic) when the workspace Cargo.toml cannot be read or no member can.
 pub fn publish_order(project_root: &Path) -> Vec<String> {
     let Ok(root_contents) = std::fs::read_to_string(project_root.join("Cargo.toml")) else {
         return Vec::new();
@@ -661,6 +625,9 @@ pub fn publish_order(project_root: &Path) -> Vec<String> {
         let Ok(contents) = std::fs::read_to_string(&manifest) else {
             continue;
         };
+        if package_publish_disabled(&contents) {
+            continue;
+        }
         let name = package_name(&contents).unwrap_or_else(|| path.clone());
         members.push((name, contents));
     }
@@ -678,9 +645,7 @@ pub fn publish_order(project_root: &Path) -> Vec<String> {
 }
 
 /// Extract the `[workspace] members = [...]` array's quoted path entries.
-/// Hand-rolled, single-array-only scan (this project deliberately avoids a
-/// TOML parser dependency for its version/workspace tooling — see
-/// `version.rs`).
+/// Hand-rolled, single-array-only scan.
 fn workspace_member_paths(contents: &str) -> Vec<String> {
     let Some(start) = contents.find("members") else {
         return Vec::new();
@@ -720,6 +685,27 @@ fn package_name(contents: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Whether a member manifest's `[package]` sets `publish = false` or
+/// `publish = []`, the two spellings Cargo reads as "never publish".
+fn package_publish_disabled(contents: &str) -> bool {
+    let mut current = String::new();
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if let Some(inner) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            current = inner.trim().to_string();
+            continue;
+        }
+        if current == "package"
+            && let Some((key, value)) = trimmed.split_once('=')
+            && key.trim() == "publish"
+        {
+            let value = value.split('#').next().unwrap_or("").trim();
+            return value == "false" || value.replace(char::is_whitespace, "") == "[]";
+        }
+    }
+    false
 }
 
 /// Whether a member manifest's `[dependencies]` section references
@@ -863,6 +849,59 @@ mod tests {
         GitFlow::new(root)
     }
 
+    #[test]
+    fn a_merged_branch_git_refuses_to_delete_is_reported_without_tracing() {
+        let repo = init_repo();
+        let root = repo.path();
+        git(root, &["branch", "held-merged"]);
+        // A merged branch checked out in a linked worktree: `git branch -D`
+        // refuses it.
+        let linked = tempfile::tempdir().unwrap();
+        let worktree = linked.path().join("wt");
+        git(
+            root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                worktree.to_str().unwrap(),
+                "held-merged",
+            ],
+        );
+        let mut sink = Vec::new();
+        let deleted = flow(root)
+            .cleanup_merged_to(&[], &mut sink)
+            .expect("cleanup");
+        assert!(!deleted.contains(&"held-merged".to_string()));
+        let text = String::from_utf8(sink).unwrap();
+        assert!(
+            text.starts_with("warning: could not delete the merged branch held-merged"),
+            "the operator must be told the branch was kept: {text:?}"
+        );
+    }
+
+    /// A merged branch named in `keep` is skipped, not deleted and not
+    /// reported; control: an unnamed merged branch in the same sweep is deleted.
+    #[test]
+    fn cleanup_merged_keeping_skips_a_kept_branch() {
+        let repo = init_repo();
+        let root = repo.path();
+        git(root, &["branch", "kept-merged"]);
+        git(root, &["branch", "swept-merged"]);
+        let mut sink = Vec::new();
+        let deleted = flow(root)
+            .cleanup_merged_to(&["kept-merged".to_string()], &mut sink)
+            .expect("cleanup");
+        assert_eq!(deleted, vec!["swept-merged".to_string()]);
+        assert!(sink.is_empty(), "{}", String::from_utf8_lossy(&sink));
+        let listed = crate::test_support::git_command(root)
+            .args(["branch", "--list", "kept-merged"])
+            .output()
+            .expect("list branches");
+        let listed = String::from_utf8_lossy(&listed.stdout);
+        assert!(listed.contains("kept-merged"), "{listed:?}");
+    }
+
     /// 45-01 / D-01: `with_config` is what makes the trunk configurable.
     /// `new` keeps the hardcoded constants for library callers with no
     /// project context, so the two constructors must give DIFFERENT answers
@@ -941,64 +980,6 @@ mod tests {
     }
 
     #[test]
-    fn feature_finish_merges_into_develop_and_deletes() {
-        let repo = init_repo();
-        let root = repo.path();
-        let gf = flow(root);
-
-        gf.feature_start(PhaseId::new(1)).expect("start");
-        commit_file(root, "feature.txt");
-
-        let branch = gf.feature_finish(PhaseId::new(1)).expect("finish");
-        assert_eq!(branch, "feature/phase-01");
-        assert_eq!(current_branch(root), "develop");
-
-        // Branch is deleted and its work is now on develop.
-        let branches = crate::test_support::git_command(root)
-            .args(["branch"])
-            .output()
-            .unwrap();
-        let listing = String::from_utf8_lossy(&branches.stdout);
-        assert!(!listing.contains("feature/phase-01"));
-        assert!(root.join("feature.txt").exists());
-    }
-
-    #[test]
-    fn release_start_and_finish_tags_main_and_merges_both() {
-        let repo = init_repo();
-        let root = repo.path();
-        let gf = flow(root);
-
-        // Add work on develop so the release has content.
-        commit_file(root, "work.txt");
-        let branch = gf.release_start("1.2.0").expect("release_start");
-        assert_eq!(branch, "release/1.2.0");
-
-        gf.release_finish("1.2.0").expect("release_finish");
-        assert_eq!(current_branch(root), "develop");
-
-        // Tag exists.
-        let tags = crate::test_support::git_command(root)
-            .args(["tag"])
-            .output()
-            .unwrap();
-        assert!(String::from_utf8_lossy(&tags.stdout).contains("v1.2.0"));
-
-        // Release branch deleted.
-        let branches = crate::test_support::git_command(root)
-            .args(["branch"])
-            .output()
-            .unwrap();
-        assert!(!String::from_utf8_lossy(&branches.stdout).contains("release/1.2.0"));
-    }
-
-    /// A global/repo `tag.gpgsign=true` must not turn `tag()`'s lightweight
-    /// tag into an annotated+signed one — that would require a tag message
-    /// and block on `$EDITOR`, silently hanging a headless, unattended run
-    /// (Phase 13 dogfood finding: VersionBump hung on a live
-    /// `devflow start --mode auto` run because the operator's global
-    /// gitconfig sets `tag.gpgsign=true`).
-    #[test]
     fn tag_stays_lightweight_when_gpgsign_is_forced_on() {
         let repo = init_repo();
         let root = repo.path();
@@ -1033,8 +1014,7 @@ mod tests {
 
     #[test]
     fn commit_path_stages_only_the_given_path_leaving_other_dirt_uncommitted() {
-        // The property that distinguishes commit_path from commit_all
-        // (17-12, Task 2b): a hook using commit_path must never sweep in
+        // 17-12, Task 2b: a caller using commit_path must never sweep in
         // unrelated dirty state.
         let repo = init_repo();
         let root = repo.path();
@@ -1087,9 +1067,9 @@ mod tests {
             .expect("rev-list --count HEAD must print an integer")
     }
 
-    /// 19b/D-16: `hooks::version_bump` (hooks.rs:242) calls `commit_path` and
-    /// then tags whatever commit it last produced (hooks.rs:249). If a
-    /// terminal-batch retry calls `commit_path` again with byte-identical
+    /// 19b/D-16: the removed version-bump hook called `commit_path` and then
+    /// tagged whatever commit it last produced. If a retry calls
+    /// `commit_path` again with byte-identical
     /// content (the file untouched since the first call), a forced commit
     /// here means the release tag can end up naming a commit that contains
     /// nothing new. This pins the exact retry scenario: two calls, unchanged
@@ -1121,11 +1101,9 @@ mod tests {
 
     /// 19b/D-16, T-19-11: separates the "no commit" claim from the "no
     /// error" claim so a future change can't satisfy one by breaking the
-    /// other. `hooks.rs` propagates `commit_path`'s `Result` with `?` at both
-    /// call sites (changelog_append:225, version_bump:242) -- turning a
-    /// genuine no-op into `Err` would stall the terminal hook batch (see
-    /// T-19-11 in this plan's threat model), so both properties must hold
-    /// simultaneously.
+    /// other: a caller that propagates `commit_path`'s `Result` with `?`
+    /// would stall on a genuine no-op turned into `Err` (T-19-11), so both
+    /// properties must hold simultaneously.
     #[test]
     fn commit_path_with_no_changes_returns_ok_without_committing() {
         let repo = init_repo();
@@ -1170,37 +1148,6 @@ mod tests {
     }
 
     #[test]
-    fn release_start_branches_from_current_head_not_develop() {
-        let repo = init_repo();
-        let root = repo.path();
-        let gf = flow(root);
-
-        // Ship from a feature branch carrying a commit that is NOT on develop.
-        gf.feature_start(PhaseId::new(5)).expect("feature_start");
-        commit_file(root, "feature-only.txt");
-        let feature_tip = gf.branch_tip("feature/phase-05").expect("feature tip");
-
-        let branch = gf.release_start("2.0.0").expect("release_start");
-        assert_eq!(branch, "release/2.0.0");
-        assert_eq!(current_branch(root), "release/2.0.0");
-
-        // The release branch tip must descend from the feature commit — i.e.
-        // the feature-only work is present, not dropped to develop's HEAD.
-        let release_tip = gf.branch_tip("release/2.0.0").expect("release tip");
-        let is_ancestor = crate::test_support::git_command(root)
-            .args(["merge-base", "--is-ancestor", &feature_tip, &release_tip])
-            .output()
-            .unwrap()
-            .status
-            .success();
-        assert!(
-            is_ancestor,
-            "release branch must descend from the shipped feature commit"
-        );
-        assert!(root.join("feature-only.txt").exists());
-    }
-
-    #[test]
     fn cleanup_merged_removes_merged_but_keeps_protected() {
         let repo = init_repo();
         let root = repo.path();
@@ -1209,7 +1156,10 @@ mod tests {
         // Create and merge a feature branch into develop.
         gf.feature_start(PhaseId::new(2)).expect("start");
         commit_file(root, "f.txt");
-        gf.feature_finish(PhaseId::new(2)).expect("finish");
+        let merged = gf
+            .merge_feature_into_develop(PhaseId::new(2))
+            .expect("merge");
+        git(root, &["branch", "-d", &merged]);
 
         // Create an already-merged stray branch off develop.
         git(root, &["branch", "stale-merged"]);
@@ -1323,8 +1273,8 @@ mod tests {
         let root = repo.path();
         let gf = flow(root);
 
-        // Merge a branch into develop WITHOUT deleting it (feature_finish
-        // deletes on merge, which would leave nothing to check out).
+        // Merge a branch into develop WITHOUT deleting it, so it is left
+        // to check out.
         git(
             root,
             &["checkout", "-q", "-b", "worktree-merged", "develop"],
@@ -1419,13 +1369,33 @@ mod tests {
         assert!(gf.delete_branch("main", true).is_err());
     }
 
+    /// `commits_not_in_develop` counts a branch's unmerged commits, reads `0` once they
+    /// are merged into the trunk, and is an error, never `0`, for an absent branch.
+    #[test]
+    fn commits_not_in_develop_counts_unmerged_work_and_fails_on_an_absent_branch() {
+        let repo = init_repo();
+        let root = repo.path();
+        let gf = flow(root);
+        gf.feature_start(PhaseId::new(8)).expect("start");
+        commit_file(root, "one.txt");
+        commit_file(root, "two.txt");
+        git(root, &["checkout", "-q", "develop"]);
+
+        assert_eq!(gf.commits_not_in_develop("feature/phase-08").unwrap(), 2);
+        git(root, &["merge", "-q", "--ff-only", "feature/phase-08"]);
+        assert_eq!(gf.commits_not_in_develop("feature/phase-08").unwrap(), 0);
+        assert!(gf.commits_not_in_develop("feature/phase-99").is_err());
+    }
+
     #[test]
     fn merge_of_missing_branch_is_an_error() {
         let repo = init_repo();
         let root = repo.path();
-        // feature_finish for a phase that was never started: checkout develop
+        // A merge for a phase that was never started: checkout develop
         // succeeds, but merging the nonexistent feature branch fails.
-        let err = flow(root).feature_finish(PhaseId::new(99)).unwrap_err();
+        let err = flow(root)
+            .merge_feature_into_develop(PhaseId::new(99))
+            .unwrap_err();
         assert!(matches!(err, GitError::Command(_)));
     }
 
@@ -1557,6 +1527,47 @@ mod tests {
         );
     }
 
+    /// A workspace member whose manifest sets `publish = false` (repo tooling
+    /// such as `tools/release-preflight`) is never uploaded to crates.io, so
+    /// it has no place in the publish order, even though it depends on the
+    /// core crate and would otherwise sort after it.
+    #[test]
+    fn publish_order_skips_an_unpublished_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\n    \"crates/devflow-core\",\n    \"crates/devflow-cli\",\n    \
+             \"tools/release-preflight\",\n]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("crates/devflow-core")).unwrap();
+        std::fs::write(
+            root.join("crates/devflow-core/Cargo.toml"),
+            "[package]\nname = \"devflow-core\"\n\n[dependencies]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("crates/devflow-cli")).unwrap();
+        std::fs::write(
+            root.join("crates/devflow-cli/Cargo.toml"),
+            "[package]\nname = \"devflow\"\n\n[dependencies]\ndevflow-core.workspace = true\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("tools/release-preflight")).unwrap();
+        std::fs::write(
+            root.join("tools/release-preflight/Cargo.toml"),
+            "[package]\nname = \"release-preflight\"\npublish = false\n\n\
+             [dependencies]\ndevflow-core.workspace = true\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            publish_order(root),
+            vec!["devflow-core".to_string(), "devflow".to_string()],
+            "a `publish = false` member must not appear in the crates.io publish order"
+        );
+    }
+
     // -----------------------------------------------------------------
     // 20d: origin/main ancestor check (no fetch)
     // -----------------------------------------------------------------
@@ -1582,7 +1593,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // release --verify: ref_is_ancestor (arbitrary ref pair)
+    // release-preflight verify: ref_is_ancestor (arbitrary ref pair)
     // -----------------------------------------------------------------
 
     #[test]
@@ -1615,7 +1626,7 @@ mod tests {
         );
     }
 
-    /// The case `release --verify` exists for: `main` and `develop` point at
+    /// The case `release-preflight verify` exists for: `main` and `develop` point at
     /// unrelated commits (main is a squash-merge lineage), so neither is an
     /// ancestor of the other — the "sync skipped" state that makes the next
     /// release PR conflict against a stale merge-base.

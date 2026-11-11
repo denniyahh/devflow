@@ -506,7 +506,7 @@ pub(crate) fn rfc3339_from_unix(unix_secs: u64) -> String {
     const SECS_PER_DAY: u64 = 24 * SECS_PER_HOUR;
     // u64::MAX / SECS_PER_DAY is below 2^48, so the day count fits i64.
     let days = i64::try_from(unix_secs / SECS_PER_DAY).unwrap_or(i64::MAX);
-    let (year, month, day) = crate::ship::civil_from_days(days);
+    let (year, month, day) = crate::reset_time::civil_from_days(days);
     let of_day = unix_secs % SECS_PER_DAY;
     format!(
         "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z",
@@ -792,6 +792,10 @@ pub enum ShutdownOutcome {
     },
     /// The supervisor had already handed the run off and did not stop it.
     HandedOff,
+    /// The run had already finished (Validate passed) when the stop could act,
+    /// so nothing was stopped (operator decision 2026-11-11: a permitted finish
+    /// wins over a late stop).
+    AlreadyFinished,
     /// The supervisor refused the request with this error.
     Refused(String),
 }
@@ -882,12 +886,13 @@ enum ShutdownLine {
     Refused(String),
 }
 
-/// A refusal's error string as an outcome: `handed_off` is its own outcome.
+/// A refusal's error string as an outcome: `handed_off` and
+/// `already_finished` are their own outcomes.
 fn refusal(error: String) -> ShutdownOutcome {
-    if error == "handed_off" {
-        ShutdownOutcome::HandedOff
-    } else {
-        ShutdownOutcome::Refused(error)
+    match error.as_str() {
+        "handed_off" => ShutdownOutcome::HandedOff,
+        "already_finished" => ShutdownOutcome::AlreadyFinished,
+        _ => ShutdownOutcome::Refused(error),
     }
 }
 
@@ -2311,6 +2316,21 @@ mod tests {
         assert!(
             matches!(late_hand_off, Ok(ShutdownOutcome::HandedOff)),
             "a hand-off after accepted is HandedOff, never Stopped, got {late_hand_off:?}"
+        );
+
+        // Operator decision (2026-11-11, 52-29): a stop that lost to a
+        // permitted finish is told so, never handed_off and never a stop.
+        let already_finished = run(
+            Box::new(move |stream| {
+                protocol::write_reply(stream, &accepted()).expect("write accepted");
+                protocol::write_reply(stream, &Reply::Error("already_finished".to_string()))
+                    .expect("write already_finished");
+            }),
+            Duration::from_secs(5),
+        );
+        assert!(
+            matches!(already_finished, Ok(ShutdownOutcome::AlreadyFinished)),
+            "already_finished is AlreadyFinished, got {already_finished:?}"
         );
 
         let refused = run(

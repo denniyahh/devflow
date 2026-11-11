@@ -9,9 +9,9 @@
 //! both call [`crate::pipeline_launch::launch_stage`] at their final step —
 //! that call is what closes the cycle `pipeline_launch (advance) →
 //! pipeline_outcomes (handle_*_outcome) → pipeline_gate (transition/
-//! run_gate/finish_workflow) → pipeline_launch (launch_stage)` back to
+//! run_gate/finish_run) → pipeline_launch (launch_stage)` back to
 //! where it started. This cycle is the state machine's real control flow
-//! (Code → Validate → Ship, with loop-backs), and Rust permits cyclic
+//! (Code → Validate, with loop-backs), and Rust permits cyclic
 //! module references — only the crate dependency graph must be acyclic —
 //! so this compiles cleanly. **A future change to pipeline logic is likely
 //! to touch two or three of these files together:** the split buys
@@ -20,26 +20,26 @@
 //! Pitfall 1).
 
 use crate::CliError;
-use crate::config_parse::{foreground_gate_timeout_secs, gate_timeout_secs};
+use crate::config_parse::gate_timeout_secs;
 use crate::pipeline_launch::{
     GateWaitEnd, clear_run_state, close_gate, commit, ensure_still_recorded, fenced, is_not_owner,
     launch_stage,
 };
-use crate::pipeline_outcomes::{run_checkout_hooks, truncate_reason};
-use devflow_core::gates::{
-    self, AnswerRead, Claim, GateAction, GateError, GateId, GateResponse, Gates,
-};
-use devflow_core::hooks;
+use crate::pipeline_outcomes::{Answer, FinishPermit, truncate_reason};
+use devflow_core::gates::{self, Claim, GateAction, GateFile, GateId, GateKind, GateLabel, Gates};
 use devflow_core::mode;
+#[cfg(test)]
 use devflow_core::phase_id::PhaseId;
-use devflow_core::prompt::FixType;
+use devflow_core::prompt::{FixType, ReverifyReport};
 use devflow_core::stage::Stage;
 use devflow_core::state::State;
-use devflow_core::{events, registry, ship, workflow};
+#[cfg(test)]
+use devflow_core::workflow;
+use devflow_core::{events, registry, reset_time};
 use std::path::Path;
-use tracing::{info, warn};
+use tracing::info;
 
-/// Fire the hooks for `from → to`, persist the new stage, and launch its agent.
+/// Persist the new stage `to` and launch its agent.
 ///
 /// `infra_failures` resets unconditionally on every successful transition
 /// (CR-01, 17-06 gap closure). Without this, an infra-fault ceiling meant to
@@ -66,11 +66,17 @@ pub(crate) fn transition(
     // runs. `stop_until == Some(from)` means the JUST-COMPLETED stage (the
     // one whose outcome triggered this call) is the requested stop point;
     // checking `to` instead would halt BEFORE the target stage ever ran
-    // (review: Codex HIGH off-by-one). This bypasses the from→to checkout
-    // hooks, `state.stage = to`, the normal `"transition"` event, and
+    // (review: Codex HIGH off-by-one). This bypasses `state.stage = to`, the normal
+    // `"transition"` event, and
     // `launch_stage` — no new monitor is spawned, and `loop_back_to_code`
     // (a retry, not an advance) is untouched by this check.
-    if state.stop_until == Some(from) {
+    //
+    // 52-27 (orchestrator decision, reversible): never after Validate. It is
+    // the last stage, so its pass ends through `finish_run`, and its only
+    // transition is the gap-closure route to Plan (GATE-03), which runs under
+    // `--until validate` as the loop-back to Code does: `--until validate`
+    // halts nothing.
+    if state.stop_until == Some(from) && from != Stage::Validate {
         commit(state, |s| {
             s.stopped = true;
             s.stop_reason = Some(format!("stopped after {from} completed (--until {from})"));
@@ -82,8 +88,13 @@ pub(crate) fn transition(
             // that is gone.
             s.supervisor = None;
             s.gate_pending = false;
-            // D-09: a run halted after its stage is no longer mid-fix.
+            // D-09: a run halted after its stage is no longer mid-fix, and the
+            // fix pass's note goes with it.
             s.code_fix = None;
+            s.code_fix_note = None;
+            s.code_fix_report = None;
+            // U7: the run leaves the stage, so the stage's relaunch note goes.
+            s.relaunch_note = None;
         })?;
         events::emit(
             project_root,
@@ -94,26 +105,43 @@ pub(crate) fn transition(
                 "stage": from.to_string(),
             }),
         );
+        // D-06/D-29: the halt ends the run too, so it notifies once, after
+        // `workflow_finished`. `finish_run` is the other end site; one run end
+        // reaches only one of them.
+        notify_run_end(
+            project_root,
+            state,
+            from,
+            "stopped_at",
+            &format!(
+                "phase {} stopped after {from} completed (--until {from})",
+                state.phase
+            ),
+        );
         return Ok(());
     }
 
     ensure_still_recorded(project_root, state.phase)?;
-    let _ = run_checkout_hooks(
-        project_root,
-        state,
-        &hooks::hooks_for_transition(from, to),
-        to,
-    );
     commit(state, |s| {
         s.stage = to;
-        if mode::transition_resets_consecutive_failures(from, to) {
+        // GATE-03 / D-09: the move from Validate to Plan is the gap-closure
+        // route, the only way out of Validate through here, so it starts a
+        // gap-closure pass. Nothing in this function clears the marker.
+        if (from, to) == (Stage::Validate, Stage::Plan) {
+            s.gap_closure_pass = true;
+        }
+        if mode::transition_resets_consecutive_failures(from, to, s.gap_closure_pass) {
             s.consecutive_failures = 0;
         }
         s.infra_failures = 0;
         s.gate_pending = false;
         // D-09: a fix type lives exactly as long as its Code pass, so a later
-        // plain Code pass never replays a stale one.
+        // plain Code pass never replays a stale one. Its note goes with it.
         s.code_fix = None;
+        s.code_fix_note = None;
+        s.code_fix_report = None;
+        // U7: a relaunch note is for the stage being left, never the next one.
+        s.relaunch_note = None;
     })?;
     events::emit(
         project_root,
@@ -125,6 +153,100 @@ pub(crate) fn transition(
         }),
     );
     launch_stage(state, None, Some(from))
+}
+
+/// The stop reason a run records when its Validate passes (D-35).
+pub(crate) const FINISHED_STOP_REASON: &str =
+    "finished: Validate passed; the worktree and branch are kept";
+
+/// End the run after a passing Validate (CUT-02; D-04, D-05, D-29, D-35).
+/// Validate is the last stage, so this is how every run that passes it ends:
+/// in auto mode on the pass, in supervise mode when the Validate gate is
+/// approved.
+///
+/// The state is kept, recorded `stopped` and `finished` with
+/// [`FINISHED_STOP_REASON`], and the supervisor record and `gate_pending` are
+/// cleared, as `transition`'s `--until` halt does, so `doctor` never reads the
+/// finished run as a crashed one. The phase leaves the machine-global gate
+/// registry. Nothing else is touched: no git call, no hook, no merge, push,
+/// tag or branch deletion, so the operator gets the tree as Validate left it.
+///
+/// It takes a [`FinishPermit`] by value, which only
+/// [`crate::pipeline_outcomes::can_finish`] makes (D-45 rule 1), so no run is
+/// recorded finished without a fresh `passed` and a Validate pass on HEAD.
+///
+/// It emits `workflow_finished` with `{"reason":"finished","shipped":false}`,
+/// then fires the notify command once and records `notify_fired`. It does not
+/// read `stop_until`: with `--until validate` a passing Validate is a finish,
+/// not a halt, because Validate is the last stage.
+pub(crate) fn finish_run(
+    project_root: &Path,
+    state: &mut State,
+    permit: FinishPermit,
+) -> Result<(), CliError> {
+    // D-45 rule 1: the permit is the proof `can_finish` held; it is spent here.
+    let _ = permit;
+    // Operator decision (2026-11-11): a permitted finish wins over a late
+    // stop. A stop taken during the advance that reached this finish (after
+    // the Validate gate was approved, or while an auto pass advanced) is not
+    // honoured here: the run is recorded finished, and the supervisor answers
+    // that stop `already_finished` (`run_monitor` marks the run finished), so
+    // `devflow stop` reports the finish, never a hand-off. A stop that lands
+    // where no finish is permitted keeps its handling at the next safe point.
+    let _ = close_gate(project_root, state.phase, state.stage);
+    commit(state, |s| {
+        s.stopped = true;
+        s.finished = true;
+        s.stop_reason = Some(FINISHED_STOP_REASON.to_string());
+        s.supervisor = None;
+        s.gate_pending = false;
+        s.code_fix = None;
+        s.code_fix_note = None;
+        s.code_fix_report = None;
+        s.relaunch_note = None;
+        s.gap_closure_pass = false;
+    })?;
+    registry::deregister(project_root, state.phase);
+    events::emit(
+        project_root,
+        state.phase,
+        "workflow_finished",
+        serde_json::json!({ "reason": "finished", "shipped": false }),
+    );
+    notify_run_end(
+        project_root,
+        state,
+        Stage::Validate,
+        "finished",
+        &format!(
+            "phase {} finished: Validate passed; the worktree and branch are kept",
+            state.phase
+        ),
+    );
+    println!(
+        "phase {} finished — Validate passed; the worktree and branch are kept",
+        state.phase
+    );
+    Ok(())
+}
+
+/// Fire the notify command once for a run that has ended at `stage`, then
+/// record `notify_fired` with the end's `reason` (D-06, D-29). Called after
+/// `workflow_finished`, by each site that emits it.
+fn notify_run_end(project_root: &Path, state: &State, stage: Stage, reason: &str, context: &str) {
+    gates::fire_gate_notify_with_fallback(
+        state.phase,
+        stage,
+        context,
+        false,
+        state.gate_notify_cmd.as_deref(),
+    );
+    events::emit(
+        project_root,
+        state.phase,
+        "notify_fired",
+        serde_json::json!({ "stage": stage.to_string(), "unexpected": false, "reason": reason }),
+    );
 }
 
 /// Why the pipeline is looping back to Code, recorded on the `loop_back`
@@ -143,8 +265,8 @@ pub(crate) enum LoopBackReason {
     /// signal that the failure budget had widened back to its full width.
     /// This reason is that signal.
     ValidateFailureNoBaseline,
-    /// A human answered a gate with a loop-back — a Ship `review:` rejection,
-    /// an ambiguous Validate adjudication, or a finalization retry. Makes no
+    /// A human answered a gate with a loop-back — an ambiguous Validate
+    /// adjudication. Makes no
     /// claim about the commit-count baseline, because none was consulted.
     GateResponse,
 }
@@ -162,16 +284,23 @@ impl LoopBackReason {
     }
 }
 
-/// Loop the pipeline back to Code with the given fix prompt (`GapsOnly` for a
-/// Validate rejection, `AuditFix` for a Ship `review:` rejection).
+/// Loop the pipeline back to Code with the given fix prompt (`GapsOnly`,
+/// `FullExecute` or `StaleReverify` for a Validate rejection). `note` is the
+/// operator's note on the rejected gate that asked for the fix (GATE-01), `None`
+/// for an unattended loop-back or an approval: the fix pass carries it to its
+/// agent. `reverify_report` is what GSD said when the fix is `StaleReverify`
+/// (D-32 part 1); it is ignored for every other fix.
 pub(crate) fn loop_back_to_code(
     project_root: &Path,
     state: &mut State,
     fix: FixType,
+    note: Option<String>,
+    reverify_report: Option<ReverifyReport>,
     reason: LoopBackReason,
 ) -> Result<(), CliError> {
     let from = state.stage;
-    let prompt = prepare_loop_back_to_code(project_root, state, fix, reason)?;
+    let prompt =
+        prepare_loop_back_to_code(project_root, state, fix, note, reverify_report, reason)?;
     launch_stage(state, Some(prompt), Some(from))
 }
 
@@ -179,30 +308,41 @@ pub(crate) fn loop_back_to_code(
 /// unit-testable without spawning a real agent process (`launch_stage`
 /// invokes the actual configured agent CLI). Cleans up the stale gate for
 /// the stage the gate fired on (CR-01), moves `state` to Code, persists it,
-/// and returns the fix prompt the caller should launch with.
+/// and returns the fix prompt the caller should launch with. The fix type and
+/// its `note` are persisted in one commit (`code_fix`, `code_fix_note`), so a
+/// replay of the fix pass renders the same note.
 pub(crate) fn prepare_loop_back_to_code(
     project_root: &Path,
     state: &mut State,
     fix: FixType,
+    note: Option<String>,
+    reverify_report: Option<ReverifyReport>,
     reason: LoopBackReason,
 ) -> Result<String, CliError> {
+    // Only the re-verify pass quotes GSD, so only it keeps the report.
+    let reverify_report = reverify_report.filter(|_| fix == FixType::StaleReverify);
     // Capture the stage the gate actually fired on before it's mutated below,
     // so the close targets the right stage's gate files (see CR-01).
     let gate_stage = state.stage;
     let _ = close_gate(project_root, state.phase, gate_stage);
-    // F-11 (`select_loop_back_fix`): this is the write that persists the
-    // verification observation that function records in the caller's copy, one
-    // write per loop-back. Nothing else writes those two fields during an advance.
-    let observed_fingerprint = state.last_verification_fingerprint;
-    let observed_mtime_nanos = state.last_verification_mtime_nanos;
     commit(state, |s| {
         s.stage = Stage::Code;
         s.gate_pending = false;
-        s.last_verification_fingerprint = observed_fingerprint;
-        s.last_verification_mtime_nanos = observed_mtime_nanos;
         // D-09: the fix pass this Code entry starts, so a same-stage relaunch
         // (failover, resume, re-drive) replays it rather than plain execute.
         s.code_fix = Some(fix);
+        s.code_fix_note = note.clone();
+        // D-32 part 1: GSD's words for the re-verify pass, in the same commit.
+        s.code_fix_report = reverify_report.clone();
+        // GATE-03: another fix route replaces a gap-closure pass, in the same
+        // commit; a gaps-only loop-back continues it.
+        if fix != FixType::GapsOnly {
+            s.gap_closure_pass = false;
+        }
+        // U7: this leaves Validate without `transition`, so it clears the
+        // relaunch note itself; the prompt below is built with none, so the
+        // prompt and the persisted state agree.
+        s.relaunch_note = None;
     })?;
     events::emit(
         project_root,
@@ -224,175 +364,11 @@ pub(crate) fn prepare_loop_back_to_code(
         &devflow_core::prompt::StageIntent::Code {
             phase: state.phase,
             fix: Some(fix),
+            fix_note: note,
+            relaunch_note: None,
+            reverify_report,
         },
     ))
-}
-
-/// Run the terminal hooks (version bump + branch cleanup) and clear state.
-///
-/// Uses [`gate_timeout_secs`]'s multi-day production default for the
-/// retry-gate wait below — safe for every caller EXCEPT the foreground
-/// `ship_override` path (WR-02), which calls
-/// [`finish_workflow_with_gate_timeout`] directly with a bounded timeout
-/// instead.
-pub(crate) fn finish_workflow(project_root: &Path, state: &mut State) -> Result<(), CliError> {
-    finish_workflow_with_gate_timeout(project_root, state, gate_timeout_secs())
-}
-
-/// `finish_workflow`'s body, parameterized on how long the retry-gate poll
-/// (below) waits for a response before failing fast (WR-02, phase 20
-/// review). Every caller reached through a detached monitor process should
-/// keep using `finish_workflow`'s multi-day default — invisible to an
-/// operator's terminal by construction. `ship_override` is the one caller
-/// invoked directly from the foreground CLI, so it passes
-/// [`crate::config_parse::foreground_gate_timeout_secs`] here instead,
-/// bounding how long a terminal-hook failure can block the operator's shell
-/// without weakening the fail-closed terminal-Ship invariant: an unanswered
-/// gate still fails the operation entirely (via `run_gate_with_timeout`'s
-/// existing timeout error), just after seconds instead of days.
-pub(crate) fn finish_workflow_with_gate_timeout(
-    project_root: &Path,
-    state: &mut State,
-    gate_timeout_secs: u64,
-) -> Result<(), CliError> {
-    #[cfg(test)]
-    crate::pipeline_launch::test_hold("before_finalization");
-    let mut progress = crate::pipeline_outcomes::BatchProgress::default();
-    loop {
-        // Safe point 6 (CR-01, 50-REVIEW.md; D-13 item 7), before every pass: a stop taken
-        // during the advance after the Ship gate was answered, or during a retry after its
-        // gate was answered, is honoured before the merge, version bump, tag and push. The
-        // consumed approval is set aside with the gate (D-06), and a resumed run reruns Ship,
-        // whose new gate a saved `yes_ship` auto-approves. Outside a supervisor's advance (the
-        // foreground `ship_override`) no stop token is engaged, and the holder's stop flag
-        // decides (D-18).
-        //
-        // This is the last point a stop lands before finalization, and the only stop check
-        // around a pass (D-18). Once a pass starts every hook runs to the end: a failed
-        // pass's retry gate honours the stop at safe point 4, and a successful pass ships.
-        if crate::pipeline_launch::stop_requested_at_safe_point() {
-            let _ = close_gate(project_root, state.phase, Stage::Ship);
-            crate::pipeline_launch::record_advance_stop(state, 6)?;
-            return Err(CliError::Message(format!(
-                "finalization did not run: {}",
-                crate::pipeline_launch::safe_point_stop_reason()
-            )));
-        }
-        ensure_still_recorded(project_root, state.phase)?;
-        if crate::pipeline_outcomes::run_checkout_hooks_from(
-            project_root,
-            state,
-            &hooks::hooks_after_ship(),
-            Stage::Ship,
-            &mut progress,
-        ) {
-            break;
-        }
-        // The original Ship approval has already been consumed. Reopen an
-        // actionable gate and keep this monitor waiting so a terminal-hook
-        // failure cannot turn into an invisible stalled Ship state.
-        let _ = close_gate(project_root, state.phase, Stage::Ship);
-        let context = format!(
-            "[finalization failed] phase {} terminal hooks did not complete. Resolve the git/version error, then approve to retry; reject to loop back or abort.",
-            state.phase
-        );
-        // This is the reopened finalization-retry gate, NEVER the routine
-        // Ship approval — it must always pass `None` here. Auto-approving
-        // it would mean "the merge could not be completed" gets silently
-        // retried forever with no human ever seeing it (T-23-91). The one
-        // and only site permitted to pass a non-`None` auto-response is
-        // `handle_ship_outcome` in `pipeline_outcomes.rs`.
-        match run_gate_with_timeout(
-            project_root,
-            state,
-            Stage::Ship,
-            &context,
-            gate_timeout_secs,
-            None,
-        )? {
-            GateAction::Advance => {
-                let _ = close_gate(project_root, state.phase, Stage::Ship);
-            }
-            GateAction::LoopBack(_) => {
-                return loop_back_to_code(
-                    project_root,
-                    state,
-                    FixType::AuditFix,
-                    LoopBackReason::GateResponse,
-                );
-            }
-            GateAction::Abort(reason) => return abort(project_root, state, &reason),
-        }
-    }
-    // 23-06 / T-23-67: the ONLY site in the workspace permitted to emit
-    // `workflow_shipped`. This is the strict shipped predicate `ship_evidence`
-    // reads — deliberately NOT `workflow_finished` below, which is also
-    // emitted by `transition`'s `--until` clean-stop branch (`pipeline_gate.rs`,
-    // `state.stop_until == Some(from)` arm) with a `"stopped_at"` reason,
-    // before any hook, stage assignment, or launch runs. A phase halted after
-    // one stage must never read as shipped. Ordering here is load-bearing in
-    // three directions: after the hook-success loop `break` above, so it can
-    // only fire once the entire `hooks_after_ship` batch has succeeded; before
-    // the state is cleared below, so a kill between the two cannot leave a
-    // shipped run with no state and no record that it shipped; and before
-    // `workflow_finished` below, because existing tests assert a phase's event
-    // stream ENDS in `workflow_finished` — do not move this emission after
-    // either of them.
-    events::emit(
-        project_root,
-        state.phase,
-        "workflow_shipped",
-        serde_json::json!({
-            "stage": Stage::Ship.to_string(),
-        }),
-    );
-    let _ = close_gate(project_root, state.phase, Stage::Validate);
-    let _ = close_gate(project_root, state.phase, Stage::Ship);
-    #[cfg(test)]
-    if let Some(probe) = BEFORE_RUN_STATE_CLEAR.take() {
-        probe();
-    }
-    clear_run_state(project_root, state.phase)?;
-    // 23b: the workflow is genuinely over — deregister this (project_root,
-    // phase) from the machine-global registry so `devflow gate list
-    // --all-roots` stops naming a phase that no longer exists.
-    registry::deregister(project_root, state.phase);
-    match ship::consume_cron_instructions(project_root, state.phase) {
-        Ok(Some(path_kind)) => {
-            let path_kind = match path_kind {
-                ship::CronInstructionPathKind::PerPhase => "per-phase",
-                ship::CronInstructionPathKind::Legacy => "legacy",
-                ship::CronInstructionPathKind::Both => "both",
-            };
-            events::emit(
-                project_root,
-                state.phase,
-                "cron_instructions_consumed",
-                serde_json::json!({
-                    "trigger": "ship_complete",
-                    "path_kind": path_kind,
-                }),
-            );
-        }
-        Ok(None) => {}
-        Err(err) => info!(phase = %state.phase, "could not consume cron instructions: {err}"),
-    }
-    events::emit(
-        project_root,
-        state.phase,
-        "workflow_finished",
-        serde_json::Value::Null,
-    );
-    println!("phase {} shipped — workflow complete", state.phase);
-    Ok(())
-}
-
-#[cfg(test)]
-thread_local! {
-    /// Run on this thread once, at the last instant before finalization removes the state,
-    /// standing in for a kill at that point.
-    static BEFORE_RUN_STATE_CLEAR: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
-        const { std::cell::Cell::new(None) };
 }
 
 // A gate wait is a plain call in a normal build. The test build routes it through
@@ -472,7 +448,7 @@ thread_local! {
 /// the loser meets a closed gate rather than the other's claim. Does nothing on a
 /// thread with no probe installed.
 #[cfg(test)]
-fn note_claim(claim: &Result<Claim, GateError>) {
+fn note_claim(claim: &Result<Claim, devflow_core::gates::GateError>) {
     use std::sync::atomic::Ordering::SeqCst;
     const OTHER_CONSUMER_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
     let Some(probe) = CLAIM_PROBE.with_borrow(Clone::clone) else {
@@ -491,28 +467,239 @@ fn note_claim(claim: &Result<Claim, GateError>) {
     }
 }
 
+/// When the rate-limit gate `gate`'s one automatic relaunch wakes, or `None`
+/// when no timer is armed (CUT-03, D-16, D-38, D-45 rule 5). The one arming
+/// decision every path takes (a first open, a resume, a takeover): armed only
+/// for a gate whose file records [`GateKind::RateLimit`] and a not-before time
+/// (the reset plus [`reset_time::RATE_LIMIT_RELAUNCH_MARGIN_SECS`]), and only
+/// while the run's [`State::rate_limit_auto_relaunch_used`] is false. The wake
+/// is that not-before time whatever the gate's lifetime.
+pub(crate) fn rate_limit_timer_deadline(state: &State, gate: &GateFile) -> Option<i64> {
+    if state.rate_limit_auto_relaunch_used || gate.gate_kind != Some(GateKind::RateLimit) {
+        return None;
+    }
+    gate.not_before
+}
+
+/// When `gate`, opened at `opened_at` (epoch seconds), stops waiting for an
+/// answer: `timeout_secs` after it opened, or for a rate-limit gate with a
+/// not-before time the later of that and the not-before time
+/// ([`reset_time::rate_limit_wait_bound`], D-27.2). Saturates instead of
+/// overflowing on an absurd timeout.
+pub(crate) fn gate_lifetime_deadline(opened_at: i64, gate: &GateFile, timeout_secs: u64) -> i64 {
+    let secs = match (gate.gate_kind, gate.not_before) {
+        (Some(GateKind::RateLimit), Some(not_before)) => reset_time::rate_limit_wait_bound(
+            opened_at,
+            not_before.saturating_sub(reset_time::RATE_LIMIT_RELAUNCH_MARGIN_SECS),
+            timeout_secs,
+        ),
+        _ => timeout_secs,
+    };
+    opened_at.saturating_add(i64::try_from(secs).unwrap_or(i64::MAX))
+}
+
+/// Which of a gate wait's two deadlines is due at a poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DueDeadline {
+    /// The armed rate-limit timer's wake: the timer answers the gate.
+    Wake,
+    /// The gate's lifetime: the wait ends unanswered.
+    Lifetime,
+}
+
+/// The per-poll choice between a gate wait's armed timer `wake` and its
+/// `lifetime` at `now` (D-45 rule 5, U8). The wake is checked first, so at
+/// equal deadlines (a reset later than the gate timeout, where the lifetime is
+/// the wake) the timer answers rather than the wait timing out. `None` while
+/// neither is due.
+pub(crate) fn due_gate_deadline(now: i64, wake: Option<i64>, lifetime: i64) -> Option<DueDeadline> {
+    if wake.is_some_and(|wake| now >= wake) {
+        Some(DueDeadline::Wake)
+    } else if now >= lifetime {
+        Some(DueDeadline::Lifetime)
+    } else {
+        None
+    }
+}
+
+/// How long a wait gives an answer already on the gate to be picked up after
+/// the timer wrote it (or found an operator's), when the gate's lifetime has
+/// come too.
+const ANSWER_PICKUP_SECS: u64 = 10;
+
+/// The current time in epoch seconds, the `now` of a gate wait's polls.
+fn epoch_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
+        })
+}
+
+/// Wait on the gate `gate_id` with its two deadlines kept apart (D-45 rule 5):
+/// the armed rate-limit timer's wake ([`rate_limit_timer_deadline`]) and the
+/// gate's lifetime ([`gate_lifetime_deadline`]), chosen per poll by
+/// [`due_gate_deadline`]. A gate that is not a rate-limit gate waits exactly as
+/// before, for `timeout_secs`. When the wake is due the timer answers once
+/// ([`answer_as_rate_limit_timer`]) and the wait goes on, so the answer, the
+/// timer's or an operator's, is picked up and claimed like any answer.
+fn wait_with_rate_limit_timer(
+    project_root: &Path,
+    state: &mut State,
+    stage: Stage,
+    gate_id: &GateId,
+    timeout_secs: u64,
+) -> Result<crate::pipeline_launch::GateWaitEnd, CliError> {
+    use crate::pipeline_launch::GateWaitEnd;
+    let opened_at = epoch_now();
+    let gate = read_gate_file(project_root, state.phase, stage).filter(|gate| {
+        gate.gate_id == gate_id.as_str() && gate.gate_kind == Some(GateKind::RateLimit)
+    });
+    let Some(gate) = gate else {
+        return gate_wait_call(project_root, state.phase, stage, gate_id, timeout_secs);
+    };
+    let mut wake = rate_limit_timer_deadline(state, &gate);
+    let lifetime = gate_lifetime_deadline(opened_at, &gate, timeout_secs);
+    loop {
+        let now = epoch_now();
+        match due_gate_deadline(now, wake, lifetime) {
+            Some(DueDeadline::Wake) => {
+                // Disarmed for the rest of this wait whatever the write did: the
+                // timer answers a gate at most once.
+                wake = None;
+                if answer_as_rate_limit_timer(project_root, state, stage, gate_id)? {
+                    // An answer is on the gate now, the timer's or an operator's.
+                    // Take it before the lifetime is looked at again: at equal
+                    // deadlines (U8) the lifetime is due too, and checking it
+                    // first would time the gate out over its own answer.
+                    let secs = u64::try_from(lifetime.saturating_sub(now))
+                        .unwrap_or(0)
+                        .max(ANSWER_PICKUP_SECS);
+                    match gate_wait_call(project_root, state.phase, stage, gate_id, secs)? {
+                        GateWaitEnd::TimedOut => {}
+                        end => return Ok(end),
+                    }
+                }
+                continue;
+            }
+            Some(DueDeadline::Lifetime) => return Ok(GateWaitEnd::TimedOut),
+            None => {}
+        }
+        let next = wake.map_or(lifetime, |wake| wake.min(lifetime));
+        let secs = u64::try_from(next.saturating_sub(now)).unwrap_or(0).max(1);
+        match gate_wait_call(project_root, state.phase, stage, gate_id, secs)? {
+            GateWaitEnd::TimedOut => {}
+            end => return Ok(end),
+        }
+    }
+}
+
+/// The timer's one answer to the rate-limit gate `gate_id` (D-38, D-45 rule
+/// 5). The run's [`State::rate_limit_auto_relaunch_used`] is committed first,
+/// durably, and only then is the approve written
+/// ([`Gates::rate_limit_timer_answer`]), so a crash after the commit leaves no
+/// automatic relaunch rather than two: nothing re-arms a timer or re-publishes
+/// its answer. When an operator answered first (`AlreadyResponded`) the flag is
+/// committed back to false, because the operator's answer does not spend it,
+/// and the wait takes that answer. Any other failure keeps the flag spent,
+/// since this cannot tell whether an answer was written, and says so.
+/// Returns whether an answer is on the gate now (the timer's or the
+/// operator's).
+fn answer_as_rate_limit_timer(
+    project_root: &Path,
+    state: &mut State,
+    stage: Stage,
+    gate_id: &GateId,
+) -> Result<bool, CliError> {
+    commit(state, |s| s.rate_limit_auto_relaunch_used = true)?;
+    let written = fenced(project_root, state.phase, || {
+        Ok(Gates::rate_limit_timer_answer(
+            project_root,
+            state.phase,
+            stage,
+            gate_id,
+        ))
+    })?;
+    let outcome = match written {
+        Ok(_) => {
+            println!(
+                "phase {}: the rate limit's reset has passed; the timer approved the {stage} \
+                 gate, so the stage relaunches once on the same agent",
+                state.phase
+            );
+            "answered"
+        }
+        Err(gates::GateError::AlreadyResponded { .. }) => {
+            commit(state, |s| s.rate_limit_auto_relaunch_used = false)?;
+            "operator_answered_first"
+        }
+        Err(err) => {
+            eprintln!(
+                "phase {}: the rate-limit timer could not answer the {stage} gate {gate_id}: \
+                 {err}; the run's automatic relaunch is spent and the gate waits for an operator",
+                state.phase
+            );
+            "failed"
+        }
+    };
+    events::emit(
+        project_root,
+        state.phase,
+        "rate_limit_timer_fired",
+        serde_json::json!({
+            "stage": stage.to_string(),
+            "gate_id": gate_id.as_str(),
+            "outcome": outcome,
+        }),
+    );
+    Ok(outcome != "failed")
+}
+
 /// Open a gate and block (in the detached monitor) until its answer or the long
 /// timeout, consuming the answer through its claim. See [`run_gate_with_timeout`].
 pub(crate) fn run_gate(
     project_root: &Path,
     state: &mut State,
     stage: Stage,
+    kind: impl Into<GateLabel>,
     context: &str,
-) -> Result<GateAction, CliError> {
+) -> Result<Answer, CliError> {
     run_gate_with_timeout(
         project_root,
         state,
         stage,
+        kind,
         context,
         gate_timeout_secs(),
-        None,
+    )
+}
+
+/// [`run_gate`] whose `gate_fired` event carries `event_context` instead of the
+/// gate's `context`, for a gate whose context holds text an event must not
+/// carry: GSD's message or git's stderr, which can name absolute paths
+/// (52-22, Pitfall 11). The gate file and the notify command still get
+/// `context`.
+pub(crate) fn run_gate_with_event_context(
+    project_root: &Path,
+    state: &mut State,
+    stage: Stage,
+    kind: impl Into<GateLabel>,
+    context: &str,
+    event_context: &str,
+) -> Result<Answer, CliError> {
+    open_and_await(
+        project_root,
+        state,
+        stage,
+        kind.into(),
+        (context, event_context),
+        gate_timeout_secs(),
     )
 }
 
 /// `run_gate`'s body, parameterized on the wait's timeout (WR-02, phase 20
-/// review) so [`finish_workflow_with_gate_timeout`]'s foreground retry-gate
-/// wait can pass a bounded timeout instead of [`gate_timeout_secs`]'s
-/// multi-day production default.
+/// review) so a caller can pass a bounded timeout instead of
+/// [`gate_timeout_secs`]'s multi-day production default.
 ///
 /// The bound protocol (D-04, D-05): a fresh gate id with this waiter registered before
 /// the gate file is published, that registration held for the whole wait, a wait for
@@ -522,213 +709,275 @@ pub(crate) fn run_gate_with_timeout(
     project_root: &Path,
     state: &mut State,
     stage: Stage,
+    kind: impl Into<GateLabel>,
     context: &str,
     timeout_secs: u64,
-    // 23-09 (D-04/D-05/D-06): a pre-authorized response to write for this
-    // gate, or `None` for a real human gate. This function must NEVER
-    // derive this value from `state` (e.g. `state.yes_ship`) — the decision
-    // belongs to the caller precisely so the reopened finalization-retry
-    // gate in `finish_workflow_with_gate_timeout` cannot inherit an
-    // authorization meant only for the routine Ship approval. The regression
-    // test `finalization_retry_gate_never_auto_approves_even_with_yes_ship_set`
-    // (pipeline_outcomes.rs) fails loudly if a future refactor reads the
-    // flag from `state` inside this function instead of receiving it here.
-    auto_response: Option<&GateResponse>,
-) -> Result<GateAction, CliError> {
+) -> Result<Answer, CliError> {
+    open_and_await(
+        project_root,
+        state,
+        stage,
+        kind.into(),
+        (context, context),
+        timeout_secs,
+    )
+}
+
+/// The body [`run_gate_with_timeout`] and [`run_gate_with_event_context`] share.
+/// `contexts` is the gate's context and the one its `gate_fired` event carries.
+/// The gate's `label` is required, so no gate opens without a kind (D-39), and
+/// it is written by the same atomic write as the rest of the gate file (52-22).
+///
+/// R10 (52-29): every answer is screened at its pickup, before the claim, the
+/// `gate_pending` write and `gate_resolved`, from the gate file and the answer
+/// alone ([`crate::pipeline_outcomes::screen_answer`], no GSD read). A refused
+/// answer is never claimed: the gate is reopened never-silently with the label
+/// this supervisor opened it with (C11), which sets the refused answer aside,
+/// `gate_answer_refused` is emitted, and the wait starts again on the reopened
+/// gate. Every other answer is claimed and routed, and `gate_resolved` names
+/// the route.
+fn open_and_await(
+    project_root: &Path,
+    state: &mut State,
+    stage: Stage,
+    label: GateLabel,
+    contexts: (&str, &str),
+    timeout_secs: u64,
+) -> Result<Answer, CliError> {
+    let (question, question_event) = contexts;
+    let mut context = question.to_string();
+    let mut event_context = question_event.to_string();
     commit(state, |s| s.gate_pending = true)?;
-    // A crash inside this call before the publish leaves `gate_pending` with no gate
-    // file, which `doctor`'s `check_gate_pending_without_gate` reports.
-    let (opened, registration) = fenced(project_root, state.phase, || {
-        Ok(Gates::open_registered(
+    loop {
+        // A crash inside this call before the publish leaves `gate_pending` with no
+        // gate file, which `doctor`'s `check_gate_pending_without_gate` reports.
+        let (opened, registration) = fenced(project_root, state.phase, || {
+            Ok(Gates::open_registered(
+                project_root,
+                state.phase,
+                stage,
+                label,
+                &context,
+            )?)
+        })?;
+        let gate_id = &opened.gate_id;
+        println!(
+            "gate written: .devflow/gates/{}-{stage}.json — awaiting response",
+            state.phase.padded()
+        );
+        // A gate is "unexpected" when the active mode would not normally fire
+        // one for this stage (e.g. a Define/Plan/Code failure in Auto mode) —
+        // WR-11's never-silent path gates unconditionally, independent of mode.
+        let unexpected = !state.mode.should_gate(
+            stage,
+            state.consecutive_failures,
+            state.phase_validate_failures,
+        );
+        if unexpected {
+            info!(
+                "never-silent gate: {stage} failed in {:?} mode — surfacing an unattended gate this mode would not normally fire",
+                state.mode
+            );
+        }
+        events::emit(
             project_root,
             state.phase,
-            stage,
-            context,
-        )?)
-    })?;
-    let gate_id = &opened.gate_id;
-    // Safe point 5 (CR-01, 50-REVIEW.md; D-13 item 8): an answer already on disk wins over
-    // a stop in the wait below, so a stop taken during the advance is honoured before the
-    // pre-authorized one is written, and before the notify and events, which would otherwise
-    // ask an operator to answer a gate this run withdraws at once. As at safe point 4, the
-    // gate is closed, the stop recorded and an error unwinds every caller. A stop that
-    // arrives after this point is honoured at safe point 6. A real human gate has no check
-    // here: its wait below ends on the stop.
-    if auto_response.is_some() && crate::pipeline_launch::stop_requested_at_safe_point() {
-        let _ = close_gate(project_root, state.phase, stage);
-        registration.finish();
-        crate::pipeline_launch::record_advance_stop(state, 5)?;
-        return Err(CliError::Message(format!(
-            "the gate for stage {stage} was not auto-answered: {}",
-            crate::pipeline_launch::safe_point_stop_reason()
-        )));
-    }
-    println!(
-        "gate written: .devflow/gates/{}-{stage}.json — awaiting response",
-        state.phase.padded()
-    );
-    // A gate is "unexpected" when the active mode would not normally fire
-    // one for this stage (e.g. a Define/Plan/Code failure in Auto mode) —
-    // WR-11's never-silent path gates unconditionally, independent of mode.
-    let unexpected = !state.mode.should_gate(
-        stage,
-        state.consecutive_failures,
-        state.phase_validate_failures,
-    );
-    if unexpected {
-        info!(
-            "never-silent gate: {stage} failed in {:?} mode — surfacing an unattended gate this mode would not normally fire",
-            state.mode
+            "gate_fired",
+            serde_json::json!({
+                "stage": stage.to_string(),
+                "unexpected": unexpected,
+                "context": event_context,
+                "gate_kind": label.kind,
+            }),
         );
-    }
-    events::emit(
-        project_root,
-        state.phase,
-        "gate_fired",
-        serde_json::json!({
-            "stage": stage.to_string(),
-            "unexpected": unexpected,
-            "context": context,
-        }),
-    );
-    gates::fire_gate_notify_with_fallback(
-        state.phase,
-        stage,
-        context,
-        unexpected,
-        state.gate_notify_cmd.as_deref(),
-    );
-    events::emit(
-        project_root,
-        state.phase,
-        "notify_fired",
-        serde_json::json!({ "stage": stage.to_string(), "unexpected": unexpected }),
-    );
-    // The auto-response, if any, is written here: after the gate opened and both
-    // `gate_fired`/`notify_fired` events, so the event stream still reads as a real gate
-    // that was really answered, and before the wait below, whose first read finds it.
-    if let Some(response) = auto_response {
-        let answered = fenced(project_root, state.phase, || {
-            match Gates::answer(project_root, state.phase, stage, gate_id, response) {
-                Ok(_) => Ok(()),
-                // A human or 23b's stale-gate sweep may have answered first;
-                // first-writer-wins is the correct resolution, not an error.
-                Err(GateError::AlreadyResponded { .. }) => Ok(()),
-                // Published, with its re-check refused by a stalled gate lock. This waiter
-                // is the one that acts on a published answer, and the wait below reads it.
-                Err(err @ GateError::PublishedUnconfirmed { .. }) => {
-                    warn!("{err}");
-                    Ok(())
-                }
-                Err(err) => Err(err.into()),
-            }
-        });
-        if let Err(err) = answered {
-            registration.finish();
-            return Err(err);
-        }
-    }
-    let wait_end = match gate_wait_call(project_root, state.phase, stage, gate_id, timeout_secs) {
-        Ok(end) => end,
-        Err(err) => {
-            registration.finish();
-            return Err(err);
-        }
-    };
-    match wait_end {
-        GateWaitEnd::Answered(response) => {
-            let claim = fenced(project_root, state.phase, || {
-                Ok(Gates::claim(project_root, state.phase, stage, gate_id))
-            });
-            let claim = match claim {
-                Ok(claim) => claim,
-                // D-03: not the recorded supervisor, so nothing was claimed.
+        gates::fire_gate_notify_with_fallback(
+            state.phase,
+            stage,
+            &context,
+            unexpected,
+            state.gate_notify_cmd.as_deref(),
+        );
+        events::emit(
+            project_root,
+            state.phase,
+            "notify_fired",
+            serde_json::json!({ "stage": stage.to_string(), "unexpected": unexpected }),
+        );
+        let wait_end =
+            match wait_with_rate_limit_timer(project_root, state, stage, gate_id, timeout_secs) {
+                Ok(end) => end,
                 Err(err) => {
                     registration.finish();
                     return Err(err);
                 }
             };
-            #[cfg(test)]
-            note_claim(&claim);
-            match claim {
-                Ok(Claim::Claimed) => {}
-                Ok(Claim::AlreadyConsumed) => {
+        match wait_end {
+            GateWaitEnd::Answered(response) => {
+                // R10: the gate file as it is on disk names the answer's family.
+                let gate_file = read_gate_file(project_root, state.phase, stage);
+                let recorded_kind = gate_file.as_ref().and_then(|gate| gate.gate_kind);
+                if let Err(refusal) =
+                    crate::pipeline_outcomes::screen_answer(recorded_kind, &response)
+                {
                     registration.finish();
-                    return Err(CliError::Message(format!(
-                        "phase {}: the answer to {stage} gate {gate_id} was already consumed: \
-                         another consumer (`devflow ship`) acted on it, so this wait did nothing",
-                        state.phase
-                    )));
+                    events::emit(
+                        project_root,
+                        state.phase,
+                        "gate_answer_refused",
+                        serde_json::json!({
+                            "stage": stage.to_string(),
+                            "gate_id": gate_id.as_str(),
+                            "gate_kind": recorded_kind,
+                            "answer": refusal.answer,
+                        }),
+                    );
+                    eprintln!(
+                        "phase {}: the {} on the {stage} gate was refused: {}",
+                        state.phase, refusal.answer, refusal.why
+                    );
+                    context = refused_answer_context(&refusal, question);
+                    event_context = refused_answer_context(&refusal, question_event);
+                    continue;
                 }
-                // R-08: the gate closed or was replaced after the answer was read, or
-                // its lock was held too long. Nothing here records a decision.
-                Err(err) => {
-                    registration.finish();
-                    return Err(CliError::Message(format!(
-                        "phase {}: the answer to {stage} gate {gate_id} could not be claimed, \
-                         so nothing was consumed: {err}",
-                        state.phase
-                    )));
+                let claim = fenced(project_root, state.phase, || {
+                    Ok(Gates::claim(project_root, state.phase, stage, gate_id))
+                });
+                let claim = match claim {
+                    Ok(claim) => claim,
+                    // D-03: not the recorded supervisor, so nothing was claimed.
+                    Err(err) => {
+                        registration.finish();
+                        return Err(err);
+                    }
+                };
+                #[cfg(test)]
+                note_claim(&claim);
+                match claim {
+                    Ok(Claim::Claimed) => {}
+                    Ok(Claim::AlreadyConsumed) => {
+                        registration.finish();
+                        return Err(CliError::Message(format!(
+                            "phase {}: the answer to {stage} gate {gate_id} was already consumed: \
+                             another consumer acted on it, so this wait did nothing",
+                            state.phase
+                        )));
+                    }
+                    // R-08: the gate closed or was replaced after the answer was read, or
+                    // its lock was held too long. Nothing here records a decision.
+                    Err(err) => {
+                        registration.finish();
+                        return Err(CliError::Message(format!(
+                            "phase {}: the answer to {stage} gate {gate_id} could not be claimed, \
+                             so nothing was consumed: {err}",
+                            state.phase
+                        )));
+                    }
                 }
-            }
-            registration.finish();
-            #[cfg(test)]
-            crate::pipeline_launch::test_hold("after_claim");
-            // D-08: whatever changed on disk during the wait (a `stop`, a
-            // `yes_ship` revoke, an edited notify command) is kept, because this
-            // write re-reads the state and sets only this field.
-            commit(state, |s| s.gate_pending = false)?;
-            let action = GateAction::from_response(&response);
-            events::emit(
-                project_root,
-                state.phase,
-                "gate_resolved",
-                serde_json::json!({
+                registration.finish();
+                #[cfg(test)]
+                crate::pipeline_launch::test_hold("after_claim");
+                // D-08: whatever changed on disk during the wait (a `stop`, an
+                // edited notify command) is kept, because this
+                // write re-reads the state and sets only this field.
+                commit(state, |s| s.gate_pending = false)?;
+                // D-45 rule 2: the answer is routed here, after its claim, so
+                // `gate_resolved` names the route it runs and the evidence a
+                // verification approve was routed on. The screen passed, so the
+                // file names a kind.
+                let gate_file = gate_file.unwrap_or_else(|| GateFile {
+                    phase: state.phase,
+                    stage,
+                    context: context.clone(),
+                    timestamp: String::new(),
+                    gate_id: gate_id.to_string(),
+                    gate_kind: Some(label.kind),
+                    gsd_status: label.gsd_status,
+                    not_before: label.not_before,
+                });
+                // The rate-limit gate's own mapping (52-31): its approve or reject
+                // is a relaunch, which `gate_resolved` names as one.
+                let action = GateAction::from_gate_answer(gate_file.gate_kind, &response);
+                let answer = crate::pipeline_outcomes::route_answer(
+                    project_root,
+                    state,
+                    &gate_file,
+                    &response,
+                );
+                let mut resolved = serde_json::json!({
                     "stage": stage.to_string(),
                     "gate_id": gate_id.as_str(),
+                    "gate_kind": gate_file.gate_kind,
                     "approved": response.approved,
                     "action": match &action {
                         GateAction::Advance => "advance",
-                        GateAction::LoopBack(_) => "loop_back",
+                        GateAction::LoopBack { .. } => "loop_back",
+                        GateAction::Relaunch { .. } => "relaunch",
                         GateAction::Abort(_) => "abort",
                     },
                     "responded_by": response.responded_by,
-                }),
-            );
-            // `gate_pending` reads false here, and the caller has not applied the action.
-            #[cfg(test)]
-            crate::pipeline_launch::test_hold("after_commit");
-            Ok(action)
-        }
-        GateWaitEnd::Stopped => {
-            // Safe point 4 (50-13, R-2): the supervisor running this advance
-            // was stopped during the wait. The gate has no waiter any more, so
-            // it is closed (an unconsumed answer is set aside, nothing outlives
-            // the run in its slot), the stop is recorded, and an error unwinds
-            // every caller through `?`, which releases a foreground process's holder.
-            // Deliberately not `GateAction::Abort`: `abort()` deletes the state
-            // file, and a stopped run keeps its state for `devflow resume`.
-            let _ = close_gate(project_root, state.phase, stage);
-            registration.finish();
-            crate::pipeline_launch::record_advance_stop(state, 4)?;
-            Err(CliError::Message(format!(
-                "the gate wait for stage {stage} ended: {}",
-                crate::pipeline_launch::safe_point_stop_reason()
-            )))
-        }
-        GateWaitEnd::TimedOut => {
-            registration.finish();
-            events::emit(
-                project_root,
-                state.phase,
-                "gate_timeout",
-                serde_json::json!({ "stage": stage.to_string() }),
-            );
-            Err(CliError::Message(format!(
-                "gate for stage {stage} timed out awaiting a response"
-            )))
+                });
+                if let (Some(resolved), serde_json::Value::Object(route)) =
+                    (resolved.as_object_mut(), answer.resolved_fields())
+                {
+                    resolved.extend(route);
+                }
+                events::emit(project_root, state.phase, "gate_resolved", resolved);
+                // `gate_pending` reads false here, and the caller has not applied the action.
+                #[cfg(test)]
+                crate::pipeline_launch::test_hold("after_commit");
+                return Ok(answer);
+            }
+            GateWaitEnd::Stopped => {
+                // Safe point 4 (50-13, R-2): the supervisor running this advance
+                // was stopped during the wait. The gate has no waiter any more, so
+                // it is closed (an unconsumed answer is set aside, nothing outlives
+                // the run in its slot), the stop is recorded, and an error unwinds
+                // every caller through `?`, which releases a foreground process's holder.
+                // Deliberately not `GateAction::Abort`: `abort()` deletes the state
+                // file, and a stopped run keeps its state for `devflow resume`.
+                let _ = close_gate(project_root, state.phase, stage);
+                registration.finish();
+                crate::pipeline_launch::record_advance_stop(state, 4)?;
+                return Err(CliError::Message(format!(
+                    "the gate wait for stage {stage} ended: {}",
+                    crate::pipeline_launch::safe_point_stop_reason()
+                )));
+            }
+            GateWaitEnd::TimedOut => {
+                registration.finish();
+                events::emit(
+                    project_root,
+                    state.phase,
+                    "gate_timeout",
+                    serde_json::json!({ "stage": stage.to_string() }),
+                );
+                return Err(CliError::Message(format!(
+                    "gate for stage {stage} timed out awaiting a response"
+                )));
+            }
         }
     }
+}
+
+/// The gate file of `phase`'s `stage` gate as it is on disk, or `None` when it
+/// cannot be read or parsed. A file with no kind parses with `gate_kind: None`.
+pub(crate) fn read_gate_file(
+    project_root: &Path,
+    phase: devflow_core::phase_id::PhaseId,
+    stage: Stage,
+) -> Option<GateFile> {
+    let text = std::fs::read_to_string(Gates::gate_path(project_root, phase, stage)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// The context of a gate reopened after `refusal` (R10, never silent): what
+/// was refused and why, the answers that apply, then the gate's question.
+fn refused_answer_context(refusal: &crate::pipeline_outcomes::Refusal, question: &str) -> String {
+    format!(
+        "[never-silent] The {} was refused and nothing ran: {}. The answers that apply here: \
+         {}. The gate asked: {question}",
+        refusal.answer, refusal.why, refusal.applies
+    )
 }
 
 /// Abort the workflow with a reason, clearing state.
@@ -780,164 +1029,6 @@ pub(crate) fn abort(project_root: &Path, state: &State, reason: &str) -> Result<
     Ok(())
 }
 
-/// Manual ship override (20e, D-01): a second, out-of-process consumer of the same
-/// Ship answer `run_gate`'s live wait consumes. `devflow gate approve` only WRITES an
-/// answer (`Gates::answer`); a live monitor waiting on the gate is what normally
-/// advances the workflow. If that monitor died before consuming the answer, the
-/// approval sits unconsumed forever; this function reads the answer directly, claims
-/// it, and on `GateAction::Advance` drives the SAME `finish_workflow` the live wait
-/// would have called (D-01) — not a reimplementation of the after-ship hook batch.
-///
-/// Guard order (D-02, D-04):
-/// 1. Claim the D-17 holder, with the D-18 stop handler installed first
-///    ([`crate::commands::claim_foreground_holder`]), so `stop` can reach this process and
-///    no other foreground process acts on the phase.
-/// 2. Refuse while a recorded or pending supervisor of the phase is live (R-17): its own
-///    wait can still consume the answer, and a loop-back here would launch beside it.
-///    After the claim, no `start` or `resume` can reserve, so none appears while this runs.
-/// 3. `state.stage` must be EXACTLY `Stage::Ship`; any earlier stage is refused, naming
-///    the stage to resolve first.
-/// 4. The live Ship gate must hold an answer bound to its id. A file that does not bind
-///    is refused and left where it is: this command reads and moves nothing (R-09).
-/// 5. The answer must be claimed before anything acts on it, and the claim excludes a live
-///    waiter's own consumption of it (D-08). A claim already there means
-///    another consumer took it and may have died mid-`finish_workflow`, and any claim
-///    error (the gate closed or was replaced since this command read it, R-08, or its
-///    lock was held too long) means nothing was consumed. All of them refuse here, so
-///    no claim error reaches `finish_workflow`, `loop_back_to_code` or `abort`.
-///
-/// `force` is accepted and echoed in the CLI output for explicit operator
-/// auditability (Hermes LOW: make `--force` semantics explicit), but is
-/// deliberately NOT consulted by any guard above — D-02 scopes `--force` to
-/// "skip Ship-gate re-verification," never to bypassing the stage, holder,
-/// gate-existence, or claim checks themselves. This design has no separate
-/// Ship-gate re-verification step beyond those guards, so `--force`
-/// currently changes no observable behavior; it exists so the flag is never
-/// silently ignored and cannot later be wired to widen scope without an
-/// explicit, reviewed change to this function.
-pub(crate) fn ship_override(
-    project_root: &Path,
-    phase: PhaseId,
-    force: bool,
-) -> Result<(), CliError> {
-    let _phase_holder = crate::commands::claim_foreground_holder(project_root, phase)?;
-    crate::commands::refuse_ship_over_a_live_supervisor(project_root, phase)?;
-
-    let mut state = workflow::load_state(project_root, phase)?;
-
-    if state.stage != Stage::Ship {
-        return Err(CliError::Message(format!(
-            "phase {phase} is at stage {} — `devflow ship` requires state.stage == Stage::Ship; \
-             resolve stage {} first (--force does not skip stages)",
-            state.stage, state.stage
-        )));
-    }
-
-    let response = claim_ship_answer(project_root, phase)?;
-
-    println!(
-        "phase {phase}: manual ship override (--force={force}) — driving the already-written \
-         Ship response through the same terminal path the live monitor would have used"
-    );
-
-    match GateAction::from_response(&response) {
-        GateAction::Advance => {
-            // WR-02 (phase 20 review): finish_workflow's retry-gate wait
-            // (on a terminal-hook failure) normally uses gate_timeout_secs'
-            // multi-day production default, invisible to an operator
-            // because every OTHER caller runs inside a detached monitor.
-            // ship_override runs in the FOREGROUND CLI — bound the wait so
-            // a hook failure fails fast with an actionable message instead
-            // of blocking this shell for days.
-            let timeout = foreground_gate_timeout_secs();
-            println!(
-                "phase {phase}: if terminal-hook finalization fails, this foreground command \
-                 will wait up to {timeout}s for the reopened Ship gate before failing (vs. the \
-                 multi-day background default) — set DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS to \
-                 change this"
-            );
-            finish_workflow_with_gate_timeout(project_root, &mut state, timeout)
-        }
-        GateAction::LoopBack(_) => {
-            // Antigravity LOW: `loop_back_to_code` → `launch_stage` forks a
-            // NEW detached monitor daemon — say so explicitly, so `devflow
-            // ship` is not a silently long-running process the operator
-            // can't account for.
-            println!(
-                "phase {phase}: Ship response loops back to Code — launching a new, detached \
-                 monitor agent to drive the retry"
-            );
-            loop_back_to_code(
-                project_root,
-                &mut state,
-                FixType::AuditFix,
-                LoopBackReason::GateResponse,
-            )
-        }
-        GateAction::Abort(reason) => abort(project_root, &state, &reason),
-    }
-}
-
-/// Read the live Ship gate's answer and claim it: guards 5 and 6 of [`ship_override`].
-/// Every refusal here consumes nothing.
-fn claim_ship_answer(project_root: &Path, phase: PhaseId) -> Result<GateResponse, CliError> {
-    let stage = Stage::Ship;
-    let no_answer = || {
-        CliError::Message(format!(
-            "phase {phase}: no Ship gate response written yet — nothing to ship (a dead monitor \
-             never wrote or received one; wait for `devflow gate approve` or resolve the pipeline first)"
-        ))
-    };
-    let gate_id = crate::commands::gate_file_id(project_root, phase, stage)?
-        .ok_or_else(no_answer)
-        .and_then(|id| {
-            GateId::parse(&id).map_err(|_| {
-                CliError::Message(format!(
-                    "phase {phase}: the Ship gate file has no valid gate id, so no answer can \
-                     bind to it; nothing was consumed. Run `devflow doctor`"
-                ))
-            })
-        })?;
-    let answer = match Gates::read_answer(project_root, phase, stage, &gate_id) {
-        AnswerRead::None => return Err(no_answer()),
-        AnswerRead::Unbound(reason) => {
-            return Err(CliError::Message(format!(
-                "phase {phase}: the file in Ship gate {gate_id}'s answer slot does not bind to it \
-                 ({reason}); nothing was consumed. `devflow gate approve` or `devflow gate reject` \
-                 sets that file aside before publishing a valid answer"
-            )));
-        }
-        AnswerRead::Bound(answer) => answer,
-    };
-    let claim = fenced(project_root, phase, || {
-        Ok(Gates::claim(project_root, phase, stage, &gate_id))
-    })?;
-    #[cfg(test)]
-    note_claim(&claim);
-    match claim {
-        Ok(Claim::Claimed) => Ok(answer.response),
-        Ok(Claim::AlreadyConsumed) => Err(CliError::Message(format!(
-            "phase {phase}: the Ship gate response was already consumed (gate {gate_id} has a \
-             claim) — the phase may be mid-finalization from a monitor that died partway through; \
-             run `devflow doctor` to inspect it rather than re-running terminal hooks"
-        ))),
-        Err(GateError::NoOpenGate { .. } | GateError::GateIdMismatch { .. }) => {
-            Err(CliError::Message(format!(
-                "phase {phase}: the Ship gate {gate_id} this command read was closed or replaced \
-                 before it could be claimed; nothing was consumed. Run `devflow status`"
-            )))
-        }
-        Err(GateError::GateLockTimeout { waited, .. }) => Err(CliError::Message(format!(
-            "phase {phase}: could not take the gate lock to claim Ship gate {gate_id} within \
-             {waited:?}; nothing was consumed. Run `devflow ship` again"
-        ))),
-        Err(err) => Err(CliError::Message(format!(
-            "phase {phase}: could not claim Ship gate {gate_id}'s answer; nothing was consumed: \
-             {err}"
-        ))),
-    }
-}
-
 /// Print the full pipeline that a `start` would run, without launching anything.
 pub(crate) fn print_dry_run(state: &State) {
     println!(
@@ -945,7 +1036,7 @@ pub(crate) fn print_dry_run(state: &State) {
         state.phase, state.agent, state.mode
     );
     println!("\nstage pipeline:");
-    let mut stage = Some(Stage::Define);
+    let mut stage = Some(Stage::Plan);
     while let Some(s) = stage {
         let command = s.gsd_command().replace("{N}", &state.phase.to_string());
         // F-7: these are PREDICTION probes, not live reads. Every one passes
@@ -978,7 +1069,7 @@ pub(crate) fn print_dry_run(state: &State) {
         // `[GATE after 3 consecutive failures]` on the Validate line.
         //
         // `!unconditional` suppresses it where it would be noise rather than
-        // information: Ship and Supervise-mode Validate gate regardless of any
+        // information: Supervise-mode Validate gates regardless of any
         // failure count, so naming a failure ceiling there tells the operator
         // nothing about where this run will stop.
         let phase_gate = if !unconditional
@@ -995,56 +1086,32 @@ pub(crate) fn print_dry_run(state: &State) {
         };
         // WR-01 (phase 20 review): annotate the stage matching `--until` so
         // the dry-run preview reflects that a real invocation would halt
-        // here instead of always showing the full Define→Ship pipeline.
+        // here instead of always showing the full pipeline.
         let stop_marker = if state.stop_until == Some(s) {
             " [STOPS HERE — --until]"
         } else {
             ""
         };
         println!("  {s:<9} {command}{gate}{phase_gate}{stop_marker}");
-        if let Some(next) = s.next() {
-            let transition_hooks = hooks::hooks_for_transition(s, next);
-            if !transition_hooks.is_empty() {
-                println!("            ↳ hooks: {transition_hooks:?}");
-            }
-        }
         stage = s.next();
     }
     if let Some(until) = state.stop_until {
         println!("\nnote: --until {until} — this run will halt after {until} completes");
     }
-    // D-12 (`28-CONTEXT.md`): the resolved combine of `--yes-ship` and a
-    // `devflow.toml` `yes_ship` key, reported here so a dry run gives the
-    // operator a stable, observable preview of whether the Ship gate is
-    // pre-authorized — this line reports `state.yes_ship` only, it does not
-    // itself distinguish flag- from config-sourced authorization (that
-    // distinction is the separate never-silent notice `commands::start`
-    // prints for the config-sourced case).
-    println!(
-        "\nship gate: {}",
-        if state.yes_ship {
-            "pre-authorized"
-        } else {
-            "not pre-authorized"
-        }
-    );
-    println!("\nafter ship: {:?}", hooks::hooks_after_ship());
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline_launch::advance;
     use crate::pipeline_outcomes::{
         ValidateOutcome, handle_infra_outcome, handle_validate_outcome,
     };
     use crate::test_support::*;
-    use devflow_core::agent_result;
+    use devflow_core::gates::GateKind;
     use devflow_core::gates::GateResponse;
     use devflow_core::mode::Mode;
     use devflow_core::state::AgentKind;
     use devflow_core::test_support::{answer_open_gate, gate_answer_files, preanswer_gate};
-    use std::path::PathBuf;
 
     macro_rules! enter_path_isolated_child {
         ($name:expr, $path_dir:expr) => {
@@ -1060,132 +1127,15 @@ mod tests {
         };
     }
 
-    /// `advance()` over a Ship-stage success with an approved Ship gate must run
-    /// the terminal `finish_workflow` path (after-ship hooks + gate cleanup +
-    /// state cleared) — the only non-spawning branch of `advance`'s orchestration
-    /// (11-VALIDATION.md 12f). The gate response is pre-seeded on disk so
-    /// `run_gate`'s poll returns immediately instead of blocking.
-    #[test]
-    fn advance_ship_success_runs_finish_workflow() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        init_repo(root);
-
-        let phase = PhaseId::new(21);
-        let branch = format!("feature/phase-{padded}", padded = phase.padded());
-        let branch_created = devflow_core::test_support::git_command(root)
-            .args(["branch", &branch, "develop"])
-            .status()
-            .unwrap()
-            .success();
-        assert!(branch_created);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Ship;
-        workflow::save_state(&state).unwrap();
-
-        // Seed a DEVFLOW_RESULT success marker so `evaluate_agent_result` resolves
-        // at Layer 1 without needing the exit-code/commit-count fallback.
-        std::fs::write(
-            agent_result::stdout_path(root, phase),
-            "DEVFLOW_RESULT: {\"status\":\"success\"}\n",
-        )
-        .unwrap();
-
-        // Pre-write an approved Ship gate response so `run_gate` returns
-        // `GateAction::Advance` immediately instead of polling.
-        preanswer_gate(
-            root,
-            phase,
-            Stage::Ship,
-            &serde_json::from_str(r#"{"approved":true,"note":null,"responded_by":"test"}"#)
-                .unwrap(),
-        );
-
-        advance(root, Some(phase)).unwrap();
-
-        let err = workflow::load_state(root, phase).unwrap_err();
-        assert!(matches!(err, workflow::WorkflowError::MissingState(_)));
-        assert!(!Gates::gate_path(root, phase, Stage::Ship).exists());
-        assert!(gate_answer_files(root, phase, Stage::Ship).is_empty());
-        assert!(gate_claim_files(root, phase, Stage::Ship).is_empty());
-        assert!(!Gates::gate_path(root, phase, Stage::Validate).exists());
-    }
-
-    /// 23-06 Task 1 acceptance: a real Ship finalization emits the
-    /// terminal-only `workflow_shipped` event, and
-    /// `ship_evidence::collect` reads it as `shipped: true` — proving the
-    /// event this module emits is exactly the one the oracle consumes.
-    #[test]
-    fn advance_ship_success_emits_workflow_shipped_and_ship_evidence_reports_shipped() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        init_repo(root);
-
-        let phase = PhaseId::new(23);
-        let branch = format!("feature/phase-{padded}", padded = phase.padded());
-        let branch_created = devflow_core::test_support::git_command(root)
-            .args(["branch", &branch, "develop"])
-            .status()
-            .unwrap()
-            .success();
-        assert!(branch_created);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Ship;
-        workflow::save_state(&state).unwrap();
-        let cron = ship::build_single_agent_cron_instructions(root, phase, "2026-06-18T15:45:30Z");
-        ship::write_cron_instructions(root, &cron).unwrap();
-
-        std::fs::write(
-            agent_result::stdout_path(root, phase),
-            "DEVFLOW_RESULT: {\"status\":\"success\"}\n",
-        )
-        .unwrap();
-
-        preanswer_gate(
-            root,
-            phase,
-            Stage::Ship,
-            &serde_json::from_str(r#"{"approved":true,"note":null,"responded_by":"test"}"#)
-                .unwrap(),
-        );
-
-        advance(root, Some(phase)).unwrap();
-
-        assert!(
-            devflow_core::events::has_event_for_phase(root, phase, "workflow_shipped"),
-            "a real Ship finalization must emit the terminal-only workflow_shipped event"
-        );
-        let evidence = devflow_core::ship_evidence::collect(root, phase);
-        assert!(
-            evidence.shipped,
-            "ship_evidence must read the just-emitted workflow_shipped event as shipped"
-        );
-        // The pre-existing invariant several other tests in this module
-        // depend on: the phase's event stream still ends in
-        // workflow_finished, unmodified by this task's additive emission.
-        let last = devflow_core::events::last_event_for_phase(root, phase)
-            .expect("events recorded for phase");
-        assert_eq!(last["event"], "workflow_finished");
-        assert!(!ship::cron_instructions_path(root, phase).exists());
-        let consumed = std::fs::read_to_string(devflow_core::events::events_path(root))
-            .unwrap()
-            .lines()
-            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .find(|event| event["event"] == "cron_instructions_consumed")
-            .expect("ship completion must audit cron consumption");
-        assert_eq!(consumed["trigger"], "ship_complete");
-    }
-
     /// 23-06 Task 1's named blocker regression guard (BLOCKER 1,
     /// cross-AI-review-caught): a phase halted cleanly by `devflow start
     /// --until <stage>` runs `transition`'s `stop_until` clean-stop branch,
     /// which emits `workflow_finished` with a `"stopped_at"` reason and
     /// returns before any hook, stage assignment, or `launch_stage` call —
-    /// `workflow_shipped` must never be emitted on this path, and
-    /// `ship_evidence::collect(..).shipped` must read false even though
-    /// `workflow_finished_seen` is true.
+    /// `workflow_shipped` must never be emitted on this path, while the
+    /// `workflow_finished` it does emit carries the `stopped_at` reason.
     #[test]
-    fn until_stop_never_emits_workflow_shipped_and_ship_evidence_reports_not_shipped() {
+    fn until_stop_never_emits_workflow_shipped() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
@@ -1202,14 +1152,10 @@ mod tests {
             !devflow_core::events::has_event_for_phase(root, phase, "workflow_shipped"),
             "the --until clean-stop branch must never emit workflow_shipped"
         );
-        let evidence = devflow_core::ship_evidence::collect(root, phase);
-        assert!(
-            !evidence.shipped,
-            "a phase that only stopped after one stage must not read as shipped"
-        );
-        assert!(evidence.workflow_finished_seen);
-        assert_eq!(evidence.finished_reason.as_deref(), Some("stopped_at"));
-        assert!(devflow_core::ship_evidence::is_stopped_at(&evidence));
+        let finished =
+            devflow_core::events::last_event_of_kind_for_phase(root, phase, "workflow_finished")
+                .expect("the --until clean stop emits workflow_finished");
+        assert_eq!(finished["reason"], "stopped_at", "{finished}");
     }
 
     /// 50-13: the `--until` stop clears the supervisor record, because the
@@ -1242,388 +1188,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn terminal_merge_failure_reopens_actionable_gate_and_never_reports_finished() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        init_repo(root);
-        let git = |args: &[&str]| {
-            let output = devflow_core::test_support::git_command(root)
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(output.status.success(), "git {args:?} failed");
-        };
-        git(&["checkout", "-q", "-b", "feature/phase-22"]);
-        std::fs::write(root.join("conflict.txt"), "feature\n").unwrap();
-        git(&["add", "conflict.txt"]);
-        git(&["commit", "-q", "-m", "feature change"]);
-        git(&["checkout", "-q", "develop"]);
-        std::fs::write(root.join("conflict.txt"), "develop\n").unwrap();
-        git(&["add", "conflict.txt"]);
-        git(&["commit", "-q", "-m", "develop change"]);
-
-        let mut state = State::new(
-            PhaseId::new(22),
-            AgentKind::Claude,
-            Mode::Auto,
-            root.to_path_buf(),
-        );
-        state.stage = Stage::Ship;
-        workflow::save_state(&state).unwrap();
-
-        let root_owned = root.to_path_buf();
-        let handle = std::thread::spawn(move || {
-            let mut state = workflow::load_state(&root_owned, PhaseId::new(22)).unwrap();
-            finish_workflow(&root_owned, &mut state)
-        });
-        let gate_path = Gates::gate_path(root, PhaseId::new(22), Stage::Ship);
-        for _ in 0..100 {
-            if gate_path.exists() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-
-        assert!(
-            gate_path.exists(),
-            "finalization failure must reopen Ship gate"
-        );
-        assert!(
-            workflow::load_state(root, PhaseId::new(22))
-                .unwrap()
-                .gate_pending
-        );
-        answer_open_gate(
-            root,
-            PhaseId::new(22),
-            Stage::Ship,
-            &GateResponse {
-                approved: false,
-                note: Some("abort after merge conflict".into()),
-                responded_by: Some("test".into()),
-            },
-        )
-        .unwrap();
-        handle.join().unwrap().unwrap();
-
-        assert_ne!(
-            events::last_event_for_phase(root, PhaseId::new(22))
-                .and_then(|event| event["event"].as_str().map(str::to_owned))
-                .as_deref(),
-            Some("workflow_finished")
-        );
-        let tags = devflow_core::test_support::git_command(root)
-            .arg("tag")
-            .output()
-            .unwrap();
-        assert!(tags.stdout.is_empty());
-    }
-
-    /// 23-09 Task 2 (T-23-91's regression guard, cross-AI-review HIGH): with
-    /// `state.yes_ship` set, a terminal-hook failure that reopens the
-    /// finalization gate must NOT be auto-approved — the reopened gate is a
-    /// different call site (passing `None`) than the routine Ship approval
-    /// in `handle_ship_outcome` (passing `Some`), and this is the concrete
-    /// proof. If a future refactor folds `state.yes_ship` into
-    /// `run_gate_with_timeout`'s own body instead of threading it as a
-    /// caller argument (see that parameter's doc comment), this test fails
-    /// loudly: the reopened gate would then find an unexpected response and
-    /// never block for a human.
-    ///
-    /// `VersionBump` is failed deterministically via `version::compute_version`
-    /// itself refusing (D-10's `UnreachableBaseline`), rather than by
-    /// pre-creating a tag name for `git.tag(&tag)` to collide with
-    /// (`hooks.rs:286-287`).
-    ///
-    /// **Why not a tag-name collision (25-01 rewrite, D-07/D-08):** the prior
-    /// (pre-25-01) algorithm derived MINOR from a raw, reachability-blind git
-    /// tag *count*, so pre-creating one extra tag deterministically
-    /// incremented that count by exactly one, and the fixture could predict
-    /// and pre-create the exact resulting tag name. The 25-01 algorithm is
-    /// no longer count-based: `compute_version` derives its baseline from
-    /// the highest semver tag *reachable from HEAD*, and always bumps
-    /// strictly past that baseline (D-10's no-bump-collapses-to-patch floor
-    /// guarantees this even when nothing in the range warrants a bump — see
-    /// `apply_bump`'s doc comment in `version.rs`). Consequently, pre-creating
-    /// ANY tag reachable from HEAD makes it become the new baseline the next
-    /// time `compute_version` runs, and the recomputed result is
-    /// *unconditionally different* from (one patch past) whatever we just
-    /// created — there is no reachable tag this fixture could create that
-    /// `compute_version` would ever predict again, so a tag-name collision
-    /// can no longer be constructed this way. (Confirmed empirically during
-    /// this rewrite: pre-creating the tag `compute_version` returned before
-    /// any tag existed did not collide — `VersionBump`'s own later call saw
-    /// that tag as the new reachable baseline and computed the next patch
-    /// past it instead, so `finish_workflow` shipped successfully instead of
-    /// re-opening the gate this test exists to exercise.)
-    ///
-    /// Instead, this fixture tags an **unreachable** orphan commit
-    /// (`git tag` sees it via [`devflow_core::version::highest_semver_tag`]'s
-    /// reachability-blind repo-wide scan; `develop`'s own reachable baseline
-    /// stays `None` because the tag is not an ancestor of `develop`) — D-10's
-    /// refusal fires unconditionally in that state, independent of any
-    /// version arithmetic, so `VersionBump` fails deterministically before it
-    /// ever reaches its `git.tag(&tag)` call. `Merge` still runs first in
-    /// `hooks_after_ship` and succeeds — the feature branch is created
-    /// identical to `develop`, so `is_merged_into_develop` is immediately
-    /// true and `merge_feature` takes its already-merged no-op success
-    /// path — exactly the "Merge has already succeeded" state the reopened
-    /// gate exists for (no rollback policy, `hooks.rs` doc comment on
-    /// `merge_feature`).
-    #[test]
-    fn finalization_retry_gate_never_auto_approves_even_with_yes_ship_set() {
-        const NAME: &str = "pipeline_gate::tests::finalization_retry_gate_never_auto_approves_even_with_yes_ship_set";
-        enter_path_isolated_child!(NAME, agent_free_git_only_path_dir());
-        assert!(
-            std::env::var_os(devflow_core::test_support::CHILD_TEST_ENV).is_some(),
-            "abort-fixture test must run in a child with an agent-free PATH (999.80)"
-        );
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        init_repo(root);
-
-        // Tag an orphan commit unreachable from `develop` — this makes
-        // `version::compute_version` refuse unconditionally (D-10's
-        // `UnreachableBaseline`) once `VersionBump` calls it, regardless of
-        // any subsequent state. `develop` is where `init_repo` leaves HEAD
-        // checked out, and is restored as the checkout before continuing.
-        let git_cmd = |args: &[&str]| {
-            assert!(
-                devflow_core::test_support::git_command(root)
-                    .args(args)
-                    .output()
-                    .unwrap()
-                    .status
-                    .success(),
-                "git {args:?} failed"
-            );
-        };
-        git_cmd(&["checkout", "--orphan", "unreachable-release"]);
-        git_cmd(&["commit", "--allow-empty", "-q", "-m", "chore: orphan"]);
-        git_cmd(&["tag", "v9.9.9"]);
-        git_cmd(&["checkout", "develop"]);
-        assert!(
-            devflow_core::version::compute_version(root).is_err(),
-            "the orphan tag must make compute_version refuse (D-10) before \
-             VersionBump ever gets to its own git.tag(&tag) call"
-        );
-
-        let phase = PhaseId::new(60);
-        let branch = format!("feature/phase-{padded}", padded = phase.padded());
-        let branch_created = devflow_core::test_support::git_command(root)
-            .args(["branch", &branch, "develop"])
-            .status()
-            .unwrap()
-            .success();
-        assert!(branch_created);
-
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Ship;
-        state.yes_ship = true;
-        workflow::save_state(&state).unwrap();
-
-        let root_owned = root.to_path_buf();
-        let handle = std::thread::spawn(move || {
-            let mut state = workflow::load_state(&root_owned, phase).unwrap();
-            finish_workflow(&root_owned, &mut state)
-        });
-
-        let gate_path = Gates::gate_path(root, phase, Stage::Ship);
-        for _ in 0..150 {
-            if gate_path.exists() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        assert!(
-            gate_path.exists(),
-            "a terminal-hook failure must reopen the Ship gate even with yes_ship set"
-        );
-
-        // Give any (incorrect) auto-write a moment to have happened if it
-        // were ever going to.
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        assert!(
-            gate_answer_files(root, phase, Stage::Ship).is_empty(),
-            "yes_ship must NEVER auto-approve the reopened finalization-retry gate \
-             (T-23-91) — a failing finalization must wait for a human"
-        );
-        assert!(
-            workflow::load_state(root, phase).unwrap().gate_pending,
-            "the reopened gate must be recorded as pending, awaiting a human"
-        );
-        assert!(
-            devflow_core::events::has_event_for_phase(root, phase, "merge_result"),
-            "Merge must have succeeded before VersionBump failed — the reopened gate must be \
-             exercised in the state it actually occurs in"
-        );
-
-        // Unblock the poll (reject, not approve — this test's subject is
-        // that nothing auto-approves it) so the spawned thread can finish.
-        answer_open_gate(
-            root,
-            phase,
-            Stage::Ship,
-            &GateResponse {
-                approved: false,
-                note: Some("abort: test cleanup".into()),
-                responded_by: Some("test".into()),
-            },
-        )
-        .unwrap();
-        handle.join().unwrap().unwrap();
-    }
-
-    /// 13-DEFERRED-CR-03 acceptance: two phases advancing their Ship stages
-    /// CONCURRENTLY must each finish their own stage machine — per-phase
-    /// state files prevent cross-phase clobbering, and the coarse checkout
-    /// lock serializes both `finish_workflow`s' git operations on the shared
-    /// primary checkout. Gate responses are pre-seeded so neither advance
-    /// blocks polling on its *first* Ship gate.
-    ///
-    /// 17-09 gap closure (GAP-2): both phases compute their next version from
-    /// the same starting git state, and on some runs genuinely race to
-    /// create the same version tag — confirmed directly during this plan's
-    /// RED phase via temporary debug instrumentation, which caught both
-    /// threads inside `version_bump` with the identical computed version
-    /// (`2.0.1`) within ~1.8ms of each other, and the loser's `git tag`
-    /// failing with git's own "reference already exists". That failure
-    /// reopens the loser's Ship gate for human review (`finish_workflow`'s
-    /// retry loop) — but only ONE gate response was ever pre-written per
-    /// phase (consumed by its first gate open), so the reopened gate has
-    /// nothing to consume. Unbounded, the gate wait then waits on the
-    /// 7-day production default (`DEVFLOW_GATE_TIMEOUT_SECS`) with no
-    /// response ever arriving — that is the wedge this plan closes.
-    ///
-    /// The binding constraint is "never hangs," not "always both succeed."
-    /// This test does not try to make the race loser also succeed (that
-    /// would require re-answering a gate reactively and still not rule out
-    /// a second, equally rare collision) — instead it bounds the reopened
-    /// gate's poll to a few seconds via `DEVFLOW_GATE_TIMEOUT_SECS`
-    /// (overridden ONLY for this test's poll, under the established
-    /// `ENV_MUTEX` guard — the 7-day production default is never touched)
-    /// and asserts the loser's documented behavior: a bounded timeout error,
-    /// state left intact (not cleared), and an actionable Ship gate still on
-    /// disk awaiting a human. The common case (no collision) still asserts
-    /// both phases finish independently, exactly as before.
-    #[test]
-    // D-09 (48-09): mutates `DEVFLOW_GATE_TIMEOUT_SECS` process-wide.
-    // Deferred deliberately, not overlooked: THIS process reads the value, so
-    // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
-    // race and the value is restored on every exit path, unwinding included.
-    #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
-    fn concurrent_ship_advances_finish_both_phases_independently() {
-        let _guard = env_lock();
-        let original_gate_timeout = std::env::var_os("DEVFLOW_GATE_TIMEOUT_SECS");
-        // SAFETY: serialized under ENV_MUTEX. Bounds a reopened Ship gate's
-        // poll to a few seconds instead of the 7-day production default.
-        // Every OTHER test that reaches `run_gate` pre-writes its response
-        // before calling in, so the wait finds it on the very first
-        // read regardless of this value — only a *reopened*, unanswered
-        // gate (this test's race-loser path) ever actually waits it out.
-        unsafe {
-            std::env::set_var("DEVFLOW_GATE_TIMEOUT_SECS", "2");
-        }
-
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        init_repo(root);
-
-        let phases = [PhaseId::new(31), PhaseId::new(32)];
-        for &phase in &phases {
-            let branch = format!("feature/phase-{padded}", padded = phase.padded());
-            let branch_created = devflow_core::test_support::git_command(root)
-                .args(["branch", &branch, "develop"])
-                .status()
-                .unwrap()
-                .success();
-            assert!(branch_created);
-            let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-            state.stage = Stage::Ship;
-            workflow::save_state(&state).unwrap();
-            std::fs::write(
-                agent_result::stdout_path(root, phase),
-                "DEVFLOW_RESULT: {\"status\":\"success\"}\n",
-            )
-            .unwrap();
-            preanswer_gate(
-                root,
-                phase,
-                Stage::Ship,
-                &serde_json::from_str(r#"{"approved":true,"note":null,"responded_by":"test"}"#)
-                    .unwrap(),
-            );
-        }
-
-        let results: Vec<(PhaseId, Result<(), CliError>)> = std::thread::scope(|scope| {
-            let handles: Vec<_> = phases
-                .iter()
-                .map(|&phase| (phase, scope.spawn(move || advance(root, Some(phase)))))
-                .collect();
-            handles
-                .into_iter()
-                .map(|(phase, handle)| (phase, handle.join().expect("advance thread")))
-                .collect()
-        });
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_gate_timeout {
-                Some(value) => std::env::set_var("DEVFLOW_GATE_TIMEOUT_SECS", value),
-                None => std::env::remove_var("DEVFLOW_GATE_TIMEOUT_SECS"),
-            }
-        }
-
-        let succeeded = results.iter().filter(|(_, r)| r.is_ok()).count();
-        assert!(
-            succeeded == 1 || succeeded == 2,
-            "at least one phase must finish independently of the other; got {succeeded}/2 successes"
-        );
-
-        for (phase, result) in &results {
-            match result {
-                Ok(()) => {
-                    assert!(
-                        matches!(
-                            workflow::load_state(root, *phase),
-                            Err(workflow::WorkflowError::MissingState(_))
-                        ),
-                        "phase {phase} must be finished (state cleared)"
-                    );
-                    assert!(!Gates::gate_path(root, *phase, Stage::Ship).exists());
-                    let last = devflow_core::events::last_event_for_phase(root, *phase)
-                        .expect("events recorded for phase");
-                    assert_eq!(
-                        last["event"], "workflow_finished",
-                        "phase {phase}'s own event stream must end in workflow_finished"
-                    );
-                }
-                Err(err) => {
-                    // The documented loser behavior (GAP-2): a version-tag
-                    // race lost by VersionBump reopens the Ship gate for a
-                    // human; with no second response pre-written, the
-                    // bounded poll above times out rather than hanging.
-                    assert!(
-                        err.to_string().contains("timed out"),
-                        "phase {phase}'s only non-success outcome must be a bounded gate \
-                         timeout, not some other failure: {err}"
-                    );
-                    let state = workflow::load_state(root, *phase)
-                        .expect("a timed-out gate leaves state intact, not cleared");
-                    assert!(
-                        state.gate_pending,
-                        "phase {phase} must leave an actionable, still-open gate for a human"
-                    );
-                    assert!(
-                        Gates::gate_path(root, *phase, Stage::Ship).exists(),
-                        "phase {phase}'s reopened Ship gate file must remain on disk"
-                    );
-                }
-            }
-        }
-    }
-
     /// An `abort` whose state cannot be removed says so, on the event a supervisor's
     /// dead stderr cannot carry, and does not report the workflow aborted. The state path
     /// is a directory so the removal fails whichever process runs this.
@@ -1651,7 +1215,14 @@ mod tests {
         let phase = PhaseId::new(5311);
         let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         workflow::save_state(&state).unwrap();
-        Gates::open_gate(root, phase, state.stage, "g").unwrap();
+        Gates::open_gate(
+            root,
+            phase,
+            state.stage,
+            devflow_core::gates::GateKind::StageFailure,
+            "g",
+        )
+        .unwrap();
         let lock = std::fs::File::options()
             .read(true)
             .write(true)
@@ -1705,7 +1276,7 @@ mod tests {
         state.last_validate_failure_commit_count = Some(0);
         workflow::save_state(&state).unwrap();
 
-        // Pre-answer a rejection whose note says "abort" so
+        // Pre-answer an abort (`abort: true`) so
         // `GateAction::from_response` resolves to `Abort`.
         preanswer_gate(
             root,
@@ -1713,6 +1284,7 @@ mod tests {
             Stage::Validate,
             &GateResponse {
                 approved: false,
+                abort: true,
                 note: Some("abort: requirements changed".into()),
                 responded_by: Some("test".into()),
             },
@@ -1748,7 +1320,14 @@ mod tests {
 
         // The phase reaching the same gate again later (e.g. after a restart) waits
         // for a fresh human decision.
-        let refired = Gates::open_gate(root, phase, Stage::Validate, "re-fired gate").unwrap();
+        let refired = Gates::open_gate(
+            root,
+            phase,
+            Stage::Validate,
+            devflow_core::gates::GateKind::StageFailure,
+            "re-fired gate",
+        )
+        .unwrap();
         let started = std::time::Instant::now();
         let end = crate::pipeline_launch::wait_for_gate_response(
             root,
@@ -1813,7 +1392,7 @@ mod tests {
             phase,
             Stage::Validate,
             &serde_json::from_str(
-                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                r#"{"approved":false,"abort":true,"note":"abort: test cleanup","responded_by":"test"}"#,
             )
             .unwrap(),
         );
@@ -1848,329 +1427,8 @@ mod tests {
         assert_eq!(state.consecutive_failures, 2);
     }
 
-    /// 20e Task 1: the tracer end-to-end case — a phase parked at
-    /// `Stage::Ship` with a gate and its approved answer, no claim, and no live
-    /// process waiting. `ship_override` must reach the SAME terminal state
-    /// `finish_workflow` produces: state cleared, gate, answer and claim files gone,
-    /// `workflow_finished` emitted.
-    #[test]
-    fn ship_override_advances_via_written_response() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        init_repo(root);
-
-        let phase = PhaseId::new(90);
-        let branch = format!("feature/phase-{padded}", padded = phase.padded());
-        let branch_created = devflow_core::test_support::git_command(root)
-            .args(["branch", &branch, "develop"])
-            .status()
-            .unwrap()
-            .success();
-        assert!(branch_created);
-
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Ship;
-        workflow::save_state(&state).unwrap();
-
-        Gates::open_gate(root, phase, Stage::Ship, "Ship complete — approve merge?").unwrap();
-        answer_open_gate(
-            root,
-            phase,
-            Stage::Ship,
-            &GateResponse {
-                approved: true,
-                note: None,
-                responded_by: Some("test".into()),
-            },
-        )
-        .unwrap();
-
-        ship_override(root, phase, false).unwrap();
-
-        let err = workflow::load_state(root, phase).unwrap_err();
-        assert!(matches!(err, workflow::WorkflowError::MissingState(_)));
-        assert!(!Gates::gate_path(root, phase, Stage::Ship).exists());
-        assert!(gate_answer_files(root, phase, Stage::Ship).is_empty());
-        assert!(gate_claim_files(root, phase, Stage::Ship).is_empty());
-        let last = devflow_core::events::last_event_for_phase(root, phase)
-            .expect("events recorded for phase");
-        assert_eq!(last["event"], "workflow_finished");
-    }
-
-    /// WR-02 (phase 20 review): `ship_override` runs in the FOREGROUND CLI,
-    /// unlike every other `finish_workflow` caller (which runs inside a
-    /// detached monitor). A terminal-hook failure (merge conflict) reopens
-    /// the Ship gate; with no response ever written for the REOPENED gate,
-    /// this must fail fast within `DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS`
-    /// (bounded here to a couple seconds) rather than block the caller's
-    /// shell for `DEVFLOW_GATE_TIMEOUT_SECS`' multi-day production default —
-    /// which is left untouched, proving the two timeouts are genuinely
-    /// independent knobs.
-    #[test]
-    // D-09 (48-09): mutates `DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS` process-wide.
-    // Deferred deliberately, not overlooked: THIS process reads the value, so
-    // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
-    // race and the value is restored on every exit path, unwinding included.
-    #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
-    fn ship_override_bounds_foreground_wait_on_terminal_hook_failure() {
-        let _guard = env_lock();
-        let original_foreground_timeout = std::env::var_os("DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS");
-        // SAFETY: serialized under ENV_MUTEX. Bounds ONLY the foreground
-        // knob — DEVFLOW_GATE_TIMEOUT_SECS (the background default) is
-        // never touched by this test, so a regression that made
-        // `ship_override` fall back to the multi-day default would hang
-        // this test instead of silently passing.
-        unsafe {
-            std::env::set_var("DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS", "2");
-        }
-
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        init_repo(root);
-        let git = |args: &[&str]| {
-            let output = devflow_core::test_support::git_command(root)
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(output.status.success(), "git {args:?} failed");
-        };
-        let phase = PhaseId::new(96);
-        let branch = format!("feature/phase-{padded}", padded = phase.padded());
-        git(&["checkout", "-q", "-b", &branch]);
-        std::fs::write(root.join("conflict.txt"), "feature\n").unwrap();
-        git(&["add", "conflict.txt"]);
-        git(&["commit", "-q", "-m", "feature change"]);
-        git(&["checkout", "-q", "develop"]);
-        std::fs::write(root.join("conflict.txt"), "develop\n").unwrap();
-        git(&["add", "conflict.txt"]);
-        git(&["commit", "-q", "-m", "develop change"]);
-
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Ship;
-        workflow::save_state(&state).unwrap();
-
-        Gates::open_gate(root, phase, Stage::Ship, "Ship complete — approve merge?").unwrap();
-        answer_open_gate(
-            root,
-            phase,
-            Stage::Ship,
-            &GateResponse {
-                approved: true,
-                note: None,
-                responded_by: Some("test".into()),
-            },
-        )
-        .unwrap();
-
-        let started = std::time::Instant::now();
-        let result = ship_override(root, phase, false);
-        let elapsed = started.elapsed();
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_foreground_timeout {
-                Some(value) => {
-                    std::env::set_var("DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS", value);
-                }
-                None => std::env::remove_var("DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS"),
-            }
-        }
-
-        assert!(
-            result.is_err(),
-            "an unresolved reopened Ship gate must fail closed, not silently advance"
-        );
-        assert!(
-            elapsed < std::time::Duration::from_secs(30),
-            "the foreground wait must be bounded by DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS, \
-             not gate_timeout_secs' multi-day default — took {elapsed:?}"
-        );
-        assert!(
-            Gates::gate_path(root, phase, Stage::Ship).exists(),
-            "the merge failure must reopen an actionable Ship gate for a human, not silently \
-             drop the phase"
-        );
-        assert!(
-            workflow::load_state(root, phase).is_ok(),
-            "state must NOT be cleared — finish_workflow_with_gate_timeout must fail before \
-             reaching workflow::clear_state"
-        );
-    }
-
-    /// 20e Task 3: an `Abort`-routing Ship response (a rejection whose note
-    /// says "abort") must reach the SAME shared `abort` helper the live
-    /// `handle_ship_outcome` path uses — no special-cased branch inside
-    /// `ship_override`. Asserts the shared path's own effects: state
-    /// cleared, gate files cleaned up, `workflow_aborted` emitted.
-    #[test]
-    fn ship_override_abort_routes_through_abort() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(95);
-
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Ship;
-        workflow::save_state(&state).unwrap();
-
-        Gates::open_gate(root, phase, Stage::Ship, "Ship complete — approve merge?").unwrap();
-        answer_open_gate(
-            root,
-            phase,
-            Stage::Ship,
-            &GateResponse {
-                approved: false,
-                note: Some("abort: found a blocking regression during manual review".into()),
-                responded_by: Some("test".into()),
-            },
-        )
-        .unwrap();
-
-        ship_override(root, phase, false).unwrap();
-
-        let err = workflow::load_state(root, phase).unwrap_err();
-        assert!(matches!(err, workflow::WorkflowError::MissingState(_)));
-        assert!(!Gates::gate_path(root, phase, Stage::Ship).exists());
-        assert!(gate_answer_files(root, phase, Stage::Ship).is_empty());
-        assert!(gate_claim_files(root, phase, Stage::Ship).is_empty());
-        let last = devflow_core::events::last_event_for_phase(root, phase)
-            .expect("events recorded for phase");
-        assert_eq!(last["event"], "workflow_aborted");
-    }
-
-    /// 20e Task 2 (D-02, EoP regression): `--force` must never let
-    /// `ship_override` reach `finish_workflow` from a non-Ship stage. Checked
-    /// for every earlier `Stage` with `--force` both true and false.
-    #[test]
-    fn ship_override_refuses_when_not_at_ship_stage() {
-        for stage in [Stage::Define, Stage::Plan, Stage::Code, Stage::Validate] {
-            for force in [true, false] {
-                let dir = tempfile::tempdir().unwrap();
-                let root = dir.path();
-                let phase = PhaseId::new(91);
-
-                let mut state =
-                    State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-                state.stage = stage;
-                workflow::save_state(&state).unwrap();
-
-                let err = ship_override(root, phase, force).unwrap_err();
-                let msg = err.to_string();
-                assert!(
-                    msg.contains(&stage.to_string()),
-                    "error for stage {stage} (force={force}) must name the stage: {msg}"
-                );
-
-                // finish_workflow was never reached: state is untouched, not cleared.
-                let reloaded = workflow::load_state(root, phase)
-                    .expect("state must survive a stage-mismatch refusal, not be cleared");
-                assert_eq!(reloaded.stage, stage);
-            }
-        }
-    }
-
-    /// 20e Task 2 (edge-probe 20e/empty): `state.stage == Stage::Ship` but no
-    /// Ship gate request/response exists on disk — a dead monitor never
-    /// wrote or received one. Must fail-closed with a clear error, both with
-    /// `--force` true and false.
-    #[test]
-    fn ship_override_refuses_when_no_response_written() {
-        for force in [true, false] {
-            let dir = tempfile::tempdir().unwrap();
-            let root = dir.path();
-            let phase = PhaseId::new(92);
-
-            let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-            state.stage = Stage::Ship;
-            workflow::save_state(&state).unwrap();
-
-            // Neither request nor response written yet.
-            let err = ship_override(root, phase, force).unwrap_err();
-            assert!(
-                err.to_string().contains("no Ship gate response"),
-                "force={force}: {err}"
-            );
-
-            // A request written but no response yet is the same fail-closed case.
-            Gates::open_gate(root, phase, Stage::Ship, "ctx").unwrap();
-            let err = ship_override(root, phase, force).unwrap_err();
-            assert!(
-                err.to_string().contains("no Ship gate response"),
-                "force={force}: {err}"
-            );
-            let _ = Gates::close(root, phase, Stage::Ship);
-        }
-    }
-
-    /// 20e Task 2 (review: Hermes ack-race): a Ship answer that already has a claim
-    /// was already consumed, by a monitor that may have died mid-finalization.
-    /// `ship_override` refuses and directs to `devflow doctor` rather than re-running
-    /// terminal hooks, with `--force` both true and false. `finish_workflow` must never
-    /// be reached: state stays intact.
-    #[test]
-    fn ship_override_refuses_when_the_answer_was_already_claimed() {
-        for force in [true, false] {
-            let dir = tempfile::tempdir().unwrap();
-            let root = dir.path();
-            let phase = PhaseId::new(94);
-
-            let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-            state.stage = Stage::Ship;
-            workflow::save_state(&state).unwrap();
-
-            let gate = Gates::open_gate(root, phase, Stage::Ship, "ctx")
-                .unwrap()
-                .gate_id;
-            answer_open_gate(root, phase, Stage::Ship, &approval()).unwrap();
-            assert_eq!(
-                Gates::claim(root, phase, Stage::Ship, &gate).unwrap(),
-                gates::Claim::Claimed
-            );
-
-            let err = ship_override(root, phase, force).unwrap_err();
-            assert!(
-                err.to_string().contains("devflow doctor"),
-                "force={force}: {err}"
-            );
-
-            let reloaded = workflow::load_state(root, phase)
-                .expect("an already-claimed refusal must never clear state");
-            assert_eq!(reloaded.stage, Stage::Ship);
-        }
-    }
-
-    /// R-09: `ship_override` reads and moves nothing. A file in the live gate's slot
-    /// that does not bind is refused, named, and left for `devflow gate approve` or
-    /// `reject`, which set it aside before publishing a valid answer.
-    #[test]
-    fn ship_override_refuses_an_answer_that_does_not_bind_and_moves_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(98);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Ship;
-        workflow::save_state(&state).unwrap();
-        let gate = Gates::open_gate(root, phase, Stage::Ship, "ctx")
-            .unwrap()
-            .gate_id;
-        let slot = Gates::answer_path(root, phase, Stage::Ship, &gate);
-        std::fs::write(&slot, br#"{"approved": true}"#).unwrap();
-
-        let message = ship_override(root, phase, false).unwrap_err().to_string();
-        assert!(message.contains("missing_gate_id"), "{message}");
-        assert!(message.contains("devflow gate approve"), "{message}");
-        assert_eq!(std::fs::read(&slot).unwrap(), br#"{"approved": true}"#);
-        assert_eq!(
-            gate_claim_files(root, phase, Stage::Ship),
-            Vec::<std::path::PathBuf>::new()
-        );
-        assert_eq!(
-            workflow::load_state(root, phase).unwrap().stage,
-            Stage::Ship
-        );
-    }
-
-    /// A phase parked at Stage::Ship in a repo whose terminal hooks can finish it.
-    fn ship_ready_fixture(root: &Path, phase: PhaseId) {
+    /// A phase parked at Stage::Validate, with its feature branch cut from `develop`.
+    fn validate_parked_fixture(root: &Path, phase: PhaseId) {
         init_repo(root);
         let branch = format!("feature/phase-{padded}", padded = phase.padded());
         let branch_created = devflow_core::test_support::git_command(root)
@@ -2180,239 +1438,9 @@ mod tests {
             .success();
         assert!(branch_created);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Ship;
+        state.stage = Stage::Validate;
         state.gate_notify_cmd = Some("true".to_string());
         workflow::save_state(&state).unwrap();
-    }
-
-    /// D-17 (V-31): `devflow ship` refuses while another process holds the phase, before
-    /// it reads or claims the answer, and writes nothing.
-    #[test]
-    fn ship_override_refuses_while_another_process_holds_the_phase() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(2906);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Ship;
-        workflow::save_state(&state).unwrap();
-        let gate = Gates::open_gate(root, phase, Stage::Ship, "ctx")
-            .unwrap()
-            .gate_id;
-        answer_open_gate(root, phase, Stage::Ship, &approval()).unwrap();
-        let _hold = devflow_core::liveness::claim_phase_holder(root, phase).unwrap();
-        let before = std::fs::read(workflow::state_path(root, phase)).unwrap();
-
-        let error = ship_override(root, phase, false)
-            .expect_err("a held phase refuses")
-            .to_string();
-
-        assert!(
-            error.contains(&format!("(pid {})", std::process::id())),
-            "the refusal names the holder's pid: {error}"
-        );
-        assert!(
-            error.contains(&format!("devflow stop --phase {phase}")),
-            "{error}"
-        );
-        assert!(!error.contains("devflow resume"), "{error}");
-        assert!(
-            !Gates::claim_path(root, phase, Stage::Ship, &gate).exists(),
-            "the answer is not claimed"
-        );
-        assert_eq!(
-            std::fs::read(workflow::state_path(root, phase)).unwrap(),
-            before,
-            "nothing is written"
-        );
-    }
-
-    /// The writer and the reader of a Ship approval agree: what `devflow gate approve`
-    /// publishes is what `devflow ship` finds, claims and finishes on.
-    #[test]
-    fn ship_override_ships_an_approval_written_by_gate_approve() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(99);
-        ship_ready_fixture(root, phase);
-        Gates::open_gate(root, phase, Stage::Ship, "Ship complete — approve merge?").unwrap();
-
-        crate::commands::gate_respond(root, phase, Some(Stage::Ship), true, None, None).unwrap();
-        ship_override(root, phase, false).unwrap();
-
-        assert!(matches!(
-            workflow::load_state(root, phase),
-            Err(workflow::WorkflowError::MissingState(_))
-        ));
-        assert_eq!(events_named(root, "workflow_shipped").len(), 1);
-    }
-
-    /// Approve the Ship gate a live waiter is on. A waiter can consume the answer and close
-    /// the gate before the writer's re-check, which then reports the gate closed although the
-    /// answer was acted on. The caller's assertions on the outcome decide.
-    fn approve_a_gate_with_a_waiter(root: &Path, phase: PhaseId) {
-        match answer_open_gate(root, phase, Stage::Ship, &approval()) {
-            Ok(_) | Err(gates::GateError::GateClosedAfterPublish { .. }) => {}
-            Err(other) => panic!("the approval was not published: {other}"),
-        }
-    }
-
-    /// An approved finalization retry after `ChangelogAppend` failed must not cut a second
-    /// release: the hooks that succeeded stay done, and the changelog written by the retry
-    /// names the one tag and carries the body computed before that tag existed.
-    #[test]
-    fn a_finalization_retry_does_not_repeat_the_version_bump() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(93);
-        ship_ready_fixture(root, phase);
-        let git = |args: &[&str]| {
-            let output = devflow_core::test_support::git_command(root)
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(output.status.success(), "git {args:?} failed");
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
-        };
-        git(&["checkout", "-q", "feature/phase-93"]);
-        std::fs::write(root.join("work.txt"), "work\n").unwrap();
-        git(&["add", "work.txt"]);
-        git(&["commit", "-q", "-m", "feat: the phase's only change"]);
-        git(&["checkout", "-q", "develop"]);
-        // A directory where the changelog goes fails `ChangelogAppend` only.
-        std::fs::create_dir(root.join("CHANGELOG.md")).unwrap();
-
-        let finished = std::thread::scope(|scope| {
-            let finalizing = scope.spawn(|| {
-                let mut state = workflow::load_state(root, phase).unwrap();
-                finish_workflow_with_gate_timeout(root, &mut state, 30)
-            });
-            wait_for_open_gate(root, phase, Stage::Ship);
-            std::fs::remove_dir(root.join("CHANGELOG.md")).unwrap();
-            approve_a_gate_with_a_waiter(root, phase);
-            finalizing.join().unwrap()
-        });
-        finished.expect("the retry finishes the batch");
-
-        let tags = git(&["tag"]);
-        assert_eq!(tags.lines().count(), 1, "one release, got tags: {tags}");
-        assert_eq!(hook_runs(root, "VersionBump"), 1);
-        assert_eq!(hook_runs(root, "ChangelogAppend"), 2);
-        let changelog = std::fs::read_to_string(root.join("CHANGELOG.md")).unwrap();
-        let version = tags.strip_prefix('v').unwrap();
-        assert!(
-            changelog.contains(&format!("## {version} ")),
-            "the heading names the tag {tags}: {changelog}"
-        );
-        assert!(
-            changelog.contains("the phase's only change"),
-            "the body computed before the tag reaches the retry: {changelog}"
-        );
-    }
-
-    /// The retry gate asks the operator to resolve the failure and approve. A repair committed
-    /// to the feature branch must be merged by the retry, or the same failure comes back,
-    /// and it must still not cut a second release.
-    #[test]
-    fn a_finalization_retry_merges_a_repair_without_a_second_tag() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(92);
-        ship_ready_fixture(root, phase);
-        let git = |args: &[&str]| {
-            let output = devflow_core::test_support::git_command(root)
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(output.status.success(), "git {args:?} failed");
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
-        };
-        // A directory where the changelog goes fails `ChangelogAppend` only.
-        std::fs::create_dir(root.join("CHANGELOG.md")).unwrap();
-
-        let (finished, repair) = std::thread::scope(|scope| {
-            let finalizing = scope.spawn(|| {
-                let mut state = workflow::load_state(root, phase).unwrap();
-                finish_workflow_with_gate_timeout(root, &mut state, 30)
-            });
-            wait_for_open_gate(root, phase, Stage::Ship);
-            git(&["checkout", "-q", "feature/phase-92"]);
-            std::fs::write(root.join("repair.txt"), "repair\n").unwrap();
-            git(&["add", "repair.txt"]);
-            git(&["commit", "-q", "-m", "fix: the repair"]);
-            let repair = git(&["rev-parse", "HEAD"]);
-            git(&["checkout", "-q", "develop"]);
-            std::fs::remove_dir(root.join("CHANGELOG.md")).unwrap();
-            approve_a_gate_with_a_waiter(root, phase);
-            (finalizing.join().unwrap(), repair)
-        });
-        finished.expect("the retry finishes the batch");
-
-        let on_develop = devflow_core::test_support::git_command(root)
-            .args(["merge-base", "--is-ancestor", &repair, "develop"])
-            .status()
-            .unwrap()
-            .success();
-        assert!(on_develop, "the repair was never merged");
-        let tags = git(&["tag"]);
-        assert_eq!(tags.lines().count(), 1, "one release, got tags: {tags}");
-        assert_eq!(hook_runs(root, "VersionBump"), 1);
-    }
-
-    /// A recovery that has passed its liveness check, holding the state write lock, cannot
-    /// see a holder claimed after that check. `devflow ship` must not read the state it is
-    /// about to delete and run hooks beside it: the recovery lands wholly first, and Ship
-    /// finds no run. The closure stands in for `recover --clean`'s decision and removal,
-    /// whose hold is in core and out of this crate's reach.
-    #[test]
-    fn ship_waits_out_a_recovery_past_its_liveness_check() {
-        /// Longer than this fixture's whole Ship takes without the wait, so a Ship that does
-        /// not wait has finished by the time the recovery deletes under it.
-        const RECOVERY_LINGERS: std::time::Duration = std::time::Duration::from_secs(2);
-        const CLAIM_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(95);
-        ship_ready_fixture(root, phase);
-        Gates::open_gate(root, phase, Stage::Ship, "ctx").unwrap();
-        answer_open_gate(root, phase, Stage::Ship, &approval()).unwrap();
-        let holder = devflow_core::liveness::phase_holder_path(root, phase);
-
-        let shipped = std::thread::scope(|scope| {
-            let (in_lock, recovery_holds) = std::sync::mpsc::channel();
-            let holder = &holder;
-            scope.spawn(move || {
-                workflow::update_state_with(root, phase, |_| {
-                    in_lock.send(()).unwrap();
-                    let deadline = std::time::Instant::now() + CLAIM_WITHIN;
-                    while !matches!(
-                        devflow_core::liveness::probe(holder),
-                        Ok(devflow_core::liveness::Held::Live)
-                    ) && std::time::Instant::now() < deadline
-                    {
-                        std::thread::sleep(std::time::Duration::from_millis(5));
-                    }
-                    std::thread::sleep(RECOVERY_LINGERS);
-                    std::fs::remove_file(workflow::state_path(root, phase)).unwrap();
-                    Ok::<_, CliError>((None, ()))
-                })
-                .unwrap();
-            });
-            recovery_holds.recv().unwrap();
-            let ship = scope.spawn(move || ship_override(root, phase, false));
-            ship.join().unwrap()
-        });
-
-        assert!(
-            events_named(root, "workflow_shipped").is_empty(),
-            "Ship ran its hooks beside the recovery: {shipped:?}"
-        );
-        assert!(
-            matches!(
-                shipped,
-                Err(CliError::Workflow(workflow::WorkflowError::MissingState(_)))
-            ),
-            "{shipped:?}"
-        );
     }
 
     /// The wait for a recovery is bounded: a stuck write-lock holder refuses the claim and
@@ -2422,7 +1450,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(94);
-        ship_ready_fixture(root, phase);
+        validate_parked_fixture(root, phase);
         let holder = devflow_core::liveness::phase_holder_path(root, phase);
 
         let refused = std::thread::scope(|scope| {
@@ -2456,106 +1484,6 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-    }
-
-    /// A process killed between deleting the state and recording the ship must not leave a
-    /// shipped run that reads as not shipped: by the moment the state goes, the strict shipped
-    /// predicate is already on disk. Runs the whole foreground finalization, reading the
-    /// evidence at the last instant before the state is removed.
-    #[test]
-    fn workflow_shipped_is_recorded_before_the_state_is_cleared() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(96);
-        ship_ready_fixture(root, phase);
-        Gates::open_gate(root, phase, Stage::Ship, "Ship complete — approve merge?").unwrap();
-        crate::commands::gate_respond(root, phase, Some(Stage::Ship), true, None, None).unwrap();
-
-        let seen = std::rc::Rc::new(std::cell::Cell::new(None));
-        BEFORE_RUN_STATE_CLEAR.set(Some(Box::new({
-            let seen = seen.clone();
-            let root = root.to_path_buf();
-            move || {
-                let evidence = devflow_core::ship_evidence::collect(&root, phase);
-                seen.set(Some((evidence.state_present, evidence.shipped)));
-            }
-        })));
-        ship_override(root, phase, false).unwrap();
-
-        assert_eq!(
-            seen.get(),
-            Some((true, true)),
-            "(state_present, shipped) at the instant before the state is cleared"
-        );
-        let last = devflow_core::events::last_event_for_phase(root, phase).unwrap();
-        assert_eq!(
-            last["event"], "workflow_finished",
-            "the stream still ends in the finish"
-        );
-        assert_eq!(events_named(root, "workflow_shipped").len(), 1);
-    }
-
-    /// D-04's consumption claim (V-21), as a defence-in-depth backstop (R2-11). This
-    /// waiter is an in-process gate wait with no supervisor record, a state 50.1-29's
-    /// R-17 guard and D-17's holder leave no production path to; the test pins that the
-    /// claim alone still lets only one of the two consumers act on one approval, if a
-    /// waiter exists that neither guard sees.
-    #[test]
-    fn ship_override_and_a_live_waiter_cannot_both_consume_one_approval() {
-        use std::sync::atomic::Ordering::SeqCst;
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(97);
-        ship_ready_fixture(root, phase);
-        let probe = std::sync::Arc::new(ClaimProbe::default());
-
-        let waiter = {
-            let root = root.to_path_buf();
-            let probe = probe.clone();
-            std::thread::spawn(move || {
-                CLAIM_PROBE.set(Some(probe));
-                let mut state = workflow::load_state(&root, phase).unwrap();
-                // What `handle_ship_outcome` does with an approval.
-                match run_gate_with_timeout(&root, &mut state, Stage::Ship, "ctx", 30, None)? {
-                    GateAction::Advance => finish_workflow_with_gate_timeout(&root, &mut state, 2),
-                    other => panic!("the approval must read as an advance: {other:?}"),
-                }
-            })
-        };
-        wait_for_open_gate(root, phase, Stage::Ship);
-        answer_open_gate(root, phase, Stage::Ship, &approval()).unwrap();
-        let shipper = {
-            let root = root.to_path_buf();
-            let probe = probe.clone();
-            std::thread::spawn(move || {
-                CLAIM_PROBE.set(Some(probe));
-                ship_override(&root, phase, false)
-            })
-        };
-        let waited = waiter.join().unwrap();
-        let shipped = shipper.join().unwrap();
-
-        assert_eq!(
-            (
-                probe.claimed.load(SeqCst),
-                probe.already_consumed.load(SeqCst)
-            ),
-            (1, 1),
-            "exactly one consumer claims: waiter {waited:?}, ship {shipped:?}"
-        );
-        assert_eq!(
-            events_named(root, "workflow_shipped").len(),
-            1,
-            "finalization ran once: waiter {waited:?}, ship {shipped:?}"
-        );
-        let refused = match (&waited, &shipped) {
-            (Ok(()), Err(refused)) | (Err(refused), Ok(())) => refused,
-            _ => panic!("exactly one consumer acts: waiter {waited:?}, ship {shipped:?}"),
-        };
-        assert!(
-            refused.to_string().contains("consumed"),
-            "the other consumer says the answer was consumed: {refused}"
-        );
     }
 
     /// 18d concurrency edge: two concurrently-active phases' `consecutive_failures`
@@ -2622,7 +1550,15 @@ mod tests {
         let root_owned = root.to_path_buf();
         let handle = std::thread::spawn(move || {
             let mut state = workflow::load_state(&root_owned, phase).unwrap();
-            run_gate_with_timeout(&root_owned, &mut state, Stage::Code, "ctx", 30, None).unwrap();
+            run_gate_with_timeout(
+                &root_owned,
+                &mut state,
+                Stage::Code,
+                GateKind::StageFailure,
+                "ctx",
+                30,
+            )
+            .unwrap();
             state.gate_notify_cmd
         });
         let gate_path = Gates::gate_path(root, phase, Stage::Code);
@@ -2643,6 +1579,7 @@ mod tests {
             Stage::Code,
             &GateResponse {
                 approved: true,
+                abort: false,
                 note: None,
                 responded_by: Some("test".into()),
             },
@@ -2704,8 +1641,15 @@ mod tests {
 
         let root_owned = root.to_path_buf();
         let handle = std::thread::spawn(move || {
-            run_gate_with_timeout(&root_owned, &mut loaded, Stage::Code, "ctx", 30, None)
-                .map(|action| (action, loaded.gate_notify_cmd))
+            run_gate_with_timeout(
+                &root_owned,
+                &mut loaded,
+                Stage::Code,
+                GateKind::StageFailure,
+                "ctx",
+                30,
+            )
+            .map(|action| (action, loaded.gate_notify_cmd))
         });
         let gate_path = Gates::gate_path(root, phase, Stage::Code);
         for _ in 0..500 {
@@ -2721,6 +1665,7 @@ mod tests {
             Stage::Code,
             &GateResponse {
                 approved: true,
+                abort: false,
                 note: None,
                 responded_by: Some("test".into()),
             },
@@ -2728,7 +1673,10 @@ mod tests {
         .unwrap();
         let (action, in_memory) = handle.join().unwrap().expect("the gate resolves");
 
-        assert!(matches!(action, GateAction::Advance), "{action:?}");
+        assert!(
+            matches!(action, crate::pipeline_outcomes::Answer::Approve(_)),
+            "{action:?}"
+        );
         assert!(
             edited_sentinel.exists(),
             "the gate must fire the command edited on disk after the advance loaded"
@@ -2767,8 +1715,15 @@ mod tests {
         let state_file = workflow::state_path(root, phase);
         std::fs::write(&state_file, "{not json").unwrap();
 
-        let err = run_gate_with_timeout(root, &mut loaded, Stage::Code, "ctx", 30, None)
-            .expect_err("an unparseable state must fail the gate entry");
+        let err = run_gate_with_timeout(
+            root,
+            &mut loaded,
+            Stage::Code,
+            GateKind::StageFailure,
+            "ctx",
+            30,
+        )
+        .expect_err("an unparseable state must fail the gate entry");
 
         let text = err.to_string();
         assert!(
@@ -2805,7 +1760,15 @@ mod tests {
             WAIT_HOLDS_WRITE_LOCK.set(hold_across_wait);
             WAIT_ENTERED.set(Some(entered_tx));
             let mut state = workflow::load_state(&root_owned, phase).unwrap();
-            run_gate_with_timeout(&root_owned, &mut state, Stage::Code, "ctx", 30, None).map(|_| ())
+            run_gate_with_timeout(
+                &root_owned,
+                &mut state,
+                Stage::Code,
+                GateKind::StageFailure,
+                "ctx",
+                30,
+            )
+            .map(|_| ())
         });
         entered_rx
             .recv_timeout(std::time::Duration::from_secs(30))
@@ -2827,6 +1790,7 @@ mod tests {
             Stage::Code,
             &GateResponse {
                 approved: true,
+                abort: false,
                 note: None,
                 responded_by: Some("test".into()),
             },
@@ -2920,7 +1884,7 @@ mod tests {
     fn spawn_code_gate_waiter(
         root: &Path,
         phase: PhaseId,
-    ) -> std::thread::JoinHandle<Result<GateAction, CliError>> {
+    ) -> std::thread::JoinHandle<Result<crate::pipeline_outcomes::Answer, CliError>> {
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
         state.gate_notify_cmd = Some("true".to_string());
@@ -2928,7 +1892,14 @@ mod tests {
         let root_owned = root.to_path_buf();
         std::thread::spawn(move || {
             let mut state = workflow::load_state(&root_owned, phase).unwrap();
-            run_gate_with_timeout(&root_owned, &mut state, Stage::Code, "ctx", 30, None)
+            run_gate_with_timeout(
+                &root_owned,
+                &mut state,
+                Stage::Code,
+                GateKind::StageFailure,
+                "ctx",
+                30,
+            )
         })
     }
 
@@ -2958,6 +1929,7 @@ mod tests {
     fn approval() -> GateResponse {
         GateResponse {
             approved: true,
+            abort: false,
             note: None,
             responded_by: Some("test".into()),
         }
@@ -3010,7 +1982,10 @@ mod tests {
 
         answer_open_gate(root, phase, Stage::Code, &approval()).unwrap();
         let action = waiter.join().unwrap().unwrap();
-        assert_eq!(action, GateAction::Advance);
+        assert!(
+            matches!(action, crate::pipeline_outcomes::Answer::Approve(_)),
+            "{action:?}"
+        );
         assert!(
             Gates::claim_path(root, phase, Stage::Code, &gate).exists(),
             "the answer was consumed through the claim"
@@ -3098,8 +2073,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(84);
-        let old = Gates::open_gate(root, phase, Stage::Code, "g1").unwrap();
-        Gates::open_gate(root, phase, Stage::Code, "g2").unwrap();
+        let old = Gates::open_gate(
+            root,
+            phase,
+            Stage::Code,
+            devflow_core::gates::GateKind::StageFailure,
+            "g1",
+        )
+        .unwrap();
+        Gates::open_gate(
+            root,
+            phase,
+            Stage::Code,
+            devflow_core::gates::GateKind::StageFailure,
+            "g2",
+        )
+        .unwrap();
         let slot = Gates::answer_path(root, phase, Stage::Code, &old.gate_id);
         let idless = br#"{"approved": true}"#;
         std::fs::write(&slot, idless).unwrap();
@@ -3126,7 +2115,7 @@ mod tests {
         assert_refused("no open gate");
     }
 
-    /// A `yes_ship` revoke made after a caller loaded its copy survives that caller's
+    /// A field another writer changed after a caller loaded its copy survives that caller's
     /// transition, which writes only the transition's own fields (D-08, T-50.1-34).
     #[test]
     fn transition_commits_only_its_fields() {
@@ -3139,10 +2128,9 @@ mod tests {
         let phase = PhaseId::new(88);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
-        state.yes_ship = true;
         workflow::save_state(&state).unwrap();
         workflow::update_state(root, phase, |on_disk| {
-            on_disk.yes_ship = false;
+            on_disk.base_branch = Some("workspace/concurrent".to_string());
             Ok::<(), workflow::WorkflowError>(())
         })
         .unwrap();
@@ -3152,17 +2140,22 @@ mod tests {
         let _ = transition(root, &mut state, Stage::Validate);
 
         let after = workflow::load_state(root, phase).unwrap();
-        assert!(!after.yes_ship, "the revoke survives the transition");
+        assert_eq!(
+            after.base_branch.as_deref(),
+            Some("workspace/concurrent"),
+            "the other writer's change survives the transition"
+        );
         assert_eq!(after.stage, Stage::Validate, "the transition's own write");
     }
 
-    /// A PATH dir whose `claude` waits (bounded, about 60 s) for a file that never
+    /// A PATH dir whose `codex` waits (bounded, about 60 s) for a file that never
     /// appears, with `sleep` for that wait, so a stage launched onto it stays
     /// running and its supervisor writes no state while the test reads it.
-    fn waiting_claude_dir() -> tempfile::TempDir {
+    /// Codex is a capture-shape agent, so the launch spends no delivery canary.
+    fn waiting_codex_dir() -> tempfile::TempDir {
         use std::os::unix::fs::PermissionsExt;
-        let path_dir = agent_free_dir_with_agent_stub("claude");
-        let path = path_dir.path().join("claude");
+        let path_dir = agent_free_dir_with_agent_stub("codex");
+        let path = path_dir.path().join("codex");
         std::fs::write(
             &path,
             "#!/bin/sh\ncase \"$1\" in --version) exit 0 ;; esac\n\
@@ -3187,19 +2180,14 @@ mod tests {
     #[test]
     fn a_transition_clears_the_persisted_code_fix() {
         const NAME: &str = "pipeline_gate::tests::a_transition_clears_the_persisted_code_fix";
-        enter_path_isolated_child!(NAME, waiting_claude_dir());
+        enter_path_isolated_child!(NAME, waiting_codex_dir());
         let _guard = env_lock();
         let code_state = |root: &Path, phase: PhaseId| {
             init_repo(root);
-            let mut state = State::new(
-                phase,
-                AgentKind::Claude,
-                Mode::Supervise,
-                root.to_path_buf(),
-            );
+            let mut state =
+                State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
             state.stage = Stage::Code;
             state.code_fix = Some(FixType::GapsOnly);
-            state.legacy_claude_launch = true;
             state
         };
 
@@ -3234,836 +2222,656 @@ mod tests {
         );
     }
 
-    /// A loop-back writes its stage move and the verification observation
-    /// `select_loop_back_fix` recorded (F-11: this is the write that persists it), and
-    /// keeps a field another writer changed since the caller loaded its copy.
+    /// A loop-back writes its stage move and its fix pass, and keeps a field another
+    /// writer changed since the caller loaded its copy.
     #[test]
-    fn a_loop_back_commits_its_fields_and_the_verification_observation() {
-        const FINGERPRINT: u64 = 0xF1;
-        const MTIME_NANOS: u64 = 0xF2;
+    fn a_loop_back_commits_its_fields() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(89);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Validate;
         state.gate_pending = true;
-        state.yes_ship = true;
         workflow::save_state(&state).unwrap();
         workflow::update_state(root, phase, |on_disk| {
-            on_disk.yes_ship = false;
+            on_disk.base_branch = Some("workspace/concurrent".to_string());
             Ok::<(), workflow::WorkflowError>(())
         })
         .unwrap();
-        state.last_verification_fingerprint = Some(FINGERPRINT);
-        state.last_verification_mtime_nanos = Some(MTIME_NANOS);
 
         prepare_loop_back_to_code(
             root,
             &mut state,
             FixType::GapsOnly,
+            None,
+            None,
             LoopBackReason::GateResponse,
         )
         .unwrap();
 
         let after = workflow::load_state(root, phase).unwrap();
-        assert!(!after.yes_ship, "the concurrent revoke is kept");
+        assert_eq!(
+            after.base_branch.as_deref(),
+            Some("workspace/concurrent"),
+            "the concurrent write is kept"
+        );
         assert_eq!(after.stage, Stage::Code);
         assert!(!after.gate_pending);
-        assert_eq!(after.last_verification_fingerprint, Some(FINGERPRINT));
-        assert_eq!(after.last_verification_mtime_nanos, Some(MTIME_NANOS));
+        assert_eq!(after.code_fix, Some(FixType::GapsOnly));
     }
 
-    // ---- 50.1-22: where a stop lands around finalization (D-13 items 7 and 8, D-18) ----
+    // ---- GATE-01 / U7: the relaunch note leaves with its stage ----
 
-    /// A supervisor published in this process and recorded in `state`, so an advance
-    /// engaged on it passes the ownership fence. Its agent group is 0: nothing here ever
-    /// signals one.
-    struct RecordedSupervisor {
-        supervisor: devflow_core::supervisor::runtime::Supervisor,
-        launch_id: String,
-        _cache: tempfile::TempDir,
-    }
+    /// The relaunch note the rows below seed: a newline and a tab, so a clear
+    /// that kept part of it, or a control that lost part of it, shows.
+    const RELAUNCH_NOTE: &str = "relaunch note:\n\tkeep the stage's scope";
 
-    impl RecordedSupervisor {
-        fn serve(state: &mut State) -> Self {
-            use devflow_core::supervisor::{self, Sidecar, SocketPath};
-            let pid = std::process::id();
-            let cache = hermetic_cache_dir();
-            let launch_id = supervisor::new_launch_id();
-            let socket =
-                SocketPath::for_launch(cache.path(), &state.project_root, state.phase, &launch_id)
-                    .expect("the socket path fits");
-            let socket_path = socket.as_path().to_path_buf();
-            let boot_id = supervisor::boot_id().unwrap_or_default();
-            let start_time = devflow_core::agent::process_start_time(pid).unwrap_or(0);
-            // `Sidecar` is `non_exhaustive`, so a test outside its crate builds one the way a
-            // reader does.
-            let sidecar: Sidecar = serde_json::from_value(serde_json::json!({
-                "launch_id": launch_id,
-                "project_root": state.project_root,
-                "phase": state.phase,
-                "stage": state.stage.to_string(),
-                "agent": state.agent.to_string(),
-                "launch": "capture",
-                "agent_pid": pid,
-                "agent_pgid": 0,
-                "agent_start_time": start_time,
-                "boot_id": boot_id,
-                "supervisor_pid": pid,
-                "supervisor_start_time": start_time,
-                "created_at": "2026-11-01T00:00:00Z",
-            }))
-            .expect("a well-formed sidecar");
-            let supervisor = devflow_core::supervisor::runtime::Supervisor::serve(socket, sidecar)
-                .expect("serve the socket");
-            supervisor
-                .token()
-                .enter(devflow_core::supervisor::runtime::OwnerPhase::Advancing);
-            state.supervisor = Some(devflow_core::state::SupervisorRecord::new(
-                socket_path,
-                launch_id.clone(),
-                0,
-                start_time,
-                boot_id,
-            ));
-            Self {
-                supervisor,
-                launch_id,
-                _cache: cache,
-            }
-        }
-
-        /// What a `shutdown` on the socket does to an advancing run.
-        fn request_stop(&self) {
-            self.supervisor
-                .token()
-                .request_stop(devflow_core::supervisor::runtime::StopSource::Socket);
-        }
-    }
-
-    /// A phase at Ship whose every finalization pass fails at `VersionBump`, after a
-    /// `Merge` that succeeds: a tag no branch reaches makes `compute_version` refuse
-    /// (D-10). The state records a supervisor.
-    fn finalization_that_fails_each_pass(root: &Path, phase: PhaseId) -> RecordedSupervisor {
+    /// A Codex run of `phase` at `root`, at `stage`, in supervise mode, holding
+    /// [`RELAUNCH_NOTE`] as its relaunch note. Codex is a capture-shape agent,
+    /// so a launch spends no delivery canary.
+    fn noted_state(root: &Path, phase: PhaseId, stage: Stage) -> State {
         init_repo(root);
-        let git = |args: &[&str]| {
-            let output = devflow_core::test_support::git_command(root)
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(output.status.success(), "git {args:?} failed: {output:?}");
-        };
-        git(&["checkout", "-q", "--orphan", "unreachable-release"]);
-        git(&["commit", "-q", "--allow-empty", "-m", "chore: orphan"]);
-        git(&["tag", "v9.9.9"]);
-        git(&["checkout", "-q", "develop"]);
-        git(&[
-            "branch",
-            &format!("feature/phase-{}", phase.padded()),
-            "develop",
-        ]);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Ship;
-        let engaged = RecordedSupervisor::serve(&mut state);
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
+        state.verification_baseline_captured = true;
+        state.stage = stage;
+        state.relaunch_note = Some(RELAUNCH_NOTE.to_string());
+        state
+    }
+
+    /// The prompt a no-override launch of `state` gives Codex: the builder a
+    /// resume or failover replay uses.
+    fn default_prompt(state: &State) -> String {
+        let codex = devflow_core::agents::driver_for(AgentKind::Codex);
+        crate::pipeline_launch::default_stage_prompt(state, codex.as_ref())
+    }
+
+    /// Whether `prompt` carries a relaunch-note block at all.
+    fn has_relaunch_block(prompt: &str) -> bool {
+        prompt.contains(devflow_core::prompt::RELAUNCH_NOTE_INTRODUCTION)
+            || prompt.contains("OPERATOR NOTE")
+    }
+
+    /// U7: `relaunch_note` is `None` once the run leaves the stage it was given
+    /// for, on each production way out at this wave: `transition` (both of its
+    /// commits: the ordinary move and the `--until` halt), the gap-closure
+    /// route's `transition` from Validate to Plan (52-27), the Validate
+    /// loop-back to Code (`prepare_loop_back_to_code`, which does not call
+    /// `transition`) and `finish_run`. Controls, so each cleared assertion can
+    /// fail: a stop and resume at the same stage keeps the note, and a Code
+    /// state saved and reloaded with no stage change keeps it in the builder the
+    /// Validate row asserts on.
+    #[test]
+    fn leaving_the_relaunched_stage_clears_the_relaunch_note() {
+        const NAME: &str =
+            "pipeline_gate::tests::leaving_the_relaunched_stage_clears_the_relaunch_note";
+        enter_path_isolated_child!(NAME, waiting_codex_dir());
+        let _guard = env_lock();
+
+        // `transition` out of Plan and out of Code, each launching the next stage.
+        for (number, from, to) in [
+            (5280, Stage::Plan, Stage::Code),
+            (5281, Stage::Code, Stage::Validate),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let phase = PhaseId::new(number);
+            let mut state = noted_state(dir.path(), phase, from);
+            workflow::save_state(&state).unwrap();
+            let result = transition(dir.path(), &mut state, to);
+            let moved = workflow::load_state(dir.path(), phase).unwrap();
+            let _reap_guard = ReapMonitorOnDrop::after_launch(&moved);
+            result.unwrap();
+            assert_eq!(moved.stage, to);
+            assert_eq!(
+                moved.relaunch_note, None,
+                "{from} -> {to}: the transition clears the relaunch note"
+            );
+            assert!(
+                !has_relaunch_block(&default_prompt(&moved)),
+                "{from} -> {to}: the {to} intent carries no relaunch note"
+            );
+        }
+
+        // Validate -> Plan, the gap-closure route's way out of Validate (52-27):
+        // a state at Validate with the note (as a rejected Validate stage-failure
+        // gate's relaunch leaves it) and the gap-closure marker set.
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(5287);
+        let mut state = noted_state(dir.path(), phase, Stage::Validate);
+        state.gap_closure_pass = true;
         workflow::save_state(&state).unwrap();
-        engaged
-    }
-
-    /// Run finalization on a thread with `engaged` as its supervisor and `probe` counting
-    /// its claims, so a claim holds there until the test lets it go.
-    fn spawn_engaged_finalization(
-        root: &Path,
-        phase: PhaseId,
-        engaged: &RecordedSupervisor,
-        probe: &std::sync::Arc<ClaimProbe>,
-    ) -> std::thread::JoinHandle<Result<(), CliError>> {
-        let root = root.to_path_buf();
-        let token = engaged.supervisor.token();
-        let launch_id = engaged.launch_id.clone();
-        let probe = probe.clone();
-        std::thread::spawn(move || {
-            CLAIM_PROBE.set(Some(probe));
-            let _engaged = crate::pipeline_launch::StopTokenGuard::engage(token, launch_id);
-            let mut state = workflow::load_state(&root, phase).unwrap();
-            finish_workflow_with_gate_timeout(&root, &mut state, 30)
-        })
-    }
-
-    /// Answer the retry gate that is open now with an approval, and return once the
-    /// finalization thread has claimed it and holds in `note_claim`, before it has acted.
-    fn approve_the_retry_gate_and_hold_its_claim(
-        root: &Path,
-        phase: PhaseId,
-        probe: &ClaimProbe,
-    ) -> gates::GateId {
-        use std::sync::atomic::Ordering::SeqCst;
-        const CLAIMED_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
-        let gate = wait_for_open_gate(root, phase, Stage::Ship);
+        let result = transition(dir.path(), &mut state, Stage::Plan);
+        let moved = workflow::load_state(dir.path(), phase).unwrap();
+        let _reap_gap = ReapMonitorOnDrop::after_launch(&moved);
+        result.unwrap();
+        assert_eq!(moved.stage, Stage::Plan);
+        assert_eq!(
+            moved.relaunch_note, None,
+            "validate -> plan: the gap route's transition clears the relaunch note"
+        );
         assert!(
-            gate_answer_files(root, phase, Stage::Ship).is_empty(),
-            "the retry gate is never auto-approved"
+            !has_relaunch_block(&default_prompt(&moved)),
+            "validate -> plan: the gaps Plan intent carries no relaunch note"
         );
-        answer_open_gate(root, phase, Stage::Ship, &approval()).unwrap();
-        let started = std::time::Instant::now();
-        while probe.claimed.load(SeqCst) == 0 {
-            assert!(
-                started.elapsed() < CLAIMED_WITHIN,
-                "the retry gate's answer was not claimed within {CLAIMED_WITHIN:?}"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        gate
-    }
 
-    /// How many `hook` runs the event log records: one per finalization pass that reached it.
-    fn hook_runs(root: &Path, hook: &str) -> usize {
-        events_named(root, "hook_run")
-            .iter()
-            .filter(|event| event["hook"] == hook)
-            .count()
-    }
-
-    /// D-13 item 7: safe point 6 runs before every finalization pass. A stop that lands
-    /// while an approved retry is on its way back to the loop runs no second merge, version
-    /// bump, tag or push.
-    #[test]
-    fn a_stop_during_a_finalization_retry_is_honoured_before_the_next_pass() {
-        use std::sync::atomic::Ordering::SeqCst;
+        // Validate -> Code through the loop-back, which does not call `transition`.
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(2211);
-        let engaged = finalization_that_fails_each_pass(root, phase);
-        let probe = std::sync::Arc::new(ClaimProbe::default());
-        let finalizing = spawn_engaged_finalization(root, phase, &engaged, &probe);
-
-        approve_the_retry_gate_and_hold_its_claim(root, phase, &probe);
-        engaged.request_stop();
-        probe.already_consumed.fetch_add(1, SeqCst);
-        let result = finalizing.join().unwrap();
-
-        assert_eq!(
-            hook_runs(root, "Merge"),
-            1,
-            "the stop ran no second pass: {result:?}"
-        );
-        let error = result
-            .expect_err("a stopped finalization does not ship")
-            .to_string();
-        assert!(error.contains("finalization did not run"), "{error}");
-        let stopped = events_named(root, "advance_stopped");
-        assert_eq!(stopped.len(), 1, "{stopped:?}");
-        assert_eq!(stopped[0]["safe_point"], 6, "{}", stopped[0]);
-        assert_eq!(stopped[0]["source"], "supervisor", "{}", stopped[0]);
-        assert!(events_named(root, "workflow_shipped").is_empty());
-        let state = workflow::load_state(root, phase).unwrap();
-        assert!(state.stopped);
-        assert_eq!(
-            state.stop_reason.as_deref(),
-            Some(crate::pipeline_launch::ADVANCE_STOP_REASON)
-        );
-        assert!(!state.gate_pending);
-        assert!(!Gates::gate_path(root, phase, Stage::Ship).exists());
-    }
-
-    /// The control for the stop above: the same approved retry with no stop runs the next
-    /// pass and reopens the gate, so the hook count above is one because of the stop.
-    #[test]
-    fn without_a_stop_an_approved_finalization_retry_runs_the_next_pass() {
-        use std::sync::atomic::Ordering::SeqCst;
-        const NEXT_PASS_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(2212);
-        let engaged = finalization_that_fails_each_pass(root, phase);
-        let probe = std::sync::Arc::new(ClaimProbe::default());
-        let finalizing = spawn_engaged_finalization(root, phase, &engaged, &probe);
-
-        let first_gate = approve_the_retry_gate_and_hold_its_claim(root, phase, &probe);
-        probe.already_consumed.fetch_add(1, SeqCst);
-
-        let started = std::time::Instant::now();
-        while hook_runs(root, "VersionBump") < 2
-            || !Gates::gate_path(root, phase, Stage::Ship).exists()
-            || live_gate_id(root, phase, Stage::Ship) == first_gate
-        {
-            assert!(
-                started.elapsed() < NEXT_PASS_WITHIN,
-                "the approved retry must run the next pass and reopen the gate"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert_eq!(hook_runs(root, "Merge"), 2);
-        assert!(events_named(root, "advance_stopped").is_empty());
-
-        answer_open_gate(
-            root,
-            phase,
-            Stage::Ship,
-            &GateResponse {
-                approved: false,
-                note: Some("abort: test cleanup".into()),
-                responded_by: Some("test".into()),
-            },
+        let phase = PhaseId::new(5282);
+        let mut state = noted_state(dir.path(), phase, Stage::Validate);
+        workflow::save_state(&state).unwrap();
+        let prompt = prepare_loop_back_to_code(
+            dir.path(),
+            &mut state,
+            FixType::GapsOnly,
+            None,
+            None,
+            LoopBackReason::GateResponse,
         )
         .unwrap();
-        finalizing.join().unwrap().unwrap();
-    }
+        let looped = workflow::load_state(dir.path(), phase).unwrap();
+        assert_eq!(looped.stage, Stage::Code);
+        assert_eq!(
+            looped.relaunch_note, None,
+            "the loop-back to Code clears Validate's relaunch note"
+        );
+        assert!(
+            !has_relaunch_block(&prompt),
+            "the loop-back's own prompt holds no relaunch note:\n{prompt}"
+        );
+        assert!(
+            !has_relaunch_block(&default_prompt(&looped)),
+            "a replay of the fix pass carries no relaunch note"
+        );
 
-    /// One auto-answered Ship gate at `root`, with a stop token engaged on this thread and
-    /// its stop requested first when `stop`. The notify command writes [`notify_marker`].
-    fn auto_answered_ship_gate(
-        root: &Path,
-        phase: PhaseId,
-        stop: bool,
-    ) -> Result<GateAction, CliError> {
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Ship;
-        state.yes_ship = true;
-        state.gate_notify_cmd = Some(format!(": > '{}'", notify_marker(root).display()));
-        let engaged = RecordedSupervisor::serve(&mut state);
+        // `finish_run` from Validate.
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(5283);
+        let mut state = noted_state(dir.path(), phase, Stage::Validate);
         workflow::save_state(&state).unwrap();
-        if stop {
-            engaged.request_stop();
-        }
-        let _engaged = crate::pipeline_launch::StopTokenGuard::engage(
-            engaged.supervisor.token(),
-            engaged.launch_id.clone(),
+        finish_run(dir.path(), &mut state, test_permit()).unwrap();
+        let finished = workflow::load_state(dir.path(), phase).unwrap();
+        assert!(finished.finished, "the run finished");
+        assert_eq!(
+            finished.relaunch_note, None,
+            "the run's end clears the note"
         );
-        run_gate_with_timeout(root, &mut state, Stage::Ship, "ctx", 30, Some(&approval()))
-    }
 
-    /// A pre-authorized answer whose re-check could not take the gate lock is published
-    /// and left in place, and this waiter is the one that acts on it: a stalled gate lock
-    /// must not make it quit its own gate. The holder arrives in the one window with no
-    /// lock held, stays past the re-check's wait and goes before the claim's ends.
-    #[test]
-    fn a_pre_authorized_answer_left_unconfirmed_still_decides_its_own_gate() {
+        // The `--until` halt, `transition`'s early-return commit.
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(2217);
-        let lock = root
-            .join(".devflow")
-            .join(format!(".gates-{}.lock", phase.padded()));
-        let past_the_recheck = gates::GATE_LOCK_WAIT + std::time::Duration::from_secs(1);
-        let stall_the_recheck = move || {
-            let holder = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .open(lock)
-                .unwrap();
-            holder.lock().unwrap();
-            std::thread::spawn(move || {
-                std::thread::sleep(past_the_recheck);
-                drop(holder);
-            });
-        };
+        let phase = PhaseId::new(5284);
+        let mut state = noted_state(dir.path(), phase, Stage::Plan);
+        state.stop_until = Some(Stage::Plan);
+        workflow::save_state(&state).unwrap();
+        transition(dir.path(), &mut state, Stage::Code).unwrap();
+        let halted = workflow::load_state(dir.path(), phase).unwrap();
+        assert!(halted.stopped, "the --until halt fired");
+        let finished_event = devflow_core::events::last_event_of_kind_for_phase(
+            dir.path(),
+            phase,
+            "workflow_finished",
+        )
+        .expect("the halt emits workflow_finished");
+        assert_eq!(finished_event["reason"], "stopped_at", "{finished_event}");
+        assert_eq!(
+            halted.relaunch_note, None,
+            "the --until halt clears the note"
+        );
 
-        let action =
-            devflow_core::test_support::with_answer_before_publish(stall_the_recheck, || {
-                auto_answered_ship_gate(root, phase, false)
-            })
-            .expect("the waiter acts on its own published answer");
-
-        assert!(matches!(action, GateAction::Advance), "{action:?}");
-        let resolved = events_named(root, "gate_resolved");
-        assert_eq!(resolved.len(), 1, "{resolved:?}");
-        assert_eq!(resolved[0]["approved"], true);
-    }
-
-    fn notify_marker(root: &Path) -> PathBuf {
-        root.join("notify-ran")
-    }
-
-    /// D-13 item 8: safe point 5 runs before the notify, so a stopped `--yes-ship` run sends
-    /// no "Ship gate awaiting" message for a gate it withdraws at once. Control: with no stop
-    /// the same gate notifies. Its own child, because `DEVFLOW_GATE_NOTIFY_CMD` in the
-    /// runner's environment would replace the state's command.
-    #[test]
-    fn a_stopped_yes_ship_run_sends_no_ship_notify() {
-        const NAME: &str = "pipeline_gate::tests::a_stopped_yes_ship_run_sends_no_ship_notify";
-        if !devflow_core::test_support::in_child_test(NAME) {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([NAME, "--exact", "--test-threads=1"])
-                .env(devflow_core::test_support::CHILD_TEST_ENV, NAME)
-                .env_remove(devflow_core::gates::GATE_NOTIFY_CMD_ENV)
-                .output()
-                .unwrap();
-            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
-            return;
-        }
-
+        // Control: a stop and resume at Plan, with no transition, keeps it.
         let dir = tempfile::tempdir().unwrap();
-        let stopped = dir.path().join("stopped");
-        std::fs::create_dir(&stopped).unwrap();
-        let phase = PhaseId::new(2215);
-        let error = auto_answered_ship_gate(&stopped, phase, true)
-            .expect_err("a stopped run does not answer its gate")
-            .to_string();
-        assert!(error.contains("was not auto-answered"), "{error}");
-        assert!(
-            !notify_marker(&stopped).exists(),
-            "no message about a gate the run withdraws"
-        );
-        assert!(events_named(&stopped, "gate_fired").is_empty());
-        assert!(events_named(&stopped, "notify_fired").is_empty());
-        let stops = events_named(&stopped, "advance_stopped");
-        assert_eq!(stops.len(), 1, "{stops:?}");
-        assert_eq!(stops[0]["safe_point"], 5, "{}", stops[0]);
-        assert!(!Gates::gate_path(&stopped, phase, Stage::Ship).exists());
-
-        let running = dir.path().join("running");
-        std::fs::create_dir(&running).unwrap();
-        let action = auto_answered_ship_gate(&running, phase, false).unwrap();
-        assert_eq!(action, GateAction::Advance);
-        assert!(notify_marker(&running).exists(), "control: the notify runs");
-        assert_eq!(events_named(&running, "gate_fired").len(), 1);
-    }
-
-    /// Comment text as it reads: each line's indent and comment marker dropped, the lines
-    /// joined, whitespace collapsed, so a sentence wrapped over two lines still matches.
-    fn comment_normal_form(source: &str) -> String {
-        source
-            .lines()
-            .map(|line| {
-                let line = line.trim_start();
-                ["///", "//!", "//"]
-                    .iter()
-                    .find_map(|marker| line.strip_prefix(marker))
-                    .unwrap_or(line)
-            })
-            .collect::<Vec<_>>()
-            .join(" ")
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-
-    /// D-13 item 8, the comment: under D-06 a resumed run reruns Ship, and a saved `yes_ship`
-    /// auto-approves its new gate, so it does not "ask again". The planted control is the
-    /// comment as it stood, whose sentence wraps, so a search of the raw text never finds it.
-    #[test]
-    fn the_safe_point_6_comment_states_what_a_resumed_run_does() {
-        const STALE: &str = "a resumed run asks again";
-        const WRAPPED_AS_IT_STOOD: &str = "    // bump, tag and push. The consumed approval is cleared with it, so a\n    // resumed run asks again. Outside a supervisor's advance (the foreground\n";
-        assert!(
-            !WRAPPED_AS_IT_STOOD.contains(STALE),
-            "control: the raw search misses the wrapped sentence"
+        let phase = PhaseId::new(5285);
+        let mut state = noted_state(dir.path(), phase, Stage::Plan);
+        state.stopped = true;
+        state.stop_reason = Some("stopped by the operator".to_string());
+        workflow::save_state(&state).unwrap();
+        let result = crate::pipeline_launch::resume(dir.path(), phase, None);
+        let resumed = workflow::load_state(dir.path(), phase).unwrap();
+        let _reap_resumed = ReapMonitorOnDrop::after_launch(&resumed);
+        result.unwrap();
+        assert_eq!(resumed.stage, Stage::Plan);
+        assert_eq!(
+            resumed.relaunch_note.as_deref(),
+            Some(RELAUNCH_NOTE),
+            "control: a stop and resume keeps the note"
         );
         assert!(
-            comment_normal_form(WRAPPED_AS_IT_STOOD).contains(STALE),
-            "control: the normal form catches it"
+            default_prompt(&resumed).contains(RELAUNCH_NOTE),
+            "control: the relaunched Plan intent carries the note"
         );
 
-        let (non_test, _) = include_str!("pipeline_gate.rs")
-            .split_once("\n#[cfg(test)]\nmod tests {")
-            .expect("this file has a test module");
+        // Control: Code to Code. A relaunched fix pass, saved and reloaded with
+        // no stage change, keeps the note in the builder the Validate row reads.
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(5286);
+        let mut state = noted_state(dir.path(), phase, Stage::Code);
+        state.code_fix = Some(FixType::GapsOnly);
+        workflow::save_state(&state).unwrap();
+        let reloaded = workflow::load_state(dir.path(), phase).unwrap();
+        assert_eq!(reloaded.relaunch_note.as_deref(), Some(RELAUNCH_NOTE));
+        let prompt = default_prompt(&reloaded);
         assert!(
-            !comment_normal_form(non_test).contains(STALE),
-            "the stale sentence is gone"
-        );
-        let safe_point_6: Vec<&str> = non_test
-            .lines()
-            .skip_while(|line| !line.trim_start().starts_with("// Safe point 6"))
-            .take_while(|line| line.trim_start().starts_with("//"))
-            .collect();
-        assert!(!safe_point_6.is_empty(), "the safe point 6 comment exists");
-        assert!(
-            comment_normal_form(&safe_point_6.join("\n")).contains("`yes_ship`"),
-            "{safe_point_6:?}"
+            prompt.contains(RELAUNCH_NOTE)
+                && prompt.contains(devflow_core::prompt::RELAUNCH_NOTE_INTRODUCTION),
+            "control: the Code intent keeps the note:\n{prompt}"
         );
     }
 
-    /// Names the D-18 fixture's project root for its finalizing child. Not a DevFlow
-    /// setting, so it carries no `DEVFLOW_` prefix the doc check would require documented.
-    const MID_MERGE_ROOT_ENV: &str = "P50_1_22_ROOT";
-    /// Says which finalizing child this process is: [`MID_MERGE_SHIP`] or
-    /// [`MID_MERGE_NO_HANDLER`].
-    const MID_MERGE_ROLE_ENV: &str = "P50_1_22_ROLE";
-    /// `ship_override`, whose claim installs the D-18 stop handler.
-    const MID_MERGE_SHIP: &str = "ship";
-    /// A holder with no stop handler, so its SIGTERM has the default disposition.
-    const MID_MERGE_NO_HANDLER: &str = "no_handler";
-    /// The finalizing child's exit code when its call returned an error.
-    const MID_MERGE_CHILD_ERROR: i32 = 41;
-    /// The bound on each step the D-18 fixture waits for.
-    const MID_MERGE_STEP: std::time::Duration = std::time::Duration::from_secs(30);
-    /// The script's bound on its pause, as 0.05 s sleeps: 30 s.
-    const MID_MERGE_PAUSE_POLLS: u32 = 600;
-
-    /// One repo the whole after-ship batch succeeds on, with an answered Ship gate, whose
-    /// `post-checkout` hook pauses inside `Merge`, between its `git checkout` and `git merge`.
-    struct MidMergeFixture {
-        _dir: tempfile::TempDir,
-        root: PathBuf,
-        phase: PhaseId,
-        branch: String,
-        feature_tip: String,
-        tags_before: Vec<String>,
-        hook_dir: tempfile::TempDir,
+    /// One write of `State.stage` the stage-write scan found: the file, the
+    /// 1-based line, the function it sits in, and the receiver written through.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct StageWrite {
+        file: String,
+        line: usize,
+        function: String,
+        receiver: String,
     }
 
-    impl MidMergeFixture {
-        fn new(phase: PhaseId) -> Self {
-            let dir = tempfile::tempdir().unwrap();
-            let root = dir.path().to_path_buf();
-            crate::test_support::init_repo_no_version_file(&root);
-            let branch = format!("feature/phase-{}", phase.padded());
-            let git = |args: &[&str]| {
-                let output = devflow_core::test_support::git_command(&root)
-                    .args(args)
-                    .output()
-                    .unwrap();
-                assert!(output.status.success(), "git {args:?} failed: {output:?}");
-            };
-            git(&["branch", &branch, "develop"]);
-            std::fs::write(root.join(".gitignore"), ".devflow/\n").unwrap();
-            git(&["checkout", "-q", &branch]);
-            std::fs::write(root.join("feature.txt"), "phase work\n").unwrap();
-            git(&["add", "."]);
-            git(&["commit", "-q", "-m", "phase work"]);
-            git(&["checkout", "-q", "develop"]);
-
-            let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.clone());
-            state.stage = Stage::Ship;
-            workflow::save_state(&state).unwrap();
-            Gates::open_gate(&root, phase, Stage::Ship, "Ship complete — approve merge?").unwrap();
-            answer_open_gate(&root, phase, Stage::Ship, &approval()).unwrap();
-
-            let hook_dir = tempfile::tempdir().unwrap();
-            let fixture = Self {
-                feature_tip: Self::git_stdout(&root, &["rev-parse", &branch]),
-                tags_before: Self::tags_in(&root),
-                _dir: dir,
-                root,
-                phase,
-                branch,
-                hook_dir,
-            };
-            // Last, so nothing above runs it.
-            fixture.install_pausing_hook();
-            fixture
-        }
-
-        fn git_stdout(root: &Path, args: &[&str]) -> String {
-            let output = devflow_core::test_support::git_command(root)
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(output.status.success(), "git {args:?} failed: {output:?}");
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
-        }
-
-        fn tags_in(root: &Path) -> Vec<String> {
-            Self::git_stdout(root, &["tag", "--list"])
-                .lines()
-                .map(str::to_string)
-                .collect()
-        }
-
-        /// The tags this run added.
-        fn new_tags(&self) -> Vec<String> {
-            Self::tags_in(&self.root)
-                .into_iter()
-                .filter(|tag| !self.tags_before.contains(tag))
-                .collect()
-        }
-
-        fn git_succeeds(&self, args: &[&str]) -> bool {
-            devflow_core::test_support::git_command(&self.root)
-                .args(args)
-                .output()
-                .unwrap()
-                .status
-                .success()
-        }
-
-        fn develop_has_the_feature(&self) -> bool {
-            self.git_succeeds(&["merge-base", "--is-ancestor", &self.feature_tip, "develop"])
-        }
-
-        fn marker(&self, name: &str) -> PathBuf {
-            self.hook_dir.path().join(name)
-        }
-
-        /// `post-checkout` marks that it runs, waits (bounded) for the release, and marks
-        /// that it is leaving. The script names `sleep` by path: the child's PATH holds only
-        /// `git`.
-        fn install_pausing_hook(&self) {
-            use std::os::unix::fs::PermissionsExt;
-            let sleep = ["/usr/bin/sleep", "/bin/sleep"]
-                .into_iter()
-                .find(|path| Path::new(path).is_file())
-                .expect("sleep must exist to run this test");
-            let hook = self.hook_dir.path().join("post-checkout");
-            std::fs::write(
-                &hook,
-                format!(
-                    "#!/bin/sh\n: > '{in_merge}'\ni=0\n\
-                     while [ ! -e '{release}' ] && [ \"$i\" -lt {MID_MERGE_PAUSE_POLLS} ]; do\n  \
-                     {sleep} 0.05\n  i=$((i+1))\ndone\n: > '{left}'\nexit 0\n",
-                    in_merge = self.marker("in-merge").display(),
-                    release = self.marker("release").display(),
-                    left = self.marker("left-merge").display(),
-                ),
-            )
-            .unwrap();
-            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
-            let hooks_path = self.hook_dir.path().display().to_string();
-            assert!(self.git_succeeds(&["config", "core.hooksPath", &hooks_path]));
-        }
-
-        /// Run the finalizing child `role`, and return it once it is inside `Merge`.
-        fn spawn_child_paused_in_merge(&self, test_name: &str, role: &str) -> MidMergeChild {
-            let path_dir = agent_free_git_only_path_dir();
-            let child = devflow_core::test_support::spawn_test_in_child(
-                test_name,
-                path_dir.path(),
-                &[
-                    (MID_MERGE_ROOT_ENV, self.root.as_os_str()),
-                    (MID_MERGE_ROLE_ENV, std::ffi::OsStr::new(role)),
-                ],
-            );
-            let mut child = MidMergeChild {
-                child: Some(child),
-                release: self.marker("release"),
-                _path_dir: path_dir,
-            };
-            let started = std::time::Instant::now();
-            while !self.marker("in-merge").exists() {
-                assert!(
-                    started.elapsed() < MID_MERGE_STEP && child.is_running(),
-                    "the child never paused inside Merge: {:?}",
-                    child.finish()
-                );
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            assert_eq!(
-                hook_runs(&self.root, "Merge"),
-                0,
-                "the pause is inside Merge, not after it"
-            );
-            child
-        }
-
-        /// Wait for the paused hook to leave, the one process here no one reaps once its
-        /// parent has died.
-        fn wait_for_the_hook_to_leave(&self) {
-            let started = std::time::Instant::now();
-            while !self.marker("left-merge").exists() {
-                assert!(
-                    started.elapsed() < MID_MERGE_STEP,
-                    "the paused hook never left after its release"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-        }
-
-        /// The `hook_run` events, in order, as `(hook, ok)`.
-        fn hook_results(&self) -> Vec<(String, bool)> {
-            events_named(&self.root, "hook_run")
-                .iter()
-                .map(|event| {
-                    (
-                        event["hook"].as_str().expect("names its hook").to_string(),
-                        event["ok"].as_bool().expect("says whether it passed"),
-                    )
-                })
-                .collect()
-        }
-
-        /// The version `CHANGELOG.md`'s newest heading names.
-        fn newest_changelog_version(&self) -> String {
-            let changelog = std::fs::read_to_string(self.root.join("CHANGELOG.md")).unwrap();
-            changelog
-                .lines()
-                .find(|line| line.starts_with("## "))
-                .and_then(|line| line.trim_start_matches("## ").split(' ').next())
-                .expect("the changelog has a version heading")
-                .to_string()
-        }
-    }
-
-    /// A finalizing child, and the release of the hook it pauses in. On a failed assertion
-    /// too, dropping this releases the hook, then kills and reaps the child.
-    struct MidMergeChild {
-        child: Option<std::process::Child>,
-        release: PathBuf,
-        _path_dir: tempfile::TempDir,
-    }
-
-    impl MidMergeChild {
-        fn pid(&self) -> u32 {
-            self.child.as_ref().expect("not yet finished").id()
-        }
-
-        fn is_running(&mut self) -> bool {
-            self.child
-                .as_mut()
-                .expect("not yet finished")
-                .try_wait()
-                .unwrap()
-                .is_none()
-        }
-
-        fn release_the_hook(&self) {
-            std::fs::write(&self.release, "").unwrap();
-        }
-
-        /// Wait for the child to end, within [`MID_MERGE_STEP`], and read its output. The
-        /// hook must already be released, or this waits out its pause.
-        fn finish(&mut self) -> std::process::Output {
-            let mut child = self.child.take().expect("finished once");
-            let started = std::time::Instant::now();
-            while child.try_wait().unwrap().is_none() {
-                if started.elapsed() > MID_MERGE_STEP {
-                    let _ = child.kill();
-                    panic!("the child did not end: {:?}", child.wait_with_output());
-                }
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            child.wait_with_output().unwrap()
-        }
-    }
-
-    impl Drop for MidMergeChild {
-        fn drop(&mut self) {
-            let _ = std::fs::write(&self.release, "");
-            if let Some(child) = &mut self.child {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-        }
-    }
-
-    /// The finalizing child of the D-18 fixture: exits 0 when its call returns `Ok`, and
-    /// [`MID_MERGE_CHILD_ERROR`] when it returns an error. Never returns.
-    fn run_the_finalizing_child(role: &std::ffi::OsStr, phase: PhaseId) -> ! {
-        let root = PathBuf::from(std::env::var_os(MID_MERGE_ROOT_ENV).expect("the parent sets it"));
-        let finished = if role == MID_MERGE_SHIP {
-            ship_override(&root, phase, false)
-        } else {
-            assert_eq!(role, MID_MERGE_NO_HANDLER);
-            let _hold = devflow_core::liveness::claim_phase_holder(&root, phase).unwrap();
-            let mut state = workflow::load_state(&root, phase).unwrap();
-            finish_workflow_with_gate_timeout(&root, &mut state, 2)
-        };
-        match finished {
-            Ok(()) => std::process::exit(0),
-            Err(err) => {
-                eprintln!("the finalizing child's call failed: {err}");
-                std::process::exit(MID_MERGE_CHILD_ERROR)
-            }
-        }
-    }
-
-    /// D-18 (operator, narrowed 2026-10-26): `devflow ship` reads the stop flag only before
-    /// `Merge`. Stopped inside `Merge`, a real `ship_override` survives the signal, runs
-    /// every hook of the pass and ships, through the real `stop` entry. Control: a holder
-    /// without the handler, sent the same signal at the same point, dies with the merge
-    /// not done, the cut D-18 forbids.
+    /// The stage writes in one file's `source`, under the scan's rule: only the
+    /// text before the test-module marker counts, each line from its first
+    /// `//` is dropped, and a hit is `\b([A-Za-z_]\w*)\.stage\s*=(?![=>])`,
+    /// matched by hand, whose receiver is not `spec`.
     ///
-    /// The limit: the flag is set inside `Merge` only, which is before every later hook
-    /// boundary, so this shows no boundary check exists. It does not drive a stop that
-    /// arrives during `VersionBump`, `ChangelogAppend` or `BranchCleanup`.
+    /// Limits: a write through a struct literal (`State { stage, .. }`),
+    /// `std::mem::replace(&mut s.stage, ..)` or a `&mut s.stage` borrow is not
+    /// seen, and a `//` inside a string literal ends that line's scanned text
+    /// early.
+    fn stage_writes_in(file: &str, source: &str) -> Vec<StageWrite> {
+        const TEST_MODULE_MARKER: &str = "\n#[cfg(test)]\nmod tests {";
+        const FIELD: &str = ".stage";
+        let non_test = source
+            .find(TEST_MODULE_MARKER)
+            .map_or(source, |at| &source[..at]);
+        let is_word = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+        let mut function = String::new();
+        let mut writes = Vec::new();
+        for (index, raw_line) in non_test.lines().enumerate() {
+            let line = raw_line.find("//").map_or(raw_line, |at| &raw_line[..at]);
+            if let Some(at) = line.find("fn ") {
+                let name: String = line[at + 3..]
+                    .chars()
+                    .take_while(|character| character.is_alphanumeric() || *character == '_')
+                    .collect();
+                if !name.is_empty() && (at == 0 || !is_word(line.as_bytes()[at - 1])) {
+                    function = name;
+                }
+            }
+            let bytes = line.as_bytes();
+            let mut from = 0;
+            while let Some(offset) = line[from..].find(FIELD) {
+                let dot = from + offset;
+                from = dot + FIELD.len();
+                let start = (0..dot)
+                    .rev()
+                    .take_while(|&at| is_word(bytes[at]))
+                    .last()
+                    .unwrap_or(dot);
+                let receiver = &line[start..dot];
+                let starts_like_an_identifier = receiver
+                    .bytes()
+                    .next()
+                    .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_');
+                let mut after = from;
+                while after < bytes.len() && bytes[after].is_ascii_whitespace() {
+                    after += 1;
+                }
+                let assigns = bytes.get(after) == Some(&b'=')
+                    && !matches!(bytes.get(after + 1), Some(b'=') | Some(b'>'));
+                if starts_like_an_identifier && assigns && receiver != "spec" {
+                    writes.push(StageWrite {
+                        file: file.to_string(),
+                        line: index + 1,
+                        function: function.clone(),
+                        receiver: receiver.to_string(),
+                    });
+                }
+            }
+        }
+        writes
+    }
+
+    /// Every `.rs` file below `dir`, recursively, sorted.
+    fn rust_files_under(dir: &Path) -> Vec<std::path::PathBuf> {
+        let mut files = Vec::new();
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(next) = pending.pop() {
+            for entry in std::fs::read_dir(&next).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    files.push(path);
+                }
+            }
+        }
+        files.sort();
+        files
+    }
+
+    /// U7's sweep pinned (V2): the only production writes of `State.stage`
+    /// under `crates/devflow-cli/src` and `crates/devflow-core/src` are
+    /// `transition`'s and `prepare_loop_back_to_code`'s, each of which clears
+    /// the relaunch note in the same commit. A plan that adds a third write
+    /// fails here and must add that write's clear site. The rule and its limits
+    /// are on [`stage_writes_in`]; `State::stage` stays `pub` (published core).
     #[test]
-    fn a_stop_inside_the_ship_finalization_pass_lands_after_the_pass_ends() {
-        use std::os::unix::process::ExitStatusExt;
-        const NAME: &str = "pipeline_gate::tests::a_stop_inside_the_ship_finalization_pass_lands_after_the_pass_ends";
-        const SHIP_PHASE: PhaseId = PhaseId::new(2213);
-        const NO_HANDLER_PHASE: PhaseId = PhaseId::new(2214);
-        // This outer child gives `stop` a hermetic cache dir to search.
-        enter_path_isolated_child!(NAME, agent_free_git_only_path_dir());
-        if let Some(role) = std::env::var_os(MID_MERGE_ROLE_ENV) {
-            let phase = if role == MID_MERGE_SHIP {
-                SHIP_PHASE
-            } else {
-                NO_HANDLER_PHASE
-            };
-            run_the_finalizing_child(&role, phase);
-        }
-
-        // Part 1: the stop lands after the pass.
-        let fixture = MidMergeFixture::new(SHIP_PHASE);
-        let (root, phase) = (fixture.root.clone(), fixture.phase);
-        let mut child = fixture.spawn_child_paused_in_merge(NAME, MID_MERGE_SHIP);
-        let pid = child.pid();
-
-        let error = crate::commands::stop(&root, phase)
-            .expect_err("a holder still running is not a stop")
-            .to_string();
-        eprintln!("stop returned: {error}");
-
-        assert!(error.contains(&format!("signalled pid {pid}")), "{error}");
-        assert!(error.contains("not marked"), "{error}");
-        assert!(error.contains("ships instead of stopping"), "{error}");
-        assert!(
-            child.is_running(),
-            "the signal was caught, not fatal: {error}"
-        );
-
-        child.release_the_hook();
-        let output = child.finish();
-        assert_eq!(output.status.signal(), None, "{output:?}");
-        assert_eq!(output.status.code(), Some(0), "{output:?}");
-
-        let hooks = fixture.hook_results();
-        eprintln!("hook_run results: {hooks:?}");
+    fn state_stage_is_written_only_by_transition_and_the_code_loop_back() {
+        // Controls: any receiver name counts; comments, `spec.stage`, a
+        // comparison, a match arm and a `let stage` local do not.
+        let planted = "fn planted() {\n    persisted.stage = Stage::Plan;\n}\n";
         assert_eq!(
-            hooks,
-            ["Merge", "VersionBump", "ChangelogAppend", "BranchCleanup"]
-                .map(|hook| (hook.to_string(), true)),
-            "every hook of the pass ran to the end"
+            stage_writes_in("planted.rs", planted),
+            vec![StageWrite {
+                file: "planted.rs".to_string(),
+                line: 2,
+                function: "planted".to_string(),
+                receiver: "persisted".to_string(),
+            }]
         );
-        assert!(fixture.develop_has_the_feature());
-        let new_tags = fixture.new_tags();
-        eprintln!("new tags: {new_tags:?}");
-        assert_eq!(new_tags.len(), 1, "exactly one new tag: {new_tags:?}");
-        assert_eq!(
-            new_tags[0].strip_prefix('v'),
-            Some(fixture.newest_changelog_version().as_str()),
-            "the changelog names the tag's version"
-        );
-        assert!(
-            !fixture.git_succeeds(&[
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                &format!("refs/heads/{}", fixture.branch),
-            ]),
-            "the feature branch is gone"
-        );
-        assert_eq!(events_named(&root, "workflow_shipped").len(), 1);
-        assert_eq!(events_named(&root, "workflow_finished").len(), 1);
-        assert!(events_named(&root, "advance_stopped").is_empty());
-        assert!(matches!(
-            workflow::load_state(&root, phase),
-            Err(workflow::WorkflowError::MissingState(_))
-        ));
-
-        // Part 2, the control: without the handler the same signal cuts the merge.
-        let fixture = MidMergeFixture::new(NO_HANDLER_PHASE);
-        let mut child = fixture.spawn_child_paused_in_merge(NAME, MID_MERGE_NO_HANDLER);
-        assert!(devflow_core::agent::terminate(child.pid()));
-        let started = std::time::Instant::now();
-        while child.is_running() {
-            assert!(
-                started.elapsed() < MID_MERGE_STEP,
-                "a holder without the handler must die by the signal"
+        for control in [
+            "    // state.stage = to\n",
+            "    spec.stage = a;\n",
+            "    if a.stage == b {}\n",
+            "    x if x != state.stage => {}\n",
+            "    let stage = Stage::Code;\n",
+        ] {
+            assert_eq!(
+                stage_writes_in("control.rs", control),
+                Vec::new(),
+                "not a stage write: {control:?}"
             );
-            std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        child.release_the_hook();
-        fixture.wait_for_the_hook_to_leave();
-        let output = child.finish();
-        eprintln!("no-handler child's status: {:?}", output.status);
-        assert_eq!(output.status.signal(), Some(libc::SIGTERM), "{output:?}");
+        // Control: the test-module split. A write after the marker is test code.
+        let with_tests = "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn t() { s.stage = x; }\n}\n";
+        assert_eq!(stage_writes_in("split.rs", with_tests), Vec::new());
+
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut writes = Vec::new();
+        for crate_src in [manifest.join("src"), manifest.join("../devflow-core/src")] {
+            for file in rust_files_under(&crate_src) {
+                let source = std::fs::read_to_string(&file).unwrap();
+                let name = file
+                    .strip_prefix(manifest)
+                    .unwrap_or(&file)
+                    .display()
+                    .to_string();
+                writes.extend(stage_writes_in(&name, &source));
+            }
+        }
+        let functions: Vec<(&str, &str)> = writes
+            .iter()
+            .map(|write| (write.file.as_str(), write.function.as_str()))
+            .collect();
         assert_eq!(
-            hook_runs(&fixture.root, "Merge"),
-            0,
-            "the child died before its Merge hook could report"
+            functions,
+            vec![
+                ("src/pipeline_gate.rs", "transition"),
+                ("src/pipeline_gate.rs", "prepare_loop_back_to_code"),
+            ],
+            "every production write of State.stage, each needing a relaunch_note clear: {writes:#?}"
         );
-        assert!(!fixture.develop_has_the_feature(), "the merge was cut");
-        assert_eq!(fixture.new_tags(), Vec::<String>::new(), "no new tag");
+    }
+
+    /// One `"workflow_finished"` literal in a file's non-test text: the file,
+    /// the function it sits in, and the text from the literal to the end of its
+    /// statement.
+    #[derive(Debug, Clone)]
+    struct FinishedSite {
+        file: String,
+        function: String,
+        payload: String,
+        constant: bool,
+    }
+
+    /// The `"workflow_finished"` literals in `source`'s non-test text: the text
+    /// before the test-module marker, or the whole file when it has none.
+    fn workflow_finished_sites(file: &str, source: &str) -> Vec<FinishedSite> {
+        const TEST_MODULE_MARKER: &str = "\n#[cfg(test)]\nmod tests {";
+        let literal = concat!("\"workflow", "_finished\"");
+        let non_test = source
+            .find(TEST_MODULE_MARKER)
+            .map_or(source, |at| &source[..at]);
+        let mut sites = Vec::new();
+        let mut from = 0;
+        while let Some(offset) = non_test[from..].find(literal) {
+            let at = from + offset;
+            from = at + literal.len();
+            let before = &non_test[..at];
+            let function = before
+                .rmatch_indices("fn ")
+                .find_map(|(index, _)| {
+                    let name: String = before[index + 3..]
+                        .chars()
+                        .take_while(|character| character.is_alphanumeric() || *character == '_')
+                        .collect();
+                    let boundary = index == 0
+                        || !before.as_bytes()[index - 1].is_ascii_alphanumeric()
+                            && before.as_bytes()[index - 1] != b'_';
+                    (boundary && !name.is_empty()).then_some(name)
+                })
+                .unwrap_or_default();
+            let line_start = before.rfind('\n').map_or(0, |index| index + 1);
+            let line = &before[line_start..];
+            let constant = ["const ", "static "]
+                .iter()
+                .any(|keyword| line.contains(keyword));
+            let rest = &non_test[at..];
+            let payload = rest[..rest.find(");").unwrap_or(rest.len())].to_string();
+            sites.push(FinishedSite {
+                file: file.to_string(),
+                function,
+                payload,
+                constant,
+            });
+        }
+        sites
+    }
+
+    /// Why `sites` breaks the rule, or nothing when exactly two sites exist,
+    /// both in `pipeline_gate.rs`: `finish_run` with reason `finished` and
+    /// `transition` with reason `stopped_at`, and no constant names the event.
+    fn workflow_finished_violations(sites: &[FinishedSite]) -> Vec<String> {
+        let mut violations: Vec<String> = sites
+            .iter()
+            .filter(|site| site.constant)
+            .map(|site| format!("a constant names the event: {site:?}"))
+            .collect();
+        let allowed = |site: &FinishedSite| {
+            site.file.ends_with("pipeline_gate.rs")
+                && ((site.function == "finish_run"
+                    && site.payload.contains(r#""reason": "finished""#))
+                    || (site.function == "transition"
+                        && site.payload.contains(r#""reason": "stopped_at""#)))
+        };
+        violations.extend(
+            sites.iter().filter(|site| !allowed(site)).map(|site| {
+                format!("an emission outside finish_run and the --until halt: {site:?}")
+            }),
+        );
+        let functions: std::collections::BTreeSet<&str> =
+            sites.iter().map(|site| site.function.as_str()).collect();
+        if sites.len() != 2 || functions != ["finish_run", "transition"].into_iter().collect() {
+            violations.push(format!(
+                "expected exactly two sites (finish_run, transition), found {}: {sites:?}",
+                sites.len()
+            ));
+        }
+        violations
+    }
+
+    /// Every `.rs` file under `dir`, recursively, as (path, text).
+    fn rust_sources(dir: &std::path::Path) -> Vec<(String, String)> {
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(dir).expect("read a source dir").flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                files.extend(rust_sources(&path));
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                files.push((
+                    path.display().to_string(),
+                    std::fs::read_to_string(&path).expect("read a source file"),
+                ));
+            }
+        }
+        files
+    }
+
+    /// D-45 rule 1 beside D-29: outside test code in both crates' `src/`, the
+    /// `"workflow_finished"` literal occurs exactly twice, both in
+    /// `pipeline_gate.rs`: in `finish_run` (reason `finished`) and in
+    /// `transition`'s `--until` halt (reason `stopped_at`). The tree is walked at
+    /// test time, so a new file is covered. Controls in the same test: a planted
+    /// third emission in another function and a planted constant naming the
+    /// event each report a violation; and since the real tree must yield exactly
+    /// two sites, a walk that reads no file fails too.
+    #[test]
+    fn workflow_finished_is_emitted_only_by_finish_run_and_the_until_halt() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut sites = Vec::new();
+        for dir in [manifest.join("src"), manifest.join("../devflow-core/src")] {
+            for (file, source) in rust_sources(&dir) {
+                sites.extend(workflow_finished_sites(&file, &source));
+            }
+        }
+        let violations = workflow_finished_violations(&sites);
+        assert!(violations.is_empty(), "{violations:#?}");
+
+        let emit = concat!("\"workflow", "_finished\"");
+        let planted_emit = format!(
+            "fn elsewhere() {{\n    events::emit(root, phase, {emit}, json!({{ \"reason\": \"finished\" }}));\n}}\n"
+        );
+        let mut with_third = sites.clone();
+        with_third.extend(workflow_finished_sites(
+            "src/pipeline_gate.rs",
+            &planted_emit,
+        ));
+        assert!(
+            !workflow_finished_violations(&with_third).is_empty(),
+            "control: a third emission site is a violation"
+        );
+        let planted_const = format!("const EVENT: &str = {emit};\n");
+        let mut with_const = sites.clone();
+        with_const.extend(workflow_finished_sites(
+            "src/pipeline_launch.rs",
+            &planted_const,
+        ));
+        assert!(
+            !workflow_finished_violations(&with_const).is_empty(),
+            "control: a constant naming the event is a violation"
+        );
+        assert!(
+            !workflow_finished_violations(&[]).is_empty(),
+            "control: a walk that read no file is a violation"
+        );
+    }
+
+    /// A permit through the one finish check, over evidence that passes it:
+    /// GSD's `passed` with the Validate PASS on HEAD over a clean tree.
+    fn test_permit() -> FinishPermit {
+        let evidence = crate::pipeline_outcomes::Evidence {
+            read: Ok(devflow_core::gsd_reader::StatusReport {
+                status: devflow_core::gsd_reader::GsdStatus::Passed,
+                route: String::new(),
+                next_action: None,
+                moved_files: Vec::new(),
+            }),
+            agent_pass_on_head: true,
+            no_pass_cause: None,
+        };
+        crate::pipeline_outcomes::can_finish(&evidence).expect("the evidence passes can_finish")
+    }
+
+    /// A rate-limit gate file for phase 1's Code stage, recording `not_before`.
+    fn rate_limit_gate(not_before: Option<i64>) -> GateFile {
+        GateFile {
+            phase: PhaseId::new(1),
+            stage: Stage::Code,
+            context: String::new(),
+            timestamp: String::new(),
+            gate_id: "g".to_string(),
+            gate_kind: Some(GateKind::RateLimit),
+            gsd_status: None,
+            not_before,
+        }
+    }
+
+    /// D-45 rule 5, U8, D-27.2: the armed timer wakes at the gate's not-before
+    /// time (reset + margin) whatever the gate timeout, and the gate's lifetime
+    /// is the later of the timeout and that wake. The per-poll choice returns a
+    /// due wake before it looks at the lifetime, so at equal deadlines the wake
+    /// wins. Controls: a spent flag arms nothing (the lifetime is unchanged),
+    /// and with no armed wake the same `now` returns the lifetime, so the
+    /// wake-first row is one that can fail.
+    #[test]
+    fn the_timer_wakes_at_reset_plus_margin_whatever_the_gate_timeout() {
+        const OPENED_AT: i64 = 1_800_000_000;
+        const GATE_TIMEOUT: u64 = 600;
+        let timeout_end = OPENED_AT + 600;
+        let margin = reset_time::RATE_LIMIT_RELAUNCH_MARGIN_SECS;
+        let state = State::new(
+            PhaseId::new(1),
+            AgentKind::Claude,
+            Mode::Supervise,
+            std::path::PathBuf::from("/nonexistent"),
+        );
+        assert!(!state.rate_limit_auto_relaunch_used);
+
+        // A reset earlier than the gate timeout: the wake is the not-before
+        // time, the lifetime is the gate timeout.
+        let early = OPENED_AT + 30;
+        let gate = rate_limit_gate(Some(early));
+        assert_eq!(rate_limit_timer_deadline(&state, &gate), Some(early));
+        assert_eq!(
+            reset_time::rate_limit_wait_bound(OPENED_AT, early - margin, GATE_TIMEOUT),
+            GATE_TIMEOUT
+        );
+        assert_eq!(
+            gate_lifetime_deadline(OPENED_AT, &gate, GATE_TIMEOUT),
+            timeout_end
+        );
+        assert_eq!(
+            due_gate_deadline(early, Some(early), timeout_end),
+            Some(DueDeadline::Wake),
+            "the wake comes at the reset, not when the gate timeout ends"
+        );
+
+        // A reset later than the gate timeout: both are the not-before time.
+        let late = OPENED_AT + 7200;
+        let gate = rate_limit_gate(Some(late));
+        assert_eq!(rate_limit_timer_deadline(&state, &gate), Some(late));
+        let lifetime = gate_lifetime_deadline(OPENED_AT, &gate, GATE_TIMEOUT);
+        assert_eq!(lifetime, late);
+
+        // U8: at a `now` equal to both, the wake wins; before both, neither.
+        assert_eq!(
+            due_gate_deadline(late, Some(late), lifetime),
+            Some(DueDeadline::Wake)
+        );
+        assert_eq!(due_gate_deadline(late - 1, Some(late), lifetime), None);
+        // Control: at the same `now` with no armed wake, the lifetime.
+        assert_eq!(
+            due_gate_deadline(late, None, lifetime),
+            Some(DueDeadline::Lifetime)
+        );
+
+        // A spent flag arms nothing; the lifetime is unchanged.
+        let mut spent = state.clone();
+        spent.rate_limit_auto_relaunch_used = true;
+        assert_eq!(rate_limit_timer_deadline(&spent, &gate), None);
+        assert_eq!(gate_lifetime_deadline(OPENED_AT, &gate, GATE_TIMEOUT), late);
+
+        // Neither a gate with no reset time nor another kind arms a timer, and
+        // another kind's lifetime is the plain gate timeout.
+        assert_eq!(
+            rate_limit_timer_deadline(&state, &rate_limit_gate(None)),
+            None
+        );
+        let mut other = rate_limit_gate(Some(early));
+        other.gate_kind = Some(GateKind::StageFailure);
+        assert_eq!(rate_limit_timer_deadline(&state, &other), None);
+        let mut other_late = rate_limit_gate(Some(late));
+        other_late.gate_kind = Some(GateKind::StageFailure);
+        assert_eq!(
+            gate_lifetime_deadline(OPENED_AT, &other_late, GATE_TIMEOUT),
+            timeout_end
+        );
     }
 }

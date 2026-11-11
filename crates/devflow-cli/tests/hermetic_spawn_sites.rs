@@ -15,13 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Suites migrated to the hermetic builder whose spawn sites this scan pins.
-const HERMETIC_SUITES: &[&str] = &[
-    "auto_chain_flag_e2e.rs",
-    "yes_ship_config.rs",
-    "release_check.rs",
-    "reap_strays_e2e.rs",
-    "help_snapshot.rs",
-];
+const HERMETIC_SUITES: &[&str] = &["auto_chain_flag_e2e.rs", "help_snapshot.rs"];
 
 /// The only files under `tests/` (paths relative to it, `/`-separated) whose
 /// code may name the binary's env var. `common/mod.rs` is the one legitimate

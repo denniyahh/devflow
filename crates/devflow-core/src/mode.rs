@@ -3,11 +3,12 @@
 //! Mode is a per-session CLI flag on `devflow start` — there is no config file
 //! and no per-phase toggling.
 //!
-//! - **Auto:** Define and Plan run once. Code ↔ Validate auto-loop until clean.
-//!   Then Ship. The only human gate is at Ship — unless Validate fails
-//!   [`MAX_CONSECUTIVE_FAILURES`] times in a row, which forces a gate.
+//! - **Auto:** Plan runs once. Code ↔ Validate auto-loop until clean,
+//!   and a passing Validate finishes the run. No human gate fires unless
+//!   Validate fails [`MAX_CONSECUTIVE_FAILURES`] times in a row, which forces a
+//!   gate.
 //! - **Supervise:** Same pipeline, but Validate always fires a gate to Hermes →
-//!   Human before advancing to Ship.
+//!   Human before the run finishes.
 
 use crate::stage::Stage;
 use serde::{Deserialize, Serialize};
@@ -24,11 +25,11 @@ pub const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 /// **Why it sits meaningfully above [`MAX_CONSECUTIVE_FAILURES`] (3).** This
 /// is a backstop for the case where the streak keeps resetting, not a
 /// competing primary bound. `consecutive_failures` is cleared whenever
-/// [`consecutive_failures_made_progress`] reports new commits, and the Code
-/// stage's fix command is a GSD command that routinely commits `.planning/`
-/// artifacts even when no source changed — so "commits something trivial
-/// every cycle" is the ORDINARY behaviour of the thing in that slot. A phase
-/// in that state never reaches the streak ceiling. Setting this one low
+/// [`consecutive_failures_made_progress`] reports new commits. Since 52-27
+/// (D-34) only commits that change a path outside `.planning/` count, so the
+/// GSD fix command's own `.planning/` artifacts no longer reset the streak,
+/// but an agent that commits a trivial source change every cycle still does.
+/// A phase in that state never reaches the streak ceiling. Setting this one low
 /// enough to compete would make the coarser signal primary and change when
 /// ordinary, genuinely-converging runs gate; ten leaves the streak ceiling
 /// the first thing a stuck loop meets, and catches only the loops the streak
@@ -127,7 +128,7 @@ const _: () = assert!(MAX_CHECKPOINT_RESUMES > 0 && MAX_CHECKPOINT_RESUMES <= MA
 /// [`MAX_CONSECUTIVE_FAILURES`] — the ceiling that exists specifically to
 /// bound this loop — is unreachable (18d). Every other transition is
 /// genuine forward progress out of the Code↔Validate loop (or the initial
-/// Define→Plan→Code entry into it) and correctly clears the counter.
+/// Plan→Code entry into it) and correctly clears the counter.
 ///
 /// This rule deliberately does NOT apply to
 /// [`crate::state::State::infra_failures`], whose unconditional reset in
@@ -139,8 +140,30 @@ const _: () = assert!(MAX_CHECKPOINT_RESUMES > 0 && MAX_CHECKPOINT_RESUMES <= MA
 /// `infra_failures` would silently convert [`MAX_INFRA_FAILURES`] from a
 /// stuck-loop bound into a phase-lifetime bound — the exact regression
 /// 17-06 was written to prevent.
-pub fn transition_resets_consecutive_failures(from: Stage, to: Stage) -> bool {
-    !matches!((from, to), (Stage::Code, Stage::Validate))
+///
+/// **A gap-closure pass keeps the streak too (D-25, GATE-03).** With
+/// `gap_closure_pass` set ([`crate::state::State::gap_closure_pass`]), a
+/// `gaps_found` Validate goes back through Plan (`--gaps`) and Code
+/// (`--gaps-only`) before the next Validate, so Validate→Plan and Plan→Code are
+/// hops of the same retry loop and do not reset it either; otherwise three
+/// gap rounds could never reach [`MAX_CONSECUTIVE_FAILURES`]. `gap_closure_pass`
+/// is the marker as the transition leaves it: the move from Validate to Plan
+/// sets it in the same write.
+///
+/// # Changed in 4.0.0 — breaking
+///
+/// The `gap_closure_pass` parameter is new; a caller outside a gap-closure
+/// pass passes `false` and gets the old answer.
+pub fn transition_resets_consecutive_failures(
+    from: Stage,
+    to: Stage,
+    gap_closure_pass: bool,
+) -> bool {
+    match (from, to) {
+        (Stage::Code, Stage::Validate) => false,
+        (Stage::Validate, Stage::Plan) | (Stage::Plan, Stage::Code) => !gap_closure_pass,
+        _ => true,
+    }
 }
 
 /// Whether a Validate failure represents forward progress since the last
@@ -211,9 +234,10 @@ pub fn phase_failure_ceiling_reached(phase_validate_failures: u32) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
-    /// Run the pipeline without human gates until Ship (or repeated failure).
+    /// Run the pipeline without human gates to a passing Validate (or repeated
+    /// failure).
     Auto,
-    /// Fire a Validate gate to Hermes → Human before Ship.
+    /// Fire a Validate gate to Hermes → Human before the run finishes.
     Supervise,
 }
 
@@ -222,7 +246,6 @@ impl Mode {
     /// failures have already occurred this session and how many Validate
     /// failures have been recorded for this PHASE in total.
     ///
-    /// - Ship always gates (both modes).
     /// - Validate gates in EITHER mode once the per-phase total reaches
     ///   [`MAX_PHASE_VALIDATE_FAILURES`] (999.78/D-07) — evaluated ahead of
     ///   the per-mode match, so it gates in Auto and is a harmless no-op in
@@ -247,7 +270,6 @@ impl Mode {
         phase_validate_failures: u32,
     ) -> bool {
         match stage {
-            Stage::Ship => true,
             Stage::Validate => {
                 phase_failure_ceiling_reached(phase_validate_failures)
                     || match self {
@@ -326,14 +348,8 @@ mod tests {
     }
 
     #[test]
-    fn ship_always_gates_in_both_modes() {
-        assert!(Mode::Auto.should_gate(Stage::Ship, 0, 0));
-        assert!(Mode::Supervise.should_gate(Stage::Ship, 0, 0));
-    }
-
-    #[test]
     fn non_gate_stages_never_gate() {
-        for stage in [Stage::Define, Stage::Plan, Stage::Code] {
+        for stage in [Stage::Plan, Stage::Code] {
             assert!(!Mode::Auto.should_gate(stage, 99, 99));
             assert!(!Mode::Supervise.should_gate(stage, 99, 99));
         }
@@ -405,7 +421,8 @@ mod tests {
     fn consecutive_reset_skips_the_code_to_validate_hop() {
         assert!(!transition_resets_consecutive_failures(
             Stage::Code,
-            Stage::Validate
+            Stage::Validate,
+            false
         ));
     }
 
@@ -415,17 +432,35 @@ mod tests {
         // future Stage variant added to the linear chain doesn't silently
         // fall through un-asserted.
         assert!(transition_resets_consecutive_failures(
-            Stage::Define,
-            Stage::Plan
-        ));
-        assert!(transition_resets_consecutive_failures(
             Stage::Plan,
-            Stage::Code
+            Stage::Code,
+            false
         ));
-        assert!(transition_resets_consecutive_failures(
-            Stage::Validate,
-            Stage::Ship
-        ));
+    }
+
+    /// D-12: no new cap. The two failure ceilings keep their values, pinned at
+    /// compile time (a runtime assertion on constants cannot fail at runtime).
+    const _: () = assert!(MAX_CONSECUTIVE_FAILURES == 3 && MAX_PHASE_VALIDATE_FAILURES == 10);
+
+    /// D-25: a gap-closure pass keeps the consecutive-failure streak across
+    /// Validate→Plan and Plan→Code, as every pass does across Code→Validate.
+    /// Without the marker, Plan→Code still resets it.
+    #[test]
+    fn a_gap_closure_pass_keeps_the_failure_streak() {
+        for (from, to) in [
+            (Stage::Validate, Stage::Plan),
+            (Stage::Plan, Stage::Code),
+            (Stage::Code, Stage::Validate),
+        ] {
+            assert!(
+                !transition_resets_consecutive_failures(from, to, true),
+                "{from} -> {to} inside a gap-closure pass keeps the streak"
+            );
+        }
+        assert!(
+            transition_resets_consecutive_failures(Stage::Plan, Stage::Code, false),
+            "control: outside a gap-closure pass Plan -> Code resets the streak"
+        );
     }
 
     #[test]

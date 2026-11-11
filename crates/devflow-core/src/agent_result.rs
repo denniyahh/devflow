@@ -2340,13 +2340,16 @@ const MAX_CAUSE_TEXT_CHARS: usize = 160;
 ///
 /// Derivation (cross-plan contract with 51-05, whose torn-final-line segment
 /// is the clause's first segment, inside this same cap):
-/// `render_gate_context(.., 300)` keeps the first 261 characters of a longer
-/// text (300 minus its 39-character truncation suffix). That happens twice: in
-/// `truncate_reason`, to the reason, and in the pending-gate banner, to the
-/// whole gate context, where the longest prefix,
-/// `[never-silent] stage validate failed: `, takes 38, leaving 223 for the
-/// reason. `idle timeout (` (14) + 200 + `): ` (3) = 217 ≤ 223, so the clause
-/// closes inside both renderings for any cause within the field bounds.
+/// `render_gate_context(.., max)` keeps the first `max - 39` characters of a
+/// longer text (39 is its truncation suffix). That happens twice: in
+/// `truncate_reason` (max 4096, the CLI's stored bound), to the reason, which
+/// keeps 4057 characters; and in the pending-gate banner and `gate list` (max
+/// 450, the CLI's display bound), to the whole gate context, which keeps 411.
+/// There the longest prefix, `[never-silent] `, the Validate stage-failure
+/// gate's way-on sentence and `stage validate failed: `, takes 171, leaving 240
+/// for the reason. `idle timeout (` (14) + 200 + `): ` (3) = 217 ≤ 240 (and ≤
+/// 4057), so the clause closes inside both renderings for any cause within the
+/// field bounds.
 /// Public so the CLI can pin this budget to its display bound in a test.
 pub const MAX_IDLE_TIMEOUT_CLAUSE_CHARS: usize = 200;
 
@@ -2860,6 +2863,38 @@ pub fn phase_commit_count(
     git_flow: &GitFlowConfig,
     phase: PhaseId,
 ) -> Option<u32> {
+    phase_commit_count_in(project_root, git_flow, phase, &[])
+}
+
+/// The pathspec that limits [`phase_source_commit_count`] to commits changing
+/// a path outside `.planning/`.
+const OUTSIDE_PLANNING: [&str; 3] = ["--", ".", ":(exclude).planning"];
+
+/// [`phase_commit_count`], counting only the commits that change at least one
+/// path outside `.planning/` (D-34, 52-27): the progress signal for the
+/// consecutive-failure streak. A GSD fix or gap-closure command commits
+/// `.planning/` artifacts on every round, whether or not any source changed, so
+/// those commits are not progress.
+///
+/// Same `Option` contract as [`phase_commit_count`]: `None` only when no count
+/// was established (git could not run, or its output did not parse), never a
+/// made-up zero. Same reach too: a commit that changes any source file counts,
+/// however trivial the change.
+pub fn phase_source_commit_count(
+    project_root: &Path,
+    git_flow: &GitFlowConfig,
+    phase: PhaseId,
+) -> Option<u32> {
+    phase_commit_count_in(project_root, git_flow, phase, &OUTSIDE_PLANNING)
+}
+
+/// [`phase_commit_count`]'s body, with `pathspec` appended to its `rev-list`.
+fn phase_commit_count_in(
+    project_root: &Path,
+    git_flow: &GitFlowConfig,
+    phase: PhaseId,
+    pathspec: &[&str],
+) -> Option<u32> {
     let branch = format!("{}phase-{}", git_flow.feature_prefix, phase.padded());
 
     // A-06: split on whether the command RAN, not on what it answered. An
@@ -2887,6 +2922,7 @@ pub fn phase_commit_count(
     // make; it belongs with the branch-absent case above as a real zero.
     let output = match git_command(project_root)
         .args(["rev-list", "--count", &range])
+        .args(pathspec)
         .output()
     {
         Err(_) => return None,
@@ -2909,8 +2945,8 @@ pub fn phase_commit_count(
 ///
 /// The commit-count gate ("no commits → failed") is scoped to `stage` — it
 /// only applies to `Stage::Plan`/`Stage::Code` (checked via an explicit
-/// `matches!`, NOT `Stage::is_agent_stage()`, since that also includes
-/// `Define`, which legitimately produces zero commits). `exit≠0` is ALWAYS
+/// `matches!`, NOT `Stage::is_agent_stage()`, so a future agent stage that
+/// legitimately produces zero commits is not swept in). `exit≠0` is ALWAYS
 /// `Failed`, for every stage — only the `exit=0`/zero-commits branch is
 /// stage-scoped.
 ///
@@ -2920,7 +2956,7 @@ pub fn phase_commit_count(
 ///   exit≠0 (excluding 137/127)                           → Failed (ALL stages)
 ///   exit=0, stage in {Plan, Code}, commits=0             → Failed ("no work done")
 ///   exit=0, stage in {Plan, Code}, commits>0             → Success
-///   exit=0, stage NOT in {Plan, Code} (Define/Validate/Ship), commits=0 → Success
+///   exit=0, stage NOT in {Plan, Code} (Validate), commits=0 → Success
 ///           (not commit-gated; Validate's real pass signal is its verdict,
 ///           not a bare zero-commit — see Task 2's turn.completed deferral)
 ///   exit unknown                                         → fall to Layer 3 (return None)
@@ -3804,12 +3840,8 @@ pub fn phase_verification_exists(evidence_root: &Path, phase: PhaseId) -> bool {
 /// The `{phase:02}-VERIFICATION.md` artifact's path under `evidence_root`, or
 /// `None` when no phase directory carries one.
 ///
-/// Extracted from [`phase_verification_exists`] (999.79, 35-05) so the
-/// existence probe and the content fingerprint below scan for the artifact in
-/// exactly ONE place. Duplicating the prefix scan would let the two answer
-/// about different files after any future change to the directory layout — and
-/// the freshness rule is only sound while "does it exist" and "what are its
-/// bytes" are questions about the same path.
+/// Extracted from [`phase_verification_exists`] (999.79, 35-05), so the prefix
+/// scan for the artifact lives in exactly ONE place.
 ///
 /// `evidence_root` carries the same meaning and the same prohibition as it does
 /// for [`phase_verification_exists`]: it is the root the Validate agent
@@ -3832,87 +3864,6 @@ fn phase_verification_path(evidence_root: &Path, phase: PhaseId) -> Option<PathB
         }
     }
     None
-}
-
-/// A content fingerprint of the phase's `{phase:02}-VERIFICATION.md`, or `None`
-/// when no such artifact exists under `evidence_root` (999.79, 35-05).
-///
-/// **What it is for.** Nothing deletes, dates or invalidates the artifact, and
-/// `devflow start --phase N --force` checks out a branch that still carries the
-/// PREVIOUS run's committed copy. That re-run is mid-arc by construction, so its
-/// first Validate failure would find the stale artifact, read it as a verdict,
-/// and dispatch a `--gaps-only` pass against zero matching plans — gating
-/// unresolvably. Comparing this value against the one recorded at the start of
-/// the run distinguishes "the Validate agent authored this during this run"
-/// from "this was inherited".
-///
-/// **Why the algorithm is written out rather than borrowed from `std`.** This
-/// value is persisted by one process (`devflow start`) and compared by a later
-/// one (`devflow advance`), so it must mean the same thing in both.
-/// `std::collections::hash_map::DefaultHasher` explicitly does NOT guarantee a
-/// stable output across toolchain versions, so an operator who upgraded Rust
-/// mid-phase would see every artifact read as "changed" — which is the
-/// fail-OPEN direction, dispatching gaps-only exactly where a full execute was
-/// correct. This is FNV-1a/64, fixed by these two constants and nothing else.
-///
-/// **No security property is claimed.** This is change detection over a
-/// planning document that is already committed to the repository. It is not
-/// collision-resistant and must never be used to authenticate anything; an
-/// adversary who can write the artifact can already write whatever verdict they
-/// like into it.
-///
-/// # Companion: [`phase_verification_mtime_nanos`]
-///
-/// Content alone cannot see an IDEMPOTENT rewrite (WR-06, 35-REVIEW): a
-/// Validate agent that re-authors byte-identical content on a later cycle
-/// produces the same fingerprint as an artifact nobody touched, and the
-/// consumer then classifies its own agent's work as inherited. The mtime is
-/// the second input that separates "unchanged because inherited" from
-/// "unchanged because idempotent"; it is read from the same resolved path and
-/// returns `None` on exactly the same "no artifact" condition, so the two are
-/// always consistent about whether an artifact exists.
-pub fn phase_verification_fingerprint(evidence_root: &Path, phase: PhaseId) -> Option<u64> {
-    let path = phase_verification_path(evidence_root, phase)?;
-    let bytes = std::fs::read(path).ok()?;
-    // FNV-1a, 64-bit: offset basis and prime are the published constants.
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in bytes {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    Some(hash)
-}
-
-/// The mtime of the same `{phase:02}-VERIFICATION.md`
-/// [`phase_verification_fingerprint`] hashes, in nanoseconds since the Unix
-/// epoch, or `None` when no such artifact exists under `evidence_root`.
-///
-/// WR-06 (35-REVIEW): the second input the freshness rule needs. A content
-/// fingerprint cannot see an IDEMPOTENT rewrite — a Validate agent that
-/// re-authors byte-identical content on a later cycle produces the same hash as
-/// an artifact nobody touched — so a hash-only rule classifies its own agent's
-/// work as inherited and re-runs every plan in the phase from then on. An
-/// inherited file's mtime does not advance during a run; a rewritten one's
-/// does, whatever the bytes say.
-///
-/// Resolved through the same [`phase_verification_path`] and returning `None`
-/// on the same "no artifact" condition, so the two readings can never disagree
-/// about whether the artifact exists.
-///
-/// **This is not provenance either.** Any writer advances an mtime, so the
-/// limitation the fingerprint's doc comment records — a mid-run branch switch
-/// or an operator edit reading as authored-this-run — is not closed by this and
-/// is marginally widened by it: a checkout restoring byte-identical content
-/// used to read as inherited and now reads as authored. That is accepted
-/// deliberately, because the case it fixes (a deterministic verification writer
-/// on cycle 2 of an unresolved gap) is ordinary rather than exotic.
-pub fn phase_verification_mtime_nanos(evidence_root: &Path, phase: PhaseId) -> Option<u64> {
-    let path = phase_verification_path(evidence_root, phase)?;
-    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
-    let since_epoch = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
-    // `as` would silently wrap past year 2554; a `None` here degrades to the
-    // content-only comparison, which is the pre-WR-06 behaviour.
-    u64::try_from(since_epoch.as_nanos()).ok()
 }
 
 /// Keep only the newest `retain` capture generations under `history_dir`,
@@ -4149,6 +4100,9 @@ mod tests {
         let fix_prompt = crate::prompt::render_claude_style(&StageIntent::Code {
             phase,
             fix: Some(FixType::FullExecute),
+            fix_note: None,
+            relaunch_note: None,
+            reverify_report: None,
         });
         for prompt in [&resume_prompt, &fix_prompt] {
             assert!(prompt.ends_with(crate::prompt::COMPLETION_PROTOCOL));
@@ -8339,7 +8293,7 @@ mod tests {
 
     /// D-05 gap 2 (17-03): a declared, operator-approved external
     /// post-condition whose probe passes is affirmative Success evidence on
-    /// its own — even with zero commits and on a non-Code stage (Define
+    /// its own — even with zero commits and on a non-Code stage (Plan
     /// here). No agent stdout is written at all, so if Layer 0 did not
     /// short-circuit, there would be nothing for Layer 1 to find and Layer 2
     /// would fall through for lack of an exit-code file.
@@ -8355,7 +8309,7 @@ mod tests {
         .unwrap();
         std::fs::write(dir.path().join("shipped"), "done").unwrap();
         let mut state = state_in(dir.path(), PhaseId::new(16));
-        state.stage = Stage::Define;
+        state.stage = Stage::Plan;
 
         let approval = vec!["test -f shipped".to_string()];
         let result = evaluate_agent_result_inner(
@@ -8779,7 +8733,7 @@ mod tests {
         .unwrap();
         std::fs::write(dir.path().join("passing-artifact"), "done").unwrap();
         let mut state = state_in(dir.path(), PhaseId::new(16));
-        state.stage = Stage::Define;
+        state.stage = Stage::Plan;
 
         let approval = vec![
             "test -f passing-artifact".to_string(),
@@ -9680,6 +9634,60 @@ mod tests {
         );
     }
 
+    /// D-34: only commits that change a path outside `.planning/` count. Two
+    /// commits touching only `.planning/` and one touching `src/x.rs` on the
+    /// phase branch count 1, where `phase_commit_count` (the control, same
+    /// repository) counts all 3; a git that cannot run is `None`.
+    #[test]
+    fn phase_source_commit_count_ignores_planning_only_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(4627);
+        git(root, &["init"]);
+        git(root, &["config", "user.email", "devflow@example.com"]);
+        git(root, &["config", "user.name", "DevFlow Tests"]);
+        git(root, &["config", "commit.gpgsign", "false"]);
+        git(root, &["config", "tag.gpgsign", "false"]);
+        git(root, &["config", "core.hooksPath", "/dev/null"]);
+        git(root, &["checkout", "-b", "develop"]);
+        std::fs::write(root.join("README.md"), "base\n").unwrap();
+        git(root, &["add", "README.md"]);
+        git(root, &["commit", "-m", "base"]);
+        git(
+            root,
+            &[
+                "checkout",
+                "-b",
+                &format!("feature/phase-{}", phase.padded()),
+            ],
+        );
+        std::fs::create_dir_all(root.join(".planning/phases/x")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        for (path, label) in [
+            (".planning/phases/x/01-PLAN.md", "plan"),
+            (".planning/STATE.md", "state"),
+            ("src/x.rs", "source"),
+        ] {
+            std::fs::write(root.join(path), label).unwrap();
+            git(root, &["add", path]);
+            git(root, &["commit", "-m", label]);
+        }
+        let flow = GitFlowConfig::default();
+
+        assert_eq!(phase_source_commit_count(root, &flow, phase), Some(1));
+        assert_eq!(
+            phase_commit_count(root, &flow, phase),
+            Some(3),
+            "control: the plain count sees every commit"
+        );
+        let unspawnable = root.join("this-directory-does-not-exist");
+        assert_eq!(
+            phase_source_commit_count(&unspawnable, &flow, phase),
+            None,
+            "a git that cannot run is not a measured zero"
+        );
+    }
+
     /// The paired opposite-result case for
     /// `phase_commit_count_reports_zero_without_a_branch` directly above, and
     /// the pair is what makes either one mean anything (NC-4).
@@ -9889,21 +9897,15 @@ mod tests {
 
     #[test]
     fn layer2_nonzero_exit_is_failed_all_stages() {
-        // Non-zero exit is Failed regardless of stage — including Define and
-        // Validate, which are exempt from the zero-commit gate but NOT from
-        // the exit-code check.
+        // Non-zero exit is Failed regardless of stage — including Validate,
+        // which is exempt from the zero-commit gate but NOT from the
+        // exit-code check.
         let dir = tempfile::tempdir().unwrap();
         init_repo_with_feature_no_commit(dir.path(), PhaseId::new(10));
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
         std::fs::write(exit_code_path(dir.path(), PhaseId::new(10)), "1").unwrap();
 
-        for stage in [
-            Stage::Define,
-            Stage::Plan,
-            Stage::Code,
-            Stage::Validate,
-            Stage::Ship,
-        ] {
+        for stage in [Stage::Plan, Stage::Code, Stage::Validate] {
             let result = evaluate_layer2(
                 dir.path(),
                 PhaseId::new(10),
@@ -9921,27 +9923,25 @@ mod tests {
     }
 
     #[test]
-    fn layer2_skips_commit_gate_for_define_and_validate() {
+    fn layer2_skips_commit_gate_for_validate() {
         let dir = tempfile::tempdir().unwrap();
         init_repo_with_feature_no_commit(dir.path(), PhaseId::new(11));
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
         std::fs::write(exit_code_path(dir.path(), PhaseId::new(11)), "0").unwrap();
 
-        for stage in [Stage::Define, Stage::Validate] {
-            let result = evaluate_layer2(
-                dir.path(),
-                PhaseId::new(11),
-                &GitFlowConfig::default(),
-                stage,
-            )
-            .unwrap()
-            .unwrap();
-            assert_ne!(
-                result.status,
-                AgentStatus::Failed,
-                "stage {stage:?} should not be Failed for zero commits"
-            );
-        }
+        let result = evaluate_layer2(
+            dir.path(),
+            PhaseId::new(11),
+            &GitFlowConfig::default(),
+            Stage::Validate,
+        )
+        .unwrap()
+        .unwrap();
+        assert_ne!(
+            result.status,
+            AgentStatus::Failed,
+            "Validate should not be Failed for zero commits"
+        );
 
         // Code stage with the same zero-commit inputs is still Failed
         // (existing behavior preserved).
@@ -10263,8 +10263,7 @@ mod tests {
     /// process inherited a hostile `GIT_DIR` pointed at an unrelated
     /// repository — proven with a real spawned `git` process, not by
     /// inspecting a `Command` object alone. Mirrors
-    /// `version::tests::tag_reads_resolve_caller_root_under_a_hostile_git_dir`
-    /// (27-03) and `origin_main_ancestor_status_holds_under_a_hostile_git_dir`
+    /// `origin_main_ancestor_status_holds_under_a_hostile_git_dir`
     /// (`git.rs`, 27-01): the hostile `GIT_DIR` this test's own `<verify>`
     /// entries exercise (`GIT_DIR=<hostile>/.git cargo test ... this test`)
     /// is injected the same way any inherited-env attack reaches
@@ -10400,77 +10399,6 @@ mod tests {
         );
     }
 
-    /// 999.79 (35-05): the fingerprint must be a function of the artifact's
-    /// BYTES, not of its existence.
-    ///
-    /// Both halves are required and neither is redundant. The first half
-    /// (different bytes → different values) is satisfied by any hash. The
-    /// second half (identical bytes → identical values) is what rules out a
-    /// value derived from something incidental — a timestamp, an inode, a
-    /// counter — which would make every check read "changed" and permanently
-    /// disable the gaps-only path. A constant-returning implementation fails
-    /// the first half; a nondeterministic one fails the second.
-    #[test]
-    fn phase_verification_fingerprint_differs_when_content_differs() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase_dir = root.join(".planning/phases/84-fingerprint");
-        std::fs::create_dir_all(&phase_dir).unwrap();
-        let artifact = phase_dir.join("84-VERIFICATION.md");
-
-        std::fs::write(&artifact, "verdict: gaps\n").unwrap();
-        let first = phase_verification_fingerprint(root, PhaseId::new(84))
-            .expect("an artifact that exists must produce a fingerprint");
-
-        let first_again = phase_verification_fingerprint(root, PhaseId::new(84))
-            .expect("an artifact that exists must produce a fingerprint");
-        assert_eq!(
-            first, first_again,
-            "identical bytes must produce identical fingerprints — a value that changes on \
-             its own would mark every artifact fresh forever and disable the stale check"
-        );
-
-        std::fs::write(&artifact, "verdict: pass\n").unwrap();
-        let second = phase_verification_fingerprint(root, PhaseId::new(84))
-            .expect("an artifact that exists must produce a fingerprint");
-        assert_ne!(
-            first, second,
-            "different bytes must produce different fingerprints — a constant implementation \
-             would report every re-authored artifact as unchanged"
-        );
-    }
-
-    /// 999.79 (35-05): an absent artifact yields no fingerprint, which is
-    /// distinguishable from an artifact whose content happens to hash to zero.
-    /// Both are asserted here so "absent" can never be conflated with "hashed
-    /// to the zero value".
-    #[test]
-    fn phase_verification_fingerprint_is_none_when_the_artifact_is_absent() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-
-        assert_eq!(
-            phase_verification_fingerprint(root, PhaseId::new(85)),
-            None,
-            "no .planning/phases directory at all must yield None, not panic"
-        );
-
-        let phase_dir = root.join(".planning/phases/85-fingerprint");
-        std::fs::create_dir_all(&phase_dir).unwrap();
-        assert_eq!(
-            phase_verification_fingerprint(root, PhaseId::new(85)),
-            None,
-            "a phase directory with no {{N}}-VERIFICATION.md must yield None"
-        );
-
-        std::fs::write(phase_dir.join("85-VERIFICATION.md"), "").unwrap();
-        let empty = phase_verification_fingerprint(root, PhaseId::new(85));
-        assert!(
-            empty.is_some(),
-            "an EMPTY artifact still exists and must yield Some — the control against an \
-             implementation that conflates 'absent' with 'no bytes'"
-        );
-    }
     // ------------------------------------------------------------------
     // Antigravity `stream-json` parser (phase 41, Task 1)
     // ------------------------------------------------------------------

@@ -35,13 +35,12 @@ pub struct ContractResult {
     pub passed: bool,
 }
 
-/// Per-stage interactivity requirement a driver declares (999.31 / 31c),
-/// replacing the hardcoded Codex-Define check.
+/// Per-stage interactivity requirement a driver declares (999.31 / 31c).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InteractivityMode {
     /// The stage can run headless with no pre-existing artifact or operator.
     HeadlessSafe,
-    /// The stage needs a pre-existing artifact (e.g. Codex's Define needs a
+    /// The stage needs a pre-existing artifact (e.g. Codex's Plan needs a
     /// CONTEXT.md written ahead of time — it cannot run the interactive
     /// discuss-phase interview headless).
     RequiresExistingArtifact,
@@ -149,11 +148,9 @@ fn contract_checks<D: AgentDriver + ?Sized>(driver: &D) -> Vec<ContractResult> {
         passed: !driver.name().is_empty(),
     }];
     for stage in [
-        crate::stage::Stage::Define,
         crate::stage::Stage::Plan,
         crate::stage::Stage::Code,
         crate::stage::Stage::Validate,
-        crate::stage::Stage::Ship,
     ] {
         let intent = crate::prompt::StageIntent::for_stage(stage, PhaseId::new(1));
         let prompt = driver.render_prompt(&intent);
@@ -280,8 +277,7 @@ mod tests {
     }
 
     /// 37-04: every driver passes the shared conformance suite, and Codex
-    /// declares the Define/Plan interactivity requirement that replaces the
-    /// hardcoded Codex-Define check.
+    /// declares the Plan interactivity requirement.
     #[test]
     fn every_driver_passes_the_conformance_suite() {
         let drivers: [Box<dyn AgentDriver>; 6] = [
@@ -331,8 +327,8 @@ mod tests {
         let results = antigravity.test_contract();
         assert_eq!(
             results.len(),
-            7,
-            "1 name + 5 per-stage DEVFLOW_RESULT prompts + 1 program"
+            5,
+            "1 name + 3 per-stage DEVFLOW_RESULT prompts + 1 program"
         );
         for result in &results {
             assert!(
@@ -371,8 +367,8 @@ mod tests {
         let results = hermes.test_contract();
         assert_eq!(
             results.len(),
-            7,
-            "1 name + 5 per-stage DEVFLOW_RESULT prompts + 1 program"
+            5,
+            "1 name + 3 per-stage DEVFLOW_RESULT prompts + 1 program"
         );
         for result in &results {
             assert!(
@@ -423,8 +419,8 @@ mod tests {
     }
 
     /// The workflow renderer must preserve the per-stage contracts (code-review
-    /// findings #1-5): Validate verdict, Ship review gate, Define no-op, Plan
-    /// idempotency, and a per-driver workflow root.
+    /// findings #1-5): Validate verdict, Plan idempotency, and a per-driver
+    /// workflow root.
     #[test]
     fn workflow_render_preserves_stage_contracts() {
         use crate::prompt::StageIntent;
@@ -438,16 +434,6 @@ mod tests {
         assert!(validate.contains("\"verdict\": \"pass\""));
         assert!(validate.contains("\"verdict\": \"gaps\""));
 
-        // Ship keeps the review gate (finding #2).
-        let ship = codex.render_prompt(&StageIntent::for_stage(Stage::Ship, PhaseId::new(7)));
-        assert!(ship.contains("Critical"));
-        assert!(ship.contains("review:"));
-
-        // Define is the D-14 no-op (finding #3).
-        let define = codex.render_prompt(&StageIntent::for_stage(Stage::Define, PhaseId::new(7)));
-        assert!(define.contains("must NOT run") || define.contains("do NOT run"));
-        assert!(!define.contains("discuss-phase.md"));
-
         // Plan keeps the idempotency guard (finding #3).
         let plan = codex.render_prompt(&StageIntent::for_stage(Stage::Plan, PhaseId::new(7)));
         assert!(plan.contains("already exists"));
@@ -459,11 +445,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_define_and_plan_require_an_existing_artifact() {
-        assert_eq!(
-            CodexDriver.interactivity_mode(crate::stage::Stage::Define),
-            InteractivityMode::RequiresExistingArtifact
-        );
+    fn codex_plan_requires_an_existing_artifact() {
         assert_eq!(
             CodexDriver.interactivity_mode(crate::stage::Stage::Plan),
             InteractivityMode::RequiresExistingArtifact
@@ -473,7 +455,7 @@ mod tests {
             InteractivityMode::HeadlessSafe
         );
         assert_eq!(
-            ClaudeDriver.interactivity_mode(crate::stage::Stage::Define),
+            ClaudeDriver.interactivity_mode(crate::stage::Stage::Plan),
             InteractivityMode::HeadlessSafe
         );
     }

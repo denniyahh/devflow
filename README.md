@@ -26,12 +26,12 @@ DevFlow handles all of this. You say `devflow start --phase 3 --agent claude --m
 
 > **Where the automation stops.** Steps 1–6 and 9 are automated end to end. The
 > release cut itself — opening the `develop` → `main` PR, tagging, and publishing
-> — is deliberately still manual; `devflow release --check` runs the preflight but
-> does not execute the release.
+> — is deliberately still manual; `scripts/cut-release.sh check` runs the preflight
+> but does not execute the release.
 >
 > **If you squash-merge `develop` → `main`,** be aware that the squash commit has
 > no parent link back to `develop`, so `develop` never learns `main` moved and your
-> *next* release will conflict against a stale merge-base. `devflow release --check`
+> *next* release will conflict against a stale merge-base. `scripts/cut-release.sh check`
 > detects this (`origin/main is NOT an ancestor of HEAD`), but DevFlow does not yet
 > ship the repair. Until it does, merge `main` back into `develop` after each
 > release with a real merge commit:
@@ -67,10 +67,10 @@ devflow status
 ## Pipeline
 
 ```
-Define → Plan → Code → Validate → Ship
+Plan → Code → Validate
 ```
 
-The 5-stage pipeline is driven by GSD-native execution. State is persisted per-phase to `.devflow/state-NN.json` and survives restarts. `--mode auto` advances through Ship unattended (gating only on repeated Validate failure or an unexpected stage crash); `--mode supervise` also gates at Validate for human review.
+The 3-stage pipeline is driven by GSD-native execution. State is persisted per-phase to `.devflow/state-NN.json` and survives restarts. A passing Validate ends the run and keeps the worktree and branch; DevFlow does not merge, tag or open a pull request. `--mode auto` runs unattended (gating only on repeated Validate failure or an unexpected stage crash); `--mode supervise` also gates at Validate for human review.
 
 ## Architecture
 
@@ -86,7 +86,7 @@ crates/
 - **Worktree isolation by default** — agents run in isolated git worktrees (`.worktrees/phase-NN/`) unless `--no-worktree` is passed, preventing cross-phase contamination.
 - **Monitor daemon** — optional background process detects agent completion and auto-advances the state machine. No cron, no polling, no tmux.
 - **Four-layer evaluation** — operator-declared external post-conditions can fail a stage before agent-controlled signals; ordinary work then uses `DEVFLOW_RESULT`, exit code + commit count, and the final commit heuristic.
-- **Per-stage prompts** — a `StageIntent` carries each stage's data (phase, fix kind, review angles) with no agent-specific syntax; each driver's `render_prompt` turns it into its own instruction (Claude/OpenCode render the legacy slash-command text; Codex/Pi render a workflow-file reference).
+- **Per-stage prompts** — a `StageIntent` carries each stage's data (phase, fix kind) with no agent-specific syntax; each driver's `render_prompt` turns it into its own instruction (Claude/OpenCode render the legacy slash-command text; Codex/Pi render a workflow-file reference).
 
 ## Agent Protocol
 
@@ -96,7 +96,7 @@ Agents communicate completion through the `DEVFLOW_RESULT` marker in stdout:
 DEVFLOW_RESULT: {"status": "success", "commits": 3, "summary": "added tests"}
 ```
 
-The Validate stage additionally requires a `verdict` field (`"pass"` or `"gaps"`) — a bare `status: success` is not enough to advance to Ship; only `verdict: "pass"` is.
+The Validate stage additionally requires a `verdict` field (`"pass"` or `"gaps"`) — a bare `status: success` is not enough to finish the run; only `verdict: "pass"` is.
 
 DevFlow evaluates agent output in four layers:
 
@@ -107,7 +107,7 @@ DevFlow evaluates agent output in four layers:
 | 2. Exit code + commits | Exit 0 **and** commits on the feature branch = success; otherwise failed | Fallback |
 | 3. Commit heuristic | Exit code unknown: commits exist = probable success (with warning) | Last resort |
 
-Rate-limit detection: if an agent's stdout contains rate-limit messages (429), DevFlow answers in one of two ways. If the Code stage was rate-limited and a fallback agent is configured (`--fallback-agent`, or `fallback_agent` in `devflow.toml`; `devflow parallel` takes no fallback and ignores the key, with a note), that agent takes over Code once, in the same worktree on the same branch; a fallback that fails to relaunch stops at a gate, or aborts the run when it is at the infra-failure ceiling. Otherwise (a rate limit at any other stage, no fallback, a fallback refused before the handoff, or after that one hop) DevFlow writes a per-phase `.devflow/cron-instructions-{phase:02}.json` for rescheduling. See [OPERATIONS.md](OPERATIONS.md#rate-limit-failover).
+Rate-limit detection: if an agent's stdout contains rate-limit messages (429), DevFlow answers in one of two ways. If the Code stage was rate-limited and a fallback agent is configured (`--fallback-agent`, or `fallback_agent` in `devflow.toml`), that agent takes over Code once, in the same worktree on the same branch; a fallback that fails to relaunch stops at a gate, or aborts the run when it is at the infra-failure ceiling. Otherwise (a rate limit at any other stage, no fallback, a fallback refused before the handoff, or after that one hop) the run waits at the stage's gate, which names `devflow resume --phase N` and the reset time when the denial carried one. See [OPERATIONS.md](OPERATIONS.md#rate-limit-failover).
 
 ## Commands
 
@@ -117,25 +117,11 @@ Rate-limit detection: if an agent's stdout contains rate-limit messages (429), D
 |---|---|
 | `devflow start --phase N --agent X [--mode auto\|supervise] [--no-worktree]` | Begin a phase: branch/worktree → launch agent → monitor pipeline |
 | `devflow status` | Show current stage, phase, agent, PID, age |
-| `devflow list` | List all feature branches with divergence from develop |
 | `devflow gate list` | List gates awaiting a response |
 | `devflow gate approve\|reject <phase> [--stage STAGE] [--note "..."] [--gate-id ID]` | Answer a human gate — the pause points where the workflow waits for approval |
 | `devflow logs [--phase N] [--follow] [--stderr]` | Print or follow an agent's captured output for a phase |
 | `devflow history [N]` | Correlate a phase's events with retained capture and review evidence |
 | `devflow cleanup` | Remove phase worktrees and their feature branches |
-
-### Multi-Agent
-
-| Command | Description |
-|---|---|
-| `devflow parallel --phases 7,8 [--agents claude,codex]` | Run multiple phases concurrently in isolated worktrees |
-| `devflow reference [--refresh]` | Create a static reference worktree for multi-agent handoff |
-
-### Quality
-
-| Command | Description |
-|---|---|
-| `devflow test` | Run local quality checks: `cargo test`, clippy, and `fmt --check` |
 
 ### Setup & Recovery
 
@@ -150,7 +136,6 @@ DevFlow stores runtime state per-phase in `.devflow/state-NN.json` (git-ignored)
 
 ```toml
 capture_retention = 5
-review_angles = ["doc accuracy", "security", "CI correctness", "external state"]
 external_verify_enabled = true
 ```
 
@@ -165,15 +150,15 @@ Key flags:
 |---|---|
 | `--phase N` | Phase number to execute |
 | `--agent claude\|codex\|opencode\|pi` | Agent to launch |
-| `--mode auto\|supervise` | `auto` advances through Ship unattended; `supervise` also gates at Validate for human review |
+| `--mode auto\|supervise` | `auto` runs unattended and finishes on a passing Validate; `supervise` also gates at Validate for human review |
 | `--no-worktree` | Run directly in the primary checkout instead of an isolated worktree (worktree is the default) |
 
 Gate responses and unattended-run notifications are file-based: a fired gate writes `.devflow/gates/NN-{stage}.json`, which names the gate's `gate_id`, and (if `DEVFLOW_GATE_NOTIFY_CMD` is set) runs that command with `DEVFLOW_GATE_PHASE`/`DEVFLOW_GATE_STAGE`/`DEVFLOW_GATE_CONTEXT` in its environment. `devflow gate approve|reject` fill the answer in for you (`--gate-id <ID>` binds it to the gate `gate list` or `gate show` displayed), first moving aside an answer in that gate's own slot that does not bind to it. To answer by hand, copy `gate_id` from the gate file and publish `.devflow/gates/NN-{stage}.{gate_id}.response.json` with `{"gate_id": "...", "approved": true, "note": "..."}` (`approved` is `true` or `false`, `note` is optional), writing it under another name and renaming it into place, because a partly written file is set aside. An answer with a missing or other id is never consumed or deleted: it is set aside as `NN-{stage}.{gate_id|noid}.{secs}.{pid}.{seq}.quarantined.json`, listed by `devflow status`, `devflow doctor` and `devflow recover --clean`, and stays until you remove it by hand.
 
-The poll timeout defaults to 3 days and is configurable via `DEVFLOW_GATE_TIMEOUT_SECS`; it bounds how long a run waits at the gate, not how long you have to answer, and the run holds no lock while it waits. The gate file never expires, but past the timeout the run has ended at that gate: `devflow resume` reruns the stage and asks again, setting any unused answer aside and reporting it. A stored Ship approval is applied without a rerun by `devflow ship --phase N`. See [OPERATIONS.md](OPERATIONS.md#answering-gates).
+The poll timeout defaults to 3 days and is configurable via `DEVFLOW_GATE_TIMEOUT_SECS`; it bounds how long a run waits at the gate, not how long you have to answer, and the run holds no lock while it waits. The gate file never expires, but past the timeout the run has ended at that gate: `devflow resume` reruns the stage and asks again, setting any unused answer aside and reporting it. See [OPERATIONS.md](OPERATIONS.md#answering-gates).
 
-`DEVFLOW_CAPTURE_RETENTION`, `DEVFLOW_REVIEW_ANGLES`, and
-`DEVFLOW_EXTERNAL_VERIFY_ENABLED` override the corresponding TOML values.
+`DEVFLOW_CAPTURE_RETENTION` and `DEVFLOW_EXTERNAL_VERIFY_ENABLED` override the
+corresponding TOML values.
 
 ## Supported Agents
 
@@ -189,7 +174,7 @@ Agents must be installed separately. Run `devflow doctor` to verify availability
 
 - **Rust** stable, edition 2024 (build from source) — see `rust-toolchain.toml`
 - **git** 2.30+
-- **gh CLI** 2.0+ (for PR creation, shipping)
+- **gh CLI** 2.0+ (`devflow doctor` checks for it; no DevFlow command runs it since the Ship stage was removed)
 - **A POSIX shell** (sh/bash)
 
 Agents (Claude Code, Codex, OpenCode) must be installed separately. See [DEPENDENCIES.md](DEPENDENCIES.md) for the full matrix.

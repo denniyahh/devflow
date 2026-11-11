@@ -151,9 +151,8 @@ fn sleeper_script(pid_path: &Path) -> String {
 /// Kills every registered pid on the way out, whether the test passed, failed
 /// an assertion, or panicked partway.
 ///
-/// This project already carries `reap_strays_e2e.rs` because leaked processes
-/// from tests are a real failure class here; a sleeping child left behind by a
-/// failed assertion would wedge the whole suite.
+/// Leaked processes from tests are a real failure class here; a sleeping
+/// child left behind by a failed assertion would wedge the whole suite.
 #[derive(Default)]
 struct Reaper {
     pids: RefCell<Vec<u32>>,
@@ -224,6 +223,7 @@ impl Fixture {
         fs::write(&config, real_shape_config(flag_before)).unwrap();
 
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.clone());
+        state.verification_baseline_captured = true;
         state.stage = Stage::Code;
         state.stop_until = Some(Stage::Code);
         state.stopped = false;

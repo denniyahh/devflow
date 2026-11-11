@@ -25,20 +25,35 @@ const REACH_WITHIN: Duration = Duration::from_secs(45);
 /// the publish. It only makes the wait the likely path; the assertions hold either way.
 const STOP_REACHES_ITS_WAIT: Duration = Duration::from_secs(1);
 
-/// A fake `claude` that answers `--version` and otherwise stays running.
-const WAITING_CLAUDE: &str = r#"if [ "$1" = "--version" ]; then echo "2.1.220 (Claude Code)"; exit 0; fi
-sleep 120"#;
+/// The fake capture-shape agent (`codex`) a fixture launches.
+#[derive(Debug, Clone, Copy)]
+enum FakeAgent {
+    /// Stays running.
+    Waiting,
+    /// Its first run finishes, so stage N hands off; its later runs stay running.
+    FinishOnce,
+}
 
-/// A fake `claude` whose first run finishes, so stage N hands off, and whose later runs
-/// stay running.
-const FINISH_ONCE_CLAUDE: &str = r#"if [ "$1" = "--version" ]; then echo "2.1.220 (Claude Code)"; exit 0; fi
-if [ ! -e .first-agent-done ]; then
-  : > .first-agent-done
-  git commit -q --allow-empty -m "fake agent work"
-  printf 'work done\nDEVFLOW_RESULT: {"status":"success","commits":1}\n'
-  exit 0
-fi
-sleep 120"#;
+impl FakeAgent {
+    fn fake_bin(self, logs: &Path) -> common::FakeBin {
+        match self {
+            FakeAgent::Waiting => common::waiting_capture_agent_bin(logs),
+            FakeAgent::FinishOnce => common::capture_agent_bin_then(
+                logs,
+                &format!(
+                    "if [ ! -e .first-agent-done ]; then\n\
+                     : > .first-agent-done\n\
+                     git commit -q --allow-empty -m \"fake agent work\"\n\
+                     {}\n\
+                     exit 0\n\
+                     fi\n\
+                     sleep 120",
+                    common::CODEX_SUCCESS_EVENTS
+                ),
+            ),
+        }
+    }
+}
 
 fn git(root: &Path, args: &[&str]) {
     let output = devflow_core::test_support::git_command(root)
@@ -52,7 +67,7 @@ fn git(root: &Path, args: &[&str]) {
     );
 }
 
-/// A repository on `develop` with a roadmap entry for `phase`.
+/// A repository on `develop` with a roadmap entry and a CONTEXT.md for `phase`.
 fn init_repo(root: &Path, phase: PhaseId) {
     git(root, &["init", "-q"]);
     git(root, &["config", "user.email", "devflow@example.com"]);
@@ -68,9 +83,16 @@ fn init_repo(root: &Path, phase: PhaseId) {
         format!("# Roadmap\n\n### Phase {phase}: pending supervisor fixture\n"),
     )
     .unwrap();
+    let context = common::write_phase_context(root, phase);
     git(
         root,
-        &["add", "README.md", ".gitignore", ".planning/ROADMAP.md"],
+        &[
+            "add",
+            "README.md",
+            ".gitignore",
+            ".planning/ROADMAP.md",
+            &context,
+        ],
     );
     git(root, &["commit", "-q", "-m", "base"]);
 }
@@ -124,6 +146,7 @@ struct Fixture {
     hold: SpawnHold,
     _reaper: common::LaunchedRunReaper,
     fake_bin: common::FakeBin,
+    _logs: tempfile::TempDir,
     home: common::HermeticHome,
     phase: PhaseId,
     root: PathBuf,
@@ -131,14 +154,16 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn new(phase: PhaseId, agent: &str) -> Self {
+    fn new(phase: PhaseId, agent: FakeAgent) -> Self {
         let repo = tempfile::tempdir().unwrap();
         let root = repo.path().canonicalize().unwrap();
         init_repo(&root, phase);
+        let logs = tempfile::tempdir().unwrap();
         Self {
             hold: SpawnHold::new(),
             _reaper: common::LaunchedRunReaper::new(&root, phase, vec![]),
-            fake_bin: common::fake_bin_dir(agent),
+            fake_bin: agent.fake_bin(logs.path()),
+            _logs: logs,
             home: common::HermeticHome::new(),
             phase,
             root,
@@ -161,11 +186,10 @@ impl Fixture {
                 "--phase",
                 &self.phase.to_string(),
                 "--agent",
-                "claude",
+                "codex",
                 "--mode",
                 "supervise",
                 "--no-worktree",
-                "--legacy-claude-launch",
             ])
             .args(extra)
             .arg(&self.root)
@@ -175,10 +199,10 @@ impl Fixture {
         command
     }
 
-    /// A launcher for stage Define, held before its supervisor's agent spawn.
+    /// A launcher for stage Plan, the first stage, held before its supervisor's agent spawn.
     fn spawn_held_launcher(&self) -> Child {
         let launcher = self
-            .start("define", &[])
+            .start("plan", &[])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -298,7 +322,7 @@ impl Fixture {
 /// socket; afterwards `status` suggests `resume`.
 #[test]
 fn stop_ends_a_pending_supervisor_through_its_socket() {
-    let fixture = Fixture::new(PhaseId::new(181), WAITING_CLAUDE);
+    let fixture = Fixture::new(PhaseId::new(181), FakeAgent::Waiting);
     let mut launcher = fixture.spawn_held_launcher();
     common::kill_and_reap(&mut launcher);
     let pending = fixture.pending();
@@ -331,7 +355,7 @@ fn stop_ends_a_pending_supervisor_through_its_socket() {
 /// first finds none, waits for the publish and ends what appears.
 #[test]
 fn stop_waits_for_a_pending_supervisor_to_publish_and_ends_it() {
-    let fixture = Fixture::new(PhaseId::new(182), WAITING_CLAUDE);
+    let fixture = Fixture::new(PhaseId::new(182), FakeAgent::Waiting);
     let mut launcher = fixture.spawn_held_launcher();
     common::kill_and_reap(&mut launcher);
     let pending = fixture.pending();
@@ -370,7 +394,7 @@ impl Drop for Frozen {
 /// re-probe of the recorded supervisor can reach it.
 #[test]
 fn stop_ends_a_launch_its_running_launcher_promotes_during_the_wait() {
-    let fixture = Fixture::new(PhaseId::new(183), WAITING_CLAUDE);
+    let fixture = Fixture::new(PhaseId::new(183), FakeAgent::Waiting);
     let mut launcher = fixture.spawn_held_launcher();
     let pending = fixture.pending();
 
@@ -436,7 +460,7 @@ fn kill_supervisor_at(socket: &Path) -> supervisor::Sidecar {
 /// and N has been SIGKILLed. Returns N+1's reservation.
 fn handoff_window(fixture: &Fixture) -> PendingSupervisor {
     let started = fixture
-        .start("plan", &["--until", "plan"])
+        .start("code", &["--until", "code"])
         .output()
         .expect("run devflow start");
     assert!(
@@ -461,7 +485,7 @@ fn handoff_window(fixture: &Fixture) -> PendingSupervisor {
 /// then ends N+1 through its socket.
 #[test]
 fn stop_in_the_handoff_window_ends_the_next_supervisor_and_names_no_resume() {
-    let fixture = Fixture::new(PhaseId::new(184), FINISH_ONCE_CLAUDE);
+    let fixture = Fixture::new(PhaseId::new(184), FakeAgent::FinishOnce);
     let pending = handoff_window(&fixture);
 
     let output = fixture.stop_across_the_release();
@@ -473,7 +497,7 @@ fn stop_in_the_handoff_window_ends_the_next_supervisor_and_names_no_resume() {
 /// so `stop` reaches its backstop through the record, which ends the agent group.
 #[test]
 fn stop_ends_the_agent_of_a_pending_supervisor_that_died() {
-    let fixture = Fixture::new(PhaseId::new(185), FINISH_ONCE_CLAUDE);
+    let fixture = Fixture::new(PhaseId::new(185), FakeAgent::FinishOnce);
     let pending = handoff_window(&fixture);
     fixture.hold.release();
     common::wait_for(

@@ -9,7 +9,7 @@
 //! | Request | Reply |
 //! |---|---|
 //! | `{"op":"ping"}` | `{"ok":true, ...PingReply fields}` |
-//! | `{"op":"shutdown"}` | `{"ok":true,"accepted":true,"owner":…}` then `{"ok":true,"stopped":true,"exit_code":143,"advance_suppressed":true,"group_signalled":…}`, or `{"ok":false,"error":"handed_off"}` |
+//! | `{"op":"shutdown"}` | `{"ok":true,"accepted":true,"owner":…}` then `{"ok":true,"stopped":true,"exit_code":143,"advance_suppressed":true,"group_signalled":…}`, or `{"ok":false,"error":"handed_off"}`, or `{"ok":false,"error":"already_finished"}` |
 //! | anything else | `{"ok":false,"error":"unknown_op"}` |
 //!
 //! The pids in a ping reply are for display only: nothing on the liveness

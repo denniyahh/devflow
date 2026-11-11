@@ -2,15 +2,16 @@
 #
 # scripts/cut-release.sh — the step-gated release cut.
 #
-# `devflow release --check` (pre-cut preflight) and `--verify` (post-cut
-# verification) are read-only; this script is the glue that runs the release
-# steps IN ORDER and refuses to proceed out of order. The two merge steps
+# `release-preflight check` (pre-cut preflight) and `release-preflight verify`
+# (post-cut verification), from the unpublished workspace tool in
+# tools/release-preflight, are read-only; this script is the glue that runs
+# the release steps IN ORDER and refuses to proceed out of order. The two merge steps
 # pause for a human (develop/main are PR-protected and merge on GitHub); the
 # tag, sync, and publish steps run here, each gated on the prior step's
 # invariant.
 #
 # Usage (one step at a time, strictly in order):
-#   scripts/cut-release.sh check          # devflow release --check (preflight)
+#   scripts/cut-release.sh check          # release-preflight check (preflight)
 #   scripts/cut-release.sh branch         # create release/vX.Y.Z off develop
 #   scripts/cut-release.sh pr-develop     # open the bump+changelog PR -> develop
 #   scripts/cut-release.sh pr-main        # open develop -> main (squash) PR
@@ -19,7 +20,7 @@
 #   scripts/cut-release.sh publish        # cargo publish devflow-core then devflow
 #   scripts/cut-release.sh github-release # create GitHub Release with CHANGELOG notes
 #   scripts/cut-release.sh docs           # deploy documentation wiki to GitHub Pages
-#   scripts/cut-release.sh verify         # devflow release --verify (post-cut)
+#   scripts/cut-release.sh verify         # release-preflight verify (post-cut)
 #
 # Every step re-verifies its precondition and refuses with a fix hint rather
 # than silently proceeding out of order — the failure mode that made the
@@ -34,14 +35,6 @@ cd "$REPO_ROOT"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 note() { echo "[release] $*"; }
-
-run_devflow() {
-    if command -v devflow >/dev/null 2>&1; then
-        devflow "$@"
-    else
-        cargo run -q -- "$@"
-    fi
-}
 
 STEP="${1:-}"
 shift || true
@@ -85,7 +78,7 @@ require_merged_to_develop() {
 step_check() {
     require_clean
     git fetch origin develop main --quiet
-    run_devflow release --check
+    cargo run -q -p release-preflight -- check
 }
 
 step_branch() {
@@ -255,8 +248,9 @@ step_tag() {
     fi
 
     # The tag MUST land on main's squash commit, not the develop release
-    # commit — enforced here, and re-checked by `release --verify`. Pass the
-    # tilde-expanded path so git does not rely on its own `~` handling.
+    # commit — enforced here, and re-checked by `release-preflight verify`.
+    # Pass the tilde-expanded path so git does not rely on its own `~`
+    # handling.
     git -c user.signingkey="$release_key_expanded" \
         tag -s "v$v" origin/main -m "release: v$v"
     git verify-tag "v$v"
@@ -332,7 +326,7 @@ step_docs() {
 
 step_verify() {
     git fetch origin develop main --quiet
-    run_devflow release --verify
+    cargo run -q -p release-preflight -- verify
 }
 
 # --- dispatch --------------------------------------------------------------

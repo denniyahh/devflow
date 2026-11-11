@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::phase_id::PhaseId;
-use crate::{agent_result, events, gates::Gates, lock, ship, workflow};
+use crate::{agent_result, events, gates::Gates, workflow};
 
 const SCOPED_DOCS: &[&str] = &[
     "README.md",
@@ -320,15 +320,6 @@ fn gitignore_covers_all_devflow_paths() {
             workflow::state_path(root, PhaseId::new(16)),
         ),
         ("Gates::dir", Gates::dir(root)),
-        ("lock::project_lock_path", lock::project_lock_path(root)),
-        (
-            "ship::cron_instructions_path",
-            ship::cron_instructions_path(root, PhaseId::new(16)),
-        ),
-        (
-            "ship::legacy_cron_instructions_path",
-            ship::legacy_cron_instructions_path(root),
-        ),
     ];
     let ignore = std::fs::read_to_string(workspace_root().join(".gitignore"))
         .expect("workspace .gitignore must be readable");
@@ -432,20 +423,74 @@ fn source_devflow_env_vars_and_subcommands_are_documented() {
     }
 }
 
+/// What disagrees with `RUST_LOG`'s `off` default, given `main.rs`'s text and
+/// the scoped docs' text. `main.rs` must build `EnvFilter::new("off")` in both
+/// log-format branches. Every scoped-doc table row whose first cell is
+/// `` `RUST_LOG` `` must name `` `off` `` and must not carry a whole cell of
+/// `` `info` `` (the 3.0 default). Checking each row, not any line, matters:
+/// CONTRIBUTING's row names `info` as a level to choose, which kept the 3.0
+/// guard green whatever the other rows said.
+fn rust_log_default_findings(main_rs: &str, docs: &str) -> Vec<String> {
+    let mut findings = Vec::new();
+    if main_rs.matches("EnvFilter::new(\"off\")").count() < 2 {
+        findings.push(
+            "main.rs must fall back to `EnvFilter::new(\"off\")` in both log-format branches"
+                .to_string(),
+        );
+    }
+    let rows: Vec<&str> = docs
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            line.strip_prefix('|')
+                .and_then(|rest| rest.split('|').next())
+                .is_some_and(|cell| cell.trim() == "`RUST_LOG`")
+        })
+        .collect();
+    if rows.is_empty() {
+        findings.push("no scoped-doc table row documents `RUST_LOG`".to_string());
+    }
+    for row in rows {
+        let cells: Vec<&str> = row.split('|').map(str::trim).collect();
+        if !row.contains("`off`") || cells.contains(&"`info`") {
+            findings.push(format!(
+                "this `RUST_LOG` row does not name `off` as the default: {row}"
+            ));
+        }
+    }
+    findings
+}
+
 #[test]
 fn pinned_doc_claims_match_source() {
     let docs = read_files(scoped_doc_paths());
     let cli = std::fs::read_to_string(workspace_root().join("crates/devflow-cli/src/main.rs"))
         .expect("CLI source must be readable");
 
-    assert!(
-        cli.matches("EnvFilter::new(\"info\")").count() >= 2,
-        "RUST_LOG's source fallback must remain info in both log-format branches"
+    assert_eq!(
+        rust_log_default_findings(&cli, &docs),
+        Vec::<String>::new(),
+        "RUST_LOG's default in main.rs and the scoped docs must be `off`"
     );
+
+    // Control: the 3.0 main.rs fallback, `info` in both branches.
+    let old_fallback = concat!(
+        "let filter = tracing_subscriber::EnvFilter::try_from_default_env()\n",
+        "    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(\"info\"));\n",
+    )
+    .repeat(2);
+    assert_eq!(
+        rust_log_default_findings(&old_fallback, &docs).len(),
+        1,
+        "the 3.0 `info` fallback in main.rs must be reported"
+    );
+
+    // Control: the 3.0 OPERATIONS.md row, default `info`.
+    let old_row = "| `RUST_LOG` | `info` | Log verbosity (stderr) |";
+    let findings = rust_log_default_findings(&cli, old_row);
     assert!(
-        docs.lines()
-            .any(|line| line.contains("`RUST_LOG`") && line.contains("`info`")),
-        "operator docs must pin RUST_LOG's default to the source fallback `info`"
+        findings.len() == 1 && findings[0].contains(old_row),
+        "the 3.0 `RUST_LOG` row must be reported: {findings:?}"
     );
 }
 
@@ -781,13 +826,11 @@ fn row_findings(text: &str, rows: &[(&str, &str)]) -> Vec<String> {
 }
 
 /// OPERATIONS.md rows that must name the fallback (51-11): the flag and the
-/// `devflow.toml` key on `start`, the flag on `resume`, and the cron record's
-/// fallback condition.
+/// `devflow.toml` key on `start`, and the flag on `resume`.
 const FALLBACK_ROW_FRAGMENTS: &[(&str, &str)] = &[
     ("| `devflow start", "--fallback-agent"),
     ("| `devflow start", "fallback_agent"),
     ("| `devflow resume", "--fallback-agent"),
-    ("| `cron-instructions-NN.json`", "fallback"),
 ];
 
 /// The failover events and keys an operator reads in `events.jsonl`, which
@@ -812,9 +855,8 @@ const FALLBACK_GUIDE_FRAGMENTS: &[(&str, &str)] = &[
 /// 51-11 (D-01, D-02, D-03, D-04, D-07, D-10, R-3): the operator docs document
 /// the rate-limit fallback. Outside HTML comments, OPERATIONS.md's `devflow
 /// start` row names `--fallback-agent` and the `fallback_agent` key, its
-/// `devflow resume` row names `--fallback-agent`, its `cron-instructions-NN.json`
-/// row says when a fallback applies, and the text names the failover events and
-/// their keys; README.md and the unattended-mode guide name the flag, and the
+/// `devflow resume` row names `--fallback-agent`, and the text names the failover
+/// events and their keys; README.md and the unattended-mode guide name the flag, and the
 /// configuration guide names the key.
 #[test]
 fn operations_md_documents_the_fallback_agent_and_its_events() {
@@ -835,11 +877,8 @@ fn operations_md_documents_the_fallback_agent_and_its_events() {
          a later row carries the flag"
     );
     assert_eq!(
-        row_findings(
-            planted_table,
-            &[("| `cron-instructions-NN.json`", "fallback")]
-        ),
-        vec!["no row starts with \"| `cron-instructions-NN.json`\"".to_string()],
+        row_findings(planted_table, &[("| `devflow status", "fallback")]),
+        vec!["no row starts with \"| `devflow status\"".to_string()],
         "planted control: a missing row is reported"
     );
     let every_event = FAILOVER_EVENT_FRAGMENTS.join("\n");
@@ -2165,5 +2204,782 @@ fn gate_notify_cmd_doc_cites_the_tests_that_pin_it() {
         found.is_empty(),
         "gate_notify_cmd's doc comment and its pinning tests disagree:\n{}",
         found.join("\n")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 52-18 (CUT-04, criterion 2, D-40): no literal of the removed v3 surface
+// remains in comment-stripped Rust under `crates/` and `tools/`, in
+// HTML-comment-stripped Markdown under `docs/` and the top-level docs, or in
+// the committed snapshot files. `CHANGELOG.md`, `.planning/` and `CLAUDE.md`
+// are out of scope (D-40). The scan has no path, file or test exemption: a
+// control test whose subject is that a removed value is rejected or absent
+// builds that value with a `concat!` split inside the token, as this file does.
+// ---------------------------------------------------------------------------
+
+/// Removed-surface tokens matched on identifier boundaries (`_` counts as an
+/// identifier character, so a token is always the whole name the tree spells).
+/// Each is split with `concat!` so this file never holds one whole.
+const REMOVED_SURFACE_TOKENS: &[&str] = &[
+    concat!("cron-", "instructions"),
+    concat!("hermes", "_cron"),
+    concat!("yes", "_ship"),
+    concat!("yes", "-ship"),
+    concat!("Version", "Bump"),
+    concat!("Changelog", "Append"),
+    concat!("Branch", "Cleanup"),
+    concat!("Hook::", "Merge"),
+    concat!("Docs", "Update"),
+    concat!("Stage::", "Define"),
+    concat!("Stage::", "Ship"),
+    concat!("StageIntent::", "Define"),
+    concat!("StageIntent::", "Ship"),
+    concat!("devflow s", "hip"),
+    concat!("devflow ", "parallel"),
+    concat!("devflow ", "evidence"),
+    concat!("devflow ", "reference"),
+    concat!("devflow ", "release"),
+    concat!("reap", "-strays"),
+    concat!("legacy-claude", "-launch"),
+    concat!("DEVFLOW_CLAUDE_LEGACY", "_LAUNCH"),
+    concat!("DEVFLOW_YES", "_SHIP"),
+    concat!("DEVFLOW_REVIEW", "_ANGLES"),
+    concat!("SHIP_REVIEW", "_ANGLES"),
+    concat!("DEVFLOW_FOREGROUND_GATE", "_TIMEOUT_SECS"),
+    concat!("DEVFLOW_CHECKOUT_LOCK", "_TIMEOUT_SECS"),
+    concat!("shi", "p_evidence"),
+];
+
+/// Removed stage names, matched in Rust only as a whole string literal (and in
+/// Markdown and snapshots as the double-quoted word), so prose and longer
+/// literals such as `"shipped"` are not findings.
+const REMOVED_STAGE_LITERALS: &[&str] = &[concat!("sh", "ip"), concat!("def", "ine")];
+
+/// Every place a removed-surface token survives in `files`, one finding per
+/// line as `path:line: removed surface <tokens>: <text>`, sorted by path then
+/// line.
+fn removed_surface_findings(files: &[(PathBuf, String)]) -> Vec<String> {
+    let root = workspace_root();
+    let mut findings: Vec<(PathBuf, usize, String)> = Vec::new();
+    for (path, text) in files {
+        let extension = path.extension().and_then(|ext| ext.to_str());
+        let is_rust = extension == Some("rs");
+        let scanned = match extension {
+            Some("rs") => strip_rust_comments(text),
+            Some("md") => blank_html_comments(text),
+            _ => text.clone(),
+        };
+        let lines: Vec<&str> = scanned.lines().collect();
+        let mut hits: std::collections::BTreeMap<usize, Vec<String>> = Default::default();
+        let mut record = |line: usize, shown: String| {
+            let tokens = hits.entry(line).or_default();
+            if !tokens.contains(&shown) {
+                tokens.push(shown);
+            }
+        };
+        for (index, line) in lines.iter().enumerate() {
+            for token in REMOVED_SURFACE_TOKENS {
+                if holds_bounded_token(line, token) {
+                    record(index + 1, format!("`{token}`"));
+                }
+            }
+            if !is_rust {
+                for value in REMOVED_STAGE_LITERALS {
+                    let quoted = format!("\"{value}\"");
+                    if line.contains(&quoted) {
+                        record(index + 1, format!("`{quoted}`"));
+                    }
+                }
+            }
+        }
+        if is_rust {
+            for (line, value) in whole_literal_lines(&scanned, REMOVED_STAGE_LITERALS) {
+                record(line, format!("`\"{value}\"`"));
+            }
+        }
+        let shown_path = path.strip_prefix(&root).unwrap_or(path);
+        for (line, tokens) in hits {
+            let text = lines.get(line - 1).copied().unwrap_or_default().trim();
+            findings.push((
+                path.clone(),
+                line,
+                format!(
+                    "{}:{line}: removed surface {}: {text}",
+                    shown_path.display(),
+                    tokens.join(", ")
+                ),
+            ));
+        }
+    }
+    findings.sort();
+    findings
+        .into_iter()
+        .map(|(_, _, finding)| finding)
+        .collect()
+}
+
+/// True when `token` occurs in `line` with no identifier character on either
+/// side. A letter right after a backslash is an escape (`\n` inside a
+/// literal), not part of the name.
+fn holds_bounded_token(line: &str, token: &str) -> bool {
+    line.match_indices(token).any(|(start, _)| {
+        let mut before = line[..start].chars().rev();
+        let starts_name = match before.next() {
+            None => true,
+            Some(ch) => !is_identifier_char(ch) || before.next() == Some('\\'),
+        };
+        let ends_name = line[start + token.len()..]
+            .chars()
+            .next()
+            .is_none_or(|ch| !is_identifier_char(ch));
+        starts_name && ends_name
+    })
+}
+
+/// `text` with every `<!--` … `-->` span blanked except its newlines (an
+/// unterminated one runs to the end), so line numbers still match the input.
+fn blank_html_comments(text: &str) -> String {
+    const OPEN: &str = "<!--";
+    const CLOSE: &str = "-->";
+    let mut kept = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find(OPEN) {
+        kept.push_str(&rest[..open]);
+        let comment = &rest[open..];
+        let end = comment[OPEN.len()..]
+            .find(CLOSE)
+            .map_or(comment.len(), |close| OPEN.len() + close + CLOSE.len());
+        kept.extend(comment[..end].chars().filter(|&ch| ch == '\n'));
+        rest = &comment[end..];
+    }
+    kept.push_str(rest);
+    kept
+}
+
+/// The 1-based lines of comment-stripped Rust `code` holding a string literal
+/// whose whole value is one of `values`, each with that value.
+fn whole_literal_lines<'a>(code: &str, values: &[&'a str]) -> Vec<(usize, &'a str)> {
+    let chars: Vec<char> = code.chars().collect();
+    let mut found = Vec::new();
+    let mut line = 1;
+    let mut index = 0;
+    while index < chars.len() {
+        if let Some((open, end, close)) = literal_at(&chars, index) {
+            let value: String = chars[index + open..end - close].iter().collect();
+            if let Some(hit) = values.iter().find(|candidate| **candidate == value) {
+                found.push((line, *hit));
+            }
+            line += chars[index..end].iter().filter(|&&ch| ch == '\n').count();
+            index = end;
+        } else {
+            if chars[index] == '\n' {
+                line += 1;
+            }
+            index += 1;
+        }
+    }
+    found
+}
+
+/// One real line per token, copied from the b8df457 tree with the token
+/// replaced by `@`, in the order of `REMOVED_SURFACE_TOKENS` then
+/// `REMOVED_STAGE_LITERALS`.
+const PLANTED_REMOVED_LINES: &[&str] = &[
+    r#".expect("the cron arm wrote @-5148.json");"#,
+    "if instructions.@.schedule.is_empty() {",
+    "@: bool,",
+    r#""a stop accepted before the --@ merge must ship nothing: {}","#,
+    "@,",
+    r#"assert_eq!(hook_runs(root, "@"), 2);"#,
+    "@,",
+    "if index < progress.completed && *hook != hooks::@ {",
+    "@,",
+    "@,",
+    "@,",
+    "@ { phase } => define_stage_prompt(*phase),",
+    "@ {",
+    r#"format!("@ --phase {phase}")"#,
+    r#".expect("run @");"#,
+    "| `@ --phase N [--json] [--require-shipped] [--root PATH]` |",
+    "| `@ [--refresh]` | Create a static reference worktree for multi-agent handoff |",
+    r#""@ accepts exactly one of --check or --verify".to_string(),"#,
+    r#"`devflow gate sweep --@` to clear them","#,
+    r#".args(legacy_launch.then_some("--@"))"#,
+    r#"command.env("@", "true");"#,
+    r#"if let Some(value) = env_value("@") {"#,
+    r#"if let Some(value) = env_value("@") {"#,
+    "const @: &[&str] = &[",
+    r#"parse_foreground_gate_timeout(std::env::var("@").ok())"#,
+    r#"parse_checkout_lock_timeout(std::env::var("@").ok())"#,
+    "use devflow_core::@;",
+    r#"assert_eq!(stage.as_deref(), Some("@"));"#,
+    r#"serde_json::json!({"stage": "@", "gate_id": gate_id, "status": "live"})"#,
+];
+
+/// The scan's inputs: `.rs` under `crates/` and `tools/`, Markdown under
+/// `docs/` plus the top-level docs, and the committed snapshot files.
+fn removed_surface_inputs() -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
+    let root = workspace_root();
+    let skip = root.join("target");
+    let with_extension = |paths: Vec<PathBuf>, extension: &str| -> Vec<PathBuf> {
+        paths
+            .into_iter()
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some(extension))
+            .collect()
+    };
+    let mut rust = with_extension(files_under(&root.join("crates"), &skip), "rs");
+    rust.extend(with_extension(
+        files_under(&root.join("tools"), &skip),
+        "rs",
+    ));
+    let mut markdown = with_extension(files_under(&root.join("docs"), &skip), "md");
+    markdown.extend(SCOPED_DOCS.iter().map(|path| root.join(path)));
+    markdown.sort();
+    let snapshots = files_under(&root.join("crates/devflow-cli/tests/snapshots"), &skip);
+    (rust, markdown, snapshots)
+}
+
+#[test]
+fn no_removed_surface_literal_remains() {
+    let planted = |name: &str, text: &str| vec![(PathBuf::from(name), text.to_string())];
+
+    // (a) One real line per token is exactly one finding, naming that token,
+    // in Rust and in Markdown.
+    let tokens: Vec<String> = REMOVED_SURFACE_TOKENS
+        .iter()
+        .map(|token| (*token).to_string())
+        .chain(
+            REMOVED_STAGE_LITERALS
+                .iter()
+                .map(|value| format!("\"{value}\"")),
+        )
+        .collect();
+    let values: Vec<&str> = REMOVED_SURFACE_TOKENS
+        .iter()
+        .chain(REMOVED_STAGE_LITERALS)
+        .copied()
+        .collect();
+    assert_eq!(values.len(), 29, "the token list is the 29 the plan names");
+    assert_eq!(PLANTED_REMOVED_LINES.len(), values.len());
+    for ((value, shown), template) in values.iter().zip(&tokens).zip(PLANTED_REMOVED_LINES) {
+        let line = template.replace('@', value);
+        for name in ["planted.rs", "planted.md"] {
+            let findings = removed_surface_findings(&planted(name, &line));
+            assert_eq!(
+                findings.len(),
+                1,
+                "{name}: the planted line `{line}` must be exactly one finding: {findings:?}"
+            );
+            assert!(
+                findings[0].contains(&format!("`{shown}`")),
+                "{name}: the finding must name {shown}: {findings:?}"
+            );
+        }
+    }
+    // A token right after an escaped newline inside a literal still counts.
+    let escaped = [
+        "let toml = \"[run]\\n",
+        REMOVED_SURFACE_TOKENS[2],
+        " = true\";",
+    ]
+    .concat();
+    assert_eq!(
+        removed_surface_findings(&planted("planted.rs", &escaped)).len(),
+        1
+    );
+
+    // (b) Decoys: comments, longer names and prose are not findings.
+    let removed_key = REMOVED_SURFACE_TOKENS[2];
+    let ship = REMOVED_STAGE_LITERALS[0];
+    let define = REMOVED_STAGE_LITERALS[1];
+    let rust_decoys = [
+        ["// ", removed_key, ": bool,"].concat(),
+        ["    /// ", REMOVED_SURFACE_TOKENS[10], " was removed"].concat(),
+        ["let x = 1; /* ", REMOVED_SURFACE_TOKENS[21], " */"].concat(),
+        ["let ", removed_key, "ment = 1;"].concat(),
+        ["let membership = \"", ship, "ped\";"].concat(),
+        ["let note = \"--until ", ship, " is refused\";"].concat(),
+        ["fn ", ship, "(stage: &str) {}"].concat(),
+        ["// let stage = \"", ship, "\";"].concat(),
+    ];
+    for decoy in rust_decoys {
+        let findings = removed_surface_findings(&planted("planted.rs", &decoy));
+        assert!(
+            findings.is_empty(),
+            "Rust decoy `{decoy}` was flagged: {findings:?}"
+        );
+    }
+    let markdown_decoys = [
+        ["<!-- ", REMOVED_SURFACE_TOKENS[13], " --phase 1 -->"].concat(),
+        ["<!--\n", removed_key, "\n-->"].concat(),
+        ["The phase ", ship, "ped; ", ship, " membership."].concat(),
+        ["Set ", removed_key, "ment to taste."].concat(),
+        [define, " the interface before the plan."].concat(),
+    ];
+    for decoy in markdown_decoys {
+        let findings = removed_surface_findings(&planted("planted.md", &decoy));
+        assert!(
+            findings.is_empty(),
+            "Markdown decoy `{decoy}` was flagged: {findings:?}"
+        );
+    }
+
+    // Ordering backstop: findings come back sorted by path, then line.
+    let unordered = vec![
+        (
+            PathBuf::from("b.rs"),
+            ["\n\nlet x = ", removed_key, ";"].concat(),
+        ),
+        (
+            PathBuf::from("a.md"),
+            ["\n\n\n\n", removed_key, "\n"].concat(),
+        ),
+        (PathBuf::from("a.md.txt"), [removed_key, "\n"].concat()),
+        (PathBuf::from("a.md"), ["\n", removed_key].concat()),
+    ];
+    let ordered: Vec<String> = removed_surface_findings(&unordered)
+        .iter()
+        .map(|finding| finding.split(": ").next().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(ordered, ["a.md:2", "a.md:5", "a.md.txt:1", "b.rs:3"]);
+
+    // (c) Every walker returns files, so a clean result means something.
+    let (rust, markdown, snapshots) = removed_surface_inputs();
+    assert!(!rust.is_empty(), "the Rust walker found no files");
+    assert!(
+        rust.iter()
+            .any(|path| path.starts_with(workspace_root().join("tools"))),
+        "the Rust walker must read tools/"
+    );
+    assert!(!markdown.is_empty(), "the Markdown walker found no files");
+    assert!(!snapshots.is_empty(), "the snapshot walker found no files");
+
+    // (d) The real tree holds no removed-surface literal.
+    let mut files = read_labelled(rust);
+    files.extend(read_labelled(markdown));
+    files.extend(read_labelled(snapshots));
+    let findings = removed_surface_findings(&files);
+    assert!(
+        findings.is_empty(),
+        "removed-surface literals remain (CUT-04, criterion 2):\n{}",
+        findings.join("\n")
+    );
+}
+
+/// Violations in reverse order (later file first, later line first) come
+/// out sorted by path then by line; a count assertion prevents an empty
+/// report from silently passing the order check.
+#[test]
+fn removed_surface_findings_are_sorted_by_path_then_line() {
+    // Three violations planted in an order that is NOT already sorted:
+    //   b.rs line 5  (input position 0: same file as position 2 but later line)
+    //   z.rs line 1  (input position 1: alphabetically later file)
+    //   b.rs line 2  (input position 2: same file as position 0 but earlier line)
+    // After sorting by (path, line) the expected order is b.rs:2, b.rs:5, z.rs:1.
+    let token = REMOVED_SURFACE_TOKENS[2]; // `yes_ship` — built at runtime, not literal
+    let files: Vec<(PathBuf, String)> = vec![
+        // b.rs: violation at line 5 (four blank lines push it down)
+        (
+            PathBuf::from("b.rs"),
+            ["\n\n\n\nlet _ = ", token, ";"].concat(),
+        ),
+        // z.rs: violation at line 1 (later in the alphabet than b.rs)
+        (PathBuf::from("z.rs"), ["let _ = ", token, ";"].concat()),
+        // b.rs again: violation at line 2 (earlier in the file than the first b.rs entry)
+        (PathBuf::from("b.rs"), ["\nlet _ = ", token, ";"].concat()),
+    ];
+
+    let findings = removed_surface_findings(&files);
+
+    // Count: three findings. If sort is broken the count still holds, so an
+    // empty result cannot pass the order assertion below.
+    assert_eq!(
+        findings.len(),
+        3,
+        "three planted violations must yield three findings; got: {findings:?}"
+    );
+
+    // Order: b.rs:2 < b.rs:5 < z.rs:1 (sorted by path, then by line).
+    let prefixes: Vec<&str> = findings
+        .iter()
+        .map(|f| f.split(": removed").next().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        prefixes,
+        ["b.rs:2", "b.rs:5", "z.rs:1"],
+        "findings must be sorted by path then by line"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 52-18 (CUT-04, D-03): the docs site (`docs/**/*.md`, outside `doc_check`'s
+// scoped docs) describes only Plan → Code → Validate, links only pages that
+// exist, and maps only modules `lib.rs` declares.
+// ---------------------------------------------------------------------------
+
+/// The removed stage names, as the docs site would capitalise them.
+const REMOVED_STAGE_WORDS: &[&str] = &[concat!("Def", "ine"), concat!("Sh", "ip")];
+
+/// The docs-site page holding the module map, relative to `docs/`.
+const MODULE_MAP_PAGE: &str = "diagrams/module-map.md";
+
+/// Every `.md` path `nav:` in `docs/mkdocs.yml` names, with its 1-based line.
+fn nav_entries(nav: &str) -> Vec<(usize, String)> {
+    let mut entries = Vec::new();
+    let mut in_nav = false;
+    for (index, line) in nav.lines().enumerate() {
+        if !line.starts_with(' ') && !line.trim().is_empty() {
+            in_nav = line.trim_end() == "nav:";
+            continue;
+        }
+        if !in_nav {
+            continue;
+        }
+        let item = line.trim().trim_start_matches("- ");
+        let target = item
+            .rsplit_once(": ")
+            .map_or(item, |(_, value)| value)
+            .trim();
+        if target.ends_with(".md") {
+            entries.push((index + 1, target.to_string()));
+        }
+    }
+    entries
+}
+
+/// True for a single lowercase Rust identifier such as `agent_result`.
+fn is_lowercase_identifier(text: &str) -> bool {
+    text.chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_lowercase() || ch == '_')
+        && text
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+}
+
+/// Every module name the module map names, with its 1-based line: backticked
+/// names in the table's Modules column and mermaid node labels that are a
+/// single lowercase identifier.
+fn module_map_names(text: &str) -> Vec<(usize, String)> {
+    let mut names = Vec::new();
+    let mut modules_column = 1;
+    let mut in_mermaid = false;
+    for (index, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            in_mermaid = trimmed == "```mermaid";
+        } else if in_mermaid {
+            let mut rest = line;
+            while let Some(open) = rest.find('[') {
+                let after = &rest[open + 1..];
+                let Some(close) = after.find(']') else {
+                    break;
+                };
+                if is_lowercase_identifier(&after[..close]) {
+                    names.push((index + 1, after[..close].to_string()));
+                }
+                rest = &after[close + 1..];
+            }
+        } else if trimmed.starts_with('|') {
+            let cells: Vec<&str> = trimmed
+                .trim_matches('|')
+                .split('|')
+                .map(str::trim)
+                .collect();
+            if let Some(column) = cells.iter().position(|cell| *cell == "Modules") {
+                modules_column = column;
+            } else if let Some(cell) = cells.get(modules_column) {
+                names.extend(
+                    cell.split('`')
+                        .skip(1)
+                        .step_by(2)
+                        .map(|name| (index + 1, name.to_string())),
+                );
+            }
+        }
+    }
+    names
+}
+
+/// Every module `lib_rs` declares as `mod <name>;`, with or without `pub`.
+fn declared_modules(lib_rs: &str) -> Vec<String> {
+    lib_rs
+        .lines()
+        .filter_map(|line| {
+            let code = line.trim();
+            let code = code.strip_prefix("pub ").unwrap_or(code);
+            let name = code.strip_prefix("mod ")?.strip_suffix(';')?;
+            Some(name.trim().to_string())
+        })
+        .collect()
+}
+
+/// The relative Markdown link targets on `line`, each without its `#anchor`;
+/// `http://`, `https://`, `mailto:` and anchor-only targets are skipped.
+fn relative_link_targets(line: &str) -> Vec<String> {
+    line.match_indices("](")
+        .filter_map(|(start, _)| {
+            let rest = &line[start + 2..];
+            let target = rest[..rest.find(')')?]
+                .split_whitespace()
+                .next()?
+                .trim_matches(['<', '>']);
+            let external = ["http://", "https://", "mailto:"]
+                .iter()
+                .any(|scheme| target.starts_with(scheme));
+            let path = target.split('#').next().unwrap_or_default();
+            (!external && !path.is_empty()).then(|| path.to_string())
+        })
+        .collect()
+}
+
+/// `path` with `.` and `dir/..` pairs folded away, lexically; a `..` with
+/// nothing left to fold is kept.
+fn fold_relative(path: &Path) -> PathBuf {
+    let mut folded = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if folded.as_os_str().is_empty() || folded.ends_with("..") {
+                    folded.push("..");
+                } else {
+                    folded.pop();
+                }
+            }
+            other => folded.push(other),
+        }
+    }
+    folded
+}
+
+/// Every place the docs site names a removed stage, links a missing page,
+/// lists a missing page in its nav, or maps an undeclared module, as
+/// `docs/<path>:line: <kind>`, sorted by path then line. `pages` and `exists`
+/// take paths relative to `docs/`.
+fn docs_site_findings(
+    pages: &[(PathBuf, String)],
+    nav: &str,
+    lib_rs: &str,
+    exists: &dyn Fn(&Path) -> bool,
+) -> Vec<String> {
+    let mut findings: Vec<(PathBuf, usize, String)> = Vec::new();
+    let mut push = |path: &Path, line: usize, kind: String| {
+        let shown = Path::new("docs").join(path);
+        let finding = format!("{}:{line}: {kind}", shown.display());
+        findings.push((shown, line, finding));
+    };
+    let declared = declared_modules(lib_rs);
+    for (page, text) in pages {
+        let text = blank_html_comments(text);
+        let directory = page.parent().unwrap_or(Path::new(""));
+        for (index, line) in text.lines().enumerate() {
+            for word in REMOVED_STAGE_WORDS {
+                if holds_bounded_token(line, word) {
+                    push(
+                        page,
+                        index + 1,
+                        format!("stage word `{word}`: {}", line.trim()),
+                    );
+                }
+            }
+            for target in relative_link_targets(line) {
+                if !exists(&fold_relative(&directory.join(&target))) {
+                    push(
+                        page,
+                        index + 1,
+                        format!("link to a missing page `{target}`"),
+                    );
+                }
+            }
+        }
+        if page == Path::new(MODULE_MAP_PAGE) {
+            for (line, name) in module_map_names(&text) {
+                if !declared.contains(&name) {
+                    push(
+                        page,
+                        line,
+                        format!("module `{name}` is not declared in lib.rs"),
+                    );
+                }
+            }
+        }
+    }
+    for (line, target) in nav_entries(nav) {
+        if !exists(Path::new(&target)) {
+            push(
+                Path::new("mkdocs.yml"),
+                line,
+                format!("nav entry names a missing page `{target}`"),
+            );
+        }
+    }
+    findings.sort();
+    findings
+        .into_iter()
+        .map(|(_, _, finding)| finding)
+        .collect()
+}
+
+#[test]
+fn docs_site_describes_only_the_kept_pipeline() {
+    let lib_rs = "pub mod git;\nmod doc_check;\npub mod stage;\n";
+    let known = ["index.md", "guides/quickstart.md", MODULE_MAP_PAGE];
+    let exists = |path: &Path| known.iter().any(|page| Path::new(page) == path);
+    let nav = "site_name: x\nnav:\n  - Home: index.md\n  - Guides:\n      - Quick Start: guides/quickstart.md\n";
+    let findings_for = |page: &str, text: &str, nav: &str| {
+        docs_site_findings(
+            &[(PathBuf::from(page), text.to_string())],
+            nav,
+            lib_rs,
+            &exists,
+        )
+    };
+    let [define, ship] = [REMOVED_STAGE_WORDS[0], REMOVED_STAGE_WORDS[1]];
+
+    // (a) Each planted defect is exactly one finding.
+    let positives = [
+        (
+            "index.md",
+            ["    V[Validate] --> S[", ship, "]"].concat(),
+            nav.to_string(),
+        ),
+        (
+            "index.md",
+            [define, " the phase before planning it."].concat(),
+            nav.to_string(),
+        ),
+        (
+            "index.md",
+            "See [Gone](missing.md) for more.".to_string(),
+            nav.to_string(),
+        ),
+        (
+            "index.md",
+            "Plain text.".to_string(),
+            [nav, "  - Gone: diagrams/missing.md\n"].concat(),
+        ),
+        (
+            MODULE_MAP_PAGE,
+            "| Git | `git`, `hooks` | Branches |".to_string(),
+            nav.to_string(),
+        ),
+        (
+            MODULE_MAP_PAGE,
+            "```mermaid\nflowchart LR\n    CLI --> HOOKS[hooks]\n```".to_string(),
+            nav.to_string(),
+        ),
+    ];
+    for (page, text, nav) in &positives {
+        let findings = findings_for(page, text, nav);
+        assert_eq!(
+            findings.len(),
+            1,
+            "`{text}` / nav `{nav}` must be one finding: {findings:?}"
+        );
+    }
+
+    // (b) Decoys are not findings.
+    let decoys = [
+        (
+            "index.md",
+            [ship, "ping and ", ship.to_lowercase().as_str(), "ped work."].concat(),
+        ),
+        (
+            "index.md",
+            "We ship code and define interfaces.".to_string(),
+        ),
+        ("index.md", ["<!-- ", ship, " was removed -->"].concat()),
+        ("index.md", ["<!--\n", define, "\n-->"].concat()),
+        (
+            "index.md",
+            "[Site](https://example.com/missing.md) and [Mail](mailto:a@b.c)".to_string(),
+        ),
+        (
+            "index.md",
+            "[Top](#section) and [Start](guides/quickstart.md#install)".to_string(),
+        ),
+        ("guides/quickstart.md", "[Home](../index.md)".to_string()),
+        (
+            MODULE_MAP_PAGE,
+            "| State | `stage`, `git` | Persist |".to_string(),
+        ),
+        (
+            MODULE_MAP_PAGE,
+            "```mermaid\n    CLI[devflow-cli] --> WF[workflow and state] --> G[git]\n```\n[Map](../index.md)".to_string(),
+        ),
+    ];
+    for (page, text) in &decoys {
+        let findings = findings_for(page, text, nav);
+        assert!(
+            findings.is_empty(),
+            "decoy `{text}` was flagged: {findings:?}"
+        );
+    }
+
+    // Ordering backstop: sorted by path, then line.
+    let unordered = vec![
+        (PathBuf::from("index.md"), ["\n\n", ship].concat()),
+        (
+            PathBuf::from("guides/quickstart.md"),
+            [define, "\n", ship].concat(),
+        ),
+    ];
+    let ordered: Vec<String> = docs_site_findings(&unordered, nav, lib_rs, &exists)
+        .iter()
+        .map(|finding| finding.split(": ").next().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(
+        ordered,
+        [
+            "docs/guides/quickstart.md:1",
+            "docs/guides/quickstart.md:2",
+            "docs/index.md:3"
+        ]
+    );
+
+    // (c) The real inputs are non-empty, so a clean result means something.
+    let root = workspace_root();
+    let docs = root.join("docs");
+    let pages: Vec<(PathBuf, String)> = read_labelled(
+        files_under(&docs, &root.join("target"))
+            .into_iter()
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("md"))
+            .collect(),
+    )
+    .into_iter()
+    .map(|(path, text)| {
+        (
+            path.strip_prefix(&docs).unwrap_or(&path).to_path_buf(),
+            text,
+        )
+    })
+    .collect();
+    assert!(!pages.is_empty(), "the docs walker found no pages");
+    let nav =
+        std::fs::read_to_string(docs.join("mkdocs.yml")).expect("docs/mkdocs.yml must be readable");
+    assert!(
+        !nav_entries(&nav).is_empty(),
+        "docs/mkdocs.yml's nav lists no page"
+    );
+    let module_map = pages
+        .iter()
+        .find(|(path, _)| path == Path::new(MODULE_MAP_PAGE))
+        .map(|(_, text)| text.as_str())
+        .expect("the docs site must keep its module map");
+    assert!(
+        !module_map_names(module_map).is_empty(),
+        "the module map names no module"
+    );
+    let lib_rs = std::fs::read_to_string(root.join("crates/devflow-core/src/lib.rs"))
+        .expect("lib.rs must be readable");
+    assert!(declared_modules(&lib_rs).iter().any(|name| name == "stage"));
+
+    // (d) The real docs site has no finding.
+    let findings = docs_site_findings(&pages, &nav, &lib_rs, &|path| docs.join(path).is_file());
+    assert!(
+        findings.is_empty(),
+        "the docs site describes removed surface (CUT-04, D-03):\n{}",
+        findings.join("\n")
     );
 }

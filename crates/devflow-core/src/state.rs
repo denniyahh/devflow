@@ -1,7 +1,7 @@
 //! DevFlow state machine.
 //!
-//! Drives the development workflow through a single linear chain of five stages:
-//! Define → Plan → Code → Validate → Ship. See [`crate::stage::Stage`].
+//! Drives the development workflow through a single linear chain of three stages:
+//! Plan → Code → Validate. See [`crate::stage::Stage`].
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -24,7 +24,7 @@ use crate::stage::Stage;
 /// state files written by older binaries still load.
 ///
 /// This exists because `State` accumulates a field roughly every phase that
-/// adds a run-scoped concept (`worktree_path`, `stop_until`, `yes_ship`, in
+/// adds a run-scoped concept (`worktree_path`, `stop_until`, in
 /// phase 28 `session_id` and `checkpoint_resumes`, and in phase 50
 /// `supervisor`).
 /// Without `non_exhaustive`, each of those additions is a semver-breaking
@@ -72,8 +72,10 @@ pub struct State {
     /// counter is NOT touched by `transition()`.
     #[serde(default)]
     pub preflight_retries: u32,
-    /// The commit count observed on the phase's feature branch at the most
-    /// recent Validate failure (999.66, D-03) — the forward-progress
+    /// The count of commits that change a path outside `.planning/` (D-34,
+    /// 52-27; `agent_result::phase_source_commit_count`) observed on the phase's
+    /// feature branch at the most recent Validate failure (999.66, D-03) — the
+    /// forward-progress
     /// baseline [`crate::mode::consecutive_failures_made_progress`] compares
     /// against to decide whether a new failure begins a fresh streak or
     /// continues the existing one.
@@ -117,10 +119,10 @@ pub struct State {
     /// Why it exists next to [`Self::consecutive_failures`] rather than
     /// replacing it: `consecutive_failures` is reset whenever
     /// [`crate::mode::consecutive_failures_made_progress`] reports that new
-    /// commits landed, and the Code stage's fix command is a GSD command
-    /// which routinely commits `.planning/` artifacts even when no source
-    /// changed. A loop that commits something trivial every cycle therefore
-    /// resets the streak every cycle and never reaches
+    /// commits landed. Since 52-27 (D-34) only commits that change a path
+    /// outside `.planning/` count, so GSD's own `.planning/` artifacts no
+    /// longer reset it, but a loop that commits a trivial source change every
+    /// cycle still resets the streak every cycle and never reaches
     /// [`crate::mode::MAX_CONSECUTIVE_FAILURES`]. This total cannot be reset
     /// by a commit count.
     ///
@@ -132,11 +134,14 @@ pub struct State {
     /// forced restart: `commands::start()` reads any persisted state for the
     /// same phase and copies this one field into the fresh `State`, because a
     /// bound a `devflow start --force` resets does not bound the unattended
-    /// case D-07 exists for. Exactly two events reset it to zero:
+    /// case D-07 exists for. Exactly three events reset it to zero (the
+    /// third is a `start` over a state recorded `finished`: that run passed
+    /// Validate, so the next one begins at zero, operator decision
+    /// 2026-11-11; a stopped run that did not finish still carries it):
     ///
-    /// 1. **Phase completion** — `finish_workflow_with_gate_timeout` calls
-    ///    `workflow::clear_state`, deleting `.devflow/state-{NN}.json`, so the
-    ///    next start for that phase finds nothing to carry.
+    /// 1. **State removal** — `workflow::clear_state` deletes
+    ///    `.devflow/state-{NN}.json` (an abort does), so the next start for
+    ///    that phase finds nothing to carry. A finished run keeps its state.
     /// 2. **Operator approval at the ceiling gate** — the Validate gate
     ///    handling zeroes it when a human advances or loops back AND
     ///    [`crate::mode::phase_failure_ceiling_reached`] is true. Keyed on that
@@ -150,126 +155,22 @@ pub struct State {
     /// back to zero and silently restore itself.
     #[serde(default)]
     pub phase_validate_failures: u32,
-    /// The content fingerprint of this phase's `{N}-VERIFICATION.md` as it
-    /// stood at the START of this run (999.79), read via
-    /// [`crate::agent_result::phase_verification_fingerprint`] once the
-    /// evidence root for the run is known.
+    /// Whether `devflow start` finished preparing this run: set once, after the
+    /// run's worktree (or `--no-worktree` root) is final, and never reset.
     ///
-    /// `None` means no artifact was observed at the start of this run — the
-    /// ordinary case for a phase being executed for the first time. It is
-    /// deliberately distinct from `Some(h)`: an artifact that EXISTS now where
-    /// the baseline recorded none was authored during this run, whereas an
-    /// artifact whose fingerprint still equals the baseline was inherited from
-    /// a previous run and its verdict must not be reused.
+    /// Its one reader is `run_never_prepared` in the CLI, which tells a
+    /// prepared run from a state only a `start`'s reservation wrote (that
+    /// `start` died before forking a worktree or passing its guards): `devflow
+    /// resume` and a hand-run `devflow advance` refuse to launch the latter, and
+    /// `status`'s recovery hints name `start` for it. `false` is the serde
+    /// default, so a reservation's state reads as unprepared.
     ///
-    /// **State written by a binary predating this field also deserializes to
-    /// `None`, and that is NOT the same reading** (WR-05, 35-REVIEW). This doc
-    /// comment used to claim it was. For a phase started under an older binary
-    /// and continued by this one, the previous run's committed
-    /// `{N}-VERIFICATION.md` is already on disk while the baseline reads
-    /// `None` — so the `(Some, None)` row would classify an inherited artifact
-    /// as authored-this-run and dispatch `--gaps-only` against zero matching
-    /// plans, gating unresolvably. That is verbatim the DOGFOOD-01-class stall
-    /// 999.79 exists to close, reproduced for every in-flight phase across the
-    /// upgrade.
-    ///
-    /// [`Self::verification_baseline_captured`] is the discriminator: only a
-    /// run that actually performed the observation sets it, so a `None` from an
-    /// old state file is distinguishable from a `None` that means "looked, and
-    /// there was nothing there".
-    ///
-    /// Why this exists at all: nothing deletes or dates `{N}-VERIFICATION.md`,
-    /// so a `devflow start --force` re-run checks out a branch still carrying
-    /// the previous run's committed copy. Without this baseline the first
-    /// Validate failure of that re-run reads the inherited artifact as a
-    /// verdict and dispatches a `--gaps-only` pass against zero matching plans,
-    /// which gates unresolvably — the same unattended-stall class as
-    /// DOGFOOD-01, reached from a different direction.
-    ///
-    /// **Lifetime.** Like [`Self::last_validate_failure_commit_count`], and
-    /// unlike [`Self::consecutive_failures`] and [`Self::infra_failures`], this
-    /// field is NOT touched by `transition()` — it is a run-scoped observation
-    /// rather than a counter, so it is replaced wholesale rather than
-    /// incremented and needs no `saturating_add` treatment. It is also NOT
-    /// carried across a forced restart the way
-    /// [`Self::phase_validate_failures`] is: a new run must re-observe the
-    /// artifact, because the whole point is to compare against what THIS run
-    /// started with.
-    #[serde(default)]
-    pub last_verification_fingerprint: Option<u64>,
-    /// Whether [`Self::last_verification_fingerprint`] was actually observed by
-    /// this run, as opposed to merely absent (WR-05, 35-REVIEW).
-    ///
-    /// `Option<u64>` cannot carry this on its own: `None` means both "the run
-    /// looked and found no artifact" and "this state file predates the field,
-    /// so nobody ever looked", and those two demand OPPOSITE dispatches. The
-    /// first is the ordinary first-verification case and `--gaps-only` is
-    /// right; the second may be sitting on an inherited artifact, where
-    /// `--gaps-only` matches zero plans and stalls.
-    ///
-    /// `false` is therefore the correct serde default in both directions: a
-    /// state file written before this field existed genuinely did not capture a
-    /// baseline, and the conservative reading of an artifact whose provenance
-    /// is unknown is "inherited" — a full execute is wasteful, an unresolvable
-    /// gate is not recoverable.
-    ///
-    /// Set exactly once per run, at the same site that captures the baseline,
-    /// after `state.worktree_path` holds its final value.
+    /// The name is historical: until 52-24 this flag also marked that the
+    /// run-start verification baseline of the report-authorship heuristic had
+    /// been captured. That heuristic and its three sibling fields are gone;
+    /// Validate routes on GSD's own status.
     #[serde(default)]
     pub verification_baseline_captured: bool,
-    /// The mtime of the same artifact [`Self::last_verification_fingerprint`]
-    /// hashes, in nanoseconds since the Unix epoch, as of the same observation.
-    ///
-    /// WR-06 (35-REVIEW): a content fingerprint cannot see an IDEMPOTENT
-    /// rewrite. A Validate agent that re-authors byte-identical content on a
-    /// later failing cycle produces the same hash as an artifact nobody
-    /// touched, so a hash-only rule reads its own agent's work as inherited and
-    /// dispatches a full execute — re-running every plan in the phase on every
-    /// subsequent cycle instead of the gaps-only pass Phase 33 built. That is
-    /// the "too strict" direction the freshness rule's own comment claims to
-    /// guard against and did not.
-    ///
-    /// Moves in lockstep with the fingerprint: written at the same capture
-    /// site, replaced at the same update site, and never read on its own — the
-    /// pair is the observation, and either one differing means the artifact was
-    /// written during this run.
-    ///
-    /// 35.2 D-05: mtime was considered as the provenance signal and REJECTED.
-    /// A branch checkout or worktree merge-back updates mtime exactly as a
-    /// real write does — it fails on the identical scenario
-    /// [`Self::verification_run_nonce`] exists to catch, which is why 999.89
-    /// survived 35-05's WR-06 fix. mtime is still what detects a byte-identical
-    /// rewrite INSIDE the Validate dispatch window whose bounds the nonce
-    /// establishes — provenance and freshness are different questions.
-    #[serde(default)]
-    pub last_verification_mtime_nanos: Option<u64>,
-    /// A run-owned marker stamped per Validate dispatch proving DevFlow itself
-    /// launched the agent whose output this state describes (35.2, 999.89 /
-    /// HARDEN-03, D-01).
-    ///
-    /// `None` means DevFlow never stamped a Validate dispatch for this state,
-    /// which is both the pre-35.2-state-file case and the never-dispatched
-    /// case. Both demand the conservative reading: the artifact's provenance is
-    /// unknown and `verification_authored_this_run` returns `false`.
-    ///
-    /// **Lifetime — replaced wholesale on every Validate dispatch, not
-    /// incremented across runs.** Unlike [`Self::consecutive_failures`] and
-    /// [`Self::phase_validate_failures`], this field is NOT touched by
-    /// `transition()`, and [`State::new`] resets it, so a `--force` restart
-    /// cannot inherit a previous run's stamp. The value is a monotonically
-    /// increasing counter; the predicate consults [`Option::is_some`], never
-    /// the magnitude, so saturation cannot degrade the signal.
-    ///
-    /// The write site is `launch_stage_inner` in `pipeline_launch.rs`, gated
-    /// on `Stage::Validate`, co-located with a fresh fingerprint/mtime
-    /// re-observation — the stamp and the baseline are one mechanism, and
-    /// splitting them silently restores the run-wide observation window.
-    ///
-    /// An actor who can write `.devflow/state-{N}.json` can set `stage` or
-    /// `consecutive_failures` directly; this field adds no attack surface
-    /// beyond what already exists (P-03).
-    #[serde(default)]
-    pub verification_run_nonce: Option<u64>,
     /// When the phase started (Unix seconds).
     pub started_at: String,
     /// Path to the project root.
@@ -340,20 +241,19 @@ pub struct State {
     /// when `stopped` is `false`, or when the state predates this field.
     #[serde(default)]
     pub stop_reason: Option<String>,
-    /// Pre-authorization for the Ship gate (D-04/D-05/D-06, 23-09),
-    /// set only from the `--yes-ship` CLI flag typed on `devflow start`.
+    /// Whether the run ended because its Validate passed (Phase 52 D-35):
+    /// Validate is the last stage, and a finished run keeps its state,
+    /// recorded with `stopped` set, so `status` and `cleanup` can say what
+    /// happened. Set once, in the write that ends the run; `devflow resume`
+    /// refuses a finished run, and a new `devflow start` replaces it.
     ///
-    /// Persisted rather than passed through the call stack: the Ship gate
-    /// fires inside a detached monitor's `advance` process, minutes to
-    /// hours after the launching `devflow start` process has already
-    /// exited, so a CLI-scoped value would be gone by the time it matters —
-    /// only a value written to `state.json` at start time survives to be
-    /// read back by that later, separate process. `false` for any state
-    /// written by a binary predating this field.
+    /// `false` means EITHER "the run has not finished" (in flight, halted by
+    /// `--until`, or stopped) OR "the state was written by a binary predating
+    /// this field" — both behave identically.
     #[serde(default)]
-    pub yes_ship: bool,
+    pub finished: bool,
     /// The integration trunk this run resolved at `start` (45-01/D-01),
-    /// persisted for the same reason [`Self::yes_ship`] is: the value comes
+    /// persisted rather than re-resolved: the value comes
     /// from `DEVFLOW_BASE_BRANCH` or `devflow.toml`, but every later entry
     /// point (`advance`, `resume`, and the checkout hooks that merge the
     /// phase branch) runs in a SEPARATE process whose environment need not
@@ -373,7 +273,7 @@ pub struct State {
     /// field" — both cases behave identically: the canary runs.
     ///
     /// Persisted rather than held in memory for the same reason
-    /// [`Self::yes_ship`] is: each stage launch happens in a SEPARATE
+    /// [`Self::base_branch`] is: each stage launch happens in a SEPARATE
     /// `devflow` process (the monitor's own `advance` tail), so an
     /// in-process flag would reset to "not yet run" at every stage
     /// transition and re-spend a real throwaway agent invocation each time —
@@ -384,28 +284,6 @@ pub struct State {
     /// in the run; it is not consumed by the first refusal.
     #[serde(default)]
     pub canary: Option<crate::canary::CanaryOutcome>,
-    /// D-11's opt-out: force the pre-31 single-document Claude launch
-    /// (positional prompt, `--output-format json`, the `sh` monitor) for this
-    /// run, off by default.
-    ///
-    /// `false` means EITHER "the operator did not ask for the legacy path" OR
-    /// "the state was written by a binary predating this field" — both cases
-    /// behave identically: the D-09/D-10 rollout decides the transport, which
-    /// is the pre-existing behaviour.
-    ///
-    /// Persisted rather than passed through the call stack for the reason
-    /// [`Self::yes_ship`] gives: each stage launch happens in a SEPARATE
-    /// `devflow` process (the detached monitor's own `advance` tail), so a
-    /// CLI-scoped value would be gone by the time the second stage launches
-    /// and the run would silently revert to the stream transport mid-flight.
-    ///
-    /// Only ever OR-ed, never cleared, once set — see
-    /// `pipeline_launch::apply_legacy_launch_opt_out`. Clearing it on a plain
-    /// `devflow resume` would be the same silent-drop class as `stop_until`'s
-    /// old unconditional clear (999.60). To turn it back off, edit
-    /// `.devflow/state-NN.json` or start a new run.
-    #[serde(default)]
-    pub legacy_claude_launch: bool,
     /// Provenance for the human-only checkpoint set DevFlow last checked at
     /// this phase's Code preflight (D-07, CHKPT-02 / 999.126).
     ///
@@ -433,7 +311,7 @@ pub struct State {
     ///   phase declared no human-only checkpoint", which is the fact that
     ///   makes a later addition detectable.
     ///
-    /// Persisted rather than held in memory for the reason [`Self::yes_ship`]
+    /// Persisted rather than held in memory for the reason [`Self::base_branch`]
     /// gives: the resume decision that compares against this set runs in the
     /// detached monitor's own separate `devflow advance` process, long after
     /// the process that recorded it has exited.
@@ -463,7 +341,7 @@ pub struct State {
     /// behaviour.
     ///
     /// Persisted rather than passed through the call stack for the reason
-    /// [`Self::yes_ship`] gives: each stage launch happens in a SEPARATE
+    /// [`Self::base_branch`] gives: each stage launch happens in a SEPARATE
     /// `devflow` process (the detached monitor's own `advance` tail), and the
     /// rate limit is observed by that process, long after the command that
     /// configured the fallback has exited.
@@ -475,20 +353,33 @@ pub struct State {
     /// environment variable.
     ///
     /// It applies only to a rate limit at [`Stage::Code`] (operator ruling
-    /// R-2): a rate limit at any other stage takes the cron arm and leaves the
-    /// fallback unused. One handoff sets [`Self::fallback_consumed`], after
-    /// which a later rate limit takes the cron arm too (D-05).
+    /// R-2): a rate limit at any other stage waits at the stage's gate and
+    /// leaves the fallback unused. One handoff sets [`Self::fallback_consumed`],
+    /// after which a later rate limit waits at the gate too (D-05).
     #[serde(default)]
     pub fallback_agent: Option<AgentKind>,
     /// Whether this run has already handed off to [`Self::fallback_agent`]
     /// (D-05). Set in the same state write that makes the fallback the run's
-    /// agent, so a second rate limit can never hand off again; it takes the
-    /// cron arm instead. A refused handoff does not set it.
+    /// agent, so a second rate limit can never hand off again; it waits at the
+    /// stage's gate instead. A refused handoff does not set it.
     ///
     /// `false` means EITHER "the fallback has not been used" OR "the state was
     /// written by a binary predating this field" — both behave identically.
     #[serde(default)]
     pub fallback_consumed: bool,
+    /// Whether this run's one automatic relaunch at a rate-limit gate has
+    /// happened (D-16, D-27.3, D-38). Only the reset timer sets it, for the
+    /// gate whose single claim takes the timer's answer; an operator's approve
+    /// or reject at a rate-limit gate never sets it, so a later denial with a
+    /// known reset still gets its automatic relaunch. Whether a gate's timer is
+    /// armed is decided from this flag when the supervisor waits, and is never
+    /// stored in the gate file (52-32).
+    ///
+    /// `false` means EITHER "the automatic relaunch has not happened" OR "the
+    /// state was written by a binary predating this field" — both behave
+    /// identically.
+    #[serde(default)]
+    pub rate_limit_auto_relaunch_used: bool,
     /// The fix type of the Code pass in flight (Phase 51 D-09).
     ///
     /// Set by a loop-back to Code in the same write that enters Code, and
@@ -505,6 +396,62 @@ pub struct State {
     /// default prompt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_fix: Option<crate::prompt::FixType>,
+    /// The operator's note for the fix pass in flight (GATE-01, D-14): the note
+    /// on the rejected verification gate whose loop-back set [`State::code_fix`],
+    /// written in the same commit. It lives exactly as long as `code_fix`, so a
+    /// failover or resume replay of the fix pass hands the note to the agent
+    /// again, and the transition that clears `code_fix` clears it too. Rendered
+    /// only through the prompt's note block, verbatim but for removed control
+    /// characters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_fix_note: Option<String>,
+    /// What GSD said when Validate chose the re-verify pass (D-32 part 1):
+    /// GSD's status, route and next action, written in the commit that sets
+    /// [`State::code_fix`] to [`crate::prompt::FixType::StaleReverify`] and
+    /// cleared with `code_fix`, so a resumed or failed-over re-verify pass
+    /// quotes the same words. `None` for every other fix pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_fix_report: Option<crate::prompt::ReverifyReport>,
+    /// The operator's note for a relaunch of the stage a rejected gate stopped
+    /// at (GATE-01, D-39): the note on a rejected stage-failure gate at Plan,
+    /// Code or Validate, committed before the stage relaunches. Every prompt
+    /// built for that stage carries it (a retry, a stop and resume, a failover
+    /// replay), and it is cleared once the run leaves the stage: by
+    /// `transition`, by the loop-back from Validate to Code and when the run
+    /// finishes. Kept apart from [`State::code_fix_note`], whose lifetime is the
+    /// fix pass rather than the stage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relaunch_note: Option<String>,
+    /// The commit a Validate agent PASS was recorded on (52-22, D-45 rule 1's
+    /// input): the evidence root's HEAD, read when the Validate outcome was
+    /// classified. Written only by the CLI's `handle_validate_outcome`, on every
+    /// classified Validate verdict: the HEAD on an agent PASS, `None` on a FAIL, an
+    /// ambiguous verdict or a HEAD that could not be read. Nothing else clears it,
+    /// so a stop, a transition, a resume or a supervisor takeover keeps it.
+    ///
+    /// `None` also means "no Validate has been classified in this run" or "the
+    /// state was written by a binary predating this field".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validate_pass_head: Option<String>,
+    /// Whether the run is in a gap-closure pass (GATE-03, D-09): a Validate
+    /// read GSD's `gaps_found` and the run went back to Plan, which runs
+    /// `/gsd-plan-phase N --gaps`, then Code, which runs
+    /// `/gsd-execute-phase N --gaps-only`, then Validate again.
+    ///
+    /// Set by the move from Validate to Plan that starts the pass. Cleared
+    /// only when the following Validate reads GSD's `passed`, when the run
+    /// finishes or is aborted, or when another fix route replaces it in the
+    /// same commit (a loop-back to Code with another fix). A `devflow stop`,
+    /// an `--until` halt, a crash, a resume and a supervisor takeover all keep
+    /// it, so a stopped gaps pass relaunches as a gaps pass (review C6), never
+    /// as an ordinary Plan or a full execute. While it is set the
+    /// consecutive-failure streak is not reset by the pass's transitions
+    /// (D-25).
+    ///
+    /// `false` also means "the state was written by a binary predating this
+    /// field".
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub gap_closure_pass: bool,
 }
 
 /// The persisted handle on a launch's supervisor ([`State::supervisor`]).
@@ -706,10 +653,11 @@ impl FromStr for AgentKind {
 pub struct AgentParseError(String);
 
 impl State {
-    /// Create a new state for starting a phase at the [`Stage::Define`] stage.
+    /// Create a new state for starting a phase at the [`Stage::Plan`] stage, the first stage
+    /// a run launches.
     pub fn new(phase: PhaseId, agent: AgentKind, mode: Mode, project_root: PathBuf) -> Self {
         State {
-            stage: Stage::Define,
+            stage: Stage::Plan,
             phase,
             agent,
             mode,
@@ -719,10 +667,7 @@ impl State {
             preflight_retries: 0,
             last_validate_failure_commit_count: None,
             phase_validate_failures: 0,
-            last_verification_fingerprint: None,
             verification_baseline_captured: false,
-            last_verification_mtime_nanos: None,
-            verification_run_nonce: None,
             started_at: timestamp_now(),
             project_root,
             worktree_path: None,
@@ -733,10 +678,9 @@ impl State {
             stop_until: None,
             stopped: false,
             stop_reason: None,
-            yes_ship: false,
+            finished: false,
             base_branch: None,
             canary: None,
-            legacy_claude_launch: false,
             // Pending, not Unrecorded: this state was created by a binary
             // that knows how to record the set, so its Code evaluation is
             // allowed to. Only a state file from an older binary may read
@@ -745,7 +689,13 @@ impl State {
             gate_notify_cmd: None,
             fallback_agent: None,
             fallback_consumed: false,
+            rate_limit_auto_relaunch_used: false,
             code_fix: None,
+            code_fix_note: None,
+            code_fix_report: None,
+            relaunch_note: None,
+            validate_pass_head: None,
+            gap_closure_pass: false,
         }
     }
 }
@@ -795,15 +745,16 @@ mod tests {
         assert!(err.to_string().contains("aider"));
     }
 
+    /// CUT-01: a fresh run starts at Plan, not Define.
     #[test]
-    fn new_state_starts_at_define() {
+    fn new_state_starts_at_plan() {
         let state = State::new(
             PhaseId::new(2),
             AgentKind::Claude,
             Mode::Auto,
             PathBuf::from("/repo"),
         );
-        assert_eq!(state.stage, Stage::Define);
+        assert_eq!(state.stage, Stage::Plan);
         assert_eq!(state.phase, PhaseId::new(2));
         assert_eq!(state.agent, AgentKind::Claude);
         assert_eq!(state.mode, Mode::Auto);
@@ -817,7 +768,6 @@ mod tests {
         assert_eq!(state.stop_until, None);
         assert!(!state.stopped);
         assert_eq!(state.stop_reason, None);
-        assert!(!state.yes_ship);
     }
 
     #[test]
@@ -832,7 +782,7 @@ mod tests {
         let back: State = serde_json::from_str(&json).unwrap();
         assert_eq!(back.phase, PhaseId::new(9));
         assert_eq!(back.agent, AgentKind::Codex);
-        assert_eq!(back.stage, Stage::Define);
+        assert_eq!(back.stage, Stage::Plan);
         assert_eq!(back.mode, Mode::Supervise);
     }
 
@@ -1091,6 +1041,40 @@ mod tests {
         assert!(!loaded.fallback_consumed);
     }
 
+    /// D-38: the run's automatic-relaunch flag is persisted under its own key,
+    /// and a state written before the field existed loads with `false`.
+    #[test]
+    fn rate_limit_auto_relaunch_used_defaults_to_false() {
+        let mut state = State::new(
+            PhaseId::new(1),
+            AgentKind::Claude,
+            Mode::Auto,
+            PathBuf::from("/repo"),
+        );
+        assert!(!state.rate_limit_auto_relaunch_used);
+        state.rate_limit_auto_relaunch_used = true;
+        let json = serde_json::to_string(&state).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value.get("rate_limit_auto_relaunch_used"),
+            Some(&serde_json::json!(true)),
+            "{json}"
+        );
+        let loaded: State = serde_json::from_str(&json).unwrap();
+        assert!(loaded.rate_limit_auto_relaunch_used);
+
+        let predating = r#"{
+            "stage": "code",
+            "phase": 1,
+            "agent": "claude",
+            "mode": "auto",
+            "started_at": "0",
+            "project_root": "/repo"
+        }"#;
+        let loaded: State = serde_json::from_str(predating).expect("an old state loads");
+        assert!(!loaded.rate_limit_auto_relaunch_used);
+    }
+
     /// D-09 (Phase 51): the fix type of the Code pass in flight is persisted under
     /// its own key with a snake_case value and survives a round trip; a state
     /// written before the field existed loads as "no fix pass"; and a state with
@@ -1103,16 +1087,16 @@ mod tests {
             Mode::Auto,
             PathBuf::from("/repo"),
         );
-        state.code_fix = Some(crate::prompt::FixType::AuditFix);
+        state.code_fix = Some(crate::prompt::FixType::GapsOnly);
         let json = serde_json::to_string(&state).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(
             value.get("code_fix"),
-            Some(&serde_json::json!("audit_fix")),
+            Some(&serde_json::json!("gaps_only")),
             "code_fix must be persisted under its own key: {json}"
         );
         let loaded: State = serde_json::from_str(&json).unwrap();
-        assert_eq!(loaded.code_fix, Some(crate::prompt::FixType::AuditFix));
+        assert_eq!(loaded.code_fix, Some(crate::prompt::FixType::GapsOnly));
 
         let predating = r#"{
             "stage": "code",
@@ -1239,40 +1223,12 @@ mod tests {
         assert_eq!(loaded.phase_validate_failures, 0);
     }
 
-    /// 999.79 (35-05): `last_verification_fingerprint` round-trips through
-    /// serde. The key-presence assertion comes BEFORE the value round-trip for
-    /// the same reason the two fields above give — this baseline is written by
-    /// `devflow start` and compared by a later `devflow advance`, which is a
-    /// different process, so a field that never reaches disk would leave every
-    /// comparison reading `None` and defeat the whole rule.
+    /// A serde-absent `verification_baseline_captured` (a state only a
+    /// `start`'s reservation wrote, or one predating the field) deserializes to
+    /// `false`, which `run_never_prepared` reads as a run `start` never
+    /// prepared.
     #[test]
-    fn last_verification_fingerprint_round_trips_through_serde() {
-        let mut state = State::new(
-            PhaseId::new(1),
-            AgentKind::Claude,
-            Mode::Auto,
-            PathBuf::from("/repo"),
-        );
-        state.last_verification_fingerprint = Some(0x0123_4567_89ab_cdef);
-        let json = serde_json::to_string(&state).unwrap();
-        assert!(
-            json.contains("last_verification_fingerprint"),
-            "last_verification_fingerprint must appear in persisted JSON"
-        );
-        let loaded: State = serde_json::from_str(&json).unwrap();
-        assert_eq!(
-            loaded.last_verification_fingerprint,
-            Some(0x0123_4567_89ab_cdef),
-            "last_verification_fingerprint must round-trip through serde"
-        );
-    }
-
-    /// A serde-absent `last_verification_fingerprint` (state written by a
-    /// binary predating this field) deserializes to `None` — "no artifact was
-    /// observed at the start of this run" — rather than failing the load, which
-    /// would make an upgrade mid-phase unrecoverable.
-    #[test]
-    fn last_verification_fingerprint_absent_from_json_defaults_to_none() {
+    fn verification_baseline_captured_absent_from_json_defaults_to_false() {
         let json = r#"{
             "stage": "code",
             "phase": 1,
@@ -1282,14 +1238,9 @@ mod tests {
             "project_root": "/repo"
         }"#;
         let loaded: State = serde_json::from_str(json).unwrap();
-        assert_eq!(loaded.last_verification_fingerprint, None);
-        // WR-05 (35-REVIEW): the SAME absent JSON must also report that nobody
-        // captured a baseline. `None` alone cannot carry that — it means both
-        // "looked, found nothing" and "never looked" — and the two demand
-        // opposite dispatches downstream.
         assert!(
             !loaded.verification_baseline_captured,
-            "state predating the baseline field never captured one, and must not claim to"
+            "a state that never recorded the flag must not claim a prepared run"
         );
     }
 
@@ -1314,50 +1265,7 @@ mod tests {
         let loaded: State = serde_json::from_str(&json).unwrap();
         assert!(
             loaded.verification_baseline_captured,
-            "a captured baseline must survive the save/load the real pipeline performs"
-        );
-    }
-
-    /// 35.2 D-01: verification_run_nonce must survive the save/load cycle
-    /// `handle_validate_outcome` → `select_loop_back_fix` performs.
-    #[test]
-    fn verification_run_nonce_round_trips_through_serde() {
-        let mut state = State::new(
-            PhaseId::new(1),
-            AgentKind::Claude,
-            Mode::Auto,
-            PathBuf::from("/repo"),
-        );
-        state.verification_run_nonce = Some(42);
-        let json = serde_json::to_string(&state).unwrap();
-        assert!(
-            json.contains("verification_run_nonce"),
-            "verification_run_nonce must appear in persisted JSON"
-        );
-        let loaded: State = serde_json::from_str(&json).unwrap();
-        assert_eq!(
-            loaded.verification_run_nonce,
-            Some(42),
-            "verification_run_nonce must round-trip through serde"
-        );
-    }
-
-    /// 35.2 D-01: a serde-absent verification_run_nonce (state written by
-    /// a pre-35.2 binary) deserializes to None — the conservative direction.
-    #[test]
-    fn verification_run_nonce_absent_from_json_defaults_to_none() {
-        let json = r#"{
-            "stage": "code",
-            "phase": 1,
-            "agent": "claude",
-            "mode": "auto",
-            "started_at": "0",
-            "project_root": "/repo"
-        }"#;
-        let loaded: State = serde_json::from_str(json).unwrap();
-        assert_eq!(
-            loaded.verification_run_nonce, None,
-            "pre-35.2 state must default to None — the conservative provenance reading"
+            "a prepared run must survive the save/load the real pipeline performs"
         );
     }
 
@@ -1596,27 +1504,6 @@ mod tests {
         assert_eq!(loaded.checkpoint_resumes, 0);
     }
 
-    /// 23-09 Task 1: `yes_ship` round-trips through serde as an exact `bool`
-    /// — its own key appears in the persisted JSON, and a fresh deserialize
-    /// recovers the value set, mirroring the `supervisor` round-trip above.
-    #[test]
-    fn yes_ship_round_trips_through_serde() {
-        let mut state = State::new(
-            PhaseId::new(1),
-            AgentKind::Claude,
-            Mode::Auto,
-            PathBuf::from("/repo"),
-        );
-        state.yes_ship = true;
-        let json = serde_json::to_string(&state).unwrap();
-        assert!(
-            json.contains("yes_ship"),
-            "yes_ship must appear in persisted JSON"
-        );
-        let loaded: State = serde_json::from_str(&json).unwrap();
-        assert!(loaded.yes_ship, "yes_ship must round-trip through serde");
-    }
-
     /// CR-02 (45-REVIEW.md): the base resolved at `start` only survives to
     /// the later, separate process that merges the phase branch if it is
     /// actually written to `state.json`.
@@ -1685,22 +1572,70 @@ mod tests {
         assert_eq!(loaded.gate_notify_cmd.as_deref(), Some("notify-send gate"));
     }
 
-    /// A serde-absent `yes_ship` (state written by a pre-23-09 binary) must
-    /// deserialize to `false`, not fail to deserialize — the same
-    /// backward-compat pattern as every other `#[serde(default)]` field
-    /// added since 17-01.
+    /// A state file written by a 3.x binary may still carry `yes_ship`, which
+    /// v4.0 removed with the Ship gate (D-01). It must still load, and the
+    /// key must not come back on the next save.
     #[test]
-    fn yes_ship_absent_from_json_defaults_to_false() {
-        let json = r#"{
+    fn a_state_file_with_a_leftover_yes_ship_key_still_loads() {
+        // Split so the removed-surface scan does not read this control as a leftover.
+        let json = concat!(
+            r#"{
             "stage": "code",
             "phase": 1,
             "agent": "claude",
             "mode": "auto",
             "started_at": "0",
-            "project_root": "/repo"
+            "project_root": "/repo",
+            "yes"#,
+            r#"_ship": true
+        }"#
+        );
+        let loaded: State =
+            serde_json::from_str(json).expect(concat!("a leftover yes", "_ship key must load"));
+        assert_eq!(loaded.stage, Stage::Code);
+        let saved = serde_json::to_string(&loaded).unwrap();
+        assert!(
+            !saved.contains(concat!("yes", "_ship")),
+            "the key is dropped on save: {saved}"
+        );
+    }
+
+    /// A state file written before 52-24 carries the verification-window keys
+    /// of the report-authorship heuristic v4.0 removed. It must still load, the
+    /// three removed keys must not come back on the next save, and the kept
+    /// `verification_baseline_captured` (which `devflow resume` reads to tell a
+    /// prepared run from a reservation) keeps its value.
+    #[test]
+    fn a_state_with_the_removed_verification_fields_still_loads() {
+        let removed = [
+            "last_verification_fingerprint",
+            "last_verification_mtime_nanos",
+            "verification_run_nonce",
+        ];
+        let json = r#"{
+            "stage": "validate",
+            "phase": 1,
+            "agent": "claude",
+            "mode": "auto",
+            "started_at": "0",
+            "project_root": "/repo",
+            "last_verification_fingerprint": 81985529216486895,
+            "verification_baseline_captured": true,
+            "last_verification_mtime_nanos": 1794380000000000000,
+            "verification_run_nonce": 3
         }"#;
-        let loaded: State = serde_json::from_str(json).unwrap();
-        assert!(!loaded.yes_ship);
+        let loaded: State =
+            serde_json::from_str(json).expect("a state with the removed keys must load");
+        assert_eq!(loaded.stage, Stage::Validate);
+        assert!(loaded.verification_baseline_captured);
+        let saved = serde_json::to_string(&loaded).unwrap();
+        for key in removed {
+            assert!(
+                !saved.contains(key),
+                "the removed key {key} is dropped on save: {saved}"
+            );
+        }
+        assert!(saved.contains("verification_baseline_captured"), "{saved}");
     }
 
     /// 20c: `stop_until`/`stopped`/`stop_reason` all round-trip through

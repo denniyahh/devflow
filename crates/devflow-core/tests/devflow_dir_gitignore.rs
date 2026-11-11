@@ -23,7 +23,6 @@ use devflow_core::gates::Gates;
 use devflow_core::liveness;
 use devflow_core::monitor;
 use devflow_core::phase_id::PhaseId;
-use devflow_core::ship;
 use devflow_core::workflow;
 use devflow_core::{AgentKind, Mode, Stage, State};
 use std::path::Path;
@@ -35,7 +34,8 @@ fn gitignore_is_star(root: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Every one of the 7 production `.devflow/`-creating entry points, driven
+/// Every one of the 8 production `.devflow/`-creating entry points this test
+/// covers (case 3 checks two: the launch reservation and the monitor spawn), driven
 /// through its real public API (not `ensure_devflow_dir` directly — that
 /// would prove nothing about whether the site was actually converted),
 /// against its own fresh temp project root. Failures accumulate into a
@@ -66,7 +66,7 @@ fn launch_context() -> ExitingMonitor {
 }
 
 #[test]
-fn all_seven_devflow_constructors_produce_the_gitignore() {
+fn all_eight_devflow_constructors_produce_the_gitignore() {
     let mut failures: Vec<&str> = Vec::new();
 
     // 1. workflow::save_state -> workflow.rs write_state_atomic
@@ -89,7 +89,14 @@ fn all_seven_devflow_constructors_produce_the_gitignore() {
     {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        Gates::write_gate(root, PhaseId::new(1), Stage::Validate, "context").expect("write_gate");
+        Gates::write_gate(
+            root,
+            PhaseId::new(1),
+            Stage::Validate,
+            devflow_core::gates::GateKind::StageFailure,
+            "context",
+        )
+        .expect("write_gate");
         if !gitignore_is_star(root) {
             failures.push("gates::Gates::write_gate (gates.rs)");
         }
@@ -170,22 +177,7 @@ fn all_seven_devflow_constructors_produce_the_gitignore() {
         }
     }
 
-    // 6. ship::write_cron_instructions -> ship.rs write_cron_instructions
-    {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let instructions = ship::build_single_agent_cron_instructions(
-            root,
-            PhaseId::new(1),
-            "2026-01-01T00:00:00Z",
-        );
-        ship::write_cron_instructions(root, &instructions).expect("write_cron_instructions");
-        if !gitignore_is_star(root) {
-            failures.push("ship::write_cron_instructions (ship.rs)");
-        }
-    }
-
-    // 7. workflow::update_state_with -> workflow.rs lock_for_write, whose lock file
+    // 6. workflow::update_state_with -> workflow.rs lock_for_write, whose lock file
     // `.devflow/.state-NN.lock` it creates before any state exists.
     {
         let dir = tempfile::tempdir().unwrap();
@@ -199,7 +191,7 @@ fn all_seven_devflow_constructors_produce_the_gitignore() {
         }
     }
 
-    // 8. liveness::claim_phase_holder -> liveness.rs, `.devflow/.holder-NN` (D-17)
+    // 7. liveness::claim_phase_holder -> liveness.rs, `.devflow/.holder-NN` (D-17)
     {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -217,8 +209,8 @@ fn all_seven_devflow_constructors_produce_the_gitignore() {
 }
 
 /// Small helper so a failing `archive_phase_files` reports through the same
-/// accumulate-then-assert shape as the other 6 sites, instead of panicking
-/// mid-test via `.expect()` and hiding which of the 7 sites regressed.
+/// accumulate-then-assert shape as the other sites, instead of panicking
+/// mid-test via `.expect()` and hiding which site regressed.
 fn archive_phase_files_or_panic(root: &Path, phase: PhaseId) {
     agent_result::archive_phase_files(root, root, phase, 5).expect("archive_phase_files");
 }
