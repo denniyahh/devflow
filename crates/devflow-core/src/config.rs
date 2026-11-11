@@ -645,6 +645,35 @@ mod tests {
         assert_eq!(load_config(dir.path()), DevflowConfig::default());
     }
 
+    /// v4.0 removed the Ship gate's pre-authorization (D-01). A `devflow.toml`
+    /// written for 3.x may still carry `yes_ship`; it must load without error
+    /// and the key must change nothing. `capture_retention` sits beside it so
+    /// the file is known to have parsed: a parse failure would also return the
+    /// defaults, and that would make this test pass for the wrong reason.
+    #[test]
+    fn a_leftover_yes_ship_key_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("devflow.toml"),
+            "yes_ship = true\ncapture_retention = 9\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            config_parse_error(dir.path()),
+            None,
+            "a leftover yes_ship key must not fail the load"
+        );
+        assert_eq!(
+            load_config(dir.path()),
+            DevflowConfig {
+                capture_retention: 9,
+                ..DevflowConfig::default()
+            },
+            "the file parsed (capture_retention is 9) and yes_ship had no effect"
+        );
+    }
+
     /// D-12: an absent `devflow.toml` must never pre-authorize a Ship — the
     /// deliberate asymmetry with `external_verify_enabled`'s `true` default.
     #[test]
