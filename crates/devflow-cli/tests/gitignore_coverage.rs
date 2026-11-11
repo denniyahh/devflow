@@ -27,8 +27,6 @@ fn repo_root() -> PathBuf {
 const RUNTIME_PATHS: &[&str] = &[
     ".devflow/state.json",
     ".devflow/state-07.json",
-    ".devflow/lock-07",
-    ".devflow/lock-project",
     ".devflow/phase-01-stdout",
     ".devflow/phase-01-stderr.log",
     ".devflow/phase-01-exit",
