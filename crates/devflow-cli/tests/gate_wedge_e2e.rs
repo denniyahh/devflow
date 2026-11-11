@@ -348,6 +348,54 @@ fn a_rejection_note_reaches_the_stream_prompt_verbatim() {
     );
 }
 
+/// GATE-01 / D-14 on the capture shape: the same rejection on a Codex run,
+/// whose prompt travels as argv. The relaunched agent's logged argv holds
+/// [`REJECTION_NOTE`] byte for byte.
+#[test]
+fn a_rejection_note_reaches_the_capture_prompt_verbatim() {
+    let home = common::HermeticHome::new();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let logs = tempfile::tempdir().unwrap();
+    let phase = PhaseId::new(4825);
+    init_launchable_repo(root, phase);
+    let _reaper = common::LaunchedRunReaper::new(root, phase, Vec::new());
+    // The relaunched Code stage logs its argv and stdin, then fails again, so
+    // nothing more is launched.
+    let fake_bin = common::capture_agent_bin_then(logs.path(), "exit 1");
+    let _child = ReapOnDrop(spawn_gated_advance_as(
+        &home,
+        root,
+        phase,
+        Some(&fake_bin.path),
+        AgentKind::Codex,
+        // Supervise: auto mode refuses an unattended Code stage on the capture
+        // shape before any agent starts.
+        |state| state.mode = Mode::Supervise,
+    ));
+
+    let output = answer_code_gate(&home, root, phase, "reject", REJECTION_NOTE);
+    assert!(
+        output.status.success(),
+        "reject failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let argv_log = logs.path().join(common::AGENT_ARGV_LOG);
+    common::wait_for(
+        || fs::read_to_string(&argv_log).is_ok_and(|argv| argv.contains("execute-phase")),
+        Duration::from_secs(20),
+        "the relaunched Code agent to log its argv",
+    );
+    let argv = fs::read_to_string(&argv_log).unwrap();
+    assert!(
+        argv.contains(REJECTION_NOTE),
+        "the relaunched agent's argv must hold the note byte for byte:\n{argv}"
+    );
+    let state = state_json(root, phase);
+    assert_eq!(state["relaunch_note"], REJECTION_NOTE, "{state}");
+    assert!(state.get("code_fix_note").is_none(), "{state}");
+}
+
 /// `devflow gate abort` writes an answer whose `abort` field is `true`: the
 /// field, not the note, is what ends the run.
 #[test]
