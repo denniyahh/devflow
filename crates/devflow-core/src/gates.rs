@@ -53,6 +53,32 @@ pub struct GateFile {
     /// the field existed, which is why it stays an `Option`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_kind: Option<GateKind>,
+    /// GSD's verification status the gate was opened over (52-29), a label
+    /// like `gate_kind`: no answer is routed on it, since an approve reads the
+    /// status fresh (D-45 rule 2). `None` for a reader failure, a status-less
+    /// gate, and a gate file written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gsd_status: Option<crate::gsd_reader::GsdStatus>,
+}
+
+/// What a gate's writer records about it beside its context: its required
+/// kind and, for a verification gate, the GSD status it was opened over
+/// (52-29). A [`GateKind`] alone converts into a label with no status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GateLabel {
+    /// The gate's kind.
+    pub kind: GateKind,
+    /// The GSD status the gate was opened over, if any.
+    pub gsd_status: Option<crate::gsd_reader::GsdStatus>,
+}
+
+impl From<GateKind> for GateLabel {
+    fn from(kind: GateKind) -> Self {
+        GateLabel {
+            kind,
+            gsd_status: None,
+        }
+    }
 }
 
 /// The kind of a gate, as its writer records it in [`GateFile::gate_kind`]. The
@@ -561,10 +587,17 @@ impl Gates {
         project_root: &Path,
         phase: PhaseId,
         stage: Stage,
-        kind: GateKind,
+        label: impl Into<GateLabel>,
         context: &str,
     ) -> Result<OpenedGate, GateError> {
-        Self::open_gate_as(project_root, phase, stage, &GateId::new(), kind, context)
+        Self::open_gate_as(
+            project_root,
+            phase,
+            stage,
+            &GateId::new(),
+            label.into(),
+            context,
+        )
     }
 
     /// Open a gate and register its waiter, in that order on disk: the registration
@@ -580,10 +613,18 @@ impl Gates {
         project_root: &Path,
         phase: PhaseId,
         stage: Stage,
-        kind: GateKind,
+        label: impl Into<GateLabel>,
         context: &str,
     ) -> Result<(OpenedGate, WaiterRegistration), GateError> {
-        Self::open_registered_with_hooks(project_root, phase, stage, kind, context, || {}, || {})
+        Self::open_registered_with_hooks(
+            project_root,
+            phase,
+            stage,
+            label.into(),
+            context,
+            || {},
+            || {},
+        )
     }
 
     /// [`open_registered`](Self::open_registered)'s whole sequence, so the tests run
@@ -593,7 +634,7 @@ impl Gates {
         project_root: &Path,
         phase: PhaseId,
         stage: Stage,
-        kind: GateKind,
+        kind: GateLabel,
         context: &str,
         before_publish: impl FnOnce(),
         after_publish: impl FnOnce(),
@@ -630,7 +671,7 @@ impl Gates {
             phase,
             stage,
             &gate_id,
-            GateKind::StageFailure,
+            GateKind::StageFailure.into(),
             context,
         )?;
         after_publish();
@@ -646,7 +687,7 @@ impl Gates {
         phase: PhaseId,
         stage: Stage,
         gate_id: &GateId,
-        kind: GateKind,
+        kind: GateLabel,
         context: &str,
     ) -> Result<OpenedGate, GateError> {
         let _lock = gate_lock(project_root, phase)?;
@@ -1459,7 +1500,7 @@ impl Gates {
         project_root: &Path,
         phase: PhaseId,
         stage: Stage,
-        kind: GateKind,
+        kind: impl Into<GateLabel>,
         context: &str,
     ) -> Result<PathBuf, GateError> {
         Self::open_gate(project_root, phase, stage, kind, context).map(|gate| gate.path)
@@ -1471,7 +1512,7 @@ impl Gates {
         phase: PhaseId,
         stage: Stage,
         gate_id: &GateId,
-        kind: GateKind,
+        label: GateLabel,
         context: &str,
     ) -> Result<OpenedGate, GateError> {
         let gate = GateFile {
@@ -1480,7 +1521,8 @@ impl Gates {
             context: context.to_string(),
             timestamp: unix_now(),
             gate_id: gate_id.to_string(),
-            gate_kind: Some(kind),
+            gate_kind: Some(label.kind),
+            gsd_status: None,
         };
         let path = Self::gate_path(project_root, phase, stage);
         info!("writing gate {} for phase {phase}", stage);
@@ -2147,6 +2189,52 @@ mod tests {
         assert_eq!(old.gate_kind, None);
     }
 
+    /// 52-29: a gate opened with a GSD status records it as GSD's own token
+    /// and reads it back; a gate opened without one writes no `gsd_status`
+    /// key; a 3.x-shaped file with no such key reads as `None`.
+    #[test]
+    fn a_gate_round_trips_its_gsd_status() {
+        use crate::gsd_reader::GsdStatus;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5291);
+
+        let opened = Gates::open_gate(
+            root,
+            phase,
+            Stage::Validate,
+            GateLabel {
+                kind: GateKind::GapsFound,
+                gsd_status: Some(GsdStatus::GapsFound),
+            },
+            "GSD verification: gaps_found",
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&opened.path).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(raw["gsd_status"], "gaps_found", "{text}");
+        let back: GateFile = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.gsd_status, Some(GsdStatus::GapsFound));
+
+        let without = Gates::open_gate(
+            root,
+            phase,
+            Stage::Code,
+            GateKind::StageFailure,
+            "a status-less gate",
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&without.path).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(raw.get("gsd_status").is_none(), "no gsd_status key: {text}");
+
+        let old: GateFile = serde_json::from_str(
+            r#"{"phase":5291,"stage":"plan","context":"3.x","timestamp":"1750000000","gate_id":"g-3x"}"#,
+        )
+        .unwrap();
+        assert_eq!(old.gsd_status, None);
+    }
+
     #[test]
     fn gate_file_round_trips_through_serde() {
         let gate = GateFile {
@@ -2156,6 +2244,7 @@ mod tests {
             timestamp: "1750000000".into(),
             gate_id: GateId::new().to_string(),
             gate_kind: None,
+            gsd_status: None,
         };
         let json = serde_json::to_string(&gate).unwrap();
         let back: GateFile = serde_json::from_str(&json).unwrap();
@@ -5090,7 +5179,7 @@ mod tests {
             shipped.path(),
             phase,
             stage,
-            GateKind::StageFailure,
+            GateKind::StageFailure.into(),
             "ctx",
             || {},
             || shipped_read = Some(answer_if_registered(shipped.path(), phase, stage)),
@@ -5152,7 +5241,7 @@ mod tests {
                 &root,
                 phase,
                 stage,
-                GateKind::StageFailure,
+                GateKind::StageFailure.into(),
                 "ctx",
                 || kill_at(BEFORE_PUBLISH),
                 || kill_at(AFTER_PUBLISH),
@@ -5218,7 +5307,7 @@ mod tests {
             dir.path(),
             phase,
             stage,
-            GateKind::StageFailure,
+            GateKind::StageFailure.into(),
             "ctx",
             || registered_at_publish = Some(waiter_files(dir.path()).len()),
             || panic!("the publish must fail"),
@@ -5951,6 +6040,7 @@ mod tests {
             timestamp: "1750000000".into(),
             gate_id: GateId::new().to_string(),
             gate_kind: None,
+            gsd_status: None,
         })
         .unwrap();
         assert!(idless.as_object_mut().unwrap().remove("gate_id").is_some());

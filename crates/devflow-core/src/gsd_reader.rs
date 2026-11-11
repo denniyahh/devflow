@@ -52,7 +52,10 @@ const LAUNCHER_CANDIDATES: [&str; 3] = [
 ///
 /// `unparseable` and `phase_dir_not_found` are in GSD's set too, but they say
 /// nothing was established, so they are [`ReaderFailure`]s.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Stored (in a gate file's `gsd_status`, 52-29) as GSD's own token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum GsdStatus {
     /// `passed`: the report passed and no covered file moved since.
     Passed,
