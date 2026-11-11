@@ -307,6 +307,7 @@ fn sweep_ends_a_real_advance_process_through_its_own_abort_path() {
     init_repo(root, phase);
 
     let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+    state.verification_baseline_captured = true;
     state.stage = Stage::Code;
     devflow_core::workflow::save_state(&state).unwrap();
 

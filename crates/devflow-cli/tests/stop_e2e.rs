@@ -664,6 +664,7 @@ fn stop_ends_a_gated_phase_through_its_own_abort_path_with_no_signal_sent() {
     init_repo(root, phase);
 
     let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+    state.verification_baseline_captured = true;
     state.stage = Stage::Code;
     devflow_core::workflow::save_state(&state).unwrap();
 
@@ -1456,7 +1457,7 @@ const SUCCEEDS: &str = r#"git commit -q --allow-empty -m "fake stage work"
 printf 'work done\nDEVFLOW_RESULT: {"status":"success","commits":1}\n'
 exit 0"#;
 
-/// What a [`triggered_agent`] does once released: a failed Define, which the
+/// What a [`triggered_agent`] does once released: a failed first stage (Plan), which the
 /// never-silent path parks at a human gate.
 const FAILS_TO_A_GATE: &str = r#"printf 'DEVFLOW_RESULT: {"status":"failed","reason":"gate fixture"}\n'
 exit 0"#;
@@ -1522,7 +1523,8 @@ impl Drop for RecordReaper {
 }
 
 /// One live supervised run of a [`triggered_agent`], started with
-/// `devflow start --mode supervise --until plan`. Its reapers are declared
+/// `devflow start --mode supervise --until code`, so a released first stage (Plan)
+/// hands off to one more. Its reapers are declared
 /// first so they drop before the home and repository they need.
 struct LiveRun {
     _record_reaper: RecordReaper,
@@ -1564,7 +1566,7 @@ impl LiveRun {
                 "supervise",
                 "--no-worktree",
                 "--until",
-                "plan",
+                "code",
             ])
             .arg(&root)
             .current_dir(&root)
@@ -2085,18 +2087,18 @@ fn stop_prints_that_an_unconfirmed_accepted_stop_is_pending() {
 fn stop_after_a_supervisor_killed_at_a_gate_reaps_and_reports_gone() {
     let run = LiveRun::start_with(PhaseId::new(144), FAILS_TO_A_GATE);
     std::fs::write(&run.trigger, "go\n").unwrap();
-    let gate = Gates::gate_path(&run.root, run.phase, Stage::Define);
+    let gate = Gates::gate_path(&run.root, run.phase, Stage::Plan);
     assert!(
         holds_within(RUN_WAIT, || gate.exists()),
-        "precondition: the run parks at the Define gate:\n{}",
+        "precondition: the run parks at the Plan gate:\n{}",
         std::fs::read_to_string(devflow_core::events::events_path(&run.root)).unwrap_or_default()
     );
-    let gate_id = open_gate_id(&run.root, run.phase, Stage::Define);
+    let gate_id = open_gate_id(&run.root, run.phase, Stage::Plan);
     assert!(
         holds_within(RUN_WAIT, || gate_registration_is_live(
             &run.root,
             run.phase,
-            Stage::Define,
+            Stage::Plan,
             &gate_id
         )),
         "precondition: the run holds the gate's registration"
@@ -2114,12 +2116,12 @@ fn stop_after_a_supervisor_killed_at_a_gate_reaps_and_reports_gone() {
         "a teardown that signalled nothing says the phase is resumable (R-8): {text}"
     );
     assert!(
-        gate_answer_files(&run.root, run.phase, Stage::Define).is_empty(),
+        gate_answer_files(&run.root, run.phase, Stage::Plan).is_empty(),
         "no gate response is written without a live waiter"
     );
     assert_eq!(run.probe(), Liveness::Gone, "the socket is torn down");
     assert_eq!(
-        Gates::waiter_status(&run.root, run.phase, Stage::Define, &gate_id).unwrap(),
+        Gates::waiter_status(&run.root, run.phase, Stage::Plan, &gate_id).unwrap(),
         devflow_core::gates::WaiterStatus::Absent,
         "the killed waiter's registration reads absent"
     );
@@ -2317,7 +2319,7 @@ fn stop_with_a_launch_id_tears_down_only_that_socket() {
     let state = devflow_core::workflow::load_state(&run.root, run.phase).unwrap();
     assert!(!state.stopped, "a targeted stop records nothing");
     assert!(
-        gate_answer_files(&run.root, run.phase, Stage::Define).is_empty(),
+        gate_answer_files(&run.root, run.phase, Stage::Plan).is_empty(),
         "a targeted stop answers no gate"
     );
 }

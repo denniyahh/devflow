@@ -199,10 +199,10 @@ impl Fixture {
         command
     }
 
-    /// A launcher for stage Define, held before its supervisor's agent spawn.
+    /// A launcher for stage Plan, the first stage, held before its supervisor's agent spawn.
     fn spawn_held_launcher(&self) -> Child {
         let launcher = self
-            .start("define", &[])
+            .start("plan", &[])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -460,7 +460,7 @@ fn kill_supervisor_at(socket: &Path) -> supervisor::Sidecar {
 /// and N has been SIGKILLed. Returns N+1's reservation.
 fn handoff_window(fixture: &Fixture) -> PendingSupervisor {
     let started = fixture
-        .start("plan", &["--until", "plan"])
+        .start("code", &["--until", "code"])
         .output()
         .expect("run devflow start");
     assert!(

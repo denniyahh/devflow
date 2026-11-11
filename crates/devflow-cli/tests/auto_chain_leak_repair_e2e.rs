@@ -223,6 +223,7 @@ impl Fixture {
         fs::write(&config, real_shape_config(flag_before)).unwrap();
 
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.clone());
+        state.verification_baseline_captured = true;
         state.stage = Stage::Code;
         state.stop_until = Some(Stage::Code);
         state.stopped = false;

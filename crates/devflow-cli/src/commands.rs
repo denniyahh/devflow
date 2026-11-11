@@ -508,9 +508,8 @@ fn start_reserved(
 
     // 999.106 driver-driven pre-flight: whether a fresh headless run can pass
     // a stage is declared by the driver's `interactivity_mode`, not a
-    // hardcoded `agent == Codex`. A `RequiresExistingArtifact` Define must
-    // have CONTEXT.md on the base branch; a `RequiresExistingArtifact` Plan
-    // warns without a PLAN.md. Fail in one second with instructions instead of
+    // hardcoded `agent == Codex`. A `RequiresExistingArtifact` first stage (Plan)
+    // must have CONTEXT.md on the base branch, and also warns without a PLAN.md. Fail in one second with instructions instead of
     // after a burned agent run and a dead-end gate. Checked on the RESOLVED
     // base (the branch worktrees fork from), so the result does not depend on
     // what the primary checkout happens to have checked out — and, since
@@ -782,16 +781,18 @@ fn start_reserved(
 /// Whether `start` must find the phase's CONTEXT.md on the base before launching `driver`:
 /// the driver declares the first stage a run launches as needing an existing artifact.
 fn start_requires_phase_context(driver: &dyn agents::AgentDriver) -> bool {
-    driver.interactivity_mode(Stage::Define) == agents::InteractivityMode::RequiresExistingArtifact
+    driver.interactivity_mode(Stage::Plan) == agents::InteractivityMode::RequiresExistingArtifact
 }
 
 /// Whether `state` is only what a `start`'s reservation wrote: that `start` died before
 /// preparing the run, so no worktree was forked, no base resolved and none of its guards
 /// passed. Every prepared run captures its verification baseline in [`start_reserved`], and
 /// nothing resets it. `worktree_path` cannot say this, because `--no-worktree` leaves it
-/// `None` for a prepared run.
+/// `None` for a prepared run. The stage cannot say it either, since a fresh state and a
+/// prepared run both sit at the first stage, and the event log cannot, because it is
+/// project-wide and append-only: an earlier run of the same phase left its events there.
 pub(crate) fn run_never_prepared(state: &State) -> bool {
-    state.stage == Stage::Define && !state.verification_baseline_captured
+    !state.verification_baseline_captured
 }
 
 /// The `start` that prepares what [`run_never_prepared`] says is missing. A worktree already
@@ -5584,11 +5585,12 @@ fn check_stage_event_drift(facts: &PhaseFacts) -> Option<PhaseFinding> {
     })
 }
 
-/// The phase's feature branch does not exist even though its stage is past
-/// `Define`. A `Warn` — a not-yet-pushed or manually deleted branch is
-/// recoverable without state surgery.
+/// The phase's feature branch does not exist even though its run is past
+/// preparation. A `Warn` — a not-yet-pushed or manually deleted branch is
+/// recoverable without state surgery. A run that was never prepared
+/// ([`PhaseFacts::unprepared_restart`] is set) never forked a branch.
 fn check_missing_branch(facts: &PhaseFacts) -> Option<PhaseFinding> {
-    if facts.feature_branch_exists || facts.stage == Stage::Define {
+    if facts.feature_branch_exists || facts.unprepared_restart.is_some() {
         return None;
     }
     Some(PhaseFinding {
@@ -8818,7 +8820,7 @@ mod tests {
             "the commit baseline is per-run; carrying it would compare a new run's count \
              against an old run's observation"
         );
-        assert_eq!(fresh.stage, Stage::Define);
+        assert_eq!(fresh.stage, Stage::Plan);
         assert_eq!(fresh.stop_until, None);
     }
 
@@ -10341,6 +10343,7 @@ mod tests {
             Mode::Auto,
             dir.path().to_path_buf(),
         );
+        state.verification_baseline_captured = true;
         state.gate_pending = true;
 
         state.stage = Stage::Code;
@@ -11734,6 +11737,7 @@ mod tests {
             let root = dir.path();
             let phase = PhaseId::new(90);
             let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+            state.verification_baseline_captured = true;
             state.stage = Stage::Validate;
             state.gate_pending = true;
             workflow::save_state(&state).unwrap();
@@ -15168,7 +15172,7 @@ mod tests {
             "{err}"
         );
         let after = workflow::load_state(root, phase).unwrap();
-        assert_eq!(after.stage, Stage::Define);
+        assert_eq!(after.stage, Stage::Plan);
         assert!(after.supervisor.is_none());
         assert!(!after.stopped, "the refusal marks nothing");
 
@@ -15178,7 +15182,7 @@ mod tests {
         assert!(err.contains("never finished preparing"), "{err}");
         assert_eq!(
             workflow::load_state(root, phase).unwrap().stage,
-            Stage::Define,
+            Stage::Plan,
             "a hand-run advance launched nothing"
         );
 
@@ -15532,7 +15536,7 @@ mod tests {
         }
         let hold = tempfile::tempdir().unwrap();
         let release = hold.path().join("release");
-        let spawn_hold: std::ffi::OsString = format!("define:{}", release.display()).into();
+        let spawn_hold: std::ffi::OsString = format!("plan:{}", release.display()).into();
         let mut launcher = devflow_core::test_support::spawn_test_in_child(
             name,
             path_dir.path(),
@@ -16596,7 +16600,7 @@ mod tests {
             crate::pipeline_launch::advance_command(
                 &holder_child_root(),
                 Some(phase),
-                Some(Stage::Define),
+                Some(Stage::Plan),
             )
             .unwrap();
             return;
@@ -16644,7 +16648,7 @@ mod tests {
         assert_eq!(output.status.signal(), None, "{output:?}");
         devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
         let state = workflow::load_state(root, phase).unwrap();
-        assert_eq!(state.stage, Stage::Define, "the stage does not move");
+        assert_eq!(state.stage, Stage::Plan, "the stage does not move");
         assert!(state.stopped, "the holder records the stop");
         assert_eq!(
             state.stop_reason.as_deref(),
@@ -16885,7 +16889,7 @@ mod tests {
                 (HOLDER_ROOT_ENV, root.as_os_str()),
             ],
         );
-        let gate = Gates::gate_path(root, phase, Stage::Define);
+        let gate = Gates::gate_path(root, phase, Stage::Plan);
         let deadline = std::time::Instant::now() + REACH_HOLD_WITHIN;
         while !gate.exists() {
             if std::time::Instant::now() > deadline || child.try_wait().unwrap().is_some() {

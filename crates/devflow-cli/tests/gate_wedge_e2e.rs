@@ -3,7 +3,7 @@
 //!
 //! The file pins both drivers:
 //! - the `start_*` arms cover criterion 4's shape: a foreground `devflow
-//!   start` parked at its Define preflight gate holds no lock-NN. It is that
+//!   start` parked at its Plan preflight gate holds no lock-NN. It is that
 //!   gate's registered waiter, and it holds its launch reservation;
 //! - the `advance_*` arms cover a foreground `devflow advance` parked at a
 //!   Code gate.
@@ -64,6 +64,7 @@ fn wait_for(mut predicate: impl FnMut() -> bool, what: &str) {
 
 fn spawn_gated_advance(home: &common::HermeticHome, root: &Path, phase: PhaseId) -> Child {
     let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+    state.verification_baseline_captured = true;
     state.stage = Stage::Code;
     devflow_core::workflow::save_state(&state).unwrap();
     let child = common::hermetic_devflow(home)
@@ -112,7 +113,7 @@ fn reject(home: &common::HermeticHome, root: &Path, phase: PhaseId) -> std::proc
 }
 
 /// A `develop`-only repo whose ROADMAP names `phase` and which has no
-/// `.planning/config.json`, so `start --mode auto` parks at its Define
+/// `.planning/config.json`, so `start --mode auto` parks at its Plan
 /// preflight gate. Same shape as start_lock_e2e.rs `init_repo`.
 fn init_start_repo(root: &Path, phase: PhaseId) {
     git(root, &["init", "-q"]);
@@ -199,7 +200,7 @@ impl Drop for ReapOnDrop {
 }
 
 /// Spawns `start` (owned by `ReapOnDrop` from the moment it exists) and waits
-/// up to 20 s for it to park at the Define preflight gate.
+/// up to 20 s for it to park at the Plan preflight gate.
 fn spawn_parked_start(
     home: &common::HermeticHome,
     root: &Path,
@@ -214,34 +215,34 @@ fn spawn_parked_start(
             .expect("spawn foreground start"),
     );
     let waited = Instant::now();
-    while !Gates::gate_path(root, phase, Stage::Define).exists() {
+    while !Gates::gate_path(root, phase, Stage::Plan).exists() {
         if let Some(status) = start.0.try_wait().expect("poll start child") {
-            panic!("start exited ({status:?}) before parking at its Define gate");
+            panic!("start exited ({status:?}) before parking at its Plan gate");
         }
         assert!(
             waited.elapsed() < Duration::from_secs(20),
-            "timed out after 20s waiting for start's Define gate"
+            "timed out after 20s waiting for start's Plan gate"
         );
         std::thread::sleep(Duration::from_millis(20));
     }
     start
 }
 
-fn reject_define(home: &common::HermeticHome, root: &Path, phase: PhaseId) -> std::process::Output {
+fn reject_plan(home: &common::HermeticHome, root: &Path, phase: PhaseId) -> std::process::Output {
     common::hermetic_devflow(home)
         .args([
             "gate",
             "reject",
             &phase.to_string(),
             "--stage",
-            "define",
+            "plan",
             "--note",
             "abort: #200 start e2e",
             "--project",
         ])
         .arg(root)
         .output()
-        .expect("run same gate reject define command")
+        .expect("run same gate reject plan command")
 }
 
 /// Names of entries in `dir` accepted by `keep`; a missing directory is empty.
@@ -448,29 +449,28 @@ fn dry_run_sweep_reports_no_waiter_gates_as_left_alone() {
     );
 }
 
-/// The id of the phase's parked Define gate.
-fn define_gate_id(root: &Path, phase: PhaseId) -> GateId {
-    let gate =
-        fs::read(Gates::gate_path(root, phase, Stage::Define)).expect("read the Define gate");
-    let gate: GateFile = serde_json::from_slice(&gate).expect("parse the Define gate");
-    GateId::parse(&gate.gate_id).expect("the Define gate has a gate id")
+/// The id of the phase's parked Plan gate.
+fn plan_gate_id(root: &Path, phase: PhaseId) -> GateId {
+    let gate = fs::read(Gates::gate_path(root, phase, Stage::Plan)).expect("read the Plan gate");
+    let gate: GateFile = serde_json::from_slice(&gate).expect("parse the Plan gate");
+    GateId::parse(&gate.gate_id).expect("the Plan gate has a gate id")
 }
 
-/// The parked start is the Define gate's registered waiter, at once: every gate
+/// The parked start is the Plan gate's registered waiter, at once: every gate
 /// wait registers before it publishes, so `gate reject` will find it. The
 /// reservation is asserted beside that, never instead of it: it predates the gate.
-fn assert_parked_start_is_the_define_gates_waiter(root: &Path, phase: PhaseId, start_pid: u32) {
-    let gate_id = define_gate_id(root, phase);
+fn assert_parked_start_is_the_plan_gates_waiter(root: &Path, phase: PhaseId, start_pid: u32) {
+    let gate_id = plan_gate_id(root, phase);
     assert_eq!(
-        Gates::waiter_status(root, phase, Stage::Define, &gate_id).unwrap(),
+        Gates::waiter_status(root, phase, Stage::Plan, &gate_id).unwrap(),
         WaiterStatus::Live,
-        "the parked start must be registered on its Define gate"
+        "the parked start must be registered on its Plan gate"
     );
     assert!(
         Gates::live_waiter_holders(root)
             .iter()
             .any(|(pid, _)| *pid == start_pid),
-        "the Define gate's waiter must be the parked start, pid {start_pid}"
+        "the Plan gate's waiter must be the parked start, pid {start_pid}"
     );
     let pending = devflow_core::workflow::load_state(root, phase)
         .unwrap()
@@ -484,7 +484,7 @@ fn assert_parked_start_is_the_define_gates_waiter(root: &Path, phase: PhaseId, s
 }
 
 #[test]
-fn start_wedge_arm_interrupted_start_leaves_a_define_gate_nothing_answers() {
+fn start_wedge_arm_interrupted_start_leaves_a_plan_gate_nothing_answers() {
     let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -493,17 +493,17 @@ fn start_wedge_arm_interrupted_start_leaves_a_define_gate_nothing_answers() {
     let fake_bin = fake_bin_dir("sleep 60");
     let mut start = spawn_parked_start(&home, root, phase, &fake_bin, "30");
 
-    assert_parked_start_is_the_define_gates_waiter(root, phase, start.0.id());
-    let gate_id = define_gate_id(root, phase);
+    assert_parked_start_is_the_plan_gates_waiter(root, phase, start.0.id());
+    let gate_id = plan_gate_id(root, phase);
 
     start.0.kill().expect("kill foreground start");
     start.0.wait().expect("reap foreground start");
     assert!(
-        Gates::gate_path(root, phase, Stage::Define).exists(),
-        "the interrupted start must leave its Define gate behind"
+        Gates::gate_path(root, phase, Stage::Plan).exists(),
+        "the interrupted start must leave its Plan gate behind"
     );
 
-    let output = reject_define(&home, root, phase);
+    let output = reject_plan(&home, root, phase);
     let output_text = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -523,9 +523,9 @@ fn start_wedge_arm_interrupted_start_leaves_a_define_gate_nothing_answers() {
         "reject must name `{recovery_hint}`: {output_text}"
     );
     assert_eq!(
-        gate_answer_files(root, phase, Stage::Define),
+        gate_answer_files(root, phase, Stage::Plan),
         Vec::<PathBuf>::new(),
-        "an unanswerable Define gate must receive no response"
+        "an unanswerable Plan gate must receive no response"
     );
 
     assert!(
@@ -545,14 +545,14 @@ fn start_wedge_arm_interrupted_start_leaves_a_define_gate_nothing_answers() {
     ));
     let gate_temp = gates_dir.join(format!(
         ".{}.1.0.tmp",
-        Gates::gate_path(root, phase, Stage::Define)
+        Gates::gate_path(root, phase, Stage::Plan)
             .file_name()
             .unwrap()
             .to_string_lossy()
     ));
     fs::write(&state_temp, b"orphaned state write").unwrap();
     fs::write(&gate_temp, b"orphaned gate write").unwrap();
-    let waiter_path = Gates::waiter_path(root, phase, Stage::Define, &gate_id);
+    let waiter_path = Gates::waiter_path(root, phase, Stage::Plan, &gate_id);
     for precondition in [&state_temp, &gate_temp, &state_path, &waiter_path] {
         assert!(
             precondition.exists(),
@@ -561,7 +561,7 @@ fn start_wedge_arm_interrupted_start_leaves_a_define_gate_nothing_answers() {
         );
     }
     assert_eq!(
-        Gates::waiter_status(root, phase, Stage::Define, &gate_id).unwrap(),
+        Gates::waiter_status(root, phase, Stage::Plan, &gate_id).unwrap(),
         WaiterStatus::Absent,
         "precondition: the killed start's registration must be unheld"
     );
@@ -604,7 +604,7 @@ fn start_wedge_arm_interrupted_start_leaves_a_define_gate_nothing_answers() {
 }
 
 #[test]
-fn start_self_resolving_arm_live_start_consumes_the_define_rejection() {
+fn start_self_resolving_arm_live_start_consumes_the_plan_rejection() {
     let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -613,10 +613,10 @@ fn start_self_resolving_arm_live_start_consumes_the_define_rejection() {
     let fake_bin = fake_bin_dir("sleep 60");
     let mut start = spawn_parked_start(&home, root, phase, &fake_bin, "60");
 
-    assert_parked_start_is_the_define_gates_waiter(root, phase, start.0.id());
+    assert_parked_start_is_the_plan_gates_waiter(root, phase, start.0.id());
 
     let before = Instant::now();
-    let output = reject_define(&home, root, phase);
+    let output = reject_plan(&home, root, phase);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success(),
@@ -657,7 +657,7 @@ fn start_self_resolving_arm_live_start_consumes_the_define_rejection() {
         "the rejected start must clear its state"
     );
     assert!(
-        !Gates::gate_path(root, phase, Stage::Define).exists(),
-        "consuming the response clears the Define gate request"
+        !Gates::gate_path(root, phase, Stage::Plan).exists(),
+        "consuming the response clears the Plan gate request"
     );
 }

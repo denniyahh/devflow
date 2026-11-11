@@ -4356,7 +4356,7 @@ mod tests {
         };
         if full {
             let mut moved = workflow::load_state(root, phase).unwrap();
-            moved.stage = Stage::Plan;
+            moved.stage = Stage::Code;
             workflow::save_state(&moved).unwrap();
         }
         std::fs::write(root.join("go"), "").unwrap();
@@ -4373,7 +4373,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("monitor_entry_full must run the advance: {events:?}"));
             assert_eq!(failed["reason"], "stage mismatch", "{failed}");
             assert_eq!(
-                failed["expected"], "define",
+                failed["expected"], "plan",
                 "the advance is passed the launched stage: {failed}"
             );
         } else {
@@ -4724,7 +4724,9 @@ mod tests {
     ///
     /// The run's agent is Codex, a capture-shape agent, persisted because
     /// `resume()` loads its own `State` from disk: the subject is resume's
-    /// stop-marker semantics, not which launch path the relaunch takes.
+    /// stop-marker semantics, not which launch path the relaunch takes. The
+    /// mode is supervise because auto mode refuses Codex at Plan, the first
+    /// stage (D-07's unattended check and the CONTEXT.md check).
     #[test]
     fn resume_clears_stop_marker_and_advances_past_stop_point() {
         const NAME: &str =
@@ -4743,7 +4745,8 @@ mod tests {
         init_repo(root);
 
         let phase = PhaseId::new(66);
-        let mut state = State::new(phase, AgentKind::Codex, Mode::Auto, root.to_path_buf());
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
+        state.verification_baseline_captured = true;
         state.stage = Stage::Plan;
         state.stop_until = Some(Stage::Plan);
         state.stopped = true;
@@ -4802,6 +4805,7 @@ mod tests {
         response: &devflow_core::gates::GateResponse,
     ) -> (devflow_core::gates::GateId, Vec<u8>) {
         let mut state = State::new(phase, AgentKind::Codex, mode, root.to_path_buf());
+        state.verification_baseline_captured = true;
         state.stage = stage;
         state.gate_pending = true;
         state.stopped = true;
@@ -5103,6 +5107,7 @@ mod tests {
         init_repo(root);
         let phase = PhaseId::new(96);
         let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
+        state.verification_baseline_captured = true;
         state.stage = Stage::Code;
         state.stopped = true;
         workflow::save_state(&state).unwrap();
@@ -5356,6 +5361,7 @@ mod tests {
             Mode::Supervise,
             root.to_path_buf(),
         );
+        state.verification_baseline_captured = true;
         state.stage = Stage::Code;
         workflow::save_state(&state).unwrap();
 
@@ -5398,6 +5404,7 @@ mod tests {
         init_repo(root);
         let phase = PhaseId::new(75);
         let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
+        state.verification_baseline_captured = true;
         state.stage = Stage::Code;
         workflow::save_state(&state).unwrap();
         let result = resume(root, phase, None);
@@ -5422,7 +5429,7 @@ mod tests {
         init_repo(root);
         let phase = PhaseId::new(76);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Define;
+        state.stage = Stage::Plan;
         state.verification_baseline_captured = true;
         workflow::save_state(&state).unwrap();
         let state_path = workflow::state_path(root, phase);
@@ -5461,6 +5468,7 @@ mod tests {
         init_repo(root);
         let phase = PhaseId::new(81);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.verification_baseline_captured = true;
         state.stage = Stage::Code;
         workflow::save_state(&state).unwrap();
         let state_path = workflow::state_path(root, phase);
@@ -5498,6 +5506,7 @@ mod tests {
         init_repo(root);
         let phase = PhaseId::new(77);
         let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
+        state.verification_baseline_captured = true;
         state.stage = Stage::Code;
         workflow::save_state(&state).unwrap();
         let result = resume(root, phase, Some(AgentKind::Codex));
@@ -5516,7 +5525,9 @@ mod tests {
         );
     }
 
-    /// Pitfall 1: Plan is deliberately not gated by the Define-only artifact check.
+    /// A handoff at Plan is allowed in supervise mode: Plan is the first stage, and its
+    /// artifact and unattended checks apply in auto mode only. The auto-mode refusal at Plan
+    /// is `resume_with_agent_refuses_before_touching_state_when_target_cannot_run_the_stage`.
     #[test]
     fn resume_with_agent_allows_plan_stage() {
         const NAME: &str = "pipeline_launch::tests::resume_with_agent_allows_plan_stage";
@@ -5532,7 +5543,13 @@ mod tests {
         let root = dir.path();
         init_repo(root);
         let phase = PhaseId::new(78);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.verification_baseline_captured = true;
         state.stage = Stage::Plan;
         workflow::save_state(&state).unwrap();
         let result = resume(root, phase, Some(AgentKind::Codex));
@@ -5570,6 +5587,7 @@ mod tests {
             Mode::Supervise,
             root.to_path_buf(),
         );
+        state.verification_baseline_captured = true;
         state.stage = Stage::Code;
         state.consecutive_failures = 3;
         state.infra_failures = 2;
@@ -5658,6 +5676,7 @@ mod tests {
             Mode::Supervise,
             root.to_path_buf(),
         );
+        state.verification_baseline_captured = true;
         state.stage = Stage::Code;
         state.stopped = true;
         state.stop_reason = Some("rate limited".to_string());
@@ -5709,6 +5728,7 @@ mod tests {
             Mode::Supervise,
             root.to_path_buf(),
         );
+        state.verification_baseline_captured = true;
         state.stage = Stage::Code;
         state.stopped = true;
         state.stop_reason = Some("rate limited".to_string());
@@ -5771,6 +5791,7 @@ mod tests {
             Mode::Supervise,
             root.to_path_buf(),
         );
+        state.verification_baseline_captured = true;
         state.stage = Stage::Code;
         state.fallback_agent = Some(AgentKind::Codex);
         state.fallback_consumed = true;
@@ -5999,6 +6020,7 @@ mod tests {
             Mode::Supervise,
             root.to_path_buf(),
         );
+        state.verification_baseline_captured = true;
         state.stage = Stage::Code;
         state.stopped = true;
         state.stop_reason = Some("rate limited".to_string());
@@ -7408,6 +7430,7 @@ mod tests {
         write_confirmed_checkpoint_capture(root, phase);
 
         let mut state = State::new(phase, AgentKind::Claude, mode, root.to_path_buf());
+        state.verification_baseline_captured = true;
         state.stage = Stage::Code;
         // A session id AND an unexhausted ceiling, so every one of these
         // tests lands in the `(Some(session_id), true)` arm where the
@@ -9247,6 +9270,9 @@ mod tests {
             )
             .unwrap();
             let mut state = State::new(phase, AgentKind::Claude, Mode::Supervise, root.clone());
+            // Stage N is Define explicitly, a stand-in: these tests are about the handoff
+            // from stage N to N+1 (Plan), not about which stage a run starts at.
+            state.stage = Stage::Define;
             state.verification_baseline_captured = true;
             // A stub `claude` cannot answer the stream launch's canary.
             state.canary = Some(canary::CanaryOutcome::Confirmed);
@@ -9783,6 +9809,7 @@ mod tests {
                     .to_string()
             };
             let mut state = State::new(phase, AgentKind::Claude, Mode::Supervise, root.into());
+            state.verification_baseline_captured = true;
             state.stage = Stage::Plan;
 
             state.supervisor = Some(fixture.record.clone());
@@ -11469,12 +11496,12 @@ mod tests {
                 Mode::Supervise,
                 root.to_path_buf(),
             );
-            state.stop_until = Some(Stage::Define);
+            state.stop_until = Some(Stage::Plan);
             state.stopped = stopped;
             workflow::save_state(&state).unwrap();
             write_success_capture(root, phase);
 
-            let result = advance_with(root, phase, Some(Stage::Define));
+            let result = advance_with(root, phase, Some(Stage::Plan));
             let failed = events_named(root, "advance_failed");
             if stopped {
                 let err = result.expect_err("a stopped state must not advance");
@@ -13111,6 +13138,7 @@ mod tests {
     ) -> (Vec<String>, ReapMonitorOnDrop) {
         init_repo(root);
         let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
+        state.verification_baseline_captured = true;
         state.stage = Stage::Code;
         state.code_fix = fix;
         state.stopped = true;
@@ -15494,6 +15522,7 @@ mod tests {
         init_repo(root);
         let phase = PhaseId::new(2405);
         let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
+        state.verification_baseline_captured = true;
         state.stage = Stage::Code;
         state.stopped = true;
         state.stop_reason = Some("stopped after code completed (--until code)".to_string());
@@ -16070,6 +16099,7 @@ mod tests {
     fn code_run_recording(root: &Path, phase: PhaseId, socket: &Path) -> State {
         init_repo(root);
         let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
+        state.verification_baseline_captured = true;
         state.stage = Stage::Code;
         state.supervisor = Some(devflow_core::state::SupervisorRecord::new(
             socket.to_path_buf(),
