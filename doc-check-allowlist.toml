@@ -89,3 +89,8 @@ reason = "Test-only: under the devflow-core test-support feature, spawn_monitor'
 kind = "source_to_docs"
 token = "DEVFLOW_TEST_WITHHOLD_SUCCESSOR_PROBE"
 reason = "Test-only: a #[cfg(test)] seam in the CLI's publish_record answers the post-save successor probe Gone, without probing, while it names <agent>:<stage>:<marker-path> for the launch being published, and writes the marker, so the Phase 51 SUPV-01 experiment can watch the run be recorded stopped while its successor still runs; compiled out of release builds, so it is not an operator setting (Phase 51, plan 51-13)."
+
+[[exceptions]]
+kind = "source_to_docs"
+token = "DEVFLOW_TEST_GSD_HOME"
+reason = "Test-only: the CLI #[cfg(test)] build reads GSD's verification status under the stub home a unit test passes to its child process (and the supervisors it spawns) through this variable, so no unit test reaches a real GSD install; a release build reads HOME and never this variable, so it is not an operator setting (Phase 52, plan 52-22)."
