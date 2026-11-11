@@ -3134,6 +3134,12 @@ fn stop_stale_launch(subject: &str, entry: &supervisor::SweepEntry) -> Result<()
     run_backstop(subject, &socket, sidecar, None, None)
 }
 
+/// `stop`'s line when the run had already finished (operator decision
+/// 2026-11-11): a permitted finish wins over a late stop. Skeleton (52-29 RED).
+pub(crate) fn already_finished_line(what: &str) -> String {
+    format!("stop: {what}: the supervisor answered handed_off")
+}
+
 /// `stop`'s line for a stop its supervisor confirmed (D-13 item 6). It claims a group ended
 /// only when the supervisor signalled one; otherwise the stop was honoured at an advance
 /// safe point and nothing was signalled.

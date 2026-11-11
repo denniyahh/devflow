@@ -792,6 +792,10 @@ pub enum ShutdownOutcome {
     },
     /// The supervisor had already handed the run off and did not stop it.
     HandedOff,
+    /// The run had already finished (Validate passed) when the stop could act,
+    /// so nothing was stopped (operator decision 2026-11-11: a permitted finish
+    /// wins over a late stop).
+    AlreadyFinished,
     /// The supervisor refused the request with this error.
     Refused(String),
 }
@@ -2311,6 +2315,21 @@ mod tests {
         assert!(
             matches!(late_hand_off, Ok(ShutdownOutcome::HandedOff)),
             "a hand-off after accepted is HandedOff, never Stopped, got {late_hand_off:?}"
+        );
+
+        // Operator decision (2026-11-11, 52-29): a stop that lost to a
+        // permitted finish is told so, never handed_off and never a stop.
+        let already_finished = run(
+            Box::new(move |stream| {
+                protocol::write_reply(stream, &accepted()).expect("write accepted");
+                protocol::write_reply(stream, &Reply::Error("already_finished".to_string()))
+                    .expect("write already_finished");
+            }),
+            Duration::from_secs(5),
+        );
+        assert!(
+            matches!(already_finished, Ok(ShutdownOutcome::AlreadyFinished)),
+            "already_finished is AlreadyFinished, got {already_finished:?}"
         );
 
         let refused = run(

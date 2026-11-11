@@ -11958,38 +11958,55 @@ mod tests {
         assert!(events_named(&run.root, "advance_stopped").is_empty());
     }
 
-    /// A stop that lands after a Validate gate was approved and its decision committed, while
-    /// the run still advances. The approval would finish the run (Validate is the last
-    /// stage), but the stop is honoured first, at safe point 6: the run ends stopped at
-    /// Validate, not finished, nothing transitions or launches, and `stop`'s line and the
-    /// exit file both say so. A resume reruns Validate, which asks again (D-06).
+    /// Operator decision (2026-11-11): a finish wins over a late stop. A stop
+    /// taken after the Validate gate's approve was claimed, while the finish
+    /// is permitted (a fresh `passed` with the PASS on HEAD), no longer stops
+    /// the run at safe point 6: the run is recorded finished, one
+    /// `workflow_finished` `{"reason":"finished","shipped":false}`, and the
+    /// stop's final line says the run already finished, never `handed_off` and
+    /// never a stop. Control in the same test: the same late stop when the
+    /// approve's fresh read gives no finish permit (`gaps_found`, the gap
+    /// loop) still stops the run at an advance safe point, unfinished.
     #[test]
-    fn a_stop_after_a_gate_answer_stops_before_the_finish_and_reports_it() {
-        const NAME: &str = "pipeline_launch::tests::a_stop_after_a_gate_answer_stops_before_the_finish_and_reports_it";
-        // 52-22: an approval finishes only over an agent pass that GSD reports
-        // `passed`, so the Validate agent passes and a GSD stub, reached by
-        // every supervisor through the child's environment, answers `passed`.
+    fn a_stop_after_a_gate_answer_loses_to_a_permitted_finish() {
+        const NAME: &str =
+            "pipeline_launch::tests::a_stop_after_a_gate_answer_loses_to_a_permitted_finish";
         const PASS_MARKER: &str = r#"DEVFLOW_RESULT: {"status":"success","verdict":"pass"}"#;
+        const FRESH_ENV: &str = "DEVFLOW_PIPELINE_LAUNCH_LATE_STOP_FRESH";
         if !devflow_core::test_support::in_child_test(NAME) {
-            let gsd = tempfile::tempdir().unwrap();
-            let home = gsd.path().join("home");
-            // 52-29: two reads, the Validate outcome's and the approve's own
-            // fresh read (D-45 rule 2).
-            let passed = crate::test_support::gsd_says(devflow_core::gsd_reader::GsdStatus::Passed);
-            devflow_core::test_support::plant_gsd_run_stub(
-                &home,
-                &[passed, passed],
-                &gsd.path().join("logs"),
-            );
-            run_handoff_child_with_stubs_and_env(
-                NAME,
-                Some("after_commit"),
-                PASS_MARKER,
-                &[],
-                &[(crate::test_support::TEST_GSD_HOME_ENV, home.as_os_str())],
-            );
+            for fresh in ["passed", "gaps_found"] {
+                let gsd = tempfile::tempdir().unwrap();
+                let home = gsd.path().join("home");
+                // Two reads: the Validate outcome's and the approve's own fresh
+                // read (D-45 rule 2), which decides whether the finish is
+                // permitted.
+                let fresh_status = if fresh == "passed" {
+                    devflow_core::gsd_reader::GsdStatus::Passed
+                } else {
+                    devflow_core::gsd_reader::GsdStatus::GapsFound
+                };
+                devflow_core::test_support::plant_gsd_run_stub(
+                    &home,
+                    &[
+                        crate::test_support::gsd_says(devflow_core::gsd_reader::GsdStatus::Passed),
+                        crate::test_support::gsd_says(fresh_status),
+                    ],
+                    &gsd.path().join("logs"),
+                );
+                run_handoff_child_with_stubs_and_env(
+                    NAME,
+                    Some("after_commit"),
+                    PASS_MARKER,
+                    &[],
+                    &[
+                        (crate::test_support::TEST_GSD_HOME_ENV, home.as_os_str()),
+                        (FRESH_ENV, std::ffi::OsStr::new(fresh)),
+                    ],
+                );
+            }
             return;
         }
+        let permitted = std::env::var(FRESH_ENV).expect("the parent names the row") == "passed";
         let _guard = env_lock();
         let run = HandoffRun::launch_with(PhaseId::new(1320), |root, state| {
             crate::test_support::phase_dir_fixture(root, state.phase);
@@ -12018,33 +12035,43 @@ mod tests {
             Duration::from_secs(30),
         );
         assert_eq!(accepted["owner"], "advancing", "{accepted}");
-        assert_eq!(last["stopped"], true, "{last}");
-        assert!(
-            events_named(&run.root, "transition").is_empty(),
-            "{}",
-            run.events()
-        );
-        assert!(
-            events_named(&run.root, "workflow_finished").is_empty(),
-            "the stop is honoured before the finish: {}",
-            run.events()
-        );
-        let stopped = events_named(&run.root, "advance_stopped");
-        assert_eq!(stopped.len(), 1, "{}", run.events());
-        assert_eq!(stopped[0]["safe_point"], 6, "{}", stopped[0]);
-        assert_eq!(
-            stage_launched_count(&run.root, run.phase),
-            1,
-            "nothing launches after the stop: {}",
-            run.events()
-        );
-        let line = stop_line_for(&run, &last);
-        assert!(line.contains("honoured at an advance safe point"), "{line}");
-        assert_eq!(exit_file_of(&run), "143", "{}", run.events());
         let state = run.state();
-        assert!(state.stopped && !state.finished, "{state:?}");
-        assert_eq!(state.stage, Stage::Validate, "{state:?}");
-        assert_eq!(state.stop_reason.as_deref(), Some(ADVANCE_STOP_REASON));
+        let finished = events_named(&run.root, "workflow_finished");
+        if permitted {
+            assert_eq!(
+                last,
+                serde_json::json!({"ok": false, "error": "already_finished"}),
+                "the stop is told the run already finished: {}",
+                run.events()
+            );
+            assert_eq!(finished.len(), 1, "{}", run.events());
+            assert_eq!(finished[0]["reason"], "finished", "{}", finished[0]);
+            assert_eq!(finished[0]["shipped"], false, "{}", finished[0]);
+            assert!(
+                events_named(&run.root, "advance_stopped").is_empty(),
+                "no safe-point stop: {}",
+                run.events()
+            );
+            assert!(state.stopped && state.finished, "{state:?}");
+            assert_eq!(
+                state.stop_reason.as_deref(),
+                Some(crate::pipeline_gate::FINISHED_STOP_REASON)
+            );
+            let line = crate::commands::already_finished_line(&format!("phase {}", run.phase));
+            assert!(
+                line.contains("already finished") && !line.contains("handed"),
+                "{line}"
+            );
+        } else {
+            // Control: no finish permit, so the stop keeps its handling.
+            assert_eq!(last["stopped"], true, "{last}");
+            assert!(finished.is_empty(), "{}", run.events());
+            let stopped = events_named(&run.root, "advance_stopped");
+            assert_eq!(stopped.len(), 1, "{}", run.events());
+            let line = stop_line_for(&run, &last);
+            assert!(line.contains("honoured at an advance safe point"), "{line}");
+            assert!(state.stopped && !state.finished, "{state:?}");
+        }
     }
 
     /// A socket stop taken during a gate wait ends the wait at safe point 4, so an answer
