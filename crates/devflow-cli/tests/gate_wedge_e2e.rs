@@ -223,6 +223,11 @@ fn gate_abort_writes_an_answer_with_the_abort_field_set() {
         "gate abort failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.starts_with(&format!("aborted gate for phase {phase} code")),
+        "gate abort must report the abort: {stdout}"
+    );
     let path = Gates::answer_path(root, phase, Stage::Code, &gate);
     let answer: serde_json::Value =
         serde_json::from_slice(&fs::read(&path).expect("gate abort wrote the answer file"))
