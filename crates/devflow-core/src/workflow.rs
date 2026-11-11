@@ -693,6 +693,12 @@ pub(crate) struct Cleared {
 /// whole listing — `status`/`recover` must degrade, not die, on one corrupt
 /// file.
 pub fn list_states(project_root: &Path) -> Vec<State> {
+    list_states_to(project_root, &mut std::io::stderr())
+}
+
+/// [`list_states`], writing the line for each skipped state file to `err`: a
+/// skipped file is a phase missing from `status`, `cleanup` and `gate list`.
+fn list_states_to(project_root: &Path, _err: &mut dyn std::io::Write) -> Vec<State> {
     let mut states = Vec::new();
     let Ok(entries) = std::fs::read_dir(devflow_dir(project_root)) else {
         return states;
@@ -906,6 +912,26 @@ fn remove_state_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_skipped_state_file_is_reported_without_tracing() {
+        let dir = tempfile::tempdir().unwrap();
+        let devflow = dir.path().join(".devflow");
+        std::fs::create_dir_all(&devflow).unwrap();
+        std::fs::write(
+            devflow.join(format!("{STATE_FILE_PREFIX}07.json")),
+            "{ not json",
+        )
+        .unwrap();
+        let mut sink = Vec::new();
+        assert!(list_states_to(dir.path(), &mut sink).is_empty());
+        let text = String::from_utf8(sink).unwrap();
+        assert!(
+            text.starts_with("warning: skipping the unreadable state file ")
+                && text.contains(&format!("{STATE_FILE_PREFIX}07.json")),
+            "the operator must be told a phase is missing from the listing: {text:?}"
+        );
+    }
 
     #[test]
     fn ensure_devflow_dir_writes_star_gitignore() {

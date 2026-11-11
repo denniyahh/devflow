@@ -687,6 +687,16 @@ impl Gates {
     /// the stray reaper's safety set. A holder whose record cannot be read is logged
     /// and left out.
     pub fn live_waiter_holders(project_root: &Path) -> Vec<(u32, Option<u64>)> {
+        Self::live_waiter_holders_to(project_root, &mut std::io::stderr())
+    }
+
+    /// [`Self::live_waiter_holders`], writing the line for each registration it
+    /// cannot read to `err`: a holder left out is a live waiter that `doctor`
+    /// can report as a stray process.
+    fn live_waiter_holders_to(
+        project_root: &Path,
+        _err: &mut dyn std::io::Write,
+    ) -> Vec<(u32, Option<u64>)> {
         let Ok(entries) = std::fs::read_dir(Self::dir(project_root)) else {
             return Vec::new();
         };
@@ -722,6 +732,29 @@ impl Gates {
         gate: &GateId,
         timeout_secs: u64,
         cancel: impl Fn() -> bool,
+    ) -> AwaitOutcome {
+        Self::await_answer_to(
+            project_root,
+            phase,
+            stage,
+            gate,
+            timeout_secs,
+            cancel,
+            &mut std::io::stderr(),
+        )
+    }
+
+    /// [`Self::await_answer`], writing the line for an answer it cannot read to
+    /// `err`, at the same rate the warning is logged: a waiter in the foreground
+    /// would otherwise sit silent over an answer the operator wrote.
+    fn await_answer_to(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        gate: &GateId,
+        timeout_secs: u64,
+        cancel: impl Fn() -> bool,
+        _err: &mut dyn std::io::Write,
     ) -> AwaitOutcome {
         let unreadable = RepeatLimit::default();
         let end = backoff_wait(Duration::from_secs(timeout_secs), cancel, || {
@@ -1308,6 +1341,13 @@ impl Gates {
     /// logged and skipped — listing must degrade, not die. A gate is hidden once its
     /// own live answer is there. Only reads.
     pub fn list_open(project_root: &Path) -> Vec<OpenGate> {
+        Self::list_open_to(project_root, &mut std::io::stderr())
+    }
+
+    /// [`Self::list_open`], writing the line for each gate file it cannot list
+    /// to `err`: a gate left out of the listing is one the operator cannot see
+    /// to answer.
+    fn list_open_to(project_root: &Path, _err: &mut dyn std::io::Write) -> Vec<OpenGate> {
         let mut open = Vec::new();
         let Ok(entries) = std::fs::read_dir(Self::dir(project_root)) else {
             return open;
@@ -1644,6 +1684,26 @@ pub fn resolve_gate_notify_cmd(
 /// `warn!` and otherwise ignored — this must never propagate an error that
 /// could abort `run_gate`.
 fn run_notify_command(cmd: &str, phase: PhaseId, stage: Stage, context: &str, unexpected: bool) {
+    run_notify_command_to(
+        cmd,
+        phase,
+        stage,
+        context,
+        unexpected,
+        &mut std::io::stderr(),
+    );
+}
+
+/// [`run_notify_command`], writing the line for a failed hook to `err`: a
+/// failing hook is the operator's notification channel going quiet.
+fn run_notify_command_to(
+    cmd: &str,
+    phase: PhaseId,
+    stage: Stage,
+    context: &str,
+    unexpected: bool,
+    _err: &mut dyn std::io::Write,
+) {
     let output = Command::new("sh")
         .arg("-c")
         .arg(cmd)
@@ -2781,6 +2841,123 @@ mod tests {
         let cmd = format!("touch {}", sentinel.display());
         run_notify_command(&cmd, PhaseId::new(11), Stage::Validate, "ctx", false);
         assert!(sentinel.exists());
+    }
+
+    #[test]
+    fn a_failing_notify_hook_is_reported_without_tracing() {
+        let mut sink = Vec::new();
+        run_notify_command_to(
+            "echo hook-said-no >&2; exit 3",
+            PhaseId::new(11),
+            Stage::Validate,
+            "ctx",
+            false,
+            &mut sink,
+        );
+        let text = String::from_utf8(sink).unwrap();
+        assert!(
+            text.starts_with("warning: the gate notify hook exited with status 3")
+                && text.contains("hook-said-no"),
+            "the operator must be told the hook failed: {text:?}"
+        );
+    }
+
+    #[test]
+    fn a_succeeding_notify_hook_writes_no_warning() {
+        // Control for the test above.
+        let mut sink = Vec::new();
+        run_notify_command_to(
+            "true",
+            PhaseId::new(11),
+            Stage::Validate,
+            "ctx",
+            false,
+            &mut sink,
+        );
+        assert!(sink.is_empty());
+    }
+
+    #[test]
+    fn an_unparsable_gate_file_is_reported_without_tracing() {
+        let dir = tempfile::tempdir().unwrap();
+        let gates = Gates::dir(dir.path());
+        std::fs::create_dir_all(&gates).unwrap();
+        std::fs::write(gates.join("07-code.json"), "{ not a gate").unwrap();
+        let mut sink = Vec::new();
+        assert!(Gates::list_open_to(dir.path(), &mut sink).is_empty());
+        let text = String::from_utf8(sink).unwrap();
+        assert!(
+            text.starts_with("warning: not listing ") && text.contains("07-code.json"),
+            "the operator must be told the gate is hidden: {text:?}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_gate_file_is_reported_without_tracing() {
+        let dir = tempfile::tempdir().unwrap();
+        let gates = Gates::dir(dir.path());
+        // A directory where the gate file belongs: the read fails.
+        std::fs::create_dir_all(gates.join("07-code.json")).unwrap();
+        let mut sink = Vec::new();
+        assert!(Gates::list_open_to(dir.path(), &mut sink).is_empty());
+        let text = String::from_utf8(sink).unwrap();
+        assert!(
+            text.starts_with("warning: not listing ") && text.contains("07-code.json"),
+            "the operator must be told the gate is hidden: {text:?}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_waiter_registration_is_reported_without_tracing() {
+        let dir = tempfile::tempdir().unwrap();
+        let gates = Gates::dir(dir.path());
+        std::fs::create_dir_all(&gates).unwrap();
+        let path = gates.join(format!("07-code{WAITER_SUFFIX}"));
+        // Held, so it reads live, with a record that does not parse.
+        let held = std::fs::File::create(&path).unwrap();
+        std::io::Write::write_all(&mut &held, b"not-a-pid\n").unwrap();
+        held.lock().unwrap();
+        let mut sink = Vec::new();
+        assert!(Gates::live_waiter_holders_to(dir.path(), &mut sink).is_empty());
+        drop(held);
+        let text = String::from_utf8(sink).unwrap();
+        assert!(
+            text.starts_with("warning: could not read the waiter registration ")
+                && text.contains(WAITER_SUFFIX),
+            "the operator must be told a waiter was left out: {text:?}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_gate_answer_is_reported_without_tracing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(7);
+        let gate = GateId::new();
+        let answer = Gates::answer_path(root, phase, Stage::Code, &gate);
+        // A directory where the answer belongs: every read fails.
+        std::fs::create_dir_all(&answer).unwrap();
+        let reads = std::cell::Cell::new(0u32);
+        let mut sink = Vec::new();
+        let outcome = Gates::await_answer_to(
+            root,
+            phase,
+            Stage::Code,
+            &gate,
+            60,
+            || {
+                reads.set(reads.get() + 1);
+                reads.get() > 1
+            },
+            &mut sink,
+        );
+        assert!(matches!(outcome, AwaitOutcome::Cancelled));
+        let text = String::from_utf8(sink).unwrap();
+        assert!(
+            text.starts_with("warning: could not read the gate answer ")
+                && text.contains("still waiting"),
+            "the operator must be told the answer is unreadable: {text:?}"
+        );
     }
 
     #[test]
