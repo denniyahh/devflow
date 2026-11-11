@@ -67,3 +67,62 @@ fn stop_help_names_the_foreground_holder_not_the_phase_lock() {
     let line = stop_line(include_str!("snapshots/devflow-help.txt"));
     assert!(names_the_foreground_holder(line), "{line}");
 }
+
+/// Help terms for surface v4.0 removed (D-01, D-03): the Ship stage, and the rate-limit
+/// cron arm cut in 52-09/52-10. Matched case-insensitively as whole words or phrases, so
+/// `shipped` or `relationship` is not a hit. Later cut plans append to this list.
+const REMOVED_HELP_TERMS: &[&str] = &["Ship", "cron arm"];
+
+/// The terms of [`REMOVED_HELP_TERMS`] that `text` names as a whole word or phrase.
+fn removed_terms_in(text: &str) -> Vec<&'static str> {
+    let haystack = text.to_lowercase();
+    REMOVED_HELP_TERMS
+        .iter()
+        .copied()
+        .filter(|term| {
+            let needle = term.to_lowercase();
+            haystack.match_indices(&needle).any(|(at, _)| {
+                let before = haystack[..at].chars().next_back();
+                let after = haystack[at + needle.len()..].chars().next();
+                !before.is_some_and(char::is_alphanumeric)
+                    && !after.is_some_and(char::is_alphanumeric)
+            })
+        })
+        .collect()
+}
+
+#[test]
+fn help_names_no_removed_surface() {
+    for planted in [
+        "Begin the workflow for a phase: Define → Plan → Code → Validate → Ship",
+        "Pipeline mode: `auto` runs to Ship unattended; `supervise` gates at Validate",
+        "a rate limit with no fallback takes the cron arm",
+    ] {
+        assert!(
+            !removed_terms_in(planted).is_empty(),
+            "control: the matcher must report the 3.0.0 line {planted:?}"
+        );
+    }
+    for clean in ["shipped", "relationship", "finished"] {
+        assert!(
+            removed_terms_in(clean).is_empty(),
+            "control: {clean:?} is not a removed term"
+        );
+    }
+
+    let home = common::HermeticHome::new();
+    for args in [&["--help"][..], &["start", "--help"], &["resume", "--help"]] {
+        let output = common::hermetic_devflow(&home)
+            .args(args)
+            .output()
+            .expect("run devflow help");
+        assert!(output.status.success(), "devflow {args:?} failed");
+        let help = String::from_utf8_lossy(&output.stdout);
+        let found = removed_terms_in(&help);
+        assert!(
+            found.is_empty(),
+            "`devflow {}` still names {found:?}:\n{help}",
+            args.join(" ")
+        );
+    }
+}
