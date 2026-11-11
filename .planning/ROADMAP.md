@@ -827,6 +827,8 @@ commit (`39f6edc`) carries the marker only in its footer.
 **Fix shape:** read `--format=%B` (or `%s%n%b` with a record separator) and match `^BREAKING[ -]CHANGE:` on body lines;
 add a test case of a footer-only breaking commit that must produce a major bump. Small: fold into the Phase 52 close-out
 or the next fix branch.
+**Rescheduled:** 2026-11-11. The operator chose not to release at Phase 52 close-out (version `4.0.0-alpha.1`, unpublished),
+so this is needed only before the next real cut: take it at the v4.0 milestone close, before 4.0.0.
 
 ### Phase 999.219: `devflow resume` (and `start --no-worktree`) Commits GSD's First Chain-Flag Write as a "Killed Run" Leak Repair (BACKLOG)
 

@@ -79,3 +79,16 @@ Phase 52 runs with GSD commands in an agent session (`/gsd-plan-phase 52`, `/gsd
 > `/gsd-execute-phase 52`, …), not with `devflow start`. This is an exception to the CLAUDE.md dogfooding rule, which
 > says DevFlow drives its own phases from Phase 51 on, and is recorded here as that rule requires. The criterion 1
 > control (a `--dry-run` of the installed 3.0.0 binary) is a dry run, not a dogfood run, and still applies.
+
+## Close-out: no release (operator, 2026-11-11)
+
+The operator chose not to cut 4.0.0 at Phase 52 close-out, because DevFlow is not yet fully usable. Phase 52 merges
+to `develop` with the workspace version set to `4.0.0-alpha.1` (no tag, no crates.io publish, nothing to `main`), so
+a build from `develop` never reports the published 3.0.0. 4.0.0 is cut at the v4.0 milestone close.
+
+- Backlog 999.226 (devflow-core `pub` items with no caller) was taken here on the operator's answer: removed before any
+  4.x publish.
+- Backlog 999.220 (`scripts/cut-release.sh` cannot see `BREAKING CHANGE` footers) is not needed until a release is
+  cut; it moves to the v4.0 milestone close, before the 4.0.0 cut.
+- The close-out itself is done by hand with `scripts/cut-pr-branch.sh` from `feature/phase-52`, per the run
+  conventions in CLAUDE.md; that is the convention, not a further exception.
