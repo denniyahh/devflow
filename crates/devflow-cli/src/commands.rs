@@ -1660,25 +1660,94 @@ pub(crate) fn write_lock_line(status: &workflow::WriteLockStatus) -> Option<Stri
     }
 }
 
-/// `status`'s header line naming the phases whose runs are active.
+/// The run's worktree when `state` records one that no longer exists on disk.
+fn missing_worktree(state: &State) -> Option<&Path> {
+    state.worktree_path.as_deref().filter(|path| !path.exists())
+}
+
+/// What a phase's run is, as `status` names it (OPS-02, D-35). A run is active
+/// only while it has not stopped and its recorded worktree still exists: a gone
+/// worktree leaves nothing for an agent to work in, however live the supervisor
+/// record or agent pid looks.
+fn run_kind(state: &State) -> &'static str {
+    if state.finished {
+        "finished"
+    } else if state.stopped {
+        "stopped"
+    } else if missing_worktree(state).is_some() {
+        "worktree missing"
+    } else {
+        "active"
+    }
+}
+
+/// `status`'s header: the phases whose runs are active (or `none`), then every
+/// other phase with what it is, so the header never calls a finished, stopped or
+/// worktree-less run active.
 fn active_phases_line(states: &[State]) -> String {
-    format!(
-        "active phases: {}",
-        states
+    let (active, others): (Vec<&State>, Vec<&State>) =
+        states.iter().partition(|s| run_kind(s) == "active");
+    let active = if active.is_empty() {
+        "none".to_string()
+    } else {
+        active
             .iter()
             .map(|s| s.phase.to_string())
             .collect::<Vec<_>>()
             .join(", ")
-    )
+    };
+    let mut line = format!("active phases: {active}");
+    if !others.is_empty() {
+        let others = others
+            .iter()
+            .map(|s| format!("{} ({})", s.phase, run_kind(s)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        line.push_str(&format!("\nother phases: {others}"));
+    }
+    line
 }
 
-/// `status`'s lines about what a phase's run did: its worktree.
+/// The fallback agent's state (OPS-04): exactly one of `armed` (configured and
+/// not used), `spent` (`fallback_consumed`) or `none` (no fallback configured).
+fn fallback_line(state: &State) -> String {
+    match state.fallback_agent {
+        Some(agent) if state.fallback_consumed => {
+            format!("  fallback: spent ({agent} already took over this run)")
+        }
+        Some(agent) => format!("  fallback: armed ({agent} takes over on a rate limit)"),
+        None => "  fallback: none".to_string(),
+    }
+}
+
+/// `status`'s lines about what a phase's run did and what is left (OPS-02,
+/// OPS-04): its worktree (marked when it is gone), what the run is, a stopped
+/// run's recorded stop reason verbatim, and the fallback agent's state.
 fn status_run_lines(state: &State) -> Vec<String> {
-    state
-        .worktree_path
-        .iter()
-        .map(|wt| format!("  worktree: {}", wt.display()))
-        .collect()
+    let mut lines = Vec::new();
+    if let Some(wt) = &state.worktree_path {
+        let gone = if missing_worktree(state).is_some() {
+            " (missing)"
+        } else {
+            ""
+        };
+        lines.push(format!("  worktree: {}{gone}", wt.display()));
+    }
+    lines.push(match (run_kind(state), missing_worktree(state)) {
+        ("worktree missing", Some(path)) => format!(
+            "  run: not active — its worktree {} no longer exists",
+            path.display()
+        ),
+        (kind, _) => format!("  run: {kind}"),
+    });
+    if state.stopped {
+        lines.push(format!(
+            "  stop reason: {}",
+            state.stop_reason.as_deref().unwrap_or("none recorded")
+        ));
+    }
+    lines.push(fallback_line(state));
+    lines
 }
 
 pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
@@ -16732,8 +16801,9 @@ mod tests {
             "names the missing worktree: {lines}"
         );
         let header = active_phases_line(&states);
+        let active = header.lines().next().unwrap_or_default();
         assert!(
-            !header.contains(&phase.to_string()),
+            active.starts_with("active phases:") && !active.contains(&phase.to_string()),
             "the header does not call it active: {header}"
         );
 
