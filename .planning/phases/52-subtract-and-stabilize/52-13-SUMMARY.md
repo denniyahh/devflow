@@ -214,3 +214,9 @@ Ready for 52-14, which removes the remaining Ship config (`--yes-ship`, `DEVFLOW
 ---
 *Phase: 52-subtract-and-stabilize*
 *Completed: 2026-11-11*
+
+## Self-Check: PASSED
+
+- `ship_evidence.rs`, `version.rs` and `ship.rs` are absent; this SUMMARY exists.
+- Commits d1018ad, 458a773, 52a9488 and 47735f7 are ancestors of HEAD.
+- `check evaluation-scope --plan 52-13 --commits-only` resolved the plan's commits on this branch.
