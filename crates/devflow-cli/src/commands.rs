@@ -2313,8 +2313,26 @@ fn answer_route_lines(
         .as_ref()
         .and_then(crate::pipeline_launch::recorded_canary_refusal);
     let canary_refusal = canary_refusal.as_deref();
+    // A relaunch runs on the run's current agent, so the print names it (D-15,
+    // D-37: the rate-limit gate relaunches on the same agent).
+    let on_agent = match &state {
+        Some(state) => format!(", on {} (the run's current agent)", state.agent),
+        None => ", on the run's current agent (its state could not be loaded)".to_string(),
+    };
     let status_less = |step: &crate::pipeline_outcomes::StatusLessStep| {
-        route_line(step.name(), &status_less_phrase(step, phase, stage))
+        use crate::pipeline_outcomes::StatusLessStep;
+        let agent = match step {
+            StatusLessStep::RetryStage
+            | StatusLessStep::RelaunchNow
+            | StatusLessStep::RelaunchWithNote(_) => on_agent.as_str(),
+            StatusLessStep::RelaunchRefused { .. }
+            | StatusLessStep::PreflightOverride
+            | StatusLessStep::RecordCheckpointSet => "",
+        };
+        route_line(
+            step.name(),
+            &format!("{}{agent}", status_less_phrase(step, phase, stage)),
+        )
     };
     let refused = |why: &str| format!("route: refused — {why}");
     match kind {

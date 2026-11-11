@@ -6,9 +6,11 @@
 //! **It never guesses a time.** Text it cannot read is `None`, and the caller
 //! opens a plain gate instead of a timed one (D-16).
 //!
-//! It does not own scheduling, waiting, relaunching or the gate itself; it only
-//! reads a timestamp and owns the civil-date arithmetic other modules format
-//! timestamps with.
+//! It also owns the rate-limit gate's pure timing rules (D-27.2): the relaunch
+//! margin, when the one automatic relaunch is due, and how long a supervisor
+//! waits at the gate. It does not own scheduling, waiting, relaunching or the
+//! gate itself; it reads a timestamp, computes those times, and owns the
+//! civil-date arithmetic other modules format timestamps with.
 
 const SECS_PER_MINUTE: i64 = 60;
 const SECS_PER_HOUR: i64 = 60 * SECS_PER_MINUTE;
