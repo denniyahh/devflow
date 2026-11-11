@@ -1023,8 +1023,8 @@ esac
     // resolve the phase before cleaning it up, not race the still-running
     // monitor. This fixture's fake agent never produces real work, so
     // Validate always loops back and forces a gate after
-    // MAX_CONSECUTIVE_FAILURES; abort it (note containing "abort" —
-    // gates.rs::GateAction::from_response) so the monitor clears state,
+    // MAX_CONSECUTIVE_FAILURES; end it with `gate abort` (a rejection
+    // would loop back and keep the run alive) so the monitor clears state,
     // then wait for that to land before invoking cleanup.
     wait_for(&root.join(".devflow/gates/08-validate.json"));
 
@@ -1040,7 +1040,7 @@ esac
 
     // HYG-01 (41-02 review finding): `start --phase 8` spawned a monitor that
     // now blocks at the Validate gate. Bind a guard so the monitor is
-    // verified-reaped on EVERY exit path — the `gate reject` teardown below is
+    // verified-reaped on EVERY exit path — the `gate abort` teardown below is
     // the happy path, not a substitute for the guard.
     let settled = load_state(root, PhaseId::new(8)).expect("load state");
     let _reap = MonitorReapGuard::after_launch(&settled);
@@ -1051,12 +1051,12 @@ esac
         &fake_bin.path,
         &[
             "gate",
-            "reject",
+            "abort",
             "8",
             "--stage",
             "validate",
             "--note",
-            "abort test teardown",
+            "test teardown",
             // run_devflow appends the root, which now has to be --project's value.
             "--project",
         ],

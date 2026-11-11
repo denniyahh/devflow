@@ -22,8 +22,8 @@ mod phase_worktree;
 
 mod commands;
 use commands::{
-    cleanup, doctor, gate_list, gate_respond, gate_show, gate_sweep, history_cmd, logs,
-    recover_cmd, start, status, stop, stop_launch,
+    GateAnswerKind, cleanup, doctor, gate_list, gate_respond, gate_show, gate_sweep, history_cmd,
+    logs, recover_cmd, start, status, stop, stop_launch,
 };
 use devflow_core::phase_id::PhaseId;
 
@@ -310,8 +310,8 @@ enum GateCmd {
         #[arg(long, default_value = ".")]
         project: PathBuf,
     },
-    /// Reject an open gate — loops back to Code, or aborts the phase when
-    /// the note contains "abort".
+    /// Reject an open gate — the stage is fixed and relaunched. A rejection
+    /// never ends the run, whatever its note says: use `gate abort` for that.
     Reject {
         /// Phase whose gate to reject.
         phase: PhaseId,
@@ -319,10 +319,28 @@ enum GateCmd {
         /// open gate).
         #[arg(long = "stage")]
         stage: Option<Stage>,
-        /// Required note explaining the rejection (include "abort" to end
-        /// the phase instead of looping back to Code).
+        /// Required note explaining what to fix.
         #[arg(long)]
         note: String,
+        /// The gate id `gate list` showed. Without it the command answers the
+        /// gate open now; with it, a gate opened since is refused.
+        #[arg(long = "gate-id")]
+        gate_id: Option<String>,
+        /// Project root.
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+    },
+    /// Abort the run at an open gate — the only answer that ends the run.
+    Abort {
+        /// Phase whose gate to answer with an abort.
+        phase: PhaseId,
+        /// Stage of the gate (auto-resolved when the phase has exactly one
+        /// open gate).
+        #[arg(long = "stage")]
+        stage: Option<Stage>,
+        /// Optional free-text note recorded as the abort's reason.
+        #[arg(long)]
+        note: Option<String>,
         /// The gate id `gate list` showed. Without it the command answers the
         /// gate open now; with it, a gate opened since is refused.
         #[arg(long = "gate-id")]
@@ -486,7 +504,14 @@ fn run() -> Result<(), CliError> {
                 note,
                 gate_id,
                 project,
-            } => gate_respond(&project_root(project)?, phase, stage, true, note, gate_id),
+            } => gate_respond(
+                &project_root(project)?,
+                phase,
+                stage,
+                GateAnswerKind::Approve,
+                note,
+                gate_id,
+            ),
             GateCmd::Reject {
                 phase,
                 stage,
@@ -497,8 +522,22 @@ fn run() -> Result<(), CliError> {
                 &project_root(project)?,
                 phase,
                 stage,
-                false,
+                GateAnswerKind::Reject,
                 Some(note),
+                gate_id,
+            ),
+            GateCmd::Abort {
+                phase,
+                stage,
+                note,
+                gate_id,
+                project,
+            } => gate_respond(
+                &project_root(project)?,
+                phase,
+                stage,
+                GateAnswerKind::Abort,
+                note,
                 gate_id,
             ),
             GateCmd::Show {

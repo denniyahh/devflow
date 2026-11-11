@@ -1,5 +1,7 @@
-//! #200 regression: the same `gate reject` command must tell a gate left by an
-//! interrupted foreground driver apart from a live consumer of that gate.
+//! #200 regression: the same gate answer command (`gate abort`, which ends
+//! the run) must tell a gate left by an interrupted foreground driver apart
+//! from a live consumer of that gate. The file also pins that a rejection never
+//! ends a run, whatever its note says, and that `gate abort` does.
 //!
 //! The file pins both drivers:
 //! - the `start_*` arms cover criterion 4's shape: a foreground `devflow
@@ -113,21 +115,13 @@ fn spawn_gated_advance_with_path(
     child
 }
 
-fn reject(home: &common::HermeticHome, root: &Path, phase: PhaseId) -> std::process::Output {
-    common::hermetic_devflow(home)
-        .args([
-            "gate",
-            "reject",
-            &phase.to_string(),
-            "--stage",
-            "code",
-            "--note",
-            "abort: #200 e2e",
-            "--project",
-        ])
-        .arg(root)
-        .output()
-        .expect("run same gate reject command")
+/// End the run at the phase's Code gate with `devflow gate abort`.
+fn abort_code_gate(
+    home: &common::HermeticHome,
+    root: &Path,
+    phase: PhaseId,
+) -> std::process::Output {
+    answer_code_gate(home, root, phase, "abort", "#200 e2e")
 }
 
 /// Run `devflow gate <verb> <phase> --stage code --note <note>` against `root`.
@@ -267,7 +261,10 @@ fn gate_abort_ends_the_run() {
         );
         std::thread::sleep(Duration::from_millis(20));
     };
-    assert!(status.success(), "the advance must abort cleanly: {status:?}");
+    assert!(
+        status.success(),
+        "the advance must abort cleanly: {status:?}"
+    );
     let resolved = events_named(root, "gate_resolved");
     assert_eq!(resolved.len(), 1, "{resolved:?}");
     assert_eq!(resolved[0]["action"], "abort", "{resolved:?}");
@@ -398,21 +395,26 @@ fn spawn_parked_start(
     start
 }
 
-fn reject_plan(home: &common::HermeticHome, root: &Path, phase: PhaseId) -> std::process::Output {
+/// End the run at the phase's Plan gate with `devflow gate abort`.
+fn abort_plan_gate(
+    home: &common::HermeticHome,
+    root: &Path,
+    phase: PhaseId,
+) -> std::process::Output {
     common::hermetic_devflow(home)
         .args([
             "gate",
-            "reject",
+            "abort",
             &phase.to_string(),
             "--stage",
             "plan",
             "--note",
-            "abort: #200 start e2e",
+            "#200 start e2e",
             "--project",
         ])
         .arg(root)
         .output()
-        .expect("run same gate reject plan command")
+        .expect("run gate abort for the Plan gate")
 }
 
 /// Names of entries in `dir` accepted by `keep`; a missing directory is empty.
@@ -449,7 +451,7 @@ fn advance_wedge_arm_killed_advance_leaves_a_code_gate_that_reject_reports_hones
     child.kill().expect("kill foreground advance");
     child.wait().expect("reap foreground advance");
 
-    let output = reject(&home, root, phase);
+    let output = abort_code_gate(&home, root, phase);
     assert!(
         !output.status.success(),
         "wedge reject unexpectedly succeeded: {}",
@@ -520,7 +522,7 @@ fn advance_self_resolving_arm_live_advance_consumes_the_code_rejection() {
     init_repo(root, phase);
     let mut child = spawn_gated_advance(&home, root, phase);
     let before = Instant::now();
-    let output = reject(&home, root, phase);
+    let output = abort_code_gate(&home, root, phase);
     assert!(
         output.status.success(),
         "live reject failed: {}",
@@ -673,7 +675,7 @@ fn start_wedge_arm_interrupted_start_leaves_a_plan_gate_nothing_answers() {
         "the interrupted start must leave its Plan gate behind"
     );
 
-    let output = reject_plan(&home, root, phase);
+    let output = abort_plan_gate(&home, root, phase);
     let output_text = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -786,7 +788,7 @@ fn start_self_resolving_arm_live_start_consumes_the_plan_rejection() {
     assert_parked_start_is_the_plan_gates_waiter(root, phase, start.0.id());
 
     let before = Instant::now();
-    let output = reject_plan(&home, root, phase);
+    let output = abort_plan_gate(&home, root, phase);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success(),

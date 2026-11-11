@@ -873,6 +873,7 @@ mod tests {
                 &gate_id,
                 &GateResponse {
                     approved: false,
+                    abort: true,
                     note: Some("abort: test".into()),
                     responded_by: Some("test".into()),
                 },
@@ -1133,6 +1134,7 @@ mod tests {
             &gate,
             &GateResponse {
                 approved: true,
+                abort: false,
                 note: None,
                 responded_by: Some("test".into()),
             },
@@ -1388,6 +1390,7 @@ mod tests {
             &answered,
             &GateResponse {
                 approved: true,
+                abort: false,
                 note: None,
                 responded_by: Some("test".into()),
             },
@@ -1629,6 +1632,7 @@ mod tests {
             &gate,
             &GateResponse {
                 approved: true,
+                abort: false,
                 note: Some("unclaimed".into()),
                 responded_by: Some("test".into()),
             },
@@ -2525,6 +2529,7 @@ mod tests {
                 &gate,
                 &GateResponse {
                     approved: true,
+                    abort: false,
                     note: None,
                     responded_by: Some("test".into()),
                 },

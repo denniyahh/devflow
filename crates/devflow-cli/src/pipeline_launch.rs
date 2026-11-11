@@ -4825,7 +4825,7 @@ mod tests {
             phase,
             Stage::Code,
             mode,
-            &gate_response(false, Some("abort: stale answer nobody polled")),
+            &abort_response("abort: stale answer nobody polled"),
         )
     }
 
@@ -6089,7 +6089,7 @@ mod tests {
                 phase,
                 Stage::Code,
                 &serde_json::from_str(
-                    r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                    r#"{"approved":false,"abort":true,"note":"abort: test cleanup","responded_by":"test"}"#,
                 )
                 .unwrap(),
             )
@@ -6173,7 +6173,7 @@ mod tests {
             phase,
             Stage::Code,
             &serde_json::from_str(
-                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                r#"{"approved":false,"abort":true,"note":"abort: test cleanup","responded_by":"test"}"#,
             )
             .unwrap(),
         );
@@ -7162,7 +7162,7 @@ mod tests {
             phase,
             stage,
             &serde_json::from_str(
-                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                r#"{"approved":false,"abort":true,"note":"abort: test cleanup","responded_by":"test"}"#,
             )
             .unwrap(),
         );
@@ -7483,28 +7483,35 @@ mod tests {
     fn gate_response(approved: bool, note: Option<&str>) -> devflow_core::gates::GateResponse {
         devflow_core::gates::GateResponse {
             approved,
+            abort: false,
             note: note.map(str::to_string),
             responded_by: Some("test".to_string()),
         }
     }
 
+    /// An abort answer, the shape `devflow gate abort` writes.
+    fn abort_response(note: &str) -> devflow_core::gates::GateResponse {
+        devflow_core::gates::GateResponse {
+            abort: true,
+            ..gate_response(false, Some(note))
+        }
+    }
+
     /// Pre-answer the next gate at `stage` so its wait returns immediately.
     ///
-    /// `GateAction::from_response` maps these three shapes: approved ->
-    /// `Advance`; not approved with a note containing "abort" -> `Abort`;
-    /// anything else not approved -> `LoopBack`.
+    /// `GateAction::from_response` maps the three shapes by their fields:
+    /// `abort` -> `Abort`; approved -> `Advance`; anything else -> `LoopBack`.
     fn preanswer_gate_response(
         root: &Path,
         phase: PhaseId,
         stage: Stage,
-        approved: bool,
-        note: Option<&str>,
+        response: &devflow_core::gates::GateResponse,
     ) {
         assert!(
             std::env::var_os(devflow_core::test_support::CHILD_TEST_ENV).is_some(),
             "preanswer_gate_response must run inside a child test with an agent-free PATH (999.80)"
         );
-        preanswer_gate(root, phase, stage, &gate_response(approved, note));
+        preanswer_gate(root, phase, stage, response);
     }
 
     /// Answer the gate that opens next at `stage`, as a human would once they see
@@ -7567,7 +7574,7 @@ mod tests {
         );
         let root = root.as_path();
 
-        preanswer_gate_response(root, phase, Stage::Code, true, None);
+        preanswer_gate_response(root, phase, Stage::Code, &gate_response(true, None));
 
         let first = advance_for_stage(root, Some(phase), Some(Stage::Code));
         let reloaded_first = workflow::load_state(root, phase).ok();
@@ -7668,7 +7675,7 @@ mod tests {
         );
         let root = root.as_path();
         let expected_approval = recorded_from_body(phase, &rescan_plan_body_rewritten());
-        preanswer_gate_response(root, phase, Stage::Code, true, None);
+        preanswer_gate_response(root, phase, Stage::Code, &gate_response(true, None));
 
         let writer_root = root.to_path_buf();
         let writer = std::thread::spawn(move || {
@@ -7685,12 +7692,7 @@ mod tests {
                 );
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
-            answer_the_next_open_gate(
-                &writer_root,
-                phase,
-                Stage::Code,
-                &gate_response(false, Some("abort")),
-            );
+            answer_the_next_open_gate(&writer_root, phase, Stage::Code, &abort_response("abort"));
         });
 
         let result = advance_for_stage(root, Some(phase), Some(Stage::Code));
@@ -7755,8 +7757,7 @@ mod tests {
             root,
             phase,
             Stage::Code,
-            false,
-            Some("the rewritten task needs supervised repair"),
+            &gate_response(false, Some("the rewritten task needs supervised repair")),
         );
 
         let writer_root = root.to_path_buf();
@@ -7781,13 +7782,8 @@ mod tests {
                     return;
                 }
                 if response_gone
-                    && answer_open_gate(
-                        &writer_root,
-                        phase,
-                        Stage::Code,
-                        &gate_response(false, Some("abort")),
-                    )
-                    .is_ok()
+                    && answer_open_gate(&writer_root, phase, Stage::Code, &abort_response("abort"))
+                        .is_ok()
                 {
                     writer_third_gate_response_written
                         .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -7915,15 +7911,13 @@ mod tests {
             .unwrap()
             .checkpoint_approval;
 
-        // Not approved, and the note deliberately does NOT say "abort":
-        // `GateAction::from_response` maps that to LoopBack, the "I will fix the plan"
-        // answer.
+        // Not approved and not an abort: `GateAction::from_response` maps that
+        // to LoopBack, the "I will fix the plan" answer.
         preanswer_gate_response(
             root,
             phase,
             Stage::Code,
-            false,
-            Some("the rewritten task needs review first"),
+            &gate_response(false, Some("the rewritten task needs review first")),
         );
 
         let result = advance_for_stage(root, Some(phase), Some(Stage::Code));
@@ -8005,7 +7999,7 @@ mod tests {
         );
     }
 
-    /// 48-15 Task 1: an abort note must terminate through the SAME
+    /// 48-15 Task 1: an abort answer must terminate through the SAME
     /// `pipeline_gate::abort` every other gate uses — not a bespoke exit
     /// path that skips gate cleanup, state clearing or deregistration.
     #[test]
@@ -8044,8 +8038,7 @@ mod tests {
             root,
             phase,
             Stage::Code,
-            false,
-            Some("abort: the agent rewrote its own gate"),
+            &abort_response("abort: the agent rewrote its own gate"),
         );
 
         let result = advance_for_stage(root, Some(phase), Some(Stage::Code));
@@ -8060,7 +8053,7 @@ mod tests {
         assert_eq!(
             events_of_kind(root, "workflow_aborted").len(),
             1,
-            "an abort note must terminate through pipeline_gate::abort"
+            "an abort answer must terminate through pipeline_gate::abort"
         );
         assert!(
             workflow::load_state(root, phase).is_err(),
@@ -11810,6 +11803,7 @@ mod tests {
             Stage::Plan,
             &devflow_core::gates::GateResponse {
                 approved: false,
+                abort: true,
                 note: Some("abort: control answer".to_string()),
                 responded_by: Some("test".to_string()),
             },
@@ -13759,6 +13753,7 @@ mod tests {
             Stage::Plan,
             &devflow_core::gates::GateResponse {
                 approved: true,
+                abort: false,
                 note: None,
                 responded_by: Some("test".to_string()),
             },
@@ -13882,6 +13877,7 @@ mod tests {
             Stage::Plan,
             &devflow_core::gates::GateResponse {
                 approved: false,
+                abort: true,
                 note: Some("abort: control answer".to_string()),
                 responded_by: Some("test".to_string()),
             },
@@ -13943,6 +13939,7 @@ mod tests {
         let g2 = opened.gate_id.clone();
         let response = devflow_core::gates::GateResponse {
             approved: true,
+            abort: false,
             note: None,
             responded_by: Some("test".to_string()),
         };

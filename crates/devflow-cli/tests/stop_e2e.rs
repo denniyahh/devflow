@@ -372,6 +372,7 @@ fn stop_says_a_claimed_gate_was_not_answered_again() {
         .gate_id;
     let response = GateResponse {
         approved: true,
+        abort: false,
         note: None,
         responded_by: Some("human".into()),
     };
@@ -987,6 +988,7 @@ fn stop_against_a_hand_written_response_is_a_success_no_op() {
         Stage::Validate,
         &GateResponse {
             approved: false,
+            abort: false,
             note: Some("hand-written rejection".into()),
             responded_by: Some("human".into()),
         },

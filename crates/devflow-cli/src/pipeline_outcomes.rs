@@ -82,8 +82,8 @@ pub(crate) fn retry_after_from_reason(reason: Option<&str>) -> String {
 /// D-20): the run waits at the never-silent gate for `stage`, which shows in
 /// `gate list`/`gate show` and fires the notify command. Its context leads with
 /// the way on ([`rate_limit_gate_context`]). Answers route as for any failed
-/// stage ([`answer_stage_failure_gate`]): approve or a plain reject relaunches
-/// the stage, a reject whose note says abort ends the run.
+/// stage ([`answer_stage_failure_gate`]): approve or reject relaunches the
+/// stage, and only an abort answer ends the run.
 ///
 /// Not an infra failure: `infra_failures` is untouched, so the infra ceiling
 /// cannot abort a run that is only waiting for quota. No cron-instructions file
@@ -125,7 +125,7 @@ fn rate_limit_gate_context(
     let lead = format!(
         "rate limited with no usable fallback; once this waiting supervisor has ended, \
          `devflow resume --phase {phase}{agent}` relaunches the stage; {reset}; approving \
-         this gate relaunches it now, rejecting with \"abort\" ends the run. Cause: "
+         this gate relaunches it now, `devflow gate abort` ends the run. Cause: "
     );
     stage_failure_context(stage, &lead, reason)
 }
@@ -1007,7 +1007,7 @@ mod tests {
         state.last_validate_failure_commit_count = Some(0);
         workflow::save_state(&state).unwrap();
 
-        // Pre-write a rejected response whose note says "abort" so
+        // Pre-write an abort response (`abort: true`) so
         // `GateAction::from_response` resolves to `Abort` rather than a
         // loop-back-to-Code.
         preanswer_gate(
@@ -1015,7 +1015,7 @@ mod tests {
             phase,
             Stage::Validate,
             &serde_json::from_str(
-                r#"{"approved":false,"note":"abort: requirements changed","responded_by":"test"}"#,
+                r#"{"approved":false,"abort":true,"note":"abort: requirements changed","responded_by":"test"}"#,
             )
             .unwrap(),
         );
@@ -1067,6 +1067,7 @@ mod tests {
         }
         let abort = devflow_core::gates::GateResponse {
             approved: false,
+            abort: true,
             note: Some(ABORT_NOTE.to_string()),
             responded_by: Some("test".to_string()),
         };
@@ -1187,7 +1188,7 @@ mod tests {
                 phase,
                 Stage::Validate,
                 &serde_json::from_str(
-                    r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                    r#"{"approved":false,"abort":true,"note":"abort: test cleanup","responded_by":"test"}"#,
                 )
                 .unwrap(),
             )
@@ -1400,7 +1401,7 @@ mod tests {
             phase,
             Stage::Validate,
             &serde_json::from_str(
-                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                r#"{"approved":false,"abort":true,"note":"abort: test cleanup","responded_by":"test"}"#,
             )
             .unwrap(),
         );
@@ -1455,7 +1456,7 @@ mod tests {
             phase,
             Stage::Validate,
             &serde_json::from_str(
-                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                r#"{"approved":false,"abort":true,"note":"abort: test cleanup","responded_by":"test"}"#,
             )
             .unwrap(),
         );
@@ -1773,7 +1774,7 @@ mod tests {
             phase,
             Stage::Validate,
             &serde_json::from_str(
-                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                r#"{"approved":false,"abort":true,"note":"abort: test cleanup","responded_by":"test"}"#,
             )
             .unwrap(),
         );
@@ -1823,7 +1824,7 @@ mod tests {
             phase,
             Stage::Code,
             &serde_json::from_str(
-                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                r#"{"approved":false,"abort":true,"note":"abort: test cleanup","responded_by":"test"}"#,
             )
             .unwrap(),
         );
@@ -1869,7 +1870,7 @@ mod tests {
             phase,
             Stage::Validate,
             &serde_json::from_str(
-                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                r#"{"approved":false,"abort":true,"note":"abort: test cleanup","responded_by":"test"}"#,
             )
             .unwrap(),
         );
@@ -1963,7 +1964,7 @@ mod tests {
                 phase,
                 Stage::Validate,
                 &serde_json::from_str(
-                    r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                    r#"{"approved":false,"abort":true,"note":"abort: test cleanup","responded_by":"test"}"#,
                 )
                 .unwrap(),
             );
@@ -2037,7 +2038,7 @@ mod tests {
                 phase,
                 Stage::Validate,
                 &serde_json::from_str(
-                    r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                    r#"{"approved":false,"abort":true,"note":"abort: test cleanup","responded_by":"test"}"#,
                 )
                 .unwrap(),
             );
@@ -2106,7 +2107,7 @@ mod tests {
                 phase,
                 Stage::Validate,
                 &serde_json::from_str(
-                    r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                    r#"{"approved":false,"abort":true,"note":"abort: test cleanup","responded_by":"test"}"#,
                 )
                 .unwrap(),
             );
@@ -2239,7 +2240,7 @@ mod tests {
                 phase,
                 Stage::Validate,
                 &serde_json::from_str(
-                    r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                    r#"{"approved":false,"abort":true,"note":"abort: test cleanup","responded_by":"test"}"#,
                 )
                 .unwrap(),
             );
@@ -2306,10 +2307,10 @@ mod tests {
     }
 
     /// The loop-back gate response used by the 999.78 tests below. Deliberately
-    /// NOT the `"abort: test cleanup"` note the older fixtures use:
-    /// `GateAction::from_response` routes any note containing `abort` to
-    /// `GateAction::Abort`, which clears the phase's state — and "the run
-    /// stays alive" (D-07) is exactly what these tests have to observe.
+    /// NOT the `"abort": true` cleanup answer the older fixtures use:
+    /// `GateAction::from_response` routes that to `GateAction::Abort`, which
+    /// clears the phase's state — and "the run stays alive" (D-07) is exactly
+    /// what these tests have to observe.
     const LOOP_BACK_RESPONSE: &str =
         r#"{"approved":false,"note":"loop back for another pass","responded_by":"test"}"#;
 
@@ -4313,7 +4314,7 @@ mod tests {
 
     /// D-01/D-02: the `Ambiguous` gate's loop-back arm must also consult
     /// `select_loop_back_fix`, not only the plain-Failed tail arm Task 1
-    /// wired. Seeds a rejecting `GateResponse` (note without "abort", so
+    /// wired. Seeds a rejecting `GateResponse` (no `abort` field, so
     /// `GateAction::from_response` resolves `LoopBack` rather than `Abort`)
     /// so the gate resolves from an already-written file instead of
     /// blocking on the multi-day default timeout. PATH is neutralized under
@@ -4497,7 +4498,7 @@ mod tests {
             phase,
             Stage::Validate,
             &serde_json::from_str(
-                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                r#"{"approved":false,"abort":true,"note":"abort: test cleanup","responded_by":"test"}"#,
             )
             .unwrap(),
         );
@@ -4536,7 +4537,7 @@ mod tests {
                 phase,
                 Stage::Validate,
                 &serde_json::from_str(
-                    r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                    r#"{"approved":false,"abort":true,"note":"abort: test cleanup","responded_by":"test"}"#,
                 )
                 .unwrap(),
             );
@@ -4589,7 +4590,7 @@ mod tests {
             phase,
             Stage::Validate,
             &serde_json::from_str(
-                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                r#"{"approved":false,"abort":true,"note":"abort: test cleanup","responded_by":"test"}"#,
             )
             .unwrap(),
         );
@@ -4660,7 +4661,7 @@ mod tests {
             phase,
             Stage::Code,
             &serde_json::from_str(
-                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                r#"{"approved":false,"abort":true,"note":"abort: test cleanup","responded_by":"test"}"#,
             )
             .unwrap(),
         );
@@ -4925,7 +4926,7 @@ mod tests {
             phase,
             Stage::Code,
             &serde_json::from_str(
-                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                r#"{"approved":false,"abort":true,"note":"abort: test cleanup","responded_by":"test"}"#,
             )
             .unwrap(),
         );
@@ -4975,6 +4976,7 @@ mod tests {
             Stage::Code,
             &devflow_core::gates::GateResponse {
                 approved: false,
+                abort: true,
                 note: Some("abort: test cleanup".into()),
                 responded_by: Some("test".into()),
             },

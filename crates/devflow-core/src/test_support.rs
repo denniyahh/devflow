@@ -415,6 +415,7 @@ mod tests {
     fn approved() -> GateResponse {
         GateResponse {
             approved: true,
+            abort: false,
             note: None,
             responded_by: Some("human".into()),
         }

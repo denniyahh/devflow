@@ -54,6 +54,11 @@ pub struct GateFile {
 pub struct GateResponse {
     /// Whether the gated work is approved to advance.
     pub approved: bool,
+    /// Whether the answer ends the run. Only an explicit `true` aborts: a record
+    /// without the field reads as not an abort, and a note's wording never
+    /// changes the action.
+    #[serde(default)]
+    pub abort: bool,
     /// Optional free-text note (e.g. what to fix on a rejection).
     #[serde(default)]
     pub note: Option<String>,
@@ -87,23 +92,27 @@ pub enum GateAction {
     Advance,
     /// Rejected with fixable feedback — loop back to the given stage.
     LoopBack(Stage),
-    /// Rejected and aborted — stop the workflow with a reason.
+    /// Aborted — stop the workflow with a reason.
     Abort(String),
 }
 
+/// The abort reason when an abort answer carries no note.
+const ABORT_WITHOUT_NOTE: &str = "the gate answer was an abort";
+
 impl GateAction {
-    /// Decide the action from a response: approval advances, a rejection loops
-    /// back to Code unless the note asks to abort.
+    /// Decide the action from a response's fields, never from its note: `abort`
+    /// ends the run, otherwise `approved` advances, and anything else loops back
+    /// to Code. The abort is checked first, so an answer can never both abort
+    /// and advance.
     pub fn from_response(response: &GateResponse) -> GateAction {
+        if response.abort {
+            let reason = response.note.as_deref().unwrap_or(ABORT_WITHOUT_NOTE);
+            return GateAction::Abort(reason.to_string());
+        }
         if response.approved {
             return GateAction::Advance;
         }
-        match response.note.as_deref() {
-            Some(note) if note.to_ascii_lowercase().contains("abort") => {
-                GateAction::Abort(note.to_string())
-            }
-            _ => GateAction::LoopBack(Stage::Code),
-        }
+        GateAction::LoopBack(Stage::Code)
     }
 }
 
@@ -668,14 +677,12 @@ impl Gates {
         Self::answer_with_hook(project_root, phase, stage, observed, response, || {})
     }
 
-    /// Answer an abandoned gate with a rejection, for the gate the caller observed.
+    /// Answer an abandoned gate with an abort, for the gate the caller observed.
     /// Mitigation for T-23-41 (Elevation of Privilege): this function takes **no**
-    /// boolean parameter and hard-codes `approved: false` at the literal below, so no
-    /// caller can ever make it write an approval.
-    ///
-    /// The caller-supplied `note`'s lowercase form MUST contain the abort keyword
-    /// [`GateAction::from_response`] matches on (`"abort"`), so the reap resolves to
-    /// `GateAction::Abort` and never relaunches an agent on an abandoned run. It
+    /// boolean parameter and hard-codes `approved: false` and `abort: true` at the
+    /// literal below, so no caller can ever make it write an approval, and the reap
+    /// always resolves to `GateAction::Abort`: it never relaunches an agent on an
+    /// abandoned run. `note` is only the reason recorded with the abort. It
     /// publishes the way [`answer`](Self::answer) does, with the same checks.
     pub fn reap_answer(
         project_root: &Path,
@@ -687,6 +694,7 @@ impl Gates {
     ) -> Result<PathBuf, GateError> {
         let response = GateResponse {
             approved: false,
+            abort: true,
             note: Some(note.to_string()),
             responded_by: Some(responded_by.to_string()),
         };
@@ -1951,6 +1959,7 @@ mod tests {
         let (phase, stage) = (PhaseId::new(11), Stage::Validate);
         let response = GateResponse {
             approved: true,
+            abort: false,
             note: None,
             responded_by: Some("human".into()),
         };
@@ -1980,6 +1989,7 @@ mod tests {
         let (phase, stage) = (PhaseId::new(12), Stage::Validate);
         let response = GateResponse {
             approved: true,
+            abort: false,
             note: None,
             responded_by: Some("human".into()),
         };
@@ -2034,6 +2044,7 @@ mod tests {
         let (phase, stage) = (PhaseId::new(11), Stage::Validate);
         let response = GateResponse {
             approved: true,
+            abort: false,
             note: None,
             responded_by: Some("human".into()),
         };
@@ -2216,6 +2227,7 @@ mod tests {
             &answered,
             &GateResponse {
                 approved: true,
+                abort: false,
                 note: None,
                 responded_by: Some("test".into()),
             },
@@ -2319,12 +2331,14 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let rejected = serde_json::to_string(&GateResponse {
             approved: false,
+            abort: false,
             note: Some("first answer".into()),
             responded_by: None,
         })
         .unwrap();
         let approved = serde_json::to_string(&GateResponse {
             approved: true,
+            abort: false,
             note: Some("second answer".into()),
             responded_by: None,
         })
@@ -2356,6 +2370,7 @@ mod tests {
         let phase = PhaseId::new(48);
         let response = GateResponse {
             approved: true,
+            abort: false,
             note: None,
             responded_by: None,
         };
@@ -2385,6 +2400,7 @@ mod tests {
             .gate_id;
         let response = GateResponse {
             approved: false,
+            abort: true,
             note: Some("abort: nope".into()),
             responded_by: Some("cli".into()),
         };
@@ -2408,6 +2424,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let response = GateResponse {
             approved: true,
+            abort: false,
             note: None,
             responded_by: None,
         };
@@ -2431,6 +2448,7 @@ mod tests {
             .gate_id;
         let response = GateResponse {
             approved: true,
+            abort: false,
             note: None,
             responded_by: None,
         };
@@ -2446,6 +2464,7 @@ mod tests {
     fn gate_action_advances_on_approval() {
         let response = GateResponse {
             approved: true,
+            abort: false,
             note: None,
             responded_by: None,
         };
@@ -2456,6 +2475,7 @@ mod tests {
     fn gate_action_loops_back_on_fixable_rejection() {
         let response = GateResponse {
             approved: false,
+            abort: false,
             note: Some("fix the failing test".into()),
             responded_by: None,
         };
@@ -2465,17 +2485,37 @@ mod tests {
         );
     }
 
+    /// The rule `from_response` used before the `abort` field (999.189): any
+    /// rejection whose note contained "abort" ended the run. Kept only as the
+    /// control the tests below disagree with.
+    fn old_substring_rule(response: &GateResponse) -> GateAction {
+        if response.approved {
+            return GateAction::Advance;
+        }
+        match response.note.as_deref() {
+            Some(note) if note.to_ascii_lowercase().contains("abort") => {
+                GateAction::Abort(note.to_string())
+            }
+            _ => GateAction::LoopBack(Stage::Code),
+        }
+    }
+
     #[test]
-    fn gate_action_aborts_when_note_says_abort() {
+    fn a_note_containing_abort_does_not_abort() {
         let response = GateResponse {
             approved: false,
-            note: Some("abort: requirements changed".into()),
+            abort: false,
+            note: Some("do not abort, fix the test".into()),
             responded_by: None,
         };
-        assert!(matches!(
+        assert_eq!(
             GateAction::from_response(&response),
-            GateAction::Abort(_)
-        ));
+            GateAction::LoopBack(Stage::Code)
+        );
+        assert!(
+            matches!(old_substring_rule(&response), GateAction::Abort(_)),
+            "control: the note-substring rule must abort on this note, or the test shows nothing"
+        );
     }
 
     /// `run_notify_command` takes the command string as an argument (not an
@@ -2657,6 +2697,7 @@ mod tests {
             .gate_id;
         let response = GateResponse {
             approved: true,
+            abort: false,
             note: Some("go".into()),
             responded_by: Some("human".into()),
         };
@@ -2698,6 +2739,7 @@ mod tests {
     fn approved() -> GateResponse {
         GateResponse {
             approved: true,
+            abort: false,
             note: None,
             responded_by: Some("human".into()),
         }
@@ -2932,6 +2974,7 @@ mod tests {
         let bound = std::fs::read(&slot).unwrap();
         let rejection = GateResponse {
             approved: false,
+            abort: false,
             note: Some("second answer".into()),
             responded_by: None,
         };
@@ -3356,6 +3399,7 @@ mod tests {
         let gate = Gates::open_gate(root, phase, stage, "ctx").unwrap().gate_id;
         let response = GateResponse {
             approved: true,
+            abort: false,
             note: None,
             responded_by: Some("test".into()),
         };
@@ -3448,6 +3492,7 @@ mod tests {
     fn rejection() -> GateResponse {
         GateResponse {
             approved: false,
+            abort: false,
             note: Some("rejected".into()),
             responded_by: None,
         }
@@ -3632,6 +3677,7 @@ mod tests {
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
         let kept = GateResponse {
             approved: true,
+            abort: false,
             note: Some("kept".into()),
             responded_by: None,
         };

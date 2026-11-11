@@ -214,6 +214,7 @@ fn start_clears_leftover_gate_files_after_reserving() {
     fs::create_dir_all(response_path.parent().unwrap()).unwrap();
     let planted = serde_json::to_vec(&GateResponse {
         approved: false,
+        abort: true,
         note: Some("abort: planted stale response".into()),
         responded_by: Some("start-lock-e2e-planted-response".into()),
     })
@@ -547,6 +548,7 @@ fn plant_code_gate(root: &Path, phase: PhaseId) -> PlantedGate {
         &opened.gate_id,
         &GateResponse {
             approved: false,
+            abort: true,
             note: Some("abort: planted leftover response".into()),
             responded_by: Some("start-lock-e2e-planted-leftover".into()),
         },
