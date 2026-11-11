@@ -159,7 +159,19 @@ impl ReaderFailure {
     /// An event-safe name for the failure class: no path, no GSD message.
     #[must_use]
     pub fn label(&self) -> &'static str {
-        ""
+        match self {
+            Self::LauncherNotFound { .. } => "gsd_launcher_not_found",
+            Self::Spawn { .. } => "gsd_reader_spawn_failed",
+            Self::TimedOut { .. } => "gsd_reader_timed_out",
+            Self::NotJson { .. } => "gsd_reader_not_json",
+            Self::UnknownStatus { .. } => "gsd_unknown_status",
+            Self::PhaseDirNotFound { .. } => "gsd_phase_dir_not_found",
+            Self::AmbiguousPhaseDir { .. } => "gsd_phase_dir_ambiguous",
+            Self::Exit { .. } => "gsd_reader_nonzero_exit",
+            Self::Unparseable { .. } => "gsd_report_unparseable",
+            Self::Indeterminate => "gsd_stale_check_indeterminate",
+            Self::MissingField { .. } => "gsd_reader_missing_field",
+        }
     }
 }
 
@@ -181,26 +193,36 @@ pub fn locate_launcher(home: &Path) -> Result<PathBuf, ReaderFailure> {
 /// It returns the directory, not the report, so GSD can still answer
 /// `missing` for a directory that holds no report. Pass the root the agent
 /// wrote to (the worktree in worktree mode), never the main checkout: the
-/// main checkout would read `missing` for a phase that has a report.
+/// main checkout would read `missing` for a phase that has a report. Two
+/// matching directories are a failure, not a guess: `read_dir` order is
+/// unspecified, so "the first" would be arbitrary.
 pub fn phase_dir(evidence_root: &Path, phase: PhaseId) -> Result<PathBuf, ReaderFailure> {
     let phases = evidence_root.join(".planning/phases");
     let prefix = format!("{padded}-", padded = phase.padded());
     let entries = std::fs::read_dir(&phases).map_err(|error| ReaderFailure::PhaseDirNotFound {
         message: format!("cannot read {}: {error}", phases.display()),
     })?;
-    entries
+    let mut matches: Vec<PathBuf> = entries
         .flatten()
         .map(|entry| entry.path())
-        .find(|path| {
+        .filter(|path| {
             path.is_dir()
                 && path
                     .file_name()
                     .and_then(OsStr::to_str)
                     .is_some_and(|name| name.starts_with(&prefix))
         })
-        .ok_or_else(|| ReaderFailure::PhaseDirNotFound {
+        .collect();
+    match matches.len() {
+        0 => Err(ReaderFailure::PhaseDirNotFound {
             message: format!("no {prefix}* directory under {}", phases.display()),
-        })
+        }),
+        1 => Ok(matches.remove(0)),
+        _ => {
+            matches.sort();
+            Err(ReaderFailure::AmbiguousPhaseDir { matches })
+        }
+    }
 }
 
 /// The command one reader call runs: `launcher args...` by argv, in
@@ -232,6 +254,7 @@ pub(crate) fn reader_command(
 struct ReaderOutput {
     status: ExitStatus,
     stdout: Vec<u8>,
+    stderr: Vec<u8>,
 }
 
 /// Run `cmd` to completion or until `timeout`, whichever is first.
@@ -245,7 +268,7 @@ fn run_bounded(mut cmd: Command, timeout: Duration) -> Result<ReaderOutput, Read
         message: error.to_string(),
     })?;
     let stdout = drain(child.stdout.take());
-    let _stderr = drain(child.stderr.take());
+    let stderr = drain(child.stderr.take());
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -263,7 +286,12 @@ fn run_bounded(mut cmd: Command, timeout: Duration) -> Result<ReaderOutput, Read
         }
     };
     let stdout = collect(&stdout, deadline, timeout)?;
-    Ok(ReaderOutput { status, stdout })
+    let stderr = collect(&stderr, deadline, timeout)?;
+    Ok(ReaderOutput {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 /// Read `pipe` to its end on a thread; the bytes arrive on the receiver.
@@ -322,20 +350,108 @@ fn end(child: &mut Child) {
     let _ = child.wait();
 }
 
+/// Run one reader under `home` in `evidence_root` and parse its stdout.
+///
+/// The exit status is checked before stdout is read, so a non-zero exit is a
+/// failure even when stdout holds a well-formed answer.
+fn read_json(
+    home: &Path,
+    evidence_root: &Path,
+    args: &[&OsStr],
+    timeout: Duration,
+) -> Result<Value, ReaderFailure> {
+    let launcher = locate_launcher(home)?;
+    let output = run_bounded(
+        reader_command(&launcher, home, evidence_root, args),
+        timeout,
+    )?;
+    if !output.status.success() {
+        return Err(ReaderFailure::Exit {
+            code: output.status.code(),
+            message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        });
+    }
+    serde_json::from_slice(&output.stdout).map_err(|error| ReaderFailure::NotJson {
+        message: error.to_string(),
+    })
+}
+
+/// GSD's own explanation in a result, for the gate context only.
+fn gsd_message(value: &Value) -> String {
+    value["message"]
+        .as_str()
+        .or_else(|| value["next_action"].as_str())
+        .unwrap_or("GSD gave no message")
+        .to_owned()
+}
+
+/// The string at `key`, or a failure naming the key.
+fn required_str<'a>(value: &'a Value, key: &str) -> Result<&'a str, ReaderFailure> {
+    value[key]
+        .as_str()
+        .ok_or_else(|| ReaderFailure::MissingField {
+            key: key.to_owned(),
+        })
+}
+
 /// Classify a `query verification status` result.
+///
+/// `staleCheckIndeterminate: true` is checked first: it means GSD could not
+/// tell whether the status still holds, so no status is established.
 fn classify(value: &Value) -> Result<StatusReport, ReaderFailure> {
-    let status = match value["status"].as_str() {
-        Some("passed") => GsdStatus::Passed,
+    match value.get("staleCheckIndeterminate") {
+        None | Some(Value::Bool(false)) => {}
+        Some(Value::Bool(true)) => return Err(ReaderFailure::Indeterminate),
+        Some(_) => {
+            return Err(ReaderFailure::MissingField {
+                key: "staleCheckIndeterminate".to_owned(),
+            });
+        }
+    }
+    let status = match required_str(value, "status")? {
+        "passed" => GsdStatus::Passed,
+        "gaps_found" => GsdStatus::GapsFound,
+        "human_needed" => GsdStatus::HumanNeeded,
+        "stale" => GsdStatus::Stale,
+        "missing" => GsdStatus::Missing,
+        "unparseable" => {
+            return Err(ReaderFailure::Unparseable {
+                message: gsd_message(value),
+            });
+        }
+        "phase_dir_not_found" => {
+            return Err(ReaderFailure::PhaseDirNotFound {
+                message: gsd_message(value),
+            });
+        }
         other => {
             return Err(ReaderFailure::UnknownStatus {
-                status: other.unwrap_or_default().to_owned(),
+                status: other.to_owned(),
+            });
+        }
+    };
+    let route = required_str(value, "route")?.to_owned();
+    // GSD omits `moved_files` when no covered file moved; present, it must be
+    // a list of strings.
+    let moved_files = match value.get("moved_files") {
+        None => Vec::new(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| item.as_str().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| ReaderFailure::MissingField {
+                key: "moved_files".to_owned(),
+            })?,
+        Some(_) => {
+            return Err(ReaderFailure::MissingField {
+                key: "moved_files".to_owned(),
             });
         }
     };
     Ok(StatusReport {
         status,
-        route: value["route"].as_str().unwrap_or_default().to_owned(),
-        moved_files: Vec::new(),
+        route,
+        moved_files,
     })
 }
 
@@ -357,23 +473,13 @@ fn verification_status_within(
     phase_dir: &Path,
     timeout: Duration,
 ) -> Result<StatusReport, ReaderFailure> {
-    let launcher = locate_launcher(home)?;
     let args = [
         OsStr::new("query"),
         OsStr::new("verification"),
         OsStr::new("status"),
         phase_dir.as_os_str(),
     ];
-    let output = run_bounded(
-        reader_command(&launcher, home, evidence_root, &args),
-        timeout,
-    )?;
-    let _ = output.status;
-    let value: Value =
-        serde_json::from_slice(&output.stdout).map_err(|error| ReaderFailure::NotJson {
-            message: error.to_string(),
-        })?;
-    classify(&value)
+    classify(&read_json(home, evidence_root, &args, timeout)?)
 }
 
 #[cfg(test)]
