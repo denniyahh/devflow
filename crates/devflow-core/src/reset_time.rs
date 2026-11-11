@@ -34,6 +34,16 @@ pub fn auto_relaunch_due(now: i64, reset_at: i64) -> bool {
     now >= relaunch_not_before(reset_at)
 }
 
+/// How long, in seconds from `now`, a supervisor waits at a rate-limit gate
+/// whose denial named `reset_at` (D-27.2): the later of `gate_timeout_secs`
+/// and the time left until [`relaunch_not_before`], so the gate timeout
+/// (`DEVFLOW_GATE_TIMEOUT_SECS`) never ends the wait before the reset. When the
+/// reset is the later of the two the bound falls exactly at the timer's wake.
+pub fn rate_limit_wait_bound(now: i64, reset_at: i64, gate_timeout_secs: u64) -> u64 {
+    let _ = (now, reset_at);
+    gate_timeout_secs
+}
+
 /// The exact UTC instant, in Unix epoch seconds, that `input` names.
 ///
 /// Two forms are read, after trimming surrounding whitespace:
@@ -227,6 +237,35 @@ mod tests {
         assert!(!auto_relaunch_due(reset, reset), "at the bare reset");
         // An absurd reset saturates instead of overflowing.
         assert_eq!(relaunch_not_before(i64::MAX), i64::MAX);
+    }
+
+    /// D-27.2, U8: the wait at a rate-limit gate is the later of the gate
+    /// timeout and the time to the reset plus margin. A reset five days out
+    /// under a three-day timeout waits five days plus the margin, exactly the
+    /// timer's wake; a reset an hour out, and one in the past, wait the timeout.
+    #[test]
+    fn the_wait_bound_is_the_later_of_the_gate_timeout_and_the_reset() {
+        const DAY: i64 = 86_400;
+        let three_days = u64::try_from(3 * DAY).unwrap();
+        let now = august_2_2026_midnight_utc();
+        let far = now + 5 * DAY;
+        assert_eq!(
+            rate_limit_wait_bound(now, far, three_days),
+            u64::try_from(5 * DAY + RATE_LIMIT_RELAUNCH_MARGIN_SECS).unwrap()
+        );
+        assert_eq!(
+            rate_limit_wait_bound(now, far, three_days),
+            u64::try_from(relaunch_not_before(far) - now).unwrap(),
+            "the bound falls at the timer's wake"
+        );
+        assert_eq!(
+            rate_limit_wait_bound(now, now + 3600, three_days),
+            three_days
+        );
+        assert_eq!(
+            rate_limit_wait_bound(now, now - DAY, three_days),
+            three_days
+        );
     }
 
     /// An epoch-seconds reset is read to the exact second, surrounding

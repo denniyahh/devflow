@@ -641,6 +641,18 @@ const EMPTY_NOTE: Refusal = Refusal {
     applies: "`devflow gate reject --note <text>`, `devflow gate approve` or `devflow gate abort`",
 };
 
+/// A relaunch action where only [`GateAction::from_response`]'s actions can
+/// arrive. `from_response` never returns [`GateAction::Relaunch`]; only the
+/// rate-limit mapping [`GateAction::from_gate_answer`] does, and nothing here
+/// calls it yet (52-32). Refused, never acted on, so the impossible case is
+/// loud: the screen's refusal names the stage and this action, and so does the
+/// dispatch's error for a routed one.
+const UNEXPECTED_RELAUNCH: Refusal = Refusal {
+    answer: "relaunch",
+    why: "a relaunch action arrived where only an approve, a reject or an abort is read",
+    applies: "`devflow gate abort`",
+};
+
 /// Any answer but abort on a gate file with no kind (a 3.x or hand-written
 /// file).
 fn unclassified(answer: &'static str) -> Refusal {
@@ -953,6 +965,7 @@ pub(crate) fn screen_answer(
     let family = answer_family(kind);
     match GateAction::from_response(response) {
         GateAction::Abort(_) => Ok(()),
+        GateAction::Relaunch { .. } => Err(UNEXPECTED_RELAUNCH),
         GateAction::Advance => match family {
             AnswerFamily::Unclassified => Err(unclassified("approve")),
             AnswerFamily::Verification
@@ -1052,6 +1065,8 @@ pub(crate) fn route_answer(
             canary_refusal.as_deref(),
             note.as_deref().unwrap_or_default(),
         )),
+        // `dispatch_answer` returns this refusal as an error naming the stage.
+        GateAction::Relaunch { .. } => Answer::Approve(ApproveRoute::Refused(UNEXPECTED_RELAUNCH)),
     }
 }
 

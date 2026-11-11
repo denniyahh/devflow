@@ -367,6 +367,19 @@ pub struct State {
     /// written by a binary predating this field" — both behave identically.
     #[serde(default)]
     pub fallback_consumed: bool,
+    /// Whether this run's one automatic relaunch at a rate-limit gate has
+    /// happened (D-16, D-27.3, D-38). Only the reset timer sets it, for the
+    /// gate whose single claim takes the timer's answer; an operator's approve
+    /// or reject at a rate-limit gate never sets it, so a later denial with a
+    /// known reset still gets its automatic relaunch. Whether a gate's timer is
+    /// armed is decided from this flag when the supervisor waits, and is never
+    /// stored in the gate file (52-32).
+    ///
+    /// `false` means EITHER "the automatic relaunch has not happened" OR "the
+    /// state was written by a binary predating this field" — both behave
+    /// identically.
+    #[serde(default)]
+    pub rate_limit_auto_relaunch_used: bool,
     /// The fix type of the Code pass in flight (Phase 51 D-09).
     ///
     /// Set by a loop-back to Code in the same write that enters Code, and
@@ -676,6 +689,7 @@ impl State {
             gate_notify_cmd: None,
             fallback_agent: None,
             fallback_consumed: false,
+            rate_limit_auto_relaunch_used: false,
             code_fix: None,
             code_fix_note: None,
             code_fix_report: None,
@@ -1025,6 +1039,40 @@ mod tests {
         let loaded: State = serde_json::from_str(predating).unwrap();
         assert_eq!(loaded.fallback_agent, None);
         assert!(!loaded.fallback_consumed);
+    }
+
+    /// D-38: the run's automatic-relaunch flag is persisted under its own key,
+    /// and a state written before the field existed loads with `false`.
+    #[test]
+    fn rate_limit_auto_relaunch_used_defaults_to_false() {
+        let mut state = State::new(
+            PhaseId::new(1),
+            AgentKind::Claude,
+            Mode::Auto,
+            PathBuf::from("/repo"),
+        );
+        assert!(!state.rate_limit_auto_relaunch_used);
+        state.rate_limit_auto_relaunch_used = true;
+        let json = serde_json::to_string(&state).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value.get("rate_limit_auto_relaunch_used"),
+            Some(&serde_json::json!(true)),
+            "{json}"
+        );
+        let loaded: State = serde_json::from_str(&json).unwrap();
+        assert!(loaded.rate_limit_auto_relaunch_used);
+
+        let predating = r#"{
+            "stage": "code",
+            "phase": 1,
+            "agent": "claude",
+            "mode": "auto",
+            "started_at": "0",
+            "project_root": "/repo"
+        }"#;
+        let loaded: State = serde_json::from_str(predating).expect("an old state loads");
+        assert!(!loaded.rate_limit_auto_relaunch_used);
     }
 
     /// D-09 (Phase 51): the fix type of the Code pass in flight is persisted under
