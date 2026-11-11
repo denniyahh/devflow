@@ -153,6 +153,13 @@ pub enum ReaderFailure {
         /// The field.
         key: String,
     },
+    /// GSD answered with an `error` key (gsd-core 1.20.1 exits 0 for a
+    /// frontmatter field that is not there).
+    #[error("GSD reported an error: {message}")]
+    GsdError {
+        /// GSD's error text.
+        message: String,
+    },
 }
 
 impl ReaderFailure {
@@ -171,6 +178,7 @@ impl ReaderFailure {
             Self::Unparseable { .. } => "gsd_report_unparseable",
             Self::Indeterminate => "gsd_stale_check_indeterminate",
             Self::MissingField { .. } => "gsd_reader_missing_field",
+            Self::GsdError { .. } => "gsd_reader_error",
         }
     }
 }
@@ -480,6 +488,25 @@ fn verification_status_within(
         phase_dir.as_os_str(),
     ];
     classify(&read_json(home, evidence_root, &args, timeout)?)
+}
+
+/// The value of frontmatter `field` in `file`.
+pub fn frontmatter_field(
+    _home: &Path,
+    _evidence_root: &Path,
+    _file: &Path,
+    _field: &str,
+) -> Result<Value, ReaderFailure> {
+    Err(ReaderFailure::Spawn {
+        message: "not implemented".to_owned(),
+    })
+}
+
+/// The installed GSD version.
+pub fn runtime_version(_home: &Path, _evidence_root: &Path) -> Result<String, ReaderFailure> {
+    Err(ReaderFailure::Spawn {
+        message: "not implemented".to_owned(),
+    })
 }
 
 #[cfg(test)]
@@ -880,6 +907,9 @@ mod tests {
             ReaderFailure::MissingField {
                 key: path.to_owned(),
             },
+            ReaderFailure::GsdError {
+                message: path.to_owned(),
+            },
         ];
         for failure in &all {
             match failure {
@@ -893,7 +923,8 @@ mod tests {
                 | ReaderFailure::Exit { .. }
                 | ReaderFailure::Unparseable { .. }
                 | ReaderFailure::Indeterminate
-                | ReaderFailure::MissingField { .. } => {}
+                | ReaderFailure::MissingField { .. }
+                | ReaderFailure::GsdError { .. } => {}
             }
         }
         all
@@ -923,6 +954,94 @@ mod tests {
             failures
                 .iter()
                 .any(|failure| failure.to_string().contains(path))
+        );
+    }
+
+    // ---- Frontmatter and version readers: recorded gsd-core 1.20.1 outputs.
+
+    const FRONTMATTER_JSON: &str = r#"{"covered_files":["a.txt"]}"#;
+    const FIELD_NOT_FOUND_JSON: &str = r#"{"error":"Field not found","field":"nope"}"#;
+    const RUNTIME_IDENTITY_JSON: &str = r#"{"packageName":"@opengsd/gsd-core","version":"1.20.1"}"#;
+
+    fn report(fx: &Fixture) -> PathBuf {
+        fx.phase().join("07-VERIFICATION.md")
+    }
+
+    #[test]
+    fn frontmatter_field_reads_the_requested_field() {
+        let fx = Fixture::new();
+        fx.plant_printing(FRONTMATTER_JSON, 0);
+        let value = frontmatter_field(&fx.home, &fx.root, &report(&fx), "covered_files")
+            .expect("a present field is read");
+        assert_eq!(value, serde_json::json!(["a.txt"]));
+        let expected_argv = vec![
+            "query".to_owned(),
+            "frontmatter".to_owned(),
+            "get".to_owned(),
+            report(&fx).display().to_string(),
+            "--field".to_owned(),
+            "covered_files".to_owned(),
+        ];
+        assert_eq!(fx.argv(), expected_argv);
+        assert_eq!(fx.cwd(), fx.root.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn a_missing_frontmatter_field_is_a_reader_failure() {
+        let fx = Fixture::new();
+        fx.plant_printing(FIELD_NOT_FOUND_JSON, 0);
+        let failure = frontmatter_field(&fx.home, &fx.root, &report(&fx), "nope")
+            .expect_err("an exit-0 error is not a value");
+        match failure {
+            ReaderFailure::GsdError { ref message } => assert_eq!(message, "Field not found"),
+            other => panic!("expected GsdError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_failing_frontmatter_read_is_a_reader_failure() {
+        let fx = Fixture::new();
+        fx.plant_printing(FRONTMATTER_JSON, 1);
+        let failure = frontmatter_field(&fx.home, &fx.root, &report(&fx), "covered_files")
+            .expect_err("a non-zero exit is not a value");
+        assert!(
+            matches!(failure, ReaderFailure::Exit { code: Some(1), .. }),
+            "{failure:?}"
+        );
+    }
+
+    #[test]
+    fn a_frontmatter_result_without_the_field_is_a_reader_failure() {
+        let fx = Fixture::new();
+        fx.plant_printing(FRONTMATTER_JSON, 0);
+        let failure = frontmatter_field(&fx.home, &fx.root, &report(&fx), "gap_closure")
+            .expect_err("an absent key is not a value");
+        assert!(
+            matches!(failure, ReaderFailure::MissingField { ref key } if key == "gap_closure"),
+            "{failure:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_version_reads_the_gsd_version() {
+        let fx = Fixture::new();
+        fx.plant_printing(RUNTIME_IDENTITY_JSON, 0);
+        let version = runtime_version(&fx.home, &fx.root).expect("the version is read");
+        assert_eq!(version, "1.20.1");
+        assert_eq!(
+            fx.argv(),
+            vec!["runtime-identity".to_owned(), "--raw".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_runtime_identity_without_a_version_is_a_reader_failure() {
+        let fx = Fixture::new();
+        fx.plant_printing(r#"{"packageName":"@opengsd/gsd-core"}"#, 0);
+        let failure = runtime_version(&fx.home, &fx.root).expect_err("no version is not a version");
+        assert!(
+            matches!(failure, ReaderFailure::MissingField { ref key } if key == "version"),
+            "{failure:?}"
         );
     }
 }
