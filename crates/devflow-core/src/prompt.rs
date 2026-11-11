@@ -154,17 +154,31 @@ self-resolve or approve one under any circumstances, and report it instead. ",
 /// adapter's `render_prompt` turns that data into its own instruction — Claude
 /// and OpenCode render the legacy slash-command text byte-for-byte, Codex
 /// renders a Codex-native instruction with no `/gsd-*` string.
+///
+/// Two operator notes can ride on an intent (GATE-01, D-14), and both are
+/// rendered through the one note block ([`note_block`]): `fix_note`, the note
+/// on the rejected verification gate whose loop-back started a fix pass
+/// (`State::code_fix_note`), and `relaunch_note`, the note on a rejected gate
+/// the stage stopped at, given for the stage's relaunch (`State::relaunch_note`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StageIntent {
     Plan {
         phase: PhaseId,
+        /// The operator's note for this relaunch of the stage, if any.
+        relaunch_note: Option<String>,
     },
     Code {
         phase: PhaseId,
         fix: Option<FixType>,
+        /// The operator's note for the fix pass `fix` names, if any.
+        fix_note: Option<String>,
+        /// The operator's note for this relaunch of the stage, if any.
+        relaunch_note: Option<String>,
     },
     Validate {
         phase: PhaseId,
+        /// The operator's note for this relaunch of the stage, if any.
+        relaunch_note: Option<String>,
     },
 }
 
@@ -195,11 +209,113 @@ impl StageIntent {
         _project_root: Option<&Path>,
     ) -> Self {
         match stage {
-            Stage::Plan => StageIntent::Plan { phase },
-            Stage::Code => StageIntent::Code { phase, fix: None },
-            Stage::Validate => StageIntent::Validate { phase },
+            Stage::Plan => StageIntent::Plan {
+                phase,
+                relaunch_note: None,
+            },
+            Stage::Code => StageIntent::Code {
+                phase,
+                fix: None,
+                fix_note: None,
+                relaunch_note: None,
+            },
+            Stage::Validate => StageIntent::Validate {
+                phase,
+                relaunch_note: None,
+            },
         }
     }
+
+    /// This intent with `note` as its relaunch note, on whichever stage it
+    /// drives. The CLI attaches `State::relaunch_note` this way to the intent
+    /// [`StageIntent::for_stage_in_project`] returns, so the default intent is
+    /// still built in one place.
+    pub fn with_relaunch_note(mut self, note: Option<String>) -> Self {
+        match &mut self {
+            StageIntent::Plan { relaunch_note, .. }
+            | StageIntent::Code { relaunch_note, .. }
+            | StageIntent::Validate { relaunch_note, .. } => *relaunch_note = note,
+        }
+        self
+    }
+}
+
+/// How the note block of a fix pass is introduced: the operator's note on the
+/// rejected gate whose loop-back started this fix pass, to act on.
+pub const FIX_NOTE_INTRODUCTION: &str = "The operator rejected the previous result and left \
+the note below for this fix pass. Act on it. The note is quoted verbatim, unchanged, between \
+the BEGIN and END marker lines; the marker lines are not part of it.";
+
+/// How the note block of a relaunched stage is introduced: the operator's note
+/// for this relaunch, given when rejecting the gate the stage stopped at. It
+/// names no gate kind, so any rejected gate that relaunches its stage can use it.
+pub const RELAUNCH_NOTE_INTRODUCTION: &str = "This is a relaunch of the stage. The operator \
+left the note below for this relaunch when rejecting the gate the stage stopped at. Act on \
+it. The note is quoted verbatim, unchanged, between the BEGIN and END marker lines; the \
+marker lines are not part of it.";
+
+/// The words of the note block's marker lines, before any disambiguating
+/// number: `----- BEGIN OPERATOR NOTE -----` and `----- END OPERATOR NOTE -----`.
+const NOTE_MARKER_WORDS: &str = "OPERATOR NOTE";
+
+/// The operator's note with every control character removed except newline
+/// and tab. Everything else, printable or not ASCII, is kept byte for byte, in
+/// order: the note is never paraphrased, truncated or reordered (D-14).
+fn sanitize_note(note: &str) -> String {
+    note.chars()
+        .filter(|character| matches!(character, '\n' | '\t') || !character.is_control())
+        .collect()
+}
+
+/// The BEGIN and END marker lines for a block holding `note` (already
+/// sanitized). The END line is the first of `----- END OPERATOR NOTE -----`,
+/// `----- END OPERATOR NOTE 2 -----`, ... that does not occur in the note, so
+/// the note can never close its own block; the BEGIN line carries the same
+/// number. It terminates: a note holds finitely many marker lines.
+fn note_markers(note: &str) -> (String, String) {
+    (1usize..)
+        .map(|number| {
+            let tag = if number == 1 {
+                String::new()
+            } else {
+                format!(" {number}")
+            };
+            (
+                format!("----- BEGIN {NOTE_MARKER_WORDS}{tag} -----"),
+                format!("----- END {NOTE_MARKER_WORDS}{tag} -----"),
+            )
+        })
+        .find(|(_, end)| !note.contains(end.as_str()))
+        .expect("a note holds finitely many marker lines")
+}
+
+/// The one renderer of an operator's note (GATE-01, D-14), shared by every
+/// stage builder of both styles: `introduction`, then the note between a BEGIN
+/// and an END marker line, followed by a blank line. The note is
+/// [`sanitize_note`]d and otherwise byte-identical; the END marker is chosen
+/// by [`note_markers`] so that it does not occur inside the note. `None` when
+/// the note is empty once sanitized: there is nothing to carry.
+///
+/// What this protects: the note's bytes and the block's boundary, so text
+/// after the note can always be told apart from the note. What it does not:
+/// the note is operator text and the agent reads it as an instruction, which
+/// is its purpose; nothing here weighs what it says.
+fn note_block(introduction: &str, note: &str) -> Option<String> {
+    let note = sanitize_note(note);
+    if note.is_empty() {
+        return None;
+    }
+    let (begin, end) = note_markers(&note);
+    Some(format!("{introduction}\n\n{begin}\n{note}\n{end}\n\n"))
+}
+
+/// The note blocks a prompt carries, in order: the fix request first, then the
+/// relaunch note (P4). Empty when neither is set, so a prompt with no note is
+/// byte-identical to one built before notes existed.
+fn note_blocks(fix_note: Option<&str>, relaunch_note: Option<&str>) -> String {
+    let fix = fix_note.and_then(|note| note_block(FIX_NOTE_INTRODUCTION, note));
+    let relaunch = relaunch_note.and_then(|note| note_block(RELAUNCH_NOTE_INTRODUCTION, note));
+    fix.into_iter().chain(relaunch).collect()
 }
 
 /// A fix variant used when looping Code ↔ Validate.
@@ -273,10 +389,10 @@ DEVFLOW_RESULT: {\"status\": \"failed\", \"reason\": \"specific explanation\"}\n
 DevFlow reads this line to decide whether the stage succeeded. \
 Output nothing after it.";
 
-fn validate_stage_prompt(phase: PhaseId) -> String {
+fn validate_stage_prompt(phase: PhaseId, notes: &str) -> String {
     let command = gsd_command_for(Stage::Validate, phase);
     format!(
-        "Run the GSD workflow command for this stage:\n\n    {command}\n\n{VALIDATE_VERDICT_CONTRACT}"
+        "Run the GSD workflow command for this stage:\n\n    {command}\n\n{notes}{VALIDATE_VERDICT_CONTRACT}"
     )
 }
 
@@ -292,7 +408,7 @@ fn validate_stage_prompt(phase: PhaseId) -> String {
 /// v1 skip-stage config flags removed by the 2026-06-19 architecture
 /// decision — a stage with no pre-existing artifact still runs in full.
 /// It serves Plan only.
-fn idempotent_stage_prompt(phase: PhaseId) -> String {
+fn idempotent_stage_prompt(phase: PhaseId, notes: &str) -> String {
     let artifact = "PLAN.md";
     let command = gsd_command_for(Stage::Plan, phase);
     let padded = phase.padded();
@@ -311,7 +427,7 @@ fn idempotent_stage_prompt(phase: PhaseId) -> String {
         \n\
         \x20   {command}\n\
         \n\
-        {COMPLETION_PROTOCOL}"
+        {notes}{COMPLETION_PROTOCOL}"
     )
 }
 
@@ -338,7 +454,7 @@ pub fn stage_prompt_for_project(stage: Stage, phase: PhaseId, project_root: &Pat
 /// Pitfall 1): `execute-phase.md` wipes `workflow._auto_chain_active` at the top
 /// of every invocation whose `$ARGUMENTS` lacks this token, which would clear
 /// the flag DevFlow just set before `checkpoint_handling` ever reads it.
-fn code_stage_prompt(phase: PhaseId) -> String {
+fn code_stage_prompt(phase: PhaseId, notes: &str) -> String {
     let command = format!(
         "{} {AUTO_CHAIN_PRESERVING_FLAG}",
         gsd_command_for(Stage::Code, phase)
@@ -347,7 +463,7 @@ fn code_stage_prompt(phase: PhaseId) -> String {
         "Run the GSD workflow command for this stage:\n\n    {command}\n\n\
         {CODE_STAGE_POLICY}\n\
         \n\
-        {COMPLETION_PROTOCOL}"
+        {notes}{COMPLETION_PROTOCOL}"
     )
 }
 
@@ -357,15 +473,39 @@ fn code_stage_prompt(phase: PhaseId) -> String {
 /// what `stage_prompt` produced before the migration (CONTEXT D-01 zero
 /// regression). It lives here — not in the adapters — so the two agents cannot
 /// drift apart, and the per-stage snapshot tests pin it.
+///
+/// An intent's notes are rendered through [`note_block`], just before the
+/// completion contract: the fix request first, then the relaunch note. With no
+/// note the text is the same as before notes existed.
 pub fn render_claude_style(intent: &StageIntent) -> String {
     match intent {
-        StageIntent::Plan { phase } => idempotent_stage_prompt(*phase),
-        StageIntent::Code { phase, fix: None } => code_stage_prompt(*phase),
+        StageIntent::Plan {
+            phase,
+            relaunch_note,
+        } => idempotent_stage_prompt(*phase, &note_blocks(None, relaunch_note.as_deref())),
+        StageIntent::Code {
+            phase,
+            fix: None,
+            fix_note,
+            relaunch_note,
+        } => code_stage_prompt(
+            *phase,
+            &note_blocks(fix_note.as_deref(), relaunch_note.as_deref()),
+        ),
         StageIntent::Code {
             phase,
             fix: Some(fix),
-        } => fix_prompt(*fix, *phase),
-        StageIntent::Validate { phase } => validate_stage_prompt(*phase),
+            fix_note,
+            relaunch_note,
+        } => fix_prompt_with_notes(
+            *fix,
+            *phase,
+            &note_blocks(fix_note.as_deref(), relaunch_note.as_deref()),
+        ),
+        StageIntent::Validate {
+            phase,
+            relaunch_note,
+        } => validate_stage_prompt(*phase, &note_blocks(None, relaunch_note.as_deref())),
     }
 }
 
@@ -381,9 +521,9 @@ pub fn render_claude_style(intent: &StageIntent) -> String {
 /// path) instead of naming a slash command.
 pub fn render_workflow_style(intent: &StageIntent, workflow_root: &str) -> String {
     match intent {
-        StageIntent::Plan { phase } => workflow_plan_prompt(*phase, workflow_root),
-        StageIntent::Code { phase, fix } => workflow_code_prompt(*phase, *fix, workflow_root),
-        StageIntent::Validate { phase } => workflow_validate_prompt(*phase, workflow_root),
+        StageIntent::Plan { phase, .. } => workflow_plan_prompt(*phase, workflow_root),
+        StageIntent::Code { phase, fix, .. } => workflow_code_prompt(*phase, *fix, workflow_root),
+        StageIntent::Validate { phase, .. } => workflow_validate_prompt(*phase, workflow_root),
     }
 }
 
@@ -527,7 +667,18 @@ pub fn checkpoint_auto_decide_prompt(phase: PhaseId) -> String {
 /// `workflow_code_prompt` consults, so the two renderers cannot state different
 /// rules. `GapsOnly` is excluded deliberately, not overlooked: it is
 /// `workflow_code_prompt`'s existing exclusion, carried over unchanged.
-pub fn fix_prompt(fix_type: FixType, phase: PhaseId) -> String {
+///
+/// `note`, the operator's note on the rejected gate that started this fix pass,
+/// is rendered through [`note_block`] with [`FIX_NOTE_INTRODUCTION`], just
+/// before the completion protocol (GATE-01, D-14).
+pub fn fix_prompt(fix_type: FixType, phase: PhaseId, note: Option<&str>) -> String {
+    fix_prompt_with_notes(fix_type, phase, &note_blocks(note, None))
+}
+
+/// [`fix_prompt`] with its note blocks already rendered by [`note_blocks`], so
+/// a fix pass relaunched after a stage-failure reject carries the relaunch
+/// note after the fix request.
+fn fix_prompt_with_notes(fix_type: FixType, phase: PhaseId, notes: &str) -> String {
     let command = match fix_type {
         FixType::GapsOnly => {
             format!("/gsd-execute-phase {phase} --gaps-only {AUTO_CHAIN_PRESERVING_FLAG}")
@@ -546,11 +697,11 @@ pub fn fix_prompt(fix_type: FixType, phase: PhaseId) -> String {
             "Validation reported issues. Run the fix command for this loop:\n\n    {command}\n\n\
             {CODE_STAGE_POLICY}\n\
             \n\
-            {COMPLETION_PROTOCOL}"
+            {notes}{COMPLETION_PROTOCOL}"
         )
     } else {
         format!(
-            "Validation reported issues. Run the fix command for this loop:\n\n    {command}\n\n{COMPLETION_PROTOCOL}"
+            "Validation reported issues. Run the fix command for this loop:\n\n    {command}\n\n{notes}{COMPLETION_PROTOCOL}"
         )
     }
 }
@@ -675,8 +826,15 @@ mod tests {
     fn code_policy_is_identical_across_both_renderers() {
         let phase = PhaseId::new(45);
         let claude_prompt = stage_prompt(Stage::Code, phase);
-        let workflow_prompt =
-            render_workflow_style(&StageIntent::Code { phase, fix: None }, "/workflows");
+        let workflow_prompt = render_workflow_style(
+            &StageIntent::Code {
+                phase,
+                fix: None,
+                fix_note: None,
+                relaunch_note: None,
+            },
+            "/workflows",
+        );
 
         assert!(
             claude_prompt.contains(CODE_STAGE_POLICY),
@@ -695,6 +853,8 @@ mod tests {
             &StageIntent::Code {
                 phase,
                 fix: Some(FixType::GapsOnly),
+                fix_note: None,
+                relaunch_note: None,
             },
             "/workflows",
         );
@@ -718,6 +878,8 @@ mod tests {
         let gaps_only = render_claude_style(&StageIntent::Code {
             phase,
             fix: Some(FixType::GapsOnly),
+            fix_note: None,
+            relaunch_note: None,
         });
 
         for prompt in [stage_prompt(Stage::Validate, phase), gaps_only] {
@@ -773,6 +935,8 @@ mod tests {
         let intent = StageIntent::Code {
             phase: PhaseId::new(47),
             fix: Some(FixType::FullExecute),
+            fix_note: None,
+            relaunch_note: None,
         };
         let mut visited: Vec<AgentKind> = Vec::new();
         let mut controls_seen = 0;
@@ -836,8 +1000,15 @@ mod tests {
     fn both_code_prompts_still_end_with_the_completion_protocol() {
         let phase = PhaseId::new(45);
         let claude_prompt = stage_prompt(Stage::Code, phase);
-        let workflow_prompt =
-            render_workflow_style(&StageIntent::Code { phase, fix: None }, "/workflows");
+        let workflow_prompt = render_workflow_style(
+            &StageIntent::Code {
+                phase,
+                fix: None,
+                fix_note: None,
+                relaunch_note: None,
+            },
+            "/workflows",
+        );
 
         assert!(
             claude_prompt.ends_with(COMPLETION_PROTOCOL),
@@ -896,11 +1067,11 @@ mod tests {
 
     #[test]
     fn fix_prompts_select_the_right_command() {
-        assert!(fix_prompt(FixType::GapsOnly, PhaseId::new(11)).contains("--gaps-only"));
-        assert!(fix_prompt(FixType::GapsOnly, PhaseId::new(11)).contains("DEVFLOW_RESULT"));
+        assert!(fix_prompt(FixType::GapsOnly, PhaseId::new(11), None).contains("--gaps-only"));
+        assert!(fix_prompt(FixType::GapsOnly, PhaseId::new(11), None).contains("DEVFLOW_RESULT"));
 
         // D-01: FullExecute renders the plain, unflagged execute command.
-        let full_execute_prompt = fix_prompt(FixType::FullExecute, PhaseId::new(11));
+        let full_execute_prompt = fix_prompt(FixType::FullExecute, PhaseId::new(11), None);
         assert!(full_execute_prompt.contains("/gsd-execute-phase 11"));
         // Negative control: without this, FullExecute's command string would
         // just be a substring of GapsOnly's — this proves the two are
@@ -918,12 +1089,12 @@ mod tests {
         let phase = PhaseId::new(11);
 
         assert!(
-            fix_prompt(FixType::GapsOnly, phase).contains(AUTO_CHAIN_PRESERVING_FLAG),
+            fix_prompt(FixType::GapsOnly, phase, None).contains(AUTO_CHAIN_PRESERVING_FLAG),
             "the --gaps-only fix loop reaches execute-phase.md, so it meets the \
              sync-clear step and needs the token exactly as the first Code pass does"
         );
         assert!(
-            fix_prompt(FixType::FullExecute, phase).contains(AUTO_CHAIN_PRESERVING_FLAG),
+            fix_prompt(FixType::FullExecute, phase, None).contains(AUTO_CHAIN_PRESERVING_FLAG),
             "the full-execute loop-back reaches execute-phase.md too"
         );
     }
@@ -1002,7 +1173,7 @@ mod tests {
     fn no_line_start_marker_in_a_code_prompt_declares_a_checkpoint() {
         let prompts = [
             stage_prompt(Stage::Code, PhaseId::new(47)),
-            fix_prompt(FixType::FullExecute, PhaseId::new(47)),
+            fix_prompt(FixType::FullExecute, PhaseId::new(47), None),
         ];
         for prompt in prompts {
             assert!(prompt.contains(CHECKPOINT_DECLARATION));
@@ -1171,6 +1342,8 @@ mod tests {
         let prompt = render_claude_style(&StageIntent::Code {
             phase: PhaseId::new(47),
             fix: Some(FixType::FullExecute),
+            fix_note: None,
+            relaunch_note: None,
         });
         insta::assert_snapshot!(prompt);
     }
@@ -1222,6 +1395,8 @@ mod tests {
         let intent = StageIntent::Code {
             phase: PhaseId::new(47),
             fix: Some(FixType::FullExecute),
+            fix_note: None,
+            relaunch_note: None,
         };
         let mut visited: Vec<AgentKind> = Vec::new();
         let mut next = Some(AgentKind::Claude);

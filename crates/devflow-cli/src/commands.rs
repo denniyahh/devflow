@@ -3823,7 +3823,7 @@ fn stop_with_existing_response(
             );
             Ok(None)
         }
-        GateAction::Advance | GateAction::LoopBack(_) => {
+        GateAction::Advance | GateAction::LoopBack { .. } => {
             println!(
                 "stop: phase {phase} {stage} already has a non-abort response; stop did not write it or claim its outcome"
             );

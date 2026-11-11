@@ -378,6 +378,25 @@ pub struct State {
     /// default prompt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_fix: Option<crate::prompt::FixType>,
+    /// The operator's note for the fix pass in flight (GATE-01, D-14): the note
+    /// on the rejected verification gate whose loop-back set [`State::code_fix`],
+    /// written in the same commit. It lives exactly as long as `code_fix`, so a
+    /// failover or resume replay of the fix pass hands the note to the agent
+    /// again, and the transition that clears `code_fix` clears it too. Rendered
+    /// only through the prompt's note block, verbatim but for removed control
+    /// characters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_fix_note: Option<String>,
+    /// The operator's note for a relaunch of the stage a rejected gate stopped
+    /// at (GATE-01, D-39): the note on a rejected stage-failure gate at Plan,
+    /// Code or Validate, committed before the stage relaunches. Every prompt
+    /// built for that stage carries it (a retry, a stop and resume, a failover
+    /// replay), and it is cleared once the run leaves the stage: by
+    /// `transition`, by the loop-back from Validate to Code and when the run
+    /// finishes. Kept apart from [`State::code_fix_note`], whose lifetime is the
+    /// fix pass rather than the stage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relaunch_note: Option<String>,
     /// The commit a Validate agent PASS was recorded on (52-22, D-45 rule 1's
     /// input): the evidence root's HEAD, read when the Validate outcome was
     /// classified. Written only by the CLI's `handle_validate_outcome`, on every
@@ -627,6 +646,8 @@ impl State {
             fallback_agent: None,
             fallback_consumed: false,
             code_fix: None,
+            code_fix_note: None,
+            relaunch_note: None,
             validate_pass_head: None,
         }
     }
