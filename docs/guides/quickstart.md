@@ -51,8 +51,7 @@ for the full gate-answering reference.
 
 - **Rust** stable (build from source)
 - **git** 2.30+
-- **gh CLI** 2.0+ (`devflow doctor` checks for it; no DevFlow command runs it
-  since the Ship stage was removed)
+- **gh CLI** 2.0+ (`devflow doctor` checks for it; no DevFlow command runs it)
 - An installed AI agent (Claude Code, Codex, or OpenCode)
 
 Verify your setup:
