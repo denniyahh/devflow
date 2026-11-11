@@ -5,16 +5,16 @@ milestone_name: Session Continuity
 current_phase: 52
 current_phase_name: Subtract and Stabilize
 status: executing
-stopped_at: Completed 52-26-PLAN.md
-last_updated: "2026-11-11T09:35:08.481Z"
+stopped_at: Completed 52-27-PLAN.md
+last_updated: "2026-11-11T10:24:44.070Z"
 last_activity: 2026-11-10
 last_activity_desc: Phase 52 execution started
-state_head: 2b9cda64e3c9e617cd8afe4546e7e56b8c423d82
+state_head: fa42abe886f1acb4a108e1fee5b575d2e892d692
 progress:
   total_phases: 4
   completed_phases: 0
   total_plans: 33
-  completed_plans: 26
+  completed_plans: 27
   percent: 0
 ---
 
@@ -159,7 +159,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 52 (Subtract and Stabilize) — EXECUTING
-Plan: 27 of 33
+Plan: 28 of 33
 Status: Ready to execute
 Last activity: 2026-11-10 — Phase 52 execution started
 
@@ -883,6 +883,7 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 52]: 52-25: cleanup --force removes a run's state only when that state records the removed worktree or none; merged branches still checked out are skipped via the additive GitFlow::cleanup_merged_keeping
 - [Phase 52]: 52-25: whether a start over a finished state carries phase_validate_failures is left to the operator (deferred-items.md), recommendation: start at zero
 - [Phase 52]: 52-26: a rejection with no note keeps an earlier relaunch_note; a rejection with a note replaces it (record_relaunch_note)
+- [Phase 52]: 52-27: the gap-closure marker (State.gap_closure_pass) is set by the Validate->Plan transition and cleared only by a passed read, the finish, an abort or a non-gaps loop-back; the post-check compares file modified times (plan newer than VERIFICATION.md)
 
 ## Roadmap Evolution
 
@@ -1020,11 +1021,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 52 P24 | 26 min | 2 tasks | 6 files |
 | Phase 52 P25 | 23 min | 3 tasks | 5 files |
 | Phase 52 P26 | 33 min | 3 tasks | 10 files |
+| Phase 52 P27 | 41 min | 3 tasks | 12 files |
 
 ## Session
 
-**Last session:** 2026-11-11T09:35:08.249Z
-**Stopped at:** Completed 52-26-PLAN.md
+**Last session:** 2026-11-11T10:24:43.885Z
+**Stopped at:** Completed 52-27-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
