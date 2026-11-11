@@ -2351,9 +2351,13 @@ fn bare_stop_addresses_the_state_record_and_leaves_a_superseded_socket() {
 #[test]
 fn recover_clean_refuses_while_the_supervisor_is_alive() {
     let run = LiveRun::start(PhaseId::new(149));
-    let gate =
-        devflow_core::gates::Gates::write_gate(&run.root, run.phase, Stage::Define, "planted gate")
-            .expect("plant a gate file");
+    let gate = devflow_core::gates::Gates::write_gate(
+        &run.root,
+        run.phase,
+        Stage::Validate,
+        "planted gate",
+    )
+    .expect("plant a gate file");
     let gate_bytes = std::fs::read(&gate).unwrap();
     let state_bytes = std::fs::read(run.state_file()).unwrap();
 

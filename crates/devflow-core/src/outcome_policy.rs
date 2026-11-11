@@ -157,12 +157,12 @@ mod tests {
         );
     }
 
-    /// Every stage in the chain, walked from `Define` via `Stage::next` rather
+    /// Every stage in the chain, walked from `Plan` via `Stage::next` rather
     /// than hardcoded, so a stage inserted into the chain is covered without
     /// editing this test. (Limit: a stage added OUTSIDE the linear chain would
     /// still be missed — `Stage` exposes no exhaustive iterator to key off.)
     fn every_stage() -> Vec<Stage> {
-        let mut stages = vec![Stage::Define];
+        let mut stages = vec![Stage::Plan];
         while let Some(next) = stages.last().and_then(|s| s.next()) {
             stages.push(next);
         }
@@ -178,7 +178,7 @@ mod tests {
     #[test]
     fn idle_timeout_is_never_auto_resumed() {
         let stages = every_stage();
-        assert_eq!(stages.len(), 4, "stage chain changed; review this test");
+        assert_eq!(stages.len(), 3, "stage chain changed; review this test");
         for stage in stages {
             let action = decide_action(stage, AgentStatus::IdleTimeout);
             assert_ne!(

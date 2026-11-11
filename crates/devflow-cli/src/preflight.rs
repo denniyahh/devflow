@@ -1376,10 +1376,9 @@ mod tests {
     /// D-14/999.106 interactivity check: the gate is driver-driven — Codex
     /// declares Plan `RequiresExistingArtifact`, so a headless Auto-mode
     /// Codex Plan run (the first stage) without CONTEXT.md on develop is
-    /// flagged. Supervise mode, a stage that is not the first one (Define,
-    /// which Codex also declares `RequiresExistingArtifact` but no run
-    /// starts at), a non-Codex agent (Claude declares HeadlessSafe), and a
-    /// CONTEXT.md that does exist are all unaffected.
+    /// flagged. Supervise mode, a stage that is not the first one (Code), a
+    /// non-Codex agent (Claude declares HeadlessSafe), and a CONTEXT.md that
+    /// does exist are all unaffected.
     #[test]
     fn preflight_interactivity_check_flags_auto_plan_without_context_md() {
         let dir = tempfile::tempdir().unwrap();
@@ -1399,7 +1398,7 @@ mod tests {
         assert!(preflight_interactivity_check(root, &state).is_ok());
 
         state.mode = Mode::Auto;
-        state.stage = Stage::Define;
+        state.stage = Stage::Code;
         assert!(
             preflight_interactivity_check(root, &state).is_ok(),
             "only the first stage, Plan, needs CONTEXT.md on the base"
@@ -2762,8 +2761,8 @@ mod tests {
         assert!(
             ensure_phase_reachable_on_base(root, PhaseId::new(24), "develop").is_ok(),
             "a present ROADMAP heading with no phase directory is the legitimate \
-             bootstrap state — Define has not run yet, and running it is what \
-             creates that directory. The guard must not refuse it (999.63)."
+             bootstrap state — `/gsd-discuss-phase` has not run yet, and running it \
+             is what creates that directory. The guard must not refuse it (999.63)."
         );
     }
 
@@ -3694,7 +3693,6 @@ mod tests {
     fn unattended_check_does_not_apply_outside_plan_and_code() {
         assert!(unattended_launch_check_applies(Stage::Plan));
         assert!(unattended_launch_check_applies(Stage::Code));
-        assert!(!unattended_launch_check_applies(Stage::Define));
         assert!(!unattended_launch_check_applies(Stage::Validate));
 
         // A wholly NOT-viable fixture parked at a non-applicable stage still
@@ -3707,13 +3705,11 @@ mod tests {
             Mode::Auto,
             dir.path().to_path_buf(),
         );
-        for stage in [Stage::Define, Stage::Validate] {
-            state.stage = stage;
-            assert!(
-                preflight_unattended_launch_check(dir.path(), &state).is_ok(),
-                "stage {stage} must return before evaluating any condition"
-            );
-        }
+        state.stage = Stage::Validate;
+        assert!(
+            preflight_unattended_launch_check(dir.path(), &state).is_ok(),
+            "Validate must return before evaluating any condition"
+        );
         state.stage = Stage::Code;
         assert!(
             preflight_unattended_launch_check(dir.path(), &state).is_err(),

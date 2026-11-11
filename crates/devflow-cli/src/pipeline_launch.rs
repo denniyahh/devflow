@@ -603,7 +603,7 @@ fn emit_canary_outcome(state: &State, outcome: &canary::CanaryOutcome) {
 /// transport varies per stage.
 ///
 /// The consequence is what makes the capture campaign worth running. A capture
-/// taken at Define and a capture taken at Validate differ only in how the agent
+/// taken at Plan and a capture taken at Validate differ only in how the agent
 /// behaved under that stage's prompt — whether it backgrounded work, whether a
 /// `background_tasks_changed` event appears, whether the stream drains. Any
 /// difference between two stages' captures is a fact about agent behaviour. It
@@ -617,31 +617,29 @@ fn emit_canary_outcome(state: &State, outcome: &canary::CanaryOutcome) {
 ///
 /// # Per-stage evidence (ROADMAP criterion 1, phase 34)
 ///
-/// Every one of the five `Stage` variants is accounted for by name below —
+/// Every one of the three `Stage` variants is accounted for by name below —
 /// each entry names the capture that authorised it, or, for a stage left off
 /// the list, what was attempted and what specifically prevented the evidence.
-/// All five are currently ON the list, so no "recorded reason for staying
+/// All three are currently ON the list, so no "recorded reason for staying
 /// narrow" entry is live; the format is retained so that removing a stage
-/// requires writing one rather than deleting a line.
+/// requires writing one rather than deleting a line. The same run also
+/// captured the Define and Ship stages (`34-evidence/define/`,
+/// `34-evidence/ship/`); v4.0 removed both stages from [`Stage`] (D-01).
 ///
-/// All five captures come from a SINGLE run — `devflow start --phase 1
+/// All five of that run's captures come from a SINGLE run — `devflow start --phase 1
 /// --no-worktree --agent claude --mode auto` against a throwaway repo
 /// scaffolded by `scripts/scratch-dogfood-repo.sh`, on `claude` 2.1.222, driven
 /// by a binary whose digest was verified byte-identical to the build made from
 /// this tree after the widening. Evidence directories are under
 /// `.planning/phases/34-…/34-evidence/{stage}/`.
 ///
-/// - **`Stage::Define`** — WIDENED on `34-evidence/define/`. 8 top-level
-///   NDJSON events; `BackgroundTaskState::NeverAnnounced`, which
-///   [`monitor::CloseRule::should_close`] treats as vacuously drained by
-///   design. **Thin by construction:** the stage ran 1 turn in 2.3 s with no
-///   tool use, because the scratch scaffold pre-writes the plan and
-///   `/gsd-discuss-phase` had nothing to gather. It is evidence that Define
-///   takes the stream path and does not announce background tasks *on a
-///   workload with no work in it* — not that Define never backgrounds work.
 /// - **`Stage::Plan`** — WIDENED on `34-evidence/plan/`. 11 events, 2 turns,
-///   11.8 s, `NeverAnnounced`. Same thinness and the same cause: the agent
-///   reported "The deliverable already exists … No work performed".
+///   11.8 s, `NeverAnnounced`, which [`monitor::CloseRule::should_close`]
+///   treats as vacuously drained by design. **Thin by construction:** the
+///   scratch scaffold pre-writes the plan, and the agent reported "The
+///   deliverable already exists … No work performed". It is evidence that Plan
+///   takes the stream path and does not announce background tasks *on a
+///   workload with no work in it* — not that Plan never backgrounds work.
 /// - **`Stage::Code`** — WIDENED on `34-evidence/code/`. The substantive
 ///   capture of the run: 455 events, 49 turns, 695 s, 67 Bash / 22 Read /
 ///   5 Write / 3 Edit and **3 `Agent` sub-agent dispatches**. `NeverAnnounced`
@@ -659,32 +657,26 @@ fn emit_canary_outcome(state: &State, outcome: &canary::CanaryOutcome) {
 ///   still classified the stage as a `loop_back` to Code. That is the
 ///   validate trust boundary this phase exists to tighten, and the capture is
 ///   filed as an observation of it rather than as a defect.
-/// - **`Stage::Ship`** — WIDENED on `34-evidence/ship/`. 463 events, 31 turns,
-///   516 s, `NeverAnnounced`, with 5 further `Agent` dispatches. The stage
-///   launched and ran to a top-level `result` marker; its *work* stopped at
-///   preflight because the scratch repo has no git remote. The capture is
-///   evidence about the launch path, which is what membership here selects —
-///   it is NOT evidence that a real Ship completes.
 ///
 /// **What none of these establish (D-10, n=1).** Each capture shows the shape
 /// occurred ONCE. None of them shows it is the stage's steady behaviour across
 /// prompts, phase shapes or CLI versions — Phase 30 needed n=2–3 trials before
 /// its drain measurements meant anything. A `NeverAnnounced` reading from a
-/// 2.3-second no-op is the weakest form this evidence takes, and Define and
-/// Plan are both that form.
+/// near no-op is the weakest form this evidence takes, and Plan's is that
+/// form.
 ///
-/// **Criterion 7 — the D-15 canary refusal has MOVED, deliberately.** With
-/// `Stage::Define` on the stream path, [`canary_gate`] now runs at Define
-/// instead of Code. A run whose canary returns `Absent`/`Unverified` therefore
-/// refuses at the FIRST stage, instead of completing Define and Plan on the
-/// legacy path and only then refusing. This is a real change to unattended
-/// behaviour, accepted rather than mitigated: D-15 rejected both alternatives
-/// (warn-and-proceed fails unattended; falling back to the legacy path is a
-/// silent capability downgrade). On the capture run the canary returned
-/// `Confirmed` at Define, so the relocated refusal did not fire — the
-/// relocation is recorded here on the strength of the code path, not on the
-/// strength of having watched it refuse.
-const STREAM_JSON_STAGES: &[Stage] = &[Stage::Define, Stage::Plan, Stage::Code, Stage::Validate];
+/// **Criterion 7 — the D-15 canary refusal runs at the FIRST stage, Plan.**
+/// With every stage on the stream path, [`canary_gate`] runs at the run's
+/// first launch instead of at Code. A run whose canary returns
+/// `Absent`/`Unverified` therefore refuses before any stage completes on the
+/// legacy path. This is a real change to unattended behaviour, accepted rather
+/// than mitigated: D-15 rejected both alternatives (warn-and-proceed fails
+/// unattended; falling back to the legacy path is a silent capability
+/// downgrade). On the phase-34 capture run the canary returned `Confirmed` at
+/// its first stage (then Define), so the refusal did not fire — it is recorded
+/// here on the strength of the code path, not on the strength of having
+/// watched it refuse.
+const STREAM_JSON_STAGES: &[Stage] = &[Stage::Plan, Stage::Code, Stage::Validate];
 
 /// Whether this launch should use the `stream-json` transport and the
 /// pipe-owning monitor.
@@ -3149,7 +3141,7 @@ pub(crate) fn resume(
 /// does NOT call `State::new`, `feature_start`, or `ensure_phase_worktree`:
 /// the branch/worktree already exist and agent/mode are read from the saved
 /// state, so neither needs to be passed as a flag and the workflow is never
-/// reset to Define.
+/// reset to Plan.
 ///
 /// 20c (review: Codex MEDIUM — resume semantics): a phase halted by
 /// `devflow start --until <stage>` persists `stopped`/`stop_reason`/
@@ -3289,7 +3281,7 @@ fn close_gates_for_resume(
     current_stage: Stage,
 ) -> Vec<String> {
     // Read before the close, which removes the files that name them.
-    let gate_ids = [Stage::Define, Stage::Plan, Stage::Code, Stage::Validate].map(|stage| {
+    let gate_ids = [Stage::Plan, Stage::Code, Stage::Validate].map(|stage| {
         let gate_id = crate::commands::gate_file_id(project_root, phase, stage)
             .ok()
             .flatten();
@@ -3722,7 +3714,6 @@ pub(crate) fn advance_with(
     // through into the success arm below.
     match outcome_policy::decide_action(stage, result.status) {
         Action::Advance => match stage {
-            Stage::Define => transition(project_root, &mut state, Stage::Plan),
             Stage::Plan => transition(project_root, &mut state, Stage::Code),
             Stage::Code => transition(project_root, &mut state, Stage::Validate),
             Stage::Validate => {
@@ -4054,17 +4045,16 @@ mod tests {
         // Every other stage, under the mode that would otherwise qualify.
         // `Stage::Plan` is the load-bearing one: the same flag makes
         // `plan-phase.md` chain into `execute-phase.md` (ROADMAP criterion 3).
-        assert!(!auto_chain_flag_eligible(Stage::Define, Mode::Auto));
         assert!(!auto_chain_flag_eligible(Stage::Plan, Mode::Auto));
         assert!(!auto_chain_flag_eligible(Stage::Validate, Mode::Auto));
 
         // Exhaustiveness tripwire: this match names every variant with no
         // wildcard arm, so a new `Stage` fails to compile here rather than
         // slipping past the assertions above.
-        for stage in [Stage::Define, Stage::Plan, Stage::Code, Stage::Validate] {
+        for stage in [Stage::Plan, Stage::Code, Stage::Validate] {
             let expected = match stage {
                 Stage::Code => true,
-                Stage::Define | Stage::Plan | Stage::Validate => false,
+                Stage::Plan | Stage::Validate => false,
             };
             assert_eq!(auto_chain_flag_eligible(stage, Mode::Auto), expected);
         }
@@ -4249,7 +4239,7 @@ mod tests {
     /// (`test_support::monitor_entry_full`, `DEVFLOW_TEST_MONITOR_FULL=1`) and
     /// proves it is reached: with the state moved on to Plan while the agent
     /// runs, its in-process advance records `advance_failed` naming the
-    /// launched stage (`define`). The second child, on the supervise-only
+    /// launched stage (`plan`). The second child, on the supervise-only
     /// entry, must record no advance event at all.
     #[test]
     fn launch_publishes_the_socket_path_under_the_cache_dir_in_state() {
@@ -5244,8 +5234,8 @@ mod tests {
         // `preflight_unattended_launch_check`, and this test's subject — the
         // unfired `stop_until` cap surviving a resume — is mode-independent.
         let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
-        // Current stage is earlier than the cap (Define < Plan), and the
-        // phase was NOT stopped by the cap — this is the rate-limit/infra
+        // Current stage is the cap's own stage (Plan), which has not yet
+        // completed, and the phase was NOT stopped by the cap — this is the rate-limit/infra
         // recovery shape, not the "cap already fired" shape.
         state.stop_until = Some(Stage::Plan);
         state.verification_baseline_captured = true;
@@ -6231,14 +6221,14 @@ mod tests {
         let state_path = workflow::state_path(root, phase);
         let before = std::fs::read(&state_path).unwrap();
 
-        let err = advance_with(root, phase, Some(Stage::Define))
+        let err = advance_with(root, phase, Some(Stage::Plan))
             .expect_err("advance must reject a stage that has moved on");
         assert!(err.to_string().contains("stage mismatch"));
         assert_eq!(std::fs::read(&state_path).unwrap(), before);
         let failed = events_of_kind(root, "advance_failed");
         assert_eq!(failed.len(), 1, "one durable refusal event: {failed:?}");
         assert_eq!(failed[0]["reason"], "stage mismatch");
-        assert_eq!(failed[0]["expected"], "define");
+        assert_eq!(failed[0]["expected"], "plan");
         assert_eq!(failed[0]["actual"], "code");
     }
 
@@ -6862,7 +6852,7 @@ mod tests {
             AgentKind::Pi,
             AgentKind::Antigravity,
         ];
-        let stages = [Stage::Define, Stage::Plan, Stage::Code, Stage::Validate];
+        let stages = [Stage::Plan, Stage::Code, Stage::Validate];
         let outcomes = [
             canary::CanaryOutcome::Confirmed,
             canary::CanaryOutcome::Absent,
@@ -9248,8 +9238,8 @@ mod tests {
     }
 
     impl HandoffRun {
-        /// Launch stage Define for `phase` (Claude with a recorded `Confirmed` canary,
-        /// Supervise mode, `--until plan`) and return once N is recorded.
+        /// Launch stage Plan for `phase` (Claude with a recorded `Confirmed` canary,
+        /// Supervise mode, `--until code`) and return once N is recorded.
         fn launch(phase: PhaseId) -> Self {
             Self::launch_with(phase, |_, _| {})
         }
@@ -9270,13 +9260,13 @@ mod tests {
             )
             .unwrap();
             let mut state = State::new(phase, AgentKind::Claude, Mode::Supervise, root.clone());
-            // Stage N is Define explicitly, a stand-in: these tests are about the handoff
-            // from stage N to N+1 (Plan), not about which stage a run starts at.
-            state.stage = Stage::Define;
+            // Stage N is Plan explicitly, a stand-in: these tests are about the handoff
+            // from stage N to N+1 (Code), not about which stage a run starts at.
+            state.stage = Stage::Plan;
             state.verification_baseline_captured = true;
             // A stub `claude` cannot answer the stream launch's canary.
             state.canary = Some(canary::CanaryOutcome::Confirmed);
-            state.stop_until = Some(Stage::Plan);
+            state.stop_until = Some(Stage::Code);
             configure(&root, &mut state);
             workflow::save_state(&state).unwrap();
             let launched = launch_stage(&mut state, None, None);
@@ -9791,7 +9781,7 @@ mod tests {
     }
 
     /// D-08, D-17 (V-32): a hand-run `advance` refuses beside a live supervisor of its
-    /// phase, recorded or pending. The state is at Plan and the advance binds to Define,
+    /// phase, recorded or pending. The state is at Plan and the advance binds to Validate,
     /// so the control proves that with the supervisor gone the same call reaches the
     /// advance's own stage check, which writes nothing either.
     #[test]
@@ -9804,7 +9794,7 @@ mod tests {
             let fixture = live_supervisor_fixture(root, phase);
             let state_file = workflow::state_path(root, phase);
             let advance = || {
-                advance_command(root, Some(phase), Some(Stage::Define))
+                advance_command(root, Some(phase), Some(Stage::Validate))
                     .expect_err("this advance never succeeds")
                     .to_string()
             };
@@ -10169,10 +10159,10 @@ mod tests {
             PathBuf::from("/repo"),
         );
         state.fallback_agent = Some(AgentKind::Codex);
-        for stage in [Stage::Define, Stage::Plan, Stage::Code, Stage::Validate] {
+        for stage in [Stage::Plan, Stage::Code, Stage::Validate] {
             let expected = match stage {
                 Stage::Code => Some(AgentKind::Codex),
-                Stage::Define | Stage::Plan | Stage::Validate => None,
+                Stage::Plan | Stage::Validate => None,
             };
             assert_eq!(
                 failover_target(&state, stage),
@@ -11482,7 +11472,7 @@ mod tests {
     /// 999.138 residual (A6): `advance_with` refuses a stopped state with an
     /// `advance_failed {reason: "stopped"}` event and an error naming
     /// `devflow resume`. Control: the same state with `stopped: false`
-    /// advances (here to its `--until define` stop, so nothing launches).
+    /// advances (here to its `--until plan` stop, so nothing launches).
     #[test]
     fn advance_refuses_a_stopped_state() {
         let _guard = env_lock();
@@ -11580,7 +11570,7 @@ mod tests {
         }
     }
 
-    /// The marker a gate fixture's first agent prints: a failed Define,
+    /// The marker a gate fixture's first agent prints: a failed Plan,
     /// which the never-silent path parks at a human gate.
     const FAILED_MARKER: &str = r#"DEVFLOW_RESULT: {"status":"failed","reason":"gate fixture"}"#;
 
@@ -11607,25 +11597,25 @@ mod tests {
             .is_ok_and(|status| status != devflow_core::gates::WaiterStatus::Live)
     }
 
-    /// Launch a gate fixture and return once N is parked at its Define gate:
+    /// Launch a gate fixture and return once N is parked at its Plan gate:
     /// the gate file exists and N holds its registration (its owner phase is the
     /// control's assertion, not a precondition here).
     fn launch_parked_at_gate(phase: PhaseId) -> HandoffRun {
         let run = HandoffRun::launch(phase);
         run.go();
-        let gate = Gates::gate_path(&run.root, phase, Stage::Define);
+        let gate = Gates::gate_path(&run.root, phase, Stage::Plan);
         assert!(
             poll_until(HANDOFF_STEP_WAIT, || gate.exists()
                 && events_named(&run.root, "gate_fired").len() == 1),
-            "N parks at the Define gate: {}",
+            "N parks at the Plan gate: {}",
             run.events()
         );
         assert_eq!(
             Gates::waiter_status(
                 &run.root,
                 phase,
-                Stage::Define,
-                &gate_id_at(&run.root, phase, Stage::Define)
+                Stage::Plan,
+                &gate_id_at(&run.root, phase, Stage::Plan)
             )
             .unwrap(),
             devflow_core::gates::WaiterStatus::Live,
@@ -11648,10 +11638,10 @@ mod tests {
         }
         let _guard = env_lock();
         let run = launch_parked_at_gate(PhaseId::new(1310));
-        let gate = gate_id_at(&run.root, run.phase, Stage::Define);
+        let gate = gate_id_at(&run.root, run.phase, Stage::Plan);
         signal_supervisor(&run, libc::SIGTERM);
         let ended = poll_until(Duration::from_secs(5), || {
-            registration_ended(&run.root, run.phase, Stage::Define, &gate)
+            registration_ended(&run.root, run.phase, Stage::Plan, &gate)
                 && devflow_core::supervisor::probe(&run.n.socket_path)
                     .is_ok_and(|liveness| liveness == devflow_core::supervisor::Liveness::Gone)
         });
@@ -11674,15 +11664,15 @@ mod tests {
         assert_eq!(stopped[0]["safe_point"], 4, "{}", stopped[0]);
     }
 
-    /// Park N at its Define gate, approve the gate, and wait for N to reach the configured
+    /// Park N at its Plan gate, approve the gate, and wait for N to reach the configured
     /// hold with its claim published. Returns the run and the gate's id.
     fn parked_at_a_hold_with_the_gate_claimed(phase: PhaseId) -> (HandoffRun, GateId) {
         let run = launch_parked_at_gate(phase);
-        let gate = gate_id_at(&run.root, phase, Stage::Define);
-        answer_open_gate(&run.root, phase, Stage::Define, &gate_response(true, None)).unwrap();
+        let gate = gate_id_at(&run.root, phase, Stage::Plan);
+        answer_open_gate(&run.root, phase, Stage::Plan, &gate_response(true, None)).unwrap();
         run.wait_held();
         assert!(
-            Gates::claim_path(&run.root, phase, Stage::Define, &gate).exists(),
+            Gates::claim_path(&run.root, phase, Stage::Plan, &gate).exists(),
             "precondition: the claim is published: {}",
             run.events()
         );
@@ -11703,17 +11693,17 @@ mod tests {
     }
 
     /// What a kill-point fixture requires of `resume`: it reports the approval it found
-    /// claimed at Define, keeps no file for that gate, sets nothing aside for it (the
+    /// claimed at Plan, keeps no file for that gate, sets nothing aside for it (the
     /// answer was claimed, not unused), and reruns the stage.
     fn assert_resume_reported_the_claimed_approval(run: &HandoffRun, gate: &GateId) {
         let found = events_named(&run.root, "resume_found_unapplied_answer");
         assert_eq!(found.len(), 1, "{}", run.events());
-        assert_eq!(found[0]["stage"], "define", "{}", found[0]);
+        assert_eq!(found[0]["stage"], "plan", "{}", found[0]);
         assert_eq!(found[0]["gate_id"], gate.as_str(), "{}", found[0]);
         assert_eq!(found[0]["approved"], true, "{}", found[0]);
-        assert!(!Gates::gate_path(&run.root, run.phase, Stage::Define).exists());
-        assert!(!Gates::answer_path(&run.root, run.phase, Stage::Define, gate).exists());
-        assert!(!Gates::claim_path(&run.root, run.phase, Stage::Define, gate).exists());
+        assert!(!Gates::gate_path(&run.root, run.phase, Stage::Plan).exists());
+        assert!(!Gates::answer_path(&run.root, run.phase, Stage::Plan, gate).exists());
+        assert!(!Gates::claim_path(&run.root, run.phase, Stage::Plan, gate).exists());
         let quarantined = Gates::quarantined(&run.root);
         assert!(
             quarantined
@@ -11745,7 +11735,7 @@ mod tests {
         let (run, gate) = parked_at_a_hold_with_the_gate_claimed(PhaseId::new(1312));
         let state = run.state();
         assert!(state.gate_pending, "precondition: nothing recorded yet");
-        assert_eq!(state.stage, Stage::Define);
+        assert_eq!(state.stage, Stage::Plan);
         kill_supervisor_until_stale(&run);
 
         resume(&run.root, run.phase, None).unwrap();
@@ -11773,7 +11763,7 @@ mod tests {
             !state.gate_pending,
             "precondition: the decision is recorded"
         );
-        assert_eq!(state.stage, Stage::Define, "precondition: not yet acted on");
+        assert_eq!(state.stage, Stage::Plan, "precondition: not yet acted on");
         assert_eq!(
             stage_launched_count(&run.root, run.phase),
             1,
@@ -11800,10 +11790,10 @@ mod tests {
         }
         let _guard = env_lock();
         let run = launch_parked_at_gate(PhaseId::new(1311));
-        let gate = gate_id_at(&run.root, run.phase, Stage::Define);
+        let gate = gate_id_at(&run.root, run.phase, Stage::Plan);
         std::thread::sleep(Duration::from_secs(3));
         assert!(
-            !registration_ended(&run.root, run.phase, Stage::Define, &gate),
+            !registration_ended(&run.root, run.phase, Stage::Plan, &gate),
             "control: still parked with its registration live after 3 s"
         );
         assert!(
@@ -11817,7 +11807,7 @@ mod tests {
         answer_open_gate(
             &run.root,
             run.phase,
-            Stage::Define,
+            Stage::Plan,
             &devflow_core::gates::GateResponse {
                 approved: false,
                 note: Some("abort: control answer".to_string()),
@@ -11826,7 +11816,7 @@ mod tests {
         )
         .unwrap();
         let ended = poll_until(HANDOFF_STEP_WAIT, || {
-            registration_ended(&run.root, run.phase, Stage::Define, &gate)
+            registration_ended(&run.root, run.phase, Stage::Plan, &gate)
                 && devflow_core::supervisor::probe(&run.n.socket_path)
                     .is_ok_and(|liveness| liveness == devflow_core::supervisor::Liveness::Gone)
         });
@@ -11939,7 +11929,7 @@ mod tests {
         assert!(!evaluated("failed"), "{}", run.events());
     }
 
-    /// The control for V-28: the same hold and no stop, with an `--until define` halt ending
+    /// The control for V-28: the same hold and no stop, with an `--until plan` halt ending
     /// the run where it is, leaves the agent's own code.
     #[test]
     fn without_a_stop_the_exit_file_keeps_the_agents_code() {
@@ -11951,7 +11941,7 @@ mod tests {
         }
         let _guard = env_lock();
         let run = HandoffRun::launch_with(PhaseId::new(1319), |_, state| {
-            state.stop_until = Some(Stage::Define);
+            state.stop_until = Some(Stage::Plan);
         });
         run.go();
         run.wait_held();
@@ -12062,7 +12052,7 @@ mod tests {
             answer_open_gate(
                 &run.root,
                 run.phase,
-                Stage::Define,
+                Stage::Plan,
                 &gate_response(true, None)
             )
             .is_err(),
@@ -12121,7 +12111,7 @@ mod tests {
     /// (50.1-16): liveness lock adopted, no socket, no agent.
     const AGENT_SPAWN_HOLD_ENV: &str = "DEVFLOW_TEST_AGENT_SPAWN_HOLD";
 
-    /// The parent half of a test whose next supervisor (Plan) is held before its
+    /// The parent half of a test whose next supervisor (Code) is held before its
     /// agent spawn, on the advance-running monitor entry.
     fn run_spawn_held_handoff_child(name: &str) {
         let path_dir = handoff_claude_dir(SUCCESS_MARKER);
@@ -12130,7 +12120,7 @@ mod tests {
             .tempdir_in("/tmp")
             .unwrap();
         let hold = std::ffi::OsString::from(format!(
-            "plan:{}",
+            "code:{}",
             hold_dir.path().join("release").display()
         ));
         let env: Vec<(&str, &std::ffi::OsStr)> = vec![
@@ -13745,7 +13735,7 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), before, "no state write");
         assert_eq!(stage_launched_count(&run.root, run.phase), 1, "no launch");
         assert!(
-            !Gates::gate_path(&run.root, run.phase, Stage::Define).exists(),
+            !Gates::gate_path(&run.root, run.phase, Stage::Plan).exists(),
             "no gate opened: {}",
             run.events()
         );
@@ -13760,13 +13750,13 @@ mod tests {
         supersede(&gated.root, gated.phase, X);
         let path = workflow::state_path(&gated.root, gated.phase);
         let before = std::fs::read(&path).unwrap();
-        let gate_path = Gates::gate_path(&gated.root, gated.phase, Stage::Define);
+        let gate_path = Gates::gate_path(&gated.root, gated.phase, Stage::Plan);
         let gate_bytes = std::fs::read(&gate_path).unwrap();
-        let gate = gate_id_at(&gated.root, gated.phase, Stage::Define);
+        let gate = gate_id_at(&gated.root, gated.phase, Stage::Plan);
         answer_open_gate(
             &gated.root,
             gated.phase,
-            Stage::Define,
+            Stage::Plan,
             &devflow_core::gates::GateResponse {
                 approved: true,
                 note: None,
@@ -13774,7 +13764,7 @@ mod tests {
             },
         )
         .unwrap();
-        let answer = Gates::answer_path(&gated.root, gated.phase, Stage::Define, &gate);
+        let answer = Gates::answer_path(&gated.root, gated.phase, Stage::Plan, &gate);
         let answer_bytes = std::fs::read(&answer).unwrap();
         assert!(
             poll_until(HANDOFF_STEP_WAIT, || probes_gone(&gated.n.socket_path)),
@@ -13783,7 +13773,7 @@ mod tests {
         );
         assert_eq!(std::fs::read(&path).unwrap(), before, "no state write");
         assert!(
-            !Gates::claim_path(&gated.root, gated.phase, Stage::Define, &gate).exists(),
+            !Gates::claim_path(&gated.root, gated.phase, Stage::Plan, &gate).exists(),
             "no claim"
         );
         assert_eq!(std::fs::read(&gate_path).unwrap(), gate_bytes, "gate stays");
@@ -13879,7 +13869,7 @@ mod tests {
         run.go();
         run.wait_held();
         run.release();
-        let gate_path = Gates::gate_path(&run.root, run.phase, Stage::Define);
+        let gate_path = Gates::gate_path(&run.root, run.phase, Stage::Plan);
         assert!(
             poll_until(HANDOFF_STEP_WAIT, || gate_path.exists()),
             "control: the recorded supervisor opens its gate: {}",
@@ -13889,7 +13879,7 @@ mod tests {
         answer_open_gate(
             &run.root,
             run.phase,
-            Stage::Define,
+            Stage::Plan,
             &devflow_core::gates::GateResponse {
                 approved: false,
                 note: Some("abort: control answer".to_string()),
@@ -13945,7 +13935,7 @@ mod tests {
         let _guard = env_lock();
         const X: &str = "aaaa0000aaaa1905";
         let run = launch_parked_at_gate(PhaseId::new(1905));
-        let (root, phase, stage) = (run.root.clone(), run.phase, Stage::Define);
+        let (root, phase, stage) = (run.root.clone(), run.phase, Stage::Plan);
         let g1 = gate_id_at(&root, phase, stage);
         supersede(&root, phase, X);
 
@@ -15485,7 +15475,7 @@ mod tests {
         let bytes_before = std::fs::read(&path).unwrap();
         let inode_before = std::fs::metadata(&path).unwrap().ino();
 
-        let err = advance_with(root, phase, Some(Stage::Define))
+        let err = advance_with(root, phase, Some(Stage::Plan))
             .expect_err("the stage mismatch fails the advance before any later write");
         assert!(err.to_string().contains("stage mismatch"), "{err}");
 

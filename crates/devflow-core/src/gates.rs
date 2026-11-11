@@ -1460,7 +1460,7 @@ fn backoff_wait<T>(
 /// Reads `DEVFLOW_GATE_NOTIFY_CMD`; if unset or empty, this is a silent no-op
 /// (no notify command configured). Otherwise delegates to
 /// [`run_notify_command`]. `unexpected` marks a gate fired on a stage the
-/// active [`crate::mode::Mode`] would not normally gate (e.g. a Define/Plan/Code
+/// active [`crate::mode::Mode`] would not normally gate (e.g. a Plan/Code
 /// failure in Auto mode) — a never-silent gate per WR-11.
 ///
 /// This ignores a run's persisted command (`State::gate_notify_cmd`). DevFlow's
@@ -1840,7 +1840,7 @@ fn gate_lock(project_root: &Path, phase: PhaseId) -> Result<GateLock, GateError>
 /// The suffix of a waiter registration's file name.
 pub(crate) const WAITER_SUFFIX: &str = ".waiter";
 /// Every stage whose gate files a phase can leave behind.
-pub(crate) const STAGES: [Stage; 4] = [Stage::Define, Stage::Plan, Stage::Code, Stage::Validate];
+pub(crate) const STAGES: [Stage; 3] = [Stage::Plan, Stage::Code, Stage::Validate];
 /// An answer body that is not JSON, or lacks what an answer needs.
 const REASON_UNPARSABLE: &str = "unparsable";
 /// An answer body with no gate id.
@@ -2631,7 +2631,7 @@ mod tests {
         let got = Gates::await_answer(
             dir.path(),
             PhaseId::new(13),
-            Stage::Define,
+            Stage::Plan,
             &GateId::new(),
             60,
             || cancelled.load(std::sync::atomic::Ordering::SeqCst),
@@ -2651,7 +2651,7 @@ mod tests {
     #[test]
     fn await_answer_returns_the_answer_when_not_cancelled() {
         let dir = tempfile::tempdir().unwrap();
-        let (phase, stage) = (PhaseId::new(13), Stage::Define);
+        let (phase, stage) = (PhaseId::new(13), Stage::Plan);
         let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
             .unwrap()
             .gate_id;

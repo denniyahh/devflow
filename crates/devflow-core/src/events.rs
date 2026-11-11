@@ -345,7 +345,7 @@ mod tests {
             dir.path(),
             PhaseId::new(1),
             "stage_launched",
-            serde_json::json!({"stage": "define"}),
+            serde_json::json!({"stage": "plan"}),
         );
         let first_ts = last_events_by_phase(dir.path())[&PhaseId::new(1)]
             .stage_launched_ts
@@ -357,7 +357,7 @@ mod tests {
             dir.path(),
             PhaseId::new(1),
             "transition",
-            serde_json::json!({"to": "plan"}),
+            serde_json::json!({"to": "code"}),
         );
         let after_transition = last_events_by_phase(dir.path());
         assert_eq!(
@@ -374,7 +374,7 @@ mod tests {
             dir.path(),
             PhaseId::new(1),
             "stage_launched",
-            serde_json::json!({"stage": "plan"}),
+            serde_json::json!({"stage": "code"}),
         );
         let path = events_path(dir.path());
         let mut contents = std::fs::read_to_string(&path).unwrap();

@@ -42,7 +42,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Begin the workflow for a phase: Define → Plan → Code → Validate.
+    /// Begin the workflow for a phase: Plan → Code → Validate.
     Start {
         /// Phase number to work on.
         #[arg(long)]
@@ -65,8 +65,8 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
         /// Run the pipeline through `<stage>` and halt cleanly before
-        /// advancing further (e.g. `--until plan` runs Define+Plan then
-        /// stops before Code).
+        /// advancing further (e.g. `--until plan` runs Plan then stops
+        /// before Code).
         #[arg(long)]
         until: Option<Stage>,
         /// A second agent that takes over the Code stage once if the agent is
@@ -157,7 +157,7 @@ enum Command {
     ///
     /// Unlike `start`, this loads the persisted per-phase state and
     /// relaunches its saved stage — it does NOT create a new branch/worktree
-    /// or reset the workflow to Define (review consensus #5); agent and mode
+    /// or reset the workflow to Plan (review consensus #5); agent and mode
     /// come from the saved state.
     Resume {
         /// Phase to resume.
