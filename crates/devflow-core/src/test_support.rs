@@ -361,8 +361,8 @@ pub fn with_answer_before_publish<R>(hook: impl FnOnce() + 'static, body: impl F
 //
 // A `PATH`-replacing guard mutates process-global state, and `cargo test` runs
 // this crate's whole suite as threads in ONE process. `devflow-core` shells out
-// to `git` from eight modules (`git`, `version`, `worktree`, `agent_result`,
-// `monitor`, `ship_evidence`, `hooks`, and this one), and — decisively — its
+// to `git` from several modules (`git`, `version`, `worktree`, `agent_result`,
+// `monitor`, `gsd_config`, and this one), and — decisively — its
 // tests reach `git` by calling PRODUCTION code that spawns it, not only through
 // fixture helpers. So no fixture-level lock can cover them: serializing this
 // module's own `git()` helper still left

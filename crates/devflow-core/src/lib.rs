@@ -74,7 +74,6 @@ pub mod recover;
 pub mod registry;
 pub mod reset_time;
 pub mod ship;
-pub mod ship_evidence;
 pub mod stage;
 pub mod state;
 pub mod supervisor;
