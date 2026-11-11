@@ -24,7 +24,8 @@
   **Fix shape:** reword the comments to say the run waits at the rate-limit gate; rename the `a_cron_resume_*` tests and their `Cron arm` evidence label together with `.planning/milestones/v3.0.0-phases/51-rate-limit-agent-failover/51-SUPV01-EVIDENCE.md`, or leave the evidence label as history. Fits 52-18 (the CUT-04 scan plan) or 52-31/52-32.
 
 - `gate approve` still stores a Ship answer when no waiter is registered (found in 52-11)
-  status: open
+  status: resolved
+  **Resolution (52-15):** the `stage == Stage::Ship ||` bypass in `refuse_a_gate_with_no_waiter` and doctor's Ship-only repair are gone with the variant. The Ship-seeded tests were re-seeded at Validate (with a registered waiter where their subject needs an answer to land) or deleted where the bypass was their subject; the 52-15 SUMMARY lists them.
   **What:** `commands.rs::refuse_a_gate_with_no_waiter` keeps its `stage == Stage::Ship ||` bypass, so `devflow gate approve|reject` at a Ship gate with no waiter writes an answer. That bypass existed so `devflow ship` could apply the answer. 52-11 removed `devflow ship` and `stop`'s matching Ship case, so nothing consumes the stored answer now. The operator is told "no registered waiter will act" and named `devflow resume` / `devflow recover --clean`, so no message is false.
   **Why deferred:** about a dozen `commands.rs` and `stop_e2e.rs` tests seed generic gate-approve behaviour at a Ship gate with no waiter (for example `gate_approve_with_no_registered_waiter_does_not_claim_advance`, `gate_respond_answers_a_registered_waiter_and_refuses_when_none_is_registered`, the `gate_sweep_*` Ship cases). Re-seeding them is the `Stage::Ship` removal's work, not 52-11's.
   **Fix shape:** in 52-15 (the `Stage::Ship` variant removal) the bypass and the Ship-seeded tests go with the variant; re-seed the kept ones at Validate with a registered or absent waiter as their subject needs.
@@ -59,7 +60,30 @@
   **Fix shape:** none needed if 52-14 removes `yes_ship` as planned; otherwise re-seed the test on the interactivity check (Codex + Auto + Define + no CONTEXT.md).
 
 - `run_gate_with_timeout`'s `auto_response` parameter and safe point 5 have no production caller (found in 52-14)
-  status: open
+  status: resolved
+  **Resolution (52-15):** the parameter, the safe-point-5 stop check and the auto-answer write are removed with `handle_ship_outcome`; every call site lost its trailing `None`. The two tests and the helper that drove an auto-answered Ship gate (`a_stopped_auto_answered_run_sends_no_ship_notify`, `a_pre_authorized_answer_left_unconfirmed_still_decides_its_own_gate`, `auto_answered_ship_gate`, with `RecordedSupervisor`) are deleted. The safe points are not renumbered: 4 and 6 keep their numbers.
   **What:** with `yes_ship` gone, `handle_ship_outcome` passes `None`, and no production call site passes `Some`. The parameter, the safe-point-5 stop check that runs only for an auto-answered gate, and their tests in `pipeline_gate.rs` (`a_stopped_auto_answered_run_sends_no_ship_notify`, `a_pre_authorized_answer_left_unconfirmed_still_decides_its_own_gate`, helper `auto_answered_ship_gate`) are kept, so they now test a path nothing reaches.
   **Why deferred:** removing the parameter touches every call (3 in production code, 10 in tests) and the safe-point numbering, which is beyond 52-14's flag/env/key/field scope; 52-15 removes `Stage::Ship` and `handle_ship_outcome`, the last caller that ever passed one.
   **Fix shape:** in 52-15, drop the parameter and safe point 5 with `handle_ship_outcome`, and delete or re-seed those tests (they drive `Stage::Ship`).
+
+- The capture-retention arithmetic still counts a five-stage run (found in 52-15)
+  status: open
+  **What:** the `DEFAULT_CAPTURE_RETENTION` doc in `crates/devflow-core/src/config.rs` and the `prune_history_retains_a_full_five_stage_run_with_loop_backs` doc and name in `agent_result.rs` say a clean Define→Plan→Code→Validate→Ship run makes 4 archive events. Without Ship it makes 3, so 12 now covers four loop-backs with one spare, not zero. The constant is still 12 and the test still passes; only the stated arithmetic is wrong.
+  **Why deferred:** 52-17 removes Define and changes the count again; rewriting it twice is waste.
+  **Fix shape:** after 52-17, restate the count for the three-stage chain in both docs and rename the test; keep the constant unless the operator wants it changed.
+
+- `devflow doctor` still checks for the `gh` CLI, which nothing runs (found in 52-15)
+  status: open
+  **What:** `commands.rs` doctor has a `cmd_check("gh CLI", "gh", ...)`. A per-name search for a `gh` invocation under `crates/` and `tools/` finds only that check (the other hits are comments about `gh pr checks`). The Ship stage's `/gsd-ship` ran inside the agent, not DevFlow, and it is gone. 52-15 reworded README.md's and the quickstart's requirement line to say so rather than drop it while doctor still checks it.
+  **Fix shape:** drop the doctor check and both requirement lines together, or keep `gh` as an operator convenience and say why. Fits 52-18.
+
+- Comments and a few test names still describe Ship as the stage after Validate (found in 52-15)
+  status: open
+  **What:** prose only, no `Stage::Ship` or `"ship"` literal: doc comments in `agent_result.rs` (ten lines, e.g. "should advance Validate to Ship"), `state.rs` (the module doc's stage list and the `stopped` field doc), `gsd_config.rs:352` and `:618`, `git.rs:213`, `staleness.rs:214`, `preflight.rs:1090`, `commands.rs:624`, `tests/auto_chain_leak_repair_e2e.rs:514`; the `pipeline_outcomes` tests `validate_gaps_does_not_advance_to_ship` and `grafted_failure_shape_gates_instead_of_shipping` and their messages; and `pipeline_gate::until_stop_never_emits_workflow_shipped`, which asserts the absence of an event nothing emits since 52-12. The failure-cap sentence "approve to ship" in `pipeline_outcomes.rs` is 52-33's, as 52-08 recorded.
+  **Fix shape:** reword the comments to say a passing Validate finishes the run, and rename the tests. Fits 52-18's comment-stripped scan pass, which does not see prose.
+
+- `StageIntent::for_stage_in_project` and `prompt::stage_prompt_for_project` keep a `project_root` nothing reads (found in 52-15)
+  status: open
+  **What:** the review angles were the only project-local input to a stage intent. 52-15 kept both `pub` functions, with the parameter now unread, because 52-26, 52-27 and `52-VALIDATION.md` name the one `for_stage_in_project(` call in `pipeline_launch::default_stage_prompt` (pinned by `every_no_override_launch_renders_through_default_stage_prompt`), and removing a `pub` fn is a semver change the plan did not ask for.
+  **Fix shape:** after 52-27, either give the parameter a reader or collapse both into `for_stage`/`stage_prompt` and move the source-scan needle with them, recording the `function_missing` from `cargo semver-checks`.
+
