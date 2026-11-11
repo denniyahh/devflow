@@ -120,6 +120,47 @@ pub enum ReaderFailure {
         /// What was searched, or GSD's message.
         message: String,
     },
+    /// More than one phase directory matched, so which one GSD should read
+    /// is not established.
+    #[error("more than one phase directory matches: {matches:?}")]
+    AmbiguousPhaseDir {
+        /// The matching directories.
+        matches: Vec<PathBuf>,
+    },
+    /// The reader exited non-zero (gsd-core 1.20.1 does so for a report
+    /// status outside its closed set).
+    #[error("the GSD reader exited {code:?}: {message}")]
+    Exit {
+        /// The exit code, `None` when a signal ended it.
+        code: Option<i32>,
+        /// The reader's stderr.
+        message: String,
+    },
+    /// GSD could not parse the report's frontmatter (`unparseable`).
+    #[error("GSD could not parse the verification report: {message}")]
+    Unparseable {
+        /// GSD's message.
+        message: String,
+    },
+    /// GSD could not determine whether the report is stale
+    /// (`staleCheckIndeterminate: true`), so a `passed` is not established.
+    #[error("GSD could not determine whether the verification report is stale")]
+    Indeterminate,
+    /// The JSON lacks a field the answer needs, or holds it with the wrong
+    /// type.
+    #[error("the GSD reader's JSON has no usable `{key}` field")]
+    MissingField {
+        /// The field.
+        key: String,
+    },
+}
+
+impl ReaderFailure {
+    /// An event-safe name for the failure class: no path, no GSD message.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        ""
+    }
 }
 
 /// The first `gsd_run` launcher under `home`: the Claude install, then the
@@ -461,5 +502,321 @@ mod tests {
             );
         }
         assert_eq!(cmd.get_current_dir(), Some(fx.root.as_path()));
+    }
+
+    // ---- Statuses: recorded gsd-core 1.20.1 shapes (probe table, RESEARCH
+    // § GSD Integration). Keys follow `routeResult`; `next_action` text is
+    // `VERIFICATION_ROUTES`'. The stale result is the verbatim probe output.
+
+    const STALE_JSON: &str = r#"{"status":"stale","next_action":"Verification is stale — covered source files changed after the verifier last ran: \"a.txt\". Re-run execute-phase for this phase: …","next_command":"/gsd-execute-phase 01","route":"execute-phase","moved_files":["a.txt"]}"#;
+    const GAPS_FOUND_JSON: &str = r#"{"status":"gaps_found","next_action":"Gaps found. Plan the fixes, then re-run execute-phase before shipping.","next_command":"/gsd-plan-phase 01 --gaps","route":"plan-phase"}"#;
+    const MISSING_JSON: &str = r#"{"status":"missing","next_action":"No verification report found — the verify step never completed.","next_command":"/gsd-execute-phase 01","route":"execute-phase"}"#;
+    /// Not in the probe table: built from the enum and `VERIFICATION_ROUTES`
+    /// (`human_needed` → `verify-work`).
+    const HUMAN_NEEDED_JSON: &str = r#"{"status":"human_needed","next_action":"Human verification required.","next_command":"/gsd-verify-work 01","route":"verify-work"}"#;
+    const PHASE_DIR_NOT_FOUND_JSON: &str = r#"{"status":"phase_dir_not_found","next_action":"Usage error: the phase directory does not exist","next_command":"","route":"","message":"Usage error: no phase directory at /var/home/x/.planning/phases/07-demo"}"#;
+    /// Not in the probe table: built from the enum and `VERIFICATION_ROUTES`.
+    const UNPARSEABLE_JSON: &str = r#"{"status":"unparseable","next_action":"The *-VERIFICATION.md frontmatter is not parseable YAML — fix the syntax error in the report itself.","next_command":"","route":""}"#;
+    const INDETERMINATE_PASSED_JSON: &str = r#"{"status":"passed","next_action":"Verification passed — continue.","next_command":"","route":"","staleCheckIndeterminate":true}"#;
+    /// The recorded stderr for a report whose status is `bogus` (exit 1, no
+    /// stdout).
+    const BOGUS_STDERR: &str = "Error: Verification report /var/home/x/.planning/phases/07-demo/07-VERIFICATION.md has status \"bogus\", which is outside the closed set";
+
+    fn status_of(fx: &Fixture) -> Result<StatusReport, ReaderFailure> {
+        verification_status(&fx.home, &fx.root, &fx.phase())
+    }
+
+    #[test]
+    fn a_stale_report_reads_as_stale_with_its_moved_files() {
+        let fx = Fixture::new();
+        fx.plant_printing(STALE_JSON, 0);
+        let report = status_of(&fx).expect("stale is a status");
+        assert_eq!(report.status, GsdStatus::Stale);
+        assert_eq!(report.route, "execute-phase");
+        assert_eq!(report.moved_files, vec!["a.txt".to_owned()]);
+    }
+
+    #[test]
+    fn a_gaps_found_report_reads_as_gaps_found() {
+        let fx = Fixture::new();
+        fx.plant_printing(GAPS_FOUND_JSON, 0);
+        let report = status_of(&fx).expect("gaps_found is a status");
+        assert_eq!(report.status, GsdStatus::GapsFound);
+        assert_eq!(report.route, "plan-phase");
+    }
+
+    #[test]
+    fn a_missing_report_reads_as_missing() {
+        let fx = Fixture::new();
+        fx.plant_printing(MISSING_JSON, 0);
+        let report = status_of(&fx).expect("missing is a status");
+        assert_eq!(report.status, GsdStatus::Missing);
+        assert_eq!(report.route, "execute-phase");
+    }
+
+    #[test]
+    fn a_human_needed_report_reads_as_human_needed() {
+        let fx = Fixture::new();
+        fx.plant_printing(HUMAN_NEEDED_JSON, 0);
+        let report = status_of(&fx).expect("human_needed is a status");
+        assert_eq!(report.status, GsdStatus::HumanNeeded);
+        assert_eq!(report.route, "verify-work");
+    }
+
+    // ---- Failures: each is an `Err` of its own variant.
+
+    #[test]
+    fn no_launcher_is_a_reader_failure() {
+        let fx = Fixture::new();
+        let failure = status_of(&fx).expect_err("no launcher is not a status");
+        assert!(
+            matches!(failure, ReaderFailure::LauncherNotFound { ref home } if *home == fx.home),
+            "{failure:?}"
+        );
+    }
+
+    #[test]
+    fn a_spawn_error_is_a_reader_failure() {
+        let fx = Fixture::new();
+        let launcher = fx.plant_at(".claude/gsd-core/bin/gsd_run", "exit 0");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let failure = status_of(&fx).expect_err("an unexecutable launcher is not a status");
+        assert!(
+            matches!(failure, ReaderFailure::Spawn { .. }),
+            "{failure:?}"
+        );
+    }
+
+    #[test]
+    fn a_hung_reader_times_out() {
+        let fx = Fixture::new();
+        let pid_file = fx.logs.join("pid");
+        fx.plant_at(
+            ".claude/gsd-core/bin/gsd_run",
+            &format!("echo $$ > '{}'\nexec sleep 30", pid_file.display()),
+        );
+        let deadline = Duration::from_millis(300);
+        let started = Instant::now();
+        let failure = verification_status_within(&fx.home, &fx.root, &fx.phase(), deadline)
+            .expect_err("a hung reader is not a status");
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(failure, ReaderFailure::TimedOut { after } if after == deadline),
+            "{failure:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the call waited {elapsed:?}, not the deadline"
+        );
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: signal 0 only probes whether `pid` exists.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(!alive, "the hung reader {pid} was left running");
+    }
+
+    #[test]
+    fn a_nonzero_exit_is_a_reader_failure() {
+        let fx = Fixture::new();
+        fx.plant_at(
+            ".claude/gsd-core/bin/gsd_run",
+            &format!("printf '%s\\n' '{BOGUS_STDERR}' >&2\nexit 1"),
+        );
+        let failure = status_of(&fx).expect_err("a non-zero exit is not a status");
+        match failure {
+            ReaderFailure::Exit { code, ref message } => {
+                assert_eq!(code, Some(1));
+                assert!(message.contains("\"bogus\""), "{message}");
+            }
+            other => panic!("expected Exit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_nonzero_exit_wins_over_a_passed_json() {
+        let fx = Fixture::new();
+        fx.plant_printing(PASSED_JSON, 3);
+        let failure = status_of(&fx).expect_err("a non-zero exit is not a status");
+        assert!(
+            matches!(failure, ReaderFailure::Exit { code: Some(3), .. }),
+            "{failure:?}"
+        );
+    }
+
+    #[test]
+    fn non_json_stdout_is_a_reader_failure() {
+        let fx = Fixture::new();
+        fx.plant_printing("Verification passed", 0);
+        let failure = status_of(&fx).expect_err("prose is not a status");
+        assert!(
+            matches!(failure, ReaderFailure::NotJson { .. }),
+            "{failure:?}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_status_is_a_reader_failure() {
+        let fx = Fixture::new();
+        fx.plant_printing(r#"{"status":"bogus","route":""}"#, 0);
+        let failure = status_of(&fx).expect_err("an unknown status is not a status");
+        assert!(
+            matches!(failure, ReaderFailure::UnknownStatus { ref status } if status == "bogus"),
+            "{failure:?}"
+        );
+    }
+
+    #[test]
+    fn phase_dir_not_found_with_exit_0_is_a_reader_failure() {
+        let fx = Fixture::new();
+        fx.plant_printing(PHASE_DIR_NOT_FOUND_JSON, 0);
+        let failure = status_of(&fx).expect_err("phase_dir_not_found is not a status");
+        match failure {
+            ReaderFailure::PhaseDirNotFound { ref message } => {
+                assert!(message.contains("Usage error"), "{message}");
+            }
+            other => panic!("expected PhaseDirNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unparseable_status_is_a_reader_failure() {
+        let fx = Fixture::new();
+        fx.plant_printing(UNPARSEABLE_JSON, 0);
+        let failure = status_of(&fx).expect_err("unparseable is not a status");
+        assert!(
+            matches!(failure, ReaderFailure::Unparseable { .. }),
+            "{failure:?}"
+        );
+    }
+
+    #[test]
+    fn an_indeterminate_passed_is_a_reader_failure() {
+        let fx = Fixture::new();
+        fx.plant_printing(INDETERMINATE_PASSED_JSON, 0);
+        let failure = status_of(&fx).expect_err("an indeterminate passed is not a pass");
+        assert!(
+            matches!(failure, ReaderFailure::Indeterminate),
+            "{failure:?}"
+        );
+    }
+
+    #[test]
+    fn a_json_object_without_status_is_a_reader_failure() {
+        let fx = Fixture::new();
+        fx.plant_printing(r#"{"route":"","next_command":""}"#, 0);
+        let failure = status_of(&fx).expect_err("no status is not a status");
+        assert!(
+            matches!(failure, ReaderFailure::MissingField { ref key } if key == "status"),
+            "{failure:?}"
+        );
+    }
+
+    #[test]
+    fn a_passed_report_without_a_route_is_a_reader_failure() {
+        let fx = Fixture::new();
+        fx.plant_printing(r#"{"status":"passed","next_command":""}"#, 0);
+        let failure = status_of(&fx).expect_err("an absent route is not an empty one");
+        assert!(
+            matches!(failure, ReaderFailure::MissingField { ref key } if key == "route"),
+            "{failure:?}"
+        );
+    }
+
+    #[test]
+    fn two_matching_phase_dirs_are_a_reader_failure() {
+        let fx = Fixture::new();
+        std::fs::create_dir_all(fx.root.join(".planning/phases/07-other")).unwrap();
+        let failure = phase_dir(&fx.root, PhaseId::new(7)).expect_err("two 07- directories");
+        match failure {
+            ReaderFailure::AmbiguousPhaseDir { ref matches } => assert_eq!(matches.len(), 2),
+            other => panic!("expected AmbiguousPhaseDir, got {other:?}"),
+        }
+    }
+
+    /// One of every variant, each built from a message holding an absolute
+    /// path. The exhaustive `match` makes a new variant fail to compile here
+    /// until it is added to the list.
+    fn every_failure(path: &str) -> Vec<ReaderFailure> {
+        let all = vec![
+            ReaderFailure::LauncherNotFound {
+                home: PathBuf::from(path),
+            },
+            ReaderFailure::Spawn {
+                message: path.to_owned(),
+            },
+            ReaderFailure::TimedOut {
+                after: Duration::from_secs(1),
+            },
+            ReaderFailure::NotJson {
+                message: path.to_owned(),
+            },
+            ReaderFailure::UnknownStatus {
+                status: path.to_owned(),
+            },
+            ReaderFailure::PhaseDirNotFound {
+                message: path.to_owned(),
+            },
+            ReaderFailure::AmbiguousPhaseDir {
+                matches: vec![PathBuf::from(path)],
+            },
+            ReaderFailure::Exit {
+                code: Some(1),
+                message: path.to_owned(),
+            },
+            ReaderFailure::Unparseable {
+                message: path.to_owned(),
+            },
+            ReaderFailure::Indeterminate,
+            ReaderFailure::MissingField {
+                key: path.to_owned(),
+            },
+        ];
+        for failure in &all {
+            match failure {
+                ReaderFailure::LauncherNotFound { .. }
+                | ReaderFailure::Spawn { .. }
+                | ReaderFailure::TimedOut { .. }
+                | ReaderFailure::NotJson { .. }
+                | ReaderFailure::UnknownStatus { .. }
+                | ReaderFailure::PhaseDirNotFound { .. }
+                | ReaderFailure::AmbiguousPhaseDir { .. }
+                | ReaderFailure::Exit { .. }
+                | ReaderFailure::Unparseable { .. }
+                | ReaderFailure::Indeterminate
+                | ReaderFailure::MissingField { .. } => {}
+            }
+        }
+        all
+    }
+
+    #[test]
+    fn reader_failure_labels_carry_no_path() {
+        let path = "/var/home/x/.planning";
+        let failures = every_failure(path);
+        let mut labels = Vec::new();
+        for failure in &failures {
+            let label = failure.label();
+            assert!(!label.is_empty(), "{failure:?} has an empty label");
+            assert!(
+                !label.contains('/'),
+                "{failure:?} label {label:?} holds a path"
+            );
+            assert!(
+                !labels.contains(&label),
+                "{failure:?} shares label {label:?}"
+            );
+            labels.push(label);
+        }
+        // Control: the Display text does carry the path, so the label is what
+        // keeps it out of an event.
+        assert!(
+            failures
+                .iter()
+                .any(|failure| failure.to_string().contains(path))
+        );
     }
 }
