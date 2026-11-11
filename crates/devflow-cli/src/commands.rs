@@ -516,8 +516,7 @@ fn start_reserved(
     // what the primary checkout happens to have checked out — and, since
     // 45-01, does not silently probe a branch the run will not use.
     let driver = agents::driver_for(agent);
-    if driver.interactivity_mode(Stage::Define)
-        == agents::InteractivityMode::RequiresExistingArtifact
+    if start_requires_phase_context(driver.as_ref())
         && !phase_artifact_on_base(project_root, phase, "-CONTEXT.md", base)
     {
         return Err(CliError::Message(format!(
@@ -778,6 +777,12 @@ fn start_reserved(
     );
     println!("  watch live: devflow logs -f --phase {phase}");
     Ok(())
+}
+
+/// Whether `start` must find the phase's CONTEXT.md on the base before launching `driver`:
+/// the driver declares the first stage a run launches as needing an existing artifact.
+fn start_requires_phase_context(driver: &dyn agents::AgentDriver) -> bool {
+    driver.interactivity_mode(Stage::Define) == agents::InteractivityMode::RequiresExistingArtifact
 }
 
 /// Whether `state` is only what a `start`'s reservation wrote: that `start` died before
@@ -6760,6 +6765,129 @@ mod tests {
         );
     }
 
+    /// CUT-01 (Pitfall 2): "never prepared" is this run's own flag, not `stage == Define`. A
+    /// fresh state is never prepared; a Plan run that captured its baseline is prepared, and
+    /// so is not reported as never launched (control).
+    #[test]
+    fn run_never_prepared_is_true_for_a_fresh_state_only() {
+        let fresh = State::new(
+            PhaseId::new(5310),
+            AgentKind::Claude,
+            Mode::Auto,
+            PathBuf::from("/repo"),
+        );
+        assert!(
+            run_never_prepared(&fresh),
+            "a fresh state was never prepared"
+        );
+
+        let mut prepared = fresh.clone();
+        prepared.stage = Stage::Plan;
+        prepared.verification_baseline_captured = true;
+        assert!(prepared.supervisor.is_none());
+        assert!(
+            !run_never_prepared(&prepared),
+            "control: a prepared Plan run with no supervisor is not never-launched"
+        );
+    }
+
+    /// The event log is project-wide and append-only, so an earlier run's `workflow_started`
+    /// and `stage_launched` for the same phase must not make a fresh state read as launched.
+    #[test]
+    fn run_never_prepared_ignores_an_earlier_runs_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5311);
+        devflow_core::events::emit(
+            root,
+            phase,
+            "workflow_started",
+            serde_json::json!({ "agent": "claude", "mode": "auto" }),
+        );
+        devflow_core::events::emit(
+            root,
+            phase,
+            "stage_launched",
+            serde_json::json!({ "stage": "plan" }),
+        );
+        assert!(
+            devflow_core::events::has_event_for_phase(root, phase, "workflow_started")
+                && devflow_core::events::has_event_for_phase(root, phase, "stage_launched"),
+            "control: the earlier run's events are on disk"
+        );
+
+        let fresh = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        assert!(
+            run_never_prepared(&fresh),
+            "an earlier run's events must not make a fresh state read as prepared"
+        );
+    }
+
+    /// Doctor's missing-branch check skips a run that was never prepared, and only that run:
+    /// the same facts with `unprepared_restart: None` report the missing branch.
+    #[test]
+    fn check_missing_branch_skips_a_never_launched_run_only() {
+        let facts = |unprepared_restart: Option<String>| PhaseFacts {
+            unprepared_restart,
+            stage: Stage::Plan,
+            feature_branch_exists: false,
+            ..doctor_reconciliation::agreeing_facts(PhaseId::new(5312))
+        };
+        let unprepared = facts(Some("devflow start --phase 5312".to_string()));
+        assert!(
+            check_missing_branch(&unprepared).is_none(),
+            "a never-prepared run has no branch to miss"
+        );
+
+        let prepared = facts(None);
+        let finding = check_missing_branch(&prepared).expect("a prepared run's branch is missing");
+        assert_eq!(finding.severity, Severity::Warn);
+        assert!(
+            finding.detail.contains("feature/phase-5312"),
+            "{}",
+            finding.detail
+        );
+    }
+
+    /// A driver whose only artifact-requiring stage is `stage`.
+    struct ArtifactAtStage(Stage);
+
+    impl agents::AgentDriver for ArtifactAtStage {
+        fn name(&self) -> &'static str {
+            "test-artifact-at-stage"
+        }
+        fn build_command(
+            &self,
+            _phase: PhaseId,
+            _prompt: &str,
+            _roots: &[PathBuf],
+        ) -> (&'static str, Vec<String>) {
+            ("true", Vec::new())
+        }
+        fn render_prompt(&self, intent: &devflow_core::prompt::StageIntent) -> String {
+            devflow_core::prompt::render_claude_style(intent)
+        }
+        fn interactivity_mode(&self, stage: Stage) -> agents::InteractivityMode {
+            if stage == self.0 {
+                agents::InteractivityMode::RequiresExistingArtifact
+            } else {
+                agents::InteractivityMode::HeadlessSafe
+            }
+        }
+    }
+
+    /// `start`'s CONTEXT.md probe asks the driver about the first stage a run launches, Plan.
+    /// A driver that needs an artifact only at Define is not asked about (control).
+    #[test]
+    fn start_context_probe_asks_the_driver_about_plan() {
+        assert!(start_requires_phase_context(&ArtifactAtStage(Stage::Plan)));
+        assert!(
+            !start_requires_phase_context(&ArtifactAtStage(Stage::Define)),
+            "control: no run starts at Define, so a Define-only requirement is not probed"
+        );
+        assert!(!start_requires_phase_context(&ArtifactAtStage(Stage::Code)));
+    }
+
     /// [`stop`] for a root with no state file, whose socket search would
     /// otherwise sweep the operator's real cache: an empty tempdir cache.
     fn stop_with_an_empty_cache(root: &Path, phase: PhaseId) -> Result<(), CliError> {
@@ -11177,7 +11305,7 @@ mod tests {
         /// A fully-agreeing baseline: `reconcile_phase` over this returns
         /// zero findings. Each test overrides only the field(s) needed to
         /// trigger the one check it's proving.
-        fn agreeing_facts(phase: PhaseId) -> PhaseFacts {
+        pub(super) fn agreeing_facts(phase: PhaseId) -> PhaseFacts {
             PhaseFacts {
                 phase,
                 stage: Stage::Code,

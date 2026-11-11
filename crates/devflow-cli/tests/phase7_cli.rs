@@ -713,6 +713,98 @@ fn removed_flags_are_unknown() {
     );
 }
 
+/// The stage names a `start --dry-run` preview lists, in order: the first word of each line
+/// indented by exactly two spaces between the `stage pipeline:` header and the next blank line.
+/// Deeper-indented continuation lines (3.0.0's `↳ hooks:`) are not stage lines.
+fn dry_run_stage_names(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .skip_while(|line| line.trim() != "stage pipeline:")
+        .skip(1)
+        .take_while(|line| !line.trim().is_empty())
+        .filter(|line| line.starts_with("  ") && !line[2..].starts_with(' '))
+        .filter_map(|line| line.split_whitespace().next().map(str::to_string))
+        .collect()
+}
+
+/// `None` when the preview lists exactly `expected`, in order; otherwise what it listed.
+fn dry_run_stage_mismatch(stdout: &str, expected: &[&str]) -> Option<String> {
+    let listed = dry_run_stage_names(stdout);
+    (listed != expected).then(|| format!("listed {listed:?}, expected {expected:?}"))
+}
+
+/// What 3.0.0 printed for `devflow start --dry-run --phase 52 --mode supervise`, copied from
+/// `52-RUN-NOTES.md` (Run 2): a Define first line and a Ship last line.
+const DRY_RUN_3_0_0: &str = "dry run — phase 52 | agent claude | mode supervise
+
+stage pipeline:
+  define /gsd-discuss-phase 52
+  plan /gsd-plan-phase 52
+  code /gsd-execute-phase 52
+  validate /gsd-validate-phase 52 [GATE]
+            ↳ hooks: [DocsUpdate]
+  ship /gsd-ship 52 [GATE]
+
+ship gate: not pre-authorized
+
+after ship: [Merge, VersionBump, ChangelogAppend, BranchCleanup]
+";
+
+/// CUT-01: a fresh run starts at Plan, so the dry run lists exactly plan, code and validate, in
+/// that order and nothing else. The comparison is checked against three outputs it must refuse:
+/// an empty preview, one missing a stage, and the 3.0.0 preview with Define and Ship.
+#[test]
+fn start_dry_run_lists_exactly_plan_code_validate() {
+    const EXPECTED: &[&str] = &["plan", "code", "validate"];
+
+    // Controls: the comparison must report each of these as a mismatch.
+    assert!(
+        dry_run_stage_mismatch("", EXPECTED).is_some(),
+        "control: an empty dry run must not compare equal"
+    );
+    let two_stages = "dry run — phase 1 | agent claude | mode supervise\n\nstage pipeline:\n  \
+                      plan /gsd-plan-phase 1\n  code /gsd-execute-phase 1\n";
+    assert!(
+        dry_run_stage_mismatch(two_stages, EXPECTED).is_some(),
+        "control: a dry run missing validate must not compare equal"
+    );
+    assert_eq!(
+        dry_run_stage_names(DRY_RUN_3_0_0),
+        ["define", "plan", "code", "validate", "ship"],
+        "control: the extraction must read every stage line of the 3.0.0 preview"
+    );
+    assert!(
+        dry_run_stage_mismatch(DRY_RUN_3_0_0, EXPECTED).is_some(),
+        "control: the 3.0.0 dry run (define … ship) must not compare equal"
+    );
+
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let fake_bin = fake_bin_dir(&[]);
+
+    let output = common::hermetic_devflow(&home)
+        .args(["start", "--dry-run", "--phase", "1", "--mode", "supervise"])
+        .arg(root)
+        .env("PATH", path_with_fake_bin(&fake_bin.path))
+        .current_dir(root)
+        .output()
+        .expect("run devflow");
+
+    assert!(
+        output.status.success(),
+        "dry-run must not fail\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        dry_run_stage_mismatch(&stdout, EXPECTED),
+        None,
+        "the dry run must list exactly plan, code, validate\nstdout: {stdout}"
+    );
+}
+
 /// WR-01 (phase 20 review): `--dry-run` must reflect `--until` in its
 /// preview instead of always printing the full pipeline as if
 /// `--until` had not been passed.
@@ -749,11 +841,20 @@ fn start_dry_run_annotates_until_stage() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout
-            .lines()
-            .any(|l| l.contains("plan") && l.contains("[STOPS HERE — --until]")),
-        "the plan stage line must be annotated as the --until stop point\nstdout: {stdout}"
+    assert_eq!(
+        dry_run_stage_mismatch(&stdout, &["plan", "code", "validate"]),
+        None,
+        "the --until preview must still list exactly plan, code, validate\nstdout: {stdout}"
+    );
+    let annotated: Vec<String> = stdout
+        .lines()
+        .filter(|l| l.contains("[STOPS HERE — --until]"))
+        .filter_map(|l| l.split_whitespace().next().map(str::to_string))
+        .collect();
+    assert_eq!(
+        annotated,
+        ["plan"],
+        "exactly the plan stage line must be annotated as the --until stop point\nstdout: {stdout}"
     );
     assert!(
         stdout.contains("--until plan"),
