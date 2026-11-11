@@ -134,7 +134,10 @@ pub struct State {
     /// forced restart: `commands::start()` reads any persisted state for the
     /// same phase and copies this one field into the fresh `State`, because a
     /// bound a `devflow start --force` resets does not bound the unattended
-    /// case D-07 exists for. Exactly two events reset it to zero:
+    /// case D-07 exists for. Exactly three events reset it to zero (the
+    /// third is a `start` over a state recorded `finished`: that run passed
+    /// Validate, so the next one begins at zero, operator decision
+    /// 2026-11-11; a stopped run that did not finish still carries it):
     ///
     /// 1. **State removal** — `workflow::clear_state` deletes
     ///    `.devflow/state-{NN}.json` (an abort does), so the next start for
