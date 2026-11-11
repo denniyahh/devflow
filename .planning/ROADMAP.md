@@ -57,7 +57,7 @@ replies (Telegram and similar) are a later milestone (REMOTE-01/02 under `REQUIR
 
 | Phase | Name | Requirements | Depends on | Status |
 |---|---|---|---|---|
-| 52 | Subtract and Stabilize | CUT-01, CUT-02, CUT-03, CUT-04, GATE-01, GATE-02, GATE-03, GATE-04, OPS-01, OPS-02, OPS-03, OPS-04 | — (Phase 51, v3.0.0, merged) | Not started |
+| 52 | Subtract and Stabilize | CUT-01, CUT-02, CUT-03, CUT-04, GATE-01, GATE-02, GATE-03, GATE-04, OPS-01, OPS-02, OPS-03, OPS-04 | — (Phase 51, v3.0.0, merged) | Complete |
 | 53 | The Question Channel | ASK-01, ASK-02, ASK-03, ASK-04, ASK-05 | 52 | Not started |
 | 54 | Decision Triage | TRIAGE-01, TRIAGE-02, TRIAGE-03, TRIAGE-04 | 53 (its recorded questions are the bake-off corpus) | Not started |
 | 55 | Failover Generalized | FAIL-01, FAIL-02, FAIL-03, FAIL-04, FAIL-05, FAIL-06 | 52 (independent of 53-54; sequenced last) | Not started |
@@ -127,7 +127,7 @@ than split: no requirement dependency forces a split, and the Validate-gate desi
      appear; on DevFlow's own checkout the provenance warning still fires; a run whose worktree is present still
      reports as active. (OPS-01, OPS-02, OPS-03, OPS-04)
 
-**Plans**: 33/33 plans executed
+**Plans**: 33/33 plans complete
 - [x] 52-01-PLAN.md
 - [x] 52-02-PLAN.md
 - [x] 52-03-PLAN.md
@@ -439,7 +439,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 50 | 29/29 | Complete | 2026-10-21 |
 | 50.1 | 30/30 | Complete | 2026-11-02 |
 | 51 | 13/13 | Complete | 2026-11-08 |
-| 52 | 33/33 | In Progress | — |
+| 52 | 33/33 | Complete | 2026-11-11 |
 | 53 | 0/? | Not started | — |
 | 54 | 0/? | Not started | — |
 | 55 | 0/? | Not started | — |
