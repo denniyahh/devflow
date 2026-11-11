@@ -3627,6 +3627,67 @@ mod tests {
         );
     }
 
+    /// OPS-03: a project with no remote at all gets one line saying so, not
+    /// the fetch failure followed by the undeterminable-currency warning —
+    /// both of which follow from the same single cause.
+    #[test]
+    fn a_project_without_a_remote_prints_one_missing_remote_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let remotes = devflow_core::test_support::git_command(root)
+            .args(["remote"])
+            .output()
+            .unwrap();
+        assert!(remotes.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&remotes.stdout).trim(),
+            "",
+            "fixture must have no remote at all"
+        );
+
+        let mut out = Vec::new();
+        assert!(
+            ensure_base_ref_current_to(&mut out, root, "develop").is_ok(),
+            "a missing remote must never refuse"
+        );
+        let printed = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = printed.lines().collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "a missing remote must produce exactly one line: {printed:?}"
+        );
+        assert!(
+            lines[0].contains("no `origin` remote"),
+            "the one line must name the missing remote: {printed:?}"
+        );
+    }
+
+    /// Control for the line above: a remote that exists and is ahead of the
+    /// checked-out base still gets its currency refusal, unchanged, and no
+    /// missing-remote line.
+    #[test]
+    fn a_remote_that_is_behind_still_warns() {
+        let (remote, local) = currency_fixture();
+        let local_root = local.path();
+        advance_remote(remote.path(), "f2.txt");
+
+        let mut out = Vec::new();
+        let err = ensure_base_ref_current_to(&mut out, local_root, "develop")
+            .expect_err("a checked-out base behind its remote must refuse");
+        assert_eq!(
+            err.to_string(),
+            stale_base_message("develop", "origin/develop", 1),
+            "the behind-remote currency message must be unchanged"
+        );
+        let printed = String::from_utf8(out).unwrap();
+        assert!(
+            !printed.contains("no `origin` remote"),
+            "a configured remote must not be reported missing: {printed:?}"
+        );
+    }
+
     /// The fetch subprocess failing must not itself fail the check — the
     /// comparison proceeds against whatever the remote-tracking ref
     /// currently resolves to locally (here, still `Current` from the
