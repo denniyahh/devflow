@@ -5786,4 +5786,253 @@ mod tests {
             "control: the newer plan's gap_closure is read: {reads:?}"
         );
     }
+
+    // ---- 52-27 (D-12, D-25, D-34): gap rounds keep the streak ----
+
+    /// Land one commit on `phase`'s feature branch that changes only
+    /// `.planning/` (a gap round's GSD artifacts), or also `src/<label>.rs` when
+    /// `source`.
+    fn commit_gap_round(root: &Path, phase: PhaseId, label: &str, source: bool) {
+        let git = |args: &[&str]| {
+            let output = devflow_core::test_support::git_command(root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+        };
+        let branch = format!("feature/phase-{}", phase.padded());
+        let exists = devflow_core::test_support::git_command(root)
+            .args(["rev-parse", "--verify", &branch])
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if exists {
+            git(&["checkout", "-q", &branch]);
+        } else {
+            git(&["checkout", "-q", "-b", &branch]);
+        }
+        let planning = root.join(".planning/rounds");
+        std::fs::create_dir_all(&planning).unwrap();
+        std::fs::write(planning.join(format!("{label}.md")), label).unwrap();
+        git(&["add", ".planning/rounds"]);
+        if source {
+            std::fs::create_dir_all(root.join("src")).unwrap();
+            std::fs::write(root.join(format!("src/{label}.rs")), label).unwrap();
+            git(&["add", "src"]);
+        }
+        git(&["commit", "-q", "-m", label]);
+    }
+
+    /// One auto gap round at `root`: the round's commit, then a Validate
+    /// outcome `outcome` over GSD's `gaps_found`, handled at Validate. The
+    /// Validate gate is pre-answered with an abort in case the round gates.
+    fn auto_gap_round(
+        root: &Path,
+        state: &mut State,
+        label: &str,
+        source: bool,
+        outcome: ValidateOutcome,
+    ) {
+        commit_gap_round(root, state.phase, label, source);
+        state.stage = Stage::Validate;
+        workflow::save_state(state).unwrap();
+        preanswer_gate(root, state.phase, Stage::Validate, &abort_answer());
+        let _gsd = GsdStub::answering(root, &[gsd_says(GsdStatus::GapsFound)]);
+        let _ = handle_validate_outcome(root, state, outcome);
+    }
+
+    /// The moves to Plan recorded for `phase`: one per gap-closure pass begun.
+    fn moves_to_plan(root: &Path, phase: PhaseId) -> usize {
+        events_named(root, phase, "transition")
+            .iter()
+            .filter(|event| event["from"] == "validate" && event["to"] == "plan")
+            .count()
+    }
+
+    /// D-12, D-25, D-34 (U2), T-52-37: three auto gap rounds whose commits
+    /// touch only `.planning/` reach `MAX_CONSECUTIVE_FAILURES` and gate, with
+    /// the Validate agent failing every round and with it passing every round
+    /// over GSD's `gaps_found`. Each round moves `consecutive_failures` and
+    /// `phase_validate_failures` by exactly one, the gate opens after the third
+    /// round, and no fourth gaps Plan launches.
+    #[test]
+    fn three_gap_rounds_without_progress_force_the_gate() {
+        if !in_bounded_child(
+            "pipeline_outcomes::tests::three_gap_rounds_without_progress_force_the_gate",
+        ) {
+            return;
+        }
+        for (number, verdict) in [(5330, "fail"), (5331, "pass")] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            init_repo(root);
+            let phase = PhaseId::new(number);
+            phase_dir_fixture(root, phase);
+            let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+            state.stage = Stage::Validate;
+            workflow::save_state(&state).unwrap();
+            for round in 1..=mode::MAX_CONSECUTIVE_FAILURES {
+                let outcome = match verdict {
+                    "fail" => ValidateOutcome::Failed,
+                    _ => ValidateOutcome::Passed,
+                };
+                auto_gap_round(root, &mut state, &format!("round-{round}"), false, outcome);
+                assert_eq!(
+                    (state.consecutive_failures, state.phase_validate_failures),
+                    (round, round),
+                    "agent {verdict}, round {round}: each round counts one failure on each \
+                     counter; events: {:?}",
+                    phase_events(root, phase)
+                );
+                let gated = events_named(root, phase, "gate_fired")
+                    .iter()
+                    .any(|event| event["stage"] == "validate");
+                assert_eq!(
+                    gated,
+                    round == mode::MAX_CONSECUTIVE_FAILURES,
+                    "agent {verdict}, round {round}: the gate opens after the third round only"
+                );
+            }
+            let gate = events_named(root, phase, "gate_fired");
+            assert_eq!(
+                gate.last().map(|event| event["gate_kind"].clone()),
+                Some(serde_json::json!("failure_cap")),
+                "agent {verdict}: the third round gates at the cap: {gate:?}"
+            );
+            assert_eq!(
+                moves_to_plan(root, phase),
+                (mode::MAX_CONSECUTIVE_FAILURES - 1) as usize,
+                "agent {verdict}: no gaps Plan after the round that gated"
+            );
+        }
+    }
+
+    /// D-34 control: a gap round that also changes a source file counts as
+    /// progress, so the streak starts again at 1 while the per-phase total
+    /// keeps counting.
+    #[test]
+    fn a_gap_round_that_changes_a_source_file_resets_the_streak() {
+        if !in_bounded_child(
+            "pipeline_outcomes::tests::a_gap_round_that_changes_a_source_file_resets_the_streak",
+        ) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(5332);
+        phase_dir_fixture(root, phase);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        workflow::save_state(&state).unwrap();
+        auto_gap_round(root, &mut state, "round-1", false, ValidateOutcome::Failed);
+        auto_gap_round(root, &mut state, "round-2", false, ValidateOutcome::Failed);
+        assert_eq!(
+            state.consecutive_failures, 2,
+            "premise: two planning-only rounds build a streak"
+        );
+        auto_gap_round(root, &mut state, "round-3", true, ValidateOutcome::Failed);
+        assert_eq!(
+            (state.consecutive_failures, state.phase_validate_failures),
+            (1, 3),
+            "a round that changes a source file restarts the streak; the total keeps counting"
+        );
+        assert!(
+            events_named(root, phase, "gate_fired").is_empty(),
+            "no gate: the streak was reset: {:?}",
+            phase_events(root, phase)
+        );
+    }
+
+    /// D-12 (U2), supervise counting: with GSD answering `gaps_found` at every
+    /// read and gap rounds that commit only `.planning/`, the first Validate
+    /// outcome's gate opens with each counter at exactly 1 on disk, approving it
+    /// starts the gaps Plan with each still 1, and the second round's gate opens
+    /// with each at 2, with the agent failing every round and with it passing
+    /// every round. Control: the same supervise run with GSD answering `passed`
+    /// and the agent passing reaches its gate with both counters at 0.
+    #[test]
+    fn a_supervise_gaps_round_counts_once_and_its_approve_counts_nothing() {
+        if !in_bounded_child(
+            "pipeline_outcomes::tests::a_supervise_gaps_round_counts_once_and_its_approve_counts_nothing",
+        ) {
+            return;
+        }
+        let counters = |state: &State| (state.consecutive_failures, state.phase_validate_failures);
+        for (number, outcome) in [
+            (5333, ValidateOutcome::Failed),
+            (5334, ValidateOutcome::Passed),
+        ] {
+            let row = format!("{outcome:?}");
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            init_repo(root);
+            let phase = PhaseId::new(number);
+            phase_dir_fixture(root, phase);
+            let _gsd = GsdStub::answering(
+                root,
+                &[
+                    gsd_says(GsdStatus::GapsFound),
+                    gsd_says(GsdStatus::GapsFound),
+                ],
+            );
+            let mut state = State::new(
+                phase,
+                AgentKind::Claude,
+                Mode::Supervise,
+                root.to_path_buf(),
+            );
+            state.stage = Stage::Validate;
+            workflow::save_state(&state).unwrap();
+
+            commit_gap_round(root, phase, "round-1", false);
+            let first = outcome.clone();
+            let (gate, at_gate) = at_the_validate_gate(root, phase, &approve_answer(), || {
+                let _ = handle_validate_outcome(root, &mut state, first);
+            });
+            assert_eq!(gate["gate_kind"], "gaps_found", "{row}: {gate}");
+            assert_eq!(counters(&at_gate), (1, 1), "{row}: round 1 counts once");
+            let after_approve = workflow::load_state(root, phase).unwrap();
+            assert_eq!(
+                after_approve.stage,
+                Stage::Plan,
+                "{row}: approve starts the gaps Plan"
+            );
+            assert_eq!(
+                counters(&after_approve),
+                (1, 1),
+                "{row}: the approve counts nothing"
+            );
+
+            commit_gap_round(root, phase, "round-2", false);
+            let mut state = after_approve;
+            state.stage = Stage::Validate;
+            workflow::save_state(&state).unwrap();
+            let second = outcome.clone();
+            let (_, at_second) = at_the_validate_gate(root, phase, &abort_answer(), || {
+                let _ = handle_validate_outcome(root, &mut state, second);
+            });
+            assert_eq!(
+                counters(&at_second),
+                (2, 2),
+                "{row}: round 2 counts once more"
+            );
+        }
+
+        // Control: GSD's `passed` and an agent pass count nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(5335);
+        let _gsd = validate_evidence(root, phase, &[gsd_says(GsdStatus::Passed)]);
+        let mut state = validate_state(root, phase, Mode::Supervise);
+        let (gate, at_gate) = at_the_validate_gate(root, phase, &abort_answer(), || {
+            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Passed);
+        });
+        assert_eq!(gate["gate_kind"], "clean_pass", "control: {gate}");
+        assert_eq!(
+            counters(&at_gate),
+            (0, 0),
+            "control: a passed round counts nothing"
+        );
+    }
 }
