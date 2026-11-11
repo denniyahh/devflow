@@ -28,3 +28,19 @@
   **What:** `commands.rs::refuse_a_gate_with_no_waiter` keeps its `stage == Stage::Ship ||` bypass, so `devflow gate approve|reject` at a Ship gate with no waiter writes an answer. That bypass existed so `devflow ship` could apply the answer. 52-11 removed `devflow ship` and `stop`'s matching Ship case, so nothing consumes the stored answer now. The operator is told "no registered waiter will act" and named `devflow resume` / `devflow recover --clean`, so no message is false.
   **Why deferred:** about a dozen `commands.rs` and `stop_e2e.rs` tests seed generic gate-approve behaviour at a Ship gate with no waiter (for example `gate_approve_with_no_registered_waiter_does_not_claim_advance`, `gate_respond_answers_a_registered_waiter_and_refuses_when_none_is_registered`, the `gate_sweep_*` Ship cases). Re-seeding them is the `Stage::Ship` removal's work, not 52-11's.
   **Fix shape:** in 52-15 (the `Stage::Ship` variant removal) the bypass and the Ship-seeded tests go with the variant; re-seed the kept ones at Validate with a registered or absent waiter as their subject needs.
+
+- `GitFlow::commit_all` lost its only caller with the hooks (found in 52-12)
+  status: open
+  **What:** `crates/devflow-core/src/git.rs` `commit_all` was called only from the deleted `hooks.rs`. It now has no caller outside `git.rs`, beside the already-uncalled `branch_tip`, `delete_remote_branch`, `ensure_branch`, `feature_finish`, `release_start` and `release_finish` (measured with a per-name `rg -w` over `crates/` and `tools/` excluding `git.rs`).
+  **Why deferred:** all are `pub` in the published devflow-core, and git.rs was in 52-12's scope only for its `hooks::` comments.
+  **Fix shape:** in a devflow-core plan under the 4.0.0 bump (52-18's breaking-change check is the natural place), delete each one `rg` still shows uncalled, with its tests, and record the expected `function_missing` from `cargo semver-checks check-release -p devflow-core`.
+
+- Docs-site pages still describe the after-ship hooks (found in 52-12)
+  status: open
+  **What:** `docs/index.md` ("terminal hooks"), `docs/diagrams/system.md`, `docs/diagrams/module-map.md` (a `hooks` node), `docs/architecture/state-machine.md`, `docs/architecture/overview.md` and `docs/architecture/git-ship.md` still name the hooks module and the Validate→Ship and after-ship hook batches. 52-12 changed only the scoped docs doc_check reads.
+  **Fix shape:** 52-18 rewrites the docs site to the kept pipeline and deletes the whole-Ship pages; include these mentions there.
+
+- A finished run keeps `phase_validate_failures`, so the next `start` carries it (found in 52-12)
+  status: open
+  **What:** `State.phase_validate_failures` is reset only when the state file is removed or a human answers the ceiling gate. Before 52-08 the finish removed the state; since 52-08 `finish_run` keeps it (`finished: true`), and `commands::fresh_state_carrying_phase_failures` copies the total from any persisted state. 52-12 corrected the two doc comments (`state.rs`, `commands.rs`) that said phase completion resets it. Not reproduced end to end: read from source only.
+  **Fix shape:** decide in 52-25 (which makes `start` say what it replaces, D-35) whether a `start` over a finished state carries the total or starts at zero, and pin it with a test.
