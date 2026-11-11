@@ -2711,64 +2711,6 @@ fn rescan_gate_context(unapproved: &[&CheckpointDeclaration], mode: Mode) -> Str
     )
 }
 
-/// A re-scan rejection in Auto mode is not an ordinary retry. The declaration
-/// remains unapproved, so an unattended Code launch correctly refuses it;
-/// routing through `GateAction::LoopBack` would open another unattended gate
-/// with no answer. Persist the human-requested handoff before cleanup, so a
-/// subsequent `resume` is supervised and cannot race a stale response file.
-fn park_auto_rescan_repair(
-    project_root: &Path,
-    state: &mut State,
-    stage: Stage,
-    unapproved_files: &[String],
-) -> Result<(), CliError> {
-    debug_assert_eq!(state.mode, Mode::Auto);
-    let reason = format!(
-        "checkpoint re-scan rejected in Auto mode; phase switched to Supervise for its remaining \
-         stages and parked for repair of {}",
-        unapproved_files.join(", ")
-    );
-    commit(state, |s| {
-        s.mode = Mode::Supervise;
-        s.stopped = true;
-        s.gate_pending = false;
-        s.stop_reason = Some(match s.stop_reason.take() {
-            Some(existing) if !existing.is_empty() => format!("{existing}; {reason}"),
-            _ => reason,
-        });
-    })?;
-    close_gate(project_root, state.phase, stage)?;
-    events::emit(
-        project_root,
-        state.phase,
-        "checkpoint_repair_parked",
-        serde_json::json!({
-            "stage": stage.to_string(),
-            "from_mode": "auto",
-            "to_mode": "supervise",
-            "plan_files": unapproved_files,
-        }),
-    );
-    println!(
-        "checkpoint re-scan rejected in Auto mode; phase {} is now Supervise for its remaining \
-         stages and parked for repair. Review the changed plan, then run `devflow resume --phase {}`.",
-        state.phase, state.phase
-    );
-    Ok(())
-}
-
-/// The distinct plan files among `unapproved`, sorted — the actionable part of
-/// both the gate context and the fall-through reason.
-fn unapproved_plan_files(unapproved: &[&CheckpointDeclaration]) -> Vec<String> {
-    let mut files: Vec<String> = unapproved
-        .iter()
-        .map(|declaration| declaration.plan_file.clone())
-        .collect();
-    files.sort_unstable();
-    files.dedup();
-    files
-}
-
 /// The `CheckpointApproval` that records `current`'s human-only declarations.
 ///
 /// Shared by the re-scan gate's approval arm and `preflight`'s recording sites
@@ -3855,12 +3797,6 @@ pub(crate) fn advance_with(
                         let unapproved = state.checkpoint_approval.unapproved(&current);
                         if !unapproved.is_empty() {
                             let context = rescan_gate_context(&unapproved, state.mode);
-                            // The unapproved plan files, captured BEFORE the
-                            // gate: `unapproved` borrows `current`, and the
-                            // LoopBack arm needs these names after `&mut state`
-                            // has been handed to the gate.
-                            let unapproved_files = unapproved_plan_files(&unapproved);
-
                             let action = run_gate_with_timeout(
                                 project_root,
                                 &mut state,
@@ -3877,7 +3813,11 @@ pub(crate) fn advance_with(
                                 // — not the stale one the gate was opened about
                                 // — and persist it before relaunching, because
                                 // the next resume runs in a separate process.
-                                crate::pipeline_outcomes::Answer::Approve(_) => {
+                                crate::pipeline_outcomes::Answer::Approve(
+                                    crate::pipeline_outcomes::ApproveRoute::StatusLess(
+                                        crate::pipeline_outcomes::StatusLessStep::RecordCheckpointSet,
+                                    ),
+                                ) => {
                                     // CR-01: close the gate now. The approval
                                     // was bound to this gate's id and is spent.
                                     let _ = close_gate(project_root, phase, stage);
@@ -3897,48 +3837,23 @@ pub(crate) fn advance_with(
                                         "Supervise mode requires a human decision for the declared blocking-human checkpoint",
                                     ));
                                 }
-                                // T-48-15-03: a rejection records NOTHING.
-                                // Widening the set here would mean the next
-                                // resume proceeded as though the human had said
-                                // yes. In Auto, it also cannot use the generic
-                                // loop-back: a second unattended Code preflight
-                                // correctly refuses the still-unapproved human
-                                // checkpoint. Park it for the explicitly
-                                // requested supervised repair instead.
-                                crate::pipeline_outcomes::Answer::Reject { note } => {
-                                    // The rejection's note is the operator's word
-                                    // for the Code relaunch this repair leads to.
-                                    record_relaunch_note(&mut state, note)?;
-                                    if state.mode == Mode::Auto {
-                                        return park_auto_rescan_repair(
-                                            project_root,
-                                            &mut state,
-                                            stage,
-                                            &unapproved_files,
-                                        );
-                                    }
-                                    // Supervise may use the ordinary repair
-                                    // loop: its next Code run is not
-                                    // unattended. D-07: this rejection answered
-                                    // "approve the changed checkpoint set?". The
-                                    // stage-failure gate that follows asks a
-                                    // different question, where any non-abort
-                                    // answer relaunches the stage, so it opens
-                                    // under its own id and waits for its own
-                                    // answer.
-                                    reason = Some(augment_unresolved_checkpoint_reason(
-                                        reason,
-                                        &format!(
-                                            "checkpoint added or changed after Code preflight in {}",
-                                            unapproved_files.join(", ")
-                                        ),
-                                    ));
-                                }
                                 // The same abort every other gate uses, so
                                 // cleanup, state clearing and deregistration
                                 // all happen exactly once and identically.
                                 crate::pipeline_outcomes::Answer::Abort(note) => {
                                     return abort(project_root, &state, &note);
+                                }
+                                // T-48-15-03, D-39 (52-29): a reject is not an
+                                // answer to this gate and records nothing. The
+                                // answer screen refuses it before its claim and
+                                // reopens the gate, so no other route reaches
+                                // here.
+                                other => {
+                                    return Err(CliError::Message(format!(
+                                        "phase {phase}: the checkpoint gate's answer has no \
+                                         route here: {}",
+                                        other.resolved_fields()
+                                    )));
                                 }
                             }
                         } else if state.mode == Mode::Auto {
@@ -7761,175 +7676,22 @@ mod tests {
         assert_eq!(code_gates, 2, "re-scan plus human-decision gates must fire");
     }
 
-    /// An Auto-mode rejection cannot reuse the ordinary failure loop-back: the
-    /// next unattended Code preflight correctly refuses the still-unapproved
-    /// human-only checkpoint. Park the phase in Supervise before cleaning the
-    /// response. The bounded writer feeds an abort only if the pre-fix third
-    /// gate appears; its marker and the exact one-gate assertion below make
-    /// both directions observable rather than treating a short run as proof.
+    /// T-48-15-03, D-39 (52-29): rejecting the supervise re-scan gate is
+    /// refused before its claim. The gate reopens never-silently, still
+    /// labelled `checkpoint_declaration`, naming approve and abort and still
+    /// showing the objected-to plan file; `checkpoint_approval` is
+    /// byte-identical; no Code launch and no follow-on stage-failure gate. A
+    /// bounded writer aborts the reopened gate.
     #[test]
-    fn auto_rescan_rejection_parks_for_supervised_repair() {
+    fn rejecting_the_rescan_gate_is_refused_and_widens_nothing() {
         const NAME: &str =
-            "pipeline_launch::tests::auto_rescan_rejection_parks_for_supervised_repair";
-        const ROOT_ENV: &str = "DEVFLOW_PIPELINE_LAUNCH_AUTO_RESCAN_REJECT_ROOT";
-        let phase = PhaseId::new(113);
-
-        if !devflow_core::test_support::in_child_test(NAME) {
-            let dir = tempfile::tempdir().unwrap();
-            let root = dir.path();
-            build_rescan_fixture(
-                root,
-                phase,
-                &rescan_plan_body_rewritten(),
-                recorded_from_body(phase, &rescan_plan_body()),
-                Mode::Auto,
-            );
-            let path_dir = agent_free_dir_with_agent_stub("claude");
-            let output = crate::test_support::run_hermetic_test_in_child(
-                NAME,
-                path_dir.path(),
-                &[(ROOT_ENV, root.as_os_str())],
-            );
-            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
-            return;
-        }
-
-        let root = PathBuf::from(
-            std::env::var_os(ROOT_ENV)
-                .expect("child test must receive its parent-built fixture root"),
-        );
-        let root = root.as_path();
-        let before = workflow::load_state(root, phase)
-            .unwrap()
-            .checkpoint_approval;
-        preanswer_gate_response(
-            root,
-            phase,
-            Stage::Code,
-            &gate_response(false, Some("the rewritten task needs supervised repair")),
-        );
-
-        let writer_root = root.to_path_buf();
-        let third_gate_response_written =
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let writer_third_gate_response_written =
-            std::sync::Arc::clone(&third_gate_response_written);
-        let writer = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            loop {
-                // Check the response before the state. The park saves
-                // `stopped` before it removes the response, so a response the
-                // park removed is always seen with `stopped` set. Reading the
-                // state first let a whole park land between the two reads.
-                // The pre-answer is read before the answer files because the
-                // gate publishes the answer before it removes the pre-answer.
-                let response_gone = !Gates::preanswer_path(&writer_root, phase, Stage::Code)
-                    .exists()
-                    && gate_answer_files(&writer_root, phase, Stage::Code).is_empty();
-                let state = workflow::load_state(&writer_root, phase);
-                if state.as_ref().is_ok_and(|state| state.stopped) {
-                    return;
-                }
-                if response_gone
-                    && answer_open_gate(&writer_root, phase, Stage::Code, &abort_response("abort"))
-                        .is_ok()
-                {
-                    writer_third_gate_response_written
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                    return;
-                }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "the re-scan response was not consumed"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-        });
-
-        advance_for_stage(root, Some(phase), Some(Stage::Code)).unwrap();
-        writer.join().expect("third-gate negative-control writer");
-
-        let after = workflow::load_state(root, phase)
-            .expect("Auto rejection must park the phase instead of aborting it");
-        assert_eq!(after.mode, Mode::Supervise);
-        assert!(after.stopped, "the automatic run must be parked");
-        assert!(
-            after
-                .stop_reason
-                .as_deref()
-                .is_some_and(|reason| reason.contains("switched to Supervise")),
-            "the parked reason must explain why Auto did not retry: {:?}",
-            after.stop_reason
-        );
-        assert_eq!(
-            after.checkpoint_approval, before,
-            "a rejection must not bless the changed declaration"
-        );
-        let parked_code_gates = events_of_kind(root, "gate_fired")
-            .into_iter()
-            .filter(|event| event["stage"] == "code")
-            .count();
-        assert_eq!(
-            parked_code_gates, 1,
-            "only the re-scan gate may fire before supervised resume; a second gate is the \
-             pre-fix unattended loopback, not a successful park"
-        );
-        assert!(
-            !third_gate_response_written.load(std::sync::atomic::Ordering::SeqCst),
-            "the negative-control writer must stay inert unless the old third gate appears"
-        );
-        assert!(
-            events_of_kind(root, "checkpoint_auto_decided").is_empty(),
-            "a rejection must never relaunch Claude's checkpoint decision"
-        );
-        assert_eq!(events_of_kind(root, "checkpoint_repair_parked").len(), 1);
-        assert!(
-            !Gates::gate_path(root, phase, Stage::Code).exists()
-                && gate_answer_files(root, phase, Stage::Code).is_empty()
-                && gate_claim_files(root, phase, Stage::Code).is_empty(),
-            "parking must leave no stale gate protocol files"
-        );
-
-        resume(root, phase, None)
-            .expect("the parked phase must resume through the supervised path");
-        let resumed = workflow::load_state(root, phase)
-            .expect("Supervise resume must leave a live state for its monitor");
-        let _reap_guard = ReapMonitorOnDrop::after_launch(&resumed);
-        assert_eq!(resumed.mode, Mode::Supervise);
-        assert_eq!(
-            resumed.checkpoint_approval, before,
-            "a supervised repair launch must not reinterpret the rejected declaration as approved"
-        );
-        assert!(
-            !resumed.stopped,
-            "resume clears the park only after launching the supervised continuation"
-        );
-        assert!(
-            events_of_kind(root, "stage_launched")
-                .iter()
-                .any(|event| event["stage"] == "code"),
-            "resume must actually launch the parked Code stage"
-        );
-    }
-
-    /// D-07 (V-22) and 48-15 Task 1 / T-48-15-03. A non-abort rejection must record
-    /// NOTHING: widening the approved set on a rejection is the repudiation path. It
-    /// also no longer answers the stage-failure gate that follows. That gate asks a
-    /// different question ("stage failed: retry, loop to Code, or abort?") where any
-    /// non-abort answer relaunches the stage, so it opens with its own id and waits;
-    /// its short timeout is what ends this test. The plan file the operator objected
-    /// to has to appear in what that gate shows them.
-    #[test]
-    fn rejecting_the_rescan_gate_leaves_the_follow_on_gate_waiting_for_its_own_answer() {
-        const NAME: &str = "pipeline_launch::tests::rejecting_the_rescan_gate_leaves_the_follow_on_gate_waiting_for_its_own_answer";
+            "pipeline_launch::tests::rejecting_the_rescan_gate_is_refused_and_widens_nothing";
         const ROOT_ENV: &str = "DEVFLOW_PIPELINE_LAUNCH_RESCAN_REJECT_ROOT";
         let phase = PhaseId::new(102);
 
         if !devflow_core::test_support::in_child_test(NAME) {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path();
-            // Supervise: D-07's route. Auto parks for repair instead
-            // (`park_auto_rescan_repair`), with no follow-on gate.
             build_rescan_fixture(
                 root,
                 phase,
@@ -7943,7 +7705,7 @@ mod tests {
                 path_dir.path(),
                 &[
                     (ROOT_ENV, root.as_os_str()),
-                    ("DEVFLOW_GATE_TIMEOUT_SECS", std::ffi::OsStr::new("1")),
+                    ("DEVFLOW_GATE_TIMEOUT_SECS", std::ffi::OsStr::new("20")),
                 ],
             );
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
@@ -7955,96 +7717,103 @@ mod tests {
                 .expect("child test must receive its parent-built fixture root"),
         );
         let root = root.as_path();
+        let before = serde_json::to_string(
+            &workflow::load_state(root, phase)
+                .unwrap()
+                .checkpoint_approval,
+        )
+        .unwrap();
 
-        let before = workflow::load_state(root, phase)
-            .unwrap()
-            .checkpoint_approval;
-
-        // Not approved and not an abort: `GateAction::from_response` maps that
-        // to LoopBack, the "I will fix the plan" answer.
-        preanswer_gate_response(
-            root,
-            phase,
-            Stage::Code,
-            &gate_response(false, Some("the rewritten task needs review first")),
-        );
-
+        let writer_root = root.to_path_buf();
+        let writer = std::thread::spawn(move || {
+            let gate_path = Gates::gate_path(&writer_root, phase, Stage::Code);
+            let mut seen: Vec<(serde_json::Value, State)> = Vec::new();
+            for answer in [
+                gate_response(false, Some("the rewritten task needs review first")),
+                devflow_core::gates::GateResponse {
+                    approved: false,
+                    abort: true,
+                    note: Some("test cleanup".into()),
+                    responded_by: Some("test".into()),
+                },
+            ] {
+                let started = std::time::Instant::now();
+                let gate = loop {
+                    let gate = std::fs::read_to_string(&gate_path)
+                        .ok()
+                        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+                    if let Some(gate) = gate
+                        && seen
+                            .last()
+                            .is_none_or(|(last, _)| last["gate_id"] != gate["gate_id"])
+                    {
+                        break gate;
+                    }
+                    assert!(
+                        started.elapsed() < Duration::from_secs(30),
+                        "gate {} did not open",
+                        seen.len() + 1
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                };
+                let at_gate = workflow::load_state(&writer_root, phase).unwrap();
+                answer_open_gate(&writer_root, phase, Stage::Code, &answer).unwrap();
+                seen.push((gate, at_gate));
+            }
+            seen
+        });
         let result = advance_for_stage(root, Some(phase), Some(Stage::Code));
-        let reloaded = workflow::load_state(root, phase).ok();
-        let _reap_guard = reloaded.as_ref().map(ReapMonitorOnDrop::after_launch);
-
-        // One answer decided one gate.
-        let resolved = events_of_kind(root, "gate_resolved");
-        assert_eq!(
-            resolved.len(),
-            1,
-            "the rejection decides the re-scan gate and nothing else: {resolved:?}"
-        );
-        assert_eq!(resolved[0]["action"], "loop_back");
-        let err = result.expect_err("the follow-on gate has no answer, so its wait times out");
+        let gates = writer.join().expect("the bounded writer");
         assert!(
-            err.to_string().contains("timed out awaiting a response"),
-            "{err}"
+            result.is_ok(),
+            "the abort of the reopened gate ends the run: {result:?}"
         );
-        assert_eq!(events_of_kind(root, "gate_timeout").len(), 1);
 
-        // The follow-on gate is its own gate, waiting.
-        let follow_on = live_gate_id(root, phase, Stage::Code);
-        assert_ne!(
-            resolved[0]["gate_id"],
-            follow_on.as_str(),
-            "the follow-on gate opens with its own id"
-        );
+        let refused = events_of_kind(root, "gate_answer_refused");
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(refused[0]["gate_kind"], "checkpoint_declaration");
+        assert_eq!(refused[0]["answer"], "reject");
+        let (reopened, at_reopened) = &gates[1];
         assert_eq!(
-            Gates::read_answer(root, phase, Stage::Code, &follow_on),
-            devflow_core::gates::AnswerRead::None,
-            "no answer is bound to the follow-on gate"
+            reopened["gate_kind"], "checkpoint_declaration",
+            "{reopened}"
+        );
+        let context = reopened["context"].as_str().unwrap_or_default();
+        assert!(
+            context.starts_with("[never-silent]")
+                && context.contains("devflow gate approve")
+                && context.contains("devflow gate abort"),
+            "the reopened gate names approve and abort: {context}"
+        );
+        let plan_file = rescan_plan_file_name(phase);
+        assert!(
+            context.contains(&plan_file),
+            "the reopened gate still shows `{plan_file}`: {context}"
+        );
+        assert!(at_reopened.gate_pending, "gate_pending stays set");
+        assert_eq!(
+            serde_json::to_string(&at_reopened.checkpoint_approval).unwrap(),
+            before,
+            "a refused reject leaves the approved set exactly as it was"
+        );
+        let first_id = GateId::parse(gates[0].0["gate_id"].as_str().unwrap()).unwrap();
+        assert!(
+            !Gates::claim_path(root, phase, Stage::Code, &first_id).exists(),
+            "the refused reject was never claimed"
         );
         assert_eq!(
             stage_launched_count(root, phase),
             0,
             "nothing relaunches on the plan the operator just rejected"
         );
-
-        let after = workflow::load_state(root, phase)
-            .unwrap()
-            .checkpoint_approval;
         assert_eq!(
-            after, before,
-            "a rejection must leave the approved set exactly as it was"
+            events_of_kind(root, "gate_fired").len(),
+            2,
+            "the re-scan gate and its reopening, no follow-on stage-failure gate"
         );
         assert!(
             events_of_kind(root, "checkpoint_auto_decided").is_empty(),
             "a rejection must never reach the relaunch path"
-        );
-
-        // A rejection must REACH the existing non-auto-decide dispatch, not stop at the
-        // re-scan gate. `handle_stage_failure` is the only thing that emits a
-        // `[never-silent]` context, and the augmented reason it renders must name the
-        // plan file the human objected to: that gate is where they will actually read
-        // it.
-        //
-        // Asserting on the never-silent context specifically, NOT merely on "some gate
-        // mentions the plan file": the re-scan gate's own context already names it, so
-        // the weaker assertion would measure nothing.
-        let plan_file = rescan_plan_file_name(phase);
-        let gate_contexts: Vec<String> = events_of_kind(root, "gate_fired")
-            .iter()
-            .filter_map(|event| event["context"].as_str().map(str::to_string))
-            .collect();
-        assert!(
-            gate_contexts.iter().any(|context| {
-                context.contains("[never-silent]")
-                    && context.contains("could not auto-resolve")
-                    && context.contains(&plan_file)
-            }),
-            "the follow-on gate must name `{plan_file}` in an augmented \
-             unresolved-checkpoint reason; contexts were {gate_contexts:?}"
-        );
-        assert_eq!(
-            gate_contexts.len(),
-            2,
-            "the re-scan gate and the follow-on gate: {gate_contexts:?}"
         );
     }
 

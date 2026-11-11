@@ -676,6 +676,12 @@ fn code_policy_applies_to_fix_arm(fix: Option<FixType>) -> bool {
     }
 }
 
+/// The quick pass's lead (GATE-02, D-10), shared by both renderers: the
+/// operator rejected a verification gate and asked for a small fix, not
+/// another pass over the whole phase.
+const QUICK_FIX_LEAD: &str = "The operator rejected the Validate result and asked for a small \
+fix, not another pass over the whole phase.";
+
 /// The re-verify pass's lead (D-32 part 1), shared by both renderers so they
 /// cannot drift: GSD's status, route and next action quoted verbatim (the next
 /// action with control characters other than newline and tab removed, as an
@@ -735,7 +741,12 @@ fn workflow_code_prompt(
             must be preserved verbatim.",
             reverify_lead(reverify_report)
         ),
-        Some(FixType::FullExecute | FixType::Quick) | None => format!(
+        Some(FixType::Quick) => format!(
+            "{QUICK_FIX_LEAD} Run it with GSD's quick task (`/gsd-quick`): read and follow \
+            the GSD workflow file at {workflow_root}/quick.md, with the operator's note below \
+            as the task. Do not run the whole phase."
+        ),
+        Some(FixType::FullExecute) | None => format!(
             "Read and follow the GSD workflow file at {workflow_root}/execute-phase.md for \
             phase {phase} --auto. The `--auto` flag is part of the workflow invocation and \
             must be preserved verbatim."
@@ -854,7 +865,11 @@ fn fix_prompt_with_notes(
             "{}\n\nRun the re-verify command for this loop:",
             reverify_lead(reverify_report)
         ),
-        FixType::GapsOnly | FixType::FullExecute | FixType::Quick => {
+        FixType::Quick => format!(
+            "{QUICK_FIX_LEAD} Run it with GSD's quick command, with the operator's note below \
+             as the task:"
+        ),
+        FixType::GapsOnly | FixType::FullExecute => {
             "Validation reported issues. Run the fix command for this loop:".to_string()
         }
     };
@@ -862,9 +877,12 @@ fn fix_prompt_with_notes(
         FixType::GapsOnly => {
             format!("/gsd-execute-phase {phase} --gaps-only {AUTO_CHAIN_PRESERVING_FLAG}")
         }
-        FixType::FullExecute | FixType::StaleReverify | FixType::Quick => {
+        FixType::FullExecute | FixType::StaleReverify => {
             format!("/gsd-execute-phase {phase} {AUTO_CHAIN_PRESERVING_FLAG}")
         }
+        // `/gsd-quick` never reaches execute-phase's sync-clear step, so it
+        // carries no chain-flag token.
+        FixType::Quick => "/gsd-quick".to_string(),
     };
     // Signature bridge: the helper takes `Option<FixType>`, where `None` means
     // the first Code pass, and a loop-back always has a fix type, so the bridge
