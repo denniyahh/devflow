@@ -232,7 +232,7 @@ fn config_key_alone_is_persisted_in_the_run_state() {
     // follows the stubs, as in `supervisor_e2e.rs`.
     let host_path = std::env::var_os("PATH").unwrap_or_default();
     let path = format!("{}:{}", fake.path.display(), host_path.to_string_lossy());
-    let output = run_start(&home, &root, phase, &path, &["--until", "define"]);
+    let output = run_start(&home, &root, phase, &path, &["--until", "plan"]);
 
     assert_success(&output, "a key-only start");
     assert!(

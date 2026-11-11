@@ -2,7 +2,7 @@
 //! Claude → Antigravity at the Code stage (Phase 51, SUPV-02, D-11), through
 //! the real `devflow` binary.
 //!
-//! `devflow start --mode auto --until code` drives Define, Plan and Code under
+//! `devflow start --mode auto --until code` drives Plan and Code under
 //! a stub `claude` on the stream shape. The stub is rate-limited on its Code
 //! turn; the supervisor hands the stage to a stub `agy`, which must pass its
 //! OWN delivery canary inside the supervisor before its stage turn runs. A
@@ -17,7 +17,7 @@
 //! What these tests do not establish: the stubs' event shapes are copied from
 //! DevFlow's own tests, not from a live Claude or Antigravity CLI; the Claude
 //! stub exits after its rate-limit event, so the stream path's idle-timeout
-//! route is not exercised; the Define and Plan turns only print success.
+//! route is not exercised; the Plan turn only commits a stub plan and prints success.
 
 mod common;
 
@@ -30,7 +30,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// The bound on one whole run: Define, Plan, Code and the handoff.
+/// The bound on one whole run: Plan, Code and the handoff.
 const RUN_WAIT: Duration = Duration::from_secs(120);
 
 /// The Claude stream `init` event, copied from `V3_INIT_EVENT` in
@@ -188,7 +188,7 @@ fn write_executable(path: &Path, contents: &str) {
 }
 
 /// A repository on `develop` with a roadmap entry for `phase` and the
-/// `.planning/config.json` auto mode's unattended check reads at Define and
+/// `.planning/config.json` auto mode's unattended check reads at Plan and
 /// Code (`preflight::unattended_config_condition`).
 fn init_repo(root: &Path, phase: PhaseId) {
     git(root, &["init", "-q"]);
@@ -474,8 +474,8 @@ fn a_rate_limited_claude_run_in_auto_mode_hands_off_to_antigravity_and_completes
 
     assert_eq!(
         rig.invocations("claude"),
-        ["canary", "stage define", "stage plan", "stage code"],
-        "Claude ran its canary, then Define, Plan and Code"
+        ["canary", "stage plan", "stage code"],
+        "Claude ran its canary, then Plan and Code"
     );
     assert_eq!(
         rig.invocations("agy"),
@@ -808,14 +808,7 @@ fn after_the_refused_relaunch_status_and_resume_lead_to_another_agent() {
     assert_eq!(handoffs[1]["reason"], "resume --agent", "{}", handoffs[1]);
     assert_eq!(
         rig.invocations("claude"),
-        [
-            "canary",
-            "stage define",
-            "stage plan",
-            "stage code",
-            "canary",
-            "stage code"
-        ],
+        ["canary", "stage plan", "stage code", "canary", "stage code"],
         "Claude ran its own canary again, then relaunched Code"
     );
     let state = rig.state();

@@ -683,10 +683,11 @@ impl FromStr for AgentKind {
 pub struct AgentParseError(String);
 
 impl State {
-    /// Create a new state for starting a phase at the [`Stage::Define`] stage.
+    /// Create a new state for starting a phase at the [`Stage::Plan`] stage, the first stage
+    /// a run launches.
     pub fn new(phase: PhaseId, agent: AgentKind, mode: Mode, project_root: PathBuf) -> Self {
         State {
-            stage: Stage::Define,
+            stage: Stage::Plan,
             phase,
             agent,
             mode,

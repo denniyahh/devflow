@@ -400,12 +400,13 @@ fn start_no_worktree_uses_feature_branch() {
 }
 
 /// 20c (D-09 + review: Codex HIGH off-by-one): `devflow start --until plan`
-/// must run Define AND Plan to completion, then halt BEFORE advancing to
-/// Code — not stop before Plan ever runs. The fake `claude` script always
-/// reports success, so the monitor chain runs Define→advance→Plan→advance;
-/// the second `advance` calls `transition(.., Stage::Code)` with
-/// `state.stage == Plan`, which is exactly the `stop_until == Some(from)`
-/// case this plan adds.
+/// must run Plan, the first stage, to completion, then halt BEFORE advancing
+/// to Code — not stop before Plan ever runs. The fake agent always reports
+/// success, so the monitor chain runs Plan→advance; that `advance` calls
+/// `transition(.., Stage::Code)` with `state.stage == Plan`, which is exactly
+/// the `stop_until == Some(from)` case this plan adds. A fresh run already
+/// sits at Plan, so the persisted stage alone cannot show Plan ran: the
+/// `stage_launched` event for Plan does.
 #[test]
 fn start_until_plan_halts_cleanly() {
     let home = common::HermeticHome::new();
@@ -443,6 +444,13 @@ fn start_until_plan_halts_cleanly() {
     let _reaper = common::LaunchedRunReaper::new(root, PhaseId::new(44), Vec::new());
 
     let state = wait_for_stopped(root, PhaseId::new(44));
+    let events = fs::read_to_string(devflow_core::events::events_path(root)).unwrap_or_default();
+    assert!(
+        events
+            .lines()
+            .any(|line| line.contains("\"stage_launched\"") && line.contains("\"stage\":\"plan\"")),
+        "Plan must have launched before the halt\nevents:\n{events}"
+    );
     assert_eq!(
         state.stage,
         devflow_core::stage::Stage::Plan,
@@ -1434,10 +1442,9 @@ fn wait_for_gate(root: &Path, phase: PhaseId) -> devflow_core::state::State {
 }
 
 /// A Pi run that exits 0 without emitting a DEVFLOW_RESULT marker must not
-/// advance a commit-gated stage. Define (not commit-gated) legitimately
-/// advances on exit 0, but Plan — a commit-gated stage — runs the same
-/// marker-less stub, which produces no commits and no marker, so it is
-/// `Failed` and gates instead of advancing to Code.
+/// advance a commit-gated stage. Plan, the first stage and commit-gated,
+/// runs the marker-less stub, which produces no commits and no marker, so it
+/// is `Failed` and gates instead of advancing to Code.
 #[test]
 fn pi_marker_less_run_does_not_advance() {
     let home = common::HermeticHome::new();
@@ -1501,7 +1508,7 @@ fn pi_nonzero_exit_does_not_advance() {
     let state = wait_for_gate(root, PhaseId::new(7));
     assert_eq!(
         state.stage,
-        Stage::Define,
+        Stage::Plan,
         "a non-zero-exit run must not advance its stage"
     );
     assert!(state.gate_pending, "the never-silent gate must have fired");
@@ -1552,7 +1559,7 @@ fn pi_hung_process_is_detected_not_left_running() {
     let state = load_state(root, PhaseId::new(7)).expect("load state");
     assert_eq!(
         state.stage,
-        Stage::Define,
+        Stage::Plan,
         "the stage must not advance while pi is hung"
     );
 
@@ -1568,7 +1575,7 @@ fn pi_hung_process_is_detected_not_left_running() {
     let gated = wait_for_gate(root, PhaseId::new(7));
     assert_eq!(
         gated.stage,
-        Stage::Define,
+        Stage::Plan,
         "a hung-then-killed run must not advance its stage"
     );
     let _reap = MonitorReapGuard::after_launch(&gated);
@@ -2040,7 +2047,7 @@ fn hermes_nonzero_exit_does_not_advance() {
     let state = wait_for_gate(root, PhaseId::new(7));
     assert_eq!(
         state.stage,
-        Stage::Define,
+        Stage::Plan,
         "a non-zero-exit hermes run must not advance its stage"
     );
     assert!(state.gate_pending, "the never-silent gate must have fired");
@@ -2088,7 +2095,7 @@ fn hermes_hung_process_is_detected_not_left_running() {
     let state = load_state(root, PhaseId::new(7)).expect("load state");
     assert_eq!(
         state.stage,
-        Stage::Define,
+        Stage::Plan,
         "the stage must not advance while hermes is hung"
     );
 
@@ -2103,7 +2110,7 @@ fn hermes_hung_process_is_detected_not_left_running() {
     let gated = wait_for_gate(root, PhaseId::new(7));
     assert_eq!(
         gated.stage,
-        Stage::Define,
+        Stage::Plan,
         "a hung-then-killed hermes run must not advance its stage"
     );
     let _reap = MonitorReapGuard::after_launch(&gated);

@@ -210,7 +210,7 @@ fn start_clears_leftover_gate_files_after_reserving() {
     init_repo(root, phase);
     let fake_bin = fake_codex("sleep 60");
     // A legacy unkeyed answer: the one form no gate id can keep from a new gate.
-    let response_path = Gates::dir(root).join(format!("{}-define.response.json", phase.padded()));
+    let response_path = Gates::dir(root).join(format!("{}-plan.response.json", phase.padded()));
     fs::create_dir_all(response_path.parent().unwrap()).unwrap();
     let planted = serde_json::to_vec(&GateResponse {
         approved: false,
@@ -227,11 +227,11 @@ fn start_clears_leftover_gate_files_after_reserving() {
         .expect("spawn devflow start");
     common::wait_for(
         || {
-            Gates::gate_path(root, phase, Stage::Define).exists()
+            Gates::gate_path(root, phase, Stage::Plan).exists()
                 || process.try_wait().expect("poll start child").is_some()
         },
         Duration::from_secs(10),
-        "Define gate or start exit",
+        "Plan gate or start exit",
     );
     std::thread::sleep(Duration::from_secs(3));
     assert!(
@@ -241,7 +241,7 @@ fn start_clears_leftover_gate_files_after_reserving() {
     assert!(
         root.join(format!(".devflow/state-{}.json", phase.padded()))
             .exists(),
-        "a fresh start parked at Define must keep state"
+        "a fresh start parked at Plan must keep state"
     );
     let events = fs::read_to_string(devflow_core::events::events_path(root)).unwrap_or_default();
     assert!(
@@ -527,6 +527,7 @@ struct PlantedGate {
 /// supervisor launches one with [`LiveRun::launch`].
 fn plant_leftover_run(root: &Path, phase: PhaseId, agent_pid: Option<u32>) -> PlantedGate {
     let mut state = State::new(phase, AgentKind::Codex, Mode::Auto, root.to_path_buf());
+    state.verification_baseline_captured = true;
     state.stage = Stage::Code;
     devflow_core::workflow::save_state(&state).expect("plant leftover state");
     if let Some(pid) = agent_pid {
@@ -996,6 +997,7 @@ fn events_contain(root: &Path, event: &str) -> bool {
 /// (50-15).
 fn plant_resumable_run(root: &Path, phase: PhaseId, agent_pid: Option<u32>, stopped: bool) {
     let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
+    state.verification_baseline_captured = true;
     state.stage = Stage::Code;
     state.stopped = stopped;
     state.stop_reason =

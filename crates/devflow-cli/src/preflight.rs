@@ -627,10 +627,10 @@ pub(crate) fn ensure_base_ref_current(project_root: &Path, base: &str) -> Result
 
 /// The driver-driven interactivity gate (999.106): whether `stage` can run
 /// headless is declared by the driver's `interactivity_mode`, not a hardcoded
-/// `agent == Codex` check. `RequiresExistingArtifact` gates **Define only**
-/// (CONTEXT.md must already be on develop in auto mode — a pre-existing input);
-/// Plan is deliberately un-gated because PLAN.md is an *output* the phase
-/// itself produces. `HeadlessSafe` is never refused; `RequiresTypedSubagents`
+/// `agent == Codex` check. `RequiresExistingArtifact` gates **the first stage
+/// only**, Plan (CONTEXT.md must already be on develop in auto mode — a
+/// pre-existing input, since no stage runs the discussion); no PLAN.md is
+/// required, because PLAN.md is an *output* the phase itself produces. `HeadlessSafe` is never refused; `RequiresTypedSubagents`
 /// / `InteractiveOnly` have no headless path at all. Routes the failure
 /// through the preflight gate (D-15) rather than a hard error.
 pub(crate) fn preflight_interactivity_check(
@@ -662,7 +662,7 @@ pub(crate) fn preflight_interactivity_check(
                     .unwrap_or_else(|_| devflow_core::config::DEVELOP.to_string())
             });
             if state.mode == Mode::Auto
-                && state.stage == Stage::Define
+                && state.stage == Stage::Plan
                 && !phase_artifact_on_base(project_root, state.phase, "-CONTEXT.md", &base)
             {
                 return Err(format!(
@@ -695,7 +695,7 @@ pub(crate) fn preflight_interactivity_check(
 
 /// The four states one unattended-launch prerequisite can be in.
 ///
-/// The fourth variant is not a nicety (F-12, C3): at Define a phase genuinely
+/// The fourth variant is not a nicety (F-12, C3): at Plan a phase genuinely
 /// has no plans yet, and folding that into [`Self::Undetermined`] would refuse
 /// every unattended launch ever started.
 ///
@@ -746,15 +746,15 @@ impl ConditionState {
     }
 }
 
-/// D-07: whether the unattended-launch check applies to `stage` — `Define` and
+/// D-07: whether the unattended-launch check applies to `stage` — `Plan` and
 /// `Code`, split out as its own pure predicate so "does not run for a
 /// non-applicable stage" is unit-testable with no fixture at all.
 ///
-/// `Define` is the earliest stage `devflow start` launches, so a refusal there
+/// `Plan` is the earliest stage `devflow start` launches, so a refusal there
 /// costs zero agent time. `Code` is where C3 first becomes determinable and
 /// where the mechanism is actually used.
 fn unattended_launch_check_applies(stage: Stage) -> bool {
-    matches!(stage, Stage::Define | Stage::Code)
+    matches!(stage, Stage::Plan | Stage::Code)
 }
 
 /// C1: the GSD config at the launch root exists, parses, and can hold the flag.
@@ -917,13 +917,13 @@ pub(crate) fn print_fallback_notice(fallback: AgentKind, agent: AgentKind) {
 /// phase builds.
 ///
 /// "No plans yet" is deliberately read differently at the two applicable
-/// stages: pending at Define (the phase is not planned yet — normal), and
+/// stages: pending at Plan (the phase is not planned yet — normal), and
 /// undetermined at Code (plans should exist by then, and their absence is an
 /// anomaly, not a pass).
 fn unattended_planned_checkpoint_condition(launch_root: &Path, state: &State) -> ConditionState {
     if verify::phase_plan_files(launch_root, state.phase).is_empty() {
         let reason = "the phase has no plan files yet".to_string();
-        return if state.stage == Stage::Define {
+        return if state.stage == Stage::Plan {
             ConditionState::NotYetApplicable(format!("{reason} — re-evaluated at Code"))
         } else {
             ConditionState::Undetermined(format!("{reason}, but Code expects them"))
@@ -977,7 +977,7 @@ fn unattended_planned_checkpoint_condition(launch_root: &Path, state: &State) ->
 /// **Where the report is actually seen (F-16).** [`run_preflight`] runs from
 /// `launch_stage`, which runs in the operator's own `devflow start` process for
 /// the FIRST stage and in the detached `__monitor` process for every later one.
-/// The Define-stage report therefore prints to the operator's TERMINAL — which
+/// The Plan-stage report therefore prints to the operator's TERMINAL — which
 /// is what makes D-08's rehearsal useful — and the Code-stage report prints to
 /// the MONITOR LOG. Nobody should later "fix" a report they could not find.
 ///
@@ -1109,7 +1109,7 @@ pub(crate) fn generic_preflight_checks(project_root: &Path, state: &State) -> Re
     // defaulted to, so `truncate_reason`'s 300-character cap cannot elide it.
     //
     // The one check it CAN co-occur with is interactivity (Codex, Auto,
-    // Define), and it outranks that deliberately: interactivity reports a
+    // Plan), and it outranks that deliberately: interactivity reports a
     // symptom this check's C2 also reports, with more actionable detail and a
     // per-condition breakdown. Losing the shorter, more-redundant reason to
     // truncation costs less than losing this one.
@@ -1374,13 +1374,14 @@ mod tests {
     // -----------------------------------------------------------------
 
     /// D-14/999.106 interactivity check: the gate is driver-driven — Codex
-    /// declares Define `RequiresExistingArtifact`, so a headless Auto-mode
-    /// Codex Define run without CONTEXT.md on develop is flagged. Supervise
-    /// mode, a non-Define stage (Plan is un-gated — PLAN.md is an output), a
-    /// non-Codex agent (Claude declares HeadlessSafe), and a CONTEXT.md that
-    /// does exist are all unaffected.
+    /// declares Plan `RequiresExistingArtifact`, so a headless Auto-mode
+    /// Codex Plan run (the first stage) without CONTEXT.md on develop is
+    /// flagged. Supervise mode, a stage that is not the first one (Define,
+    /// which Codex also declares `RequiresExistingArtifact` but no run
+    /// starts at), a non-Codex agent (Claude declares HeadlessSafe), and a
+    /// CONTEXT.md that does exist are all unaffected.
     #[test]
-    fn preflight_interactivity_check_flags_auto_define_without_context_md() {
+    fn preflight_interactivity_check_flags_auto_plan_without_context_md() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
@@ -1391,21 +1392,24 @@ mod tests {
             Mode::Auto,
             root.to_path_buf(),
         );
-        state.stage = Stage::Define;
+        state.stage = Stage::Plan;
         assert!(preflight_interactivity_check(root, &state).is_err());
 
         state.mode = Mode::Supervise;
         assert!(preflight_interactivity_check(root, &state).is_ok());
 
         state.mode = Mode::Auto;
-        state.stage = Stage::Plan;
-        assert!(preflight_interactivity_check(root, &state).is_ok());
-
         state.stage = Stage::Define;
+        assert!(
+            preflight_interactivity_check(root, &state).is_ok(),
+            "only the first stage, Plan, needs CONTEXT.md on the base"
+        );
+
+        state.stage = Stage::Plan;
         state.agent = AgentKind::Claude;
         assert!(
             preflight_interactivity_check(root, &state).is_ok(),
-            "Claude declares Define HeadlessSafe — not flagged"
+            "Claude declares Plan HeadlessSafe — not flagged"
         );
         state.agent = AgentKind::Codex;
 
@@ -1425,7 +1429,7 @@ mod tests {
         git(&["add", "-A"]);
         git(&["commit", "-q", "-m", "context"]);
 
-        state.stage = Stage::Define;
+        state.stage = Stage::Plan;
         assert!(preflight_interactivity_check(root, &state).is_ok());
     }
 
@@ -1480,7 +1484,7 @@ mod tests {
             Mode::Auto,
             root.to_path_buf(),
         );
-        state.stage = Stage::Define;
+        state.stage = Stage::Plan;
 
         // NEGATIVE CONTROL, asserted FIRST so the positive case cannot be
         // satisfied by a check that passes unconditionally: with nothing
@@ -1532,13 +1536,13 @@ mod tests {
 
         let phase = PhaseId::new(61);
         let mut state = State::new(phase, AgentKind::Codex, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Define;
+        state.stage = Stage::Plan;
         workflow::save_state(&state).unwrap();
 
         preanswer_gate(
             root,
             phase,
-            Stage::Define,
+            Stage::Plan,
             &serde_json::from_str(
                 r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
             )
@@ -1576,16 +1580,16 @@ mod tests {
         let root = dir.path();
 
         let phase = PhaseId::new(62);
-        // Plan is unaffected by the interactivity/gh-auth generic checks, so
+        // Validate is unaffected by the interactivity/unattended generic checks, so
         // only the adapter hook can be the source of this failure.
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Plan;
+        state.stage = Stage::Validate;
         workflow::save_state(&state).unwrap();
 
         preanswer_gate(
             root,
             phase,
-            Stage::Plan,
+            Stage::Validate,
             &serde_json::from_str(
                 r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
             )
@@ -1629,13 +1633,13 @@ mod tests {
 
         let phase = PhaseId::new(63);
         let mut state = State::new(phase, AgentKind::Codex, Mode::Auto, root.to_path_buf());
-        // Plan is unaffected by the interactivity/gh-auth generic checks
+        // Validate is unaffected by the interactivity/unattended generic checks
         // (D-14) — only the injected adapter's `preflight` fails; the real
         // Codex adapter's default (Ok) preflight passes every other check.
-        state.stage = Stage::Plan;
+        state.stage = Stage::Validate;
         // Codex, a capture-shape agent: the subject is the launch COUNT
         // through the Advance arm (CR-01's double-launch defect), not which
-        // launch path is taken, and a Claude launch at Plan would take the
+        // launch path is taken, and a Claude launch at Validate would take the
         // stream path, where `canary_gate` invokes the real
         // `ClaudeCanaryLauncher`. The `launches == 1` and
         // `supervisor.is_some()` assertions below are untouched, so a launch
@@ -1645,7 +1649,7 @@ mod tests {
         preanswer_gate(
             root,
             phase,
-            Stage::Plan,
+            Stage::Validate,
             &serde_json::from_str(r#"{"approved":true,"responded_by":"test"}"#).unwrap(),
         );
 
@@ -1709,7 +1713,7 @@ mod tests {
 
         let phase = PhaseId::new(64);
         let mut state = State::new(phase, AgentKind::Codex, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Plan;
+        state.stage = Stage::Validate;
         // Codex, for the Advance arm's sibling's reason: the subject is the
         // launch COUNT through the LoopBack arm, not which launch path is
         // taken, and the `launches == 1` and `supervisor.is_some()` assertions
@@ -1719,7 +1723,7 @@ mod tests {
         preanswer_gate(
             root,
             phase,
-            Stage::Plan,
+            Stage::Validate,
             &serde_json::from_str(r#"{"approved":false,"note":"retry","responded_by":"test"}"#)
                 .unwrap(),
         );
@@ -1773,7 +1777,7 @@ mod tests {
     // bound's reset must persist.
     //
     // These three tests deliberately fail via `preflight_interactivity_check`
-    // (Codex + Auto + Define + no CONTEXT.md on develop), NOT via
+    // (Codex + Auto + Plan + no CONTEXT.md on develop), NOT via
     // `AlwaysFailAdapter`'s adapter hook. `AlwaysFailAdapter` is still
     // passed as the `adapter` argument (defense in depth — it would also
     // fail were it ever reached), but it structurally CANNOT be what
@@ -1821,18 +1825,18 @@ mod tests {
         init_repo(root);
 
         let phase = PhaseId::new(620);
-        // Codex + Auto + Define + no `.planning/phases/620-*/620-CONTEXT.md`
+        // Codex + Auto + Plan + no `.planning/phases/620-*/620-CONTEXT.md`
         // on `develop` deterministically fails `preflight_interactivity_check`
         // — see the section doc comment above for why this (not the adapter
         // hook) is what actually reproduces the wedge across a relaunch.
         let mut state = State::new(phase, AgentKind::Codex, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Define;
+        state.stage = Stage::Plan;
         workflow::save_state(&state).unwrap();
 
         preanswer_gate(
             root,
             phase,
-            Stage::Define,
+            Stage::Plan,
             &serde_json::from_str(r#"{"approved":true,"responded_by":"test"}"#).unwrap(),
         );
 
@@ -1866,7 +1870,7 @@ mod tests {
              check and return Ok(false), not {result:?}"
         );
         assert!(
-            !Gates::gate_path(root, phase, Stage::Define).exists(),
+            !Gates::gate_path(root, phase, Stage::Plan).exists(),
             "no second gate should ever be written once Advance skips the recheck"
         );
         assert_eq!(
@@ -1915,14 +1919,14 @@ mod tests {
 
         let phase = PhaseId::new(621);
         let mut state = State::new(phase, AgentKind::Codex, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Define;
+        state.stage = Stage::Plan;
         state.preflight_retries = mode::MAX_PREFLIGHT_RETRIES - 1;
         workflow::save_state(&state).unwrap();
 
         preanswer_gate(
             root,
             phase,
-            Stage::Define,
+            Stage::Plan,
             &serde_json::from_str(r#"{"approved":false,"note":"retry","responded_by":"test"}"#)
                 .unwrap(),
         );
@@ -2629,11 +2633,11 @@ mod tests {
         let root = dir.path();
 
         let phase = PhaseId::new(622);
-        // Plan + Claude bypasses the generic checks and the real Claude
+        // Validate + Claude bypasses the generic checks and the real Claude
         // adapter's default preflight passes — the same "unaffected" shape
         // used by `run_preflight_adapter_hook_override_fires` above.
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Plan;
+        state.stage = Stage::Validate;
         state.preflight_retries = 2;
         workflow::save_state(&state).unwrap();
 
@@ -3683,14 +3687,14 @@ mod tests {
         (dir, state)
     }
 
-    /// D-07 scope: Define and Code only. Stages named explicitly rather than
-    /// iterated, so adding a `Stage` variant surfaces here as a compile-time
-    /// prompt to decide rather than as a silently-widened set.
+    /// D-07 scope: Plan (the first stage) and Code only. Stages named explicitly
+    /// rather than iterated, so adding a `Stage` variant surfaces here as a
+    /// compile-time prompt to decide rather than as a silently-widened set.
     #[test]
-    fn unattended_check_does_not_apply_outside_define_and_code() {
-        assert!(unattended_launch_check_applies(Stage::Define));
+    fn unattended_check_does_not_apply_outside_plan_and_code() {
+        assert!(unattended_launch_check_applies(Stage::Plan));
         assert!(unattended_launch_check_applies(Stage::Code));
-        assert!(!unattended_launch_check_applies(Stage::Plan));
+        assert!(!unattended_launch_check_applies(Stage::Define));
         assert!(!unattended_launch_check_applies(Stage::Validate));
 
         // A wholly NOT-viable fixture parked at a non-applicable stage still
@@ -3703,7 +3707,7 @@ mod tests {
             Mode::Auto,
             dir.path().to_path_buf(),
         );
-        for stage in [Stage::Plan, Stage::Validate] {
+        for stage in [Stage::Define, Stage::Validate] {
             state.stage = stage;
             assert!(
                 preflight_unattended_launch_check(dir.path(), &state).is_ok(),
@@ -3882,15 +3886,15 @@ mod tests {
     /// refuse every launch made before the phase was planned, and the check
     /// would be unusable at the stage where refusing is cheapest.
     #[test]
-    fn unattended_check_treats_an_unplanned_phase_as_pending_at_define_and_undetermined_at_code() {
+    fn unattended_check_treats_an_unplanned_phase_as_pending_at_plan_and_undetermined_at_code() {
         let phase = PhaseId::new(87);
         let (dir, mut state) = viable_unattended_fixture(phase);
         std::fs::remove_dir_all(dir.path().join(".planning/phases")).unwrap();
 
-        state.stage = Stage::Define;
+        state.stage = Stage::Plan;
         assert!(
             preflight_unattended_launch_check(dir.path(), &state).is_ok(),
-            "an unplanned phase at Define is pending, not failing"
+            "an unplanned phase at Plan is pending, not failing"
         );
 
         state.stage = Stage::Code;
@@ -3937,7 +3941,7 @@ mod tests {
     /// safe to skip the re-check — the human approving the gate has already
     /// been shown every applicable reason.
     ///
-    /// The fixture fails BOTH: Codex at Define with no CONTEXT.md on develop
+    /// The fixture fails BOTH: Codex at Plan with no CONTEXT.md on develop
     /// trips `preflight_interactivity_check`, and Codex also trips this check's
     /// C2 (no non-Claude agent can host the chain-flag guard).
     #[test]
@@ -3954,11 +3958,11 @@ mod tests {
             "---\nphase: probe\n---\n\n<task type=\"auto\">\n</task>\n",
         );
         let mut state = State::new(phase, AgentKind::Codex, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Define;
+        state.stage = Stage::Plan;
 
         let err = generic_preflight_checks(root, &state).unwrap_err();
         assert!(
-            err.contains("cannot run the define stage headlessly"),
+            err.contains("cannot run the plan stage headlessly"),
             "the interactivity reason must survive aggregation: {err}"
         );
         assert!(

@@ -401,7 +401,7 @@ fn finishing_run_advances_for(shape: Shape, phase: PhaseId) {
     let fake_bin = shape.fake_bin(logs.path(), AgentRun::Finishing);
     let _reaper = common::LaunchedRunReaper::new(&root, phase, vec![]);
 
-    let output = run_start_with(&home, &root, phase, &fake_bin, shape, &["--until", "plan"]);
+    let output = run_start_with(&home, &root, phase, &fake_bin, shape, &["--until", "code"]);
     assert!(
         output.status.success(),
         "{shape:?}: start failed\nstderr: {}",
@@ -418,8 +418,8 @@ fn finishing_run_advances_for(shape: Shape, phase: PhaseId) {
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .filter(|event| event["event"].as_str() == Some("stage_launched"))
         .collect();
-    assert_eq!(launched[0]["stage"], "define", "{shape:?}: {launched:?}");
-    assert_eq!(launched[1]["stage"], "plan", "{shape:?}: {launched:?}");
+    assert_eq!(launched[0]["stage"], "plan", "{shape:?}: {launched:?}");
+    assert_eq!(launched[1]["stage"], "code", "{shape:?}: {launched:?}");
     assert_eq!(
         launched[1]["launch"],
         shape.label(),
@@ -430,7 +430,7 @@ fn finishing_run_advances_for(shape: Shape, phase: PhaseId) {
             &root, phase
         )
         .is_ok_and(|state| state.stopped)),
-        "{shape:?} control: the chain stops at --until plan"
+        "{shape:?} control: the chain stops at --until code"
     );
 }
 
@@ -465,7 +465,7 @@ fn capture_supervisor_owns_a_fake_agent_and_records_devflow_result() {
         phase,
         &fake_bin,
         Shape::Capture,
-        &["--until", "define"],
+        &["--until", "plan"],
     );
     assert!(
         output.status.success(),
@@ -477,7 +477,7 @@ fn capture_supervisor_owns_a_fake_agent_and_records_devflow_result() {
             &root, phase
         )
         .is_ok_and(|state| state.stopped)),
-        "the run stops at --until define once its supervisor advanced"
+        "the run stops at --until plan once its supervisor advanced"
     );
 
     let agent_pid: u32 =

@@ -59,7 +59,7 @@ fn base_repo(root: &Path) {
 }
 
 /// A `develop`-only repo whose ROADMAP names `phase` and which has no
-/// `.planning/config.json`, so `start --mode auto` parks at its Define
+/// `.planning/config.json`, so `start --mode auto` parks at its Plan
 /// preflight gate. Same shape as gate_wedge_e2e.rs `init_start_repo`.
 fn init_start_repo(root: &Path, phase: PhaseId) {
     base_repo(root);
@@ -224,7 +224,7 @@ fn spawn_parked_start_with(
     let mut start = ParkedChild(command.spawn().expect("spawn foreground start"));
     wait_until_parked(
         &mut start,
-        &Gates::gate_path(root, phase, Stage::Define),
+        &Gates::gate_path(root, phase, Stage::Plan),
         "start",
     );
     start
@@ -238,6 +238,7 @@ fn spawn_parked_advance(
     notify: NotifyEnv<'_>,
 ) -> ParkedChild {
     let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+    state.verification_baseline_captured = true;
     state.stage = Stage::Code;
     state.gate_notify_cmd = persisted.map(str::to_owned);
     devflow_core::workflow::save_state(&state).unwrap();
@@ -380,7 +381,7 @@ fn advance_gate_with_an_empty_variable_skips_the_persisted_command() {
 /// is returned once they are reaped.
 ///
 /// In `Mode::Auto` this fixture (no `.planning/config.json`, capture launch)
-/// parks at the Define preflight gate (D-07) before any stage is launched; in
+/// parks at the Plan preflight gate (D-07) before any stage is launched; in
 /// `Mode::Supervise` the same preflight reports and proceeds (D-08), so the
 /// stage launches and `stage_launched` is emitted.
 fn with_spawned_resume<T>(
@@ -491,7 +492,7 @@ fn wait_for_first_stage_launched(root: &Path, resume: &mut ParkedChild) {
 }
 
 /// The saved notify command, read once `resume` has launched its stage (in
-/// supervise mode, so the fixture's Define stage launches rather than parks).
+/// supervise mode, so the fixture's Plan stage launches rather than parks).
 fn saved_after_first_stage_launched(notify: NotifyEnv<'_>) -> Option<String> {
     with_spawned_resume(Mode::Supervise, notify, |root, phase, resume| {
         wait_for_first_stage_launched(root, resume);
@@ -569,10 +570,10 @@ fn marked_processes(marker: &str) -> Vec<(u32, String, Vec<String>)> {
     found
 }
 
-/// Approve the parked Define gate, wait for the monitor chain to launch the
+/// Approve the parked Plan gate, wait for the monitor chain to launch the
 /// fake agent, and return the agent's environment from `/proc`. Every marked
 /// process is killed before returning.
-fn agent_environment_after_define(
+fn agent_environment_after_plan_gate(
     home: &common::HermeticHome,
     root: &Path,
     phase: PhaseId,
@@ -580,7 +581,7 @@ fn agent_environment_after_define(
     agent: &str,
 ) -> Vec<String> {
     let approve = common::hermetic_devflow(home)
-        .args(["gate", "approve", &phase.to_string(), "--stage", "define"])
+        .args(["gate", "approve", &phase.to_string(), "--stage", "plan"])
         .arg("--project")
         .arg(root)
         .output()
@@ -634,7 +635,7 @@ fn assert_chain_has_no_notify_variable(agent: &str) {
     );
     let _run_reaper = common::LaunchedRunReaper::new(root, phase, Vec::new());
 
-    let environment = agent_environment_after_define(&home, root, phase, &fake_bin, agent);
+    let environment = agent_environment_after_plan_gate(&home, root, phase, &fake_bin, agent);
 
     // Control: a variable set on `start` the same way does reach the agent,
     // so an absent entry below means stripped, not unread.

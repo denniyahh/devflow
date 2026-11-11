@@ -659,7 +659,7 @@ pub(crate) fn print_dry_run(state: &State) {
         state.phase, state.agent, state.mode
     );
     println!("\nstage pipeline:");
-    let mut stage = Some(Stage::Define);
+    let mut stage = Some(Stage::Plan);
     while let Some(s) = stage {
         let command = s.gsd_command().replace("{N}", &state.phase.to_string());
         // F-7: these are PREDICTION probes, not live reads. Every one passes
