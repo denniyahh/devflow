@@ -443,6 +443,20 @@ fn idempotent_stage_prompt(phase: PhaseId, notes: &str) -> String {
     )
 }
 
+/// The gap-closure pass's Plan prompt (GATE-03, D-09): run
+/// `/gsd-plan-phase N --gaps`, which plans the closure of the gaps GSD's
+/// verification report names. It has no idempotency short-circuit: the
+/// phase's PLAN.md files exist by now, and this pass must run anyway
+/// (Pitfall 5). The command names no `--auto`, as the ordinary Plan command
+/// does not.
+fn gaps_plan_prompt(phase: PhaseId, notes: &str) -> String {
+    let command = format!("{} --gaps", gsd_command_for(Stage::Plan, phase));
+    format!(
+        "Validation reported gaps. Plan their closure with the GSD workflow command for \
+        this stage:\n\n    {command}\n\n{notes}{COMPLETION_PROTOCOL}"
+    )
+}
+
 /// Build the prompt for a stage of a phase.
 pub fn stage_prompt(stage: Stage, phase: PhaseId) -> String {
     render_claude_style(&StageIntent::for_stage(stage, phase))
@@ -494,11 +508,11 @@ pub fn render_claude_style(intent: &StageIntent) -> String {
         StageIntent::Plan {
             phase,
             relaunch_note,
-        }
-        | StageIntent::PlanGaps {
+        } => idempotent_stage_prompt(*phase, &note_blocks(None, relaunch_note.as_deref())),
+        StageIntent::PlanGaps {
             phase,
             relaunch_note,
-        } => idempotent_stage_prompt(*phase, &note_blocks(None, relaunch_note.as_deref())),
+        } => gaps_plan_prompt(*phase, &note_blocks(None, relaunch_note.as_deref())),
         StageIntent::Code {
             phase,
             fix: None,
@@ -540,11 +554,15 @@ pub fn render_claude_style(intent: &StageIntent) -> String {
 /// in the same place: just before the completion contract, fix request first.
 pub fn render_workflow_style(intent: &StageIntent, workflow_root: &str) -> String {
     match intent {
-        StageIntent::Plan {
+        StageIntent::PlanGaps {
             phase,
             relaunch_note,
-        }
-        | StageIntent::PlanGaps {
+        } => workflow_gaps_plan_prompt(
+            *phase,
+            workflow_root,
+            &note_blocks(None, relaunch_note.as_deref()),
+        ),
+        StageIntent::Plan {
             phase,
             relaunch_note,
         } => workflow_plan_prompt(
@@ -591,6 +609,17 @@ fn workflow_plan_prompt(phase: PhaseId, workflow_root: &str, notes: &str) -> Str
         - If it does NOT exist: read and follow the GSD workflow file at \
         {workflow_root}/plan-phase.md for phase {phase}.\n\
         \n\
+        {notes}{COMPLETION_PROTOCOL}"
+    )
+}
+
+/// The workflow-style [`gaps_plan_prompt`]: the same pass, naming the
+/// plan-phase workflow file with `--gaps` instead of a slash command.
+fn workflow_gaps_plan_prompt(phase: PhaseId, workflow_root: &str, notes: &str) -> String {
+    format!(
+        "Validation reported gaps. Read and follow the GSD workflow file at \
+        {workflow_root}/plan-phase.md for phase {phase} --gaps, to plan their closure. The \
+        `--gaps` flag is part of the workflow invocation and must be preserved verbatim.\n\n\
         {notes}{COMPLETION_PROTOCOL}"
     )
 }
