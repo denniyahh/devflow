@@ -5,16 +5,16 @@ milestone_name: Session Continuity
 current_phase: 52
 current_phase_name: Subtract and Stabilize
 status: executing
-stopped_at: Completed 52-30-PLAN.md
-last_updated: "2026-11-11T14:33:04.928Z"
+stopped_at: Completed 52-31-PLAN.md
+last_updated: "2026-11-11T15:21:49.335Z"
 last_activity: 2026-11-10
 last_activity_desc: Phase 52 execution started
-state_head: 3357ae838a59f7acfd4bdd9b05d5c464927430cd
+state_head: ba086373e96ed0dda77e4242d1509ef806330d8d
 progress:
   total_phases: 4
   completed_phases: 0
   total_plans: 33
-  completed_plans: 31
+  completed_plans: 32
   percent: 0
 ---
 
@@ -159,7 +159,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 52 (Subtract and Stabilize) — EXECUTING
-Plan: 32 of 33
+Plan: 33 of 33
 Status: Ready to execute
 Last activity: 2026-11-10 — Phase 52 execution started
 
@@ -892,6 +892,8 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 52]: 52-33: GATE-03 never-lies checks read the cause after the way-on sentence, whose finish rule names `passed` on every verification gate
 - [Phase 52]: 52-30: the notify hook's DEVFLOW_GATE_CONTEXT is cut to the display bound (450 characters, one constant in devflow-core shared with the banner and gate list), not the plan's 300, which predates 52-33's raise
 - [Phase 52]: 52-30: a failure reason is stored whole up to GATE_CONTEXT_STORED_MAX_CHARS (4096 characters); the bound applies to each reason, so a context is at most 4096 plus its fixed lead
+- [Phase 52]: 52-31: the rate-limit gate is its own kind (gate_kind rate_limit) and records not_before = reset + 60 s when the denial named a reset; gate sweep spares it until then; approve runs relaunch_now, reject relaunch_with_note (canary unread); the live writer opens it, led by the way-on sentence
+- [Phase 52]: 52-31: Gates::rate_limit_timer_answer (no boolean, refuses a non-rate_limit gate, responded_by devflow-rate-limit-timer), GateAction::Relaunch with from_gate_answer, rate_limit_wait_bound and State.rate_limit_auto_relaunch_used exist with no production caller; 52-32 wires them
 
 ## Roadmap Evolution
 
@@ -1034,11 +1036,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 52 P29 | 86 min | 3 tasks | 16 files |
 | Phase 52 P33 | 46 min | 3 tasks | 10 files |
 | Phase 52 P30 | 23 min | 2 tasks | 7 files |
+| Phase 52 P31 | 34 min | 3 tasks | 9 files |
 
 ## Session
 
-**Last session:** 2026-11-11T14:33:04.721Z
-**Stopped at:** Completed 52-30-PLAN.md
+**Last session:** 2026-11-11T15:21:49.110Z
+**Stopped at:** Completed 52-31-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
