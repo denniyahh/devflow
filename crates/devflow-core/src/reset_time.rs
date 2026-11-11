@@ -40,8 +40,8 @@ pub fn auto_relaunch_due(now: i64, reset_at: i64) -> bool {
 /// (`DEVFLOW_GATE_TIMEOUT_SECS`) never ends the wait before the reset. When the
 /// reset is the later of the two the bound falls exactly at the timer's wake.
 pub fn rate_limit_wait_bound(now: i64, reset_at: i64, gate_timeout_secs: u64) -> u64 {
-    let _ = (now, reset_at);
-    gate_timeout_secs
+    let until_wake = relaunch_not_before(reset_at).saturating_sub(now).max(0);
+    gate_timeout_secs.max(u64::try_from(until_wake).unwrap_or(0))
 }
 
 /// The exact UTC instant, in Unix epoch seconds, that `input` names.

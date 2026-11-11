@@ -264,8 +264,17 @@ impl GateAction {
     /// D-37); no answer to a rate-limit gate advances. Every other gate's answer
     /// is [`from_response`](Self::from_response)'s.
     pub fn from_gate_answer(kind: Option<GateKind>, response: &GateResponse) -> GateAction {
-        let _ = kind;
-        Self::from_response(response)
+        let action = Self::from_response(response);
+        if kind != Some(GateKind::RateLimit) {
+            return action;
+        }
+        match action {
+            abort @ GateAction::Abort(_) => abort,
+            GateAction::Advance => GateAction::Relaunch { note: None },
+            GateAction::LoopBack { note, .. } => GateAction::Relaunch { note },
+            // `from_response` never returns a relaunch; kept as it is.
+            relaunch @ GateAction::Relaunch { .. } => relaunch,
+        }
     }
 }
 
@@ -962,11 +971,32 @@ impl Gates {
         stage: Stage,
         observed: &GateId,
     ) -> Result<PathBuf, GateError> {
+        // The kind is read for the observed id. A gate's kind and id are written
+        // in one atomic write, and `answer_with_hook` re-checks the id under the
+        // gate lock, so a gate replaced after this read is refused there.
+        let gate = match std::fs::read_to_string(Self::gate_path(project_root, phase, stage)) {
+            Ok(contents) => serde_json::from_str::<GateFile>(&contents)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(GateError::NoOpenGate { phase, stage });
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if gate.gate_id != observed.as_str() {
+            return Err(GateError::GateIdMismatch {
+                phase,
+                stage,
+                observed: observed.to_string(),
+                current: gate.gate_id,
+            });
+        }
+        if gate.gate_kind != Some(GateKind::RateLimit) {
+            return Err(GateError::NotARateLimitGate { phase, stage });
+        }
         let response = GateResponse {
             approved: true,
             abort: false,
             note: None,
-            responded_by: Some("devflow".to_string()),
+            responded_by: Some(RATE_LIMIT_TIMER.to_string()),
         };
         Self::answer_with_hook(project_root, phase, stage, observed, &response, || {})
     }
