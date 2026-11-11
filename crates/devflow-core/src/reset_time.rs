@@ -24,15 +24,14 @@ pub const RATE_LIMIT_RELAUNCH_MARGIN_SECS: i64 = 60;
 /// the reset plus [`RATE_LIMIT_RELAUNCH_MARGIN_SECS`], saturating rather than
 /// overflowing on an absurd reset.
 pub fn relaunch_not_before(reset_at: i64) -> i64 {
-    reset_at
+    reset_at.saturating_add(RATE_LIMIT_RELAUNCH_MARGIN_SECS)
 }
 
 /// Whether the one automatic relaunch is due at `now` for a denial that
 /// named `reset_at` (D-27.2): true exactly when `now` has reached
 /// [`relaunch_not_before`].
 pub fn auto_relaunch_due(now: i64, reset_at: i64) -> bool {
-    let _ = (now, reset_at);
-    false
+    now >= relaunch_not_before(reset_at)
 }
 
 /// The exact UTC instant, in Unix epoch seconds, that `input` names.

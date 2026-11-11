@@ -86,17 +86,20 @@ pub(crate) fn retry_after_from_reason(reason: Option<&str>) -> String {
 }
 
 /// Route a `RateLimited` outcome that no fallback can take (CUT-03, D-15,
-/// D-20): the run waits at the never-silent gate for `stage`, which shows in
-/// `gate list`/`gate show` and fires the notify command. Its context leads with
-/// the way on ([`rate_limit_gate_context`]). Answers route as for any failed
-/// stage ([`answer_stage_failure_gate`]): approve or reject relaunches the
-/// stage, and only an abort answer ends the run.
+/// D-20): the run waits at the never-silent rate-limit gate for `stage`
+/// ([`GateKind::RateLimit`]), which shows in `gate list`/`gate show` and fires
+/// the notify command. Its file records the not-before time when the denial
+/// named a parseable reset ([`GateLabel::rate_limit`]), so `gate sweep` spares
+/// it until then (D-27.2). Its context leads with the routers' way-on sentence
+/// ([`rate_limit_gate_context`]). Answers route through the routers' rate-limit
+/// arms ([`dispatch_answer`]): an approve relaunches the stage now on the same
+/// agent, a reject relaunches it with the note, and only an abort ends the run.
 ///
 /// Not an infra failure: `infra_failures` is untouched, so the infra ceiling
 /// cannot abort a run that is only waiting for quota. No cron-instructions file
 /// is written and no `rate_limit_resume_scheduled` event is emitted; nothing
 /// ever acted on either (999.186). The one automatic relaunch at the reset time
-/// is not part of this path yet.
+/// is not part of this path yet (52-32).
 pub(crate) fn handle_rate_limited_outcome(
     project_root: &Path,
     state: &mut State,
@@ -104,14 +107,23 @@ pub(crate) fn handle_rate_limited_outcome(
     stage: Stage,
     reason: Option<String>,
 ) -> Result<(), CliError> {
+    let reset_at = reset_time::parse_reset_time(&retry_after_from_reason(reason.as_deref()));
     let context = rate_limit_gate_context(state, phase, stage, reason);
-    answer_stage_failure_gate(project_root, state, stage, &context)
+    let answer = run_gate(
+        project_root,
+        state,
+        stage,
+        GateLabel::rate_limit(reset_at),
+        &context,
+    )?;
+    dispatch_answer(project_root, state, stage, answer, false)
 }
 
-/// The never-silent gate context for a rate limit no fallback can take. Way on
-/// first, because the notify hook and the banner show only the start: the
-/// resume command (with `--agent` when the run is not on the default agent),
-/// then the reset time when the denial carried one, then the cause.
+/// The never-silent gate context for a rate limit no fallback can take. The
+/// routers' way-on sentence first (C2), because the notify hook and the banner
+/// show only the start; then the resume command (with `--agent` when the run
+/// is not on the default agent), the reset time when the denial carried one,
+/// and the cause.
 fn rate_limit_gate_context(
     state: &State,
     phase: PhaseId,
@@ -131,10 +143,14 @@ fn rate_limit_gate_context(
     };
     let lead = format!(
         "rate limited with no usable fallback; once this waiting supervisor has ended, \
-         `devflow resume --phase {phase}{agent}` relaunches the stage; {reset}; approving \
-         this gate relaunches it now, `devflow gate abort` ends the run. Cause: "
+         `devflow resume --phase {phase}{agent}` relaunches the stage; {reset}. Cause: "
     );
-    stage_failure_context(stage, &lead, reason)
+    lead_with_way_on(
+        GateKind::RateLimit,
+        (phase, stage),
+        None,
+        &stage_failure_context(stage, &lead, reason),
+    )
 }
 
 /// The three-way outcome of a Validate stage evaluation (18e, D-18e).
@@ -526,6 +542,11 @@ pub(crate) enum AnswerFamily {
     Verification,
     /// A failed stage (D-39).
     StageFailure,
+    /// A rate limit no fallback can take (D-15, D-27.4, D-37): an approve
+    /// relaunches the stage now on the same agent, a reject relaunches it with
+    /// the note. It keeps its own answers and can never finish a run (D-45
+    /// rule 2).
+    RateLimit,
     /// A failed preflight check (D-39, D-18f).
     Preflight,
     /// A human-only checkpoint declaration at Code (D-39).
@@ -548,7 +569,7 @@ pub(crate) fn answer_family(kind: Option<GateKind>) -> AnswerFamily {
         Some(GateKind::FailureCap) => AnswerFamily::Verification,
         Some(GateKind::NoGapClosurePlan) => AnswerFamily::Verification,
         Some(GateKind::StageFailure) => AnswerFamily::StageFailure,
-        Some(GateKind::RateLimit) => AnswerFamily::StageFailure,
+        Some(GateKind::RateLimit) => AnswerFamily::RateLimit,
         Some(GateKind::Preflight) => AnswerFamily::Preflight,
         Some(GateKind::CheckpointDeclaration) => AnswerFamily::CheckpointDeclaration,
         None => AnswerFamily::Unclassified,
@@ -561,6 +582,8 @@ pub(crate) fn answer_family(kind: Option<GateKind>) -> AnswerFamily {
 pub(crate) enum StatusLessStep {
     /// Retry the failed stage.
     RetryStage,
+    /// Relaunch the rate-limited stage now, on the same agent (D-15, D-27.4).
+    RelaunchNow,
     /// Relaunch the failed stage with the reject's note (GATE-01, 52-26).
     RelaunchWithNote(String),
     /// The run's recorded delivery canary refuses its agent (999.187): stop the
@@ -583,6 +606,7 @@ impl StatusLessStep {
     pub(crate) fn name(&self) -> &'static str {
         match self {
             StatusLessStep::RetryStage => "retry_stage",
+            StatusLessStep::RelaunchNow => "relaunch_now",
             StatusLessStep::RelaunchWithNote(_) => "relaunch_with_note",
             StatusLessStep::RelaunchRefused { .. } => "relaunch_refused",
             StatusLessStep::PreflightOverride => "preflight_override",
@@ -659,6 +683,12 @@ pub(crate) fn status_less_step(
             (None, Approve) => StatusLessStep::RetryStage,
             (None, Reject(note)) => StatusLessStep::RelaunchWithNote(note.to_string()),
         }),
+        // The rate-limit family reads no canary (T-52-67).
+        (AnswerFamily::RateLimit, Reject(note)) if note.trim().is_empty() => Err(EMPTY_NOTE),
+        (AnswerFamily::RateLimit, Approve) => Ok(StatusLessStep::RelaunchNow),
+        (AnswerFamily::RateLimit, Reject(note)) => {
+            Ok(StatusLessStep::RelaunchWithNote(note.to_string()))
+        }
         (AnswerFamily::Preflight, Approve) => Ok(StatusLessStep::PreflightOverride),
         (AnswerFamily::Preflight, Reject(_)) => Err(REJECT_NOT_AN_ANSWER),
         (AnswerFamily::CheckpointDeclaration, Approve) => Ok(StatusLessStep::RecordCheckpointSet),
@@ -726,6 +756,7 @@ pub(crate) fn approve_route_by_kind(
             ApproveRoute::Verification { step, evidence }
         }
         family @ (AnswerFamily::StageFailure
+        | AnswerFamily::RateLimit
         | AnswerFamily::Preflight
         | AnswerFamily::CheckpointDeclaration
         | AnswerFamily::Unclassified) => {
@@ -758,6 +789,7 @@ pub(crate) fn reject_route_by_kind(
         AnswerFamily::Verification if note.trim().is_empty() => RejectRoute::Refused(EMPTY_NOTE),
         AnswerFamily::Verification => RejectRoute::Verification(next_step(Trigger::Reject(note))),
         family @ (AnswerFamily::StageFailure
+        | AnswerFamily::RateLimit
         | AnswerFamily::Preflight
         | AnswerFamily::CheckpointDeclaration
         | AnswerFamily::Unclassified) => {
@@ -793,6 +825,9 @@ pub(crate) fn step_phrase(step: &Step) -> &'static str {
 pub(crate) fn status_less_phrase(step: &StatusLessStep, phase: PhaseId, stage: Stage) -> String {
     match step {
         StatusLessStep::RetryStage => format!("retries the {stage} stage"),
+        StatusLessStep::RelaunchNow => {
+            format!("relaunches the {stage} stage now on the same agent")
+        }
         StatusLessStep::RelaunchWithNote(_) => {
             format!("relaunches the {stage} stage with the note")
         }
@@ -838,6 +873,7 @@ pub(crate) fn way_on_sentence(
     let approve = match answer_family(Some(kind)) {
         AnswerFamily::Verification => Some(VERIFICATION_APPROVE_RULE.to_string()),
         AnswerFamily::StageFailure
+        | AnswerFamily::RateLimit
         | AnswerFamily::Preflight
         | AnswerFamily::CheckpointDeclaration
         | AnswerFamily::Unclassified => {
@@ -921,6 +957,7 @@ pub(crate) fn screen_answer(
             AnswerFamily::Unclassified => Err(unclassified("approve")),
             AnswerFamily::Verification
             | AnswerFamily::StageFailure
+            | AnswerFamily::RateLimit
             | AnswerFamily::Preflight
             | AnswerFamily::CheckpointDeclaration => Ok(()),
         },
@@ -930,6 +967,7 @@ pub(crate) fn screen_answer(
                 AnswerFamily::Verification if note.trim().is_empty() => Err(EMPTY_NOTE),
                 AnswerFamily::Verification => Ok(()),
                 AnswerFamily::StageFailure
+                | AnswerFamily::RateLimit
                 | AnswerFamily::Preflight
                 | AnswerFamily::CheckpointDeclaration
                 | AnswerFamily::Unclassified => {
@@ -1635,7 +1673,9 @@ fn run_status_less_step(
     let _ = close_gate(project_root, state.phase, stage);
     state.gate_pending = false;
     match step {
-        StatusLessStep::RetryStage => launch_stage(state, None, Some(stage)),
+        StatusLessStep::RetryStage | StatusLessStep::RelaunchNow => {
+            launch_stage(state, None, Some(stage))
+        }
         StatusLessStep::RelaunchWithNote(note) => {
             // GATE-01 / D-39: the note is the operator's word for this
             // relaunch, committed before the launch. It is never the fix
@@ -8230,6 +8270,49 @@ mod tests {
             "control: a predicted approve route fails"
         );
 
+        // The rate-limit gate (52-31): its own kind and sentence, the same
+        // whatever the recorded canary. Control: the 52-09 hand-written answer
+        // text after the sentence fails the check.
+        for (index, stage) in [Stage::Plan, Stage::Code].into_iter().enumerate() {
+            let row = format!("rate limit at {stage}");
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = PhaseId::new(5736 + u32::try_from(index).unwrap());
+            let mut state =
+                State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
+            state.stage = stage;
+            state.canary = Some(devflow_core::canary::CanaryOutcome::Absent);
+            workflow::save_state(&state).unwrap();
+            let (gate, _) = at_the_gate(root, phase, stage, &abort_answer(), || {
+                let _ = handle_rate_limited_outcome(
+                    root,
+                    &mut state,
+                    phase,
+                    stage,
+                    Some("rate limited until 2026-06-18T15:45:30Z".into()),
+                );
+            });
+            assert_eq!(gate["gate_kind"], "rate_limit", "{row}: {gate}");
+            let context = gate["context"].as_str().unwrap();
+            let sentence = way_on_sentence(GateKind::RateLimit, phase, stage, None);
+            check(&row, context, &sentence);
+            assert!(
+                sentence.contains(&format!(
+                    "approve: relaunches the {stage} stage now on the same agent"
+                )) && sentence.contains(&format!(
+                    "reject with a note: relaunches the {stage} stage with the note"
+                )),
+                "{row}: {sentence}"
+            );
+            let planted = format!(
+                "{context} approving this gate relaunches it now, `devflow gate abort` ends the run"
+            );
+            assert!(
+                leads_with_only(&planted, &sentence).is_err(),
+                "{row}: control: {planted}"
+            );
+        }
+
         // The stage-failure gate at Plan, Code and Validate, with its canary
         // rows and their controls.
         let refusal = "background-task notification delivery is ABSENT";
@@ -8381,6 +8464,8 @@ mod tests {
         Verification(Stage),
         /// The stage-failure gate.
         StageFailure,
+        /// The rate-limit gate.
+        RateLimit,
         /// A gate whose reject is refused (preflight, checkpoint declaration).
         RejectRefused,
         /// A file with no kind.
@@ -8400,7 +8485,8 @@ mod tests {
             | Some(GateKind::AmbiguousVerdict)
             | Some(GateKind::FailureCap) => ParityCase::Verification(Stage::Validate),
             Some(GateKind::NoGapClosurePlan) => ParityCase::Verification(Stage::Plan),
-            Some(GateKind::StageFailure) | Some(GateKind::RateLimit) => ParityCase::StageFailure,
+            Some(GateKind::StageFailure) => ParityCase::StageFailure,
+            Some(GateKind::RateLimit) => ParityCase::RateLimit,
             Some(GateKind::Preflight) | Some(GateKind::CheckpointDeclaration) => {
                 ParityCase::RejectRefused
             }
@@ -8703,6 +8789,62 @@ mod tests {
                         }
                     }
                 }
+                ParityCase::RateLimit => {
+                    // The routers read no canary for this family (T-52-67):
+                    // a recorded refusal changes nothing.
+                    for (offset, stage) in [Stage::Plan, Stage::Code, Stage::Validate]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        let number = number + u32::try_from(offset).unwrap();
+                        let row = format!("{row} at {stage}");
+                        let route = reject_route(
+                            &parity_gate(PhaseId::new(number), stage, kind),
+                            Some("a recorded refusal"),
+                            NOTE,
+                        );
+                        assert_eq!(
+                            format!("{route:?}"),
+                            format!(
+                                "{:?}",
+                                RejectRoute::StatusLess(StatusLessStep::RelaunchWithNote(
+                                    NOTE.to_string()
+                                ))
+                            ),
+                            "{row}"
+                        );
+                        let dir = tempfile::tempdir().unwrap();
+                        let root = dir.path();
+                        init_repo(root);
+                        let phase = PhaseId::new(number);
+                        let mut state = State::new(
+                            phase,
+                            AgentKind::Codex,
+                            Mode::Supervise,
+                            root.to_path_buf(),
+                        );
+                        state.stage = stage;
+                        workflow::save_state(&state).unwrap();
+                        let (gate, _) =
+                            at_the_gate(root, phase, stage, &reject_answer(NOTE), || {
+                                let _ = handle_rate_limited_outcome(
+                                    root,
+                                    &mut state,
+                                    phase,
+                                    stage,
+                                    Some("rate limited until 2026-06-18T15:45:30Z".into()),
+                                );
+                            });
+                        assert_eq!(gate["gate_kind"], "rate_limit", "{row}: {gate}");
+                        let after = workflow::load_state(root, phase).unwrap();
+                        assert_eq!(after.stage, stage, "{row}: the same stage relaunches");
+                        assert_eq!(after.agent, AgentKind::Codex, "{row}: on the same agent");
+                        assert_eq!(after.relaunch_note.as_deref(), Some(NOTE), "{row}");
+                        assert!(!after.stopped, "{row}");
+                        let resolved = events_named(root, phase, "gate_resolved");
+                        assert_eq!(resolved[0]["route"], "relaunch_with_note", "{row}");
+                    }
+                }
                 ParityCase::RejectRefused => {
                     let kind = kind.expect("a kind");
                     let route = reject_route(
@@ -8948,6 +9090,67 @@ mod tests {
                         );
                         let resolved = events_named(root, phase, "gate_resolved");
                         assert_eq!(resolved[0]["route"], expected, "{row}: {}", resolved[0]);
+                    }
+                }
+                ParityCase::RateLimit => {
+                    for (offset, refuses) in [(0u32, false), (1, true)] {
+                        let row = format!("{row}, canary refuses {refuses}");
+                        let dir = tempfile::tempdir().unwrap();
+                        let root = dir.path();
+                        init_repo(root);
+                        let phase = PhaseId::new(number + offset);
+                        phase_dir_fixture(root, phase);
+                        let gsd = GsdStub::answering(root, &[gsd_says(GsdStatus::Passed)]);
+                        let mut state = State::new(
+                            phase,
+                            AgentKind::Claude,
+                            Mode::Supervise,
+                            root.to_path_buf(),
+                        );
+                        state.verification_baseline_captured = true;
+                        state.stage = Stage::Code;
+                        state.canary = Some(if refuses {
+                            devflow_core::canary::CanaryOutcome::Absent
+                        } else {
+                            devflow_core::canary::CanaryOutcome::Confirmed
+                        });
+                        workflow::save_state(&state).unwrap();
+                        let refusal = recorded_canary_refusal(&state);
+                        let route = approve_route(
+                            &parity_gate(phase, Stage::Code, kind),
+                            refusal.as_deref(),
+                            || panic!("{row}: a rate-limit approve reads no GSD status"),
+                        );
+                        assert!(
+                            matches!(
+                                &route,
+                                ApproveRoute::StatusLess(StatusLessStep::RelaunchNow)
+                            ),
+                            "{row}: {route:?}"
+                        );
+                        at_the_gate(root, phase, Stage::Code, &approve_answer(), || {
+                            let _ = handle_rate_limited_outcome(
+                                root,
+                                &mut state,
+                                phase,
+                                Stage::Code,
+                                Some("rate limited until usage limit".into()),
+                            );
+                        });
+                        let after = workflow::load_state(root, phase).unwrap();
+                        assert_eq!(status_reads(&gsd), 0, "{row}: no status read");
+                        assert!(!after.stopped, "{row}: {after:?}");
+                        assert_eq!(after.relaunch_note, None, "{row}: no note");
+                        assert!(
+                            events_named(root, phase, "gate_relaunch_refused").is_empty(),
+                            "{row}"
+                        );
+                        let resolved = events_named(root, phase, "gate_resolved");
+                        assert_eq!(
+                            resolved[0]["route"], "relaunch_now",
+                            "{row}: {}",
+                            resolved[0]
+                        );
                     }
                 }
                 ParityCase::RejectRefused => {
@@ -9522,6 +9725,11 @@ mod tests {
                 "relaunch_refused"
             }
             (PropTrigger::Reject(_), Some(GateKind::StageFailure)) => "relaunch_with_note",
+            (PropTrigger::Approve, Some(GateKind::RateLimit)) => "relaunch_now",
+            (PropTrigger::Reject(note), Some(GateKind::RateLimit)) if note.trim().is_empty() => {
+                "refused"
+            }
+            (PropTrigger::Reject(_), Some(GateKind::RateLimit)) => "relaunch_with_note",
             (PropTrigger::Approve, Some(GateKind::Preflight)) => "preflight_override",
             (PropTrigger::Approve, Some(GateKind::CheckpointDeclaration)) => {
                 "record_checkpoint_set"

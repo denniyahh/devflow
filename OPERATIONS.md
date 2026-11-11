@@ -389,12 +389,18 @@ A rate-limited stage gets one of two answers.
   runs again at the handoff, because the check at launch is best effort, so a
   fallback can still be refused there (its binary gone, say). The gate shows in
   `devflow gate list` and `devflow gate show`, and fires the notify command.
-  Its context leads with the way on: `devflow resume --phase N` (with
+  It is its own kind of gate (`gate_kind: rate_limit`). Its context leads with
+  the routers' way-on sentence, then `devflow resume --phase N` (with
   `--agent <agent>` when the run is not on `claude`), then the reset time when
   the denial carried one (`the limit resets at <time>`, otherwise `the denial
-  carried no reset time`), then the cause. `devflow gate approve N` (or a
-  `gate reject`) relaunches the stage now, on the same agent;
-  `devflow gate abort N` ends the run. `devflow resume
+  carried no reset time`), then the cause. `devflow gate approve N` relaunches
+  the stage now, on the same agent (`relaunch_now`); `devflow gate reject N
+  --note <text>` relaunches it with the note in the stage's prompt
+  (`relaunch_with_note`; an empty note is refused); `devflow gate abort N` ends
+  the run. The run's recorded delivery canary does not change these answers.
+  When the denial named a reset time, the gate file records `not_before` (the
+  reset plus 60 seconds), and `devflow gate sweep` leaves the gate alone until
+  then, however old it is. `devflow resume
   --phase N` is refused while the supervisor waits at the gate, so it is the
   way on after the reset once that supervisor has ended. Waiting for quota
   does not count toward the infra ceiling, so it cannot abort the run, and
