@@ -82,7 +82,10 @@ pub struct StatusReport {
 ///
 /// The `Display` text may carry GSD's message and absolute paths; use
 /// [`ReaderFailure::label`] wherever the text is persisted as an event.
+/// `non_exhaustive`: a later gsd-core can add a failure class without a
+/// major release of this published crate.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ReaderFailure {
     /// No launcher under the home.
     #[error("no GSD launcher (gsd_run) under {home}")]
@@ -490,23 +493,56 @@ fn verification_status_within(
     classify(&read_json(home, evidence_root, &args, timeout)?)
 }
 
-/// The value of frontmatter `field` in `file`.
-pub fn frontmatter_field(
-    _home: &Path,
-    _evidence_root: &Path,
-    _file: &Path,
-    _field: &str,
-) -> Result<Value, ReaderFailure> {
-    Err(ReaderFailure::Spawn {
-        message: "not implemented".to_owned(),
-    })
+/// A failure when GSD answered with an `error` key, whatever it exited.
+fn refuse_gsd_error(value: &Value) -> Result<(), ReaderFailure> {
+    match value.get("error") {
+        None => Ok(()),
+        Some(Value::String(message)) => Err(ReaderFailure::GsdError {
+            message: message.clone(),
+        }),
+        Some(other) => Err(ReaderFailure::GsdError {
+            message: other.to_string(),
+        }),
+    }
 }
 
-/// The installed GSD version.
-pub fn runtime_version(_home: &Path, _evidence_root: &Path) -> Result<String, ReaderFailure> {
-    Err(ReaderFailure::Spawn {
-        message: "not implemented".to_owned(),
-    })
+/// The value of frontmatter `field` in `file`, as GSD's
+/// `query frontmatter get <file> --field <field>` reads it.
+///
+/// An `error` key is a failure even at exit 0, and so is a result that does
+/// not carry `field`. A field present with a `null` value is returned as
+/// `null`: present-and-empty is not absent.
+pub fn frontmatter_field(
+    home: &Path,
+    evidence_root: &Path,
+    file: &Path,
+    field: &str,
+) -> Result<Value, ReaderFailure> {
+    let args = [
+        OsStr::new("query"),
+        OsStr::new("frontmatter"),
+        OsStr::new("get"),
+        file.as_os_str(),
+        OsStr::new("--field"),
+        OsStr::new(field),
+    ];
+    let value = read_json(home, evidence_root, &args, GSD_READER_TIMEOUT)?;
+    refuse_gsd_error(&value)?;
+    value
+        .get(field)
+        .cloned()
+        .ok_or_else(|| ReaderFailure::MissingField {
+            key: field.to_owned(),
+        })
+}
+
+/// The installed GSD version (`runtime-identity --raw`'s `version`), so a
+/// caller can record which GSD answered.
+pub fn runtime_version(home: &Path, evidence_root: &Path) -> Result<String, ReaderFailure> {
+    let args = [OsStr::new("runtime-identity"), OsStr::new("--raw")];
+    let value = read_json(home, evidence_root, &args, GSD_READER_TIMEOUT)?;
+    refuse_gsd_error(&value)?;
+    required_str(&value, "version").map(str::to_owned)
 }
 
 #[cfg(test)]
