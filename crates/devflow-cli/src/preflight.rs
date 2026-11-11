@@ -370,7 +370,17 @@ pub(crate) enum BaseRefCurrency {
 /// whatever the remote-tracking ref currently holds (Phase 24's inherited
 /// D-06 precedent — a new code path must not introduce a false hard-block
 /// on correct work, and an offline machine is correct work).
+#[cfg(test)]
 pub(crate) fn base_ref_currency(project_root: &Path, base: &str) -> BaseRefCurrency {
+    base_ref_currency_to(&mut std::io::stdout(), project_root, base)
+}
+
+/// [`base_ref_currency`] with its operator output sent to `out`.
+fn base_ref_currency_to(
+    out: &mut dyn std::io::Write,
+    project_root: &Path,
+    base: &str,
+) -> BaseRefCurrency {
     let remote_ref = format!("{ORIGIN}/{base}");
 
     let fetch_ok = git_command(project_root)
@@ -379,7 +389,8 @@ pub(crate) fn base_ref_currency(project_root: &Path, base: &str) -> BaseRefCurre
         .map(|out| out.status.success())
         .unwrap_or(false);
     if !fetch_ok {
-        println!(
+        let _ = writeln!(
+            out,
             "warning: could not fetch `{ORIGIN} {base}` — comparing `{base}` against \
              whatever `{remote_ref}` currently resolves to locally, which may be stale"
         );
@@ -556,7 +567,17 @@ pub(crate) fn undeterminable_currency_warning(base: &str) -> String {
 /// `Diverged` always refuses — a divergent base is never silently forked
 /// from.
 pub(crate) fn ensure_base_ref_current(project_root: &Path, base: &str) -> Result<(), CliError> {
-    match base_ref_currency(project_root, base) {
+    ensure_base_ref_current_to(&mut std::io::stdout(), project_root, base)
+}
+
+/// [`ensure_base_ref_current`] with its operator output sent to `out`, so a
+/// test can assert the lines an operator sees.
+fn ensure_base_ref_current_to(
+    out: &mut dyn std::io::Write,
+    project_root: &Path,
+    base: &str,
+) -> Result<(), CliError> {
+    match base_ref_currency_to(out, project_root, base) {
         BaseRefCurrency::Current | BaseRefCurrency::Ahead => Ok(()),
         // FAIL DIRECTION: OPEN. This arm is what allows a local-only
         // planning branch — one with no `origin/<base>` tracking ref, the
@@ -571,7 +592,7 @@ pub(crate) fn ensure_base_ref_current(project_root: &Path, base: &str) -> Result
         // `undeterminable_currency_warning_names_the_branch_and_its_disposition`,
         // because a bare `println!` here is unobservable from a unit test.
         BaseRefCurrency::Undeterminable => {
-            println!("{}", undeterminable_currency_warning(base));
+            let _ = writeln!(out, "{}", undeterminable_currency_warning(base));
             Ok(())
         }
         BaseRefCurrency::Diverged => {
@@ -603,7 +624,8 @@ pub(crate) fn ensure_base_ref_current(project_root: &Path, base: &str) -> Result
                     let fast_forwarded =
                         fast_forward_base_ref(project_root, base, &local_sha, &remote_sha);
                     if fast_forwarded {
-                        println!(
+                        let _ = writeln!(
+                            out,
                             "advanced `{base}` to `{remote_ref}` ({count} commit(s) fast-forwarded)"
                         );
                         return Ok(());
