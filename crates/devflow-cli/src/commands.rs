@@ -2635,6 +2635,9 @@ fn stop_in(project_root: &Path, phase: PhaseId, cache_dir: Option<&Path>) -> Res
         return persist_stopped_state(project_root, phase, false, &known_launches);
     }
     let socket_stop = stop_via_socket(project_root, phase, cache_dir)?;
+    if matches!(socket_stop, SocketStop::AlreadyFinished) {
+        return Ok(());
+    }
     if let SocketStop::EndedStateUnloadable(state_file) = &socket_stop {
         println!(
             "stop: phase {phase}'s state file {} does not load, so `stopped` was not \
@@ -2646,6 +2649,9 @@ fn stop_in(project_root: &Path, phase: PhaseId, cache_dir: Option<&Path>) -> Res
     let mut ended = note_socket_stop(socket_stop, &mut known_launches);
     let mut launcher_signalled = false;
     if let Some(pending) = stop_pending_launch(project_root, phase, &mut known_launches)? {
+        if pending == PendingStop::AlreadyFinished {
+            return Ok(());
+        }
         ended |= pending == PendingStop::SupervisorEnded;
         launcher_signalled = pending == PendingStop::LauncherSignalled;
         // A launch promoted while `stop` waited on it is the recorded supervisor now.
@@ -2675,7 +2681,7 @@ fn note_socket_stop(stop: SocketStop, known_launches: &mut Vec<String>) -> bool 
             known_launches.extend(launch_id);
             true
         }
-        SocketStop::EndedStateUnloadable(_) => true,
+        SocketStop::EndedStateUnloadable(_) | SocketStop::AlreadyFinished => true,
     }
 }
 
@@ -2690,6 +2696,8 @@ enum PendingStop {
     /// The launcher holding the reservation was signalled through the holder file, and it
     /// has exited.
     LauncherSignalled,
+    /// The run had already finished: nothing was stopped (operator decision 2026-11-11).
+    AlreadyFinished,
 }
 
 /// How long `stop` waits for a live pending supervisor to publish its socket: the
@@ -2759,6 +2767,7 @@ fn stop_pending_launch(
                     known_launches.push(pending.launch_id.clone());
                     return Ok(Some(PendingStop::SupervisorEnded));
                 }
+                ShutdownResult::AlreadyFinished => return Ok(Some(PendingStop::AlreadyFinished)),
                 ShutdownResult::Relocate => {}
                 ShutdownResult::HandedOff => {
                     handed_off += 1;
@@ -3135,9 +3144,13 @@ fn stop_stale_launch(subject: &str, entry: &supervisor::SweepEntry) -> Result<()
 }
 
 /// `stop`'s line when the run had already finished (operator decision
-/// 2026-11-11): a permitted finish wins over a late stop. Skeleton (52-29 RED).
+/// 2026-11-11): a permitted finish wins over a late stop, so nothing was
+/// stopped and the finished state is left as it is.
 pub(crate) fn already_finished_line(what: &str) -> String {
-    format!("stop: {what}: the supervisor answered handed_off")
+    format!(
+        "stop: {what} already finished (Validate passed) before the stop could act; nothing \
+         was stopped and the finished run is kept as it is"
+    )
 }
 
 /// `stop`'s line for a stop its supervisor confirmed (D-13 item 6). It claims a group ended
@@ -3206,6 +3219,9 @@ enum SocketStop {
     /// The run was ended through a sidecar-found socket, but the state file
     /// at this path exists and does not load, so nothing can be recorded.
     EndedStateUnloadable(PathBuf),
+    /// The run had already finished: nothing was stopped, and nothing is
+    /// recorded over the finished state.
+    AlreadyFinished,
 }
 
 /// The supervisor socket `stop` addresses for a phase, and its provenance.
@@ -3386,6 +3402,7 @@ fn stop_via_socket(
             }
             Ok(supervisor::Liveness::Alive(_)) => match shutdown_supervisor(phase, &located)? {
                 ShutdownResult::Ended | ShutdownResult::AcceptedPending => true,
+                ShutdownResult::AlreadyFinished => return Ok(SocketStop::AlreadyFinished),
                 ShutdownResult::Relocate => false,
                 ShutdownResult::HandedOff => {
                     handed_off += 1;
@@ -3450,6 +3467,9 @@ enum ShutdownResult {
     AcceptedPending,
     /// The supervisor had handed the run to its successor.
     HandedOff,
+    /// The run had already finished: nothing was stopped (operator decision
+    /// 2026-11-11).
+    AlreadyFinished,
     /// The socket went away under the request: locate the run again.
     Relocate,
 }
@@ -3492,6 +3512,10 @@ fn shutdown_supervisor(
             return Ok(ShutdownResult::AcceptedPending);
         }
         Ok(supervisor::ShutdownOutcome::HandedOff) => return Ok(ShutdownResult::HandedOff),
+        Ok(supervisor::ShutdownOutcome::AlreadyFinished) => {
+            println!("{}", already_finished_line(&format!("phase {phase}")));
+            return Ok(ShutdownResult::AlreadyFinished);
+        }
         Ok(supervisor::ShutdownOutcome::Refused(reason)) => {
             return Err(CliError::Message(format!(
                 "stop: phase {phase}'s supervisor at {} refused the shutdown ({reason}); nothing \

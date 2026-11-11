@@ -1573,6 +1573,11 @@ pub(crate) fn run_monitor(invocation: &MonitorInvocation, advance: bool) -> Resu
                         if token.stop_requested() {
                             forward_stop_to_successor(&token, project_root, phase, &successor);
                         }
+                    } else if workflow::load_state(project_root, phase).is_ok_and(|s| s.finished) {
+                        // A permitted finish wins over a late stop (operator
+                        // decision 2026-11-11): a stop still pending is answered
+                        // `already_finished`, never `handed_off`.
+                        run.supervisor.token().enter(OwnerPhase::Finished);
                     }
                     drop(stop_guard);
                     match advanced {

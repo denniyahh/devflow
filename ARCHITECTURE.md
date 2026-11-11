@@ -335,7 +335,11 @@ but are not called from any production CLI path today (only exercised in
 DevFlow does not merge, open a pull request, bump a version, tag or delete a
 branch: there is no Ship stage. A passing Validate ends the run
 (`finish_run()`), leaving the worktree and `feature/phase-NN` as Validate left
-them; integrating the branch is the operator's step.
+them; integrating the branch is the operator's step. `finish_run()` takes a
+`FinishPermit`, which only `can_finish` makes: GSD's fresh status is `passed`
+and the run's Validate agent PASS is recorded on the current commit over a
+clean tree (D-45, D-46). A permitted finish wins over a late `devflow stop`,
+which the supervisor answers `already_finished`.
 
 ## Configuration
 

@@ -886,12 +886,13 @@ enum ShutdownLine {
     Refused(String),
 }
 
-/// A refusal's error string as an outcome: `handed_off` is its own outcome.
+/// A refusal's error string as an outcome: `handed_off` and
+/// `already_finished` are their own outcomes.
 fn refusal(error: String) -> ShutdownOutcome {
-    if error == "handed_off" {
-        ShutdownOutcome::HandedOff
-    } else {
-        ShutdownOutcome::Refused(error)
+    match error.as_str() {
+        "handed_off" => ShutdownOutcome::HandedOff,
+        "already_finished" => ShutdownOutcome::AlreadyFinished,
+        _ => ShutdownOutcome::Refused(error),
     }
 }
 

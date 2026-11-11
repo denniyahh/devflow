@@ -188,21 +188,13 @@ pub(crate) fn finish_run(
 ) -> Result<(), CliError> {
     // D-45 rule 1: the permit is the proof `can_finish` held; it is spent here.
     let _ = permit;
-    // A stop taken during the advance that reached this finish (after the
-    // Validate gate was approved, or while an auto pass advanced) is honoured
-    // here, at safe point 6, before the run is recorded finished. The run ends
-    // stopped at Validate rather than finished, and `devflow resume` reruns
-    // Validate, which asks again (D-06). Without this check the finish would
-    // run and the stop would be answered `handed_off`, which `devflow stop`
-    // reports as a run that moved on to a successor.
-    if crate::pipeline_launch::stop_requested_at_safe_point() {
-        let _ = close_gate(project_root, state.phase, state.stage);
-        crate::pipeline_launch::record_advance_stop(state, 6)?;
-        return Err(CliError::Message(format!(
-            "the run did not finish: {}",
-            crate::pipeline_launch::safe_point_stop_reason()
-        )));
-    }
+    // Operator decision (2026-11-11): a permitted finish wins over a late
+    // stop. A stop taken during the advance that reached this finish (after
+    // the Validate gate was approved, or while an auto pass advanced) is not
+    // honoured here: the run is recorded finished, and the supervisor answers
+    // that stop `already_finished` (`run_monitor` marks the run finished), so
+    // `devflow stop` reports the finish, never a hand-off. A stop that lands
+    // where no finish is permitted keeps its handling at the next safe point.
     let _ = close_gate(project_root, state.phase, state.stage);
     commit(state, |s| {
         s.stopped = true;
