@@ -81,10 +81,8 @@ fn inspect_state(project_root: &Path, state: State) -> RecoveryStatus {
 /// running, whose state is simply fresh, or whose supervisor, pending supervisor,
 /// gate waiter or foreground holder may be live is kept (with a warning naming the
 /// repair), so cleaning one dead phase beside running ones can never orphan a
-/// healthy sibling. Also removes lock files whose holder is dead (the sweep lives in
-/// [`crate::lock::remove_stale_locks`], which refuses to delete a live
-/// holder's lock), gate files whose phase has no state file, and the liveness
-/// files and hold temps crashes left. Returns warnings for anything kept or
+/// healthy sibling. Also removes gate files whose phase has no state file, and
+/// the liveness files and hold temps crashes left. Returns warnings for anything kept or
 /// that could not be removed.
 pub fn clean(project_root: &Path) -> Result<Vec<String>, RecoverError> {
     clean_report(project_root).map(|report| report.warnings)
@@ -135,14 +133,6 @@ pub fn clean_report(project_root: &Path) -> Result<CleanReport, RecoverError> {
         }
     }
     sweep_orphan_gates(project_root, &mut report);
-    for outcome in crate::lock::remove_stale_locks_with_outcomes(project_root) {
-        match outcome {
-            crate::lock::StaleLockRemovalOutcome::Notice(warning) => {
-                report.warnings.push(warning);
-            }
-            crate::lock::StaleLockRemovalOutcome::Failure(warning) => report.fail(warning),
-        }
-    }
     sweep_abandoned_markers(project_root, &mut report);
     report.quarantined = crate::gates::Gates::quarantined(project_root)
         .into_iter()
@@ -708,7 +698,7 @@ pub struct PhaseCleanReport {
 /// explains them.
 ///
 /// The decision, the gate files and the state share one hold of the write lock, on a
-/// fresh read (R-07), so a `start` that reserves meanwhile loses nothing. Only the leftover `lock-*` files are swept outside it.
+/// fresh read (R-07), so a `start` that reserves meanwhile loses nothing.
 pub fn clean_phase_report(
     project_root: &Path,
     phase: PhaseId,
@@ -730,14 +720,6 @@ pub fn clean_phase_report(
     report.removed_anything |= cleared.removed;
     if let Err(err) = cleared.result {
         report.fail(format!("could not clear phase {phase}'s state: {err}"));
-    }
-    for outcome in crate::lock::remove_stale_locks_with_outcomes(project_root) {
-        match outcome {
-            crate::lock::StaleLockRemovalOutcome::Notice(warning) => {
-                report.warnings.push(warning);
-            }
-            crate::lock::StaleLockRemovalOutcome::Failure(warning) => report.fail(warning),
-        }
     }
     Ok(report)
 }
@@ -1341,49 +1323,6 @@ mod tests {
         );
     }
 
-    /// R-3: a stale lock whose coordination inode cannot be opened must be
-    /// reported as a failed removal, not only as a warning.
-    #[test]
-    fn clean_phase_report_flags_a_stale_lock_with_unusable_coordination() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let cleaned_phase = PhaseId::new(65);
-        let stale_lock = root.join(".devflow/lock-66");
-        std::fs::create_dir_all(stale_lock.parent().unwrap()).unwrap();
-        std::fs::write(&stale_lock, DEAD_PID.to_string()).unwrap();
-        let coordination = stale_lock.with_file_name(format!(
-            ".{}.coord",
-            stale_lock.file_name().unwrap().to_string_lossy()
-        ));
-        // A directory where the coordination inode belongs: opening it fails
-        // before the sweeper can remove the dead-holder lock.
-        std::fs::create_dir_all(&coordination).unwrap();
-
-        let report = clean_phase_report(root, cleaned_phase).expect("clean");
-
-        assert!(
-            stale_lock.is_file(),
-            "the stale lock must remain when its coordination cannot be opened"
-        );
-        assert!(
-            coordination.is_dir(),
-            "the coordination directory is the negative control for this failure"
-        );
-        assert!(
-            report.removal_failed,
-            "the unremovable stale lock must be reported as a failed removal"
-        );
-        assert!(
-            report
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("could not coordinate")
-                    && warning.contains("lock-66")),
-            "the stale-lock failure must be reported: {:?}",
-            report.warnings
-        );
-    }
-
     #[test]
     fn clean_phase_removes_gate_files_when_nothing_is_live() {
         let dir = tempfile::tempdir().unwrap();
@@ -1611,75 +1550,6 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains(temp.file_name().unwrap().to_str().unwrap())),
             "the unremovable state temp must be named in a warning: {:?}",
-            report.warnings
-        );
-    }
-
-    /// R-3: the stale-lock sweep must classify an unusable coordination inode
-    /// as a failed removal rather than a harmless kept-lock notice.
-    #[test]
-    fn clean_report_flags_a_stale_lock_with_unusable_coordination() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let stale_lock = root.join(".devflow/lock-67");
-        std::fs::create_dir_all(stale_lock.parent().unwrap()).unwrap();
-        std::fs::write(&stale_lock, DEAD_PID.to_string()).unwrap();
-        let coordination = stale_lock.with_file_name(format!(
-            ".{}.coord",
-            stale_lock.file_name().unwrap().to_string_lossy()
-        ));
-        // A directory where the coordination inode belongs: opening it fails
-        // before the sweeper can remove the dead-holder lock.
-        std::fs::create_dir_all(&coordination).unwrap();
-
-        let report = clean_report(root).expect("clean");
-
-        assert!(
-            stale_lock.is_file(),
-            "the stale lock must remain when its coordination cannot be opened"
-        );
-        assert!(
-            coordination.is_dir(),
-            "the coordination directory is the negative control for this failure"
-        );
-        assert!(
-            report.removal_failed,
-            "the unremovable stale lock must be reported as a failed removal"
-        );
-        assert!(
-            report
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("could not coordinate")
-                    && warning.contains("lock-67")),
-            "the stale-lock failure must be reported: {:?}",
-            report.warnings
-        );
-    }
-
-    /// A live-holder lock is kept intentionally, so its notice must not make
-    /// the stale-lock sweep report a failed removal.
-    #[test]
-    fn clean_report_does_not_flag_a_live_stale_lock_notice_as_a_removal_failure() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let live_lock = root.join(".devflow/lock-68");
-        std::fs::create_dir_all(live_lock.parent().unwrap()).unwrap();
-        std::fs::write(&live_lock, std::process::id().to_string()).unwrap();
-
-        let report = clean_report(root).expect("clean");
-
-        assert!(live_lock.is_file(), "a live holder's lock must be kept");
-        assert!(
-            !report.removal_failed,
-            "a live-holder notice must not be classified as a failed removal"
-        );
-        assert!(
-            report
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("still alive") && warning.contains("lock-68")),
-            "the kept live lock must be reported: {:?}",
             report.warnings
         );
     }

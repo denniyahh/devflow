@@ -172,7 +172,7 @@ fn find_devflow_marker(dir: &Path) -> Option<PathBuf> {
 /// Returns `std::io::Result<()>`, not a crate-specific error enum: this
 /// plan's seven conversion sites each live in a different module with their
 /// own error enum (`WorkflowError`, `GateError`, `MonitorError`,
-/// `ResultError`, `ShipError`, `LockError`), and every one already carries an
+/// `ResultError`, `ShipError`), and every one already carries an
 /// `Io(#[from] std::io::Error)` variant, so `?` converts at every call site
 /// with zero signature churn.
 ///
@@ -288,8 +288,7 @@ pub const WRITE_LOCK_REPAIR_WAIT: Duration = Duration::from_secs(10);
 /// The file the phase's state write lock lives on: `.devflow/.state-NN.lock`.
 ///
 /// DevFlow never replaces or removes it, because a `flock` belongs to an inode
-/// and `state-NN.json` is replaced on every write (D-08). Its name does not start
-/// with `lock-`, so `lock.rs`'s stale-lock sweep leaves it alone.
+/// and `state-NN.json` is replaced on every write (D-08).
 ///
 /// A holder records `"{pid} {start}\n"` in it for as long as it holds the lock.
 /// The record only names a process in a message: nothing signals or waits on it,

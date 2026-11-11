@@ -162,15 +162,6 @@ gate wait (D-08):
   its lifetime by a `start`/`resume` before its spawn or a hand-run
   `devflow advance`, recording its pid and start time. It is the only pid
   `devflow stop` signals, and only when the holder's start time still matches.
-- **Project-wide checkout lock** (`.devflow/lock-project`,
-  `lock::acquire_project_blocking`, `crates/devflow-core/src/lock.rs`) — a coarse,
-  seconds-scale, file-based lock (`O_EXCL` create, PID written into the file,
-  stale-holder reclaim if the recorded PID is dead) that serializes mutations of
-  the shared primary checkout (hook batches) across concurrently finishing phases.
-  It must never be held across a gate wait.
-
-A `.devflow/lock-{phase:02}` left by an older binary means nothing now and blocks
-nothing; `devflow recover --clean` removes it once the pid it names has exited.
 
 State and gate files are written through the durable helpers in
 `crates/devflow-core/src/durable.rs` (D-09), and a source scan
@@ -344,8 +335,7 @@ without checking out).
 
 `crates/devflow-core/src/git.rs` (`GitFlow`) implements branch primitives:
 `feature_start(phase)`/`feature_start_force(phase)` (create
-`feature/phase-NN` from `develop`), `feature_finish(phase)` (merge into
-`develop` with `--no-ff` and delete), `push`, `has_remote`,
+`feature/phase-NN` from `develop`), `push`, `has_remote`,
 `cleanup_merged`. `release_start`/`release_finish` also exist on `GitFlow`
 but are not called from any production CLI path today (only exercised in
 `git.rs`'s own tests) — cutting a `release/{version}` branch and opening a
@@ -429,7 +419,6 @@ Key modules log via `tracing`'s `info!`/`warn!`/`debug!` macros:
 - **`gates.rs`** — gate writes/polls log at `INFO`/`DEBUG`; a failed or
   unspawnable notify command warns at `WARN` (fail-soft — never aborts
   `run_gate`).
-- **`lock.rs`** — reclaiming a stale (dead-holder) lock warns at `WARN`.
 - **`monitor.rs`** — agent spawn logs at `INFO`; PID/exit polling logs at
   `DEBUG`.
 
@@ -438,7 +427,7 @@ Key modules log via `tracing`'s `info!`/`warn!`/`debug!` macros:
 | Level | Usage |
 |---|---|
 | `ERROR` | Unrecoverable conditions that abort an operation. |
-| `WARN` | Recoverable anomalies (force operations, stale locks, fail-soft hook/notify failures). |
+| `WARN` | Recoverable anomalies (force operations, fail-soft notify failures). |
 | `INFO` | Stage transitions, agent lifecycle, branch/gate milestones. |
 | `DEBUG` | I/O details, merge/checkout operations, poll iterations. |
 | `TRACE` | Fine-grained execution tracing (rarely needed outside debugging). |
