@@ -408,8 +408,9 @@ fn staleness_outcome(is_self_dogfood: bool, staleness: Staleness) -> StalenessOu
 /// it would reintroduce the exact Phase 16 false-evidence incident — but it
 /// is never SILENT: notify + an event fire before the blocking error is
 /// returned, so an unattended cron run still sees it (reconciling D-15's
-/// never-silent idiom with D-18's hard block). An ordinary project (or an
-/// Indeterminate result) only warns and proceeds.
+/// never-silent idiom with D-18's hard block). An Indeterminate or Ahead
+/// result on DevFlow's own workspace only warns and proceeds; an ordinary
+/// project proceeds with no output at all (OPS-03).
 ///
 /// 18c: ancestry/dirty-tree checks run against `execution_root` — the
 /// phase's worktree when `state.worktree_path` is set, else `project_root`
@@ -512,6 +513,10 @@ fn enforce_build_staleness_to(
             );
             Err(CliError::Message(message))
         }
+        // OPS-03: the provenance of the devflow binary is only news on
+        // DevFlow's own checkout. An ordinary project proceeds silently; the
+        // warn path never emitted an event, so there is none to keep.
+        StalenessOutcome::Warn if !self_dogfood => Ok(()),
         StalenessOutcome::Warn => {
             // Best-effort operator output: a closed stdout must not turn a
             // warn-and-proceed verdict into a failure.
