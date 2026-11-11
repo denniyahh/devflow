@@ -863,6 +863,95 @@ fn start_dry_run_lists_exactly_plan_code_validate() {
     );
 }
 
+/// OPS-02 / D-35: `devflow start` says when it replaces a phase's existing state,
+/// naming which: a finished run, a stopped run with its stop reason, or a state
+/// file that does not load. `--dry-run` reaches the point where `start` loads the
+/// state. Control: with no prior state, no replace line.
+#[test]
+fn start_says_when_it_replaces_a_finished_or_stale_state() {
+    const FINISHED: &str = "replaces the state of a finished run";
+    const STOPPED: &str = "replaces the state of a stopped run";
+    const UNREADABLE: &str = "replaces an unreadable state";
+    let dry_run = |prior: Option<&dyn Fn(&Path, PhaseId)>| -> String {
+        let home = common::HermeticHome::new();
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        init_repo(root);
+        let phase = PhaseId::new(7);
+        if let Some(prior) = prior {
+            prior(root, phase);
+        }
+        let fake_bin = fake_bin_dir(&[]);
+        let output = common::hermetic_devflow(&home)
+            .args(["start", "--dry-run", "--phase", "7", "--mode", "supervise"])
+            .arg(root)
+            .env("PATH", path_with_fake_bin(&fake_bin.path))
+            .current_dir(root)
+            .output()
+            .expect("run devflow");
+        let text = String::from_utf8_lossy(&output.stdout).to_string()
+            + &String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "dry run must not fail: {text}");
+        text
+    };
+    let saved = |shape: fn(&mut devflow_core::state::State)| {
+        move |root: &Path, phase: PhaseId| {
+            let mut state = devflow_core::state::State::new(
+                phase,
+                devflow_core::state::AgentKind::Claude,
+                devflow_core::mode::Mode::Supervise,
+                root.to_path_buf(),
+            );
+            shape(&mut state);
+            devflow_core::workflow::save_state(&state).unwrap();
+        }
+    };
+
+    let finished = saved(|state| {
+        state.stopped = true;
+        state.finished = true;
+        state.stop_reason = Some(FINISHED_REASON.to_string());
+    });
+    let text = dry_run(Some(&finished));
+    assert!(text.contains(FINISHED), "finished: {text}");
+    assert!(
+        !text.contains(STOPPED) && !text.contains(UNREADABLE),
+        "finished names only itself: {text}"
+    );
+
+    let stopped = saved(|state| {
+        state.stopped = true;
+        state.stop_reason = Some(UNTIL_PLAN_REASON.to_string());
+    });
+    let text = dry_run(Some(&stopped));
+    assert!(
+        text.contains(STOPPED) && text.contains(UNTIL_PLAN_REASON),
+        "stopped, with its reason: {text}"
+    );
+    assert!(
+        !text.contains(FINISHED) && !text.contains(UNREADABLE),
+        "stopped names only itself: {text}"
+    );
+
+    let unloadable = |root: &Path, phase: PhaseId| {
+        let path = devflow_core::workflow::state_path(root, phase);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "{ not a state").unwrap();
+    };
+    let text = dry_run(Some(&unloadable));
+    assert!(text.contains(UNREADABLE), "unloadable: {text}");
+    assert!(
+        !text.contains(FINISHED) && !text.contains(STOPPED),
+        "unloadable names only itself: {text}"
+    );
+
+    let text = dry_run(None);
+    assert!(
+        !text.contains("replaces"),
+        "control: a fresh start replaces nothing: {text}"
+    );
+}
+
 /// WR-01 (phase 20 review): `--dry-run` must reflect `--until` in its
 /// preview instead of always printing the full pipeline as if
 /// `--until` had not been passed.
