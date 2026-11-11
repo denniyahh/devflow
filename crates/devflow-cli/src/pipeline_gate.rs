@@ -891,11 +891,10 @@ mod tests {
     /// --until <stage>` runs `transition`'s `stop_until` clean-stop branch,
     /// which emits `workflow_finished` with a `"stopped_at"` reason and
     /// returns before any hook, stage assignment, or `launch_stage` call —
-    /// `workflow_shipped` must never be emitted on this path, and
-    /// `ship_evidence::collect(..).shipped` must read false even though
-    /// `workflow_finished_seen` is true.
+    /// `workflow_shipped` must never be emitted on this path, while the
+    /// `workflow_finished` it does emit carries the `stopped_at` reason.
     #[test]
-    fn until_stop_never_emits_workflow_shipped_and_ship_evidence_reports_not_shipped() {
+    fn until_stop_never_emits_workflow_shipped() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
@@ -912,14 +911,10 @@ mod tests {
             !devflow_core::events::has_event_for_phase(root, phase, "workflow_shipped"),
             "the --until clean-stop branch must never emit workflow_shipped"
         );
-        let evidence = devflow_core::ship_evidence::collect(root, phase);
-        assert!(
-            !evidence.shipped,
-            "a phase that only stopped after one stage must not read as shipped"
-        );
-        assert!(evidence.workflow_finished_seen);
-        assert_eq!(evidence.finished_reason.as_deref(), Some("stopped_at"));
-        assert!(devflow_core::ship_evidence::is_stopped_at(&evidence));
+        let finished =
+            devflow_core::events::last_event_of_kind_for_phase(root, phase, "workflow_finished")
+                .expect("the --until clean stop emits workflow_finished");
+        assert_eq!(finished["reason"], "stopped_at", "{finished}");
     }
 
     /// 50-13: the `--until` stop clears the supervisor record, because the

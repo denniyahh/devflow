@@ -22,7 +22,7 @@ mod phase_worktree;
 
 mod commands;
 use commands::{
-    cleanup, doctor, evidence, gate_list, gate_respond, gate_show, gate_sweep, history_cmd, logs,
+    cleanup, doctor, gate_list, gate_respond, gate_show, gate_sweep, history_cmd, logs,
     recover_cmd, start, status, stop, stop_launch,
 };
 use devflow_core::phase_id::PhaseId;
@@ -288,25 +288,6 @@ enum Command {
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
-    },
-    /// Report DevFlow's own structural record of whether a phase shipped
-    /// (23-06) — a read-only oracle sourced from the append-only event log,
-    /// not from any agent-authored attestation document. See
-    /// `devflow_core::ship_evidence` for the full contract.
-    Evidence {
-        /// Phase to report on.
-        #[arg(long)]
-        phase: PhaseId,
-        /// Output as JSON.
-        #[arg(long)]
-        json: bool,
-        /// Exit non-zero unless DevFlow's own record shows this phase
-        /// shipped — declarable as a Layer 0 `external_verify` probe.
-        #[arg(long)]
-        require_shipped: bool,
-        /// Project root.
-        #[arg(long)]
-        root: Option<PathBuf>,
     },
 }
 
@@ -587,17 +568,6 @@ fn run() -> Result<(), CliError> {
                 None => stop(&root, phase),
             }
         }
-        Command::Evidence {
-            phase,
-            json,
-            require_shipped,
-            root,
-        } => evidence(
-            &project_root(root.unwrap_or_else(|| PathBuf::from(".")))?,
-            phase,
-            json,
-            require_shipped,
-        ),
     }
 }
 

@@ -144,9 +144,9 @@ pub fn last_event_for_phase(project_root: &Path, phase: PhaseId) -> Option<serde
 ///
 /// This is a targeted, single-event-kind scan, distinct from
 /// [`last_events_by_phase`]'s one-pass "latest event of any kind per phase"
-/// read — `ship_evidence::collect` needs the last occurrence of one
-/// *specific* event name, which the latest-of-any-kind index does not
-/// preserve once a later, different event overwrites it.
+/// read — a caller that needs the last occurrence of one *specific* event
+/// name cannot use that index, which does not preserve it once a later,
+/// different event overwrites it.
 pub fn last_event_of_kind_for_phase(
     project_root: &Path,
     phase: PhaseId,
@@ -411,8 +411,7 @@ mod tests {
 
     // These tests deliberately use a generic marker event name rather than
     // any production event literal, keeping this generic scanner's tests
-    // decoupled from any one caller's naming choice. `ship_evidence::tests`
-    // exercises this same scanner against its real, specific event name.
+    // decoupled from any one caller's naming choice.
     const MARKER_EVENT: &str = "marker_event";
 
     #[test]
