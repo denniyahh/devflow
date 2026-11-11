@@ -45,7 +45,7 @@ environment variables, not config file fields:
 | `DEVFLOW_CAPTURE_RETENTION` | 5 | Override capture generations retained per phase |
 | `DEVFLOW_EXTERNAL_VERIFY_ENABLED` | true | Enable or disable PLAN-declared external probes |
 | `DEVFLOW_TRUST_EXTERNAL_VERIFY` | unset | Exact reviewed PLAN probe commands as a JSON string array; required in addition to enabling probes |
-| `RUST_LOG` | `info` | Log verbosity (stderr) |
+| `RUST_LOG` | `off` | Tracing verbosity (stderr). Unset or empty prints no tracing lines; set a level such as `info` or `debug` to see them |
 | `DEVFLOW_LOG_FORMAT` | plain text | Set to `json` for machine-readable log lines |
 
 Gate metadata (`DEVFLOW_GATE_PHASE`/`DEVFLOW_GATE_STAGE`/`DEVFLOW_GATE_CONTEXT`)

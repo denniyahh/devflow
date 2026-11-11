@@ -373,7 +373,7 @@ for agent/system output and structured results.
 
 | Environment variable | Purpose | Default |
 |---|---|---|
-| `RUST_LOG` | Controls log verbosity via `tracing-subscriber::EnvFilter`. Accepts bare levels (`error`, `warn`, `info`, `debug`, `trace`) or targeted directives (`devflow_core=debug,devflow=info`). | `info` |
+| `RUST_LOG` | Controls log verbosity via `tracing-subscriber::EnvFilter`. Accepts bare levels (`error`, `warn`, `info`, `debug`, `trace`) or targeted directives (`devflow_core=debug,devflow=info`). Unset or empty prints no tracing lines. | `off` |
 | `DEVFLOW_LOG_FORMAT` | When set to `json`, enables JSON-structured log output (one JSON object per line on stderr). Any other value (or unset) produces human-readable plain-text logs. | plain text |
 
 ### Instrumentation
@@ -419,8 +419,9 @@ DEVFLOW_LOG_FORMAT=json RUST_LOG=info cargo run -- status 2>devflow.json
 head -1 devflow.json | python3 -m json.tool  # Should parse as valid JSON
 ```
 
-`devflow doctor` includes a `RUST_LOG` environment check that validates the
-variable is set to a parseable value and warns when it is missing or invalid.
+`devflow doctor` includes a `RUST_LOG` environment check: an unset or empty
+value is reported as information (tracing is off, and the row says how to turn
+it on), and a value that does not parse is a warning.
 
 ## Extension points — adding an agent
 
