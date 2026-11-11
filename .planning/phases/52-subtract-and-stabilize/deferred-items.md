@@ -14,11 +14,13 @@
 
 - `gate_sweep_e2e::no_suite_on_the_common_builder_runs_a_real_reap_strays_pass` guards a removed flag (found in 52-03)
   status: open
+  **52-18:** not deleted. The removed-surface scan read its assertion messages as leftovers, so 52-18 split the flag in those messages with `concat!` like the other controls; the test still passes and still guards nothing. Deleting it remains open (file outside 52-18's list).
   **What:** the source scan refuses any test that passes `--reap-strays` without `--dry-run`. Since 52-03, clap rejects `--reap-strays`, so a real pass can no longer run from any suite and the guard protects nothing. It still passes: `phase7_cli::removed_flags_are_unknown` passes the flag together with `--dry-run`.
   **Fix shape:** delete the test, `REAP_STRAYS_LITERAL`, `DRY_RUN_LITERAL`, `real_reap_strays_statements` and `code_only` if nothing else in `gate_sweep_e2e.rs` uses it. `gate_sweep_e2e.rs` was not in 52-03's files.
 
 - Comments and test wording still describe the removed rate-limit cron resume (found in 52-10)
   status: open
+  **52-18:** not taken. The scan strips comments by design and finds none of these; the wording is outside 52-18's files. Still open for 52-31/52-32.
   **What:** 52-10 removed the cron-instructions file and every reader. Doc comments that still describe a "resume cron" or "cron arm" as live behaviour remain in `crates/devflow-core/src/agent_result.rs` (about nine, e.g. "drives the primary rate-limit resume cron"), `monitor.rs`, `state.rs` (`fallback_agent` doc, "takes the cron-resume arm"), `reset_time.rs`, `crates/devflow-cli/src/staleness.rs` and `pipeline_outcomes.rs:94`. In `pipeline_launch.rs` tests, names and messages still say "cron arm" (`a_cron_resume_and_an_ordinary_resume_refuse_alike_*`, "a failed relaunch never takes the cron arm (R2-D1)"), and the SUPV-01 evidence check requires a `Cron arm: ` conclusion line.
   **Why deferred:** comments and test wording only; none names the `cron-instructions` token outside comments, so the 52-18 scan does not see them. The test names are cited by the 51-10 SUPV-01 evidence file, so renaming them needs that file changed in the same commit. None of these files except `pipeline_launch.rs`/`pipeline_outcomes.rs` was in 52-10's scope.
   **Fix shape:** reword the comments to say the run waits at the rate-limit gate; rename the `a_cron_resume_*` tests and their `Cron arm` evidence label together with `.planning/milestones/v3.0.0-phases/51-rate-limit-agent-failover/51-SUPV01-EVIDENCE.md`, or leave the evidence label as history. Fits 52-18 (the CUT-04 scan plan) or 52-31/52-32.
@@ -32,12 +34,14 @@
 
 - `GitFlow::commit_all` lost its only caller with the hooks (found in 52-12)
   status: open
+  **52-18:** not taken. 52-18's semver run reports only removals already made by 52-01..52-17; deleting `commit_all` and the six other uncalled `GitFlow` functions is a new `pub` removal outside its files. Still open.
   **What:** `crates/devflow-core/src/git.rs` `commit_all` was called only from the deleted `hooks.rs`. It now has no caller outside `git.rs`, beside the already-uncalled `branch_tip`, `delete_remote_branch`, `ensure_branch`, `feature_finish`, `release_start` and `release_finish` (measured with a per-name `rg -w` over `crates/` and `tools/` excluding `git.rs`).
   **Why deferred:** all are `pub` in the published devflow-core, and git.rs was in 52-12's scope only for its `hooks::` comments.
   **Fix shape:** in a devflow-core plan under the 4.0.0 bump (52-18's breaking-change check is the natural place), delete each one `rg` still shows uncalled, with its tests, and record the expected `function_missing` from `cargo semver-checks check-release -p devflow-core`.
 
 - Docs-site pages still describe the after-ship hooks (found in 52-12)
-  status: open
+  status: resolved
+  **Resolution (52-18):** the whole-Ship pages `docs/architecture/git-ship.md` and `docs/diagrams/ship-flow.md` are deleted; `docs/index.md`, `docs/architecture/overview.md`, `state-machine.md`, `agent-model.md`, `docs/diagrams/agent-lifecycle.md`, `module-map.md` and `system.md` describe Plan → Code → Validate with no hooks, version, lock or ship module. `doc_check::docs_site_describes_only_the_kept_pipeline` pins it.
   **What:** `docs/index.md` ("terminal hooks"), `docs/diagrams/system.md`, `docs/diagrams/module-map.md` (a `hooks` node), `docs/architecture/state-machine.md`, `docs/architecture/overview.md` and `docs/architecture/git-ship.md` still name the hooks module and the Validate→Ship and after-ship hook batches. 52-12 changed only the scoped docs doc_check reads.
   **Fix shape:** 52-18 rewrites the docs site to the kept pipeline and deletes the whole-Ship pages; include these mentions there.
 
@@ -48,6 +52,7 @@
 
 - A CLI test fixture comment still names the removed after-ship hooks (found in 52-13)
   status: open
+  **52-18:** not taken: the scan strips comments, so it does not see this one, and `test_support.rs` is outside 52-18's files. Still open.
   **What:** `crates/devflow-cli/src/test_support.rs` `init_repo`'s doc comment says the fixture exists so "the terminal-path hooks (`VersionBump`, `BranchCleanup`) exercised below" have real git plumbing. 52-12 removed those hooks and 52-13 removed `version.rs`; the fixture is still used, but not for that reason.
   **Why deferred:** comment only, and the file was not in 52-13's list; 52-13 rewrote only comments that pointed at the modules it deleted.
   **Fix shape:** reword it to say the fixture builds a main + develop repo with a committed Cargo.toml. Fits 52-18's comment-stripped scan pass.
@@ -74,11 +79,13 @@
 
 - `devflow doctor` still checks for the `gh` CLI, which nothing runs (found in 52-15)
   status: open
+  **52-18:** not taken (outside its files). 52-18 dropped "since the Ship stage was removed" from the quickstart's gh line, which now reads "`devflow doctor` checks for it; no DevFlow command runs it". Still open.
   **What:** `commands.rs` doctor has a `cmd_check("gh CLI", "gh", ...)`. A per-name search for a `gh` invocation under `crates/` and `tools/` finds only that check (the other hits are comments about `gh pr checks`). The Ship stage's `/gsd-ship` ran inside the agent, not DevFlow, and it is gone. 52-15 reworded README.md's and the quickstart's requirement line to say so rather than drop it while doctor still checks it.
   **Fix shape:** drop the doctor check and both requirement lines together, or keep `gh` as an operator convenience and say why. Fits 52-18.
 
 - Comments and a few test names still describe Ship as the stage after Validate (found in 52-15)
   status: open
+  **52-18:** not taken. The scan strips comments and matches only the named tokens, so prose and these test names pass it; the files are outside 52-18's list. Still open.
   **What:** prose only, no `Stage::Ship` or `"ship"` literal: doc comments in `agent_result.rs` (ten lines, e.g. "should advance Validate to Ship"), `state.rs` (the module doc's stage list and the `stopped` field doc), `gsd_config.rs:352` and `:618`, `git.rs:213`, `staleness.rs:214`, `preflight.rs:1090`, `commands.rs:624`, `tests/auto_chain_leak_repair_e2e.rs:514`; the `pipeline_outcomes` tests `validate_gaps_does_not_advance_to_ship` and `grafted_failure_shape_gates_instead_of_shipping` and their messages; and `pipeline_gate::until_stop_never_emits_workflow_shipped`, which asserts the absence of an event nothing emits since 52-12. The failure-cap sentence "approve to ship" in `pipeline_outcomes.rs` is 52-33's, as 52-08 recorded.
   **Fix shape:** reword the comments to say a passing Validate finishes the run, and rename the tests. Fits 52-18's comment-stripped scan pass, which does not see prose.
 
