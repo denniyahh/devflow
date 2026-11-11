@@ -732,6 +732,7 @@ value falls back silently from the operator's point of view (the warning goes to
 off by default since 52-23). Breaks the fail-closed-observability rule.
 **Fix shape:** validate it once in the foreground at `devflow start`/`resume` and refuse or print a `warning:` line,
 or record an event the operator sees in `status`. Small: next phase or any fix branch.
+**Taken into Phase 52.1** (operator, 2026-11-11: accepted 52.1-CONTEXT D-03).
 
 ### Phase 999.228: `devflow doctor` Still Checks for the `gh` CLI (BACKLOG)
 
@@ -915,6 +916,7 @@ HEAD lacks the key and the working copy holds `false`, either commit with an acc
 working tree `false` → no killed-run notice.
 
 **Disposition (operator, 2026-11-10):** a separate fix branch after Phase 52, not folded into the phase.
+**Taken into Phase 52.1** (operator, 2026-11-11: accepted 52.1-CONTEXT D-02, superseding the line above).
 
 ### Phase 999.218: The Plan-Bashism Scanner Drops the Finding Text When the File Path Is Long (DUPLICATE of 999.169)
 
