@@ -10249,6 +10249,381 @@ mod tests {
         registration.finish();
     }
 
+    /// A registered gate of `kind` at `stage` with `context`; `None` writes a
+    /// file with no kind (a 3.x or hand-written file), whose waiter is live.
+    fn registered_gate_of(
+        root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        kind: Option<devflow_core::gates::GateKind>,
+        context: &str,
+    ) -> WaiterRegistration {
+        let label = kind.unwrap_or(devflow_core::gates::GateKind::StageFailure);
+        let (_, registration) = Gates::open_registered(root, phase, stage, label, context).unwrap();
+        if kind.is_none() {
+            let path = Gates::gate_path(root, phase, stage);
+            let mut gate: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let object = gate.as_object_mut().unwrap();
+            object.remove("gate_kind");
+            object.remove("gsd_status");
+            std::fs::write(&path, serde_json::to_string(&gate).unwrap()).unwrap();
+        }
+        registration
+    }
+
+    /// The stage a gate of `kind` opens at in these tests.
+    fn print_stage(kind: Option<devflow_core::gates::GateKind>) -> Stage {
+        match crate::pipeline_outcomes::answer_family(kind) {
+            crate::pipeline_outcomes::AnswerFamily::Verification => Stage::Validate,
+            _ => Stage::Code,
+        }
+    }
+
+    /// A Code-stage state for `phase` under Claude, its recorded canary set to
+    /// `canary`, saved under `root`.
+    fn print_state(
+        root: &Path,
+        phase: PhaseId,
+        canary: Option<devflow_core::canary::CanaryOutcome>,
+    ) -> State {
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Supervise, root.to_path_buf());
+        state.stage = Stage::Code;
+        state.canary = canary;
+        workflow::save_state(&state).unwrap();
+        state
+    }
+
+    /// D-10, D-39: `gate reject` prints the route its answer runs, for a gate of
+    /// every kind, from the routers over the gate file on disk: `/gsd-quick`
+    /// with the note on every verification kind, the stage's relaunch with the
+    /// note on a stage failure. A reject the supervisor's screen refuses
+    /// (preflight, checkpoint declaration, a kindless file, a whitespace-only
+    /// note) exits non-zero, names the answers that apply and writes nothing.
+    /// Decoys: a `clean_pass` gate whose context reads like a stage failure
+    /// prints `/gsd-quick`, and a `stage_failure` gate whose context names
+    /// `gaps_found` prints the relaunch. Canary row: a stage failure on a run
+    /// whose recorded delivery canary refuses its agent prints the stop and the
+    /// `--agent <other>` resume; its control, an admitting canary, prints the
+    /// relaunch.
+    #[test]
+    fn gate_reject_prints_the_route_it_will_run() {
+        use crate::pipeline_outcomes::{AnswerFamily, answer_family};
+        use devflow_core::canary::CanaryOutcome;
+        use devflow_core::gates::GateKind;
+        const NOTE: &str = "rename `--quiet` to `--silent`; keep the alias";
+        let reject = |root: &Path, phase: PhaseId, stage: Stage, note: &str| {
+            gate_respond_report(
+                root,
+                phase,
+                Some(stage),
+                GateAnswerKind::Reject,
+                Some(note.to_string()),
+                None,
+            )
+        };
+        for (index, kind) in crate::test_support::every_gate_kind()
+            .into_iter()
+            .enumerate()
+        {
+            let row = format!("{kind:?}");
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = PhaseId::new(6100 + u32::try_from(index).unwrap());
+            let stage = print_stage(kind);
+            print_state(root, phase, None);
+            let registration = registered_gate_of(root, phase, stage, kind, "a gate");
+            let family = answer_family(kind);
+            if matches!(
+                family,
+                AnswerFamily::Verification | AnswerFamily::StageFailure
+            ) {
+                let refused = reject(root, phase, stage, " \t ").expect_err(&row);
+                assert!(
+                    refused.to_string().contains("refused")
+                        && refused.to_string().contains("devflow gate reject --note"),
+                    "{row}: a whitespace-only note is refused, naming the answers: {refused}"
+                );
+                assert!(
+                    gate_answer_files(root, phase, stage).is_empty(),
+                    "{row}: a refused reject writes nothing"
+                );
+            }
+            match family {
+                AnswerFamily::Verification => {
+                    let printed = reject(root, phase, stage, NOTE).expect(&row);
+                    assert!(
+                        printed.contains("route: quick")
+                            && printed.contains("`/gsd-quick` with the note")
+                            && printed.contains(NOTE),
+                        "{row}: {printed}"
+                    );
+                }
+                AnswerFamily::StageFailure => {
+                    let printed = reject(root, phase, stage, NOTE).expect(&row);
+                    assert!(
+                        printed.contains("route: relaunch_with_note")
+                            && printed.contains("relaunches the code stage with the note")
+                            && printed.contains(NOTE),
+                        "{row}: {printed}"
+                    );
+                    assert!(!printed.contains("/gsd-quick"), "{row}: {printed}");
+                }
+                AnswerFamily::Preflight
+                | AnswerFamily::CheckpointDeclaration
+                | AnswerFamily::Unclassified => {
+                    let refused = reject(root, phase, stage, NOTE).expect_err(&row);
+                    assert!(
+                        refused.to_string().contains("refused")
+                            && refused.to_string().contains("devflow gate abort"),
+                        "{row}: the refusal names the answers that apply: {refused}"
+                    );
+                    assert!(
+                        gate_answer_files(root, phase, stage).is_empty(),
+                        "{row}: a refused reject writes nothing"
+                    );
+                }
+            }
+            registration.finish();
+        }
+
+        // Decoys: the context says the other family's words.
+        let decoys = [
+            (
+                GateKind::CleanPass,
+                "[never-silent] stage code failed: no output for 900s",
+                "route: quick",
+            ),
+            (
+                GateKind::StageFailure,
+                "GSD verification: gaps_found. Approving closes the gaps.",
+                "route: relaunch_with_note",
+            ),
+        ];
+        for (index, (kind, context, route)) in decoys.into_iter().enumerate() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = PhaseId::new(6150 + u32::try_from(index).unwrap());
+            let stage = print_stage(Some(kind));
+            print_state(root, phase, None);
+            let registration = registered_gate_of(root, phase, stage, Some(kind), context);
+            let printed = reject(root, phase, stage, NOTE).unwrap();
+            assert!(printed.contains(route), "decoy {kind:?}: {printed}");
+            registration.finish();
+        }
+
+        // Canary row and its control.
+        for (index, (canary, route, way_on)) in [
+            (CanaryOutcome::Absent, "route: relaunch_refused", true),
+            (CanaryOutcome::Confirmed, "route: relaunch_with_note", false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = PhaseId::new(6160 + u32::try_from(index).unwrap());
+            print_state(root, phase, Some(canary.clone()));
+            let registration = registered_gate_of(
+                root,
+                phase,
+                Stage::Code,
+                Some(GateKind::StageFailure),
+                "a gate",
+            );
+            let printed = reject(root, phase, Stage::Code, NOTE).unwrap();
+            assert!(printed.contains(route), "{canary:?}: {printed}");
+            assert_eq!(
+                printed.contains(&format!("`devflow resume --phase {phase} --agent <other>`")),
+                way_on,
+                "{canary:?}: {printed}"
+            );
+            registration.finish();
+        }
+    }
+
+    /// D-45 rule 2, D-39: `gate approve` prints the route its answer runs. A
+    /// verification approve reads GSD and HEAD now through `read_evidence`, prints
+    /// the route `approve_route` gives (one row per table row: finish, Validate
+    /// again, gap loop, re-verify, reopen), and says the supervisor reads again
+    /// when it picks the answer up. A status-less approve prints its own route,
+    /// and the GSD stub logs no read. A kindless file is refused and nothing is
+    /// written. Decoy: a gate whose context and label say `passed` while GSD
+    /// now reads `gaps_found` prints the gap loop. Canary row: a stage failure
+    /// under a refusing canary prints the stop and the `--agent <other>`
+    /// resume, with no GSD read; control: an admitting canary prints the retry.
+    /// A state that cannot be loaded is named, not guessed.
+    #[test]
+    fn gate_approve_prints_the_route_it_will_run() {
+        use crate::pipeline_outcomes::{AnswerFamily, answer_family};
+        use crate::test_support::{gsd_says, validate_evidence};
+        use devflow_core::canary::CanaryOutcome;
+        use devflow_core::gates::GateKind;
+        use devflow_core::gsd_reader::GsdStatus;
+        const PICKUP: &str = "the supervisor reads GSD's verification status again when it \
+                              picks this answer up";
+        let approve = |root: &Path, phase: PhaseId, stage: Stage| {
+            gate_respond_report(root, phase, Some(stage), GateAnswerKind::Approve, None, None)
+        };
+
+        // One row per table row of the verification approve.
+        let table: [(GsdStatus, bool, &str); 6] = [
+            (GsdStatus::Passed, true, "route: finish"),
+            (GsdStatus::Passed, false, "route: validate_again"),
+            (GsdStatus::GapsFound, true, "route: gap_loop"),
+            (GsdStatus::Stale, false, "route: reverify"),
+            (GsdStatus::Missing, false, "route: reverify"),
+            (GsdStatus::HumanNeeded, true, "route: reopen"),
+        ];
+        for (index, (status, pass_on_head, route)) in table.into_iter().enumerate() {
+            let row = format!("{status:?}, pass on HEAD {pass_on_head}");
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = PhaseId::new(6200 + u32::try_from(index).unwrap());
+            let gsd = validate_evidence(root, phase, &[gsd_says(status)]);
+            let mut state = print_state(root, phase, None);
+            state.stage = Stage::Validate;
+            if pass_on_head {
+                state.validate_pass_head = Some(crate::test_support::repo_with_head(root));
+            }
+            workflow::save_state(&state).unwrap();
+            let registration = registered_gate_of(
+                root,
+                phase,
+                Stage::Validate,
+                Some(GateKind::CleanPass),
+                "a gate",
+            );
+            let printed = approve(root, phase, Stage::Validate).expect(&row);
+            assert!(printed.contains(route), "{row}: {printed}");
+            assert!(printed.contains(PICKUP), "{row}: {printed}");
+            assert_eq!(gsd.calls().len(), 1, "{row}: one status read now");
+            registration.finish();
+        }
+
+        for (index, kind) in crate::test_support::every_gate_kind()
+            .into_iter()
+            .enumerate()
+        {
+            let row = format!("{kind:?}");
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = PhaseId::new(6220 + u32::try_from(index).unwrap());
+            let stage = print_stage(kind);
+            let gsd = validate_evidence(root, phase, &[gsd_says(GsdStatus::Stale)]);
+            let mut state = print_state(root, phase, None);
+            state.stage = stage;
+            workflow::save_state(&state).unwrap();
+            let registration = registered_gate_of(root, phase, stage, kind, "a gate");
+            let expected = match answer_family(kind) {
+                AnswerFamily::Verification => Some("route: reverify"),
+                AnswerFamily::StageFailure => Some("route: retry_stage"),
+                AnswerFamily::Preflight => Some("route: preflight_override"),
+                AnswerFamily::CheckpointDeclaration => Some("route: record_checkpoint_set"),
+                AnswerFamily::Unclassified => None,
+            };
+            match expected {
+                Some(route) => {
+                    let printed = approve(root, phase, stage).expect(&row);
+                    assert!(printed.contains(route), "{row}: {printed}");
+                    let verification = answer_family(kind) == AnswerFamily::Verification;
+                    assert_eq!(printed.contains(PICKUP), verification, "{row}: {printed}");
+                    assert_eq!(
+                        gsd.calls().len(),
+                        usize::from(verification),
+                        "{row}: only a verification approve reads GSD"
+                    );
+                }
+                None => {
+                    let refused = approve(root, phase, stage).expect_err(&row);
+                    assert!(
+                        refused.to_string().contains("refused")
+                            && refused.to_string().contains("devflow gate abort"),
+                        "{row}: {refused}"
+                    );
+                    assert!(gate_answer_files(root, phase, stage).is_empty(), "{row}");
+                    assert!(gsd.calls().is_empty(), "{row}");
+                }
+            }
+            registration.finish();
+        }
+
+        // Decoy: the gate's context and label say `passed`; GSD reads
+        // `gaps_found` now.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(6240);
+        let _gsd = validate_evidence(root, phase, &[gsd_says(GsdStatus::GapsFound)]);
+        let mut state = print_state(root, phase, None);
+        state.stage = Stage::Validate;
+        state.validate_pass_head = Some(crate::test_support::repo_with_head(root));
+        workflow::save_state(&state).unwrap();
+        let (_, registration) = Gates::open_registered(
+            root,
+            phase,
+            Stage::Validate,
+            devflow_core::gates::GateLabel {
+                kind: GateKind::CleanPass,
+                gsd_status: Some(GsdStatus::Passed),
+            },
+            "Validation passed. GSD verification: passed.",
+        )
+        .unwrap();
+        let printed = approve(root, phase, Stage::Validate).unwrap();
+        assert!(printed.contains("route: gap_loop"), "decoy: {printed}");
+        registration.finish();
+
+        // Canary row and its control: no GSD read either way.
+        for (index, (canary, route, way_on)) in [
+            (CanaryOutcome::Absent, "route: relaunch_refused", true),
+            (CanaryOutcome::Confirmed, "route: retry_stage", false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = PhaseId::new(6250 + u32::try_from(index).unwrap());
+            let gsd = validate_evidence(root, phase, &[gsd_says(GsdStatus::Passed)]);
+            print_state(root, phase, Some(canary.clone()));
+            let registration = registered_gate_of(
+                root,
+                phase,
+                Stage::Code,
+                Some(GateKind::StageFailure),
+                "a gate",
+            );
+            let printed = approve(root, phase, Stage::Code).unwrap();
+            assert!(printed.contains(route), "{canary:?}: {printed}");
+            assert_eq!(
+                printed.contains(&format!("`devflow resume --phase {phase} --agent <other>`")),
+                way_on,
+                "{canary:?}: {printed}"
+            );
+            assert!(gsd.calls().is_empty(), "{canary:?}: no GSD read");
+            registration.finish();
+        }
+
+        // A state that cannot be loaded is named; no route is guessed.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(6260);
+        let registration = registered_gate_of(
+            root,
+            phase,
+            Stage::Code,
+            Some(GateKind::StageFailure),
+            "a gate",
+        );
+        let printed = approve(root, phase, Stage::Code).unwrap();
+        assert!(
+            printed.contains("route: not known") && printed.contains("state could not be loaded"),
+            "{printed}"
+        );
+        assert!(!printed.contains("route: retry_stage"), "{printed}");
+        registration.finish();
+    }
+
     #[test]
     fn gate_respond_requires_stage_when_ambiguous_and_errors_when_none_open() {
         let dir = tempfile::tempdir().unwrap();

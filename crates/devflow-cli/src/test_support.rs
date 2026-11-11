@@ -982,6 +982,45 @@ pub(crate) fn validate_evidence(
     GsdStub::answering(evidence_root, responses)
 }
 
+/// Every gate kind, then a file with no kind (C11). The `match` has no
+/// wildcard, so a kind added later fails the build here until its row is
+/// written.
+pub(crate) fn every_gate_kind() -> Vec<Option<devflow_core::gates::GateKind>> {
+    use devflow_core::gates::GateKind;
+    let all = [
+        GateKind::CleanPass,
+        GateKind::GapsFound,
+        GateKind::ReverifyNeeded,
+        GateKind::HumanNeeded,
+        GateKind::DisagreementOverPassed,
+        GateKind::DisagreementOverHumanNeeded,
+        GateKind::ReaderFailure,
+        GateKind::AmbiguousVerdict,
+        GateKind::FailureCap,
+        GateKind::NoGapClosurePlan,
+        GateKind::StageFailure,
+        GateKind::Preflight,
+        GateKind::CheckpointDeclaration,
+    ];
+    let listed = |kind: GateKind| match kind {
+        GateKind::CleanPass
+        | GateKind::GapsFound
+        | GateKind::ReverifyNeeded
+        | GateKind::HumanNeeded
+        | GateKind::DisagreementOverPassed
+        | GateKind::DisagreementOverHumanNeeded
+        | GateKind::ReaderFailure
+        | GateKind::AmbiguousVerdict
+        | GateKind::FailureCap
+        | GateKind::NoGapClosurePlan
+        | GateKind::StageFailure
+        | GateKind::Preflight
+        | GateKind::CheckpointDeclaration => all.contains(&kind),
+    };
+    assert!(all.iter().all(|kind| listed(*kind)));
+    all.into_iter().map(Some).chain([None]).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
