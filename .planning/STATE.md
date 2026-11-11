@@ -5,16 +5,16 @@ milestone_name: Session Continuity
 current_phase: 52
 current_phase_name: Subtract and Stabilize
 status: executing
-stopped_at: Completed 52-24-PLAN.md
-last_updated: "2026-11-11T08:18:42.590Z"
+stopped_at: Completed 52-25-PLAN.md
+last_updated: "2026-11-11T08:52:34.351Z"
 last_activity: 2026-11-10
 last_activity_desc: Phase 52 execution started
-state_head: 54fe444e5cea24e58b6231355336630004e7dac8
+state_head: 8df8c1e931929b8868b02b213740b38d1e88a449
 progress:
   total_phases: 4
   completed_phases: 0
   total_plans: 33
-  completed_plans: 24
+  completed_plans: 25
   percent: 0
 ---
 
@@ -159,7 +159,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 52 (Subtract and Stabilize) — EXECUTING
-Plan: 25 of 33
+Plan: 26 of 33
 Status: Ready to execute
 Last activity: 2026-11-10 — Phase 52 execution started
 
@@ -879,6 +879,9 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 52]: 52-23: gate list now also warns when a gate file cannot be read, not only when it does not parse
 - [Phase 52]: 52-24: Validate routes on GSD's verification status only; select_loop_back_fix, verification_authored_this_run and stamp_validate_dispatch_window are deleted, and 999.192's case is pinned by a_verifier_written_report_from_code_routes_by_gsd_status
 - [Phase 52]: 52-24: State loses last_verification_fingerprint, last_verification_mtime_nanos and verification_run_nonce (old state files load and drop them on save); verification_baseline_captured is kept because commands::run_never_prepared reads it
+- [Phase 52]: 52-25: status calls a run active only when it is not stopped and its recorded worktree exists; the active phases header lists only those, and other phases names each other phase's kind
+- [Phase 52]: 52-25: cleanup --force removes a run's state only when that state records the removed worktree or none; merged branches still checked out are skipped via the additive GitFlow::cleanup_merged_keeping
+- [Phase 52]: 52-25: whether a start over a finished state carries phase_validate_failures is left to the operator (deferred-items.md), recommendation: start at zero
 
 ## Roadmap Evolution
 
@@ -1014,11 +1017,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 52 P22 | 59 min | 4 tasks | 24 files |
 | Phase 52 P23 | 32 min | 3 tasks | 14 files |
 | Phase 52 P24 | 26 min | 2 tasks | 6 files |
+| Phase 52 P25 | 23 min | 3 tasks | 5 files |
 
 ## Session
 
-**Last session:** 2026-11-11T08:18:42.303Z
-**Stopped at:** Completed 52-24-PLAN.md
+**Last session:** 2026-11-11T08:52:34.093Z
+**Stopped at:** Completed 52-25-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
