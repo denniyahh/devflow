@@ -14,10 +14,13 @@ Plan → Code → Validate
 
 - **Plan / Code** launch a headless coding agent with the stage's
   GSD command.
-- **Validate** requires an explicit `verdict: pass` from the agent to
-  pass; gaps loop back to Code (after `MAX_CONSECUTIVE_FAILURES` = 3
-  failures a gate is forced). Validate is the last stage that runs: a pass
-  ends the run as finished and leaves the worktree and branch in place
+- **Validate** passes only when the agent reports an explicit
+  `verdict: pass` **and** GSD's own reader, `gsd query verification status`,
+  reports `passed` for the phase ([How Validate decides](#how-validate-decides)).
+  Any other answer routes by GSD's status: gaps loop back to Code (after
+  `MAX_CONSECUTIVE_FAILURES` = 3 failures a gate is forced), and a reader
+  that cannot answer stops at a gate. Validate is the last stage that runs: a
+  pass ends the run as finished and leaves the worktree and branch in place
   ([How a run ends](#how-a-run-ends)).
 - Modes: `--mode auto` (finishes on a passing Validate without a gate;
   only never-silent failure gates and the failure caps stop it) or
@@ -372,6 +375,46 @@ The way on when the fallback's canary refused:
   runs its own. A plain `devflow resume --phase N` is refused by the same
   recorded canary before it changes anything, so the stop reason that names
   the way on is kept.
+
+## How Validate decides
+
+A Validate verdict has two halves: the validate agent's own `verdict`, and
+the status GSD's reader reports for the phase. DevFlow never parses
+`VERIFICATION.md` itself. After every Validate it runs
+`gsd query verification status <phase dir>` through GSD's `gsd_run`
+launcher, found under the run's `HOME` (`.claude/gsd-core/bin/`, then
+`.codex/gsd-core/bin/`, then `.pi/agent/gsd-core/bin/`). The read runs in the
+phase's worktree, where the Validate agent wrote its report (the main checkout
+when the run uses `--no-worktree`), and is killed after 60 seconds.
+
+| GSD status | After an agent pass | After an agent fail |
+|---|---|---|
+| `passed` | auto: the run finishes; supervise: the Validate gate, whose approval finishes the run | a gate: the agent and GSD disagree; approving runs Validate again |
+| `gaps_found` | auto: back to Code for a gaps-only pass; supervise: a gate whose approval or rejection loops back the same way | the same |
+| `stale` or `missing` | auto: back to Code with the full execute command, which re-runs the verifier; supervise: a `reverify_needed` gate, and nothing launches until it is answered | the same |
+| `human_needed` | a gate in both modes; approving runs Validate again | a gate: the agent and GSD disagree |
+| no answer | a `[never-silent]` gate naming the failure: no launcher, a non-zero exit, a timeout, output that is not JSON, a status outside GSD's set, no phase directory, and the like. It is never a pass and never a silent retry | the same |
+
+An agent pass over any status but `passed` counts as a Validate failure, so the
+consecutive-failure and per-phase caps still bound the loop; at a cap the run
+stops at a gate whatever the status says. An ambiguous verdict (the external
+verification probe succeeded but the agent reported gaps or no verdict)
+always stops at a gate. A gate context quotes GSD's status as GSD printed it
+and says `passed` only when GSD reported `passed`.
+
+What a run records:
+
+- Each Validate read is one `gsd_verification` event: the agent's verdict and
+  GSD's status, or the failure's short label. GSD's message can name absolute
+  paths, so it goes only to the gate context and stderr, never to an event.
+- Every gate file records which gate it is in `gate_kind` (for example
+  `clean_pass`, `gaps_found`, `reverify_needed`, `reader_failure`,
+  `failure_cap`), and the `gate_fired` event carries the same value.
+- An agent pass is recorded in the state file's `validate_pass_head`, the
+  commit the Validate ran on; any other verdict clears it. A commit that cannot
+  be read stops at the `[never-silent]` gate.
+- `devflow start` records the GSD version that answers the run's reads in one
+  `gsd_runtime` event.
 
 ## How a run ends
 
