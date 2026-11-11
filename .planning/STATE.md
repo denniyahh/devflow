@@ -6,10 +6,10 @@ current_phase: 52
 current_phase_name: Subtract and Stabilize
 status: executing
 stopped_at: Completed 52-29-PLAN.md
-last_updated: "2026-11-11T12:49:48.122Z"
+last_updated: "2026-11-11T13:06:32.926Z"
 last_activity: 2026-11-10
 last_activity_desc: Phase 52 execution started
-state_head: fcaf6efb4f3a81b1e57f0821faeea806a69faac2
+state_head: 96f90b119d6930eb9e9e6dbd9621f7ca86167b58
 progress:
   total_phases: 4
   completed_phases: 0
@@ -887,6 +887,7 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 52]: 52-28: a stale or missing Validate takes FixType::StaleReverify, whose prompt quotes GSD's status, route and next action from State.code_fix_report (set with code_fix); record_validate_failure is the one streak update and now also counts the no_gap_closure_plan gate
 - [Phase 52]: 52-29 (operator decision 2026-11-11): a permitted finish wins over a late stop; finish_run no longer stops at safe point 6, the supervisor answers the pending stop already_finished, and a stop without a finish permit keeps its handling
 - [Phase 52]: 52-29: can_finish (FinishPermit, private field) is the one finish check and next_step the one D-45 table; after Validate only a failure_cap label opens ahead of it, so an ambiguous verdict in auto over gaps_found/stale/missing follows the table; a rejected verification gate runs /gsd-quick (FixType::Quick) with the note
+- [Phase 52]: Operator 2026-11-11: a start over a FINISHED run resets phase_validate_failures to zero; a stopped unfinished run still carries it (96f90b1)
 
 ## Roadmap Evolution
 
