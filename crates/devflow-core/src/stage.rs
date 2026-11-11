@@ -151,19 +151,52 @@ mod tests {
 
     #[test]
     fn removed_stage_names_do_not_parse() {
-        let err = "ship"
-            .parse::<Stage>()
-            .expect_err("`ship` names a removed stage and must not parse");
-        let text = err.to_string();
-        let (_, expected) = text
-            .split_once("expected")
-            .expect("the parse error lists the stages it accepts");
-        for kept in ["define", "plan", "code", "validate"] {
-            assert!(expected.contains(kept), "`{kept}` missing from: {text}");
+        for removed in ["define", "ship"] {
+            let err = removed
+                .parse::<Stage>()
+                .expect_err("a removed stage name must not parse");
+            let text = err.to_string();
+            let (_, expected) = text
+                .split_once("expected")
+                .expect("the parse error lists the stages it accepts");
+            for kept in ["plan", "code", "validate"] {
+                assert!(expected.contains(kept), "`{kept}` missing from: {text}");
+            }
+            for gone in ["define", "ship"] {
+                assert!(
+                    !expected.contains(gone),
+                    "the parse error still offers the removed stage `{gone}`: {text}"
+                );
+            }
         }
-        assert!(
-            !expected.contains("ship"),
-            "the parse error still offers a removed stage: {text}"
+    }
+
+    #[test]
+    fn plan_is_the_first_stage_and_validate_the_last() {
+        // Every name a stage has ever had, current or removed. The ones that
+        // still parse are the stage machine; no parsable stage may precede
+        // Plan, and the chain walked from Plan must reach all of them.
+        let parsed: Vec<Stage> = ["define", "plan", "code", "validate", "ship"]
+            .into_iter()
+            .filter_map(|name| name.parse::<Stage>().ok())
+            .collect();
+        for stage in &parsed {
+            assert_ne!(
+                stage.next(),
+                Some(Stage::Plan),
+                "`{stage}` precedes Plan, so Plan is not the first stage"
+            );
+        }
+        let mut chain = vec![Stage::Plan];
+        while let Some(next) = chain.last().copied().and_then(Stage::next) {
+            chain.push(next);
+        }
+        assert_eq!(chain, [Stage::Plan, Stage::Code, Stage::Validate]);
+        assert_eq!(Stage::Validate.next(), None);
+        assert_eq!(
+            parsed.len(),
+            chain.len(),
+            "parsable stages {parsed:?} differ from the chain walked from Plan {chain:?}"
         );
     }
 
