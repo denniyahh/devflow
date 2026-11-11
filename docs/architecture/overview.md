@@ -26,4 +26,3 @@ The split keeps workflow logic testable and independent of both the CLI surface 
 
 - [State Machine](state-machine.md) — Step transitions and serialization
 - [Agent Model](agent-model.md) — Agent trait, adapters, and evaluation
-- [Git & Ship Model](git-ship.md) — Git-flow orchestration
