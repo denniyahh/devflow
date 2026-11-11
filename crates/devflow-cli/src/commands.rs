@@ -1660,6 +1660,27 @@ pub(crate) fn write_lock_line(status: &workflow::WriteLockStatus) -> Option<Stri
     }
 }
 
+/// `status`'s header line naming the phases whose runs are active.
+fn active_phases_line(states: &[State]) -> String {
+    format!(
+        "active phases: {}",
+        states
+            .iter()
+            .map(|s| s.phase.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// `status`'s lines about what a phase's run did: its worktree.
+fn status_run_lines(state: &State) -> Vec<String> {
+    state
+        .worktree_path
+        .iter()
+        .map(|wt| format!("  worktree: {}", wt.display()))
+        .collect()
+}
+
 pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
     // 13-DEFERRED-CR-03 acceptance: enumerate every active phase, not just
     // the last one started.
@@ -1673,14 +1694,7 @@ pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
         // instead of a full-file scan per phase.
         let mut last_events = events::last_events_by_phase(project_root);
         println!("project_root: {}", project_root.display());
-        println!(
-            "active phases: {}",
-            states
-                .iter()
-                .map(|s| s.phase.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
+        println!("{}", active_phases_line(&states));
         for state in &states {
             let gate = if state.gate_pending {
                 "pending"
@@ -1701,8 +1715,8 @@ pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
                 state.started_at,
                 recover::format_age(&state.started_at)
             );
-            if let Some(ref wt) = state.worktree_path {
-                println!("  worktree: {}", wt.display());
+            for line in status_run_lines(state) {
+                println!("{line}");
             }
             current_worktree = current_worktree.or_else(|| state.worktree_path.clone());
             let agent_pid = agent_pid_from_file(project_root, state.phase);
@@ -16608,6 +16622,130 @@ mod tests {
         let mut lines = status_supervisor_lines(root, state, &phase_liveness);
         lines.extend(status_hint_lines(root, state, &phase_liveness));
         lines.join("\n")
+    }
+
+    /// OPS-04: `status` names the fallback agent's state as exactly one of `armed`,
+    /// `spent` or `none`, prints a stopped run's recorded stop reason verbatim, and
+    /// says a finished run (D-35) finished.
+    #[test]
+    fn status_prints_the_stop_reason_and_fallback_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let state_for = |phase: u32| {
+            State::new(
+                PhaseId::new(phase),
+                AgentKind::Claude,
+                Mode::Supervise,
+                root.to_path_buf(),
+            )
+        };
+        let fallback_word = |lines: &[String]| -> Vec<String> {
+            lines
+                .iter()
+                .filter_map(|line| line.trim().strip_prefix("fallback: "))
+                .map(|rest| rest.split_whitespace().next().unwrap_or("").to_string())
+                .collect()
+        };
+
+        let mut armed = state_for(5251);
+        armed.fallback_agent = Some(AgentKind::Codex);
+        let mut spent = state_for(5252);
+        spent.fallback_agent = Some(AgentKind::Codex);
+        spent.fallback_consumed = true;
+        let none = state_for(5253);
+        for (state, word) in [(&armed, "armed"), (&spent, "spent"), (&none, "none")] {
+            let lines = status_run_lines(state);
+            assert_eq!(
+                fallback_word(&lines),
+                vec![word.to_string()],
+                "exactly one fallback word: {lines:?}"
+            );
+        }
+
+        let reason = "stopped after plan completed (--until plan)";
+        let mut stopped = state_for(5254);
+        stopped.stopped = true;
+        stopped.stop_reason = Some(reason.to_string());
+        let lines = status_run_lines(&stopped).join("\n");
+        assert!(lines.contains(reason), "the stop reason verbatim: {lines}");
+        assert!(lines.contains("run: stopped"), "{lines}");
+        assert!(
+            !lines.contains("finished"),
+            "a halt is not a finish: {lines}"
+        );
+
+        let mut finished = state_for(5255);
+        finished.stopped = true;
+        finished.finished = true;
+        finished.stop_reason = Some(crate::pipeline_gate::FINISHED_STOP_REASON.to_string());
+        let lines = status_run_lines(&finished).join("\n");
+        assert!(lines.contains("run: finished"), "{lines}");
+        assert!(
+            lines.contains(crate::pipeline_gate::FINISHED_STOP_REASON),
+            "{lines}"
+        );
+        assert!(!lines.contains("run: active"), "{lines}");
+
+        let in_flight = status_run_lines(&none).join("\n");
+        assert!(
+            !in_flight.contains("stop reason") && !in_flight.contains("finished"),
+            "control: a run that has not stopped prints no stop reason: {in_flight}"
+        );
+    }
+
+    /// OPS-02: a run whose recorded worktree no longer exists is never reported
+    /// active, however live its supervisor record and agent pid look, and the output
+    /// names the missing worktree. Control: the same state with the directory present
+    /// is reported active.
+    #[test]
+    fn status_does_not_report_a_run_with_a_missing_worktree_as_active() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5256);
+        let worktree = root.join(".worktrees").join("phase-5256");
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.worktree_path = Some(worktree.clone());
+        state.supervisor = Some(SupervisorRecord::new(
+            root.join("sup.sock"),
+            "aaaa0000aaaa5256".to_string(),
+            std::process::id(),
+            0,
+            "boot".to_string(),
+        ));
+        workflow::save_state(&state).unwrap();
+        let pid_file = agent_result::agent_pid_path(root, phase);
+        std::fs::create_dir_all(pid_file.parent().unwrap()).unwrap();
+        std::fs::write(&pid_file, std::process::id().to_string()).unwrap();
+        let states = vec![state.clone()];
+        let shown = worktree.display().to_string();
+
+        let lines = status_run_lines(&state).join("\n");
+        assert!(!lines.contains("run: active"), "{lines}");
+        assert!(lines.contains("run: not active"), "{lines}");
+        assert!(
+            lines.contains(&shown) && lines.contains("no longer exists"),
+            "names the missing worktree: {lines}"
+        );
+        let header = active_phases_line(&states);
+        assert!(
+            !header.contains(&phase.to_string()),
+            "the header does not call it active: {header}"
+        );
+
+        std::fs::create_dir_all(&worktree).unwrap();
+        let lines = status_run_lines(&state).join("\n");
+        assert!(lines.contains("run: active"), "control: {lines}");
+        assert!(!lines.contains("no longer exists"), "control: {lines}");
+        assert_eq!(
+            active_phases_line(&states),
+            format!("active phases: {phase}"),
+            "control"
+        );
     }
 
     /// V-07 (criterion 2): while the pending supervisor's lock is held, `status` names
