@@ -18,7 +18,7 @@ use crate::pipeline_gate::{
     LoopBackReason, abort, finish_run, loop_back_to_code, run_gate, run_gate_with_timeout,
 };
 use crate::pipeline_launch::{close_gate, commit, launch_stage, recorded_canary_refusal};
-use devflow_core::gates::{GateAction, GateResponse};
+use devflow_core::gates::GateAction;
 use devflow_core::mode;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::prompt::FixType;
@@ -824,30 +824,22 @@ fn loop_back_reason(baseline_absent: bool) -> LoopBackReason {
     }
 }
 
-/// Decide what happens after the Ship stage completes — always gated.
-///
-/// **The only site in the crate permitted to pass a non-`None` auto-response
-/// to `run_gate_with_timeout`.** This is the routine Ship approval — D-04's
-/// pre-authorization exists to answer exactly this gate. It must never be
-/// generalized into `run_gate_with_timeout`'s own body.
+/// Decide what happens after the Ship stage completes — always gated, and
+/// always answered by a human: the Ship pre-authorization that used to answer
+/// this gate is gone (CUT-02, D-01).
 ///
 /// An approval ends the run as a passing Validate does ([`finish_run`]): no
 /// stage follows Ship, and the after-ship hooks that merged, bumped, tagged
 /// and deleted the branch are gone (CUT-02, D-01, D-23). Only a state written
 /// by an older binary still reaches this gate.
 pub(crate) fn handle_ship_outcome(project_root: &Path, state: &mut State) -> Result<(), CliError> {
-    let auto_response = state.yes_ship.then(|| GateResponse {
-        approved: true,
-        note: Some("pre-authorized by --yes-ship".to_string()),
-        responded_by: Some("--yes-ship".to_string()),
-    });
     match run_gate_with_timeout(
         project_root,
         state,
         Stage::Ship,
         "Ship complete — approve merge?",
         gate_timeout_secs(),
-        auto_response.as_ref(),
+        None,
     )? {
         GateAction::Advance => {
             let _ = close_gate(project_root, state.phase, Stage::Ship);
@@ -4541,10 +4533,6 @@ mod tests {
         let phase = PhaseId::new(86);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Ship;
-        assert!(
-            !state.yes_ship,
-            "no pre-authorization must short-circuit the gate"
-        );
         workflow::save_state(&state).unwrap();
 
         // No {phase:02}-VERIFICATION.md — same mid-arc precondition that
@@ -5065,122 +5053,12 @@ mod tests {
         assert!(!prompt.contains("--gaps-only"));
     }
 
-    /// 23-09 Task 2 origin (D-05), corrected for D-12 (`28-CONTEXT.md`).
-    /// D-12 reversed D-05: `devflow.toml`'s `yes_ship` key now DOES reach
-    /// `state.yes_ship`, via `commands::start`'s new OR-combine
-    /// (`config::yes_ship(project_root) || --yes-ship`,
-    /// `crates/devflow-cli/src/commands.rs`). But this test constructs
-    /// `State::new` directly, never going through `commands::start` — and
-    /// `State::new` takes no project config and reads none, so its own
-    /// assertion (a bare `State::new` never derives `yes_ship` from config)
-    /// remains true both before and after D-12. What *is* now false is the
-    /// old doc comment's broader premise ("`DevflowConfig` has no field of
-    /// that name, so nothing ... could ever reach `State`") — `config.rs`
-    /// gained exactly that field in this same plan (Task 1). The only path
-    /// from `devflow.toml` to `state.yes_ship` is the explicit combine in
-    /// `commands::start`, covered by `crates/devflow-cli/tests/
-    /// yes_ship_config.rs`, not by this unit-level test.
+    /// `handle_ship_outcome` writes a gate request but never writes a
+    /// response: the Ship approval waits for a human.
     #[test]
-    fn state_new_alone_never_derives_yes_ship_from_config() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::write(root.join("devflow.toml"), "yes_ship = true\n").unwrap();
-
-        // The config loader must accept the file — an unknown-to-State-new
-        // key must not be a load failure (fail-soft is the existing
-        // contract; this just proves this specific key doesn't somehow
-        // special-case that).
-        let _config = devflow_core::config::load_config(root);
-
-        // State::new takes no project_root-derived config input at all, so
-        // no devflow.toml key — including yes_ship, now a real config field
-        // — can reach it through this constructor.
-        let state = State::new(
-            PhaseId::new(1),
-            AgentKind::Claude,
-            Mode::Auto,
-            root.to_path_buf(),
-        );
-        assert!(
-            !state.yes_ship,
-            "State::new alone must never derive the Ship pre-authorization from \
-             devflow.toml (D-05, narrowed post-D-12: only commands::start's explicit \
-             OR-combine may do that — see yes_ship_config.rs)"
-        );
-    }
-
-    /// 23-09 Task 1 acceptance: with `state.yes_ship` set, `handle_ship_outcome`
-    /// writes the Ship gate request exactly once (never reopened) and the
-    /// resolved gate carries the flag's literal `--yes-ship` attribution —
-    /// proving the auto-response is written through the normal protocol
-    /// (`gate_fired` → `notify_fired` → `gate_resolved`), not a bypass.
-    #[test]
-    fn handle_ship_outcome_with_yes_ship_auto_approves_exactly_once_with_attribution() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        init_repo(root);
-
-        let phase = PhaseId::new(50);
-        let branch = format!("feature/phase-{padded}", padded = phase.padded());
-        let branch_created = devflow_core::test_support::git_command(root)
-            .args(["branch", &branch, "develop"])
-            .status()
-            .unwrap()
-            .success();
-        assert!(branch_created);
-
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Ship;
-        state.yes_ship = true;
-        workflow::save_state(&state).unwrap();
-
-        handle_ship_outcome(root, &mut state).unwrap();
-
-        // The run finished unattended — no human ever wrote a response.
-        assert!(
-            workflow::load_state(root, phase).is_ok_and(|kept| kept.finished),
-            "the pre-authorized gate must let the run finish without a human"
-        );
-        assert!(!Gates::gate_path(root, phase, Stage::Ship).exists());
-        assert!(gate_answer_files(root, phase, Stage::Ship).is_empty());
-        assert!(gate_claim_files(root, phase, Stage::Ship).is_empty());
-
-        // Exactly one gate_fired for this phase+stage — nothing reopened it.
-        let contents =
-            std::fs::read_to_string(devflow_core::events::events_path(root)).unwrap_or_default();
-        let gate_fired_count = contents
-            .lines()
-            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .filter(|event| {
-                event["event"] == "gate_fired"
-                    && phase.matches_json(event.get("phase"))
-                    && event["stage"] == "ship"
-            })
-            .count();
-        assert_eq!(
-            gate_fired_count, 1,
-            "the Ship gate must be written exactly once, not reopened"
-        );
-
-        let resolved =
-            devflow_core::events::last_event_of_kind_for_phase(root, phase, "gate_resolved")
-                .expect("a gate_resolved event must be recorded");
-        assert_eq!(resolved["stage"], "ship");
-        assert_eq!(resolved["approved"], true);
-        assert_eq!(resolved["action"], "advance");
-        assert_eq!(
-            resolved["responded_by"], "--yes-ship",
-            "the gate ledger must carry the pre-authorization's literal attribution"
-        );
-    }
-
-    /// 23-09 Task 1 acceptance (the negative half): with `state.yes_ship`
-    /// unset (the default), `handle_ship_outcome` writes a gate request but
-    /// never writes a response — the routine Ship approval still waits for a
-    /// human exactly as before this flag existed.
-    #[test]
-    fn handle_ship_outcome_without_yes_ship_writes_gate_but_no_response() {
-        const NAME: &str = "pipeline_outcomes::tests::handle_ship_outcome_without_yes_ship_writes_gate_but_no_response";
+    fn handle_ship_outcome_writes_gate_but_no_response() {
+        const NAME: &str =
+            "pipeline_outcomes::tests::handle_ship_outcome_writes_gate_but_no_response";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_git_only_path_dir();
             let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
@@ -5194,7 +5072,6 @@ mod tests {
         let phase = PhaseId::new(51);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Ship;
-        assert!(!state.yes_ship, "yes_ship must default to false");
         workflow::save_state(&state).unwrap();
 
         let gate_path = Gates::gate_path(root, phase, Stage::Ship);
@@ -5218,7 +5095,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
             assert!(
                 gate_answer_files(root, phase, Stage::Ship).is_empty(),
-                "with yes_ship unset, no response may ever be auto-written — the run must wait for a human"
+                "no response may ever be auto-written — the run must wait for a human"
             );
 
             // Unblock the poll so the spawned thread finishes.
@@ -5396,7 +5273,7 @@ mod tests {
             root,
             phase,
             Stage::Code,
-            &GateResponse {
+            &devflow_core::gates::GateResponse {
                 approved: false,
                 note: Some("abort: test cleanup".into()),
                 responded_by: Some("test".into()),
@@ -5624,12 +5501,11 @@ mod tests {
             |state| {
                 state.mode = Mode::Supervise;
                 state.stage = Stage::Validate;
-                state.yes_ship = true;
                 state.consecutive_failures = 1;
                 state.phase_validate_failures = 1;
             },
             |state| {
-                state.yes_ship = false;
+                state.base_branch = Some("workspace/concurrent".to_string());
                 state.consecutive_failures = 2;
                 state.phase_validate_failures = 2;
                 state.last_validate_failure_commit_count = Some(0);
@@ -5641,7 +5517,11 @@ mod tests {
             handle_validate_outcome(root, &mut stale, ValidateOutcome::Failed).unwrap();
         });
 
-        assert!(!on_disk.yes_ship, "the concurrent revoke survives");
+        assert_eq!(
+            on_disk.base_branch.as_deref(),
+            Some("workspace/concurrent"),
+            "the concurrent write survives"
+        );
         assert_eq!(on_disk.consecutive_failures, 3);
         assert_eq!(on_disk.phase_validate_failures, 3);
         assert_eq!(on_disk.verification_run_nonce, Some(8));

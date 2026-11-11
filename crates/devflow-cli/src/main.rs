@@ -69,19 +69,6 @@ enum Command {
         /// stops there.
         #[arg(long)]
         until: Option<Stage>,
-        /// Pre-authorize the Ship gate so this run can reach a completed
-        /// Ship stage unattended (D-04/D-05/D-06, 23-09; provenance widened
-        /// by D-12, `28-CONTEXT.md`). The Ship gate still fires and is
-        /// still answered through the normal gate protocol — this only
-        /// supplies the approval automatically, attributed to `--yes-ship`
-        /// in the gate ledger. This flag ORs with a standing `yes_ship =
-        /// true` in `devflow.toml` (or `DEVFLOW_YES_SHIP`) rather than
-        /// replacing it — passing it here always wins, and a run whose
-        /// authorization came from config instead prints a notice naming
-        /// `devflow.toml` as the source, so a persisted default is never a
-        /// silent one.
-        #[arg(long)]
-        yes_ship: bool,
         /// A second agent that takes over the Code stage once if the agent is
         /// rate-limited there (D-01, `51-CONTEXT.md`). Failover happens only at
         /// Code; at any other stage a rate limit waits at the stage's gate.
@@ -431,7 +418,6 @@ fn run() -> Result<(), CliError> {
             no_worktree,
             dry_run,
             until,
-            yes_ship,
             fallback_agent,
             project,
         } => {
@@ -458,7 +444,6 @@ fn run() -> Result<(), CliError> {
                 worktree,
                 dry_run,
                 until,
-                yes_ship,
                 commands::FallbackSource::FlagOrConfig(fallback_agent),
             )
         }

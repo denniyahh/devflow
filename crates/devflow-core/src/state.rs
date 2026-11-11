@@ -24,7 +24,7 @@ use crate::stage::Stage;
 /// state files written by older binaries still load.
 ///
 /// This exists because `State` accumulates a field roughly every phase that
-/// adds a run-scoped concept (`worktree_path`, `stop_until`, `yes_ship`, in
+/// adds a run-scoped concept (`worktree_path`, `stop_until`, in
 /// phase 28 `session_id` and `checkpoint_resumes`, and in phase 50
 /// `supervisor`).
 /// Without `non_exhaustive`, each of those additions is a semver-breaking
@@ -351,20 +351,8 @@ pub struct State {
     /// this field" — both behave identically.
     #[serde(default)]
     pub finished: bool,
-    /// Pre-authorization for the Ship gate (D-04/D-05/D-06, 23-09),
-    /// set only from the `--yes-ship` CLI flag typed on `devflow start`.
-    ///
-    /// Persisted rather than passed through the call stack: the Ship gate
-    /// fires inside a detached monitor's `advance` process, minutes to
-    /// hours after the launching `devflow start` process has already
-    /// exited, so a CLI-scoped value would be gone by the time it matters —
-    /// only a value written to `state.json` at start time survives to be
-    /// read back by that later, separate process. `false` for any state
-    /// written by a binary predating this field.
-    #[serde(default)]
-    pub yes_ship: bool,
     /// The integration trunk this run resolved at `start` (45-01/D-01),
-    /// persisted for the same reason [`Self::yes_ship`] is: the value comes
+    /// persisted rather than re-resolved: the value comes
     /// from `DEVFLOW_BASE_BRANCH` or `devflow.toml`, but every later entry
     /// point (`advance`, `resume`, and the checkout hooks that merge the
     /// phase branch) runs in a SEPARATE process whose environment need not
@@ -384,7 +372,7 @@ pub struct State {
     /// field" — both cases behave identically: the canary runs.
     ///
     /// Persisted rather than held in memory for the same reason
-    /// [`Self::yes_ship`] is: each stage launch happens in a SEPARATE
+    /// [`Self::base_branch`] is: each stage launch happens in a SEPARATE
     /// `devflow` process (the monitor's own `advance` tail), so an
     /// in-process flag would reset to "not yet run" at every stage
     /// transition and re-spend a real throwaway agent invocation each time —
@@ -422,7 +410,7 @@ pub struct State {
     ///   phase declared no human-only checkpoint", which is the fact that
     ///   makes a later addition detectable.
     ///
-    /// Persisted rather than held in memory for the reason [`Self::yes_ship`]
+    /// Persisted rather than held in memory for the reason [`Self::base_branch`]
     /// gives: the resume decision that compares against this set runs in the
     /// detached monitor's own separate `devflow advance` process, long after
     /// the process that recorded it has exited.
@@ -452,7 +440,7 @@ pub struct State {
     /// behaviour.
     ///
     /// Persisted rather than passed through the call stack for the reason
-    /// [`Self::yes_ship`] gives: each stage launch happens in a SEPARATE
+    /// [`Self::base_branch`] gives: each stage launch happens in a SEPARATE
     /// `devflow` process (the detached monitor's own `advance` tail), and the
     /// rate limit is observed by that process, long after the command that
     /// configured the fallback has exited.
@@ -723,7 +711,6 @@ impl State {
             stopped: false,
             stop_reason: None,
             finished: false,
-            yes_ship: false,
             base_branch: None,
             canary: None,
             // Pending, not Unrecorded: this state was created by a binary
@@ -806,7 +793,6 @@ mod tests {
         assert_eq!(state.stop_until, None);
         assert!(!state.stopped);
         assert_eq!(state.stop_reason, None);
-        assert!(!state.yes_ship);
     }
 
     #[test]
@@ -1585,27 +1571,6 @@ mod tests {
         assert_eq!(loaded.checkpoint_resumes, 0);
     }
 
-    /// 23-09 Task 1: `yes_ship` round-trips through serde as an exact `bool`
-    /// — its own key appears in the persisted JSON, and a fresh deserialize
-    /// recovers the value set, mirroring the `supervisor` round-trip above.
-    #[test]
-    fn yes_ship_round_trips_through_serde() {
-        let mut state = State::new(
-            PhaseId::new(1),
-            AgentKind::Claude,
-            Mode::Auto,
-            PathBuf::from("/repo"),
-        );
-        state.yes_ship = true;
-        let json = serde_json::to_string(&state).unwrap();
-        assert!(
-            json.contains("yes_ship"),
-            "yes_ship must appear in persisted JSON"
-        );
-        let loaded: State = serde_json::from_str(&json).unwrap();
-        assert!(loaded.yes_ship, "yes_ship must round-trip through serde");
-    }
-
     /// CR-02 (45-REVIEW.md): the base resolved at `start` only survives to
     /// the later, separate process that merges the phase branch if it is
     /// actually written to `state.json`.
@@ -1674,22 +1639,27 @@ mod tests {
         assert_eq!(loaded.gate_notify_cmd.as_deref(), Some("notify-send gate"));
     }
 
-    /// A serde-absent `yes_ship` (state written by a pre-23-09 binary) must
-    /// deserialize to `false`, not fail to deserialize — the same
-    /// backward-compat pattern as every other `#[serde(default)]` field
-    /// added since 17-01.
+    /// A state file written by a 3.x binary may still carry `yes_ship`, which
+    /// v4.0 removed with the Ship gate (D-01). It must still load, and the
+    /// key must not come back on the next save.
     #[test]
-    fn yes_ship_absent_from_json_defaults_to_false() {
+    fn a_state_file_with_a_leftover_yes_ship_key_still_loads() {
         let json = r#"{
             "stage": "code",
             "phase": 1,
             "agent": "claude",
             "mode": "auto",
             "started_at": "0",
-            "project_root": "/repo"
+            "project_root": "/repo",
+            "yes_ship": true
         }"#;
-        let loaded: State = serde_json::from_str(json).unwrap();
-        assert!(!loaded.yes_ship);
+        let loaded: State = serde_json::from_str(json).expect("a leftover yes_ship key must load");
+        assert_eq!(loaded.stage, Stage::Code);
+        let saved = serde_json::to_string(&loaded).unwrap();
+        assert!(
+            !saved.contains("yes_ship"),
+            "the key is dropped on save: {saved}"
+        );
     }
 
     /// 20c: `stop_until`/`stopped`/`stop_reason` all round-trip through

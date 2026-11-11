@@ -455,9 +455,9 @@ pub(crate) fn run_gate_with_timeout(
     timeout_secs: u64,
     // 23-09 (D-04/D-05/D-06): a pre-authorized response to write for this
     // gate, or `None` for a real human gate. This function must NEVER
-    // derive this value from `state` (e.g. `state.yes_ship`) — the decision
-    // belongs to the caller, so no gate other than the routine Ship approval
-    // in `handle_ship_outcome` can inherit an authorization meant for it.
+    // derive this value from `state` — the decision belongs to the caller, so
+    // no gate can inherit an authorization meant for another. No production
+    // caller passes one since the Ship pre-authorization was removed (D-01).
     auto_response: Option<&GateResponse>,
 ) -> Result<GateAction, CliError> {
     commit(state, |s| s.gate_pending = true)?;
@@ -599,8 +599,8 @@ pub(crate) fn run_gate_with_timeout(
             registration.finish();
             #[cfg(test)]
             crate::pipeline_launch::test_hold("after_claim");
-            // D-08: whatever changed on disk during the wait (a `stop`, a
-            // `yes_ship` revoke, an edited notify command) is kept, because this
+            // D-08: whatever changed on disk during the wait (a `stop`, an
+            // edited notify command) is kept, because this
             // write re-reads the state and sets only this field.
             commit(state, |s| s.gate_pending = false)?;
             let action = GateAction::from_response(&response);
@@ -774,21 +774,6 @@ pub(crate) fn print_dry_run(state: &State) {
     if let Some(until) = state.stop_until {
         println!("\nnote: --until {until} — this run will halt after {until} completes");
     }
-    // D-12 (`28-CONTEXT.md`): the resolved combine of `--yes-ship` and a
-    // `devflow.toml` `yes_ship` key, reported here so a dry run gives the
-    // operator a stable, observable preview of whether the Ship gate is
-    // pre-authorized — this line reports `state.yes_ship` only, it does not
-    // itself distinguish flag- from config-sourced authorization (that
-    // distinction is the separate never-silent notice `commands::start`
-    // prints for the config-sourced case).
-    println!(
-        "\nship gate: {}",
-        if state.yes_ship {
-            "pre-authorized"
-        } else {
-            "not pre-authorized"
-        }
-    );
 }
 
 #[cfg(test)]
@@ -1798,7 +1783,7 @@ mod tests {
         assert_refused("no open gate");
     }
 
-    /// A `yes_ship` revoke made after a caller loaded its copy survives that caller's
+    /// A field another writer changed after a caller loaded its copy survives that caller's
     /// transition, which writes only the transition's own fields (D-08, T-50.1-34).
     #[test]
     fn transition_commits_only_its_fields() {
@@ -1811,10 +1796,9 @@ mod tests {
         let phase = PhaseId::new(88);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
-        state.yes_ship = true;
         workflow::save_state(&state).unwrap();
         workflow::update_state(root, phase, |on_disk| {
-            on_disk.yes_ship = false;
+            on_disk.base_branch = Some("workspace/concurrent".to_string());
             Ok::<(), workflow::WorkflowError>(())
         })
         .unwrap();
@@ -1824,7 +1808,11 @@ mod tests {
         let _ = transition(root, &mut state, Stage::Validate);
 
         let after = workflow::load_state(root, phase).unwrap();
-        assert!(!after.yes_ship, "the revoke survives the transition");
+        assert_eq!(
+            after.base_branch.as_deref(),
+            Some("workspace/concurrent"),
+            "the other writer's change survives the transition"
+        );
         assert_eq!(after.stage, Stage::Validate, "the transition's own write");
     }
 
@@ -1915,10 +1903,9 @@ mod tests {
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Validate;
         state.gate_pending = true;
-        state.yes_ship = true;
         workflow::save_state(&state).unwrap();
         workflow::update_state(root, phase, |on_disk| {
-            on_disk.yes_ship = false;
+            on_disk.base_branch = Some("workspace/concurrent".to_string());
             Ok::<(), workflow::WorkflowError>(())
         })
         .unwrap();
@@ -1934,7 +1921,11 @@ mod tests {
         .unwrap();
 
         let after = workflow::load_state(root, phase).unwrap();
-        assert!(!after.yes_ship, "the concurrent revoke is kept");
+        assert_eq!(
+            after.base_branch.as_deref(),
+            Some("workspace/concurrent"),
+            "the concurrent write is kept"
+        );
         assert_eq!(after.stage, Stage::Code);
         assert!(!after.gate_pending);
         assert_eq!(after.last_verification_fingerprint, Some(FINGERPRINT));
@@ -2018,7 +2009,6 @@ mod tests {
     ) -> Result<GateAction, CliError> {
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Ship;
-        state.yes_ship = true;
         state.gate_notify_cmd = Some(format!(": > '{}'", notify_marker(root).display()));
         let engaged = RecordedSupervisor::serve(&mut state);
         workflow::save_state(&state).unwrap();
@@ -2075,13 +2065,13 @@ mod tests {
         root.join("notify-ran")
     }
 
-    /// D-13 item 8: safe point 5 runs before the notify, so a stopped `--yes-ship` run sends
-    /// no "Ship gate awaiting" message for a gate it withdraws at once. Control: with no stop
+    /// D-13 item 8: safe point 5 runs before the notify, so a stopped run whose gate is
+    /// auto-answered sends no "Ship gate awaiting" message for a gate it withdraws at once. Control: with no stop
     /// the same gate notifies. Its own child, because `DEVFLOW_GATE_NOTIFY_CMD` in the
     /// runner's environment would replace the state's command.
     #[test]
-    fn a_stopped_yes_ship_run_sends_no_ship_notify() {
-        const NAME: &str = "pipeline_gate::tests::a_stopped_yes_ship_run_sends_no_ship_notify";
+    fn a_stopped_auto_answered_run_sends_no_ship_notify() {
+        const NAME: &str = "pipeline_gate::tests::a_stopped_auto_answered_run_sends_no_ship_notify";
         if !devflow_core::test_support::in_child_test(NAME) {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([NAME, "--exact", "--test-threads=1"])
