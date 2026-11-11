@@ -999,6 +999,7 @@ pub(crate) fn every_gate_kind() -> Vec<Option<devflow_core::gates::GateKind>> {
         GateKind::FailureCap,
         GateKind::NoGapClosurePlan,
         GateKind::StageFailure,
+        GateKind::RateLimit,
         GateKind::Preflight,
         GateKind::CheckpointDeclaration,
     ];
@@ -1014,6 +1015,7 @@ pub(crate) fn every_gate_kind() -> Vec<Option<devflow_core::gates::GateKind>> {
         | GateKind::FailureCap
         | GateKind::NoGapClosurePlan
         | GateKind::StageFailure
+        | GateKind::RateLimit
         | GateKind::Preflight
         | GateKind::CheckpointDeclaration => all.contains(&kind),
     };

@@ -59,6 +59,15 @@ pub struct GateFile {
     /// gate, and a gate file written before the field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gsd_status: Option<crate::gsd_reader::GsdStatus>,
+    /// The not-before time of a rate-limit gate, in Unix epoch seconds (D-27.2,
+    /// D-38): the reported reset plus
+    /// [`crate::reset_time::RATE_LIMIT_RELAUNCH_MARGIN_SECS`], recorded whenever
+    /// the denial named a parseable reset, whether or not a timer is armed for
+    /// it. `gate sweep` never reaps the gate before it. `None` for every other
+    /// gate, a rate-limit gate whose denial named no reset (D-16), and a gate
+    /// file written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_before: Option<i64>,
 }
 
 /// What a gate's writer records about it beside its context: its required
@@ -70,6 +79,9 @@ pub struct GateLabel {
     pub kind: GateKind,
     /// The GSD status the gate was opened over, if any.
     pub gsd_status: Option<crate::gsd_reader::GsdStatus>,
+    /// The rate-limit gate's not-before time ([`GateFile::not_before`]);
+    /// `None` for every other gate.
+    pub not_before: Option<i64>,
 }
 
 impl From<GateKind> for GateLabel {
@@ -77,6 +89,23 @@ impl From<GateKind> for GateLabel {
         GateLabel {
             kind,
             gsd_status: None,
+            not_before: None,
+        }
+    }
+}
+
+impl GateLabel {
+    /// The label of a rate-limit gate whose denial named `reset_at`, the
+    /// reported reset in Unix epoch seconds, or no parseable reset (D-27.2,
+    /// D-16). It takes the reset time only, never whether a timer is armed or
+    /// the run's automatic relaunch is used, so the not-before time, and with
+    /// it sweep protection, depends on the reset alone (D-38).
+    pub fn rate_limit(reset_at: Option<i64>) -> GateLabel {
+        let _ = reset_at;
+        GateLabel {
+            kind: GateKind::RateLimit,
+            gsd_status: None,
+            not_before: None,
         }
     }
 }
@@ -119,9 +148,12 @@ pub enum GateKind {
     /// The gate when a gaps pass produced no gap-closure plan (written by 52-27).
     NoGapClosurePlan,
     /// The never-silent gate for a failed stage at any stage: a launch failure, a
-    /// crash, a reported failure, a timeout, an infra failure, and the interim
-    /// rate-limit gate until 52-31's `RateLimit` (D-39; 52-22).
+    /// crash, a reported failure, a timeout or an infra failure (D-39; 52-22).
     StageFailure,
+    /// The gate for a rate limit no fallback can take (CUT-03, D-15, D-27): it
+    /// keeps its own answers and can never finish a run. Its file records
+    /// [`GateFile::not_before`] when the denial named a reset (52-31).
+    RateLimit,
     /// The gate for a failed preflight check before a stage launches (D-39; 52-22).
     Preflight,
     /// The gate for a human-only checkpoint declaration at Code that was not
@@ -457,6 +489,9 @@ pub struct OpenGate {
     /// The id the gate file names, unchecked: no answer can bind to one that
     /// [`GateId::parse`] refuses.
     pub gate_id: String,
+    /// The gate file's [`GateFile::not_before`]: a rate-limit gate's
+    /// not-before time, which `gate sweep` honours.
+    pub not_before: Option<i64>,
 }
 
 /// A waiter's registration: a held lock on `NN-{stage}.{gate_id}.waiter` (D-04).
@@ -1462,6 +1497,7 @@ impl Gates {
                 context: gate.context,
                 timestamp: gate.timestamp,
                 gate_id: gate.gate_id,
+                not_before: gate.not_before,
             });
         }
         open.sort_by_key(|g| (g.phase, g.stage.to_string()));
@@ -1523,6 +1559,7 @@ impl Gates {
             gate_id: gate_id.to_string(),
             gate_kind: Some(label.kind),
             gsd_status: label.gsd_status,
+            not_before: label.not_before,
         };
         let path = Self::gate_path(project_root, phase, stage);
         info!("writing gate {} for phase {phase}", stage);
@@ -2252,6 +2289,7 @@ mod tests {
             GateLabel {
                 kind: GateKind::GapsFound,
                 gsd_status: Some(GsdStatus::GapsFound),
+                not_before: None,
             },
             "GSD verification: gaps_found",
         )
@@ -2281,6 +2319,70 @@ mod tests {
         assert_eq!(old.gsd_status, None);
     }
 
+    /// D-27.2, D-38, CUT-03 empty: a rate-limit gate opened with a reset time
+    /// records `gate_kind` `rate_limit` and `not_before` = reset + margin, and
+    /// `list_open` carries the not-before time to the sweep. One opened with no
+    /// parseable reset records the kind and no not-before time (D-16).
+    /// `GateLabel::rate_limit` takes the reset time only, so the not-before time
+    /// cannot depend on a timer or the run's used flag. Control: an ordinary
+    /// gate writes no `not_before` key.
+    #[test]
+    fn a_rate_limit_gate_records_its_not_before_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let reset = 1_785_645_600;
+        let expected = reset + crate::reset_time::RATE_LIMIT_RELAUNCH_MARGIN_SECS;
+
+        let (timed, untimed, ordinary) =
+            (PhaseId::new(5311), PhaseId::new(5312), PhaseId::new(5313));
+        let opened = Gates::open_gate(
+            root,
+            timed,
+            Stage::Code,
+            GateLabel::rate_limit(Some(reset)),
+            "rate limited",
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&opened.path).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(raw["gate_kind"], "rate_limit", "{text}");
+        assert_eq!(raw["not_before"], expected, "{text}");
+        let back: GateFile = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.gate_kind, Some(GateKind::RateLimit));
+        assert_eq!(back.not_before, Some(expected));
+        let listed = Gates::list_open(root);
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].not_before, Some(expected), "the sweep sees it");
+
+        let opened = Gates::open_gate(
+            root,
+            untimed,
+            Stage::Code,
+            GateLabel::rate_limit(None),
+            "rate limited, no reset time",
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&opened.path).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(raw["gate_kind"], "rate_limit", "{text}");
+        assert!(
+            raw.get("not_before").is_none(),
+            "no reset, no not-before: {text}"
+        );
+
+        let opened = Gates::open_gate(
+            root,
+            ordinary,
+            Stage::Code,
+            GateKind::StageFailure,
+            "failed",
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&opened.path).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(raw.get("not_before").is_none(), "control: {text}");
+    }
+
     #[test]
     fn gate_file_round_trips_through_serde() {
         let gate = GateFile {
@@ -2291,6 +2393,7 @@ mod tests {
             gate_id: GateId::new().to_string(),
             gate_kind: None,
             gsd_status: None,
+            not_before: None,
         };
         let json = serde_json::to_string(&gate).unwrap();
         let back: GateFile = serde_json::from_str(&json).unwrap();
@@ -6134,6 +6237,7 @@ mod tests {
             gate_id: GateId::new().to_string(),
             gate_kind: None,
             gsd_status: None,
+            not_before: None,
         })
         .unwrap();
         assert!(idless.as_object_mut().unwrap().remove("gate_id").is_some());
