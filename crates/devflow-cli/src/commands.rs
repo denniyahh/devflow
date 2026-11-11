@@ -14727,6 +14727,79 @@ mod tests {
         value
     }
 
+    /// T4: a stop keeps the fix pass. `persist_stopped_state` sets `stopped` and
+    /// `stop_reason` only, so a stopped re-verify or gaps-only pass resumes as
+    /// that pass: `code_fix` (and the re-verify pass's quoted GSD report) are
+    /// unchanged on disk. Control in the same test: the same state moved by
+    /// `transition` from Code to Validate holds no `code_fix`, so the kept-field
+    /// assertion is one that can fail.
+    #[test]
+    fn a_stop_keeps_the_recorded_fix_pass() {
+        const NAME: &str = "commands::tests::a_stop_keeps_the_recorded_fix_pass";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            // Agent-free: the control's `transition` launches Validate, and
+            // must not reach a real agent.
+            let path_dir = crate::test_support::agent_free_git_only_path_dir();
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let report = devflow_core::prompt::ReverifyReport {
+            status: "stale".to_string(),
+            route: "execute-phase".to_string(),
+            next_action: Some("Re-run execute-phase for this phase.".to_string()),
+        };
+        let rows = [
+            (
+                4960,
+                devflow_core::prompt::FixType::StaleReverify,
+                Some(report),
+            ),
+            (4961, devflow_core::prompt::FixType::GapsOnly, None),
+        ];
+        for (number, fix, report) in rows {
+            let at_code = |root: &Path, phase: PhaseId| {
+                let mut state =
+                    State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+                state.stage = Stage::Code;
+                state.code_fix = Some(fix);
+                state.code_fix_report = report.clone();
+                workflow::save_state(&state).unwrap();
+                state
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = PhaseId::new(number);
+            at_code(root, phase);
+            persist_stopped_state(root, phase, false, &[]).unwrap();
+            let stopped = workflow::load_state(root, phase).unwrap();
+            assert!(stopped.stopped, "{fix:?}: the stop landed");
+            assert_eq!(
+                stopped.code_fix,
+                Some(fix),
+                "{fix:?}: a stop keeps the fix pass"
+            );
+            assert_eq!(
+                stopped.code_fix_report, report,
+                "{fix:?}: a stop keeps the re-verify pass's GSD report"
+            );
+
+            // Control: a transition out of Code clears the fix pass.
+            let control_dir = tempfile::tempdir().unwrap();
+            let control_root = control_dir.path();
+            let mut moving = at_code(control_root, phase);
+            let _ = crate::pipeline_gate::transition(control_root, &mut moving, Stage::Validate);
+            let moved = workflow::load_state(control_root, phase).unwrap();
+            assert_eq!(moved.stage, Stage::Validate, "{fix:?}: control moved");
+            assert_eq!(
+                moved.code_fix, None,
+                "{fix:?}: control: a transition clears it"
+            );
+            assert_eq!(moved.code_fix_report, None, "{fix:?}: control");
+        }
+    }
+
     /// D-08: `stop` appends to the reason on disk when it writes, not to one it read
     /// earlier. A writer holds the write lock while `stop` runs, then records a
     /// `--until` reason, so a `stop` that does not wait loses its write to that writer.

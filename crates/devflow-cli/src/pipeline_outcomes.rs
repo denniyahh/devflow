@@ -6364,4 +6364,74 @@ mod tests {
             "control: a stopped gaps Code pass resumes gaps-only: {resumed}"
         );
     }
+
+    /// Route I, T10 (D-12): a counted Plan-pass gate reaches the per-phase
+    /// ceiling through the same streak update a Validate failure takes. From
+    /// one below the ceiling, a gaps Plan pass with no new gap-closure plan
+    /// opens its `no_gap_closure_plan` gate with the count at the ceiling, its
+    /// context names this phase's per-phase failure ceiling in its own words
+    /// (never the Validate sentence `Validation has failed N time(s)`), and an
+    /// approve resets the count with one `phase_failure_budget_reset` event.
+    /// The abort row resets nothing. Control in the same test: from 5, the
+    /// same pass counts one (6), names no ceiling, and its approve leaves the
+    /// count at 6 with no reset event.
+    #[test]
+    fn a_counted_gate_at_the_phase_ceiling_resets_the_count_when_answered() {
+        if !in_bounded_child(
+            "pipeline_outcomes::tests::a_counted_gate_at_the_phase_ceiling_resets_the_count_when_answered",
+        ) {
+            return;
+        }
+        let ceiling = mode::MAX_PHASE_VALIDATE_FAILURES;
+        let rows = [
+            (5350, ceiling - 1, approve_answer(), true),
+            (5351, ceiling - 1, abort_answer(), true),
+            (5352, 5, approve_answer(), false),
+        ];
+        for (number, before, answer, at_ceiling) in rows {
+            let row = format!(
+                "from {before}, {}",
+                if answer.abort { "abort" } else { "approve" }
+            );
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = PhaseId::new(number);
+            let (mut state, _) = gaps_plan_fixture(root, phase, false);
+            state.phase_validate_failures = before;
+            workflow::save_state(&state).unwrap();
+            let (gate, at_gate) = at_the_gate(root, phase, Stage::Plan, &answer, || {
+                let _ = handle_gaps_plan_outcome(root, &mut state);
+            });
+            assert_eq!(gate["gate_kind"], "no_gap_closure_plan", "{row}: {gate}");
+            assert_eq!(
+                at_gate.phase_validate_failures,
+                before + 1,
+                "{row}: the gate's round counts one failure; events: {:?}",
+                phase_events(root, phase)
+            );
+            let context = gate["context"].as_str().unwrap_or_default();
+            assert_eq!(
+                context.contains("per-phase failure ceiling"),
+                at_ceiling,
+                "{row}: the context names the ceiling exactly when it is reached: {context}"
+            );
+            assert!(
+                !context.contains("Validation has failed"),
+                "{row}: a Plan-pass gate is not worded as a Validate failure: {context}"
+            );
+            let resets = events_named(root, phase, "phase_failure_budget_reset");
+            let continues_at_ceiling = at_ceiling && !answer.abort;
+            assert_eq!(
+                resets.len(),
+                usize::from(continues_at_ceiling),
+                "{row}: one reset exactly when an answer continues the run at the ceiling: \
+                 {resets:?}"
+            );
+            if !answer.abort {
+                let after = workflow::load_state(root, phase).unwrap();
+                let expected = if at_ceiling { 0 } else { before + 1 };
+                assert_eq!(after.phase_validate_failures, expected, "{row}");
+            }
+        }
+    }
 }
