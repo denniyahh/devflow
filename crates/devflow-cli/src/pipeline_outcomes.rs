@@ -8899,16 +8899,18 @@ mod tests {
     /// expected counterexample writes no `proptest-regressions/` file.
     fn run_rule_six(
         route: fn(&PropInput) -> String,
-    ) -> Result<(), proptest::test_runner::TestError<PropInput>> {
+    ) -> Result<(), Box<proptest::test_runner::TestError<PropInput>>> {
         let config = proptest::test_runner::Config {
             cases: 1024,
             failure_persistence: None,
             ..proptest::test_runner::Config::default()
         };
         let mut runner = proptest::test_runner::TestRunner::new(config);
-        runner.run(&prop_inputs(), |input| {
-            rule_six(route, &input).map_err(proptest::test_runner::TestCaseError::fail)
-        })
+        runner
+            .run(&prop_inputs(), |input| {
+                rule_six(route, &input).map_err(proptest::test_runner::TestCaseError::fail)
+            })
+            .map_err(Box::new)
     }
 
     /// D-45 rule 6: the routing yields a finish only when `can_finish` holds,
@@ -8921,7 +8923,7 @@ mod tests {
     #[test]
     fn workflow_finished_is_reached_only_when_can_finish_holds() {
         run_rule_six(real_route).unwrap_or_else(|error| panic!("the real routing: {error}"));
-        match run_rule_six(mutant_route) {
+        match run_rule_six(mutant_route).map_err(|error| *error) {
             Err(proptest::test_runner::TestError::Fail(reason, input)) => {
                 assert_eq!(input.status, Some(GsdStatus::Passed), "{reason}: {input:?}");
                 assert!(
