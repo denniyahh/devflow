@@ -85,6 +85,15 @@ pub fn git_command(repo: &Path) -> Command {
 /// redirect via an inherited variable — an operator who wants DevFlow to
 /// act on a different repository passes it a different path (D-01).
 pub fn hermetic_command(program: &str, dir: &Path) -> Command {
+    hermetic_command_at(Path::new(program), dir)
+}
+
+/// As [`hermetic_command`], for a program named by a path rather than a
+/// UTF-8 string: the GSD launcher found under the operator's home
+/// (`gsd_reader`). A path without a separator still resolves through `PATH`,
+/// exactly as [`hermetic_command`]'s `&str` does, so the two build the same
+/// command for the same program.
+pub(crate) fn hermetic_command_at(program: &Path, dir: &Path) -> Command {
     let mut cmd = Command::new(program);
     cmd.current_dir(dir);
     for var in REPO_LOCAL_GIT_VARS.iter().chain(ALSO_REDIRECTING_GIT_VARS) {
