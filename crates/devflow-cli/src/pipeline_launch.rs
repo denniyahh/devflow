@@ -97,7 +97,10 @@ const PROMOTION_WAIT: Duration = Duration::from_secs(5);
 /// ([`State::code_fix`]), so a same-stage relaunch inside a gaps-only or
 /// full-execute pass continues that pass; every other stage gets
 /// its default intent. The fix TYPE is persisted and rendered here, at launch,
-/// so after a handoff the fallback's own renderer is used.
+/// so after a handoff the fallback's own renderer is used. The operator's notes
+/// ride the same way (GATE-01): the fix pass's [`State::code_fix_note`], only
+/// while a fix pass is in flight, and the stage's [`State::relaunch_note`],
+/// attached to the intent the default builder returns.
 ///
 /// The only place a default stage prompt is rendered:
 /// [`launch_stage_inner`] (whose prompt the agent receives) and
@@ -108,9 +111,12 @@ fn default_stage_prompt(state: &State, driver: &dyn agents::AgentDriver) -> Stri
         Stage::Code => prompt::StageIntent::Code {
             phase: state.phase,
             fix: state.code_fix,
+            fix_note: state.code_fix.and(state.code_fix_note.clone()),
+            relaunch_note: state.relaunch_note.clone(),
         },
         stage => {
             prompt::StageIntent::for_stage_in_project(stage, state.phase, Some(&state.project_root))
+                .with_relaunch_note(state.relaunch_note.clone())
         }
     };
     driver.render_prompt(&intent)
@@ -1051,6 +1057,23 @@ pub(crate) fn commit(state: &mut State, apply: impl FnOnce(&mut State)) -> Resul
     })?;
     *state = committed;
     Ok(())
+}
+
+/// Commit a rejected gate's `note` as the run's relaunch note
+/// ([`State::relaunch_note`], GATE-01 / D-39), for the relaunch of the stage the
+/// gate stopped at. A rejection with a note replaces an earlier one; a rejection
+/// with none keeps it, so a second failure answered without a note does not
+/// drop what the operator already asked for at this stage. Writes nothing when
+/// there is no note. The note leaves with the stage (`transition`, the Validate
+/// loop-back to Code, `finish_run`).
+pub(crate) fn record_relaunch_note(
+    state: &mut State,
+    note: Option<String>,
+) -> Result<(), CliError> {
+    let Some(note) = note else {
+        return Ok(());
+    };
+    commit(state, |s| s.relaunch_note = Some(note))
 }
 
 /// CR-03 (49-REVIEW.md): commit the notify command this process's environment
@@ -3814,7 +3837,10 @@ pub(crate) fn advance_with(
                                 // correctly refuses the still-unapproved human
                                 // checkpoint. Park it for the explicitly
                                 // requested supervised repair instead.
-                                GateAction::LoopBack(_) => {
+                                GateAction::LoopBack { note, .. } => {
+                                    // The rejection's note is the operator's word
+                                    // for the Code relaunch this repair leads to.
+                                    record_relaunch_note(&mut state, note)?;
                                     if state.mode == Mode::Auto {
                                         return park_auto_rescan_repair(
                                             project_root,
@@ -8865,6 +8891,8 @@ mod tests {
         let loop_back_prompt = driver.render_prompt(&prompt::StageIntent::Code {
             phase,
             fix: Some(prompt::FixType::FullExecute),
+            fix_note: None,
+            relaunch_note: None,
         });
         let (_program, _args, launch) = resolve_launch_shape(
             agent,
@@ -11193,6 +11221,7 @@ mod tests {
                 root,
                 &mut state,
                 fix,
+                None,
                 crate::pipeline_gate::LoopBackReason::GateResponse,
             )
             .unwrap();
@@ -11232,7 +11261,12 @@ mod tests {
         let _guard = env_lock();
         let codex = agents::driver_for(AgentKind::Codex);
         let code_prompt = |phase: PhaseId, fix: Option<prompt::FixType>| {
-            codex.render_prompt(&prompt::StageIntent::Code { phase, fix })
+            codex.render_prompt(&prompt::StageIntent::Code {
+                phase,
+                fix,
+                fix_note: None,
+                relaunch_note: None,
+            })
         };
 
         let fix_dir = tempfile::tempdir().unwrap();
@@ -13189,7 +13223,12 @@ mod tests {
         let _guard = env_lock();
         let codex = agents::driver_for(AgentKind::Codex);
         let code_prompt = |phase: PhaseId, fix: Option<prompt::FixType>| {
-            codex.render_prompt(&prompt::StageIntent::Code { phase, fix })
+            codex.render_prompt(&prompt::StageIntent::Code {
+                phase,
+                fix,
+                fix_note: None,
+                relaunch_note: None,
+            })
         };
 
         let fix_dir = tempfile::tempdir().unwrap();

@@ -144,8 +144,16 @@ pub struct GateAck {
 pub enum GateAction {
     /// Approved — advance to the next stage.
     Advance,
-    /// Rejected with fixable feedback — loop back to the given stage.
-    LoopBack(Stage),
+    /// Rejected with fixable feedback — loop back to `stage`. `note` is the
+    /// rejection's note, kept verbatim, so the relaunched agent's prompt can
+    /// carry the operator's words (GATE-01, D-14): every consumer that relaunches
+    /// an agent on a loop-back hands it on.
+    LoopBack {
+        /// The stage to loop back to.
+        stage: Stage,
+        /// The operator's note on the rejection, if any.
+        note: Option<String>,
+    },
     /// Aborted — stop the workflow with a reason.
     Abort(String),
 }
@@ -162,8 +170,8 @@ const APPROVED_AND_ABORTED: &str =
 impl GateAction {
     /// Decide the action from a response's fields, never from its note: `abort`
     /// ends the run, otherwise `approved` advances, and anything else loops back
-    /// to Code. The abort is checked first, so an answer can never both abort
-    /// and advance.
+    /// to Code, carrying the response's note. The abort is checked first, so an
+    /// answer can never both abort and advance.
     pub fn from_response(response: &GateResponse) -> GateAction {
         if response.abort && response.approved {
             return GateAction::Abort(APPROVED_AND_ABORTED.to_string());
@@ -175,7 +183,10 @@ impl GateAction {
         if response.approved {
             return GateAction::Advance;
         }
-        GateAction::LoopBack(Stage::Code)
+        GateAction::LoopBack {
+            stage: Stage::Code,
+            note: response.note.clone(),
+        }
     }
 }
 
@@ -2735,7 +2746,10 @@ mod tests {
         };
         assert_eq!(
             GateAction::from_response(&response),
-            GateAction::LoopBack(Stage::Code)
+            GateAction::LoopBack {
+                stage: Stage::Code,
+                note: Some("fix the failing test".into()),
+            }
         );
     }
 
@@ -2750,7 +2764,10 @@ mod tests {
             Some(note) if note.to_ascii_lowercase().contains("abort") => {
                 GateAction::Abort(note.to_string())
             }
-            _ => GateAction::LoopBack(Stage::Code),
+            _ => GateAction::LoopBack {
+                stage: Stage::Code,
+                note: response.note.clone(),
+            },
         }
     }
 
@@ -2764,7 +2781,10 @@ mod tests {
         };
         assert_eq!(
             GateAction::from_response(&response),
-            GateAction::LoopBack(Stage::Code)
+            GateAction::LoopBack {
+                stage: Stage::Code,
+                note: Some("do not abort, fix the test".into()),
+            }
         );
         assert!(
             matches!(old_substring_rule(&response), GateAction::Abort(_)),
@@ -2854,7 +2874,10 @@ mod tests {
         assert!(!response.abort);
         assert_eq!(
             GateAction::from_response(&response),
-            GateAction::LoopBack(Stage::Code)
+            GateAction::LoopBack {
+                stage: Stage::Code,
+                note: Some("abort".into()),
+            }
         );
     }
 

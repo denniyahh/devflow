@@ -4149,6 +4149,8 @@ mod tests {
         let fix_prompt = crate::prompt::render_claude_style(&StageIntent::Code {
             phase,
             fix: Some(FixType::FullExecute),
+            fix_note: None,
+            relaunch_note: None,
         });
         for prompt in [&resume_prompt, &fix_prompt] {
             assert!(prompt.ends_with(crate::prompt::COMPLETION_PROTOCOL));

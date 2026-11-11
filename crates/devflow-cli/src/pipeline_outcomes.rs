@@ -16,7 +16,9 @@ use crate::CliError;
 use crate::pipeline_gate::{
     LoopBackReason, abort, finish_run, loop_back_to_code, run_gate, run_gate_with_event_context,
 };
-use crate::pipeline_launch::{close_gate, commit, launch_stage, recorded_canary_refusal};
+use crate::pipeline_launch::{
+    close_gate, commit, launch_stage, record_relaunch_note, recorded_canary_refusal,
+};
 use devflow_core::gates::{GateAction, GateKind};
 use devflow_core::gsd_reader::{self, GsdStatus, ReaderFailure, StatusReport};
 use devflow_core::mode::{self, Mode};
@@ -749,9 +751,13 @@ pub(crate) fn handle_validate_outcome(
     match validate_route(verdict, &read, state.mode, cap_reached) {
         // D-05: auto mode finishes on a passing Validate, without a gate.
         ValidateRoute::Finish => finish_run(project_root, state),
-        ValidateRoute::LoopBack(fix) => {
-            loop_back_to_code(project_root, state, fix, loop_back_reason(baseline_absent))
-        }
+        ValidateRoute::LoopBack(fix) => loop_back_to_code(
+            project_root,
+            state,
+            fix,
+            None,
+            loop_back_reason(baseline_absent),
+        ),
         ValidateRoute::Gate(kind) => {
             let (context, event_context) = validate_gate_context(
                 kind,
@@ -882,7 +888,7 @@ fn answer_validate_gate(
                 // the run.
                 ApproveRoute::Finish => finish_run(project_root, state),
                 ApproveRoute::LoopBack(fix) => {
-                    loop_back_to_code(project_root, state, fix, LoopBackReason::GateResponse)
+                    loop_back_to_code(project_root, state, fix, None, LoopBackReason::GateResponse)
                 }
                 ApproveRoute::RerunValidate => {
                     // CR-01: close the gate before relaunching; its answer is spent.
@@ -892,7 +898,7 @@ fn answer_validate_gate(
                 }
             }
         }
-        GateAction::LoopBack(_) => {
+        GateAction::LoopBack { note, .. } => {
             // Reset first: its `commit` replaces `state`.
             reset_phase_failures_at_ceiling(project_root, state, ceiling_gate)?;
             let reason = match verdict {
@@ -901,7 +907,8 @@ fn answer_validate_gate(
                 AgentVerdict::Ambiguous => LoopBackReason::GateResponse,
                 AgentVerdict::Pass | AgentVerdict::Fail => loop_back_reason(baseline_absent),
             };
-            loop_back_to_code(project_root, state, reject_fix(read), reason)
+            // The rejection's note is the fix request: it rides the fix pass.
+            loop_back_to_code(project_root, state, reject_fix(read), note, reason)
         }
         // No reset on abort: the phase is ending and `abort` clears its state
         // outright, so there is no budget left to restore.
@@ -1074,11 +1081,17 @@ fn answer_stage_failure_gate(
             state.gate_pending = false;
             relaunch_failed_stage(project_root, state, stage)
         }
-        GateAction::LoopBack(_) => {
+        GateAction::LoopBack { note, .. } => {
             // Retry the SAME failed stage — Code is not a valid recovery
             // target before planning exists for a Define/Plan failure
             // (Codex 13-01 MEDIUM).
             let _ = close_gate(project_root, state.phase, stage);
+            // GATE-01 / D-39: the note is the operator's word for this
+            // relaunch, so it is committed before `relaunch_failed_stage` runs:
+            // a relaunch the recorded canary refuses keeps it for the
+            // `devflow resume --agent <other>` its stop names. It is never the
+            // fix request, so `code_fix` and `code_fix_note` are left alone.
+            record_relaunch_note(state, note)?;
             relaunch_failed_stage(project_root, state, stage)
         }
         GateAction::Abort(reason) => abort(project_root, state, &reason),

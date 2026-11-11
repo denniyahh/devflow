@@ -84,8 +84,10 @@ pub(crate) fn transition(
             // that is gone.
             s.supervisor = None;
             s.gate_pending = false;
-            // D-09: a run halted after its stage is no longer mid-fix.
+            // D-09: a run halted after its stage is no longer mid-fix, and the
+            // fix pass's note goes with it.
             s.code_fix = None;
+            s.code_fix_note = None;
         })?;
         events::emit(
             project_root,
@@ -121,8 +123,9 @@ pub(crate) fn transition(
         s.infra_failures = 0;
         s.gate_pending = false;
         // D-09: a fix type lives exactly as long as its Code pass, so a later
-        // plain Code pass never replays a stale one.
+        // plain Code pass never replays a stale one. Its note goes with it.
         s.code_fix = None;
+        s.code_fix_note = None;
     })?;
     events::emit(
         project_root,
@@ -180,6 +183,7 @@ pub(crate) fn finish_run(project_root: &Path, state: &mut State) -> Result<(), C
         s.supervisor = None;
         s.gate_pending = false;
         s.code_fix = None;
+        s.code_fix_note = None;
     })?;
     registry::deregister(project_root, state.phase);
     events::emit(
@@ -260,15 +264,18 @@ impl LoopBackReason {
 }
 
 /// Loop the pipeline back to Code with the given fix prompt (`GapsOnly` or
-/// `FullExecute` for a Validate rejection).
+/// `FullExecute` for a Validate rejection). `note` is the operator's note on
+/// the rejected gate that asked for the fix (GATE-01), `None` for an
+/// unattended loop-back or an approval: the fix pass carries it to its agent.
 pub(crate) fn loop_back_to_code(
     project_root: &Path,
     state: &mut State,
     fix: FixType,
+    note: Option<String>,
     reason: LoopBackReason,
 ) -> Result<(), CliError> {
     let from = state.stage;
-    let prompt = prepare_loop_back_to_code(project_root, state, fix, reason)?;
+    let prompt = prepare_loop_back_to_code(project_root, state, fix, note, reason)?;
     launch_stage(state, Some(prompt), Some(from))
 }
 
@@ -276,11 +283,14 @@ pub(crate) fn loop_back_to_code(
 /// unit-testable without spawning a real agent process (`launch_stage`
 /// invokes the actual configured agent CLI). Cleans up the stale gate for
 /// the stage the gate fired on (CR-01), moves `state` to Code, persists it,
-/// and returns the fix prompt the caller should launch with.
+/// and returns the fix prompt the caller should launch with. The fix type and
+/// its `note` are persisted in one commit (`code_fix`, `code_fix_note`), so a
+/// replay of the fix pass renders the same note.
 pub(crate) fn prepare_loop_back_to_code(
     project_root: &Path,
     state: &mut State,
     fix: FixType,
+    note: Option<String>,
     reason: LoopBackReason,
 ) -> Result<String, CliError> {
     // Capture the stage the gate actually fired on before it's mutated below,
@@ -293,6 +303,7 @@ pub(crate) fn prepare_loop_back_to_code(
         // D-09: the fix pass this Code entry starts, so a same-stage relaunch
         // (failover, resume, re-drive) replays it rather than plain execute.
         s.code_fix = Some(fix);
+        s.code_fix_note = note.clone();
     })?;
     events::emit(
         project_root,
@@ -314,6 +325,8 @@ pub(crate) fn prepare_loop_back_to_code(
         &devflow_core::prompt::StageIntent::Code {
             phase: state.phase,
             fix: Some(fix),
+            fix_note: note,
+            relaunch_note: None,
         },
     ))
 }
@@ -611,7 +624,7 @@ fn open_and_await(
                     "approved": response.approved,
                     "action": match &action {
                         GateAction::Advance => "advance",
-                        GateAction::LoopBack(_) => "loop_back",
+                        GateAction::LoopBack { .. } => "loop_back",
                         GateAction::Abort(_) => "abort",
                     },
                     "responded_by": response.responded_by,
@@ -1909,6 +1922,7 @@ mod tests {
             root,
             &mut state,
             FixType::GapsOnly,
+            None,
             LoopBackReason::GateResponse,
         )
         .unwrap();

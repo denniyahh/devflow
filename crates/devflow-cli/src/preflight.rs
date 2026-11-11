@@ -1344,10 +1344,13 @@ pub(crate) fn run_preflight(
                 })?;
                 launch_stage_inner(state, None, None)?;
             }
-            GateAction::LoopBack(_) => {
+            GateAction::LoopBack { note, .. } => {
                 // D-18f: "I will fix it, then retry" — re-check deliberately,
                 // bounded by the ceiling above.
                 let _ = close_gate(project_root, state.phase, stage);
+                // GATE-01: the rejection's note is the operator's word for the
+                // stage this relaunches.
+                crate::pipeline_launch::record_relaunch_note(state, note)?;
                 launch_stage(state, None, None)?;
             }
             GateAction::Abort(reason) => abort(project_root, state, &reason)?,
