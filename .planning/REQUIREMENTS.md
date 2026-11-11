@@ -11,7 +11,7 @@ requirement closes a backlog entry, the entry is named; `.planning/user/V4-CUT-I
 
 ### Subtraction (CUT)
 
-- [ ] **CUT-01**: A run has no Define stage. `devflow start` begins at Plan (or at the stage the operator names with
+- [x] **CUT-01**: A run has no Define stage. `devflow start` begins at Plan (or at the stage the operator names with
       `--until`-style selection), and `--dry-run` shows no Define. Closes 999.183, 999.214.
 - [ ] **CUT-02**: A run ends after Validate as *finished*: there is no Ship stage, no after-ship hooks (Merge, VersionBump,
       ChangelogAppend, BranchCleanup), no `devflow ship` and no `--yes-ship`; the event log records `workflow_finished`
@@ -130,7 +130,7 @@ Populated during roadmap creation (2026-11-08). Phase order and dependencies: RO
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| CUT-01 | Phase 52 — Subtract and Stabilize | Pending |
+| CUT-01 | Phase 52 — Subtract and Stabilize | Complete |
 | CUT-02 | Phase 52 — Subtract and Stabilize | Pending |
 | CUT-03 | Phase 52 — Subtract and Stabilize | Pending |
 | CUT-04 | Phase 52 — Subtract and Stabilize | Pending |
