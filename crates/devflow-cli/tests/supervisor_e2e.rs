@@ -2700,3 +2700,113 @@ fn a_validate_gate_names_the_route_its_reject_prints_and_runs() {
         rig.events_text()
     );
 }
+
+// ---- 52-08 backstop: a --no-worktree run finishes the same way -----------
+//
+// When DevFlow runs in no-worktree mode the agent operates in the primary
+// checkout on a feature branch rather than a separate worktree directory.
+// `finish_run` has no worktree-specific branch, so the finish path is the
+// same as a worktree run, but the fact was only established by code reading.
+// This test pins the observable finish facts for the no-worktree mode so that
+// any future divergence between the two paths is caught immediately.
+
+/// A run started with `--no-worktree` finishes the same way as a worktree
+/// run when Validate passes: one `workflow_finished` with
+/// `{"reason":"finished","shipped":false}`, `state.finished: true`,
+/// `notify_fired` once, no git mutation (no merge/push/tag/branch delete).
+/// `state.worktree_path` is `None`; the feature branch and HEAD are unchanged
+/// by the finish.
+#[test]
+fn a_no_worktree_run_that_passes_validate_finishes_the_same_way() {
+    let phase = PhaseId::new(95);
+    let rig = FinishRig::new(phase);
+    let reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+
+    rig.start(&["--no-worktree"]);
+    rig.wait_for_end(&reaper);
+    let log = rig.events_text();
+    let events = rig.events();
+
+    // One workflow_finished with the same payload as a worktree run.
+    let finished = rig.positions("workflow_finished");
+    assert_eq!(finished.len(), 1, "one workflow_finished; events:\n{log}");
+    let finish = &events[finished[0]];
+    let payload: serde_json::Map<String, serde_json::Value> = finish
+        .as_object()
+        .unwrap()
+        .iter()
+        .filter(|(key, _)| !["v", "ts", "phase", "event"].contains(&key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    assert_eq!(
+        serde_json::Value::Object(payload),
+        serde_json::json!({"reason": "finished", "shipped": false}),
+        "the terminal payload; events:\n{log}"
+    );
+
+    // Notify fired exactly once, after workflow_finished.
+    assert_eq!(
+        rig.notify_lines().len(),
+        1,
+        "notify fired exactly once: {:?}\nevents:\n{log}",
+        rig.notify_lines()
+    );
+    let notified = rig.positions("notify_fired");
+    assert_eq!(notified.len(), 1, "one notify_fired; events:\n{log}");
+    assert!(
+        notified[0] > finished[0],
+        "notify_fired follows workflow_finished; events:\n{log}"
+    );
+    assert_eq!(events[notified[0]]["reason"], "finished", "{log}");
+
+    // No ship or hook events.
+    for absent in ["workflow_shipped", "hook_run"] {
+        assert!(
+            rig.positions(absent).is_empty(),
+            "no {absent} event; events:\n{log}"
+        );
+    }
+
+    // State kept: stopped and finished.
+    let state_file = devflow_core::workflow::state_path(&rig.root, phase);
+    let raw: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&state_file).unwrap_or_else(|err| {
+            panic!("the state file {} is kept: {err}", state_file.display())
+        }))
+        .expect("the kept state file parses");
+    assert_eq!(raw["stopped"], true, "the kept state is stopped: {raw}");
+    assert_eq!(raw["finished"], true, "the kept state is finished: {raw}");
+
+    // No worktree was created: state.worktree_path must be absent/null.
+    let state = rig.state();
+    assert!(
+        state.worktree_path.is_none(),
+        "--no-worktree run has no worktree_path: {state:?}"
+    );
+
+    // The feature branch exists and HEAD is still on it (finish_run made no
+    // git mutations in the primary checkout).
+    let branch = format!("feature/phase-{}", phase.padded());
+    assert_eq!(
+        rig.git_out(&["branch", "--list", &branch])
+            .trim_start_matches(['*', '+', ' ']),
+        branch,
+        "the feature branch is kept after finish"
+    );
+    assert_eq!(
+        rig.git_out(&["rev-parse", "--abbrev-ref", "HEAD"]),
+        branch,
+        "HEAD is still on the feature branch after finish (no git mutation)"
+    );
+
+    // The phase was deregistered.
+    let cache = rig.home.cache_dir();
+    assert!(
+        devflow_core::registry::roots_dir_in(&cache).is_dir(),
+        "control: the launch registered the phase in this registry directory"
+    );
+    assert!(
+        !devflow_core::registry::entry_path_in(&cache, &rig.root, phase).exists(),
+        "the finished phase is deregistered"
+    );
+}
