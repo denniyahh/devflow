@@ -99,12 +99,21 @@ pub enum GateAction {
 /// The abort reason when an abort answer carries no note.
 const ABORT_WITHOUT_NOTE: &str = "the gate answer was an abort";
 
+/// The abort reason for an answer that both approves and aborts. Such an answer
+/// is refused when written ([`GateError::ApprovedAndAborted`]), so one on disk
+/// was written by hand; it is read as an abort, never as an approval.
+const APPROVED_AND_ABORTED: &str =
+    "the gate answer both approves and aborts, which is invalid; it is read as an abort";
+
 impl GateAction {
     /// Decide the action from a response's fields, never from its note: `abort`
     /// ends the run, otherwise `approved` advances, and anything else loops back
     /// to Code. The abort is checked first, so an answer can never both abort
     /// and advance.
     pub fn from_response(response: &GateResponse) -> GateAction {
+        if response.abort && response.approved {
+            return GateAction::Abort(APPROVED_AND_ABORTED.to_string());
+        }
         if response.abort {
             let reason = response.note.as_deref().unwrap_or(ABORT_WITHOUT_NOTE);
             return GateAction::Abort(reason.to_string());
@@ -120,8 +129,8 @@ impl GateAction {
 ///
 /// Whether a file was published matters to a caller deciding what to do next.
 /// Nothing was published on [`GateError::GateLockTimeout`],
-/// [`GateError::GateIdMismatch`], [`GateError::NoOpenGate`] and
-/// [`GateError::AlreadyResponded`]. A file was on
+/// [`GateError::GateIdMismatch`], [`GateError::NoOpenGate`],
+/// [`GateError::AlreadyResponded`] and [`GateError::ApprovedAndAborted`]. A file was on
 /// [`GateError::GateClosedAfterPublish`] (it was then set aside) and on
 /// [`GateError::PublishedUnconfirmed`] (it was left in place). [`GateError::Io`]
 /// and [`GateError::Json`] say neither: from `answer` they can come from either
@@ -140,6 +149,12 @@ pub enum GateError {
     /// Responding to a gate that already has a response on disk.
     #[error("gate for phase {phase} stage {stage} already has a response awaiting pickup")]
     AlreadyResponded { phase: PhaseId, stage: Stage },
+    /// An answer that sets both `approved` and `abort`. Refused before anything
+    /// is read or written.
+    #[error(
+        "an answer cannot both approve and abort phase {phase}'s {stage} gate; nothing was written"
+    )]
+    ApprovedAndAborted { phase: PhaseId, stage: Stage },
     /// A gate id that does not have a gate id's format.
     #[error("`{0}` is not a gate id: expected 16 lowercase hex digits")]
     InvalidGateId(String),
@@ -1062,6 +1077,9 @@ impl Gates {
         response: &GateResponse,
         before_publish: impl FnOnce(),
     ) -> Result<PathBuf, GateError> {
+        if response.approved && response.abort {
+            return Err(GateError::ApprovedAndAborted { phase, stage });
+        }
         if !Self::dir(project_root).is_dir() {
             return Err(GateError::NoOpenGate { phase, stage });
         }
