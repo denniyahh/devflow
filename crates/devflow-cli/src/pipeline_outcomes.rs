@@ -336,7 +336,8 @@ pub(crate) fn record_gsd_runtime(project_root: &Path, phase: PhaseId) {
 }
 
 /// The agent's half of a Validate verdict (D-08): one input of
-/// [`validate_route`], GSD's status being the other.
+/// [`validate_gate_kind`] and of the route [`handle_validate_outcome`] takes
+/// through [`next_step`], GSD's status being the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AgentVerdict {
     /// The validate agent reported pass.
@@ -1389,7 +1390,8 @@ fn validate_gate_context(
 ///
 /// 52-22 (D-08, D-24, D45-4): every outcome reads GSD's own verification
 /// status once, in the evidence root, and the pair (agent verdict, GSD read)
-/// picks the route through [`validate_route`]. A run finishes only over an
+/// labels the gate through [`validate_gate_kind`] and picks the route through
+/// [`next_step`]. A run finishes only over an
 /// agent pass that GSD reports `passed`; every other status and every reader
 /// failure routes away from the finish. An agent PASS is recorded in
 /// `State::validate_pass_head` against the evidence root's HEAD, and every
