@@ -211,9 +211,20 @@ pub enum GateAction {
         /// The operator's note on the rejection, if any.
         note: Option<String>,
     },
+    /// Relaunch the gate's stage on the run's agent: the action of an approve
+    /// or a reject on a rate-limit gate (D-15, D-27.4, D-37). `note` is a
+    /// reject's note, kept byte for byte for the relaunched stage's prompt;
+    /// `None` for an approve. Only [`GateAction::from_gate_answer`] produces it.
+    Relaunch {
+        /// The operator's note on a reject, if any.
+        note: Option<String>,
+    },
     /// Aborted — stop the workflow with a reason.
     Abort(String),
 }
+
+/// Who [`Gates::rate_limit_timer_answer`] records as the responder.
+pub const RATE_LIMIT_TIMER: &str = "devflow-rate-limit-timer";
 
 /// The abort reason when an abort answer carries no note.
 const ABORT_WITHOUT_NOTE: &str = "the gate answer was an abort";
@@ -245,6 +256,17 @@ impl GateAction {
             note: response.note.clone(),
         }
     }
+
+    /// The action of `response` on a gate whose file records `kind`. On a
+    /// rate-limit gate an approve relaunches the stage with no note, a reject
+    /// relaunches it with its note, and an abort is the
+    /// [`from_response`](Self::from_response) abort, reason and all (D-27.4,
+    /// D-37); no answer to a rate-limit gate advances. Every other gate's answer
+    /// is [`from_response`](Self::from_response)'s.
+    pub fn from_gate_answer(kind: Option<GateKind>, response: &GateResponse) -> GateAction {
+        let _ = kind;
+        Self::from_response(response)
+    }
 }
 
 /// Errors produced by the gate protocol.
@@ -271,6 +293,12 @@ pub enum GateError {
     /// Responding to a gate that already has a response on disk.
     #[error("gate for phase {phase} stage {stage} already has a response awaiting pickup")]
     AlreadyResponded { phase: PhaseId, stage: Stage },
+    /// The rate-limit relaunch timer was asked to answer a gate that is not a
+    /// rate-limit gate. Refused before anything is written (T-52-44).
+    #[error(
+        "phase {phase}'s {stage} gate is not a rate-limit gate, so the relaunch timer cannot answer it; nothing was written"
+    )]
+    NotARateLimitGate { phase: PhaseId, stage: Stage },
     /// An answer that sets both `approved` and `abort`. Refused before anything
     /// is read or written.
     #[error(
@@ -915,6 +943,30 @@ impl Gates {
             abort: true,
             note: Some(note.to_string()),
             responded_by: Some(responded_by.to_string()),
+        };
+        Self::answer_with_hook(project_root, phase, stage, observed, &response, || {})
+    }
+
+    /// The rate-limit relaunch timer's answer to the gate the caller observed:
+    /// an approve, recorded as by [`RATE_LIMIT_TIMER`] (D-27.3). Mitigation for
+    /// T-52-44 (Elevation of Privilege): it takes **no** boolean parameter and
+    /// hard-codes the approve below, and it refuses, before anything is
+    /// written, any gate whose file does not record
+    /// [`GateKind::RateLimit`]. It publishes through the same first-writer-wins
+    /// path as [`answer`](Self::answer), so a human answer written first stands
+    /// and this call returns [`GateError::AlreadyResponded`]. It does not touch
+    /// the run's state: the used flag is the caller's (52-32).
+    pub fn rate_limit_timer_answer(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        observed: &GateId,
+    ) -> Result<PathBuf, GateError> {
+        let response = GateResponse {
+            approved: true,
+            abort: false,
+            note: None,
+            responded_by: Some("devflow".to_string()),
         };
         Self::answer_with_hook(project_root, phase, stage, observed, &response, || {})
     }
@@ -2380,6 +2432,152 @@ mod tests {
         let text = std::fs::read_to_string(&opened.path).unwrap();
         let raw: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert!(raw.get("not_before").is_none(), "control: {text}");
+    }
+
+    /// T-52-44: the relaunch timer refuses a gate that is not a rate-limit
+    /// gate, an ordinary stage-failure gate and a kindless 3.x file alike, and
+    /// writes nothing for either.
+    #[test]
+    fn the_relaunch_timer_writer_refuses_a_gate_that_is_not_a_rate_limit_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (ordinary, kindless) = (PhaseId::new(5314), PhaseId::new(5315));
+        let stage = Stage::Code;
+        let gate = Gates::open_gate(root, ordinary, stage, GateKind::StageFailure, "failed")
+            .unwrap()
+            .gate_id;
+        let refused = Gates::rate_limit_timer_answer(root, ordinary, stage, &gate);
+        assert!(
+            matches!(refused, Err(GateError::NotARateLimitGate { phase, stage: at }) if phase == ordinary && at == stage),
+            "{refused:?}"
+        );
+        assert!(!Gates::answer_path(root, ordinary, stage, &gate).exists());
+        assert_eq!(
+            Gates::read_answer(root, ordinary, stage, &gate),
+            AnswerRead::None
+        );
+
+        let opened = Gates::open_gate(root, kindless, stage, GateKind::RateLimit, "3.x").unwrap();
+        let mut raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&opened.path).unwrap()).unwrap();
+        raw.as_object_mut().unwrap().remove("gate_kind");
+        std::fs::write(&opened.path, serde_json::to_string(&raw).unwrap()).unwrap();
+        let refused = Gates::rate_limit_timer_answer(root, kindless, stage, &opened.gate_id);
+        assert!(
+            matches!(refused, Err(GateError::NotARateLimitGate { .. })),
+            "a kindless file is refused: {refused:?}"
+        );
+        assert!(!Gates::answer_path(root, kindless, stage, &opened.gate_id).exists());
+    }
+
+    /// D-27.3, T-52-45: the timer approves a rate-limit gate once, as the
+    /// timer; a second call is `AlreadyResponded`. A human answer written first
+    /// stands, and the timer's call is `AlreadyResponded`.
+    #[test]
+    fn the_relaunch_timer_writer_approves_a_rate_limit_gate_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (timed, human) = (PhaseId::new(5316), PhaseId::new(5317));
+        let stage = Stage::Code;
+        let gate = Gates::open_gate(
+            root,
+            timed,
+            stage,
+            GateLabel::rate_limit(Some(1_785_645_600)),
+            "rl",
+        )
+        .unwrap()
+        .gate_id;
+        Gates::rate_limit_timer_answer(root, timed, stage, &gate).unwrap();
+        let AnswerRead::Bound(answer) = Gates::read_answer(root, timed, stage, &gate) else {
+            panic!("the timer's answer is bound to its gate");
+        };
+        assert!(
+            answer.response.approved && !answer.response.abort,
+            "{answer:?}"
+        );
+        assert_eq!(answer.response.note, None);
+        assert_eq!(
+            answer.response.responded_by.as_deref(),
+            Some(RATE_LIMIT_TIMER)
+        );
+        let again = Gates::rate_limit_timer_answer(root, timed, stage, &gate);
+        assert!(
+            matches!(again, Err(GateError::AlreadyResponded { .. })),
+            "a second call: {again:?}"
+        );
+
+        let gate = Gates::open_gate(root, human, stage, GateLabel::rate_limit(None), "rl")
+            .unwrap()
+            .gate_id;
+        let operator = GateResponse {
+            approved: false,
+            abort: false,
+            note: Some("wait for the quota, then retry with a smaller diff".into()),
+            responded_by: Some("operator".into()),
+        };
+        Gates::answer(root, human, stage, &gate, &operator).unwrap();
+        let late = Gates::rate_limit_timer_answer(root, human, stage, &gate);
+        assert!(
+            matches!(late, Err(GateError::AlreadyResponded { .. })),
+            "the human answered first: {late:?}"
+        );
+        let AnswerRead::Bound(answer) = Gates::read_answer(root, human, stage, &gate) else {
+            panic!("the human's answer is bound");
+        };
+        assert_eq!(answer.response, operator, "the human's answer stands");
+    }
+
+    /// D-27.4, D-37, review C19: answers to a rate-limit gate map to a
+    /// relaunch or an abort. Approve relaunches with no note; a reject's note,
+    /// with a newline, a tab and quotes, reaches the relaunch byte for byte; an
+    /// abort, with and without a note, is `from_response`'s abort and reason.
+    /// Control in the same test: none of them advances, and the same answers
+    /// on a stage-failure gate keep `from_response`'s actions.
+    #[test]
+    fn rate_limit_gate_answers_map_to_relaunch_or_abort() {
+        let answer = |approved: bool, abort: bool, note: Option<&str>| GateResponse {
+            approved,
+            abort,
+            note: note.map(str::to_string),
+            responded_by: Some("operator".into()),
+        };
+        let note = "line one\n\tsay \"wait\" and 'then' retry";
+        let rate_limit = Some(GateKind::RateLimit);
+        let approve = answer(true, false, None);
+        let reject = answer(false, false, Some(note));
+        let aborts = [
+            answer(false, true, Some("stop: quota gone")),
+            answer(false, true, None),
+        ];
+
+        assert_eq!(
+            GateAction::from_gate_answer(rate_limit, &approve),
+            GateAction::Relaunch { note: None }
+        );
+        match GateAction::from_gate_answer(rate_limit, &reject) {
+            GateAction::Relaunch { note: Some(kept) } => {
+                assert_eq!(kept.as_bytes(), note.as_bytes(), "byte for byte");
+            }
+            other => panic!("a reject relaunches with its note: {other:?}"),
+        }
+        for abort in &aborts {
+            let mapped = GateAction::from_gate_answer(rate_limit, abort);
+            assert!(matches!(mapped, GateAction::Abort(_)), "{mapped:?}");
+            assert_eq!(mapped, GateAction::from_response(abort), "the same reason");
+        }
+        for response in [&approve, &reject, &aborts[0], &aborts[1]] {
+            assert_ne!(
+                GateAction::from_gate_answer(rate_limit, response),
+                GateAction::Advance,
+                "control: nothing advances on a rate-limit gate: {response:?}"
+            );
+            assert_eq!(
+                GateAction::from_gate_answer(Some(GateKind::StageFailure), response),
+                GateAction::from_response(response),
+                "control: another kind keeps from_response's action"
+            );
+        }
     }
 
     #[test]

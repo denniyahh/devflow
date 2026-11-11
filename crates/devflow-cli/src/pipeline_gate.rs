@@ -723,6 +723,7 @@ fn open_and_await(
                     "action": match &action {
                         GateAction::Advance => "advance",
                         GateAction::LoopBack { .. } => "loop_back",
+                        GateAction::Relaunch { .. } => "relaunch",
                         GateAction::Abort(_) => "abort",
                     },
                     "responded_by": response.responded_by,
