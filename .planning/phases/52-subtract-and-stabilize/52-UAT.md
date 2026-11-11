@@ -3,16 +3,12 @@ status: testing
 phase: 52-subtract-and-stabilize
 source: [52-VERIFICATION.md]
 started: 2026-11-11T20:10:00Z
-updated: 2026-11-11T20:10:00Z
+updated: 2026-11-11T20:40:00Z
 ---
 
 ## Current Test
 
-number: 8
-name: Manual close-out (operator machine): 3.x leftovers in .devflow/ and hermes cron jobs
-expected: |
-  None remain, or they are removed by hand
-awaiting: operator decision on the trading_bot leftovers (see resolution)
+[testing complete]
 
 ## Tests
 
@@ -53,15 +49,15 @@ resolution: Decided by the orchestrator on the evidence, 2026-11-11: `gates::tes
 
 ### 8. Manual close-out (operator machine): 3.x leftovers in .devflow/ and hermes cron jobs
 expected: None remain, or they are removed by hand
-result: [pending]
-resolution: Checked by the orchestrator, 2026-11-11, read-only. No `state-*.json` in any `.devflow/` under ~/Github or its `.worktrees/`. No rate-limit cron-resume job in ~/.hermes/cron/jobs.json (13 jobs; the 4 naming DevFlow are a gate watcher, a pane watchdog, a milestone watchdog and an unrelated UAT job). Found: /var/home/denniyahh/Github/trading_bot/.devflow/ holds 3.x leftovers from 2026-07-19 — `lock-08` and gate files `gates/08-define.json`, `gates/08-define.response.json`, `gates/08-ship.json`. A v4 binary does not read `define`/`ship` gates (no migration, D-28/D-30). Removing them is outside this repo and is the operator's call. Also unverified: whether the `devflow-gate-watcher` hermes job (gate-watcher.py) still reads v4 gate files correctly (gate kinds, `abort` field).
+result: pass
+resolution: Checked by the orchestrator, 2026-11-11, read-only. No `state-*.json` in any `.devflow/` under ~/Github or its `.worktrees/`. No rate-limit cron-resume job in ~/.hermes/cron/jobs.json (13 jobs; the 4 naming DevFlow are a gate watcher, a pane watchdog, a milestone watchdog and an unrelated UAT job). Found: /var/home/denniyahh/Github/trading_bot/.devflow/ holds 3.x leftovers from 2026-07-19 — `lock-08` and gate files `gates/08-define.json`, `gates/08-define.response.json`, `gates/08-ship.json`. A v4 binary does not read `define`/`ship` gates (no migration, D-28/D-30). Removing them is outside this repo and is the operator's call. Operator decisions, 2026-11-11: the four trading_bot files were deleted by the orchestrator on the operator's instruction (its three `08-validate` gate files kept: Validate is a v4 stage). The `devflow-gate-watcher` hermes job (created 2026-06-19, paused the same day after 49 runs; read v3 gate fields and offered a v3 reply menu) was removed with `hermes cron remove 1c097d288022` on the operator's instruction; its script ~/.hermes/scripts/gate-watcher.py was left in place.
 
 ## Summary
 
 total: 8
-passed: 7
+passed: 8
 issues: 0
-pending: 1
+pending: 0
 skipped: 0
 blocked: 0
 
