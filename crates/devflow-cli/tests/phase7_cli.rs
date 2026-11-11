@@ -650,6 +650,10 @@ const REMOVED_FLAG_INVOCATIONS: &[(&[&str], &str)] = &[
         &["resume", "--phase", "1", "--legacy-claude-launch"],
         "--legacy-claude-launch",
     ),
+    (
+        &["start", "--phase", "1", "--yes-ship", "--dry-run"],
+        "--yes-ship",
+    ),
 ];
 
 /// A removed flag or positional argument is refused by clap as unexpected
