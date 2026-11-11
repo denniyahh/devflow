@@ -1303,7 +1303,7 @@ pub(crate) fn run_preflight(
              (retry, loop-to-code, or abort)",
             truncate_reason(&reason)
         );
-        match run_gate(project_root, state, stage, &context)? {
+        match run_gate(project_root, state, stage, None, &context)? {
             GateAction::Advance => {
                 // D-18f: approval is an explicit override — skip the
                 // just-adjudicated check on the retry (see the function

@@ -3807,6 +3807,7 @@ pub(crate) fn advance_with(
                                 project_root,
                                 &mut state,
                                 stage,
+                                None,
                                 &context,
                                 gate_timeout_secs(),
                             )?;
@@ -9603,6 +9604,7 @@ mod tests {
                 &root,
                 &mut state,
                 Stage::Code,
+                None,
                 "a foreground gate",
                 300,
             );
@@ -11960,12 +11962,32 @@ mod tests {
     #[test]
     fn a_stop_after_a_gate_answer_stops_before_the_finish_and_reports_it() {
         const NAME: &str = "pipeline_launch::tests::a_stop_after_a_gate_answer_stops_before_the_finish_and_reports_it";
+        // 52-22: an approval finishes only over an agent pass that GSD reports
+        // `passed`, so the Validate agent passes and a GSD stub, reached by
+        // every supervisor through the child's environment, answers `passed`.
+        const PASS_MARKER: &str = r#"DEVFLOW_RESULT: {"status":"success","verdict":"pass"}"#;
         if !devflow_core::test_support::in_child_test(NAME) {
-            run_handoff_child(NAME, Some("after_commit"), SUCCESS_MARKER);
+            let gsd = tempfile::tempdir().unwrap();
+            let home = gsd.path().join("home");
+            devflow_core::test_support::plant_gsd_run_stub(
+                &home,
+                &[crate::test_support::gsd_says(
+                    devflow_core::gsd_reader::GsdStatus::Passed,
+                )],
+                &gsd.path().join("logs"),
+            );
+            run_handoff_child_with_stubs_and_env(
+                NAME,
+                Some("after_commit"),
+                PASS_MARKER,
+                &[],
+                &[(crate::test_support::TEST_GSD_HOME_ENV, home.as_os_str())],
+            );
             return;
         }
         let _guard = env_lock();
-        let run = HandoffRun::launch_with(PhaseId::new(1320), |_, state| {
+        let run = HandoffRun::launch_with(PhaseId::new(1320), |root, state| {
+            crate::test_support::phase_dir_fixture(root, state.phase);
             state.stage = Stage::Validate;
             state.stop_until = None;
         });
