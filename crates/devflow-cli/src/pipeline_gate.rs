@@ -2328,4 +2328,157 @@ mod tests {
             "every production write of State.stage, each needing a relaunch_note clear: {writes:#?}"
         );
     }
+
+    /// One `"workflow_finished"` literal in a file's non-test text: the file,
+    /// the function it sits in, and the text from the literal to the end of its
+    /// statement.
+    #[derive(Debug, Clone)]
+    struct FinishedSite {
+        file: String,
+        function: String,
+        payload: String,
+        constant: bool,
+    }
+
+    /// The `"workflow_finished"` literals in `source`'s non-test text: the text
+    /// before the test-module marker, or the whole file when it has none.
+    fn workflow_finished_sites(file: &str, source: &str) -> Vec<FinishedSite> {
+        const TEST_MODULE_MARKER: &str = "\n#[cfg(test)]\nmod tests {";
+        let literal = concat!("\"workflow", "_finished\"");
+        let non_test = source
+            .find(TEST_MODULE_MARKER)
+            .map_or(source, |at| &source[..at]);
+        let mut sites = Vec::new();
+        let mut from = 0;
+        while let Some(offset) = non_test[from..].find(literal) {
+            let at = from + offset;
+            from = at + literal.len();
+            let before = &non_test[..at];
+            let function = before
+                .rmatch_indices("fn ")
+                .find_map(|(index, _)| {
+                    let name: String = before[index + 3..]
+                        .chars()
+                        .take_while(|character| character.is_alphanumeric() || *character == '_')
+                        .collect();
+                    let boundary = index == 0
+                        || !before.as_bytes()[index - 1].is_ascii_alphanumeric()
+                            && before.as_bytes()[index - 1] != b'_';
+                    (boundary && !name.is_empty()).then_some(name)
+                })
+                .unwrap_or_default();
+            let line_start = before.rfind('\n').map_or(0, |index| index + 1);
+            let line = &before[line_start..];
+            let constant = ["const ", "static "]
+                .iter()
+                .any(|keyword| line.contains(keyword));
+            let rest = &non_test[at..];
+            let payload = rest[..rest.find(");").unwrap_or(rest.len())].to_string();
+            sites.push(FinishedSite {
+                file: file.to_string(),
+                function,
+                payload,
+                constant,
+            });
+        }
+        sites
+    }
+
+    /// Why `sites` breaks the rule, or nothing when exactly two sites exist,
+    /// both in `pipeline_gate.rs`: `finish_run` with reason `finished` and
+    /// `transition` with reason `stopped_at`, and no constant names the event.
+    fn workflow_finished_violations(sites: &[FinishedSite]) -> Vec<String> {
+        let mut violations: Vec<String> = sites
+            .iter()
+            .filter(|site| site.constant)
+            .map(|site| format!("a constant names the event: {site:?}"))
+            .collect();
+        let allowed = |site: &FinishedSite| {
+            site.file.ends_with("pipeline_gate.rs")
+                && ((site.function == "finish_run"
+                    && site.payload.contains(r#""reason": "finished""#))
+                    || (site.function == "transition"
+                        && site.payload.contains(r#""reason": "stopped_at""#)))
+        };
+        violations.extend(
+            sites.iter().filter(|site| !allowed(site)).map(|site| {
+                format!("an emission outside finish_run and the --until halt: {site:?}")
+            }),
+        );
+        let functions: std::collections::BTreeSet<&str> =
+            sites.iter().map(|site| site.function.as_str()).collect();
+        if sites.len() != 2 || functions != ["finish_run", "transition"].into_iter().collect() {
+            violations.push(format!(
+                "expected exactly two sites (finish_run, transition), found {}: {sites:?}",
+                sites.len()
+            ));
+        }
+        violations
+    }
+
+    /// Every `.rs` file under `dir`, recursively, as (path, text).
+    fn rust_sources(dir: &std::path::Path) -> Vec<(String, String)> {
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(dir).expect("read a source dir").flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                files.extend(rust_sources(&path));
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                files.push((
+                    path.display().to_string(),
+                    std::fs::read_to_string(&path).expect("read a source file"),
+                ));
+            }
+        }
+        files
+    }
+
+    /// D-45 rule 1 beside D-29: outside test code in both crates' `src/`, the
+    /// `"workflow_finished"` literal occurs exactly twice, both in
+    /// `pipeline_gate.rs`: in `finish_run` (reason `finished`) and in
+    /// `transition`'s `--until` halt (reason `stopped_at`). The tree is walked at
+    /// test time, so a new file is covered. Controls in the same test: a planted
+    /// third emission in another function and a planted constant naming the
+    /// event each report a violation; and since the real tree must yield exactly
+    /// two sites, a walk that reads no file fails too.
+    #[test]
+    fn workflow_finished_is_emitted_only_by_finish_run_and_the_until_halt() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut sites = Vec::new();
+        for dir in [manifest.join("src"), manifest.join("../devflow-core/src")] {
+            for (file, source) in rust_sources(&dir) {
+                sites.extend(workflow_finished_sites(&file, &source));
+            }
+        }
+        let violations = workflow_finished_violations(&sites);
+        assert!(violations.is_empty(), "{violations:#?}");
+
+        let emit = concat!("\"workflow", "_finished\"");
+        let planted_emit = format!(
+            "fn elsewhere() {{\n    events::emit(root, phase, {emit}, json!({{ \"reason\": \"finished\" }}));\n}}\n"
+        );
+        let mut with_third = sites.clone();
+        with_third.extend(workflow_finished_sites(
+            "src/pipeline_gate.rs",
+            &planted_emit,
+        ));
+        assert!(
+            !workflow_finished_violations(&with_third).is_empty(),
+            "control: a third emission site is a violation"
+        );
+        let planted_const = format!("const EVENT: &str = {emit};\n");
+        let mut with_const = sites.clone();
+        with_const.extend(workflow_finished_sites(
+            "src/pipeline_launch.rs",
+            &planted_const,
+        ));
+        assert!(
+            !workflow_finished_violations(&with_const).is_empty(),
+            "control: a constant naming the event is a violation"
+        );
+        assert!(
+            !workflow_finished_violations(&[]).is_empty(),
+            "control: a walk that read no file is a violation"
+        );
+    }
 }

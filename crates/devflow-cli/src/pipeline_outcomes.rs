@@ -511,6 +511,146 @@ fn read_evidence_head(evidence_root: &Path) -> Result<String, String> {
     Ok(head)
 }
 
+/// What the D-46 dirty-tree read found over the evidence root: one
+/// `git status --porcelain --untracked-files=all` call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TreeRead {
+    /// The read listed nothing.
+    Clean,
+    /// The paths the read listed, in its order.
+    Dirty(Vec<String>),
+    /// The read could not run or failed; holds git's error.
+    Failed(String),
+}
+
+/// The D-46 dirty-tree read: `git status --porcelain --untracked-files=all`
+/// over `evidence_root`, through the hermetic git command. `.planning/` is
+/// included, and untracked files are listed whatever the user, global or repo
+/// config sets for `status.showUntrackedFiles`. DevFlow's own `.devflow/` is
+/// ignored by the `*` `.gitignore` `workflow::ensure_devflow_dir` writes there.
+pub(crate) fn read_tree(evidence_root: &Path) -> TreeRead {
+    let output = match devflow_core::git::hermetic_command("git", evidence_root)
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) => return TreeRead::Failed(format!("git status could not run: {error}")),
+    };
+    if !output.status.success() {
+        return TreeRead::Failed(format!(
+            "git status exited {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let paths: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.get(3..).unwrap_or(line).to_string())
+        .collect();
+    if paths.is_empty() {
+        TreeRead::Clean
+    } else {
+        TreeRead::Dirty(paths)
+    }
+}
+
+/// What a routing decision is made on (D-45 rule 2, D-46): GSD's fresh status
+/// read, and whether the run's recorded Validate agent PASS names the evidence
+/// root's current HEAD over a clean tree. `no_pass_cause` is why a PASS does not
+/// count when the reason is a failed read or a dirty tree, worded for the gate
+/// context it leads to (`[never-silent]`); it never routes.
+#[derive(Debug)]
+pub(crate) struct Evidence {
+    /// GSD's status read, or why it could not be read.
+    pub(crate) read: ValidateRead,
+    /// The recorded PASS head equals HEAD and the tree read listed nothing.
+    pub(crate) agent_pass_on_head: bool,
+    /// Why no PASS counts: a failed HEAD read, a failed tree read, or the
+    /// dirty paths. `None` when a PASS counts or simply none is recorded.
+    pub(crate) no_pass_cause: Option<String>,
+}
+
+impl Evidence {
+    /// GSD's status, or `None` for a reader failure.
+    pub(crate) fn status(&self) -> Option<GsdStatus> {
+        self.read.as_ref().ok().map(|report| report.status)
+    }
+}
+
+/// `read_evidence`'s pure part: the evidence from its three reads' results.
+/// `recorded_head` is the run's recorded Validate PASS head, `current_head` the
+/// evidence root's HEAD read (or git's error), `tree` the D-46 read.
+pub(crate) fn evidence_from_reads(
+    read: ValidateRead,
+    recorded_head: Option<&str>,
+    current_head: Result<&str, &str>,
+    tree: &TreeRead,
+) -> Evidence {
+    let _ = tree;
+    let (agent_pass_on_head, no_pass_cause) = match current_head {
+        Ok(head) => (recorded_head == Some(head), None),
+        Err(error) => (
+            false,
+            Some(format!(
+                "[never-silent] the HEAD of the evidence root could not be read ({}), so no \
+                 Validate pass counts on it.",
+                truncate_reason(error)
+            )),
+        ),
+    };
+    Evidence {
+        read,
+        agent_pass_on_head,
+        no_pass_cause,
+    }
+}
+
+/// The evidence an answer is routed on, read fresh when the answer is picked
+/// up, never what a gate recorded (D-45 rule 2): GSD's status under the
+/// evidence root, then the D-46 tree read, then the root's HEAD (tree before
+/// HEAD, so a commit landing between the two reads shows as a HEAD change),
+/// compared with `recorded_head`.
+pub(crate) fn read_evidence(
+    evidence_root: &Path,
+    phase: PhaseId,
+    recorded_head: Option<&str>,
+) -> Evidence {
+    let read = read_verification_status(evidence_root, phase).map_err(EvidenceFailure::Reader);
+    let tree = TreeRead::Clean;
+    let head = read_evidence_head(evidence_root);
+    evidence_from_reads(
+        read,
+        recorded_head,
+        head.as_deref().map_err(String::as_str),
+        &tree,
+    )
+}
+
+/// The one finish check (D-45 rule 1) and the permit only it makes. Kept in
+/// its own module so nothing else in `pipeline_outcomes` can build a permit:
+/// its field is private here.
+mod finish_permit {
+    use super::Evidence;
+    use devflow_core::gsd_reader::GsdStatus;
+
+    /// Proof that [`can_finish`] held. Taken by value by
+    /// [`crate::pipeline_gate::finish_run`], so no run is recorded finished
+    /// without it.
+    #[derive(Debug)]
+    pub(crate) struct FinishPermit {
+        _sealed: (),
+    }
+
+    /// A permit only when GSD's fresh status is `passed` and the run's Validate
+    /// agent PASS is on the current HEAD over a clean tree (D-45 rule 1, D-46).
+    pub(crate) fn can_finish(evidence: &Evidence) -> Option<FinishPermit> {
+        (evidence.status() == Some(GsdStatus::Passed) && evidence.agent_pass_on_head)
+            .then_some(FinishPermit { _sealed: () })
+    }
+}
+pub(crate) use finish_permit::{FinishPermit, can_finish};
+
 /// Record one Validate outcome's read as a `gsd_verification` event: the
 /// agent's verdict and GSD's status, or the failure's label. Never GSD's or
 /// git's message, which can hold absolute paths (Pitfall 11).
@@ -6473,5 +6613,381 @@ mod tests {
                 assert_eq!(after.phase_validate_failures, expected, "{row}");
             }
         }
+    }
+
+    // ---- 52-29 (D-45 rules 1, 2; D-46): one finish check, one routing table ----
+
+    /// Run git in `root` and return its trimmed stdout, asserting success.
+    fn git_in(root: &Path, args: &[&str]) -> String {
+        let output = devflow_core::test_support::git_command(root)
+            .args(args)
+            .output()
+            .expect("spawn git");
+        assert!(output.status.success(), "git {args:?} failed: {output:?}");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// D-45 rule 1, D-46: `can_finish` gives a permit only over GSD's `passed`
+    /// with the recorded Validate PASS head equal to the evidence root's HEAD
+    /// over a clean tree. The first row (clean tree, equal heads, `passed`) is
+    /// the control that gives a permit; each dirty row differs from it only in
+    /// the tree, and names the dirty path or the failed read.
+    #[test]
+    fn can_finish_needs_passed_and_a_pass_on_the_current_head() {
+        enum Tree {
+            Clean,
+            Untracked,
+            UntrackedHiddenByConfig,
+            ModifiedPlanning,
+            UnreadableIndex,
+        }
+        enum Recorded {
+            Head,
+            Other,
+            None,
+        }
+        // (status reply or None for a reader failure, recorded head, tree,
+        // HEAD readable, permit expected, text the evidence must name)
+        let passed = Some(gsd_says(GsdStatus::Passed));
+        let rows: Vec<(&str, Option<&str>, Recorded, Tree, bool, bool, Option<&str>)> = vec![
+            (
+                "control",
+                passed,
+                Recorded::Head,
+                Tree::Clean,
+                true,
+                true,
+                None,
+            ),
+            (
+                "other head",
+                passed,
+                Recorded::Other,
+                Tree::Clean,
+                true,
+                false,
+                None,
+            ),
+            (
+                "no record",
+                passed,
+                Recorded::None,
+                Tree::Clean,
+                true,
+                false,
+                None,
+            ),
+            (
+                "HEAD unreadable",
+                passed,
+                Recorded::Other,
+                Tree::Clean,
+                false,
+                false,
+                Some("HEAD"),
+            ),
+            (
+                "untracked",
+                passed,
+                Recorded::Head,
+                Tree::Untracked,
+                true,
+                false,
+                Some("loose.txt"),
+            ),
+            (
+                "untracked, showUntrackedFiles=no",
+                passed,
+                Recorded::Head,
+                Tree::UntrackedHiddenByConfig,
+                true,
+                false,
+                Some("loose.txt"),
+            ),
+            (
+                "modified .planning",
+                passed,
+                Recorded::Head,
+                Tree::ModifiedPlanning,
+                true,
+                false,
+                Some(".planning/notes.md"),
+            ),
+            (
+                "tree read failed",
+                passed,
+                Recorded::Head,
+                Tree::UnreadableIndex,
+                true,
+                false,
+                Some("could not be read"),
+            ),
+            (
+                "gaps_found",
+                Some(gsd_says(GsdStatus::GapsFound)),
+                Recorded::Head,
+                Tree::Clean,
+                true,
+                false,
+                None,
+            ),
+            (
+                "human_needed",
+                Some(gsd_says(GsdStatus::HumanNeeded)),
+                Recorded::Head,
+                Tree::Clean,
+                true,
+                false,
+                None,
+            ),
+            (
+                "stale",
+                Some(gsd_says(GsdStatus::Stale)),
+                Recorded::Head,
+                Tree::Clean,
+                true,
+                false,
+                None,
+            ),
+            (
+                "missing",
+                Some(gsd_says(GsdStatus::Missing)),
+                Recorded::Head,
+                Tree::Clean,
+                true,
+                false,
+                None,
+            ),
+            (
+                "reader failure",
+                None,
+                Recorded::Head,
+                Tree::Clean,
+                true,
+                false,
+                None,
+            ),
+        ];
+        for (number, (row, reply, recorded, tree, head_readable, permit, names)) in
+            (5400u32..).zip(rows)
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = PhaseId::new(number);
+            phase_dir_fixture(root, phase);
+            let _gsd = reply.map(|reply| GsdStub::answering(root, &[reply]));
+            git_in(root, &["init", "-q"]);
+            git_in(root, &["config", "user.email", "devflow@example.com"]);
+            git_in(root, &["config", "user.name", "DevFlow Tests"]);
+            git_in(root, &["config", "commit.gpgsign", "false"]);
+            let head = if head_readable {
+                std::fs::write(root.join(".planning/notes.md"), "notes\n").unwrap();
+                git_in(root, &["add", ".planning/notes.md"]);
+                git_in(root, &["commit", "-q", "-m", "fixture"]);
+                git_in(root, &["rev-parse", "HEAD"])
+            } else {
+                // No commit and no file: HEAD names nothing, so its read
+                // fails, over a tree the read finds clean.
+                String::new()
+            };
+            match tree {
+                Tree::Clean => {}
+                Tree::Untracked => std::fs::write(root.join("loose.txt"), "x").unwrap(),
+                Tree::UntrackedHiddenByConfig => {
+                    git_in(root, &["config", "status.showUntrackedFiles", "no"]);
+                    std::fs::write(root.join("loose.txt"), "x").unwrap();
+                    let plain = git_in(root, &["status", "--porcelain"]);
+                    assert!(
+                        plain.is_empty(),
+                        "{row}: premise: a plain porcelain read hides the file: {plain:?}"
+                    );
+                }
+                Tree::ModifiedPlanning => {
+                    std::fs::write(root.join(".planning/notes.md"), "changed\n").unwrap()
+                }
+                Tree::UnreadableIndex => {
+                    std::fs::write(root.join(".git/index"), "not an index").unwrap()
+                }
+            }
+            let recorded_head = match recorded {
+                Recorded::Head => Some(head.clone()),
+                Recorded::Other => Some("0".repeat(40)),
+                Recorded::None => None,
+            };
+            let evidence = read_evidence(root, phase, recorded_head.as_deref());
+            assert_eq!(
+                can_finish(&evidence).is_some(),
+                permit,
+                "{row}: permit expected {permit}; evidence {evidence:?}"
+            );
+            if let Some(names) = names {
+                let cause = evidence.no_pass_cause.as_deref().unwrap_or_default();
+                assert!(
+                    cause.contains(names) && cause.starts_with("[never-silent]"),
+                    "{row}: the evidence names {names:?} never-silently: {evidence:?}"
+                );
+            }
+        }
+    }
+
+    /// U4 (D-45 rule 2): a supervise Validate whose agent passes while GSD
+    /// answers `stale` opens a `reverify_needed` gate, launches nothing before
+    /// an answer and counts one failure on each counter; approving it while the
+    /// fresh read is still `stale` relaunches Code with the re-verify pass and
+    /// records no `workflow_finished`. Control in the same test: the same gate
+    /// approved while the fresh read is `passed`, with the PASS on HEAD over a
+    /// clean tree, finishes, so the route follows the fresh read and not the
+    /// `reverify_needed` label.
+    #[test]
+    fn a_supervise_stale_validate_gates_and_approve_reverifies() {
+        if !in_bounded_child(
+            "pipeline_outcomes::tests::a_supervise_stale_validate_gates_and_approve_reverifies",
+        ) {
+            return;
+        }
+        for (number, fresh, finishes) in [
+            (5420, GsdStatus::Stale, false),
+            (5421, GsdStatus::Passed, true),
+        ] {
+            let row = format!("fresh read {fresh:?}");
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = PhaseId::new(number);
+            let _gsd =
+                validate_evidence(root, phase, &[gsd_says(GsdStatus::Stale), gsd_says(fresh)]);
+            let mut state = validate_state(root, phase, Mode::Supervise);
+            let (gate, at_gate) = at_the_validate_gate(root, phase, &approve_answer(), || {
+                let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Passed);
+            });
+            assert_eq!(gate["gate_kind"], "reverify_needed", "{row}: {gate}");
+            assert_eq!(
+                at_gate.stage,
+                Stage::Validate,
+                "{row}: nothing launched before an answer"
+            );
+            assert_eq!(
+                at_gate.code_fix, None,
+                "{row}: no fix pass before an answer"
+            );
+            assert_eq!(
+                (
+                    at_gate.consecutive_failures,
+                    at_gate.phase_validate_failures
+                ),
+                (1, 1),
+                "{row}: the stale round counts once on each counter"
+            );
+            let finished = events_named(root, phase, "workflow_finished");
+            let after = workflow::load_state(root, phase).unwrap();
+            if finishes {
+                assert_eq!(
+                    finished.len(),
+                    1,
+                    "{row}: a fresh `passed` with the PASS on HEAD finishes: {:?}",
+                    phase_events(root, phase)
+                );
+                assert!(after.finished, "{row}: {after:?}");
+            } else {
+                assert!(
+                    finished.is_empty(),
+                    "{row}: no finish over `stale`: {finished:?}"
+                );
+                assert_eq!(after.stage, Stage::Code, "{row}: approve launches Code");
+                assert_eq!(after.code_fix, Some(FixType::StaleReverify), "{row}");
+                let prompt = claude_launch_prompt(&after);
+                assert!(
+                    prompt.contains("re-run the verifier"),
+                    "{row}: the Code launch is the re-verify pass: {prompt}"
+                );
+            }
+        }
+    }
+
+    /// D-45 rule 2, D-08: a Validate outcome reads GSD's status once, and that
+    /// one read picks the label, the count and the route. Each row's stub gives
+    /// one status at its first read and a different one at any later read.
+    /// Control in the same test: approving the supervise row's gate logs
+    /// exactly one more read and takes the gap loop over its `gaps_found`, so
+    /// the log counts reads and the later answer is what a second read sees.
+    #[test]
+    fn a_validate_outcome_reads_gsd_status_once() {
+        if !in_bounded_child("pipeline_outcomes::tests::a_validate_outcome_reads_gsd_status_once") {
+            return;
+        }
+        let counters = |state: &State| (state.consecutive_failures, state.phase_validate_failures);
+
+        // Auto, agent PASS, `stale` then `passed`: the re-verify pass.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5430);
+        let gsd = validate_evidence(
+            root,
+            phase,
+            &[gsd_says(GsdStatus::Stale), gsd_says(GsdStatus::Passed)],
+        );
+        let mut state = validate_state(root, phase, Mode::Auto);
+        preanswer_gate(root, phase, Stage::Validate, &abort_answer());
+        let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Passed);
+        let after = workflow::load_state(root, phase).unwrap();
+        assert_eq!(status_reads(&gsd), 1, "auto stale: one read");
+        assert_eq!(counters(&after), (1, 1), "auto stale: counted once");
+        assert_eq!(
+            after.code_fix,
+            Some(FixType::StaleReverify),
+            "auto stale: re-verify"
+        );
+        assert!(events_named(root, phase, "workflow_finished").is_empty());
+
+        // Auto, agent FAIL, `gaps_found` then `passed`: the gaps Plan launch.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5431);
+        let gsd = validate_evidence(
+            root,
+            phase,
+            &[gsd_says(GsdStatus::GapsFound), gsd_says(GsdStatus::Passed)],
+        );
+        let mut state = validate_state(root, phase, Mode::Auto);
+        preanswer_gate(root, phase, Stage::Validate, &abort_answer());
+        let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
+        let after = workflow::load_state(root, phase).unwrap();
+        assert_eq!(status_reads(&gsd), 1, "auto gaps: one read");
+        assert_eq!(counters(&after), (1, 1), "auto gaps: counted once");
+        assert_eq!(after.stage, Stage::Plan, "auto gaps: the gaps Plan launch");
+        assert!(after.gap_closure_pass, "auto gaps: the gap marker is set");
+
+        // Supervise, agent PASS, `passed` then `gaps_found`: a clean_pass gate.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5432);
+        let gsd = validate_evidence(
+            root,
+            phase,
+            &[gsd_says(GsdStatus::Passed), gsd_says(GsdStatus::GapsFound)],
+        );
+        let mut state = validate_state(root, phase, Mode::Supervise);
+        let (gate, at_gate) = at_the_validate_gate(root, phase, &approve_answer(), || {
+            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Passed);
+        });
+        assert_eq!(gate["gate_kind"], "clean_pass", "supervise: {gate}");
+        assert_eq!(
+            counters(&at_gate),
+            (0, 0),
+            "supervise: a clean pass counts nothing"
+        );
+        // Control: the approve reads once more and takes the gap loop.
+        assert_eq!(
+            status_reads(&gsd),
+            2,
+            "control: the approve logs exactly one more read; events: {:?}",
+            phase_events(root, phase)
+        );
+        let after = workflow::load_state(root, phase).unwrap();
+        assert!(
+            events_named(root, phase, "workflow_finished").is_empty(),
+            "control: the fresh `gaps_found` does not finish"
+        );
+        assert_eq!(after.stage, Stage::Plan, "control: the gap loop: {after:?}");
+        assert!(after.gap_closure_pass, "control: the gap marker is set");
     }
 }

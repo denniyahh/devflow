@@ -2248,3 +2248,251 @@ fn an_until_validate_run_with_gaps_runs_the_gap_loop() {
         "control: no until_noop event; events:\n{control_log}"
     );
 }
+
+// ---- 52-29 (D-45 rules 1 and 2, D-46): a finish needs a Validate PASS on HEAD ----
+
+impl FinishRig {
+    /// The run's phase worktree.
+    fn worktree(&self) -> std::path::PathBuf {
+        self.state()
+            .worktree_path
+            .expect("the run used a phase worktree")
+            .canonicalize()
+            .expect("the worktree exists")
+    }
+
+    /// `devflow gate <answer> N --stage validate`, asserting it exits 0.
+    fn answer_validate(&self, answer: &str) {
+        let output = common::hermetic_devflow(&self.home)
+            .args([
+                "gate",
+                answer,
+                &self.phase.to_string(),
+                "--stage",
+                "validate",
+            ])
+            .arg("--project")
+            .arg(&self.root)
+            .output()
+            .expect("run devflow gate");
+        assert!(
+            output.status.success(),
+            "gate {answer} exits 0\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// The Validate gates fired so far.
+    fn validate_gates(&self) -> usize {
+        self.events()
+            .iter()
+            .filter(|event| event["event"] == "gate_fired" && event["stage"] == "validate")
+            .count()
+    }
+
+    /// Wait until `count` Validate gates have fired.
+    fn wait_for_validate_gates(&self, count: usize) {
+        common::wait_for(
+            || self.validate_gates() >= count || !self.positions("workflow_finished").is_empty(),
+            RUN_WAIT,
+            &format!("Validate gate {count} of phase {}", self.phase),
+        );
+        assert_eq!(
+            self.validate_gates(),
+            count,
+            "Validate gate {count} fired; events:\n{}",
+            self.events_text()
+        );
+    }
+
+    /// The `gate_resolved` events, in order.
+    fn resolved(&self) -> Vec<serde_json::Value> {
+        self.events()
+            .into_iter()
+            .filter(|event| event["event"] == "gate_resolved")
+            .collect()
+    }
+
+    /// The Validate gate file's JSON.
+    fn validate_gate(&self) -> serde_json::Value {
+        let path = devflow_core::gates::Gates::gate_path(
+            &self.root,
+            self.phase,
+            devflow_core::stage::Stage::Validate,
+        );
+        serde_json::from_str(&fs::read_to_string(&path).expect("the Validate gate file"))
+            .expect("the gate file parses")
+    }
+
+    /// The Validate agent launches so far.
+    fn validate_launches(&self) -> usize {
+        self.events()
+            .iter()
+            .filter(|event| event["event"] == "stage_launched" && event["stage"] == "validate")
+            .count()
+    }
+}
+
+/// GSD's `passed` for every status read a supervise run makes.
+fn always_passed() -> Vec<&'static str> {
+    vec![devflow_core::test_support::gsd_status_json(GsdStatus::Passed); 12]
+}
+
+/// D-45 rule 1: a supervise run whose GSD stub answers `passed` to every
+/// read and whose Validate agent reports pass. At the first Validate gate the
+/// test commits one file on the phase branch in the run's worktree, then
+/// approves: no `workflow_finished`, and a second Validate launch. The second
+/// gate is approved: one `workflow_finished` `{"reason":"finished",
+/// "shipped":false}`. The first approve's `gate_resolved` names the
+/// Validate-again route with `agent_pass_on_head: false`, the second names
+/// finish with `true`. Control in the same test: the second approve, over the
+/// same `passed` stub with the PASS on HEAD, finishes, so the no-finish
+/// assertion is one that can fail.
+#[test]
+fn approving_a_clean_pass_after_a_new_commit_runs_validate_again() {
+    let phase = PhaseId::new(91);
+    let rig = FinishRig::new(phase);
+    rig.stub_gsd(&always_passed());
+    let reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+
+    rig.start_in("supervise", &[]);
+    rig.wait_for_validate_gates(1);
+    let worktree = rig.worktree();
+    fs::write(worktree.join("after-validate.txt"), "new\n").unwrap();
+    git(&worktree, &["add", "after-validate.txt"]);
+    git(
+        &worktree,
+        &["commit", "-q", "-m", "a commit after Validate"],
+    );
+    rig.answer_validate("approve");
+    rig.wait_for_validate_gates(2);
+    let log = rig.events_text();
+    assert!(
+        rig.positions("workflow_finished").is_empty(),
+        "an approve after a new commit does not finish; events:\n{log}"
+    );
+    assert_eq!(
+        rig.validate_launches(),
+        2,
+        "Validate runs again; events:\n{log}"
+    );
+    let first = rig.resolved()[0].clone();
+    assert_eq!(first["route"], "validate_again", "{first}");
+    assert_eq!(first["agent_pass_on_head"], false, "{first}");
+    assert_eq!(first["gsd_status"], "passed", "{first}");
+
+    // Control: the same approve over the PASS on HEAD finishes.
+    rig.answer_validate("approve");
+    common::wait_for(
+        || !rig.positions("workflow_finished").is_empty(),
+        RUN_WAIT,
+        "the second approve to finish the run",
+    );
+    let log = rig.events_text();
+    assert_eq!(
+        finished_payloads(&rig),
+        vec![serde_json::json!({"reason": "finished", "shipped": false})],
+        "events:\n{log}"
+    );
+    let second = rig.resolved()[1].clone();
+    assert_eq!(second["route"], "finish", "{second}");
+    assert_eq!(second["agent_pass_on_head"], true, "{second}");
+    assert!(
+        reaper.supervisors_exited_within(EXIT_WAIT),
+        "the finished run's supervisors exit; events:\n{log}"
+    );
+}
+
+/// D-46 (U3) and its 2026-11-10 amendment: the same supervise run; at the
+/// first Validate gate the test writes one untracked file in the worktree and
+/// commits nothing, then approves: no finish, a second Validate launch, and
+/// the approve's `gate_resolved` names Validate again with
+/// `agent_pass_on_head: false`. The second gate names the untracked path in a
+/// `[never-silent]` line, and the state at that gate holds no
+/// `validate_pass_head` (that Validate read the dirty tree, so it recorded no
+/// PASS). The test deletes the file and approves: still no finish, a third
+/// Validate launch, Validate again with `false` (cleaning the tree does not
+/// revive a PASS). The third gate, whose Validate ran over the clean tree, is
+/// approved: one `workflow_finished`. Control in the same test: that last
+/// approve, over the same stub, HEAD and clean tree, finishes because a
+/// Validate examined the clean tree.
+#[test]
+fn approving_a_clean_pass_over_an_uncommitted_change_runs_validate_again() {
+    let phase = PhaseId::new(92);
+    let rig = FinishRig::new(phase);
+    rig.stub_gsd(&always_passed());
+    let reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+
+    rig.start_in("supervise", &[]);
+    rig.wait_for_validate_gates(1);
+    let worktree = rig.worktree();
+    let loose = worktree.join("uncommitted.txt");
+    fs::write(&loose, "not committed\n").unwrap();
+    rig.answer_validate("approve");
+    rig.wait_for_validate_gates(2);
+    let log = rig.events_text();
+    assert!(
+        rig.positions("workflow_finished").is_empty(),
+        "an approve over an uncommitted file does not finish; events:\n{log}"
+    );
+    assert_eq!(
+        rig.validate_launches(),
+        2,
+        "Validate runs again; events:\n{log}"
+    );
+    let first = rig.resolved()[0].clone();
+    assert_eq!(first["route"], "validate_again", "{first}");
+    assert_eq!(first["agent_pass_on_head"], false, "{first}");
+    let context = rig.validate_gate()["context"]
+        .as_str()
+        .expect("a gate context")
+        .to_string();
+    assert!(
+        context
+            .lines()
+            .chain(context.split(". "))
+            .any(|line| line.contains("[never-silent]") && line.contains("uncommitted.txt")),
+        "the second gate names the untracked path never-silently: {context}"
+    );
+    assert!(
+        rig.state().validate_pass_head.is_none(),
+        "a Validate over a dirty tree records no PASS: {:?}",
+        rig.state()
+    );
+
+    fs::remove_file(&loose).unwrap();
+    rig.answer_validate("approve");
+    rig.wait_for_validate_gates(3);
+    let log = rig.events_text();
+    assert!(
+        rig.positions("workflow_finished").is_empty(),
+        "cleaning the tree does not revive a PASS; events:\n{log}"
+    );
+    assert_eq!(
+        rig.validate_launches(),
+        3,
+        "a third Validate; events:\n{log}"
+    );
+    let second = rig.resolved()[1].clone();
+    assert_eq!(second["route"], "validate_again", "{second}");
+    assert_eq!(second["agent_pass_on_head"], false, "{second}");
+
+    // Control: after a Validate over the clean tree, the same approve finishes.
+    rig.answer_validate("approve");
+    common::wait_for(
+        || !rig.positions("workflow_finished").is_empty(),
+        RUN_WAIT,
+        "the approve after a clean Validate to finish the run",
+    );
+    let log = rig.events_text();
+    assert_eq!(
+        finished_payloads(&rig),
+        vec![serde_json::json!({"reason": "finished", "shipped": false})],
+        "events:\n{log}"
+    );
+    assert!(
+        reaper.supervisors_exited_within(EXIT_WAIT),
+        "the finished run's supervisors exit; events:\n{log}"
+    );
+}
