@@ -10108,7 +10108,7 @@ mod tests {
     /// retry time parses, so the no-fallback gate names it as the reset time
     /// (`pipeline_outcomes::tests::primary_loop_rate_limited_waits_at_the_code_gate`).
     const RATE_LIMIT_ENVELOPE: &str =
-        r#"{"type":"result","subtype":"error_rate_limit","retry_after":"2026-06-18T15:45:30Z"}"#;
+        r#"{"type":"result","subtype":"error_rate_limit","retry_after":"2099-06-18T15:45:30Z"}"#;
 
     /// A `claude` stub that waits for `go` in its working directory, commits
     /// once, records that commit's id in `primary-commit` and prints the
