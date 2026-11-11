@@ -106,7 +106,7 @@ const PROMOTION_WAIT: Duration = Duration::from_secs(5);
 /// [`launch_stage_inner`] (whose prompt the agent receives) and
 /// [`launch_stage`] (which resolves the program from it) both call this, which
 /// `every_no_override_launch_renders_through_default_stage_prompt` pins.
-fn default_stage_prompt(state: &State, driver: &dyn agents::AgentDriver) -> String {
+pub(crate) fn default_stage_prompt(state: &State, driver: &dyn agents::AgentDriver) -> String {
     let intent = match state.stage {
         Stage::Code => prompt::StageIntent::Code {
             phase: state.phase,
@@ -11202,6 +11202,17 @@ mod tests {
         phase: PhaseId,
         fix: Option<prompt::FixType>,
     ) -> (Vec<String>, ReapMonitorOnDrop) {
+        fail_over_from_code_with_note(root, phase, fix, None)
+    }
+
+    /// [`fail_over_from_code`] whose loop-back into Code carried the rejection
+    /// note `note` (GATE-01): the fix pass records it as `code_fix_note`.
+    fn fail_over_from_code_with_note(
+        root: &Path,
+        phase: PhaseId,
+        fix: Option<prompt::FixType>,
+        note: Option<&str>,
+    ) -> (Vec<String>, ReapMonitorOnDrop) {
         init_repo(root);
         let mut state = State::new(
             phase,
@@ -11221,7 +11232,7 @@ mod tests {
                 root,
                 &mut state,
                 fix,
-                None,
+                note.map(str::to_string),
                 crate::pipeline_gate::LoopBackReason::GateResponse,
             )
             .unwrap();
@@ -13190,11 +13201,23 @@ mod tests {
         phase: PhaseId,
         fix: Option<prompt::FixType>,
     ) -> (Vec<String>, ReapMonitorOnDrop) {
+        resume_code_run_with_note(root, phase, fix, None)
+    }
+
+    /// [`resume_code_run`] whose fix pass holds the rejection note `note` as
+    /// `code_fix_note` (GATE-01).
+    fn resume_code_run_with_note(
+        root: &Path,
+        phase: PhaseId,
+        fix: Option<prompt::FixType>,
+        note: Option<&str>,
+    ) -> (Vec<String>, ReapMonitorOnDrop) {
         init_repo(root);
         let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
         state.verification_baseline_captured = true;
         state.stage = Stage::Code;
         state.code_fix = fix;
+        state.code_fix_note = note.map(str::to_string);
         state.stopped = true;
         state.stop_reason = Some("rate limited".to_string());
         workflow::save_state(&state).unwrap();
@@ -13254,6 +13277,272 @@ mod tests {
         assert!(
             !argv.contains(&code_prompt(plain_phase, Some(prompt::FixType::GapsOnly))),
             "control: a plain resume delivers no fix prompt: {argv:?}"
+        );
+    }
+
+    // ---- GATE-01: a replayed or relaunched pass keeps the operator's note ----
+
+    /// A fix-pass note with a newline, a tab, quotes and a backtick.
+    const FIX_NOTE_Q: &str =
+        "Q: fix the gaps in\tparse.rs,\nthen run \"cargo test\" and `cargo fmt`";
+
+    /// A relaunch note with a newline and a tab.
+    const RELAUNCH_NOTE_R: &str = "R: the stage failed on a flaky step;\n\tretry it once";
+
+    /// Whether some argument in `argv` holds `note` byte for byte.
+    fn argv_holds(argv: &[String], note: &str) -> bool {
+        argv.iter().any(|arg| arg.contains(note))
+    }
+
+    /// GATE-01 / D-14: a fix pass entered with a rejection note keeps that note
+    /// when it is replayed, through `devflow resume` and through the rate-limit
+    /// failover handoff; the assertion is on the argv the spawned `codex`
+    /// received. Control in the same test: the same replays of a fix pass with
+    /// no note carry no note block.
+    #[test]
+    fn a_replayed_fix_pass_keeps_the_note() {
+        const NAME: &str = "pipeline_launch::tests::a_replayed_fix_pass_keeps_the_note";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = argv_recording_agents_dir();
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let _guard = env_lock();
+        let gaps = Some(prompt::FixType::GapsOnly);
+
+        let resume_dir = tempfile::tempdir().unwrap();
+        let (argv, _reap_resume) = resume_code_run_with_note(
+            resume_dir.path(),
+            PhaseId::new(5290),
+            gaps,
+            Some(FIX_NOTE_Q),
+        );
+        assert!(
+            argv_holds(&argv, FIX_NOTE_Q),
+            "a resumed fix pass hands the agent its note: {argv:?}"
+        );
+        let reloaded = workflow::load_state(resume_dir.path(), PhaseId::new(5290)).unwrap();
+        assert_eq!(reloaded.code_fix_note.as_deref(), Some(FIX_NOTE_Q));
+
+        let failover_dir = tempfile::tempdir().unwrap();
+        let (argv, _reap_failover) = fail_over_from_code_with_note(
+            failover_dir.path(),
+            PhaseId::new(5291),
+            gaps,
+            Some(FIX_NOTE_Q),
+        );
+        assert!(
+            argv_holds(&argv, FIX_NOTE_Q),
+            "the fallback's replay of the fix pass carries the note: {argv:?}"
+        );
+
+        // Control: the same two replays of a fix pass with no note.
+        let plain_dir = tempfile::tempdir().unwrap();
+        let (argv, _reap_plain) =
+            resume_code_run_with_note(plain_dir.path(), PhaseId::new(5292), gaps, None);
+        assert!(
+            !argv.iter().any(|arg| arg.contains("OPERATOR NOTE")),
+            "control: no note, no block: {argv:?}"
+        );
+        let plain_failover_dir = tempfile::tempdir().unwrap();
+        let (argv, _reap_plain_failover) = fail_over_from_code_with_note(
+            plain_failover_dir.path(),
+            PhaseId::new(5293),
+            gaps,
+            None,
+        );
+        assert!(
+            !argv.iter().any(|arg| arg.contains("OPERATOR NOTE")),
+            "control: no note, no block: {argv:?}"
+        );
+    }
+
+    /// A supervise-mode Codex run of `phase` at `root` at `stage`, saved.
+    fn failing_stage_state(root: &Path, phase: PhaseId, stage: Stage) -> State {
+        init_repo(root);
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
+        state.verification_baseline_captured = true;
+        state.stage = stage;
+        workflow::save_state(&state).unwrap();
+        state
+    }
+
+    /// Fail `state`'s stage through `fail` (which opens its stage-failure gate),
+    /// with that gate pre-answered as a rejection carrying `note`. Returns the
+    /// state as it is on disk afterwards and a reaper for any launch.
+    fn reject_stage_failure(
+        root: &Path,
+        state: &mut State,
+        note: &str,
+        fail: impl FnOnce(&Path, &mut State) -> Result<(), CliError>,
+    ) -> (State, ReapMonitorOnDrop) {
+        preanswer_gate_response(
+            root,
+            state.phase,
+            state.stage,
+            &gate_response(false, Some(note)),
+        );
+        let result = fail(root, state);
+        let reloaded = workflow::load_state(root, state.phase).unwrap();
+        let reap = ReapMonitorOnDrop::after_launch(&reloaded);
+        result.unwrap();
+        (reloaded, reap)
+    }
+
+    /// GATE-01 / D-39 (U1): a rejected stage-failure gate relaunches its stage
+    /// with the reject's note in the prompt, through `relaunch_note`, at Plan,
+    /// at Code (an ordinary Code pass) and at Validate (opened by the infra
+    /// path). Rows: a Code fix pass with fix note Q fails and its gate is
+    /// rejected with R, and the relaunch holds Q under the fix request's
+    /// introduction, then R under the relaunch's, with `code_fix_note` still Q;
+    /// and a run whose recorded delivery canary refuses its agent, where the
+    /// reject launches nothing, stops the run naming `devflow resume`, and keeps
+    /// R on disk for that resume. Control: the stage's first launch prompt does
+    /// not hold the reject's note.
+    #[test]
+    fn a_rejected_stage_failure_relaunches_the_stage_with_the_note() {
+        const NAME: &str =
+            "pipeline_launch::tests::a_rejected_stage_failure_relaunches_the_stage_with_the_note";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = argv_recording_agents_dir();
+            let output = crate::test_support::run_hermetic_test_in_child(
+                NAME,
+                path_dir.path(),
+                &[("DEVFLOW_GATE_TIMEOUT_SECS", std::ffi::OsStr::new("20"))],
+            );
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let _guard = env_lock();
+        let codex = agents::driver_for(AgentKind::Codex);
+
+        for (number, stage, infra) in [
+            (5294, Stage::Plan, false),
+            (5295, Stage::Code, false),
+            (5296, Stage::Validate, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let phase = PhaseId::new(number);
+            let mut state = failing_stage_state(dir.path(), phase, stage);
+            let first_launch = default_stage_prompt(&state, codex.as_ref());
+            assert!(
+                !first_launch.contains(RELAUNCH_NOTE_R),
+                "control: {stage}'s first launch prompt holds no reject note"
+            );
+            let (reloaded, _reap) =
+                reject_stage_failure(dir.path(), &mut state, RELAUNCH_NOTE_R, |root, state| {
+                    if infra {
+                        crate::pipeline_outcomes::handle_infra_outcome(
+                            root,
+                            state,
+                            stage,
+                            Some("the agent was killed".into()),
+                        )
+                    } else {
+                        crate::pipeline_outcomes::handle_stage_failure(
+                            root,
+                            state,
+                            stage,
+                            Some("the stage failed".into()),
+                        )
+                    }
+                });
+            assert_eq!(reloaded.stage, stage, "{stage}: the same stage relaunches");
+            assert_eq!(
+                reloaded.relaunch_note.as_deref(),
+                Some(RELAUNCH_NOTE_R),
+                "{stage}: the reject's note is the relaunch note"
+            );
+            assert_eq!(
+                reloaded.code_fix_note, None,
+                "{stage}: a stage-failure note is never the fix request"
+            );
+            let argv = recorded_argv(dir.path(), "codex");
+            assert!(
+                argv_holds(&argv, RELAUNCH_NOTE_R),
+                "{stage}: the relaunched agent's prompt holds the note: {argv:?}"
+            );
+        }
+
+        // Q -> failure -> R: a Code fix pass fails and its gate is rejected.
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(5297);
+        let mut state = failing_stage_state(dir.path(), phase, Stage::Code);
+        commit(&mut state, |s| {
+            s.code_fix = Some(prompt::FixType::GapsOnly);
+            s.code_fix_note = Some(FIX_NOTE_Q.to_string());
+        })
+        .unwrap();
+        let (reloaded, _reap_fix) =
+            reject_stage_failure(dir.path(), &mut state, RELAUNCH_NOTE_R, |root, state| {
+                crate::pipeline_outcomes::handle_stage_failure(
+                    root,
+                    state,
+                    Stage::Code,
+                    Some("the fix pass failed".into()),
+                )
+            });
+        assert_eq!(
+            reloaded.code_fix_note.as_deref(),
+            Some(FIX_NOTE_Q),
+            "the fix request is kept"
+        );
+        assert_eq!(reloaded.relaunch_note.as_deref(), Some(RELAUNCH_NOTE_R));
+        let argv = recorded_argv(dir.path(), "codex");
+        let relaunched = argv
+            .iter()
+            .find(|arg| arg.contains(RELAUNCH_NOTE_R))
+            .unwrap_or_else(|| panic!("the relaunch holds R: {argv:?}"));
+        let at = |needle: &str| {
+            relaunched
+                .find(needle)
+                .unwrap_or_else(|| panic!("the relaunch lacks {needle:?}:\n{relaunched}"))
+        };
+        assert!(
+            at(prompt::FIX_NOTE_INTRODUCTION) < at(FIX_NOTE_Q)
+                && at(FIX_NOTE_Q) < at(prompt::RELAUNCH_NOTE_INTRODUCTION)
+                && at(prompt::RELAUNCH_NOTE_INTRODUCTION) < at(RELAUNCH_NOTE_R),
+            "Q under the fix request's introduction, then R under the relaunch's:\n{relaunched}"
+        );
+
+        // A run whose recorded delivery canary refuses its agent.
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(5298);
+        init_repo(dir.path());
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Supervise, dir.path().into());
+        state.verification_baseline_captured = true;
+        state.stage = Stage::Code;
+        state.canary = Some(canary::CanaryOutcome::Absent);
+        workflow::save_state(&state).unwrap();
+        assert!(
+            recorded_canary_refusal(&state).is_some(),
+            "the canary refuses Claude"
+        );
+        let (reloaded, _reap_canary) =
+            reject_stage_failure(dir.path(), &mut state, RELAUNCH_NOTE_R, |root, state| {
+                crate::pipeline_outcomes::handle_stage_failure(
+                    root,
+                    state,
+                    Stage::Code,
+                    Some("the stage failed".into()),
+                )
+            });
+        assert!(
+            !dir.path().join("claude-argv.done").exists(),
+            "a refused relaunch launches nothing"
+        );
+        assert!(reloaded.stopped, "the refused relaunch stops the run");
+        let reason = reloaded.stop_reason.clone().unwrap_or_default();
+        assert!(
+            reason.contains(&format!("devflow resume --phase {phase} --agent <other>")),
+            "the stop names the resume: {reason}"
+        );
+        assert_eq!(
+            reloaded.relaunch_note.as_deref(),
+            Some(RELAUNCH_NOTE_R),
+            "the note is kept for that resume"
         );
     }
 

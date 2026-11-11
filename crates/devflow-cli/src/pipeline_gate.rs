@@ -1937,4 +1937,330 @@ mod tests {
         assert!(!after.gate_pending);
         assert_eq!(after.code_fix, Some(FixType::GapsOnly));
     }
+
+    // ---- GATE-01 / U7: the relaunch note leaves with its stage ----
+
+    /// The relaunch note the rows below seed: a newline and a tab, so a clear
+    /// that kept part of it, or a control that lost part of it, shows.
+    const RELAUNCH_NOTE: &str = "relaunch note:\n\tkeep the stage's scope";
+
+    /// A Codex run of `phase` at `root`, at `stage`, in supervise mode, holding
+    /// [`RELAUNCH_NOTE`] as its relaunch note. Codex is a capture-shape agent,
+    /// so a launch spends no delivery canary.
+    fn noted_state(root: &Path, phase: PhaseId, stage: Stage) -> State {
+        init_repo(root);
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
+        state.verification_baseline_captured = true;
+        state.stage = stage;
+        state.relaunch_note = Some(RELAUNCH_NOTE.to_string());
+        state
+    }
+
+    /// The prompt a no-override launch of `state` gives Codex: the builder a
+    /// resume or failover replay uses.
+    fn default_prompt(state: &State) -> String {
+        let codex = devflow_core::agents::driver_for(AgentKind::Codex);
+        crate::pipeline_launch::default_stage_prompt(state, codex.as_ref())
+    }
+
+    /// Whether `prompt` carries a relaunch-note block at all.
+    fn has_relaunch_block(prompt: &str) -> bool {
+        prompt.contains(devflow_core::prompt::RELAUNCH_NOTE_INTRODUCTION)
+            || prompt.contains("OPERATOR NOTE")
+    }
+
+    /// U7: `relaunch_note` is `None` once the run leaves the stage it was given
+    /// for, on each production way out at this wave: `transition` (both of its
+    /// commits: the ordinary move and the `--until` halt), the Validate
+    /// loop-back to Code (`prepare_loop_back_to_code`, which does not call
+    /// `transition`) and `finish_run`. Controls, so each cleared assertion can
+    /// fail: a stop and resume at the same stage keeps the note, and a Code
+    /// state saved and reloaded with no stage change keeps it in the builder the
+    /// Validate row asserts on.
+    #[test]
+    fn leaving_the_relaunched_stage_clears_the_relaunch_note() {
+        const NAME: &str =
+            "pipeline_gate::tests::leaving_the_relaunched_stage_clears_the_relaunch_note";
+        enter_path_isolated_child!(NAME, waiting_codex_dir());
+        let _guard = env_lock();
+
+        // `transition` out of Plan and out of Code, each launching the next stage.
+        for (number, from, to) in [
+            (5280, Stage::Plan, Stage::Code),
+            (5281, Stage::Code, Stage::Validate),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let phase = PhaseId::new(number);
+            let mut state = noted_state(dir.path(), phase, from);
+            workflow::save_state(&state).unwrap();
+            let result = transition(dir.path(), &mut state, to);
+            let moved = workflow::load_state(dir.path(), phase).unwrap();
+            let _reap_guard = ReapMonitorOnDrop::after_launch(&moved);
+            result.unwrap();
+            assert_eq!(moved.stage, to);
+            assert_eq!(
+                moved.relaunch_note, None,
+                "{from} -> {to}: the transition clears the relaunch note"
+            );
+            assert!(
+                !has_relaunch_block(&default_prompt(&moved)),
+                "{from} -> {to}: the {to} intent carries no relaunch note"
+            );
+        }
+
+        // Validate -> Code through the loop-back, which does not call `transition`.
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(5282);
+        let mut state = noted_state(dir.path(), phase, Stage::Validate);
+        workflow::save_state(&state).unwrap();
+        let prompt = prepare_loop_back_to_code(
+            dir.path(),
+            &mut state,
+            FixType::GapsOnly,
+            None,
+            LoopBackReason::GateResponse,
+        )
+        .unwrap();
+        let looped = workflow::load_state(dir.path(), phase).unwrap();
+        assert_eq!(looped.stage, Stage::Code);
+        assert_eq!(
+            looped.relaunch_note, None,
+            "the loop-back to Code clears Validate's relaunch note"
+        );
+        assert!(
+            !has_relaunch_block(&prompt),
+            "the loop-back's own prompt holds no relaunch note:\n{prompt}"
+        );
+        assert!(
+            !has_relaunch_block(&default_prompt(&looped)),
+            "a replay of the fix pass carries no relaunch note"
+        );
+
+        // `finish_run` from Validate.
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(5283);
+        let mut state = noted_state(dir.path(), phase, Stage::Validate);
+        workflow::save_state(&state).unwrap();
+        finish_run(dir.path(), &mut state).unwrap();
+        let finished = workflow::load_state(dir.path(), phase).unwrap();
+        assert!(finished.finished, "the run finished");
+        assert_eq!(
+            finished.relaunch_note, None,
+            "the run's end clears the note"
+        );
+
+        // The `--until` halt, `transition`'s early-return commit.
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(5284);
+        let mut state = noted_state(dir.path(), phase, Stage::Plan);
+        state.stop_until = Some(Stage::Plan);
+        workflow::save_state(&state).unwrap();
+        transition(dir.path(), &mut state, Stage::Code).unwrap();
+        let halted = workflow::load_state(dir.path(), phase).unwrap();
+        assert!(halted.stopped, "the --until halt fired");
+        let finished_event = devflow_core::events::last_event_of_kind_for_phase(
+            dir.path(),
+            phase,
+            "workflow_finished",
+        )
+        .expect("the halt emits workflow_finished");
+        assert_eq!(finished_event["reason"], "stopped_at", "{finished_event}");
+        assert_eq!(
+            halted.relaunch_note, None,
+            "the --until halt clears the note"
+        );
+
+        // Control: a stop and resume at Plan, with no transition, keeps it.
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(5285);
+        let mut state = noted_state(dir.path(), phase, Stage::Plan);
+        state.stopped = true;
+        state.stop_reason = Some("stopped by the operator".to_string());
+        workflow::save_state(&state).unwrap();
+        let result = crate::pipeline_launch::resume(dir.path(), phase, None);
+        let resumed = workflow::load_state(dir.path(), phase).unwrap();
+        let _reap_resumed = ReapMonitorOnDrop::after_launch(&resumed);
+        result.unwrap();
+        assert_eq!(resumed.stage, Stage::Plan);
+        assert_eq!(
+            resumed.relaunch_note.as_deref(),
+            Some(RELAUNCH_NOTE),
+            "control: a stop and resume keeps the note"
+        );
+        assert!(
+            default_prompt(&resumed).contains(RELAUNCH_NOTE),
+            "control: the relaunched Plan intent carries the note"
+        );
+
+        // Control: Code to Code. A relaunched fix pass, saved and reloaded with
+        // no stage change, keeps the note in the builder the Validate row reads.
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(5286);
+        let mut state = noted_state(dir.path(), phase, Stage::Code);
+        state.code_fix = Some(FixType::GapsOnly);
+        workflow::save_state(&state).unwrap();
+        let reloaded = workflow::load_state(dir.path(), phase).unwrap();
+        assert_eq!(reloaded.relaunch_note.as_deref(), Some(RELAUNCH_NOTE));
+        let prompt = default_prompt(&reloaded);
+        assert!(
+            prompt.contains(RELAUNCH_NOTE)
+                && prompt.contains(devflow_core::prompt::RELAUNCH_NOTE_INTRODUCTION),
+            "control: the Code intent keeps the note:\n{prompt}"
+        );
+    }
+
+    /// One write of `State.stage` the stage-write scan found: the file, the
+    /// 1-based line, the function it sits in, and the receiver written through.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct StageWrite {
+        file: String,
+        line: usize,
+        function: String,
+        receiver: String,
+    }
+
+    /// The stage writes in one file's `source`, under the scan's rule: only the
+    /// text before the test-module marker counts, each line from its first
+    /// `//` is dropped, and a hit is `\b([A-Za-z_]\w*)\.stage\s*=(?![=>])`,
+    /// matched by hand, whose receiver is not `spec`.
+    ///
+    /// Limits: a write through a struct literal (`State { stage, .. }`),
+    /// `std::mem::replace(&mut s.stage, ..)` or a `&mut s.stage` borrow is not
+    /// seen, and a `//` inside a string literal ends that line's scanned text
+    /// early.
+    fn stage_writes_in(file: &str, source: &str) -> Vec<StageWrite> {
+        const TEST_MODULE_MARKER: &str = "\n#[cfg(test)]\nmod tests {";
+        const FIELD: &str = ".stage";
+        let non_test = source
+            .find(TEST_MODULE_MARKER)
+            .map_or(source, |at| &source[..at]);
+        let is_word = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+        let mut function = String::new();
+        let mut writes = Vec::new();
+        for (index, raw_line) in non_test.lines().enumerate() {
+            let line = raw_line.find("//").map_or(raw_line, |at| &raw_line[..at]);
+            if let Some(at) = line.find("fn ") {
+                let name: String = line[at + 3..]
+                    .chars()
+                    .take_while(|character| character.is_alphanumeric() || *character == '_')
+                    .collect();
+                if !name.is_empty() && (at == 0 || !is_word(line.as_bytes()[at - 1])) {
+                    function = name;
+                }
+            }
+            let bytes = line.as_bytes();
+            let mut from = 0;
+            while let Some(offset) = line[from..].find(FIELD) {
+                let dot = from + offset;
+                from = dot + FIELD.len();
+                let start = (0..dot)
+                    .rev()
+                    .take_while(|&at| is_word(bytes[at]))
+                    .last()
+                    .unwrap_or(dot);
+                let receiver = &line[start..dot];
+                let starts_like_an_identifier = receiver
+                    .bytes()
+                    .next()
+                    .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_');
+                let mut after = from;
+                while after < bytes.len() && bytes[after].is_ascii_whitespace() {
+                    after += 1;
+                }
+                let assigns = bytes.get(after) == Some(&b'=')
+                    && !matches!(bytes.get(after + 1), Some(b'=') | Some(b'>'));
+                if starts_like_an_identifier && assigns && receiver != "spec" {
+                    writes.push(StageWrite {
+                        file: file.to_string(),
+                        line: index + 1,
+                        function: function.clone(),
+                        receiver: receiver.to_string(),
+                    });
+                }
+            }
+        }
+        writes
+    }
+
+    /// Every `.rs` file below `dir`, recursively, sorted.
+    fn rust_files_under(dir: &Path) -> Vec<std::path::PathBuf> {
+        let mut files = Vec::new();
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(next) = pending.pop() {
+            for entry in std::fs::read_dir(&next).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    files.push(path);
+                }
+            }
+        }
+        files.sort();
+        files
+    }
+
+    /// U7's sweep pinned (V2): the only production writes of `State.stage`
+    /// under `crates/devflow-cli/src` and `crates/devflow-core/src` are
+    /// `transition`'s and `prepare_loop_back_to_code`'s, each of which clears
+    /// the relaunch note in the same commit. A plan that adds a third write
+    /// fails here and must add that write's clear site. The rule and its limits
+    /// are on [`stage_writes_in`]; `State::stage` stays `pub` (published core).
+    #[test]
+    fn state_stage_is_written_only_by_transition_and_the_code_loop_back() {
+        // Controls: any receiver name counts; comments, `spec.stage`, a
+        // comparison, a match arm and a `let stage` local do not.
+        let planted = "fn planted() {\n    persisted.stage = Stage::Plan;\n}\n";
+        assert_eq!(
+            stage_writes_in("planted.rs", planted),
+            vec![StageWrite {
+                file: "planted.rs".to_string(),
+                line: 2,
+                function: "planted".to_string(),
+                receiver: "persisted".to_string(),
+            }]
+        );
+        for control in [
+            "    // state.stage = to\n",
+            "    spec.stage = a;\n",
+            "    if a.stage == b {}\n",
+            "    x if x != state.stage => {}\n",
+            "    let stage = Stage::Code;\n",
+        ] {
+            assert_eq!(
+                stage_writes_in("control.rs", control),
+                Vec::new(),
+                "not a stage write: {control:?}"
+            );
+        }
+        // Control: the test-module split. A write after the marker is test code.
+        let with_tests = "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn t() { s.stage = x; }\n}\n";
+        assert_eq!(stage_writes_in("split.rs", with_tests), Vec::new());
+
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut writes = Vec::new();
+        for crate_src in [manifest.join("src"), manifest.join("../devflow-core/src")] {
+            for file in rust_files_under(&crate_src) {
+                let source = std::fs::read_to_string(&file).unwrap();
+                let name = file
+                    .strip_prefix(manifest)
+                    .unwrap_or(&file)
+                    .display()
+                    .to_string();
+                writes.extend(stage_writes_in(&name, &source));
+            }
+        }
+        let functions: Vec<(&str, &str)> = writes
+            .iter()
+            .map(|write| (write.file.as_str(), write.function.as_str()))
+            .collect();
+        assert_eq!(
+            functions,
+            vec![
+                ("src/pipeline_gate.rs", "transition"),
+                ("src/pipeline_gate.rs", "prepare_loop_back_to_code"),
+            ],
+            "every production write of State.stage, each needing a relaunch_note clear: {writes:#?}"
+        );
+    }
 }
