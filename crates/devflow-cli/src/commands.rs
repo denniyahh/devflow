@@ -635,52 +635,10 @@ fn start_reserved(
         crate::pipeline_launch::AUTO_CHAIN_REPAIR_FROM_START,
     );
 
-    // 999.79 (35-05, A-05): record what this phase's `{N}-VERIFICATION.md`
-    // looked like BEFORE this run's Validate agent has had any opportunity to
-    // rewrite it. `handle_validate_outcome`'s loop-back selector compares the
-    // artifact against this baseline: unchanged means it was inherited from a
-    // previous run and its verdict must not be reused; changed (or newly
-    // present) means the Validate agent authored it during this run.
-    //
-    // Nothing deletes, dates or invalidates the artifact, and a
-    // `devflow start --phase N --force` checks out a branch that still carries
-    // the previous run's committed copy. Without this baseline that re-run —
-    // mid-arc by construction — reads the inherited artifact as a verdict and
-    // dispatches a `--gaps-only` pass against zero matching plans, gating
-    // unresolvably.
-    //
-    // PLACEMENT IS LOAD-BEARING, and this is A-05's whole point: the capture
-    // sits AFTER the `if worktree { ... }` fork above, where
-    // `state.worktree_path` holds its final value for this run. The artifact
-    // lives under the EVIDENCE ROOT, and in worktree mode that directory is
-    // created by `ensure_phase_worktree` inside that fork — it does not exist
-    // when `fresh_state_carrying_phase_failures` builds the state near the top
-    // of this function. Capturing there would record "absent" for every
-    // worktree run and make the very first freshness check read as fresh,
-    // which is the failure direction this baseline exists to prevent.
-    //
-    // The evidence root is resolved the same way every loop-back arm resolves
-    // it — the worktree path when present, the project root otherwise — and
-    // NOT unconditionally as the project root. `.planning/` is tracked and the
-    // Validate agent runs in the worktree, so the artifact lands on
-    // `feature/phase-{N}` inside the worktree and is invisible from the main
-    // checkout; reading the project root here is exactly the defect plan 33-05
-    // closed (CR-01) and must not be reintroduced. Persisted by
-    // `create_run_state` below rather than by a second write.
-    let evidence_root: PathBuf = state
-        .worktree_path
-        .clone()
-        .unwrap_or_else(|| project_root.to_path_buf());
-    state.last_verification_fingerprint =
-        agent_result::phase_verification_fingerprint(&evidence_root, phase);
-    // WR-06: read from the SAME evidence root in the same breath, so the pair
-    // is one observation of one file rather than two readings that could
-    // disagree about which artifact they saw.
-    state.last_verification_mtime_nanos =
-        agent_result::phase_verification_mtime_nanos(&evidence_root, phase);
-    // WR-05: the observation happened. Without this flag a `None` fingerprint
-    // from an old state file is indistinguishable from a `None` that means
-    // "looked, found nothing", and the two demand opposite dispatches.
+    // Mark the run prepared, after the `if worktree { ... }` fork, where
+    // `state.worktree_path` holds its final value. `run_never_prepared` reads
+    // this flag to tell this run from a state only the reservation wrote.
+    // Persisted by `create_run_state` below rather than by a second write.
     state.verification_baseline_captured = true;
 
     // 25b (D-03): the self-dogfood build-staleness gate, hoisted here from
@@ -788,7 +746,7 @@ fn start_requires_phase_context(driver: &dyn agents::AgentDriver) -> bool {
 
 /// Whether `state` is only what a `start`'s reservation wrote: that `start` died before
 /// preparing the run, so no worktree was forked, no base resolved and none of its guards
-/// passed. Every prepared run captures its verification baseline in [`start_reserved`], and
+/// passed. Every prepared run sets `verification_baseline_captured` in [`start_reserved`], and
 /// nothing resets it. `worktree_path` cannot say this, because `--no-worktree` leaves it
 /// `None` for a prepared run. The stage cannot say it either, since a fresh state and a
 /// prepared run both sit at the first stage, and the event log cannot, because it is
