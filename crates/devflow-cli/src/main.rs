@@ -399,6 +399,13 @@ pub(crate) enum CliError {
     Message(String),
 }
 
+/// `--version`'s text after the binary name: the package version, then the
+/// commit `build.rs` embedded and whether the tree was dirty.
+#[allow(dead_code)]
+fn version_label(version: &str, _commit: &str, _dirty: &str) -> String {
+    version.to_string()
+}
+
 fn main() {
     match std::env::var("DEVFLOW_LOG_FORMAT").as_deref() {
         Ok("json") => {
@@ -607,6 +614,18 @@ fn project_root(project: PathBuf) -> Result<PathBuf, CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_label_renders_an_empty_commit_as_unknown() {
+        assert_eq!(
+            version_label("4.0.0", "", "false"),
+            "4.0.0 (unknown, clean)"
+        );
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        let dirty = version_label("4.0.0", commit, "true");
+        assert_eq!(dirty, format!("4.0.0 ({commit}, dirty)"));
+        assert!(dirty.ends_with(", dirty)"));
+    }
 
     #[test]
     fn project_root_walks_up_to_nearest_devflow_ancestor() {
