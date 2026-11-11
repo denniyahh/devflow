@@ -9471,6 +9471,7 @@ mod tests {
             root,
             &mut state,
             Stage::Plan,
+            None,
             "the new run's gate",
             1,
         )
@@ -9500,6 +9501,7 @@ mod tests {
             root,
             &mut state,
             Stage::Plan,
+            None,
             "control: an answer that binds",
             1,
         )

@@ -28,7 +28,7 @@ use crate::pipeline_launch::{
 use crate::pipeline_outcomes::truncate_reason;
 #[cfg(test)]
 use devflow_core::gates::GateId;
-use devflow_core::gates::{self, Claim, GateAction, Gates};
+use devflow_core::gates::{self, Claim, GateAction, GateKind, Gates};
 use devflow_core::mode;
 #[cfg(test)]
 use devflow_core::phase_id::PhaseId;
@@ -427,9 +427,40 @@ pub(crate) fn run_gate(
     project_root: &Path,
     state: &mut State,
     stage: Stage,
+    kind: Option<GateKind>,
     context: &str,
 ) -> Result<GateAction, CliError> {
-    run_gate_with_timeout(project_root, state, stage, context, gate_timeout_secs())
+    run_gate_with_timeout(
+        project_root,
+        state,
+        stage,
+        kind,
+        context,
+        gate_timeout_secs(),
+    )
+}
+
+/// [`run_gate`] whose `gate_fired` event carries `event_context` instead of the
+/// gate's `context`, for a gate whose context holds text an event must not
+/// carry: GSD's message or git's stderr, which can name absolute paths
+/// (52-22, Pitfall 11). The gate file and the notify command still get
+/// `context`.
+pub(crate) fn run_gate_with_event_context(
+    project_root: &Path,
+    state: &mut State,
+    stage: Stage,
+    kind: Option<GateKind>,
+    context: &str,
+    event_context: &str,
+) -> Result<GateAction, CliError> {
+    open_and_await(
+        project_root,
+        state,
+        stage,
+        kind,
+        (context, event_context),
+        gate_timeout_secs(),
+    )
 }
 
 /// `run_gate`'s body, parameterized on the wait's timeout (WR-02, phase 20
@@ -444,17 +475,42 @@ pub(crate) fn run_gate_with_timeout(
     project_root: &Path,
     state: &mut State,
     stage: Stage,
+    kind: Option<GateKind>,
     context: &str,
     timeout_secs: u64,
 ) -> Result<GateAction, CliError> {
+    open_and_await(
+        project_root,
+        state,
+        stage,
+        kind,
+        (context, context),
+        timeout_secs,
+    )
+}
+
+/// The body [`run_gate_with_timeout`] and [`run_gate_with_event_context`] share.
+/// `contexts` is the gate's context and the one its `gate_fired` event carries.
+/// The gate's `kind` is written by the same atomic write as the rest of the gate
+/// file (52-22).
+fn open_and_await(
+    project_root: &Path,
+    state: &mut State,
+    stage: Stage,
+    kind: Option<GateKind>,
+    contexts: (&str, &str),
+    timeout_secs: u64,
+) -> Result<GateAction, CliError> {
+    let (context, event_context) = contexts;
     commit(state, |s| s.gate_pending = true)?;
     // A crash inside this call before the publish leaves `gate_pending` with no gate
     // file, which `doctor`'s `check_gate_pending_without_gate` reports.
     let (opened, registration) = fenced(project_root, state.phase, || {
-        Ok(Gates::open_registered(
+        Ok(Gates::open_registered_with_kind(
             project_root,
             state.phase,
             stage,
+            kind,
             context,
         )?)
     })?;
@@ -484,7 +540,8 @@ pub(crate) fn run_gate_with_timeout(
         serde_json::json!({
             "stage": stage.to_string(),
             "unexpected": unexpected,
-            "context": context,
+            "context": event_context,
+            "gate_kind": kind,
         }),
     );
     gates::fire_gate_notify_with_fallback(
@@ -1158,7 +1215,7 @@ mod tests {
         let root_owned = root.to_path_buf();
         let handle = std::thread::spawn(move || {
             let mut state = workflow::load_state(&root_owned, phase).unwrap();
-            run_gate_with_timeout(&root_owned, &mut state, Stage::Code, "ctx", 30).unwrap();
+            run_gate_with_timeout(&root_owned, &mut state, Stage::Code, None, "ctx", 30).unwrap();
             state.gate_notify_cmd
         });
         let gate_path = Gates::gate_path(root, phase, Stage::Code);
@@ -1241,7 +1298,7 @@ mod tests {
 
         let root_owned = root.to_path_buf();
         let handle = std::thread::spawn(move || {
-            run_gate_with_timeout(&root_owned, &mut loaded, Stage::Code, "ctx", 30)
+            run_gate_with_timeout(&root_owned, &mut loaded, Stage::Code, None, "ctx", 30)
                 .map(|action| (action, loaded.gate_notify_cmd))
         });
         let gate_path = Gates::gate_path(root, phase, Stage::Code);
@@ -1305,7 +1362,7 @@ mod tests {
         let state_file = workflow::state_path(root, phase);
         std::fs::write(&state_file, "{not json").unwrap();
 
-        let err = run_gate_with_timeout(root, &mut loaded, Stage::Code, "ctx", 30)
+        let err = run_gate_with_timeout(root, &mut loaded, Stage::Code, None, "ctx", 30)
             .expect_err("an unparseable state must fail the gate entry");
 
         let text = err.to_string();
@@ -1343,7 +1400,7 @@ mod tests {
             WAIT_HOLDS_WRITE_LOCK.set(hold_across_wait);
             WAIT_ENTERED.set(Some(entered_tx));
             let mut state = workflow::load_state(&root_owned, phase).unwrap();
-            run_gate_with_timeout(&root_owned, &mut state, Stage::Code, "ctx", 30).map(|_| ())
+            run_gate_with_timeout(&root_owned, &mut state, Stage::Code, None, "ctx", 30).map(|_| ())
         });
         entered_rx
             .recv_timeout(std::time::Duration::from_secs(30))
@@ -1467,7 +1524,7 @@ mod tests {
         let root_owned = root.to_path_buf();
         std::thread::spawn(move || {
             let mut state = workflow::load_state(&root_owned, phase).unwrap();
-            run_gate_with_timeout(&root_owned, &mut state, Stage::Code, "ctx", 30)
+            run_gate_with_timeout(&root_owned, &mut state, Stage::Code, None, "ctx", 30)
         })
     }
 

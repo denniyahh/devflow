@@ -538,18 +538,19 @@ impl Gates {
         stage: Stage,
         context: &str,
     ) -> Result<OpenedGate, GateError> {
-        Self::open_gate_as(project_root, phase, stage, &GateId::new(), context)
+        Self::open_gate_with_kind(project_root, phase, stage, None, context)
     }
 
-    /// [`open_gate`](Self::open_gate), recording `kind` in the gate file.
+    /// [`open_gate`](Self::open_gate), recording `kind` in the gate file by the
+    /// same atomic write as the rest of the gate.
     pub fn open_gate_with_kind(
         project_root: &Path,
         phase: PhaseId,
         stage: Stage,
-        _kind: Option<GateKind>,
+        kind: Option<GateKind>,
         context: &str,
     ) -> Result<OpenedGate, GateError> {
-        Self::open_gate_as(project_root, phase, stage, &GateId::new(), context)
+        Self::open_gate_as(project_root, phase, stage, &GateId::new(), kind, context)
     }
 
     /// Open a gate and register its waiter, in that order on disk: the registration
@@ -564,7 +565,19 @@ impl Gates {
         stage: Stage,
         context: &str,
     ) -> Result<(OpenedGate, WaiterRegistration), GateError> {
-        Self::open_registered_with_hooks(project_root, phase, stage, context, || {}, || {})
+        Self::open_registered_with_kind(project_root, phase, stage, None, context)
+    }
+
+    /// [`open_registered`](Self::open_registered), recording `kind` in the gate
+    /// file by the same atomic write and registration as the rest of the gate.
+    pub fn open_registered_with_kind(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        kind: Option<GateKind>,
+        context: &str,
+    ) -> Result<(OpenedGate, WaiterRegistration), GateError> {
+        Self::open_registered_with_hooks(project_root, phase, stage, kind, context, || {}, || {})
     }
 
     /// [`open_registered`](Self::open_registered)'s whole sequence, so the tests run
@@ -574,6 +587,7 @@ impl Gates {
         project_root: &Path,
         phase: PhaseId,
         stage: Stage,
+        kind: Option<GateKind>,
         context: &str,
         before_publish: impl FnOnce(),
         after_publish: impl FnOnce(),
@@ -581,7 +595,7 @@ impl Gates {
         let gate_id = GateId::new();
         let registration = Self::register_waiter(project_root, phase, stage, &gate_id)?;
         before_publish();
-        let opened = match Self::open_gate_as(project_root, phase, stage, &gate_id, context) {
+        let opened = match Self::open_gate_as(project_root, phase, stage, &gate_id, kind, context) {
             Ok(opened) => opened,
             Err(error) => {
                 registration.finish();
@@ -605,7 +619,7 @@ impl Gates {
     ) -> Result<(OpenedGate, WaiterRegistration), GateError> {
         let gate_id = GateId::new();
         before_publish();
-        let opened = Self::open_gate_as(project_root, phase, stage, &gate_id, context)?;
+        let opened = Self::open_gate_as(project_root, phase, stage, &gate_id, None, context)?;
         after_publish();
         let registration = Self::register_waiter(project_root, phase, stage, &gate_id)?;
         Ok((opened, registration))
@@ -619,13 +633,14 @@ impl Gates {
         phase: PhaseId,
         stage: Stage,
         gate_id: &GateId,
+        kind: Option<GateKind>,
         context: &str,
     ) -> Result<OpenedGate, GateError> {
         let _lock = gate_lock(project_root, phase)?;
         let (_, _, disposal) =
             Self::set_aside_stage_answers(project_root, phase, stage, &mut |_| {});
         disposal?;
-        let opened = Self::write_gate_file(project_root, phase, stage, gate_id, context)?;
+        let opened = Self::write_gate_file(project_root, phase, stage, gate_id, kind, context)?;
         consume_preanswer(project_root, phase, stage, gate_id)?;
         Ok(opened)
     }
@@ -1383,6 +1398,7 @@ impl Gates {
         phase: PhaseId,
         stage: Stage,
         gate_id: &GateId,
+        kind: Option<GateKind>,
         context: &str,
     ) -> Result<OpenedGate, GateError> {
         let gate = GateFile {
@@ -1391,7 +1407,7 @@ impl Gates {
             context: context.to_string(),
             timestamp: unix_now(),
             gate_id: gate_id.to_string(),
-            gate_kind: None,
+            gate_kind: kind,
         };
         let path = Self::gate_path(project_root, phase, stage);
         info!("writing gate {} for phase {phase}", stage);
@@ -4782,6 +4798,7 @@ mod tests {
             shipped.path(),
             phase,
             stage,
+            None,
             "ctx",
             || {},
             || shipped_read = Some(answer_if_registered(shipped.path(), phase, stage)),
@@ -4843,6 +4860,7 @@ mod tests {
                 &root,
                 phase,
                 stage,
+                None,
                 "ctx",
                 || kill_at(BEFORE_PUBLISH),
                 || kill_at(AFTER_PUBLISH),
@@ -4908,6 +4926,7 @@ mod tests {
             dir.path(),
             phase,
             stage,
+            None,
             "ctx",
             || registered_at_publish = Some(waiter_files(dir.path()).len()),
             || panic!("the publish must fail"),

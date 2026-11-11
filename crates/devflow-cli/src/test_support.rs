@@ -958,6 +958,16 @@ pub(crate) fn repo_with_head(root: &Path) -> String {
     git(&["rev-parse", "HEAD"])
 }
 
+/// A phase directory for `phase` under `evidence_root` and a GSD stub there
+/// answering `gaps_found` to each of `reads` status reads: what an agent-FAIL
+/// Validate outcome reads (no HEAD read) when a test's subject is the counters
+/// and the auto loop, not GSD's status.
+pub(crate) fn gsd_gaps_found(evidence_root: &Path, phase: PhaseId, reads: usize) -> GsdStub {
+    phase_dir_fixture(evidence_root, phase);
+    let gaps = gsd_says(devflow_core::gsd_reader::GsdStatus::GapsFound);
+    GsdStub::answering(evidence_root, &vec![gaps; reads])
+}
+
 /// Everything a Validate outcome reads in `evidence_root` for `phase`: a phase
 /// directory, a git HEAD, and this thread's GSD stub answering `responses`.
 pub(crate) fn validate_evidence(
