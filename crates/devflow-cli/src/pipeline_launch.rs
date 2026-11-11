@@ -132,10 +132,8 @@ pub(crate) fn default_stage_prompt(state: &State, driver: &dyn agents::AgentDriv
                 .filter(|fix| *fix == prompt::FixType::StaleReverify)
                 .and(state.code_fix_report.clone()),
         },
-        stage => {
-            prompt::StageIntent::for_stage_in_project(stage, state.phase, Some(&state.project_root))
-                .with_relaunch_note(state.relaunch_note.clone())
-        }
+        stage => prompt::StageIntent::for_stage(stage, state.phase)
+            .with_relaunch_note(state.relaunch_note.clone()),
     };
     driver.render_prompt(&intent)
 }
@@ -13755,7 +13753,7 @@ mod tests {
 
     // ---- 51-07: one place renders a no-override stage prompt (D-09, review B-1) ----
 
-    const DEFAULT_RENDER_NEEDLE: &str = concat!("for_stage_in_", "project(");
+    const DEFAULT_RENDER_NEEDLE: &str = concat!("StageIntent::for_", "stage(");
     const DEFAULT_RENDER_NOT_ONCE: &str =
         "a default intent is built more than once (or never) in the non-test code";
     const DEFAULT_RENDER_OUTSIDE: &str = "a default intent is built outside default_stage_prompt";
@@ -13835,8 +13833,7 @@ mod tests {
     /// path. Planted sources first, each carrying one defect, then the real file.
     #[test]
     fn every_no_override_launch_renders_through_default_stage_prompt() {
-        let render =
-            format!("    driver.render_prompt(&StageIntent::{DEFAULT_RENDER_NEEDLE}..));\n");
+        let render = format!("    driver.render_prompt(&{DEFAULT_RENDER_NEEDLE}..));\n");
         let default_fn =
             format!("fn default_stage_prompt(state: &State) -> String {{\n{render}}}\n");
         let caller = |header: &str, body: &str| format!("{header}\n{body}}}\n");

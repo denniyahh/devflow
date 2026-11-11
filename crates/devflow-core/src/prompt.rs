@@ -7,7 +7,6 @@
 
 use crate::phase_id::PhaseId;
 use crate::stage::Stage;
-use std::path::Path;
 
 /// The token that stops GSD from wiping `workflow._auto_chain_active` before
 /// it is read (35.1-01, RESEARCH Pitfall 1).
@@ -208,21 +207,10 @@ impl StageIntent {
     }
 
     /// Build the intent for a stage with no fix.
-    pub fn for_stage(stage: Stage, phase: PhaseId) -> Self {
-        Self::for_stage_in_project(stage, phase, None)
-    }
-
-    /// Build the intent for a stage of the project at `project_root`.
     ///
-    /// No stage reads project-local configuration since the Ship stage's
-    /// review angles were removed (D-01), so this builds the same intent as
-    /// [`StageIntent::for_stage`]. It stays as the CLI's one entry point for a
-    /// default intent, which `pipeline_launch` pins by source scan.
-    pub fn for_stage_in_project(
-        stage: Stage,
-        phase: PhaseId,
-        _project_root: Option<&Path>,
-    ) -> Self {
+    /// The CLI's one entry point for a default intent, which `pipeline_launch`
+    /// pins by source scan.
+    pub fn for_stage(stage: Stage, phase: PhaseId) -> Self {
         match stage {
             Stage::Plan => StageIntent::Plan {
                 phase,
@@ -244,7 +232,7 @@ impl StageIntent {
 
     /// This intent with `note` as its relaunch note, on whichever stage it
     /// drives. The CLI attaches `State::relaunch_note` this way to the intent
-    /// [`StageIntent::for_stage_in_project`] returns, so the default intent is
+    /// [`StageIntent::for_stage`] returns, so the default intent is
     /// still built in one place.
     pub fn with_relaunch_note(mut self, note: Option<String>) -> Self {
         match &mut self {
@@ -492,18 +480,6 @@ fn gaps_plan_prompt(phase: PhaseId, notes: &str) -> String {
 /// Build the prompt for a stage of a phase.
 pub fn stage_prompt(stage: Stage, phase: PhaseId) -> String {
     render_claude_style(&StageIntent::for_stage(stage, phase))
-}
-
-/// Build a stage prompt for the project at `project_root`.
-///
-/// The same prompt as [`stage_prompt`]: no stage reads project-local
-/// configuration since the Ship stage's review angles were removed (D-01).
-pub fn stage_prompt_for_project(stage: Stage, phase: PhaseId, project_root: &Path) -> String {
-    render_claude_style(&StageIntent::for_stage_in_project(
-        stage,
-        phase,
-        Some(project_root),
-    ))
 }
 
 /// The Code stage's dedicated prompt.

@@ -705,6 +705,12 @@ only destructive caller, `gate sweep --reap-strays`, went in 52-03); `GitFlow::c
 **Fix shape:** remove them before 4.0.0 is published, so the removal rides the same major bump instead of forcing a
 5.0.0; record each `function_missing` from `cargo semver-checks`. Take it at Phase 52 close-out if the operator
 agrees, else first in the next phase.
+**Resolved:** 2026-11-11 at Phase 52 close-out, on the operator's answer (remove inside 4.0.0). Removed: `agent::process_age`,
+`agent::STRAY_MIN_AGE`, seven `GitFlow` methods (`commit_all`, `branch_tip`, `delete_remote_branch`, `ensure_branch`,
+`feature_finish`, `release_start`, `release_finish`), both `phase_verification_*` helpers, `reset_time::auto_relaunch_due`
+(new in Phase 52, never published), `prompt::stage_prompt_for_project` and `StageIntent::for_stage_in_project`
+(`for_stage` is now the one default builder). `cargo semver-checks` reports each as `function_missing`,
+`inherent_method_missing` or `pub_module_level_const_missing`. `discover_stray_devflow_processes` stays: `doctor` calls it.
 
 ### Phase 999.225: `parse_reset_time` Accepts a Day Past the Month's End (BACKLOG)
 

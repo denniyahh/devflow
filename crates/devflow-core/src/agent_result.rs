@@ -3840,12 +3840,8 @@ pub fn phase_verification_exists(evidence_root: &Path, phase: PhaseId) -> bool {
 /// The `{phase:02}-VERIFICATION.md` artifact's path under `evidence_root`, or
 /// `None` when no phase directory carries one.
 ///
-/// Extracted from [`phase_verification_exists`] (999.79, 35-05) so the
-/// existence probe and the content fingerprint below scan for the artifact in
-/// exactly ONE place. Duplicating the prefix scan would let the two answer
-/// about different files after any future change to the directory layout — and
-/// the freshness rule is only sound while "does it exist" and "what are its
-/// bytes" are questions about the same path.
+/// Extracted from [`phase_verification_exists`] (999.79, 35-05), so the prefix
+/// scan for the artifact lives in exactly ONE place.
 ///
 /// `evidence_root` carries the same meaning and the same prohibition as it does
 /// for [`phase_verification_exists`]: it is the root the Validate agent
@@ -3868,87 +3864,6 @@ fn phase_verification_path(evidence_root: &Path, phase: PhaseId) -> Option<PathB
         }
     }
     None
-}
-
-/// A content fingerprint of the phase's `{phase:02}-VERIFICATION.md`, or `None`
-/// when no such artifact exists under `evidence_root` (999.79, 35-05).
-///
-/// **What it is for.** Nothing deletes, dates or invalidates the artifact, and
-/// `devflow start --phase N --force` checks out a branch that still carries the
-/// PREVIOUS run's committed copy. That re-run is mid-arc by construction, so its
-/// first Validate failure would find the stale artifact, read it as a verdict,
-/// and dispatch a `--gaps-only` pass against zero matching plans — gating
-/// unresolvably. Comparing this value against the one recorded at the start of
-/// the run distinguishes "the Validate agent authored this during this run"
-/// from "this was inherited".
-///
-/// **Why the algorithm is written out rather than borrowed from `std`.** This
-/// value is persisted by one process (`devflow start`) and compared by a later
-/// one (`devflow advance`), so it must mean the same thing in both.
-/// `std::collections::hash_map::DefaultHasher` explicitly does NOT guarantee a
-/// stable output across toolchain versions, so an operator who upgraded Rust
-/// mid-phase would see every artifact read as "changed" — which is the
-/// fail-OPEN direction, dispatching gaps-only exactly where a full execute was
-/// correct. This is FNV-1a/64, fixed by these two constants and nothing else.
-///
-/// **No security property is claimed.** This is change detection over a
-/// planning document that is already committed to the repository. It is not
-/// collision-resistant and must never be used to authenticate anything; an
-/// adversary who can write the artifact can already write whatever verdict they
-/// like into it.
-///
-/// # Companion: [`phase_verification_mtime_nanos`]
-///
-/// Content alone cannot see an IDEMPOTENT rewrite (WR-06, 35-REVIEW): a
-/// Validate agent that re-authors byte-identical content on a later cycle
-/// produces the same fingerprint as an artifact nobody touched, and the
-/// consumer then classifies its own agent's work as inherited. The mtime is
-/// the second input that separates "unchanged because inherited" from
-/// "unchanged because idempotent"; it is read from the same resolved path and
-/// returns `None` on exactly the same "no artifact" condition, so the two are
-/// always consistent about whether an artifact exists.
-pub fn phase_verification_fingerprint(evidence_root: &Path, phase: PhaseId) -> Option<u64> {
-    let path = phase_verification_path(evidence_root, phase)?;
-    let bytes = std::fs::read(path).ok()?;
-    // FNV-1a, 64-bit: offset basis and prime are the published constants.
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in bytes {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    Some(hash)
-}
-
-/// The mtime of the same `{phase:02}-VERIFICATION.md`
-/// [`phase_verification_fingerprint`] hashes, in nanoseconds since the Unix
-/// epoch, or `None` when no such artifact exists under `evidence_root`.
-///
-/// WR-06 (35-REVIEW): the second input the freshness rule needs. A content
-/// fingerprint cannot see an IDEMPOTENT rewrite — a Validate agent that
-/// re-authors byte-identical content on a later cycle produces the same hash as
-/// an artifact nobody touched — so a hash-only rule classifies its own agent's
-/// work as inherited and re-runs every plan in the phase from then on. An
-/// inherited file's mtime does not advance during a run; a rewritten one's
-/// does, whatever the bytes say.
-///
-/// Resolved through the same [`phase_verification_path`] and returning `None`
-/// on the same "no artifact" condition, so the two readings can never disagree
-/// about whether the artifact exists.
-///
-/// **This is not provenance either.** Any writer advances an mtime, so the
-/// limitation the fingerprint's doc comment records — a mid-run branch switch
-/// or an operator edit reading as authored-this-run — is not closed by this and
-/// is marginally widened by it: a checkout restoring byte-identical content
-/// used to read as inherited and now reads as authored. That is accepted
-/// deliberately, because the case it fixes (a deterministic verification writer
-/// on cycle 2 of an unresolved gap) is ordinary rather than exotic.
-pub fn phase_verification_mtime_nanos(evidence_root: &Path, phase: PhaseId) -> Option<u64> {
-    let path = phase_verification_path(evidence_root, phase)?;
-    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
-    let since_epoch = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
-    // `as` would silently wrap past year 2554; a `None` here degrades to the
-    // content-only comparison, which is the pre-WR-06 behaviour.
-    u64::try_from(since_epoch.as_nanos()).ok()
 }
 
 /// Keep only the newest `retain` capture generations under `history_dir`,
@@ -10484,77 +10399,6 @@ mod tests {
         );
     }
 
-    /// 999.79 (35-05): the fingerprint must be a function of the artifact's
-    /// BYTES, not of its existence.
-    ///
-    /// Both halves are required and neither is redundant. The first half
-    /// (different bytes → different values) is satisfied by any hash. The
-    /// second half (identical bytes → identical values) is what rules out a
-    /// value derived from something incidental — a timestamp, an inode, a
-    /// counter — which would make every check read "changed" and permanently
-    /// disable the gaps-only path. A constant-returning implementation fails
-    /// the first half; a nondeterministic one fails the second.
-    #[test]
-    fn phase_verification_fingerprint_differs_when_content_differs() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase_dir = root.join(".planning/phases/84-fingerprint");
-        std::fs::create_dir_all(&phase_dir).unwrap();
-        let artifact = phase_dir.join("84-VERIFICATION.md");
-
-        std::fs::write(&artifact, "verdict: gaps\n").unwrap();
-        let first = phase_verification_fingerprint(root, PhaseId::new(84))
-            .expect("an artifact that exists must produce a fingerprint");
-
-        let first_again = phase_verification_fingerprint(root, PhaseId::new(84))
-            .expect("an artifact that exists must produce a fingerprint");
-        assert_eq!(
-            first, first_again,
-            "identical bytes must produce identical fingerprints — a value that changes on \
-             its own would mark every artifact fresh forever and disable the stale check"
-        );
-
-        std::fs::write(&artifact, "verdict: pass\n").unwrap();
-        let second = phase_verification_fingerprint(root, PhaseId::new(84))
-            .expect("an artifact that exists must produce a fingerprint");
-        assert_ne!(
-            first, second,
-            "different bytes must produce different fingerprints — a constant implementation \
-             would report every re-authored artifact as unchanged"
-        );
-    }
-
-    /// 999.79 (35-05): an absent artifact yields no fingerprint, which is
-    /// distinguishable from an artifact whose content happens to hash to zero.
-    /// Both are asserted here so "absent" can never be conflated with "hashed
-    /// to the zero value".
-    #[test]
-    fn phase_verification_fingerprint_is_none_when_the_artifact_is_absent() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-
-        assert_eq!(
-            phase_verification_fingerprint(root, PhaseId::new(85)),
-            None,
-            "no .planning/phases directory at all must yield None, not panic"
-        );
-
-        let phase_dir = root.join(".planning/phases/85-fingerprint");
-        std::fs::create_dir_all(&phase_dir).unwrap();
-        assert_eq!(
-            phase_verification_fingerprint(root, PhaseId::new(85)),
-            None,
-            "a phase directory with no {{N}}-VERIFICATION.md must yield None"
-        );
-
-        std::fs::write(phase_dir.join("85-VERIFICATION.md"), "").unwrap();
-        let empty = phase_verification_fingerprint(root, PhaseId::new(85));
-        assert!(
-            empty.is_some(),
-            "an EMPTY artifact still exists and must yield Some — the control against an \
-             implementation that conflates 'absent' with 'no bytes'"
-        );
-    }
     // ------------------------------------------------------------------
     // Antigravity `stream-json` parser (phase 41, Task 1)
     // ------------------------------------------------------------------

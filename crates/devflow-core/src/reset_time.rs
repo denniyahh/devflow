@@ -29,13 +29,6 @@ pub fn relaunch_not_before(reset_at: i64) -> i64 {
     reset_at.saturating_add(RATE_LIMIT_RELAUNCH_MARGIN_SECS)
 }
 
-/// Whether the one automatic relaunch is due at `now` for a denial that
-/// named `reset_at` (D-27.2): true exactly when `now` has reached
-/// [`relaunch_not_before`].
-pub fn auto_relaunch_due(now: i64, reset_at: i64) -> bool {
-    now >= relaunch_not_before(reset_at)
-}
-
 /// How long, in seconds from `now`, a supervisor waits at a rate-limit gate
 /// whose denial named `reset_at` (D-27.2): the later of `gate_timeout_secs`
 /// and the time left until [`relaunch_not_before`], so the gate timeout
@@ -223,20 +216,16 @@ pub(crate) fn civil_from_days(days: i64) -> (i32, u32, u32) {
 mod tests {
     use super::*;
 
-    /// D-27.2, CUT-03 boundary: the automatic relaunch is due exactly at the
-    /// reset plus the margin. One second before it is not due; at and after it
-    /// is.
+    /// D-27.2, CUT-03 boundary: the automatic relaunch's not-before time is
+    /// the reset plus the margin, never the bare reset.
     #[test]
-    fn auto_relaunch_is_due_exactly_at_reset_plus_margin() {
+    fn relaunch_not_before_is_the_reset_plus_the_margin() {
         let reset = august_2_2026_midnight_utc();
         let due_at = reset + RATE_LIMIT_RELAUNCH_MARGIN_SECS;
         assert_eq!(RATE_LIMIT_RELAUNCH_MARGIN_SECS, 60);
         assert_eq!(relaunch_not_before(reset), due_at);
-        assert!(!auto_relaunch_due(due_at - 1, reset), "one second early");
-        assert!(auto_relaunch_due(due_at, reset), "at the reset plus margin");
-        assert!(auto_relaunch_due(due_at + 1, reset), "after it");
-        // Control: at the reset itself, before the margin, it is not due.
-        assert!(!auto_relaunch_due(reset, reset), "at the bare reset");
+        // Control: the not-before time is never the bare reset itself.
+        assert_ne!(relaunch_not_before(reset), reset, "the margin is applied");
         // An absurd reset saturates instead of overflowing.
         assert_eq!(relaunch_not_before(i64::MAX), i64::MAX);
     }
