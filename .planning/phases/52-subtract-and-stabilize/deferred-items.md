@@ -44,3 +44,15 @@
   status: open
   **What:** `State.phase_validate_failures` is reset only when the state file is removed or a human answers the ceiling gate. Before 52-08 the finish removed the state; since 52-08 `finish_run` keeps it (`finished: true`), and `commands::fresh_state_carrying_phase_failures` copies the total from any persisted state. 52-12 corrected the two doc comments (`state.rs`, `commands.rs`) that said phase completion resets it. Not reproduced end to end: read from source only.
   **Fix shape:** decide in 52-25 (which makes `start` say what it replaces, D-35) whether a `start` over a finished state carries the total or starts at zero, and pin it with a test.
+
+- A CLI test fixture comment still names the removed after-ship hooks (found in 52-13)
+  status: open
+  **What:** `crates/devflow-cli/src/test_support.rs` `init_repo`'s doc comment says the fixture exists so "the terminal-path hooks (`VersionBump`, `BranchCleanup`) exercised below" have real git plumbing. 52-12 removed those hooks and 52-13 removed `version.rs`; the fixture is still used, but not for that reason.
+  **Why deferred:** comment only, and the file was not in 52-13's list; 52-13 rewrote only comments that pointed at the modules it deleted.
+  **Fix shape:** reword it to say the fixture builds a main + develop repo with a committed Cargo.toml. Fits 52-18's comment-stripped scan pass.
+
+- No test now pins that `yes_ship` cannot auto-approve a preflight gate (found in 52-13)
+  status: open
+  **What:** `preflight::tests::run_preflight_major_bump_gate_not_auto_approved_by_yes_ship` was the test that drove `run_preflight` into its gate with `yes_ship` set and proved the gate timed out instead of approving. It needed the major-bump check to produce a failing reason, so 52-13 deleted it with the check. `unattended_check_is_not_bypassed_by_yes_ship` still covers the unattended check's own predicate, not the gate.
+  **Why deferred:** 52-14 deletes `State.yes_ship` and `--yes-ship`, after which the property has no subject.
+  **Fix shape:** none needed if 52-14 removes `yes_ship` as planned; otherwise re-seed the test on the interactivity check (Codex + Auto + Define + no CONTEXT.md).
