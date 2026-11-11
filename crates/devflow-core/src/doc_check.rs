@@ -2566,6 +2566,51 @@ fn no_removed_surface_literal_remains() {
     );
 }
 
+/// Violations in reverse order (later file first, later line first) come
+/// out sorted by path then by line; a count assertion prevents an empty
+/// report from silently passing the order check.
+#[test]
+fn removed_surface_findings_are_sorted_by_path_then_line() {
+    // Three violations planted in an order that is NOT already sorted:
+    //   b.rs line 5  (input position 0: same file as position 2 but later line)
+    //   z.rs line 1  (input position 1: alphabetically later file)
+    //   b.rs line 2  (input position 2: same file as position 0 but earlier line)
+    // After sorting by (path, line) the expected order is b.rs:2, b.rs:5, z.rs:1.
+    let token = REMOVED_SURFACE_TOKENS[2]; // `yes_ship` — built at runtime, not literal
+    let files: Vec<(PathBuf, String)> = vec![
+        // b.rs: violation at line 5 (four blank lines push it down)
+        (
+            PathBuf::from("b.rs"),
+            ["\n\n\n\nlet _ = ", token, ";"].concat(),
+        ),
+        // z.rs: violation at line 1 (later in the alphabet than b.rs)
+        (PathBuf::from("z.rs"), ["let _ = ", token, ";"].concat()),
+        // b.rs again: violation at line 2 (earlier in the file than the first b.rs entry)
+        (PathBuf::from("b.rs"), ["\nlet _ = ", token, ";"].concat()),
+    ];
+
+    let findings = removed_surface_findings(&files);
+
+    // Count: three findings. If sort is broken the count still holds, so an
+    // empty result cannot pass the order assertion below.
+    assert_eq!(
+        findings.len(),
+        3,
+        "three planted violations must yield three findings; got: {findings:?}"
+    );
+
+    // Order: b.rs:2 < b.rs:5 < z.rs:1 (sorted by path, then by line).
+    let prefixes: Vec<&str> = findings
+        .iter()
+        .map(|f| f.split(": removed").next().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        prefixes,
+        ["b.rs:2", "b.rs:5", "z.rs:1"],
+        "findings must be sorted by path then by line"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 52-18 (CUT-04, D-03): the docs site (`docs/**/*.md`, outside `doc_check`'s
 // scoped docs) describes only Plan → Code → Validate, links only pages that
