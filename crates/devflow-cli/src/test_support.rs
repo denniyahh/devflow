@@ -849,6 +849,122 @@ fn monitor_entry_supervise_only() {
     run_monitor_harness_entry(false);
 }
 
+/// The child-process seam for GSD's home (52-22): a test that runs stages in
+/// spawned supervisor processes passes a stub home to its child through this
+/// variable, and every process the child starts inherits it. Read only by the
+/// test build; a release build reads `HOME`.
+pub(crate) const TEST_GSD_HOME_ENV: &str = "DEVFLOW_TEST_GSD_HOME";
+
+/// The GSD stub home registered for each evidence root by a live [`GsdStub`].
+/// Keyed by root, not by thread, so a read on any thread of this process (an
+/// `advance` a test runs on a scoped thread) finds the stub its test installed.
+static GSD_HOMES: Mutex<Vec<(PathBuf, PathBuf)>> = Mutex::new(Vec::new());
+
+/// The GSD home a test build reads under for `evidence_root`: the stub a
+/// [`GsdStub`] registered for that root, else the home named by
+/// [`TEST_GSD_HOME_ENV`]. With neither, `None`, so the read fails closed as a
+/// missing launcher and never reaches a real GSD install.
+pub(crate) fn test_gsd_home(evidence_root: &Path) -> Option<PathBuf> {
+    let registered = GSD_HOMES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .rev()
+        .find(|(root, _)| root == evidence_root)
+        .map(|(_, home)| home.clone());
+    registered.or_else(|| std::env::var_os(TEST_GSD_HOME_ENV).map(PathBuf::from))
+}
+
+/// A `gsd_run` stub (`devflow_core::test_support::plant_gsd_run_stub`) under a
+/// temp home, registered as the GSD home for one evidence root until dropped.
+/// Its replies answer that root's verification-status reads in order, one per
+/// read.
+pub(crate) struct GsdStub {
+    dir: tempfile::TempDir,
+    root: PathBuf,
+}
+
+impl GsdStub {
+    /// A stub answering `responses`, registered for `evidence_root`.
+    pub(crate) fn answering(evidence_root: &Path, responses: &[&str]) -> Self {
+        let dir = tempfile::tempdir().expect("create the GSD stub's temp dir");
+        let home = dir.path().join("home");
+        devflow_core::test_support::plant_gsd_run_stub(&home, responses, &dir.path().join("logs"));
+        GSD_HOMES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((evidence_root.to_path_buf(), home));
+        Self {
+            dir,
+            root: evidence_root.to_path_buf(),
+        }
+    }
+
+    /// The stub's home, for a child process's [`TEST_GSD_HOME_ENV`].
+    pub(crate) fn home(&self) -> PathBuf {
+        self.dir.path().join("home")
+    }
+}
+
+impl Drop for GsdStub {
+    fn drop(&mut self) {
+        let home = self.home();
+        GSD_HOMES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|(root, registered)| !(root == &self.root && registered == &home));
+    }
+}
+
+/// GSD's status JSON for `status`, one reply of a [`GsdStub`].
+pub(crate) fn gsd_says(status: devflow_core::gsd_reader::GsdStatus) -> &'static str {
+    devflow_core::test_support::gsd_status_json(status)
+}
+
+/// `phase`'s directory under `evidence_root` (`.planning/phases/NN-fixture`),
+/// created, so `gsd_reader::phase_dir` finds it.
+pub(crate) fn phase_dir_fixture(evidence_root: &Path, phase: PhaseId) -> PathBuf {
+    let dir = evidence_root
+        .join(".planning/phases")
+        .join(format!("{}-fixture", phase.padded()));
+    std::fs::create_dir_all(&dir).expect("create the phase dir fixture");
+    dir
+}
+
+/// Make `root` a git repository with one commit if it is not one already, so a
+/// Validate agent PASS there can be recorded against its HEAD. Returns HEAD.
+pub(crate) fn repo_with_head(root: &Path) -> String {
+    let git = |args: &[&str]| {
+        let output = devflow_core::test_support::git_command(root)
+            .args(args)
+            .output()
+            .expect("spawn git");
+        assert!(output.status.success(), "git {args:?} failed: {output:?}");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    };
+    if !root.join(".git").exists() {
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "devflow@example.com"]);
+        git(&["config", "user.name", "DevFlow Tests"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        git(&["config", "core.hooksPath", "/dev/null"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "evidence root"]);
+    }
+    git(&["rev-parse", "HEAD"])
+}
+
+/// Everything a Validate outcome reads in `evidence_root` for `phase`: a phase
+/// directory, a git HEAD, and this thread's GSD stub answering `responses`.
+pub(crate) fn validate_evidence(
+    evidence_root: &Path,
+    phase: PhaseId,
+    responses: &[&str],
+) -> GsdStub {
+    phase_dir_fixture(evidence_root, phase);
+    repo_with_head(evidence_root);
+    GsdStub::answering(evidence_root, responses)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

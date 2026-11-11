@@ -16,6 +16,7 @@ use crate::CliError;
 use crate::pipeline_gate::{LoopBackReason, abort, finish_run, loop_back_to_code, run_gate};
 use crate::pipeline_launch::{close_gate, commit, launch_stage, recorded_canary_refusal};
 use devflow_core::gates::GateAction;
+use devflow_core::gsd_reader::{self, GsdStatus, ReaderFailure, StatusReport};
 use devflow_core::mode;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::prompt::FixType;
@@ -452,6 +453,90 @@ fn verification_authored_this_run(
     }
 }
 
+/// The home GSD's launcher is looked up under for a read in `_root`: the
+/// run's `HOME` (D-08).
+#[cfg(not(test))]
+fn gsd_home(_root: &Path) -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// A test build reads GSD only through a stub its test installed
+/// (`test_support::GsdStub`, or the child-process variable it names). Without
+/// one there is no home, so the read fails closed as a missing launcher and
+/// never reaches a real GSD install.
+#[cfg(test)]
+fn gsd_home(root: &Path) -> Option<PathBuf> {
+    crate::test_support::test_gsd_home(root)
+}
+
+/// GSD's verification status for `phase`, read through GSD's own reader in
+/// `evidence_root` (D-08). The phase directory is resolved under the same root
+/// (D-24): the worktree in worktree mode, where the Validate agent wrote.
+pub(crate) fn read_verification_status(
+    evidence_root: &Path,
+    phase: PhaseId,
+) -> Result<StatusReport, ReaderFailure> {
+    let home = gsd_home(evidence_root).ok_or_else(|| ReaderFailure::LauncherNotFound {
+        home: PathBuf::from("$HOME (unset)"),
+    })?;
+    let dir = gsd_reader::phase_dir(evidence_root, phase)?;
+    gsd_reader::verification_status(&home, evidence_root, &dir)
+}
+
+/// GSD's name for `status`, as `query verification status` prints it.
+pub(crate) fn gsd_status_name(status: GsdStatus) -> &'static str {
+    match status {
+        GsdStatus::Passed => "passed",
+        GsdStatus::GapsFound => "gaps_found",
+        GsdStatus::HumanNeeded => "human_needed",
+        GsdStatus::Stale => "stale",
+        GsdStatus::Missing => "missing",
+    }
+}
+
+/// Record which GSD answers this run's reads: one `gsd_runtime` event with
+/// `runtime-identity`'s version, or with the reader failure's path-free label
+/// when the version could not be read. Called once per run, when it starts.
+pub(crate) fn record_gsd_runtime(project_root: &Path, phase: PhaseId) {
+    let version = gsd_home(project_root)
+        .ok_or_else(|| ReaderFailure::LauncherNotFound {
+            home: PathBuf::from("$HOME (unset)"),
+        })
+        .and_then(|home| gsd_reader::runtime_version(&home, project_root));
+    let payload = match version {
+        Ok(version) => serde_json::json!({ "version": version }),
+        Err(failure) => serde_json::json!({ "version": null, "failure": failure.label() }),
+    };
+    events::emit(project_root, phase, "gsd_runtime", payload);
+}
+
+/// Record one Validate status read as a `gsd_verification` event: GSD's
+/// status, or the reader failure's label. Never GSD's message, which can hold
+/// absolute paths (Pitfall 11).
+fn emit_verification_read(
+    project_root: &Path,
+    phase: PhaseId,
+    read: &Result<StatusReport, ReaderFailure>,
+) {
+    let payload = match read {
+        Ok(report) => serde_json::json!({ "status": gsd_status_name(report.status) }),
+        Err(failure) => serde_json::json!({ "failure": failure.label() }),
+    };
+    events::emit(project_root, phase, "gsd_verification", payload);
+}
+
+/// The ` GSD verification: …` sentence a Validate gate carries for a read.
+fn verification_clause(read: &Result<StatusReport, ReaderFailure>) -> String {
+    match read {
+        Ok(report) => format!(" GSD verification: {}.", gsd_status_name(report.status)),
+        Err(failure) => format!(
+            " GSD verification could not be read ({}): {}.",
+            failure.label(),
+            truncate_reason(&failure.to_string())
+        ),
+    }
+}
+
 /// Decide what happens after a Validate stage, honoring the active mode's
 /// gate policy, the consecutive-failure threshold, and (18e) the immediate
 /// gate an ambiguous `external_verify` outcome forces regardless of either.
@@ -544,6 +629,37 @@ pub(crate) fn handle_validate_outcome(
         ValidateOutcome::Passed => ValidateResult::Passed,
         ValidateOutcome::Failed => ValidateResult::Failed,
     };
+
+    // D-08: an agent pass is a Validate pass only when GSD's own reader, run
+    // in the evidence root, reports `passed`. Anything else is a failed
+    // Validate whose route follows GSD's status, and it never finishes the run.
+    let gsd_read = if result == ValidateResult::Passed {
+        let read = read_verification_status(&evidence_root, state.phase);
+        emit_verification_read(project_root, state.phase, &read);
+        Some(read)
+    } else {
+        None
+    };
+    let gsd_says_passed = matches!(
+        &gsd_read,
+        Some(Ok(StatusReport {
+            status: GsdStatus::Passed,
+            ..
+        }))
+    );
+    let result = if result == ValidateResult::Passed && !gsd_says_passed {
+        ValidateResult::Failed
+    } else {
+        result
+    };
+    // The fix a loop-back takes when GSD's status decided this outcome.
+    let status_fix = gsd_read.as_ref().map(|read| match read {
+        Ok(StatusReport {
+            status: GsdStatus::GapsFound,
+            ..
+        }) => FixType::GapsOnly,
+        _ => FixType::FullExecute,
+    });
 
     // IN-02: read BEFORE the recording below, which sets the baseline to
     // `Some(current)` on its measured arm and would erase the distinction
@@ -671,7 +787,7 @@ pub(crate) fn handle_validate_outcome(
             // two directions the review offered.
             ValidateResult::Passed => {
                 // D-04: approving finishes the run; nothing is merged or shipped.
-                let mut message = "Validation passed — approve to finish the run? The worktree and branch are kept.".to_string();
+                let mut message = "Validation passed — approve to finish the run? The worktree and branch are kept. GSD verification: passed.".to_string();
                 if ceiling_gate {
                     message.push_str(&format!(
                         " (This phase recorded {} Validate failure(s), at the per-phase ceiling of {} — that is why this gate fired. Answering it restarts the count.)",
@@ -694,6 +810,10 @@ pub(crate) fn handle_validate_outcome(
                     "Validation has failed {} time(s) for this phase ({} in the current consecutive streak) — human review needed.",
                     state.phase_validate_failures, state.consecutive_failures
                 );
+                if let Some(read) = &gsd_read {
+                    message.push_str(" The validate agent reported pass.");
+                    message.push_str(&verification_clause(read));
+                }
                 // F-6: conditioned on the ceiling PREDICATE read directly
                 // against the total — never on "a gate fired". In Supervise
                 // every Validate gates, so a gate-keyed clause would appear on
@@ -718,7 +838,13 @@ pub(crate) fn handle_validate_outcome(
             // would kill a phase that may be one cycle from converging.
             GateAction::Advance => {
                 reset_phase_failures_at_ceiling(project_root, state, ceiling_gate)?;
-                finish_run(project_root, state)
+                match status_fix {
+                    // GATE-03: an approval finishes only over GSD's `passed`.
+                    Some(fix) if result == ValidateResult::Failed => {
+                        loop_back_to_code(project_root, state, fix, LoopBackReason::GateResponse)
+                    }
+                    _ => finish_run(project_root, state),
+                }
             }
             GateAction::LoopBack(_) => {
                 // Evidence root: see the single binding at the top.
@@ -726,7 +852,10 @@ pub(crate) fn handle_validate_outcome(
                 // between this selection and the loop-back write that carries the
                 // observation the selection recorded in `state`.
                 reset_phase_failures_at_ceiling(project_root, state, ceiling_gate)?;
-                let fix = select_loop_back_fix(&evidence_root, state.phase, state);
+                let fix = match status_fix {
+                    Some(fix) => fix,
+                    None => select_loop_back_fix(&evidence_root, state.phase, state),
+                };
                 loop_back_to_code(project_root, state, fix, loop_back_reason(baseline_absent))
             }
             // No reset on abort: the phase is ending and `abort` clears its
@@ -742,7 +871,28 @@ pub(crate) fn handle_validate_outcome(
             // The plain-Failed tail arm — the common auto-loop path, and the
             // one the Phase 29 dogfood actually hit. Evidence root: see the
             // single binding at the top.
-            let fix = select_loop_back_fix(&evidence_root, state.phase, state);
+            let fix = match (&gsd_read, status_fix) {
+                // GSD found gaps: the gaps loop, without a gate.
+                (_, Some(FixType::GapsOnly)) => FixType::GapsOnly,
+                // Any other non-`passed` read after an agent pass waits at a
+                // gate naming it: never a finish, never a silent retry.
+                (Some(read), Some(fix)) => {
+                    let context = format!(
+                        "The validate agent reported pass, but GSD does not report the phase verified.{} Approving or rejecting loops back to Code.",
+                        verification_clause(read)
+                    );
+                    return match run_gate(project_root, state, Stage::Validate, &context)? {
+                        GateAction::Advance | GateAction::LoopBack(_) => loop_back_to_code(
+                            project_root,
+                            state,
+                            fix,
+                            LoopBackReason::GateResponse,
+                        ),
+                        GateAction::Abort(reason) => abort(project_root, state, &reason),
+                    };
+                }
+                _ => select_loop_back_fix(&evidence_root, state.phase, state),
+            };
             loop_back_to_code(project_root, state, fix, loop_back_reason(baseline_absent))
         }
     }
@@ -1281,6 +1431,8 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
+        // 52-22: a pass needs GSD's `passed` too.
+        let _gsd = validate_evidence(root, PhaseId::new(62), &[gsd_says(GsdStatus::Passed)]);
         let context = drive_validate_advance_and_read_gate_context(
             root,
             PhaseId::new(62),
@@ -1313,6 +1465,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(90);
+        // 52-22: a pass needs GSD's `passed` too.
+        let _gsd = validate_evidence(root, phase, &[gsd_says(GsdStatus::Passed)]);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Validate;
         workflow::save_state(&state).unwrap();
@@ -2774,6 +2928,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
+        // 52-22: both passes need GSD's `passed` too, one read each.
+        let _gsd = validate_evidence(
+            root,
+            PhaseId::new(88),
+            &[gsd_says(GsdStatus::Passed), gsd_says(GsdStatus::Passed)],
+        );
+        phase_dir_fixture(root, PhaseId::new(89));
 
         // AUTO, at the ceiling, and the Validate PASSED. Nothing here is a
         // failure: the budget is spent from earlier cycles and no increment
@@ -2857,6 +3018,8 @@ mod tests {
         let root = dir.path();
         init_repo(root);
         let phase = PhaseId::new(97);
+        // 52-22: a pass needs GSD's `passed` too.
+        let _gsd = validate_evidence(root, phase, &[gsd_says(GsdStatus::Passed)]);
         let mut state = State::new(
             phase,
             AgentKind::Claude,

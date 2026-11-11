@@ -750,6 +750,8 @@ fn start_reserved(
         "workflow_started",
         workflow_started_payload(&state),
     );
+    // 52-22: which GSD answers this run's verification reads, once per run.
+    crate::pipeline_outcomes::record_gsd_runtime(project_root, phase);
     if let Err(err) = launch_stage(&mut state, None, None) {
         // A stop at a safe point is recorded and ends the launch with an error; a stopped
         // run keeps its state for `devflow resume`.
