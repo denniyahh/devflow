@@ -1950,15 +1950,9 @@ pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
-/// The characters of a gate's context the pending-gate banner and `devflow
-/// gate list` show. Every gate's context leads with its way-on sentence
-/// (GATE-04), so the bound holds that sentence and the cause after it. The
-/// idle-timeout cause clause is budgeted to close inside this bound behind the
-/// longest such sentence (`MAX_IDLE_TIMEOUT_CLAUSE_CHARS` in `devflow-core`),
-/// so both renderings must use it; `gate show` prints the context in full.
-/// `the_budgeted_idle_timeout_clause_closes_inside_the_gate_display_bound` pins
-/// the two together.
-pub(crate) const GATE_CONTEXT_DISPLAY_CHARS: usize = 450;
+/// The characters of a gate's context the pending-gate banner, `devflow gate
+/// list` and the notify hook show; `gate show` prints the context in full.
+pub(crate) use devflow_core::gates::GATE_CONTEXT_DISPLAY_CHARS;
 
 /// Build the persistent status-side signal for gates awaiting an operator.
 /// Context is agent-controlled, so it must use the same bounded rendering as

@@ -1715,6 +1715,34 @@ pub const GATE_NOTIFY_CMD_ENV: &str = "DEVFLOW_GATE_NOTIFY_CMD";
 /// pins the two together.
 pub const GATE_CONTEXT_DISPLAY_CHARS: usize = 450;
 
+/// Render agent-controlled gate text as one bounded, terminal-safe line: every
+/// control character becomes a space, and text longer than `max_chars`
+/// characters (counted in characters, never bytes) is cut at a character
+/// boundary to exactly `max_chars`, ending in a truncation suffix that names
+/// `.devflow/`. The CLI's gate renderings and the notify hook share it.
+pub fn render_gate_context(context: &str, max_chars: usize) -> String {
+    const TRUNCATED: &str = "… [truncated; full output in .devflow/]";
+    let sanitized: String = context
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    if sanitized.chars().count() <= max_chars {
+        return sanitized;
+    }
+
+    let suffix_len = TRUNCATED.chars().count().min(max_chars);
+    let head_len = max_chars.saturating_sub(suffix_len);
+    let head: String = sanitized.chars().take(head_len).collect();
+    let suffix: String = TRUNCATED.chars().take(suffix_len).collect();
+    format!("{head}{suffix}")
+}
+
 /// Apply the operator's `DEVFLOW_GATE_NOTIFY_CMD` to a run's persisted notify
 /// command. `devflow start`, `resume` and `advance` all call this, so the
 /// state file is the one place a run's command lives (49-REVIEW.md CR-03):
@@ -1765,7 +1793,9 @@ pub fn resolve_gate_notify_cmd(
 /// Run the notify `cmd` via `sh -c`, passing gate metadata to the child as
 /// environment variables — never interpolated into the command string
 /// (WR-01 argv-not-shell precedent; `context` may contain agent-generated,
-/// untrusted text). Fail-soft: a non-zero exit or spawn error is logged via
+/// untrusted text). `DEVFLOW_GATE_CONTEXT` is `context` cut to
+/// [`GATE_CONTEXT_DISPLAY_CHARS`] characters (GATE-04, Pitfall 6): the gate
+/// file keeps the whole context, the notification only its start. Fail-soft: a non-zero exit or spawn error is logged via
 /// `warn!` and otherwise ignored — this must never propagate an error that
 /// could abort `run_gate`.
 fn run_notify_command(cmd: &str, phase: PhaseId, stage: Stage, context: &str, unexpected: bool) {
@@ -1794,7 +1824,10 @@ fn run_notify_command_to(
         .arg(cmd)
         .env("DEVFLOW_GATE_PHASE", phase.to_string())
         .env("DEVFLOW_GATE_STAGE", stage.to_string())
-        .env("DEVFLOW_GATE_CONTEXT", context)
+        .env(
+            "DEVFLOW_GATE_CONTEXT",
+            render_gate_context(context, GATE_CONTEXT_DISPLAY_CHARS),
+        )
         .env(
             "DEVFLOW_NON_SILENT_GATE",
             if unexpected { "1" } else { "0" },
