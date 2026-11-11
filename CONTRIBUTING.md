@@ -495,7 +495,7 @@ info!(before = %current, after = %next, phase = state.phase, "step_entered");
 
 | Variable | Purpose |
 |---|---|
-| `RUST_LOG` | Controls verbosity. Set to `error`, `warn`, `info`, `debug`, or `trace`. Use targeted directives like `devflow_core=debug,devflow=info` to filter by crate. |
+| `RUST_LOG` | Controls verbosity. Unset or empty means `off`: no tracing lines. Set to `error`, `warn`, `info`, `debug`, or `trace`. Use targeted directives like `devflow_core=debug,devflow=info` to filter by crate. |
 | `DEVFLOW_LOG_FORMAT` | Set to `json` for machine-readable JSON output (one JSON object per line on stderr). |
 
 ### Do's and Don'ts

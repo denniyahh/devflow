@@ -422,11 +422,20 @@ fn build_version() -> &'static str {
     })
 }
 
+/// Tracing is off unless `RUST_LOG` names a filter: an unset or empty value
+/// prints no tracing lines, so a command's output is its own sentences. A
+/// value that does not parse keeps the `info` fallback, and `doctor` reports
+/// it as invalid. Both log-format branches build the same filter.
 fn main() {
     match std::env::var("DEVFLOW_LOG_FORMAT").as_deref() {
         Ok("json") => {
-            let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+            let filter = match std::env::var("RUST_LOG") {
+                Ok(value) if !value.is_empty() => {
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+                }
+                _ => tracing_subscriber::EnvFilter::new("off"),
+            };
             tracing_subscriber::fmt()
                 .json()
                 .with_writer(std::io::stderr)
@@ -434,8 +443,13 @@ fn main() {
                 .init();
         }
         _ => {
-            let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+            let filter = match std::env::var("RUST_LOG") {
+                Ok(value) if !value.is_empty() => {
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+                }
+                _ => tracing_subscriber::EnvFilter::new("off"),
+            };
             tracing_subscriber::fmt()
                 .with_writer(std::io::stderr)
                 .with_env_filter(filter)

@@ -5093,10 +5093,12 @@ fn doctor_checks() -> Vec<Check> {
 fn rust_log_check(value: Option<&str>) -> Check {
     // RUST_LOG environment check: validate the value is a parsable log directive.
     let (rust_log_status, rust_log_version, rust_log_hint) = match value {
-        Some("") => (
-            "warn",
-            Some("empty (logging disabled)".to_string()),
-            Some("Set RUST_LOG=info for better diagnostics".to_string()),
+        // Unset and empty both turn tracing off (main.rs's default filter):
+        // information, not a failure.
+        None | Some("") => (
+            "info",
+            Some("not set or empty — tracing off".to_string()),
+            Some("Set RUST_LOG=info to see tracing lines".to_string()),
         ),
         Some(val) => {
             let all_valid = val.split(',').all(|directive| {
@@ -5117,11 +5119,6 @@ fn rust_log_check(value: Option<&str>) -> Check {
                 )
             }
         }
-        None => (
-            "missing",
-            Some("not set — defaulting to info".to_string()),
-            Some("Set RUST_LOG=info for better diagnostics".to_string()),
-        ),
     };
     Check {
         name: "RUST_LOG".into(),
@@ -5138,12 +5135,13 @@ fn check_line(c: &Check) -> String {
         "ok" => "✓",
         "missing" => "✗",
         "warn" => "⚠",
+        "info" => "ℹ",
         _ => "?",
     };
     let version_str = c.version.as_deref().unwrap_or("-");
     let mut line = format!("  {:<20} {:<20} {}", c.name, version_str, icon);
     #[allow(clippy::collapsible_if)]
-    if c.status == "missing" || c.status == "warn" {
+    if c.status == "missing" || c.status == "warn" || c.status == "info" {
         if let Some(hint) = &c.install_hint {
             line.push_str(&format!(" — {}", hint));
         }
