@@ -34,7 +34,7 @@ use crate::preflight::{
 };
 use devflow_core::config::capture_retention;
 use devflow_core::gates::{
-    AwaitOutcome, ClaimedAnswer, CloseReport, GateAction, GateAnswer, GateId, GateKind, Gates,
+    AwaitOutcome, ClaimedAnswer, CloseReport, GateAnswer, GateId, GateKind, Gates,
 };
 use devflow_core::mode::Mode;
 use devflow_core::outcome_policy::{self, Action};
@@ -773,13 +773,17 @@ fn auto_chain_flag_eligible(stage: Stage, mode: Mode) -> bool {
 /// ineligible path is a genuine no-op on an already-`false` file and does not
 /// dirty a tracked file on every stage launch.
 ///
-/// **Does not restore a prior value, deliberately.** A guard over an env var
-/// restores the caller's PRIOR value, because the variable may have had a
-/// meaningful pre-existing state. This one does not restore anything: `false`
-/// is always the correct value on exit (D-06). A run that ends with the flag
-/// still set is the failure mode this type exists to prevent, and "put back
-/// whatever was there" would reproduce it exactly whenever what was there was a
-/// leaked `true`.
+/// **Restores only its own write (D-46, review 5 V3).** When [`Self::engage`]
+/// changed the file, the guard keeps the bytes it read before and the bytes it
+/// wrote. On drop, if the file still holds exactly its own write, the earlier
+/// bytes go back (temp write, then rename in the same directory), so a file it
+/// found without the key, or with the key `false` in another layout, is
+/// byte-identical after the stage and never reads as a dirty tree. Those
+/// earlier bytes never hold `true`: bytes whose flag reads `true` are not kept
+/// (a leaked `true` an ineligible launch clears stays cleared), so 35.1 D-06's
+/// `false` on exit stands. Otherwise (the guard wrote nothing,
+/// or the file changed during the stage) the drop clears the flag as before, so
+/// a leaked `true` is still cleared and an edit made during the stage is kept.
 ///
 /// Errors are logged, never propagated. A hand-edited or absent
 /// `.planning/config.json` must not abort a long unattended run — the guard
@@ -787,33 +791,74 @@ fn auto_chain_flag_eligible(stage: Stage, mode: Mode) -> bool {
 /// which is the conservative direction (T-35.1-03).
 struct AutoChainGuard {
     config_root: PathBuf,
+    /// The file's bytes before `engage` and the bytes `engage` wrote, when
+    /// `engage` changed it.
+    restore: Option<(Vec<u8>, Vec<u8>)>,
 }
 
 impl AutoChainGuard {
     fn engage(config_root: &Path, active: bool) -> Self {
+        let path = gsd_config::config_path(config_root);
+        // Bytes that hold a `true` flag are never kept for a restore: a leaked
+        // `true` that an ineligible launch clears stays cleared (F-3).
+        let before = std::fs::read(&path)
+            .ok()
+            .filter(|_| matches!(gsd_config::auto_chain_active(config_root), Ok(false)));
+        let mut restore = None;
         match gsd_config::set_auto_chain_active(config_root, active) {
             Ok(changed) => {
                 if changed {
                     info!(
                         "GSD chain flag set to {active} for this stage at {}",
-                        gsd_config::config_path(config_root).display()
+                        path.display()
                     );
+                    if let (Some(before), Ok(written)) = (before, std::fs::read(&path)) {
+                        restore = Some((before, written));
+                    }
                 }
             }
             Err(err) => warn!(
                 "could not set the GSD chain flag at {}: {err} — proceeding without \
                  checkpoint auto-approval",
-                gsd_config::config_path(config_root).display()
+                path.display()
             ),
         }
         Self {
             config_root: config_root.to_path_buf(),
+            restore,
+        }
+    }
+
+    /// Put `before` back when the file still holds exactly `written`. `true`
+    /// when it did.
+    fn restore_own_write(&self, before: &[u8], written: &[u8]) -> bool {
+        let path = gsd_config::config_path(&self.config_root);
+        if std::fs::read(&path).ok().as_deref() != Some(written) {
+            return false;
+        }
+        let temp = path.with_extension("json.devflow-restore");
+        let restored = std::fs::write(&temp, before).and_then(|()| std::fs::rename(&temp, &path));
+        match restored {
+            Ok(()) => true,
+            Err(err) => {
+                let _ = std::fs::remove_file(&temp);
+                warn!(
+                    "could not restore the GSD config at {}: {err}",
+                    path.display()
+                );
+                false
+            }
         }
     }
 }
 
 impl Drop for AutoChainGuard {
     fn drop(&mut self) {
+        if let Some((before, written)) = self.restore.take()
+            && self.restore_own_write(&before, &written)
+        {
+            return;
+        }
         if let Err(err) = gsd_config::set_auto_chain_active(&self.config_root, false) {
             warn!(
                 "could not clear the GSD chain flag at {}: {err}",
@@ -3832,7 +3877,7 @@ pub(crate) fn advance_with(
                                 // — not the stale one the gate was opened about
                                 // — and persist it before relaunching, because
                                 // the next resume runs in a separate process.
-                                GateAction::Advance => {
+                                crate::pipeline_outcomes::Answer::Approve(_) => {
                                     // CR-01: close the gate now. The approval
                                     // was bound to this gate's id and is spent.
                                     let _ = close_gate(project_root, phase, stage);
@@ -3860,7 +3905,7 @@ pub(crate) fn advance_with(
                                 // correctly refuses the still-unapproved human
                                 // checkpoint. Park it for the explicitly
                                 // requested supervised repair instead.
-                                GateAction::LoopBack { note, .. } => {
+                                crate::pipeline_outcomes::Answer::Reject { note } => {
                                     // The rejection's note is the operator's word
                                     // for the Code relaunch this repair leads to.
                                     record_relaunch_note(&mut state, note)?;
@@ -3892,7 +3937,7 @@ pub(crate) fn advance_with(
                                 // The same abort every other gate uses, so
                                 // cleanup, state clearing and deregistration
                                 // all happen exactly once and identically.
-                                GateAction::Abort(note) => {
+                                crate::pipeline_outcomes::Answer::Abort(note) => {
                                     return abort(project_root, &state, &note);
                                 }
                             }
@@ -9407,6 +9452,23 @@ mod tests {
                 format!("# Roadmap\n\n### Phase {phase}: handoff fixture\n"),
             )
             .unwrap();
+            // D-46 (52-29): the fixture's files are committed and the stub
+            // agent's signal files are excluded, so a Validate here reads a
+            // clean tree.
+            std::fs::write(
+                root.join(".git/info/exclude"),
+                "go\ngo2\nfirst-done\ndescendant\n",
+            )
+            .unwrap();
+            let git = |args: &[&str]| {
+                let output = devflow_core::test_support::git_command(&root)
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "git {args:?}: {output:?}");
+            };
+            git(&["add", ".planning/ROADMAP.md"]);
+            git(&["commit", "-q", "-m", "handoff fixture roadmap"]);
             let mut state = State::new(phase, AgentKind::Claude, Mode::Supervise, root.clone());
             // Stage N is Plan explicitly, a stand-in: these tests are about the handoff
             // from stage N to N+1 (Code), not about which stage a run starts at.
@@ -12142,11 +12204,12 @@ mod tests {
         if !devflow_core::test_support::in_child_test(NAME) {
             let gsd = tempfile::tempdir().unwrap();
             let home = gsd.path().join("home");
+            // 52-29: two reads, the Validate outcome's and the approve's own
+            // fresh read (D-45 rule 2).
+            let passed = crate::test_support::gsd_says(devflow_core::gsd_reader::GsdStatus::Passed);
             devflow_core::test_support::plant_gsd_run_stub(
                 &home,
-                &[crate::test_support::gsd_says(
-                    devflow_core::gsd_reader::GsdStatus::Passed,
-                )],
+                &[passed, passed],
                 &gsd.path().join("logs"),
             );
             run_handoff_child_with_stubs_and_env(

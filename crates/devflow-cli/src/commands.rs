@@ -10015,7 +10015,10 @@ mod tests {
             1,
         )
         .expect("control: an answer that binds decides the gate");
-        assert_eq!(action, GateAction::Advance);
+        assert!(
+            matches!(action, crate::pipeline_outcomes::Answer::Approve(_)),
+            "{action:?}"
+        );
     }
 
     /// D-05 / T-50.1-48: `start`'s leftover step deletes no answer, and names each one

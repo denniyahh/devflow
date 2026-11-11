@@ -26,7 +26,7 @@ use crate::pipeline_launch::launch_stage;
 use crate::pipeline_launch::launch_stage_inner;
 use crate::pipeline_launch::stream_launch_enabled;
 use crate::pipeline_outcomes::truncate_reason;
-use devflow_core::gates::{GateAction, GateKind};
+use devflow_core::gates::GateKind;
 use devflow_core::git::git_command;
 use devflow_core::gsd_config::{self, GsdConfigError};
 use devflow_core::mode::{self, Mode};
@@ -1304,7 +1304,7 @@ pub(crate) fn run_preflight(
             truncate_reason(&reason)
         );
         match run_gate(project_root, state, stage, GateKind::Preflight, &context)? {
-            GateAction::Advance => {
+            crate::pipeline_outcomes::Answer::Approve(_) => {
                 // D-18f: approval is an explicit override — skip the
                 // just-adjudicated check on the retry (see the function
                 // doc comment above).
@@ -1344,7 +1344,7 @@ pub(crate) fn run_preflight(
                 })?;
                 launch_stage_inner(state, None, None)?;
             }
-            GateAction::LoopBack { note, .. } => {
+            crate::pipeline_outcomes::Answer::Reject { note } => {
                 // D-18f: "I will fix it, then retry" — re-check deliberately,
                 // bounded by the ceiling above.
                 let _ = close_gate(project_root, state.phase, stage);
@@ -1353,7 +1353,7 @@ pub(crate) fn run_preflight(
                 crate::pipeline_launch::record_relaunch_note(state, note)?;
                 launch_stage(state, None, None)?;
             }
-            GateAction::Abort(reason) => abort(project_root, state, &reason)?,
+            crate::pipeline_outcomes::Answer::Abort(reason) => abort(project_root, state, &reason)?,
         }
         return Ok(false);
     }
