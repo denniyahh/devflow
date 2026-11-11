@@ -53,6 +53,31 @@ fn init_repo(root: &Path, phase: PhaseId) {
     git(root, &["commit", "-q", "-m", "agent work"]);
 }
 
+/// [`init_repo`], plus what an unattended Code launch's preflight reads: a
+/// `.planning/config.json` that can hold the chain flag and one plan with no
+/// checkpoint, committed on the phase branch. Without them a relaunched Code
+/// stage stops at its preflight gate and no agent starts.
+fn init_launchable_repo(root: &Path, phase: PhaseId) {
+    init_repo(root, phase);
+    let padded = phase.padded();
+    let plan = format!(".planning/phases/{padded}-fixture/{padded}-01-PLAN.md");
+    fs::create_dir_all(root.join(format!(".planning/phases/{padded}-fixture"))).unwrap();
+    fs::write(
+        root.join(".planning/config.json"),
+        "{\n  \"workflow\": {\n    \"auto_advance\": true,\n    \"_auto_chain_active\": false\n  }\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join(&plan),
+        format!(
+            "---\nphase: {padded}-fixture\nplan: 01\ntype: execute\nautonomous: true\n---\n\n<tasks>\n<task type=\"auto\"><name>stub</name></task>\n</tasks>\n"
+        ),
+    )
+    .unwrap();
+    git(root, &["add", ".planning/config.json", &plan]);
+    git(root, &["commit", "-q", "-m", "auto config and plan"]);
+}
+
 fn wait_for(mut predicate: impl FnMut() -> bool, what: &str) {
     let start = Instant::now();
     while !predicate() {
@@ -76,9 +101,23 @@ fn spawn_gated_advance_with_path(
     phase: PhaseId,
     bin_first: Option<&Path>,
 ) -> Child {
-    let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+    spawn_gated_advance_as(home, root, phase, bin_first, AgentKind::Claude, |_| {})
+}
+
+/// [`spawn_gated_advance_with_path`] for a run of `agent`, with `seed` applied
+/// to the saved state before the advance starts.
+fn spawn_gated_advance_as(
+    home: &common::HermeticHome,
+    root: &Path,
+    phase: PhaseId,
+    bin_first: Option<&Path>,
+    agent: AgentKind,
+    seed: impl FnOnce(&mut State),
+) -> Child {
+    let mut state = State::new(phase, agent, Mode::Auto, root.to_path_buf());
     state.verification_baseline_captured = true;
     state.stage = Stage::Code;
+    seed(&mut state);
     devflow_core::workflow::save_state(&state).unwrap();
     let mut command = common::hermetic_devflow(home);
     command
@@ -201,6 +240,111 @@ fn a_note_saying_do_not_abort_keeps_the_run_alive() {
         events_named(root, "workflow_aborted").is_empty(),
         "a rejection must not abort the run: {:?}",
         events_named(root, "workflow_aborted")
+    );
+}
+
+/// A rejection note with a newline, a tab, double quotes, a `$HOME` and a
+/// backtick: the characters a shell or a prompt template would most easily
+/// mangle on the way to the agent.
+const REJECTION_NOTE: &str = "fix the flaky test first,\n\tthen rerun \"cargo test\" with $HOME unset\nand leave `scripts/` alone";
+
+/// A fake stream-shape `claude`: it answers `--version` (the launch's health
+/// check), appends the one stdin turn the stream launch writes to
+/// `logs/`[`common::AGENT_STDIN_LOG`], and exits 1 without a result, so the
+/// relaunched stage fails again and nothing more is launched.
+fn stream_agent_logging_stdin(logs: &Path) -> common::FakeBin {
+    let logs = logs.to_str().expect("a UTF-8 logs path");
+    assert!(
+        !logs.contains('\''),
+        "the logs path is single-quoted: {logs}"
+    );
+    common::fake_bin_dir(&format!(
+        "if [ \"$1\" = \"--version\" ]; then echo \"2.1.220 (Claude Code)\"; exit 0; fi\n\
+         IFS= read -r turn\n\
+         printf '%s\\n' \"$turn\" >> '{logs}/{}'\n\
+         exit 1",
+        common::AGENT_STDIN_LOG
+    ))
+}
+
+/// The prompt text of each stream turn logged in `logs`: the `content` string
+/// of each `{"type":"user","message":{...}}` line, decoded from its JSON, so
+/// it holds the bytes the agent was given rather than their JSON escaping.
+fn logged_stream_prompts(logs: &Path) -> Vec<String> {
+    let Ok(contents) = fs::read_to_string(logs.join(common::AGENT_STDIN_LOG)) else {
+        return Vec::new();
+    };
+    contents
+        .lines()
+        .map(|line| {
+            let turn: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|error| panic!("a stream turn is one JSON line ({error}): {line}"));
+            turn["message"]["content"]
+                .as_str()
+                .unwrap_or_else(|| panic!("a stream turn carries its prompt as a string: {line}"))
+                .to_string()
+        })
+        .collect()
+}
+
+/// The run's state file as JSON, so a test can see which fields it holds.
+fn state_json(root: &Path, phase: PhaseId) -> serde_json::Value {
+    let path = devflow_core::workflow::state_path(root, phase);
+    serde_json::from_slice(&fs::read(&path).expect("the run's state file"))
+        .expect("the state file is JSON")
+}
+
+/// GATE-01 / D-14 on the stream shape: a gated Code advance on Claude, whose
+/// Code stage-failure gate is rejected with [`REJECTION_NOTE`], relaunches
+/// Code with the note in the prompt the agent reads on stdin, byte for byte.
+/// The note is the operator's word for that relaunch, so the state holds it as
+/// `relaunch_note`, and never as the fix request's `code_fix_note`.
+#[test]
+fn a_rejection_note_reaches_the_stream_prompt_verbatim() {
+    let home = common::HermeticHome::new();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let logs = tempfile::tempdir().unwrap();
+    let phase = PhaseId::new(4824);
+    init_launchable_repo(root, phase);
+    let _reaper = common::LaunchedRunReaper::new(root, phase, Vec::new());
+    let fake_bin = stream_agent_logging_stdin(logs.path());
+    // A recorded, confirmed delivery canary: the stream relaunch runs no canary
+    // of its own, so the only turn the fake logs is the relaunch's.
+    let _child = ReapOnDrop(spawn_gated_advance_as(
+        &home,
+        root,
+        phase,
+        Some(&fake_bin.path),
+        AgentKind::Claude,
+        |state| state.canary = Some(devflow_core::canary::CanaryOutcome::Confirmed),
+    ));
+
+    let output = answer_code_gate(&home, root, phase, "reject", REJECTION_NOTE);
+    assert!(
+        output.status.success(),
+        "reject failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    common::wait_for(
+        || !logged_stream_prompts(logs.path()).is_empty(),
+        Duration::from_secs(20),
+        "the relaunched Code agent to read its stdin turn",
+    );
+    let prompts = logged_stream_prompts(logs.path());
+    assert!(
+        prompts[0].contains(REJECTION_NOTE),
+        "the relaunched agent's prompt must hold the note byte for byte:\n{}",
+        prompts[0]
+    );
+    let state = state_json(root, phase);
+    assert_eq!(
+        state["relaunch_note"], REJECTION_NOTE,
+        "a stage-failure reject's note is the relaunch note: {state}"
+    );
+    assert!(
+        state.get("code_fix_note").is_none(),
+        "a stage-failure reject must not write the fix request's note: {state}"
     );
 }
 
