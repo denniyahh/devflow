@@ -8000,6 +8000,154 @@ mod tests {
         );
     }
 
+    /// Run `handler` on another thread until it opens `stage`'s gate, read the
+    /// gate file's `gate_kind`, answer the gate with an abort and wait for
+    /// `handler`.
+    fn gate_kind_at_gate(
+        root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        handler: impl FnOnce() + Send,
+    ) -> serde_json::Value {
+        const GATE_OPENS_WITHIN: Duration = Duration::from_secs(30);
+        let gate_path = Gates::gate_path(root, phase, stage);
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(handler);
+            let started = std::time::Instant::now();
+            while !gate_path.exists() {
+                assert!(
+                    !waiter.is_finished(),
+                    "the handler returned without opening the {stage} gate"
+                );
+                assert!(
+                    started.elapsed() < GATE_OPENS_WITHIN,
+                    "the {stage} gate did not open within {GATE_OPENS_WITHIN:?}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let gate: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&gate_path).unwrap()).unwrap();
+            answer_open_gate(root, phase, stage, &abort_response("test cleanup")).unwrap();
+            waiter.join().unwrap();
+            gate
+        })
+    }
+
+    /// D-39: no gate is kindless. A stage failure at Plan and at Code and an
+    /// infra failure each record `stage_failure`, a failed preflight check
+    /// `preflight`, and an unapproved human-only checkpoint declaration at Code
+    /// `checkpoint_declaration`. Control in the same test: a stage-failure gate at
+    /// Validate and a Validate disagreement gate both have stage Validate and
+    /// record different kinds.
+    #[test]
+    fn each_status_less_gate_records_its_kind() {
+        const NAME: &str = "pipeline_launch::tests::each_status_less_gate_records_its_kind";
+        const ROOT_ENV: &str = "DEVFLOW_PIPELINE_LAUNCH_STATUS_LESS_KINDS_ROOT";
+        let rescan_phase = PhaseId::new(5260);
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let dir = tempfile::tempdir().unwrap();
+            build_rescan_fixture(
+                dir.path(),
+                rescan_phase,
+                &rescan_plan_body_rewritten(),
+                recorded_from_body(rescan_phase, &rescan_plan_body()),
+                Mode::Auto,
+            );
+            let path_dir = agent_free_dir_with_agent_stub("claude");
+            let output = crate::test_support::run_hermetic_test_in_child(
+                NAME,
+                path_dir.path(),
+                &[
+                    (ROOT_ENV, dir.path().as_os_str()),
+                    ("DEVFLOW_GATE_TIMEOUT_SECS", std::ffi::OsStr::new("20")),
+                ],
+            );
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let at = |phase: u32, stage: Stage| {
+            let dir = tempfile::tempdir().unwrap();
+            let phase = PhaseId::new(phase);
+            let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, dir.path().into());
+            state.stage = stage;
+            workflow::save_state(&state).unwrap();
+            (dir, phase, state)
+        };
+
+        let mut stage_failures = Vec::new();
+        for (number, stage) in [
+            (5261, Stage::Plan),
+            (5262, Stage::Code),
+            (5263, Stage::Validate),
+        ] {
+            let (dir, phase, mut state) = at(number, stage);
+            let gate = gate_kind_at_gate(dir.path(), phase, stage, || {
+                let _ = crate::pipeline_outcomes::handle_stage_failure(
+                    dir.path(),
+                    &mut state,
+                    stage,
+                    Some("the launch failed".into()),
+                );
+            });
+            assert_eq!(gate["gate_kind"], "stage_failure", "{stage}: {gate}");
+            stage_failures.push(gate);
+        }
+
+        let (dir, phase, mut state) = at(5264, Stage::Code);
+        let gate = gate_kind_at_gate(dir.path(), phase, Stage::Code, || {
+            let _ = crate::pipeline_outcomes::handle_infra_outcome(
+                dir.path(),
+                &mut state,
+                Stage::Code,
+                Some("the agent was killed".into()),
+            );
+        });
+        assert_eq!(gate["gate_kind"], "stage_failure", "infra: {gate}");
+
+        let (dir, phase, mut state) = at(5265, Stage::Code);
+        let gate = gate_kind_at_gate(dir.path(), phase, Stage::Code, || {
+            let _ = crate::preflight::run_preflight(dir.path(), &mut state, &AlwaysFailAdapter);
+        });
+        assert_eq!(gate["gate_kind"], "preflight", "preflight: {gate}");
+
+        let root = PathBuf::from(std::env::var_os(ROOT_ENV).expect("the parent's fixture root"));
+        let gate = gate_kind_at_gate(&root, rescan_phase, Stage::Code, || {
+            let result = advance_for_stage(&root, Some(rescan_phase), Some(Stage::Code));
+            let reloaded = workflow::load_state(&root, rescan_phase).ok();
+            let _reap_guard = reloaded.as_ref().map(ReapMonitorOnDrop::after_launch);
+            let _ = result;
+        });
+        assert_eq!(
+            gate["gate_kind"], "checkpoint_declaration",
+            "checkpoint: {gate}"
+        );
+
+        // Control: two gates at Validate, one a stage failure, one a disagreement.
+        let (dir, phase, mut state) = at(5266, Stage::Validate);
+        let _gsd = crate::test_support::validate_evidence(
+            dir.path(),
+            phase,
+            &[crate::test_support::gsd_says(
+                devflow_core::gsd_reader::GsdStatus::Passed,
+            )],
+        );
+        let disagreement = gate_kind_at_gate(dir.path(), phase, Stage::Validate, || {
+            let _ = crate::pipeline_outcomes::handle_validate_outcome(
+                dir.path(),
+                &mut state,
+                crate::pipeline_outcomes::ValidateOutcome::Failed,
+            );
+        });
+        let stage_failure = &stage_failures[2];
+        assert_eq!(stage_failure["stage"], "validate");
+        assert_eq!(disagreement["stage"], "validate");
+        assert_eq!(
+            disagreement["gate_kind"], "disagreement_over_passed",
+            "{disagreement}"
+        );
+        assert_ne!(stage_failure["gate_kind"], disagreement["gate_kind"]);
+    }
+
     /// 48-15 Task 1: an abort answer must terminate through the SAME
     /// `pipeline_gate::abort` every other gate uses — not a bespoke exit
     /// path that skips gate cleanup, state clearing or deregistration.
