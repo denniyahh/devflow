@@ -1951,12 +1951,14 @@ pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
 }
 
 /// The characters of a gate's context the pending-gate banner and `devflow
-/// gate list` show. The idle-timeout cause clause is budgeted to close inside
-/// this bound (`MAX_IDLE_TIMEOUT_CLAUSE_CHARS` in `devflow-core`), so both
-/// renderings must use it; `gate show` prints the context in full.
+/// gate list` show. Every gate's context leads with its way-on sentence
+/// (GATE-04), so the bound holds that sentence and the cause after it. The
+/// idle-timeout cause clause is budgeted to close inside this bound behind the
+/// longest such sentence (`MAX_IDLE_TIMEOUT_CLAUSE_CHARS` in `devflow-core`),
+/// so both renderings must use it; `gate show` prints the context in full.
 /// `the_budgeted_idle_timeout_clause_closes_inside_the_gate_display_bound` pins
 /// the two together.
-const GATE_CONTEXT_DISPLAY_CHARS: usize = 300;
+const GATE_CONTEXT_DISPLAY_CHARS: usize = 450;
 
 /// Build the persistent status-side signal for gates awaiting an operator.
 /// Context is agent-controlled, so it must use the same bounded rendering as
@@ -7916,9 +7918,10 @@ mod tests {
     /// The idle-timeout cause clause, at the longest length `devflow-core` budgets for it
     /// (`MAX_IDLE_TIMEOUT_CLAUSE_CHARS`), closes inside what the banner and `gate list`
     /// show (`GATE_CONTEXT_DISPLAY_CHARS`) after the reason cap and behind the longest
-    /// failure prefix (the Validate stage), however long the text after it. The bound is
-    /// derived from the constants, so changing either one fails this test until the
-    /// budget is re-derived. Control: one character past the budget is cut.
+    /// failure prefix (the Validate stage's way-on sentence and failure words), however
+    /// long the text after it. The bound is derived from the constants, so changing
+    /// either one fails this test until the budget is re-derived. Control: a clause 24
+    /// characters past the budget is cut.
     #[test]
     fn the_budgeted_idle_timeout_clause_closes_inside_the_gate_display_bound() {
         let clause_close = |clause_chars: usize| {
@@ -7939,7 +7942,11 @@ mod tests {
                 Stage::Validate,
                 Some(reason),
             );
-            assert!(context.starts_with("[never-silent] stage validate failed: idle timeout ("));
+            assert!(
+                context.starts_with("[never-silent] Answers — approve: retries the validate stage")
+                    && context.contains(" stage validate failed: idle timeout ("),
+                "{context}"
+            );
             Gates::write_gate(
                 dir.path(),
                 PhaseId::new(9999),

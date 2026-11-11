@@ -1927,8 +1927,12 @@ fn a_finished_run_is_kept_by_cleanup_and_refused_by_resume() {
 
 /// GATE-03's never-lies rule for one gate context: a context names GSD's
 /// `status`, and says `passed` only when GSD returned `passed`. `Err` names
-/// the lie.
+/// the lie. The rule reads how the gate reports GSD's status, the cause after
+/// the way-on sentence: that sentence's finish rule names `passed` on every
+/// verification gate (GATE-04, U10), whatever GSD returned.
 fn never_lies(context: &str, status: &str) -> Result<(), String> {
+    let body = context.strip_prefix("[never-silent] ").unwrap_or(context);
+    let context = body.strip_prefix(VERIFICATION_WAY_ON).unwrap_or(context);
     if !context.contains(status) {
         return Err(format!(
             "the context does not name GSD's status {status}: {context}"
@@ -1989,7 +1993,12 @@ fn a_gaps_found_report_never_reads_as_passed() {
         .expect("a gate context")
         .to_string();
     never_lies(&context, "gaps_found").unwrap_or_else(|lie| panic!("{lie}\nevents:\n{log}"));
-    for event in rig.events() {
+    for mut event in rig.events() {
+        if event["event"] == "gate_fired" {
+            let fired = event["context"].as_str().unwrap_or_default().to_string();
+            never_lies(&fired, "gaps_found").unwrap_or_else(|lie| panic!("{lie}\nevents:\n{log}"));
+            event.as_object_mut().unwrap().remove("context");
+        }
         if event["event"] == "gate_fired" || event["event"] == "gsd_verification" {
             assert!(
                 !event.to_string().contains("passed"),
@@ -2015,10 +2024,18 @@ fn a_gaps_found_report_never_reads_as_passed() {
         worktree.display()
     );
 
-    // Control: the check bites on a planted lie.
+    // Control: the check bites on a planted lie, after the way-on sentence too.
     assert!(
         never_lies("GSD verification: passed", "gaps_found").is_err(),
         "a context saying passed beside gaps_found must fail the never-lies check"
+    );
+    assert!(
+        never_lies(
+            &format!("{VERIFICATION_WAY_ON} GSD verification: passed. gaps_found"),
+            "gaps_found"
+        )
+        .is_err(),
+        "a cause saying passed after the way-on sentence must fail the never-lies check"
     );
 
     let abort = common::hermetic_devflow(&rig.home)

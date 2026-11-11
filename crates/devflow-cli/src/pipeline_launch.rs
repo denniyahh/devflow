@@ -2699,26 +2699,28 @@ pub(crate) fn rescan_gate_context(
     unapproved: &[&CheckpointDeclaration],
     mode: Mode,
 ) -> String {
-    let _ = (phase, stage);
     let mut plan_files: Vec<&str> = unapproved
         .iter()
         .map(|declaration| declaration.plan_file.as_str())
         .collect();
     plan_files.sort_unstable();
     plan_files.dedup();
-    let next_step = match mode {
+    let repair = match mode {
         Mode::Auto => {
-            "approve, or switch this phase to Supervise for its remaining stages to repair, or abort"
+            " To repair them instead, switch this phase to Supervise for its remaining stages."
         }
-        Mode::Supervise => {
-            "approve then make a separate human Code decision, repair under Supervise, or abort"
-        }
+        Mode::Supervise => " Code then needs a separate human decision.",
     };
-    format!(
-        "[checkpoint re-scan] {} human-only checkpoint(s) in {} were added or changed after this \
-         phase's Code preflight — a human must review them before continuing ({next_step})",
-        unapproved.len(),
-        plan_files.join(", ")
+    crate::pipeline_outcomes::lead_with_way_on(
+        GateKind::CheckpointDeclaration,
+        (phase, stage),
+        None,
+        &format!(
+            "[checkpoint re-scan] {} human-only checkpoint(s) in {} were added or changed after \
+             this phase's Code preflight — a human must review them before continuing.{repair}",
+            unapproved.len(),
+            plan_files.join(", ")
+        ),
     )
 }
 
@@ -7781,6 +7783,18 @@ mod tests {
             "the abort of the reopened gate ends the run: {result:?}"
         );
 
+        // GATE-04: the live re-scan writer leads with the routers' sentence.
+        let sentence = crate::pipeline_outcomes::way_on_sentence(
+            GateKind::CheckpointDeclaration,
+            phase,
+            Stage::Code,
+            None,
+        );
+        let first = gates[0].0["context"].as_str().unwrap_or_default();
+        assert!(
+            first.starts_with(&sentence),
+            "the re-scan gate leads with its way on: {first}"
+        );
         let refused = events_of_kind(root, "gate_answer_refused");
         assert_eq!(refused.len(), 1, "{refused:?}");
         assert_eq!(refused[0]["gate_kind"], "checkpoint_declaration");

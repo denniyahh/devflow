@@ -234,6 +234,93 @@ ends the run. A note's wording never changes which one it is, so a rejection
 that reads "do not abort, fix the test" relaunches the stage. An answer that
 both approves and aborts is refused when it is written.
 
+### What each answer runs
+
+Every gate's context opens with one sentence that names what each answer runs
+on that gate, or that it is not offered, and that abort ends the run. The cause
+follows it, so the notify hook, the pending-gate banner and `gate list` show
+the way on first. `gate approve`, `gate reject` and `gate abort` print the same
+route (a `route:` line) once the answer is written. The sentence and the print
+come from the routers the supervisor dispatches through, read over the gate
+file's kind and the run's recorded delivery canary, never from the gate's
+text. An answer the supervisor would refuse is refused by the command before
+anything is written: it exits non-zero and names the answers that apply.
+
+**Verification gates** are the gates opened over a GSD status or a failed GSD
+read: `clean_pass`, `gaps_found`, `reverify_needed`, `human_needed`,
+`disagreement_over_passed`, `disagreement_over_human_needed`,
+`ambiguous_verdict`, `failure_cap`, `reader_failure` and
+`no_gap_closure_plan`. Approve reads GSD's verification status again when the
+supervisor picks the answer up, and routes on that fresh read, never on the
+status the gate was opened over:
+
+| Fresh GSD status | Validate pass on the current commit, over a clean tree | Auto mode, after Validate | Approve |
+|---|---|---|---|
+| `passed` | yes | finish | finish |
+| `passed` | no | gate | run Validate again |
+| `gaps_found` | any | the gap-closure loop | the gap-closure loop |
+| `stale` or `missing` | any | the re-verify Code pass | the re-verify Code pass |
+| `human_needed` | any | gate | read again; the gate reopens with the fresh facts |
+| no answer (a reader failure) | any | gate | read again; the gate reopens with the fresh facts |
+
+In supervise mode every Validate ends at a gate. An approve follows the
+Approve column whether the run is in auto or supervise mode, a `failure_cap`
+approve included: that one restarts the count first. `gate approve` prints the
+route the table gives over a read it makes itself, and says that the
+supervisor reads again at pickup; a status that changes between the two reads
+can route differently from the print.
+
+A finish needs a fresh `passed` and a Validate pass recorded on the current
+commit. A commit made during a gate wait sends approve back to Validate, and so
+does an uncommitted change: a pass counts only on a clean tree, `.planning/`
+included, and the gate names the dirty paths. A Validate that ran over a dirty
+tree records no pass, so cleaning the tree afterwards does not revive one: the
+finish needs another Validate over the clean tree. Approving an
+`ambiguous_verdict` gate no longer advances the run: an ambiguous verdict
+records no Validate pass, so approve over `passed` runs Validate again, and a
+Validate that stays ambiguous can finish only through a later clean pass.
+
+GSD's own `/gsd-plan-phase`, run without `--auto` as DevFlow's Plan stage runs
+it, writes `workflow._auto_chain_active` into `.planning/config.json` and does
+not commit it. So in a project whose committed config lacks that key, the
+first Validate gate names `.planning/config.json` as a dirty path; commit the
+file once, and later Validates read a clean tree (GSD's later writes of the
+same value leave it unchanged). A `devflow resume` runs DevFlow's existing
+chain-flag repair before it relaunches, and when the flag is the file's only
+difference from the branch's last commit the repair commits the file itself,
+with a commit message and notice that say a killed run leaked the flag, which
+is not so here (backlog 999.219, not fixed in Phase 52). `devflow start
+--no-worktree` on a checkout that still holds that uncommitted write (from an
+earlier run or a hand-run `/gsd-plan-phase`) commits it the same way when git
+carries the write across start's branch checkout and the flag is the file's
+only difference from develop; otherwise the checkout refuses and start fails
+first, or the repair declines with a warning and the file stays dirty. That run
+launches in the project checkout, and start makes no dirty-tree check before
+the repair. `devflow start` runs the repair before its own Plan writes the key,
+so a worktree run that is not resumed, or a `--no-worktree` run whose checkout
+held no such write at start, needs the one manual commit. DevFlow makes no
+other write for it and exempts no path.
+
+Reject with a note runs `/gsd-quick` with the note, then Validate, on every
+verification gate. A reject whose note is empty or only whitespace is refused.
+Abort ends the run.
+
+Accepted limits, fixed upstream: a `gaps_found` report gone stale runs the
+gap-closure loop, whose execute-phase re-verifies (open-gsd/gsd-core#6078); and
+a quick fix to a file the report does not cover can leave GSD's `passed`
+unchanged (open-gsd/gsd-core#6096), so the finish still needs a fresh Validate
+pass on that commit.
+
+**Status-less gates** read no GSD status, and none of them can finish a run:
+
+| Gate kind | Approve | Reject with a note | Abort |
+|---|---|---|---|
+| `stage_failure` (a rate-limit gate included) | retries the stage | relaunches the stage with the note | ends the run |
+| `stage_failure` on a run whose recorded delivery canary refuses its agent | stops the run; the way on is `devflow resume --phase N --agent <other>` | the same, and the note is kept for that resume | ends the run |
+| `preflight` | relaunches the stage with the failed check overridden | not offered: refused | ends the run |
+| `checkpoint_declaration` | records the checkpoints as seen and relaunches Code | not offered: refused | ends the run |
+| a gate file with no `gate_kind` (a 3.x or hand-written file) | refused | refused | ends the run |
+
 `--stage` is only needed when one phase somehow has several open gates.
 `--gate-id <ID>` binds the answer to the gate `gate list` or `gate show`
 displayed, and a gate opened since is refused; without it the command answers
@@ -354,8 +441,8 @@ refusal stays recorded for the run and refuses every later launch. And after a s
 successor may still be running. The gate names the cause as
 `the handoff to <agent> could not relaunch the code stage: <error>`. When the
 recorded canary refuses the agent, the gate context (and so the notify hook)
-also says that a retry or loop-back will not relaunch and names
-`devflow resume --phase N --agent <other>`.
+leads with the routers' sentence: approve and reject both stop the run, and the
+way on is `devflow resume --phase N --agent <other>`. The cause follows it.
 
 The way on when the fallback's canary refused:
 
@@ -392,7 +479,7 @@ when the run uses `--no-worktree`), and is killed after 60 seconds.
 | `passed` | auto: the run finishes; supervise: the Validate gate, whose approval finishes the run | a gate: the agent and GSD disagree; approving runs Validate again |
 | `gaps_found` | auto: a gap-closure pass: Plan runs `/gsd-plan-phase N --gaps`, then Code runs `/gsd-execute-phase N --gaps-only`, then Validate runs again; supervise: a `gaps_found` gate, whose approval runs that gap-closure pass and never finishes the run, and whose abort (`devflow gate abort`) ends the run | the same |
 | `stale` or `missing` | auto: back to Code for the re-verify pass (below); supervise: a `reverify_needed` gate, and nothing launches until it is answered | the same |
-| `human_needed` | a gate in both modes; approving runs Validate again | a gate: the agent and GSD disagree |
+| `human_needed` | a gate in both modes; approving reads GSD again and reopens the gate while it still says `human_needed` | a gate: the agent and GSD disagree |
 | no answer | a `[never-silent]` gate naming the failure: no launcher, a non-zero exit, a timeout, output that is not JSON, a status outside GSD's set, no phase directory, and the like. It is never a pass and never a silent retry | the same |
 
 A gap-closure pass keeps going until a Validate reads `passed`. A `devflow
@@ -438,8 +525,11 @@ to its per-phase ceiling, its `no_gap_closure_plan` gate says so, and an answer
 that continues the run restarts the per-phase count (a
 `phase_failure_budget_reset` event); `devflow gate abort` does not. An ambiguous verdict (the external
 verification probe succeeded but the agent reported gaps or no verdict)
-always stops at a gate. A gate context quotes GSD's status as GSD printed it
-and says `passed` only when GSD reported `passed`.
+records no Validate pass: over `passed`, `human_needed` or a failed read it
+stops at a gate, and in auto mode over `gaps_found`, `stale` or `missing` it
+takes the table's route (see [What each answer runs](#what-each-answer-runs)). A gate context quotes GSD's status as GSD printed it
+and says `passed` only when GSD reported `passed`, apart from the way-on
+sentence that leads every verification gate, whose finish rule names `passed`.
 
 What a run records:
 
