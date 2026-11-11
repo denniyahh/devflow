@@ -548,6 +548,7 @@ pub(crate) fn answer_family(kind: Option<GateKind>) -> AnswerFamily {
         Some(GateKind::FailureCap) => AnswerFamily::Verification,
         Some(GateKind::NoGapClosurePlan) => AnswerFamily::Verification,
         Some(GateKind::StageFailure) => AnswerFamily::StageFailure,
+        Some(GateKind::RateLimit) => AnswerFamily::StageFailure,
         Some(GateKind::Preflight) => AnswerFamily::Preflight,
         Some(GateKind::CheckpointDeclaration) => AnswerFamily::CheckpointDeclaration,
         None => AnswerFamily::Unclassified,
@@ -1302,6 +1303,7 @@ fn validate_gate_context(
         | GateKind::ReaderFailure
         | GateKind::NoGapClosurePlan
         | GateKind::StageFailure
+        | GateKind::RateLimit
         | GateKind::Preflight
         | GateKind::CheckpointDeclaration => "",
     });
@@ -1528,6 +1530,7 @@ pub(crate) fn handle_validate_outcome(
             let label = GateLabel {
                 kind,
                 gsd_status: evidence.status(),
+                not_before: None,
             };
             open_verification_gate(
                 project_root,
@@ -1766,6 +1769,7 @@ fn reopen_verification_gate(
     let label = GateLabel {
         kind,
         gsd_status: evidence.status(),
+        not_before: None,
     };
     open_verification_gate(
         project_root,
@@ -1937,6 +1941,7 @@ pub(crate) fn handle_gaps_plan_outcome(
                     GateLabel {
                         kind: GateKind::NoGapClosurePlan,
                         gsd_status: Some(GsdStatus::GapsFound),
+                        not_before: None,
                     },
                 ),
                 (&context, &context),
@@ -8395,7 +8400,7 @@ mod tests {
             | Some(GateKind::AmbiguousVerdict)
             | Some(GateKind::FailureCap) => ParityCase::Verification(Stage::Validate),
             Some(GateKind::NoGapClosurePlan) => ParityCase::Verification(Stage::Plan),
-            Some(GateKind::StageFailure) => ParityCase::StageFailure,
+            Some(GateKind::StageFailure) | Some(GateKind::RateLimit) => ParityCase::StageFailure,
             Some(GateKind::Preflight) | Some(GateKind::CheckpointDeclaration) => {
                 ParityCase::RejectRefused
             }
@@ -8414,6 +8419,7 @@ mod tests {
             gate_id: "g-parity".to_string(),
             gate_kind: kind,
             gsd_status: None,
+            not_before: None,
         }
     }
 
@@ -9012,6 +9018,7 @@ mod tests {
         let decoy = |status: Option<GsdStatus>| devflow_core::gates::GateLabel {
             kind: GateKind::CleanPass,
             gsd_status: status,
+            not_before: None,
         };
         let gap = approve_row(
             Stage::Validate,

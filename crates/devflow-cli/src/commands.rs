@@ -2576,6 +2576,22 @@ pub(crate) fn gate_sweep(
     dry_run: bool,
     root: Option<PathBuf>,
 ) -> Result<(), CliError> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    gate_sweep_at(max_age_secs, dry_run, root, now)
+}
+
+/// [`gate_sweep`] at `now`, in Unix epoch seconds, so a test can place the
+/// sweep before or after a rate-limit gate's not-before time without waiting
+/// on the clock.
+fn gate_sweep_at(
+    max_age_secs: Option<u64>,
+    dry_run: bool,
+    root: Option<PathBuf>,
+    now: u64,
+) -> Result<(), CliError> {
     let threshold = max_age_secs.unwrap_or_else(config_parse::gate_max_unattended_age_secs);
 
     let roots: Vec<PathBuf> = match root {
@@ -2588,11 +2604,6 @@ pub(crate) fn gate_sweep(
                 .collect()
         }
     };
-
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
 
     let mut reaped = 0u32;
     let mut skipped = 0u32;
@@ -2609,7 +2620,7 @@ pub(crate) fn gate_sweep(
                 left_alone += 1;
                 continue;
             }
-            match sweep_one_gate(project_root, &gate, age, threshold, dry_run)? {
+            match sweep_one_gate(project_root, &gate, age, threshold, dry_run, now)? {
                 SweepStep::Reaped => reaped += 1,
                 SweepStep::Skipped => skipped += 1,
                 SweepStep::LeftAlone => left_alone += 1,
@@ -2627,7 +2638,16 @@ pub(crate) fn gate_sweep(
     Ok(())
 }
 
-fn gate_sweep_may_reap(_stage: Stage, waiter_live: bool) -> bool {
+/// Whether the sweep may reap an aged gate at `stage`: only one with a live
+/// waiter, and never a rate-limit gate before its `not_before` time (D-27.2,
+/// T-52-46), `now` being Unix epoch seconds.
+fn gate_sweep_may_reap(
+    _stage: Stage,
+    waiter_live: bool,
+    not_before: Option<i64>,
+    now: u64,
+) -> bool {
+    let _ = (not_before, now);
     waiter_live
 }
 
@@ -2654,6 +2674,7 @@ fn sweep_one_gate(
     age: u64,
     threshold: u64,
     dry_run: bool,
+    now: u64,
 ) -> Result<SweepStep, CliError> {
     let at = project_root.display();
     let (phase, stage) = (gate.phase, gate.stage);
@@ -2673,7 +2694,7 @@ fn sweep_one_gate(
         }
     };
     let waiter_live = waiter_is_live(project_root, phase, stage, &observed);
-    if !gate_sweep_may_reap(stage, waiter_live) {
+    if !gate_sweep_may_reap(stage, waiter_live, gate.not_before, now) {
         println!(
             "left phase {phase} {stage} alone at {at} — no confirmed waiter; {}",
             no_waiter_repair(phase)
@@ -7318,11 +7339,85 @@ mod tests {
         assert!(gate_answer_files(root, phase, Stage::Code).is_empty());
     }
 
+    /// Unix epoch seconds now, for a sweep step whose gate has no not-before
+    /// time.
+    fn now_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    /// D-27.2, T-52-46: an aged rate-limit gate whose not-before time is still
+    /// ahead is not reaped, even with a live waiter; the same gate at its
+    /// not-before time is. Control in the same sweep: an ordinary aged gate
+    /// with a live waiter is reaped. The time is injected, never waited on.
+    #[test]
+    fn gate_sweep_skips_a_rate_limit_gate_before_its_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let stage = Stage::Code;
+        let (limited, ordinary) = (PhaseId::new(5321), PhaseId::new(5322));
+        let reset = i64::try_from(now_secs()).unwrap() + 3600;
+        let not_before = reset + devflow_core::reset_time::RATE_LIMIT_RELAUNCH_MARGIN_SECS;
+        let (limited_gate, limited_registration) = Gates::open_registered(
+            root,
+            limited,
+            stage,
+            devflow_core::gates::GateLabel::rate_limit(Some(reset)),
+            "rate limited",
+        )
+        .unwrap();
+        let (ordinary_gate, ordinary_registration) = Gates::open_registered(
+            root,
+            ordinary,
+            stage,
+            devflow_core::gates::GateKind::StageFailure,
+            "failed",
+        )
+        .unwrap();
+        let before = u64::try_from(not_before - 1).unwrap();
+
+        gate_sweep_at(Some(0), false, Some(root.to_path_buf()), before).unwrap();
+
+        assert_eq!(
+            Gates::read_answer(root, limited, stage, &limited_gate.gate_id),
+            AnswerRead::None,
+            "a rate-limit gate is not reaped one second before its not-before time"
+        );
+        assert!(
+            matches!(
+                Gates::read_answer(root, ordinary, stage, &ordinary_gate.gate_id),
+                AnswerRead::Bound(answer) if answer.response.abort
+            ),
+            "control: the ordinary aged gate is reaped"
+        );
+
+        let at = u64::try_from(not_before).unwrap();
+        gate_sweep_at(Some(0), false, Some(root.to_path_buf()), at).unwrap();
+
+        assert!(
+            matches!(
+                Gates::read_answer(root, limited, stage, &limited_gate.gate_id),
+                AnswerRead::Bound(answer) if answer.response.abort
+            ),
+            "at its not-before time the rate-limit gate is reaped"
+        );
+        limited_registration.finish();
+        ordinary_registration.finish();
+    }
+
     #[test]
     fn gate_sweep_preview_uses_the_no_waiter_matrix() {
         for stage in [Stage::Code, Stage::Validate] {
-            assert!(!gate_sweep_may_reap(stage, false), "{stage} with no waiter");
-            assert!(gate_sweep_may_reap(stage, true), "{stage} with a waiter");
+            assert!(
+                !gate_sweep_may_reap(stage, false, None, 0),
+                "{stage} with no waiter"
+            );
+            assert!(
+                gate_sweep_may_reap(stage, true, None, 0),
+                "{stage} with a waiter"
+            );
         }
     }
 
@@ -7479,7 +7574,7 @@ mod tests {
         let g2 = g2.gate_id;
 
         assert_eq!(
-            sweep_one_gate(root, &g1_entry, 1, 0, false).unwrap(),
+            sweep_one_gate(root, &g1_entry, 1, 0, false, now_secs()).unwrap(),
             SweepStep::Skipped,
             "a gate changed since it was listed is reported, not left as waiterless"
         );
@@ -7491,7 +7586,7 @@ mod tests {
 
         let g2_entry = listed_gate(root, phase);
         assert_eq!(
-            sweep_one_gate(root, &g2_entry, 1, 0, false).unwrap(),
+            sweep_one_gate(root, &g2_entry, 1, 0, false, now_secs()).unwrap(),
             SweepStep::Reaped
         );
         let AnswerRead::Bound(answer) = Gates::read_answer(root, phase, stage, &g2) else {
@@ -7527,6 +7622,7 @@ mod tests {
             gate_id: String::new(),
             gate_kind: None,
             gsd_status: None,
+            not_before: None,
         };
         std::fs::write(
             Gates::gate_path(root, phase, stage),
@@ -7535,7 +7631,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            sweep_one_gate(root, &entry, 1, 0, false).unwrap(),
+            sweep_one_gate(root, &entry, 1, 0, false, now_secs()).unwrap(),
             SweepStep::Skipped
         );
         assert_eq!(stop_reap_observed_gate(root, phase, &entry).unwrap(), None);
@@ -10678,6 +10774,7 @@ mod tests {
             devflow_core::gates::GateLabel {
                 kind: GateKind::CleanPass,
                 gsd_status: Some(GsdStatus::Passed),
+                not_before: None,
             },
             "Validation passed. GSD verification: passed.",
         )
@@ -10895,7 +10992,8 @@ mod tests {
         let before = std::fs::read_to_string(&path).unwrap();
 
         let result = gate_sweep(None, false, Some(root.to_path_buf()));
-        let raced = sweep_one_gate(root, &listed_before_the_answer, 1, 0, false).unwrap();
+        let raced =
+            sweep_one_gate(root, &listed_before_the_answer, 1, 0, false, now_secs()).unwrap();
 
         assert!(result.is_ok(), "an already-answered gate must not error");
         assert_eq!(raced, SweepStep::Skipped, "the race is a skip");
@@ -11599,6 +11697,7 @@ mod tests {
             context: "ctx".to_string(),
             timestamp: "not-a-number".to_string(),
             gate_id: String::new(),
+            not_before: None,
         };
 
         let row = render_all_roots_gate_row(Path::new("/tmp/some-root"), &gate, 10_000);

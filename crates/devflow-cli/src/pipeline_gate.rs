@@ -707,6 +707,7 @@ fn open_and_await(
                     gate_id: gate_id.to_string(),
                     gate_kind: Some(label.kind),
                     gsd_status: label.gsd_status,
+                    not_before: label.not_before,
                 });
                 let answer = crate::pipeline_outcomes::route_answer(
                     project_root,

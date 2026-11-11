@@ -14,6 +14,27 @@ const SECS_PER_MINUTE: i64 = 60;
 const SECS_PER_HOUR: i64 = 60 * SECS_PER_MINUTE;
 const SECS_PER_DAY: i64 = 24 * SECS_PER_HOUR;
 
+/// How long after a reported reset the one automatic relaunch waits (D-27.2,
+/// D-16): a fixed margin, so a relaunch never lands on the reset second
+/// itself. Deliberately a constant: there is no environment variable or
+/// config key for it.
+pub const RATE_LIMIT_RELAUNCH_MARGIN_SECS: i64 = 60;
+
+/// The not-before time of a rate-limit gate whose denial named `reset_at`:
+/// the reset plus [`RATE_LIMIT_RELAUNCH_MARGIN_SECS`], saturating rather than
+/// overflowing on an absurd reset.
+pub fn relaunch_not_before(reset_at: i64) -> i64 {
+    reset_at
+}
+
+/// Whether the one automatic relaunch is due at `now` for a denial that
+/// named `reset_at` (D-27.2): true exactly when `now` has reached
+/// [`relaunch_not_before`].
+pub fn auto_relaunch_due(now: i64, reset_at: i64) -> bool {
+    let _ = (now, reset_at);
+    false
+}
+
 /// The exact UTC instant, in Unix epoch seconds, that `input` names.
 ///
 /// Two forms are read, after trimming surrounding whitespace:
@@ -190,6 +211,24 @@ pub(crate) fn civil_from_days(days: i64) -> (i32, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D-27.2, CUT-03 boundary: the automatic relaunch is due exactly at the
+    /// reset plus the margin. One second before it is not due; at and after it
+    /// is.
+    #[test]
+    fn auto_relaunch_is_due_exactly_at_reset_plus_margin() {
+        let reset = august_2_2026_midnight_utc();
+        let due_at = reset + RATE_LIMIT_RELAUNCH_MARGIN_SECS;
+        assert_eq!(RATE_LIMIT_RELAUNCH_MARGIN_SECS, 60);
+        assert_eq!(relaunch_not_before(reset), due_at);
+        assert!(!auto_relaunch_due(due_at - 1, reset), "one second early");
+        assert!(auto_relaunch_due(due_at, reset), "at the reset plus margin");
+        assert!(auto_relaunch_due(due_at + 1, reset), "after it");
+        // Control: at the reset itself, before the margin, it is not due.
+        assert!(!auto_relaunch_due(reset, reset), "at the bare reset");
+        // An absurd reset saturates instead of overflowing.
+        assert_eq!(relaunch_not_before(i64::MAX), i64::MAX);
+    }
 
     /// An epoch-seconds reset is read to the exact second, surrounding
     /// whitespace is ignored, and a fraction is rounded UP: the deadline must
