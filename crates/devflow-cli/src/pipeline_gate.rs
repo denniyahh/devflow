@@ -88,6 +88,8 @@ pub(crate) fn transition(
             // fix pass's note goes with it.
             s.code_fix = None;
             s.code_fix_note = None;
+            // U7: the run leaves the stage, so the stage's relaunch note goes.
+            s.relaunch_note = None;
         })?;
         events::emit(
             project_root,
@@ -126,6 +128,8 @@ pub(crate) fn transition(
         // plain Code pass never replays a stale one. Its note goes with it.
         s.code_fix = None;
         s.code_fix_note = None;
+        // U7: a relaunch note is for the stage being left, never the next one.
+        s.relaunch_note = None;
     })?;
     events::emit(
         project_root,
@@ -184,6 +188,7 @@ pub(crate) fn finish_run(project_root: &Path, state: &mut State) -> Result<(), C
         s.gate_pending = false;
         s.code_fix = None;
         s.code_fix_note = None;
+        s.relaunch_note = None;
     })?;
     registry::deregister(project_root, state.phase);
     events::emit(
@@ -304,6 +309,10 @@ pub(crate) fn prepare_loop_back_to_code(
         // (failover, resume, re-drive) replays it rather than plain execute.
         s.code_fix = Some(fix);
         s.code_fix_note = note.clone();
+        // U7: this leaves Validate without `transition`, so it clears the
+        // relaunch note itself; the prompt below is built with none, so the
+        // prompt and the persisted state agree.
+        s.relaunch_note = None;
     })?;
     events::emit(
         project_root,
