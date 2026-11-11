@@ -218,9 +218,10 @@ pub(crate) fn ensure_base_is_a_local_branch(
 /// process started":
 ///
 /// 1. **State removal** — `workflow::clear_state` deletes
-///    `.devflow/state-{NN}.json` (an abort does), so the next start for this
-///    phase finds nothing to carry. No code here. A finished run keeps its
-///    state.
+///    `.devflow/state-{NN}.json` (an abort does, and so does `cleanup --force`
+///    with the run's worktree), so the next start for this phase finds nothing
+///    to carry. No code here. A finished run keeps its state, so a `start` over
+///    it carries the total (the replace notice names the finished run).
 /// 2. **Operator approval at the ceiling gate** — `handle_validate_outcome`
 ///    zeroes the total when a human advances or loops back AND
 ///    `mode::phase_failure_ceiling_reached` is true.
@@ -231,13 +232,45 @@ pub(crate) fn fresh_state_carrying_phase_failures(
     mode: Mode,
 ) -> State {
     let mut state = State::new(phase, agent, mode, project_root.to_path_buf());
-    let (carried, warning) =
-        carried_phase_failures(phase, workflow::load_state(project_root, phase));
+    let loaded = workflow::load_state(project_root, phase);
+    if let Some(notice) = replaced_state_notice(phase, &loaded) {
+        println!("{notice}");
+    }
+    let (carried, warning) = carried_phase_failures(phase, loaded);
     state.phase_validate_failures = carried;
     if let Some(warning) = warning {
         println!("{warning}");
     }
     state
+}
+
+/// The line `start` prints when the phase already has a state it replaces (OPS-02,
+/// D-35), naming which: a finished run, a stopped run with its recorded stop
+/// reason, or a state file that does not load. `None` for no state, or for a
+/// state whose run has not stopped (the live-run guard decides that case).
+/// Printed where `start` first loads the state, so `--dry-run` shows it too.
+fn replaced_state_notice(
+    phase: PhaseId,
+    loaded: &Result<State, workflow::WorkflowError>,
+) -> Option<String> {
+    match loaded {
+        Ok(state) if state.stopped => {
+            let kind = if state.finished {
+                "finished"
+            } else {
+                "stopped"
+            };
+            Some(format!(
+                "note: phase {phase}: this start replaces the state of a {kind} run (stop reason: \
+                 {})",
+                state.stop_reason.as_deref().unwrap_or("none recorded")
+            ))
+        }
+        Ok(_) | Err(workflow::WorkflowError::MissingState(_)) => None,
+        Err(err) => Some(format!(
+            "note: phase {phase}: this start replaces an unreadable state ({err})"
+        )),
+    }
 }
 
 /// The three-way carry-forward decision, split from its I/O so each case can
@@ -1774,7 +1807,7 @@ fn fallback_line(state: &State) -> String {
         Some(agent) if state.fallback_consumed => {
             format!("  fallback: spent ({agent} already took over this run)")
         }
-        Some(agent) => format!("  fallback: armed ({agent} takes over on a rate limit)"),
+        Some(agent) => format!("  fallback: armed ({agent} takes over if Code is rate-limited)"),
         None => "  fallback: none".to_string(),
     }
 }

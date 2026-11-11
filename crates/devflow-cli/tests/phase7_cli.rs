@@ -872,7 +872,9 @@ fn start_says_when_it_replaces_a_finished_or_stale_state() {
     const FINISHED: &str = "replaces the state of a finished run";
     const STOPPED: &str = "replaces the state of a stopped run";
     const UNREADABLE: &str = "replaces an unreadable state";
-    let dry_run = |prior: Option<&dyn Fn(&Path, PhaseId)>| -> String {
+    /// What a case writes before the dry run: a prior state, or nothing.
+    type Prior<'a> = Option<&'a dyn Fn(&Path, PhaseId)>;
+    let dry_run = |prior: Prior| -> String {
         let home = common::HermeticHome::new();
         let repo = tempfile::tempdir().unwrap();
         let root = repo.path();
