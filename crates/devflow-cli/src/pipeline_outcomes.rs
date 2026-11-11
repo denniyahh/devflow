@@ -2018,7 +2018,8 @@ fn stage_failure_context(stage: Stage, lead: &str, reason: Option<String>) -> St
 
 /// The gate context for a failed non-Validate stage. When the run's recorded delivery
 /// canary already refuses its agent, both non-abort answers stop the run instead of
-/// relaunching ([`relaunch_failed_stage`]), so the context names the way on. It leads,
+/// relaunching (the routers' relaunch-refused step, [`refuse_relaunch`]), so the context
+/// names the way on. It leads,
 /// before the reason, because the notify hook carries this context to an operator who
 /// decides from it alone, and the banner and `gate list` show only its start.
 pub(crate) fn failure_gate_context(state: &State, stage: Stage, reason: Option<String>) -> String {
@@ -2048,8 +2049,10 @@ pub(crate) fn handle_stage_failure(
 }
 
 /// Fire the never-silent gate for a failed `stage` with `context` and act on
-/// its answer: approve or a plain reject relaunches the stage
-/// ([`relaunch_failed_stage`]), an abort answer ends the run.
+/// its answer through [`dispatch_answer`]: the routers' stage-failure family
+/// retries the stage on an approve, relaunches it with the note on a reject,
+/// or stops the run when the recorded canary refuses its agent (D-39); an
+/// abort ends the run.
 fn answer_stage_failure_gate(
     project_root: &Path,
     state: &mut State,
