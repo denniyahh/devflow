@@ -698,7 +698,7 @@ pub fn list_states(project_root: &Path) -> Vec<State> {
 
 /// [`list_states`], writing the line for each skipped state file to `err`: a
 /// skipped file is a phase missing from `status`, `cleanup` and `gate list`.
-fn list_states_to(project_root: &Path, _err: &mut dyn std::io::Write) -> Vec<State> {
+fn list_states_to(project_root: &Path, err: &mut dyn std::io::Write) -> Vec<State> {
     let mut states = Vec::new();
     let Ok(entries) = std::fs::read_dir(devflow_dir(project_root)) else {
         return states;
@@ -714,7 +714,15 @@ fn list_states_to(project_root: &Path, _err: &mut dyn std::io::Write) -> Vec<Sta
             .and_then(|c| Ok(serde_json::from_str::<State>(&c)?))
         {
             Ok(state) => states.push(state),
-            Err(err) => warn!("skipping unreadable state file {name}: {err}"),
+            Err(error) => {
+                warn!("skipping unreadable state file {name}: {error}");
+                let _ = writeln!(
+                    err,
+                    "warning: skipping the unreadable state file {} ({error}); its phase is \
+                     left out of this listing",
+                    entry.path().display()
+                );
+            }
         }
     }
     states.sort_by_key(|s| s.phase);

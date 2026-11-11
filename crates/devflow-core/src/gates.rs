@@ -695,7 +695,7 @@ impl Gates {
     /// can report as a stray process.
     fn live_waiter_holders_to(
         project_root: &Path,
-        _err: &mut dyn std::io::Write,
+        err: &mut dyn std::io::Write,
     ) -> Vec<(u32, Option<u64>)> {
         let Ok(entries) = std::fs::read_dir(Self::dir(project_root)) else {
             return Vec::new();
@@ -709,10 +709,18 @@ impl Gates {
             match liveness::live_holder(&path) {
                 Ok(Some(holder)) => holders.push(holder),
                 Ok(None) => {}
-                Err(error) => warn!(
-                    "could not read the waiter registration {}: {error}",
-                    path.display()
-                ),
+                Err(error) => {
+                    warn!(
+                        "could not read the waiter registration {}: {error}",
+                        path.display()
+                    );
+                    let _ = writeln!(
+                        err,
+                        "warning: could not read the waiter registration {} ({error}); its \
+                         holder is not counted as a live waiter",
+                        path.display()
+                    );
+                }
             }
         }
         holders
@@ -754,7 +762,7 @@ impl Gates {
         gate: &GateId,
         timeout_secs: u64,
         cancel: impl Fn() -> bool,
-        _err: &mut dyn std::io::Write,
+        err: &mut dyn std::io::Write,
     ) -> AwaitOutcome {
         let unreadable = RepeatLimit::default();
         let end = backoff_wait(Duration::from_secs(timeout_secs), cancel, || {
@@ -770,6 +778,11 @@ impl Gates {
                     if unreadable.allow(std::time::Instant::now()) {
                         warn!(
                             "could not read gate answer {}: {error}; still waiting",
+                            path.display()
+                        );
+                        let _ = writeln!(
+                            err,
+                            "warning: could not read the gate answer {} ({error}); still waiting",
                             path.display()
                         );
                     }
@@ -1347,7 +1360,7 @@ impl Gates {
     /// [`Self::list_open`], writing the line for each gate file it cannot list
     /// to `err`: a gate left out of the listing is one the operator cannot see
     /// to answer.
-    fn list_open_to(project_root: &Path, _err: &mut dyn std::io::Write) -> Vec<OpenGate> {
+    fn list_open_to(project_root: &Path, err: &mut dyn std::io::Write) -> Vec<OpenGate> {
         let mut open = Vec::new();
         let Ok(entries) = std::fs::read_dir(Self::dir(project_root)) else {
             return open;
@@ -1363,14 +1376,20 @@ impl Gates {
             if after_phase.contains('.') {
                 continue;
             }
-            let Ok(contents) = std::fs::read_to_string(entry.path()) else {
-                continue;
-            };
-            let gate = match serde_json::from_str::<GateFile>(&contents) {
+            let gate = match std::fs::read_to_string(entry.path())
+                .map_err(|error| error.to_string())
+                .and_then(|contents| {
+                    serde_json::from_str::<GateFile>(&contents).map_err(|error| error.to_string())
+                }) {
                 Ok(gate) => gate,
                 Err(error) => {
                     warn!(
                         "not listing {} as an open gate: {error}",
+                        entry.path().display()
+                    );
+                    let _ = writeln!(
+                        err,
+                        "warning: not listing {} as an open gate ({error})",
                         entry.path().display()
                     );
                     continue;
@@ -1702,7 +1721,7 @@ fn run_notify_command_to(
     stage: Stage,
     context: &str,
     unexpected: bool,
-    _err: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
 ) {
     let output = Command::new("sh")
         .arg("-c")
@@ -1719,11 +1738,19 @@ fn run_notify_command_to(
         Ok(out) if out.status.success() => {
             debug!("gate notify hook ran successfully");
         }
-        Ok(out) => warn!(
-            "gate notify hook exited with status {:?}: {}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stderr)
-        ),
+        Ok(out) => {
+            let status = out
+                .status
+                .code()
+                .map_or_else(|| "a signal".to_string(), |code| code.to_string());
+            let hook_stderr = String::from_utf8_lossy(&out.stderr);
+            warn!("gate notify hook exited with status {status}: {hook_stderr}");
+            let _ = writeln!(
+                err,
+                "warning: the gate notify hook exited with status {status}: {}",
+                hook_stderr.trim()
+            );
+        }
         Err(err) => warn!("gate notify hook could not be spawned: {err}"),
     }
 }

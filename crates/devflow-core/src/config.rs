@@ -159,7 +159,7 @@ pub fn load_config(project_root: &Path) -> DevflowConfig {
 /// [`load_config`], writing its operator-facing warning lines to `err`. With
 /// tracing off by default, those lines are the operator's only sign that the
 /// file's settings were ignored.
-fn load_config_to(project_root: &Path, _err: &mut dyn std::io::Write) -> DevflowConfig {
+fn load_config_to(project_root: &Path, err: &mut dyn std::io::Write) -> DevflowConfig {
     let path = project_root.join("devflow.toml");
     let contents = match std::fs::read_to_string(&path) {
         Ok(contents) => contents,
@@ -168,6 +168,11 @@ fn load_config_to(project_root: &Path, _err: &mut dyn std::io::Write) -> Devflow
         }
         Err(error) => {
             tracing::warn!(path = %path.display(), %error, "failed to read devflow config; using defaults");
+            let _ = writeln!(
+                err,
+                "warning: could not read {} ({error}); using the built-in settings instead",
+                path.display()
+            );
             return DevflowConfig::default();
         }
     };
@@ -176,6 +181,12 @@ fn load_config_to(project_root: &Path, _err: &mut dyn std::io::Write) -> Devflow
         Ok(config) => config,
         Err(error) => {
             tracing::warn!(path = %path.display(), %error, "failed to parse devflow config; using defaults");
+            let _ = writeln!(
+                err,
+                "warning: {} does not parse ({}); using the built-in settings instead",
+                path.display(),
+                error.message()
+            );
             DevflowConfig::default()
         }
     }
@@ -212,7 +223,7 @@ pub fn capture_retention(project_root: &Path) -> usize {
 fn capture_retention_with(
     value: Option<String>,
     project_root: &Path,
-    _err: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
 ) -> usize {
     if let Some(value) = value {
         match value.parse::<usize>() {
@@ -223,10 +234,15 @@ fn capture_retention_with(
                     %error,
                     "invalid DEVFLOW_CAPTURE_RETENTION; using devflow.toml or default"
                 );
+                let _ = writeln!(
+                    err,
+                    "warning: DEVFLOW_CAPTURE_RETENTION={value:?} is not a count ({error}); \
+                     using devflow.toml or the default"
+                );
             }
         }
     }
-    load_config_to(project_root, _err).capture_retention
+    load_config_to(project_root, err).capture_retention
 }
 
 /// Resolve external verification with `DEVFLOW_EXTERNAL_VERIFY_ENABLED`
@@ -358,7 +374,7 @@ pub fn git_flow_for_project(project_root: &Path) -> GitFlowConfig {
 /// fallback warning line to `err`.
 fn git_flow_from(
     resolved: Result<ResolvedBaseBranch, String>,
-    _err: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
 ) -> GitFlowConfig {
     match resolved {
         Ok(resolved) => GitFlowConfig {
@@ -369,6 +385,11 @@ fn git_flow_from(
             tracing::warn!(
                 %error,
                 "invalid base branch configuration; using the built-in git-flow defaults"
+            );
+            let _ = writeln!(
+                err,
+                "warning: the base branch configuration is invalid ({error}); using `{DEVELOP}` \
+                 as the trunk"
             );
             GitFlowConfig::default()
         }
@@ -458,7 +479,7 @@ pub fn fallback_agent(project_root: &Path) -> Result<Option<AgentKind>, String> 
 /// [`fallback_agent`], writing the unreadable-file warning line to `err`.
 fn fallback_agent_to(
     project_root: &Path,
-    _err: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
 ) -> Result<Option<AgentKind>, String> {
     let path = project_root.join("devflow.toml");
     let contents = match std::fs::read_to_string(&path) {
@@ -466,6 +487,11 @@ fn fallback_agent_to(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             tracing::warn!(path = %path.display(), %error, "failed to read devflow config; no fallback_agent key read");
+            let _ = writeln!(
+                err,
+                "warning: could not read {} ({error}); no `fallback_agent` was read from it",
+                path.display()
+            );
             return Ok(None);
         }
     };
