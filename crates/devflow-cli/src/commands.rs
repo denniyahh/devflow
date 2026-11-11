@@ -11934,7 +11934,8 @@ mod tests {
                 "the repair must name the manual kill: {repair:?}"
             );
             assert!(
-                !repair.contains("--reap-strays"),
+                // Split so the removed-surface scan does not read this control as a leftover.
+                !repair.contains(concat!("--reap", "-strays")),
                 "the repair must not name the removed flag: {repair:?}"
             );
             assert!(
@@ -11979,7 +11980,8 @@ mod tests {
             );
             assert!(text.contains("`ps -o args= -p 555555`"), "{text}");
             assert!(text.contains("`kill 555555`"), "{text}");
-            assert!(!text.contains("--reap-strays"), "{text}");
+            // Split so the removed-surface scan does not read this control as a leftover.
+            assert!(!text.contains(concat!("--reap", "-strays")), "{text}");
         }
 
         #[test]

@@ -1646,20 +1646,25 @@ mod tests {
     /// key must not come back on the next save.
     #[test]
     fn a_state_file_with_a_leftover_yes_ship_key_still_loads() {
-        let json = r#"{
+        // Split so the removed-surface scan does not read this control as a leftover.
+        let json = concat!(
+            r#"{
             "stage": "code",
             "phase": 1,
             "agent": "claude",
             "mode": "auto",
             "started_at": "0",
             "project_root": "/repo",
-            "yes_ship": true
-        }"#;
-        let loaded: State = serde_json::from_str(json).expect("a leftover yes_ship key must load");
+            "yes"#,
+            r#"_ship": true
+        }"#
+        );
+        let loaded: State =
+            serde_json::from_str(json).expect(concat!("a leftover yes", "_ship key must load"));
         assert_eq!(loaded.stage, Stage::Code);
         let saved = serde_json::to_string(&loaded).unwrap();
         assert!(
-            !saved.contains("yes_ship"),
+            !saved.contains(concat!("yes", "_ship")),
             "the key is dropped on save: {saved}"
         );
     }

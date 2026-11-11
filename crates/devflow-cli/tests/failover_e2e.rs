@@ -413,7 +413,11 @@ impl Rig {
     fn cron_file(&self) -> PathBuf {
         self.root
             .join(".devflow")
-            .join(format!("cron-instructions-{}.json", self.phase.padded()))
+            // Split so the removed-surface scan does not read this control as a leftover.
+            .join(format!(
+                concat!("cron-", "instructions-{}.json"),
+                self.phase.padded()
+            ))
     }
 }
 
@@ -843,7 +847,9 @@ fn a_rate_limited_claude_run_without_a_fallback_waits_at_a_gate() {
 
     assert!(
         !rig.cron_file().exists(),
-        "no cron-instructions file is written; events:\n{log}"
+        // Split so the removed-surface scan does not read this control as a leftover.
+        concat!("no cron-", "instructions file is written; events:\n{}"),
+        log
     );
     assert!(
         rig.events_named("rate_limit_resume_scheduled").is_empty(),

@@ -2180,7 +2180,7 @@ const REMOVED_SURFACE_TOKENS: &[&str] = &[
     concat!("Stage::", "Ship"),
     concat!("StageIntent::", "Define"),
     concat!("StageIntent::", "Ship"),
-    concat!("devflow ", "ship"),
+    concat!("devflow s", "hip"),
     concat!("devflow ", "parallel"),
     concat!("devflow ", "evidence"),
     concat!("devflow ", "reference"),
@@ -2193,7 +2193,7 @@ const REMOVED_SURFACE_TOKENS: &[&str] = &[
     concat!("SHIP_REVIEW", "_ANGLES"),
     concat!("DEVFLOW_FOREGROUND_GATE", "_TIMEOUT_SECS"),
     concat!("DEVFLOW_CHECKOUT_LOCK", "_TIMEOUT_SECS"),
-    concat!("ship", "_evidence"),
+    concat!("shi", "p_evidence"),
 ];
 
 /// Removed stage names, matched in Rust only as a whole string literal (and in
@@ -2204,8 +2204,127 @@ const REMOVED_STAGE_LITERALS: &[&str] = &[concat!("sh", "ip"), concat!("def", "i
 /// Every place a removed-surface token survives in `files`, one finding per
 /// line as `path:line: removed surface <tokens>: <text>`, sorted by path then
 /// line.
-fn removed_surface_findings(_files: &[(PathBuf, String)]) -> Vec<String> {
-    Vec::new()
+fn removed_surface_findings(files: &[(PathBuf, String)]) -> Vec<String> {
+    let root = workspace_root();
+    let mut findings: Vec<(PathBuf, usize, String)> = Vec::new();
+    for (path, text) in files {
+        let extension = path.extension().and_then(|ext| ext.to_str());
+        let is_rust = extension == Some("rs");
+        let scanned = match extension {
+            Some("rs") => strip_rust_comments(text),
+            Some("md") => blank_html_comments(text),
+            _ => text.clone(),
+        };
+        let lines: Vec<&str> = scanned.lines().collect();
+        let mut hits: std::collections::BTreeMap<usize, Vec<String>> = Default::default();
+        let mut record = |line: usize, shown: String| {
+            let tokens = hits.entry(line).or_default();
+            if !tokens.contains(&shown) {
+                tokens.push(shown);
+            }
+        };
+        for (index, line) in lines.iter().enumerate() {
+            for token in REMOVED_SURFACE_TOKENS {
+                if holds_bounded_token(line, token) {
+                    record(index + 1, format!("`{token}`"));
+                }
+            }
+            if !is_rust {
+                for value in REMOVED_STAGE_LITERALS {
+                    let quoted = format!("\"{value}\"");
+                    if line.contains(&quoted) {
+                        record(index + 1, format!("`{quoted}`"));
+                    }
+                }
+            }
+        }
+        if is_rust {
+            for (line, value) in whole_literal_lines(&scanned, REMOVED_STAGE_LITERALS) {
+                record(line, format!("`\"{value}\"`"));
+            }
+        }
+        let shown_path = path.strip_prefix(&root).unwrap_or(path);
+        for (line, tokens) in hits {
+            let text = lines.get(line - 1).copied().unwrap_or_default().trim();
+            findings.push((
+                path.clone(),
+                line,
+                format!(
+                    "{}:{line}: removed surface {}: {text}",
+                    shown_path.display(),
+                    tokens.join(", ")
+                ),
+            ));
+        }
+    }
+    findings.sort();
+    findings
+        .into_iter()
+        .map(|(_, _, finding)| finding)
+        .collect()
+}
+
+/// True when `token` occurs in `line` with no identifier character on either
+/// side. A letter right after a backslash is an escape (`\n` inside a
+/// literal), not part of the name.
+fn holds_bounded_token(line: &str, token: &str) -> bool {
+    line.match_indices(token).any(|(start, _)| {
+        let mut before = line[..start].chars().rev();
+        let starts_name = match before.next() {
+            None => true,
+            Some(ch) => !is_identifier_char(ch) || before.next() == Some('\\'),
+        };
+        let ends_name = line[start + token.len()..]
+            .chars()
+            .next()
+            .is_none_or(|ch| !is_identifier_char(ch));
+        starts_name && ends_name
+    })
+}
+
+/// `text` with every `<!--` … `-->` span blanked except its newlines (an
+/// unterminated one runs to the end), so line numbers still match the input.
+fn blank_html_comments(text: &str) -> String {
+    const OPEN: &str = "<!--";
+    const CLOSE: &str = "-->";
+    let mut kept = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find(OPEN) {
+        kept.push_str(&rest[..open]);
+        let comment = &rest[open..];
+        let end = comment[OPEN.len()..]
+            .find(CLOSE)
+            .map_or(comment.len(), |close| OPEN.len() + close + CLOSE.len());
+        kept.extend(comment[..end].chars().filter(|&ch| ch == '\n'));
+        rest = &comment[end..];
+    }
+    kept.push_str(rest);
+    kept
+}
+
+/// The 1-based lines of comment-stripped Rust `code` holding a string literal
+/// whose whole value is one of `values`, each with that value.
+fn whole_literal_lines<'a>(code: &str, values: &[&'a str]) -> Vec<(usize, &'a str)> {
+    let chars: Vec<char> = code.chars().collect();
+    let mut found = Vec::new();
+    let mut line = 1;
+    let mut index = 0;
+    while index < chars.len() {
+        if let Some((open, end, close)) = literal_at(&chars, index) {
+            let value: String = chars[index + open..end - close].iter().collect();
+            if let Some(hit) = values.iter().find(|candidate| **candidate == value) {
+                found.push((line, *hit));
+            }
+            line += chars[index..end].iter().filter(|&&ch| ch == '\n').count();
+            index = end;
+        } else {
+            if chars[index] == '\n' {
+                line += 1;
+            }
+            index += 1;
+        }
+    }
+    found
 }
 
 /// One real line per token, copied from the b8df457 tree with the token
@@ -2316,14 +2435,14 @@ fn no_removed_surface_literal_remains() {
     );
 
     // (b) Decoys: comments, longer names and prose are not findings.
-    let yes_ship = REMOVED_SURFACE_TOKENS[2];
+    let removed_key = REMOVED_SURFACE_TOKENS[2];
     let ship = REMOVED_STAGE_LITERALS[0];
     let define = REMOVED_STAGE_LITERALS[1];
     let rust_decoys = [
-        ["// ", yes_ship, ": bool,"].concat(),
+        ["// ", removed_key, ": bool,"].concat(),
         ["    /// ", REMOVED_SURFACE_TOKENS[10], " was removed"].concat(),
         ["let x = 1; /* ", REMOVED_SURFACE_TOKENS[21], " */"].concat(),
-        ["let ", yes_ship, "ment = 1;"].concat(),
+        ["let ", removed_key, "ment = 1;"].concat(),
         ["let membership = \"", ship, "ped\";"].concat(),
         ["let note = \"--until ", ship, " is refused\";"].concat(),
         ["fn ", ship, "(stage: &str) {}"].concat(),
@@ -2338,9 +2457,9 @@ fn no_removed_surface_literal_remains() {
     }
     let markdown_decoys = [
         ["<!-- ", REMOVED_SURFACE_TOKENS[13], " --phase 1 -->"].concat(),
-        ["<!--\n", yes_ship, "\n-->"].concat(),
+        ["<!--\n", removed_key, "\n-->"].concat(),
         ["The phase ", ship, "ped; ", ship, " membership."].concat(),
-        ["Set ", yes_ship, "ment to taste."].concat(),
+        ["Set ", removed_key, "ment to taste."].concat(),
         [define, " the interface before the plan."].concat(),
     ];
     for decoy in markdown_decoys {
@@ -2355,11 +2474,14 @@ fn no_removed_surface_literal_remains() {
     let unordered = vec![
         (
             PathBuf::from("b.rs"),
-            ["\n\nlet x = ", yes_ship, ";"].concat(),
+            ["\n\nlet x = ", removed_key, ";"].concat(),
         ),
-        (PathBuf::from("a.md"), ["\n\n\n\n", yes_ship, "\n"].concat()),
-        (PathBuf::from("a.md.txt"), [yes_ship, "\n"].concat()),
-        (PathBuf::from("a.md"), ["\n", yes_ship].concat()),
+        (
+            PathBuf::from("a.md"),
+            ["\n\n\n\n", removed_key, "\n"].concat(),
+        ),
+        (PathBuf::from("a.md.txt"), [removed_key, "\n"].concat()),
+        (PathBuf::from("a.md"), ["\n", removed_key].concat()),
     ];
     let ordered: Vec<String> = removed_surface_findings(&unordered)
         .iter()
