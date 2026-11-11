@@ -2342,13 +2342,14 @@ const MAX_CAUSE_TEXT_CHARS: usize = 160;
 /// is the clause's first segment, inside this same cap):
 /// `render_gate_context(.., max)` keeps the first `max - 39` characters of a
 /// longer text (39 is its truncation suffix). That happens twice: in
-/// `truncate_reason` (max 300), to the reason, which keeps 261 characters; and
-/// in the pending-gate banner and `gate list` (max 450, the CLI's display
-/// bound), to the whole gate context, which keeps 411. There the longest
-/// prefix, `[never-silent] `, the Validate stage-failure gate's way-on sentence
-/// and `stage validate failed: `, takes 171, leaving 240 for the reason.
-/// `idle timeout (` (14) + 200 + `): ` (3) = 217 ≤ 240 (and ≤ 261), so the
-/// clause closes inside both renderings for any cause within the field bounds.
+/// `truncate_reason` (max 4096, the CLI's stored bound), to the reason, which
+/// keeps 4057 characters; and in the pending-gate banner and `gate list` (max
+/// 450, the CLI's display bound), to the whole gate context, which keeps 411.
+/// There the longest prefix, `[never-silent] `, the Validate stage-failure
+/// gate's way-on sentence and `stage validate failed: `, takes 171, leaving 240
+/// for the reason. `idle timeout (` (14) + 200 + `): ` (3) = 217 ≤ 240 (and ≤
+/// 4057), so the clause closes inside both renderings for any cause within the
+/// field bounds.
 /// Public so the CLI can pin this budget to its display bound in a test.
 pub const MAX_IDLE_TIMEOUT_CLAUSE_CHARS: usize = 200;
 
