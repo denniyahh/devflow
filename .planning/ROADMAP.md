@@ -670,6 +670,48 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.224: Replace the Overloaded `--force` Flags With Named Actions (BACKLOG)
+
+**Found:** 2026-11-11, Phase 52 code review (CR-02, IN-03) and the operator's question "what is the purpose of the
+--force flags? ... is this compensating for poor design?". Operator decision the same day: close the data-loss path in
+Phase 52 (no `--force` deletes an unmerged phase branch), and file the redesign here.
+
+**What is wrong:** one `--force` per command authorises several unrelated destructive actions at once, and DevFlow's
+own messages route the operator through it as the normal path.
+- `devflow start --force`: removes and recreates an existing phase worktree from the base (discards uncommitted work),
+  deletes `feature/phase-NN` (before the Phase 52 fix: `git branch -D`), and, in the primary-checkout path, overrides
+  the "base is >50 commits ahead" refusal.
+- `devflow cleanup --force`: removes a stopped or finished run's kept worktree, removes one whose supervisor is stale
+  or unprobeable (its agent may still be alive), force-removes a dirty worktree, deletes the branch, and removes the
+  run's state file.
+- The routine path: `resume` refuses a finished run and names `devflow start`; `start` refuses because the worktree
+  exists and names `--force` ("recreates ... discarding what is in it", `commands::restart_verb`). A hand-run
+  `devflow advance` over a finished run names `devflow resume`, which refuses it (review IN-03,
+  `pipeline_launch.rs` ~L3646-3660).
+- In 3.x a finished run had shipped, so the branch was usually merged; in v4 a finished run ends at Validate and its
+  branch is the only copy of the work until close-out.
+
+**Fix shape (recommendation, not decided):**
+1. `start` over a finished or stopped phase reuses its worktree and branch (continue on it) instead of demanding
+   `--force`; `resume`, `advance` and `status` name that verb.
+2. One explicit discard verb (e.g. `devflow discard --phase N`) that lists exactly what it will remove (worktree,
+   uncommitted changes, state, branch) and refuses an unmerged branch unless the operator names it.
+3. A stale or unprobeable supervisor goes through `devflow stop`, which already ends orphaned runs; `cleanup` stops
+   offering `--force` for it.
+4. The base-behind refusal gets an override named for what it overrides, or is dropped.
+5. Remove both `--force` flags; `cleanup` removes only what is provably safe (merged, clean, no live run).
+
+**Interim fix already in Phase 52 (3f0714f):** `start --force` refuses over a phase branch with commits not in the
+base (worktree and no-worktree paths) and `cleanup --force` keeps such a branch, naming the delete command. Left by
+it: `start --force` still discards uncommitted files in a merged branch's worktree; the "replaces the state of a
+finished run" notice may print before the refusal (unchecked); the `--no-worktree` refusal's `git branch -D` hint
+fails if the main checkout has the branch checked out; no test exercises a non-default base.
+
+**Not established:** whether any operator workflow depends on `start --force` recreating a phase from scratch beyond
+the discard case above. Removing a verb is a CLI break (4.x major, or fold into 4.0.0 if not yet released).
+
+**Take it in:** the next phase after Phase 52 (v4 operator-surface work), before any external user.
+
 ### Phase 999.223: `stop_ends_a_launch_its_running_launcher_promotes_during_the_wait` Flakes on Its Liveness Check (BACKLOG)
 
 **Found:** 2026-11-11, Phase 52 plan 52-28, first full `cargo nextest run --workspace` (2010 tests, 1 failed). The test
