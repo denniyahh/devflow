@@ -1227,14 +1227,18 @@ fn fill_pending_approval(state: &mut State, approval: CheckpointApproval) {
     }
 }
 
-/// The context of the preflight gate for a refusal at `stage` of `phase`,
-/// with the refusal's `reason` capped by [`truncate_reason`].
+/// The context of the preflight gate for a refusal at `stage` of `phase`: the
+/// way-on sentence the routers render for a preflight gate (GATE-04, D-39),
+/// then the refusal's `reason` capped by [`truncate_reason`].
 pub(crate) fn preflight_gate_context(phase: PhaseId, stage: Stage, reason: &str) -> String {
-    let _ = phase;
-    format!(
-        "[never-silent] preflight failed for stage {stage}: {} — human review needed \
-         (retry, loop-to-code, or abort)",
-        truncate_reason(reason)
+    crate::pipeline_outcomes::lead_with_way_on(
+        GateKind::Preflight,
+        (phase, stage),
+        None,
+        &format!(
+            "[never-silent] preflight failed for stage {stage}: {}",
+            truncate_reason(reason)
+        ),
     )
 }
 
@@ -2304,6 +2308,18 @@ mod tests {
             "the refused reject, then the abort: {loopback_result:?}"
         );
         assert_eq!(gates.len(), 2, "the refused reject reopened the gate");
+        // GATE-04: the live preflight writer leads with the routers' sentence.
+        let sentence = crate::pipeline_outcomes::way_on_sentence(
+            GateKind::Preflight,
+            loopback_phase,
+            Stage::Code,
+            None,
+        );
+        let first = gates[0].0["context"].as_str().unwrap_or_default();
+        assert!(
+            first.starts_with(&format!("[never-silent] {sentence} preflight failed")),
+            "the preflight gate leads with its way on: {first}"
+        );
         let first_id =
             devflow_core::gates::GateId::parse(gates[0].0["gate_id"].as_str().unwrap()).unwrap();
         assert!(

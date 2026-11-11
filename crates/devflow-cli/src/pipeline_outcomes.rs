@@ -1218,7 +1218,9 @@ fn emit_verification_read(
 /// The context of a Validate gate of `kind`, and the one its `gate_fired`
 /// event carries. They differ only for a reader failure, whose detail stays
 /// out of the event. Every context but a reader failure's quotes GSD's status
-/// verbatim, and says `passed` only when GSD did (GATE-03).
+/// verbatim, and says `passed` only when GSD did (GATE-03). Both lead with the
+/// way-on sentence the routers render (GATE-04, C2); the cause after it names
+/// no answer.
 fn validate_gate_context(
     kind: GateKind,
     round: (AgentVerdict, &Evidence),
@@ -1227,18 +1229,25 @@ fn validate_gate_context(
     ceiling_gate: bool,
 ) -> (String, String) {
     let (verdict, evidence) = round;
+    let canary_refusal = recorded_canary_refusal(state);
+    let lead = |cause: &str| {
+        lead_with_way_on(
+            kind,
+            (state.phase, Stage::Validate),
+            canary_refusal.as_deref(),
+            cause,
+        )
+    };
     let report = match &evidence.read {
         Ok(report) => report,
         Err(failure) => {
-            let lead = format!(
+            let cause = format!(
                 "[never-silent] GSD verification could not be read at Validate ({})",
                 failure.label()
             );
-            let way_on = " — the run waits here: approving runs Validate again, rejecting \
-                          loops back to Code, `devflow gate abort` ends the run.";
             return (
-                format!("{lead}: {}{way_on}", truncate_reason(&failure.detail())),
-                format!("{lead}{way_on}"),
+                lead(&format!("{cause}: {}.", truncate_reason(&failure.detail()))),
+                lead(&format!("{cause}.")),
             );
         }
     };
@@ -1274,21 +1283,13 @@ fn validate_gate_context(
         message.push_str(" No Validate pass counts on this commit.");
     }
     message.push_str(match kind {
-        GateKind::GapsFound => {
-            " Approving closes the gaps inside the run: Plan runs `plan-phase --gaps`, then \
-             Code runs the gaps-only pass, then Validate runs again. `devflow gate abort` ends \
-             the run. Finishing over open gaps is not offered."
-        }
-        GateKind::ReverifyNeeded => {
-            " The report must be re-verified: approving or rejecting relaunches Code for the \
-             re-verify pass, which resumes execute-phase at the phase gates and re-runs the \
-             verifier."
-        }
-        GateKind::HumanNeeded => " GSD needs a human sign-off; approving runs Validate again.",
+        GateKind::ReverifyNeeded => " The report is out of date or was never written.",
+        GateKind::HumanNeeded => " GSD needs a human sign-off.",
         GateKind::DisagreementOverPassed | GateKind::DisagreementOverHumanNeeded => {
-            " The validate agent and GSD disagree; approving runs Validate again."
+            " The validate agent and GSD disagree."
         }
-        GateKind::CleanPass
+        GateKind::GapsFound
+        | GateKind::CleanPass
         | GateKind::AmbiguousVerdict
         | GateKind::FailureCap
         | GateKind::ReaderFailure
@@ -1303,26 +1304,17 @@ fn validate_gate_context(
     // predicate read once by the caller, never on "a gate fired".
     if ceiling_gate && clean {
         message.push_str(&format!(
-            " (This phase recorded {} Validate failure(s), at the per-phase ceiling of {} — that is why this gate fired. Answering it restarts the count.)",
+            " (This phase recorded {} Validate failure(s), at the per-phase ceiling of {} — that is why this gate fired. An answer that continues the run restarts the count.)",
             state.phase_validate_failures,
             mode::MAX_PHASE_VALIDATE_FAILURES
         ));
     } else if ceiling_gate && verdict != AgentVerdict::Ambiguous {
         message.push_str(&format!(
-            " The per-phase ceiling of {} is reached: this run is paused for a human, not aborted — approve to ship, reject to loop back for another pass, or abort.",
+            " The per-phase ceiling of {} is reached: this run is paused for a human, and an answer that continues the run restarts the count.",
             mode::MAX_PHASE_VALIDATE_FAILURES
         ));
     }
-    // GATE-04 (C2): the way on leads, rendered from the routers.
-    if kind == GateKind::CleanPass {
-        let canary_refusal = recorded_canary_refusal(state);
-        message = lead_with_way_on(
-            kind,
-            (state.phase, Stage::Validate),
-            canary_refusal.as_deref(),
-            &message,
-        );
-    }
+    let message = lead(&message);
     (message.clone(), message)
 }
 
@@ -1741,26 +1733,29 @@ fn reopen_verification_gate(
     let (kind, context, event_context) = match &evidence.read {
         Ok(report) => {
             let context = format!(
-                "GSD verification at the approve: {}. GSD still needs a human sign-off; \
-                 approving reads GSD again.",
+                "GSD verification, read again: {}. GSD still needs a human sign-off.",
                 gsd_status_name(report.status)
             );
             (GateKind::HumanNeeded, context.clone(), context)
         }
         Err(failure) => {
-            let lead = format!(
-                "[never-silent] GSD verification could not be read at the approve ({})",
+            let cause = format!(
+                "[never-silent] GSD verification could not be read again ({})",
                 failure.label()
             );
-            let way_on = " — the run waits here: approving reads GSD again, `devflow gate \
-                          abort` ends the run.";
             (
                 GateKind::ReaderFailure,
-                format!("{lead}: {}{way_on}", truncate_reason(&failure.detail())),
-                format!("{lead}{way_on}"),
+                format!("{cause}: {}.", truncate_reason(&failure.detail())),
+                format!("{cause}."),
             )
         }
     };
+    // GATE-04 (C2): the way on leads, rendered from the routers.
+    let canary_refusal = recorded_canary_refusal(state);
+    let lead = |cause: &str| {
+        lead_with_way_on(kind, (state.phase, stage), canary_refusal.as_deref(), cause)
+    };
+    let (context, event_context) = (lead(&context), lead(&event_context));
     let label = GateLabel {
         kind,
         gsd_status: evidence.status(),
@@ -1911,16 +1906,22 @@ pub(crate) fn handle_gaps_plan_outcome(
         Ok(true) => transition(project_root, state, Stage::Code),
         Ok(false) => {
             let ceiling_gate = record_validate_failure(project_root, state)?;
-            let mut context = format!(
+            let mut cause = format!(
                 "The gaps Plan pass wrote no gap-closure plan (`gap_closure: true`) newer than \
                  the phase's verification report, so there is nothing for the gaps-only pass to \
-                 execute. GSD verification: {}. Approving reruns the gaps Plan pass; `devflow \
-                 gate abort` ends the run.",
+                 execute. GSD verification: {}.",
                 gsd_status_name(GsdStatus::GapsFound)
             );
             if ceiling_gate {
-                context.push_str(&phase_ceiling_clause(state.phase_validate_failures));
+                cause.push_str(&phase_ceiling_clause(state.phase_validate_failures));
             }
+            let canary_refusal = recorded_canary_refusal(state);
+            let context = lead_with_way_on(
+                GateKind::NoGapClosurePlan,
+                (state.phase, Stage::Plan),
+                canary_refusal.as_deref(),
+                &cause,
+            );
             open_verification_gate(
                 project_root,
                 state,
@@ -1941,21 +1942,29 @@ pub(crate) fn handle_gaps_plan_outcome(
                 state.phase,
                 failure.detail()
             );
-            let lead = format!(
+            let cause = format!(
                 "[never-silent] the gaps Plan post-check could not tell whether a gap-closure \
                  plan was written ({})",
                 failure.label()
             );
-            let way_on = " — the run waits here: approving reruns the gaps Plan pass, \
-                          `devflow gate abort` ends the run.";
+            let canary_refusal = recorded_canary_refusal(state);
+            let lead = |cause: &str| {
+                lead_with_way_on(
+                    GateKind::ReaderFailure,
+                    (state.phase, Stage::Plan),
+                    canary_refusal.as_deref(),
+                    cause,
+                )
+            };
+            let (context, event_context) = (
+                lead(&format!("{cause}: {}.", truncate_reason(&failure.detail()))),
+                lead(&format!("{cause}.")),
+            );
             open_verification_gate(
                 project_root,
                 state,
                 (Stage::Plan, GateKind::ReaderFailure.into()),
-                (
-                    &format!("{lead}: {}{way_on}", truncate_reason(&failure.detail())),
-                    &format!("{lead}{way_on}"),
-                ),
+                (&context, &event_context),
                 false,
             )
         }
@@ -1968,8 +1977,8 @@ pub(crate) fn handle_gaps_plan_outcome(
 fn phase_ceiling_clause(phase_validate_failures: u32) -> String {
     format!(
         " This phase has counted {phase_validate_failures} failure(s), reaching its per-phase \
-         failure ceiling of {}: an answer that continues the run restarts the count, and \
-         `devflow gate abort` does not.",
+         failure ceiling of {}: an answer that continues the run restarts the count, and an \
+         answer that ends the run does not.",
         mode::MAX_PHASE_VALIDATE_FAILURES
     )
 }
@@ -2172,30 +2181,28 @@ pub(crate) fn render_gate_context(context: &str, max_chars: usize) -> String {
 /// the reason's length.
 fn stage_failure_context(stage: Stage, lead: &str, reason: Option<String>) -> String {
     format!(
-        "[never-silent] stage {stage} failed: {lead}{} — human review needed (retry, loop-to-code, or abort)",
+        "[never-silent] stage {stage} failed: {lead}{}",
         truncate_reason(&reason.unwrap_or_else(|| "no details available".into()))
     )
 }
 
-/// The gate context for a failed non-Validate stage. When the run's recorded delivery
-/// canary already refuses its agent, both non-abort answers stop the run instead of
-/// relaunching (the routers' relaunch-refused step, [`refuse_relaunch`]), so the context
-/// names the way on. It leads,
-/// before the reason, because the notify hook carries this context to an operator who
-/// decides from it alone, and the banner and `gate list` show only its start.
+/// The gate context for a failed stage: the way-on sentence the routers render
+/// for a stage-failure gate, then the cause (GATE-04, C2). When the run's
+/// recorded delivery canary already refuses its agent, both non-abort answers
+/// stop the run instead of relaunching (the routers' relaunch-refused step,
+/// [`refuse_relaunch`]), and the sentence, rendered from that same
+/// `canary_refusal` input, says so and names `devflow resume --phase N --agent
+/// <other>`. It leads, before the reason, because the notify hook carries this
+/// context to an operator who decides from it alone, and the banner and
+/// `gate list` show only its start.
 pub(crate) fn failure_gate_context(state: &State, stage: Stage, reason: Option<String>) -> String {
-    let lead = if recorded_canary_refusal(state).is_some() {
-        format!(
-            "a retry or loop-back will not relaunch under {agent} (its recorded delivery \
-             canary refuses it); answer the gate, then run `devflow resume --phase {phase} \
-             --agent <other>`. Cause: ",
-            agent = state.agent,
-            phase = state.phase,
-        )
-    } else {
-        String::new()
-    };
-    stage_failure_context(stage, &lead, reason)
+    let canary_refusal = recorded_canary_refusal(state);
+    lead_with_way_on(
+        GateKind::StageFailure,
+        (state.phase, stage),
+        canary_refusal.as_deref(),
+        &stage_failure_context(stage, "", reason),
+    )
 }
 
 /// Fire the never-silent failure gate with [`failure_gate_context`].
@@ -6436,8 +6443,15 @@ mod tests {
             let row = format!("until {until:?}");
             assert_eq!(gate["gate_kind"], "gaps_found", "{row}: {gate}");
             let context = gate["context"].as_str().expect("a gate context");
+            // GATE-03 holds for how the gate reports GSD's status, the cause
+            // after the way-on sentence; the sentence's finish rule names
+            // `passed` on every verification gate (U10).
+            let sentence = way_on_sentence(GateKind::GapsFound, phase, Stage::Validate, None);
+            let cause = context
+                .strip_prefix(&sentence)
+                .unwrap_or_else(|| panic!("{row}: the gate leads with its way on: {context}"));
             assert!(
-                context.contains("gaps_found") && !context.contains("passed"),
+                cause.contains("gaps_found") && !cause.contains("passed"),
                 "{row}: the gate names GSD's status and never says passed: {context}"
             );
             assert!(
