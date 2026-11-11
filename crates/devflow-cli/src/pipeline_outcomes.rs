@@ -437,8 +437,10 @@ pub(crate) enum Trigger<'a> {
     Approve(&'a Evidence),
     /// A reject of a verification gate, with its note.
     Reject(&'a str),
-    /// An abort.
-    #[allow(dead_code)] // Interim: the rule-6 property constructs it (52-29 Task 3).
+    /// An abort. The table's row for it is `End`; a production abort answer
+    /// goes straight to `abort` (`Answer::Abort`), so only the rule-6 property
+    /// asks the table about one.
+    #[cfg_attr(not(test), allow(dead_code))]
     Abort,
 }
 
@@ -8627,5 +8629,461 @@ mod tests {
         });
         assert_eq!(gate["gate_kind"], "stage_failure", "{gate}");
         assert!(gate.get("gsd_status").is_none(), "{gate}");
+    }
+
+    // ---- 52-29 Task 3 (D-45 rule 6): the table as a property ----
+
+    /// The trigger of one property input.
+    #[derive(Debug, Clone)]
+    enum PropTrigger {
+        AfterValidate(Mode),
+        Approve,
+        Reject(String),
+        Abort,
+    }
+
+    /// The tree of one property input (D-46).
+    #[derive(Debug, Clone)]
+    enum PropTree {
+        Clean,
+        Dirty(Vec<String>),
+        Failed,
+    }
+
+    /// One input of the rule-6 property: GSD's status (`None` for a reader
+    /// failure), the recorded PASS head, the current HEAD (`None` for a failed
+    /// read), the tree, the trigger, the gate's kind and the run's recorded
+    /// canary refusal.
+    #[derive(Debug, Clone)]
+    struct PropInput {
+        status: Option<GsdStatus>,
+        recorded: Option<String>,
+        current: Option<String>,
+        tree: PropTree,
+        trigger: PropTrigger,
+        kind: Option<GateKind>,
+        canary: Option<String>,
+    }
+
+    impl PropInput {
+        /// The evidence `read_evidence`'s pure part builds from this input.
+        fn evidence(&self) -> Evidence {
+            let read = match self.status {
+                Some(status) => Ok(StatusReport {
+                    status,
+                    route: String::new(),
+                    next_action: None,
+                    moved_files: Vec::new(),
+                }),
+                None => Err(EvidenceFailure::HeadRead("a planted reader failure".into())),
+            };
+            let tree = match &self.tree {
+                PropTree::Clean => TreeRead::Clean,
+                PropTree::Dirty(paths) => TreeRead::Dirty(paths.clone()),
+                PropTree::Failed => TreeRead::Failed("a planted tree failure".into()),
+            };
+            evidence_from_reads(
+                read,
+                self.recorded.as_deref(),
+                self.current.as_deref().ok_or("a planted HEAD failure"),
+                &tree,
+            )
+        }
+
+        /// Whether the PASS is on HEAD, spelled independently of
+        /// `evidence_from_reads`: the recorded head equals a readable current
+        /// HEAD over a clean tree.
+        fn pass_on_head(&self) -> bool {
+            matches!(self.tree, PropTree::Clean)
+                && self.current.is_some()
+                && self.recorded == self.current
+        }
+
+        /// The gate file the routers see.
+        fn gate(&self) -> GateFile {
+            parity_gate(PhaseId::new(1), Stage::Validate, self.kind)
+        }
+    }
+
+    /// The property's strategy over every input class.
+    fn prop_inputs() -> impl proptest::strategy::Strategy<Value = PropInput> {
+        use proptest::prelude::*;
+        let hex = || "[0-9a-f]{40}";
+        let status = prop_oneof![
+            Just(Some(GsdStatus::Passed)),
+            Just(Some(GsdStatus::GapsFound)),
+            Just(Some(GsdStatus::HumanNeeded)),
+            Just(Some(GsdStatus::Stale)),
+            Just(Some(GsdStatus::Missing)),
+            Just(None),
+        ];
+        let heads =
+            (proptest::option::of(hex()), 0..3u8, hex()).prop_map(|(recorded, which, other)| {
+                let current = match which {
+                    0 => recorded.clone().or(Some(other)),
+                    1 => Some(other),
+                    _ => None,
+                };
+                (recorded, current)
+            });
+        let tree = prop_oneof![
+            Just(PropTree::Clean),
+            proptest::collection::vec("[a-z]{1,8}(/[a-z]{1,8})?", 1..4).prop_map(PropTree::Dirty),
+            Just(PropTree::Failed),
+        ];
+        let trigger = prop_oneof![
+            Just(PropTrigger::AfterValidate(Mode::Auto)),
+            Just(PropTrigger::AfterValidate(Mode::Supervise)),
+            Just(PropTrigger::Approve),
+            any::<String>().prop_map(PropTrigger::Reject),
+            Just(PropTrigger::Abort),
+        ];
+        let kind = (0..every_gate_kind().len()).prop_map(|index| every_gate_kind()[index]);
+        let canary = proptest::option::of("[a-z ]{1,20}");
+        (status, heads, tree, trigger, kind, canary).prop_map(
+            |(status, (recorded, current), tree, trigger, kind, canary)| PropInput {
+                status,
+                recorded,
+                current,
+                tree,
+                trigger,
+                kind,
+                canary,
+            },
+        )
+    }
+
+    /// The route the real dispatch names for `input`: `next_step` after a
+    /// Validate, the routers for an answer.
+    fn real_route(input: &PropInput) -> String {
+        let evidence = input.evidence();
+        match &input.trigger {
+            PropTrigger::AfterValidate(mode) => next_step(Trigger::AfterValidate {
+                mode: *mode,
+                evidence: &evidence,
+            })
+            .name()
+            .to_string(),
+            PropTrigger::Approve => {
+                match approve_route(&input.gate(), input.canary.as_deref(), || input.evidence()) {
+                    ApproveRoute::Verification { step, .. } => step.name().to_string(),
+                    ApproveRoute::StatusLess(step) => step.name().to_string(),
+                    ApproveRoute::Refused(_) => "refused".to_string(),
+                }
+            }
+            PropTrigger::Reject(note) => {
+                match reject_route(&input.gate(), input.canary.as_deref(), note) {
+                    RejectRoute::Verification(step) => step.name().to_string(),
+                    RejectRoute::StatusLess(step) => step.name().to_string(),
+                    RejectRoute::Refused(_) => "refused".to_string(),
+                }
+            }
+            PropTrigger::Abort => next_step(Trigger::Abort).name().to_string(),
+        }
+    }
+
+    /// The control mutant: a copy of `next_step`'s table, by name, that
+    /// finishes on `passed` without an agent PASS on HEAD. Answers to
+    /// status-less gates take the real routers.
+    fn mutant_route(input: &PropInput) -> String {
+        let passed = input.status == Some(GsdStatus::Passed);
+        let row = |after_validate: bool| -> &'static str {
+            match input.status {
+                Some(GsdStatus::Passed) => "finish",
+                Some(GsdStatus::GapsFound) => "gap_loop",
+                Some(GsdStatus::Stale | GsdStatus::Missing) => "reverify",
+                Some(GsdStatus::HumanNeeded) | None if after_validate => "gate",
+                Some(GsdStatus::HumanNeeded) | None => "reopen",
+            }
+        };
+        match &input.trigger {
+            PropTrigger::AfterValidate(Mode::Supervise) => "gate".to_string(),
+            PropTrigger::AfterValidate(Mode::Auto) => row(true).to_string(),
+            PropTrigger::Approve
+                if answer_family(input.kind) == AnswerFamily::Verification && passed =>
+            {
+                row(false).to_string()
+            }
+            _ => real_route(input),
+        }
+    }
+
+    /// The D-45 table's row for a Validate outcome or a verification-family
+    /// answer, spelled out independently of `next_step`.
+    fn table_row(input: &PropInput) -> String {
+        let pass = input.pass_on_head();
+        let row = |after_validate: bool| -> &'static str {
+            match (input.status, pass, after_validate) {
+                (Some(GsdStatus::Passed), true, _) => "finish",
+                (Some(GsdStatus::Passed), false, true) => "gate",
+                (Some(GsdStatus::Passed), false, false) => "validate_again",
+                (Some(GsdStatus::GapsFound), _, _) => "gap_loop",
+                (Some(GsdStatus::Stale | GsdStatus::Missing), _, _) => "reverify",
+                (Some(GsdStatus::HumanNeeded) | None, _, true) => "gate",
+                (Some(GsdStatus::HumanNeeded) | None, _, false) => "reopen",
+            }
+        };
+        match &input.trigger {
+            PropTrigger::AfterValidate(Mode::Supervise) => "gate".to_string(),
+            PropTrigger::AfterValidate(Mode::Auto) => row(true).to_string(),
+            PropTrigger::Approve => row(false).to_string(),
+            PropTrigger::Reject(note) if note.trim().is_empty() => "refused".to_string(),
+            PropTrigger::Reject(_) => "quick".to_string(),
+            PropTrigger::Abort => "end".to_string(),
+        }
+    }
+
+    /// A status-less or kindless gate's own answer, spelled out independently
+    /// of `status_less_step`.
+    fn status_less_row(input: &PropInput) -> String {
+        let refused_canary = input.canary.is_some();
+        match (&input.trigger, input.kind) {
+            (PropTrigger::Abort, _) => "end",
+            (PropTrigger::Approve, Some(GateKind::StageFailure)) if refused_canary => {
+                "relaunch_refused"
+            }
+            (PropTrigger::Approve, Some(GateKind::StageFailure)) => "retry_stage",
+            (PropTrigger::Reject(note), Some(GateKind::StageFailure)) if note.trim().is_empty() => {
+                "refused"
+            }
+            (PropTrigger::Reject(_), Some(GateKind::StageFailure)) if refused_canary => {
+                "relaunch_refused"
+            }
+            (PropTrigger::Reject(_), Some(GateKind::StageFailure)) => "relaunch_with_note",
+            (PropTrigger::Approve, Some(GateKind::Preflight)) => "preflight_override",
+            (PropTrigger::Approve, Some(GateKind::CheckpointDeclaration)) => {
+                "record_checkpoint_set"
+            }
+            _ => "refused",
+        }
+        .to_string()
+    }
+
+    /// D-45 rule 6, over a routing function: the route is a finish only when
+    /// `can_finish` holds, and only after a Validate in auto mode or on an
+    /// approve of a verification gate; after a Validate and on any answer to
+    /// a verification gate it is the table's row whatever the kind; on a
+    /// status-less or kindless gate it is that gate's own answer (or a
+    /// refusal) and never a finish.
+    fn rule_six(route: fn(&PropInput) -> String, input: &PropInput) -> Result<(), String> {
+        let routed = route(input);
+        let verification = answer_family(input.kind) == AnswerFamily::Verification;
+        if routed == "finish" {
+            if can_finish(&input.evidence()).is_none() {
+                return Err(format!("a finish without can_finish: {input:?}"));
+            }
+            let finish_trigger = matches!(input.trigger, PropTrigger::AfterValidate(Mode::Auto))
+                || (matches!(input.trigger, PropTrigger::Approve) && verification);
+            if !finish_trigger {
+                return Err(format!("a finish on the wrong trigger: {input:?}"));
+            }
+        }
+        let expected = match &input.trigger {
+            PropTrigger::AfterValidate(_) => table_row(input),
+            PropTrigger::Approve | PropTrigger::Reject(_) | PropTrigger::Abort if verification => {
+                table_row(input)
+            }
+            PropTrigger::Approve | PropTrigger::Reject(_) | PropTrigger::Abort => {
+                status_less_row(input)
+            }
+        };
+        if routed != expected {
+            return Err(format!(
+                "routed {routed}, the table says {expected}: {input:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Run [`rule_six`] over `route` with persistence off, so the control's
+    /// expected counterexample writes no `proptest-regressions/` file.
+    fn run_rule_six(
+        route: fn(&PropInput) -> String,
+    ) -> Result<(), proptest::test_runner::TestError<PropInput>> {
+        let config = proptest::test_runner::Config {
+            cases: 1024,
+            failure_persistence: None,
+            ..proptest::test_runner::Config::default()
+        };
+        let mut runner = proptest::test_runner::TestRunner::new(config);
+        runner.run(&prop_inputs(), |input| {
+            rule_six(route, &input).map_err(proptest::test_runner::TestCaseError::fail)
+        })
+    }
+
+    /// D-45 rule 6: the routing yields a finish only when `can_finish` holds,
+    /// and each step is the D-45 table's row (property over status, recorded
+    /// and current HEAD, the tree, the trigger with an arbitrary note, the gate
+    /// kind or none, and the recorded canary refusal). Control in the same
+    /// test: the same property over a routing function forced to finish on
+    /// `passed` without an agent PASS on HEAD finds a counterexample holding
+    /// `passed` and no PASS on HEAD. Both runs persist no failure.
+    #[test]
+    fn workflow_finished_is_reached_only_when_can_finish_holds() {
+        run_rule_six(real_route).unwrap_or_else(|error| panic!("the real routing: {error}"));
+        match run_rule_six(mutant_route) {
+            Err(proptest::test_runner::TestError::Fail(reason, input)) => {
+                assert_eq!(input.status, Some(GsdStatus::Passed), "{reason}: {input:?}");
+                assert!(
+                    !input.evidence().agent_pass_on_head,
+                    "the counterexample has no PASS on HEAD: {input:?}"
+                );
+            }
+            other => panic!("control: the mutant must fail the property: {other:?}"),
+        }
+    }
+
+    /// D-12, D-45 rule 2: a `failure_cap` gate at the per-phase ceiling,
+    /// approved, resets the count through the dispatch's one call (exactly one
+    /// `phase_failure_budget_reset`) and then follows the table: a fresh
+    /// `passed` with the PASS on HEAD finishes, one without the PASS runs
+    /// Validate again, a fresh `gaps_found` runs the gap loop. Control in the
+    /// same test: an abort resets nothing and the count stays at the ceiling.
+    #[test]
+    fn approving_a_failure_cap_gate_resets_the_cap_and_follows_the_table() {
+        if !in_bounded_child(
+            "pipeline_outcomes::tests::approving_a_failure_cap_gate_resets_the_cap_and_follows_the_table",
+        ) {
+            return;
+        }
+        let ceiling = mode::MAX_PHASE_VALIDATE_FAILURES;
+        let rows = [
+            (6000, GsdStatus::Passed, true, false, "finish"),
+            (6001, GsdStatus::Passed, false, false, "validate_again"),
+            (6002, GsdStatus::GapsFound, false, false, "gap_loop"),
+            (6003, GsdStatus::Passed, true, true, "end"),
+        ];
+        for (number, status, on_head, abort, route) in rows {
+            let row = format!("{status:?}, PASS on HEAD {on_head}, abort {abort}");
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = PhaseId::new(number);
+            let _gsd = validate_evidence(root, phase, &[gsd_says(status)]);
+            let head = repo_with_head(root);
+            let mut state = validate_state(root, phase, Mode::Auto);
+            state.phase_validate_failures = ceiling;
+            state.validate_pass_head = on_head.then_some(head);
+            workflow::save_state(&state).unwrap();
+            let answer = if abort {
+                abort_answer()
+            } else {
+                approve_answer()
+            };
+            at_the_validate_gate(root, phase, &answer, || {
+                open_and_dispatch(
+                    root,
+                    &mut state,
+                    Stage::Validate,
+                    GateKind::FailureCap.into(),
+                    true,
+                );
+            });
+            let resets = events_named(root, phase, "phase_failure_budget_reset");
+            let finished = events_named(root, phase, "workflow_finished");
+            assert_eq!(
+                events_named(root, phase, "gate_resolved")[0]["route"],
+                route,
+                "{row}"
+            );
+            if abort {
+                assert!(
+                    resets.is_empty(),
+                    "control: an abort resets nothing: {resets:?}"
+                );
+                assert_eq!(state.phase_validate_failures, ceiling, "control: {row}");
+                continue;
+            }
+            assert_eq!(resets.len(), 1, "{row}: exactly one reset: {resets:?}");
+            assert_eq!(state.phase_validate_failures, 0, "{row}");
+            match route {
+                "finish" => assert_eq!(
+                    finished
+                        .iter()
+                        .map(|event| (event["reason"].clone(), event["shipped"].clone()))
+                        .collect::<Vec<_>>(),
+                    vec![(serde_json::json!("finished"), serde_json::json!(false))],
+                    "{row}"
+                ),
+                "gap_loop" => {
+                    assert!(finished.is_empty(), "{row}");
+                    let after = workflow::load_state(root, phase).unwrap();
+                    assert_eq!(after.stage, Stage::Plan, "{row}");
+                    assert!(after.gap_closure_pass, "{row}");
+                }
+                _ => {
+                    assert!(finished.is_empty(), "{row}: no finish without the PASS");
+                    assert_eq!(
+                        workflow::load_state(root, phase).unwrap().stage,
+                        Stage::Validate
+                    );
+                }
+            }
+        }
+    }
+
+    /// D-39: a Code stage failure over an old `passed` report with the PASS on
+    /// HEAD, approved, retries Code: no finish, and the answer reads no GSD
+    /// status. Control in the same test: a `clean_pass` gate over the same
+    /// evidence, approved, finishes.
+    #[test]
+    fn approving_a_code_stage_failure_over_an_old_passed_report_retries_code() {
+        if !in_bounded_child(
+            "pipeline_outcomes::tests::approving_a_code_stage_failure_over_an_old_passed_report_retries_code",
+        ) {
+            return;
+        }
+        for (number, stage_failure) in [(6010, true), (6011, false)] {
+            let row = if stage_failure {
+                "stage_failure"
+            } else {
+                "control: clean_pass"
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = PhaseId::new(number);
+            let passed = gsd_says(GsdStatus::Passed);
+            let gsd = validate_evidence(root, phase, &[passed, passed]);
+            let head = repo_with_head(root);
+            let stage = if stage_failure {
+                Stage::Code
+            } else {
+                Stage::Validate
+            };
+            let mut state = State::new(
+                phase,
+                AgentKind::Claude,
+                Mode::Supervise,
+                root.to_path_buf(),
+            );
+            state.stage = stage;
+            state.validate_pass_head = Some(head);
+            workflow::save_state(&state).unwrap();
+            at_the_gate(root, phase, stage, &approve_answer(), || {
+                if stage_failure {
+                    let _ =
+                        handle_stage_failure(root, &mut state, Stage::Code, Some("failed".into()));
+                } else {
+                    open_and_dispatch(root, &mut state, stage, GateKind::CleanPass.into(), false);
+                }
+            });
+            let finished = events_named(root, phase, "workflow_finished");
+            if stage_failure {
+                assert!(finished.is_empty(), "{row}: a stage failure never finishes");
+                assert_eq!(
+                    status_reads(&gsd),
+                    0,
+                    "{row}: no GSD status read for the answer"
+                );
+                let after = workflow::load_state(root, phase).unwrap();
+                assert_eq!(after.stage, Stage::Code, "{row}: Code is retried");
+                assert_eq!(
+                    events_named(root, phase, "gate_resolved")[0]["route"],
+                    "retry_stage",
+                    "{row}"
+                );
+            } else {
+                assert_eq!(finished.len(), 1, "{row}: {:?}", phase_events(root, phase));
+            }
+        }
     }
 }
