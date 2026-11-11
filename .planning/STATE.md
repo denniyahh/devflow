@@ -5,16 +5,16 @@ milestone_name: Session Continuity
 current_phase: 52
 current_phase_name: Subtract and Stabilize
 status: executing
-stopped_at: Completed 52-15-PLAN.md
-last_updated: "2026-11-11T02:06:21.681Z"
+stopped_at: Completed 52-16-PLAN.md
+last_updated: "2026-11-11T03:14:09.197Z"
 last_activity: 2026-11-10
 last_activity_desc: Phase 52 execution started
-state_head: f57154eaceda11394477d04ce2e1195cd702b8cc
+state_head: 13c0d7176724ae24b80e0bef10912b811504f58c
 progress:
   total_phases: 4
   completed_phases: 0
   total_plans: 33
-  completed_plans: 15
+  completed_plans: 16
   percent: 0
 ---
 
@@ -159,7 +159,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 52 (Subtract and Stabilize) — EXECUTING
-Plan: 16 of 33
+Plan: 17 of 33
 Status: Ready to execute
 Last activity: 2026-11-10 — Phase 52 execution started
 
@@ -862,6 +862,8 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 52]: Stage::Ship, StageIntent::Ship, the Ship prompts, review angles (DEVFLOW_REVIEW_ANGLES and the toml key) and FixType::AuditFix are removed; clap rejects --until ship (52-15)
 - [Phase 52]: run_gate_with_timeout's auto_response parameter and safe point 5 are removed with handle_ship_outcome; safe points 4 and 6 keep their numbers (52-15)
 - [Phase 52]: StageIntent::for_stage_in_project and stage_prompt_for_project are kept with an unread project_root, because 52-26/52-27 pin the one for_stage_in_project( call (52-15)
+- [Phase 52]: 52-16: preflight's first-stage checks (auto-mode CONTEXT.md, D-07 unattended check, not-yet-planned case) now key on Plan instead of Define; a Codex handoff or resume at Plan in auto mode is refused, as it was at Define before
+- [Phase 52]: 52-16: run_never_prepared is !verification_baseline_captured alone, so a state that never captured its baseline reads as never prepared at any stage; the pipeline_launch handoff fixture keeps an explicit stage N = Define for 52-17 to move
 
 ## Roadmap Evolution
 
@@ -988,11 +990,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 52 P13 | 20 min | 2 tasks | 23 files |
 | Phase 52 P14 | 22 min | 2 tasks | 13 files |
 | Phase 52 P15 | 45 min | 3 tasks | 42 files |
+| Phase 52 P16 | 57 min | 3 tasks | 16 files |
 
 ## Session
 
-**Last session:** 2026-11-11T02:06:21.398Z
-**Stopped at:** Completed 52-15-PLAN.md
+**Last session:** 2026-11-11T03:14:08.999Z
+**Stopped at:** Completed 52-16-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps

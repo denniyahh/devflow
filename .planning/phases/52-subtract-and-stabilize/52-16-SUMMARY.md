@@ -233,7 +233,7 @@ See `key-decisions`.
 **1. [Rule 2 - Missing critical] preflight.rs's Define behaviour sites re-keyed to Plan**
 - **Found during:** Task 2, checking the acceptance criterion "no behaviour site in `crates/*/src` compares a stage to `Stage::Define`"
 - **Issue:** preflight.rs is in no task's file list, but it has three such sites: the auto-mode CONTEXT.md check, `unattended_launch_check_applies` (Define and Code) and the "no plans yet is pending at Define" case. With runs starting at Plan, the D-07 unattended check would no longer run at launch, only at Code. 52-17's deletion would then drop these arms silently.
-- **Fix:** the three sites and their docs now name Plan. 14 preflight tests were moved (listed above). A side effect: a Codex handoff or resume at Plan in auto mode is now refused, as it was at Define before.
+- **Fix:** the three sites and their docs now name Plan. 12 preflight tests were moved (listed above). A side effect: a Codex handoff or resume at Plan in auto mode is now refused, as it was at Define before.
 - **Files modified:** crates/devflow-cli/src/preflight.rs, plus the tests listed above
 - **Verification:** all 60 `preflight::` tests pass, the bin suite passes, and `scripts/check.sh all` passes
 - **Committed in:** cc68322
@@ -253,7 +253,7 @@ See `key-decisions`.
 ---
 
 **Total deviations:** 4 (1 missing critical, 2 blocking, 1 convention)
-**Impact on plan:** deviation 1 widens the plan's scope by one source file and 14 tests, and it changes one behaviour (deciding note 2). The rest are wording and commit shape.
+**Impact on plan:** deviation 1 widens the plan's scope by one source file and 12 preflight tests, and it changes one behaviour (the second key decision). The rest are wording and commit shape.
 
 ## Issues Encountered
 
