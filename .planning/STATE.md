@@ -5,16 +5,16 @@ milestone_name: Session Continuity
 current_phase: 52
 current_phase_name: Subtract and Stabilize
 status: executing
-stopped_at: Completed 52-20-PLAN.md
-last_updated: "2026-11-11T05:28:37.996Z"
+stopped_at: Completed 52-21-PLAN.md
+last_updated: "2026-11-11T05:42:27.966Z"
 last_activity: 2026-11-10
 last_activity_desc: Phase 52 execution started
-state_head: a6c9135467619cb16ea26137a79872619c926f3e
+state_head: b590f7c0918009768c5c313abc19bc986b6f777a
 progress:
   total_phases: 4
   completed_phases: 0
   total_plans: 33
-  completed_plans: 20
+  completed_plans: 21
   percent: 0
 ---
 
@@ -159,7 +159,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 52 (Subtract and Stabilize) — EXECUTING
-Plan: 21 of 33
+Plan: 22 of 33
 Status: Ready to execute
 Last activity: 2026-11-10 — Phase 52 execution started
 
@@ -871,6 +871,7 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 52]: 52-18: gate_sweep_e2e's reap-strays guard is split with concat! like the other controls, not deleted; its deletion stays in deferred-items.md
 - [Phase 52]: 52-19: a gate answer aborts only through its abort field (gate abort, gate sweep, devflow stop); a note never changes the action, and an answer that approves and aborts is refused when written and read as an abort
 - [Phase 52]: 52-20: gsd_reader runs gsd_run by argv in the evidence root (GIT_* removed, HOME set to the launcher home, 60 s kill-and-reap deadline); every answer is one of five GsdStatus values or a named ReaderFailure, exit 0 is not success, and events carry only ReaderFailure::label()
+- [Phase 52]: 52-21: the build-provenance Warn arm is silent on any project that is not DevFlow's own checkout; a project with no origin remote gets one line and skips the fetch, while a remote that exists but cannot be fetched keeps both lines
 
 ## Roadmap Evolution
 
@@ -1002,11 +1003,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 52 P18 | 31 min | 3 tasks | 20 files |
 | Phase 52 P19 | 25 min | 3 tasks | 17 files |
 | Phase 52 P20 | 20 min | 3 tasks | 3 files |
+| Phase 52 P21 | 11 min | 2 tasks | 2 files |
 
 ## Session
 
-**Last session:** 2026-11-11T05:28:37.818Z
-**Stopped at:** Completed 52-20-PLAN.md
+**Last session:** 2026-11-11T05:42:27.743Z
+**Stopped at:** Completed 52-21-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
