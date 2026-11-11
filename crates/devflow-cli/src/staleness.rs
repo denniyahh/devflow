@@ -433,6 +433,24 @@ pub(crate) fn enforce_build_staleness(
     embedded_commit: &str,
     build_dirty: bool,
 ) -> Result<(), CliError> {
+    enforce_build_staleness_to(
+        &mut std::io::stdout(),
+        project_root,
+        state,
+        embedded_commit,
+        build_dirty,
+    )
+}
+
+/// [`enforce_build_staleness`] with its operator output sent to `out`
+/// instead of stdout, so a test can assert what the operator sees.
+fn enforce_build_staleness_to(
+    out: &mut dyn std::io::Write,
+    project_root: &Path,
+    state: &State,
+    embedded_commit: &str,
+    build_dirty: bool,
+) -> Result<(), CliError> {
     let execution_root = state.worktree_path.as_deref().unwrap_or(project_root);
     // 45-02 (AUTO-02): this ordering is now LOAD-BEARING — `self_dogfood` is
     // no longer only the Block-vs-Warn selector, it is also the
@@ -495,7 +513,10 @@ pub(crate) fn enforce_build_staleness(
             Err(CliError::Message(message))
         }
         StalenessOutcome::Warn => {
-            println!(
+            // Best-effort operator output: a closed stdout must not turn a
+            // warn-and-proceed verdict into a failure.
+            let _ = writeln!(
+                out,
                 "warning: build provenance staleness check did not confirm a fresh build for \
                  stage {} — proceeding (only DevFlow's own workspace is ever hard-blocked, D-18)",
                 state.stage
