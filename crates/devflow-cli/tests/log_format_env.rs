@@ -121,7 +121,7 @@ fn rust_log_debug_is_honored_under_json_log_format() {
 fn rust_log_default_suppresses_debug_under_json_log_format() {
     let home = common::HermeticHome::new();
     let dir = project_with_phase_state();
-    // No RUST_LOG set — main.rs falls back to INFO, so this DEBUG line must NOT
+    // No RUST_LOG set — the default filter is `off`, so this DEBUG line must NOT
     // appear. If it does, RUST_LOG is being ignored (i.e. a fixed, too-verbose
     // level is hardcoded again), the exact WR-01 bug class.
     let (stdout, stderr) = run_recover_clean(&home, &dir.path().to_path_buf(), Some("json"), None);
@@ -144,20 +144,11 @@ fn rust_log_default_suppresses_debug_under_json_log_format() {
     );
 }
 
-/// Regression guard for CR-01 (15-REVIEW.md, third round, commit `50db857`):
-/// `main.rs` previously built its `EnvFilter` with the bare
-/// `EnvFilter::from_default_env()`, which defaults to ERROR-only when
-/// `RUST_LOG` is unset. Fixed by falling back to `EnvFilter::new("info")`
-/// via `try_from_default_env().unwrap_or_else(...)` on both branches, so
-/// `devflow` now logs at INFO level by default with no env var set at all.
-///
-/// This drives `devflow gate approve` against a project with a single open
-/// gate and a registered waiter (with none, the approval writes nothing and
-/// logs nothing) — `Gates::answer` emits `info!("gate answer written for phase {phase}
-/// {stage} gate {gate}: approved=...")` as an unconditional side effect of a
-/// successful approval, giving a real INFO-level log line to assert on. If
-/// commit 50db857 were reverted (back to the bare `from_default_env()`),
-/// this line would default to being suppressed and this test would fail.
+/// An open gate with a registered waiter, so `devflow gate approve` writes an
+/// answer and `Gates::answer` emits its `info!("gate answer written for phase
+/// {phase} {stage} gate {gate}: approved=...")` line: a real INFO-level tracing
+/// line whose presence or absence the tests below assert. (With no waiter the
+/// approval writes nothing and logs nothing.)
 fn project_with_open_gate(
     phase: PhaseId,
     stage: Stage,
@@ -174,8 +165,19 @@ fn project_with_open_gate(
     (dir, registration)
 }
 
-#[test]
-fn rust_log_unset_still_shows_info_level_logs_by_default() {
+/// What one `devflow gate approve` run printed, and the tracing line its
+/// approval logs.
+struct ApproveRun {
+    stdout: String,
+    stderr: String,
+    logged: String,
+}
+
+/// Approve phase 15's one open Validate gate with `RUST_LOG` set to `rust_log`
+/// (`None` removes it) and `DEVFLOW_LOG_FORMAT` to `log_format`. Every variable
+/// is set on the child, never on this process. Asserts the approval succeeded,
+/// so a quiet stderr below means "filtered", not "never got there".
+fn approve_one_gate(rust_log: Option<&str>, log_format: Option<&str>) -> ApproveRun {
     let home = common::HermeticHome::new();
     let (dir, registration) = project_with_open_gate(PhaseId::new(15), Stage::Validate);
     let gate_id = Gates::list_open(dir.path())[0].gate_id.clone();
@@ -187,28 +189,101 @@ fn rust_log_unset_still_shows_info_level_logs_by_default() {
         .arg("15")
         .arg("--project")
         .arg(dir.path());
-    // No RUST_LOG, no DEVFLOW_LOG_FORMAT — exercise the true CLI default.
     cmd.env_remove("RUST_LOG");
     cmd.env_remove("DEVFLOW_LOG_FORMAT");
+    if let Some(level) = rust_log {
+        cmd.env("RUST_LOG", level);
+    }
+    if let Some(format) = log_format {
+        cmd.env("DEVFLOW_LOG_FORMAT", format);
+    }
 
     let output = cmd.output().expect("run devflow gate approve");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     assert!(
         output.status.success(),
         "devflow gate approve should succeed against a single open gate\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
-        stderr.contains(&logged),
-        "with RUST_LOG unset, an INFO-level tracing log should still reach stderr \
-         by default (CR-01 / commit 50db857 — default level is INFO, not \
-         ERROR-only), but it did not appear.\nstderr:\n{stderr}"
-    );
-    assert!(
-        !stdout.contains(&logged),
-        "the tracing log line must not leak onto stdout (CR-02) — only the CLI's \
-         own printed confirmation message belongs there.\nstdout:\n{stdout}"
+        stdout.contains("response was written"),
+        "the approval must have been written, or a quiet stderr proves nothing\nstdout:\n{stdout}"
     );
     registration.finish();
+    ApproveRun {
+        stdout,
+        stderr,
+        logged,
+    }
+}
+
+/// The stderr lines that came from the `tracing` subscriber: a plain-format
+/// line carries a level marker word, a json-format line is an object with a
+/// `level` key.
+fn tracing_lines(stderr: &str) -> Vec<&str> {
+    const LEVELS: [&str; 5] = ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"];
+    stderr
+        .lines()
+        .filter(|line| {
+            let is_json_record = serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .is_some_and(|value| value.get("level").is_some());
+            let has_level_word = line
+                .split(|c: char| !c.is_ascii_alphabetic())
+                .any(|word| LEVELS.contains(&word));
+            is_json_record || has_level_word
+        })
+        .collect()
+}
+
+#[test]
+fn rust_log_unset_prints_no_tracing_lines() {
+    let run = approve_one_gate(None, None);
+    assert!(
+        tracing_lines(&run.stderr).is_empty() && !run.stderr.contains(&run.logged),
+        "with RUST_LOG unset, no tracing line may reach stderr (the default filter is \
+         `off`).\nstderr:\n{}",
+        run.stderr
+    );
+}
+
+#[test]
+fn rust_log_unset_prints_no_json_tracing_objects() {
+    let run = approve_one_gate(None, Some("json"));
+    assert!(
+        tracing_lines(&run.stderr).is_empty() && !run.stderr.contains(&run.logged),
+        "with RUST_LOG unset, the json branch must print no tracing object either.\n\
+         stderr:\n{}",
+        run.stderr
+    );
+}
+
+#[test]
+fn an_empty_rust_log_prints_no_tracing_lines() {
+    let run = approve_one_gate(Some(""), None);
+    assert!(
+        tracing_lines(&run.stderr).is_empty() && !run.stderr.contains(&run.logged),
+        "an empty RUST_LOG must behave as unset: no tracing lines.\nstderr:\n{}",
+        run.stderr
+    );
+}
+
+/// Control for the three tests above: with `RUST_LOG=info` the same approval's
+/// tracing line does reach stderr, and `tracing_lines` recognizes it, so their
+/// empty result is the filter at work, not a detector that sees nothing.
+#[test]
+fn rust_log_info_still_prints_the_tracing_line() {
+    let run = approve_one_gate(Some("info"), None);
+    let lines = tracing_lines(&run.stderr);
+    assert!(
+        lines.iter().any(|line| line.contains(&run.logged)),
+        "with RUST_LOG=info the approval's INFO line must reach stderr and be \
+         recognized as a tracing line.\nstderr:\n{}",
+        run.stderr
+    );
+    assert!(
+        !run.stdout.contains(&run.logged),
+        "tracing lines never leak onto stdout (CR-02).\nstdout:\n{}",
+        run.stdout
+    );
 }
