@@ -350,12 +350,23 @@ impl GitFlow {
     /// checked out in a worktree) is logged and skipped so one failure
     /// doesn't abort the rest of the sweep.
     pub fn cleanup_merged(&self) -> Result<Vec<String>, GitError> {
-        self.cleanup_merged_to(&mut std::io::stderr())
+        self.cleanup_merged_to(&[], &mut std::io::stderr())
     }
 
-    /// [`Self::cleanup_merged`], writing the line for each branch git refused
-    /// to delete to `err`: the returned list names only the deleted ones.
-    fn cleanup_merged_to(&self, err: &mut dyn std::io::Write) -> Result<Vec<String>, GitError> {
+    /// [`Self::cleanup_merged`], never touching a branch named in `keep`: a
+    /// caller that keeps a worktree passes the branch it has checked out, so
+    /// the sweep skips it instead of leaving the refusal to git.
+    pub fn cleanup_merged_keeping(&self, keep: &[String]) -> Result<Vec<String>, GitError> {
+        self.cleanup_merged_to(keep, &mut std::io::stderr())
+    }
+
+    /// [`Self::cleanup_merged_keeping`], writing the line for each branch git
+    /// refused to delete to `err`: the returned list names only the deleted ones.
+    fn cleanup_merged_to(
+        &self,
+        keep: &[String],
+        err: &mut dyn std::io::Write,
+    ) -> Result<Vec<String>, GitError> {
         let output = self.git_output(["branch", "--merged", &self.config.develop])?;
         // CR-01 (45-REVIEW.md): the configured trunk cannot be the SOLE
         // source of the protected set. Once `config.develop` became the
@@ -386,7 +397,11 @@ impl GitFlow {
                 .trim();
             // Skip blanks, protected trunks, and the detached-HEAD line
             // ("(HEAD detached at ...)"), which is not a branch name.
-            if branch.is_empty() || branch.starts_with('(') || protected.contains(&branch) {
+            if branch.is_empty()
+                || branch.starts_with('(')
+                || protected.contains(&branch)
+                || keep.iter().any(|kept| kept == branch)
+            {
                 continue;
             }
             info!("cleaning up merged branch: {branch}");
@@ -928,13 +943,37 @@ mod tests {
             ],
         );
         let mut sink = Vec::new();
-        let deleted = flow(root).cleanup_merged_to(&mut sink).expect("cleanup");
+        let deleted = flow(root)
+            .cleanup_merged_to(&[], &mut sink)
+            .expect("cleanup");
         assert!(!deleted.contains(&"held-merged".to_string()));
         let text = String::from_utf8(sink).unwrap();
         assert!(
             text.starts_with("warning: could not delete the merged branch held-merged"),
             "the operator must be told the branch was kept: {text:?}"
         );
+    }
+
+    /// A merged branch named in `keep` is skipped, not deleted and not
+    /// reported; control: an unnamed merged branch in the same sweep is deleted.
+    #[test]
+    fn cleanup_merged_keeping_skips_a_kept_branch() {
+        let repo = init_repo();
+        let root = repo.path();
+        git(root, &["branch", "kept-merged"]);
+        git(root, &["branch", "swept-merged"]);
+        let mut sink = Vec::new();
+        let deleted = flow(root)
+            .cleanup_merged_to(&["kept-merged".to_string()], &mut sink)
+            .expect("cleanup");
+        assert_eq!(deleted, vec!["swept-merged".to_string()]);
+        assert!(sink.is_empty(), "{}", String::from_utf8_lossy(&sink));
+        let listed = crate::test_support::git_command(root)
+            .args(["branch", "--list", "kept-merged"])
+            .output()
+            .expect("list branches");
+        let listed = String::from_utf8_lossy(&listed.stdout);
+        assert!(listed.contains("kept-merged"), "{listed:?}");
     }
 
     /// 45-01 / D-01: `with_config` is what makes the trunk configurable.
