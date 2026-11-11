@@ -9,7 +9,7 @@ This page describes the CLI **as built** (verified against `main.rs` by the
 Each phase runs a linear stage chain, driven end-to-end by detached monitors:
 
 ```
-Define → Plan → Code → Validate → Ship
+Define → Plan → Code → Validate
 ```
 
 - **Define / Plan / Code** launch a headless coding agent with the stage's
@@ -18,7 +18,7 @@ Define → Plan → Code → Validate → Ship
   pass; gaps loop back to Code (after `MAX_CONSECUTIVE_FAILURES` = 3
   failures a gate is forced). Validate is the last stage that runs: a pass
   ends the run as finished and leaves the worktree and branch in place
-  ([How a run ends](#how-a-run-ends)). No transition reaches Ship.
+  ([How a run ends](#how-a-run-ends)).
 - Modes: `--mode auto` (finishes on a passing Validate without a gate;
   only never-silent failure gates and the failure caps stop it) or
   `--mode supervise` (also gates every Validate; approving it finishes the
@@ -30,7 +30,7 @@ Define → Plan → Code → Validate → Ship
 
 | Command | Purpose |
 |---|---|
-| `devflow start --phase N --agent claude\|codex\|opencode --mode auto\|supervise [--force] [--no-worktree] [--dry-run] [--until define\|plan\|code\|validate] [--fallback-agent <agent>]` | Begin a phase; a detached monitor owns the agent and auto-advances. `--until <stage>` runs through `<stage>` then halts cleanly (no orphaned monitor, no `doctor` false positive) instead of continuing to Ship; `--until ship` is rejected (a no-op — Ship is already terminal). Refuses before scaffolding anything if phase N is not reachable from `develop` (see Preflight refusals below). `--fallback-agent <agent>` names one agent that takes over if the Code stage is rate-limited: one hop per run, at Code only (a rate limit at any other stage waits at the stage's gate), relaunching Code in the same worktree on the same branch. It is saved in `state-NN.json`, and refused when it equals `--agent`, when its binary is missing or its driver unhealthy, and in `--mode auto` unless it is `claude` or `antigravity`. That launch check is best effort: the full preflight runs again at the handoff, a refusal there leaves the run waiting at the Code gate, and a relaunch that fails after the handoff stops at a Code gate (see [Rate-limit failover](#rate-limit-failover)). Without the flag, `start` uses `devflow.toml`'s `fallback_agent` key and prints a note naming it; the flag wins the value, and no environment variable selects a fallback |
+| `devflow start --phase N --agent claude\|codex\|opencode --mode auto\|supervise [--force] [--no-worktree] [--dry-run] [--until define\|plan\|code\|validate] [--fallback-agent <agent>]` | Begin a phase; a detached monitor owns the agent and auto-advances. `--until <stage>` runs through `<stage>` then halts cleanly (no orphaned monitor, no `doctor` false positive) instead of continuing; `--until validate` finishes as a run without `--until` does ([How a run ends](#how-a-run-ends)). `--until ship` is rejected by clap as an invalid value: there is no Ship stage. Refuses before scaffolding anything if phase N is not reachable from `develop` (see Preflight refusals below). `--fallback-agent <agent>` names one agent that takes over if the Code stage is rate-limited: one hop per run, at Code only (a rate limit at any other stage waits at the stage's gate), relaunching Code in the same worktree on the same branch. It is saved in `state-NN.json`, and refused when it equals `--agent`, when its binary is missing or its driver unhealthy, and in `--mode auto` unless it is `claude` or `antigravity`. That launch check is best effort: the full preflight runs again at the handoff, a refusal there leaves the run waiting at the Code gate, and a relaunch that fails after the handoff stops at a Code gate (see [Rate-limit failover](#rate-limit-failover)). Without the flag, `start` uses `devflow.toml`'s `fallback_agent` key and prints a note naming it; the flag wins the value, and no environment variable selects a fallback |
 | `devflow resume --phase N [--agent <agent>] [--fallback-agent <agent>]` | Resume a rate-limited or infra-paused phase from its saved stage (loads `state-NN.json`, does not recreate the branch/worktree or reset to Define) — the command a rate-limit gate names for after the reset. Also clears a `--until`-stopped phase's stop marker, so the phase advances past its old stop point instead of re-stopping immediately. A run that finished (its Validate passed) is refused, naming `devflow start`, and nothing is launched. It reruns the stage, so a pending gate is asked again: it sets any unused answer aside and reports it, and reports an answer that was claimed with no record that it was applied (see [Answering gates](#answering-gates)). `--agent <agent>` hands the run to another agent (an `agent_handoff` event with reason `resume --agent`); naming the run's saved, unused fallback is refused unless `--fallback-agent` names another. `--fallback-agent <agent>` sets the fallback or re-arms a spent one, checked as on `start`; like any resume it is accepted only on a run that is not live. Without it the saved fallback is kept as it is, spent or not: `resume` does not re-read `devflow.toml` |
 | `devflow status` | All active phases: stage, gate state, supervisor liveness (ALIVE / STALE / GONE, with the repair; see [Run liveness](#run-liveness)), elapsed, last action. Also shows a held state write lock with its holder, names a live agent that has no supervisor with the manual kill, and lists set-aside gate answers |
 | `devflow logs [-f] [--phase N] [--stderr]` | Print/follow a phase's captured agent output |
@@ -235,9 +235,8 @@ approve` and `gate reject` write it to
 `.devflow/gates/NN-{stage}.{gate_id}.response.json`. Before they publish, they
 move an answer in that gate's own slot that does not bind to it aside, so a
 refused answer never blocks a valid one, and they refuse to overwrite an
-unconsumed answer that does bind. At a stage other than Ship with no registered
-waiter they write nothing and name the repair. A run no longer reaches Ship; a
-Ship answer with no waiter is still stored, and nothing consumes it.
+unconsumed answer that does bind. With no registered waiter they write nothing
+and name the repair.
 
 To answer by hand, copy `gate_id` from the gate file and publish the same path
 with the same body, renaming it into place so no reader sees it half written:
@@ -467,13 +466,13 @@ Everything under `.devflow/` and `.worktrees/` is runtime state
 ## A typical dogfood session
 
 ```bash
-devflow start --phase 15 --agent claude --mode auto .
+devflow start --phase 15 --agent claude --mode supervise .
 devflow status                       # any time, from any terminal
 devflow logs -f --phase 15           # watch the agent work
-# ...notify hook pings you at the Ship gate...
+# ...notify hook pings you at the Validate gate...
 devflow gate list
-devflow gate approve 15 --note "reviewed the PR-ready diff"
-devflow status                       # idle — phase shipped, version tagged
+devflow gate approve 15 --note "reviewed the validation"
+devflow status                       # finished — worktree and branch kept
 ```
 
 When something wedges: `devflow recover` to inspect,

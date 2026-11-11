@@ -330,9 +330,8 @@ does any of the following:
 4. Greps implementation text as a substitute for a runtime contract that
    could have been asserted directly.
 
-Enforcement lives at the existing review-before-Ship gate:
-`/gsd-code-review` runs before Ship and refuses to ship on Critical findings
-— this contract is applied there, not aspirational.
+Enforcement lives at code review: `/gsd-code-review` applies this contract to
+each change, so it is applied, not aspirational.
 
 The single source of truth for this contract is
 [`.claude/skills/ai-change-acceptance/`](.claude/skills/ai-change-acceptance/),

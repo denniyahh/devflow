@@ -383,15 +383,21 @@ fn dry_run_sweep_reports_no_waiter_gates_as_left_alone() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(4818);
-    let ship_phase = PhaseId::new(4819);
-    let live_ship_phase = PhaseId::new(4820);
+    let validate_phase = PhaseId::new(4819);
+    let live_validate_phase = PhaseId::new(4820);
     Gates::write_gate(root, phase, Stage::Code, "abandoned").unwrap();
-    Gates::write_gate(root, ship_phase, Stage::Ship, "release").unwrap();
-    let live_ship_gate = Gates::open_gate(root, live_ship_phase, Stage::Ship, "live poller")
-        .unwrap()
-        .gate_id;
-    let _live_ship_waiter =
-        Gates::register_waiter(root, live_ship_phase, Stage::Ship, &live_ship_gate).unwrap();
+    Gates::write_gate(root, validate_phase, Stage::Validate, "release").unwrap();
+    let live_validate_gate =
+        Gates::open_gate(root, live_validate_phase, Stage::Validate, "live poller")
+            .unwrap()
+            .gate_id;
+    let _live_validate_waiter = Gates::register_waiter(
+        root,
+        live_validate_phase,
+        Stage::Validate,
+        &live_validate_gate,
+    )
+    .unwrap();
 
     let output = common::hermetic_devflow(&home)
         .args([
@@ -420,16 +426,16 @@ fn dry_run_sweep_reports_no_waiter_gates_as_left_alone() {
         "no-waiter dry-run must not claim it would reap the Code gate: {stdout}"
     );
     assert!(
-        stdout.contains(&format!("left phase {ship_phase} ship alone")),
-        "a no-waiter Ship gate must also be left alone: {stdout}"
+        stdout.contains(&format!("left phase {validate_phase} validate alone")),
+        "a no-waiter Validate gate must also be left alone: {stdout}"
     );
     assert!(
-        !stdout.contains(&format!("would reap phase {ship_phase} ship")),
-        "a no-waiter dry-run must not claim it would reap the Ship gate: {stdout}"
+        !stdout.contains(&format!("would reap phase {validate_phase} validate")),
+        "a no-waiter dry-run must not claim it would reap the Validate gate: {stdout}"
     );
     assert!(
-        stdout.contains(&format!("would reap phase {live_ship_phase} ship")),
-        "a registered Ship waiter must remain the positive would-reap control: {stdout}"
+        stdout.contains(&format!("would reap phase {live_validate_phase} validate")),
+        "a registered Validate waiter must remain the positive would-reap control: {stdout}"
     );
     assert!(
         stdout.contains("1 would be reaped"),

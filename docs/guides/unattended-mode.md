@@ -160,7 +160,7 @@ So:
 
 - **That repair may write a commit.** If the leaked `true` had already reached
   the branch tip, the repair commits the corrected file so it cannot travel
-  onward through Ship into `develop`. You will see this subject in your
+  onward with the branch into `develop`. You will see this subject in your
   history:
 
   ```
