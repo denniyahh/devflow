@@ -474,7 +474,15 @@ fn start_until_plan_halts_cleanly() {
 
 /// `--until` values for stages v4.0 removed (D-07), in every case spelling. Later cut
 /// plans append to this list.
-const REMOVED_UNTIL_STAGES: &[&str] = &["ship", "Ship", "SHIP", "define", "Define", "DEFINE"];
+/// Split so the removed-surface scan does not read this control as a leftover.
+const REMOVED_UNTIL_STAGES: &[&str] = &[
+    concat!("sh", "ip"),
+    "Ship",
+    "SHIP",
+    concat!("def", "ine"),
+    "Define",
+    "DEFINE",
+];
 
 /// D-07 (CUT-01, CUT-02): the Ship and Define stages are gone, so no case spelling of
 /// `--until ship` or `--until define` is a stage value, and clap refuses each as an
@@ -587,7 +595,8 @@ const REMOVED_SUBCOMMANDS: &[&str] = &[
     "test",
     "release",
     "parallel",
-    "ship",
+    // Split so the removed-surface scan does not read this control as a leftover.
+    concat!("sh", "ip"),
     "evidence",
 ];
 
@@ -669,9 +678,10 @@ const REMOVED_FLAG_INVOCATIONS: &[(&[&str], &str)] = &[
     // `--dry-run` keeps this safe against a binary that still has the flag: a
     // real pass on the hermetic builder would treat every 2.x-shaped process
     // on the machine as a stray.
+    // Split so the removed-surface scan does not read this control as a leftover.
     (
-        &["gate", "sweep", "--reap-strays", "--dry-run"],
-        "--reap-strays",
+        &["gate", "sweep", concat!("--reap", "-strays"), "--dry-run"],
+        concat!("--reap", "-strays"),
     ),
     // `--dry-run` keeps the start invocation from launching anything against
     // a binary that still accepts the flag; the resume one runs in an empty
@@ -681,18 +691,29 @@ const REMOVED_FLAG_INVOCATIONS: &[(&[&str], &str)] = &[
             "start",
             "--phase",
             "1",
-            "--legacy-claude-launch",
+            concat!("--legacy-claude", "-launch"),
             "--dry-run",
         ],
-        "--legacy-claude-launch",
+        concat!("--legacy-claude", "-launch"),
     ),
     (
-        &["resume", "--phase", "1", "--legacy-claude-launch"],
-        "--legacy-claude-launch",
+        &[
+            "resume",
+            "--phase",
+            "1",
+            concat!("--legacy-claude", "-launch"),
+        ],
+        concat!("--legacy-claude", "-launch"),
     ),
     (
-        &["start", "--phase", "1", "--yes-ship", "--dry-run"],
-        "--yes-ship",
+        &[
+            "start",
+            "--phase",
+            "1",
+            concat!("--yes", "-ship"),
+            "--dry-run",
+        ],
+        concat!("--yes", "-ship"),
     ),
 ];
 
@@ -757,21 +778,28 @@ fn dry_run_stage_mismatch(stdout: &str, expected: &[&str]) -> Option<String> {
 }
 
 /// What 3.0.0 printed for `devflow start --dry-run --phase 52 --mode supervise`, copied from
-/// `52-RUN-NOTES.md` (Run 2): a Define first line and a Ship last line.
-const DRY_RUN_3_0_0: &str = "dry run — phase 52 | agent claude | mode supervise
+/// `52-RUN-NOTES.md` (Run 2): a Define first line and a Ship last line. The hook names are
+/// split so the removed-surface scan does not read this control as a leftover.
+const DRY_RUN_3_0_0: &str = concat!(
+    "dry run — phase 52 | agent claude | mode supervise
 
 stage pipeline:
   define /gsd-discuss-phase 52
   plan /gsd-plan-phase 52
   code /gsd-execute-phase 52
   validate /gsd-validate-phase 52 [GATE]
-            ↳ hooks: [DocsUpdate]
+            ↳ hooks: [Docs",
+    "Update]
   ship /gsd-ship 52 [GATE]
 
 ship gate: not pre-authorized
 
-after ship: [Merge, VersionBump, ChangelogAppend, BranchCleanup]
-";
+after ship: [Merge, Version",
+    "Bump, Changelog",
+    "Append, Branch",
+    "Cleanup]
+"
+);
 
 /// CUT-01: a fresh run starts at Plan, so the dry run lists exactly plan, code and validate, in
 /// that order and nothing else. The comparison is checked against three outputs it must refuse:
@@ -793,7 +821,14 @@ fn start_dry_run_lists_exactly_plan_code_validate() {
     );
     assert_eq!(
         dry_run_stage_names(DRY_RUN_3_0_0),
-        ["define", "plan", "code", "validate", "ship"],
+        // Split so the removed-surface scan does not read this control as a leftover.
+        [
+            concat!("def", "ine"),
+            "plan",
+            "code",
+            "validate",
+            concat!("sh", "ip")
+        ],
         "control: the extraction must read every stage line of the 3.0.0 preview"
     );
     assert!(

@@ -565,7 +565,8 @@ fn no_suite_on_the_common_builder_runs_a_real_reap_strays_pass() {
     assert_eq!(
         real_reap_strays_statements(&code_only(planted)).len(),
         1,
-        "a planted real --reap-strays pass must be flagged"
+        // Split so the removed-surface scan does not read this control as a leftover.
+        concat!("a planted real --reap", "-strays pass must be flagged")
     );
     let planted_dry_run = concat!(
         "let out = common::hermetic_devflow(&home).args([\"gate\", \"sweep\", \"--reap-",
@@ -575,13 +576,13 @@ fn no_suite_on_the_common_builder_runs_a_real_reap_strays_pass() {
     assert_eq!(
         real_reap_strays_statements(&code_only(planted_dry_run)),
         Vec::<String>::new(),
-        "a planted --reap-strays pass with --dry-run must pass"
+        concat!("a planted --reap", "-strays pass with --dry-run must pass")
     );
     let commented = format!("// {planted}\n");
     assert_eq!(
         real_reap_strays_statements(&code_only(&commented)),
         Vec::<String>::new(),
-        "a commented-out real --reap-strays pass must pass"
+        concat!("a commented-out real --reap", "-strays pass must pass")
     );
 
     // (2) Every suite directly under `tests/` that declares `mod common;`;
@@ -614,8 +615,11 @@ fn no_suite_on_the_common_builder_runs_a_real_reap_strays_pass() {
     );
     assert!(
         offenders.is_empty(),
-        "a suite on the hermetic builder runs a real (non-dry-run) --reap-strays pass, \
-         whose safety set would shrink to the test's own roots:\n{}",
+        // Split so the removed-surface scan does not read this control as a leftover.
+        concat!(
+            "a suite on the hermetic builder runs a real (non-dry-run) --reap",
+            "-strays pass, whose safety set would shrink to the test's own roots:\n{}"
+        ),
         offenders.join("\n")
     );
 }

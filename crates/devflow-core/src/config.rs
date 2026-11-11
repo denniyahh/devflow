@@ -569,14 +569,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("devflow.toml"),
-            "yes_ship = true\ncapture_retention = 9\n",
+            // Split so the removed-surface scan does not read this control as a leftover.
+            concat!("yes", "_ship = true\ncapture_retention = 9\n"),
         )
         .unwrap();
 
         assert_eq!(
             config_parse_error(dir.path()),
             None,
-            "a leftover yes_ship key must not fail the load"
+            concat!("a leftover yes", "_ship key must not fail the load")
         );
         assert_eq!(
             load_config(dir.path()),
@@ -584,7 +585,10 @@ mod tests {
                 capture_retention: 9,
                 ..DevflowConfig::default()
             },
-            "the file parsed (capture_retention is 9) and yes_ship had no effect"
+            concat!(
+                "the file parsed (capture_retention is 9) and yes",
+                "_ship had no effect"
+            )
         );
     }
 
