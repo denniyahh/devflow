@@ -52,7 +52,14 @@
   **Fix shape:** reword it to say the fixture builds a main + develop repo with a committed Cargo.toml. Fits 52-18's comment-stripped scan pass.
 
 - No test now pins that `yes_ship` cannot auto-approve a preflight gate (found in 52-13)
-  status: open
+  status: resolved
+  **Resolution (52-14):** `State.yes_ship`, `--yes-ship`, `DEVFLOW_YES_SHIP` and the toml key are removed, so nothing can pre-authorize any gate and the property has no subject.
   **What:** `preflight::tests::run_preflight_major_bump_gate_not_auto_approved_by_yes_ship` was the test that drove `run_preflight` into its gate with `yes_ship` set and proved the gate timed out instead of approving. It needed the major-bump check to produce a failing reason, so 52-13 deleted it with the check. `unattended_check_is_not_bypassed_by_yes_ship` still covers the unattended check's own predicate, not the gate.
   **Why deferred:** 52-14 deletes `State.yes_ship` and `--yes-ship`, after which the property has no subject.
   **Fix shape:** none needed if 52-14 removes `yes_ship` as planned; otherwise re-seed the test on the interactivity check (Codex + Auto + Define + no CONTEXT.md).
+
+- `run_gate_with_timeout`'s `auto_response` parameter and safe point 5 have no production caller (found in 52-14)
+  status: open
+  **What:** with `yes_ship` gone, `handle_ship_outcome` passes `None`, and no production call site passes `Some`. The parameter, the safe-point-5 stop check that runs only for an auto-answered gate, and their tests in `pipeline_gate.rs` (`a_stopped_auto_answered_run_sends_no_ship_notify`, `a_pre_authorized_answer_left_unconfirmed_still_decides_its_own_gate`, helper `auto_answered_ship_gate`) are kept, so they now test a path nothing reaches.
+  **Why deferred:** removing the parameter touches every call (3 in production code, 10 in tests) and the safe-point numbering, which is beyond 52-14's flag/env/key/field scope; 52-15 removes `Stage::Ship` and `handle_ship_outcome`, the last caller that ever passed one.
+  **Fix shape:** in 52-15, drop the parameter and safe point 5 with `handle_ship_outcome`, and delete or re-seed those tests (they drive `Stage::Ship`).
