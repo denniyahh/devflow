@@ -678,14 +678,19 @@ impl Supervisor {
     /// End the supervisor: stop the control thread, remove the socket and
     /// sidecar, then send each parked shutdown caller its final line. That
     /// line is `stopped` only when the run ended as a stop
-    /// ([`AgentOutcome::Stopped`] or a safe point that stopped), otherwise
-    /// `{"ok":false,"error":"handed_off"}`, so no caller is told a stop
-    /// happened that did not. The files go before the line, so a caller that
-    /// reads `stopped` finds the socket already gone.
+    /// ([`AgentOutcome::Stopped`] or a safe point that stopped);
+    /// `{"ok":false,"error":"already_finished"}` when the CLI marked the run
+    /// [`OwnerPhase::Finished`] because it finished while the stop was pending
+    /// (a permitted finish wins over a late stop, operator decision
+    /// 2026-11-11); otherwise `{"ok":false,"error":"handed_off"}`, so no caller
+    /// is told a stop happened that did not. The files go before the line, so a
+    /// caller that reads `stopped` finds the socket already gone.
     pub fn finish(mut self) {
         let parked = self.close();
         let reply = if self.token.ended_stopped() {
             stopped_reply(self.token.lock().group_signalled)
+        } else if self.token.phase() == OwnerPhase::Finished {
+            Reply::Error("already_finished".to_string())
         } else {
             Reply::Error("handed_off".to_string())
         };

@@ -480,10 +480,15 @@ says so in one printed note and records one `until_noop` event with
 `{"until":"validate"}`; `--until plan` and `--until code` do neither.
 
 A `devflow stop` taken while the run advances toward its finish (for example
-just after the Validate gate was approved) is honoured first, at safe point 6:
-the run ends stopped at Validate with `finished: false`, no
-`workflow_finished` is recorded, and `devflow resume` reruns Validate, which
-asks again.
+just after the Validate gate was approved) loses to a finish that is
+permitted: when GSD's fresh status is `passed` and the Validate pass is on the
+current commit over a clean tree, the run is recorded finished, one
+`workflow_finished` is recorded, and `stop` prints that the run already
+finished and that nothing was stopped (the supervisor answers
+`already_finished`, never `handed_off`). A stop that lands where no finish is
+permitted (the approve runs Validate again, the gap loop or the re-verify
+pass) is honoured at the next advance safe point as before, and the run ends
+stopped and unfinished.
 
 Finishing never merges, pushes, tags, deletes or resets anything and runs no
 hook: the worktree and the `feature/phase-NN` branch are left as Validate left
