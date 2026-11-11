@@ -5,16 +5,16 @@ milestone_name: Session Continuity
 current_phase: 52
 current_phase_name: Subtract and Stabilize
 status: executing
-stopped_at: Completed 52-11-PLAN.md
-last_updated: "2026-11-10T23:31:46.065Z"
+stopped_at: Completed 52-12-PLAN.md
+last_updated: "2026-11-11T00:12:15.423Z"
 last_activity: 2026-11-10
 last_activity_desc: Phase 52 execution started
-state_head: b46ce19a29cdcc6abce9f043b4a90f820d965467
+state_head: 2c3071e2078042365bf3fcfe7f932ee5bb9e7e9c
 progress:
   total_phases: 4
   completed_phases: 0
   total_plans: 33
-  completed_plans: 11
+  completed_plans: 12
   percent: 0
 ---
 
@@ -159,7 +159,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 52 (Subtract and Stabilize) — EXECUTING
-Plan: 12 of 33
+Plan: 13 of 33
 Status: Ready to execute
 Last activity: 2026-11-10 — Phase 52 execution started
 
@@ -851,6 +851,8 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 52]: A rate limit with no usable fallback waits at the never-silent stage gate and does not charge infra_failures; its context leads with devflow resume --phase N, then the reset time, then the cause (52-09)
 - [Phase 52]: The cron-instructions file has no reader, writer, cleaner, doc or ignore pattern left; ship.rs keeps only ShipError and prepend_changelog, recover has no cron arm, and workflow::clear_state_if lost its after_clear step (52-10)
 - [Phase 52]: devflow ship is an unknown subcommand: ship_override, claim_ship_answer, ship_answer_stored, refuse_ship_over_a_live_supervisor, stop's Ship case and DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS are gone, and no message names devflow ship; gate approve still stores a no-waiter Ship answer until 52-15 (52-11)
+- [Phase 52]: An approved Ship gate (reachable only from a 3.x state) ends the run through finish_run, keeping state and branch; handle_ship_outcome goes with Stage::Ship in 52-15 (52-12)
+- [Phase 52]: devflow_core::hooks and devflow_core::lock are deleted (semver major, intended); git.rs commit_all is left uncalled and logged for 52-18 (52-12)
 
 ## Roadmap Evolution
 
@@ -973,11 +975,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 52 P09 | 18 min | 2 tasks | 7 files |
 | Phase 52 P10 | 23 min | 2 tasks | 16 files |
 | Phase 52 P11 | 25 min | 2 tasks | 17 files |
+| Phase 52 P12 | 32 min | 2 tasks | 24 files |
 
 ## Session
 
-**Last session:** 2026-11-10T23:31:45.865Z
-**Stopped at:** Completed 52-11-PLAN.md
+**Last session:** 2026-11-11T00:12:15.177Z
+**Stopped at:** Completed 52-12-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
