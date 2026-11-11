@@ -31,7 +31,7 @@ requirement closes a backlog entry, the entry is named; `.planning/user/V4-CUT-I
 
 ### Supervise gate loop (GATE)
 
-- [ ] **GATE-01**: A gate rejection's note reaches the relaunched agent's prompt verbatim. A gate answer aborts the run
+- [x] **GATE-01**: A gate rejection's note reaches the relaunched agent's prompt verbatim. A gate answer aborts the run
       only when it is an explicit abort answer, never because the word "abort" appears in a note. DevFlow's own
       infra-ceiling abort is out of this requirement's scope. Closes 999.189. (Amended 2026-11-08 by the operator after
       the Phase 52 context review, 52-CONTEXT D-20.)
@@ -39,7 +39,7 @@ requirement closes a backlog entry, the entry is named; `.planning/user/V4-CUT-I
       GSD's gaps route (`plan-phase --gaps`, then `execute-phase --gaps-only`). A rejection of a clean pass runs
       `/gsd-quick` with the operator's note. Closes 999.192. (Amended 2026-11-08 by the operator after the Phase 52
       context review, 52-CONTEXT D-21.)
-- [ ] **GATE-03**: A verification that reports `gaps_found` can be driven to `passed` from inside the run: the relaunched
+- [x] **GATE-03**: A verification that reports `gaps_found` can be driven to `passed` from inside the run: the relaunched
       agent is told to plan and close the gaps and re-verify, and the Validate gate never says "passed" while the
       report says otherwise. DevFlow follows GSD's routes and does not re-judge GSD's report: a run finishes only
       when GSD reports `passed` and the Validate agent passed on the current commit. Closes 999.193, 999.205.
@@ -134,9 +134,9 @@ Populated during roadmap creation (2026-11-08). Phase order and dependencies: RO
 | CUT-02 | Phase 52 — Subtract and Stabilize | Complete |
 | CUT-03 | Phase 52 — Subtract and Stabilize | Pending |
 | CUT-04 | Phase 52 — Subtract and Stabilize | Complete |
-| GATE-01 | Phase 52 — Subtract and Stabilize | Pending |
+| GATE-01 | Phase 52 — Subtract and Stabilize | Complete |
 | GATE-02 | Phase 52 — Subtract and Stabilize | Pending |
-| GATE-03 | Phase 52 — Subtract and Stabilize | Pending |
+| GATE-03 | Phase 52 — Subtract and Stabilize | Complete |
 | GATE-04 | Phase 52 — Subtract and Stabilize | Pending |
 | OPS-01 | Phase 52 — Subtract and Stabilize | Complete |
 | OPS-02 | Phase 52 — Subtract and Stabilize | Complete |

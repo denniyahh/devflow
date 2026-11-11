@@ -5,16 +5,16 @@ milestone_name: Session Continuity
 current_phase: 52
 current_phase_name: Subtract and Stabilize
 status: executing
-stopped_at: Completed 52-28-PLAN.md
-last_updated: "2026-11-11T11:12:31.423Z"
+stopped_at: Completed 52-29-PLAN.md
+last_updated: "2026-11-11T12:49:48.122Z"
 last_activity: 2026-11-10
 last_activity_desc: Phase 52 execution started
-state_head: 43d1d2761576e0e03b346a378142480320492df9
+state_head: fcaf6efb4f3a81b1e57f0821faeea806a69faac2
 progress:
   total_phases: 4
   completed_phases: 0
   total_plans: 33
-  completed_plans: 28
+  completed_plans: 29
   percent: 0
 ---
 
@@ -159,7 +159,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 52 (Subtract and Stabilize) — EXECUTING
-Plan: 29 of 33
+Plan: 30 of 33
 Status: Ready to execute
 Last activity: 2026-11-10 — Phase 52 execution started
 
@@ -885,6 +885,8 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 52]: 52-26: a rejection with no note keeps an earlier relaunch_note; a rejection with a note replaces it (record_relaunch_note)
 - [Phase 52]: 52-27: the gap-closure marker (State.gap_closure_pass) is set by the Validate->Plan transition and cleared only by a passed read, the finish, an abort or a non-gaps loop-back; the post-check compares file modified times (plan newer than VERIFICATION.md)
 - [Phase 52]: 52-28: a stale or missing Validate takes FixType::StaleReverify, whose prompt quotes GSD's status, route and next action from State.code_fix_report (set with code_fix); record_validate_failure is the one streak update and now also counts the no_gap_closure_plan gate
+- [Phase 52]: 52-29 (operator decision 2026-11-11): a permitted finish wins over a late stop; finish_run no longer stops at safe point 6, the supervisor answers the pending stop already_finished, and a stop without a finish permit keeps its handling
+- [Phase 52]: 52-29: can_finish (FinishPermit, private field) is the one finish check and next_step the one D-45 table; after Validate only a failure_cap label opens ahead of it, so an ambiguous verdict in auto over gaps_found/stale/missing follows the table; a rejected verification gate runs /gsd-quick (FixType::Quick) with the note
 
 ## Roadmap Evolution
 
@@ -1024,11 +1026,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 52 P26 | 33 min | 3 tasks | 10 files |
 | Phase 52 P27 | 41 min | 3 tasks | 12 files |
 | Phase 52 P28 | 38 min | 3 tasks | 10 files |
+| Phase 52 P29 | 86 min | 3 tasks | 16 files |
 
 ## Session
 
-**Last session:** 2026-11-11T11:12:31.235Z
-**Stopped at:** Completed 52-28-PLAN.md
+**Last session:** 2026-11-11T12:49:47.921Z
+**Stopped at:** Completed 52-29-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
