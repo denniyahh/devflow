@@ -92,39 +92,6 @@ const PROMOTION_WAIT: Duration = PROMOTION_WAIT_RELEASE;
 #[cfg(test)]
 const PROMOTION_WAIT: Duration = Duration::from_secs(5);
 
-/// The post-preflight body of [`launch_stage`]: capture archival/rollover
-/// and spawning the monitor. (25b, D-03: this function no longer performs
-/// self-dogfood build-staleness enforcement — that check is now adjudicated
-/// once, in `commands::start`, before this function's first caller ever
-/// runs. See the module-level history at the removed call site below.)
-/// Extracted (18f, D-18f) so `run_preflight`'s `Advance` arm can call it
-/// directly and skip the just-adjudicated preflight check, while every
-/// other caller keeps going through [`launch_stage`]'s full path (readiness
-/// resolution, `ensure_agent_binary`, then `run_preflight`).
-///
-/// 35.2 (999.89 / HARDEN-03, P-01/P-02): stamp the run-owned nonce and
-/// re-observe the artifact baseline into a window scoped to THIS Validate
-/// dispatch.
-///
-/// The stamp and the re-observation are ONE mechanism — do not separate.
-/// Extracted so the co-location is testable without spawning an agent.
-fn stamp_validate_dispatch_window(state: &mut State) {
-    if state.stage != Stage::Validate {
-        return;
-    }
-    let evidence_root = state
-        .worktree_path
-        .as_deref()
-        .unwrap_or(&state.project_root);
-    state.verification_run_nonce =
-        Some(state.verification_run_nonce.unwrap_or(0).saturating_add(1));
-    state.last_verification_fingerprint =
-        devflow_core::agent_result::phase_verification_fingerprint(evidence_root, state.phase);
-    state.last_verification_mtime_nanos =
-        devflow_core::agent_result::phase_verification_mtime_nanos(evidence_root, state.phase);
-    state.verification_baseline_captured = true;
-}
-
 /// The prompt a launch with no override gives the agent, rendered by `driver`
 /// (Phase 51 D-09). At Code it replays the persisted fix pass
 /// ([`State::code_fix`]), so a same-stage relaunch inside a gaps-only or
@@ -149,6 +116,16 @@ fn default_stage_prompt(state: &State, driver: &dyn agents::AgentDriver) -> Stri
     driver.render_prompt(&intent)
 }
 
+/// The post-preflight body of [`launch_stage`]: capture archival/rollover
+/// and spawning the monitor. (25b, D-03: this function no longer performs
+/// self-dogfood build-staleness enforcement — that check is now adjudicated
+/// once, in `commands::start`, before this function's first caller ever
+/// runs. See the module-level history at the removed call site below.)
+/// Extracted (18f, D-18f) so `run_preflight`'s `Advance` arm can call it
+/// directly and skip the just-adjudicated preflight check, while every
+/// other caller keeps going through [`launch_stage`]'s full path (readiness
+/// resolution, `ensure_agent_binary`, then `run_preflight`).
+///
 /// Recomputes `prompt`/`adapter`/`roots`/`program`/`args` from `state` and
 /// `prompt_override` — deliberately NOT threaded through as parameters.
 /// They are pure functions of `state` and the prompt override; recomputing
@@ -228,8 +205,6 @@ pub(crate) fn launch_stage_inner(
     // `infra_failures`). Persisted below by `spawn_agent_and_record`'s first
     // commit — no extra save needed here.
     state.checkpoint_resumes = 0;
-
-    stamp_validate_dispatch_window(state);
 
     spawn_agent_and_record(
         state,
@@ -2068,7 +2043,7 @@ fn spawn_agent_and_record(
     launch: monitor::MonitorLaunch,
 ) -> Result<(), CliError> {
     // Persist the caller's launch bookkeeping (`launch_stage_inner`'s
-    // `checkpoint_resumes` reset and Validate dispatch stamp) before
+    // `checkpoint_resumes` reset) before
     // anything is spawned, as this save always has. It once also cleared
     // the previous stage's monitor pid (WR-04, 18-fix); that field is gone
     // from the CLI (50-22), and the record keeps its own rule below.
@@ -6424,115 +6399,6 @@ mod tests {
         );
         let reloaded = workflow::load_state(root, phase).unwrap();
         assert_eq!(reloaded.checkpoint_resumes, 0);
-    }
-
-    /// 35.2 P-02: the nonce stamp and baseline re-observation are co-located
-    /// and gated on Validate. Both arms must disagree — a stamp on every
-    /// stage re-widens the window at the Code stage.
-    #[test]
-    fn launch_stage_inner_stamps_the_validate_dispatch_nonce_with_its_baseline() {
-        let _guard = env_lock();
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(92);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        let worktree = root.join(format!(".worktrees/phase-{phase}"));
-        std::fs::create_dir_all(&worktree).unwrap();
-        state.worktree_path = Some(worktree.clone());
-
-        // Write an artifact under the evidence root.
-        let phase_dir = worktree
-            .join(".planning/phases")
-            .join(format!("{padded}-stamp", padded = phase.padded()));
-        std::fs::create_dir_all(&phase_dir).unwrap();
-        std::fs::write(
-            phase_dir.join(format!("{padded}-VERIFICATION.md", padded = phase.padded())),
-            "verdict: pass\n",
-        )
-        .unwrap();
-
-        let fingerprint_before =
-            devflow_core::agent_result::phase_verification_fingerprint(&worktree, phase);
-
-        // Validate stage: nonce advances, fingerprint refreshed.
-        state.stage = Stage::Validate;
-        stamp_validate_dispatch_window(&mut state);
-        assert_eq!(state.verification_run_nonce, Some(1));
-        assert_eq!(
-            state.last_verification_fingerprint, fingerprint_before,
-            "fingerprint must match the on-disk artifact after stamp"
-        );
-        assert!(state.verification_baseline_captured);
-
-        // Non-Validate stage: nothing changes.
-        let nonce_after_validate = state.verification_run_nonce;
-        let fp_after_validate = state.last_verification_fingerprint;
-        state.stage = Stage::Code;
-        stamp_validate_dispatch_window(&mut state);
-        assert_eq!(
-            state.verification_run_nonce, nonce_after_validate,
-            "nonce must not change on non-Validate stages"
-        );
-        assert_eq!(
-            state.last_verification_fingerprint, fp_after_validate,
-            "fingerprint must not change on non-Validate stages"
-        );
-    }
-
-    /// A Validate launch's dispatch stamp reaches disk with its first commit, and only
-    /// its fields do: a revoke another writer made since the caller loaded is kept.
-    #[test]
-    fn a_validate_launch_commits_its_dispatch_stamp() {
-        const NAME: &str = "pipeline_launch::tests::a_validate_launch_commits_its_dispatch_stamp";
-        enter_agent_free_child!(NAME, "codex");
-        let _guard = env_lock();
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        init_repo(root);
-        let phase = PhaseId::new(93);
-        let worktree = root.join(format!(".worktrees/phase-{phase}"));
-        let phase_dir = worktree
-            .join(".planning/phases")
-            .join(format!("{padded}-stamp", padded = phase.padded()));
-        std::fs::create_dir_all(&phase_dir).unwrap();
-        std::fs::write(
-            phase_dir.join(format!("{padded}-VERIFICATION.md", padded = phase.padded())),
-            "verdict: pass\n",
-        )
-        .unwrap();
-        let observed = (
-            devflow_core::agent_result::phase_verification_fingerprint(&worktree, phase),
-            devflow_core::agent_result::phase_verification_mtime_nanos(&worktree, phase),
-        );
-        assert!(
-            observed.0.is_some(),
-            "premise: the artifact has a fingerprint"
-        );
-
-        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
-        state.stage = Stage::Validate;
-        state.worktree_path = Some(worktree);
-        workflow::save_state(&state).unwrap();
-        workflow::update_state(root, phase, |on_disk| {
-            on_disk.base_branch = Some("workspace/concurrent".to_string());
-            Ok::<(), workflow::WorkflowError>(())
-        })
-        .unwrap();
-
-        let result = launch_stage_inner(&mut state, None, None);
-        let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
-        result.unwrap();
-
-        let after = workflow::load_state(root, phase).unwrap();
-        assert_eq!(after.verification_run_nonce, Some(1));
-        assert_eq!(after.last_verification_fingerprint, observed.0);
-        assert_eq!(after.last_verification_mtime_nanos, observed.1);
-        assert!(after.verification_baseline_captured);
-        assert_eq!(
-            after.base_branch.as_deref(),
-            Some("workspace/concurrent"),
-            "the concurrent write is kept"
-        );
     }
 
     // ---- D-15 delivery-canary gate (31-03) ------------------------------
