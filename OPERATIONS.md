@@ -315,7 +315,8 @@ pass on that commit.
 
 | Gate kind | Approve | Reject with a note | Abort |
 |---|---|---|---|
-| `stage_failure` (a rate-limit gate included) | retries the stage | relaunches the stage with the note | ends the run |
+| `stage_failure` | retries the stage | relaunches the stage with the note | ends the run |
+| `rate_limit` | relaunches the stage now on the same agent | relaunches the stage with the note | ends the run |
 | `stage_failure` on a run whose recorded delivery canary refuses its agent | stops the run; the way on is `devflow resume --phase N --agent <other>` | the same, and the note is kept for that resume | ends the run |
 | `preflight` | relaunches the stage with the failed check overridden | not offered: refused | ends the run |
 | `checkpoint_declaration` | records the checkpoints as seen and relaunches Code | not offered: refused | ends the run |
@@ -400,12 +401,41 @@ A rate-limited stage gets one of two answers.
   the run. The run's recorded delivery canary does not change these answers.
   When the denial named a reset time, the gate file records `not_before` (the
   reset plus 60 seconds), and `devflow gate sweep` leaves the gate alone until
-  then, however old it is. `devflow resume
-  --phase N` is refused while the supervisor waits at the gate, so it is the
-  way on after the reset once that supervisor has ended. Waiting for quota
-  does not count toward the infra ceiling, so it cannot abort the run, and
-  DevFlow does not yet relaunch by itself at the reset time: answer the gate
-  or resume by hand.
+  then, however old it is. Waiting for quota does not count toward the infra
+  ceiling, so it cannot abort the run.
+
+  **The one automatic relaunch.** When the denial named a reset time, the
+  waiting supervisor relaunches the stage by itself once `not_before` has
+  passed with the gate still unanswered: it answers the gate as
+  `devflow-rate-limit-timer` (the answer's `responded_by`), and the stage
+  relaunches on the same agent, as an approve would. The wake is the reset plus
+  60 seconds whatever the gate timeout. The gate keeps waiting past
+  `DEVFLOW_GATE_TIMEOUT_SECS` when the reset is later, and the relaunch still
+  happens at the wake. This happens at most once per run: the supervisor
+  records `rate_limit_auto_relaunch_used: true` in `state-NN.json` before it
+  writes the answer. If an operator answered first, the supervisor takes that
+  answer and the flag goes back to false. A gate's answer is claimed once, so
+  the timer and an operator answering the same gate launch the stage once.
+
+  - A second denial after the automatic relaunch opens the same kind of gate.
+    The gate records its `not_before`, but no timer is armed, and it waits for
+    an operator.
+  - A denial with no reset time is an ordinary blocking gate. Nothing is
+    guessed and nothing relaunches by itself.
+  - An operator's answer (`gate approve` relaunches now, `gate reject --note`
+    relaunches with the note in the stage's prompt, `gate abort` ends the run)
+    does not use up the run's one automatic relaunch. A later denial with a
+    reset time still gets it.
+  - A resume, a stop and resume, or a supervisor takeover after the automatic
+    relaunch was used does not arm it again.
+  - A crash after the supervisor recorded the flag leaves no automatic
+    relaunch: nothing re-arms the timer or writes its answer again. Run the
+    `devflow resume --phase N` command the gate names. `devflow resume` is
+    refused while the waiting supervisor is alive, so it is the way on once
+    that supervisor has ended. It closes the phase's gates and relaunches the
+    stage itself.
+
+  The timer's write is recorded as a `rate_limit_timer_fired` event (below).
 
 Only top-level events decide a rate limit: a subagent's rate-limit event or
 `result` in the capture does not. A stage that went silent with no quota
@@ -437,6 +467,7 @@ The failover events in `events.jsonl`:
 |---|---|---|
 | `agent_handoff` | The run changed agent | `stage`, `from_agent`, `to_agent`, `reason` (`rate_limited` for a failover, `resume --agent` for `devflow resume --agent`), `tree_dirty` (the tree handed over had uncommitted changes), `commit_count` (commits on the phase branch). Each of the last two is `null` when it could not be measured |
 | `agent_handoff_refused` | The fallback was refused before the handoff; the rate-limit gate follows | `stage`, `from_agent`, `to_agent`, `reason` |
+| `rate_limit_timer_fired` | The rate-limit gate's reset plus margin passed with the gate unanswered, and the supervisor's timer tried its one answer | `stage`, `gate_id`, `outcome` (`answered`; `operator_answered_first`, when an operator's answer was taken instead and the automatic relaunch stays unused; `failed`, when the write failed, the automatic relaunch is spent and the gate waits for an operator) |
 | `agent_handoff_relaunch_failed` | The handoff happened, but Code could not be relaunched under the fallback | `stage`, `from_agent`, `to_agent`, `reason` (the launch error) |
 | `gate_relaunch_refused` | A retry or loop-back answer to a stage's failure gate was not relaunched, because the delivery canary recorded for the run refuses its agent; the run is marked stopped | `stage`, `agent`, `reason` (the recorded refusal) |
 
@@ -546,8 +577,9 @@ What a run records:
   `clean_pass`, `gaps_found`, `reverify_needed`, `reader_failure`,
   `failure_cap`), and the `gate_fired` event carries the same value. Gates
   outside Validate's routes record one too: `stage_failure` for a failed stage
-  at any stage (a rate-limit gate included), `preflight` for a failed preflight
-  check and `checkpoint_declaration` for an unapproved human-only checkpoint.
+  at any stage, `rate_limit` for a rate limit no fallback takes, `preflight`
+  for a failed preflight check and `checkpoint_declaration` for an unapproved
+  human-only checkpoint.
   A gate file written by a 3.x binary has no `gate_kind` and still loads.
 - An agent pass is recorded in the state file's `validate_pass_head`, the
   commit the Validate ran on; any other verdict clears it. A commit that cannot

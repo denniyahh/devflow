@@ -6,6 +6,7 @@
   **Impact:** the result is a later instant, never an earlier one, so a relaunch cannot fire before the named time. It is still a date the agent never meant.
   **Fix shape:** refuse a day past the month's length (leap-aware) and add a test for Feb 29 on leap and non-leap years. Fits plan 52-31 or 52-32, where the rate-limit gate consumes the parser.
   **52-31:** not taken. 52-31 added the gate's timing functions to `reset_time.rs` and records `not_before` from the parsed reset, but did not change `parse_reset_time`. A past-the-month date still reads as a later instant, so `not_before` can only be later than meant, never earlier. Deferred to 52-32, which wires the timer.
+  **52-32:** not taken. 52-32 wired the timer but did not change `parse_reset_time`; its effect on the timer is a wake later than meant (the relaunch waits longer), never an earlier one. Still open; fits a post-phase fix branch.
 
 - devflow-core stray-reaping primitives outlived their only destructive caller (found in 52-03)
   status: open
@@ -25,6 +26,7 @@
   **What:** 52-10 removed the cron-instructions file and every reader. Doc comments that still describe a "resume cron" or "cron arm" as live behaviour remain in `crates/devflow-core/src/agent_result.rs` (about nine, e.g. "drives the primary rate-limit resume cron"), `monitor.rs`, `state.rs` (`fallback_agent` doc, "takes the cron-resume arm"), `reset_time.rs`, `crates/devflow-cli/src/staleness.rs` and `pipeline_outcomes.rs:94`. In `pipeline_launch.rs` tests, names and messages still say "cron arm" (`a_cron_resume_and_an_ordinary_resume_refuse_alike_*`, "a failed relaunch never takes the cron arm (R2-D1)"), and the SUPV-01 evidence check requires a `Cron arm: ` conclusion line.
   **Why deferred:** comments and test wording only; none names the `cron-instructions` token outside comments, so the 52-18 scan does not see them. The test names are cited by the 51-10 SUPV-01 evidence file, so renaming them needs that file changed in the same commit. None of these files except `pipeline_launch.rs`/`pipeline_outcomes.rs` was in 52-10's scope.
   **52-31:** not taken; this plan rewrote `handle_rate_limited_outcome`'s doc (which says no cron file is written, accurately) and touched none of the listed comments. Still open for 52-32.
+  **52-32:** not taken. 52-32 rewrote `handle_rate_limited_outcome`'s doc again (it now names the timer) and touched none of the listed comments or test names. Still open; fits a post-phase fix branch together with the 51-10 evidence file.
   **Fix shape:** reword the comments to say the run waits at the rate-limit gate; rename the `a_cron_resume_*` tests and their `Cron arm` evidence label together with `.planning/milestones/v3.0.0-phases/51-rate-limit-agent-failover/51-SUPV01-EVIDENCE.md`, or leave the evidence label as history. Fits 52-18 (the CUT-04 scan plan) or 52-31/52-32.
 
 - `gate approve` still stores a Ship answer when no waiter is registered (found in 52-11)
