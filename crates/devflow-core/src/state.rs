@@ -482,6 +482,17 @@ pub struct State {
     /// default prompt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_fix: Option<crate::prompt::FixType>,
+    /// The commit a Validate agent PASS was recorded on (52-22, D-45 rule 1's
+    /// input): the evidence root's HEAD, read when the Validate outcome was
+    /// classified. Written only by the CLI's `handle_validate_outcome`, on every
+    /// classified Validate verdict: the HEAD on an agent PASS, `None` on a FAIL, an
+    /// ambiguous verdict or a HEAD that could not be read. Nothing else clears it,
+    /// so a stop, a transition, a resume or a supervisor takeover keeps it.
+    ///
+    /// `None` also means "no Validate has been classified in this run" or "the
+    /// state was written by a binary predating this field".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validate_pass_head: Option<String>,
 }
 
 /// The persisted handle on a launch's supervisor ([`State::supervisor`]).
@@ -723,6 +734,7 @@ impl State {
             fallback_agent: None,
             fallback_consumed: false,
             code_fix: None,
+            validate_pass_head: None,
         }
     }
 }

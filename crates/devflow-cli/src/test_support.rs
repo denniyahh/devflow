@@ -904,6 +904,11 @@ impl GsdStub {
     pub(crate) fn home(&self) -> PathBuf {
         self.dir.path().join("home")
     }
+
+    /// The calls the stub logged, as `(working directory, argv)`.
+    pub(crate) fn calls(&self) -> Vec<(PathBuf, String)> {
+        devflow_core::test_support::gsd_run_calls(&self.dir.path().join("logs"))
+    }
 }
 
 impl Drop for GsdStub {
