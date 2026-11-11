@@ -1980,7 +1980,8 @@ mod tests {
 
     /// U7: `relaunch_note` is `None` once the run leaves the stage it was given
     /// for, on each production way out at this wave: `transition` (both of its
-    /// commits: the ordinary move and the `--until` halt), the Validate
+    /// commits: the ordinary move and the `--until` halt), the gap-closure
+    /// route's `transition` from Validate to Plan (52-27), the Validate
     /// loop-back to Code (`prepare_loop_back_to_code`, which does not call
     /// `transition`) and `finish_run`. Controls, so each cleared assertion can
     /// fail: a stop and resume at the same stage keeps the note, and a Code
@@ -2016,6 +2017,28 @@ mod tests {
                 "{from} -> {to}: the {to} intent carries no relaunch note"
             );
         }
+
+        // Validate -> Plan, the gap-closure route's way out of Validate (52-27):
+        // a state at Validate with the note (as a rejected Validate stage-failure
+        // gate's relaunch leaves it) and the gap-closure marker set.
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(5287);
+        let mut state = noted_state(dir.path(), phase, Stage::Validate);
+        state.gap_closure_pass = true;
+        workflow::save_state(&state).unwrap();
+        let result = transition(dir.path(), &mut state, Stage::Plan);
+        let moved = workflow::load_state(dir.path(), phase).unwrap();
+        let _reap_gap = ReapMonitorOnDrop::after_launch(&moved);
+        result.unwrap();
+        assert_eq!(moved.stage, Stage::Plan);
+        assert_eq!(
+            moved.relaunch_note, None,
+            "validate -> plan: the gap route's transition clears the relaunch note"
+        );
+        assert!(
+            !has_relaunch_block(&default_prompt(&moved)),
+            "validate -> plan: the gaps Plan intent carries no relaunch note"
+        );
 
         // Validate -> Code through the loop-back, which does not call `transition`.
         let dir = tempfile::tempdir().unwrap();
