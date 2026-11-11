@@ -783,7 +783,7 @@ pub(crate) fn handle_validate_outcome(
 }
 
 /// Record one failed Validate on the counters: the per-phase total, the
-/// consecutive streak (999.66, 999.77) and the 35.2 nonce.
+/// consecutive streak (999.66, 999.77).
 fn record_validate_failure(project_root: &Path, state: &mut State) -> Result<(), CliError> {
     // 999.78/WR-01 (D-07): the per-phase total accumulates on EVERY recorded
     // failure — including the arm below where the commit count could not be
@@ -854,13 +854,6 @@ fn record_validate_failure(project_root: &Path, state: &mut State) -> Result<(),
                 s.consecutive_failures = s.consecutive_failures.saturating_add(1);
             }
         }
-    })?;
-    // 35.2: stamp the nonce on every Validate failure so the loop-back cycle
-    // sees it. launch_stage_inner stamps on the launch path; this stamps on the
-    // already-running path where launch_stage_inner already ran for THIS
-    // dispatch.
-    commit(state, |s| {
-        s.verification_run_nonce = Some(s.verification_run_nonce.unwrap_or(0).saturating_add(1));
     })
 }
 
@@ -4269,14 +4262,11 @@ mod tests {
         assert!(started.elapsed() >= std::time::Duration::from_secs(1));
     }
 
-    /// A loop-back answered at the ceiling gate persists both the budget reset and the
-    /// verification observation. Each is a write of its own or part of one: an
-    /// ordering that replaced the caller's copy between recording the observation and
-    /// writing it would lose it, and the next cycle would read an unchanged artifact
-    /// as fresh (F-11).
+    /// A loop-back answered at the ceiling gate persists the budget reset: the reset's
+    /// commit and the loop-back's commit both reach disk.
     #[test]
-    fn a_ceiling_loop_back_persists_the_reset_and_the_verification_observation() {
-        const NAME: &str = "pipeline_outcomes::tests::a_ceiling_loop_back_persists_the_reset_and_the_verification_observation";
+    fn a_ceiling_loop_back_persists_the_reset() {
+        const NAME: &str = "pipeline_outcomes::tests::a_ceiling_loop_back_persists_the_reset";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_git_only_path_dir();
             let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
@@ -4292,16 +4282,6 @@ mod tests {
             .join(".planning/phases")
             .join(format!("{padded}-test", padded = phase.padded()));
         std::fs::create_dir_all(&phase_dir).unwrap();
-        std::fs::write(
-            phase_dir.join(format!("{padded}-VERIFICATION.md", padded = phase.padded())),
-            "verdict: gaps — written by this run\n",
-        )
-        .unwrap();
-        let observed = agent_result::phase_verification_fingerprint(&worktree, phase);
-        assert!(
-            observed.is_some(),
-            "premise: the artifact has a fingerprint"
-        );
 
         let mut state = State::new(
             phase,
@@ -4313,8 +4293,6 @@ mod tests {
         state.worktree_path = Some(worktree.clone());
         state.phase_validate_failures = mode::MAX_PHASE_VALIDATE_FAILURES - 1;
         state.verification_baseline_captured = true;
-        state.verification_run_nonce = Some(1);
-        state.last_verification_fingerprint = observed;
         workflow::save_state(&state).unwrap();
         preanswer_gate(
             root,
@@ -4332,13 +4310,6 @@ mod tests {
         let after = workflow::load_state(root, phase).unwrap();
         assert_eq!(after.stage, Stage::Code, "premise: the run looped back");
         assert_eq!(after.phase_validate_failures, 0, "the reset is on disk");
-        // 52-22: the Validate path no longer records the report-authorship
-        // heuristic's observation (52-24 deletes it); the loop-back write must
-        // still keep the one already on disk.
-        assert_eq!(
-            after.last_verification_fingerprint, observed,
-            "the observation on disk is kept"
-        );
     }
 
     /// A state saved as `seed` left it, and the stale copy a handler's caller loaded
@@ -4385,7 +4356,6 @@ mod tests {
                 state.consecutive_failures = 2;
                 state.phase_validate_failures = 2;
                 state.last_validate_failure_commit_count = Some(0);
-                state.verification_run_nonce = Some(7);
             },
         );
 
@@ -4400,7 +4370,6 @@ mod tests {
         );
         assert_eq!(on_disk.consecutive_failures, 3);
         assert_eq!(on_disk.phase_validate_failures, 3);
-        assert_eq!(on_disk.verification_run_nonce, Some(8));
     }
 
     /// D-08: an infra outcome increments the counter on disk, not the caller's copy.

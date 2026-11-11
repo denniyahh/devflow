@@ -2048,16 +2048,8 @@ fn spawn_agent_and_record(
     // the previous stage's monitor pid (WR-04, 18-fix); that field is gone
     // from the CLI (50-22), and the record keeps its own rule below.
     let checkpoint_resumes = state.checkpoint_resumes;
-    let verification_run_nonce = state.verification_run_nonce;
-    let last_verification_fingerprint = state.last_verification_fingerprint;
-    let last_verification_mtime_nanos = state.last_verification_mtime_nanos;
-    let verification_baseline_captured = state.verification_baseline_captured;
     commit(state, |s| {
         s.checkpoint_resumes = checkpoint_resumes;
-        s.verification_run_nonce = verification_run_nonce;
-        s.last_verification_fingerprint = last_verification_fingerprint;
-        s.last_verification_mtime_nanos = last_verification_mtime_nanos;
-        s.verification_baseline_captured = verification_baseline_captured;
     })?;
 
     // WR-04 (18-fix, 50-23 T-50-62): every error before the publish save

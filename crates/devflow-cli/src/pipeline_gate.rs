@@ -287,16 +287,9 @@ pub(crate) fn prepare_loop_back_to_code(
     // so the close targets the right stage's gate files (see CR-01).
     let gate_stage = state.stage;
     let _ = close_gate(project_root, state.phase, gate_stage);
-    // F-11 (`select_loop_back_fix`): this is the write that persists the
-    // verification observation that function records in the caller's copy, one
-    // write per loop-back. Nothing else writes those two fields during an advance.
-    let observed_fingerprint = state.last_verification_fingerprint;
-    let observed_mtime_nanos = state.last_verification_mtime_nanos;
     commit(state, |s| {
         s.stage = Stage::Code;
         s.gate_pending = false;
-        s.last_verification_fingerprint = observed_fingerprint;
-        s.last_verification_mtime_nanos = observed_mtime_nanos;
         // D-09: the fix pass this Code entry starts, so a same-stage relaunch
         // (failover, resume, re-drive) replays it rather than plain execute.
         s.code_fix = Some(fix);
@@ -1895,13 +1888,10 @@ mod tests {
         );
     }
 
-    /// A loop-back writes its stage move and the verification observation
-    /// `select_loop_back_fix` recorded (F-11: this is the write that persists it), and
-    /// keeps a field another writer changed since the caller loaded its copy.
+    /// A loop-back writes its stage move and its fix pass, and keeps a field another
+    /// writer changed since the caller loaded its copy.
     #[test]
-    fn a_loop_back_commits_its_fields_and_the_verification_observation() {
-        const FINGERPRINT: u64 = 0xF1;
-        const MTIME_NANOS: u64 = 0xF2;
+    fn a_loop_back_commits_its_fields() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(89);
@@ -1914,8 +1904,6 @@ mod tests {
             Ok::<(), workflow::WorkflowError>(())
         })
         .unwrap();
-        state.last_verification_fingerprint = Some(FINGERPRINT);
-        state.last_verification_mtime_nanos = Some(MTIME_NANOS);
 
         prepare_loop_back_to_code(
             root,
@@ -1933,7 +1921,6 @@ mod tests {
         );
         assert_eq!(after.stage, Stage::Code);
         assert!(!after.gate_pending);
-        assert_eq!(after.last_verification_fingerprint, Some(FINGERPRINT));
-        assert_eq!(after.last_verification_mtime_nanos, Some(MTIME_NANOS));
+        assert_eq!(after.code_fix, Some(FixType::GapsOnly));
     }
 }
