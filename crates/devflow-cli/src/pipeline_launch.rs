@@ -4103,6 +4103,94 @@ mod tests {
         git(&["commit", "-q", "-m", "add gsd config"]);
     }
 
+    /// D-46 (review 5, V3): the chain-flag guard an auto Code stage on the
+    /// stream shape engages leaves `.planning/config.json` as it found it. Two
+    /// committed shapes: a file with no `workflow._auto_chain_active` key, and
+    /// one holding it `false` in 4-space indent (which `to_string_pretty` would
+    /// rewrite). After the drop the D-46 dirty-tree read lists nothing and the
+    /// bytes are the committed ones. Third row: an edit to another key made
+    /// while the guard is engaged is kept, and the flag reads `false` (the
+    /// guard restores only its own write). Control in the same test: while the
+    /// guard is engaged, the same read lists the config, so it sees the write.
+    #[test]
+    fn an_auto_code_stage_leaves_the_gsd_config_as_it_found_it() {
+        let active = auto_chain_flag_eligible(Stage::Code, Mode::Auto);
+        assert!(
+            active,
+            "premise: an auto Code stage engages the flag `true`"
+        );
+        let no_key = "{\n  \"workflow\": {\n    \"auto_advance\": true\n  }\n}\n";
+        let four_space_false =
+            "{\n    \"workflow\": {\n        \"_auto_chain_active\": false\n    }\n}\n";
+        let config_path = ".planning/config.json".to_string();
+        for (row, committed, edit_while_engaged) in [
+            ("no key", no_key, false),
+            ("false, 4-space", four_space_false, false),
+            ("no key, edited while engaged", no_key, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            init_repo(root);
+            std::fs::create_dir_all(root.join(".planning")).unwrap();
+            std::fs::write(root.join(&config_path), committed).unwrap();
+            let git = |args: &[&str]| {
+                let output = devflow_core::test_support::git_command(root)
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "git {args:?}: {output:?}");
+            };
+            git(&["add", &config_path]);
+            git(&["commit", "-q", "-m", "gsd config"]);
+            assert_eq!(
+                crate::pipeline_outcomes::read_tree(root),
+                crate::pipeline_outcomes::TreeRead::Clean,
+                "{row}: premise: the committed tree is clean"
+            );
+
+            let guard = AutoChainGuard::engage(root, active);
+            assert_eq!(
+                crate::pipeline_outcomes::read_tree(root),
+                crate::pipeline_outcomes::TreeRead::Dirty(vec![config_path.clone()]),
+                "{row}: control: the read sees the engaged guard's write"
+            );
+            if edit_while_engaged {
+                let mut value: serde_json::Value = serde_json::from_str(
+                    &std::fs::read_to_string(root.join(&config_path)).unwrap(),
+                )
+                .unwrap();
+                value["workflow"]["auto_advance"] = serde_json::Value::Bool(false);
+                std::fs::write(
+                    root.join(&config_path),
+                    serde_json::to_string_pretty(&value).unwrap(),
+                )
+                .unwrap();
+            }
+            drop(guard);
+
+            let after = std::fs::read_to_string(root.join(&config_path)).unwrap();
+            if edit_while_engaged {
+                let value: serde_json::Value = serde_json::from_str(&after).unwrap();
+                assert_eq!(
+                    value["workflow"]["auto_advance"],
+                    serde_json::Value::Bool(false),
+                    "{row}: the edit made while engaged is kept: {after}"
+                );
+                assert!(
+                    !gsd_config::auto_chain_active(root).unwrap(),
+                    "{row}: the flag reads false after the drop: {after}"
+                );
+            } else {
+                assert_eq!(after, committed, "{row}: the bytes are the committed ones");
+                assert_eq!(
+                    crate::pipeline_outcomes::read_tree(root),
+                    crate::pipeline_outcomes::TreeRead::Clean,
+                    "{row}: the drop leaves no dirty path"
+                );
+            }
+        }
+    }
+
     /// Every `auto_chain_flag_repaired` line in a project's event log.
     fn repair_events(root: &Path) -> Vec<serde_json::Value> {
         let path = devflow_core::events::events_path(root);
