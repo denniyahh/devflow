@@ -2000,7 +2000,8 @@ impl GateAnswerKind {
     fn past_tense(self) -> &'static str {
         match self {
             GateAnswerKind::Approve => "approved",
-            GateAnswerKind::Reject | GateAnswerKind::Abort => "rejected",
+            GateAnswerKind::Reject => "rejected",
+            GateAnswerKind::Abort => "aborted",
         }
     }
 }
@@ -2051,6 +2052,7 @@ pub(crate) fn gate_respond(
             "stage": stage.to_string(),
             "gate_id": observed.as_str(),
             "approved": response.approved,
+            "abort": response.abort,
             "via": "cli",
         }),
     );

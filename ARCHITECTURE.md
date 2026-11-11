@@ -250,9 +250,9 @@ on with the time left. Either wait ends when a bound answer appears or
 `DEVFLOW_GATE_MAX_UNATTENDED_AGE_SECS` so `devflow gate sweep` cannot reap a
 gate this wait is still watching) elapses, and past that the run has ended at the
 gate. `devflow resume` then reruns the stage and asks again, reporting any unused
-answer it set aside. `GateAction::from_response()` turns an
-approval into `Advance`, a rejection into `LoopBack(Code)`, or — when the
-rejection note contains "abort" — `Abort(reason)`. `devflow gate list`
+answer it set aside. `GateAction::from_response()` reads the answer's
+fields, never its note: `abort: true` is `Abort(reason)`, an approval is
+`Advance`, and any other rejection is `LoopBack(Code)`. `devflow gate list`
 (`Gates::list_open()`) enumerates requests with no answer bound to them yet,
 skipping unparsable entries rather than failing.
 
