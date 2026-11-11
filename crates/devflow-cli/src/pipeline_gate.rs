@@ -771,7 +771,7 @@ fn open_and_await(
 
 /// The gate file of `phase`'s `stage` gate as it is on disk, or `None` when it
 /// cannot be read or parsed. A file with no kind parses with `gate_kind: None`.
-fn read_gate_file(
+pub(crate) fn read_gate_file(
     project_root: &Path,
     phase: devflow_core::phase_id::PhaseId,
     stage: Stage,
