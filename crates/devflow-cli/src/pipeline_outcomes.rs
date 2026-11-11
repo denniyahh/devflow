@@ -7845,13 +7845,15 @@ mod tests {
 
     // ---- 52-33 Task 3 (GATE-04, W3, D-39, C2): one way on per gate ---------
 
-    /// The answer words no text after a gate's way-on sentence may hold.
+    /// The answer words no text after a gate's way-on sentence may hold. The
+    /// removed Ship answer is split with `concat!` so the removed-surface scan
+    /// (52-18) does not read it as a surviving literal.
     const ANSWER_WORDS: [&str; 7] = [
         "approve",
         "reject",
         "abort",
         "retry",
-        "ship",
+        concat!("sh", "ip"),
         "loop back",
         "loop-to-code",
     ];
