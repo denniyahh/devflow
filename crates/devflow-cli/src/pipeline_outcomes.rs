@@ -9815,6 +9815,102 @@ mod tests {
     /// test: the same property over a routing function forced to finish on
     /// `passed` without an agent PASS on HEAD finds a counterexample holding
     /// `passed` and no PASS on HEAD. Both runs persist no failure.
+    /// D-15, D-27.4, D-37, D-39: for a gate file whose `gate_kind` is
+    /// `rate_limit`, `approve_route` relaunches its stage now and
+    /// `reject_route` relaunches it with the note, neither reading GSD, and a
+    /// whitespace-only note is refused. Control in the same test: a
+    /// `clean_pass` gate at the same stage with the same context, over a fresh
+    /// `passed` with the Validate PASS on HEAD, finishes on approve and runs
+    /// `/gsd-quick` on reject; a `preflight` gate there takes the override and
+    /// refuses the reject. So the rate-limit arms are not another kind's.
+    #[test]
+    fn a_rate_limit_gate_routes_approve_and_reject_to_a_relaunch_of_its_stage() {
+        const NOTE: &str = "wait for the quota, then keep the smaller diff";
+        const CONTEXT: &str = "[never-silent] stage validate failed: a shared context";
+        let gate = |kind: GateKind| GateFile {
+            phase: PhaseId::new(5320),
+            stage: Stage::Validate,
+            context: CONTEXT.to_string(),
+            timestamp: "1750000000".to_string(),
+            gate_id: "g-rate-limit".to_string(),
+            gate_kind: Some(kind),
+            gsd_status: None,
+            not_before: None,
+        };
+        let passed_on_head = || {
+            evidence_from_reads(
+                Ok(StatusReport {
+                    status: GsdStatus::Passed,
+                    route: String::new(),
+                    next_action: None,
+                    moved_files: Vec::new(),
+                }),
+                Some("abc123"),
+                Ok("abc123"),
+                &TreeRead::Clean,
+            )
+        };
+
+        let rate_limit = gate(GateKind::RateLimit);
+        let approve = approve_route(&rate_limit, None, || {
+            panic!("a rate-limit approve reads no GSD status")
+        });
+        assert!(
+            matches!(
+                approve,
+                ApproveRoute::StatusLess(StatusLessStep::RelaunchNow)
+            ),
+            "{approve:?}"
+        );
+        let reject = reject_route(&rate_limit, None, NOTE);
+        assert!(
+            matches!(&reject, RejectRoute::StatusLess(StatusLessStep::RelaunchWithNote(note)) if note == NOTE),
+            "{reject:?}"
+        );
+        assert!(
+            matches!(
+                reject_route(&rate_limit, None, " \t "),
+                RejectRoute::Refused(_)
+            ),
+            "a whitespace-only note is refused"
+        );
+
+        let clean_pass = gate(GateKind::CleanPass);
+        let approve = approve_route(&clean_pass, None, passed_on_head);
+        assert!(
+            matches!(
+                &approve,
+                ApproveRoute::Verification {
+                    step: Step::Finish(_),
+                    ..
+                }
+            ),
+            "control: {approve:?}"
+        );
+        let reject = reject_route(&clean_pass, None, NOTE);
+        assert!(
+            matches!(&reject, RejectRoute::Verification(Step::Quick(note)) if note == NOTE),
+            "control: {reject:?}"
+        );
+
+        let preflight = gate(GateKind::Preflight);
+        let approve = approve_route(&preflight, None, || panic!("no GSD read"));
+        assert!(
+            matches!(
+                approve,
+                ApproveRoute::StatusLess(StatusLessStep::PreflightOverride)
+            ),
+            "control: {approve:?}"
+        );
+        assert!(
+            matches!(
+                reject_route(&preflight, None, NOTE),
+                RejectRoute::Refused(_)
+            ),
+            "control: a preflight reject is refused"
+        );
+    }
+
     #[test]
     fn workflow_finished_is_reached_only_when_can_finish_holds() {
         run_rule_six(real_route).unwrap_or_else(|error| panic!("the real routing: {error}"));
