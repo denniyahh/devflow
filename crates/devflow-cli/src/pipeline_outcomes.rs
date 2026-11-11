@@ -798,11 +798,20 @@ pub(crate) fn handle_validate_outcome(
                 project_root,
                 state,
                 action,
+                kind,
                 (verdict, &read),
                 (ceiling_gate, baseline_absent),
             )
         }
     }
+}
+
+/// After a gaps Plan pass (GATE-03). Skeleton: moves to Code unchecked.
+pub(crate) fn handle_gaps_plan_outcome(
+    project_root: &Path,
+    state: &mut State,
+) -> Result<(), CliError> {
+    transition(project_root, state, Stage::Code)
 }
 
 /// Record one failed Validate on the counters: the per-phase total, the
@@ -889,6 +898,7 @@ fn answer_validate_gate(
     project_root: &Path,
     state: &mut State,
     action: GateAction,
+    _kind: GateKind,
     round: (AgentVerdict, &ValidateRead),
     budget: (bool, bool),
 ) -> Result<(), CliError> {
@@ -4586,27 +4596,38 @@ mod tests {
         answer: &devflow_core::gates::GateResponse,
         handler: impl FnOnce() + Send,
     ) -> (serde_json::Value, State) {
+        at_the_gate(root, phase, Stage::Validate, answer, handler)
+    }
+
+    /// [`at_the_validate_gate`] for the gate at `stage`.
+    fn at_the_gate(
+        root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        answer: &devflow_core::gates::GateResponse,
+        handler: impl FnOnce() + Send,
+    ) -> (serde_json::Value, State) {
         const GATE_OPENS_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
-        let gate_path = Gates::gate_path(root, phase, Stage::Validate);
+        let gate_path = Gates::gate_path(root, phase, stage);
         std::thread::scope(|scope| {
             let waiter = scope.spawn(handler);
             let started = std::time::Instant::now();
             while !gate_path.exists() {
                 assert!(
                     !waiter.is_finished(),
-                    "the handler returned without opening the Validate gate; events: {:?}",
+                    "the handler returned without opening the {stage} gate; events: {:?}",
                     phase_events(root, phase)
                 );
                 assert!(
                     started.elapsed() < GATE_OPENS_WITHIN,
-                    "the Validate gate did not open within {GATE_OPENS_WITHIN:?}"
+                    "the {stage} gate did not open within {GATE_OPENS_WITHIN:?}"
                 );
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             let gate: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(&gate_path).unwrap()).unwrap();
             let on_disk = workflow::load_state(root, phase).unwrap();
-            answer_open_gate(root, phase, Stage::Validate, answer).unwrap();
+            answer_open_gate(root, phase, stage, answer).unwrap();
             waiter.join().unwrap();
             (gate, on_disk)
         })
@@ -5250,5 +5271,328 @@ mod tests {
             "the gate names the HEAD read: {context}"
         );
         assert!(events_named(root, phase, "workflow_finished").is_empty());
+    }
+
+    // ---- 52-27 (GATE-03, D-36): the supervise gaps gate and the gaps Plan post-check ----
+
+    /// A supervise Validate state whose GSD stub answers `gaps_found`, with a
+    /// git HEAD so an agent PASS is recorded.
+    fn supervise_gaps_state(root: &Path, phase: PhaseId) -> (State, GsdStub) {
+        let gsd = validate_evidence(root, phase, &[gsd_says(GsdStatus::GapsFound)]);
+        (validate_state(root, phase, Mode::Supervise), gsd)
+    }
+
+    /// D-36 / D-45 rule 2 (interim arm): approving a supervise gate whose
+    /// `gate_kind` is `gaps_found` runs the gap loop: the run moves to Plan with
+    /// the gap-closure marker set, the gaps Plan intent is what Plan launches,
+    /// and no `workflow_finished` is recorded. The `--until validate` row does
+    /// the same, recording neither `finished` nor `stopped_at`. Control: an
+    /// approved gate of kind `human_needed` whose round read `gaps_found` (so a
+    /// context that quotes `gaps_found`) does not set the marker and does not
+    /// move to Plan.
+    #[test]
+    fn approving_a_gaps_gate_runs_the_gap_loop() {
+        if !in_bounded_child("pipeline_outcomes::tests::approving_a_gaps_gate_runs_the_gap_loop") {
+            return;
+        }
+        for (number, until) in [(5310, None), (5311, Some(Stage::Validate))] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            init_repo(root);
+            let phase = PhaseId::new(number);
+            let (mut state, _gsd) = supervise_gaps_state(root, phase);
+            state.stop_until = until;
+            workflow::save_state(&state).unwrap();
+            let (gate, _) = at_the_validate_gate(root, phase, &approve_answer(), || {
+                let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Passed);
+            });
+            let row = format!("until {until:?}");
+            assert_eq!(gate["gate_kind"], "gaps_found", "{row}: {gate}");
+            let context = gate["context"].as_str().expect("a gate context");
+            assert!(
+                context.contains("gaps_found") && !context.contains("passed"),
+                "{row}: the gate names GSD's status and never says passed: {context}"
+            );
+            assert!(
+                !context.to_lowercase().contains("approve to finish"),
+                "{row}: the gate does not offer finishing: {context}"
+            );
+            let moved = workflow::load_state(root, phase).unwrap();
+            assert_eq!(moved.stage, Stage::Plan, "{row}: approve moves to Plan");
+            assert!(
+                moved.gap_closure_pass,
+                "{row}: the gap-closure marker is set"
+            );
+            assert!(!moved.finished && !moved.stopped, "{row}: {moved:?}");
+            let claude = devflow_core::agents::driver_for(AgentKind::Claude);
+            let launched = crate::pipeline_launch::default_stage_prompt(&moved, claude.as_ref());
+            assert!(
+                launched.contains(&format!("/gsd-plan-phase {phase} --gaps")),
+                "{row}: Plan launches the gaps Plan pass: {launched}"
+            );
+            assert!(
+                events_named(root, phase, "workflow_finished").is_empty(),
+                "{row}: approving a gaps gate records no workflow_finished: {:?}",
+                phase_events(root, phase)
+            );
+        }
+
+        // Control: the gate's kind decides, never the status its context quotes.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(5312);
+        let (mut state, _gsd) = supervise_gaps_state(root, phase);
+        let read: ValidateRead = Ok(StatusReport {
+            status: GsdStatus::GapsFound,
+            route: "plan-phase".into(),
+            moved_files: Vec::new(),
+        });
+        let _ = answer_validate_gate(
+            root,
+            &mut state,
+            GateAction::Advance,
+            GateKind::HumanNeeded,
+            (AgentVerdict::Pass, &read),
+            (false, false),
+        );
+        let after = workflow::load_state(root, phase).unwrap();
+        assert!(
+            !after.gap_closure_pass,
+            "control: a human_needed gate sets no gap-closure marker: {after:?}"
+        );
+        assert_ne!(after.stage, Stage::Plan, "control: no gaps Plan launch");
+        assert!(
+            !events_named(root, phase, "transition")
+                .iter()
+                .any(|event| event["to"] == "plan"),
+            "control: no move to Plan: {:?}",
+            phase_events(root, phase)
+        );
+    }
+
+    /// D-36: aborting the supervise gaps gate ends the run: the state is
+    /// cleared and nothing moves to Plan.
+    #[test]
+    fn aborting_a_gaps_gate_ends_the_run() {
+        if !in_bounded_child("pipeline_outcomes::tests::aborting_a_gaps_gate_ends_the_run") {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(5313);
+        let (mut state, _gsd) = supervise_gaps_state(root, phase);
+        let (gate, _) = at_the_validate_gate(root, phase, &abort_answer(), || {
+            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Passed);
+        });
+        assert_eq!(gate["gate_kind"], "gaps_found", "{gate}");
+        assert!(
+            workflow::load_state(root, phase).is_err(),
+            "abort clears the run's state"
+        );
+        assert!(
+            !events_named(root, phase, "transition")
+                .iter()
+                .any(|event| event["to"] == "plan"),
+            "abort runs no gap loop: {:?}",
+            phase_events(root, phase)
+        );
+    }
+
+    /// How far apart the post-check fixture's plans and report are, in commit
+    /// date and in file modified time: a minute or more, so both comparisons
+    /// order them the same way.
+    const FIXTURE_SPACING_SECS: i64 = 120;
+
+    /// Write `name` in `phase`'s directory under `root` with `contents`,
+    /// commit it with committer date `at` (seconds since the epoch) and set
+    /// its modified time to `at`.
+    fn write_dated(root: &Path, phase: PhaseId, name: &str, contents: &str, at: i64) {
+        let dir = phase_dir_fixture(root, phase);
+        let path = dir.join(name);
+        std::fs::write(&path, contents).unwrap();
+        let relative = path
+            .strip_prefix(root)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let date = format!("@{at} +0000");
+        for args in [
+            vec!["add", relative.as_str()],
+            vec!["commit", "-q", "-m", name],
+        ] {
+            let output = devflow_core::test_support::git_command(root)
+                .args(&args)
+                .env("GIT_COMMITTER_DATE", &date)
+                .env("GIT_AUTHOR_DATE", &date)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+        }
+        let modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(at as u64);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+    }
+
+    /// A plan's text, with `gap_closure: true` in its frontmatter when `gap`.
+    fn plan_text(phase: PhaseId, plan: &str, gap: bool) -> String {
+        let padded = phase.padded();
+        let gap = if gap { "gap_closure: true\n" } else { "" };
+        format!(
+            "---\nphase: {padded}-fixture\nplan: {plan}\ntype: execute\nautonomous: true\n{gap}---\n\n<tasks>\n<task type=\"auto\"><name>stub</name></task>\n</tasks>\n"
+        )
+    }
+
+    /// A gaps Plan state at Plan for `phase` under `root`, saved, with the
+    /// phase's first plan and, a spacing later, its verification report.
+    /// Returns the state and the report's time.
+    fn gaps_plan_fixture(root: &Path, phase: PhaseId, earlier_gap_plan: bool) -> (State, i64) {
+        init_repo(root);
+        let report_at = 1_900_000_000;
+        let padded = phase.padded();
+        write_dated(
+            root,
+            phase,
+            &format!("{padded}-01-PLAN.md"),
+            &plan_text(phase, "01", false),
+            report_at - 2 * FIXTURE_SPACING_SECS,
+        );
+        if earlier_gap_plan {
+            // An earlier round's gap plan, written before this round's report.
+            write_dated(
+                root,
+                phase,
+                &format!("{padded}-02-PLAN.md"),
+                &plan_text(phase, "02", true),
+                report_at - FIXTURE_SPACING_SECS,
+            );
+        }
+        write_dated(
+            root,
+            phase,
+            &format!("{padded}-VERIFICATION.md"),
+            "---\nstatus: gaps_found\n---\n",
+            report_at,
+        );
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Plan;
+        state.gap_closure_pass = true;
+        workflow::save_state(&state).unwrap();
+        (state, report_at)
+    }
+
+    /// Run the gaps Plan outcome of `state` until its Plan gate opens, answer it
+    /// with an abort, and return the gate file.
+    fn gaps_plan_gate(root: &Path, state: &mut State) -> serde_json::Value {
+        let phase = state.phase;
+        let (gate, _) = at_the_gate(root, phase, Stage::Plan, &abort_answer(), || {
+            let _ = handle_gaps_plan_outcome(root, state);
+        });
+        gate
+    }
+
+    /// Pitfall 5 (GATE-03, U6): after a gaps Plan pass, a plan with
+    /// `gap_closure: true` newer than the verification report must exist, or
+    /// the pass gates with `no_gap_closure_plan`; a reader failure on that read
+    /// gates with `reader_failure`, never silently. Rows: no new plan; an
+    /// earlier round's gap plan that predates the report and no newer one; a
+    /// newer plan whose read fails. Control: the same tree plus a gap plan
+    /// written after the report proceeds to Code, whose pass is gaps-only.
+    /// The check compares file modified times; the fixture spaces commit dates
+    /// and file times alike, so a commit-order check would order them the same.
+    #[test]
+    fn a_gaps_plan_pass_without_a_new_gap_closure_plan_gates() {
+        if !in_bounded_child(
+            "pipeline_outcomes::tests::a_gaps_plan_pass_without_a_new_gap_closure_plan_gates",
+        ) {
+            return;
+        }
+        // No plan newer than the report: no GSD read is needed, and none is
+        // scripted, so a read would surface as a reader failure instead.
+        for (number, earlier_gap_plan) in [(5320, false), (5321, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = PhaseId::new(number);
+            let (mut state, _) = gaps_plan_fixture(root, phase, earlier_gap_plan);
+            let _gsd = GsdStub::answering(root, &[]);
+            let gate = gaps_plan_gate(root, &mut state);
+            assert_eq!(
+                gate["gate_kind"], "no_gap_closure_plan",
+                "earlier gap plan {earlier_gap_plan}: {gate}"
+            );
+            assert!(
+                events_named(root, phase, "transition").is_empty(),
+                "earlier gap plan {earlier_gap_plan}: no Code launch: {:?}",
+                phase_events(root, phase)
+            );
+        }
+
+        // A newer plan whose read fails: a never-silent reader-failure gate.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5322);
+        let (mut state, report_at) = gaps_plan_fixture(root, phase, true);
+        write_dated(
+            root,
+            phase,
+            &format!("{}-03-PLAN.md", phase.padded()),
+            &plan_text(phase, "03", true),
+            report_at + FIXTURE_SPACING_SECS,
+        );
+        let _gsd = GsdStub::answering(root, &["not json"]);
+        let gate = gaps_plan_gate(root, &mut state);
+        assert_eq!(gate["gate_kind"], "reader_failure", "{gate}");
+        assert!(
+            gate["context"]
+                .as_str()
+                .is_some_and(|context| context.starts_with("[never-silent]")),
+            "a reader failure is never silent: {gate}"
+        );
+
+        // Control: the earlier gap plan, plus one written after the report.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5323);
+        let (mut state, report_at) = gaps_plan_fixture(root, phase, true);
+        let newer = format!("{}-03-PLAN.md", phase.padded());
+        write_dated(
+            root,
+            phase,
+            &newer,
+            &plan_text(phase, "03", true),
+            report_at + FIXTURE_SPACING_SECS,
+        );
+        let gsd = GsdStub::answering(root, &[r#"{"gap_closure": true}"#]);
+        let _ = handle_gaps_plan_outcome(root, &mut state);
+        assert!(
+            events_named(root, phase, "gate_fired").is_empty(),
+            "control: a new gap plan opens no gate: {:?}",
+            phase_events(root, phase)
+        );
+        let moved = workflow::load_state(root, phase).unwrap();
+        assert_eq!(moved.stage, Stage::Code, "control: the run moves to Code");
+        assert!(moved.gap_closure_pass, "control: the marker stays set");
+        let claude = devflow_core::agents::driver_for(AgentKind::Claude);
+        let code = crate::pipeline_launch::default_stage_prompt(&moved, claude.as_ref());
+        assert!(
+            code.contains(&format!("/gsd-execute-phase {phase} --gaps-only")),
+            "control: Code launches the gaps-only pass: {code}"
+        );
+        let reads: Vec<String> = gsd.calls().into_iter().map(|(_, argv)| argv).collect();
+        assert_eq!(
+            reads.len(),
+            1,
+            "control: only the plan newer than the report is read: {reads:?}"
+        );
+        assert!(
+            reads[0].ends_with(&format!("{newer} --field gap_closure")),
+            "control: the newer plan's gap_closure is read: {reads:?}"
+        );
     }
 }
