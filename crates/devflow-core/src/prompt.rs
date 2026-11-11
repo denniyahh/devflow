@@ -167,6 +167,17 @@ pub enum StageIntent {
         /// The operator's note for this relaunch of the stage, if any.
         relaunch_note: Option<String>,
     },
+    /// The Plan stage of a gap-closure pass (GATE-03, D-09): Validate read
+    /// GSD's `gaps_found`, so Plan runs `/gsd-plan-phase N --gaps` to plan the
+    /// gaps' closure. Unlike [`StageIntent::Plan`] it has no idempotency
+    /// short-circuit: the phase's PLAN.md files exist by now, and the pass
+    /// must run anyway (Pitfall 5). It carries no fix note of its own; a
+    /// rejection of the gaps gate takes another route.
+    PlanGaps {
+        phase: PhaseId,
+        /// The operator's note for this relaunch of the stage, if any.
+        relaunch_note: Option<String>,
+    },
     Code {
         phase: PhaseId,
         fix: Option<FixType>,
@@ -186,7 +197,7 @@ impl StageIntent {
     /// The stage this intent drives.
     pub fn stage(&self) -> Stage {
         match self {
-            StageIntent::Plan { .. } => Stage::Plan,
+            StageIntent::Plan { .. } | StageIntent::PlanGaps { .. } => Stage::Plan,
             StageIntent::Code { .. } => Stage::Code,
             StageIntent::Validate { .. } => Stage::Validate,
         }
@@ -233,6 +244,7 @@ impl StageIntent {
     pub fn with_relaunch_note(mut self, note: Option<String>) -> Self {
         match &mut self {
             StageIntent::Plan { relaunch_note, .. }
+            | StageIntent::PlanGaps { relaunch_note, .. }
             | StageIntent::Code { relaunch_note, .. }
             | StageIntent::Validate { relaunch_note, .. } => *relaunch_note = note,
         }
@@ -482,6 +494,10 @@ pub fn render_claude_style(intent: &StageIntent) -> String {
         StageIntent::Plan {
             phase,
             relaunch_note,
+        }
+        | StageIntent::PlanGaps {
+            phase,
+            relaunch_note,
         } => idempotent_stage_prompt(*phase, &note_blocks(None, relaunch_note.as_deref())),
         StageIntent::Code {
             phase,
@@ -525,6 +541,10 @@ pub fn render_claude_style(intent: &StageIntent) -> String {
 pub fn render_workflow_style(intent: &StageIntent, workflow_root: &str) -> String {
     match intent {
         StageIntent::Plan {
+            phase,
+            relaunch_note,
+        }
+        | StageIntent::PlanGaps {
             phase,
             relaunch_note,
         } => workflow_plan_prompt(
@@ -1482,11 +1502,79 @@ mod tests {
     fn intents_with_relaunch_note(phase: PhaseId, relaunch_note: Option<&str>) -> Vec<StageIntent> {
         [Stage::Plan, Stage::Code, Stage::Validate]
             .into_iter()
-            .map(|stage| {
-                StageIntent::for_stage(stage, phase)
-                    .with_relaunch_note(relaunch_note.map(str::to_string))
-            })
+            .map(|stage| StageIntent::for_stage(stage, phase))
+            // The gaps Plan pass (52-27) carries the relaunch note too.
+            .chain([StageIntent::PlanGaps {
+                phase,
+                relaunch_note: None,
+            }])
+            .map(|intent| intent.with_relaunch_note(relaunch_note.map(str::to_string)))
             .collect()
+    }
+
+    /// The idempotency short-circuit's wording, in either style: the ordinary
+    /// Plan prompt tells the agent to do nothing when a PLAN.md exists.
+    const PLAN_SHORT_CIRCUIT: [&str; 3] = [
+        "already exists",
+        "If it EXISTS",
+        "do NOT modify the existing",
+    ];
+
+    /// Pitfall 5 (GATE-03): the gaps Plan pass runs `plan-phase --gaps` even
+    /// though the phase's PLAN.md files exist, so its prompt names `--gaps`
+    /// and has none of the idempotency short-circuit, in both styles. Control
+    /// in the same test: the ordinary Plan prompt keeps the short-circuit.
+    #[test]
+    fn the_gaps_plan_prompt_runs_plan_phase_gaps_even_when_plans_exist() {
+        let phase = PhaseId::new(52);
+        let gaps = StageIntent::PlanGaps {
+            phase,
+            relaunch_note: None,
+        };
+        let claude = render_claude_style(&gaps);
+        assert!(
+            claude.contains("/gsd-plan-phase 52 --gaps"),
+            "the claude-style gaps Plan prompt runs plan-phase --gaps:\n{claude}"
+        );
+        let workflow = render_workflow_style(&gaps, "/workflows");
+        assert!(
+            workflow.contains("/workflows/plan-phase.md for phase 52 --gaps"),
+            "the workflow-style gaps Plan prompt runs plan-phase with --gaps:\n{workflow}"
+        );
+        assert!(
+            !workflow.contains("/gsd-"),
+            "the workflow style names no slash command:\n{workflow}"
+        );
+        for (style, prompt) in [("claude", &claude), ("workflow", &workflow)] {
+            for wording in PLAN_SHORT_CIRCUIT {
+                assert!(
+                    !prompt.contains(wording),
+                    "{style}: the gaps Plan prompt must not short-circuit ({wording:?}):\n{prompt}"
+                );
+            }
+            assert!(
+                prompt.ends_with(COMPLETION_PROTOCOL),
+                "{style}: the completion protocol stays last:\n{prompt}"
+            );
+        }
+        // Control: the ordinary Plan prompt keeps the short-circuit, and does
+        // not run --gaps.
+        let plain = StageIntent::for_stage(Stage::Plan, phase);
+        for (style, prompt) in [
+            ("claude", render_claude_style(&plain)),
+            ("workflow", render_workflow_style(&plain, "/workflows")),
+        ] {
+            for wording in PLAN_SHORT_CIRCUIT {
+                assert!(
+                    prompt.contains(wording),
+                    "control, {style}: the ordinary Plan prompt short-circuits ({wording:?}):\n{prompt}"
+                );
+            }
+            assert!(
+                !prompt.contains("--gaps"),
+                "control, {style}: the ordinary Plan prompt does not run --gaps:\n{prompt}"
+            );
+        }
     }
 
     #[test]

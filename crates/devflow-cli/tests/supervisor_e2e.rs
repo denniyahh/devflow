@@ -1500,6 +1500,12 @@ struct FinishRig {
 
 impl FinishRig {
     fn new(phase: PhaseId) -> Self {
+        Self::with_claude(phase, |_| passing_claude())
+    }
+
+    /// [`new`](Self::new) with the fake `claude` body `agent(notify_dir)`
+    /// returns, for an agent that writes a log beside the notify log.
+    fn with_claude(phase: PhaseId, agent: impl FnOnce(&Path) -> String) -> Self {
         let home = common::HermeticHome::new();
         let repo = tempfile::tempdir().unwrap();
         let root = repo.path().canonicalize().unwrap();
@@ -1522,13 +1528,14 @@ impl FinishRig {
         .unwrap();
         git(&root, &["add", ".planning/config.json", &plan]);
         git(&root, &["commit", "-q", "-m", "auto config and plan"]);
+        let notify = tempfile::tempdir().unwrap();
         let rig = Self {
             home,
             _repo: repo,
             root,
             phase,
-            fake_bin: common::fake_bin_dir(&passing_claude()),
-            notify: tempfile::tempdir().unwrap(),
+            fake_bin: common::fake_bin_dir(&agent(notify.path())),
+            notify,
             gsd_logs: tempfile::tempdir().unwrap(),
         };
         rig.stub_gsd(&[devflow_core::test_support::gsd_status_json(
@@ -1554,12 +1561,12 @@ impl FinishRig {
 
     /// `devflow start --phase N --agent claude --mode auto`, plus `extra`, in
     /// a phase worktree. Asserts the start itself succeeded.
-    fn start(&self, extra: &[&str]) {
-        self.start_in("auto", extra);
+    fn start(&self, extra: &[&str]) -> Output {
+        self.start_in("auto", extra)
     }
 
     /// [`start`](Self::start) in `mode` (`auto` or `supervise`).
-    fn start_in(&self, mode: &str, extra: &[&str]) {
+    fn start_in(&self, mode: &str, extra: &[&str]) -> Output {
         let existing = std::env::var_os("PATH").unwrap_or_default();
         let path = format!(
             "{}:{}",
@@ -1593,6 +1600,7 @@ impl FinishRig {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        output
     }
 
     fn events(&self) -> Vec<serde_json::Value> {
@@ -2037,5 +2045,206 @@ fn a_gaps_found_report_never_reads_as_passed() {
         reaper.supervisors_exited_within(EXIT_WAIT),
         "the aborted run's supervisors exit; events:\n{}",
         rig.events_text()
+    );
+}
+
+/// A fake `claude` for the gap loop (GATE-03): it logs every turn it receives
+/// to `prompts.log` in `log_dir`, and acts on the stage its prompt names. The
+/// Validate pass writes the phase's `NN-VERIFICATION.md`; the gaps Plan pass
+/// (`/gsd-plan-phase N --gaps`) writes and commits `NN-02-PLAN.md`, a gap
+/// plan with `gap_closure: true` and no checkpoint, newer than the report;
+/// every other pass commits an empty commit. Each reports success with a pass
+/// verdict, so GSD's stub alone decides each Validate's route.
+fn gap_loop_claude(log_dir: &Path, phase: PhaseId) -> String {
+    let log = log_dir.join("prompts.log");
+    let log = log.to_str().expect("a UTF-8 log path");
+    assert!(!log.contains('\''), "the log path is single-quoted: {log}");
+    let padded = phase.padded();
+    format!(
+        r#"if [ "$1" = "--version" ]; then echo "2.1.220 (Claude Code)"; exit 0; fi
+read -r turn
+case "$turn" in
+  *DEVFLOW_DELIVERY_CANARY_*)
+    token=$(printf '%s' "$turn" | grep -o 'DEVFLOW_DELIVERY_CANARY_[0-9a-f]*' | head -1)
+    printf '{{"type":"result","subtype":"success","is_error":false,"session_id":"s-fake","result":"%s"}}\n' "$token"
+    exit 0
+    ;;
+esac
+printf '%s\n' "$turn" >> '{log}'
+dir='.planning/phases/{padded}-fixture'
+case "$turn" in
+  *gsd-validate-phase*)
+    printf -- '---\nstatus: gaps_found\n---\n' > "$dir/{padded}-VERIFICATION.md"
+    git add "$dir/{padded}-VERIFICATION.md"
+    git commit -q -m "fake verification report"
+    ;;
+  *"gsd-plan-phase {phase} --gaps"*)
+    printf -- '---\nphase: {padded}-fixture\nplan: 02\ntype: execute\nautonomous: true\ngap_closure: true\n---\n\n<tasks>\n<task type="auto"><name>gap</name></task>\n</tasks>\n' > "$dir/{padded}-02-PLAN.md"
+    git add "$dir/{padded}-02-PLAN.md"
+    git commit -q -m "fake gap plan"
+    ;;
+  *)
+    git commit -q --allow-empty -m "fake stage work"
+    ;;
+esac
+printf 'work done\nDEVFLOW_RESULT: {{"status":"success","commits":1,"verdict":"pass"}}\n'
+exit 0"#
+    )
+}
+
+/// The turns [`gap_loop_claude`] logged, one per launched stage pass, in order.
+fn logged_prompts(rig: &FinishRig) -> Vec<String> {
+    fs::read_to_string(rig.notify.path().join("prompts.log"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// The GSD replies of one gap round: `gaps_found` at the first Validate, the
+/// gap plan's `gap_closure` read after the gaps Plan pass, `passed` at the
+/// second Validate.
+fn gap_round_replies() -> [&'static str; 3] {
+    [
+        devflow_core::test_support::gsd_status_json(GsdStatus::GapsFound),
+        r#"{"gap_closure": true}"#,
+        devflow_core::test_support::gsd_status_json(GsdStatus::Passed),
+    ]
+}
+
+/// The index of the first prompt in `prompts` holding `needle`.
+fn first_prompt_with(prompts: &[String], needle: &str) -> Option<usize> {
+    prompts.iter().position(|prompt| prompt.contains(needle))
+}
+
+/// GATE-03 / D-09: an auto run whose first Validate reads `gaps_found` goes to
+/// Plan with `/gsd-plan-phase N --gaps`, then to Code with
+/// `/gsd-execute-phase N --gaps-only` (and not the full execute command), then
+/// to Validate, which reads `passed`, and the run finishes inside the same run.
+#[test]
+fn a_gaps_found_validate_runs_plan_gaps_then_execute_gaps_only_then_passes() {
+    let phase = PhaseId::new(86);
+    let rig = FinishRig::with_claude(phase, |dir| gap_loop_claude(dir, phase));
+    rig.stub_gsd(&gap_round_replies());
+    let reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+
+    rig.start(&[]);
+    rig.wait_for_end(&reaper);
+    let log = rig.events_text();
+    let prompts = logged_prompts(&rig);
+
+    let first_validate = first_prompt_with(&prompts, "/gsd-validate-phase 86")
+        .unwrap_or_else(|| panic!("a Validate ran; prompts: {prompts:?}\nevents:\n{log}"));
+    let gaps_plan = first_prompt_with(&prompts, "/gsd-plan-phase 86 --gaps")
+        .unwrap_or_else(|| panic!("the gaps Plan ran; prompts: {prompts:?}\nevents:\n{log}"));
+    let gaps_code = first_prompt_with(&prompts, "/gsd-execute-phase 86 --gaps-only")
+        .unwrap_or_else(|| panic!("the gaps-only Code ran; prompts: {prompts:?}\nevents:\n{log}"));
+    assert!(
+        first_validate < gaps_plan && gaps_plan < gaps_code,
+        "Validate, then Plan --gaps, then Code --gaps-only; prompts: {prompts:?}"
+    );
+    assert!(
+        !prompts[gaps_code].contains("/gsd-execute-phase 86 --auto"),
+        "the gaps Code pass runs no full execute: {}",
+        prompts[gaps_code]
+    );
+    assert!(
+        prompts[gaps_code + 1..]
+            .iter()
+            .any(|prompt| prompt.contains("/gsd-validate-phase 86")),
+        "Validate runs again after the gaps Code pass; prompts: {prompts:?}"
+    );
+    assert_eq!(
+        finished_payloads(&rig),
+        vec![serde_json::json!({"reason": "finished", "shipped": false})],
+        "the run finishes once; events:\n{log}"
+    );
+    assert!(
+        !raw_state(&rig)
+            .get("gap_closure_pass")
+            .is_some_and(|value| value == true),
+        "the passed Validate cleared the gap-closure marker: {}",
+        raw_state(&rig)
+    );
+}
+
+/// The `--until validate` notice's wording, as `devflow start` prints it.
+const UNTIL_VALIDATE_NOTICE: &str = "--until validate halts nothing";
+
+/// `--until validate` halts nothing in v4 (Validate is the last stage): an
+/// auto run started with it whose first Validate reads `gaps_found` runs the
+/// gap loop and finishes, records no `stopped_at`, prints one notice line and
+/// records one `until_noop` event. Control in the same test, on a fresh rig
+/// with the same stubs: `--until plan` halts at Plan, launches no Code, prints
+/// no notice and records no `until_noop` event.
+#[test]
+fn an_until_validate_run_with_gaps_runs_the_gap_loop() {
+    let phase = PhaseId::new(87);
+    let rig = FinishRig::with_claude(phase, |dir| gap_loop_claude(dir, phase));
+    rig.stub_gsd(&gap_round_replies());
+    let reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+
+    let output = rig.start(&["--until", "validate"]);
+    rig.wait_for_end(&reaper);
+    let log = rig.events_text();
+    let prompts = logged_prompts(&rig);
+    let first_validate = first_prompt_with(&prompts, "/gsd-validate-phase 87")
+        .unwrap_or_else(|| panic!("a Validate ran; prompts: {prompts:?}\nevents:\n{log}"));
+    let gaps_plan = first_prompt_with(&prompts, "/gsd-plan-phase 87 --gaps")
+        .unwrap_or_else(|| panic!("the gaps Plan ran; prompts: {prompts:?}\nevents:\n{log}"));
+    let gaps_code = first_prompt_with(&prompts, "/gsd-execute-phase 87 --gaps-only")
+        .unwrap_or_else(|| panic!("the gaps-only Code ran; prompts: {prompts:?}\nevents:\n{log}"));
+    assert!(
+        first_validate < gaps_plan && gaps_plan < gaps_code,
+        "Validate, then Plan --gaps, then Code --gaps-only; prompts: {prompts:?}"
+    );
+    assert!(
+        !log.contains("\"stopped_at\""),
+        "no workflow_finished is stopped_at; events:\n{log}"
+    );
+    assert_eq!(
+        finished_payloads(&rig),
+        vec![serde_json::json!({"reason": "finished", "shipped": false})],
+        "exactly one finish; events:\n{log}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout.matches(UNTIL_VALIDATE_NOTICE).count(),
+        1,
+        "start prints the notice once:\n{stdout}"
+    );
+    let noop: Vec<_> = rig
+        .events()
+        .into_iter()
+        .filter(|event| event["event"] == "until_noop")
+        .collect();
+    assert_eq!(noop.len(), 1, "one until_noop event; events:\n{log}");
+    assert_eq!(noop[0]["until"], "validate", "{}", noop[0]);
+
+    // Control: `--until plan` halts at Plan, with no notice.
+    let control_phase = PhaseId::new(88);
+    let control = FinishRig::with_claude(control_phase, |dir| gap_loop_claude(dir, control_phase));
+    control.stub_gsd(&gap_round_replies());
+    let control_reaper = common::LaunchedRunReaper::new(&control.root, control_phase, vec![]);
+    let control_output = control.start(&["--until", "plan"]);
+    control.wait_for_end(&control_reaper);
+    let control_log = control.events_text();
+    assert_eq!(
+        finished_payloads(&control),
+        vec![serde_json::json!({"reason": "stopped_at", "stage": "plan"})],
+        "control: --until plan halts at Plan; events:\n{control_log}"
+    );
+    let control_prompts = logged_prompts(&control);
+    assert!(
+        first_prompt_with(&control_prompts, "/gsd-execute-phase").is_none(),
+        "control: no Code launched; prompts: {control_prompts:?}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&control_output.stdout).contains(UNTIL_VALIDATE_NOTICE),
+        "control: --until plan prints no notice"
+    );
+    assert!(
+        !control_log.contains("until_noop"),
+        "control: no until_noop event; events:\n{control_log}"
     );
 }

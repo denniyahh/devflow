@@ -13280,6 +13280,148 @@ mod tests {
         );
     }
 
+    /// Resume a stopped Codex run of `phase` at `root` at `stage`, with the
+    /// gap-closure marker `gap_pass` and the fix pass `code_fix`, stopped as
+    /// `devflow stop` leaves it. Returns the argv the spawned `codex` received,
+    /// the state on disk after the resume and a reaper for its monitor.
+    fn resume_gap_pass_run(
+        root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        gap_pass: bool,
+        code_fix: Option<prompt::FixType>,
+    ) -> (Vec<String>, State, ReapMonitorOnDrop) {
+        init_repo(root);
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
+        state.verification_baseline_captured = true;
+        state.stage = stage;
+        state.gap_closure_pass = gap_pass;
+        state.code_fix = code_fix;
+        state.stopped = true;
+        state.stop_reason = Some("stopped by `devflow stop`".to_string());
+        workflow::save_state(&state).unwrap();
+
+        let result = resume(root, phase, None);
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        let reap = ReapMonitorOnDrop::after_launch(&reloaded);
+        result.unwrap();
+        (recorded_argv(root, "codex"), reloaded, reap)
+    }
+
+    /// Review C6 (GATE-03): a gaps Plan pass that was stopped and is resumed
+    /// relaunches as the gaps Plan pass (`plan-phase --gaps`), and the resume
+    /// keeps the gap-closure marker. Asserted on the argv the spawned `codex`
+    /// received. Control in the same test: the same stopped Plan without the
+    /// marker resumes an ordinary Plan prompt without `--gaps`.
+    #[test]
+    fn a_stopped_gaps_plan_pass_resumes_with_gaps() {
+        const NAME: &str = "pipeline_launch::tests::a_stopped_gaps_plan_pass_resumes_with_gaps";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = argv_recording_agents_dir();
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let _guard = env_lock();
+        let codex = agents::driver_for(AgentKind::Codex);
+
+        let gaps_dir = tempfile::tempdir().unwrap();
+        let gaps_phase = PhaseId::new(5271);
+        let (argv, reloaded, _reap_gaps) =
+            resume_gap_pass_run(gaps_dir.path(), gaps_phase, Stage::Plan, true, None);
+        let gaps_prompt = codex.render_prompt(&prompt::StageIntent::PlanGaps {
+            phase: gaps_phase,
+            relaunch_note: None,
+        });
+        assert!(
+            gaps_prompt.contains(&format!("plan-phase.md for phase {gaps_phase} --gaps")),
+            "the fixture's gaps Plan prompt runs plan-phase --gaps: {gaps_prompt}"
+        );
+        assert!(
+            argv.contains(&gaps_prompt),
+            "the resumed agent receives the gaps Plan pass: {argv:?}"
+        );
+        assert!(
+            reloaded.gap_closure_pass,
+            "the resume keeps the gap-closure marker"
+        );
+
+        // Control: no marker, an ordinary Plan without --gaps.
+        let plain_dir = tempfile::tempdir().unwrap();
+        let plain_phase = PhaseId::new(5272);
+        let (argv, reloaded, _reap_plain) =
+            resume_gap_pass_run(plain_dir.path(), plain_phase, Stage::Plan, false, None);
+        assert!(
+            argv.contains(
+                &codex.render_prompt(&prompt::StageIntent::for_stage(Stage::Plan, plain_phase))
+            ),
+            "control: a plain resume delivers the ordinary Plan prompt: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|arg| arg.contains("--gaps")),
+            "control: a plain resume does not run --gaps: {argv:?}"
+        );
+        assert!(!reloaded.gap_closure_pass, "control: no marker appears");
+    }
+
+    /// Review C6 (GATE-03): a gaps Code pass whose `code_fix` was cleared (as
+    /// an `--until code` halt leaves it; a stop keeps `code_fix`), resumed with
+    /// the gap-closure marker still set, relaunches the gaps-only execute and
+    /// not the full one: the gaps-only intent is derived from the marker.
+    /// Control in the same test: the same state without the marker resumes a
+    /// full execute.
+    #[test]
+    fn a_stopped_gaps_code_pass_resumes_with_gaps_only() {
+        const NAME: &str =
+            "pipeline_launch::tests::a_stopped_gaps_code_pass_resumes_with_gaps_only";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = argv_recording_agents_dir();
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let _guard = env_lock();
+        let codex = agents::driver_for(AgentKind::Codex);
+        let code_prompt = |phase: PhaseId, fix: Option<prompt::FixType>| {
+            codex.render_prompt(&prompt::StageIntent::Code {
+                phase,
+                fix,
+                fix_note: None,
+                relaunch_note: None,
+            })
+        };
+
+        let gaps_dir = tempfile::tempdir().unwrap();
+        let gaps_phase = PhaseId::new(5273);
+        let (argv, reloaded, _reap_gaps) =
+            resume_gap_pass_run(gaps_dir.path(), gaps_phase, Stage::Code, true, None);
+        assert!(
+            argv.contains(&code_prompt(gaps_phase, Some(prompt::FixType::GapsOnly))),
+            "the resumed agent receives the gaps-only execute: {argv:?}"
+        );
+        assert!(
+            !argv.contains(&code_prompt(gaps_phase, None)),
+            "the resumed agent does not receive the full execute: {argv:?}"
+        );
+        assert!(reloaded.gap_closure_pass, "the resume keeps the marker");
+
+        // Control: no marker and no fix pass, a full execute.
+        let plain_dir = tempfile::tempdir().unwrap();
+        let plain_phase = PhaseId::new(5274);
+        let (argv, _reloaded, _reap_plain) =
+            resume_gap_pass_run(plain_dir.path(), plain_phase, Stage::Code, false, None);
+        assert!(
+            argv.contains(&code_prompt(plain_phase, None)),
+            "control: a plain resume delivers the full execute: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|arg| arg.contains("--gaps-only")),
+            "control: a plain resume runs no gaps-only pass: {argv:?}"
+        );
+    }
+
     // ---- GATE-01: a replayed or relaunched pass keeps the operator's note ----
 
     /// A fix-pass note with a newline, a tab, quotes and a backtick.

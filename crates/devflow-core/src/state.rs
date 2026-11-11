@@ -408,6 +408,25 @@ pub struct State {
     /// state was written by a binary predating this field".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validate_pass_head: Option<String>,
+    /// Whether the run is in a gap-closure pass (GATE-03, D-09): a Validate
+    /// read GSD's `gaps_found` and the run went back to Plan, which runs
+    /// `/gsd-plan-phase N --gaps`, then Code, which runs
+    /// `/gsd-execute-phase N --gaps-only`, then Validate again.
+    ///
+    /// Set by the move from Validate to Plan that starts the pass. Cleared
+    /// only when the following Validate reads GSD's `passed`, when the run
+    /// finishes or is aborted, or when another fix route replaces it in the
+    /// same commit (a loop-back to Code with another fix). A `devflow stop`,
+    /// an `--until` halt, a crash, a resume and a supervisor takeover all keep
+    /// it, so a stopped gaps pass relaunches as a gaps pass (review C6), never
+    /// as an ordinary Plan or a full execute. While it is set the
+    /// consecutive-failure streak is not reset by the pass's transitions
+    /// (D-25).
+    ///
+    /// `false` also means "the state was written by a binary predating this
+    /// field".
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub gap_closure_pass: bool,
 }
 
 /// The persisted handle on a launch's supervisor ([`State::supervisor`]).
@@ -649,6 +668,7 @@ impl State {
             code_fix_note: None,
             relaunch_note: None,
             validate_pass_head: None,
+            gap_closure_pass: false,
         }
     }
 }
