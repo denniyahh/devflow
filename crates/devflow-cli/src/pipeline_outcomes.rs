@@ -754,14 +754,12 @@ pub(crate) fn handle_validate_outcome(
         (AgentVerdict::Pass, Ok(report)) => report.status != GsdStatus::Passed,
         (AgentVerdict::Pass, Err(_)) | (AgentVerdict::Ambiguous, _) => false,
     };
-    if counted_failure {
-        record_validate_failure(project_root, state)?;
-    }
-
     // F-6: read ONCE, and used for both the message's ceiling clause and the
     // reset below, so the two can never disagree about whether this gate was a
-    // ceiling gate. Read AFTER the increment above, so it reflects the failure
-    // being handled right now.
+    // ceiling gate. Read AFTER the increment, so it reflects the failure being
+    // handled right now. The one streak update runs at most once per outcome,
+    // so a round counted for two reasons (an agent fail over `stale`) is one
+    // failure, and it returns the ceiling read after its own update.
     //
     // Deliberately NOT "did a gate fire": `Stage::Validate` + `Mode::Supervise`
     // gates unconditionally, so in Supervise the two conditions overlap
@@ -769,7 +767,11 @@ pub(crate) fn handle_validate_outcome(
     // Supervise failure, the accumulation would never be observable, and the
     // bound would be defeated in exactly the mode where an operator watches
     // every occurrence.
-    let ceiling_gate = mode::phase_failure_ceiling_reached(state.phase_validate_failures);
+    let ceiling_gate = if counted_failure {
+        record_validate_failure(project_root, state)?
+    } else {
+        mode::phase_failure_ceiling_reached(state.phase_validate_failures)
+    };
     // A failure counter at its cap, in either mode: the predicate auto mode
     // gates on (`Mode::should_gate` puts the per-phase ceiling first).
     let cap_reached = Mode::Auto.should_gate(
@@ -934,8 +936,15 @@ const GSD_FIELD_NOT_FOUND: &str = "Field not found";
 /// After a gaps Plan pass (GATE-03, Pitfall 5): the pass must have written a
 /// gap-closure plan newer than the verification report, or it counts as a
 /// failure and the run gates with `no_gap_closure_plan`. A check that cannot
-/// tell gates with `reader_failure`, never silently. With a new gap plan the
-/// run moves to Code, whose pass is gaps-only while the marker is set.
+/// tell gates with `reader_failure`, never silently, and counts nothing. With
+/// a new gap plan the run moves to Code, whose pass is gaps-only while the
+/// marker is set.
+///
+/// The counted round goes through [`record_validate_failure`], the one streak
+/// update, so it reaches the per-phase ceiling as a Validate failure does
+/// (D-12, T10). At the ceiling the gate keeps its kind and says so in its own
+/// words, and an approve or reject resets the count through
+/// [`reset_phase_failures_at_ceiling`]; an abort resets nothing.
 ///
 /// Interim until 52-29's `approve_route` (pi C3): both gates are answered like
 /// the gaps gate. Approve reruns the gaps Plan pass with the marker still set,
@@ -949,23 +958,28 @@ pub(crate) fn handle_gaps_plan_outcome(
         .worktree_path
         .clone()
         .unwrap_or_else(|| project_root.to_path_buf());
-    let action = match has_new_gap_closure_plan(&evidence_root, state.phase) {
+    let (action, ceiling_gate) = match has_new_gap_closure_plan(&evidence_root, state.phase) {
         Ok(true) => return transition(project_root, state, Stage::Code),
         Ok(false) => {
-            let context = format!(
+            let ceiling_gate = record_validate_failure(project_root, state)?;
+            let mut context = format!(
                 "The gaps Plan pass wrote no gap-closure plan (`gap_closure: true`) newer than \
                  the phase's verification report, so there is nothing for the gaps-only pass to \
                  execute. GSD verification: {}. Approving reruns the gaps Plan pass; `devflow \
                  gate abort` ends the run.",
                 gsd_status_name(GsdStatus::GapsFound)
             );
-            run_gate(
+            if ceiling_gate {
+                context.push_str(&phase_ceiling_clause(state.phase_validate_failures));
+            }
+            let action = run_gate(
                 project_root,
                 state,
                 Stage::Plan,
                 GateKind::NoGapClosurePlan,
                 &context,
-            )?
+            )?;
+            (action, ceiling_gate)
         }
         Err(failure) => {
             eprintln!(
@@ -980,37 +994,60 @@ pub(crate) fn handle_gaps_plan_outcome(
             );
             let way_on = " — the run waits here: approving reruns the gaps Plan pass, \
                           `devflow gate abort` ends the run.";
-            run_gate_with_event_context(
+            let action = run_gate_with_event_context(
                 project_root,
                 state,
                 Stage::Plan,
                 GateKind::ReaderFailure,
                 &format!("{lead}: {}{way_on}", truncate_reason(&failure.detail())),
                 &format!("{lead}{way_on}"),
-            )?
+            )?;
+            (action, false)
         }
     };
     match action {
         GateAction::Advance => {
+            // Reset first: its `commit` replaces `state`.
+            reset_phase_failures_at_ceiling(project_root, state, ceiling_gate)?;
             let _ = close_gate(project_root, state.phase, Stage::Plan);
             state.gate_pending = false;
             relaunch_failed_stage(project_root, state, Stage::Plan)
         }
-        GateAction::LoopBack { note, .. } => loop_back_to_code(
-            project_root,
-            state,
-            FixType::GapsOnly,
-            note,
-            None,
-            LoopBackReason::GateResponse,
-        ),
+        GateAction::LoopBack { note, .. } => {
+            reset_phase_failures_at_ceiling(project_root, state, ceiling_gate)?;
+            loop_back_to_code(
+                project_root,
+                state,
+                FixType::GapsOnly,
+                note,
+                None,
+                LoopBackReason::GateResponse,
+            )
+        }
+        // No reset on abort: `abort` clears the phase's state.
         GateAction::Abort(reason) => abort(project_root, state, &reason),
     }
 }
 
-/// Record one failed Validate on the counters: the per-phase total, the
-/// consecutive streak (999.66, 999.77).
-fn record_validate_failure(project_root: &Path, state: &mut State) -> Result<(), CliError> {
+/// The clause a counted Plan-pass gate carries when its round brought the
+/// phase to the per-phase ceiling (T10): in its own words, never the Validate
+/// failure sentence, since this gate did not open over a Validate.
+fn phase_ceiling_clause(phase_validate_failures: u32) -> String {
+    format!(
+        " This phase has counted {phase_validate_failures} failure(s), reaching its per-phase \
+         failure ceiling of {}: an answer that continues the run restarts the count, and \
+         `devflow gate abort` does not.",
+        mode::MAX_PHASE_VALIDATE_FAILURES
+    )
+}
+
+/// Record one counted failure on the counters: the per-phase total, the
+/// consecutive streak (999.66, 999.77) and D-34's progress rule. The one streak
+/// update: every counted round calls it, a Validate outcome (at most once per
+/// outcome) and a gaps Plan pass that wrote no gap-closure plan alike, so each
+/// reaches the per-phase ceiling the same way. Returns
+/// [`mode::phase_failure_ceiling_reached`] read after the update.
+fn record_validate_failure(project_root: &Path, state: &mut State) -> Result<bool, CliError> {
     // 999.78/WR-01 (D-07): the per-phase total accumulates on EVERY recorded
     // failure — including the arm below where the commit count could not be
     // measured, because a failure is a failure whether or not it could be
@@ -1083,7 +1120,10 @@ fn record_validate_failure(project_root: &Path, state: &mut State) -> Result<(),
                 s.consecutive_failures = s.consecutive_failures.saturating_add(1);
             }
         }
-    })
+    })?;
+    Ok(mode::phase_failure_ceiling_reached(
+        state.phase_validate_failures,
+    ))
 }
 
 /// Act on the answer to a Validate gate opened for `round` (the verdict and
