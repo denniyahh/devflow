@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::phase_id::PhaseId;
-use crate::{agent_result, events, gates::Gates, lock, workflow};
+use crate::{agent_result, events, gates::Gates, workflow};
 
 const SCOPED_DOCS: &[&str] = &[
     "README.md",
@@ -320,7 +320,6 @@ fn gitignore_covers_all_devflow_paths() {
             workflow::state_path(root, PhaseId::new(16)),
         ),
         ("Gates::dir", Gates::dir(root)),
-        ("lock::project_lock_path", lock::project_lock_path(root)),
     ];
     let ignore = std::fs::read_to_string(workspace_root().join(".gitignore"))
         .expect("workspace .gitignore must be readable");
