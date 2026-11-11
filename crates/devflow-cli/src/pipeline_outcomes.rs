@@ -15,6 +15,7 @@
 use crate::CliError;
 use crate::pipeline_gate::{
     LoopBackReason, abort, finish_run, loop_back_to_code, run_gate, run_gate_with_event_context,
+    transition,
 };
 use crate::pipeline_launch::{
     close_gate, commit, launch_stage, record_relaunch_note, recorded_canary_refusal,
@@ -380,6 +381,10 @@ pub(crate) enum ValidateRoute {
     Finish,
     /// Loop back to Code with this fix, without a gate (auto mode).
     LoopBack(FixType),
+    /// Start a gap-closure pass, without a gate (auto mode): Plan runs
+    /// `/gsd-plan-phase N --gaps`, then Code `/gsd-execute-phase N
+    /// --gaps-only`, then Validate (GATE-03, D-09).
+    GapLoop,
     /// Open the Validate gate of this kind.
     Gate(GateKind),
 }
@@ -393,7 +398,8 @@ pub(crate) enum ValidateRoute {
 /// mode below the cap. A reader failure takes precedence over every verdict,
 /// the ambiguous one included (D-24). `stale` and `missing` send Code back to
 /// the full execute command in auto mode and open a `reverify_needed` gate in
-/// supervise mode (U4); `gaps_found` takes the gaps loop; `human_needed` and an
+/// supervise mode (U4); `gaps_found` takes the gap-closure loop through Plan
+/// (GATE-03); `human_needed` and an
 /// agent that disagrees with GSD always gate. A status a later gsd-core adds
 /// reaches here as a reader failure (`UnknownStatus`), so it gates.
 pub(crate) fn validate_route(
@@ -404,13 +410,13 @@ pub(crate) fn validate_route(
 ) -> ValidateRoute {
     use AgentVerdict::{Ambiguous, Fail, Pass};
     use GsdStatus::{GapsFound, HumanNeeded, Missing, Passed, Stale};
-    use ValidateRoute::{Finish, Gate, LoopBack};
+    use ValidateRoute::{Finish, GapLoop, Gate, LoopBack};
     let unattended = |auto, supervise_kind| match (cap_reached, mode) {
         (true, _) => Gate(GateKind::FailureCap),
         (false, Mode::Auto) => auto,
         (false, Mode::Supervise) => Gate(supervise_kind),
     };
-    let gaps = || unattended(LoopBack(FixType::GapsOnly), GateKind::GapsFound);
+    let gaps = || unattended(GapLoop, GateKind::GapsFound);
     let reverify = || unattended(LoopBack(FixType::FullExecute), GateKind::ReverifyNeeded);
     match (verdict, read.as_ref().map(|report| report.status)) {
         (Pass, Err(_)) => Gate(GateKind::ReaderFailure),
@@ -703,7 +709,15 @@ pub(crate) fn handle_validate_outcome(
         );
     }
     // The only write of `validate_pass_head`: every classified verdict sets it.
-    commit(state, |s| s.validate_pass_head = pass_head.clone())?;
+    // GATE-03: a Validate that reads GSD's `passed` ends a gap-closure pass, in
+    // the same commit; no other read clears the marker.
+    let read_passed = matches!(&read, Ok(report) if report.status == GsdStatus::Passed);
+    commit(state, |s| {
+        s.validate_pass_head = pass_head.clone();
+        if read_passed {
+            s.gap_closure_pass = false;
+        }
+    })?;
 
     // IN-02: read BEFORE the recording below, which sets the baseline to
     // `Some(current)` on its measured arm and would erase the distinction
@@ -758,6 +772,9 @@ pub(crate) fn handle_validate_outcome(
             None,
             loop_back_reason(baseline_absent),
         ),
+        // GATE-03 / D-09: the gap-closure pass starts with the move to Plan,
+        // which sets the marker in its own commit.
+        ValidateRoute::GapLoop => transition(project_root, state, Stage::Plan),
         ValidateRoute::Gate(kind) => {
             let (context, event_context) = validate_gate_context(
                 kind,
@@ -2153,6 +2170,10 @@ mod tests {
             );
             // 52-22: GSD's status routes the outcome; `gaps_found` keeps the auto loop.
             let _gsd = gsd_gaps_found(root, state.phase, 1);
+            // 52-27: the outcome is handled at Validate, saved, because its
+            // gap-closure route (`transition`) moves on from the saved stage.
+            state.stage = Stage::Validate;
+            workflow::save_state(&state).unwrap();
             let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
             state.stage = Stage::Code;
             let _ = transition(root, &mut state, Stage::Validate);
@@ -2298,6 +2319,10 @@ mod tests {
             );
             // 52-22: GSD's status routes the outcome; `gaps_found` keeps the auto loop.
             let _gsd = gsd_gaps_found(root, state.phase, 1);
+            // 52-27: the outcome is handled at Validate, saved, because its
+            // gap-closure route (`transition`) moves on from the saved stage.
+            state.stage = Stage::Validate;
+            workflow::save_state(&state).unwrap();
             let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
             state.stage = Stage::Code;
             let _ = transition(root, &mut state, Stage::Validate);
@@ -2564,6 +2589,9 @@ mod tests {
                 &serde_json::from_str(LOOP_BACK_RESPONSE).unwrap(),
             );
             state.stage = Stage::Validate;
+            // 52-27: saved, because the gap-closure route moves on from the
+            // saved stage.
+            workflow::save_state(&state).unwrap();
             // 52-22: GSD's status routes the outcome; `gaps_found` keeps the auto loop.
             let _gsd = gsd_gaps_found(root, state.phase, 1);
             let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
@@ -2817,8 +2845,10 @@ mod tests {
         );
         workflow::save_state(&state).unwrap();
 
-        // 52-22: GSD's status routes the outcome; `gaps_found` keeps the auto loop.
-        let _gsd = gsd_gaps_found(root, state.phase, 1);
+        // GSD's status routes the outcome; `stale` keeps the auto loop back to
+        // Code (52-27: `gaps_found` goes through Plan, with no `loop_back`).
+        phase_dir_fixture(root, state.phase);
+        let _gsd = GsdStub::answering(root, &[gsd_says(GsdStatus::Stale)]);
         let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
         let without_baseline =
             devflow_core::events::last_event_of_kind_for_phase(root, phase, "loop_back")
@@ -2832,8 +2862,10 @@ mod tests {
             "the second half's premise: the first failure recorded a baseline"
         );
         state.stage = Stage::Validate;
-        // 52-22: GSD's status routes the outcome; `gaps_found` keeps the auto loop.
-        let _gsd = gsd_gaps_found(root, state.phase, 1);
+        // GSD's status routes the outcome; `stale` keeps the auto loop back to
+        // Code (52-27: `gaps_found` goes through Plan, with no `loop_back`).
+        phase_dir_fixture(root, state.phase);
+        let _gsd = GsdStub::answering(root, &[gsd_says(GsdStatus::Stale)]);
         let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
         let with_baseline =
             devflow_core::events::last_event_of_kind_for_phase(root, phase, "loop_back")
@@ -3795,6 +3827,10 @@ mod tests {
             );
             // 52-22: GSD's status routes the outcome; `gaps_found` keeps the auto loop.
             let _gsd = gsd_gaps_found(root, state.phase, 1);
+            // 52-27: the outcome is handled at Validate, saved, because its
+            // gap-closure route (`transition`) moves on from the saved stage.
+            state.stage = Stage::Validate;
+            workflow::save_state(&state).unwrap();
             let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
             state.stage = Stage::Code;
             let _ = transition(root, &mut state, Stage::Validate);
@@ -4703,14 +4739,19 @@ mod tests {
         preanswer_gate(root, phase, Stage::Validate, &abort_answer());
         let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Passed);
         assert!(
-            events_named(root, phase, "gate_fired").is_empty(),
-            "auto gaps_found loops back without a gate: {:?}",
+            events_named(root, phase, "gate_fired")
+                .iter()
+                .all(|event| event["stage"] != "validate"),
+            "auto gaps_found leaves Validate without a gate: {:?}",
             phase_events(root, phase)
         );
-        assert_eq!(
-            last_loop_back_fix(root, phase).as_deref(),
-            Some("GapsOnly"),
-            "auto gaps_found takes the gaps route"
+        // 52-27 (GATE-03): the gaps route is the gap-closure pass through Plan.
+        assert!(
+            events_named(root, phase, "transition")
+                .iter()
+                .any(|event| event["from"] == "validate" && event["to"] == "plan"),
+            "auto gaps_found takes the gaps route through Plan: {:?}",
+            phase_events(root, phase)
         );
         no_full_execute(root, phase, "auto gaps_found");
 

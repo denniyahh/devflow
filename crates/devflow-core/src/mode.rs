@@ -140,8 +140,30 @@ const _: () = assert!(MAX_CHECKPOINT_RESUMES > 0 && MAX_CHECKPOINT_RESUMES <= MA
 /// `infra_failures` would silently convert [`MAX_INFRA_FAILURES`] from a
 /// stuck-loop bound into a phase-lifetime bound — the exact regression
 /// 17-06 was written to prevent.
-pub fn transition_resets_consecutive_failures(from: Stage, to: Stage) -> bool {
-    !matches!((from, to), (Stage::Code, Stage::Validate))
+///
+/// **A gap-closure pass keeps the streak too (D-25, GATE-03).** With
+/// `gap_closure_pass` set ([`crate::state::State::gap_closure_pass`]), a
+/// `gaps_found` Validate goes back through Plan (`--gaps`) and Code
+/// (`--gaps-only`) before the next Validate, so Validate→Plan and Plan→Code are
+/// hops of the same retry loop and do not reset it either; otherwise three
+/// gap rounds could never reach [`MAX_CONSECUTIVE_FAILURES`]. `gap_closure_pass`
+/// is the marker as the transition leaves it: the move from Validate to Plan
+/// sets it in the same write.
+///
+/// # Changed in 4.0.0 — breaking
+///
+/// The `gap_closure_pass` parameter is new; a caller outside a gap-closure
+/// pass passes `false` and gets the old answer.
+pub fn transition_resets_consecutive_failures(
+    from: Stage,
+    to: Stage,
+    gap_closure_pass: bool,
+) -> bool {
+    match (from, to) {
+        (Stage::Code, Stage::Validate) => false,
+        (Stage::Validate, Stage::Plan) | (Stage::Plan, Stage::Code) => !gap_closure_pass,
+        _ => true,
+    }
 }
 
 /// Whether a Validate failure represents forward progress since the last
@@ -399,7 +421,8 @@ mod tests {
     fn consecutive_reset_skips_the_code_to_validate_hop() {
         assert!(!transition_resets_consecutive_failures(
             Stage::Code,
-            Stage::Validate
+            Stage::Validate,
+            false
         ));
     }
 
@@ -410,7 +433,8 @@ mod tests {
         // fall through un-asserted.
         assert!(transition_resets_consecutive_failures(
             Stage::Plan,
-            Stage::Code
+            Stage::Code,
+            false
         ));
     }
 

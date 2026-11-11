@@ -100,7 +100,9 @@ const PROMOTION_WAIT: Duration = Duration::from_secs(5);
 /// so after a handoff the fallback's own renderer is used. The operator's notes
 /// ride the same way (GATE-01): the fix pass's [`State::code_fix_note`], only
 /// while a fix pass is in flight, and the stage's [`State::relaunch_note`],
-/// attached to the intent the default builder returns.
+/// attached to the intent the default builder returns. In a gap-closure pass
+/// ([`State::gap_closure_pass`], GATE-03) Plan renders the gaps Plan intent
+/// and Code the gaps-only pass, so a stop and resume keeps the pass's commands.
 ///
 /// The only place a default stage prompt is rendered:
 /// [`launch_stage_inner`] (whose prompt the agent receives) and
@@ -108,9 +110,20 @@ const PROMOTION_WAIT: Duration = Duration::from_secs(5);
 /// `every_no_override_launch_renders_through_default_stage_prompt` pins.
 pub(crate) fn default_stage_prompt(state: &State, driver: &dyn agents::AgentDriver) -> String {
     let intent = match state.stage {
+        // GATE-03 (review C6): a gap-closure pass's Plan runs `--gaps`, at its
+        // first launch and at every relaunch, a resume included.
+        Stage::Plan if state.gap_closure_pass => prompt::StageIntent::PlanGaps {
+            phase: state.phase,
+            relaunch_note: state.relaunch_note.clone(),
+        },
+        // The gaps-only pass is derived from the gap-closure marker when no
+        // fix pass is recorded, so an `--until code` halt, which clears
+        // `code_fix`, cannot turn a gaps Code pass into a full execute.
         Stage::Code => prompt::StageIntent::Code {
             phase: state.phase,
-            fix: state.code_fix,
+            fix: state
+                .code_fix
+                .or(state.gap_closure_pass.then_some(prompt::FixType::GapsOnly)),
             fix_note: state.code_fix.and(state.code_fix_note.clone()),
             relaunch_note: state.relaunch_note.clone(),
         },

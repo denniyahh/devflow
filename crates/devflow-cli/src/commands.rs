@@ -345,6 +345,12 @@ pub(crate) enum FallbackSource {
     FlagOrConfig(Option<AgentKind>),
 }
 
+/// What `devflow start --until validate` prints (52-27, pi S3): Validate is
+/// the last stage, so the run ends at its finish or at a gate as it would
+/// without `--until`, and a gaps verdict runs the gap-closure loop.
+const UNTIL_VALIDATE_NOTICE: &str = "note: --until validate halts nothing: Validate is the \
+last stage, so the run ends at its finish or at a gate, as it would without --until";
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start(
     project_root: &Path,
@@ -743,6 +749,16 @@ fn start_reserved(
     );
     // 52-22: which GSD answers this run's verification reads, once per run.
     crate::pipeline_outcomes::record_gsd_runtime(project_root, phase);
+    // 52-27 (pi S3): `--until validate` halts nothing in v4, so say so once.
+    if state.stop_until == Some(Stage::Validate) {
+        println!("{UNTIL_VALIDATE_NOTICE}");
+        events::emit(
+            project_root,
+            phase,
+            "until_noop",
+            serde_json::json!({ "until": Stage::Validate.to_string() }),
+        );
+    }
     if let Err(err) = launch_stage(&mut state, None, None) {
         // A stop at a safe point is recorded and ends the launch with an error; a stopped
         // run keeps its state for `devflow resume`.

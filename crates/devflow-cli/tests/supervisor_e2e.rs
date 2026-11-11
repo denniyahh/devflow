@@ -2101,13 +2101,11 @@ fn logged_prompts(rig: &FinishRig) -> Vec<String> {
         .collect()
 }
 
-/// The GSD replies of one gap round: `gaps_found` at the first Validate, the
-/// gap plan's `gap_closure` read after the gaps Plan pass, `passed` at the
-/// second Validate.
-fn gap_round_replies() -> [&'static str; 3] {
+/// The GSD replies of one gap round: `gaps_found` at the first Validate and
+/// `passed` at the second.
+fn gap_round_replies() -> [&'static str; 2] {
     [
         devflow_core::test_support::gsd_status_json(GsdStatus::GapsFound),
-        r#"{"gap_closure": true}"#,
         devflow_core::test_support::gsd_status_json(GsdStatus::Passed),
     ]
 }

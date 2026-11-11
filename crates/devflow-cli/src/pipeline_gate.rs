@@ -72,7 +72,13 @@ pub(crate) fn transition(
     // `"transition"` event, and
     // `launch_stage` — no new monitor is spawned, and `loop_back_to_code`
     // (a retry, not an advance) is untouched by this check.
-    if state.stop_until == Some(from) {
+    //
+    // 52-27 (orchestrator decision, reversible): never after Validate. It is
+    // the last stage, so its pass ends through `finish_run`, and its only
+    // transition is the gap-closure route to Plan (GATE-03), which runs under
+    // `--until validate` as the loop-back to Code does: `--until validate`
+    // halts nothing.
+    if state.stop_until == Some(from) && from != Stage::Validate {
         commit(state, |s| {
             s.stopped = true;
             s.stop_reason = Some(format!("stopped after {from} completed (--until {from})"));
@@ -119,7 +125,13 @@ pub(crate) fn transition(
     ensure_still_recorded(project_root, state.phase)?;
     commit(state, |s| {
         s.stage = to;
-        if mode::transition_resets_consecutive_failures(from, to) {
+        // GATE-03 / D-09: the move from Validate to Plan is the gap-closure
+        // route, the only way out of Validate through here, so it starts a
+        // gap-closure pass. Nothing in this function clears the marker.
+        if (from, to) == (Stage::Validate, Stage::Plan) {
+            s.gap_closure_pass = true;
+        }
+        if mode::transition_resets_consecutive_failures(from, to, s.gap_closure_pass) {
             s.consecutive_failures = 0;
         }
         s.infra_failures = 0;
@@ -189,6 +201,7 @@ pub(crate) fn finish_run(project_root: &Path, state: &mut State) -> Result<(), C
         s.code_fix = None;
         s.code_fix_note = None;
         s.relaunch_note = None;
+        s.gap_closure_pass = false;
     })?;
     registry::deregister(project_root, state.phase);
     events::emit(
@@ -309,6 +322,11 @@ pub(crate) fn prepare_loop_back_to_code(
         // (failover, resume, re-drive) replays it rather than plain execute.
         s.code_fix = Some(fix);
         s.code_fix_note = note.clone();
+        // GATE-03: another fix route replaces a gap-closure pass, in the same
+        // commit; a gaps-only loop-back continues it.
+        if fix != FixType::GapsOnly {
+            s.gap_closure_pass = false;
+        }
         // U7: this leaves Validate without `transition`, so it clears the
         // relaunch note itself; the prompt below is built with none, so the
         // prompt and the persisted state agree.
