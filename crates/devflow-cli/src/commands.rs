@@ -13,7 +13,9 @@
 use crate::CliError;
 use crate::config_parse;
 use crate::config_parse::GATE_ESCALATION_THRESHOLD_SECS;
-use crate::phase_worktree::ensure_phase_worktree;
+use crate::phase_worktree::{
+    ensure_phase_worktree, refuse_force_over_unmerged_branch, unmerged_commits,
+};
 use crate::pipeline_gate::print_dry_run;
 use crate::pipeline_launch::{launch_stage, single_active_phase};
 use crate::pipeline_outcomes::render_gate_context;
@@ -630,6 +632,10 @@ fn start_reserved(
         // not on a fresh read that can differ from it.
         let git = GitFlow::with_config(project_root, resolved_git_flow.clone());
         let result = if force {
+            // `feature_start_force` resets the branch to the base in place,
+            // which loses commits not merged into it as surely as `-D`.
+            let branch = format!("{FEATURE_PREFIX}phase-{padded}", padded = phase.padded());
+            refuse_force_over_unmerged_branch(&git, &branch, base, None)?;
             git.feature_start_force(phase)
         } else {
             git.feature_start(phase)
@@ -818,7 +824,8 @@ fn restart_verb(state: &State) -> String {
     let worktree_path = worktree::phase_path(&state.project_root, state.phase);
     if worktree_path.exists() {
         format!(
-            "{verb} --force  # recreates {} from the base, discarding what is in it",
+            "{verb} --force  # recreates {} from the base, discarding what is in it; \
+             refused while its branch has commits not merged into the base",
             worktree_path.display()
         )
     } else {
@@ -1168,7 +1175,10 @@ fn remove_worktree_with_retry(
 }
 
 /// Remove phase worktrees, deleting their associated feature branches,
-/// then prune and clean up merged branches.
+/// then prune and clean up merged branches. `--force` never deletes a branch
+/// with commits not merged into the trunk: it keeps the branch and names the
+/// command that deletes it, since a finished run's branch holds the only copy
+/// of its work until it is closed out.
 ///
 /// Hard-refuses (D-06, no override flag) removal of any worktree whose owning
 /// phase has a live agent (whatever its supervisor's liveness) or a
@@ -1181,7 +1191,10 @@ pub(crate) fn cleanup(project_root: &Path, force: bool) -> Result<(), CliError> 
     // Project-resolved (45-01): `cleanup_merged` computes "merged" relative
     // to the trunk and treats it as protected — both must be the configured
     // one, or this sweep can delete a branch that was never merged.
-    let git = GitFlow::for_project(project_root);
+    // Built from `git_flow_for_project`, as `for_project` is, so the trunk name the
+    // kept-branch line gives is the one `git` counted against.
+    let flow = devflow_core::config::git_flow_for_project(project_root);
+    let git = GitFlow::with_config(project_root, flow.clone());
     let worktrees_dir = worktree::worktrees_dir(project_root);
     let states = workflow::list_states(project_root);
 
@@ -1270,9 +1283,12 @@ pub(crate) fn cleanup(project_root: &Path, force: bool) -> Result<(), CliError> 
                 print!("removed worktree {}", wt.path.display());
                 match &wt.branch {
                     Some(branch) if branch.starts_with(FEATURE_PREFIX) => {
-                        match git.delete_branch(branch, force) {
-                            Ok(()) => println!(" + deleted branch {branch}"),
-                            Err(err) => println!(" (branch {branch} kept: {err})"),
+                        match kept_unmerged_branch(&git, branch, &flow.develop, force) {
+                            Some(kept) => println!(" ({kept})"),
+                            None => match git.delete_branch(branch, force) {
+                                Ok(()) => println!(" + deleted branch {branch}"),
+                                Err(err) => println!(" (branch {branch} kept: {err})"),
+                            },
                         }
                     }
                     _ => println!(),
@@ -1312,6 +1328,24 @@ pub(crate) fn cleanup(project_root: &Path, force: bool) -> Result<(), CliError> 
     Ok(())
 }
 
+/// Why `cleanup --force` keeps `branch` instead of force-deleting it, when it does:
+/// the branch has commits not merged into `trunk`, or its merge state cannot be read.
+/// Names the command that deletes it. `None` without `force`, whose `git branch -d`
+/// refuses unmerged work itself, and for a branch whose every commit is merged.
+fn kept_unmerged_branch(git: &GitFlow, branch: &str, trunk: &str, force: bool) -> Option<String> {
+    if !force {
+        return None;
+    }
+    let why = match git.commits_not_in_develop(branch) {
+        Ok(0) => return None,
+        Ok(count) => format!("it has {}", unmerged_commits(count, trunk)),
+        Err(err) => format!("could not check whether it is merged into `{trunk}`: {err}"),
+    };
+    Some(format!(
+        "branch {branch} kept: {why}; to delete it yourself, run `git branch -D {branch}`"
+    ))
+}
+
 /// `cleanup`'s line for a worktree it keeps because its run stopped or finished
 /// (OPS-02, D-35): the recorded stop reason verbatim, and the way on from there. A
 /// finished run is offered only `--force`, since `resume` refuses it.
@@ -1321,14 +1355,17 @@ fn kept_stopped_worktree_line(path: &Path, state: &State) -> String {
     let (kind, next) = if state.finished {
         (
             "finished",
-            "pass --force to remove the worktree and the run's state".to_string(),
+            "pass --force to remove the worktree and the run's state (a branch with commits \
+             not merged into the base is kept)"
+                .to_string(),
         )
     } else {
         (
             "stopped",
             format!(
                 "run `devflow resume --phase {phase}` to continue it, or pass --force to discard \
-                 the worktree and the run's state"
+                 the worktree and the run's state (a branch with commits not merged into the \
+                 base is kept)"
             ),
         )
     };

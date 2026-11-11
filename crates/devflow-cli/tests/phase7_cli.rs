@@ -1690,6 +1690,202 @@ fn cleanup_keeps_the_branch_of_a_kept_worktree() {
     );
 }
 
+/// Whether `branch` exists in `root`, and its tip when it does.
+fn branch_tip(root: &Path, branch: &str) -> Option<String> {
+    let out = devflow_core::test_support::git_command(root)
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ])
+        .output()
+        .expect("spawn git rev-parse");
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// A finished run's branch holds the only copy of its work until it is closed out, so
+/// `cleanup --force` keeps a branch with commits not merged into the base: it still
+/// removes the worktree and the run's state, and names the branch, why it was kept and
+/// the command that deletes it.
+#[test]
+fn cleanup_force_keeps_an_unmerged_branch_and_names_the_delete_command() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let phase = PhaseId::new(27);
+    let branch = format!("feature/phase-{padded}", padded = phase.padded());
+    let wt = cleanup_fixture(root, phase, false, |state| {
+        state.stopped = true;
+        state.finished = true;
+        state.stop_reason = Some(FINISHED_REASON.to_string());
+    });
+    let tip = branch_tip(root, &branch).expect("premise: the branch exists");
+    let state_file = devflow_core::workflow::state_path(root, phase);
+    assert!(state_file.is_file(), "premise: the state file exists");
+
+    let out = run_cleanup(&home, root, &["--force"]);
+    let text =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{text}");
+    assert!(!wt.is_dir(), "the worktree is removed: {text}");
+    assert!(!state_file.exists(), "the run's state is removed: {text}");
+    assert_eq!(
+        branch_tip(root, &branch).as_deref(),
+        Some(tip.as_str()),
+        "the unmerged branch is kept at its tip: {text}"
+    );
+    let kept_line = text
+        .lines()
+        .find(|line| line.contains(&format!("branch {branch} kept")))
+        .unwrap_or_else(|| panic!("a line names the kept branch: {text}"));
+    assert!(
+        kept_line.contains("1 commit not merged into `develop`"),
+        "the line says why, with the count: {kept_line}"
+    );
+    assert!(
+        kept_line.contains(&format!("git branch -D {branch}")),
+        "the line names the delete command: {kept_line}"
+    );
+}
+
+/// Control for the test above: `cleanup --force` still deletes a branch with no
+/// commit beyond the base.
+#[test]
+fn cleanup_force_deletes_a_merged_branch() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let phase = PhaseId::new(28);
+    let branch = format!("feature/phase-{padded}", padded = phase.padded());
+    let wt = cleanup_fixture(root, phase, true, |state| {
+        state.stopped = true;
+        state.finished = true;
+        state.stop_reason = Some(FINISHED_REASON.to_string());
+    });
+    assert!(
+        branch_tip(root, &branch).is_some(),
+        "premise: the branch exists"
+    );
+
+    let out = run_cleanup(&home, root, &["--force"]);
+    let text =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{text}");
+    assert!(!wt.is_dir(), "the worktree is removed: {text}");
+    assert_eq!(
+        branch_tip(root, &branch),
+        None,
+        "the merged branch is deleted: {text}"
+    );
+    assert!(!text.contains("git branch -D"), "{text}");
+}
+
+/// `devflow start` with `--force` (plus `extra`) for phase 12 over `root`, in a
+/// hermetic home, with its exit status left to the caller. A reaper is bound before the
+/// launch, so a start that does launch has its run ended when the test ends.
+fn force_start_phase_12(
+    home: &common::HermeticHome,
+    root: &Path,
+    extra: &[&str],
+) -> (Output, common::LaunchedRunReaper) {
+    let reaper = common::LaunchedRunReaper::new(root, PhaseId::new(12), Vec::new());
+    let fake_bin = fake_bin_dir(&[(
+        "codex",
+        "#!/bin/sh\nprintf 'DEVFLOW_RESULT: {\"status\":\"success\"}\\n'\n",
+    )]);
+    let output = common::hermetic_devflow(home)
+        .args([
+            "start",
+            "--phase",
+            "12",
+            "--agent",
+            "codex",
+            "--mode",
+            "supervise",
+            "--force",
+        ])
+        .args(extra)
+        .arg(root)
+        .env("PATH", path_with_fake_bin(&fake_bin.path))
+        .env("DEVFLOW_TEST_ROOT", root)
+        .env("DEVFLOW_GATE_TIMEOUT_SECS", "60")
+        .current_dir(root)
+        .output()
+        .expect("run devflow start --force");
+    (output, reaper)
+}
+
+/// `start --force` cannot recreate a phase branch with commits not merged into the base
+/// without deleting them, so it refuses before removing anything: the worktree and the
+/// branch are both left, and the refusal names the branch and both ways on.
+#[test]
+fn start_force_refuses_over_an_unmerged_phase_branch() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let phase = PhaseId::new(12);
+    let branch = format!("feature/phase-{padded}", padded = phase.padded());
+    seed_feature_branch(root, phase);
+    let wt = root.join(".worktrees/phase-12");
+    devflow_core::worktree::add(root, &wt, &branch, &branch, false).unwrap();
+    let tip = branch_tip(root, &branch).expect("premise: the branch exists");
+
+    let (out, _reaper) = force_start_phase_12(&home, root, &[]);
+    let text =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "start --force is refused: {text}");
+    assert!(wt.is_dir(), "the worktree is left in place: {text}");
+    assert_eq!(
+        branch_tip(root, &branch).as_deref(),
+        Some(tip.as_str()),
+        "the branch is left at its tip: {text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "`{branch}` has 1 commit not merged into `develop`"
+        )),
+        "names the branch and its unmerged commit: {text}"
+    );
+    assert!(
+        text.contains(&format!("git branch -D {branch}")),
+        "names the delete command: {text}"
+    );
+}
+
+/// The `--no-worktree` arm of the test above: `start --force` would reset the branch to
+/// the base in place, so it refuses an unmerged one too and leaves it at its tip.
+#[test]
+fn start_force_no_worktree_refuses_over_an_unmerged_phase_branch() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let phase = PhaseId::new(12);
+    let branch = format!("feature/phase-{padded}", padded = phase.padded());
+    seed_feature_branch(root, phase);
+    let tip = branch_tip(root, &branch).expect("premise: the branch exists");
+
+    let (out, _reaper) = force_start_phase_12(&home, root, &["--no-worktree"]);
+    let text =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "start --force is refused: {text}");
+    assert_eq!(
+        branch_tip(root, &branch).as_deref(),
+        Some(tip.as_str()),
+        "the branch is left at its tip: {text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "`{branch}` has 1 commit not merged into `develop`"
+        )),
+        "names the branch and its unmerged commit: {text}"
+    );
+}
+
 /// 20b instance 1 (probe 20b/idempotency): `cleanup` run twice succeeds —
 /// the second run finds the worktree already gone and does not error.
 #[test]

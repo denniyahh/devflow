@@ -216,6 +216,24 @@ impl GitFlow {
             .unwrap_or(false)
     }
 
+    /// How many commits `branch` has that the trunk (`develop`, as configured)
+    /// does not: `0` means every commit on it is merged into the trunk, so
+    /// force-deleting it loses nothing.
+    ///
+    /// Takes the branch name rather than a phase, unlike
+    /// [`Self::is_merged_into_develop`], so a caller can ask about the branch a
+    /// worktree actually has checked out. An absent branch or trunk is an
+    /// error, never `0`: callers deciding whether to delete must fail closed.
+    pub fn commits_not_in_develop(&self, branch: &str) -> Result<usize, GitError> {
+        let range = format!("{}..{branch}", self.config.develop);
+        let count = self.git_output(["rev-list", "--count", &range, "--"])?;
+        count.trim().parse().map_err(|err| {
+            GitError::Command(format!(
+                "git rev-list --count {range} printed {count:?}, not a count: {err}"
+            ))
+        })
+    }
+
     /// Create or reset a release branch from the current `HEAD`.
     ///
     /// The release branch is cut from wherever the caller currently is — the
@@ -1528,6 +1546,24 @@ mod tests {
         // Protected branches are never deleted.
         assert!(gf.delete_branch("develop", true).is_err());
         assert!(gf.delete_branch("main", true).is_err());
+    }
+
+    /// `commits_not_in_develop` counts a branch's unmerged commits, reads `0` once they
+    /// are merged into the trunk, and is an error, never `0`, for an absent branch.
+    #[test]
+    fn commits_not_in_develop_counts_unmerged_work_and_fails_on_an_absent_branch() {
+        let repo = init_repo();
+        let root = repo.path();
+        let gf = flow(root);
+        gf.feature_start(PhaseId::new(8)).expect("start");
+        commit_file(root, "one.txt");
+        commit_file(root, "two.txt");
+        git(root, &["checkout", "-q", "develop"]);
+
+        assert_eq!(gf.commits_not_in_develop("feature/phase-08").unwrap(), 2);
+        git(root, &["merge", "-q", "--ff-only", "feature/phase-08"]);
+        assert_eq!(gf.commits_not_in_develop("feature/phase-08").unwrap(), 0);
+        assert!(gf.commits_not_in_develop("feature/phase-99").is_err());
     }
 
     #[test]

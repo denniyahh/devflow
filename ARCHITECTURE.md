@@ -353,7 +353,7 @@ optional minimal `devflow.toml` contains only reliability knobs:
 | `--phase N` | Phase number to work on |
 | `--agent claude\|codex\|opencode` | Agent to launch |
 | `--mode auto\|supervise` | `auto` runs unattended and finishes on a passing Validate (gating only on repeated Validate failure, plus never-silent failure gates); `supervise` also gates every Validate |
-| `--force` | Overwrite the feature branch if it already exists |
+| `--force` | Recreate the phase worktree and feature branch from the base if they exist; refused, with nothing removed, while the branch has commits not merged into the base |
 | `--no-worktree` | Run in the primary checkout instead of an isolated worktree |
 | `--dry-run` | Print the pipeline that would run without launching anything |
 
