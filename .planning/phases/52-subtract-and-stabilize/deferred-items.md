@@ -110,3 +110,9 @@
   status: open
   **What:** 52-24 deleted the report-authorship heuristic and its three State fields, which were these two `pub` functions' only consumers. They stay because they are `pub` in the published devflow-core and the plan did not list them; their own unit tests still pass.
   **Fix shape:** delete both with `phase_verification_fingerprint_*` tests in a plan that already takes devflow-core semver breaks (4.0.0 covers it), and record the `function_missing` from `cargo semver-checks`; or keep them and say why.
+
+- `pending_supervisor_e2e::stop_ends_a_launch_its_running_launcher_promotes_during_the_wait` failed once on its liveness-file check (found in 52-28)
+  status: open
+  **What:** in 52-28's first full `cargo nextest run --workspace` (2010 tests, 1 failed), the test failed at `crates/devflow-cli/tests/pending_supervisor_e2e.rs:309` with `its liveness file is gone`: `liveness::probe` read `Live`, not `Missing`, right after `stop` returned. Three isolated reruns passed, and the next two full runs (2012 tests, and `scripts/check.sh all`) passed. 52-28 touched no stop, supervisor or liveness code (its diff is the re-verify fix pass, the streak update and OPERATIONS.md).
+  **Not established:** the cause. Suspected: the same fork-inherits-fd family as 999.221 (a child forked by another test holding a duplicate of the liveness lock's description until its `exec`), or the ended supervisor's exit racing the probe under load. Not reproduced on demand.
+  **Fix shape:** have the assertion wait (bounded) for the liveness file to read `Missing`, or treat it with 999.221's fix; file a 999.x entry if it recurs.
