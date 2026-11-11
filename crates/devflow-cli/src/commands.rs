@@ -1152,22 +1152,17 @@ pub(crate) fn cleanup(project_root: &Path, force: bool) -> Result<(), CliError> 
         // never a pid.
         let phase_liveness = matched_state.map_or(PhaseLiveness::NotLaunched, probe_phase);
 
-        // A phase halted via `devflow start --until <stage>` (20c) has no
-        // running supervisor and its agent has already exited by design —
-        // which would otherwise sail straight through the live-agent refusal
-        // below. Treat it the same way `doctor`'s `check_dead_agent`/
-        // `check_supervisor` were taught about `facts.stopped`: an
-        // intentionally-parked worktree is never implicitly safe to remove —
-        // require `--force`.
-        let stopped = matched_state.is_some_and(|s| s.stopped);
-        if stopped && !force {
-            let phase_label = phase
-                .map(|p| p.to_string())
-                .unwrap_or_else(|| "?".to_string());
-            println!(
-                "keeping worktree {} for phase {phase_label} — halted via --until; run `devflow resume --phase {phase_label}` first, or pass --force to discard it",
-                wt.path.display()
-            );
+        // A stopped run (an `--until` halt, a `devflow stop`, any other recorded
+        // stop) or a finished one (D-35) has no running supervisor and its agent
+        // has exited by design, which would otherwise sail straight through the
+        // live-agent refusal below. An intentionally kept worktree is never
+        // implicitly safe to remove: require `--force`, and say why it is kept
+        // with the run's own recorded stop reason (OPS-02). A finished run is
+        // not offered `resume`, which refuses it.
+        if let Some(state) = matched_state.filter(|s| s.stopped)
+            && !force
+        {
+            println!("{}", kept_stopped_worktree_line(&wt.path, state));
             continue;
         }
 
@@ -1186,8 +1181,13 @@ pub(crate) fn cleanup(project_root: &Path, force: bool) -> Result<(), CliError> 
             let phase_label = phase
                 .map(|p| p.to_string())
                 .unwrap_or_else(|| "?".to_string());
+            let agent = if agent_alive {
+                "its agent is running; "
+            } else {
+                ""
+            };
             return Err(CliError::Message(format!(
-                "refusing to remove worktree {} for phase {phase_label} ({}) — run `devflow stop --phase {phase_label}` or wait for it to finish",
+                "refusing to remove worktree {} for phase {phase_label} — a run is live ({agent}supervisor: {}); run `devflow stop --phase {phase_label}` or wait for it to finish",
                 wt.path.display(),
                 phase_liveness.describe(),
             )));
@@ -1225,6 +1225,9 @@ pub(crate) fn cleanup(project_root: &Path, force: bool) -> Result<(), CliError> 
                     }
                     _ => println!(),
                 }
+                if force && let Some(state) = matched_state {
+                    remove_run_state_with_worktree(project_root, state, &wt.path);
+                }
                 removed += 1;
             }
             Err(err) => {
@@ -1240,7 +1243,13 @@ pub(crate) fn cleanup(project_root: &Path, force: bool) -> Result<(), CliError> 
     if removed == 0 {
         println!("no worktrees to clean up");
     }
-    match git.cleanup_merged() {
+    // A merged branch that a kept worktree (or any other checkout) still has
+    // checked out is skipped, not left to git to refuse.
+    let checked_out: Vec<String> = worktree::list(project_root)?
+        .into_iter()
+        .filter_map(|wt| wt.branch)
+        .collect();
+    match git.cleanup_merged_keeping(&checked_out) {
         Ok(merged) => {
             for branch in merged {
                 println!("deleted merged branch {branch}");
@@ -1249,6 +1258,56 @@ pub(crate) fn cleanup(project_root: &Path, force: bool) -> Result<(), CliError> 
         Err(err) => println!("warning: could not prune merged branches: {err}"),
     }
     Ok(())
+}
+
+/// `cleanup`'s line for a worktree it keeps because its run stopped or finished
+/// (OPS-02, D-35): the recorded stop reason verbatim, and the way on from there. A
+/// finished run is offered only `--force`, since `resume` refuses it.
+fn kept_stopped_worktree_line(path: &Path, state: &State) -> String {
+    let phase = state.phase;
+    let reason = state.stop_reason.as_deref().unwrap_or("no reason recorded");
+    let (kind, next) = if state.finished {
+        (
+            "finished",
+            "pass --force to remove the worktree and the run's state".to_string(),
+        )
+    } else {
+        (
+            "stopped",
+            format!(
+                "run `devflow resume --phase {phase}` to continue it, or pass --force to discard \
+                 the worktree and the run's state"
+            ),
+        )
+    };
+    format!(
+        "keeping worktree {} for phase {phase}: the run {kind} (stop reason: {reason}); {next}",
+        path.display()
+    )
+}
+
+/// `cleanup --force`'s removal of the run's state file once its worktree is gone
+/// (OPS-02, 999.213), so nothing of the run is left behind. Only a state that
+/// records this worktree, or none, is removed: a state joined by name whose
+/// recorded worktree is another path still owns that one.
+fn remove_run_state_with_worktree(project_root: &Path, state: &State, removed: &Path) {
+    if state
+        .worktree_path
+        .as_deref()
+        .is_some_and(|recorded| recorded != removed)
+    {
+        return;
+    }
+    let path = workflow::state_path(project_root, state.phase);
+    match workflow::clear_state(project_root, state.phase) {
+        Ok(true) => println!("removed run state {}", path.display()),
+        Ok(false) => {}
+        Err(err) => println!(
+            "warning: could not remove the run state {} for phase {}: {err}",
+            path.display(),
+            state.phase
+        ),
+    }
 }
 
 /// A phase's supervisor liveness as `status`, `cleanup` and `doctor` report
