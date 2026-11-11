@@ -350,6 +350,12 @@ impl GitFlow {
     /// checked out in a worktree) is logged and skipped so one failure
     /// doesn't abort the rest of the sweep.
     pub fn cleanup_merged(&self) -> Result<Vec<String>, GitError> {
+        self.cleanup_merged_to(&mut std::io::stderr())
+    }
+
+    /// [`Self::cleanup_merged`], writing the line for each branch git refused
+    /// to delete to `err`: the returned list names only the deleted ones.
+    fn cleanup_merged_to(&self, _err: &mut dyn std::io::Write) -> Result<Vec<String>, GitError> {
         let output = self.git_output(["branch", "--merged", &self.config.develop])?;
         // CR-01 (45-REVIEW.md): the configured trunk cannot be the SOLE
         // source of the protected set. Once `config.develop` became the
@@ -894,6 +900,35 @@ mod tests {
 
     fn flow(root: &Path) -> GitFlow {
         GitFlow::new(root)
+    }
+
+    #[test]
+    fn a_merged_branch_git_refuses_to_delete_is_reported_without_tracing() {
+        let repo = init_repo();
+        let root = repo.path();
+        git(root, &["branch", "held-merged"]);
+        // A merged branch checked out in a linked worktree: `git branch -D`
+        // refuses it.
+        let linked = tempfile::tempdir().unwrap();
+        let worktree = linked.path().join("wt");
+        git(
+            root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                worktree.to_str().unwrap(),
+                "held-merged",
+            ],
+        );
+        let mut sink = Vec::new();
+        let deleted = flow(root).cleanup_merged_to(&mut sink).expect("cleanup");
+        assert!(!deleted.contains(&"held-merged".to_string()));
+        let text = String::from_utf8(sink).unwrap();
+        assert!(
+            text.starts_with("warning: could not delete the merged branch held-merged"),
+            "the operator must be told the branch was kept: {text:?}"
+        );
     }
 
     /// 45-01 / D-01: `with_config` is what makes the trunk configurable.

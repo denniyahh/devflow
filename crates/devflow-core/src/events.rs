@@ -34,6 +34,19 @@ const SCHEMA_VERSION: u32 = 1;
 /// Append one event line. `fields` supplies the kind-specific payload and
 /// must be a JSON object (anything else is recorded under a `"data"` key).
 pub fn emit(project_root: &Path, phase: PhaseId, event: &str, fields: serde_json::Value) {
+    emit_to(project_root, phase, event, fields, &mut std::io::stderr());
+}
+
+/// [`emit`], writing the warning line for an event it could not record to
+/// `err`: with tracing off by default that line is the operator's only sign
+/// that the log is missing an event.
+fn emit_to(
+    project_root: &Path,
+    phase: PhaseId,
+    event: &str,
+    fields: serde_json::Value,
+    _err: &mut dyn Write,
+) {
     let mut line = serde_json::json!({
         "v": SCHEMA_VERSION,
         "ts": unix_now(),
@@ -206,6 +219,63 @@ mod tests {
             .lines()
             .map(|l| serde_json::from_str(l).expect("every line parses as JSON"))
             .collect()
+    }
+
+    #[test]
+    fn an_event_dir_that_cannot_be_created_is_reported_without_tracing() {
+        let dir = tempfile::tempdir().unwrap();
+        // `.devflow` is a file, so the events directory cannot be created.
+        std::fs::write(dir.path().join(".devflow"), "").unwrap();
+        let mut sink = Vec::new();
+        emit_to(
+            dir.path(),
+            PhaseId::new(7),
+            "probe",
+            serde_json::json!({}),
+            &mut sink,
+        );
+        let text = String::from_utf8(sink).unwrap();
+        assert!(
+            text.starts_with("warning: could not record the `probe` event"),
+            "the operator must be told the event was not recorded: {text:?}"
+        );
+    }
+
+    #[test]
+    fn an_event_log_that_cannot_be_appended_is_reported_without_tracing() {
+        let dir = tempfile::tempdir().unwrap();
+        // The log path is a directory, so the append cannot open it.
+        std::fs::create_dir_all(events_path(dir.path())).unwrap();
+        let mut sink = Vec::new();
+        emit_to(
+            dir.path(),
+            PhaseId::new(7),
+            "probe",
+            serde_json::json!({}),
+            &mut sink,
+        );
+        let text = String::from_utf8(sink).unwrap();
+        assert!(
+            text.starts_with("warning: could not record the `probe` event")
+                && text.contains("events.jsonl"),
+            "the operator must be told the event was not recorded: {text:?}"
+        );
+    }
+
+    #[test]
+    fn a_recorded_event_writes_no_warning() {
+        // Control for the two tests above.
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = Vec::new();
+        emit_to(
+            dir.path(),
+            PhaseId::new(7),
+            "probe",
+            serde_json::json!({}),
+            &mut sink,
+        );
+        assert_eq!(read_lines(dir.path()).len(), 1);
+        assert!(sink.is_empty());
     }
 
     #[test]

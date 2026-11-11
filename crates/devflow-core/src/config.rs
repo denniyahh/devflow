@@ -153,6 +153,13 @@ impl DevflowConfig {
 /// fail-soft: DevFlow warns and continues with defaults instead of aborting the
 /// workflow.
 pub fn load_config(project_root: &Path) -> DevflowConfig {
+    load_config_to(project_root, &mut std::io::stderr())
+}
+
+/// [`load_config`], writing its operator-facing warning lines to `err`. With
+/// tracing off by default, those lines are the operator's only sign that the
+/// file's settings were ignored.
+fn load_config_to(project_root: &Path, _err: &mut dyn std::io::Write) -> DevflowConfig {
     let path = project_root.join("devflow.toml");
     let contents = match std::fs::read_to_string(&path) {
         Ok(contents) => contents,
@@ -193,17 +200,33 @@ fn config_parse_error(project_root: &Path) -> Option<String> {
 /// Resolve capture retention with `DEVFLOW_CAPTURE_RETENTION` taking
 /// precedence over `devflow.toml` and the built-in default.
 pub fn capture_retention(project_root: &Path) -> usize {
-    if let Some(value) = env_value("DEVFLOW_CAPTURE_RETENTION") {
-        match value.parse() {
+    capture_retention_with(
+        env_value("DEVFLOW_CAPTURE_RETENTION"),
+        project_root,
+        &mut std::io::stderr(),
+    )
+}
+
+/// [`capture_retention`] for an already-read `DEVFLOW_CAPTURE_RETENTION`
+/// value, writing the invalid-value warning line to `err`.
+fn capture_retention_with(
+    value: Option<String>,
+    project_root: &Path,
+    _err: &mut dyn std::io::Write,
+) -> usize {
+    if let Some(value) = value {
+        match value.parse::<usize>() {
             Ok(retention) => return retention,
-            Err(error) => tracing::warn!(
-                value,
-                %error,
-                "invalid DEVFLOW_CAPTURE_RETENTION; using devflow.toml or default"
-            ),
+            Err(error) => {
+                tracing::warn!(
+                    value,
+                    %error,
+                    "invalid DEVFLOW_CAPTURE_RETENTION; using devflow.toml or default"
+                );
+            }
         }
     }
-    load_config(project_root).capture_retention
+    load_config_to(project_root, _err).capture_retention
 }
 
 /// Resolve external verification with `DEVFLOW_EXTERNAL_VERIFY_ENABLED`
@@ -328,7 +351,16 @@ pub fn base_branch(project_root: &Path) -> Result<ResolvedBaseBranch, String> {
 /// those sites with an invalid configuration. If that refusal is ever
 /// removed, this fallback becomes one.
 pub fn git_flow_for_project(project_root: &Path) -> GitFlowConfig {
-    match base_branch(project_root) {
+    git_flow_from(base_branch(project_root), &mut std::io::stderr())
+}
+
+/// [`git_flow_for_project`] for an already-resolved base branch, writing the
+/// fallback warning line to `err`.
+fn git_flow_from(
+    resolved: Result<ResolvedBaseBranch, String>,
+    _err: &mut dyn std::io::Write,
+) -> GitFlowConfig {
+    match resolved {
         Ok(resolved) => GitFlowConfig {
             develop: resolved.value,
             ..GitFlowConfig::default()
@@ -420,6 +452,14 @@ struct FallbackAgentKey {
 /// have no `fallback_agent` key at all; only a parseable file whose
 /// `fallback_agent` value names no agent gets the key-specific refusal.
 pub fn fallback_agent(project_root: &Path) -> Result<Option<AgentKind>, String> {
+    fallback_agent_to(project_root, &mut std::io::stderr())
+}
+
+/// [`fallback_agent`], writing the unreadable-file warning line to `err`.
+fn fallback_agent_to(
+    project_root: &Path,
+    _err: &mut dyn std::io::Write,
+) -> Result<Option<AgentKind>, String> {
     let path = project_root.join("devflow.toml");
     let contents = match std::fs::read_to_string(&path) {
         Ok(contents) => contents,
@@ -502,6 +542,116 @@ mod tests {
             // SAFETY: See EnvOverride::set; the same mutex guard is still held.
             unsafe { std::env::remove_var(self.0) };
         }
+    }
+
+    /// What a `_to`/`_with` seam wrote to its warning sink.
+    fn written(sink: Vec<u8>) -> String {
+        String::from_utf8(sink).expect("warning lines are UTF-8")
+    }
+
+    /// A project whose `devflow.toml` exists but cannot be read: it is a
+    /// directory, so the read fails with something other than NotFound.
+    fn project_with_unreadable_config() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("devflow.toml")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn an_unreadable_devflow_toml_is_reported_without_tracing() {
+        let dir = project_with_unreadable_config();
+        let mut sink = Vec::new();
+        assert_eq!(
+            load_config_to(dir.path(), &mut sink),
+            DevflowConfig::default()
+        );
+        let text = written(sink);
+        assert!(
+            text.starts_with("warning: could not read ") && text.contains("devflow.toml"),
+            "the operator must be told the file was ignored: {text:?}"
+        );
+    }
+
+    #[test]
+    fn an_unparsable_devflow_toml_is_reported_without_tracing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("devflow.toml"), "capture_retention = [\n").unwrap();
+        let mut sink = Vec::new();
+        assert_eq!(
+            load_config_to(dir.path(), &mut sink),
+            DevflowConfig::default()
+        );
+        let text = written(sink);
+        assert!(
+            text.starts_with("warning: ") && text.contains("does not parse"),
+            "the operator must be told the file was ignored: {text:?}"
+        );
+    }
+
+    #[test]
+    fn an_invalid_env_value_is_reported_without_tracing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = Vec::new();
+        assert_eq!(
+            capture_retention_with(Some("many".to_string()), dir.path(), &mut sink),
+            DEFAULT_CAPTURE_RETENTION
+        );
+        let text = written(sink);
+        assert!(
+            text.starts_with("warning: DEVFLOW_CAPTURE_RETENTION=\"many\""),
+            "the operator must be told the value was ignored: {text:?}"
+        );
+    }
+
+    #[test]
+    fn a_valid_config_writes_no_warning() {
+        // Control for the three tests above: a readable, parsable file and a
+        // valid value write nothing to the sink.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("devflow.toml"), "capture_retention = 3\n").unwrap();
+        let mut sink = Vec::new();
+        assert_eq!(
+            capture_retention_with(Some("4".to_string()), dir.path(), &mut sink),
+            4
+        );
+        assert_eq!(load_config_to(dir.path(), &mut sink).capture_retention(), 3);
+        assert_eq!(fallback_agent_to(dir.path(), &mut sink), Ok(None));
+        let _ = git_flow_from(
+            Ok(ResolvedBaseBranch {
+                value: DEVELOP.to_string(),
+                source: BaseBranchSource::Default,
+            }),
+            &mut sink,
+        );
+        assert_eq!(written(sink), "");
+    }
+
+    #[test]
+    fn an_invalid_base_branch_fallback_is_reported_without_tracing() {
+        let mut sink = Vec::new();
+        let config = git_flow_from(
+            Err("devflow.toml `base_branch`: `main` is not a trunk".to_string()),
+            &mut sink,
+        );
+        assert_eq!(config, GitFlowConfig::default());
+        let text = written(sink);
+        assert!(
+            text.starts_with("warning: the base branch configuration is invalid")
+                && text.contains("`develop`"),
+            "the operator must be told the trunk fell back: {text:?}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_devflow_toml_fallback_agent_is_reported_without_tracing() {
+        let dir = project_with_unreadable_config();
+        let mut sink = Vec::new();
+        assert_eq!(fallback_agent_to(dir.path(), &mut sink), Ok(None));
+        let text = written(sink);
+        assert!(
+            text.starts_with("warning: could not read ") && text.contains("fallback_agent"),
+            "the operator must be told no fallback was read: {text:?}"
+        );
     }
 
     #[test]
