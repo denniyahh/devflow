@@ -993,6 +993,15 @@ esac
 "#,
     )]);
 
+    // 52-22: Validate reads GSD's own verification status, so the run gets a
+    // `gsd_run` stub under its home and never a real GSD install. The agent
+    // reports no verdict (a fail) and GSD reports gaps, so the auto loop runs
+    // to its cap; one reply per Validate, with room to spare.
+    let gsd_logs = tempfile::tempdir().unwrap();
+    let gaps =
+        devflow_core::test_support::gsd_status_json(devflow_core::gsd_reader::GsdStatus::GapsFound);
+    common::stub_gsd_run(&home, &[gaps; 10], gsd_logs.path());
+
     // start — creates the phase worktree by default
     let out = run_devflow(
         &home,
@@ -1027,6 +1036,14 @@ esac
     // would loop back and keep the run alive) so the monitor clears state,
     // then wait for that to land before invoking cleanup.
     wait_for(&root.join(".devflow/gates/08-validate.json"));
+    let gate: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(root.join(".devflow/gates/08-validate.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        gate["gate_kind"], "failure_cap",
+        "the loop over GSD's gaps_found reaches its cap: {gate}"
+    );
 
     // 31-03: reaching the Validate gate already implies the Code stage's
     // delivery canary confirmed — but only implicitly. Asserted explicitly so
