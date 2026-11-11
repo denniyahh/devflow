@@ -1,11 +1,11 @@
 //! DevFlow stage machine.
 //!
-//! The workflow is a single linear chain of five stages:
-//! Define → Plan → Code → Validate → Ship.
+//! The workflow is a single linear chain of four stages:
+//! Define → Plan → Code → Validate. A passing Validate ends the run.
 //!
 //! - **Define / Plan / Code** launch a coding agent driven by a GSD slash command.
-//! - **Validate / Ship** are gate stages: they may fire a gate to Hermes (the
-//!   human interface) depending on the active [`Mode`](crate::mode::Mode).
+//! - **Validate** is the gate stage: it may fire a gate to Hermes (the human
+//!   interface) depending on the active [`Mode`](crate::mode::Mode).
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -20,27 +20,24 @@ pub enum Stage {
     Plan,
     /// Wave-based parallel execution (`/gsd-execute-phase`).
     Code,
-    /// Nyquist coverage audit (`/gsd-validate-phase`).
+    /// Nyquist coverage audit (`/gsd-validate-phase`). The last stage.
     Validate,
-    /// PR + review + merge prep (`/gsd-ship`).
-    Ship,
 }
 
 impl Stage {
-    /// The next stage in the linear chain, or `None` after `Ship`.
+    /// The next stage in the linear chain, or `None` after `Validate`.
     pub fn next(self) -> Option<Stage> {
         match self {
             Stage::Define => Some(Stage::Plan),
             Stage::Plan => Some(Stage::Code),
             Stage::Code => Some(Stage::Validate),
-            Stage::Validate => Some(Stage::Ship),
-            Stage::Ship => None,
+            Stage::Validate => None,
         }
     }
 
-    /// Whether this stage fires a gate to Hermes (Validate and Ship).
+    /// Whether this stage fires a gate to Hermes (Validate only).
     pub fn is_gate(self) -> bool {
-        matches!(self, Stage::Validate | Stage::Ship)
+        matches!(self, Stage::Validate)
     }
 
     /// Whether this stage launches a coding agent (Define, Plan, Code).
@@ -63,7 +60,6 @@ impl Stage {
             Stage::Plan => "/gsd-plan-phase {N}",
             Stage::Code => "/gsd-execute-phase {N}",
             Stage::Validate => "/gsd-validate-phase {N}",
-            Stage::Ship => "/gsd-ship {N}",
         }
     }
 }
@@ -75,7 +71,6 @@ impl fmt::Display for Stage {
             Stage::Plan => "plan",
             Stage::Code => "code",
             Stage::Validate => "validate",
-            Stage::Ship => "ship",
         };
         f.write_str(name)
     }
@@ -90,7 +85,6 @@ impl std::str::FromStr for Stage {
             "plan" => Ok(Stage::Plan),
             "code" => Ok(Stage::Code),
             "validate" => Ok(Stage::Validate),
-            "ship" => Ok(Stage::Ship),
             other => Err(StageParseError(other.to_string())),
         }
     }
@@ -98,7 +92,7 @@ impl std::str::FromStr for Stage {
 
 /// Error returned when parsing an unsupported stage name.
 #[derive(Debug, Clone, thiserror::Error)]
-#[error("unsupported stage `{0}`; expected define, plan, code, validate, or ship")]
+#[error("unsupported stage `{0}`; expected define, plan, code, or validate")]
 pub struct StageParseError(String);
 
 #[cfg(test)]
@@ -110,14 +104,12 @@ mod tests {
         assert_eq!(Stage::Define.next(), Some(Stage::Plan));
         assert_eq!(Stage::Plan.next(), Some(Stage::Code));
         assert_eq!(Stage::Code.next(), Some(Stage::Validate));
-        assert_eq!(Stage::Validate.next(), Some(Stage::Ship));
-        assert_eq!(Stage::Ship.next(), None);
+        assert_eq!(Stage::Validate.next(), None);
     }
 
     #[test]
-    fn gate_stages_are_validate_and_ship() {
+    fn the_gate_stage_is_validate() {
         assert!(Stage::Validate.is_gate());
-        assert!(Stage::Ship.is_gate());
         assert!(!Stage::Define.is_gate());
         assert!(!Stage::Plan.is_gate());
         assert!(!Stage::Code.is_gate());
@@ -129,7 +121,6 @@ mod tests {
         assert!(Stage::Plan.is_agent_stage());
         assert!(Stage::Code.is_agent_stage());
         assert!(!Stage::Validate.is_agent_stage());
-        assert!(!Stage::Ship.is_agent_stage());
     }
 
     #[test]
@@ -138,7 +129,6 @@ mod tests {
         assert_eq!(Stage::Plan.gsd_command(), "/gsd-plan-phase {N}");
         assert_eq!(Stage::Code.gsd_command(), "/gsd-execute-phase {N}");
         assert_eq!(Stage::Validate.gsd_command(), "/gsd-validate-phase {N}");
-        assert_eq!(Stage::Ship.gsd_command(), "/gsd-ship {N}");
     }
 
     #[test]
@@ -147,21 +137,14 @@ mod tests {
         assert_eq!(Stage::Plan.to_string(), "plan");
         assert_eq!(Stage::Code.to_string(), "code");
         assert_eq!(Stage::Validate.to_string(), "validate");
-        assert_eq!(Stage::Ship.to_string(), "ship");
     }
 
     #[test]
     fn from_str_round_trips_display_and_rejects_unknown() {
-        for stage in [
-            Stage::Define,
-            Stage::Plan,
-            Stage::Code,
-            Stage::Validate,
-            Stage::Ship,
-        ] {
+        for stage in [Stage::Define, Stage::Plan, Stage::Code, Stage::Validate] {
             assert_eq!(stage.to_string().parse::<Stage>().unwrap(), stage);
         }
-        assert_eq!("SHIP".parse::<Stage>().unwrap(), Stage::Ship);
+        assert_eq!("VALIDATE".parse::<Stage>().unwrap(), Stage::Validate);
         let err = "docsing".parse::<Stage>().unwrap_err();
         assert!(err.to_string().contains("docsing"));
     }
@@ -186,13 +169,7 @@ mod tests {
 
     #[test]
     fn serde_round_trips_each_stage() {
-        for stage in [
-            Stage::Define,
-            Stage::Plan,
-            Stage::Code,
-            Stage::Validate,
-            Stage::Ship,
-        ] {
+        for stage in [Stage::Define, Stage::Plan, Stage::Code, Stage::Validate] {
             let json = serde_json::to_string(&stage).unwrap();
             let back: Stage = serde_json::from_str(&json).unwrap();
             assert_eq!(stage, back);

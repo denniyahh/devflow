@@ -1716,10 +1716,10 @@ mod tests {
 
         let phase = PhaseId::new(68);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Ship;
+        state.stage = Stage::Validate;
         assert!(
             enforce_build_staleness(root, &state, &embedded_commit, build_dirty).is_ok(),
-            "a doc-only dirty tree must not block Ship"
+            "a doc-only dirty tree must not block Validate"
         );
 
         // Converse: a dirty source file, on a build that was clean, IS

@@ -3692,7 +3692,6 @@ mod tests {
         assert!(unattended_launch_check_applies(Stage::Code));
         assert!(!unattended_launch_check_applies(Stage::Plan));
         assert!(!unattended_launch_check_applies(Stage::Validate));
-        assert!(!unattended_launch_check_applies(Stage::Ship));
 
         // A wholly NOT-viable fixture parked at a non-applicable stage still
         // passes — the early return is what is being measured, so the fixture
@@ -3704,7 +3703,7 @@ mod tests {
             Mode::Auto,
             dir.path().to_path_buf(),
         );
-        for stage in [Stage::Plan, Stage::Validate, Stage::Ship] {
+        for stage in [Stage::Plan, Stage::Validate] {
             state.stage = stage;
             assert!(
                 preflight_unattended_launch_check(dir.path(), &state).is_ok(),

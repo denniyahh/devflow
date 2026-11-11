@@ -86,7 +86,7 @@ crates/
 - **Worktree isolation by default** — agents run in isolated git worktrees (`.worktrees/phase-NN/`) unless `--no-worktree` is passed, preventing cross-phase contamination.
 - **Monitor daemon** — optional background process detects agent completion and auto-advances the state machine. No cron, no polling, no tmux.
 - **Four-layer evaluation** — operator-declared external post-conditions can fail a stage before agent-controlled signals; ordinary work then uses `DEVFLOW_RESULT`, exit code + commit count, and the final commit heuristic.
-- **Per-stage prompts** — a `StageIntent` carries each stage's data (phase, fix kind, review angles) with no agent-specific syntax; each driver's `render_prompt` turns it into its own instruction (Claude/OpenCode render the legacy slash-command text; Codex/Pi render a workflow-file reference).
+- **Per-stage prompts** — a `StageIntent` carries each stage's data (phase, fix kind) with no agent-specific syntax; each driver's `render_prompt` turns it into its own instruction (Claude/OpenCode render the legacy slash-command text; Codex/Pi render a workflow-file reference).
 
 ## Agent Protocol
 
@@ -136,7 +136,6 @@ DevFlow stores runtime state per-phase in `.devflow/state-NN.json` (git-ignored)
 
 ```toml
 capture_retention = 5
-review_angles = ["doc accuracy", "security", "CI correctness", "external state"]
 external_verify_enabled = true
 ```
 
@@ -158,8 +157,8 @@ Gate responses and unattended-run notifications are file-based: a fired gate wri
 
 The poll timeout defaults to 3 days and is configurable via `DEVFLOW_GATE_TIMEOUT_SECS`; it bounds how long a run waits at the gate, not how long you have to answer, and the run holds no lock while it waits. The gate file never expires, but past the timeout the run has ended at that gate: `devflow resume` reruns the stage and asks again, setting any unused answer aside and reporting it. See [OPERATIONS.md](OPERATIONS.md#answering-gates).
 
-`DEVFLOW_CAPTURE_RETENTION`, `DEVFLOW_REVIEW_ANGLES`, and
-`DEVFLOW_EXTERNAL_VERIFY_ENABLED` override the corresponding TOML values.
+`DEVFLOW_CAPTURE_RETENTION` and `DEVFLOW_EXTERNAL_VERIFY_ENABLED` override the
+corresponding TOML values.
 
 ## Supported Agents
 

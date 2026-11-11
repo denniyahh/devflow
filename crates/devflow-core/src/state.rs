@@ -1078,16 +1078,16 @@ mod tests {
             Mode::Auto,
             PathBuf::from("/repo"),
         );
-        state.code_fix = Some(crate::prompt::FixType::AuditFix);
+        state.code_fix = Some(crate::prompt::FixType::GapsOnly);
         let json = serde_json::to_string(&state).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(
             value.get("code_fix"),
-            Some(&serde_json::json!("audit_fix")),
+            Some(&serde_json::json!("gaps_only")),
             "code_fix must be persisted under its own key: {json}"
         );
         let loaded: State = serde_json::from_str(&json).unwrap();
-        assert_eq!(loaded.code_fix, Some(crate::prompt::FixType::AuditFix));
+        assert_eq!(loaded.code_fix, Some(crate::prompt::FixType::GapsOnly));
 
         let predating = r#"{
             "stage": "code",

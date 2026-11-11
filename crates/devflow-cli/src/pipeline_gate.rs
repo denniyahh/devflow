@@ -11,7 +11,7 @@
 //! pipeline_outcomes (handle_*_outcome) → pipeline_gate (transition/
 //! run_gate/finish_run) → pipeline_launch (launch_stage)` back to
 //! where it started. This cycle is the state machine's real control flow
-//! (Code → Validate → Ship, with loop-backs), and Rust permits cyclic
+//! (Code → Validate, with loop-backs), and Rust permits cyclic
 //! module references — only the crate dependency graph must be acyclic —
 //! so this compiles cleanly. **A future change to pipeline logic is likely
 //! to touch two or three of these files together:** the split buys
@@ -28,7 +28,7 @@ use crate::pipeline_launch::{
 use crate::pipeline_outcomes::truncate_reason;
 #[cfg(test)]
 use devflow_core::gates::GateId;
-use devflow_core::gates::{self, Claim, GateAction, GateError, GateResponse, Gates};
+use devflow_core::gates::{self, Claim, GateAction, Gates};
 use devflow_core::mode;
 #[cfg(test)]
 use devflow_core::phase_id::PhaseId;
@@ -39,7 +39,7 @@ use devflow_core::state::State;
 use devflow_core::workflow;
 use devflow_core::{events, registry};
 use std::path::Path;
-use tracing::{info, warn};
+use tracing::info;
 
 /// Persist the new stage `to` and launch its agent.
 ///
@@ -240,8 +240,8 @@ pub(crate) enum LoopBackReason {
     /// signal that the failure budget had widened back to its full width.
     /// This reason is that signal.
     ValidateFailureNoBaseline,
-    /// A human answered a gate with a loop-back — a Ship `review:` rejection
-    /// or an ambiguous Validate adjudication. Makes no
+    /// A human answered a gate with a loop-back — an ambiguous Validate
+    /// adjudication. Makes no
     /// claim about the commit-count baseline, because none was consulted.
     GateResponse,
 }
@@ -259,8 +259,8 @@ impl LoopBackReason {
     }
 }
 
-/// Loop the pipeline back to Code with the given fix prompt (`GapsOnly` for a
-/// Validate rejection, `AuditFix` for a Ship `review:` rejection).
+/// Loop the pipeline back to Code with the given fix prompt (`GapsOnly` or
+/// `FullExecute` for a Validate rejection).
 pub(crate) fn loop_back_to_code(
     project_root: &Path,
     state: &mut State,
@@ -402,7 +402,7 @@ thread_local! {
 /// the loser meets a closed gate rather than the other's claim. Does nothing on a
 /// thread with no probe installed.
 #[cfg(test)]
-fn note_claim(claim: &Result<Claim, GateError>) {
+fn note_claim(claim: &Result<Claim, devflow_core::gates::GateError>) {
     use std::sync::atomic::Ordering::SeqCst;
     const OTHER_CONSUMER_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
     let Some(probe) = CLAIM_PROBE.with_borrow(Clone::clone) else {
@@ -429,14 +429,7 @@ pub(crate) fn run_gate(
     stage: Stage,
     context: &str,
 ) -> Result<GateAction, CliError> {
-    run_gate_with_timeout(
-        project_root,
-        state,
-        stage,
-        context,
-        gate_timeout_secs(),
-        None,
-    )
+    run_gate_with_timeout(project_root, state, stage, context, gate_timeout_secs())
 }
 
 /// `run_gate`'s body, parameterized on the wait's timeout (WR-02, phase 20
@@ -453,12 +446,6 @@ pub(crate) fn run_gate_with_timeout(
     stage: Stage,
     context: &str,
     timeout_secs: u64,
-    // 23-09 (D-04/D-05/D-06): a pre-authorized response to write for this
-    // gate, or `None` for a real human gate. This function must NEVER
-    // derive this value from `state` — the decision belongs to the caller, so
-    // no gate can inherit an authorization meant for another. No production
-    // caller passes one since the Ship pre-authorization was removed (D-01).
-    auto_response: Option<&GateResponse>,
 ) -> Result<GateAction, CliError> {
     commit(state, |s| s.gate_pending = true)?;
     // A crash inside this call before the publish leaves `gate_pending` with no gate
@@ -472,22 +459,6 @@ pub(crate) fn run_gate_with_timeout(
         )?)
     })?;
     let gate_id = &opened.gate_id;
-    // Safe point 5 (CR-01, 50-REVIEW.md; D-13 item 8): an answer already on disk wins over
-    // a stop in the wait below, so a stop taken during the advance is honoured before the
-    // pre-authorized one is written, and before the notify and events, which would otherwise
-    // ask an operator to answer a gate this run withdraws at once. As at safe point 4, the
-    // gate is closed, the stop recorded and an error unwinds every caller. A stop that
-    // arrives after this point is honoured at safe point 6. A real human gate has no check
-    // here: its wait below ends on the stop.
-    if auto_response.is_some() && crate::pipeline_launch::stop_requested_at_safe_point() {
-        let _ = close_gate(project_root, state.phase, stage);
-        registration.finish();
-        crate::pipeline_launch::record_advance_stop(state, 5)?;
-        return Err(CliError::Message(format!(
-            "the gate for stage {stage} was not auto-answered: {}",
-            crate::pipeline_launch::safe_point_stop_reason()
-        )));
-    }
     println!(
         "gate written: .devflow/gates/{}-{stage}.json — awaiting response",
         state.phase.padded()
@@ -529,30 +500,6 @@ pub(crate) fn run_gate_with_timeout(
         "notify_fired",
         serde_json::json!({ "stage": stage.to_string(), "unexpected": unexpected }),
     );
-    // The auto-response, if any, is written here: after the gate opened and both
-    // `gate_fired`/`notify_fired` events, so the event stream still reads as a real gate
-    // that was really answered, and before the wait below, whose first read finds it.
-    if let Some(response) = auto_response {
-        let answered = fenced(project_root, state.phase, || {
-            match Gates::answer(project_root, state.phase, stage, gate_id, response) {
-                Ok(_) => Ok(()),
-                // A human or 23b's stale-gate sweep may have answered first;
-                // first-writer-wins is the correct resolution, not an error.
-                Err(GateError::AlreadyResponded { .. }) => Ok(()),
-                // Published, with its re-check refused by a stalled gate lock. This waiter
-                // is the one that acts on a published answer, and the wait below reads it.
-                Err(err @ GateError::PublishedUnconfirmed { .. }) => {
-                    warn!("{err}");
-                    Ok(())
-                }
-                Err(err) => Err(err.into()),
-            }
-        });
-        if let Err(err) = answered {
-            registration.finish();
-            return Err(err);
-        }
-    }
     let wait_end = match gate_wait_call(project_root, state.phase, stage, gate_id, timeout_secs) {
         Ok(end) => end,
         Err(err) => {
@@ -745,7 +692,7 @@ pub(crate) fn print_dry_run(state: &State) {
         // `[GATE after 3 consecutive failures]` on the Validate line.
         //
         // `!unconditional` suppresses it where it would be noise rather than
-        // information: Ship and Supervise-mode Validate gate regardless of any
+        // information: Supervise-mode Validate gates regardless of any
         // failure count, so naming a failure ceiling there tells the operator
         // nothing about where this run will stop.
         let phase_gate = if !unconditional
@@ -762,7 +709,7 @@ pub(crate) fn print_dry_run(state: &State) {
         };
         // WR-01 (phase 20 review): annotate the stage matching `--until` so
         // the dry-run preview reflects that a real invocation would halt
-        // here instead of always showing the full Define→Ship pipeline.
+        // here instead of always showing the full pipeline.
         let stop_marker = if state.stop_until == Some(s) {
             " [STOPS HERE — --until]"
         } else {
@@ -779,17 +726,14 @@ pub(crate) fn print_dry_run(state: &State) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline_launch::advance;
     use crate::pipeline_outcomes::{
         ValidateOutcome, handle_infra_outcome, handle_validate_outcome,
     };
     use crate::test_support::*;
-    use devflow_core::agent_result;
     use devflow_core::gates::GateResponse;
     use devflow_core::mode::Mode;
     use devflow_core::state::AgentKind;
     use devflow_core::test_support::{answer_open_gate, gate_answer_files, preanswer_gate};
-    use std::path::PathBuf;
 
     macro_rules! enter_path_isolated_child {
         ($name:expr, $path_dir:expr) => {
@@ -803,72 +747,6 @@ mod tests {
                 return;
             }
         };
-    }
-
-    /// CUT-02 (D-01, D-23): an approved Ship gate, which only a state written by
-    /// an older binary can still reach, ends the run the way a passing Validate
-    /// does. No after-ship hook runs: no merge, version bump, changelog or branch
-    /// deletion, and nothing records the phase as shipped. The state is kept,
-    /// recorded finished, and the feature branch survives. The gate response is
-    /// pre-seeded on disk so `run_gate`'s poll returns at once.
-    #[test]
-    fn an_approved_ship_gate_finishes_the_run_without_running_a_hook() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        init_repo(root);
-
-        let phase = PhaseId::new(21);
-        let branch = format!("feature/phase-{padded}", padded = phase.padded());
-        let branch_created = devflow_core::test_support::git_command(root)
-            .args(["branch", &branch, "develop"])
-            .status()
-            .unwrap()
-            .success();
-        assert!(branch_created);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Ship;
-        workflow::save_state(&state).unwrap();
-
-        // Seed a DEVFLOW_RESULT success marker so `evaluate_agent_result` resolves
-        // at Layer 1 without needing the exit-code/commit-count fallback.
-        std::fs::write(
-            agent_result::stdout_path(root, phase),
-            "DEVFLOW_RESULT: {\"status\":\"success\"}\n",
-        )
-        .unwrap();
-
-        // Pre-write an approved Ship gate response so `run_gate` returns
-        // `GateAction::Advance` immediately instead of polling.
-        preanswer_gate(
-            root,
-            phase,
-            Stage::Ship,
-            &serde_json::from_str(r#"{"approved":true,"note":null,"responded_by":"test"}"#)
-                .unwrap(),
-        );
-
-        advance(root, Some(phase)).unwrap();
-
-        assert!(
-            events_named(root, "hook_run").is_empty(),
-            "no after-ship hook runs"
-        );
-        assert!(events_named(root, "workflow_shipped").is_empty());
-        let finished = events_named(root, "workflow_finished");
-        assert_eq!(finished.len(), 1, "{finished:?}");
-        assert_eq!(finished[0]["reason"], "finished", "{}", finished[0]);
-        let kept = workflow::load_state(root, phase).expect("the state is kept");
-        assert!(kept.finished && kept.stopped, "{kept:?}");
-        let branch_kept = devflow_core::test_support::git_command(root)
-            .args(["rev-parse", "--verify", "--quiet", &branch])
-            .status()
-            .unwrap()
-            .success();
-        assert!(branch_kept, "the feature branch is not deleted");
-        assert!(!Gates::gate_path(root, phase, Stage::Ship).exists());
-        assert!(gate_answer_files(root, phase, Stage::Ship).is_empty());
-        assert!(gate_claim_files(root, phase, Stage::Ship).is_empty());
-        assert!(!Gates::gate_path(root, phase, Stage::Validate).exists());
     }
 
     /// 23-06 Task 1's named blocker regression guard (BLOCKER 1,
@@ -1156,8 +1034,8 @@ mod tests {
         assert_eq!(state.consecutive_failures, 2);
     }
 
-    /// A phase parked at Stage::Ship, with its feature branch cut from `develop`.
-    fn ship_ready_fixture(root: &Path, phase: PhaseId) {
+    /// A phase parked at Stage::Validate, with its feature branch cut from `develop`.
+    fn validate_parked_fixture(root: &Path, phase: PhaseId) {
         init_repo(root);
         let branch = format!("feature/phase-{padded}", padded = phase.padded());
         let branch_created = devflow_core::test_support::git_command(root)
@@ -1167,7 +1045,7 @@ mod tests {
             .success();
         assert!(branch_created);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Ship;
+        state.stage = Stage::Validate;
         state.gate_notify_cmd = Some("true".to_string());
         workflow::save_state(&state).unwrap();
     }
@@ -1179,7 +1057,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(94);
-        ship_ready_fixture(root, phase);
+        validate_parked_fixture(root, phase);
         let holder = devflow_core::liveness::phase_holder_path(root, phase);
 
         let refused = std::thread::scope(|scope| {
@@ -1279,7 +1157,7 @@ mod tests {
         let root_owned = root.to_path_buf();
         let handle = std::thread::spawn(move || {
             let mut state = workflow::load_state(&root_owned, phase).unwrap();
-            run_gate_with_timeout(&root_owned, &mut state, Stage::Code, "ctx", 30, None).unwrap();
+            run_gate_with_timeout(&root_owned, &mut state, Stage::Code, "ctx", 30).unwrap();
             state.gate_notify_cmd
         });
         let gate_path = Gates::gate_path(root, phase, Stage::Code);
@@ -1361,7 +1239,7 @@ mod tests {
 
         let root_owned = root.to_path_buf();
         let handle = std::thread::spawn(move || {
-            run_gate_with_timeout(&root_owned, &mut loaded, Stage::Code, "ctx", 30, None)
+            run_gate_with_timeout(&root_owned, &mut loaded, Stage::Code, "ctx", 30)
                 .map(|action| (action, loaded.gate_notify_cmd))
         });
         let gate_path = Gates::gate_path(root, phase, Stage::Code);
@@ -1424,7 +1302,7 @@ mod tests {
         let state_file = workflow::state_path(root, phase);
         std::fs::write(&state_file, "{not json").unwrap();
 
-        let err = run_gate_with_timeout(root, &mut loaded, Stage::Code, "ctx", 30, None)
+        let err = run_gate_with_timeout(root, &mut loaded, Stage::Code, "ctx", 30)
             .expect_err("an unparseable state must fail the gate entry");
 
         let text = err.to_string();
@@ -1462,7 +1340,7 @@ mod tests {
             WAIT_HOLDS_WRITE_LOCK.set(hold_across_wait);
             WAIT_ENTERED.set(Some(entered_tx));
             let mut state = workflow::load_state(&root_owned, phase).unwrap();
-            run_gate_with_timeout(&root_owned, &mut state, Stage::Code, "ctx", 30, None).map(|_| ())
+            run_gate_with_timeout(&root_owned, &mut state, Stage::Code, "ctx", 30).map(|_| ())
         });
         entered_rx
             .recv_timeout(std::time::Duration::from_secs(30))
@@ -1585,7 +1463,7 @@ mod tests {
         let root_owned = root.to_path_buf();
         std::thread::spawn(move || {
             let mut state = workflow::load_state(&root_owned, phase).unwrap();
-            run_gate_with_timeout(&root_owned, &mut state, Stage::Code, "ctx", 30, None)
+            run_gate_with_timeout(&root_owned, &mut state, Stage::Code, "ctx", 30)
         })
     }
 
@@ -1930,183 +1808,5 @@ mod tests {
         assert!(!after.gate_pending);
         assert_eq!(after.last_verification_fingerprint, Some(FINGERPRINT));
         assert_eq!(after.last_verification_mtime_nanos, Some(MTIME_NANOS));
-    }
-
-    // ---- 50.1-22: where a stop lands at an auto-answered Ship gate (D-13 item 8) ----
-
-    /// A supervisor published in this process and recorded in `state`, so an advance
-    /// engaged on it passes the ownership fence. Its agent group is 0: nothing here ever
-    /// signals one.
-    struct RecordedSupervisor {
-        supervisor: devflow_core::supervisor::runtime::Supervisor,
-        launch_id: String,
-        _cache: tempfile::TempDir,
-    }
-
-    impl RecordedSupervisor {
-        fn serve(state: &mut State) -> Self {
-            use devflow_core::supervisor::{self, Sidecar, SocketPath};
-            let pid = std::process::id();
-            let cache = hermetic_cache_dir();
-            let launch_id = supervisor::new_launch_id();
-            let socket =
-                SocketPath::for_launch(cache.path(), &state.project_root, state.phase, &launch_id)
-                    .expect("the socket path fits");
-            let socket_path = socket.as_path().to_path_buf();
-            let boot_id = supervisor::boot_id().unwrap_or_default();
-            let start_time = devflow_core::agent::process_start_time(pid).unwrap_or(0);
-            // `Sidecar` is `non_exhaustive`, so a test outside its crate builds one the way a
-            // reader does.
-            let sidecar: Sidecar = serde_json::from_value(serde_json::json!({
-                "launch_id": launch_id,
-                "project_root": state.project_root,
-                "phase": state.phase,
-                "stage": state.stage.to_string(),
-                "agent": state.agent.to_string(),
-                "launch": "capture",
-                "agent_pid": pid,
-                "agent_pgid": 0,
-                "agent_start_time": start_time,
-                "boot_id": boot_id,
-                "supervisor_pid": pid,
-                "supervisor_start_time": start_time,
-                "created_at": "2026-11-01T00:00:00Z",
-            }))
-            .expect("a well-formed sidecar");
-            let supervisor = devflow_core::supervisor::runtime::Supervisor::serve(socket, sidecar)
-                .expect("serve the socket");
-            supervisor
-                .token()
-                .enter(devflow_core::supervisor::runtime::OwnerPhase::Advancing);
-            state.supervisor = Some(devflow_core::state::SupervisorRecord::new(
-                socket_path,
-                launch_id.clone(),
-                0,
-                start_time,
-                boot_id,
-            ));
-            Self {
-                supervisor,
-                launch_id,
-                _cache: cache,
-            }
-        }
-
-        /// What a `shutdown` on the socket does to an advancing run.
-        fn request_stop(&self) {
-            self.supervisor
-                .token()
-                .request_stop(devflow_core::supervisor::runtime::StopSource::Socket);
-        }
-    }
-
-    /// One auto-answered Ship gate at `root`, with a stop token engaged on this thread and
-    /// its stop requested first when `stop`. The notify command writes [`notify_marker`].
-    fn auto_answered_ship_gate(
-        root: &Path,
-        phase: PhaseId,
-        stop: bool,
-    ) -> Result<GateAction, CliError> {
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Ship;
-        state.gate_notify_cmd = Some(format!(": > '{}'", notify_marker(root).display()));
-        let engaged = RecordedSupervisor::serve(&mut state);
-        workflow::save_state(&state).unwrap();
-        if stop {
-            engaged.request_stop();
-        }
-        let _engaged = crate::pipeline_launch::StopTokenGuard::engage(
-            engaged.supervisor.token(),
-            engaged.launch_id.clone(),
-        );
-        run_gate_with_timeout(root, &mut state, Stage::Ship, "ctx", 30, Some(&approval()))
-    }
-
-    /// A pre-authorized answer whose re-check could not take the gate lock is published
-    /// and left in place, and this waiter is the one that acts on it: a stalled gate lock
-    /// must not make it quit its own gate. The holder arrives in the one window with no
-    /// lock held, stays past the re-check's wait and goes before the claim's ends.
-    #[test]
-    fn a_pre_authorized_answer_left_unconfirmed_still_decides_its_own_gate() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(2217);
-        let lock = root
-            .join(".devflow")
-            .join(format!(".gates-{}.lock", phase.padded()));
-        let past_the_recheck = gates::GATE_LOCK_WAIT + std::time::Duration::from_secs(1);
-        let stall_the_recheck = move || {
-            let holder = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .open(lock)
-                .unwrap();
-            holder.lock().unwrap();
-            std::thread::spawn(move || {
-                std::thread::sleep(past_the_recheck);
-                drop(holder);
-            });
-        };
-
-        let action =
-            devflow_core::test_support::with_answer_before_publish(stall_the_recheck, || {
-                auto_answered_ship_gate(root, phase, false)
-            })
-            .expect("the waiter acts on its own published answer");
-
-        assert!(matches!(action, GateAction::Advance), "{action:?}");
-        let resolved = events_named(root, "gate_resolved");
-        assert_eq!(resolved.len(), 1, "{resolved:?}");
-        assert_eq!(resolved[0]["approved"], true);
-    }
-
-    fn notify_marker(root: &Path) -> PathBuf {
-        root.join("notify-ran")
-    }
-
-    /// D-13 item 8: safe point 5 runs before the notify, so a stopped run whose gate is
-    /// auto-answered sends no "Ship gate awaiting" message for a gate it withdraws at once. Control: with no stop
-    /// the same gate notifies. Its own child, because `DEVFLOW_GATE_NOTIFY_CMD` in the
-    /// runner's environment would replace the state's command.
-    #[test]
-    fn a_stopped_auto_answered_run_sends_no_ship_notify() {
-        const NAME: &str = "pipeline_gate::tests::a_stopped_auto_answered_run_sends_no_ship_notify";
-        if !devflow_core::test_support::in_child_test(NAME) {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([NAME, "--exact", "--test-threads=1"])
-                .env(devflow_core::test_support::CHILD_TEST_ENV, NAME)
-                .env_remove(devflow_core::gates::GATE_NOTIFY_CMD_ENV)
-                .output()
-                .unwrap();
-            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
-            return;
-        }
-
-        let dir = tempfile::tempdir().unwrap();
-        let stopped = dir.path().join("stopped");
-        std::fs::create_dir(&stopped).unwrap();
-        let phase = PhaseId::new(2215);
-        let error = auto_answered_ship_gate(&stopped, phase, true)
-            .expect_err("a stopped run does not answer its gate")
-            .to_string();
-        assert!(error.contains("was not auto-answered"), "{error}");
-        assert!(
-            !notify_marker(&stopped).exists(),
-            "no message about a gate the run withdraws"
-        );
-        assert!(events_named(&stopped, "gate_fired").is_empty());
-        assert!(events_named(&stopped, "notify_fired").is_empty());
-        let stops = events_named(&stopped, "advance_stopped");
-        assert_eq!(stops.len(), 1, "{stops:?}");
-        assert_eq!(stops[0]["safe_point"], 5, "{}", stops[0]);
-        assert!(!Gates::gate_path(&stopped, phase, Stage::Ship).exists());
-
-        let running = dir.path().join("running");
-        std::fs::create_dir(&running).unwrap();
-        let action = auto_answered_ship_gate(&running, phase, false).unwrap();
-        assert_eq!(action, GateAction::Advance);
-        assert!(notify_marker(&running).exists(), "control: the notify runs");
-        assert_eq!(events_named(&running, "gate_fired").len(), 1);
     }
 }

@@ -2077,7 +2077,7 @@ mod tests {
     fn clear_only_touches_its_own_phase() {
         let dir = tempfile::tempdir().unwrap();
         save_state(&state_in(dir.path(), PhaseId::new(13), Stage::Code)).unwrap();
-        save_state(&state_in(dir.path(), PhaseId::new(14), Stage::Ship)).unwrap();
+        save_state(&state_in(dir.path(), PhaseId::new(14), Stage::Validate)).unwrap();
 
         clear_state(dir.path(), PhaseId::new(13)).unwrap();
 
@@ -2189,7 +2189,7 @@ mod tests {
     #[test]
     fn list_states_enumerates_sorted_by_phase() {
         let dir = tempfile::tempdir().unwrap();
-        save_state(&state_in(dir.path(), PhaseId::new(14), Stage::Ship)).unwrap();
+        save_state(&state_in(dir.path(), PhaseId::new(14), Stage::Validate)).unwrap();
         save_state(&state_in(dir.path(), PhaseId::new(3), Stage::Code)).unwrap();
 
         let states = list_states(dir.path());

@@ -464,45 +464,8 @@ fn start_until_plan_halts_cleanly() {
     let _reap = MonitorReapGuard::after_launch(&state);
 }
 
-/// 20c (D-07): `--until ship` is a semantic no-op — Ship never calls
-/// `transition` (`handle_ship_outcome` ends the run itself), so
-/// the full pipeline already stops there today. It must be rejected before
-/// any stage runs, not silently accepted as if it intercepted anything.
-#[test]
-fn start_until_ship_is_rejected() {
-    let home = common::HermeticHome::new();
-    let repo = tempfile::tempdir().unwrap();
-    let root = repo.path();
-    init_repo(root);
-    let fake_bin = fake_bin_dir(&[(
-        "claude",
-        "#!/bin/sh\nprintf 'DEVFLOW_RESULT: {\"status\":\"success\"}\\n'\n",
-    )]);
-
-    let output = common::hermetic_devflow(&home)
-        .args([
-            "start", "--phase", "45", "--agent", "claude", "--mode", "auto", "--until", "ship",
-        ])
-        .arg(root)
-        .env("PATH", path_with_fake_bin(&fake_bin.path))
-        .current_dir(root)
-        .output()
-        .expect("run devflow");
-
-    assert!(
-        !output.status.success(),
-        "--until ship must be rejected, not silently accepted"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("ship") && stderr.contains("no-op"),
-        "the rejection must explain Ship is already terminal\nstderr: {stderr}"
-    );
-    assert!(
-        !root.join(".worktrees/phase-45").exists(),
-        "a rejected --until ship must not run any stage or create a worktree"
-    );
-}
+/// `--until` values for stages v4.0 removed (D-07). Later cut plans append to this list.
+const REMOVED_UNTIL_STAGES: &[&str] = &["ship"];
 
 /// D-07 (CUT-02): the Ship stage is gone, so `--until ship` is not a stage value and
 /// clap refuses it as an invalid value before `start` is dispatched. Control in the same
@@ -535,7 +498,7 @@ fn until_rejects_removed_stages() {
             .expect("run devflow")
     };
 
-    for removed in ["ship"] {
+    for removed in REMOVED_UNTIL_STAGES {
         let output = dry_run_until(removed);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
@@ -751,7 +714,7 @@ fn removed_flags_are_unknown() {
 }
 
 /// WR-01 (phase 20 review): `--dry-run` must reflect `--until` in its
-/// preview instead of always printing the full Define→Ship pipeline as if
+/// preview instead of always printing the full pipeline as if
 /// `--until` had not been passed.
 #[test]
 fn start_dry_run_annotates_until_stage() {
@@ -803,7 +766,7 @@ fn start_dry_run_annotates_until_stage() {
 }
 
 /// WR-01 counterpart: without `--until`, the preview must NOT show any stop
-/// annotation — the full pipeline runs to Ship.
+/// annotation — the full pipeline runs to Validate.
 #[test]
 fn start_dry_run_without_until_has_no_stop_annotation() {
     let home = common::HermeticHome::new();

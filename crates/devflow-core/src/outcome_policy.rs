@@ -178,7 +178,7 @@ mod tests {
     #[test]
     fn idle_timeout_is_never_auto_resumed() {
         let stages = every_stage();
-        assert_eq!(stages.len(), 5, "stage chain changed; review this test");
+        assert_eq!(stages.len(), 4, "stage chain changed; review this test");
         for stage in stages {
             let action = decide_action(stage, AgentStatus::IdleTimeout);
             assert_ne!(

@@ -3,11 +3,12 @@
 //! Mode is a per-session CLI flag on `devflow start` — there is no config file
 //! and no per-phase toggling.
 //!
-//! - **Auto:** Define and Plan run once. Code ↔ Validate auto-loop until clean.
-//!   Then Ship. The only human gate is at Ship — unless Validate fails
-//!   [`MAX_CONSECUTIVE_FAILURES`] times in a row, which forces a gate.
+//! - **Auto:** Define and Plan run once. Code ↔ Validate auto-loop until clean,
+//!   and a passing Validate finishes the run. No human gate fires unless
+//!   Validate fails [`MAX_CONSECUTIVE_FAILURES`] times in a row, which forces a
+//!   gate.
 //! - **Supervise:** Same pipeline, but Validate always fires a gate to Hermes →
-//!   Human before advancing to Ship.
+//!   Human before the run finishes.
 
 use crate::stage::Stage;
 use serde::{Deserialize, Serialize};
@@ -211,9 +212,10 @@ pub fn phase_failure_ceiling_reached(phase_validate_failures: u32) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
-    /// Run the pipeline without human gates until Ship (or repeated failure).
+    /// Run the pipeline without human gates to a passing Validate (or repeated
+    /// failure).
     Auto,
-    /// Fire a Validate gate to Hermes → Human before Ship.
+    /// Fire a Validate gate to Hermes → Human before the run finishes.
     Supervise,
 }
 
@@ -222,7 +224,6 @@ impl Mode {
     /// failures have already occurred this session and how many Validate
     /// failures have been recorded for this PHASE in total.
     ///
-    /// - Ship always gates (both modes).
     /// - Validate gates in EITHER mode once the per-phase total reaches
     ///   [`MAX_PHASE_VALIDATE_FAILURES`] (999.78/D-07) — evaluated ahead of
     ///   the per-mode match, so it gates in Auto and is a harmless no-op in
@@ -247,7 +248,6 @@ impl Mode {
         phase_validate_failures: u32,
     ) -> bool {
         match stage {
-            Stage::Ship => true,
             Stage::Validate => {
                 phase_failure_ceiling_reached(phase_validate_failures)
                     || match self {
@@ -323,12 +323,6 @@ mod tests {
     fn supervise_always_gates_validate() {
         assert!(Mode::Supervise.should_gate(Stage::Validate, 0, 0));
         assert!(Mode::Supervise.should_gate(Stage::Validate, 5, 0));
-    }
-
-    #[test]
-    fn ship_always_gates_in_both_modes() {
-        assert!(Mode::Auto.should_gate(Stage::Ship, 0, 0));
-        assert!(Mode::Supervise.should_gate(Stage::Ship, 0, 0));
     }
 
     #[test]
@@ -421,10 +415,6 @@ mod tests {
         assert!(transition_resets_consecutive_failures(
             Stage::Plan,
             Stage::Code
-        ));
-        assert!(transition_resets_consecutive_failures(
-            Stage::Validate,
-            Stage::Ship
         ));
     }
 

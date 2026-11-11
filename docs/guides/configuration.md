@@ -6,7 +6,6 @@ reliability knobs.
 
 ```toml
 capture_retention = 5
-review_angles = ["doc accuracy", "security", "CI correctness", "external state"]
 external_verify_enabled = true
 fallback_agent = "antigravity"   # optional: the rate-limit fallback for the Code stage
 ```
@@ -44,7 +43,6 @@ environment variables, not config file fields:
 | `DEVFLOW_GATE_TIMEOUT_SECS` | 259200 (3 days) | How long a supervisor waits at a gate, registered as its waiter and holding no lock. Not a deadline for answering — the gate file never expires. Past the timeout the run ends at that gate, and `devflow resume` reruns the stage and asks again, setting any unused answer aside |
 | `DEVFLOW_GATE_MAX_UNATTENDED_AGE_SECS` | 259200 (3 days) | Age threshold `devflow gate sweep` uses to call a gate abandoned. Held equal to `DEVFLOW_GATE_TIMEOUT_SECS`, never shorter |
 | `DEVFLOW_CAPTURE_RETENTION` | 5 | Override capture generations retained per phase |
-| `DEVFLOW_REVIEW_ANGLES` | built-in list | Override Ship review angles with a comma-separated list |
 | `DEVFLOW_EXTERNAL_VERIFY_ENABLED` | true | Enable or disable PLAN-declared external probes |
 | `DEVFLOW_TRUST_EXTERNAL_VERIFY` | unset | Exact reviewed PLAN probe commands as a JSON string array; required in addition to enabling probes |
 | `RUST_LOG` | `info` | Log verbosity (stderr) |

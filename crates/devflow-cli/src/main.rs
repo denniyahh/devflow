@@ -42,7 +42,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Begin the workflow for a phase: Define → Plan → Code → Validate → Ship.
+    /// Begin the workflow for a phase: Define → Plan → Code → Validate.
     Start {
         /// Phase number to work on.
         #[arg(long)]
@@ -50,7 +50,8 @@ enum Command {
         /// Agent to launch.
         #[arg(long, default_value = "claude")]
         agent: AgentKind,
-        /// Pipeline mode: `auto` runs to Ship unattended; `supervise` gates at Validate.
+        /// Pipeline mode: `auto` runs unattended and finishes on a passing
+        /// Validate; `supervise` gates at Validate.
         #[arg(long)]
         mode: Mode,
         /// Overwrite the feature branch if it already exists.
@@ -65,8 +66,7 @@ enum Command {
         dry_run: bool,
         /// Run the pipeline through `<stage>` and halt cleanly before
         /// advancing further (e.g. `--until plan` runs Define+Plan then
-        /// stops before Code). `ship` is rejected — the pipeline already
-        /// stops there.
+        /// stops before Code).
         #[arg(long)]
         until: Option<Stage>,
         /// A second agent that takes over the Code stage once if the agent is
@@ -423,18 +423,6 @@ fn run() -> Result<(), CliError> {
         } => {
             // Worktree is the default; `--no-worktree` is the only switch.
             let worktree = !no_worktree;
-            // D-07: `--until ship` is a semantic no-op — `handle_ship_outcome`
-            // ends the run itself and never calls `transition`,
-            // so the pipeline already stops at Ship today regardless of this
-            // flag. Reject before any stage runs rather than silently
-            // accepting a flag that would never actually intercept anything.
-            if until == Some(Stage::Ship) {
-                return Err(CliError::Message(
-                    "--until ship is a no-op: Ship is already the pipeline's terminal \
-                     stage and never advances further"
-                        .to_string(),
-                ));
-            }
             start(
                 &project_root(project)?,
                 phase,

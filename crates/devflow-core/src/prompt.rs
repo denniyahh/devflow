@@ -9,14 +9,6 @@ use crate::phase_id::PhaseId;
 use crate::stage::Stage;
 use std::path::Path;
 
-const SHIP_REVIEW_ANGLES: &[&str] = &[
-    "doc-accuracy cross-reference (do documented claims match source?)",
-    "security / leaked-data (does anything commit secrets, session data, or telemetry?)",
-    "CI/build correctness (can a failing step still report green?)",
-    "external-state claims (does the diff claim merges, tags, or deletions that are not actually true?)",
-    "one generalist deep pass",
-];
-
 /// The token that stops GSD from wiping `workflow._auto_chain_active` before
 /// it is read (35.1-01, RESEARCH Pitfall 1).
 ///
@@ -127,7 +119,7 @@ const CODE_STAGE_POLICY: &str = concat!(
 After each plan or wave lands, perform a quick, shallow self-check \
 for doc accuracy, leaked data, CI/build correctness, and \
 external-state claims. Record any drift in the working output and \
-continue execution; the authoritative review happens during Ship. \
+continue execution; this self-check is not the authoritative review of the phase. \
 This check must not pause execution or request human input.\n\
 \n\
 ## Unattended decision checkpoints\n\
@@ -177,10 +169,6 @@ pub enum StageIntent {
     Validate {
         phase: PhaseId,
     },
-    Ship {
-        phase: PhaseId,
-        review_angles: Vec<String>,
-    },
 }
 
 impl StageIntent {
@@ -191,38 +179,30 @@ impl StageIntent {
             StageIntent::Plan { .. } => Stage::Plan,
             StageIntent::Code { .. } => Stage::Code,
             StageIntent::Validate { .. } => Stage::Validate,
-            StageIntent::Ship { .. } => Stage::Ship,
         }
     }
 
-    /// Build the intent for a stage with no fix and default review angles
-    /// (callers that need a project-local review-angle override use
-    /// [`StageIntent::for_stage_in_project`]).
+    /// Build the intent for a stage with no fix.
     pub fn for_stage(stage: Stage, phase: PhaseId) -> Self {
         Self::for_stage_in_project(stage, phase, None)
     }
 
-    /// Build the intent for a stage, resolving project-local review angles.
-    pub fn for_stage_in_project(stage: Stage, phase: PhaseId, project_root: Option<&Path>) -> Self {
+    /// Build the intent for a stage of the project at `project_root`.
+    ///
+    /// No stage reads project-local configuration since the Ship stage's
+    /// review angles were removed (D-01), so this builds the same intent as
+    /// [`StageIntent::for_stage`]. It stays as the CLI's one entry point for a
+    /// default intent, which `pipeline_launch` pins by source scan.
+    pub fn for_stage_in_project(
+        stage: Stage,
+        phase: PhaseId,
+        _project_root: Option<&Path>,
+    ) -> Self {
         match stage {
             Stage::Define => StageIntent::Define { phase },
             Stage::Plan => StageIntent::Plan { phase },
             Stage::Code => StageIntent::Code { phase, fix: None },
             Stage::Validate => StageIntent::Validate { phase },
-            Stage::Ship => {
-                let review_angles = project_root
-                    .and_then(crate::config::review_angles)
-                    .unwrap_or_else(|| {
-                        SHIP_REVIEW_ANGLES
-                            .iter()
-                            .map(|angle| (*angle).to_owned())
-                            .collect()
-                    });
-                StageIntent::Ship {
-                    phase,
-                    review_angles,
-                }
-            }
         }
     }
 }
@@ -249,8 +229,6 @@ impl StageIntent {
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum FixType {
-    /// Run the GSD audit-fix pipeline over review findings.
-    AuditFix,
     /// Re-run execution targeting only the gaps left by validation.
     GapsOnly,
     /// Re-run the phase's remaining plans with the plain, unflagged
@@ -266,78 +244,13 @@ fn gsd_command_for(stage: Stage, phase: PhaseId) -> String {
     stage.gsd_command().replace("{N}", &phase.to_string())
 }
 
-/// The Ship stage's pull-request base instruction, shared by both renderers.
-///
-/// The PR targets the trunk, [`crate::config::MAIN`], not the
-/// base branch DevFlow merges the phase into locally. The instruction is
-/// explicit because GSD's own `git.base_branch` setting alone did not steer the
-/// PR: in Phase 49 attempt 2 it was set to `main` and the PR still targeted the
-/// local merge base. No branch name other than the trunk appears here, so no
-/// project is told about a branch it does not have (49-REVIEW.md WR-03).
-fn ship_pr_base_instruction() -> String {
-    format!(
-        "When creating the pull request, target base branch `{main}` (the \
-        repository trunk), not the base branch DevFlow merges this phase into \
-        locally.",
-        main = crate::config::MAIN
-    )
-}
-
-/// The Ship stage's dedicated prompt.
-///
-/// Headless-safety rationale: `/gsd-ship`'s own `optional_review` step is an
-/// interactive `AskUserQuestion` with undefined behavior under
-/// `--dangerously-skip-permissions` (RESEARCH Pitfall 2). Rather than relying
-/// on that step being skipped, this prompt sidesteps it entirely: the agent
-/// runs `/gsd-code-review {N}` first (non-interactive; writes `REVIEW.md`
-/// with severity-classified findings), and MUST NOT run `/gsd-ship {N}` at
-/// all if `REVIEW.md` contains any Critical-severity finding — instead it
-/// reports a `review:`-prefixed failure. Only a clean (no-Critical) review
-/// proceeds to `/gsd-ship {N}`. The `review:` reason prefix is the
-/// ReviewFailed contract that `handle_ship_failure` matches (trimmed,
-/// case-folded) to loop back to Code with `AuditFix`.
-fn ship_stage_prompt(phase: PhaseId, review_angles: &[String]) -> String {
-    let pr_base = ship_pr_base_instruction();
-    let code_review = format!("/gsd-code-review {phase}");
-    let ship = format!("/gsd-ship {phase}");
-    let review_angles = review_angles
-        .iter()
-        .map(|angle| format!("- {angle}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!(
-        "Run the Ship stage in two steps:\n\
-        \n\
-        1. Run `{code_review}` (non-interactive). This writes a `REVIEW.md` \
-        artifact with severity-classified findings. Review at high depth from \
-        every angle below:\n\
-        \n\
-        {review_angles}\n\
-        \n\
-        If your harness supports parallel finder subagents, dispatch one per \
-        angle; otherwise run each angle as a focused sequential pass. Merge \
-        and deduplicate every angle's findings into one `REVIEW.md`.\n\
-        2. Check `REVIEW.md` for the Critical-severity gate:\n\
-        \n\
-        - If `REVIEW.md` contains ANY finding at Critical severity: do NOT \
-        run `{ship}` at all. Your FINAL message must be exactly:\n\
-        \n\
-        DEVFLOW_RESULT: {{\"status\": \"failed\", \"reason\": \"review: <short summary of the Critical findings>\"}}\n\
-        \n\
-        - If `REVIEW.md` has NO Critical-severity findings: run `{ship}`. \
-        {pr_base} Report the outcome via the normal completion protocol below.\n\
-        \n\
-        {COMPLETION_PROTOCOL}"
-    )
-}
-
 /// The Validate stage's dedicated prompt.
 ///
 /// 13b verdict-vs-ran: `status` only reports whether the stage's task (running
 /// `/gsd-validate-phase {N}`) completed — it says nothing about whether
 /// validation itself passed. This prompt REQUIRES a distinct `verdict` field
 /// so `advance()`'s Validate arm can tell "the agent ran validation" apart
-/// from "validation passed," and never advances to Ship on a bare `status:
+/// from "validation passed," and never finishes the run on a bare `status:
 /// success` for this stage.
 /// The Validate verdict contract (13b verdict-vs-ran): a Validate stage must
 /// report `verdict: pass|gaps`, not a bare `status`. Shared by the legacy and
@@ -439,16 +352,19 @@ fn define_stage_prompt(phase: PhaseId) -> String {
 
 /// Build the prompt for a stage of a phase.
 pub fn stage_prompt(stage: Stage, phase: PhaseId) -> String {
-    stage_prompt_with_project(stage, phase, None)
+    render_claude_style(&StageIntent::for_stage(stage, phase))
 }
 
-/// Build a stage prompt with project-local configuration applied.
+/// Build a stage prompt for the project at `project_root`.
 ///
-/// The CLI uses this entry point after resolving the canonical project root;
-/// library callers that have no project context keep using [`stage_prompt`]
-/// and receive built-in defaults.
+/// The same prompt as [`stage_prompt`]: no stage reads project-local
+/// configuration since the Ship stage's review angles were removed (D-01).
 pub fn stage_prompt_for_project(stage: Stage, phase: PhaseId, project_root: &Path) -> String {
-    stage_prompt_with_project(stage, phase, Some(project_root))
+    render_claude_style(&StageIntent::for_stage_in_project(
+        stage,
+        phase,
+        Some(project_root),
+    ))
 }
 
 /// The Code stage's dedicated prompt.
@@ -486,10 +402,6 @@ pub fn render_claude_style(intent: &StageIntent) -> String {
             fix: Some(fix),
         } => fix_prompt(*fix, *phase),
         StageIntent::Validate { phase } => validate_stage_prompt(*phase),
-        StageIntent::Ship {
-            phase,
-            review_angles,
-        } => ship_stage_prompt(*phase, review_angles),
     }
 }
 
@@ -500,7 +412,7 @@ pub fn render_claude_style(intent: &StageIntent) -> String {
 /// GSD slash command.
 /// Render a [`StageIntent`] for an agent that cannot receive the legacy
 /// `/gsd-*` slash command (Codex, Pi). Each stage's *contract* is preserved —
-/// Validate verdict, Ship review gate, Define no-op, Plan idempotency — but the
+/// Validate verdict, Define no-op, Plan idempotency — but the
 /// instruction references the workflow file under `workflow_root` (a per-driver
 /// path) instead of naming a slash command.
 pub fn render_workflow_style(intent: &StageIntent, workflow_root: &str) -> String {
@@ -511,10 +423,6 @@ pub fn render_workflow_style(intent: &StageIntent, workflow_root: &str) -> Strin
         StageIntent::Plan { phase } => workflow_plan_prompt(*phase, workflow_root),
         StageIntent::Code { phase, fix } => workflow_code_prompt(*phase, *fix, workflow_root),
         StageIntent::Validate { phase } => workflow_validate_prompt(*phase, workflow_root),
-        StageIntent::Ship {
-            phase,
-            review_angles,
-        } => workflow_ship_prompt(*phase, review_angles, workflow_root),
     }
 }
 
@@ -545,22 +453,17 @@ fn workflow_plan_prompt(phase: PhaseId, workflow_root: &str) -> String {
 /// from `workflow_code_prompt`'s arm split, where the rule already lived and
 /// was correct, not re-derived. Stating the rule separately in each renderer is
 /// what let `fix_prompt` drift from it (DECN-02). The first Code pass (`None`)
-/// and the full-execute loop-back carry the policy; `GapsOnly` and `AuditFix`
-/// do not. The `match` is exhaustive on purpose: a new `FixType` variant must
+/// and the full-execute loop-back carry the policy; `GapsOnly` does not. The `match` is exhaustive on purpose: a new `FixType` variant must
 /// be classified here rather than falling into either answer by default.
 fn code_policy_applies_to_fix_arm(fix: Option<FixType>) -> bool {
     match fix {
         Some(FixType::FullExecute) | None => true,
-        Some(FixType::GapsOnly) | Some(FixType::AuditFix) => false,
+        Some(FixType::GapsOnly) => false,
     }
 }
 
 fn workflow_code_prompt(phase: PhaseId, fix: Option<FixType>, workflow_root: &str) -> String {
     let instruction = match fix {
-        Some(FixType::AuditFix) => format!(
-            "Read and follow the GSD workflow file at {workflow_root}/audit-fix.md for \
-            phase {phase}."
-        ),
         Some(FixType::GapsOnly) => format!(
             "Read and follow the GSD workflow file at {workflow_root}/execute-phase.md for \
             phase {phase} --auto --gaps-only. The `--auto` and `--gaps-only` flags are part \
@@ -589,49 +492,6 @@ fn workflow_validate_prompt(phase: PhaseId, workflow_root: &str) -> String {
         "Read and follow the GSD workflow file at {workflow_root}/validate-phase.md for \
         phase {phase}.\n\n{VALIDATE_VERDICT_CONTRACT}"
     )
-}
-
-fn workflow_ship_prompt(phase: PhaseId, review_angles: &[String], workflow_root: &str) -> String {
-    let pr_base = ship_pr_base_instruction();
-    let review_angles = review_angles
-        .iter()
-        .map(|angle| format!("- {angle}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!(
-        "Run the Ship stage in two steps:\n\
-        \n\
-        1. Read and follow the GSD workflow file at {workflow_root}/code-review.md for \
-        phase {phase}. This writes a REVIEW.md artifact with severity-classified findings. \
-        Review at high depth from every angle below:\n\
-        \n\
-        {review_angles}\n\
-        \n\
-        If your harness supports parallel finder subagents, dispatch one per angle; otherwise \
-        run each angle as a focused sequential pass. Merge and deduplicate every angle's \
-        findings into one REVIEW.md.\n\
-        2. Check REVIEW.md for the Critical-severity gate:\n\
-        \n\
-        - If REVIEW.md contains ANY finding at Critical severity: do NOT run the ship workflow \
-        at all. Your FINAL message must be exactly:\n\
-        \n\
-        DEVFLOW_RESULT: {{\"status\": \"failed\", \"reason\": \"review: <short summary of the \
-        Critical findings>\"}}\n\
-        \n\
-        - If REVIEW.md has NO Critical-severity findings: read and follow the GSD workflow file \
-        at {workflow_root}/ship.md for phase {phase}. {pr_base} \
-        Report the outcome via the normal completion protocol below.\n\
-        \n\
-        {COMPLETION_PROTOCOL}"
-    )
-}
-
-fn stage_prompt_with_project(stage: Stage, phase: PhaseId, project_root: Option<&Path>) -> String {
-    render_claude_style(&StageIntent::for_stage_in_project(
-        stage,
-        phase,
-        project_root,
-    ))
 }
 
 /// The synthesized instruction sent into a resumed Claude session when a
@@ -691,9 +551,6 @@ pub fn checkpoint_auto_decide_prompt(phase: PhaseId) -> String {
 /// treatment as the first Code pass, or the phase's unattended behaviour
 /// changes the moment validation reports a gap.
 ///
-/// `AuditFix` is deliberately left alone: it routes to `/gsd-audit-fix`, never
-/// reaches `execute-phase.md`, and so never meets the sync-clear step.
-///
 /// Flag ORDER within the command string does not matter — GSD extracts
 /// `--`-prefixed tokens position-independently
 /// (`references/phase-argument-parsing.md`).
@@ -707,12 +564,10 @@ pub fn checkpoint_auto_decide_prompt(phase: PhaseId) -> String {
 /// kept it through `workflow_code_prompt`. Whether an arm carries the policy is
 /// now decided by `code_policy_applies_to_fix_arm`, the same helper
 /// `workflow_code_prompt` consults, so the two renderers cannot state different
-/// rules. `GapsOnly` and `AuditFix` are excluded deliberately, not overlooked:
-/// they are `workflow_code_prompt`'s existing exclusions, carried over
-/// unchanged.
+/// rules. `GapsOnly` is excluded deliberately, not overlooked: it is
+/// `workflow_code_prompt`'s existing exclusion, carried over unchanged.
 pub fn fix_prompt(fix_type: FixType, phase: PhaseId) -> String {
     let command = match fix_type {
-        FixType::AuditFix => format!("/gsd-audit-fix {phase}"),
         FixType::GapsOnly => {
             format!("/gsd-execute-phase {phase} --gaps-only {AUTO_CHAIN_PRESERVING_FLAG}")
         }
@@ -751,7 +606,6 @@ mod tests {
             (Stage::Plan, "/gsd-plan-phase 11"),
             (Stage::Code, "/gsd-execute-phase 11"),
             (Stage::Validate, "/gsd-validate-phase 11"),
-            (Stage::Ship, "/gsd-ship 11"),
         ];
         for (stage, command) in cases {
             let prompt = stage_prompt(stage, PhaseId::new(11));
@@ -764,110 +618,6 @@ mod tests {
     fn phase_placeholder_is_substituted() {
         assert!(stage_prompt(Stage::Code, PhaseId::new(7)).contains("/gsd-execute-phase 7"));
         assert!(!stage_prompt(Stage::Code, PhaseId::new(7)).contains("{N}"));
-    }
-
-    #[test]
-    fn ship_prompt_sequences_code_review_before_ship() {
-        let prompt = stage_prompt(Stage::Ship, PhaseId::new(13));
-        let review_pos = prompt
-            .find("/gsd-code-review 13")
-            .expect("Ship prompt must run /gsd-code-review {N}");
-        let ship_pos = prompt
-            .find("/gsd-ship 13")
-            .expect("Ship prompt must run /gsd-ship {N}");
-        assert!(
-            review_pos < ship_pos,
-            "code-review must be sequenced before ship"
-        );
-    }
-
-    #[test]
-    fn ship_prompt_defines_critical_gate_and_review_failed_contract() {
-        let prompt = stage_prompt(Stage::Ship, PhaseId::new(13));
-        assert!(
-            prompt.contains("REVIEW.md"),
-            "Ship prompt must reference the REVIEW.md artifact"
-        );
-        assert!(
-            prompt.to_lowercase().contains("critical"),
-            "Ship prompt must name the Critical-severity gate"
-        );
-        assert!(
-            prompt.contains("do not run")
-                || prompt.contains("do NOT run")
-                || prompt.contains("DO NOT run"),
-            "Ship prompt must instruct the agent not to run /gsd-ship on Critical findings"
-        );
-        assert!(
-            prompt.contains("review:"),
-            "Ship prompt must define the review: ReviewFailed reason convention"
-        );
-        assert!(prompt.contains("DEVFLOW_RESULT"));
-    }
-
-    #[test]
-    fn ship_prompt_instructs_pr_targeting_main() {
-        let prompt = stage_prompt(Stage::Ship, PhaseId::new(13));
-        assert!(
-            prompt.contains("target base branch `main`"),
-            "Ship prompt must explicitly instruct targeting base branch main for the PR"
-        );
-    }
-
-    /// WR-03 (49-REVIEW.md): both Ship renderers name the trunk (`config::MAIN`)
-    /// and never a fixture branch name such as the phase-49 scratch repo's
-    /// `integration`.
-    #[test]
-    fn ship_prompts_name_the_trunk_and_no_fixture_branch() {
-        let intent = StageIntent::for_stage(Stage::Ship, PhaseId::new(13));
-        let expected = format!("target base branch `{}`", crate::config::MAIN);
-        for prompt in [
-            render_claude_style(&intent),
-            render_workflow_style(&intent, "/gsd/workflows"),
-        ] {
-            assert!(
-                prompt.contains(&expected),
-                "Ship prompt must target the trunk: {prompt}"
-            );
-            assert!(
-                !prompt.contains("integration"),
-                "Ship prompt must not name a fixture branch: {prompt}"
-            );
-        }
-    }
-
-    #[test]
-    fn ship_prompt_includes_multi_angle_conditional_review() {
-        let prompt = stage_prompt(Stage::Ship, PhaseId::new(13));
-        for angle in [
-            "doc-accuracy cross-reference",
-            "security / leaked-data",
-            "CI/build correctness",
-            "external-state claims",
-            "generalist deep pass",
-        ] {
-            assert!(prompt.contains(angle), "Ship prompt missing angle: {angle}");
-        }
-        assert!(prompt.contains("parallel finder subagents"));
-        assert!(prompt.contains("focused sequential pass"));
-        assert!(prompt.contains("Merge and deduplicate"));
-        assert!(prompt.contains("REVIEW.md"));
-    }
-
-    #[test]
-    fn ship_prompt_uses_project_review_angle_override() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("devflow.toml"),
-            "review_angles = [\"custom release evidence\", \"custom threat boundary\"]\n",
-        )
-        .unwrap();
-
-        let prompt = stage_prompt_for_project(Stage::Ship, PhaseId::new(13), dir.path());
-
-        assert!(prompt.contains("custom release evidence"));
-        assert!(prompt.contains("custom threat boundary"));
-        assert!(!prompt.contains("doc-accuracy cross-reference"));
     }
 
     #[test]
@@ -884,7 +634,7 @@ mod tests {
         assert!(prompt.contains("DEVFLOW_RESULT"));
         assert!(
             !prompt.contains("/gsd-code-review"),
-            "Code prompt should not carry Ship-specific code-review sequencing"
+            "Code prompt should not carry a code-review sequencing step"
         );
         assert!(
             !prompt.contains("already exists"),
@@ -991,20 +741,8 @@ mod tests {
             },
             "/workflows",
         );
-        let audit_fix = render_workflow_style(
-            &StageIntent::Code {
-                phase,
-                fix: Some(FixType::AuditFix),
-            },
-            "/workflows",
-        );
 
-        for prompt in [
-            stage_prompt(Stage::Validate, phase),
-            stage_prompt(Stage::Ship, phase),
-            gaps_only,
-            audit_fix,
-        ] {
+        for prompt in [stage_prompt(Stage::Validate, phase), gaps_only] {
             assert!(
                 !prompt.contains(CODE_STAGE_POLICY),
                 "only full-execute Code prompts may carry the shared policy"
@@ -1024,17 +762,8 @@ mod tests {
             phase,
             fix: Some(FixType::GapsOnly),
         });
-        let audit_fix = render_claude_style(&StageIntent::Code {
-            phase,
-            fix: Some(FixType::AuditFix),
-        });
 
-        for prompt in [
-            stage_prompt(Stage::Validate, phase),
-            stage_prompt(Stage::Ship, phase),
-            gaps_only,
-            audit_fix,
-        ] {
+        for prompt in [stage_prompt(Stage::Validate, phase), gaps_only] {
             assert!(
                 !prompt.contains(CODE_STAGE_POLICY),
                 "only full-execute Code prompts may carry the shared policy"
@@ -1236,9 +965,8 @@ mod tests {
 
     #[test]
     fn fix_prompts_select_the_right_command() {
-        assert!(fix_prompt(FixType::AuditFix, PhaseId::new(11)).contains("/gsd-audit-fix 11"));
         assert!(fix_prompt(FixType::GapsOnly, PhaseId::new(11)).contains("--gaps-only"));
-        assert!(fix_prompt(FixType::AuditFix, PhaseId::new(11)).contains("DEVFLOW_RESULT"));
+        assert!(fix_prompt(FixType::GapsOnly, PhaseId::new(11)).contains("DEVFLOW_RESULT"));
 
         // D-01: FullExecute renders the plain, unflagged execute command.
         let full_execute_prompt = fix_prompt(FixType::FullExecute, PhaseId::new(11));
@@ -1253,10 +981,7 @@ mod tests {
     /// The flag-preserving token belongs on exactly the command strings that
     /// reach `execute-phase.md`'s sync-clear step, and nowhere else.
     ///
-    /// All three `FixType` arms are asserted, present AND absent, so this test
-    /// distinguishes "added where it belongs" from "added everywhere" — the
-    /// same habit `fix_prompts_select_the_right_command` above already uses for
-    /// `--gaps-only`.
+    /// Both `FixType` arms reach `execute-phase.md`, so both must carry it.
     #[test]
     fn fix_prompts_carry_the_chain_flag_token_only_where_it_reaches_execute_phase() {
         let phase = PhaseId::new(11);
@@ -1269,11 +994,6 @@ mod tests {
         assert!(
             fix_prompt(FixType::FullExecute, phase).contains(AUTO_CHAIN_PRESERVING_FLAG),
             "the full-execute loop-back reaches execute-phase.md too"
-        );
-        assert!(
-            !fix_prompt(FixType::AuditFix, phase).contains(AUTO_CHAIN_PRESERVING_FLAG),
-            "audit-fix routes to /gsd-audit-fix and never reaches execute-phase.md, \
-             so it never meets the sync-clear step the token exists to skip"
         );
     }
 
@@ -1378,13 +1098,13 @@ mod tests {
 
     /// Only Code may declare. The resume prompt and every non-Code stage
     /// prompt carry no checkpoint form, so a resumed agent is not re-offered
-    /// it and Define, Plan, Validate and Ship are not invited to use it.
+    /// it and Define, Plan and Validate are not invited to use it.
     #[test]
     fn checkpoint_declaration_is_offered_only_to_the_code_stage() {
         let resume = checkpoint_auto_decide_prompt(PhaseId::new(47));
         assert!(!resume.contains("\"checkpoint\""), "{resume}");
         assert!(!COMPLETION_PROTOCOL.contains("checkpoint"));
-        for stage in [Stage::Define, Stage::Plan, Stage::Validate, Stage::Ship] {
+        for stage in [Stage::Define, Stage::Plan, Stage::Validate] {
             let prompt = stage_prompt(stage, PhaseId::new(47));
             assert!(!prompt.contains("\"checkpoint\""), "{stage:?}: {prompt}");
         }
@@ -1537,7 +1257,7 @@ mod tests {
     /// workflow-style baselines (codex, pi) differ only in each driver's
     /// workflow root.
     ///
-    /// Scope is D-15's and no wider. The `GapsOnly`/`AuditFix` arms carry no
+    /// Scope is D-15's and no wider. The `GapsOnly` arm carries no
     /// policy and are already discriminated by
     /// `claude_style_fix_prompts_that_must_not_carry_the_policy_still_omit_it`.
     ///

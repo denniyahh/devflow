@@ -9897,13 +9897,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
         std::fs::write(exit_code_path(dir.path(), PhaseId::new(10)), "1").unwrap();
 
-        for stage in [
-            Stage::Define,
-            Stage::Plan,
-            Stage::Code,
-            Stage::Validate,
-            Stage::Ship,
-        ] {
+        for stage in [Stage::Define, Stage::Plan, Stage::Code, Stage::Validate] {
             let result = evaluate_layer2(
                 dir.path(),
                 PhaseId::new(10),
