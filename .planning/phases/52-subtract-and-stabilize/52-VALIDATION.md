@@ -3,9 +3,9 @@ phase: "52"
 slug: "subtract-and-stabilize"
 # status lifecycle: draft (seeded by plan-phase) → validated (set by validate-phase §6)
 # audit-milestone §5.5 distinguishes NOT-VALIDATED (draft) from PARTIAL (validated + nyquist_compliant: false) (#2117)
-status: draft
-nyquist_compliant: false
-wave_0_complete: false
+status: validated
+nyquist_compliant: true
+wave_0_complete: true
 created: "2026-11-09"
 ---
 
@@ -92,7 +92,7 @@ One row per requirement behaviour; each plan's `<automated>` gates carry per-tes
 | CUT-03/GATE-01 | `State.relaunch_note` is `None` once the run leaves the relaunched stage, on every production way out: `transition` out of Plan and Code, its `--until` halt, `prepare_loop_back_to_code` out of Validate (it moves Validate to Code without `transition`; the loop-back's returned prompt and the replayed Code intent carry no note), `finish_run`, and from 52-27 the gaps route's `transition(Validate → Plan)` (U7) | a stop and resume with no transition keeps the note; a reloaded Code state with no stage change keeps it in the same Code-intent builder the loop-back row asserts on | `pipeline_gate::tests::leaving_the_relaunched_stage_clears_the_relaunch_note` (52-26; moved from 52-31, `--until` halt row added, `prepare_loop_back_to_code` row and Code-to-Code control added; gaps-route row 52-27) |
 | CUT-03/GATE-01 | only `transition` and `prepare_loop_back_to_code` write `State.stage` in non-test code (so every stage exit is a `relaunch_note` clear site) | the rule is 52-26's own (review 5, V2): the non-test text before `"\n#[cfg(test)]\nmod tests {"` (a file without it is all non-test text), each line cut at its first `//`, matches of `\b([A-Za-z_]\w*)\.stage\s*=(?![=>])` with any receiver but `spec`, exactly two hits; a planted `persisted.stage = Stage::Plan;` counts; `// state.stage = to`, `spec.stage = a;`, `a.stage == b`, `!= state.stage =>` and a `let stage` local count none | `pipeline_gate::tests::state_stage_is_written_only_by_transition_and_the_code_loop_back` (52-26) |
 | GATE-01/GATE-03 | the default stage intent is still built exactly once, inside `default_stage_prompt`: 52-26 sets the relaunch note on the intent `for_stage_in_project` returns, and 52-27 builds its gaps Plan intent beside the Code arm | the test's planted sources (a second render, a bypassing caller) each report their violation | `pipeline_launch::tests::every_no_override_launch_renders_through_default_stage_prompt` (existing, unchanged; run by name in 52-26 Task 1 and 52-27 Task 1) |
-| GATE-04 | a >300-char reason reaches `gate show` whole; banner, list and notify stay ≤300 and lead with the way-on sentence | existing `commands::tests::gate_show_renders_full_untruncated_sanitized_context`; an empty cause yields the sentence alone | `pipeline_outcomes::tests::a_long_failure_reason_is_stored_whole`, `gate_wedge_e2e::a_long_failure_reason_reaches_gate_show_whole`, `pipeline_outcomes::tests::the_failure_context_leads_with_the_way_on` (52-30) |
+| GATE-04 | a >300-char reason reaches `gate show` whole (stored up to 4096 chars); banner, list and notify stay within `GATE_CONTEXT_DISPLAY_CHARS` (raised to 450 by 52-33, shared by 52-30 through `render_gate_context`) and lead with the way-on sentence | existing `commands::tests::gate_show_renders_full_untruncated_sanitized_context`; an empty cause yields the sentence alone | `pipeline_outcomes::tests::a_long_failure_reason_is_stored_whole`, `gate_wedge_e2e::a_long_failure_reason_reaches_gate_show_whole`, `pipeline_outcomes::tests::the_failure_context_leads_with_the_way_on`, `gates::tests::notify_context_is_capped_at_the_display_bound` (52-30; renamed from the plan's `notify_context_is_capped_at_300_chars`) |
 | OPS-01 | `--version` = `devflow <CARGO_PKG_VERSION> (<commit>, clean\|dirty)` (the version stays 3.x in-phase; `cut-release.sh` derives 4.0.0 from `!` subjects) | an empty commit renders `unknown` | `build_provenance::version_prints_the_embedded_commit_and_dirty_flag` (52-23) |
 | OPS-02 | cleanup names the stop reason and keeps a finished run's worktree (D-35); `--force` removes state; status never shows a gone worktree as active; start announces a stale replace | a run whose worktree is present still reports active | `phase7_cli::cleanup_*` (52-25; `cleanup_worktree_cli_flow` renamed by 52-02), `commands::tests::status_*` (52-25) |
 | OPS-03 | no tracing lines with `RUST_LOG` unset; doctor reports RUST_LOG as info; no provenance warning off-repo; one missing-remote line | `RUST_LOG=debug` still shows tracing (existing test); provenance still fires on DevFlow's own checkout (existing test) | `log_format_env::rust_log_unset_prints_no_tracing_lines` (52-23; inverts the existing `:167` test), `staleness::tests::enforce_build_staleness_is_silent_for_an_ordinary_project` (52-21) |
@@ -102,11 +102,11 @@ One row per requirement behaviour; each plan's `<automated>` gates carry per-tes
 
 ## Wave 0 Requirements
 
-- [ ] Stub `gsd_run` helper in `crates/devflow-cli/tests/common/mod.rs` (a scripted JSON sequence per call; logs argv), needed by every GATE-02/03 e2e test.
-- [ ] A capture-shape fake-agent helper replacing the `--legacy-claude-launch` usage in the ten e2e files that use it only to get the capture shape.
-- [ ] Fake agents that log stdin and argv, for the per-shape note assertion.
-- [ ] Recorded gsd-core 1.20.1 JSON fixtures (the research probe outputs) for the `gsd_reader` unit tests.
-- [ ] `proptest` 1.12.0 as a dev-dependency of `devflow` (pinned in its own `[dev-dependencies]`; the version RESEARCH's Package Legitimacy Audit addendum rates [OK] verified), for D-45 rule 6's property test (52-29 Task 3; revised 2026-11-10: the legitimacy checkpoint is dropped on that audit).
+- [x] Stub `gsd_run` helper in `crates/devflow-cli/tests/common/mod.rs` (a scripted JSON sequence per call; logs argv), needed by every GATE-02/03 e2e test.
+- [x] A capture-shape fake-agent helper replacing the `--legacy-claude-launch` usage in the ten e2e files that use it only to get the capture shape.
+- [x] Fake agents that log stdin and argv, for the per-shape note assertion.
+- [x] Recorded gsd-core 1.20.1 JSON fixtures (the research probe outputs) for the `gsd_reader` unit tests.
+- [x] `proptest` 1.12.0 as a dev-dependency of `devflow` (pinned in its own `[dev-dependencies]`; the version RESEARCH's Package Legitimacy Audit addendum rates [OK] verified), for D-45 rule 6's property test (52-29 Task 3; revised 2026-11-10: the legitimacy checkpoint is dropped on that audit).
 
 ---
 
@@ -122,11 +122,19 @@ One row per requirement behaviour; each plan's `<automated>` gates carry per-tes
 
 ## Validation Sign-Off
 
-- [ ] All tasks have `<automated>` verify or Wave 0 dependencies
-- [ ] Sampling continuity: no 3 consecutive tasks without automated verify
-- [ ] Wave 0 covers all MISSING references
-- [ ] No watch-mode flags
-- [ ] Feedback latency: named gates per task, full suite per wave
-- [ ] `nyquist_compliant: true` set in frontmatter
+- [x] All tasks have `<automated>` verify or Wave 0 dependencies
+- [x] Sampling continuity: no 3 consecutive tasks without automated verify
+- [x] Wave 0 covers all MISSING references
+- [x] No watch-mode flags
+- [x] Feedback latency: named gates per task, full suite per wave
+- [x] `nyquist_compliant: true` set in frontmatter
 
-**Approval:** pending
+**Approval:** validated 2026-11-11 by `/gsd-validate-phase 52` (run inside `/gsd-execute-phase 52`'s verify:post hook). All 81 fully named tests in the map exist in `cargo nextest list --workspace` (a planted nonexistent name matched none) and passed in one bounded run (81 run, 81 passed); the wildcard rows (`phase7_cli::cleanup_*` 9, `commands::tests::status_*` 11, `gsd_reader::tests::*` 26) passed in the final `scripts/check.sh all` runs. Wave 0 notes: the stub is `devflow_core::test_support::plant_gsd_run_stub`; `--legacy-claude-launch` has no remaining use under `crates/devflow-cli/tests`; two status fixtures (`human_needed`, unparseable) were built from GSD's status list, not recorded from a live GSD (52-20 SUMMARY), so they pin the reader's handling, not GSD's current output shape.
+
+## Validation Audit 2026-11-11
+
+| Metric | Count |
+|---|---|
+| Gaps found | 0 |
+| Resolved | 0 |
+| Escalated | 0 |
