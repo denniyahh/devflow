@@ -25,7 +25,7 @@ use crate::pipeline_launch::{
     GateWaitEnd, clear_run_state, close_gate, commit, ensure_still_recorded, fenced, is_not_owner,
     launch_stage,
 };
-use crate::pipeline_outcomes::truncate_reason;
+use crate::pipeline_outcomes::{Answer, FinishPermit, truncate_reason};
 #[cfg(test)]
 use devflow_core::gates::GateId;
 use devflow_core::gates::{self, Claim, GateAction, GateKind, Gates};
@@ -173,11 +173,21 @@ pub(crate) const FINISHED_STOP_REASON: &str =
 /// registry. Nothing else is touched: no git call, no hook, no merge, push,
 /// tag or branch deletion, so the operator gets the tree as Validate left it.
 ///
+/// It takes a [`FinishPermit`] by value, which only
+/// [`crate::pipeline_outcomes::can_finish`] makes (D-45 rule 1), so no run is
+/// recorded finished without a fresh `passed` and a Validate pass on HEAD.
+///
 /// It emits `workflow_finished` with `{"reason":"finished","shipped":false}`,
 /// then fires the notify command once and records `notify_fired`. It does not
 /// read `stop_until`: with `--until validate` a passing Validate is a finish,
 /// not a halt, because Validate is the last stage.
-pub(crate) fn finish_run(project_root: &Path, state: &mut State) -> Result<(), CliError> {
+pub(crate) fn finish_run(
+    project_root: &Path,
+    state: &mut State,
+    permit: FinishPermit,
+) -> Result<(), CliError> {
+    // D-45 rule 1: the permit is the proof `can_finish` held; it is spent here.
+    let _ = permit;
     // A stop taken during the advance that reached this finish (after the
     // Validate gate was approved, or while an auto pass advanced) is honoured
     // here, at safe point 6, before the run is recorded finished. The run ends
@@ -186,14 +196,14 @@ pub(crate) fn finish_run(project_root: &Path, state: &mut State) -> Result<(), C
     // run and the stop would be answered `handed_off`, which `devflow stop`
     // reports as a run that moved on to a successor.
     if crate::pipeline_launch::stop_requested_at_safe_point() {
-        let _ = close_gate(project_root, state.phase, Stage::Validate);
+        let _ = close_gate(project_root, state.phase, state.stage);
         crate::pipeline_launch::record_advance_stop(state, 6)?;
         return Err(CliError::Message(format!(
             "the run did not finish: {}",
             crate::pipeline_launch::safe_point_stop_reason()
         )));
     }
-    let _ = close_gate(project_root, state.phase, Stage::Validate);
+    let _ = close_gate(project_root, state.phase, state.stage);
     commit(state, |s| {
         s.stopped = true;
         s.finished = true;
@@ -475,7 +485,7 @@ pub(crate) fn run_gate(
     stage: Stage,
     kind: GateKind,
     context: &str,
-) -> Result<GateAction, CliError> {
+) -> Result<Answer, CliError> {
     run_gate_with_timeout(
         project_root,
         state,
@@ -498,7 +508,7 @@ pub(crate) fn run_gate_with_event_context(
     kind: GateKind,
     context: &str,
     event_context: &str,
-) -> Result<GateAction, CliError> {
+) -> Result<Answer, CliError> {
     open_and_await(
         project_root,
         state,
@@ -524,7 +534,7 @@ pub(crate) fn run_gate_with_timeout(
     kind: GateKind,
     context: &str,
     timeout_secs: u64,
-) -> Result<GateAction, CliError> {
+) -> Result<Answer, CliError> {
     open_and_await(
         project_root,
         state,
@@ -546,7 +556,7 @@ fn open_and_await(
     kind: GateKind,
     contexts: (&str, &str),
     timeout_secs: u64,
-) -> Result<GateAction, CliError> {
+) -> Result<Answer, CliError> {
     let (context, event_context) = contexts;
     commit(state, |s| s.gate_pending = true)?;
     // A crash inside this call before the publish leaves `gate_pending` with no gate
@@ -654,26 +664,33 @@ fn open_and_await(
             // write re-reads the state and sets only this field.
             commit(state, |s| s.gate_pending = false)?;
             let action = GateAction::from_response(&response);
-            events::emit(
-                project_root,
-                state.phase,
-                "gate_resolved",
-                serde_json::json!({
-                    "stage": stage.to_string(),
-                    "gate_id": gate_id.as_str(),
-                    "approved": response.approved,
-                    "action": match &action {
-                        GateAction::Advance => "advance",
-                        GateAction::LoopBack { .. } => "loop_back",
-                        GateAction::Abort(_) => "abort",
-                    },
-                    "responded_by": response.responded_by,
-                }),
-            );
+            // D-45 rule 2: the answer is routed here, after its claim, so
+            // `gate_resolved` names the route it runs and the evidence a
+            // verification approve was routed on.
+            let answer =
+                crate::pipeline_outcomes::route_answer(project_root, state, kind, &response);
+            let mut resolved = serde_json::json!({
+                "stage": stage.to_string(),
+                "gate_id": gate_id.as_str(),
+                "gate_kind": kind,
+                "approved": response.approved,
+                "action": match &action {
+                    GateAction::Advance => "advance",
+                    GateAction::LoopBack { .. } => "loop_back",
+                    GateAction::Abort(_) => "abort",
+                },
+                "responded_by": response.responded_by,
+            });
+            if let (Some(resolved), serde_json::Value::Object(route)) =
+                (resolved.as_object_mut(), answer.resolved_fields())
+            {
+                resolved.extend(route);
+            }
+            events::emit(project_root, state.phase, "gate_resolved", resolved);
             // `gate_pending` reads false here, and the caller has not applied the action.
             #[cfg(test)]
             crate::pipeline_launch::test_hold("after_commit");
-            Ok(action)
+            Ok(answer)
         }
         GateWaitEnd::Stopped => {
             // Safe point 4 (50-13, R-2): the supervisor running this advance
@@ -1398,7 +1415,10 @@ mod tests {
         .unwrap();
         let (action, in_memory) = handle.join().unwrap().expect("the gate resolves");
 
-        assert!(matches!(action, GateAction::Advance), "{action:?}");
+        assert!(
+            matches!(action, crate::pipeline_outcomes::Answer::Approve(_)),
+            "{action:?}"
+        );
         assert!(
             edited_sentinel.exists(),
             "the gate must fire the command edited on disk after the advance loaded"
@@ -1606,7 +1626,7 @@ mod tests {
     fn spawn_code_gate_waiter(
         root: &Path,
         phase: PhaseId,
-    ) -> std::thread::JoinHandle<Result<GateAction, CliError>> {
+    ) -> std::thread::JoinHandle<Result<crate::pipeline_outcomes::Answer, CliError>> {
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
         state.gate_notify_cmd = Some("true".to_string());
@@ -1704,7 +1724,10 @@ mod tests {
 
         answer_open_gate(root, phase, Stage::Code, &approval()).unwrap();
         let action = waiter.join().unwrap().unwrap();
-        assert_eq!(action, GateAction::Advance);
+        assert!(
+            matches!(action, crate::pipeline_outcomes::Answer::Approve(_)),
+            "{action:?}"
+        );
         assert!(
             Gates::claim_path(root, phase, Stage::Code, &gate).exists(),
             "the answer was consumed through the claim"
@@ -2106,7 +2129,7 @@ mod tests {
         let phase = PhaseId::new(5283);
         let mut state = noted_state(dir.path(), phase, Stage::Validate);
         workflow::save_state(&state).unwrap();
-        finish_run(dir.path(), &mut state).unwrap();
+        finish_run(dir.path(), &mut state, test_permit()).unwrap();
         let finished = workflow::load_state(dir.path(), phase).unwrap();
         assert!(finished.finished, "the run finished");
         assert_eq!(
@@ -2480,5 +2503,21 @@ mod tests {
             !workflow_finished_violations(&[]).is_empty(),
             "control: a walk that read no file is a violation"
         );
+    }
+
+    /// A permit through the one finish check, over evidence that passes it:
+    /// GSD's `passed` with the Validate PASS on HEAD over a clean tree.
+    fn test_permit() -> FinishPermit {
+        let evidence = crate::pipeline_outcomes::Evidence {
+            read: Ok(devflow_core::gsd_reader::StatusReport {
+                status: devflow_core::gsd_reader::GsdStatus::Passed,
+                route: String::new(),
+                next_action: None,
+                moved_files: Vec::new(),
+            }),
+            agent_pass_on_head: true,
+            no_pass_cause: None,
+        };
+        crate::pipeline_outcomes::can_finish(&evidence).expect("the evidence passes can_finish")
     }
 }
