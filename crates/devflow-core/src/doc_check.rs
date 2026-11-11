@@ -2152,3 +2152,240 @@ fn gate_notify_cmd_doc_cites_the_tests_that_pin_it() {
         found.join("\n")
     );
 }
+
+// ---------------------------------------------------------------------------
+// 52-18 (CUT-04, criterion 2, D-40): no literal of the removed v3 surface
+// remains in comment-stripped Rust under `crates/` and `tools/`, in
+// HTML-comment-stripped Markdown under `docs/` and the top-level docs, or in
+// the committed snapshot files. `CHANGELOG.md`, `.planning/` and `CLAUDE.md`
+// are out of scope (D-40). The scan has no path, file or test exemption: a
+// control test whose subject is that a removed value is rejected or absent
+// builds that value with a `concat!` split inside the token, as this file does.
+// ---------------------------------------------------------------------------
+
+/// Removed-surface tokens matched on identifier boundaries (`_` counts as an
+/// identifier character, so a token is always the whole name the tree spells).
+/// Each is split with `concat!` so this file never holds one whole.
+const REMOVED_SURFACE_TOKENS: &[&str] = &[
+    concat!("cron-", "instructions"),
+    concat!("hermes", "_cron"),
+    concat!("yes", "_ship"),
+    concat!("yes", "-ship"),
+    concat!("Version", "Bump"),
+    concat!("Changelog", "Append"),
+    concat!("Branch", "Cleanup"),
+    concat!("Hook::", "Merge"),
+    concat!("Docs", "Update"),
+    concat!("Stage::", "Define"),
+    concat!("Stage::", "Ship"),
+    concat!("StageIntent::", "Define"),
+    concat!("StageIntent::", "Ship"),
+    concat!("devflow ", "ship"),
+    concat!("devflow ", "parallel"),
+    concat!("devflow ", "evidence"),
+    concat!("devflow ", "reference"),
+    concat!("devflow ", "release"),
+    concat!("reap", "-strays"),
+    concat!("legacy-claude", "-launch"),
+    concat!("DEVFLOW_CLAUDE_LEGACY", "_LAUNCH"),
+    concat!("DEVFLOW_YES", "_SHIP"),
+    concat!("DEVFLOW_REVIEW", "_ANGLES"),
+    concat!("SHIP_REVIEW", "_ANGLES"),
+    concat!("DEVFLOW_FOREGROUND_GATE", "_TIMEOUT_SECS"),
+    concat!("DEVFLOW_CHECKOUT_LOCK", "_TIMEOUT_SECS"),
+    concat!("ship", "_evidence"),
+];
+
+/// Removed stage names, matched in Rust only as a whole string literal (and in
+/// Markdown and snapshots as the double-quoted word), so prose and longer
+/// literals such as `"shipped"` are not findings.
+const REMOVED_STAGE_LITERALS: &[&str] = &[concat!("sh", "ip"), concat!("def", "ine")];
+
+/// Every place a removed-surface token survives in `files`, one finding per
+/// line as `path:line: removed surface <tokens>: <text>`, sorted by path then
+/// line.
+fn removed_surface_findings(_files: &[(PathBuf, String)]) -> Vec<String> {
+    Vec::new()
+}
+
+/// One real line per token, copied from the b8df457 tree with the token
+/// replaced by `@`, in the order of `REMOVED_SURFACE_TOKENS` then
+/// `REMOVED_STAGE_LITERALS`.
+const PLANTED_REMOVED_LINES: &[&str] = &[
+    r#".expect("the cron arm wrote @-5148.json");"#,
+    "if instructions.@.schedule.is_empty() {",
+    "@: bool,",
+    r#""a stop accepted before the --@ merge must ship nothing: {}","#,
+    "@,",
+    r#"assert_eq!(hook_runs(root, "@"), 2);"#,
+    "@,",
+    "if index < progress.completed && *hook != hooks::@ {",
+    "@,",
+    "@,",
+    "@,",
+    "@ { phase } => define_stage_prompt(*phase),",
+    "@ {",
+    r#"format!("@ --phase {phase}")"#,
+    r#".expect("run @");"#,
+    "| `@ --phase N [--json] [--require-shipped] [--root PATH]` |",
+    "| `@ [--refresh]` | Create a static reference worktree for multi-agent handoff |",
+    r#""@ accepts exactly one of --check or --verify".to_string(),"#,
+    r#"`devflow gate sweep --@` to clear them","#,
+    r#".args(legacy_launch.then_some("--@"))"#,
+    r#"command.env("@", "true");"#,
+    r#"if let Some(value) = env_value("@") {"#,
+    r#"if let Some(value) = env_value("@") {"#,
+    "const @: &[&str] = &[",
+    r#"parse_foreground_gate_timeout(std::env::var("@").ok())"#,
+    r#"parse_checkout_lock_timeout(std::env::var("@").ok())"#,
+    "use devflow_core::@;",
+    r#"assert_eq!(stage.as_deref(), Some("@"));"#,
+    r#"serde_json::json!({"stage": "@", "gate_id": gate_id, "status": "live"})"#,
+];
+
+/// The scan's inputs: `.rs` under `crates/` and `tools/`, Markdown under
+/// `docs/` plus the top-level docs, and the committed snapshot files.
+fn removed_surface_inputs() -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
+    let root = workspace_root();
+    let skip = root.join("target");
+    let with_extension = |paths: Vec<PathBuf>, extension: &str| -> Vec<PathBuf> {
+        paths
+            .into_iter()
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some(extension))
+            .collect()
+    };
+    let mut rust = with_extension(files_under(&root.join("crates"), &skip), "rs");
+    rust.extend(with_extension(
+        files_under(&root.join("tools"), &skip),
+        "rs",
+    ));
+    let mut markdown = with_extension(files_under(&root.join("docs"), &skip), "md");
+    markdown.extend(SCOPED_DOCS.iter().map(|path| root.join(path)));
+    markdown.sort();
+    let snapshots = files_under(&root.join("crates/devflow-cli/tests/snapshots"), &skip);
+    (rust, markdown, snapshots)
+}
+
+#[test]
+fn no_removed_surface_literal_remains() {
+    let planted = |name: &str, text: &str| vec![(PathBuf::from(name), text.to_string())];
+
+    // (a) One real line per token is exactly one finding, naming that token,
+    // in Rust and in Markdown.
+    let tokens: Vec<String> = REMOVED_SURFACE_TOKENS
+        .iter()
+        .map(|token| (*token).to_string())
+        .chain(
+            REMOVED_STAGE_LITERALS
+                .iter()
+                .map(|value| format!("\"{value}\"")),
+        )
+        .collect();
+    let values: Vec<&str> = REMOVED_SURFACE_TOKENS
+        .iter()
+        .chain(REMOVED_STAGE_LITERALS)
+        .copied()
+        .collect();
+    assert_eq!(values.len(), 29, "the token list is the 29 the plan names");
+    assert_eq!(PLANTED_REMOVED_LINES.len(), values.len());
+    for ((value, shown), template) in values.iter().zip(&tokens).zip(PLANTED_REMOVED_LINES) {
+        let line = template.replace('@', value);
+        for name in ["planted.rs", "planted.md"] {
+            let findings = removed_surface_findings(&planted(name, &line));
+            assert_eq!(
+                findings.len(),
+                1,
+                "{name}: the planted line `{line}` must be exactly one finding: {findings:?}"
+            );
+            assert!(
+                findings[0].contains(&format!("`{shown}`")),
+                "{name}: the finding must name {shown}: {findings:?}"
+            );
+        }
+    }
+    // A token right after an escaped newline inside a literal still counts.
+    let escaped = [
+        "let toml = \"[run]\\n",
+        REMOVED_SURFACE_TOKENS[2],
+        " = true\";",
+    ]
+    .concat();
+    assert_eq!(
+        removed_surface_findings(&planted("planted.rs", &escaped)).len(),
+        1
+    );
+
+    // (b) Decoys: comments, longer names and prose are not findings.
+    let yes_ship = REMOVED_SURFACE_TOKENS[2];
+    let ship = REMOVED_STAGE_LITERALS[0];
+    let define = REMOVED_STAGE_LITERALS[1];
+    let rust_decoys = [
+        ["// ", yes_ship, ": bool,"].concat(),
+        ["    /// ", REMOVED_SURFACE_TOKENS[10], " was removed"].concat(),
+        ["let x = 1; /* ", REMOVED_SURFACE_TOKENS[21], " */"].concat(),
+        ["let ", yes_ship, "ment = 1;"].concat(),
+        ["let membership = \"", ship, "ped\";"].concat(),
+        ["let note = \"--until ", ship, " is refused\";"].concat(),
+        ["fn ", ship, "(stage: &str) {}"].concat(),
+        ["// let stage = \"", ship, "\";"].concat(),
+    ];
+    for decoy in rust_decoys {
+        let findings = removed_surface_findings(&planted("planted.rs", &decoy));
+        assert!(
+            findings.is_empty(),
+            "Rust decoy `{decoy}` was flagged: {findings:?}"
+        );
+    }
+    let markdown_decoys = [
+        ["<!-- ", REMOVED_SURFACE_TOKENS[13], " --phase 1 -->"].concat(),
+        ["<!--\n", yes_ship, "\n-->"].concat(),
+        ["The phase ", ship, "ped; ", ship, " membership."].concat(),
+        ["Set ", yes_ship, "ment to taste."].concat(),
+        [define, " the interface before the plan."].concat(),
+    ];
+    for decoy in markdown_decoys {
+        let findings = removed_surface_findings(&planted("planted.md", &decoy));
+        assert!(
+            findings.is_empty(),
+            "Markdown decoy `{decoy}` was flagged: {findings:?}"
+        );
+    }
+
+    // Ordering backstop: findings come back sorted by path, then line.
+    let unordered = vec![
+        (
+            PathBuf::from("b.rs"),
+            ["\n\nlet x = ", yes_ship, ";"].concat(),
+        ),
+        (PathBuf::from("a.md"), ["\n\n\n\n", yes_ship, "\n"].concat()),
+        (PathBuf::from("a.md.txt"), [yes_ship, "\n"].concat()),
+        (PathBuf::from("a.md"), ["\n", yes_ship].concat()),
+    ];
+    let ordered: Vec<String> = removed_surface_findings(&unordered)
+        .iter()
+        .map(|finding| finding.split(": ").next().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(ordered, ["a.md:2", "a.md:5", "a.md.txt:1", "b.rs:3"]);
+
+    // (c) Every walker returns files, so a clean result means something.
+    let (rust, markdown, snapshots) = removed_surface_inputs();
+    assert!(!rust.is_empty(), "the Rust walker found no files");
+    assert!(
+        rust.iter()
+            .any(|path| path.starts_with(workspace_root().join("tools"))),
+        "the Rust walker must read tools/"
+    );
+    assert!(!markdown.is_empty(), "the Markdown walker found no files");
+    assert!(!snapshots.is_empty(), "the snapshot walker found no files");
+
+    // (d) The real tree holds no removed-surface literal.
+    let mut files = read_labelled(rust);
+    files.extend(read_labelled(markdown));
+    files.extend(read_labelled(snapshots));
+    let findings = removed_surface_findings(&files);
+    assert!(
+        findings.is_empty(),
+        "removed-surface literals remain (CUT-04, criterion 2):\n{}",
+        findings.join("\n")
+    );
+}
