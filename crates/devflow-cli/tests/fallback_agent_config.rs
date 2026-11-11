@@ -1,8 +1,7 @@
 //! R-3 (Phase 51): CLI-boundary coverage of `devflow start`'s combined
 //! resolution of the `--fallback-agent` flag and a `fallback_agent` key in
-//! `devflow.toml`, mirroring `yes_ship_config.rs`. The flag wins when given;
-//! the key applies when the flag is absent, and a key-only fallback names
-//! `devflow.toml` as its source.
+//! `devflow.toml`. The flag wins when given; the key applies when the flag is
+//! absent, and a key-only fallback names `devflow.toml` as its source.
 //!
 //! Most cases run through `--dry-run`, which returns before the run is
 //! persisted, so `config_key_alone_is_persisted_in_the_run_state` is the one
