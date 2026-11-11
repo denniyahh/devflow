@@ -328,7 +328,6 @@ pub(crate) fn start(
     worktree: bool,
     dry_run: bool,
     until: Option<Stage>,
-    yes_ship: bool,
     fallback: FallbackSource,
 ) -> Result<(), CliError> {
     // 999.78/A-11: NOT a bare `State::new`. See
@@ -336,24 +335,6 @@ pub(crate) fn start(
     // forced restart and every other counter does not.
     let mut state = fresh_state_carrying_phase_failures(project_root, phase, agent, mode);
     state.stop_until = until;
-    // The only assignment in the crate that ever sets `yes_ship` to a
-    // non-default value. Provenance (D-12, `28-CONTEXT.md`): the typed
-    // `--yes-ship` CLI flag OR a standing `yes_ship = true` in
-    // `devflow.toml`, combined here with logical OR since the flag has no
-    // negative form. Combined before `create_run_state` below, so the
-    // persisted authorization exists before the detached monitor that will
-    // later consult it is ever spawned. `run_gate_with_timeout` must never
-    // re-derive this from `state` itself — see its own comment.
-    let config_yes_ship = config::yes_ship(project_root);
-    // D-12's compensating control: a standing default is never silent. Only
-    // fires when config alone supplied the authorization — a typed flag
-    // needs no explanation of where it came from.
-    if config_yes_ship && !yes_ship {
-        println!(
-            "note: Ship gate pre-authorized by devflow.toml (yes_ship = true) — see D-12, 28-CONTEXT.md"
-        );
-    }
-    state.yes_ship = yes_ship || config_yes_ship;
     // Persist the operator's gate notify hook for the processes that outlive
     // this one (monitor chain, rate-limit resume), on the same "before
     // `create_run_state`" idiom. Captured here rather than in `State::new`
@@ -361,11 +342,11 @@ pub(crate) fn start(
     // WR-01); `resume` and `advance` apply the same rule (CR-03).
     state.gate_notify_cmd = devflow_core::gates::apply_notify_env(state.gate_notify_cmd.take());
 
-    // R-3: `devflow.toml`'s `fallback_agent` key, combined with the flag the way
-    // `yes_ship` is above: the flag wins when given, the key applies when it is
-    // absent. Resolved unconditionally, also when the flag is given, so a broken
-    // key refuses `start` whatever the flag says: the flag wins the value, it does
-    // not excuse a broken config file (stricter than `base_branch`, whose env
+    // R-3: `devflow.toml`'s `fallback_agent` key, combined with the flag: the
+    // flag wins when given, the key applies when it is absent. Resolved
+    // unconditionally, also when the flag is given, so a broken key refuses
+    // `start` whatever the flag says: the flag wins the value, it does not
+    // excuse a broken config file (stricter than `base_branch`, whose env
     // override skips the file).
     let (fallback_agent, from_config) = match fallback {
         FallbackSource::FlagOrConfig(flag) => {
@@ -398,7 +379,7 @@ pub(crate) fn start(
         state.fallback_agent = Some(fallback);
         print_fallback_notice(fallback, state.agent);
         // A standing default is never a silent one: name the key when it alone
-        // supplied the fallback, as the `yes_ship` notice does.
+        // supplied the fallback.
         if from_config {
             println!(
                 "note: fallback agent {fallback} set by devflow.toml (fallback_agent) — pass \
@@ -464,8 +445,7 @@ fn start_reserved(
 
     // 45-01 / D-01 / AUTO-01: resolve the project's integration trunk once,
     // here, and use the SAME value for every guard and both fork paths below.
-    // Resolved beside `yes_ship` and for the same reason — before anything
-    // is spawned or mutated.
+    // Resolved before anything is spawned or mutated.
     //
     // The resolver is fail-hard on an explicitly supplied value (see its own
     // doc comment): a `main`, blank or flag-shaped base is refused here
@@ -482,10 +462,9 @@ fn start_reserved(
         // local `develop` is untouched.
         ensure_base_is_a_local_branch(project_root, base)?;
     }
-    // CR-02 (45-REVIEW.md): persist the resolved trunk on the same "before
-    // `create_run_state`" idiom `yes_ship` uses directly above, and for
-    // the same reason — `advance`, `resume` and the checkout hooks that
-    // merge this phase branch all run in SEPARATE processes whose
+    // CR-02 (45-REVIEW.md): persist the resolved trunk before
+    // `create_run_state`, because `advance`, `resume` and the checkout hooks
+    // that merge this phase branch all run in SEPARATE processes whose
     // environment need not carry `DEVFLOW_BASE_BRANCH`. Without this the
     // resolved value dies with the `start` process and every later site
     // silently re-resolves `develop`.
@@ -643,8 +622,8 @@ fn start_reserved(
     // `.planning/config.json` the agent will actually read, and before the fork
     // that copy does not exist (F-10). It sits BEFORE
     // `create_run_state` below, matching this function's own
-    // "combine before `create_run_state`" idiom for `yes_ship` and D-11's
-    // opt-out.
+    // "combine before `create_run_state`" idiom for the base branch and
+    // D-11's opt-out.
     //
     // Why `start` needs this at all, and not just `resume`: a freshly forked
     // worktree inherits whatever `develop` carries. A leak that already reached
@@ -2262,7 +2241,7 @@ fn response_pickup_message(status: WaiterStatus) -> &'static str {
 /// watching for.
 ///
 /// `GateError::NoOpenGate`/`AlreadyResponded` are treated as benign races —
-/// a human or `--yes-ship` may have answered the same gate between
+/// a human may have answered the same gate between
 /// `list_open` and `reap` — and counted as skipped rather than returned as
 /// an error; `Gates::reap_answer`'s own refusal to clobber an unconsumed
 /// answer is the first-writer-wins resolution that makes this safe with
@@ -3599,7 +3578,7 @@ fn stop_reap_observed_gate(
             );
             Ok(Some((gate.stage, observed, run_launch, false)))
         }
-        // A human, `--yes-ship`, or `devflow gate sweep` answered this gate
+        // A human or `devflow gate sweep` answered this gate
         // between our scan and this reap. Read its action: an approval or
         // loop-back is not `stop`'s outcome and must fall through to the
         // socket and holder arms; only an abort response can be treated as the
@@ -9492,7 +9471,7 @@ mod tests {
     }
 
     /// Task 2 behavior: a gate that already has a response is a benign race
-    /// (a human or `--yes-ship` may have answered it between `list_open`
+    /// (a human may have answered it between `list_open`
     /// and `reap`) — the sweep must return `Ok` and leave the existing
     /// response byte-for-byte untouched, never overwrite it.
     #[test]
@@ -13912,7 +13891,7 @@ mod tests {
         let phase = PhaseId::new(4901);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
-        state.yes_ship = true;
+        state.base_branch = Some("workspace/example".to_string());
         state.infra_failures = 2;
         workflow::save_state(&state).unwrap();
         let others_before = state_file_without_stop_fields(root, phase);
@@ -14034,7 +14013,6 @@ mod tests {
             false,
             false,
             None,
-            false,
             FallbackSource::FlagOrConfig(None),
         )
         .map_err(|err| err.to_string())
@@ -14127,7 +14105,6 @@ mod tests {
             false,
             false,
             None,
-            false,
             FallbackSource::FlagOrConfig(fallback),
         )
     }
@@ -14578,7 +14555,6 @@ mod tests {
             false,
             false,
             None,
-            false,
             FallbackSource::FlagOrConfig(None),
         )
         .map_err(|err| err.to_string())
@@ -15113,7 +15089,6 @@ mod tests {
             true,
             false,
             None,
-            false,
             FallbackSource::FlagOrConfig(None),
         )
         .map_err(|err| err.to_string())
@@ -16775,7 +16750,6 @@ mod tests {
                 false,
                 false,
                 None,
-                false,
                 FallbackSource::FlagOrConfig(None),
             )
             .expect_err("a stop at a safe point during the gate wait is an error")

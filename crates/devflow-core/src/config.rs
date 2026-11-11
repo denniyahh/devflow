@@ -82,21 +82,6 @@ pub struct DevflowConfig {
     pub review_angles: Option<Vec<String>>,
     /// Whether declared external verification commands may run.
     pub external_verify_enabled: bool,
-    /// Whether the Ship gate is standing pre-authorized for this project
-    /// (D-12, `28-CONTEXT.md`) — the gate's approval is supplied
-    /// automatically and attributed in the gate ledger, exactly as if
-    /// `--yes-ship` had been typed on every invocation. Deliberately
-    /// defaults to `false`, unlike `external_verify_enabled`: an absent
-    /// `devflow.toml`, or one that omits this key, must never pre-authorize
-    /// a Ship. This is a deliberate reversal of Phase 23's own D-05
-    /// (`--yes-ship` was a per-run flag only, never config-persistable, "so
-    /// a standing unattended auto-merge can never become the silent
-    /// default"). The reversal's stated cost, recorded twice: relaxing this
-    /// later is easy, but tightening it after operators depend on a
-    /// persisted setting is not. `commands::start` combines this value with
-    /// the CLI flag via logical OR rather than replacing it, because the
-    /// flag has no negative form — passing `--yes-ship` always wins.
-    pub yes_ship: bool,
     /// The branch this project's DevFlow phase lifecycle integrates on
     /// (45-01 decision D-01, AUTO-01). `None` means the built-in [`DEVELOP`]
     /// constant, which is what every project resolved before this key
@@ -148,7 +133,6 @@ impl Default for DevflowConfig {
             capture_retention: DEFAULT_CAPTURE_RETENTION,
             review_angles: None,
             external_verify_enabled: true,
-            yes_ship: false,
             base_branch: None,
         }
     }
@@ -168,11 +152,6 @@ impl DevflowConfig {
     /// Return whether external verification is enabled.
     pub fn external_verify_enabled(&self) -> bool {
         self.external_verify_enabled
-    }
-
-    /// Return whether the Ship gate is standing pre-authorized (D-12).
-    pub fn yes_ship(&self) -> bool {
-        self.yes_ship
     }
 }
 
@@ -269,27 +248,6 @@ pub fn external_verify_enabled(project_root: &Path) -> bool {
     load_config(project_root).external_verify_enabled
 }
 
-/// Resolve the Ship gate's standing pre-authorization (D-12) with
-/// `DEVFLOW_YES_SHIP` taking precedence over `devflow.toml` and the
-/// built-in `false` default. Mirrors `external_verify_enabled`'s resolver
-/// shape exactly. Note that this resolver is not the only path by which
-/// `state.yes_ship` becomes `true` — `commands::start` also ORs in the
-/// `--yes-ship` CLI flag; this function reports only the config/env-derived
-/// half of that combination.
-pub fn yes_ship(project_root: &Path) -> bool {
-    if let Some(value) = env_value("DEVFLOW_YES_SHIP") {
-        match value.parse() {
-            Ok(enabled) => return enabled,
-            Err(error) => tracing::warn!(
-                value,
-                %error,
-                "invalid DEVFLOW_YES_SHIP; using devflow.toml or default"
-            ),
-        }
-    }
-    load_config(project_root).yes_ship
-}
-
 /// Reject a base-branch value that must never reach a `git` argv or become
 /// this project's integration trunk (45-01, D-01).
 ///
@@ -331,8 +289,8 @@ pub fn validate_base_branch(value: &str) -> Result<(), String> {
 /// `devflow.toml`'s `base_branch` key and the built-in [`DEVELOP`] default.
 ///
 /// **This resolver is deliberately FAIL-HARD on an explicitly supplied
-/// value, unlike its [`yes_ship`] sibling — do not "fix" it to match.** A bad
-/// `yes_ship` bool falls back to `false`, which is the SAFER direction. A bad
+/// value, unlike its fail-soft siblings such as [`external_verify_enabled`] —
+/// do not "fix" it to match.** A bad bool there falls back to a default. A bad
 /// base branch falling back to [`DEVELOP`] would silently redirect the trunk
 /// to a value the operator did not ask for, and it would make this phase's
 /// own `main`-refusal unobservable for the most direct way to configure it:
@@ -469,15 +427,14 @@ struct FallbackAgentKey {
 /// Resolve the standing fallback agent from `devflow.toml`'s `fallback_agent`
 /// key (operator ruling R-3, Phase 51).
 ///
-/// **No environment variable, by operator decision.** Unlike [`yes_ship`],
-/// this key has no `DEVFLOW_*` override: the fallback decides which binary a
-/// detached supervisor may launch later, unattended, and a tracked project
-/// file is the only standing source R-3 allows. `commands::start` combines
-/// it with `--fallback-agent` the way it combines [`yes_ship`] with
-/// `--yes-ship`: the flag wins when given, this value applies when the flag
-/// is absent, and `start` prints a notice naming `devflow.toml` when it
-/// does. Only `devflow start` arms it; `devflow resume` keeps the run's
-/// persisted fallback.
+/// **No environment variable, by operator decision.** Unlike
+/// [`external_verify_enabled`], this key has no `DEVFLOW_*` override: the
+/// fallback decides which binary a detached supervisor may launch later,
+/// unattended, and a tracked project file is the only standing source R-3
+/// allows. `commands::start` combines it with `--fallback-agent`: the flag
+/// wins when given, this value applies when the flag is absent, and `start`
+/// prints a notice naming `devflow.toml` when it does. Only `devflow start`
+/// arms it; `devflow resume` keeps the run's persisted fallback.
 ///
 /// A missing file, or a file without the key, is `Ok(None)`. An unreadable
 /// file follows [`load_config`]'s warn-and-default path and is treated as no
@@ -672,74 +629,6 @@ mod tests {
             },
             "the file parsed (capture_retention is 9) and yes_ship had no effect"
         );
-    }
-
-    /// D-12: an absent `devflow.toml` must never pre-authorize a Ship — the
-    /// deliberate asymmetry with `external_verify_enabled`'s `true` default.
-    #[test]
-    fn yes_ship_defaults_to_false() {
-        assert!(!DevflowConfig::default().yes_ship());
-    }
-
-    /// D-12: no `devflow.toml` present → the resolver falls through to the
-    /// built-in `false` default.
-    #[test]
-    fn yes_ship_missing_file_returns_false() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(!yes_ship(dir.path()));
-    }
-
-    /// D-12: `devflow.toml` setting the key `true` → the resolver returns
-    /// `true`.
-    #[test]
-    fn yes_ship_file_sets_true() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("devflow.toml"), "yes_ship = true\n").unwrap();
-
-        assert!(yes_ship(dir.path()));
-    }
-
-    /// D-12: `devflow.toml` setting the key `false` → the resolver returns
-    /// `false`.
-    #[test]
-    fn yes_ship_file_sets_false() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("devflow.toml"), "yes_ship = false\n").unwrap();
-
-        assert!(!yes_ship(dir.path()));
-    }
-
-    /// D-12: a `devflow.toml` with unrelated keys still loads, and the
-    /// resolver returns the default.
-    #[test]
-    fn yes_ship_unrelated_keys_returns_default() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("devflow.toml"), "capture_retention = 9\n").unwrap();
-
-        assert!(!yes_ship(dir.path()));
-    }
-
-    /// D-12: an unparseable `DEVFLOW_YES_SHIP` value warns and falls back to
-    /// the file/default rather than panicking or returning true.
-    #[test]
-    fn yes_ship_unparseable_env_falls_back_to_file() {
-        let _lock = ENV_MUTEX.lock().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("devflow.toml"), "yes_ship = true\n").unwrap();
-        let _env = EnvOverride::set("DEVFLOW_YES_SHIP", "not-a-bool");
-
-        assert!(yes_ship(dir.path()));
-    }
-
-    /// D-12: env beats file, matching every sibling resolver.
-    #[test]
-    fn env_overrides_file_yes_ship() {
-        let _lock = ENV_MUTEX.lock().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("devflow.toml"), "yes_ship = false\n").unwrap();
-        let _env = EnvOverride::set("DEVFLOW_YES_SHIP", "true");
-
-        assert!(yes_ship(dir.path()));
     }
 
     // -----------------------------------------------------------------
@@ -1083,7 +972,7 @@ mod tests {
 
         assert_eq!(resolve(None), Ok(None), "no devflow.toml arms nothing");
         assert_eq!(
-            resolve(Some("yes_ship = true\n")),
+            resolve(Some("capture_retention = 9\n")),
             Ok(None),
             "a file without the key arms nothing"
         );

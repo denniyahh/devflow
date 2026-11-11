@@ -957,8 +957,6 @@ fn unattended_planned_checkpoint_condition(launch_root: &Path, state: &State) ->
 /// **D-09: there is no override, and its absence is a decision, not an
 /// oversight.** No flag, no environment variable, no config key, and no
 /// parameter beyond `(&Path, &State)` turns this refusal into a warning.
-/// `state.yes_ship` authorizes the Ship gate and nothing else; that
-/// non-interaction is pinned by `unattended_check_is_not_bypassed_by_yes_ship`.
 /// **Both external review lanes objected to this on record** — a false-positive
 /// refusal has no in-product recovery — and the operator heard the objection
 /// and let the decision stand (registered as T-35.1-15, disposition `accept`).
@@ -3932,27 +3930,6 @@ mod tests {
             preflight_unattended_launch_check(dir.path(), &state).is_ok(),
             "D-08: an operator rehearsing viability must not be blocked out of a \
              supervised run by the rehearsal"
-        );
-    }
-
-    /// F-13 / D-09. `state.yes_ship` authorizes the Ship gate and NOTHING else.
-    /// A launch-prerequisite bypass arriving through it would be D-09's
-    /// prohibition through a side door, so the non-interaction is pinned here
-    /// rather than left to the reader of `run_gate`'s signature.
-    #[test]
-    fn unattended_check_is_not_bypassed_by_yes_ship() {
-        let (dir, mut state) = viable_unattended_fixture(PhaseId::new(89));
-        std::fs::remove_file(dir.path().join(".planning/config.json")).unwrap();
-
-        assert!(
-            preflight_unattended_launch_check(dir.path(), &state).is_err(),
-            "precondition: the fixture must refuse before yes_ship is involved"
-        );
-        state.yes_ship = true;
-        assert!(
-            preflight_unattended_launch_check(dir.path(), &state).is_err(),
-            "yes_ship must not convert a refusal into a pass — it authorizes the \
-             Ship gate and nothing else (F-13)"
         );
     }
 

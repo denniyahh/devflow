@@ -6530,10 +6530,9 @@ mod tests {
         let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
         state.stage = Stage::Validate;
         state.worktree_path = Some(worktree);
-        state.yes_ship = true;
         workflow::save_state(&state).unwrap();
         workflow::update_state(root, phase, |on_disk| {
-            on_disk.yes_ship = false;
+            on_disk.base_branch = Some("workspace/concurrent".to_string());
             Ok::<(), workflow::WorkflowError>(())
         })
         .unwrap();
@@ -6547,7 +6546,11 @@ mod tests {
         assert_eq!(after.last_verification_fingerprint, observed.0);
         assert_eq!(after.last_verification_mtime_nanos, observed.1);
         assert!(after.verification_baseline_captured);
-        assert!(!after.yes_ship, "the concurrent revoke is kept");
+        assert_eq!(
+            after.base_branch.as_deref(),
+            Some("workspace/concurrent"),
+            "the concurrent write is kept"
+        );
     }
 
     // ---- D-15 delivery-canary gate (31-03) ------------------------------
@@ -12094,122 +12097,6 @@ mod tests {
         assert_eq!(stage_launched_count(&run.root, run.phase), 1);
     }
 
-    // ---- CR-01 (50-REVIEW.md): a stop before a `--yes-ship` merge ----
-
-    /// Whether `branch` exists in the repo at `root`.
-    fn branch_exists(root: &Path, branch: &str) -> bool {
-        devflow_core::test_support::git_command(root)
-            .args(["rev-parse", "--verify", "--quiet", branch])
-            .status()
-            .unwrap()
-            .success()
-    }
-
-    /// The body of the `--yes-ship` pair: stage N is Ship with `--yes-ship`
-    /// and a feature branch, and its advance is held at the configured point.
-    /// With `stop`, a socket stop is taken there (owner `advancing`, so it is
-    /// only flagged) before the release: the advance must not finish, must
-    /// record the stop at `safe_point` and answer the caller `stopped`.
-    /// Without it (the control) the run finishes. Neither touches the branch.
-    fn held_yes_ship_advance(phase: PhaseId, stop: bool, safe_point: u8) {
-        let _guard = env_lock();
-        let branch = format!("feature/phase-{}", phase.padded());
-        let run = HandoffRun::launch_with(phase, |root, state| {
-            assert!(
-                devflow_core::test_support::git_command(root)
-                    .args(["branch", &branch, "develop"])
-                    .status()
-                    .unwrap()
-                    .success()
-            );
-            state.stage = Stage::Ship;
-            state.yes_ship = true;
-            state.stop_until = None;
-        });
-        run.go();
-        run.wait_held();
-        if stop {
-            let (accepted, last) = shutdown_accepted_then(
-                &run.n.socket_path,
-                || run.release(),
-                Duration::from_secs(30),
-            );
-            assert_eq!(accepted["owner"], "advancing", "{accepted}");
-            assert!(
-                events_named(&run.root, "workflow_finished").is_empty(),
-                "a stop accepted before the --yes-ship approval must not finish the run: {}",
-                run.events()
-            );
-            assert!(
-                branch_exists(&run.root, &branch),
-                "the feature branch is kept"
-            );
-            let state = run.state();
-            assert!(
-                state.stopped,
-                "state.stopped after a stop at safe point {safe_point}"
-            );
-            assert_eq!(state.stop_reason.as_deref(), Some(ADVANCE_STOP_REASON));
-            assert!(!state.gate_pending, "no gate is left pending");
-            assert!(gate_answer_files(&run.root, run.phase, Stage::Ship).is_empty());
-            let stopped = events_named(&run.root, "advance_stopped");
-            assert_eq!(stopped.len(), 1, "{}", run.events());
-            assert_eq!(stopped[0]["safe_point"], safe_point, "{}", stopped[0]);
-            assert_eq!(
-                last["stopped"], true,
-                "the stop's caller reads stopped: {last}"
-            );
-        } else {
-            run.release();
-            assert!(
-                poll_until(HANDOFF_STEP_WAIT, || events_named(
-                    &run.root,
-                    "workflow_finished"
-                )
-                .len()
-                    == 1),
-                "control: without a stop the --yes-ship run finishes: {}",
-                run.events()
-            );
-            assert!(
-                run.state().finished,
-                "control: the run is recorded finished"
-            );
-            assert!(
-                branch_exists(&run.root, &branch),
-                "control: the feature branch is kept"
-            );
-            assert!(events_named(&run.root, "advance_stopped").is_empty());
-        }
-    }
-
-    /// CR-01, safe point 5: a stop accepted after safe point 1 and before
-    /// `--yes-ship` writes its approval stops the run there. The pre-written
-    /// approval would otherwise beat the stop in the gate wait and finish the
-    /// run.
-    #[test]
-    fn a_stop_after_safe_point_1_is_honoured_before_the_yes_ship_approval() {
-        const NAME: &str = "pipeline_launch::tests::a_stop_after_safe_point_1_is_honoured_before_the_yes_ship_approval";
-        if !devflow_core::test_support::in_child_test(NAME) {
-            run_handoff_child(NAME, Some("after_safe_point_1"), SUCCESS_MARKER);
-            return;
-        }
-        held_yes_ship_advance(PhaseId::new(1314), true, 5);
-    }
-
-    /// The control for safe point 5: the same hold and no stop, and the
-    /// `--yes-ship` run finishes.
-    #[test]
-    fn without_a_stop_after_safe_point_1_the_yes_ship_run_finishes() {
-        const NAME: &str =
-            "pipeline_launch::tests::without_a_stop_after_safe_point_1_the_yes_ship_run_finishes";
-        if !devflow_core::test_support::in_child_test(NAME) {
-            run_handoff_child(NAME, Some("after_safe_point_1"), SUCCESS_MARKER);
-            return;
-        }
-        held_yes_ship_advance(PhaseId::new(1315), false, 5);
-    }
-
     /// R-10: a SIGKILL of N between N+1's publish and N's unlink (N parked
     /// at `after_publish`) leaves the state naming the live N+1, and N's
     /// leftover socket probes Stale with a sidecar whose launch id differs
@@ -15664,10 +15551,9 @@ mod tests {
         state.stopped = true;
         state.stop_reason = Some("stopped after code completed (--until code)".to_string());
         state.stop_until = Some(Stage::Code);
-        state.yes_ship = true;
         workflow::save_state(&state).unwrap();
         workflow::update_state(root, phase, |on_disk| {
-            on_disk.yes_ship = false;
+            on_disk.base_branch = Some("workspace/concurrent".to_string());
             Ok::<(), workflow::WorkflowError>(())
         })
         .unwrap();
@@ -15680,7 +15566,11 @@ mod tests {
         result.unwrap();
 
         let after = workflow::load_state(root, phase).unwrap();
-        assert!(!after.yes_ship, "the revoke survives the resume");
+        assert_eq!(
+            after.base_branch.as_deref(),
+            Some("workspace/concurrent"),
+            "the other writer's change survives the resume"
+        );
         assert!(!after.stopped);
         assert_eq!(after.stop_reason, None);
         assert_eq!(after.stop_until, None);
