@@ -1995,6 +1995,16 @@ pub(crate) enum GateAnswerKind {
     Abort,
 }
 
+impl GateAnswerKind {
+    /// The word `gate_respond`'s pickup line opens with.
+    fn past_tense(self) -> &'static str {
+        match self {
+            GateAnswerKind::Approve => "approved",
+            GateAnswerKind::Reject | GateAnswerKind::Abort => "rejected",
+        }
+    }
+}
+
 /// Answer the gate the operator observed: the id they passed, or the id of the
 /// stage's open gate in this command's one [`Gates::list_open`] read. The id is
 /// fixed here and only re-checked afterwards, so a decision about one gate cannot
@@ -2054,11 +2064,7 @@ pub(crate) fn gate_respond(
     };
     println!(
         "{} gate for phase {phase} {stage} — response was written; {pickup} (response at {})",
-        if response.approved {
-            "approved"
-        } else {
-            "rejected"
-        },
+        kind.past_tense(),
         path.display()
     );
     Ok(())
@@ -9558,6 +9564,35 @@ mod tests {
         let event = devflow_core::events::last_event_for_phase(root, PhaseId::new(15)).unwrap();
         assert_eq!(event["event"], "gate_response_written");
         assert_eq!(event["stage"], "validate");
+        registration.finish();
+    }
+
+    #[test]
+    fn gate_respond_reports_an_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(16);
+        let (_, registration) =
+            Gates::open_registered(root, phase, Stage::Code, "relaunch Code?").unwrap();
+
+        gate_respond(
+            root,
+            phase,
+            Some(Stage::Code),
+            GateAnswerKind::Abort,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let event = devflow_core::events::last_event_for_phase(root, phase).unwrap();
+        assert_eq!(event["event"], "gate_response_written");
+        assert_eq!(event["abort"], true, "{event}");
+        assert_eq!(event["approved"], false, "{event}");
+        assert_eq!(GateAnswerKind::Abort.past_tense(), "aborted");
+        // Control: the other two answers keep their own words.
+        assert_eq!(GateAnswerKind::Reject.past_tense(), "rejected");
+        assert_eq!(GateAnswerKind::Approve.past_tense(), "approved");
         registration.finish();
     }
 
