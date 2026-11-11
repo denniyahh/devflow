@@ -98,8 +98,10 @@ pub(crate) fn retry_after_from_reason(reason: Option<&str>) -> String {
 /// Not an infra failure: `infra_failures` is untouched, so the infra ceiling
 /// cannot abort a run that is only waiting for quota. No cron-instructions file
 /// is written and no `rate_limit_resume_scheduled` event is emitted; nothing
-/// ever acted on either (999.186). The one automatic relaunch at the reset time
-/// is not part of this path yet (52-32).
+/// ever acted on either (999.186). The gate's wait arms the run's one automatic
+/// relaunch at the reset plus the margin while it is unused
+/// ([`crate::pipeline_gate::rate_limit_timer_deadline`], D-38, D-45 rule 5), and
+/// keeps the gate open past the gate timeout until then (D-27.2).
 pub(crate) fn handle_rate_limited_outcome(
     project_root: &Path,
     state: &mut State,
@@ -5091,7 +5093,7 @@ mod tests {
         std::fs::create_dir_all(root.join(".devflow")).unwrap();
         std::fs::write(
             agent_result::stdout_path(root, phase),
-            r#"{"type":"result","subtype":"error_rate_limit","retry_after":"2026-06-18T15:45:30Z"}"#,
+            r#"{"type":"result","subtype":"error_rate_limit","retry_after":"2099-06-18T15:45:30Z"}"#,
         )
         .unwrap();
 
@@ -5758,7 +5760,7 @@ mod tests {
                 &mut state,
                 phase,
                 Stage::Code,
-                Some("rate limited until 2026-06-18T15:45:30Z".into()),
+                Some("rate limited until 2099-06-18T15:45:30Z".into()),
             )
             .unwrap();
         });
@@ -5777,7 +5779,7 @@ mod tests {
             .find(&format!("`devflow resume --phase {phase}`"))
             .expect("the context names the resume command");
         let reset = context
-            .find("the limit resets at 2026-06-18T15:45:30Z")
+            .find("the limit resets at 2099-06-18T15:45:30Z")
             .expect("the context names the reset time");
         let cause = context
             .find("Cause: rate limited until")
@@ -8304,7 +8306,7 @@ mod tests {
                     &mut state,
                     phase,
                     stage,
-                    Some("rate limited until 2026-06-18T15:45:30Z".into()),
+                    Some("rate limited until 2099-06-18T15:45:30Z".into()),
                 );
             });
             assert_eq!(gate["gate_kind"], "rate_limit", "{row}: {gate}");
@@ -8325,6 +8327,39 @@ mod tests {
             assert!(
                 leads_with_only(&planted, &sentence).is_err(),
                 "{row}: control: {planted}"
+            );
+            // 52-32: right after the sentence come the exact resume command
+            // (with `--agent`, the run is on codex) and the reset time, both
+            // inside the shared display cut the banner and notify hook show.
+            let resume = format!("`devflow resume --phase {phase} --agent codex`");
+            let reset = "the limit resets at 2099-06-18T15:45:30Z";
+            let shown_after_sentence = |context: &str| {
+                let shown: String = context
+                    .chars()
+                    .take(devflow_core::gates::GATE_CONTEXT_DISPLAY_CHARS)
+                    .collect();
+                let after = shown.find(&sentence).map(|at| at + sentence.len());
+                after.is_some_and(|after| {
+                    let rest = &shown[after..];
+                    rest.starts_with(&format!(" stage {stage} failed: "))
+                        && rest.contains(&resume)
+                        && rest.contains(reset)
+                })
+            };
+            assert!(
+                shown_after_sentence(context),
+                "{row}: the resume command and the reset follow the sentence inside the cut: \
+                 {context}"
+            );
+            // Control: the same text pushed past the cut by a long insertion fails.
+            let pushed = context.replacen(
+                &format!(" stage {stage} failed: "),
+                &format!(" stage {stage} failed: {} ", "x".repeat(400)),
+                1,
+            );
+            assert!(
+                !shown_after_sentence(&pushed),
+                "{row}: control: a reset past the display cut must fail: {pushed}"
             );
         }
 
@@ -8847,7 +8882,7 @@ mod tests {
                                     &mut state,
                                     phase,
                                     stage,
-                                    Some("rate limited until 2026-06-18T15:45:30Z".into()),
+                                    Some("rate limited until 2099-06-18T15:45:30Z".into()),
                                 );
                             });
                         assert_eq!(gate["gate_kind"], "rate_limit", "{row}: {gate}");

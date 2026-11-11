@@ -26,9 +26,7 @@ use crate::pipeline_launch::{
     launch_stage,
 };
 use crate::pipeline_outcomes::{Answer, FinishPermit, truncate_reason};
-#[cfg(test)]
-use devflow_core::gates::GateId;
-use devflow_core::gates::{self, Claim, GateAction, GateFile, GateLabel, Gates};
+use devflow_core::gates::{self, Claim, GateAction, GateFile, GateId, GateKind, GateLabel, Gates};
 use devflow_core::mode;
 #[cfg(test)]
 use devflow_core::phase_id::PhaseId;
@@ -37,7 +35,7 @@ use devflow_core::stage::Stage;
 use devflow_core::state::State;
 #[cfg(test)]
 use devflow_core::workflow;
-use devflow_core::{events, registry};
+use devflow_core::{events, registry, reset_time};
 use std::path::Path;
 use tracing::info;
 
@@ -469,6 +467,175 @@ fn note_claim(claim: &Result<Claim, devflow_core::gates::GateError>) {
     }
 }
 
+/// When the rate-limit gate `gate`'s one automatic relaunch wakes, or `None`
+/// when no timer is armed (CUT-03, D-16, D-38, D-45 rule 5). The one arming
+/// decision every path takes (a first open, a resume, a takeover): armed only
+/// for a gate whose file records [`GateKind::RateLimit`] and a not-before time
+/// (the reset plus [`reset_time::RATE_LIMIT_RELAUNCH_MARGIN_SECS`]), and only
+/// while the run's [`State::rate_limit_auto_relaunch_used`] is false. The wake
+/// is that not-before time whatever the gate's lifetime.
+pub(crate) fn rate_limit_timer_deadline(state: &State, gate: &GateFile) -> Option<i64> {
+    if state.rate_limit_auto_relaunch_used || gate.gate_kind != Some(GateKind::RateLimit) {
+        return None;
+    }
+    gate.not_before
+}
+
+/// When `gate`, opened at `opened_at` (epoch seconds), stops waiting for an
+/// answer: `timeout_secs` after it opened, or for a rate-limit gate with a
+/// not-before time the later of that and the not-before time
+/// ([`reset_time::rate_limit_wait_bound`], D-27.2). Saturates instead of
+/// overflowing on an absurd timeout.
+pub(crate) fn gate_lifetime_deadline(opened_at: i64, gate: &GateFile, timeout_secs: u64) -> i64 {
+    let secs = match (gate.gate_kind, gate.not_before) {
+        (Some(GateKind::RateLimit), Some(not_before)) => reset_time::rate_limit_wait_bound(
+            opened_at,
+            not_before.saturating_sub(reset_time::RATE_LIMIT_RELAUNCH_MARGIN_SECS),
+            timeout_secs,
+        ),
+        _ => timeout_secs,
+    };
+    opened_at.saturating_add(i64::try_from(secs).unwrap_or(i64::MAX))
+}
+
+/// Which of a gate wait's two deadlines is due at a poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DueDeadline {
+    /// The armed rate-limit timer's wake: the timer answers the gate.
+    Wake,
+    /// The gate's lifetime: the wait ends unanswered.
+    Lifetime,
+}
+
+/// The per-poll choice between a gate wait's armed timer `wake` and its
+/// `lifetime` at `now` (D-45 rule 5, U8). The wake is checked first, so at
+/// equal deadlines (a reset later than the gate timeout, where the lifetime is
+/// the wake) the timer answers rather than the wait timing out. `None` while
+/// neither is due.
+pub(crate) fn due_gate_deadline(now: i64, wake: Option<i64>, lifetime: i64) -> Option<DueDeadline> {
+    if wake.is_some_and(|wake| now >= wake) {
+        Some(DueDeadline::Wake)
+    } else if now >= lifetime {
+        Some(DueDeadline::Lifetime)
+    } else {
+        None
+    }
+}
+
+/// The current time in epoch seconds, the `now` of a gate wait's polls.
+fn epoch_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
+        })
+}
+
+/// Wait on the gate `gate_id` with its two deadlines kept apart (D-45 rule 5):
+/// the armed rate-limit timer's wake ([`rate_limit_timer_deadline`]) and the
+/// gate's lifetime ([`gate_lifetime_deadline`]), chosen per poll by
+/// [`due_gate_deadline`]. A gate that is not a rate-limit gate waits exactly as
+/// before, for `timeout_secs`. When the wake is due the timer answers once
+/// ([`answer_as_rate_limit_timer`]) and the wait goes on, so the answer, the
+/// timer's or an operator's, is picked up and claimed like any answer.
+fn wait_with_rate_limit_timer(
+    project_root: &Path,
+    state: &mut State,
+    stage: Stage,
+    gate_id: &GateId,
+    timeout_secs: u64,
+) -> Result<crate::pipeline_launch::GateWaitEnd, CliError> {
+    use crate::pipeline_launch::GateWaitEnd;
+    let opened_at = epoch_now();
+    let gate = read_gate_file(project_root, state.phase, stage).filter(|gate| {
+        gate.gate_id == gate_id.as_str() && gate.gate_kind == Some(GateKind::RateLimit)
+    });
+    let Some(gate) = gate else {
+        return gate_wait_call(project_root, state.phase, stage, gate_id, timeout_secs);
+    };
+    let mut wake = rate_limit_timer_deadline(state, &gate);
+    let lifetime = gate_lifetime_deadline(opened_at, &gate, timeout_secs);
+    loop {
+        let now = epoch_now();
+        match due_gate_deadline(now, wake, lifetime) {
+            Some(DueDeadline::Wake) => {
+                // Disarmed for the rest of this wait whatever the write did: the
+                // timer answers a gate at most once.
+                wake = None;
+                answer_as_rate_limit_timer(project_root, state, stage, gate_id)?;
+                continue;
+            }
+            Some(DueDeadline::Lifetime) => return Ok(GateWaitEnd::TimedOut),
+            None => {}
+        }
+        let next = wake.map_or(lifetime, |wake| wake.min(lifetime));
+        let secs = u64::try_from(next.saturating_sub(now)).unwrap_or(0).max(1);
+        match gate_wait_call(project_root, state.phase, stage, gate_id, secs)? {
+            GateWaitEnd::TimedOut => {}
+            end => return Ok(end),
+        }
+    }
+}
+
+/// The timer's one answer to the rate-limit gate `gate_id` (D-38, D-45 rule
+/// 5). The run's [`State::rate_limit_auto_relaunch_used`] is committed first,
+/// durably, and only then is the approve written
+/// ([`Gates::rate_limit_timer_answer`]), so a crash after the commit leaves no
+/// automatic relaunch rather than two: nothing re-arms a timer or re-publishes
+/// its answer. When an operator answered first (`AlreadyResponded`) the flag is
+/// committed back to false, because the operator's answer does not spend it,
+/// and the wait takes that answer. Any other failure keeps the flag spent,
+/// since this cannot tell whether an answer was written, and says so.
+fn answer_as_rate_limit_timer(
+    project_root: &Path,
+    state: &mut State,
+    stage: Stage,
+    gate_id: &GateId,
+) -> Result<(), CliError> {
+    commit(state, |s| s.rate_limit_auto_relaunch_used = true)?;
+    let written = fenced(project_root, state.phase, || {
+        Ok(Gates::rate_limit_timer_answer(
+            project_root,
+            state.phase,
+            stage,
+            gate_id,
+        ))
+    })?;
+    let outcome = match written {
+        Ok(_) => {
+            println!(
+                "phase {}: the rate limit's reset has passed; the timer approved the {stage} \
+                 gate, so the stage relaunches once on the same agent",
+                state.phase
+            );
+            "answered"
+        }
+        Err(gates::GateError::AlreadyResponded { .. }) => {
+            commit(state, |s| s.rate_limit_auto_relaunch_used = false)?;
+            "operator_answered_first"
+        }
+        Err(err) => {
+            eprintln!(
+                "phase {}: the rate-limit timer could not answer the {stage} gate {gate_id}: \
+                 {err}; the run's automatic relaunch is spent and the gate waits for an operator",
+                state.phase
+            );
+            "failed"
+        }
+    };
+    events::emit(
+        project_root,
+        state.phase,
+        "rate_limit_timer_fired",
+        serde_json::json!({
+            "stage": stage.to_string(),
+            "gate_id": gate_id.as_str(),
+            "outcome": outcome,
+        }),
+    );
+    Ok(())
+}
+
 /// Open a gate and block (in the detached monitor) until its answer or the long
 /// timeout, consuming the answer through its claim. See [`run_gate_with_timeout`].
 pub(crate) fn run_gate(
@@ -617,14 +784,14 @@ fn open_and_await(
             "notify_fired",
             serde_json::json!({ "stage": stage.to_string(), "unexpected": unexpected }),
         );
-        let wait_end = match gate_wait_call(project_root, state.phase, stage, gate_id, timeout_secs)
-        {
-            Ok(end) => end,
-            Err(err) => {
-                registration.finish();
-                return Err(err);
-            }
-        };
+        let wait_end =
+            match wait_with_rate_limit_timer(project_root, state, stage, gate_id, timeout_secs) {
+                Ok(end) => end,
+                Err(err) => {
+                    registration.finish();
+                    return Err(err);
+                }
+            };
         match wait_end {
             GateWaitEnd::Answered(response) => {
                 // R10: the gate file as it is on disk names the answer's family.
@@ -694,7 +861,6 @@ fn open_and_await(
                 // edited notify command) is kept, because this
                 // write re-reads the state and sets only this field.
                 commit(state, |s| s.gate_pending = false)?;
-                let action = GateAction::from_response(&response);
                 // D-45 rule 2: the answer is routed here, after its claim, so
                 // `gate_resolved` names the route it runs and the evidence a
                 // verification approve was routed on. The screen passed, so the
@@ -709,6 +875,9 @@ fn open_and_await(
                     gsd_status: label.gsd_status,
                     not_before: label.not_before,
                 });
+                // The rate-limit gate's own mapping (52-31): its approve or reject
+                // is a relaunch, which `gate_resolved` names as one.
+                let action = GateAction::from_gate_answer(gate_file.gate_kind, &response);
                 let answer = crate::pipeline_outcomes::route_answer(
                     project_root,
                     state,
