@@ -1258,28 +1258,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(61);
-        let early_gate = Gates::gate_path(root, phase, Stage::Define);
-        let later_gate = Gates::gate_path(root, phase, Stage::Plan);
-        Gates::write_gate(root, phase, Stage::Define, "leftover").unwrap();
+        let early_gate = Gates::gate_path(root, phase, Stage::Plan);
+        let later_gate = Gates::gate_path(root, phase, Stage::Code);
+        Gates::write_gate(root, phase, Stage::Plan, "leftover").unwrap();
         std::fs::create_dir_all(&later_gate).unwrap();
 
         let report = clean_phase_report(root, phase).expect("clean");
 
         assert!(
             !early_gate.exists(),
-            "the early Define gate must have been removed before the failure"
+            "the early Plan gate must have been removed before the failure"
         );
         assert!(
             later_gate.is_dir(),
-            "the Plan gate directory is the negative control for this failure"
+            "the Code gate directory is the negative control for this failure"
         );
         assert!(
             report.removal_failed,
-            "the Plan gate directory must be reported as a failed removal"
+            "the Code gate directory must be reported as a failed removal"
         );
         assert!(
             report.removed_anything,
-            "the Define gate was removed before the Plan removal failed"
+            "the Plan gate was removed before the Code removal failed"
         );
     }
 
@@ -2145,7 +2145,7 @@ mod tests {
                 })
                 .unwrap();
                 let (opened, registration) =
-                    Gates::open_registered(root, phase, Stage::Define, "run B").unwrap();
+                    Gates::open_registered(root, phase, Stage::Plan, "run B").unwrap();
                 *hook_run_b.borrow_mut() = Some((
                     std::fs::read(workflow::state_path(root, phase)).unwrap(),
                     opened.path,

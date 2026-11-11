@@ -92,9 +92,9 @@ impl AgentDriver for CodexDriver {
         use crate::stage::Stage;
         match stage {
             // Codex cannot run the interactive discuss-phase interview or the
-            // interactive plan-phase decision headless — its Define/Plan stages
-            // need the artifact to pre-exist (13-06 dogfood finding).
-            Stage::Define | Stage::Plan => InteractivityMode::RequiresExistingArtifact,
+            // interactive plan-phase decision headless — its Plan stage needs
+            // the artifact to pre-exist (13-06 dogfood finding).
+            Stage::Plan => InteractivityMode::RequiresExistingArtifact,
             _ => InteractivityMode::HeadlessSafe,
         }
     }

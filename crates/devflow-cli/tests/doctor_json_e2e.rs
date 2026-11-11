@@ -56,7 +56,7 @@ fn phase_one_gate_waiters(home: &common::HermeticHome, root: &Path) -> Vec<serde
     waiters
 }
 
-/// Every phase-1 entry names the open Define gate: `live` while this process holds
+/// Every phase-1 entry names the open Plan gate: `live` while this process holds
 /// its registration, `absent` once it finishes. `finish` removes the registration
 /// file, so the second run reads it missing, with no wait on a lock's release.
 /// `devflow status` is refused `--json`, so a consumer of the wrong command fails
@@ -68,15 +68,15 @@ fn doctor_json_names_the_open_gates_waiter() {
     let root = dir.path();
     let phase = PhaseId::new(1);
     let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-    state.stage = Stage::Define;
+    state.stage = Stage::Plan;
     state.gate_pending = true;
     devflow_core::workflow::save_state(&state).unwrap();
     let (opened, registration) =
-        Gates::open_registered(root, phase, Stage::Define, "approve the definition").unwrap();
+        Gates::open_registered(root, phase, Stage::Plan, "approve the plan").unwrap();
     let gate_id = opened.gate_id.as_str();
 
     let expected =
-        |status: &str| serde_json::json!({"stage": "define", "gate_id": gate_id, "status": status});
+        |status: &str| serde_json::json!({"stage": "plan", "gate_id": gate_id, "status": status});
     for waiter in phase_one_gate_waiters(&home, root) {
         assert_eq!(waiter, expected("live"), "while the registration is held");
     }

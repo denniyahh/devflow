@@ -3,7 +3,7 @@
 //! Mode is a per-session CLI flag on `devflow start` — there is no config file
 //! and no per-phase toggling.
 //!
-//! - **Auto:** Define and Plan run once. Code ↔ Validate auto-loop until clean,
+//! - **Auto:** Plan runs once. Code ↔ Validate auto-loop until clean,
 //!   and a passing Validate finishes the run. No human gate fires unless
 //!   Validate fails [`MAX_CONSECUTIVE_FAILURES`] times in a row, which forces a
 //!   gate.
@@ -128,7 +128,7 @@ const _: () = assert!(MAX_CHECKPOINT_RESUMES > 0 && MAX_CHECKPOINT_RESUMES <= MA
 /// [`MAX_CONSECUTIVE_FAILURES`] — the ceiling that exists specifically to
 /// bound this loop — is unreachable (18d). Every other transition is
 /// genuine forward progress out of the Code↔Validate loop (or the initial
-/// Define→Plan→Code entry into it) and correctly clears the counter.
+/// Plan→Code entry into it) and correctly clears the counter.
 ///
 /// This rule deliberately does NOT apply to
 /// [`crate::state::State::infra_failures`], whose unconditional reset in
@@ -327,7 +327,7 @@ mod tests {
 
     #[test]
     fn non_gate_stages_never_gate() {
-        for stage in [Stage::Define, Stage::Plan, Stage::Code] {
+        for stage in [Stage::Plan, Stage::Code] {
             assert!(!Mode::Auto.should_gate(stage, 99, 99));
             assert!(!Mode::Supervise.should_gate(stage, 99, 99));
         }
@@ -408,10 +408,6 @@ mod tests {
         // Enumerated explicitly (not a negation of the skip case above) so a
         // future Stage variant added to the linear chain doesn't silently
         // fall through un-asserted.
-        assert!(transition_resets_consecutive_failures(
-            Stage::Define,
-            Stage::Plan
-        ));
         assert!(transition_resets_consecutive_failures(
             Stage::Plan,
             Stage::Code

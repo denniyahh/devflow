@@ -156,9 +156,6 @@ self-resolve or approve one under any circumstances, and report it instead. ",
 /// renders a Codex-native instruction with no `/gsd-*` string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StageIntent {
-    Define {
-        phase: PhaseId,
-    },
     Plan {
         phase: PhaseId,
     },
@@ -175,7 +172,6 @@ impl StageIntent {
     /// The stage this intent drives.
     pub fn stage(&self) -> Stage {
         match self {
-            StageIntent::Define { .. } => Stage::Define,
             StageIntent::Plan { .. } => Stage::Plan,
             StageIntent::Code { .. } => Stage::Code,
             StageIntent::Validate { .. } => Stage::Validate,
@@ -199,7 +195,6 @@ impl StageIntent {
         _project_root: Option<&Path>,
     ) -> Self {
         match stage {
-            Stage::Define => StageIntent::Define { phase },
             Stage::Plan => StageIntent::Plan { phase },
             Stage::Code => StageIntent::Code { phase, fix: None },
             Stage::Validate => StageIntent::Validate { phase },
@@ -296,12 +291,7 @@ fn validate_stage_prompt(phase: PhaseId) -> String {
 /// interactive dead end. This is idempotency for a completed stage, NOT the
 /// v1 skip-stage config flags removed by the 2026-06-19 architecture
 /// decision — a stage with no pre-existing artifact still runs in full.
-///
-/// D-14 update: Define used to share this branch (dispatched by a `stage`
-/// parameter), but its missing-artifact arm ran an interactive interview
-/// command that cannot be answered headlessly. That branch was deleted
-/// rather than made conditional — see [`define_stage_prompt`] for Define's
-/// actual (always-no-op) contract. This function now serves only Plan.
+/// It serves Plan only.
 fn idempotent_stage_prompt(phase: PhaseId) -> String {
     let artifact = "PLAN.md";
     let command = gsd_command_for(Stage::Plan, phase);
@@ -320,31 +310,6 @@ fn idempotent_stage_prompt(phase: PhaseId) -> String {
         - If it does NOT exist: run the GSD workflow command for this stage:\n\
         \n\
         \x20   {command}\n\
-        \n\
-        {COMPLETION_PROTOCOL}"
-    )
-}
-
-/// The Define stage's dedicated prompt (D-14).
-///
-/// Headless-safety rationale: `idempotent_stage_prompt`'s missing-artifact
-/// arm used to run an interactive interview command for Define — one that
-/// hangs or errors under `claude -p` with no operator present to answer it
-/// (T-28-08). D-14 settles the fix as deletion, not disambiguation: the
-/// Define stage never runs that command in a DevFlow launch, whether or not
-/// CONTEXT.md already exists. The operator decides whether to run the
-/// interview before invoking `devflow start`; DevFlow makes no runtime
-/// accommodation for that choice.
-fn define_stage_prompt(phase: PhaseId) -> String {
-    format!(
-        "This is the Define stage of a headless DevFlow run for phase {phase}.\n\
-        \n\
-        There is no agent work to perform here. Whether or not this phase's \
-        CONTEXT.md already exists, you must NOT run an interactive \
-        discuss-phase or interview command, and you must NOT ask for input \
-        — this run is headless and no operator is available to answer \
-        interactive questions. Do NOT modify any existing planning \
-        artifacts.\n\
         \n\
         {COMPLETION_PROTOCOL}"
     )
@@ -394,7 +359,6 @@ fn code_stage_prompt(phase: PhaseId) -> String {
 /// drift apart, and the per-stage snapshot tests pin it.
 pub fn render_claude_style(intent: &StageIntent) -> String {
     match intent {
-        StageIntent::Define { phase } => define_stage_prompt(*phase),
         StageIntent::Plan { phase } => idempotent_stage_prompt(*phase),
         StageIntent::Code { phase, fix: None } => code_stage_prompt(*phase),
         StageIntent::Code {
@@ -412,14 +376,11 @@ pub fn render_claude_style(intent: &StageIntent) -> String {
 /// GSD slash command.
 /// Render a [`StageIntent`] for an agent that cannot receive the legacy
 /// `/gsd-*` slash command (Codex, Pi). Each stage's *contract* is preserved —
-/// Validate verdict, Define no-op, Plan idempotency — but the
+/// Validate verdict, Plan idempotency — but the
 /// instruction references the workflow file under `workflow_root` (a per-driver
 /// path) instead of naming a slash command.
 pub fn render_workflow_style(intent: &StageIntent, workflow_root: &str) -> String {
     match intent {
-        // D-14: Define is a no-op for every agent — `define_stage_prompt`
-        // already carries no slash command, so it is shared verbatim.
-        StageIntent::Define { phase } => define_stage_prompt(*phase),
         StageIntent::Plan { phase } => workflow_plan_prompt(*phase, workflow_root),
         StageIntent::Code { phase, fix } => workflow_code_prompt(*phase, *fix, workflow_root),
         StageIntent::Validate { phase } => workflow_validate_prompt(*phase, workflow_root),
@@ -600,8 +561,6 @@ mod tests {
 
     #[test]
     fn each_stage_prompt_carries_its_gsd_command_and_marker() {
-        // Define is excluded here (D-14): its prompt never contains its GSD
-        // command — see `define_prompt_never_invokes_discuss_phase` below.
         let cases = [
             (Stage::Plan, "/gsd-plan-phase 11"),
             (Stage::Code, "/gsd-execute-phase 11"),
@@ -624,11 +583,9 @@ mod tests {
     fn code_stage_prompt_is_unchanged_single_command_template() {
         // Validate is excluded here (Task 2, 13-05): it now gets its own
         // dedicated prompt requiring a verdict — see
-        // `validate_stage_prompt_requires_verdict` below. Define and Plan
-        // are excluded too: Plan carries the idempotency contract (see
-        // `plan_prompt_is_idempotent` below); Define carries its own D-14
-        // always-no-op contract (see `define_prompt_never_invokes_discuss_phase`
-        // below).
+        // `validate_stage_prompt_requires_verdict` below. Plan is excluded
+        // too: it carries the idempotency contract (see
+        // `plan_prompt_is_idempotent` below).
         let prompt = stage_prompt(Stage::Code, PhaseId::new(9));
         assert!(prompt.contains("/gsd-execute-phase 9"));
         assert!(prompt.contains("DEVFLOW_RESULT"));
@@ -638,7 +595,7 @@ mod tests {
         );
         assert!(
             !prompt.contains("already exists"),
-            "Code prompt should not carry the Define/Plan idempotency contract"
+            "Code prompt should not carry the Plan idempotency contract"
         );
         assert!(prompt.contains("Advisory incremental self-review"));
         for angle in [
@@ -918,32 +875,6 @@ mod tests {
         assert!(prompt.contains("DEVFLOW_RESULT"));
     }
 
-    /// D-14: the Define stage must never invoke the interactive
-    /// discuss-phase command, whether or not CONTEXT.md exists — the branch
-    /// that did so is deleted, not disambiguated. Regression guard for
-    /// T-28-08 (a headless run has no operator to answer it).
-    #[test]
-    fn define_prompt_never_invokes_discuss_phase() {
-        let prompt = stage_prompt(Stage::Define, PhaseId::new(9));
-        assert!(
-            !prompt.contains("/gsd-discuss-phase"),
-            "Define prompt must never invoke the interactive discuss-phase command (D-14)"
-        );
-        assert!(
-            prompt.contains("must NOT run") || prompt.contains("do NOT run"),
-            "Define prompt must forbid running an interactive interview headlessly"
-        );
-        assert!(
-            prompt.contains("do NOT ask for input") || prompt.contains("must NOT ask for input"),
-            "Define prompt must forbid requesting input"
-        );
-        assert!(
-            prompt.to_lowercase().contains("modify"),
-            "Define prompt must forbid modifying existing planning artifacts"
-        );
-        assert!(prompt.contains("DEVFLOW_RESULT"));
-    }
-
     #[test]
     fn validate_stage_prompt_requires_verdict() {
         let prompt = stage_prompt(Stage::Validate, PhaseId::new(13));
@@ -1098,13 +1029,13 @@ mod tests {
 
     /// Only Code may declare. The resume prompt and every non-Code stage
     /// prompt carry no checkpoint form, so a resumed agent is not re-offered
-    /// it and Define, Plan and Validate are not invited to use it.
+    /// it and Plan and Validate are not invited to use it.
     #[test]
     fn checkpoint_declaration_is_offered_only_to_the_code_stage() {
         let resume = checkpoint_auto_decide_prompt(PhaseId::new(47));
         assert!(!resume.contains("\"checkpoint\""), "{resume}");
         assert!(!COMPLETION_PROTOCOL.contains("checkpoint"));
-        for stage in [Stage::Define, Stage::Plan, Stage::Validate] {
+        for stage in [Stage::Plan, Stage::Validate] {
             let prompt = stage_prompt(stage, PhaseId::new(47));
             assert!(!prompt.contains("\"checkpoint\""), "{stage:?}: {prompt}");
         }

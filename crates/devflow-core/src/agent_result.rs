@@ -2909,8 +2909,8 @@ pub fn phase_commit_count(
 ///
 /// The commit-count gate ("no commits → failed") is scoped to `stage` — it
 /// only applies to `Stage::Plan`/`Stage::Code` (checked via an explicit
-/// `matches!`, NOT `Stage::is_agent_stage()`, since that also includes
-/// `Define`, which legitimately produces zero commits). `exit≠0` is ALWAYS
+/// `matches!`, NOT `Stage::is_agent_stage()`, so a future agent stage that
+/// legitimately produces zero commits is not swept in). `exit≠0` is ALWAYS
 /// `Failed`, for every stage — only the `exit=0`/zero-commits branch is
 /// stage-scoped.
 ///
@@ -2920,7 +2920,7 @@ pub fn phase_commit_count(
 ///   exit≠0 (excluding 137/127)                           → Failed (ALL stages)
 ///   exit=0, stage in {Plan, Code}, commits=0             → Failed ("no work done")
 ///   exit=0, stage in {Plan, Code}, commits>0             → Success
-///   exit=0, stage NOT in {Plan, Code} (Define/Validate/Ship), commits=0 → Success
+///   exit=0, stage NOT in {Plan, Code} (Validate), commits=0 → Success
 ///           (not commit-gated; Validate's real pass signal is its verdict,
 ///           not a bare zero-commit — see Task 2's turn.completed deferral)
 ///   exit unknown                                         → fall to Layer 3 (return None)
@@ -8339,7 +8339,7 @@ mod tests {
 
     /// D-05 gap 2 (17-03): a declared, operator-approved external
     /// post-condition whose probe passes is affirmative Success evidence on
-    /// its own — even with zero commits and on a non-Code stage (Define
+    /// its own — even with zero commits and on a non-Code stage (Plan
     /// here). No agent stdout is written at all, so if Layer 0 did not
     /// short-circuit, there would be nothing for Layer 1 to find and Layer 2
     /// would fall through for lack of an exit-code file.
@@ -8355,7 +8355,7 @@ mod tests {
         .unwrap();
         std::fs::write(dir.path().join("shipped"), "done").unwrap();
         let mut state = state_in(dir.path(), PhaseId::new(16));
-        state.stage = Stage::Define;
+        state.stage = Stage::Plan;
 
         let approval = vec!["test -f shipped".to_string()];
         let result = evaluate_agent_result_inner(
@@ -8779,7 +8779,7 @@ mod tests {
         .unwrap();
         std::fs::write(dir.path().join("passing-artifact"), "done").unwrap();
         let mut state = state_in(dir.path(), PhaseId::new(16));
-        state.stage = Stage::Define;
+        state.stage = Stage::Plan;
 
         let approval = vec![
             "test -f passing-artifact".to_string(),
@@ -9889,15 +9889,15 @@ mod tests {
 
     #[test]
     fn layer2_nonzero_exit_is_failed_all_stages() {
-        // Non-zero exit is Failed regardless of stage — including Define and
-        // Validate, which are exempt from the zero-commit gate but NOT from
-        // the exit-code check.
+        // Non-zero exit is Failed regardless of stage — including Validate,
+        // which is exempt from the zero-commit gate but NOT from the
+        // exit-code check.
         let dir = tempfile::tempdir().unwrap();
         init_repo_with_feature_no_commit(dir.path(), PhaseId::new(10));
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
         std::fs::write(exit_code_path(dir.path(), PhaseId::new(10)), "1").unwrap();
 
-        for stage in [Stage::Define, Stage::Plan, Stage::Code, Stage::Validate] {
+        for stage in [Stage::Plan, Stage::Code, Stage::Validate] {
             let result = evaluate_layer2(
                 dir.path(),
                 PhaseId::new(10),
@@ -9915,27 +9915,25 @@ mod tests {
     }
 
     #[test]
-    fn layer2_skips_commit_gate_for_define_and_validate() {
+    fn layer2_skips_commit_gate_for_validate() {
         let dir = tempfile::tempdir().unwrap();
         init_repo_with_feature_no_commit(dir.path(), PhaseId::new(11));
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
         std::fs::write(exit_code_path(dir.path(), PhaseId::new(11)), "0").unwrap();
 
-        for stage in [Stage::Define, Stage::Validate] {
-            let result = evaluate_layer2(
-                dir.path(),
-                PhaseId::new(11),
-                &GitFlowConfig::default(),
-                stage,
-            )
-            .unwrap()
-            .unwrap();
-            assert_ne!(
-                result.status,
-                AgentStatus::Failed,
-                "stage {stage:?} should not be Failed for zero commits"
-            );
-        }
+        let result = evaluate_layer2(
+            dir.path(),
+            PhaseId::new(11),
+            &GitFlowConfig::default(),
+            Stage::Validate,
+        )
+        .unwrap()
+        .unwrap();
+        assert_ne!(
+            result.status,
+            AgentStatus::Failed,
+            "Validate should not be Failed for zero commits"
+        );
 
         // Code stage with the same zero-commit inputs is still Failed
         // (existing behavior preserved).

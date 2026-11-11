@@ -1,7 +1,7 @@
 //! DevFlow state machine.
 //!
-//! Drives the development workflow through a single linear chain of five stages:
-//! Define → Plan → Code → Validate → Ship. See [`crate::stage::Stage`].
+//! Drives the development workflow through a single linear chain of three stages:
+//! Plan → Code → Validate. See [`crate::stage::Stage`].
 
 use serde::{Deserialize, Serialize};
 use std::fmt;

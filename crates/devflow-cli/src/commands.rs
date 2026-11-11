@@ -59,7 +59,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// `config::base_branch` (45-01 / D-01) rather than hardcoded. A project
 /// whose planning artifacts live on a planning branch was previously
 /// invisible to this probe, so a `RequiresExistingArtifact` driver was
-/// refused at Define for an artifact that existed.
+/// refused at the first stage for an artifact that existed.
 ///
 /// Fail-open on git errors (base branch missing, not a repo): pre-flight must
 /// never block a run the later, more specific checks would allow. That
@@ -283,7 +283,7 @@ fn set_aside_leftover_gates(
     phase: PhaseId,
     warnings: &mut dyn std::io::Write,
 ) {
-    for stage in [Stage::Define, Stage::Plan, Stage::Code, Stage::Validate] {
+    for stage in [Stage::Plan, Stage::Code, Stage::Validate] {
         match Gates::close(project_root, phase, stage) {
             Ok(report) => {
                 for path in report.quarantined {
@@ -6879,13 +6879,13 @@ mod tests {
     }
 
     /// `start`'s CONTEXT.md probe asks the driver about the first stage a run launches, Plan.
-    /// A driver that needs an artifact only at Define is not asked about (control).
+    /// A driver that needs an artifact only at a later stage is not asked about (control).
     #[test]
     fn start_context_probe_asks_the_driver_about_plan() {
         assert!(start_requires_phase_context(&ArtifactAtStage(Stage::Plan)));
         assert!(
-            !start_requires_phase_context(&ArtifactAtStage(Stage::Define)),
-            "control: no run starts at Define, so a Define-only requirement is not probed"
+            !start_requires_phase_context(&ArtifactAtStage(Stage::Validate)),
+            "control: a requirement of a later stage is not probed at start"
         );
         assert!(!start_requires_phase_context(&ArtifactAtStage(Stage::Code)));
     }
@@ -7786,15 +7786,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(5016);
-        state_pending_at(root, phase, Stage::Define);
-        let (opened, registration) =
-            Gates::open_registered(root, phase, Stage::Define, "g").unwrap();
+        state_pending_at(root, phase, Stage::Plan);
+        let (opened, registration) = Gates::open_registered(root, phase, Stage::Plan, "g").unwrap();
         let gate_id = opened.gate_id.as_str();
 
         for waiter in doctor_json_gate_waiters(root) {
             assert_eq!(
                 waiter,
-                serde_json::json!({"stage": "define", "gate_id": gate_id, "status": "live"})
+                serde_json::json!({"stage": "plan", "gate_id": gate_id, "status": "live"})
             );
         }
 
@@ -7802,12 +7801,12 @@ mod tests {
         for waiter in doctor_json_gate_waiters(root) {
             assert_eq!(
                 waiter,
-                serde_json::json!({"stage": "define", "gate_id": gate_id, "status": "absent"})
+                serde_json::json!({"stage": "plan", "gate_id": gate_id, "status": "absent"})
             );
         }
 
         let no_gate = tempfile::tempdir().unwrap();
-        state_pending_at(no_gate.path(), phase, Stage::Define);
+        state_pending_at(no_gate.path(), phase, Stage::Plan);
         for waiter in doctor_json_gate_waiters(no_gate.path()) {
             assert_eq!(
                 waiter,
@@ -9320,10 +9319,10 @@ mod tests {
     /// 15a: `devflow gate approve` resolves the stage automatically when a
     /// phase has exactly one open gate and writes a response the workflow's
     /// poller will consume.
-    /// A saved Define-stage state with both kinds of answer an earlier run can leave:
+    /// A saved Plan-stage state with both kinds of answer an earlier run can leave:
     /// a keyed answer for its gate, which an abort, and an unkeyed approval from before
     /// gate ids. Returns the state and the two answers' bytes.
-    fn plant_leftover_define_answers(root: &Path, phase: PhaseId) -> (State, Vec<Vec<u8>>) {
+    fn plant_leftover_plan_answers(root: &Path, phase: PhaseId) -> (State, Vec<Vec<u8>>) {
         let mut state = State::new(
             phase,
             devflow_core::state::AgentKind::Claude,
@@ -9333,11 +9332,11 @@ mod tests {
         state.gate_notify_cmd = Some("true".to_string());
         workflow::save_state(&state).unwrap();
 
-        let old = Gates::open_gate(root, phase, Stage::Define, "the earlier run's gate").unwrap();
+        let old = Gates::open_gate(root, phase, Stage::Plan, "the earlier run's gate").unwrap();
         let keyed = Gates::answer(
             root,
             phase,
-            Stage::Define,
+            Stage::Plan,
             &old.gate_id,
             &GateResponse {
                 approved: false,
@@ -9346,7 +9345,7 @@ mod tests {
             },
         )
         .unwrap();
-        let unkeyed = Gates::dir(root).join(format!("{}-define.response.json", phase.padded()));
+        let unkeyed = Gates::dir(root).join(format!("{}-plan.response.json", phase.padded()));
         std::fs::write(
             &unkeyed,
             br#"{"approved":true,"note":"legacy","responded_by":"test"}"#,
@@ -9378,13 +9377,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(4910);
-        let (mut state, mut planted) = plant_leftover_define_answers(root, phase);
+        let (mut state, mut planted) = plant_leftover_plan_answers(root, phase);
         planted.sort();
 
         let err = crate::pipeline_gate::run_gate_with_timeout(
             root,
             &mut state,
-            Stage::Define,
+            Stage::Plan,
             "the new run's gate",
             1,
         )
@@ -9395,14 +9394,14 @@ mod tests {
         );
         assert_eq!(quarantined_bytes(root), planted, "both leftovers set aside");
         assert_eq!(
-            gate_answer_files(root, phase, Stage::Define),
+            gate_answer_files(root, phase, Stage::Plan),
             Vec::<std::path::PathBuf>::new()
         );
 
         devflow_core::test_support::preanswer_gate(
             root,
             phase,
-            Stage::Define,
+            Stage::Plan,
             &GateResponse {
                 approved: true,
                 note: None,
@@ -9412,7 +9411,7 @@ mod tests {
         let action = crate::pipeline_gate::run_gate_with_timeout(
             root,
             &mut state,
-            Stage::Define,
+            Stage::Plan,
             "control: an answer that binds",
             1,
         )
@@ -9427,7 +9426,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(4911);
-        let (_state, mut planted) = plant_leftover_define_answers(root, phase);
+        let (_state, mut planted) = plant_leftover_plan_answers(root, phase);
         planted.sort();
 
         let mut warnings = Vec::new();
@@ -9437,14 +9436,14 @@ mod tests {
         assert_eq!(quarantined_bytes(root), planted, "no leftover was deleted");
         for answer in Gates::quarantined(root) {
             let line = format!(
-                "warning: set aside an unused answer for phase {phase} define: {}",
+                "warning: set aside an unused answer for phase {phase} plan: {}",
                 answer.path.display()
             );
             assert!(warnings.contains(&line), "{line} not in: {warnings}");
         }
-        assert!(!Gates::gate_path(root, phase, Stage::Define).exists());
+        assert!(!Gates::gate_path(root, phase, Stage::Plan).exists());
         assert_eq!(
-            gate_answer_files(root, phase, Stage::Define),
+            gate_answer_files(root, phase, Stage::Plan),
             Vec::<std::path::PathBuf>::new()
         );
     }
@@ -9833,7 +9832,7 @@ mod tests {
     }
 
     /// 13-06 dogfood regression (Codex leg): a fresh headless Codex run can
-    /// never pass Define, so `start --agent codex` pre-flights on the
+    /// never pass Plan, so `start --agent codex` pre-flights on the
     /// phase's CONTEXT.md existing on the base branch.
     #[test]
     fn phase_artifact_on_base_detects_context_and_fails_open() {
@@ -10806,13 +10805,13 @@ mod tests {
                 },
                 PhaseFacts {
                     waiter: WaiterStatus::Live,
-                    waiter_gate: Some((Stage::Define, gate_id.clone())),
-                    open_gate_stages: vec![Stage::Define],
+                    waiter_gate: Some((Stage::Plan, gate_id.clone())),
+                    open_gate_stages: vec![Stage::Plan],
                     ..agreeing_facts(PhaseId::new(29))
                 },
                 PhaseFacts {
-                    waiter_gate: Some((Stage::Define, PATH_AS_GATE_ID.to_string())),
-                    open_gate_stages: vec![Stage::Define],
+                    waiter_gate: Some((Stage::Plan, PATH_AS_GATE_ID.to_string())),
+                    open_gate_stages: vec![Stage::Plan],
                     ..agreeing_facts(PhaseId::new(30))
                 },
             ];
@@ -10848,8 +10847,8 @@ mod tests {
         #[test]
         fn doctor_json_gives_a_refused_gate_id_as_null() {
             let facts = vec![PhaseFacts {
-                waiter_gate: Some((Stage::Define, PATH_AS_GATE_ID.to_string())),
-                open_gate_stages: vec![Stage::Define],
+                waiter_gate: Some((Stage::Plan, PATH_AS_GATE_ID.to_string())),
+                open_gate_stages: vec![Stage::Plan],
                 ..agreeing_facts(PhaseId::new(31))
             }];
             let body = render_reconciliation_json(&facts);
@@ -10858,7 +10857,7 @@ mod tests {
             for entry in entries {
                 assert_eq!(
                     entry["gate_waiter"],
-                    serde_json::json!({"stage": "define", "gate_id": null, "status": "absent"}),
+                    serde_json::json!({"stage": "plan", "gate_id": null, "status": "absent"}),
                     "{body}"
                 );
             }
@@ -16311,7 +16310,7 @@ mod tests {
             "launch_id": PROMOTED,
             "project_root": root,
             "phase": phase,
-            "stage": "define",
+            "stage": "plan",
             "agent": "claude",
             "launch": "stream",
             "agent_pid": NO_SUCH_PGID,
