@@ -891,7 +891,7 @@ mod tests {
         state.last_validate_failure_commit_count = Some(0);
         workflow::save_state(&state).unwrap();
 
-        // Pre-answer a rejection whose note says "abort" so
+        // Pre-answer an abort (`abort: true`) so
         // `GateAction::from_response` resolves to `Abort`.
         preanswer_gate(
             root,
@@ -899,6 +899,7 @@ mod tests {
             Stage::Validate,
             &GateResponse {
                 approved: false,
+                abort: true,
                 note: Some("abort: requirements changed".into()),
                 responded_by: Some("test".into()),
             },
@@ -999,7 +1000,7 @@ mod tests {
             phase,
             Stage::Validate,
             &serde_json::from_str(
-                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                r#"{"approved":false,"abort":true,"note":"abort: test cleanup","responded_by":"test"}"#,
             )
             .unwrap(),
         );
@@ -1178,6 +1179,7 @@ mod tests {
             Stage::Code,
             &GateResponse {
                 approved: true,
+                abort: false,
                 note: None,
                 responded_by: Some("test".into()),
             },
@@ -1256,6 +1258,7 @@ mod tests {
             Stage::Code,
             &GateResponse {
                 approved: true,
+                abort: false,
                 note: None,
                 responded_by: Some("test".into()),
             },
@@ -1362,6 +1365,7 @@ mod tests {
             Stage::Code,
             &GateResponse {
                 approved: true,
+                abort: false,
                 note: None,
                 responded_by: Some("test".into()),
             },
@@ -1493,6 +1497,7 @@ mod tests {
     fn approval() -> GateResponse {
         GateResponse {
             approved: true,
+            abort: false,
             note: None,
             responded_by: Some("test".into()),
         }

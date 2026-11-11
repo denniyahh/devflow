@@ -1543,7 +1543,7 @@ mod tests {
             phase,
             Stage::Plan,
             &serde_json::from_str(
-                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                r#"{"approved":false,"abort":true,"note":"abort: test cleanup","responded_by":"test"}"#,
             )
             .unwrap(),
         );
@@ -1590,7 +1590,7 @@ mod tests {
             phase,
             Stage::Validate,
             &serde_json::from_str(
-                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                r#"{"approved":false,"abort":true,"note":"abort: test cleanup","responded_by":"test"}"#,
             )
             .unwrap(),
         );
@@ -2256,7 +2256,7 @@ mod tests {
         loopback_state.canary = Some(devflow_core::canary::CanaryOutcome::Confirmed);
         workflow::save_state(&loopback_state).unwrap();
 
-        // Not approved, and the note does NOT say "abort" — LoopBack.
+        // Not approved and not an abort — LoopBack.
         preanswer_gate(
             loopback_root,
             loopback_phase,

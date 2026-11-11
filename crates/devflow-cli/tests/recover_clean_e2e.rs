@@ -254,6 +254,7 @@ fn sweep_names_the_markers_it_removed_and_the_answers_it_kept() {
         &gate,
         &devflow_core::gates::GateResponse {
             approved: true,
+            abort: false,
             note: None,
             responded_by: Some("test".into()),
         },

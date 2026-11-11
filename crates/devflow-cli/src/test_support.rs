@@ -56,6 +56,7 @@ pub(crate) fn state_on_disk_at_gate(
             stage,
             &GateResponse {
                 approved: false,
+                abort: true,
                 note: Some("abort: test cleanup".into()),
                 responded_by: Some("test".into()),
             },

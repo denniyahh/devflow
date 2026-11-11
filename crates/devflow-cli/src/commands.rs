@@ -1850,7 +1850,8 @@ pub(crate) fn gate_list(project_root: &Path, all_roots: bool) -> Result<(), CliE
     println!("{}", render_gate_list(&open));
     println!(
         "\nanswer with: devflow gate approve <phase> [--gate-id <id>] [--note ...] | \
-         devflow gate reject <phase> [--gate-id <id>] --note ... (note with \"abort\" ends the phase)"
+         devflow gate reject <phase> [--gate-id <id>] --note ... (fix and relaunch) | \
+         devflow gate abort <phase> [--gate-id <id>] [--note ...] (ends the run)"
     );
     Ok(())
 }
@@ -1983,6 +1984,17 @@ fn resolve_single_open_gate_stage(open: &[OpenGate], phase: PhaseId) -> Result<S
     }
 }
 
+/// The three answers an operator can give a gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GateAnswerKind {
+    /// The stage's work is accepted and the run advances.
+    Approve,
+    /// The stage is fixed and relaunched; the run stays alive.
+    Reject,
+    /// The run ends.
+    Abort,
+}
+
 /// Answer the gate the operator observed: the id they passed, or the id of the
 /// stage's open gate in this command's one [`Gates::list_open`] read. The id is
 /// fixed here and only re-checked afterwards, so a decision about one gate cannot
@@ -1991,7 +2003,7 @@ pub(crate) fn gate_respond(
     project_root: &Path,
     phase: PhaseId,
     stage: Option<Stage>,
-    approved: bool,
+    kind: GateAnswerKind,
     note: Option<String>,
     observed_gate_id: Option<String>,
 ) -> Result<(), CliError> {
@@ -2014,7 +2026,8 @@ pub(crate) fn gate_respond(
         .filter(|user| !user.is_empty())
         .unwrap_or_else(|| "devflow-cli".into());
     let response = GateResponse {
-        approved,
+        approved: kind == GateAnswerKind::Approve,
+        abort: kind == GateAnswerKind::Abort,
         note,
         responded_by: Some(responded_by),
     };
@@ -2027,7 +2040,7 @@ pub(crate) fn gate_respond(
         serde_json::json!({
             "stage": stage.to_string(),
             "gate_id": observed.as_str(),
-            "approved": approved,
+            "approved": response.approved,
             "via": "cli",
         }),
     );
@@ -2041,7 +2054,11 @@ pub(crate) fn gate_respond(
     };
     println!(
         "{} gate for phase {phase} {stage} — response was written; {pickup} (response at {})",
-        if approved { "approved" } else { "rejected" },
+        if response.approved {
+            "approved"
+        } else {
+            "rejected"
+        },
         path.display()
     );
     Ok(())
@@ -3476,10 +3493,11 @@ fn run_backstop(
     }
 }
 
-/// The primary path: answer `phase`'s open gate with a rejection whose note
-/// contains the abort keyword, so `GateAction::from_response` resolves to
-/// `GateAction::Abort` rather than `LoopBack(Code)` — looping back would
-/// relaunch an agent on a phase the operator just asked to stop.
+/// The primary path: answer `phase`'s open gate with an abort
+/// ([`Gates::reap_answer`] sets the `abort` field), so
+/// `GateAction::from_response` resolves to `GateAction::Abort` rather than
+/// `LoopBack(Code)` — looping back would relaunch an agent on a phase the
+/// operator just asked to stop.
 ///
 /// Returns the [`AnsweredGate`] when a gate was found and handled — either reaped
 /// here, or discovered already answered by a race — telling the caller not
@@ -3570,7 +3588,7 @@ fn stop_reap_observed_gate(
                 WaiterStatus::Absent
             };
             println!(
-                "stop: wrote a rejection for phase {phase} {} at {} — {}",
+                "stop: wrote an abort for phase {phase} {} at {} — {}",
                 gate.stage,
                 path.display(),
                 response_pickup_message(waiter)
@@ -3621,7 +3639,8 @@ fn stop_reap_observed_gate(
     }
 }
 
-/// Classify an answer which appeared after `stop_via_gate` saw an open gate.
+/// Classify an answer which appeared after `stop_via_gate` saw an open gate, by
+/// its fields, never its note: [`GateAction::from_response`] reads `abort`.
 /// An approval or loop-back is not attributable to `stop`, so that path must
 /// fall through to the socket and holder arms. An abort can be the requested action
 /// only while a waiter is registered. `run_launch` rides along in the [`AnsweredGate`].
@@ -6950,7 +6969,7 @@ mod tests {
             root,
             phase,
             Some(Stage::Code),
-            false,
+            GateAnswerKind::Reject,
             Some("abort".into()),
             None,
         )
@@ -6993,10 +7012,11 @@ mod tests {
         let stage = Stage::Code;
 
         // A new gate per case: a gate keeps its first answer.
-        let answered_gate = |approved, note: Option<&str>| {
+        let answered_gate = |approved, abort, note: Option<&str>| {
             let gate = Gates::open_gate(root, phase, stage, "g").unwrap().gate_id;
             let response = GateResponse {
                 approved,
+                abort,
                 note: note.map(str::to_owned),
                 responded_by: Some("test".into()),
             };
@@ -7004,18 +7024,18 @@ mod tests {
             gate
         };
 
-        let approved = answered_gate(true, None);
+        let approved = answered_gate(true, false, None);
         let registration = Gates::register_waiter(root, phase, stage, &approved).unwrap();
         let non_abort = stop_with_existing_response(root, phase, stage, &approved, None).unwrap();
         assert_eq!(non_abort, None);
         registration.finish();
 
-        let no_waiter = answered_gate(false, Some("abort"));
+        let no_waiter = answered_gate(false, true, Some("abort"));
         let unregistered =
             stop_with_existing_response(root, phase, stage, &no_waiter, None).unwrap();
         assert_eq!(unregistered, None, "nothing on disk is no waiter");
 
-        let live = answered_gate(false, Some("abort"));
+        let live = answered_gate(false, true, Some("abort"));
         let registration = Gates::register_waiter(root, phase, stage, &live).unwrap();
         let live_abort =
             stop_with_existing_response(root, phase, stage, &live, Some("launch-a".to_string()))
@@ -7156,11 +7176,12 @@ mod tests {
         let root = dir.path();
         let (phase, stage) = (PhaseId::new(4914), Stage::Code);
         state_pending_at(root, phase, stage);
-        let answer_with = |approved, note: &str| {
+        let answer_with = |approved, abort, note: &str| {
             let (opened, registration) = Gates::open_registered(root, phase, stage, "g").unwrap();
             let entry = listed_gate(root, phase);
             let response = GateResponse {
                 approved,
+                abort,
                 note: Some(note.to_owned()),
                 responded_by: Some("human".into()),
             };
@@ -7168,7 +7189,7 @@ mod tests {
             (opened.gate_id, entry, registration)
         };
 
-        let (gate, entry, registration) = answer_with(false, "abort: by a human");
+        let (gate, entry, registration) = answer_with(false, true, "abort: by a human");
         let answered = stop_reap_observed_gate(root, phase, &entry).unwrap();
         assert_eq!(
             answered,
@@ -7182,7 +7203,7 @@ mod tests {
         registration.finish();
         Gates::close(root, phase, stage).unwrap();
 
-        let (gate, entry, registration) = answer_with(true, "approved by a human");
+        let (gate, entry, registration) = answer_with(true, false, "approved by a human");
         assert_eq!(
             stop_reap_observed_gate(root, phase, &entry).unwrap(),
             None,
@@ -7215,9 +7236,16 @@ mod tests {
         let (phase, stage) = (PhaseId::new(4901), Stage::Code);
         let (g1, g2, registration) = g1_replaced_by_registered_g2(root, phase, stage);
 
-        let err = gate_respond(root, phase, Some(stage), true, None, Some(g1.to_string()))
-            .expect_err("an answer about G1 must not land while G2 is open")
-            .to_string();
+        let err = gate_respond(
+            root,
+            phase,
+            Some(stage),
+            GateAnswerKind::Approve,
+            None,
+            Some(g1.to_string()),
+        )
+        .expect_err("an answer about G1 must not land while G2 is open")
+        .to_string();
 
         assert!(
             err.contains(g1.as_str()) && err.contains(g2.as_str()),
@@ -7234,7 +7262,15 @@ mod tests {
         );
         assert!(!Gates::answer_path(root, phase, stage, &g1).exists());
 
-        gate_respond(root, phase, Some(stage), true, None, None).unwrap();
+        gate_respond(
+            root,
+            phase,
+            Some(stage),
+            GateAnswerKind::Approve,
+            None,
+            None,
+        )
+        .unwrap();
 
         let AnswerRead::Bound(answer) = Gates::read_answer(root, phase, stage, &g2) else {
             panic!("with no id given, the command answers the gate open now");
@@ -7256,7 +7292,7 @@ mod tests {
             root,
             phase,
             Some(stage),
-            true,
+            GateAnswerKind::Approve,
             None,
             Some("../../etc".into()),
         )
@@ -7493,8 +7529,15 @@ mod tests {
 
         let (registered, stage) = (PhaseId::new(5001), Stage::Code);
         let (opened, registration) = Gates::open_registered(root, registered, stage, "g").unwrap();
-        gate_respond(root, registered, Some(stage), true, None, None)
-            .expect("a registered waiter's gate is answered");
+        gate_respond(
+            root,
+            registered,
+            Some(stage),
+            GateAnswerKind::Approve,
+            None,
+            None,
+        )
+        .expect("a registered waiter's gate is answered");
         assert!(
             matches!(
                 Gates::read_answer(root, registered, stage, &opened.gate_id),
@@ -7514,18 +7557,32 @@ mod tests {
         let beside_a_lock = PhaseId::new(5003);
         Gates::open_gate(root, beside_a_lock, stage, "g").unwrap();
         plant_live_lock_record(root, beside_a_lock);
-        let refused = gate_respond(root, beside_a_lock, Some(stage), true, None, None)
-            .expect_err("a live lock record is no waiter")
-            .to_string();
+        let refused = gate_respond(
+            root,
+            beside_a_lock,
+            Some(stage),
+            GateAnswerKind::Approve,
+            None,
+            None,
+        )
+        .expect_err("a live lock record is no waiter")
+        .to_string();
         assert!(refused.contains("no registered waiter"), "{refused}");
         assert!(gate_answer_files(root, beside_a_lock, stage).is_empty());
 
         let released = PhaseId::new(5002);
         let (_, registration) = Gates::open_registered(root, released, stage, "g").unwrap();
         registration.finish();
-        let refused = gate_respond(root, released, Some(stage), true, None, None)
-            .expect_err("a finished registration is no waiter")
-            .to_string();
+        let refused = gate_respond(
+            root,
+            released,
+            Some(stage),
+            GateAnswerKind::Approve,
+            None,
+            None,
+        )
+        .expect_err("a finished registration is no waiter")
+        .to_string();
         assert!(refused.contains("no registered waiter"), "{refused}");
         assert!(refused.contains("no response was written"), "{refused}");
         assert!(gate_answer_files(root, released, stage).is_empty());
@@ -7604,7 +7661,7 @@ mod tests {
             root,
             phase,
             Some(stage),
-            true,
+            GateAnswerKind::Approve,
             None,
             Some(opened.gate_id.to_string()),
         )
@@ -7652,7 +7709,7 @@ mod tests {
             root,
             phase,
             Some(stage),
-            true,
+            GateAnswerKind::Approve,
             None,
             Some(opened.gate_id.to_string()),
         )
@@ -8028,6 +8085,7 @@ mod tests {
         registration.finish();
         let response = GateResponse {
             approved: true,
+            abort: false,
             note: None,
             responded_by: Some("human".into()),
         };
@@ -8502,7 +8560,14 @@ mod tests {
         };
         let responding = PhaseId::new(5009);
         check(responding, &|root| {
-            gate_respond(root, responding, Some(Stage::Code), true, None, None)
+            gate_respond(
+                root,
+                responding,
+                Some(Stage::Code),
+                GateAnswerKind::Approve,
+                None,
+                None,
+            )
         });
         check(PhaseId::new(5010), &|root| {
             gate_sweep(Some(0), false, Some(root.to_path_buf()))
@@ -8615,7 +8680,16 @@ mod tests {
                 Gates::close(&hook_root, phase, stage).unwrap();
                 Gates::open_gate(&hook_root, phase, stage, "g2").unwrap();
             },
-            || gate_respond(root, phase, Some(stage), true, None, Some(g1.to_string())),
+            || {
+                gate_respond(
+                    root,
+                    phase,
+                    Some(stage),
+                    GateAnswerKind::Approve,
+                    None,
+                    Some(g1.to_string()),
+                )
+            },
         )
         .expect_err("an answer set aside must exit non-zero")
         .to_string();
@@ -8655,6 +8729,7 @@ mod tests {
         let opened = Gates::open_gate(root, phase, Stage::Code, "ctx").unwrap();
         let response = GateResponse {
             approved: true,
+            abort: false,
             note: None,
             responded_by: None,
         };
@@ -9340,6 +9415,7 @@ mod tests {
             &old.gate_id,
             &GateResponse {
                 approved: false,
+                abort: true,
                 note: Some("abort: the earlier run".into()),
                 responded_by: Some("test".into()),
             },
@@ -9404,6 +9480,7 @@ mod tests {
             Stage::Plan,
             &GateResponse {
                 approved: true,
+                abort: false,
                 note: None,
                 responded_by: Some("test".into()),
             },
@@ -9464,7 +9541,7 @@ mod tests {
             root,
             PhaseId::new(15),
             None,
-            true,
+            GateAnswerKind::Approve,
             Some("lgtm".into()),
             None,
         )
@@ -9489,7 +9566,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        let err = gate_respond(root, PhaseId::new(15), None, true, None, None).unwrap_err();
+        let err = gate_respond(
+            root,
+            PhaseId::new(15),
+            None,
+            GateAnswerKind::Approve,
+            None,
+            None,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("no open gate"), "{err}");
 
         Gates::write_gate(root, PhaseId::new(15), Stage::Code, "a").unwrap();
@@ -9499,7 +9584,7 @@ mod tests {
             root,
             PhaseId::new(15),
             None,
-            false,
+            GateAnswerKind::Reject,
             Some("nope".into()),
             None,
         )
@@ -9512,7 +9597,7 @@ mod tests {
             root,
             PhaseId::new(15),
             Some(Stage::Validate),
-            false,
+            GateAnswerKind::Reject,
             Some("gaps".into()),
             None,
         )
@@ -9599,6 +9684,7 @@ mod tests {
         let listed_before_the_answer = listed_gate(root, phase);
         let response = GateResponse {
             approved: true,
+            abort: false,
             note: None,
             responded_by: Some("human".into()),
         };
