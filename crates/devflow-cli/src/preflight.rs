@@ -22,10 +22,10 @@ use crate::commands::phase_artifact_on_base;
 use crate::pipeline_gate::{abort, run_gate};
 use crate::pipeline_launch::close_gate;
 use crate::pipeline_launch::commit;
-use crate::pipeline_launch::launch_stage;
 use crate::pipeline_launch::launch_stage_inner;
 use crate::pipeline_launch::stream_launch_enabled;
 use crate::pipeline_outcomes::truncate_reason;
+use crate::pipeline_outcomes::{Answer, ApproveRoute, StatusLessStep};
 use devflow_core::gates::GateKind;
 use devflow_core::git::git_command;
 use devflow_core::gsd_config::{self, GsdConfigError};
@@ -1237,7 +1237,7 @@ fn fill_pending_approval(state: &mut State, approval: CheckpointApproval) {
 /// Returns `Ok(true)` when the caller should continue the rest of
 /// `launch_stage` (preflight passed). Returns `Ok(false)` when a failing
 /// check was resolved via a gate that ALREADY completed a full retried
-/// launch (Advance/LoopBack), reached the retry ceiling, or aborted —
+/// launch (the approve's override), reached the retry ceiling, or aborted —
 /// the caller must not run any more launch steps for this invocation
 /// (CR-01, 17-08 gap closure: the old `Result<(), CliError>` return
 /// couldn't distinguish these cases, so the caller always continued and
@@ -1255,12 +1255,12 @@ fn fill_pending_approval(state: &mut State, approval: CheckpointApproval) {
 /// so skipping the re-check on `Advance` cannot silently skip a check that
 /// never ran once.** The `Advance` arm therefore relaunches via
 /// [`launch_stage_inner`] directly, SKIPPING this function entirely on the
-/// retry. `GateAction::LoopBack` still calls the full [`launch_stage`]
-/// (re-entering this function), because that path means the operator will
-/// fix the condition and retry, and the state may genuinely have changed.
-/// Either arm's recursion is bounded by `state.preflight_retries` /
-/// [`mode::MAX_PREFLIGHT_RETRIES`]: the ceiling is checked BEFORE writing
-/// another gate, so reaching it aborts with a logged
+/// retry. A reject is not an answer to this gate (D-39, 52-29): the answer
+/// screen refuses it before its claim and reopens the gate, so the only
+/// answers that reach here are approve and abort. A failed check is checked
+/// again only by a later `run_preflight` call, which `state.preflight_retries` /
+/// [`mode::MAX_PREFLIGHT_RETRIES`] bounds: the ceiling is checked BEFORE
+/// writing another gate, so reaching it aborts with a logged
 /// `preflight_retry_ceiling_reached` event instead of polling a second
 /// 7-day gate timeout nobody will ever answer (T-18-27, T-18-30).
 pub(crate) fn run_preflight(
@@ -1304,7 +1304,7 @@ pub(crate) fn run_preflight(
             truncate_reason(&reason)
         );
         match run_gate(project_root, state, stage, GateKind::Preflight, &context)? {
-            crate::pipeline_outcomes::Answer::Approve(_) => {
+            Answer::Approve(ApproveRoute::StatusLess(StatusLessStep::PreflightOverride)) => {
                 // D-18f: approval is an explicit override — skip the
                 // just-adjudicated check on the retry (see the function
                 // doc comment above).
@@ -1344,16 +1344,17 @@ pub(crate) fn run_preflight(
                 })?;
                 launch_stage_inner(state, None, None)?;
             }
-            crate::pipeline_outcomes::Answer::Reject { note } => {
-                // D-18f: "I will fix it, then retry" — re-check deliberately,
-                // bounded by the ceiling above.
-                let _ = close_gate(project_root, state.phase, stage);
-                // GATE-01: the rejection's note is the operator's word for the
-                // stage this relaunches.
-                crate::pipeline_launch::record_relaunch_note(state, note)?;
-                launch_stage(state, None, None)?;
+            Answer::Abort(reason) => abort(project_root, state, &reason)?,
+            // D-39 (52-29): a reject is not an answer to this gate. The answer
+            // screen refuses it before its claim and reopens the gate, so no
+            // other route reaches here.
+            other => {
+                return Err(CliError::Message(format!(
+                    "phase {}: the preflight gate's answer has no route here: {}",
+                    state.phase,
+                    other.resolved_fields()
+                )));
             }
-            crate::pipeline_outcomes::Answer::Abort(reason) => abort(project_root, state, &reason)?,
         }
         return Ok(false);
     }
@@ -1389,6 +1390,7 @@ pub(crate) fn run_preflight(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline_launch::launch_stage;
     use crate::test_support::*;
     use devflow_core::gates::Gates;
     use devflow_core::test_support::preanswer_gate;
@@ -1750,87 +1752,10 @@ mod tests {
         );
     }
 
-    /// CR-01 regression (LoopBack arm, 17-08 gap closure): same defect as
-    /// the Advance arm above, but through `GateAction::LoopBack` — per
-    /// `GateAction::from_response` (gates.rs:69-78) a rejection whose note
-    /// doesn't mention "abort" yields `LoopBack(Stage::Code)`, which
-    /// `run_preflight` routes through the identical recursive-relaunch code
-    /// path as Advance.
-    #[test]
-    fn run_preflight_loopback_gate_launches_agent_exactly_once() {
-        const NAME: &str =
-            "preflight::tests::run_preflight_loopback_gate_launches_agent_exactly_once";
-        enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("codex"));
-        let _guard = env_lock();
-
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        init_repo(root);
-
-        let phase = PhaseId::new(64);
-        let mut state = State::new(phase, AgentKind::Codex, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Validate;
-        // Codex, for the Advance arm's sibling's reason: the subject is the
-        // launch COUNT through the LoopBack arm, not which launch path is
-        // taken, and the `launches == 1` and `supervisor.is_some()` assertions
-        // below are untouched.
-        workflow::save_state(&state).unwrap();
-
-        preanswer_gate(
-            root,
-            phase,
-            Stage::Validate,
-            &serde_json::from_str(r#"{"approved":false,"note":"retry","responded_by":"test"}"#)
-                .unwrap(),
-        );
-
-        let adapter = FailOnceAdapter::new();
-        let preflight = run_preflight(root, &mut state, &adapter);
-        let continuation = match &preflight {
-            Ok(true) => launch_stage(&mut state, None, None),
-            _ => Ok(()),
-        };
-
-        // WR-05 / 999.44: this test's spawn arrives through the
-        // `GateAction::LoopBack(_)` arm (`preflight.rs:945-950`), which calls
-        // `launch_stage` at `:949`. That re-resolves the REAL Claude adapter
-        // (whose default preflight passes), re-runs `run_preflight` against
-        // it, and falls through to the same `launch_stage_inner` and the
-        // same `monitor::spawn_monitor` — one spawn, on the same
-        // `&mut State`, reached by a longer road than the Advance arm above.
-        // The guard must bind here, the first line after the final
-        // `&mut state` use, because every line below is a panic site,
-        // including unwrapping `preflight` itself: that call can spawn the
-        // monitor and then still fail a later `?`. The wrapper must die
-        // before `dir` unlinks the project root out from under it.
-        let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
-
-        let should_continue = preflight.unwrap();
-        continuation.unwrap();
-
-        assert!(
-            !should_continue,
-            "a LoopBack-resolved preflight failure must tell its caller not \
-             to continue launch_stage — the recursive retry already did"
-        );
-        let launches = stage_launched_count(root, phase);
-        assert_eq!(
-            launches, 1,
-            "a preflight failure resolved by LoopBack must launch the agent \
-             exactly once, not {launches}"
-        );
-        assert!(
-            state.supervisor.is_some(),
-            "this test is expected to drive a real monitor::spawn_monitor \
-             through run_preflight's LoopBack arm — None here means WR-05's \
-             premise was wrong and the guard above reaped nothing"
-        );
-    }
-
     // -----------------------------------------------------------------
     // 18f (D-18f): approving a preflight gate must not re-run the just-
-    // adjudicated check, LoopBack's re-check must be bounded, and the
-    // bound's reset must persist.
+    // adjudicated check, the retry ceiling must be checked before a gate,
+    // and the bound's reset must persist.
     //
     // These three tests deliberately fail via `preflight_interactivity_check`
     // (Codex + Auto + Plan + no CONTEXT.md on develop), NOT via
@@ -1942,32 +1867,19 @@ mod tests {
         );
     }
 
-    /// D-18f backstop: `GateAction::LoopBack` deliberately keeps re-running
-    /// the check (unlike Advance), so the recursion must be bounded
-    /// separately. `state.preflight_retries` starts one below the ceiling —
-    /// exercising the bound via a REAL recursive `run_preflight` call
-    /// (through `launch_stage`) rather than simulating multiple cycles: with
-    /// only ONE gate response ever seeded, and the gate wait
-    /// blocking synchronously in this same thread, nothing could seed a
-    /// SECOND response file mid-recursion inside one call stack — deferring
-    /// to the ceiling on the very next cycle instead genuinely exercises
-    /// "one retry short of the ceiling" → "ceiling reached" without a racy
-    /// background writer.
+    /// D-18f backstop, after D-39 (52-29): a reject on a preflight gate is
+    /// refused, so a failed check is checked again only by a later
+    /// `run_preflight` call, and the ceiling is checked before any gate opens.
+    /// With `preflight_retries` at `MAX_PREFLIGHT_RETRIES`, no answer and an
+    /// always-failing adapter, the call returns `Ok(false)`, writes no gate,
+    /// and the event log holds `preflight_retry_ceiling_reached` followed by
+    /// `workflow_aborted`, each asserted on its own.
     #[test]
-    // D-09 (48-09): mutates `DEVFLOW_GATE_TIMEOUT_SECS` process-wide.
-    // Deferred deliberately, not overlooked: THIS process reads the value, so
-    // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
-    // race and the value is restored on every exit path, unwinding included.
-    #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
-    fn run_preflight_loopback_bounds_recursion() {
-        const NAME: &str = "preflight::tests::run_preflight_loopback_bounds_recursion";
+    fn run_preflight_at_the_retry_ceiling_aborts_before_opening_a_gate() {
+        const NAME: &str =
+            "preflight::tests::run_preflight_at_the_retry_ceiling_aborts_before_opening_a_gate";
         enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("codex"));
         let _guard = env_lock();
-        let original_gate_timeout = std::env::var_os("DEVFLOW_GATE_TIMEOUT_SECS");
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("DEVFLOW_GATE_TIMEOUT_SECS", "2");
-        }
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1976,41 +1888,38 @@ mod tests {
         let phase = PhaseId::new(621);
         let mut state = State::new(phase, AgentKind::Codex, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Plan;
-        state.preflight_retries = mode::MAX_PREFLIGHT_RETRIES - 1;
+        state.preflight_retries = mode::MAX_PREFLIGHT_RETRIES;
         workflow::save_state(&state).unwrap();
 
-        preanswer_gate(
-            root,
-            phase,
-            Stage::Plan,
-            &serde_json::from_str(r#"{"approved":false,"note":"retry","responded_by":"test"}"#)
-                .unwrap(),
-        );
-
         let result = run_preflight(root, &mut state, &AlwaysFailAdapter);
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_gate_timeout {
-                Some(value) => std::env::set_var("DEVFLOW_GATE_TIMEOUT_SECS", value),
-                None => std::env::remove_var("DEVFLOW_GATE_TIMEOUT_SECS"),
-            }
-        }
 
         assert!(
             matches!(result, Ok(false)),
             "the ceiling must abort cleanly, not error out, got {result:?}"
         );
         assert!(
-            workflow::load_state(root, phase).is_err(),
-            "the ceiling must abort() and clear state, not leave it gate_pending forever"
+            !Gates::gate_path(root, phase, Stage::Plan).exists(),
+            "the ceiling is checked before any gate opens"
         );
-        let last = devflow_core::events::last_event_for_phase(root, phase)
-            .expect("a ceiling or abort event must have been recorded");
+        let events: Vec<String> = std::fs::read_to_string(devflow_core::events::events_path(root))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|event| phase.matches_json(event.get("phase")))
+            .filter_map(|event| event["event"].as_str().map(str::to_string))
+            .collect();
+        let ceiling = events
+            .iter()
+            .position(|event| event == "preflight_retry_ceiling_reached")
+            .unwrap_or_else(|| panic!("the ceiling event is recorded: {events:?}"));
+        let aborted = events
+            .iter()
+            .position(|event| event == "workflow_aborted")
+            .unwrap_or_else(|| panic!("the abort is recorded: {events:?}"));
+        assert!(ceiling < aborted, "the ceiling, then the abort: {events:?}");
         assert!(
-            last["event"] == "preflight_retry_ceiling_reached"
-                || last["event"] == "workflow_aborted",
-            "expected a ceiling or abort event, got {last:?}"
+            !events.iter().any(|event| event == "gate_fired"),
+            "no gate fired: {events:?}"
         );
     }
 
@@ -2188,8 +2097,10 @@ mod tests {
     /// - `Advance` records the current EXECUTION-root set (T-48-15-02: from
     ///   the worktree, not the project root, or recording and comparison
     ///   would disagree and every worktree run would gate forever).
-    /// - `LoopBack` records NOTHING — "I will fix it and retry" is not
-    ///   approval, and treating it as approval is the repudiation path.
+    /// - A reject records NOTHING — "I will fix it and retry" is not
+    ///   approval, and treating it as approval is the repudiation path. Since
+    ///   52-29 (D-39) it is refused before its claim and the gate reopens;
+    ///   a bounded writer aborts the reopened gate.
     #[test]
     // D-09 (48-09): mutates `DEVFLOW_GATE_TIMEOUT_SECS` process-wide.
     // Deferred deliberately, not overlooked: THIS process reads the value, so
@@ -2313,27 +2224,64 @@ mod tests {
         loopback_state.canary = Some(devflow_core::canary::CanaryOutcome::Confirmed);
         workflow::save_state(&loopback_state).unwrap();
 
-        // Not approved and not an abort — LoopBack.
-        preanswer_gate(
-            loopback_root,
-            loopback_phase,
-            Stage::Code,
-            &serde_json::from_str(
+        // Not approved and not an abort: a reject, refused before its claim
+        // (52-29, D-39). A bounded writer answers the first gate with it and
+        // the reopened gate with an abort; it records the state at each gate.
+        let writer_root = loopback_root.to_path_buf();
+        let writer = std::thread::spawn(move || {
+            let gate_path = Gates::gate_path(&writer_root, loopback_phase, Stage::Code);
+            let reject = serde_json::from_str::<devflow_core::gates::GateResponse>(
                 r#"{"approved":false,"note":"I will fix the plan first","responded_by":"test"}"#,
             )
-            .unwrap(),
-        );
+            .unwrap();
+            let abort = serde_json::from_str::<devflow_core::gates::GateResponse>(
+                r#"{"approved":false,"abort":true,"note":"test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap();
+            let mut seen: Vec<(serde_json::Value, State)> = Vec::new();
+            for answer in [reject, abort] {
+                let started = std::time::Instant::now();
+                let gate = loop {
+                    let gate = std::fs::read_to_string(&gate_path)
+                        .ok()
+                        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+                    if let Some(gate) = gate
+                        && seen
+                            .last()
+                            .is_none_or(|(last, _)| last["gate_id"] != gate["gate_id"])
+                    {
+                        break gate;
+                    }
+                    assert!(
+                        started.elapsed() < std::time::Duration::from_secs(30),
+                        "gate {} did not open",
+                        seen.len() + 1
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                };
+                let at_gate = workflow::load_state(&writer_root, loopback_phase).unwrap();
+                devflow_core::test_support::answer_open_gate(
+                    &writer_root,
+                    loopback_phase,
+                    Stage::Code,
+                    &answer,
+                )
+                .unwrap();
+                seen.push((gate, at_gate));
+            }
+            seen
+        });
 
-        // SAFETY: serialized under ENV_MUTEX (the guard is still held).
+        // SAFETY: serialized under ENV_MUTEX (the guard is still held). The
+        // writer answers both gates, so no wait reaches this bound.
         unsafe {
-            std::env::set_var("DEVFLOW_GATE_TIMEOUT_SECS", "2");
+            std::env::set_var("DEVFLOW_GATE_TIMEOUT_SECS", "20");
         }
         let loopback_result = run_preflight(
             loopback_root,
             &mut loopback_state,
             agents::driver_for(AgentKind::Claude).as_ref(),
         );
-        let _loopback_reap = ReapMonitorOnDrop::after_launch(&loopback_state);
         // SAFETY: still serialized under ENV_MUTEX.
         unsafe {
             match &original_gate_timeout {
@@ -2341,19 +2289,38 @@ mod tests {
                 None => std::env::remove_var("DEVFLOW_GATE_TIMEOUT_SECS"),
             }
         }
+        let gates = writer.join().unwrap();
 
-        // The terminus is deliberately NOT asserted as Ok. LoopBack re-enters
-        // `run_preflight`, which refuses again; its own `Gates::close` has
-        // removed the one seeded response, so the next cycle's gate reaches
-        // the bounded 2s timeout and that Err propagates. Which terminus the
-        // recursion reaches is `run_preflight_loopback_bounds_recursion`'s
-        // subject, not this test's. What matters here is that NO arm along
-        // that path recorded a set.
-        let _ = loopback_result;
+        // The abort of the reopened gate ends the run: `Ok(false)`.
+        assert!(
+            matches!(loopback_result, Ok(false)),
+            "the refused reject, then the abort: {loopback_result:?}"
+        );
+        assert_eq!(gates.len(), 2, "the refused reject reopened the gate");
+        let first_id =
+            devflow_core::gates::GateId::parse(gates[0].0["gate_id"].as_str().unwrap()).unwrap();
+        assert!(
+            !Gates::claim_path(loopback_root, loopback_phase, Stage::Code, &first_id).exists(),
+            "the refused reject was never claimed"
+        );
+        assert_eq!(gates[1].0["gate_kind"], "preflight", "{}", gates[1].0);
+        assert!(
+            gates[1].1.gate_pending,
+            "gate_pending stays set at the reopened gate"
+        );
+        assert_eq!(
+            gates[1].1.checkpoint_approval,
+            CheckpointApproval::Pending,
+            "a refused reject is not approval and records nothing"
+        );
         assert_eq!(
             loopback_state.checkpoint_approval,
             CheckpointApproval::Pending,
-            "a LoopBack answer is not approval and must record nothing"
+            "a refused reject widens nothing (T-48-15-03)"
+        );
+        assert!(
+            loopback_state.supervisor.is_none(),
+            "a refused reject launches nothing: {loopback_state:?}"
         );
     }
 

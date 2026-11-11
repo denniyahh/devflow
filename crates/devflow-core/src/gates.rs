@@ -1522,7 +1522,7 @@ impl Gates {
             timestamp: unix_now(),
             gate_id: gate_id.to_string(),
             gate_kind: Some(label.kind),
-            gsd_status: None,
+            gsd_status: label.gsd_status,
         };
         let path = Self::gate_path(project_root, phase, stage);
         info!("writing gate {} for phase {phase}", stage);

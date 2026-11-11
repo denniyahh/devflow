@@ -20,7 +20,7 @@ use crate::pipeline_gate::{
 use crate::pipeline_launch::{
     close_gate, commit, launch_stage, record_relaunch_note, recorded_canary_refusal,
 };
-use devflow_core::gates::{GateAction, GateFile, GateKind, GateResponse};
+use devflow_core::gates::{GateAction, GateFile, GateKind, GateLabel, GateResponse};
 use devflow_core::gsd_reader::{self, GsdStatus, ReaderFailure, StatusReport};
 use devflow_core::mode::{self, Mode};
 use devflow_core::phase_id::PhaseId;
@@ -516,25 +516,6 @@ pub(crate) fn next_step(trigger: Trigger<'_>) -> Step {
     }
 }
 
-/// Whether a gate of `kind` is a verification gate: one whose approve is
-/// routed by GSD's fresh status (D-45 rule 2). Interim (52-29 Task 1) until
-/// the answer families.
-pub(crate) fn is_verification_kind(kind: GateKind) -> bool {
-    match kind {
-        GateKind::CleanPass
-        | GateKind::GapsFound
-        | GateKind::ReverifyNeeded
-        | GateKind::HumanNeeded
-        | GateKind::DisagreementOverPassed
-        | GateKind::DisagreementOverHumanNeeded
-        | GateKind::ReaderFailure
-        | GateKind::AmbiguousVerdict
-        | GateKind::FailureCap
-        | GateKind::NoGapClosurePlan => true,
-        GateKind::StageFailure | GateKind::Preflight | GateKind::CheckpointDeclaration => false,
-    }
-}
-
 /// Which answers a gate's kind takes (D-45 rule 2, D-37, D-39): the kind is a
 /// label, so every verification kind is one family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -802,11 +783,8 @@ pub(crate) fn screen_answer(
 pub(crate) enum Answer {
     /// An approve and its route.
     Approve(ApproveRoute),
-    /// A reject, with its note.
-    Reject {
-        /// The operator's note.
-        note: Option<String>,
-    },
+    /// A reject and its route.
+    Reject(RejectRoute),
     /// An abort, with its reason.
     Abort(String),
 }
@@ -822,11 +800,16 @@ impl Answer {
                 "gsd_status": evidence.status().map(gsd_status_name),
                 "agent_pass_on_head": evidence.agent_pass_on_head,
             }),
-            Answer::Approve(ApproveRoute::StatusLess(step)) => {
+            Answer::Approve(ApproveRoute::StatusLess(step))
+            | Answer::Reject(RejectRoute::StatusLess(step)) => {
                 serde_json::json!({ "route": step.name() })
             }
-            Answer::Approve(ApproveRoute::Refused(_)) => serde_json::json!({ "route": "refused" }),
-            Answer::Reject { .. } => serde_json::json!({ "route": "reject" }),
+            Answer::Reject(RejectRoute::Verification(step)) => {
+                serde_json::json!({ "route": step.name() })
+            }
+            Answer::Approve(ApproveRoute::Refused(_)) | Answer::Reject(RejectRoute::Refused(_)) => {
+                serde_json::json!({ "route": "refused" })
+            }
             Answer::Abort(_) => serde_json::json!({ "route": "end" }),
         }
     }
@@ -841,30 +824,34 @@ pub(crate) fn evidence_root(project_root: &Path, state: &State) -> PathBuf {
         .unwrap_or_else(|| project_root.to_path_buf())
 }
 
-/// Route `response`, the claimed answer to a gate of `kind`. A verification
-/// approve reads the evidence fresh (D-45 rule 2) and takes [`next_step`]'s
-/// row; nothing here reads the gate's context or a status it recorded.
+/// Route `response`, the claimed answer to `gate` (the file read back from
+/// disk), through [`approve_route`] and [`reject_route`]: a verification
+/// approve reads the evidence fresh (D-45 rule 2); nothing here reads the
+/// gate's context or a status it recorded. The run's recorded delivery canary
+/// refusal is passed for the stage-failure family (999.187).
 pub(crate) fn route_answer(
     project_root: &Path,
     state: &State,
-    kind: GateKind,
+    gate: &GateFile,
     response: &GateResponse,
 ) -> Answer {
+    let canary_refusal = recorded_canary_refusal(state);
     match GateAction::from_response(response) {
         GateAction::Abort(reason) => Answer::Abort(reason),
-        GateAction::LoopBack { note, .. } => Answer::Reject { note },
-        GateAction::Advance if is_verification_kind(kind) => {
-            let evidence = read_evidence(
-                &evidence_root(project_root, state),
-                state.phase,
-                state.validate_pass_head.as_deref(),
-            );
-            let step = next_step(Trigger::Approve(&evidence));
-            Answer::Approve(ApproveRoute::Verification { step, evidence })
-        }
         GateAction::Advance => {
-            Answer::Approve(ApproveRoute::StatusLess(StatusLessStep::RetryStage))
+            Answer::Approve(approve_route(gate, canary_refusal.as_deref(), || {
+                read_evidence(
+                    &evidence_root(project_root, state),
+                    state.phase,
+                    state.validate_pass_head.as_deref(),
+                )
+            }))
         }
+        GateAction::LoopBack { note, .. } => Answer::Reject(reject_route(
+            gate,
+            canary_refusal.as_deref(),
+            note.as_deref().unwrap_or_default(),
+        )),
     }
 }
 
@@ -1375,23 +1362,17 @@ pub(crate) fn handle_validate_outcome(
             // An ambiguous verdict spends no budget, so answering its gate
             // resets none.
             let ceiling_gate = ceiling_gate && verdict != AgentVerdict::Ambiguous;
-            let reject = LegacyReject {
-                fix: reject_fix(read),
-                report: reverify_report(read),
-                reason: match verdict {
-                    // A human adjudicated an ambiguous outcome; no commit
-                    // baseline was consulted, so this makes no claim about one.
-                    AgentVerdict::Ambiguous => LoopBackReason::GateResponse,
-                    AgentVerdict::Pass | AgentVerdict::Fail => loop_back_reason(baseline_absent),
-                },
+            // The status the gate was opened over is recorded as a label.
+            let label = GateLabel {
+                kind,
+                gsd_status: evidence.status(),
             };
             open_verification_gate(
                 project_root,
                 state,
-                (Stage::Validate, kind),
+                (Stage::Validate, label),
                 (&context, &event_context),
                 ceiling_gate,
-                reject,
             )
         }
         // D-45 rule 2's after-Validate column: a finish, the gap loop or the
@@ -1401,59 +1382,41 @@ pub(crate) fn handle_validate_outcome(
             state,
             Stage::Validate,
             step,
-            &evidence,
+            Some(&evidence),
             loop_back_reason(baseline_absent),
         ),
     }
 }
 
-/// Interim (52-29 Task 1, until the quick route): what rejecting a
-/// verification gate loops back to Code with.
-struct LegacyReject {
-    fix: FixType,
-    report: Option<ReverifyReport>,
-    reason: LoopBackReason,
-}
-
-/// The fix a rejected Validate gate loops back to Code with (interim): the
-/// gaps pass when GSD found gaps, the re-verify pass when GSD reads `stale` or
-/// `missing` (D-32 part 1), otherwise the full execute command.
-fn reject_fix(read: &ValidateRead) -> FixType {
-    match read.as_ref().map(|report| report.status) {
-        Ok(GsdStatus::GapsFound) => FixType::GapsOnly,
-        Ok(GsdStatus::Stale | GsdStatus::Missing) => FixType::StaleReverify,
-        Ok(GsdStatus::Passed | GsdStatus::HumanNeeded) | Err(_) => FixType::FullExecute,
-    }
-}
-
-/// Open a verification gate (`stage`, `kind`) with its context and the one its
-/// event carries, and act on its answer through [`dispatch_answer`].
+/// Open a verification gate (`stage`, `label`) with its context and the one
+/// its event carries, and act on its answer through [`dispatch_answer`].
 /// `ceiling_gate` is the caller's one read of whether the gate opened at the
 /// per-phase ceiling (F-6).
 fn open_verification_gate(
     project_root: &Path,
     state: &mut State,
-    at: (Stage, GateKind),
+    at: (Stage, GateLabel),
     contexts: (&str, &str),
     ceiling_gate: bool,
-    reject: LegacyReject,
 ) -> Result<(), CliError> {
-    let (stage, kind) = at;
+    let (stage, label) = at;
     let answer =
-        run_gate_with_event_context(project_root, state, stage, kind, contexts.0, contexts.1)?;
-    dispatch_answer(project_root, state, stage, answer, ceiling_gate, reject)
+        run_gate_with_event_context(project_root, state, stage, label, contexts.0, contexts.1)?;
+    dispatch_answer(project_root, state, stage, answer, ceiling_gate)
 }
 
-/// Act on a routed answer to a verification gate at `stage`. The one place
-/// the per-phase reset runs for an answer (D-12): before any route that
-/// continues the run, never on abort.
-fn dispatch_answer(
+/// The one dispatch every routed answer at `stage` goes through, by family
+/// (D-45 rule 2, D-39). It owns the single per-phase reset an answer makes
+/// (D-12, review 5 pi C3): before any route that continues the run, keyed on
+/// the caller's `ceiling_gate`, never on abort. The preflight override and the
+/// checkpoint-set record are run by their own gates' sites, which hold the
+/// adjudicated check and the scanned set.
+pub(crate) fn dispatch_answer(
     project_root: &Path,
     state: &mut State,
     stage: Stage,
     answer: Answer,
     ceiling_gate: bool,
-    reject: LegacyReject,
 ) -> Result<(), CliError> {
     match answer {
         // No reset on abort: the phase is ending and `abort` clears its state
@@ -1467,38 +1430,68 @@ fn dispatch_answer(
                 state,
                 stage,
                 step,
-                &evidence,
+                Some(&evidence),
                 LoopBackReason::GateResponse,
             )
         }
-        Answer::Approve(ApproveRoute::StatusLess(_) | ApproveRoute::Refused(_)) => {
-            Err(CliError::Message(format!(
-                "phase {}: a verification gate at {stage} was answered as a status-less gate",
-                state.phase
-            )))
-        }
-        Answer::Reject { note } => {
+        Answer::Reject(RejectRoute::Verification(step)) => {
             reset_phase_failures_at_ceiling(project_root, state, ceiling_gate)?;
-            if stage == Stage::Plan {
-                // The gaps Plan gates (52-27): a reject loops back gaps-only.
-                return loop_back_to_code(
-                    project_root,
-                    state,
-                    FixType::GapsOnly,
-                    note,
-                    None,
-                    LoopBackReason::GateResponse,
-                );
-            }
-            // The rejection's note is the fix request: it rides the fix pass.
-            loop_back_to_code(
+            run_step(
                 project_root,
                 state,
-                reject.fix,
-                note,
-                reject.report,
-                reject.reason,
+                stage,
+                step,
+                None,
+                LoopBackReason::GateResponse,
             )
+        }
+        Answer::Approve(ApproveRoute::StatusLess(step))
+        | Answer::Reject(RejectRoute::StatusLess(step)) => {
+            reset_phase_failures_at_ceiling(project_root, state, ceiling_gate)?;
+            run_status_less_step(project_root, state, stage, step)
+        }
+        // The screen refused these before the claim, so none arrives here.
+        Answer::Approve(ApproveRoute::Refused(refusal))
+        | Answer::Reject(RejectRoute::Refused(refusal)) => Err(CliError::Message(format!(
+            "phase {}: a refused {} on the {stage} gate reached the dispatch: {}",
+            state.phase, refusal.answer, refusal.why
+        ))),
+    }
+}
+
+/// Run a status-less gate's own answer at `stage` (D-39).
+fn run_status_less_step(
+    project_root: &Path,
+    state: &mut State,
+    stage: Stage,
+    step: StatusLessStep,
+) -> Result<(), CliError> {
+    // CR-01: close the gate before relaunching; its answer is spent.
+    let _ = close_gate(project_root, state.phase, stage);
+    state.gate_pending = false;
+    match step {
+        StatusLessStep::RetryStage => launch_stage(state, None, Some(stage)),
+        StatusLessStep::RelaunchWithNote(note) => {
+            // GATE-01 / D-39: the note is the operator's word for this
+            // relaunch, committed before the launch. It is never the fix
+            // request, so `code_fix` and `code_fix_note` are left alone.
+            record_relaunch_note(state, Some(note))?;
+            launch_stage(state, None, Some(stage))
+        }
+        StatusLessStep::RelaunchRefused { refusal, note } => {
+            // 52-26: a reject's note is kept for the `devflow resume --agent
+            // <other>` the stop names; an approve carries none.
+            if let Some(note) = note {
+                record_relaunch_note(state, Some(note))?;
+            }
+            refuse_relaunch(project_root, state, stage, &refusal)
+        }
+        StatusLessStep::PreflightOverride | StatusLessStep::RecordCheckpointSet => {
+            Err(CliError::Message(format!(
+                "phase {}: the {} step is run by its own gate's site, not at {stage}",
+                state.phase,
+                step.name()
+            )))
         }
     }
 }
@@ -1512,7 +1505,7 @@ fn run_step(
     state: &mut State,
     stage: Stage,
     step: Step,
-    evidence: &Evidence,
+    evidence: Option<&Evidence>,
     reason: LoopBackReason,
 ) -> Result<(), CliError> {
     match step {
@@ -1527,7 +1520,7 @@ fn run_step(
                 Stage::Validate => transition(project_root, state, Stage::Plan),
                 // At a gaps Plan gate the pass is already under way: run the
                 // gaps Plan pass again, the marker still set.
-                _ => relaunch_failed_stage(project_root, state, stage),
+                _ => relaunch_or_refuse(project_root, state, stage),
             }
         }
         Step::Reverify => loop_back_to_code(
@@ -1535,7 +1528,7 @@ fn run_step(
             state,
             FixType::StaleReverify,
             None,
-            reverify_report(&evidence.read),
+            evidence.and_then(|evidence| reverify_report(&evidence.read)),
             reason,
         ),
         Step::ValidateAgain => {
@@ -1543,15 +1536,23 @@ fn run_step(
             let _ = close_gate(project_root, state.phase, stage);
             state.gate_pending = false;
             match stage {
-                Stage::Validate => relaunch_failed_stage(project_root, state, Stage::Validate),
+                Stage::Validate => relaunch_or_refuse(project_root, state, Stage::Validate),
                 _ => transition(project_root, state, Stage::Validate),
             }
         }
-        Step::Reopen => reopen_verification_gate(project_root, state, stage, evidence),
+        Step::Reopen => match evidence {
+            Some(evidence) => reopen_verification_gate(project_root, state, stage, evidence),
+            None => Err(CliError::Message(format!(
+                "phase {}: a reopen at {stage} has no fresh read",
+                state.phase
+            ))),
+        },
+        // GATE-02 / D-10: the operator's small fix, `/gsd-quick` with the note,
+        // then Validate. The loop-back clears the gap marker in its commit.
         Step::Quick(note) => loop_back_to_code(
             project_root,
             state,
-            FixType::FullExecute,
+            FixType::Quick,
             Some(note),
             None,
             LoopBackReason::GateResponse,
@@ -1597,18 +1598,16 @@ fn reopen_verification_gate(
             )
         }
     };
-    let reject = LegacyReject {
-        fix: reject_fix(&evidence.read),
-        report: reverify_report(&evidence.read),
-        reason: LoopBackReason::GateResponse,
+    let label = GateLabel {
+        kind,
+        gsd_status: evidence.status(),
     };
     open_verification_gate(
         project_root,
         state,
-        (stage, kind),
+        (stage, label),
         (&context, &event_context),
         false,
-        reject,
     )
 }
 
@@ -1745,11 +1744,6 @@ pub(crate) fn handle_gaps_plan_outcome(
         .worktree_path
         .clone()
         .unwrap_or_else(|| project_root.to_path_buf());
-    let reject = || LegacyReject {
-        fix: FixType::GapsOnly,
-        report: None,
-        reason: LoopBackReason::GateResponse,
-    };
     match has_new_gap_closure_plan(&evidence_root, state.phase) {
         Ok(true) => transition(project_root, state, Stage::Code),
         Ok(false) => {
@@ -1767,10 +1761,15 @@ pub(crate) fn handle_gaps_plan_outcome(
             open_verification_gate(
                 project_root,
                 state,
-                (Stage::Plan, GateKind::NoGapClosurePlan),
+                (
+                    Stage::Plan,
+                    GateLabel {
+                        kind: GateKind::NoGapClosurePlan,
+                        gsd_status: Some(GsdStatus::GapsFound),
+                    },
+                ),
                 (&context, &context),
                 ceiling_gate,
-                reject(),
             )
         }
         Err(failure) => {
@@ -1789,13 +1788,12 @@ pub(crate) fn handle_gaps_plan_outcome(
             open_verification_gate(
                 project_root,
                 state,
-                (Stage::Plan, GateKind::ReaderFailure),
+                (Stage::Plan, GateKind::ReaderFailure.into()),
                 (
                     &format!("{lead}: {}{way_on}", truncate_reason(&failure.detail())),
                     &format!("{lead}{way_on}"),
                 ),
                 false,
-                reject(),
             )
         }
     }
@@ -2056,49 +2054,42 @@ fn answer_stage_failure_gate(
     stage: Stage,
     context: &str,
 ) -> Result<(), CliError> {
-    match run_gate(project_root, state, stage, GateKind::StageFailure, context)? {
-        Answer::Approve(_) => {
-            // CR-01: close the gate before retrying; its answer is spent.
-            let _ = close_gate(project_root, state.phase, stage);
-            state.gate_pending = false;
-            relaunch_failed_stage(project_root, state, stage)
-        }
-        Answer::Reject { note } => {
-            // Retry the SAME failed stage — Code is not a valid recovery
-            // target before planning exists for a Define/Plan failure
-            // (Codex 13-01 MEDIUM).
-            let _ = close_gate(project_root, state.phase, stage);
-            // GATE-01 / D-39: the note is the operator's word for this
-            // relaunch, so it is committed before `relaunch_failed_stage` runs:
-            // a relaunch the recorded canary refuses keeps it for the
-            // `devflow resume --agent <other>` its stop names. It is never the
-            // fix request, so `code_fix` and `code_fix_note` are left alone.
-            record_relaunch_note(state, note)?;
-            relaunch_failed_stage(project_root, state, stage)
-        }
-        Answer::Abort(reason) => abort(project_root, state, &reason),
-    }
+    let answer = run_gate(project_root, state, stage, GateKind::StageFailure, context)?;
+    dispatch_answer(project_root, state, stage, answer, false)
 }
 
-/// Relaunch `stage` for a retry or loop-back answer to its never-silent gate.
-///
-/// A delivery canary the run already recorded as refusing its agent refuses every
-/// relaunch under that agent, and that refusal would clear the supervisor record and end
-/// the supervisor with no gate, no event and no cause (backlog 999.187). The gate after
-/// a failover whose fallback failed its canary makes this routine. So the relaunch is not
-/// tried: the run is marked stopped, with a reason naming the refusal and
-/// `devflow resume --phase N --agent <other>` as the way on, a `gate_relaunch_refused`
-/// event is written, and the supervisor ends. Not a new gate: a supervisor waiting at a
-/// gate is live, and `resume` refuses over a live run. All of it is written while the
-/// supervisor is still the one the state records.
-fn relaunch_failed_stage(
+/// Relaunch `stage` for a verification step that reruns a stage (Validate
+/// again, or the gaps Plan pass again), unless the run's recorded delivery
+/// canary refuses its agent, which [`refuse_relaunch`] reports. The
+/// stage-failure family's choice between the two is its routers' (D-39), not
+/// this function's.
+fn relaunch_or_refuse(
     project_root: &Path,
     state: &mut State,
     stage: Stage,
 ) -> Result<(), CliError> {
-    let Some(refusal) = recorded_canary_refusal(state) else {
-        return launch_stage(state, None, Some(stage));
-    };
+    match recorded_canary_refusal(state) {
+        Some(refusal) => refuse_relaunch(project_root, state, stage, &refusal),
+        None => launch_stage(state, None, Some(stage)),
+    }
+}
+
+/// The relaunch-refused step (backlog 999.187): a delivery canary the run
+/// already recorded as refusing its agent refuses every relaunch under that
+/// agent, and that refusal would clear the supervisor record and end the
+/// supervisor with no gate, no event and no cause. So the relaunch is not
+/// tried: the run is marked stopped, with a reason naming the refusal and
+/// `devflow resume --phase N --agent <other>` as the way on, a
+/// `gate_relaunch_refused` event is written, and the supervisor ends. Not a new
+/// gate: a supervisor waiting at a gate is live, and `resume` refuses over a
+/// live run. All of it is written while the supervisor is still the one the
+/// state records.
+fn refuse_relaunch(
+    project_root: &Path,
+    state: &mut State,
+    stage: Stage,
+    refusal: &str,
+) -> Result<(), CliError> {
     let phase = state.phase;
     let agent = state.agent;
     let stop_reason = format!(
@@ -5695,9 +5686,9 @@ mod tests {
     }
 
     /// 999.192: a report the verifier wrote during Code routes by GSD's status,
-    /// never by when it was written. `gaps_found` takes the gaps route, in auto
-    /// mode and on a supervise reject (the Phase 51 case); `passed` takes the
-    /// finish path. No row relaunches the full execute command.
+    /// never by when it was written. `gaps_found` takes the gaps route in auto
+    /// mode, and a supervise reject runs `/gsd-quick` (52-29, D-10); `passed`
+    /// takes the finish path. No row relaunches the full execute command.
     #[test]
     fn a_verifier_written_report_from_code_routes_by_gsd_status() {
         if !in_bounded_child(
@@ -5744,7 +5735,8 @@ mod tests {
         );
         no_full_execute(root, phase, "auto gaps_found");
 
-        // Supervise, the operator rejects the gaps_found gate: the gaps loop.
+        // Supervise, the operator rejects the gaps_found gate: since 52-29
+        // (GATE-02, D-10) the quick pass with the note, never the full execute.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(5241);
@@ -5763,8 +5755,8 @@ mod tests {
         assert_eq!(gate["gate_kind"], "gaps_found", "{gate}");
         assert_eq!(
             last_loop_back_fix(root, phase).as_deref(),
-            Some("GapsOnly"),
-            "a rejected gaps_found gate takes the gaps route: {:?}",
+            Some("Quick"),
+            "a rejected gaps_found gate runs /gsd-quick with the note: {:?}",
             phase_events(root, phase)
         );
         no_full_execute(root, phase, "supervise reject over gaps_found");
@@ -7231,9 +7223,17 @@ mod tests {
             let (mut state, _) = gaps_plan_fixture(root, phase, false);
             state.phase_validate_failures = before;
             workflow::save_state(&state).unwrap();
-            let (gate, at_gate) = at_the_gate(root, phase, Stage::Plan, &answer, || {
+            // 52-29: an approve reads GSD fresh (D-45 rule 2); `human_needed`
+            // reopens an uncounted gate, which the writer aborts.
+            let _gsd = GsdStub::answering(root, &[gsd_says(GsdStatus::HumanNeeded)]);
+            let mut answers = vec![answer.clone()];
+            if !answer.abort {
+                answers.push(abort_answer());
+            }
+            let gates = at_the_gates_with(root, phase, Stage::Plan, &answers, false, || {
                 let _ = handle_gaps_plan_outcome(root, &mut state);
             });
+            let (gate, at_gate) = gates[0].clone();
             assert_eq!(gate["gate_kind"], "no_gap_closure_plan", "{row}: {gate}");
             assert_eq!(
                 at_gate.phase_validate_failures,
@@ -7260,9 +7260,20 @@ mod tests {
                  {resets:?}"
             );
             if !answer.abort {
-                let after = workflow::load_state(root, phase).unwrap();
-                let expected = if at_ceiling { 0 } else { before + 1 };
-                assert_eq!(after.phase_validate_failures, expected, "{row}");
+                assert_eq!(gates[1].0["gate_kind"], "human_needed", "{row}: reopened");
+            }
+            // The abort removes the state file, so the counts are read from
+            // the state the call held, and the resets from the events.
+            let expected = match (answer.abort, at_ceiling) {
+                (false, true) => 0,
+                _ => before + 1,
+            };
+            assert_eq!(state.phase_validate_failures, expected, "{row}");
+            if continues_at_ceiling {
+                assert_eq!(
+                    resets[0]["phase_validate_failures_before"], ceiling,
+                    "{row}: {resets:?}"
+                );
             }
         }
     }
@@ -7761,14 +7772,9 @@ mod tests {
         let _ = open_verification_gate(
             root,
             state,
-            (stage, label.kind),
+            (stage, label),
             ("a parity gate", "a parity gate"),
             ceiling_gate,
-            LegacyReject {
-                fix: FixType::FullExecute,
-                report: None,
-                reason: LoopBackReason::GateResponse,
-            },
         );
     }
 

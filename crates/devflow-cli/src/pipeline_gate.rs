@@ -28,7 +28,7 @@ use crate::pipeline_launch::{
 use crate::pipeline_outcomes::{Answer, FinishPermit, truncate_reason};
 #[cfg(test)]
 use devflow_core::gates::GateId;
-use devflow_core::gates::{self, Claim, GateAction, GateKind, Gates};
+use devflow_core::gates::{self, Claim, GateAction, GateFile, GateLabel, Gates};
 use devflow_core::mode;
 #[cfg(test)]
 use devflow_core::phase_id::PhaseId;
@@ -483,7 +483,7 @@ pub(crate) fn run_gate(
     project_root: &Path,
     state: &mut State,
     stage: Stage,
-    kind: GateKind,
+    kind: impl Into<GateLabel>,
     context: &str,
 ) -> Result<Answer, CliError> {
     run_gate_with_timeout(
@@ -505,7 +505,7 @@ pub(crate) fn run_gate_with_event_context(
     project_root: &Path,
     state: &mut State,
     stage: Stage,
-    kind: GateKind,
+    kind: impl Into<GateLabel>,
     context: &str,
     event_context: &str,
 ) -> Result<Answer, CliError> {
@@ -513,7 +513,7 @@ pub(crate) fn run_gate_with_event_context(
         project_root,
         state,
         stage,
-        kind,
+        kind.into(),
         (context, event_context),
         gate_timeout_secs(),
     )
@@ -531,7 +531,7 @@ pub(crate) fn run_gate_with_timeout(
     project_root: &Path,
     state: &mut State,
     stage: Stage,
-    kind: GateKind,
+    kind: impl Into<GateLabel>,
     context: &str,
     timeout_secs: u64,
 ) -> Result<Answer, CliError> {
@@ -539,7 +539,7 @@ pub(crate) fn run_gate_with_timeout(
         project_root,
         state,
         stage,
-        kind,
+        kind.into(),
         (context, context),
         timeout_secs,
     )
@@ -547,180 +547,255 @@ pub(crate) fn run_gate_with_timeout(
 
 /// The body [`run_gate_with_timeout`] and [`run_gate_with_event_context`] share.
 /// `contexts` is the gate's context and the one its `gate_fired` event carries.
-/// The gate's `kind` is required, so no gate opens without one (D-39), and it is
-/// written by the same atomic write as the rest of the gate file (52-22).
+/// The gate's `label` is required, so no gate opens without a kind (D-39), and
+/// it is written by the same atomic write as the rest of the gate file (52-22).
+///
+/// R10 (52-29): every answer is screened at its pickup, before the claim, the
+/// `gate_pending` write and `gate_resolved`, from the gate file and the answer
+/// alone ([`crate::pipeline_outcomes::screen_answer`], no GSD read). A refused
+/// answer is never claimed: the gate is reopened never-silently with the label
+/// this supervisor opened it with (C11), which sets the refused answer aside,
+/// `gate_answer_refused` is emitted, and the wait starts again on the reopened
+/// gate. Every other answer is claimed and routed, and `gate_resolved` names
+/// the route.
 fn open_and_await(
     project_root: &Path,
     state: &mut State,
     stage: Stage,
-    kind: GateKind,
+    label: GateLabel,
     contexts: (&str, &str),
     timeout_secs: u64,
 ) -> Result<Answer, CliError> {
-    let (context, event_context) = contexts;
+    let (question, question_event) = contexts;
+    let mut context = question.to_string();
+    let mut event_context = question_event.to_string();
     commit(state, |s| s.gate_pending = true)?;
-    // A crash inside this call before the publish leaves `gate_pending` with no gate
-    // file, which `doctor`'s `check_gate_pending_without_gate` reports.
-    let (opened, registration) = fenced(project_root, state.phase, || {
-        Ok(Gates::open_registered(
-            project_root,
-            state.phase,
-            stage,
-            kind,
-            context,
-        )?)
-    })?;
-    let gate_id = &opened.gate_id;
-    println!(
-        "gate written: .devflow/gates/{}-{stage}.json — awaiting response",
-        state.phase.padded()
-    );
-    // A gate is "unexpected" when the active mode would not normally fire
-    // one for this stage (e.g. a Define/Plan/Code failure in Auto mode) —
-    // WR-11's never-silent path gates unconditionally, independent of mode.
-    let unexpected = !state.mode.should_gate(
-        stage,
-        state.consecutive_failures,
-        state.phase_validate_failures,
-    );
-    if unexpected {
-        info!(
-            "never-silent gate: {stage} failed in {:?} mode — surfacing an unattended gate this mode would not normally fire",
-            state.mode
-        );
-    }
-    events::emit(
-        project_root,
-        state.phase,
-        "gate_fired",
-        serde_json::json!({
-            "stage": stage.to_string(),
-            "unexpected": unexpected,
-            "context": event_context,
-            "gate_kind": kind,
-        }),
-    );
-    gates::fire_gate_notify_with_fallback(
-        state.phase,
-        stage,
-        context,
-        unexpected,
-        state.gate_notify_cmd.as_deref(),
-    );
-    events::emit(
-        project_root,
-        state.phase,
-        "notify_fired",
-        serde_json::json!({ "stage": stage.to_string(), "unexpected": unexpected }),
-    );
-    let wait_end = match gate_wait_call(project_root, state.phase, stage, gate_id, timeout_secs) {
-        Ok(end) => end,
-        Err(err) => {
-            registration.finish();
-            return Err(err);
-        }
-    };
-    match wait_end {
-        GateWaitEnd::Answered(response) => {
-            let claim = fenced(project_root, state.phase, || {
-                Ok(Gates::claim(project_root, state.phase, stage, gate_id))
-            });
-            let claim = match claim {
-                Ok(claim) => claim,
-                // D-03: not the recorded supervisor, so nothing was claimed.
-                Err(err) => {
-                    registration.finish();
-                    return Err(err);
-                }
-            };
-            #[cfg(test)]
-            note_claim(&claim);
-            match claim {
-                Ok(Claim::Claimed) => {}
-                Ok(Claim::AlreadyConsumed) => {
-                    registration.finish();
-                    return Err(CliError::Message(format!(
-                        "phase {}: the answer to {stage} gate {gate_id} was already consumed: \
-                         another consumer acted on it, so this wait did nothing",
-                        state.phase
-                    )));
-                }
-                // R-08: the gate closed or was replaced after the answer was read, or
-                // its lock was held too long. Nothing here records a decision.
-                Err(err) => {
-                    registration.finish();
-                    return Err(CliError::Message(format!(
-                        "phase {}: the answer to {stage} gate {gate_id} could not be claimed, \
-                         so nothing was consumed: {err}",
-                        state.phase
-                    )));
-                }
-            }
-            registration.finish();
-            #[cfg(test)]
-            crate::pipeline_launch::test_hold("after_claim");
-            // D-08: whatever changed on disk during the wait (a `stop`, an
-            // edited notify command) is kept, because this
-            // write re-reads the state and sets only this field.
-            commit(state, |s| s.gate_pending = false)?;
-            let action = GateAction::from_response(&response);
-            // D-45 rule 2: the answer is routed here, after its claim, so
-            // `gate_resolved` names the route it runs and the evidence a
-            // verification approve was routed on.
-            let answer =
-                crate::pipeline_outcomes::route_answer(project_root, state, kind, &response);
-            let mut resolved = serde_json::json!({
-                "stage": stage.to_string(),
-                "gate_id": gate_id.as_str(),
-                "gate_kind": kind,
-                "approved": response.approved,
-                "action": match &action {
-                    GateAction::Advance => "advance",
-                    GateAction::LoopBack { .. } => "loop_back",
-                    GateAction::Abort(_) => "abort",
-                },
-                "responded_by": response.responded_by,
-            });
-            if let (Some(resolved), serde_json::Value::Object(route)) =
-                (resolved.as_object_mut(), answer.resolved_fields())
-            {
-                resolved.extend(route);
-            }
-            events::emit(project_root, state.phase, "gate_resolved", resolved);
-            // `gate_pending` reads false here, and the caller has not applied the action.
-            #[cfg(test)]
-            crate::pipeline_launch::test_hold("after_commit");
-            Ok(answer)
-        }
-        GateWaitEnd::Stopped => {
-            // Safe point 4 (50-13, R-2): the supervisor running this advance
-            // was stopped during the wait. The gate has no waiter any more, so
-            // it is closed (an unconsumed answer is set aside, nothing outlives
-            // the run in its slot), the stop is recorded, and an error unwinds
-            // every caller through `?`, which releases a foreground process's holder.
-            // Deliberately not `GateAction::Abort`: `abort()` deletes the state
-            // file, and a stopped run keeps its state for `devflow resume`.
-            let _ = close_gate(project_root, state.phase, stage);
-            registration.finish();
-            crate::pipeline_launch::record_advance_stop(state, 4)?;
-            Err(CliError::Message(format!(
-                "the gate wait for stage {stage} ended: {}",
-                crate::pipeline_launch::safe_point_stop_reason()
-            )))
-        }
-        GateWaitEnd::TimedOut => {
-            registration.finish();
-            events::emit(
+    loop {
+        // A crash inside this call before the publish leaves `gate_pending` with no
+        // gate file, which `doctor`'s `check_gate_pending_without_gate` reports.
+        let (opened, registration) = fenced(project_root, state.phase, || {
+            Ok(Gates::open_registered(
                 project_root,
                 state.phase,
-                "gate_timeout",
-                serde_json::json!({ "stage": stage.to_string() }),
+                stage,
+                label,
+                &context,
+            )?)
+        })?;
+        let gate_id = &opened.gate_id;
+        println!(
+            "gate written: .devflow/gates/{}-{stage}.json — awaiting response",
+            state.phase.padded()
+        );
+        // A gate is "unexpected" when the active mode would not normally fire
+        // one for this stage (e.g. a Define/Plan/Code failure in Auto mode) —
+        // WR-11's never-silent path gates unconditionally, independent of mode.
+        let unexpected = !state.mode.should_gate(
+            stage,
+            state.consecutive_failures,
+            state.phase_validate_failures,
+        );
+        if unexpected {
+            info!(
+                "never-silent gate: {stage} failed in {:?} mode — surfacing an unattended gate this mode would not normally fire",
+                state.mode
             );
-            Err(CliError::Message(format!(
-                "gate for stage {stage} timed out awaiting a response"
-            )))
+        }
+        events::emit(
+            project_root,
+            state.phase,
+            "gate_fired",
+            serde_json::json!({
+                "stage": stage.to_string(),
+                "unexpected": unexpected,
+                "context": event_context,
+                "gate_kind": label.kind,
+            }),
+        );
+        gates::fire_gate_notify_with_fallback(
+            state.phase,
+            stage,
+            &context,
+            unexpected,
+            state.gate_notify_cmd.as_deref(),
+        );
+        events::emit(
+            project_root,
+            state.phase,
+            "notify_fired",
+            serde_json::json!({ "stage": stage.to_string(), "unexpected": unexpected }),
+        );
+        let wait_end = match gate_wait_call(project_root, state.phase, stage, gate_id, timeout_secs)
+        {
+            Ok(end) => end,
+            Err(err) => {
+                registration.finish();
+                return Err(err);
+            }
+        };
+        match wait_end {
+            GateWaitEnd::Answered(response) => {
+                // R10: the gate file as it is on disk names the answer's family.
+                let gate_file = read_gate_file(project_root, state.phase, stage);
+                let recorded_kind = gate_file.as_ref().and_then(|gate| gate.gate_kind);
+                if let Err(refusal) =
+                    crate::pipeline_outcomes::screen_answer(recorded_kind, &response)
+                {
+                    registration.finish();
+                    events::emit(
+                        project_root,
+                        state.phase,
+                        "gate_answer_refused",
+                        serde_json::json!({
+                            "stage": stage.to_string(),
+                            "gate_id": gate_id.as_str(),
+                            "gate_kind": recorded_kind,
+                            "answer": refusal.answer,
+                        }),
+                    );
+                    eprintln!(
+                        "phase {}: the {} on the {stage} gate was refused: {}",
+                        state.phase, refusal.answer, refusal.why
+                    );
+                    context = refused_answer_context(&refusal, question);
+                    event_context = refused_answer_context(&refusal, question_event);
+                    continue;
+                }
+                let claim = fenced(project_root, state.phase, || {
+                    Ok(Gates::claim(project_root, state.phase, stage, gate_id))
+                });
+                let claim = match claim {
+                    Ok(claim) => claim,
+                    // D-03: not the recorded supervisor, so nothing was claimed.
+                    Err(err) => {
+                        registration.finish();
+                        return Err(err);
+                    }
+                };
+                #[cfg(test)]
+                note_claim(&claim);
+                match claim {
+                    Ok(Claim::Claimed) => {}
+                    Ok(Claim::AlreadyConsumed) => {
+                        registration.finish();
+                        return Err(CliError::Message(format!(
+                            "phase {}: the answer to {stage} gate {gate_id} was already consumed: \
+                             another consumer acted on it, so this wait did nothing",
+                            state.phase
+                        )));
+                    }
+                    // R-08: the gate closed or was replaced after the answer was read, or
+                    // its lock was held too long. Nothing here records a decision.
+                    Err(err) => {
+                        registration.finish();
+                        return Err(CliError::Message(format!(
+                            "phase {}: the answer to {stage} gate {gate_id} could not be claimed, \
+                             so nothing was consumed: {err}",
+                            state.phase
+                        )));
+                    }
+                }
+                registration.finish();
+                #[cfg(test)]
+                crate::pipeline_launch::test_hold("after_claim");
+                // D-08: whatever changed on disk during the wait (a `stop`, an
+                // edited notify command) is kept, because this
+                // write re-reads the state and sets only this field.
+                commit(state, |s| s.gate_pending = false)?;
+                let action = GateAction::from_response(&response);
+                // D-45 rule 2: the answer is routed here, after its claim, so
+                // `gate_resolved` names the route it runs and the evidence a
+                // verification approve was routed on. The screen passed, so the
+                // file names a kind.
+                let gate_file = gate_file.unwrap_or_else(|| GateFile {
+                    phase: state.phase,
+                    stage,
+                    context: context.clone(),
+                    timestamp: String::new(),
+                    gate_id: gate_id.to_string(),
+                    gate_kind: Some(label.kind),
+                    gsd_status: label.gsd_status,
+                });
+                let answer = crate::pipeline_outcomes::route_answer(
+                    project_root,
+                    state,
+                    &gate_file,
+                    &response,
+                );
+                let mut resolved = serde_json::json!({
+                    "stage": stage.to_string(),
+                    "gate_id": gate_id.as_str(),
+                    "gate_kind": gate_file.gate_kind,
+                    "approved": response.approved,
+                    "action": match &action {
+                        GateAction::Advance => "advance",
+                        GateAction::LoopBack { .. } => "loop_back",
+                        GateAction::Abort(_) => "abort",
+                    },
+                    "responded_by": response.responded_by,
+                });
+                if let (Some(resolved), serde_json::Value::Object(route)) =
+                    (resolved.as_object_mut(), answer.resolved_fields())
+                {
+                    resolved.extend(route);
+                }
+                events::emit(project_root, state.phase, "gate_resolved", resolved);
+                // `gate_pending` reads false here, and the caller has not applied the action.
+                #[cfg(test)]
+                crate::pipeline_launch::test_hold("after_commit");
+                return Ok(answer);
+            }
+            GateWaitEnd::Stopped => {
+                // Safe point 4 (50-13, R-2): the supervisor running this advance
+                // was stopped during the wait. The gate has no waiter any more, so
+                // it is closed (an unconsumed answer is set aside, nothing outlives
+                // the run in its slot), the stop is recorded, and an error unwinds
+                // every caller through `?`, which releases a foreground process's holder.
+                // Deliberately not `GateAction::Abort`: `abort()` deletes the state
+                // file, and a stopped run keeps its state for `devflow resume`.
+                let _ = close_gate(project_root, state.phase, stage);
+                registration.finish();
+                crate::pipeline_launch::record_advance_stop(state, 4)?;
+                return Err(CliError::Message(format!(
+                    "the gate wait for stage {stage} ended: {}",
+                    crate::pipeline_launch::safe_point_stop_reason()
+                )));
+            }
+            GateWaitEnd::TimedOut => {
+                registration.finish();
+                events::emit(
+                    project_root,
+                    state.phase,
+                    "gate_timeout",
+                    serde_json::json!({ "stage": stage.to_string() }),
+                );
+                return Err(CliError::Message(format!(
+                    "gate for stage {stage} timed out awaiting a response"
+                )));
+            }
         }
     }
+}
+
+/// The gate file of `phase`'s `stage` gate as it is on disk, or `None` when it
+/// cannot be read or parsed. A file with no kind parses with `gate_kind: None`.
+fn read_gate_file(
+    project_root: &Path,
+    phase: devflow_core::phase_id::PhaseId,
+    stage: Stage,
+) -> Option<GateFile> {
+    let text = std::fs::read_to_string(Gates::gate_path(project_root, phase, stage)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// The context of a gate reopened after `refusal` (R10, never silent): what
+/// was refused and why, the answers that apply, then the gate's question.
+fn refused_answer_context(refusal: &crate::pipeline_outcomes::Refusal, question: &str) -> String {
+    format!(
+        "[never-silent] The {} was refused and nothing ran: {}. The answers that apply here: \
+         {}. The gate asked: {question}",
+        refusal.answer, refusal.why, refusal.applies
+    )
 }
 
 /// Abort the workflow with a reason, clearing state.
@@ -850,6 +925,7 @@ mod tests {
         ValidateOutcome, handle_infra_outcome, handle_validate_outcome,
     };
     use crate::test_support::*;
+    use devflow_core::gates::GateKind;
     use devflow_core::gates::GateResponse;
     use devflow_core::mode::Mode;
     use devflow_core::state::AgentKind;
