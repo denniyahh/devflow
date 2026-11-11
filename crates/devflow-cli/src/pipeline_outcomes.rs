@@ -6043,4 +6043,298 @@ mod tests {
             "control: a passed round counts nothing"
         );
     }
+
+    // ---- D-32 part 1: the re-verify pass for a `stale` or `missing` report ----
+
+    /// The Code prompt a launch of `state` with no override receives, as the
+    /// Claude driver renders it: the prompt a resume, a failover or a re-drive
+    /// of the stage gets (`default_stage_prompt` is the only renderer of one).
+    fn claude_launch_prompt(state: &State) -> String {
+        let driver = devflow_core::agents::driver_for(AgentKind::Claude);
+        crate::pipeline_launch::default_stage_prompt(state, driver.as_ref())
+    }
+
+    /// Whether `prompt` is the re-verify pass over GSD's `status`: it quotes
+    /// the status and the route `execute-phase`, asks for the verifier, and
+    /// does not run the gaps-only command.
+    fn is_reverify_prompt(prompt: &str, status: &str) -> bool {
+        prompt.contains(&format!("`{status}`"))
+            && prompt.contains("`execute-phase`")
+            && prompt.contains("re-run the verifier")
+            && !prompt.contains("--gaps-only")
+    }
+
+    /// The verification-status reads the GSD stub has answered so far.
+    fn status_reads(gsd: &GsdStub) -> usize {
+        gsd.calls()
+            .iter()
+            .filter(|(_, argv)| argv.contains("verification status"))
+            .count()
+    }
+
+    /// D-32 part 1, D-45 rule 3: an auto run whose Validate agent passes over
+    /// GSD's `stale` relaunches Code with the re-verify pass; when that Code
+    /// pass ends (advance's Code success arm, `transition` to Validate) GSD is
+    /// not read before Validate launches, and the next Validate's fresh read
+    /// decides: `passed` finishes the run. Control in the same test: GSD still
+    /// answering `stale` at the second Validate takes the re-verify pass again
+    /// and records no `workflow_finished`.
+    #[test]
+    fn a_stale_validate_runs_the_reverify_pass_then_validate() {
+        if !in_bounded_child(
+            "pipeline_outcomes::tests::a_stale_validate_runs_the_reverify_pass_then_validate",
+        ) {
+            return;
+        }
+        for (number, second, finishes) in [
+            (5340, GsdStatus::Passed, true),
+            (5341, GsdStatus::Stale, false),
+        ] {
+            let row = format!("second read {second:?}");
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = PhaseId::new(number);
+            let gsd =
+                validate_evidence(root, phase, &[gsd_says(GsdStatus::Stale), gsd_says(second)]);
+            let mut state = validate_state(root, phase, Mode::Auto);
+            // A gate here would take this abort and fail the assertions below.
+            preanswer_gate(root, phase, Stage::Validate, &abort_answer());
+            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Passed);
+
+            let at_code = workflow::load_state(root, phase).unwrap();
+            assert_eq!(at_code.stage, Stage::Code, "{row}: stale relaunches Code");
+            assert_eq!(
+                at_code.code_fix,
+                Some(FixType::StaleReverify),
+                "{row}: the Code pass is the re-verify pass; events: {:?}",
+                phase_events(root, phase)
+            );
+            assert_eq!(
+                last_loop_back_fix(root, phase).as_deref(),
+                Some("StaleReverify"),
+                "{row}"
+            );
+            let prompt = claude_launch_prompt(&at_code);
+            assert!(
+                is_reverify_prompt(&prompt, "stale"),
+                "{row}: the Code launch carries the re-verify prompt: {prompt}"
+            );
+
+            // The Code pass ends: advance's Code success arm.
+            let reads_at_code = status_reads(&gsd);
+            assert_eq!(reads_at_code, 1, "{row}: one read, at the first Validate");
+            let mut state = at_code;
+            let _ = transition(root, &mut state, Stage::Validate);
+            assert_eq!(
+                workflow::load_state(root, phase).unwrap().stage,
+                Stage::Validate,
+                "{row}: the re-verify pass ends at Validate like any Code pass"
+            );
+            assert_eq!(
+                status_reads(&gsd),
+                reads_at_code,
+                "{row}: no GSD status read between the end of Code and Validate"
+            );
+
+            let mut state = workflow::load_state(root, phase).unwrap();
+            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Passed);
+            assert_eq!(
+                status_reads(&gsd),
+                2,
+                "{row}: the second Validate reads once"
+            );
+            let finished = events_named(root, phase, "workflow_finished");
+            if finishes {
+                assert_eq!(
+                    finished.len(),
+                    1,
+                    "{row}: the fresh `passed` read finishes the run: {:?}",
+                    phase_events(root, phase)
+                );
+            } else {
+                assert!(
+                    finished.is_empty(),
+                    "{row}: a run never finishes over `stale`: {finished:?}"
+                );
+                let again = workflow::load_state(root, phase).unwrap();
+                assert_eq!(again.stage, Stage::Code, "{row}");
+                assert_eq!(again.code_fix, Some(FixType::StaleReverify), "{row}");
+                assert_eq!(
+                    events_named(root, phase, "loop_back").len(),
+                    2,
+                    "{row}: the re-verify pass runs again"
+                );
+            }
+        }
+    }
+
+    /// D-08, D-12 (U2): a Validate whose fresh status is `stale` or
+    /// `gaps_found` counts exactly one Validate failure, whatever the agent
+    /// said: each row starts from both counts at 0 and ends with both at 1, on
+    /// its route (the re-verify pass, or 52-27's gap loop through Plan). Three
+    /// auto rounds over `stale` whose re-verify passes commit only `.planning/`
+    /// reach the consecutive-failure gate, and no third Code pass launches.
+    /// Control in the same test: an agent pass over `passed` finishes with
+    /// both counts unchanged.
+    #[test]
+    fn a_validate_that_takes_the_reverify_route_counts_one_failure() {
+        if !in_bounded_child(
+            "pipeline_outcomes::tests::a_validate_that_takes_the_reverify_route_counts_one_failure",
+        ) {
+            return;
+        }
+        let counters = |state: &State| (state.consecutive_failures, state.phase_validate_failures);
+        let rows = [
+            (5342, ValidateOutcome::Passed, GsdStatus::Stale),
+            (5343, ValidateOutcome::Failed, GsdStatus::Stale),
+            (5344, ValidateOutcome::Failed, GsdStatus::GapsFound),
+            (5345, ValidateOutcome::Passed, GsdStatus::GapsFound),
+        ];
+        for (number, outcome, status) in rows {
+            let row = format!("{outcome:?} over {status:?}");
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = PhaseId::new(number);
+            let _gsd = validate_evidence(root, phase, &[gsd_says(status)]);
+            let mut state = validate_state(root, phase, Mode::Auto);
+            assert_eq!(counters(&state), (0, 0), "{row}: premise");
+            preanswer_gate(root, phase, Stage::Validate, &abort_answer());
+            let _ = handle_validate_outcome(root, &mut state, outcome);
+            let after = workflow::load_state(root, phase).unwrap();
+            assert_eq!(
+                counters(&after),
+                (1, 1),
+                "{row}: one round counts once on each counter; events: {:?}",
+                phase_events(root, phase)
+            );
+            match status {
+                GsdStatus::Stale => {
+                    assert_eq!(after.code_fix, Some(FixType::StaleReverify), "{row}");
+                    assert_eq!(moves_to_plan(root, phase), 0, "{row}");
+                }
+                _ => {
+                    assert_eq!(moves_to_plan(root, phase), 1, "{row}: the gap loop");
+                    assert!(after.gap_closure_pass, "{row}: the gap loop's marker");
+                    assert!(
+                        events_named(root, phase, "loop_back").is_empty(),
+                        "{row}: no Code loop-back"
+                    );
+                }
+            }
+        }
+
+        // Three unproductive re-verify rounds reach the consecutive-failure gate.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(5346);
+        phase_dir_fixture(root, phase);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        workflow::save_state(&state).unwrap();
+        for round in 1..=mode::MAX_CONSECUTIVE_FAILURES {
+            commit_gap_round(root, phase, &format!("reverify-{round}"), false);
+            state.stage = Stage::Validate;
+            workflow::save_state(&state).unwrap();
+            preanswer_gate(root, phase, Stage::Validate, &abort_answer());
+            let _gsd = GsdStub::answering(root, &[gsd_says(GsdStatus::Stale)]);
+            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Passed);
+            assert_eq!(
+                counters(&state),
+                (round, round),
+                "round {round}: each re-verify round counts one failure; events: {:?}",
+                phase_events(root, phase)
+            );
+        }
+        let gates = events_named(root, phase, "gate_fired");
+        assert_eq!(
+            gates.last().map(|event| event["gate_kind"].clone()),
+            Some(serde_json::json!("failure_cap")),
+            "the third round gates at the cap: {gates:?}"
+        );
+        let loop_backs = events_named(root, phase, "loop_back");
+        assert_eq!(
+            loop_backs.len(),
+            (mode::MAX_CONSECUTIVE_FAILURES - 1) as usize,
+            "no Code pass after the round that gated: {loop_backs:?}"
+        );
+        assert!(
+            loop_backs
+                .iter()
+                .all(|event| event["fix"] == "StaleReverify"),
+            "{loop_backs:?}"
+        );
+
+        // Control: an agent pass over `passed` finishes and counts nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5347);
+        let _gsd = validate_evidence(root, phase, &[gsd_says(GsdStatus::Passed)]);
+        let mut state = validate_state(root, phase, Mode::Auto);
+        let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Passed);
+        assert_eq!(
+            events_named(root, phase, "workflow_finished").len(),
+            1,
+            "control: a passed round finishes"
+        );
+        assert_eq!(
+            counters(&workflow::load_state(root, phase).unwrap()),
+            (0, 0),
+            "control: a passed round counts nothing"
+        );
+    }
+
+    /// R6 (review 2): the re-verify route taken inside a gap-closure pass
+    /// sets `code_fix` to the re-verify pass and clears the gap marker, so a
+    /// stop and resume relaunches the re-verify pass, not `--gaps-only`.
+    /// Control in the same test: the same marker-set state at Code, stopped
+    /// before any Validate, relaunches `--gaps-only`.
+    #[test]
+    fn a_reverify_route_clears_the_gap_marker() {
+        if !in_bounded_child("pipeline_outcomes::tests::a_reverify_route_clears_the_gap_marker") {
+            return;
+        }
+        let stop = |root: &Path, phase: PhaseId| {
+            let mut stopped = workflow::load_state(root, phase).unwrap();
+            stopped.stopped = true;
+            stopped.stop_reason = Some("stopped via `devflow stop`".to_string());
+            workflow::save_state(&stopped).unwrap();
+            workflow::load_state(root, phase).unwrap()
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5348);
+        let _gsd = validate_evidence(root, phase, &[gsd_says(GsdStatus::Stale)]);
+        let mut state = validate_state(root, phase, Mode::Auto);
+        state.gap_closure_pass = true;
+        workflow::save_state(&state).unwrap();
+        preanswer_gate(root, phase, Stage::Validate, &abort_answer());
+        let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Passed);
+        let after = workflow::load_state(root, phase).unwrap();
+        assert_eq!(after.code_fix, Some(FixType::StaleReverify));
+        assert!(
+            !after.gap_closure_pass,
+            "the re-verify route clears the gap marker"
+        );
+        let resumed = claude_launch_prompt(&stop(root, phase));
+        assert!(
+            is_reverify_prompt(&resumed, "stale"),
+            "a resumed re-verify pass is the re-verify pass: {resumed}"
+        );
+
+        // Control: a marker-set gaps Code pass stopped before any Validate.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5349);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        state.gap_closure_pass = true;
+        workflow::save_state(&state).unwrap();
+        let resumed = claude_launch_prompt(&stop(root, phase));
+        assert!(
+            resumed.contains("--gaps-only"),
+            "control: a stopped gaps Code pass resumes gaps-only: {resumed}"
+        );
+    }
 }

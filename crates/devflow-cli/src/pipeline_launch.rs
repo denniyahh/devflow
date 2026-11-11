@@ -126,6 +126,7 @@ pub(crate) fn default_stage_prompt(state: &State, driver: &dyn agents::AgentDriv
                 .or(state.gap_closure_pass.then_some(prompt::FixType::GapsOnly)),
             fix_note: state.code_fix.and(state.code_fix_note.clone()),
             relaunch_note: state.relaunch_note.clone(),
+            reverify_report: None,
         },
         stage => {
             prompt::StageIntent::for_stage_in_project(stage, state.phase, Some(&state.project_root))
@@ -8911,6 +8912,7 @@ mod tests {
             fix: Some(prompt::FixType::FullExecute),
             fix_note: None,
             relaunch_note: None,
+            reverify_report: None,
         });
         let (_program, _args, launch) = resolve_launch_shape(
             agent,
@@ -11295,6 +11297,7 @@ mod tests {
                 fix,
                 fix_note: None,
                 relaunch_note: None,
+                reverify_report: None,
             })
         };
 
@@ -13269,6 +13272,7 @@ mod tests {
                 fix,
                 fix_note: None,
                 relaunch_note: None,
+                reverify_report: None,
             })
         };
 
@@ -13408,6 +13412,7 @@ mod tests {
                 fix,
                 fix_note: None,
                 relaunch_note: None,
+                reverify_report: None,
             })
         };
 
