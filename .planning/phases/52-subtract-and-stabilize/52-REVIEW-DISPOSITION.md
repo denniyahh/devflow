@@ -5,7 +5,7 @@ titles: json
 findings:
   - id: CR-01
     severity: critical
-    disposition: open
+    disposition: fixed
     title: "An ambiguous Validate verdict loops forever in auto mode over `gaps_found`, `stale` or `missing`"
   - id: CR-02
     severity: critical
@@ -13,21 +13,21 @@ findings:
     title: "Starting a finished phase again force-deletes its unmerged branch, the only copy of the finished work"
   - id: WR-01
     severity: warning
-    disposition: open
+    disposition: fixed
     title: "A reader whose child left a process holding stdout is reported as timed out, but that process is never killed"
   - id: IN-01
     severity: info
-    disposition: open
+    disposition: fixed
     title: "Doc links point to `validate_route`, which does not exist"
   - id: IN-02
     severity: info
-    disposition: open
+    disposition: fixed
     title: "The doc of `handle_gaps_plan_outcome` describes a reject route the code no longer takes"
   - id: IN-03
     severity: info
     disposition: open
     title: "A hand-run `devflow advance` over a finished run names `devflow resume`, which refuses it"
-open: 6
+open: 2
 total: 6
 recorded: 2026-11-11T17:15:19.010Z
 ---
