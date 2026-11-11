@@ -5,16 +5,16 @@ milestone_name: Session Continuity
 current_phase: 52
 current_phase_name: Subtract and Stabilize
 status: executing
-stopped_at: Completed 52-13-PLAN.md
-last_updated: "2026-11-11T00:40:49.762Z"
+stopped_at: Completed 52-14-PLAN.md
+last_updated: "2026-11-11T01:11:52.701Z"
 last_activity: 2026-11-10
 last_activity_desc: Phase 52 execution started
-state_head: 47735f70bf2dbaef2a0b1c490a2c1ab6a3cfcae8
+state_head: c07ef6a52dee539a24428e5906705c4164071c48
 progress:
   total_phases: 4
   completed_phases: 0
   total_plans: 33
-  completed_plans: 13
+  completed_plans: 14
   percent: 0
 ---
 
@@ -159,7 +159,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 52 (Subtract and Stabilize) — EXECUTING
-Plan: 14 of 33
+Plan: 15 of 33
 Status: Ready to execute
 Last activity: 2026-11-10 — Phase 52 execution started
 
@@ -856,6 +856,9 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 52]: until_stop_never_emits_workflow_shipped is kept and reads the workflow_finished event directly instead of through ship_evidence (52-13)
 - [Phase 52]: semver stays in Cargo.lock (wasmparser, wit-parser); only git-conventional and unicase were removed (52-13)
 - [Phase 52]: generic_preflight_checks now runs the unattended-launch check first, then interactivity; the gh-auth and major-bump checks are gone (52-13)
+- [Phase 52]: Concurrent-write tests that used yes_ship as their stand-in field now use base_branch (52-14)
+- [Phase 52]: run_gate_with_timeout's auto_response and safe point 5 are kept with no production Some caller; 52-15 removes them with handle_ship_outcome (52-14)
+- [Phase 52]: devflow start --yes-ship, DEVFLOW_YES_SHIP, the devflow.toml yes_ship key and State.yes_ship are removed; a leftover key in devflow.toml or a 3.x state file is ignored (52-14)
 
 ## Roadmap Evolution
 
@@ -980,11 +983,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 52 P11 | 25 min | 2 tasks | 17 files |
 | Phase 52 P12 | 32 min | 2 tasks | 24 files |
 | Phase 52 P13 | 20 min | 2 tasks | 23 files |
+| Phase 52 P14 | 22 min | 2 tasks | 13 files |
 
 ## Session
 
-**Last session:** 2026-11-11T00:40:49.551Z
-**Stopped at:** Completed 52-13-PLAN.md
+**Last session:** 2026-11-11T01:11:44.301Z
+**Stopped at:** Completed 52-14-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
