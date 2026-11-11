@@ -23,7 +23,7 @@ OPERATIONS.md's rate-limit failover section for what the fallback does.
 |---|---|
 | `--phase N` | Phase number to execute |
 | `--agent claude\|codex\|opencode\|pi` | Agent to launch |
-| `--mode auto\|supervise` | `auto` advances through Ship unattended (gating only at Ship, plus never-silent failure gates); `supervise` also gates every Validate for human review |
+| `--mode auto\|supervise` | `auto` runs unattended and finishes on a passing Validate (gating only on repeated Validate failure, plus never-silent failure gates); `supervise` also gates every Validate for human review |
 | `--force` | Overwrite the feature branch if it already exists |
 | `--no-worktree` | Run directly in the primary checkout instead of an isolated worktree (worktree is the default) |
 | `--dry-run` | Print the pipeline that would run without launching anything |

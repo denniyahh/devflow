@@ -67,10 +67,10 @@ devflow status
 ## Pipeline
 
 ```
-Define → Plan → Code → Validate → Ship
+Define → Plan → Code → Validate
 ```
 
-The 5-stage pipeline is driven by GSD-native execution. State is persisted per-phase to `.devflow/state-NN.json` and survives restarts. `--mode auto` advances through Ship unattended (gating only on repeated Validate failure or an unexpected stage crash); `--mode supervise` also gates at Validate for human review.
+The 4-stage pipeline is driven by GSD-native execution. State is persisted per-phase to `.devflow/state-NN.json` and survives restarts. A passing Validate ends the run and keeps the worktree and branch; DevFlow does not merge, tag or open a pull request. `--mode auto` runs unattended (gating only on repeated Validate failure or an unexpected stage crash); `--mode supervise` also gates at Validate for human review.
 
 ## Architecture
 
@@ -96,7 +96,7 @@ Agents communicate completion through the `DEVFLOW_RESULT` marker in stdout:
 DEVFLOW_RESULT: {"status": "success", "commits": 3, "summary": "added tests"}
 ```
 
-The Validate stage additionally requires a `verdict` field (`"pass"` or `"gaps"`) — a bare `status: success` is not enough to advance to Ship; only `verdict: "pass"` is.
+The Validate stage additionally requires a `verdict` field (`"pass"` or `"gaps"`) — a bare `status: success` is not enough to finish the run; only `verdict: "pass"` is.
 
 DevFlow evaluates agent output in four layers:
 
@@ -150,7 +150,7 @@ Key flags:
 |---|---|
 | `--phase N` | Phase number to execute |
 | `--agent claude\|codex\|opencode\|pi` | Agent to launch |
-| `--mode auto\|supervise` | `auto` advances through Ship unattended; `supervise` also gates at Validate for human review |
+| `--mode auto\|supervise` | `auto` runs unattended and finishes on a passing Validate; `supervise` also gates at Validate for human review |
 | `--no-worktree` | Run directly in the primary checkout instead of an isolated worktree (worktree is the default) |
 
 Gate responses and unattended-run notifications are file-based: a fired gate writes `.devflow/gates/NN-{stage}.json`, which names the gate's `gate_id`, and (if `DEVFLOW_GATE_NOTIFY_CMD` is set) runs that command with `DEVFLOW_GATE_PHASE`/`DEVFLOW_GATE_STAGE`/`DEVFLOW_GATE_CONTEXT` in its environment. `devflow gate approve|reject` fill the answer in for you (`--gate-id <ID>` binds it to the gate `gate list` or `gate show` displayed), first moving aside an answer in that gate's own slot that does not bind to it. To answer by hand, copy `gate_id` from the gate file and publish `.devflow/gates/NN-{stage}.{gate_id}.response.json` with `{"gate_id": "...", "approved": true, "note": "..."}` (`approved` is `true` or `false`, `note` is optional), writing it under another name and renaming it into place, because a partly written file is set aside. An answer with a missing or other id is never consumed or deleted: it is set aside as `NN-{stage}.{gate_id|noid}.{secs}.{pid}.{seq}.quarantined.json`, listed by `devflow status`, `devflow doctor` and `devflow recover --clean`, and stays until you remove it by hand.
@@ -174,7 +174,7 @@ Agents must be installed separately. Run `devflow doctor` to verify availability
 
 - **Rust** stable, edition 2024 (build from source) — see `rust-toolchain.toml`
 - **git** 2.30+
-- **gh CLI** 2.0+ (for PR creation, shipping)
+- **gh CLI** 2.0+ (`devflow doctor` checks for it; no DevFlow command runs it since the Ship stage was removed)
 - **A POSIX shell** (sh/bash)
 
 Agents (Claude Code, Codex, OpenCode) must be installed separately. See [DEPENDENCIES.md](DEPENDENCIES.md) for the full matrix.

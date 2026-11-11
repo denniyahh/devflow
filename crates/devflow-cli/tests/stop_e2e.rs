@@ -354,7 +354,7 @@ fn gated_phase_with_foreign_holder(
     (state_path, before, holder)
 }
 
-/// A Ship gate with its gate file and an approval's claim but no answer, the shape a
+/// A Validate gate with its gate file and an approval's claim but no answer, the shape a
 /// partial close leaves: `stop` says a consumer took it and writes no second answer.
 #[test]
 fn stop_says_a_claimed_gate_was_not_answered_again() {
@@ -364,10 +364,10 @@ fn stop_says_a_claimed_gate_was_not_answered_again() {
     let phase = PhaseId::new(112);
     let (_state_path, _before, mut holder) = gated_phase_with_foreign_holder(root, phase);
     let mut state = devflow_core::workflow::load_state(root, phase).unwrap();
-    state.stage = Stage::Ship;
+    state.stage = Stage::Validate;
     state.gate_pending = true;
     devflow_core::workflow::save_state(&state).unwrap();
-    let gate = Gates::open_gate(root, phase, Stage::Ship, "merge")
+    let gate = Gates::open_gate(root, phase, Stage::Validate, "finish")
         .unwrap()
         .gate_id;
     let response = GateResponse {
@@ -375,12 +375,12 @@ fn stop_says_a_claimed_gate_was_not_answered_again() {
         note: None,
         responded_by: Some("human".into()),
     };
-    Gates::answer(root, phase, Stage::Ship, &gate, &response).unwrap();
+    Gates::answer(root, phase, Stage::Validate, &gate, &response).unwrap();
     assert!(matches!(
-        Gates::claim(root, phase, Stage::Ship, &gate).unwrap(),
+        Gates::claim(root, phase, Stage::Validate, &gate).unwrap(),
         devflow_core::gates::Claim::Claimed
     ));
-    std::fs::remove_file(Gates::answer_path(root, phase, Stage::Ship, &gate)).unwrap();
+    std::fs::remove_file(Gates::answer_path(root, phase, Stage::Validate, &gate)).unwrap();
 
     let output = common::hermetic_devflow(&home)
         .args(["stop", "--phase", &phase.to_string(), "--root"])
@@ -394,7 +394,7 @@ fn stop_says_a_claimed_gate_was_not_answered_again() {
         "stdout: {stdout}"
     );
     assert!(
-        !Gates::answer_path(root, phase, Stage::Ship, &gate).exists(),
+        !Gates::answer_path(root, phase, Stage::Validate, &gate).exists(),
         "stop writes no second answer"
     );
     common::kill_and_reap(&mut holder);
@@ -444,7 +444,7 @@ fn stop_says_a_held_gate_lock_left_its_gate_unanswered() {
     common::kill_and_reap(&mut holder);
 }
 
-/// With no registered waiter, a non-Ship gate gets no answer, and a holder record with
+/// With no registered waiter, a gate gets no answer, and a holder record with
 /// no start time cannot be confirmed: `stop` signals nothing and fails rather than
 /// return success.
 #[test]
@@ -488,7 +488,7 @@ fn stop_at_a_gate_with_an_unconfirmable_holder_refuses_unevidenced_success() {
     );
     assert!(
         gate_answer_files(root, phase, Stage::Code).is_empty(),
-        "an unconfirmable non-Ship holder must not receive a stale abort response"
+        "an unconfirmable holder must not receive a stale abort response"
     );
     assert!(holder.try_wait().expect("poll holder").is_none());
     assert_eq!(std::fs::read(&state_path).unwrap(), before);
@@ -558,16 +558,16 @@ fn stop_does_not_treat_a_stale_gate_as_the_live_holders_wait() {
     );
 }
 
-/// Finding E: persisting an answer is not evidence that a process will act on
-/// it. Ship still stores the response with no waiter, but its CLI confirmation
-/// must not claim that the workflow will advance while no live holder exists.
+/// Finding E: an answer is evidence of nothing unless a process will act on it.
+/// With no registered waiter, `gate approve` writes no response, names the repair
+/// and never claims that the workflow will advance.
 #[test]
 fn gate_approve_with_no_registered_waiter_does_not_claim_advance() {
     let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(110);
-    Gates::write_gate(root, phase, Stage::Ship, "approve merge").unwrap();
+    Gates::write_gate(root, phase, Stage::Validate, "approve the finish").unwrap();
 
     let output = common::hermetic_devflow(&home)
         .args(["gate", "approve", &phase.to_string(), "--project"])
@@ -578,17 +578,17 @@ fn gate_approve_with_no_registered_waiter_does_not_claim_advance() {
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert!(
-        output.status.success(),
+        !output.status.success(),
         "stdout: {stdout}\nstderr: {stderr}"
     );
-    assert!(!gate_answer_files(root, phase, Stage::Ship).is_empty());
+    assert!(gate_answer_files(root, phase, Stage::Validate).is_empty());
     assert!(
-        !stdout.contains("workflow will advance"),
-        "a no-waiter response must not claim an outcome: {stdout}"
+        !stdout.contains("workflow will advance") && !stderr.contains("workflow will advance"),
+        "a no-waiter refusal must not claim an outcome: {stdout}{stderr}"
     );
     assert!(
-        stdout.contains("no registered waiter will act"),
-        "a no-waiter response must name the evidence limit: {stdout}"
+        stderr.contains("no registered waiter") && stderr.contains("no response was written"),
+        "a no-waiter refusal must name the evidence limit: {stderr}"
     );
 }
 
@@ -747,9 +747,9 @@ fn stop_marks_state_stopped_and_records_reason() {
     let root = dir.path();
     let phase = PhaseId::new(96);
 
-    Gates::write_gate(root, phase, Stage::Ship, "approve merge?").unwrap();
+    Gates::write_gate(root, phase, Stage::Validate, "approve the finish?").unwrap();
     let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-    state.stage = Stage::Ship;
+    state.stage = Stage::Validate;
     state.gate_pending = true;
     devflow_core::workflow::save_state(&state).unwrap();
 
@@ -926,13 +926,13 @@ fn gate_approve_takes_the_id_gate_list_shows_and_refuses_a_replaced_one() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(111);
-    let g1 = Gates::open_gate(root, phase, Stage::Ship, "first")
+    let g1 = Gates::open_gate(root, phase, Stage::Validate, "first")
         .unwrap()
         .gate_id;
-    Gates::close(root, phase, Stage::Ship).unwrap();
-    let g2 = Gates::open_gate(root, phase, Stage::Ship, "second")
-        .unwrap()
-        .gate_id;
+    Gates::close(root, phase, Stage::Validate).unwrap();
+    let (opened, registration) =
+        Gates::open_registered(root, phase, Stage::Validate, "second").unwrap();
+    let g2 = opened.gate_id;
     let approve_with = |gate_id: &str| {
         common::hermetic_devflow(&home)
             .args(["gate", "approve", &phase.to_string(), "--gate-id", gate_id])
@@ -957,7 +957,7 @@ fn gate_approve_takes_the_id_gate_list_shows_and_refuses_a_replaced_one() {
         refusal.contains(g1.as_str()) && refusal.contains(g2.as_str()),
         "the refusal names both gates: {refusal}"
     );
-    assert!(gate_answer_files(root, phase, Stage::Ship).is_empty());
+    assert!(gate_answer_files(root, phase, Stage::Validate).is_empty());
 
     let answered = approve_with(g2.as_str());
     assert!(
@@ -965,7 +965,8 @@ fn gate_approve_takes_the_id_gate_list_shows_and_refuses_a_replaced_one() {
         "{}",
         String::from_utf8_lossy(&answered.stderr)
     );
-    assert_eq!(gate_answer_files(root, phase, Stage::Ship).len(), 1);
+    assert_eq!(gate_answer_files(root, phase, Stage::Validate).len(), 1);
+    registration.finish();
 }
 
 /// Task 3 behavior: a response written by hand before `stop` ever runs (a
@@ -978,11 +979,11 @@ fn stop_against_a_hand_written_response_is_a_success_no_op() {
     let root = dir.path();
     let phase = PhaseId::new(100);
 
-    Gates::write_gate(root, phase, Stage::Ship, "approve merge?").unwrap();
+    Gates::write_gate(root, phase, Stage::Validate, "approve the finish?").unwrap();
     let response_path = answer_open_gate(
         root,
         phase,
-        Stage::Ship,
+        Stage::Validate,
         &GateResponse {
             approved: false,
             note: Some("hand-written rejection".into()),

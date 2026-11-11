@@ -163,12 +163,12 @@ fn sweep_reaps_an_aged_gate_and_a_real_poller_resolves_to_abort() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(91);
-    let stage = Stage::Ship;
+    let stage = Stage::Validate;
 
     // Registered before the gate file exists, as every production gate wait is, and held
     // by the poller while it awaits, so the sweep can never see the gate before its waiter.
     let (opened, registration) =
-        Gates::open_registered(root, phase, stage, "approve merge?").unwrap();
+        Gates::open_registered(root, phase, stage, "approve the finish?").unwrap();
     let gate = opened.gate_id;
     backdate_gate(root, phase, stage, AGED_WELL_PAST_DEFAULT_THRESHOLD_SECS);
 

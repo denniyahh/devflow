@@ -152,23 +152,28 @@ fn rust_log_default_suppresses_debug_under_json_log_format() {
 /// `devflow` now logs at INFO level by default with no env var set at all.
 ///
 /// This drives `devflow gate approve` against a project with a single open
-/// gate — `Gates::answer` emits `info!("gate answer written for phase {phase}
+/// gate and a registered waiter (with none, the approval writes nothing and
+/// logs nothing) — `Gates::answer` emits `info!("gate answer written for phase {phase}
 /// {stage} gate {gate}: approved=...")` as an unconditional side effect of a
 /// successful approval, giving a real INFO-level log line to assert on. If
 /// commit 50db857 were reverted (back to the bare `from_default_env()`),
 /// this line would default to being suppressed and this test would fail.
-fn project_with_open_gate(phase: PhaseId, stage: Stage) -> tempfile::TempDir {
+fn project_with_open_gate(
+    phase: PhaseId,
+    stage: Stage,
+) -> (tempfile::TempDir, devflow_core::gates::WaiterRegistration) {
     let dir = tempfile::tempdir().expect("create tempdir");
-    Gates::write_gate(dir.path(), phase, stage, "test gate").expect("write gate");
-    dir
+    let (_, registration) =
+        Gates::open_registered(dir.path(), phase, stage, "test gate").expect("open gate");
+    (dir, registration)
 }
 
 #[test]
 fn rust_log_unset_still_shows_info_level_logs_by_default() {
     let home = common::HermeticHome::new();
-    let dir = project_with_open_gate(PhaseId::new(15), Stage::Ship);
+    let (dir, registration) = project_with_open_gate(PhaseId::new(15), Stage::Validate);
     let gate_id = Gates::list_open(dir.path())[0].gate_id.clone();
-    let logged = format!("gate answer written for phase 15 ship gate {gate_id}: approved=true");
+    let logged = format!("gate answer written for phase 15 validate gate {gate_id}: approved=true");
 
     let mut cmd = common::hermetic_devflow(&home);
     cmd.arg("gate")
@@ -199,4 +204,5 @@ fn rust_log_unset_still_shows_info_level_logs_by_default() {
         "the tracing log line must not leak onto stdout (CR-02) — only the CLI's \
          own printed confirmation message belongs there.\nstdout:\n{stdout}"
     );
+    registration.finish();
 }
