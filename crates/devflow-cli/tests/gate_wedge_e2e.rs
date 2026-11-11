@@ -1055,3 +1055,126 @@ fn start_self_resolving_arm_live_start_consumes_the_plan_rejection() {
         "consuming the response clears the Plan gate request"
     );
 }
+
+/// The unique end of [`long_failure_reason`]: if `gate show` prints it, the
+/// reason was stored whole.
+const LONG_REASON_MARKER: &str = "END-OF-THE-WHOLE-REASON-4826";
+
+/// A 1000-character failure reason that ends in [`LONG_REASON_MARKER`]. Plain
+/// words only, so it passes through a shell `printf` and a JSON string as is.
+fn long_failure_reason() -> String {
+    let words =
+        "the code stage could not finish its work because a check kept failing; ".repeat(20);
+    let head: String = words
+        .chars()
+        .take(1000 - LONG_REASON_MARKER.len() - 1)
+        .collect();
+    let reason = format!("{head} {LONG_REASON_MARKER}");
+    assert_eq!(reason.chars().count(), 1000);
+    reason
+}
+
+/// GATE-04 (999.206): a stage failure whose reason is longer than the display
+/// bound reaches `devflow gate show` whole, end to end. A gated Code advance on
+/// Claude is rejected, the relaunched agent fails with a 1000-character
+/// reason, and the failure gate it leaves prints that reason in full in `gate
+/// show`. `gate list` still shows a bounded line that leads with the way-on
+/// sentence, so the display cut is unchanged: it is the control that the
+/// marker's presence in `gate show` is not a display that never cuts.
+#[test]
+fn a_long_failure_reason_reaches_gate_show_whole() {
+    let home = common::HermeticHome::new();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let phase = PhaseId::new(4826);
+    init_launchable_repo(root, phase);
+    let _reaper = common::LaunchedRunReaper::new(root, phase, Vec::new());
+    let reason = long_failure_reason();
+    // A stream-shape `claude`: it answers `--version`, reads the one stdin
+    // turn, reports an error result carrying the long reason, and exits 1.
+    let fake_bin = common::fake_bin_dir(&format!(
+        "if [ \"$1\" = \"--version\" ]; then echo \"2.1.220 (Claude Code)\"; exit 0; fi\n\
+         IFS= read -r turn\n\
+         printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"result\":\"{reason}\"}}'\n\
+         exit 1"
+    ));
+    let _child = ReapOnDrop(spawn_gated_advance_as(
+        &home,
+        root,
+        phase,
+        Some(&fake_bin.path),
+        AgentKind::Claude,
+        |state| state.canary = Some(devflow_core::canary::CanaryOutcome::Confirmed),
+    ));
+
+    let output = answer_code_gate(&home, root, phase, "reject", "relaunch it");
+    assert!(
+        output.status.success(),
+        "reject failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    common::wait_for(
+        || events_named(root, "gate_fired").len() >= 2,
+        Duration::from_secs(30),
+        "the relaunched Code stage to fail and fire its gate",
+    );
+    common::wait_for(
+        || Gates::gate_path(root, phase, Stage::Code).exists(),
+        Duration::from_secs(10),
+        "the failure gate's file",
+    );
+
+    let shown = common::hermetic_devflow(&home)
+        .args(["gate", "show", &phase.to_string(), "--stage", "code"])
+        .arg(root)
+        .output()
+        .expect("run devflow gate show");
+    let shown_text = String::from_utf8_lossy(&shown.stdout);
+    assert!(
+        shown.status.success(),
+        "gate show failed: {}",
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    assert!(
+        shown_text.contains(&reason),
+        "gate show must print the whole reason, marker included: {shown_text}"
+    );
+
+    let listed = common::hermetic_devflow(&home)
+        .args(["gate", "list"])
+        .arg(root)
+        .output()
+        .expect("run devflow gate list");
+    assert!(
+        listed.status.success(),
+        "gate list failed: {}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let listed_text = String::from_utf8_lossy(&listed.stdout);
+    let contexts: Vec<&str> = listed_text
+        .lines()
+        .filter_map(|line| line.find("[never-silent] ").map(|at| &line[at..]))
+        .collect();
+    assert_eq!(
+        contexts.len(),
+        1,
+        "one failure gate is listed: {listed_text}"
+    );
+    for context in contexts {
+        // The banner's and `gate list`'s display bound,
+        // `GATE_CONTEXT_DISPLAY_CHARS` in `commands.rs`.
+        assert!(
+            context.chars().count() <= 450,
+            "a gate list context exceeds the display bound: {context}"
+        );
+        assert!(
+            context.starts_with("[never-silent] Answers — ") && context.contains("; abort: "),
+            "a gate list context must lead with the way-on sentence: {context}"
+        );
+        assert!(
+            !context.contains(LONG_REASON_MARKER)
+                && context.ends_with("… [truncated; full output in .devflow/]"),
+            "control: gate list still cuts a long context: {context}"
+        );
+    }
+}
