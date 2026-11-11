@@ -2860,6 +2860,38 @@ pub fn phase_commit_count(
     git_flow: &GitFlowConfig,
     phase: PhaseId,
 ) -> Option<u32> {
+    phase_commit_count_in(project_root, git_flow, phase, &[])
+}
+
+/// The pathspec that limits [`phase_source_commit_count`] to commits changing
+/// a path outside `.planning/`.
+const OUTSIDE_PLANNING: [&str; 3] = ["--", ".", ":(exclude).planning"];
+
+/// [`phase_commit_count`], counting only the commits that change at least one
+/// path outside `.planning/` (D-34, 52-27): the progress signal for the
+/// consecutive-failure streak. A GSD fix or gap-closure command commits
+/// `.planning/` artifacts on every round, whether or not any source changed, so
+/// those commits are not progress.
+///
+/// Same `Option` contract as [`phase_commit_count`]: `None` only when no count
+/// was established (git could not run, or its output did not parse), never a
+/// made-up zero. Same reach too: a commit that changes any source file counts,
+/// however trivial the change.
+pub fn phase_source_commit_count(
+    project_root: &Path,
+    git_flow: &GitFlowConfig,
+    phase: PhaseId,
+) -> Option<u32> {
+    phase_commit_count_in(project_root, git_flow, phase, &OUTSIDE_PLANNING)
+}
+
+/// [`phase_commit_count`]'s body, with `pathspec` appended to its `rev-list`.
+fn phase_commit_count_in(
+    project_root: &Path,
+    git_flow: &GitFlowConfig,
+    phase: PhaseId,
+    pathspec: &[&str],
+) -> Option<u32> {
     let branch = format!("{}phase-{}", git_flow.feature_prefix, phase.padded());
 
     // A-06: split on whether the command RAN, not on what it answered. An
@@ -2887,6 +2919,7 @@ pub fn phase_commit_count(
     // make; it belongs with the branch-absent case above as a real zero.
     let output = match git_command(project_root)
         .args(["rev-list", "--count", &range])
+        .args(pathspec)
         .output()
     {
         Err(_) => return None,
@@ -2899,15 +2932,6 @@ pub fn phase_commit_count(
     // succeeded, and said something this function cannot read. Nothing was
     // established, so it stays `None` rather than being asserted as zero.
     String::from_utf8_lossy(&output.stdout).trim().parse().ok()
-}
-
-/// Skeleton (52-27): counts like [`phase_commit_count`] for now.
-pub fn phase_source_commit_count(
-    project_root: &Path,
-    git_flow: &GitFlowConfig,
-    phase: PhaseId,
-) -> Option<u32> {
-    phase_commit_count(project_root, git_flow, phase)
 }
 
 /// Layer 2: Use exit code + commit count to determine result.

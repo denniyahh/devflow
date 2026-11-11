@@ -197,6 +197,8 @@ pub(crate) fn init_repo(root: &Path) {
 /// from the current `HEAD` if it does not already exist. Designed to be
 /// called repeatedly within one test, so each call adds exactly one commit
 /// to the `develop..branch` range — assumes [`init_repo`] has already run.
+/// The file it commits sits at the repository root, outside `.planning/`, so
+/// the commit is progress for the Validate failure streak (D-34, 52-27).
 ///
 /// Uses plain `checkout`, never `checkout -B`, when the branch already
 /// exists: `-B` resets an existing branch to `HEAD`, which would silently
