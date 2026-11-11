@@ -5,16 +5,16 @@ milestone_name: Session Continuity
 current_phase: 52
 current_phase_name: Subtract and Stabilize
 status: executing
-stopped_at: Completed 52-22-PLAN.md
-last_updated: "2026-11-11T06:58:56.500Z"
+stopped_at: Completed 52-23-PLAN.md
+last_updated: "2026-11-11T07:43:24.149Z"
 last_activity: 2026-11-10
 last_activity_desc: Phase 52 execution started
-state_head: 56fc1ebe8246898263bf495d835a4d20ddbd75d6
+state_head: a272b641f17c6bad06f0fbf823a0f4cbc9edb9ae
 progress:
   total_phases: 4
   completed_phases: 0
   total_plans: 33
-  completed_plans: 22
+  completed_plans: 23
   percent: 0
 ---
 
@@ -159,7 +159,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 52 (Subtract and Stabilize) — EXECUTING
-Plan: 23 of 33
+Plan: 24 of 33
 Status: Ready to execute
 Last activity: 2026-11-10 — Phase 52 execution started
 
@@ -873,6 +873,10 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 52]: 52-20: gsd_reader runs gsd_run by argv in the evidence root (GIT_* removed, HOME set to the launcher home, 60 s kill-and-reap deadline); every answer is one of five GsdStatus values or a named ReaderFailure, exit 0 is not success, and events carry only ReaderFailure::label()
 - [Phase 52]: 52-21: the build-provenance Warn arm is silent on any project that is not DevFlow's own checkout; a project with no origin remote gets one line and skips the fetch, while a remote that exists but cannot be fetched keeps both lines
 - [Phase 52]: 52-22: Validate passes only when the agent says pass and gsd query verification status (read in the worktree) says passed; every other status and every reader failure routes through validate_route, a reader failure is a never-silent gate, an agent PASS records State.validate_pass_head, and every gate records a required GateKind
+- [Phase 52]: 52-23: an empty RUST_LOG is treated exactly as an unset one, in main.rs's filter and in doctor's row (both info, tracing off)
+- [Phase 52]: 52-23: a non-empty RUST_LOG that does not parse keeps the 3.0 info fallback; doctor still warns on it
+- [Phase 52]: 52-23: the never-silent audit adds two labels beside (a)/(b)/(c): (n) not a skip/refusal/failure or an unreachable guard, (h) advisory housekeeping; both are left
+- [Phase 52]: 52-23: gate list now also warns when a gate file cannot be read, not only when it does not parse
 
 ## Roadmap Evolution
 
@@ -1006,11 +1010,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 52 P20 | 20 min | 3 tasks | 3 files |
 | Phase 52 P21 | 11 min | 2 tasks | 2 files |
 | Phase 52 P22 | 59 min | 4 tasks | 24 files |
+| Phase 52 P23 | 32 min | 3 tasks | 14 files |
 
 ## Session
 
-**Last session:** 2026-11-11T06:58:47.347Z
-**Stopped at:** Completed 52-22-PLAN.md
+**Last session:** 2026-11-11T07:43:23.962Z
+**Stopped at:** Completed 52-23-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps

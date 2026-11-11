@@ -299,3 +299,7 @@ OPS-01 and OPS-03 are delivered. One gap is logged for later: an invalid `DEVFLO
 ---
 *Phase: 52-subtract-and-stabilize*
 *Completed: 2026-11-11*
+
+## Self-Check: PASSED
+
+Key files and all eight commits (613ba3a, d904a59, 1bd2ef5, 8422920, f19ad6b, e5402f3, 0807945, a272b64) checked present on this branch; `check evaluation-scope --plan 52-23 --commits-only` resolved them (exit 0).

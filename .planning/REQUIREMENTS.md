@@ -49,11 +49,11 @@ requirement closes a backlog entry, the entry is named; `.planning/user/V4-CUT-I
 
 ### Operator surface (OPS)
 
-- [ ] **OPS-01**: `devflow --version` prints the version with the embedded build commit and dirty flag. Closes 999.216.
+- [x] **OPS-01**: `devflow --version` prints the version with the embedded build commit and dirty flag. Closes 999.216.
 - [ ] **OPS-02**: `devflow cleanup` says why it keeps a worktree (the recorded stop reason, an `--until` halt, or a live
       run), `cleanup --force` removes the run's state together with its worktree, `devflow status` never reports a run
       whose worktree is gone as active, and `devflow start` says when it replaces a stale state. Closes 999.213.
-- [ ] **OPS-03**: Command output carries no `tracing` lines unless `RUST_LOG` is set; `devflow doctor` reports an unset
+- [x] **OPS-03**: Command output carries no `tracing` lines unless `RUST_LOG` is set; `devflow doctor` reports an unset
       `RUST_LOG` as information, not a failure; a project that is not DevFlow's own gets no build-provenance warning and
       one line, not two, for a missing remote. Closes 999.217.
 - [ ] **OPS-04**: `devflow status` shows a stopped run's stop reason and the fallback agent's state (armed, spent, none).
@@ -138,9 +138,9 @@ Populated during roadmap creation (2026-11-08). Phase order and dependencies: RO
 | GATE-02 | Phase 52 — Subtract and Stabilize | Pending |
 | GATE-03 | Phase 52 — Subtract and Stabilize | Pending |
 | GATE-04 | Phase 52 — Subtract and Stabilize | Pending |
-| OPS-01 | Phase 52 — Subtract and Stabilize | Pending |
+| OPS-01 | Phase 52 — Subtract and Stabilize | Complete |
 | OPS-02 | Phase 52 — Subtract and Stabilize | Pending |
-| OPS-03 | Phase 52 — Subtract and Stabilize | Pending |
+| OPS-03 | Phase 52 — Subtract and Stabilize | Complete |
 | OPS-04 | Phase 52 — Subtract and Stabilize | Pending |
 | ASK-01 | Phase 53 — The Question Channel | Pending |
 | ASK-02 | Phase 53 — The Question Channel | Pending |
