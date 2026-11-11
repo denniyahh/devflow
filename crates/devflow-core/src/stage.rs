@@ -167,6 +167,24 @@ mod tests {
     }
 
     #[test]
+    fn removed_stage_names_do_not_parse() {
+        let err = "ship"
+            .parse::<Stage>()
+            .expect_err("`ship` names a removed stage and must not parse");
+        let text = err.to_string();
+        let (_, expected) = text
+            .split_once("expected")
+            .expect("the parse error lists the stages it accepts");
+        for kept in ["define", "plan", "code", "validate"] {
+            assert!(expected.contains(kept), "`{kept}` missing from: {text}");
+        }
+        assert!(
+            !expected.contains("ship"),
+            "the parse error still offers a removed stage: {text}"
+        );
+    }
+
+    #[test]
     fn serde_round_trips_each_stage() {
         for stage in [
             Stage::Define,

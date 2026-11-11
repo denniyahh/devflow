@@ -504,6 +504,60 @@ fn start_until_ship_is_rejected() {
     );
 }
 
+/// D-07 (CUT-02): the Ship stage is gone, so `--until ship` is not a stage value and
+/// clap refuses it as an invalid value before `start` is dispatched. Control in the same
+/// test: every kept stage `--until` accepts still parses, and the dry run exits 0.
+#[test]
+fn until_rejects_removed_stages() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let fake_bin = fake_bin_dir(&[]);
+    let dry_run_until = |stage: &str| {
+        common::hermetic_devflow(&home)
+            .args([
+                "start",
+                "--phase",
+                "1",
+                "--agent",
+                "claude",
+                "--mode",
+                "auto",
+                "--until",
+                stage,
+                "--dry-run",
+            ])
+            .arg(root)
+            .env("PATH", path_with_fake_bin(&fake_bin.path))
+            .current_dir(root)
+            .output()
+            .expect("run devflow")
+    };
+
+    for removed in ["ship"] {
+        let output = dry_run_until(removed);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "--until {removed} must be rejected\nstderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("invalid value"),
+            "clap must refuse --until {removed} as an invalid value\nstderr: {stderr}"
+        );
+    }
+    for kept in ["plan", "code", "validate"] {
+        let output = dry_run_until(kept);
+        assert!(
+            output.status.success(),
+            "--until {kept} must be accepted\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert!(!root.join(".worktrees/phase-1").exists());
+}
+
 /// 20c edge-probe (20c/empty): `--until bogus` needs no new parsing surface —
 /// it is rejected by the existing `Stage: FromStr` parser (via clap) before
 /// `start` is ever dispatched.
