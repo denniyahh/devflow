@@ -63,6 +63,7 @@ pub mod events;
 pub mod gates;
 pub mod git;
 pub mod gsd_config;
+pub mod gsd_reader;
 pub mod history;
 pub mod liveness;
 pub mod mode;
