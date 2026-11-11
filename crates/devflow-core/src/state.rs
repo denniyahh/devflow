@@ -389,6 +389,13 @@ pub struct State {
     /// characters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_fix_note: Option<String>,
+    /// What GSD said when Validate chose the re-verify pass (D-32 part 1):
+    /// GSD's status, route and next action, written in the commit that sets
+    /// [`State::code_fix`] to [`crate::prompt::FixType::StaleReverify`] and
+    /// cleared with `code_fix`, so a resumed or failed-over re-verify pass
+    /// quotes the same words. `None` for every other fix pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_fix_report: Option<crate::prompt::ReverifyReport>,
     /// The operator's note for a relaunch of the stage a rejected gate stopped
     /// at (GATE-01, D-39): the note on a rejected stage-failure gate at Plan,
     /// Code or Validate, committed before the stage relaunches. Every prompt
@@ -668,6 +675,7 @@ impl State {
             fallback_consumed: false,
             code_fix: None,
             code_fix_note: None,
+            code_fix_report: None,
             relaunch_note: None,
             validate_pass_head: None,
             gap_closure_pass: false,

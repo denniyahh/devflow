@@ -24,7 +24,7 @@ use devflow_core::gates::{GateAction, GateKind};
 use devflow_core::gsd_reader::{self, GsdStatus, ReaderFailure, StatusReport};
 use devflow_core::mode::{self, Mode};
 use devflow_core::phase_id::PhaseId;
-use devflow_core::prompt::FixType;
+use devflow_core::prompt::{FixType, ReverifyReport};
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
 use devflow_core::{
@@ -396,9 +396,9 @@ pub(crate) enum ValidateRoute {
 /// One arm per (verdict, status-or-failure) pair, and no wildcard arm that
 /// yields a finish: only an agent pass over GSD's `passed` can, and only in auto
 /// mode below the cap. A reader failure takes precedence over every verdict,
-/// the ambiguous one included (D-24). `stale` and `missing` send Code back to
-/// the full execute command in auto mode and open a `reverify_needed` gate in
-/// supervise mode (U4); `gaps_found` takes the gap-closure loop through Plan
+/// the ambiguous one included (D-24). `stale` and `missing` send Code back for
+/// the re-verify pass (D-32 part 1) in auto mode and open a `reverify_needed`
+/// gate in supervise mode (U4); `gaps_found` takes the gap-closure loop through Plan
 /// (GATE-03); `human_needed` and an
 /// agent that disagrees with GSD always gate. A status a later gsd-core adds
 /// reaches here as a reader failure (`UnknownStatus`), so it gates.
@@ -417,7 +417,7 @@ pub(crate) fn validate_route(
         (false, Mode::Supervise) => Gate(supervise_kind),
     };
     let gaps = || unattended(GapLoop, GateKind::GapsFound);
-    let reverify = || unattended(LoopBack(FixType::FullExecute), GateKind::ReverifyNeeded);
+    let reverify = || unattended(LoopBack(FixType::StaleReverify), GateKind::ReverifyNeeded);
     match (verdict, read.as_ref().map(|report| report.status)) {
         (Pass, Err(_)) => Gate(GateKind::ReaderFailure),
         (Fail, Err(_)) => Gate(GateKind::ReaderFailure),
@@ -463,22 +463,32 @@ fn approve_route(verdict: AgentVerdict, read: &ValidateRead) -> ApproveRoute {
         (Fail, Ok(GsdStatus::Passed)) => ApproveRoute::RerunValidate,
         (_, Ok(GsdStatus::GapsFound)) => ApproveRoute::LoopBack(FixType::GapsOnly),
         (_, Ok(GsdStatus::Stale | GsdStatus::Missing)) => {
-            ApproveRoute::LoopBack(FixType::FullExecute)
+            ApproveRoute::LoopBack(FixType::StaleReverify)
         }
         (_, Ok(GsdStatus::HumanNeeded)) | (_, Err(_)) => ApproveRoute::RerunValidate,
     }
 }
 
 /// The fix a rejected Validate gate loops back to Code with: the gaps pass when
-/// GSD found gaps, otherwise the full execute command.
+/// GSD found gaps, the re-verify pass when GSD reads `stale` or `missing`
+/// (D-32 part 1), otherwise the full execute command.
 fn reject_fix(read: &ValidateRead) -> FixType {
-    match read {
-        Ok(StatusReport {
-            status: GsdStatus::GapsFound,
-            ..
-        }) => FixType::GapsOnly,
-        _ => FixType::FullExecute,
+    match read.as_ref().map(|report| report.status) {
+        Ok(GsdStatus::GapsFound) => FixType::GapsOnly,
+        Ok(GsdStatus::Stale | GsdStatus::Missing) => FixType::StaleReverify,
+        Ok(GsdStatus::Passed | GsdStatus::HumanNeeded) | Err(_) => FixType::FullExecute,
     }
+}
+
+/// What GSD said in this round's read, for the re-verify pass's prompt to
+/// quote verbatim (D-32 part 1): its status name, route and next action.
+/// `None` when the read failed.
+fn reverify_report(read: &ValidateRead) -> Option<ReverifyReport> {
+    read.as_ref().ok().map(|report| ReverifyReport {
+        status: gsd_status_name(report.status).to_string(),
+        route: report.route.clone(),
+        next_action: report.next_action.clone(),
+    })
 }
 
 /// The evidence root's HEAD, through the hermetic git command, or git's error.
@@ -578,8 +588,9 @@ fn validate_gate_context(
              the run. Finishing over open gaps is not offered."
         }
         GateKind::ReverifyNeeded => {
-            " The report must be re-verified: approving or rejecting relaunches Code with the \
-             full execute command."
+            " The report must be re-verified: approving or rejecting relaunches Code for the \
+             re-verify pass, which resumes execute-phase at the phase gates and re-runs the \
+             verifier."
         }
         GateKind::HumanNeeded => " GSD needs a human sign-off; approving runs Validate again.",
         GateKind::DisagreementOverPassed | GateKind::DisagreementOverHumanNeeded => {
@@ -775,6 +786,7 @@ pub(crate) fn handle_validate_outcome(
             state,
             fix,
             None,
+            reverify_report(&read),
             loop_back_reason(baseline_absent),
         ),
         // GATE-03 / D-09: the gap-closure pass starts with the move to Plan,
@@ -989,6 +1001,7 @@ pub(crate) fn handle_gaps_plan_outcome(
             state,
             FixType::GapsOnly,
             note,
+            None,
             LoopBackReason::GateResponse,
         ),
         GateAction::Abort(reason) => abort(project_root, state, &reason),
@@ -1109,9 +1122,14 @@ fn answer_validate_gate(
                 // D-04: Validate is the last stage, so this approval finishes
                 // the run.
                 ApproveRoute::Finish => finish_run(project_root, state),
-                ApproveRoute::LoopBack(fix) => {
-                    loop_back_to_code(project_root, state, fix, None, LoopBackReason::GateResponse)
-                }
+                ApproveRoute::LoopBack(fix) => loop_back_to_code(
+                    project_root,
+                    state,
+                    fix,
+                    None,
+                    reverify_report(read),
+                    LoopBackReason::GateResponse,
+                ),
                 ApproveRoute::RerunValidate => {
                     // CR-01: close the gate before relaunching; its answer is spent.
                     let _ = close_gate(project_root, state.phase, Stage::Validate);
@@ -1130,7 +1148,14 @@ fn answer_validate_gate(
                 AgentVerdict::Pass | AgentVerdict::Fail => loop_back_reason(baseline_absent),
             };
             // The rejection's note is the fix request: it rides the fix pass.
-            loop_back_to_code(project_root, state, reject_fix(read), note, reason)
+            loop_back_to_code(
+                project_root,
+                state,
+                reject_fix(read),
+                note,
+                reverify_report(read),
+                reason,
+            )
         }
         // No reset on abort: the phase is ending and `abort` clears its state
         // outright, so there is no budget left to restore.
@@ -4838,8 +4863,9 @@ mod tests {
             .and_then(|event| event["fix"].as_str().map(str::to_string))
     }
 
-    /// A `stale` or `missing` report sends Code back to the full execute command
-    /// after either agent verdict in auto mode, with no gate and no finish. In
+    /// A `stale` or `missing` report sends Code back for the re-verify pass
+    /// (D-32 part 1) after either agent verdict in auto mode, with no gate and
+    /// no finish. In
     /// supervise mode the same report opens a `reverify_needed` gate, nothing
     /// launches before it is answered, and approving it relaunches Code on the
     /// auto rows' route and finishes nothing.
@@ -4865,8 +4891,8 @@ mod tests {
             );
             assert_eq!(
                 last_loop_back_fix(root, phase).as_deref(),
-                Some("FullExecute"),
-                "{status:?} relaunches the full execute command, not --gaps-only ({outcome:?})"
+                Some("StaleReverify"),
+                "{status:?} relaunches the re-verify pass, not --gaps-only ({outcome:?})"
             );
             assert!(events_named(root, phase, "workflow_finished").is_empty());
         }
@@ -4894,7 +4920,7 @@ mod tests {
         }
         assert_eq!(
             last_loop_back_fix(root, phase).as_deref(),
-            Some("FullExecute"),
+            Some("StaleReverify"),
             "approving reverify_needed relaunches Code on the auto route"
         );
         assert!(
@@ -5545,6 +5571,7 @@ mod tests {
         let read: ValidateRead = Ok(StatusReport {
             status: GsdStatus::GapsFound,
             route: "plan-phase".into(),
+            next_action: None,
             moved_files: Vec::new(),
         });
         let _ = answer_validate_gate(

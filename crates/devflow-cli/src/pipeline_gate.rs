@@ -32,7 +32,7 @@ use devflow_core::gates::{self, Claim, GateAction, GateKind, Gates};
 use devflow_core::mode;
 #[cfg(test)]
 use devflow_core::phase_id::PhaseId;
-use devflow_core::prompt::FixType;
+use devflow_core::prompt::{FixType, ReverifyReport};
 use devflow_core::stage::Stage;
 use devflow_core::state::State;
 #[cfg(test)]
@@ -94,6 +94,7 @@ pub(crate) fn transition(
             // fix pass's note goes with it.
             s.code_fix = None;
             s.code_fix_note = None;
+            s.code_fix_report = None;
             // U7: the run leaves the stage, so the stage's relaunch note goes.
             s.relaunch_note = None;
         })?;
@@ -140,6 +141,7 @@ pub(crate) fn transition(
         // plain Code pass never replays a stale one. Its note goes with it.
         s.code_fix = None;
         s.code_fix_note = None;
+        s.code_fix_report = None;
         // U7: a relaunch note is for the stage being left, never the next one.
         s.relaunch_note = None;
     })?;
@@ -200,6 +202,7 @@ pub(crate) fn finish_run(project_root: &Path, state: &mut State) -> Result<(), C
         s.gate_pending = false;
         s.code_fix = None;
         s.code_fix_note = None;
+        s.code_fix_report = None;
         s.relaunch_note = None;
         s.gap_closure_pass = false;
     })?;
@@ -281,19 +284,23 @@ impl LoopBackReason {
     }
 }
 
-/// Loop the pipeline back to Code with the given fix prompt (`GapsOnly` or
-/// `FullExecute` for a Validate rejection). `note` is the operator's note on
-/// the rejected gate that asked for the fix (GATE-01), `None` for an
-/// unattended loop-back or an approval: the fix pass carries it to its agent.
+/// Loop the pipeline back to Code with the given fix prompt (`GapsOnly`,
+/// `FullExecute` or `StaleReverify` for a Validate rejection). `note` is the
+/// operator's note on the rejected gate that asked for the fix (GATE-01), `None`
+/// for an unattended loop-back or an approval: the fix pass carries it to its
+/// agent. `reverify_report` is what GSD said when the fix is `StaleReverify`
+/// (D-32 part 1); it is ignored for every other fix.
 pub(crate) fn loop_back_to_code(
     project_root: &Path,
     state: &mut State,
     fix: FixType,
     note: Option<String>,
+    reverify_report: Option<ReverifyReport>,
     reason: LoopBackReason,
 ) -> Result<(), CliError> {
     let from = state.stage;
-    let prompt = prepare_loop_back_to_code(project_root, state, fix, note, reason)?;
+    let prompt =
+        prepare_loop_back_to_code(project_root, state, fix, note, reverify_report, reason)?;
     launch_stage(state, Some(prompt), Some(from))
 }
 
@@ -309,8 +316,11 @@ pub(crate) fn prepare_loop_back_to_code(
     state: &mut State,
     fix: FixType,
     note: Option<String>,
+    reverify_report: Option<ReverifyReport>,
     reason: LoopBackReason,
 ) -> Result<String, CliError> {
+    // Only the re-verify pass quotes GSD, so only it keeps the report.
+    let reverify_report = reverify_report.filter(|_| fix == FixType::StaleReverify);
     // Capture the stage the gate actually fired on before it's mutated below,
     // so the close targets the right stage's gate files (see CR-01).
     let gate_stage = state.stage;
@@ -322,6 +332,8 @@ pub(crate) fn prepare_loop_back_to_code(
         // (failover, resume, re-drive) replays it rather than plain execute.
         s.code_fix = Some(fix);
         s.code_fix_note = note.clone();
+        // D-32 part 1: GSD's words for the re-verify pass, in the same commit.
+        s.code_fix_report = reverify_report.clone();
         // GATE-03: another fix route replaces a gap-closure pass, in the same
         // commit; a gaps-only loop-back continues it.
         if fix != FixType::GapsOnly {
@@ -354,7 +366,7 @@ pub(crate) fn prepare_loop_back_to_code(
             fix: Some(fix),
             fix_note: note,
             relaunch_note: None,
-            reverify_report: None,
+            reverify_report,
         },
     ))
 }
@@ -1951,6 +1963,7 @@ mod tests {
             &mut state,
             FixType::GapsOnly,
             None,
+            None,
             LoopBackReason::GateResponse,
         )
         .unwrap();
@@ -2068,6 +2081,7 @@ mod tests {
             dir.path(),
             &mut state,
             FixType::GapsOnly,
+            None,
             None,
             LoopBackReason::GateResponse,
         )

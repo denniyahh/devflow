@@ -672,10 +672,50 @@ fn code_policy_applies_to_fix_arm(fix: Option<FixType>) -> bool {
     }
 }
 
+/// The re-verify pass's lead (D-32 part 1), shared by both renderers so they
+/// cannot drift: GSD's status, route and next action quoted verbatim (the next
+/// action with control characters other than newline and tab removed, as an
+/// operator note is), then the instruction to resume at the phase gates and
+/// re-run the verifier (gsd-core#4682). `None` when GSD's words were not
+/// recorded for the pass: the prompt says so instead of inventing them.
+fn reverify_lead(report: Option<&ReverifyReport>) -> String {
+    let quote = match report {
+        Some(report) => {
+            let route = if report.route.is_empty() {
+                "GSD names no route".to_string()
+            } else {
+                format!("its route is `{}`", report.route)
+            };
+            let next_action = match &report.next_action {
+                Some(text) => format!(
+                    "GSD's next action, quoted verbatim:\n\n    {}",
+                    sanitize_note(text)
+                ),
+                None => "GSD gave no next action.".to_string(),
+            };
+            format!(
+                "GSD's own verification status for this phase is `{}`, and {route}. \
+                 {next_action}",
+                report.status
+            )
+        }
+        None => "GSD's verification status for this phase is not `passed`; its words were \
+                 not recorded for this pass."
+            .to_string(),
+    };
+    format!(
+        "Validation cannot finish yet. {quote}\n\n\
+        This is the re-verify pass. The phase's plans are already executed: resume at the \
+        phase gates, where execute-phase verifies the phase, and re-run the verifier so it \
+        writes the phase's verification report again against the current code. Do not end \
+        this pass before the verifier has run (gsd-core#4682)."
+    )
+}
+
 fn workflow_code_prompt(
     phase: PhaseId,
     fix: Option<FixType>,
-    _reverify_report: Option<&ReverifyReport>,
+    reverify_report: Option<&ReverifyReport>,
     workflow_root: &str,
     notes: &str,
 ) -> String {
@@ -685,7 +725,13 @@ fn workflow_code_prompt(
             phase {phase} --auto --gaps-only. The `--auto` and `--gaps-only` flags are part \
             of the workflow invocation and must be preserved verbatim."
         ),
-        Some(FixType::FullExecute | FixType::StaleReverify) | None => format!(
+        Some(FixType::StaleReverify) => format!(
+            "{}\n\nRead and follow the GSD workflow file at {workflow_root}/execute-phase.md \
+            for phase {phase} --auto. The `--auto` flag is part of the workflow invocation and \
+            must be preserved verbatim.",
+            reverify_lead(reverify_report)
+        ),
+        Some(FixType::FullExecute) | None => format!(
             "Read and follow the GSD workflow file at {workflow_root}/execute-phase.md for \
             phase {phase} --auto. The `--auto` flag is part of the workflow invocation and \
             must be preserved verbatim."
@@ -796,9 +842,18 @@ pub fn fix_prompt(fix_type: FixType, phase: PhaseId, note: Option<&str>) -> Stri
 fn fix_prompt_with_notes(
     fix_type: FixType,
     phase: PhaseId,
-    _reverify_report: Option<&ReverifyReport>,
+    reverify_report: Option<&ReverifyReport>,
     notes: &str,
 ) -> String {
+    let lead = match fix_type {
+        FixType::StaleReverify => format!(
+            "{}\n\nRun the re-verify command for this loop:",
+            reverify_lead(reverify_report)
+        ),
+        FixType::GapsOnly | FixType::FullExecute => {
+            "Validation reported issues. Run the fix command for this loop:".to_string()
+        }
+    };
     let command = match fix_type {
         FixType::GapsOnly => {
             format!("/gsd-execute-phase {phase} --gaps-only {AUTO_CHAIN_PRESERVING_FLAG}")
@@ -814,15 +869,13 @@ fn fix_prompt_with_notes(
     // claude-style omission control in `mod tests` is what catches that.
     if code_policy_applies_to_fix_arm(Some(fix_type)) {
         format!(
-            "Validation reported issues. Run the fix command for this loop:\n\n    {command}\n\n\
+            "{lead}\n\n    {command}\n\n\
             {CODE_STAGE_POLICY}\n\
             \n\
             {notes}{COMPLETION_PROTOCOL}"
         )
     } else {
-        format!(
-            "Validation reported issues. Run the fix command for this loop:\n\n    {command}\n\n{notes}{COMPLETION_PROTOCOL}"
-        )
+        format!("{lead}\n\n    {command}\n\n{notes}{COMPLETION_PROTOCOL}")
     }
 }
 
@@ -1300,6 +1353,10 @@ mod tests {
         assert!(
             fix_prompt(FixType::FullExecute, phase, None).contains(AUTO_CHAIN_PRESERVING_FLAG),
             "the full-execute loop-back reaches execute-phase.md too"
+        );
+        assert!(
+            fix_prompt(FixType::StaleReverify, phase, None).contains(AUTO_CHAIN_PRESERVING_FLAG),
+            "the re-verify pass reaches execute-phase.md too"
         );
     }
 
