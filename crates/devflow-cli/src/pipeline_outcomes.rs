@@ -20,6 +20,7 @@ use crate::pipeline_gate::{
 use crate::pipeline_launch::{
     close_gate, commit, launch_stage, record_relaunch_note, recorded_canary_refusal,
 };
+pub(crate) use devflow_core::gates::render_gate_context;
 use devflow_core::gates::{GateAction, GateFile, GateKind, GateLabel, GateResponse};
 use devflow_core::gsd_reader::{self, GsdStatus, ReaderFailure, StatusReport};
 use devflow_core::mode::{self, Mode};
@@ -884,7 +885,8 @@ pub(crate) fn unread_evidence() -> Evidence {
 
 /// `cause`, led by the way-on sentence for a gate of `kind` (C2): first, after
 /// a leading `[never-silent]` marker if `cause` has one, so the notify hook,
-/// the banner and `gate list` show it before the cause.
+/// the banner and `gate list` show it before the cause. An empty cause yields
+/// the sentence alone (after the marker, if any).
 pub(crate) fn lead_with_way_on(
     kind: GateKind,
     at: (PhaseId, Stage),
@@ -893,9 +895,14 @@ pub(crate) fn lead_with_way_on(
 ) -> String {
     const MARKER: &str = "[never-silent] ";
     let sentence = way_on_sentence(kind, at.0, at.1, canary_refusal);
-    match cause.strip_prefix(MARKER) {
-        Some(rest) => format!("{MARKER}{sentence} {rest}"),
-        None => format!("{sentence} {cause}"),
+    let (lead, rest) = match cause.strip_prefix(MARKER) {
+        Some(rest) => (format!("{MARKER}{sentence}"), rest),
+        None => (sentence, cause),
+    };
+    if rest.is_empty() {
+        lead
+    } else {
+        format!("{lead} {rest}")
     }
 }
 
@@ -2159,30 +2166,6 @@ pub(crate) const GATE_CONTEXT_STORED_MAX_CHARS: usize = 4096;
 /// the whole context to their own display bound.
 pub(crate) fn truncate_reason(reason: &str) -> String {
     render_gate_context(reason, GATE_CONTEXT_STORED_MAX_CHARS)
-}
-
-/// Render agent-controlled gate text as one bounded, terminal-safe line.
-pub(crate) fn render_gate_context(context: &str, max_chars: usize) -> String {
-    const TRUNCATED: &str = "… [truncated; full output in .devflow/]";
-    let sanitized: String = context
-        .chars()
-        .map(|character| {
-            if character.is_control() {
-                ' '
-            } else {
-                character
-            }
-        })
-        .collect();
-    if sanitized.chars().count() <= max_chars {
-        return sanitized;
-    }
-
-    let suffix_len = TRUNCATED.chars().count().min(max_chars);
-    let head_len = max_chars.saturating_sub(suffix_len);
-    let head: String = sanitized.chars().take(head_len).collect();
-    let suffix: String = TRUNCATED.chars().take(suffix_len).collect();
-    format!("{head}{suffix}")
 }
 
 /// The never-silent gate context for a failed `stage`, with its `reason`

@@ -604,6 +604,13 @@ Env provided to the hook: `DEVFLOW_GATE_PHASE`, `DEVFLOW_GATE_STAGE`,
 `DEVFLOW_GATE_CONTEXT`, `DEVFLOW_NON_SILENT_GATE` (`1` when the gate exists
 only because a stage failed unexpectedly).
 
+`DEVFLOW_GATE_CONTEXT` holds the first 450 characters of the gate's context,
+the same start the pending-gate banner and `devflow gate list` show; a longer
+context ends in `… [truncated; full output in .devflow/]`. Every context leads
+with the way-on sentence, so the start names each answer's route. The gate
+file stores a failure's reason whole (up to 4096 characters), and `devflow
+gate show <phase>` prints all of it.
+
 The command is saved in the run's state file (`gate_notify_cmd` in
 `.devflow/state-NN.json`), so gates fired by the detached monitor use it
 without your shell's environment. `devflow start`, `resume` and `advance`
