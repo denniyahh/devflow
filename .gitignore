@@ -65,7 +65,6 @@ skills-lock.json
 # DevFlow own state (dogfooding) — per-phase since the 14a refactor
 .devflow/state.json
 .devflow/state-*.json
-.devflow/lock-*
 .devflow/phase-*-stdout
 .devflow/phase-*-stderr.log
 .devflow/phase-*-exit
