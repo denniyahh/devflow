@@ -73,7 +73,6 @@ pub mod prompt;
 pub mod recover;
 pub mod registry;
 pub mod reset_time;
-pub mod ship;
 pub mod stage;
 pub mod state;
 pub mod supervisor;
@@ -82,7 +81,6 @@ pub mod supervisor;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 pub mod verify;
-pub mod version;
 pub mod workflow;
 pub mod worktree;
 

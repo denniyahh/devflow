@@ -32,7 +32,6 @@ const RUNTIME_PATHS: &[&str] = &[
     ".devflow/phase-01-exit",
     ".devflow/phase-01-agent-pid",
     ".devflow/phase-01-monitor-stop",
-    ".devflow/last-ship.json",
     ".devflow/events.jsonl",
     ".devflow/gates/probe.json",
     ".devflow/history/phase-01-state.json",
