@@ -532,8 +532,37 @@ pub(crate) fn undeterminable_currency_warning(base: &str) -> String {
     )
 }
 
+/// The one line [`ensure_base_ref_current`] prints when the project has no
+/// `origin` remote at all (OPS-03). It replaces the fetch-failure line and
+/// the undeterminable-currency warning, which would both follow from that
+/// single cause.
+fn missing_remote_line(base: &str) -> String {
+    format!(
+        "warning: no `{ORIGIN}` remote is configured — skipping the check that `{base}` \
+         is current with `{ORIGIN}/{base}` (fail-open)"
+    )
+}
+
+/// Whether the repository at `project_root` has a remote named `origin`:
+/// `Some(false)` only when `git remote` ran and did not list it. `None` when
+/// git could not answer, so the caller keeps its existing fetch-and-compare
+/// path rather than guessing that the remote is missing.
+fn origin_is_configured(project_root: &Path) -> Option<bool> {
+    let output = git_command(project_root).args(["remote"]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|name| name.trim() == ORIGIN),
+    )
+}
+
 /// Refuse before `devflow start` forks anything when `base` is stale
-/// relative to its remote. `Current`, `Ahead` and `Undeterminable` all
+/// relative to its remote. A project with no `origin` remote at all gets
+/// one line saying so and proceeds (OPS-03); a remote that exists but cannot
+/// be fetched is a different cause and keeps its own lines. `Current`, `Ahead` and `Undeterminable` all
 /// return `Ok(())` (the last with a warning — the guard fails open where it
 /// cannot see, mirroring [`ensure_phase_reachable_on_base`]).
 ///
@@ -577,6 +606,10 @@ fn ensure_base_ref_current_to(
     project_root: &Path,
     base: &str,
 ) -> Result<(), CliError> {
+    if origin_is_configured(project_root) == Some(false) {
+        let _ = writeln!(out, "{}", missing_remote_line(base));
+        return Ok(());
+    }
     match base_ref_currency_to(out, project_root, base) {
         BaseRefCurrency::Current | BaseRefCurrency::Ahead => Ok(()),
         // FAIL DIRECTION: OPEN. This arm is what allows a local-only
@@ -589,8 +622,7 @@ fn ensure_base_ref_current_to(
         // (the classification) and
         // `ensure_base_ref_current_fails_open_for_a_local_only_planning_branch`
         // (the disposition); the WARNING's own text is guarded separately by
-        // `undeterminable_currency_warning_names_the_branch_and_its_disposition`,
-        // because a bare `println!` here is unobservable from a unit test.
+        // `undeterminable_currency_warning_names_the_branch_and_its_disposition`.
         BaseRefCurrency::Undeterminable => {
             let _ = writeln!(out, "{}", undeterminable_currency_warning(base));
             Ok(())
