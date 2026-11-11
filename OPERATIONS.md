@@ -390,10 +390,20 @@ when the run uses `--no-worktree`), and is killed after 60 seconds.
 | GSD status | After an agent pass | After an agent fail |
 |---|---|---|
 | `passed` | auto: the run finishes; supervise: the Validate gate, whose approval finishes the run | a gate: the agent and GSD disagree; approving runs Validate again |
-| `gaps_found` | auto: a gap-closure pass: Plan runs `/gsd-plan-phase N --gaps`, then Code runs `/gsd-execute-phase N --gaps-only`, then Validate runs again; supervise: a gate whose approval or rejection loops back to Code for a gaps-only pass | the same |
+| `gaps_found` | auto: a gap-closure pass: Plan runs `/gsd-plan-phase N --gaps`, then Code runs `/gsd-execute-phase N --gaps-only`, then Validate runs again; supervise: a `gaps_found` gate, whose approval runs that gap-closure pass and never finishes the run, and whose abort (`devflow gate abort`) ends the run | the same |
 | `stale` or `missing` | auto: back to Code with the full execute command, which re-runs the verifier; supervise: a `reverify_needed` gate, and nothing launches until it is answered | the same |
 | `human_needed` | a gate in both modes; approving runs Validate again | a gate: the agent and GSD disagree |
 | no answer | a `[never-silent]` gate naming the failure: no launcher, a non-zero exit, a timeout, output that is not JSON, a status outside GSD's set, no phase directory, and the like. It is never a pass and never a silent retry | the same |
+
+A gap-closure pass keeps going until a Validate reads `passed`. A `devflow
+stop`, a resume or a crash in the middle of it keeps it: a resumed Plan still
+runs `--gaps` and a resumed Code still runs `--gaps-only`. After its Plan
+pass DevFlow checks that the pass wrote a plan with `gap_closure: true` (read
+through GSD's `frontmatter get`) whose file is newer than the phase's
+`VERIFICATION.md`. An earlier round's gap plan does not count. Without one the
+run stops at a Plan gate of kind `no_gap_closure_plan`; if the check cannot
+read the plans it stops at a `[never-silent]` `reader_failure` gate. Approving
+either gate reruns the gaps Plan pass, and `devflow gate abort` ends the run.
 
 An agent pass over any status but `passed` counts as a Validate failure, so the
 consecutive-failure and per-phase caps still bound the loop; at a cap the run

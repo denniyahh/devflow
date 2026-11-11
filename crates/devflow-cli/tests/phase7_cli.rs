@@ -1086,12 +1086,15 @@ esac
 
     // 52-22: Validate reads GSD's own verification status, so the run gets a
     // `gsd_run` stub under its home and never a real GSD install. The agent
-    // reports no verdict (a fail) and GSD reports gaps, so the auto loop runs
-    // to its cap; one reply per Validate, with room to spare.
+    // reports no verdict (a fail) and GSD reports a stale report, so the auto
+    // loop back to Code runs to its cap; one reply per Validate, with room to
+    // spare. (52-27: `gaps_found` would take the gap-closure pass through
+    // Plan, whose post-check gates at Plan on this fixture, which writes no
+    // report and no gap plan.)
     let gsd_logs = tempfile::tempdir().unwrap();
-    let gaps =
-        devflow_core::test_support::gsd_status_json(devflow_core::gsd_reader::GsdStatus::GapsFound);
-    common::stub_gsd_run(&home, &[gaps; 10], gsd_logs.path());
+    let stale =
+        devflow_core::test_support::gsd_status_json(devflow_core::gsd_reader::GsdStatus::Stale);
+    common::stub_gsd_run(&home, &[stale; 10], gsd_logs.path());
 
     // start — creates the phase worktree by default
     let out = run_devflow(
@@ -1133,7 +1136,7 @@ esac
     .unwrap();
     assert_eq!(
         gate["gate_kind"], "failure_cap",
-        "the loop over GSD's gaps_found reaches its cap: {gate}"
+        "the loop over GSD's stale report reaches its cap: {gate}"
     );
 
     // 31-03: reaching the Validate gate already implies the Code stage's
