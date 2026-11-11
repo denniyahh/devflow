@@ -9521,6 +9521,42 @@ mod tests {
         );
     }
 
+    /// Operator decision (2026-11-11, Phase 52): a `start` over a FINISHED
+    /// run begins with a zero Validate-failure total. A finished run passed
+    /// Validate, so its old failures say nothing about the new run. Since
+    /// 52-08 the finish keeps the state file, so without this the total
+    /// carried. The control is a stopped run that did NOT finish: its total is
+    /// still carried, so a stop-and-restart cannot reset the bound.
+    #[test]
+    fn a_start_over_a_finished_run_resets_the_failure_total_and_a_stopped_one_carries_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(74);
+
+        let mut persisted = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        persisted.phase_validate_failures = 5;
+        persisted.stopped = true;
+        persisted.finished = false;
+        workflow::save_state(&persisted).unwrap();
+        let (stopped_total, stopped_warning) =
+            carried_phase_failures(phase, workflow::load_state(root, phase));
+        assert_eq!(
+            stopped_total, 5,
+            "control: a stopped, unfinished run's total must carry into the next start"
+        );
+        assert_eq!(stopped_warning, None);
+
+        persisted.finished = true;
+        workflow::save_state(&persisted).unwrap();
+        let (finished_total, finished_warning) =
+            carried_phase_failures(phase, workflow::load_state(root, phase));
+        assert_eq!(
+            finished_total, 0,
+            "a finished run passed Validate, so the next start begins at zero"
+        );
+        assert_eq!(finished_warning, None);
+    }
+
     #[test]
     fn gate_approve_arg_parsing_takes_the_stage_option() {
         let flagged =
