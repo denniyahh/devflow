@@ -670,6 +670,22 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.223: `stop_ends_a_launch_its_running_launcher_promotes_during_the_wait` Flakes on Its Liveness Check (BACKLOG)
+
+**Found:** 2026-11-11, Phase 52 plan 52-28, first full `cargo nextest run --workspace` (2010 tests, 1 failed). The test
+failed at `crates/devflow-cli/tests/pending_supervisor_e2e.rs` ~L309 (`its liveness file is gone`): `liveness::probe`
+read `Live`, not `Missing`, right after `stop` returned.
+**Evidence:** 1 failure; then 3/3 isolated reruns and the next two full runs passed. 52-28 touched no stop, supervisor or
+liveness code.
+
+**Not established:** the cause. Suspected: the fork-inherits-fd family of 999.221/999.222 (another test's child holding
+a duplicate of the liveness lock's open file description until its `exec`), or the ended supervisor's exit racing the
+probe under load. Not reproduced on demand. If it is the fd family, `stop` itself could briefly report a live run in a
+multi-threaded caller, not only in tests.
+
+**Fix shape:** make the assertion wait (bounded, ~2 s) for `Missing`, or fold into 999.221's fix; check whether the
+lock fds are `O_CLOEXEC` and whether test helpers fork without exec. Small: any fix branch, ideally with 999.221/222.
+
 ### Phase 999.222: The GSD Test Stub Can Fail to Exec With "Text file busy" (BACKLOG)
 
 **Found:** 2026-11-11, Phase 52 plan 52-24, first `scripts/check.sh all` run (`cargo test --workspace`, devflow-core
