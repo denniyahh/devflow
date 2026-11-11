@@ -2809,6 +2809,15 @@ pub(crate) fn relaunch_checkpoint_session(
     )
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Set on a thread to record each [`launch_stage`] call made on it, as the
+    /// stage and agent it launches, before anything can refuse the launch: a
+    /// unit test's launch seam, where no agent binary is on `PATH`.
+    pub(crate) static LAUNCH_PROBE: std::cell::RefCell<Option<Vec<(Stage, AgentKind)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Spawn the background monitor that owns the agent for `state.stage`. The
 /// monitor calls `devflow advance` when the agent exits. An optional
 /// `prompt_override` is used for Code loop-backs (fix prompts).
@@ -2827,6 +2836,12 @@ pub(crate) fn launch_stage(
     prompt_override: Option<String>,
     archived_stage: Option<Stage>,
 ) -> Result<(), CliError> {
+    #[cfg(test)]
+    LAUNCH_PROBE.with_borrow_mut(|probe| {
+        if let Some(launches) = probe {
+            launches.push((state.stage, state.agent));
+        }
+    });
     let driver = agents::driver_for(state.agent);
     let prompt = prompt_override
         .clone()
@@ -18189,6 +18204,250 @@ mod tests {
             baseline,
             |root| with_pending(root, baseline, &missing),
             &gone,
+        );
+    }
+
+    // ---- 52-32: resume and takeover decide arming the same way ----
+
+    /// A `claude` stub that prints a rate-limit envelope whose retry time is long
+    /// past, so an armed timer would answer the gate at once.
+    fn past_reset_claude_script() -> String {
+        "#!/bin/sh\ncase \"$1\" in --version) exit 0 ;; esac\n\
+         printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"error_rate_limit\",\"retry_after\":\"1700000000\"}'\n\
+         exit 0\n"
+            .to_string()
+    }
+
+    /// Run `name` in a hermetic child whose `PATH` holds [`past_reset_claude_script`]
+    /// as `claude`, with the monitor's full advance on and a 20 s gate timeout so
+    /// no waiting supervisor outlives the test by long. `true` in the parent,
+    /// whose work is done.
+    fn parent_of_a_past_reset_claude_child(name: &str) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        if devflow_core::test_support::in_child_test(name) {
+            return false;
+        }
+        let path_dir = agent_free_dir_with_agent_stub("claude");
+        let stub = path_dir.path().join("claude");
+        std::fs::write(&stub, past_reset_claude_script()).unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let output = crate::test_support::run_hermetic_test_in_child(
+            name,
+            path_dir.path(),
+            &[
+                (TEST_MONITOR_FULL_ENV, std::ffi::OsStr::new("1")),
+                ("DEVFLOW_GATE_TIMEOUT_SECS", std::ffi::OsStr::new("20")),
+            ],
+        );
+        devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, name);
+        true
+    }
+
+    /// A Code-stage Claude run of `phase` at `root`, Supervise, with a recorded
+    /// `Confirmed` canary and `used` as its automatic-relaunch flag, saved.
+    fn save_rate_limit_run(root: &Path, phase: PhaseId, used: bool) -> State {
+        init_repo(root);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.verification_baseline_captured = true;
+        state.stage = Stage::Code;
+        state.canary = Some(canary::CanaryOutcome::Confirmed);
+        state.rate_limit_auto_relaunch_used = used;
+        workflow::save_state(&state).unwrap();
+        state
+    }
+
+    /// The phase's open Code gate file, once it exists (bounded).
+    fn the_open_code_gate(root: &Path, phase: PhaseId) -> devflow_core::gates::GateFile {
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || {
+                crate::pipeline_gate::read_gate_file(root, phase, Stage::Code).is_some()
+            }),
+            "no Code gate opened; events:\n{}",
+            std::fs::read_to_string(devflow_core::events::events_path(root)).unwrap_or_default()
+        );
+        crate::pipeline_gate::read_gate_file(root, phase, Stage::Code).unwrap()
+    }
+
+    /// How long a row watches for a timer that must not fire.
+    const NO_TIMER_WITHIN: Duration = Duration::from_secs(3);
+
+    /// Assert the run at `root` waits at a rate-limit gate with its not-before
+    /// time recorded and no timer: the arming function says so over the state
+    /// and gate on disk, and over a bounded wait the timer never fires and
+    /// nothing launches beyond `launches`.
+    fn assert_waits_with_no_timer(root: &Path, phase: PhaseId, launches: usize, row: &str) {
+        let gate = the_open_code_gate(root, phase);
+        assert_eq!(
+            gate.gate_kind,
+            Some(devflow_core::gates::GateKind::RateLimit),
+            "{row}: {gate:?}"
+        );
+        assert!(gate.not_before.is_some(), "{row}: not_before is recorded");
+        std::thread::sleep(NO_TIMER_WITHIN);
+        let state = workflow::load_state(root, phase).unwrap();
+        assert!(
+            state.rate_limit_auto_relaunch_used,
+            "{row}: the flag stays spent"
+        );
+        assert_eq!(
+            crate::pipeline_gate::rate_limit_timer_deadline(&state, &gate),
+            None,
+            "{row}: no timer is armed"
+        );
+        assert!(
+            events_named(root, "rate_limit_timer_fired").is_empty(),
+            "{row}: the timer never fired"
+        );
+        assert!(
+            events_named(root, "gate_resolved").is_empty(),
+            "{row}: nothing answered the gate"
+        );
+        assert_eq!(stage_launched_count(root, phase), launches, "{row}");
+        assert!(
+            crate::pipeline_gate::read_gate_file(root, phase, Stage::Code).is_some(),
+            "{row}: the gate is still open"
+        );
+    }
+
+    /// Wait, bounded, until the timer has answered `root`'s gate.
+    fn assert_the_timer_answers(root: &Path, row: &str) {
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || {
+                events_named(root, "rate_limit_timer_fired")
+                    .iter()
+                    .any(|event| event["outcome"] == "answered")
+            }),
+            "{row}: the armed timer never answered; events:\n{}",
+            std::fs::read_to_string(devflow_core::events::events_path(root)).unwrap_or_default()
+        );
+    }
+
+    /// D-27.3 / D-38: a resume after the automatic relaunch was used does not
+    /// re-arm it: the denied relaunch opens the gate with its not-before time
+    /// and no timer. The same after a stop (`stopped` with a reason, as `devflow
+    /// stop` leaves it) and then a resume. Control: the same resume over a run
+    /// whose flag is still false arms the timer, which answers the gate.
+    #[test]
+    fn resume_does_not_rearm_the_auto_relaunch() {
+        const NAME: &str = "pipeline_launch::tests::resume_does_not_rearm_the_auto_relaunch";
+        if parent_of_a_past_reset_claude_child(NAME) {
+            return;
+        }
+        let _guard = env_lock();
+        for (offset, (stopped, used)) in [(false, true), (true, true), (false, false)]
+            .into_iter()
+            .enumerate()
+        {
+            let row = format!("stopped {stopped}, flag used {used}");
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = PhaseId::new(5160 + u32::try_from(offset).unwrap());
+            let mut state = save_rate_limit_run(root, phase, used);
+            if stopped {
+                state.stopped = true;
+                state.stop_reason = Some("stopped by devflow stop".to_string());
+                workflow::save_state(&state).unwrap();
+            }
+            let result = resume(root, phase, None);
+            let reloaded_for_reap = workflow::load_state(root, phase).ok();
+            let _reap_guard = reloaded_for_reap
+                .as_ref()
+                .map(ReapMonitorOnDrop::after_launch);
+            result.unwrap();
+            if used {
+                assert_waits_with_no_timer(root, phase, 1, &row);
+            } else {
+                assert_the_timer_answers(root, &row);
+                let relaunched = workflow::load_state(root, phase).ok();
+                let _relaunch_reap = relaunched.as_ref().map(ReapMonitorOnDrop::after_launch);
+            }
+        }
+    }
+
+    /// D-27.3 / D-38 / D-45 rule 5: a supervisor that takes over a run whose
+    /// automatic relaunch was used finds the flag spent in the state on disk, the
+    /// only thing a takeover inherits, and arms nothing when its stage is denied
+    /// again. Crash row: the state a crash right after the flag commit leaves
+    /// (flag spent, the rate-limit gate open, no answer on it): the arming
+    /// function arms nothing over it, and over a bounded wait no answer is
+    /// written and nothing launches, while the gate still names `devflow resume`.
+    /// Controls: the same launch over a state whose flag is false arms the timer,
+    /// and the arming function arms the crash row's gate over an unspent flag.
+    #[test]
+    fn a_takeover_does_not_rearm_the_auto_relaunch() {
+        const NAME: &str = "pipeline_launch::tests::a_takeover_does_not_rearm_the_auto_relaunch";
+        if parent_of_a_past_reset_claude_child(NAME) {
+            return;
+        }
+        let _guard = env_lock();
+        for (offset, used) in [(0u32, true), (1, false)] {
+            let row = format!("takeover, flag used {used}");
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = PhaseId::new(5170 + offset);
+            let mut state = save_rate_limit_run(root, phase, used);
+            // As a takeover would: a supervisor that never set the flag is
+            // recorded, and it reads the flag from disk.
+            let launched = launch_stage(&mut state, None, None);
+            let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
+            launched.unwrap();
+            if used {
+                assert_waits_with_no_timer(root, phase, 1, &row);
+            } else {
+                assert_the_timer_answers(root, &row);
+                let relaunched = workflow::load_state(root, phase).ok();
+                let _relaunch_reap = relaunched.as_ref().map(ReapMonitorOnDrop::after_launch);
+            }
+        }
+
+        // The crash row: no process is waiting, the flag is spent and the gate open.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5172);
+        let state = save_rate_limit_run(root, phase, true);
+        Gates::open_gate(
+            root,
+            phase,
+            Stage::Code,
+            devflow_core::gates::GateLabel::rate_limit(Some(1_700_000_000)),
+            "[never-silent] stage code failed: rate limited with no usable fallback; once this \
+             waiting supervisor has ended, `devflow resume --phase 5172` relaunches the stage",
+        )
+        .unwrap();
+        let gate = crate::pipeline_gate::read_gate_file(root, phase, Stage::Code).unwrap();
+        assert_eq!(
+            crate::pipeline_gate::rate_limit_timer_deadline(&state, &gate),
+            None,
+            "crash row: a spent flag arms nothing"
+        );
+        std::thread::sleep(NO_TIMER_WITHIN);
+        assert!(
+            gate_answer_files(root, phase, Stage::Code).is_empty(),
+            "crash row: no answer was written"
+        );
+        assert_eq!(
+            stage_launched_count(root, phase),
+            0,
+            "crash row: nothing launched"
+        );
+        let still = crate::pipeline_gate::read_gate_file(root, phase, Stage::Code)
+            .expect("crash row: the gate is still open");
+        assert!(
+            still.context.contains("devflow resume --phase 5172"),
+            "crash row: the gate still names the resume command: {}",
+            still.context
+        );
+        let mut unspent = state.clone();
+        unspent.rate_limit_auto_relaunch_used = false;
+        assert_eq!(
+            crate::pipeline_gate::rate_limit_timer_deadline(&unspent, &gate),
+            gate.not_before,
+            "control: the same gate over an unspent flag is armed"
         );
     }
 }

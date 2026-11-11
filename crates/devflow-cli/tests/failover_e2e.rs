@@ -353,6 +353,15 @@ impl Rig {
         self.start_with_env(extra, &[]);
     }
 
+    /// [`Self::start`] with `env` set on the `devflow start` child, which the
+    /// detached supervisor inherits (`DEVFLOW_GATE_TIMEOUT_SECS`).
+    fn start_with_timeout(&self, gate_timeout_secs: u64) {
+        self.start_with_env(
+            &["--no-worktree"],
+            &[("DEVFLOW_GATE_TIMEOUT_SECS", &gate_timeout_secs.to_string())],
+        );
+    }
+
     fn start_with_env(&self, extra: &[&str], env: &[(&str, &str)]) {
         let existing = std::env::var_os("PATH").unwrap_or_default();
         let path = format!(
@@ -456,6 +465,27 @@ impl Rig {
             .collect()
     }
 
+    /// The prompt of each `claude` invocation, in order: the `content` of each
+    /// stdin turn the stub logged, decoded from its JSON so it holds the bytes
+    /// the agent was given.
+    fn claude_prompts(&self) -> Vec<String> {
+        fs::read_to_string(self.logs.path().join("claude-stdin.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| {
+                let turn: Value = serde_json::from_str(line).unwrap_or_else(|error| {
+                    panic!("a stdin turn is one JSON line ({error}): {line}")
+                });
+                turn["message"]["content"]
+                    .as_str()
+                    .unwrap_or_else(|| {
+                        panic!("a stdin turn carries its prompt as a string: {line}")
+                    })
+                    .to_string()
+            })
+            .collect()
+    }
+
     /// The phase's open Code gate file, parsed.
     fn code_gate(&self) -> Option<Value> {
         let path = devflow_core::gates::Gates::gate_path(
@@ -464,6 +494,17 @@ impl Rig {
             devflow_core::stage::Stage::Code,
         );
         serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
+    }
+
+    /// Run `devflow gate <args> <phase> --stage code ...` against the rig.
+    fn gate(&self, verb: &str, extra: &[&str]) -> std::process::Output {
+        common::hermetic_devflow(&self.home)
+            .args(["gate", verb, &self.phase.to_string(), "--stage", "code"])
+            .args(extra)
+            .arg("--project")
+            .arg(&self.root)
+            .output()
+            .expect("run devflow gate")
     }
 
     /// A commit id a stub recorded, outside the repository.
@@ -958,6 +999,23 @@ fn a_rate_limited_claude_run_without_a_fallback_waits_at_a_gate() {
         shown_text.contains(&format!("devflow resume --phase {phase}")),
         "the gate names the resume command: {shown_text}"
     );
+    assert!(
+        shown_text.contains(&format!(
+            "once this waiting supervisor has ended, `devflow resume --phase {phase}`"
+        )),
+        "the resume command is worded as the way on once the waiter is gone: {shown_text}"
+    );
+    assert_eq!(
+        rig.claude_code_turns(),
+        1,
+        "one Code turn before the gate: {:?}",
+        rig.invocations("claude")
+    );
+    assert_eq!(
+        rig.code_launches().len(),
+        1,
+        "one stage_launched event for Code; events:\n{log}"
+    );
 
     assert!(
         rig.events_named("agent_handoff").is_empty(),
@@ -1052,6 +1110,294 @@ fn a_passed_reset_relaunches_once_and_a_second_denial_waits() {
     assert!(
         rig.state().rate_limit_auto_relaunch_used,
         "the run's one automatic relaunch is spent"
+    );
+}
+
+/// `devflow_core::reset_time::RATE_LIMIT_RELAUNCH_MARGIN_SECS`, the margin the
+/// timer waits after a reset.
+const MARGIN: i64 = devflow_core::reset_time::RATE_LIMIT_RELAUNCH_MARGIN_SECS;
+
+/// The bound a relaunch at a near reset must land within.
+const RELAUNCH_WITHIN: Duration = Duration::from_secs(60);
+
+/// Wait, bounded by `limit`, until the run has launched Code `count` times
+/// (by `stage_launched` events) and the stub has run that many Code turns.
+fn wait_for_code_launches(rig: &Rig, count: usize, limit: Duration) {
+    let started = std::time::Instant::now();
+    while rig.code_launches().len() < count || rig.claude_code_turns() < count {
+        assert!(
+            started.elapsed() < limit,
+            "timed out after {limit:?} waiting for {count} Code launches in phase {}; claude \
+             ran {:?}; events:\n{}",
+            rig.phase,
+            rig.invocations("claude"),
+            rig.events_text()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// The index of the first event named `name` at or after `from`, if any.
+fn position_from(events: &[Value], name: &str, from: usize) -> Option<usize> {
+    events
+        .iter()
+        .skip(from)
+        .position(|event| event["event"] == name)
+        .map(|at| at + from)
+}
+
+/// D-27.2: a reset later than `DEVFLOW_GATE_TIMEOUT_SECS` keeps the gate open
+/// past that timeout. The other direction of
+/// `a_reset_earlier_than_the_gate_timeout_relaunches_at_the_reset`: a lifetime
+/// cut to the gate timeout fails here.
+#[test]
+fn a_future_reset_outlives_the_gate_timeout() {
+    const GATE_TIMEOUT_SECS: u64 = 2;
+    let phase = PhaseId::new(5128);
+    let rig = Rig::with_reset(phase, a_future_reset());
+    let _reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+
+    rig.start_with_timeout(GATE_TIMEOUT_SECS);
+    wait_for_gates(&rig, 1);
+    std::thread::sleep(Duration::from_secs(GATE_TIMEOUT_SECS) + NO_MORE_LAUNCHES_WITHIN);
+    let log = rig.events_text();
+
+    let gate = rig
+        .code_gate()
+        .expect("the gate is still open past the timeout");
+    assert_eq!(gate["gate_kind"], "rate_limit", "{gate}");
+    assert!(
+        rig.events_named("gate_timeout").is_empty(),
+        "the gate timeout did not end the wait; events:\n{log}"
+    );
+    assert!(
+        rig.events_named("workflow_aborted").is_empty(),
+        "nothing aborted; events:\n{log}"
+    );
+    assert_eq!(
+        rig.claude_code_turns(),
+        1,
+        "{:?}",
+        rig.invocations("claude")
+    );
+}
+
+/// D-45 rule 5: the armed timer wakes at reset + margin whatever the gate's
+/// lifetime, so a reset a few seconds away relaunches within a bounded wait
+/// while the gate timeout is ten minutes away, and not before reset + margin.
+/// A wake tied to the gate's lifetime fails here.
+#[test]
+fn a_reset_earlier_than_the_gate_timeout_relaunches_at_the_reset() {
+    const GATE_TIMEOUT_SECS: u64 = 600;
+    let phase = PhaseId::new(5129);
+    let resets_at = now_epoch() - MARGIN + 5;
+    let rig = Rig::with_reset(phase, Some(resets_at));
+    let _reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+
+    rig.start_with_timeout(GATE_TIMEOUT_SECS);
+    wait_for_code_launches(&rig, 2, RELAUNCH_WITHIN);
+    std::thread::sleep(NO_MORE_LAUNCHES_WITHIN);
+    let log = rig.events_text();
+
+    let launches = rig.code_launches();
+    assert_eq!(launches.len(), 2, "one relaunch; events:\n{log}");
+    assert_eq!(
+        rig.claude_code_turns(),
+        2,
+        "{:?}",
+        rig.invocations("claude")
+    );
+    let relaunched_at = launches[1]["ts"].as_i64().expect("an event timestamp");
+    assert!(
+        relaunched_at >= resets_at + MARGIN,
+        "the relaunch ({relaunched_at}) is not before reset + margin ({}); events:\n{log}",
+        resets_at + MARGIN
+    );
+    let resolved = rig.events_named("gate_resolved");
+    assert_eq!(resolved[0]["responded_by"], TIMER, "{}", resolved[0]);
+}
+
+/// U8, the dispatcher row: with a 2 s gate timeout and a wake about 6 s away,
+/// the gate's lifetime equals the wake, and the wake wins: the Code stage
+/// relaunches once at the wake, answered by the timer, with no `gate_timeout`
+/// and no `workflow_aborted` before that relaunch. (The second denial's gate
+/// has no timer and a 2 s lifetime, so it times out afterwards; that is not
+/// this row's gate.) Pins the wiring; the equal-deadline pin is the pure row of
+/// `pipeline_gate::tests::the_timer_wakes_at_reset_plus_margin_whatever_the_gate_timeout`.
+#[test]
+fn a_reset_later_than_the_gate_timeout_relaunches_at_the_reset() {
+    const GATE_TIMEOUT_SECS: u64 = 2;
+    let phase = PhaseId::new(5130);
+    let resets_at = now_epoch() - MARGIN + 6;
+    let rig = Rig::with_reset(phase, Some(resets_at));
+    let _reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+
+    rig.start_with_timeout(GATE_TIMEOUT_SECS);
+    wait_for_code_launches(&rig, 2, RELAUNCH_WITHIN);
+    let log = rig.events_text();
+    let events = rig.events();
+
+    let launches = rig.code_launches();
+    let relaunched_at = launches[1]["ts"].as_i64().expect("an event timestamp");
+    assert!(
+        relaunched_at >= resets_at + MARGIN,
+        "the relaunch ({relaunched_at}) is not before reset + margin ({}); events:\n{log}",
+        resets_at + MARGIN
+    );
+    let first_gate = position(&events, "gate_fired", &log);
+    let relaunch = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| event["event"] == "stage_launched" && event["stage"] == "code")
+        .map(|(at, _)| at)
+        .nth(1)
+        .expect("the relaunch's stage_launched event");
+    let resolved =
+        position_from(&events, "gate_resolved", first_gate).expect("the first gate was answered");
+    assert!(
+        resolved < relaunch,
+        "answered, then relaunched; events:\n{log}"
+    );
+    assert_eq!(
+        events[resolved]["responded_by"], TIMER,
+        "{}",
+        events[resolved]
+    );
+    for end in ["gate_timeout", "workflow_aborted"] {
+        assert!(
+            position_from(&events, end, first_gate).is_none_or(|at| at > relaunch),
+            "no {end} before the relaunch; events:\n{log}"
+        );
+    }
+}
+
+/// D-16: a denial with no reset time is an ordinary blocking gate: nothing is
+/// guessed and nothing relaunches by itself.
+#[test]
+fn a_denial_without_a_reset_time_is_a_plain_gate() {
+    let phase = PhaseId::new(5131);
+    let rig = Rig::with_reset(phase, None);
+    let _reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+
+    rig.start(&[]);
+    wait_for_gates(&rig, 1);
+    std::thread::sleep(NO_MORE_LAUNCHES_WITHIN);
+    let log = rig.events_text();
+
+    let gate = rig.code_gate().expect("the gate stays open");
+    assert_eq!(gate["gate_kind"], "rate_limit", "{gate}");
+    assert!(
+        gate.get("not_before").is_none(),
+        "no reset, no not-before time: {gate}"
+    );
+    assert!(
+        gate["context"]
+            .as_str()
+            .is_some_and(|context| context.contains("the denial carried no reset time")),
+        "{gate}"
+    );
+    assert_eq!(
+        rig.claude_code_turns(),
+        1,
+        "{:?}",
+        rig.invocations("claude")
+    );
+    assert_eq!(rig.code_launches().len(), 1, "no relaunch; events:\n{log}");
+    assert!(
+        rig.events_named("rate_limit_timer_fired").is_empty(),
+        "{log}"
+    );
+}
+
+/// Answer the waiting rate-limit gate with `gate <verb> <extra>` and wait for the
+/// relaunch's own denial to open the second gate.
+fn answer_and_wait_for_the_relaunch(rig: &Rig, verb: &str, extra: &[&str]) {
+    let output = rig.gate(verb, extra);
+    // A fast waiter can consume the answer and close its gate before the writer's
+    // re-check (backlog 999.177); the relaunch below decides whether it was applied.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() || stderr.contains("published after that gate closed"),
+        "gate {verb} failed: {stderr}"
+    );
+    wait_for_gates(rig, 2);
+}
+
+/// D-15 / D-27 / D-38: `gate approve` on the waiting rate-limit gate relaunches
+/// the same stage on the same agent, and an operator's answer does not spend
+/// the run's one automatic relaunch.
+#[test]
+fn approving_a_rate_limit_gate_relaunches_the_same_stage_on_the_same_agent() {
+    let phase = PhaseId::new(5132);
+    let rig = Rig::with_reset(phase, a_future_reset());
+    let _reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+
+    rig.start(&[]);
+    wait_for_gates(&rig, 1);
+    answer_and_wait_for_the_relaunch(&rig, "approve", &[]);
+    let log = rig.events_text();
+
+    assert_eq!(
+        rig.claude_code_turns(),
+        2,
+        "{:?}",
+        rig.invocations("claude")
+    );
+    let launches = rig.code_launches();
+    assert_eq!(launches.len(), 2, "one relaunch; events:\n{log}");
+    assert_eq!(launches[1]["agent"], "claude", "{}", launches[1]);
+    let resolved = rig.events_named("gate_resolved");
+    assert_ne!(resolved[0]["responded_by"], TIMER, "{}", resolved[0]);
+    assert!(
+        !rig.state().rate_limit_auto_relaunch_used,
+        "an operator's approve does not spend the automatic relaunch"
+    );
+}
+
+/// D-37 / D-38: `gate reject --note` on the waiting rate-limit gate relaunches
+/// the same stage on the same agent with the note in the prompt the stub reads
+/// on stdin, byte for byte, and leaves the automatic relaunch unspent.
+/// Control: the original Code turn's prompt does not hold the note.
+#[test]
+fn rejecting_a_rate_limit_gate_relaunches_the_same_stage_with_the_note() {
+    const NOTE: &str = "wait for the quota,\n\tthen rerun \"cargo test\" and 'nothing else'";
+    let phase = PhaseId::new(5133);
+    let rig = Rig::with_reset(phase, a_future_reset());
+    let _reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+
+    rig.start(&[]);
+    wait_for_gates(&rig, 1);
+    answer_and_wait_for_the_relaunch(&rig, "reject", &["--note", NOTE]);
+    let log = rig.events_text();
+
+    assert_eq!(
+        rig.claude_code_turns(),
+        2,
+        "{:?}",
+        rig.invocations("claude")
+    );
+    let launches = rig.code_launches();
+    assert_eq!(launches.len(), 2, "one relaunch; events:\n{log}");
+    assert_eq!(launches[1]["agent"], "claude", "{}", launches[1]);
+    let code_prompts: Vec<String> = rig
+        .claude_prompts()
+        .into_iter()
+        .filter(|prompt| prompt.contains("gsd-execute-phase"))
+        .collect();
+    assert_eq!(code_prompts.len(), 2, "two Code prompts were logged");
+    assert!(
+        !code_prompts[0].contains(NOTE),
+        "control: the original Code prompt holds no note:\n{}",
+        code_prompts[0]
+    );
+    assert!(
+        code_prompts[1].contains(NOTE),
+        "the relaunch's prompt holds the note byte for byte:\n{}",
+        code_prompts[1]
+    );
+    assert!(
+        !rig.state().rate_limit_auto_relaunch_used,
+        "an operator's reject does not spend the automatic relaunch"
     );
 }
 

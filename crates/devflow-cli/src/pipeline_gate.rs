@@ -2759,4 +2759,100 @@ mod tests {
         };
         crate::pipeline_outcomes::can_finish(&evidence).expect("the evidence passes can_finish")
     }
+
+    /// A rate-limit gate file for phase 1's Code stage, recording `not_before`.
+    fn rate_limit_gate(not_before: Option<i64>) -> GateFile {
+        GateFile {
+            phase: PhaseId::new(1),
+            stage: Stage::Code,
+            context: String::new(),
+            timestamp: String::new(),
+            gate_id: "g".to_string(),
+            gate_kind: Some(GateKind::RateLimit),
+            gsd_status: None,
+            not_before,
+        }
+    }
+
+    /// D-45 rule 5, U8, D-27.2: the armed timer wakes at the gate's not-before
+    /// time (reset + margin) whatever the gate timeout, and the gate's lifetime
+    /// is the later of the timeout and that wake. The per-poll choice returns a
+    /// due wake before it looks at the lifetime, so at equal deadlines the wake
+    /// wins. Controls: a spent flag arms nothing (the lifetime is unchanged),
+    /// and with no armed wake the same `now` returns the lifetime, so the
+    /// wake-first row is one that can fail.
+    #[test]
+    fn the_timer_wakes_at_reset_plus_margin_whatever_the_gate_timeout() {
+        const OPENED_AT: i64 = 1_800_000_000;
+        const GATE_TIMEOUT: u64 = 600;
+        let timeout_end = OPENED_AT + 600;
+        let margin = reset_time::RATE_LIMIT_RELAUNCH_MARGIN_SECS;
+        let state = State::new(
+            PhaseId::new(1),
+            AgentKind::Claude,
+            Mode::Supervise,
+            std::path::PathBuf::from("/nonexistent"),
+        );
+        assert!(!state.rate_limit_auto_relaunch_used);
+
+        // A reset earlier than the gate timeout: the wake is the not-before
+        // time, the lifetime is the gate timeout.
+        let early = OPENED_AT + 30;
+        let gate = rate_limit_gate(Some(early));
+        assert_eq!(rate_limit_timer_deadline(&state, &gate), Some(early));
+        assert_eq!(
+            reset_time::rate_limit_wait_bound(OPENED_AT, early - margin, GATE_TIMEOUT),
+            GATE_TIMEOUT
+        );
+        assert_eq!(
+            gate_lifetime_deadline(OPENED_AT, &gate, GATE_TIMEOUT),
+            timeout_end
+        );
+        assert_eq!(
+            due_gate_deadline(early, Some(early), timeout_end),
+            Some(DueDeadline::Wake),
+            "the wake comes at the reset, not when the gate timeout ends"
+        );
+
+        // A reset later than the gate timeout: both are the not-before time.
+        let late = OPENED_AT + 7200;
+        let gate = rate_limit_gate(Some(late));
+        assert_eq!(rate_limit_timer_deadline(&state, &gate), Some(late));
+        let lifetime = gate_lifetime_deadline(OPENED_AT, &gate, GATE_TIMEOUT);
+        assert_eq!(lifetime, late);
+
+        // U8: at a `now` equal to both, the wake wins; before both, neither.
+        assert_eq!(
+            due_gate_deadline(late, Some(late), lifetime),
+            Some(DueDeadline::Wake)
+        );
+        assert_eq!(due_gate_deadline(late - 1, Some(late), lifetime), None);
+        // Control: at the same `now` with no armed wake, the lifetime.
+        assert_eq!(
+            due_gate_deadline(late, None, lifetime),
+            Some(DueDeadline::Lifetime)
+        );
+
+        // A spent flag arms nothing; the lifetime is unchanged.
+        let mut spent = state.clone();
+        spent.rate_limit_auto_relaunch_used = true;
+        assert_eq!(rate_limit_timer_deadline(&spent, &gate), None);
+        assert_eq!(gate_lifetime_deadline(OPENED_AT, &gate, GATE_TIMEOUT), late);
+
+        // Neither a gate with no reset time nor another kind arms a timer, and
+        // another kind's lifetime is the plain gate timeout.
+        assert_eq!(
+            rate_limit_timer_deadline(&state, &rate_limit_gate(None)),
+            None
+        );
+        let mut other = rate_limit_gate(Some(early));
+        other.gate_kind = Some(GateKind::StageFailure);
+        assert_eq!(rate_limit_timer_deadline(&state, &other), None);
+        let mut other_late = rate_limit_gate(Some(late));
+        other_late.gate_kind = Some(GateKind::StageFailure);
+        assert_eq!(
+            gate_lifetime_deadline(OPENED_AT, &other_late, GATE_TIMEOUT),
+            timeout_end
+        );
+    }
 }
