@@ -5024,39 +5024,6 @@ fn doctor_checks() -> Vec<Check> {
 
     let devflow_version = env!("CARGO_PKG_VERSION");
 
-    // RUST_LOG environment check: validate the value is a parsable log directive.
-    let (rust_log_status, rust_log_version, rust_log_hint) = match std::env::var("RUST_LOG") {
-        Ok(ref val) if val.is_empty() => (
-            "warn",
-            Some("empty (logging disabled)".into()),
-            Some("Set RUST_LOG=info for better diagnostics".into()),
-        ),
-        Ok(val) => {
-            let all_valid = val.split(',').all(|directive| {
-                let directive = directive.trim();
-                if let Some((_target, level)) = directive.split_once('=') {
-                    matches!(level.trim(), "error" | "warn" | "info" | "debug" | "trace")
-                } else {
-                    matches!(directive, "error" | "warn" | "info" | "debug" | "trace")
-                }
-            });
-            if all_valid {
-                ("ok", Some(val), None)
-            } else {
-                (
-                    "warn",
-                    Some(val),
-                    Some("RUST_LOG value may be invalid — expected error, warn, info, debug, or trace".into()),
-                )
-            }
-        }
-        Err(_) => (
-            "missing",
-            Some("not set — defaulting to info".into()),
-            Some("Set RUST_LOG=info for better diagnostics".into()),
-        ),
-    };
-
     vec![
         cmd_check(
             "git",
@@ -5116,13 +5083,72 @@ fn doctor_checks() -> Vec<Check> {
             version: Some(devflow_version.into()),
             install_hint: None,
         },
-        Check {
-            name: "RUST_LOG".into(),
-            status: rust_log_status.into(),
-            version: rust_log_version,
-            install_hint: rust_log_hint,
-        },
+        rust_log_check(std::env::var("RUST_LOG").ok().as_deref()),
     ]
+}
+
+/// The doctor row for `RUST_LOG`, from its value: `None` when it is unset (or
+/// not Unicode). Split out of [`doctor_checks`] so a test can pin each case
+/// without mutating the process environment.
+fn rust_log_check(value: Option<&str>) -> Check {
+    // RUST_LOG environment check: validate the value is a parsable log directive.
+    let (rust_log_status, rust_log_version, rust_log_hint) = match value {
+        Some("") => (
+            "warn",
+            Some("empty (logging disabled)".to_string()),
+            Some("Set RUST_LOG=info for better diagnostics".to_string()),
+        ),
+        Some(val) => {
+            let all_valid = val.split(',').all(|directive| {
+                let directive = directive.trim();
+                if let Some((_target, level)) = directive.split_once('=') {
+                    matches!(level.trim(), "error" | "warn" | "info" | "debug" | "trace")
+                } else {
+                    matches!(directive, "error" | "warn" | "info" | "debug" | "trace")
+                }
+            });
+            if all_valid {
+                ("ok", Some(val.to_string()), None)
+            } else {
+                (
+                    "warn",
+                    Some(val.to_string()),
+                    Some("RUST_LOG value may be invalid — expected error, warn, info, debug, or trace".to_string()),
+                )
+            }
+        }
+        None => (
+            "missing",
+            Some("not set — defaulting to info".to_string()),
+            Some("Set RUST_LOG=info for better diagnostics".to_string()),
+        ),
+    };
+    Check {
+        name: "RUST_LOG".into(),
+        status: rust_log_status.into(),
+        version: rust_log_version,
+        install_hint: rust_log_hint,
+    }
+}
+
+/// One environment check as `doctor` prints it (without the newline): name,
+/// version or detail, status icon, and the hint when the status carries one.
+fn check_line(c: &Check) -> String {
+    let icon = match c.status.as_str() {
+        "ok" => "✓",
+        "missing" => "✗",
+        "warn" => "⚠",
+        _ => "?",
+    };
+    let version_str = c.version.as_deref().unwrap_or("-");
+    let mut line = format!("  {:<20} {:<20} {}", c.name, version_str, icon);
+    #[allow(clippy::collapsible_if)]
+    if c.status == "missing" || c.status == "warn" {
+        if let Some(hint) = &c.install_hint {
+            line.push_str(&format!(" — {}", hint));
+        }
+    }
+    line
 }
 
 /// Audit the environment and report what's installed, missing, or broken.
@@ -5178,21 +5204,7 @@ fn doctor_in(project_root: &Path, json: bool, cache_dir: Option<&Path>) -> Resul
         );
     } else {
         for c in &checks {
-            let icon = match c.status.as_str() {
-                "ok" => "✓",
-                "missing" => "✗",
-                "warn" => "⚠",
-                _ => "?",
-            };
-            let version_str = c.version.as_deref().unwrap_or("-");
-            print!("  {:<20} {:<20} {}", c.name, version_str, icon);
-            #[allow(clippy::collapsible_if)]
-            if c.status == "missing" || c.status == "warn" {
-                if let Some(hint) = &c.install_hint {
-                    print!(" — {}", hint);
-                }
-            }
-            println!();
+            println!("{}", check_line(c));
         }
         print!("{}", render_reconciliation_text(&facts));
         print!("{}", render_set_aside_findings_text(&set_aside));
@@ -13284,6 +13296,49 @@ mod tests {
     // (integration — spawning the real binary from a unit-test harness
     // re-enters the suite).
     // ------------------------------------------------------------------
+
+    #[test]
+    fn doctor_reports_an_unset_rust_log_as_information() {
+        let row = rust_log_check(None);
+        assert_eq!(
+            row.status, "info",
+            "an unset RUST_LOG is information, not a failure"
+        );
+        let detail = row.version.as_deref().unwrap_or("");
+        assert!(
+            detail.contains("tracing off"),
+            "the row must say tracing is off: {detail:?}"
+        );
+        let hint = row.install_hint.as_deref().unwrap_or("");
+        assert!(
+            hint.contains("RUST_LOG=info"),
+            "the row must say how to turn tracing on: {hint:?}"
+        );
+        let line = check_line(&row);
+        assert!(
+            !line.contains('✗'),
+            "no red cross for an unset RUST_LOG: {line}"
+        );
+        assert!(
+            line.contains(hint),
+            "the printed row carries the hint: {line}"
+        );
+    }
+
+    #[test]
+    fn doctor_reports_an_empty_rust_log_as_information() {
+        // An empty RUST_LOG turns tracing off exactly as an unset one does.
+        let row = rust_log_check(Some(""));
+        assert_eq!(row.status, "info");
+        assert!(row.version.as_deref().unwrap_or("").contains("tracing off"));
+    }
+
+    #[test]
+    fn doctor_still_warns_on_an_invalid_rust_log() {
+        // Control: only the unset and empty cases became information.
+        assert_eq!(rust_log_check(Some("loud")).status, "warn");
+        assert_eq!(rust_log_check(Some("devflow=debug")).status, "ok");
+    }
 
     #[test]
     fn doctor_includes_antigravity_check_in_the_seam() {

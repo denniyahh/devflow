@@ -423,20 +423,74 @@ fn source_devflow_env_vars_and_subcommands_are_documented() {
     }
 }
 
+/// What disagrees with `RUST_LOG`'s `off` default, given `main.rs`'s text and
+/// the scoped docs' text. `main.rs` must build `EnvFilter::new("off")` in both
+/// log-format branches. Every scoped-doc table row whose first cell is
+/// `` `RUST_LOG` `` must name `` `off` `` and must not carry a whole cell of
+/// `` `info` `` (the 3.0 default). Checking each row, not any line, matters:
+/// CONTRIBUTING's row names `info` as a level to choose, which kept the 3.0
+/// guard green whatever the other rows said.
+fn rust_log_default_findings(main_rs: &str, docs: &str) -> Vec<String> {
+    let mut findings = Vec::new();
+    if main_rs.matches("EnvFilter::new(\"off\")").count() < 2 {
+        findings.push(
+            "main.rs must fall back to `EnvFilter::new(\"off\")` in both log-format branches"
+                .to_string(),
+        );
+    }
+    let rows: Vec<&str> = docs
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            line.strip_prefix('|')
+                .and_then(|rest| rest.split('|').next())
+                .is_some_and(|cell| cell.trim() == "`RUST_LOG`")
+        })
+        .collect();
+    if rows.is_empty() {
+        findings.push("no scoped-doc table row documents `RUST_LOG`".to_string());
+    }
+    for row in rows {
+        let cells: Vec<&str> = row.split('|').map(str::trim).collect();
+        if !row.contains("`off`") || cells.contains(&"`info`") {
+            findings.push(format!(
+                "this `RUST_LOG` row does not name `off` as the default: {row}"
+            ));
+        }
+    }
+    findings
+}
+
 #[test]
 fn pinned_doc_claims_match_source() {
     let docs = read_files(scoped_doc_paths());
     let cli = std::fs::read_to_string(workspace_root().join("crates/devflow-cli/src/main.rs"))
         .expect("CLI source must be readable");
 
-    assert!(
-        cli.matches("EnvFilter::new(\"info\")").count() >= 2,
-        "RUST_LOG's source fallback must remain info in both log-format branches"
+    assert_eq!(
+        rust_log_default_findings(&cli, &docs),
+        Vec::<String>::new(),
+        "RUST_LOG's default in main.rs and the scoped docs must be `off`"
     );
+
+    // Control: the 3.0 main.rs fallback, `info` in both branches.
+    let old_fallback = concat!(
+        "let filter = tracing_subscriber::EnvFilter::try_from_default_env()\n",
+        "    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(\"info\"));\n",
+    )
+    .repeat(2);
+    assert_eq!(
+        rust_log_default_findings(&old_fallback, &docs).len(),
+        1,
+        "the 3.0 `info` fallback in main.rs must be reported"
+    );
+
+    // Control: the 3.0 OPERATIONS.md row, default `info`.
+    let old_row = "| `RUST_LOG` | `info` | Log verbosity (stderr) |";
+    let findings = rust_log_default_findings(&cli, old_row);
     assert!(
-        docs.lines()
-            .any(|line| line.contains("`RUST_LOG`") && line.contains("`info`")),
-        "operator docs must pin RUST_LOG's default to the source fallback `info`"
+        findings.len() == 1 && findings[0].contains(old_row),
+        "the 3.0 `RUST_LOG` row must be reported: {findings:?}"
     );
 }
 
