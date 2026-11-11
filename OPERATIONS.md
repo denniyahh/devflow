@@ -263,7 +263,10 @@ status the gate was opened over:
 | `human_needed` | any | gate | read again; the gate reopens with the fresh facts |
 | no answer (a reader failure) | any | gate | read again; the gate reopens with the fresh facts |
 
-In supervise mode every Validate ends at a gate. An approve follows the
+In supervise mode every Validate ends at a gate. So does an ambiguous verdict
+in auto mode, over every status in the table: it counts no Validate failure, so
+the gap-closure loop or the re-verify pass would have nothing to bound it. An
+approve follows the
 Approve column whether the run is in auto or supervise mode, a `failure_cap`
 approve included: that one restarts the count first. `gate approve` prints the
 route the table gives over a read it makes itself, and says that the
@@ -543,9 +546,10 @@ pass and not as `--gaps-only`.
 
 The re-verify prompt cannot make an agent run the verifier (gsd-core#6096). What
 bounds an agent that skips it is the count: every Validate whose status is
-`stale`, `missing` or `gaps_found` counts one Validate failure, whatever the
-agent said and in either mode, and a Validate counts at most once even when the
-agent also failed. Three such rounds whose commits change nothing outside
+`stale`, `missing` or `gaps_found` counts one Validate failure, whether the
+agent passed or failed and in either mode, and a Validate counts at most once
+even when the agent also failed. An ambiguous verdict counts nothing and stops
+at a gate instead. Three such rounds whose commits change nothing outside
 `.planning/` reach the consecutive-failure gate instead of looping.
 
 DevFlow does not check a `gaps_found` report's own digest. A `gaps_found`
@@ -562,9 +566,10 @@ to its per-phase ceiling, its `no_gap_closure_plan` gate says so, and an answer
 that continues the run restarts the per-phase count (a
 `phase_failure_budget_reset` event); `devflow gate abort` does not. An ambiguous verdict (the external
 verification probe succeeded but the agent reported gaps or no verdict)
-records no Validate pass: over `passed`, `human_needed` or a failed read it
-stops at a gate, and in auto mode over `gaps_found`, `stale` or `missing` it
-takes the table's route (see [What each answer runs](#what-each-answer-runs)). A gate context quotes GSD's status as GSD printed it
+records no Validate pass and counts no Validate failure: it stops at an
+`ambiguous_verdict` gate at once (a `reader_failure` gate over a failed read),
+over every GSD status and in either mode, and never takes the gap-closure loop
+or the re-verify pass on its own. A gate context quotes GSD's status as GSD printed it
 and says `passed` only when GSD reported `passed`, apart from the way-on
 sentence that leads every verification gate, whose finish rule names `passed`.
 

@@ -397,7 +397,8 @@ pub(crate) type ValidateRead = Result<StatusReport, EvidenceFailure>;
 /// outcome's agent verdict and GSD read, with `cap_reached` when a failure
 /// counter is at its cap. It only labels: whether a gate opens at all is
 /// [`next_step`]'s decision, except that a `failure_cap` label is the
-/// streak update's own gate (D-12), which opens ahead of the table.
+/// streak update's own gate (D-12), and an ambiguous verdict gates at once
+/// over every status (T-18-19): both open ahead of the table.
 ///
 /// One arm per (verdict, status-or-failure) pair. A reader failure takes
 /// precedence over every verdict (D-24). The cap labels the rows an unattended
@@ -1559,9 +1560,12 @@ pub(crate) fn handle_validate_outcome(
     // 52-22's label and 52-28's streak update, on the same read as the route
     // below, so the label, the count and the route cannot disagree. A
     // `failure_cap` label is the streak update's own gate (D-12): it opens
-    // ahead of the table, in either mode.
+    // ahead of the table, in either mode. So does an ambiguous verdict
+    // (T-18-19), over every GSD status: it counts no failure, so routing it
+    // through the table's gap loop or re-verify pass would loop with no
+    // ceiling.
     let kind = validate_gate_kind(verdict, read, cap_reached);
-    let step = if kind == GateKind::FailureCap {
+    let step = if kind == GateKind::FailureCap || verdict == AgentVerdict::Ambiguous {
         Step::Gate
     } else {
         next_step(Trigger::AfterValidate {
@@ -6002,6 +6006,89 @@ mod tests {
         if in_bounded_child("pipeline_outcomes::tests::a_missing_report_routes_to_execute_phase") {
             assert_a_reverify_report_routes_to_execute_phase(GsdStatus::Missing, 5224);
         }
+    }
+
+    /// T-18-19: an ambiguous Validate verdict gates at once in auto mode over
+    /// every GSD status, launches nothing before the gate (no gap loop through
+    /// Plan, no re-verify loop-back) and moves no failure counter. Controls in
+    /// the same test: an ambiguous verdict over `passed` gates the same way,
+    /// and an agent FAIL over `gaps_found` still takes the gap loop with no
+    /// gate and counts one failure on each counter.
+    #[test]
+    fn an_ambiguous_verdict_gates_at_once_in_auto_over_every_status() {
+        if !in_bounded_child(
+            "pipeline_outcomes::tests::an_ambiguous_verdict_gates_at_once_in_auto_over_every_status",
+        ) {
+            return;
+        }
+        let counters = |state: &State| (state.consecutive_failures, state.phase_validate_failures);
+        let ambiguous = || ValidateOutcome::Ambiguous("the agent reported gaps".into());
+        let rows = [
+            (6100, GsdStatus::GapsFound),
+            (6101, GsdStatus::Stale),
+            (6102, GsdStatus::Missing),
+            // Control: the row the table gates on its own.
+            (6103, GsdStatus::Passed),
+        ];
+        for (number, status) in rows {
+            let row = format!("ambiguous over {status:?}");
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = PhaseId::new(number);
+            let _gsd = validate_evidence(root, phase, &[gsd_says(status)]);
+            let mut state = validate_state(root, phase, Mode::Auto);
+            assert_eq!(counters(&state), (0, 0), "{row}: premise");
+            // The state on disk is read while the gate is open, before the
+            // abort answer ends the run and removes it.
+            let (gate, at_gate) = at_the_validate_gate(root, phase, &abort_answer(), || {
+                let _ = handle_validate_outcome(root, &mut state, ambiguous());
+            });
+            assert_eq!(gate["gate_kind"], "ambiguous_verdict", "{row}: {gate}");
+            assert_eq!(counters(&at_gate), (0, 0), "{row}: no counter moves");
+            let fired: Vec<_> = events_named(root, phase, "gate_fired")
+                .into_iter()
+                .filter(|event| event["stage"] == "validate")
+                .collect();
+            assert_eq!(
+                fired.len(),
+                1,
+                "{row}: one Validate gate at once; events: {:?}",
+                phase_events(root, phase)
+            );
+            assert_eq!(fired[0]["gate_kind"], "ambiguous_verdict", "{row}");
+            assert_eq!(moves_to_plan(root, phase), 0, "{row}: no gap loop");
+            assert!(
+                events_named(root, phase, "loop_back").is_empty(),
+                "{row}: no re-verify loop-back: {:?}",
+                phase_events(root, phase)
+            );
+            assert!(
+                events_named(root, phase, "workflow_finished")
+                    .iter()
+                    .all(|event| event["reason"] != "finished"),
+                "{row}: no finish"
+            );
+        }
+
+        // Control: an agent FAIL over gaps_found takes the gap loop, ungated,
+        // and counts.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(6104);
+        let _gsd = validate_evidence(root, phase, &[gsd_says(GsdStatus::GapsFound)]);
+        let mut state = validate_state(root, phase, Mode::Auto);
+        preanswer_gate(root, phase, Stage::Validate, &abort_answer());
+        let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
+        assert!(
+            events_named(root, phase, "gate_fired")
+                .iter()
+                .all(|event| event["stage"] != "validate"),
+            "control: an agent FAIL over gaps_found opens no Validate gate: {:?}",
+            phase_events(root, phase)
+        );
+        assert_eq!(moves_to_plan(root, phase), 1, "control: the gap loop");
+        let after = workflow::load_state(root, phase).unwrap();
+        assert_eq!(counters(&after), (1, 1), "control: one counted failure");
     }
 
     /// Write the phase's `{N}-VERIFICATION.md` as GSD's verifier does at the
