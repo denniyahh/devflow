@@ -1393,6 +1393,209 @@ fn cleanup_force_removes_worktree_for_until_stopped_phase() {
     );
 }
 
+/// A fixture repo for `cleanup`: phase `phase`'s worktree under `.worktrees/` on
+/// `feature/phase-NN`, and a saved state recording it, shaped by `shape`. With
+/// `merged`, the branch is forked at `develop` with no commit of its own, so
+/// `git branch --merged develop` lists it. Returns the worktree's path.
+fn cleanup_fixture(
+    root: &Path,
+    phase: PhaseId,
+    merged: bool,
+    shape: impl FnOnce(&mut devflow_core::state::State),
+) -> PathBuf {
+    init_repo(root);
+    let branch = format!("feature/phase-{padded}", padded = phase.padded());
+    if merged {
+        git(root, &["branch", &branch, "develop"]);
+    } else {
+        seed_feature_branch(root, phase);
+    }
+    let wt_path = root
+        .join(".worktrees")
+        .join(format!("phase-{padded}", padded = phase.padded()));
+    devflow_core::worktree::add(root, &wt_path, &branch, &branch, false).unwrap();
+    let mut state = devflow_core::state::State::new(
+        phase,
+        devflow_core::state::AgentKind::Claude,
+        devflow_core::mode::Mode::Auto,
+        root.to_path_buf(),
+    );
+    state.worktree_path = Some(wt_path.clone());
+    shape(&mut state);
+    devflow_core::workflow::save_state(&state).unwrap();
+    wt_path
+}
+
+/// `devflow cleanup` (plus `extra`) on `root`, in a hermetic home.
+fn run_cleanup(home: &common::HermeticHome, root: &Path, extra: &[&str]) -> Output {
+    let fake_bin = fake_bin_dir(&[]);
+    common::hermetic_devflow(home)
+        .arg("cleanup")
+        .args(extra)
+        .arg(root)
+        .env("PATH", path_with_fake_bin(&fake_bin.path))
+        .current_dir(root)
+        .output()
+        .expect("run devflow cleanup")
+}
+
+/// The stop reason a finished run records (D-35), as the CLI writes it.
+const FINISHED_REASON: &str = "finished: Validate passed; the worktree and branch are kept";
+/// The stop reason a `--until plan` halt records.
+const UNTIL_PLAN_REASON: &str = "stopped after plan completed (--until plan)";
+
+/// OPS-02 / D-35: `cleanup` says why it keeps a worktree, and each case names only
+/// its own reason: a finished run gives its stop reason and `--force` (never
+/// `resume`, which refuses a finished run); an `--until plan` halt gives that halt's
+/// reason and `resume`; a live run is refused with a non-zero exit naming that a run
+/// is live and `devflow stop`.
+#[test]
+fn cleanup_names_why_it_keeps_a_worktree() {
+    // A finished run.
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let phase = PhaseId::new(21);
+    let wt = cleanup_fixture(repo.path(), phase, false, |state| {
+        state.stopped = true;
+        state.finished = true;
+        state.stop_reason = Some(FINISHED_REASON.to_string());
+    });
+    let out = run_cleanup(&home, repo.path(), &[]);
+    let text =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{text}");
+    assert!(wt.is_dir(), "a finished run's worktree is kept: {text}");
+    assert!(
+        text.contains(FINISHED_REASON) && text.contains("--force"),
+        "names the finished run's reason and --force: {text}"
+    );
+    for other in ["devflow resume", "--until", "a run is live"] {
+        assert!(!text.contains(other), "finished names {other:?}: {text}");
+    }
+
+    // An `--until plan` halt.
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let phase = PhaseId::new(22);
+    let wt = cleanup_fixture(repo.path(), phase, false, |state| {
+        state.stopped = true;
+        state.stop_until = Some(Stage::Plan);
+        state.stop_reason = Some(UNTIL_PLAN_REASON.to_string());
+    });
+    let out = run_cleanup(&home, repo.path(), &[]);
+    let text =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{text}");
+    assert!(wt.is_dir(), "a halted run's worktree is kept: {text}");
+    assert!(
+        text.contains(UNTIL_PLAN_REASON) && text.contains("devflow resume --phase 22"),
+        "names the halt's reason and resume: {text}"
+    );
+    for other in ["finished", "a run is live"] {
+        assert!(!text.contains(other), "the halt names {other:?}: {text}");
+    }
+
+    // A live run: the agent pid file holds this test process's own pid.
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let phase = PhaseId::new(23);
+    let wt = cleanup_fixture(repo.path(), phase, false, |_| {});
+    let pid_path = devflow_core::agent_result::agent_pid_path(repo.path(), phase);
+    fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
+    fs::write(&pid_path, std::process::id().to_string()).unwrap();
+    let out = run_cleanup(&home, repo.path(), &[]);
+    let text =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "a live run is refused: {text}");
+    assert!(wt.is_dir(), "a live run's worktree is kept: {text}");
+    assert!(
+        text.contains("a run is live") && text.contains("devflow stop --phase 23"),
+        "names the live run and stop: {text}"
+    );
+    for other in ["finished", "--until", "devflow resume"] {
+        assert!(
+            !text.contains(other),
+            "the live refusal names {other:?}: {text}"
+        );
+    }
+}
+
+/// OPS-02 (999.213): `cleanup --force` removes the run's state file together with
+/// its worktree, and only that phase's state.
+#[test]
+fn cleanup_force_removes_the_run_state_with_the_worktree() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let phase = PhaseId::new(24);
+    let wt = cleanup_fixture(root, phase, false, |state| {
+        state.stopped = true;
+        state.finished = true;
+        state.stop_reason = Some(FINISHED_REASON.to_string());
+    });
+    // Another phase's state, with no worktree: `--force` must leave it alone.
+    let other = PhaseId::new(25);
+    let other_state = devflow_core::state::State::new(
+        other,
+        devflow_core::state::AgentKind::Claude,
+        devflow_core::mode::Mode::Auto,
+        root.to_path_buf(),
+    );
+    devflow_core::workflow::save_state(&other_state).unwrap();
+    let state_file = devflow_core::workflow::state_path(root, phase);
+    assert!(state_file.is_file(), "premise: the state file exists");
+
+    let out = run_cleanup(&home, root, &["--force"]);
+    let text =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{text}");
+    assert!(!wt.is_dir(), "the worktree is removed: {text}");
+    assert!(
+        !state_file.exists(),
+        "the run's state file is removed with its worktree: {text}"
+    );
+    assert!(
+        devflow_core::workflow::state_path(root, other).is_file(),
+        "another phase's state is untouched: {text}"
+    );
+}
+
+/// `cleanup` never deletes a merged branch that a kept worktree still has checked
+/// out: it skips the branch rather than leaving the refusal to git.
+#[test]
+fn cleanup_keeps_the_branch_of_a_kept_worktree() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let phase = PhaseId::new(26);
+    let branch = format!("feature/phase-{padded}", padded = phase.padded());
+    let wt = cleanup_fixture(root, phase, true, |state| {
+        state.stopped = true;
+        state.finished = true;
+        state.stop_reason = Some(FINISHED_REASON.to_string());
+    });
+    let merged = git(root, &["branch", "--merged", "develop"]);
+    assert!(
+        String::from_utf8_lossy(&merged.stdout).contains(&branch),
+        "premise: the branch reads as merged"
+    );
+
+    let out = run_cleanup(&home, root, &[]);
+    let text =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{text}");
+    assert!(wt.is_dir(), "premise: the worktree is kept: {text}");
+    let listed = git(root, &["branch", "--list", &branch]);
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).contains(&branch),
+        "the kept worktree's branch still exists: {text}"
+    );
+    assert!(
+        !text.contains(&format!("merged branch {branch}")),
+        "cleanup does not try to delete the kept worktree's branch: {text}"
+    );
+}
+
 /// 20b instance 1 (probe 20b/idempotency): `cleanup` run twice succeeds —
 /// the second run finds the worktree already gone and does not error.
 #[test]
