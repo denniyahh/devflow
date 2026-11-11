@@ -2183,26 +2183,90 @@ mod tests {
         );
     }
 
-    /// D-18: an ordinary (non-self-dogfood) project with the same confirmed-
-    /// Stale embedded commit only warns and proceeds — no event, no error.
+    /// OPS-03: DevFlow's build provenance only matters on DevFlow's own
+    /// checkout. An ordinary (non-self-dogfood) project with a confirmed-
+    /// Stale embedded commit proceeds with no operator output at all — no
+    /// warning, no event, no error.
     #[test]
-    fn enforce_build_staleness_warns_for_ordinary_project_with_stale_commit() {
+    fn enforce_build_staleness_is_silent_for_an_ordinary_project() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let (_base, side) = init_repo_with_diverged_commit(root);
         assert!(!is_self_dogfood_workspace(root));
+        assert_eq!(
+            combined_staleness(root, &side, false, false),
+            Staleness::Stale,
+            "fixture must be a confirmed-Stale build, or silence proves nothing"
+        );
 
         let phase = PhaseId::new(64);
         let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
 
-        let result = enforce_build_staleness(root, &state, &side, false);
+        let mut out = Vec::new();
+        let result = enforce_build_staleness_to(&mut out, root, &state, &side, false);
         assert!(
             result.is_ok(),
-            "an ordinary project's stale build must only warn, never block"
+            "an ordinary project's stale build must never block"
+        );
+        let printed = String::from_utf8(out).unwrap();
+        assert_eq!(
+            printed, "",
+            "an ordinary project must hear nothing about DevFlow's build provenance"
         );
         assert!(
             devflow_core::events::last_event_for_phase(root, phase).is_none(),
-            "a warn-only path must not fire the self_dogfood_stale_blocked event"
+            "a non-blocking path must not fire the self_dogfood_stale_blocked event"
+        );
+    }
+
+    /// Control for the silence above: the same captured writer on DevFlow's
+    /// own checkout with an Indeterminate build still carries the warning,
+    /// so an empty capture is not an artefact of the capture itself.
+    #[test]
+    fn enforce_build_staleness_still_warns_on_devflows_own_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            assert!(
+                devflow_core::test_support::git_command(root)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@e.st"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        git(&["config", "core.hooksPath", "/dev/null"]);
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/devflow-core\", \"crates/devflow-cli\"]\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        assert!(is_self_dogfood_workspace(root));
+
+        let phase = PhaseId::new(66);
+        let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+
+        let mut out = Vec::new();
+        let result = enforce_build_staleness_to(
+            &mut out,
+            root,
+            &state,
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            false,
+        );
+        assert!(result.is_ok(), "an Indeterminate result must never block");
+        let printed = String::from_utf8(out).unwrap();
+        assert!(
+            printed.contains("build provenance staleness check did not confirm a fresh build"),
+            "DevFlow's own checkout must still hear about an unconfirmed build: {printed:?}"
         );
     }
 
