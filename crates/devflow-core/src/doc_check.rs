@@ -2511,3 +2511,208 @@ fn no_removed_surface_literal_remains() {
         findings.join("\n")
     );
 }
+
+// ---------------------------------------------------------------------------
+// 52-18 (CUT-04, D-03): the docs site (`docs/**/*.md`, outside `doc_check`'s
+// scoped docs) describes only Plan → Code → Validate, links only pages that
+// exist, and maps only modules `lib.rs` declares.
+// ---------------------------------------------------------------------------
+
+/// The removed stage names, as the docs site would capitalise them.
+const REMOVED_STAGE_WORDS: &[&str] = &[concat!("Def", "ine"), concat!("Sh", "ip")];
+
+/// The docs-site page holding the module map, relative to `docs/`.
+const MODULE_MAP_PAGE: &str = "diagrams/module-map.md";
+
+/// Every `.md` path `nav:` in `docs/mkdocs.yml` names, with its 1-based line.
+fn nav_entries(_nav: &str) -> Vec<(usize, String)> {
+    Vec::new()
+}
+
+/// Every module name the module map names, with its 1-based line: backticked
+/// names in the table's Modules column and mermaid node labels that are a
+/// single lowercase identifier.
+fn module_map_names(_text: &str) -> Vec<(usize, String)> {
+    Vec::new()
+}
+
+/// Every module `lib_rs` declares as `mod <name>;`, with or without `pub`.
+fn declared_modules(_lib_rs: &str) -> Vec<String> {
+    Vec::new()
+}
+
+/// Every place the docs site names a removed stage, links a missing page,
+/// lists a missing page in its nav, or maps an undeclared module, as
+/// `docs/<path>:line: <kind>`, sorted by path then line. `pages` and `exists`
+/// take paths relative to `docs/`.
+fn docs_site_findings(
+    _pages: &[(PathBuf, String)],
+    _nav: &str,
+    _lib_rs: &str,
+    _exists: &dyn Fn(&Path) -> bool,
+) -> Vec<String> {
+    Vec::new()
+}
+
+#[test]
+fn docs_site_describes_only_the_kept_pipeline() {
+    let lib_rs = "pub mod git;\nmod doc_check;\npub mod stage;\n";
+    let known = ["index.md", "guides/quickstart.md", MODULE_MAP_PAGE];
+    let exists = |path: &Path| known.iter().any(|page| Path::new(page) == path);
+    let nav = "site_name: x\nnav:\n  - Home: index.md\n  - Guides:\n      - Quick Start: guides/quickstart.md\n";
+    let findings_for = |page: &str, text: &str, nav: &str| {
+        docs_site_findings(
+            &[(PathBuf::from(page), text.to_string())],
+            nav,
+            lib_rs,
+            &exists,
+        )
+    };
+    let [define, ship] = [REMOVED_STAGE_WORDS[0], REMOVED_STAGE_WORDS[1]];
+
+    // (a) Each planted defect is exactly one finding.
+    let positives = [
+        (
+            "index.md",
+            ["    V[Validate] --> S[", ship, "]"].concat(),
+            nav.to_string(),
+        ),
+        (
+            "index.md",
+            [define, " the phase before planning it."].concat(),
+            nav.to_string(),
+        ),
+        (
+            "index.md",
+            "See [Gone](missing.md) for more.".to_string(),
+            nav.to_string(),
+        ),
+        (
+            "index.md",
+            "Plain text.".to_string(),
+            [nav, "  - Gone: diagrams/missing.md\n"].concat(),
+        ),
+        (
+            MODULE_MAP_PAGE,
+            "| Git | `git`, `hooks` | Branches |".to_string(),
+            nav.to_string(),
+        ),
+        (
+            MODULE_MAP_PAGE,
+            "    CLI --> HOOKS[hooks]".to_string(),
+            nav.to_string(),
+        ),
+    ];
+    for (page, text, nav) in &positives {
+        let findings = findings_for(page, text, nav);
+        assert_eq!(
+            findings.len(),
+            1,
+            "`{text}` / nav `{nav}` must be one finding: {findings:?}"
+        );
+    }
+
+    // (b) Decoys are not findings.
+    let decoys = [
+        (
+            "index.md",
+            [ship, "ping and ", ship.to_lowercase().as_str(), "ped work."].concat(),
+        ),
+        (
+            "index.md",
+            "We ship code and define interfaces.".to_string(),
+        ),
+        ("index.md", ["<!-- ", ship, " was removed -->"].concat()),
+        ("index.md", ["<!--\n", define, "\n-->"].concat()),
+        (
+            "index.md",
+            "[Site](https://example.com/missing.md) and [Mail](mailto:a@b.c)".to_string(),
+        ),
+        (
+            "index.md",
+            "[Top](#section) and [Start](guides/quickstart.md#install)".to_string(),
+        ),
+        ("guides/quickstart.md", "[Home](../index.md)".to_string()),
+        (
+            MODULE_MAP_PAGE,
+            "| State | `stage`, `git` | Persist |".to_string(),
+        ),
+        (
+            MODULE_MAP_PAGE,
+            "    CLI[devflow-cli] --> WF[workflow and state]".to_string(),
+        ),
+    ];
+    for (page, text) in &decoys {
+        let findings = findings_for(page, text, nav);
+        assert!(
+            findings.is_empty(),
+            "decoy `{text}` was flagged: {findings:?}"
+        );
+    }
+
+    // Ordering backstop: sorted by path, then line.
+    let unordered = vec![
+        (PathBuf::from("index.md"), ["\n\n", ship].concat()),
+        (
+            PathBuf::from("guides/quickstart.md"),
+            [define, "\n", ship].concat(),
+        ),
+    ];
+    let ordered: Vec<String> = docs_site_findings(&unordered, nav, lib_rs, &exists)
+        .iter()
+        .map(|finding| finding.split(": ").next().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(
+        ordered,
+        [
+            "docs/guides/quickstart.md:1",
+            "docs/guides/quickstart.md:2",
+            "docs/index.md:3"
+        ]
+    );
+
+    // (c) The real inputs are non-empty, so a clean result means something.
+    let root = workspace_root();
+    let docs = root.join("docs");
+    let pages: Vec<(PathBuf, String)> = read_labelled(
+        files_under(&docs, &root.join("target"))
+            .into_iter()
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("md"))
+            .collect(),
+    )
+    .into_iter()
+    .map(|(path, text)| {
+        (
+            path.strip_prefix(&docs).unwrap_or(&path).to_path_buf(),
+            text,
+        )
+    })
+    .collect();
+    assert!(!pages.is_empty(), "the docs walker found no pages");
+    let nav =
+        std::fs::read_to_string(docs.join("mkdocs.yml")).expect("docs/mkdocs.yml must be readable");
+    assert!(
+        !nav_entries(&nav).is_empty(),
+        "docs/mkdocs.yml's nav lists no page"
+    );
+    let module_map = pages
+        .iter()
+        .find(|(path, _)| path == Path::new(MODULE_MAP_PAGE))
+        .map(|(_, text)| text.as_str())
+        .expect("the docs site must keep its module map");
+    assert!(
+        !module_map_names(module_map).is_empty(),
+        "the module map names no module"
+    );
+    let lib_rs = std::fs::read_to_string(root.join("crates/devflow-core/src/lib.rs"))
+        .expect("lib.rs must be readable");
+    assert!(declared_modules(&lib_rs).iter().any(|name| name == "stage"));
+
+    // (d) The real docs site has no finding.
+    let findings = docs_site_findings(&pages, &nav, &lib_rs, &|path| docs.join(path).is_file());
+    assert!(
+        findings.is_empty(),
+        "the docs site describes removed surface (CUT-04, D-03):\n{}",
+        findings.join("\n")
+    );
+}
