@@ -5,16 +5,16 @@ milestone_name: Session Continuity
 current_phase: 52
 current_phase_name: Subtract and Stabilize
 status: executing
-stopped_at: Completed 52-29-PLAN.md
-last_updated: "2026-11-11T13:06:32.926Z"
+stopped_at: Completed 52-33-PLAN.md
+last_updated: "2026-11-11T13:59:06.152Z"
 last_activity: 2026-11-10
 last_activity_desc: Phase 52 execution started
-state_head: 96f90b119d6930eb9e9e6dbd9621f7ca86167b58
+state_head: f957db8032c22a5aba4d3b425a7a19ef70a7a8a3
 progress:
   total_phases: 4
   completed_phases: 0
   total_plans: 33
-  completed_plans: 29
+  completed_plans: 30
   percent: 0
 ---
 
@@ -159,7 +159,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 52 (Subtract and Stabilize) — EXECUTING
-Plan: 30 of 33
+Plan: 31 of 33
 Status: Ready to execute
 Last activity: 2026-11-10 — Phase 52 execution started
 
@@ -888,6 +888,8 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 52]: 52-29 (operator decision 2026-11-11): a permitted finish wins over a late stop; finish_run no longer stops at safe point 6, the supervisor answers the pending stop already_finished, and a stop without a finish permit keeps its handling
 - [Phase 52]: 52-29: can_finish (FinishPermit, private field) is the one finish check and next_step the one D-45 table; after Validate only a failure_cap label opens ahead of it, so an ambiguous verdict in auto over gaps_found/stale/missing follows the table; a rejected verification gate runs /gsd-quick (FixType::Quick) with the note
 - [Phase 52]: Operator 2026-11-11: a start over a FINISHED run resets phase_validate_failures to zero; a stopped unfinished run still carries it (96f90b1)
+- [Phase 52]: 52-33: every gate context leads with way_on_sentence, rendered from approve_route_by_kind/reject_route_by_kind (a verification approve clause states the finish rule, U10); gate approve/reject/abort refuse through screen_answer before writing and print the route (gate_respond_report); the gate display bound is 450
+- [Phase 52]: 52-33: GATE-03 never-lies checks read the cause after the way-on sentence, whose finish rule names `passed` on every verification gate
 
 ## Roadmap Evolution
 
@@ -1028,11 +1030,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 52 P27 | 41 min | 3 tasks | 12 files |
 | Phase 52 P28 | 38 min | 3 tasks | 10 files |
 | Phase 52 P29 | 86 min | 3 tasks | 16 files |
+| Phase 52 P33 | 46 min | 3 tasks | 10 files |
 
 ## Session
 
-**Last session:** 2026-11-11T12:49:47.921Z
-**Stopped at:** Completed 52-29-PLAN.md
+**Last session:** 2026-11-11T13:59:05.814Z
+**Stopped at:** Completed 52-33-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps

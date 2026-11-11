@@ -35,7 +35,7 @@ requirement closes a backlog entry, the entry is named; `.planning/user/V4-CUT-I
       only when it is an explicit abort answer, never because the word "abort" appears in a note. DevFlow's own
       infra-ceiling abort is out of this requirement's scope. Closes 999.189. (Amended 2026-11-08 by the operator after
       the Phase 52 context review, 52-CONTEXT D-20.)
-- [ ] **GATE-02**: A Validate rejection relaunches only the fix work, not the whole phase. A `gaps_found` verdict runs
+- [x] **GATE-02**: A Validate rejection relaunches only the fix work, not the whole phase. A `gaps_found` verdict runs
       GSD's gaps route (`plan-phase --gaps`, then `execute-phase --gaps-only`). A rejection of a clean pass runs
       `/gsd-quick` with the operator's note. Closes 999.192. (Amended 2026-11-08 by the operator after the Phase 52
       context review, 52-CONTEXT D-21.)
@@ -135,7 +135,7 @@ Populated during roadmap creation (2026-11-08). Phase order and dependencies: RO
 | CUT-03 | Phase 52 — Subtract and Stabilize | Pending |
 | CUT-04 | Phase 52 — Subtract and Stabilize | Complete |
 | GATE-01 | Phase 52 — Subtract and Stabilize | Complete |
-| GATE-02 | Phase 52 — Subtract and Stabilize | Pending |
+| GATE-02 | Phase 52 — Subtract and Stabilize | Complete |
 | GATE-03 | Phase 52 — Subtract and Stabilize | Complete |
 | GATE-04 | Phase 52 — Subtract and Stabilize | Pending |
 | OPS-01 | Phase 52 — Subtract and Stabilize | Complete |
