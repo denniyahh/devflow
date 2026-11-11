@@ -283,13 +283,7 @@ fn set_aside_leftover_gates(
     phase: PhaseId,
     warnings: &mut dyn std::io::Write,
 ) {
-    for stage in [
-        Stage::Define,
-        Stage::Plan,
-        Stage::Code,
-        Stage::Validate,
-        Stage::Ship,
-    ] {
+    for stage in [Stage::Define, Stage::Plan, Stage::Code, Stage::Validate] {
         match Gates::close(project_root, phase, stage) {
             Ok(report) => {
                 for path in report.quarantined {
@@ -2139,16 +2133,15 @@ fn classify_listed_gate(project_root: &Path, gate: &OpenGate) -> ListedGate {
     }
 }
 
-/// The liveness half of [`gate_respond`] (D-04). With no registered waiter, a Ship
-/// answer is still stored, though a run no longer reaches Ship and nothing consumes it;
-/// any other stage has nothing to act on it.
+/// The liveness half of [`gate_respond`] (D-04). With no registered waiter there is
+/// nothing to act on an answer, so none is written.
 fn refuse_a_gate_with_no_waiter(
     project_root: &Path,
     phase: PhaseId,
     stage: Stage,
     observed: &GateId,
 ) -> Result<(), CliError> {
-    if stage == Stage::Ship || waiter_is_live(project_root, phase, stage, observed) {
+    if waiter_is_live(project_root, phase, stage, observed) {
         return Ok(());
     }
     Err(CliError::Message(format!(
@@ -5388,11 +5381,10 @@ fn check_open_gate_without_waiter(facts: &PhaseFacts) -> Option<PhaseFinding> {
             "phase {}: gate open for stage {} but no waiter may still be waiting",
             facts.phase, gate_stage
         ),
-        repair: Some(if gate_stage == Stage::Ship {
-            no_waiter_repair(facts.phase)
-        } else {
-            repair_instead_of_resume(facts, no_waiter_repair(facts.phase))
-        }),
+        repair: Some(repair_instead_of_resume(
+            facts,
+            no_waiter_repair(facts.phase),
+        )),
     })
 }
 
@@ -6776,7 +6768,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_via_gate_with_no_waiter_at_a_non_ship_gate_writes_nothing() {
+    fn stop_via_gate_with_no_waiter_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(4801);
@@ -6801,7 +6793,7 @@ mod tests {
     }
 
     #[test]
-    fn gate_sweep_leaves_a_no_waiter_non_ship_gate_alone() {
+    fn gate_sweep_leaves_a_no_waiter_gate_alone() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(4802);
@@ -6812,24 +6804,14 @@ mod tests {
 
     #[test]
     fn gate_sweep_preview_uses_the_no_waiter_matrix() {
-        for stage in [Stage::Code, Stage::Ship] {
+        for stage in [Stage::Code, Stage::Validate] {
             assert!(!gate_sweep_may_reap(stage, false), "{stage} with no waiter");
             assert!(gate_sweep_may_reap(stage, true), "{stage} with a waiter");
         }
     }
 
     #[test]
-    fn gate_approve_with_no_waiter_at_the_ship_gate_still_writes() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(4803);
-        Gates::write_gate(root, phase, Stage::Ship, "merge").unwrap();
-        gate_respond(root, phase, Some(Stage::Ship), true, None, None).unwrap();
-        assert!(!gate_answer_files(root, phase, Stage::Ship).is_empty());
-    }
-
-    #[test]
-    fn gate_respond_with_no_registered_waiter_at_a_non_ship_gate_writes_nothing() {
+    fn gate_respond_with_no_registered_waiter_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(4804);
@@ -6842,7 +6824,7 @@ mod tests {
             Some("abort".into()),
             None,
         )
-        .expect_err("an unregistered non-Ship gate must not receive a response");
+        .expect_err("an unregistered gate must not receive a response");
         assert!(
             err.to_string().contains("devflow resume --phase 4804"),
             "repair must name the concrete phase: {err}"
@@ -6851,7 +6833,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_at_a_non_ship_gate_with_an_unconfirmable_holder_refuses_success() {
+    fn stop_at_a_gate_with_an_unconfirmable_holder_refuses_success() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(4807);
@@ -7331,7 +7313,7 @@ mod tests {
     fn gate_list_and_show_print_the_gate_id() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let opened = Gates::open_gate(root, PhaseId::new(4903), Stage::Ship, "ctx").unwrap();
+        let opened = Gates::open_gate(root, PhaseId::new(4903), Stage::Validate, "ctx").unwrap();
         let open = Gates::list_open(root);
 
         let list = render_gate_list(&open);
@@ -7417,17 +7399,6 @@ mod tests {
         assert!(refused.contains("no registered waiter"), "{refused}");
         assert!(refused.contains("no response was written"), "{refused}");
         assert!(gate_answer_files(root, released, stage).is_empty());
-
-        let ship = PhaseId::new(5004);
-        let gate = Gates::open_gate(root, ship, Stage::Ship, "g")
-            .unwrap()
-            .gate_id;
-        gate_respond(root, ship, Some(Stage::Ship), true, None, None)
-            .expect("a Ship answer is stored");
-        assert!(matches!(
-            Gates::read_answer(root, ship, Stage::Ship, &gate),
-            AnswerRead::Bound(answer) if answer.response.approved
-        ));
     }
 
     /// Hold `phase`'s gate lock through a separate open, as a suspended writer would.
@@ -7919,20 +7890,21 @@ mod tests {
             .collect()
     }
 
-    /// A Ship gate with its gate file, an approval and that approval's claim: a consumer
-    /// that took the answer, as its registration has finished.
-    fn claimed_ship_gate(root: &Path, phase: PhaseId) -> GateId {
-        state_pending_at(root, phase, Stage::Ship);
-        let (opened, registration) = Gates::open_registered(root, phase, Stage::Ship, "g").unwrap();
+    /// A Validate gate with its gate file, an approval and that approval's claim: a
+    /// consumer that took the answer, as its registration has finished.
+    fn claimed_gate(root: &Path, phase: PhaseId) -> GateId {
+        state_pending_at(root, phase, Stage::Validate);
+        let (opened, registration) =
+            Gates::open_registered(root, phase, Stage::Validate, "g").unwrap();
         registration.finish();
         let response = GateResponse {
             approved: true,
             note: None,
             responded_by: Some("human".into()),
         };
-        Gates::answer(root, phase, Stage::Ship, &opened.gate_id, &response).unwrap();
+        Gates::answer(root, phase, Stage::Validate, &opened.gate_id, &response).unwrap();
         assert!(matches!(
-            Gates::claim(root, phase, Stage::Ship, &opened.gate_id).unwrap(),
+            Gates::claim(root, phase, Stage::Validate, &opened.gate_id).unwrap(),
             devflow_core::gates::Claim::Claimed
         ));
         opened.gate_id
@@ -7963,20 +7935,26 @@ mod tests {
     /// never answered again, and `stop` reaches that consumer through the holder. Control:
     /// an unclaimed gate with a registered waiter gets the abort, and no holder is signalled.
     #[test]
-    fn stop_reaches_the_holder_past_a_claimed_ship_gate() {
+    fn stop_reaches_the_holder_past_a_claimed_gate() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
         // Listed by no one: `list_open` hides a gate whose live answer exists.
         let claimed = PhaseId::new(5017);
-        claimed_ship_gate(root, claimed);
+        claimed_gate(root, claimed);
         assert_stop_reaches_the_holder_and_writes_no_gate_file(root, claimed);
 
         // A partial close: the answer is gone, so the gate is listed, and the claim is all
         // that tells `stop` a consumer took it.
         let partly_closed = PhaseId::new(5018);
-        let gate = claimed_ship_gate(root, partly_closed);
-        std::fs::remove_file(Gates::answer_path(root, partly_closed, Stage::Ship, &gate)).unwrap();
+        let gate = claimed_gate(root, partly_closed);
+        std::fs::remove_file(Gates::answer_path(
+            root,
+            partly_closed,
+            Stage::Validate,
+            &gate,
+        ))
+        .unwrap();
         assert!(
             Gates::list_open(root)
                 .iter()
@@ -8820,14 +8798,15 @@ mod tests {
     #[test]
     fn gate_approve_arg_parsing_takes_the_stage_option() {
         let flagged =
-            Cli::try_parse_from(["devflow", "gate", "approve", "15", "--stage", "ship"]).unwrap();
+            Cli::try_parse_from(["devflow", "gate", "approve", "15", "--stage", "validate"])
+                .unwrap();
         let Command::Gate {
             action: GateCmd::Approve { stage, project, .. },
         } = flagged.command
         else {
             panic!("expected flagged gate approve command");
         };
-        assert_eq!(stage, Some(Stage::Ship));
+        assert_eq!(stage, Some(Stage::Validate));
         assert_eq!(project, PathBuf::from("."));
 
         let bare = Cli::try_parse_from(["devflow", "gate", "approve", "15"]).unwrap();
@@ -8853,7 +8832,7 @@ mod tests {
         assert_eq!(stage, None);
 
         let flagged =
-            Cli::try_parse_from(["devflow", "gate", "show", "15", "--stage", "ship"]).unwrap();
+            Cli::try_parse_from(["devflow", "gate", "show", "15", "--stage", "validate"]).unwrap();
         let Command::Gate {
             action: GateCmd::Show { phase, stage, .. },
         } = flagged.command
@@ -8861,7 +8840,7 @@ mod tests {
             panic!("expected gate show command with stage");
         };
         assert_eq!(phase, PhaseId::new(15));
-        assert_eq!(stage, Some(Stage::Ship));
+        assert_eq!(stage, Some(Stage::Validate));
     }
 
     #[test]
@@ -8900,7 +8879,7 @@ mod tests {
     fn gate_show_renders_full_untruncated_sanitized_context() {
         let dir = tempfile::tempdir().unwrap();
         let context = format!("first line\n\u{1b}[2J{}", "x".repeat(150));
-        Gates::write_gate(dir.path(), PhaseId::new(15), Stage::Ship, &context).unwrap();
+        Gates::write_gate(dir.path(), PhaseId::new(15), Stage::Validate, &context).unwrap();
         let gate = Gates::list_open(dir.path())
             .into_iter()
             .find(|g| g.phase == PhaseId::new(15))
@@ -8923,7 +8902,7 @@ mod tests {
     #[test]
     fn gate_show_errors_asking_for_stage_with_several_open_gates() {
         let dir = tempfile::tempdir().unwrap();
-        Gates::write_gate(dir.path(), PhaseId::new(15), Stage::Ship, "ctx1").unwrap();
+        Gates::write_gate(dir.path(), PhaseId::new(15), Stage::Code, "ctx1").unwrap();
         Gates::write_gate(dir.path(), PhaseId::new(15), Stage::Validate, "ctx2").unwrap();
 
         let err = gate_show(dir.path(), PhaseId::new(15), None).unwrap_err();
@@ -8937,7 +8916,7 @@ mod tests {
         Gates::write_gate(
             dir.path(),
             PhaseId::new(15),
-            Stage::Ship,
+            Stage::Validate,
             "the only open gate",
         )
         .unwrap();
@@ -9278,7 +9257,6 @@ mod tests {
             Stage::Define,
             "the new run's gate",
             1,
-            None,
         )
         .expect_err("a leftover must not decide the new run's gate");
         assert!(
@@ -9307,7 +9285,6 @@ mod tests {
             Stage::Define,
             "control: an answer that binds",
             1,
-            None,
         )
         .expect("control: an answer that binds decides the gate");
         assert_eq!(action, GateAction::Advance);
@@ -9346,7 +9323,13 @@ mod tests {
     fn gate_respond_auto_resolves_single_open_gate() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        Gates::write_gate(root, PhaseId::new(15), Stage::Ship, "approve merge?").unwrap();
+        let (_, registration) = Gates::open_registered(
+            root,
+            PhaseId::new(15),
+            Stage::Validate,
+            "approve the finish?",
+        )
+        .unwrap();
 
         gate_respond(
             root,
@@ -9358,9 +9341,9 @@ mod tests {
         )
         .unwrap();
 
-        let gate = crate::test_support::live_gate_id(root, PhaseId::new(15), Stage::Ship);
+        let gate = crate::test_support::live_gate_id(root, PhaseId::new(15), Stage::Validate);
         let AnswerRead::Bound(answer) =
-            Gates::read_answer(root, PhaseId::new(15), Stage::Ship, &gate)
+            Gates::read_answer(root, PhaseId::new(15), Stage::Validate, &gate)
         else {
             panic!("the live gate holds the answer gate_respond wrote");
         };
@@ -9368,7 +9351,8 @@ mod tests {
         assert_eq!(answer.response.note.as_deref(), Some("lgtm"));
         let event = devflow_core::events::last_event_for_phase(root, PhaseId::new(15)).unwrap();
         assert_eq!(event["event"], "gate_response_written");
-        assert_eq!(event["stage"], "ship");
+        assert_eq!(event["stage"], "validate");
+        registration.finish();
     }
 
     #[test]
@@ -9379,8 +9363,9 @@ mod tests {
         let err = gate_respond(root, PhaseId::new(15), None, true, None, None).unwrap_err();
         assert!(err.to_string().contains("no open gate"), "{err}");
 
-        Gates::write_gate(root, PhaseId::new(15), Stage::Validate, "a").unwrap();
-        Gates::write_gate(root, PhaseId::new(15), Stage::Ship, "b").unwrap();
+        Gates::write_gate(root, PhaseId::new(15), Stage::Code, "a").unwrap();
+        let (_, registration) =
+            Gates::open_registered(root, PhaseId::new(15), Stage::Validate, "b").unwrap();
         let err = gate_respond(
             root,
             PhaseId::new(15),
@@ -9392,22 +9377,23 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("--stage"), "{err}");
 
-        // Explicit Ship disambiguates. Non-Ship gates need a confirmed
-        // waiter before a response can be published.
+        // An explicit stage disambiguates. A gate needs a confirmed waiter
+        // before a response can be published, so the Validate gate has one.
         gate_respond(
             root,
             PhaseId::new(15),
-            Some(Stage::Ship),
+            Some(Stage::Validate),
             false,
             Some("gaps".into()),
             None,
         )
         .unwrap();
         assert!(
-            !gate_answer_files(root, PhaseId::new(15), Stage::Ship).is_empty(),
+            !gate_answer_files(root, PhaseId::new(15), Stage::Validate).is_empty(),
             "explicit-stage rejection must land"
         );
-        assert!(gate_answer_files(root, PhaseId::new(15), Stage::Validate).is_empty());
+        assert!(gate_answer_files(root, PhaseId::new(15), Stage::Code).is_empty());
+        registration.finish();
     }
 
     /// Backdate an already-written gate's `timestamp` so it reads as
@@ -9448,7 +9434,7 @@ mod tests {
     fn gate_sweep_dry_run_does_not_write_a_response() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let (phase, stage) = (PhaseId::new(30), Stage::Ship);
+        let (phase, stage) = (PhaseId::new(30), Stage::Validate);
         let (_, registration) = Gates::open_registered(root, phase, stage, "ctx").unwrap();
         backdate_gate(root, phase, stage, aged_past_threshold());
 
@@ -9478,7 +9464,7 @@ mod tests {
     fn gate_sweep_skips_already_responded_gate_without_clobbering() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let (phase, stage) = (PhaseId::new(31), Stage::Ship);
+        let (phase, stage) = (PhaseId::new(31), Stage::Validate);
         let (opened, registration) = Gates::open_registered(root, phase, stage, "ctx").unwrap();
         backdate_gate(root, phase, stage, aged_past_threshold());
         let listed_before_the_answer = listed_gate(root, phase);
@@ -9511,14 +9497,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(32);
-        let (_, registration) = Gates::open_registered(root, phase, Stage::Ship, "ctx").unwrap();
-        backdate_gate(root, phase, Stage::Ship, aged_past_threshold());
+        let (_, registration) =
+            Gates::open_registered(root, phase, Stage::Validate, "ctx").unwrap();
+        backdate_gate(root, phase, Stage::Validate, aged_past_threshold());
 
         gate_sweep(None, false, Some(root.to_path_buf())).unwrap();
 
         let event = devflow_core::events::last_event_for_phase(root, phase).unwrap();
         assert_eq!(event["event"], "gate_reaped");
-        assert_eq!(event["stage"], "ship");
+        assert_eq!(event["stage"], "validate");
         registration.finish();
     }
 
@@ -10114,16 +10101,16 @@ mod tests {
     fn status_shows_pending_gate_prominently() {
         let dir = tempfile::tempdir().unwrap();
         let context = format!("first line\n\u{1b}[2J{}", "sensitive detail ".repeat(80));
-        Gates::write_gate(dir.path(), PhaseId::new(16), Stage::Ship, &context).unwrap();
+        Gates::write_gate(dir.path(), PhaseId::new(16), Stage::Validate, &context).unwrap();
         let open = Gates::list_open(dir.path());
 
         let banner = render_pending_gate_banner(&open, u64::MAX).unwrap();
 
         assert!(banner.contains("PENDING GATE"));
         assert!(banner.contains("phase 16"));
-        assert!(banner.contains("ship"));
-        assert!(banner.contains("devflow gate approve 16 --stage ship"));
-        assert!(banner.contains("devflow gate reject 16 --stage ship"));
+        assert!(banner.contains("validate"));
+        assert!(banner.contains("devflow gate approve 16 --stage validate"));
+        assert!(banner.contains("devflow gate reject 16 --stage validate"));
         assert!(banner.contains("[truncated; full output in .devflow/]"));
         assert!(!banner.contains(&context));
         assert!(!banner.contains('\u{1b}'));
@@ -10177,7 +10164,7 @@ mod tests {
     fn all_roots_row_includes_gate_with_non_numeric_timestamp() {
         let gate = OpenGate {
             phase: PhaseId::new(42),
-            stage: Stage::Ship,
+            stage: Stage::Validate,
             context: "ctx".to_string(),
             timestamp: "not-a-number".to_string(),
             gate_id: String::new(),
@@ -10215,7 +10202,7 @@ mod tests {
     }
 
     /// V-33, D-06: a gate-pending phase whose supervisor is gone is repaired by `resume`, which
-    /// asks again, at Ship as at any other stage. No liveness, gate state or stage names
+    /// asks again, at Validate as at any other stage. No liveness, gate state or stage names
     /// `advance`.
     #[test]
     fn recovery_hints_for_a_gone_gate_pending_phase_name_resume_not_advance() {
@@ -10233,7 +10220,7 @@ mod tests {
             recovery_hints(&state, &PhaseLiveness::GoneWhileActive),
             vec!["devflow resume --phase 7".to_string()]
         );
-        state.stage = Stage::Ship;
+        state.stage = Stage::Validate;
         assert_eq!(
             recovery_hints(&state, &PhaseLiveness::GoneWhileActive),
             vec!["devflow resume --phase 7".to_string()]
@@ -10256,7 +10243,7 @@ mod tests {
         ];
         for liveness in &every_liveness {
             for gate_pending in [false, true] {
-                for stage in [Stage::Code, Stage::Ship] {
+                for stage in [Stage::Code, Stage::Validate] {
                     state.gate_pending = gate_pending;
                     state.stage = stage;
                     let hints = recovery_hints(&state, liveness);

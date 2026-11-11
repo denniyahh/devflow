@@ -78,8 +78,6 @@ impl Default for GitFlowConfig {
 pub struct DevflowConfig {
     /// Number of capture generations to retain per pipeline stage.
     pub capture_retention: usize,
-    /// Custom Ship review angles; `None` keeps the built-in angle list.
-    pub review_angles: Option<Vec<String>>,
     /// Whether declared external verification commands may run.
     pub external_verify_enabled: bool,
     /// The branch this project's DevFlow phase lifecycle integrates on
@@ -131,7 +129,6 @@ impl Default for DevflowConfig {
     fn default() -> Self {
         Self {
             capture_retention: DEFAULT_CAPTURE_RETENTION,
-            review_angles: None,
             external_verify_enabled: true,
             base_branch: None,
         }
@@ -142,11 +139,6 @@ impl DevflowConfig {
     /// Return the configured capture-retention count.
     pub fn capture_retention(&self) -> usize {
         self.capture_retention
-    }
-
-    /// Return configured review angles, or `None` to use built-in angles.
-    pub fn review_angles(&self) -> Option<&[String]> {
-        self.review_angles.as_deref()
     }
 
     /// Return whether external verification is enabled.
@@ -212,24 +204,6 @@ pub fn capture_retention(project_root: &Path) -> usize {
         }
     }
     load_config(project_root).capture_retention
-}
-
-/// Resolve Ship review angles with `DEVFLOW_REVIEW_ANGLES` taking precedence
-/// over `devflow.toml`. The environment value is a comma-separated list.
-pub fn review_angles(project_root: &Path) -> Option<Vec<String>> {
-    if let Some(value) = env_value("DEVFLOW_REVIEW_ANGLES") {
-        let angles: Vec<_> = value
-            .split(',')
-            .map(str::trim)
-            .filter(|angle| !angle.is_empty())
-            .map(str::to_owned)
-            .collect();
-        if !angles.is_empty() {
-            return Some(angles);
-        }
-        tracing::warn!("DEVFLOW_REVIEW_ANGLES contains no review angles; using devflow.toml");
-    }
-    load_config(project_root).review_angles
 }
 
 /// Resolve external verification with `DEVFLOW_EXTERNAL_VERIFY_ENABLED`
@@ -564,23 +538,6 @@ mod tests {
     }
 
     #[test]
-    fn env_overrides_file_review_angles() {
-        let _lock = ENV_MUTEX.lock().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("devflow.toml"),
-            "review_angles = [\"file angle\"]\n",
-        )
-        .unwrap();
-        let _env = EnvOverride::set("DEVFLOW_REVIEW_ANGLES", "security, docs accuracy");
-
-        assert_eq!(
-            review_angles(dir.path()),
-            Some(vec!["security".into(), "docs accuracy".into()])
-        );
-    }
-
-    #[test]
     fn env_overrides_file_external_verification() {
         let _lock = ENV_MUTEX.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -628,6 +585,33 @@ mod tests {
                 ..DevflowConfig::default()
             },
             "the file parsed (capture_retention is 9) and yes_ship had no effect"
+        );
+    }
+
+    /// v4.0 removed the Ship stage and its review angles (D-01). A
+    /// `devflow.toml` written for 3.x may still carry `review_angles`; it must
+    /// load without error, and the key changes nothing.
+    #[test]
+    fn a_leftover_review_angles_key_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("devflow.toml"),
+            "review_angles = [\"security\"]\ncapture_retention = 9\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            config_parse_error(dir.path()),
+            None,
+            "a leftover review_angles key must not fail the load"
+        );
+        assert_eq!(
+            load_config(dir.path()),
+            DevflowConfig {
+                capture_retention: 9,
+                ..DevflowConfig::default()
+            },
+            "the file parsed (capture_retention is 9) and review_angles had no effect"
         );
     }
 
@@ -1009,7 +993,7 @@ mod tests {
         // A syntax error elsewhere in a file with no `fallback_agent` key is a
         // file problem, not a key problem: the refusal must not send the
         // operator to remove a key they never set.
-        let broken = resolve(Some("review_angles = [\"security\"\n"))
+        let broken = resolve(Some("capture_retention = [9\n"))
             .expect_err("a file that does not parse is refused");
         assert!(
             broken.starts_with("devflow.toml: "),

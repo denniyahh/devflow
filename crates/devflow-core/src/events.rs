@@ -221,7 +221,7 @@ mod tests {
             dir.path(),
             PhaseId::new(15),
             "gate_fired",
-            serde_json::json!({"stage": "ship"}),
+            serde_json::json!({"stage": "validate"}),
         );
 
         let lines = read_lines(dir.path());
@@ -235,7 +235,7 @@ mod tests {
         assert_eq!(lines[0]["phase"], 14);
         assert_eq!(lines[0]["from"], "code");
         assert_eq!(lines[1]["phase"], 15);
-        assert_eq!(lines[1]["stage"], "ship");
+        assert_eq!(lines[1]["stage"], "validate");
     }
 
     #[test]
@@ -310,7 +310,7 @@ mod tests {
             dir.path(),
             PhaseId::new(2),
             "gate_fired",
-            serde_json::json!({"stage": "ship"}),
+            serde_json::json!({"stage": "validate"}),
         );
 
         let latest = last_events_by_phase(dir.path());
@@ -427,18 +427,18 @@ mod tests {
             dir.path(),
             PhaseId::new(1),
             MARKER_EVENT,
-            serde_json::json!({"stage": "ship"}),
+            serde_json::json!({"stage": "validate"}),
         );
         emit(
             dir.path(),
             PhaseId::new(2),
             MARKER_EVENT,
-            serde_json::json!({"stage": "ship"}),
+            serde_json::json!({"stage": "validate"}),
         );
 
         let phase1 = last_event_of_kind_for_phase(dir.path(), PhaseId::new(1), MARKER_EVENT)
             .expect("phase 1 marker event exists");
-        assert_eq!(phase1["stage"], "ship");
+        assert_eq!(phase1["stage"], "validate");
         assert!(has_event_for_phase(
             dir.path(),
             PhaseId::new(1),
@@ -476,8 +476,8 @@ mod tests {
     #[test]
     fn describe_prefers_detail_fields() {
         assert_eq!(
-            describe(&serde_json::json!({"event": "transition", "to": "ship"})),
-            "transition (ship)"
+            describe(&serde_json::json!({"event": "transition", "to": "validate"})),
+            "transition (validate)"
         );
         assert_eq!(
             describe(&serde_json::json!({"event": "workflow_finished"})),

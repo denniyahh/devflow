@@ -264,9 +264,9 @@ mod tests {
                 "\n",
                 r#"{"v":1,"ts":10,"phase":16,"event":"transition","to":"code"}"#,
                 "\n",
-                r#"{"v":1,"ts":20,"phase":16,"event":"gate_fired","stage":"ship"}"#,
+                r#"{"v":1,"ts":20,"phase":16,"event":"gate_fired","stage":"validate"}"#,
                 "\n",
-                r#"{"v":1,"ts":21,"phase":16,"event":"capture_archived","stage":"ship","stamp":"20000000000-0"}"#,
+                r#"{"v":1,"ts":21,"phase":16,"event":"capture_archived","stage":"validate","stamp":"20000000000-0"}"#,
                 "\n",
                 r#"{"v":1,"ts":15,"phase":99,"event":"workflow_started"}"#,
                 "\n",
@@ -300,7 +300,7 @@ mod tests {
         );
         let rendered = render_timeline(&timeline);
         assert!(rendered.contains("transition (code)"));
-        assert!(rendered.contains("gate_fired (ship)"));
+        assert!(rendered.contains("gate_fired (validate)"));
         assert!(rendered.contains("capture:"));
     }
 

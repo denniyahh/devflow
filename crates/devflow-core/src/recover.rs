@@ -862,7 +862,7 @@ mod tests {
         workflow::save_state(&state_aged_phase(root, phase, 0, None)).unwrap();
 
         let mut paths = vec![workflow::state_path(root, phase)];
-        for stage in [Stage::Validate, Stage::Ship] {
+        for stage in [Stage::Code, Stage::Validate] {
             let gate_id = Gates::open_gate(root, phase, stage, "wedged gate")
                 .unwrap()
                 .gate_id;
@@ -2044,8 +2044,9 @@ mod tests {
             SOCKET_PROBES_PER_DECISION,
             crate::gates::STAGES.len() as u32,
         );
+        let extra_gate_waits = crate::gates::STAGES.len() as u32 - 1;
         assert!(
-            per_stage >= worst + gate * 4,
+            per_stage >= worst + gate * extra_gate_waits,
             "{per_stage:?} against {worst:?}"
         );
     }

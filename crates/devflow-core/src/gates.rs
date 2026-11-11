@@ -1840,13 +1840,7 @@ fn gate_lock(project_root: &Path, phase: PhaseId) -> Result<GateLock, GateError>
 /// The suffix of a waiter registration's file name.
 pub(crate) const WAITER_SUFFIX: &str = ".waiter";
 /// Every stage whose gate files a phase can leave behind.
-pub(crate) const STAGES: [Stage; 5] = [
-    Stage::Define,
-    Stage::Plan,
-    Stage::Code,
-    Stage::Validate,
-    Stage::Ship,
-];
+pub(crate) const STAGES: [Stage; 4] = [Stage::Define, Stage::Plan, Stage::Code, Stage::Validate];
 /// An answer body that is not JSON, or lacks what an answer needs.
 const REASON_UNPARSABLE: &str = "unparsable";
 /// An answer body with no gate id.
@@ -2068,7 +2062,7 @@ mod tests {
             Gates::await_answer(
                 dir.path(),
                 PhaseId::new(11),
-                Stage::Ship,
+                Stage::Validate,
                 &GateId::new(),
                 0,
                 || false
@@ -2080,7 +2074,7 @@ mod tests {
     #[test]
     fn claim_writes_received_true() {
         let dir = tempfile::tempdir().unwrap();
-        let (phase, stage) = (PhaseId::new(11), Stage::Ship);
+        let (phase, stage) = (PhaseId::new(11), Stage::Validate);
         let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
             .unwrap()
             .gate_id;
@@ -2096,7 +2090,7 @@ mod tests {
     #[test]
     fn a_claim_whose_directory_fsync_fails_leaves_no_ack_and_can_be_retried() {
         let dir = tempfile::tempdir().unwrap();
-        let (phase, stage) = (PhaseId::new(12), Stage::Ship);
+        let (phase, stage) = (PhaseId::new(12), Stage::Validate);
         let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
             .unwrap()
             .gate_id;
@@ -2203,7 +2197,13 @@ mod tests {
     #[test]
     fn list_open_shows_unanswered_gates_only() {
         let dir = tempfile::tempdir().unwrap();
-        Gates::write_gate(dir.path(), PhaseId::new(7), Stage::Ship, "approve merge?").unwrap();
+        Gates::write_gate(
+            dir.path(),
+            PhaseId::new(7),
+            Stage::Validate,
+            "approve the finish?",
+        )
+        .unwrap();
         let answered =
             Gates::open_gate(dir.path(), PhaseId::new(8), Stage::Validate, "review gaps")
                 .unwrap()
@@ -2229,8 +2229,8 @@ mod tests {
 
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].phase, PhaseId::new(7));
-        assert_eq!(open[0].stage, Stage::Ship);
-        assert_eq!(open[0].context, "approve merge?");
+        assert_eq!(open[0].stage, Stage::Validate);
+        assert_eq!(open[0].context, "approve the finish?");
     }
 
     #[test]
@@ -2379,7 +2379,7 @@ mod tests {
     #[test]
     fn an_answer_round_trips_through_await_answer() {
         let dir = tempfile::tempdir().unwrap();
-        let (phase, stage) = (PhaseId::new(9), Stage::Ship);
+        let (phase, stage) = (PhaseId::new(9), Stage::Validate);
         let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
             .unwrap()
             .gate_id;
@@ -2414,7 +2414,7 @@ mod tests {
         let err = Gates::answer(
             dir.path(),
             PhaseId::new(3),
-            Stage::Ship,
+            Stage::Validate,
             &GateId::new(),
             &response,
         )
@@ -2486,7 +2486,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sentinel = dir.path().join("sentinel");
         let cmd = format!("touch {}", sentinel.display());
-        run_notify_command(&cmd, PhaseId::new(11), Stage::Ship, "ctx", false);
+        run_notify_command(&cmd, PhaseId::new(11), Stage::Validate, "ctx", false);
         assert!(sentinel.exists());
     }
 
@@ -2494,7 +2494,7 @@ mod tests {
     fn notify_hook_failure_is_fail_soft() {
         // A command that always fails must not panic or otherwise abort the
         // caller — fail-soft per T-13-02.
-        run_notify_command("exit 1", PhaseId::new(11), Stage::Ship, "ctx", false);
+        run_notify_command("exit 1", PhaseId::new(11), Stage::Validate, "ctx", false);
     }
 
     #[test]
@@ -2514,7 +2514,13 @@ mod tests {
             "echo -n \"$DEVFLOW_NON_SILENT_GATE\" > {}",
             sentinel_expected.display()
         );
-        run_notify_command(&cmd_expected, PhaseId::new(11), Stage::Ship, "ctx", false);
+        run_notify_command(
+            &cmd_expected,
+            PhaseId::new(11),
+            Stage::Validate,
+            "ctx",
+            false,
+        );
         assert_eq!(std::fs::read_to_string(&sentinel_expected).unwrap(), "0");
     }
 
@@ -2591,7 +2597,7 @@ mod tests {
             std::env::remove_var("DEVFLOW_GATE_NOTIFY_CMD");
         }
         // Must return normally without touching the filesystem or panicking.
-        fire_gate_notify(PhaseId::new(11), Stage::Ship, "ctx", false);
+        fire_gate_notify(PhaseId::new(11), Stage::Validate, "ctx", false);
     }
 
     #[test]
@@ -2604,7 +2610,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sentinel = dir.path().join("sentinel");
         let cmd = format!("touch {}", sentinel.display());
-        fire_gate_notify_with_fallback(PhaseId::new(11), Stage::Ship, "ctx", false, Some(&cmd));
+        fire_gate_notify_with_fallback(PhaseId::new(11), Stage::Validate, "ctx", false, Some(&cmd));
         assert!(sentinel.exists());
     }
 
@@ -2673,9 +2679,14 @@ mod tests {
         let empty = tempfile::tempdir().unwrap();
         let started = std::time::Instant::now();
         assert_eq!(
-            Gates::await_answer(empty.path(), phase, Stage::Ship, &GateId::new(), 1, || {
-                false
-            }),
+            Gates::await_answer(
+                empty.path(),
+                phase,
+                Stage::Validate,
+                &GateId::new(),
+                1,
+                || { false }
+            ),
             AwaitOutcome::TimedOut
         );
         assert!(
@@ -3341,7 +3352,7 @@ mod tests {
     fn a_fenced_answers_two_gate_waits_reach_the_write_lock_repair_wait() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let (phase, stage) = (PhaseId::new(2102), Stage::Ship);
+        let (phase, stage) = (PhaseId::new(2102), Stage::Validate);
         let gate = Gates::open_gate(root, phase, stage, "ctx").unwrap().gate_id;
         let response = GateResponse {
             approved: true,

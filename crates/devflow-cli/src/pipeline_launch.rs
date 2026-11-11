@@ -26,8 +26,7 @@ use crate::pipeline_gate::transition;
 use crate::pipeline_gate::{abort, run_gate_with_timeout};
 use crate::pipeline_outcomes::{
     ValidateOutcome, classify_validate_outcome, gate_or_abort_infra, handle_infra_outcome,
-    handle_rate_limited_outcome, handle_ship_failure, handle_ship_outcome, handle_stage_failure,
-    handle_validate_outcome, truncate_reason,
+    handle_rate_limited_outcome, handle_stage_failure, handle_validate_outcome, truncate_reason,
 };
 use crate::preflight::{
     agent_program, ensure_agent_binary, generic_preflight_checks, print_fallback_notice,
@@ -128,8 +127,8 @@ fn stamp_validate_dispatch_window(state: &mut State) {
 
 /// The prompt a launch with no override gives the agent, rendered by `driver`
 /// (Phase 51 D-09). At Code it replays the persisted fix pass
-/// ([`State::code_fix`]), so a same-stage relaunch inside an audit-fix,
-/// gaps-only or full-execute pass continues that pass; every other stage gets
+/// ([`State::code_fix`]), so a same-stage relaunch inside a gaps-only or
+/// full-execute pass continues that pass; every other stage gets
 /// its default intent. The fix TYPE is persisted and rendered here, at launch,
 /// so after a handoff the fallback's own renderer is used.
 ///
@@ -685,13 +684,7 @@ fn emit_canary_outcome(state: &State, outcome: &canary::CanaryOutcome) {
 /// `Confirmed` at Define, so the relocated refusal did not fire — the
 /// relocation is recorded here on the strength of the code path, not on the
 /// strength of having watched it refuse.
-const STREAM_JSON_STAGES: &[Stage] = &[
-    Stage::Define,
-    Stage::Plan,
-    Stage::Code,
-    Stage::Validate,
-    Stage::Ship,
-];
+const STREAM_JSON_STAGES: &[Stage] = &[Stage::Define, Stage::Plan, Stage::Code, Stage::Validate];
 
 /// Whether this launch should use the `stream-json` transport and the
 /// pipe-owning monitor.
@@ -3296,14 +3289,7 @@ fn close_gates_for_resume(
     current_stage: Stage,
 ) -> Vec<String> {
     // Read before the close, which removes the files that name them.
-    let gate_ids = [
-        Stage::Define,
-        Stage::Plan,
-        Stage::Code,
-        Stage::Validate,
-        Stage::Ship,
-    ]
-    .map(|stage| {
+    let gate_ids = [Stage::Define, Stage::Plan, Stage::Code, Stage::Validate].map(|stage| {
         let gate_id = crate::commands::gate_file_id(project_root, phase, stage)
             .ok()
             .flatten();
@@ -3741,11 +3727,11 @@ pub(crate) fn advance_with(
             Stage::Code => transition(project_root, &mut state, Stage::Validate),
             Stage::Validate => {
                 // 13b verdict-vs-ran + 18e: the Validate prompt now REQUIRES
-                // a verdict, so ONLY an explicit `verdict: pass` advances to
-                // Ship. A missing verdict is a fail-safe (gate/loop), NOT a
+                // a verdict, so ONLY an explicit `verdict: pass` finishes
+                // the run. A missing verdict is a fail-safe (gate/loop), NOT a
                 // silent pass — closes the composition bug where a
-                // marker-less/verdict-less Validate could otherwise reach
-                // Ship. `classify_validate_outcome` additionally resolves
+                // marker-less/verdict-less Validate could otherwise finish
+                // it. `classify_validate_outcome` additionally resolves
                 // the `external_verify` three-way matrix (D-18e): agreement
                 // advances, disagreement/no-verdict gates immediately.
                 handle_validate_outcome(
@@ -3754,7 +3740,6 @@ pub(crate) fn advance_with(
                     classify_validate_outcome(&result),
                 )
             }
-            Stage::Ship => handle_ship_outcome(project_root, &mut state),
         },
         Action::GateReview => {
             // D-01/D-03/D-05 (28-03): before the ordinary per-stage failure
@@ -3827,17 +3812,12 @@ pub(crate) fn advance_with(
                             // has been handed to the gate.
                             let unapproved_files = unapproved_plan_files(&unapproved);
 
-                            // `None` for the auto-response is load-bearing and
-                            // not a placeholder: this gate exists precisely
-                            // because a human has not seen these declarations,
-                            // so nothing may pre-authorize it.
                             let action = run_gate_with_timeout(
                                 project_root,
                                 &mut state,
                                 stage,
                                 &context,
                                 gate_timeout_secs(),
-                                None,
                             )?;
                             match action {
                                 // R-8 / T-48-15-01: approval must become
@@ -3943,9 +3923,6 @@ pub(crate) fn advance_with(
                 Stage::Validate => {
                     handle_validate_outcome(project_root, &mut state, ValidateOutcome::Failed)
                 }
-                // Ship distinguishes an agent crash (AgentFailed) from a
-                // review rejection (ReviewFailed, `review:`-prefixed reason).
-                Stage::Ship => handle_ship_failure(project_root, &mut state, reason),
                 // Every other non-Validate failure (incl. Unknown, D-06) is
                 // never silent (WR-11): it always fires a gate + notify
                 // instead of returning a bare error or silently advancing.
@@ -4080,21 +4057,14 @@ mod tests {
         assert!(!auto_chain_flag_eligible(Stage::Define, Mode::Auto));
         assert!(!auto_chain_flag_eligible(Stage::Plan, Mode::Auto));
         assert!(!auto_chain_flag_eligible(Stage::Validate, Mode::Auto));
-        assert!(!auto_chain_flag_eligible(Stage::Ship, Mode::Auto));
 
-        // Exhaustiveness tripwire: this match names all five variants with no
+        // Exhaustiveness tripwire: this match names every variant with no
         // wildcard arm, so a new `Stage` fails to compile here rather than
-        // slipping past the five assertions above.
-        for stage in [
-            Stage::Define,
-            Stage::Plan,
-            Stage::Code,
-            Stage::Validate,
-            Stage::Ship,
-        ] {
+        // slipping past the assertions above.
+        for stage in [Stage::Define, Stage::Plan, Stage::Code, Stage::Validate] {
             let expected = match stage {
                 Stage::Code => true,
-                Stage::Define | Stage::Plan | Stage::Validate | Stage::Ship => false,
+                Stage::Define | Stage::Plan | Stage::Validate => false,
             };
             assert_eq!(auto_chain_flag_eligible(stage, Mode::Auto), expected);
         }
@@ -5053,15 +5023,6 @@ mod tests {
                  record that it was applied; the rerun asks again"
                     .to_string()
             ]
-        );
-        assert_eq!(
-            resume_gate_lines(Stage::Ship, Some("G1"), &approved, true),
-            vec![
-                "resume: an answer for the ship gate (gate G1: approved) was claimed, with no \
-                 record that it was applied; the rerun asks again"
-                    .to_string()
-            ],
-            "nothing runs after a Ship approval, so the Ship line adds no caution"
         );
         assert_eq!(
             resume_gate_lines(Stage::Code, Some("G1"), &approved, false),
@@ -6879,13 +6840,7 @@ mod tests {
             AgentKind::Pi,
             AgentKind::Antigravity,
         ];
-        let stages = [
-            Stage::Define,
-            Stage::Plan,
-            Stage::Code,
-            Stage::Validate,
-            Stage::Ship,
-        ];
+        let stages = [Stage::Define, Stage::Plan, Stage::Code, Stage::Validate];
         let outcomes = [
             canary::CanaryOutcome::Confirmed,
             canary::CanaryOutcome::Absent,
@@ -9641,7 +9596,6 @@ mod tests {
                 Stage::Code,
                 "a foreground gate",
                 300,
-                None,
             );
             let error = end.expect_err("a stopped wait is an error").to_string();
             assert!(error.contains(HOLDER_STOP_REASON), "{error}");
@@ -10188,16 +10142,10 @@ mod tests {
             PathBuf::from("/repo"),
         );
         state.fallback_agent = Some(AgentKind::Codex);
-        for stage in [
-            Stage::Define,
-            Stage::Plan,
-            Stage::Code,
-            Stage::Validate,
-            Stage::Ship,
-        ] {
+        for stage in [Stage::Define, Stage::Plan, Stage::Code, Stage::Validate] {
             let expected = match stage {
                 Stage::Code => Some(AgentKind::Codex),
-                Stage::Define | Stage::Plan | Stage::Validate | Stage::Ship => None,
+                Stage::Define | Stage::Plan | Stage::Validate => None,
             };
             assert_eq!(
                 failover_target(&state, stage),
@@ -11239,15 +11187,15 @@ mod tests {
         (recorded_argv(root, "codex"), reap)
     }
 
-    /// D-09 (Code, review B-1): a Code failover in the middle of an audit-fix pass
-    /// hands the fallback the audit-fix workflow, rendered by the FALLBACK's
+    /// D-09 (Code, review B-1): a Code failover in the middle of a gaps-only pass
+    /// hands the fallback the gaps-only workflow, rendered by the FALLBACK's
     /// driver, and the assertion is on the argv the spawned `codex` received.
     /// Control in the same test: the same failover from a plain Code pass
     /// delivers the plain execute-phase rendering.
     #[test]
-    fn a_code_failover_during_an_audit_fix_pass_replays_audit_fix() {
+    fn a_code_failover_during_a_gaps_only_pass_replays_gaps_only() {
         const NAME: &str =
-            "pipeline_launch::tests::a_code_failover_during_an_audit_fix_pass_replays_audit_fix";
+            "pipeline_launch::tests::a_code_failover_during_a_gaps_only_pass_replays_gaps_only";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = argv_recording_agents_dir();
             let output =
@@ -11264,12 +11212,12 @@ mod tests {
         let fix_dir = tempfile::tempdir().unwrap();
         let fix_phase = PhaseId::new(5171);
         let (argv, _reap_fix) =
-            fail_over_from_code(fix_dir.path(), fix_phase, Some(prompt::FixType::AuditFix));
-        let audit_fix = code_prompt(fix_phase, Some(prompt::FixType::AuditFix));
-        assert_ne!(audit_fix, code_prompt(fix_phase, None));
+            fail_over_from_code(fix_dir.path(), fix_phase, Some(prompt::FixType::GapsOnly));
+        let gaps_only = code_prompt(fix_phase, Some(prompt::FixType::GapsOnly));
+        assert_ne!(gaps_only, code_prompt(fix_phase, None));
         assert!(
-            argv.contains(&audit_fix),
-            "the fallback receives the audit-fix pass in Codex's own rendering: {argv:?}"
+            argv.contains(&gaps_only),
+            "the fallback receives the gaps-only pass in Codex's own rendering: {argv:?}"
         );
         assert!(
             !argv.contains(&code_prompt(fix_phase, None)),
@@ -11284,7 +11232,7 @@ mod tests {
             "control: a plain Code failover delivers execute-phase: {argv:?}"
         );
         assert!(
-            !argv.contains(&code_prompt(plain_phase, Some(prompt::FixType::AuditFix))),
+            !argv.contains(&code_prompt(plain_phase, Some(prompt::FixType::GapsOnly))),
             "control: a plain Code failover delivers no fix prompt: {argv:?}"
         );
     }
@@ -13177,13 +13125,12 @@ mod tests {
         (recorded_argv(root, "codex"), reap)
     }
 
-    /// D-09: a `devflow resume` in the middle of an audit-fix pass (the cron arm's
-    /// later resume) relaunches that pass, asserted on the argv the spawned
+    /// D-09: a `devflow resume` in the middle of a gaps-only pass relaunches that pass, asserted on the argv the spawned
     /// `codex` received. Control: the same resume with no fix pass recorded
     /// delivers the plain execute-phase prompt.
     #[test]
-    fn a_resume_mid_audit_fix_replays_audit_fix() {
-        const NAME: &str = "pipeline_launch::tests::a_resume_mid_audit_fix_replays_audit_fix";
+    fn a_resume_mid_gaps_only_pass_replays_gaps_only() {
+        const NAME: &str = "pipeline_launch::tests::a_resume_mid_gaps_only_pass_replays_gaps_only";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = argv_recording_agents_dir();
             let output =
@@ -13200,10 +13147,10 @@ mod tests {
         let fix_dir = tempfile::tempdir().unwrap();
         let fix_phase = PhaseId::new(5173);
         let (argv, _reap_fix) =
-            resume_code_run(fix_dir.path(), fix_phase, Some(prompt::FixType::AuditFix));
+            resume_code_run(fix_dir.path(), fix_phase, Some(prompt::FixType::GapsOnly));
         assert!(
-            argv.contains(&code_prompt(fix_phase, Some(prompt::FixType::AuditFix))),
-            "the resumed agent receives the audit-fix pass: {argv:?}"
+            argv.contains(&code_prompt(fix_phase, Some(prompt::FixType::GapsOnly))),
+            "the resumed agent receives the gaps-only pass: {argv:?}"
         );
         assert!(
             !argv.contains(&code_prompt(fix_phase, None)),
@@ -13218,7 +13165,7 @@ mod tests {
             "control: a plain resume delivers execute-phase: {argv:?}"
         );
         assert!(
-            !argv.contains(&code_prompt(plain_phase, Some(prompt::FixType::AuditFix))),
+            !argv.contains(&code_prompt(plain_phase, Some(prompt::FixType::GapsOnly))),
             "control: a plain resume delivers no fix prompt: {argv:?}"
         );
     }

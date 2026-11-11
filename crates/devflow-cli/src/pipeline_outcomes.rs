@@ -13,10 +13,7 @@
 //! actually move the state machine.
 
 use crate::CliError;
-use crate::config_parse::gate_timeout_secs;
-use crate::pipeline_gate::{
-    LoopBackReason, abort, finish_run, loop_back_to_code, run_gate, run_gate_with_timeout,
-};
+use crate::pipeline_gate::{LoopBackReason, abort, finish_run, loop_back_to_code, run_gate};
 use crate::pipeline_launch::{close_gate, commit, launch_stage, recorded_canary_refusal};
 use devflow_core::gates::GateAction;
 use devflow_core::mode;
@@ -35,8 +32,8 @@ use std::path::{Path, PathBuf};
 /// `state.infra_failures` (saturating, never `consecutive_failures`),
 /// persists, then either aborts at the ceiling or fires the never-silent
 /// gate via [`handle_stage_failure`]. Deliberately never calls
-/// `handle_validate_outcome`/`handle_ship_failure` on any stage (review
-/// consensus #4) — those increment `consecutive_failures`, which would
+/// `handle_validate_outcome` on any stage (review
+/// consensus #4) — it increments `consecutive_failures`, which would
 /// conflate an infrastructure fault with an agent-caused failure (D-08).
 pub(crate) fn handle_infra_outcome(
     project_root: &Path,
@@ -146,7 +143,7 @@ fn rate_limit_gate_context(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ValidateOutcome {
     /// The two independent signals agree (or no `external_verify` is
-    /// declared and the agent reported `verdict: pass`): advance to Ship.
+    /// declared and the agent reported `verdict: pass`): finish the run.
     Passed,
     /// An ordinary Validate failure — the pre-existing fail-safe, unchanged:
     /// loop back to Code, or gate once `consecutive_failures` reaches the
@@ -277,11 +274,6 @@ pub(crate) enum ValidateResult {
 /// `{N}-VERIFICATION.md` has been produced yet, so `--gaps-only` would match
 /// zero plans and gate unresolvably) or the narrower `--gaps-only` command
 /// (a `{N}-VERIFICATION.md` already exists, so this is a genuine gaps loop).
-///
-/// D-02 places `handle_ship_outcome`'s loop-back deliberately out of scope:
-/// by the time Ship runs, the phase has already been judged complete, so it
-/// is by definition not mid-arc and `FixType::GapsOnly` is already correct
-/// there — that call site does not call this helper.
 ///
 /// CR-01: the root passed in is the **evidence root**, not the main checkout.
 /// In worktree mode that is the phase's worktree, because `.planning/` is a
@@ -824,39 +816,7 @@ fn loop_back_reason(baseline_absent: bool) -> LoopBackReason {
     }
 }
 
-/// Decide what happens after the Ship stage completes — always gated, and
-/// always answered by a human: the Ship pre-authorization that used to answer
-/// this gate is gone (CUT-02, D-01).
-///
-/// An approval ends the run as a passing Validate does ([`finish_run`]): no
-/// stage follows Ship, and the after-ship hooks that merged, bumped, tagged
-/// and deleted the branch are gone (CUT-02, D-01, D-23). Only a state written
-/// by an older binary still reaches this gate.
-pub(crate) fn handle_ship_outcome(project_root: &Path, state: &mut State) -> Result<(), CliError> {
-    match run_gate_with_timeout(
-        project_root,
-        state,
-        Stage::Ship,
-        "Ship complete — approve merge?",
-        gate_timeout_secs(),
-        None,
-    )? {
-        GateAction::Advance => {
-            let _ = close_gate(project_root, state.phase, Stage::Ship);
-            finish_run(project_root, state)
-        }
-        GateAction::LoopBack(_) => loop_back_to_code(
-            project_root,
-            state,
-            FixType::GapsOnly,
-            LoopBackReason::GateResponse,
-        ),
-        GateAction::Abort(reason) => abort(project_root, state, &reason),
-    }
-}
-
-/// Handle a non-Validate stage failure (Define/Plan/Code, or a Ship agent
-/// crash routed in via [`handle_ship_failure`]). WR-11: this path must never
+/// Handle a non-Validate stage failure (Define/Plan/Code). WR-11: this path must never
 /// be silent — it unconditionally fires a gate + notify via [`run_gate`]
 /// (independent of `Mode::should_gate`; `run_gate` marks it as an unexpected
 /// gate and notifies accordingly), then lets the operator retry, loop back,
@@ -956,8 +916,7 @@ fn answer_stage_failure_gate(
         GateAction::LoopBack(_) => {
             // Retry the SAME failed stage — Code is not a valid recovery
             // target before planning exists for a Define/Plan failure
-            // (Codex 13-01 MEDIUM). Only Ship's ReviewFailed path (handled
-            // separately in `handle_ship_failure`) actually loops to Code.
+            // (Codex 13-01 MEDIUM).
             let _ = close_gate(project_root, state.phase, stage);
             relaunch_failed_stage(project_root, state, stage)
         }
@@ -1010,54 +969,17 @@ fn relaunch_failed_stage(
     Ok(())
 }
 
-/// Handle the Ship stage's failure outcome, distinguishing an agent crash
-/// (`AgentFailed`) from a review rejection (`ReviewFailed`). A `review:`-
-/// prefixed reason (trimmed, case-folded) is the agent-reported convention
-/// for "the change was reviewed and rejected" — that loops back to Code with
-/// the `/gsd-audit-fix` prompt rather than firing a gate (consensus #7).
-/// Anything else is treated as an agent crash and routed through the generic
-/// never-silent gate path.
-pub(crate) fn handle_ship_failure(
-    project_root: &Path,
-    state: &mut State,
-    reason: Option<String>,
-) -> Result<(), CliError> {
-    if is_ship_review_failure(&reason) {
-        // A Ship review rejection, not a Validate failure — the commit-count
-        // baseline plays no part in this decision, so it makes no claim.
-        return loop_back_to_code(
-            project_root,
-            state,
-            FixType::AuditFix,
-            LoopBackReason::GateResponse,
-        );
-    }
-    handle_stage_failure(project_root, state, Stage::Ship, reason)
-}
-
-/// Whether a Ship-stage failure `reason` is a review rejection (`review:`
-/// prefix, trimmed + case-folded) rather than an agent crash. This string
-/// convention is an inherent limitation of the agent-reported DEVFLOW_RESULT
-/// contract (T-13-04) — verified live against a real agent in 13-06.
-pub(crate) fn is_ship_review_failure(reason: &Option<String>) -> bool {
-    reason
-        .as_deref()
-        .map(|r| r.trim().to_ascii_lowercase().starts_with("review:"))
-        .unwrap_or(false)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use devflow_core::gates::Gates;
     // Test-only: production code resolves its branch model from the
     // project (45-01), so the defaults survive here as fixture input only.
-    use crate::pipeline_gate::{prepare_loop_back_to_code, transition};
+    use crate::pipeline_gate::transition;
     use crate::pipeline_launch::advance;
     use crate::test_support::*;
     use devflow_core::config::GitFlowConfig;
     use devflow_core::mode::Mode;
-    use devflow_core::prompt;
     use devflow_core::state::AgentKind;
     use devflow_core::test_support::{answer_open_gate, gate_answer_files, preanswer_gate};
     use devflow_core::workflow;
@@ -1201,7 +1123,7 @@ mod tests {
     /// every case (rather than letting a `passed=true` case fall through to a
     /// bare `transition`) is deliberate: `transition`/`loop_back_to_code` both
     /// call `launch_stage`, which spawns the real configured agent CLI and
-    /// must never fire from a unit test (see `ship_review_failed_loops_to_code`).
+    /// must never fire from a unit test.
     fn drive_validate_advance_and_read_gate_context(
         root: &Path,
         phase: PhaseId,
@@ -1858,10 +1780,9 @@ mod tests {
 
         handle_validate_outcome(root, &mut state, post_fix).unwrap();
 
-        assert_ne!(
-            state.stage,
-            Stage::Ship,
-            "the post-fix shape must never advance to Ship — that advance is the \
+        assert!(
+            !state.finished,
+            "the post-fix shape must never finish the run — that finish is the \
              whole of 999.74"
         );
         assert_eq!(
@@ -4512,52 +4433,6 @@ mod tests {
         );
     }
 
-    /// D-02, the negative control for the whole D-01 change: identical
-    /// precondition (no `{N}-VERIFICATION.md`) as the two tests above, but
-    /// driven through `handle_ship_outcome` instead — must still dispatch
-    /// `GapsOnly`, proving the out-of-scope call site was not swept in as a
-    /// runtime fact, not merely a claim about the diff. PATH-neutralized
-    /// under `ENV_MUTEX`, same as above.
-    #[test]
-    fn ship_loop_back_still_issues_gaps_only_when_verification_absent() {
-        const NAME: &str = "pipeline_outcomes::tests::ship_loop_back_still_issues_gaps_only_when_verification_absent";
-        if !devflow_core::test_support::in_child_test(NAME) {
-            let path_dir = agent_free_git_only_path_dir();
-            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
-            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
-            return;
-        }
-
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(86);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Ship;
-        workflow::save_state(&state).unwrap();
-
-        // No {phase:02}-VERIFICATION.md — same mid-arc precondition that
-        // flips the two Validate arms above.
-
-        preanswer_gate(
-            root,
-            phase,
-            Stage::Ship,
-            &serde_json::from_str(
-                r#"{"approved":false,"note":"loop back for another pass","responded_by":"test"}"#,
-            )
-            .unwrap(),
-        );
-
-        let _ = handle_ship_outcome(root, &mut state);
-
-        let last = devflow_core::events::last_event_of_kind_for_phase(root, phase, "loop_back")
-            .expect("loop_back event must be recorded");
-        assert_eq!(
-            last["fix"], "GapsOnly",
-            "handle_ship_outcome must remain unaffected by the D-01 mid-arc check (D-02)"
-        );
-    }
-
     /// Combined 18d+18e scenario (18-RESEARCH.md Pitfall 1) — the only test
     /// that proves both fixes hold TOGETHER, not each in isolation: 18e's
     /// Layer-0 discard is what makes an `external_verify` Validate fail for
@@ -4935,181 +4810,6 @@ mod tests {
         let bounded = render_gate_context(&"x".repeat(500), 100);
         assert_eq!(bounded.chars().count(), 100);
         assert!(bounded.ends_with("[truncated; full output in .devflow/]"));
-    }
-
-    /// A Ship-stage AgentFailed result (no `review:` prefix) must write a
-    /// gate file and block for a response — not silently return an `Err`
-    /// with nothing surfaced (WR-11; the pre-Task-2 catch-all never wrote a
-    /// gate at all for this case). Runs `handle_ship_failure` on a scoped
-    /// thread and busy-polls for the gate file to appear while the call is
-    /// still blocked in `run_gate`'s poll, then unblocks it with an Abort
-    /// response so the thread can finish without spawning a real monitor
-    /// (Abort resolves via `abort()`, which never calls `launch_stage`).
-    #[test]
-    fn ship_agent_failed_fires_gate() {
-        const NAME: &str = "pipeline_outcomes::tests::ship_agent_failed_fires_gate";
-        if !devflow_core::test_support::in_child_test(NAME) {
-            let path_dir = agent_free_git_only_path_dir();
-            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
-            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
-            return;
-        }
-
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-
-        let phase = PhaseId::new(40);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Ship;
-        workflow::save_state(&state).unwrap();
-
-        let gate_path = Gates::gate_path(root, phase, Stage::Ship);
-
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
-                handle_ship_failure(root, &mut state, Some("agent crashed".into())).unwrap();
-            });
-
-            let mut seen = false;
-            for _ in 0..150 {
-                if gate_path.exists() {
-                    seen = true;
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            assert!(
-                seen,
-                "handle_ship_failure must write a gate file, not silently return an Err"
-            );
-
-            // Unblock the poll with an Abort response so the spawned thread
-            // finishes (abort() cleans up on its own; no monitor spawned).
-            answer_open_gate(
-                root,
-                phase,
-                Stage::Ship,
-                &serde_json::from_str(
-                    r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        });
-    }
-
-    /// A Ship-stage result whose reason starts with `review:` must loop back
-    /// to Code instead of firing a gate — it does not go through `run_gate`
-    /// at all, so no gate file is ever written for this path.
-    ///
-    /// Exercises `is_ship_review_failure` (the exact dispatch predicate
-    /// `handle_ship_failure` uses) plus `prepare_loop_back_to_code` (the
-    /// state-mutating half of `loop_back_to_code`) directly, rather than the
-    /// full `handle_ship_failure` → `loop_back_to_code` → `launch_stage`
-    /// chain: `launch_stage` spawns the real configured agent CLI (e.g. real
-    /// `claude -p ... --dangerously-skip-permissions` if it's on `$PATH`),
-    /// which must never fire from a unit test.
-    #[test]
-    fn ship_review_failed_loops_to_code() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-
-        let phase = PhaseId::new(41);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Ship;
-        workflow::save_state(&state).unwrap();
-
-        let reason = Some("review: please fix naming".to_string());
-        assert!(is_ship_review_failure(&reason));
-
-        prepare_loop_back_to_code(
-            root,
-            &mut state,
-            FixType::AuditFix,
-            LoopBackReason::GateResponse,
-        )
-        .unwrap();
-
-        assert_eq!(state.stage, Stage::Code);
-        assert!(!Gates::gate_path(root, phase, Stage::Ship).exists());
-        // The run continues at Code, so its state is kept.
-        assert!(workflow::load_state(root, phase).is_ok());
-    }
-
-    /// The ReviewFailed loop-back must select `FixType::AuditFix`
-    /// (`/gsd-audit-fix`), not the Validate path's `FixType::GapsOnly`
-    /// (consensus #7 / OpenCode HIGH #2).
-    #[test]
-    fn ship_review_failed_uses_audit_fix() {
-        assert!(is_ship_review_failure(&Some(
-            "review: needs changes".into()
-        )));
-        assert!(is_ship_review_failure(&Some("  Review: nitpick".into())));
-        assert!(!is_ship_review_failure(&Some("agent crashed".into())));
-        assert!(!is_ship_review_failure(&None));
-
-        let prompt = prompt::fix_prompt(FixType::AuditFix, PhaseId::new(11));
-        assert!(prompt.contains("/gsd-audit-fix"));
-        assert!(!prompt.contains("--gaps-only"));
-    }
-
-    /// `handle_ship_outcome` writes a gate request but never writes a
-    /// response: the Ship approval waits for a human.
-    #[test]
-    fn handle_ship_outcome_writes_gate_but_no_response() {
-        const NAME: &str =
-            "pipeline_outcomes::tests::handle_ship_outcome_writes_gate_but_no_response";
-        if !devflow_core::test_support::in_child_test(NAME) {
-            let path_dir = agent_free_git_only_path_dir();
-            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
-            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
-            return;
-        }
-
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-
-        let phase = PhaseId::new(51);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Ship;
-        workflow::save_state(&state).unwrap();
-
-        let gate_path = Gates::gate_path(root, phase, Stage::Ship);
-
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
-                handle_ship_outcome(root, &mut state).unwrap();
-            });
-
-            let mut seen = false;
-            for _ in 0..150 {
-                if gate_path.exists() {
-                    seen = true;
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            assert!(seen, "handle_ship_outcome must write a gate request");
-            // Give the (non-existent) auto-response write a moment to have
-            // happened if it were ever going to — it must not.
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            assert!(
-                gate_answer_files(root, phase, Stage::Ship).is_empty(),
-                "no response may ever be auto-written — the run must wait for a human"
-            );
-
-            // Unblock the poll so the spawned thread finishes.
-            answer_open_gate(
-                root,
-                phase,
-                Stage::Ship,
-                &serde_json::from_str(
-                    r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        });
     }
 
     /// A Code-stage failure must fire a gate AND run the configured notify

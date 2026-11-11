@@ -153,7 +153,6 @@ fn contract_checks<D: AgentDriver + ?Sized>(driver: &D) -> Vec<ContractResult> {
         crate::stage::Stage::Plan,
         crate::stage::Stage::Code,
         crate::stage::Stage::Validate,
-        crate::stage::Stage::Ship,
     ] {
         let intent = crate::prompt::StageIntent::for_stage(stage, PhaseId::new(1));
         let prompt = driver.render_prompt(&intent);
@@ -331,8 +330,8 @@ mod tests {
         let results = antigravity.test_contract();
         assert_eq!(
             results.len(),
-            7,
-            "1 name + 5 per-stage DEVFLOW_RESULT prompts + 1 program"
+            6,
+            "1 name + 4 per-stage DEVFLOW_RESULT prompts + 1 program"
         );
         for result in &results {
             assert!(
@@ -371,8 +370,8 @@ mod tests {
         let results = hermes.test_contract();
         assert_eq!(
             results.len(),
-            7,
-            "1 name + 5 per-stage DEVFLOW_RESULT prompts + 1 program"
+            6,
+            "1 name + 4 per-stage DEVFLOW_RESULT prompts + 1 program"
         );
         for result in &results {
             assert!(
@@ -423,7 +422,7 @@ mod tests {
     }
 
     /// The workflow renderer must preserve the per-stage contracts (code-review
-    /// findings #1-5): Validate verdict, Ship review gate, Define no-op, Plan
+    /// findings #1-5): Validate verdict, Define no-op, Plan
     /// idempotency, and a per-driver workflow root.
     #[test]
     fn workflow_render_preserves_stage_contracts() {
@@ -437,11 +436,6 @@ mod tests {
             codex.render_prompt(&StageIntent::for_stage(Stage::Validate, PhaseId::new(7)));
         assert!(validate.contains("\"verdict\": \"pass\""));
         assert!(validate.contains("\"verdict\": \"gaps\""));
-
-        // Ship keeps the review gate (finding #2).
-        let ship = codex.render_prompt(&StageIntent::for_stage(Stage::Ship, PhaseId::new(7)));
-        assert!(ship.contains("Critical"));
-        assert!(ship.contains("review:"));
 
         // Define is the D-14 no-op (finding #3).
         let define = codex.render_prompt(&StageIntent::for_stage(Stage::Define, PhaseId::new(7)));

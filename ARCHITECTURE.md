@@ -1,9 +1,9 @@
 # Architecture
 
-DevFlow is an opinionated CLI that drives a fixed 5-stage pipeline
-(Define → Plan → Code → Validate → Ship) end-to-end: it launches a coding
+DevFlow is an opinionated CLI that drives a fixed 4-stage pipeline
+(Define → Plan → Code → Validate) end-to-end: it launches a coding
 agent per stage, evaluates whether the agent succeeded, fires human gates at
-Validate/Ship, and ends the run when Validate passes, leaving the worktree and
+Validate, and ends the run when Validate passes, leaving the worktree and
 branch as Validate left them. This document describes the implementation as it
 actually exists; treat the named source files as the source of truth if this
 drifts.
@@ -22,24 +22,23 @@ and any individual coding agent.
 
 ## The Stage machine
 
-The pipeline is a single linear chain of five stages
+The pipeline is a single linear chain of four stages
 (`crates/devflow-core/src/stage.rs`, `enum Stage`):
 
 ```
-Define → Plan → Code → Validate → Ship
+Define → Plan → Code → Validate
 ```
 
-- `Stage::next()` defines the linear transitions; `Ship` is terminal
-  (`next()` returns `None`).
+- `Stage::next()` defines the linear transitions; `Validate` is terminal
+  (`next()` returns `None`), and a passing Validate ends the run.
 - `Stage::is_agent_stage()` is true for `Define`, `Plan`, `Code` — these
   launch a headless coding agent driven by a GSD slash command
   (`Stage::gsd_command()`): `/gsd-discuss-phase {N}`, `/gsd-plan-phase {N}`,
   `/gsd-execute-phase {N}`.
-- `Stage::is_gate()` is true for `Validate` and `Ship` — these may pause the
+- `Stage::is_gate()` is true for `Validate` only — it may pause the
   workflow at a human gate (see [Gate protocol](#gate-protocol)) depending on
   the active `Mode`. Validate also launches an agent
-  (`/gsd-validate-phase {N}`) before its gate decision; Ship's agent step
-  (`/gsd-ship {N}`) is described in [Git and ship model](#git-and-ship-model).
+  (`/gsd-validate-phase {N}`) before its gate decision.
 - `State` (`crates/devflow-core/src/state.rs`) holds `stage`, `phase`,
   `agent`, `mode`, `gate_pending`, `consecutive_failures`, `project_root`,
   and an optional `worktree_path`. It is persisted per-phase — see
@@ -47,8 +46,8 @@ Define → Plan → Code → Validate → Ship
 - `crates/devflow-cli/src/main.rs`'s `advance()` function drives the
   machine: after an agent exits (or a gate resolves), it evaluates the
   result (see [Completion evaluation](#completion-evaluation)) and calls
-  `transition()` to move to the next stage, `handle_validate_outcome()` /
-  `handle_ship_outcome()` for the two gate stages, or
+  `transition()` to move to the next stage, `handle_validate_outcome()`
+  for the gate stage, or
   `handle_stage_failure()` for a never-silent failure gate (WR-11 — any
   non-Validate stage failure fires a gate rather than halting silently).
 
@@ -90,11 +89,6 @@ Agent backends are isolated behind a trait
   - **Validate** — REQUIRES a `verdict: "pass"` or `verdict: "gaps"` field
     distinct from `status`, so `advance()` can tell "the validation task
     ran" apart from "validation passed."
-  - **Ship** — runs `/gsd-code-review {N}` first; if `REVIEW.md` contains
-    any Critical-severity finding, the agent must NOT run `/gsd-ship {N}`
-    and instead reports a `review:`-prefixed failure (looped back to Code
-    with the audit-fix prompt, not gated as a crash). Only a clean review
-    proceeds to `/gsd-ship {N}`.
 
 ## Completion evaluation
 
@@ -119,7 +113,7 @@ four layers, tried in order:
    `Failed`, for every stage. On `exit == 0`, the "zero commits → failed"
    gate applies **only** to `Stage::Plan`/`Stage::Code` (checked explicitly,
    not via `is_agent_stage()`, since that also includes `Define`, which
-   legitimately produces zero commits) — Define/Validate/Ship with
+   legitimately produces zero commits) — Define/Validate with
    `exit == 0` succeed regardless of commit count; Validate's real pass
    signal is its `verdict`, not a commit count.
 3. **Layer 3 — process gone + commits exist (last resort).** If neither the
@@ -331,51 +325,32 @@ backs:
 Branch integration uses `GitFlow::ensure_branch()` (create at a start point
 without checking out).
 
-## Git and ship model
+## Git model
 
 `crates/devflow-core/src/git.rs` (`GitFlow`) implements branch primitives:
 `feature_start(phase)`/`feature_start_force(phase)` (create
 `feature/phase-NN` from `develop`), `push`, `has_remote`,
 `cleanup_merged`. `release_start`/`release_finish` also exist on `GitFlow`
 but are not called from any production CLI path today (only exercised in
-`git.rs`'s own tests) — cutting a `release/{version}` branch and opening a
-PR is not part of the current Ship flow.
+`git.rs`'s own tests).
 
-The real Ship model is **gate-driven, not command-driven**: there is no
-standalone ship subcommand and no separate commands to finalize or undo a
-recorded ship — those do not exist in `enum Command`. Ship works like any
-other stage plus a mandatory terminal gate:
-
-1. `Validate → Ship` transition launches the Ship agent with its dedicated prompt (code
-   review gate, then `/gsd-ship {N}` — see [Agent
-   model](#agent-model)). PR creation, if any, happens inside that GSD
-   command, not in DevFlow's own git primitives.
-2. When the Ship agent exits successfully, `handle_ship_outcome()` **always**
-   fires a Ship gate (`run_gate(..., Stage::Ship, "Ship complete — approve
-   merge?")`) — Ship is never auto-advanced past, regardless of `Mode`.
-3. A human answers via `devflow gate approve <phase> --stage ship [--note
-   ...]` or `devflow gate reject <phase> --note "..." [--stage ship]`
-   (`GateCmd::Approve`/`GateCmd::Reject`, `crates/devflow-cli/src/main.rs`).
-   Approval ends the run as a passing Validate does (`finish_run()`):
-   nothing is merged, bumped, tagged or deleted. A rejection loops
-   back to Code (or aborts, if the note contains "abort").
-4. A Ship-stage **agent crash** (vs. a review rejection) is routed through
-   the same never-silent gate path as any other stage failure
-   (`handle_stage_failure`) — WR-11: no non-Validate stage failure is ever
-   silent.
+DevFlow does not merge, open a pull request, bump a version, tag or delete a
+branch: there is no Ship stage. A passing Validate ends the run
+(`finish_run()`), leaving the worktree and `feature/phase-NN` as Validate left
+them; integrating the branch is the operator's step.
 
 ## Configuration
 
 DevFlow has no initialization step. Workflow options remain CLI flags to
 `devflow start` (`crates/devflow-cli/src/main.rs`, `Command::Start`). An
 optional minimal `devflow.toml` contains only reliability knobs:
-`capture_retention`, `review_angles`, and `external_verify_enabled`.
+`capture_retention` and `external_verify_enabled`.
 
 | Flag | Purpose |
 |---|---|
 | `--phase N` | Phase number to work on |
 | `--agent claude\|codex\|opencode` | Agent to launch |
-| `--mode auto\|supervise` | `auto` gates only at Ship (plus never-silent failure gates); `supervise` also gates every Validate |
+| `--mode auto\|supervise` | `auto` runs unattended and finishes on a passing Validate (gating only on repeated Validate failure, plus never-silent failure gates); `supervise` also gates every Validate |
 | `--force` | Overwrite the feature branch if it already exists |
 | `--no-worktree` | Run in the primary checkout instead of an isolated worktree |
 | `--dry-run` | Print the pipeline that would run without launching anything |
@@ -386,7 +361,7 @@ locking](#per-phase-state-and-locking)). Tunable *runtime behavior* (not
 workflow options) is read from environment variables —
 `DEVFLOW_GATE_NOTIFY_CMD`, `DEVFLOW_GATE_TIMEOUT_SECS`,
 `DEVFLOW_CAPTURE_RETENTION`,
-`DEVFLOW_REVIEW_ANGLES`, `DEVFLOW_EXTERNAL_VERIFY_ENABLED`, `RUST_LOG`,
+`DEVFLOW_EXTERNAL_VERIFY_ENABLED`, `RUST_LOG`,
 `DEVFLOW_LOG_FORMAT` — see
 [OPERATIONS.md](OPERATIONS.md) for the full operator-facing reference.
 
