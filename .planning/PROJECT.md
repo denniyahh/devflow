@@ -499,7 +499,7 @@ seven of the ten (#174, #204, #206, 999.115, 999.116, 999.118, #200), plus 999.1
 
 **v4.0 Session Continuity** — declared 2026-11-08. Requirement IDs in `REQUIREMENTS.md`.
 
-- [ ] Subtract and stabilize (CUT, GATE, OPS)
+- [x] Subtract and stabilize (CUT, GATE, OPS) — Phase 52, complete 2026-11-11 (verification and UAT passed; unreleased: ships as 4.0.0)
 - [ ] The question channel: an MCP ask tool with an operator-gate answer path (ASK)
 - [ ] Decision triage with a calibrated model and a decision ledger (TRIAGE)
 - [ ] Failover generalized to any stage with rotation and utilization-aware routing (FAIL)
@@ -638,6 +638,10 @@ close), confirming the fix. See `.planning/milestones/gsd-hygiene-ROADMAP.md`.)*
 | Dogfooding: DevFlow drives its own phases from Phase 51; every defect is filed as 999.x and never bypassed without approval (operator, 2026-11-04/08) | The point of dogfooding is the defects it produces | ✓ Good — Phase 51 filed 999.183-217; four hand-run exceptions recorded in `51-RUN-NOTES.md` |
 | v3.0.0 closed as an override closeout without a milestone audit; 3.1.0 skipped, Phase 51 ships in 4.0.0 (operator, 2026-11-08) | Five verification digests were stale from later edits while every report passed; v4.0 removes much of what an audit would check | ✓ Accepted |
 | v4.0 direction: DevFlow becomes a detached runner plus an MCP decision channel; Define, Ship, the after-ship hooks, the cron file and `devflow ship` are removed; GSD owns the workflow (operator, 2026-11-08) | Phase 51 by DevFlow needed four by-hand exceptions and produced 24 backlog entries about DevFlow itself; cross-agent continuation is the one thing neither Claude Code nor GSD provides | — Pending (v4.0) |
+| A permitted finish wins over a late `devflow stop`; `stop` answers `already_finished` (operator, 2026-11-11, Phase 52) | Validate already passed, so rerunning it costs an agent run for nothing | ✓ Good — 52-29 |
+| A `start` over a finished run resets the per-phase Validate-failure total to zero; a stopped unfinished run carries it (operator, 2026-11-11) | A finished run passed Validate, so its old failures say nothing about the next run | ✓ Good — 96f90b1 |
+| An ambiguous Validate verdict always gates, in every GSD status and mode, touching no counter (operator, 2026-11-11, code review CR-01) | Routing it by GSD's status in auto mode let a run loop with no ceiling | ✓ Good — bc88f9a |
+| No `--force` deletes an unmerged phase branch; the overloaded `--force` flags are to be replaced by named actions (operator, 2026-11-11, code review CR-02) | In v4 a finished run's branch is the only copy of its work until close-out; one flag authorised several unrelated destructive actions | ✓ Interim fix 3f0714f — redesign is backlog 999.224 |
 
 ## Key Files
 
