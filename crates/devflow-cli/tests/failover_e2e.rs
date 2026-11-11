@@ -550,15 +550,18 @@ fn a_handoff_to_antigravity_that_fails_its_canary_ends_at_a_gate() {
         events[failed]
     );
     assert_eq!(events[gated]["stage"], "code", "{}", events[gated]);
+    let context = events[gated]["context"].as_str().unwrap_or_default();
+    let body = context.strip_prefix("[never-silent] ").unwrap_or(context);
+    let way_on = body.find(&format!("`devflow resume --phase {phase} --agent <other>`"));
+    let cause = body.find("the handoff to antigravity could not relaunch the code stage");
     assert!(
-        events[gated]["context"]
-            .as_str()
-            .is_some_and(|context| context.contains(&format!(
-                "a retry or loop-back will not relaunch under antigravity (its recorded \
-             delivery canary refuses it); answer the gate, then run `devflow resume --phase \
-             {phase} --agent <other>`."
-            ))),
-        "the gate names the way on: {}",
+        matches!((way_on, cause), (Some(way_on), Some(cause)) if way_on < cause),
+        "the gate names the way on before the cause: {}",
+        events[gated]
+    );
+    assert!(
+        !context.contains("a retry or loop-back will not relaunch under"),
+        "the removed hand-written lead is gone: {}",
         events[gated]
     );
 

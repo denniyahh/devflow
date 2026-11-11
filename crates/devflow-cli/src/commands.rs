@@ -7844,10 +7844,12 @@ mod tests {
         );
     }
 
-    /// When the recorded delivery canary refuses the run's agent, the failure gate's way
-    /// on (`devflow resume --phase N --agent <other>`) stays visible in the pending-gate
-    /// banner, `gate list` and the all-roots row even when the reason is long enough to be
-    /// capped. Control: a run whose recorded canary admits its agent carries no way on.
+    /// When the recorded delivery canary refuses the run's agent, the context the
+    /// stage-failure gate writer builds leads with the routers' relaunch-refused
+    /// sentence, and its way on (`devflow resume --phase N --agent <other>`) stays
+    /// visible in the pending-gate banner, `gate list` and the all-roots row even when
+    /// the reason is long enough to be capped. Control: a run whose recorded canary
+    /// admits its agent names no `--agent <other>`.
     #[test]
     fn the_failure_gate_way_on_survives_the_banner_and_gate_list_for_a_long_reason() {
         let dir = tempfile::tempdir().unwrap();
@@ -7870,7 +7872,18 @@ mod tests {
             Stage::Code,
             Some(reason.clone()),
         );
-        assert!(context.contains(way_on), "{context}");
+        let refusal = crate::pipeline_launch::recorded_canary_refusal(&state);
+        let sentence = crate::pipeline_outcomes::way_on_sentence(
+            devflow_core::gates::GateKind::StageFailure,
+            PhaseId::new(9999),
+            Stage::Code,
+            refusal.as_deref(),
+        );
+        assert!(
+            context.starts_with(&format!("[never-silent] {sentence}")),
+            "the writer leads with the routers' sentence: {context}"
+        );
+        assert!(sentence.contains(way_on), "{sentence}");
         Gates::write_gate(
             dir.path(),
             PhaseId::new(9999),
@@ -7889,17 +7902,13 @@ mod tests {
             ("banner", &banner),
         ] {
             assert!(text.contains(way_on), "{rendering} cut the way on: {text}");
-            assert!(
-                text.contains("will not relaunch under antigravity"),
-                "{rendering} cut the way on: {text}"
-            );
         }
 
         state.canary = Some(devflow_core::canary::CanaryOutcome::Confirmed);
         let admitted =
             crate::pipeline_outcomes::failure_gate_context(&state, Stage::Code, Some(reason));
         assert!(
-            !admitted.contains("will not relaunch") && !admitted.contains("--agent <other>"),
+            !admitted.contains("--agent <other>"),
             "control: an admitting canary names no way on: {admitted}"
         );
     }

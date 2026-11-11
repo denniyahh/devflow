@@ -7829,6 +7829,428 @@ mod tests {
         assert!(after.gap_closure_pass, "control: the gap marker is set");
     }
 
+    // ---- 52-33 Task 3 (GATE-04, W3, D-39, C2): one way on per gate ---------
+
+    /// The answer words no text after a gate's way-on sentence may hold.
+    const ANSWER_WORDS: [&str; 7] = [
+        "approve",
+        "reject",
+        "abort",
+        "retry",
+        "ship",
+        "loop back",
+        "loop-to-code",
+    ];
+
+    /// `Ok` when `context` starts with `sentence`, after a leading
+    /// `[never-silent]` marker if it has one, and the text after the sentence
+    /// names no answer; otherwise why not.
+    fn leads_with_only(context: &str, sentence: &str) -> Result<(), String> {
+        let body = context.strip_prefix("[never-silent] ").unwrap_or(context);
+        let rest = body
+            .strip_prefix(sentence)
+            .ok_or_else(|| format!("the context does not start with the sentence: {context}"))?;
+        let lower = rest.to_lowercase();
+        match ANSWER_WORDS.iter().find(|word| lower.contains(*word)) {
+            Some(word) => Err(format!(
+                "the text after the sentence names `{word}`: {rest}"
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// GATE-04, W3, D-39, C2: every gate writer leads its context with the
+    /// sentence `way_on_sentence` renders for that gate from `approve_route`
+    /// and `reject_route`, after any `[never-silent]` marker, and names no
+    /// answer after it. Rows: each verification writer (the Validate outcome's
+    /// kinds, both ceiling clauses, the two reopens and the two gaps Plan
+    /// gates), the stage-failure gate at Plan, Code and Validate, the preflight
+    /// gate and the checkpoint-declaration gate. A verification gate's approve
+    /// clause states the finish rule (U10), so a `clean_pass` gate over
+    /// `passed` with the PASS on HEAD and a `gaps_found` gate carry the same
+    /// one. Canary rows: under a refusing delivery canary the stage-failure
+    /// gate leads with the relaunch-refused route at every stage. Planted
+    /// controls fail the same check: the old failure-cap and preflight answer
+    /// texts after the sentence, the sentence after the cause, an approve
+    /// clause that says approve finishes, and the admitting-canary sentence on
+    /// a refusing run.
+    #[test]
+    fn every_gate_names_only_the_routes_its_answers_run() {
+        if !in_bounded_child(
+            "pipeline_outcomes::tests::every_gate_names_only_the_routes_its_answers_run",
+        ) {
+            return;
+        }
+        let verification_sentence =
+            |phase: PhaseId| way_on_sentence(GateKind::CleanPass, phase, Stage::Validate, None);
+        let check = |row: &str, context: &str, sentence: &str| {
+            if let Err(why) = leads_with_only(context, sentence) {
+                panic!("{row}: {why}");
+            }
+        };
+        let mut verification_contexts: Vec<(String, String)> = Vec::new();
+
+        // The Validate outcome's verification writers.
+        // (mode, outcome, GSD status, kind, streak, per-phase total)
+        type WriterRow = (
+            Mode,
+            ValidateOutcome,
+            Option<GsdStatus>,
+            &'static str,
+            u32,
+            u32,
+        );
+        let rows: [WriterRow; 11] = [
+            (
+                Mode::Supervise,
+                ValidateOutcome::Passed,
+                Some(GsdStatus::Passed),
+                "clean_pass",
+                0,
+                0,
+            ),
+            (
+                Mode::Supervise,
+                ValidateOutcome::Passed,
+                Some(GsdStatus::GapsFound),
+                "gaps_found",
+                0,
+                0,
+            ),
+            (
+                Mode::Supervise,
+                ValidateOutcome::Passed,
+                Some(GsdStatus::Stale),
+                "reverify_needed",
+                0,
+                0,
+            ),
+            (
+                Mode::Auto,
+                ValidateOutcome::Passed,
+                Some(GsdStatus::HumanNeeded),
+                "human_needed",
+                0,
+                0,
+            ),
+            (
+                Mode::Auto,
+                ValidateOutcome::Failed,
+                Some(GsdStatus::Passed),
+                "disagreement_over_passed",
+                0,
+                0,
+            ),
+            (
+                Mode::Auto,
+                ValidateOutcome::Failed,
+                Some(GsdStatus::HumanNeeded),
+                "disagreement_over_human_needed",
+                0,
+                0,
+            ),
+            (
+                Mode::Auto,
+                ValidateOutcome::Ambiguous("no verdict".into()),
+                Some(GsdStatus::Passed),
+                "ambiguous_verdict",
+                0,
+                0,
+            ),
+            (
+                Mode::Auto,
+                ValidateOutcome::Failed,
+                Some(GsdStatus::GapsFound),
+                "failure_cap",
+                mode::MAX_CONSECUTIVE_FAILURES - 1,
+                0,
+            ),
+            (
+                Mode::Auto,
+                ValidateOutcome::Passed,
+                None,
+                "reader_failure",
+                0,
+                0,
+            ),
+            // The two ceiling clauses: a clean pass at the ceiling, and a
+            // counted failure that reaches it.
+            (
+                Mode::Supervise,
+                ValidateOutcome::Passed,
+                Some(GsdStatus::Passed),
+                "failure_cap",
+                0,
+                mode::MAX_PHASE_VALIDATE_FAILURES,
+            ),
+            (
+                Mode::Supervise,
+                ValidateOutcome::Failed,
+                Some(GsdStatus::Passed),
+                "disagreement_over_passed",
+                0,
+                mode::MAX_PHASE_VALIDATE_FAILURES - 1,
+            ),
+        ];
+        for (index, (mode, outcome, status, kind, streak, total)) in rows.into_iter().enumerate() {
+            let row = format!("{kind} over {status:?} (total {total})");
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = PhaseId::new(5700 + u32::try_from(index).unwrap());
+            let replies: Vec<&str> = status.map(gsd_says).into_iter().collect();
+            let _gsd = validate_evidence(root, phase, &replies);
+            let mut state = validate_state(root, phase, mode);
+            state.consecutive_failures = streak;
+            state.phase_validate_failures = total;
+            workflow::save_state(&state).unwrap();
+            let (gate, _) = at_the_validate_gate(root, phase, &abort_answer(), || {
+                let _ = handle_validate_outcome(root, &mut state, outcome);
+            });
+            assert_eq!(gate["gate_kind"], kind, "{row}: {gate}");
+            let context = gate["context"].as_str().unwrap().to_string();
+            check(&row, &context, &verification_sentence(phase));
+            verification_contexts.push((kind.to_string(), context));
+        }
+
+        // The reopens: an approve over a fresh `human_needed`, and over a read
+        // that fails.
+        for (index, (replies, reopened)) in [
+            (vec![gsd_says(GsdStatus::HumanNeeded); 2], "human_needed"),
+            (vec![gsd_says(GsdStatus::HumanNeeded)], "reader_failure"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = PhaseId::new(5720 + u32::try_from(index).unwrap());
+            let _gsd = validate_evidence(root, phase, &replies);
+            let mut state = validate_state(root, phase, Mode::Auto);
+            let gates = at_the_gates(
+                root,
+                phase,
+                Stage::Validate,
+                &[approve_answer(), abort_answer()],
+                || {
+                    let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Passed);
+                },
+            );
+            assert_eq!(gates[1]["gate_kind"], reopened, "{:?}", gates[1]);
+            let context = gates[1]["context"].as_str().unwrap();
+            check(
+                &format!("reopen {reopened}"),
+                context,
+                &verification_sentence(phase),
+            );
+        }
+
+        // The gaps Plan gates: no new gap plan, at and below the ceiling, and
+        // a post-check that cannot read the plans.
+        for (index, total) in [0, mode::MAX_PHASE_VALIDATE_FAILURES - 1]
+            .into_iter()
+            .enumerate()
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = PhaseId::new(5730 + u32::try_from(index).unwrap());
+            let (mut state, _) = gaps_plan_fixture(root, phase, false);
+            state.phase_validate_failures = total;
+            workflow::save_state(&state).unwrap();
+            let _gsd = GsdStub::answering(root, &[]);
+            let gate = gaps_plan_gate(root, &mut state);
+            assert_eq!(gate["gate_kind"], "no_gap_closure_plan", "{gate}");
+            let context = gate["context"].as_str().unwrap();
+            check(
+                &format!("no_gap_closure_plan (total {total})"),
+                context,
+                &way_on_sentence(GateKind::NoGapClosurePlan, phase, Stage::Plan, None),
+            );
+            verification_contexts.push(("no_gap_closure_plan".into(), context.to_string()));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5735);
+        let (mut state, report_at) = gaps_plan_fixture(root, phase, true);
+        write_dated(
+            root,
+            phase,
+            &format!("{}-03-PLAN.md", phase.padded()),
+            &plan_text(phase, "03", true),
+            report_at + FIXTURE_SPACING_SECS,
+        );
+        let _gsd = GsdStub::answering(root, &["not json"]);
+        let gate = gaps_plan_gate(root, &mut state);
+        assert_eq!(gate["gate_kind"], "reader_failure", "{gate}");
+        check(
+            "gaps Plan reader_failure",
+            gate["context"].as_str().unwrap(),
+            &way_on_sentence(GateKind::ReaderFailure, phase, Stage::Plan, None),
+        );
+
+        // U10: every verification gate carries the same approve clause, the
+        // rule, whatever evidence it was opened over.
+        let sentence = verification_sentence(PhaseId::new(1));
+        assert!(
+            sentence.contains("approve: reads GSD's verification status again")
+                && sentence
+                    .contains("`passed` with a Validate pass on this commit over a clean tree"),
+            "the approve clause states the finish rule: {sentence}"
+        );
+        for (kind, context) in &verification_contexts {
+            assert!(
+                context.contains(&sentence),
+                "{kind}: the same approve clause as every verification gate: {context}"
+            );
+        }
+        // Control: an approve clause that predicts the finish fails the check.
+        let predicted = sentence.replace(VERIFICATION_APPROVE_RULE, "finishes the run");
+        assert_ne!(predicted, sentence, "the planted clause differs");
+        assert!(
+            leads_with_only(&format!("{predicted} GSD verification: passed."), &sentence).is_err(),
+            "control: a predicted approve route fails"
+        );
+
+        // The stage-failure gate at Plan, Code and Validate, with its canary
+        // rows and their controls.
+        let refusal = "background-task notification delivery is ABSENT";
+        for (index, stage) in [Stage::Plan, Stage::Code, Stage::Validate]
+            .into_iter()
+            .enumerate()
+        {
+            for (offset, canary) in [
+                devflow_core::canary::CanaryOutcome::Confirmed,
+                devflow_core::canary::CanaryOutcome::Absent,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let refuses = offset == 1;
+                let row = format!("stage failure at {stage}, canary refuses: {refuses}");
+                let dir = tempfile::tempdir().unwrap();
+                let root = dir.path();
+                let phase = PhaseId::new(5740 + u32::try_from(index * 2 + offset).unwrap());
+                let mut state = State::new(
+                    phase,
+                    AgentKind::Claude,
+                    Mode::Supervise,
+                    root.to_path_buf(),
+                );
+                state.stage = stage;
+                state.canary = Some(canary);
+                workflow::save_state(&state).unwrap();
+                assert_eq!(recorded_canary_refusal(&state).is_some(), refuses, "{row}");
+                let (gate, _) = at_the_gate(root, phase, stage, &abort_answer(), || {
+                    let _ = handle_stage_failure(
+                        root,
+                        &mut state,
+                        stage,
+                        Some("the agent exited with status 1".into()),
+                    );
+                });
+                assert_eq!(gate["gate_kind"], "stage_failure", "{row}: {gate}");
+                let context = gate["context"].as_str().unwrap();
+                let admitting = way_on_sentence(GateKind::StageFailure, phase, stage, None);
+                let refusing = way_on_sentence(GateKind::StageFailure, phase, stage, Some(refusal));
+                let resume = format!("`devflow resume --phase {phase} --agent <other>`");
+                if refuses {
+                    check(&row, context, &refusing);
+                    assert!(
+                        refusing.contains("approve or reject with a note: stops the run")
+                            && refusing.contains(&resume),
+                        "{row}: {refusing}"
+                    );
+                    // Control: the admitting sentence on a refusing run fails.
+                    let planted = context.replacen(&refusing, &admitting, 1);
+                    assert!(
+                        leads_with_only(&planted, &refusing).is_err(),
+                        "{row}: control: {planted}"
+                    );
+                } else {
+                    check(&row, context, &admitting);
+                    assert!(
+                        admitting.contains(&format!("approve: retries the {stage} stage"))
+                            && admitting.contains(&format!(
+                                "reject with a note: relaunches the {stage} stage with the note"
+                            ))
+                            && !admitting.contains("--agent <other>"),
+                        "{row}: {admitting}"
+                    );
+                }
+            }
+        }
+
+        // The preflight gate and the checkpoint-declaration gate: reject is
+        // not offered.
+        let phase = PhaseId::new(5750);
+        let preflight =
+            crate::preflight::preflight_gate_context(phase, Stage::Code, "the driver check failed");
+        let preflight_sentence = way_on_sentence(GateKind::Preflight, phase, Stage::Code, None);
+        check("preflight", &preflight, &preflight_sentence);
+        assert!(
+            preflight_sentence.contains("reject: not offered"),
+            "{preflight_sentence}"
+        );
+        let declaration = devflow_core::verify::CheckpointDeclaration {
+            plan_file: format!("{}-01-PLAN.md", phase.padded()),
+            element: "<task type=\"checkpoint:human-action\"></task>".into(),
+            blocking_human: false,
+            human_action: true,
+        };
+        for mode in [Mode::Auto, Mode::Supervise] {
+            let rescan = crate::pipeline_launch::rescan_gate_context(
+                phase,
+                Stage::Code,
+                &[&declaration],
+                mode,
+            );
+            let rescan_sentence =
+                way_on_sentence(GateKind::CheckpointDeclaration, phase, Stage::Code, None);
+            check(
+                &format!("checkpoint declaration ({mode:?})"),
+                &rescan,
+                &rescan_sentence,
+            );
+            assert!(
+                rescan_sentence.contains("reject: not offered"),
+                "{rescan_sentence}"
+            );
+        }
+
+        // Planted controls: old answer texts after the sentence, and the
+        // sentence after the cause.
+        let ceiling = "The per-phase ceiling of 3 is reached: this run is paused for a human, \
+                       not aborted — approve to ship, reject to loop back for another pass, or \
+                       abort.";
+        let cause = "The validate agent reported fail. GSD verification: passed.";
+        for (row, planted) in [
+            (
+                "old failure-cap text",
+                format!("{sentence} {cause} {ceiling}"),
+            ),
+            (
+                "old preflight text",
+                format!(
+                    "[never-silent] {preflight_sentence} preflight failed for stage code: x — \
+                     human review needed (retry, loop-to-code, or abort)"
+                ),
+            ),
+            (
+                "the sentence after the cause",
+                format!("{cause} {sentence}"),
+            ),
+        ] {
+            let expected = if row == "old preflight text" {
+                &preflight_sentence
+            } else {
+                &sentence
+            };
+            assert!(
+                leads_with_only(&planted, expected).is_err(),
+                "control ({row}) must fail: {planted}"
+            );
+        }
+    }
+
     // ---- 52-29 Task 2 (GATE-02, D-10, D-39, R10): one dispatch by family ----
 
     use crate::test_support::every_gate_kind;
