@@ -72,8 +72,14 @@ fn explicit_clean_with_a_registered_waiter_fails_and_cleans_nothing() {
     save_state_aged(root, phase, 60);
     let state_path = devflow_core::workflow::state_path(root, phase);
     let before = std::fs::read(&state_path).unwrap();
-    let (opened, registration) = Gates::open_registered(root, phase, Stage::Code, "waiting")
-        .expect("register as the gate's waiter");
+    let (opened, registration) = Gates::open_registered(
+        root,
+        phase,
+        Stage::Code,
+        devflow_core::gates::GateKind::StageFailure,
+        "waiting",
+    )
+    .expect("register as the gate's waiter");
     let gate_before = std::fs::read(&opened.path).unwrap();
 
     let output = recover_clean(root, Some(phase));
@@ -173,9 +179,14 @@ fn explicit_clean_with_an_unheld_registration_cleans() {
     init_repo(root);
     let phase = PhaseId::new(65);
     save_state_aged(root, phase, 60);
-    let (opened, registration) =
-        Gates::open_registered(root, phase, Stage::Code, "wedged at a crashed waiter")
-            .expect("register as the gate's waiter");
+    let (opened, registration) = Gates::open_registered(
+        root,
+        phase,
+        Stage::Code,
+        devflow_core::gates::GateKind::StageFailure,
+        "wedged at a crashed waiter",
+    )
+    .expect("register as the gate's waiter");
     let waiter = Gates::waiter_path(root, phase, Stage::Code, &opened.gate_id);
     drop(registration);
     assert!(waiter.exists(), "precondition: the crash leaves the file");
@@ -215,8 +226,14 @@ fn inspect_prints_why_a_phase_may_be_live() {
     let (waited, idle) = (PhaseId::new(73), PhaseId::new(74));
     save_state_aged(root, waited, 60);
     save_state_aged(root, idle, 60);
-    let (_opened, registration) = Gates::open_registered(root, waited, Stage::Code, "waiting")
-        .expect("register as the gate's waiter");
+    let (_opened, registration) = Gates::open_registered(
+        root,
+        waited,
+        Stage::Code,
+        devflow_core::gates::GateKind::StageFailure,
+        "waiting",
+    )
+    .expect("register as the gate's waiter");
     let home = common::HermeticHome::new();
 
     let output = common::hermetic_devflow(&home)
@@ -244,9 +261,15 @@ fn sweep_names_the_markers_it_removed_and_the_answers_it_kept() {
     let root = dir.path();
     init_repo(root);
     let phase = PhaseId::new(75);
-    let gate = Gates::open_gate(root, phase, Stage::Code, "ctx")
-        .unwrap()
-        .gate_id;
+    let gate = Gates::open_gate(
+        root,
+        phase,
+        Stage::Code,
+        devflow_core::gates::GateKind::StageFailure,
+        "ctx",
+    )
+    .unwrap()
+    .gate_id;
     Gates::answer(
         root,
         phase,
@@ -414,6 +437,7 @@ fn sweep_removes_and_names_orphan_gate_files() {
         root,
         phase,
         devflow_core::stage::Stage::Code,
+        devflow_core::gates::GateKind::StageFailure,
         "orphaned",
     )
     .unwrap();

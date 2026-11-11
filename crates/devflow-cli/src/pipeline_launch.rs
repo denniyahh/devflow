@@ -34,7 +34,7 @@ use crate::preflight::{
 };
 use devflow_core::config::capture_retention;
 use devflow_core::gates::{
-    AwaitOutcome, ClaimedAnswer, CloseReport, GateAction, GateAnswer, GateId, Gates,
+    AwaitOutcome, ClaimedAnswer, CloseReport, GateAction, GateAnswer, GateId, GateKind, Gates,
 };
 use devflow_core::mode::Mode;
 use devflow_core::outcome_policy::{self, Action};
@@ -3807,7 +3807,7 @@ pub(crate) fn advance_with(
                                 project_root,
                                 &mut state,
                                 stage,
-                                None,
+                                GateKind::CheckpointDeclaration,
                                 &context,
                                 gate_timeout_secs(),
                             )?;
@@ -4807,6 +4807,7 @@ mod tests {
             root,
             phase,
             stage,
+            devflow_core::gates::GateKind::StageFailure,
             "[never-silent] stage failed — human review needed",
         )
         .unwrap();
@@ -4837,7 +4838,14 @@ mod tests {
         phase: PhaseId,
         stage: Stage,
     ) -> devflow_core::gates::GateId {
-        let opened = Gates::open_gate(root, phase, stage, "planted claimed answer").unwrap();
+        let opened = Gates::open_gate(
+            root,
+            phase,
+            stage,
+            devflow_core::gates::GateKind::StageFailure,
+            "planted claimed answer",
+        )
+        .unwrap();
         Gates::answer(
             root,
             phase,
@@ -9752,7 +9760,7 @@ mod tests {
                 &root,
                 &mut state,
                 Stage::Code,
-                None,
+                devflow_core::gates::GateKind::StageFailure,
                 "a foreground gate",
                 300,
             );
@@ -14105,7 +14113,14 @@ mod tests {
         let g1 = gate_id_at(&root, phase, stage);
         supersede(&root, phase, X);
 
-        let (opened, registration) = Gates::open_registered(&root, phase, stage, "g2").unwrap();
+        let (opened, registration) = Gates::open_registered(
+            &root,
+            phase,
+            stage,
+            devflow_core::gates::GateKind::StageFailure,
+            "g2",
+        )
+        .unwrap();
         let g2 = opened.gate_id.clone();
         let response = devflow_core::gates::GateResponse {
             approved: true,

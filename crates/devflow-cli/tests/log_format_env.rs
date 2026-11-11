@@ -163,8 +163,14 @@ fn project_with_open_gate(
     stage: Stage,
 ) -> (tempfile::TempDir, devflow_core::gates::WaiterRegistration) {
     let dir = tempfile::tempdir().expect("create tempdir");
-    let (_, registration) =
-        Gates::open_registered(dir.path(), phase, stage, "test gate").expect("open gate");
+    let (_, registration) = Gates::open_registered(
+        dir.path(),
+        phase,
+        stage,
+        devflow_core::gates::GateKind::StageFailure,
+        "test gate",
+    )
+    .expect("open gate");
     (dir, registration)
 }
 

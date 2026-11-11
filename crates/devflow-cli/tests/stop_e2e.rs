@@ -367,9 +367,15 @@ fn stop_says_a_claimed_gate_was_not_answered_again() {
     state.stage = Stage::Validate;
     state.gate_pending = true;
     devflow_core::workflow::save_state(&state).unwrap();
-    let gate = Gates::open_gate(root, phase, Stage::Validate, "finish")
-        .unwrap()
-        .gate_id;
+    let gate = Gates::open_gate(
+        root,
+        phase,
+        Stage::Validate,
+        devflow_core::gates::GateKind::StageFailure,
+        "finish",
+    )
+    .unwrap()
+    .gate_id;
     let response = GateResponse {
         approved: true,
         abort: false,
@@ -414,7 +420,14 @@ fn stop_says_a_held_gate_lock_left_its_gate_unanswered() {
     state.stage = Stage::Code;
     state.gate_pending = true;
     devflow_core::workflow::save_state(&state).unwrap();
-    let (_opened, registration) = Gates::open_registered(root, phase, Stage::Code, "g").unwrap();
+    let (_opened, registration) = Gates::open_registered(
+        root,
+        phase,
+        Stage::Code,
+        devflow_core::gates::GateKind::StageFailure,
+        "g",
+    )
+    .unwrap();
     let gate_lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -461,7 +474,14 @@ fn stop_at_a_gate_with_an_unconfirmable_holder_refuses_unevidenced_success() {
     devflow_core::workflow::save_state(&state).unwrap();
     let before = std::fs::read(&state_path).unwrap();
     let _hold = hold_phase_with_record(root, phase, holder.id(), None);
-    Gates::write_gate(root, phase, Stage::Code, "paused").unwrap();
+    Gates::write_gate(
+        root,
+        phase,
+        Stage::Code,
+        devflow_core::gates::GateKind::StageFailure,
+        "paused",
+    )
+    .unwrap();
 
     let output = common::hermetic_devflow(&home)
         .args(["stop", "--phase", &phase.to_string(), "--root"])
@@ -517,7 +537,14 @@ fn stop_does_not_treat_a_stale_gate_as_the_live_holders_wait() {
     devflow_core::workflow::save_state(&state).unwrap();
 
     let mut holder = spawn_holder_child(NAME, root, phase);
-    Gates::write_gate(root, phase, Stage::Code, "stale request").unwrap();
+    Gates::write_gate(
+        root,
+        phase,
+        Stage::Code,
+        devflow_core::gates::GateKind::StageFailure,
+        "stale request",
+    )
+    .unwrap();
 
     let output = common::hermetic_devflow(&home)
         .args(["stop", "--phase", &phase.to_string(), "--root"])
@@ -568,7 +595,14 @@ fn gate_approve_with_no_registered_waiter_does_not_claim_advance() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(110);
-    Gates::write_gate(root, phase, Stage::Validate, "approve the finish").unwrap();
+    Gates::write_gate(
+        root,
+        phase,
+        Stage::Validate,
+        devflow_core::gates::GateKind::StageFailure,
+        "approve the finish",
+    )
+    .unwrap();
 
     let output = common::hermetic_devflow(&home)
         .args(["gate", "approve", &phase.to_string(), "--project"])
@@ -749,7 +783,14 @@ fn stop_marks_state_stopped_and_records_reason() {
     let root = dir.path();
     let phase = PhaseId::new(96);
 
-    Gates::write_gate(root, phase, Stage::Validate, "approve the finish?").unwrap();
+    Gates::write_gate(
+        root,
+        phase,
+        Stage::Validate,
+        devflow_core::gates::GateKind::StageFailure,
+        "approve the finish?",
+    )
+    .unwrap();
     let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
     state.stage = Stage::Validate;
     state.gate_pending = true;
@@ -881,8 +922,14 @@ fn stop_is_idempotent_against_an_already_answered_gate() {
     state.stage = Stage::Validate;
     state.gate_pending = true;
     devflow_core::workflow::save_state(&state).unwrap();
-    let (_opened, registration) =
-        Gates::open_registered(root, phase, Stage::Validate, "approve validation?").unwrap();
+    let (_opened, registration) = Gates::open_registered(
+        root,
+        phase,
+        Stage::Validate,
+        devflow_core::gates::GateKind::StageFailure,
+        "approve validation?",
+    )
+    .unwrap();
 
     let run_stop = || {
         common::hermetic_devflow(&home)
@@ -928,12 +975,24 @@ fn gate_approve_takes_the_id_gate_list_shows_and_refuses_a_replaced_one() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(111);
-    let g1 = Gates::open_gate(root, phase, Stage::Validate, "first")
-        .unwrap()
-        .gate_id;
+    let g1 = Gates::open_gate(
+        root,
+        phase,
+        Stage::Validate,
+        devflow_core::gates::GateKind::StageFailure,
+        "first",
+    )
+    .unwrap()
+    .gate_id;
     Gates::close(root, phase, Stage::Validate).unwrap();
-    let (opened, registration) =
-        Gates::open_registered(root, phase, Stage::Validate, "second").unwrap();
+    let (opened, registration) = Gates::open_registered(
+        root,
+        phase,
+        Stage::Validate,
+        devflow_core::gates::GateKind::StageFailure,
+        "second",
+    )
+    .unwrap();
     let g2 = opened.gate_id;
     let approve_with = |gate_id: &str| {
         common::hermetic_devflow(&home)
@@ -981,7 +1040,14 @@ fn stop_against_a_hand_written_response_is_a_success_no_op() {
     let root = dir.path();
     let phase = PhaseId::new(100);
 
-    Gates::write_gate(root, phase, Stage::Validate, "approve the finish?").unwrap();
+    Gates::write_gate(
+        root,
+        phase,
+        Stage::Validate,
+        devflow_core::gates::GateKind::StageFailure,
+        "approve the finish?",
+    )
+    .unwrap();
     let response_path = answer_open_gate(
         root,
         phase,
@@ -2357,6 +2423,7 @@ fn recover_clean_refuses_while_the_supervisor_is_alive() {
         &run.root,
         run.phase,
         Stage::Validate,
+        devflow_core::gates::GateKind::StageFailure,
         "planted gate",
     )
     .expect("plant a gate file");

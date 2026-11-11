@@ -765,7 +765,10 @@ fn validate_gate_context(
         | GateKind::AmbiguousVerdict
         | GateKind::FailureCap
         | GateKind::ReaderFailure
-        | GateKind::NoGapClosurePlan => "",
+        | GateKind::NoGapClosurePlan
+        | GateKind::StageFailure
+        | GateKind::Preflight
+        | GateKind::CheckpointDeclaration => "",
     });
     // WR-04 (35-REVIEW): the ceiling clause belongs on every Validate gate that
     // fired at the ceiling, a passing one included, or an operator running
@@ -949,7 +952,7 @@ pub(crate) fn handle_validate_outcome(
                 project_root,
                 state,
                 Stage::Validate,
-                Some(kind),
+                kind,
                 &context,
                 &event_context,
             )?;
@@ -1259,7 +1262,7 @@ fn answer_stage_failure_gate(
     stage: Stage,
     context: &str,
 ) -> Result<(), CliError> {
-    match run_gate(project_root, state, stage, None, context)? {
+    match run_gate(project_root, state, stage, GateKind::StageFailure, context)? {
         GateAction::Advance => {
             // CR-01: close the gate before retrying; its answer is spent.
             let _ = close_gate(project_root, state.phase, stage);
@@ -5269,7 +5272,14 @@ mod tests {
         );
 
         // The phase reaching the same gate again waits for a fresh decision.
-        let refired = Gates::open_gate(root, phase, Stage::Code, "re-fired gate").unwrap();
+        let refired = Gates::open_gate(
+            root,
+            phase,
+            Stage::Code,
+            devflow_core::gates::GateKind::StageFailure,
+            "re-fired gate",
+        )
+        .unwrap();
         let started = std::time::Instant::now();
         let end = crate::pipeline_launch::wait_for_gate_response(
             root,

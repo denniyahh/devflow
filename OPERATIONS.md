@@ -409,7 +409,11 @@ What a run records:
   paths, so it goes only to the gate context and stderr, never to an event.
 - Every gate file records which gate it is in `gate_kind` (for example
   `clean_pass`, `gaps_found`, `reverify_needed`, `reader_failure`,
-  `failure_cap`), and the `gate_fired` event carries the same value.
+  `failure_cap`), and the `gate_fired` event carries the same value. Gates
+  outside Validate's routes record one too: `stage_failure` for a failed stage
+  at any stage (a rate-limit gate included), `preflight` for a failed preflight
+  check and `checkpoint_declaration` for an unapproved human-only checkpoint.
+  A gate file written by a 3.x binary has no `gate_kind` and still loads.
 - An agent pass is recorded in the state file's `validate_pass_head`, the
   commit the Validate ran on; any other verdict clears it. A commit that cannot
   be read stops at the `[never-silent]` gate.

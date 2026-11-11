@@ -89,7 +89,14 @@ fn all_eight_devflow_constructors_produce_the_gitignore() {
     {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        Gates::write_gate(root, PhaseId::new(1), Stage::Validate, "context").expect("write_gate");
+        Gates::write_gate(
+            root,
+            PhaseId::new(1),
+            Stage::Validate,
+            devflow_core::gates::GateKind::StageFailure,
+            "context",
+        )
+        .expect("write_gate");
         if !gitignore_is_star(root) {
             failures.push("gates::Gates::write_gate (gates.rs)");
         }
