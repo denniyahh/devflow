@@ -3717,6 +3717,11 @@ pub(crate) fn advance_with(
     // through into the success arm below.
     match outcome_policy::decide_action(stage, result.status) {
         Action::Advance => match stage {
+            // GATE-03 (Pitfall 5): a gaps Plan pass must have written a new
+            // gap-closure plan before the gaps-only Code pass runs.
+            Stage::Plan if state.gap_closure_pass => {
+                crate::pipeline_outcomes::handle_gaps_plan_outcome(project_root, &mut state)
+            }
             Stage::Plan => transition(project_root, &mut state, Stage::Code),
             Stage::Code => transition(project_root, &mut state, Stage::Validate),
             Stage::Validate => {
