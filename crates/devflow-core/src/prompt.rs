@@ -519,15 +519,42 @@ pub fn render_claude_style(intent: &StageIntent) -> String {
 /// Validate verdict, Plan idempotency — but the
 /// instruction references the workflow file under `workflow_root` (a per-driver
 /// path) instead of naming a slash command.
+///
+/// The intent's notes go through the same [`note_block`] as the claude style,
+/// in the same place: just before the completion contract, fix request first.
 pub fn render_workflow_style(intent: &StageIntent, workflow_root: &str) -> String {
     match intent {
-        StageIntent::Plan { phase, .. } => workflow_plan_prompt(*phase, workflow_root),
-        StageIntent::Code { phase, fix, .. } => workflow_code_prompt(*phase, *fix, workflow_root),
-        StageIntent::Validate { phase, .. } => workflow_validate_prompt(*phase, workflow_root),
+        StageIntent::Plan {
+            phase,
+            relaunch_note,
+        } => workflow_plan_prompt(
+            *phase,
+            workflow_root,
+            &note_blocks(None, relaunch_note.as_deref()),
+        ),
+        StageIntent::Code {
+            phase,
+            fix,
+            fix_note,
+            relaunch_note,
+        } => workflow_code_prompt(
+            *phase,
+            *fix,
+            workflow_root,
+            &note_blocks(fix_note.as_deref(), relaunch_note.as_deref()),
+        ),
+        StageIntent::Validate {
+            phase,
+            relaunch_note,
+        } => workflow_validate_prompt(
+            *phase,
+            workflow_root,
+            &note_blocks(None, relaunch_note.as_deref()),
+        ),
     }
 }
 
-fn workflow_plan_prompt(phase: PhaseId, workflow_root: &str) -> String {
+fn workflow_plan_prompt(phase: PhaseId, workflow_root: &str, notes: &str) -> String {
     let artifact = "PLAN.md";
     let padded = phase.padded();
     format!(
@@ -544,7 +571,7 @@ fn workflow_plan_prompt(phase: PhaseId, workflow_root: &str) -> String {
         - If it does NOT exist: read and follow the GSD workflow file at \
         {workflow_root}/plan-phase.md for phase {phase}.\n\
         \n\
-        {COMPLETION_PROTOCOL}"
+        {notes}{COMPLETION_PROTOCOL}"
     )
 }
 
@@ -563,7 +590,12 @@ fn code_policy_applies_to_fix_arm(fix: Option<FixType>) -> bool {
     }
 }
 
-fn workflow_code_prompt(phase: PhaseId, fix: Option<FixType>, workflow_root: &str) -> String {
+fn workflow_code_prompt(
+    phase: PhaseId,
+    fix: Option<FixType>,
+    workflow_root: &str,
+    notes: &str,
+) -> String {
     let instruction = match fix {
         Some(FixType::GapsOnly) => format!(
             "Read and follow the GSD workflow file at {workflow_root}/execute-phase.md for \
@@ -581,17 +613,17 @@ fn workflow_code_prompt(phase: PhaseId, fix: Option<FixType>, workflow_root: &st
             "{instruction}\n\n\
             {CODE_STAGE_POLICY}\n\
             \n\
-            {COMPLETION_PROTOCOL}"
+            {notes}{COMPLETION_PROTOCOL}"
         )
     } else {
-        format!("{instruction}\n\n{COMPLETION_PROTOCOL}")
+        format!("{instruction}\n\n{notes}{COMPLETION_PROTOCOL}")
     }
 }
 
-fn workflow_validate_prompt(phase: PhaseId, workflow_root: &str) -> String {
+fn workflow_validate_prompt(phase: PhaseId, workflow_root: &str, notes: &str) -> String {
     format!(
         "Read and follow the GSD workflow file at {workflow_root}/validate-phase.md for \
-        phase {phase}.\n\n{VALIDATE_VERDICT_CONTRACT}"
+        phase {phase}.\n\n{notes}{VALIDATE_VERDICT_CONTRACT}"
     )
 }
 
