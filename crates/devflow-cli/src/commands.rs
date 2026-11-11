@@ -6931,7 +6931,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(4801);
-        Gates::write_gate(root, phase, Stage::Code, "paused").unwrap();
+        Gates::write_gate(
+            root,
+            phase,
+            Stage::Code,
+            devflow_core::gates::GateKind::StageFailure,
+            "paused",
+        )
+        .unwrap();
         assert!(stop_via_gate(root, phase).unwrap().is_none());
         assert!(gate_answer_files(root, phase, Stage::Code).is_empty());
     }
@@ -6945,7 +6952,14 @@ mod tests {
         state.stage = Stage::Code;
         state.gate_pending = true;
         workflow::save_state(&state).unwrap();
-        let (_, registration) = Gates::open_registered(root, phase, Stage::Code, "paused").unwrap();
+        let (_, registration) = Gates::open_registered(
+            root,
+            phase,
+            Stage::Code,
+            devflow_core::gates::GateKind::StageFailure,
+            "paused",
+        )
+        .unwrap();
         assert!(stop_via_gate(root, phase).unwrap().is_some());
         assert!(!gate_answer_files(root, phase, Stage::Code).is_empty());
         registration.finish();
@@ -6956,7 +6970,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(4802);
-        Gates::write_gate(root, phase, Stage::Code, "paused").unwrap();
+        Gates::write_gate(
+            root,
+            phase,
+            Stage::Code,
+            devflow_core::gates::GateKind::StageFailure,
+            "paused",
+        )
+        .unwrap();
         gate_sweep(Some(0), false, Some(root.to_path_buf())).unwrap();
         assert!(gate_answer_files(root, phase, Stage::Code).is_empty());
     }
@@ -6974,7 +6995,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(4804);
-        Gates::write_gate(root, phase, Stage::Code, "paused").unwrap();
+        Gates::write_gate(
+            root,
+            phase,
+            Stage::Code,
+            devflow_core::gates::GateKind::StageFailure,
+            "paused",
+        )
+        .unwrap();
         let err = gate_respond(
             root,
             phase,
@@ -7000,7 +7028,14 @@ mod tests {
         state.stage = Stage::Code;
         state.gate_pending = true;
         workflow::save_state(&state).unwrap();
-        Gates::write_gate(root, phase, Stage::Code, "paused").unwrap();
+        Gates::write_gate(
+            root,
+            phase,
+            Stage::Code,
+            devflow_core::gates::GateKind::StageFailure,
+            "paused",
+        )
+        .unwrap();
         // Not the test process: a broken identity check signals this child, not the runner.
         let (mut holder, _) = sleep_child_with_start();
         let _hold = hold_phase_with_record(root, phase, holder.id(), None);
@@ -7023,7 +7058,15 @@ mod tests {
 
         // A new gate per case: a gate keeps its first answer.
         let answered_gate = |approved, abort, note: Option<&str>| {
-            let gate = Gates::open_gate(root, phase, stage, "g").unwrap().gate_id;
+            let gate = Gates::open_gate(
+                root,
+                phase,
+                stage,
+                devflow_core::gates::GateKind::StageFailure,
+                "g",
+            )
+            .unwrap()
+            .gate_id;
             let response = GateResponse {
                 approved,
                 abort,
@@ -7079,10 +7122,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let (phase, stage) = (PhaseId::new(4911), Stage::Code);
-        Gates::open_gate(root, phase, stage, "g1").unwrap();
+        Gates::open_gate(
+            root,
+            phase,
+            stage,
+            devflow_core::gates::GateKind::StageFailure,
+            "g1",
+        )
+        .unwrap();
         let g1_entry = listed_gate(root, phase);
         Gates::close(root, phase, stage).unwrap();
-        let (g2, registration) = Gates::open_registered(root, phase, stage, "g2").unwrap();
+        let (g2, registration) = Gates::open_registered(
+            root,
+            phase,
+            stage,
+            devflow_core::gates::GateKind::StageFailure,
+            "g2",
+        )
+        .unwrap();
         let g2 = g2.gate_id;
 
         assert_eq!(
@@ -7116,7 +7173,14 @@ mod tests {
         let root = dir.path();
         let (phase, stage) = (PhaseId::new(4912), Stage::Code);
         state_pending_at(root, phase, stage);
-        Gates::open_gate(root, phase, stage, "g").unwrap();
+        Gates::open_gate(
+            root,
+            phase,
+            stage,
+            devflow_core::gates::GateKind::StageFailure,
+            "g",
+        )
+        .unwrap();
         let mut entry = listed_gate(root, phase);
         entry.gate_id = String::new();
         let file = GateFile {
@@ -7147,10 +7211,24 @@ mod tests {
         let root = dir.path();
         let (phase, stage) = (PhaseId::new(4913), Stage::Code);
         state_pending_at(root, phase, stage);
-        Gates::open_gate(root, phase, stage, "g1").unwrap();
+        Gates::open_gate(
+            root,
+            phase,
+            stage,
+            devflow_core::gates::GateKind::StageFailure,
+            "g1",
+        )
+        .unwrap();
         let g1_entry = listed_gate(root, phase);
         Gates::close(root, phase, stage).unwrap();
-        let (g2, registration) = Gates::open_registered(root, phase, stage, "g2").unwrap();
+        let (g2, registration) = Gates::open_registered(
+            root,
+            phase,
+            stage,
+            devflow_core::gates::GateKind::StageFailure,
+            "g2",
+        )
+        .unwrap();
         let g2 = g2.gate_id;
 
         assert_eq!(
@@ -7188,7 +7266,14 @@ mod tests {
         let (phase, stage) = (PhaseId::new(4914), Stage::Code);
         state_pending_at(root, phase, stage);
         let answer_with = |approved, abort, note: &str| {
-            let (opened, registration) = Gates::open_registered(root, phase, stage, "g").unwrap();
+            let (opened, registration) = Gates::open_registered(
+                root,
+                phase,
+                stage,
+                devflow_core::gates::GateKind::StageFailure,
+                "g",
+            )
+            .unwrap();
             let entry = listed_gate(root, phase);
             let response = GateResponse {
                 approved,
@@ -7234,9 +7319,24 @@ mod tests {
         phase: PhaseId,
         stage: Stage,
     ) -> (GateId, GateId, WaiterRegistration) {
-        let g1 = Gates::open_gate(root, phase, stage, "g1").unwrap().gate_id;
+        let g1 = Gates::open_gate(
+            root,
+            phase,
+            stage,
+            devflow_core::gates::GateKind::StageFailure,
+            "g1",
+        )
+        .unwrap()
+        .gate_id;
         Gates::close(root, phase, stage).unwrap();
-        let (g2, registration) = Gates::open_registered(root, phase, stage, "g2").unwrap();
+        let (g2, registration) = Gates::open_registered(
+            root,
+            phase,
+            stage,
+            devflow_core::gates::GateKind::StageFailure,
+            "g2",
+        )
+        .unwrap();
         (g1, g2.gate_id, registration)
     }
 
@@ -7297,7 +7397,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let (phase, stage) = (PhaseId::new(4902), Stage::Code);
-        let (opened, registration) = Gates::open_registered(root, phase, stage, "g").unwrap();
+        let (opened, registration) = Gates::open_registered(
+            root,
+            phase,
+            stage,
+            devflow_core::gates::GateKind::StageFailure,
+            "g",
+        )
+        .unwrap();
 
         let err = gate_respond(
             root,
@@ -7352,7 +7459,14 @@ mod tests {
         );
         assert!(context.chars().count() > 100 && context.chars().count() <= 261);
         let dir = tempfile::tempdir().unwrap();
-        Gates::write_gate(dir.path(), PhaseId::new(5108), Stage::Code, &context).unwrap();
+        Gates::write_gate(
+            dir.path(),
+            PhaseId::new(5108),
+            Stage::Code,
+            devflow_core::gates::GateKind::StageFailure,
+            &context,
+        )
+        .unwrap();
         let open = Gates::list_open(dir.path());
 
         let list = render_gate_list(&open);
@@ -7370,7 +7484,14 @@ mod tests {
         }
 
         let long = format!("{context} {}", "y".repeat(400));
-        Gates::write_gate(dir.path(), PhaseId::new(5108), Stage::Code, &long).unwrap();
+        Gates::write_gate(
+            dir.path(),
+            PhaseId::new(5108),
+            Stage::Code,
+            devflow_core::gates::GateKind::StageFailure,
+            &long,
+        )
+        .unwrap();
         let open = Gates::list_open(dir.path());
         let shown = render_gate_context(&long, GATE_CONTEXT_DISPLAY_CHARS);
         assert!(shown.contains(&context), "{shown}");
@@ -7409,7 +7530,14 @@ mod tests {
             Some(reason.clone()),
         );
         assert!(context.contains(way_on), "{context}");
-        Gates::write_gate(dir.path(), PhaseId::new(9999), Stage::Code, &context).unwrap();
+        Gates::write_gate(
+            dir.path(),
+            PhaseId::new(9999),
+            Stage::Code,
+            devflow_core::gates::GateKind::StageFailure,
+            &context,
+        )
+        .unwrap();
         let open = Gates::list_open(dir.path());
         let list = render_gate_list(&open);
         let row = render_all_roots_gate_row(Path::new("/tmp/some-root"), &open[0], 10_000);
@@ -7462,7 +7590,14 @@ mod tests {
                 Some(reason),
             );
             assert!(context.starts_with("[never-silent] stage validate failed: idle timeout ("));
-            Gates::write_gate(dir.path(), PhaseId::new(9999), Stage::Validate, &context).unwrap();
+            Gates::write_gate(
+                dir.path(),
+                PhaseId::new(9999),
+                Stage::Validate,
+                devflow_core::gates::GateKind::StageFailure,
+                &context,
+            )
+            .unwrap();
             let open = Gates::list_open(dir.path());
             let closed = format!("{clause}): ");
             [
@@ -7490,7 +7625,14 @@ mod tests {
     fn gate_list_and_show_print_the_gate_id() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let opened = Gates::open_gate(root, PhaseId::new(4903), Stage::Validate, "ctx").unwrap();
+        let opened = Gates::open_gate(
+            root,
+            PhaseId::new(4903),
+            Stage::Validate,
+            devflow_core::gates::GateKind::StageFailure,
+            "ctx",
+        )
+        .unwrap();
         let open = Gates::list_open(root);
 
         let list = render_gate_list(&open);
@@ -7508,7 +7650,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let (phase, stage) = (PhaseId::new(4906), Stage::Code);
-        let (_, registration) = Gates::open_registered(root, phase, stage, "g").unwrap();
+        let (_, registration) = Gates::open_registered(
+            root,
+            phase,
+            stage,
+            devflow_core::gates::GateKind::StageFailure,
+            "g",
+        )
+        .unwrap();
         let open = Gates::list_open(root);
 
         assert_eq!(phase_gate_waiter(root, phase, &open).0, WaiterStatus::Live);
@@ -7539,7 +7688,14 @@ mod tests {
         let root = dir.path();
 
         let (registered, stage) = (PhaseId::new(5001), Stage::Code);
-        let (opened, registration) = Gates::open_registered(root, registered, stage, "g").unwrap();
+        let (opened, registration) = Gates::open_registered(
+            root,
+            registered,
+            stage,
+            devflow_core::gates::GateKind::StageFailure,
+            "g",
+        )
+        .unwrap();
         gate_respond(
             root,
             registered,
@@ -7566,7 +7722,14 @@ mod tests {
         registration.finish();
 
         let beside_a_lock = PhaseId::new(5003);
-        Gates::open_gate(root, beside_a_lock, stage, "g").unwrap();
+        Gates::open_gate(
+            root,
+            beside_a_lock,
+            stage,
+            devflow_core::gates::GateKind::StageFailure,
+            "g",
+        )
+        .unwrap();
         plant_live_lock_record(root, beside_a_lock);
         let refused = gate_respond(
             root,
@@ -7582,7 +7745,14 @@ mod tests {
         assert!(gate_answer_files(root, beside_a_lock, stage).is_empty());
 
         let released = PhaseId::new(5002);
-        let (_, registration) = Gates::open_registered(root, released, stage, "g").unwrap();
+        let (_, registration) = Gates::open_registered(
+            root,
+            released,
+            stage,
+            devflow_core::gates::GateKind::StageFailure,
+            "g",
+        )
+        .unwrap();
         registration.finish();
         let refused = gate_respond(
             root,
@@ -7665,7 +7835,14 @@ mod tests {
         let stage = Stage::Code;
 
         let phase = PhaseId::new(5005);
-        let (opened, registration) = Gates::open_registered(root, phase, stage, "g").unwrap();
+        let (opened, registration) = Gates::open_registered(
+            root,
+            phase,
+            stage,
+            devflow_core::gates::GateKind::StageFailure,
+            "g",
+        )
+        .unwrap();
         let gate_lock = hold_gate_lock(root, phase);
         let started = std::time::Instant::now();
         let error = gate_respond(
@@ -7697,7 +7874,14 @@ mod tests {
 
         let stopping = PhaseId::new(5006);
         state_pending_at(root, stopping, stage);
-        let (_, stop_registration) = Gates::open_registered(root, stopping, stage, "g").unwrap();
+        let (_, stop_registration) = Gates::open_registered(
+            root,
+            stopping,
+            stage,
+            devflow_core::gates::GateKind::StageFailure,
+            "g",
+        )
+        .unwrap();
         let stop_gate_lock = hold_gate_lock(root, stopping);
         let mut holder = SleepingChild::spawn();
         let _hold = hold_phase_with_record(root, stopping, holder.pid(), Some(holder.start));
@@ -7754,9 +7938,22 @@ mod tests {
         let root = dir.path();
         let stage = Stage::Code;
         let (live, crashed) = (PhaseId::new(5011), PhaseId::new(5012));
-        let (live_gate, registration) = Gates::open_registered(root, live, stage, "g").unwrap();
-        let (crashed_gate, crashed_registration) =
-            Gates::open_registered(root, crashed, stage, "g").unwrap();
+        let (live_gate, registration) = Gates::open_registered(
+            root,
+            live,
+            stage,
+            devflow_core::gates::GateKind::StageFailure,
+            "g",
+        )
+        .unwrap();
+        let (crashed_gate, crashed_registration) = Gates::open_registered(
+            root,
+            crashed,
+            stage,
+            devflow_core::gates::GateKind::StageFailure,
+            "g",
+        )
+        .unwrap();
         drop(crashed_registration);
         let crashed_file = Gates::waiter_path(root, crashed, stage, &crashed_gate.gate_id);
         wait_until_unheld(&crashed_file);
@@ -7787,7 +7984,14 @@ mod tests {
         let root = dir.path();
         let (phase, stage) = (PhaseId::new(5013), Stage::Code);
         state_pending_at(root, phase, stage);
-        let (opened, registration) = Gates::open_registered(root, phase, stage, "g").unwrap();
+        let (opened, registration) = Gates::open_registered(
+            root,
+            phase,
+            stage,
+            devflow_core::gates::GateKind::StageFailure,
+            "g",
+        )
+        .unwrap();
         let holder = SleepingChild::spawn();
         let _hold = hold_phase_with_record(root, phase, holder.pid(), Some(holder.start));
         let cache = tempfile::tempdir().unwrap();
@@ -7815,7 +8019,14 @@ mod tests {
         let (phase, stage) = (PhaseId::new(5014), Stage::Code);
         state_pending_at(root, phase, stage);
         plant_live_lock_record(root, phase);
-        let (_, registration) = Gates::open_registered(root, phase, stage, "g").unwrap();
+        let (_, registration) = Gates::open_registered(
+            root,
+            phase,
+            stage,
+            devflow_core::gates::GateKind::StageFailure,
+            "g",
+        )
+        .unwrap();
 
         let held = collect_phase_facts(root);
         assert_eq!(held[0].waiter, WaiterStatus::Live);
@@ -7855,7 +8066,14 @@ mod tests {
         let root = dir.path();
         let phase = PhaseId::new(5016);
         state_pending_at(root, phase, Stage::Plan);
-        let (opened, registration) = Gates::open_registered(root, phase, Stage::Plan, "g").unwrap();
+        let (opened, registration) = Gates::open_registered(
+            root,
+            phase,
+            Stage::Plan,
+            devflow_core::gates::GateKind::StageFailure,
+            "g",
+        )
+        .unwrap();
         let gate_id = opened.gate_id.as_str();
 
         for waiter in doctor_json_gate_waiters(root) {
@@ -7891,9 +8109,22 @@ mod tests {
         let root = dir.path();
         let phase = PhaseId::new(5017);
         state_pending_at(root, phase, Stage::Validate);
-        let unwaited = Gates::open_gate(root, phase, Stage::Code, "no waiter").unwrap();
-        let (waited, registration) =
-            Gates::open_registered(root, phase, Stage::Validate, "waiter").unwrap();
+        let unwaited = Gates::open_gate(
+            root,
+            phase,
+            Stage::Code,
+            devflow_core::gates::GateKind::StageFailure,
+            "no waiter",
+        )
+        .unwrap();
+        let (waited, registration) = Gates::open_registered(
+            root,
+            phase,
+            Stage::Validate,
+            devflow_core::gates::GateKind::StageFailure,
+            "waiter",
+        )
+        .unwrap();
 
         for waiter in doctor_json_gate_waiters(root) {
             assert_eq!(
@@ -7945,7 +8176,15 @@ mod tests {
             "unheld file"
         );
 
-        let gate = Gates::open_gate(&root, phase, stage, "g").unwrap().gate_id;
+        let gate = Gates::open_gate(
+            &root,
+            phase,
+            stage,
+            devflow_core::gates::GateKind::StageFailure,
+            "g",
+        )
+        .unwrap()
+        .gate_id;
         let waiter = Gates::register_waiter(&root, phase, stage, &gate).unwrap();
         assert!(registry_reachable_pids(roots).contains(&pid), "waiter");
         drop(waiter);
@@ -8091,8 +8330,14 @@ mod tests {
     /// consumer that took the answer, as its registration has finished.
     fn claimed_gate(root: &Path, phase: PhaseId) -> GateId {
         state_pending_at(root, phase, Stage::Validate);
-        let (opened, registration) =
-            Gates::open_registered(root, phase, Stage::Validate, "g").unwrap();
+        let (opened, registration) = Gates::open_registered(
+            root,
+            phase,
+            Stage::Validate,
+            devflow_core::gates::GateKind::StageFailure,
+            "g",
+        )
+        .unwrap();
         registration.finish();
         let response = GateResponse {
             approved: true,
@@ -8163,8 +8408,14 @@ mod tests {
 
         let unclaimed = PhaseId::new(5019);
         state_pending_at(root, unclaimed, Stage::Validate);
-        let (opened, registration) =
-            Gates::open_registered(root, unclaimed, Stage::Validate, "g").unwrap();
+        let (opened, registration) = Gates::open_registered(
+            root,
+            unclaimed,
+            Stage::Validate,
+            devflow_core::gates::GateKind::StageFailure,
+            "g",
+        )
+        .unwrap();
         let holder = SleepingChild::spawn();
         let _hold = hold_phase_with_record(root, unclaimed, holder.pid(), Some(holder.start));
         let cache = tempfile::tempdir().unwrap();
@@ -8465,7 +8716,14 @@ mod tests {
             root.join("b.live"),
         ));
         workflow::save_state(&state).unwrap();
-        let (opened, registration) = Gates::open_registered(&root, promoted, stage, "g").unwrap();
+        let (opened, registration) = Gates::open_registered(
+            &root,
+            promoted,
+            stage,
+            devflow_core::gates::GateKind::StageFailure,
+            "g",
+        )
+        .unwrap();
         let kept = SharedBytes::default();
         let hook = {
             let (root, kept) = (root.clone(), kept.clone());
@@ -8500,7 +8758,14 @@ mod tests {
 
         let answered = PhaseId::new(5029);
         at_gate(answered);
-        let (_, registration) = Gates::open_registered(&root, answered, stage, "g").unwrap();
+        let (_, registration) = Gates::open_registered(
+            &root,
+            answered,
+            stage,
+            devflow_core::gates::GateKind::StageFailure,
+            "g",
+        )
+        .unwrap();
         stop_in(&root, answered, Some(cache.path())).expect("the answered run is the only one");
         assert!(workflow::load_state(&root, answered).unwrap().stopped);
         registration.finish();
@@ -8513,7 +8778,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let (phase, stage) = (PhaseId::new(5008), Stage::Code);
-        let (opened, registration) = Gates::open_registered(root, phase, stage, "g").unwrap();
+        let (opened, registration) = Gates::open_registered(
+            root,
+            phase,
+            stage,
+            devflow_core::gates::GateKind::StageFailure,
+            "g",
+        )
+        .unwrap();
         let gate_lock = hold_gate_lock(root, phase);
 
         let error = gate_sweep(Some(0), false, Some(root.to_path_buf()))
@@ -8541,8 +8813,14 @@ mod tests {
         let check = |phase: PhaseId, write: &dyn Fn(&Path) -> Result<(), CliError>| {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path();
-            let (opened, registration) =
-                Gates::open_registered(root, phase, Stage::Code, "g").unwrap();
+            let (opened, registration) = Gates::open_registered(
+                root,
+                phase,
+                Stage::Code,
+                devflow_core::gates::GateKind::StageFailure,
+                "g",
+            )
+            .unwrap();
             let parked = std::rc::Rc::new(std::cell::RefCell::new(None));
             let (hook_root, hook_parked) = (root.to_path_buf(), parked.clone());
             let error = with_answer_before_publish(
@@ -8593,7 +8871,14 @@ mod tests {
         let root = dir.path();
         let (phase, stage) = (PhaseId::new(5007), Stage::Code);
         state_pending_at(root, phase, stage);
-        let (opened, registration) = Gates::open_registered(root, phase, stage, "g").unwrap();
+        let (opened, registration) = Gates::open_registered(
+            root,
+            phase,
+            stage,
+            devflow_core::gates::GateKind::StageFailure,
+            "g",
+        )
+        .unwrap();
         let holder = SleepingChild::spawn();
         let _hold = hold_phase_with_record(root, phase, holder.pid(), Some(holder.start));
         let cache = tempfile::tempdir().unwrap();
@@ -8640,7 +8925,14 @@ mod tests {
         let supervisor = ScriptedSupervisor::serve(&socket, LAUNCH, phase, "agent_running", |_| {
             stopped_and_gone()
         });
-        let (_, registration) = Gates::open_registered(root, phase, stage, "g").unwrap();
+        let (_, registration) = Gates::open_registered(
+            root,
+            phase,
+            stage,
+            devflow_core::gates::GateKind::StageFailure,
+            "g",
+        )
+        .unwrap();
         let cache = tempfile::tempdir().unwrap();
         let parked = std::rc::Rc::new(std::cell::RefCell::new(None));
         let (hook_root, hook_parked) = (root.to_path_buf(), parked.clone());
@@ -8665,7 +8957,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let (phase, stage) = (PhaseId::new(4904), Stage::Code);
-        let gate = Gates::open_gate(root, phase, stage, "g").unwrap().gate_id;
+        let gate = Gates::open_gate(
+            root,
+            phase,
+            stage,
+            devflow_core::gates::GateKind::StageFailure,
+            "g",
+        )
+        .unwrap()
+        .gate_id;
         assert!(!waiter_is_live(root, phase, stage, &gate), "nothing at all");
 
         let registration = Gates::register_waiter(root, phase, stage, &gate).unwrap();
@@ -8682,14 +8982,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let (phase, stage) = (PhaseId::new(4905), Stage::Code);
-        let (opened, registration) = Gates::open_registered(root, phase, stage, "g1").unwrap();
+        let (opened, registration) = Gates::open_registered(
+            root,
+            phase,
+            stage,
+            devflow_core::gates::GateKind::StageFailure,
+            "g1",
+        )
+        .unwrap();
         let g1 = opened.gate_id;
 
         let hook_root = root.to_path_buf();
         let err = with_answer_before_publish(
             move || {
                 Gates::close(&hook_root, phase, stage).unwrap();
-                Gates::open_gate(&hook_root, phase, stage, "g2").unwrap();
+                Gates::open_gate(
+                    &hook_root,
+                    phase,
+                    stage,
+                    devflow_core::gates::GateKind::StageFailure,
+                    "g2",
+                )
+                .unwrap();
             },
             || {
                 gate_respond(
@@ -8737,7 +9051,14 @@ mod tests {
         assert_eq!(render_set_aside_findings_text(&no_findings), "");
         assert_eq!(doctor_json(&no_findings), Vec::<serde_json::Value>::new());
 
-        let opened = Gates::open_gate(root, phase, Stage::Code, "ctx").unwrap();
+        let opened = Gates::open_gate(
+            root,
+            phase,
+            Stage::Code,
+            devflow_core::gates::GateKind::StageFailure,
+            "ctx",
+        )
+        .unwrap();
         let response = GateResponse {
             approved: true,
             abort: false,
@@ -9094,7 +9415,14 @@ mod tests {
     fn gate_show_renders_full_untruncated_sanitized_context() {
         let dir = tempfile::tempdir().unwrap();
         let context = format!("first line\n\u{1b}[2J{}", "x".repeat(150));
-        Gates::write_gate(dir.path(), PhaseId::new(15), Stage::Validate, &context).unwrap();
+        Gates::write_gate(
+            dir.path(),
+            PhaseId::new(15),
+            Stage::Validate,
+            devflow_core::gates::GateKind::StageFailure,
+            &context,
+        )
+        .unwrap();
         let gate = Gates::list_open(dir.path())
             .into_iter()
             .find(|g| g.phase == PhaseId::new(15))
@@ -9117,8 +9445,22 @@ mod tests {
     #[test]
     fn gate_show_errors_asking_for_stage_with_several_open_gates() {
         let dir = tempfile::tempdir().unwrap();
-        Gates::write_gate(dir.path(), PhaseId::new(15), Stage::Code, "ctx1").unwrap();
-        Gates::write_gate(dir.path(), PhaseId::new(15), Stage::Validate, "ctx2").unwrap();
+        Gates::write_gate(
+            dir.path(),
+            PhaseId::new(15),
+            Stage::Code,
+            devflow_core::gates::GateKind::StageFailure,
+            "ctx1",
+        )
+        .unwrap();
+        Gates::write_gate(
+            dir.path(),
+            PhaseId::new(15),
+            Stage::Validate,
+            devflow_core::gates::GateKind::StageFailure,
+            "ctx2",
+        )
+        .unwrap();
 
         let err = gate_show(dir.path(), PhaseId::new(15), None).unwrap_err();
 
@@ -9132,6 +9474,7 @@ mod tests {
             dir.path(),
             PhaseId::new(15),
             Stage::Validate,
+            devflow_core::gates::GateKind::StageFailure,
             "the only open gate",
         )
         .unwrap();
@@ -9418,7 +9761,14 @@ mod tests {
         state.gate_notify_cmd = Some("true".to_string());
         workflow::save_state(&state).unwrap();
 
-        let old = Gates::open_gate(root, phase, Stage::Plan, "the earlier run's gate").unwrap();
+        let old = Gates::open_gate(
+            root,
+            phase,
+            Stage::Plan,
+            devflow_core::gates::GateKind::StageFailure,
+            "the earlier run's gate",
+        )
+        .unwrap();
         let keyed = Gates::answer(
             root,
             phase,
@@ -9471,7 +9821,7 @@ mod tests {
             root,
             &mut state,
             Stage::Plan,
-            None,
+            devflow_core::gates::GateKind::StageFailure,
             "the new run's gate",
             1,
         )
@@ -9501,7 +9851,7 @@ mod tests {
             root,
             &mut state,
             Stage::Plan,
-            None,
+            devflow_core::gates::GateKind::StageFailure,
             "control: an answer that binds",
             1,
         )
@@ -9546,6 +9896,7 @@ mod tests {
             root,
             PhaseId::new(15),
             Stage::Validate,
+            devflow_core::gates::GateKind::StageFailure,
             "approve the finish?",
         )
         .unwrap();
@@ -9579,8 +9930,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(16);
-        let (_, registration) =
-            Gates::open_registered(root, phase, Stage::Code, "relaunch Code?").unwrap();
+        let (_, registration) = Gates::open_registered(
+            root,
+            phase,
+            Stage::Code,
+            devflow_core::gates::GateKind::StageFailure,
+            "relaunch Code?",
+        )
+        .unwrap();
 
         gate_respond(
             root,
@@ -9619,9 +9976,22 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("no open gate"), "{err}");
 
-        Gates::write_gate(root, PhaseId::new(15), Stage::Code, "a").unwrap();
-        let (_, registration) =
-            Gates::open_registered(root, PhaseId::new(15), Stage::Validate, "b").unwrap();
+        Gates::write_gate(
+            root,
+            PhaseId::new(15),
+            Stage::Code,
+            devflow_core::gates::GateKind::StageFailure,
+            "a",
+        )
+        .unwrap();
+        let (_, registration) = Gates::open_registered(
+            root,
+            PhaseId::new(15),
+            Stage::Validate,
+            devflow_core::gates::GateKind::StageFailure,
+            "b",
+        )
+        .unwrap();
         let err = gate_respond(
             root,
             PhaseId::new(15),
@@ -9691,7 +10061,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let (phase, stage) = (PhaseId::new(30), Stage::Validate);
-        let (_, registration) = Gates::open_registered(root, phase, stage, "ctx").unwrap();
+        let (_, registration) = Gates::open_registered(
+            root,
+            phase,
+            stage,
+            devflow_core::gates::GateKind::StageFailure,
+            "ctx",
+        )
+        .unwrap();
         backdate_gate(root, phase, stage, aged_past_threshold());
 
         gate_sweep(None, true, Some(root.to_path_buf())).unwrap();
@@ -9721,7 +10098,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let (phase, stage) = (PhaseId::new(31), Stage::Validate);
-        let (opened, registration) = Gates::open_registered(root, phase, stage, "ctx").unwrap();
+        let (opened, registration) = Gates::open_registered(
+            root,
+            phase,
+            stage,
+            devflow_core::gates::GateKind::StageFailure,
+            "ctx",
+        )
+        .unwrap();
         backdate_gate(root, phase, stage, aged_past_threshold());
         let listed_before_the_answer = listed_gate(root, phase);
         let response = GateResponse {
@@ -9754,8 +10138,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(32);
-        let (_, registration) =
-            Gates::open_registered(root, phase, Stage::Validate, "ctx").unwrap();
+        let (_, registration) = Gates::open_registered(
+            root,
+            phase,
+            Stage::Validate,
+            devflow_core::gates::GateKind::StageFailure,
+            "ctx",
+        )
+        .unwrap();
         backdate_gate(root, phase, Stage::Validate, aged_past_threshold());
 
         gate_sweep(None, false, Some(root.to_path_buf())).unwrap();
@@ -10358,7 +10748,14 @@ mod tests {
     fn status_shows_pending_gate_prominently() {
         let dir = tempfile::tempdir().unwrap();
         let context = format!("first line\n\u{1b}[2J{}", "sensitive detail ".repeat(80));
-        Gates::write_gate(dir.path(), PhaseId::new(16), Stage::Validate, &context).unwrap();
+        Gates::write_gate(
+            dir.path(),
+            PhaseId::new(16),
+            Stage::Validate,
+            devflow_core::gates::GateKind::StageFailure,
+            &context,
+        )
+        .unwrap();
         let open = Gates::list_open(dir.path());
 
         let banner = render_pending_gate_banner(&open, u64::MAX).unwrap();

@@ -167,8 +167,14 @@ fn sweep_reaps_an_aged_gate_and_a_real_poller_resolves_to_abort() {
 
     // Registered before the gate file exists, as every production gate wait is, and held
     // by the poller while it awaits, so the sweep can never see the gate before its waiter.
-    let (opened, registration) =
-        Gates::open_registered(root, phase, stage, "approve the finish?").unwrap();
+    let (opened, registration) = Gates::open_registered(
+        root,
+        phase,
+        stage,
+        devflow_core::gates::GateKind::StageFailure,
+        "approve the finish?",
+    )
+    .unwrap();
     let gate = opened.gate_id;
     backdate_gate(root, phase, stage, AGED_WELL_PAST_DEFAULT_THRESHOLD_SECS);
 
@@ -224,7 +230,14 @@ fn sweep_leaves_a_fresh_gate_untouched() {
 
     // Freshly written, so its age is about 0 s, and the registration stays held: only
     // the age filter stands between this gate and a reap.
-    let (_, registration) = Gates::open_registered(root, phase, stage, "review gaps").unwrap();
+    let (_, registration) = Gates::open_registered(
+        root,
+        phase,
+        stage,
+        devflow_core::gates::GateKind::StageFailure,
+        "review gaps",
+    )
+    .unwrap();
 
     let sweep = |extra: &[&str]| {
         let output = common::hermetic_devflow(&home)

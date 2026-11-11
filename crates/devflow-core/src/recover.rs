@@ -863,9 +863,15 @@ mod tests {
 
         let mut paths = vec![workflow::state_path(root, phase)];
         for stage in [Stage::Code, Stage::Validate] {
-            let gate_id = Gates::open_gate(root, phase, stage, "wedged gate")
-                .unwrap()
-                .gate_id;
+            let gate_id = Gates::open_gate(
+                root,
+                phase,
+                stage,
+                crate::gates::GateKind::StageFailure,
+                "wedged gate",
+            )
+            .unwrap()
+            .gate_id;
             let answer = Gates::answer(
                 root,
                 phase,
@@ -1079,7 +1085,14 @@ mod tests {
             Some(DEAD_PID),
         ))
         .unwrap();
-        Gates::write_gate(root, phase, Stage::Code, "left open").unwrap();
+        Gates::write_gate(
+            root,
+            phase,
+            Stage::Code,
+            crate::gates::GateKind::StageFailure,
+            "left open",
+        )
+        .unwrap();
 
         clean(root).expect("clean");
 
@@ -1096,7 +1109,14 @@ mod tests {
         let root = dir.path();
         let phase = PhaseId::new(54);
         workflow::save_state(&state_aged_phase(root, phase, 60, Some(DEAD_PID))).unwrap();
-        Gates::write_gate(root, phase, Stage::Code, "still fresh").unwrap();
+        Gates::write_gate(
+            root,
+            phase,
+            Stage::Code,
+            crate::gates::GateKind::StageFailure,
+            "still fresh",
+        )
+        .unwrap();
 
         clean(root).expect("clean");
 
@@ -1124,8 +1144,14 @@ mod tests {
         .unwrap();
         let state_path = workflow::state_path(root, phase);
         let state_before = std::fs::read(&state_path).unwrap();
-        let (opened, registration) =
-            Gates::open_registered(root, phase, Stage::Code, "waiting").unwrap();
+        let (opened, registration) = Gates::open_registered(
+            root,
+            phase,
+            Stage::Code,
+            crate::gates::GateKind::StageFailure,
+            "waiting",
+        )
+        .unwrap();
         let gate = opened.gate_id;
         let answer = Gates::answer(
             root,
@@ -1241,7 +1267,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(52);
-        Gates::write_gate(root, phase, Stage::Code, "leftover").unwrap();
+        Gates::write_gate(
+            root,
+            phase,
+            Stage::Code,
+            crate::gates::GateKind::StageFailure,
+            "leftover",
+        )
+        .unwrap();
         assert!(!workflow::state_path(root, phase).exists());
 
         let report = clean_phase_report(root, phase).expect("clean");
@@ -1262,7 +1295,14 @@ mod tests {
         let phase = PhaseId::new(61);
         let early_gate = Gates::gate_path(root, phase, Stage::Plan);
         let later_gate = Gates::gate_path(root, phase, Stage::Code);
-        Gates::write_gate(root, phase, Stage::Plan, "leftover").unwrap();
+        Gates::write_gate(
+            root,
+            phase,
+            Stage::Plan,
+            crate::gates::GateKind::StageFailure,
+            "leftover",
+        )
+        .unwrap();
         std::fs::create_dir_all(&later_gate).unwrap();
 
         let report = clean_phase_report(root, phase).expect("clean");
@@ -1379,10 +1419,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(9);
-        Gates::write_gate(root, phase, Stage::Code, "orphaned").unwrap();
-        let answered = Gates::open_gate(root, phase, Stage::Validate, "orphaned")
-            .unwrap()
-            .gate_id;
+        Gates::write_gate(
+            root,
+            phase,
+            Stage::Code,
+            crate::gates::GateKind::StageFailure,
+            "orphaned",
+        )
+        .unwrap();
+        let answered = Gates::open_gate(
+            root,
+            phase,
+            Stage::Validate,
+            crate::gates::GateKind::StageFailure,
+            "orphaned",
+        )
+        .unwrap()
+        .gate_id;
         let answer = Gates::answer(
             root,
             phase,
@@ -1424,8 +1477,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(10);
-        let (opened, registration) =
-            Gates::open_registered(root, phase, Stage::Code, "held").unwrap();
+        let (opened, registration) = Gates::open_registered(
+            root,
+            phase,
+            Stage::Code,
+            crate::gates::GateKind::StageFailure,
+            "held",
+        )
+        .unwrap();
 
         let warnings = clean(root).expect("clean");
 
@@ -1453,7 +1512,14 @@ mod tests {
         let state_path = workflow::state_path(root, phase);
         std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
         std::fs::write(&state_path, "{\"stage\":").unwrap();
-        Gates::write_gate(root, phase, Stage::Code, "behind corrupt state").unwrap();
+        Gates::write_gate(
+            root,
+            phase,
+            Stage::Code,
+            crate::gates::GateKind::StageFailure,
+            "behind corrupt state",
+        )
+        .unwrap();
 
         let warnings = clean(root).expect("clean");
 
@@ -1622,9 +1688,15 @@ mod tests {
             Some(DEAD_PID),
         ))
         .unwrap();
-        let gate = Gates::open_gate(root, phase, Stage::Code, "left open")
-            .unwrap()
-            .gate_id;
+        let gate = Gates::open_gate(
+            root,
+            phase,
+            Stage::Code,
+            crate::gates::GateKind::StageFailure,
+            "left open",
+        )
+        .unwrap()
+        .gate_id;
         let answer = Gates::answer(
             root,
             phase,
@@ -1792,7 +1864,14 @@ mod tests {
         save_stale(root, phase, |state| {
             state.supervisor = Some(supervisor_record(socket.clone()));
         });
-        let gate = Gates::write_gate(root, phase, Stage::Code, "left open").unwrap();
+        let gate = Gates::write_gate(
+            root,
+            phase,
+            Stage::Code,
+            crate::gates::GateKind::StageFailure,
+            "left open",
+        )
+        .unwrap();
         let state_path = workflow::state_path(root, phase);
         let (state_before, gate_before) = (
             std::fs::read(&state_path).unwrap(),
@@ -1904,8 +1983,14 @@ mod tests {
         let root = dir.path();
         let phase = PhaseId::new(2103);
         save_stale(root, phase, |_| {});
-        let (opened, registration) =
-            Gates::open_registered(root, phase, Stage::Plan, "waiting").unwrap();
+        let (opened, registration) = Gates::open_registered(
+            root,
+            phase,
+            Stage::Plan,
+            crate::gates::GateKind::StageFailure,
+            "waiting",
+        )
+        .unwrap();
         let state_path = workflow::state_path(root, phase);
         let before = std::fs::read(&state_path).unwrap();
 
@@ -1987,7 +2072,14 @@ mod tests {
                 state.pending_supervisor = Some(pending_record(root, "aaaa0000aaaa2105"));
             });
             for stage in crate::gates::STAGES {
-                Gates::write_gate(root, phase, stage, "left open").unwrap();
+                Gates::write_gate(
+                    root,
+                    phase,
+                    stage,
+                    crate::gates::GateKind::StageFailure,
+                    "left open",
+                )
+                .unwrap();
             }
         };
         let counts = || {
@@ -2065,7 +2157,14 @@ mod tests {
         let (replaced, control) = (PhaseId::new(2110), PhaseId::new(2111));
         for phase in [replaced, control] {
             save_stale(&root, phase, |_| {});
-            Gates::write_gate(&root, phase, Stage::Code, "run A").unwrap();
+            Gates::write_gate(
+                &root,
+                phase,
+                Stage::Code,
+                crate::gates::GateKind::StageFailure,
+                "run A",
+            )
+            .unwrap();
         }
         let gate = Gates::gate_path(&root, replaced, Stage::Code);
         // Kept alive to the end of the test: B's reservation and registration.
@@ -2089,8 +2188,14 @@ mod tests {
                     Ok::<_, WorkflowError>((Some(run_b), ()))
                 })
                 .unwrap();
-                let (opened, registration) =
-                    Gates::open_registered(root, phase, Stage::Code, "run B").unwrap();
+                let (opened, registration) = Gates::open_registered(
+                    root,
+                    phase,
+                    Stage::Code,
+                    crate::gates::GateKind::StageFailure,
+                    "run B",
+                )
+                .unwrap();
                 *hook_run_b.borrow_mut() = Some((
                     std::fs::read(workflow::state_path(root, phase)).unwrap(),
                     std::fs::read(&opened.path).unwrap(),
@@ -2129,8 +2234,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
         let (started, control) = (PhaseId::new(2112), PhaseId::new(2113));
-        let orphan = Gates::write_gate(&root, started, Stage::Code, "orphan").unwrap();
-        let control_gate = Gates::write_gate(&root, control, Stage::Code, "orphan").unwrap();
+        let orphan = Gates::write_gate(
+            &root,
+            started,
+            Stage::Code,
+            crate::gates::GateKind::StageFailure,
+            "orphan",
+        )
+        .unwrap();
+        let control_gate = Gates::write_gate(
+            &root,
+            control,
+            Stage::Code,
+            crate::gates::GateKind::StageFailure,
+            "orphan",
+        )
+        .unwrap();
         let held = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let run_b = std::rc::Rc::new(std::cell::RefCell::new(None));
         let (hook_root, hook_held, hook_run_b) = (root.clone(), held.clone(), run_b.clone());
@@ -2148,8 +2267,14 @@ mod tests {
                     Ok::<_, WorkflowError>((Some(run_b), ()))
                 })
                 .unwrap();
-                let (opened, registration) =
-                    Gates::open_registered(root, phase, Stage::Plan, "run B").unwrap();
+                let (opened, registration) = Gates::open_registered(
+                    root,
+                    phase,
+                    Stage::Plan,
+                    crate::gates::GateKind::StageFailure,
+                    "run B",
+                )
+                .unwrap();
                 *hook_run_b.borrow_mut() = Some((
                     std::fs::read(workflow::state_path(root, phase)).unwrap(),
                     opened.path,
@@ -2215,8 +2340,14 @@ mod tests {
         let root = dir.path();
         let phase = PhaseId::new(2122);
         workflow::save_state(&state_aged_phase(root, phase, 0, None)).unwrap();
-        let (opened, registration) =
-            Gates::open_registered(root, phase, Stage::Code, "waiting").unwrap();
+        let (opened, registration) = Gates::open_registered(
+            root,
+            phase,
+            Stage::Code,
+            crate::gates::GateKind::StageFailure,
+            "waiting",
+        )
+        .unwrap();
         let state_path = workflow::state_path(root, phase);
         let (state_before, gate_before) = (
             std::fs::read(&state_path).unwrap(),
@@ -2368,8 +2499,14 @@ mod tests {
         drop(hold);
 
         let missing = PhaseId::new(2125);
-        let (opened, registration) =
-            Gates::open_registered(root, missing, Stage::Code, "waiting").unwrap();
+        let (opened, registration) = Gates::open_registered(
+            root,
+            missing,
+            Stage::Code,
+            crate::gates::GateKind::StageFailure,
+            "waiting",
+        )
+        .unwrap();
 
         let report = clean_phase_report(root, missing).expect("explicit clean");
 
@@ -2444,7 +2581,14 @@ mod tests {
         let root = dir.path();
         let phase = PhaseId::new(2126);
         save_stale(root, phase, |_| {});
-        let gate = Gates::write_gate(root, phase, Stage::Code, "left open").unwrap();
+        let gate = Gates::write_gate(
+            root,
+            phase,
+            Stage::Code,
+            crate::gates::GateKind::StageFailure,
+            "left open",
+        )
+        .unwrap();
         let state_path = workflow::state_path(root, phase);
         let (state_before, gate_before) = (
             std::fs::read(&state_path).unwrap(),
@@ -2519,9 +2663,15 @@ mod tests {
         save_stale(root, cleared, |_| {});
         workflow::save_state(&state_aged_phase(root, kept, 60, None)).unwrap();
         for phase in [cleared, kept] {
-            let gate = Gates::open_gate(root, phase, Stage::Code, "ctx")
-                .unwrap()
-                .gate_id;
+            let gate = Gates::open_gate(
+                root,
+                phase,
+                Stage::Code,
+                crate::gates::GateKind::StageFailure,
+                "ctx",
+            )
+            .unwrap()
+            .gate_id;
             Gates::answer(
                 root,
                 phase,

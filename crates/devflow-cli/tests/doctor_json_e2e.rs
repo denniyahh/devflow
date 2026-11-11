@@ -71,8 +71,14 @@ fn doctor_json_names_the_open_gates_waiter() {
     state.stage = Stage::Plan;
     state.gate_pending = true;
     devflow_core::workflow::save_state(&state).unwrap();
-    let (opened, registration) =
-        Gates::open_registered(root, phase, Stage::Plan, "approve the plan").unwrap();
+    let (opened, registration) = Gates::open_registered(
+        root,
+        phase,
+        Stage::Plan,
+        devflow_core::gates::GateKind::StageFailure,
+        "approve the plan",
+    )
+    .unwrap();
     let gate_id = opened.gate_id.as_str();
 
     let expected =

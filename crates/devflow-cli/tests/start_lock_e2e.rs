@@ -539,8 +539,14 @@ fn plant_leftover_run(root: &Path, phase: PhaseId, agent_pid: Option<u32>) -> Pl
 
 /// A Code gate and an aborting answer bound to it, as a leftover run leaves them.
 fn plant_code_gate(root: &Path, phase: PhaseId) -> PlantedGate {
-    let opened = Gates::open_gate(root, phase, Stage::Code, "planted leftover Code gate")
-        .expect("plant Code gate request");
+    let opened = Gates::open_gate(
+        root,
+        phase,
+        Stage::Code,
+        devflow_core::gates::GateKind::StageFailure,
+        "planted leftover Code gate",
+    )
+    .expect("plant Code gate request");
     let response = Gates::answer(
         root,
         phase,

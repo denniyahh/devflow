@@ -48,13 +48,15 @@ pub struct GateFile {
     /// can list it or answer it.
     pub gate_id: String,
     /// Which kind of gate this is, recorded by its writer (52-22, D-37, D-39): a
-    /// label for display, events and tests, never parsed out of `context`. `None`
-    /// only in a gate file written before the field existed.
+    /// label for display, events and tests, never parsed out of `context`. Every
+    /// gate DevFlow opens records one; `None` only in a gate file written before
+    /// the field existed, which is why it stays an `Option`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_kind: Option<GateKind>,
 }
 
-/// The kind of a gate, as its writer records it in [`GateFile::gate_kind`].
+/// The kind of a gate, as its writer records it in [`GateFile::gate_kind`]. The
+/// open path takes one, so no gate is opened without a kind (D-39).
 ///
 /// Deliberately not `#[non_exhaustive]`: a router that matches it has no wildcard
 /// arm, so a kind added later fails the build until it is classified.
@@ -90,6 +92,15 @@ pub enum GateKind {
     FailureCap,
     /// The gate when a gaps pass produced no gap-closure plan (written by 52-27).
     NoGapClosurePlan,
+    /// The never-silent gate for a failed stage at any stage: a launch failure, a
+    /// crash, a reported failure, a timeout, an infra failure, and the interim
+    /// rate-limit gate until 52-31's `RateLimit` (D-39; 52-22).
+    StageFailure,
+    /// The gate for a failed preflight check before a stage launches (D-39; 52-22).
+    Preflight,
+    /// The gate for a human-only checkpoint declaration at Code that was not
+    /// approved (D-39; 52-22).
+    CheckpointDeclaration,
 }
 
 /// The human's response to a gate.
@@ -532,22 +543,14 @@ impl Gates {
     /// For fixtures and any opener that is not a waiter. A waiter opens through
     /// [`open_registered`](Self::open_registered), so its gate file is never visible
     /// before its registration.
+    ///
+    /// `kind` is recorded in the gate file by the same atomic write as the rest of
+    /// the gate.
     pub fn open_gate(
         project_root: &Path,
         phase: PhaseId,
         stage: Stage,
-        context: &str,
-    ) -> Result<OpenedGate, GateError> {
-        Self::open_gate_with_kind(project_root, phase, stage, None, context)
-    }
-
-    /// [`open_gate`](Self::open_gate), recording `kind` in the gate file by the
-    /// same atomic write as the rest of the gate.
-    pub fn open_gate_with_kind(
-        project_root: &Path,
-        phase: PhaseId,
-        stage: Stage,
-        kind: Option<GateKind>,
+        kind: GateKind,
         context: &str,
     ) -> Result<OpenedGate, GateError> {
         Self::open_gate_as(project_root, phase, stage, &GateId::new(), kind, context)
@@ -559,22 +562,14 @@ impl Gates {
     ///
     /// A crash between the two leaves no gate file, so no writer can learn the id,
     /// and an unheld registration the stage's next close removes.
+    ///
+    /// `kind` is recorded in the gate file by the same atomic write as the rest of
+    /// the gate.
     pub fn open_registered(
         project_root: &Path,
         phase: PhaseId,
         stage: Stage,
-        context: &str,
-    ) -> Result<(OpenedGate, WaiterRegistration), GateError> {
-        Self::open_registered_with_kind(project_root, phase, stage, None, context)
-    }
-
-    /// [`open_registered`](Self::open_registered), recording `kind` in the gate
-    /// file by the same atomic write and registration as the rest of the gate.
-    pub fn open_registered_with_kind(
-        project_root: &Path,
-        phase: PhaseId,
-        stage: Stage,
-        kind: Option<GateKind>,
+        kind: GateKind,
         context: &str,
     ) -> Result<(OpenedGate, WaiterRegistration), GateError> {
         Self::open_registered_with_hooks(project_root, phase, stage, kind, context, || {}, || {})
@@ -587,7 +582,7 @@ impl Gates {
         project_root: &Path,
         phase: PhaseId,
         stage: Stage,
-        kind: Option<GateKind>,
+        kind: GateKind,
         context: &str,
         before_publish: impl FnOnce(),
         after_publish: impl FnOnce(),
@@ -619,7 +614,14 @@ impl Gates {
     ) -> Result<(OpenedGate, WaiterRegistration), GateError> {
         let gate_id = GateId::new();
         before_publish();
-        let opened = Self::open_gate_as(project_root, phase, stage, &gate_id, None, context)?;
+        let opened = Self::open_gate_as(
+            project_root,
+            phase,
+            stage,
+            &gate_id,
+            GateKind::StageFailure,
+            context,
+        )?;
         after_publish();
         let registration = Self::register_waiter(project_root, phase, stage, &gate_id)?;
         Ok((opened, registration))
@@ -633,7 +635,7 @@ impl Gates {
         phase: PhaseId,
         stage: Stage,
         gate_id: &GateId,
-        kind: Option<GateKind>,
+        kind: GateKind,
         context: &str,
     ) -> Result<OpenedGate, GateError> {
         let _lock = gate_lock(project_root, phase)?;
@@ -1387,9 +1389,10 @@ impl Gates {
         project_root: &Path,
         phase: PhaseId,
         stage: Stage,
+        kind: GateKind,
         context: &str,
     ) -> Result<PathBuf, GateError> {
-        Self::open_gate(project_root, phase, stage, context).map(|gate| gate.path)
+        Self::open_gate(project_root, phase, stage, kind, context).map(|gate| gate.path)
     }
 
     /// Write a gate file under `gate_id`. Disposes of nothing.
@@ -1398,7 +1401,7 @@ impl Gates {
         phase: PhaseId,
         stage: Stage,
         gate_id: &GateId,
-        kind: Option<GateKind>,
+        kind: GateKind,
         context: &str,
     ) -> Result<OpenedGate, GateError> {
         let gate = GateFile {
@@ -1407,7 +1410,7 @@ impl Gates {
             context: context.to_string(),
             timestamp: unix_now(),
             gate_id: gate_id.to_string(),
-            gate_kind: kind,
+            gate_kind: Some(kind),
         };
         let path = Self::gate_path(project_root, phase, stage);
         info!("writing gate {} for phase {phase}", stage);
@@ -2016,20 +2019,20 @@ mod tests {
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     /// 52-22: a gate's kind is a structured field of its file. A gate opened
-    /// with a kind reads back with it and its file holds the snake_case name; a
-    /// gate opened with none writes no `gate_kind` key; a 3.x-shaped file with
-    /// no such key reads as `None`.
+    /// with a kind reads back with it and its file holds the snake_case name. The
+    /// open path can no longer omit a kind, so the kindless case is a 3.x-shaped
+    /// file with no such key, which still loads and reads as `None`.
     #[test]
     fn a_gate_round_trips_its_kind() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(5222);
 
-        let opened = Gates::open_gate_with_kind(
+        let opened = Gates::open_gate(
             root,
             phase,
             Stage::Validate,
-            Some(GateKind::DisagreementOverPassed),
+            GateKind::DisagreementOverPassed,
             "the agent and GSD disagree",
         )
         .unwrap();
@@ -2038,12 +2041,6 @@ mod tests {
         assert_eq!(raw["gate_kind"], "disagreement_over_passed", "{text}");
         let back: GateFile = serde_json::from_str(&text).unwrap();
         assert_eq!(back.gate_kind, Some(GateKind::DisagreementOverPassed));
-
-        let kindless =
-            Gates::open_gate_with_kind(root, phase, Stage::Code, None, "no kind").unwrap();
-        let raw: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&kindless.path).unwrap()).unwrap();
-        assert!(raw.get("gate_kind").is_none(), "{raw}");
 
         let old: GateFile = serde_json::from_str(
             r#"{"phase":5222,"stage":"plan","context":"3.x","timestamp":"1750000000","gate_id":"g-3x"}"#,
@@ -2070,7 +2067,14 @@ mod tests {
     #[test]
     fn write_gate_creates_file_with_correct_path() {
         let dir = tempfile::tempdir().unwrap();
-        let path = Gates::write_gate(dir.path(), PhaseId::new(11), Stage::Validate, "ctx").unwrap();
+        let path = Gates::write_gate(
+            dir.path(),
+            PhaseId::new(11),
+            Stage::Validate,
+            GateKind::StageFailure,
+            "ctx",
+        )
+        .unwrap();
         assert!(path.ends_with(".devflow/gates/11-validate.json"));
         assert!(path.exists());
         let gate: GateFile =
@@ -2090,7 +2094,7 @@ mod tests {
             note: None,
             responded_by: Some("human".into()),
         };
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         Gates::answer(dir.path(), phase, stage, &gate, &response).unwrap();
@@ -2120,7 +2124,9 @@ mod tests {
             note: None,
             responded_by: Some("human".into()),
         };
-        let gate = Gates::open_gate(root, phase, stage, "ctx").unwrap().gate_id;
+        let gate = Gates::open_gate(root, phase, stage, GateKind::StageFailure, "ctx")
+            .unwrap()
+            .gate_id;
         let slot = Gates::answer_path(root, phase, stage, &gate);
         std::fs::create_dir(&slot).unwrap();
 
@@ -2175,7 +2181,7 @@ mod tests {
             note: None,
             responded_by: Some("human".into()),
         };
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         Gates::answer(dir.path(), phase, stage, &gate, &response).unwrap();
@@ -2213,7 +2219,7 @@ mod tests {
     fn claim_writes_received_true() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(11), Stage::Validate);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         Gates::claim(dir.path(), phase, stage, &gate).unwrap();
@@ -2229,7 +2235,7 @@ mod tests {
     fn a_claim_whose_directory_fsync_fails_leaves_no_ack_and_can_be_retried() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(12), Stage::Validate);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         let path = Gates::claim_path(dir.path(), phase, stage, &gate);
@@ -2256,7 +2262,7 @@ mod tests {
     fn close_removes_a_claimed_gates_three_files_idempotently() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(11), Stage::Validate);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         Gates::answer(dir.path(), phase, stage, &gate, &approved()).unwrap();
@@ -2275,7 +2281,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let phase = PhaseId::new(12);
         let stage = Stage::Validate;
-        let opened = Gates::open_gate(dir.path(), phase, stage, "ctx").unwrap();
+        let opened =
+            Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx").unwrap();
         let answer = Gates::answer(dir.path(), phase, stage, &opened.gate_id, &approved()).unwrap();
         Gates::claim(dir.path(), phase, stage, &opened.gate_id).unwrap();
         let claim = Gates::claim_path(dir.path(), phase, stage, &opened.gate_id);
@@ -2339,13 +2346,19 @@ mod tests {
             dir.path(),
             PhaseId::new(7),
             Stage::Validate,
+            GateKind::StageFailure,
             "approve the finish?",
         )
         .unwrap();
-        let answered =
-            Gates::open_gate(dir.path(), PhaseId::new(8), Stage::Validate, "review gaps")
-                .unwrap()
-                .gate_id;
+        let answered = Gates::open_gate(
+            dir.path(),
+            PhaseId::new(8),
+            Stage::Validate,
+            GateKind::StageFailure,
+            "review gaps",
+        )
+        .unwrap()
+        .gate_id;
         // Phase 8's gate gets answered; its answer/claim must hide it.
         Gates::answer(
             dir.path(),
@@ -2382,7 +2395,14 @@ mod tests {
     fn list_open_ignores_a_planted_temp() {
         let dir = tempfile::tempdir().unwrap();
         let phase = PhaseId::new(48);
-        Gates::write_gate(dir.path(), phase, Stage::Code, "real gate").unwrap();
+        Gates::write_gate(
+            dir.path(),
+            phase,
+            Stage::Code,
+            GateKind::StageFailure,
+            "real gate",
+        )
+        .unwrap();
         let gate = Gates::gate_path(dir.path(), phase, Stage::Code);
         let orphan = gate.with_file_name(format!(
             ".{}.1.0.tmp",
@@ -2402,9 +2422,23 @@ mod tests {
     fn write_gate_still_overwrites_a_leftover_request() {
         let dir = tempfile::tempdir().unwrap();
         let phase = PhaseId::new(48);
-        Gates::write_gate(dir.path(), phase, Stage::Code, "old request").unwrap();
+        Gates::write_gate(
+            dir.path(),
+            phase,
+            Stage::Code,
+            GateKind::StageFailure,
+            "old request",
+        )
+        .unwrap();
 
-        Gates::write_gate(dir.path(), phase, Stage::Code, "replacement request").unwrap();
+        Gates::write_gate(
+            dir.path(),
+            phase,
+            Stage::Code,
+            GateKind::StageFailure,
+            "replacement request",
+        )
+        .unwrap();
 
         let gate: GateFile = serde_json::from_str(
             &std::fs::read_to_string(Gates::gate_path(dir.path(), phase, Stage::Code)).unwrap(),
@@ -2421,7 +2455,7 @@ mod tests {
         let stage = Stage::Code;
         let gates_dir = Synced::Dir(Gates::dir(dir.path()));
 
-        Gates::write_gate(dir.path(), phase, stage, "ctx").unwrap();
+        Gates::write_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx").unwrap();
         let synced = take_synced();
         assert!(synced.contains(&gates_dir), "write_gate: {synced:?}");
 
@@ -2501,9 +2535,15 @@ mod tests {
             note: None,
             responded_by: None,
         };
-        let gate = Gates::open_gate(dir.path(), phase, Stage::Code, "ctx")
-            .unwrap()
-            .gate_id;
+        let gate = Gates::open_gate(
+            dir.path(),
+            phase,
+            Stage::Code,
+            GateKind::StageFailure,
+            "ctx",
+        )
+        .unwrap()
+        .gate_id;
 
         Gates::answer(dir.path(), phase, Stage::Code, &gate, &response).unwrap();
 
@@ -2522,7 +2562,7 @@ mod tests {
     fn an_answer_round_trips_through_await_answer() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(9), Stage::Validate);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         let response = GateResponse {
@@ -2570,7 +2610,7 @@ mod tests {
     fn answer_refuses_to_clobber_an_unconsumed_answer() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(4), Stage::Validate);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         let response = GateResponse {
@@ -2663,7 +2703,7 @@ mod tests {
     fn an_answer_that_approves_and_aborts_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         let both = GateResponse {
@@ -2691,7 +2731,7 @@ mod tests {
     fn a_hand_written_approve_and_abort_reads_as_abort() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         let hand_written = GateAnswer {
@@ -2905,7 +2945,7 @@ mod tests {
     fn await_answer_returns_the_answer_when_not_cancelled() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(13), Stage::Plan);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         let response = GateResponse {
@@ -3015,7 +3055,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
 
-        let opened = Gates::open_gate(dir.path(), phase, stage, "ctx").unwrap();
+        let opened =
+            Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx").unwrap();
         let gate = opened.gate_id.clone();
         assert!(is_gate_id(gate.as_str()), "{gate} is not a gate id");
         assert_eq!(opened.path, Gates::gate_path(dir.path(), phase, stage));
@@ -3059,8 +3100,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
 
-        let first = Gates::open_gate(dir.path(), phase, stage, "first").unwrap();
-        let second = Gates::open_gate(dir.path(), phase, stage, "second").unwrap();
+        let first =
+            Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "first").unwrap();
+        let second =
+            Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "second").unwrap();
 
         assert_ne!(first.gate_id, second.gate_id);
         assert_eq!(
@@ -3074,7 +3117,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
 
-        let path = Gates::write_gate(dir.path(), phase, stage, "ctx").unwrap();
+        let path =
+            Gates::write_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx").unwrap();
 
         assert_eq!(path, Gates::gate_path(dir.path(), phase, stage));
         let gate = read_gate(dir.path(), phase, stage);
@@ -3100,11 +3144,11 @@ mod tests {
     fn write_gate_sets_aside_the_earlier_gates_unconsumed_answer() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        Gates::write_gate(dir.path(), phase, stage, "first").unwrap();
+        Gates::write_gate(dir.path(), phase, stage, GateKind::StageFailure, "first").unwrap();
         let first = GateId::parse(&read_gate(dir.path(), phase, stage).gate_id).unwrap();
         let answer = Gates::answer(dir.path(), phase, stage, &first, &approved()).unwrap();
 
-        Gates::write_gate(dir.path(), phase, stage, "second").unwrap();
+        Gates::write_gate(dir.path(), phase, stage, GateKind::StageFailure, "second").unwrap();
 
         assert_ne!(read_gate(dir.path(), phase, stage).gate_id, first.as_str());
         assert!(!answer.exists());
@@ -3117,7 +3161,7 @@ mod tests {
     fn an_answer_without_a_gate_id_is_quarantined_and_a_valid_one_is_then_accepted() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         let slot = Gates::answer_path(dir.path(), phase, stage, &gate);
@@ -3159,7 +3203,7 @@ mod tests {
     fn answer_sets_aside_an_unbound_answer_in_its_own_slot_before_publishing() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         let slot = Gates::answer_path(dir.path(), phase, stage, &gate);
@@ -3206,7 +3250,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
         let old = GateId::new();
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         let slot = Gates::answer_path(dir.path(), phase, stage, &gate);
@@ -3252,7 +3296,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
         let old = GateId::new();
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
 
@@ -3284,14 +3328,14 @@ mod tests {
     fn a_late_respond_after_cleanup_cannot_decide_the_next_gate() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let first = Gates::open_gate(dir.path(), phase, stage, "first")
+        let first = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "first")
             .unwrap()
             .gate_id;
         let mut next = None;
 
         let late = Gates::answer_with_hook(dir.path(), phase, stage, &first, &approved(), || {
             next = Some(
-                Gates::open_gate(dir.path(), phase, stage, "next")
+                Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "next")
                     .unwrap()
                     .gate_id,
             );
@@ -3323,7 +3367,7 @@ mod tests {
     fn a_hostile_gate_id_in_an_answer_is_quarantined_as_noid() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         std::fs::write(
@@ -3409,7 +3453,7 @@ mod tests {
     fn a_gate_operation_gives_up_on_a_held_gate_lock_after_its_bound() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         let slot = Gates::answer_path(dir.path(), phase, stage, &gate);
@@ -3445,7 +3489,7 @@ mod tests {
     fn every_stage_answered(root: &Path, phase: PhaseId) -> Vec<PathBuf> {
         let mut files = Vec::new();
         for stage in STAGES {
-            let gate = Gates::open_gate(root, phase, stage, "ctx").unwrap();
+            let gate = Gates::open_gate(root, phase, stage, GateKind::StageFailure, "ctx").unwrap();
             let answer = Gates::answer(root, phase, stage, &gate.gate_id, &approved()).unwrap();
             files.extend([gate.path, answer]);
         }
@@ -3538,7 +3582,7 @@ mod tests {
     fn an_answer_whose_recheck_cannot_take_the_gate_lock_is_published_unconfirmed() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         let mut parked = None;
@@ -3575,7 +3619,7 @@ mod tests {
 
         // The control: held before the call, the writer publishes nothing and says so.
         let other = Stage::Validate;
-        let second = Gates::open_gate(dir.path(), phase, other, "ctx")
+        let second = Gates::open_gate(dir.path(), phase, other, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         let holder = hold_gate_lock(dir.path(), phase);
@@ -3609,7 +3653,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let (phase, stage) = (PhaseId::new(2102), Stage::Validate);
-        let gate = Gates::open_gate(root, phase, stage, "ctx").unwrap().gate_id;
+        let gate = Gates::open_gate(root, phase, stage, GateKind::StageFailure, "ctx")
+            .unwrap()
+            .gate_id;
         let response = GateResponse {
             approved: true,
             abort: false,
@@ -3734,7 +3780,7 @@ mod tests {
     fn closing_a_gate_sets_aside_unconsumed_answers_and_removes_consumed_ones() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         Gates::answer(dir.path(), phase, stage, &gate, &approved()).unwrap();
@@ -3789,7 +3835,7 @@ mod tests {
     fn a_claimed_body_that_does_not_bind_is_reported_and_set_aside_not_deleted() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         std::fs::write(
@@ -3826,7 +3872,7 @@ mod tests {
     fn a_paused_consumer_cannot_claim_a_gate_that_closed_or_was_replaced() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let first = Gates::open_gate(dir.path(), phase, stage, "first")
+        let first = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "first")
             .unwrap()
             .gate_id;
         Gates::answer(dir.path(), phase, stage, &first, &approved()).unwrap();
@@ -3842,7 +3888,7 @@ mod tests {
             Claim::Claimed
         );
         Gates::close(dir.path(), phase, stage).unwrap();
-        let next = Gates::open_gate(dir.path(), phase, stage, "next")
+        let next = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "next")
             .unwrap()
             .gate_id;
         let next_gate_file = std::fs::read(Gates::gate_path(dir.path(), phase, stage)).unwrap();
@@ -3867,7 +3913,7 @@ mod tests {
 
         // A gate closed with none opened after it.
         let other = Stage::Validate;
-        let closed = Gates::open_gate(dir.path(), phase, other, "ctx")
+        let closed = Gates::open_gate(dir.path(), phase, other, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         Gates::close(dir.path(), phase, other).unwrap();
@@ -3896,7 +3942,7 @@ mod tests {
         };
         if crate::test_support::in_child_test(NAME) {
             let root = PathBuf::from(std::env::var_os("CLAIM_KILL_ROOT").unwrap());
-            let gate = Gates::open_gate(&root, phase, stage, "ctx")
+            let gate = Gates::open_gate(&root, phase, stage, GateKind::StageFailure, "ctx")
                 .unwrap()
                 .gate_id;
             Gates::answer(&root, phase, stage, &gate, &kept).unwrap();
@@ -3940,7 +3986,7 @@ mod tests {
         assert_eq!(events[0]["note"], "kept");
 
         // The control: an answer nobody claimed is never reported as claimed.
-        let unclaimed = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let unclaimed = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         Gates::answer(dir.path(), phase, stage, &unclaimed, &approved()).unwrap();
@@ -3965,7 +4011,7 @@ mod tests {
         let second = GateId::parse(SECOND).unwrap();
         if crate::test_support::in_child_test(NAME) {
             let root = PathBuf::from(std::env::var_os("CLOSE_KILL_ROOT").unwrap());
-            Gates::open_gate(&root, phase, stage, "ctx").unwrap();
+            Gates::open_gate(&root, phase, stage, GateKind::StageFailure, "ctx").unwrap();
             plant_claimed_pair(&root, phase, stage, &first);
             plant_claimed_pair(&root, phase, stage, &second);
             let mut hook = |step: DisposalStep| {
@@ -4029,14 +4075,14 @@ mod tests {
     fn opening_a_gate_sets_aside_the_previous_gates_unconsumed_answer() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let first = Gates::open_gate(dir.path(), phase, stage, "first")
+        let first = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "first")
             .unwrap()
             .gate_id;
         Gates::answer(dir.path(), phase, stage, &first, &approved()).unwrap();
         let legacy = legacy_response_path(dir.path(), phase, stage);
         std::fs::write(&legacy, "{\"approved\":true}").unwrap();
 
-        let next = Gates::open_gate(dir.path(), phase, stage, "next")
+        let next = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "next")
             .unwrap()
             .gate_id;
 
@@ -4059,9 +4105,15 @@ mod tests {
     fn quarantined_lists_every_set_aside_answer() {
         let dir = tempfile::tempdir().unwrap();
         let decimal: PhaseId = "50.1".parse().unwrap();
-        let first = Gates::open_gate(dir.path(), PhaseId::new(7), Stage::Code, "ctx")
-            .unwrap()
-            .gate_id;
+        let first = Gates::open_gate(
+            dir.path(),
+            PhaseId::new(7),
+            Stage::Code,
+            GateKind::StageFailure,
+            "ctx",
+        )
+        .unwrap()
+        .gate_id;
         Gates::answer(
             dir.path(),
             PhaseId::new(7),
@@ -4071,9 +4123,15 @@ mod tests {
         )
         .unwrap();
         Gates::close(dir.path(), PhaseId::new(7), Stage::Code).unwrap();
-        let second = Gates::open_gate(dir.path(), decimal, Stage::Validate, "ctx")
-            .unwrap()
-            .gate_id;
+        let second = Gates::open_gate(
+            dir.path(),
+            decimal,
+            Stage::Validate,
+            GateKind::StageFailure,
+            "ctx",
+        )
+        .unwrap()
+        .gate_id;
         std::fs::write(
             Gates::answer_path(dir.path(), decimal, Stage::Validate, &second),
             "not json",
@@ -4110,7 +4168,7 @@ mod tests {
     fn reap_answer_writes_an_abort_for_the_observed_gate_only() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         let other = GateId::new();
@@ -4141,7 +4199,7 @@ mod tests {
     fn list_open_reports_the_gate_id_and_hides_a_gate_its_live_answer_decided() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         let open = Gates::list_open(dir.path());
@@ -4151,7 +4209,14 @@ mod tests {
         // What sits beside a gate file must not read as another request, even with a
         // gate-shaped body, in a decimal phase whose own name holds a dot.
         let decimal: PhaseId = "50.1".parse().unwrap();
-        let decimal_gate = Gates::open_gate(dir.path(), decimal, stage, "decimal").unwrap();
+        let decimal_gate = Gates::open_gate(
+            dir.path(),
+            decimal,
+            stage,
+            GateKind::StageFailure,
+            "decimal",
+        )
+        .unwrap();
         let gate_shaped = std::fs::read_to_string(&decimal_gate.path).unwrap();
         for name in [
             "50.1-code.noid.1.1.0.quarantined.json",
@@ -4194,7 +4259,7 @@ mod tests {
     fn close_reports_removed_for_a_lone_gate_file_and_for_a_lone_temp() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        Gates::open_gate(dir.path(), phase, stage, "ctx").unwrap();
+        Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx").unwrap();
         assert!(Gates::close(dir.path(), phase, stage).unwrap().removed);
 
         std::fs::write(Gates::dir(dir.path()).join(".07-code.json.1.0.tmp"), "temp").unwrap();
@@ -4221,7 +4286,7 @@ mod tests {
     fn a_claim_with_its_answer_already_gone_is_reported_without_one() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         assert_eq!(
@@ -4247,7 +4312,7 @@ mod tests {
     fn a_claimed_answer_that_cannot_be_read_stops_the_close_and_keeps_the_gate_file() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         let slot = Gates::answer_path(dir.path(), phase, stage, &gate);
@@ -4284,7 +4349,7 @@ mod tests {
     fn an_answer_slot_that_cannot_be_read_is_not_an_empty_slot() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         let slot = Gates::answer_path(dir.path(), phase, stage, &gate);
@@ -4404,7 +4469,7 @@ mod tests {
             .as_secs();
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         let slot = Gates::answer_path(dir.path(), phase, stage, &gate);
@@ -4527,7 +4592,7 @@ mod tests {
     fn a_registered_waiter_reads_live_and_its_answer_is_awaited_and_claimed() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         let registration = Gates::register_waiter(dir.path(), phase, stage, &gate).unwrap();
@@ -4579,7 +4644,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let path_dir = tempfile::tempdir().unwrap();
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
 
@@ -4620,7 +4685,7 @@ mod tests {
         const ID_LESS_BODY: &str = "{\"approved\":true}";
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         let slot = Gates::answer_path(dir.path(), phase, stage, &gate);
@@ -4798,7 +4863,7 @@ mod tests {
             shipped.path(),
             phase,
             stage,
-            None,
+            GateKind::StageFailure,
             "ctx",
             || {},
             || shipped_read = Some(answer_if_registered(shipped.path(), phase, stage)),
@@ -4860,7 +4925,7 @@ mod tests {
                 &root,
                 phase,
                 stage,
-                None,
+                GateKind::StageFailure,
                 "ctx",
                 || kill_at(BEFORE_PUBLISH),
                 || kill_at(AFTER_PUBLISH),
@@ -4926,7 +4991,7 @@ mod tests {
             dir.path(),
             phase,
             stage,
-            None,
+            GateKind::StageFailure,
             "ctx",
             || registered_at_publish = Some(waiter_files(dir.path()).len()),
             || panic!("the publish must fail"),
@@ -4967,7 +5032,7 @@ mod tests {
     fn await_answer_checks_cancellation_before_reading_an_answer() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         let slot = Gates::answer(dir.path(), phase, stage, &gate, &approved()).unwrap();
@@ -4989,7 +5054,7 @@ mod tests {
     fn await_answer_reads_once_more_at_its_deadline() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         let root = dir.path().to_path_buf();
@@ -5044,7 +5109,7 @@ mod tests {
         const MORE_READS_SEEN: u32 = 3;
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
-        let first = Gates::open_gate(dir.path(), phase, stage, "first")
+        let first = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "first")
             .unwrap()
             .gate_id;
         let registration = Gates::register_waiter(dir.path(), phase, stage, &first).unwrap();
@@ -5061,7 +5126,7 @@ mod tests {
             })
         };
 
-        let current = Gates::open_gate(dir.path(), phase, stage, "second")
+        let current = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "second")
             .unwrap()
             .gate_id;
         Gates::answer(dir.path(), phase, stage, &current, &approved()).unwrap();
@@ -5121,7 +5186,7 @@ mod tests {
 
         let opened = tempfile::tempdir().unwrap();
         preanswer_gate(opened.path(), phase, stage, &rejection());
-        let gate = Gates::open_gate(opened.path(), phase, stage, "ctx")
+        let gate = Gates::open_gate(opened.path(), phase, stage, GateKind::StageFailure, "ctx")
             .unwrap()
             .gate_id;
         assert_eq!(
@@ -5132,8 +5197,14 @@ mod tests {
 
         let registered = tempfile::tempdir().unwrap();
         preanswer_gate(registered.path(), phase, stage, &rejection());
-        let (opened_gate, registration) =
-            Gates::open_registered(registered.path(), phase, stage, "ctx").unwrap();
+        let (opened_gate, registration) = Gates::open_registered(
+            registered.path(),
+            phase,
+            stage,
+            GateKind::StageFailure,
+            "ctx",
+        )
+        .unwrap();
         assert_eq!(
             Gates::await_answer(
                 registered.path(),
@@ -5149,7 +5220,7 @@ mod tests {
 
         let written = tempfile::tempdir().unwrap();
         preanswer_gate(written.path(), phase, stage, &rejection());
-        Gates::write_gate(written.path(), phase, stage, "ctx").unwrap();
+        Gates::write_gate(written.path(), phase, stage, GateKind::StageFailure, "ctx").unwrap();
         let gate = GateId::parse(&read_gate(written.path(), phase, stage).gate_id).unwrap();
         assert_eq!(
             Gates::await_answer(written.path(), phase, stage, &gate, 5, || false),
@@ -5159,9 +5230,15 @@ mod tests {
         // The control: a pre-answer for another stage decides nothing here.
         let elsewhere = tempfile::tempdir().unwrap();
         preanswer_gate(elsewhere.path(), phase, Stage::Validate, &rejection());
-        let gate = Gates::open_gate(elsewhere.path(), phase, stage, "ctx")
-            .unwrap()
-            .gate_id;
+        let gate = Gates::open_gate(
+            elsewhere.path(),
+            phase,
+            stage,
+            GateKind::StageFailure,
+            "ctx",
+        )
+        .unwrap()
+        .gate_id;
         assert_eq!(
             Gates::read_answer(elsewhere.path(), phase, stage, &gate),
             AnswerRead::None
@@ -5181,7 +5258,7 @@ mod tests {
             || {
                 let dir = tempfile::tempdir().unwrap();
                 let (phase, stage) = (PhaseId::new(7), Stage::Code);
-                Gates::write_gate(dir.path(), phase, stage, "ctx").unwrap();
+                Gates::write_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx").unwrap();
                 let live = GateId::parse(&read_gate(dir.path(), phase, stage).gate_id).unwrap();
                 Gates::answer(dir.path(), phase, stage, &live, &approved()).unwrap();
                 assert_eq!(
@@ -5285,7 +5362,7 @@ mod tests {
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
         std::fs::create_dir_all(Gates::preanswer_path(dir.path(), phase, stage)).unwrap();
 
-        let opened = Gates::open_gate(dir.path(), phase, stage, "ctx");
+        let opened = Gates::open_gate(dir.path(), phase, stage, GateKind::StageFailure, "ctx");
 
         assert!(matches!(opened, Err(GateError::Io(_))), "{opened:?}");
     }
@@ -5573,9 +5650,15 @@ mod tests {
 
         let before_open = tempfile::tempdir().unwrap();
         let (path, body) = plant_legacy_answer(before_open.path(), phase, stage);
-        let gate = Gates::open_gate(before_open.path(), phase, stage, "ctx")
-            .unwrap()
-            .gate_id;
+        let gate = Gates::open_gate(
+            before_open.path(),
+            phase,
+            stage,
+            GateKind::StageFailure,
+            "ctx",
+        )
+        .unwrap()
+        .gate_id;
         assert!(!path.exists(), "the open sets the legacy answer aside");
         assert_eq!(quarantine_reasons(before_open.path()), ["legacy_unkeyed"]);
         let set_aside = quarantine_files(before_open.path());
@@ -5587,9 +5670,15 @@ mod tests {
         );
 
         let after_open = tempfile::tempdir().unwrap();
-        let live = Gates::open_gate(after_open.path(), phase, stage, "ctx")
-            .unwrap()
-            .gate_id;
+        let live = Gates::open_gate(
+            after_open.path(),
+            phase,
+            stage,
+            GateKind::StageFailure,
+            "ctx",
+        )
+        .unwrap()
+        .gate_id;
         let (path, body) = plant_legacy_answer(after_open.path(), phase, stage);
         let open = Gates::list_open(after_open.path());
         assert_eq!(open.len(), 1, "a legacy answer does not hide the gate");
@@ -5619,9 +5708,15 @@ mod tests {
     fn a_gate_file_without_an_id_is_not_listed_as_open() {
         let dir = tempfile::tempdir().unwrap();
         let phase = PhaseId::new(7);
-        let listed = Gates::open_gate(dir.path(), phase, Stage::Validate, "listed")
-            .unwrap()
-            .gate_id;
+        let listed = Gates::open_gate(
+            dir.path(),
+            phase,
+            Stage::Validate,
+            GateKind::StageFailure,
+            "listed",
+        )
+        .unwrap()
+        .gate_id;
         let mut idless = serde_json::to_value(GateFile {
             phase,
             stage: Stage::Code,

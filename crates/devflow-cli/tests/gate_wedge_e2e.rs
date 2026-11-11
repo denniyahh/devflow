@@ -212,9 +212,15 @@ fn gate_abort_writes_an_answer_with_the_abort_field_set() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(4823);
-    let gate = Gates::open_gate(root, phase, Stage::Code, "an open Code gate")
-        .unwrap()
-        .gate_id;
+    let gate = Gates::open_gate(
+        root,
+        phase,
+        Stage::Code,
+        devflow_core::gates::GateKind::StageFailure,
+        "an open Code gate",
+    )
+    .unwrap()
+    .gate_id;
     let _waiter = Gates::register_waiter(root, phase, Stage::Code, &gate).unwrap();
 
     let output = answer_code_gate(&home, root, phase, "abort", "operator stop");
@@ -563,12 +569,31 @@ fn dry_run_sweep_reports_no_waiter_gates_as_left_alone() {
     let phase = PhaseId::new(4818);
     let validate_phase = PhaseId::new(4819);
     let live_validate_phase = PhaseId::new(4820);
-    Gates::write_gate(root, phase, Stage::Code, "abandoned").unwrap();
-    Gates::write_gate(root, validate_phase, Stage::Validate, "release").unwrap();
-    let live_validate_gate =
-        Gates::open_gate(root, live_validate_phase, Stage::Validate, "live poller")
-            .unwrap()
-            .gate_id;
+    Gates::write_gate(
+        root,
+        phase,
+        Stage::Code,
+        devflow_core::gates::GateKind::StageFailure,
+        "abandoned",
+    )
+    .unwrap();
+    Gates::write_gate(
+        root,
+        validate_phase,
+        Stage::Validate,
+        devflow_core::gates::GateKind::StageFailure,
+        "release",
+    )
+    .unwrap();
+    let live_validate_gate = Gates::open_gate(
+        root,
+        live_validate_phase,
+        Stage::Validate,
+        devflow_core::gates::GateKind::StageFailure,
+        "live poller",
+    )
+    .unwrap()
+    .gate_id;
     let _live_validate_waiter = Gates::register_waiter(
         root,
         live_validate_phase,

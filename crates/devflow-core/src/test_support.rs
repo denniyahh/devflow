@@ -530,15 +530,28 @@ mod tests {
 
     fn close_and_open(root: &std::path::Path) {
         Gates::close(root, PHASE, STAGE).unwrap();
-        Gates::open_gate(root, PHASE, STAGE, "next").unwrap();
+        Gates::open_gate(
+            root,
+            PHASE,
+            STAGE,
+            crate::gates::GateKind::StageFailure,
+            "next",
+        )
+        .unwrap();
     }
 
     #[test]
     fn with_answer_before_publish_runs_between_the_check_and_the_publish() {
         let dir = tempfile::tempdir().unwrap();
-        let first = Gates::open_gate(dir.path(), PHASE, STAGE, "first")
-            .unwrap()
-            .gate_id;
+        let first = Gates::open_gate(
+            dir.path(),
+            PHASE,
+            STAGE,
+            crate::gates::GateKind::StageFailure,
+            "first",
+        )
+        .unwrap()
+        .gate_id;
         let root = dir.path().to_path_buf();
         let runs = Rc::new(Cell::new(0));
         let hook_runs = runs.clone();
@@ -568,9 +581,15 @@ mod tests {
         // The control: run just before `answer`, the same step fails its id check,
         // so the hook above ran after that check.
         let before = tempfile::tempdir().unwrap();
-        let observed = Gates::open_gate(before.path(), PHASE, STAGE, "first")
-            .unwrap()
-            .gate_id;
+        let observed = Gates::open_gate(
+            before.path(),
+            PHASE,
+            STAGE,
+            crate::gates::GateKind::StageFailure,
+            "first",
+        )
+        .unwrap()
+        .gate_id;
         close_and_open(before.path());
         let refused = Gates::answer(before.path(), PHASE, STAGE, &observed, &approved());
         assert!(
@@ -582,9 +601,15 @@ mod tests {
     #[test]
     fn with_answer_before_publish_runs_its_hook_once_and_never_after_its_body() {
         let dir = tempfile::tempdir().unwrap();
-        let gate = Gates::open_gate(dir.path(), PHASE, STAGE, "ctx")
-            .unwrap()
-            .gate_id;
+        let gate = Gates::open_gate(
+            dir.path(),
+            PHASE,
+            STAGE,
+            crate::gates::GateKind::StageFailure,
+            "ctx",
+        )
+        .unwrap()
+        .gate_id;
         let runs = Rc::new(Cell::new(0));
         let counted = |runs: &Rc<Cell<i32>>| {
             let runs = runs.clone();
@@ -608,9 +633,15 @@ mod tests {
     #[test]
     fn with_answer_before_publish_also_runs_inside_reap_answer() {
         let dir = tempfile::tempdir().unwrap();
-        let gate = Gates::open_gate(dir.path(), PHASE, STAGE, "ctx")
-            .unwrap()
-            .gate_id;
+        let gate = Gates::open_gate(
+            dir.path(),
+            PHASE,
+            STAGE,
+            crate::gates::GateKind::StageFailure,
+            "ctx",
+        )
+        .unwrap()
+        .gate_id;
         let runs = Rc::new(Cell::new(0));
         let hook_runs = runs.clone();
 
@@ -625,9 +656,15 @@ mod tests {
     #[test]
     fn gate_answer_files_lists_keyed_and_legacy_answers() {
         let dir = tempfile::tempdir().unwrap();
-        let gate = Gates::open_gate(dir.path(), PHASE, STAGE, "ctx")
-            .unwrap()
-            .gate_id;
+        let gate = Gates::open_gate(
+            dir.path(),
+            PHASE,
+            STAGE,
+            crate::gates::GateKind::StageFailure,
+            "ctx",
+        )
+        .unwrap()
+        .gate_id;
         let keyed = Gates::answer(dir.path(), PHASE, STAGE, &gate, &approved()).unwrap();
         let legacy = Gates::dir(dir.path()).join("07-code.response.json");
         std::fs::write(&legacy, "{}").unwrap();
@@ -651,7 +688,14 @@ mod tests {
             "{refused:?}"
         );
 
-        Gates::write_gate(dir.path(), PHASE, STAGE, "ctx").unwrap();
+        Gates::write_gate(
+            dir.path(),
+            PHASE,
+            STAGE,
+            crate::gates::GateKind::StageFailure,
+            "ctx",
+        )
+        .unwrap();
         let live = live_gate(dir.path());
         let path = answer_open_gate(dir.path(), PHASE, STAGE, &approved()).unwrap();
 

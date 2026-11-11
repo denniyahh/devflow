@@ -427,7 +427,7 @@ pub(crate) fn run_gate(
     project_root: &Path,
     state: &mut State,
     stage: Stage,
-    kind: Option<GateKind>,
+    kind: GateKind,
     context: &str,
 ) -> Result<GateAction, CliError> {
     run_gate_with_timeout(
@@ -449,7 +449,7 @@ pub(crate) fn run_gate_with_event_context(
     project_root: &Path,
     state: &mut State,
     stage: Stage,
-    kind: Option<GateKind>,
+    kind: GateKind,
     context: &str,
     event_context: &str,
 ) -> Result<GateAction, CliError> {
@@ -475,7 +475,7 @@ pub(crate) fn run_gate_with_timeout(
     project_root: &Path,
     state: &mut State,
     stage: Stage,
-    kind: Option<GateKind>,
+    kind: GateKind,
     context: &str,
     timeout_secs: u64,
 ) -> Result<GateAction, CliError> {
@@ -491,13 +491,13 @@ pub(crate) fn run_gate_with_timeout(
 
 /// The body [`run_gate_with_timeout`] and [`run_gate_with_event_context`] share.
 /// `contexts` is the gate's context and the one its `gate_fired` event carries.
-/// The gate's `kind` is written by the same atomic write as the rest of the gate
-/// file (52-22).
+/// The gate's `kind` is required, so no gate opens without one (D-39), and it is
+/// written by the same atomic write as the rest of the gate file (52-22).
 fn open_and_await(
     project_root: &Path,
     state: &mut State,
     stage: Stage,
-    kind: Option<GateKind>,
+    kind: GateKind,
     contexts: (&str, &str),
     timeout_secs: u64,
 ) -> Result<GateAction, CliError> {
@@ -506,7 +506,7 @@ fn open_and_await(
     // A crash inside this call before the publish leaves `gate_pending` with no gate
     // file, which `doctor`'s `check_gate_pending_without_gate` reports.
     let (opened, registration) = fenced(project_root, state.phase, || {
-        Ok(Gates::open_registered_with_kind(
+        Ok(Gates::open_registered(
             project_root,
             state.phase,
             stage,
@@ -894,7 +894,14 @@ mod tests {
         let phase = PhaseId::new(5311);
         let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         workflow::save_state(&state).unwrap();
-        Gates::open_gate(root, phase, state.stage, "g").unwrap();
+        Gates::open_gate(
+            root,
+            phase,
+            state.stage,
+            devflow_core::gates::GateKind::StageFailure,
+            "g",
+        )
+        .unwrap();
         let lock = std::fs::File::options()
             .read(true)
             .write(true)
@@ -992,7 +999,14 @@ mod tests {
 
         // The phase reaching the same gate again later (e.g. after a restart) waits
         // for a fresh human decision.
-        let refired = Gates::open_gate(root, phase, Stage::Validate, "re-fired gate").unwrap();
+        let refired = Gates::open_gate(
+            root,
+            phase,
+            Stage::Validate,
+            devflow_core::gates::GateKind::StageFailure,
+            "re-fired gate",
+        )
+        .unwrap();
         let started = std::time::Instant::now();
         let end = crate::pipeline_launch::wait_for_gate_response(
             root,
@@ -1215,7 +1229,15 @@ mod tests {
         let root_owned = root.to_path_buf();
         let handle = std::thread::spawn(move || {
             let mut state = workflow::load_state(&root_owned, phase).unwrap();
-            run_gate_with_timeout(&root_owned, &mut state, Stage::Code, None, "ctx", 30).unwrap();
+            run_gate_with_timeout(
+                &root_owned,
+                &mut state,
+                Stage::Code,
+                GateKind::StageFailure,
+                "ctx",
+                30,
+            )
+            .unwrap();
             state.gate_notify_cmd
         });
         let gate_path = Gates::gate_path(root, phase, Stage::Code);
@@ -1298,8 +1320,15 @@ mod tests {
 
         let root_owned = root.to_path_buf();
         let handle = std::thread::spawn(move || {
-            run_gate_with_timeout(&root_owned, &mut loaded, Stage::Code, None, "ctx", 30)
-                .map(|action| (action, loaded.gate_notify_cmd))
+            run_gate_with_timeout(
+                &root_owned,
+                &mut loaded,
+                Stage::Code,
+                GateKind::StageFailure,
+                "ctx",
+                30,
+            )
+            .map(|action| (action, loaded.gate_notify_cmd))
         });
         let gate_path = Gates::gate_path(root, phase, Stage::Code);
         for _ in 0..500 {
@@ -1362,8 +1391,15 @@ mod tests {
         let state_file = workflow::state_path(root, phase);
         std::fs::write(&state_file, "{not json").unwrap();
 
-        let err = run_gate_with_timeout(root, &mut loaded, Stage::Code, None, "ctx", 30)
-            .expect_err("an unparseable state must fail the gate entry");
+        let err = run_gate_with_timeout(
+            root,
+            &mut loaded,
+            Stage::Code,
+            GateKind::StageFailure,
+            "ctx",
+            30,
+        )
+        .expect_err("an unparseable state must fail the gate entry");
 
         let text = err.to_string();
         assert!(
@@ -1400,7 +1436,15 @@ mod tests {
             WAIT_HOLDS_WRITE_LOCK.set(hold_across_wait);
             WAIT_ENTERED.set(Some(entered_tx));
             let mut state = workflow::load_state(&root_owned, phase).unwrap();
-            run_gate_with_timeout(&root_owned, &mut state, Stage::Code, None, "ctx", 30).map(|_| ())
+            run_gate_with_timeout(
+                &root_owned,
+                &mut state,
+                Stage::Code,
+                GateKind::StageFailure,
+                "ctx",
+                30,
+            )
+            .map(|_| ())
         });
         entered_rx
             .recv_timeout(std::time::Duration::from_secs(30))
@@ -1524,7 +1568,14 @@ mod tests {
         let root_owned = root.to_path_buf();
         std::thread::spawn(move || {
             let mut state = workflow::load_state(&root_owned, phase).unwrap();
-            run_gate_with_timeout(&root_owned, &mut state, Stage::Code, None, "ctx", 30)
+            run_gate_with_timeout(
+                &root_owned,
+                &mut state,
+                Stage::Code,
+                GateKind::StageFailure,
+                "ctx",
+                30,
+            )
         })
     }
 
@@ -1695,8 +1746,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(84);
-        let old = Gates::open_gate(root, phase, Stage::Code, "g1").unwrap();
-        Gates::open_gate(root, phase, Stage::Code, "g2").unwrap();
+        let old = Gates::open_gate(
+            root,
+            phase,
+            Stage::Code,
+            devflow_core::gates::GateKind::StageFailure,
+            "g1",
+        )
+        .unwrap();
+        Gates::open_gate(
+            root,
+            phase,
+            Stage::Code,
+            devflow_core::gates::GateKind::StageFailure,
+            "g2",
+        )
+        .unwrap();
         let slot = Gates::answer_path(root, phase, Stage::Code, &old.gate_id);
         let idless = br#"{"approved": true}"#;
         std::fs::write(&slot, idless).unwrap();

@@ -26,7 +26,7 @@ use crate::pipeline_launch::launch_stage;
 use crate::pipeline_launch::launch_stage_inner;
 use crate::pipeline_launch::stream_launch_enabled;
 use crate::pipeline_outcomes::truncate_reason;
-use devflow_core::gates::GateAction;
+use devflow_core::gates::{GateAction, GateKind};
 use devflow_core::git::git_command;
 use devflow_core::gsd_config::{self, GsdConfigError};
 use devflow_core::mode::{self, Mode};
@@ -1303,7 +1303,7 @@ pub(crate) fn run_preflight(
              (retry, loop-to-code, or abort)",
             truncate_reason(&reason)
         );
-        match run_gate(project_root, state, stage, None, &context)? {
+        match run_gate(project_root, state, stage, GateKind::Preflight, &context)? {
             GateAction::Advance => {
                 // D-18f: approval is an explicit override — skip the
                 // just-adjudicated check on the retry (see the function
