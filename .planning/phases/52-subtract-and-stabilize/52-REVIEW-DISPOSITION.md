@@ -36,12 +36,12 @@ recorded: 2026-11-11T17:15:19.010Z
 
 | Finding | Severity | Disposition | Source |
 |---------|----------|-------------|--------|
-| CR-01 | critical | open | - |
-| CR-02 | critical | open | - |
-| WR-01 | warning | open | - |
-| IN-01 | info | open | - |
-| IN-02 | info | open | - |
-| IN-03 | info | open | - |
+| CR-01 | critical | fixed | bc88f9a (operator decision 2026-11-11: an ambiguous verdict always gates); test `pipeline_outcomes::tests::an_ambiguous_verdict_gates_at_once_in_auto_over_every_status` |
+| CR-02 | critical | open | awaiting the operator's decision on the `--force` design (asked 2026-11-11) |
+| WR-01 | warning | fixed | f4df92d; test `gsd_reader::tests::a_reader_whose_child_holds_stdout_times_out_and_the_child_is_killed`; a holder that leaves the process group is still out of reach (documented) |
+| IN-01 | info | fixed | b616cbe |
+| IN-02 | info | fixed | dc85bb6 |
+| IN-03 | info | open | waits on the same `--force` design decision as CR-02 |
 
 Dispositions: `open` (recorded, not yet triaged), `fixed`, `skipped`, `deferred`.
 Set `deferred` by hand and put the reason in the Source cell; both are preserved. A `|` in the reason is kept as prose and escaped on the next run.
