@@ -541,7 +541,15 @@ fn start_until_unknown_stage_is_rejected_by_clap() {
 }
 
 /// Subcommands v4.0 removed (D-01). Later cut plans append to this list.
-const REMOVED_SUBCOMMANDS: &[&str] = &["list", "reference", "test", "release", "parallel", "ship"];
+const REMOVED_SUBCOMMANDS: &[&str] = &[
+    "list",
+    "reference",
+    "test",
+    "release",
+    "parallel",
+    "ship",
+    "evidence",
+];
 
 /// The subcommand names listed under `Commands:` in a `devflow --help` output.
 fn help_subcommand_names(help: &str) -> Vec<&str> {
