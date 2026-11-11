@@ -670,6 +670,33 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.231: `pre-push` Runs the Workspace Divergence Check Against the Checkout, Not the Pushed Ref (BACKLOG)
+
+**Found:** 2026-11-11, Phase 52 close-out. `git push -u origin feature/phase-52-pr` from the phase-52 worktree with
+`feature/phase-52` checked out was refused with about 100 "undeclared change to a develop file" lines.
+**Defect:** `scripts/hooks/pre-push` runs `scripts/check-workspace-divergence.sh` whenever the pushing checkout has a
+`.workspace-divergence` file, and the check diffs `origin/develop` against `HEAD`. Neither looks at the ref being
+pushed, so a clean PR branch pushed from a workspace-style checkout is judged as the checkout's own branch. The same
+push from a checkout of the PR branch itself (no manifest) passed.
+**Not established:** whether the reverse also happens (a workspace branch pushed from a develop-based checkout would
+skip the check: a fail-open shape). Read from source, not reproduced.
+**Fix shape:** run the check per pushed `local_sha` from the hook's stdin lines, only for `refs/heads/workspace/*`
+remote refs, reading the manifest from that commit (`git show <sha>:.workspace-divergence`) rather than the working
+tree. Add a test with both directions. Take it on the next fix branch.
+
+### Phase 999.230: `cut-pr-branch.sh` Phase Mode Drops Phase Work With a Non-Phase Scope, and Halts on the Conflict (BACKLOG)
+
+**Found:** 2026-11-11, Phase 52 close-out. The replay stopped with "unresolved code conflict in commit 8d1429d"
+(`feat(52-30)`) on three files.
+**Defect:** `bb8a0df feat(cli): print the route each gate answer runs` was Phase 52 work, made on the phase branch,
+with a `(cli)` scope. `SCOPE_RE` skipped it, so the later phase commit that built on it could not apply. Unlike the
+`(NN-review)` case in 999.167, the dropped commit is not reported after the fact: the run halts and deletes nothing
+useful, and the script has no way to name extra commits. Worked around by running the cut from a throwaway branch
+where only that commit's subject was re-scoped to `(52)` (identical tree, checked), so the phase branch's SHAs, which
+planning docs cite, were not rewritten.
+**Fix shape:** add `--include <sha>` (repeatable) and, before replaying, list every non-planning commit in the range
+the scope filter skips, so an unscoped phase commit is visible up front. Pair with 999.167. Next fix branch.
+
 ### Phase 999.229: An Invalid `DEVFLOW_EXTERNAL_VERIFY_ENABLED` Is Ignored With No Operator-Visible Line (BACKLOG)
 
 **Found:** 2026-11-11, Phase 52 plan 52-23 (`.planning/phases/52-subtract-and-stabilize/deferred-items.md`). The variable is read only in the detached supervisor, so an invalid
