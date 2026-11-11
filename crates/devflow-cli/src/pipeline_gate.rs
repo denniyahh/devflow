@@ -522,6 +522,11 @@ pub(crate) fn due_gate_deadline(now: i64, wake: Option<i64>, lifetime: i64) -> O
     }
 }
 
+/// How long a wait gives an answer already on the gate to be picked up after
+/// the timer wrote it (or found an operator's), when the gate's lifetime has
+/// come too.
+const ANSWER_PICKUP_SECS: u64 = 10;
+
 /// The current time in epoch seconds, the `now` of a gate wait's polls.
 fn epoch_now() -> i64 {
     std::time::SystemTime::now()
@@ -562,7 +567,19 @@ fn wait_with_rate_limit_timer(
                 // Disarmed for the rest of this wait whatever the write did: the
                 // timer answers a gate at most once.
                 wake = None;
-                answer_as_rate_limit_timer(project_root, state, stage, gate_id)?;
+                if answer_as_rate_limit_timer(project_root, state, stage, gate_id)? {
+                    // An answer is on the gate now, the timer's or an operator's.
+                    // Take it before the lifetime is looked at again: at equal
+                    // deadlines (U8) the lifetime is due too, and checking it
+                    // first would time the gate out over its own answer.
+                    let secs = u64::try_from(lifetime.saturating_sub(now))
+                        .unwrap_or(0)
+                        .max(ANSWER_PICKUP_SECS);
+                    match gate_wait_call(project_root, state.phase, stage, gate_id, secs)? {
+                        GateWaitEnd::TimedOut => {}
+                        end => return Ok(end),
+                    }
+                }
                 continue;
             }
             Some(DueDeadline::Lifetime) => return Ok(GateWaitEnd::TimedOut),
@@ -586,12 +603,14 @@ fn wait_with_rate_limit_timer(
 /// committed back to false, because the operator's answer does not spend it,
 /// and the wait takes that answer. Any other failure keeps the flag spent,
 /// since this cannot tell whether an answer was written, and says so.
+/// Returns whether an answer is on the gate now (the timer's or the
+/// operator's).
 fn answer_as_rate_limit_timer(
     project_root: &Path,
     state: &mut State,
     stage: Stage,
     gate_id: &GateId,
-) -> Result<(), CliError> {
+) -> Result<bool, CliError> {
     commit(state, |s| s.rate_limit_auto_relaunch_used = true)?;
     let written = fenced(project_root, state.phase, || {
         Ok(Gates::rate_limit_timer_answer(
@@ -633,7 +652,7 @@ fn answer_as_rate_limit_timer(
             "outcome": outcome,
         }),
     );
-    Ok(())
+    Ok(outcome != "failed")
 }
 
 /// Open a gate and block (in the detached monitor) until its answer or the long
