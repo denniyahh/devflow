@@ -872,7 +872,7 @@ pub(crate) fn way_on_sentence(
 
 /// The evidence handed to a router that reads none: the status-less families
 /// never call their `read`, so this is a reader failure nothing routes on.
-fn unread_evidence() -> Evidence {
+pub(crate) fn unread_evidence() -> Evidence {
     Evidence {
         read: Err(EvidenceFailure::HeadRead(
             "no evidence is read for a status-less gate".to_string(),

@@ -2215,12 +2215,13 @@ pub(crate) fn gate_respond_report(
     };
     // R10, D-10: the gate file as it is on disk names the answer's family, and
     // the supervisor's own screen decides whether the answer is refused.
-    let gate = crate::pipeline_gate::read_gate_file(project_root, phase, stage).ok_or_else(|| {
-        CliError::Message(format!(
-            "phase {phase} {stage}'s gate file could not be read, so DevFlow cannot tell what \
+    let gate =
+        crate::pipeline_gate::read_gate_file(project_root, phase, stage).ok_or_else(|| {
+            CliError::Message(format!(
+                "phase {phase} {stage}'s gate file could not be read, so DevFlow cannot tell what \
              this answer would run; no response was written"
-        ))
-    })?;
+            ))
+        })?;
     if let Err(refusal) = crate::pipeline_outcomes::screen_answer(gate.gate_kind, &response) {
         return Err(CliError::Message(format!(
             "the {} on phase {phase} {stage}'s gate is refused: {}; no response was written. \
@@ -2255,31 +2256,121 @@ pub(crate) fn gate_respond_report(
         kind.past_tense(),
         path.display()
     );
-    for line in answer_route_lines(&gate, kind, response.note.as_deref()) {
+    for line in answer_route_lines(
+        project_root,
+        (phase, stage),
+        &gate,
+        kind,
+        response.note.as_deref(),
+    ) {
         report.push_str(&line);
         report.push('\n');
     }
     Ok(report)
 }
 
-/// The route a written answer runs, as `gate reject` prints it (D-10): from
+/// The route a written answer runs, as `gate approve`, `gate reject` and
+/// `gate abort` print it (D-10, D-45 rule 2, D-39): from
+/// [`crate::pipeline_outcomes::approve_route`] and
 /// [`crate::pipeline_outcomes::reject_route`] over the gate file read back from
-/// disk, never its `context` or recorded `gsd_status`.
-fn answer_route_lines(gate: &GateFile, kind: GateAnswerKind, note: Option<&str>) -> Vec<String> {
-    use crate::pipeline_outcomes::{RejectRoute, reject_route, step_phrase};
+/// disk and the run's recorded canary refusal, never the gate's `context` or
+/// its recorded `gsd_status`. A verification approve reads GSD's status and
+/// HEAD now, through the same `read_evidence` the supervisor uses, and says the
+/// supervisor reads them again when it picks the answer up. A route that needs
+/// the run's state is not guessed when the state cannot be loaded: the print
+/// names the failure instead.
+fn answer_route_lines(
+    project_root: &Path,
+    at: (PhaseId, Stage),
+    gate: &GateFile,
+    kind: GateAnswerKind,
+    note: Option<&str>,
+) -> Vec<String> {
+    use crate::pipeline_outcomes::{
+        AnswerFamily, ApproveRoute, RejectRoute, Step, Trigger, answer_family, approve_route,
+        evidence_root, gsd_status_name, next_step, read_evidence, reject_route, status_less_phrase,
+        step_phrase, unread_evidence,
+    };
+    let (phase, stage) = at;
+    let route_line = |name: &str, phrase: &str| format!("route: {name} — {phrase}");
+    let family = answer_family(gate.gate_kind);
+    let state = workflow::load_state(project_root, phase);
+    // The family's route reads the run's state: the canary for a stage
+    // failure, the recorded PASS head and evidence root for a verification
+    // approve.
+    let reads_state = matches!(
+        (family, kind),
+        (AnswerFamily::StageFailure, _) | (AnswerFamily::Verification, GateAnswerKind::Approve)
+    );
+    let state = match state {
+        Ok(state) => Some(state),
+        Err(error) if reads_state && kind != GateAnswerKind::Abort => {
+            return vec![format!(
+                "route: not known — the run's state could not be loaded ({error}), so DevFlow \
+                 cannot tell which route this answer runs; the supervisor decides when it picks \
+                 this answer up"
+            )];
+        }
+        Err(_) => None,
+    };
+    let canary_refusal = state
+        .as_ref()
+        .and_then(crate::pipeline_launch::recorded_canary_refusal);
+    let canary_refusal = canary_refusal.as_deref();
+    let status_less = |step: &crate::pipeline_outcomes::StatusLessStep| {
+        route_line(step.name(), &status_less_phrase(step, phase, stage))
+    };
+    let refused = |why: &str| format!("route: refused — {why}");
     match kind {
+        GateAnswerKind::Abort => {
+            let step: Step = next_step(Trigger::Abort);
+            vec![route_line(step.name(), step_phrase(&step))]
+        }
         GateAnswerKind::Reject => {
             let note = note.unwrap_or_default();
-            let route = match reject_route(gate, None, note) {
-                RejectRoute::Verification(step) => {
-                    format!("route: {} — {}", step.name(), step_phrase(&step))
-                }
-                RejectRoute::StatusLess(step) => format!("route: {}", step.name()),
-                RejectRoute::Refused(refusal) => format!("route: refused — {}", refusal.why),
+            let route = match reject_route(gate, canary_refusal, note) {
+                RejectRoute::Verification(step) => route_line(step.name(), step_phrase(&step)),
+                RejectRoute::StatusLess(step) => status_less(&step),
+                RejectRoute::Refused(refusal) => refused(refusal.why),
             };
             vec![route, format!("note: {note}")]
         }
-        GateAnswerKind::Approve | GateAnswerKind::Abort => Vec::new(),
+        GateAnswerKind::Approve => {
+            let route = match &state {
+                Some(state) => approve_route(gate, canary_refusal, || {
+                    read_evidence(
+                        &evidence_root(project_root, state),
+                        phase,
+                        state.validate_pass_head.as_deref(),
+                    )
+                }),
+                // No state, and the family reads none: its approve reads no
+                // evidence either.
+                None => approve_route(gate, None, unread_evidence),
+            };
+            match route {
+                ApproveRoute::Verification { step, evidence } => vec![
+                    route_line(step.name(), step_phrase(&step)),
+                    format!(
+                        "read now: GSD verification {}; Validate pass on this commit over a \
+                         clean tree: {}",
+                        evidence
+                            .status()
+                            .map_or("could not be read", gsd_status_name),
+                        if evidence.agent_pass_on_head {
+                            "yes"
+                        } else {
+                            "no"
+                        }
+                    ),
+                    "the supervisor reads GSD's verification status again when it picks this \
+                     answer up, and routes on that read"
+                        .to_string(),
+                ],
+                ApproveRoute::StatusLess(step) => vec![status_less(&step)],
+                ApproveRoute::Refused(refusal) => vec![refused(refusal.why)],
+            }
+        }
     }
 }
 
@@ -10287,7 +10378,12 @@ mod tests {
         phase: PhaseId,
         canary: Option<devflow_core::canary::CanaryOutcome>,
     ) -> State {
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Supervise, root.to_path_buf());
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
         state.stage = Stage::Code;
         state.canary = canary;
         workflow::save_state(&state).unwrap();
@@ -10463,7 +10559,14 @@ mod tests {
         const PICKUP: &str = "the supervisor reads GSD's verification status again when it \
                               picks this answer up";
         let approve = |root: &Path, phase: PhaseId, stage: Stage| {
-            gate_respond_report(root, phase, Some(stage), GateAnswerKind::Approve, None, None)
+            gate_respond_report(
+                root,
+                phase,
+                Some(stage),
+                GateAnswerKind::Approve,
+                None,
+                None,
+            )
         };
 
         // One row per table row of the verification approve.
