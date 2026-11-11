@@ -40,8 +40,10 @@ const CLAUDE_INIT_EVENT: &str = r#"{"type":"system","subtype":"init","cwd":"/tmp
 
 /// `v3_rate_limit_event("rejected")` from `devflow-core/src/agent_result.rs`:
 /// the archived `allowed` event with only its top-level `status` replaced. Its
-/// `resetsAt` epoch is the reset time the no-fallback gate names.
-const CLAUDE_REJECTED_RATE_LIMIT_EVENT: &str = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1785645600,"rateLimitType":"five_hour","overageStatus":"rejected","overageDisabledReason":"out_of_credits","isUsingOverage":false},"uuid":"e73e6774-a79d-4cdf-90bd-53a695f44f5a","session_id":"559fef4d-2053-459e-b7a7-f3200c3b3790"}"#;
+/// `resetsAt` is the `@RESETS_AT@` placeholder, which the [`Rig`] fills with an
+/// epoch the test computes from the current time (or `null`, for a denial with
+/// no reset time): the reset time the no-fallback gate names.
+const CLAUDE_REJECTED_RATE_LIMIT_EVENT: &str = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":@RESETS_AT@,"rateLimitType":"five_hour","overageStatus":"rejected","overageDisabledReason":"out_of_credits","isUsingOverage":false},"uuid":"e73e6774-a79d-4cdf-90bd-53a695f44f5a","session_id":"559fef4d-2053-459e-b7a7-f3200c3b3790"}"#;
 
 /// A Claude stream `result` carrying the success marker.
 const CLAUDE_SUCCESS_RESULT: &str = r#"{"type":"result","subtype":"success","is_error":false,"session_id":"559fef4d-2053-459e-b7a7-f3200c3b3790","result":"DEVFLOW_RESULT: {\"status\":\"success\"}"}"#;
@@ -59,13 +61,15 @@ const ANTIGRAVITY_SUCCESS_RESULT: &str = r#"{"event":"result","result":{"status"
 /// `stage plan|code` for a stage turn, told apart by the stage prompt
 /// (`render_claude_style`: Code runs `/gsd-execute-phase`, Plan
 /// `/gsd-plan-phase`), and `unexpected turn` for any other turn, so a sequence
-/// assertion sees it. Plan commits a minimal plan file with no
+/// assertion sees it. It also appends each invocation's stdin turn (one JSON
+/// line) to `claude-stdin.log`, in the same order. Plan commits a minimal plan file with no
 /// checkpoint; Code commits once, records that commit, runs `@CODE_TURN_DIRT@`
 /// (empty unless the rig leaves uncommitted work), then reports a quota denial
 /// and exits.
 const CLAUDE_STUB: &str = r#"log='@LOGS@/claude.log'
 if [ "$1" = "--version" ]; then echo health >> "$log"; echo "2.1.220 (Claude Code)"; exit 0; fi
 IFS= read -r turn
+printf '%s\n' "$turn" >> '@LOGS@/claude-stdin.log'
 case "$turn" in
   *DEVFLOW_DELIVERY_CANARY_*)
     echo canary >> "$log"
@@ -241,9 +245,32 @@ struct Rig {
     logs: tempfile::TempDir,
 }
 
+/// The current time in Unix epoch seconds, the base every computed reset time
+/// starts from (Pitfall 10: no fixed epoch, which ages from future to past).
+fn now_epoch() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap()
+}
+
+/// A reset an hour away: far enough that no test here reaches its relaunch.
+fn a_future_reset() -> Option<i64> {
+    Some(now_epoch() + 3600)
+}
+
 impl Rig {
     fn new(phase: PhaseId, canary: AgyCanary) -> Self {
-        Self::build(phase, canary, "", "")
+        Self::build(phase, canary, "", "", a_future_reset())
+    }
+
+    /// A rig whose Claude denial names `resets_at` (epoch seconds), or no reset
+    /// time at all for `None`.
+    fn with_reset(phase: PhaseId, resets_at: Option<i64>) -> Self {
+        Self::build(phase, AgyCanary::ReturnsToken, "", "", resets_at)
     }
 
     /// A rig whose Claude Code turn leaves uncommitted work behind
@@ -255,10 +282,17 @@ impl Rig {
             AgyCanary::ReturnsToken,
             CODE_TURN_LEAVES_UNCOMMITTED_WORK,
             AGY_RECORDS_WHAT_IT_INHERITED,
+            a_future_reset(),
         )
     }
 
-    fn build(phase: PhaseId, canary: AgyCanary, code_turn_dirt: &str, stage_probe: &str) -> Self {
+    fn build(
+        phase: PhaseId,
+        canary: AgyCanary,
+        code_turn_dirt: &str,
+        stage_probe: &str,
+        resets_at: Option<i64>,
+    ) -> Self {
         let home = common::HermeticHome::new();
         let repo = tempfile::tempdir().unwrap();
         let root = repo.path().canonicalize().unwrap();
@@ -273,6 +307,10 @@ impl Rig {
             .replace("@PADDED@", &padded)
             .replace("@CLAUDE_INIT@", CLAUDE_INIT_EVENT)
             .replace("@CLAUDE_RATE_LIMIT@", CLAUDE_REJECTED_RATE_LIMIT_EVENT)
+            .replace(
+                "@RESETS_AT@",
+                &resets_at.map_or_else(|| "null".to_string(), |at| at.to_string()),
+            )
             .replace("@CLAUDE_SUCCESS@", CLAUDE_SUCCESS_RESULT);
         let fake_bin = common::fake_bin_dir_for("claude", &claude);
 
@@ -312,6 +350,10 @@ impl Rig {
     }
 
     fn start_with(&self, extra: &[&str]) {
+        self.start_with_env(extra, &[]);
+    }
+
+    fn start_with_env(&self, extra: &[&str], env: &[(&str, &str)]) {
         let existing = std::env::var_os("PATH").unwrap_or_default();
         let path = format!(
             "{}:{}",
@@ -334,6 +376,7 @@ impl Rig {
             .arg(&self.root)
             .current_dir(&self.root)
             .env("PATH", path)
+            .envs(env.iter().copied())
             .output()
             .expect("run devflow start");
         assert!(
@@ -393,6 +436,34 @@ impl Rig {
             .filter(|line| *line != "health")
             .map(str::to_string)
             .collect()
+    }
+
+    /// How many Code stage turns the `claude` stub ran (its `stage code` log
+    /// lines; the log also keeps `canary` and `stage plan`).
+    fn claude_code_turns(&self) -> usize {
+        self.invocations("claude")
+            .iter()
+            .filter(|line| *line == "stage code")
+            .count()
+    }
+
+    /// The `stage_launched` events for the Code stage, in order: the second,
+    /// independent count of Code launches.
+    fn code_launches(&self) -> Vec<Value> {
+        self.events_named("stage_launched")
+            .into_iter()
+            .filter(|event| event["stage"] == "code")
+            .collect()
+    }
+
+    /// The phase's open Code gate file, parsed.
+    fn code_gate(&self) -> Option<Value> {
+        let path = devflow_core::gates::Gates::gate_path(
+            &self.root,
+            self.phase,
+            devflow_core::stage::Stage::Code,
+        );
+        serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
     }
 
     /// A commit id a stub recorded, outside the repository.
@@ -837,7 +908,8 @@ fn after_the_refused_relaunch_status_and_resume_lead_to_another_agent() {
 #[test]
 fn a_rate_limited_claude_run_without_a_fallback_waits_at_a_gate() {
     let phase = PhaseId::new(5122);
-    let rig = Rig::new(phase, AgyCanary::ReturnsToken);
+    let resets_at = now_epoch() + 3600;
+    let rig = Rig::with_reset(phase, Some(resets_at));
     let _reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
 
     rig.start(&[]);
@@ -879,7 +951,7 @@ fn a_rate_limited_claude_run_without_a_fallback_waits_at_a_gate() {
         String::from_utf8_lossy(&shown.stderr)
     );
     assert!(
-        shown_text.contains("1785645600"),
+        shown_text.contains(&resets_at.to_string()),
         "the gate names the reset time from the denial: {shown_text}"
     );
     assert!(
@@ -900,6 +972,87 @@ fn a_rate_limited_claude_run_without_a_fallback_waits_at_a_gate() {
     let state = rig.state();
     assert_eq!(state.agent, AgentKind::Claude);
     assert_eq!(state.fallback_agent, None);
+}
+
+/// How long a test watches for a launch that must not happen.
+const NO_MORE_LAUNCHES_WITHIN: Duration = Duration::from_secs(5);
+
+/// The responder name the rate-limit timer writes on its answer
+/// (`devflow_core::gates::RATE_LIMIT_TIMER`).
+const TIMER: &str = devflow_core::gates::RATE_LIMIT_TIMER;
+
+/// Wait, bounded by [`RUN_WAIT`], until `count` gates have fired in the rig's
+/// run. The failure message reads the logs when the wait ends, not when it starts.
+fn wait_for_gates(rig: &Rig, count: usize) {
+    let started = std::time::Instant::now();
+    while rig.events_named("gate_fired").len() < count {
+        assert!(
+            started.elapsed() < RUN_WAIT,
+            "timed out after {RUN_WAIT:?} waiting for {count} gate_fired events in phase {}; \
+             claude ran {:?}; events:\n{}",
+            rig.phase,
+            rig.invocations("claude"),
+            rig.events_text()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// CUT-03 / D-16 / D-17 / D-38, criterion 3: a denial whose reset (plus the
+/// margin) has already passed relaunches the Code stage once by itself, and
+/// the second denial waits at the gate. Code launches are counted two
+/// independent ways: the stub's `stage code` turns and the `stage_launched`
+/// events for Code.
+#[test]
+fn a_passed_reset_relaunches_once_and_a_second_denial_waits() {
+    let phase = PhaseId::new(5127);
+    let rig = Rig::with_reset(phase, Some(now_epoch() - 3600));
+    let _reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+
+    rig.start(&[]);
+    wait_for_gates(&rig, 2);
+    std::thread::sleep(NO_MORE_LAUNCHES_WITHIN);
+    let log = rig.events_text();
+
+    assert_eq!(
+        rig.claude_code_turns(),
+        2,
+        "the original Code turn and one automatic relaunch: {:?}; events:\n{log}",
+        rig.invocations("claude")
+    );
+    assert_eq!(
+        rig.invocations("claude")
+            .iter()
+            .filter(|line| *line == "stage plan")
+            .count(),
+        1,
+        "Plan ran once: {:?}",
+        rig.invocations("claude")
+    );
+    assert_eq!(
+        rig.code_launches().len(),
+        2,
+        "two stage_launched events for Code; events:\n{log}"
+    );
+    let resolved = rig.events_named("gate_resolved");
+    assert_eq!(resolved.len(), 1, "one gate was answered; events:\n{log}");
+    assert_eq!(
+        resolved[0]["responded_by"], TIMER,
+        "the timer answered it: {}",
+        resolved[0]
+    );
+    assert_eq!(resolved[0]["gate_kind"], "rate_limit", "{}", resolved[0]);
+
+    let gate = rig.code_gate().expect("the second denial's gate is open");
+    assert_eq!(gate["gate_kind"], "rate_limit", "{gate}");
+    assert!(
+        gate["not_before"].is_i64(),
+        "the second gate records its not-before time: {gate}"
+    );
+    assert!(
+        rig.state().rate_limit_auto_relaunch_used,
+        "the run's one automatic relaunch is spent"
+    );
 }
 
 /// Criterion 1 on the worktree arm (D-10): a run in its phase worktree whose
