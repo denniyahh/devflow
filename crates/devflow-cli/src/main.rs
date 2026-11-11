@@ -390,8 +390,6 @@ pub(crate) enum CliError {
     Worktree(#[from] devflow_core::worktree::WorktreeError),
     #[error(transparent)]
     Gate(#[from] devflow_core::gates::GateError),
-    #[error(transparent)]
-    Ship(#[from] devflow_core::ship::ShipError),
     #[error("{0}")]
     Message(String),
 }

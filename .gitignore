@@ -53,7 +53,6 @@ Thumbs.db
 .devflow/phase-*-exit
 .devflow/phase-*-agent-pid
 .devflow/phase-*-monitor-stop
-.devflow/last-ship*.json
 .devflow/events.jsonl
 .devflow/gates/
 .devflow/history/

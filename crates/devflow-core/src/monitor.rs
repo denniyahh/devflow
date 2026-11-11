@@ -4871,7 +4871,7 @@ kill -9 $$
     }
 
     /// Build the fixture repositories through the scrubbing constructor, as
-    /// every other test module in this phase does (`version.rs:1102`).
+    /// the other git-touching test modules do.
     ///
     /// A bare `Command::new("git")` here would itself inherit an ambient
     /// hostile `GIT_DIR` — so under this phase's own acceptance command

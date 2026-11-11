@@ -169,10 +169,10 @@ fn find_devflow_marker(dir: &Path) -> Option<PathBuf> {
 /// The marker takes no temp file and no file fsync (R-15): this runs on every
 /// state write, and `.gitignore` is not a state or gate record.
 ///
-/// Returns `std::io::Result<()>`, not a crate-specific error enum: this
-/// plan's seven conversion sites each live in a different module with their
-/// own error enum (`WorkflowError`, `GateError`, `MonitorError`,
-/// `ResultError`, `ShipError`), and every one already carries an
+/// Returns `std::io::Result<()>`, not a crate-specific error enum: its
+/// conversion sites each live in a different module with their own error
+/// enum (`WorkflowError`, `GateError`, `MonitorError`, `ResultError`), and
+/// every one already carries an
 /// `Io(#[from] std::io::Error)` variant, so `?` converts at every call site
 /// with zero signature churn.
 ///

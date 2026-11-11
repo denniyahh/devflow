@@ -2973,7 +2973,7 @@ enum HandoffOutcome {
 ///
 /// Every check runs against a candidate copy before ANY mutation, so a refusal
 /// leaves the state byte-identical. It runs the FULL generic preflight bundle
-/// (major-bump, unattended-launch-shape, interactivity, gh-auth), not just
+/// (unattended-launch-shape, interactivity), not just
 /// interactivity: `launch_stage` runs this same bundle again via
 /// `run_preflight`, and it is stricter than plain interactivity — e.g. a
 /// Claude/Antigravity-only chain-flag guard means a same-stage handoff to any

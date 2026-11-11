@@ -683,9 +683,7 @@ pub fn publish_order(project_root: &Path) -> Vec<String> {
 }
 
 /// Extract the `[workspace] members = [...]` array's quoted path entries.
-/// Hand-rolled, single-array-only scan (this project deliberately avoids a
-/// TOML parser dependency for its version/workspace tooling — see
-/// `version.rs`).
+/// Hand-rolled, single-array-only scan.
 fn workspace_member_paths(contents: &str) -> Vec<String> {
     let Some(start) = contents.find("members") else {
         return Vec::new();

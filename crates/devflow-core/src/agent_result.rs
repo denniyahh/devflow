@@ -10263,8 +10263,7 @@ mod tests {
     /// process inherited a hostile `GIT_DIR` pointed at an unrelated
     /// repository — proven with a real spawned `git` process, not by
     /// inspecting a `Command` object alone. Mirrors
-    /// `version::tests::tag_reads_resolve_caller_root_under_a_hostile_git_dir`
-    /// (27-03) and `origin_main_ancestor_status_holds_under_a_hostile_git_dir`
+    /// `origin_main_ancestor_status_holds_under_a_hostile_git_dir`
     /// (`git.rs`, 27-01): the hostile `GIT_DIR` this test's own `<verify>`
     /// entries exercise (`GIT_DIR=<hostile>/.git cargo test ... this test`)
     /// is injected the same way any inherited-env attack reaches
