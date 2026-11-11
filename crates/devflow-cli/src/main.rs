@@ -32,7 +32,7 @@ mod config_parse;
 #[derive(Debug, Parser)]
 #[command(
     name = "devflow",
-    version,
+    version = build_version(),
     about = "An opinionated, GSD-native take on AI-driven development automation"
 )]
 struct Cli {
@@ -400,10 +400,26 @@ pub(crate) enum CliError {
 }
 
 /// `--version`'s text after the binary name: the package version, then the
-/// commit `build.rs` embedded and whether the tree was dirty.
-#[allow(dead_code)]
-fn version_label(version: &str, _commit: &str, _dirty: &str) -> String {
-    version.to_string()
+/// commit `build.rs` embedded and whether the tree was dirty. A build without
+/// git embeds an empty commit, which reads `unknown`; any dirty flag other
+/// than `true` reads `clean`, matching how the staleness check reads it.
+fn version_label(version: &str, commit: &str, dirty: &str) -> String {
+    let commit = if commit.is_empty() { "unknown" } else { commit };
+    let tree = if dirty == "true" { "dirty" } else { "clean" };
+    format!("{version} ({commit}, {tree})")
+}
+
+/// [`version_label`] for this binary's own build, built once: clap needs a
+/// `'static` string.
+fn build_version() -> &'static str {
+    static LABEL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    LABEL.get_or_init(|| {
+        version_label(
+            env!("CARGO_PKG_VERSION"),
+            env!("DEVFLOW_BUILD_COMMIT"),
+            env!("DEVFLOW_BUILD_DIRTY"),
+        )
+    })
 }
 
 fn main() {
