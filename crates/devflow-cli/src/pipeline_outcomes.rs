@@ -628,11 +628,12 @@ fn validate_gate_context(
 /// 999.66: on a recorded failure, the counter now decides between beginning a
 /// fresh streak and continuing the existing one, instead of always
 /// continuing. It asks [`mode::consecutive_failures_made_progress`], fed by
-/// [`agent_result::phase_commit_count`] read fresh against `project_root` and
+/// [`agent_result::phase_source_commit_count`] read fresh against `project_root` and
 /// the baseline persisted in `state.last_validate_failure_commit_count`. A
-/// `true` (progress) result means new commits exist on the feature branch
-/// since the last recorded failure — **not** that those commits addressed
-/// what Validate reported. This narrows the ceiling's guarantee to loops that
+/// `true` (progress) result means new commits that change a path outside
+/// `.planning/` exist on the feature branch since the last recorded failure
+/// (D-34, 52-27: GSD's own `.planning/` artifacts are not progress) — **not**
+/// that those commits addressed what Validate reported. This narrows the ceiling's guarantee to loops that
 /// produce no commits at all; it does not disable the ceiling. That is the
 /// accepted weakness of the commit-count signal recorded in
 /// `33-RESEARCH.md`'s D-03 Recommendation and Assumptions Log A1.
@@ -646,7 +647,7 @@ fn validate_gate_context(
 /// free extension of the [`mode::MAX_CONSECUTIVE_FAILURES`] ceiling.
 ///
 /// The guarantee the code now delivers instead: a cycle whose count could not
-/// be measured — [`agent_result::phase_commit_count`] returning `None` — is
+/// be measured — [`agent_result::phase_source_commit_count`] returning `None` — is
 /// treated as not-progress AND leaves the recorded baseline untouched, so the
 /// next real measurement is compared against the last real observation. A
 /// single transient fault can no longer buy a reset. What is still NOT claimed
@@ -660,7 +661,7 @@ fn validate_gate_context(
 /// the phase's worktree when one is configured — because that is where the
 /// Validate agent authors the artifact and `.planning/` is tracked, so it is
 /// invisible from the main checkout until merge. The
-/// [`agent_result::phase_commit_count`] read one branch below keeps reading
+/// [`agent_result::phase_source_commit_count`] read one branch below keeps reading
 /// `project_root`, the main checkout, because git refs and the object
 /// database are shared across a repository's worktrees, so a commit made in
 /// the worktree is already visible from there. Retargeting the commit count
@@ -675,7 +676,7 @@ pub(crate) fn handle_validate_outcome(
     // the report it authors lands on `feature/phase-{N}` inside the worktree
     // and is invisible from the main checkout; GSD's reader and the HEAD read
     // must therefore run there (D-24). This is NOT the root the
-    // `phase_commit_count` read below uses: see the CR-01 note above.
+    // `phase_source_commit_count` read below uses: see the CR-01 note above.
     let evidence_root: PathBuf = state
         .worktree_path
         .clone()
@@ -1016,7 +1017,10 @@ fn record_validate_failure(project_root: &Path, state: &mut State) -> Result<(),
     //
     // Measured before the commit: it runs git, which a write-lock closure must
     // not do.
-    let measured_commit_count = agent_result::phase_commit_count(
+    // D-34 (52-27): only commits that change a path outside `.planning/` are
+    // progress, for every Validate failure. A fix or gap-closure pass whose
+    // commits are only GSD's `.planning/` artifacts continues the streak.
+    let measured_commit_count = agent_result::phase_source_commit_count(
         project_root,
         &devflow_core::config::git_flow_for_project(project_root),
         state.phase,
@@ -2397,7 +2401,10 @@ mod tests {
 
     /// 999.66, ROADMAP criterion 3: a phase running three or more
     /// Code<->Validate waves in Auto mode, with a new commit landing on its
-    /// feature branch before every failure, must not trip the ceiling —
+    /// feature branch before every failure (a file outside `.planning/`, which
+    /// D-34 counts as progress; `.planning/`-only rounds are
+    /// `three_gap_rounds_without_progress_force_the_gate`), must not trip the
+    /// ceiling —
     /// `handle_validate_outcome`'s reset-vs-accumulate branch must read each
     /// cycle's new commit as forward progress and restart the streak at 1.
     ///
@@ -2742,10 +2749,11 @@ mod tests {
     /// Every cycle lands a real new commit before the failure is recorded, so
     /// `consecutive_failures_made_progress` reports progress and the streak
     /// resets to 1 on every single cycle. `MAX_CONSECUTIVE_FAILURES` is
-    /// therefore unreachable by construction here — which is not an
-    /// adversarial hypothetical: the Code stage's fix command is a GSD command
-    /// that commits `.planning/` artifacts on cycles that changed no source.
-    /// The per-phase total is the only thing that can bound this loop.
+    /// therefore unreachable by construction here. Since 52-27 (D-34) only a
+    /// commit outside `.planning/` is progress, so each cycle's commit is a
+    /// trivial source file: GSD's own `.planning/` artifacts no longer reset
+    /// the streak, but a trivial source change still does. The per-phase total
+    /// is the only thing that can bound this loop.
     ///
     /// Three things are asserted, and the third is the one that distinguishes
     /// D-07's gate from the abort D-07 rejected:

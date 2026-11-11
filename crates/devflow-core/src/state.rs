@@ -72,8 +72,10 @@ pub struct State {
     /// counter is NOT touched by `transition()`.
     #[serde(default)]
     pub preflight_retries: u32,
-    /// The commit count observed on the phase's feature branch at the most
-    /// recent Validate failure (999.66, D-03) — the forward-progress
+    /// The count of commits that change a path outside `.planning/` (D-34,
+    /// 52-27; `agent_result::phase_source_commit_count`) observed on the phase's
+    /// feature branch at the most recent Validate failure (999.66, D-03) — the
+    /// forward-progress
     /// baseline [`crate::mode::consecutive_failures_made_progress`] compares
     /// against to decide whether a new failure begins a fresh streak or
     /// continues the existing one.
@@ -117,10 +119,10 @@ pub struct State {
     /// Why it exists next to [`Self::consecutive_failures`] rather than
     /// replacing it: `consecutive_failures` is reset whenever
     /// [`crate::mode::consecutive_failures_made_progress`] reports that new
-    /// commits landed, and the Code stage's fix command is a GSD command
-    /// which routinely commits `.planning/` artifacts even when no source
-    /// changed. A loop that commits something trivial every cycle therefore
-    /// resets the streak every cycle and never reaches
+    /// commits landed. Since 52-27 (D-34) only commits that change a path
+    /// outside `.planning/` count, so GSD's own `.planning/` artifacts no
+    /// longer reset it, but a loop that commits a trivial source change every
+    /// cycle still resets the streak every cycle and never reaches
     /// [`crate::mode::MAX_CONSECUTIVE_FAILURES`]. This total cannot be reset
     /// by a commit count.
     ///

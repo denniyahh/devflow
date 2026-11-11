@@ -25,11 +25,11 @@ pub const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 /// **Why it sits meaningfully above [`MAX_CONSECUTIVE_FAILURES`] (3).** This
 /// is a backstop for the case where the streak keeps resetting, not a
 /// competing primary bound. `consecutive_failures` is cleared whenever
-/// [`consecutive_failures_made_progress`] reports new commits, and the Code
-/// stage's fix command is a GSD command that routinely commits `.planning/`
-/// artifacts even when no source changed — so "commits something trivial
-/// every cycle" is the ORDINARY behaviour of the thing in that slot. A phase
-/// in that state never reaches the streak ceiling. Setting this one low
+/// [`consecutive_failures_made_progress`] reports new commits. Since 52-27
+/// (D-34) only commits that change a path outside `.planning/` count, so the
+/// GSD fix command's own `.planning/` artifacts no longer reset the streak,
+/// but an agent that commits a trivial source change every cycle still does.
+/// A phase in that state never reaches the streak ceiling. Setting this one low
 /// enough to compete would make the coarser signal primary and change when
 /// ordinary, genuinely-converging runs gate; ten leaves the streak ceiling
 /// the first thing a stuck loop meets, and catches only the loops the streak
