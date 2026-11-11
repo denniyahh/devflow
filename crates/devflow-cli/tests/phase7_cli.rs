@@ -472,12 +472,16 @@ fn start_until_plan_halts_cleanly() {
     let _reap = MonitorReapGuard::after_launch(&state);
 }
 
-/// `--until` values for stages v4.0 removed (D-07). Later cut plans append to this list.
-const REMOVED_UNTIL_STAGES: &[&str] = &["ship"];
+/// `--until` values for stages v4.0 removed (D-07), in every case spelling. Later cut
+/// plans append to this list.
+const REMOVED_UNTIL_STAGES: &[&str] = &["ship", "Ship", "SHIP", "define", "Define", "DEFINE"];
 
-/// D-07 (CUT-02): the Ship stage is gone, so `--until ship` is not a stage value and
-/// clap refuses it as an invalid value before `start` is dispatched. Control in the same
-/// test: every kept stage `--until` accepts still parses, and the dry run exits 0.
+/// D-07 (CUT-01, CUT-02): the Ship and Define stages are gone, so no case spelling of
+/// `--until ship` or `--until define` is a stage value, and clap refuses each as an
+/// invalid value before `start` is dispatched. Control in the same test: every kept
+/// stage `--until` accepts still parses, and the dry run exits 0. The accepted values
+/// follow one case rule: whatever the parser does with `PLAN`, it does with `CODE` and
+/// `VALIDATE` too.
 #[test]
 fn until_rejects_removed_stages() {
     let home = common::HermeticHome::new();
@@ -523,6 +527,17 @@ fn until_rejects_removed_stages() {
         assert!(
             output.status.success(),
             "--until {kept} must be accepted\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let upper_plan_accepted = dry_run_until("PLAN").status.success();
+    for upper in ["CODE", "VALIDATE"] {
+        let output = dry_run_until(upper);
+        assert_eq!(
+            output.status.success(),
+            upper_plan_accepted,
+            "--until {upper} must follow the case rule `PLAN` follows (accepted: \
+             {upper_plan_accepted})\nstderr: {}",
             String::from_utf8_lossy(&output.stderr)
         );
     }

@@ -68,10 +68,11 @@ fn stop_help_names_the_foreground_holder_not_the_phase_lock() {
     assert!(names_the_foreground_holder(line), "{line}");
 }
 
-/// Help terms for surface v4.0 removed (D-01, D-03): the Ship stage, and the rate-limit
-/// cron arm cut in 52-09/52-10. Matched case-insensitively as whole words or phrases, so
-/// `shipped` or `relationship` is not a hit. Later cut plans append to this list.
-const REMOVED_HELP_TERMS: &[&str] = &["Ship", "cron arm"];
+/// Help terms for surface v4.0 removed (D-01, D-03): the Ship and Define stages, and the
+/// rate-limit cron arm cut in 52-09/52-10. Matched case-insensitively as whole words or
+/// phrases, so `shipped`, `relationship` or `undefined` is not a hit. Later cut plans append
+/// to this list.
+const REMOVED_HELP_TERMS: &[&str] = &["Ship", "Define", "cron arm"];
 
 /// The terms of [`REMOVED_HELP_TERMS`] that `text` names as a whole word or phrase.
 fn removed_terms_in(text: &str) -> Vec<&'static str> {
@@ -93,17 +94,22 @@ fn removed_terms_in(text: &str) -> Vec<&'static str> {
 
 #[test]
 fn help_names_no_removed_surface() {
+    assert_eq!(
+        removed_terms_in("Begin the workflow for a phase: Define → Plan → Code → Validate → Ship"),
+        ["Ship", "Define"],
+        "control: the matcher must report both removed stages in the 3.0.0 start line"
+    );
     for planted in [
-        "Begin the workflow for a phase: Define → Plan → Code → Validate → Ship",
         "Pipeline mode: `auto` runs to Ship unattended; `supervise` gates at Validate",
         "a rate limit with no fallback takes the cron arm",
+        "does not reset the workflow to define",
     ] {
         assert!(
             !removed_terms_in(planted).is_empty(),
             "control: the matcher must report the 3.0.0 line {planted:?}"
         );
     }
-    for clean in ["shipped", "relationship", "finished"] {
+    for clean in ["shipped", "relationship", "finished", "undefined"] {
         assert!(
             removed_terms_in(clean).is_empty(),
             "control: {clean:?} is not a removed term"
