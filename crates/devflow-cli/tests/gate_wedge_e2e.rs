@@ -63,16 +63,34 @@ fn wait_for(mut predicate: impl FnMut() -> bool, what: &str) {
 }
 
 fn spawn_gated_advance(home: &common::HermeticHome, root: &Path, phase: PhaseId) -> Child {
+    spawn_gated_advance_with_path(home, root, phase, None)
+}
+
+/// [`spawn_gated_advance`], with `bin_first` (when given) put first on the
+/// child's PATH, so any agent the advance launches after its gate is a stub.
+fn spawn_gated_advance_with_path(
+    home: &common::HermeticHome,
+    root: &Path,
+    phase: PhaseId,
+    bin_first: Option<&Path>,
+) -> Child {
     let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
     state.verification_baseline_captured = true;
     state.stage = Stage::Code;
     devflow_core::workflow::save_state(&state).unwrap();
-    let child = common::hermetic_devflow(home)
+    let mut command = common::hermetic_devflow(home);
+    command
         .args(["advance", "--phase", &phase.to_string()])
         .arg(root)
-        .env("DEVFLOW_GATE_TIMEOUT_SECS", "15")
-        .spawn()
-        .expect("spawn foreground advance");
+        .env("DEVFLOW_GATE_TIMEOUT_SECS", "15");
+    if let Some(bin_first) = bin_first {
+        let existing = std::env::var_os("PATH").unwrap_or_default();
+        command.env(
+            "PATH",
+            format!("{}:{}", bin_first.display(), existing.to_string_lossy()),
+        );
+    }
+    let child = command.spawn().expect("spawn foreground advance");
     wait_for(
         || Gates::gate_path(root, phase, Stage::Code).exists(),
         "Code gate",
@@ -110,6 +128,158 @@ fn reject(home: &common::HermeticHome, root: &Path, phase: PhaseId) -> std::proc
         .arg(root)
         .output()
         .expect("run same gate reject command")
+}
+
+/// Run `devflow gate <verb> <phase> --stage code --note <note>` against `root`.
+fn answer_code_gate(
+    home: &common::HermeticHome,
+    root: &Path,
+    phase: PhaseId,
+    verb: &str,
+    note: &str,
+) -> std::process::Output {
+    common::hermetic_devflow(home)
+        .args([
+            "gate",
+            verb,
+            &phase.to_string(),
+            "--stage",
+            "code",
+            "--note",
+            note,
+            "--project",
+        ])
+        .arg(root)
+        .output()
+        .unwrap_or_else(|error| panic!("run gate {verb}: {error}"))
+}
+
+/// Every event line in `root`'s log named `event`, parsed.
+fn events_named(root: &Path, event: &str) -> Vec<serde_json::Value> {
+    let Ok(contents) = fs::read_to_string(devflow_core::events::events_path(root)) else {
+        return Vec::new();
+    };
+    contents
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|line| line["event"] == event)
+        .collect()
+}
+
+/// A rejection is never an abort, whatever its note says: a note reading "do
+/// not abort, fix the test" resolves the live advance's Code gate as a
+/// loop-back, and the run is not aborted.
+#[test]
+fn a_note_saying_do_not_abort_keeps_the_run_alive() {
+    let home = common::HermeticHome::new();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let phase = PhaseId::new(4821);
+    init_repo(root, phase);
+    // The loop-back relaunches Code: the agent it finds is a stub that exits at
+    // once, never a real one, and the reaper ends any supervisor it started.
+    let _reaper = common::LaunchedRunReaper::new(root, phase, Vec::new());
+    let fake_bin = common::fake_bin_dir("exit 1");
+    let _child = ReapOnDrop(spawn_gated_advance_with_path(
+        &home,
+        root,
+        phase,
+        Some(&fake_bin.path),
+    ));
+
+    let output = answer_code_gate(&home, root, phase, "reject", "do not abort, fix the test");
+    assert!(
+        output.status.success(),
+        "live reject failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    common::wait_for(
+        || !events_named(root, "gate_resolved").is_empty(),
+        Duration::from_secs(20),
+        "the advance to resolve its Code gate",
+    );
+    let resolved = events_named(root, "gate_resolved");
+    assert_eq!(
+        resolved[0]["action"], "loop_back",
+        "a rejection whose note says `do not abort` must loop back: {resolved:?}"
+    );
+    assert!(
+        events_named(root, "workflow_aborted").is_empty(),
+        "a rejection must not abort the run: {:?}",
+        events_named(root, "workflow_aborted")
+    );
+}
+
+/// `devflow gate abort` writes an answer whose `abort` field is `true`: the
+/// field, not the note, is what ends the run.
+#[test]
+fn gate_abort_writes_an_answer_with_the_abort_field_set() {
+    let home = common::HermeticHome::new();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let phase = PhaseId::new(4823);
+    let gate = Gates::open_gate(root, phase, Stage::Code, "an open Code gate")
+        .unwrap()
+        .gate_id;
+    let _waiter = Gates::register_waiter(root, phase, Stage::Code, &gate).unwrap();
+
+    let output = answer_code_gate(&home, root, phase, "abort", "operator stop");
+    assert!(
+        output.status.success(),
+        "gate abort failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let path = Gates::answer_path(root, phase, Stage::Code, &gate);
+    let answer: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).expect("gate abort wrote the answer file"))
+            .expect("the answer file is JSON");
+    assert_eq!(answer["abort"], true, "{answer}");
+    assert_eq!(answer["approved"], false, "{answer}");
+    assert_eq!(answer["note"], "operator stop", "{answer}");
+}
+
+/// `devflow gate abort` ends a live advance parked at its Code gate: the
+/// advance resolves the gate as an abort and records `workflow_aborted`.
+#[test]
+fn gate_abort_ends_the_run() {
+    let home = common::HermeticHome::new();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let phase = PhaseId::new(4822);
+    init_repo(root, phase);
+    let _reaper = common::LaunchedRunReaper::new(root, phase, Vec::new());
+    let mut child = ReapOnDrop(spawn_gated_advance(&home, root, phase));
+
+    let output = answer_code_gate(&home, root, phase, "abort", "operator stop");
+    assert!(
+        output.status.success(),
+        "gate abort failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let before = Instant::now();
+    let status = loop {
+        if let Some(status) = child.0.try_wait().expect("poll advance") {
+            break status;
+        }
+        assert!(
+            before.elapsed() < Duration::from_secs(20),
+            "the live advance did not act on the abort within 20s"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(status.success(), "the advance must abort cleanly: {status:?}");
+    let resolved = events_named(root, "gate_resolved");
+    assert_eq!(resolved.len(), 1, "{resolved:?}");
+    assert_eq!(resolved[0]["action"], "abort", "{resolved:?}");
+    assert_eq!(
+        events_named(root, "workflow_aborted").len(),
+        1,
+        "gate abort must end the run"
+    );
+    assert!(
+        !devflow_core::workflow::state_path(root, phase).exists(),
+        "an aborted run clears its state"
+    );
 }
 
 /// A `develop`-only repo whose ROADMAP names `phase` and which has no
