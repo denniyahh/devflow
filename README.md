@@ -67,10 +67,10 @@ devflow status
 ## Pipeline
 
 ```
-Define → Plan → Code → Validate
+Plan → Code → Validate
 ```
 
-The 4-stage pipeline is driven by GSD-native execution. State is persisted per-phase to `.devflow/state-NN.json` and survives restarts. A passing Validate ends the run and keeps the worktree and branch; DevFlow does not merge, tag or open a pull request. `--mode auto` runs unattended (gating only on repeated Validate failure or an unexpected stage crash); `--mode supervise` also gates at Validate for human review.
+The 3-stage pipeline is driven by GSD-native execution. State is persisted per-phase to `.devflow/state-NN.json` and survives restarts. A passing Validate ends the run and keeps the worktree and branch; DevFlow does not merge, tag or open a pull request. `--mode auto` runs unattended (gating only on repeated Validate failure or an unexpected stage crash); `--mode supervise` also gates at Validate for human review.
 
 ## Architecture
 

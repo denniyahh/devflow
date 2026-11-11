@@ -1,7 +1,7 @@
 # Architecture
 
-DevFlow is an opinionated CLI that drives a fixed 4-stage pipeline
-(Define → Plan → Code → Validate) end-to-end: it launches a coding
+DevFlow is an opinionated CLI that drives a fixed 3-stage pipeline
+(Plan → Code → Validate) end-to-end: it launches a coding
 agent per stage, evaluates whether the agent succeeded, fires human gates at
 Validate, and ends the run when Validate passes, leaving the worktree and
 branch as Validate left them. This document describes the implementation as it
@@ -22,19 +22,18 @@ and any individual coding agent.
 
 ## The Stage machine
 
-The pipeline is a single linear chain of four stages
+The pipeline is a single linear chain of three stages
 (`crates/devflow-core/src/stage.rs`, `enum Stage`):
 
 ```
-Define → Plan → Code → Validate
+Plan → Code → Validate
 ```
 
 - `Stage::next()` defines the linear transitions; `Validate` is terminal
   (`next()` returns `None`), and a passing Validate ends the run.
-- `Stage::is_agent_stage()` is true for `Define`, `Plan`, `Code` — these
+- `Stage::is_agent_stage()` is true for `Plan` and `Code` — these
   launch a headless coding agent driven by a GSD slash command
-  (`Stage::gsd_command()`): `/gsd-discuss-phase {N}`, `/gsd-plan-phase {N}`,
-  `/gsd-execute-phase {N}`.
+  (`Stage::gsd_command()`): `/gsd-plan-phase {N}`, `/gsd-execute-phase {N}`.
 - `Stage::is_gate()` is true for `Validate` only — it may pause the
   workflow at a human gate (see [Gate protocol](#gate-protocol)) depending on
   the active `Mode`. Validate also launches an agent
@@ -80,10 +79,10 @@ Agent backends are isolated behind a trait
   completion contract (`DEVFLOW_RESULT: {"status": "success"}` /
   `{"status": "failed", "reason": "..."}`). Prompts using
   `COMPLETION_PROTOCOL` require that result as the last line of the agent's
-  final message, with any decision reasoning above it. Three stages get
+  final message, with any decision reasoning above it. Plan and Validate get
   dedicated prompts:
-  - **Define / Plan** — idempotent: if the stage's deliverable
-    (`CONTEXT.md` / `PLAN.md`) already exists, the agent reports success
+  - **Plan** — idempotent: if the stage's deliverable
+    (`PLAN.md`) already exists, the agent reports success
     without re-running the GSD command (headless Codex cannot answer GSD's
     interactive overwrite/append/cancel prompt).
   - **Validate** — REQUIRES a `verdict: "pass"` or `verdict: "gaps"` field
@@ -112,9 +111,8 @@ four layers, tried in order:
    `feature/phase-NN` (`develop..feature/phase-NN`). `exit != 0` is always
    `Failed`, for every stage. On `exit == 0`, the "zero commits → failed"
    gate applies **only** to `Stage::Plan`/`Stage::Code` (checked explicitly,
-   not via `is_agent_stage()`, since that also includes `Define`, which
-   legitimately produces zero commits) — Define/Validate with
-   `exit == 0` succeed regardless of commit count; Validate's real pass
+   not via `is_agent_stage()`) — Validate with
+   `exit == 0` succeeds regardless of commit count; Validate's real pass
    signal is its `verdict`, not a commit count.
 3. **Layer 3 — process gone + commits exist (last resort).** If neither the
    marker nor the exit-code file is available, commit presence is used as a

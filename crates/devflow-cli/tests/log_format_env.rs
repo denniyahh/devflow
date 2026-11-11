@@ -50,7 +50,7 @@ fn project_with_phase_state() -> tempfile::TempDir {
         Mode::Auto,
         dir.path().to_path_buf(),
     );
-    state.stage = Stage::Code; // `new` starts at Define; this fixture needs Code
+    state.stage = Stage::Code; // `new` starts at Plan; this fixture needs Code
     state.started_at = "0".to_string(); // fixed, not `timestamp_now()`, so the fixture is deterministic
     devflow_core::workflow::save_state(&state).expect("save the phase's state");
 

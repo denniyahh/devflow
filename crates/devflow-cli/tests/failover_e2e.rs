@@ -56,9 +56,10 @@ const ANTIGRAVITY_SUCCESS_RESULT: &str = r#"{"event":"result","result":{"status"
 
 /// The `claude` stub. Each invocation appends one line to `claude.log`:
 /// `health` for `--version`, `canary` for the delivery canary, and
-/// `stage define|plan|code` for a stage turn, told apart by the stage prompt
+/// `stage plan|code` for a stage turn, told apart by the stage prompt
 /// (`render_claude_style`: Code runs `/gsd-execute-phase`, Plan
-/// `/gsd-plan-phase`, Define neither). Plan commits a minimal plan file with no
+/// `/gsd-plan-phase`), and `unexpected turn` for any other turn, so a sequence
+/// assertion sees it. Plan commits a minimal plan file with no
 /// checkpoint; Code commits once, records that commit, runs `@CODE_TURN_DIRT@`
 /// (empty unless the rig leaves uncommitted work), then reports a quota denial
 /// and exits.
@@ -90,7 +91,7 @@ case "$turn" in
     git commit -q -m 'plan' || exit 1
     ;;
   *)
-    echo 'stage define' >> "$log"
+    echo 'unexpected turn' >> "$log"
     ;;
 esac
 printf '%s\n' '@CLAUDE_INIT@'

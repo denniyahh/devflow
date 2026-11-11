@@ -84,7 +84,7 @@ design and no mode approves them, so an unattended run that reached one would
 simply stall. Better to say so at the start.
 
 Before the phase has been planned there is nothing to scan, and the condition
-reports `[not yet applicable]` at Define rather than refusing. At Code, plans
+reports `[not yet applicable]` at Plan rather than refusing. At Code, plans
 are expected — their absence is `[COULD NOT BE DETERMINED]`, and that refuses.
 
 A refusal here means replanning the phase without the human-only marker, or
@@ -183,8 +183,8 @@ buried in planning notes, because both are places an overnight run can stop.
 ### 1. An unattended run can still stall at a Plan-stage checkpoint
 
 Checkpoint auto-approval covers the Code stage and its fix loop. It does
-**not** cover Plan. Since DevFlow's Define stage does no agent work, Plan is
-the earliest stage where a run can stall — so unattended mode does not fully
+**not** cover Plan. Plan is the first stage, so it is the earliest stage where
+a run can stall — so unattended mode does not fully
 deliver "complete a phase with nobody present".
 
 **Cause.** The flag that would auto-approve a Plan-stage checkpoint is the same

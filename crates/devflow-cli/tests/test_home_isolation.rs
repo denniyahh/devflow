@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-/// Bounds the Define gate a launched supervise run parks at, so a reaper
+/// Bounds the Plan gate a launched supervise run parks at, so a reaper
 /// failure cannot leave an immortal monitor.
 const GATE_TIMEOUT_SECS: &str = "15";
 
