@@ -13,7 +13,7 @@ requirement closes a backlog entry, the entry is named; `.planning/user/V4-CUT-I
 
 - [x] **CUT-01**: A run has no Define stage. `devflow start` begins at Plan (or at the stage the operator names with
       `--until`-style selection), and `--dry-run` shows no Define. Closes 999.183, 999.214.
-- [ ] **CUT-02**: A run ends after Validate as *finished*: there is no Ship stage, no after-ship hooks (Merge, VersionBump,
+- [x] **CUT-02**: A run ends after Validate as *finished*: there is no Ship stage, no after-ship hooks (Merge, VersionBump,
       ChangelogAppend, BranchCleanup), no `devflow ship` and no `--yes-ship`; the event log records `workflow_finished`
       with `shipped: false` and the worktree and branch are left for the operator. Closes 999.180, 999.210; retires 999.111, 999.129, 999.132, 999.173, 999.178.
 - [ ] **CUT-03**: A rate limit with no usable fallback waits at a gate whose context names the reset time and the exact
@@ -25,7 +25,7 @@ requirement closes a backlog entry, the entry is named; `.planning/user/V4-CUT-I
       (release history, which records the removal), `.planning/` and the operator-owned `CLAUDE.md`. Closes 999.185, 999.186;
       retires 999.137's R-2. (Amended 2026-11-08 by the operator in the Phase 52 discuss step: auto-relaunch at reset,
       52-CONTEXT D-15/D-16. Scan scope amended 2026-11-09 by the operator, 52-CONTEXT D-40.)
-- [ ] **CUT-04**: Every inventory row marked `cut` that the operator confirms in the Phase 52 discuss step is removed with
+- [x] **CUT-04**: Every inventory row marked `cut` that the operator confirms in the Phase 52 discuss step is removed with
       its documentation, tests, allowlist entries and OPERATIONS.md rows, and `scripts/check.sh all` (including
       `doc_check`) passes on the result. `devflow parallel` is cut (operator 2026-11-08): closes 999.181, retires 999.26.
 
@@ -131,9 +131,9 @@ Populated during roadmap creation (2026-11-08). Phase order and dependencies: RO
 | Requirement | Phase | Status |
 |-------------|-------|--------|
 | CUT-01 | Phase 52 — Subtract and Stabilize | Complete |
-| CUT-02 | Phase 52 — Subtract and Stabilize | Pending |
+| CUT-02 | Phase 52 — Subtract and Stabilize | Complete |
 | CUT-03 | Phase 52 — Subtract and Stabilize | Pending |
-| CUT-04 | Phase 52 — Subtract and Stabilize | Pending |
+| CUT-04 | Phase 52 — Subtract and Stabilize | Complete |
 | GATE-01 | Phase 52 — Subtract and Stabilize | Pending |
 | GATE-02 | Phase 52 — Subtract and Stabilize | Pending |
 | GATE-03 | Phase 52 — Subtract and Stabilize | Pending |
