@@ -2647,8 +2647,12 @@ fn gate_sweep_may_reap(
     not_before: Option<i64>,
     now: u64,
 ) -> bool {
-    let _ = (not_before, now);
-    waiter_live
+    waiter_live && !rate_limit_gate_still_waits(not_before, now)
+}
+
+/// True while a rate-limit gate's `not_before` time is still ahead of `now`.
+fn rate_limit_gate_still_waits(not_before: Option<i64>, now: u64) -> bool {
+    not_before.is_some_and(|not_before| i64::try_from(now).unwrap_or(i64::MAX) < not_before)
 }
 
 /// What the sweep did with one aged gate it listed.
@@ -2694,6 +2698,14 @@ fn sweep_one_gate(
         }
     };
     let waiter_live = waiter_is_live(project_root, phase, stage, &observed);
+    if waiter_live && rate_limit_gate_still_waits(gate.not_before, now) {
+        println!(
+            "left phase {phase} {stage} alone at {at} — a rate-limit gate waiting for its reset \
+             (not before {}); not reaped",
+            gate.not_before.unwrap_or_default()
+        );
+        return Ok(SweepStep::LeftAlone);
+    }
     if !gate_sweep_may_reap(stage, waiter_live, gate.not_before, now) {
         println!(
             "left phase {phase} {stage} alone at {at} — no confirmed waiter; {}",
@@ -10538,7 +10550,7 @@ mod tests {
             let family = answer_family(kind);
             if matches!(
                 family,
-                AnswerFamily::Verification | AnswerFamily::StageFailure
+                AnswerFamily::Verification | AnswerFamily::StageFailure | AnswerFamily::RateLimit
             ) {
                 let refused = reject(root, phase, stage, " \t ").expect_err(&row);
                 assert!(
@@ -10567,6 +10579,16 @@ mod tests {
                         printed.contains("route: relaunch_with_note")
                             && printed.contains("relaunches the code stage with the note")
                             && printed.contains(NOTE),
+                        "{row}: {printed}"
+                    );
+                    assert!(!printed.contains("/gsd-quick"), "{row}: {printed}");
+                }
+                // The rate-limit reject's own assertion, with the agent, is
+                // `gate_reject_on_a_rate_limit_gate_prints_the_relaunch_with_the_note`.
+                AnswerFamily::RateLimit => {
+                    let printed = reject(root, phase, stage, NOTE).expect(&row);
+                    assert!(
+                        printed.contains("route: relaunch_with_note") && printed.contains(NOTE),
                         "{row}: {printed}"
                     );
                     assert!(!printed.contains("/gsd-quick"), "{row}: {printed}");
@@ -10727,6 +10749,7 @@ mod tests {
             let expected = match answer_family(kind) {
                 AnswerFamily::Verification => Some("route: reverify"),
                 AnswerFamily::StageFailure => Some("route: retry_stage"),
+                AnswerFamily::RateLimit => Some("route: relaunch_now"),
                 AnswerFamily::Preflight => Some("route: preflight_override"),
                 AnswerFamily::CheckpointDeclaration => Some("route: record_checkpoint_set"),
                 AnswerFamily::Unclassified => None,

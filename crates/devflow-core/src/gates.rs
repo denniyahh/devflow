@@ -101,11 +101,10 @@ impl GateLabel {
     /// the run's automatic relaunch is used, so the not-before time, and with
     /// it sweep protection, depends on the reset alone (D-38).
     pub fn rate_limit(reset_at: Option<i64>) -> GateLabel {
-        let _ = reset_at;
         GateLabel {
             kind: GateKind::RateLimit,
             gsd_status: None,
-            not_before: None,
+            not_before: reset_at.map(crate::reset_time::relaunch_not_before),
         }
     }
 }
