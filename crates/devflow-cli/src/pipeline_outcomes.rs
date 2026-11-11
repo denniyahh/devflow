@@ -2142,13 +2142,23 @@ fn loop_back_reason(baseline_absent: bool) -> LoopBackReason {
 /// gate and notifies accordingly), then lets the operator retry, loop back,
 /// or abort. Deliberately kept separate from `handle_validate_outcome`: it
 /// does not touch `consecutive_failures` and never auto-loops.
-/// Cap a failure reason before it enters a gate context (and from there the
-/// operator's notification). Reasons are agent- or parser-derived and can
-/// embed arbitrary output — 13-06 dogfood finding: a multi-KB raw JSONL line
-/// reached the desktop notification verbatim. Full detail stays available in
-/// `.devflow/phase-NN-stdout`; the gate only needs a readable headline.
+/// The characters of a reason kept when it is written into a gate context or
+/// an event (GATE-04, 999.206). The reason is stored whole up to this bound, so
+/// `devflow gate show` prints what the gate fired on; the bound only stops an
+/// unbounded agent output from filling the gate file (at most 16 KiB of UTF-8).
+/// Counted in characters, as [`render_gate_context`] counts them. What an
+/// operator is shown is cut later, where it is displayed or notified.
+pub(crate) const GATE_CONTEXT_STORED_MAX_CHARS: usize = 4096;
+
+/// Bound a failure reason before it enters a gate context or an event: one
+/// sanitized line of at most [`GATE_CONTEXT_STORED_MAX_CHARS`] characters.
+/// Reasons are agent- or parser-derived and can embed arbitrary output (13-06
+/// dogfood finding: a multi-KB raw JSONL line reached the desktop notification
+/// verbatim), so the bound stays; the full output stays in
+/// `.devflow/phase-NN-stdout`. The banner, `gate list` and the notify hook cut
+/// the whole context to their own display bound.
 pub(crate) fn truncate_reason(reason: &str) -> String {
-    render_gate_context(reason, 300)
+    render_gate_context(reason, GATE_CONTEXT_STORED_MAX_CHARS)
 }
 
 /// Render agent-controlled gate text as one bounded, terminal-safe line.
@@ -2176,9 +2186,9 @@ pub(crate) fn render_gate_context(context: &str, max_chars: usize) -> String {
 }
 
 /// The never-silent gate context for a failed `stage`, with its `reason`
-/// capped by [`truncate_reason`]. `lead` goes before the reason, so it
-/// survives the pending-gate banner's and `gate list`'s display bound whatever
-/// the reason's length.
+/// stored whole up to [`truncate_reason`]'s bound. `lead` goes before the
+/// reason, so it survives the pending-gate banner's and `gate list`'s display
+/// bound whatever the reason's length.
 fn stage_failure_context(stage: Stage, lead: &str, reason: Option<String>) -> String {
     format!(
         "[never-silent] stage {stage} failed: {lead}{}",
@@ -5120,14 +5130,14 @@ mod tests {
     }
 
     /// 13-06 dogfood regression: a multi-KB parser-derived reason reached
-    /// the operator's desktop notification verbatim. Gate contexts must cap
-    /// the reason to a readable headline.
+    /// the operator's desktop notification verbatim. A stored reason stays
+    /// bounded, at the stored bound (GATE-04).
     #[test]
     fn truncate_reason_caps_long_reasons_and_keeps_short_ones() {
         assert_eq!(truncate_reason("short reason"), "short reason");
         let long = "x".repeat(5000);
         let capped = truncate_reason(&long);
-        assert!(capped.chars().count() <= 300);
+        assert_eq!(capped.chars().count(), GATE_CONTEXT_STORED_MAX_CHARS);
         assert!(capped.ends_with("[truncated; full output in .devflow/]"));
     }
 
@@ -5173,11 +5183,25 @@ mod tests {
     }
 
     /// D-15: the idle-timeout cause survives into what the operator sees —
-    /// `truncate_reason`'s 300 characters and the pending-gate banner's
-    /// 300-character rendering of the whole gate context — even behind a long
-    /// commit list, and even at the maximum bound of every cause field.
+    /// the stored reason, and the pending-gate banner's and `gate list`'s
+    /// rendering of the whole failure gate context at the display bound — even
+    /// behind a long commit list, and even at the maximum bound of every cause
+    /// field.
     #[test]
     fn an_idle_timeout_gate_context_names_the_last_result_cause() {
+        let shown = |reason: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            let state = State::new(
+                PhaseId::new(71),
+                AgentKind::Claude,
+                Mode::Auto,
+                dir.path().to_path_buf(),
+            );
+            render_gate_context(
+                &failure_gate_context(&state, Stage::Validate, Some(reason.to_string())),
+                crate::commands::GATE_CONTEXT_DISPLAY_CHARS,
+            )
+        };
         // (a) the measured 999.102 cause with 40 commits.
         let measured = serde_json::json!({
             "terminal_reason": "aborted_tools",
@@ -5186,21 +5210,21 @@ mod tests {
         });
         let reason = idle_timeout_reason_with(measured, 40);
         assert!(
-            truncate_reason(&reason).contains("aborted_tools"),
+            shown(&reason).contains("aborted_tools"),
             "the cause was truncated away: {}",
-            truncate_reason(&reason)
+            shown(&reason)
         );
 
         // CONTROL: the same reason with the clause moved to the end loses the
-        // cause to truncation, so the assertion above depends on placement.
+        // cause to the display cut, so the assertion above depends on placement.
         let rest = reason
             .strip_prefix("idle timeout (")
             .expect("the reason opens with the clause");
         let close = rest.find("): ").expect("the clause closes");
         let moved = format!("idle timeout: {} ({})", &rest[close + 3..], &rest[..close]);
         assert!(
-            !truncate_reason(&moved).contains("aborted_tools"),
-            "control is vacuous: a trailing clause also survived truncation"
+            !shown(&moved).contains("aborted_tools"),
+            "control is vacuous: a trailing clause also survived the display cut"
         );
 
         // (b) every cause field at its bound: 160 characters each, 3 errors.
@@ -5210,15 +5234,12 @@ mod tests {
             "errors": vec!["e".repeat(160); 3],
         });
         let reason = idle_timeout_reason_with(max_bound, 40);
-        let truncated = truncate_reason(&reason);
-        assert!(
-            holds_whole_clause(&truncated),
-            "truncate_reason cut the clause before it closed: {truncated}"
+        assert_eq!(
+            truncate_reason(&reason),
+            reason,
+            "a reason inside the stored bound is stored whole"
         );
-        let banner = render_gate_context(
-            &stage_failure_context(Stage::Validate, "", Some(reason.clone())),
-            300,
-        );
+        let banner = shown(&reason);
         assert!(
             holds_whole_clause(&banner),
             "the banner cut the clause before it closed: {banner}"

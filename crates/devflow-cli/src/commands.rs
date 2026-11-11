@@ -1958,7 +1958,7 @@ pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
 /// so both renderings must use it; `gate show` prints the context in full.
 /// `the_budgeted_idle_timeout_clause_closes_inside_the_gate_display_bound` pins
 /// the two together.
-const GATE_CONTEXT_DISPLAY_CHARS: usize = 450;
+pub(crate) const GATE_CONTEXT_DISPLAY_CHARS: usize = 450;
 
 /// Build the persistent status-side signal for gates awaiting an operator.
 /// Context is agent-controlled, so it must use the same bounded rendering as

@@ -753,11 +753,12 @@ pub(crate) fn preflight_interactivity_check(
 /// has no plans yet, and folding that into [`Self::Undetermined`] would refuse
 /// every unattended launch ever started.
 ///
-/// Reasons are kept SHORT on purpose. [`run_preflight`] passes the joined
-/// refusal string through [`truncate_reason`] — a hard 300-character cap that
-/// includes a 39-character truncation marker — and three verbose reasons would
-/// not survive it. The unbounded detail lives in the printed report instead,
-/// which is exactly the split [`truncate_reason`]'s own doc comment describes.
+/// Reasons are kept SHORT on purpose. [`run_preflight`] stores the joined
+/// refusal string whole (up to [`truncate_reason`]'s bound), but the banner,
+/// `gate list` and the notify hook show only the start of the gate context,
+/// cut with a 39-character truncation marker, and three verbose reasons would
+/// not survive that cut. The unbounded detail lives in the printed report
+/// instead.
 #[derive(Debug)]
 enum ConditionState {
     /// Observed to hold.
@@ -1148,10 +1149,9 @@ fn unattended_launch_check_reporting_to(
 /// check added to this chain).
 ///
 /// Reasons are ordered by consequence, **unattended launch FIRST**, then
-/// interactivity — load-bearing, not cosmetic: `run_preflight` passes the
-/// joined string through [`truncate_reason`] (a hard 300-character cap)
-/// before it reaches the gate context, so a later reason is the one
-/// truncation elides.
+/// interactivity — load-bearing, not cosmetic: the joined string reaches the
+/// gate context, whose start is all the banner, `gate list` and the notify
+/// hook show, so a later reason is the one their cut elides.
 ///
 /// The adapter-specific hook (composed by [`run_preflight`] via
 /// `.and_then`) is deliberately NOT folded into this aggregation —
@@ -1160,7 +1160,7 @@ fn unattended_launch_check_reporting_to(
 pub(crate) fn generic_preflight_checks(project_root: &Path, state: &State) -> Result<(), String> {
     let mut reasons = Vec::new();
     // D-07 (35.1-03) sits FIRST, and the position was chosen rather than
-    // defaulted to, so `truncate_reason`'s 300-character cap cannot elide it.
+    // defaulted to, so the display cut of the gate context cannot elide it.
     //
     // The one check it CAN co-occur with is interactivity (Codex, Auto,
     // Plan), and it outranks that deliberately: interactivity reports a
@@ -1229,7 +1229,7 @@ fn fill_pending_approval(state: &mut State, approval: CheckpointApproval) {
 
 /// The context of the preflight gate for a refusal at `stage` of `phase`: the
 /// way-on sentence the routers render for a preflight gate (GATE-04, D-39),
-/// then the refusal's `reason` capped by [`truncate_reason`].
+/// then the refusal's `reason`, bounded by [`truncate_reason`].
 pub(crate) fn preflight_gate_context(phase: PhaseId, stage: Stage, reason: &str) -> String {
     crate::pipeline_outcomes::lead_with_way_on(
         GateKind::Preflight,
@@ -2385,9 +2385,9 @@ mod tests {
         );
     }
 
-    /// Auto refuses on the checkpoint condition, but the gate text is capped
-    /// at 300 characters and the condition is joined last, so even here the
-    /// approver may never have seen it.
+    /// Auto refuses on the checkpoint condition, but the gate text is cut for
+    /// display and the condition is joined last, so even here the approver may
+    /// never have seen it.
     #[test]
     fn approving_an_auto_code_preflight_refusal_never_widens_a_recorded_set() {
         const NAME: &str = "preflight::tests::\
@@ -4075,12 +4075,15 @@ mod tests {
         );
 
         // The unattended reason is ordered ahead of interactivity precisely so
-        // the 300-character cap cannot elide it (see the placement comment in
+        // the display cut cannot elide it (see the placement comment in
         // `generic_preflight_checks`).
+        let shown = crate::pipeline_outcomes::render_gate_context(
+            &err,
+            crate::commands::GATE_CONTEXT_DISPLAY_CHARS,
+        );
         assert!(
-            truncate_reason(&err).contains("Code would launch on the pipe-owning arm"),
-            "{}",
-            truncate_reason(&err)
+            shown.contains("Code would launch on the pipe-owning arm"),
+            "{shown}"
         );
     }
 
