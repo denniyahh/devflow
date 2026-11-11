@@ -1227,6 +1227,17 @@ fn fill_pending_approval(state: &mut State, approval: CheckpointApproval) {
     }
 }
 
+/// The context of the preflight gate for a refusal at `stage` of `phase`,
+/// with the refusal's `reason` capped by [`truncate_reason`].
+pub(crate) fn preflight_gate_context(phase: PhaseId, stage: Stage, reason: &str) -> String {
+    let _ = phase;
+    format!(
+        "[never-silent] preflight failed for stage {stage}: {} — human review needed \
+         (retry, loop-to-code, or abort)",
+        truncate_reason(reason)
+    )
+}
+
 /// Gate a stage launch on readiness (17c, D-13-D-16): the generic universal
 /// checks (D-14) plus the adapter-specific hook, called from `launch_stage`
 /// BEFORE `monitor::spawn_monitor` so a readiness failure is caught before
@@ -1298,11 +1309,7 @@ pub(crate) fn run_preflight(
             s.preflight_retries = s.preflight_retries.saturating_add(1)
         })?;
 
-        let context = format!(
-            "[never-silent] preflight failed for stage {stage}: {} — human review needed \
-             (retry, loop-to-code, or abort)",
-            truncate_reason(&reason)
-        );
+        let context = preflight_gate_context(state.phase, stage, &reason);
         match run_gate(project_root, state, stage, GateKind::Preflight, &context)? {
             Answer::Approve(ApproveRoute::StatusLess(StatusLessStep::PreflightOverride)) => {
                 // D-18f: approval is an explicit override — skip the

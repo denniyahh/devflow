@@ -2693,7 +2693,13 @@ fn reservation_is_pending(state: &State, reservation: &monitor::Reservation) -> 
 /// can be arbitrarily long and the gate context is truncated for the notify
 /// payload, so quoting bodies would push the actionable part — which file to
 /// look at — past the cut.
-fn rescan_gate_context(unapproved: &[&CheckpointDeclaration], mode: Mode) -> String {
+pub(crate) fn rescan_gate_context(
+    phase: PhaseId,
+    stage: Stage,
+    unapproved: &[&CheckpointDeclaration],
+    mode: Mode,
+) -> String {
+    let _ = (phase, stage);
     let mut plan_files: Vec<&str> = unapproved
         .iter()
         .map(|declaration| declaration.plan_file.as_str())
@@ -3801,7 +3807,8 @@ pub(crate) fn advance_with(
                         let current = verify::phase_checkpoint_declarations(execution_root, phase);
                         let unapproved = state.checkpoint_approval.unapproved(&current);
                         if !unapproved.is_empty() {
-                            let context = rescan_gate_context(&unapproved, state.mode);
+                            let context =
+                                rescan_gate_context(phase, stage, &unapproved, state.mode);
                             let action = run_gate_with_timeout(
                                 project_root,
                                 &mut state,
