@@ -277,12 +277,18 @@ struct ReaderOutput {
 ///
 /// stdout and stderr are drained on their own threads so a full pipe cannot
 /// stall the child into a false timeout. On expiry the child's process group
-/// is killed and the child reaped before [`ReaderFailure::TimedOut`] returns.
+/// is killed and the child reaped before [`ReaderFailure::TimedOut`] returns,
+/// whether the child itself was still running or had exited while a process
+/// it started held a pipe open past the deadline.
 fn run_bounded(mut cmd: Command, timeout: Duration) -> Result<ReaderOutput, ReaderFailure> {
     let deadline = Instant::now() + timeout;
     let mut child = cmd.spawn().map_err(|error| ReaderFailure::Spawn {
         message: error.to_string(),
     })?;
+    // Read before `try_wait` reaps the child: through `process_group(0)` the
+    // child's pid is its group's id, which outlives the child while any
+    // member does.
+    let group = child.id();
     let stdout = drain(child.stdout.take());
     let stderr = drain(child.stderr.take());
     let status = loop {
@@ -301,8 +307,19 @@ fn run_bounded(mut cmd: Command, timeout: Duration) -> Result<ReaderOutput, Read
             }
         }
     };
-    let stdout = collect(&stdout, deadline, timeout)?;
-    let stderr = collect(&stderr, deadline, timeout)?;
+    let collected = collect(&stdout, deadline, timeout)
+        .and_then(|stdout| Ok((stdout, collect(&stderr, deadline, timeout)?)));
+    let (stdout, stderr) = match collected {
+        Ok(both) => both,
+        Err(failure) => {
+            if matches!(failure, ReaderFailure::TimedOut { .. }) {
+                // The child is reaped; a member of its group that holds the
+                // pipe is reaped by its new parent once it is killed.
+                kill_group(group);
+            }
+            return Err(failure);
+        }
+    };
     Ok(ReaderOutput {
         status,
         stdout,
@@ -350,20 +367,34 @@ fn collect(
 
 /// Kill the unreaped `child`'s process group, then the child, and reap it.
 fn end(child: &mut Child) {
+    kill_group(child.id());
+    // Both fail only when the child already exited, which the wait reaps.
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// SIGKILL the process group `group`, the id of a reader child spawned with
+/// `process_group(0)`.
+///
+/// Called while the child is unreaped, or after it was reaped while a process
+/// still holds one of its pipes open. That holder is a member of the group
+/// unless it left with `setsid` (a `detached` spawn): such a holder is out of
+/// reach of this kill, and once the group is empty its id could name another
+/// group.
+fn kill_group(group: u32) {
     #[cfg(unix)]
-    if let Ok(pid) = i32::try_from(child.id())
+    if let Ok(pid) = i32::try_from(group)
         && pid > 1
     {
-        // SAFETY: `child` is not yet reaped, so `pid` is still this child and,
-        // through `process_group(0)`, its own group id; `pid > 1`, so `-pid`
-        // is neither our group (`0`) nor every process (`-1`).
+        // SAFETY: `group` is a reader child's own group id (see above);
+        // `pid > 1`, so `-pid` is neither our group (`0`) nor every process
+        // (`-1`).
         unsafe {
             libc::kill(-pid, libc::SIGKILL);
         }
     }
-    // Both fail only when the child already exited, which the wait reaps.
-    let _ = child.kill();
-    let _ = child.wait();
+    #[cfg(not(unix))]
+    let _ = group;
 }
 
 /// Run one reader under `home` in `evidence_root` and parse its stdout.
@@ -810,6 +841,70 @@ mod tests {
         // SAFETY: signal 0 only probes whether `pid` exists.
         let alive = unsafe { libc::kill(pid, 0) } == 0;
         assert!(!alive, "the hung reader {pid} was left running");
+    }
+
+    /// A launcher that exits at once while a process it started keeps stdout
+    /// open times out on the drain, and that process (a member of the
+    /// reader's process group) is killed before `TimedOut` returns. Control
+    /// in the same test: the leftover is alive while the launcher has already
+    /// exited, so the drain, not the launcher, is what timed out.
+    #[test]
+    fn a_reader_whose_child_holds_stdout_times_out_and_the_child_is_killed() {
+        let fx = Fixture::new();
+        let group_file = fx.logs.join("group");
+        let leftover_file = fx.logs.join("leftover");
+        fx.plant_at(
+            ".claude/gsd-core/bin/gsd_run",
+            &format!(
+                "sleep 30 &\necho $! > '{leftover}'\necho $$ > '{group}'\nexit 0",
+                leftover = leftover_file.display(),
+                group = group_file.display(),
+            ),
+        );
+        let deadline = Duration::from_millis(300);
+        let started = Instant::now();
+        let failure = verification_status_within(&fx.home, &fx.root, &fx.phase(), deadline)
+            .expect_err("a reader whose output never closes is not a status");
+        let elapsed = started.elapsed();
+        let read_pid = |path: &Path| -> u32 {
+            std::fs::read_to_string(path)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap()
+        };
+        let (group, leftover) = (read_pid(&group_file), read_pid(&leftover_file));
+        // SIGKILL is delivered asynchronously: allow a short window for the
+        // leftover to leave the live set.
+        let gone_by = Instant::now() + Duration::from_secs(2);
+        while crate::test_support::process_is_live(leftover) && Instant::now() < gone_by {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let leftover_live = crate::test_support::process_is_live(leftover);
+        let group_live = crate::test_support::live_group_members(group);
+        if leftover_live {
+            // Clean up the recorded leftover before the assertion fails.
+            // SAFETY: `leftover` is the pid the stub recorded, still live.
+            unsafe {
+                libc::kill(i32::try_from(leftover).unwrap(), libc::SIGKILL);
+            }
+        }
+        assert!(
+            matches!(failure, ReaderFailure::TimedOut { after } if after == deadline),
+            "{failure:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the call waited {elapsed:?}, not the deadline"
+        );
+        assert!(
+            !leftover_live,
+            "the process {leftover} holding the reader's stdout was left running"
+        );
+        assert!(
+            group_live.is_empty(),
+            "the reader's group {group} still has live members: {group_live:?}"
+        );
     }
 
     #[test]
