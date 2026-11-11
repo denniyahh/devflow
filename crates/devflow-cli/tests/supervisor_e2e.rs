@@ -2657,7 +2657,10 @@ fn a_validate_gate_names_the_route_its_reject_prints_and_runs() {
         stdout.contains("route: quick") && stdout.contains("`/gsd-quick`"),
         "the reject prints the /gsd-quick route: {stdout}"
     );
-    assert!(stdout.contains(NOTE), "the print carries the note: {stdout}");
+    assert!(
+        stdout.contains(NOTE),
+        "the print carries the note: {stdout}"
+    );
     rig.wait_for_validate_gates(2);
     let prompts = logged_prompts(&rig);
     let quick = prompts
