@@ -10857,6 +10857,92 @@ mod tests {
         registration.finish();
     }
 
+    /// D-15, D-27.4, D-37: `gate reject` with a note on a rate-limit gate
+    /// opened at Plan on a Codex run is written, and prints the relaunch of the
+    /// plan stage on codex with the note; a whitespace-only note exits non-zero
+    /// and writes nothing. `gate approve` on such a gate prints the relaunch
+    /// now, on codex, and `gate abort` is written. The print comes from the
+    /// routers over the gate's kind: control in the same test, a `clean_pass`
+    /// gate at Plan with the same context prints `/gsd-quick` on reject.
+    #[test]
+    fn gate_reject_on_a_rate_limit_gate_prints_the_relaunch_with_the_note() {
+        use devflow_core::gates::GateKind;
+        const NOTE: &str = "the quota is back; keep the diff small";
+        const CONTEXT: &str = "[never-silent] stage plan failed: rate limited until soon";
+        let stage = Stage::Plan;
+        let run_at = |root: &Path, phase: PhaseId, kind: GateKind| {
+            let mut state =
+                State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
+            state.stage = stage;
+            workflow::save_state(&state).unwrap();
+            registered_gate_of(root, phase, stage, Some(kind), CONTEXT)
+        };
+        let answer = |root: &Path, phase: PhaseId, kind: GateAnswerKind, note: Option<&str>| {
+            gate_respond_report(
+                root,
+                phase,
+                Some(stage),
+                kind,
+                note.map(str::to_string),
+                None,
+            )
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(6270);
+        let registration = run_at(root, phase, GateKind::RateLimit);
+        let refused = answer(root, phase, GateAnswerKind::Reject, Some(" \t ")).unwrap_err();
+        assert!(
+            refused.to_string().contains("refused")
+                && refused.to_string().contains("devflow gate reject --note"),
+            "{refused}"
+        );
+        assert!(
+            gate_answer_files(root, phase, stage).is_empty(),
+            "a refused reject writes nothing"
+        );
+        let printed = answer(root, phase, GateAnswerKind::Reject, Some(NOTE)).unwrap();
+        assert!(
+            printed.contains("route: relaunch_with_note")
+                && printed.contains("relaunches the plan stage with the note")
+                && printed.contains("codex")
+                && printed.contains(NOTE),
+            "{printed}"
+        );
+        assert!(!printed.contains("/gsd-quick"), "{printed}");
+        assert_eq!(gate_answer_files(root, phase, stage).len(), 1, "written");
+        registration.finish();
+
+        let phase = PhaseId::new(6271);
+        let registration = run_at(root, phase, GateKind::RateLimit);
+        let printed = answer(root, phase, GateAnswerKind::Approve, None).unwrap();
+        assert!(
+            printed.contains("route: relaunch_now")
+                && printed.contains("relaunches the plan stage now on the same agent")
+                && printed.contains("codex"),
+            "{printed}"
+        );
+        registration.finish();
+
+        let phase = PhaseId::new(6272);
+        let registration = run_at(root, phase, GateKind::RateLimit);
+        let printed = answer(root, phase, GateAnswerKind::Abort, None).unwrap();
+        assert!(printed.contains("route: end"), "{printed}");
+        assert_eq!(gate_answer_files(root, phase, stage).len(), 1, "written");
+        registration.finish();
+
+        // Control: the same stage and context on a `clean_pass` gate.
+        let phase = PhaseId::new(6273);
+        let registration = run_at(root, phase, GateKind::CleanPass);
+        let printed = answer(root, phase, GateAnswerKind::Reject, Some(NOTE)).unwrap();
+        assert!(
+            printed.contains("route: quick") && printed.contains("/gsd-quick"),
+            "control: {printed}"
+        );
+        registration.finish();
+    }
+
     #[test]
     fn gate_respond_requires_stage_when_ambiguous_and_errors_when_none_open() {
         let dir = tempfile::tempdir().unwrap();
