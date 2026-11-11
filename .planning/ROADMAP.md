@@ -670,6 +670,49 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.229: An Invalid `DEVFLOW_EXTERNAL_VERIFY_ENABLED` Is Ignored With No Operator-Visible Line (BACKLOG)
+
+**Found:** 2026-11-11, Phase 52 plan 52-23 (`.planning/phases/52-subtract-and-stabilize/deferred-items.md`). The variable is read only in the detached supervisor, so an invalid
+value falls back silently from the operator's point of view (the warning goes to the supervisor's tracing, which is
+off by default since 52-23). Breaks the fail-closed-observability rule.
+**Fix shape:** validate it once in the foreground at `devflow start`/`resume` and refuse or print a `warning:` line,
+or record an event the operator sees in `status`. Small: next phase or any fix branch.
+
+### Phase 999.228: `devflow doctor` Still Checks for the `gh` CLI (BACKLOG)
+
+**Found:** 2026-11-11, Phase 52 plan 52-15 (`.planning/phases/52-subtract-and-stabilize/deferred-items.md`). Nothing runs `gh` since Ship was removed, so the check reports a
+dependency the tool no longer has. **Fix shape:** drop the check and its doc row. Small: any fix branch.
+
+### Phase 999.227: Stale v3 Wording in Comments, Test Names and One Retention Count (BACKLOG)
+
+**Found:** 2026-11-11, Phase 52 plans 52-03, 52-10, 52-13, 52-15 (`.planning/phases/52-subtract-and-stabilize/deferred-items.md`). Comments and test names still describe the
+removed cron resume, the after-ship hooks (`test_support.rs` `init_repo`), and Ship as the stage after Validate;
+`gate_sweep_e2e::no_suite_on_the_common_builder_runs_a_real_reap_strays_pass` guards a flag that no longer exists;
+the capture-retention arithmetic still counts a five-stage run. The removed-surface scan (52-18) strips comments, so
+it does not see these.
+**Not established:** whether the five-stage retention count changes how many captures are kept (behaviour) or is only
+a comment; check first.
+**Fix shape:** one wording sweep plus the retention check; delete or rewrite the obsolete guard test. Small.
+
+### Phase 999.226: devflow-core Public Items With No Production Caller After the v4 Cuts (BACKLOG)
+
+**Found:** 2026-11-11, Phase 52 plans 52-03, 52-12, 52-15, 52-24 and the phase verifier (`.planning/phases/52-subtract-and-stabilize/deferred-items.md`, 52-VERIFICATION.md).
+Kept because each is `pub` in the published crate and its plan did not list it: the stray-reaping primitives (their
+only destructive caller, `gate sweep --reap-strays`, went in 52-03); `GitFlow::commit_all` and other uncalled
+`GitFlow` functions; `agent_result::phase_verification_fingerprint` and `phase_verification_mtime_nanos`;
+`reset_time::auto_relaunch_due` (only its own test calls it); the unused `project_root` parameter of
+`StageIntent::for_stage_in_project` and `prompt::stage_prompt_for_project`.
+**Fix shape:** remove them before 4.0.0 is published, so the removal rides the same major bump instead of forcing a
+5.0.0; record each `function_missing` from `cargo semver-checks`. Take it at Phase 52 close-out if the operator
+agrees, else first in the next phase.
+
+### Phase 999.225: `parse_reset_time` Accepts a Day Past the Month's End (BACKLOG)
+
+**Found:** 2026-11-11, Phase 52 plan 52-01 (`.planning/phases/52-subtract-and-stabilize/deferred-items.md`); deferred through 52-31 and 52-32. A reset such as Feb 31 parses
+instead of being refused. It always yields a later instant, never an earlier one, so a relaunch can only be late, not
+early (52-31 SUMMARY). **Fix shape:** validate the day against the month (and leap years) and return `None`, which
+leads to a plain gate; add the boundary tests. Small: any fix branch.
+
 ### Phase 999.224: Replace the Overloaded `--force` Flags With Named Actions (BACKLOG)
 
 **Found:** 2026-11-11, Phase 52 code review (CR-02, IN-03) and the operator's question "what is the purpose of the
