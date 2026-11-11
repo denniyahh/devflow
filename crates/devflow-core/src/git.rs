@@ -355,7 +355,7 @@ impl GitFlow {
 
     /// [`Self::cleanup_merged`], writing the line for each branch git refused
     /// to delete to `err`: the returned list names only the deleted ones.
-    fn cleanup_merged_to(&self, _err: &mut dyn std::io::Write) -> Result<Vec<String>, GitError> {
+    fn cleanup_merged_to(&self, err: &mut dyn std::io::Write) -> Result<Vec<String>, GitError> {
         let output = self.git_output(["branch", "--merged", &self.config.develop])?;
         // CR-01 (45-REVIEW.md): the configured trunk cannot be the SOLE
         // source of the protected set. Once `config.develop` became the
@@ -392,7 +392,13 @@ impl GitFlow {
             info!("cleaning up merged branch: {branch}");
             match self.git(["branch", "-D", branch]) {
                 Ok(()) => deleted.push(branch.to_string()),
-                Err(err) => warn!("could not delete merged branch {branch}: {err}"),
+                Err(error) => {
+                    warn!("could not delete merged branch {branch}: {error}");
+                    let _ = writeln!(
+                        err,
+                        "warning: could not delete the merged branch {branch} ({error}); it was kept"
+                    );
+                }
             }
         }
         Ok(deleted)

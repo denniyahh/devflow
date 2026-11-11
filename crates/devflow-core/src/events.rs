@@ -45,7 +45,7 @@ fn emit_to(
     phase: PhaseId,
     event: &str,
     fields: serde_json::Value,
-    _err: &mut dyn Write,
+    sink: &mut dyn Write,
 ) {
     let mut line = serde_json::json!({
         "v": SCHEMA_VERSION,
@@ -72,6 +72,11 @@ fn emit_to(
         && let Err(err) = crate::workflow::ensure_devflow_dir(parent)
     {
         warn!("could not create events dir: {err}");
+        let _ = writeln!(
+            sink,
+            "warning: could not record the `{event}` event: could not create {} ({err})",
+            parent.display()
+        );
         return;
     }
     let result = std::fs::OpenOptions::new()
@@ -81,6 +86,11 @@ fn emit_to(
         .and_then(|mut f| f.write_all(format!("{line}\n").as_bytes()));
     if let Err(err) = result {
         warn!("could not append to {}: {err}", path.display());
+        let _ = writeln!(
+            sink,
+            "warning: could not record the `{event}` event in {} ({err})",
+            path.display()
+        );
     }
 }
 
