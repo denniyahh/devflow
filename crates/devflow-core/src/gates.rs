@@ -2518,6 +2518,92 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_explicit_abort_field_aborts() {
+        let response = GateResponse {
+            approved: false,
+            abort: true,
+            note: None,
+            responded_by: None,
+        };
+        assert!(matches!(
+            GateAction::from_response(&response),
+            GateAction::Abort(_)
+        ));
+    }
+
+    #[test]
+    fn an_answer_that_approves_and_aborts_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+            .unwrap()
+            .gate_id;
+        let both = GateResponse {
+            approved: true,
+            abort: true,
+            note: None,
+            responded_by: None,
+        };
+        let refused = Gates::answer(dir.path(), phase, stage, &gate, &both);
+        let message = refused
+            .as_ref()
+            .expect_err("an answer that approves and aborts must be refused")
+            .to_string();
+        assert!(
+            message.contains("both approve and abort"),
+            "the refusal must name both fields: {message}"
+        );
+        assert!(
+            !Gates::answer_path(dir.path(), phase, stage, &gate).exists(),
+            "a refused answer writes nothing"
+        );
+    }
+
+    #[test]
+    fn a_hand_written_approve_and_abort_reads_as_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+            .unwrap()
+            .gate_id;
+        let hand_written = GateAnswer {
+            gate_id: gate.to_string(),
+            response: GateResponse {
+                approved: true,
+                abort: true,
+                note: Some("ship it".into()),
+                responded_by: Some("someone".into()),
+            },
+        };
+        std::fs::write(
+            Gates::answer_path(dir.path(), phase, stage, &gate),
+            serde_json::to_string(&hand_written).unwrap(),
+        )
+        .unwrap();
+        let AnswerRead::Bound(answer) = Gates::read_answer(dir.path(), phase, stage, &gate) else {
+            panic!("the hand-written file must read back as an answer to its gate");
+        };
+        let GateAction::Abort(reason) = GateAction::from_response(&answer.response) else {
+            panic!("an answer that approves and aborts must never advance");
+        };
+        assert!(
+            reason.contains("both approves and aborts"),
+            "the reason must name the invalid answer: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_record_without_the_abort_field_is_not_an_abort() {
+        let response: GateResponse =
+            serde_json::from_str(r#"{"approved":false,"note":"abort"}"#).unwrap();
+        assert!(!response.abort);
+        assert_eq!(
+            GateAction::from_response(&response),
+            GateAction::LoopBack(Stage::Code)
+        );
+    }
+
     /// `run_notify_command` takes the command string as an argument (not an
     /// env var), so this test needs no env mutation and cannot race other
     /// tests.
@@ -3894,7 +3980,7 @@ mod tests {
     }
 
     #[test]
-    fn reap_answer_writes_a_rejection_for_the_observed_gate_only() {
+    fn reap_answer_writes_an_abort_for_the_observed_gate_only() {
         let dir = tempfile::tempdir().unwrap();
         let (phase, stage) = (PhaseId::new(7), Stage::Code);
         let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
@@ -3902,24 +3988,26 @@ mod tests {
             .gate_id;
         let other = GateId::new();
 
-        let refused = Gates::reap_answer(dir.path(), phase, stage, &other, "abort: x", "sweep");
+        let refused = Gates::reap_answer(dir.path(), phase, stage, &other, "reaped", "sweep");
         assert!(
             matches!(refused, Err(GateError::GateIdMismatch { .. })),
             "{refused:?}"
         );
         assert!(!Gates::answer_path(dir.path(), phase, stage, &other).exists());
 
-        Gates::reap_answer(dir.path(), phase, stage, &gate, "abort: x", "sweep").unwrap();
+        // The note does not say "abort": the field alone must make it one.
+        Gates::reap_answer(dir.path(), phase, stage, &gate, "reaped", "sweep").unwrap();
 
         let AnswerRead::Bound(answer) = Gates::read_answer(dir.path(), phase, stage, &gate) else {
             panic!("the reap must be read back as an answer to its gate");
         };
         assert!(!answer.response.approved);
+        assert!(answer.response.abort, "a reap is an abort");
         assert_eq!(answer.response.responded_by.as_deref(), Some("sweep"));
-        assert!(matches!(
+        assert_eq!(
             GateAction::from_response(&answer.response),
-            GateAction::Abort(_)
-        ));
+            GateAction::Abort("reaped".to_string())
+        );
     }
 
     #[test]
