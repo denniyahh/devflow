@@ -54,7 +54,9 @@ enum Command {
         /// Validate; `supervise` gates at Validate.
         #[arg(long)]
         mode: Mode,
-        /// Overwrite the feature branch if it already exists.
+        /// Recreate the phase worktree and feature branch from the base if
+        /// they exist. Refused, with nothing removed, while the branch has
+        /// commits not merged into the base.
         #[arg(long)]
         force: bool,
         /// Run the agent directly in the primary checkout instead of an
@@ -218,7 +220,8 @@ enum Command {
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
-        /// Force-remove dirty worktrees.
+        /// Force-remove dirty and kept worktrees. A branch with commits not
+        /// merged into the base is still kept.
         #[arg(long)]
         force: bool,
     },
