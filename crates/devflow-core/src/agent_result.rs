@@ -2901,6 +2901,15 @@ pub fn phase_commit_count(
     String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 }
 
+/// Skeleton (52-27): counts like [`phase_commit_count`] for now.
+pub fn phase_source_commit_count(
+    project_root: &Path,
+    git_flow: &GitFlowConfig,
+    phase: PhaseId,
+) -> Option<u32> {
+    phase_commit_count(project_root, git_flow, phase)
+}
+
 /// Layer 2: Use exit code + commit count to determine result.
 ///
 /// Reads exit code from `.devflow/phase-NN-exit` file.
@@ -9679,6 +9688,60 @@ mod tests {
             Some(0),
             "git RAN and reported the branch absent — a real observation of zero, \
              not a failure to measure"
+        );
+    }
+
+    /// D-34: only commits that change a path outside `.planning/` count. Two
+    /// commits touching only `.planning/` and one touching `src/x.rs` on the
+    /// phase branch count 1, where `phase_commit_count` (the control, same
+    /// repository) counts all 3; a git that cannot run is `None`.
+    #[test]
+    fn phase_source_commit_count_ignores_planning_only_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(4627);
+        git(root, &["init"]);
+        git(root, &["config", "user.email", "devflow@example.com"]);
+        git(root, &["config", "user.name", "DevFlow Tests"]);
+        git(root, &["config", "commit.gpgsign", "false"]);
+        git(root, &["config", "tag.gpgsign", "false"]);
+        git(root, &["config", "core.hooksPath", "/dev/null"]);
+        git(root, &["checkout", "-b", "develop"]);
+        std::fs::write(root.join("README.md"), "base\n").unwrap();
+        git(root, &["add", "README.md"]);
+        git(root, &["commit", "-m", "base"]);
+        git(
+            root,
+            &[
+                "checkout",
+                "-b",
+                &format!("feature/phase-{}", phase.padded()),
+            ],
+        );
+        std::fs::create_dir_all(root.join(".planning/phases/x")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        for (path, label) in [
+            (".planning/phases/x/01-PLAN.md", "plan"),
+            (".planning/STATE.md", "state"),
+            ("src/x.rs", "source"),
+        ] {
+            std::fs::write(root.join(path), label).unwrap();
+            git(root, &["add", path]);
+            git(root, &["commit", "-m", label]);
+        }
+        let flow = GitFlowConfig::default();
+
+        assert_eq!(phase_source_commit_count(root, &flow, phase), Some(1));
+        assert_eq!(
+            phase_commit_count(root, &flow, phase),
+            Some(3),
+            "control: the plain count sees every commit"
+        );
+        let unspawnable = root.join("this-directory-does-not-exist");
+        assert_eq!(
+            phase_source_commit_count(&unspawnable, &flow, phase),
+            None,
+            "a git that cannot run is not a measured zero"
         );
     }
 

@@ -438,6 +438,31 @@ mod tests {
         ));
     }
 
+    /// D-12: no new cap. The two failure ceilings keep their values, pinned at
+    /// compile time (a runtime assertion on constants cannot fail at runtime).
+    const _: () = assert!(MAX_CONSECUTIVE_FAILURES == 3 && MAX_PHASE_VALIDATE_FAILURES == 10);
+
+    /// D-25: a gap-closure pass keeps the consecutive-failure streak across
+    /// Validate→Plan and Plan→Code, as every pass does across Code→Validate.
+    /// Without the marker, Plan→Code still resets it.
+    #[test]
+    fn a_gap_closure_pass_keeps_the_failure_streak() {
+        for (from, to) in [
+            (Stage::Validate, Stage::Plan),
+            (Stage::Plan, Stage::Code),
+            (Stage::Code, Stage::Validate),
+        ] {
+            assert!(
+                !transition_resets_consecutive_failures(from, to, true),
+                "{from} -> {to} inside a gap-closure pass keeps the streak"
+            );
+        }
+        assert!(
+            transition_resets_consecutive_failures(Stage::Plan, Stage::Code, false),
+            "control: outside a gap-closure pass Plan -> Code resets the streak"
+        );
+    }
+
     #[test]
     fn made_progress_treats_no_prior_record_as_progress() {
         // No prior record with a zero current count: the state of a
