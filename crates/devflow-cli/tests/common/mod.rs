@@ -177,6 +177,22 @@ pub fn capture_agent_bin_then(logs: &Path, tail: &str) -> FakeBin {
     )
 }
 
+/// Plant a `gsd_run` stub at `<home>/.claude/gsd-core/bin/gsd_run`, so a run
+/// under `home` reads GSD's verification status from `responses` (one reply
+/// per `query verification status` call, in order) and never from a real GSD
+/// install. Each call's working directory and argv land in `logs`; read them
+/// with [`gsd_run_calls`]. See `devflow_core::test_support::plant_gsd_run_stub`
+/// for what the stub answers.
+pub fn stub_gsd_run(home: &HermeticHome, responses: &[&str], logs: &Path) {
+    devflow_core::test_support::plant_gsd_run_stub(home.home(), responses, logs);
+}
+
+/// The calls a [`stub_gsd_run`] stub logged under `logs`, as
+/// `(working directory, argv)`, in call order.
+pub fn gsd_run_calls(logs: &Path) -> Vec<(PathBuf, String)> {
+    devflow_core::test_support::gsd_run_calls(logs)
+}
+
 /// Write a CONTEXT.md for `phase` under `root` and return its path relative to
 /// `root`, for the caller to commit. `start` refuses to launch codex for a
 /// phase with no CONTEXT.md on the base branch.

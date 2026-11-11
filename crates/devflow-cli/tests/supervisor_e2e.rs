@@ -15,6 +15,7 @@
 
 mod common;
 
+use devflow_core::gsd_reader::GsdStatus;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::supervisor::{self, Liveness, ShutdownOutcome};
 use std::fs;
@@ -1483,8 +1484,10 @@ const EXIT_WAIT: Duration = Duration::from_secs(30);
 
 /// One auto run's fixture: a hermetic home, a repository with the
 /// `.planning/config.json` auto mode's unattended check reads, a passing fake
-/// `claude` first on PATH, and a notify command that appends one line per
-/// call to a log outside the repository.
+/// `claude` first on PATH, a notify command that appends one line per call to
+/// a log outside the repository, and a `gsd_run` stub under the home that
+/// answers GSD's verification status `passed` (52-22: Validate passes only
+/// when GSD reports `passed` too).
 struct FinishRig {
     home: common::HermeticHome,
     _repo: tempfile::TempDir,
@@ -1492,6 +1495,7 @@ struct FinishRig {
     phase: PhaseId,
     fake_bin: common::FakeBin,
     notify: tempfile::TempDir,
+    gsd_logs: tempfile::TempDir,
 }
 
 impl FinishRig {
@@ -1518,14 +1522,30 @@ impl FinishRig {
         .unwrap();
         git(&root, &["add", ".planning/config.json", &plan]);
         git(&root, &["commit", "-q", "-m", "auto config and plan"]);
-        Self {
+        let rig = Self {
             home,
             _repo: repo,
             root,
             phase,
             fake_bin: common::fake_bin_dir(&passing_claude()),
             notify: tempfile::tempdir().unwrap(),
-        }
+            gsd_logs: tempfile::tempdir().unwrap(),
+        };
+        rig.stub_gsd(&[devflow_core::test_support::gsd_status_json(
+            GsdStatus::Passed,
+        )]);
+        rig
+    }
+
+    /// Replace the run's `gsd_run` stub with one answering `responses`, one per
+    /// verification-status read.
+    fn stub_gsd(&self, responses: &[&str]) {
+        common::stub_gsd_run(&self.home, responses, self.gsd_logs.path());
+    }
+
+    /// The calls the `gsd_run` stub logged, as `(working directory, argv)`.
+    fn gsd_calls(&self) -> Vec<(std::path::PathBuf, String)> {
+        common::gsd_run_calls(self.gsd_logs.path())
     }
 
     fn notify_log(&self) -> std::path::PathBuf {
@@ -1535,6 +1555,11 @@ impl FinishRig {
     /// `devflow start --phase N --agent claude --mode auto`, plus `extra`, in
     /// a phase worktree. Asserts the start itself succeeded.
     fn start(&self, extra: &[&str]) {
+        self.start_in("auto", extra);
+    }
+
+    /// [`start`](Self::start) in `mode` (`auto` or `supervise`).
+    fn start_in(&self, mode: &str, extra: &[&str]) {
         let existing = std::env::var_os("PATH").unwrap_or_default();
         let path = format!(
             "{}:{}",
@@ -1553,7 +1578,7 @@ impl FinishRig {
                 "--agent",
                 "claude",
                 "--mode",
-                "auto",
+                mode,
             ])
             .args(extra)
             .arg(&self.root)
@@ -1887,5 +1912,130 @@ fn a_finished_run_is_kept_by_cleanup_and_refused_by_resume() {
     assert!(
         rig.state().finished,
         "the refused resume leaves the finished state as it was"
+    );
+}
+
+// ---- 52-22: Validate passes only when GSD reports `passed` (GATE-02, GATE-03)
+
+/// GATE-03's never-lies rule for one gate context: a context names GSD's
+/// `status`, and says `passed` only when GSD returned `passed`. `Err` names
+/// the lie.
+fn never_lies(context: &str, status: &str) -> Result<(), String> {
+    if !context.contains(status) {
+        return Err(format!(
+            "the context does not name GSD's status {status}: {context}"
+        ));
+    }
+    if status != "passed" && context.contains("passed") {
+        return Err(format!(
+            "the context says passed while GSD reports {status}: {context}"
+        ));
+    }
+    Ok(())
+}
+
+/// D-08 / GATE-03: a supervise run whose Validate agent reports pass while GSD
+/// reports `gaps_found` does not finish. The Validate gate names `gaps_found`
+/// and never says passed, and GSD was asked about the phase directory under
+/// the worktree, from the worktree. Control in the same test: a planted
+/// context that says passed beside the same `gaps_found` status fails the
+/// never-lies check.
+#[test]
+fn a_gaps_found_report_never_reads_as_passed() {
+    let phase = PhaseId::new(85);
+    let rig = FinishRig::new(phase);
+    rig.stub_gsd(&[devflow_core::test_support::gsd_status_json(
+        GsdStatus::GapsFound,
+    )]);
+    let reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+
+    rig.start_in("supervise", &[]);
+    common::wait_for(
+        || {
+            rig.events().iter().any(|event| {
+                event["event"] == "workflow_finished"
+                    || (event["event"] == "gate_fired" && event["stage"] == "validate")
+            })
+        },
+        RUN_WAIT,
+        "the run to finish or reach the Validate gate",
+    );
+    let log = rig.events_text();
+    assert!(
+        rig.positions("workflow_finished").is_empty(),
+        "a gaps_found report must not finish the run; events:\n{log}"
+    );
+
+    let gate_path = devflow_core::gates::Gates::gate_path(
+        &rig.root,
+        phase,
+        devflow_core::stage::Stage::Validate,
+    );
+    let gate: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&gate_path)
+            .unwrap_or_else(|err| panic!("the Validate gate file {}: {err}", gate_path.display())),
+    )
+    .expect("the gate file parses");
+    let context = gate["context"]
+        .as_str()
+        .expect("a gate context")
+        .to_string();
+    never_lies(&context, "gaps_found").unwrap_or_else(|lie| panic!("{lie}\nevents:\n{log}"));
+    for event in rig.events() {
+        if event["event"] == "gate_fired" || event["event"] == "gsd_verification" {
+            assert!(
+                !event.to_string().contains("passed"),
+                "no event may say passed while GSD reports gaps_found: {event}"
+            );
+        }
+    }
+
+    let worktree = rig
+        .state()
+        .worktree_path
+        .expect("the run used a phase worktree")
+        .canonicalize()
+        .expect("the worktree exists");
+    let phase_dir = worktree.join(format!(".planning/phases/{}-fixture", phase.padded()));
+    let calls = rig.gsd_calls();
+    let read = format!("query verification status {}", phase_dir.display());
+    assert!(
+        calls
+            .iter()
+            .any(|(cwd, argv)| argv == &read && cwd == &worktree),
+        "GSD was asked `{read}` from {}; calls: {calls:?}",
+        worktree.display()
+    );
+
+    // Control: the check bites on a planted lie.
+    assert!(
+        never_lies("GSD verification: passed", "gaps_found").is_err(),
+        "a context saying passed beside gaps_found must fail the never-lies check"
+    );
+
+    let abort = common::hermetic_devflow(&rig.home)
+        .args([
+            "gate",
+            "abort",
+            &phase.to_string(),
+            "--stage",
+            "validate",
+            "--note",
+            "test teardown",
+        ])
+        .arg("--project")
+        .arg(&rig.root)
+        .output()
+        .expect("run devflow gate abort");
+    assert!(
+        abort.status.success(),
+        "gate abort exits 0\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&abort.stdout),
+        String::from_utf8_lossy(&abort.stderr)
+    );
+    assert!(
+        reaper.supervisors_exited_within(EXIT_WAIT),
+        "the aborted run's supervisors exit; events:\n{}",
+        rig.events_text()
     );
 }
