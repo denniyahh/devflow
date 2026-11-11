@@ -5793,6 +5793,109 @@ mod tests {
         }
     }
 
+    /// Write the phase's `{N}-VERIFICATION.md` as GSD's verifier does at the
+    /// tail of `/gsd-execute-phase`: during Code, before Validate launches.
+    fn verifier_tail_report(evidence_root: &Path, phase: PhaseId) {
+        let report = phase_dir_fixture(evidence_root, phase)
+            .join(format!("{}-VERIFICATION.md", phase.padded()));
+        std::fs::write(&report, "---\nstatus: written-by-code\n---\n").unwrap();
+    }
+
+    /// 999.192: a report the verifier wrote during Code routes by GSD's status,
+    /// never by when it was written. `gaps_found` takes the gaps route, in auto
+    /// mode and on a supervise reject (the Phase 51 case); `passed` takes the
+    /// finish path. No row relaunches the full execute command.
+    #[test]
+    fn a_verifier_written_report_from_code_routes_by_gsd_status() {
+        if !in_bounded_child(
+            "pipeline_outcomes::tests::a_verifier_written_report_from_code_routes_by_gsd_status",
+        ) {
+            return;
+        }
+        let no_full_execute = |root: &Path, phase: PhaseId, row: &str| {
+            let full = events_named(root, phase, "loop_back")
+                .into_iter()
+                .filter(|event| event["fix"] == "FullExecute")
+                .count();
+            assert_eq!(
+                full,
+                0,
+                "{row}: a verifier-written report never relaunches a full-phase execute: {:?}",
+                phase_events(root, phase)
+            );
+        };
+
+        // Auto, agent pass over gaps_found: the gaps loop, no gate.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5240);
+        let _gsd = validate_evidence(root, phase, &[gsd_says(GsdStatus::GapsFound)]);
+        verifier_tail_report(root, phase);
+        let mut state = validate_state(root, phase, Mode::Auto);
+        preanswer_gate(root, phase, Stage::Validate, &abort_answer());
+        let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Passed);
+        assert!(
+            events_named(root, phase, "gate_fired").is_empty(),
+            "auto gaps_found loops back without a gate: {:?}",
+            phase_events(root, phase)
+        );
+        assert_eq!(
+            last_loop_back_fix(root, phase).as_deref(),
+            Some("GapsOnly"),
+            "auto gaps_found takes the gaps route"
+        );
+        no_full_execute(root, phase, "auto gaps_found");
+
+        // Supervise, the operator rejects the gaps_found gate: the gaps loop.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5241);
+        let _gsd = validate_evidence(root, phase, &[gsd_says(GsdStatus::GapsFound)]);
+        verifier_tail_report(root, phase);
+        let mut state = validate_state(root, phase, Mode::Supervise);
+        let reject = devflow_core::gates::GateResponse {
+            approved: false,
+            abort: false,
+            note: Some("re-validate after the review fixes".into()),
+            responded_by: Some("test".into()),
+        };
+        let (gate, _) = at_the_validate_gate(root, phase, &reject, || {
+            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Passed);
+        });
+        assert_eq!(gate["gate_kind"], "gaps_found", "{gate}");
+        assert_eq!(
+            last_loop_back_fix(root, phase).as_deref(),
+            Some("GapsOnly"),
+            "a rejected gaps_found gate takes the gaps route: {:?}",
+            phase_events(root, phase)
+        );
+        no_full_execute(root, phase, "supervise reject over gaps_found");
+
+        // Auto, agent pass over passed: the finish path, no loop-back.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5242);
+        let _gsd = validate_evidence(root, phase, &[gsd_says(GsdStatus::Passed)]);
+        verifier_tail_report(root, phase);
+        let mut state = validate_state(root, phase, Mode::Auto);
+        preanswer_gate(root, phase, Stage::Validate, &abort_answer());
+        let outcome = handle_validate_outcome(root, &mut state, ValidateOutcome::Passed);
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert!(state.finished, "passed finishes the run: {state:?}");
+        assert_eq!(
+            events_named(root, phase, "workflow_finished").len(),
+            1,
+            "{:?}",
+            phase_events(root, phase)
+        );
+        assert!(
+            events_named(root, phase, "loop_back").is_empty(),
+            "passed launches nothing: {:?}",
+            phase_events(root, phase)
+        );
+        no_full_execute(root, phase, "auto passed");
+    }
+
     /// `human_needed` after an agent pass gates in auto mode too (D-08), and the
     /// gate names the status.
     #[test]
