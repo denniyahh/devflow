@@ -439,8 +439,7 @@ pub(crate) enum Trigger<'a> {
     Reject(&'a str),
     /// An abort. The table's row for it is `End`; a production abort answer
     /// goes straight to `abort` (`Answer::Abort`), so only the rule-6 property
-    /// asks the table about one.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// and the way-on sentence ask the table about one.
     Abort,
 }
 
@@ -707,7 +706,18 @@ pub(crate) fn approve_route(
     canary_refusal: Option<&str>,
     read: impl FnOnce() -> Evidence,
 ) -> ApproveRoute {
-    match answer_family(gate.gate_kind) {
+    approve_route_by_kind(gate.gate_kind, canary_refusal, read)
+}
+
+/// [`approve_route`] over the gate's recorded kind alone, the only field of
+/// the gate file it reads; the way-on sentence asks it before a gate file
+/// exists.
+pub(crate) fn approve_route_by_kind(
+    kind: Option<GateKind>,
+    canary_refusal: Option<&str>,
+    read: impl FnOnce() -> Evidence,
+) -> ApproveRoute {
+    match answer_family(kind) {
         AnswerFamily::Verification => {
             let evidence = read();
             let step = next_step(Trigger::Approve(&evidence));
@@ -732,7 +742,17 @@ pub(crate) fn reject_route(
     canary_refusal: Option<&str>,
     note: &str,
 ) -> RejectRoute {
-    match answer_family(gate.gate_kind) {
+    reject_route_by_kind(gate.gate_kind, canary_refusal, note)
+}
+
+/// [`reject_route`] over the gate's recorded kind alone, the only field of the
+/// gate file it reads.
+pub(crate) fn reject_route_by_kind(
+    kind: Option<GateKind>,
+    canary_refusal: Option<&str>,
+    note: &str,
+) -> RejectRoute {
+    match answer_family(kind) {
         AnswerFamily::Verification if note.trim().is_empty() => RejectRoute::Refused(EMPTY_NOTE),
         AnswerFamily::Verification => RejectRoute::Verification(next_step(Trigger::Reject(note))),
         family @ (AnswerFamily::StageFailure
@@ -744,6 +764,138 @@ pub(crate) fn reject_route(
                 Err(refusal) => RejectRoute::Refused(refusal),
             }
         }
+    }
+}
+
+/// What `step` does, in the words the way-on sentence and the `gate approve`
+/// and `gate reject` print both use: the one place a verification step's
+/// description lives, so neither can drift from the variant it names.
+pub(crate) fn step_phrase(step: &Step) -> &'static str {
+    match step {
+        Step::Finish(_) => "finishes the run",
+        Step::Gate => "opens a gate",
+        Step::ValidateAgain => "runs Validate again",
+        Step::GapLoop => {
+            "runs the gap loop (Plan `--gaps`, then Code's gaps-only pass, then Validate)"
+        }
+        Step::Reverify => "relaunches Code for a re-verify pass, then Validate",
+        Step::Reopen => "opens this gate again over GSD's fresh status",
+        Step::Quick(_) => "runs `/gsd-quick` with the note, then Validate",
+        Step::End => "ends the run",
+    }
+}
+
+/// What a status-less `step` at `stage` of `phase` does, in the words the
+/// way-on sentence and the CLI print both use (D-39): the one place its
+/// description lives.
+pub(crate) fn status_less_phrase(step: &StatusLessStep, phase: PhaseId, stage: Stage) -> String {
+    match step {
+        StatusLessStep::RetryStage => format!("retries the {stage} stage"),
+        StatusLessStep::RelaunchWithNote(_) => {
+            format!("relaunches the {stage} stage with the note")
+        }
+        // 999.187: the way on leads the clause, so it survives a display bound.
+        StatusLessStep::RelaunchRefused { .. } => format!(
+            "stops the run, and the way on is `devflow resume --phase {phase} --agent <other>`, \
+             because the delivery canary recorded for this run refuses its agent"
+        ),
+        StatusLessStep::PreflightOverride => {
+            format!("relaunches the {stage} stage with the failed check overridden")
+        }
+        StatusLessStep::RecordCheckpointSet => {
+            format!("records the checkpoints as seen and relaunches the {stage} stage")
+        }
+    }
+}
+
+/// The approve clause of every verification gate (U10): the rule, not a row.
+/// An approve is routed on GSD's status read when the supervisor picks it up
+/// (D-45 rule 2), so a route chosen from the evidence the gate was opened over
+/// could name one the approve does not run.
+const VERIFICATION_APPROVE_RULE: &str = "reads GSD's verification status again and finishes \
+     the run only on `passed` with a Validate pass on this commit over a clean tree, otherwise \
+     taking the route the fresh read names";
+
+/// The note a reject's route is rendered with: any non-empty note takes the
+/// route a reject with a note takes, and no route's description quotes it.
+const RENDERED_NOTE: &str = "the operator's note";
+
+/// GATE-04's way on (W3, D-39, C2): one sentence naming each answer's route on
+/// a gate of `kind` at `stage` of `phase`, or that the answer is not offered,
+/// and that abort ends the run. Rendered from [`approve_route_by_kind`] and
+/// [`reject_route_by_kind`] over the kind and `canary_refusal`, the run's
+/// recorded delivery canary refusal, except that a verification gate's approve
+/// clause states the finish rule (U10). Approve and reject on a stage-failure
+/// gate under a refusing canary are the same route, so they share one clause.
+pub(crate) fn way_on_sentence(
+    kind: GateKind,
+    phase: PhaseId,
+    stage: Stage,
+    canary_refusal: Option<&str>,
+) -> String {
+    let approve = match answer_family(Some(kind)) {
+        AnswerFamily::Verification => Some(VERIFICATION_APPROVE_RULE.to_string()),
+        AnswerFamily::StageFailure
+        | AnswerFamily::Preflight
+        | AnswerFamily::CheckpointDeclaration
+        | AnswerFamily::Unclassified => {
+            // A status-less approve reads no evidence (D-39): the closure is
+            // never called for these families.
+            match approve_route_by_kind(Some(kind), canary_refusal, unread_evidence) {
+                ApproveRoute::StatusLess(step) => Some(status_less_phrase(&step, phase, stage)),
+                ApproveRoute::Verification { step, .. } => Some(step_phrase(&step).to_string()),
+                ApproveRoute::Refused(_) => None,
+            }
+        }
+    };
+    let reject = match reject_route_by_kind(Some(kind), canary_refusal, RENDERED_NOTE) {
+        RejectRoute::Verification(step) => Some(step_phrase(&step).to_string()),
+        RejectRoute::StatusLess(step) => Some(status_less_phrase(&step, phase, stage)),
+        RejectRoute::Refused(_) => None,
+    };
+    let answers = match (approve, reject) {
+        (Some(approve), Some(reject)) if approve == reject => {
+            format!("approve or reject with a note: {approve}")
+        }
+        (Some(approve), Some(reject)) => {
+            format!("approve: {approve}; reject with a note: {reject}")
+        }
+        (Some(approve), None) => format!("approve: {approve}; reject: not offered"),
+        (None, Some(reject)) => format!("approve: not offered; reject with a note: {reject}"),
+        (None, None) => "approve: not offered; reject: not offered".to_string(),
+    };
+    format!(
+        "Answers — {answers}; abort: {}.",
+        step_phrase(&next_step(Trigger::Abort))
+    )
+}
+
+/// The evidence handed to a router that reads none: the status-less families
+/// never call their `read`, so this is a reader failure nothing routes on.
+fn unread_evidence() -> Evidence {
+    Evidence {
+        read: Err(EvidenceFailure::HeadRead(
+            "no evidence is read for a status-less gate".to_string(),
+        )),
+        agent_pass_on_head: false,
+        no_pass_cause: None,
+    }
+}
+
+/// `cause`, led by the way-on sentence for a gate of `kind` (C2): first, after
+/// a leading `[never-silent]` marker if `cause` has one, so the notify hook,
+/// the banner and `gate list` show it before the cause.
+pub(crate) fn lead_with_way_on(
+    kind: GateKind,
+    at: (PhaseId, Stage),
+    canary_refusal: Option<&str>,
+    cause: &str,
+) -> String {
+    const MARKER: &str = "[never-silent] ";
+    let sentence = way_on_sentence(kind, at.0, at.1, canary_refusal);
+    match cause.strip_prefix(MARKER) {
+        Some(rest) => format!("{MARKER}{sentence} {rest}"),
+        None => format!("{sentence} {cause}"),
     }
 }
 
@@ -1097,8 +1249,7 @@ fn validate_gate_context(
         && evidence.agent_pass_on_head;
     let mut message = match verdict {
         AgentVerdict::Pass if clean => {
-            "Validation passed — approve to finish the run? The worktree and branch are kept."
-                .to_string()
+            "Validation passed. The worktree and branch are kept.".to_string()
         }
         AgentVerdict::Pass => "The validate agent reported pass.".to_string(),
         AgentVerdict::Fail => format!(
@@ -1120,7 +1271,7 @@ fn validate_gate_context(
         message.push_str(cause);
     }
     if kind == GateKind::CleanPass && !clean {
-        message.push_str(" No Validate pass counts on this commit; approving runs Validate again.");
+        message.push_str(" No Validate pass counts on this commit.");
     }
     message.push_str(match kind {
         GateKind::GapsFound => {
@@ -1161,6 +1312,16 @@ fn validate_gate_context(
             " The per-phase ceiling of {} is reached: this run is paused for a human, not aborted — approve to ship, reject to loop back for another pass, or abort.",
             mode::MAX_PHASE_VALIDATE_FAILURES
         ));
+    }
+    // GATE-04 (C2): the way on leads, rendered from the routers.
+    if kind == GateKind::CleanPass {
+        let canary_refusal = recorded_canary_refusal(state);
+        message = lead_with_way_on(
+            kind,
+            (state.phase, Stage::Validate),
+            canary_refusal.as_deref(),
+            &message,
+        );
     }
     (message.clone(), message)
 }

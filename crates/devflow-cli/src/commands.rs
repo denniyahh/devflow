@@ -2172,6 +2172,23 @@ pub(crate) fn gate_respond(
     note: Option<String>,
     observed_gate_id: Option<String>,
 ) -> Result<(), CliError> {
+    let report = gate_respond_report(project_root, phase, stage, kind, note, observed_gate_id)?;
+    print!("{report}");
+    Ok(())
+}
+
+/// [`gate_respond`]'s work, returning what it prints. An answer the supervisor's
+/// own answer screen would refuse is refused here, before anything is written
+/// (D-10, one refusal predicate); a written answer's report names the route
+/// it runs, from the routers (D-45 rule 2).
+pub(crate) fn gate_respond_report(
+    project_root: &Path,
+    phase: PhaseId,
+    stage: Option<Stage>,
+    kind: GateAnswerKind,
+    note: Option<String>,
+    observed_gate_id: Option<String>,
+) -> Result<String, CliError> {
     // A malformed id is refused before anything is read, so it can never name a
     // path (T-50.1-42).
     let given_gate_id = observed_gate_id.as_deref().map(GateId::parse).transpose()?;
@@ -2196,6 +2213,21 @@ pub(crate) fn gate_respond(
         note,
         responded_by: Some(responded_by),
     };
+    // R10, D-10: the gate file as it is on disk names the answer's family, and
+    // the supervisor's own screen decides whether the answer is refused.
+    let gate = crate::pipeline_gate::read_gate_file(project_root, phase, stage).ok_or_else(|| {
+        CliError::Message(format!(
+            "phase {phase} {stage}'s gate file could not be read, so DevFlow cannot tell what \
+             this answer would run; no response was written"
+        ))
+    })?;
+    if let Err(refusal) = crate::pipeline_outcomes::screen_answer(gate.gate_kind, &response) {
+        return Err(CliError::Message(format!(
+            "the {} on phase {phase} {stage}'s gate is refused: {}; no response was written. \
+             The answers that apply: {}",
+            refusal.answer, refusal.why, refusal.applies
+        )));
+    }
     let path = Gates::answer(project_root, phase, stage, &observed, &response)
         .map_err(gate_answer_error)?;
     events::emit(
@@ -2218,12 +2250,37 @@ pub(crate) fn gate_respond(
             no_waiter_repair(phase)
         )
     };
-    println!(
-        "{} gate for phase {phase} {stage} — response was written; {pickup} (response at {})",
+    let mut report = format!(
+        "{} gate for phase {phase} {stage} — response was written; {pickup} (response at {})\n",
         kind.past_tense(),
         path.display()
     );
-    Ok(())
+    for line in answer_route_lines(&gate, kind, response.note.as_deref()) {
+        report.push_str(&line);
+        report.push('\n');
+    }
+    Ok(report)
+}
+
+/// The route a written answer runs, as `gate reject` prints it (D-10): from
+/// [`crate::pipeline_outcomes::reject_route`] over the gate file read back from
+/// disk, never its `context` or recorded `gsd_status`.
+fn answer_route_lines(gate: &GateFile, kind: GateAnswerKind, note: Option<&str>) -> Vec<String> {
+    use crate::pipeline_outcomes::{RejectRoute, reject_route, step_phrase};
+    match kind {
+        GateAnswerKind::Reject => {
+            let note = note.unwrap_or_default();
+            let route = match reject_route(gate, None, note) {
+                RejectRoute::Verification(step) => {
+                    format!("route: {} — {}", step.name(), step_phrase(&step))
+                }
+                RejectRoute::StatusLess(step) => format!("route: {}", step.name()),
+                RejectRoute::Refused(refusal) => format!("route: refused — {}", refusal.why),
+            };
+            vec![route, format!("note: {note}")]
+        }
+        GateAnswerKind::Approve | GateAnswerKind::Abort => Vec::new(),
+    }
 }
 
 /// The id of the open gate at `phase` + `stage`, from an already-fetched listing.
