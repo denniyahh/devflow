@@ -1,22 +1,24 @@
 # DevFlow
 
 **A durable execution loop for AI-assisted development.** DevFlow runs a
-phase through planning, implementation, validation, and human-approved
-shipping while preserving the evidence needed to understand what happened.
+phase through planning, implementation, and validation while preserving the
+evidence needed to understand what happened.
 
 ## Pipeline Overview
 
 ```mermaid
 flowchart LR
-    D[Define] --> P[Plan] --> C[Code] --> V[Validate] --> S[Ship]
+    P[Plan] --> C[Code] --> V[Validate]
     V -->|gaps| C
-    S -->|approved| M[Merge and tag]
-    S -->|rejected| C
+    V -->|pass| F[Run finishes, branch kept]
 ```
 
-Define, Plan, and Code launch an agent in an isolated worktree. Validate
-requires an explicit pass verdict. Ship runs review and always pauses for a
-human decision before DevFlow performs terminal Git operations.
+Plan and Code launch an agent in an isolated worktree. Validate requires an
+explicit pass verdict; a `gaps` verdict loops back to Code. Failures open a
+gate, repeated Validate failure opens a gate, and `--mode supervise` also
+gates every Validate. A passing Validate ends the run and keeps the worktree
+and the `feature/phase-NN` branch: DevFlow does not merge, tag, or open a pull
+request, so integrating the branch is the operator's step.
 
 ## Quick Links
 

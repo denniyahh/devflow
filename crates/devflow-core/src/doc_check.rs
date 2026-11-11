@@ -2525,20 +2525,133 @@ const REMOVED_STAGE_WORDS: &[&str] = &[concat!("Def", "ine"), concat!("Sh", "ip"
 const MODULE_MAP_PAGE: &str = "diagrams/module-map.md";
 
 /// Every `.md` path `nav:` in `docs/mkdocs.yml` names, with its 1-based line.
-fn nav_entries(_nav: &str) -> Vec<(usize, String)> {
-    Vec::new()
+fn nav_entries(nav: &str) -> Vec<(usize, String)> {
+    let mut entries = Vec::new();
+    let mut in_nav = false;
+    for (index, line) in nav.lines().enumerate() {
+        if !line.starts_with(' ') && !line.trim().is_empty() {
+            in_nav = line.trim_end() == "nav:";
+            continue;
+        }
+        if !in_nav {
+            continue;
+        }
+        let item = line.trim().trim_start_matches("- ");
+        let target = item
+            .rsplit_once(": ")
+            .map_or(item, |(_, value)| value)
+            .trim();
+        if target.ends_with(".md") {
+            entries.push((index + 1, target.to_string()));
+        }
+    }
+    entries
+}
+
+/// True for a single lowercase Rust identifier such as `agent_result`.
+fn is_lowercase_identifier(text: &str) -> bool {
+    text.chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_lowercase() || ch == '_')
+        && text
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
 }
 
 /// Every module name the module map names, with its 1-based line: backticked
 /// names in the table's Modules column and mermaid node labels that are a
 /// single lowercase identifier.
-fn module_map_names(_text: &str) -> Vec<(usize, String)> {
-    Vec::new()
+fn module_map_names(text: &str) -> Vec<(usize, String)> {
+    let mut names = Vec::new();
+    let mut modules_column = 1;
+    let mut in_mermaid = false;
+    for (index, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            in_mermaid = trimmed == "```mermaid";
+        } else if in_mermaid {
+            let mut rest = line;
+            while let Some(open) = rest.find('[') {
+                let after = &rest[open + 1..];
+                let Some(close) = after.find(']') else {
+                    break;
+                };
+                if is_lowercase_identifier(&after[..close]) {
+                    names.push((index + 1, after[..close].to_string()));
+                }
+                rest = &after[close + 1..];
+            }
+        } else if trimmed.starts_with('|') {
+            let cells: Vec<&str> = trimmed
+                .trim_matches('|')
+                .split('|')
+                .map(str::trim)
+                .collect();
+            if let Some(column) = cells.iter().position(|cell| *cell == "Modules") {
+                modules_column = column;
+            } else if let Some(cell) = cells.get(modules_column) {
+                names.extend(
+                    cell.split('`')
+                        .skip(1)
+                        .step_by(2)
+                        .map(|name| (index + 1, name.to_string())),
+                );
+            }
+        }
+    }
+    names
 }
 
 /// Every module `lib_rs` declares as `mod <name>;`, with or without `pub`.
-fn declared_modules(_lib_rs: &str) -> Vec<String> {
-    Vec::new()
+fn declared_modules(lib_rs: &str) -> Vec<String> {
+    lib_rs
+        .lines()
+        .filter_map(|line| {
+            let code = line.trim();
+            let code = code.strip_prefix("pub ").unwrap_or(code);
+            let name = code.strip_prefix("mod ")?.strip_suffix(';')?;
+            Some(name.trim().to_string())
+        })
+        .collect()
+}
+
+/// The relative Markdown link targets on `line`, each without its `#anchor`;
+/// `http://`, `https://`, `mailto:` and anchor-only targets are skipped.
+fn relative_link_targets(line: &str) -> Vec<String> {
+    line.match_indices("](")
+        .filter_map(|(start, _)| {
+            let rest = &line[start + 2..];
+            let target = rest[..rest.find(')')?]
+                .split_whitespace()
+                .next()?
+                .trim_matches(['<', '>']);
+            let external = ["http://", "https://", "mailto:"]
+                .iter()
+                .any(|scheme| target.starts_with(scheme));
+            let path = target.split('#').next().unwrap_or_default();
+            (!external && !path.is_empty()).then(|| path.to_string())
+        })
+        .collect()
+}
+
+/// `path` with `.` and `dir/..` pairs folded away, lexically; a `..` with
+/// nothing left to fold is kept.
+fn fold_relative(path: &Path) -> PathBuf {
+    let mut folded = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if folded.as_os_str().is_empty() || folded.ends_with("..") {
+                    folded.push("..");
+                } else {
+                    folded.pop();
+                }
+            }
+            other => folded.push(other),
+        }
+    }
+    folded
 }
 
 /// Every place the docs site names a removed stage, links a missing page,
@@ -2546,12 +2659,67 @@ fn declared_modules(_lib_rs: &str) -> Vec<String> {
 /// `docs/<path>:line: <kind>`, sorted by path then line. `pages` and `exists`
 /// take paths relative to `docs/`.
 fn docs_site_findings(
-    _pages: &[(PathBuf, String)],
-    _nav: &str,
-    _lib_rs: &str,
-    _exists: &dyn Fn(&Path) -> bool,
+    pages: &[(PathBuf, String)],
+    nav: &str,
+    lib_rs: &str,
+    exists: &dyn Fn(&Path) -> bool,
 ) -> Vec<String> {
-    Vec::new()
+    let mut findings: Vec<(PathBuf, usize, String)> = Vec::new();
+    let mut push = |path: &Path, line: usize, kind: String| {
+        let shown = Path::new("docs").join(path);
+        let finding = format!("{}:{line}: {kind}", shown.display());
+        findings.push((shown, line, finding));
+    };
+    let declared = declared_modules(lib_rs);
+    for (page, text) in pages {
+        let text = blank_html_comments(text);
+        let directory = page.parent().unwrap_or(Path::new(""));
+        for (index, line) in text.lines().enumerate() {
+            for word in REMOVED_STAGE_WORDS {
+                if holds_bounded_token(line, word) {
+                    push(
+                        page,
+                        index + 1,
+                        format!("stage word `{word}`: {}", line.trim()),
+                    );
+                }
+            }
+            for target in relative_link_targets(line) {
+                if !exists(&fold_relative(&directory.join(&target))) {
+                    push(
+                        page,
+                        index + 1,
+                        format!("link to a missing page `{target}`"),
+                    );
+                }
+            }
+        }
+        if page == Path::new(MODULE_MAP_PAGE) {
+            for (line, name) in module_map_names(&text) {
+                if !declared.contains(&name) {
+                    push(
+                        page,
+                        line,
+                        format!("module `{name}` is not declared in lib.rs"),
+                    );
+                }
+            }
+        }
+    }
+    for (line, target) in nav_entries(nav) {
+        if !exists(Path::new(&target)) {
+            push(
+                Path::new("mkdocs.yml"),
+                line,
+                format!("nav entry names a missing page `{target}`"),
+            );
+        }
+    }
+    findings.sort();
+    findings
+        .into_iter()
+        .map(|(_, _, finding)| finding)
+        .collect()
 }
 
 #[test]
@@ -2599,7 +2767,7 @@ fn docs_site_describes_only_the_kept_pipeline() {
         ),
         (
             MODULE_MAP_PAGE,
-            "    CLI --> HOOKS[hooks]".to_string(),
+            "```mermaid\nflowchart LR\n    CLI --> HOOKS[hooks]\n```".to_string(),
             nav.to_string(),
         ),
     ];
@@ -2639,7 +2807,7 @@ fn docs_site_describes_only_the_kept_pipeline() {
         ),
         (
             MODULE_MAP_PAGE,
-            "    CLI[devflow-cli] --> WF[workflow and state]".to_string(),
+            "```mermaid\n    CLI[devflow-cli] --> WF[workflow and state] --> G[git]\n```\n[Map](../index.md)".to_string(),
         ),
     ];
     for (page, text) in &decoys {
