@@ -13828,6 +13828,55 @@ mod tests {
             "Q under the fix request's introduction, then R under the relaunch's:\n{relaunched}"
         );
 
+        // 52-29 (U1), the `Quick` row: a quick pass carrying Q fails and its
+        // gate is rejected with R through `reject_route`. The relaunch runs
+        // `/gsd-quick` with Q under the fix request's introduction and R under
+        // the relaunch's, and Q is still the fix note on disk.
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(5299);
+        let mut state = failing_stage_state(dir.path(), phase, Stage::Code);
+        commit(&mut state, |s| {
+            s.code_fix = Some(prompt::FixType::Quick);
+            s.code_fix_note = Some(FIX_NOTE_Q.to_string());
+        })
+        .unwrap();
+        let (reloaded, _reap_quick) =
+            reject_stage_failure(dir.path(), &mut state, RELAUNCH_NOTE_R, |root, state| {
+                crate::pipeline_outcomes::handle_stage_failure(
+                    root,
+                    state,
+                    Stage::Code,
+                    Some("the quick pass failed".into()),
+                )
+            });
+        assert_eq!(
+            reloaded.code_fix,
+            Some(prompt::FixType::Quick),
+            "quick: kept"
+        );
+        assert_eq!(
+            reloaded.code_fix_note.as_deref(),
+            Some(FIX_NOTE_Q),
+            "quick: the pending quick-fix note is kept byte for byte"
+        );
+        let argv = recorded_argv(dir.path(), "codex");
+        let relaunched = argv
+            .iter()
+            .find(|arg| arg.contains(RELAUNCH_NOTE_R))
+            .unwrap_or_else(|| panic!("quick: the relaunch holds R: {argv:?}"));
+        let at = |needle: &str| {
+            relaunched
+                .find(needle)
+                .unwrap_or_else(|| panic!("quick: the relaunch lacks {needle:?}:\n{relaunched}"))
+        };
+        assert!(
+            at("/gsd-quick") < at(prompt::FIX_NOTE_INTRODUCTION)
+                && at(prompt::FIX_NOTE_INTRODUCTION) < at(FIX_NOTE_Q)
+                && at(FIX_NOTE_Q) < at(prompt::RELAUNCH_NOTE_INTRODUCTION)
+                && at(prompt::RELAUNCH_NOTE_INTRODUCTION) < at(RELAUNCH_NOTE_R),
+            "quick: `/gsd-quick`, Q under the fix request, then R:\n{relaunched}"
+        );
+
         // A run whose recorded delivery canary refuses its agent.
         let dir = tempfile::tempdir().unwrap();
         let phase = PhaseId::new(5298);

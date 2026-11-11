@@ -2496,3 +2496,65 @@ fn approving_a_clean_pass_over_an_uncommitted_change_runs_validate_again() {
         "the finished run's supervisors exit; events:\n{log}"
     );
 }
+
+/// GATE-02 / D-10: a supervise run whose GSD stub answers `passed`; its
+/// Validate gate is rejected with a note. The next Code prompt runs
+/// `/gsd-quick` with the note, and runs neither the gaps-only nor the full
+/// execute command; Validate runs after it.
+#[test]
+fn rejecting_a_clean_validate_pass_runs_gsd_quick_with_the_note() {
+    const NOTE: &str = "rename the quiet flag to silent and keep the old name";
+    let phase = PhaseId::new(93);
+    let rig = FinishRig::with_claude(phase, |dir| gap_loop_claude(dir, phase));
+    rig.stub_gsd(&always_passed());
+    let reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+
+    rig.start_in("supervise", &[]);
+    rig.wait_for_validate_gates(1);
+    let output = common::hermetic_devflow(&rig.home)
+        .args(["gate", "reject", &phase.to_string(), "--stage", "validate"])
+        .args(["--note", NOTE])
+        .arg("--project")
+        .arg(&rig.root)
+        .output()
+        .expect("run devflow gate reject");
+    assert!(
+        output.status.success(),
+        "gate reject exits 0\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    rig.wait_for_validate_gates(2);
+    let log = rig.events_text();
+    let prompts = logged_prompts(&rig);
+    let quick = prompts
+        .iter()
+        .find(|prompt| prompt.contains("/gsd-quick"))
+        .unwrap_or_else(|| panic!("a Code prompt runs /gsd-quick; prompts: {prompts:?}"));
+    assert!(quick.contains(NOTE), "the note, verbatim: {quick}");
+    assert!(!quick.contains("--gaps-only"), "not the gaps pass: {quick}");
+    assert!(
+        !quick.contains("/gsd-execute-phase"),
+        "not the full execute command: {quick}"
+    );
+    assert_eq!(
+        rig.validate_launches(),
+        2,
+        "Validate runs after it; events:\n{log}"
+    );
+    assert!(rig.positions("workflow_finished").is_empty(), "{log}");
+
+    let abort = common::hermetic_devflow(&rig.home)
+        .args(["gate", "abort", &phase.to_string(), "--stage", "validate"])
+        .args(["--note", "test teardown"])
+        .arg("--project")
+        .arg(&rig.root)
+        .output()
+        .expect("run devflow gate abort");
+    assert!(abort.status.success(), "gate abort exits 0: {abort:?}");
+    assert!(
+        reaper.supervisors_exited_within(EXIT_WAIT),
+        "the aborted run's supervisors exit; events:\n{}",
+        rig.events_text()
+    );
+}

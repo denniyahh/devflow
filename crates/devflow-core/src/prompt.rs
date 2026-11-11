@@ -374,6 +374,10 @@ pub enum FixType {
     ///
     /// [`State::code_fix_report`]: crate::state::State::code_fix_report
     StaleReverify,
+    /// The small fix an operator asked for by rejecting a verification gate
+    /// (GATE-02, D-10, 52-29): Code runs `/gsd-quick` with the operator's note
+    /// as the task, never the whole phase, and Validate runs after it.
+    Quick,
 }
 
 /// What GSD said about the phase when Validate chose the re-verify pass
@@ -667,7 +671,7 @@ fn workflow_gaps_plan_prompt(phase: PhaseId, workflow_root: &str, notes: &str) -
 /// be classified here rather than falling into either answer by default.
 fn code_policy_applies_to_fix_arm(fix: Option<FixType>) -> bool {
     match fix {
-        Some(FixType::FullExecute | FixType::StaleReverify) | None => true,
+        Some(FixType::FullExecute | FixType::StaleReverify | FixType::Quick) | None => true,
         Some(FixType::GapsOnly) => false,
     }
 }
@@ -731,7 +735,7 @@ fn workflow_code_prompt(
             must be preserved verbatim.",
             reverify_lead(reverify_report)
         ),
-        Some(FixType::FullExecute) | None => format!(
+        Some(FixType::FullExecute | FixType::Quick) | None => format!(
             "Read and follow the GSD workflow file at {workflow_root}/execute-phase.md for \
             phase {phase} --auto. The `--auto` flag is part of the workflow invocation and \
             must be preserved verbatim."
@@ -850,7 +854,7 @@ fn fix_prompt_with_notes(
             "{}\n\nRun the re-verify command for this loop:",
             reverify_lead(reverify_report)
         ),
-        FixType::GapsOnly | FixType::FullExecute => {
+        FixType::GapsOnly | FixType::FullExecute | FixType::Quick => {
             "Validation reported issues. Run the fix command for this loop:".to_string()
         }
     };
@@ -858,7 +862,7 @@ fn fix_prompt_with_notes(
         FixType::GapsOnly => {
             format!("/gsd-execute-phase {phase} --gaps-only {AUTO_CHAIN_PRESERVING_FLAG}")
         }
-        FixType::FullExecute | FixType::StaleReverify => {
+        FixType::FullExecute | FixType::StaleReverify | FixType::Quick => {
             format!("/gsd-execute-phase {phase} {AUTO_CHAIN_PRESERVING_FLAG}")
         }
     };
@@ -1898,6 +1902,7 @@ mod tests {
             FixType::StaleReverify => {
                 unreachable!("the pre-fix builder predates the re-verify pass")
             }
+            FixType::Quick => unreachable!("the pre-fix builder predates the quick pass"),
         };
         if code_policy_applies_to_fix_arm(Some(fix_type)) {
             format!(

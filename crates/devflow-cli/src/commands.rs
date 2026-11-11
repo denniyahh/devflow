@@ -7349,6 +7349,7 @@ mod tests {
             timestamp: entry.timestamp.clone(),
             gate_id: String::new(),
             gate_kind: None,
+            gsd_status: None,
         };
         std::fs::write(
             Gates::gate_path(root, phase, stage),
@@ -14801,6 +14802,34 @@ mod tests {
             );
             assert_eq!(moved.code_fix_report, None, "{fix:?}: control");
         }
+
+        // 52-29 (T4), the `Quick` row: a stopped quick pass keeps its fix and
+        // its note byte for byte, and the Code prompt the resume path builds
+        // from the reloaded state is the quick pass with the note.
+        const QUICK_NOTE: &str = "rename the flag  and keep\ttabs";
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(4962);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        state.code_fix = Some(devflow_core::prompt::FixType::Quick);
+        state.code_fix_note = Some(QUICK_NOTE.to_string());
+        workflow::save_state(&state).unwrap();
+        persist_stopped_state(root, phase, false, &[]).unwrap();
+        let stopped = workflow::load_state(root, phase).unwrap();
+        assert!(stopped.stopped, "quick: the stop landed");
+        assert_eq!(
+            stopped.code_fix,
+            Some(devflow_core::prompt::FixType::Quick),
+            "quick: a stop keeps the quick pass"
+        );
+        assert_eq!(stopped.code_fix_note.as_deref(), Some(QUICK_NOTE), "quick");
+        let claude = devflow_core::agents::driver_for(AgentKind::Claude);
+        let resumed = crate::pipeline_launch::default_stage_prompt(&stopped, claude.as_ref());
+        assert!(
+            resumed.contains("/gsd-quick") && resumed.contains(QUICK_NOTE),
+            "quick: the resumed Code prompt is the quick pass with its note: {resumed}"
+        );
     }
 
     /// D-08: `stop` appends to the reason on disk when it writes, not to one it read

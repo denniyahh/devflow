@@ -20,7 +20,7 @@ use crate::pipeline_gate::{
 use crate::pipeline_launch::{
     close_gate, commit, launch_stage, record_relaunch_note, recorded_canary_refusal,
 };
-use devflow_core::gates::{GateAction, GateKind, GateResponse};
+use devflow_core::gates::{GateAction, GateFile, GateKind, GateResponse};
 use devflow_core::gsd_reader::{self, GsdStatus, ReaderFailure, StatusReport};
 use devflow_core::mode::{self, Mode};
 use devflow_core::phase_id::PhaseId;
@@ -436,10 +436,9 @@ pub(crate) enum Trigger<'a> {
     /// picked up.
     Approve(&'a Evidence),
     /// A reject of a verification gate, with its note.
-    #[allow(dead_code)] // Interim: the answer routers construct it (52-29 Task 2).
     Reject(&'a str),
     /// An abort.
-    #[allow(dead_code)] // Interim: the answer routers construct it (52-29 Task 2).
+    #[allow(dead_code)] // Interim: the rule-6 property constructs it (52-29 Task 3).
     Abort,
 }
 
@@ -536,6 +535,158 @@ pub(crate) fn is_verification_kind(kind: GateKind) -> bool {
     }
 }
 
+/// Which answers a gate's kind takes (D-45 rule 2, D-37, D-39): the kind is a
+/// label, so every verification kind is one family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AnswerFamily {
+    /// The ten verification kinds: routed by GSD's fresh status.
+    Verification,
+    /// A failed stage (D-39).
+    StageFailure,
+    /// A failed preflight check (D-39, D-18f).
+    Preflight,
+    /// A human-only checkpoint declaration at Code (D-39).
+    CheckpointDeclaration,
+    /// A gate file with no kind: only a 3.x or hand-written file.
+    Unclassified,
+}
+
+/// The family of a gate whose file records `kind`.
+pub(crate) fn answer_family(kind: Option<GateKind>) -> AnswerFamily {
+    match kind {
+        Some(GateKind::CleanPass) => AnswerFamily::Verification,
+        Some(GateKind::GapsFound) => AnswerFamily::Verification,
+        Some(GateKind::ReverifyNeeded) => AnswerFamily::Verification,
+        Some(GateKind::HumanNeeded) => AnswerFamily::Verification,
+        Some(GateKind::DisagreementOverPassed) => AnswerFamily::Verification,
+        Some(GateKind::DisagreementOverHumanNeeded) => AnswerFamily::Verification,
+        Some(GateKind::ReaderFailure) => AnswerFamily::Verification,
+        Some(GateKind::AmbiguousVerdict) => AnswerFamily::Verification,
+        Some(GateKind::FailureCap) => AnswerFamily::Verification,
+        Some(GateKind::NoGapClosurePlan) => AnswerFamily::Verification,
+        Some(GateKind::StageFailure) => AnswerFamily::StageFailure,
+        Some(GateKind::Preflight) => AnswerFamily::Preflight,
+        Some(GateKind::CheckpointDeclaration) => AnswerFamily::CheckpointDeclaration,
+        None => AnswerFamily::Unclassified,
+    }
+}
+
+/// A status-less gate's own answer (D-39). Never a finish: there is no such
+/// variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StatusLessStep {
+    /// Retry the failed stage.
+    RetryStage,
+    /// Relaunch the failed stage with the reject's note (GATE-01, 52-26).
+    RelaunchWithNote(String),
+    /// The run's recorded delivery canary refuses its agent (999.187): stop the
+    /// run naming `devflow resume --phase N --agent <other>`, keeping a reject's
+    /// note for that relaunch.
+    RelaunchRefused {
+        /// The recorded refusal.
+        refusal: String,
+        /// A reject's note, kept for the resume; `None` for an approve.
+        note: Option<String>,
+    },
+    /// The D-18f override: relaunch with the adjudicated check skipped.
+    PreflightOverride,
+    /// Record the scanned checkpoint set as seen and relaunch.
+    RecordCheckpointSet,
+}
+
+impl StatusLessStep {
+    /// The step's name in `gate_resolved`.
+    pub(crate) fn name(&self) -> &'static str {
+        match self {
+            StatusLessStep::RetryStage => "retry_stage",
+            StatusLessStep::RelaunchWithNote(_) => "relaunch_with_note",
+            StatusLessStep::RelaunchRefused { .. } => "relaunch_refused",
+            StatusLessStep::PreflightOverride => "preflight_override",
+            StatusLessStep::RecordCheckpointSet => "record_checkpoint_set",
+        }
+    }
+}
+
+/// An answer the routers refuse (R10): which answer, why, and the answers that
+/// apply on that gate, for the reopened gate's context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Refusal {
+    /// `approve` or `reject`.
+    pub(crate) answer: &'static str,
+    /// Why it is refused.
+    pub(crate) why: &'static str,
+    /// The answers that apply.
+    pub(crate) applies: &'static str,
+}
+
+/// A reject on a gate whose reject is not an answer (D-39).
+const REJECT_NOT_AN_ANSWER: Refusal = Refusal {
+    answer: "reject",
+    why: "a reject is not an answer to this gate",
+    applies: "`devflow gate approve` or `devflow gate abort`",
+};
+
+/// A reject with an empty note whose route carries the note.
+const EMPTY_NOTE: Refusal = Refusal {
+    answer: "reject",
+    why: "a reject must carry a note, which is what the relaunched agent acts on",
+    applies: "`devflow gate reject --note <text>`, `devflow gate approve` or `devflow gate abort`",
+};
+
+/// Any answer but abort on a gate file with no kind (a 3.x or hand-written
+/// file).
+fn unclassified(answer: &'static str) -> Refusal {
+    Refusal {
+        answer,
+        why: "the gate file records no kind, so DevFlow cannot tell what this answer would run",
+        applies: "`devflow gate abort`",
+    }
+}
+
+/// How an answer reached a status-less gate.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum StatusLessAnswer<'a> {
+    /// An approve.
+    Approve,
+    /// A reject with its note.
+    Reject(&'a str),
+}
+
+/// A status-less gate's own answer (D-39), or its refusal. `canary_refusal` is
+/// read by the stage-failure family only: when the run's recorded delivery
+/// canary refuses its agent, both answers stop the run (999.187).
+pub(crate) fn status_less_step(
+    family: AnswerFamily,
+    answer: StatusLessAnswer<'_>,
+    canary_refusal: Option<&str>,
+) -> Result<StatusLessStep, Refusal> {
+    use StatusLessAnswer::{Approve, Reject};
+    match (family, answer) {
+        (AnswerFamily::StageFailure, Reject(note)) if note.trim().is_empty() => Err(EMPTY_NOTE),
+        (AnswerFamily::StageFailure, answer) => Ok(match (canary_refusal, answer) {
+            (Some(refusal), Approve) => StatusLessStep::RelaunchRefused {
+                refusal: refusal.to_string(),
+                note: None,
+            },
+            (Some(refusal), Reject(note)) => StatusLessStep::RelaunchRefused {
+                refusal: refusal.to_string(),
+                note: Some(note.to_string()),
+            },
+            (None, Approve) => StatusLessStep::RetryStage,
+            (None, Reject(note)) => StatusLessStep::RelaunchWithNote(note.to_string()),
+        }),
+        (AnswerFamily::Preflight, Approve) => Ok(StatusLessStep::PreflightOverride),
+        (AnswerFamily::Preflight, Reject(_)) => Err(REJECT_NOT_AN_ANSWER),
+        (AnswerFamily::CheckpointDeclaration, Approve) => Ok(StatusLessStep::RecordCheckpointSet),
+        (AnswerFamily::CheckpointDeclaration, Reject(_)) => Err(REJECT_NOT_AN_ANSWER),
+        (AnswerFamily::Unclassified, Approve) => Err(unclassified("approve")),
+        (AnswerFamily::Unclassified, Reject(_)) => Err(unclassified("reject")),
+        // Not status-less: the verification family goes through `next_step`.
+        (AnswerFamily::Verification, Approve) => Err(unclassified("approve")),
+        (AnswerFamily::Verification, Reject(_)) => Err(unclassified("reject")),
+    }
+}
+
 /// Where an approve goes.
 #[derive(Debug)]
 pub(crate) enum ApproveRoute {
@@ -548,7 +699,102 @@ pub(crate) enum ApproveRoute {
         evidence: Evidence,
     },
     /// A status-less gate's approve, which reads no GSD status (D-39).
-    StatusLess,
+    StatusLess(StatusLessStep),
+    /// The approve is refused.
+    Refused(Refusal),
+}
+
+/// Where a reject goes.
+#[derive(Debug)]
+pub(crate) enum RejectRoute {
+    /// A verification gate's reject: `/gsd-quick` with the note (D-10).
+    Verification(Step),
+    /// A status-less gate's reject (D-39).
+    StatusLess(StatusLessStep),
+    /// The reject is refused.
+    Refused(Refusal),
+}
+
+/// The route of an approve on `gate` (D-39, D-45 rule 2). It reads the gate
+/// only through [`answer_family`]; `read` is called, and [`next_step`] asked,
+/// only for the verification family, so a status-less approve reads no GSD
+/// status.
+pub(crate) fn approve_route(
+    gate: &GateFile,
+    canary_refusal: Option<&str>,
+    read: impl FnOnce() -> Evidence,
+) -> ApproveRoute {
+    match answer_family(gate.gate_kind) {
+        AnswerFamily::Verification => {
+            let evidence = read();
+            let step = next_step(Trigger::Approve(&evidence));
+            ApproveRoute::Verification { step, evidence }
+        }
+        family @ (AnswerFamily::StageFailure
+        | AnswerFamily::Preflight
+        | AnswerFamily::CheckpointDeclaration
+        | AnswerFamily::Unclassified) => {
+            match status_less_step(family, StatusLessAnswer::Approve, canary_refusal) {
+                Ok(step) => ApproveRoute::StatusLess(step),
+                Err(refusal) => ApproveRoute::Refused(refusal),
+            }
+        }
+    }
+}
+
+/// The route of a reject with `note` on `gate` (D-10, D-39). It reads the gate
+/// only through [`answer_family`].
+pub(crate) fn reject_route(
+    gate: &GateFile,
+    canary_refusal: Option<&str>,
+    note: &str,
+) -> RejectRoute {
+    match answer_family(gate.gate_kind) {
+        AnswerFamily::Verification if note.trim().is_empty() => RejectRoute::Refused(EMPTY_NOTE),
+        AnswerFamily::Verification => RejectRoute::Verification(next_step(Trigger::Reject(note))),
+        family @ (AnswerFamily::StageFailure
+        | AnswerFamily::Preflight
+        | AnswerFamily::CheckpointDeclaration
+        | AnswerFamily::Unclassified) => {
+            match status_less_step(family, StatusLessAnswer::Reject(note), canary_refusal) {
+                Ok(step) => RejectRoute::StatusLess(step),
+                Err(refusal) => RejectRoute::Refused(refusal),
+            }
+        }
+    }
+}
+
+/// The answer screen (R10): whether `response` on a gate whose file records
+/// `kind` is refused, from the gate file and the answer alone, never GSD.
+/// Runs before the answer is claimed, so a refused answer is never acted on.
+pub(crate) fn screen_answer(
+    kind: Option<GateKind>,
+    response: &GateResponse,
+) -> Result<(), Refusal> {
+    let family = answer_family(kind);
+    match GateAction::from_response(response) {
+        GateAction::Abort(_) => Ok(()),
+        GateAction::Advance => match family {
+            AnswerFamily::Unclassified => Err(unclassified("approve")),
+            AnswerFamily::Verification
+            | AnswerFamily::StageFailure
+            | AnswerFamily::Preflight
+            | AnswerFamily::CheckpointDeclaration => Ok(()),
+        },
+        GateAction::LoopBack { note, .. } => {
+            let note = note.unwrap_or_default();
+            match family {
+                AnswerFamily::Verification if note.trim().is_empty() => Err(EMPTY_NOTE),
+                AnswerFamily::Verification => Ok(()),
+                AnswerFamily::StageFailure
+                | AnswerFamily::Preflight
+                | AnswerFamily::CheckpointDeclaration
+                | AnswerFamily::Unclassified => {
+                    status_less_step(family, StatusLessAnswer::Reject(&note), None).map(|_| ())
+                }
+            }
+        }
+    }
 }
 
 /// A gate's answer, routed.
@@ -576,7 +822,10 @@ impl Answer {
                 "gsd_status": evidence.status().map(gsd_status_name),
                 "agent_pass_on_head": evidence.agent_pass_on_head,
             }),
-            Answer::Approve(ApproveRoute::StatusLess) => serde_json::json!({ "route": "retry" }),
+            Answer::Approve(ApproveRoute::StatusLess(step)) => {
+                serde_json::json!({ "route": step.name() })
+            }
+            Answer::Approve(ApproveRoute::Refused(_)) => serde_json::json!({ "route": "refused" }),
             Answer::Reject { .. } => serde_json::json!({ "route": "reject" }),
             Answer::Abort(_) => serde_json::json!({ "route": "end" }),
         }
@@ -613,7 +862,9 @@ pub(crate) fn route_answer(
             let step = next_step(Trigger::Approve(&evidence));
             Answer::Approve(ApproveRoute::Verification { step, evidence })
         }
-        GateAction::Advance => Answer::Approve(ApproveRoute::StatusLess),
+        GateAction::Advance => {
+            Answer::Approve(ApproveRoute::StatusLess(StatusLessStep::RetryStage))
+        }
     }
 }
 
@@ -1220,10 +1471,12 @@ fn dispatch_answer(
                 LoopBackReason::GateResponse,
             )
         }
-        Answer::Approve(ApproveRoute::StatusLess) => Err(CliError::Message(format!(
-            "phase {}: a verification gate at {stage} was answered as a status-less gate",
-            state.phase
-        ))),
+        Answer::Approve(ApproveRoute::StatusLess(_) | ApproveRoute::Refused(_)) => {
+            Err(CliError::Message(format!(
+                "phase {}: a verification gate at {stage} was answered as a status-less gate",
+                state.phase
+            )))
+        }
         Answer::Reject { note } => {
             reset_phase_failures_at_ceiling(project_root, state, ceiling_gate)?;
             if stage == Stage::Plan {
@@ -7045,9 +7298,9 @@ mod tests {
             Other,
             None,
         }
+        // (status reply or None for a reader failure, recorded head, tree,
+        // HEAD readable, permit expected, text the evidence must name)
         let passed = Some(gsd_says(GsdStatus::Passed));
-        // (row, status reply or None for a reader failure, recorded head,
-        // tree, HEAD readable, permit expected, text the evidence must name)
         type Row<'a> = (
             &'a str,
             Option<&'a str>,
@@ -7397,5 +7650,976 @@ mod tests {
         );
         assert_eq!(after.stage, Stage::Plan, "control: the gap loop: {after:?}");
         assert!(after.gap_closure_pass, "control: the gap marker is set");
+    }
+
+    // ---- 52-29 Task 2 (GATE-02, D-10, D-39, R10): one dispatch by family ----
+
+    /// Every gate kind, then a file with no kind (C11). The `match` has no
+    /// wildcard, so a kind added later fails the build here until its row is
+    /// written.
+    fn every_gate_kind() -> Vec<Option<GateKind>> {
+        let all = [
+            GateKind::CleanPass,
+            GateKind::GapsFound,
+            GateKind::ReverifyNeeded,
+            GateKind::HumanNeeded,
+            GateKind::DisagreementOverPassed,
+            GateKind::DisagreementOverHumanNeeded,
+            GateKind::ReaderFailure,
+            GateKind::AmbiguousVerdict,
+            GateKind::FailureCap,
+            GateKind::NoGapClosurePlan,
+            GateKind::StageFailure,
+            GateKind::Preflight,
+            GateKind::CheckpointDeclaration,
+        ];
+        let listed = |kind: GateKind| match kind {
+            GateKind::CleanPass
+            | GateKind::GapsFound
+            | GateKind::ReverifyNeeded
+            | GateKind::HumanNeeded
+            | GateKind::DisagreementOverPassed
+            | GateKind::DisagreementOverHumanNeeded
+            | GateKind::ReaderFailure
+            | GateKind::AmbiguousVerdict
+            | GateKind::FailureCap
+            | GateKind::NoGapClosurePlan
+            | GateKind::StageFailure
+            | GateKind::Preflight
+            | GateKind::CheckpointDeclaration => all.contains(&kind),
+        };
+        assert!(all.iter().all(|kind| listed(*kind)));
+        all.into_iter().map(Some).chain([None]).collect()
+    }
+
+    /// How a parity row is driven, by the gate's kind.
+    enum ParityCase {
+        /// A verification gate, opened at this stage.
+        Verification(Stage),
+        /// The stage-failure gate.
+        StageFailure,
+        /// A gate whose reject is refused (preflight, checkpoint declaration).
+        RejectRefused,
+        /// A file with no kind.
+        NoKind,
+    }
+
+    /// The parity case of `kind`, with no wildcard arm.
+    fn parity_case(kind: Option<GateKind>) -> ParityCase {
+        match kind {
+            Some(GateKind::CleanPass)
+            | Some(GateKind::GapsFound)
+            | Some(GateKind::ReverifyNeeded)
+            | Some(GateKind::HumanNeeded)
+            | Some(GateKind::DisagreementOverPassed)
+            | Some(GateKind::DisagreementOverHumanNeeded)
+            | Some(GateKind::ReaderFailure)
+            | Some(GateKind::AmbiguousVerdict)
+            | Some(GateKind::FailureCap) => ParityCase::Verification(Stage::Validate),
+            Some(GateKind::NoGapClosurePlan) => ParityCase::Verification(Stage::Plan),
+            Some(GateKind::StageFailure) => ParityCase::StageFailure,
+            Some(GateKind::Preflight) | Some(GateKind::CheckpointDeclaration) => {
+                ParityCase::RejectRefused
+            }
+            None => ParityCase::NoKind,
+        }
+    }
+
+    /// A gate file of `kind` for the routers, which read it only through
+    /// `answer_family`.
+    fn parity_gate(phase: PhaseId, stage: Stage, kind: Option<GateKind>) -> GateFile {
+        GateFile {
+            phase,
+            stage,
+            context: "a parity gate".to_string(),
+            timestamp: "1750000000".to_string(),
+            gate_id: "g-parity".to_string(),
+            gate_kind: kind,
+            gsd_status: None,
+        }
+    }
+
+    /// A reject carrying `note`.
+    fn reject_answer(note: &str) -> devflow_core::gates::GateResponse {
+        devflow_core::gates::GateResponse {
+            approved: false,
+            abort: false,
+            note: Some(note.to_string()),
+            responded_by: Some("test".into()),
+        }
+    }
+
+    /// Open a verification gate `label` at `stage` as its handler does and act
+    /// on its answer through the one dispatch.
+    fn open_and_dispatch(
+        root: &Path,
+        state: &mut State,
+        stage: Stage,
+        label: devflow_core::gates::GateLabel,
+        ceiling_gate: bool,
+    ) {
+        let _ = open_verification_gate(
+            root,
+            state,
+            (stage, label.kind),
+            ("a parity gate", "a parity gate"),
+            ceiling_gate,
+            LegacyReject {
+                fix: FixType::FullExecute,
+                report: None,
+                reason: LoopBackReason::GateResponse,
+            },
+        );
+    }
+
+    /// R10: the first answer was refused before its claim. `gates` are the
+    /// gates answered in order (the refused one, then the reopened one, which
+    /// the test aborted). One `gate_answer_refused` with `kind` and `answer`;
+    /// the reopened gate is never-silent, names `devflow gate abort`, records
+    /// `reopened_kind` and was waited on with `gate_pending` set; the refused
+    /// answer was never claimed and no `gate_resolved` names it; nothing was
+    /// launched.
+    fn assert_refused_before_the_claim(
+        root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        gates: &[(serde_json::Value, State)],
+        expected: (serde_json::Value, &str, &str),
+    ) {
+        let (kind, answer, reopened_kind) = expected;
+        let refused = events_named(root, phase, "gate_answer_refused");
+        assert_eq!(
+            refused.len(),
+            1,
+            "one refusal: {:?}",
+            phase_events(root, phase)
+        );
+        assert_eq!(refused[0]["gate_kind"], kind, "{}", refused[0]);
+        assert_eq!(refused[0]["answer"], answer, "{}", refused[0]);
+        assert_eq!(gates.len(), 2, "the gate reopened");
+        let (reopened, at_reopened) = &gates[1];
+        let context = reopened["context"].as_str().unwrap_or_default();
+        assert!(
+            context.starts_with("[never-silent]") && context.contains("devflow gate abort"),
+            "the reopened gate names the answers that apply: {context}"
+        );
+        assert_eq!(reopened["gate_kind"], reopened_kind, "{reopened}");
+        assert!(
+            at_reopened.gate_pending,
+            "gate_pending stays set: {at_reopened:?}"
+        );
+        let first_id =
+            devflow_core::gates::GateId::parse(gates[0].0["gate_id"].as_str().unwrap()).unwrap();
+        assert!(
+            !Gates::claim_path(root, phase, stage, &first_id).exists(),
+            "the refused answer was never claimed"
+        );
+        let resolved = events_named(root, phase, "gate_resolved");
+        assert!(
+            resolved
+                .iter()
+                .all(|event| event["gate_id"] != gates[0].0["gate_id"]),
+            "no gate_resolved for the refused answer: {resolved:?}"
+        );
+        for launched in [
+            "loop_back",
+            "stage_launched",
+            "transition",
+            "workflow_finished",
+        ] {
+            assert!(
+                events_named(root, phase, launched).is_empty(),
+                "a refused answer launches nothing ({launched}): {:?}",
+                phase_events(root, phase)
+            );
+        }
+    }
+
+    /// GATE-02, D-10, D-39, R10: rejecting a gate of every kind (and of a file
+    /// with no kind) changes state the way `reject_route` says. A verification
+    /// kind runs `/gsd-quick` with the note and clears the gap marker; a
+    /// stage-failure reject relaunches its stage with the note in
+    /// `relaunch_note` and leaves the fix pass alone, or stops the run when the
+    /// recorded canary refuses its agent; a reject on a preflight, checkpoint
+    /// declaration or kindless gate, and an empty-note reject, are refused
+    /// before the claim. Control: the noted reject on a `clean_pass` gate runs
+    /// `/gsd-quick` (its row below).
+    #[test]
+    fn the_reject_path_takes_the_route_reject_route_names() {
+        if !in_bounded_child(
+            "pipeline_outcomes::tests::the_reject_path_takes_the_route_reject_route_names",
+        ) {
+            return;
+        }
+        const NOTE: &str = "rename the quiet flag, keep the old name as an alias";
+        const FIX_Q: &str = "the pending quick fix";
+        for (index, kind) in every_gate_kind().into_iter().enumerate() {
+            let number = 5500 + u32::try_from(index).unwrap() * 10;
+            let row = format!("{kind:?}");
+            match parity_case(kind) {
+                ParityCase::Verification(stage) => {
+                    let route =
+                        reject_route(&parity_gate(PhaseId::new(number), stage, kind), None, NOTE);
+                    assert!(
+                        matches!(&route, RejectRoute::Verification(Step::Quick(note)) if note == NOTE),
+                        "{row}: {route:?}"
+                    );
+                    let dir = tempfile::tempdir().unwrap();
+                    let root = dir.path();
+                    init_repo(root);
+                    let phase = PhaseId::new(number);
+                    let mut state = State::new(
+                        phase,
+                        AgentKind::Claude,
+                        Mode::Supervise,
+                        root.to_path_buf(),
+                    );
+                    state.stage = stage;
+                    state.gap_closure_pass =
+                        matches!(kind, Some(GateKind::GapsFound | GateKind::NoGapClosurePlan));
+                    let at_ceiling = kind == Some(GateKind::FailureCap);
+                    if at_ceiling {
+                        state.phase_validate_failures = mode::MAX_PHASE_VALIDATE_FAILURES;
+                    }
+                    workflow::save_state(&state).unwrap();
+                    let label = kind.expect("a verification kind").into();
+                    at_the_gate(root, phase, stage, &reject_answer(NOTE), || {
+                        open_and_dispatch(root, &mut state, stage, label, at_ceiling);
+                    });
+                    let after = workflow::load_state(root, phase).unwrap();
+                    assert_eq!(after.stage, Stage::Code, "{row}: Code runs the quick pass");
+                    assert_eq!(after.code_fix, Some(FixType::Quick), "{row}");
+                    assert_eq!(after.code_fix_note.as_deref(), Some(NOTE), "{row}");
+                    assert!(!after.gap_closure_pass, "{row}: the gap marker is cleared");
+                    assert!(
+                        claude_launch_prompt(&after).contains("/gsd-quick"),
+                        "{row}: the launch runs /gsd-quick"
+                    );
+                    assert_eq!(
+                        events_named(root, phase, "phase_failure_budget_reset").len(),
+                        usize::from(at_ceiling),
+                        "{row}: one reset exactly at the ceiling"
+                    );
+                }
+                ParityCase::StageFailure => {
+                    for (offset, stage) in [Stage::Plan, Stage::Code, Stage::Validate]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        let number = number + u32::try_from(offset).unwrap();
+                        let row = format!("{row} at {stage}");
+                        let route = reject_route(
+                            &parity_gate(PhaseId::new(number), stage, kind),
+                            None,
+                            NOTE,
+                        );
+                        assert_eq!(
+                            format!("{route:?}"),
+                            format!(
+                                "{:?}",
+                                RejectRoute::StatusLess(StatusLessStep::RelaunchWithNote(
+                                    NOTE.to_string()
+                                ))
+                            ),
+                            "{row}"
+                        );
+                        let dir = tempfile::tempdir().unwrap();
+                        let root = dir.path();
+                        init_repo(root);
+                        let phase = PhaseId::new(number);
+                        let mut state = State::new(
+                            phase,
+                            AgentKind::Codex,
+                            Mode::Supervise,
+                            root.to_path_buf(),
+                        );
+                        state.stage = stage;
+                        if stage == Stage::Code {
+                            state.code_fix = Some(FixType::Quick);
+                            state.code_fix_note = Some(FIX_Q.to_string());
+                        }
+                        workflow::save_state(&state).unwrap();
+                        let before = (state.code_fix, state.code_fix_note.clone());
+                        at_the_gate(root, phase, stage, &reject_answer(NOTE), || {
+                            let _ = handle_stage_failure(
+                                root,
+                                &mut state,
+                                stage,
+                                Some("failed".into()),
+                            );
+                        });
+                        let after = workflow::load_state(root, phase).unwrap();
+                        assert_eq!(after.stage, stage, "{row}: the same stage relaunches");
+                        assert_eq!(after.relaunch_note.as_deref(), Some(NOTE), "{row}");
+                        assert_eq!(
+                            (after.code_fix, after.code_fix_note.clone()),
+                            before,
+                            "{row}"
+                        );
+                        assert!(!after.stopped, "{row}");
+                    }
+                    // The canary row, and its admitting control.
+                    for (offset, refuses) in [(3u32, true), (4, false)] {
+                        let number = number + offset;
+                        let row = format!("{row}, canary refuses {refuses}");
+                        let dir = tempfile::tempdir().unwrap();
+                        let root = dir.path();
+                        init_repo(root);
+                        let phase = PhaseId::new(number);
+                        let mut state = State::new(
+                            phase,
+                            AgentKind::Claude,
+                            Mode::Supervise,
+                            root.to_path_buf(),
+                        );
+                        state.verification_baseline_captured = true;
+                        state.stage = Stage::Code;
+                        state.canary = Some(if refuses {
+                            devflow_core::canary::CanaryOutcome::Absent
+                        } else {
+                            devflow_core::canary::CanaryOutcome::Confirmed
+                        });
+                        workflow::save_state(&state).unwrap();
+                        let refusal = recorded_canary_refusal(&state);
+                        assert_eq!(refusal.is_some(), refuses, "{row}: premise");
+                        let route = reject_route(
+                            &parity_gate(phase, Stage::Code, kind),
+                            refusal.as_deref(),
+                            NOTE,
+                        );
+                        assert_eq!(
+                            matches!(
+                                route,
+                                RejectRoute::StatusLess(StatusLessStep::RelaunchRefused { .. })
+                            ),
+                            refuses,
+                            "{row}: {route:?}"
+                        );
+                        at_the_gate(root, phase, Stage::Code, &reject_answer(NOTE), || {
+                            let _ = handle_stage_failure(
+                                root,
+                                &mut state,
+                                Stage::Code,
+                                Some("failed".into()),
+                            );
+                        });
+                        let after = workflow::load_state(root, phase).unwrap();
+                        assert_eq!(after.relaunch_note.as_deref(), Some(NOTE), "{row}: kept");
+                        assert_eq!(
+                            events_named(root, phase, "gate_relaunch_refused").len(),
+                            usize::from(refuses),
+                            "{row}"
+                        );
+                        assert_eq!(after.stopped, refuses, "{row}: {after:?}");
+                        if refuses {
+                            let reason = after.stop_reason.clone().unwrap_or_default();
+                            assert!(
+                                reason.contains(&format!(
+                                    "devflow resume --phase {phase} --agent <other>"
+                                )),
+                                "{row}: {reason}"
+                            );
+                            assert_eq!(events_named(root, phase, "gate_fired").len(), 1, "{row}");
+                            assert!(events_named(root, phase, "workflow_finished").is_empty());
+                        }
+                    }
+                }
+                ParityCase::RejectRefused => {
+                    let kind = kind.expect("a kind");
+                    let route = reject_route(
+                        &parity_gate(PhaseId::new(number), Stage::Code, Some(kind)),
+                        None,
+                        NOTE,
+                    );
+                    assert!(matches!(route, RejectRoute::Refused(_)), "{row}: {route:?}");
+                    let dir = tempfile::tempdir().unwrap();
+                    let root = dir.path();
+                    init_repo(root);
+                    let phase = PhaseId::new(number);
+                    let mut state = State::new(
+                        phase,
+                        AgentKind::Claude,
+                        Mode::Supervise,
+                        root.to_path_buf(),
+                    );
+                    state.stage = Stage::Code;
+                    workflow::save_state(&state).unwrap();
+                    let approval_before =
+                        serde_json::to_string(&state.checkpoint_approval).unwrap();
+                    let gates = at_the_gates_with(
+                        root,
+                        phase,
+                        Stage::Code,
+                        &[reject_answer(NOTE), abort_answer()],
+                        false,
+                        || {
+                            let _ = crate::pipeline_gate::run_gate_with_timeout(
+                                root,
+                                &mut state,
+                                Stage::Code,
+                                kind,
+                                "the gate's question",
+                                20,
+                            );
+                        },
+                    );
+                    let name = serde_json::to_value(kind).unwrap();
+                    let reopened = name.as_str().unwrap().to_string();
+                    assert_refused_before_the_claim(
+                        root,
+                        phase,
+                        Stage::Code,
+                        &gates,
+                        (name, "reject", &reopened),
+                    );
+                    assert_eq!(
+                        serde_json::to_string(&state.checkpoint_approval).unwrap(),
+                        approval_before,
+                        "{row}: a refused reject widens nothing (T-48-15-03)"
+                    );
+                }
+                ParityCase::NoKind => {
+                    let route = reject_route(
+                        &parity_gate(PhaseId::new(number), Stage::Validate, None),
+                        None,
+                        NOTE,
+                    );
+                    assert!(matches!(route, RejectRoute::Refused(_)), "{row}: {route:?}");
+                    let dir = tempfile::tempdir().unwrap();
+                    let root = dir.path();
+                    init_repo(root);
+                    let phase = PhaseId::new(number);
+                    let mut state = validate_state(root, phase, Mode::Supervise);
+                    let gates = at_the_gates_with(
+                        root,
+                        phase,
+                        Stage::Validate,
+                        &[reject_answer(NOTE), abort_answer()],
+                        true,
+                        || {
+                            open_and_dispatch(
+                                root,
+                                &mut state,
+                                Stage::Validate,
+                                GateKind::CleanPass.into(),
+                                false,
+                            )
+                        },
+                    );
+                    assert_refused_before_the_claim(
+                        root,
+                        phase,
+                        Stage::Validate,
+                        &gates,
+                        (serde_json::Value::Null, "reject", "clean_pass"),
+                    );
+                }
+            }
+        }
+
+        // An empty-note reject on a `clean_pass` gate is refused before its claim.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(5699);
+        let mut state = validate_state(root, phase, Mode::Supervise);
+        let gates = at_the_gates_with(
+            root,
+            phase,
+            Stage::Validate,
+            &[reject_answer("  "), abort_answer()],
+            false,
+            || {
+                open_and_dispatch(
+                    root,
+                    &mut state,
+                    Stage::Validate,
+                    GateKind::CleanPass.into(),
+                    false,
+                )
+            },
+        );
+        assert_refused_before_the_claim(
+            root,
+            phase,
+            Stage::Validate,
+            &gates,
+            (
+                serde_json::Value::from("clean_pass"),
+                "reject",
+                "clean_pass",
+            ),
+        );
+    }
+
+    /// The fresh facts of one approve row of the D-45 table.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Fresh {
+        PassedOnHead,
+        PassedWithoutPass,
+        GapsFound,
+        Stale,
+        HumanNeeded,
+    }
+
+    /// D-45 rule 2, D-39, R10: approving a gate of every kind (and of a file
+    /// with no kind) changes state the way `approve_route` says. Each
+    /// verification kind is approved over each table row (the stub's fresh
+    /// status and the recorded HEAD): finish, Validate again, the gap loop, the
+    /// re-verify pass, or a reopened gate labelled by the fresh read; every
+    /// kind takes the same route on the same row. Decoys: a gate recording
+    /// `passed` whose fresh read is `gaps_found` runs the gap loop, and one
+    /// recording `gaps_found` whose fresh read is `passed` with the PASS on
+    /// HEAD finishes. Status-less approves read no GSD status; a canary-refused
+    /// stage failure stops the run with no note; a kindless approve is refused
+    /// before the claim.
+    #[test]
+    fn the_approve_path_takes_the_route_approve_route_names() {
+        if !in_bounded_child(
+            "pipeline_outcomes::tests::the_approve_path_takes_the_route_approve_route_names",
+        ) {
+            return;
+        }
+        let rows = [
+            Fresh::PassedOnHead,
+            Fresh::PassedWithoutPass,
+            Fresh::GapsFound,
+            Fresh::Stale,
+            Fresh::HumanNeeded,
+        ];
+        let mut routes_per_row: Vec<std::collections::BTreeSet<String>> =
+            vec![std::collections::BTreeSet::new(); rows.len()];
+        let mut number = 5700u32;
+        for kind in every_gate_kind() {
+            let row = format!("{kind:?}");
+            number += 10;
+            match parity_case(kind) {
+                ParityCase::Verification(stage) => {
+                    for (index, fresh) in rows.into_iter().enumerate() {
+                        let phase = PhaseId::new(number + u32::try_from(index).unwrap());
+                        let row = format!("{row} over {fresh:?}");
+                        let status = match fresh {
+                            Fresh::PassedOnHead | Fresh::PassedWithoutPass => GsdStatus::Passed,
+                            Fresh::GapsFound => GsdStatus::GapsFound,
+                            Fresh::Stale => GsdStatus::Stale,
+                            Fresh::HumanNeeded => GsdStatus::HumanNeeded,
+                        };
+                        let resolved =
+                            approve_row(stage, kind.unwrap().into(), phase, fresh, status, &row);
+                        routes_per_row[index].insert(resolved);
+                    }
+                }
+                ParityCase::StageFailure => {
+                    for (offset, refuses) in [(0u32, false), (1, true)] {
+                        let row = format!("{row}, canary refuses {refuses}");
+                        let dir = tempfile::tempdir().unwrap();
+                        let root = dir.path();
+                        init_repo(root);
+                        let phase = PhaseId::new(number + offset);
+                        phase_dir_fixture(root, phase);
+                        let gsd = GsdStub::answering(root, &[gsd_says(GsdStatus::Passed)]);
+                        let mut state = State::new(
+                            phase,
+                            AgentKind::Claude,
+                            Mode::Supervise,
+                            root.to_path_buf(),
+                        );
+                        state.verification_baseline_captured = true;
+                        state.stage = Stage::Code;
+                        state.canary = Some(if refuses {
+                            devflow_core::canary::CanaryOutcome::Absent
+                        } else {
+                            devflow_core::canary::CanaryOutcome::Confirmed
+                        });
+                        workflow::save_state(&state).unwrap();
+                        let refusal = recorded_canary_refusal(&state);
+                        let route = approve_route(
+                            &parity_gate(phase, Stage::Code, kind),
+                            refusal.as_deref(),
+                            || panic!("{row}: a status-less approve reads no GSD status"),
+                        );
+                        let expected = if refuses {
+                            "relaunch_refused"
+                        } else {
+                            "retry_stage"
+                        };
+                        assert!(
+                            matches!(&route, ApproveRoute::StatusLess(step) if step.name() == expected),
+                            "{row}: {route:?}"
+                        );
+                        at_the_gate(root, phase, Stage::Code, &approve_answer(), || {
+                            let _ = handle_stage_failure(
+                                root,
+                                &mut state,
+                                Stage::Code,
+                                Some("failed".into()),
+                            );
+                        });
+                        let after = workflow::load_state(root, phase).unwrap();
+                        assert_eq!(status_reads(&gsd), 0, "{row}: no status read");
+                        assert_eq!(after.stopped, refuses, "{row}: {after:?}");
+                        assert_eq!(
+                            after.relaunch_note, None,
+                            "{row}: an approve carries no note"
+                        );
+                        assert_eq!(
+                            events_named(root, phase, "gate_relaunch_refused").len(),
+                            usize::from(refuses),
+                            "{row}"
+                        );
+                        let resolved = events_named(root, phase, "gate_resolved");
+                        assert_eq!(resolved[0]["route"], expected, "{row}: {}", resolved[0]);
+                    }
+                }
+                ParityCase::RejectRefused => {
+                    let expected = match kind {
+                        Some(GateKind::Preflight) => StatusLessStep::PreflightOverride,
+                        _ => StatusLessStep::RecordCheckpointSet,
+                    };
+                    let route = approve_route(
+                        &parity_gate(PhaseId::new(number), Stage::Code, kind),
+                        None,
+                        || panic!("{row}: a status-less approve reads no GSD status"),
+                    );
+                    assert!(
+                        matches!(&route, ApproveRoute::StatusLess(step) if *step == expected),
+                        "{row}: {route:?}"
+                    );
+                }
+                ParityCase::NoKind => {
+                    let route = approve_route(
+                        &parity_gate(PhaseId::new(number), Stage::Validate, None),
+                        None,
+                        || panic!("{row}: a kindless approve reads no GSD status"),
+                    );
+                    assert!(
+                        matches!(route, ApproveRoute::Refused(_)),
+                        "{row}: {route:?}"
+                    );
+                    let dir = tempfile::tempdir().unwrap();
+                    let root = dir.path();
+                    init_repo(root);
+                    let phase = PhaseId::new(number);
+                    let mut state = validate_state(root, phase, Mode::Supervise);
+                    let gates = at_the_gates_with(
+                        root,
+                        phase,
+                        Stage::Validate,
+                        &[approve_answer(), abort_answer()],
+                        true,
+                        || {
+                            open_and_dispatch(
+                                root,
+                                &mut state,
+                                Stage::Validate,
+                                GateKind::CleanPass.into(),
+                                false,
+                            )
+                        },
+                    );
+                    assert_refused_before_the_claim(
+                        root,
+                        phase,
+                        Stage::Validate,
+                        &gates,
+                        (serde_json::Value::Null, "approve", "clean_pass"),
+                    );
+                }
+            }
+        }
+        for (fresh, routes) in rows.iter().zip(&routes_per_row) {
+            assert_eq!(
+                routes.len(),
+                1,
+                "every verification kind routes {fresh:?} alike: {routes:?}"
+            );
+        }
+
+        // Decoys: the route follows the fresh read, never the recorded status.
+        let decoy = |status: Option<GsdStatus>| devflow_core::gates::GateLabel {
+            kind: GateKind::CleanPass,
+            gsd_status: status,
+        };
+        let gap = approve_row(
+            Stage::Validate,
+            decoy(Some(GsdStatus::Passed)),
+            PhaseId::new(5990),
+            Fresh::GapsFound,
+            GsdStatus::GapsFound,
+            "decoy: recorded passed, fresh gaps_found",
+        );
+        assert_eq!(gap, "gap_loop");
+        let mut gaps_label = decoy(Some(GsdStatus::GapsFound));
+        gaps_label.kind = GateKind::GapsFound;
+        let finish = approve_row(
+            Stage::Validate,
+            gaps_label,
+            PhaseId::new(5991),
+            Fresh::PassedOnHead,
+            GsdStatus::Passed,
+            "decoy: recorded gaps_found, fresh passed with the PASS on HEAD",
+        );
+        assert_eq!(finish, "finish");
+    }
+
+    /// One approve row: a verification gate `label` at `stage`, approved while
+    /// the stub's fresh read answers `status` and the recorded PASS is on HEAD
+    /// exactly for [`Fresh::PassedOnHead`]. Asserts the state the row's route
+    /// leaves, and returns the route `gate_resolved` named.
+    fn approve_row(
+        stage: Stage,
+        label: devflow_core::gates::GateLabel,
+        phase: PhaseId,
+        fresh: Fresh,
+        status: GsdStatus,
+        row: &str,
+    ) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let _gsd = validate_evidence(root, phase, &[gsd_says(status)]);
+        let head = repo_with_head(root);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = stage;
+        state.gap_closure_pass = stage == Stage::Plan;
+        state.phase_validate_failures = 4;
+        state.validate_pass_head = (fresh == Fresh::PassedOnHead).then(|| head.clone());
+        workflow::save_state(&state).unwrap();
+        let mut answers = vec![approve_answer()];
+        if fresh == Fresh::HumanNeeded {
+            answers.push(abort_answer());
+        }
+        let gates = at_the_gates_with(root, phase, stage, &answers, false, || {
+            open_and_dispatch(root, &mut state, stage, label, false);
+        });
+        let resolved = events_named(root, phase, "gate_resolved");
+        let route = resolved[0]["route"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(resolved[0]["gsd_status"], gsd_status_name(status), "{row}");
+        assert_eq!(
+            resolved[0]["agent_pass_on_head"],
+            fresh == Fresh::PassedOnHead,
+            "{row}: {}",
+            resolved[0]
+        );
+        let finished = events_named(root, phase, "workflow_finished");
+        match fresh {
+            Fresh::PassedOnHead => {
+                assert_eq!(route, "finish", "{row}");
+                assert_eq!(
+                    finished
+                        .iter()
+                        .map(|event| (event["reason"].clone(), event["shipped"].clone()))
+                        .collect::<Vec<_>>(),
+                    vec![(serde_json::json!("finished"), serde_json::json!(false))],
+                    "{row}"
+                );
+                let after = workflow::load_state(root, phase).unwrap();
+                assert!(after.finished && after.stopped, "{row}: {after:?}");
+                assert_eq!(
+                    after.stop_reason.as_deref(),
+                    Some(crate::pipeline_gate::FINISHED_STOP_REASON),
+                    "{row}"
+                );
+            }
+            Fresh::PassedWithoutPass => {
+                assert_eq!(route, "validate_again", "{row}");
+                assert!(finished.is_empty(), "{row}");
+                assert_eq!(
+                    workflow::load_state(root, phase).unwrap().stage,
+                    Stage::Validate
+                );
+            }
+            Fresh::GapsFound => {
+                assert_eq!(route, "gap_loop", "{row}");
+                assert!(finished.is_empty(), "{row}");
+                let after = workflow::load_state(root, phase).unwrap();
+                assert_eq!(after.stage, Stage::Plan, "{row}");
+                assert!(after.gap_closure_pass, "{row}");
+            }
+            Fresh::Stale => {
+                assert_eq!(route, "reverify", "{row}");
+                assert!(finished.is_empty(), "{row}");
+                let after = workflow::load_state(root, phase).unwrap();
+                assert_eq!(after.code_fix, Some(FixType::StaleReverify), "{row}");
+            }
+            Fresh::HumanNeeded => {
+                assert_eq!(route, "reopen", "{row}");
+                assert!(finished.is_empty(), "{row}");
+                assert_eq!(gates.len(), 2, "{row}: the gate reopened");
+                assert_eq!(gates[1].0["gate_kind"], "human_needed", "{row}");
+                assert_eq!(
+                    gates[1].1.phase_validate_failures, 4,
+                    "{row}: counted nothing"
+                );
+            }
+        }
+        route
+    }
+
+    /// 52-29: every verification gate records the GSD status it was opened
+    /// over (a label), and none for a reader failure; a stage-failure gate
+    /// opened while the stub answers `passed` records none. Control in the
+    /// same test: an `ambiguous_verdict` gate over `passed` and one over
+    /// `gaps_found` record different statuses.
+    #[test]
+    fn each_verification_gate_records_the_status_that_chose_it() {
+        if !in_bounded_child(
+            "pipeline_outcomes::tests::each_verification_gate_records_the_status_that_chose_it",
+        ) {
+            return;
+        }
+        let rows: [(Mode, ValidateOutcome, Option<GsdStatus>, &str, u32); 10] = [
+            (
+                Mode::Supervise,
+                ValidateOutcome::Passed,
+                Some(GsdStatus::Passed),
+                "clean_pass",
+                0,
+            ),
+            (
+                Mode::Supervise,
+                ValidateOutcome::Passed,
+                Some(GsdStatus::GapsFound),
+                "gaps_found",
+                0,
+            ),
+            (
+                Mode::Supervise,
+                ValidateOutcome::Passed,
+                Some(GsdStatus::Stale),
+                "reverify_needed",
+                0,
+            ),
+            (
+                Mode::Auto,
+                ValidateOutcome::Passed,
+                Some(GsdStatus::HumanNeeded),
+                "human_needed",
+                0,
+            ),
+            (
+                Mode::Auto,
+                ValidateOutcome::Failed,
+                Some(GsdStatus::Passed),
+                "disagreement_over_passed",
+                0,
+            ),
+            (
+                Mode::Auto,
+                ValidateOutcome::Failed,
+                Some(GsdStatus::HumanNeeded),
+                "disagreement_over_human_needed",
+                0,
+            ),
+            (
+                Mode::Auto,
+                ValidateOutcome::Ambiguous("no verdict".into()),
+                Some(GsdStatus::Passed),
+                "ambiguous_verdict",
+                0,
+            ),
+            (
+                Mode::Supervise,
+                ValidateOutcome::Ambiguous("no verdict".into()),
+                Some(GsdStatus::GapsFound),
+                "ambiguous_verdict",
+                0,
+            ),
+            (
+                Mode::Auto,
+                ValidateOutcome::Failed,
+                Some(GsdStatus::GapsFound),
+                "failure_cap",
+                mode::MAX_CONSECUTIVE_FAILURES - 1,
+            ),
+            (
+                Mode::Auto,
+                ValidateOutcome::Passed,
+                None,
+                "reader_failure",
+                0,
+            ),
+        ];
+        let mut ambiguous = Vec::new();
+        for (index, (mode, outcome, status, kind, streak)) in rows.into_iter().enumerate() {
+            let row = format!("{kind} over {status:?}");
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = PhaseId::new(5600 + u32::try_from(index).unwrap());
+            let replies: Vec<&str> = status.map(gsd_says).into_iter().collect();
+            let _gsd = validate_evidence(root, phase, &replies);
+            let mut state = validate_state(root, phase, mode);
+            state.consecutive_failures = streak;
+            workflow::save_state(&state).unwrap();
+            let (gate, _) = at_the_validate_gate(root, phase, &abort_answer(), || {
+                let _ = handle_validate_outcome(root, &mut state, outcome);
+            });
+            assert_eq!(gate["gate_kind"], kind, "{row}: {gate}");
+            match status {
+                Some(status) => {
+                    assert_eq!(gate["gsd_status"], gsd_status_name(status), "{row}: {gate}")
+                }
+                None => assert!(gate.get("gsd_status").is_none(), "{row}: {gate}"),
+            }
+            if kind == "ambiguous_verdict" {
+                ambiguous.push(gate["gsd_status"].clone());
+            }
+        }
+        assert_eq!(ambiguous.len(), 2);
+        assert_ne!(
+            ambiguous[0], ambiguous[1],
+            "control: two ambiguous gates, two statuses"
+        );
+
+        // 52-27's no_gap_closure_plan gate, over the round's gaps_found.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (mut state, _) = gaps_plan_fixture(root, PhaseId::new(5620), false);
+        let gate = gaps_plan_gate(root, &mut state);
+        assert_eq!(gate["gate_kind"], "no_gap_closure_plan", "{gate}");
+        assert_eq!(gate["gsd_status"], "gaps_found", "{gate}");
+
+        // 52-27's reader-failure gate at Plan records no status.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5621);
+        let (mut state, report_at) = gaps_plan_fixture(root, phase, true);
+        write_dated(
+            root,
+            phase,
+            &format!("{}-03-PLAN.md", phase.padded()),
+            &plan_text(phase, "03", true),
+            report_at + FIXTURE_SPACING_SECS,
+        );
+        let _gsd = GsdStub::answering(root, &["not json"]);
+        let gate = gaps_plan_gate(root, &mut state);
+        assert_eq!(gate["gate_kind"], "reader_failure", "{gate}");
+        assert!(gate.get("gsd_status").is_none(), "{gate}");
+
+        // A stage-failure gate records none, whatever GSD would say.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5622);
+        let _gsd = validate_evidence(root, phase, &[gsd_says(GsdStatus::Passed)]);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Code;
+        workflow::save_state(&state).unwrap();
+        let (gate, _) = at_the_gate(root, phase, Stage::Code, &abort_answer(), || {
+            let _ = handle_stage_failure(root, &mut state, Stage::Code, Some("failed".into()));
+        });
+        assert_eq!(gate["gate_kind"], "stage_failure", "{gate}");
+        assert!(gate.get("gsd_status").is_none(), "{gate}");
     }
 }
