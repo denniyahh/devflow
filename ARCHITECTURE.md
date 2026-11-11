@@ -72,8 +72,7 @@ Agent backends are isolated behind a trait
   (surfaced by `devflow doctor`) — no stage-routing or launch logic consumes it
   yet. The signal is name-based (Pi has no `pi tools` command), not a
   tool-registry proof.
-- Prompts are built per-stage by `crate::prompt::stage_prompt(stage, phase)`
-  (or `stage_prompt_for_project` when the CLI applies project config),
+- Prompts are built per-stage by `crate::prompt::stage_prompt(stage, phase)`,
   not a single shared instruction template. Every prompt hands the agent its
   GSD slash command (`Stage::gsd_command()`) plus a `DEVFLOW_RESULT`
   completion contract (`DEVFLOW_RESULT: {"status": "success"}` /
@@ -320,17 +319,12 @@ backs:
 - `start` (default) — run a single phase in its own worktree;
   `--no-worktree` runs directly in the primary checkout instead.
 
-Branch integration uses `GitFlow::ensure_branch()` (create at a start point
-without checking out).
-
 ## Git model
 
 `crates/devflow-core/src/git.rs` (`GitFlow`) implements branch primitives:
 `feature_start(phase)`/`feature_start_force(phase)` (create
 `feature/phase-NN` from `develop`), `push`, `has_remote`,
-`cleanup_merged`. `release_start`/`release_finish` also exist on `GitFlow`
-but are not called from any production CLI path today (only exercised in
-`git.rs`'s own tests).
+`cleanup_merged`.
 
 DevFlow does not merge, open a pull request, bump a version, tag or delete a
 branch: there is no Ship stage. A passing Validate ends the run
@@ -390,8 +384,7 @@ Key modules log via `tracing`'s `info!`/`warn!`/`debug!` macros:
 - **`workflow.rs`** — state I/O (`update_state`, `load_state`) logs at `DEBUG`;
   unreadable/corrupt state files warn at `WARN`
   rather than aborting a listing.
-- **`git.rs`** — branch operations (`feature_start`, `feature_finish`,
-  `tag`, `push`) log at `INFO`; checkout/rebase/commit operations log at
+- **`git.rs`** — branch operations (`feature_start`, `tag`, `push`) log at `INFO`; checkout/rebase/commit operations log at
   `DEBUG`; force operations log at `WARN`.
 - **`gates.rs`** — gate writes/polls log at `INFO`/`DEBUG`; a failed or
   unspawnable notify command warns at `WARN` (fail-soft — never aborts

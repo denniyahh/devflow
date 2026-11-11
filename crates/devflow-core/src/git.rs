@@ -180,13 +180,6 @@ impl GitFlow {
         Ok(branch)
     }
 
-    /// Merge a feature branch into develop and delete it.
-    pub fn feature_finish(&self, phase: PhaseId) -> Result<String, GitError> {
-        let branch = self.merge_feature_into_develop(phase)?;
-        self.git(["branch", "-d", &branch])?;
-        Ok(branch)
-    }
-
     /// Merge a feature branch into develop without deleting it.
     ///
     /// Default DevFlow runs keep the feature branch checked out in a linked
@@ -232,38 +225,6 @@ impl GitFlow {
                 "git rev-list --count {range} printed {count:?}, not a count: {err}"
             ))
         })
-    }
-
-    /// Create or reset a release branch from the current `HEAD`.
-    ///
-    /// The release branch is cut from wherever the caller currently is — the
-    /// branch being shipped — not from `develop`. Ship finalization writes the
-    /// version bump into the working tree first, so branching from `HEAD`
-    /// keeps any commits unique to the shipped branch in the release.
-    pub fn release_start(&self, version: &str) -> Result<String, GitError> {
-        let branch = format!("release/{version}");
-        info!("creating release branch: {branch}");
-        self.git(["checkout", "-B", &branch])?;
-        Ok(branch)
-    }
-
-    /// Merge a release branch into main and develop, tag it, and delete it.
-    pub fn release_finish(&self, version: &str) -> Result<String, GitError> {
-        let branch = format!("release/{version}");
-        info!("finishing release branch: {branch}");
-        self.git(["checkout", &self.config.main])?;
-        self.git(["merge", "--no-ff", &branch])?;
-        // `-c tag.gpgSign=false` scopes the override to this invocation only
-        // (never the user's global/repo config) — without it, a global
-        // `tag.gpgsign=true` forces this lightweight tag into an
-        // annotated+signed one requiring a message, which blocks on
-        // `$EDITOR` in what must be a headless, unattended flow (Phase 13
-        // dogfood finding).
-        self.git(["-c", "tag.gpgSign=false", "tag", &format!("v{version}")])?;
-        self.git(["checkout", &self.config.develop])?;
-        self.git(["merge", "--no-ff", &branch])?;
-        self.git(["branch", "-d", &branch])?;
-        Ok(branch)
     }
 
     /// Create an annotated-free lightweight tag at the current `HEAD`.
@@ -313,30 +274,10 @@ impl GitFlow {
             .unwrap_or(false)
     }
 
-    /// The commit SHA at the tip of `branch`.
-    pub fn branch_tip(&self, branch: &str) -> Result<String, GitError> {
-        Ok(self.git_output(["rev-parse", branch])?.trim().to_string())
-    }
-
-    /// Create `branch` at `start_point` if it does not already exist, without
-    /// checking it out (leaves the current checkout untouched).
-    pub fn ensure_branch(&self, branch: &str, start_point: &str) -> Result<(), GitError> {
-        if self.branch_exists(branch) {
-            return Ok(());
-        }
-        self.git(["branch", branch, start_point])
-    }
-
     /// Check out an existing branch in the main worktree.
     pub fn checkout(&self, branch: &str) -> Result<(), GitError> {
         debug!("checking out branch: {branch}");
         self.git(["checkout", branch])
-    }
-
-    /// Delete `branch` on `origin` (best-effort; errors if no remote/branch).
-    pub fn delete_remote_branch(&self, branch: &str) -> Result<(), GitError> {
-        info!("deleting remote branch: {branch}");
-        self.git(["push", "origin", "--delete", branch])
     }
 
     /// Whether the repository has at least one configured remote.
@@ -437,26 +378,11 @@ impl GitFlow {
         Ok(deleted)
     }
 
-    /// Stage all changes and commit with the given message.
-    /// Returns Ok(()) whether or not there were changes to commit.
-    pub fn commit_all(&self, message: &str) -> Result<(), GitError> {
-        debug!("committing all changes: {message}");
-        self.git(["add", "."])?;
-        // --allow-empty so we don't fail when there are no changes
-        match self.git_raw(&["commit", "--allow-empty", "-m", message]) {
-            Ok(()) => Ok(()),
-            // If the commit produced no changes and we used --allow-empty,
-            // this should still succeed. But just in case, ignore "nothing to commit".
-            Err(GitError::Command(ref msg)) if msg.contains("nothing to commit") => Ok(()),
-            Err(e) => Err(e),
-        }
-    }
-
     /// Stage a single relative path and commit with the given message.
-    /// Mirrors `commit_all`, but scoped to one path, for hooks that must not
-    /// sweep in unrelated dirty state left by other hooks or the workflow.
-    /// Returns Ok(()) whether or not the path had changes to commit. Unlike
-    /// `commit_all`, a path with no changes produces **no commit** — it is a
+    /// Scoped to one path, for callers that must not sweep in unrelated dirty
+    /// state left by other hooks or the workflow.
+    /// Returns Ok(()) whether or not the path had changes to commit. A path
+    /// with no changes produces **no commit** — it is a
     /// genuine no-op, not a forced empty commit, so a caller that tags the
     /// commit it last produced can never tag one containing nothing
     /// (19b/D-16).
@@ -546,38 +472,20 @@ impl GitFlow {
             .and_then(|s| s.trim().parse().ok())
     }
 
-    fn git_raw(&self, args: &[&str]) -> Result<(), GitError> {
-        debug!("git {}", args.join(" "));
-        // Pin the subprocess locale to C (Antigravity review, 19b): commit_path's
-        // "nothing to commit" match arm above compares against git's own
-        // English-locale output, which a non-English LC_ALL/LANG would
-        // localize, silently defeating the match and reopening 19b under a
-        // localized environment (T-19-14). Scoped to this one call path only.
-        let output = git_command(&self.root)
-            .args(args)
-            .env("LC_ALL", "C")
-            .env("LANG", "C")
-            .output()?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(GitError::Command(stderr_or_status(&output)))
-        }
-    }
-
-    /// Like [`git_raw`](Self::git_raw), but the error text combines stdout
-    /// with stderr instead of inspecting stderr alone.
+    /// Run git, with an error text that combines stdout with stderr instead
+    /// of inspecting stderr alone.
     ///
     /// Discovered empirically while implementing 19b: `git commit`'s
     /// "nothing to commit, working tree clean" message is written to
     /// **stdout**, not stderr. `stderr_or_status` only ever inspects
-    /// `output.stderr`, so a plain `git_raw` error can never contain that
-    /// text — `commit_path`'s `nothing to commit` match arm (immediately
-    /// above its call site) would never fire, no matter how the arm itself
-    /// is written. This sibling exists solely so `commit_path` can see it;
-    /// `commit_all` keeps calling `git_raw` unchanged (D-17 out of scope),
-    /// and `git_raw`'s own error-mapping branch is untouched by this
-    /// addition.
+    /// `output.stderr`, so a stderr-only error can never contain that text —
+    /// `commit_path`'s `nothing to commit` match arm would never fire, no
+    /// matter how the arm itself is written.
+    ///
+    /// The subprocess locale is pinned to C (Antigravity review, 19b): that
+    /// match arm compares against git's own English-locale output, which a
+    /// non-English LC_ALL/LANG would localize, silently defeating the match
+    /// and reopening 19b under a localized environment (T-19-14).
     fn git_raw_combined(&self, args: &[&str]) -> Result<(), GitError> {
         debug!("git {}", args.join(" "));
         let output = git_command(&self.root)
@@ -1072,64 +980,6 @@ mod tests {
     }
 
     #[test]
-    fn feature_finish_merges_into_develop_and_deletes() {
-        let repo = init_repo();
-        let root = repo.path();
-        let gf = flow(root);
-
-        gf.feature_start(PhaseId::new(1)).expect("start");
-        commit_file(root, "feature.txt");
-
-        let branch = gf.feature_finish(PhaseId::new(1)).expect("finish");
-        assert_eq!(branch, "feature/phase-01");
-        assert_eq!(current_branch(root), "develop");
-
-        // Branch is deleted and its work is now on develop.
-        let branches = crate::test_support::git_command(root)
-            .args(["branch"])
-            .output()
-            .unwrap();
-        let listing = String::from_utf8_lossy(&branches.stdout);
-        assert!(!listing.contains("feature/phase-01"));
-        assert!(root.join("feature.txt").exists());
-    }
-
-    #[test]
-    fn release_start_and_finish_tags_main_and_merges_both() {
-        let repo = init_repo();
-        let root = repo.path();
-        let gf = flow(root);
-
-        // Add work on develop so the release has content.
-        commit_file(root, "work.txt");
-        let branch = gf.release_start("1.2.0").expect("release_start");
-        assert_eq!(branch, "release/1.2.0");
-
-        gf.release_finish("1.2.0").expect("release_finish");
-        assert_eq!(current_branch(root), "develop");
-
-        // Tag exists.
-        let tags = crate::test_support::git_command(root)
-            .args(["tag"])
-            .output()
-            .unwrap();
-        assert!(String::from_utf8_lossy(&tags.stdout).contains("v1.2.0"));
-
-        // Release branch deleted.
-        let branches = crate::test_support::git_command(root)
-            .args(["branch"])
-            .output()
-            .unwrap();
-        assert!(!String::from_utf8_lossy(&branches.stdout).contains("release/1.2.0"));
-    }
-
-    /// A global/repo `tag.gpgsign=true` must not turn `tag()`'s lightweight
-    /// tag into an annotated+signed one — that would require a tag message
-    /// and block on `$EDITOR`, silently hanging a headless, unattended run
-    /// (Phase 13 dogfood finding: VersionBump hung on a live
-    /// `devflow start --mode auto` run because the operator's global
-    /// gitconfig sets `tag.gpgsign=true`).
-    #[test]
     fn tag_stays_lightweight_when_gpgsign_is_forced_on() {
         let repo = init_repo();
         let root = repo.path();
@@ -1164,8 +1014,7 @@ mod tests {
 
     #[test]
     fn commit_path_stages_only_the_given_path_leaving_other_dirt_uncommitted() {
-        // The property that distinguishes commit_path from commit_all
-        // (17-12, Task 2b): a hook using commit_path must never sweep in
+        // 17-12, Task 2b: a caller using commit_path must never sweep in
         // unrelated dirty state.
         let repo = init_repo();
         let root = repo.path();
@@ -1299,37 +1148,6 @@ mod tests {
     }
 
     #[test]
-    fn release_start_branches_from_current_head_not_develop() {
-        let repo = init_repo();
-        let root = repo.path();
-        let gf = flow(root);
-
-        // Ship from a feature branch carrying a commit that is NOT on develop.
-        gf.feature_start(PhaseId::new(5)).expect("feature_start");
-        commit_file(root, "feature-only.txt");
-        let feature_tip = gf.branch_tip("feature/phase-05").expect("feature tip");
-
-        let branch = gf.release_start("2.0.0").expect("release_start");
-        assert_eq!(branch, "release/2.0.0");
-        assert_eq!(current_branch(root), "release/2.0.0");
-
-        // The release branch tip must descend from the feature commit — i.e.
-        // the feature-only work is present, not dropped to develop's HEAD.
-        let release_tip = gf.branch_tip("release/2.0.0").expect("release tip");
-        let is_ancestor = crate::test_support::git_command(root)
-            .args(["merge-base", "--is-ancestor", &feature_tip, &release_tip])
-            .output()
-            .unwrap()
-            .status
-            .success();
-        assert!(
-            is_ancestor,
-            "release branch must descend from the shipped feature commit"
-        );
-        assert!(root.join("feature-only.txt").exists());
-    }
-
-    #[test]
     fn cleanup_merged_removes_merged_but_keeps_protected() {
         let repo = init_repo();
         let root = repo.path();
@@ -1338,7 +1156,10 @@ mod tests {
         // Create and merge a feature branch into develop.
         gf.feature_start(PhaseId::new(2)).expect("start");
         commit_file(root, "f.txt");
-        gf.feature_finish(PhaseId::new(2)).expect("finish");
+        let merged = gf
+            .merge_feature_into_develop(PhaseId::new(2))
+            .expect("merge");
+        git(root, &["branch", "-d", &merged]);
 
         // Create an already-merged stray branch off develop.
         git(root, &["branch", "stale-merged"]);
@@ -1452,8 +1273,8 @@ mod tests {
         let root = repo.path();
         let gf = flow(root);
 
-        // Merge a branch into develop WITHOUT deleting it (feature_finish
-        // deletes on merge, which would leave nothing to check out).
+        // Merge a branch into develop WITHOUT deleting it, so it is left
+        // to check out.
         git(
             root,
             &["checkout", "-q", "-b", "worktree-merged", "develop"],
@@ -1570,9 +1391,11 @@ mod tests {
     fn merge_of_missing_branch_is_an_error() {
         let repo = init_repo();
         let root = repo.path();
-        // feature_finish for a phase that was never started: checkout develop
+        // A merge for a phase that was never started: checkout develop
         // succeeds, but merging the nonexistent feature branch fails.
-        let err = flow(root).feature_finish(PhaseId::new(99)).unwrap_err();
+        let err = flow(root)
+            .merge_feature_into_develop(PhaseId::new(99))
+            .unwrap_err();
         assert!(matches!(err, GitError::Command(_)));
     }
 
