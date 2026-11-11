@@ -4,17 +4,17 @@ milestone: v4.0
 milestone_name: Session Continuity
 current_phase: 52
 current_phase_name: Subtract and Stabilize
-status: executing
-stopped_at: Completed 52-31-PLAN.md
-last_updated: "2026-11-11T15:21:49.335Z"
+status: verifying
+stopped_at: Completed 52-32-PLAN.md
+last_updated: "2026-11-11T16:32:03.773Z"
 last_activity: 2026-11-10
 last_activity_desc: Phase 52 execution started
-state_head: ba086373e96ed0dda77e4242d1509ef806330d8d
+state_head: f25a9ec515211c26b1ed42dcefc07f75b031981e
 progress:
   total_phases: 4
   completed_phases: 0
   total_plans: 33
-  completed_plans: 32
+  completed_plans: 33
   percent: 0
 ---
 
@@ -160,7 +160,7 @@ change earns 2.0.
 
 Phase: 52 (Subtract and Stabilize) — EXECUTING
 Plan: 33 of 33
-Status: Ready to execute
+Status: Phase complete — ready for verification
 Last activity: 2026-11-10 — Phase 52 execution started
 
 
@@ -894,6 +894,9 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 52]: 52-30: a failure reason is stored whole up to GATE_CONTEXT_STORED_MAX_CHARS (4096 characters); the bound applies to each reason, so a context is at most 4096 plus its fixed lead
 - [Phase 52]: 52-31: the rate-limit gate is its own kind (gate_kind rate_limit) and records not_before = reset + 60 s when the denial named a reset; gate sweep spares it until then; approve runs relaunch_now, reject relaunch_with_note (canary unread); the live writer opens it, led by the way-on sentence
 - [Phase 52]: 52-31: Gates::rate_limit_timer_answer (no boolean, refuses a non-rate_limit gate, responded_by devflow-rate-limit-timer), GateAction::Relaunch with from_gate_answer, rate_limit_wait_bound and State.rate_limit_auto_relaunch_used exist with no production caller; 52-32 wires them
+- [Phase 52]: 52-32: the rate-limit timer lives in the gate wait and arms per gate open through rate_limit_timer_deadline only, so first open, resume and takeover decide it alike
+- [Phase 52]: 52-32: after the timer writes (or finds an operator's answer) the wait takes the answer before checking the lifetime, so a reset later than the gate timeout relaunches at the wake (U8 fix)
+- [Phase 52]: 52-32: a timer write failing other than AlreadyResponded keeps the automatic relaunch spent and reports rate_limit_timer_fired outcome failed
 
 ## Roadmap Evolution
 
@@ -1037,11 +1040,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 52 P33 | 46 min | 3 tasks | 10 files |
 | Phase 52 P30 | 23 min | 2 tasks | 7 files |
 | Phase 52 P31 | 34 min | 3 tasks | 9 files |
+| Phase 52 P32 | 60min | 3 tasks | 7 files |
 
 ## Session
 
-**Last session:** 2026-11-11T15:21:49.110Z
-**Stopped at:** Completed 52-31-PLAN.md
+**Last session:** 2026-11-11T16:32:03.526Z
+**Stopped at:** Completed 52-32-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps

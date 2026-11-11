@@ -16,7 +16,7 @@ requirement closes a backlog entry, the entry is named; `.planning/user/V4-CUT-I
 - [x] **CUT-02**: A run ends after Validate as *finished*: there is no Ship stage, no after-ship hooks (Merge, VersionBump,
       ChangelogAppend, BranchCleanup), no `devflow ship` and no `--yes-ship`; the event log records `workflow_finished`
       with `shipped: false` and the worktree and branch are left for the operator. Closes 999.180, 999.210; retires 999.111, 999.129, 999.132, 999.173, 999.178.
-- [ ] **CUT-03**: A rate limit with no usable fallback waits at a gate whose context names the reset time and the exact
+- [x] **CUT-03**: A rate limit with no usable fallback waits at a gate whose context names the reset time and the exact
       resume command. Once the reset time passes, the supervisor relaunches the stage by itself, at most once (a supervisor crash
       after the timer claims the gate leaves the relaunch to the gate's `devflow resume` command; amended 2026-11-09,
       52-CONTEXT D-45 rule 5). With no
@@ -132,7 +132,7 @@ Populated during roadmap creation (2026-11-08). Phase order and dependencies: RO
 |-------------|-------|--------|
 | CUT-01 | Phase 52 — Subtract and Stabilize | Complete |
 | CUT-02 | Phase 52 — Subtract and Stabilize | Complete |
-| CUT-03 | Phase 52 — Subtract and Stabilize | Pending |
+| CUT-03 | Phase 52 — Subtract and Stabilize | Complete |
 | CUT-04 | Phase 52 — Subtract and Stabilize | Complete |
 | GATE-01 | Phase 52 — Subtract and Stabilize | Complete |
 | GATE-02 | Phase 52 — Subtract and Stabilize | Complete |
