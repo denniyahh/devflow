@@ -100,7 +100,7 @@ fn run_devflow(home: &common::HermeticHome, root: &Path, fake_bin: &Path, args: 
         .env("DEVFLOW_TEST_ROOT", root)
         .current_dir(root);
     // HYG-01: bound the gate wait on the CHILD's env. Supervise-mode stages
-    // that reach a gate (never-silent Define/Plan failures, Validate in
+    // that reach a gate (never-silent Plan/Code failures, Validate in
     // supervise) block `devflow advance` for the default 3-day gate timeout;
     // the sh monitor reaps cleanly but its advance child — spawned as the
     // script's last line — is orphaned and keeps polling. The tests finish
@@ -1037,7 +1037,7 @@ esac
 }
 
 /// 13-06 dogfood regression (Codex leg): a fresh headless Codex run can
-/// never pass Define, so `start --agent codex` on a phase with no CONTEXT.md
+/// never pass Plan, so `start --agent codex` on a phase with no CONTEXT.md
 /// on develop must fail fast in pre-flight — before any worktree, branch, or
 /// monitor is created.
 #[test]
@@ -1600,7 +1600,7 @@ fn pi_hung_process_is_detected_not_left_running() {
 // Phase 41 Task 8 (ANTG-03, F4, codex-3, antigravity notice (a)): the
 // Antigravity transport, end to end through `devflow start --agent
 // antigravity` with a stubbed `agy` on PATH. The canary-aware stub answers
-// the `DEVFLOW_DELIVERY_CANARY_` turn (AntigravityCanaryLauncher at Define),
+// the `DEVFLOW_DELIVERY_CANARY_` turn (AntigravityCanaryLauncher at Plan),
 // schema-checks every turn (codex-3), and then behaves per mode.
 // ---------------------------------------------------------------------------
 
@@ -1610,7 +1610,7 @@ fn pi_hung_process_is_detected_not_left_running() {
 /// `*DEVFLOW_DELIVERY_CANARY_*` turn (the common prefix; the enum is named
 /// without it) by echoing the token inside an antigravity-shaped
 /// `event:result.response`, so `run_delivery_canary` reaches `Confirmed` at
-/// Define; then:
+/// Plan; then:
 /// - `MarkerStream`: emits a marker stream for real stage turns — the happy
 ///   path.
 /// - `Quiet`: exits 0 with NO events — the marker-less control (ANTG-03).
@@ -1738,9 +1738,8 @@ impl Drop for MonitorReapGuard {
 }
 
 /// ANTG-03: a stubbed `agy` that exits 0 with no stream events must not
-/// advance a COMMIT-GATED stage. Define (not commit-gated) legitimately
-/// advances on exit 0; Plan — a commit-gated stage — produces no marker and
-/// no commits, so it gates instead of advancing to Code.
+/// advance a COMMIT-GATED stage. Plan — a commit-gated stage — produces no
+/// marker and no commits, so it gates instead of advancing to Code.
 #[test]
 fn marker_less_antigravity_never_advances() {
     let home = common::HermeticHome::new();
@@ -1931,7 +1930,7 @@ fn unguarded_monitor_is_detected_by_the_registry() {
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
-    // A HANGING pi keeps the Define monitor alive past the launch — the
+    // A HANGING pi keeps the Plan monitor alive past the launch — the
     // "leaked" shape this control must be able to see.
     let fake_bin = fake_bin_dir(&[("pi", &pi_stub("exec sleep 30\n"))]);
 
@@ -1993,7 +1992,7 @@ fi
 }
 
 /// HRMS-03: a stubbed `hermes` that exits 0 with no marker must not advance a
-/// commit-gated stage. Define advances on exit 0; Plan gates.
+/// commit-gated stage: Plan gates.
 #[test]
 fn hermes_marker_less_run_does_not_advance() {
     let home = common::HermeticHome::new();
