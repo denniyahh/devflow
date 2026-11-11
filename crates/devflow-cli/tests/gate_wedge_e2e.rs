@@ -396,6 +396,99 @@ fn a_rejection_note_reaches_the_capture_prompt_verbatim() {
     assert!(state.get("code_fix_note").is_none(), "{state}");
 }
 
+/// D-26 / D-37 on the capture shape, at a rate-limit gate: a codex run with no
+/// fallback, whose capture fake reports a usage limit with no reset time on its
+/// first launch, waits at a rate-limit gate (no timer: there is no reset).
+/// `gate reject --note` relaunches codex for the same stage, and that relaunch's
+/// logged argv holds the note byte for byte. Control: the first launch's argv
+/// does not hold it.
+#[test]
+fn a_rate_limit_rejection_note_reaches_the_capture_prompt_verbatim() {
+    let home = common::HermeticHome::new();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let logs = tempfile::tempdir().unwrap();
+    let phase = PhaseId::new(4827);
+    init_launchable_repo(root, phase);
+    let _reaper = common::LaunchedRunReaper::new(root, phase, Vec::new());
+    let logs_path = logs.path().to_str().expect("a UTF-8 logs path");
+    // The first launch reports a usage limit with no reset time; the relaunch
+    // fails, so nothing more is launched after it.
+    let fake_bin = common::capture_agent_bin_then(
+        logs.path(),
+        &format!(
+            "if [ ! -e '{logs_path}/launched-once' ]; then\n\
+             : > '{logs_path}/launched-once'\n\
+             echo \"You've hit your usage limit. Upgrade to Pro.\"\n\
+             exit 0\n\
+             fi\n\
+             exit 1"
+        ),
+    );
+    // Plan has finished (its capture is a successful codex turn), so the advance
+    // moves to Code and launches codex there: the first launch.
+    let stdout = devflow_core::agent_result::stdout_path(root, phase);
+    fs::create_dir_all(stdout.parent().unwrap()).unwrap();
+    let plan_capture = Command::new("sh")
+        .arg("-c")
+        .arg(common::CODEX_SUCCESS_EVENTS)
+        .output()
+        .expect("render the codex success events");
+    fs::write(&stdout, &plan_capture.stdout).unwrap();
+    let _child = ReapOnDrop(spawn_gated_advance_as(
+        &home,
+        root,
+        phase,
+        Some(&fake_bin.path),
+        AgentKind::Codex,
+        |state| {
+            state.mode = Mode::Supervise;
+            state.stage = Stage::Plan;
+        },
+    ));
+    let gate: GateFile = serde_json::from_str(
+        &fs::read_to_string(Gates::gate_path(root, phase, Stage::Code)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        gate.gate_kind,
+        Some(devflow_core::gates::GateKind::RateLimit),
+        "the usage limit opened a rate-limit gate: {}",
+        gate.context
+    );
+    assert_eq!(gate.not_before, None, "no reset time, no not-before time");
+    let argv_log = logs.path().join(common::AGENT_ARGV_LOG);
+    let first_launch = fs::read_to_string(&argv_log).expect("the first launch logged its argv");
+    assert!(
+        first_launch.contains("execute-phase"),
+        "the first launch ran Code:\n{first_launch}"
+    );
+
+    let output = answer_code_gate(&home, root, phase, "reject", REJECTION_NOTE);
+    assert!(
+        output.status.success(),
+        "reject failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    common::wait_for(
+        || {
+            fs::read_to_string(&argv_log)
+                .is_ok_and(|argv| argv[first_launch.len()..].contains("execute-phase"))
+        },
+        Duration::from_secs(20),
+        "the relaunched Code agent to log its argv",
+    );
+    let relaunch = fs::read_to_string(&argv_log).unwrap()[first_launch.len()..].to_string();
+    assert!(
+        !first_launch.contains(REJECTION_NOTE),
+        "control: the first launch's argv holds no note:\n{first_launch}"
+    );
+    assert!(
+        relaunch.contains(REJECTION_NOTE),
+        "the relaunch's argv must hold the note byte for byte:\n{relaunch}"
+    );
+}
+
 /// `devflow gate abort` writes an answer whose `abort` field is `true`: the
 /// field, not the note, is what ends the run.
 #[test]

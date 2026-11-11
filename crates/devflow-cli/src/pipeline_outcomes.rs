@@ -9033,6 +9033,122 @@ mod tests {
         HumanNeeded,
     }
 
+    /// A Code-stage Claude run of `phase` at `root` with a confirmed canary and
+    /// `used` as its automatic-relaunch flag, saved and returned.
+    fn rate_limit_parity_state(root: &Path, phase: PhaseId, used: bool) -> State {
+        init_repo(root);
+        phase_dir_fixture(root, phase);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.verification_baseline_captured = true;
+        state.stage = Stage::Code;
+        state.canary = Some(devflow_core::canary::CanaryOutcome::Confirmed);
+        state.rate_limit_auto_relaunch_used = used;
+        workflow::save_state(&state).unwrap();
+        state
+    }
+
+    /// Open a rate-limit gate for a denial with a known reset over `state`,
+    /// answer it with `answer`, and return the gate file as it was opened and
+    /// the launches [`crate::pipeline_launch::LAUNCH_PROBE`] saw on the waiter.
+    fn rate_limit_gate_answered(
+        root: &Path,
+        state: &mut State,
+        answer: &devflow_core::gates::GateResponse,
+    ) -> (GateFile, Vec<(Stage, AgentKind)>) {
+        let phase = state.phase;
+        let mut launches = Vec::new();
+        let (gate, _) = at_the_gate(root, phase, Stage::Code, answer, || {
+            crate::pipeline_launch::LAUNCH_PROBE.set(Some(Vec::new()));
+            let _ = handle_rate_limited_outcome(
+                root,
+                state,
+                phase,
+                Stage::Code,
+                Some("rate limited until 2099-06-18T15:45:30Z".into()),
+            );
+            launches = crate::pipeline_launch::LAUNCH_PROBE
+                .take()
+                .unwrap_or_default();
+        });
+        (serde_json::from_value(gate).unwrap(), launches)
+    }
+
+    /// The approve parity row's launch half for a rate-limit gate (D-38): an
+    /// approve from an unspent flag launches stage S on agent A once and leaves
+    /// the flag unspent; the timer then writes nothing on that gate and the
+    /// count stays 1; a later denial with a known reset is armed. Controls: an
+    /// abort launches nothing, and a later denial over a spent flag is not armed.
+    fn rate_limit_approve_launches_once(row: &str, first: u32) {
+        use crate::pipeline_gate::rate_limit_timer_deadline;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(first);
+        let mut state = rate_limit_parity_state(root, phase, false);
+        let (gate, launches) = rate_limit_gate_answered(root, &mut state, &approve_answer());
+        assert_eq!(
+            launches,
+            [(Stage::Code, AgentKind::Claude)],
+            "{row}: one launch, of Code on Claude"
+        );
+        let after = workflow::load_state(root, phase).unwrap();
+        assert!(
+            !after.rate_limit_auto_relaunch_used,
+            "{row}: an approve does not spend the flag"
+        );
+        let observed = devflow_core::gates::GateId::parse(&gate.gate_id).unwrap();
+        crate::pipeline_launch::LAUNCH_PROBE.set(Some(Vec::new()));
+        let timer = Gates::rate_limit_timer_answer(root, phase, Stage::Code, &observed);
+        assert!(
+            matches!(
+                timer,
+                Err(devflow_core::gates::GateError::AlreadyResponded { .. }
+                    | devflow_core::gates::GateError::NoOpenGate { .. })
+            ),
+            "{row}: the timer writes nothing on an answered gate: {timer:?}"
+        );
+        assert_eq!(
+            crate::pipeline_launch::LAUNCH_PROBE.take(),
+            Some(Vec::new()),
+            "{row}: the launch count stays 1"
+        );
+        // A later denial with a known reset from that state is armed.
+        let mut state = after;
+        let (later, _) = rate_limit_gate_answered(root, &mut state, &abort_answer());
+        assert!(later.not_before.is_some(), "{row}: {later:?}");
+        assert_eq!(
+            rate_limit_timer_deadline(&state, &later),
+            later.not_before,
+            "{row}: a manual approve does not spend the automatic relaunch"
+        );
+
+        // Control: an abort on the same kind of gate launches nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut state = rate_limit_parity_state(root, PhaseId::new(first + 1), false);
+        let (_, launches) = rate_limit_gate_answered(root, &mut state, &abort_answer());
+        assert!(
+            launches.is_empty(),
+            "{row}: control: an abort launches nothing"
+        );
+
+        // Control: a later denial over a spent flag records not_before, unarmed.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut state = rate_limit_parity_state(root, PhaseId::new(first + 2), true);
+        let (spent, _) = rate_limit_gate_answered(root, &mut state, &abort_answer());
+        assert!(spent.not_before.is_some(), "{row}: {spent:?}");
+        assert_eq!(
+            rate_limit_timer_deadline(&state, &spent),
+            None,
+            "{row}: control: a spent flag arms nothing"
+        );
+    }
+
     /// D-45 rule 2, D-39, R10: approving a gate of every kind (and of a file
     /// with no kind) changes state the way `approve_route` says. Each
     /// verification kind is approved over each table row (the stub's fresh
@@ -9202,6 +9318,7 @@ mod tests {
                             resolved[0]
                         );
                     }
+                    rate_limit_approve_launches_once(&row, number + 2);
                 }
                 ParityCase::RejectRefused => {
                     let expected = match kind {
