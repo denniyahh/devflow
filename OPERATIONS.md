@@ -391,7 +391,7 @@ when the run uses `--no-worktree`), and is killed after 60 seconds.
 |---|---|---|
 | `passed` | auto: the run finishes; supervise: the Validate gate, whose approval finishes the run | a gate: the agent and GSD disagree; approving runs Validate again |
 | `gaps_found` | auto: a gap-closure pass: Plan runs `/gsd-plan-phase N --gaps`, then Code runs `/gsd-execute-phase N --gaps-only`, then Validate runs again; supervise: a `gaps_found` gate, whose approval runs that gap-closure pass and never finishes the run, and whose abort (`devflow gate abort`) ends the run | the same |
-| `stale` or `missing` | auto: back to Code with the full execute command, which re-runs the verifier; supervise: a `reverify_needed` gate, and nothing launches until it is answered | the same |
+| `stale` or `missing` | auto: back to Code for the re-verify pass (below); supervise: a `reverify_needed` gate, and nothing launches until it is answered | the same |
 | `human_needed` | a gate in both modes; approving runs Validate again | a gate: the agent and GSD disagree |
 | no answer | a `[never-silent]` gate naming the failure: no launcher, a non-zero exit, a timeout, output that is not JSON, a status outside GSD's set, no phase directory, and the like. It is never a pass and never a silent retry | the same |
 
@@ -405,9 +405,38 @@ run stops at a Plan gate of kind `no_gap_closure_plan`; if the check cannot
 read the plans it stops at a `[never-silent]` `reader_failure` gate. Approving
 either gate reruns the gaps Plan pass, and `devflow gate abort` ends the run.
 
+The re-verify pass. A `stale` or `missing` status says the phase's report is
+out of date or was never written, not that the code has gaps. DevFlow
+relaunches Code with `/gsd-execute-phase N`, telling the agent to resume at the
+phase gates and re-run the verifier, and the prompt quotes GSD's status, route
+and next action as GSD gave them. DevFlow does not read GSD's status when that
+pass ends: Validate runs after it as after any Code pass, and that Validate's
+own read decides. A report that is still `stale` takes the re-verify pass
+again, and the run finishes only over `passed`. A `devflow stop` keeps the
+pass: a stopped re-verify pass resumes as the re-verify pass, and one taken in
+the middle of a gap-closure pass ends that pass, so it resumes as the re-verify
+pass and not as `--gaps-only`.
+
+The re-verify prompt cannot make an agent run the verifier (gsd-core#6096). What
+bounds an agent that skips it is the count: every Validate whose status is
+`stale`, `missing` or `gaps_found` counts one Validate failure, whatever the
+agent said and in either mode, and a Validate counts at most once even when the
+agent also failed. Three such rounds whose commits change nothing outside
+`.planning/` reach the consecutive-failure gate instead of looping.
+
+DevFlow does not check a `gaps_found` report's own digest. A `gaps_found`
+report whose covered files changed after it was written still runs the
+gap-closure pass, whose execute-phase re-verifies at its end. The upstream fix
+is open-gsd/gsd-core#6078. Re-running `/gsd-execute-phase N` by hand refreshes
+the report.
+
 An agent pass over any status but `passed` counts as a Validate failure, so the
 consecutive-failure and per-phase caps still bound the loop; at a cap the run
-stops at a gate whatever the status says. An ambiguous verdict (the external
+stops at a gate whatever the status says. A gaps Plan pass that wrote no
+gap-closure plan counts one failure the same way. When that brings the phase
+to its per-phase ceiling, its `no_gap_closure_plan` gate says so, and an answer
+that continues the run restarts the per-phase count (a
+`phase_failure_budget_reset` event); `devflow gate abort` does not. An ambiguous verdict (the external
 verification probe succeeded but the agent reported gaps or no verdict)
 always stops at a gate. A gate context quotes GSD's status as GSD printed it
 and says `passed` only when GSD reported `passed`.
