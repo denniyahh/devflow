@@ -572,7 +572,11 @@ fn validate_gate_context(
         gsd_status_name(report.status)
     ));
     message.push_str(match kind {
-        GateKind::GapsFound => " Approving or rejecting loops back to Code for a gaps-only pass.",
+        GateKind::GapsFound => {
+            " Approving closes the gaps inside the run: Plan runs `plan-phase --gaps`, then \
+             Code runs the gaps-only pass, then Validate runs again. `devflow gate abort` ends \
+             the run. Finishing over open gaps is not offered."
+        }
         GateKind::ReverifyNeeded => {
             " The report must be re-verified: approving or rejecting relaunches Code with the \
              full execute command."
@@ -806,12 +810,188 @@ pub(crate) fn handle_validate_outcome(
     }
 }
 
-/// After a gaps Plan pass (GATE-03). Skeleton: moves to Code unchecked.
+/// Why a gaps Plan pass's post-check could not establish whether a new gap
+/// plan exists (D-24: never silent).
+#[derive(Debug)]
+enum GapPlanCheckFailure {
+    /// GSD's reader failed: the phase directory, or a plan's `gap_closure`.
+    Reader(ReaderFailure),
+    /// The verification report's or a plan's modified time could not be read.
+    FileTime(String),
+}
+
+impl GapPlanCheckFailure {
+    /// The event-safe name of the failure: no path, no GSD message.
+    fn label(&self) -> &'static str {
+        match self {
+            GapPlanCheckFailure::Reader(failure) => failure.label(),
+            GapPlanCheckFailure::FileTime(_) => "gap_plan_file_time_unreadable",
+        }
+    }
+
+    /// The failure in full, for the gate context and stderr only.
+    fn detail(&self) -> String {
+        match self {
+            GapPlanCheckFailure::Reader(failure) => failure.to_string(),
+            GapPlanCheckFailure::FileTime(detail) => detail.clone(),
+        }
+    }
+}
+
+/// A file's modified time, or why it could not be read.
+fn modified_time(path: &Path) -> Result<std::time::SystemTime, GapPlanCheckFailure> {
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .map_err(|error| {
+            GapPlanCheckFailure::FileTime(format!(
+                "the modified time of {} could not be read: {error}",
+                path.display()
+            ))
+        })
+}
+
+/// Whether `value`, a `gap_closure` frontmatter value as GSD read it, is true.
+/// GSD's own plan reader compares the field with the string `"true"`
+/// (`plan-document.cjs`), and YAML may also give a boolean.
+fn gap_closure_is_true(value: &serde_json::Value) -> bool {
+    matches!(value, serde_json::Value::Bool(true))
+        || value.as_str().is_some_and(|text| text == "true")
+}
+
+/// Whether the phase has a gap-closure plan newer than its verification
+/// report (Pitfall 5, U6): a `*-PLAN.md` in the phase directory whose modified
+/// time is after the report's and whose `gap_closure`, read through GSD's
+/// `frontmatter get`, is true. An earlier round's gap plan predates this
+/// round's report and does not count.
+///
+/// The comparison is on file modified times, the report's against each plan's.
+/// Only plans newer than the report are read through GSD; a plan without the
+/// field (GSD's `Field not found`) is not a gap plan.
+fn has_new_gap_closure_plan(
+    evidence_root: &Path,
+    phase: PhaseId,
+) -> Result<bool, GapPlanCheckFailure> {
+    let dir = gsd_reader::phase_dir(evidence_root, phase).map_err(GapPlanCheckFailure::Reader)?;
+    let report = dir.join(format!("{}-VERIFICATION.md", phase.padded()));
+    let report_time = modified_time(&report)?;
+    let mut plans: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .map_err(|error| {
+            GapPlanCheckFailure::FileTime(format!(
+                "the phase directory {} could not be listed: {error}",
+                dir.display()
+            ))
+        })?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with("-PLAN.md"))
+        })
+        .collect();
+    plans.sort();
+    let mut newer = Vec::new();
+    for plan in plans {
+        if modified_time(&plan)? > report_time {
+            newer.push(plan);
+        }
+    }
+    if newer.is_empty() {
+        return Ok(false);
+    }
+    let home = gsd_home(evidence_root).ok_or_else(|| {
+        GapPlanCheckFailure::Reader(ReaderFailure::LauncherNotFound {
+            home: PathBuf::from("$HOME (unset)"),
+        })
+    })?;
+    for plan in newer {
+        match gsd_reader::frontmatter_field(&home, evidence_root, &plan, "gap_closure") {
+            Ok(value) if gap_closure_is_true(&value) => return Ok(true),
+            Ok(_) => {}
+            Err(ReaderFailure::GsdError { message }) if message == GSD_FIELD_NOT_FOUND => {}
+            Err(failure) => return Err(GapPlanCheckFailure::Reader(failure)),
+        }
+    }
+    Ok(false)
+}
+
+/// GSD's `frontmatter get` error for a field the file does not have
+/// (gsd-core 1.20.1, `cmdFrontmatterGet`).
+const GSD_FIELD_NOT_FOUND: &str = "Field not found";
+
+/// After a gaps Plan pass (GATE-03, Pitfall 5): the pass must have written a
+/// gap-closure plan newer than the verification report, or it counts as a
+/// failure and the run gates with `no_gap_closure_plan`. A check that cannot
+/// tell gates with `reader_failure`, never silently. With a new gap plan the
+/// run moves to Code, whose pass is gaps-only while the marker is set.
+///
+/// Interim until 52-29's `approve_route` (pi C3): both gates are answered like
+/// the gaps gate. Approve reruns the gaps Plan pass with the marker still set,
+/// reject loops back to Code for a gaps-only pass with the note, abort ends
+/// the run.
 pub(crate) fn handle_gaps_plan_outcome(
     project_root: &Path,
     state: &mut State,
 ) -> Result<(), CliError> {
-    transition(project_root, state, Stage::Code)
+    let evidence_root: PathBuf = state
+        .worktree_path
+        .clone()
+        .unwrap_or_else(|| project_root.to_path_buf());
+    let action = match has_new_gap_closure_plan(&evidence_root, state.phase) {
+        Ok(true) => return transition(project_root, state, Stage::Code),
+        Ok(false) => {
+            let context = format!(
+                "The gaps Plan pass wrote no gap-closure plan (`gap_closure: true`) newer than \
+                 the phase's verification report, so there is nothing for the gaps-only pass to \
+                 execute. GSD verification: {}. Approving reruns the gaps Plan pass; `devflow \
+                 gate abort` ends the run.",
+                gsd_status_name(GsdStatus::GapsFound)
+            );
+            run_gate(
+                project_root,
+                state,
+                Stage::Plan,
+                GateKind::NoGapClosurePlan,
+                &context,
+            )?
+        }
+        Err(failure) => {
+            eprintln!(
+                "phase {}: the gaps Plan post-check could not read the phase's plans: {}",
+                state.phase,
+                failure.detail()
+            );
+            let lead = format!(
+                "[never-silent] the gaps Plan post-check could not tell whether a gap-closure \
+                 plan was written ({})",
+                failure.label()
+            );
+            let way_on = " — the run waits here: approving reruns the gaps Plan pass, \
+                          `devflow gate abort` ends the run.";
+            run_gate_with_event_context(
+                project_root,
+                state,
+                Stage::Plan,
+                GateKind::ReaderFailure,
+                &format!("{lead}: {}{way_on}", truncate_reason(&failure.detail())),
+                &format!("{lead}{way_on}"),
+            )?
+        }
+    };
+    match action {
+        GateAction::Advance => {
+            let _ = close_gate(project_root, state.phase, Stage::Plan);
+            state.gate_pending = false;
+            relaunch_failed_stage(project_root, state, Stage::Plan)
+        }
+        GateAction::LoopBack { note, .. } => loop_back_to_code(
+            project_root,
+            state,
+            FixType::GapsOnly,
+            note,
+            LoopBackReason::GateResponse,
+        ),
+        GateAction::Abort(reason) => abort(project_root, state, &reason),
+    }
 }
 
 /// Record one failed Validate on the counters: the per-phase total, the
@@ -898,7 +1078,7 @@ fn answer_validate_gate(
     project_root: &Path,
     state: &mut State,
     action: GateAction,
-    _kind: GateKind,
+    kind: GateKind,
     round: (AgentVerdict, &ValidateRead),
     budget: (bool, bool),
 ) -> Result<(), CliError> {
@@ -908,6 +1088,17 @@ fn answer_validate_gate(
         // D-07: the ceiling fires a gate and the run stays alive. Every arm
         // below is the same set of choices an ordinary Validate gate offers —
         // reaching the ceiling adds no abort path.
+        // D-36 (interim until 52-29's `approve_route`, D-45 rule 2): approving
+        // the gate whose kind is `gaps_found` runs the gap-closure pass and never
+        // finishes. Keyed on the gate's kind, never on the status its context
+        // quotes. The round was counted when its Validate ended, so the approve
+        // counts nothing.
+        GateAction::Advance if kind == GateKind::GapsFound => {
+            reset_phase_failures_at_ceiling(project_root, state, ceiling_gate)?;
+            let _ = close_gate(project_root, state.phase, Stage::Validate);
+            state.gate_pending = false;
+            transition(project_root, state, Stage::Plan)
+        }
         GateAction::Advance => {
             reset_phase_failures_at_ceiling(project_root, state, ceiling_gate)?;
             match approve_route(verdict, read) {
