@@ -670,6 +670,19 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.232: `health_fails_closed_on_a_hung_probe` Flakes on Its Descendant-Dead Check Under Load (BACKLOG)
+
+**Found:** 2026-11-11, Phase 52 close-out: the `workspace/denniyahh` pre-push container gate failed 1 of 1079
+devflow-core lib tests, "the timed-out health probe's sleep descendant must be dead: pid 28442"
+(`crates/devflow-core/src/agents/opencode.rs`, the assertion after `run_test_in_child`).
+**Evidence:** the same code passed GitHub CI on PR #236 and the PR branch's own container gate the same day; 20 of 20
+isolated host runs passed. The test is unchanged since 8b534d9 (2026-09-16).
+**Not established:** the cause or a rate. Suspected: the assertion checks `agent_running(pid)` once, immediately after
+the child test exits, while the killed `sleep` may not be gone yet under full parallel load; or the fork-inherits-fd
+family of 999.221-999.223.
+**Fix shape:** wait (bounded, ~2 s) for the descendant to be gone before asserting, as 999.223 proposes for its own
+liveness check; then run the test 50x under `scripts/check-in-container.sh` load. Fold into the 999.221-999.223 fix branch.
+
 ### Phase 999.231: `pre-push` Runs the Workspace Divergence Check Against the Checkout, Not the Pushed Ref (BACKLOG)
 
 **Found:** 2026-11-11, Phase 52 close-out. `git push -u origin feature/phase-52-pr` from the phase-52 worktree with
