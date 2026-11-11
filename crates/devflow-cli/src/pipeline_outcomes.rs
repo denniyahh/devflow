@@ -1964,9 +1964,11 @@ const GSD_FIELD_NOT_FOUND: &str = "Field not found";
 /// words, and an approve or reject resets the count through
 /// [`reset_phase_failures_at_ceiling`]; an abort resets nothing.
 ///
-/// Interim until 52-29's `approve_route` (pi C3): both gates are answered like
-/// the gaps gate. Approve reruns the gaps Plan pass with the marker still set,
-/// reject loops back to Code for a gaps-only pass with the note, abort ends
+/// Both gates are verification gates, answered like every other one through
+/// [`approve_route`] and [`reject_route`] (52-29). Approve reads GSD again and
+/// follows [`next_step`]'s approve row at Plan: a fresh `gaps_found` reruns the
+/// gaps Plan pass with the marker still set. Reject runs `/gsd-quick` with the
+/// note, then Validate, and its loop-back clears the gap marker. Abort ends
 /// the run.
 pub(crate) fn handle_gaps_plan_outcome(
     project_root: &Path,
