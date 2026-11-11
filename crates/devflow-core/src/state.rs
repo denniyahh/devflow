@@ -771,15 +771,16 @@ mod tests {
         assert!(err.to_string().contains("aider"));
     }
 
+    /// CUT-01: a fresh run starts at Plan, not Define.
     #[test]
-    fn new_state_starts_at_define() {
+    fn new_state_starts_at_plan() {
         let state = State::new(
             PhaseId::new(2),
             AgentKind::Claude,
             Mode::Auto,
             PathBuf::from("/repo"),
         );
-        assert_eq!(state.stage, Stage::Define);
+        assert_eq!(state.stage, Stage::Plan);
         assert_eq!(state.phase, PhaseId::new(2));
         assert_eq!(state.agent, AgentKind::Claude);
         assert_eq!(state.mode, Mode::Auto);
@@ -807,7 +808,7 @@ mod tests {
         let back: State = serde_json::from_str(&json).unwrap();
         assert_eq!(back.phase, PhaseId::new(9));
         assert_eq!(back.agent, AgentKind::Codex);
-        assert_eq!(back.stage, Stage::Define);
+        assert_eq!(back.stage, Stage::Plan);
         assert_eq!(back.mode, Mode::Supervise);
     }
 
