@@ -163,6 +163,19 @@ than split: no requirement dependency forces a split, and the Validate-gate desi
 - [x] 52-33-PLAN.md
 **UI hint**: no
 
+### Phase 52.1: Stabilize for Dogfooding (INSERTED)
+
+**Goal:** Make DevFlow stable enough to resume dogfooding: a supervised run can drive a phase from Plan to a finished
+Validate without hand-run stages or hand-edited state. Not dogfooded itself (operator, 2026-11-11).
+**Candidate scope (agent recommendation, for discuss to settle; not an operator decision):** the test flakes 999.221,
+999.222, 999.223 and 999.232; the `--force` redesign 999.224; the close-out script defects 999.230 and 999.231.
+**Requirements**: TBD
+**Depends on:** Phase 52
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (run /gsd-plan-phase 52.1 to break down)
+
 ### Phase 53: The Question Channel
 
 **Goal**: An agent running under DevFlow asks DevFlow instead of a human. DevFlow serves an MCP tool, `devflow_ask`,
@@ -171,8 +184,9 @@ agent in the same session. The one policy this phase ships, "operator via gate",
 operator answers from the shell, with the notify hook firing as for any gate. Every stage prompt sends decision
 checkpoints, `blocking-human` gates and GSD discuss questions through the tool, and every question and answer is on
 the event log.
-**Depends on**: Phase 52 — the stage set must be final before every stage prompt is rewritten (ASK-03), and the
-checkpoint auto-decide relaunch that ASK-05 replaces is only worth replacing on the cut tree.
+**Depends on**: Phase 52.1 (and through it Phase 52) — the stage set must be final before every stage prompt is rewritten (ASK-03), and the
+checkpoint auto-decide relaunch that ASK-05 replaces is only worth replacing on the cut tree. Phase 52.1 must make DevFlow
+stable enough to dogfood this phase (operator, 2026-11-11).
 **Sequencing note**: The first unknown of the milestone lives here: how each supported agent consumes an MCP tool
 (stdio server registration, tool discovery, blocking-call semantics). It is a spike in this phase's discuss step
 (operator, 2026-11-08), not research done up front. Only the agents the rotation needs are proven live; the rest are
@@ -443,6 +457,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 53 | 0/? | Not started | — |
 | 54 | 0/? | Not started | — |
 | 55 | 0/? | Not started | — |
+| 52.1. Stabilize for Dogfooding | 0/0 | Not started | - |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
 
