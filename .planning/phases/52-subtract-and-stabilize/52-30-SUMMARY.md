@@ -237,3 +237,7 @@ Ready for 52-31 and 52-32. Whoever adds a gate writer: bound reasons with `trunc
 ---
 *Phase: 52-subtract-and-stabilize*
 *Completed: 2026-11-11*
+
+## Self-Check: PASSED
+
+All key files exist on disk. Commits 14f3872, 8d1429d, db531b9, 92673eb and 3357ae8 are ancestors of HEAD.

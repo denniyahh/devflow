@@ -44,7 +44,7 @@ requirement closes a backlog entry, the entry is named; `.planning/user/V4-CUT-I
       report says otherwise. DevFlow follows GSD's routes and does not re-judge GSD's report: a run finishes only
       when GSD reports `passed` and the Validate agent passed on the current commit. Closes 999.193, 999.205.
       (Amended 2026-11-09 by the operator, 52-CONTEXT D-45: 999.208 moves to gsd-core #6078.)
-- [ ] **GATE-04**: `devflow gate show` prints a failure gate's full reason, and the banner and `gate list` cut keeps the
+- [x] **GATE-04**: `devflow gate show` prints a failure gate's full reason, and the banner and `gate list` cut keeps the
       "way on" sentence first. Closes 999.206.
 
 ### Operator surface (OPS)
@@ -137,7 +137,7 @@ Populated during roadmap creation (2026-11-08). Phase order and dependencies: RO
 | GATE-01 | Phase 52 — Subtract and Stabilize | Complete |
 | GATE-02 | Phase 52 — Subtract and Stabilize | Complete |
 | GATE-03 | Phase 52 — Subtract and Stabilize | Complete |
-| GATE-04 | Phase 52 — Subtract and Stabilize | Pending |
+| GATE-04 | Phase 52 — Subtract and Stabilize | Complete |
 | OPS-01 | Phase 52 — Subtract and Stabilize | Complete |
 | OPS-02 | Phase 52 — Subtract and Stabilize | Complete |
 | OPS-03 | Phase 52 — Subtract and Stabilize | Complete |
