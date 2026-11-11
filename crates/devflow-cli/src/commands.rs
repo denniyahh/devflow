@@ -214,17 +214,20 @@ pub(crate) fn ensure_base_is_a_local_branch(
 /// a restart. The total still restarts at zero, because there is nothing else
 /// it could do, but the operator is told so rather than left to infer it.
 ///
-/// **The two events that DO reset the total**, neither of which is "a new
+/// **The three events that DO reset the total**, none of which is "a new
 /// process started":
 ///
 /// 1. **State removal** — `workflow::clear_state` deletes
 ///    `.devflow/state-{NN}.json` (an abort does, and so does `cleanup --force`
 ///    with the run's worktree), so the next start for this phase finds nothing
-///    to carry. No code here. A finished run keeps its state, so a `start` over
-///    it carries the total (the replace notice names the finished run).
+///    to carry. No code here.
 /// 2. **Operator approval at the ceiling gate** — `handle_validate_outcome`
 ///    zeroes the total when a human advances or loops back AND
 ///    `mode::phase_failure_ceiling_reached` is true.
+/// 3. **A finished run** — a finish keeps its state, but a `start` over a
+///    state recorded `finished` begins at zero, because that run passed
+///    Validate (operator decision, 2026-11-11). A stopped run that did not
+///    finish still carries its total.
 pub(crate) fn fresh_state_carrying_phase_failures(
     project_root: &Path,
     phase: PhaseId,
@@ -291,11 +294,11 @@ fn carried_phase_failures(
     loaded: Result<State, workflow::WorkflowError>,
 ) -> (u32, Option<String>) {
     match loaded {
+        // A finished run passed Validate, so its failures say nothing about
+        // the next run (operator decision, 2026-11-11).
+        Ok(persisted) if persisted.finished => (0, None),
         Ok(persisted) => (persisted.phase_validate_failures, None),
-        // Genuine zero: a phase's first start, or one whose completion already
-        // cleared the file.
-        // Genuine zero: a phase's first start, or one whose completion already
-        // cleared the file.
+        // Genuine zero: a phase's first start, or one whose state was removed.
         Err(workflow::WorkflowError::MissingState(_)) => (0, None),
         Err(err) => (
             0,
