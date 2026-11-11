@@ -670,6 +670,23 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.222: The GSD Test Stub Can Fail to Exec With "Text file busy" (BACKLOG)
+
+**Found:** 2026-11-11, Phase 52 plan 52-24, first `scripts/check.sh all` run (`cargo test --workspace`, devflow-core
+lib: 1062 passed, 1 failed). `gsd_reader::tests::a_gaps_found_report_reads_as_gaps_found` failed at
+`crates/devflow-core/src/gsd_reader.rs` ~L712 with `Spawn { message: "Text file busy (os error 26)" }`.
+**Evidence:** 1 failure; then 3/3 isolated reruns and the next full `check.sh all` passed. 52-24 touched neither
+`gsd_reader.rs` nor `test_support.rs`. `test_support::plant_gsd_run_stub` (~L374) writes the launcher script with
+`fs::write` and the reader executes it straight after, while other test threads fork children.
+
+**Not established:** the cause. Suspected: a child forked by another thread between the stub's open and close inherits
+the write fd until its own `exec`, so exec of the stub gets `ETXTBSY`. Same fork-inherits-fd family as 999.221. Not
+reproduced on demand.
+
+**Fix shape:** write the stub to a temp name in the same directory, close it, and `rename` it into place (the exec'd
+inode was never open for writing), or retry the spawn on `ETXTBSY` in test builds only. Small: the next Phase 52 plan
+that touches `plant_gsd_run_stub` (52-27 or 52-29), else any fix branch.
+
 ### Phase 999.221: `status_and_doctor_name_a_held_state_write_lock` Flakes on Its "Released" Control (BACKLOG)
 
 **Found:** 2026-11-10, Phase 52 wave 7 post-merge gate (`cargo test`, whole workspace). The test (added in
