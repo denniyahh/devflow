@@ -1681,6 +1681,44 @@ mod tests {
         );
     }
 
+    /// A state file written before 52-24 carries the verification-window keys
+    /// of the report-authorship heuristic v4.0 removed. It must still load, the
+    /// three removed keys must not come back on the next save, and the kept
+    /// `verification_baseline_captured` (which `devflow resume` reads to tell a
+    /// prepared run from a reservation) keeps its value.
+    #[test]
+    fn a_state_with_the_removed_verification_fields_still_loads() {
+        let removed = [
+            "last_verification_fingerprint",
+            "last_verification_mtime_nanos",
+            "verification_run_nonce",
+        ];
+        let json = r#"{
+            "stage": "validate",
+            "phase": 1,
+            "agent": "claude",
+            "mode": "auto",
+            "started_at": "0",
+            "project_root": "/repo",
+            "last_verification_fingerprint": 81985529216486895,
+            "verification_baseline_captured": true,
+            "last_verification_mtime_nanos": 1794380000000000000,
+            "verification_run_nonce": 3
+        }"#;
+        let loaded: State =
+            serde_json::from_str(json).expect("a state with the removed keys must load");
+        assert_eq!(loaded.stage, Stage::Validate);
+        assert!(loaded.verification_baseline_captured);
+        let saved = serde_json::to_string(&loaded).unwrap();
+        for key in removed {
+            assert!(
+                !saved.contains(key),
+                "the removed key {key} is dropped on save: {saved}"
+            );
+        }
+        assert!(saved.contains("verification_baseline_captured"), "{saved}");
+    }
+
     /// 20c: `stop_until`/`stopped`/`stop_reason` all round-trip through
     /// serde — each field's own key appears in the persisted JSON, and a
     /// fresh deserialize recovers the exact values set.
