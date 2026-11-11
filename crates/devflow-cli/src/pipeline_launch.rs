@@ -126,7 +126,11 @@ pub(crate) fn default_stage_prompt(state: &State, driver: &dyn agents::AgentDriv
                 .or(state.gap_closure_pass.then_some(prompt::FixType::GapsOnly)),
             fix_note: state.code_fix.and(state.code_fix_note.clone()),
             relaunch_note: state.relaunch_note.clone(),
-            reverify_report: None,
+            // D-32 part 1: a resumed re-verify pass quotes GSD's recorded words.
+            reverify_report: state
+                .code_fix
+                .filter(|fix| *fix == prompt::FixType::StaleReverify)
+                .and(state.code_fix_report.clone()),
         },
         stage => {
             prompt::StageIntent::for_stage_in_project(stage, state.phase, Some(&state.project_root))
@@ -11253,6 +11257,7 @@ mod tests {
                 &mut state,
                 fix,
                 note.map(str::to_string),
+                None,
                 crate::pipeline_gate::LoopBackReason::GateResponse,
             )
             .unwrap();

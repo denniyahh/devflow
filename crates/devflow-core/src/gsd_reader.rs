@@ -74,6 +74,8 @@ pub struct StatusReport {
     /// GSD's bare route command (`plan-phase`, `execute-phase`, ...), empty
     /// when GSD names none.
     pub route: String,
+    /// GSD's `next_action` text, `None` when GSD's answer had none.
+    pub next_action: Option<String>,
     /// The covered files GSD saw move (GSD omits the key when none did).
     pub moved_files: Vec<String>,
 }
@@ -442,6 +444,17 @@ fn classify(value: &Value) -> Result<StatusReport, ReaderFailure> {
         }
     };
     let route = required_str(value, "route")?.to_owned();
+    // GSD writes `next_action` beside every status; absent, it is `None`,
+    // and present, it must be a string.
+    let next_action = match value.get("next_action") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(text)) => Some(text.clone()),
+        Some(_) => {
+            return Err(ReaderFailure::MissingField {
+                key: "next_action".to_owned(),
+            });
+        }
+    };
     // GSD omits `moved_files` when no covered file moved; present, it must be
     // a list of strings.
     let moved_files = match value.get("moved_files") {
@@ -462,6 +475,7 @@ fn classify(value: &Value) -> Result<StatusReport, ReaderFailure> {
     Ok(StatusReport {
         status,
         route,
+        next_action,
         moved_files,
     })
 }
@@ -703,6 +717,13 @@ mod tests {
         assert_eq!(report.status, GsdStatus::Stale);
         assert_eq!(report.route, "execute-phase");
         assert_eq!(report.moved_files, vec!["a.txt".to_owned()]);
+        let recorded: Value = serde_json::from_str(STALE_JSON).unwrap();
+        assert_eq!(
+            report.next_action.as_deref(),
+            recorded["next_action"].as_str(),
+            "GSD's next action is read verbatim"
+        );
+        assert!(report.next_action.is_some());
     }
 
     #[test]
