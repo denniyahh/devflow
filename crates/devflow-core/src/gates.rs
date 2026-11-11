@@ -1702,6 +1702,19 @@ pub fn fire_gate_notify_with_fallback(
 /// The environment variable that configures the gate notify hook.
 pub const GATE_NOTIFY_CMD_ENV: &str = "DEVFLOW_GATE_NOTIFY_CMD";
 
+/// The characters of a gate's context an operator is shown: the pending-gate
+/// banner, `devflow gate list` and the notify hook's `DEVFLOW_GATE_CONTEXT`
+/// (GATE-04). The context is stored whole, up to the CLI's stored bound, and
+/// `devflow gate show` prints all of it; this bound keeps every other
+/// rendering, and a notification in particular, to a readable start. Every
+/// gate's context leads with its way-on sentence, so the bound holds that
+/// sentence and the cause after it. The idle-timeout cause clause is budgeted
+/// to close inside it behind the longest such sentence
+/// ([`crate::agent_result::MAX_IDLE_TIMEOUT_CLAUSE_CHARS`]); the CLI test
+/// `the_budgeted_idle_timeout_clause_closes_inside_the_gate_display_bound`
+/// pins the two together.
+pub const GATE_CONTEXT_DISPLAY_CHARS: usize = 450;
+
 /// Apply the operator's `DEVFLOW_GATE_NOTIFY_CMD` to a run's persisted notify
 /// command. `devflow start`, `resume` and `advance` all call this, so the
 /// state file is the one place a run's command lives (49-REVIEW.md CR-03):
@@ -2980,6 +2993,53 @@ mod tests {
         let cmd = format!("touch {}", sentinel.display());
         run_notify_command(&cmd, PhaseId::new(11), Stage::Validate, "ctx", false);
         assert!(sentinel.exists());
+    }
+
+    /// GATE-04, Pitfall 6: a context stored whole must not put kilobytes into
+    /// a notification. The hook's `DEVFLOW_GATE_CONTEXT` is the context cut to
+    /// [`GATE_CONTEXT_DISPLAY_CHARS`] characters at a character boundary, with
+    /// the display's truncation suffix; a context of exactly the bound, with
+    /// multi-byte characters, arrives unchanged.
+    #[test]
+    fn notify_context_is_capped_at_the_display_bound() {
+        const SUFFIX: &str = "… [truncated; full output in .devflow/]";
+        let dir = tempfile::tempdir().unwrap();
+        let recorded = dir.path().join("context");
+        let cmd = format!(
+            "printf '%s' \"$DEVFLOW_GATE_CONTEXT\" > '{}'",
+            recorded.display()
+        );
+        let notified = |context: &str| {
+            run_notify_command(&cmd, PhaseId::new(11), Stage::Code, context, true);
+            std::fs::read_to_string(&recorded).expect("the hook recorded its context")
+        };
+
+        let long = "é".repeat(4000);
+        let sent = notified(&long);
+        assert_eq!(sent.chars().count(), GATE_CONTEXT_DISPLAY_CHARS, "{sent}");
+        assert!(sent.ends_with(SUFFIX), "{sent}");
+        assert_eq!(
+            sent.strip_suffix(SUFFIX).unwrap(),
+            "é".repeat(GATE_CONTEXT_DISPLAY_CHARS - SUFFIX.chars().count()),
+            "the cut keeps whole characters"
+        );
+
+        let at_bound: String = "aé…"
+            .chars()
+            .cycle()
+            .take(GATE_CONTEXT_DISPLAY_CHARS)
+            .collect();
+        assert_eq!(
+            notified(&at_bound),
+            at_bound,
+            "a context at the bound is unchanged"
+        );
+        let one_over = format!("{at_bound}x");
+        assert_eq!(
+            notified(&one_over).chars().count(),
+            GATE_CONTEXT_DISPLAY_CHARS,
+            "one character over is cut to the bound"
+        );
     }
 
     #[test]

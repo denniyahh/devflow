@@ -5246,6 +5246,101 @@ mod tests {
         );
     }
 
+    /// GATE-04 (999.206): a failure cause far longer than the display bound is
+    /// stored whole in the failure gate's context, after the way-on sentence.
+    #[test]
+    fn a_long_failure_reason_is_stored_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::new(
+            PhaseId::new(5230),
+            AgentKind::Claude,
+            Mode::Auto,
+            dir.path().to_path_buf(),
+        );
+        let cause = format!("{}END", "a check kept failing; ".repeat(50))
+            .chars()
+            .take(1000)
+            .collect::<String>();
+        assert_eq!(cause.chars().count(), 1000);
+        let context = failure_gate_context(&state, Stage::Code, Some(cause.clone()));
+        assert!(
+            context.ends_with(&format!(" stage code failed: {cause}")),
+            "the whole cause is stored, last: {context}"
+        );
+        assert!(
+            context.chars().count() > crate::commands::GATE_CONTEXT_DISPLAY_CHARS,
+            "control: the context is longer than what the banner shows"
+        );
+    }
+
+    /// The stored bound's edges, counted in characters, never bytes: a reason
+    /// of exactly [`GATE_CONTEXT_STORED_MAX_CHARS`] characters, multi-byte ones
+    /// among them, is stored unchanged; one character more, with multi-byte
+    /// characters at the cut, is cut at a character boundary to exactly the
+    /// bound, ending in the truncation suffix.
+    #[test]
+    fn a_context_at_the_stored_cap_is_unchanged_and_one_over_is_cut_at_a_char_boundary() {
+        const SUFFIX: &str = "… [truncated; full output in .devflow/]";
+        let at_cap: String = "aé…"
+            .chars()
+            .cycle()
+            .take(GATE_CONTEXT_STORED_MAX_CHARS)
+            .collect();
+        assert!(
+            at_cap.len() > GATE_CONTEXT_STORED_MAX_CHARS,
+            "control: the text is longer in bytes than in characters"
+        );
+        assert_eq!(truncate_reason(&at_cap), at_cap);
+
+        let one_over = "é".repeat(GATE_CONTEXT_STORED_MAX_CHARS + 1);
+        let cut = truncate_reason(&one_over);
+        assert_eq!(cut.chars().count(), GATE_CONTEXT_STORED_MAX_CHARS);
+        assert!(cut.ends_with(SUFFIX), "the cut must end in the suffix");
+        let head = cut.strip_suffix(SUFFIX).unwrap();
+        assert_eq!(
+            head,
+            "é".repeat(GATE_CONTEXT_STORED_MAX_CHARS - SUFFIX.chars().count()),
+            "the cut keeps whole characters"
+        );
+        assert!(std::str::from_utf8(cut.as_bytes()).is_ok());
+    }
+
+    /// C2: the failure gate's context leads with the sentence the routers
+    /// render for that gate, after the never-silent marker; an empty cause
+    /// yields that sentence alone.
+    #[test]
+    fn the_failure_context_leads_with_the_way_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(5231);
+        let state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Auto,
+            dir.path().to_path_buf(),
+        );
+        let sentence = way_on_sentence(GateKind::StageFailure, phase, Stage::Code, None);
+        let context = failure_gate_context(&state, Stage::Code, Some("the build broke".into()));
+        assert_eq!(
+            context,
+            format!("[never-silent] {sentence} stage code failed: the build broke")
+        );
+        assert_eq!(
+            lead_with_way_on(GateKind::StageFailure, (phase, Stage::Code), None, ""),
+            sentence,
+            "an empty cause yields the sentence alone"
+        );
+        assert_eq!(
+            lead_with_way_on(
+                GateKind::StageFailure,
+                (phase, Stage::Code),
+                None,
+                "[never-silent] "
+            ),
+            format!("[never-silent] {sentence}"),
+            "a marker with an empty cause yields the marker and the sentence"
+        );
+    }
+
     #[test]
     fn gate_context_rendering_neutralizes_all_controls_and_obeys_limit() {
         let rendered = render_gate_context("line 1\n\u{1b}[2J\tline 2\u{7}", 100);
