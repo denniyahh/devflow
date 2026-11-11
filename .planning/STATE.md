@@ -5,16 +5,16 @@ milestone_name: Session Continuity
 current_phase: 52
 current_phase_name: Subtract and Stabilize
 status: executing
-stopped_at: Completed 52-21-PLAN.md
-last_updated: "2026-11-11T05:42:27.966Z"
+stopped_at: Completed 52-22-PLAN.md
+last_updated: "2026-11-11T06:58:56.500Z"
 last_activity: 2026-11-10
 last_activity_desc: Phase 52 execution started
-state_head: b590f7c0918009768c5c313abc19bc986b6f777a
+state_head: 56fc1ebe8246898263bf495d835a4d20ddbd75d6
 progress:
   total_phases: 4
   completed_phases: 0
   total_plans: 33
-  completed_plans: 21
+  completed_plans: 22
   percent: 0
 ---
 
@@ -159,7 +159,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 52 (Subtract and Stabilize) — EXECUTING
-Plan: 22 of 33
+Plan: 23 of 33
 Status: Ready to execute
 Last activity: 2026-11-10 — Phase 52 execution started
 
@@ -872,6 +872,7 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 52]: 52-19: a gate answer aborts only through its abort field (gate abort, gate sweep, devflow stop); a note never changes the action, and an answer that approves and aborts is refused when written and read as an abort
 - [Phase 52]: 52-20: gsd_reader runs gsd_run by argv in the evidence root (GIT_* removed, HOME set to the launcher home, 60 s kill-and-reap deadline); every answer is one of five GsdStatus values or a named ReaderFailure, exit 0 is not success, and events carry only ReaderFailure::label()
 - [Phase 52]: 52-21: the build-provenance Warn arm is silent on any project that is not DevFlow's own checkout; a project with no origin remote gets one line and skips the fetch, while a remote that exists but cannot be fetched keeps both lines
+- [Phase 52]: 52-22: Validate passes only when the agent says pass and gsd query verification status (read in the worktree) says passed; every other status and every reader failure routes through validate_route, a reader failure is a never-silent gate, an agent PASS records State.validate_pass_head, and every gate records a required GateKind
 
 ## Roadmap Evolution
 
@@ -1004,11 +1005,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 52 P19 | 25 min | 3 tasks | 17 files |
 | Phase 52 P20 | 20 min | 3 tasks | 3 files |
 | Phase 52 P21 | 11 min | 2 tasks | 2 files |
+| Phase 52 P22 | 59 min | 4 tasks | 24 files |
 
 ## Session
 
-**Last session:** 2026-11-11T05:42:27.743Z
-**Stopped at:** Completed 52-21-PLAN.md
+**Last session:** 2026-11-11T06:58:47.347Z
+**Stopped at:** Completed 52-22-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
