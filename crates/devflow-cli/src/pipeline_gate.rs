@@ -354,6 +354,7 @@ pub(crate) fn prepare_loop_back_to_code(
             fix: Some(fix),
             fix_note: note,
             relaunch_note: None,
+            reverify_report: None,
         },
     ))
 }

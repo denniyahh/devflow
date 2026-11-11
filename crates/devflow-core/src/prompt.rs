@@ -185,6 +185,10 @@ pub enum StageIntent {
         fix_note: Option<String>,
         /// The operator's note for this relaunch of the stage, if any.
         relaunch_note: Option<String>,
+        /// What GSD said when Validate chose the re-verify pass, quoted by
+        /// that pass's prompt; read only when `fix` is
+        /// [`FixType::StaleReverify`].
+        reverify_report: Option<ReverifyReport>,
     },
     Validate {
         phase: PhaseId,
@@ -229,6 +233,7 @@ impl StageIntent {
                 fix: None,
                 fix_note: None,
                 relaunch_note: None,
+                reverify_report: None,
             },
             Stage::Validate => StageIntent::Validate {
                 phase,
@@ -360,6 +365,29 @@ pub enum FixType {
     /// `{N}-VERIFICATION.md` yet has not been judged, so `--gaps-only` would
     /// match zero plans and gate unresolvably.
     FullExecute,
+    /// The re-verify pass (D-32 part 1, GATE-03): Validate read GSD's `stale`
+    /// or `missing`, so the report must be written again against the current
+    /// code. Code runs `/gsd-execute-phase {N}`, told to resume at the phase
+    /// gates and re-run the verifier (gsd-core#4682), with GSD's status, route
+    /// and next action quoted from [`State::code_fix_report`]. It is not the
+    /// gaps-only command.
+    ///
+    /// [`State::code_fix_report`]: crate::state::State::code_fix_report
+    StaleReverify,
+}
+
+/// What GSD said about the phase when Validate chose the re-verify pass
+/// ([`FixType::StaleReverify`]), quoted into that pass's prompt verbatim:
+/// GSD's status name, its bare route and its `next_action` text. Persisted
+/// beside the fix pass so a resumed re-verify pass quotes the same words.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReverifyReport {
+    /// GSD's status name, as GSD wrote it (`stale`, `missing`).
+    pub status: String,
+    /// GSD's bare route command (`execute-phase`), empty when GSD named none.
+    pub route: String,
+    /// GSD's `next_action` text, `None` when GSD's answer had none.
+    pub next_action: Option<String>,
 }
 
 /// Substitute the `{N}` phase placeholder in a GSD command string.
@@ -518,6 +546,7 @@ pub fn render_claude_style(intent: &StageIntent) -> String {
             fix: None,
             fix_note,
             relaunch_note,
+            ..
         } => code_stage_prompt(
             *phase,
             &note_blocks(fix_note.as_deref(), relaunch_note.as_deref()),
@@ -527,9 +556,11 @@ pub fn render_claude_style(intent: &StageIntent) -> String {
             fix: Some(fix),
             fix_note,
             relaunch_note,
+            reverify_report,
         } => fix_prompt_with_notes(
             *fix,
             *phase,
+            reverify_report.as_ref(),
             &note_blocks(fix_note.as_deref(), relaunch_note.as_deref()),
         ),
         StageIntent::Validate {
@@ -575,9 +606,11 @@ pub fn render_workflow_style(intent: &StageIntent, workflow_root: &str) -> Strin
             fix,
             fix_note,
             relaunch_note,
+            reverify_report,
         } => workflow_code_prompt(
             *phase,
             *fix,
+            reverify_report.as_ref(),
             workflow_root,
             &note_blocks(fix_note.as_deref(), relaunch_note.as_deref()),
         ),
@@ -634,7 +667,7 @@ fn workflow_gaps_plan_prompt(phase: PhaseId, workflow_root: &str, notes: &str) -
 /// be classified here rather than falling into either answer by default.
 fn code_policy_applies_to_fix_arm(fix: Option<FixType>) -> bool {
     match fix {
-        Some(FixType::FullExecute) | None => true,
+        Some(FixType::FullExecute | FixType::StaleReverify) | None => true,
         Some(FixType::GapsOnly) => false,
     }
 }
@@ -642,6 +675,7 @@ fn code_policy_applies_to_fix_arm(fix: Option<FixType>) -> bool {
 fn workflow_code_prompt(
     phase: PhaseId,
     fix: Option<FixType>,
+    _reverify_report: Option<&ReverifyReport>,
     workflow_root: &str,
     notes: &str,
 ) -> String {
@@ -651,7 +685,7 @@ fn workflow_code_prompt(
             phase {phase} --auto --gaps-only. The `--auto` and `--gaps-only` flags are part \
             of the workflow invocation and must be preserved verbatim."
         ),
-        Some(FixType::FullExecute) | None => format!(
+        Some(FixType::FullExecute | FixType::StaleReverify) | None => format!(
             "Read and follow the GSD workflow file at {workflow_root}/execute-phase.md for \
             phase {phase} --auto. The `--auto` flag is part of the workflow invocation and \
             must be preserved verbatim."
@@ -753,18 +787,23 @@ pub fn checkpoint_auto_decide_prompt(phase: PhaseId) -> String {
 /// is rendered through [`note_block`] with [`FIX_NOTE_INTRODUCTION`], just
 /// before the completion protocol (GATE-01, D-14).
 pub fn fix_prompt(fix_type: FixType, phase: PhaseId, note: Option<&str>) -> String {
-    fix_prompt_with_notes(fix_type, phase, &note_blocks(note, None))
+    fix_prompt_with_notes(fix_type, phase, None, &note_blocks(note, None))
 }
 
 /// [`fix_prompt`] with its note blocks already rendered by [`note_blocks`], so
 /// a fix pass relaunched after a stage-failure reject carries the relaunch
 /// note after the fix request.
-fn fix_prompt_with_notes(fix_type: FixType, phase: PhaseId, notes: &str) -> String {
+fn fix_prompt_with_notes(
+    fix_type: FixType,
+    phase: PhaseId,
+    _reverify_report: Option<&ReverifyReport>,
+    notes: &str,
+) -> String {
     let command = match fix_type {
         FixType::GapsOnly => {
             format!("/gsd-execute-phase {phase} --gaps-only {AUTO_CHAIN_PRESERVING_FLAG}")
         }
-        FixType::FullExecute => {
+        FixType::FullExecute | FixType::StaleReverify => {
             format!("/gsd-execute-phase {phase} {AUTO_CHAIN_PRESERVING_FLAG}")
         }
     };
@@ -913,6 +952,7 @@ mod tests {
                 fix: None,
                 fix_note: None,
                 relaunch_note: None,
+                reverify_report: None,
             },
             "/workflows",
         );
@@ -936,6 +976,7 @@ mod tests {
                 fix: Some(FixType::GapsOnly),
                 fix_note: None,
                 relaunch_note: None,
+                reverify_report: None,
             },
             "/workflows",
         );
@@ -961,6 +1002,7 @@ mod tests {
             fix: Some(FixType::GapsOnly),
             fix_note: None,
             relaunch_note: None,
+            reverify_report: None,
         });
 
         for prompt in [stage_prompt(Stage::Validate, phase), gaps_only] {
@@ -1018,6 +1060,7 @@ mod tests {
             fix: Some(FixType::FullExecute),
             fix_note: None,
             relaunch_note: None,
+            reverify_report: None,
         };
         let mut visited: Vec<AgentKind> = Vec::new();
         let mut controls_seen = 0;
@@ -1087,6 +1130,7 @@ mod tests {
                 fix: None,
                 fix_note: None,
                 relaunch_note: None,
+                reverify_report: None,
             },
             "/workflows",
         );
@@ -1159,6 +1203,85 @@ mod tests {
         // actually distinguishable, not that FullExecute merely contains
         // GapsOnly's prefix.
         assert!(!full_execute_prompt.contains("--gaps-only"));
+    }
+
+    /// D-32 part 1: the re-verify pass quotes GSD's status, route and next
+    /// action verbatim and tells the agent to resume at the phase gates and
+    /// re-run the verifier (gsd-core#4682), in both renderers, and never runs
+    /// the gaps-only command. Two rows with different statuses and routes, so
+    /// a prompt that hardcoded one quote fails the other. Control: the
+    /// full-execute pass carries neither the quote nor the re-verify
+    /// instruction, so the assertions can fail.
+    #[test]
+    fn the_stale_reverify_prompt_quotes_gsd_status_and_route() {
+        let phase = PhaseId::new(52);
+        type Renderer = fn(&StageIntent) -> String;
+        let styles: [(&str, Renderer); 2] = [
+            ("claude", render_claude_style),
+            ("workflow", |intent| {
+                render_workflow_style(intent, "/workflows")
+            }),
+        ];
+        let rows = [
+            ReverifyReport {
+                status: "stale".to_string(),
+                route: "execute-phase".to_string(),
+                next_action: Some(
+                    "Verification is stale — covered source files changed after the verifier \
+                     last ran: \"a.txt\". Re-run execute-phase for this phase: …"
+                        .to_string(),
+                ),
+            },
+            ReverifyReport {
+                status: "missing".to_string(),
+                route: "verify-route-under-test".to_string(),
+                next_action: Some(
+                    "No verification report found — the verify step never completed.".to_string(),
+                ),
+            },
+        ];
+        let code = |fix, reverify_report| StageIntent::Code {
+            phase,
+            fix: Some(fix),
+            fix_note: None,
+            relaunch_note: None,
+            reverify_report,
+        };
+        for (style, render) in styles {
+            for report in &rows {
+                let prompt = render(&code(FixType::StaleReverify, Some(report.clone())));
+                let row = format!("{style} {}", report.status);
+                assert!(
+                    prompt.contains(&format!("`{}`", report.status)),
+                    "{row}: GSD's status is quoted: {prompt}"
+                );
+                assert!(
+                    prompt.contains(&format!("`{}`", report.route)),
+                    "{row}: GSD's route is quoted: {prompt}"
+                );
+                assert!(
+                    prompt.contains(report.next_action.as_deref().unwrap()),
+                    "{row}: GSD's next action is quoted verbatim: {prompt}"
+                );
+                assert!(
+                    prompt.contains("re-run the verifier"),
+                    "{row}: the pass re-runs the verifier: {prompt}"
+                );
+                assert!(
+                    prompt.contains("resume at the phase gates"),
+                    "{row}: the pass resumes at the phase gates: {prompt}"
+                );
+                assert!(
+                    !prompt.contains("--gaps-only"),
+                    "{row}: the re-verify pass is not the gaps-only command: {prompt}"
+                );
+                assert!(prompt.ends_with(COMPLETION_PROTOCOL), "{row}");
+            }
+            // Control: the full-execute pass quotes nothing and asks for no re-verify.
+            let full = render(&code(FixType::FullExecute, Some(rows[1].clone())));
+            assert!(!full.contains("re-run the verifier"), "{style}: {full}");
+            assert!(!full.contains("verify-route-under-test"), "{style}: {full}");
+        }
     }
 
     /// The flag-preserving token belongs on exactly the command strings that
@@ -1425,6 +1548,7 @@ mod tests {
             fix: Some(FixType::FullExecute),
             fix_note: None,
             relaunch_note: None,
+            reverify_report: None,
         });
         insta::assert_snapshot!(prompt);
     }
@@ -1478,6 +1602,7 @@ mod tests {
             fix: Some(FixType::FullExecute),
             fix_note: None,
             relaunch_note: None,
+            reverify_report: None,
         };
         let mut visited: Vec<AgentKind> = Vec::new();
         let mut next = Some(AgentKind::Claude);
@@ -1632,6 +1757,7 @@ mod tests {
                     fix,
                     fix_note: Some(AWKWARD_NOTE.to_string()),
                     relaunch_note: None,
+                    reverify_report: None,
                 },
                 "/workflows",
             );
@@ -1711,6 +1837,9 @@ mod tests {
             }
             FixType::FullExecute => {
                 format!("/gsd-execute-phase {phase} {AUTO_CHAIN_PRESERVING_FLAG}")
+            }
+            FixType::StaleReverify => {
+                unreachable!("the pre-fix builder predates the re-verify pass")
             }
         };
         if code_policy_applies_to_fix_arm(Some(fix_type)) {
@@ -1802,6 +1931,7 @@ mod tests {
                     fix: Some(fix),
                     fix_note: Some(fix_note.to_string()),
                     relaunch_note: Some(relaunch_note.to_string()),
+                    reverify_report: None,
                 });
                 assert_eq!(
                     note_block_contents(&both),
@@ -1825,6 +1955,7 @@ mod tests {
                     fix: Some(fix),
                     fix_note: None,
                     relaunch_note: Some(relaunch_note.to_string()),
+                    reverify_report: None,
                 });
                 assert_eq!(
                     note_block_contents(&relaunch_only),

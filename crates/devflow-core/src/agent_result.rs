@@ -4184,6 +4184,7 @@ mod tests {
             fix: Some(FixType::FullExecute),
             fix_note: None,
             relaunch_note: None,
+            reverify_report: None,
         });
         for prompt in [&resume_prompt, &fix_prompt] {
             assert!(prompt.ends_with(crate::prompt::COMPLETION_PROTOCOL));
