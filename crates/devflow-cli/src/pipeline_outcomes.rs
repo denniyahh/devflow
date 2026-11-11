@@ -5473,4 +5473,645 @@ mod tests {
         assert_eq!(retry_after_from_reason(Some("usage limit")), "unknown");
         assert_eq!(retry_after_from_reason(None), "unknown");
     }
+
+    // ---- 52-22: every GSD status and reader failure has its route ----------
+
+    /// Run `name` in a child with an agent-free `PATH` and a 20 s gate timeout,
+    /// so a launch fails fast and a gate nobody answers ends instead of
+    /// waiting days. `true` means this process is the child: run the body.
+    fn in_bounded_child(name: &str) -> bool {
+        if devflow_core::test_support::in_child_test(name) {
+            return true;
+        }
+        let path_dir = agent_free_git_only_path_dir();
+        let out = crate::test_support::run_hermetic_test_in_child(
+            name,
+            path_dir.path(),
+            &[("DEVFLOW_GATE_TIMEOUT_SECS", std::ffi::OsStr::new("20"))],
+        );
+        devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, name);
+        false
+    }
+
+    /// A Validate-stage state for `phase` in `mode`, saved, with the commit
+    /// baseline seeded so a failure continues rather than restarts a streak.
+    fn validate_state(root: &Path, phase: PhaseId, mode: Mode) -> State {
+        let mut state = State::new(phase, AgentKind::Claude, mode, root.to_path_buf());
+        state.stage = Stage::Validate;
+        state.last_validate_failure_commit_count = Some(0);
+        workflow::save_state(&state).unwrap();
+        state
+    }
+
+    /// Every event recorded for `phase`, in order.
+    fn phase_events(root: &Path, phase: PhaseId) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(devflow_core::events::events_path(root))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|event| phase.matches_json(event.get("phase")))
+            .collect()
+    }
+
+    /// The events of `phase` named `name`.
+    fn events_named(root: &Path, phase: PhaseId, name: &str) -> Vec<serde_json::Value> {
+        phase_events(root, phase)
+            .into_iter()
+            .filter(|event| event["event"] == name)
+            .collect()
+    }
+
+    /// The position of the first event of `phase` named `name`.
+    fn first_position(root: &Path, phase: PhaseId, name: &str) -> Option<usize> {
+        phase_events(root, phase)
+            .iter()
+            .position(|event| event["event"] == name)
+    }
+
+    /// An abort answer, as `devflow gate abort` writes it.
+    fn abort_answer() -> devflow_core::gates::GateResponse {
+        devflow_core::gates::GateResponse {
+            approved: false,
+            abort: true,
+            note: Some("test cleanup".into()),
+            responded_by: Some("test".into()),
+        }
+    }
+
+    /// An approval.
+    fn approve_answer() -> devflow_core::gates::GateResponse {
+        devflow_core::gates::GateResponse {
+            approved: true,
+            abort: false,
+            note: None,
+            responded_by: Some("test".into()),
+        }
+    }
+
+    /// Run `handler` on another thread until it opens `phase`'s Validate gate;
+    /// read the gate file and the state on disk at that moment, answer the gate
+    /// with `answer`, and wait for `handler`.
+    fn at_the_validate_gate(
+        root: &Path,
+        phase: PhaseId,
+        answer: &devflow_core::gates::GateResponse,
+        handler: impl FnOnce() + Send,
+    ) -> (serde_json::Value, State) {
+        const GATE_OPENS_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
+        let gate_path = Gates::gate_path(root, phase, Stage::Validate);
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(handler);
+            let started = std::time::Instant::now();
+            while !gate_path.exists() {
+                assert!(
+                    !waiter.is_finished(),
+                    "the handler returned without opening the Validate gate; events: {:?}",
+                    phase_events(root, phase)
+                );
+                assert!(
+                    started.elapsed() < GATE_OPENS_WITHIN,
+                    "the Validate gate did not open within {GATE_OPENS_WITHIN:?}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let gate: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&gate_path).unwrap()).unwrap();
+            let on_disk = workflow::load_state(root, phase).unwrap();
+            answer_open_gate(root, phase, Stage::Validate, answer).unwrap();
+            waiter.join().unwrap();
+            (gate, on_disk)
+        })
+    }
+
+    /// The `fix` of the last `loop_back` event of `phase`.
+    fn last_loop_back_fix(root: &Path, phase: PhaseId) -> Option<String> {
+        devflow_core::events::last_event_of_kind_for_phase(root, phase, "loop_back")
+            .and_then(|event| event["fix"].as_str().map(str::to_string))
+    }
+
+    /// A `stale` or `missing` report sends Code back to the full execute command
+    /// after either agent verdict in auto mode, with no gate and no finish. In
+    /// supervise mode the same report opens a `reverify_needed` gate, nothing
+    /// launches before it is answered, and approving it relaunches Code on the
+    /// auto rows' route and finishes nothing.
+    fn assert_a_reverify_report_routes_to_execute_phase(status: GsdStatus, first: u32) {
+        // Auto, after an agent pass and after an agent fail: the controls,
+        // which launch Code with no gate.
+        for (offset, outcome) in [ValidateOutcome::Passed, ValidateOutcome::Failed]
+            .into_iter()
+            .enumerate()
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = PhaseId::new(first + offset as u32);
+            let _gsd = validate_evidence(root, phase, &[gsd_says(status)]);
+            let mut state = validate_state(root, phase, Mode::Auto);
+            // A gate here would take this abort and fail the assertions below.
+            preanswer_gate(root, phase, Stage::Validate, &abort_answer());
+            let _ = handle_validate_outcome(root, &mut state, outcome.clone());
+            assert!(
+                events_named(root, phase, "gate_fired").is_empty(),
+                "auto mode relaunches Code over {status:?} without a gate ({outcome:?}): {:?}",
+                phase_events(root, phase)
+            );
+            assert_eq!(
+                last_loop_back_fix(root, phase).as_deref(),
+                Some("FullExecute"),
+                "{status:?} relaunches the full execute command, not --gaps-only ({outcome:?})"
+            );
+            assert!(events_named(root, phase, "workflow_finished").is_empty());
+        }
+
+        // Supervise: a reverify_needed gate, then the auto rows' route.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(first + 2);
+        let _gsd = validate_evidence(root, phase, &[gsd_says(status)]);
+        let mut state = validate_state(root, phase, Mode::Supervise);
+        preanswer_gate(root, phase, Stage::Validate, &approve_answer());
+        let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Passed);
+        let fired = events_named(root, phase, "gate_fired");
+        assert_eq!(fired.len(), 1, "{:?}", phase_events(root, phase));
+        assert_eq!(fired[0]["gate_kind"], "reverify_needed", "{}", fired[0]);
+        let resolved = first_position(root, phase, "gate_resolved").expect("the gate was answered");
+        for launch in ["loop_back", "stage_launched"] {
+            if let Some(at) = first_position(root, phase, launch) {
+                assert!(
+                    at > resolved,
+                    "nothing launches before the reverify_needed gate is answered ({launch}): {:?}",
+                    phase_events(root, phase)
+                );
+            }
+        }
+        assert_eq!(
+            last_loop_back_fix(root, phase).as_deref(),
+            Some("FullExecute"),
+            "approving reverify_needed relaunches Code on the auto route"
+        );
+        assert!(
+            events_named(root, phase, "workflow_finished").is_empty(),
+            "approving reverify_needed finishes nothing"
+        );
+    }
+
+    #[test]
+    fn a_stale_report_routes_to_execute_phase() {
+        if in_bounded_child("pipeline_outcomes::tests::a_stale_report_routes_to_execute_phase") {
+            assert_a_reverify_report_routes_to_execute_phase(GsdStatus::Stale, 5221);
+        }
+    }
+
+    #[test]
+    fn a_missing_report_routes_to_execute_phase() {
+        if in_bounded_child("pipeline_outcomes::tests::a_missing_report_routes_to_execute_phase") {
+            assert_a_reverify_report_routes_to_execute_phase(GsdStatus::Missing, 5224);
+        }
+    }
+
+    /// `human_needed` after an agent pass gates in auto mode too (D-08), and the
+    /// gate names the status.
+    #[test]
+    fn a_human_needed_report_gates_in_auto_mode() {
+        if !in_bounded_child("pipeline_outcomes::tests::a_human_needed_report_gates_in_auto_mode") {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5227);
+        let _gsd = validate_evidence(root, phase, &[gsd_says(GsdStatus::HumanNeeded)]);
+        let mut state = validate_state(root, phase, Mode::Auto);
+        let (gate, _) = at_the_validate_gate(root, phase, &abort_answer(), || {
+            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Passed);
+        });
+        let context = gate["context"].as_str().unwrap();
+        assert!(context.contains("human_needed"), "{context}");
+        assert_eq!(gate["gate_kind"], "human_needed", "{gate}");
+        assert!(events_named(root, phase, "workflow_finished").is_empty());
+    }
+
+    /// An agent fail over a GSD `passed` report is a disagreement: a gate that
+    /// names both verdicts, and an approval of it reruns Validate rather than
+    /// finishing (D-45 rule 1: an agent fail records no PASS).
+    #[test]
+    fn an_agent_fail_over_a_passed_report_gates_as_a_disagreement() {
+        if !in_bounded_child(
+            "pipeline_outcomes::tests::an_agent_fail_over_a_passed_report_gates_as_a_disagreement",
+        ) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5228);
+        let _gsd = validate_evidence(root, phase, &[gsd_says(GsdStatus::Passed)]);
+        let mut state = validate_state(root, phase, Mode::Auto);
+        let (gate, _) = at_the_validate_gate(root, phase, &approve_answer(), || {
+            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
+        });
+        let context = gate["context"].as_str().unwrap();
+        assert!(
+            context.contains("agent reported fail") && context.contains("passed"),
+            "the gate names both verdicts: {context}"
+        );
+        assert_eq!(gate["gate_kind"], "disagreement_over_passed", "{gate}");
+        assert!(
+            events_named(root, phase, "workflow_finished").is_empty(),
+            "an approved disagreement does not finish: {:?}",
+            phase_events(root, phase)
+        );
+        let kept = workflow::load_state(root, phase).expect("the run keeps its state");
+        assert!(!kept.finished, "{kept:?}");
+    }
+
+    /// D-24: the reader runs in the worktree evidence root. With the phase
+    /// directory only under the worktree, GSD is asked about the worktree's
+    /// phase directory, from the worktree. Control in the same test: a read
+    /// pointed at the project root finds no phase directory there, and the
+    /// stub answers `missing` for the project root's would-be directory.
+    #[test]
+    fn the_reader_reads_the_worktree_evidence_root() {
+        if !in_bounded_child(
+            "pipeline_outcomes::tests::the_reader_reads_the_worktree_evidence_root",
+        ) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let phase = PhaseId::new(5229);
+        let worktree = root.join(format!(".worktrees/phase-{phase}"));
+        std::fs::create_dir_all(&worktree).unwrap();
+        let gsd = validate_evidence(&worktree, phase, &[gsd_says(GsdStatus::GapsFound)]);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.clone());
+        state.stage = Stage::Validate;
+        state.worktree_path = Some(worktree.clone());
+        state.last_validate_failure_commit_count = Some(0);
+        workflow::save_state(&state).unwrap();
+
+        let _ = handle_validate_outcome(&root, &mut state, ValidateOutcome::Failed);
+
+        let phase_dir = worktree.join(format!(".planning/phases/{}-fixture", phase.padded()));
+        let read = format!("query verification status {}", phase_dir.display());
+        assert!(
+            gsd.calls()
+                .iter()
+                .any(|(cwd, argv)| argv == &read && cwd == &worktree),
+            "GSD was asked `{read}` from the worktree; calls: {:?}",
+            gsd.calls()
+        );
+
+        // Control: the project root holds no phase directory.
+        assert!(gsd_reader::phase_dir(&root, phase).is_err());
+        let beside = gsd_reader::verification_status(
+            &gsd.home(),
+            &root,
+            &root.join(format!(".planning/phases/{}-fixture", phase.padded())),
+        )
+        .expect("the stub answers");
+        assert_eq!(beside.status, GsdStatus::Missing);
+    }
+
+    /// D-24: a reader failure at Validate opens a never-silent gate naming the
+    /// failure, never finishes, and its events carry only the failure's
+    /// path-free label: for no launcher (after an agent pass) and for a
+    /// non-zero exit (after an agent fail).
+    #[test]
+    fn a_reader_failure_at_validate_fires_a_never_silent_gate() {
+        if !in_bounded_child(
+            "pipeline_outcomes::tests::a_reader_failure_at_validate_fires_a_never_silent_gate",
+        ) {
+            return;
+        }
+        // No launcher: no stub at all.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5230);
+        phase_dir_fixture(root, phase);
+        repo_with_head(root);
+        let mut state = validate_state(root, phase, Mode::Auto);
+        let (gate, _) = at_the_validate_gate(root, phase, &abort_answer(), || {
+            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Passed);
+        });
+        let context = gate["context"].as_str().unwrap();
+        assert!(context.starts_with("[never-silent]"), "{context}");
+        assert!(context.contains("gsd_launcher_not_found"), "{context}");
+        assert_eq!(gate["gate_kind"], "reader_failure", "{gate}");
+        let reads = events_named(root, phase, "gsd_verification");
+        assert_eq!(reads.len(), 1, "{reads:?}");
+        assert_eq!(
+            reads[0]["failure"], "gsd_launcher_not_found",
+            "{}",
+            reads[0]
+        );
+        assert!(reads[0].get("status").is_none(), "{}", reads[0]);
+        assert!(events_named(root, phase, "workflow_finished").is_empty());
+
+        // A non-zero exit: a stub with no reply exits 97 with a message.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5231);
+        let _gsd = validate_evidence(root, phase, &[]);
+        let mut state = validate_state(root, phase, Mode::Auto);
+        let (gate, _) = at_the_validate_gate(root, phase, &abort_answer(), || {
+            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
+        });
+        let context = gate["context"].as_str().unwrap();
+        assert!(context.starts_with("[never-silent]"), "{context}");
+        assert!(
+            context.contains("gsd_reader_nonzero_exit") && context.contains("no scripted reply"),
+            "the gate names the failure and GSD's message: {context}"
+        );
+        let reads = events_named(root, phase, "gsd_verification");
+        assert_eq!(reads.len(), 1, "{reads:?}");
+        assert_eq!(
+            reads[0]["failure"], "gsd_reader_nonzero_exit",
+            "{}",
+            reads[0]
+        );
+        for event in phase_events(root, phase) {
+            assert!(
+                !event.to_string().contains("no scripted reply"),
+                "an event carries GSD's message: {event}"
+            );
+        }
+        assert!(events_named(root, phase, "workflow_finished").is_empty());
+    }
+
+    /// Every gate the Validate path opens records its kind in the gate file.
+    /// Control in the same test: the agent-pass `passed` gate and the
+    /// agent-fail `passed` gate both have stage Validate and quote `passed`,
+    /// and their kinds differ.
+    #[test]
+    fn each_validate_gate_records_its_kind() {
+        if !in_bounded_child("pipeline_outcomes::tests::each_validate_gate_records_its_kind") {
+            return;
+        }
+        let rows: [(Mode, ValidateOutcome, Option<GsdStatus>, u32, &str); 9] = [
+            (
+                Mode::Supervise,
+                ValidateOutcome::Passed,
+                Some(GsdStatus::Passed),
+                0,
+                "clean_pass",
+            ),
+            (
+                Mode::Supervise,
+                ValidateOutcome::Passed,
+                Some(GsdStatus::GapsFound),
+                0,
+                "gaps_found",
+            ),
+            (
+                Mode::Supervise,
+                ValidateOutcome::Passed,
+                Some(GsdStatus::Stale),
+                0,
+                "reverify_needed",
+            ),
+            (
+                Mode::Auto,
+                ValidateOutcome::Passed,
+                Some(GsdStatus::HumanNeeded),
+                0,
+                "human_needed",
+            ),
+            (
+                Mode::Auto,
+                ValidateOutcome::Failed,
+                Some(GsdStatus::Passed),
+                0,
+                "disagreement_over_passed",
+            ),
+            (
+                Mode::Auto,
+                ValidateOutcome::Failed,
+                Some(GsdStatus::HumanNeeded),
+                0,
+                "disagreement_over_human_needed",
+            ),
+            (
+                Mode::Auto,
+                ValidateOutcome::Passed,
+                None,
+                0,
+                "reader_failure",
+            ),
+            (
+                Mode::Auto,
+                ValidateOutcome::Ambiguous("the agent reported gaps".into()),
+                Some(GsdStatus::Passed),
+                0,
+                "ambiguous_verdict",
+            ),
+            (
+                Mode::Auto,
+                ValidateOutcome::Failed,
+                Some(GsdStatus::GapsFound),
+                mode::MAX_CONSECUTIVE_FAILURES - 1,
+                "failure_cap",
+            ),
+        ];
+        let mut gates = Vec::new();
+        for (index, (mode, outcome, status, streak, kind)) in rows.into_iter().enumerate() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = PhaseId::new(5240 + index as u32);
+            let replies: Vec<&str> = status.into_iter().map(gsd_says).collect();
+            let gsd = match status {
+                Some(_) => Some(validate_evidence(root, phase, &replies)),
+                None => {
+                    phase_dir_fixture(root, phase);
+                    repo_with_head(root);
+                    None
+                }
+            };
+            let mut state = validate_state(root, phase, mode);
+            state.consecutive_failures = streak;
+            workflow::save_state(&state).unwrap();
+            let (gate, _) = at_the_validate_gate(root, phase, &abort_answer(), || {
+                let _ = handle_validate_outcome(root, &mut state, outcome.clone());
+            });
+            drop(gsd);
+            assert_eq!(
+                gate["gate_kind"], kind,
+                "row {index} ({mode:?}, {outcome:?}, {status:?}): {gate}"
+            );
+            gates.push(gate);
+        }
+        let (clean, disagreement) = (&gates[0], &gates[4]);
+        for gate in [clean, disagreement] {
+            assert_eq!(gate["stage"], "validate", "{gate}");
+            assert!(
+                gate["context"].as_str().unwrap().contains("passed"),
+                "{gate}"
+            );
+        }
+        assert_ne!(clean["gate_kind"], disagreement["gate_kind"]);
+    }
+
+    /// D45-4: an agent PASS is recorded with the evidence root's HEAD, in the
+    /// state on disk, and survives a stop, a transition and a supervisor
+    /// takeover's publish write. An agent FAIL, an ambiguous verdict and a HEAD
+    /// that cannot be read record `None`; the last also opens a never-silent
+    /// gate naming the HEAD read. Control: two PASS rows on two commits record
+    /// two different shas.
+    #[test]
+    fn a_validate_pass_is_recorded_with_the_head_it_ran_on() {
+        if !in_bounded_child(
+            "pipeline_outcomes::tests::a_validate_pass_is_recorded_with_the_head_it_ran_on",
+        ) {
+            return;
+        }
+        let raw_head = |root: &Path, phase: PhaseId| -> serde_json::Value {
+            let raw: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(workflow::state_path(root, phase)).unwrap(),
+            )
+            .unwrap();
+            raw["validate_pass_head"].clone()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5250);
+        let _gsd = validate_evidence(
+            root,
+            phase,
+            &[
+                gsd_says(GsdStatus::Passed),
+                gsd_says(GsdStatus::GapsFound),
+                gsd_says(GsdStatus::Passed),
+                gsd_says(GsdStatus::Passed),
+                gsd_says(GsdStatus::Passed),
+            ],
+        );
+        let first = repo_with_head(root);
+
+        // An agent PASS over `passed`: auto finishes, and the HEAD is recorded.
+        let mut state = validate_state(root, phase, Mode::Auto);
+        handle_validate_outcome(root, &mut state, ValidateOutcome::Passed).expect("the finish");
+        assert_eq!(
+            raw_head(root, phase),
+            first,
+            "the PASS is recorded with its HEAD"
+        );
+
+        // A stop, as `devflow stop` writes it.
+        workflow::update_state(root, phase, |s| {
+            s.stopped = true;
+            s.stop_reason = Some("stopped by devflow stop".into());
+            Ok::<_, workflow::WorkflowError>(())
+        })
+        .unwrap();
+        assert_eq!(raw_head(root, phase), first, "a stop keeps the PASS");
+
+        // A transition.
+        let mut loaded = workflow::load_state(root, phase).unwrap();
+        loaded.stopped = false;
+        let _ = transition(root, &mut loaded, Stage::Code);
+        assert_eq!(
+            workflow::load_state(root, phase).unwrap().stage,
+            Stage::Code,
+            "premise: the transition was written"
+        );
+        assert_eq!(raw_head(root, phase), first, "a transition keeps the PASS");
+
+        // A supervisor takeover: a second launch's record published over the
+        // first, through the publish's own save.
+        let mut taken = workflow::load_state(root, phase).unwrap();
+        let next = devflow_core::state::SupervisorRecord::new(
+            root.join("next.sock"),
+            "nextlaunch0000000000".into(),
+            4_294_967_001,
+            1,
+            String::new(),
+        );
+        taken.supervisor = Some(next.clone());
+        workflow::update_state(root, phase, |s| {
+            s.supervisor = Some(devflow_core::state::SupervisorRecord::new(
+                root.join("prior.sock"),
+                "nextlaunch0000000000".into(),
+                4_294_967_000,
+                1,
+                String::new(),
+            ));
+            Ok::<_, workflow::WorkflowError>(())
+        })
+        .unwrap();
+        crate::pipeline_launch::save_publish_fields(&taken).expect("the publish save");
+        assert_eq!(
+            workflow::load_state(root, phase).unwrap().supervisor,
+            Some(next),
+            "premise: the takeover's record was published"
+        );
+        assert_eq!(raw_head(root, phase), first, "a takeover keeps the PASS");
+
+        // An agent FAIL on the same HEAD records none (gaps_found: auto loops).
+        let mut state = workflow::load_state(root, phase).unwrap();
+        state.stage = Stage::Validate;
+        let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
+        assert_eq!(
+            raw_head(root, phase),
+            serde_json::Value::Null,
+            "a FAIL records no PASS"
+        );
+
+        // A PASS again, then an ambiguous verdict: none.
+        let mut state = workflow::load_state(root, phase).unwrap();
+        state.stage = Stage::Validate;
+        let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Passed);
+        assert_eq!(
+            raw_head(root, phase),
+            first,
+            "premise: a PASS is recorded again"
+        );
+        let mut state = workflow::load_state(root, phase).unwrap();
+        state.stage = Stage::Validate;
+        let (_, at_gate) = at_the_validate_gate(root, phase, &abort_answer(), || {
+            let _ = handle_validate_outcome(
+                root,
+                &mut state,
+                ValidateOutcome::Ambiguous("the agent reported gaps".into()),
+            );
+        });
+        assert_eq!(
+            at_gate.validate_pass_head, None,
+            "an ambiguous verdict records no PASS"
+        );
+
+        // Control: a PASS on a second commit records the second sha.
+        devflow_core::test_support::git_command(root)
+            .args(["commit", "-q", "--allow-empty", "-m", "second"])
+            .status()
+            .unwrap();
+        let second = repo_with_head(root);
+        assert_ne!(first, second);
+        let mut state = validate_state(root, phase, Mode::Auto);
+        let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Passed);
+        assert_eq!(
+            raw_head(root, phase),
+            second,
+            "the field follows HEAD, not a constant"
+        );
+
+        // A HEAD that cannot be read: none, and a never-silent gate naming it.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5251);
+        let _gsd = validate_evidence(root, phase, &[gsd_says(GsdStatus::Passed)]);
+        std::fs::remove_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git"), "").unwrap();
+        let mut state = validate_state(root, phase, Mode::Auto);
+        state.validate_pass_head = Some("a-previous-pass".into());
+        workflow::save_state(&state).unwrap();
+        let (gate, at_gate) = at_the_validate_gate(root, phase, &abort_answer(), || {
+            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Passed);
+        });
+        assert_eq!(
+            at_gate.validate_pass_head, None,
+            "a failed HEAD read records no PASS"
+        );
+        let context = gate["context"].as_str().unwrap();
+        assert!(
+            context.starts_with("[never-silent]") && context.contains("HEAD"),
+            "the gate names the HEAD read: {context}"
+        );
+        assert!(events_named(root, phase, "workflow_finished").is_empty());
+    }
 }

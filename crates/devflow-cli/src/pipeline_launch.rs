@@ -2263,7 +2263,7 @@ fn promote_pending(state: &mut State) {
 /// [`publish_record`] then shuts this supervisor down through its socket. Inside a
 /// supervisor's advance it is also an owned write (D-03), so a superseded supervisor
 /// promotes nothing.
-fn save_publish_fields(published: &State) -> Result<(), CliError> {
+pub(crate) fn save_publish_fields(published: &State) -> Result<(), CliError> {
     let launch_id = published.supervisor.as_ref().map(|r| r.launch_id.as_str());
     update_engaged_state(&published.project_root, published.phase, |s| {
         let pending_id = s.pending_supervisor.as_ref().map(|p| p.launch_id.as_str());

@@ -7125,6 +7125,7 @@ mod tests {
             context: entry.context.clone(),
             timestamp: entry.timestamp.clone(),
             gate_id: String::new(),
+            gate_kind: None,
         };
         std::fs::write(
             Gates::gate_path(root, phase, stage),

@@ -47,6 +47,49 @@ pub struct GateFile {
     /// The gate's identity. Required: a file without one does not parse, so nothing
     /// can list it or answer it.
     pub gate_id: String,
+    /// Which kind of gate this is, recorded by its writer (52-22, D-37, D-39): a
+    /// label for display, events and tests, never parsed out of `context`. `None`
+    /// only in a gate file written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_kind: Option<GateKind>,
+}
+
+/// The kind of a gate, as its writer records it in [`GateFile::gate_kind`].
+///
+/// Deliberately not `#[non_exhaustive]`: a router that matches it has no wildcard
+/// arm, so a kind added later fails the build until it is classified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateKind {
+    /// The supervise Validate gate after an agent pass that GSD reports `passed`
+    /// (52-22).
+    CleanPass,
+    /// A Validate gate over a GSD `gaps_found` report, after either agent verdict
+    /// (52-22).
+    GapsFound,
+    /// The supervise Validate gate over a GSD `stale` or `missing` report, after
+    /// either agent verdict: the report must be re-verified (52-22).
+    ReverifyNeeded,
+    /// The Validate gate after an agent pass that GSD reports `human_needed`
+    /// (52-22).
+    HumanNeeded,
+    /// The Validate gate after an agent fail that GSD reports `passed`: the two
+    /// disagree (52-22).
+    DisagreementOverPassed,
+    /// The Validate gate after an agent fail that GSD reports `human_needed`
+    /// (52-22).
+    DisagreementOverHumanNeeded,
+    /// The never-silent Validate gate when GSD's status, or the HEAD a pass ran
+    /// on, could not be read (52-22, D-24).
+    ReaderFailure,
+    /// The never-silent Validate gate when the agent's verdict is ambiguous
+    /// (52-22).
+    AmbiguousVerdict,
+    /// A Validate gate fired because a failure counter reached its cap
+    /// (`MAX_CONSECUTIVE_FAILURES` or `MAX_PHASE_VALIDATE_FAILURES`, 52-22).
+    FailureCap,
+    /// The gate when a gaps pass produced no gap-closure plan (written by 52-27).
+    NoGapClosurePlan,
 }
 
 /// The human's response to a gate.
@@ -493,6 +536,17 @@ impl Gates {
         project_root: &Path,
         phase: PhaseId,
         stage: Stage,
+        context: &str,
+    ) -> Result<OpenedGate, GateError> {
+        Self::open_gate_as(project_root, phase, stage, &GateId::new(), context)
+    }
+
+    /// [`open_gate`](Self::open_gate), recording `kind` in the gate file.
+    pub fn open_gate_with_kind(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        _kind: Option<GateKind>,
         context: &str,
     ) -> Result<OpenedGate, GateError> {
         Self::open_gate_as(project_root, phase, stage, &GateId::new(), context)
@@ -1337,6 +1391,7 @@ impl Gates {
             context: context.to_string(),
             timestamp: unix_now(),
             gate_id: gate_id.to_string(),
+            gate_kind: None,
         };
         let path = Self::gate_path(project_root, phase, stage);
         info!("writing gate {} for phase {phase}", stage);
@@ -1944,6 +1999,43 @@ mod tests {
     /// default) so they don't race each other.
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
+    /// 52-22: a gate's kind is a structured field of its file. A gate opened
+    /// with a kind reads back with it and its file holds the snake_case name; a
+    /// gate opened with none writes no `gate_kind` key; a 3.x-shaped file with
+    /// no such key reads as `None`.
+    #[test]
+    fn a_gate_round_trips_its_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5222);
+
+        let opened = Gates::open_gate_with_kind(
+            root,
+            phase,
+            Stage::Validate,
+            Some(GateKind::DisagreementOverPassed),
+            "the agent and GSD disagree",
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&opened.path).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(raw["gate_kind"], "disagreement_over_passed", "{text}");
+        let back: GateFile = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.gate_kind, Some(GateKind::DisagreementOverPassed));
+
+        let kindless =
+            Gates::open_gate_with_kind(root, phase, Stage::Code, None, "no kind").unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&kindless.path).unwrap()).unwrap();
+        assert!(raw.get("gate_kind").is_none(), "{raw}");
+
+        let old: GateFile = serde_json::from_str(
+            r#"{"phase":5222,"stage":"plan","context":"3.x","timestamp":"1750000000","gate_id":"g-3x"}"#,
+        )
+        .unwrap();
+        assert_eq!(old.gate_kind, None);
+    }
+
     #[test]
     fn gate_file_round_trips_through_serde() {
         let gate = GateFile {
@@ -1952,6 +2044,7 @@ mod tests {
             context: "review the validation".into(),
             timestamp: "1750000000".into(),
             gate_id: GateId::new().to_string(),
+            gate_kind: None,
         };
         let json = serde_json::to_string(&gate).unwrap();
         let back: GateFile = serde_json::from_str(&json).unwrap();
@@ -5516,6 +5609,7 @@ mod tests {
             context: "no id".into(),
             timestamp: "1750000000".into(),
             gate_id: GateId::new().to_string(),
+            gate_kind: None,
         })
         .unwrap();
         assert!(idless.as_object_mut().unwrap().remove("gate_id").is_some());
