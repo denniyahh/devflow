@@ -7,6 +7,8 @@
 //! removed entirely (CR-02, 17-11 gap closure). See the regression test
 //! below for why.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 
 #[test]
@@ -54,13 +56,11 @@ fn version_prints_the_embedded_commit_and_dirty_flag() {
         env!("CARGO_PKG_VERSION")
     );
 
-    let output = devflow_core::test_support::hermetic_command(
-        env!("CARGO_BIN_EXE_devflow"),
-        &std::env::temp_dir(),
-    )
-    .arg("--version")
-    .output()
-    .expect("run devflow --version");
+    let home = common::HermeticHome::new();
+    let output = common::hermetic_devflow(&home)
+        .arg("--version")
+        .output()
+        .expect("run devflow --version");
 
     assert!(
         output.status.success(),
