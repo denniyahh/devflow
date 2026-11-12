@@ -2029,6 +2029,8 @@ review-fix flow does) is phase work the filter cannot see.
 Plans:
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
+**Taken into Phase 52.1** (2026-11-11, agent decision the operator delegated; 52.1-CONTEXT D-12): narrowed to the `-review` and `-fix` suffixes only.
+
 ### Phase 999.168: Adopt wsx for Repo Operations (BACKLOG)
 
 **Found:** 2026-10-20, operator decision while planning wsx milestone 1 (`~/Github/wsx`,
