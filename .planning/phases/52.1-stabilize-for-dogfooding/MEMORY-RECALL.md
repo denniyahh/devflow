@@ -22,6 +22,16 @@ Score floor used: `max_distance` 0.55; a nonsense query scores about 0.62–0.63
   exec. This is consistent with D-05's "a close-on-exec audit proves nothing" and the fork-held test helper. —
   drawer_devflow_planning_fb6118af4abde9b9540c598c, drawer_devflow_decisions_29756e1e4e64fb3ef47d7359
 
+- **50.1 criterion 2 / 50.1-16's must-have: no refusal printed while a pending supervisor's lock is held may suggest
+  `devflow resume`.** The 2026-11-12 plan check found that 52.1-10 Task 3 (the D-26 Clarification's after-stop verb)
+  would have broken it for `start`: today's `pending_blocks_resume` covers `resume` only. Fixed in the plan the same day
+  (`pending_live` for both verbs, plus `commands::tests::a_start_refused_over_a_pending_supervisor_never_names_resume`). —
+  drawer_devflow_planning_25367269ceb77443e7597d27 (50.1-16-PLAN)
+- **Never push from parallel wave worktrees (Phase 25):** each push runs the pinned container gate, and parallel
+  runs caused load flakes. Checked: no 52.1 plan pushes. — drawer_devflow_planning_b5297b105a4f83c9d9e8d242
+- **A live run is owned outside any agent worktree or subagent turn (Phase 49).** Checked: 52.1-14's runs are a
+  `checkpoint:human-action` run from a shell outside any agent worktree. — drawer_devflow_decisions_b8d3946f5b37c3952bd5bf9d
+
 ## Patterns
 - **Honest disclosure over a racy test (Phase 25, 25-07):** a branch reachable only through a real external race was
   left untested and documented, not covered with a flaky test. This applies to 999.223's "not reproduced live" cause. —
