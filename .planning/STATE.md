@@ -86,8 +86,19 @@ else can make (restated by the operator 2026-11-08).
 
 ## Operator Next Steps
 
-- `/gsd-discuss-phase 52` — confirm the cut list (`.planning/user/V4-CUT-INVENTORY.md`) and the Validate-gate design, then plan.
-- Push `workspace/denniyahh` (the v3.0.0 close and v4.0 start are local until then).
+Phase 52.1 is planned (14 plans, 10 waves; commits `48582cd`, `ff62f80`). In order:
+
+1. **External adversarial review of the 52.1 plan set** (codex and agy lanes, `external-review` skill) before any
+   code. A replan from it runs as `/gsd-plan-phase 52.1 --reviews` in an agent session (a hand-run stage; note it).
+2. **Create the phase worktree:** `scripts/phase-worktree.sh 52.1` (D-18). Every plan's precondition stops without
+   `.worktrees/phase-52.1` on `feature/phase-52.1`.
+3. **MemPalace capture once the plans are final** (`/gsd-mempalace-capture`): supersede, not add beside, the palace's
+   2026-11-11 copy of 52.1-CONTEXT (pre-D-20) and the two "auto, unconfirmed" KG facts on "Phase 52.1";
+   `52.1-MEMORY-RECALL.md` names them. The MemPalace daemon is left stopped (operator, 2026-11-12), so this session's
+   MCP server is the writer; see `~/.config/agents/AGENTS.md` § MemPalace.
+4. **Execute:** `/gsd-execute-phase 52.1` from the worktree. Plan 52.1-14 Task 2 (the live proof run and its
+   control) needs the operator at a shell outside any agent worktree.
+5. **Push `workspace/denniyahh`:** 8 commits ahead of origin as of 2026-11-12.
 
 ### Historical — superseded phase notes
 
@@ -1044,8 +1055,8 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 
 ## Session
 
-**Last session:** 2026-11-11T23:21:52.473Z
-**Stopped at:** Phase 52.1 context gathered
+**Last session:** 2026-11-12
+**Stopped at:** Phase 52.1 planned (14 plans); external adversarial plan review next
 **Resume file:** .planning/phases/52.1-stabilize-for-dogfooding/52.1-CONTEXT.md
 
 ## Operator Next Steps
