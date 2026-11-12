@@ -171,10 +171,42 @@ Validate without hand-run stages or hand-edited state. Not dogfooded itself (ope
 999.222, 999.223 and 999.232; the `--force` redesign 999.224; the close-out script defects 999.230 and 999.231.
 **Requirements**: TBD
 **Depends on:** Phase 52
-**Plans:** 0 plans
+**Plans:** 14 plans
 
 Plans:
-- [ ] TBD (run /gsd-plan-phase 52.1 to break down)
+**Wave 1**
+- [ ] 52.1-01-PLAN.md
+- [ ] 52.1-02-PLAN.md
+- [ ] 52.1-03-PLAN.md
+- [ ] 52.1-05-PLAN.md
+
+**Wave 2** *(blocked on Wave 1 completion)*
+- [ ] 52.1-04-PLAN.md
+- [ ] 52.1-06-PLAN.md
+
+**Wave 3** *(blocked on Wave 2 completion)*
+- [ ] 52.1-07-PLAN.md
+
+**Wave 4** *(blocked on Wave 3 completion)*
+- [ ] 52.1-08-PLAN.md
+
+**Wave 5** *(blocked on Wave 4 completion)*
+- [ ] 52.1-09-PLAN.md
+
+**Wave 6** *(blocked on Wave 5 completion)*
+- [ ] 52.1-10-PLAN.md
+
+**Wave 7** *(blocked on Wave 6 completion)*
+- [ ] 52.1-11-PLAN.md
+
+**Wave 8** *(blocked on Wave 7 completion)*
+- [ ] 52.1-12-PLAN.md
+
+**Wave 9** *(blocked on Wave 8 completion)*
+- [ ] 52.1-13-PLAN.md
+
+**Wave 10** *(blocked on Wave 9 completion)*
+- [ ] 52.1-14-PLAN.md
 
 ### Phase 53: The Question Channel
 
@@ -457,7 +489,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 53 | 0/? | Not started | — |
 | 54 | 0/? | Not started | — |
 | 55 | 0/? | Not started | — |
-| 52.1. Stabilize for Dogfooding | 0/0 | Not started | - |
+| 52.1. Stabilize for Dogfooding | 0/14 | Planned | - |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
 
