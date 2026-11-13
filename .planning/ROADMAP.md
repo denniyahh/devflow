@@ -57,8 +57,9 @@ replies (Telegram and similar) are a later milestone (REMOTE-01/02 under `REQUIR
 
 | Phase | Name | Requirements | Depends on | Status |
 |---|---|---|---|---|
-| 52 | Subtract and Stabilize | CUT-01, CUT-02, CUT-03, CUT-04, GATE-01, GATE-02, GATE-03, GATE-04, OPS-01, OPS-02, OPS-03, OPS-04 | — (Phase 51, v3.0.0, merged) | Complete |
-| 53 | The Question Channel | ASK-01, ASK-02, ASK-03, ASK-04, ASK-05 | 52 | Not started |
+| 52 | Subtract and Stabilize | CUT-01, CUT-02, CUT-03, CUT-04, GATE-01, GATE-02, GATE-03, GATE-04, OPS-01, OPS-02, OPS-03, OPS-04 | — (Phase 51, v3.0.0, merged) | Executed — verification stale |
+| 52.1 | Stabilize for Dogfooding (INSERTED) | backlog 999.221, 999.222, 999.223, 999.232, 999.224, 999.219, 999.229, 999.230, 999.231, 999.167 (no REQ IDs; plans bind to D-01..D-27) | 52 | Planned — 15 plans, none executed |
+| 53 | The Question Channel | ASK-01, ASK-02, ASK-03, ASK-04, ASK-05 | 52.1 (and through it 52 — the stage set must be final) | Not started |
 | 54 | Decision Triage | TRIAGE-01, TRIAGE-02, TRIAGE-03, TRIAGE-04 | 53 (its recorded questions are the bake-off corpus) | Not started |
 | 55 | Failover Generalized | FAIL-01, FAIL-02, FAIL-03, FAIL-04, FAIL-05, FAIL-06 | 52 (independent of 53-54; sequenced last) | Not started |
 
@@ -169,9 +170,11 @@ than split: no requirement dependency forces a split, and the Validate-gate desi
 Validate without hand-run stages or hand-edited state. Not dogfooded itself (operator, 2026-11-11).
 **Candidate scope (agent recommendation, for discuss to settle; not an operator decision):** the test flakes 999.221,
 999.222, 999.223 and 999.232; the `--force` redesign 999.224; the close-out script defects 999.230 and 999.231.
-**Requirements**: TBD
+**Requirements**: backlog items 999.221, 999.222, 999.223, 999.232 (test flakes), 999.224 (`--force` redesign),
+999.219, 999.229, 999.230, 999.231 and 999.167 (close-out scripts; 999.167 folds into D-12). This phase carries no REQ
+IDs from `REQUIREMENTS.md` — its plans bind to its own decisions, D-01..D-27 in `52.1-CONTEXT.md`.
 **Depends on:** Phase 52
-**Plans:** 14 plans
+**Plans:** 15 plans
 
 Plans:
 **Wave 1**
@@ -197,15 +200,18 @@ Plans:
 - [ ] 52.1-10-PLAN.md
 
 **Wave 7** *(blocked on Wave 6 completion)*
-- [ ] 52.1-11-PLAN.md
+- [ ] 52.1-15-PLAN.md
 
 **Wave 8** *(blocked on Wave 7 completion)*
-- [ ] 52.1-12-PLAN.md
+- [ ] 52.1-11-PLAN.md
 
 **Wave 9** *(blocked on Wave 8 completion)*
-- [ ] 52.1-13-PLAN.md
+- [ ] 52.1-12-PLAN.md
 
 **Wave 10** *(blocked on Wave 9 completion)*
+- [ ] 52.1-13-PLAN.md
+
+**Wave 11** *(blocked on Wave 10 completion)*
 - [ ] 52.1-14-PLAN.md
 
 ### Phase 53: The Question Channel
@@ -485,11 +491,11 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 50 | 29/29 | Complete | 2026-10-21 |
 | 50.1 | 30/30 | Complete | 2026-11-02 |
 | 51 | 13/13 | Complete | 2026-11-08 |
-| 52 | 33/33 | Complete | 2026-11-11 |
+| 52 | 33/33 | Executed — verification stale | 2026-11-11 |
+| 52.1 | 0/15 | Planned | — |
 | 53 | 0/? | Not started | — |
 | 54 | 0/? | Not started | — |
 | 55 | 0/? | Not started | — |
-| 52.1. Stabilize for Dogfooding | 0/14 | Planned | - |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
 
