@@ -717,6 +717,19 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.233: `stop` Refuses an Unprobeable Pending-Launch or `--launch` Socket With No Way On (BACKLOG)
+
+**Found:** 2026-11-12, Phase 52.1 replan from the cross-AI plan review (the plans 07-12 planner; host-checked in
+source at f23c2eb). Not found by a run.
+**Defect:** two `stop` paths still refuse a socket probe error and name nothing to do next:
+`stop_pending_launch` (`crates/devflow-cli/src/commands.rs:2986`, via `probe_refusal`) and `stop_one_launch` for
+`stop --launch` (`commands.rs:3303`). Both print "nothing was signalled, removed or recorded". D-21 covers only the
+run's recorded supervisor, so 52.1-08 changes neither.
+**Not established:** whether either path is reachable in practice with a probe error (no run has hit it), and whether
+the backstop's identity checks can be applied to a pending launch, which has no recorded supervisor.
+**Fix shape:** route both through 52.1-08's `teardown_unprobeable` where a sidecar exists, otherwise refuse and name
+the way on; one e2e test per path with a regular file at the socket path. Take it in the first fix branch after 52.1.
+
 ### Phase 999.232: `health_fails_closed_on_a_hung_probe` Flakes on Its Descendant-Dead Check Under Load (BACKLOG)
 
 **Found:** 2026-11-11, Phase 52 close-out: the `workspace/denniyahh` pre-push container gate failed 1 of 1079
