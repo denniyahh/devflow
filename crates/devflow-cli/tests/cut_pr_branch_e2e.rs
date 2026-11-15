@@ -782,3 +782,40 @@ fn an_include_naming_a_merge_commit_is_refused() {
 
     assert_include_refused(&fixture, &out, &not_in_range(&merge));
 }
+
+#[test]
+fn without_a_phase_every_commit_is_replayed_minus_its_forbidden_paths() {
+    const NOTES_PR_BRANCH: &str = "feature/notes";
+    let fixture = Fixture::new();
+    fixture.git(&["checkout", "-q", "-b", "workspace/notes"]);
+    fixture.commit("feat: code", &["src/a.txt"]);
+    fixture.commit("docs: planning only", &[".planning/a.md"]);
+    fixture.commit("chore: mixed", &["src/b.txt", ".planning/b.md"]);
+
+    let out = fixture.script(&[]).output().expect("run cut-pr-branch.sh");
+
+    assert!(
+        out.status.success(),
+        "the cut must pass: {}",
+        describe(&out)
+    );
+    let range = format!("origin/develop..{NOTES_PR_BRANCH}");
+    assert_eq!(
+        fixture
+            .git(&["log", "--reverse", "--format=%s", &range])
+            .lines()
+            .collect::<Vec<_>>(),
+        ["feat: code", "chore: mixed"],
+        "the code commits must be replayed in order and the planning-only one left out: {}",
+        describe(&out)
+    );
+    assert_eq!(
+        fixture
+            .git(&["ls-tree", "-r", "--name-only", NOTES_PR_BRANCH])
+            .lines()
+            .collect::<Vec<_>>(),
+        ["base.txt", "src/a.txt", "src/b.txt"],
+        "the PR branch must hold the code files and no forbidden path: {}",
+        describe(&out)
+    );
+}
