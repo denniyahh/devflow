@@ -3,7 +3,7 @@
 # by filtering out all personal/agent planning artifacts (.planning, .agents, etc.).
 #
 # Usage:
-#   ./scripts/cut-pr-branch.sh [--phase N] [TARGET_PR_BRANCH] [BASE_BRANCH] [WORKSPACE_BASE]
+#   ./scripts/cut-pr-branch.sh [--phase N] [--include SHA]... [TARGET_PR_BRANCH] [BASE_BRANCH] [WORKSPACE_BASE]
 #
 # Phase mode (--phase N, or automatic on a feature/phase-N branch) replays only
 # the commits in BASE_BRANCH..HEAD whose conventional-commit scope names phase N
@@ -12,6 +12,11 @@
 # Phase work committed on the workspace branch before the phase branch split
 # off is included, and unrelated workspace commits are left out, whatever the
 # fork point. The default PR branch is feature/phase-N-pr.
+#
+# Before replaying, phase mode lists on stderr every commit the scope filter
+# skips that touches a file which would reach develop. `--include <sha>` (or
+# `--include=<sha>`, repeatable) replays such a commit in its place in the
+# range's order. A SHA outside BASE_BRANCH..HEAD, or a merge commit, is refused.
 #
 # Without a phase, the branch's commits since its fork from WORKSPACE_BASE are
 # replayed. WORKSPACE_BASE is the third argument, the WORKSPACE_BASE environment
@@ -30,6 +35,7 @@
 set -euo pipefail
 
 PHASE="${PHASE:-}"
+INCLUDES=()
 POSITIONAL=()
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -40,6 +46,15 @@ while [ $# -gt 0 ]; do
             ;;
         --phase=*)
             PHASE="${1#--phase=}"
+            shift
+            ;;
+        --include)
+            [ $# -ge 2 ] || { echo "error: --include needs a commit SHA" >&2; exit 1; }
+            INCLUDES+=("$2")
+            shift 2
+            ;;
+        --include=*)
+            INCLUDES+=("${1#--include=}")
             shift
             ;;
         *)
@@ -73,6 +88,9 @@ if [ -n "$PHASE" ]; then
     fi
     PHASE_INT="${PHASE%%.*}"
     PHASE="$((10#$PHASE_INT))${PHASE#"$PHASE_INT"}"
+elif [ "${#INCLUDES[@]}" -gt 0 ]; then
+    echo "error: --include needs a phase (--phase N, or a feature/phase-N branch); without one every commit since the fork point is replayed." >&2
+    exit 1
 fi
 
 # Infer PR branch name if not explicitly passed
@@ -157,10 +175,22 @@ if [ -n "$PHASE" ]; then
     # Review fixes use -review and -fix; no other suffix is accepted.
     PHASE_ESC="${PHASE//./\\.}"
     SCOPE_RE="^[a-z]+\((phase-)?0*${PHASE_ESC}(-[0-9]+|-review|-fix)?\)!?: "
+    # Every --include must name a non-merge commit in the range; a wrong one
+    # is refused here, before anything is created.
+    RANGE_HASHES="$(git log --no-merges --format='%H' "$BASE_REF..$CURRENT_BRANCH")"
+    INCLUDE_SET=$'\n'
+    for INCLUDE in ${INCLUDES[@]+"${INCLUDES[@]}"}; do
+        INCLUDE_HASH="$(git rev-parse --verify -q "${INCLUDE}^{commit}" || true)"
+        if [ -z "$INCLUDE_HASH" ] || [[ $'\n'"$RANGE_HASHES"$'\n' != *$'\n'"$INCLUDE_HASH"$'\n'* ]]; then
+            echo "error: --include $INCLUDE is not in $BASE_REF..$CURRENT_BRANCH (or is a merge commit)" >&2
+            exit 1
+        fi
+        INCLUDE_SET+="$INCLUDE_HASH"$'\n'
+    done
     COMMIT_LIST=()
     SKIPPED_CODE=()
     while IFS=$'\t' read -r HASH SHORT_HASH SUBJECT; do
-        if [[ "$SUBJECT" =~ $SCOPE_RE ]]; then
+        if [[ "$SUBJECT" =~ $SCOPE_RE ]] || [[ "$INCLUDE_SET" == *$'\n'"$HASH"$'\n'* ]]; then
             COMMIT_LIST+=("$HASH")
             continue
         fi
@@ -172,14 +202,14 @@ if [ -n "$PHASE" ]; then
     # A commit the scope filter leaves out is never dropped silently when it
     # touches a file that would reach develop.
     if [ "${#SKIPPED_CODE[@]}" -gt 0 ]; then
-        echo "cut-pr-branch: ${#SKIPPED_CODE[@]} commit(s) outside phase $PHASE's scope touch files that would reach develop:" >&2
+        echo "cut-pr-branch: ${#SKIPPED_CODE[@]} commit(s) outside phase $PHASE's scope touch files that would reach develop; replay one with --include <sha>:" >&2
         printf '%s\n' "${SKIPPED_CODE[@]}" >&2
     fi
     if [ "${#COMMIT_LIST[@]}" -eq 0 ]; then
         echo "error: no commits scoped to phase $PHASE in $BASE_REF..$CURRENT_BRANCH." >&2
         exit 1
     fi
-    echo "==> Source branch: $CURRENT_BRANCH (${#COMMIT_LIST[@]} commits scoped to phase $PHASE not yet in $BASE_REF)"
+    echo "==> Source branch: $CURRENT_BRANCH (${#COMMIT_LIST[@]} commits selected for phase $PHASE, not yet in $BASE_REF)"
 else
     # Find fork point from base workspace branch
     FORK_POINT=$(git merge-base "$CURRENT_BRANCH" "$WORKSPACE_BASE" 2>/dev/null || true)
