@@ -40,6 +40,15 @@ pub const GSD_READER_TIMEOUT: Duration = Duration::from_secs(60);
 /// How often a running reader is polled for exit.
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+/// How long a test build's reader spawn keeps retrying `ETXTBSY`. See
+/// [`spawn_reader_observed`].
+#[cfg(any(test, feature = "test-support"))]
+const TEXT_BUSY_RETRY_FOR: Duration = Duration::from_secs(2);
+
+/// How long a test build's reader spawn waits between `ETXTBSY` retries.
+#[cfg(any(test, feature = "test-support"))]
+const TEXT_BUSY_RETRY_STEP: Duration = Duration::from_millis(10);
+
 /// Where each runtime install ships GSD's `gsd_run` launcher, relative to the
 /// home, in the order they are tried.
 const LAUNCHER_CANDIDATES: [&str; 3] = [
@@ -325,7 +334,8 @@ fn run_bounded(mut cmd: Command, timeout: Duration) -> Result<ReaderOutput, Read
     })
 }
 
-/// Spawn the reader. A release build spawns once.
+/// Spawn the reader. A release build spawns once; the retry in
+/// [`spawn_reader_observed`] is not compiled into it.
 #[cfg(not(any(test, feature = "test-support")))]
 fn spawn_reader(cmd: &mut Command) -> Result<Child, ReaderFailure> {
     cmd.spawn().map_err(|error| ReaderFailure::Spawn {
@@ -339,15 +349,47 @@ fn spawn_reader(cmd: &mut Command) -> Result<Child, ReaderFailure> {
     spawn_reader_observed(cmd, &mut || {})
 }
 
-/// Spawn the reader, telling `on_text_busy` about each `ETXTBSY` it meets.
+/// Test-only retry (999.222). Spawn the reader, retrying `ETXTBSY` every
+/// [`TEXT_BUSY_RETRY_STEP`] for up to [`TEXT_BUSY_RETRY_FOR`], and call
+/// `on_text_busy` after each `ETXTBSY` that is retried.
+///
+/// A test writes its stub launcher and then runs it. A sibling test's `fork`
+/// in the same process holds a copy of the stub's write descriptor until its
+/// own `exec`, close-on-exec or not, and `exec` of a file open for writing
+/// fails with `ETXTBSY`. A real launcher is not being written while it is
+/// read, so only a test build retries.
+///
+/// The observer exists so the reproduction can release the fork it holds at
+/// the moment this function meets `ETXTBSY`, not after a guessed delay.
+///
+/// Compiled only under `cfg(test)` or the `test-support` feature, together
+/// with its two constants and the [`spawn_reader`] that calls it.
 #[cfg(any(test, feature = "test-support"))]
 fn spawn_reader_observed(
     cmd: &mut Command,
-    _on_text_busy: &mut dyn FnMut(),
+    on_text_busy: &mut dyn FnMut(),
 ) -> Result<Child, ReaderFailure> {
-    cmd.spawn().map_err(|error| ReaderFailure::Spawn {
-        message: error.to_string(),
-    })
+    let deadline = Instant::now() + TEXT_BUSY_RETRY_FOR;
+    loop {
+        let error = match cmd.spawn() {
+            Ok(child) => return Ok(child),
+            Err(error) => error,
+        };
+        if error.raw_os_error() != Some(libc::ETXTBSY) {
+            return Err(ReaderFailure::Spawn {
+                message: error.to_string(),
+            });
+        }
+        if Instant::now() >= deadline {
+            return Err(ReaderFailure::Spawn {
+                message: format!(
+                    "{error}; still busy after retrying for {TEXT_BUSY_RETRY_FOR:?} (test builds only)"
+                ),
+            });
+        }
+        on_text_busy();
+        std::thread::sleep(TEXT_BUSY_RETRY_STEP);
+    }
 }
 
 /// Read `pipe` to its end on a thread; the bytes arrive on the receiver.
