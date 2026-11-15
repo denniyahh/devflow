@@ -5,16 +5,16 @@ milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: "52.1"
 current_phase_name: Stabilize for Dogfooding
 status: executing
-stopped_at: Completed 52.1-03-PLAN.md
-last_updated: "2026-11-15T17:56:44.161Z"
+stopped_at: Completed 52.1-05-PLAN.md
+last_updated: "2026-11-15T18:20:21.876Z"
 last_activity: 2026-11-14
 last_activity_desc: Phase 52.1 execution started
-state_head: 951b62e858aaab9e70579263dc606ed858341e89
+state_head: 616a18e5dd6fbe91292c612d2fc4ff7c3ef3ce33
 progress:
   total_phases: 5
   completed_phases: 0
   total_plans: 48
-  completed_plans: 36
+  completed_plans: 37
   percent: 0
 ---
 
@@ -172,7 +172,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 52.1 (Stabilize for Dogfooding) — EXECUTING
-Plan: 4 of 15
+Plan: 5 of 15
 Status: Ready to execute
 Last activity: 2026-11-14 — Phase 52.1 execution started
 
@@ -920,6 +920,10 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 52.1]: 52.1-03: --include without a phase is refused, because non-phase mode replays every commit and would ignore the option silently (T-52.1-06)
 - [Phase 52.1]: 52.1-03: the three shellcheck notes cut-pr-branch.sh already carried are marked with directives (comments only), so the plan's shellcheck gate exits 0 and reports new findings alone
 - [Phase 52.1]: 52.1-03: an unreadable out-of-scope commit stops the cut before anything is created; an unreadable in-scope commit is still stopped in the replay loop, after the PR branch exists (untested gap)
+- [Phase 52.1]: 52.1-05: the default scaffold config follows the live payload's top-level key order (commit_docs, parallelization, workflow, git) with model_profile appended last
+- [Phase 52.1]: 52.1-05: the pre-written 01-VALIDATION.md uses the GSD 1.21.0 template columns; its one row is pending, not green, because PROBE.md does not exist at scaffold time
+- [Phase 52.1]: 52.1-05: the selftest's 01-VALIDATION.md case reads the plan's automated line and requires the map row to name it
+- [Phase 52.1]: 52.1-05: executed on GSD 1.21.0 after the orchestrator amended the 1.20.1 precondition (24c90a6) on re-measured facts; validate-phase State A (A3) was not re-checked and stays untested until 52.1-14
 
 ## Roadmap Evolution
 
@@ -1067,11 +1071,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 52.1 P01 | 23min | 3 tasks | 4 files |
 | Phase 52.1 P02 | 23 min | 3 tasks | 7 files |
 | Phase 52.1 P03 | 22 min | 3 tasks | 3 files |
+| Phase 52.1 P05 | 15 min | 2 tasks | 1 files |
 
 ## Session
 
-**Last session:** 2026-11-15T17:56:43.545Z
-**Stopped at:** Completed 52.1-03-PLAN.md
+**Last session:** 2026-11-15T18:20:20.793Z
+**Stopped at:** Completed 52.1-05-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
