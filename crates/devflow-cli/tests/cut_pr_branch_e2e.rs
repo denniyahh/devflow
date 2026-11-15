@@ -501,6 +501,83 @@ fn an_unreadable_commit_aborts_before_anything_is_replayed() {
     );
 }
 
+/// Removes the loose object holding `commit`'s root tree, so git can no longer
+/// list the files the commit touches.
+fn remove_root_tree(fixture: &Fixture, commit: &str) {
+    let tree = fixture.git(&["rev-parse", &format!("{commit}^{{tree}}")]);
+    let object = fixture
+        .work()
+        .join(".git/objects")
+        .join(&tree[..2])
+        .join(&tree[2..]);
+    assert!(
+        object.is_file(),
+        "premise: the commit's tree must be a loose object at {}",
+        object.display()
+    );
+    std::fs::remove_file(&object).expect("remove the commit's tree object");
+}
+
+fn local_branches(fixture: &Fixture) -> String {
+    fixture.git(&["for-each-ref", "--format=%(refname)", "refs/heads"])
+}
+
+/// Asserts the script stopped on `commit` with the error that names it.
+fn assert_refused_as_unreadable(out: &Output, commit: &str) {
+    assert!(
+        !out.status.success(),
+        "a commit git cannot read must stop the cut: {}",
+        describe(out)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "error: cannot list the files commit {commit} touches"
+        )),
+        "the error must name the commit ({commit}) whose files could not be listed: {}",
+        describe(out)
+    );
+}
+
+#[test]
+fn an_unreadable_in_scope_commit_is_refused_before_the_pr_branch_is_created() {
+    let fixture = Fixture::new();
+    fixture.commit("feat(52.1-01): a", &["src/a.txt"]);
+    let unreadable = fixture.commit("feat(52.1-02): b", &["src/b.txt"]);
+    fixture.commit("feat(52.1-03): c", &["src/c.txt"]);
+    remove_root_tree(&fixture, &unreadable);
+
+    let out = fixture.cut(&[]);
+
+    assert_refused_as_unreadable(&out, &unreadable);
+    assert!(
+        !fixture.pr_branch_exists(),
+        "the cut must stop before the PR branch is created: {}",
+        describe(&out)
+    );
+}
+
+#[test]
+fn an_unreadable_commit_is_refused_before_a_branch_is_created_without_a_phase() {
+    let fixture = Fixture::new();
+    fixture.git(&["checkout", "-q", "-b", "workspace/notes"]);
+    fixture.commit("feat: a", &["src/a.txt"]);
+    let unreadable = fixture.commit("feat: b", &["src/b.txt"]);
+    fixture.commit("feat: c", &["src/c.txt"]);
+    remove_root_tree(&fixture, &unreadable);
+    let branches_before = local_branches(&fixture);
+
+    let out = fixture.script(&[]).output().expect("run cut-pr-branch.sh");
+
+    assert_refused_as_unreadable(&out, &unreadable);
+    assert_eq!(
+        local_branches(&fixture),
+        branches_before,
+        "the cut must stop before any branch is created: {}",
+        describe(&out)
+    );
+}
+
 #[test]
 fn an_included_commit_is_replayed_in_its_original_order() {
     let fixture = Fixture::new();
