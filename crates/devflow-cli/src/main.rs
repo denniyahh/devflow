@@ -22,8 +22,8 @@ mod phase_worktree;
 
 mod commands;
 use commands::{
-    GateAnswerKind, cleanup, doctor, gate_list, gate_respond, gate_show, gate_sweep, history_cmd,
-    logs, recover_cmd, start, status, stop, stop_launch,
+    GateAnswerKind, cleanup, discard, doctor, gate_list, gate_respond, gate_show, gate_sweep,
+    history_cmd, logs, recover_cmd, start, status, stop, stop_launch,
 };
 use devflow_core::phase_id::PhaseId;
 
@@ -224,6 +224,21 @@ enum Command {
         /// merged into the base is still kept.
         #[arg(long)]
         force: bool,
+    },
+    /// Remove a phase's worktree, its uncommitted changes, its run state and
+    /// its feature branch, after listing them. Refuses a live run; refuses an
+    /// unmerged branch unless `--delete-unmerged-branch` names it.
+    Discard {
+        /// Phase to discard.
+        #[arg(long)]
+        phase: PhaseId,
+        /// Also delete the phase's feature branch when it has commits not
+        /// merged into the base. The value must be that branch's name.
+        #[arg(long, value_name = "BRANCH")]
+        delete_unmerged_branch: Option<String>,
+        /// Project root.
+        #[arg(default_value = ".")]
+        project: PathBuf,
     },
     /// Show current workflow state.
     Status {
@@ -599,6 +614,15 @@ fn run() -> Result<(), CliError> {
         } => logs(&project_root(project)?, phase, follow, stderr),
         Command::History { phase, project } => history_cmd(&project_root(project)?, phase),
         Command::Cleanup { project, force } => cleanup(&project_root(project)?, force),
+        Command::Discard {
+            phase,
+            delete_unmerged_branch,
+            project,
+        } => discard(
+            &project_root(project)?,
+            phase,
+            delete_unmerged_branch.as_deref(),
+        ),
         Command::Status { project } => status(&project_root(project)?),
         Command::Recover {
             project,

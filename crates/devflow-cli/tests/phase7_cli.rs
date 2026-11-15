@@ -1840,6 +1840,17 @@ fn cleanup_fixture(
     shape: impl FnOnce(&mut devflow_core::state::State),
 ) -> PathBuf {
     init_repo(root);
+    add_phase(root, phase, merged, shape)
+}
+
+/// [`cleanup_fixture`]'s branch, worktree and saved state for `phase`, in a repository
+/// that is already initialised, so one repository can hold more than one phase.
+fn add_phase(
+    root: &Path,
+    phase: PhaseId,
+    merged: bool,
+    shape: impl FnOnce(&mut devflow_core::state::State),
+) -> PathBuf {
     let branch = format!("feature/phase-{padded}", padded = phase.padded());
     if merged {
         git(root, &["branch", &branch, "develop"]);
@@ -3015,4 +3026,184 @@ fn hermes_hung_process_is_detected_not_left_running() {
         "a hung-then-killed hermes run must not advance its stage"
     );
     let _reap = MonitorReapGuard::after_launch(&gated);
+}
+
+/// A finished run, as [`cleanup_fixture`]'s `shape`.
+fn finished(state: &mut devflow_core::state::State) {
+    state.stopped = true;
+    state.finished = true;
+    state.stop_reason = Some(FINISHED_REASON.to_string());
+}
+
+/// `devflow discard --phase <phase>` (plus `extra`) on `root`, in a hermetic home.
+fn run_discard(home: &common::HermeticHome, root: &Path, phase: PhaseId, extra: &[&str]) -> Output {
+    let fake_bin = fake_bin_dir(&[]);
+    common::hermetic_devflow(home)
+        .args(["discard", "--phase", &phase.to_string()])
+        .args(extra)
+        .arg(root)
+        .env("PATH", path_with_fake_bin(&fake_bin.path))
+        .current_dir(root)
+        .output()
+        .expect("run devflow discard")
+}
+
+/// Everything `devflow discard` may remove for one phase, as it is on disk: read before
+/// and after a run, so a refusal is shown to have removed none of it and a removal is
+/// shown to have left another phase's alone.
+#[derive(Debug, PartialEq)]
+struct PhaseItems {
+    /// Every file below `.worktrees/phase-NN` with its bytes, uncommitted ones included.
+    /// `None` when nothing is at that path.
+    worktree: Option<Vec<(PathBuf, Vec<u8>)>>,
+    /// The bytes of `.devflow/state-NN.json`, or `None` with no such file.
+    state: Option<Vec<u8>>,
+    /// The tip of `feature/phase-NN`, or `None` with no such branch.
+    branch_tip: Option<String>,
+}
+
+impl PhaseItems {
+    /// A phase with no worktree, no state and no branch.
+    const NONE: Self = Self {
+        worktree: None,
+        state: None,
+        branch_tip: None,
+    };
+}
+
+fn phase_items(root: &Path, phase: PhaseId) -> PhaseItems {
+    let worktree = devflow_core::worktree::phase_path(root, phase);
+    PhaseItems {
+        worktree: worktree.exists().then(|| {
+            common::entries_under(&worktree)
+                .into_iter()
+                .map(|file| {
+                    let bytes = fs::read(&file).expect("read a worktree file");
+                    (file, bytes)
+                })
+                .collect()
+        }),
+        state: fs::read(devflow_core::workflow::state_path(root, phase)).ok(),
+        branch_tip: branch_tip(
+            root,
+            &format!("feature/phase-{padded}", padded = phase.padded()),
+        ),
+    }
+}
+
+/// The phase a discard of any other phase must leave alone.
+const BYSTANDER_PHASE: PhaseId = PhaseId::new(90);
+/// A branch no phase owns, holding a commit that is not in `develop`.
+const BYSTANDER_BRANCH: &str = "keep/unrelated";
+
+/// What a discard of another phase must leave alone: [`BYSTANDER_PHASE`]'s worktree
+/// (with an uncommitted file), state and unmerged branch, and [`BYSTANDER_BRANCH`].
+struct Bystanders {
+    phase: PhaseItems,
+    branch_tip: String,
+}
+
+/// Add the bystanders to an initialised repository and record them.
+fn add_bystanders(root: &Path) -> Bystanders {
+    let worktree = add_phase(root, BYSTANDER_PHASE, false, finished);
+    fs::write(worktree.join("scratch.txt"), "the bystander's work\n").unwrap();
+    let phase_branch = format!("feature/phase-{}", BYSTANDER_PHASE.padded());
+    git(root, &["branch", BYSTANDER_BRANCH, &phase_branch]);
+    let phase = phase_items(root, BYSTANDER_PHASE);
+    assert!(
+        phase.worktree.is_some() && phase.state.is_some() && phase.branch_tip.is_some(),
+        "premise: the bystander phase has a worktree, a state and a branch"
+    );
+    Bystanders {
+        phase,
+        branch_tip: branch_tip(root, BYSTANDER_BRANCH).expect("premise: the unrelated branch"),
+    }
+}
+
+impl Bystanders {
+    /// Assert that the bystanders are exactly as [`add_bystanders`] recorded them.
+    fn assert_untouched(&self, root: &Path, text: &str) {
+        assert_eq!(
+            phase_items(root, BYSTANDER_PHASE),
+            self.phase,
+            "another phase's worktree, state and branch are untouched: {text}"
+        );
+        assert_eq!(
+            branch_tip(root, BYSTANDER_BRANCH).as_deref(),
+            Some(self.branch_tip.as_str()),
+            "an unrelated branch is untouched: {text}"
+        );
+    }
+}
+
+/// A discard's stdout and its stdout followed by its stderr.
+fn discard_text(out: &Output) -> (String, String) {
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let text = format!("{stdout}{}", String::from_utf8_lossy(&out.stderr));
+    (stdout, text)
+}
+
+/// The item lines of a discard's listing: the indented lines of its stdout.
+fn discard_listing(stdout: &str) -> Vec<&str> {
+    stdout
+        .lines()
+        .filter(|line| line.starts_with("  "))
+        .collect()
+}
+
+/// D-09.2: `devflow discard --phase N` lists the worktree, its uncommitted changes, the
+/// run state and the branch, then removes exactly those: another phase's worktree, state
+/// and branch and an unrelated branch are left as they were.
+#[test]
+fn discard_removes_a_finished_runs_worktree_state_and_merged_branch() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    let phase = PhaseId::new(31);
+    let worktree = cleanup_fixture(&root, phase, true, finished);
+    fs::write(worktree.join("scratch.txt"), "uncommitted\n").unwrap();
+    let bystanders = add_bystanders(&root);
+    let before = phase_items(&root, phase);
+    assert!(
+        before.worktree.is_some() && before.state.is_some() && before.branch_tip.is_some(),
+        "premise: the phase has a worktree, a state and a branch"
+    );
+
+    let out = run_discard(&home, &root, phase, &[]);
+    let (stdout, text) = discard_text(&out);
+    assert!(out.status.success(), "{text}");
+
+    let listing = discard_listing(&stdout);
+    let listed = |fragment: &str| listing.iter().any(|line| line.contains(fragment));
+    assert!(
+        listed(&worktree.display().to_string()),
+        "the listing names the worktree: {text}"
+    );
+    assert!(
+        listed("1 uncommitted change"),
+        "the listing counts the worktree's uncommitted changes: {text}"
+    );
+    let state_file = devflow_core::workflow::state_path(&root, phase);
+    assert!(
+        listed(&state_file.display().to_string()),
+        "the listing names the run state: {text}"
+    );
+    assert!(
+        listed("branch feature/phase-31 (merged into `develop`)"),
+        "the listing names the branch and that it is merged: {text}"
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    let last_listed = lines.iter().rposition(|line| line.starts_with("  "));
+    let first_removed = lines.iter().position(|line| line.starts_with("removed "));
+    assert!(
+        last_listed.is_some() && last_listed < first_removed,
+        "every listing line comes before the first `removed` line: {text}"
+    );
+
+    assert_eq!(
+        phase_items(&root, phase),
+        PhaseItems::NONE,
+        "the worktree, the state and the branch are gone: {text}"
+    );
+    bystanders.assert_untouched(&root, &text);
 }
