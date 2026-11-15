@@ -199,6 +199,11 @@ pub struct ClearOutcome {
     /// whenever the working tree was corrected but the committed copy was left
     /// alone for a reason the operator needs to hear.
     pub commit_refused: Option<String>,
+    /// Not a leak: the branch tip held no `true` flag, the working copy holds
+    /// GSD's `false`, the two copies differed only in the key's presence or in
+    /// layout, and a commit recorded the working copy. Confirmed by re-probing
+    /// the tip after the commit, like `committed_tree_repaired`.
+    pub recorded_gsd_false: bool,
 }
 
 impl ClearOutcome {
@@ -641,6 +646,131 @@ mod tests {
         );
         assert_eq!(outcome.commit_refused, None);
         assert_eq!(flag_at_head(&root), Value::Bool(false));
+    }
+
+    /// The subject of the commit `force_clear_auto_chain` writes when it
+    /// records GSD's `false` rather than repairing a leak.
+    const RECORD_SUBJECT: &str = "chore(gsd): record GSD's workflow._auto_chain_active: false";
+
+    /// [`REAL_SHAPE`] parsed, with the chain flag removed: a config that has
+    /// not grown the key yet.
+    fn real_shape_without_the_key() -> Value {
+        let mut value: Value = serde_json::from_str(&real_shape(false)).unwrap();
+        without_flag(&mut value);
+        assert_eq!(
+            value["workflow"]["_auto_chain_active"],
+            Value::Null,
+            "the fixture must actually lack the key"
+        );
+        value
+    }
+
+    /// GSD's own serialization: two-space pretty JSON plus one newline.
+    fn pretty(value: &Value) -> String {
+        format!("{}\n", serde_json::to_string_pretty(value).unwrap())
+    }
+
+    fn head_subject(root: &Path) -> String {
+        git_output(root, &["log", "-1", "--format=%s"])
+            .trim_end()
+            .to_string()
+    }
+
+    fn status_porcelain(root: &Path) -> String {
+        git_output(root, &["status", "--porcelain"])
+    }
+
+    /// GSD's first `config-set` in a project whose committed config never had
+    /// the key writes `false`. Nothing leaked: the commit that keeps the tree
+    /// clean says what it records, and the outcome reports no repair.
+    #[test]
+    fn force_clear_records_gsds_false_without_reporting_a_leak() {
+        let (_dir, root) = git_project();
+        write_config(&root, &pretty(&real_shape_without_the_key()));
+        commit_config(&root, "add gsd config without the chain flag");
+        assert_eq!(
+            flag_at_head(&root),
+            Value::Null,
+            "premise: the committed config lacks the key"
+        );
+        write_config(&root, &real_shape(false));
+
+        let outcome = force_clear_auto_chain(&root).unwrap();
+
+        assert!(
+            !outcome.committed_tree_repaired,
+            "the branch tip never held true, so no repair may be reported"
+        );
+        assert!(
+            outcome.recorded_gsd_false,
+            "GSD's false over an absent key must be reported as recorded"
+        );
+        assert!(!outcome.working_tree_repaired);
+        assert_eq!(outcome.commit_refused, None);
+        assert!(!outcome.repaired_anything());
+        assert_eq!(flag_at_head(&root), Value::Bool(false));
+        assert_eq!(head_subject(&root), RECORD_SUBJECT);
+        assert_eq!(status_porcelain(&root), "", "the tree must be left clean");
+    }
+
+    /// The committed copy already holds `false` and the working copy differs
+    /// only in serialization (a compact file that GSD's config-set rewrote
+    /// pretty). Still not a leak, and still recorded under the accurate commit.
+    #[test]
+    fn force_clear_records_a_layout_only_rewrite_of_false_without_reporting_a_leak() {
+        let (_dir, root) = git_project();
+        let value: Value = serde_json::from_str(&real_shape(false)).unwrap();
+        write_config(&root, &serde_json::to_string(&value).unwrap());
+        commit_config(&root, "add a compact gsd config");
+        assert_eq!(
+            flag_at_head(&root),
+            Value::Bool(false),
+            "premise: the committed config holds false"
+        );
+        write_config(&root, &real_shape(false));
+
+        let outcome = force_clear_auto_chain(&root).unwrap();
+
+        assert!(
+            !outcome.repaired_anything(),
+            "a layout-only difference must not be reported as a killed-run repair"
+        );
+        assert!(
+            outcome.recorded_gsd_false,
+            "the rewritten copy must be reported as recorded"
+        );
+        assert_eq!(outcome.commit_refused, None);
+        assert_eq!(head_subject(&root), RECORD_SUBJECT);
+        assert_eq!(status_porcelain(&root), "", "the tree must be left clean");
+    }
+
+    /// Neither copy holds the flag and only the layout differs. DevFlow owns
+    /// only the flag, so it commits nothing and reports nothing.
+    #[test]
+    fn force_clear_leaves_a_layout_only_difference_without_the_key_uncommitted() {
+        let (_dir, root) = git_project();
+        let value = real_shape_without_the_key();
+        write_config(&root, &serde_json::to_string(&value).unwrap());
+        commit_config(&root, "add a compact gsd config without the chain flag");
+        let head_before = head_sha(&root);
+        write_config(&root, &pretty(&value));
+
+        let outcome = force_clear_auto_chain(&root).unwrap();
+
+        assert_eq!(
+            head_sha(&root),
+            head_before,
+            "a layout difference with no flag in it must not be committed"
+        );
+        assert_eq!(
+            status_porcelain(&root),
+            " M .planning/config.json\n",
+            "the operator's file stays as it was: modified and uncommitted"
+        );
+        assert!(!outcome.working_tree_repaired);
+        assert!(!outcome.committed_tree_repaired);
+        assert!(!outcome.recorded_gsd_false);
+        assert_eq!(outcome.commit_refused, None);
     }
 
     /// F-8 / T-35.1-08: `commit_path` is path-scoped but still commits whatever

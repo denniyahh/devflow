@@ -361,19 +361,33 @@ pub(crate) fn repair_leaked_auto_chain_flag(
         }),
     );
 
+    if let Some(note) = auto_chain_repair_note(entry_point, phase, &outcome) {
+        println!("{note}");
+    }
+    if let Some(reason) = &outcome.commit_refused {
+        println!("warning: {reason}");
+    }
+}
+
+/// The foreground `note:` line for what [`repair_leaked_auto_chain_flag`] found,
+/// or `None` when there is nothing to say. Names a killed run only when a set
+/// flag was actually cleared.
+fn auto_chain_repair_note(
+    entry_point: &str,
+    phase: PhaseId,
+    outcome: &gsd_config::ClearOutcome,
+) -> Option<String> {
     if outcome.repaired_anything() {
-        println!(
+        return Some(format!(
             "note: devflow {entry_point} found phase {phase}'s GSD chain flag \
              (workflow._auto_chain_active) still set — a previous run for this phase \
              was killed before it could clear it. Cleared before launching \
              (working tree: {}, this branch's tip: {})",
             repaired_word(outcome.working_tree_repaired),
             repaired_word(outcome.committed_tree_repaired),
-        );
+        ));
     }
-    if let Some(reason) = &outcome.commit_refused {
-        println!("warning: {reason}");
-    }
+    None
 }
 
 fn repaired_word(repaired: bool) -> &'static str {
@@ -4237,6 +4251,71 @@ mod tests {
             repair_events(root).is_empty(),
             "a launch that found nothing to repair must write no event: {:?}",
             repair_events(root)
+        );
+    }
+
+    /// GSD's first `false` over a committed config that lacks the key is
+    /// recorded in a commit, with no repair event and no killed-run wording:
+    /// nothing leaked, so nothing may read as a killed run.
+    #[test]
+    fn recording_gsds_false_emits_no_repair_event_and_no_killed_run_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let config = root.join(".planning/config.json");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config,
+            "{\n  \"workflow\": {\n    \"auto_advance\": true\n  }\n}\n",
+        )
+        .unwrap();
+        let git = |args: &[&str]| {
+            let output = devflow_core::test_support::git_command(root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?} failed");
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        };
+        git(&["add", ".planning/config.json"]);
+        git(&[
+            "commit",
+            "-q",
+            "-m",
+            "add gsd config without the chain flag",
+        ]);
+        std::fs::write(
+            &config,
+            "{\n  \"workflow\": {\n    \"auto_advance\": true,\n    \
+             \"_auto_chain_active\": false\n  }\n}\n",
+        )
+        .unwrap();
+
+        repair_leaked_auto_chain_flag(root, root, PhaseId::new(83), "start");
+
+        assert!(
+            repair_events(root).is_empty(),
+            "recording GSD's false is not a repair and must write no repair event: {:?}",
+            repair_events(root)
+        );
+        assert_eq!(
+            git(&["log", "-1", "--format=%s"]).trim_end(),
+            "chore(gsd): record GSD's workflow._auto_chain_active: false",
+            "the launch repair must have recorded the working copy, or the absent event is vacuous"
+        );
+        let outcome = gsd_config::ClearOutcome {
+            recorded_gsd_false: true,
+            ..Default::default()
+        };
+        let note = auto_chain_repair_note("start", PhaseId::new(83), &outcome)
+            .expect("a recorded false must be announced");
+        assert!(
+            note.contains("recorded GSD's workflow._auto_chain_active: false"),
+            "the note must say what was recorded: {note}"
+        );
+        assert!(
+            !note.contains("was killed before it could clear it"),
+            "the note must not name a killed run: {note}"
         );
     }
 
