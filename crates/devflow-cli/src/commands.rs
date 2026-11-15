@@ -1407,13 +1407,108 @@ fn remove_run_state_with_worktree(project_root: &Path, state: &State, removed: &
 
 /// `devflow discard --phase N`: remove the phase's worktree, its run state and its
 /// feature branch, after listing them.
+///
+/// The worktree and the state are the derived `.worktrees/phase-NN` and
+/// `.devflow/state-NN.json`, never a path read from the state, and the branch is the
+/// derived `feature/phase-NN`. The phase's foreground holder is held from the first
+/// check to the last removal, so a `start` cannot begin in between.
 pub(crate) fn discard(
     project_root: &Path,
     phase: PhaseId,
     delete_unmerged_branch: Option<&str>,
 ) -> Result<(), CliError> {
-    let _ = (project_root, phase, delete_unmerged_branch);
+    let _ = delete_unmerged_branch;
+    let _holder = claim_foreground_holder(project_root, phase)?;
+    let existing = workflow::update_state_with_within(
+        project_root,
+        phase,
+        workflow::WRITE_LOCK_REPAIR_WAIT,
+        |existing| Ok::<_, CliError>((None, existing)),
+    )?;
+    let flow = config::git_flow_for_project(project_root);
+    let recorded_base = match &existing {
+        workflow::Existing::Loaded(state) => state.base_branch.clone(),
+        workflow::Existing::Missing | workflow::Existing::Unloadable(_) => None,
+    };
+    let base = recorded_base.unwrap_or_else(|| flow.develop.clone());
+    let git = GitFlow::with_config(
+        project_root,
+        config::GitFlowConfig {
+            develop: base.clone(),
+            ..flow
+        },
+    );
+    let worktree = worktree::phase_path(project_root, phase);
+    let state_file = workflow::state_path(project_root, phase);
+    let branch = format!("{FEATURE_PREFIX}phase-{padded}", padded = phase.padded());
+
+    println!("discard: phase {phase} — to be removed:");
+    let uncommitted = match uncommitted_changes(&worktree) {
+        Ok(1) => "1 uncommitted change".to_string(),
+        Ok(count) => format!("{count} uncommitted changes"),
+        Err(why) => format!("its uncommitted changes could not be counted ({why})"),
+    };
+    println!(
+        "  worktree {}, with everything in it: {uncommitted} (ignored files are removed too \
+         and are not counted)",
+        worktree.display()
+    );
+    println!("  run state {}", state_file.display());
+    let merged = match git.commits_not_in_develop(&branch) {
+        Ok(0) => format!("merged into `{base}`"),
+        Ok(count) => unmerged_commits(count, &base),
+        Err(err) => format!("could not be checked for commits not merged into `{base}`: {err}"),
+    };
+    println!("  branch {branch} ({merged})");
+
+    let mut failed = false;
+    match worktree::remove(project_root, &worktree, true) {
+        Ok(()) => println!("removed worktree {}", worktree.display()),
+        Err(err) => {
+            failed = true;
+            println!(
+                "warning: could not remove the worktree {}: {err}",
+                worktree.display()
+            );
+        }
+    }
+    match workflow::clear_state(project_root, phase) {
+        Ok(true) => println!("removed run state {}", state_file.display()),
+        Ok(false) => {}
+        Err(err) => {
+            failed = true;
+            println!(
+                "warning: could not remove the run state {}: {err}",
+                state_file.display()
+            );
+        }
+    }
+    match git.delete_branch(&branch, true) {
+        Ok(()) => println!("removed branch {branch}"),
+        Err(err) => {
+            failed = true;
+            println!("warning: could not remove the branch {branch}: {err}");
+        }
+    }
+    if failed {
+        return Err(CliError::Message(format!(
+            "discard could not remove everything for phase {phase} — see the warnings above"
+        )));
+    }
     Ok(())
+}
+
+/// How many uncommitted changes the worktree at `path` holds: the lines of
+/// `git status --porcelain --untracked-files=all`. Ignored files are not counted.
+fn uncommitted_changes(path: &Path) -> Result<usize, String> {
+    let output = git_command(path)
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .output()
+        .map_err(|err| err.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).lines().count())
 }
 
 /// A phase's supervisor liveness as `status`, `cleanup` and `doctor` report
