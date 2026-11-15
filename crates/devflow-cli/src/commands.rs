@@ -19082,6 +19082,87 @@ mod tests {
         );
     }
 
+    /// Take the phase's state write lock on another thread and hold it until the
+    /// returned sender is dropped. Returns once the lock is held.
+    fn hold_state_write_lock(
+        root: &Path,
+        phase: PhaseId,
+    ) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Sender<()>) {
+        let (holding, wait_holding) = std::sync::mpsc::channel();
+        let (release, wait_release) = std::sync::mpsc::channel::<()>();
+        let root = root.to_path_buf();
+        let holder = std::thread::spawn(move || {
+            workflow::update_state(&root, phase, |_| {
+                holding.send(()).unwrap();
+                let _ = wait_release.recv_timeout(std::time::Duration::from_secs(30));
+                Ok::<(), workflow::WorkflowError>(())
+            })
+            .unwrap();
+        });
+        wait_holding.recv().unwrap();
+        (holder, release)
+    }
+
+    /// Check that the released state write lock reads free, telling `on_held` about
+    /// each reading that still says held.
+    fn wait_for_released_write_lock_with(root: &Path, phase: PhaseId, _on_held: impl FnMut()) {
+        assert_eq!(
+            workflow::write_lock_status(root, phase).unwrap(),
+            workflow::WriteLockStatus::Free,
+            "control: released"
+        );
+    }
+
+    /// 999.221 on demand: a child forked while the state write lock is held, and parked
+    /// before any exec, keeps a duplicate of the lock's descriptor after the holder lets
+    /// go, so a read right after the release says held. The released-lock wait outlasts
+    /// it.
+    ///
+    /// No clock decides what the first reading sees: the parked child is released only
+    /// by the wait's own on-held observer, or by its guard's drop once an assertion has
+    /// failed.
+    #[test]
+    fn the_released_write_lock_control_outlasts_a_fork_held_before_exec() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let phase = PhaseId::new(5190);
+        let state = State::new(phase, AgentKind::Claude, Mode::Supervise, root.clone());
+        workflow::save_state(&state).unwrap();
+        let (holder, release) = hold_state_write_lock(&root, phase);
+        let mut held_fork = Some(devflow_core::test_support::fork_held_before_exec());
+
+        drop(release);
+        holder.join().unwrap();
+        let mut times_held = 0_u32;
+        wait_for_released_write_lock_with(&root, phase, || {
+            times_held += 1;
+            if let Some(fork) = held_fork.take() {
+                fork.release();
+            }
+        });
+
+        assert!(
+            times_held >= 1,
+            "the held fork was never seen holding the lock: this run did not reproduce 999.221"
+        );
+        assert_eq!(
+            write_lock_line(&workflow::write_lock_status(&root, phase).unwrap()),
+            None,
+            "control: released"
+        );
+        assert!(
+            !rendered_status(&state).contains("state write lock"),
+            "control"
+        );
+        let free = reconcile_phase(&facts_for(&root, &state));
+        assert!(
+            !free
+                .iter()
+                .any(|finding| finding.detail.contains("state write lock")),
+            "control: released"
+        );
+    }
+
     /// Criterion 2 at a gate nothing waits on: `stop`'s own line names no `resume` while
     /// a pending supervisor lives, and names it again once that supervisor is gone.
     #[test]
