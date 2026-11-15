@@ -1488,12 +1488,12 @@ enum PhaseRunLiveness {
     /// agent group running, and a failed probe proves nothing either way, so this is
     /// not "no run": `devflow stop` is what ends it.
     Orphaned(PhaseLiveness),
-    /// The state is missing or does not load, so it names no supervisor to probe, and
-    /// the sweep of this root's and phase's sockets found some that may still run: one
-    /// [`LiveSocket::repair_line`] each.
+    /// The sweep of this root's and phase's sockets found some that may still run and
+    /// that the state does not name, because it is missing, does not load, or names
+    /// another launch or none: one [`LiveSocket::repair_line`] each.
     Swept(Vec<String>),
-    /// The state is missing or does not load, and the socket directory could not be
-    /// listed, so a live supervisor cannot be ruled out.
+    /// The socket directory could not be listed, so a live supervisor that the state
+    /// does not name cannot be ruled out.
     SocketDirUnlistable {
         /// The socket directory.
         dir: PathBuf,
@@ -1513,11 +1513,8 @@ enum PhaseRunLiveness {
 ///
 /// Four existing checks, in this order. `cleanup`'s live test alone (the agent pid
 /// file and [`probe_phase`]) misses two things: a STALE or unprobeable supervisor,
-/// which `cleanup` handles in a separate block, and a supervisor of a phase whose
-/// state is missing or does not load, where there is no record to probe. For that
-/// last case this runs the launch guard's stateless sweep ([`possibly_live_sockets`]
-/// with no state), and only then, followed by the launch guard's check for a
-/// supervisor that is in no sweep yet ([`unpublished_launch_liveness`]).
+/// which `cleanup` handles in a separate block, and a supervisor the state does not
+/// name, where there is no record to probe ([`unnamed_supervisor_liveness`]).
 fn phase_run_liveness(
     project_root: &Path,
     phase: PhaseId,
@@ -1550,18 +1547,40 @@ fn phase_run_liveness(
     ) {
         return PhaseRunLiveness::Orphaned(supervisor);
     }
-    if matches!(existing, workflow::Existing::Loaded(_)) {
-        return PhaseRunLiveness::NotLive;
-    }
+    unnamed_supervisor_liveness(project_root, phase, existing, cache_dir)
+}
+
+/// A supervisor of this phase that `existing` does not name, once the one it names
+/// has been probed and is not live. The launch guard's stateless sweep
+/// ([`possibly_live_sockets`] with no state) runs whether or not the state loads: a
+/// loaded state names at most its latest launch, and a finished or `--until` run's
+/// names none while its supervisor still fires the notify command. A socket the state
+/// names is not live here, so the sweep reads it GONE, or STALE over a group the
+/// backstop proves gone, as [`probe_phase`] did. Then, for a state that names no
+/// launch, [`unpublished_launch_liveness`].
+fn unnamed_supervisor_liveness(
+    project_root: &Path,
+    phase: PhaseId,
+    existing: &workflow::Existing,
+    cache_dir: Option<&Path>,
+) -> PhaseRunLiveness {
     match possibly_live_sockets(project_root, phase, None, cache_dir) {
-        Ok(sockets) if sockets.is_empty() => unpublished_launch_liveness(project_root, phase),
-        Ok(sockets) => PhaseRunLiveness::Swept(
-            sockets
-                .iter()
-                .map(|socket| socket.repair_line(phase))
-                .collect(),
-        ),
-        Err((dir, why)) => PhaseRunLiveness::SocketDirUnlistable { dir, why },
+        Ok(sockets) if sockets.is_empty() => {}
+        Ok(sockets) => {
+            return PhaseRunLiveness::Swept(
+                sockets
+                    .iter()
+                    .map(|socket| socket.repair_line(phase))
+                    .collect(),
+            );
+        }
+        Err((dir, why)) => return PhaseRunLiveness::SocketDirUnlistable { dir, why },
+    }
+    match existing {
+        workflow::Existing::Loaded(_) => PhaseRunLiveness::NotLive,
+        workflow::Existing::Missing | workflow::Existing::Unloadable(_) => {
+            unpublished_launch_liveness(project_root, phase)
+        }
     }
 }
 
@@ -1616,9 +1635,17 @@ fn refuse_discard_of_a_live_run(
             supervisor.describe()
         ),
         PhaseRunLiveness::Swept(repair_lines) => {
+            let found = match existing {
+                workflow::Existing::Loaded(_) => {
+                    "a supervisor of this phase that its state does not name".to_string()
+                }
+                workflow::Existing::Missing | workflow::Existing::Unloadable(_) => {
+                    format!("its state {condition}, and a supervisor of this phase")
+                }
+            };
             let mut text = format!(
-                "refusing to discard phase {phase} — its state {condition}, and a supervisor of \
-                 this phase may still run; nothing was removed. Run each line below first:"
+                "refusing to discard phase {phase} — {found} may still run; nothing was removed. \
+                 Run each line below first:"
             );
             for line in &repair_lines {
                 text.push_str("\n  ");
