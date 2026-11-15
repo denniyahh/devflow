@@ -3902,6 +3902,365 @@ fn discard_refuses_when_the_socket_directory_cannot_be_listed() {
     );
 }
 
+/// A launch liveness lock in `root`'s `.devflow/`, taken by this test process: what a
+/// supervisor holds from before it publishes its socket. It reads live for as long as
+/// the returned hold is kept, and the launch has no socket and no sidecar. Returns the
+/// launch id with the hold.
+fn hold_launch_lock(root: &Path) -> (String, devflow_core::liveness::Hold) {
+    let launch_id = devflow_core::supervisor::new_launch_id();
+    let path = devflow_core::liveness::launch_liveness_path(root, &launch_id)
+        .expect("a launch id of the launch-id format");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let hold = devflow_core::liveness::Hold::take(&path).expect("take the liveness lock");
+    assert_eq!(
+        devflow_core::liveness::probe(&path).unwrap(),
+        devflow_core::liveness::Held::Live,
+        "premise: the launch's liveness lock reads live"
+    );
+    (launch_id, hold)
+}
+
+/// A supervisor that has not published its socket is in no sweep: only its held
+/// liveness lock shows it. With no state to name that launch, discard refuses on the
+/// lock, names it and `devflow stop`, and removes nothing. The control with a lock
+/// nothing holds is `discard_ignores_a_launch_lock_nothing_holds`.
+#[test]
+fn discard_refuses_an_unpublished_launch_when_no_state_exists() {
+    let case = discard_case();
+    let phase = PhaseId::new(58);
+    full_phase(&case.root, phase, true, finished);
+    fs::remove_file(devflow_core::workflow::state_path(&case.root, phase)).unwrap();
+    let (_, hold) = hold_launch_lock(&case.root);
+    let before = phase_items(&case.root, phase);
+    assert!(
+        before.worktree.is_some() && before.state.is_none() && before.branch_tip.is_some(),
+        "premise: a worktree and a branch with no state"
+    );
+
+    let out = run_discard(&case.home, &case.root, phase, &[]);
+    assert_discard_refused(
+        &out,
+        &case.root,
+        phase,
+        &before,
+        &[
+            "its state is missing",
+            &hold.path().display().to_string(),
+            "is held",
+            "devflow stop",
+            "nothing was removed",
+        ],
+    );
+    assert!(hold.path().exists(), "the liveness lock is left in place");
+}
+
+/// A state that does not load names no launch either: the same held lock refuses.
+#[test]
+fn discard_refuses_an_unpublished_launch_when_the_state_does_not_load() {
+    let case = discard_case();
+    let phase = PhaseId::new(59);
+    full_phase(&case.root, phase, true, finished);
+    fs::write(
+        devflow_core::workflow::state_path(&case.root, phase),
+        "not json",
+    )
+    .unwrap();
+    let (_, hold) = hold_launch_lock(&case.root);
+    let before = phase_items(&case.root, phase);
+    assert_eq!(
+        before.state.as_deref(),
+        Some(b"not json".as_slice()),
+        "premise: the state file does not load"
+    );
+
+    let out = run_discard(&case.home, &case.root, phase, &[]);
+    assert_discard_refused(
+        &out,
+        &case.root,
+        phase,
+        &before,
+        &[
+            "its state does not load",
+            &hold.path().display().to_string(),
+            "is held",
+            "devflow stop",
+            "nothing was removed",
+        ],
+    );
+    assert!(hold.path().exists(), "the liveness lock is left in place");
+}
+
+/// The lock decides, not the file: a launch liveness file that nothing holds is an
+/// abandoned reservation, so with no state discard still removes the worktree and the
+/// branch, and leaves that file alone.
+#[test]
+fn discard_ignores_a_launch_lock_nothing_holds() {
+    let case = discard_case();
+    let phase = PhaseId::new(60);
+    full_phase(&case.root, phase, true, finished);
+    fs::remove_file(devflow_core::workflow::state_path(&case.root, phase)).unwrap();
+    let (_, hold) = hold_launch_lock(&case.root);
+    let lock = hold.path().to_path_buf();
+    drop(hold);
+    assert_eq!(
+        devflow_core::liveness::probe(&lock).unwrap(),
+        devflow_core::liveness::Held::Abandoned,
+        "premise: the liveness file exists and nothing holds it"
+    );
+
+    let out = run_discard(&case.home, &case.root, phase, &[]);
+    let (_, text) = discard_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert_eq!(
+        phase_items(&case.root, phase),
+        PhaseItems::NONE,
+        "the worktree and the branch are gone: {text}"
+    );
+    assert!(lock.exists(), "the unheld liveness file is left in place");
+}
+
+/// A held lock that another phase's loadable state records is that phase's launch, not
+/// this one's: with no state of its own, the phase is still discarded, and the other
+/// phase is left as it was.
+#[test]
+fn discard_ignores_a_launch_lock_another_phases_state_records() {
+    let case = discard_case();
+    let phase = PhaseId::new(61);
+    full_phase(&case.root, phase, true, finished);
+    fs::remove_file(devflow_core::workflow::state_path(&case.root, phase)).unwrap();
+    let (launch_id, hold) = hold_launch_lock(&case.root);
+    let socket = devflow_core::supervisor::SocketPath::for_launch(
+        &case.home.cache_dir(),
+        &case.root,
+        BYSTANDER_PHASE,
+        &launch_id,
+    )
+    .expect("a socket path that fits");
+    let pending = devflow_core::state::PendingSupervisor::new(
+        launch_id,
+        socket.as_path().to_path_buf(),
+        hold.path().to_path_buf(),
+    );
+    add_phase(&case.root, BYSTANDER_PHASE, false, |state| {
+        state.pending_supervisor = Some(pending);
+    });
+    let other = phase_items(&case.root, BYSTANDER_PHASE);
+    assert!(
+        other.worktree.is_some() && other.state.is_some() && other.branch_tip.is_some(),
+        "premise: the other phase has a worktree, a state and a branch"
+    );
+
+    let out = run_discard(&case.home, &case.root, phase, &[]);
+    let (_, text) = discard_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert_eq!(
+        phase_items(&case.root, phase),
+        PhaseItems::NONE,
+        "the worktree and the branch are gone: {text}"
+    );
+    assert_eq!(
+        phase_items(&case.root, BYSTANDER_PHASE),
+        other,
+        "the phase that records the launch is untouched: {text}"
+    );
+    assert!(hold.path().exists(), "the liveness lock is left in place");
+}
+
+/// A state that loads names at most its latest launch, and a finished run's names
+/// none: the supervisor clears its record and then fires the notify command before it
+/// exits. A socket of this project and phase that the state does not name may be a
+/// supervisor that still runs, so discard sweeps for one beside a loaded state too,
+/// refuses, and removes nothing. The control is
+/// `discard_removes_a_run_whose_recorded_supervisor_left_only_its_sidecar`.
+#[test]
+fn discard_refuses_a_swept_live_supervisor_a_loaded_state_does_not_name() {
+    let case = discard_case();
+    let phase = PhaseId::new(62);
+    full_phase(&case.root, phase, true, finished);
+    let socket = plant_swept_socket(&case.home, &case.root, phase);
+    let state = load_state(&case.root, phase).expect("premise: the state loads");
+    assert!(
+        state.supervisor.is_none() && state.pending_supervisor.is_none(),
+        "premise: the state names no supervisor"
+    );
+    let before = phase_items(&case.root, phase);
+
+    let out = run_discard(&case.home, &case.root, phase, &[]);
+    assert_discard_refused(
+        &out,
+        &case.root,
+        phase,
+        &before,
+        &[
+            "its state does not name",
+            &socket.display().to_string(),
+            "devflow stop --phase 62",
+            "nothing was removed",
+        ],
+    );
+    assert!(socket.exists(), "the swept socket is left in place");
+}
+
+/// The sweep beside a loaded state fails closed as the stateless one does: a socket
+/// directory that cannot be listed cannot rule out a supervisor the state does not
+/// name, so discard refuses and removes nothing.
+#[test]
+fn discard_refuses_an_unlistable_socket_directory_beside_a_loaded_state() {
+    let case = discard_case();
+    let phase = PhaseId::new(63);
+    full_phase(&case.root, phase, true, finished);
+    // A regular file where the socket directory belongs: listing it fails.
+    let sock_dir = devflow_core::registry::socket_dir_in(&case.home.cache_dir());
+    fs::create_dir_all(sock_dir.parent().unwrap()).unwrap();
+    fs::write(&sock_dir, "not a directory\n").unwrap();
+    let before = phase_items(&case.root, phase);
+    assert!(
+        load_state(&case.root, phase).is_ok(),
+        "premise: the state loads"
+    );
+
+    let out = run_discard(&case.home, &case.root, phase, &[]);
+    assert_discard_refused(
+        &out,
+        &case.root,
+        phase,
+        &before,
+        &[
+            &sock_dir.display().to_string(),
+            "cannot be listed",
+            "a live supervisor cannot be ruled out",
+            "nothing was removed",
+        ],
+    );
+}
+
+/// The socket path of a launch of `phase` in `root`, in the hermetic cache: a name the
+/// sweep attributes to that project and phase.
+fn launch_socket(
+    home: &common::HermeticHome,
+    root: &Path,
+    phase: PhaseId,
+    launch_id: &str,
+) -> devflow_core::supervisor::SocketPath {
+    let cache = home.cache_dir();
+    fs::create_dir_all(devflow_core::registry::socket_dir_in(&cache)).unwrap();
+    devflow_core::supervisor::SocketPath::for_launch(&cache, root, phase, launch_id)
+        .expect("a socket path that fits")
+}
+
+/// The sweep beside a loaded state turns no supervisor the state names into a second
+/// refusal. A supervisor that exited leaves its sidecar behind, so the sweep sees an
+/// entry for the launch the state records: its socket is gone, and the run is discarded.
+/// Another phase's socket does not refuse either.
+#[test]
+fn discard_removes_a_run_whose_recorded_supervisor_left_only_its_sidecar() {
+    let case = discard_case();
+    let phase = PhaseId::new(64);
+    let launch_id = devflow_core::supervisor::new_launch_id();
+    let socket = launch_socket(&case.home, &case.root, phase, &launch_id);
+    let sidecar = serde_json::json!({
+        "launch_id": launch_id,
+        "project_root": case.root,
+        "phase": phase,
+        "stage": null,
+        "agent": "claude",
+        "launch": "capture",
+        "agent_pid": u32::MAX,
+        "agent_pgid": u32::MAX,
+        "agent_start_time": 0,
+        "boot_id": "no-such-boot",
+        "supervisor_pid": u32::MAX,
+        "supervisor_start_time": 0,
+        "created_at": "2026-01-01T00:00:00Z",
+    });
+    fs::write(socket.sidecar_path(), sidecar.to_string()).unwrap();
+    let record = devflow_core::state::SupervisorRecord::new(
+        socket.as_path().to_path_buf(),
+        launch_id,
+        u32::MAX,
+        0,
+        "no-such-boot".to_string(),
+    );
+    full_phase(&case.root, phase, true, |state| {
+        finished(state);
+        state.supervisor = Some(record);
+    });
+    let swept = devflow_core::supervisor::sweep_for_in(&case.home.cache_dir(), &case.root, phase);
+    assert!(
+        matches!(swept.as_slice(), [entry] if entry.sidecar.is_some() && !entry.socket_present),
+        "premise: the sweep sees the recorded launch's sidecar and no socket: {swept:?}"
+    );
+    let bystanders = add_bystanders(&case.root);
+    let other_socket = plant_swept_socket(&case.home, &case.root, BYSTANDER_PHASE);
+
+    let out = run_discard(&case.home, &case.root, phase, &[]);
+    let (_, text) = discard_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert_eq!(
+        phase_items(&case.root, phase),
+        PhaseItems::NONE,
+        "the worktree, the state and the branch are gone: {text}"
+    );
+    assert!(
+        other_socket.exists(),
+        "another phase's socket is left in place: {text}"
+    );
+    bystanders.assert_untouched(&case.root, &text);
+}
+
+/// A STALE supervisor the state records is refused once, as the recorded supervisor,
+/// even when its socket has a name the sweep attributes to this project and phase: the
+/// refusal is the recorded one, and the socket is not listed a second time as a
+/// supervisor the state does not name.
+#[test]
+fn discard_refuses_a_recorded_stale_supervisor_once_when_the_sweep_would_find_it() {
+    let case = discard_case();
+    let phase = PhaseId::new(65);
+    let launch_id = devflow_core::supervisor::new_launch_id();
+    let socket = launch_socket(&case.home, &case.root, phase, &launch_id);
+    drop(std::os::unix::net::UnixListener::bind(socket.as_path()).expect("bind the socket"));
+    let record = devflow_core::state::SupervisorRecord::new(
+        socket.as_path().to_path_buf(),
+        launch_id,
+        u32::MAX,
+        0,
+        "no-such-boot".to_string(),
+    );
+    full_phase(&case.root, phase, true, |state| {
+        finished(state);
+        state.supervisor = Some(record);
+    });
+    let swept = devflow_core::supervisor::sweep_for_in(&case.home.cache_dir(), &case.root, phase);
+    assert!(
+        matches!(swept.as_slice(), [entry] if entry.socket_present),
+        "premise: the sweep sees the recorded supervisor's socket: {swept:?}"
+    );
+    let before = phase_items(&case.root, phase);
+
+    let out = run_discard(&case.home, &case.root, phase, &[]);
+    assert_discard_refused(
+        &out,
+        &case.root,
+        phase,
+        &before,
+        &[
+            "its supervisor is STALE",
+            "devflow stop --phase 65",
+            "nothing was removed",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("its state does not name")
+            && !stderr.contains(&socket.as_path().display().to_string()),
+        "the recorded supervisor is not listed again as a swept socket: {stderr}"
+    );
+    assert!(
+        socket.as_path().exists(),
+        "the recorded socket is left in place"
+    );
+}
+
 /// D-20: discard is the way out of a state that does not load. It removes that file
 /// with the worktree and the branch, and keeps no copy of it.
 #[test]
