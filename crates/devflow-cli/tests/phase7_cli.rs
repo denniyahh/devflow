@@ -3207,3 +3207,472 @@ fn discard_removes_a_finished_runs_worktree_state_and_merged_branch() {
     );
     bystanders.assert_untouched(&root, &text);
 }
+
+/// A hermetic home and an empty temporary directory, canonical because the CLI prints
+/// the canonical project root, for one discard test.
+struct DiscardCase {
+    home: common::HermeticHome,
+    _repo: tempfile::TempDir,
+    root: PathBuf,
+}
+
+fn discard_case() -> DiscardCase {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    DiscardCase {
+        home: common::HermeticHome::new(),
+        _repo: repo,
+        root,
+    }
+}
+
+/// [`cleanup_fixture`] with an uncommitted file in the worktree: a phase with all three
+/// of the items discard removes. Returns the worktree's path.
+fn full_phase(
+    root: &Path,
+    phase: PhaseId,
+    merged: bool,
+    shape: impl FnOnce(&mut devflow_core::state::State),
+) -> PathBuf {
+    let worktree = cleanup_fixture(root, phase, merged, shape);
+    fs::write(worktree.join("scratch.txt"), "uncommitted\n").unwrap();
+    let items = phase_items(root, phase);
+    assert!(
+        items.worktree.is_some() && items.state.is_some() && items.branch_tip.is_some(),
+        "premise: the phase has a worktree, a state and a branch"
+    );
+    worktree
+}
+
+/// Assert that `out` refused and removed nothing: `phase`'s worktree files, state bytes
+/// and branch tip are exactly `before`, the exit is non-zero, stderr holds every
+/// `fragment`, and stdout reports no removal. The effects are asserted first.
+fn assert_discard_refused(
+    out: &Output,
+    root: &Path,
+    phase: PhaseId,
+    before: &PhaseItems,
+    fragments: &[&str],
+) {
+    let (stdout, text) = discard_text(out);
+    assert_eq!(
+        &phase_items(root, phase),
+        before,
+        "a refused discard removes nothing: {text}"
+    );
+    assert!(!out.status.success(), "the discard is refused: {text}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for fragment in fragments {
+        assert!(
+            stderr.contains(fragment),
+            "the refusal names {fragment:?}: {text}"
+        );
+    }
+    assert!(
+        !stdout.lines().any(|line| line.starts_with("removed ")),
+        "stdout reports no removal: {text}"
+    );
+}
+
+/// D-10: an unmerged branch is not deleted unless the operator names it. Without the
+/// name nothing is removed, and the refusal gives the command that names it.
+#[test]
+fn discard_refuses_an_unmerged_branch_without_its_name() {
+    let case = discard_case();
+    let phase = PhaseId::new(32);
+    full_phase(&case.root, phase, false, finished);
+    let before = phase_items(&case.root, phase);
+
+    let out = run_discard(&case.home, &case.root, phase, &[]);
+    assert_discard_refused(
+        &out,
+        &case.root,
+        phase,
+        &before,
+        &[
+            "1 commit not merged into `develop`",
+            "nothing was removed",
+            "devflow discard --phase 32 --delete-unmerged-branch feature/phase-32",
+        ],
+    );
+}
+
+/// D-10 / D-23: the name must be the phase's own branch. Another name is refused with
+/// both names, and nothing is removed.
+#[test]
+fn discard_refuses_a_wrong_branch_name() {
+    let case = discard_case();
+    let phase = PhaseId::new(33);
+    full_phase(&case.root, phase, false, finished);
+    let before = phase_items(&case.root, phase);
+
+    let out = run_discard(
+        &case.home,
+        &case.root,
+        phase,
+        &["--delete-unmerged-branch", "feature/phase-99"],
+    );
+    assert_discard_refused(
+        &out,
+        &case.root,
+        phase,
+        &before,
+        &[
+            "feature/phase-99",
+            "feature/phase-33",
+            "nothing was removed",
+        ],
+    );
+}
+
+/// D-23: the value must equal the phase's branch whatever the branch's merge state, so
+/// a wrong name is refused over a merged branch too.
+#[test]
+fn discard_refuses_a_wrong_branch_name_over_a_merged_branch() {
+    let case = discard_case();
+    let phase = PhaseId::new(43);
+    full_phase(&case.root, phase, true, finished);
+    let before = phase_items(&case.root, phase);
+
+    let out = run_discard(
+        &case.home,
+        &case.root,
+        phase,
+        &["--delete-unmerged-branch", "feature/phase-99"],
+    );
+    assert_discard_refused(
+        &out,
+        &case.root,
+        phase,
+        &before,
+        &[
+            "feature/phase-99",
+            "feature/phase-43",
+            "nothing was removed",
+        ],
+    );
+}
+
+/// D-10's one exception: with the phase's own branch named, an unmerged branch is
+/// deleted with the worktree and the state. Another phase's unmerged branch and an
+/// unrelated unmerged branch are left alone.
+#[test]
+fn discard_with_the_branch_name_deletes_an_unmerged_branch() {
+    let case = discard_case();
+    let phase = PhaseId::new(34);
+    full_phase(&case.root, phase, false, finished);
+    let bystanders = add_bystanders(&case.root);
+
+    let out = run_discard(
+        &case.home,
+        &case.root,
+        phase,
+        &["--delete-unmerged-branch", "feature/phase-34"],
+    );
+    let (stdout, text) = discard_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        discard_listing(&stdout)
+            .iter()
+            .any(|line| line
+                .contains("branch feature/phase-34 (1 commit not merged into `develop`)")),
+        "the listing says the branch is not merged: {text}"
+    );
+    assert_eq!(
+        phase_items(&case.root, phase),
+        PhaseItems::NONE,
+        "the worktree, the state and the named branch are gone: {text}"
+    );
+    bystanders.assert_untouched(&case.root, &text);
+}
+
+/// The base a run may record instead of `develop`.
+const OTHER_BASE: &str = "workspace/example";
+
+/// A finished phase whose branch is forked from [`OTHER_BASE`], a branch holding one
+/// commit `develop` lacks: the phase branch is merged into that base and has one
+/// commit not merged into `develop`. The saved state records `recorded_base`.
+fn phase_on_another_base(root: &Path, phase: PhaseId, recorded_base: Option<&str>) {
+    init_repo(root);
+    git(root, &["checkout", "-q", "-b", OTHER_BASE]);
+    fs::write(root.join("planning.txt"), "only on the other base\n").unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-q", "-m", "planning"]);
+    git(root, &["checkout", "-q", "develop"]);
+    let branch = format!("feature/phase-{padded}", padded = phase.padded());
+    git(root, &["branch", &branch, OTHER_BASE]);
+    let worktree = devflow_core::worktree::phase_path(root, phase);
+    devflow_core::worktree::add(root, &worktree, &branch, &branch, false).unwrap();
+    let mut state = devflow_core::state::State::new(
+        phase,
+        devflow_core::state::AgentKind::Claude,
+        devflow_core::mode::Mode::Auto,
+        root.to_path_buf(),
+    );
+    finished(&mut state);
+    state.base_branch = recorded_base.map(str::to_string);
+    devflow_core::workflow::save_state(&state).unwrap();
+}
+
+/// D-10: merged means merged into the base the run recorded. A branch merged into a
+/// recorded non-default base is discarded without its name, though it has a commit
+/// `develop` lacks.
+#[test]
+fn discard_counts_merged_against_the_recorded_base() {
+    let case = discard_case();
+    let phase = PhaseId::new(35);
+    phase_on_another_base(&case.root, phase, Some(OTHER_BASE));
+    let base_tip = branch_tip(&case.root, OTHER_BASE).expect("premise: the base exists");
+
+    let out = run_discard(&case.home, &case.root, phase, &[]);
+    let (stdout, text) = discard_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        discard_listing(&stdout)
+            .iter()
+            .any(|line| line.contains("branch feature/phase-35 (merged into `workspace/example`)")),
+        "the listing counts against the recorded base: {text}"
+    );
+    assert_eq!(
+        phase_items(&case.root, phase),
+        PhaseItems::NONE,
+        "the worktree, the state and the branch are gone: {text}"
+    );
+    assert_eq!(
+        branch_tip(&case.root, OTHER_BASE).as_deref(),
+        Some(base_tip.as_str()),
+        "the base branch is untouched: {text}"
+    );
+}
+
+/// Control for the test above: the same branch with no recorded base is counted
+/// against `develop`, where it is unmerged, so it is refused.
+#[test]
+fn discard_without_a_recorded_base_counts_merged_against_develop() {
+    let case = discard_case();
+    let phase = PhaseId::new(36);
+    phase_on_another_base(&case.root, phase, None);
+    let before = phase_items(&case.root, phase);
+    assert!(
+        before.worktree.is_some() && before.state.is_some() && before.branch_tip.is_some(),
+        "premise: the phase has a worktree, a state and a branch"
+    );
+
+    let out = run_discard(&case.home, &case.root, phase, &[]);
+    assert_discard_refused(
+        &out,
+        &case.root,
+        phase,
+        &before,
+        &[
+            "1 commit not merged into `develop`",
+            "--delete-unmerged-branch feature/phase-36",
+        ],
+    );
+}
+
+/// The merge state is never assumed: when it cannot be read (here the recorded base
+/// does not exist), discard refuses and removes nothing.
+#[test]
+fn discard_refuses_when_the_merge_state_cannot_be_read() {
+    let case = discard_case();
+    let phase = PhaseId::new(44);
+    full_phase(&case.root, phase, true, |state| {
+        finished(state);
+        state.base_branch = Some("no/such-base".to_string());
+    });
+    let before = phase_items(&case.root, phase);
+
+    let out = run_discard(&case.home, &case.root, phase, &[]);
+    assert_discard_refused(
+        &out,
+        &case.root,
+        phase,
+        &before,
+        &[
+            "could not be checked for commits not merged into `no/such-base`",
+            "nothing was removed",
+        ],
+    );
+}
+
+/// Whether a discard's listing has a line for `item` (`worktree`, `run state`, `branch`).
+fn listing_has(stdout: &str, item: &str) -> bool {
+    discard_listing(stdout)
+        .iter()
+        .any(|line| line.starts_with(&format!("  {item} ")))
+}
+
+/// D-09.1: a leftover branch with no worktree and no state is discarded on its own.
+/// The items that do not exist are neither listed nor a failure.
+#[test]
+fn discard_removes_a_branch_with_no_worktree_or_state() {
+    let case = discard_case();
+    let phase = PhaseId::new(37);
+    init_repo(&case.root);
+    git(&case.root, &["branch", "feature/phase-37", "develop"]);
+    let bystanders = add_bystanders(&case.root);
+    let before = phase_items(&case.root, phase);
+    assert!(
+        before.worktree.is_none() && before.state.is_none() && before.branch_tip.is_some(),
+        "premise: the phase has only a branch"
+    );
+
+    let out = run_discard(&case.home, &case.root, phase, &[]);
+    let (stdout, text) = discard_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        listing_has(&stdout, "branch"),
+        "the listing names the branch: {text}"
+    );
+    assert!(
+        !listing_has(&stdout, "worktree") && !listing_has(&stdout, "run state"),
+        "the listing has no worktree line and no state line: {text}"
+    );
+    assert!(!text.contains("warning:"), "nothing failed: {text}");
+    assert_eq!(
+        phase_items(&case.root, phase),
+        PhaseItems::NONE,
+        "the branch is gone: {text}"
+    );
+    bystanders.assert_untouched(&case.root, &text);
+}
+
+/// D-09.1: a leftover worktree and branch with no state are discarded, and the
+/// missing state is neither listed nor a failure.
+#[test]
+fn discard_removes_a_worktree_and_branch_with_no_state() {
+    let case = discard_case();
+    let phase = PhaseId::new(38);
+    full_phase(&case.root, phase, true, finished);
+    fs::remove_file(devflow_core::workflow::state_path(&case.root, phase)).unwrap();
+    let bystanders = add_bystanders(&case.root);
+
+    let out = run_discard(&case.home, &case.root, phase, &[]);
+    let (stdout, text) = discard_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        listing_has(&stdout, "worktree") && listing_has(&stdout, "branch"),
+        "the listing names the worktree and the branch: {text}"
+    );
+    assert!(
+        !listing_has(&stdout, "run state"),
+        "the listing has no state line: {text}"
+    );
+    assert!(!text.contains("warning:"), "nothing failed: {text}");
+    assert_eq!(
+        phase_items(&case.root, phase),
+        PhaseItems::NONE,
+        "the worktree and the branch are gone: {text}"
+    );
+    bystanders.assert_untouched(&case.root, &text);
+}
+
+/// A directory at the phase path that git does not list as a worktree is not
+/// discard's to remove: it refuses before anything is removed, the state and the
+/// branch included.
+#[test]
+fn discard_refuses_a_directory_git_does_not_list_as_a_worktree() {
+    let case = discard_case();
+    let phase = PhaseId::new(39);
+    init_repo(&case.root);
+    let directory = devflow_core::worktree::phase_path(&case.root, phase);
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(directory.join("notes.txt"), "not a worktree\n").unwrap();
+    git(&case.root, &["branch", "feature/phase-39", "develop"]);
+    let mut state = devflow_core::state::State::new(
+        phase,
+        devflow_core::state::AgentKind::Claude,
+        devflow_core::mode::Mode::Auto,
+        case.root.clone(),
+    );
+    finished(&mut state);
+    devflow_core::workflow::save_state(&state).unwrap();
+    let before = phase_items(&case.root, phase);
+    assert!(
+        before
+            .worktree
+            .as_ref()
+            .is_some_and(|files| files.len() == 1)
+            && before.state.is_some()
+            && before.branch_tip.is_some(),
+        "premise: a directory with one file, a state and a branch"
+    );
+
+    let out = run_discard(&case.home, &case.root, phase, &[]);
+    assert_discard_refused(
+        &out,
+        &case.root,
+        phase,
+        &before,
+        &[
+            &directory.display().to_string(),
+            "git does not list it as a worktree",
+            "nothing was removed",
+        ],
+    );
+}
+
+/// A phase worktree that is not on the phase branch may hold commits no branch
+/// keeps, which the listing would not show: discard refuses it and removes nothing.
+#[test]
+fn discard_refuses_a_phase_worktree_that_is_not_on_the_phase_branch() {
+    let case = discard_case();
+    let phase = PhaseId::new(45);
+    let worktree = full_phase(&case.root, phase, true, finished);
+    git(&worktree, &["checkout", "-q", "--detach"]);
+    fs::write(worktree.join("detached.txt"), "kept by no branch\n").unwrap();
+    git(&worktree, &["add", "detached.txt"]);
+    git(
+        &worktree,
+        &["commit", "-q", "-m", "a commit on a detached HEAD"],
+    );
+    let before = phase_items(&case.root, phase);
+
+    let out = run_discard(&case.home, &case.root, phase, &[]);
+    assert_discard_refused(
+        &out,
+        &case.root,
+        phase,
+        &before,
+        &[
+            &worktree.display().to_string(),
+            "a detached HEAD",
+            "feature/phase-45",
+            "nothing was removed",
+        ],
+    );
+}
+
+/// A worktree git still lists whose directory is gone cannot be read, so discard
+/// refuses, keeps the state and the branch, and names `git worktree prune`.
+#[test]
+fn discard_refuses_a_listed_worktree_whose_directory_is_gone() {
+    let case = discard_case();
+    let phase = PhaseId::new(46);
+    let worktree = full_phase(&case.root, phase, true, finished);
+    fs::remove_dir_all(&worktree).unwrap();
+    let before = phase_items(&case.root, phase);
+    assert!(
+        before.worktree.is_none() && before.state.is_some() && before.branch_tip.is_some(),
+        "premise: the directory is gone, the state and the branch are not"
+    );
+    let listed = git(&case.root, &["worktree", "list", "--porcelain"]);
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).contains(&worktree.display().to_string()),
+        "premise: git still lists the worktree"
+    );
+
+    let out = run_discard(&case.home, &case.root, phase, &[]);
+    assert_discard_refused(
+        &out,
+        &case.root,
+        phase,
+        &before,
+        &[
+            &worktree.display().to_string(),
+            "git worktree prune",
+            "nothing was removed",
+        ],
+    );
+}
