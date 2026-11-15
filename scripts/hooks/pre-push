@@ -106,6 +106,7 @@ for line in "${PUSH_LINES[@]}"; do
             esac
             if [ "$range_rc" -ne 0 ]; then
                 echo "pre-push: FATAL — could not inspect the commit range for '$remote_ref':" >&2
+                # shellcheck disable=SC2001  # sed indents every line of a multi-line value
                 echo "$range_files" | sed 's/^/  /' >&2
                 echo "  Refusing to push rather than silently allowing forbidden content through" >&2
                 echo "  a range this hook could not actually check. If the remote has moved ahead" >&2
