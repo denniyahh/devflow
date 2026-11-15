@@ -773,3 +773,147 @@ fn a_clean_resume_prints_no_left_uncommitted_note() {
         "a clean launch has no repair note at all\nprinted:\n{printed}"
     );
 }
+
+/// Puts the fixture in the row the recording commit serves: the branch tip
+/// lacks the chain flag and the working copy holds GSD's `false`.
+fn hold_gsds_first_false(fixture: &Fixture) {
+    let gsd_false = fs::read_to_string(&fixture.config).unwrap();
+    let without_key = gsd_false.replace("    \"_auto_chain_active\": false,\n", "");
+    assert_ne!(
+        without_key, gsd_false,
+        "the fixture must actually drop the key from the committed copy"
+    );
+    fs::write(&fixture.config, &without_key).unwrap();
+    commit_config(fixture, "docs: add gsd config without the chain flag");
+    fs::write(&fixture.config, &gsd_false).unwrap();
+}
+
+/// Installs `body` as the fixture repository's `name` hook, so the recording
+/// commit `devflow` makes runs it. [`init_repo`] turns hooks off; this turns
+/// them back on for one hook.
+fn install_hook(fixture: &Fixture, name: &str, body: &str) {
+    let hooks = fixture.root.join(".git/test-hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    devflow_core::test_support::write_executable(
+        &hooks.join(name),
+        &format!("#!/bin/sh\n{body}\n"),
+    );
+    git(
+        &fixture.root,
+        &["config", "core.hooksPath", hooks.to_str().unwrap()],
+    );
+}
+
+/// The opening of every warning about a recording commit that was refused.
+const RECORD_REFUSAL_WARNING: &str =
+    "warning: the commit recording GSD's workflow._auto_chain_active: false";
+
+/// What a refused recording commit must never print: the recording note (no
+/// commit was confirmed) or the killed-run notice (nothing leaked).
+fn assert_no_recording_or_killed_run_note(printed: &str) {
+    assert!(
+        !printed.contains("note: devflow resume recorded"),
+        "a refused recording commit must not be announced as recorded\nprinted:\n{printed}"
+    );
+    assert!(
+        !printed.contains("was killed before it could clear it"),
+        "nothing leaked, so no killed run may be named\nprinted:\n{printed}"
+    );
+}
+
+/// The recording commit fails (a pre-commit hook rejects it). `resume` warns
+/// in the foreground, naming the recording commit and git's own reason.
+#[test]
+fn a_recording_commit_that_fails_is_warned_about_at_resume() {
+    let fixture = Fixture::new(false);
+    let path_dir = git_only_path();
+    hold_gsds_first_false(&fixture);
+    install_hook(
+        &fixture,
+        "pre-commit",
+        "echo 'the hook says no' >&2\nexit 1",
+    );
+
+    let output = fixture.run_resume(path_dir.path());
+    let printed = printed(&output);
+
+    assert_eq!(
+        fixture.flag_at_head(),
+        "null",
+        "premise: the hook stopped the recording commit\nprinted:\n{printed}"
+    );
+    let warning = printed
+        .lines()
+        .find(|line| line.starts_with(RECORD_REFUSAL_WARNING))
+        .unwrap_or_else(|| panic!("resume must warn about the failed commit\nprinted:\n{printed}"));
+    assert!(
+        warning.contains("could not be made (") && warning.contains("the hook says no"),
+        "the warning must carry git's own reason: {warning}"
+    );
+    assert_no_recording_or_killed_run_note(&printed);
+}
+
+/// The recording commit lands and the file then differs from the branch tip
+/// again (a post-commit hook rewrites it). `resume` warns; it does not say the
+/// write was recorded.
+#[test]
+fn a_recording_commit_the_reprobe_contradicts_is_warned_about_at_resume() {
+    let fixture = Fixture::new(false);
+    let path_dir = git_only_path();
+    hold_gsds_first_false(&fixture);
+    install_hook(&fixture, "post-commit", "echo >> .planning/config.json");
+
+    let output = fixture.run_resume(path_dir.path());
+    let printed = printed(&output);
+
+    assert_eq!(
+        git_output(&fixture.root, &["log", "-1", "--format=%s"]).trim_end(),
+        "chore(gsd): record GSD's workflow._auto_chain_active: false",
+        "premise: the recording commit landed\nprinted:\n{printed}"
+    );
+    assert!(
+        printed.lines().any(|line| line
+            == format!(
+                "{RECORD_REFUSAL_WARNING} reported success but .planning/config.json still \
+                 differs from HEAD — the file stays uncommitted; nothing was leaked"
+            )),
+        "resume must warn that the file still differs from HEAD\nprinted:\n{printed}"
+    );
+    assert_no_recording_or_killed_run_note(&printed);
+}
+
+/// The recording commit lands and the branch tip then cannot be read (a
+/// post-commit hook points `HEAD` at a branch with no commits). `resume` warns
+/// that the commit could not be confirmed and claims no leak.
+#[test]
+fn a_recording_commit_that_cannot_be_confirmed_is_warned_about_at_resume() {
+    let fixture = Fixture::new(false);
+    let path_dir = git_only_path();
+    hold_gsds_first_false(&fixture);
+    install_hook(
+        &fixture,
+        "post-commit",
+        "git symbolic-ref HEAD refs/heads/no-commits-yet",
+    );
+
+    let output = fixture.run_resume(path_dir.path());
+    let printed = printed(&output);
+
+    assert_eq!(
+        git_output(
+            &fixture.root,
+            &["log", "-1", "--format=%s", "feature/phase-78"]
+        )
+        .trim_end(),
+        "chore(gsd): record GSD's workflow._auto_chain_active: false",
+        "premise: the recording commit landed on the phase branch\nprinted:\n{printed}"
+    );
+    assert!(
+        printed.lines().any(|line| line.starts_with(&format!(
+            "{RECORD_REFUSAL_WARNING} could not be confirmed at HEAD; nothing was leaked \
+             (could not compare .planning/config.json against HEAD"
+        ))),
+        "resume must warn that the commit could not be confirmed\nprinted:\n{printed}"
+    );
+    assert_no_recording_or_killed_run_note(&printed);
+}
