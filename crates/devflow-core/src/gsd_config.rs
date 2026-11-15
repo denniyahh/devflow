@@ -336,10 +336,13 @@ pub fn force_clear_auto_chain(root: &Path) -> Result<ClearOutcome, GsdConfigErro
     // 52.1 D-22: it is a leak only when a copy actually held `true`. Otherwise
     // the copies differ in the key's presence or in layout alone, and there are
     // exactly two answers: record GSD's `false`, or, when the working copy holds
-    // no flag at all, leave a file DevFlow has no stake in exactly as it is.
+    // no flag at all, leave a file DevFlow has no stake in exactly as it is and
+    // report that it was left, so the caller can say so.
     if !(outcome.working_tree_repaired || head_flag_was_true) {
         if working_holds_false {
             record_gsd_false(root, &mut outcome);
+        } else {
+            outcome.left_uncommitted = true;
         }
         return Ok(outcome);
     }

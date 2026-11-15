@@ -347,9 +347,10 @@ pub(crate) fn repair_leaked_auto_chain_flag(
 
     let note = auto_chain_repair_note(entry_point, phase, &outcome);
     if !outcome.repaired_anything() && outcome.commit_refused.is_none() {
-        // 52.1 D-22: recording GSD's own `false` is not a repair. It is said in
-        // the foreground and writes no `auto_chain_flag_repaired` event. A
-        // clean launch has no note at all.
+        // 52.1 D-22: recording GSD's own `false` is not a repair, and neither
+        // is leaving a difference DevFlow cannot attribute uncommitted. Each is
+        // said in the foreground and writes no `auto_chain_flag_repaired`
+        // event. A clean launch has no note at all.
         if let Some(note) = note {
             println!("{note}");
         }
@@ -378,7 +379,8 @@ pub(crate) fn repair_leaked_auto_chain_flag(
 
 /// The foreground `note:` line for what [`repair_leaked_auto_chain_flag`] found,
 /// or `None` when there is nothing to say. Names a killed run only when a set
-/// flag was actually cleared; a recorded `false` (52.1 D-22) says nothing leaked.
+/// flag was actually cleared; a recorded `false` (52.1 D-22) says nothing leaked;
+/// a difference left uncommitted says so, and what that costs at Validate.
 fn auto_chain_repair_note(
     entry_point: &str,
     phase: PhaseId,
@@ -399,6 +401,14 @@ fn auto_chain_repair_note(
             "note: devflow {entry_point} recorded GSD's workflow._auto_chain_active: false \
              for phase {phase} in a commit (the committed config held no true flag; \
              nothing was leaked)"
+        ));
+    }
+    if outcome.left_uncommitted {
+        return Some(format!(
+            "note: devflow {entry_point} left .planning/config.json uncommitted for phase \
+             {phase}: it differs from this branch's tip and DevFlow cannot attribute the \
+             change (no copy holds a true chain flag, and the working copy holds no false \
+             to record). Validate will not record a pass until it is committed"
         ));
     }
     None
