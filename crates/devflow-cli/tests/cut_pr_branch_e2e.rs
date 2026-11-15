@@ -8,10 +8,14 @@
 //! real checkout; the script file is only read from it.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, ExitStatus, Output};
 
 const PHASE_BRANCH: &str = "feature/phase-52.1";
 const PR_BRANCH: &str = "feature/phase-52.1-pr";
+/// An in-scope commit, so a range under test always has something to replay.
+const SENTINEL: &str = "feat(52.1-01): sentinel";
+/// An out-of-scope commit that touches a code file.
+const SKIPPED_CODE: &str = "fix(52-review): code";
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -114,17 +118,35 @@ impl Fixture {
         self.git(&["rev-parse", "HEAD"])
     }
 
-    /// Runs the real script for phase 52.1 in the work repository.
-    fn cut(&self, extra: &[&str]) -> Output {
-        self.hermetic("bash", &self.work())
-            .arg(repo_root().join("scripts/cut-pr-branch.sh"))
+    /// The real script for phase 52.1, set to run in the work repository.
+    fn script(&self, extra: &[&str]) -> Command {
+        let mut cmd = self.hermetic("bash", &self.work());
+        cmd.arg(repo_root().join("scripts/cut-pr-branch.sh"))
             .args(["--phase", "52.1"])
             .args(extra)
             .env_remove("PHASE")
             .env_remove("BASE_REMOTE")
-            .env_remove("WORKSPACE_BASE")
-            .output()
-            .expect("run cut-pr-branch.sh")
+            .env_remove("WORKSPACE_BASE");
+        cmd
+    }
+
+    fn cut(&self, extra: &[&str]) -> Output {
+        self.script(extra).output().expect("run cut-pr-branch.sh")
+    }
+
+    /// Runs the script with stdout and stderr on one file, so the order the
+    /// two streams were written in can be read back.
+    fn cut_transcript(&self) -> (ExitStatus, String) {
+        let path = self.scratch.path().join("transcript.log");
+        let file = std::fs::File::create(&path).expect("create the transcript");
+        let status = self
+            .script(&[])
+            .stdout(file.try_clone().expect("share the transcript"))
+            .stderr(file)
+            .status()
+            .expect("run cut-pr-branch.sh");
+        let transcript = std::fs::read_to_string(&path).expect("read the transcript");
+        (status, transcript)
     }
 
     /// Subjects on the PR branch that are not on `origin/develop`, oldest first.
@@ -135,6 +157,28 @@ impl Fixture {
             .map(str::to_owned)
             .collect()
     }
+
+    fn pr_branch_exists(&self) -> bool {
+        let reference = format!("refs/heads/{PR_BRANCH}");
+        self.try_git(&["show-ref", "--verify", "--quiet", &reference])
+            .status
+            .success()
+    }
+
+    fn short(&self, sha: &str) -> String {
+        self.git(&["rev-parse", "--short", sha])
+    }
+}
+
+/// The script's `  skipped <short-sha> <subject>` stderr lines, as
+/// `(short sha, subject)` pairs.
+fn skipped(out: &Output) -> Vec<(String, String)> {
+    String::from_utf8_lossy(&out.stderr)
+        .lines()
+        .filter_map(|line| line.strip_prefix("  skipped "))
+        .filter_map(|rest| rest.split_once(' '))
+        .map(|(sha, subject)| (sha.to_owned(), subject.to_owned()))
+        .collect()
 }
 
 /// Commits one code file per subject, in order, and returns each commit's SHA.
@@ -201,6 +245,252 @@ fn look_alike_scopes_are_not_replayed() {
         fixture.pr_subjects(),
         ["feat(52.1-01): k"],
         "only the commit scoped to phase 52.1 may be replayed: {}",
+        describe(&out)
+    );
+}
+
+#[test]
+fn a_skipped_code_commit_is_named_before_the_replay() {
+    let fixture = Fixture::new();
+    fixture.commit(SENTINEL, &["src/sentinel.txt"]);
+    let code = fixture.commit(SKIPPED_CODE, &["src/x.txt"]);
+
+    let out = fixture.cut(&[]);
+
+    assert!(
+        out.status.success(),
+        "the cut must pass: {}",
+        describe(&out)
+    );
+    assert_eq!(
+        fixture.pr_subjects(),
+        [SENTINEL],
+        "the out-of-scope commit must not be replayed: {}",
+        describe(&out)
+    );
+    assert_eq!(
+        skipped(&out),
+        [(fixture.short(&code), SKIPPED_CODE.to_owned())],
+        "the dropped code commit must be named on a skipped line: {}",
+        describe(&out)
+    );
+}
+
+#[test]
+fn the_skipped_listing_is_printed_before_the_pr_branch_is_initialized() {
+    let fixture = Fixture::new();
+    fixture.commit(SENTINEL, &["src/sentinel.txt"]);
+    let code = fixture.commit(SKIPPED_CODE, &["src/x.txt"]);
+    let skipped_line = format!("  skipped {} {SKIPPED_CODE}", fixture.short(&code));
+
+    let (status, transcript) = fixture.cut_transcript();
+
+    assert!(status.success(), "the cut must pass: {transcript}");
+    let listed_at = transcript.lines().position(|line| line == skipped_line);
+    let initialized_at = transcript
+        .lines()
+        .position(|line| line.starts_with("==> Initializing clean branch"));
+    assert!(
+        listed_at.is_some(),
+        "the dropped code commit must be listed: {transcript}"
+    );
+    assert!(
+        initialized_at.is_some(),
+        "premise: the script announces the PR branch: {transcript}"
+    );
+    assert!(
+        listed_at < initialized_at,
+        "the listing must be printed before the PR branch is created: {transcript}"
+    );
+}
+
+#[test]
+fn look_alike_scopes_are_each_listed_as_skipped() {
+    let fixture = Fixture::new();
+    let shas = commit_code(&fixture, &LOOK_ALIKES);
+    fixture.commit("feat(52.1-01): k", &["src/k.txt"]);
+
+    let out = fixture.cut(&[]);
+
+    assert!(
+        out.status.success(),
+        "the cut must pass: {}",
+        describe(&out)
+    );
+    assert_eq!(
+        fixture.pr_subjects(),
+        ["feat(52.1-01): k"],
+        "only the commit scoped to phase 52.1 may be replayed: {}",
+        describe(&out)
+    );
+    let listed = skipped(&out);
+    for (sha, subject) in shas.iter().zip(LOOK_ALIKES) {
+        assert!(
+            listed.contains(&(fixture.short(sha), subject.to_owned())),
+            "{subject} must be named on its own skipped line: {}",
+            describe(&out)
+        );
+    }
+}
+
+#[test]
+fn a_skipped_planning_only_commit_is_not_listed() {
+    let fixture = Fixture::new();
+    fixture.commit(SENTINEL, &["src/sentinel.txt"]);
+    fixture.commit("chore(notes): planning", &[".planning/notes.md"]);
+
+    let out = fixture.cut(&[]);
+
+    assert!(
+        out.status.success(),
+        "the cut must pass: {}",
+        describe(&out)
+    );
+    assert_eq!(
+        fixture.pr_subjects(),
+        [SENTINEL],
+        "the planning-only commit must not be replayed: {}",
+        describe(&out)
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("chore(notes): planning"),
+        "a commit that touches only forbidden paths must not be listed: {}",
+        describe(&out)
+    );
+}
+
+#[test]
+fn the_skipped_listing_and_the_replay_agree() {
+    let fixture = Fixture::new();
+    let range: [(&str, &[&str]); 6] = [
+        ("feat(52.1-01): in scope code", &["src/a.txt"]),
+        ("fix(52-review): out of scope code", &["src/b.txt"]),
+        ("docs(52.1): in scope planning", &[".planning/a.md"]),
+        ("chore(notes): out of scope planning", &[".planning/b.md"]),
+        (
+            "fix(52.1-review): in scope mixed",
+            &["src/c.txt", ".planning/c.md"],
+        ),
+        (
+            "chore(ci): out of scope mixed",
+            &["src/d.txt", ".planning/d.md"],
+        ),
+    ];
+    for (subject, paths) in range {
+        fixture.commit(subject, paths);
+    }
+
+    let out = fixture.cut(&[]);
+
+    assert!(
+        out.status.success(),
+        "the cut must pass: {}",
+        describe(&out)
+    );
+    let replayed = fixture.pr_subjects();
+    let listed = skipped(&out);
+    for (subject, paths) in range {
+        let outcomes = [
+            replayed.iter().any(|replayed| replayed == subject),
+            listed.iter().any(|(_, listed)| listed == subject),
+            paths.iter().all(|path| path.starts_with(".planning/")),
+        ];
+        assert_eq!(
+            outcomes.iter().filter(|held| **held).count(),
+            1,
+            "{subject} must be exactly one of replayed, listed and planning-only, \
+             got {outcomes:?}: {}",
+            describe(&out)
+        );
+    }
+}
+
+#[test]
+fn an_all_skipped_range_lists_its_code_commits_then_refuses() {
+    let fixture = Fixture::new();
+    let code = fixture.commit(SKIPPED_CODE, &["src/x.txt"]);
+    let skipped_line = format!("  skipped {} {SKIPPED_CODE}", fixture.short(&code));
+
+    let out = fixture.cut(&[]);
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a range with nothing in scope must be refused: {}",
+        describe(&out)
+    );
+    assert!(
+        !fixture.pr_branch_exists(),
+        "a refused cut must not create the PR branch: {}",
+        describe(&out)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let listed_at = stderr.lines().position(|line| line == skipped_line);
+    let refused_at = stderr
+        .lines()
+        .position(|line| line.starts_with("error: no commits scoped to phase 52.1"));
+    assert!(
+        listed_at.is_some(),
+        "the skipped code commit must be listed: {}",
+        describe(&out)
+    );
+    assert!(
+        refused_at.is_some(),
+        "the refusal must say nothing is scoped to the phase: {}",
+        describe(&out)
+    );
+    assert!(
+        listed_at < refused_at,
+        "the listing must come before the refusal: {}",
+        describe(&out)
+    );
+}
+
+#[test]
+fn an_unreadable_commit_aborts_before_anything_is_replayed() {
+    let fixture = Fixture::new();
+    fixture.commit("feat(52.1-01): a", &["src/a.txt"]);
+    let unreadable = fixture.commit("fix(52-review): b", &["src/b.txt"]);
+    fixture.commit("feat(52.1-02): c", &["src/c.txt"]);
+    let tree = fixture.git(&["rev-parse", &format!("{unreadable}^{{tree}}")]);
+    let object = fixture
+        .work()
+        .join(".git/objects")
+        .join(&tree[..2])
+        .join(&tree[2..]);
+    assert!(
+        object.is_file(),
+        "premise: commit b's tree must be a loose object at {}",
+        object.display()
+    );
+    std::fs::remove_file(&object).expect("remove commit b's tree object");
+
+    let out = fixture.cut(&[]);
+
+    assert!(
+        !out.status.success(),
+        "a commit git cannot read must stop the cut: {}",
+        describe(&out)
+    );
+    assert!(
+        !fixture.pr_branch_exists(),
+        "the cut must stop before the PR branch is created: {}",
+        describe(&out)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot list the files commit"),
+        "the error must say the commit's files could not be listed: {}",
+        describe(&out)
+    );
+    assert!(
+        stderr.contains(&unreadable),
+        "the error must name commit b ({unreadable}): {}",
+        describe(&out)
+    );
+    assert!(
+        !stderr.contains("skipped "),
+        "an unreadable commit must not be reported as skipped: {}",
         describe(&out)
     );
 }
