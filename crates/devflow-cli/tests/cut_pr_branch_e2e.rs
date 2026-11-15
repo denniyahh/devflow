@@ -12,6 +12,7 @@ use std::process::{Command, ExitStatus, Output};
 
 const PHASE_BRANCH: &str = "feature/phase-52.1";
 const PR_BRANCH: &str = "feature/phase-52.1-pr";
+const PHASE_ARGS: [&str; 2] = ["--phase", "52.1"];
 /// An in-scope commit, so a range under test always has something to replay.
 const SENTINEL: &str = "feat(52.1-01): sentinel";
 /// An out-of-scope commit that touches a code file.
@@ -118,20 +119,22 @@ impl Fixture {
         self.git(&["rev-parse", "HEAD"])
     }
 
-    /// The real script for phase 52.1, set to run in the work repository.
-    fn script(&self, extra: &[&str]) -> Command {
+    /// The real script, set to run in the work repository.
+    fn script(&self, args: &[&str]) -> Command {
         let mut cmd = self.hermetic("bash", &self.work());
         cmd.arg(repo_root().join("scripts/cut-pr-branch.sh"))
-            .args(["--phase", "52.1"])
-            .args(extra)
+            .args(args)
             .env_remove("PHASE")
             .env_remove("BASE_REMOTE")
             .env_remove("WORKSPACE_BASE");
         cmd
     }
 
+    /// Runs the script for phase 52.1.
     fn cut(&self, extra: &[&str]) -> Output {
-        self.script(extra).output().expect("run cut-pr-branch.sh")
+        self.script(&[&PHASE_ARGS[..], extra].concat())
+            .output()
+            .expect("run cut-pr-branch.sh")
     }
 
     /// Runs the script with stdout and stderr on one file, so the order the
@@ -140,7 +143,7 @@ impl Fixture {
         let path = self.scratch.path().join("transcript.log");
         let file = std::fs::File::create(&path).expect("create the transcript");
         let status = self
-            .script(&[])
+            .script(&PHASE_ARGS)
             .stdout(file.try_clone().expect("share the transcript"))
             .stderr(file)
             .status()
@@ -199,6 +202,9 @@ const LOOK_ALIKES: [&str; 5] = [
     "docs(52.1-docs): i",
     "fix(52.1-reviewx): j",
 ];
+
+/// A range whose middle commit is out of scope and touches a code file.
+const OUT_OF_SCOPE_MIDDLE: [&str; 3] = ["feat(52.1-01): a", "chore(ci): b", "feat(52.1-02): c"];
 
 #[test]
 fn review_and_fix_scoped_commits_of_the_phase_are_replayed() {
@@ -491,6 +497,118 @@ fn an_unreadable_commit_aborts_before_anything_is_replayed() {
     assert!(
         !stderr.contains("skipped "),
         "an unreadable commit must not be reported as skipped: {}",
+        describe(&out)
+    );
+}
+
+#[test]
+fn an_included_commit_is_replayed_in_its_original_order() {
+    let fixture = Fixture::new();
+    let shas = commit_code(&fixture, &OUT_OF_SCOPE_MIDDLE);
+
+    let out = fixture.cut(&["--include", &shas[1]]);
+
+    assert!(
+        out.status.success(),
+        "the cut must pass: {}",
+        describe(&out)
+    );
+    assert_eq!(
+        fixture.pr_subjects(),
+        OUT_OF_SCOPE_MIDDLE,
+        "the included commit must be replayed between its neighbours: {}",
+        describe(&out)
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("chore(ci): b"),
+        "an included commit must not be listed as skipped: {}",
+        describe(&out)
+    );
+}
+
+#[test]
+fn an_include_given_with_an_equals_sign_is_replayed() {
+    let fixture = Fixture::new();
+    let shas = commit_code(&fixture, &OUT_OF_SCOPE_MIDDLE);
+
+    let out = fixture.cut(&[&format!("--include={}", shas[1])]);
+
+    assert!(
+        out.status.success(),
+        "the cut must pass: {}",
+        describe(&out)
+    );
+    assert_eq!(
+        fixture.pr_subjects(),
+        OUT_OF_SCOPE_MIDDLE,
+        "the included commit must be replayed between its neighbours: {}",
+        describe(&out)
+    );
+    let branches = fixture.git(&["for-each-ref", "--format=%(refname)", "refs/heads"]);
+    assert!(
+        branches
+            .lines()
+            .any(|branch| branch == format!("refs/heads/{PR_BRANCH}")),
+        "the PR branch must keep its phase name, got {branches:?}"
+    );
+    assert!(
+        !branches.contains("include"),
+        "no branch may be named after the argument, got {branches:?}"
+    );
+}
+
+#[test]
+fn an_include_outside_the_range_is_refused() {
+    let fixture = Fixture::new();
+    let base = fixture.git(&["rev-parse", "develop"]);
+    fixture.commit(SENTINEL, &["src/sentinel.txt"]);
+
+    let out = fixture.cut(&["--include", &base]);
+
+    assert!(
+        !out.status.success(),
+        "a commit outside the range must be refused: {}",
+        describe(&out)
+    );
+    assert!(
+        !fixture.pr_branch_exists(),
+        "a refused cut must not create the PR branch: {}",
+        describe(&out)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("is not in origin/develop..feature/phase-52.1"),
+        "the refusal must name the range: {}",
+        describe(&out)
+    );
+}
+
+#[test]
+fn an_include_without_a_phase_is_refused() {
+    let fixture = Fixture::new();
+    let code = fixture.commit("chore(ci): b", &["src/b.txt"]);
+    fixture.git(&["checkout", "-q", "-b", "workspace/notes"]);
+    let branches_before = fixture.git(&["for-each-ref", "--format=%(refname)", "refs/heads"]);
+
+    let out = fixture
+        .script(&["--include", &code])
+        .output()
+        .expect("run cut-pr-branch.sh");
+
+    assert!(
+        !out.status.success(),
+        "an include outside phase mode must be refused: {}",
+        describe(&out)
+    );
+    assert_eq!(
+        fixture.git(&["for-each-ref", "--format=%(refname)", "refs/heads"]),
+        branches_before,
+        "a refused cut must not create a branch: {}",
+        describe(&out)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--include needs a phase"),
+        "the refusal must say an include needs a phase: {}",
         describe(&out)
     );
 }
