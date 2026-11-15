@@ -372,7 +372,6 @@ pub const GSD_STUB_VERSION: &str = "0.0.0-stub";
 ///
 /// The script uses shell builtins only, so it runs under an agent-free `PATH`.
 pub fn plant_gsd_run_stub(home: &std::path::Path, responses: &[&str], logs: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(logs).expect("create the GSD stub's logs dir");
     let logs_text = logs.to_str().expect("a UTF-8 logs path");
     assert!(
@@ -411,9 +410,7 @@ printf '%s\n' "$((n + 1))" > "$logs/gsd-next"
 while IFS= read -r line || [ -n "$line" ]; do printf '%s\n' "$line"; done < "$logs/gsd-response-$n"
 "#
     );
-    std::fs::write(&launcher, script).expect("write the GSD stub launcher");
-    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))
-        .expect("make the GSD stub executable");
+    write_executable(&launcher, &script);
 }
 
 /// The calls a stub from [`plant_gsd_run_stub`] logged, as
@@ -567,8 +564,47 @@ pub fn wait_until(timeout: std::time::Duration, what: &str, mut predicate: impl 
     }
 }
 
-/// Write `contents` to `path` and make it executable.
-pub fn write_executable(_path: &std::path::Path, _contents: &str) {}
+/// Write `contents` to `path` and make it executable, without this process
+/// ever holding a write descriptor on the file.
+///
+/// A short-lived `/bin/sh` writes the file with its `printf` builtin. A test
+/// process is multi-threaded, and a sibling test's `fork` holds a copy of
+/// every descriptor open at that instant until its own `exec`, close-on-exec
+/// or not; had this process opened the file for writing, an `exec` of it in
+/// that window would fail with `ETXTBSY` (999.222). With no write descriptor
+/// here there is nothing for a fork to inherit. That holds by construction; no
+/// test can aim a fork at the inside of a write to show the difference.
+///
+/// The mode is set by path (`chmod(2)` opens nothing), in this process and
+/// not by the shell, so nothing here is looked up on `PATH`.
+///
+/// # Panics
+/// Naming `path`, when the shell cannot be started (with the spawn error: a
+/// fork refused under load is not retried, it must be seen), when it exits
+/// non-zero (with its status and stderr), or when the mode cannot be set.
+pub fn write_executable(path: &std::path::Path, contents: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let written = std::process::Command::new("/bin/sh")
+        .args(["-c", r#"printf "%s" "$1" > "$2""#, "sh"])
+        .arg(contents)
+        .arg(path)
+        .output()
+        .unwrap_or_else(|error| {
+            panic!(
+                "write the executable {}: the writing shell did not start: {error}",
+                path.display()
+            )
+        });
+    assert!(
+        written.status.success(),
+        "write the executable {}: the writing shell ended with {}: {}",
+        path.display(),
+        written.status,
+        String::from_utf8_lossy(&written.stderr)
+    );
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .unwrap_or_else(|error| panic!("make {} executable: {error}", path.display()));
+}
 
 // ## Why there is no in-process absent-`git` harness in THIS crate
 //

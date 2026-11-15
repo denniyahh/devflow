@@ -702,9 +702,7 @@ mod tests {
         fn plant_at(&self, relative: &str, body: &str) -> PathBuf {
             let launcher = self.home.join(relative);
             std::fs::create_dir_all(launcher.parent().unwrap()).unwrap();
-            std::fs::write(&launcher, format!("#!/bin/sh\n{body}\n")).unwrap();
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::test_support::write_executable(&launcher, &format!("#!/bin/sh\n{body}\n"));
             launcher
         }
 
