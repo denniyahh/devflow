@@ -544,6 +544,9 @@ pub fn fork_held_before_exec() -> ForkHeldBeforeExec {
     }
 }
 
+/// Wait until `predicate` is true, for at most `timeout`.
+pub fn wait_until(_timeout: std::time::Duration, _what: &str, _predicate: impl FnMut() -> bool) {}
+
 // ## Why there is no in-process absent-`git` harness in THIS crate
 //
 // 35-01 planned one empty-`PATH` guard per crate, so that criterion 6's tests
@@ -1082,5 +1085,69 @@ mod tests {
         );
         // SAFETY: closes this test's read end, once.
         unsafe { libc::close(read_end) };
+    }
+
+    /// The predicate kills the sleeper on its first call, so no timer decides
+    /// what this test sees: a `wait_until` that never polls leaves a `sleep
+    /// 60` running, however threads are scheduled.
+    #[test]
+    fn wait_until_passes_a_process_that_exits_late() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn the sleeper");
+        let pid = child.id();
+        let mut polls = 0_u32;
+
+        wait_until(
+            std::time::Duration::from_secs(2),
+            "the killed sleep to be gone",
+            || {
+                if polls == 0 {
+                    child.kill().expect("SIGKILL the sleeper");
+                }
+                polls += 1;
+                !crate::agent::agent_running(pid)
+            },
+        );
+
+        let running_after_the_wait = crate::agent::agent_running(pid);
+        let _ = child.kill();
+        child.wait().expect("reap the sleeper");
+        assert!(polls >= 1, "wait_until never called its predicate");
+        assert!(
+            !running_after_the_wait,
+            "wait_until returned while the sleeper was still running"
+        );
+    }
+
+    /// Control: a state that never arrives fails with `wait_until`'s own
+    /// timeout text, within its bound. It does not hang and does not pass.
+    #[test]
+    fn wait_until_times_out_on_a_process_that_never_exits() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn the sleeper");
+        let pid = child.id();
+
+        let waited = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            wait_until(
+                std::time::Duration::from_secs(2),
+                "the sleep to exit",
+                || !crate::agent::agent_running(pid),
+            );
+        }));
+
+        child.kill().expect("SIGKILL the sleeper");
+        child.wait().expect("reap the sleeper");
+        let payload = waited.expect_err("wait_until returned although the sleep never exited");
+        let message = payload
+            .downcast_ref::<String>()
+            .expect("a formatted panic message");
+        assert!(
+            message.contains("timed out after 2s waiting for the sleep to exit"),
+            "the timeout names its bound and what it waited for: {message}"
+        );
     }
 }
