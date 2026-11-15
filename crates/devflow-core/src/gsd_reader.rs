@@ -886,6 +886,44 @@ mod tests {
         );
     }
 
+    /// Control: a writer that never lets go ends the retry at its bound with
+    /// the retry's own message. It does not hang and does not pass.
+    ///
+    /// Runs in its own process: the parked fork holds every descriptor of the
+    /// process it was forked from for the whole bound, and in a shared test
+    /// process those would be the sibling tests' descriptors too.
+    #[test]
+    fn a_reader_spawn_gives_up_on_text_file_busy_after_its_bound() {
+        const NAME: &str =
+            "gsd_reader::tests::a_reader_spawn_gives_up_on_text_file_busy_after_its_bound";
+        let fx = Fixture::new();
+        if !crate::test_support::in_child_test(NAME) {
+            let output = crate::test_support::run_test_in_child(NAME, &fx.home, &[]);
+            crate::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let (launcher, held) = launcher_whose_writer_a_fork_holds(&fx);
+        let started = Instant::now();
+
+        let spawned = spawn_reader_observed(&mut Command::new(&launcher), &mut || {});
+
+        let retried_for = started.elapsed();
+        held.release();
+        let message = match spawned {
+            Err(ReaderFailure::Spawn { message }) => message,
+            Err(other) => panic!("the spawn must fail as a spawn failure: {other}"),
+            Ok(_) => panic!("the spawn must not succeed while a fork holds the launcher's writer"),
+        };
+        assert!(
+            message.contains("still busy after retrying for 2s"),
+            "the failure names the retry and its bound: {message}"
+        );
+        assert!(
+            retried_for >= TEXT_BUSY_RETRY_FOR,
+            "the spawn gave up after {retried_for:?}, before its {TEXT_BUSY_RETRY_FOR:?} bound"
+        );
+    }
+
     #[test]
     fn a_missing_report_reads_as_missing() {
         let fx = Fixture::new();
