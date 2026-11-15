@@ -265,7 +265,13 @@ pub fn external_verify_enabled(project_root: &Path) -> bool {
 /// [`external_verify_enabled`] would ignore, or `None` when the value is unset
 /// or is one it accepts (`true` or `false`).
 pub fn external_verify_env_warning(value: Option<&str>) -> Option<String> {
-    value.and(None)
+    let value = value?;
+    value.parse::<bool>().err().map(|_| {
+        format!(
+            "warning: DEVFLOW_EXTERNAL_VERIFY_ENABLED={value:?} is not true or false; \
+             using devflow.toml or the default"
+        )
+    })
 }
 
 /// [`external_verify_env_warning`] for the value in this process's environment,
