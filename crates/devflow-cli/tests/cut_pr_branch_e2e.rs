@@ -689,3 +689,96 @@ fn an_include_without_a_phase_is_refused() {
         describe(&out)
     );
 }
+
+/// Asserts the script refused an `--include` with exactly `error` on stderr
+/// and created no PR branch.
+fn assert_include_refused(fixture: &Fixture, out: &Output, error: &str) {
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "the include must be refused: {}",
+        describe(out)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .lines()
+            .any(|line| line == error),
+        "the refusal must read {error:?}: {}",
+        describe(out)
+    );
+    assert!(
+        !fixture.pr_branch_exists(),
+        "a refused cut must not create the PR branch: {}",
+        describe(out)
+    );
+}
+
+/// The refusal for an `--include` value that names no replayable commit in
+/// the phase's range.
+fn not_in_range(value: &str) -> String {
+    format!(
+        "error: --include {value} is not in origin/develop..{PHASE_BRANCH} (or is a merge commit)"
+    )
+}
+
+#[test]
+fn an_include_with_an_empty_value_is_refused() {
+    let fixture = Fixture::new();
+    fixture.commit(SENTINEL, &["src/sentinel.txt"]);
+
+    let out = fixture.cut(&["--include="]);
+
+    assert_include_refused(&fixture, &out, &not_in_range(""));
+}
+
+#[test]
+fn an_include_with_no_value_is_refused() {
+    let fixture = Fixture::new();
+    fixture.commit(SENTINEL, &["src/sentinel.txt"]);
+
+    let out = fixture.cut(&["--include"]);
+
+    assert_include_refused(&fixture, &out, "error: --include needs a commit SHA");
+}
+
+#[test]
+fn an_include_git_cannot_resolve_is_refused() {
+    const NO_SUCH_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+    let fixture = Fixture::new();
+    fixture.commit(SENTINEL, &["src/sentinel.txt"]);
+
+    let out = fixture.cut(&["--include", NO_SUCH_COMMIT]);
+
+    assert_include_refused(&fixture, &out, &not_in_range(NO_SUCH_COMMIT));
+}
+
+#[test]
+fn an_include_naming_a_merge_commit_is_refused() {
+    let fixture = Fixture::new();
+    fixture.commit(SENTINEL, &["src/sentinel.txt"]);
+    fixture.git(&["checkout", "-q", "-b", "side", "develop"]);
+    fixture.commit("chore(ci): side", &["src/side.txt"]);
+    fixture.git(&["checkout", "-q", PHASE_BRANCH]);
+    fixture.git(&["merge", "-q", "--no-ff", "-m", "merge side", "side"]);
+    let merge = fixture.git(&["rev-parse", "HEAD"]);
+    assert_eq!(
+        fixture
+            .git(&["rev-list", "--parents", "-n", "1", &merge])
+            .split(' ')
+            .count(),
+        3,
+        "premise: the commit must have two parents"
+    );
+    let range = format!("origin/develop..{PHASE_BRANCH}");
+    assert!(
+        fixture
+            .git(&["rev-list", &range])
+            .lines()
+            .any(|sha| sha == merge),
+        "premise: the merge commit is inside the range, so only its being a merge can refuse it"
+    );
+
+    let out = fixture.cut(&["--include", &merge]);
+
+    assert_include_refused(&fixture, &out, &not_in_range(&merge));
+}
