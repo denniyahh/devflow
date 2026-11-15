@@ -86,10 +86,12 @@ else can make (restated by the operator 2026-11-08).
 
 ## Operator Next Steps
 
-Phase 52.1 is planned (14 plans, 10 waves; commits `48582cd`, `ff62f80`). In order:
+Phase 52.1 is planned (15 plans, 11 waves; review applied in `6d37732`, reconciled in `3f9a430`; plan-checker round 2
+on 2026-11-14: 0 blockers, its one warning closed by recording the pi S7 ruling in CONTEXT D-09.5). In order:
 
-1. **External adversarial review of the 52.1 plan set** (codex and agy lanes, `external-review` skill) before any
-   code. A replan from it runs as `/gsd-plan-phase 52.1 --reviews` in an agent session (a hand-run stage; note it).
+1. **Done — external review and replan.** The `--reviews` replan ran as `/gsd-plan-phase 52.1 --reviews` in an agent
+   session, a hand-run stage, because DevFlow's Plan stage has no reviews mode. Operator ruled pi S7 on 2026-11-14:
+   cleanup keeps an incomplete stopped run (CONTEXT D-09.5 amendment, plan 11).
 2. **Create the phase worktree:** `scripts/phase-worktree.sh 52.1` (D-18). Every plan's precondition stops without
    `.worktrees/phase-52.1` on `feature/phase-52.1`.
 3. **MemPalace capture once the plans are final** (`/gsd-mempalace-capture`): supersede, not add beside, the palace's
@@ -98,7 +100,7 @@ Phase 52.1 is planned (14 plans, 10 waves; commits `48582cd`, `ff62f80`). In ord
    MCP server is the writer; see `~/.config/agents/AGENTS.md` § MemPalace.
 4. **Execute:** `/gsd-execute-phase 52.1` from the worktree. Plan 52.1-14 Task 2 (the live proof run and its
    control) needs the operator at a shell outside any agent worktree.
-5. **Push `workspace/denniyahh`:** 8 commits ahead of origin as of 2026-11-12.
+5. **Push `workspace/denniyahh`** after the 2026-11-14 ruling commits.
 
 ### Historical — superseded phase notes
 
