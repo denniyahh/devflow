@@ -5,16 +5,16 @@ milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: "52.1"
 current_phase_name: Stabilize for Dogfooding
 status: executing
-stopped_at: Completed 52.1-02-PLAN.md
-last_updated: "2026-11-15T17:29:24.256Z"
+stopped_at: Completed 52.1-03-PLAN.md
+last_updated: "2026-11-15T17:56:44.161Z"
 last_activity: 2026-11-14
 last_activity_desc: Phase 52.1 execution started
-state_head: 23f614f20322b6ed9abc6a4e99241871e02da024
+state_head: 951b62e858aaab9e70579263dc606ed858341e89
 progress:
   total_phases: 5
   completed_phases: 0
   total_plans: 48
-  completed_plans: 35
+  completed_plans: 36
   percent: 0
 ---
 
@@ -172,7 +172,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 52.1 (Stabilize for Dogfooding) — EXECUTING
-Plan: 3 of 15
+Plan: 4 of 15
 Status: Ready to execute
 Last activity: 2026-11-14 — Phase 52.1 execution started
 
@@ -916,6 +916,10 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 52.1]: 52.1-02: force_clear_auto_chain reports a leak only when HEAD or the working copy held true. A working copy holding false is recorded under 'chore(gsd): record GSD's workflow._auto_chain_active: false' with no killed-run note and no auto_chain_flag_repaired event; a layout difference with no flag in it is left uncommitted (D-22).
 - [Phase 52.1]: 52.1-02: the benign-row e2e drives devflow resume, not start. The fixture the plan names spawns resume; start's call site is covered by the shared helper's unit test (entry point start), not by its own e2e.
 - [Phase 52.1]: 52.1-02: an invalid DEVFLOW_EXTERNAL_VERIFY_ENABLED prints one warning: line on stderr, first, at start (a dry run included) and at resume, before any refusal (D-03). The detached supervisor's tracing warning is unchanged.
+- [Phase 52.1]: 52.1-03: cut-pr-branch.sh accepts only (N-review) and (N-fix) as new scope suffixes; any other suffix is listed as skipped and needs --include (D-12)
+- [Phase 52.1]: 52.1-03: --include without a phase is refused, because non-phase mode replays every commit and would ignore the option silently (T-52.1-06)
+- [Phase 52.1]: 52.1-03: the three shellcheck notes cut-pr-branch.sh already carried are marked with directives (comments only), so the plan's shellcheck gate exits 0 and reports new findings alone
+- [Phase 52.1]: 52.1-03: an unreadable out-of-scope commit stops the cut before anything is created; an unreadable in-scope commit is still stopped in the replay loop, after the PR branch exists (untested gap)
 
 ## Roadmap Evolution
 
@@ -1062,11 +1066,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 52 P32 | 60min | 3 tasks | 7 files |
 | Phase 52.1 P01 | 23min | 3 tasks | 4 files |
 | Phase 52.1 P02 | 23 min | 3 tasks | 7 files |
+| Phase 52.1 P03 | 22 min | 3 tasks | 3 files |
 
 ## Session
 
-**Last session:** 2026-11-15T17:29:23.563Z
-**Stopped at:** Completed 52.1-02-PLAN.md
+**Last session:** 2026-11-15T17:56:43.545Z
+**Stopped at:** Completed 52.1-03-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
