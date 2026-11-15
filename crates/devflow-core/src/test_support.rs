@@ -567,6 +567,9 @@ pub fn wait_until(timeout: std::time::Duration, what: &str, mut predicate: impl 
     }
 }
 
+/// Write `contents` to `path` and make it executable.
+pub fn write_executable(_path: &std::path::Path, _contents: &str) {}
+
 // ## Why there is no in-process absent-`git` harness in THIS crate
 //
 // 35-01 planned one empty-`PATH` guard per crate, so that criterion 6's tests
@@ -1168,6 +1171,58 @@ mod tests {
         assert!(
             message.contains("timed out after 2s waiting for the sleep to exit"),
             "the timeout names its bound and what it waited for: {message}"
+        );
+    }
+
+    /// The script both stub-writer tests plant.
+    const STUB_SCRIPT: &str = "#!/bin/sh\nexit 0\n";
+
+    /// Control: a stub this process wrote itself cannot be executed while a
+    /// fork taken during the write still holds the write descriptor (999.222).
+    #[test]
+    fn a_held_fork_makes_a_parent_written_stub_text_busy() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("stub");
+        let mut file = std::fs::File::create(&stub).expect("create the stub");
+        file.write_all(STUB_SCRIPT.as_bytes())
+            .expect("write the stub");
+        let held = fork_held_before_exec();
+        drop(file);
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("make the stub executable");
+
+        let ran = std::process::Command::new(&stub).status();
+
+        held.release();
+        let error = ran.expect_err("exec must fail while a fork holds the stub's write descriptor");
+        assert_eq!(
+            error.raw_os_error(),
+            Some(libc::ETXTBSY),
+            "the failure is Text file busy: {error}"
+        );
+    }
+
+    /// A stub from `write_executable` holds exactly `contents` and runs at
+    /// once beside a parked fork: this process never had a write descriptor on
+    /// it for a fork to inherit.
+    #[test]
+    fn a_stub_written_by_write_executable_execs_beside_a_held_fork() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("stub");
+        write_executable(&stub, STUB_SCRIPT);
+        let held = fork_held_before_exec();
+
+        let ran = std::process::Command::new(&stub).status();
+
+        held.release();
+        let status = ran.expect("exec the stub beside a held fork");
+        assert!(status.success(), "the stub exits 0: {status:?}");
+        assert_eq!(
+            std::fs::read_to_string(&stub).expect("read the stub back"),
+            STUB_SCRIPT,
+            "the stub holds exactly the contents it was given"
         );
     }
 }
