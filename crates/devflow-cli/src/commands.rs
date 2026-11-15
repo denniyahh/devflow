@@ -1417,7 +1417,6 @@ pub(crate) fn discard(
     phase: PhaseId,
     delete_unmerged_branch: Option<&str>,
 ) -> Result<(), CliError> {
-    let _ = delete_unmerged_branch;
     let _holder = claim_foreground_holder(project_root, phase)?;
     let existing = workflow::update_state_with_within(
         project_root,
@@ -1438,56 +1437,225 @@ pub(crate) fn discard(
             ..flow
         },
     );
-    let worktree = worktree::phase_path(project_root, phase);
-    let state_file = workflow::state_path(project_root, phase);
+    let items = discard_items(project_root, phase, &existing, &git, base)?;
+    print_discard_listing(phase, &items);
+    refuse_discard_of_branch(phase, &items, delete_unmerged_branch)?;
+    remove_discarded(project_root, phase, &git, &items)
+}
+
+/// What `devflow discard` found for a phase: the three things it removes, each present
+/// only when it exists, so a partial phase is discarded item by item.
+struct DiscardItems {
+    /// The worktree git lists at `.worktrees/phase-NN`, with its count of uncommitted
+    /// changes.
+    worktree: Option<(PathBuf, usize)>,
+    /// `.devflow/state-NN.json`, when the file exists, whether or not it loads.
+    state: Option<PathBuf>,
+    /// The derived `feature/phase-NN`.
+    branch: String,
+    /// The branch's count of commits not merged into `base`. `None` when the branch
+    /// does not exist.
+    unmerged: Option<usize>,
+    /// The branch `unmerged` is counted against: the base the run recorded, else the
+    /// project's.
+    base: String,
+}
+
+/// Read what discard would remove for `phase`, removing nothing. `git`'s trunk is
+/// `base`. Refuses whatever it cannot account for: see [`discard_worktree`], and a
+/// branch whose merge state does not read, which is never assumed merged.
+fn discard_items(
+    project_root: &Path,
+    phase: PhaseId,
+    existing: &workflow::Existing,
+    git: &GitFlow,
+    base: String,
+) -> Result<DiscardItems, CliError> {
     let branch = format!("{FEATURE_PREFIX}phase-{padded}", padded = phase.padded());
+    let worktree = discard_worktree(project_root, phase, &branch)?;
+    let state = (!matches!(existing, workflow::Existing::Missing))
+        .then(|| workflow::state_path(project_root, phase));
+    let unmerged = if git.branch_exists(&branch) {
+        Some(git.commits_not_in_develop(&branch).map_err(|err| {
+            CliError::Message(format!(
+                "discard refused: phase {phase}'s branch {branch} could not be checked for \
+                 commits not merged into `{base}` ({err}); nothing was removed. Make `{base}` \
+                 resolve, then run `devflow discard --phase {phase}` again"
+            ))
+        })?)
+    } else {
+        None
+    };
+    Ok(DiscardItems {
+        worktree,
+        state,
+        branch,
+        unmerged,
+        base,
+    })
+}
 
+/// The phase worktree discard may remove, with its count of uncommitted changes: the
+/// one git lists at the derived `.worktrees/phase-NN` with `branch` checked out. `None`
+/// when nothing is at that path.
+///
+/// Refuses what it cannot account for: something at that path that git does not list
+/// as a worktree; a worktree on another branch or a detached HEAD, which may hold
+/// commits no branch keeps and the listing would not show; and a worktree whose status
+/// does not read.
+fn discard_worktree(
+    project_root: &Path,
+    phase: PhaseId,
+    branch: &str,
+) -> Result<Option<(PathBuf, usize)>, CliError> {
+    let path = worktree::phase_path(project_root, phase);
+    let again = format!("then run `devflow discard --phase {phase}` again");
+    let worktrees = worktree::list(project_root).map_err(|err| {
+        CliError::Message(format!(
+            "discard refused: this repository's worktrees could not be listed ({err}); \
+             nothing was removed"
+        ))
+    })?;
+    let Some(listed) = worktrees.iter().find(|wt| same_path(&wt.path, &path)) else {
+        if path.symlink_metadata().is_ok() {
+            return Err(CliError::Message(format!(
+                "discard refused: {} exists but git does not list it as a worktree, so discard \
+                 cannot tell what is in it; nothing was removed. Inspect it and remove it \
+                 yourself, {again}",
+                path.display()
+            )));
+        }
+        return Ok(None);
+    };
+    if listed.branch.as_deref() != Some(branch) {
+        let found = listed.branch.as_deref().map_or_else(
+            || "a detached HEAD".to_string(),
+            |other| format!("branch {other}"),
+        );
+        return Err(CliError::Message(format!(
+            "discard refused: the worktree {} has {found} checked out, not {branch}, so discard \
+             cannot tell what removing it would lose; nothing was removed. Inspect it and remove \
+             it yourself, {again}",
+            path.display()
+        )));
+    }
+    let uncommitted = uncommitted_changes(&path).map_err(|why| {
+        CliError::Message(format!(
+            "discard refused: the uncommitted changes in the worktree {} could not be counted \
+             ({why}); nothing was removed. If its directory is gone, run `git worktree prune`, \
+             {again}",
+            path.display()
+        ))
+    })?;
+    Ok(Some((path, uncommitted)))
+}
+
+/// Whether two paths name the same place: their canonical forms are compared, and a
+/// path that does not resolve is compared as written.
+fn same_path(left: &Path, right: &Path) -> bool {
+    let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    canonical(left) == canonical(right)
+}
+
+/// Discard's listing of what it will remove (D-09.2), printed before any removal.
+fn print_discard_listing(phase: PhaseId, items: &DiscardItems) {
     println!("discard: phase {phase} — to be removed:");
-    let uncommitted = match uncommitted_changes(&worktree) {
-        Ok(1) => "1 uncommitted change".to_string(),
-        Ok(count) => format!("{count} uncommitted changes"),
-        Err(why) => format!("its uncommitted changes could not be counted ({why})"),
-    };
-    println!(
-        "  worktree {}, with everything in it: {uncommitted} (ignored files are removed too \
-         and are not counted)",
-        worktree.display()
-    );
-    println!("  run state {}", state_file.display());
-    let merged = match git.commits_not_in_develop(&branch) {
-        Ok(0) => format!("merged into `{base}`"),
-        Ok(count) => unmerged_commits(count, &base),
-        Err(err) => format!("could not be checked for commits not merged into `{base}`: {err}"),
-    };
-    println!("  branch {branch} ({merged})");
+    if let Some((path, uncommitted)) = &items.worktree {
+        let changes = match uncommitted {
+            1 => "1 uncommitted change".to_string(),
+            count => format!("{count} uncommitted changes"),
+        };
+        println!(
+            "  worktree {}, with everything in it: {changes} (ignored files are removed too \
+             and are not counted)",
+            path.display()
+        );
+    }
+    if let Some(path) = &items.state {
+        println!("  run state {}", path.display());
+    }
+    if let Some(unmerged) = items.unmerged {
+        let merged = match unmerged {
+            0 => format!("merged into `{}`", items.base),
+            count => unmerged_commits(count, &items.base),
+        };
+        println!("  branch {} ({merged})", items.branch);
+    }
+}
 
+/// D-10 / D-23: no unmerged branch is deleted unless `--delete-unmerged-branch` names
+/// it, and the name must be the phase's own branch whatever its merge state.
+fn refuse_discard_of_branch(
+    phase: PhaseId,
+    items: &DiscardItems,
+    named: Option<&str>,
+) -> Result<(), CliError> {
+    let branch = &items.branch;
+    if let Some(named) = named
+        && named != branch
+    {
+        return Err(CliError::Message(format!(
+            "discard refused: --delete-unmerged-branch names {named}, and phase {phase}'s branch \
+             is {branch}; nothing was removed. Name {branch}, or leave the flag out"
+        )));
+    }
+    match items.unmerged {
+        Some(count) if count > 0 && named.is_none() => Err(CliError::Message(format!(
+            "discard refused: phase {phase}'s branch {branch} has {}; nothing was removed. To \
+             delete it with the rest, run `devflow discard --phase {phase} \
+             --delete-unmerged-branch {branch}`",
+            unmerged_commits(count, &items.base)
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// Remove what [`discard_items`] found, in the order worktree, state, branch: a
+/// `removed` line for each, a `warning:` line for each that failed, and an error when
+/// any did. An item that was not found is not attempted.
+fn remove_discarded(
+    project_root: &Path,
+    phase: PhaseId,
+    git: &GitFlow,
+    items: &DiscardItems,
+) -> Result<(), CliError> {
     let mut failed = false;
-    match worktree::remove(project_root, &worktree, true) {
-        Ok(()) => println!("removed worktree {}", worktree.display()),
-        Err(err) => {
-            failed = true;
-            println!(
-                "warning: could not remove the worktree {}: {err}",
-                worktree.display()
-            );
+    if let Some((path, _)) = &items.worktree {
+        match worktree::remove(project_root, path, true) {
+            Ok(()) => println!("removed worktree {}", path.display()),
+            Err(err) => {
+                failed = true;
+                println!(
+                    "warning: could not remove the worktree {}: {err}",
+                    path.display()
+                );
+            }
         }
     }
-    match workflow::clear_state(project_root, phase) {
-        Ok(true) => println!("removed run state {}", state_file.display()),
-        Ok(false) => {}
-        Err(err) => {
-            failed = true;
-            println!(
-                "warning: could not remove the run state {}: {err}",
-                state_file.display()
-            );
+    if let Some(path) = &items.state {
+        match workflow::clear_state(project_root, phase) {
+            Ok(true) => println!("removed run state {}", path.display()),
+            // Gone since it was listed: nothing to remove, and not a failure.
+            Ok(false) => {}
+            Err(err) => {
+                failed = true;
+                println!(
+                    "warning: could not remove the run state {}: {err}",
+                    path.display()
+                );
+            }
         }
     }
-    match git.delete_branch(&branch, true) {
-        Ok(()) => println!("removed branch {branch}"),
-        Err(err) => {
-            failed = true;
-            println!("warning: could not remove the branch {branch}: {err}");
+    if items.unmerged.is_some() {
+        match git.delete_branch(&items.branch, true) {
+            Ok(()) => println!("removed branch {}", items.branch),
+            Err(err) => {
+                failed = true;
+                println!(
+                    "warning: could not remove the branch {}: {err}",
+                    items.branch
+                );
+            }
         }
     }
     if failed {
