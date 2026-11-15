@@ -863,6 +863,146 @@ fn start_dry_run_lists_exactly_plan_code_validate() {
     );
 }
 
+const EXTERNAL_VERIFY_WARNING_PREFIX: &str = "warning: DEVFLOW_EXTERNAL_VERIFY_ENABLED=";
+const EXTERNAL_VERIFY_YES_WARNING: &str =
+    "warning: DEVFLOW_EXTERNAL_VERIFY_ENABLED=\"yes\" is not true or false";
+
+/// The stderr lines that warn about `DEVFLOW_EXTERNAL_VERIFY_ENABLED`.
+fn external_verify_warning_lines(stderr: &str) -> Vec<&str> {
+    stderr
+        .lines()
+        .filter(|line| line.starts_with(EXTERNAL_VERIFY_WARNING_PREFIX))
+        .collect()
+}
+
+/// `devflow start --dry-run` with `DEVFLOW_EXTERNAL_VERIFY_ENABLED` set on the
+/// child only. Returns the child's stderr.
+fn start_dry_run_stderr_with_external_verify(value: &str) -> String {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let fake_bin = fake_bin_dir(&[]);
+
+    let output = common::hermetic_devflow(&home)
+        .args(["start", "--dry-run", "--phase", "1", "--mode", "supervise"])
+        .arg(root)
+        .env("PATH", path_with_fake_bin(&fake_bin.path))
+        .env("DEVFLOW_EXTERNAL_VERIFY_ENABLED", value)
+        .current_dir(root)
+        .output()
+        .expect("run devflow");
+
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "dry-run must not fail\nstderr: {stderr}"
+    );
+    stderr
+}
+
+/// `devflow resume` on a project with no saved state, with
+/// `DEVFLOW_EXTERNAL_VERIFY_ENABLED` set on the child only. Nothing can launch:
+/// resume refuses for the missing state. Returns the child's stderr.
+fn resume_without_state_stderr_with_external_verify(value: &str) -> String {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let fake_bin = fake_bin_dir(&[]);
+
+    let output = common::hermetic_devflow(&home)
+        .args(["resume", "--phase", "12"])
+        .arg(root)
+        .env("PATH", path_with_fake_bin(&fake_bin.path))
+        .env("DEVFLOW_EXTERNAL_VERIFY_ENABLED", value)
+        .current_dir(root)
+        .output()
+        .expect("run devflow");
+
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        !output.status.success(),
+        "premise: resume with no saved state must refuse\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("no active DevFlow state"),
+        "premise: the refusal is the missing-state one\nstderr: {stderr}"
+    );
+    stderr
+}
+
+/// 999.229: an invalid `DEVFLOW_EXTERNAL_VERIFY_ENABLED` is said in the
+/// foreground at `start`, a dry run included, as the first thing on stderr.
+#[test]
+fn start_dry_run_warns_on_an_invalid_external_verify_value() {
+    let stderr = start_dry_run_stderr_with_external_verify("yes");
+
+    let warnings = external_verify_warning_lines(&stderr);
+    assert_eq!(
+        warnings.len(),
+        1,
+        "exactly one warning line for the ignored value\nstderr: {stderr}"
+    );
+    assert!(
+        warnings[0].starts_with(EXTERNAL_VERIFY_YES_WARNING),
+        "the warning names the value and what is accepted: {}",
+        warnings[0]
+    );
+    assert_eq!(
+        stderr.lines().next(),
+        Some(warnings[0]),
+        "the warning is the first line on stderr\nstderr: {stderr}"
+    );
+}
+
+/// Control for the test above: a value that is accepted prints no warning.
+#[test]
+fn start_dry_run_prints_no_external_verify_warning_for_a_valid_value() {
+    let stderr = start_dry_run_stderr_with_external_verify("true");
+
+    assert_eq!(
+        external_verify_warning_lines(&stderr).len(),
+        0,
+        "an accepted value must print no warning\nstderr: {stderr}"
+    );
+}
+
+/// 999.229: `resume` says it too, and before its own refusal.
+#[test]
+fn resume_warns_on_an_invalid_external_verify_value() {
+    let stderr = resume_without_state_stderr_with_external_verify("yes");
+
+    let warnings = external_verify_warning_lines(&stderr);
+    assert_eq!(
+        warnings.len(),
+        1,
+        "exactly one warning line for the ignored value\nstderr: {stderr}"
+    );
+    assert!(
+        warnings[0].starts_with(EXTERNAL_VERIFY_YES_WARNING),
+        "the warning names the value and what is accepted: {}",
+        warnings[0]
+    );
+    let line_of = |needle: &str| stderr.lines().position(|line| line.contains(needle));
+    assert!(
+        line_of(EXTERNAL_VERIFY_WARNING_PREFIX) < line_of("no active DevFlow state"),
+        "the warning prints before the refusal\nstderr: {stderr}"
+    );
+}
+
+/// Control for the test above: a value that is accepted prints no warning.
+#[test]
+fn resume_prints_no_external_verify_warning_for_a_valid_value() {
+    let stderr = resume_without_state_stderr_with_external_verify("true");
+
+    assert_eq!(
+        external_verify_warning_lines(&stderr).len(),
+        0,
+        "an accepted value must print no warning\nstderr: {stderr}"
+    );
+}
+
 /// OPS-02 / D-35: `devflow start` says when it replaces a phase's existing state,
 /// naming which: a finished run, a stopped run with its stop reason, or a state
 /// file that does not load. `--dry-run` reaches the point where `start` loads the

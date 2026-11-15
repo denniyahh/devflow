@@ -261,6 +261,19 @@ pub fn external_verify_enabled(project_root: &Path) -> bool {
     load_config(project_root).external_verify_enabled
 }
 
+/// The foreground warning for a `DEVFLOW_EXTERNAL_VERIFY_ENABLED` value that
+/// [`external_verify_enabled`] would ignore, or `None` when the value is unset
+/// or is one it accepts (`true` or `false`).
+pub fn external_verify_env_warning(value: Option<&str>) -> Option<String> {
+    value.and(None)
+}
+
+/// [`external_verify_env_warning`] for the value in this process's environment,
+/// read the same way [`external_verify_enabled`] reads it.
+pub fn external_verify_env_warning_now() -> Option<String> {
+    external_verify_env_warning(env_value("DEVFLOW_EXTERNAL_VERIFY_ENABLED").as_deref())
+}
+
 /// Reject a base-branch value that must never reach a `git` argv or become
 /// this project's integration trunk (45-01, D-01).
 ///
@@ -650,6 +663,26 @@ mod tests {
             &mut sink,
         );
         assert_eq!(written(sink), "");
+    }
+
+    #[test]
+    fn an_invalid_external_verify_value_is_warned() {
+        let warning = external_verify_env_warning(Some("yes"));
+        assert!(
+            warning.as_deref().is_some_and(|text| text.starts_with(
+                "warning: DEVFLOW_EXTERNAL_VERIFY_ENABLED=\"yes\" is not true or false"
+            )),
+            "an ignored value must be named in a warning: {warning:?}"
+        );
+    }
+
+    #[test]
+    fn a_valid_external_verify_value_is_not_warned() {
+        // Control for the test above: the two values `external_verify_enabled`
+        // accepts, and no value at all, say nothing.
+        for value in [Some("true"), Some("false"), None] {
+            assert_eq!(external_verify_env_warning(value), None, "{value:?}");
+        }
     }
 
     #[test]
