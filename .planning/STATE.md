@@ -5,16 +5,16 @@ milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: "52.1"
 current_phase_name: Stabilize for Dogfooding
 status: executing
-stopped_at: Completed 52.1-04-PLAN.md
-last_updated: "2026-11-15T19:22:06.772Z"
+stopped_at: Completed 52.1-06-PLAN.md
+last_updated: "2026-11-15T19:46:22.622Z"
 last_activity: 2026-11-14
 last_activity_desc: Phase 52.1 execution started
-state_head: f938b5baa6517dc61a216104b7ed3c3358185139
+state_head: b6d37c4185b2bdb568124b0abd4233cd0a5dcf0b
 progress:
   total_phases: 5
   completed_phases: 0
   total_plans: 48
-  completed_plans: 38
+  completed_plans: 39
   percent: 0
 ---
 
@@ -172,7 +172,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 52.1 (Stabilize for Dogfooding) — EXECUTING
-Plan: 6 of 15
+Plan: 7 of 15
 Status: Ready to execute
 Last activity: 2026-11-14 — Phase 52.1 execution started
 
@@ -928,6 +928,9 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 52.1]: check-workspace-divergence.sh captures each git listing before reading it and stops with its own message when git fails; a `done < <(git ...)` loop reads nothing and passes
 - [Phase 52.1]: A sixth hook test beyond the five planned proves the manifest and FORBIDDEN_PATHS come from the pushed commit: no planned test told those two reads apart from the checkout
 - [Phase 52.1]: A divergence refusal names the commit, and the hook adds a line naming the refused ref, so a push of several refs says which one failed
+- [Phase 52.1]: 52.1-06: the released-lock wait's never-released control runs in a child process, because its parked fork holds every descriptor of the process it is forked from for the whole 2 s bound
+- [Phase 52.1]: 52.1-06: the note on write_lock_status names the holder's process as the one whose fork keeps the lock, not the reader's; no production code changed
+- [Phase 52.1]: 52.1-06: the sibling-test backlog entry is 999.236 (999.235 was already taken by the 52.1-02 follow-up)
 
 ## Roadmap Evolution
 
@@ -1077,11 +1080,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 52.1 P03 | 22 min | 3 tasks | 3 files |
 | Phase 52.1 P05 | 15 min | 2 tasks | 1 files |
 | Phase 52.1 P04 | 23 min | 2 tasks | 5 files |
+| Phase 52.1 P06 | 23 min | 2 tasks | 3 files |
 
 ## Session
 
-**Last session:** 2026-11-15T19:22:06.153Z
-**Stopped at:** Completed 52.1-04-PLAN.md
+**Last session:** 2026-11-15T19:46:22.017Z
+**Stopped at:** Completed 52.1-06-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
