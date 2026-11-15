@@ -3912,10 +3912,16 @@ fn discard_removes_a_state_that_does_not_load() {
     let state_file = devflow_core::workflow::state_path(&case.root, phase);
     fs::write(&state_file, "not json").unwrap();
     let bystanders = add_bystanders(&case.root);
+    // Another phase's socket is not this phase's: the sweep must not refuse on it.
+    let other_socket = plant_swept_socket(&case.home, &case.root, BYSTANDER_PHASE);
 
     let out = run_discard(&case.home, &case.root, phase, &[]);
     let (stdout, text) = discard_text(&out);
     assert!(out.status.success(), "{text}");
+    assert!(
+        other_socket.exists(),
+        "another phase's socket is left in place: {text}"
+    );
     assert!(
         listing_has(&stdout, "run state"),
         "the listing names the state file: {text}"
