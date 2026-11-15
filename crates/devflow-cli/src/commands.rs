@@ -368,6 +368,12 @@ pub(crate) fn start(
     until: Option<Stage>,
     fallback: FallbackSource,
 ) -> Result<(), CliError> {
+    // 999.229: said first, before any other output, a refusal or the dry-run
+    // return. The detached supervisor that reads the value has no foreground.
+    if let Some(warning) = config::external_verify_env_warning_now() {
+        eprintln!("{warning}");
+    }
+
     // 999.78/A-11: NOT a bare `State::new`. See
     // `fresh_state_carrying_phase_failures` for why one field survives a
     // forced restart and every other counter does not.

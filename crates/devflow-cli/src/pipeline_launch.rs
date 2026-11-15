@@ -3225,6 +3225,11 @@ pub(crate) fn resume_with_fallback(
     agent: Option<AgentKind>,
     fallback_agent: Option<AgentKind>,
 ) -> Result<(), CliError> {
+    // 999.229: said first, so it prints even when the resume then refuses.
+    if let Some(warning) = devflow_core::config::external_verify_env_warning_now() {
+        eprintln!("{warning}");
+    }
+
     let _phase_holder = crate::commands::claim_foreground_holder(project_root, phase)?;
     let reserved = crate::commands::reserve_launch(
         project_root,
