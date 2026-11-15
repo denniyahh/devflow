@@ -723,6 +723,30 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.236: `write_lock_status_reads_free_held_and_the_recorded_holder` Polls an Exclusive Probe, Then Reads Once (BACKLOG)
+
+**Found:** 2026-11-15, Phase 52.1 plan 52.1-06 (research for 999.221), by reading the test source. Not found by a
+failing run.
+**Defect:** `workflow::tests::write_lock_status_reads_free_held_and_the_recorded_holder`
+(`crates/devflow-core/src/workflow.rs`) waits for its released lock with `wait_for_free_write_lock`, then asserts one
+shared `write_lock_status` read is `Free`. The wait polls `write_lock_is_free`, which takes an exclusive `try_lock` on
+its own open of the lock file. If another test thread forks while that probe holds the lock, the child keeps a
+duplicate of the probe's descriptor until its `exec`, so the lock is held exclusively again after the wait returned
+`true`, and the one shared read that follows can say `Held { pid: None }`. It is 999.221's race one step later: the
+wait covers the holder's descriptor and makes a new one of its own.
+**Evidence:** the two calls are adjacent in the test (`assert!(wait_for_free_write_lock(root, phase));`, then
+`assert_eq!(write_lock_status(root, phase).unwrap(), WriteLockStatus::Free)`), and `write_lock_is_free` calls
+`file.try_lock()`. 52.1-06's `commands::tests::the_released_write_lock_control_outlasts_a_fork_held_before_exec` shows
+a parked fork's duplicate of a lock descriptor making the shared read say `Held { pid: None }` after the holder's
+release. `wait_for_free_write_lock`'s other three callers assert on the wait's result alone, with no shared read after
+it, so they do not have this shape (read 2026-11-15).
+**Not established:** this test has not been seen to fail, and no rate is known. The reproduction above parks its fork
+during the holder's lock, not during an exclusive probe; no test aims a fork at the probe.
+**Fix shape:** poll the shared read with a bound and assert on that, as 52.1-06's `wait_for_released_write_lock` does
+in `crates/devflow-cli/src/commands.rs` (`devflow_core::test_support::wait_until` over `write_lock_status(..) ==
+WriteLockStatus::Free`, 2 s). Outside 52.1's named scope (D-01 lists 999.221, not this test). Take it in any fix
+branch.
+
 ### Phase 999.235: A Refused Recording Commit Is Logged as `auto_chain_flag_repaired` (BACKLOG)
 
 **Found:** 2026-11-15, Phase 52.1 plan 52.1-02 (its SUMMARY lists it) and that plan's follow-up. Found by reading the
