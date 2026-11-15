@@ -723,6 +723,35 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.235: A Refused Recording Commit Is Logged as `auto_chain_flag_repaired` (BACKLOG)
+
+**Found:** 2026-11-15, Phase 52.1 plan 52.1-02 (its SUMMARY lists it) and that plan's follow-up. Found by reading the
+source, then seen in a test run.
+**Defect:** `repair_leaked_auto_chain_flag` (`crates/devflow-cli/src/pipeline_launch.rs`) writes one event,
+`auto_chain_flag_repaired`, whenever the outcome carries a `commit_refused`, whether or not anything was repaired. When
+the commit that records GSD's first `workflow._auto_chain_active: false` is refused (`record_gsd_false` in
+`crates/devflow-core/src/gsd_config.rs`: the commit fails, the file differs from HEAD again, or HEAD cannot be read),
+nothing leaked and nothing was repaired. `.devflow/events.jsonl` still gains an entry named for a repair, with
+`working_tree_repaired: false`, `committed_tree_repaired: false` and the reason in `commit_refused`.
+`docs/guides/unattended-mode.md` ("The repair is also recorded as an `auto_chain_flag_repaired` entry") tells the
+operator that entry means a repair. The foreground `warning:` line for the same case is accurate.
+**Evidence:** the early return in `repair_leaked_auto_chain_flag` is taken only when nothing was repaired and
+`commit_refused` is `None`, so a refusal alone reaches `events::emit`. Seen once, 2026-11-15: a temporary probe in the
+e2e test `a_recording_commit_that_fails_is_warned_about_at_resume` (a pre-commit hook rejects the recording commit;
+the real `devflow resume`) printed the phase's only such event: `"event": "auto_chain_flag_repaired"`,
+`"entry_point": "resume"`, `"working_tree_repaired": false`, `"committed_tree_repaired": false`,
+`"commit_refused": "the commit recording GSD's workflow._auto_chain_active: false could not be made (git command
+failed: the hook says no) — .planning/config.json stays uncommitted; nothing was leaked"`. The probe was removed; no
+committed test asserts on this event, so that the name is not pinned.
+**Not established:** whether any run has met a refused recording commit (none is known). Whether anything outside this
+repository reads the event by name; inside it the only reader is test code. The older refusals that can also fire with
+no `true` flag in either copy (a config carrying other changes, a HEAD that cannot be compared) reach the same `emit`
+by the source; that was not run.
+**Fix shape:** when `commit_refused` is set and `repaired_anything()` is false, emit an event named for what happened
+(for example `auto_chain_record_refused`) and keep `auto_chain_flag_repaired` for a real repair; update the guide's
+sentence; one launch-helper test per name, with the other name asserted absent. Take it in the first fix branch after
+52.1: it is outside the behaviour 52.1 proves.
+
 ### Phase 999.234: Remaining `fs::write`-Then-Exec Test Stubs Can Hit "Text file busy" (BACKLOG)
 
 **Found:** 2026-11-15, Phase 52.1 plan 52.1-01 Task 3, by reading the test sources. Not found by a failing run.
