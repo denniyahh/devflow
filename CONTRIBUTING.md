@@ -231,7 +231,7 @@ If you use AI agent harnesses (Claude Code, Codex, Antigravity, Hermes), custom 
    # Cuts a pristine feature/my-feature branch off origin/develop,
    # cherry-picks code commits, and strips personal/planning artifacts.
    ```
-   On a DevFlow phase branch (`feature/phase-N`) it runs in phase mode: it replays the commits scoped to that phase (`feat(N-07): ...`), wherever they were committed, onto `feature/phase-N-pr`. It ends with a fidelity report; review any path it lists as differing from your branch.
+   On a DevFlow phase branch (`feature/phase-N`) it runs in phase mode: it replays the commits scoped to that phase (`feat(N-07): ...`), wherever they were committed, onto `feature/phase-N-pr`. Before replaying, it lists on stderr every commit outside the phase's scope that touches a file which would reach `develop` (`skipped <short-sha> <subject>`); read that listing, and replay a commit that belongs in the PR with `--include <sha>` (repeatable). It ends with a fidelity report; review any path it lists as differing from your branch.
 5. Test, push, and submit the clean PR:
    ```bash
    git checkout feature/my-feature
