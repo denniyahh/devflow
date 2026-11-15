@@ -126,6 +126,7 @@ if MANIFEST="$(git show "$CURRENT_BRANCH:.workspace-divergence" 2>/dev/null)"; t
     done <<< "$MANIFEST"
 fi
 # Each entry matches that exact path or anything under it, nothing else.
+# shellcheck disable=SC2016 # The sed program's `$` and `\\&` are literal.
 FORBIDDEN_REGEX="^($(printf '%s\n' "${FORBIDDEN_PATHS[@]%/}" | sed 's/[][\.*^$()+?{}|]/\\&/g' | paste -sd '|' -))(/|$)"
 
 if [ -n "$PHASE" ]; then
@@ -222,6 +223,7 @@ for HASH in "${COMMIT_LIST[@]}"; do
         REMAINING_UNMERGED=$(git diff --name-only --diff-filter=U || true)
         if [ -n "$REMAINING_UNMERGED" ]; then
             echo "error: unresolved code conflict in commit $HASH on:" >&2
+            # shellcheck disable=SC2001 # sed indents every line of the list.
             echo "$REMAINING_UNMERGED" | sed 's/^/  /' >&2
             git cherry-pick --abort >/dev/null 2>&1 || git reset --hard HEAD --quiet
             git checkout "$ORIG_BRANCH" --quiet
@@ -270,6 +272,7 @@ CHANGED_SET="$(git diff --name-only "$BASE_REF" "$PR_BRANCH" | sort -u)"
 UNEXPLAINED="$(comm -13 <(echo "$TOUCHED_SET") <(echo "$CHANGED_SET") | grep -v '^$' || true)"
 if [ -n "$UNEXPLAINED" ]; then
     echo "error: '$PR_BRANCH' changes paths no replayed commit touched:" >&2
+    # shellcheck disable=SC2001 # sed indents every line of the list.
     echo "$UNEXPLAINED" | sed 's/^/  /' >&2
     git checkout "$ORIG_BRANCH" --quiet
     exit 1
