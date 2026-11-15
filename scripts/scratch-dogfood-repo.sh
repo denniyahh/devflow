@@ -260,9 +260,9 @@ st_control_head_on_main() {
 
 # The negative arm's fixture (D-14/D-25) is pinned by content: tree hashes
 # carry no timestamps, so they are deterministic where commit SHAs are not.
-# Measured at bc73b1b and re-measured at aaad4b9; one appended byte to
-# config.json gives 8ffe954e… instead.
-DEFAULT_TREE=f6120b337cb9b37d658c6111b7ac14694338dc56
+# Re-measured 2026-11-15 for the GSD-serialized config (Phase 52.1, D-15); one
+# appended byte to config.json gives 54d171cb… instead.
+DEFAULT_TREE=39a4bda8d5baa05877d8205d026ed87cbb8a9f15
 
 st_default_tree() {
     local name="default mode: tree hash unchanged"
@@ -299,6 +299,83 @@ st_default_branches() {
         return
     fi
     case_ok "$name"
+}
+
+# st_default_chain_flag <config.json>: one case line. Read with `jq -e`, so an
+# absent key (null) fails rather than reading as false.
+st_default_chain_flag() {
+    local name="default: config.json carries _auto_chain_active false"
+    if jq -e '.workflow._auto_chain_active == false' "$1" >/dev/null 2>&1; then
+        case_ok "$name"
+    else
+        case_fail "$name" "workflow._auto_chain_active is absent or not false in $1"
+    fi
+}
+
+st_default_config() {
+    local cfg="$ST_TMP/dflt/.planning/config.json"
+    st_default_chain_flag "$cfg"
+    if cmp -s <(jq --indent 2 . "$cfg" 2>/dev/null) "$cfg"; then
+        case_ok "default: config.json is in GSD's serialization"
+    else
+        case_fail "default: config.json is in GSD's serialization" \
+            "bytes differ from jq --indent 2 of the file (or it is not JSON)"
+    fi
+    if jq -e '.workflow.code_review == false and .model_profile == "budget"' "$cfg" >/dev/null 2>&1; then
+        case_ok "default: config.json keeps the proof run cheap"
+    else
+        case_fail "default: config.json keeps the proof run cheap" \
+            "workflow.code_review is not false or model_profile is not budget"
+    fi
+}
+
+st_control_default_no_chain_flag() {
+    local name="control: a default config without the chain-flag key fails"
+    local cfg="$ST_TMP/dflt/.planning/config.json" mutated="$ST_TMP/nokey.json" out="$ST_TMP/nokey.out"
+    if ! jq --indent 2 'del(.workflow._auto_chain_active)' "$cfg" >"$mutated" 2>/dev/null ||
+        ! jq -e '(.workflow | type) == "object" and (.workflow | has("_auto_chain_active") | not)' \
+            "$mutated" >/dev/null 2>&1; then
+        case_fail "$name" "precondition: could not write a copy of the default config without the key"
+        return
+    fi
+    # In a subshell: the case line is captured and stays out of the totals.
+    (st_default_chain_flag "$mutated") >"$out" 2>&1
+    if [ "$(st_count '  FAIL default: config.json carries _auto_chain_active false' "$out")" -eq 1 ] &&
+        [ "$(wc -l <"$out")" -eq 1 ]; then
+        case_ok "$name"
+    else
+        case_fail "$name" "the chain-flag case did not print exactly its own FAIL line for a key-absent config"
+    fi
+}
+
+st_default_hook_controls() {
+    local name="control: a default config without schema_drift_gate activates the drift wave gate"
+    local dflt="$ST_TMP/dflt" copy="$ST_TMP/dflt-nodrift" wave rc=0
+    wave="$(hook_count "$dflt" execute:wave:post '["ui","drift"]')" || rc=1
+    if [ "$rc" -eq 0 ] && [ "$wave" -eq 0 ]; then
+        case_ok "default: GSD resolves no ui or drift wave gate"
+    else
+        case_fail "default: GSD resolves no ui or drift wave gate" "probe failed or a ui or drift hook resolved"
+    fi
+    if [ ! -d "$dflt/.git" ]; then
+        case_fail "$name" "precondition: no default scaffold at $dflt"
+        return
+    fi
+    cp -a "$dflt" "$copy"
+    if ! jq --indent 2 'del(.workflow.schema_drift_gate)' "$dflt/.planning/config.json" \
+        >"$copy/.planning/config.json" 2>/dev/null ||
+        ! jq -e '(.workflow | type) == "object" and (.workflow | has("schema_drift_gate") | not)' \
+            "$copy/.planning/config.json" >/dev/null 2>&1; then
+        case_fail "$name" "precondition: could not write the copy's config without schema_drift_gate"
+        return
+    fi
+    rc=0
+    wave="$(hook_count "$copy" execute:wave:post '["drift"]')" || rc=1
+    if [ "$rc" -eq 0 ] && [ "$wave" -gt 0 ]; then
+        case_ok "$name"
+    else
+        case_fail "$name" "probe failed or no drift hook resolved"
+    fi
 }
 
 # st_guard_probe <name> <root>: scaffolding <root>/.p49-guard-probe-<pid> must
@@ -537,6 +614,9 @@ run_selftest() {
     st_control_compact_config
     st_control_head_on_main
     st_default_tree
+    st_default_config
+    st_control_default_no_chain_flag
+    st_default_hook_controls
     st_default_branches
     st_guard_probe "control: refuses a destination inside this checkout" "$REPO_ROOT"
     # The main checkout, computed here independently of the guard's own
@@ -1248,9 +1328,50 @@ Create `.planning/phases/01-add-probe-marker/01-01-SUMMARY.md` when done.
 </output>
 EOF
 
+# Written as GSD itself serializes it (`JSON.stringify(config, null, 2)` plus
+# one newline, which `jq --indent 2 .` reproduces for objects, strings and
+# booleans), with `_auto_chain_active` present and false, so GSD's own
+# `config-set workflow._auto_chain_active false` rewrites the file to the same
+# bytes and leaves the tree clean for Validate. Measured against GSD 1.21.0 on
+# 2026-11-15 (first probed on 1.20.1): key present in this layout stays clean,
+# key absent goes ` M .planning/config.json`.
+# The `workflow` object is the `--live-payload` config's, key for key, with one
+# value changed (`code_review`). Non-default keys, one reason each:
+# `auto_mode` false: the ephemeral chain flag stays the only auto-approval path.
+# `security_enforcement` false: removes the `verify:post` secure-phase hook GSD activates by default.
+# `verifier` true: keeps Code's verifier writing `01-VERIFICATION.md`, whose `passed` status a finish reads.
+# `nyquist_validation` true: keeps the Validate stage doing real work.
+# `ui_phase`/`ui_safety_gate`/`ui_review`/`schema_drift_gate` false: remove default-active wave gates.
+# `code_review` false, `model_profile` budget: the proof run tests the pipeline, not review, so it stays cheap.
+# `tdd_mode`/`research`/`plan_check` false: the live payload's values; no extra GSD steps on a one-line plan.
+# `use_worktrees` false: no nested executor worktrees inside DevFlow's phase worktree.
+# `git.branching_strategy` none: GSD stays on the branch DevFlow created.
+# `git.base_branch` develop: this scaffold's DevFlow base; it has no remote, so GSD cannot read origin/HEAD.
 cat > "$DEST_ABS/.planning/config.json" <<'EOF'
 {
-  "workflow": {}
+  "commit_docs": true,
+  "parallelization": false,
+  "workflow": {
+    "auto_mode": false,
+    "_auto_chain_active": false,
+    "verifier": true,
+    "nyquist_validation": true,
+    "security_enforcement": false,
+    "ui_phase": false,
+    "ui_safety_gate": false,
+    "ui_review": false,
+    "schema_drift_gate": false,
+    "code_review": false,
+    "tdd_mode": false,
+    "use_worktrees": false,
+    "research": false,
+    "plan_check": false
+  },
+  "git": {
+    "branching_strategy": "none",
+    "base_branch": "develop"
+  },
+  "model_profile": "budget"
 }
 EOF
 
