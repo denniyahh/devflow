@@ -37,6 +37,12 @@ const BASE_SCRIPTS: [&str; 3] = [
     "scripts/check-in-container.sh",
 ];
 const PASSING_STUB: &str = "#!/bin/sh\nexit 0\n";
+/// The two modes git records for a regular file.
+const EXECUTABLE: &str = "100755";
+const NOT_EXECUTABLE: &str = "100644";
+/// Every message the divergence script prints, a pass or a refusal, opens
+/// with this, so its absence from both streams means the script never ran.
+const CHECK_PREFIX: &str = "check-workspace-divergence:";
 const EVERY_DIFFERENCE_DECLARED: &str =
     "check-workspace-divergence: every difference from origin/develop is declared.";
 
@@ -116,7 +122,7 @@ impl Fixture {
 
         let not_executable: Vec<&str> = BASE_SCRIPTS
             .into_iter()
-            .filter(|script| self.committed_mode("develop", script) != "100755")
+            .filter(|script| self.committed_mode("develop", script) != EXECUTABLE)
             .collect();
         assert!(
             not_executable.is_empty(),
@@ -176,7 +182,17 @@ impl Fixture {
             .expect("create the script's directory");
         write_executable(&file, contents);
         self.git(&["add", "--", path]);
-        self.git(&["update-index", "--chmod=+x", "--", path]);
+        self.stage_mode(path, EXECUTABLE);
+    }
+
+    /// Stages `path` with `mode`, leaving the file on disk as it is.
+    fn stage_mode(&self, path: &str, mode: &str) {
+        let flag = if mode == EXECUTABLE {
+            "--chmod=+x"
+        } else {
+            "--chmod=-x"
+        };
+        self.git(&["update-index", flag, "--", path]);
     }
 
     /// Commits what is staged and returns the commit's full SHA.
@@ -208,14 +224,16 @@ impl Fixture {
         self.commit("chore: undeclared readme edit")
     }
 
-    /// Checks out a new `workspace/x` from `develop` that adds one executable
-    /// script and declares it, and returns its commit. The manifest is itself
-    /// a built-in path, so the script's mode is all a check can object to.
-    fn workspace_branch_adding_a_script(&self) -> String {
+    /// Checks out a new `workspace/x` from `develop` that adds one script,
+    /// committed with `mode`, and declares it, and returns its commit. The
+    /// manifest is itself a built-in path, so the script's mode is all a
+    /// check can object to.
+    fn workspace_branch_adding_a_script(&self, mode: &str) -> String {
         self.git(&["checkout", "-q", "-b", "workspace/x", "develop"]);
         self.write(MANIFEST, &format!("only {ADDED_SCRIPT}\n"));
         self.git(&["add", "--", MANIFEST]);
         self.add_executable(ADDED_SCRIPT, PASSING_STUB);
+        self.stage_mode(ADDED_SCRIPT, mode);
         self.commit("chore: add a declared script")
     }
 
@@ -311,16 +329,16 @@ fn a_clean_pr_branch_pushed_from_a_workspace_checkout_passes() {
 #[test]
 fn a_pushed_commits_script_mode_is_judged_by_the_commit_not_the_index() {
     let fixture = Fixture::new();
-    let sha = fixture.workspace_branch_adding_a_script();
-    fixture.git(&["update-index", "--chmod=-x", "--", ADDED_SCRIPT]);
+    let sha = fixture.workspace_branch_adding_a_script(EXECUTABLE);
+    fixture.stage_mode(ADDED_SCRIPT, NOT_EXECUTABLE);
     assert_eq!(
         fixture.committed_mode(&sha, ADDED_SCRIPT),
-        "100755",
+        EXECUTABLE,
         "premise: the pushed commit carries the script executable"
     );
     assert_eq!(
         fixture.index_mode(ADDED_SCRIPT),
-        "100644",
+        NOT_EXECUTABLE,
         "premise: the index stages it non-executable"
     );
 
@@ -329,6 +347,112 @@ fn a_pushed_commits_script_mode_is_judged_by_the_commit_not_the_index() {
     assert!(
         out.status.success(),
         "the index's mode must not refuse a commit that carries the script executable: {}",
+        describe(&out)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains(EVERY_DIFFERENCE_DECLARED),
+        "the check must have run and passed, not been skipped: {}",
+        describe(&out)
+    );
+}
+
+#[test]
+fn a_non_executable_script_at_the_pushed_commit_is_refused() {
+    let fixture = Fixture::new();
+    let sha = fixture.workspace_branch_adding_a_script(NOT_EXECUTABLE);
+    fixture.stage_mode(ADDED_SCRIPT, EXECUTABLE);
+    assert_eq!(
+        fixture.committed_mode(&sha, ADDED_SCRIPT),
+        NOT_EXECUTABLE,
+        "premise: the pushed commit carries the script non-executable"
+    );
+    assert_eq!(
+        fixture.index_mode(ADDED_SCRIPT),
+        EXECUTABLE,
+        "premise: the index stages it executable"
+    );
+
+    let out = fixture.push(&first_push_of(WORKSPACE_REF, &sha));
+
+    assert!(
+        !out.status.success(),
+        "a script the pushed commit carries non-executable must be refused, whatever the \
+         index stages: {}",
+        describe(&out)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("not committed executable (100644): scripts/x.sh"),
+        "the refusal must name the script and the mode the commit carries: {}",
+        describe(&out)
+    );
+}
+
+#[test]
+fn a_delete_push_is_skipped() {
+    let fixture = Fixture::new();
+    let sha = fixture.wrong_workspace_branch();
+    let direct = fixture
+        .hermetic("bash", &fixture.repo())
+        .arg(DIVERGENCE_SCRIPT)
+        .args(["origin/develop", "HEAD"])
+        .output()
+        .expect("run the divergence script");
+    let direct_stderr = String::from_utf8_lossy(&direct.stderr);
+    assert!(
+        !direct.status.success(),
+        "premise: a check of this checkout refuses it: {}",
+        describe(&direct)
+    );
+    assert!(
+        direct_stderr.contains(CHECK_PREFIX),
+        "premise: the refusal carries the script's prefix: {}",
+        describe(&direct)
+    );
+    assert!(
+        direct_stderr.contains("README.md"),
+        "premise: the refusal is the undeclared file: {}",
+        describe(&direct)
+    );
+
+    let out = fixture.push(&format!("(delete) {ZERO_SHA} {WORKSPACE_REF} {sha}"));
+
+    assert!(
+        out.status.success(),
+        "a delete pushes no commit, so there is nothing to check: {}",
+        describe(&out)
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains(CHECK_PREFIX),
+        "the divergence script must not run for a delete (stdout): {}",
+        describe(&out)
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains(CHECK_PREFIX),
+        "the divergence script must not run for a delete (stderr): {}",
+        describe(&out)
+    );
+}
+
+#[test]
+fn a_pushed_commit_is_judged_by_its_own_manifest_and_built_in_list() {
+    let fixture = Fixture::new();
+    let sha = fixture.workspace_branch_adding_a_script(EXECUTABLE);
+    // Uncommitted edits to the two files the check reads its rules from. Read
+    // from the checkout, the first leaves the added script undeclared and the
+    // second stops the manifest being a built-in path.
+    fixture.write(MANIFEST, "# declares nothing\n");
+    fixture.write(
+        "scripts/cut-pr-branch.sh",
+        "#!/bin/sh\nFORBIDDEN_PATHS=(.nothing)\n",
+    );
+
+    let out = fixture.push(&first_push_of(WORKSPACE_REF, &sha));
+
+    assert!(
+        out.status.success(),
+        "the checkout's uncommitted manifest and built-in list must not refuse a commit \
+         that declares every difference: {}",
         describe(&out)
     );
     assert!(
