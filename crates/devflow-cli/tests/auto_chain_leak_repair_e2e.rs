@@ -566,6 +566,11 @@ fn a_leak_that_reached_the_branch_tip_is_repaired_in_the_commit_too() {
     assert_eq!(events.len(), 1, "exactly one repair event: {events:?}");
     assert_eq!(events[0]["committed_tree_repaired"], true);
     assert_eq!(events[0]["entry_point"], "resume");
+    assert!(
+        !printed(&output).contains(LEFT_UNCOMMITTED_NOTE),
+        "a repaired leak leaves nothing uncommitted\nprinted:\n{}",
+        printed(&output)
+    );
 }
 
 /// 52.1 D-22, at the binary level: GSD's first `config-set` writes
@@ -634,5 +639,137 @@ fn gsds_first_false_write_is_recorded_without_a_killed_run_notice() {
     assert!(
         !printed.contains("was killed before it could clear it"),
         "nothing leaked, so no killed run may be named\nprinted:\n{printed}"
+    );
+    assert!(
+        !printed.contains(LEFT_UNCOMMITTED_NOTE),
+        "a recorded false leaves nothing uncommitted\nprinted:\n{printed}"
+    );
+}
+
+/// The words only the left-uncommitted note uses.
+const LEFT_UNCOMMITTED_NOTE: &str = "left .planning/config.json uncommitted";
+
+/// How `resume` refuses once it reaches the launch under [`git_only_path`].
+const MISSING_AGENT_REFUSAL: &str = "agent binary `claude` not found";
+
+/// Everything a spawned `devflow` printed: stdout, then stderr.
+fn printed(output: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+/// Commits the fixture's `.planning/config.json` as it stands.
+fn commit_config(fixture: &Fixture, subject: &str) {
+    git(&fixture.root, &["add", ".planning/config.json"]);
+    git(&fixture.root, &["commit", "-q", "-m", subject]);
+}
+
+/// Operator ruling 2026-11-15, at the binary level: the branch tip holds GSD's
+/// `false` and the key is gone from the working copy. No copy holds `true` and
+/// there is no `false` to record, so the next real `devflow resume` commits
+/// nothing, writes no repair event, and says in one foreground line that the
+/// file is left uncommitted and what that costs.
+#[test]
+fn a_config_change_devflow_cannot_attribute_is_left_uncommitted_and_said() {
+    let fixture = Fixture::new(false);
+    let path_dir = git_only_path();
+
+    commit_config(&fixture, "docs: add gsd config holding false");
+    assert_eq!(
+        fixture.flag_at_head(),
+        "false",
+        "premise: the committed config holds false"
+    );
+    let head_before = git_output(&fixture.root, &["rev-parse", "HEAD"]);
+    let with_false = fs::read_to_string(&fixture.config).unwrap();
+    let without_key = with_false.replace("    \"_auto_chain_active\": false,\n", "");
+    assert_ne!(
+        without_key, with_false,
+        "the fixture must actually drop the key from the working copy"
+    );
+    fs::write(&fixture.config, &without_key).unwrap();
+
+    let output = fixture.run_resume(path_dir.path());
+    let printed = printed(&output);
+
+    assert_eq!(
+        git_output(&fixture.root, &["rev-parse", "HEAD"]),
+        head_before,
+        "resume must commit nothing in this row\nprinted:\n{printed}"
+    );
+    let status = git_output(&fixture.root, &["status", "--porcelain"]);
+    assert!(
+        status
+            .lines()
+            .any(|line| line == " M .planning/config.json"),
+        "the file stays modified and uncommitted, got status {status:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&fixture.config).unwrap(),
+        without_key,
+        "the working copy must be left byte for byte as it was"
+    );
+    let events = fixture.repair_events();
+    assert!(
+        events.is_empty(),
+        "nothing was repaired, so no repair event may be written: {events:?}"
+    );
+    let notes: Vec<&str> = printed
+        .lines()
+        .filter(|line| line.contains(LEFT_UNCOMMITTED_NOTE))
+        .collect();
+    assert_eq!(
+        notes.len(),
+        1,
+        "resume must say in exactly one line that the file is left uncommitted\nprinted:\n{printed}"
+    );
+    assert!(
+        notes[0].starts_with(
+            "note: devflow resume left .planning/config.json uncommitted for phase 78"
+        ),
+        "the line must name the entry point, the file and the phase: {}",
+        notes[0]
+    );
+    assert!(
+        notes[0].contains("DevFlow cannot attribute the change"),
+        "the line must say why nothing was committed: {}",
+        notes[0]
+    );
+    assert!(
+        notes[0].contains("Validate will not record a pass until it is committed"),
+        "the line must say what the uncommitted file costs: {}",
+        notes[0]
+    );
+    assert!(
+        !printed.contains("was killed before it could clear it"),
+        "nothing leaked, so no killed run may be named\nprinted:\n{printed}"
+    );
+}
+
+/// The control for the row above: a committed config the working copy agrees
+/// with. `resume` reaches the launch and says nothing about the config.
+#[test]
+fn a_clean_resume_prints_no_left_uncommitted_note() {
+    let fixture = Fixture::new(false);
+    let path_dir = git_only_path();
+    commit_config(&fixture, "docs: add gsd config holding false");
+
+    let output = fixture.run_resume(path_dir.path());
+    let printed = printed(&output);
+
+    assert!(
+        printed.contains(MISSING_AGENT_REFUSAL),
+        "premise: resume ran past the launch repair and refused at the launch\nprinted:\n{printed}"
+    );
+    assert!(
+        !printed.contains(LEFT_UNCOMMITTED_NOTE),
+        "a clean config has nothing left uncommitted\nprinted:\n{printed}"
+    );
+    assert!(
+        !printed.contains("note: devflow resume"),
+        "a clean launch has no repair note at all\nprinted:\n{printed}"
     );
 }

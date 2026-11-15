@@ -587,6 +587,91 @@ fn start_records_gsds_first_false_without_a_killed_run_notice() {
         !printed.contains(KILLED_RUN_NOTICE),
         "nothing leaked, so no killed run may be named\nprinted:\n{printed}"
     );
+    assert!(
+        !printed.contains(LEFT_UNCOMMITTED_NOTE),
+        "a recorded false leaves nothing uncommitted\nprinted:\n{printed}"
+    );
+}
+
+/// The words only the left-uncommitted note uses.
+const LEFT_UNCOMMITTED_NOTE: &str = "left .planning/config.json uncommitted";
+
+/// Operator ruling 2026-11-15 through `devflow start`: the branch tip holds
+/// GSD's `false` and the key is gone from the working copy. `start` commits
+/// nothing and writes no repair event, and says in one foreground line that the
+/// file is left uncommitted and what that costs.
+#[test]
+fn start_says_when_it_leaves_a_config_change_it_cannot_attribute_uncommitted() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let config = root.join(".planning/config.json");
+    let without_key = fs::read_to_string(&config).unwrap();
+    assert!(
+        !without_key.contains("_auto_chain_active"),
+        "premise: the fixture's config has no chain flag: {without_key}"
+    );
+    fs::write(&config, CONFIG_WITH_GSDS_FALSE).unwrap();
+    git(root, &["add", ".planning/config.json"]);
+    git(
+        root,
+        &["commit", "-q", "-m", "docs: record the chain flag as false"],
+    );
+    let develop_tip = String::from_utf8_lossy(&git(root, &["rev-parse", "develop"]).stdout)
+        .trim()
+        .to_owned();
+    fs::write(&config, &without_key).unwrap();
+
+    let printed = start_phase_44_in_place(&home, root);
+
+    assert_eq!(
+        String::from_utf8_lossy(&git(root, &["rev-parse", "feature/phase-44"]).stdout).trim(),
+        develop_tip,
+        "start must commit nothing on the phase branch in this row\nprinted:\n{printed}"
+    );
+    let status =
+        String::from_utf8_lossy(&git(root, &["status", "--porcelain"]).stdout).into_owned();
+    assert!(
+        status
+            .lines()
+            .any(|line| line == " M .planning/config.json"),
+        "the file stays modified and uncommitted, got status {status:?}"
+    );
+    let events = auto_chain_repair_events(root);
+    assert!(
+        events.is_empty(),
+        "nothing was repaired, so no repair event may be written: {events:?}"
+    );
+    let notes: Vec<&str> = printed
+        .lines()
+        .filter(|line| line.contains(LEFT_UNCOMMITTED_NOTE))
+        .collect();
+    assert_eq!(
+        notes.len(),
+        1,
+        "start must say in exactly one line that the file is left uncommitted\nprinted:\n{printed}"
+    );
+    assert!(
+        notes[0]
+            .starts_with("note: devflow start left .planning/config.json uncommitted for phase 44"),
+        "the line must name the entry point, the file and the phase: {}",
+        notes[0]
+    );
+    assert!(
+        notes[0].contains("DevFlow cannot attribute the change"),
+        "the line must say why nothing was committed: {}",
+        notes[0]
+    );
+    assert!(
+        notes[0].contains("Validate will not record a pass until it is committed"),
+        "the line must say what the uncommitted file costs: {}",
+        notes[0]
+    );
+    assert!(
+        !printed.contains(KILLED_RUN_NOTICE),
+        "nothing leaked, so no killed run may be named\nprinted:\n{printed}"
+    );
 }
 
 /// `--until` values for stages v4.0 removed (D-07), in every case spelling. Later cut

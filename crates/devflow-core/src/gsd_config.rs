@@ -189,6 +189,7 @@ pub fn set_auto_chain_active(root: &Path, active: bool) -> Result<bool, GsdConfi
 /// from "nothing happened" would report the deferral as silence.
 ///
 /// `recorded_gsd_false` is a fourth fact, about a commit that is not a repair.
+/// `left_uncommitted` is a fifth, about a difference nobody committed.
 #[derive(Debug, Default)]
 pub struct ClearOutcome {
     /// The file on disk carried a set flag and now does not.
@@ -206,6 +207,14 @@ pub struct ClearOutcome {
     /// layout, and a commit recorded the working copy. Confirmed by re-probing
     /// the tip after the commit, like `committed_tree_repaired`.
     pub recorded_gsd_false: bool,
+    /// Not a leak and nothing to record: the working copy differs from the
+    /// branch tip, no copy holds a `true` flag and the working copy holds no
+    /// `false` (the key was removed, or only the layout differs). DevFlow
+    /// cannot attribute the difference, so it commits nothing and the file
+    /// stays modified. The caller says so, because an uncommitted
+    /// `.planning/config.json` stops Validate recording a pass (52-CONTEXT
+    /// D-46).
+    pub left_uncommitted: bool,
 }
 
 impl ClearOutcome {
@@ -715,6 +724,10 @@ mod tests {
              → next-phase-chains path stays open (35.1 D-01)"
         );
         assert_eq!(outcome.commit_refused, None);
+        assert!(
+            !outcome.left_uncommitted,
+            "a repaired leak leaves nothing uncommitted"
+        );
         assert_eq!(flag_at_head(&root), Value::Bool(false));
     }
 
@@ -813,6 +826,10 @@ mod tests {
         assert!(!outcome.working_tree_repaired);
         assert_eq!(outcome.commit_refused, None);
         assert!(!outcome.repaired_anything());
+        assert!(
+            !outcome.left_uncommitted,
+            "a recorded false leaves nothing uncommitted"
+        );
         assert_eq!(flag_at_head(&root), Value::Bool(false));
         assert_eq!(head_subject(&root), RECORD_SUBJECT);
         assert_eq!(status_porcelain(&root), "", "the tree must be left clean");
@@ -849,8 +866,55 @@ mod tests {
         assert_eq!(status_porcelain(&root), "", "the tree must be left clean");
     }
 
+    /// The branch tip holds GSD's `false` and the key is gone from the working
+    /// copy, in the same layout. No copy holds `true`, so it is not a leak, and
+    /// the working copy holds no `false` to record. DevFlow cannot attribute
+    /// the change: it commits nothing (operator ruling, 2026-11-15) and reports
+    /// the file as left uncommitted.
+    #[test]
+    fn force_clear_leaves_a_removed_false_uncommitted_and_reports_it() {
+        let (_dir, root) = git_project();
+        write_config(&root, &real_shape(false));
+        commit_config(&root, "add gsd config holding false");
+        assert_eq!(
+            flag_at_head(&root),
+            Value::Bool(false),
+            "premise: the committed config holds false"
+        );
+        let head_before = head_sha(&root);
+        let working = pretty(&real_shape_without_the_key());
+        write_config(&root, &working);
+
+        let outcome = force_clear_auto_chain(&root).unwrap();
+
+        assert_eq!(
+            head_sha(&root),
+            head_before,
+            "a removed false must not be committed"
+        );
+        assert_eq!(
+            status_porcelain(&root),
+            " M .planning/config.json\n",
+            "the file stays modified and uncommitted"
+        );
+        assert_eq!(
+            std::fs::read_to_string(config_path(&root)).unwrap(),
+            working,
+            "the working copy must be left byte for byte as it was"
+        );
+        assert!(!outcome.working_tree_repaired);
+        assert!(!outcome.committed_tree_repaired);
+        assert!(!outcome.recorded_gsd_false);
+        assert_eq!(outcome.commit_refused, None);
+        assert!(
+            outcome.left_uncommitted,
+            "a difference left uncommitted must be reported, not passed over in silence"
+        );
+    }
+
     /// Neither copy holds the flag and only the layout differs. DevFlow owns
-    /// only the flag, so it commits nothing and reports nothing.
+    /// only the flag, so it commits nothing and reports the file as left
+    /// uncommitted.
     #[test]
     fn force_clear_leaves_a_layout_only_difference_without_the_key_uncommitted() {
         let (_dir, root) = git_project();
@@ -876,6 +940,10 @@ mod tests {
         assert!(!outcome.committed_tree_repaired);
         assert!(!outcome.recorded_gsd_false);
         assert_eq!(outcome.commit_refused, None);
+        assert!(
+            outcome.left_uncommitted,
+            "a layout difference left uncommitted must be reported too"
+        );
     }
 
     /// F-8 / T-35.1-08: `commit_path` is path-scoped but still commits whatever
@@ -954,6 +1022,10 @@ mod tests {
         assert!(
             !outcome.repaired_anything(),
             "an ordinary clean launch must have nothing to be loud about"
+        );
+        assert!(
+            !outcome.left_uncommitted,
+            "a clean config has no difference to leave uncommitted"
         );
         assert_eq!(std::fs::read(config_path(&root)).unwrap(), bytes_before);
         assert_eq!(head_sha(&root), head_before);
