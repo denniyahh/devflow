@@ -282,9 +282,7 @@ struct ReaderOutput {
 /// it started held a pipe open past the deadline.
 fn run_bounded(mut cmd: Command, timeout: Duration) -> Result<ReaderOutput, ReaderFailure> {
     let deadline = Instant::now() + timeout;
-    let mut child = cmd.spawn().map_err(|error| ReaderFailure::Spawn {
-        message: error.to_string(),
-    })?;
+    let mut child = spawn_reader(&mut cmd)?;
     // Read before `try_wait` reaps the child: through `process_group(0)` the
     // child's pid is its group's id, which outlives the child while any
     // member does.
@@ -324,6 +322,31 @@ fn run_bounded(mut cmd: Command, timeout: Duration) -> Result<ReaderOutput, Read
         status,
         stdout,
         stderr,
+    })
+}
+
+/// Spawn the reader. A release build spawns once.
+#[cfg(not(any(test, feature = "test-support")))]
+fn spawn_reader(cmd: &mut Command) -> Result<Child, ReaderFailure> {
+    cmd.spawn().map_err(|error| ReaderFailure::Spawn {
+        message: error.to_string(),
+    })
+}
+
+/// Spawn the reader through [`spawn_reader_observed`], with no observer.
+#[cfg(any(test, feature = "test-support"))]
+fn spawn_reader(cmd: &mut Command) -> Result<Child, ReaderFailure> {
+    spawn_reader_observed(cmd, &mut || {})
+}
+
+/// Spawn the reader, telling `on_text_busy` about each `ETXTBSY` it meets.
+#[cfg(any(test, feature = "test-support"))]
+fn spawn_reader_observed(
+    cmd: &mut Command,
+    _on_text_busy: &mut dyn FnMut(),
+) -> Result<Child, ReaderFailure> {
+    cmd.spawn().map_err(|error| ReaderFailure::Spawn {
+        message: error.to_string(),
     })
 }
 
@@ -767,6 +790,58 @@ mod tests {
         let report = status_of(&fx).expect("gaps_found is a status");
         assert_eq!(report.status, GsdStatus::GapsFound);
         assert_eq!(report.route, "plan-phase");
+    }
+
+    /// A launcher under `fx`'s home whose write descriptor a parked fork
+    /// holds: the state a sibling test's fork leaves for the instant before
+    /// its exec (999.222), kept until the returned guard is released.
+    ///
+    /// Written through `File::create` on purpose: the reproduction needs this
+    /// process to hold a write descriptor on the launcher at the fork.
+    fn launcher_whose_writer_a_fork_holds(
+        fx: &Fixture,
+    ) -> (PathBuf, crate::test_support::ForkHeldBeforeExec) {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let launcher = fx.home.join("launcher-with-a-held-writer");
+        let mut file = std::fs::File::create(&launcher).unwrap();
+        file.write_all(b"#!/bin/sh\nexit 0\n").unwrap();
+        let held = crate::test_support::fork_held_before_exec();
+        drop(file);
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (launcher, held)
+    }
+
+    /// The held fork is released only when the spawn reports `ETXTBSY` to its
+    /// observer (or by the guard's drop after a failed assertion), so the
+    /// first spawn always meets the held writer, however threads are
+    /// scheduled.
+    #[test]
+    fn a_reader_spawn_retries_text_file_busy_while_a_fork_holds_the_writer() {
+        let fx = Fixture::new();
+        let (launcher, held) = launcher_whose_writer_a_fork_holds(&fx);
+        let mut held = Some(held);
+        let mut times_busy = 0_u32;
+        let mut on_text_busy = || {
+            times_busy += 1;
+            if let Some(held) = held.take() {
+                held.release();
+            }
+        };
+
+        let spawned = spawn_reader_observed(&mut Command::new(&launcher), &mut on_text_busy);
+
+        let mut child = spawned.unwrap_or_else(|failure| {
+            panic!(
+                "the reader spawn must outlast a fork that holds the launcher's writer: {failure}"
+            )
+        });
+        let status = child.wait().expect("wait for the launcher");
+        assert!(status.success(), "the launcher exits 0: {status:?}");
+        assert!(
+            times_busy >= 1,
+            "the held fork was never seen busy: this run did not reproduce 999.222"
+        );
     }
 
     #[test]

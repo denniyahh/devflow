@@ -452,6 +452,98 @@ pub fn gsd_status_json(status: crate::gsd_reader::GsdStatus) -> &'static str {
     }
 }
 
+/// A child forked from this process and parked before any `exec`.
+///
+/// Until it is released it holds a duplicate of **every** descriptor that was
+/// open in this process at the fork, close-on-exec ones included: `O_CLOEXEC`
+/// closes a descriptor at `exec`, and this child never execs. That is the
+/// state a sibling test's `fork` leaves for the instant before its own `exec`
+/// (999.221, 999.222), held for as long as a test needs it. An audit for
+/// descriptors missing `O_CLOEXEC` therefore proves nothing about that window
+/// (52.1 D-05).
+///
+/// [`ForkHeldBeforeExec::release`] lets the child exit and reaps it. Dropping
+/// the guard does the same, so a panicking test never leaves a parked child.
+///
+/// The hold covers the whole process, not only the calling test: in an
+/// in-process `cargo test` run the child also holds every sibling test's
+/// descriptors. Keep the hold as short as the check needs, and run a test that
+/// must hold it for long in its own process ([`run_test_in_child`]).
+pub struct ForkHeldBeforeExec {
+    pid: libc::pid_t,
+    release_write: libc::c_int,
+}
+
+impl ForkHeldBeforeExec {
+    /// Let the parked child exit and reap it. Every descriptor the child held
+    /// is closed when this returns.
+    pub fn release(self) {
+        drop(self);
+    }
+}
+
+impl Drop for ForkHeldBeforeExec {
+    fn drop(&mut self) {
+        let byte = 0_u8;
+        // SAFETY: `release_write` is the pipe write end this guard owns and
+        // closes exactly once, here; `byte` outlives the one-byte write. `pid`
+        // is this guard's own unreaped child, so `waitpid` cannot name another
+        // process. Nothing here panics: a drop may already be unwinding.
+        unsafe {
+            // A byte, not only the close: any other copy of the write end (a
+            // sibling test's fork before its exec) would hold EOF back.
+            libc::write(self.release_write, (&raw const byte).cast(), 1);
+            libc::close(self.release_write);
+            let mut status = 0;
+            while libc::waitpid(self.pid, &raw mut status, 0) == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+            {}
+        }
+    }
+}
+
+/// Fork a child that parks before any `exec` and holds every descriptor open
+/// in this process right now. See [`ForkHeldBeforeExec`].
+pub fn fork_held_before_exec() -> ForkHeldBeforeExec {
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: `pipe2` writes two descriptors into the two-element `fds`.
+    let piped = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    assert_eq!(
+        piped,
+        0,
+        "pipe2 for the held fork: {}",
+        std::io::Error::last_os_error()
+    );
+    let (read_end, write_end) = (fds[0], fds[1]);
+    // SAFETY: this process is multi-threaded, so the child may call only
+    // async-signal-safe functions: it calls `close`, `read` and `_exit`, and
+    // touches no allocator, lock or formatter.
+    let pid = unsafe { libc::fork() };
+    assert!(
+        pid >= 0,
+        "fork for the held child: {}",
+        std::io::Error::last_os_error()
+    );
+    if pid == 0 {
+        let mut byte = 0_u8;
+        // SAFETY: as above. The child closes its own copy of the write end
+        // first, so it also reads EOF, and exits, if this process dies without
+        // releasing it.
+        unsafe {
+            libc::close(write_end);
+            libc::read(read_end, (&raw mut byte).cast(), 1);
+            libc::_exit(0);
+        }
+    }
+    // SAFETY: closes this process's copy of the read end, once; the child
+    // keeps its own.
+    unsafe { libc::close(read_end) };
+    ForkHeldBeforeExec {
+        pid,
+        release_write: write_end,
+    }
+}
+
 // ## Why there is no in-process absent-`git` harness in THIS crate
 //
 // 35-01 planned one empty-`PATH` guard per crate, so that criterion 6's tests
@@ -929,5 +1021,66 @@ mod tests {
         );
         assert!(!process_is_live(pid), "a zombie is not live");
         child.wait().expect("reap the sleeper");
+    }
+
+    /// How long a test waits for a pipe's end-of-file once the last writer
+    /// this test knows of is gone. A sibling test's fork can hold a copy of
+    /// the write end for the instant before its own exec.
+    const PIPE_EOF_WAIT_MS: libc::c_int = 5_000;
+
+    /// One non-blocking one-byte read of `fd`: the byte count, or the errno.
+    fn read_one_byte(fd: libc::c_int) -> Result<isize, i32> {
+        let mut byte = 0_u8;
+        // SAFETY: `fd` is the caller's open descriptor and `byte` is a
+        // one-byte buffer that outlives the call.
+        let read = unsafe { libc::read(fd, (&raw mut byte).cast(), 1) };
+        if read >= 0 {
+            Ok(read)
+        } else {
+            Err(std::io::Error::last_os_error()
+                .raw_os_error()
+                .expect("an errno"))
+        }
+    }
+
+    /// A descriptor open at the fork stays open in the parked child after this
+    /// process closes its own copy, close-on-exec or not, and is closed once
+    /// the child is released.
+    #[test]
+    fn a_fork_held_before_exec_keeps_an_inherited_pipe_open_until_released() {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `pipe2` writes two descriptors into the two-element `fds`.
+        let piped = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) };
+        assert_eq!(piped, 0, "pipe2: {}", std::io::Error::last_os_error());
+        let (read_end, write_end) = (fds[0], fds[1]);
+
+        let held = fork_held_before_exec();
+        // SAFETY: closes this process's own copy of the write end, once.
+        assert_eq!(unsafe { libc::close(write_end) }, 0);
+        assert_eq!(
+            read_one_byte(read_end),
+            Err(libc::EAGAIN),
+            "the parked child holds the close-on-exec write end, so the pipe has no end-of-file yet"
+        );
+
+        held.release();
+        let mut poll = libc::pollfd {
+            fd: read_end,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `poll` reads and writes the one `pollfd` it is given.
+        let ready = unsafe { libc::poll(&raw mut poll, 1, PIPE_EOF_WAIT_MS) };
+        assert_eq!(
+            ready, 1,
+            "no end-of-file within {PIPE_EOF_WAIT_MS} ms of the release"
+        );
+        assert_eq!(
+            read_one_byte(read_end),
+            Ok(0),
+            "the released child closed its copy, so the pipe is at end-of-file"
+        );
+        // SAFETY: closes this test's read end, once.
+        unsafe { libc::close(read_end) };
     }
 }
