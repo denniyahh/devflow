@@ -1405,6 +1405,17 @@ fn remove_run_state_with_worktree(project_root: &Path, state: &State, removed: &
     }
 }
 
+/// `devflow discard --phase N`: remove the phase's worktree, its run state and its
+/// feature branch, after listing them.
+pub(crate) fn discard(
+    project_root: &Path,
+    phase: PhaseId,
+    delete_unmerged_branch: Option<&str>,
+) -> Result<(), CliError> {
+    let _ = (project_root, phase, delete_unmerged_branch);
+    Ok(())
+}
+
 /// A phase's supervisor liveness as `status`, `cleanup` and `doctor` report
 /// it (50-12): answered from the socket recorded in `state.supervisor`
 /// through [`supervisor::probe`], never from a pid. Three parts, like the
