@@ -949,6 +949,143 @@ mod tests {
         );
     }
 
+    /// A repository in the row the recording commit serves: the branch tip
+    /// lacks the key and the working copy holds GSD's `false`.
+    fn project_holding_gsds_first_false() -> (tempfile::TempDir, PathBuf) {
+        let (dir, root) = git_project();
+        write_config(&root, &pretty(&real_shape_without_the_key()));
+        commit_config(&root, "add gsd config without the chain flag");
+        write_config(&root, &real_shape(false));
+        (dir, root)
+    }
+
+    /// Installs `body` as the repository's `name` hook, so the recording commit
+    /// runs it. [`git_project`] turns hooks off; this turns them back on for
+    /// one hook.
+    fn install_hook(root: &Path, name: &str, body: &str) {
+        let hooks = root.join(".git/test-hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        crate::test_support::write_executable(&hooks.join(name), &format!("#!/bin/sh\n{body}\n"));
+        git(root, &["config", "core.hooksPath", hooks.to_str().unwrap()]);
+    }
+
+    /// The opening every refusal of the recording commit shares.
+    const RECORD_REFUSAL: &str = "the commit recording GSD's workflow._auto_chain_active: false";
+
+    /// The recording commit fails (here a pre-commit hook rejects it). That is
+    /// a refusal naming the recording commit and its cause: nothing is reported
+    /// as recorded or repaired, and the branch tip is where it was.
+    #[test]
+    fn a_recording_commit_that_fails_is_refused_and_says_why() {
+        let (_dir, root) = project_holding_gsds_first_false();
+        install_hook(&root, "pre-commit", "echo 'the hook says no' >&2\nexit 1");
+        let head_before = head_sha(&root);
+
+        let outcome = force_clear_auto_chain(&root).unwrap();
+
+        assert_eq!(
+            head_sha(&root),
+            head_before,
+            "premise: the hook must actually stop the commit"
+        );
+        assert!(
+            !outcome.recorded_gsd_false,
+            "a commit that failed must not be reported as recorded"
+        );
+        assert!(!outcome.repaired_anything(), "nothing was repaired");
+        assert!(!outcome.left_uncommitted);
+        let reason = outcome
+            .commit_refused
+            .expect("a failed recording commit must say why");
+        assert!(
+            reason.starts_with(&format!("{RECORD_REFUSAL} could not be made (")),
+            "the refusal must name the recording commit: {reason}"
+        );
+        assert!(
+            reason.contains("the hook says no"),
+            "the refusal must carry git's own reason: {reason}"
+        );
+        assert!(
+            reason.ends_with(".planning/config.json stays uncommitted; nothing was leaked"),
+            "the refusal must say the file stays uncommitted and nothing leaked: {reason}"
+        );
+    }
+
+    /// The recording commit lands, and the working copy then differs from the
+    /// branch tip again (here a post-commit hook rewrites it). The outcome is a
+    /// refusal, never `recorded_gsd_false`, which is set only from a re-probe
+    /// that agrees.
+    #[test]
+    fn a_recording_commit_the_reprobe_contradicts_is_refused() {
+        let (_dir, root) = project_holding_gsds_first_false();
+        install_hook(&root, "post-commit", "echo >> .planning/config.json");
+
+        let outcome = force_clear_auto_chain(&root).unwrap();
+
+        assert_eq!(
+            head_subject(&root),
+            RECORD_SUBJECT,
+            "premise: the recording commit landed"
+        );
+        assert_eq!(
+            status_porcelain(&root),
+            " M .planning/config.json\n",
+            "premise: the hook left the file differing from the branch tip"
+        );
+        assert!(
+            !outcome.recorded_gsd_false,
+            "a tip the working copy still differs from must not be reported as recorded"
+        );
+        assert!(!outcome.repaired_anything(), "nothing was repaired");
+        assert!(!outcome.left_uncommitted);
+        assert_eq!(
+            outcome.commit_refused,
+            Some(format!(
+                "{RECORD_REFUSAL} reported success but .planning/config.json still differs \
+                 from HEAD — the file stays uncommitted; nothing was leaked"
+            ))
+        );
+    }
+
+    /// The recording commit lands and the re-probe then cannot run (here a
+    /// post-commit hook points `HEAD` at a branch with no commits, so git
+    /// cannot resolve it). Unknown is not agreement: the outcome is a refusal
+    /// that claims no leak.
+    #[test]
+    fn a_recording_commit_the_reprobe_cannot_confirm_is_refused() {
+        let (_dir, root) = project_holding_gsds_first_false();
+        let branch = git_output(&root, &["symbolic-ref", "HEAD"]);
+        install_hook(
+            &root,
+            "post-commit",
+            "git symbolic-ref HEAD refs/heads/no-commits-yet",
+        );
+
+        let outcome = force_clear_auto_chain(&root).unwrap();
+
+        assert_eq!(
+            git_output(&root, &["log", "-1", "--format=%s", branch.trim_end()]).trim_end(),
+            RECORD_SUBJECT,
+            "premise: the recording commit landed on the branch"
+        );
+        assert!(
+            !outcome.recorded_gsd_false,
+            "a tip that could not be read must not be reported as recorded"
+        );
+        assert!(!outcome.repaired_anything(), "nothing was repaired");
+        assert!(!outcome.left_uncommitted);
+        let reason = outcome
+            .commit_refused
+            .expect("an unconfirmed recording commit must say so");
+        assert!(
+            reason.starts_with(&format!(
+                "{RECORD_REFUSAL} could not be confirmed at HEAD; nothing was leaked \
+                 (could not compare .planning/config.json against HEAD (git exited Some(128))"
+            )),
+            "the refusal must name the recording commit and the failed comparison: {reason}"
+        );
+    }
+
     /// F-8 / T-35.1-08: `commit_path` is path-scoped but still commits whatever
     /// else is dirty IN that path. This repository has already had an incident
     /// where an in-progress file was swept into an unrelated commit
