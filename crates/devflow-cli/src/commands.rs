@@ -1500,18 +1500,24 @@ enum PhaseRunLiveness {
         /// Why it could not be listed.
         why: String,
     },
+    /// The state is missing or does not load, so it names no launch, and a supervisor
+    /// that has not published its socket may run: a launch liveness lock that no other
+    /// phase's state records is held, or the locks could not be listed. Holds what
+    /// the refusal says was found.
+    UnpublishedLaunch(String),
 }
 
 /// The one live-run test of the verbs that remove a run's worktree and state
 /// (`discard`, and from 52.1-11 `cleanup`). `existing` is the phase's state as read
 /// under the write lock; `cache_dir` holds the supervisor sockets.
 ///
-/// Three existing checks, in this order. `cleanup`'s live test alone (the agent pid
+/// Four existing checks, in this order. `cleanup`'s live test alone (the agent pid
 /// file and [`probe_phase`]) misses two things: a STALE or unprobeable supervisor,
 /// which `cleanup` handles in a separate block, and a supervisor of a phase whose
 /// state is missing or does not load, where there is no record to probe. For that
 /// last case this runs the launch guard's stateless sweep ([`possibly_live_sockets`]
-/// with no state), and only then.
+/// with no state), and only then, followed by the launch guard's check for a
+/// supervisor that is in no sweep yet ([`unpublished_launch_liveness`]).
 fn phase_run_liveness(
     project_root: &Path,
     phase: PhaseId,
@@ -1548,7 +1554,7 @@ fn phase_run_liveness(
         return PhaseRunLiveness::NotLive;
     }
     match possibly_live_sockets(project_root, phase, None, cache_dir) {
-        Ok(sockets) if sockets.is_empty() => PhaseRunLiveness::NotLive,
+        Ok(sockets) if sockets.is_empty() => unpublished_launch_liveness(project_root, phase),
         Ok(sockets) => PhaseRunLiveness::Swept(
             sockets
                 .iter()
@@ -1559,6 +1565,23 @@ fn phase_run_liveness(
     }
 }
 
+/// The launch guard's check for a phase whose state names no launch
+/// ([`refuse_stateless_launch_beside_a_live_lock`]): a supervisor that has not
+/// published its socket shows in no sweep, only as a held launch liveness lock that
+/// no other phase's loadable state records. A lock that cannot be probed counts as
+/// held (T-50-40), and locks that cannot be listed rule nothing out.
+fn unpublished_launch_liveness(project_root: &Path, phase: PhaseId) -> PhaseRunLiveness {
+    match recover::unrecorded_live_launches(project_root, phase, None) {
+        Ok(live) => live.first().map_or(PhaseRunLiveness::NotLive, |launch| {
+            PhaseRunLiveness::UnpublishedLaunch(launch.describe())
+        }),
+        Err(error) => PhaseRunLiveness::UnpublishedLaunch(format!(
+            "{} could not be listed for live launches ({error})",
+            project_root.join(".devflow").display()
+        )),
+    }
+}
+
 /// D-09.2: discard refuses a run that is live or may be, on every arm of
 /// [`PhaseRunLiveness`] but `NotLive`, naming `devflow stop`. Nothing is removed.
 fn refuse_discard_of_a_live_run(
@@ -1566,6 +1589,10 @@ fn refuse_discard_of_a_live_run(
     existing: &workflow::Existing,
     liveness: PhaseRunLiveness,
 ) -> Result<(), CliError> {
+    let condition = match existing {
+        workflow::Existing::Unloadable(_) => "does not load",
+        workflow::Existing::Missing | workflow::Existing::Loaded(_) => "is missing",
+    };
     let text = match liveness {
         PhaseRunLiveness::NotLive => return Ok(()),
         PhaseRunLiveness::Live {
@@ -1589,10 +1616,6 @@ fn refuse_discard_of_a_live_run(
             supervisor.describe()
         ),
         PhaseRunLiveness::Swept(repair_lines) => {
-            let condition = match existing {
-                workflow::Existing::Unloadable(_) => "does not load",
-                workflow::Existing::Missing | workflow::Existing::Loaded(_) => "is missing",
-            };
             let mut text = format!(
                 "refusing to discard phase {phase} — its state {condition}, and a supervisor of \
                  this phase may still run; nothing was removed. Run each line below first:"
@@ -1607,6 +1630,12 @@ fn refuse_discard_of_a_live_run(
             "refusing to discard phase {phase} — the supervisor socket directory {} cannot be \
              listed ({why}), so a live supervisor cannot be ruled out; nothing was removed",
             dir.display()
+        ),
+        PhaseRunLiveness::UnpublishedLaunch(found) => format!(
+            "refusing to discard phase {phase} — its state {condition}, so it cannot name its \
+             launch, and {found}; nothing was removed. Run discard again once that launch has \
+             published or exited; `devflow stop` never signals an unpublished launch, so if it \
+             stays, end that process yourself"
         ),
     };
     Err(CliError::Message(text))
