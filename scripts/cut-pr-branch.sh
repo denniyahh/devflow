@@ -230,6 +230,15 @@ else
     mapfile -t COMMIT_LIST < <(git rev-list --reverse "$FORK_POINT".."$CURRENT_BRANCH")
 fi
 
+# Read the files of every commit about to be replayed before anything is
+# created, so a commit git cannot read stops the cut with the commit named and
+# no PR branch. The replay below uses what was read here.
+declare -A REPLAY_PATHS
+for HASH in "${COMMIT_LIST[@]}"; do
+    NON_FORBIDDEN="$(non_forbidden_paths "$HASH")"
+    REPLAY_PATHS["$HASH"]="$NON_FORBIDDEN"
+done
+
 echo "==> Target clean PR branch: $PR_BRANCH (rooted at $BASE_REF)"
 
 # Create target clean branch off BASE_REF
@@ -253,7 +262,7 @@ EXCLUDED_COUNT=0
 INCLUDED_HASHES=()
 
 for HASH in "${COMMIT_LIST[@]}"; do
-    NON_FORBIDDEN="$(non_forbidden_paths "$HASH")"
+    NON_FORBIDDEN="${REPLAY_PATHS[$HASH]}"
 
     if [ -z "$NON_FORBIDDEN" ]; then
         # Commit touches only personal/agent planning files
