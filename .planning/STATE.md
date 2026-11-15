@@ -1,20 +1,20 @@
 ---
 gsd_state_version: "1.0"
 milestone: v4.0
-milestone_name: Session Continuity
+milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: "52.1"
 current_phase_name: Stabilize for Dogfooding
-status: Planned (15 plans) — review applied, ready to execute
-stopped_at: Phase 52.1 reviewed and plan set committed (6d37732); execution not started
-last_updated: "2026-11-13T21:02:32.335Z"
-last_activity: 2026-11-13
-last_activity_desc: Phase 52.1 planning complete
-state_head: 6d377324255332308fab1d9d8fcf0518de5a1985
+status: executing
+stopped_at: Completed 52.1-01-PLAN.md
+last_updated: "2026-11-15T17:01:26.729Z"
+last_activity: 2026-11-14
+last_activity_desc: Phase 52.1 execution started
+state_head: 5e3a5ee7bfa0ee6125c280bf86e985dfe0854005
 progress:
   total_phases: 5
   completed_phases: 0
   total_plans: 48
-  completed_plans: 33
+  completed_plans: 34
   percent: 0
 ---
 
@@ -82,7 +82,7 @@ See: `.planning/PROJECT.md` (updated 2026-11-08)
 **Core value:** a coding session that outlives any one agent — the session is the repository, so another agent
 continues the same work when one runs out of quota or budget, and the run asks a human only for the decisions nothing
 else can make (restated by the operator 2026-11-08).
-**Current focus:** Phase 52 — Subtract and Stabilize
+**Current focus:** Phase 52.1 — Stabilize for Dogfooding
 
 ## Operator Next Steps
 
@@ -171,10 +171,10 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 52.1 (Stabilize for Dogfooding) — READY TO EXECUTE
-Plan: Not started
-Status: Planned (15 plans) — review applied, ready to execute
-Last activity: 2026-11-13 — Phase 52.1 planning complete
+Phase: 52.1 (Stabilize for Dogfooding) — EXECUTING
+Plan: 2 of 15
+Status: Ready to execute
+Last activity: 2026-11-14 — Phase 52.1 execution started
 
 
 ## Recently Shipped
@@ -910,6 +910,9 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 52]: 52-32: the rate-limit timer lives in the gate wait and arms per gate open through rate_limit_timer_deadline only, so first open, resume and takeover decide it alike
 - [Phase 52]: 52-32: after the timer writes (or finds an operator's answer) the wait takes the answer before checking the lifetime, so a reset later than the gate timeout relaunches at the wake (U8 fix)
 - [Phase 52]: 52-32: a timer write failing other than AlreadyResponded keeps the automatic relaunch spent and reports rate_limit_timer_fired outcome failed
+- [Phase 52.1]: 52.1-01: the ETXTBSY retry's give-up control runs in its own process, because a parked fork holds every descriptor of the process it is forked from for the whole 2 s bound
+- [Phase 52.1]: 52.1-01: test_support::write_executable sets the stub's mode with chmod(2) from the test process, not the shell's chmod, so nothing is looked up on a child test's stub-only PATH
+- [Phase 52.1]: 52.1-01 took backlog number 999.234 (remaining fs::write-then-exec stub writers); 52.1-06 takes 999.235
 
 ## Roadmap Evolution
 
@@ -1054,12 +1057,13 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 52 P30 | 23 min | 2 tasks | 7 files |
 | Phase 52 P31 | 34 min | 3 tasks | 9 files |
 | Phase 52 P32 | 60min | 3 tasks | 7 files |
+| Phase 52.1 P01 | 23min | 3 tasks | 4 files |
 
 ## Session
 
-**Last session:** 2026-11-13T21:02:31.712Z
-**Stopped at:** Phase 52.1 reviewed and plan set committed (6d37732); execution not started
-**Resume file:** .planning/phases/52.1-stabilize-for-dogfooding/52.1-CONTEXT.md
+**Last session:** 2026-11-15T17:01:25.953Z
+**Stopped at:** Completed 52.1-01-PLAN.md
+**Resume file:** None
 
 ## Operator Next Steps
 

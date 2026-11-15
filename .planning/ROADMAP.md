@@ -174,11 +174,11 @@ Validate without hand-run stages or hand-edited state. Not dogfooded itself (ope
 999.219, 999.229, 999.230, 999.231 and 999.167 (close-out scripts; 999.167 folds into D-12). This phase carries no REQ
 IDs from `REQUIREMENTS.md` — its plans bind to its own decisions, D-01..D-27 in `52.1-CONTEXT.md`.
 **Depends on:** Phase 52
-**Plans:** 15 plans
+**Plans:** 1/15 plans executed
 
 Plans:
 **Wave 1**
-- [ ] 52.1-01-PLAN.md
+- [x] 52.1-01-PLAN.md
 - [ ] 52.1-02-PLAN.md
 - [ ] 52.1-03-PLAN.md
 - [ ] 52.1-05-PLAN.md
@@ -492,7 +492,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 50.1 | 30/30 | Complete | 2026-11-02 |
 | 51 | 13/13 | Complete | 2026-11-08 |
 | 52 | 33/33 | Executed — verification stale | 2026-11-11 |
-| 52.1 | 0/15 | Planned | — |
+| 52.1 | 1/15 | In Progress | — |
 | 53 | 0/? | Not started | — |
 | 54 | 0/? | Not started | — |
 | 55 | 0/? | Not started | — |
