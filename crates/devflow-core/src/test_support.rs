@@ -544,8 +544,28 @@ pub fn fork_held_before_exec() -> ForkHeldBeforeExec {
     }
 }
 
-/// Wait until `predicate` is true, for at most `timeout`.
-pub fn wait_until(_timeout: std::time::Duration, _what: &str, _predicate: impl FnMut() -> bool) {}
+/// How often [`wait_until`] checks its predicate.
+const WAIT_UNTIL_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Wait until `predicate` is true, checking it every [`WAIT_UNTIL_POLL`] for
+/// at most `timeout`. `what` names the awaited state in the timeout message.
+///
+/// The one bounded poll for this crate's unit tests; integration tests use
+/// their own `common::wait_for`, which fails with the same text.
+///
+/// # Panics
+/// With `timed out after {timeout:?} waiting for {what}` when `predicate` is
+/// still false once `timeout` has passed.
+pub fn wait_until(timeout: std::time::Duration, what: &str, mut predicate: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + timeout;
+    while !predicate() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out after {timeout:?} waiting for {what}"
+        );
+        std::thread::sleep(WAIT_UNTIL_POLL);
+    }
+}
 
 // ## Why there is no in-process absent-`git` harness in THIS crate
 //
