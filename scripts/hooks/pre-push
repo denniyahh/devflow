@@ -202,12 +202,22 @@ if [ -n "$RELEASE_KEY" ]; then
 fi
 
 # A workspace branch (Workflow B) must declare every way it differs from
-# develop in .workspace-divergence. core.hooksPath may be shared by every
-# worktree, so the check runs the pushing checkout's own copy, and only in a
-# checkout that carries the manifest; develop-based branches skip it.
-if [ -f .workspace-divergence ]; then
-    ./scripts/check-workspace-divergence.sh origin/develop
-fi
+# develop in .workspace-divergence. The check judges each pushed commit that
+# carries the manifest, whatever the pushing checkout has on disk and whatever
+# the remote ref is called; a commit without one (a develop-based branch) and a
+# delete are skipped. core.hooksPath may be shared by every worktree, so the
+# script beside this hook runs, never the pushing checkout's copy, which may
+# be another version.
+for line in "${PUSH_LINES[@]}"; do
+    read -r local_ref local_sha _ <<< "$line"
+    [ -z "${local_ref:-}" ] && continue
+    case "$local_sha" in *[!0]*) ;; *) continue ;; esac
+    git cat-file -e "$local_sha:.workspace-divergence" 2>/dev/null || continue
+    if ! "$(dirname "$0")/../check-workspace-divergence.sh" origin/develop "$local_sha"; then
+        echo "pre-push: the divergence check refused '$local_ref' ($local_sha)." >&2
+        exit 1
+    fi
+done
 
 # Drop-in extension point: every file in scripts/hooks/pre-push.d/ runs, in name
 # order, with this hook's arguments, and the first failure fails the hook.
