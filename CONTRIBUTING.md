@@ -50,10 +50,13 @@ Two things this hook does that are load-bearing:
   `DEVFLOW_ALLOW_OFF_WORKTREE=1` when that is intended). It does nothing
   without a `.planning/STATE.md`. `scripts/phase-worktree.sh <N>` creates the
   worktree from your workspace branch.
-- `pre-push` also runs `scripts/check-workspace-divergence.sh` in a checkout
-  that carries `.workspace-divergence` (Workflow B): every difference from
-  `develop` must be declared there, and every hook and top-level script must be
-  committed executable.
+- `pre-push` also runs `scripts/check-workspace-divergence.sh` for each pushed
+  commit that carries a `.workspace-divergence` file (Workflow B), against that
+  commit and not against the checkout the push comes from: every difference
+  from `develop` must be declared there, and every hook and top-level script
+  must be committed executable. A delete and a commit with no such file are
+  skipped. The hook runs the copy of the script beside itself, so a
+  `core.hooksPath` shared by several worktrees runs one version of both.
 - `pre-commit` and `pre-push` each run any executables in
   `scripts/hooks/pre-commit.d/` and `scripts/hooks/pre-push.d/`, in name order,
   with the hook's arguments; the first failure fails the hook. `develop` ships
