@@ -19186,6 +19186,55 @@ mod tests {
         );
     }
 
+    /// Control: a lock that stays held ends the released-lock wait at its bound with
+    /// the wait's own message. It does not hang and does not pass.
+    ///
+    /// Runs in its own process: the parked fork holds every descriptor of the process
+    /// it was forked from for the whole bound, and in a shared test process those
+    /// would be the sibling tests' descriptors too.
+    #[test]
+    fn the_released_write_lock_wait_times_out_while_a_fork_keeps_the_lock() {
+        const NAME: &str =
+            "commands::tests::the_released_write_lock_wait_times_out_while_a_fork_keeps_the_lock";
+        let dir = tempfile::tempdir().unwrap();
+        if !devflow_core::test_support::in_child_test(NAME) {
+            // The child half execs nothing, so its PATH is this empty directory.
+            let output = devflow_core::test_support::run_test_in_child(NAME, dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let root = dir.path().to_path_buf();
+        let phase = PhaseId::new(5191);
+        let state = State::new(phase, AgentKind::Claude, Mode::Supervise, root.clone());
+        workflow::save_state(&state).unwrap();
+        let (holder, release) = hold_state_write_lock(&root, phase);
+        let held_fork = devflow_core::test_support::fork_held_before_exec();
+        drop(release);
+        holder.join().unwrap();
+        let started = std::time::Instant::now();
+
+        let waited = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            wait_for_released_write_lock(&root, phase);
+        }));
+
+        let waited_for = started.elapsed();
+        held_fork.release();
+        let payload = waited.expect_err("the wait must not pass while a fork keeps the lock");
+        let message = payload
+            .downcast_ref::<String>()
+            .expect("the wait panics with a formatted message");
+        assert!(
+            message.contains(
+                "timed out after 2s waiting for the state write lock to read free after its release"
+            ),
+            "the wait fails with its own timeout text: {message}"
+        );
+        assert!(
+            waited_for >= RELEASED_WRITE_LOCK_WAIT,
+            "the wait gave up after {waited_for:?}, before its {RELEASED_WRITE_LOCK_WAIT:?} bound"
+        );
+    }
+
     /// Criterion 2 at a gate nothing waits on: `stop`'s own line names no `resume` while
     /// a pending supervisor lives, and names it again once that supervisor is gone.
     #[test]
