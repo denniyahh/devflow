@@ -472,6 +472,123 @@ fn start_until_plan_halts_cleanly() {
     let _reap = MonitorReapGuard::after_launch(&state);
 }
 
+/// [`init_repo`]'s committed GSD config as GSD's `config-set` rewrites it the
+/// first time it writes `workflow._auto_chain_active: false`.
+const CONFIG_WITH_GSDS_FALSE: &str = "{\n  \"workflow\": {\n    \"auto_advance\": false,\n    \"_auto_chain_active\": false\n  }\n}\n";
+
+/// The subject of the commit that records GSD's own `false` (52.1 D-22).
+const RECORD_GSD_FALSE_SUBJECT: &str =
+    "chore(gsd): record GSD's workflow._auto_chain_active: false";
+
+/// The words only the killed-run repair notice uses.
+const KILLED_RUN_NOTICE: &str = "was killed before it could clear it";
+
+/// Every `auto_chain_flag_repaired` line in a project's event log.
+fn auto_chain_repair_events(root: &Path) -> Vec<String> {
+    fs::read_to_string(devflow_core::events::events_path(root))
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains("\"auto_chain_flag_repaired\""))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Runs `devflow start --no-worktree --until plan` for phase 44 with a stub
+/// `codex`, waits for the run to settle, and returns what `start` printed
+/// (stdout, then stderr).
+///
+/// `--no-worktree` is what lets the launch repair meet an uncommitted
+/// `.planning/config.json`: `start` cuts `feature/phase-44` in place, so the
+/// working copy the caller left is the one the repair reads. A worktree start
+/// forks a clean checkout and can never show a difference.
+fn start_phase_44_in_place(home: &common::HermeticHome, root: &Path) -> String {
+    let fake_bin = fake_bin_dir(&[(
+        "codex",
+        "#!/bin/sh\nprintf 'DEVFLOW_RESULT: {\"status\":\"success\"}\\n'\n",
+    )]);
+    let output = run_devflow(
+        home,
+        root,
+        &fake_bin.path,
+        &[
+            "start",
+            "--phase",
+            "44",
+            "--agent",
+            "codex",
+            "--mode",
+            "supervise",
+            "--until",
+            "plan",
+            "--no-worktree",
+        ],
+    );
+    let _reaper = common::LaunchedRunReaper::new(root, PhaseId::new(44), Vec::new());
+    let settled = wait_for_settled(root, PhaseId::new(44));
+    let _reap = MonitorReapGuard::after_launch(&settled);
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+/// 52.1 D-22 through `devflow start`: the committed config never had the chain
+/// flag and GSD's first `config-set` wrote `false` into the working copy. `start`
+/// records it on the phase branch under the accurate commit, and names no
+/// killed run on either channel.
+#[test]
+fn start_records_gsds_first_false_without_a_killed_run_notice() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let committed =
+        String::from_utf8_lossy(&git(root, &["show", "develop:.planning/config.json"]).stdout)
+            .into_owned();
+    assert!(
+        !committed.contains("_auto_chain_active"),
+        "premise: the committed config lacks the key: {committed}"
+    );
+    fs::write(root.join(".planning/config.json"), CONFIG_WITH_GSDS_FALSE).unwrap();
+
+    let printed = start_phase_44_in_place(&home, root);
+
+    let subjects = String::from_utf8_lossy(
+        &git(root, &["log", "--format=%s", "develop..feature/phase-44"]).stdout,
+    )
+    .into_owned();
+    assert_eq!(
+        subjects.lines().collect::<Vec<_>>(),
+        [RECORD_GSD_FALSE_SUBJECT],
+        "start must record GSD's false in one commit on the phase branch\nprinted:\n{printed}"
+    );
+    let at_tip = String::from_utf8_lossy(
+        &git(root, &["show", "feature/phase-44:.planning/config.json"]).stdout,
+    )
+    .into_owned();
+    assert_eq!(
+        at_tip, CONFIG_WITH_GSDS_FALSE,
+        "the phase branch's tip must carry GSD's false"
+    );
+    let events = auto_chain_repair_events(root);
+    assert!(
+        events.is_empty(),
+        "recording GSD's false is not a repair and writes no repair event: {events:?}"
+    );
+    assert!(
+        printed.contains(
+            "note: devflow start recorded GSD's workflow._auto_chain_active: false for phase 44"
+        ),
+        "start must announce the recording, or the absent killed-run notice below \
+         proves nothing\nprinted:\n{printed}"
+    );
+    assert!(
+        !printed.contains(KILLED_RUN_NOTICE),
+        "nothing leaked, so no killed run may be named\nprinted:\n{printed}"
+    );
+}
+
 /// `--until` values for stages v4.0 removed (D-07), in every case spelling. Later cut
 /// plans append to this list.
 /// Split so the removed-surface scan does not read this control as a leftover.
