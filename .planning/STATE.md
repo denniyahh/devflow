@@ -5,16 +5,16 @@ milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: "52.1"
 current_phase_name: Stabilize for Dogfooding
 status: executing
-stopped_at: Completed 52.1-06-PLAN.md
-last_updated: "2026-11-15T19:46:22.622Z"
+stopped_at: Completed 52.1-07-PLAN.md
+last_updated: "2026-11-15T22:46:22.164Z"
 last_activity: 2026-11-14
 last_activity_desc: Phase 52.1 execution started
-state_head: b6d37c4185b2bdb568124b0abd4233cd0a5dcf0b
+state_head: 591efe54623fffdde7179019e666638a64ae5901
 progress:
   total_phases: 5
   completed_phases: 0
   total_plans: 48
-  completed_plans: 39
+  completed_plans: 40
   percent: 0
 ---
 
@@ -172,7 +172,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 52.1 (Stabilize for Dogfooding) — EXECUTING
-Plan: 7 of 15
+Plan: 8 of 15
 Status: Ready to execute
 Last activity: 2026-11-14 — Phase 52.1 execution started
 
@@ -931,6 +931,11 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 52.1]: 52.1-06: the released-lock wait's never-released control runs in a child process, because its parked fork holds every descriptor of the process it is forked from for the whole 2 s bound
 - [Phase 52.1]: 52.1-06: the note on write_lock_status names the holder's process as the one whose fork keeps the lock, not the reader's; no production code changed
 - [Phase 52.1]: 52.1-06: the sibling-test backlog entry is 999.236 (999.235 was already taken by the 52.1-02 follow-up)
+- [Phase 52.1]: 52.1-07: discard refuses a phase worktree that is not on feature/phase-NN (another branch or a detached HEAD); the plan text would remove any worktree git lists at the phase path. Fail closed, awaiting the operator
+- [Phase 52.1]: 52.1-07: discard refuses a phase branch that any checkout other than the phase worktree holds, not only the primary checkout, so git cannot refuse the branch after the state is gone
+- [Phase 52.1]: 52.1-07: a --delete-unmerged-branch value that is not the phase branch is refused whatever the branch merge state
+- [Phase 52.1]: 52.1-07: the live-run refusal runs before discard reads the items, so a run that may be live is refused before nothing-to-discard
+- [Phase 52.1]: 52.1-07: discard removes a loadable and an unloadable state the same way, with workflow::clear_state, and nothing else under .devflow/
 
 ## Roadmap Evolution
 
@@ -1081,11 +1086,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 52.1 P05 | 15 min | 2 tasks | 1 files |
 | Phase 52.1 P04 | 23 min | 2 tasks | 5 files |
 | Phase 52.1 P06 | 23 min | 2 tasks | 3 files |
+| Phase 52.1 P07 | 50 min | 3 tasks | 5 files |
 
 ## Session
 
-**Last session:** 2026-11-15T19:46:22.017Z
-**Stopped at:** Completed 52.1-06-PLAN.md
+**Last session:** 2026-11-15T22:46:21.259Z
+**Stopped at:** Completed 52.1-07-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
