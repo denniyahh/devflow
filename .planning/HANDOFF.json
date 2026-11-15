@@ -1,0 +1,35 @@
+{
+  "version": "1.0",
+  "timestamp": "2026-11-15T02:06:21.365Z",
+  "phase": "52.1",
+  "phase_name": "Stabilize for Dogfooding",
+  "phase_dir": ".planning/phases/52.1-stabilize-for-dogfooding",
+  "plan": null,
+  "task": null,
+  "total_tasks": null,
+  "status": "paused",
+  "completed_tasks": [
+    {"id": 1, "name": "pi S7 ruling recorded in plan 11 (cleanup keeps an incomplete stopped run)", "status": "done", "commit": "c83b4d4"},
+    {"id": 2, "name": "plan-checker round 2 (0 blockers); its one warning fixed by CONTEXT D-09.5 amendment; STATE next steps", "status": "done", "commit": "ac97bf3"},
+    {"id": 3, "name": "phase worktree .worktrees/phase-52.1 on feature/phase-52.1", "status": "done", "commit": "9ced850"},
+    {"id": 4, "name": "MemPalace capture of CONTEXT + 15 plans (889 drawers); stale 2026-11-11 CONTEXT copy deleted (35); KG scope + exit-criterion facts superseded", "status": "done"},
+    {"id": 5, "name": "D-15 operator-confirmed; plan 05 fixture sets code_review false + model_profile budget", "status": "done", "commit": "9ced850"}
+  ],
+  "remaining_tasks": [
+    {"id": 6, "name": "/gsd-execute-phase 52.1 from .worktrees/phase-52.1 (15 plans, 11 waves; none executed)", "status": "not_started"}
+  ],
+  "blockers": [],
+  "async_jobs": [],
+  "human_actions_pending": [
+    {"action": "Plan 52.1-14 Task 2: live proof run and its control from a shell outside any agent worktree", "context": "a worktree subagent cannot own a run that outlives its turn", "blocking": true},
+    {"action": "Push workspace/denniyahh (3 commits ahead of origin, plus this handoff commit)", "context": "outward-facing; operator's call", "blocking": false}
+  ],
+  "decisions": [
+    {"decision": "cleanup keeps an incomplete stopped run even when merged and clean (pi S7)", "rationale": "its state is the only copy resume continues from, incl. A-11's Validate failure total", "phase": "52.1"},
+    {"decision": "D-15 confirmed: proof run on the throwaway project, kept cheap (code_review false, model_profile budget; research/plan_check already off)", "rationale": "operator considered real backlog item 999.147 and chose the throwaway project", "phase": "52.1"},
+    {"decision": "no fish-shell rule in AGENTS.md", "rationale": "operator declined 2026-11-14", "phase": "52.1"}
+  ],
+  "uncommitted_files": [],
+  "next_action": "cd .worktrees/phase-52.1, confirm branch feature/phase-52.1 at or past 9ced850, then run /gsd-execute-phase 52.1",
+  "context_notes": "Plan revisions all committed. MemPalace copies of CONTEXT and plan 05 predate 9ced850; re-file after execution (deleting the old drawers needs explicit operator approval). Installed devflow is 3.0.0; plan 14's run needs the phase-head build installed first (D-17)."
+}
