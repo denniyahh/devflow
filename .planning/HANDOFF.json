@@ -1,13 +1,13 @@
 {
   "version": "1.0",
-  "timestamp": "2026-11-15T20:07:28.035Z",
+  "timestamp": "2026-11-15T23:59:00.000Z",
   "phase": "52.1",
   "phase_name": "Stabilize for Dogfooding",
   "phase_dir": ".planning/phases/52.1-stabilize-for-dogfooding",
   "plan": 7,
   "task": 7,
   "total_tasks": 15,
-  "status": "paused",
+  "status": "halted",
   "completed_tasks": [
     {
       "id": 1,
@@ -47,9 +47,9 @@
     },
     {
       "id": 7,
-      "name": "52.1-07: devflow discard",
-      "status": "in_progress",
-      "progress": "PARTIAL: executor cut off by the usage limit about 15:10 EST while writing Task 2's tests; commits 9b39f80, be11929, b2f948f, 2fd5de2; clean tree; no SUMMARY (measured 17:20 EST)"
+      "name": "52.1-07: devflow discard, plus its liveness follow-up",
+      "status": "done",
+      "commit": "see its SUMMARY and addendum"
     }
   ],
   "remaining_tasks": [
@@ -94,7 +94,13 @@
       "status": "not_started"
     }
   ],
-  "blockers": [],
+  "blockers": [
+    {
+      "description": "Phase halted by the operator pending a new direction",
+      "type": "human_action",
+      "workaround": "none; see the brief"
+    }
+  ],
   "async_jobs": [],
   "human_actions_pending": [
     {
@@ -146,16 +152,9 @@
     }
   ],
   "uncommitted_files": {
-    "main_checkout_before_this_handoff": [
-      " M .planning/phases/52.1-stabilize-for-dogfooding/.continue-here.md"
-    ],
-    "phase_worktree": [],
-    "wsx": [
-      " M .planning/PROJECT.md",
-      " M .planning/REQUIREMENTS.md",
-      "?? .planning/research/AGENT-HOOKS-UNIFICATION-BRIEF.md"
-    ]
+    "main_checkout": [],
+    "phase_worktree": []
   },
-  "next_action": "In the phase worktree, read 52.1-07-PLAN.md against commits 9b39f80..2fd5de2, then ask the operator whether to finish plan 07 from them or re-execute. Dispatch nothing before they answer.",
-  "context_notes": "Sequential executors, about 25 minutes per plan. Read each executor's 'not verified' section and act on it between waves. From plan 07 on the work is destructive; check that refusal tests assert nothing was deleted."
+  "next_action": "Read .planning/audits/2026-11-15-new-direction-brief.md, then ask the operator which spike to run, if any. Do not resume Phase 52.1's plans.",
+  "context_notes": "Phase 52.1 halted by the operator after plan 07; direction under consideration is a foreground runner. Evidence so far is from stand-in scripts only."
 }
