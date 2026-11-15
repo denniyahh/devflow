@@ -7,7 +7,8 @@
 #
 # Phase mode (--phase N, or automatic on a feature/phase-N branch) replays only
 # the commits in BASE_BRANCH..HEAD whose conventional-commit scope names phase N
-# (`(48)`, `(48-07)`, `(phase-48)`), the scope GSD's execute-phase commits use.
+# (`(48)`, `(48-07)`, `(phase-48)`, the scope GSD's execute-phase commits use,
+# and `(48-review)`, `(48-fix)`, the scopes its review fixes use).
 # Phase work committed on the workspace branch before the phase branch split
 # off is included, and unrelated workspace commits are left out, whatever the
 # fork point. The default PR branch is feature/phase-N-pr.
@@ -130,8 +131,9 @@ FORBIDDEN_REGEX="^($(printf '%s\n' "${FORBIDDEN_PATHS[@]%/}" | sed 's/[][\.*^$()
 if [ -n "$PHASE" ]; then
     # Scope anchored the way GSD's execute-phase matches plan commits: the
     # phase's leading integer may carry zero padding, a plan suffix is -NN.
+    # Review fixes use -review and -fix; no other suffix is accepted.
     PHASE_ESC="${PHASE//./\\.}"
-    SCOPE_RE="^[a-z]+\((phase-)?0*${PHASE_ESC}(-[0-9]+)?\)!?: "
+    SCOPE_RE="^[a-z]+\((phase-)?0*${PHASE_ESC}(-[0-9]+|-review|-fix)?\)!?: "
     COMMIT_LIST=()
     while IFS=$'\t' read -r HASH SUBJECT; do
         if [[ "$SUBJECT" =~ $SCOPE_RE ]]; then
