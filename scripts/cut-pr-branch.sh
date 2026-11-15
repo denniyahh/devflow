@@ -129,6 +129,28 @@ fi
 # shellcheck disable=SC2016 # The sed program's `$` and `\\&` are literal.
 FORBIDDEN_REGEX="^($(printf '%s\n' "${FORBIDDEN_PATHS[@]%/}" | sed 's/[][\.*^$()+?{}|]/\\&/g' | paste -sd '|' -))(/|$)"
 
+# Prints the paths commit $1 touches that may reach the PR branch, one per
+# line: every path outside FORBIDDEN_REGEX. A commit that touches only
+# forbidden paths prints nothing. When git cannot list the commit's files it
+# fails and names the commit, so the commit is never read as forbidden-only.
+# Call it only as a standalone assignment, X="$(non_forbidden_paths "$sha")":
+# `if`, `[ ... ]` and `local X="$(...)"` each discard its status.
+non_forbidden_paths() {
+    local touched
+    local status=0
+    local path
+    touched="$(git diff-tree --no-commit-id --name-only -r "$1")" || status=$?
+    if [ "$status" -ne 0 ]; then
+        echo "error: cannot list the files commit $1 touches (git diff-tree exited $status)" >&2
+        return 1
+    fi
+    while IFS= read -r path; do
+        if [ -n "$path" ] && ! [[ $path =~ $FORBIDDEN_REGEX ]]; then
+            printf '%s\n' "$path"
+        fi
+    done <<< "$touched"
+}
+
 if [ -n "$PHASE" ]; then
     # Scope anchored the way GSD's execute-phase matches plan commits: the
     # phase's leading integer may carry zero padding, a plan suffix is -NN.
@@ -136,11 +158,23 @@ if [ -n "$PHASE" ]; then
     PHASE_ESC="${PHASE//./\\.}"
     SCOPE_RE="^[a-z]+\((phase-)?0*${PHASE_ESC}(-[0-9]+|-review|-fix)?\)!?: "
     COMMIT_LIST=()
-    while IFS=$'\t' read -r HASH SUBJECT; do
+    SKIPPED_CODE=()
+    while IFS=$'\t' read -r HASH SHORT_HASH SUBJECT; do
         if [[ "$SUBJECT" =~ $SCOPE_RE ]]; then
             COMMIT_LIST+=("$HASH")
+            continue
         fi
-    done < <(git log --reverse --no-merges --format='%H%x09%s' "$BASE_REF..$CURRENT_BRANCH")
+        NON_FORBIDDEN="$(non_forbidden_paths "$HASH")"
+        if [ -n "$NON_FORBIDDEN" ]; then
+            SKIPPED_CODE+=("  skipped $SHORT_HASH $SUBJECT")
+        fi
+    done < <(git log --reverse --no-merges --format='%H%x09%h%x09%s' "$BASE_REF..$CURRENT_BRANCH")
+    # A commit the scope filter leaves out is never dropped silently when it
+    # touches a file that would reach develop.
+    if [ "${#SKIPPED_CODE[@]}" -gt 0 ]; then
+        echo "cut-pr-branch: ${#SKIPPED_CODE[@]} commit(s) outside phase $PHASE's scope touch files that would reach develop:" >&2
+        printf '%s\n' "${SKIPPED_CODE[@]}" >&2
+    fi
     if [ "${#COMMIT_LIST[@]}" -eq 0 ]; then
         echo "error: no commits scoped to phase $PHASE in $BASE_REF..$CURRENT_BRANCH." >&2
         exit 1
@@ -189,8 +223,7 @@ EXCLUDED_COUNT=0
 INCLUDED_HASHES=()
 
 for HASH in "${COMMIT_LIST[@]}"; do
-    TOUCHED_FILES=$(git diff-tree --no-commit-id --name-only -r "$HASH")
-    NON_FORBIDDEN=$(echo "$TOUCHED_FILES" | grep -v -E "$FORBIDDEN_REGEX" | grep -v '^$' || true)
+    NON_FORBIDDEN="$(non_forbidden_paths "$HASH")"
 
     if [ -z "$NON_FORBIDDEN" ]; then
         # Commit touches only personal/agent planning files
