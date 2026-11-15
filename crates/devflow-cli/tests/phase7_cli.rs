@@ -3676,3 +3676,412 @@ fn discard_refuses_a_listed_worktree_whose_directory_is_gone() {
         ],
     );
 }
+
+/// A live run is never discarded: with the phase's agent running, discard refuses
+/// with cleanup's liveness refusal, naming `devflow stop`, and removes nothing.
+#[test]
+fn discard_refuses_a_live_run() {
+    let case = discard_case();
+    let phase = PhaseId::new(47);
+    full_phase(&case.root, phase, true, |_| {});
+    // The agent pid file holds a live pid: this test process's own.
+    let pid_path = devflow_core::agent_result::agent_pid_path(&case.root, phase);
+    fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
+    fs::write(&pid_path, std::process::id().to_string()).unwrap();
+    let before = phase_items(&case.root, phase);
+
+    let out = run_discard(&case.home, &case.root, phase, &[]);
+    assert_discard_refused(
+        &out,
+        &case.root,
+        phase,
+        &before,
+        &[
+            "a run is live",
+            "its agent is running",
+            "devflow stop --phase 47",
+            "nothing was removed",
+        ],
+    );
+}
+
+/// A supervisor record whose socket is `name` in the hermetic cache's `sock`
+/// directory. With `stale`, a listener is bound there and dropped, so the socket
+/// probes STALE; otherwise a regular file is written there, so the probe fails. The
+/// recorded agent group is one that cannot exist: nothing here assesses it.
+fn recorded_supervisor(
+    home: &common::HermeticHome,
+    name: &str,
+    stale: bool,
+) -> devflow_core::state::SupervisorRecord {
+    let sock_dir = devflow_core::registry::socket_dir_in(&home.cache_dir());
+    fs::create_dir_all(&sock_dir).unwrap();
+    let socket = sock_dir.join(name);
+    if stale {
+        drop(std::os::unix::net::UnixListener::bind(&socket).expect("bind the socket"));
+    } else {
+        fs::write(&socket, "a regular file\n").unwrap();
+    }
+    devflow_core::state::SupervisorRecord::new(
+        socket,
+        "aaaa0000aaaa0007".to_string(),
+        u32::MAX,
+        0,
+        "no-such-boot".to_string(),
+    )
+}
+
+/// D-09.3: a STALE supervisor may have left its agent group running, so discard
+/// refuses, names the supervisor as STALE and `devflow stop`, and removes nothing.
+#[test]
+fn discard_refuses_a_stale_supervisor_naming_stop() {
+    let case = discard_case();
+    let phase = PhaseId::new(48);
+    let record = recorded_supervisor(&case.home, "stale.sock", true);
+    let socket = record.socket_path.clone();
+    full_phase(&case.root, phase, true, |state| {
+        finished(state);
+        state.supervisor = Some(record);
+    });
+    let before = phase_items(&case.root, phase);
+
+    let out = run_discard(&case.home, &case.root, phase, &[]);
+    assert_discard_refused(
+        &out,
+        &case.root,
+        phase,
+        &before,
+        &[
+            "its supervisor is STALE",
+            "devflow stop --phase 48",
+            "nothing was removed",
+        ],
+    );
+    assert!(socket.exists(), "the recorded socket is left in place");
+}
+
+/// D-09.3: a supervisor that cannot be probed proves nothing either way, so discard
+/// refuses, says the probe failed, names `devflow stop`, and removes nothing.
+#[test]
+fn discard_refuses_an_unprobeable_supervisor_naming_stop() {
+    let case = discard_case();
+    let phase = PhaseId::new(49);
+    let record = recorded_supervisor(&case.home, "not-a-socket.sock", false);
+    full_phase(&case.root, phase, true, |state| {
+        finished(state);
+        state.supervisor = Some(record);
+    });
+    let before = phase_items(&case.root, phase);
+
+    let out = run_discard(&case.home, &case.root, phase, &[]);
+    assert_discard_refused(
+        &out,
+        &case.root,
+        phase,
+        &before,
+        &[
+            "the probe failed",
+            "devflow stop --phase 49",
+            "nothing was removed",
+        ],
+    );
+}
+
+/// A STALE supervisor socket named for `root` (canonical) and `phase`, with no
+/// sidecar beside it, in the hermetic cache: what the stateless sweep finds for a
+/// supervisor no state names, and counts as possibly live. Returns the socket's path.
+fn plant_swept_socket(home: &common::HermeticHome, root: &Path, phase: PhaseId) -> PathBuf {
+    let cache = home.cache_dir();
+    fs::create_dir_all(devflow_core::registry::socket_dir_in(&cache)).unwrap();
+    let socket = devflow_core::supervisor::SocketPath::for_launch(
+        &cache,
+        root,
+        phase,
+        &devflow_core::supervisor::new_launch_id(),
+    )
+    .expect("a socket path that fits");
+    drop(std::os::unix::net::UnixListener::bind(socket.as_path()).expect("bind the socket"));
+    socket.as_path().to_path_buf()
+}
+
+/// With a state that does not load there is no supervisor record to probe, so
+/// discard sweeps for this phase's sockets and refuses on one that may still run.
+/// The control with no socket is `discard_removes_a_state_that_does_not_load`.
+#[test]
+fn discard_refuses_a_swept_live_supervisor_when_the_state_does_not_load() {
+    let case = discard_case();
+    let phase = PhaseId::new(50);
+    full_phase(&case.root, phase, true, finished);
+    fs::write(
+        devflow_core::workflow::state_path(&case.root, phase),
+        "not json",
+    )
+    .unwrap();
+    let socket = plant_swept_socket(&case.home, &case.root, phase);
+    let before = phase_items(&case.root, phase);
+    assert_eq!(
+        before.state.as_deref(),
+        Some(b"not json".as_slice()),
+        "premise: the state file does not load"
+    );
+
+    let out = run_discard(&case.home, &case.root, phase, &[]);
+    assert_discard_refused(
+        &out,
+        &case.root,
+        phase,
+        &before,
+        &[
+            "its state does not load",
+            &socket.display().to_string(),
+            "devflow stop --phase 50",
+            "nothing was removed",
+        ],
+    );
+    assert!(socket.exists(), "the swept socket is left in place");
+}
+
+/// With no state there is no supervisor record to probe either: the same sweep
+/// refuses. The control with no socket is
+/// `discard_removes_a_worktree_and_branch_with_no_state`.
+#[test]
+fn discard_refuses_a_swept_live_supervisor_when_no_state_exists() {
+    let case = discard_case();
+    let phase = PhaseId::new(51);
+    full_phase(&case.root, phase, true, finished);
+    fs::remove_file(devflow_core::workflow::state_path(&case.root, phase)).unwrap();
+    let socket = plant_swept_socket(&case.home, &case.root, phase);
+    let before = phase_items(&case.root, phase);
+    assert!(
+        before.worktree.is_some() && before.state.is_none() && before.branch_tip.is_some(),
+        "premise: a worktree and a branch with no state"
+    );
+
+    let out = run_discard(&case.home, &case.root, phase, &[]);
+    assert_discard_refused(
+        &out,
+        &case.root,
+        phase,
+        &before,
+        &[
+            "its state is missing",
+            &socket.display().to_string(),
+            "devflow stop --phase 51",
+            "nothing was removed",
+        ],
+    );
+    assert!(socket.exists(), "the swept socket is left in place");
+}
+
+/// A socket directory that cannot be listed cannot rule a live supervisor out, so
+/// with no state discard refuses and removes nothing.
+#[test]
+fn discard_refuses_when_the_socket_directory_cannot_be_listed() {
+    let case = discard_case();
+    let phase = PhaseId::new(55);
+    full_phase(&case.root, phase, true, finished);
+    fs::remove_file(devflow_core::workflow::state_path(&case.root, phase)).unwrap();
+    // A regular file where the socket directory belongs: listing it fails.
+    let sock_dir = devflow_core::registry::socket_dir_in(&case.home.cache_dir());
+    fs::create_dir_all(sock_dir.parent().unwrap()).unwrap();
+    fs::write(&sock_dir, "not a directory\n").unwrap();
+    let before = phase_items(&case.root, phase);
+
+    let out = run_discard(&case.home, &case.root, phase, &[]);
+    assert_discard_refused(
+        &out,
+        &case.root,
+        phase,
+        &before,
+        &[
+            &sock_dir.display().to_string(),
+            "cannot be listed",
+            "a live supervisor cannot be ruled out",
+            "nothing was removed",
+        ],
+    );
+}
+
+/// D-20: discard is the way out of a state that does not load. It removes that file
+/// with the worktree and the branch, and keeps no copy of it.
+#[test]
+fn discard_removes_a_state_that_does_not_load() {
+    let case = discard_case();
+    let phase = PhaseId::new(52);
+    full_phase(&case.root, phase, true, finished);
+    let state_file = devflow_core::workflow::state_path(&case.root, phase);
+    fs::write(&state_file, "not json").unwrap();
+    let bystanders = add_bystanders(&case.root);
+
+    let out = run_discard(&case.home, &case.root, phase, &[]);
+    let (stdout, text) = discard_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        listing_has(&stdout, "run state"),
+        "the listing names the state file: {text}"
+    );
+    assert_eq!(
+        phase_items(&case.root, phase),
+        PhaseItems::NONE,
+        "the state that does not load, the worktree and the branch are gone: {text}"
+    );
+    let copies: Vec<PathBuf> = common::entries_under(&case.root.join(".devflow"))
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("unloadable-state-"))
+        })
+        .collect();
+    assert!(copies.is_empty(), "no copy is kept: {copies:?}\n{text}");
+    bystanders.assert_untouched(&case.root, &text);
+}
+
+/// The branch the primary checkout of `root` has checked out.
+fn primary_branch(root: &Path) -> String {
+    let out = git(root, &["symbolic-ref", "--short", "HEAD"]);
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// A finished state for `phase` that records no worktree, saved in `root`.
+fn save_finished_state(root: &Path, phase: PhaseId) {
+    let mut state = devflow_core::state::State::new(
+        phase,
+        devflow_core::state::AgentKind::Claude,
+        devflow_core::mode::Mode::Auto,
+        root.to_path_buf(),
+    );
+    finished(&mut state);
+    devflow_core::workflow::save_state(&state).unwrap();
+}
+
+/// D-09.2, the `start --no-worktree` shape: with the phase branch checked out in the
+/// primary checkout, discard refuses, names the branch to switch to and never
+/// switches itself. Nothing is removed.
+#[test]
+fn discard_refuses_a_branch_checked_out_in_the_primary_checkout() {
+    let case = discard_case();
+    let phase = PhaseId::new(53);
+    init_repo(&case.root);
+    git(&case.root, &["checkout", "-q", "-b", "feature/phase-53"]);
+    save_finished_state(&case.root, phase);
+    let before = phase_items(&case.root, phase);
+    assert!(
+        before.worktree.is_none() && before.state.is_some() && before.branch_tip.is_some(),
+        "premise: a state and a branch, and no worktree"
+    );
+
+    let out = run_discard(&case.home, &case.root, phase, &[]);
+    assert_discard_refused(
+        &out,
+        &case.root,
+        phase,
+        &before,
+        &[
+            "feature/phase-53 is checked out in the primary checkout",
+            "git switch develop",
+            "nothing was removed",
+        ],
+    );
+    assert_eq!(
+        primary_branch(&case.root),
+        "feature/phase-53",
+        "discard does not switch the primary checkout's branch"
+    );
+}
+
+/// git refuses to delete a branch any worktree has checked out, so with the phase
+/// branch checked out in a worktree other than the phase's own, discard refuses
+/// before it removes the state.
+#[test]
+fn discard_refuses_a_branch_checked_out_in_another_worktree() {
+    let case = discard_case();
+    let phase = PhaseId::new(56);
+    init_repo(&case.root);
+    git(&case.root, &["branch", "feature/phase-56", "develop"]);
+    let elsewhere = case.root.join(".worktrees").join("elsewhere");
+    devflow_core::worktree::add(
+        &case.root,
+        &elsewhere,
+        "feature/phase-56",
+        "feature/phase-56",
+        false,
+    )
+    .unwrap();
+    save_finished_state(&case.root, phase);
+    let before = phase_items(&case.root, phase);
+    assert!(
+        before.worktree.is_none() && before.state.is_some() && before.branch_tip.is_some(),
+        "premise: a state and a branch, and no worktree at the phase path"
+    );
+
+    let out = run_discard(&case.home, &case.root, phase, &[]);
+    assert_discard_refused(
+        &out,
+        &case.root,
+        phase,
+        &before,
+        &[
+            "feature/phase-56 is checked out in the worktree",
+            &elsewhere.display().to_string(),
+            "nothing was removed",
+        ],
+    );
+    assert!(
+        elsewhere.join("README.md").is_file(),
+        "the other worktree is left in place"
+    );
+}
+
+/// D-09.2: discard holds the phase's foreground holder, so while another foreground
+/// process holds the phase it refuses, naming the holder, and removes nothing.
+#[test]
+fn discard_refuses_while_a_foreground_holder_holds_the_phase() {
+    let case = discard_case();
+    let phase = PhaseId::new(57);
+    full_phase(&case.root, phase, true, finished);
+    let hold = devflow_core::liveness::claim_phase_holder(&case.root, phase)
+        .unwrap_or_else(|_| panic!("premise: the test claims the phase's holder"));
+    let before = phase_items(&case.root, phase);
+
+    let out = run_discard(&case.home, &case.root, phase, &[]);
+    assert_discard_refused(
+        &out,
+        &case.root,
+        phase,
+        &before,
+        &[
+            "phase 57 is held by a foreground DevFlow process",
+            &format!("pid {}", std::process::id()),
+        ],
+    );
+    drop(hold);
+}
+
+/// A verb refuses every state it does not act on: with no state, worktree or branch
+/// for the phase, discard says there is nothing to discard and exits non-zero.
+#[test]
+fn discard_refuses_when_nothing_exists_for_the_phase() {
+    let case = discard_case();
+    let phase = PhaseId::new(54);
+    init_repo(&case.root);
+    let bystanders = add_bystanders(&case.root);
+    assert_eq!(
+        phase_items(&case.root, phase),
+        PhaseItems::NONE,
+        "premise: the phase has nothing"
+    );
+
+    let out = run_discard(&case.home, &case.root, phase, &[]);
+    assert_discard_refused(
+        &out,
+        &case.root,
+        phase,
+        &PhaseItems::NONE,
+        &[
+            "phase 54 has no run state, worktree or branch",
+            "nothing to discard",
+        ],
+    );
+    let (_, text) = discard_text(&out);
+    bystanders.assert_untouched(&case.root, &text);
+}
