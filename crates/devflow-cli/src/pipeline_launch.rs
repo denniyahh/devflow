@@ -345,7 +345,14 @@ pub(crate) fn repair_leaked_auto_chain_flag(
         }
     };
 
+    let note = auto_chain_repair_note(entry_point, phase, &outcome);
     if !outcome.repaired_anything() && outcome.commit_refused.is_none() {
+        // 52.1 D-22: recording GSD's own `false` is not a repair. It is said in
+        // the foreground and writes no `auto_chain_flag_repaired` event. A
+        // clean launch has no note at all.
+        if let Some(note) = note {
+            println!("{note}");
+        }
         return;
     }
 
@@ -361,7 +368,7 @@ pub(crate) fn repair_leaked_auto_chain_flag(
         }),
     );
 
-    if let Some(note) = auto_chain_repair_note(entry_point, phase, &outcome) {
+    if let Some(note) = note {
         println!("{note}");
     }
     if let Some(reason) = &outcome.commit_refused {
@@ -371,7 +378,7 @@ pub(crate) fn repair_leaked_auto_chain_flag(
 
 /// The foreground `note:` line for what [`repair_leaked_auto_chain_flag`] found,
 /// or `None` when there is nothing to say. Names a killed run only when a set
-/// flag was actually cleared.
+/// flag was actually cleared; a recorded `false` (52.1 D-22) says nothing leaked.
 fn auto_chain_repair_note(
     entry_point: &str,
     phase: PhaseId,
@@ -385,6 +392,13 @@ fn auto_chain_repair_note(
              (working tree: {}, this branch's tip: {})",
             repaired_word(outcome.working_tree_repaired),
             repaired_word(outcome.committed_tree_repaired),
+        ));
+    }
+    if outcome.recorded_gsd_false {
+        return Some(format!(
+            "note: devflow {entry_point} recorded GSD's workflow._auto_chain_active: false \
+             for phase {phase} in a commit (the committed config held no true flag; \
+             nothing was leaked)"
         ));
     }
     None
