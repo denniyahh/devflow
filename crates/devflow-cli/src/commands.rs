@@ -19064,6 +19064,7 @@ mod tests {
 
         drop(release);
         holder.join().unwrap();
+        wait_for_released_write_lock(&root, phase);
         assert_eq!(
             write_lock_line(&workflow::write_lock_status(&root, phase).unwrap()),
             None,
@@ -19103,14 +19104,36 @@ mod tests {
         (holder, release)
     }
 
-    /// Check that the released state write lock reads free, telling `on_held` about
+    /// How long a released state write lock may keep reading held before the test
+    /// calls it a leak.
+    const RELEASED_WRITE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// Wait for the released state write lock to read free, telling `on_held` about
     /// each reading that still says held.
-    fn wait_for_released_write_lock_with(root: &Path, phase: PhaseId, _on_held: impl FnMut()) {
-        assert_eq!(
-            workflow::write_lock_status(root, phase).unwrap(),
-            workflow::WriteLockStatus::Free,
-            "control: released"
+    ///
+    /// A fork in another test thread holds a duplicate of every descriptor until its
+    /// exec, so a just-released lock can read held for a moment (999.221). A real leak
+    /// outlasts the bound. The poll is the shared read `status` and `doctor` make, not
+    /// `write_lock_is_free`: that probe takes an exclusive lock, and a fork during the
+    /// probe would leave a child holding it, so the next shared read could still say
+    /// held.
+    fn wait_for_released_write_lock_with(root: &Path, phase: PhaseId, mut on_held: impl FnMut()) {
+        devflow_core::test_support::wait_until(
+            RELEASED_WRITE_LOCK_WAIT,
+            "the state write lock to read free after its release",
+            || {
+                let status = workflow::write_lock_status(root, phase).unwrap();
+                if status != workflow::WriteLockStatus::Free {
+                    on_held();
+                }
+                status == workflow::WriteLockStatus::Free
+            },
         );
+    }
+
+    /// [`wait_for_released_write_lock_with`], with nothing to tell.
+    fn wait_for_released_write_lock(root: &Path, phase: PhaseId) {
+        wait_for_released_write_lock_with(root, phase, || {});
     }
 
     /// 999.221 on demand: a child forked while the state write lock is held, and parked
