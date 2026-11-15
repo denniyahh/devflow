@@ -187,6 +187,8 @@ pub fn set_auto_chain_active(root: &Path, active: bool) -> Result<bool, GsdConfi
 /// failure — it is the correct answer when committing would sweep in an edit
 /// DevFlow does not own (F-8) — and a call site that could not tell it apart
 /// from "nothing happened" would report the deferral as silence.
+///
+/// `recorded_gsd_false` is a fourth fact, about a commit that is not a repair.
 #[derive(Debug, Default)]
 pub struct ClearOutcome {
     /// The file on disk carried a set flag and now does not.
@@ -293,11 +295,14 @@ pub fn force_clear_auto_chain(root: &Path) -> Result<ClearOutcome, GsdConfigErro
         }
     };
     let working_text = std::fs::read_to_string(config_path(root))?;
-    match (
+    let (head_flag_was_true, working_holds_false) = match (
         serde_json::from_str::<Value>(&head_text),
         serde_json::from_str::<Value>(&working_text),
     ) {
         (Ok(mut head), Ok(mut working)) => {
+            // Read both facts before `without_flag` removes the key they are
+            // read from.
+            let flags = (read_flag(&head), holds_explicit_false(&working));
             without_flag(&mut head);
             without_flag(&mut working);
             if head != working {
@@ -308,6 +313,7 @@ pub fn force_clear_auto_chain(root: &Path) -> Result<ClearOutcome, GsdConfigErro
                 ));
                 return Ok(outcome);
             }
+            flags
         }
         _ => {
             outcome.commit_refused = Some(format!(
@@ -316,6 +322,17 @@ pub fn force_clear_auto_chain(root: &Path) -> Result<ClearOutcome, GsdConfigErro
             ));
             return Ok(outcome);
         }
+    };
+
+    // 52.1 D-22: it is a leak only when a copy actually held `true`. Otherwise
+    // the copies differ in the key's presence or in layout alone, and there are
+    // exactly two answers: record GSD's `false`, or, when the working copy holds
+    // no flag at all, leave a file DevFlow has no stake in exactly as it is.
+    if !(outcome.working_tree_repaired || head_flag_was_true) {
+        if working_holds_false {
+            record_gsd_false(root, &mut outcome);
+        }
+        return Ok(outcome);
     }
 
     // F-9: a commit failure is a loud warning, not a run-killer. Hooks, a
@@ -359,6 +376,50 @@ plan-phase invocation reads the same boolean as \"chain into execute-phase\"
 rather than \"approve this checkpoint\".
 
 Repaired forward by devflow start/resume (35.1 D-01).";
+
+/// Commit the working copy under [`RECORD_GSD_FALSE_COMMIT_MESSAGE`] and set
+/// `recorded_gsd_false` only when the branch tip then agrees with it. A commit
+/// that fails or does not land is a refusal that names the recording commit,
+/// never a leak.
+fn record_gsd_false(root: &Path, outcome: &mut ClearOutcome) {
+    if let Err(err) =
+        GitFlow::new(root).commit_path(CONFIG_PATHSPEC, RECORD_GSD_FALSE_COMMIT_MESSAGE)
+    {
+        outcome.commit_refused = Some(format!(
+            "the commit recording GSD's workflow._auto_chain_active: false could not \
+             be made ({err}) — {CONFIG_PATHSPEC} stays uncommitted; nothing was leaked"
+        ));
+        return;
+    }
+    match probe_head(root) {
+        HeadProbe::Agrees => outcome.recorded_gsd_false = true,
+        HeadProbe::Differs => {
+            outcome.commit_refused = Some(format!(
+                "the commit recording GSD's workflow._auto_chain_active: false \
+                 reported success but {CONFIG_PATHSPEC} still differs from HEAD — \
+                 the file stays uncommitted; nothing was leaked"
+            ));
+        }
+        HeadProbe::Unknown(reason) => {
+            outcome.commit_refused = Some(format!(
+                "the commit recording GSD's workflow._auto_chain_active: false could \
+                 not be confirmed at HEAD; nothing was leaked ({reason})"
+            ));
+        }
+    }
+}
+
+/// The commit that records GSD's own `false`. Not a repair: it says so, and it
+/// names no killed run.
+const RECORD_GSD_FALSE_COMMIT_MESSAGE: &str = "\
+chore(gsd): record GSD's workflow._auto_chain_active: false
+
+GSD's config-set wrote workflow._auto_chain_active: false into a config
+whose committed copy held no true flag: it lacked the key, or differed
+only in layout. Committing it keeps the tree clean, so Validate can
+record a PASS (52-CONTEXT D-46). Nothing was leaked.
+
+Recorded by devflow start/resume (52.1 D-22).";
 
 /// What the branch tip says about the corrected file. Three answers, not two:
 /// a probe that could not run is its own case and must never collapse into
@@ -424,6 +485,15 @@ fn without_flag(value: &mut Value) {
     if let Some(workflow) = value.get_mut(WORKFLOW_KEY).and_then(Value::as_object_mut) {
         workflow.remove(AUTO_CHAIN_KEY);
     }
+}
+
+/// Whether `workflow._auto_chain_active` is present and is the boolean `false`.
+/// Unlike [`read_flag`], an absent key does not count.
+fn holds_explicit_false(value: &Value) -> bool {
+    value
+        .get(WORKFLOW_KEY)
+        .and_then(|workflow| workflow.get(AUTO_CHAIN_KEY))
+        == Some(&Value::Bool(false))
 }
 
 /// Write through a sibling temporary file so a live GSD process never observes
