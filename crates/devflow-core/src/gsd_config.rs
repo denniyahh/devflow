@@ -718,6 +718,41 @@ mod tests {
         assert_eq!(flag_at_head(&root), Value::Bool(false));
     }
 
+    /// The guard that recording GSD's `false` did not swallow a real leak: the
+    /// branch tip holds `true` while the working copy already holds `false`, so
+    /// the only `true` is the committed one. It passes on the code from before
+    /// `recorded_gsd_false` existed as well; it is here so that a change to the
+    /// non-leak rows cannot quietly turn this row into one of them.
+    #[test]
+    fn force_clear_reports_a_leak_when_only_head_held_true() {
+        let (_dir, root) = git_project();
+        write_config(&root, &real_shape(true));
+        commit_config(&root, "add gsd config carrying the leak");
+        assert_eq!(
+            flag_at_head(&root),
+            Value::Bool(true),
+            "premise: the committed config carries the leak"
+        );
+        write_config(&root, &real_shape(false));
+
+        let outcome = force_clear_auto_chain(&root).unwrap();
+
+        assert!(
+            outcome.committed_tree_repaired,
+            "a true flag at the branch tip is a leak and must be reported as repaired"
+        );
+        assert!(
+            !outcome.recorded_gsd_false,
+            "a leak must not be reported as GSD's own false"
+        );
+        assert!(outcome.repaired_anything());
+        let subject = head_subject(&root);
+        assert!(
+            subject.starts_with("fix(gsd): clear a leaked auto-chain flag before launch"),
+            "the leak repair keeps its own commit message: {subject}"
+        );
+    }
+
     /// The subject of the commit `force_clear_auto_chain` writes when it
     /// records GSD's `false` rather than repairing a leak.
     const RECORD_SUBJECT: &str = "chore(gsd): record GSD's workflow._auto_chain_active: false";

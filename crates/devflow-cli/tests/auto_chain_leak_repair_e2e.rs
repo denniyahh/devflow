@@ -567,3 +567,72 @@ fn a_leak_that_reached_the_branch_tip_is_repaired_in_the_commit_too() {
     assert_eq!(events[0]["committed_tree_repaired"], true);
     assert_eq!(events[0]["entry_point"], "resume");
 }
+
+/// 52.1 D-22, at the binary level: GSD's first `config-set` writes
+/// `workflow._auto_chain_active: false` into a project whose committed config
+/// never had the key. Nothing leaked, so the next real `devflow resume` records
+/// the write under an accurate commit and names no killed run on either channel.
+///
+/// The working copy is GSD's own serialization (`JSON.stringify(config, null,
+/// 2)` plus one newline), which is the shape [`real_shape_config`] is written in.
+#[test]
+fn gsds_first_false_write_is_recorded_without_a_killed_run_notice() {
+    let fixture = Fixture::new(false);
+    let path_dir = git_only_path();
+
+    let gsd_false = fs::read_to_string(&fixture.config).unwrap();
+    let without_key = gsd_false.replace("    \"_auto_chain_active\": false,\n", "");
+    assert_ne!(
+        without_key, gsd_false,
+        "the fixture must actually drop the key from the committed copy"
+    );
+    fs::write(&fixture.config, &without_key).unwrap();
+    git(&fixture.root, &["add", ".planning/config.json"]);
+    git(
+        &fixture.root,
+        &[
+            "commit",
+            "-q",
+            "-m",
+            "docs: add gsd config without the chain flag",
+        ],
+    );
+    assert_eq!(
+        fixture.flag_at_head(),
+        "null",
+        "premise: the committed config lacks the key"
+    );
+    fs::write(&fixture.config, &gsd_false).unwrap();
+
+    let output = fixture.run_resume(path_dir.path());
+    let printed = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(
+        fixture.flag_at_head(),
+        "false",
+        "the branch tip must carry GSD's false after the resume\nprinted:\n{printed}"
+    );
+    assert_eq!(
+        git_output(&fixture.root, &["log", "-1", "--format=%s"]).trim_end(),
+        "chore(gsd): record GSD's workflow._auto_chain_active: false",
+        "the commit must say what it records"
+    );
+    let events = fixture.repair_events();
+    assert!(
+        events.is_empty(),
+        "recording GSD's false is not a repair and writes no repair event: {events:?}"
+    );
+    assert!(
+        printed.contains("recorded GSD's workflow._auto_chain_active: false"),
+        "the recording must be announced, or the absent killed-run notice below \
+         proves nothing\nprinted:\n{printed}"
+    );
+    assert!(
+        !printed.contains("was killed before it could clear it"),
+        "nothing leaked, so no killed run may be named\nprinted:\n{printed}"
+    );
+}
