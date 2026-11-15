@@ -723,6 +723,35 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.234: Remaining `fs::write`-Then-Exec Test Stubs Can Hit "Text file busy" (BACKLOG)
+
+**Found:** 2026-11-15, Phase 52.1 plan 52.1-01 Task 3, by reading the test sources. Not found by a failing run.
+**Defect:** these test helpers write an executable stub with `fs::write` in the test process and a test execs it
+soon after. A sibling test's `fork` holds a copy of the write descriptor until its own `exec`, and `exec` of a file
+open for writing fails with `ETXTBSY`. None of them goes through `run_bounded`, so the test-build retry 52.1-01 added
+to `gsd_reader` does not cover them:
+- `crates/devflow-core/src/agents/opencode.rs`: `stub_opencode_on_path`, `stub_hanging_opencode_on_path`,
+  `stub_parent_exits_before_hanging_child`, `stub_parent_exits_with_silent_same_group_child`,
+  `stub_parent_exits_after_attempting_setsid`, `stub_parent_exits_after_attempting_setpgid`.
+- `crates/devflow-core/src/agents/pi.rs` `stub_pi_on_path`; `agents/antigravity.rs`
+  `antigravity_driver_spawn_argv_smoke`; `monitor.rs` test `StageFixture::agent`;
+  `crates/devflow-core/tests/devflow_dir_gitignore.rs` `launch_context`.
+- `crates/devflow-cli/src/test_support.rs` `agent_free_dir_with_agent_stub` and `add_agent_stub`;
+  `pipeline_gate.rs` `waiting_codex_dir`; `pipeline_launch.rs` `run_handoff_child_with_stubs_and_env`,
+  `waiting_agents_dir`, `argv_recording_agents_dir`, `parent_of_a_past_reset_claude_child`.
+- `crates/devflow-cli/tests/`: `common/mod.rs` `fake_bin_dir_for`; `fake_bin_dir` in `phase7_cli.rs`,
+  `gate_notify_persist_e2e.rs`, `gate_wedge_e2e.rs` and `start_reachability_e2e.rs`; the local `write_executable` in
+  `auto_chain_leak_repair_e2e.rs`, `auto_chain_flag_e2e.rs` and `failover_e2e.rs`; `fallback_agent_config.rs`
+  `stub_dir`; `doctor_antigravity.rs` `write_stub_agy`; `pre_commit_secret_scan.rs` `fake_gitleaks`.
+
+**Evidence:** 999.222, the same shape in `gsd_reader`'s fixture, failed once with `Text file busy (os error 26)`.
+52.1-01's `test_support::tests::a_held_fork_makes_a_parent_written_stub_text_busy` reproduces the kernel state on
+demand.
+**Not established:** none of the writers above has been seen to fail, and no rate is known. The list is every
+`0o755` stub writer found by search on 2026-11-15; it was not checked that each stub is run by a test.
+**Fix shape:** write each through `devflow_core::test_support::write_executable` (52.1-01), which writes through a
+short-lived shell so the test process never holds a write descriptor on the stub. Take it in any fix branch.
+
 ### Phase 999.233: `stop` Refuses an Unprobeable Pending-Launch or `--launch` Socket With No Way On (BACKLOG)
 
 **Found:** 2026-11-12, Phase 52.1 replan from the cross-AI plan review (the plans 07-12 planner; host-checked in
