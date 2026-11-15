@@ -5,16 +5,16 @@ milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: "52.1"
 current_phase_name: Stabilize for Dogfooding
 status: executing
-stopped_at: Completed 52.1-01-PLAN.md
-last_updated: "2026-11-15T17:01:26.729Z"
+stopped_at: Completed 52.1-02-PLAN.md
+last_updated: "2026-11-15T17:29:24.256Z"
 last_activity: 2026-11-14
 last_activity_desc: Phase 52.1 execution started
-state_head: 5e3a5ee7bfa0ee6125c280bf86e985dfe0854005
+state_head: 23f614f20322b6ed9abc6a4e99241871e02da024
 progress:
   total_phases: 5
   completed_phases: 0
   total_plans: 48
-  completed_plans: 34
+  completed_plans: 35
   percent: 0
 ---
 
@@ -172,7 +172,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 52.1 (Stabilize for Dogfooding) — EXECUTING
-Plan: 2 of 15
+Plan: 3 of 15
 Status: Ready to execute
 Last activity: 2026-11-14 — Phase 52.1 execution started
 
@@ -913,6 +913,9 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 52.1]: 52.1-01: the ETXTBSY retry's give-up control runs in its own process, because a parked fork holds every descriptor of the process it is forked from for the whole 2 s bound
 - [Phase 52.1]: 52.1-01: test_support::write_executable sets the stub's mode with chmod(2) from the test process, not the shell's chmod, so nothing is looked up on a child test's stub-only PATH
 - [Phase 52.1]: 52.1-01 took backlog number 999.234 (remaining fs::write-then-exec stub writers); 52.1-06 takes 999.235
+- [Phase 52.1]: 52.1-02: force_clear_auto_chain reports a leak only when HEAD or the working copy held true. A working copy holding false is recorded under 'chore(gsd): record GSD's workflow._auto_chain_active: false' with no killed-run note and no auto_chain_flag_repaired event; a layout difference with no flag in it is left uncommitted (D-22).
+- [Phase 52.1]: 52.1-02: the benign-row e2e drives devflow resume, not start. The fixture the plan names spawns resume; start's call site is covered by the shared helper's unit test (entry point start), not by its own e2e.
+- [Phase 52.1]: 52.1-02: an invalid DEVFLOW_EXTERNAL_VERIFY_ENABLED prints one warning: line on stderr, first, at start (a dry run included) and at resume, before any refusal (D-03). The detached supervisor's tracing warning is unchanged.
 
 ## Roadmap Evolution
 
@@ -1058,11 +1061,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 52 P31 | 34 min | 3 tasks | 9 files |
 | Phase 52 P32 | 60min | 3 tasks | 7 files |
 | Phase 52.1 P01 | 23min | 3 tasks | 4 files |
+| Phase 52.1 P02 | 23 min | 3 tasks | 7 files |
 
 ## Session
 
-**Last session:** 2026-11-15T17:01:25.953Z
-**Stopped at:** Completed 52.1-01-PLAN.md
+**Last session:** 2026-11-15T17:29:23.563Z
+**Stopped at:** Completed 52.1-02-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
