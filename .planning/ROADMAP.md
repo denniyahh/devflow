@@ -58,7 +58,7 @@ replies (Telegram and similar) are a later milestone (REMOTE-01/02 under `REQUIR
 | Phase | Name | Requirements | Depends on | Status |
 |---|---|---|---|---|
 | 52 | Subtract and Stabilize | CUT-01, CUT-02, CUT-03, CUT-04, GATE-01, GATE-02, GATE-03, GATE-04, OPS-01, OPS-02, OPS-03, OPS-04 | — (Phase 51, v3.0.0, merged) | Executed — verification stale |
-| 52.1 | Stabilize for Dogfooding (INSERTED) | backlog 999.221, 999.222, 999.223, 999.232, 999.224, 999.219, 999.229, 999.230, 999.231, 999.167 (no REQ IDs; plans bind to D-01..D-27) | 52 | Executed — closed at plan 07 |
+| 52.1 | Stabilize for Dogfooding (INSERTED) | backlog 999.221, 999.222, 999.223, 999.232, 999.224, 999.219, 999.229, 999.230, 999.231, 999.167 (no REQ IDs; plans bind to D-01..D-27) | 52 | Complete    |
 | 52.2 | Foreground Runner (INSERTED) | none (carries 52.1's D-11, D-09.1, D-09.5, D-20, D-24, D-26, D-27, D-08, D-15) | 52.1 | Not started |
 | 53 | The Question Channel | ASK-01, ASK-02, ASK-03, ASK-04, ASK-05 | 52.2 (and through it 52.1 and 52 — the stage set must be final) | Not started |
 | 54 | Decision Triage | TRIAGE-01, TRIAGE-02, TRIAGE-03, TRIAGE-04 | 53 (its recorded questions are the bake-off corpus) | Not started |
@@ -179,7 +179,7 @@ IDs from `REQUIREMENTS.md` — its plans bind to its own decisions, D-01..D-27 i
 to 15 moved to Phase 52.2 for replanning, and the goal's proof run moves with them. Delivered here: the test-flake
 fixes, truthful launch lines, the close-out script fixes, the proof-run fixture, the push-time divergence check and
 `discard`.
-**Plans:** 7/7 plans executed
+**Plans:** 7/7 plans complete
 
 Plans:
 **Wave 1**
@@ -204,8 +204,9 @@ decisions carried from Phase 52.1 are built on the simpler runner, and the phase
 supervised run drives a phase from Plan to a finished Validate without hand-run stages or hand-edited state.
 **Requirements**: no REQ IDs. Carried from Phase 52.1 (its plans 09 to 15, kept for reference in
 `carried-from-52.1/`, to be replanned, not executed as written): D-11, D-09.1, D-09.5, D-20, D-24, D-26, D-27,
-D-08 and D-15 in `52.1-CONTEXT.md`. Plan 08 (D-21, an exit for an unprobeable supervisor) has no object once the
-supervisor is gone. Evidence and spike results: `.planning/audits/2026-11-15-new-direction-brief.md`.
+D-08 and D-15 in `52.1-CONTEXT.md`. Plan 08 (D-21, D-25, D-09.3: an exit for an unprobeable or unanswering
+supervisor) has no object once the supervisor is gone; 999.223, which plan 08 also carried, closes with the
+supervisor's removal. Also owned here: 999.237, `discard` and `start` refusing over a live run. Evidence and spike results: `.planning/audits/2026-11-15-new-direction-brief.md`.
 **Depends on:** Phase 52.1
 **Plans:** 0 plans
 
@@ -722,6 +723,20 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.237: `discard` and `start` Do Not Look for a Held Launch Lock a Loadable State Does Not Name (BACKLOG)
+
+**Found:** 2026-11-15, Phase 52.1 plan 52.1-07, by reading the code after the liveness follow-up (52.1-07-SUMMARY,
+addendum); restated by the 52.1 verifier. Not found by a failing run.
+**Defect:** when the state loads, `devflow discard` probes only the supervisor the state names. Another launch of
+this phase that the state does not name (an orphan of an earlier launch, found by its socket or its held liveness
+lock) is not looked for. `discard` could then remove the worktree and branch under a running agent. `start` has the same shape.
+**Not established:** not reproduced; no test aims at it.
+**Owner:** Phase 52.2 (decided 2026-11-15 by the agent, on the operator's foreground-runner decision): the detached
+supervisor and its launch locks go, but a foreground run in another terminal or a user service can still be live, so
+`discard` and `start` must refuse over a live run under the new design. **Fix shape:** one liveness question under the
+foreground runner (the run's service unit or one lifetime lock), asked by both verbs, with a table test covering every
+combination.
+
 ### Phase 999.236: `write_lock_status_reads_free_held_and_the_recorded_holder` Polls an Exclusive Probe, Then Reads Once (BACKLOG)
 
 **Found:** 2026-11-15, Phase 52.1 plan 52.1-06 (research for 999.221), by reading the test source. Not found by a
@@ -964,6 +979,9 @@ multi-threaded caller, not only in tests.
 
 **Fix shape:** make the assertion wait (bounded, ~2 s) for `Missing`, or fold into 999.221's fix; check whether the
 lock fds are `O_CLOEXEC` and whether test helpers fork without exec. Small: any fix branch, ideally with 999.221/222.
+**Owner (2026-11-15):** Phase 52.2. The test exercises the pending-launch promotion of the detached supervisor, which
+52.2 removes; the test goes with it, and the entry closes as moot then. Not fixed in 52.1: its only plan (52.1-08)
+was dropped.
 
 ### Phase 999.222: The GSD Test Stub Can Fail to Exec With "Text file busy" (BACKLOG)
 
