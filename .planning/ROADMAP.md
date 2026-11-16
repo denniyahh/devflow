@@ -208,10 +208,68 @@ D-08 and D-15 in `52.1-CONTEXT.md`. Plan 08 (D-21, D-25, D-09.3: an exit for an 
 supervisor) has no object once the supervisor is gone; 999.223, which plan 08 also carried, closes with the
 supervisor's removal. Also owned here: 999.237, `discard` and `start` refusing over a live run. Evidence and spike results: `.planning/audits/2026-11-15-new-direction-brief.md`.
 **Depends on:** Phase 52.1
-**Plans:** 0 plans
+**Plans:** 0/24 plans executed
 
 Plans:
-- [ ] TBD (run /gsd-plan-phase 52.2 to break down)
+**Wave 1**
+- [ ] 52.2-01-PLAN.md
+- [ ] 52.2-20-PLAN.md
+
+**Wave 2** *(blocked on Wave 1 completion)*
+- [ ] 52.2-02-PLAN.md
+- [ ] 52.2-03-PLAN.md
+- [ ] 52.2-21-PLAN.md
+
+**Wave 3** *(blocked on Wave 2 completion)*
+- [ ] 52.2-04-PLAN.md
+- [ ] 52.2-05-PLAN.md
+
+**Wave 4** *(blocked on Wave 3 completion)*
+- [ ] 52.2-06-PLAN.md
+
+**Wave 5** *(blocked on Wave 4 completion)*
+- [ ] 52.2-07-PLAN.md
+- [ ] 52.2-08-PLAN.md
+- [ ] 52.2-22-PLAN.md
+
+**Wave 6** *(blocked on Wave 5 completion)*
+- [ ] 52.2-09-PLAN.md
+
+**Wave 7** *(blocked on Wave 6 completion)*
+- [ ] 52.2-10-PLAN.md
+
+**Wave 8** *(blocked on Wave 7 completion)*
+- [ ] 52.2-11-PLAN.md
+
+**Wave 9** *(blocked on Wave 8 completion)*
+- [ ] 52.2-12-PLAN.md
+
+**Wave 10** *(blocked on Wave 9 completion)*
+- [ ] 52.2-23-PLAN.md
+
+**Wave 11** *(blocked on Wave 10 completion)*
+- [ ] 52.2-24-PLAN.md
+
+**Wave 12** *(blocked on Wave 11 completion)*
+- [ ] 52.2-13-PLAN.md
+
+**Wave 13** *(blocked on Wave 12 completion)*
+- [ ] 52.2-14-PLAN.md
+
+**Wave 14** *(blocked on Wave 13 completion)*
+- [ ] 52.2-15-PLAN.md
+
+**Wave 15** *(blocked on Wave 14 completion)*
+- [ ] 52.2-16-PLAN.md
+
+**Wave 16** *(blocked on Wave 15 completion)*
+- [ ] 52.2-17-PLAN.md
+
+**Wave 17** *(blocked on Wave 16 completion)*
+- [ ] 52.2-18-PLAN.md
+
+**Wave 18** *(blocked on Wave 17 completion)*
+- [ ] 52.2-19-PLAN.md
 
 ### Phase 53: The Question Channel
 
@@ -492,7 +550,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 51 | 13/13 | Complete | 2026-11-08 |
 | 52 | 33/33 | Executed — verification stale | 2026-11-11 |
 | 52.1 | 7/7 | Executed — closed at plan 07 (operator, 2026-11-15) | 2026-11-15 |
-| 52.2 | 0/? | Not started | — |
+| 52.2 | 0/24 | Planned     | — |
 | 53 | 0/? | Not started | — |
 | 54 | 0/? | Not started | — |
 | 55 | 0/? | Not started | — |
