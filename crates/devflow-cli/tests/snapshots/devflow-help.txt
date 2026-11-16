@@ -9,6 +9,7 @@ Commands:
   logs     Print or follow an agent's captured output for a phase
   history  Show a phase's chronological events and retained attempt evidence
   cleanup  Remove phase worktrees and their feature branches
+  discard  Remove a phase's worktree, its uncommitted changes, its run state and its feature branch, after listing them. Refuses a live run; refuses an unmerged branch unless `--delete-unmerged-branch` names it
   status   Show current workflow state
   recover  Recover or inspect stale/abandoned workflow state
   doctor   Audit the environment and report what's installed, missing, or broken

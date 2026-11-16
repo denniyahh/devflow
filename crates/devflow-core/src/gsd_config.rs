@@ -187,6 +187,9 @@ pub fn set_auto_chain_active(root: &Path, active: bool) -> Result<bool, GsdConfi
 /// failure — it is the correct answer when committing would sweep in an edit
 /// DevFlow does not own (F-8) — and a call site that could not tell it apart
 /// from "nothing happened" would report the deferral as silence.
+///
+/// `recorded_gsd_false` is a fourth fact, about a commit that is not a repair.
+/// `left_uncommitted` is a fifth, about a difference nobody committed.
 #[derive(Debug, Default)]
 pub struct ClearOutcome {
     /// The file on disk carried a set flag and now does not.
@@ -199,6 +202,19 @@ pub struct ClearOutcome {
     /// whenever the working tree was corrected but the committed copy was left
     /// alone for a reason the operator needs to hear.
     pub commit_refused: Option<String>,
+    /// Not a leak: the branch tip held no `true` flag, the working copy holds
+    /// GSD's `false`, the two copies differed only in the key's presence or in
+    /// layout, and a commit recorded the working copy. Confirmed by re-probing
+    /// the tip after the commit, like `committed_tree_repaired`.
+    pub recorded_gsd_false: bool,
+    /// Not a leak and nothing to record: the working copy differs from the
+    /// branch tip, no copy holds a `true` flag and the working copy holds no
+    /// `false` (the key was removed, or only the layout differs). DevFlow
+    /// cannot attribute the difference, so it commits nothing and the file
+    /// stays modified. The caller says so, because an uncommitted
+    /// `.planning/config.json` stops Validate recording a pass (52-CONTEXT
+    /// D-46).
+    pub left_uncommitted: bool,
 }
 
 impl ClearOutcome {
@@ -288,11 +304,14 @@ pub fn force_clear_auto_chain(root: &Path) -> Result<ClearOutcome, GsdConfigErro
         }
     };
     let working_text = std::fs::read_to_string(config_path(root))?;
-    match (
+    let (head_flag_was_true, working_holds_false) = match (
         serde_json::from_str::<Value>(&head_text),
         serde_json::from_str::<Value>(&working_text),
     ) {
         (Ok(mut head), Ok(mut working)) => {
+            // Read both facts before `without_flag` removes the key they are
+            // read from.
+            let flags = (read_flag(&head), holds_explicit_false(&working));
             without_flag(&mut head);
             without_flag(&mut working);
             if head != working {
@@ -303,6 +322,7 @@ pub fn force_clear_auto_chain(root: &Path) -> Result<ClearOutcome, GsdConfigErro
                 ));
                 return Ok(outcome);
             }
+            flags
         }
         _ => {
             outcome.commit_refused = Some(format!(
@@ -311,6 +331,20 @@ pub fn force_clear_auto_chain(root: &Path) -> Result<ClearOutcome, GsdConfigErro
             ));
             return Ok(outcome);
         }
+    };
+
+    // 52.1 D-22: it is a leak only when a copy actually held `true`. Otherwise
+    // the copies differ in the key's presence or in layout alone, and there are
+    // exactly two answers: record GSD's `false`, or, when the working copy holds
+    // no flag at all, leave a file DevFlow has no stake in exactly as it is and
+    // report that it was left, so the caller can say so.
+    if !(outcome.working_tree_repaired || head_flag_was_true) {
+        if working_holds_false {
+            record_gsd_false(root, &mut outcome);
+        } else {
+            outcome.left_uncommitted = true;
+        }
+        return Ok(outcome);
     }
 
     // F-9: a commit failure is a loud warning, not a run-killer. Hooks, a
@@ -354,6 +388,50 @@ plan-phase invocation reads the same boolean as \"chain into execute-phase\"
 rather than \"approve this checkpoint\".
 
 Repaired forward by devflow start/resume (35.1 D-01).";
+
+/// Commit the working copy under [`RECORD_GSD_FALSE_COMMIT_MESSAGE`] and set
+/// `recorded_gsd_false` only when the branch tip then agrees with it. A commit
+/// that fails or does not land is a refusal that names the recording commit,
+/// never a leak.
+fn record_gsd_false(root: &Path, outcome: &mut ClearOutcome) {
+    if let Err(err) =
+        GitFlow::new(root).commit_path(CONFIG_PATHSPEC, RECORD_GSD_FALSE_COMMIT_MESSAGE)
+    {
+        outcome.commit_refused = Some(format!(
+            "the commit recording GSD's workflow._auto_chain_active: false could not \
+             be made ({err}) — {CONFIG_PATHSPEC} stays uncommitted; nothing was leaked"
+        ));
+        return;
+    }
+    match probe_head(root) {
+        HeadProbe::Agrees => outcome.recorded_gsd_false = true,
+        HeadProbe::Differs => {
+            outcome.commit_refused = Some(format!(
+                "the commit recording GSD's workflow._auto_chain_active: false \
+                 reported success but {CONFIG_PATHSPEC} still differs from HEAD — \
+                 the file stays uncommitted; nothing was leaked"
+            ));
+        }
+        HeadProbe::Unknown(reason) => {
+            outcome.commit_refused = Some(format!(
+                "the commit recording GSD's workflow._auto_chain_active: false could \
+                 not be confirmed at HEAD; nothing was leaked ({reason})"
+            ));
+        }
+    }
+}
+
+/// The commit that records GSD's own `false`. Not a repair: it says so, and it
+/// names no killed run.
+const RECORD_GSD_FALSE_COMMIT_MESSAGE: &str = "\
+chore(gsd): record GSD's workflow._auto_chain_active: false
+
+GSD's config-set wrote workflow._auto_chain_active: false into a config
+whose committed copy held no true flag: it lacked the key, or differed
+only in layout. Committing it keeps the tree clean, so Validate can
+record a PASS (52-CONTEXT D-46). Nothing was leaked.
+
+Recorded by devflow start/resume (52.1 D-22).";
 
 /// What the branch tip says about the corrected file. Three answers, not two:
 /// a probe that could not run is its own case and must never collapse into
@@ -419,6 +497,15 @@ fn without_flag(value: &mut Value) {
     if let Some(workflow) = value.get_mut(WORKFLOW_KEY).and_then(Value::as_object_mut) {
         workflow.remove(AUTO_CHAIN_KEY);
     }
+}
+
+/// Whether `workflow._auto_chain_active` is present and is the boolean `false`.
+/// Unlike [`read_flag`], an absent key does not count.
+fn holds_explicit_false(value: &Value) -> bool {
+    value
+        .get(WORKFLOW_KEY)
+        .and_then(|workflow| workflow.get(AUTO_CHAIN_KEY))
+        == Some(&Value::Bool(false))
 }
 
 /// Write through a sibling temporary file so a live GSD process never observes
@@ -640,7 +727,363 @@ mod tests {
              → next-phase-chains path stays open (35.1 D-01)"
         );
         assert_eq!(outcome.commit_refused, None);
+        assert!(
+            !outcome.left_uncommitted,
+            "a repaired leak leaves nothing uncommitted"
+        );
         assert_eq!(flag_at_head(&root), Value::Bool(false));
+    }
+
+    /// The guard that recording GSD's `false` did not swallow a real leak: the
+    /// branch tip holds `true` while the working copy already holds `false`, so
+    /// the only `true` is the committed one. It passes on the code from before
+    /// `recorded_gsd_false` existed as well; it is here so that a change to the
+    /// non-leak rows cannot quietly turn this row into one of them.
+    #[test]
+    fn force_clear_reports_a_leak_when_only_head_held_true() {
+        let (_dir, root) = git_project();
+        write_config(&root, &real_shape(true));
+        commit_config(&root, "add gsd config carrying the leak");
+        assert_eq!(
+            flag_at_head(&root),
+            Value::Bool(true),
+            "premise: the committed config carries the leak"
+        );
+        write_config(&root, &real_shape(false));
+
+        let outcome = force_clear_auto_chain(&root).unwrap();
+
+        assert!(
+            outcome.committed_tree_repaired,
+            "a true flag at the branch tip is a leak and must be reported as repaired"
+        );
+        assert!(
+            !outcome.recorded_gsd_false,
+            "a leak must not be reported as GSD's own false"
+        );
+        assert!(outcome.repaired_anything());
+        let subject = head_subject(&root);
+        assert!(
+            subject.starts_with("fix(gsd): clear a leaked auto-chain flag before launch"),
+            "the leak repair keeps its own commit message: {subject}"
+        );
+    }
+
+    /// The subject of the commit `force_clear_auto_chain` writes when it
+    /// records GSD's `false` rather than repairing a leak.
+    const RECORD_SUBJECT: &str = "chore(gsd): record GSD's workflow._auto_chain_active: false";
+
+    /// [`REAL_SHAPE`] parsed, with the chain flag removed: a config that has
+    /// not grown the key yet.
+    fn real_shape_without_the_key() -> Value {
+        let mut value: Value = serde_json::from_str(&real_shape(false)).unwrap();
+        without_flag(&mut value);
+        assert_eq!(
+            value["workflow"]["_auto_chain_active"],
+            Value::Null,
+            "the fixture must actually lack the key"
+        );
+        value
+    }
+
+    /// GSD's own serialization: two-space pretty JSON plus one newline.
+    fn pretty(value: &Value) -> String {
+        format!("{}\n", serde_json::to_string_pretty(value).unwrap())
+    }
+
+    fn head_subject(root: &Path) -> String {
+        git_output(root, &["log", "-1", "--format=%s"])
+            .trim_end()
+            .to_string()
+    }
+
+    fn status_porcelain(root: &Path) -> String {
+        git_output(root, &["status", "--porcelain"])
+    }
+
+    /// GSD's first `config-set` in a project whose committed config never had
+    /// the key writes `false`. Nothing leaked: the commit that keeps the tree
+    /// clean says what it records, and the outcome reports no repair.
+    #[test]
+    fn force_clear_records_gsds_false_without_reporting_a_leak() {
+        let (_dir, root) = git_project();
+        write_config(&root, &pretty(&real_shape_without_the_key()));
+        commit_config(&root, "add gsd config without the chain flag");
+        assert_eq!(
+            flag_at_head(&root),
+            Value::Null,
+            "premise: the committed config lacks the key"
+        );
+        write_config(&root, &real_shape(false));
+
+        let outcome = force_clear_auto_chain(&root).unwrap();
+
+        assert!(
+            !outcome.committed_tree_repaired,
+            "the branch tip never held true, so no repair may be reported"
+        );
+        assert!(
+            outcome.recorded_gsd_false,
+            "GSD's false over an absent key must be reported as recorded"
+        );
+        assert!(!outcome.working_tree_repaired);
+        assert_eq!(outcome.commit_refused, None);
+        assert!(!outcome.repaired_anything());
+        assert!(
+            !outcome.left_uncommitted,
+            "a recorded false leaves nothing uncommitted"
+        );
+        assert_eq!(flag_at_head(&root), Value::Bool(false));
+        assert_eq!(head_subject(&root), RECORD_SUBJECT);
+        assert_eq!(status_porcelain(&root), "", "the tree must be left clean");
+    }
+
+    /// The committed copy already holds `false` and the working copy differs
+    /// only in serialization (a compact file that GSD's config-set rewrote
+    /// pretty). Still not a leak, and still recorded under the accurate commit.
+    #[test]
+    fn force_clear_records_a_layout_only_rewrite_of_false_without_reporting_a_leak() {
+        let (_dir, root) = git_project();
+        let value: Value = serde_json::from_str(&real_shape(false)).unwrap();
+        write_config(&root, &serde_json::to_string(&value).unwrap());
+        commit_config(&root, "add a compact gsd config");
+        assert_eq!(
+            flag_at_head(&root),
+            Value::Bool(false),
+            "premise: the committed config holds false"
+        );
+        write_config(&root, &real_shape(false));
+
+        let outcome = force_clear_auto_chain(&root).unwrap();
+
+        assert!(
+            !outcome.repaired_anything(),
+            "a layout-only difference must not be reported as a killed-run repair"
+        );
+        assert!(
+            outcome.recorded_gsd_false,
+            "the rewritten copy must be reported as recorded"
+        );
+        assert_eq!(outcome.commit_refused, None);
+        assert_eq!(head_subject(&root), RECORD_SUBJECT);
+        assert_eq!(status_porcelain(&root), "", "the tree must be left clean");
+    }
+
+    /// The branch tip holds GSD's `false` and the key is gone from the working
+    /// copy, in the same layout. No copy holds `true`, so it is not a leak, and
+    /// the working copy holds no `false` to record. DevFlow cannot attribute
+    /// the change: it commits nothing (operator ruling, 2026-11-15) and reports
+    /// the file as left uncommitted.
+    #[test]
+    fn force_clear_leaves_a_removed_false_uncommitted_and_reports_it() {
+        let (_dir, root) = git_project();
+        write_config(&root, &real_shape(false));
+        commit_config(&root, "add gsd config holding false");
+        assert_eq!(
+            flag_at_head(&root),
+            Value::Bool(false),
+            "premise: the committed config holds false"
+        );
+        let head_before = head_sha(&root);
+        let working = pretty(&real_shape_without_the_key());
+        write_config(&root, &working);
+
+        let outcome = force_clear_auto_chain(&root).unwrap();
+
+        assert_eq!(
+            head_sha(&root),
+            head_before,
+            "a removed false must not be committed"
+        );
+        assert_eq!(
+            status_porcelain(&root),
+            " M .planning/config.json\n",
+            "the file stays modified and uncommitted"
+        );
+        assert_eq!(
+            std::fs::read_to_string(config_path(&root)).unwrap(),
+            working,
+            "the working copy must be left byte for byte as it was"
+        );
+        assert!(!outcome.working_tree_repaired);
+        assert!(!outcome.committed_tree_repaired);
+        assert!(!outcome.recorded_gsd_false);
+        assert_eq!(outcome.commit_refused, None);
+        assert!(
+            outcome.left_uncommitted,
+            "a difference left uncommitted must be reported, not passed over in silence"
+        );
+    }
+
+    /// Neither copy holds the flag and only the layout differs. DevFlow owns
+    /// only the flag, so it commits nothing and reports the file as left
+    /// uncommitted.
+    #[test]
+    fn force_clear_leaves_a_layout_only_difference_without_the_key_uncommitted() {
+        let (_dir, root) = git_project();
+        let value = real_shape_without_the_key();
+        write_config(&root, &serde_json::to_string(&value).unwrap());
+        commit_config(&root, "add a compact gsd config without the chain flag");
+        let head_before = head_sha(&root);
+        write_config(&root, &pretty(&value));
+
+        let outcome = force_clear_auto_chain(&root).unwrap();
+
+        assert_eq!(
+            head_sha(&root),
+            head_before,
+            "a layout difference with no flag in it must not be committed"
+        );
+        assert_eq!(
+            status_porcelain(&root),
+            " M .planning/config.json\n",
+            "the operator's file stays as it was: modified and uncommitted"
+        );
+        assert!(!outcome.working_tree_repaired);
+        assert!(!outcome.committed_tree_repaired);
+        assert!(!outcome.recorded_gsd_false);
+        assert_eq!(outcome.commit_refused, None);
+        assert!(
+            outcome.left_uncommitted,
+            "a layout difference left uncommitted must be reported too"
+        );
+    }
+
+    /// A repository in the row the recording commit serves: the branch tip
+    /// lacks the key and the working copy holds GSD's `false`.
+    fn project_holding_gsds_first_false() -> (tempfile::TempDir, PathBuf) {
+        let (dir, root) = git_project();
+        write_config(&root, &pretty(&real_shape_without_the_key()));
+        commit_config(&root, "add gsd config without the chain flag");
+        write_config(&root, &real_shape(false));
+        (dir, root)
+    }
+
+    /// Installs `body` as the repository's `name` hook, so the recording commit
+    /// runs it. [`git_project`] turns hooks off; this turns them back on for
+    /// one hook.
+    fn install_hook(root: &Path, name: &str, body: &str) {
+        let hooks = root.join(".git/test-hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        crate::test_support::write_executable(&hooks.join(name), &format!("#!/bin/sh\n{body}\n"));
+        git(root, &["config", "core.hooksPath", hooks.to_str().unwrap()]);
+    }
+
+    /// The opening every refusal of the recording commit shares.
+    const RECORD_REFUSAL: &str = "the commit recording GSD's workflow._auto_chain_active: false";
+
+    /// The recording commit fails (here a pre-commit hook rejects it). That is
+    /// a refusal naming the recording commit and its cause: nothing is reported
+    /// as recorded or repaired, and the branch tip is where it was.
+    #[test]
+    fn a_recording_commit_that_fails_is_refused_and_says_why() {
+        let (_dir, root) = project_holding_gsds_first_false();
+        install_hook(&root, "pre-commit", "echo 'the hook says no' >&2\nexit 1");
+        let head_before = head_sha(&root);
+
+        let outcome = force_clear_auto_chain(&root).unwrap();
+
+        assert_eq!(
+            head_sha(&root),
+            head_before,
+            "premise: the hook must actually stop the commit"
+        );
+        assert!(
+            !outcome.recorded_gsd_false,
+            "a commit that failed must not be reported as recorded"
+        );
+        assert!(!outcome.repaired_anything(), "nothing was repaired");
+        assert!(!outcome.left_uncommitted);
+        let reason = outcome
+            .commit_refused
+            .expect("a failed recording commit must say why");
+        assert!(
+            reason.starts_with(&format!("{RECORD_REFUSAL} could not be made (")),
+            "the refusal must name the recording commit: {reason}"
+        );
+        assert!(
+            reason.contains("the hook says no"),
+            "the refusal must carry git's own reason: {reason}"
+        );
+        assert!(
+            reason.ends_with(".planning/config.json stays uncommitted; nothing was leaked"),
+            "the refusal must say the file stays uncommitted and nothing leaked: {reason}"
+        );
+    }
+
+    /// The recording commit lands, and the working copy then differs from the
+    /// branch tip again (here a post-commit hook rewrites it). The outcome is a
+    /// refusal, never `recorded_gsd_false`, which is set only from a re-probe
+    /// that agrees.
+    #[test]
+    fn a_recording_commit_the_reprobe_contradicts_is_refused() {
+        let (_dir, root) = project_holding_gsds_first_false();
+        install_hook(&root, "post-commit", "echo >> .planning/config.json");
+
+        let outcome = force_clear_auto_chain(&root).unwrap();
+
+        assert_eq!(
+            head_subject(&root),
+            RECORD_SUBJECT,
+            "premise: the recording commit landed"
+        );
+        assert_eq!(
+            status_porcelain(&root),
+            " M .planning/config.json\n",
+            "premise: the hook left the file differing from the branch tip"
+        );
+        assert!(
+            !outcome.recorded_gsd_false,
+            "a tip the working copy still differs from must not be reported as recorded"
+        );
+        assert!(!outcome.repaired_anything(), "nothing was repaired");
+        assert!(!outcome.left_uncommitted);
+        assert_eq!(
+            outcome.commit_refused,
+            Some(format!(
+                "{RECORD_REFUSAL} reported success but .planning/config.json still differs \
+                 from HEAD — the file stays uncommitted; nothing was leaked"
+            ))
+        );
+    }
+
+    /// The recording commit lands and the re-probe then cannot run (here a
+    /// post-commit hook points `HEAD` at a branch with no commits, so git
+    /// cannot resolve it). Unknown is not agreement: the outcome is a refusal
+    /// that claims no leak.
+    #[test]
+    fn a_recording_commit_the_reprobe_cannot_confirm_is_refused() {
+        let (_dir, root) = project_holding_gsds_first_false();
+        let branch = git_output(&root, &["symbolic-ref", "HEAD"]);
+        install_hook(
+            &root,
+            "post-commit",
+            "git symbolic-ref HEAD refs/heads/no-commits-yet",
+        );
+
+        let outcome = force_clear_auto_chain(&root).unwrap();
+
+        assert_eq!(
+            git_output(&root, &["log", "-1", "--format=%s", branch.trim_end()]).trim_end(),
+            RECORD_SUBJECT,
+            "premise: the recording commit landed on the branch"
+        );
+        assert!(
+            !outcome.recorded_gsd_false,
+            "a tip that could not be read must not be reported as recorded"
+        );
+        assert!(!outcome.repaired_anything(), "nothing was repaired");
+        assert!(!outcome.left_uncommitted);
+        let reason = outcome
+            .commit_refused
+            .expect("an unconfirmed recording commit must say so");
+        assert!(
+            reason.starts_with(&format!(
+                "{RECORD_REFUSAL} could not be confirmed at HEAD; nothing was leaked \
+                 (could not compare .planning/config.json against HEAD (git exited Some(128))"
+            )),
+            "the refusal must name the recording commit and the failed comparison: {reason}"
+        );
     }
 
     /// F-8 / T-35.1-08: `commit_path` is path-scoped but still commits whatever
@@ -719,6 +1162,10 @@ mod tests {
         assert!(
             !outcome.repaired_anything(),
             "an ordinary clean launch must have nothing to be loud about"
+        );
+        assert!(
+            !outcome.left_uncommitted,
+            "a clean config has no difference to leave uncommitted"
         );
         assert_eq!(std::fs::read(config_path(&root)).unwrap(), bytes_before);
         assert_eq!(head_sha(&root), head_before);

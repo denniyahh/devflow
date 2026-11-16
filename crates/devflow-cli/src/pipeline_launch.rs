@@ -345,7 +345,15 @@ pub(crate) fn repair_leaked_auto_chain_flag(
         }
     };
 
+    let note = auto_chain_repair_note(entry_point, phase, &outcome);
     if !outcome.repaired_anything() && outcome.commit_refused.is_none() {
+        // 52.1 D-22: recording GSD's own `false` is not a repair, and neither
+        // is leaving a difference DevFlow cannot attribute uncommitted. Each is
+        // said in the foreground and writes no `auto_chain_flag_repaired`
+        // event. A clean launch has no note at all.
+        if let Some(note) = note {
+            println!("{note}");
+        }
         return;
     }
 
@@ -361,19 +369,49 @@ pub(crate) fn repair_leaked_auto_chain_flag(
         }),
     );
 
+    if let Some(note) = note {
+        println!("{note}");
+    }
+    if let Some(reason) = &outcome.commit_refused {
+        println!("warning: {reason}");
+    }
+}
+
+/// The foreground `note:` line for what [`repair_leaked_auto_chain_flag`] found,
+/// or `None` when there is nothing to say. Names a killed run only when a set
+/// flag was actually cleared; a recorded `false` (52.1 D-22) says nothing leaked;
+/// a difference left uncommitted says so, and what that costs at Validate.
+fn auto_chain_repair_note(
+    entry_point: &str,
+    phase: PhaseId,
+    outcome: &gsd_config::ClearOutcome,
+) -> Option<String> {
     if outcome.repaired_anything() {
-        println!(
+        return Some(format!(
             "note: devflow {entry_point} found phase {phase}'s GSD chain flag \
              (workflow._auto_chain_active) still set — a previous run for this phase \
              was killed before it could clear it. Cleared before launching \
              (working tree: {}, this branch's tip: {})",
             repaired_word(outcome.working_tree_repaired),
             repaired_word(outcome.committed_tree_repaired),
-        );
+        ));
     }
-    if let Some(reason) = &outcome.commit_refused {
-        println!("warning: {reason}");
+    if outcome.recorded_gsd_false {
+        return Some(format!(
+            "note: devflow {entry_point} recorded GSD's workflow._auto_chain_active: false \
+             for phase {phase} in a commit (the committed config held no true flag; \
+             nothing was leaked)"
+        ));
     }
+    if outcome.left_uncommitted {
+        return Some(format!(
+            "note: devflow {entry_point} left .planning/config.json uncommitted for phase \
+             {phase}: it differs from this branch's tip and DevFlow cannot attribute the \
+             change (no copy holds a true chain flag, and the working copy holds no false \
+             to record). Validate will not record a pass until it is committed"
+        ));
+    }
+    None
 }
 
 fn repaired_word(repaired: bool) -> &'static str {
@@ -3197,6 +3235,11 @@ pub(crate) fn resume_with_fallback(
     agent: Option<AgentKind>,
     fallback_agent: Option<AgentKind>,
 ) -> Result<(), CliError> {
+    // 999.229: said first, so it prints even when the resume then refuses.
+    if let Some(warning) = devflow_core::config::external_verify_env_warning_now() {
+        eprintln!("{warning}");
+    }
+
     let _phase_holder = crate::commands::claim_foreground_holder(project_root, phase)?;
     let reserved = crate::commands::reserve_launch(
         project_root,
@@ -4237,6 +4280,207 @@ mod tests {
             repair_events(root).is_empty(),
             "a launch that found nothing to repair must write no event: {:?}",
             repair_events(root)
+        );
+    }
+
+    /// GSD's first `false` over a committed config that lacks the key is
+    /// recorded in a commit, with no repair event and no killed-run wording:
+    /// nothing leaked, so nothing may read as a killed run.
+    #[test]
+    fn recording_gsds_false_emits_no_repair_event_and_no_killed_run_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let config = root.join(".planning/config.json");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config,
+            "{\n  \"workflow\": {\n    \"auto_advance\": true\n  }\n}\n",
+        )
+        .unwrap();
+        let git = |args: &[&str]| {
+            let output = devflow_core::test_support::git_command(root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?} failed");
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        };
+        git(&["add", ".planning/config.json"]);
+        git(&[
+            "commit",
+            "-q",
+            "-m",
+            "add gsd config without the chain flag",
+        ]);
+        std::fs::write(
+            &config,
+            "{\n  \"workflow\": {\n    \"auto_advance\": true,\n    \
+             \"_auto_chain_active\": false\n  }\n}\n",
+        )
+        .unwrap();
+
+        repair_leaked_auto_chain_flag(root, root, PhaseId::new(83), "start");
+
+        assert!(
+            repair_events(root).is_empty(),
+            "recording GSD's false is not a repair and must write no repair event: {:?}",
+            repair_events(root)
+        );
+        assert_eq!(
+            git(&["log", "-1", "--format=%s"]).trim_end(),
+            "chore(gsd): record GSD's workflow._auto_chain_active: false",
+            "the launch repair must have recorded the working copy, or the absent event is vacuous"
+        );
+        let outcome = gsd_config::ClearOutcome {
+            recorded_gsd_false: true,
+            ..Default::default()
+        };
+        let note = auto_chain_repair_note("start", PhaseId::new(83), &outcome)
+            .expect("a recorded false must be announced");
+        assert!(
+            note.contains("recorded GSD's workflow._auto_chain_active: false"),
+            "the note must say what was recorded: {note}"
+        );
+        assert!(
+            !note.contains("was killed before it could clear it"),
+            "the note must not name a killed run: {note}"
+        );
+    }
+
+    /// The words only the left-uncommitted note uses.
+    const LEFT_UNCOMMITTED_NOTE: &str = "left .planning/config.json uncommitted";
+
+    /// A small GSD config in GSD's own serialization, with the chain flag
+    /// holding `flag`, or absent for `None`.
+    fn gsd_config_text(flag: Option<bool>) -> String {
+        let key = flag
+            .map(|value| format!(",\n    \"_auto_chain_active\": {value}"))
+            .unwrap_or_default();
+        format!("{{\n  \"workflow\": {{\n    \"auto_advance\": true{key}\n  }}\n}}\n")
+    }
+
+    fn git_stdout(root: &Path, args: &[&str]) -> String {
+        let output = devflow_core::test_support::git_command(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// A repository whose branch tip holds `committed` as
+    /// `.planning/config.json` and whose working copy holds `working`.
+    fn repo_with_gsd_config(committed: &str, working: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let config = root.join(".planning/config.json");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(&config, committed).unwrap();
+        git_stdout(root, &["add", ".planning/config.json"]);
+        git_stdout(root, &["commit", "-q", "-m", "add gsd config"]);
+        std::fs::write(&config, working).unwrap();
+        dir
+    }
+
+    /// The foreground note `start` prints for the row a repository is in, read
+    /// from the real outcome of the repair.
+    fn start_note_for(committed: Option<bool>, working: Option<bool>) -> Option<String> {
+        let dir = repo_with_gsd_config(&gsd_config_text(committed), &gsd_config_text(working));
+        let outcome = gsd_config::force_clear_auto_chain(dir.path()).unwrap();
+        auto_chain_repair_note("start", PhaseId::new(85), &outcome)
+    }
+
+    /// The branch tip holds GSD's `false` and the working copy lost the key.
+    /// DevFlow commits nothing (operator ruling, 2026-11-15) and writes no
+    /// repair event, and both entry points say in the foreground that the file
+    /// is left uncommitted and what that costs.
+    #[test]
+    fn a_config_change_devflow_cannot_attribute_is_left_uncommitted_and_said() {
+        let dir = repo_with_gsd_config(&gsd_config_text(Some(false)), &gsd_config_text(None));
+        let root = dir.path();
+        let head_before = git_stdout(root, &["rev-parse", "HEAD"]);
+
+        repair_leaked_auto_chain_flag(root, root, PhaseId::new(84), "start");
+
+        assert_eq!(
+            git_stdout(root, &["rev-parse", "HEAD"]),
+            head_before,
+            "the launch repair must commit nothing in this row"
+        );
+        assert_eq!(
+            git_stdout(root, &["status", "--porcelain"]),
+            " M .planning/config.json\n",
+            "the file stays modified and uncommitted"
+        );
+        assert!(
+            repair_events(root).is_empty(),
+            "nothing was repaired, so no repair event may be written: {:?}",
+            repair_events(root)
+        );
+        // The launch repair changed nothing, so asking again reads the same row.
+        let outcome = gsd_config::force_clear_auto_chain(root).unwrap();
+        for entry_point in ["start", "resume"] {
+            let note = auto_chain_repair_note(entry_point, PhaseId::new(84), &outcome)
+                .unwrap_or_else(|| {
+                    panic!("{entry_point}: a file left uncommitted must be said in the foreground")
+                });
+            assert!(
+                note.starts_with(&format!(
+                    "note: devflow {entry_point} {LEFT_UNCOMMITTED_NOTE} for phase 84"
+                )),
+                "{entry_point}: the note must name the entry point, the file and the phase: {note}"
+            );
+            assert!(
+                note.contains("DevFlow cannot attribute the change"),
+                "{entry_point}: the note must say why nothing was committed: {note}"
+            );
+            assert!(
+                note.contains("Validate will not record a pass until it is committed"),
+                "{entry_point}: the note must say what the uncommitted file costs: {note}"
+            );
+            assert!(
+                !note.contains("was killed before it could clear it"),
+                "{entry_point}: the note must not name a killed run: {note}"
+            );
+        }
+    }
+
+    /// A clean launch has no config difference, so nothing is said at all.
+    #[test]
+    fn a_clean_launch_prints_no_left_uncommitted_note() {
+        assert_eq!(start_note_for(Some(false), Some(false)), None);
+    }
+
+    /// GSD's first `false` is committed, so the note is the recording one.
+    #[test]
+    fn recording_gsds_false_prints_no_left_uncommitted_note() {
+        let note = start_note_for(None, Some(false)).expect("premise: a recorded false is said");
+
+        assert!(
+            note.contains("recorded GSD's workflow._auto_chain_active: false"),
+            "premise: this is the recording note: {note}"
+        );
+        assert!(
+            !note.contains(LEFT_UNCOMMITTED_NOTE),
+            "a recorded false leaves nothing uncommitted: {note}"
+        );
+    }
+
+    /// A leak in the working copy is repaired there, so the note is the
+    /// killed-run one.
+    #[test]
+    fn a_repaired_leak_prints_no_left_uncommitted_note() {
+        let note = start_note_for(Some(false), Some(true)).expect("premise: a repair is said");
+
+        assert!(
+            note.contains("was killed before it could clear it"),
+            "premise: this is the killed-run note: {note}"
+        );
+        assert!(
+            !note.contains(LEFT_UNCOMMITTED_NOTE),
+            "a repaired leak leaves nothing uncommitted: {note}"
         );
     }
 

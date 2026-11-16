@@ -494,6 +494,16 @@ pub enum WriteLockStatus {
 /// Read the state of the phase's write lock without waiting, for `status` and
 /// `doctor`. It creates no file. It asks for a shared lock, so two concurrent reads
 /// never report each other as the holder.
+///
+/// One reading can say [`WriteLockStatus::Held`] for a moment after the holder has
+/// released. The lock belongs to the holder's open file description, and a child
+/// that the holder's process forks from another thread while the lock is held keeps
+/// a duplicate of that descriptor, close-on-exec or not, until the child's own
+/// `exec` (999.221). That has been seen only in the multi-threaded test process,
+/// where the holder, the forking thread and the reader are one process. `status`
+/// and `doctor` take one reading in a short-lived process, and the line they print
+/// says how to judge a single reading, so nothing here waits or retries. A caller
+/// that needs the released state polls this read with a bound.
 pub fn write_lock_status(
     project_root: &Path,
     phase: PhaseId,
