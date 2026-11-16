@@ -137,3 +137,13 @@ What was run, on the real program with stand-in agents, in the throwaway worktre
 
 Not yet decided: how Phase 52.1 is closed (plans 01 to 07 kept, 08 to 14 dropped) and when the conversion phase
 is opened.
+
+### Double check before proceeding (same day)
+
+- The user service was then run with the real program (two more `spike_*` tests, one run each): started with
+  `systemd-run --user -p KillMode=control-group`, SIGKILL of the main process left no member of the agent's group
+  and the unit read inactive; `systemctl --user stop` ended the agent's group and the stop was recorded.
+- Correction to "drop plans 08 to 14": read by objective, only plan 08 exists solely for the detached supervisor.
+  Plans 09 to 12 and 15 carry operator decisions that do not depend on the runner (D-11 remove `--force` from
+  `start` and `cleanup`, D-09.1 `start` only on a new phase, D-09.5, D-24, D-27), and 13 and 14 are the phase
+  goal's proof run (D-15). They need replanning against the foreground runner, not dropping.
