@@ -147,3 +147,13 @@ is opened.
   Plans 09 to 12 and 15 carry operator decisions that do not depend on the runner (D-11 remove `--force` from
   `start` and `cleanup`, D-09.1 `start` only on a new phase, D-09.5, D-24, D-27), and 13 and 14 are the phase
   goal's proof run (D-15). They need replanning against the foreground runner, not dropping.
+
+### Carried out (same day, on the operator's word)
+
+- Phase 52.1 closed at plan 07: plans 08 to 15 moved to `.planning/phases/52.2-foreground-runner/carried-from-52.1/`,
+  the code merged to `develop` as PR #237 (`scripts/check.sh all`, the container gate and CI all passed on it).
+- Phase 52.2, Foreground Runner, inserted after 52; Phase 53 now depends on it.
+- GSD does not mark 52.1 complete: `phase complete` requires a verification report and none was written (the
+  verifier was not run, to save its cost; Phase 52 sits in the same state). `current_phase` in STATE.md therefore
+  still reads 52.1 until Phase 52.2 is started.
+- Next step, not started: `/gsd-discuss-phase 52.2`.
