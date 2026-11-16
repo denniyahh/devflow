@@ -58,8 +58,9 @@ replies (Telegram and similar) are a later milestone (REMOTE-01/02 under `REQUIR
 | Phase | Name | Requirements | Depends on | Status |
 |---|---|---|---|---|
 | 52 | Subtract and Stabilize | CUT-01, CUT-02, CUT-03, CUT-04, GATE-01, GATE-02, GATE-03, GATE-04, OPS-01, OPS-02, OPS-03, OPS-04 | — (Phase 51, v3.0.0, merged) | Executed — verification stale |
-| 52.1 | Stabilize for Dogfooding (INSERTED) | backlog 999.221, 999.222, 999.223, 999.232, 999.224, 999.219, 999.229, 999.230, 999.231, 999.167 (no REQ IDs; plans bind to D-01..D-27) | 52 | Planned — 15 plans, none executed |
-| 53 | The Question Channel | ASK-01, ASK-02, ASK-03, ASK-04, ASK-05 | 52.1 (and through it 52 — the stage set must be final) | Not started |
+| 52.1 | Stabilize for Dogfooding (INSERTED) | backlog 999.221, 999.222, 999.223, 999.232, 999.224, 999.219, 999.229, 999.230, 999.231, 999.167 (no REQ IDs; plans bind to D-01..D-27) | 52 | Executed — closed at plan 07 |
+| 52.2 | Foreground Runner (INSERTED) | none (carries 52.1's D-11, D-09.1, D-09.5, D-20, D-24, D-26, D-27, D-08, D-15) | 52.1 | Not started |
+| 53 | The Question Channel | ASK-01, ASK-02, ASK-03, ASK-04, ASK-05 | 52.2 (and through it 52.1 and 52 — the stage set must be final) | Not started |
 | 54 | Decision Triage | TRIAGE-01, TRIAGE-02, TRIAGE-03, TRIAGE-04 | 53 (its recorded questions are the bake-off corpus) | Not started |
 | 55 | Failover Generalized | FAIL-01, FAIL-02, FAIL-03, FAIL-04, FAIL-05, FAIL-06 | 52 (independent of 53-54; sequenced last) | Not started |
 
@@ -174,7 +175,11 @@ Validate without hand-run stages or hand-edited state. Not dogfooded itself (ope
 999.219, 999.229, 999.230, 999.231 and 999.167 (close-out scripts; 999.167 folds into D-12). This phase carries no REQ
 IDs from `REQUIREMENTS.md` — its plans bind to its own decisions, D-01..D-27 in `52.1-CONTEXT.md`.
 **Depends on:** Phase 52
-**Plans:** 7/15 plans executed
+**Closed at plan 07 (operator, 2026-11-15):** the foreground runner replaces the detached supervisor, so plans 08
+to 15 moved to Phase 52.2 for replanning, and the goal's proof run moves with them. Delivered here: the test-flake
+fixes, truthful launch lines, the close-out script fixes, the proof-run fixture, the push-time divergence check and
+`discard`.
+**Plans:** 7/7 plans executed
 
 Plans:
 **Wave 1**
@@ -190,29 +195,22 @@ Plans:
 **Wave 3** *(blocked on Wave 2 completion)*
 - [x] 52.1-07-PLAN.md
 
-**Wave 4** *(blocked on Wave 3 completion)*
-- [ ] 52.1-08-PLAN.md
+### Phase 52.2: Foreground Runner (INSERTED)
 
-**Wave 5** *(blocked on Wave 4 completion)*
-- [ ] 52.1-09-PLAN.md
+**Goal:** Each stage runs in the foreground of the command that started it, and the detached supervisor and the
+liveness machinery that exists only for it are removed; a long run is started as a user service
+(`systemd-run --user`), which is what covers a hard kill of the runner (operator decisions, 2026-11-15). Then the
+decisions carried from Phase 52.1 are built on the simpler runner, and the phase ends with 52.1's proof: a
+supervised run drives a phase from Plan to a finished Validate without hand-run stages or hand-edited state.
+**Requirements**: no REQ IDs. Carried from Phase 52.1 (its plans 09 to 15, kept for reference in
+`carried-from-52.1/`, to be replanned, not executed as written): D-11, D-09.1, D-09.5, D-20, D-24, D-26, D-27,
+D-08 and D-15 in `52.1-CONTEXT.md`. Plan 08 (D-21, an exit for an unprobeable supervisor) has no object once the
+supervisor is gone. Evidence and spike results: `.planning/audits/2026-11-15-new-direction-brief.md`.
+**Depends on:** Phase 52.1
+**Plans:** 0 plans
 
-**Wave 6** *(blocked on Wave 5 completion)*
-- [ ] 52.1-10-PLAN.md
-
-**Wave 7** *(blocked on Wave 6 completion)*
-- [ ] 52.1-15-PLAN.md
-
-**Wave 8** *(blocked on Wave 7 completion)*
-- [ ] 52.1-11-PLAN.md
-
-**Wave 9** *(blocked on Wave 8 completion)*
-- [ ] 52.1-12-PLAN.md
-
-**Wave 10** *(blocked on Wave 9 completion)*
-- [ ] 52.1-13-PLAN.md
-
-**Wave 11** *(blocked on Wave 10 completion)*
-- [ ] 52.1-14-PLAN.md
+Plans:
+- [ ] TBD (run /gsd-plan-phase 52.2 to break down)
 
 ### Phase 53: The Question Channel
 
@@ -222,8 +220,8 @@ agent in the same session. The one policy this phase ships, "operator via gate",
 operator answers from the shell, with the notify hook firing as for any gate. Every stage prompt sends decision
 checkpoints, `blocking-human` gates and GSD discuss questions through the tool, and every question and answer is on
 the event log.
-**Depends on**: Phase 52.1 (and through it Phase 52) — the stage set must be final before every stage prompt is rewritten (ASK-03), and the
-checkpoint auto-decide relaunch that ASK-05 replaces is only worth replacing on the cut tree. Phase 52.1 must make DevFlow
+**Depends on**: Phase 52.2 (and through it Phases 52.1 and 52) — the stage set must be final before every stage prompt is rewritten (ASK-03), and the
+checkpoint auto-decide relaunch that ASK-05 replaces is only worth replacing on the cut tree. Phase 52.2 must make DevFlow
 stable enough to dogfood this phase (operator, 2026-11-11).
 **Sequencing note**: The first unknown of the milestone lives here: how each supported agent consumes an MCP tool
 (stdio server registration, tool discovery, blocking-call semantics). It is a spike in this phase's discuss step
@@ -492,7 +490,8 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 50.1 | 30/30 | Complete | 2026-11-02 |
 | 51 | 13/13 | Complete | 2026-11-08 |
 | 52 | 33/33 | Executed — verification stale | 2026-11-11 |
-| 52.1 | 7/15 | In Progress | — |
+| 52.1 | 7/7 | Executed — closed at plan 07 (operator, 2026-11-15) | 2026-11-15 |
+| 52.2 | 0/? | Not started | — |
 | 53 | 0/? | Not started | — |
 | 54 | 0/? | Not started | — |
 | 55 | 0/? | Not started | — |

@@ -6,12 +6,12 @@ current_phase: "52.1"
 current_phase_name: Stabilize for Dogfooding
 status: executing
 stopped_at: Completed 52.1-07-PLAN.md
-last_updated: "2026-11-15T22:46:22.164Z"
+last_updated: "2026-11-16T00:16:41.019Z"
 last_activity: 2026-11-14
 last_activity_desc: Phase 52.1 execution started
-state_head: 591efe54623fffdde7179019e666638a64ae5901
+state_head: 561f8b9514d221a66a9b88948257984141d18308
 progress:
-  total_phases: 5
+  total_phases: 6
   completed_phases: 0
   total_plans: 48
   completed_plans: 40
@@ -1116,3 +1116,4 @@ None pending in `.planning/todos/pending/` (the two phase-48 merge-back todos cl
 - Phase 52.1 inserted after Phase 52: Stabilize for Dogfooding: make DevFlow stable enough to resume dogfooding; not dogfooded itself (operator 2026-11-11) (URGENT)
 - Phase 52.1 edited: edited fields: goal, candidate scope
 - Phase 53 edited: edited fields: depends_on (now Phase 52.1)
+- Phase 52.2 inserted after Phase 52: Foreground runner replaces the detached supervisor (operator, 2026-11-15); carries Phase 52.1 plans 09-15, which are replanned there (URGENT)
