@@ -110,3 +110,30 @@ All in `~/.config/agents/RULES-CHANGELOG.md`. The ones that change behaviour:
 - Agent hooks belong to WSX, not DevFlow; a research brief is in `~/Github/wsx/.planning/research/`.
 - Queued for after the phase and now unscheduled: the first `harness-retro`, the worktree-isolation trial, the
   codebase-map refresh, the MemPalace re-file.
+
+## Decisions and spike results (2026-11-15, later the same day)
+
+Operator decisions:
+
+- The foreground runner is the direction. The detached supervisor goes.
+- The hard-kill case is covered by running a long run as a user service (`systemd-run --user`), not by an
+  in-process guard.
+
+What was run, on the real program with stand-in agents, in the throwaway worktree `.worktrees/spike-foreground`
+(branch `spike/foreground-runner`, uncommitted, never to be merged; five tests named `spike_*` in
+`crates/devflow-cli/tests/supervisor_e2e.rs`, one run each):
+
+- Plan, Code and Validate ran to a finished run inside one `start`, in the Claude launch shape, with no background
+  process.
+- A Validate gate was answered by a separate `devflow gate approve` process while `start` waited, and the run
+  finished.
+- SIGINT to the runner's process group ended the agent's group and `start` exited. The stop is recorded only by
+  code the spike added: `record_supervisor_stop` writes nothing without a supervisor record.
+- SIGKILL of the runner left the agent's group running; `status` reported it. After the test ended the orphan,
+  `resume` ran to finished. `resume` with the orphan still alive was not run.
+- With `PR_SET_PDEATHSIG` on the agent, SIGKILL of the runner ended the agent but not the agent's child. That is
+  why the in-process guard was rejected.
+- The user-service result is from the stand-in experiment recorded in the complexity review, not from DevFlow.
+
+Not yet decided: how Phase 52.1 is closed (plans 01 to 07 kept, 08 to 14 dropped) and when the conversion phase
+is opened.
