@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 #
 # Scaffold a throwaway git repository that is a legal `devflow start`
-# target — for probing the Define->Ship pipeline (phase 23a) without
+# target — for running the Plan->Code->Validate pipeline without
 # touching this checkout's own working tree or git state (D-01
 # blast-radius isolation, T-23-01/T-23-02).
+#
+# The default mode is the v4 proof-run fixture (Phase 52.1, D-15): the
+# cheapest project a supervised run can carry through Plan, Code and Validate
+# to a finished run on a clean tree.
 #
 # Scaffolding decision (Claude's Discretion item #2, recorded in
 # 23-CONTEXT.md / 23-01-PLAN.md "Recorded planning choices"): the probe
@@ -21,17 +25,24 @@
 #     be `### Phase N:` — three hashes — to satisfy the reachability guard in
 #     `preflight.rs`, and the current preflight also requires a minimal
 #     `.planning/config.json` so the 35.1 unattended-launch chain-flag
-#     prerequisite has somewhere to hold `workflow._auto_chain_active`)
-#   - one phase directory carrying a trivial, already-written plan, so
-#     Define/Plan have a real target instead of inventing scope
+#     prerequisite has somewhere to hold `workflow._auto_chain_active`; the
+#     default mode commits that key as false, in GSD's own serialization, with
+#     the stage-gate keys whose reasons sit above its writer)
+#   - one phase directory carrying a trivial, already-written plan with no
+#     `checkpoint:*` task, so Plan has a real target instead of inventing
+#     scope, and a pre-written `01-VALIDATION.md` mapping the plan's one
+#     behaviour to its automated check, so Validate finds a complete map
 #
 # Branch names below are hardcoded to "main"/"develop" — verified against
 # `crates/devflow-core/src/config.rs:15,17`
 # (`pub const MAIN: &str = "main";` / `pub const DEVELOP: &str = "develop";`)
 # at plan time, not re-read live by this script.
 #
-# The default mode's output is also the Phase 49 negative arm's fixture
-# (D-14/D-25), so it must stay byte-identical: `--selftest` pins its tree hash.
+# History: this script was written for phase 23a, to probe the 3.x
+# Define->Ship pipeline, and its default mode later served as the Phase 49
+# negative arm's fixture (D-14/D-25). v4 has neither stage, and the default
+# mode is now the v4 proof fixture. `--selftest` pins its tree; re-measure
+# `DEFAULT_TREE` when you change it.
 #
 # `--live-payload` (Phase 49, D-20): the disposable project for the
 # milestone's live unattended run — again a SYNTHETIC single-task phase, for
@@ -54,7 +65,7 @@
 #
 # WHAT `--check` DOES NOT ESTABLISH: it proves the layout and config values
 # above and the installed GSD's hook resolution, read-only. It does NOT prove
-# DevFlow's live preflight, agent behavior, gate recovery or Ship completion.
+# DevFlow's live preflight, agent behavior, gate recovery or a finished run.
 #
 # Usage:
 #   scripts/scratch-dogfood-repo.sh [destination]
@@ -258,11 +269,12 @@ st_control_head_on_main() {
     case_ok "$name"
 }
 
-# The negative arm's fixture (D-14/D-25) is pinned by content: tree hashes
-# carry no timestamps, so they are deterministic where commit SHAs are not.
-# Measured at bc73b1b and re-measured at aaad4b9; one appended byte to
-# config.json gives 8ffe954e… instead.
-DEFAULT_TREE=f6120b337cb9b37d658c6111b7ac14694338dc56
+# The default fixture is pinned by content: tree hashes carry no timestamps,
+# so they are deterministic where commit SHAs are not.
+# Re-measured 2026-11-15 for the GSD-serialized config and the pre-written
+# 01-VALIDATION.md (Phase 52.1, D-15); one appended byte to config.json gives
+# c5b1f181… instead.
+DEFAULT_TREE=59948ed7026f3adffc3c88246bcd5ca2dffa54cc
 
 st_default_tree() {
     local name="default mode: tree hash unchanged"
@@ -296,6 +308,105 @@ st_default_branches() {
     fi
     if [ "$refs" != "refs/heads/develop refs/heads/main " ]; then
         case_fail "$name" "local branches are '$refs', want exactly develop and main"
+        return
+    fi
+    case_ok "$name"
+}
+
+# st_default_chain_flag <config.json>: one case line. Read with `jq -e`, so an
+# absent key (null) fails rather than reading as false.
+st_default_chain_flag() {
+    local name="default: config.json carries _auto_chain_active false"
+    if jq -e '.workflow._auto_chain_active == false' "$1" >/dev/null 2>&1; then
+        case_ok "$name"
+    else
+        case_fail "$name" "workflow._auto_chain_active is absent or not false in $1"
+    fi
+}
+
+st_default_config() {
+    local cfg="$ST_TMP/dflt/.planning/config.json"
+    st_default_chain_flag "$cfg"
+    if cmp -s <(jq --indent 2 . "$cfg" 2>/dev/null) "$cfg"; then
+        case_ok "default: config.json is in GSD's serialization"
+    else
+        case_fail "default: config.json is in GSD's serialization" \
+            "bytes differ from jq --indent 2 of the file (or it is not JSON)"
+    fi
+    if jq -e '.workflow.code_review == false and .model_profile == "budget"' "$cfg" >/dev/null 2>&1; then
+        case_ok "default: config.json keeps the proof run cheap"
+    else
+        case_fail "default: config.json keeps the proof run cheap" \
+            "workflow.code_review is not false or model_profile is not budget"
+    fi
+}
+
+st_control_default_no_chain_flag() {
+    local name="control: a default config without the chain-flag key fails"
+    local cfg="$ST_TMP/dflt/.planning/config.json" mutated="$ST_TMP/nokey.json" out="$ST_TMP/nokey.out"
+    if ! jq --indent 2 'del(.workflow._auto_chain_active)' "$cfg" >"$mutated" 2>/dev/null ||
+        ! jq -e '(.workflow | type) == "object" and (.workflow | has("_auto_chain_active") | not)' \
+            "$mutated" >/dev/null 2>&1; then
+        case_fail "$name" "precondition: could not write a copy of the default config without the key"
+        return
+    fi
+    # In a subshell: the case line is captured and stays out of the totals.
+    (st_default_chain_flag "$mutated") >"$out" 2>&1
+    if [ "$(st_count '  FAIL default: config.json carries _auto_chain_active false' "$out")" -eq 1 ] &&
+        [ "$(wc -l <"$out")" -eq 1 ]; then
+        case_ok "$name"
+    else
+        case_fail "$name" "the chain-flag case did not print exactly its own FAIL line for a key-absent config"
+    fi
+}
+
+st_default_hook_controls() {
+    local name="control: a default config without schema_drift_gate activates the drift wave gate"
+    local dflt="$ST_TMP/dflt" copy="$ST_TMP/dflt-nodrift" wave rc=0
+    wave="$(hook_count "$dflt" execute:wave:post '["ui","drift"]')" || rc=1
+    if [ "$rc" -eq 0 ] && [ "$wave" -eq 0 ]; then
+        case_ok "default: GSD resolves no ui or drift wave gate"
+    else
+        case_fail "default: GSD resolves no ui or drift wave gate" "probe failed or a ui or drift hook resolved"
+    fi
+    if [ ! -d "$dflt/.git" ]; then
+        case_fail "$name" "precondition: no default scaffold at $dflt"
+        return
+    fi
+    cp -a "$dflt" "$copy"
+    if ! jq --indent 2 'del(.workflow.schema_drift_gate)' "$dflt/.planning/config.json" \
+        >"$copy/.planning/config.json" 2>/dev/null ||
+        ! jq -e '(.workflow | type) == "object" and (.workflow | has("schema_drift_gate") | not)' \
+            "$copy/.planning/config.json" >/dev/null 2>&1; then
+        case_fail "$name" "precondition: could not write the copy's config without schema_drift_gate"
+        return
+    fi
+    rc=0
+    wave="$(hook_count "$copy" execute:wave:post '["drift"]')" || rc=1
+    if [ "$rc" -eq 0 ] && [ "$wave" -gt 0 ]; then
+        case_ok "$name"
+    else
+        case_fail "$name" "probe failed or no drift hook resolved"
+    fi
+}
+
+st_default_validation() {
+    local name="default: scaffold has 01-VALIDATION.md"
+    local rel=".planning/phases/01-add-probe-marker" phase cmd
+    phase="$ST_TMP/dflt/$rel"
+    if ! git -C "$ST_TMP/dflt" cat-file -e "develop:$rel/01-VALIDATION.md" 2>/dev/null; then
+        case_fail "$name" "01-VALIDATION.md is not committed on develop"
+        return
+    fi
+    if ! rg -qxF -e 'nyquist_compliant: true' -- "$phase/01-VALIDATION.md"; then
+        case_fail "$name" "no line exactly 'nyquist_compliant: true'"
+        return
+    fi
+    # The map's one row must name the plan's own automated check, read from the plan.
+    cmd="$(sed -n 's|^ *<automated>\(.*\)</automated>$|\1|p' "$phase/01-01-PLAN.md")"
+    if [ -z "$cmd" ] || [ "$(st_count "| 01-01-01 | 01 | 1 | — | — | N/A | smoke | \`$cmd\` |" \
+        "$phase/01-VALIDATION.md")" -ne 1 ]; then
+        case_fail "$name" "the map has no 01-01-01 row naming the plan's <automated> command"
         return
     fi
     case_ok "$name"
@@ -537,6 +648,10 @@ run_selftest() {
     st_control_compact_config
     st_control_head_on_main
     st_default_tree
+    st_default_config
+    st_control_default_no_chain_flag
+    st_default_hook_controls
+    st_default_validation
     st_default_branches
     st_guard_probe "control: refuses a destination inside this checkout" "$REPO_ROOT"
     # The main checkout, computed here independently of the guard's own
@@ -1143,8 +1258,8 @@ cat > "$DEST_ABS/.planning/PROJECT.md" <<'EOF'
 
 A throwaway, single-purpose scratch repository scaffolded by
 `scripts/scratch-dogfood-repo.sh` (DevFlow phase 23a) solely to give
-`devflow start --phase 1` a legal, isolated target for probing the
-Define->Ship pipeline mechanism. Nothing in this repo is meant to be kept.
+`devflow start --phase 1` a legal, isolated target for running the
+Plan->Code->Validate pipeline. Nothing in this repo is meant to be kept.
 
 ## Core Value
 
@@ -1156,7 +1271,7 @@ build anything real.
 ### Active
 
 - Phase 1: add a one-line marker file (`PROBE.md`) — deliberately trivial
-  so Define/Plan exercise the pipeline, not the work.
+  so Plan, Code and Validate exercise the pipeline, not the work.
 EOF
 
 cat > "$DEST_ABS/.planning/ROADMAP.md" <<'EOF'
@@ -1165,7 +1280,7 @@ cat > "$DEST_ABS/.planning/ROADMAP.md" <<'EOF'
 ### Phase 1: Add PROBE marker file
 
 Goal: create `PROBE.md` at the repo root containing exactly one line,
-proving the pipeline can carry a trivial change from Define through Ship.
+proving the pipeline can carry a trivial change from Plan through Validate.
 
 Status: not started
 EOF
@@ -1183,7 +1298,7 @@ status: planned
 ## Active Phase
 
 Phase 1 — Add PROBE marker file. Plan 01-01 is pre-written (see
-`.planning/phases/01-add-probe-marker/01-01-PLAN.md`) so Define/Plan have
+`.planning/phases/01-add-probe-marker/01-01-PLAN.md`) so Plan has
 a real artifact to work against rather than inventing scope during a
 probe.
 
@@ -1208,7 +1323,7 @@ autonomous: true
 
 <objective>
 Create `PROBE.md` containing exactly one line, proving DevFlow's
-Define->Ship pipeline can carry a trivial change end-to-end. This is a
+Plan->Code->Validate pipeline can carry a trivial change end-to-end. This is a
 throwaway scratch repo (scripts/scratch-dogfood-repo.sh) — the change
 itself has no value beyond exercising the pipeline mechanism.
 </objective>
@@ -1248,9 +1363,129 @@ Create `.planning/phases/01-add-probe-marker/01-01-SUMMARY.md` when done.
 </output>
 EOF
 
+# Pre-written so /gsd-validate-phase audits an existing, complete map instead
+# of reconstructing one, which can end in a question a headless run cannot
+# answer. Assumed, not yet shown by a live run (Phase 52.1 research, A3). The
+# command is the plan's own `<automated>` check; `--selftest` compares the two.
+cat > "$DEST_ABS/.planning/phases/01-add-probe-marker/01-VALIDATION.md" <<'EOF_VALIDATION'
+---
+phase: "01"
+slug: "add-probe-marker"
+status: validated
+nyquist_compliant: true
+wave_0_complete: true
+created: "2026-11-15"
+---
+
+# Phase 01 — Validation Strategy
+
+> Per-phase validation contract for feedback sampling during execution.
+
+---
+
+## Test Infrastructure
+
+| Property | Value |
+|----------|-------|
+| **Framework** | none (POSIX shell `test`) |
+| **Config file** | none |
+| **Quick run command** | `test "$(cat PROBE.md)" = "probe ok" && echo PROBE_OK` |
+| **Full suite command** | `test "$(cat PROBE.md)" = "probe ok" && echo PROBE_OK` |
+| **Estimated runtime** | under 1 second |
+
+---
+
+## Sampling Rate
+
+- **After every task commit:** Run `test "$(cat PROBE.md)" = "probe ok" && echo PROBE_OK`
+- **After every plan wave:** Run `test "$(cat PROBE.md)" = "probe ok" && echo PROBE_OK`
+- **Before `/gsd-verify-work`:** Full suite must be green
+- **Max feedback latency:** 1 second
+
+---
+
+## Per-Task Verification Map
+
+| Task ID | Plan | Wave | Requirement | Threat Ref | Secure Behavior | Test Type | Automated Command | File Exists | Status |
+|---------|------|------|-------------|------------|-----------------|-----------|-------------------|-------------|--------|
+| 01-01-01 | 01 | 1 | — | — | N/A | smoke | `test "$(cat PROBE.md)" = "probe ok" && echo PROBE_OK` | n/a (inline command) | ⬜ pending |
+
+*Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky*
+
+Behaviour covered: `PROBE.md` exists at the repository root and holds exactly `probe ok` (plan 01-01, task 1). The
+phase has no requirement IDs.
+
+---
+
+## Wave 0 Requirements
+
+None. The check is the shell command in the plan's `<verify>`; there is no test file to create and no framework to
+install.
+
+---
+
+## Manual-Only Verifications
+
+All phase behaviors have automated verification.
+
+---
+
+## Validation Sign-Off
+
+- [x] All tasks have `<automated>` verify or Wave 0 dependencies
+- [x] Sampling continuity: no 3 consecutive tasks without automated verify
+- [x] Wave 0 covers all MISSING references
+- [x] No watch-mode flags
+- [x] Feedback latency < 1s
+- [x] `nyquist_compliant: true` set in frontmatter
+
+**Approval:** pre-written by `scripts/scratch-dogfood-repo.sh`; the map was complete before execution.
+EOF_VALIDATION
+
+# Written as GSD itself serializes it (`JSON.stringify(config, null, 2)` plus
+# one newline, which `jq --indent 2 .` reproduces for objects, strings and
+# booleans), with `_auto_chain_active` present and false, so GSD's own
+# `config-set workflow._auto_chain_active false` rewrites the file to the same
+# bytes and leaves the tree clean for Validate. Measured against GSD 1.21.0 on
+# 2026-11-15 (first probed on 1.20.1): key present in this layout stays clean,
+# key absent goes ` M .planning/config.json`.
+# The `workflow` object is the `--live-payload` config's, key for key, with one
+# value changed (`code_review`). Non-default keys, one reason each:
+# `auto_mode` false: the ephemeral chain flag stays the only auto-approval path.
+# `security_enforcement` false: removes the `verify:post` secure-phase hook GSD activates by default.
+# `verifier` true: keeps Code's verifier writing `01-VERIFICATION.md`, whose `passed` status a finish reads.
+# `nyquist_validation` true: keeps the Validate stage doing real work.
+# `ui_phase`/`ui_safety_gate`/`ui_review`/`schema_drift_gate` false: remove default-active wave gates.
+# `code_review` false, `model_profile` budget: the proof run tests the pipeline, not review, so it stays cheap.
+# `tdd_mode`/`research`/`plan_check` false: the live payload's values; no extra GSD steps on a one-line plan.
+# `use_worktrees` false: no nested executor worktrees inside DevFlow's phase worktree.
+# `git.branching_strategy` none: GSD stays on the branch DevFlow created.
+# `git.base_branch` develop: this scaffold's DevFlow base; it has no remote, so GSD cannot read origin/HEAD.
 cat > "$DEST_ABS/.planning/config.json" <<'EOF'
 {
-  "workflow": {}
+  "commit_docs": true,
+  "parallelization": false,
+  "workflow": {
+    "auto_mode": false,
+    "_auto_chain_active": false,
+    "verifier": true,
+    "nyquist_validation": true,
+    "security_enforcement": false,
+    "ui_phase": false,
+    "ui_safety_gate": false,
+    "ui_review": false,
+    "schema_drift_gate": false,
+    "code_review": false,
+    "tdd_mode": false,
+    "use_worktrees": false,
+    "research": false,
+    "plan_check": false
+  },
+  "git": {
+    "branching_strategy": "none",
+    "base_branch": "develop"
+  },
+  "model_profile": "budget"
 }
 EOF
 
@@ -1260,4 +1495,4 @@ git -C "$DEST_ABS" branch develop
 git -C "$DEST_ABS" checkout -q develop
 
 echo "Scaffolded devflow probe target: $DEST_ABS"
-echo "Next: devflow start --phase 1 --agent claude --mode auto $DEST_ABS"
+echo "Next: devflow start --phase 1 --agent claude --mode supervise $DEST_ABS"

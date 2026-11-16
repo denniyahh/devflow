@@ -58,8 +58,9 @@ replies (Telegram and similar) are a later milestone (REMOTE-01/02 under `REQUIR
 | Phase | Name | Requirements | Depends on | Status |
 |---|---|---|---|---|
 | 52 | Subtract and Stabilize | CUT-01, CUT-02, CUT-03, CUT-04, GATE-01, GATE-02, GATE-03, GATE-04, OPS-01, OPS-02, OPS-03, OPS-04 | — (Phase 51, v3.0.0, merged) | Executed — verification stale |
-| 52.1 | Stabilize for Dogfooding (INSERTED) | backlog 999.221, 999.222, 999.223, 999.232, 999.224, 999.219, 999.229, 999.230, 999.231, 999.167 (no REQ IDs; plans bind to D-01..D-27) | 52 | Planned — 15 plans, none executed |
-| 53 | The Question Channel | ASK-01, ASK-02, ASK-03, ASK-04, ASK-05 | 52.1 (and through it 52 — the stage set must be final) | Not started |
+| 52.1 | Stabilize for Dogfooding (INSERTED) | backlog 999.221, 999.222, 999.223, 999.232, 999.224, 999.219, 999.229, 999.230, 999.231, 999.167 (no REQ IDs; plans bind to D-01..D-27) | 52 | Executed — closed at plan 07 |
+| 52.2 | Foreground Runner (INSERTED) | none (carries 52.1's D-11, D-09.1, D-09.5, D-20, D-24, D-26, D-27, D-08, D-15) | 52.1 | Not started |
+| 53 | The Question Channel | ASK-01, ASK-02, ASK-03, ASK-04, ASK-05 | 52.2 (and through it 52.1 and 52 — the stage set must be final) | Not started |
 | 54 | Decision Triage | TRIAGE-01, TRIAGE-02, TRIAGE-03, TRIAGE-04 | 53 (its recorded questions are the bake-off corpus) | Not started |
 | 55 | Failover Generalized | FAIL-01, FAIL-02, FAIL-03, FAIL-04, FAIL-05, FAIL-06 | 52 (independent of 53-54; sequenced last) | Not started |
 
@@ -174,45 +175,42 @@ Validate without hand-run stages or hand-edited state. Not dogfooded itself (ope
 999.219, 999.229, 999.230, 999.231 and 999.167 (close-out scripts; 999.167 folds into D-12). This phase carries no REQ
 IDs from `REQUIREMENTS.md` — its plans bind to its own decisions, D-01..D-27 in `52.1-CONTEXT.md`.
 **Depends on:** Phase 52
-**Plans:** 15 plans
+**Closed at plan 07 (operator, 2026-11-15):** the foreground runner replaces the detached supervisor, so plans 08
+to 15 moved to Phase 52.2 for replanning, and the goal's proof run moves with them. Delivered here: the test-flake
+fixes, truthful launch lines, the close-out script fixes, the proof-run fixture, the push-time divergence check and
+`discard`.
+**Plans:** 7/7 plans executed
 
 Plans:
 **Wave 1**
-- [ ] 52.1-01-PLAN.md
-- [ ] 52.1-02-PLAN.md
-- [ ] 52.1-03-PLAN.md
-- [ ] 52.1-05-PLAN.md
+- [x] 52.1-01-PLAN.md
+- [x] 52.1-02-PLAN.md
+- [x] 52.1-03-PLAN.md
+- [x] 52.1-05-PLAN.md
 
 **Wave 2** *(blocked on Wave 1 completion)*
-- [ ] 52.1-04-PLAN.md
-- [ ] 52.1-06-PLAN.md
+- [x] 52.1-04-PLAN.md
+- [x] 52.1-06-PLAN.md
 
 **Wave 3** *(blocked on Wave 2 completion)*
-- [ ] 52.1-07-PLAN.md
+- [x] 52.1-07-PLAN.md
 
-**Wave 4** *(blocked on Wave 3 completion)*
-- [ ] 52.1-08-PLAN.md
+### Phase 52.2: Foreground Runner (INSERTED)
 
-**Wave 5** *(blocked on Wave 4 completion)*
-- [ ] 52.1-09-PLAN.md
+**Goal:** Each stage runs in the foreground of the command that started it, and the detached supervisor and the
+liveness machinery that exists only for it are removed; a long run is started as a user service
+(`systemd-run --user`), which is what covers a hard kill of the runner (operator decisions, 2026-11-15). Then the
+decisions carried from Phase 52.1 are built on the simpler runner, and the phase ends with 52.1's proof: a
+supervised run drives a phase from Plan to a finished Validate without hand-run stages or hand-edited state.
+**Requirements**: no REQ IDs. Carried from Phase 52.1 (its plans 09 to 15, kept for reference in
+`carried-from-52.1/`, to be replanned, not executed as written): D-11, D-09.1, D-09.5, D-20, D-24, D-26, D-27,
+D-08 and D-15 in `52.1-CONTEXT.md`. Plan 08 (D-21, an exit for an unprobeable supervisor) has no object once the
+supervisor is gone. Evidence and spike results: `.planning/audits/2026-11-15-new-direction-brief.md`.
+**Depends on:** Phase 52.1
+**Plans:** 0 plans
 
-**Wave 6** *(blocked on Wave 5 completion)*
-- [ ] 52.1-10-PLAN.md
-
-**Wave 7** *(blocked on Wave 6 completion)*
-- [ ] 52.1-15-PLAN.md
-
-**Wave 8** *(blocked on Wave 7 completion)*
-- [ ] 52.1-11-PLAN.md
-
-**Wave 9** *(blocked on Wave 8 completion)*
-- [ ] 52.1-12-PLAN.md
-
-**Wave 10** *(blocked on Wave 9 completion)*
-- [ ] 52.1-13-PLAN.md
-
-**Wave 11** *(blocked on Wave 10 completion)*
-- [ ] 52.1-14-PLAN.md
+Plans:
+- [ ] TBD (run /gsd-plan-phase 52.2 to break down)
 
 ### Phase 53: The Question Channel
 
@@ -222,8 +220,8 @@ agent in the same session. The one policy this phase ships, "operator via gate",
 operator answers from the shell, with the notify hook firing as for any gate. Every stage prompt sends decision
 checkpoints, `blocking-human` gates and GSD discuss questions through the tool, and every question and answer is on
 the event log.
-**Depends on**: Phase 52.1 (and through it Phase 52) — the stage set must be final before every stage prompt is rewritten (ASK-03), and the
-checkpoint auto-decide relaunch that ASK-05 replaces is only worth replacing on the cut tree. Phase 52.1 must make DevFlow
+**Depends on**: Phase 52.2 (and through it Phases 52.1 and 52) — the stage set must be final before every stage prompt is rewritten (ASK-03), and the
+checkpoint auto-decide relaunch that ASK-05 replaces is only worth replacing on the cut tree. Phase 52.2 must make DevFlow
 stable enough to dogfood this phase (operator, 2026-11-11).
 **Sequencing note**: The first unknown of the milestone lives here: how each supported agent consumes an MCP tool
 (stdio server registration, tool discovery, blocking-call semantics). It is a spike in this phase's discuss step
@@ -492,7 +490,8 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 50.1 | 30/30 | Complete | 2026-11-02 |
 | 51 | 13/13 | Complete | 2026-11-08 |
 | 52 | 33/33 | Executed — verification stale | 2026-11-11 |
-| 52.1 | 0/15 | Planned | — |
+| 52.1 | 7/7 | Executed — closed at plan 07 (operator, 2026-11-15) | 2026-11-15 |
+| 52.2 | 0/? | Not started | — |
 | 53 | 0/? | Not started | — |
 | 54 | 0/? | Not started | — |
 | 55 | 0/? | Not started | — |
@@ -722,6 +721,88 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
+
+### Phase 999.236: `write_lock_status_reads_free_held_and_the_recorded_holder` Polls an Exclusive Probe, Then Reads Once (BACKLOG)
+
+**Found:** 2026-11-15, Phase 52.1 plan 52.1-06 (research for 999.221), by reading the test source. Not found by a
+failing run.
+**Defect:** `workflow::tests::write_lock_status_reads_free_held_and_the_recorded_holder`
+(`crates/devflow-core/src/workflow.rs`) waits for its released lock with `wait_for_free_write_lock`, then asserts one
+shared `write_lock_status` read is `Free`. The wait polls `write_lock_is_free`, which takes an exclusive `try_lock` on
+its own open of the lock file. If another test thread forks while that probe holds the lock, the child keeps a
+duplicate of the probe's descriptor until its `exec`, so the lock is held exclusively again after the wait returned
+`true`, and the one shared read that follows can say `Held { pid: None }`. It is 999.221's race one step later: the
+wait covers the holder's descriptor and makes a new one of its own.
+**Evidence:** the two calls are adjacent in the test (`assert!(wait_for_free_write_lock(root, phase));`, then
+`assert_eq!(write_lock_status(root, phase).unwrap(), WriteLockStatus::Free)`), and `write_lock_is_free` calls
+`file.try_lock()`. 52.1-06's `commands::tests::the_released_write_lock_control_outlasts_a_fork_held_before_exec` shows
+a parked fork's duplicate of a lock descriptor making the shared read say `Held { pid: None }` after the holder's
+release. `wait_for_free_write_lock`'s other three callers assert on the wait's result alone, with no shared read after
+it, so they do not have this shape (read 2026-11-15).
+**Not established:** this test has not been seen to fail, and no rate is known. The reproduction above parks its fork
+during the holder's lock, not during an exclusive probe; no test aims a fork at the probe.
+**Fix shape:** poll the shared read with a bound and assert on that, as 52.1-06's `wait_for_released_write_lock` does
+in `crates/devflow-cli/src/commands.rs` (`devflow_core::test_support::wait_until` over `write_lock_status(..) ==
+WriteLockStatus::Free`, 2 s). Outside 52.1's named scope (D-01 lists 999.221, not this test). Take it in any fix
+branch.
+
+### Phase 999.235: A Refused Recording Commit Is Logged as `auto_chain_flag_repaired` (BACKLOG)
+
+**Found:** 2026-11-15, Phase 52.1 plan 52.1-02 (its SUMMARY lists it) and that plan's follow-up. Found by reading the
+source, then seen in a test run.
+**Defect:** `repair_leaked_auto_chain_flag` (`crates/devflow-cli/src/pipeline_launch.rs`) writes one event,
+`auto_chain_flag_repaired`, whenever the outcome carries a `commit_refused`, whether or not anything was repaired. When
+the commit that records GSD's first `workflow._auto_chain_active: false` is refused (`record_gsd_false` in
+`crates/devflow-core/src/gsd_config.rs`: the commit fails, the file differs from HEAD again, or HEAD cannot be read),
+nothing leaked and nothing was repaired. `.devflow/events.jsonl` still gains an entry named for a repair, with
+`working_tree_repaired: false`, `committed_tree_repaired: false` and the reason in `commit_refused`.
+`docs/guides/unattended-mode.md` ("The repair is also recorded as an `auto_chain_flag_repaired` entry") tells the
+operator that entry means a repair. The foreground `warning:` line for the same case is accurate.
+**Evidence:** the early return in `repair_leaked_auto_chain_flag` is taken only when nothing was repaired and
+`commit_refused` is `None`, so a refusal alone reaches `events::emit`. Seen once, 2026-11-15: a temporary probe in the
+e2e test `a_recording_commit_that_fails_is_warned_about_at_resume` (a pre-commit hook rejects the recording commit;
+the real `devflow resume`) printed the phase's only such event: `"event": "auto_chain_flag_repaired"`,
+`"entry_point": "resume"`, `"working_tree_repaired": false`, `"committed_tree_repaired": false`,
+`"commit_refused": "the commit recording GSD's workflow._auto_chain_active: false could not be made (git command
+failed: the hook says no) — .planning/config.json stays uncommitted; nothing was leaked"`. The probe was removed; no
+committed test asserts on this event, so that the name is not pinned.
+**Not established:** whether any run has met a refused recording commit (none is known). Whether anything outside this
+repository reads the event by name; inside it the only reader is test code. The older refusals that can also fire with
+no `true` flag in either copy (a config carrying other changes, a HEAD that cannot be compared) reach the same `emit`
+by the source; that was not run.
+**Fix shape:** when `commit_refused` is set and `repaired_anything()` is false, emit an event named for what happened
+(for example `auto_chain_record_refused`) and keep `auto_chain_flag_repaired` for a real repair; update the guide's
+sentence; one launch-helper test per name, with the other name asserted absent. Take it in the first fix branch after
+52.1: it is outside the behaviour 52.1 proves.
+
+### Phase 999.234: Remaining `fs::write`-Then-Exec Test Stubs Can Hit "Text file busy" (BACKLOG)
+
+**Found:** 2026-11-15, Phase 52.1 plan 52.1-01 Task 3, by reading the test sources. Not found by a failing run.
+**Defect:** these test helpers write an executable stub with `fs::write` in the test process and a test execs it
+soon after. A sibling test's `fork` holds a copy of the write descriptor until its own `exec`, and `exec` of a file
+open for writing fails with `ETXTBSY`. None of them goes through `run_bounded`, so the test-build retry 52.1-01 added
+to `gsd_reader` does not cover them:
+- `crates/devflow-core/src/agents/opencode.rs`: `stub_opencode_on_path`, `stub_hanging_opencode_on_path`,
+  `stub_parent_exits_before_hanging_child`, `stub_parent_exits_with_silent_same_group_child`,
+  `stub_parent_exits_after_attempting_setsid`, `stub_parent_exits_after_attempting_setpgid`.
+- `crates/devflow-core/src/agents/pi.rs` `stub_pi_on_path`; `agents/antigravity.rs`
+  `antigravity_driver_spawn_argv_smoke`; `monitor.rs` test `StageFixture::agent`;
+  `crates/devflow-core/tests/devflow_dir_gitignore.rs` `launch_context`.
+- `crates/devflow-cli/src/test_support.rs` `agent_free_dir_with_agent_stub` and `add_agent_stub`;
+  `pipeline_gate.rs` `waiting_codex_dir`; `pipeline_launch.rs` `run_handoff_child_with_stubs_and_env`,
+  `waiting_agents_dir`, `argv_recording_agents_dir`, `parent_of_a_past_reset_claude_child`.
+- `crates/devflow-cli/tests/`: `common/mod.rs` `fake_bin_dir_for`; `fake_bin_dir` in `phase7_cli.rs`,
+  `gate_notify_persist_e2e.rs`, `gate_wedge_e2e.rs` and `start_reachability_e2e.rs`; the local `write_executable` in
+  `auto_chain_leak_repair_e2e.rs`, `auto_chain_flag_e2e.rs` and `failover_e2e.rs`; `fallback_agent_config.rs`
+  `stub_dir`; `doctor_antigravity.rs` `write_stub_agy`; `pre_commit_secret_scan.rs` `fake_gitleaks`.
+
+**Evidence:** 999.222, the same shape in `gsd_reader`'s fixture, failed once with `Text file busy (os error 26)`.
+52.1-01's `test_support::tests::a_held_fork_makes_a_parent_written_stub_text_busy` reproduces the kernel state on
+demand.
+**Not established:** none of the writers above has been seen to fail, and no rate is known. The list is every
+`0o755` stub writer found by search on 2026-11-15; it was not checked that each stub is run by a test.
+**Fix shape:** write each through `devflow_core::test_support::write_executable` (52.1-01), which writes through a
+short-lived shell so the test process never holds a write descriptor on the stub. Take it in any fix branch.
 
 ### Phase 999.233: `stop` Refuses an Unprobeable Pending-Launch or `--launch` Socket With No Way On (BACKLOG)
 

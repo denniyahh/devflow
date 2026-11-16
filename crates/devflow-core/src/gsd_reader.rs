@@ -40,6 +40,15 @@ pub const GSD_READER_TIMEOUT: Duration = Duration::from_secs(60);
 /// How often a running reader is polled for exit.
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+/// How long a test build's reader spawn keeps retrying `ETXTBSY`. See
+/// [`spawn_reader_observed`].
+#[cfg(any(test, feature = "test-support"))]
+const TEXT_BUSY_RETRY_FOR: Duration = Duration::from_secs(2);
+
+/// How long a test build's reader spawn waits between `ETXTBSY` retries.
+#[cfg(any(test, feature = "test-support"))]
+const TEXT_BUSY_RETRY_STEP: Duration = Duration::from_millis(10);
+
 /// Where each runtime install ships GSD's `gsd_run` launcher, relative to the
 /// home, in the order they are tried.
 const LAUNCHER_CANDIDATES: [&str; 3] = [
@@ -282,9 +291,7 @@ struct ReaderOutput {
 /// it started held a pipe open past the deadline.
 fn run_bounded(mut cmd: Command, timeout: Duration) -> Result<ReaderOutput, ReaderFailure> {
     let deadline = Instant::now() + timeout;
-    let mut child = cmd.spawn().map_err(|error| ReaderFailure::Spawn {
-        message: error.to_string(),
-    })?;
+    let mut child = spawn_reader(&mut cmd)?;
     // Read before `try_wait` reaps the child: through `process_group(0)` the
     // child's pid is its group's id, which outlives the child while any
     // member does.
@@ -325,6 +332,64 @@ fn run_bounded(mut cmd: Command, timeout: Duration) -> Result<ReaderOutput, Read
         stdout,
         stderr,
     })
+}
+
+/// Spawn the reader. A release build spawns once; the retry in
+/// [`spawn_reader_observed`] is not compiled into it.
+#[cfg(not(any(test, feature = "test-support")))]
+fn spawn_reader(cmd: &mut Command) -> Result<Child, ReaderFailure> {
+    cmd.spawn().map_err(|error| ReaderFailure::Spawn {
+        message: error.to_string(),
+    })
+}
+
+/// Spawn the reader through [`spawn_reader_observed`], with no observer.
+#[cfg(any(test, feature = "test-support"))]
+fn spawn_reader(cmd: &mut Command) -> Result<Child, ReaderFailure> {
+    spawn_reader_observed(cmd, &mut || {})
+}
+
+/// Test-only retry (999.222). Spawn the reader, retrying `ETXTBSY` every
+/// [`TEXT_BUSY_RETRY_STEP`] for up to [`TEXT_BUSY_RETRY_FOR`], and call
+/// `on_text_busy` after each `ETXTBSY` that is retried.
+///
+/// A test writes its stub launcher and then runs it. A sibling test's `fork`
+/// in the same process holds a copy of the stub's write descriptor until its
+/// own `exec`, close-on-exec or not, and `exec` of a file open for writing
+/// fails with `ETXTBSY`. A real launcher is not being written while it is
+/// read, so only a test build retries.
+///
+/// The observer exists so the reproduction can release the fork it holds at
+/// the moment this function meets `ETXTBSY`, not after a guessed delay.
+///
+/// Compiled only under `cfg(test)` or the `test-support` feature, together
+/// with its two constants and the [`spawn_reader`] that calls it.
+#[cfg(any(test, feature = "test-support"))]
+fn spawn_reader_observed(
+    cmd: &mut Command,
+    on_text_busy: &mut dyn FnMut(),
+) -> Result<Child, ReaderFailure> {
+    let deadline = Instant::now() + TEXT_BUSY_RETRY_FOR;
+    loop {
+        let error = match cmd.spawn() {
+            Ok(child) => return Ok(child),
+            Err(error) => error,
+        };
+        if error.raw_os_error() != Some(libc::ETXTBSY) {
+            return Err(ReaderFailure::Spawn {
+                message: error.to_string(),
+            });
+        }
+        if Instant::now() >= deadline {
+            return Err(ReaderFailure::Spawn {
+                message: format!(
+                    "{error}; still busy after retrying for {TEXT_BUSY_RETRY_FOR:?} (test builds only)"
+                ),
+            });
+        }
+        on_text_busy();
+        std::thread::sleep(TEXT_BUSY_RETRY_STEP);
+    }
 }
 
 /// Read `pipe` to its end on a thread; the bytes arrive on the receiver.
@@ -637,9 +702,7 @@ mod tests {
         fn plant_at(&self, relative: &str, body: &str) -> PathBuf {
             let launcher = self.home.join(relative);
             std::fs::create_dir_all(launcher.parent().unwrap()).unwrap();
-            std::fs::write(&launcher, format!("#!/bin/sh\n{body}\n")).unwrap();
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::test_support::write_executable(&launcher, &format!("#!/bin/sh\n{body}\n"));
             launcher
         }
 
@@ -767,6 +830,96 @@ mod tests {
         let report = status_of(&fx).expect("gaps_found is a status");
         assert_eq!(report.status, GsdStatus::GapsFound);
         assert_eq!(report.route, "plan-phase");
+    }
+
+    /// A launcher under `fx`'s home whose write descriptor a parked fork
+    /// holds: the state a sibling test's fork leaves for the instant before
+    /// its exec (999.222), kept until the returned guard is released.
+    ///
+    /// Written through `File::create` on purpose: the reproduction needs this
+    /// process to hold a write descriptor on the launcher at the fork.
+    fn launcher_whose_writer_a_fork_holds(
+        fx: &Fixture,
+    ) -> (PathBuf, crate::test_support::ForkHeldBeforeExec) {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let launcher = fx.home.join("launcher-with-a-held-writer");
+        let mut file = std::fs::File::create(&launcher).unwrap();
+        file.write_all(b"#!/bin/sh\nexit 0\n").unwrap();
+        let held = crate::test_support::fork_held_before_exec();
+        drop(file);
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (launcher, held)
+    }
+
+    /// The held fork is released only when the spawn reports `ETXTBSY` to its
+    /// observer (or by the guard's drop after a failed assertion), so the
+    /// first spawn always meets the held writer, however threads are
+    /// scheduled.
+    #[test]
+    fn a_reader_spawn_retries_text_file_busy_while_a_fork_holds_the_writer() {
+        let fx = Fixture::new();
+        let (launcher, held) = launcher_whose_writer_a_fork_holds(&fx);
+        let mut held = Some(held);
+        let mut times_busy = 0_u32;
+        let mut on_text_busy = || {
+            times_busy += 1;
+            if let Some(held) = held.take() {
+                held.release();
+            }
+        };
+
+        let spawned = spawn_reader_observed(&mut Command::new(&launcher), &mut on_text_busy);
+
+        let mut child = spawned.unwrap_or_else(|failure| {
+            panic!(
+                "the reader spawn must outlast a fork that holds the launcher's writer: {failure}"
+            )
+        });
+        let status = child.wait().expect("wait for the launcher");
+        assert!(status.success(), "the launcher exits 0: {status:?}");
+        assert!(
+            times_busy >= 1,
+            "the held fork was never seen busy: this run did not reproduce 999.222"
+        );
+    }
+
+    /// Control: a writer that never lets go ends the retry at its bound with
+    /// the retry's own message. It does not hang and does not pass.
+    ///
+    /// Runs in its own process: the parked fork holds every descriptor of the
+    /// process it was forked from for the whole bound, and in a shared test
+    /// process those would be the sibling tests' descriptors too.
+    #[test]
+    fn a_reader_spawn_gives_up_on_text_file_busy_after_its_bound() {
+        const NAME: &str =
+            "gsd_reader::tests::a_reader_spawn_gives_up_on_text_file_busy_after_its_bound";
+        let fx = Fixture::new();
+        if !crate::test_support::in_child_test(NAME) {
+            let output = crate::test_support::run_test_in_child(NAME, &fx.home, &[]);
+            crate::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let (launcher, held) = launcher_whose_writer_a_fork_holds(&fx);
+        let started = Instant::now();
+
+        let spawned = spawn_reader_observed(&mut Command::new(&launcher), &mut || {});
+
+        let retried_for = started.elapsed();
+        held.release();
+        let message = match spawned {
+            Err(ReaderFailure::Spawn { message }) => message,
+            Err(other) => panic!("the spawn must fail as a spawn failure: {other}"),
+            Ok(_) => panic!("the spawn must not succeed while a fork holds the launcher's writer"),
+        };
+        assert!(
+            message.contains("still busy after retrying for 2s"),
+            "the failure names the retry and its bound: {message}"
+        );
+        assert!(
+            retried_for >= TEXT_BUSY_RETRY_FOR,
+            "the spawn gave up after {retried_for:?}, before its {TEXT_BUSY_RETRY_FOR:?} bound"
+        );
     }
 
     #[test]

@@ -368,6 +368,12 @@ pub(crate) fn start(
     until: Option<Stage>,
     fallback: FallbackSource,
 ) -> Result<(), CliError> {
+    // 999.229: said first, before any other output, a refusal or the dry-run
+    // return. The detached supervisor that reads the value has no foreground.
+    if let Some(warning) = config::external_verify_env_warning_now() {
+        eprintln!("{warning}");
+    }
+
     // 999.78/A-11: NOT a bare `State::new`. See
     // `fresh_state_carrying_phase_failures` for why one field survives a
     // forced restart and every other counter does not.
@@ -1397,6 +1403,545 @@ fn remove_run_state_with_worktree(project_root: &Path, state: &State, removed: &
             state.phase
         ),
     }
+}
+
+/// `devflow discard --phase N`: remove the phase's worktree, its run state and its
+/// feature branch, after listing them.
+///
+/// The worktree and the state are the derived `.worktrees/phase-NN` and
+/// `.devflow/state-NN.json`, never a path read from the state, and the branch is the
+/// derived `feature/phase-NN`. The phase's foreground holder is held from the first
+/// check to the last removal, so a `start` cannot begin in between.
+///
+/// Every refusal comes before the first removal: a run that is live or may be
+/// ([`phase_run_liveness`]), whatever [`discard_items`] cannot account for, a phase
+/// with nothing to discard, a branch another checkout holds, and an unmerged branch
+/// that `delete_unmerged_branch` does not name.
+pub(crate) fn discard(
+    project_root: &Path,
+    phase: PhaseId,
+    delete_unmerged_branch: Option<&str>,
+) -> Result<(), CliError> {
+    let _holder = claim_foreground_holder(project_root, phase)?;
+    let existing = workflow::update_state_with_within(
+        project_root,
+        phase,
+        workflow::WRITE_LOCK_REPAIR_WAIT,
+        |existing| Ok::<_, CliError>((None, existing)),
+    )?;
+    let (base, git) = discard_base(project_root, &existing);
+    let liveness = phase_run_liveness(
+        project_root,
+        phase,
+        &existing,
+        registry::cache_dir().as_deref(),
+    );
+    refuse_discard_of_a_live_run(phase, &existing, liveness)?;
+    let items = discard_items(project_root, phase, &existing, &git, base)?;
+    if items.worktree.is_none() && items.state.is_none() && items.unmerged.is_none() {
+        return Err(CliError::Message(format!(
+            "discard refused: phase {phase} has no run state, worktree or branch; nothing to \
+             discard"
+        )));
+    }
+    print_discard_listing(phase, &items);
+    refuse_discard_of_a_checked_out_branch(phase, &items)?;
+    refuse_discard_of_branch(phase, &items, delete_unmerged_branch)?;
+    remove_discarded(project_root, phase, &git, &items)
+}
+
+/// The base discard counts "merged" against (D-10), and a [`GitFlow`] whose trunk is
+/// that base: the base the run recorded when its state loads and records one, else
+/// the project's.
+fn discard_base(project_root: &Path, existing: &workflow::Existing) -> (String, GitFlow) {
+    let flow = config::git_flow_for_project(project_root);
+    let recorded = match existing {
+        workflow::Existing::Loaded(state) => state.base_branch.clone(),
+        workflow::Existing::Missing | workflow::Existing::Unloadable(_) => None,
+    };
+    let base = recorded.unwrap_or_else(|| flow.develop.clone());
+    let git = GitFlow::with_config(
+        project_root,
+        config::GitFlowConfig {
+            develop: base.clone(),
+            ..flow
+        },
+    );
+    (base, git)
+}
+
+/// Whether a phase's run is live, may be live, or is not, for the verbs that remove a
+/// run's worktree and state: `discard`, and from 52.1-11 `cleanup`. Both refuse or
+/// keep on every arm but [`Self::NotLive`].
+enum PhaseRunLiveness {
+    /// Nothing says a run is live.
+    NotLive,
+    /// `cleanup`'s live-run test: the agent is running, or the supervisor answers, is
+    /// a live pending launch, or still holds its liveness lock with its socket gone.
+    Live {
+        /// Whether the pid in the phase's agent pid file is a running process.
+        agent_alive: bool,
+        /// The supervisor's liveness, as [`probe_phase`] reads it.
+        supervisor: PhaseLiveness,
+    },
+    /// The recorded supervisor is STALE or could not be probed. It may have left its
+    /// agent group running, and a failed probe proves nothing either way, so this is
+    /// not "no run": `devflow stop` is what ends it.
+    Orphaned(PhaseLiveness),
+    /// The sweep of this root's and phase's sockets found some that may still run and
+    /// that the state does not name, because it is missing, does not load, or names
+    /// another launch or none: one [`LiveSocket::repair_line`] each.
+    Swept(Vec<String>),
+    /// The socket directory could not be listed, so a live supervisor that the state
+    /// does not name cannot be ruled out.
+    SocketDirUnlistable {
+        /// The socket directory.
+        dir: PathBuf,
+        /// Why it could not be listed.
+        why: String,
+    },
+    /// The state is missing or does not load, so it names no launch, and a supervisor
+    /// that has not published its socket may run: a launch liveness lock that no other
+    /// phase's state records is held, or the locks could not be listed. Holds what
+    /// the refusal says was found.
+    UnpublishedLaunch(String),
+}
+
+/// The one live-run test of the verbs that remove a run's worktree and state
+/// (`discard`, and from 52.1-11 `cleanup`). `existing` is the phase's state as read
+/// under the write lock; `cache_dir` holds the supervisor sockets.
+///
+/// Four existing checks, in this order. `cleanup`'s live test alone (the agent pid
+/// file and [`probe_phase`]) misses two things: a STALE or unprobeable supervisor,
+/// which `cleanup` handles in a separate block, and a supervisor the state does not
+/// name, where there is no record to probe ([`unnamed_supervisor_liveness`]).
+fn phase_run_liveness(
+    project_root: &Path,
+    phase: PhaseId,
+    existing: &workflow::Existing,
+    cache_dir: Option<&Path>,
+) -> PhaseRunLiveness {
+    let agent_alive = agent_pid_from_file(project_root, phase).is_some_and(agent::agent_running);
+    let supervisor = match existing {
+        workflow::Existing::Loaded(state) => probe_phase(state),
+        workflow::Existing::Missing | workflow::Existing::Unloadable(_) => {
+            PhaseLiveness::NotLaunched
+        }
+    };
+    if agent_alive
+        || matches!(
+            supervisor,
+            PhaseLiveness::Alive { .. }
+                | PhaseLiveness::LaunchPending { .. }
+                | PhaseLiveness::HeldNoSocket { .. }
+        )
+    {
+        return PhaseRunLiveness::Live {
+            agent_alive,
+            supervisor,
+        };
+    }
+    if matches!(
+        supervisor,
+        PhaseLiveness::Stale | PhaseLiveness::ProbeFailed(_)
+    ) {
+        return PhaseRunLiveness::Orphaned(supervisor);
+    }
+    unnamed_supervisor_liveness(project_root, phase, existing, cache_dir)
+}
+
+/// A supervisor of this phase that `existing` does not name, once the one it names
+/// has been probed and is not live. The launch guard's stateless sweep
+/// ([`possibly_live_sockets`] with no state) runs whether or not the state loads: a
+/// loaded state names at most its latest launch, and a finished or `--until` run's
+/// names none while its supervisor still fires the notify command. A socket the state
+/// names is not live here, so the sweep reads it GONE, or STALE over a group the
+/// backstop proves gone, as [`probe_phase`] did. Then, for a state that names no
+/// launch, [`unpublished_launch_liveness`].
+fn unnamed_supervisor_liveness(
+    project_root: &Path,
+    phase: PhaseId,
+    existing: &workflow::Existing,
+    cache_dir: Option<&Path>,
+) -> PhaseRunLiveness {
+    match possibly_live_sockets(project_root, phase, None, cache_dir) {
+        Ok(sockets) if sockets.is_empty() => {}
+        Ok(sockets) => {
+            return PhaseRunLiveness::Swept(
+                sockets
+                    .iter()
+                    .map(|socket| socket.repair_line(phase))
+                    .collect(),
+            );
+        }
+        Err((dir, why)) => return PhaseRunLiveness::SocketDirUnlistable { dir, why },
+    }
+    match existing {
+        workflow::Existing::Loaded(_) => PhaseRunLiveness::NotLive,
+        workflow::Existing::Missing | workflow::Existing::Unloadable(_) => {
+            unpublished_launch_liveness(project_root, phase)
+        }
+    }
+}
+
+/// The launch guard's check for a phase whose state names no launch
+/// ([`refuse_stateless_launch_beside_a_live_lock`]): a supervisor that has not
+/// published its socket shows in no sweep, only as a held launch liveness lock that
+/// no other phase's loadable state records. A lock that cannot be probed counts as
+/// held (T-50-40), and locks that cannot be listed rule nothing out.
+fn unpublished_launch_liveness(project_root: &Path, phase: PhaseId) -> PhaseRunLiveness {
+    match recover::unrecorded_live_launches(project_root, phase, None) {
+        Ok(live) => live.first().map_or(PhaseRunLiveness::NotLive, |launch| {
+            PhaseRunLiveness::UnpublishedLaunch(launch.describe())
+        }),
+        Err(error) => PhaseRunLiveness::UnpublishedLaunch(format!(
+            "{} could not be listed for live launches ({error})",
+            project_root.join(".devflow").display()
+        )),
+    }
+}
+
+/// D-09.2: discard refuses a run that is live or may be, on every arm of
+/// [`PhaseRunLiveness`] but `NotLive`, naming `devflow stop`. Nothing is removed.
+fn refuse_discard_of_a_live_run(
+    phase: PhaseId,
+    existing: &workflow::Existing,
+    liveness: PhaseRunLiveness,
+) -> Result<(), CliError> {
+    let condition = match existing {
+        workflow::Existing::Unloadable(_) => "does not load",
+        workflow::Existing::Missing | workflow::Existing::Loaded(_) => "is missing",
+    };
+    let text = match liveness {
+        PhaseRunLiveness::NotLive => return Ok(()),
+        PhaseRunLiveness::Live {
+            agent_alive,
+            supervisor,
+        } => {
+            let agent = if agent_alive {
+                "its agent is running; "
+            } else {
+                ""
+            };
+            format!(
+                "refusing to discard phase {phase} — a run is live ({agent}supervisor: {}); run \
+                 `devflow stop --phase {phase}` or wait for it to finish; nothing was removed",
+                supervisor.describe()
+            )
+        }
+        PhaseRunLiveness::Orphaned(supervisor) => format!(
+            "refusing to discard phase {phase} — its supervisor is {}, so its agent group may \
+             still run; run `devflow stop --phase {phase}` first; nothing was removed",
+            supervisor.describe()
+        ),
+        PhaseRunLiveness::Swept(repair_lines) => {
+            let found = match existing {
+                workflow::Existing::Loaded(_) => {
+                    "a supervisor of this phase that its state does not name".to_string()
+                }
+                workflow::Existing::Missing | workflow::Existing::Unloadable(_) => {
+                    format!("its state {condition}, and a supervisor of this phase")
+                }
+            };
+            let mut text = format!(
+                "refusing to discard phase {phase} — {found} may still run; nothing was removed. \
+                 Run each line below first:"
+            );
+            for line in &repair_lines {
+                text.push_str("\n  ");
+                text.push_str(line);
+            }
+            text
+        }
+        PhaseRunLiveness::SocketDirUnlistable { dir, why } => format!(
+            "refusing to discard phase {phase} — the supervisor socket directory {} cannot be \
+             listed ({why}), so a live supervisor cannot be ruled out; nothing was removed",
+            dir.display()
+        ),
+        PhaseRunLiveness::UnpublishedLaunch(found) => format!(
+            "refusing to discard phase {phase} — its state {condition}, so it cannot name its \
+             launch, and {found}; nothing was removed. Run discard again once that launch has \
+             published or exited; `devflow stop` never signals an unpublished launch, so if it \
+             stays, end that process yourself"
+        ),
+    };
+    Err(CliError::Message(text))
+}
+
+/// What `devflow discard` found for a phase: the three things it removes, each present
+/// only when it exists, so a partial phase is discarded item by item.
+struct DiscardItems {
+    /// The worktree git lists at `.worktrees/phase-NN`, with its count of uncommitted
+    /// changes.
+    worktree: Option<(PathBuf, usize)>,
+    /// `.devflow/state-NN.json`, when the file exists, whether or not it loads.
+    state: Option<PathBuf>,
+    /// The derived `feature/phase-NN`.
+    branch: String,
+    /// The branch's count of commits not merged into `base`. `None` when the branch
+    /// does not exist.
+    unmerged: Option<usize>,
+    /// The branch `unmerged` is counted against: the base the run recorded, else the
+    /// project's.
+    base: String,
+    /// A checkout other than the phase worktree that has `branch` checked out, and
+    /// whether it is the primary checkout. git deletes no branch a checkout holds.
+    checked_out_elsewhere: Option<(PathBuf, bool)>,
+}
+
+/// Read what discard would remove for `phase`, removing nothing. `git`'s trunk is
+/// `base`. Refuses whatever it cannot account for: see [`discard_worktree`], and a
+/// branch whose merge state does not read, which is never assumed merged.
+fn discard_items(
+    project_root: &Path,
+    phase: PhaseId,
+    existing: &workflow::Existing,
+    git: &GitFlow,
+    base: String,
+) -> Result<DiscardItems, CliError> {
+    let branch = format!("{FEATURE_PREFIX}phase-{padded}", padded = phase.padded());
+    let worktrees = worktree::list(project_root).map_err(|err| {
+        CliError::Message(format!(
+            "discard refused: this repository's worktrees could not be listed ({err}); \
+             nothing was removed"
+        ))
+    })?;
+    let phase_path = worktree::phase_path(project_root, phase);
+    let worktree = discard_worktree(&worktrees, phase_path.clone(), phase, &branch)?;
+    // git lists the primary checkout first.
+    let checked_out_elsewhere = worktrees
+        .iter()
+        .enumerate()
+        .find(|(_, wt)| {
+            wt.branch.as_deref() == Some(branch.as_str()) && !same_path(&wt.path, &phase_path)
+        })
+        .map(|(index, wt)| (wt.path.clone(), index == 0));
+    let state = (!matches!(existing, workflow::Existing::Missing))
+        .then(|| workflow::state_path(project_root, phase));
+    let unmerged = if git.branch_exists(&branch) {
+        Some(git.commits_not_in_develop(&branch).map_err(|err| {
+            CliError::Message(format!(
+                "discard refused: phase {phase}'s branch {branch} could not be checked for \
+                 commits not merged into `{base}` ({err}); nothing was removed. Make `{base}` \
+                 resolve, then run `devflow discard --phase {phase}` again"
+            ))
+        })?)
+    } else {
+        None
+    };
+    Ok(DiscardItems {
+        worktree,
+        state,
+        branch,
+        unmerged,
+        base,
+        checked_out_elsewhere,
+    })
+}
+
+/// The phase worktree discard may remove, with its count of uncommitted changes: the
+/// one of `worktrees` (git's list) at `path`, the derived `.worktrees/phase-NN`, with
+/// `branch` checked out. `None` when nothing is at that path.
+///
+/// Refuses what it cannot account for: something at that path that git does not list
+/// as a worktree; a worktree on another branch or a detached HEAD, which may hold
+/// commits no branch keeps and the listing would not show; and a worktree whose status
+/// does not read.
+fn discard_worktree(
+    worktrees: &[worktree::WorktreeInfo],
+    path: PathBuf,
+    phase: PhaseId,
+    branch: &str,
+) -> Result<Option<(PathBuf, usize)>, CliError> {
+    let again = format!("then run `devflow discard --phase {phase}` again");
+    let Some(listed) = worktrees.iter().find(|wt| same_path(&wt.path, &path)) else {
+        if path.symlink_metadata().is_ok() {
+            return Err(CliError::Message(format!(
+                "discard refused: {} exists but git does not list it as a worktree, so discard \
+                 cannot tell what is in it; nothing was removed. Inspect it and remove it \
+                 yourself, {again}",
+                path.display()
+            )));
+        }
+        return Ok(None);
+    };
+    if listed.branch.as_deref() != Some(branch) {
+        let found = listed.branch.as_deref().map_or_else(
+            || "a detached HEAD".to_string(),
+            |other| format!("branch {other}"),
+        );
+        return Err(CliError::Message(format!(
+            "discard refused: the worktree {} has {found} checked out, not {branch}, so discard \
+             cannot tell what removing it would lose; nothing was removed. Inspect it and remove \
+             it yourself, {again}",
+            path.display()
+        )));
+    }
+    let uncommitted = uncommitted_changes(&path).map_err(|why| {
+        CliError::Message(format!(
+            "discard refused: the uncommitted changes in the worktree {} could not be counted \
+             ({why}); nothing was removed. If its directory is gone, run `git worktree prune`, \
+             {again}",
+            path.display()
+        ))
+    })?;
+    Ok(Some((path, uncommitted)))
+}
+
+/// Whether two paths name the same place: their canonical forms are compared, and a
+/// path that does not resolve is compared as written.
+fn same_path(left: &Path, right: &Path) -> bool {
+    let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    canonical(left) == canonical(right)
+}
+
+/// Discard's listing of what it will remove (D-09.2), printed before any removal.
+fn print_discard_listing(phase: PhaseId, items: &DiscardItems) {
+    println!("discard: phase {phase} — to be removed:");
+    if let Some((path, uncommitted)) = &items.worktree {
+        let changes = match uncommitted {
+            1 => "1 uncommitted change".to_string(),
+            count => format!("{count} uncommitted changes"),
+        };
+        println!(
+            "  worktree {}, with everything in it: {changes} (ignored files are removed too \
+             and are not counted)",
+            path.display()
+        );
+    }
+    if let Some(path) = &items.state {
+        println!("  run state {}", path.display());
+    }
+    if let Some(unmerged) = items.unmerged {
+        let merged = match unmerged {
+            0 => format!("merged into `{}`", items.base),
+            count => unmerged_commits(count, &items.base),
+        };
+        println!("  branch {} ({merged})", items.branch);
+    }
+}
+
+/// D-09.2: a phase branch that a checkout other than the phase worktree holds is not
+/// discard's to delete, and git would refuse it after the worktree and the state were
+/// gone. For the primary checkout (`start --no-worktree`) the refusal names the branch
+/// to switch to; discard never switches a branch itself.
+fn refuse_discard_of_a_checked_out_branch(
+    phase: PhaseId,
+    items: &DiscardItems,
+) -> Result<(), CliError> {
+    let Some((path, primary)) = &items.checked_out_elsewhere else {
+        return Ok(());
+    };
+    let (branch, base, path) = (&items.branch, &items.base, path.display());
+    let again = format!("then run `devflow discard --phase {phase}` again");
+    Err(CliError::Message(if *primary {
+        format!(
+            "discard refused: phase {phase}'s branch {branch} is checked out in the primary \
+             checkout {path}; nothing was removed. Run `git switch {base}` there, {again}"
+        )
+    } else {
+        format!(
+            "discard refused: phase {phase}'s branch {branch} is checked out in the worktree \
+             {path}, and git deletes no branch a worktree has checked out; nothing was removed. \
+             Switch that worktree to another branch or remove it, {again}"
+        )
+    }))
+}
+
+/// D-10 / D-23: no unmerged branch is deleted unless `--delete-unmerged-branch` names
+/// it, and the name must be the phase's own branch whatever its merge state.
+fn refuse_discard_of_branch(
+    phase: PhaseId,
+    items: &DiscardItems,
+    named: Option<&str>,
+) -> Result<(), CliError> {
+    let branch = &items.branch;
+    if let Some(named) = named
+        && named != branch
+    {
+        return Err(CliError::Message(format!(
+            "discard refused: --delete-unmerged-branch names {named}, and phase {phase}'s branch \
+             is {branch}; nothing was removed. Name {branch}, or leave the flag out"
+        )));
+    }
+    match items.unmerged {
+        Some(count) if count > 0 && named.is_none() => Err(CliError::Message(format!(
+            "discard refused: phase {phase}'s branch {branch} has {}; nothing was removed. To \
+             delete it with the rest, run `devflow discard --phase {phase} \
+             --delete-unmerged-branch {branch}`",
+            unmerged_commits(count, &items.base)
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// Remove what [`discard_items`] found, in the order worktree, state, branch: a
+/// `removed` line for each, a `warning:` line for each that failed, and an error when
+/// any did. An item that was not found is not attempted.
+fn remove_discarded(
+    project_root: &Path,
+    phase: PhaseId,
+    git: &GitFlow,
+    items: &DiscardItems,
+) -> Result<(), CliError> {
+    let mut failed = false;
+    if let Some((path, _)) = &items.worktree {
+        match worktree::remove(project_root, path, true) {
+            Ok(()) => println!("removed worktree {}", path.display()),
+            Err(err) => {
+                failed = true;
+                println!(
+                    "warning: could not remove the worktree {}: {err}",
+                    path.display()
+                );
+            }
+        }
+    }
+    if let Some(path) = &items.state {
+        match workflow::clear_state(project_root, phase) {
+            Ok(true) => println!("removed run state {}", path.display()),
+            // Gone since it was listed: nothing to remove, and not a failure.
+            Ok(false) => {}
+            Err(err) => {
+                failed = true;
+                println!(
+                    "warning: could not remove the run state {}: {err}",
+                    path.display()
+                );
+            }
+        }
+    }
+    if items.unmerged.is_some() {
+        match git.delete_branch(&items.branch, true) {
+            Ok(()) => println!("removed branch {}", items.branch),
+            Err(err) => {
+                failed = true;
+                println!(
+                    "warning: could not remove the branch {}: {err}",
+                    items.branch
+                );
+            }
+        }
+    }
+    if failed {
+        return Err(CliError::Message(format!(
+            "discard could not remove everything for phase {phase} — see the warnings above"
+        )));
+    }
+    Ok(())
+}
+
+/// How many uncommitted changes the worktree at `path` holds: the lines of
+/// `git status --porcelain --untracked-files=all`. Ignored files are not counted.
+fn uncommitted_changes(path: &Path) -> Result<usize, String> {
+    let output = git_command(path)
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .output()
+        .map_err(|err| err.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).lines().count())
 }
 
 /// A phase's supervisor liveness as `status`, `cleanup` and `doctor` report
@@ -19058,6 +19603,7 @@ mod tests {
 
         drop(release);
         holder.join().unwrap();
+        wait_for_released_write_lock(&root, phase);
         assert_eq!(
             write_lock_line(&workflow::write_lock_status(&root, phase).unwrap()),
             None,
@@ -19073,6 +19619,158 @@ mod tests {
                 .iter()
                 .any(|finding| finding.detail.contains("state write lock")),
             "control: released"
+        );
+    }
+
+    /// Take the phase's state write lock on another thread and hold it until the
+    /// returned sender is dropped. Returns once the lock is held.
+    fn hold_state_write_lock(
+        root: &Path,
+        phase: PhaseId,
+    ) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Sender<()>) {
+        let (holding, wait_holding) = std::sync::mpsc::channel();
+        let (release, wait_release) = std::sync::mpsc::channel::<()>();
+        let root = root.to_path_buf();
+        let holder = std::thread::spawn(move || {
+            workflow::update_state(&root, phase, |_| {
+                holding.send(()).unwrap();
+                let _ = wait_release.recv_timeout(std::time::Duration::from_secs(30));
+                Ok::<(), workflow::WorkflowError>(())
+            })
+            .unwrap();
+        });
+        wait_holding.recv().unwrap();
+        (holder, release)
+    }
+
+    /// How long a released state write lock may keep reading held before the test
+    /// calls it a leak.
+    const RELEASED_WRITE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// Wait for the released state write lock to read free, telling `on_held` about
+    /// each reading that still says held.
+    ///
+    /// A fork in another test thread holds a duplicate of every descriptor until its
+    /// exec, so a just-released lock can read held for a moment (999.221). A real leak
+    /// outlasts the bound. The poll is the shared read `status` and `doctor` make, not
+    /// `write_lock_is_free`: that probe takes an exclusive lock, and a fork during the
+    /// probe would leave a child holding it, so the next shared read could still say
+    /// held.
+    fn wait_for_released_write_lock_with(root: &Path, phase: PhaseId, mut on_held: impl FnMut()) {
+        devflow_core::test_support::wait_until(
+            RELEASED_WRITE_LOCK_WAIT,
+            "the state write lock to read free after its release",
+            || {
+                let status = workflow::write_lock_status(root, phase).unwrap();
+                if status != workflow::WriteLockStatus::Free {
+                    on_held();
+                }
+                status == workflow::WriteLockStatus::Free
+            },
+        );
+    }
+
+    /// [`wait_for_released_write_lock_with`], with nothing to tell.
+    fn wait_for_released_write_lock(root: &Path, phase: PhaseId) {
+        wait_for_released_write_lock_with(root, phase, || {});
+    }
+
+    /// 999.221 on demand: a child forked while the state write lock is held, and parked
+    /// before any exec, keeps a duplicate of the lock's descriptor after the holder lets
+    /// go, so a read right after the release says held. The released-lock wait outlasts
+    /// it.
+    ///
+    /// No clock decides what the first reading sees: the parked child is released only
+    /// by the wait's own on-held observer, or by its guard's drop once an assertion has
+    /// failed.
+    #[test]
+    fn the_released_write_lock_control_outlasts_a_fork_held_before_exec() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let phase = PhaseId::new(5190);
+        let state = State::new(phase, AgentKind::Claude, Mode::Supervise, root.clone());
+        workflow::save_state(&state).unwrap();
+        let (holder, release) = hold_state_write_lock(&root, phase);
+        let mut held_fork = Some(devflow_core::test_support::fork_held_before_exec());
+
+        drop(release);
+        holder.join().unwrap();
+        let mut times_held = 0_u32;
+        wait_for_released_write_lock_with(&root, phase, || {
+            times_held += 1;
+            if let Some(fork) = held_fork.take() {
+                fork.release();
+            }
+        });
+
+        assert!(
+            times_held >= 1,
+            "the held fork was never seen holding the lock: this run did not reproduce 999.221"
+        );
+        assert_eq!(
+            write_lock_line(&workflow::write_lock_status(&root, phase).unwrap()),
+            None,
+            "control: released"
+        );
+        assert!(
+            !rendered_status(&state).contains("state write lock"),
+            "control"
+        );
+        let free = reconcile_phase(&facts_for(&root, &state));
+        assert!(
+            !free
+                .iter()
+                .any(|finding| finding.detail.contains("state write lock")),
+            "control: released"
+        );
+    }
+
+    /// Control: a lock that stays held ends the released-lock wait at its bound with
+    /// the wait's own message. It does not hang and does not pass.
+    ///
+    /// Runs in its own process: the parked fork holds every descriptor of the process
+    /// it was forked from for the whole bound, and in a shared test process those
+    /// would be the sibling tests' descriptors too.
+    #[test]
+    fn the_released_write_lock_wait_times_out_while_a_fork_keeps_the_lock() {
+        const NAME: &str =
+            "commands::tests::the_released_write_lock_wait_times_out_while_a_fork_keeps_the_lock";
+        let dir = tempfile::tempdir().unwrap();
+        if !devflow_core::test_support::in_child_test(NAME) {
+            // The child half execs nothing, so its PATH is this empty directory.
+            let output = devflow_core::test_support::run_test_in_child(NAME, dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let root = dir.path().to_path_buf();
+        let phase = PhaseId::new(5191);
+        let state = State::new(phase, AgentKind::Claude, Mode::Supervise, root.clone());
+        workflow::save_state(&state).unwrap();
+        let (holder, release) = hold_state_write_lock(&root, phase);
+        let held_fork = devflow_core::test_support::fork_held_before_exec();
+        drop(release);
+        holder.join().unwrap();
+        let started = std::time::Instant::now();
+
+        let waited = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            wait_for_released_write_lock(&root, phase);
+        }));
+
+        let waited_for = started.elapsed();
+        held_fork.release();
+        let payload = waited.expect_err("the wait must not pass while a fork keeps the lock");
+        let message = payload
+            .downcast_ref::<String>()
+            .expect("the wait panics with a formatted message");
+        assert!(
+            message.contains(
+                "timed out after 2s waiting for the state write lock to read free after its release"
+            ),
+            "the wait fails with its own timeout text: {message}"
+        );
+        assert!(
+            waited_for >= RELEASED_WRITE_LOCK_WAIT,
+            "the wait gave up after {waited_for:?}, before its {RELEASED_WRITE_LOCK_WAIT:?} bound"
         );
     }
 

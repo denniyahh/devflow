@@ -1,20 +1,20 @@
 ---
 gsd_state_version: "1.0"
 milestone: v4.0
-milestone_name: Session Continuity
+milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: "52.1"
 current_phase_name: Stabilize for Dogfooding
-status: Planned (15 plans) — review applied, ready to execute
-stopped_at: Phase 52.1 reviewed and plan set committed (6d37732); execution not started
-last_updated: "2026-11-13T21:02:32.335Z"
-last_activity: 2026-11-13
-last_activity_desc: Phase 52.1 planning complete
-state_head: 6d377324255332308fab1d9d8fcf0518de5a1985
+status: executing
+stopped_at: Completed 52.1-07-PLAN.md
+last_updated: "2026-11-16T00:16:41.019Z"
+last_activity: 2026-11-14
+last_activity_desc: Phase 52.1 execution started
+state_head: 561f8b9514d221a66a9b88948257984141d18308
 progress:
-  total_phases: 5
+  total_phases: 6
   completed_phases: 0
   total_plans: 48
-  completed_plans: 33
+  completed_plans: 40
   percent: 0
 ---
 
@@ -82,7 +82,7 @@ See: `.planning/PROJECT.md` (updated 2026-11-08)
 **Core value:** a coding session that outlives any one agent — the session is the repository, so another agent
 continues the same work when one runs out of quota or budget, and the run asks a human only for the decisions nothing
 else can make (restated by the operator 2026-11-08).
-**Current focus:** Phase 52 — Subtract and Stabilize
+**Current focus:** Phase 52.1 — Stabilize for Dogfooding
 
 ## Operator Next Steps
 
@@ -171,10 +171,10 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 52.1 (Stabilize for Dogfooding) — READY TO EXECUTE
-Plan: Not started
-Status: Planned (15 plans) — review applied, ready to execute
-Last activity: 2026-11-13 — Phase 52.1 planning complete
+Phase: 52.1 (Stabilize for Dogfooding) — EXECUTING
+Plan: 8 of 15
+Status: Ready to execute
+Last activity: 2026-11-14 — Phase 52.1 execution started
 
 
 ## Recently Shipped
@@ -910,6 +910,32 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 52]: 52-32: the rate-limit timer lives in the gate wait and arms per gate open through rate_limit_timer_deadline only, so first open, resume and takeover decide it alike
 - [Phase 52]: 52-32: after the timer writes (or finds an operator's answer) the wait takes the answer before checking the lifetime, so a reset later than the gate timeout relaunches at the wake (U8 fix)
 - [Phase 52]: 52-32: a timer write failing other than AlreadyResponded keeps the automatic relaunch spent and reports rate_limit_timer_fired outcome failed
+- [Phase 52.1]: 52.1-01: the ETXTBSY retry's give-up control runs in its own process, because a parked fork holds every descriptor of the process it is forked from for the whole 2 s bound
+- [Phase 52.1]: 52.1-01: test_support::write_executable sets the stub's mode with chmod(2) from the test process, not the shell's chmod, so nothing is looked up on a child test's stub-only PATH
+- [Phase 52.1]: 52.1-01 took backlog number 999.234 (remaining fs::write-then-exec stub writers); 52.1-06 takes 999.235
+- [Phase 52.1]: 52.1-02: force_clear_auto_chain reports a leak only when HEAD or the working copy held true. A working copy holding false is recorded under 'chore(gsd): record GSD's workflow._auto_chain_active: false' with no killed-run note and no auto_chain_flag_repaired event; a layout difference with no flag in it is left uncommitted (D-22).
+- [Phase 52.1]: 52.1-02: the benign-row e2e drives devflow resume, not start. The fixture the plan names spawns resume; start's call site is covered by the shared helper's unit test (entry point start), not by its own e2e.
+- [Phase 52.1]: 52.1-02: an invalid DEVFLOW_EXTERNAL_VERIFY_ENABLED prints one warning: line on stderr, first, at start (a dry run included) and at resume, before any refusal (D-03). The detached supervisor's tracing warning is unchanged.
+- [Phase 52.1]: 52.1-03: cut-pr-branch.sh accepts only (N-review) and (N-fix) as new scope suffixes; any other suffix is listed as skipped and needs --include (D-12)
+- [Phase 52.1]: 52.1-03: --include without a phase is refused, because non-phase mode replays every commit and would ignore the option silently (T-52.1-06)
+- [Phase 52.1]: 52.1-03: the three shellcheck notes cut-pr-branch.sh already carried are marked with directives (comments only), so the plan's shellcheck gate exits 0 and reports new findings alone
+- [Phase 52.1]: 52.1-03: an unreadable out-of-scope commit stops the cut before anything is created; an unreadable in-scope commit is still stopped in the replay loop, after the PR branch exists (untested gap)
+- [Phase 52.1]: 52.1-05: the default scaffold config follows the live payload's top-level key order (commit_docs, parallelization, workflow, git) with model_profile appended last
+- [Phase 52.1]: 52.1-05: the pre-written 01-VALIDATION.md uses the GSD 1.21.0 template columns; its one row is pending, not green, because PROBE.md does not exist at scaffold time
+- [Phase 52.1]: 52.1-05: the selftest's 01-VALIDATION.md case reads the plan's automated line and requires the map row to name it
+- [Phase 52.1]: 52.1-05: executed on GSD 1.21.0 after the orchestrator amended the 1.20.1 precondition (24c90a6) on re-measured facts; validate-phase State A (A3) was not re-checked and stays untested until 52.1-14
+- [Phase 52.1]: The pre-push divergence check judges each pushed commit that carries .workspace-divergence, reading every input from that commit, and the hook runs the script beside itself (D-13, 999.231)
+- [Phase 52.1]: check-workspace-divergence.sh captures each git listing before reading it and stops with its own message when git fails; a `done < <(git ...)` loop reads nothing and passes
+- [Phase 52.1]: A sixth hook test beyond the five planned proves the manifest and FORBIDDEN_PATHS come from the pushed commit: no planned test told those two reads apart from the checkout
+- [Phase 52.1]: A divergence refusal names the commit, and the hook adds a line naming the refused ref, so a push of several refs says which one failed
+- [Phase 52.1]: 52.1-06: the released-lock wait's never-released control runs in a child process, because its parked fork holds every descriptor of the process it is forked from for the whole 2 s bound
+- [Phase 52.1]: 52.1-06: the note on write_lock_status names the holder's process as the one whose fork keeps the lock, not the reader's; no production code changed
+- [Phase 52.1]: 52.1-06: the sibling-test backlog entry is 999.236 (999.235 was already taken by the 52.1-02 follow-up)
+- [Phase 52.1]: 52.1-07: discard refuses a phase worktree that is not on feature/phase-NN (another branch or a detached HEAD); the plan text would remove any worktree git lists at the phase path. Fail closed, awaiting the operator
+- [Phase 52.1]: 52.1-07: discard refuses a phase branch that any checkout other than the phase worktree holds, not only the primary checkout, so git cannot refuse the branch after the state is gone
+- [Phase 52.1]: 52.1-07: a --delete-unmerged-branch value that is not the phase branch is refused whatever the branch merge state
+- [Phase 52.1]: 52.1-07: the live-run refusal runs before discard reads the items, so a run that may be live is refused before nothing-to-discard
+- [Phase 52.1]: 52.1-07: discard removes a loadable and an unloadable state the same way, with workflow::clear_state, and nothing else under .devflow/
 
 ## Roadmap Evolution
 
@@ -1054,12 +1080,19 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 52 P30 | 23 min | 2 tasks | 7 files |
 | Phase 52 P31 | 34 min | 3 tasks | 9 files |
 | Phase 52 P32 | 60min | 3 tasks | 7 files |
+| Phase 52.1 P01 | 23min | 3 tasks | 4 files |
+| Phase 52.1 P02 | 23 min | 3 tasks | 7 files |
+| Phase 52.1 P03 | 22 min | 3 tasks | 3 files |
+| Phase 52.1 P05 | 15 min | 2 tasks | 1 files |
+| Phase 52.1 P04 | 23 min | 2 tasks | 5 files |
+| Phase 52.1 P06 | 23 min | 2 tasks | 3 files |
+| Phase 52.1 P07 | 50 min | 3 tasks | 5 files |
 
 ## Session
 
-**Last session:** 2026-11-13T21:02:31.712Z
-**Stopped at:** Phase 52.1 reviewed and plan set committed (6d37732); execution not started
-**Resume file:** .planning/phases/52.1-stabilize-for-dogfooding/52.1-CONTEXT.md
+**Last session:** 2026-11-15T22:46:21.259Z
+**Stopped at:** Completed 52.1-07-PLAN.md
+**Resume file:** None
 
 ## Operator Next Steps
 
@@ -1083,3 +1116,4 @@ None pending in `.planning/todos/pending/` (the two phase-48 merge-back todos cl
 - Phase 52.1 inserted after Phase 52: Stabilize for Dogfooding: make DevFlow stable enough to resume dogfooding; not dogfooded itself (operator 2026-11-11) (URGENT)
 - Phase 52.1 edited: edited fields: goal, candidate scope
 - Phase 53 edited: edited fields: depends_on (now Phase 52.1)
+- Phase 52.2 inserted after Phase 52: Foreground runner replaces the detached supervisor (operator, 2026-11-15); carries Phase 52.1 plans 09-15, which are replanned there (URGENT)

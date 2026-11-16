@@ -236,6 +236,26 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
   - Runs the **full CI-equivalent check inside the pinned container** (§5), not host tools —
     `scripts/check-in-container.sh all`, with `DEVFLOW_SKIP_CONTAINER_CHECK=1` as an explicit,
     loudly-non-equivalent escape hatch.
+- [ ] **[PROJECT]** `scripts/hooks/pre-push` **runs `scripts/check-workspace-divergence.sh` once for
+  each pushed commit that carries `.workspace-divergence`, against that commit** (Phase 52.1,
+  999.231). The script takes `[BASE_REF] [SHA]` and reads the manifest, the diff against
+  `origin/develop`, the committed script modes and `cut-pr-branch.sh`'s `FORBIDDEN_PATHS` from the
+  commit, never from the pushing checkout or its index. A delete and a commit with no manifest are
+  skipped. Before this, the hook checked only when the checkout had a manifest on disk and judged
+  the checkout: a workspace branch pushed from a develop-based checkout went unchecked, and a clean
+  PR branch pushed from a workspace checkout was refused.
+  - The hook runs the script **beside itself** (`$(dirname "$0")/../check-workspace-divergence.sh`),
+    not the pushing checkout's copy, so hook and script are one version.
+  - **`core.hooksPath` is absolute on this machine** (`git config --get core.hooksPath` prints the
+    main checkout's `scripts/hooks`), so a push from any worktree runs the main checkout's hook.
+    The per-commit check therefore applies to every worktree only once the branch checked out in
+    the main checkout carries this change. Until then a push still runs the old hook, which judges
+    the pushing checkout, not the pushed commit, with that checkout's copy of the script.
+  - `git ls-tree` refuses glob pathspec magic, and a `done < <(git ...)` loop does not see git
+    fail: it reads nothing and passes. The mode check lists all of `scripts/` and filters in bash,
+    and every listing is captured before it is read.
+  - Verify: `cargo nextest run -p devflow --test pre_push_divergence_e2e --no-tests=fail` (6 tests,
+    each running a byte copy of the hook and the script against a scratch repository).
 - [ ] **[PROJECT]** `scripts/hooks/post-commit`: warns (never auto-edits) when a `*-SUMMARY.md`
   lands but `STATE.md`'s authored prose wasn't updated to match. Only a summary directly inside a
   phase directory counts; a nested one (a plan review's `52-plan-review-N/SUMMARY.md`) does not.
