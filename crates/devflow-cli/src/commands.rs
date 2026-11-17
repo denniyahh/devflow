@@ -46,7 +46,7 @@ use devflow_core::state::{AgentKind, PendingSupervisor, State, SupervisorRecord}
 use devflow_core::supervisor;
 use devflow_core::workflow;
 use devflow_core::worktree;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2803,71 +2803,95 @@ fn status_run_lines(state: &State) -> Vec<String> {
     lines
 }
 
+/// D-09 (review codex-8): every phase `status` lists, found by file name only, never
+/// by file contents: `.runner-NN` locks in `.devflow/`, gate request files
+/// `NN-{stage}.json` in [`Gates::dir`] and state files through
+/// [`workflow::state_file_phases`], whether or not they load. A missing directory is an
+/// empty set; any other read error is returned, never read as empty.
+fn status_phases(project_root: &Path) -> Result<BTreeSet<PhaseId>, CliError> {
+    let mut phases = BTreeSet::new();
+    for name in file_names(&workflow::devflow_dir(project_root))? {
+        if let Some(phase) = name
+            .strip_prefix(".runner-")
+            .and_then(|phase| phase.parse::<PhaseId>().ok())
+        {
+            phases.insert(phase);
+        }
+    }
+    phases.extend(workflow::state_file_phases(project_root));
+    for name in file_names(&Gates::dir(project_root))? {
+        if let Some(phase) = gate_request_phase(&name) {
+            phases.insert(phase);
+        }
+    }
+    Ok(phases)
+}
+
+/// The phase a gate request file `NN-{stage}.json` names; `None` for any other name,
+/// such as a protocol artifact with more after the stage ([`Gates::list_open`]'s rule).
+fn gate_request_phase(name: &str) -> Option<PhaseId> {
+    let (phase, stage) = name.strip_suffix(".json")?.split_once('-')?;
+    if stage.contains('.') || stage.parse::<Stage>().is_err() {
+        return None;
+    }
+    phase.parse().ok()
+}
+
+/// The names of the entries in `dir`: empty when it does not exist, an error naming
+/// it for any other read failure.
+fn file_names(dir: &Path) -> Result<Vec<String>, CliError> {
+    let unreadable = |error: std::io::Error| {
+        CliError::Message(format!("could not read {}: {error}", dir.display()))
+    };
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(unreadable(error)),
+    };
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(unreadable)?;
+        if let Some(name) = entry.file_name().to_str() {
+            names.push(name.to_string());
+        }
+    }
+    Ok(names)
+}
+
 pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
-    // 13-DEFERRED-CR-03 acceptance: enumerate every active phase, not just
-    // the last one started.
-    let states = workflow::list_states(project_root);
+    // D-09: every phase found from its files, each with its liveness row. A phase found
+    // only through a free runner lock is history and has no row.
+    let rows: Vec<(PhaseId, workflow::Existing, RunStatus)> = status_phases(project_root)?
+        .into_iter()
+        .filter_map(|phase| {
+            let existing = existing_state(project_root, phase);
+            run_status(project_root, phase, &existing).map(|row| (phase, existing, row))
+        })
+        .collect();
     let mut current_worktree: Option<PathBuf> = None;
-    if states.is_empty() {
+    if rows.is_empty() {
         println!("stage: idle");
         println!("project_root: {}", project_root.display());
     } else {
+        let states: Vec<State> = rows
+            .iter()
+            .filter_map(|(_, existing, _)| match existing {
+                workflow::Existing::Loaded(state) => Some(state.clone()),
+                _ => None,
+            })
+            .collect();
         // 14-CR-10: one pass over events.jsonl for every phase's last event,
         // instead of a full-file scan per phase.
         let mut last_events = events::last_events_by_phase(project_root);
         println!("project_root: {}", project_root.display());
         println!("{}", active_phases_line(&states));
-        for state in &states {
-            let gate = if state.gate_pending {
-                "pending"
-            } else {
-                "none"
-            };
-            let row = run_status(
-                project_root,
-                state.phase,
-                &workflow::Existing::Loaded(state.clone()),
-            );
-            match row {
-                Some(row) => println!("\nphase {}: {}", state.phase, row.line(state.phase)),
-                None => println!("\nphase {}:", state.phase),
-            }
-            println!(
-                "  stage: {} | mode: {} | gate: {}",
-                state.stage, state.mode, gate
-            );
-            println!("  agent: {}", agents::driver_for(state.agent).name());
-            if state.consecutive_failures > 0 {
-                println!("  validate failures: {}", state.consecutive_failures);
-            }
-            println!(
-                "  started: {} ({})",
-                state.started_at,
-                recover::format_age(&state.started_at)
-            );
-            for line in status_run_lines(state) {
-                println!("{line}");
-            }
-            current_worktree = current_worktree.or_else(|| state.worktree_path.clone());
-            if let Some(line) = status_write_lock_line(project_root, state.phase) {
-                println!("{line}");
-            }
-            let phase_summary = last_events.remove(&state.phase);
-            println!(
-                "{}",
-                render_stage_progress_line(
-                    state.stage,
-                    phase_summary.as_ref().and_then(|s| s.stage_launched_ts)
-                )
-            );
-            if let Some(summary) = phase_summary {
-                let ago = summary
-                    .event
-                    .get("ts")
-                    .and_then(|t| t.as_u64())
-                    .map(|t| format!(" ({})", recover::format_age(&t.to_string())))
-                    .unwrap_or_default();
-                println!("  last action: {}{ago}", events::describe(&summary.event));
+        for (phase, _, row) in &rows {
+            println!("\nphase {phase}: {}", row.line(*phase));
+            if let Some(state) = states.iter().find(|state| state.phase == *phase) {
+                for line in status_state_lines(project_root, state, last_events.remove(phase)) {
+                    println!("{line}");
+                }
+                current_worktree = current_worktree.or_else(|| state.worktree_path.clone());
             }
         }
     }
@@ -2875,7 +2899,8 @@ pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    if let Some(banner) = render_pending_gate_banner(&Gates::list_open(project_root), now) {
+    let open = Gates::list_open(project_root);
+    if let Some(banner) = render_pending_gate_banner(project_root, &open, now) {
         println!("\n{banner}");
     }
     if let Some(block) = render_set_aside_answers(&Gates::quarantined(project_root)) {
@@ -2886,6 +2911,57 @@ pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
+/// `status`'s lines about a loaded state under its row: what the run is recorded as,
+/// the write lock, the stage's progress and the last action.
+fn status_state_lines(
+    project_root: &Path,
+    state: &State,
+    summary: Option<events::PhaseEventSummary>,
+) -> Vec<String> {
+    let gate = if state.gate_pending {
+        "pending"
+    } else {
+        "none"
+    };
+    let mut lines = vec![
+        format!(
+            "  stage: {} | mode: {} | gate: {gate}",
+            state.stage, state.mode
+        ),
+        format!("  agent: {}", agents::driver_for(state.agent).name()),
+    ];
+    if state.consecutive_failures > 0 {
+        lines.push(format!(
+            "  validate failures: {}",
+            state.consecutive_failures
+        ));
+    }
+    lines.push(format!(
+        "  started: {} ({})",
+        state.started_at,
+        recover::format_age(&state.started_at)
+    ));
+    lines.extend(status_run_lines(state));
+    lines.extend(status_write_lock_line(project_root, state.phase));
+    lines.push(render_stage_progress_line(
+        state.stage,
+        summary.as_ref().and_then(|s| s.stage_launched_ts),
+    ));
+    if let Some(summary) = summary {
+        let ago = summary
+            .event
+            .get("ts")
+            .and_then(|t| t.as_u64())
+            .map(|t| format!(" ({})", recover::format_age(&t.to_string())))
+            .unwrap_or_default();
+        lines.push(format!(
+            "  last action: {}{ago}",
+            events::describe(&summary.event)
+        ));
+    }
+    lines
+}
+
 /// The characters of a gate's context the pending-gate banner, `devflow gate
 /// list` and the notify hook show; `gate show` prints the context in full.
 pub(crate) use devflow_core::gates::GATE_CONTEXT_DISPLAY_CHARS;
@@ -2893,7 +2969,11 @@ pub(crate) use devflow_core::gates::GATE_CONTEXT_DISPLAY_CHARS;
 /// Build the persistent status-side signal for gates awaiting an operator.
 /// Context is agent-controlled, so it must use the same bounded rendering as
 /// gate notifications and failure events.
-fn render_pending_gate_banner(open: &[OpenGate], now: u64) -> Option<String> {
+///
+/// D-09a (review pi-9): a gate is offered approve and reject only while its waiter
+/// registration reads [`WaiterStatus::Live`] ([`Gates::waiter_status`]). A gate nothing
+/// waits on is debris naming `devflow discard`; a probe error offers no answer.
+fn render_pending_gate_banner(project_root: &Path, open: &[OpenGate], now: u64) -> Option<String> {
     if open.is_empty() {
         return None;
     }
@@ -2908,15 +2988,39 @@ fn render_pending_gate_banner(open: &[OpenGate], now: u64) -> Option<String> {
         let context = render_gate_context(&gate.context, GATE_CONTEXT_DISPLAY_CHARS);
         let stage = gate.stage.to_string();
         banner.push_str(&format!(
-            "{marker}: phase {} {stage} ({})\n  {context}\n  approve: devflow gate approve {} --stage {stage}\n  reject:  devflow gate reject {} --stage {stage} --note <reason>\n",
+            "{marker}: phase {} {stage} ({})\n  {context}\n{}",
             gate.phase,
             recover::format_age(&gate.timestamp),
-            gate.phase,
-            gate.phase,
+            banner_answer_lines(project_root, gate),
         ));
     }
     banner.push_str("======================================================");
     Some(banner)
+}
+
+/// The banner's lines under one gate: the answers while its waiter is live, else why
+/// none is offered.
+fn banner_answer_lines(project_root: &Path, gate: &OpenGate) -> String {
+    let (phase, stage) = (gate.phase, gate.stage);
+    let waiter = GateId::parse(&gate.gate_id)
+        .map_err(|error| error.to_string())
+        .and_then(|id| {
+            Gates::waiter_status(project_root, phase, stage, &id).map_err(|e| e.to_string())
+        });
+    match waiter {
+        Ok(WaiterStatus::Live) => format!(
+            "  approve: devflow gate approve {phase} --stage {stage}\n  reject:  devflow gate \
+             reject {phase} --stage {stage} --note <reason>\n"
+        ),
+        Ok(WaiterStatus::Absent) => format!(
+            "  debris: nothing waits on this gate, so an answer would reach no run; remove it \
+             with `devflow discard --phase {phase}`\n"
+        ),
+        Err(error) => format!(
+            "  error: whether anything waits on this gate could not be read ({error}); no \
+             answer is offered\n"
+        ),
+    }
 }
 
 /// List every gate awaiting a human response. When `all_roots` is set,
@@ -6769,6 +6873,145 @@ mod tests {
         String::from_utf8_lossy(&output.stderr).into_owned()
     }
 
+    /// D-09, D-09a, D-20: every row of RESEARCH's status table, one word and one verb
+    /// each, in a process of its own (the runner lock is held and probed here). No row
+    /// names the removed `recover`. Control: a phase with no state, no gate file and a
+    /// free lock has no row.
+    #[test]
+    fn status_words_follow_the_liveness_table() {
+        const NAME: &str = "commands::tests::status_words_follow_the_liveness_table";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_runner_liveness_child(NAME, &[]);
+            return;
+        }
+        use crate::service::double;
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        let phase = PhaseId::new(4403);
+        let (stop, logs, discard) = (
+            format!("`devflow stop --phase {phase}`"),
+            format!("`devflow logs --phase {phase} -f`"),
+            format!("`devflow discard --phase {phase}`"),
+        );
+        let resume = format!("`devflow resume --phase {phase}`");
+        let mut prepared = State::new(phase, AgentKind::Claude, Mode::Supervise, root.into());
+        prepared.verification_baseline_captured = true;
+        prepared.stage = Stage::Code;
+        let loaded = |edit: &dyn Fn(&mut State)| {
+            let mut state = prepared.clone();
+            edit(&mut state);
+            workflow::Existing::Loaded(state)
+        };
+        let row = |label: &str, existing: &workflow::Existing, word: &str, verbs: &[&str]| {
+            let status = run_status(root, phase, existing)
+                .unwrap_or_else(|| panic!("row `{label}`: no row"));
+            let line = status.line(phase);
+            assert_eq!(status.word(), word, "row `{label}`: {line}");
+            assert!(line.starts_with(word), "row `{label}`: {line}");
+            for verb in verbs {
+                assert!(line.contains(verb), "row `{label}` lacks {verb}: {line}");
+            }
+            assert!(!line.contains("recover"), "row `{label}` names recover: {line}");
+        };
+
+        let hold = liveness::claim_runner_lock(root, phase).expect("hold the runner lock");
+        row("held", &loaded(&|_| {}), "live", &[&stop, &logs]);
+        let gate = format!("`devflow gate approve {phase}`");
+        let at_gate = loaded(&|state| state.gate_pending = true);
+        row("held at a gate", &at_gate, "live", &[&gate, &stop]);
+        row("held, no state", &workflow::Existing::Missing, "live", &[&stop]);
+        drop(hold);
+
+        double::set_unit_state(Ok("deactivating"));
+        row("stopping", &loaded(&|_| {}), "live (stopping)", &[&stop]);
+        double::set_unit_state(Ok("inactive"));
+        let finished = loaded(&|state| {
+            state.stopped = true;
+            state.finished = true;
+        });
+        row("finished", &finished, "finished", &[&discard]);
+        let stopped = loaded(&|state| state.stopped = true);
+        row("stopped", &stopped, "stopped", &[&resume, &discard]);
+        row("crashed", &loaded(&|_| {}), "crashed", &[&resume, &discard]);
+        let crashed_at_gate = loaded(&|state| state.gate_pending = true);
+        row("crashed at a gate", &crashed_at_gate, "crashed", &[&resume, &discard]);
+        let reserved = loaded(&|state| state.verification_baseline_captured = false);
+        row("reservation-only", &reserved, "idle", &["devflow start --phase"]);
+
+        assert_eq!(
+            run_status(root, phase, &workflow::Existing::Missing),
+            None,
+            "control: nothing on disk, no row"
+        );
+        Gates::write_gate(
+            root,
+            phase,
+            Stage::Plan,
+            devflow_core::gates::GateKind::StageFailure,
+            "left behind",
+        )
+        .unwrap();
+        row("orphan gates", &workflow::Existing::Missing, "debris", &[&discard]);
+
+        let state_file = workflow::state_path(root, phase);
+        std::fs::write(&state_file, "{ not json").unwrap();
+        let unloadable = existing_state(root, phase);
+        assert!(matches!(unloadable, workflow::Existing::Unloadable(_)));
+        row("unloadable", &unloadable, "unloadable", &[&discard]);
+
+        double::set_unit_state(Err("the bus went away (test double)"));
+        row(
+            "probe error",
+            &loaded(&|_| {}),
+            "error",
+            &["the bus went away (test double)"],
+        );
+    }
+
+    /// D-09a: the banner offers approve and reject for a gate whose waiter registration is
+    /// held, and for the same gate with the waiter gone prints the debris line naming
+    /// `devflow discard` and no answer (control). In a process of its own.
+    #[test]
+    fn the_gate_banner_offers_answers_only_for_a_live_waiter() {
+        const NAME: &str = "commands::tests::the_gate_banner_offers_answers_only_for_a_live_waiter";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_runner_liveness_child(NAME, &[]);
+            return;
+        }
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        let phase = PhaseId::new(4404);
+        Gates::write_gate(
+            root,
+            phase,
+            Stage::Code,
+            devflow_core::gates::GateKind::StageFailure,
+            "stage code failed",
+        )
+        .unwrap();
+        let open = Gates::list_open(root);
+        assert_eq!(open.len(), 1, "{open:?}");
+        let gate_id = GateId::parse(&open[0].gate_id).unwrap();
+        let approve = format!("devflow gate approve {phase} --stage code");
+        let discard = format!("`devflow discard --phase {phase}`");
+
+        let waiter = Gates::register_waiter(root, phase, Stage::Code, &gate_id).unwrap();
+        let banner = render_pending_gate_banner(root, &open, 10_000).unwrap();
+        assert!(banner.contains(&approve), "no approve with a live waiter: {banner}");
+        assert!(banner.contains("devflow gate reject"), "{banner}");
+        assert!(!banner.contains(&discard), "{banner}");
+        drop(waiter);
+
+        let banner = render_pending_gate_banner(root, &open, 10_000).unwrap();
+        assert!(
+            !banner.contains(&approve) && !banner.contains("devflow gate reject"),
+            "banner offered approve without a waiter: {banner}"
+        );
+        assert!(banner.contains("debris"), "{banner}");
+        assert!(banner.contains(&discard), "{banner}");
+        assert!(banner.contains("stage code failed"), "the context stays: {banner}");
+    }
+
     /// D-07: runner_liveness's answers, one row each, in a process of its own (the
     /// runner lock is held and probed here). A held lock is Live whatever the unit
     /// reads; with the lock free a deactivating unit is Stopping and an inactive one
@@ -7494,7 +7737,7 @@ mod tests {
 
         let list = render_gate_list(&open);
         let row = render_all_roots_gate_row(Path::new("/tmp/some-root"), &open[0], 10_000);
-        let banner = render_pending_gate_banner(&open, 10_000).unwrap();
+        let banner = render_pending_gate_banner(dir.path(), &open, 10_000).unwrap();
         for (rendering, text) in [
             ("list", &list),
             ("all-roots row", &row),
@@ -7520,7 +7763,7 @@ mod tests {
         assert!(shown.contains(&context), "{shown}");
         assert!(render_gate_list(&open).contains(&shown));
         assert!(
-            render_pending_gate_banner(&open, 10_000)
+            render_pending_gate_banner(dir.path(), &open, 10_000)
                 .unwrap()
                 .contains(&shown)
         );
@@ -7577,7 +7820,7 @@ mod tests {
         let open = Gates::list_open(dir.path());
         let list = render_gate_list(&open);
         let row = render_all_roots_gate_row(Path::new("/tmp/some-root"), &open[0], 10_000);
-        let banner = render_pending_gate_banner(&open, 10_000).unwrap();
+        let banner = render_pending_gate_banner(dir.path(), &open, 10_000).unwrap();
         for (rendering, text) in [
             ("list", &list),
             ("all-roots row", &row),
@@ -7640,7 +7883,7 @@ mod tests {
             [
                 render_gate_list(&open),
                 render_all_roots_gate_row(Path::new("/tmp/some-root"), &open[0], 10_000),
-                render_pending_gate_banner(&open, 10_000).unwrap(),
+                render_pending_gate_banner(dir.path(), &open, 10_000).unwrap(),
             ]
             .map(|text| text.contains(&closed))
         };
@@ -10459,8 +10702,12 @@ mod tests {
         )
         .unwrap();
         let open = Gates::list_open(dir.path());
+        let gate_id = GateId::parse(&open[0].gate_id).unwrap();
+        let _waiter =
+            Gates::register_waiter(dir.path(), PhaseId::new(16), Stage::Validate, &gate_id)
+                .unwrap();
 
-        let banner = render_pending_gate_banner(&open, u64::MAX).unwrap();
+        let banner = render_pending_gate_banner(dir.path(), &open, u64::MAX).unwrap();
 
         assert!(banner.contains("PENDING GATE"));
         assert!(banner.contains("phase 16"));
