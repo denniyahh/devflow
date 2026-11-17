@@ -5,16 +5,16 @@ milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: "52.2"
 current_phase_name: Foreground Runner
 status: executing
-stopped_at: Completed 52.2-17-PLAN.md
-last_updated: "2026-11-17T18:36:31.885Z"
+stopped_at: Completed 52.2-18-PLAN.md
+last_updated: "2026-11-17T20:56:02.176Z"
 last_activity: 2026-11-16
 last_activity_desc: Phase 52.2 execution started
-state_head: e77c392a463b5fb6b841485956b673e5520f9f37
+state_head: 2d5764fdae2837f592016e6014c9df8fefa960d8
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 66
-  completed_plans: 64
+  completed_plans: 65
   percent: 17
 ---
 
@@ -172,7 +172,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 52.2 (Foreground Runner) — EXECUTING
-Plan: 25 of 26
+Plan: 26 of 26
 Status: Ready to execute
 Last activity: 2026-11-16 — Phase 52.2 execution started
 
@@ -995,6 +995,8 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 52.2]: 52.2-16: cleanup counts merged against the base the run recorded, else the project's, through discard_base, so cleanup and discard agree
 - [Phase 52.2]: 52.2-17: cleanup visits every phase whose .devflow/.runner-NN does not probe free, so a held runner lock with no state keeps its phase and makes the exit non-zero; a free lock file names no phase
 - [Phase 52.2]: 52.2-17: the removed --force surface is guarded by two scans in crates/devflow-cli/tests/removed_surface_scan.rs (CLI code lines outside test modules, and the scoped docs), each with planted controls
+- [Phase 52.2]: 52.2-18: the green commit CI saw is d3be8c7 on feature/phase-52.2-pr, the cut-pr-branch.sh replay of 9de8b28, because the pre-push hook refuses .planning/ on feature/* (operator chose the filtered-branch route)
+- [Phase 52.2]: 52.2-18: 999.222's repeat row uses gsd_reader::tests::a_gaps_found_report_reads_as_gaps_found, the test that failed in 52-24
 
 ## Roadmap Evolution
 
@@ -1170,11 +1172,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 52.2 P15 | 17 min | 3 tasks | 8 files |
 | Phase 52.2 P16 | 26 min | 3 tasks | 7 files |
 | Phase 52.2 P17 | 27 min | 3 tasks | 10 files |
+| Phase 52.2 P18 | 133 min | 3 tasks | 2 files |
 
 ## Session
 
-**Last session:** 2026-11-17T18:36:30.944Z
-**Stopped at:** Completed 52.2-17-PLAN.md
+**Last session:** 2026-11-17T20:56:01.138Z
+**Stopped at:** Completed 52.2-18-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
