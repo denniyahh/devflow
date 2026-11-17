@@ -592,3 +592,106 @@ fn resume_with_no_state_names_start() {
         "a refused resume wrote a state: {text}"
     );
 }
+
+/// Every file under `root`'s `.devflow/` with its bytes, sorted by path; empty when the
+/// directory does not exist.
+fn devflow_tree(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    fn walk(dir: &Path, base: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, base, out);
+            } else {
+                let bytes = fs::read(&path).unwrap_or_default();
+                out.push((path.strip_prefix(base).unwrap().to_path_buf(), bytes));
+            }
+        }
+    }
+    let mut files = Vec::new();
+    let dir = root.join(".devflow");
+    walk(&dir, &dir, &mut files);
+    files.sort();
+    files
+}
+
+/// `.devflow/`'s files and every ref in `root`, the two things a start writes.
+fn repo_snapshot(root: &Path) -> (Vec<(PathBuf, Vec<u8>)>, String) {
+    (devflow_tree(root), git_stdout(root, &["for-each-ref"]))
+}
+
+/// 52.1 D-26: `start --dry-run` over a finished phase prints the refusal a real
+/// `start` prints, and fails as it does.
+#[test]
+fn a_dry_run_over_a_finished_phase_prints_starts_refusal() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    save_phase_state(root, |state| {
+        state.verification_baseline_captured = true;
+        state.finished = true;
+    });
+
+    let (real, _reaper) = start_phase(&home, root, &[]);
+    assert!(
+        !real.status.success(),
+        "premise: start refuses a finished phase: {}",
+        combined(&real)
+    );
+    let (dry, _dry_reaper) = start_phase(&home, root, &["--dry-run"]);
+    assert!(
+        !dry.status.success(),
+        "dry run text differs from start: the dry run passed a phase start refuses\n\
+         start:\n{}\ndry run:\n{}",
+        combined(&real),
+        combined(&dry)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&dry.stderr),
+        String::from_utf8_lossy(&real.stderr),
+        "dry run text differs from start"
+    );
+}
+
+/// 52.1 D-26: a dry run that passes writes nothing: `.devflow/` and every ref are as
+/// they were. Control: a real start over the same repository changes both.
+#[test]
+fn a_dry_run_writes_nothing() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+
+    let before = repo_snapshot(root);
+    let (dry, _dry_reaper) = start_phase(&home, root, &["--dry-run"]);
+    assert!(
+        dry.status.success(),
+        "premise: the dry run passes: {}",
+        combined(&dry)
+    );
+    let after = repo_snapshot(root);
+    assert_eq!(
+        after.0,
+        before.0,
+        "dry run wrote under .devflow/: {}",
+        combined(&dry)
+    );
+    assert_eq!(after.1, before.1, "dry run wrote a ref: {}", combined(&dry));
+
+    let (real, _reaper) = start_phase(&home, root, &[]);
+    assert!(
+        real.status.success(),
+        "control: a real start launches: {}",
+        combined(&real)
+    );
+    wait_for_settled(root);
+    let started = repo_snapshot(root);
+    assert_ne!(
+        started.0, before.0,
+        "control: a real start wrote no .devflow/ file"
+    );
+    assert_ne!(started.1, before.1, "control: a real start wrote no ref");
+}
