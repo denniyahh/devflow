@@ -1117,16 +1117,13 @@ mod tests {
             let mut state = workflow::load_state(project_root, phase)
                 .expect("parent-built state must be available to the child");
 
-            let result = launch_stage_inner(&mut state, None, None);
-
-            // WR-03 / 999.46: the launch above spawned a detached monitor.
-            // Bind its reaper before assertions, while the child still owns
-            // the parent-built fixture root.
-            let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
-
-            result.expect(
+            let launch = launch_stage_inner(&mut state, None, None).expect(
                 "a mid-run stage transition must not re-invoke the staleness adjudication — this \
                  same fixture just refused via the direct start-shaped call above",
+            );
+            assert_eq!(
+                launch.state.stage, state.stage,
+                "the transition resolves the launch of the stage it moved to"
             );
 
             let all_events =

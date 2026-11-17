@@ -902,7 +902,7 @@ fn restart_verb(state: &State) -> String {
     }
 }
 
-/// `resume`'s and a hand-run `advance`'s refusal of a run [`run_never_prepared`] names.
+/// `resume`'s refusal of a run [`run_never_prepared`] names.
 /// Launching it would run the agent in the primary checkout, on whatever branch is
 /// checked out.
 pub(crate) fn refuse_unprepared_run(state: &State) -> Result<(), CliError> {
@@ -14628,16 +14628,6 @@ mod tests {
         assert!(after.supervisor.is_none());
         assert!(!after.stopped, "the refusal marks nothing");
 
-        let err = crate::pipeline_launch::advance_command(root, Some(phase), None)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("never finished preparing"), "{err}");
-        assert_eq!(
-            workflow::load_state(root, phase).unwrap().stage,
-            Stage::Plan,
-            "a hand-run advance launched nothing"
-        );
-
         let prepared = PhaseId::new(5302);
         let mut state = State::new(prepared, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.verification_baseline_captured = true;
@@ -14691,8 +14681,6 @@ mod tests {
         );
 
         let result = start_as_refusal_names(root, phase, false);
-        let launched = workflow::load_state(root, phase).unwrap();
-        let _reap = crate::test_support::ReapMonitorOnDrop::after_launch(&launched);
         result.expect("the start the refusal names launches");
     }
 
@@ -14729,8 +14717,6 @@ mod tests {
         assert!(refused.contains("use --force"), "{refused}");
 
         let result = start_as_refusal_names(root, phase, true);
-        let launched = workflow::load_state(root, phase).unwrap();
-        let _reap = crate::test_support::ReapMonitorOnDrop::after_launch(&launched);
         result.expect("the start the refusal names launches");
     }
 
