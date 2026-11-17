@@ -94,6 +94,23 @@ pub(crate) fn ensure_agent_binary(program: &str) -> Result<(), CliError> {
     )))
 }
 
+/// The integration trunk `start` forks from (45-01 / D-01), resolved once: the resolver
+/// is fail-hard on an explicitly supplied value, and a configured base must also be a
+/// local branch ([`ensure_base_is_a_local_branch`]). The default path keeps its
+/// fall-open for a clone with no local `develop`. Shared by `start` and its dry run
+/// (52.1 D-27), so both refuse the same base the same way.
+///
+/// [`ensure_base_is_a_local_branch`]: crate::commands::ensure_base_is_a_local_branch
+pub(crate) fn resolve_start_base(
+    project_root: &Path,
+) -> Result<devflow_core::config::ResolvedBaseBranch, CliError> {
+    let resolved = devflow_core::config::base_branch(project_root).map_err(CliError::Message)?;
+    if resolved.source != devflow_core::config::BaseBranchSource::Default {
+        crate::commands::ensure_base_is_a_local_branch(project_root, &resolved.value)?;
+    }
+    Ok(resolved)
+}
+
 // ---------------------------------------------------------------------------
 // 23f (gap closure, 23-12): phase-reachability guard. `devflow start` forks
 // a worktree (or, in `--no-worktree` mode, a feature branch) from `develop`

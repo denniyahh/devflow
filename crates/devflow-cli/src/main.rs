@@ -60,7 +60,9 @@ enum Command {
         /// isolated worktree (not recommended for unattended runs).
         #[arg(long)]
         no_worktree: bool,
-        /// Print the pipeline that would run without launching anything.
+        /// Check, read-only, what a real start would refuse, then print the
+        /// pipeline that would run; launches and writes nothing and names the
+        /// start checks it skips.
         #[arg(long)]
         dry_run: bool,
         /// Run the pipeline through `<stage>` and halt cleanly before

@@ -26,7 +26,7 @@ OPERATIONS.md's rate-limit failover section for what the fallback does.
 | `--mode auto\|supervise` | `auto` runs unattended and finishes on a passing Validate (gating only on repeated Validate failure, plus never-silent failure gates); `supervise` also gates every Validate for human review |
 | `--force` | Recreate the phase worktree and feature branch from the base if they exist; refused, with nothing removed, while the branch has commits not merged into the base |
 | `--no-worktree` | Run directly in the primary checkout instead of an isolated worktree (worktree is the default) |
-| `--dry-run` | Print the pipeline that would run without launching anything |
+| `--dry-run` | Check, read-only, what a real start would refuse, then print the pipeline that would run; launches and writes nothing and names the start checks it skips |
 
 ```bash
 devflow start --phase 3 --agent claude --mode auto
