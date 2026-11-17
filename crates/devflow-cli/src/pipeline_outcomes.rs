@@ -18,7 +18,8 @@ use crate::pipeline_gate::{
     transition,
 };
 use crate::pipeline_launch::{
-    close_gate, commit, launch_stage, record_relaunch_note, recorded_canary_refusal,
+    StageLaunch, close_gate, commit, launch_stage_next, record_relaunch_note,
+    recorded_canary_refusal,
 };
 pub(crate) use devflow_core::gates::render_gate_context;
 use devflow_core::gates::{GateAction, GateFile, GateKind, GateLabel, GateResponse};
@@ -47,7 +48,7 @@ pub(crate) fn handle_infra_outcome(
     state: &mut State,
     stage: Stage,
     reason: Option<String>,
-) -> Result<(), CliError> {
+) -> Result<Option<StageLaunch>, CliError> {
     commit(state, |s| {
         s.infra_failures = s.infra_failures.saturating_add(1)
     })?;
@@ -63,7 +64,7 @@ pub(crate) fn gate_or_abort_infra(
     state: &mut State,
     stage: Stage,
     reason: Option<String>,
-) -> Result<(), CliError> {
+) -> Result<Option<StageLaunch>, CliError> {
     if state.infra_failures >= mode::MAX_INFRA_FAILURES {
         return abort(
             project_root,
@@ -73,7 +74,8 @@ pub(crate) fn gate_or_abort_infra(
                 state.infra_failures,
                 mode::MAX_INFRA_FAILURES
             ),
-        );
+        )
+        .map(|()| None);
     }
     handle_stage_failure(project_root, state, stage, reason)
 }
@@ -108,7 +110,7 @@ pub(crate) fn handle_rate_limited_outcome(
     phase: PhaseId,
     stage: Stage,
     reason: Option<String>,
-) -> Result<(), CliError> {
+) -> Result<Option<StageLaunch>, CliError> {
     let reset_at = reset_time::parse_reset_time(&retry_after_from_reason(reason.as_deref()));
     let context = rate_limit_gate_context(state, phase, stage, reason);
     let answer = run_gate(
@@ -1442,7 +1444,7 @@ pub(crate) fn handle_validate_outcome(
     project_root: &Path,
     state: &mut State,
     outcome: ValidateOutcome,
-) -> Result<(), CliError> {
+) -> Result<Option<StageLaunch>, CliError> {
     // WR-08: the evidence root, resolved ONCE for every read in this function.
     // `.planning/` is tracked and the Validate agent runs in the worktree, so
     // the report it authors lands on `feature/phase-{N}` inside the worktree
@@ -1624,7 +1626,7 @@ fn open_verification_gate(
     at: (Stage, GateLabel),
     contexts: (&str, &str),
     ceiling_gate: bool,
-) -> Result<(), CliError> {
+) -> Result<Option<StageLaunch>, CliError> {
     let (stage, label) = at;
     let answer =
         run_gate_with_event_context(project_root, state, stage, label, contexts.0, contexts.1)?;
@@ -1643,11 +1645,11 @@ pub(crate) fn dispatch_answer(
     stage: Stage,
     answer: Answer,
     ceiling_gate: bool,
-) -> Result<(), CliError> {
+) -> Result<Option<StageLaunch>, CliError> {
     match answer {
         // No reset on abort: the phase is ending and `abort` clears its state
         // outright, so there is no budget left to restore.
-        Answer::Abort(reason) => abort(project_root, state, &reason),
+        Answer::Abort(reason) => abort(project_root, state, &reason).map(|()| None),
         Answer::Approve(ApproveRoute::Verification { step, evidence }) => {
             // Reset first: its `commit` replaces `state`.
             reset_phase_failures_at_ceiling(project_root, state, ceiling_gate)?;
@@ -1691,20 +1693,20 @@ fn run_status_less_step(
     state: &mut State,
     stage: Stage,
     step: StatusLessStep,
-) -> Result<(), CliError> {
+) -> Result<Option<StageLaunch>, CliError> {
     // CR-01: close the gate before relaunching; its answer is spent.
     let _ = close_gate(project_root, state.phase, stage);
     state.gate_pending = false;
     match step {
         StatusLessStep::RetryStage | StatusLessStep::RelaunchNow => {
-            launch_stage(state, None, Some(stage))
+            launch_stage_next(state, None, Some(stage))
         }
         StatusLessStep::RelaunchWithNote(note) => {
             // GATE-01 / D-39: the note is the operator's word for this
             // relaunch, committed before the launch. It is never the fix
             // request, so `code_fix` and `code_fix_note` are left alone.
             record_relaunch_note(state, Some(note))?;
-            launch_stage(state, None, Some(stage))
+            launch_stage_next(state, None, Some(stage))
         }
         StatusLessStep::RelaunchRefused { refusal, note } => {
             // 52-26: a reject's note is kept for the `devflow resume --agent
@@ -1712,7 +1714,7 @@ fn run_status_less_step(
             if let Some(note) = note {
                 record_relaunch_note(state, Some(note))?;
             }
-            refuse_relaunch(project_root, state, stage, &refusal)
+            refuse_relaunch(project_root, state, stage, &refusal).map(|()| None)
         }
         StatusLessStep::PreflightOverride | StatusLessStep::RecordCheckpointSet => {
             Err(CliError::Message(format!(
@@ -1735,10 +1737,10 @@ fn run_step(
     step: Step,
     evidence: Option<&Evidence>,
     reason: LoopBackReason,
-) -> Result<(), CliError> {
+) -> Result<Option<StageLaunch>, CliError> {
     match step {
         // D-05, D-45 rule 1: the permit is the proof `can_finish` held.
-        Step::Finish(permit) => finish_run(project_root, state, permit),
+        Step::Finish(permit) => finish_run(project_root, state, permit).map(|()| None),
         Step::GapLoop => {
             let _ = close_gate(project_root, state.phase, stage);
             state.gate_pending = false;
@@ -1801,7 +1803,7 @@ fn reopen_verification_gate(
     state: &mut State,
     stage: Stage,
     evidence: &Evidence,
-) -> Result<(), CliError> {
+) -> Result<Option<StageLaunch>, CliError> {
     let _ = close_gate(project_root, state.phase, stage);
     let (kind, context, event_context) = match &evidence.read {
         Ok(report) => {
@@ -1973,7 +1975,7 @@ const GSD_FIELD_NOT_FOUND: &str = "Field not found";
 pub(crate) fn handle_gaps_plan_outcome(
     project_root: &Path,
     state: &mut State,
-) -> Result<(), CliError> {
+) -> Result<Option<StageLaunch>, CliError> {
     let evidence_root: PathBuf = state
         .worktree_path
         .clone()
@@ -2274,7 +2276,7 @@ pub(crate) fn handle_stage_failure(
     state: &mut State,
     stage: Stage,
     reason: Option<String>,
-) -> Result<(), CliError> {
+) -> Result<Option<StageLaunch>, CliError> {
     let context = failure_gate_context(state, stage, reason);
     answer_stage_failure_gate(project_root, state, stage, &context)
 }
@@ -2289,7 +2291,7 @@ fn answer_stage_failure_gate(
     state: &mut State,
     stage: Stage,
     context: &str,
-) -> Result<(), CliError> {
+) -> Result<Option<StageLaunch>, CliError> {
     let answer = run_gate(project_root, state, stage, GateKind::StageFailure, context)?;
     dispatch_answer(project_root, state, stage, answer, false)
 }
@@ -2303,10 +2305,10 @@ fn relaunch_or_refuse(
     project_root: &Path,
     state: &mut State,
     stage: Stage,
-) -> Result<(), CliError> {
+) -> Result<Option<StageLaunch>, CliError> {
     match recorded_canary_refusal(state) {
-        Some(refusal) => refuse_relaunch(project_root, state, stage, &refusal),
-        None => launch_stage(state, None, Some(stage)),
+        Some(refusal) => refuse_relaunch(project_root, state, stage, &refusal).map(|()| None),
+        None => launch_stage_next(state, None, Some(stage)),
     }
 }
 

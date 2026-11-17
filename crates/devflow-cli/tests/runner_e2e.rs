@@ -73,6 +73,9 @@ struct RunnerFixture {
     phase: PhaseId,
     fake_bin: common::FakeBin,
     gsd_logs: tempfile::TempDir,
+    /// The runner child's `PATH` after the fake service manager, when it is not
+    /// [`path_with_fake_bin`]'s.
+    runner_path: Option<String>,
     _repo: tempfile::TempDir,
     /// Declared last so it drops after the rest of the fixture.
     home: common::HermeticHome,
@@ -82,11 +85,21 @@ impl RunnerFixture {
     /// A Codex/Supervise state at Plan with `stop_until`, and a `codex` stub whose body
     /// is `agent_body`.
     fn new(phase: PhaseId, stop_until: Option<Stage>, agent_body: &str) -> Self {
+        Self::with_agent(phase, stop_until, |_| agent_body.to_string())
+    }
+
+    /// [`Self::new`] with the stub body `agent(root)` returns, for a stub that reads a
+    /// file under the fixture root.
+    fn with_agent(
+        phase: PhaseId,
+        stop_until: Option<Stage>,
+        agent: impl FnOnce(&Path) -> String,
+    ) -> Self {
         let repo = tempfile::tempdir().unwrap();
         // The binary canonicalizes `--project`, so the fixture must too.
         let root = repo.path().canonicalize().unwrap();
         init_repo(&root, phase);
-        let fake_bin = common::fake_bin_dir_for("codex", agent_body);
+        let fake_bin = common::fake_bin_dir_for("codex", &agent(&root));
         let mut state = devflow_core::state::State::new(
             phase,
             devflow_core::state::AgentKind::Codex,
@@ -102,6 +115,7 @@ impl RunnerFixture {
             phase,
             fake_bin,
             gsd_logs: tempfile::tempdir().unwrap(),
+            runner_path: None,
             _repo: repo,
             home: common::HermeticHome::new(),
         };
@@ -160,6 +174,9 @@ impl RunnerFixture {
     /// `devflow __runner --project ROOT --phase N` with `NOTIFY_SOCKET` unset.
     fn runner(&self) -> Command {
         let mut command = self.devflow();
+        if let Some(path) = &self.runner_path {
+            command.hermetic_path(path);
+        }
         command
             .env_remove("NOTIFY_SOCKET")
             .arg("__runner")
@@ -439,11 +456,10 @@ fn a_runner_drives_plan_code_validate_and_finishes_after_a_gate_approve_from_a_s
         "a stage ran outside the runner: ppids {lines:?}, runner pid {runner_pid}, outside {outside:?}"
     );
     // Control: a non-runner parent in the Code line is reported.
-    let sleeper = Command::new("sleep")
+    let mut sleeper = Command::new("sleep")
         .arg("30")
         .spawn()
         .expect("spawn sleep");
-    let mut sleeper = scopeguard_child(sleeper);
     let mut planted = lines.clone();
     planted[1] = sleeper.id().to_string();
     let reported = runs_outside_the_runner(runner_pid, &planted);
@@ -476,6 +492,11 @@ fn a_runner_drives_plan_code_validate_and_finishes_after_a_gate_approve_from_a_s
     );
     let state = fixture.state().expect("a finished run keeps its state");
     assert!(state.finished, "runner did not finish: state {state:?}");
+    let answers = fixture.events_of("gate_response_written");
+    assert!(
+        answers.len() == 1 && answers[0]["approved"] == true,
+        "exactly one gate approve answer: {answers:?}"
+    );
     assert_eq!(
         fixture.events_of("stage_launched").len(),
         3,
@@ -494,11 +515,6 @@ fn a_runner_drives_plan_code_validate_and_finishes_after_a_gate_approve_from_a_s
         Held::Live,
         "holder probe missed a held holder"
     );
-}
-
-/// A child process, reaped by [`common::kill_and_reap`] by its caller.
-fn scopeguard_child(child: Child) -> Child {
-    child
 }
 
 /// D-11, the control for the approve case: a `devflow gate reject N --note TEXT` from a
@@ -539,5 +555,344 @@ fn a_runner_at_a_rejected_gate_does_not_finish() {
     assert!(
         fixture.state().is_none_or(|state| !state.finished),
         "rejected run read finished after the abort"
+    );
+}
+
+/// Every event line in the project's event log, in order.
+fn all_events(fixture: &RunnerFixture) -> Vec<serde_json::Value> {
+    fs::read_to_string(devflow_core::events::events_path(&fixture.root))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .collect()
+}
+
+/// The index in [`all_events`] of the first event named `kind`, if any.
+fn first_position(events: &[serde_json::Value], kind: &str) -> Option<usize> {
+    events.iter().position(|event| event["event"] == kind)
+}
+
+/// Wait until the runner exits or a gate file for any stage is open, at most
+/// [`RUNNER_WAIT`].
+fn wait_for_exit_or_gate(fixture: &RunnerFixture, runner: &mut RunnerChild) {
+    let deadline = Instant::now() + RUNNER_WAIT;
+    while runner.running()
+        && ![Stage::Plan, Stage::Code, Stage::Validate]
+            .into_iter()
+            .any(|stage| fixture.gate_open(stage))
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the runner neither exited nor gated within {RUNNER_WAIT:?}"
+        );
+        std::thread::sleep(RUNNER_POLL);
+    }
+}
+
+/// A `codex` stub whose first act is to record, as one `exit=… idle=…` line in a `seen`
+/// file beside it, whether the exit file `exit` and the idle-timeout record `idle` are
+/// present, then reports a passing turn.
+fn codex_recording_side_channels(exit: &Path, idle: &Path) -> String {
+    format!(
+        "e=absent; [ -e '{exit}' ] && e=present\n\
+         i=absent; [ -e '{idle}' ] && i=present\n\
+         printf 'exit=%s idle=%s\\n' \"$e\" \"$i\" >> \"$(dirname \"$0\")/seen\"\n\
+         {PASSING_CODEX}",
+        exit = exit.display(),
+        idle = idle.display()
+    )
+}
+
+/// What a monitor writes as an idle-timeout record (the keys of agent_result.rs's
+/// `IdleTimeoutRecord`).
+const STALE_IDLE_TIMEOUT_RECORD: &str = r#"{"status":"idle_timeout","idle_secs":30,"agent_pid":4242,"written_at":1700000000,"commits":[]}"#;
+
+/// D-02 (review r2 codex-1 = pi-1): in a two-stage run each launch archives the previous
+/// capture into history first, and no stale `-exit` or `-idle-timeout` file is present
+/// when a stage's agent starts; each `stage_launched` names the runner's pid.
+#[test]
+fn each_runner_launch_archives_the_previous_capture_and_clears_its_side_channels() {
+    use devflow_core::agent_result;
+    let phase = PhaseId::new(85);
+    let fixture = RunnerFixture::with_agent(phase, Some(Stage::Code), |root| {
+        codex_recording_side_channels(
+            &agent_result::exit_code_path(root, phase),
+            &agent_result::idle_timeout_path(root, phase),
+        )
+    });
+    let stdout = agent_result::stdout_path(&fixture.root, phase);
+    let exit = agent_result::exit_code_path(&fixture.root, phase);
+    let idle = agent_result::idle_timeout_path(&fixture.root, phase);
+    fs::create_dir_all(stdout.parent().expect("a .devflow dir")).unwrap();
+    fs::write(&stdout, "stale capture\n").unwrap();
+    fs::write(&exit, "0\n").unwrap();
+    fs::write(&idle, STALE_IDLE_TIMEOUT_RECORD).unwrap();
+    assert!(
+        stdout.is_file() && exit.is_file() && idle.is_file(),
+        "a planted stale file is missing before the run"
+    );
+
+    let mut runner = fixture.spawn_runner();
+    let runner_pid = runner.pid;
+    wait_for_exit_or_gate(&fixture, &mut runner);
+    let seen = fixture.lines_beside_agent("seen");
+    for (index, line) in seen.iter().enumerate() {
+        let stage = ["Plan", "Code"].get(index).copied().unwrap_or("a later");
+        assert!(
+            !line.contains("exit=present"),
+            "stale exit file seen by the {stage} agent: {seen:?}"
+        );
+        assert!(
+            !line.contains("idle=present"),
+            "stale idle-timeout record seen by the {stage} agent: {seen:?}"
+        );
+    }
+    let output = runner.wait();
+    assert!(
+        exited_zero(output.status),
+        "runner failed: {}",
+        shown(&output)
+    );
+    assert_eq!(
+        seen,
+        vec!["exit=absent idle=absent"; 2],
+        "the Plan and Code agents each ran once"
+    );
+
+    let archived: Vec<String> = fs::read_dir(agent_result::history_dir(&fixture.root, phase))
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().ends_with("-stdout"))
+                .map(|entry| fs::read_to_string(entry.path()).unwrap_or_default())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        archived.len() == 2
+            && archived.iter().any(|text| text.contains("stale capture"))
+            && archived.iter().any(|text| text.contains("DEVFLOW_RESULT")),
+        "no archived capture in history (the stale one and Plan's): {archived:?}"
+    );
+    let captures = fixture.events_of("capture_archived");
+    assert!(
+        captures.len() == 2 && captures[1]["stage"] == "plan" && captures[1]["to_stage"] == "code",
+        "expected two capture_archived, the second from plan to code: {captures:?}"
+    );
+    let launched = fixture.events_of("stage_launched");
+    let stages: Vec<&str> = launched
+        .iter()
+        .map(|event| event["stage"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(stages, ["plan", "code"], "stage_launched in run order");
+    assert!(
+        launched
+            .iter()
+            .all(|event| event["runner_pid"].as_u64() == Some(u64::from(runner_pid))),
+        "stage_launched without runner_pid {runner_pid}: {launched:?}"
+    );
+    let evaluated = fixture.events_of("advance_evaluated");
+    assert!(
+        evaluated
+            .iter()
+            .any(|event| event["stage"] == "plan" && event["status"] == "success"),
+        "stale idle-timeout record seen: Plan's verdict is not a pass: {evaluated:?}"
+    );
+}
+
+/// Symlinks, in a new scratch dir, to only the tools a run invokes by name, resolved
+/// from this test's own `PATH`.
+fn tools_dir(tools: &[&str]) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    for tool in tools {
+        let found = std::env::split_paths(&path)
+            .map(|entry| entry.join(tool))
+            .find(|candidate| candidate.is_file())
+            .unwrap_or_else(|| panic!("`{tool}` is not on this test's PATH"));
+        std::os::unix::fs::symlink(found, dir.path().join(tool)).unwrap();
+    }
+    dir
+}
+
+/// The tools a run with a capture-shape stub invokes by name.
+const RUN_TOOLS: [&str; 3] = ["git", "sh", "rm"];
+
+/// D-02, never silent (review r2 codex-6): a `codex` missing at the next stage makes
+/// launch_stage_next's binary check refuse inside the advance. The runner emits
+/// `runner_advance_failed` for Code, opens the infra gate, and exits 1 after a
+/// `devflow gate abort N` from a second process. Control: the same PATH with the stub
+/// kept launches Code.
+#[test]
+fn a_missing_agent_binary_at_the_next_stage_opens_the_infra_gate_with_an_event() {
+    let tools = tools_dir(&RUN_TOOLS);
+    assert!(
+        !tools.path().join("codex").exists(),
+        "a codex is on the test PATH"
+    );
+
+    // Control first: the stub kept, stop_until Code, on the same PATH shape.
+    let control_phase = PhaseId::new(86);
+    let mut control = RunnerFixture::new(control_phase, Some(Stage::Code), PASSING_CODEX);
+    control.runner_path = Some(format!(
+        "{}:{}",
+        control.fake_bin.path.display(),
+        tools.path().display()
+    ));
+    let output = control.spawn_runner().wait();
+    assert!(
+        exited_zero(output.status),
+        "the kept-stub control failed: {}",
+        shown(&output)
+    );
+    assert_eq!(
+        control.events_of("stage_launched").len(),
+        2,
+        "the kept-stub control did not launch Code"
+    );
+    assert!(
+        control.events_of("runner_advance_failed").is_empty(),
+        "control run wrote runner_advance_failed"
+    );
+
+    let phase = PhaseId::new(87);
+    let removing = format!("rm -f -- \"$0\"\n{PASSING_CODEX}");
+    let mut fixture = RunnerFixture::new(phase, Some(Stage::Code), &removing);
+    fixture.runner_path = Some(format!(
+        "{}:{}",
+        fixture.fake_bin.path.display(),
+        tools.path().display()
+    ));
+    let mut runner = fixture.spawn_runner();
+    wait_for_exit_or_gate(&fixture, &mut runner);
+    assert!(runner.running(), "runner exited at a failed advance");
+    assert!(
+        !fixture.beside_agent("codex").exists(),
+        "the stub did not remove itself"
+    );
+    let events = all_events(&fixture);
+    let failed = fixture.events_of("runner_advance_failed");
+    assert!(
+        failed.len() == 1
+            && failed[0]["stage"] == "code"
+            && failed[0]["agent"] == "codex"
+            && failed[0]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("not found — is it installed?")),
+        "no runner_advance_failed event for Code: {failed:?}"
+    );
+    let failed_at = first_position(&events, "runner_advance_failed");
+    let gated_at = events
+        .iter()
+        .rposition(|event| event["event"] == "gate_fired" && event["stage"] == "code");
+    assert!(
+        matches!((failed_at, gated_at), (Some(failed), Some(gated)) if gated > failed),
+        "no infra gate after a failed advance"
+    );
+    let state = fixture.state().expect("the state at the infra gate");
+    assert_eq!(state.infra_failures, 1, "infra_failures at the gate");
+    let stages: Vec<String> = fixture
+        .events_of("stage_launched")
+        .iter()
+        .map(|event| event["stage"].to_string())
+        .collect();
+    assert_eq!(stages, ["\"plan\""], "only Plan was launched");
+
+    fixture.gate(&["abort", &phase.to_string()]);
+    let output = runner.wait();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "an aborted run's runner exits 1: {}",
+        shown(&output)
+    );
+}
+
+/// D-02, never silent (W-2): a `codex` stub the binary check accepts (a regular file with
+/// its execute bit) whose `#!` names an interpreter that does not exist fails at the
+/// exec inside the runner's `monitor::run_stage`. The runner emits `stage_launch_failed`,
+/// opens the infra gate, and exits 1 after a `devflow gate abort N` from a second
+/// process. Control: a working stub runs Plan with no such event.
+#[test]
+fn a_stage_the_runner_cannot_start_opens_the_infra_gate_with_an_event() {
+    // No other `codex` may be on the runner's PATH: a failed exec of the stub would
+    // otherwise go on to the next `codex` the PATH search finds.
+    let tools = tools_dir(&RUN_TOOLS);
+    assert!(
+        !tools.path().join("codex").exists(),
+        "a codex is on the test PATH"
+    );
+    let only_the_stub = |fixture: &mut RunnerFixture| {
+        fixture.runner_path = Some(format!(
+            "{}:{}",
+            fixture.fake_bin.path.display(),
+            tools.path().display()
+        ));
+    };
+    let mut control = RunnerFixture::new(PhaseId::new(88), Some(Stage::Plan), PASSING_CODEX);
+    only_the_stub(&mut control);
+    let output = control.spawn_runner().wait();
+    assert!(
+        exited_zero(output.status),
+        "the working-stub control failed: {}",
+        shown(&output)
+    );
+    assert!(
+        control
+            .events_of("advance_evaluated")
+            .iter()
+            .any(|event| event["stage"] == "plan" && event["status"] == "success"),
+        "the control recorded no Plan verdict"
+    );
+    assert!(
+        control.events_of("stage_launch_failed").is_empty(),
+        "control run wrote stage_launch_failed"
+    );
+
+    let phase = PhaseId::new(89);
+    let mut fixture = RunnerFixture::new(phase, Some(Stage::Plan), PASSING_CODEX);
+    only_the_stub(&mut fixture);
+    let stub = fixture.beside_agent("codex");
+    fs::write(&stub, "#!/nonexistent/devflow-test-interpreter\n").unwrap();
+    fs::set_permissions(&stub, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+
+    let mut runner = fixture.spawn_runner();
+    wait_for_exit_or_gate(&fixture, &mut runner);
+    assert!(runner.running(), "runner exited at a failed start");
+    let events = all_events(&fixture);
+    let failed = fixture.events_of("stage_launch_failed");
+    assert!(
+        failed.len() == 1
+            && failed[0]["stage"] == "plan"
+            && failed[0]["agent"] == "codex"
+            && failed[0]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("spawn")),
+        "no stage_launch_failed event: {failed:?}"
+    );
+    let failed_at = first_position(&events, "stage_launch_failed");
+    let gated_at = events
+        .iter()
+        .rposition(|event| event["event"] == "gate_fired" && event["stage"] == "plan");
+    assert!(
+        matches!((failed_at, gated_at), (Some(failed), Some(gated)) if gated > failed),
+        "no infra gate after a failed start"
+    );
+    assert_eq!(
+        fixture
+            .state()
+            .expect("the state at the infra gate")
+            .infra_failures,
+        1,
+        "infra_failures at the gate"
+    );
+
+    fixture.gate(&["abort", &phase.to_string()]);
+    let output = runner.wait();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "an aborted run's runner exits 1: {}",
+        shown(&output)
     );
 }
