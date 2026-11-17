@@ -395,8 +395,7 @@ pub(crate) fn start(
     }
 
     if dry_run {
-        print_dry_run(&state);
-        return Ok(());
+        return start_dry_run(project_root, &state);
     }
 
     // D-03: no launch without an answering user manager, and no fallback launch.
@@ -439,6 +438,29 @@ pub(crate) fn start(
             )))
         }
     }
+}
+
+/// `start --dry-run` (52.1 D-26): the real start's guard sequence, read-only and in its
+/// order, then the pipeline preview. The manager probe comes first, as in [`start`]
+/// (D-03); the facts are read without the phase holder, the write lock or a
+/// reservation, and the state is read without the lock, so nothing is written.
+fn start_dry_run(project_root: &Path, state: &State) -> Result<(), CliError> {
+    let phase = state.phase;
+    refuse_without_a_user_manager(phase, LaunchVerb::Start)?;
+    let facts = gather_guard_facts(project_root, phase, LaunchVerb::Start)?;
+    let state_file = workflow::state_path(project_root, phase);
+    let existing = match workflow::load_state(project_root, phase) {
+        Ok(loaded) => workflow::Existing::Loaded(loaded),
+        Err(workflow::WorkflowError::MissingState(_)) => workflow::Existing::Missing,
+        Err(error) => workflow::Existing::Unloadable(error),
+    };
+    let facts = GuardFacts {
+        state: StateFact::of(&existing, &state_file),
+        ..facts
+    };
+    launch_guards(phase, &facts)?;
+    print_dry_run(state);
+    Ok(())
 }
 
 /// D-03 (review codex-2, agy-6): refuse `verb` when the systemd user manager does not
