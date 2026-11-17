@@ -259,3 +259,9 @@ else
     echo "pre-push: scripts/check-in-container.sh all"
     scripts/check-in-container.sh all
 fi
+
+# The host-only user-unit tests (D-07b), on both branches above: the pinned
+# container has no systemd user manager, so they cannot run inside it. The
+# target fails, naming what is missing, when no user manager answers.
+echo "pre-push: scripts/check.sh service"
+scripts/check.sh service
