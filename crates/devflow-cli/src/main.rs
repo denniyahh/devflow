@@ -25,7 +25,7 @@ mod service;
 mod commands;
 use commands::{
     GateAnswerKind, cleanup, discard, doctor, gate_list, gate_respond, gate_show, gate_sweep,
-    history_cmd, logs, recover_cmd, start, status, stop,
+    history_cmd, logs, start, status, stop,
 };
 use devflow_core::phase_id::PhaseId;
 
@@ -241,9 +241,10 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Remove a phase's worktree, its uncommitted changes, its run state and
-    /// its feature branch, after listing them. Refuses a live run; refuses an
-    /// unmerged branch unless `--delete-unmerged-branch` names it.
+    /// Remove a phase's worktree, its uncommitted changes, its run state, its
+    /// feature branch, and the gate files and hold temps a killed run left,
+    /// after listing them. Refuses a live run or a gate something still waits
+    /// on; refuses an unmerged branch unless `--delete-unmerged-branch` names it.
     Discard {
         /// Phase to discard.
         #[arg(long)]
@@ -261,20 +262,6 @@ enum Command {
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
-    },
-    /// Recover or inspect stale/abandoned workflow state.
-    Recover {
-        /// Project root.
-        #[arg(default_value = ".")]
-        project: PathBuf,
-        /// Clean up stale state instead of just inspecting. Only stale
-        /// phases are swept; combine with --phase to clear a specific
-        /// phase regardless of staleness.
-        #[arg(long)]
-        clean: bool,
-        /// Restrict the command to one phase.
-        #[arg(long)]
-        phase: Option<PhaseId>,
     },
     /// Audit the environment and report what's installed, missing, or broken.
     Doctor {
@@ -642,11 +629,6 @@ fn run() -> Result<(), CliError> {
             delete_unmerged_branch.as_deref(),
         ),
         Command::Status { project } => status(&project_root(project)?),
-        Command::Recover {
-            project,
-            clean,
-            phase,
-        } => recover_cmd(&project_root(project)?, clean, phase),
         Command::Doctor { json, project } => doctor(&project_root(project)?, json),
         Command::Stop {
             phase,

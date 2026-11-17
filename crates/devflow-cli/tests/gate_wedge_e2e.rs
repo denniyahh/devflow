@@ -840,19 +840,25 @@ fn advance_wedge_arm_killed_advance_leaves_a_code_gate_that_reject_reports_hones
         "unexpected output: {output_text}"
     );
 
+    // The fixture's phase branch is checked out in the primary checkout with commits
+    // of its own, so discard needs `develop` checked out and the branch named.
+    git(root, &["switch", "-q", "develop"]);
+    let branch = format!("feature/phase-{}", phase.padded());
     let recovery = common::hermetic_devflow(&home)
-        .args(["recover", "--clean", "--phase", &phase.to_string()])
+        .args(["discard", "--phase", &phase.to_string()])
+        .args(["--delete-unmerged-branch", &branch])
         .arg(root)
         .output()
-        .expect("recover the wedge");
+        .expect("discard the wedge");
     assert!(
         recovery.status.success(),
-        "recover --clean failed: {}",
+        "discard failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&recovery.stdout),
         String::from_utf8_lossy(&recovery.stderr)
     );
     assert!(
         !devflow_core::workflow::state_path(root, phase).exists(),
-        "recovery must remove the wedged state"
+        "discard must remove the wedged state"
     );
     assert!(
         !Gates::dir(root)
@@ -863,7 +869,7 @@ fn advance_wedge_arm_killed_advance_leaves_a_code_gate_that_reject_reports_hones
                 .file_name()
                 .to_string_lossy()
                 .starts_with(&format!("{}-", phase.padded()))),
-        "recovery must remove every gate artifact for the wedged phase"
+        "discard must remove every gate artifact for the wedged phase once its waiter is dead"
     );
     assert!(
         !root
@@ -877,7 +883,7 @@ fn advance_wedge_arm_killed_advance_leaves_a_code_gate_that_reject_reports_hones
                     .to_string_lossy()
                     .ends_with(".tmp")
             }),
-        "recovery must remove orphaned temporary files"
+        "discard must remove orphaned temporary files"
     );
 }
 
@@ -1142,31 +1148,34 @@ fn start_wedge_arm_interrupted_start_leaves_a_plan_gate_nothing_answers() {
         "precondition: the killed runner no longer holds its runner lock"
     );
 
+    // `start` checked the phase branch out in the primary checkout, which discard
+    // refuses to delete a branch from.
+    git(root, &["switch", "-q", "develop"]);
     let recovery = common::hermetic_devflow(&home)
-        .args(["recover", "--clean", "--phase", &phase.to_string()])
+        .args(["discard", "--phase", &phase.to_string()])
         .arg(root)
         .output()
-        .expect("recover the interrupted run");
+        .expect("discard the interrupted run");
     assert!(
         recovery.status.success(),
-        "recover --clean failed\nstdout: {}\nstderr: {}",
+        "discard failed\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&recovery.stdout),
         String::from_utf8_lossy(&recovery.stderr)
     );
     assert!(
         !state_path.exists(),
-        "recovery must remove the interrupted run's state"
+        "discard must remove the interrupted run's state"
     );
     let gates_left = phase_gate_entries(root, phase);
     assert!(
         gates_left.is_empty(),
-        "recovery must remove every gate file for the phase: {gates_left:?}"
+        "discard must remove every gate file for the phase once its waiter is dead: {gates_left:?}"
     );
     for temp_dir in [&devflow_dir, &gates_dir] {
         let temps_left = dir_entries(temp_dir, |name| name.ends_with(".tmp"));
         assert!(
             temps_left.is_empty(),
-            "recovery must remove orphaned write temps in {}: {temps_left:?}",
+            "discard must remove orphaned write temps in {}: {temps_left:?}",
             temp_dir.display()
         );
     }
