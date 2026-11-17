@@ -15,3 +15,8 @@
   status: open
   **What:** CONTRIBUTING.md's "Required checks" paragraph says the `--all-targets` regression guards live in `crates/devflow-cli/tests/devcontainer_ci_failfast.rs`; no such file exists in the tree (checked by 52.2-03 with `ls`). The guards it describes are presumably in `ci_parity_guards.rs`, unconfirmed.
   **Why deferred:** pre-existing doc drift beside 52.2-03's CONTRIBUTING edit, not caused by it. Fix shape: point the sentence at the file that holds the guards. Owner: the phase's docs pass or any CONTRIBUTING change.
+
+- Repair lines still name `devflow stop --launch`, which 52.2-06 removed
+  status: open
+  **What:** `devflow doctor`'s orphan-supervisor finding (`crates/devflow-cli/src/commands.rs`, `repair: Some(format!("devflow stop --phase {phase} --launch {launch_id}"))`), the launch guard's leftover-socket refusal (`` `devflow stop --phase {phase} --launch {id}` first ``) and OPERATIONS.md's stop row still print or document `--launch`. 52.2-06 removed the flag with `stop_launch` (D-05), so following one of those lines now fails clap's argument parse.
+  **Why deferred:** both code paths read the detached supervisor's sockets (`possibly_live_sockets`, `socket_live_socket`), which 52.2-06 keeps for 52.2-23 to delete with their other callers; a `start` or `resume` since 52.2-06 creates no such socket, so only a run from an older binary reaches them. OPERATIONS.md is 52.2-22's. Fix shape: 52.2-23 deletes the socket findings and refusals with those helpers; 52.2-22 rewrites the stop row.
