@@ -454,8 +454,8 @@ pub(crate) fn take_with_hook(
 
 /// Remove the hold temps in `dir` that a creator died leaving: a name of
 /// [`HOLD_TEMP_SUFFIX`]'s shape, unheld, whose creator pid is not a live process.
-/// Returns the paths removed. `recover --clean` (50.1-21) calls this for
-/// `.devflow/` and the gates directory.
+/// Returns the paths removed. `devflow discard` calls this for `.devflow/` and the
+/// gates directory.
 ///
 /// A temp is never a hold. Removing an unheld temp of a dead creator is safe
 /// because the hold, if it was ever published, lives on under its final name,

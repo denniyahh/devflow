@@ -1277,34 +1277,6 @@ impl Gates {
     /// existing hold name, so the probe and the removal cannot race a waiter. A live
     /// one is never removed here: only its owner does that, through
     /// [`WaiterRegistration::finish`] (R-06).
-    /// Every waiter registration file of `phase`, live or not. No directory lists as
-    /// no files.
-    ///
-    /// # Errors
-    /// The gates directory exists and could not be read.
-    pub(crate) fn waiter_files(
-        project_root: &Path,
-        phase: PhaseId,
-    ) -> std::io::Result<Vec<PathBuf>> {
-        let entries = match std::fs::read_dir(Self::dir(project_root)) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(error),
-        };
-        let prefix = format!("{}-", phase.padded());
-        let mut files = Vec::new();
-        for entry in entries {
-            let entry = entry?;
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            if name.starts_with(&prefix) && name.ends_with(WAITER_SUFFIX) {
-                files.push(entry.path());
-            }
-        }
-        files.sort();
-        Ok(files)
-    }
-
     fn remove_abandoned_waiters(
         project_root: &Path,
         phase: PhaseId,
