@@ -787,6 +787,16 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.241: `start` Should Warn or Refuse Up Front When GSD's Derived Files Are Not Ignored (BACKLOG)
+
+**Found:** 2026-11-17, Phase 52.2 plan 52.2-19, from 999.238 (enhancement, not a defect in shipped behaviour).
+**Gap:** a project that does not ignore GSD's derived files (`.planning/state.json`, `.planning/milestone.lock`) runs
+through Plan and Code and only then stops at Validate, where the clean-tree rule counts no pass and each approve loops
+back into Validate. **Evidence:** 52.2-PROOF-RUN.md attempt 1, gate text "[never-silent] the tree has uncommitted changes
+(.planning/state.json); a Validate pass counts only on a clean tree. No Validate pass counts on this commit."
+**Fix shape (not decided):** `devflow start` and `start --dry-run` check `git check-ignore` for each derived path on the
+base and warn or refuse before launching, naming the `.gitignore` lines to add. **Owner:** a later phase.
+
 ### Phase 999.240: The Post-Commit Stale-State Marker Leaves the Phase Worktree Dirty, So an Installed Build Reads `dirty` (BACKLOG)
 
 **Found:** 2026-11-17, Phase 52.2 plan 52.2-19 Task 1, before the install.
@@ -828,6 +838,9 @@ runtime file (`.planning/milestone.lock`) also appears during a run.
 `.planning/milestone.lock` (a `scripts/` change, so reinstall and rerun the proof); or (b) DevFlow's clean-tree rule
 ignores GSD's derived files, or preflight refuses a project that does not ignore them, naming the line to add.
 **Owner:** Phase 52.2: it blocks the proof run (52.2-19).
+**Fixture cause fixed (operator chose (a), 2026-11-17):** commit 84bb59d makes `scripts/scratch-dogfood-repo.sh`'s
+default mode commit a `.gitignore` with `.devflow/`, `.worktrees/`, `.planning/state.json` and
+`.planning/milestone.lock`. The product side (a project that does not ignore them) is 999.241.
 
 ### Phase 999.237: `discard` and `start` Do Not Look for a Held Launch Lock a Loadable State Does Not Name (BACKLOG)
 
