@@ -135,6 +135,19 @@ fn start_phase(
     (output, reaper)
 }
 
+/// Wait until phase 12's run settles at a gate or a stop, so the reaper ends a quiet run.
+fn wait_for_settled(root: &Path) {
+    for _ in 0..400 {
+        if let Ok(state) = devflow_core::workflow::load_state(root, PhaseId::new(PHASE))
+            && (state.gate_pending || state.stopped)
+        {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    panic!("timed out waiting for phase {PHASE} to settle (gate or stop)");
+}
+
 fn combined(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr)
 }
@@ -236,4 +249,55 @@ fn start_no_worktree_over_a_leftover_branch_names_discard() {
         "develop",
         "a refused start leaves the primary checkout on its branch: {text}"
     );
+}
+
+/// How far behind the base the checkout `start --no-worktree` runs from is: past the
+/// removed check's 50-commit refusal.
+const COMMITS_BEHIND: usize = 51;
+
+/// 52.1 D-24: `start --no-worktree` from a branch more than 50 commits behind the base
+/// succeeds with no "behind" warning, and cuts the phase branch from the base: its tip is
+/// the base's tip, not the checkout's (control: the two tips differ).
+#[test]
+fn start_no_worktree_far_behind_the_base_cuts_the_branch_from_the_base() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    git(root, &["branch", "behind"]);
+    for n in 0..COMMITS_BEHIND {
+        git(
+            root,
+            &["commit", "-q", "--allow-empty", "-m", &format!("base {n}")],
+        );
+    }
+    git(root, &["checkout", "-q", "behind"]);
+    let base_tip = branch_tip(root, "develop").expect("premise: the base exists");
+    let checkout_tip = branch_tip(root, "behind").expect("premise: the checkout's branch");
+    assert_ne!(
+        base_tip, checkout_tip,
+        "control: the checkout is not at the base's tip"
+    );
+    assert_eq!(
+        git_stdout(root, &["rev-list", "--count", "behind..develop"]),
+        COMMITS_BEHIND.to_string(),
+        "premise: the checkout is {COMMITS_BEHIND} commits behind the base"
+    );
+
+    let (out, _reaper) = start_phase(&home, root, &["--no-worktree"]);
+    let text = combined(&out);
+    assert!(
+        out.status.success(),
+        "start refused as too far behind the base: {text}"
+    );
+    assert!(
+        !text.contains("commits ahead"),
+        "start printed the removed behind-the-base warning: {text}"
+    );
+    assert_eq!(
+        branch_tip(root, &phase_branch()).as_deref(),
+        Some(base_tip.as_str()),
+        "branch tip differs from base: {text}"
+    );
+    wait_for_settled(root);
 }
