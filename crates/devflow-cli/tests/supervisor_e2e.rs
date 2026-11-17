@@ -1,31 +1,25 @@
-//! End-to-end proof that a stage launch runs under an addressed Rust
-//! supervisor (50-11, criteria 2 and 3).
+//! End-to-end proof that a run `devflow start` launches runs its stages to
+//! their end (50-11, criteria 2 and 3, on the runner unit since 52.2-06).
 //!
-//! The launch path is `commands::start` → `launch_stage` →
-//! `monitor::spawn_monitor` → the hidden `__monitor` subcommand, all inside
-//! the `devflow` BINARY crate (no `lib.rs`), so integration tests cannot call
-//! any of it in-process. Like `stop_e2e.rs`, this drives the real compiled
-//! binary through `common::hermetic_devflow` and observes what an operator
-//! can: the persisted state, the socket it names, and the files the
-//! supervisor writes.
+//! The launch path is `commands::start` → `systemd-run --user` (faked by
+//! [`common::HermeticHome`]) → the hidden `__runner` subcommand, all inside the
+//! `devflow` BINARY crate (no `lib.rs`), so integration tests cannot call any of
+//! it in-process. Like `stop_e2e.rs`, this drives the real compiled binary
+//! through `common::hermetic_devflow` and observes what an operator can: the
+//! persisted state, the event log, and the files the runner writes.
 //!
-//! Every `devflow` child gets a tempdir `HOME` and `DEVFLOW_CACHE_DIR`, so the
-//! sockets these launches bind live under that tempdir, never under the
-//! operator's real `~/.cache/devflow`.
+//! Every `devflow` child gets a tempdir `HOME` and `DEVFLOW_CACHE_DIR`, so no
+//! launch writes under the operator's real `~/.cache/devflow`.
 
 mod common;
 
 use common::HermeticPath;
 use devflow_core::gsd_reader::GsdStatus;
 use devflow_core::phase_id::PhaseId;
-use devflow_core::supervisor::{self, Liveness, ShutdownOutcome};
 use std::fs;
 use std::path::Path;
 use std::process::Output;
 use std::time::{Duration, Instant};
-
-/// How long a shutdown waits for the supervisor's final line.
-const SHUTDOWN_WAIT: Duration = Duration::from_secs(30);
 
 /// Hermetic `git` for fixture setup (999.37), never a bare `Command::new("git")`.
 fn git(root: &Path, args: &[&str]) {
@@ -167,98 +161,9 @@ fn run_start_with(
         .expect("run devflow start")
 }
 
-/// Criterion 3 for one shape: after `devflow start` returns, the state names
-/// a socket under the hermetic cache dir that answers ALIVE with the
-/// shape's label, its sidecar names this root and phase, and a socket
-/// shutdown stops the run and leaves the socket Gone.
-fn start_publishes_for(shape: Shape, phase: PhaseId) {
-    let home = common::HermeticHome::new();
-    let repo = tempfile::tempdir().unwrap();
-    let root = repo.path().canonicalize().unwrap();
-    init_repo(&root, phase);
-    let logs = tempfile::tempdir().unwrap();
-    let fake_bin = shape.fake_bin(logs.path(), AgentRun::Waiting);
-    let _reaper = common::LaunchedRunReaper::new(&root, phase, vec![]);
-
-    // Control: nothing names a supervisor before the launch, so an Alive
-    // answer below can only come from this launch.
-    assert!(
-        devflow_core::workflow::load_state(&root, phase).is_err(),
-        "{shape:?}: no state may exist before start"
-    );
-
-    let output = run_start(&home, &root, phase, &fake_bin, shape);
-    assert!(
-        output.status.success(),
-        "{shape:?}: start failed\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let state = devflow_core::workflow::load_state(&root, phase).expect("start saved state");
-    let record = state
-        .supervisor
-        .clone()
-        .unwrap_or_else(|| panic!("{shape:?}: start must record state.supervisor: {state:?}"));
-    let socket = record.socket_path.clone();
-    let sock_dir = home.cache_dir().join("sock");
-    assert!(
-        socket.starts_with(&sock_dir),
-        "{shape:?}: socket {} must be under the child's cache dir {}",
-        socket.display(),
-        sock_dir.display()
-    );
-    assert!(
-        !socket.starts_with(&root),
-        "{shape:?}: the socket must not live in the project tree"
-    );
-    assert!(
-        socket.as_os_str().len() <= 107,
-        "{shape:?}: socket path is {} bytes",
-        socket.as_os_str().len()
-    );
-    let reply = match supervisor::probe(&socket).expect("probe the recorded socket") {
-        Liveness::Alive(reply) => reply,
-        other => panic!("{shape:?}: the recorded socket must answer ALIVE, got {other:?}"),
-    };
-    assert_eq!(reply.launch, shape.label(), "{shape:?}: launch label");
-    assert_eq!(reply.launch_id, record.launch_id, "{shape:?}: launch id");
-    assert_eq!(reply.agent_pgid, record.agent_pgid, "{shape:?}: agent pgid");
-
-    let sidecar_path = socket.with_extension("json");
-    let sidecar = supervisor::read_sidecar(&sidecar_path).expect("read the sidecar");
-    assert_eq!(sidecar.project_root, root, "{shape:?}: sidecar root");
-    assert_eq!(sidecar.phase, phase, "{shape:?}: sidecar phase");
-    assert_eq!(sidecar.launch, shape.label(), "{shape:?}: sidecar launch");
-    assert_eq!(
-        sidecar.supervisor_pid, reply.supervisor_pid,
-        "{shape:?}: the recorded socket answers for the supervisor its sidecar names"
-    );
-
-    match supervisor::request_shutdown(&socket, SHUTDOWN_WAIT).expect("shutdown the run") {
-        ShutdownOutcome::Stopped { .. } => {}
-        other => panic!("{shape:?}: shutdown must stop the run, got {other:?}"),
-    }
-    assert_eq!(
-        supervisor::probe(&socket).expect("probe after shutdown"),
-        Liveness::Gone,
-        "{shape:?}: the socket is gone once the supervisor stopped"
-    );
-}
-
-#[test]
-fn start_publishes_a_live_supervisor_socket_for_each_launch_shape() {
-    start_publishes_for(Shape::Stream, PhaseId::new(61));
-    start_publishes_for(Shape::Capture, PhaseId::new(62));
-}
-
 /// How long the tests below wait for a supervisor to act on a signal, or a
 /// stage chain to reach its stop point.
 const RUN_WAIT: Duration = Duration::from_secs(60);
-
-/// The stop reason `run_monitor` records for a run its supervisor stopped.
-const SUPERVISOR_STOP_REASON: &str =
-    "stopped through the supervisor (socket shutdown or SIGTERM/SIGINT)";
 
 /// A fake `claude` that answers `--version` and the canary like
 /// [`WAITING_CLAUDE`], commits one empty commit as its "work", prints the
@@ -310,18 +215,78 @@ fn holds_within(within: Duration, mut done: impl FnMut() -> bool) -> bool {
     }
 }
 
-/// D-05 at the CLI level (999.134) for one shape: SIGTERM to the live
-/// supervisor named in its sidecar ends the run. The agent group is gone,
-/// `state.stopped` carries the supervisor stop reason, no further
-/// `stage_launched` is recorded, and the socket is Gone.
+/// The stop reason the runner records for a SIGTERM (`runner_stop_reason`).
+const RUNNER_SIGTERM_REASON: &str = "stopped by SIGTERM to the runner";
+
+/// The phase's unit name as the binary derives it (`service::unit_name`).
+fn unit_name(root: &Path, phase: PhaseId) -> String {
+    format!(
+        "devflow-{:016x}-{}.service",
+        devflow_core::registry::path_digest(root),
+        phase.padded()
+    )
+}
+
+/// The runner pid the fake `systemd-run` recorded for `phase`'s unit under `home`.
+fn recorded_runner_pid(home: &common::HermeticHome, root: &Path, phase: PhaseId) -> Option<u32> {
+    fs::read_to_string(
+        home.service_bin()
+            .join(format!("{}.pid", unit_name(root, phase))),
+    )
+    .ok()
+    .and_then(|text| text.trim().parse().ok())
+}
+
+/// Every runner pid the fake `systemd-run` recorded under `home`.
+fn recorded_runner_pids(home: &common::HermeticHome) -> Vec<u32> {
+    let Ok(entries) = fs::read_dir(home.service_bin()) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "pid"))
+        .filter_map(|entry| fs::read_to_string(entry.path()).ok())
+        .filter_map(|text| text.trim().parse::<u32>().ok())
+        .collect()
+}
+
+/// The recorded runners under `home` that still run the runner verb.
+fn live_runners(home: &common::HermeticHome) -> Vec<u32> {
+    recorded_runner_pids(home)
+        .into_iter()
+        .filter(|pid| common::runs_the_runner_verb(*pid))
+        .collect()
+}
+
+/// Whether every runner the fake `systemd-run` recorded under `home` has exited
+/// within `within`. Ends nothing: a run still live reads `false`, so a caller can
+/// count a run's events only once nothing can add to them.
+fn runners_exited_within(home: &common::HermeticHome, within: Duration) -> bool {
+    holds_within(within, || live_runners(home).is_empty())
+}
+
+/// A fake agent for `shape` that writes its pid (its group's leader) to `pid_file`
+/// and stays running until it is ended.
+fn waiting_bin_recording_pid(shape: Shape, logs: &Path, pid_file: &Path) -> common::FakeBin {
+    let record = format!("echo $$ > '{}'\nsleep 120", pid_file.display());
+    match shape {
+        Shape::Stream => common::fake_bin_dir(&WAITING_CLAUDE.replace("sleep 120", &record)),
+        Shape::Capture => common::capture_agent_bin_then(logs, &record),
+    }
+}
+
+/// D-05 at the CLI level (999.134) for one shape: SIGTERM to the runner the unit
+/// runs ends the run. The agent group is gone, `state.stopped` carries the runner's
+/// SIGTERM reason, and no further `stage_launched` is recorded.
 fn sigterm_stops_for(shape: Shape, phase: PhaseId) {
     let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path().canonicalize().unwrap();
     init_repo(&root, phase);
     let logs = tempfile::tempdir().unwrap();
-    let fake_bin = shape.fake_bin(logs.path(), AgentRun::Waiting);
-    let _reaper = common::LaunchedRunReaper::new(&root, phase, vec![]);
+    let agent_pid_file = logs.path().join("agent.pid");
+    let fake_bin = waiting_bin_recording_pid(shape, logs.path(), &agent_pid_file);
+    let _reaper = common::LaunchedRunReaper::for_home(&home, &root, phase);
 
     let output = run_start(&home, &root, phase, &fake_bin, shape);
     assert!(
@@ -329,32 +294,35 @@ fn sigterm_stops_for(shape: Shape, phase: PhaseId) {
         "{shape:?}: start failed\nstderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let record = devflow_core::workflow::load_state(&root, phase)
-        .expect("start saved state")
-        .supervisor
-        .unwrap_or_else(|| panic!("{shape:?}: start must record state.supervisor"));
-    let socket = record.socket_path.clone();
-    let sidecar = supervisor::read_sidecar(&socket.with_extension("json")).expect("sidecar");
+    let pid = recorded_runner_pid(&home, &root, phase)
+        .unwrap_or_else(|| panic!("{shape:?}: start launched no runner"));
+    assert!(
+        common::runs_the_runner_verb(pid),
+        "{shape:?}: the recorded pid {pid} runs the runner verb"
+    );
+    assert!(
+        holds_within(RUN_WAIT, || agent_pid_file.is_file()),
+        "{shape:?}: the agent starts"
+    );
+    let agent_pgid: u32 = fs::read_to_string(&agent_pid_file)
+        .expect("read the agent's pid")
+        .trim()
+        .parse()
+        .expect("a pid");
     assert_eq!(
         stage_launched_count(&root, phase),
         1,
         "{shape:?}: one launch"
     );
     assert!(
-        !group_members(record.agent_pgid).is_empty(),
+        !group_members(agent_pgid).is_empty(),
         "{shape:?}: the agent group is running before the signal"
     );
 
-    // The pid to signal comes from the sidecar and is confirmed against its
-    // recorded start time first, so a recycled pid is never signalled.
-    let pid = sidecar.supervisor_pid;
-    assert!(
-        devflow_core::agent::is_same_process(pid, sidecar.supervisor_start_time),
-        "{shape:?}: the sidecar's supervisor {pid} is the recorded process"
-    );
     let signed = libc::pid_t::try_from(pid).expect("pid fits pid_t");
     assert!(signed > 1, "refusing to signal pid {signed}");
-    // SAFETY: `signed > 1` names the supervisor just identity-checked.
+    // SAFETY: `signed > 1` names the runner this test's fake launcher recorded,
+    // whose argv was just checked.
     assert_eq!(
         unsafe { libc::kill(signed, libc::SIGTERM) },
         0,
@@ -362,26 +330,20 @@ fn sigterm_stops_for(shape: Shape, phase: PhaseId) {
     );
 
     assert!(
-        holds_within(RUN_WAIT, || !devflow_core::agent::agent_running(pid)),
-        "{shape:?}: the supervisor {pid} exits after SIGTERM"
+        holds_within(RUN_WAIT, || !common::runs_the_runner_verb(pid)),
+        "{shape:?}: the runner {pid} exits after SIGTERM"
     );
     assert_eq!(
-        supervisor::probe(&socket).expect("probe after the signal"),
-        Liveness::Gone,
-        "{shape:?}: the socket is gone"
-    );
-    assert_eq!(
-        group_members(record.agent_pgid),
+        group_members(agent_pgid),
         Vec::<u32>::new(),
-        "{shape:?}: the agent group {} is gone",
-        record.agent_pgid
+        "{shape:?}: the agent group {agent_pgid} is gone"
     );
     let state = devflow_core::workflow::load_state(&root, phase).expect("reload state");
     assert!(state.stopped, "{shape:?}: state.stopped after the signal");
     assert_eq!(
         state.stop_reason.as_deref(),
-        Some(SUPERVISOR_STOP_REASON),
-        "{shape:?}: the supervisor stop reason"
+        Some(RUNNER_SIGTERM_REASON),
+        "{shape:?}: the runner's stop reason"
     );
     assert_eq!(
         stage_launched_count(&root, phase),
@@ -401,7 +363,7 @@ fn finishing_run_advances_for(shape: Shape, phase: PhaseId) {
     init_repo(&root, phase);
     let logs = tempfile::tempdir().unwrap();
     let fake_bin = shape.fake_bin(logs.path(), AgentRun::Finishing);
-    let _reaper = common::LaunchedRunReaper::new(&root, phase, vec![]);
+    let _reaper = common::LaunchedRunReaper::for_home(&home, &root, phase);
 
     let output = run_start_with(&home, &root, phase, &fake_bin, shape, &["--until", "code"]);
     assert!(
@@ -445,11 +407,11 @@ fn sigterm_to_a_live_supervisor_ends_the_run_without_advancing() {
 }
 
 /// Re-homed from `devflow-core/tests/monitor_e2e.rs` (50-11): a library test
-/// binary cannot re-exec `__monitor`, so the capture-result check runs on the
-/// real binary. A capture-shape run whose fake agent prints a
-/// `DEVFLOW_RESULT` marker and exits 0: Layers 1–2 evaluate to Success from
-/// the files the supervisor wrote, and the supervisor's own advance recorded
-/// the same verdict.
+/// binary cannot re-exec the binary, so the capture-result check runs on the
+/// real binary. A capture-shape run, launched by `start` as a runner unit, whose
+/// fake agent prints a `DEVFLOW_RESULT` marker and exits 0: Layers 1–2 evaluate
+/// to Success from the files the runner wrote, and the runner's own advance
+/// recorded the same verdict.
 #[test]
 fn capture_supervisor_owns_a_fake_agent_and_records_devflow_result() {
     let phase = PhaseId::new(67);
@@ -459,7 +421,7 @@ fn capture_supervisor_owns_a_fake_agent_and_records_devflow_result() {
     init_repo(&root, phase);
     let logs = tempfile::tempdir().unwrap();
     let fake_bin = Shape::Capture.fake_bin(logs.path(), AgentRun::Finishing);
-    let _reaper = common::LaunchedRunReaper::new(&root, phase, vec![]);
+    let _reaper = common::LaunchedRunReaper::for_home(&home, &root, phase);
 
     let output = run_start_with(
         &home,
@@ -479,29 +441,22 @@ fn capture_supervisor_owns_a_fake_agent_and_records_devflow_result() {
             &root, phase
         )
         .is_ok_and(|state| state.stopped)),
-        "the run stops at --until plan once its supervisor advanced"
+        "the run stops at --until plan once its runner advanced"
     );
 
-    let agent_pid: u32 =
-        fs::read_to_string(devflow_core::agent_result::agent_pid_path(&root, phase))
-            .expect("the supervisor records the agent pid")
-            .trim()
-            .parse()
-            .expect("a pid");
-    assert!(agent_pid > 0);
     let stdout = fs::read_to_string(devflow_core::agent_result::stdout_path(&root, phase)).unwrap();
     assert!(
         stdout.contains("DEVFLOW_RESULT"),
         "captured stdout missing marker: {stdout:?}"
     );
     let exit = fs::read_to_string(devflow_core::agent_result::exit_code_path(&root, phase))
-        .expect("the supervisor records the exit code");
+        .expect("the runner records the exit code");
     assert_eq!(exit.trim(), "0");
 
     let state = devflow_core::workflow::load_state(&root, phase).unwrap();
     let git_flow = devflow_core::config::git_flow_for_run(&root, state.base_branch.as_deref());
     let result = devflow_core::agent_result::evaluate_agent_result(&root, &state, &git_flow)
-        .expect("evaluate the supervisor's files");
+        .expect("evaluate the runner's files");
     assert_eq!(
         result.status,
         devflow_core::agent_result::AgentStatus::Success,
@@ -513,10 +468,10 @@ fn capture_supervisor_owns_a_fake_agent_and_records_devflow_result() {
             .lines()
             .any(|line| line.contains("\"advance_evaluated\"")
                 && line.contains("\"status\":\"success\"")),
-        "the supervisor's in-process advance evaluated the stage as success:\n{events}"
+        "the runner's in-process advance evaluated the stage as success:\n{events}"
     );
     // The assertions above hold for a stream launch too: a stream-shape
-    // supervisor also writes the stdout and exit-code files. This one is the
+    // stage also writes the stdout and exit-code files. This one is the
     // shape check.
     let launches: Vec<serde_json::Value> = events
         .lines()
@@ -544,244 +499,9 @@ fn capture_supervisor_owns_a_fake_agent_and_records_devflow_result() {
     assert_eq!(stdin, "", "the capture shape gives the agent no stdin");
 }
 
-/// `devflow status` for `root`, as an operator runs it; its stdout.
-fn run_status(home: &common::HermeticHome, root: &Path) -> String {
-    let output = common::hermetic_devflow(home)
-        .arg("status")
-        .arg(root)
-        .current_dir(root)
-        .output()
-        .expect("run devflow status");
-    assert!(
-        output.status.success(),
-        "status failed\nstderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8_lossy(&output.stdout).into_owned()
-}
-
-/// 50-12 criterion 1: `devflow status` answers ALIVE, STALE and GONE from the
-/// recorded socket, and each non-ALIVE answer names the verb that repairs it.
-/// The run is made STALE by a SIGKILL of its supervisor (the pid comes from
-/// the sidecar and is identity-checked first), and GONE by removing the stale
-/// socket file. The reaper ends the agent group the SIGKILL orphaned.
-#[test]
-fn status_reports_each_liveness_state_with_its_repair_verb() {
-    let phase = PhaseId::new(68);
-    let home = common::HermeticHome::new();
-    let repo = tempfile::tempdir().unwrap();
-    let root = repo.path().canonicalize().unwrap();
-    init_repo(&root, phase);
-    let fake_bin = common::fake_bin_dir(WAITING_CLAUDE);
-    let _reaper = common::LaunchedRunReaper::new(&root, phase, vec![]);
-
-    let output = run_start(&home, &root, phase, &fake_bin, Shape::Stream);
-    assert!(
-        output.status.success(),
-        "start failed\nstderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let record = devflow_core::workflow::load_state(&root, phase)
-        .expect("start saved state")
-        .supervisor
-        .expect("start must record state.supervisor");
-    let socket = record.socket_path.clone();
-    let stop_verb = format!("devflow stop --phase {phase}");
-    let resume_verb = format!("devflow resume --phase {phase}");
-
-    let alive = run_status(&home, &root);
-    assert!(
-        alive.contains("ALIVE") && alive.contains("owner: agent_running"),
-        "a live run reads ALIVE with its owner:\n{alive}"
-    );
-    assert!(
-        alive.contains(&format!("supervisor: {}", socket.display())),
-        "status names the recorded socket:\n{alive}"
-    );
-    assert!(
-        !alive.contains(&stop_verb) && !alive.contains(&resume_verb),
-        "an ALIVE run needs no repair:\n{alive}"
-    );
-
-    let sidecar = supervisor::read_sidecar(&socket.with_extension("json")).expect("sidecar");
-    let pid = sidecar.supervisor_pid;
-    census_never_sees_a_live_supervisor(pid);
-
-    assert!(
-        devflow_core::agent::is_same_process(pid, sidecar.supervisor_start_time),
-        "the sidecar's supervisor {pid} is the recorded process"
-    );
-    let signed = libc::pid_t::try_from(pid).expect("pid fits pid_t");
-    assert!(signed > 1, "refusing to signal pid {signed}");
-    // SAFETY: `signed > 1` names the supervisor just identity-checked.
-    assert_eq!(
-        unsafe { libc::kill(signed, libc::SIGKILL) },
-        0,
-        "SIGKILL {pid}"
-    );
-    assert!(
-        holds_within(RUN_WAIT, || !devflow_core::agent::agent_running(pid)),
-        "the supervisor {pid} is gone after SIGKILL"
-    );
-    assert_eq!(
-        supervisor::probe(&socket).expect("probe the orphaned socket"),
-        Liveness::Stale,
-        "a SIGKILLed supervisor leaves its socket STALE"
-    );
-
-    let stale = run_status(&home, &root);
-    assert!(stale.contains("STALE"), "the run reads STALE:\n{stale}");
-    let stop_at = stale
-        .find(&stop_verb)
-        .unwrap_or_else(|| panic!("STALE names `{stop_verb}`:\n{stale}"));
-    let resume_at = stale
-        .find(&resume_verb)
-        .unwrap_or_else(|| panic!("STALE names `{resume_verb}` after the stop:\n{stale}"));
-    assert!(stop_at < resume_at, "stop comes before resume:\n{stale}");
-    assert!(
-        !stale.contains("ALIVE"),
-        "a STALE run is not ALIVE:\n{stale}"
-    );
-
-    fs::remove_file(&socket).expect("remove the stale socket");
-    // D-19: the SIGKILL orphaned the agent, so `resume` would refuse.
-    let orphaned = run_status(&home, &root);
-    assert!(orphaned.contains("GONE"), "the run reads GONE:\n{orphaned}");
-    let kill_line = format!("kill -TERM -- -{}", record.agent_pgid);
-    assert!(
-        orphaned.contains(&kill_line),
-        "GONE beside a live agent names `{kill_line}`:\n{orphaned}"
-    );
-    assert!(
-        !orphaned.contains(&resume_verb),
-        "GONE beside a live agent names no resume:\n{orphaned}"
-    );
-
-    assert!(
-        devflow_core::agent::is_same_process(record.agent_pgid, record.agent_start_time),
-        "the record's agent {} is the orphan",
-        record.agent_pgid
-    );
-    common::signal_group(record.agent_pgid, libc::SIGKILL);
-    assert!(
-        holds_within(RUN_WAIT, || group_members(record.agent_pgid).is_empty()),
-        "the agent group {} is gone after SIGKILL",
-        record.agent_pgid
-    );
-    let gone = run_status(&home, &root);
-    assert!(gone.contains("GONE"), "the run reads GONE:\n{gone}");
-    assert!(
-        gone.contains(&resume_verb),
-        "GONE while active names `{resume_verb}`:\n{gone}"
-    );
-    assert!(
-        !gone.contains(&stop_verb),
-        "GONE names no stop, there is nothing left to stop:\n{gone}"
-    );
-}
-
-/// A 2.x-shaped monitor wrapper (`sh -c` with the trap line the 2.x script
-/// carried), in its own process group, which drop SIGKILLs and reaps.
-struct PlantedWrapper(std::process::Child);
-
-impl PlantedWrapper {
-    fn spawn() -> Self {
-        use std::os::unix::process::CommandExt as _;
-        // The trailing `:` keeps `sh` from exec-ing `sleep` in its place, so
-        // the wrapper's own argv stays visible in `/proc`.
-        let child = std::process::Command::new("sh")
-            .arg("-c")
-            .arg("cleanup() { :; }\ntrap cleanup TERM INT\nsleep 30\n:")
-            .process_group(0)
-            .spawn()
-            .expect("spawn the planted 2.x wrapper");
-        Self(child)
-    }
-}
-
-impl Drop for PlantedWrapper {
-    fn drop(&mut self) {
-        common::signal_group(self.0.id(), libc::SIGKILL);
-        let _ = self.0.wait();
-    }
-}
-
-/// 50-12 (T-50-52): the `/proc` stray census, run against a real 3.x
-/// supervisor, never lists it. The control is a planted 2.x-shaped wrapper
-/// that the same census run must list, so an empty census cannot pass.
-fn census_never_sees_a_live_supervisor(supervisor_pid: u32) {
-    let wrapper = PlantedWrapper::spawn();
-    let wrapper_pid = wrapper.0.id();
-    let mut census = Vec::new();
-    assert!(
-        holds_within(RUN_WAIT, || {
-            census = devflow_core::agent::discover_stray_devflow_processes();
-            census.iter().any(|stray| stray.pid == wrapper_pid)
-        }),
-        "control: the census must list the planted 2.x wrapper {wrapper_pid}"
-    );
-    assert!(
-        devflow_core::agent::agent_running(supervisor_pid),
-        "the supervisor {supervisor_pid} is alive while the census runs"
-    );
-    assert!(
-        census.iter().all(|stray| stray.pid != supervisor_pid),
-        "the 2.x census must never list the 3.x supervisor {supervisor_pid}: {census:?}"
-    );
-    drop(wrapper);
-}
-
-/// D-01 through the real binary: the `__monitor` re-exec adopts the reserved lock, so
-/// it reads live after the `devflow start` that took it has exited, and it reads
-/// not-live once that supervisor is gone (its last act removes the file).
-#[test]
-fn a_real_supervisor_holds_its_reserved_lock_after_its_launcher_exits() {
-    let home = common::HermeticHome::new();
-    let repo = tempfile::tempdir().unwrap();
-    let root = repo.path().canonicalize().unwrap();
-    let phase = PhaseId::new(64);
-    init_repo(&root, phase);
-    let logs = tempfile::tempdir().unwrap();
-    let fake_bin = Shape::Capture.fake_bin(logs.path(), AgentRun::Waiting);
-    let _reaper = common::LaunchedRunReaper::new(&root, phase, vec![]);
-
-    let output = spawn_start(&home, &root, phase, &fake_bin)
-        .wait_with_output()
-        .expect("wait for the start");
-    assert!(
-        output.status.success(),
-        "start failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let state = devflow_core::workflow::load_state(&root, phase).unwrap();
-    assert_eq!(state.pending_supervisor, None, "the publish promoted it");
-    let record = state.supervisor.expect("the start recorded its supervisor");
-    let liveness_path =
-        devflow_core::liveness::launch_liveness_path(&root, &record.launch_id).unwrap();
-    assert_eq!(
-        devflow_core::liveness::probe(&liveness_path).unwrap(),
-        devflow_core::liveness::Held::Live,
-        "the launcher has exited, so only the supervisor can hold this"
-    );
-
-    let outcome = supervisor::request_shutdown(&record.socket_path, RUN_WAIT);
-    assert!(
-        matches!(outcome, Ok(ShutdownOutcome::Stopped { .. })),
-        "the supervisor stops through its socket: {outcome:?}"
-    );
-    assert!(
-        holds_within(RUN_WAIT, || {
-            devflow_core::liveness::probe(&liveness_path).unwrap()
-                != devflow_core::liveness::Held::Live
-        }),
-        "control: the lock does not outlive its supervisor"
-    );
-}
-
 // ---------------------------------------------------------------------------
 // 50-15 (R-1, V-12): two `devflow start` launches racing for one phase yield
-// exactly one live supervisor and one agent group.
+// exactly one live runner and one agent group.
 // ---------------------------------------------------------------------------
 
 /// Bounds any gate a launched run parks at, as the 48-19 refusal tests do.
@@ -789,8 +509,8 @@ const RACE_GATE_TIMEOUT_SECS: &str = "15";
 
 /// A spawned `devflow start` for `phase` with the arguments the 48-19
 /// live-run refusal tests use (supervise mode, `--no-worktree`, the capture
-/// shape), so a loser fails only at the reservation's live-run guard, never at
-/// an earlier refusal.
+/// shape), so a loser fails only at a live-run refusal, never at an earlier
+/// one.
 fn spawn_start(
     home: &common::HermeticHome,
     root: &Path,
@@ -820,22 +540,10 @@ fn spawn_start(
         .expect("spawn devflow start")
 }
 
-/// What a sweep of `home`'s socket directory sees: the ALIVE sockets, and the
-/// distinct agent pgids its parsed sidecars name.
-fn live_supervisors(home: &common::HermeticHome) -> (Vec<std::path::PathBuf>, Vec<u32>) {
-    let entries = supervisor::sweep_in(&home.cache_dir());
-    let alive = entries
-        .iter()
-        .filter(|entry| matches!(entry.liveness, Ok(Liveness::Alive(_))))
-        .map(|entry| entry.socket_path.clone())
-        .collect();
-    let mut pgids: Vec<u32> = entries
-        .iter()
-        .filter_map(|entry| entry.sidecar.as_ref().map(|sidecar| sidecar.agent_pgid))
-        .collect();
-    pgids.sort_unstable();
-    pgids.dedup();
-    (alive, pgids)
+/// Whether `phase`'s runner lock under `root` probes Live.
+fn runner_lock_live(root: &Path, phase: PhaseId) -> bool {
+    devflow_core::liveness::probe(&devflow_core::liveness::runner_lock_path(root, phase))
+        .is_ok_and(|held| held == devflow_core::liveness::Held::Live)
 }
 
 #[test]
@@ -846,8 +554,9 @@ fn two_concurrent_starts_yield_exactly_one_live_supervisor() {
     let phase = PhaseId::new(63);
     init_repo(&root, phase);
     let logs = tempfile::tempdir().unwrap();
-    let fake_bin = Shape::Capture.fake_bin(logs.path(), AgentRun::Waiting);
-    let _reaper = common::LaunchedRunReaper::new(&root, phase, vec![]);
+    let agent_pid_file = logs.path().join("agent.pid");
+    let fake_bin = waiting_bin_recording_pid(Shape::Capture, logs.path(), &agent_pid_file);
+    let _reaper = common::LaunchedRunReaper::for_home(&home, &root, phase);
 
     let first = spawn_start(&home, &root, phase, &fake_bin);
     let second = spawn_start(&home, &root, phase, &fake_bin);
@@ -882,42 +591,46 @@ fn two_concurrent_starts_yield_exactly_one_live_supervisor() {
         .find(|output| !output.status.success())
         .expect("one start lost");
     let stderr = String::from_utf8_lossy(&loser.stderr);
-    assert!(
-        stderr.contains(&format!("devflow stop --phase {phase}")),
-        "the loser's refusal must name `devflow stop`\n{}",
-        report(loser)
-    );
-    // While the winner is before its spawn its holder decides; once its supervisor is live
-    // the reservation's guard does. Either is a correct refusal, and which one depends on
-    // the timing of this run.
-    let refused_by = if stderr.contains("is held by a foreground DevFlow process") {
+    // While the winner launches its unit, its phase holder decides, and the loser is
+    // told to run again once that verb returns; once its runner holds the runner lock,
+    // the lock does, and the loser is told to stop the live run first. Either is a
+    // correct refusal, and which one depends on the timing of this run.
+    let refused_by = if stderr.contains(&format!("another DevFlow verb holds phase {phase}")) {
         "the holder"
-    } else if stderr.contains("a run is still live") {
-        "the reservation's live-run guard"
+    } else if stderr.contains(&format!("devflow stop --phase {phase}")) {
+        "the runner lock"
     } else {
         panic!(
-            "the loser must be refused by the holder or the live-run guard\n{}",
+            "the loser must be refused by the holder or by the runner lock naming \
+             `devflow stop`\n{}",
             report(loser)
         );
     };
     println!("the loser was refused by {refused_by}");
 
-    let (alive, pgids) = live_supervisors(&home);
+    let runners = live_runners(&home);
     assert_eq!(
-        alive.len(),
+        runners.len(),
         1,
-        "exactly one socket may probe ALIVE: {alive:?}\nloser: {}",
+        "exactly one runner may run: {runners:?}\nloser: {}",
         report(loser)
     );
-    assert_eq!(
-        pgids.len(),
-        1,
-        "the sidecars must name exactly one agent group: {pgids:?}"
+    assert!(
+        runner_lock_live(&root, phase),
+        "the winner's runner holds the runner lock"
     );
     assert!(
-        !group_members(pgids[0]).is_empty(),
-        "the one agent group {} must be live",
-        pgids[0]
+        holds_within(RUN_WAIT, || agent_pid_file.is_file()),
+        "the winner's agent starts"
+    );
+    let agent_pgid: u32 = fs::read_to_string(&agent_pid_file)
+        .expect("read the agent's pid")
+        .trim()
+        .parse()
+        .expect("a pid");
+    assert!(
+        !group_members(agent_pgid).is_empty(),
+        "the one agent group {agent_pgid} must be live"
     );
 }
 
@@ -938,7 +651,7 @@ fn two_starts_for_different_phases_yield_two_live_supervisors() {
     let _reapers: Vec<common::LaunchedRunReaper> = roots
         .iter()
         .zip(phases)
-        .map(|(root, phase)| common::LaunchedRunReaper::new(root, phase, vec![]))
+        .map(|(root, phase)| common::LaunchedRunReaper::for_home(&home, root, phase))
         .collect();
 
     let first = spawn_start(&home, &roots[0], phases[0], &fake_bin);
@@ -952,25 +665,25 @@ fn two_starts_for_different_phases_yield_two_live_supervisors() {
         );
     }
 
-    let (alive, pgids) = live_supervisors(&home);
+    let runners = live_runners(&home);
     assert_eq!(
-        alive.len(),
+        runners.len(),
         2,
-        "the counting must see both live supervisors: {alive:?}"
+        "the counting must see both live runners: {runners:?}"
     );
-    assert_eq!(
-        pgids.len(),
-        2,
-        "the sidecars must name two distinct agent groups: {pgids:?}"
-    );
+    for (root, phase) in roots.iter().zip(phases) {
+        assert!(
+            runner_lock_live(root, phase),
+            "phase {phase}: its runner holds its runner lock"
+        );
+    }
 }
 
-// ---- 50-26: WR-03 on the real `devflow __monitor` binary -----------------
+// ---- 50-26: WR-03 on the real `devflow __runner` binary ------------------
 //
 // A completed stream run whose agent left a process holding its stdout must
-// reach its advance, and a `devflow stop` sent while it is `advancing` must
-// end it at safe point 1. Each run is a `__monitor` started directly (no
-// launcher), over a seeded Code-stage state that halts at `--until code`.
+// reach its advance. Each run is a `__runner` started directly (no unit), over
+// a seeded Code-stage state that halts at `--until code`.
 
 /// A repository on `develop` with `feature/phase-NN` one commit ahead of it.
 /// Named apart from [`init_repo`] (develop only, with a ROADMAP entry, used by
@@ -995,11 +708,6 @@ fn init_repo_with_feature_branch(root: &Path, phase: PhaseId) {
     git(root, &["commit", "-q", "-m", "agent work"]);
 }
 
-/// Mirrors `pipeline_launch::ADVANCE_STOP_REASON`, as
-/// [`SUPERVISOR_STOP_REASON`] mirrors the supervisor's; `devflow stop`
-/// appends its own clause after it.
-const ADVANCE_STOP_REASON: &str = "stopped through the supervisor during advance";
-
 /// The Claude top-level result line the held-stdout agent prints.
 const HELD_RESULT_LINE: &str = r#"{"type":"result","subtype":"success","is_error":false,"session_id":"s-fake","result":"DEVFLOW_RESULT: {\"status\":\"success\"}"}"#;
 
@@ -1012,37 +720,36 @@ fn read_holder_record(record: &Path) -> Option<(u32, u64)> {
     fields.next().is_none().then_some((pid, start))
 }
 
-/// A `devflow __monitor` started directly over a seeded Code-stage state
+/// A `devflow __runner` started directly over a seeded Code-stage state
 /// (`Mode::Supervise`, `stop_until = Some(Stage::Code)`), with production's
-/// 120 s idle timeout, supervising `sh <script>`: the script reads one line,
-/// prints [`HELD_RESULT_LINE`], starts its holder as a background job,
-/// records it (`<pid> <start>` while the holder is its unreaped child, as the
-/// core tests' fixture rule says) and exits 0.
+/// idle timeout, running a fake `claude`: it reads one line, prints
+/// [`HELD_RESULT_LINE`], starts its holder as a background job, records it
+/// (`<pid> <start>` while the holder is its unreaped child, as the core tests'
+/// fixture rule says) and exits 0.
 ///
-/// Dropped, it SIGKILLs and reaps the monitor through its own `Child` if it
+/// Dropped, it SIGKILLs and reaps the runner through its own `Child` if it
 /// still runs, then SIGKILLs the holder by its recorded pid only while
 /// [`devflow_core::agent::is_same_process`] holds. It signals nothing else.
 struct HeldStdoutRun {
-    monitor: Option<std::process::Child>,
+    runner: Option<std::process::Child>,
     root: std::path::PathBuf,
     phase: PhaseId,
-    socket: supervisor::SocketPath,
     record: std::path::PathBuf,
     hold: std::path::PathBuf,
     log: std::path::PathBuf,
     aux_path: std::path::PathBuf,
-    _reaper: common::LaunchedRunReaper,
+    _fake_bin: common::FakeBin,
     _repo: tempfile::TempDir,
     _aux: tempfile::TempDir,
     /// Every `devflow` child's `HOME` and cache. Declared last so it drops
     /// after the rest of the fixture.
-    home: common::HermeticHome,
+    _home: common::HermeticHome,
 }
 
 impl HeldStdoutRun {
-    /// Seed the repository and state for `phase`, then spawn the monitor
-    /// with `holder` as the agent's leftover. `hold` sets
-    /// `DEVFLOW_TEST_STREAM_WAIT_HOLD` on the monitor.
+    /// Seed the repository and state for `phase`, then spawn the runner with
+    /// `holder` as the agent's leftover. `hold` sets
+    /// `DEVFLOW_TEST_STREAM_WAIT_HOLD` on the runner.
     fn spawn(phase: PhaseId, holder: &str, hold: bool) -> Self {
         let repo = tempfile::tempdir().unwrap();
         let aux = tempfile::tempdir().unwrap();
@@ -1064,101 +771,75 @@ impl HeldStdoutRun {
         state.stage = devflow_core::stage::Stage::Code;
         state.stop_until = Some(devflow_core::stage::Stage::Code);
         state.stopped = false;
+        devflow_core::workflow::save_state(&state).unwrap();
 
         let aux_path = aux.path().to_path_buf();
         let record = aux_path.join("holder");
         let hold_path = aux_path.join("hold");
-        let log = aux_path.join("monitor.stderr");
-        let prompt = aux_path.join("prompt.txt");
-        fs::write(&prompt, "run the code stage\n").unwrap();
-        let script = aux_path.join("agent.sh");
-        fs::write(
-            &script,
-            format!(
-                "PATH=/usr/bin:/bin\n\
-                 IFS= read -r _turn || exit 91\n\
-                 printf '%s\\n' '{HELD_RESULT_LINE}'\n\
-                 {holder} &\n\
-                 holder=$!\n\
-                 echo \"$holder $(cut -d' ' -f22 /proc/$holder/stat)\" > '{record}.tmp'\n\
-                 mv '{record}.tmp' '{record}'\n\
-                 exit 0\n",
-                record = record.display()
-            ),
-        )
-        .unwrap();
+        let log = aux_path.join("runner.stderr");
+        let fake_bin = common::fake_bin_dir(&format!(
+            "if [ \"$1\" = \"--version\" ]; then echo \"2.1.220 (Claude Code)\"; exit 0; fi\n\
+             PATH=/usr/bin:/bin\n\
+             IFS= read -r turn || exit 91\n\
+             case \"$turn\" in\n\
+               *DEVFLOW_DELIVERY_CANARY_*)\n\
+                 token=$(printf '%s' \"$turn\" | grep -o 'DEVFLOW_DELIVERY_CANARY_[0-9a-f]*' | head -1)\n\
+                 printf '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"s-fake\",\"result\":\"%s\"}}\\n' \"$token\"\n\
+                 exit 0\n\
+                 ;;\n\
+             esac\n\
+             printf '%s\\n' '{HELD_RESULT_LINE}'\n\
+             {holder} &\n\
+             holder=$!\n\
+             echo \"$holder $(cut -d' ' -f22 /proc/$holder/stat)\" > '{record}.tmp'\n\
+             mv '{record}.tmp' '{record}'\n\
+             exit 0",
+            record = record.display()
+        ));
 
         let home = common::HermeticHome::new();
-        let launch_id = supervisor::new_launch_id();
-        let socket =
-            supervisor::SocketPath::for_launch(&home.cache_dir(), &root, phase, &launch_id)
-                .expect("the hermetic socket path fits sun_path");
-        // The state must record this launch, as a launcher's publish does: the monitor
-        // started directly has no launcher to promote it (D-15).
-        state.supervisor = Some(devflow_core::state::SupervisorRecord::new(
-            socket.as_path().to_path_buf(),
-            launch_id.clone(),
-            4_294_967_000,
-            1,
-            String::new(),
-        ));
-        devflow_core::workflow::save_state(&state).unwrap();
+        let existing = std::env::var_os("PATH").unwrap_or_default();
+        let path = format!("{}:{}", fake_bin.path.display(), existing.to_string_lossy());
         let mut command = common::hermetic_devflow(&home);
         command
-            .arg("__monitor")
+            .hermetic_path(path)
+            .env_remove("NOTIFY_SOCKET")
+            .current_dir(&root)
+            .arg("__runner")
             .arg("--project")
             .arg(&root)
             .arg("--phase")
             .arg(phase.to_string())
-            .arg("--workdir")
-            .arg(&root)
-            .arg("--prompt-file")
-            .arg(&prompt)
-            .arg("--idle-timeout-secs")
-            .arg("120")
-            .arg("--agent")
-            .arg("claude")
-            .arg("--launch")
-            .arg("stream")
-            .arg("--launch-id")
-            .arg(&launch_id)
-            .arg("--socket")
-            .arg(socket.as_path())
-            .arg("--")
-            .arg("sh")
-            .arg(&script)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(fs::File::create(&log).expect("create the monitor's stderr log"));
+            .stderr(fs::File::create(&log).expect("create the runner's stderr log"));
         if hold {
             command.env("DEVFLOW_TEST_STREAM_WAIT_HOLD", &hold_path);
         }
-        let monitor = command.spawn().expect("spawn devflow __monitor");
-        let reaper = common::LaunchedRunReaper::new(&root, phase, Vec::new());
+        let runner = command.spawn().expect("spawn devflow __runner");
         Self {
-            monitor: Some(monitor),
+            runner: Some(runner),
             root,
             phase,
-            socket,
             record,
             hold: hold_path,
             log,
             aux_path,
-            _reaper: reaper,
+            _fake_bin: fake_bin,
             _repo: repo,
             _aux: aux,
-            home,
+            _home: home,
         }
     }
 
-    /// The holder the agent recorded, waited for up to 10 s and required to
+    /// The holder the agent recorded, waited for up to 30 s and required to
     /// name a live process.
     fn holder(&self) -> (u32, u64) {
-        if !holds_within(Duration::from_secs(10), || {
+        if !holds_within(Duration::from_secs(30), || {
             read_holder_record(&self.record).is_some()
         }) {
             panic!(
-                "FIXTURE: no holder record at {} within 10 s; monitor stderr: {}",
+                "FIXTURE: no holder record at {} within 30 s; runner stderr: {}",
                 self.record.display(),
                 self.stderr_log()
             );
@@ -1170,23 +851,15 @@ impl HeldStdoutRun {
         (pid, start)
     }
 
-    /// The monitor's exit status, polled for up to `within`.
+    /// The runner's exit status, polled for up to `within`.
     fn wait_exit(&mut self, within: Duration) -> Option<std::process::ExitStatus> {
-        let monitor = self.monitor.as_mut().expect("the monitor is still owned");
+        let runner = self.runner.as_mut().expect("the runner is still owned");
         let mut status = None;
         holds_within(within, || {
-            status = monitor.try_wait().expect("poll the monitor");
+            status = runner.try_wait().expect("poll the runner");
             status.is_some()
         });
         status
-    }
-
-    /// The owner a ping reports, or what the probe saw instead.
-    fn owner(&self) -> String {
-        match supervisor::probe(self.socket.as_path()) {
-            Ok(Liveness::Alive(reply)) => reply.owner,
-            other => format!("{other:?}"),
-        }
     }
 
     fn stderr_log(&self) -> String {
@@ -1236,12 +909,12 @@ impl HeldStdoutRun {
         assert_eq!(bounded[0]["capture_closed"], serde_json::json!(true));
     }
 
-    /// E1 and E2 after the monitor exited 0: the run reached its advance and
+    /// E1 and E2 after the runner exited 0: the run reached its advance and
     /// halted at `--until code`.
     fn assert_reached_advance(&self, holder: (u32, u64), stdout_held: bool) {
         assert!(
             devflow_core::agent::is_same_process(holder.0, holder.1),
-            "the holder still runs: the supervisor's wait ended, not the holder"
+            "the holder still runs: the runner's wait ended, not the holder"
         );
         assert_eq!(self.exit_file(), "0");
         let state = self.state();
@@ -1269,20 +942,16 @@ impl HeldStdoutRun {
                 "a released stdout is not a bounded wait: {bounded:?}"
             );
         }
-        assert!(matches!(
-            supervisor::probe(self.socket.as_path()),
-            Ok(Liveness::Gone)
-        ));
     }
 }
 
 impl Drop for HeldStdoutRun {
     fn drop(&mut self) {
-        if let Some(mut monitor) = self.monitor.take()
-            && matches!(monitor.try_wait(), Ok(None))
+        if let Some(mut runner) = self.runner.take()
+            && matches!(runner.try_wait(), Ok(None))
         {
-            let _ = monitor.kill();
-            let _ = monitor.wait();
+            let _ = runner.kill();
+            let _ = runner.wait();
         }
         if let Some((pid, start)) = read_holder_record(&self.record)
             && let Ok(signed) = libc::pid_t::try_from(pid)
@@ -1305,16 +974,15 @@ fn a_completed_stream_run_reaches_its_advance_while_a_leftover_process_holds_std
     let holder = run.holder();
     let Some(status) = run.wait_exit(Duration::from_secs(30)) else {
         panic!(
-            "WR-03: the __monitor still runs 30 s after its agent exited while holder {} holds \
-             its stdout; owner: {}; stderr: {}",
+            "WR-03: the __runner still runs 30 s after its agent exited while holder {} holds \
+             its stdout; stderr: {}",
             holder.0,
-            run.owner(),
             run.stderr_log()
         );
     };
     assert!(
         status.success(),
-        "monitor exited {status:?}; stderr: {}",
+        "runner exited {status:?}; stderr: {}",
         run.stderr_log()
     );
     run.assert_reached_advance(holder, true);
@@ -1322,8 +990,8 @@ fn a_completed_stream_run_reaches_its_advance_while_a_leftover_process_holds_std
 
 /// E2 (control): with the holder on `/dev/null`, the hold before the stream
 /// thread wait is reached on the unfixed and the fixed code alike, so this
-/// proves the binary under test honours the test-support hold E3 relies on
-/// (agy-4), and the run then reaches its advance with no bounded wait.
+/// proves the binary under test honours the test-support hold (agy-4), and
+/// the run then reaches its advance with no bounded wait.
 #[test]
 fn a_completed_stream_run_reaches_its_advance_once_its_leftover_process_released_stdout() {
     let mut run = HeldStdoutRun::spawn(
@@ -1335,132 +1003,24 @@ fn a_completed_stream_run_reaches_its_advance_once_its_leftover_process_released
     let held = run.aux_path.join("hold.held");
     if !holds_within(Duration::from_secs(30), || held.exists()) {
         panic!(
-            "HOLD-UNREACHABLE: the monitor never reached the stream-wait hold within 30 s, so \
-             this binary lacks the test-support hold; owner: {}; stderr: {}",
-            run.owner(),
+            "HOLD-UNREACHABLE: the runner never reached the stream-wait hold within 30 s, so \
+             this binary lacks the test-support hold; stderr: {}",
             run.stderr_log()
         );
     }
     fs::write(&run.hold, "").expect("release the hold");
     let Some(status) = run.wait_exit(Duration::from_secs(30)) else {
         panic!(
-            "WR-03: the released __monitor still runs 30 s later; owner: {}; stderr: {}",
-            run.owner(),
+            "WR-03: the released __runner still runs 30 s later; stderr: {}",
             run.stderr_log()
         );
     };
     assert!(
         status.success(),
-        "monitor exited {status:?}; stderr: {}",
+        "runner exited {status:?}; stderr: {}",
         run.stderr_log()
     );
     run.assert_reached_advance(holder, false);
-}
-
-/// E3 (fail-first): `devflow stop` sent while a completed run is `advancing`
-/// with its agent's stdout held ends the run at advance safe point 1: no
-/// `--until` halt, no next stage, the socket removed, the supervisor gone.
-/// The hold parks the supervisor in `advancing` and releases on the stop
-/// request, so the stop lands there deterministically. The exit file records
-/// the stop outcome, `143`, in place of the agent's own `0`, and `stop`'s line
-/// says nothing was signalled (D-16).
-#[test]
-fn a_stop_sent_while_a_completed_run_waits_on_a_held_stdout_ends_it_at_safe_point_1() {
-    let phase = PhaseId::new(74);
-    let mut run = HeldStdoutRun::spawn(phase, "sleep 300", true);
-    let holder = run.holder();
-    let held = run.aux_path.join("hold.held");
-    if !holds_within(Duration::from_secs(30), || held.exists()) {
-        panic!(
-            "WR-03: the supervisor did not reach its stream-thread wait within 30 s of the \
-             agent's exit; owner: {}; stderr: {}",
-            run.owner(),
-            run.stderr_log()
-        );
-    }
-    let owner = run.owner();
-    if owner != "advancing" {
-        panic!("FIXTURE: the held supervisor reports owner {owner}, not advancing");
-    }
-
-    let stop_out = run.aux_path.join("stop.stdout");
-    let stop_err = run.aux_path.join("stop.stderr");
-    let mut stop = common::hermetic_devflow(&run.home)
-        .args(["stop", "--phase", &phase.to_string(), "--root"])
-        .arg(&run.root)
-        .stdin(std::process::Stdio::null())
-        .stdout(fs::File::create(&stop_out).unwrap())
-        .stderr(fs::File::create(&stop_err).unwrap())
-        .spawn()
-        .expect("spawn devflow stop");
-    let mut stop_status = None;
-    holds_within(Duration::from_secs(40), || {
-        stop_status = stop.try_wait().expect("poll devflow stop");
-        stop_status.is_some()
-    });
-    if stop_status.is_none() {
-        common::kill_and_reap(&mut stop);
-    }
-    let stop_stdout = fs::read_to_string(&stop_out).unwrap_or_default();
-    let stop_stderr = fs::read_to_string(&stop_err).unwrap_or_default();
-    if !stop_status.is_some_and(|status| status.success()) {
-        panic!(
-            "WR-03: `devflow stop` sent in advancing did not exit 0 within 40 s ({stop_status:?})\n\
-             stdout: {stop_stdout}\nstderr: {stop_stderr}\nmonitor stderr: {}",
-            run.stderr_log()
-        );
-    }
-    assert!(
-        stop_stdout.contains(&format!(
-            "stop: stopped phase {phase} through its supervisor (honoured at an advance safe \
-             point; nothing was signalled; exit code 143)"
-        )),
-        "stdout: {stop_stdout}\nstderr: {stop_stderr}"
-    );
-    assert!(
-        !stop_stdout.contains("agent group ended"),
-        "nothing was signalled: {stop_stdout}"
-    );
-
-    let Some(status) = run.wait_exit(Duration::from_secs(20)) else {
-        panic!(
-            "WR-03: the stopped __monitor still runs 20 s after `devflow stop`; stderr: {}",
-            run.stderr_log()
-        );
-    };
-    assert!(
-        devflow_core::agent::is_same_process(holder.0, holder.1),
-        "the holder still runs at the monitor's exit (status {status:?})"
-    );
-    let state = run.state();
-    assert!(state.stopped, "{state:?}");
-    let reason = state.stop_reason.clone().unwrap_or_default();
-    assert!(
-        reason.starts_with(ADVANCE_STOP_REASON),
-        "the stop was honoured at an advance safe point: {reason:?}"
-    );
-    let advance_stopped = run.events("advance_stopped");
-    assert_eq!(advance_stopped.len(), 1, "{advance_stopped:?}");
-    assert_eq!(advance_stopped[0]["safe_point"], serde_json::json!(1));
-    let halted: Vec<_> = run
-        .events("workflow_finished")
-        .into_iter()
-        .filter(|event| event["reason"] == "stopped_at")
-        .collect();
-    assert!(
-        halted.is_empty(),
-        "a stopped advance never reaches the --until halt: {halted:?}"
-    );
-    run.assert_one_reader_bound();
-    assert!(matches!(
-        supervisor::probe(run.socket.as_path()),
-        Ok(Liveness::Gone)
-    ));
-    assert_eq!(
-        run.exit_file(),
-        "143",
-        "the exit file records the stop outcome, not the agent's own code (D-16)"
-    );
 }
 
 // ---- 52-08: a run whose Validate passes ends as finished (CUT-02) ---------
@@ -1479,7 +1039,7 @@ fn passing_claude() -> String {
     )
 }
 
-/// How long a finished run's supervisors get to exit before the events are
+/// How long a finished run's runners get to exit before the events are
 /// counted. Counting earlier could miss a second notify still to come.
 const EXIT_WAIT: Duration = Duration::from_secs(30);
 
@@ -1626,9 +1186,9 @@ impl FinishRig {
     }
 
     /// Wait until the run ends (a `workflow_finished` or a gate), then until
-    /// every supervisor it started has exited, so nothing can add an event. A
+    /// every runner it started has exited, so nothing can add an event. A
     /// run that ends at a gate fails here: no run under test should gate.
-    fn wait_for_end(&self, reaper: &common::LaunchedRunReaper) {
+    fn wait_for_end(&self) {
         common::wait_for(
             || {
                 self.events().iter().any(|event| {
@@ -1644,8 +1204,8 @@ impl FinishRig {
             self.events_text()
         );
         assert!(
-            reaper.supervisors_exited_within(EXIT_WAIT),
-            "the run's supervisors did not exit after it ended; events:\n{}",
+            runners_exited_within(&self.home, EXIT_WAIT),
+            "the run's runners did not exit after it ended; events:\n{}",
             self.events_text()
         );
     }
@@ -1675,10 +1235,10 @@ impl FinishRig {
 fn a_run_that_passes_validate_finishes_and_keeps_its_worktree() {
     let phase = PhaseId::new(81);
     let rig = FinishRig::new(phase);
-    let reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+    let _reaper = common::LaunchedRunReaper::for_home(&rig.home, &rig.root, phase);
 
     rig.start(&[]);
-    rig.wait_for_end(&reaper);
+    rig.wait_for_end();
     let log = rig.events_text();
     let events = rig.events();
 
@@ -1792,10 +1352,10 @@ fn raw_state(rig: &FinishRig) -> serde_json::Value {
 fn an_until_halt_finishes_with_stopped_at_and_notifies_once() {
     let phase = PhaseId::new(82);
     let rig = FinishRig::new(phase);
-    let reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+    let _reaper = common::LaunchedRunReaper::for_home(&rig.home, &rig.root, phase);
 
     rig.start(&["--until", "plan"]);
-    rig.wait_for_end(&reaper);
+    rig.wait_for_end();
     let log = rig.events_text();
 
     assert_eq!(
@@ -1830,10 +1390,10 @@ fn an_until_halt_finishes_with_stopped_at_and_notifies_once() {
 fn an_until_validate_run_that_passes_finishes_as_finished() {
     let phase = PhaseId::new(83);
     let rig = FinishRig::new(phase);
-    let reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+    let _reaper = common::LaunchedRunReaper::for_home(&rig.home, &rig.root, phase);
 
     rig.start(&["--until", "validate"]);
-    rig.wait_for_end(&reaper);
+    rig.wait_for_end();
     let log = rig.events_text();
 
     assert_eq!(
@@ -1858,10 +1418,10 @@ fn an_until_validate_run_that_passes_finishes_as_finished() {
 fn a_finished_run_is_kept_by_cleanup_and_refused_by_resume() {
     let phase = PhaseId::new(84);
     let rig = FinishRig::new(phase);
-    let reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+    let _reaper = common::LaunchedRunReaper::for_home(&rig.home, &rig.root, phase);
 
     rig.start(&[]);
-    rig.wait_for_end(&reaper);
+    rig.wait_for_end();
     let state = rig.state();
     assert!(state.finished, "premise: the run finished: {state:?}");
     let worktree = state
@@ -1960,7 +1520,7 @@ fn a_gaps_found_report_never_reads_as_passed() {
     rig.stub_gsd(&[devflow_core::test_support::gsd_status_json(
         GsdStatus::GapsFound,
     )]);
-    let reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+    let _reaper = common::LaunchedRunReaper::for_home(&rig.home, &rig.root, phase);
 
     rig.start_in("supervise", &[]);
     common::wait_for(
@@ -2060,8 +1620,8 @@ fn a_gaps_found_report_never_reads_as_passed() {
         String::from_utf8_lossy(&abort.stderr)
     );
     assert!(
-        reaper.supervisors_exited_within(EXIT_WAIT),
-        "the aborted run's supervisors exit; events:\n{}",
+        runners_exited_within(&rig.home, EXIT_WAIT),
+        "the aborted run's runners exit; events:\n{}",
         rig.events_text()
     );
 }
@@ -2144,10 +1704,10 @@ fn a_gaps_found_validate_runs_plan_gaps_then_execute_gaps_only_then_passes() {
     let phase = PhaseId::new(86);
     let rig = FinishRig::with_claude(phase, |dir| gap_loop_claude(dir, phase));
     rig.stub_gsd(&gap_round_replies());
-    let reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+    let _reaper = common::LaunchedRunReaper::for_home(&rig.home, &rig.root, phase);
 
     rig.start(&[]);
-    rig.wait_for_end(&reaper);
+    rig.wait_for_end();
     let log = rig.events_text();
     let prompts = logged_prompts(&rig);
 
@@ -2200,10 +1760,10 @@ fn an_until_validate_run_with_gaps_runs_the_gap_loop() {
     let phase = PhaseId::new(87);
     let rig = FinishRig::with_claude(phase, |dir| gap_loop_claude(dir, phase));
     rig.stub_gsd(&gap_round_replies());
-    let reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+    let _reaper = common::LaunchedRunReaper::for_home(&rig.home, &rig.root, phase);
 
     let output = rig.start(&["--until", "validate"]);
-    rig.wait_for_end(&reaper);
+    rig.wait_for_end();
     let log = rig.events_text();
     let prompts = logged_prompts(&rig);
     let first_validate = first_prompt_with(&prompts, "/gsd-validate-phase 87")
@@ -2243,9 +1803,10 @@ fn an_until_validate_run_with_gaps_runs_the_gap_loop() {
     let control_phase = PhaseId::new(88);
     let control = FinishRig::with_claude(control_phase, |dir| gap_loop_claude(dir, control_phase));
     control.stub_gsd(&gap_round_replies());
-    let control_reaper = common::LaunchedRunReaper::new(&control.root, control_phase, vec![]);
+    let _control_reaper =
+        common::LaunchedRunReaper::for_home(&control.home, &control.root, control_phase);
     let control_output = control.start(&["--until", "plan"]);
-    control.wait_for_end(&control_reaper);
+    control.wait_for_end();
     let control_log = control.events_text();
     assert_eq!(
         finished_payloads(&control),
@@ -2372,7 +1933,7 @@ fn approving_a_clean_pass_after_a_new_commit_runs_validate_again() {
     let phase = PhaseId::new(91);
     let rig = FinishRig::new(phase);
     rig.stub_gsd(&always_passed());
-    let reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+    let _reaper = common::LaunchedRunReaper::for_home(&rig.home, &rig.root, phase);
 
     rig.start_in("supervise", &[]);
     rig.wait_for_validate_gates(1);
@@ -2417,8 +1978,8 @@ fn approving_a_clean_pass_after_a_new_commit_runs_validate_again() {
     assert_eq!(second["route"], "finish", "{second}");
     assert_eq!(second["agent_pass_on_head"], true, "{second}");
     assert!(
-        reaper.supervisors_exited_within(EXIT_WAIT),
-        "the finished run's supervisors exit; events:\n{log}"
+        runners_exited_within(&rig.home, EXIT_WAIT),
+        "the finished run's runners exit; events:\n{log}"
     );
 }
 
@@ -2440,7 +2001,7 @@ fn approving_a_clean_pass_over_an_uncommitted_change_runs_validate_again() {
     let phase = PhaseId::new(92);
     let rig = FinishRig::new(phase);
     rig.stub_gsd(&always_passed());
-    let reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+    let _reaper = common::LaunchedRunReaper::for_home(&rig.home, &rig.root, phase);
 
     rig.start_in("supervise", &[]);
     rig.wait_for_validate_gates(1);
@@ -2510,8 +2071,8 @@ fn approving_a_clean_pass_over_an_uncommitted_change_runs_validate_again() {
         "events:\n{log}"
     );
     assert!(
-        reaper.supervisors_exited_within(EXIT_WAIT),
-        "the finished run's supervisors exit; events:\n{log}"
+        runners_exited_within(&rig.home, EXIT_WAIT),
+        "the finished run's runners exit; events:\n{log}"
     );
 }
 
@@ -2525,7 +2086,7 @@ fn rejecting_a_clean_validate_pass_runs_gsd_quick_with_the_note() {
     let phase = PhaseId::new(93);
     let rig = FinishRig::with_claude(phase, |dir| gap_loop_claude(dir, phase));
     rig.stub_gsd(&always_passed());
-    let reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+    let _reaper = common::LaunchedRunReaper::for_home(&rig.home, &rig.root, phase);
 
     rig.start_in("supervise", &[]);
     rig.wait_for_validate_gates(1);
@@ -2571,8 +2132,8 @@ fn rejecting_a_clean_validate_pass_runs_gsd_quick_with_the_note() {
         .expect("run devflow gate abort");
     assert!(abort.status.success(), "gate abort exits 0: {abort:?}");
     assert!(
-        reaper.supervisors_exited_within(EXIT_WAIT),
-        "the aborted run's supervisors exit; events:\n{}",
+        runners_exited_within(&rig.home, EXIT_WAIT),
+        "the aborted run's runners exit; events:\n{}",
         rig.events_text()
     );
 }
@@ -2616,7 +2177,7 @@ fn a_validate_gate_names_the_route_its_reject_prints_and_runs() {
     let phase = PhaseId::new(94);
     let rig = FinishRig::with_claude(phase, |dir| gap_loop_claude(dir, phase));
     rig.stub_gsd(&always_passed());
-    let reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+    let _reaper = common::LaunchedRunReaper::for_home(&rig.home, &rig.root, phase);
     let reject = |note: &str| {
         common::hermetic_devflow(&rig.home)
             .args(["gate", "reject", &phase.to_string(), "--stage", "validate"])
@@ -2696,8 +2257,8 @@ fn a_validate_gate_names_the_route_its_reject_prints_and_runs() {
         .expect("run devflow gate abort");
     assert!(abort.status.success(), "gate abort exits 0: {abort:?}");
     assert!(
-        reaper.supervisors_exited_within(EXIT_WAIT),
-        "the aborted run's supervisors exit; events:\n{}",
+        runners_exited_within(&rig.home, EXIT_WAIT),
+        "the aborted run's runners exit; events:\n{}",
         rig.events_text()
     );
 }
@@ -2721,10 +2282,10 @@ fn a_validate_gate_names_the_route_its_reject_prints_and_runs() {
 fn a_no_worktree_run_that_passes_validate_finishes_the_same_way() {
     let phase = PhaseId::new(95);
     let rig = FinishRig::new(phase);
-    let reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+    let _reaper = common::LaunchedRunReaper::for_home(&rig.home, &rig.root, phase);
 
     rig.start(&["--no-worktree"]);
-    rig.wait_for_end(&reaper);
+    rig.wait_for_end();
     let log = rig.events_text();
     let events = rig.events();
 
