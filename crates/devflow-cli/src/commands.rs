@@ -215,8 +215,8 @@ pub(crate) fn ensure_base_is_a_local_branch(
 /// process started":
 ///
 /// 1. **State removal** — `workflow::clear_state` deletes
-///    `.devflow/state-{NN}.json` (an abort does, and so does `cleanup --force`
-///    with the run's worktree), so the next start for this phase finds nothing
+///    `.devflow/state-{NN}.json` (an abort does, and so does `cleanup` or
+///    `discard` with the run's worktree), so the next start for this phase finds nothing
 ///    to carry. No code here.
 /// 2. **Operator approval at the ceiling gate** — `handle_validate_outcome`
 ///    zeroes the total when a human advances or loops back AND
@@ -1272,114 +1272,85 @@ fn remove_worktree_with_retry(
     Err(last_err.expect("loop runs ATTEMPTS >= 1 times"))
 }
 
-/// Remove phase worktrees, deleting their associated feature branches,
-/// then prune and clean up merged branches. `--force` never deletes a branch
-/// with commits not merged into the trunk: it keeps the branch and names the
-/// command that deletes it, since a finished run's branch holds the only copy
-/// of its work until it is closed out.
+/// What [`cleanup`] did with one phase, or with one worktree no phase owns.
+#[derive(Debug, PartialEq, Eq)]
+enum CleanupOutcome {
+    /// Something was removed.
+    Removed,
+    /// Kept, with a line saying why and naming the verb that removes it.
+    Kept,
+    /// Kept because a live run could not be ruled out or a removal failed: a line on
+    /// stderr says why, and cleanup exits non-zero at the end.
+    Unsettled,
+    /// Nothing exists for the phase.
+    Untouched,
+}
+
+/// Remove what is provably safe to remove, phase by phase (52.1 D-09.5, amended):
+/// a finished run's worktree and state, a dead start's reservation, and a worktree with
+/// no or unloadable state, each only when its branch is merged into the base, its
+/// worktree is clean and no run is live. An incomplete run is kept whatever its branch,
+/// naming `devflow resume` and `devflow discard`. Everything kept prints why, and the
+/// verb that removes it. No path deletes a branch with commits not merged into the base
+/// (52.1 D-10).
 ///
-/// Hard-refuses (D-06, no override flag) removal of any worktree whose owning
-/// phase's run may be live, as [`runner_liveness`] reads it (D-07, D-12a): a held
-/// runner lock, a unit not yet inactive, or a read that failed. `--force` does not
-/// bypass it.
-pub(crate) fn cleanup(project_root: &Path, force: bool) -> Result<(), CliError> {
-    // Project-resolved (45-01): `cleanup_merged` computes "merged" relative
-    // to the trunk and treats it as protected — both must be the configured
-    // one, or this sweep can delete a branch that was never merged.
-    // Built from `git_flow_for_project`, as `for_project` is, so the trunk name the
-    // kept-branch line gives is the one `git` counted against.
+/// The pass is driven by `worktree::list`, so a worktree with no state is still seen,
+/// then by `workflow::state_file_phases` for each phase no worktree resolved to. Each
+/// phase is handled under its foreground holder, after [`cleanup_liveness`] (D-07,
+/// D-07a). A phase whose run may be live, or whose liveness cannot be read, is kept
+/// and named on stderr, the pass goes on, and cleanup exits non-zero at the end.
+pub(crate) fn cleanup(project_root: &Path) -> Result<(), CliError> {
+    // Project-resolved (45-01): the merged-branch sweep counts "merged" relative to the
+    // trunk and treats it as protected, so it must be the configured one.
     let flow = devflow_core::config::git_flow_for_project(project_root);
-    let git = GitFlow::with_config(project_root, flow.clone());
+    let git = GitFlow::with_config(project_root, flow);
     let worktrees_dir = worktree::worktrees_dir(project_root);
     let states = workflow::list_states(project_root);
 
-    let worktrees = worktree::list(project_root)?;
-    let mut removed = 0usize;
-    for wt in &worktrees {
-        // Only touch worktrees under `.worktrees/` (never the main checkout).
-        if !wt.path.starts_with(&worktrees_dir) {
-            continue;
-        }
-
-        let matched_state = state_for_worktree(&states, &worktrees_dir, wt);
-        let phase = matched_state
+    let mut outcomes = Vec::new();
+    let mut seen = Vec::new();
+    for wt in worktree::list(project_root)?
+        .iter()
+        .filter(|wt| wt.path.starts_with(&worktrees_dir))
+    {
+        let phase = state_for_worktree(&states, &worktrees_dir, wt)
             .map(|s| s.phase)
             .or_else(|| phase_from_worktree_path(&worktrees_dir, &wt.path));
-
-        // A stopped run (an `--until` halt, a `devflow stop`, any other recorded
-        // stop) or a finished one (D-35) has no runner and its agent has exited by
-        // design, which would otherwise pass the live-run refusal below and be
-        // removed. An intentionally kept worktree is never
-        // implicitly safe to remove: require `--force`, and say why it is kept
-        // with the run's own recorded stop reason (OPS-02). A finished run is
-        // not offered `resume`, which refuses it.
-        if let Some(state) = matched_state.filter(|s| s.stopped)
-            && !force
-        {
-            println!("{}", kept_stopped_worktree_line(&wt.path, state));
-            continue;
-        }
-
-        // D-07: a held runner lock is live whatever the state names, and a unit that
-        // is not yet inactive may still run its agent. cleanup holds no phase holder,
-        // so it has nowhere to wait (52.2-16 adds the wait): it refuses both, and a
-        // read it cannot make, fail-closed.
-        if let Some(phase) = phase {
-            let runner = match runner_liveness(project_root, phase) {
-                Ok(RunnerLiveness::NotLive) => None,
-                Ok(RunnerLiveness::Live { pid }) => Some(format!(
-                    "its runner holds the runner lock{}",
-                    runner_pid_note(pid)
-                )),
-                Ok(RunnerLiveness::Stopping { unit, state }) => {
-                    Some(format!("its unit {unit} still reads {state}"))
-                }
-                Err(why) => Some(format!("{why}, so a live runner cannot be ruled out")),
-            };
-            if let Some(found) = runner {
-                return Err(CliError::Message(format!(
-                    "refusing to remove worktree {} for phase {phase} — {found}; run `devflow \
-                     stop --phase {phase}` or wait for it to finish",
-                    wt.path.display(),
-                )));
+        outcomes.push(match phase {
+            Some(phase) => {
+                seen.push(phase);
+                cleanup_phase(project_root, phase, Some(wt))
             }
-        }
-
-        match remove_worktree_with_retry(project_root, &wt.path, force) {
-            Ok(()) => {
-                print!("removed worktree {}", wt.path.display());
-                match &wt.branch {
-                    Some(branch) if branch.starts_with(FEATURE_PREFIX) => {
-                        match kept_unmerged_branch(&git, branch, &flow.develop, force) {
-                            Some(kept) => println!(" ({kept})"),
-                            None => match git.delete_branch(branch, force) {
-                                Ok(()) => println!(" + deleted branch {branch}"),
-                                Err(err) => println!(" (branch {branch} kept: {err})"),
-                            },
-                        }
-                    }
-                    _ => println!(),
-                }
-                if force && let Some(state) = matched_state {
-                    remove_run_state_with_worktree(project_root, state, &wt.path);
-                }
-                removed += 1;
-            }
-            Err(err) => {
-                println!(
-                    "warning: could not remove worktree {} after retrying — manually delete this directory: {err}",
-                    wt.path.display()
-                );
-            }
+            None => cleanup_unowned_worktree(project_root, &git, wt),
+        });
+    }
+    for phase in workflow::state_file_phases(project_root) {
+        if !seen.contains(&phase) {
+            outcomes.push(cleanup_phase(project_root, phase, None));
         }
     }
 
     worktree::prune(project_root)?;
-    if removed == 0 {
+    if !outcomes.contains(&CleanupOutcome::Removed) {
         println!("no worktrees to clean up");
     }
-    // A merged branch that a kept worktree (or any other checkout) still has
-    // checked out is skipped, not left to git to refuse.
+    sweep_merged_branches(project_root, &git)?;
+    let unsettled = outcomes
+        .iter()
+        .filter(|outcome| **outcome == CleanupOutcome::Unsettled)
+        .count();
+    if unsettled > 0 {
+        return Err(CliError::Message(format!(
+            "cleanup kept {unsettled} item(s) whose run may still be live or that could not be \
+             removed; see the lines above"
+        )));
+    }
+    Ok(())
+}
+
+/// Delete the branches merged into the trunk. A merged branch that a kept worktree (or
+/// any other checkout) still has checked out is skipped, not left to git to refuse.
+fn sweep_merged_branches(project_root: &Path, git: &GitFlow) -> Result<(), CliError> {
     let checked_out: Vec<String> = worktree::list(project_root)?
         .into_iter()
         .filter_map(|wt| wt.branch)
@@ -1395,57 +1366,311 @@ pub(crate) fn cleanup(project_root: &Path, force: bool) -> Result<(), CliError> 
     Ok(())
 }
 
-/// Why `cleanup --force` keeps `branch` instead of force-deleting it, when it does:
-/// the branch has commits not merged into `trunk`, or its merge state cannot be read.
-/// Names the command that deletes it. `None` without `force`, whose `git branch -d`
-/// refuses unmerged work itself, and for a branch whose every commit is merged.
-fn kept_unmerged_branch(git: &GitFlow, branch: &str, trunk: &str, force: bool) -> Option<String> {
-    if !force {
-        return None;
+/// A `.worktrees/` entry no phase owns: removed as before 52.1 D-09.5, through
+/// `git worktree remove` (which refuses a dirty worktree) and `git branch -d` (which
+/// refuses an unmerged branch).
+fn cleanup_unowned_worktree(
+    project_root: &Path,
+    git: &GitFlow,
+    wt: &worktree::WorktreeInfo,
+) -> CleanupOutcome {
+    if let Err(err) = remove_worktree_with_retry(project_root, &wt.path, false) {
+        println!(
+            "warning: could not remove worktree {} after retrying — manually delete this directory: {err}",
+            wt.path.display()
+        );
+        return CleanupOutcome::Kept;
     }
-    let why = match git.commits_not_in_develop(branch) {
-        Ok(0) => return None,
-        Ok(count) => format!("it has {}", unmerged_commits(count, trunk)),
-        Err(err) => format!("could not check whether it is merged into `{trunk}`: {err}"),
-    };
-    Some(format!(
-        "branch {branch} kept: {why}; to delete it yourself, run `git branch -D {branch}`"
-    ))
+    print!("removed worktree {}", wt.path.display());
+    match &wt.branch {
+        Some(branch) if branch.starts_with(FEATURE_PREFIX) => {
+            match git.delete_branch(branch, false) {
+                Ok(()) => println!(" + deleted branch {branch}"),
+                Err(err) => println!(" (branch {branch} kept: {err})"),
+            }
+        }
+        _ => println!(),
+    }
+    CleanupOutcome::Removed
 }
 
-/// `cleanup`'s line for a worktree it keeps because its run stopped or finished
-/// (OPS-02, D-35): the recorded stop reason verbatim, and the way on from there. A
-/// finished run is offered only `--force`, since `resume` refuses it.
-fn kept_stopped_worktree_line(path: &Path, state: &State) -> String {
-    let phase = state.phase;
-    let reason = state.stop_reason.as_deref().unwrap_or("no reason recorded");
-    let (kind, next) = if state.finished {
-        (
-            "finished",
-            "pass --force to remove the worktree and the run's state (a branch with commits \
-             not merged into the base is kept)"
+/// One phase of [`cleanup`], under its foreground holder: its worktree `wt` when one
+/// resolved to it, else its state file alone.
+fn cleanup_phase(
+    project_root: &Path,
+    phase: PhaseId,
+    wt: Option<&worktree::WorktreeInfo>,
+) -> CleanupOutcome {
+    let what = match wt {
+        Some(wt) => format!("worktree {}", wt.path.display()),
+        None => format!(
+            "run state {}",
+            workflow::state_path(project_root, phase).display()
+        ),
+    };
+    let unsettled = |why: String| {
+        eprintln!("keeping phase {phase} ({what}): {why}");
+        CleanupOutcome::Unsettled
+    };
+    let _holder = match claim_foreground_holder(project_root, phase) {
+        Ok(holder) => holder,
+        Err(err) => return unsettled(err.to_string()),
+    };
+    let existing = match workflow::update_state_with_within(
+        project_root,
+        phase,
+        workflow::WRITE_LOCK_REPAIR_WAIT,
+        |existing| Ok::<_, CliError>((None, existing)),
+    ) {
+        Ok(existing) => existing,
+        Err(err) => return unsettled(format!("its run state could not be read ({err})")),
+    };
+    if wt.is_none() && matches!(existing, workflow::Existing::Missing) {
+        return CleanupOutcome::Untouched;
+    }
+    if let Err(why) = cleanup_liveness(project_root, phase) {
+        return unsettled(why);
+    }
+    match wt {
+        Some(wt) => cleanup_phase_worktree(project_root, phase, wt, &existing),
+        None => cleanup_state_only(project_root, phase, &existing),
+    }
+}
+
+/// D-07, D-07a: `Ok` when no run of `phase` is live, as [`runner_liveness`] reads it. A
+/// unit that is still stopping is waited on for [`crate::service::UNIT_STOP_WAIT`], as
+/// `discard` waits, and then read again. Otherwise the reason to keep the phase: a held
+/// runner lock, a unit that does not stop, or a read that failed (systemctl's stderr
+/// included).
+fn cleanup_liveness(project_root: &Path, phase: PhaseId) -> Result<(), String> {
+    let read = || {
+        runner_liveness(project_root, phase)
+            .map_err(|why| format!("{why}, so a live runner cannot be ruled out"))
+    };
+    let answer = match read()? {
+        RunnerLiveness::Stopping { unit, state } => {
+            eprintln!(
+                "cleanup: phase {phase}'s unit {unit} reads {state}; waiting up to {}s for it to \
+                 read inactive",
+                crate::service::UNIT_STOP_WAIT.as_secs()
+            );
+            crate::service::wait_unit_inactive(&unit, crate::service::UNIT_STOP_WAIT).map_err(
+                |why| {
+                    format!(
+                        "its unit {unit} did not read inactive ({why}); run `devflow stop --phase \
+                         {phase}` or wait for it to finish"
+                    )
+                },
+            )?;
+            read()?
+        }
+        answer => answer,
+    };
+    match answer {
+        RunnerLiveness::NotLive => Ok(()),
+        RunnerLiveness::Live { pid } => Err(format!(
+            "its runner holds the runner lock{}; run `devflow stop --phase {phase}` or wait for \
+             it to finish",
+            runner_pid_note(pid)
+        )),
+        RunnerLiveness::Stopping { unit, state } => Err(format!(
+            "its unit {unit} reads {state} again after it read inactive; run `devflow stop \
+             --phase {phase}` or wait for it to finish"
+        )),
+    }
+}
+
+/// D-09.5 for a phase worktree whose run is not live: an incomplete run is kept whatever
+/// its branch; anything else is removed, with its state, only when its branch has no
+/// commit outside the base and its worktree is clean (untracked files count).
+fn cleanup_phase_worktree(
+    project_root: &Path,
+    phase: PhaseId,
+    wt: &worktree::WorktreeInfo,
+    existing: &workflow::Existing,
+) -> CleanupOutcome {
+    if let workflow::Existing::Loaded(state) = existing
+        && incomplete_run(state)
+    {
+        println!(
+            "keeping worktree {} for phase {phase}: {}",
+            wt.path.display(),
+            incomplete_run_keep(state)
+        );
+        return CleanupOutcome::Kept;
+    }
+    let held = cleanup_worktree_holds(project_root, wt, existing);
+    if !held.is_empty() {
+        println!(
+            "keeping worktree {} for phase {phase} ({}): {}; run `devflow discard --phase \
+             {phase}` to remove the worktree, the run's state and the branch (discard refuses \
+             a branch with commits not merged into the base unless you name it)",
+            wt.path.display(),
+            run_description(existing),
+            held.join(", and ")
+        );
+        return CleanupOutcome::Kept;
+    }
+    if let Err(err) = remove_worktree_with_retry(project_root, &wt.path, false) {
+        eprintln!(
+            "warning: could not remove worktree {} after retrying: {err}",
+            wt.path.display()
+        );
+        return CleanupOutcome::Unsettled;
+    }
+    print!("removed worktree {}", wt.path.display());
+    let (_, git) = discard_base(project_root, existing);
+    match &wt.branch {
+        // Every commit of it is in the base: just measured, under the holder.
+        Some(branch) if branch.starts_with(FEATURE_PREFIX) => match git.delete_branch(branch, true)
+        {
+            Ok(()) => println!(" + deleted branch {branch}"),
+            Err(err) => println!(" (branch {branch} kept: {err})"),
+        },
+        _ => println!(),
+    }
+    match existing {
+        workflow::Existing::Loaded(state) => {
+            remove_run_state_with_worktree(project_root, state, &wt.path);
+        }
+        workflow::Existing::Unloadable(_) => clear_run_state(project_root, phase),
+        workflow::Existing::Missing => {}
+    }
+    CleanupOutcome::Removed
+}
+
+/// Why the worktree `wt` of a run that is not live is not yet safe to remove: its branch
+/// has commits outside the run's base (or its merge state, or its HEAD, does not read),
+/// or it holds uncommitted changes. Empty when it is safe.
+fn cleanup_worktree_holds(
+    project_root: &Path,
+    wt: &worktree::WorktreeInfo,
+    existing: &workflow::Existing,
+) -> Vec<String> {
+    let (base, git) = discard_base(project_root, existing);
+    let mut held = Vec::new();
+    match wt.branch.as_deref() {
+        None => held.push(
+            "it has a detached HEAD, so cleanup cannot tell what removing it would lose"
                 .to_string(),
-        )
+        ),
+        Some(branch) => match git.commits_not_in_develop(branch) {
+            Ok(0) => {}
+            Ok(count) => held.push(format!(
+                "its branch {branch} has {}",
+                unmerged_commits(count, &base)
+            )),
+            Err(err) => held.push(format!(
+                "its branch {branch} could not be checked for commits not merged into `{base}` \
+                 ({err})"
+            )),
+        },
+    }
+    match uncommitted_changes(&wt.path) {
+        Ok(0) => {}
+        Ok(1) => held.push("it holds 1 uncommitted change".to_string()),
+        Ok(count) => held.push(format!("it holds {count} uncommitted changes")),
+        Err(why) => held.push(format!(
+            "its uncommitted changes could not be counted ({why})"
+        )),
+    }
+    held
+}
+
+/// D-09.5 for a phase with a state file and no worktree, whose run is not live: a dead
+/// start's reservation ([`run_never_prepared`]) has only its state removed; every other
+/// state is kept, naming the verb that removes it.
+fn cleanup_state_only(
+    project_root: &Path,
+    phase: PhaseId,
+    existing: &workflow::Existing,
+) -> CleanupOutcome {
+    let path = workflow::state_path(project_root, phase);
+    let keep = match existing {
+        workflow::Existing::Missing => return CleanupOutcome::Untouched,
+        workflow::Existing::Loaded(state) if dead_reservation(state) => {
+            return match workflow::clear_state(project_root, phase) {
+                Ok(true) => {
+                    println!(
+                        "removed run state {} for phase {phase}: the start that reserved it never \
+                         prepared its run, and it has no worktree",
+                        path.display()
+                    );
+                    CleanupOutcome::Removed
+                }
+                Ok(false) => CleanupOutcome::Untouched,
+                Err(err) => {
+                    eprintln!(
+                        "warning: could not remove the run state {}: {err}",
+                        path.display()
+                    );
+                    CleanupOutcome::Unsettled
+                }
+            };
+        }
+        workflow::Existing::Loaded(state) if incomplete_run(state) => incomplete_run_keep(state),
+        workflow::Existing::Loaded(_) | workflow::Existing::Unloadable(_) => format!(
+            "{}, with no worktree; run `devflow discard --phase {phase}` to remove the run's \
+             state and the branch (discard refuses a branch with commits not merged into the \
+             base unless you name it)",
+            run_description(existing)
+        ),
+    };
+    println!(
+        "keeping run state {} for phase {phase}: {keep}",
+        path.display()
+    );
+    CleanupOutcome::Kept
+}
+
+/// Whether `state` is a run that has not finished: one that stopped, or one a start
+/// prepared. Its state is the only copy of what `resume` continues from, so cleanup
+/// keeps it whatever its branch (52.1 D-09.5 amendment).
+fn incomplete_run(state: &State) -> bool {
+    !state.finished && (state.stopped || !run_never_prepared(state))
+}
+
+/// Whether `state` is a dead start's reservation: a state no start prepared, that
+/// neither stopped nor finished.
+fn dead_reservation(state: &State) -> bool {
+    !state.finished && !state.stopped && run_never_prepared(state)
+}
+
+/// The keep reason for an incomplete run (52.1 D-09.5 amendment): its state is the only
+/// copy of what `resume` continues from, so it names `resume` and `discard`.
+fn incomplete_run_keep(state: &State) -> String {
+    let phase = state.phase;
+    let kind = if state.stopped {
+        let reason = state.stop_reason.as_deref().unwrap_or("no reason recorded");
+        format!("the run stopped (stop reason: {reason})")
     } else {
-        (
-            "stopped",
-            format!(
-                "run `devflow resume --phase {phase}` to continue it, or pass --force to discard \
-                 the worktree and the run's state (a branch with commits not merged into the \
-                 base is kept)"
-            ),
-        )
+        "the run did not complete and no runner is live".to_string()
     };
     format!(
-        "keeping worktree {} for phase {phase}: the run {kind} (stop reason: {reason}); {next}",
-        path.display()
+        "{kind}; run `devflow resume --phase {phase}` to continue it, or `devflow discard \
+         --phase {phase}` to remove the worktree, the run's state and the branch"
     )
 }
 
-/// `cleanup --force`'s removal of the run's state file once its worktree is gone
-/// (OPS-02, 999.213), so nothing of the run is left behind. Only a state that
-/// records this worktree, or none, is removed: a state joined by name whose
-/// recorded worktree is another path still owns that one.
+/// What cleanup found for a phase's run, for its keep lines.
+fn run_description(existing: &workflow::Existing) -> String {
+    match existing {
+        workflow::Existing::Loaded(state) if state.finished => {
+            let reason = state.stop_reason.as_deref().unwrap_or("no reason recorded");
+            format!("the run finished, stop reason: {reason}")
+        }
+        workflow::Existing::Loaded(_) => {
+            "the start that reserved it never prepared its run".to_string()
+        }
+        workflow::Existing::Unloadable(err) => format!("its run state does not load: {err}"),
+        workflow::Existing::Missing => "no run state".to_string(),
+    }
+}
+
+/// Remove the run's state file once its worktree is gone (OPS-02, 999.213), so nothing
+/// of the run is left behind. Only a state that records this worktree, or none, is
+/// removed: a state joined by name whose recorded worktree is another path still owns
+/// that one.
 fn remove_run_state_with_worktree(project_root: &Path, state: &State, removed: &Path) {
     if state
         .worktree_path
@@ -1454,14 +1679,18 @@ fn remove_run_state_with_worktree(project_root: &Path, state: &State, removed: &
     {
         return;
     }
-    let path = workflow::state_path(project_root, state.phase);
-    match workflow::clear_state(project_root, state.phase) {
+    clear_run_state(project_root, state.phase);
+}
+
+/// Remove `phase`'s state file, printing what happened.
+fn clear_run_state(project_root: &Path, phase: PhaseId) {
+    let path = workflow::state_path(project_root, phase);
+    match workflow::clear_state(project_root, phase) {
         Ok(true) => println!("removed run state {}", path.display()),
         Ok(false) => {}
         Err(err) => println!(
-            "warning: could not remove the run state {} for phase {}: {err}",
-            path.display(),
-            state.phase
+            "warning: could not remove the run state {} for phase {phase}: {err}",
+            path.display()
         ),
     }
 }

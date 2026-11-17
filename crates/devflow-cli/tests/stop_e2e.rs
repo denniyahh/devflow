@@ -294,66 +294,6 @@ fn stop_against_a_root_with_no_state_is_a_success() {
     );
 }
 
-/// Task 3's composition proof (23-CONTEXT.md's Integration Points, T-23-54):
-/// stop makes a phase not-live; `cleanup`'s existing `stopped && !force`
-/// refusal (20c/CR-02) must still decline it, and `cleanup --force` must
-/// then succeed — the two verbs compose in that order, and `cleanup`'s
-/// fail-closed guarantee is provably unweakened by this plan.
-#[test]
-fn stop_then_cleanup_composes_refuse_then_force() {
-    let run = LiveRun::start_in_a_worktree(PhaseId::new(102));
-    let wt_path = run
-        .state()
-        .worktree_path
-        .expect("the run used a phase worktree");
-    assert!(wt_path.is_dir(), "the run's worktree exists");
-
-    let stopped = run.stop(&[]);
-    assert!(
-        stopped.status.success(),
-        "devflow stop failed: {}",
-        describe(&stopped)
-    );
-    assert!(
-        run.state().stopped,
-        "stop must have marked the phase stopped before the composition check runs"
-    );
-
-    // cleanup without --force must still decline — the fail-closed
-    // guarantee this plan's design depends on and does not weaken.
-    let refused = common::hermetic_devflow(&run.home)
-        .args(["cleanup"])
-        .arg(&run.root)
-        .output()
-        .expect("run devflow cleanup");
-    assert!(
-        refused.status.success(),
-        "cleanup on a stopped phase must not error, only skip: {}",
-        String::from_utf8_lossy(&refused.stderr)
-    );
-    assert!(
-        wt_path.is_dir(),
-        "cleanup without --force must not remove a stop-marked phase's worktree"
-    );
-
-    // cleanup --force is the documented escape hatch — the two verbs
-    // compose in that order.
-    let forced = common::hermetic_devflow(&run.home)
-        .args(["cleanup", "--force"])
-        .arg(&run.root)
-        .output()
-        .expect("run devflow cleanup --force");
-    assert!(
-        forced.status.success(),
-        "cleanup --force must succeed: {}",
-        String::from_utf8_lossy(&forced.stderr)
-    );
-    assert!(
-        !wt_path.is_dir(),
-        "cleanup --force must remove the worktree after stop"
-    );
-}
-
 /// Phase 46 / D-11 (VALID-02): `stop` must accept its project root as a
 /// POSITIONAL argument, the way `start`, `resume`, `status` and
 /// `approve` already do.
@@ -759,11 +699,6 @@ impl LiveRun {
     /// A run whose agent succeeds once released, on the main checkout.
     fn start(phase: PhaseId) -> Self {
         Self::launch(phase, &["--no-worktree"])
-    }
-
-    /// [`Self::start`] in a phase worktree, `start`'s default.
-    fn start_in_a_worktree(phase: PhaseId) -> Self {
-        Self::launch(phase, &[])
     }
 
     fn launch(phase: PhaseId, extra: &[&str]) -> Self {
