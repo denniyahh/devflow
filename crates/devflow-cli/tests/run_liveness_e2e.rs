@@ -537,3 +537,288 @@ fn discard_refuses_when_the_user_bus_cannot_be_located() {
         text(&out)
     );
 }
+
+/// How long `start` through the fake launcher may take to return.
+const START_RETURNS_WITHIN: Duration = Duration::from_secs(30);
+
+impl Case {
+    /// The `start` argv for this case: codex in supervise mode on the main checkout.
+    fn start_args(&self) -> Vec<String> {
+        [
+            "start",
+            "--phase",
+            &self.phase.to_string(),
+            "--agent",
+            "codex",
+            "--mode",
+            "supervise",
+            "--no-worktree",
+        ]
+        .map(str::to_string)
+        .to_vec()
+    }
+
+    /// A `devflow start` child whose codex stub waits until it is ended.
+    fn start_command(&self, stubs: &common::FakeBin) -> std::process::Command {
+        let args = self.start_args();
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.devflow(&args, &stubs.path)
+    }
+
+    /// The pid the fake `systemd-run` recorded for the phase's unit, if any.
+    fn recorded_runner_pid(&self) -> Option<u32> {
+        fs::read_to_string(self.home.service_bin().join(format!("{}.pid", self.unit())))
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+    }
+
+    /// Whether the phase's state names no reservation: it is absent, or it loads
+    /// with no `pending_supervisor`.
+    fn reservation_free(&self) -> bool {
+        match devflow_core::workflow::load_state(&self.root, self.phase) {
+            Ok(state) => state.pending_supervisor.is_none(),
+            Err(devflow_core::workflow::WorkflowError::MissingState(_)) => true,
+            Err(_) => false,
+        }
+    }
+
+    /// Whether the runner lock probes Live.
+    fn runner_lock_live(&self) -> bool {
+        liveness::probe(&liveness::runner_lock_path(&self.root, self.phase))
+            .is_ok_and(|held| held == liveness::Held::Live)
+    }
+}
+
+/// D-04a: a unit start that fails makes `start` exit non-zero naming the unit and
+/// systemd-run's stderr, and the reservation is cleared.
+#[test]
+fn start_reports_a_failed_unit_start_naming_the_unit_and_clears_the_reservation() {
+    let case = Case::new(PhaseId::new(73));
+    let failure = format!(
+        "Job for {} failed because the control process exited with error code.",
+        case.unit()
+    );
+    fs::write(
+        case.home.service_bin().join(common::FAKE_FAIL_NEXT),
+        format!("{failure}\n"),
+    )
+    .unwrap();
+    let logs = tempfile::tempdir().unwrap();
+    let stubs = common::waiting_capture_agent_bin(logs.path());
+    let _reaper = common::LaunchedRunReaper::for_home(&case.home, &case.root, case.phase);
+
+    let out = case
+        .start_command(&stubs)
+        .output()
+        .expect("run devflow start");
+    assert!(!out.status.success(), "start exited 0:\n{}", text(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&case.unit()) && stderr.contains(&failure),
+        "missing runner path not reported: the unit and systemd-run's text:\n{}",
+        text(&out)
+    );
+    assert!(
+        case.reservation_free(),
+        "reservation left after a failed start:\n{}",
+        text(&out)
+    );
+}
+
+/// D-04c: with lingering off `start` warns that the run ends at logout and still
+/// launches. Control: with lingering on it prints no such warning.
+#[test]
+fn start_warns_when_lingering_is_off() {
+    for (phase, linger_off) in [(PhaseId::new(74), true), (PhaseId::new(75), false)] {
+        let case = Case::new(phase);
+        if linger_off {
+            fs::write(case.home.service_bin().join("linger.no"), "").unwrap();
+        }
+        let logs = tempfile::tempdir().unwrap();
+        let stubs = common::waiting_capture_agent_bin(logs.path());
+        let _reaper = common::LaunchedRunReaper::for_home(&case.home, &case.root, case.phase);
+
+        let out = case
+            .start_command(&stubs)
+            .output()
+            .expect("run devflow start");
+        assert!(out.status.success(), "start failed:\n{}", text(&out));
+        assert!(
+            case.recorded_runner_pid().is_some(),
+            "start did not launch through systemd-run:\n{}",
+            text(&out)
+        );
+        let warned = String::from_utf8_lossy(&out.stderr).contains("logout");
+        assert_eq!(
+            warned,
+            linger_off,
+            "linger warning {} with lingering {}:\n{}",
+            if warned { "printed" } else { "missing" },
+            if linger_off { "off" } else { "on" },
+            text(&out)
+        );
+    }
+}
+
+/// Review codex-6, pi-6: `start` through the fake launcher returns while the runner
+/// lives, the runner lock is held right after, and the recorded pid runs `__runner`,
+/// not `__monitor`.
+#[test]
+fn start_through_the_fake_launcher_returns_while_the_run_is_live() {
+    let case = Case::new(PhaseId::new(76));
+    let logs = tempfile::tempdir().unwrap();
+    let stubs = common::waiting_capture_agent_bin(logs.path());
+    let _reaper = common::LaunchedRunReaper::for_home(&case.home, &case.root, case.phase);
+    let mut guard = ChildGuard(Some(
+        case.start_command(&stubs)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn devflow start"),
+    ));
+
+    common::wait_for(
+        || guard.child().try_wait().expect("poll start").is_some(),
+        START_RETURNS_WITHIN,
+        "start did not return while the runner lives",
+    );
+    let out = guard.output_within(Duration::from_secs(1));
+    assert!(out.status.success(), "start failed:\n{}", text(&out));
+    assert!(
+        case.runner_lock_live(),
+        "runner lock not live after start:\n{}",
+        text(&out)
+    );
+    let pid = case
+        .recorded_runner_pid()
+        .unwrap_or_else(|| panic!("the fake did not start the runner verb:\n{}", text(&out)));
+    let args = common::process_args(pid);
+    assert!(
+        args.iter().any(|arg| arg == "__runner"),
+        "the fake did not start the runner verb: {args:?}"
+    );
+    assert!(
+        !args.iter().any(|arg| arg == "__monitor"),
+        "the fake started __monitor: {args:?}"
+    );
+}
+
+/// D-07a, D-12, review agy-1: a unit still deactivating with the runner lock free is
+/// waited on, not refused; once it reads inactive `start` launches.
+#[test]
+fn start_waits_for_a_deactivating_unit_then_launches() {
+    let case = Case::new(PhaseId::new(77));
+    let marker = case.mark_unit_deactivating();
+    let logs = tempfile::tempdir().unwrap();
+    let stubs = common::waiting_capture_agent_bin(logs.path());
+    let _reaper = common::LaunchedRunReaper::for_home(&case.home, &case.root, case.phase);
+    let mut guard = ChildGuard(Some(
+        case.start_command(&stubs)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn devflow start"),
+    ));
+
+    std::thread::sleep(Duration::from_secs(1));
+    let still_waiting = guard.child().try_wait().expect("poll start").is_none();
+    if !still_waiting {
+        let out = guard.output_within(Duration::from_secs(1));
+        panic!(
+            "start refused a stopping unit instead of waiting:\n{}",
+            text(&out)
+        );
+    }
+    assert!(
+        case.recorded_runner_pid().is_none(),
+        "start refused a stopping unit instead of waiting: it launched while the unit \
+         read deactivating"
+    );
+
+    fs::remove_file(&marker).unwrap();
+    let out = guard.output_within(START_RETURNS_WITHIN);
+    assert!(
+        out.status.success(),
+        "start did not launch once the unit read inactive:\n{}",
+        text(&out)
+    );
+    assert!(
+        case.runner_lock_live(),
+        "runner lock not live after start:\n{}",
+        text(&out)
+    );
+}
+
+/// D-03, review codex-2, agy-6: with no locatable user bus `start` refuses naming
+/// both bus variables and printing systemctl's stderr, and gives no lingering hint,
+/// which is Absent's alone.
+#[test]
+fn start_refuses_when_the_user_bus_cannot_be_located_naming_the_variables() {
+    let case = Case::new(PhaseId::new(78));
+    case.mark_manager_unanswering();
+    let logs = tempfile::tempdir().unwrap();
+    let stubs = common::waiting_capture_agent_bin(logs.path());
+    let _reaper = common::LaunchedRunReaper::for_home(&case.home, &case.root, case.phase);
+
+    let out = case
+        .start_command(&stubs)
+        .env_remove("XDG_RUNTIME_DIR")
+        .env_remove("DBUS_SESSION_BUS_ADDRESS")
+        .output()
+        .expect("run devflow start");
+    assert!(!out.status.success(), "start exited 0:\n{}", text(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("XDG_RUNTIME_DIR") && stderr.contains("DBUS_SESSION_BUS_ADDRESS"),
+        "bus variables not named:\n{}",
+        text(&out)
+    );
+    assert!(
+        stderr.contains("No medium found"),
+        "systemctl stderr missing from the refusal:\n{}",
+        text(&out)
+    );
+    assert!(
+        !stderr.contains("enable-linger"),
+        "lingering hint on an unreachable bus:\n{}",
+        text(&out)
+    );
+    assert!(
+        case.recorded_runner_pid().is_none(),
+        "start launched without a reachable manager:\n{}",
+        text(&out)
+    );
+}
+
+/// D-07, review agy-6: a failed unit read once the manager answers refuses `start`,
+/// printing systemctl's stderr, and launches nothing.
+#[test]
+fn start_refuses_when_the_unit_read_fails_printing_systemctls_error() {
+    let case = Case::new(PhaseId::new(79));
+    fs::write(
+        case.home
+            .service_bin()
+            .join(format!("{}.fail", case.unit())),
+        "",
+    )
+    .unwrap();
+    let logs = tempfile::tempdir().unwrap();
+    let stubs = common::waiting_capture_agent_bin(logs.path());
+    let _reaper = common::LaunchedRunReaper::for_home(&case.home, &case.root, case.phase);
+
+    let out = case
+        .start_command(&stubs)
+        .output()
+        .expect("run devflow start");
+    assert!(!out.status.success(), "start exited 0:\n{}", text(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("Transport endpoint is not connected"),
+        "systemctl stderr missing from the refusal:\n{}",
+        text(&out)
+    );
+    assert!(
+        case.recorded_runner_pid().is_none(),
+        "start launched over a failed unit read:\n{}",
+        text(&out)
+    );
+}
