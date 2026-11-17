@@ -1,5 +1,6 @@
 mod common;
 
+use common::HermeticPath;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
 use devflow_core::workflow::load_state;
@@ -96,7 +97,7 @@ fn run_devflow(home: &common::HermeticHome, root: &Path, fake_bin: &Path, args: 
     command
         .args(args)
         .arg(root)
-        .env("PATH", path_with_fake_bin(fake_bin))
+        .hermetic_path(path_with_fake_bin(fake_bin))
         .env("DEVFLOW_TEST_ROOT", root)
         .current_dir(root);
     // HYG-01: bound the gate wait on the CHILD's env. Supervise-mode stages
@@ -714,7 +715,7 @@ fn until_rejects_removed_stages() {
                 "--dry-run",
             ])
             .arg(root)
-            .env("PATH", path_with_fake_bin(&fake_bin.path))
+            .hermetic_path(path_with_fake_bin(&fake_bin.path))
             .current_dir(root)
             .output()
             .expect("run devflow")
@@ -773,7 +774,7 @@ fn start_until_unknown_stage_is_rejected_by_clap() {
             "start", "--phase", "46", "--agent", "claude", "--mode", "auto", "--until", "bogus",
         ])
         .arg(root)
-        .env("PATH", path_with_fake_bin(&fake_bin.path))
+        .hermetic_path(path_with_fake_bin(&fake_bin.path))
         .current_dir(root)
         .output()
         .expect("run devflow");
@@ -1047,7 +1048,7 @@ fn start_dry_run_lists_exactly_plan_code_validate() {
     let output = common::hermetic_devflow(&home)
         .args(["start", "--dry-run", "--phase", "1", "--mode", "supervise"])
         .arg(root)
-        .env("PATH", path_with_fake_bin(&fake_bin.path))
+        .hermetic_path(path_with_fake_bin(&fake_bin.path))
         .current_dir(root)
         .output()
         .expect("run devflow");
@@ -1089,7 +1090,7 @@ fn start_dry_run_stderr_with_external_verify(value: &str) -> String {
     let output = common::hermetic_devflow(&home)
         .args(["start", "--dry-run", "--phase", "1", "--mode", "supervise"])
         .arg(root)
-        .env("PATH", path_with_fake_bin(&fake_bin.path))
+        .hermetic_path(path_with_fake_bin(&fake_bin.path))
         .env("DEVFLOW_EXTERNAL_VERIFY_ENABLED", value)
         .current_dir(root)
         .output()
@@ -1116,7 +1117,7 @@ fn resume_without_state_stderr_with_external_verify(value: &str) -> String {
     let output = common::hermetic_devflow(&home)
         .args(["resume", "--phase", "12"])
         .arg(root)
-        .env("PATH", path_with_fake_bin(&fake_bin.path))
+        .hermetic_path(path_with_fake_bin(&fake_bin.path))
         .env("DEVFLOW_EXTERNAL_VERIFY_ENABLED", value)
         .current_dir(root)
         .output()
@@ -1229,7 +1230,7 @@ fn start_says_when_it_replaces_a_finished_or_stale_state() {
         let output = common::hermetic_devflow(&home)
             .args(["start", "--dry-run", "--phase", "7", "--mode", "supervise"])
             .arg(root)
-            .env("PATH", path_with_fake_bin(&fake_bin.path))
+            .hermetic_path(path_with_fake_bin(&fake_bin.path))
             .current_dir(root)
             .output()
             .expect("run devflow");
@@ -1321,7 +1322,7 @@ fn start_dry_run_annotates_until_stage() {
             "--dry-run",
         ])
         .arg(root)
-        .env("PATH", path_with_fake_bin(&fake_bin.path))
+        .hermetic_path(path_with_fake_bin(&fake_bin.path))
         .current_dir(root)
         .output()
         .expect("run devflow");
@@ -1379,7 +1380,7 @@ fn start_dry_run_without_until_has_no_stop_annotation() {
             "--dry-run",
         ])
         .arg(root)
-        .env("PATH", path_with_fake_bin(&fake_bin.path))
+        .hermetic_path(path_with_fake_bin(&fake_bin.path))
         .current_dir(root)
         .output()
         .expect("run devflow");
@@ -1543,7 +1544,7 @@ fn start_codex_without_context_fails_preflight() {
             "start", "--phase", "42", "--agent", "codex", "--mode", "auto",
         ])
         .arg(root)
-        .env("PATH", path_with_fake_bin(&fake_bin.path))
+        .hermetic_path(path_with_fake_bin(&fake_bin.path))
         .current_dir(root)
         .output()
         .expect("run devflow");
@@ -1612,7 +1613,7 @@ fn cleanup_force_refuses_on_live_agent_unknown_monitor() {
     let output = common::hermetic_devflow(&home)
         .args(["cleanup", "--force"])
         .arg(root)
-        .env("PATH", path_with_fake_bin(&fake_bin.path))
+        .hermetic_path(path_with_fake_bin(&fake_bin.path))
         .current_dir(root)
         .output()
         .expect("run devflow cleanup");
@@ -1686,7 +1687,7 @@ fn cleanup_force_refuses_on_dead_monitor_live_agent() {
     let output = common::hermetic_devflow(&home)
         .args(["cleanup", "--force"])
         .arg(root)
-        .env("PATH", path_with_fake_bin(&fake_bin.path))
+        .hermetic_path(path_with_fake_bin(&fake_bin.path))
         .current_dir(root)
         .output()
         .expect("run devflow cleanup");
@@ -1755,7 +1756,7 @@ fn cleanup_keeps_worktree_for_until_stopped_phase_without_force() {
     let output = common::hermetic_devflow(&home)
         .args(["cleanup"])
         .arg(root)
-        .env("PATH", path_with_fake_bin(&fake_bin.path))
+        .hermetic_path(path_with_fake_bin(&fake_bin.path))
         .current_dir(root)
         .output()
         .expect("run devflow cleanup");
@@ -1813,7 +1814,7 @@ fn cleanup_force_removes_worktree_for_until_stopped_phase() {
     let output = common::hermetic_devflow(&home)
         .args(["cleanup", "--force"])
         .arg(root)
-        .env("PATH", path_with_fake_bin(&fake_bin.path))
+        .hermetic_path(path_with_fake_bin(&fake_bin.path))
         .current_dir(root)
         .output()
         .expect("run devflow cleanup --force");
@@ -1880,7 +1881,7 @@ fn run_cleanup(home: &common::HermeticHome, root: &Path, extra: &[&str]) -> Outp
         .arg("cleanup")
         .args(extra)
         .arg(root)
-        .env("PATH", path_with_fake_bin(&fake_bin.path))
+        .hermetic_path(path_with_fake_bin(&fake_bin.path))
         .current_dir(root)
         .output()
         .expect("run devflow cleanup")
@@ -2162,7 +2163,7 @@ fn force_start_phase_12(
         ])
         .args(extra)
         .arg(root)
-        .env("PATH", path_with_fake_bin(&fake_bin.path))
+        .hermetic_path(path_with_fake_bin(&fake_bin.path))
         .env("DEVFLOW_TEST_ROOT", root)
         .env("DEVFLOW_GATE_TIMEOUT_SECS", "60")
         .current_dir(root)
@@ -2279,7 +2280,7 @@ fn cleanup_is_idempotent_when_worktree_already_removed() {
     let first = common::hermetic_devflow(&home)
         .args(["cleanup", "--force"])
         .arg(root)
-        .env("PATH", path_with_fake_bin(&fake_bin.path))
+        .hermetic_path(path_with_fake_bin(&fake_bin.path))
         .current_dir(root)
         .output()
         .expect("run devflow cleanup (first)");
@@ -2293,7 +2294,7 @@ fn cleanup_is_idempotent_when_worktree_already_removed() {
     let second = common::hermetic_devflow(&home)
         .args(["cleanup", "--force"])
         .arg(root)
-        .env("PATH", path_with_fake_bin(&fake_bin.path))
+        .hermetic_path(path_with_fake_bin(&fake_bin.path))
         .current_dir(root)
         .output()
         .expect("run devflow cleanup (second)");
@@ -3042,7 +3043,7 @@ fn run_discard(home: &common::HermeticHome, root: &Path, phase: PhaseId, extra: 
         .args(["discard", "--phase", &phase.to_string()])
         .args(extra)
         .arg(root)
-        .env("PATH", path_with_fake_bin(&fake_bin.path))
+        .hermetic_path(path_with_fake_bin(&fake_bin.path))
         .current_dir(root)
         .output()
         .expect("run devflow discard")

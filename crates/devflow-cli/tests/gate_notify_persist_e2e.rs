@@ -26,6 +26,7 @@
 
 mod common;
 
+use common::HermeticPath;
 use devflow_core::gates::{GATE_NOTIFY_CMD_ENV, Gates};
 use devflow_core::mode::Mode;
 use devflow_core::phase_id::PhaseId;
@@ -217,7 +218,7 @@ fn spawn_parked_start_with(
         ])
         .arg(root)
         .current_dir(root)
-        .env("PATH", path)
+        .hermetic_path(path)
         .env("DEVFLOW_GATE_TIMEOUT_SECS", "30")
         .env(TEST_MARKER_ENV, root);
     apply_notify_env(&mut command, notify);
@@ -414,7 +415,7 @@ fn with_spawned_resume<T>(
         .args(["resume", "--phase", &phase.to_string()])
         .arg(root)
         .current_dir(root)
-        .env("PATH", path)
+        .hermetic_path(path)
         .env("DEVFLOW_GATE_TIMEOUT_SECS", "30")
         .env(TEST_MARKER_ENV, root);
     apply_notify_env(&mut command, notify);

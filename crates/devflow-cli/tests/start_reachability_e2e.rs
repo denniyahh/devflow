@@ -12,6 +12,7 @@
 
 mod common;
 
+use common::HermeticPath;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -124,7 +125,7 @@ fn start_refuses_a_phase_promoted_only_on_the_working_branch_and_scaffolds_nothi
             "start", "--phase", "24", "--agent", "claude", "--mode", "auto",
         ])
         .arg(root)
-        .env("PATH", path_with_fake_bin(&fake_bin.path))
+        .hermetic_path(path_with_fake_bin(&fake_bin.path))
         .current_dir(root)
         .output()
         .expect("run devflow");
@@ -202,7 +203,7 @@ fn start_refuses_before_creating_the_feature_branch_in_no_worktree_mode() {
             "--no-worktree",
         ])
         .arg(root)
-        .env("PATH", path_with_fake_bin(&fake_bin.path))
+        .hermetic_path(path_with_fake_bin(&fake_bin.path))
         .current_dir(root)
         .output()
         .expect("run devflow");

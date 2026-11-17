@@ -14,6 +14,7 @@
 
 mod common;
 
+use common::HermeticPath;
 use devflow_core::phase_id::PhaseId;
 use std::fs;
 use std::path::Path;
@@ -109,7 +110,7 @@ fn run_start(
         .args(extra)
         .arg(root)
         .current_dir(root)
-        .env("PATH", path)
+        .hermetic_path(path)
         .output()
         .expect("run devflow start")
 }
