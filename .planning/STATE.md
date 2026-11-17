@@ -5,16 +5,16 @@ milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: "52.2"
 current_phase_name: Foreground Runner
 status: executing
-stopped_at: Completed 52.2-22-PLAN.md
-last_updated: "2026-11-17T10:32:00.345Z"
+stopped_at: Completed 52.2-09-PLAN.md
+last_updated: "2026-11-17T11:11:42.065Z"
 last_activity: 2026-11-16
 last_activity_desc: Phase 52.2 execution started
-state_head: 844d6880ee9f1a09fb91b427eb0ec3835727d4a7
+state_head: 7bf32760011e7edf990147d6230c289e2d85205e
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 66
-  completed_plans: 51
+  completed_plans: 52
   percent: 17
 ---
 
@@ -172,7 +172,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 52.2 (Foreground Runner) — EXECUTING
-Plan: 12 of 26
+Plan: 13 of 26
 Status: Ready to execute
 Last activity: 2026-11-16 — Phase 52.2 execution started
 
@@ -965,6 +965,9 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 52.2]: gate_notify_persist_e2e advance arms run through resume: a bare __runner fires the notify command but saves nothing; committing the variable is start and resume's job
 - [Phase 52.2]: Two auto_chain_flag_e2e supervisor-record tests retired with ledger rows; the runner lock leaves no second run to supersede
 - [Phase 52.2]: 52.2-22: OPERATIONS.md's doctor orphan paragraph keeps its place for 52.2-26 but says its printed repair names stop's removed --launch flag and no longer parses; the code that prints it is 52.2-23's
+- [Phase 52.2]: 52.2-09: reservation-only = state loads and run_never_prepared holds, read after runner_liveness is not live; status shows it as idle naming start
+- [Phase 52.2]: 52.2-09: status lists phases from .runner-NN, gate request and state file names; a free runner lock alone is history and gets no row
+- [Phase 52.2]: 52.2-09: logs -f prints the run's state line on stderr once the runner leaves the followed stage (60 s bound), or when a quiescent poll finds the runner NotLive
 
 ## Roadmap Evolution
 
@@ -1127,11 +1130,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 52.2 P07 | 32 min | 3 tasks | 9 files |
 | Phase 52.2 P08 | 28 min | 3 tasks | 7 files |
 | Phase 52.2 P22 | 15min | 2 tasks | 7 files |
+| Phase 52.2 P09 | 30 min | 3 tasks | 2 files |
 
 ## Session
 
-**Last session:** 2026-11-17T10:31:59.401Z
-**Stopped at:** Completed 52.2-22-PLAN.md
+**Last session:** 2026-11-17T11:11:41.186Z
+**Stopped at:** Completed 52.2-09-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
