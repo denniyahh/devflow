@@ -22,16 +22,13 @@
 //! only names the holder for an operator.
 
 use std::fs::{File, OpenOptions, TryLockError};
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::phase_id::PhaseId;
-
-/// The descriptor number a hold has in the child `pass_to_child` spawns.
-pub const INHERITED_FD: RawFd = 3;
 
 /// The suffix of the temporary name a hold is locked under before it is
 /// published: `.{final_file_name}.{pid}.{seq}.hold-tmp`, beside the final name.
@@ -227,29 +224,6 @@ pub fn probe(path: &Path) -> std::io::Result<Held> {
     }
 }
 
-/// Have `cmd`'s child inherit `hold` at [`INHERITED_FD`], so it holds the lock
-/// after this process drops its copy.
-pub(crate) fn pass_to_child(cmd: &mut std::process::Command, hold: &Hold) {
-    let raw = hold.as_raw_fd();
-    // SAFETY: the callback only calls `fcntl` and `dup2`, both
-    // async-signal-safe, and reads errno. It allocates nothing and takes no
-    // locks. When the descriptor already is fd 3, `dup2` would be a no-op that
-    // leaves close-on-exec set, so that case clears the flag instead.
-    unsafe {
-        std::os::unix::process::CommandExt::pre_exec(cmd, move || {
-            let result = if raw == INHERITED_FD {
-                libc::fcntl(INHERITED_FD, libc::F_SETFD, 0)
-            } else {
-                libc::dup2(raw, INHERITED_FD)
-            };
-            if result == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-}
-
 /// A fresh launch id: 16 lowercase hex characters from this process's pid,
 /// the current time in nanoseconds and a process-wide counter. Uniqueness is
 /// also enforced where an id names a file, which refuses an existing name.
@@ -295,28 +269,6 @@ pub fn launch_liveness_path(project_root: &Path, launch_id: &str) -> Option<Path
             .join(".devflow")
             .join(format!("supervisor-{launch_id}.live"))
     })
-}
-
-/// The supervisor's side of `pass_to_child`: take ownership of the inherited
-/// descriptor `fd` on `path`, mark it close-on-exec so an agent this process
-/// spawns never inherits it, and record this process as the holder.
-///
-/// # Errors
-/// `fd` is not an open descriptor, or the record could not be written.
-pub fn adopt_inherited(fd: RawFd, path: PathBuf) -> std::io::Result<Hold> {
-    // SAFETY: fcntl on a descriptor number reads and sets its flags and touches
-    // no memory; a closed number fails with EBADF.
-    unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFD);
-        if flags == -1 || libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) == -1 {
-            return Err(std::io::Error::last_os_error());
-        }
-    }
-    // SAFETY: the descriptor is open (checked above) and was handed to this
-    // process for exclusive ownership; nothing else here uses it.
-    let file = unsafe { File::from_raw_fd(fd) };
-    write_identity_record(&file)?;
-    Ok(Hold { file, path })
 }
 
 /// The per-phase holder file (D-17): `.devflow/.holder-{padded}`.
@@ -631,7 +583,6 @@ mod tests {
         assert_child_ran_exactly_one_passing_test, in_child_test, run_test_in_child,
         spawn_test_in_child,
     };
-    use std::os::unix::process::CommandExt;
     use std::process::{Child, Command, Stdio};
 
     /// Run `body` in a child test process of its own, with no other test
@@ -669,72 +620,6 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         command
-    }
-
-    /// Establish that fd 3 is free: anything the harness left there is moved
-    /// aside, not closed, so it stays open until this process exits.
-    fn free_fd_3() {
-        // SAFETY: fcntl and close on a descriptor number; this process runs
-        // one test (`in_own_process`), and the moved copy keeps the file open.
-        unsafe {
-            if libc::fcntl(INHERITED_FD, libc::F_GETFD) == -1 {
-                eprintln!("fd 3 was free");
-                return;
-            }
-            let moved = libc::fcntl(INHERITED_FD, libc::F_DUPFD_CLOEXEC, 64);
-            assert_ne!(moved, -1, "move fd 3 aside");
-            assert_eq!(libc::close(INHERITED_FD), 0, "close fd 3 after moving it");
-            eprintln!("fd 3 was open; moved aside to {moved}");
-        }
-    }
-
-    /// Put `file` at fd 3 with close-on-exec set. With fd 3 free, a file
-    /// opened since may already be there; otherwise the copy lands there and
-    /// the original closes, and any lock stays, since both refer to one open
-    /// file description.
-    fn place_at_fd_3(file: File) -> File {
-        if file.as_raw_fd() == INHERITED_FD {
-            return file;
-        }
-        // SAFETY: fcntl on a descriptor `file` owns; the result is a new
-        // descriptor nothing else owns, checked to be fd 3 before it is wrapped.
-        unsafe {
-            let placed = libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, INHERITED_FD);
-            assert_eq!(placed, INHERITED_FD, "fd 3 must have been free");
-            File::from_raw_fd(placed)
-        }
-    }
-
-    fn hold_at_fd_3(hold: Hold) -> Hold {
-        let Hold { file, path } = hold;
-        let hold = Hold {
-            file: place_at_fd_3(file),
-            path,
-        };
-        assert_eq!(hold.as_raw_fd(), INHERITED_FD);
-        // SAFETY: F_GETFD reads a flag of a descriptor `hold` owns.
-        let flags = unsafe { libc::fcntl(INHERITED_FD, libc::F_GETFD) };
-        assert_ne!(
-            flags & libc::FD_CLOEXEC,
-            0,
-            "the trap needs close-on-exec set on fd 3"
-        );
-        hold
-    }
-
-    /// The variant Pitfall 1 describes: `dup2` alone, which is a no-op when
-    /// the descriptor already is fd 3 and leaves close-on-exec set.
-    fn pass_to_child_naively(cmd: &mut Command, hold: &Hold) {
-        let raw = hold.as_raw_fd();
-        // SAFETY: only `dup2`, which is async-signal-safe.
-        unsafe {
-            cmd.pre_exec(move || {
-                if libc::dup2(raw, INHERITED_FD) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
     }
 
     /// The D-17 holder: one claim at a time, its record names the claimer, and the file
@@ -1010,77 +895,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_inherited_liveness_lock_survives_the_launcher_when_it_is_fd_3() {
-        in_own_process(
-            "liveness::tests::an_inherited_liveness_lock_survives_the_launcher_when_it_is_fd_3",
-            || {
-                free_fd_3();
-                let dir = tempfile::tempdir().expect("create a temp dir");
-
-                let held = dir.path().join("x.live");
-                let hold = hold_at_fd_3(Hold::take(&held).expect("take a hold"));
-                let mut command = sleep_command();
-                pass_to_child(&mut command, &hold);
-                let child = ReapOnDrop(command.spawn().expect("spawn the child"));
-                drop(hold);
-                assert_eq!(
-                    probe(&held).expect("probe"),
-                    Held::Live,
-                    "the child at fd 3 must hold the lock after the parent's drop"
-                );
-                drop(child);
-                assert_eq!(
-                    probe(&held).expect("probe"),
-                    Held::Abandoned,
-                    "the lock must end with the child"
-                );
-
-                let naive = dir.path().join("naive.live");
-                let hold = hold_at_fd_3(Hold::take(&naive).expect("take a hold"));
-                let mut command = sleep_command();
-                pass_to_child_naively(&mut command, &hold);
-                let child = ReapOnDrop(command.spawn().expect("spawn the child"));
-                drop(hold);
-                assert_eq!(
-                    probe(&naive).expect("probe"),
-                    Held::Abandoned,
-                    "dup2 alone must lose the lock at exec, or the raw == 3 branch keeps nothing"
-                );
-                drop(child);
-            },
-        );
-    }
-
-    #[test]
-    fn an_inherited_liveness_lock_survives_the_launcher_when_it_is_not_fd_3() {
-        in_own_process(
-            "liveness::tests::an_inherited_liveness_lock_survives_the_launcher_when_it_is_not_fd_3",
-            || {
-                free_fd_3();
-                let dir = tempfile::tempdir().expect("create a temp dir");
-                let other = File::create(dir.path().join("other")).expect("create a file");
-                let other = place_at_fd_3(other);
-                assert_eq!(other.as_raw_fd(), INHERITED_FD);
-
-                let held = dir.path().join("x.live");
-                let hold = Hold::take(&held).expect("take a hold");
-                assert_ne!(hold.as_raw_fd(), INHERITED_FD, "fd 3 is taken");
-                let mut command = sleep_command();
-                pass_to_child(&mut command, &hold);
-                let child = ReapOnDrop(command.spawn().expect("spawn the child"));
-                drop(hold);
-                assert_eq!(
-                    probe(&held).expect("probe"),
-                    Held::Live,
-                    "the dup2 branch must keep the lock in the child"
-                );
-                drop(child);
-                assert_eq!(probe(&held).expect("probe"), Held::Abandoned);
-            },
-        );
-    }
-
     /// This process's identity as a hold records it.
     fn this_process() -> (u32, Option<u64>) {
         let pid = std::process::id();
@@ -1103,33 +917,6 @@ mod tests {
 
                 drop(hold);
                 assert_eq!(probe(&path).expect("probe"), Held::Abandoned);
-            },
-        );
-    }
-
-    #[test]
-    fn unlock_on_a_duplicate_releases_the_inherited_lock() {
-        in_own_process(
-            "liveness::tests::unlock_on_a_duplicate_releases_the_inherited_lock",
-            || {
-                let dir = tempfile::tempdir().expect("create a temp dir");
-                let path = dir.path().join("x.live");
-                let hold = Hold::take(&path).expect("take a hold");
-                let mut command = sleep_command();
-                pass_to_child(&mut command, &hold);
-                let mut child = ReapOnDrop(command.spawn().expect("spawn the child"));
-                assert_eq!(probe(&path).expect("probe"), Held::Live);
-
-                hold.file.unlock().expect("unlock the parent's copy");
-                assert_eq!(
-                    probe(&path).expect("probe"),
-                    Held::Abandoned,
-                    "unlock on a duplicate must release the lock the child inherited"
-                );
-                assert!(
-                    child.0.try_wait().expect("poll the child").is_none(),
-                    "the child still runs, and no longer holds anything"
-                );
             },
         );
     }
@@ -1189,52 +976,6 @@ mod tests {
         assert_eq!(
             production_lines_containing(source, ".write_all("),
             Vec::<String>::new()
-        );
-    }
-
-    #[test]
-    fn adopting_the_inherited_descriptor_marks_it_close_on_exec_and_records_the_adopter() {
-        in_own_process(
-            "liveness::tests::adopting_the_inherited_descriptor_marks_it_close_on_exec_and_records_the_adopter",
-            || {
-                let dir = tempfile::tempdir().expect("create a temp dir");
-                let path = dir.path().join("a.live");
-                let file = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create_new(true)
-                    .open(&path)
-                    .expect("create the file");
-                file.try_lock().expect("lock the file");
-                // SAFETY: fcntl on a descriptor `file` owns; the result is owned
-                // by the adoption below.
-                let fd = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, 10) };
-                assert_ne!(fd, -1);
-                drop(file);
-                // SAFETY: F_GETFD reads a flag of the descriptor just made.
-                let before = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-                assert_eq!(
-                    before & libc::FD_CLOEXEC,
-                    0,
-                    "the fixture hands over an inheritable fd"
-                );
-
-                let hold = adopt_inherited(fd, path.clone()).expect("adopt the descriptor");
-                // SAFETY: F_GETFD reads a flag of a descriptor `hold` owns.
-                let after = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-                assert_ne!(after & libc::FD_CLOEXEC, 0, "an agent must not inherit it");
-                assert_eq!(
-                    live_holder(&path).expect("read the holder"),
-                    Some(this_process())
-                );
-
-                drop(hold);
-                assert_eq!(live_holder(&path).expect("read the holder"), None);
-                assert!(
-                    adopt_inherited(fd, path).is_err(),
-                    "a closed descriptor must be refused"
-                );
-            },
         );
     }
 
@@ -1319,80 +1060,6 @@ mod tests {
                 "record {record:?} must be refused, got {refused:?}"
             );
         }
-    }
-
-    /// Take a hold on `path` and return a duplicate of its descriptor that is
-    /// not close-on-exec and shares its open file description, with the shared
-    /// offset past the record, where any cursor write leaves it. The hold's
-    /// drop closes only its own copy, so the duplicate keeps the lock.
-    fn duplicate_with_an_advanced_offset(path: &Path) -> (RawFd, usize) {
-        let hold = Hold::take(path).expect("take a hold");
-        // SAFETY: fcntl and lseek on a descriptor `hold` owns and on its new
-        // duplicate, which the caller owns.
-        unsafe {
-            let duplicate = libc::fcntl(hold.as_raw_fd(), libc::F_DUPFD, 10);
-            assert_ne!(duplicate, -1);
-            let offset = libc::lseek(duplicate, 0, libc::SEEK_END);
-            assert!(offset > 0, "the shared offset must have moved");
-            (duplicate, usize::try_from(offset).expect("a small offset"))
-        }
-    }
-
-    /// The rewrite `write_identity_record` replaced.
-    fn rewrite_through_the_cursor(file: &File) {
-        use std::io::Write;
-        let (pid, start) = this_process();
-        file.set_len(0).expect("truncate");
-        let start = start.expect("a start time");
-        let mut writer = file;
-        writer
-            .write_all(format!("{pid} {start}\n").as_bytes())
-            .expect("write through the cursor");
-    }
-
-    #[test]
-    fn adopting_a_descriptor_take_wrote_through_keeps_the_record_intact() {
-        in_own_process(
-            "liveness::tests::adopting_a_descriptor_take_wrote_through_keeps_the_record_intact",
-            || {
-                let dir = tempfile::tempdir().expect("create a temp dir");
-                let (pid, start) = this_process();
-
-                let adopted = dir.path().join("a.live");
-                let (duplicate, _) = duplicate_with_an_advanced_offset(&adopted);
-                let _hold = adopt_inherited(duplicate, adopted.clone()).expect("adopt");
-                let bytes = std::fs::read(&adopted).expect("read the record");
-                assert!(
-                    !bytes.contains(&0),
-                    "the record has a NUL hole: {bytes:?}; live_holder reads {:?}",
-                    live_holder(&adopted)
-                );
-                assert!(bytes.starts_with(format!("{pid} ").as_bytes()));
-                assert_eq!(
-                    live_holder(&adopted).expect("read the holder"),
-                    Some((pid, start))
-                );
-
-                let cursor = dir.path().join("b.live");
-                let (duplicate, offset) = duplicate_with_an_advanced_offset(&cursor);
-                // SAFETY: the caller owns the duplicate, and nothing else uses it.
-                let file = unsafe { File::from_raw_fd(duplicate) };
-                rewrite_through_the_cursor(&file);
-                let bytes = std::fs::read(&cursor).expect("read the record");
-                assert_eq!(
-                    bytes.iter().take_while(|&&byte| byte == 0).count(),
-                    offset,
-                    "a cursor write lands past a hole as long as the offset: {bytes:?}"
-                );
-                let unreadable = live_holder(&cursor);
-                assert!(
-                    unreadable
-                        .as_ref()
-                        .is_err_and(|error| error.kind() == std::io::ErrorKind::InvalidData),
-                    "a live holder would go unnamed, got {unreadable:?}"
-                );
-            },
-        );
     }
 
     /// The sweep a remover runs: orphaned temps, then every `*.live` that
@@ -1644,74 +1311,6 @@ mod tests {
         assert!(
             live_holder(dir.path()).is_err(),
             "a held file with an unreadable record must not read as unheld"
-        );
-    }
-
-    #[test]
-    fn a_handoff_that_cannot_place_the_descriptor_fails_the_spawn() {
-        in_own_process(
-            "liveness::tests::a_handoff_that_cannot_place_the_descriptor_fails_the_spawn",
-            || {
-                free_fd_3();
-                let dir = tempfile::tempdir().expect("create a temp dir");
-                let other = File::create(dir.path().join("other")).expect("create a file");
-                let _other = place_at_fd_3(other);
-                let hold = Hold::take(&dir.path().join("x.live")).expect("take a hold");
-                assert_ne!(hold.as_raw_fd(), INHERITED_FD);
-
-                let mut limit = libc::rlimit {
-                    rlim_cur: 0,
-                    rlim_max: 0,
-                };
-                // SAFETY: getrlimit writes only into the struct it is given.
-                assert_eq!(
-                    unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
-                    0
-                );
-                limit.rlim_cur = 3;
-                let mut command = sleep_command();
-                // SAFETY: only `setrlimit`, in the child, on its stack-local
-                // copy. Closures run in order, so `dup2(raw, 3)` below then
-                // fails EBADF: fd 3 is outside the allowed range.
-                unsafe {
-                    command.pre_exec(move || {
-                        if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) == -1 {
-                            return Err(std::io::Error::last_os_error());
-                        }
-                        Ok(())
-                    });
-                }
-                pass_to_child(&mut command, &hold);
-
-                let spawned = command.spawn().map(ReapOnDrop);
-                assert_eq!(
-                    spawned
-                        .as_ref()
-                        .err()
-                        .and_then(std::io::Error::raw_os_error),
-                    Some(libc::EBADF),
-                    "a child that does not hold the lock must not start"
-                );
-            },
-        );
-    }
-
-    #[test]
-    fn adopting_a_close_on_exec_descriptor_keeps_it_close_on_exec() {
-        in_own_process(
-            "liveness::tests::adopting_a_close_on_exec_descriptor_keeps_it_close_on_exec",
-            || {
-                let dir = tempfile::tempdir().expect("create a temp dir");
-                let path = dir.path().join("a.live");
-                let hold = Hold::take(&path).expect("take a hold");
-                let Hold { file, path } = hold;
-                let fd = std::os::fd::IntoRawFd::into_raw_fd(file);
-
-                let _adopted = adopt_inherited(fd, path).expect("adopt the descriptor");
-                // SAFETY: F_GETFD reads a flag of a descriptor `_adopted` owns.
-                let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-                assert_ne!(flags & libc::FD_CLOEXEC, 0);
-            },
         );
     }
 

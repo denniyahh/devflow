@@ -43,7 +43,6 @@ use devflow_core::recover;
 use devflow_core::registry;
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, PendingSupervisor, State};
-use devflow_core::supervisor;
 use devflow_core::workflow;
 use devflow_core::worktree;
 use std::collections::{BTreeSet, HashSet};
@@ -980,9 +979,9 @@ pub(crate) fn reserve_launch(
     verb: LaunchVerb,
     fresh: Option<&State>,
 ) -> Result<Reserved, CliError> {
-    let ctx = crate::pipeline_launch::launch_context()?;
+    let cache_dir = crate::pipeline_launch::launch_cache_dir()?;
     let reservation =
-        monitor::Reservation::for_phase(&ctx, project_root, phase).map_err(|err| {
+        monitor::Reservation::for_phase(&cache_dir, project_root, phase).map_err(|err| {
             CliError::Message(format!(
                 "could not reserve a launch of phase {phase}: {err}"
             ))
@@ -4222,14 +4221,6 @@ fn check_line(c: &Check) -> String {
 
 /// Audit the environment and report what's installed, missing, or broken.
 pub(crate) fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
-    doctor_in(project_root, json, registry::cache_dir().as_deref())
-}
-
-/// [`doctor`] against an explicit cache dir, whose `sock/` directory the
-/// read-only supervisor sweep lists (50-12); `None` (no cache dir can be
-/// resolved) skips the sweep without an error. Split out so tests sweep a
-/// tempdir, never the operator's real cache.
-fn doctor_in(project_root: &Path, json: bool, cache_dir: Option<&Path>) -> Result<(), CliError> {
     let checks = doctor_checks();
 
     let facts = collect_phase_facts(project_root);
@@ -4239,12 +4230,6 @@ fn doctor_in(project_root: &Path, json: bool, cache_dir: Option<&Path>) -> Resul
     // scan, which never signals anything (T-25-62, doctor's read-only
     // contract).
     let stray_findings = collect_stray_process_findings(project_root);
-    // 50-12 (D-06): the read-only socket sweep — orphaned, superseded and
-    // deleted-root supervisors. It removes nothing and signals nothing.
-    let orphans = cache_dir
-        .map(|cache| collect_orphan_supervisors(project_root, cache))
-        .unwrap_or_default();
-    let sweep_unlistable = cache_dir.and_then(socket_dir_unlistable);
     let set_aside = set_aside_answer_findings(project_root, &Gates::quarantined(project_root));
 
     if json {
@@ -4259,14 +4244,7 @@ fn doctor_in(project_root: &Path, json: bool, cache_dir: Option<&Path>) -> Resul
         // planning-doc check (D-05) and this plan's stray-process finding
         // (999.44) each extend this SAME object with one more key rather
         // than forking a second array.
-        let body = doctor_json_body(
-            &checks,
-            &facts,
-            &doc_findings,
-            &stray_findings,
-            (&orphans, sweep_unlistable.as_deref()),
-            &set_aside,
-        );
+        let body = doctor_json_body(&checks, &facts, &doc_findings, &stray_findings, &set_aside);
         println!(
             "{}",
             serde_json::to_string_pretty(&body).expect("doctor --json body must serialize")
@@ -4279,10 +4257,6 @@ fn doctor_in(project_root: &Path, json: bool, cache_dir: Option<&Path>) -> Resul
         print!("{}", render_set_aside_findings_text(&set_aside));
         print!("{}", render_planning_doc_text(&doc_findings));
         print!("{}", render_stray_process_text(&stray_findings));
-        print!(
-            "{}",
-            render_orphan_supervisors_text(&orphans, sweep_unlistable.as_deref())
-        );
     }
 
     Ok(())
@@ -5012,16 +4986,12 @@ fn checks_json_value(checks: &[Check]) -> serde_json::Value {
 /// [...], "planning_doc_staleness": [...]}` — 21b's addition (D-05) extends
 /// this SAME object with a third key rather than forking a second reporter
 /// or printing a second top-level array.
-/// 50-12 adds `"orphan_supervisors"` (the socket sweep's findings) and
-/// `"orphan_supervisor_sweep_error"` (`null`, or why the socket directory
-/// could not be listed, so an empty array is never mistaken for a clean
-/// sweep). D-05 adds `"set_aside_gate_answers"`, an empty array when there are none.
+/// D-05 adds `"set_aside_gate_answers"`, an empty array when there are none.
 fn doctor_json_body(
     checks: &[Check],
     facts: &[PhaseFacts],
     doc_findings: &[PlanningDocFinding],
     stray_findings: &[StrayProcessFinding],
-    (orphans, sweep_unlistable): (&[OrphanSupervisorFinding], Option<&str>),
     set_aside: &[PhaseFinding],
 ) -> serde_json::Value {
     serde_json::json!({
@@ -5029,8 +4999,6 @@ fn doctor_json_body(
         "reconciliation": render_reconciliation_json(facts),
         "planning_doc_staleness": render_planning_doc_findings_json(doc_findings),
         "stray_processes": render_stray_process_findings_json(stray_findings),
-        "orphan_supervisors": render_orphan_supervisors_json(orphans),
-        "orphan_supervisor_sweep_error": sweep_unlistable,
         "set_aside_gate_answers": render_set_aside_findings_json(set_aside),
     })
 }
@@ -5465,9 +5433,7 @@ pub(crate) fn build_stray_process_findings(
 ///
 /// The census matches only the two 2.x process shapes (the `sh -c` monitor
 /// wrapper and its `devflow advance` child), which a 3.x binary never
-/// starts, so this finding covers 2.x leftovers only (50-12). A 3.x
-/// supervisor is found through its socket by [`collect_orphan_supervisors`]
-/// (which also takes over the deleted-root class).
+/// starts, so this finding covers 2.x leftovers only (50-12).
 fn collect_stray_process_findings(project_root: &Path) -> Vec<StrayProcessFinding> {
     build_stray_process_findings(&unreachable_stray_candidates(&[project_root.to_path_buf()]))
 }
@@ -5507,255 +5473,6 @@ fn render_stray_process_text(findings: &[StrayProcessFinding]) -> String {
     for finding in findings {
         out.push_str(&format!("  {}\n", finding.detail));
         if let Some(repair) = &finding.repair {
-            out.push_str(&format!("    repair: {repair}\n"));
-        }
-    }
-    out
-}
-
-/// One supervisor socket `doctor`'s read-only sweep reports (50-12, D-06).
-pub(crate) struct OrphanSupervisorFinding {
-    /// The path-free finding: detail and `devflow stop --phase N --launch
-    /// <id>` repair.
-    pub(crate) finding: PhaseFinding,
-    /// The launch id that addresses exactly this socket.
-    pub(crate) launch_id: String,
-    /// `alive` or `stale`.
-    pub(crate) liveness: &'static str,
-    /// Whether the project root the socket names still exists. `true` for a
-    /// sidecar-less socket, which is attributed to this (existing) root.
-    pub(crate) root_exists: bool,
-}
-
-/// Every ALIVE or STALE supervisor socket under `cache_dir` that nothing
-/// claims (50-12, D-06): (1) this root's sockets whose phase has no loadable
-/// state, or whose state records no supervisor or another launch
-/// (superseded) and does not name it as pending; (2) machine-wide, sockets whose sidecar names a project
-/// root that no longer exists (the 999.44 deleted-root class the 2.x `/proc`
-/// census used to cover); (3) (R5-I3) sockets of this root whose sidecar is
-/// missing or does not parse, attributed by file name through
-/// [`supervisor::sweep_for_in`] so 50-06's digest rule stays in one place.
-///
-/// Not listed, by design: a socket named outside the 50-05 scheme (it
-/// carries no launch id, so no verb addresses it), and a sidecar-less socket
-/// of a deleted root (only the digest survives, so nothing attributes it).
-///
-/// Read-only (D-06, T-50-31): it sweeps, probes and loads state, and removes
-/// nothing and signals nothing. Every finding's repair is `devflow stop
-/// --phase N --launch <id>` (50-14), never the bare stop, which addresses
-/// the state's own record and would stop a live successor (T-50-51).
-fn collect_orphan_supervisors(
-    project_root: &Path,
-    cache_dir: &Path,
-) -> Vec<OrphanSupervisorFinding> {
-    let mut findings = Vec::new();
-    for entry in supervisor::sweep_in(cache_dir) {
-        let liveness = match &entry.liveness {
-            Ok(supervisor::Liveness::Alive(_)) => "alive",
-            Ok(supervisor::Liveness::Stale) => "stale",
-            _ => continue,
-        };
-        if let Some(sidecar) = &entry.sidecar {
-            // A root that cannot be examined counts as present: only a
-            // proven-missing root is the deleted-root class.
-            let root_exists = sidecar.project_root.try_exists().unwrap_or(true);
-            let reason = if !root_exists {
-                Some(OrphanReason::RootDeleted)
-            } else if sidecar.project_root == project_root {
-                unclaimed_by_state(project_root, sidecar.phase, &sidecar.launch_id)
-            } else {
-                None
-            };
-            if let Some(reason) = reason {
-                let launch = (sidecar.phase, sidecar.launch_id.as_str());
-                findings.push(orphan_finding(launch, liveness, root_exists, &reason));
-            }
-            continue;
-        }
-        // R5-I3: no usable sidecar, so the file name is the only address.
-        let (Some(launch_id), Some(phase)) = (
-            entry.launch_id_in_name.as_deref(),
-            phase_in_socket_name(&entry.socket_path),
-        ) else {
-            continue;
-        };
-        let ours = supervisor::sweep_for_in(cache_dir, project_root, phase)
-            .iter()
-            .any(|candidate| candidate.socket_path == entry.socket_path);
-        let Some(unclaimed) = ours
-            .then(|| unclaimed_by_state(project_root, phase, launch_id))
-            .flatten()
-        else {
-            continue;
-        };
-        let reason = OrphanReason::NoUsableSidecar {
-            broken: entry.sidecar_error.is_some(),
-            unclaimed: Box::new(unclaimed),
-        };
-        findings.push(orphan_finding((phase, launch_id), liveness, true, &reason));
-    }
-    findings
-}
-
-/// Why [`collect_orphan_supervisors`] lists a socket.
-enum OrphanReason {
-    /// This root's phase has no state file.
-    NoState,
-    /// This root's phase has a state file that does not load.
-    StateUnloadable,
-    /// The phase's state records no supervisor.
-    NoRecord,
-    /// The phase's state records another launch (the R-10 aftermath).
-    Superseded,
-    /// The sidecar names a project root that no longer exists.
-    RootDeleted,
-    /// The sidecar is missing (`broken: false`) or does not parse, and the
-    /// state does not claim the launch for `unclaimed`'s reason.
-    NoUsableSidecar {
-        broken: bool,
-        unclaimed: Box<OrphanReason>,
-    },
-}
-
-impl OrphanReason {
-    /// Path-free text for the finding's detail (T-18-01).
-    fn describe(&self) -> String {
-        match self {
-            OrphanReason::NoState => "its phase has no state".to_string(),
-            OrphanReason::StateUnloadable => "its phase's state does not load".to_string(),
-            OrphanReason::NoRecord => "its phase's state records no supervisor".to_string(),
-            OrphanReason::Superseded => {
-                "its phase's state records another launch (superseded)".to_string()
-            }
-            OrphanReason::RootDeleted => "its project root no longer exists".to_string(),
-            OrphanReason::NoUsableSidecar { broken, unclaimed } => format!(
-                "its sidecar {}, and {}",
-                if *broken {
-                    "does not parse"
-                } else {
-                    "is missing"
-                },
-                unclaimed.describe()
-            ),
-        }
-    }
-}
-
-/// Whether this root's state for `phase` claims `launch_id`; the reason
-/// when it does not. A launch the state names as pending is claimed, since it may
-/// be the next stage's supervisor before its promotion (D-01). Reads the state file
-/// only.
-fn unclaimed_by_state(
-    project_root: &Path,
-    phase: PhaseId,
-    launch_id: &str,
-) -> Option<OrphanReason> {
-    match workflow::load_state(project_root, phase) {
-        Err(workflow::WorkflowError::MissingState(_)) => Some(OrphanReason::NoState),
-        Err(_) => Some(OrphanReason::StateUnloadable),
-        Ok(state)
-            if state
-                .pending_supervisor
-                .as_ref()
-                .is_some_and(|pending| pending.launch_id == launch_id) =>
-        {
-            None
-        }
-        Ok(state) => match state.supervisor {
-            None => Some(OrphanReason::NoRecord),
-            Some(record) if record.launch_id != launch_id => Some(OrphanReason::Superseded),
-            Some(_) => None,
-        },
-    }
-}
-
-/// The phase segment of a socket file name in the 50-05 scheme
-/// (`<016x digest>-<padded phase>-<launch id>.sock`): the text between the
-/// first and second `-`. `None` when it does not parse as a phase.
-fn phase_in_socket_name(socket: &Path) -> Option<PhaseId> {
-    let stem = socket.file_stem()?.to_str()?;
-    stem.split('-').nth(1)?.parse().ok()
-}
-
-/// One orphan finding for `(phase, launch_id)`, path-free, with the
-/// `--launch` repair that tears down exactly that socket.
-fn orphan_finding(
-    (phase, launch_id): (PhaseId, &str),
-    liveness: &'static str,
-    root_exists: bool,
-    reason: &OrphanReason,
-) -> OrphanSupervisorFinding {
-    OrphanSupervisorFinding {
-        finding: PhaseFinding {
-            phase,
-            severity: Severity::Problem,
-            detail: format!(
-                "phase {phase}: supervisor launch {launch_id} is {} but {}",
-                liveness.to_uppercase(),
-                reason.describe()
-            ),
-            repair: Some(format!("devflow stop --phase {phase} --launch {launch_id}")),
-        },
-        launch_id: launch_id.to_string(),
-        liveness,
-        root_exists,
-    }
-}
-
-/// Whether doctor's socket sweep could look (50-12): `None` when the socket
-/// directory is absent or listable, else why it cannot be listed.
-/// [`supervisor::sweep_in`] answers an unlistable directory with no entries,
-/// so without this check doctor would report "nothing" when it saw nothing.
-fn socket_dir_unlistable(cache_dir: &Path) -> Option<String> {
-    match std::fs::read_dir(registry::socket_dir_in(cache_dir)) {
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-            Some(error.kind().to_string())
-        }
-        _ => None,
-    }
-}
-
-/// Build `doctor --json`'s `"orphan_supervisors"` array (50-12).
-fn render_orphan_supervisors_json(findings: &[OrphanSupervisorFinding]) -> serde_json::Value {
-    serde_json::Value::Array(
-        findings
-            .iter()
-            .map(|orphan| {
-                serde_json::json!({
-                    "phase": orphan.finding.phase,
-                    "launch_id": orphan.launch_id,
-                    "liveness": orphan.liveness,
-                    "root_exists": orphan.root_exists,
-                    "severity": orphan.finding.severity.label(),
-                    "detail": orphan.finding.detail,
-                    "repair": orphan.finding.repair,
-                })
-            })
-            .collect(),
-    )
-}
-
-/// Build `doctor`'s text section for the socket sweep (50-12). Like
-/// [`render_stray_process_text`] it prints nothing when there is nothing to
-/// report, but a socket directory it could not list is reported, never
-/// shown as "nothing".
-fn render_orphan_supervisors_text(
-    findings: &[OrphanSupervisorFinding],
-    unlistable: Option<&str>,
-) -> String {
-    if findings.is_empty() && unlistable.is_none() {
-        return String::new();
-    }
-    let mut out = String::from("\nsupervisor sockets no state claims:\n");
-    if let Some(why) = unlistable {
-        out.push_str(&format!(
-            "  warn: the socket directory could not be listed ({why}); its sockets are not \
-             reported\n"
-        ));
-    }
-    for orphan in findings {
-        out.push_str(&format!("  {}\n", orphan.finding.detail));
-        if let Some(repair) = &orphan.finding.repair {
             out.push_str(&format!("    repair: {repair}\n"));
         }
     }
@@ -7836,7 +7553,7 @@ mod tests {
         let root = dir.path();
         let phase = PhaseId::new(7);
         let doctor_json = |findings: &[PhaseFinding]| {
-            doctor_json_body(&[], &[], &[], &[], (&[], None), findings)["set_aside_gate_answers"]
+            doctor_json_body(&[], &[], &[], &[], findings)["set_aside_gate_answers"]
                 .as_array()
                 .unwrap()
                 .clone()
@@ -10192,72 +9909,6 @@ mod tests {
         );
     }
 
-    /// Run `body` on a new thread without `CAP_DAC_OVERRIDE` and
-    /// `CAP_DAC_READ_SEARCH` in its effective set (WINDOWS.md #19). Either
-    /// lets uid 0 list a mode-0o000 directory, so the pinned container (root)
-    /// could not produce an unlistable socket directory; without them root is
-    /// refused like any other owner. Capabilities are per-thread and
-    /// `capset(2)` changes only the calling thread's, so the harness keeps
-    /// its own, and they end with the thread. A non-root thread holds neither
-    /// capability, so nothing changes there.
-    fn without_dac_override<T: Send>(body: impl FnOnce() -> T + Send) -> T {
-        std::thread::scope(|scope| {
-            scope
-                .spawn(|| {
-                    drop_dac_override_on_this_thread();
-                    body()
-                })
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-        })
-    }
-
-    /// Clear `CAP_DAC_OVERRIDE` and `CAP_DAC_READ_SEARCH` from the calling
-    /// thread's effective capability set; the permitted set is kept.
-    #[cfg(target_os = "linux")]
-    fn drop_dac_override_on_this_thread() {
-        // `<linux/capability.h>`, version 3: one header, two data structs.
-        #[repr(C)]
-        struct CapHeader {
-            version: u32,
-            pid: libc::c_int,
-        }
-        #[repr(C)]
-        #[derive(Clone, Copy)]
-        struct CapData {
-            effective: u32,
-            permitted: u32,
-            inheritable: u32,
-        }
-        const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
-        const CAP_DAC_OVERRIDE: u32 = 1;
-        const CAP_DAC_READ_SEARCH: u32 = 2;
-
-        let mut header = CapHeader {
-            version: LINUX_CAPABILITY_VERSION_3,
-            pid: 0,
-        };
-        let mut data = [CapData {
-            effective: 0,
-            permitted: 0,
-            inheritable: 0,
-        }; 2];
-        // SAFETY: `header` and `data` have capget(2)'s version-3 layout (one
-        // header, two data structs); pid 0 is the calling thread.
-        let got = unsafe { libc::syscall(libc::SYS_capget, &raw mut header, data.as_mut_ptr()) };
-        assert_eq!(got, 0, "capget: {}", std::io::Error::last_os_error());
-        data[0].effective &= !((1 << CAP_DAC_OVERRIDE) | (1 << CAP_DAC_READ_SEARCH));
-        // SAFETY: as above; capset(2) with pid 0 changes only this thread.
-        let set = unsafe { libc::syscall(libc::SYS_capset, &raw const header, data.as_ptr()) };
-        assert_eq!(set, 0, "capset: {}", std::io::Error::last_os_error());
-    }
-
-    /// No per-thread capabilities to drop off Linux: there a root run still
-    /// lists a 0o000 directory, and the tests that use this fail their own
-    /// precondition rather than pass without asserting.
-    #[cfg(not(target_os = "linux"))]
-    fn drop_dac_override_on_this_thread() {}
-
     /// Unit tests for the pure `doctor` reconciliation core (18a). Each test
     /// builds a `PhaseFacts` directly — no repository, no I/O — proving
     /// `reconcile_phase` is a predicate over facts alone.
@@ -10375,423 +10026,6 @@ mod tests {
                     "{body}"
                 );
             }
-        }
-
-        /// A short cache dir directly under `/tmp`, so every socket path
-        /// below it fits `sun_path`.
-        pub(super) fn short_cache() -> tempfile::TempDir {
-            tempfile::Builder::new()
-                .prefix("dfs")
-                .tempdir_in("/tmp")
-                .expect("create a short cache dir under /tmp")
-        }
-
-        /// Publish the socket for `(root, phase, launch_id)` under `cache`.
-        /// Dropping the returned listener leaves the socket STALE.
-        pub(super) fn publish_launch(
-            cache: &Path,
-            root: &Path,
-            phase: u32,
-            launch_id: &str,
-        ) -> (supervisor::SocketPath, std::os::unix::net::UnixListener) {
-            let socket =
-                supervisor::SocketPath::for_launch(cache, root, PhaseId::new(phase), launch_id)
-                    .expect("socket path fits sun_path");
-            let listener = supervisor::publish(&socket).expect("publish the socket");
-            (socket, listener)
-        }
-
-        /// A complete sidecar for `(root, phase, launch_id)`, as a supervisor
-        /// writes it.
-        pub(super) fn write_sidecar_for(
-            socket: &supervisor::SocketPath,
-            root: &Path,
-            phase: u32,
-            id: &str,
-        ) {
-            let sidecar = serde_json::json!({
-                "launch_id": id,
-                "project_root": root,
-                "phase": PhaseId::new(phase),
-                "stage": "code",
-                "agent": "claude",
-                "launch": "stream",
-                "agent_pid": 1,
-                "agent_pgid": 1,
-                "agent_start_time": 0,
-                "boot_id": "boot",
-                "supervisor_pid": 1,
-                "supervisor_start_time": 0,
-                "created_at": "2026-10-17T00:00:00Z",
-            });
-            std::fs::write(socket.sidecar_path(), sidecar.to_string()).unwrap();
-            supervisor::read_sidecar(&socket.sidecar_path()).expect("the planted sidecar parses");
-        }
-
-        /// A loadable state for `phase` whose supervisor record carries
-        /// `launch_id`.
-        pub(super) fn save_state_with_launch(root: &Path, phase: u32, launch_id: &str) {
-            let mut state = State::new(
-                PhaseId::new(phase),
-                AgentKind::Claude,
-                Mode::Auto,
-                root.to_path_buf(),
-            );
-            state.supervisor = Some(devflow_core::state::SupervisorRecord::new(
-                PathBuf::from("/elsewhere.sock"),
-                launch_id.to_string(),
-                1,
-                0,
-                "boot".to_string(),
-            ));
-            workflow::save_state(&state).unwrap();
-        }
-
-        /// Answers every ping on `listener` as a supervisor would, until
-        /// [`PingResponder::stop`].
-        struct PingResponder {
-            done: std::sync::Arc<std::sync::atomic::AtomicBool>,
-            socket: PathBuf,
-            thread: Option<std::thread::JoinHandle<()>>,
-        }
-
-        impl PingResponder {
-            fn start(
-                socket: &supervisor::SocketPath,
-                listener: std::os::unix::net::UnixListener,
-                launch_id: &str,
-                phase: u32,
-            ) -> Self {
-                use std::io::{BufRead as _, Write as _};
-                let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let reply = serde_json::json!({
-                    "ok": true,
-                    "launch_id": launch_id,
-                    "phase": phase.to_string(),
-                    "stage": "code",
-                    "launch": "stream",
-                    "owner": "agent_running",
-                    "agent_pid": 1,
-                    "agent_pgid": 1,
-                    "agent_start_time": 0,
-                    "boot_id": null,
-                    "supervisor_pid": 1,
-                });
-                let stop = std::sync::Arc::clone(&done);
-                let thread = std::thread::spawn(move || {
-                    for stream in listener.incoming() {
-                        if stop.load(std::sync::atomic::Ordering::SeqCst) {
-                            break;
-                        }
-                        let Ok(stream) = stream else { continue };
-                        let mut line = String::new();
-                        if std::io::BufReader::new(&stream)
-                            .read_line(&mut line)
-                            .is_ok()
-                        {
-                            let _ = (&stream).write_all(format!("{reply}\n").as_bytes());
-                        }
-                    }
-                });
-                Self {
-                    done,
-                    socket: socket.as_path().to_path_buf(),
-                    thread: Some(thread),
-                }
-            }
-
-            fn stop(&mut self) {
-                self.done.store(true, std::sync::atomic::Ordering::SeqCst);
-                // Wake the blocked accept so the thread sees the flag.
-                let _ = std::os::unix::net::UnixStream::connect(&self.socket);
-                if let Some(thread) = self.thread.take() {
-                    thread.join().expect("the ping responder thread");
-                }
-            }
-        }
-
-        impl Drop for PingResponder {
-            fn drop(&mut self) {
-                self.stop();
-            }
-        }
-
-        /// Every file under `dir` as (name, length, mtime), sorted.
-        fn snapshot(dir: &Path) -> Vec<(String, u64, std::time::SystemTime)> {
-            let mut files: Vec<_> = std::fs::read_dir(dir)
-                .expect("list the socket dir")
-                .map(|entry| {
-                    let entry = entry.unwrap();
-                    let meta = std::fs::symlink_metadata(entry.path()).unwrap();
-                    (
-                        entry.file_name().to_string_lossy().into_owned(),
-                        meta.len(),
-                        meta.modified().unwrap(),
-                    )
-                })
-                .collect();
-            files.sort();
-            files
-        }
-
-        /// 50-12 (D-06, R5-I3, T-50-31, T-50-51, T-50-84): doctor's sweep
-        /// lists the ALIVE and STALE sockets that no loadable state of this
-        /// root claims — no state, an unparsable state, a superseded launch,
-        /// a missing or broken sidecar attributed by file name — and,
-        /// machine-wide, those whose project root is gone. Each names the
-        /// `--launch` teardown, never the bare stop. Another root's sockets
-        /// and the ones a state claims are not listed, and nothing under
-        /// `sock/` changes.
-        #[test]
-        fn doctor_reports_an_orphan_socket_without_removing_it() {
-            let cache = short_cache();
-            let cache = cache.path();
-            let repo = tempfile::tempdir().unwrap();
-            let root = repo.path();
-            let other = tempfile::tempdir().unwrap();
-            let other_root = other.path();
-            let deleted = tempfile::tempdir().unwrap();
-            let deleted_root = deleted.path().to_path_buf();
-
-            // (a) STALE, sidecar for phase 7, whose state file is corrupt.
-            let (a, _) = publish_launch(cache, root, 7, "aaaa0000aaaa0007");
-            write_sidecar_for(&a, root, 7, "aaaa0000aaaa0007");
-            let state7 = workflow::state_path(root, PhaseId::new(7));
-            std::fs::create_dir_all(state7.parent().unwrap()).unwrap();
-            std::fs::write(&state7, "{").unwrap();
-            // (b) STALE, superseded: phase 8's state names its successor.
-            let (b, _) = publish_launch(cache, root, 8, "aaaa0000aaaa0008");
-            write_sidecar_for(&b, root, 8, "aaaa0000aaaa0008");
-            save_state_with_launch(root, 8, "ffff0000ffff0008");
-            // (c) STALE, another root that exists: not ours.
-            let (c, _) = publish_launch(cache, other_root, 7, "aaaa0000aaaa000c");
-            write_sidecar_for(&c, other_root, 7, "aaaa0000aaaa000c");
-            // (d) STALE, a project root deleted after the launch.
-            let (d, _) = publish_launch(cache, &deleted_root, 5, "aaaa0000aaaa000d");
-            write_sidecar_for(&d, &deleted_root, 5, "aaaa0000aaaa000d");
-            drop(deleted);
-            assert!(!deleted_root.exists(), "the root of (d) is deleted");
-            // (e) ALIVE, this root's phase 9, no state, sidecar `{`.
-            let (e, listener) = publish_launch(cache, root, 9, "bbbb0000bbbb0000");
-            std::fs::write(e.sidecar_path(), "{").unwrap();
-            let mut responder = PingResponder::start(&e, listener, "bbbb0000bbbb0000", 9);
-            // (f) STALE, this root's phase 10, no sidecar, no state.
-            let (_f, _) = publish_launch(cache, root, 10, "cccc0000cccc0000");
-            // (g) control: STALE, the other root's phase 9, no sidecar.
-            let (_g, _) = publish_launch(cache, other_root, 9, "dddd0000dddd0000");
-            // (h) control: STALE, no sidecar, whose state claims it.
-            let (_h, _) = publish_launch(cache, root, 11, "eeee0000eeee0000");
-            save_state_with_launch(root, 11, "eeee0000eeee0000");
-            // (i) control: STALE with a sidecar, whose state claims it.
-            let (i, _) = publish_launch(cache, root, 12, "aaaa0000aaaa0012");
-            write_sidecar_for(&i, root, 12, "aaaa0000aaaa0012");
-            save_state_with_launch(root, 12, "aaaa0000aaaa0012");
-
-            let sock_dir = registry::socket_dir_in(cache);
-            let before = snapshot(&sock_dir);
-            let findings = collect_orphan_supervisors(root, cache);
-            assert_eq!(
-                snapshot(&sock_dir),
-                before,
-                "the sweep must change nothing under sock/"
-            );
-            responder.stop();
-
-            let mut listed: Vec<(PhaseId, &str, &str, bool)> = findings
-                .iter()
-                .map(|orphan| {
-                    (
-                        orphan.finding.phase,
-                        orphan.launch_id.as_str(),
-                        orphan.liveness,
-                        orphan.root_exists,
-                    )
-                })
-                .collect();
-            listed.sort();
-            assert_eq!(
-                listed,
-                vec![
-                    (PhaseId::new(5), "aaaa0000aaaa000d", "stale", false),
-                    (PhaseId::new(7), "aaaa0000aaaa0007", "stale", true),
-                    (PhaseId::new(8), "aaaa0000aaaa0008", "stale", true),
-                    (PhaseId::new(9), "bbbb0000bbbb0000", "alive", true),
-                    (PhaseId::new(10), "cccc0000cccc0000", "stale", true),
-                ],
-                "exactly (a), (b), (d), (e) and (f) are listed"
-            );
-            for orphan in &findings {
-                let finding = &orphan.finding;
-                let repair = finding
-                    .repair
-                    .as_deref()
-                    .expect("every orphan names a repair");
-                assert_eq!(
-                    repair,
-                    format!(
-                        "devflow stop --phase {} --launch {}",
-                        finding.phase, orphan.launch_id
-                    ),
-                    "the repair addresses exactly this socket"
-                );
-                assert!(
-                    repair.contains("--launch")
-                        && repair != format!("devflow stop --phase {}", finding.phase),
-                    "never the bare stop, which would stop the state's own record: {repair}"
-                );
-                assert!(
-                    !finding.detail.contains('/'),
-                    "a path-free detail: {}",
-                    finding.detail
-                );
-                assert_eq!(finding.severity, Severity::Problem);
-            }
-            let detail_of = |id: &str| {
-                findings
-                    .iter()
-                    .find(|orphan| orphan.launch_id == id)
-                    .map(|orphan| orphan.finding.detail.clone())
-                    .unwrap()
-            };
-            assert!(detail_of("aaaa0000aaaa000d").contains("no longer exists"));
-            assert!(detail_of("bbbb0000bbbb0000").contains("does not parse"));
-            assert!(detail_of("cccc0000cccc0000").contains("missing"));
-            assert!(detail_of("aaaa0000aaaa0008").contains("another launch"));
-
-            // Control: removing (a)'s files changes the snapshot, so the
-            // comparison above can fail.
-            supervisor::remove_launch_files(&a).unwrap();
-            assert_ne!(
-                snapshot(&sock_dir),
-                before,
-                "the snapshot must see a removal"
-            );
-        }
-
-        /// 50-12: `supervisor::sweep_in` answers a socket directory it
-        /// cannot list with no entries, so doctor checks that case itself and
-        /// reports it rather than printing nothing. Controls: an absent and a
-        /// listable directory report nothing.
-        #[test]
-        fn doctor_reports_an_unlistable_socket_dir_instead_of_nothing() {
-            use std::os::unix::fs::PermissionsExt as _;
-            let cache = tempfile::tempdir().unwrap();
-            assert_eq!(socket_dir_unlistable(cache.path()), None, "absent");
-            assert_eq!(render_orphan_supervisors_text(&[], None), "");
-            let sock = registry::socket_dir_in(cache.path());
-            std::fs::create_dir_all(&sock).unwrap();
-            assert_eq!(socket_dir_unlistable(cache.path()), None, "listable");
-
-            std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o000)).unwrap();
-            // Without DAC override, so uid 0 (the pinned container) is
-            // refused too (WINDOWS.md #19).
-            let unlistable = without_dac_override(|| socket_dir_unlistable(cache.path()));
-            std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o700)).unwrap();
-            let why = unlistable.expect("a directory without read permission is unlistable");
-            assert_eq!(
-                why,
-                std::io::ErrorKind::PermissionDenied.to_string(),
-                "the 0o000 directory itself refuses the listing"
-            );
-            assert!(!why.contains('/'), "path-free: {why}");
-            let text = render_orphan_supervisors_text(&[], Some(&why));
-            assert!(
-                text.contains("could not be listed") && text.contains(&why),
-                "{text}"
-            );
-            let body = doctor_json_body(&[], &[], &[], &[], (&[], Some(&why)), &[]);
-            assert_eq!(body["orphan_supervisor_sweep_error"], why.as_str());
-        }
-
-        /// The comment-stripped body of `fn collect_orphan_supervisors(` in
-        /// `source` (cut at its first `mod tests {` line), from that line to
-        /// the next line that is exactly `}`; `None` when absent.
-        fn orphan_sweep_body(source: &str) -> Option<Vec<&str>> {
-            let lines: Vec<&str> = source
-                .lines()
-                .take_while(|line| !line.contains("mod tests {"))
-                .collect();
-            let start = lines
-                .iter()
-                .position(|line| line.contains("fn collect_orphan_supervisors("))?;
-            let end = start + lines[start..].iter().position(|line| *line == "}")?;
-            Some(
-                lines[start..=end]
-                    .iter()
-                    .copied()
-                    .filter(|line| !line.trim_start().starts_with("//"))
-                    .collect(),
-            )
-        }
-
-        /// Why `source`'s `collect_orphan_supervisors` breaks R6-G4: absent
-        /// or under 5 lines, an acting call, or no `sweep_for_in(` call.
-        fn orphan_sweep_violations(source: &str) -> Vec<String> {
-            const ACTING: [&str; 5] = [
-                "remove_launch_files",
-                "remove_file",
-                "teardown_stale",
-                "request_shutdown",
-                "kill(",
-            ];
-            let Some(body) = orphan_sweep_body(source) else {
-                return vec!["fn collect_orphan_supervisors( not found".to_string()];
-            };
-            let mut violations = Vec::new();
-            if body.len() < 5 {
-                violations.push(format!("body has {} lines, under 5", body.len()));
-            }
-            for line in &body {
-                for call in ACTING {
-                    if line.contains(call) {
-                        violations.push(format!("acting call {call}: {line}"));
-                    }
-                }
-            }
-            if !body.iter().any(|line| line.contains("sweep_for_in(")) {
-                violations.push("no sweep_for_in( call".to_string());
-            }
-            violations
-        }
-
-        /// 50-12 R6-G4 (T-50-31, T-50-84): doctor's orphan sweep only reads,
-        /// and attributes a sidecar-less socket through `sweep_for_in`, so
-        /// 50-06's digest rule stays in one place. Planted controls run the
-        /// same check.
-        #[test]
-        fn the_orphan_sweep_only_reads_and_attributes_through_sweep_for_in() {
-            let reads = "fn collect_orphan_supervisors(a: &Path, b: &Path) -> Vec<X> {\n    let mut out = Vec::new();\n    for entry in supervisor::sweep_for_in(b, a, p) {\n        out.push(entry);\n    }\n    out\n}\n";
-            assert!(
-                orphan_sweep_violations(reads).is_empty(),
-                "a read-only fn passes"
-            );
-            let acts = "fn collect_orphan_supervisors(a: &Path, b: &Path) -> Vec<X> {\n    let mut out = Vec::new();\n    for entry in supervisor::sweep_for_in(b, a, p) {\n        supervisor::remove_launch_files(&entry);\n        out.push(entry);\n    }\n    out\n}\n";
-            let found = orphan_sweep_violations(acts);
-            assert!(
-                found.len() == 1 && found[0].contains("remove_launch_files"),
-                "an acting call fails: {found:?}"
-            );
-            let reimplements = "fn collect_orphan_supervisors(a: &Path, b: &Path) -> Vec<X> {\n    let mut out = Vec::new();\n    // sweep_for_in(b, a, p) re-derived below\n    for entry in supervisor::sweep_in(b) {\n        out.push(entry);\n    }\n    out\n}\n";
-            let found = orphan_sweep_violations(reimplements);
-            assert!(
-                found.len() == 1 && found[0].contains("no sweep_for_in"),
-                "a commented-out sweep_for_in fails: {found:?}"
-            );
-            let absent = "fn other() {\n}\n";
-            assert_eq!(
-                orphan_sweep_violations(absent),
-                vec!["fn collect_orphan_supervisors( not found".to_string()]
-            );
-
-            let source = std::fs::read_to_string(
-                Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands.rs"),
-            )
-            .expect("read src/commands.rs");
-            assert_eq!(
-                orphan_sweep_violations(&source),
-                Vec::<String>::new(),
-                "collect_orphan_supervisors must only read and must call sweep_for_in"
-            );
         }
 
         /// A fully-agreeing baseline: `reconcile_phase` over this returns
@@ -11227,7 +10461,7 @@ mod tests {
             workflow::save_state(&state).unwrap();
             let facts = collect_phase_facts(root);
 
-            let body = doctor_json_body(&checks, &facts, &[], &[], (&[], None), &[]);
+            let body = doctor_json_body(&checks, &facts, &[], &[], &[]);
             let serialized = serde_json::to_string(&body).unwrap();
             let reparsed: serde_json::Value = serde_json::from_str(&serialized)
                 .expect("doctor --json must be single-document JSON, not two concatenated arrays");
@@ -11250,14 +10484,10 @@ mod tests {
                 "999.44: must carry the stray-process findings under a FOURTH key, \
                  never a second concatenated array: {reparsed}"
             );
-            assert!(
-                reparsed.get("orphan_supervisors").is_some(),
-                "50-12: must carry the socket sweep's findings under their own key: {reparsed}"
-            );
             assert_eq!(
                 reparsed.as_object().unwrap().len(),
-                7,
-                "doctor --json must have exactly seven top-level keys: {reparsed}"
+                5,
+                "doctor --json must have exactly five top-level keys: {reparsed}"
             );
             assert!(reparsed["environment"].is_array());
             assert!(reparsed["reconciliation"].is_array());
@@ -11305,18 +10535,8 @@ mod tests {
                 .lines()
                 .count();
 
-            // 50-12: a hermetic cache whose STALE socket no state claims, so
-            // the run also exercises the socket sweep, which must leave it.
-            let cache = short_cache();
-            let (orphan, _) = publish_launch(cache.path(), root, 91, "aaaa0000aaaa0091");
-            write_sidecar_for(&orphan, root, 91, "aaaa0000aaaa0091");
-
-            doctor_in(root, false, Some(cache.path())).unwrap();
-            doctor_in(root, false, Some(cache.path())).unwrap();
-            assert!(
-                orphan.as_path().exists() && orphan.sidecar_path().exists(),
-                "doctor must not remove a socket or sidecar it reports"
-            );
+            doctor(root, false).unwrap();
+            doctor(root, false).unwrap();
 
             let after_len = std::fs::metadata(&state_path).unwrap().len();
             let after_modified = std::fs::metadata(&state_path).unwrap().modified().unwrap();
@@ -11448,9 +10668,9 @@ mod tests {
                 detail: "detail".to_string(),
                 repair: None,
             }];
-            let body = doctor_json_body(&checks, &facts, &[], &stray_findings, (&[], None), &[]);
+            let body = doctor_json_body(&checks, &facts, &[], &stray_findings, &[]);
             let obj = body.as_object().unwrap();
-            assert_eq!(obj.len(), 7, "must be exactly seven top-level keys: {body}");
+            assert_eq!(obj.len(), 5, "must be exactly five top-level keys: {body}");
             assert!(obj.contains_key("stray_processes"));
             let strays = obj["stray_processes"].as_array().unwrap();
             assert_eq!(strays.len(), 1);
@@ -11524,11 +10744,9 @@ mod tests {
 
             // Also exercise doctor() itself, end to end, twice — not just
             // the pure finding collector — proving the full read-only path.
-            // A hermetic, empty cache: never sweep the operator's real one.
-            let cache = tempfile::tempdir().unwrap();
-            doctor_in(dir.path(), false, Some(cache.path())).unwrap();
+            doctor(dir.path(), false).unwrap();
             assert!(agent::agent_running(pid), "doctor() itself must not signal");
-            doctor_in(dir.path(), false, Some(cache.path())).unwrap();
+            doctor(dir.path(), false).unwrap();
             assert!(
                 agent::agent_running(pid),
                 "doctor() must remain read-only across repeated runs"
@@ -12188,14 +11406,13 @@ mod tests {
                 detail: "detail".to_string(),
                 repair: None,
             }];
-            let body = doctor_json_body(&checks, &facts, &doc_findings, &[], (&[], None), &[]);
+            let body = doctor_json_body(&checks, &facts, &doc_findings, &[], &[]);
             let obj = body.as_object().unwrap();
             assert_eq!(
                 obj.len(),
-                7,
+                5,
                 "must be exactly {{environment, reconciliation, planning_doc_staleness, \
-                 stray_processes, orphan_supervisors, orphan_supervisor_sweep_error, \
-                 set_aside_gate_answers}}: {body}"
+                 stray_processes, set_aside_gate_answers}}: {body}"
             );
             assert!(obj.contains_key("environment"));
             assert!(obj.contains_key("reconciliation"));
@@ -12304,7 +11521,7 @@ mod tests {
     const HOLDER_ENTERS_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
 
     // The launch reservation (50.1-16, D-01). Every test here runs its launch in a
-    // child: `launch_context` needs a hermetic DEVFLOW_CACHE_DIR, and the test holds
+    // child: `launch_cache_dir` needs a hermetic DEVFLOW_CACHE_DIR, and the test holds
     // read their variables from that child's environment.
 
     const LAUNCH_HOLD_ENV: &str = "DEVFLOW_TEST_LAUNCH_HOLD";
@@ -12969,69 +12186,6 @@ mod tests {
             0,
             "the copy is not a state"
         );
-    }
-
-    /// RESEARCH Pitfall 7: a socket whose launch id is the state's pending supervisor is
-    /// claimed, with or without a recorded supervisor beside it, so `doctor` does not
-    /// call a legitimate next supervisor an orphan. Controls: the same socket with no
-    /// pending record, the state naming another launch, is reported as superseded; and
-    /// with the pending record naming another launch, too.
-    #[test]
-    fn doctor_does_not_call_a_pending_next_supervisor_superseded() {
-        use doctor_reconciliation::{
-            publish_launch, save_state_with_launch, short_cache, write_sidecar_for,
-        };
-        const RECORDED: &str = "aaaa0000aaaa1709";
-        const NEXT: &str = "bbbb0000bbbb1709";
-        const OTHER: &str = "cccc0000cccc1709";
-        const PHASE: u32 = 1709;
-        let cache = short_cache();
-        let cache = cache.path();
-        let repo = tempfile::tempdir().unwrap();
-        let root = repo.path();
-        let phase = PhaseId::new(PHASE);
-        let (next, _) = publish_launch(cache, root, PHASE, NEXT);
-        write_sidecar_for(&next, root, PHASE, NEXT);
-        save_state_with_launch(root, PHASE, RECORDED);
-        let set_pending = |id: Option<&str>| {
-            workflow::update_state(root, phase, |state| {
-                state.pending_supervisor = id.map(|id| {
-                    PendingSupervisor::new(
-                        id.to_string(),
-                        next.as_path().to_path_buf(),
-                        root.join(format!("{id}.live")),
-                    )
-                });
-                Ok::<(), workflow::WorkflowError>(())
-            })
-            .unwrap();
-        };
-        let details = || -> Vec<String> {
-            collect_orphan_supervisors(root, cache)
-                .into_iter()
-                .map(|orphan| orphan.finding.detail)
-                .collect()
-        };
-
-        set_pending(Some(NEXT));
-        assert_eq!(details(), Vec::<String>::new(), "beside a recorded one");
-        workflow::update_state(root, phase, |state| {
-            state.supervisor = None;
-            Ok::<(), workflow::WorkflowError>(())
-        })
-        .unwrap();
-        assert_eq!(details(), Vec::<String>::new(), "with no recorded one");
-
-        save_state_with_launch(root, PHASE, RECORDED);
-        for (case, pending) in [("no pending record", None), ("another's", Some(OTHER))] {
-            set_pending(pending);
-            let listed = details();
-            assert_eq!(listed.len(), 1, "control, {case}: {listed:?}");
-            assert!(
-                listed[0].contains(NEXT) && listed[0].contains("superseded"),
-                "control, {case}: {listed:?}"
-            );
-        }
     }
 
     /// V-03: a reservation whose lock nothing holds, or whose file is gone, is

@@ -468,6 +468,7 @@ pub enum SidecarError {
 }
 
 /// `unix_secs` as an RFC 3339 UTC timestamp, `YYYY-MM-DDTHH:MM:SSZ`.
+#[cfg(test)]
 pub(crate) fn rfc3339_from_unix(unix_secs: u64) -> String {
     const SECS_PER_MINUTE: u64 = 60;
     const SECS_PER_HOUR: u64 = 60 * SECS_PER_MINUTE;
@@ -486,6 +487,7 @@ pub(crate) fn rfc3339_from_unix(unix_secs: u64) -> String {
 
 /// The current time as [`rfc3339_from_unix`] formats it, for
 /// [`Sidecar::created_at`].
+#[cfg(test)]
 pub(crate) fn rfc3339_now() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

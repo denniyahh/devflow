@@ -211,7 +211,22 @@ fn prepare_stage_launch(
     )
 }
 
-/// Resolve a stage launch into `(program, argv, monitor arm)`.
+/// How a stage's agent is launched, before the runner builds its
+/// [`monitor::StageIo`]: the stream shape delivers `prompt` as the first turn
+/// on the agent's stdin and keeps the pipes; the capture shape gives the agent
+/// `/dev/null` for stdin and the capture file for stdout.
+#[derive(Debug)]
+pub(crate) enum StageShape {
+    /// [`monitor::StageIo::Stream`], with this prompt as the first turn.
+    Stream {
+        /// The stage prompt, delivered on the agent's stdin rather than argv.
+        prompt: String,
+    },
+    /// [`monitor::StageIo::Capture`].
+    Capture,
+}
+
+/// Resolve a stage launch into `(program, argv, launch shape)`.
 ///
 /// Extracted from [`launch_stage_inner`] unchanged (31-04) so the shape a
 /// launch resolves to is assertable without spawning a process. The body is the
@@ -226,20 +241,20 @@ fn resolve_launch_shape(
     prompt: String,
     roots: &[std::path::PathBuf],
     stream_launch: bool,
-) -> (&'static str, Vec<String>, monitor::MonitorLaunch) {
+) -> (&'static str, Vec<String>, StageShape) {
     if stream_launch {
         let (program, args) = driver.build_command(phase, &prompt, roots);
-        (program, args, monitor::MonitorLaunch::PipeOwning { prompt })
+        (program, args, StageShape::Stream { prompt })
     } else if agent == AgentKind::Claude {
         // Claude on a stage the rollout has not reached (none today; Phase 52
         // removed D-11's opt-out): the explicitly named pre-31 builder, NOT
         // `exec_command` — which now returns the stream-json shape for every
         // stage.
         let (program, args) = agents::ClaudeDriver::exec_command_single_document(&prompt);
-        (program, args, monitor::MonitorLaunch::Legacy)
+        (program, args, StageShape::Capture)
     } else {
         let (program, args) = driver.build_command(phase, &prompt, roots);
-        (program, args, monitor::MonitorLaunch::Legacy)
+        (program, args, StageShape::Capture)
     }
 }
 
@@ -691,7 +706,7 @@ const STREAM_JSON_STAGES: &[Stage] = &[Stage::Plan, Stage::Code, Stage::Validate
 ///
 /// **Agent coverage (round-3 D-10):** Claude and Antigravity, purely on
 /// `STREAM_JSON_STAGES` membership. Every other agent (codex, opencode, pi,
-/// hermes) takes the capture shape, `MonitorLaunch::Legacy`. There is no
+/// hermes) takes the capture shape, `StageShape::Capture`. There is no
 /// opt-out: Phase 52 removed Claude's pre-31 single-document launch and its
 /// flag and environment override, so one predicate governs the launch shape
 /// and the D-15 canary gate that protects it.
@@ -712,10 +727,10 @@ const STREAM_JSON_STAGES: &[Stage] = &[Stage::Plan, Stage::Code, Stage::Validate
 /// as Success.
 ///
 /// Note what this predicate does NOT reach: `relaunch_checkpoint_session`
-/// hardcodes `MonitorLaunch::Legacy` and calls `spawn_agent_and_record`
+/// hardcodes `StageShape::Capture` and calls `spawn_agent_and_record`
 /// directly, so it never consults this predicate at all. That is a
-/// pre-existing, deliberate capture route (see `MonitorLaunch::Legacy`'s own
-/// doc), recorded rather than silently covered.
+/// pre-existing, deliberate capture route, recorded rather than silently
+/// covered.
 pub(crate) fn stream_launch_enabled(agent: AgentKind, stage: Stage) -> bool {
     matches!(agent, AgentKind::Claude | AgentKind::Antigravity)
         && STREAM_JSON_STAGES.contains(&stage)
@@ -1306,10 +1321,10 @@ pub(crate) fn launch_test_hold(point: &str) {
 }
 
 /// The label a launch shape carries in `stage_launched` and on stdout.
-fn launch_label(launch: &monitor::MonitorLaunch) -> &'static str {
+fn launch_label(launch: &StageShape) -> &'static str {
     match launch {
-        monitor::MonitorLaunch::PipeOwning { .. } => "stream",
-        monitor::MonitorLaunch::Legacy => "capture",
+        StageShape::Stream { .. } => "stream",
+        StageShape::Capture => "capture",
     }
 }
 
@@ -1518,7 +1533,7 @@ fn run_one_stage(
     let agent = launch.state.agent;
     let relaunch = launch.relaunch.clone();
     let auto_chain_guard = match launch.launch {
-        monitor::MonitorLaunch::PipeOwning { .. } => Some(AutoChainGuard::engage(
+        StageShape::Stream { .. } => Some(AutoChainGuard::engage(
             launch
                 .state
                 .worktree_path
@@ -1526,16 +1541,14 @@ fn run_one_stage(
                 .unwrap_or(&launch.state.project_root),
             auto_chain_flag_eligible(stage, launch.state.mode),
         )),
-        monitor::MonitorLaunch::Legacy => None,
+        StageShape::Capture => None,
     };
-    let ran = runner_stage_spec(launch).and_then(|spec| {
-        monitor::run_stage(spec, token).map_err(|err| match err {
-            // `MonitorError::Io`'s text names a monitor spawn; here the agent is spawned.
-            monitor::MonitorError::Io(io) => {
-                CliError::Message(format!("could not spawn the agent: {io}"))
-            }
-            other => CliError::Message(other.to_string()),
-        })
+    let ran = monitor::run_stage(runner_stage_spec(launch), token).map_err(|err| match err {
+        // `MonitorError::Io`'s text names a monitor spawn; here the agent is spawned.
+        monitor::MonitorError::Io(io) => {
+            CliError::Message(format!("could not spawn the agent: {io}"))
+        }
+        other => CliError::Message(other.to_string()),
     });
     // Before the advance: the flag lives as long as the agent does.
     drop(auto_chain_guard);
@@ -1662,8 +1675,8 @@ fn runner_exit_code(state: Option<&State>) -> i32 {
 fn begin_runner_stage(launch: &StageLaunch) -> Result<(), CliError> {
     let state = &launch.state;
     archive_prior_capture(state, launch.archived_stage)?;
-    let ctx = launch_context()?;
-    let _ = devflow_core::registry::register_in(&ctx.cache_dir, &state.project_root, state.phase);
+    let cache_dir = launch_cache_dir()?;
+    let _ = devflow_core::registry::register_in(&cache_dir, &state.project_root, state.phase);
     let label = launch_label(&launch.launch);
     let runner_pid = std::process::id();
     events::emit(
@@ -1685,9 +1698,8 @@ fn begin_runner_stage(launch: &StageLaunch) -> Result<(), CliError> {
     Ok(())
 }
 
-/// The [`monitor::StageSpec`] the runner runs `launch` with. Its socket and launch id
-/// satisfy the spec's shape only: [`monitor::run_stage`] publishes no socket.
-fn runner_stage_spec(launch: StageLaunch) -> Result<monitor::StageSpec, CliError> {
+/// The [`monitor::StageSpec`] the runner runs `launch` with.
+fn runner_stage_spec(launch: StageLaunch) -> monitor::StageSpec {
     let StageLaunch {
         state,
         program,
@@ -1697,29 +1709,18 @@ fn runner_stage_spec(launch: StageLaunch) -> Result<monitor::StageSpec, CliError
         ..
     } = launch;
     let io = match launch {
-        monitor::MonitorLaunch::PipeOwning { prompt } => monitor::StageIo::Stream {
+        StageShape::Stream { prompt } => monitor::StageIo::Stream {
             prompt,
             idle_timeout: monitor::idle_timeout_setting_for(state.agent).timeout,
         },
-        monitor::MonitorLaunch::Legacy => monitor::StageIo::Capture,
+        StageShape::Capture => monitor::StageIo::Capture,
     };
-    let ctx = launch_context()?;
-    let launch_id = devflow_core::liveness::new_launch_id();
-    let socket = devflow_core::supervisor::SocketPath::for_launch(
-        &ctx.cache_dir,
-        &state.project_root,
-        state.phase,
-        &launch_id,
-    )
-    .map_err(|err| CliError::Message(format!("runner stage socket path refused: {err}")))?;
     let mut spec = monitor::StageSpec::new(
         state.project_root.clone(),
         state.phase,
         state.agent,
         program,
         io,
-        socket,
-        launch_id,
     );
     spec.stage = Some(state.stage);
     spec.workdir = state
@@ -1728,41 +1729,31 @@ fn runner_stage_spec(launch: StageLaunch) -> Result<monitor::StageSpec, CliError
         .unwrap_or_else(|| state.project_root.clone());
     spec.args = args;
     spec.envs = extra_env;
-    Ok(spec)
+    spec
 }
 
-/// Resolve, once per launch, the cache directory a stage launch registers under
-/// (50-10): [`devflow_core::registry::cache_dir`]. There is no environment override:
-/// the test-build branch below is selected at compile time. The monitor executable the
-/// context also names is never spawned: the runner runs every stage in its own process.
+/// Resolve, once per launch, the cache directory a launch registers and reserves
+/// under (50-10): [`devflow_core::registry::cache_dir`]. There is no environment
+/// override: the test-build branch below is selected at compile time.
 #[cfg(not(test))]
-pub(crate) fn launch_context() -> Result<monitor::LaunchContext, CliError> {
-    let cache_dir = devflow_core::registry::cache_dir().ok_or_else(|| {
+pub(crate) fn launch_cache_dir() -> Result<PathBuf, CliError> {
+    devflow_core::registry::cache_dir().ok_or_else(|| {
         CliError::Message(
             "cannot resolve DevFlow's cache directory for this launch: set HOME, \
              XDG_CACHE_HOME or DEVFLOW_CACHE_DIR"
                 .to_string(),
         )
-    })?;
-    let exe = std::env::current_exe().map_err(|err| {
-        CliError::Message(format!(
-            "could not resolve the devflow executable for the stage monitor: {err}"
-        ))
-    })?;
-    Ok(monitor::LaunchContext::new(
-        cache_dir,
-        monitor::MonitorExec::Subcommand { exe },
-    ))
+    })
 }
 
-/// The test build of [`launch_context`] (50-10, D-07): the cache dir comes from the
+/// The test build of [`launch_cache_dir`] (50-10, D-07): the cache dir comes from the
 /// test process's own `DEVFLOW_CACHE_DIR`, which only a child test process given one
 /// through `run_hermetic_test_in_child`'s `extra_env` has, so an in-crate test that
-/// resolves a launch context any other way fails here, loudly, instead of registering
-/// under the developer's real HOME. No test spawns a monitor through it.
+/// resolves a cache dir any other way fails here, loudly, instead of registering under
+/// the developer's real HOME.
 #[cfg(test)]
-pub(crate) fn launch_context() -> Result<monitor::LaunchContext, CliError> {
-    let cache_dir = std::env::var_os("DEVFLOW_CACHE_DIR")
+pub(crate) fn launch_cache_dir() -> Result<PathBuf, CliError> {
+    std::env::var_os("DEVFLOW_CACHE_DIR")
         .map(PathBuf::from)
         .ok_or_else(|| {
             CliError::Message(
@@ -1770,13 +1761,7 @@ pub(crate) fn launch_context() -> Result<monitor::LaunchContext, CliError> {
                  run it through run_hermetic_test_in_child with extra_env"
                     .to_string(),
             )
-        })?;
-    let exe = std::env::current_exe()
-        .map_err(|err| CliError::Message(format!("could not resolve the test binary: {err}")))?;
-    Ok(monitor::LaunchContext::new(
-        cache_dir,
-        monitor::MonitorExec::Subcommand { exe },
-    ))
+        })
 }
 
 thread_local! {
@@ -1915,7 +1900,7 @@ fn spawn_agent_and_record(
     args: &[String],
     extra_env: &[(String, String)],
     archived_stage: Option<Stage>,
-    launch: monitor::MonitorLaunch,
+    launch: StageShape,
 ) -> Result<Option<StageLaunch>, CliError> {
     stage_launch(state, program, args, extra_env, archived_stage, launch).map(Some)
 }
@@ -1936,7 +1921,7 @@ pub(crate) struct StageLaunch {
     /// The stage whose capture this launch archives, when it is not `state.stage`.
     pub(crate) archived_stage: Option<Stage>,
     /// The supervision shape.
-    pub(crate) launch: monitor::MonitorLaunch,
+    pub(crate) launch: StageShape,
     /// The rate-limit handoff this launch relaunches the stage after, set only by
     /// [`fail_over_on_rate_limit`].
     pub(crate) relaunch: Option<HandoffRelaunch>,
@@ -1952,7 +1937,7 @@ fn stage_launch(
     args: &[String],
     extra_env: &[(String, String)],
     archived_stage: Option<Stage>,
-    launch: monitor::MonitorLaunch,
+    launch: StageShape,
 ) -> Result<StageLaunch, CliError> {
     let checkpoint_resumes = state.checkpoint_resumes;
     commit(state, |s| {
@@ -2114,14 +2099,7 @@ pub(crate) fn relaunch_checkpoint_session(
     // so its capture is a `SingleDocEnvelope` and there is no stdin turn to
     // deliver. Routing it through the pipe-owning arm would hand that
     // single-document child a stdin document it never reads.
-    spawn_agent_and_record(
-        state,
-        program,
-        &args,
-        &[],
-        None,
-        monitor::MonitorLaunch::Legacy,
-    )
+    spawn_agent_and_record(state, program, &args, &[], None, StageShape::Capture)
 }
 
 #[cfg(test)]
@@ -2757,8 +2735,8 @@ fn resume_loaded(
     // Placed after `load_state` (the state is what names the launch root) and
     // before the commit below, so the repair is complete before anything
     // is spawned. Root resolved with the same
-    // `worktree_path.unwrap_or(project_root)` idiom `spawn_monitor` uses for
-    // `--workdir` (F-11) — a second spelling here would repair a different copy
+    // `worktree_path.unwrap_or(project_root)` idiom `runner_stage_spec` uses for
+    // the agent's workdir (F-11) — a second spelling here would repair a different copy
     // of the file from the one the agent reads.
     let launch_root = state
         .worktree_path
@@ -3802,7 +3780,7 @@ mod tests {
     }
 
     /// T-50-27: every root registration in the CLI goes through
-    /// `register_in(ctx.cache_dir, …)`, so a test's cache dir is the only
+    /// `register_in(cache_dir, …)`, so a test's cache dir is the only
     /// place an in-crate launch can register.
     #[test]
     fn cli_source_registers_roots_only_through_register_in() {
@@ -3825,7 +3803,7 @@ mod tests {
         );
         let scoped = concat!(
             "    let _ = devflow_core::registry::",
-            "register_in(&ctx.cache_dir, &root, phase);\n"
+            "register_in(&cache_dir, &root, phase);\n"
         );
         assert!(
             unscoped_register_calls(scoped).is_empty(),
@@ -5295,7 +5273,7 @@ mod tests {
     }
 
     /// WR-04 (18-fix, 50-23): an early failure in `launch_stage_inner` —
-    /// before `monitor::spawn_monitor` ever runs — must not leave the
+    /// before `monitor::run_stage` ever runs — must not leave the
     /// PREVIOUS stage's supervisor record behind. Pre-fix, the state still
     /// named the previous stage's (now-dead) monitor after the launch
     /// returned early via `?`, and `status`/`doctor` then misreported it as
@@ -7396,7 +7374,7 @@ mod tests {
         let phase = PhaseId::new(94);
         // D-05: a plain directory, not a real `git worktree add`. The
         // argument under test resolves a path, and a linked worktree's files
-        // are ordinary files — `monitor::spawn_monitor`'s own worktree test
+        // are ordinary files — `monitor::run_stage`'s own worktree test
         // uses the same plain-directory fixture.
         let worktree = root.join("phase-worktree");
         std::fs::create_dir_all(&worktree).unwrap();
@@ -7926,8 +7904,8 @@ mod tests {
             stream_launch,
         );
         let turn1 = match launch {
-            monitor::MonitorLaunch::PipeOwning { prompt: stdin_turn } => stdin_turn,
-            monitor::MonitorLaunch::Legacy => {
+            StageShape::Stream { prompt: stdin_turn } => stdin_turn,
+            StageShape::Capture => {
                 panic!("the Code loop-back must deliver a stdin user turn, not a Legacy launch")
             }
         };
@@ -7982,7 +7960,7 @@ mod tests {
         insta::assert_snapshot!("turn_two_resume_prompt", turn2);
     }
 
-    /// Phase 39 Stage 1 regression: Pi always resolves to `MonitorLaunch::Legacy`.
+    /// Phase 39 Stage 1 regression: Pi always resolves to `StageShape::Capture`.
     /// Pi is never Claude, so `stream_launch` is false and the `else` branch
     /// applies; `PipeOwning` deadlocks Pi (Pi consumes stdin until EOF while
     /// `PipeOwning` holds it open — phase-38 review).
@@ -8014,7 +7992,7 @@ mod tests {
             &[],
             false,
         );
-        assert!(matches!(launch, monitor::MonitorLaunch::Legacy));
+        assert!(matches!(launch, StageShape::Capture));
         assert_eq!(program, "pi");
         assert_eq!(args, vec!["-p", "--no-approve", "the stage prompt"]);
     }
@@ -8031,7 +8009,7 @@ mod tests {
     /// it covers *parse-failure-driven* fallback only. It does NOT prove that
     /// nothing anywhere selects legacy automatically — that claim is already
     /// false on `develop`. `relaunch_checkpoint_session` hardcodes
-    /// `MonitorLaunch::Legacy`, is reached by unconditional checkpoint
+    /// `StageShape::Capture`, is reached by unconditional checkpoint
     /// auto-decide, and bypasses both `canary_gate` and
     /// `stream_launch_enabled` by calling `spawn_agent_and_record`
     /// directly. That is a pre-existing, deliberate exception recorded in
@@ -8088,7 +8066,7 @@ mod tests {
             &[],
             stream_launch,
         );
-        assert!(matches!(launch, monitor::MonitorLaunch::PipeOwning { .. }));
+        assert!(matches!(launch, StageShape::Stream { .. }));
     }
 
     // ------------------------------------------------------------------
@@ -8099,7 +8077,7 @@ mod tests {
     // ------------------------------------------------------------------
 
     /// Claude and Antigravity take the stream shape at every stream stage, with no
-    /// opt-out; every other agent takes the capture shape (`MonitorLaunch::Legacy`).
+    /// opt-out; every other agent takes the capture shape (`StageShape::Capture`).
     #[test]
     fn stream_launch_includes_antigravity_on_stream_stages() {
         for stage in STREAM_JSON_STAGES.iter().copied() {
@@ -8135,7 +8113,7 @@ mod tests {
             true,
         );
         assert!(
-            matches!(launch, monitor::MonitorLaunch::PipeOwning { .. }),
+            matches!(launch, StageShape::Stream { .. }),
             "Antigravity on a stream stage must reach the pipe-owning arm"
         );
     }
@@ -8179,7 +8157,7 @@ mod tests {
             true,
         );
         assert!(
-            matches!(launch, monitor::MonitorLaunch::PipeOwning { .. }),
+            matches!(launch, StageShape::Stream { .. }),
             "premise: the launch shape is PipeOwning — the only arm run_monitor guards"
         );
         assert!(
@@ -8199,85 +8177,6 @@ mod tests {
 
     /// How long a handoff child waits for any one step of the chain.
     const HANDOFF_STEP_WAIT: Duration = Duration::from_secs(45);
-
-    /// What a handoff observer saw in one poll: the state's recorded
-    /// supervisor and how its socket probed.
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    enum Seen {
-        Alive(String),
-        Stale,
-        Gone,
-        NoRecord,
-        Unloadable,
-        ProbeFailed,
-    }
-
-    fn observe(root: &Path, phase: PhaseId) -> Seen {
-        let Ok(state) = workflow::load_state(root, phase) else {
-            return Seen::Unloadable;
-        };
-        let Some(record) = state.supervisor else {
-            return Seen::NoRecord;
-        };
-        match devflow_core::supervisor::probe(&record.socket_path) {
-            Ok(devflow_core::supervisor::Liveness::Alive(reply)) => Seen::Alive(reply.launch_id),
-            Ok(devflow_core::supervisor::Liveness::Stale) => Seen::Stale,
-            Ok(devflow_core::supervisor::Liveness::Gone) => Seen::Gone,
-            Err(_) => Seen::ProbeFailed,
-        }
-    }
-
-    /// A thread that polls [`observe`] every 5 ms (and whether `watched`
-    /// exists) until stopped.
-    struct Observer {
-        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-        handle: std::thread::JoinHandle<Vec<(Seen, bool)>>,
-    }
-
-    impl Observer {
-        fn start(root: &Path, phase: PhaseId, watched: &Path) -> Self {
-            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let (root, watched, flag) = (
-                root.to_path_buf(),
-                watched.to_path_buf(),
-                std::sync::Arc::clone(&stop),
-            );
-            let handle = std::thread::spawn(move || {
-                let mut seen = Vec::new();
-                while !flag.load(std::sync::atomic::Ordering::Acquire) {
-                    seen.push((observe(&root, phase), watched.exists()));
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                seen
-            });
-            Self { stop, handle }
-        }
-
-        fn finish(self) -> Vec<(Seen, bool)> {
-            self.stop.store(true, std::sync::atomic::Ordering::Release);
-            self.handle.join().expect("the observer thread")
-        }
-    }
-
-    /// Every observation between the first `Alive(from)` and the first
-    /// `Alive(to)` that reads `Gone`, `Stale` or no record: the handoff's
-    /// gaps. An error when either endpoint was never observed.
-    fn handoff_gaps(seen: &[(Seen, bool)], from: &str, to: &str) -> Result<Vec<Seen>, String> {
-        let first = |id: &str| {
-            seen.iter()
-                .position(|(observed, _)| *observed == Seen::Alive(id.to_string()))
-        };
-        let start = first(from).ok_or_else(|| format!("never saw {from} alive"))?;
-        let end = first(to).ok_or_else(|| format!("never saw {to} alive"))?;
-        if end < start {
-            return Err(format!("saw {to} alive before {from}"));
-        }
-        Ok(seen[start..end]
-            .iter()
-            .map(|(observed, _)| observed.clone())
-            .filter(|observed| matches!(observed, Seen::Gone | Seen::Stale | Seen::NoRecord))
-            .collect())
-    }
 
     /// The refusal a process meets when another foreground process holds the phase
     /// (D-12): it names the holder's pid and that another verb is in progress, and never
@@ -8321,99 +8220,6 @@ mod tests {
             before,
             "nothing is reserved"
         );
-    }
-
-    /// A live in-process supervisor serving `launch_id` at a short socket
-    /// path in `dir`, for the observer control.
-    fn fake_supervisor(
-        dir: &Path,
-        root: &Path,
-        phase: PhaseId,
-        launch_id: &str,
-    ) -> (
-        devflow_core::supervisor::runtime::Supervisor,
-        devflow_core::state::SupervisorRecord,
-    ) {
-        let path = dir.join(format!("{launch_id}.sock"));
-        let socket = devflow_core::supervisor::SocketPath::new(path.clone()).unwrap();
-        let sidecar: devflow_core::supervisor::Sidecar =
-            serde_json::from_value(serde_json::json!({
-                "launch_id": launch_id,
-                "project_root": root,
-                "phase": phase,
-                "stage": null,
-                "agent": "claude",
-                "launch": "capture",
-                "agent_pid": 0,
-                "agent_pgid": 0,
-                "agent_start_time": 0,
-                "boot_id": "",
-                "supervisor_pid": std::process::id(),
-                "supervisor_start_time": 0,
-                "created_at": "2026-10-17T00:00:00Z",
-            }))
-            .unwrap();
-        let supervisor = devflow_core::supervisor::runtime::Supervisor::serve(socket, sidecar)
-            .expect("serve the fake supervisor");
-        let record = devflow_core::state::SupervisorRecord::new(
-            path,
-            launch_id.to_string(),
-            0,
-            0,
-            String::new(),
-        );
-        (supervisor, record)
-    }
-
-    /// The observer control for V-13: the same observer and gap rule applied
-    /// to a simulated pre-clear handoff (a save with no supervisor between
-    /// N's record and N+1's, the WR-04 pitfall) reports the gap; the same
-    /// sequence without the pre-clear reports none. Both endpoints are real
-    /// in-process supervisors answering pings.
-    #[test]
-    fn the_handoff_observer_detects_a_pre_clear_gap() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let sock_dir = tempfile::Builder::new()
-            .prefix("dfs")
-            .tempdir_in("/tmp")
-            .unwrap();
-        let phase = PhaseId::new(1302);
-        // Launch ids in `new_launch_id`'s format, the only one a sidecar takes.
-        let (obs_n, obs_next) = ("0000000000000b5a", "0000000000000b5b");
-        let (sup_n, rec_n) = fake_supervisor(sock_dir.path(), root, phase, obs_n);
-        let (sup_next, rec_next) = fake_supervisor(sock_dir.path(), root, phase, obs_next);
-        let save = |record: Option<&devflow_core::state::SupervisorRecord>| {
-            let mut state = State::new(phase, AgentKind::Claude, Mode::Supervise, root.into());
-            state.supervisor = record.cloned();
-            workflow::save_state(&state).unwrap();
-        };
-        let hold = Duration::from_millis(80);
-
-        for pre_clear in [true, false] {
-            save(Some(&rec_n));
-            let observer = Observer::start(root, phase, &rec_n.socket_path);
-            std::thread::sleep(hold);
-            if pre_clear {
-                save(None);
-                std::thread::sleep(hold);
-            }
-            save(Some(&rec_next));
-            std::thread::sleep(hold);
-            let seen = observer.finish();
-            let gaps = handoff_gaps(&seen, obs_n, obs_next)
-                .unwrap_or_else(|why| panic!("observer: {why}: {seen:?}"));
-            if pre_clear {
-                assert!(
-                    gaps.contains(&Seen::NoRecord),
-                    "the observer must see the pre-clear gap: {seen:?}"
-                );
-            } else {
-                assert!(gaps.is_empty(), "control: no pre-clear, no gap: {gaps:?}");
-            }
-        }
-        sup_n.finish();
-        sup_next.finish();
     }
 
     /// The run's events named `name`.
