@@ -896,3 +896,162 @@ fn a_stage_the_runner_cannot_start_opens_the_infra_gate_with_an_event() {
         shown(&output)
     );
 }
+
+// ---- 52.2-05: the runner stops (D-05, D-04b) ----
+
+/// How long a signalled runner may take to end its agent, record the stop and exit.
+const STOP_WAIT: Duration = Duration::from_secs(20);
+
+/// The exit code of a runner that recorded a stop.
+const STOPPED_EXIT_CODE: i32 = devflow_core::supervisor::runtime::STOPPED_EXIT_CODE;
+
+/// A `codex` stub that, after `prelude`, writes its pid (`$$`, its group's pgid) to a
+/// `pid` file beside itself and waits in a short-sleep loop (bounded, about 60 s).
+fn codex_waiting_with_pid(prelude: &str) -> String {
+    format!(
+        "here=$(dirname \"$0\")\n{prelude}\nprintf '%s\\n' \"$$\" > \"$here/pid.tmp\"\n\
+         mv \"$here/pid.tmp\" \"$here/pid\"\n\
+         i=0; while [ \"$i\" -lt 600 ]; do sleep 0.1; i=$((i+1)); done\n{PASSING_CODEX}"
+    )
+}
+
+/// SIGKILLs the process groups it names on drop, when they still have a live member:
+/// a failing stop test leaves no stub agent behind.
+struct GroupReaper(Vec<u32>);
+
+impl Drop for GroupReaper {
+    fn drop(&mut self) {
+        for &pgid in &self.0 {
+            if !devflow_core::test_support::live_group_members(pgid).is_empty() {
+                common::signal_group(pgid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+/// The pid a [`codex_waiting_with_pid`] stub wrote to `name` beside it, once it has.
+fn agent_pid(fixture: &RunnerFixture, name: &str, runner: &mut RunnerChild) -> u32 {
+    let path = fixture.beside_agent(name);
+    common::wait_for(
+        || path.exists() || !runner.running(),
+        RUNNER_WAIT,
+        "the stub agent's pid file",
+    );
+    fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("no pid file {} ({err}); the runner exited", path.display()))
+        .trim()
+        .parse()
+        .expect("a pid")
+}
+
+/// Send `signal` to the runner by its recorded pid.
+fn signal_runner(runner: &RunnerChild, signal: libc::c_int) {
+    let pid = libc::pid_t::try_from(runner.pid).expect("a pid_t");
+    // SAFETY: a plain kill(2) on the runner child this test spawned and has not reaped.
+    assert_eq!(unsafe { libc::kill(pid, signal) }, 0, "signal the runner");
+}
+
+/// Wait at most [`STOP_WAIT`] for a signalled runner to exit; its output once it has.
+fn wait_stopped(runner: &mut RunnerChild, what: &str) -> Output {
+    let deadline = Instant::now() + STOP_WAIT;
+    while runner.running() {
+        assert!(
+            Instant::now() < deadline,
+            "{what}: the runner's exit code: none, still running {STOP_WAIT:?} after the stop"
+        );
+        std::thread::sleep(RUNNER_POLL);
+    }
+    runner.wait()
+}
+
+/// D-05: a SIGTERM to the runner while its agent runs ends the agent's process group,
+/// records `stopped` with a reason in the state and as a `runner_stopped` event, and the
+/// runner exits with STOPPED_EXIT_CODE.
+#[test]
+fn a_sigterm_to_the_runner_mid_stage_records_stopped() {
+    let phase = PhaseId::new(90);
+    let fixture = RunnerFixture::new(phase, None, &codex_waiting_with_pid(""));
+    let mut runner = fixture.spawn_runner();
+    let pgid = agent_pid(&fixture, "pid", &mut runner);
+    let _reaper = GroupReaper(vec![pgid]);
+
+    signal_runner(&runner, libc::SIGTERM);
+    let output = wait_stopped(&mut runner, "a_sigterm_to_the_runner_mid_stage");
+
+    let live = devflow_core::test_support::live_group_members(pgid);
+    assert!(live.is_empty(), "agent group still live: {live:?}");
+    let state = fixture.state().expect("a stopped run keeps its state");
+    assert!(
+        state.stopped && !state.finished && state.stop_reason.is_some(),
+        "state not stopped: {state:?}\n{}",
+        shown(&output)
+    );
+    assert!(
+        !fixture.events_of("runner_stopped").is_empty(),
+        "no stop event in the log: {:?}",
+        all_events(&fixture)
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(STOPPED_EXIT_CODE),
+        "the runner's exit code: {}",
+        shown(&output)
+    );
+}
+
+/// A `codex` stub that counts its runs in a `runs` file beside it. Its first run (Plan)
+/// commits and passes; its second (Code) ignores SIGTERM, writes its pid to `code-pid`
+/// and waits (bounded, about 60 s).
+const TERM_IGNORING_SECOND_RUN_CODEX: &str = r#"here=$(dirname "$0")
+n=$(cat "$here/runs" 2>/dev/null || echo 0); n=$((n+1)); printf '%s\n' "$n" > "$here/runs"
+if [ "$n" -ge 2 ]; then
+  trap '' TERM
+  printf '%s\n' "$$" > "$here/code-pid.tmp"; mv "$here/code-pid.tmp" "$here/code-pid"
+  i=0; while [ "$i" -lt 600 ]; do sleep 0.1; i=$((i+1)); done
+fi
+git commit -q --allow-empty -m "stub stage work"
+printf 'DEVFLOW_RESULT: {"status":"success","commits":1,"verdict":"pass"}\n'"#;
+
+/// D-05 (review codex-1): the run-long stop token is re-armed for each stage. A stop
+/// while the Code agent (the second stage, reached from Plan with no gate) ignores
+/// SIGTERM still ends its group, by SIGKILL after the grace, and the run reads
+/// `stopped`. Without the per-stage reset Plan's observed exit is still recorded, the
+/// group is never signalled, and the bound below turns that into a panic.
+#[test]
+fn a_stop_in_the_second_stage_ends_a_term_ignoring_agent_and_records_stopped() {
+    let phase = PhaseId::new(91);
+    let fixture = RunnerFixture::new(phase, None, TERM_IGNORING_SECOND_RUN_CODEX);
+    let mut runner = fixture.spawn_runner();
+    let pgid = agent_pid(&fixture, "code-pid", &mut runner);
+    let _reaper = GroupReaper(vec![pgid]);
+    assert_eq!(
+        fixture.lines_beside_agent("runs"),
+        ["2"],
+        "the pid is the Code run's"
+    );
+
+    signal_runner(&runner, libc::SIGTERM);
+    let deadline = Instant::now() + STOP_WAIT;
+    while runner.running() || !devflow_core::test_support::live_group_members(pgid).is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "stage-2 agent group not ended after a stop: members {:?}, runner running {}",
+            devflow_core::test_support::live_group_members(pgid),
+            runner.running()
+        );
+        std::thread::sleep(RUNNER_POLL);
+    }
+    let output = runner.wait();
+    let state = fixture.state().expect("a stopped run keeps its state");
+    assert!(
+        state.stopped && !state.finished && state.stage == Stage::Code,
+        "state not stopped: {state:?}\n{}",
+        shown(&output)
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(STOPPED_EXIT_CODE),
+        "the runner's exit code: {}",
+        shown(&output)
+    );
+}
