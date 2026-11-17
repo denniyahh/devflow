@@ -48,3 +48,8 @@
   status: open
   **What:** `service_e2e::start_launches_a_unit_and_returns_with_the_run_live` (host-only, `--run-ignored only`) fails in its `UnitGuard` drop with `unit devflow-<digest>-81.service was not removed` (`left: "loaded"`, `right: "not-found"`): the guard runs `systemctl --user stop`, then `reset-failed`, then reads `LoadState` once, and the transient unit is sometimes not yet collected. Seen by 52.2-11 in 2 of 6 runs at its head and in 2 of 8 runs at the plan's base `34febac` (built in a scratch worktree), so it predates 52.2-11. The test body's own assertions passed in every run.
   **Why deferred:** found by 52.2-11 outside its files and its subject. Fix shape: poll `LoadState` for `not-found` with a short bound in the guard's drop instead of reading it once. Owner: 52.2-17, the one remaining plan whose files_modified lists `crates/devflow-cli/tests/service_e2e.rs`, else a 999.x entry at phase close.
+
+- The unattended-launch shape refusal still names a supervisor
+  status: open
+  **What:** `unattended_launch_shape_condition` (`crates/devflow-cli/src/preflight.rs`) refuses a non-claude, non-antigravity agent in auto mode with "Code would launch on the capture shape, whose supervisor never engages the chain-flag guard". The refusal itself is intended (D-07, fail-closed, pinned by `unattended_launch_shape_refusal_names_the_capture_supervisor`), but no supervisor exists after 52.2-11: the text should name the runner. Found by 52.2-11 (orchestrator follow-up).
+  **Why deferred:** wording only, outside 52.2-11's subject. Owner: 52.2-15, the one remaining plan whose files_modified lists `preflight.rs`; rename the pinning test with the text. Else a 999.x entry at phase close.
