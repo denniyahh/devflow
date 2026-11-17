@@ -67,10 +67,8 @@ pub fn roots_dir_in(cache_dir: &Path) -> PathBuf {
     cache_dir.join("roots")
 }
 
-/// The `sock/` subdirectory of a cache dir, where each launch's supervisor
-/// socket and its sidecar live (see [`crate::supervisor`]). The socket path is
-/// persisted in state when a launch is recorded and is never re-derived at
-/// probe time.
+/// The `sock/` subdirectory of a cache dir, where a 3.x launch's supervisor socket
+/// and its sidecar lived. No current build creates one.
 pub fn socket_dir_in(cache_dir: &Path) -> PathBuf {
     cache_dir.join("sock")
 }

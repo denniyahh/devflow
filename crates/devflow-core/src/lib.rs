@@ -76,7 +76,6 @@ pub mod reset_time;
 pub mod stage;
 pub mod state;
 pub mod stop;
-pub mod supervisor;
 /// Test-only helpers, also available to other crates' test targets via the
 /// `test-support` feature. Never compiled into a normal build.
 #[cfg(any(test, feature = "test-support"))]
