@@ -787,6 +787,48 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.240: The Post-Commit Stale-State Marker Leaves the Phase Worktree Dirty, So an Installed Build Reads `dirty` (BACKLOG)
+
+**Found:** 2026-11-17, Phase 52.2 plan 52.2-19 Task 1, before the install.
+**Defect:** `scripts/hooks/post-commit` rewrites the tracked `.planning/user/errors/state-stale.json` after a SUMMARY
+commit and leaves the change uncommitted. `crates/devflow-cli/build.rs` sets `DEVFLOW_BUILD_DIRTY` from the whole
+`git status --porcelain`, `.planning/` included, so `cargo install --path crates/devflow-cli` from the phase worktree
+prints `(<sha>, dirty)` and the plan's installed-head gate refuses it, while the same gate excludes `.planning/` from its
+own source-change check.
+**Evidence:** `git diff` of the marker (`stale_since_commit` 24ae442 -> 3aec579); 52.2-PROOF-RUN.md, Task 1.
+**Bypass used:** built from a clean detached checkout of the same commit (`git worktree add --detach`).
+**Not established:** whether the marker is meant to be committed by the executor (earlier plans did, as
+`chore(...): refresh the stale-state marker`).
+**Fix shape (not decided):** either the hook commits or ignores its marker, or build.rs's dirty flag excludes `.planning/`
+as the proof gate does. **Owner:** Phase 52.2 close-out or the next fix branch.
+
+### Phase 999.239: The Runner's Stop Reason Still Names the Removed Supervisor (BACKLOG)
+
+**Found:** 2026-11-17, Phase 52.2 plan 52.2-19 Task 1, by `devflow stop --phase 1` on the proof fixture.
+**Defect:** with no supervisor left (52.2), `stop` prints `stopped through the supervisor during advance` and the
+runner writes `{"event":"advance_stopped",...,"source":"supervisor"}`. Source: `pipeline_launch.rs`
+`ADVANCE_STOP_REASON` and the `"supervisor"` source label beside it.
+**Not established:** whether other stop paths carry the same stale label.
+**Fix shape:** name the runner (or the unit stop) in the reason and the event source, with a test on the printed text.
+**Owner:** Phase 52.2 (wording of a verb it rewrote) or the next fix branch.
+
+### Phase 999.238: A GSD 1.21.0 Project That Does Not Ignore `.planning/state.json` Can Never Finish a Run (BACKLOG)
+
+**Found:** 2026-11-17, Phase 52.2 plan 52.2-19 Task 1, the proof run on `scripts/scratch-dogfood-repo.sh`'s fixture.
+**Defect:** GSD 1.21.0 publishes `.planning/state.json` at step boundaries (gsd-core `bin/lib/state-contract.cjs`
+`publishStateContract`, #3227). The fixture has no `.gitignore`, so the file is untracked in the phase worktree; DevFlow
+counts no Validate pass on a dirty tree (52-CONTEXT D-46). The Validate gate fired `clean_pass` with "the tree has
+uncommitted changes (.planning/state.json) ... No Validate pass counts on this commit"; `gate approve 1` routed
+`validate_again` (`next_step`, `Trigger::Approve`, `can_finish` false), and Validate fired the same gate again. Nothing
+removes the file, so every approve loops. DevFlow's own repo ignores it (`.gitignore`, `.planning/state.json`).
+**Evidence:** 52.2-PROOF-RUN.md (events, both gate requests, `git status --porcelain` = `?? .planning/state.json`).
+**Not established:** whether GSD's own project setup adds the ignore line for new projects; whether any other GSD
+runtime file (`.planning/milestone.lock`) also appears during a run.
+**Fix shape (not decided, operator's choice):** (a) the fixture commits a `.gitignore` with `.planning/state.json` and
+`.planning/milestone.lock` (a `scripts/` change, so reinstall and rerun the proof); or (b) DevFlow's clean-tree rule
+ignores GSD's derived files, or preflight refuses a project that does not ignore them, naming the line to add.
+**Owner:** Phase 52.2: it blocks the proof run (52.2-19).
+
 ### Phase 999.237: `discard` and `start` Do Not Look for a Held Launch Lock a Loadable State Does Not Name (BACKLOG)
 
 **Found:** 2026-11-15, Phase 52.1 plan 52.1-07, by reading the code after the liveness follow-up (52.1-07-SUMMARY,
