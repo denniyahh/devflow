@@ -42,8 +42,6 @@ pub enum OwnerPhase {
     Advancing,
     /// The CLI is waiting on a gate answer.
     GateWait,
-    /// The run was handed to another process for its next stage.
-    HandedOff,
     /// The run is over.
     Finished,
 }
@@ -55,7 +53,6 @@ impl OwnerPhase {
             Self::AgentRunning => "agent_running",
             Self::Advancing => "advancing",
             Self::GateWait => "gate_wait",
-            Self::HandedOff => "handed_off",
             Self::Finished => "finished",
         }
     }
@@ -105,7 +102,8 @@ pub enum StopAction {
     /// The CLI owns the run: the stop is flagged and its next safe point
     /// stops.
     FlagForSafePoint,
-    /// The run was handed off: reply `handed_off` and act on nothing.
+    /// The run was handed off: reply `handed_off` and act on nothing. No current
+    /// [`OwnerPhase`] decides it.
     ReplyHandedOff,
     /// The run is already over: act on nothing.
     AlreadyFinished,
@@ -126,7 +124,6 @@ pub fn on_stop_request(phase: OwnerPhase) -> StopAction {
     match phase {
         OwnerPhase::AgentRunning => StopAction::KillAgentGroup,
         OwnerPhase::Advancing | OwnerPhase::GateWait => StopAction::FlagForSafePoint,
-        OwnerPhase::HandedOff => StopAction::ReplyHandedOff,
         OwnerPhase::Finished => StopAction::AlreadyFinished,
     }
 }
@@ -257,7 +254,7 @@ impl StopToken {
 
     /// Take a stop request and return what it does. A request in
     /// `AgentRunning`, `Advancing` or `GateWait` sets the stop flag; one in
-    /// `HandedOff` or `Finished` changes nothing. This only decides: the
+    /// `Finished` changes nothing. This only decides: the
     /// caller acts on the returned [`StopAction`] (the runner's signal
     /// dispatcher ends the agent group for [`StopAction::KillAgentGroup`]).
     pub fn request_stop(&self, source: StopSource) -> StopAction {
@@ -828,5 +825,464 @@ pub(crate) mod tests {
             let line = index * 2 + 1;
             assert_eq!(found[index], format!("line {line}: {needle}"));
         }
+    }
+
+    // ---- The run-lifetime stop decisions and the agent-group end, against real processes ----
+
+    use super::*;
+    use std::cell::Cell;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Child, Command, Stdio};
+    use std::time::Instant;
+
+    fn wait_until(within: Duration, mut done: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + within;
+        loop {
+            if done() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Whether any live member of process group `pgid` still exists. A zombie
+    /// is not one: an orphaned member is PID 1's to reap, and a CI job
+    /// container's PID 1 never reaps (`test_support::live_group_members`).
+    fn group_exists(pgid: u32) -> bool {
+        !crate::test_support::live_group_members(pgid).is_empty()
+    }
+
+    /// Kills and reaps a child process on every exit path.
+    struct ChildGuard(Option<Child>);
+
+    impl ChildGuard {
+        fn child(&mut self) -> &mut Child {
+            self.0.as_mut().expect("the child is still owned")
+        }
+    }
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                // `Child::kill` is SIGKILL to the pid this test spawned and
+                // still owns, never a pid read from disk.
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    /// SIGKILLs whatever is left of a process group on drop.
+    struct GroupGuard(u32);
+
+    impl Drop for GroupGuard {
+        fn drop(&mut self) {
+            if group_exists(self.0) {
+                signal_group(self.0, libc::SIGKILL);
+            }
+        }
+    }
+
+    /// The windows of one stage's life in which a stop can land (V-14).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Window {
+        /// The agent is still running.
+        BeforeExit,
+        /// `waitid` has seen the exit, the leader is unreaped, and the exit
+        /// decision has not been taken.
+        ExitObservedBeforeDecision,
+        /// The runner is waiting on a gate.
+        DuringGateWait,
+        /// Safe point 1 has passed and the run is `Advancing` again, before
+        /// safe point 2 (right before the next stage's spawn).
+        AfterAdvancingBeforeSpawn,
+        /// The next stage is spawned, before it is recorded (safe point 3).
+        BetweenSpawnAndPublish,
+    }
+
+    /// How one stage's life ended.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Verdict {
+        /// The next stage was launched: the pipeline advanced.
+        Advanced,
+        /// The run stopped at this decision and launched nothing further.
+        Stopped(&'static str),
+    }
+
+    /// One stage's life against a real [`StopToken`]: a real agent process
+    /// (`cat`, which exits when its stdin closes) is observed with `waitid`
+    /// without reaping, the exit is decided under the owner lock, and the
+    /// advance passes its gate wait and three safe points. `pause` runs at
+    /// `window` and holds it open.
+    fn run_stage(token: &StopToken, window: Option<Window>, pause: &dyn Fn()) -> Verdict {
+        let at = |here: Window| {
+            if window == Some(here) {
+                pause();
+            }
+        };
+        let mut agent = ChildGuard(Some(
+            Command::new("/bin/cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .spawn()
+                .expect("spawn the agent"),
+        ));
+        at(Window::BeforeExit);
+        drop(agent.child().stdin.take());
+        wait_for_exit_without_reaping(agent.child().id()).expect("observe the exit");
+        at(Window::ExitObservedBeforeDecision);
+        let outcome = token
+            .observe_exit(|_| agent.child().wait().map(exit_code))
+            .expect("decide the exit");
+        if outcome == AgentOutcome::Stopped {
+            return Verdict::Stopped("exit decision");
+        }
+        assert_eq!(outcome, AgentOutcome::Completed(0));
+        assert_eq!(token.phase(), OwnerPhase::Advancing);
+        if token.safe_point() == SafePoint::StopHere {
+            return Verdict::Stopped("safe point 1");
+        }
+        token.enter(OwnerPhase::GateWait);
+        at(Window::DuringGateWait);
+        if token.safe_point() == SafePoint::StopHere {
+            return Verdict::Stopped("gate wait");
+        }
+        token.enter(OwnerPhase::Advancing);
+        at(Window::AfterAdvancingBeforeSpawn);
+        if token.safe_point() == SafePoint::StopHere {
+            return Verdict::Stopped("safe point 2");
+        }
+        at(Window::BetweenSpawnAndPublish);
+        if token.safe_point() == SafePoint::StopHere {
+            return Verdict::Stopped("safe point 3");
+        }
+        Verdict::Advanced
+    }
+
+    #[test]
+    fn a_stop_racing_natural_completion_never_advances() {
+        let cases = [
+            (
+                Window::BeforeExit,
+                StopAction::KillAgentGroup,
+                "exit decision",
+            ),
+            (
+                Window::ExitObservedBeforeDecision,
+                StopAction::KillAgentGroup,
+                "exit decision",
+            ),
+            (
+                Window::DuringGateWait,
+                StopAction::FlagForSafePoint,
+                "gate wait",
+            ),
+            (
+                Window::AfterAdvancingBeforeSpawn,
+                StopAction::FlagForSafePoint,
+                "safe point 2",
+            ),
+            (
+                Window::BetweenSpawnAndPublish,
+                StopAction::FlagForSafePoint,
+                "safe point 3",
+            ),
+        ];
+        for (window, expected_action, stopped_at) in cases {
+            let token = StopToken::new(OwnerPhase::AgentRunning);
+            let ready = Arc::new(std::sync::Barrier::new(2));
+            let done = Arc::new(std::sync::Barrier::new(2));
+            let stopper = {
+                let (token, ready, done) = (token.clone(), Arc::clone(&ready), Arc::clone(&done));
+                std::thread::spawn(move || {
+                    ready.wait();
+                    let action = token.request_stop(StopSource::Signal(libc::SIGTERM));
+                    done.wait();
+                    action
+                })
+            };
+            let reached = Cell::new(false);
+            let verdict = run_stage(&token, Some(window), &|| {
+                reached.set(true);
+                ready.wait();
+                done.wait();
+            });
+            // A run that ended before its window would leave the stopper
+            // blocked on the barrier: fail here rather than hang on the join.
+            assert!(
+                reached.get(),
+                "{window:?}: the run ended before its window was reached: {verdict:?}"
+            );
+            let action = stopper.join().expect("the stopper thread");
+            assert_eq!(action, expected_action, "{window:?}: the stop's action");
+            assert_eq!(
+                verdict,
+                Verdict::Stopped(stopped_at),
+                "{window:?}: a stop must end the run, never advance it"
+            );
+            assert!(token.stop_requested(), "{window:?}: the stop is recorded");
+            assert!(token.ended_stopped(), "{window:?}: the run ended as a stop");
+        }
+    }
+
+    #[test]
+    fn natural_completion_without_a_stop_advances() {
+        let token = StopToken::new(OwnerPhase::AgentRunning);
+        assert_eq!(run_stage(&token, None, &|| {}), Verdict::Advanced);
+        assert!(!token.stop_requested());
+        assert!(!token.ended_stopped(), "no stop, so no stopped line");
+        assert_eq!(token.phase(), OwnerPhase::Advancing);
+    }
+
+    #[test]
+    fn every_owner_phase_has_exactly_one_stop_decision() {
+        use OwnerPhase::{Advancing, AgentRunning, Finished, GateWait};
+        let table = [
+            (
+                AgentRunning,
+                StopAction::KillAgentGroup,
+                true,
+                "agent_running",
+            ),
+            (Advancing, StopAction::FlagForSafePoint, true, "advancing"),
+            (GateWait, StopAction::FlagForSafePoint, true, "gate_wait"),
+            (Finished, StopAction::AlreadyFinished, false, "finished"),
+        ];
+        for (phase, action, flags, label) in table {
+            assert_eq!(on_stop_request(phase), action, "{phase:?}");
+            assert_eq!(phase.as_str(), label);
+            let token = StopToken::new(phase);
+            assert_eq!(
+                token.safe_point(),
+                SafePoint::Proceed,
+                "{phase:?}: before a stop"
+            );
+            assert!(!token.ended_stopped(), "{phase:?}: before a stop");
+            assert_eq!(
+                token.request_stop(StopSource::Signal(libc::SIGTERM)),
+                action
+            );
+            assert_eq!(token.stop_requested(), flags, "{phase:?}: the stop flag");
+            assert_eq!(
+                token.phase(),
+                phase,
+                "{phase:?}: a stop never moves the phase"
+            );
+            let expected = if flags {
+                SafePoint::StopHere
+            } else {
+                SafePoint::Proceed
+            };
+            assert_eq!(
+                token.safe_point(),
+                expected,
+                "{phase:?}: the next safe point"
+            );
+            assert_eq!(token.ended_stopped(), flags, "{phase:?}: ended as a stop");
+        }
+    }
+
+    #[test]
+    fn exit_and_safe_point_decisions_cover_every_input() {
+        for code in [0, 1, 7, 137, STOPPED_EXIT_CODE] {
+            assert_eq!(on_agent_exit(false, code), AgentOutcome::Completed(code));
+            assert_eq!(on_agent_exit(true, code), AgentOutcome::Stopped);
+        }
+        assert_eq!(at_safe_point(false), SafePoint::Proceed);
+        assert_eq!(at_safe_point(true), SafePoint::StopHere);
+        // The exit decision leaves the phase where the runner expects it.
+        let completed = StopToken::new(OwnerPhase::AgentRunning);
+        assert_eq!(
+            completed.observe_exit(|_| Ok(7)).expect("decide"),
+            AgentOutcome::Completed(7)
+        );
+        assert_eq!(completed.phase(), OwnerPhase::Advancing);
+        assert!(!completed.ended_stopped());
+        let stopped = StopToken::new(OwnerPhase::AgentRunning);
+        stopped.request_stop(StopSource::Signal(libc::SIGTERM));
+        assert_eq!(
+            stopped
+                .observe_exit(|stop| Ok(if stop { 143 } else { 0 }))
+                .expect("decide"),
+            AgentOutcome::Stopped
+        );
+        assert_eq!(stopped.phase(), OwnerPhase::Finished);
+        assert!(stopped.ended_stopped());
+    }
+
+    /// A process group this test spawned, unrelated to any run's agent.
+    fn unrelated_group() -> (ChildGuard, GroupGuard, u32) {
+        let child = Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("spawn the unrelated group");
+        let pgid = child.id();
+        (ChildGuard(Some(child)), GroupGuard(pgid), pgid)
+    }
+
+    /// R-13: once its leader is reaped, a group's recorded number may name anyone's
+    /// group, so `end_group_while_running` signals nothing, whatever group holds that
+    /// number now. Control: with the agent still running, the same call does end the
+    /// group it names, so the silence above is the rule and not a broken signal path.
+    #[test]
+    fn end_group_while_running_never_signals_a_pgid_after_its_leader_is_reaped() {
+        let (_u_child, _u_guard, unrelated) = unrelated_group();
+        let mut reaped_agent = Command::new("true")
+            .process_group(0)
+            .spawn()
+            .expect("spawn the agent that exits");
+        let token = StopToken::for_run();
+        assert!(!token.begin_agent(unrelated), "no stop is pending");
+        assert_eq!(
+            wait_owned_agent(&token, unrelated, &mut reaped_agent)
+                .expect("the leader is observed and reaped"),
+            AgentOutcome::Completed(0)
+        );
+        assert_eq!(
+            end_group_while_running(&token, unrelated),
+            AgentGroupEnd::AlreadyExited
+        );
+        std::thread::sleep(Duration::from_secs(1));
+        assert!(
+            group_exists(unrelated),
+            "a group holding a reaped leader's number is not signalled"
+        );
+
+        let (_u2_child, _u2_guard, named) = unrelated_group();
+        let _running_agent = ChildGuard(Some(
+            Command::new("sleep")
+                .arg("60")
+                .process_group(0)
+                .spawn()
+                .expect("spawn the running agent"),
+        ));
+        let token = StopToken::for_run();
+        assert!(!token.begin_agent(named), "no stop is pending");
+        assert_eq!(end_group_while_running(&token, named), AgentGroupEnd::Ended);
+        assert!(
+            wait_until(
+                crate::agent::TERMINATE_VERIFY_WAIT + Duration::from_secs(1),
+                || !group_exists(named)
+            ),
+            "control: a running agent's recorded group is ended"
+        );
+        assert!(
+            token.stop_requested(),
+            "control: it is a stop, so the agent's exit never advances"
+        );
+    }
+
+    /// The named mask field of `/proc/<pid>/status` (`SigIgn`, ...). Panics when the
+    /// field is absent, so an unreadable mask never reads as clear.
+    #[cfg(target_os = "linux")]
+    fn signal_mask_field(pid: u32, field: &str) -> u64 {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status"))
+            .unwrap_or_else(|error| panic!("/proc/{pid}/status must be readable: {error}"));
+        let hex = status
+            .lines()
+            .find_map(|line| line.strip_prefix(field)?.strip_prefix(':'))
+            .unwrap_or_else(|| panic!("/proc/{pid}/status has no {field} line"))
+            .trim();
+        u64::from_str_radix(hex, 16).expect("signal masks are hex")
+    }
+
+    /// Whether `pid` is gone or a zombie: it can no longer run.
+    #[cfg(target_os = "linux")]
+    fn process_is_dead(pid: u32) -> bool {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => true,
+            Ok(stat) => stat
+                .rfind(')')
+                .and_then(|end| stat[end + 1..].split_whitespace().next())
+                .is_some_and(|state| state == "Z"),
+        }
+    }
+
+    /// A signal stop while the agent runs (the runner's dispatcher path, `stop_on_signal`)
+    /// ends a group member that ignores SIGTERM: the leader dies of the TERM, and the
+    /// exit decision SIGKILLs the group while the unreaped leader still holds the pgid.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_term_ignoring_group_member_is_killed_after_the_leader_exits() {
+        use crate::test_support::{EXEC_VISIBILITY_POLL, EXEC_VISIBILITY_WAIT};
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let member_file = dir.path().join("member");
+        let script = format!(
+            "(trap '' TERM; exec sleep 60) & echo $! > '{}'; wait",
+            member_file.display()
+        );
+        let mut agent = ChildGuard(Some(
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg(script)
+                .env("PATH", "/usr/bin:/bin")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .process_group(0)
+                .spawn()
+                .expect("spawn the agent"),
+        ));
+        let pgid = agent.child().id();
+        let _group = GroupGuard(pgid);
+        let mut member = None;
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                member = std::fs::read_to_string(&member_file)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<u32>().ok());
+                member.is_some()
+            }),
+            "the agent must record its member's pid"
+        );
+        let member = member.expect("member pid");
+        assert!(
+            crate::test_support::wait_for_exec_visibility(
+                member,
+                "sleep",
+                EXEC_VISIBILITY_WAIT,
+                EXEC_VISIBILITY_POLL
+            ),
+            "the member must exec sleep"
+        );
+        // The fixture is what it claims: the member is in the agent's group
+        // and ignores TERM.
+        // SAFETY: getpgid only reads; `member` is a live pid we just saw.
+        let member_pgid = unsafe { libc::getpgid(libc::pid_t::try_from(member).expect("pid")) };
+        assert_eq!(u32::try_from(member_pgid).ok(), Some(pgid));
+        assert_ne!(
+            signal_mask_field(member, "SigIgn") & (1 << (libc::SIGTERM - 1)),
+            0,
+            "the member must ignore TERM"
+        );
+
+        let token = StopToken::for_run();
+        assert!(!token.begin_agent(pgid), "no stop is pending");
+        let stopper = {
+            let token = token.clone();
+            std::thread::spawn(move || stop_on_signal(&token, libc::SIGTERM))
+        };
+        let outcome = wait_owned_agent(&token, pgid, agent.child()).expect("wait the agent");
+        agent.0 = None;
+        stopper.join().expect("the stopper thread");
+        assert_eq!(outcome, AgentOutcome::Stopped, "a signal stop is a stop");
+        assert!(token.ended_stopped());
+        assert!(
+            wait_until(crate::agent::TERMINATE_VERIFY_WAIT, || process_is_dead(
+                member
+            )),
+            "the TERM-ignoring member must be gone within the grace window"
+        );
+        assert!(
+            wait_until(Duration::from_secs(5), || !group_exists(pgid)),
+            "the agent group must be gone"
+        );
     }
 }

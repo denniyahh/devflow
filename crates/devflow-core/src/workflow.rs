@@ -1871,7 +1871,7 @@ mod tests {
             .iter()
             .map(|file| file.strip_prefix(root).unwrap().display().to_string())
             .collect();
-        for expected in ["workflow.rs", "supervisor/runtime.rs"] {
+        for expected in ["workflow.rs", "agents/codex.rs"] {
             assert!(
                 relative.iter().any(|file| file == expected),
                 "the walk must reach {expected}: {relative:?}"
