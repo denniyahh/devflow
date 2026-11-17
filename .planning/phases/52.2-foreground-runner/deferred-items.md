@@ -52,6 +52,7 @@
   status: open
   **What:** `service_e2e::start_launches_a_unit_and_returns_with_the_run_live` (host-only, `--run-ignored only`) fails in its `UnitGuard` drop with `unit devflow-<digest>-81.service was not removed` (`left: "loaded"`, `right: "not-found"`): the guard runs `systemctl --user stop`, then `reset-failed`, then reads `LoadState` once, and the transient unit is sometimes not yet collected. Seen by 52.2-11 in 2 of 6 runs at its head and in 2 of 8 runs at the plan's base `34febac` (built in a scratch worktree), so it predates 52.2-11. The test body's own assertions passed in every run.
   **Why deferred:** found by 52.2-11 outside its files and its subject. Fix shape: poll `LoadState` for `not-found` with a short bound in the guard's drop instead of reading it once. Owner: 52.2-17, the one remaining plan whose files_modified lists `crates/devflow-cli/tests/service_e2e.rs`, else a 999.x entry at phase close.
+  **Seen again (52.2-25):** 2 of 8 runs of `start_launches_a_unit_and_returns_with_the_run_live` during Task 1's gate failed in the guard's drop with the same `was not removed` assertion; the body's assertions passed in every run.
 
 - The unattended-launch shape refusal still names a supervisor
   status: open
@@ -65,10 +66,11 @@
   **Resolution:** the test binds `LaunchedRunReaper::for_home`, and `LaunchedRunReaper::new`, `supervisors_exited_within` and the `__monitor` argv scan are deleted (`rg -n -w -e 'LaunchedRunReaper::new' -e supervisors_exited_within crates/devflow-cli/tests` exits 1).
 
 - Tests and comments still plant or name the agent pid file and `check_dead_agent`
-  status: open (the start_lock_e2e and pipeline_launch.rs halves resolved by 52.2-23, commit c1a95c5; `pipeline_gate.rs:84` remains)
+  status: resolved (52.2-23, commit c1a95c5; the `pipeline_gate.rs:84` half by 52.2-25, commit 2a72c16)
   **What:** after 52.2-26 no verb reads `.devflow/phase-NN-agent-pid` (D-12a), but `start_lock_e2e.rs` still plants it in `plant_leftover_run`, `plant_resumable_run` and `resume_without_phase_state_reports_the_missing_state_not_a_live_run` (inert now: those tests pass on the runner lock and the state alone), and its `50-15` section comment says a fixture's "supervisor socket" refuses. `pipeline_launch.rs:5168` and `pipeline_gate.rs:84` comments name `check_dead_agent`, which 52.2-26 deleted. Found by 52.2-26.
   **Why deferred:** comments and inert fixture writes, no wrong behaviour; `start_lock_e2e.rs` names are 52.2-23 Task 3's (supervisor items in passing tests), and the two source comments are outside 52.2-26's files. Owner: 52.2-23 (its files include `start_lock_e2e.rs` and `pipeline_launch.rs`); `pipeline_gate.rs`'s comment to whichever plan next edits that file, else a 999.x entry at phase close.
   **Partial resolution (52.2-23):** `start_lock_e2e.rs` plants no agent pid file and its section comment names the runner lock; the `pipeline_launch.rs` and `phase7_cli.rs` comments no longer name `check_dead_agent`. `pipeline_gate.rs:84` is outside 52.2-23's files and keeps its owner above.
+  **Resolution (52.2-25):** `transition`'s `--until` stop no longer clears a supervisor record, and the comment that explained the clear (naming `check_dead_agent` and `check_dead_monitor`) now says only why `gate_pending` is cleared. `rg -n check_dead_agent crates` exits 1.
 
 - The stop primitives' own unit tests still live in `supervisor/runtime.rs`
   status: open
@@ -85,3 +87,12 @@
   **What:** 52.2-23 stopped writing `.devflow/phase-NN-prompt` and `phase-NN-monitor.log` (D-09). Both path functions are still public in `crates/devflow-core/src/agent_result.rs`; `monitor_log_path` is read only by monitor tests that assert the file is absent, and `prompt_path` by nothing. Removing them is a published-API removal. Found by 52.2-23.
   **Why deferred:** `agent_result.rs` is outside 52.2-23's files and the two functions are in no group of 52.2-SEMVER-REMOVALS.txt. Owner: 52.2-24 (which already edits devflow-core's remaining per-run file readers), else a 999.x entry at phase close.
 
+- A gates.rs test still describes the deleted ownership fence
+  status: open
+  **What:** after 52.2-25 deleted `workflow::while_owner` and the CLI's `fenced` wrapper, `crates/devflow-core/src/gates.rs`'s `a_fenced_answers_two_gate_waits_reach_the_write_lock_repair_wait` (its doc comment, ~:4386, names `workflow::while_owner` and says a fenced answer holds the write lock across its two gate waits) describes a hold no code makes any more; the test itself still passes, because it counts `Gates::answer`'s two gate-lock acquisitions. The `state_lock_paths("use crate::workflow::update_owned_state;\n")` fixture at ~:4472 is a string, not a call, and still works as a planted control. Found by 52.2-25.
+  **Why deferred:** `gates.rs` is outside 52.2-25's files. Fix shape: reword the doc (or rename the test) to say what it pins now, two gate waits per answer against `WRITE_LOCK_REPAIR_WAIT`, and swap the fixture's item name for one that exists. Owner: 52.2-24, else a 999.x entry at phase close.
+
+- Two readers of `.devflow/supervisor-<id>.live` remain with no writer
+  status: open
+  **What:** since 52.2-25 no build writes a launch reservation file, but `commands.rs`'s `held_launch_and_phase_holders` (doctor's stray-process check) still counts a held `supervisor-*.live` file's holder as reachable, and `recover::unrecorded_live_launches` (verb-only code) still lists them. Both only read leftovers an older build left; neither is wrong. OPERATIONS.md's `.devflow/` table row says no current build writes one. Found by 52.2-25.
+  **Why deferred:** removing the commands.rs reader is outside 52.2-25's named items, and recover.rs's verb-only code is 52.2-24's to delete. Fix shape: 52.2-24 deletes `unrecorded_live_launches` with recover's verb-only code, and drops the `supervisor-` arm of `held_launch_and_phase_holders` (its test `registry_reachable_pids_includes_held_reservation_and_waiter_holders` loses its reservation case), then the OPERATIONS.md row. Else a 999.x entry at phase close.
