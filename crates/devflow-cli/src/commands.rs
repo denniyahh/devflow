@@ -6951,6 +6951,98 @@ mod tests {
     use devflow_core::gates::WaiterRegistration;
     use devflow_core::test_support::{gate_answer_files, with_answer_before_publish};
 
+    /// The names of the removed `recover` verb that D-09a keeps out of production text.
+    const REMOVED_RECOVER_NAMES: [&str; 3] = ["devflow recover", "recover --clean", "`recover`"];
+
+    /// The lines of `source` that name the removed `recover` verb, as `line: text`:
+    /// `source` is cut at its first `mod tests {` line, and a line whose trimmed start
+    /// is `//` is a comment and not counted.
+    fn lines_naming_the_removed_recover_verb(source: &str) -> Vec<String> {
+        source
+            .lines()
+            .enumerate()
+            .take_while(|(_, line)| !line.contains("mod tests {"))
+            .filter(|(_, line)| !line.trim_start().starts_with("//"))
+            .filter(|(_, line)| REMOVED_RECOVER_NAMES.iter().any(|name| line.contains(name)))
+            .map(|(index, line)| format!("{}: {}", index + 1, line.trim()))
+            .collect()
+    }
+
+    /// Every `.rs` file under `dir`, recursively, sorted.
+    fn rust_sources(dir: &Path) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir)
+                .unwrap_or_else(|err| panic!("read {}: {err}", dir.display()))
+            {
+                let path = entry.expect("a source entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    files.push(path);
+                }
+            }
+        }
+        files.sort();
+        files
+    }
+
+    /// D-09a: no production string sends the operator to the removed `recover` verb.
+    /// Scans every source of both crates but devflow-core's `doc_check.rs` (a
+    /// `#[cfg(test)]` module, whose fixtures quote removed verbs). Controls: a planted
+    /// string line counts 1; the same line as a comment, or after a `mod tests {` line,
+    /// counts 0.
+    #[test]
+    fn no_production_string_names_the_removed_recover_verb() {
+        let planted = "    \"run `devflow recover --clean --phase 7` first\"";
+        assert_eq!(
+            lines_naming_the_removed_recover_verb(planted).len(),
+            1,
+            "planted control: a string line naming the verb counts"
+        );
+        let commented = format!("// {}", planted.trim_start());
+        assert_eq!(
+            lines_naming_the_removed_recover_verb(&commented).len(),
+            0,
+            "planted control: a comment does not count"
+        );
+        let in_tests = format!("fn f() {{}}\nmod tests {{\n{planted}\n}}\n");
+        assert_eq!(
+            lines_naming_the_removed_recover_verb(&in_tests).len(),
+            0,
+            "planted control: a line inside the test module does not count"
+        );
+
+        let cli = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let core = Path::new(env!("CARGO_MANIFEST_DIR")).join("../devflow-core/src");
+        let mut files = rust_sources(&cli);
+        files.extend(
+            rust_sources(&core)
+                .into_iter()
+                .filter(|path| path.file_name().is_none_or(|name| name != "doc_check.rs")),
+        );
+        assert!(
+            files.len() > 40 && files.iter().any(|path| path.ends_with("src/commands.rs")),
+            "the scan read too few sources: {files:?}"
+        );
+        let found: Vec<String> = files
+            .iter()
+            .flat_map(|path| {
+                let source = std::fs::read_to_string(path)
+                    .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+                lines_naming_the_removed_recover_verb(&source)
+                    .into_iter()
+                    .map(move |line| format!("{}:{line}", path.display()))
+            })
+            .collect();
+        assert_eq!(
+            found,
+            Vec::<String>::new(),
+            "production lines name the removed `recover` verb"
+        );
+    }
+
     /// D-07 / D-12 as corrected (review agy-1): with the runner lock free, a unit that
     /// still reads `deactivating` is not a live-run refusal for the launch guard or for
     /// discard's liveness read; discard waits on it instead. Control: with the lock
