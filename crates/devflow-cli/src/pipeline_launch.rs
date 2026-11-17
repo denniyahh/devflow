@@ -9679,7 +9679,7 @@ mod tests {
             .collect();
         for expected in [
             "devflow-cli/src/pipeline_gate.rs",
-            "devflow-core/src/recover.rs",
+            "devflow-core/src/workflow.rs",
         ] {
             assert!(
                 labelled.iter().any(|(label, _)| label == expected),

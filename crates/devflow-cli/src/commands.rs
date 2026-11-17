@@ -38,7 +38,6 @@ use devflow_core::history;
 use devflow_core::liveness;
 use devflow_core::mode::Mode;
 use devflow_core::phase_id::PhaseId;
-use devflow_core::recover;
 use devflow_core::registry;
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
@@ -2229,16 +2228,37 @@ fn uncommitted_changes(path: &Path) -> Result<usize, String> {
     Ok(String::from_utf8_lossy(&output.stdout).lines().count())
 }
 
+/// The age of a unix-seconds timestamp, in seconds; `None` when it does not parse
+/// or lies in the future.
+fn state_age_secs(started_at: &str) -> Option<u64> {
+    let started: u64 = started_at.parse().ok()?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    now.checked_sub(started)
+}
+
+/// Format a unix-seconds timestamp's age as a human-readable string ("5m ago"), or
+/// "unknown" when it does not parse. `status` uses it for elapsed time and event
+/// recency, and the gate lines for a gate's age.
+fn format_age(started_at: &str) -> String {
+    match state_age_secs(started_at) {
+        Some(s) if s < 60 => format!("{s}s ago"),
+        Some(s) if s < 3600 => format!("{}m ago", s / 60),
+        Some(s) if s < 86400 => format!("{}h ago", s / 3600),
+        Some(s) => format!("{}d ago", s / 86400),
+        None => "unknown".into(),
+    }
+}
+
 /// `status`'s in-stage progress line: real elapsed time since the phase's
 /// most recent `stage_launched` event. `None` (no such event yet) renders
 /// the stage name with no age, rather than mislabeling phase age as stage
 /// age — never pass `state.started_at`'s age here (3/3 review MEDIUM).
 fn render_stage_progress_line(stage: Stage, stage_launched_ts: Option<u64>) -> String {
     match stage_launched_ts {
-        Some(ts) => format!(
-            "  in stage {stage}: {}",
-            recover::format_age(&ts.to_string())
-        ),
+        Some(ts) => format!("  in stage {stage}: {}", format_age(&ts.to_string())),
         None => format!("  in stage {stage}"),
     }
 }
@@ -2498,7 +2518,7 @@ fn status_state_lines(
     lines.push(format!(
         "  started: {} ({})",
         state.started_at,
-        recover::format_age(&state.started_at)
+        format_age(&state.started_at)
     ));
     lines.extend(status_run_lines(state));
     lines.extend(status_write_lock_line(project_root, state.phase));
@@ -2511,7 +2531,7 @@ fn status_state_lines(
             .event
             .get("ts")
             .and_then(|t| t.as_u64())
-            .map(|t| format!(" ({})", recover::format_age(&t.to_string())))
+            .map(|t| format!(" ({})", format_age(&t.to_string())))
             .unwrap_or_default();
         lines.push(format!(
             "  last action: {}{ago}",
@@ -2549,7 +2569,7 @@ fn render_pending_gate_banner(project_root: &Path, open: &[OpenGate], now: u64) 
         banner.push_str(&format!(
             "{marker}: phase {} {stage} ({})\n  {context}\n{}",
             gate.phase,
-            recover::format_age(&gate.timestamp),
+            format_age(&gate.timestamp),
             banner_answer_lines(project_root, gate),
         ));
     }
@@ -2618,7 +2638,7 @@ fn render_gate_list(open: &[OpenGate]) -> String {
             "\n{:<6} {:<9} {:<9} {:<16} {context}",
             gate.phase,
             gate.stage.to_string(),
-            recover::format_age(&gate.timestamp),
+            format_age(&gate.timestamp),
             printable_gate_id(gate),
         ));
     }
@@ -3538,7 +3558,7 @@ fn render_gate_show(gate: &OpenGate) -> String {
         "phase {} {} ({})\ngate id: {}\n{}",
         gate.phase,
         gate.stage,
-        recover::format_age(&gate.timestamp),
+        format_age(&gate.timestamp),
         printable_gate_id(gate),
         render_gate_context(&gate.context, usize::MAX),
     )
@@ -5180,7 +5200,7 @@ pub(crate) fn registry_reachable_pids(roots: &[PathBuf]) -> HashSet<u32> {
             // `.devflow/` already covers every phase.
             continue;
         }
-        reachable.extend(held_launch_and_phase_holders(root));
+        reachable.extend(held_phase_holders(root));
         reachable.extend(
             Gates::live_waiter_holders(root)
                 .into_iter()
@@ -5190,9 +5210,9 @@ pub(crate) fn registry_reachable_pids(roots: &[PathBuf]) -> HashSet<u32> {
     reachable
 }
 
-/// The pid recorded by each held `.devflow/supervisor-*.live` and `.devflow/.holder-*`
-/// under `root`. A file whose record cannot be read is reported and left out.
-fn held_launch_and_phase_holders(root: &Path) -> Vec<u32> {
+/// The pid recorded by each held `.devflow/.holder-*` under `root`. A file whose record
+/// cannot be read is reported and left out.
+fn held_phase_holders(root: &Path) -> Vec<u32> {
     let Ok(entries) = std::fs::read_dir(root.join(".devflow")) else {
         return Vec::new();
     };
@@ -5201,8 +5221,7 @@ fn held_launch_and_phase_holders(root: &Path) -> Vec<u32> {
         .filter(|entry| {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            (name.starts_with("supervisor-") && name.ends_with(".live"))
-                || name.starts_with(".holder-")
+            name.starts_with(".holder-")
         })
         .filter_map(|entry| match liveness::live_holder(&entry.path()) {
             Ok(holder) => holder.map(|(pid, _start_time)| pid),
@@ -5383,6 +5402,32 @@ mod tests {
     use devflow_core::gates::AnswerRead;
     use devflow_core::gates::WaiterRegistration;
     use devflow_core::test_support::{gate_answer_files, with_answer_before_publish};
+
+    #[test]
+    fn state_age_secs_parses_epoch() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let started = (now - 120).to_string();
+        let age = state_age_secs(&started).expect("age");
+        // Allow a small window for clock drift during the test.
+        assert!((118..=125).contains(&age), "unexpected age: {age}");
+    }
+
+    #[test]
+    fn format_age_buckets_by_magnitude() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let ago = |secs: u64| format_age(&(now - secs).to_string());
+        assert!(ago(30).ends_with("s ago"));
+        assert!(ago(120).ends_with("m ago"));
+        assert!(ago(7200).ends_with("h ago"));
+        assert!(ago(2 * 86400).ends_with("d ago"));
+        assert_eq!(format_age("garbage"), "unknown");
+    }
 
     /// The names of the removed `recover` verb that D-09a keeps out of production text.
     const REMOVED_RECOVER_NAMES: [&str; 3] = ["devflow recover", "recover --clean", "`recover`"];
@@ -7440,10 +7485,11 @@ mod tests {
         }
     }
 
-    /// T-50.1-70: each of the three held files protects its holder from the stray reaper,
-    /// and an unheld one protects nothing.
+    /// T-50.1-70: a held waiter or phase-holder file protects its holder from the stray
+    /// reaper, and an unheld one protects nothing. An older build's held launch reservation
+    /// (`supervisor-*.live`) protects nothing: no current build writes one.
     #[test]
-    fn registry_reachable_pids_includes_held_reservation_and_waiter_holders() {
+    fn registry_reachable_pids_includes_held_waiter_and_holder_files_only() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
         let (phase, stage) = (PhaseId::new(5015), Stage::Code);
@@ -7457,14 +7503,12 @@ mod tests {
         let live_path = root.join(".devflow/supervisor-aaaa0000aaaa5015.live");
         std::fs::create_dir_all(live_path.parent().unwrap()).unwrap();
         let reservation = liveness::Hold::take(&live_path).unwrap();
-        assert!(registry_reachable_pids(roots).contains(&pid), "reservation");
-        drop(reservation);
-        wait_until_unheld(&live_path);
-        assert!(live_path.exists(), "the file outlives its holder");
         assert!(
             !registry_reachable_pids(roots).contains(&pid),
-            "unheld file"
+            "an older build's held launch reservation is not a holder any build reads"
         );
+        drop(reservation);
+        wait_until_unheld(&live_path);
 
         let gate = Gates::open_gate(
             &root,

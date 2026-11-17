@@ -336,8 +336,6 @@ pub(crate) enum CliError {
     #[error(transparent)]
     Workflow(#[from] devflow_core::workflow::WorkflowError),
     #[error(transparent)]
-    Recover(#[from] devflow_core::recover::RecoverError),
-    #[error(transparent)]
     Git(#[from] devflow_core::git::GitError),
     #[error(transparent)]
     Worktree(#[from] devflow_core::worktree::WorktreeError),
