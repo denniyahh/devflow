@@ -5,16 +5,16 @@ milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: "52.2"
 current_phase_name: Foreground Runner
 status: executing
-stopped_at: Completed 52.2-01-PLAN.md
-last_updated: "2026-11-17T03:53:38.798Z"
+stopped_at: Completed 52.2-20-PLAN.md
+last_updated: "2026-11-17T04:05:51.877Z"
 last_activity: 2026-11-16
 last_activity_desc: Phase 52.2 execution started
-state_head: cb4c3739e423d7f3bcd2b4d1d93ba8cae5c03394
+state_head: cf66133be68bbcc89c976a2f9f60fd4eff904898
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 66
-  completed_plans: 41
+  completed_plans: 42
   percent: 17
 ---
 
@@ -172,7 +172,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 52.2 (Foreground Runner) — EXECUTING
-Plan: 2 of 26
+Plan: 3 of 26
 Status: Ready to execute
 Last activity: 2026-11-16 — Phase 52.2 execution started
 
@@ -939,6 +939,7 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 52.2]: 52.2-01: launch_stage_inner keeps its default_stage_prompt render and delegates to prepare_stage_launch; launch_stage_next renders again after preflight
 - [Phase 52.2]: 52.2-01: run_runner engages AutoChainGuard around a stream-shape run_stage and drops it before the advance, as run_monitor does
 - [Phase 52.2]: 52.2-01: service.rs items not yet called carry cfg_attr(not(test), expect(dead_code)) naming 52.2-06, which errors once they are called
+- [Phase 52.2]: 52.2-20: the fake service manager lives in each HermeticHome's service-bin/ and is first on every hermetic_devflow PATH; suites add PATH entries only via HermeticPath::hermetic_path
 
 ## Roadmap Evolution
 
@@ -1091,11 +1092,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 52.1 P06 | 23 min | 2 tasks | 3 files |
 | Phase 52.1 P07 | 50 min | 3 tasks | 5 files |
 | Phase 52.2 P01 | 30 min | 2 tasks | 10 files |
+| Phase 52.2 P20 | 10 min | 2 tasks | 7 files |
 
 ## Session
 
-**Last session:** 2026-11-17T03:53:37.814Z
-**Stopped at:** Completed 52.2-01-PLAN.md
+**Last session:** 2026-11-17T04:05:50.911Z
+**Stopped at:** Completed 52.2-20-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
