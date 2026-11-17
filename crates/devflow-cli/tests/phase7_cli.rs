@@ -186,6 +186,27 @@ fn wait_for_pid(path: &Path) -> u32 {
     panic!("timed out waiting for a pid in {}", path.display());
 }
 
+/// The launch line of an agent stub that records its own pid in `pid_path` and
+/// then becomes `sleep`, so the recorded pid is the hung agent process itself.
+fn recording_sleeper(pid_path: &Path) -> String {
+    format!("echo $$ > '{}'\nexec sleep 30\n", pid_path.display())
+}
+
+/// The runner pid the fake `systemd-run` recorded for `phase`'s unit under
+/// `home`. The unit name is derived from the canonical root, as the binary does
+/// (`service::unit_name`).
+fn recorded_runner_pid(home: &common::HermeticHome, root: &Path, phase: PhaseId) -> Option<u32> {
+    let root = root.canonicalize().ok()?;
+    let unit = format!(
+        "devflow-{:016x}-{}.service",
+        devflow_core::registry::path_digest(&root),
+        phase.padded()
+    );
+    fs::read_to_string(home.service_bin().join(format!("{unit}.pid")))
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+}
+
 /// Wait until a phase's persisted state is cleared (the run was aborted and
 /// `abort` called `clear_state`). 20b's new liveness
 /// guard in `cleanup` correctly refuses to remove a worktree whose monitor
@@ -260,7 +281,7 @@ fn start_defaults_to_worktree() {
             "supervise",
         ],
     );
-    let _reaper = common::LaunchedRunReaper::new(root, PhaseId::new(11), Vec::new());
+    let _reaper = common::LaunchedRunReaper::for_home(&home, root, PhaseId::new(11));
 
     // start returns before the detached monitor finishes; wait for the
     // worktree directory like the other integration tests do.
@@ -338,7 +359,7 @@ fn start_worktree_mode_ignores_main_checkout_divergence() {
             "supervise",
         ],
     );
-    let _reaper = common::LaunchedRunReaper::new(root, PhaseId::new(13), Vec::new());
+    let _reaper = common::LaunchedRunReaper::for_home(&home, root, PhaseId::new(13));
 
     wait_for(&root.join(".worktrees/phase-13"));
     assert!(root.join(".worktrees/phase-13").is_dir());
@@ -381,11 +402,11 @@ fn start_no_worktree_uses_feature_branch() {
             "--no-worktree",
         ],
     );
-    let _reaper = common::LaunchedRunReaper::new(root, PhaseId::new(12), Vec::new());
+    let _reaper = common::LaunchedRunReaper::for_home(&home, root, PhaseId::new(12));
 
-    // start returns before the detached monitor finishes; wait for the
-    // agent pid file that the monitor writes on the feature-branch path.
-    wait_for(&root.join(".devflow/phase-12-agent-pid"));
+    // start returns once its runner unit holds the runner lock (D-11); wait for
+    // the run to settle on the feature-branch path before reading it.
+    let settled = wait_for_settled(root, PhaseId::new(12));
     assert!(!root.join(".worktrees/phase-12").exists());
 
     let state = devflow_core::workflow::load_state(root, PhaseId::new(12)).expect("load state");
@@ -394,10 +415,11 @@ fn start_no_worktree_uses_feature_branch() {
         "expected worktree_path to be None with --no-worktree, got {:?}",
         state.worktree_path
     );
-    // Bind the guard to the SETTLED state (the chain blocks at the Validate
-    // gate in supervise mode — that last monitor is this test's to reap).
-    let settled = wait_for_settled(root, PhaseId::new(12));
-    let _reap = MonitorReapGuard::after_launch(&settled);
+    assert!(
+        settled.worktree_path.is_none(),
+        "the settled run stays on the feature branch: {:?}",
+        settled.worktree_path
+    );
 }
 
 /// 20c (D-09 + review: Codex HIGH off-by-one): `devflow start --until plan`
@@ -442,7 +464,7 @@ fn start_until_plan_halts_cleanly() {
             "plan",
         ],
     );
-    let _reaper = common::LaunchedRunReaper::new(root, PhaseId::new(44), Vec::new());
+    let _reaper = common::LaunchedRunReaper::for_home(&home, root, PhaseId::new(44));
 
     let state = wait_for_stopped(root, PhaseId::new(44));
     let events = fs::read_to_string(devflow_core::events::events_path(root)).unwrap_or_default();
@@ -524,7 +546,7 @@ fn start_phase_44_in_place(home: &common::HermeticHome, root: &Path) -> String {
             "--no-worktree",
         ],
     );
-    let _reaper = common::LaunchedRunReaper::new(root, PhaseId::new(44), Vec::new());
+    let _reaper = common::LaunchedRunReaper::for_home(home, root, PhaseId::new(44));
     let settled = wait_for_settled(root, PhaseId::new(44));
     let _reap = MonitorReapGuard::after_launch(&settled);
     format!(
@@ -1448,7 +1470,7 @@ esac
             "start", "--phase", "8", "--agent", "claude", "--mode", "auto",
         ],
     );
-    let _reaper = common::LaunchedRunReaper::new(root, PhaseId::new(8), Vec::new());
+    let _reaper = common::LaunchedRunReaper::for_home(&home, root, PhaseId::new(8));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("phase 8"));
     assert!(
@@ -2145,7 +2167,7 @@ fn force_start_phase_12(
     root: &Path,
     extra: &[&str],
 ) -> (Output, common::LaunchedRunReaper) {
-    let reaper = common::LaunchedRunReaper::new(root, PhaseId::new(12), Vec::new());
+    let reaper = common::LaunchedRunReaper::for_home(home, root, PhaseId::new(12));
     let fake_bin = fake_bin_dir(&[(
         "codex",
         "#!/bin/sh\nprintf 'DEVFLOW_RESULT: {\"status\":\"success\"}\\n'\n",
@@ -2381,7 +2403,7 @@ fn pi_marker_less_run_does_not_advance() {
             "supervise",
         ],
     );
-    let _reaper = common::LaunchedRunReaper::new(root, PhaseId::new(7), Vec::new());
+    let _reaper = common::LaunchedRunReaper::for_home(&home, root, PhaseId::new(7));
 
     let state = wait_for_gate(root, PhaseId::new(7));
     assert_eq!(
@@ -2417,7 +2439,7 @@ fn pi_nonzero_exit_does_not_advance() {
             "supervise",
         ],
     );
-    let _reaper = common::LaunchedRunReaper::new(root, PhaseId::new(7), Vec::new());
+    let _reaper = common::LaunchedRunReaper::for_home(&home, root, PhaseId::new(7));
 
     let state = wait_for_gate(root, PhaseId::new(7));
     assert_eq!(
@@ -2438,8 +2460,11 @@ fn pi_hung_process_is_detected_not_left_running() {
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
-    let fake_bin = fake_bin_dir(&[("pi", &pi_stub("exec sleep 30\n"))]);
+    let aux = tempfile::tempdir().unwrap();
+    let pid_path = aux.path().join("agent.pid");
+    let fake_bin = fake_bin_dir(&[("pi", &pi_stub(&recording_sleeper(&pid_path)))]);
 
+    let _reaper = common::LaunchedRunReaper::for_home(&home, root, PhaseId::new(7));
     run_devflow(
         &home,
         root,
@@ -2454,9 +2479,7 @@ fn pi_hung_process_is_detected_not_left_running() {
             "supervise",
         ],
     );
-    let _reaper = common::LaunchedRunReaper::new(root, PhaseId::new(7), Vec::new());
 
-    let pid_path = root.join(".devflow/phase-07-agent-pid");
     let pid = wait_for_pid(&pid_path);
 
     // The hung process must be surfaced as alive, not silently reaped or
@@ -2661,7 +2684,7 @@ fn marker_less_antigravity_never_advances() {
             "supervise",
         ],
     );
-    let _reaper = common::LaunchedRunReaper::new(root, PhaseId::new(7), Vec::new());
+    let _reaper = common::LaunchedRunReaper::for_home(&home, root, PhaseId::new(7));
 
     let state = wait_for_gate(root, PhaseId::new(7));
     let _reap = MonitorReapGuard::after_launch(&state);
@@ -2702,7 +2725,7 @@ fn antigravity_parses_devflow_result_from_stream() {
             "plan",
         ],
     );
-    let _reaper = common::LaunchedRunReaper::new(root, PhaseId::new(7), Vec::new());
+    let _reaper = common::LaunchedRunReaper::for_home(&home, root, PhaseId::new(7));
 
     let state = wait_for_stopped(root, PhaseId::new(7));
     let _reap = MonitorReapGuard::after_launch(&state);
@@ -2742,7 +2765,7 @@ fn antigravity_init_without_marker_gates_at_plan() {
             "supervise",
         ],
     );
-    let _reaper = common::LaunchedRunReaper::new(root, PhaseId::new(7), Vec::new());
+    let _reaper = common::LaunchedRunReaper::for_home(&home, root, PhaseId::new(7));
 
     let state = wait_for_gate(root, PhaseId::new(7));
     let _reap = MonitorReapGuard::after_launch(&state);
@@ -2817,22 +2840,22 @@ fn suite_reap_audit() {
     }
 }
 
-/// codex-4: a monitor the suite cannot account for is DETECTABLE. With NO
-/// guard bound, a start leaves its monitor ALIVE; the test registers that
-/// pid by hand — exactly what [`MonitorReapGuard::after_launch`] would have
-/// registered had the test bound a guard — proves the detection helper FAILS
-/// against it (the gate can redden), then reaps and deregisters through the
-/// normal guard.
+/// codex-4: a run process the suite cannot account for is DETECTABLE. A start
+/// leaves its runner ALIVE while its agent hangs; the test registers that pid
+/// by hand, as a guard would have, proves the detection helper FAILS against it
+/// (the gate can redden), then deregisters it and lets the reaper end the
+/// runner.
 #[test]
 fn unguarded_monitor_is_detected_by_the_registry() {
     let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
-    // A HANGING pi keeps the Plan monitor alive past the launch — the
+    // A HANGING pi keeps the runner's Plan stage alive past the launch — the
     // "leaked" shape this control must be able to see.
     let fake_bin = fake_bin_dir(&[("pi", &pi_stub("exec sleep 30\n"))]);
 
+    let _reaper = common::LaunchedRunReaper::for_home(&home, root, PhaseId::new(7));
     run_devflow(
         &home,
         root,
@@ -2847,14 +2870,12 @@ fn unguarded_monitor_is_detected_by_the_registry() {
             "supervise",
         ],
     );
-    let _reaper = common::LaunchedRunReaper::new(root, PhaseId::new(7), Vec::new());
 
-    let state = load_state(root, PhaseId::new(7)).expect("load state");
-    let pid = live_supervisor_pid(&state)
-        .expect("a launched stage must record a supervisor that answers its socket");
+    let pid = recorded_runner_pid(&home, root, PhaseId::new(7))
+        .expect("start launched a runner the fake systemd-run recorded");
     assert!(
-        devflow_core::agent::agent_running(pid),
-        "premise: with no guard the monitor stays alive — nothing reaps it"
+        common::runs_the_runner_verb(pid),
+        "premise: the runner stays alive while its agent hangs — nothing reaps it"
     );
 
     // Simulate what a guard's after_launch would have registered (the leak).
@@ -2863,11 +2884,11 @@ fn unguarded_monitor_is_detected_by_the_registry() {
     let alive = registered_monitors_alive(&registry().lock().unwrap());
     assert!(
         alive.contains(&pid),
-        "a live registered monitor must be detected: {alive:?}"
+        "a live registered runner must be detected: {alive:?}"
     );
 
-    // Clean up through the normal guard: verified reap + deregister.
-    let _reap = MonitorReapGuard::after_launch(&state);
+    // Deregister; the reaper ends the runner when the test returns.
+    registry().lock().unwrap().remove(&pid);
 }
 
 // ---------------------------------------------------------------------------
@@ -2917,7 +2938,7 @@ fn hermes_marker_less_run_does_not_advance() {
             "supervise",
         ],
     );
-    let _reaper = common::LaunchedRunReaper::new(root, PhaseId::new(7), Vec::new());
+    let _reaper = common::LaunchedRunReaper::for_home(&home, root, PhaseId::new(7));
 
     let state = wait_for_gate(root, PhaseId::new(7));
     assert_eq!(
@@ -2955,7 +2976,7 @@ fn hermes_nonzero_exit_does_not_advance() {
             "supervise",
         ],
     );
-    let _reaper = common::LaunchedRunReaper::new(root, PhaseId::new(7), Vec::new());
+    let _reaper = common::LaunchedRunReaper::for_home(&home, root, PhaseId::new(7));
 
     let state = wait_for_gate(root, PhaseId::new(7));
     assert_eq!(
@@ -2975,8 +2996,11 @@ fn hermes_hung_process_is_detected_not_left_running() {
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
-    let fake_bin = fake_bin_dir(&[("hermes", &hermes_stub("exec sleep 30\n"))]);
+    let aux = tempfile::tempdir().unwrap();
+    let pid_path = aux.path().join("agent.pid");
+    let fake_bin = fake_bin_dir(&[("hermes", &hermes_stub(&recording_sleeper(&pid_path)))]);
 
+    let _reaper = common::LaunchedRunReaper::for_home(&home, root, PhaseId::new(7));
     run_devflow(
         &home,
         root,
@@ -2991,9 +3015,7 @@ fn hermes_hung_process_is_detected_not_left_running() {
             "supervise",
         ],
     );
-    let _reaper = common::LaunchedRunReaper::new(root, PhaseId::new(7), Vec::new());
 
-    let pid_path = root.join(".devflow/phase-07-agent-pid");
     let pid = wait_for_pid(&pid_path);
 
     assert!(
@@ -4416,8 +4438,8 @@ fn discard_refuses_while_a_foreground_holder_holds_the_phase() {
         phase,
         &before,
         &[
-            "phase 57 is held by a foreground DevFlow process",
-            &format!("pid {}", std::process::id()),
+            "another DevFlow verb holds phase 57",
+            &format!("(pid {})", std::process::id()),
         ],
     );
     drop(hold);

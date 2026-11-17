@@ -5,7 +5,7 @@
 //!
 //! **Deliberately a separate file from `auto_chain_flag_e2e.rs` (D-02).** That
 //! suite owns the in-stage-error path — `guard_clears_the_flag_when_the_
-//! supervised_child_fails`, driven through `run_monitor`'s `?` early-return.
+//! supervised_child_fails`, an agent that never runs in the runner's Code stage.
 //! This one owns the kill path. Two mechanisms, two separately-named tests, so
 //! a regression in either is attributable rather than masked by the other.
 //! Neither is a combined test.
@@ -30,7 +30,6 @@ use devflow_core::state::{AgentKind, State};
 use devflow_core::workflow::save_state;
 use std::cell::RefCell;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output};
 use std::time::{Duration, Instant};
@@ -123,16 +122,10 @@ fn real_shape_config(active: bool) -> String {
     )
 }
 
-fn write_executable(path: &Path, contents: &str) {
-    fs::write(path, contents).unwrap();
-    let mut perms = fs::metadata(path).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(path, perms).unwrap();
-}
-
-/// The supervised child: record its own pid, then become `sleep` so it holds
-/// the monitor open long enough for this test to kill the monitor out from
-/// under it.
+/// The body of the fake stream-shape `claude` the runner launches for Code: it
+/// answers `--version`, then records its own pid and becomes `sleep`, so it holds
+/// the runner's Code stage open long enough for this test to kill the runner out
+/// from under it.
 ///
 /// `exec` rather than a plain `sleep` call is what keeps the recorded pid
 /// meaningful: without it, `$$` names the shell and `sleep` is a grandchild
@@ -142,9 +135,10 @@ fn write_executable(path: &Path, contents: &str) {
 /// The 30s ceiling is a backstop, not the mechanism — the teardown below kills
 /// this process explicitly. It exists so a test that dies before its teardown
 /// still cannot leave something sleeping indefinitely.
-fn sleeper_script(pid_path: &Path) -> String {
+fn sleeper_body(pid_path: &Path) -> String {
     format!(
-        "#!/bin/sh\nprintf '%s' \"$$\" > '{pid}'\nexec sleep 30\n",
+        "if [ \"$1\" = \"--version\" ]; then echo \"2.1.220 (Claude Code)\"; exit 0; fi\n\
+         printf '%s' \"$$\" > '{pid}'\nexec sleep 30",
         pid = pid_path.display()
     )
 }
@@ -199,12 +193,13 @@ struct Fixture {
     root: PathBuf,
     phase: PhaseId,
     config: PathBuf,
-    prompt_file: PathBuf,
-    script: PathBuf,
+    /// The fake `claude` (the sleeper) a runner from [`Fixture::spawn_runner`]
+    /// launches.
+    agent_bin: common::FakeBin,
     child_pid_file: PathBuf,
     reaper: Reaper,
     /// Every `devflow` child's `HOME` and cache. Declared last so it drops
-    /// after `reaper` has reaped the monitor.
+    /// after `reaper` has reaped the runner.
     home: common::HermeticHome,
 }
 
@@ -230,12 +225,8 @@ impl Fixture {
         state.stopped = false;
         save_state(&state).unwrap();
 
-        let script = aux.path().join("agent.sh");
         let child_pid_file = aux.path().join("child.pid");
-        write_executable(&script, &sleeper_script(&child_pid_file));
-
-        let prompt_file = aux.path().join("prompt.txt");
-        fs::write(&prompt_file, "run the code stage\n").unwrap();
+        let agent_bin = common::fake_bin_dir(&sleeper_body(&child_pid_file));
 
         Self {
             _repo: repo,
@@ -243,68 +234,59 @@ impl Fixture {
             root,
             phase,
             config,
-            prompt_file,
-            script,
+            agent_bin,
             child_pid_file,
             reaper: Reaper::default(),
             home: common::HermeticHome::new(),
         }
     }
 
-    /// Spawn the REAL binary's hidden `__monitor` subcommand supervising the
-    /// sleeper, as a child of this test process so it can be signalled
-    /// directly.
-    fn spawn_monitor(&self) -> Child {
-        // The 3.x `__monitor` argv (50-11): a per-launch id and a socket
-        // under the hermetic cache dir this file's child process gets.
-        let launch_id = devflow_core::supervisor::new_launch_id();
-        let socket = devflow_core::supervisor::SocketPath::for_launch(
-            &self.home.cache_dir(),
-            &self.root,
-            self.phase,
-            &launch_id,
+    /// Commit what an unattended Code launch's preflight reads (one plan with no
+    /// checkpoint) and record a confirmed delivery canary, so a runner over the saved
+    /// Code stage starts its agent instead of stopping at a preflight gate or running
+    /// a canary first.
+    fn make_launchable(&self) {
+        let padded = self.phase.padded();
+        let plan = format!(".planning/phases/{padded}-fixture/{padded}-01-PLAN.md");
+        fs::create_dir_all(self.root.join(format!(".planning/phases/{padded}-fixture"))).unwrap();
+        fs::write(
+            self.root.join(&plan),
+            format!(
+                "---\nphase: {padded}-fixture\nplan: 01\ntype: execute\nautonomous: true\n---\n\n<tasks>\n<task type=\"auto\"><name>stub</name></task>\n</tasks>\n"
+            ),
         )
-        .expect("the hermetic socket path fits sun_path");
-        // The state must record this launch, as a launcher's publish does: this monitor
-        // has no launcher to promote it (D-15).
+        .unwrap();
+        git(&self.root, &["add", &plan]);
+        git(&self.root, &["commit", "-q", "-m", "plan"]);
         devflow_core::workflow::update_state(&self.root, self.phase, |state| {
-            state.supervisor = Some(devflow_core::state::SupervisorRecord::new(
-                socket.as_path().to_path_buf(),
-                launch_id.clone(),
-                4_294_967_000,
-                1,
-                String::new(),
-            ));
+            state.canary = Some(devflow_core::canary::CanaryOutcome::Confirmed);
             Ok::<(), devflow_core::workflow::WorkflowError>(())
         })
         .unwrap();
+    }
+
+    /// Spawn the REAL binary's hidden `__runner` subcommand over the saved Code
+    /// stage, with [`Fixture::agent_bin`] first on its PATH so the Code agent it
+    /// launches is the sleeper, as a child of this test process so it can be
+    /// signalled directly.
+    fn spawn_runner(&self) -> Child {
+        let existing = std::env::var_os("PATH").unwrap_or_default();
         let child = common::hermetic_devflow(&self.home)
-            .arg("__monitor")
+            .hermetic_path(format!(
+                "{}:{}",
+                self.agent_bin.path.display(),
+                existing.to_string_lossy()
+            ))
+            .env_remove("NOTIFY_SOCKET")
+            .current_dir(&self.root)
+            .arg("__runner")
             .arg("--project")
             .arg(&self.root)
             .arg("--phase")
             .arg(self.phase.to_string())
-            .arg("--workdir")
-            .arg(&self.root)
-            .arg("--prompt-file")
-            .arg(&self.prompt_file)
-            .arg("--idle-timeout-secs")
-            // Comfortably above the sleeper's own 30s ceiling, so the idle
-            // timeout can never be what ends this run — the kill below is.
-            .arg("120")
-            .arg("--agent")
-            .arg("claude")
-            .arg("--launch")
-            .arg("stream")
-            .arg("--launch-id")
-            .arg(&launch_id)
-            .arg("--socket")
-            .arg(socket.as_path())
-            .arg("--")
-            .arg("sh")
-            .arg(&self.script)
+            .stdin(std::process::Stdio::null())
             .spawn()
-            .expect("spawn devflow __monitor");
+            .expect("spawn devflow __runner");
         self.reaper.watch(child.id());
         child
     }
@@ -410,8 +392,10 @@ fn auto_chain_flag_survives_sigkill_and_is_repaired_on_the_next_start() {
     let fixture = Fixture::new(false);
     let path_dir = git_only_path();
 
-    let mut monitor = fixture.spawn_monitor();
-    let _run_reaper = common::LaunchedRunReaper::new(&fixture.root, fixture.phase, Vec::new());
+    fixture.make_launchable();
+    let _run_reaper =
+        common::LaunchedRunReaper::for_home(&fixture.home, &fixture.root, fixture.phase);
+    let mut runner = fixture.spawn_runner();
 
     // The fixture must actually engage the guard before anything downstream
     // means anything. A timeout here is "the fixture never set the flag", which
@@ -427,15 +411,15 @@ fn auto_chain_flag_survives_sigkill_and_is_repaired_on_the_next_start() {
     wait_for(
         || fixture.child_pid().is_some(),
         Duration::from_secs(30),
-        "the monitor to spawn the sleeper after setting the chain flag — resume now refuses \
-         over a live recorded agent, so the orphan must be known and terminated before resume",
+        "the runner to spawn the sleeper after setting the chain flag — the orphan must be \
+         known so it can be terminated before resume",
     );
     let child_pid = fixture.child_pid();
 
-    // A real SIGKILL: `Child::kill` sends SIGKILL on Unix. The monitor dies
+    // A real SIGKILL: `Child::kill` sends SIGKILL on Unix. The runner dies
     // with its guard still engaged and no opportunity to run `Drop`.
-    monitor.kill().expect("SIGKILL the monitor");
-    monitor.wait().expect("reap the killed monitor");
+    runner.kill().expect("SIGKILL the runner");
+    runner.wait().expect("reap the killed runner");
 
     // ==================== NEGATIVE CONTROL ====================
     // THE load-bearing assertion of this plan. It proves the leak is real and
@@ -446,7 +430,7 @@ fn auto_chain_flag_survives_sigkill_and_is_repaired_on_the_next_start() {
     assert_eq!(
         fixture.flag_now(),
         "true",
-        "a SIGKILLed monitor must LEAVE the chain flag set — the in-process \
+        "a SIGKILLed runner must LEAVE the chain flag set — the in-process \
          guard's Drop cannot run on a kill, which is the entire reason the \
          force-clear repair exists (35.1 D-01)"
     );
@@ -462,15 +446,6 @@ fn auto_chain_flag_survives_sigkill_and_is_repaired_on_the_next_start() {
             Duration::from_millis(20),
         );
     }
-
-    // The killed monitor's record is only this fixture's way to let it serve (D-15). It
-    // would make `resume` refuse over the STALE socket, which is not what this test is
-    // about, so it goes before the resume.
-    devflow_core::workflow::update_state(&fixture.root, fixture.phase, |state| {
-        state.supervisor = None;
-        Ok::<(), devflow_core::workflow::WorkflowError>(())
-    })
-    .unwrap();
 
     let output = fixture.run_resume(path_dir.path());
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();

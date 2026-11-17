@@ -4,31 +4,32 @@
 //! `checkpoint_handling` only auto-approves an ordinary `gate="blocking"`
 //! checkpoint when `.planning/config.json` reads
 //! `workflow._auto_chain_active: true`. This suite proves the whole mechanism
-//! on one real path: a `Stage::Code`, `Mode::Auto`, pipe-owning-monitor launch
-//! of the real `devflow __monitor` binary.
+//! on one real path: a `Stage::Code`, `Mode::Auto`, pipe-owning (stream) launch
+//! by the real `devflow __runner` binary, started directly over a saved state.
 //!
 //! **The load-bearing measurement is the CHILD's own reading of the config
 //! file while it runs**, written to a file outside the repository. Reading the
-//! config from the test process after the monitor returns would pass even with
+//! config from the test process after the runner returns would pass even with
 //! the guard scoped to the wrong stack frame — that is RESEARCH Pitfall 2, and
 //! it is the entire reason this is an end-to-end test rather than a unit test
 //! of the writer.
 //!
 //! Every `devflow` child is built by `common::hermetic_devflow`, so the
-//! monitor's registry entries land in the fixture's own tempdir `HOME`, never
+//! runner's registry entries land in the fixture's own tempdir `HOME`, never
 //! in the operator's real `~/.cache/devflow` (999.141).
 
 mod common;
 
+use common::HermeticPath;
 use devflow_core::mode::Mode;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
 use devflow_core::workflow::save_state;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Output;
+use std::process::{Child, Command};
+use std::time::Duration;
 
 /// Hermetic git invocation pinned to `root` (999.37) — never a bare
 /// `Command::new("git")`.
@@ -107,9 +108,13 @@ fn real_shape_config(active: bool) -> String {
     )
 }
 
-/// The supervised child: FIRST record the value of
-/// `workflow._auto_chain_active` visible in the config file this process can
-/// see (its cwd is the monitor's `--workdir`), THEN print the success marker.
+/// The Claude top-level result line the observer prints after its observation.
+const SUCCESS_RESULT_LINE: &str = r#"{"type":"result","subtype":"success","is_error":false,"session_id":"s-fake","result":"DEVFLOW_RESULT: {\"status\":\"success\"}"}"#;
+
+/// The body of the fake stream-shape `claude` the runner launches for Code: it
+/// answers `--version`, reads its one stdin turn, FIRST records the value of
+/// `workflow._auto_chain_active` visible in the config file this process can see
+/// (its cwd is the run's project root), THEN prints a successful result line.
 ///
 /// The observation file is written OUTSIDE the repository so it survives any
 /// git operation the pipeline performs, and so it can never be confused with
@@ -118,33 +123,37 @@ fn real_shape_config(active: bool) -> String {
 /// `MISSING` is emitted when the key is absent. That distinction matters: a
 /// `.get()`-style silent default would render an absent key as `false` and make
 /// a broken fixture indistinguishable from a correct negative observation.
-fn observer_script(obs_path: &Path) -> String {
+fn observer_body(obs_path: &Path) -> String {
     format!(
-        "#!/bin/sh\n\
+        "if [ \"$1\" = \"--version\" ]; then echo \"2.1.220 (Claude Code)\"; exit 0; fi\n\
+         IFS= read -r turn\n\
          line=$(grep '\"_auto_chain_active\"' .planning/config.json 2>/dev/null | head -n1)\n\
          if [ -z \"$line\" ]; then\n\
          \x20 printf 'MISSING' > '{obs}'\n\
          else\n\
          \x20 printf '%s' \"$line\" | sed 's/.*: *//; s/[,[:space:]]*$//' > '{obs}'\n\
          fi\n\
-         printf 'DEVFLOW_RESULT: {{\"status\":\"success\"}}\\n'\n",
+         printf '%s\\n' '{SUCCESS_RESULT_LINE}'\n\
+         exit 0",
         obs = obs_path.display()
     )
 }
 
-fn write_executable(path: &Path, contents: &str) {
-    fs::write(path, contents).unwrap();
-    let mut perms = fs::metadata(path).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(path, perms).unwrap();
-}
+/// A fake `claude` the runner finds on its PATH but cannot execute: its
+/// interpreter does not exist, so its exec fails and the agent command exits 127.
+const UNSPAWNABLE_CLAUDE: &str = "#!/definitely-not-a-real-interpreter-35-1-01\n";
 
-/// Which launch, if any, the state records when a monitor starts.
-#[derive(Clone, Copy)]
-enum RecordedLaunch {
-    Ours,
-    Other(&'static str),
-    Nobody,
+/// How long a test waits for a runner halting at the Code boundary to exit.
+const RUNNER_EXIT_WAIT: Duration = Duration::from_secs(60);
+
+/// Owns a spawned `devflow __runner` so a panicking assertion never leaks it:
+/// dropped, it SIGKILLs and reaps the runner if it still runs.
+struct RunnerChild(Child);
+
+impl Drop for RunnerChild {
+    fn drop(&mut self) {
+        common::kill_and_reap(&mut self.0);
+    }
 }
 
 struct Fixture {
@@ -154,8 +163,6 @@ struct Fixture {
     phase: PhaseId,
     config: PathBuf,
     observation: PathBuf,
-    prompt_file: PathBuf,
-    script: PathBuf,
     /// Every `devflow` child's `HOME` and cache. Declared last so it drops
     /// after the rest of the fixture.
     home: common::HermeticHome,
@@ -163,7 +170,7 @@ struct Fixture {
 
 impl Fixture {
     /// Build a Code-stage repo whose persisted state is ready for a
-    /// `__monitor` run in `mode`, with the config flag seeded to
+    /// `__runner` run in `mode`, with the config flag seeded to
     /// `flag_before`.
     fn new(mode: Mode, flag_before: bool) -> Self {
         let repo = tempfile::tempdir().unwrap();
@@ -178,6 +185,21 @@ impl Fixture {
         fs::create_dir_all(&planning).unwrap();
         let config = planning.join("config.json");
         fs::write(&config, real_shape_config(flag_before)).unwrap();
+        // One plan with no checkpoint, committed on the phase branch: what an
+        // unattended Code launch's preflight reads. Without it an auto-mode Code
+        // launch stops at its preflight gate and no agent starts.
+        let padded = phase.padded();
+        let plan = format!(".planning/phases/{padded}-fixture/{padded}-01-PLAN.md");
+        fs::create_dir_all(root.join(format!(".planning/phases/{padded}-fixture"))).unwrap();
+        fs::write(
+            root.join(&plan),
+            format!(
+                "---\nphase: {padded}-fixture\nplan: 01\ntype: execute\nautonomous: true\n---\n\n<tasks>\n<task type=\"auto\"><name>stub</name></task>\n</tasks>\n"
+            ),
+        )
+        .unwrap();
+        git(&root, &["add", &plan]);
+        git(&root, &["commit", "-q", "-m", "plan"]);
 
         let mut state = State::new(phase, AgentKind::Claude, mode, root.clone());
         state.stage = Stage::Code;
@@ -186,14 +208,12 @@ impl Fixture {
         // cleanly once the just-completed stage is the requested stop point.
         state.stop_until = Some(Stage::Code);
         state.stopped = false;
+        // A recorded, confirmed delivery canary: the Code launch runs no canary of
+        // its own, so the fake's one turn is the Code stage's.
+        state.canary = Some(devflow_core::canary::CanaryOutcome::Confirmed);
         save_state(&state).unwrap();
 
         let observation = aux.path().join("child-observation.txt");
-        let script = aux.path().join("agent.sh");
-        write_executable(&script, &observer_script(&observation));
-
-        let prompt_file = aux.path().join("prompt.txt");
-        fs::write(&prompt_file, "run the code stage\n").unwrap();
 
         Self {
             _repo: repo,
@@ -202,79 +222,60 @@ impl Fixture {
             phase,
             config,
             observation,
-            prompt_file,
-            script,
             home: common::HermeticHome::new(),
         }
     }
 
-    /// Run the REAL binary's hidden `__monitor` subcommand over `argv`, with the state
-    /// recording this launch.
-    fn run_monitor(&self, argv: &[&str]) -> Output {
-        self.run_monitor_recording(argv, RecordedLaunch::Ours)
-    }
-
-    /// Run the monitor with the state's record as `recorded` says.
-    fn run_monitor_recording(&self, argv: &[&str], recorded: RecordedLaunch) -> Output {
-        // The 3.x `__monitor` argv (50-11): a per-launch id and a socket
-        // under the hermetic cache dir this file's child process gets.
-        let launch_id = devflow_core::supervisor::new_launch_id();
-        let socket = devflow_core::supervisor::SocketPath::for_launch(
-            &self.home.cache_dir(),
-            &self.root,
-            self.phase,
-            &launch_id,
-        )
-        .expect("the hermetic socket path fits sun_path");
-        // The state must record this launch, as a launcher's publish does: this monitor
-        // has no launcher to promote it (D-15).
-        devflow_core::workflow::update_state(&self.root, self.phase, |state| {
-            state.supervisor = match recorded {
-                RecordedLaunch::Ours => Some(launch_id.clone()),
-                RecordedLaunch::Other(other) => Some(other.to_string()),
-                RecordedLaunch::Nobody => None,
-            }
-            .map(|recorded_id| {
-                devflow_core::state::SupervisorRecord::new(
-                    socket.as_path().to_path_buf(),
-                    recorded_id,
-                    4_294_967_000,
-                    1,
-                    String::new(),
-                )
-            });
-            Ok::<(), devflow_core::workflow::WorkflowError>(())
-        })
-        .unwrap();
-        common::hermetic_devflow(&self.home)
-            .arg("__monitor")
+    /// The REAL binary's hidden `__runner` subcommand over the saved state, with
+    /// `agent_bin` first on its PATH so the Code agent it launches is that dir's
+    /// fake `claude`.
+    fn runner_command(&self, agent_bin: &common::FakeBin) -> Command {
+        let existing = std::env::var_os("PATH").unwrap_or_default();
+        let mut command = common::hermetic_devflow(&self.home);
+        command
+            .hermetic_path(format!(
+                "{}:{}",
+                agent_bin.path.display(),
+                existing.to_string_lossy()
+            ))
+            .env_remove("NOTIFY_SOCKET")
+            .current_dir(&self.root)
+            .arg("__runner")
             .arg("--project")
             .arg(&self.root)
             .arg("--phase")
             .arg(self.phase.to_string())
-            .arg("--workdir")
-            .arg(&self.root)
-            .arg("--prompt-file")
-            .arg(&self.prompt_file)
-            .arg("--idle-timeout-secs")
-            .arg("30")
-            .arg("--agent")
-            .arg("claude")
-            .arg("--launch")
-            .arg("stream")
-            .arg("--launch-id")
-            .arg(&launch_id)
-            .arg("--socket")
-            .arg(socket.as_path())
-            .arg("--")
-            .args(argv)
-            .output()
-            .expect("spawn devflow __monitor")
+            .stdin(std::process::Stdio::null());
+        command
     }
 
-    fn run_observer(&self) -> Output {
-        let script = self.script.to_str().unwrap().to_string();
-        self.run_monitor(&["sh", &script])
+    /// Run the observer as the Code agent and wait, bounded by
+    /// [`RUNNER_EXIT_WAIT`], for the runner to exit. A runner still running then
+    /// fails the test with its stderr and the run's events.
+    fn run_observer(&self) -> std::process::ExitStatus {
+        let agent_bin = common::fake_bin_dir(&observer_body(&self.observation));
+        let stderr = self._aux.path().join("runner.stderr");
+        let mut runner = RunnerChild(
+            self.runner_command(&agent_bin)
+                .stdout(std::process::Stdio::null())
+                .stderr(fs::File::create(&stderr).expect("create the runner's stderr log"))
+                .spawn()
+                .expect("spawn devflow __runner"),
+        );
+        let mut status = None;
+        let waited = std::time::Instant::now();
+        while status.is_none() && waited.elapsed() < RUNNER_EXIT_WAIT {
+            status = runner.0.try_wait().expect("poll the runner");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        status.unwrap_or_else(|| {
+            panic!(
+                "the runner did not exit within {RUNNER_EXIT_WAIT:?}\nstderr:\n{}\nevents:\n{}",
+                fs::read_to_string(&stderr).unwrap_or_default(),
+                fs::read_to_string(devflow_core::events::events_path(&self.root))
+                    .unwrap_or_default()
+            )
+        })
     }
 
     fn child_observed(&self) -> String {
@@ -293,70 +294,31 @@ impl Fixture {
         // quietly render as `false` and agree with a correct negative result.
         value["workflow"]["_auto_chain_active"].to_string()
     }
+
+    /// The `event` lines in the run's event log, parsed.
+    fn events_named(&self, event: &str) -> Vec<serde_json::Value> {
+        let Ok(text) = fs::read_to_string(devflow_core::events::events_path(&self.root)) else {
+            return Vec::new();
+        };
+        text.lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|line| line["event"] == event)
+            .collect()
+    }
 }
 
-/// D-03: the state records another launch, so that run owns the flag. This supervisor ends
-/// its agent and leaves the flag as it stands. Its own engage set it `true` here, and
-/// `auto_mode_code_stage_child_observes_the_flag_set` is the control: a recorded supervisor
-/// clears the same value.
-#[test]
-fn a_superseded_supervisor_leaves_the_flag_to_the_run_that_superseded_it() {
-    let fixture = Fixture::new(Mode::Auto, false);
-
-    let output = fixture.run_monitor_recording(
-        &["sh", "-c", "sleep 30"],
-        RecordedLaunch::Other("bbbb0000bbbb0077"),
-    );
-    let _run_reaper = common::LaunchedRunReaper::new(&fixture.root, fixture.phase, Vec::new());
-    assert!(output.status.success(), "{output:?}");
-
-    assert_eq!(
-        fixture.flag_now(),
-        "true",
-        "restoring the flag could change the run that superseded this one"
-    );
-    assert!(
-        !devflow_core::agent_result::exit_code_path(&fixture.root, fixture.phase).exists(),
-        "a superseded supervisor writes no exit file"
-    );
-}
-
-/// A state that records no launch has no run to disturb, and nothing else would clear the
-/// flag before the next launch, so the supervisor still clears it. It writes no exit file.
-#[test]
-fn a_supervisor_the_state_records_nobody_for_still_clears_the_flag() {
-    let fixture = Fixture::new(Mode::Auto, false);
-
-    let output = fixture.run_monitor_recording(&["sh", "-c", "sleep 30"], RecordedLaunch::Nobody);
-    let _run_reaper = common::LaunchedRunReaper::new(&fixture.root, fixture.phase, Vec::new());
-    assert!(output.status.success(), "{output:?}");
-
-    assert_eq!(fixture.flag_now(), "false");
-    assert!(
-        !devflow_core::agent_result::exit_code_path(&fixture.root, fixture.phase).exists(),
-        "a supervisor the state does not record writes no exit file"
-    );
-}
-
-/// The positive arm. The child — a real process supervised by a real
-/// `devflow __monitor` — reports having seen the chain flag SET while it ran,
-/// and the flag is clear again once that monitor process returns.
+/// The positive arm. The child — a real process the real `devflow __runner`
+/// launched for Code — reports having seen the chain flag SET while it ran, and
+/// the flag is clear again once that runner returns.
 #[test]
 fn auto_mode_code_stage_child_observes_the_flag_set() {
     let fixture = Fixture::new(Mode::Auto, false);
+    let _run_reaper =
+        common::LaunchedRunReaper::for_home(&fixture.home, &fixture.root, fixture.phase);
 
-    let output = fixture.run_observer();
-    // The foreground monitor halts at the Code boundary (`stop_until`), so
-    // it should launch nothing. If that halt ever regresses, the next stage's
-    // detached monitor and agent are reaped here instead of outliving the test.
-    let _run_reaper = common::LaunchedRunReaper::new(&fixture.root, fixture.phase, Vec::new());
-    assert!(
-        output.status.success(),
-        "monitor exited {:?}\nstdout:\n{}\nstderr:\n{}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    // The runner halts at the Code boundary (`stop_until`) and exits 0.
+    let status = fixture.run_observer();
+    assert!(status.success(), "runner exited {status:?}");
 
     assert_eq!(
         fixture.child_observed(),
@@ -368,7 +330,7 @@ fn auto_mode_code_stage_child_observes_the_flag_set() {
     assert_eq!(
         fixture.flag_now(),
         "false",
-        "the guard must clear the flag when the monitor process returns"
+        "the guard must clear the flag when the runner's stage returns"
     );
 }
 
@@ -387,20 +349,13 @@ fn auto_mode_code_stage_child_observes_the_flag_set() {
 #[test]
 fn supervise_mode_code_stage_child_observes_the_flag_clear() {
     let fixture = Fixture::new(Mode::Supervise, false);
+    let _run_reaper =
+        common::LaunchedRunReaper::for_home(&fixture.home, &fixture.root, fixture.phase);
     let before = fs::read(&fixture.config).unwrap();
 
-    let output = fixture.run_observer();
-    // The foreground monitor halts at the Code boundary (`stop_until`), so
-    // it should launch nothing. If that halt ever regresses, the next stage's
-    // detached monitor and agent are reaped here instead of outliving the test.
-    let _run_reaper = common::LaunchedRunReaper::new(&fixture.root, fixture.phase, Vec::new());
-    assert!(
-        output.status.success(),
-        "monitor exited {:?}\nstdout:\n{}\nstderr:\n{}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    // The runner halts at the Code boundary (`stop_until`) and exits 0.
+    let status = fixture.run_observer();
+    assert!(status.success(), "runner exited {status:?}");
 
     assert_eq!(
         fixture.child_observed(),
@@ -417,10 +372,11 @@ fn supervise_mode_code_stage_child_observes_the_flag_clear() {
     );
 }
 
-/// The in-process half of criterion 2: the flag is cleared even when the run
-/// dies before `advance` is ever reached — `run_supervised_stage`'s
-/// early-return `Err` path, driven here by a child program that cannot be
-/// spawned at all. (`35.1-02` owns the kill half.)
+/// The in-process half of criterion 2: the flag is cleared even when the agent
+/// never runs — here a `claude` whose interpreter does not exist, so its exec
+/// fails (exit 127) and the runner fails the Code stage as `agent_unavailable` and
+/// waits at its stage-failure gate. The guard drops when the stage returns, before
+/// that advance. (`35.1-02` owns the kill half.)
 ///
 /// The fixture seeds the flag TRUE so this assertion discriminates. Seeded
 /// `false`, "reads false afterwards" would also be satisfied by a guard that
@@ -428,15 +384,43 @@ fn supervise_mode_code_stage_child_observes_the_flag_clear() {
 #[test]
 fn guard_clears_the_flag_when_the_supervised_child_fails() {
     let fixture = Fixture::new(Mode::Auto, true);
+    let _run_reaper =
+        common::LaunchedRunReaper::for_home(&fixture.home, &fixture.root, fixture.phase);
+    let agent_bin = common::fake_bin_dir("");
+    fs::write(agent_bin.path.join("claude"), UNSPAWNABLE_CLAUDE).unwrap();
+    let stderr = fixture._aux.path().join("runner.stderr");
 
-    let output = fixture.run_monitor(&["definitely-not-a-real-program-35-1-01"]);
-    // The foreground monitor halts at the Code boundary (`stop_until`), so
-    // it should launch nothing. If that halt ever regresses, the next stage's
-    // detached monitor and agent are reaped here instead of outliving the test.
-    let _run_reaper = common::LaunchedRunReaper::new(&fixture.root, fixture.phase, Vec::new());
-    assert!(
-        !output.status.success(),
-        "a child that cannot be spawned must fail the monitor, not pass silently"
+    // The failed stage opens a gate the runner then waits on, so the test reads
+    // the flag once that gate has fired and ends the runner itself.
+    let _runner = RunnerChild(
+        fixture
+            .runner_command(&agent_bin)
+            .stdout(std::process::Stdio::null())
+            .stderr(fs::File::create(&stderr).expect("create the runner's stderr log"))
+            .spawn()
+            .expect("spawn devflow __runner"),
+    );
+    let waited = std::time::Instant::now();
+    while fixture.events_named("gate_fired").is_empty() {
+        assert!(
+            waited.elapsed() < RUNNER_EXIT_WAIT,
+            "the runner opened no gate for the failed Code agent within {RUNNER_EXIT_WAIT:?}\nstderr:\n{}\n\
+             events:\n{}",
+            fs::read_to_string(&stderr).unwrap_or_default(),
+            fs::read_to_string(devflow_core::events::events_path(&fixture.root))
+                .unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let evaluated = fixture.events_named("advance_evaluated");
+    assert_eq!(
+        evaluated.len(),
+        1,
+        "the failed Code stage is evaluated once: {evaluated:?}"
+    );
+    assert_eq!(
+        evaluated[0]["status"], "agent_unavailable",
+        "a child that cannot be executed must fail the stage as unavailable: {evaluated:?}"
     );
 
     assert_eq!(
