@@ -418,6 +418,12 @@ pub(crate) fn end_group_while_running(token: &StopToken, pgid: u32) -> AgentGrou
 /// (50-26, WR-03), which ends the stream at the agent's exit without
 /// reaping it.
 pub(crate) fn wait_for_exit_without_reaping(pid: u32) -> io::Result<()> {
+    wait_without_reaping(pid).map(|_| ())
+}
+
+/// [`wait_for_exit_without_reaping`], returning how `pid` ended, read from the
+/// unreaped child's `siginfo_t`.
+fn wait_without_reaping(pid: u32) -> io::Result<AgentEnd> {
     let id = libc::id_t::from(pid);
     loop {
         // SAFETY: an all-zero siginfo_t is a valid out-parameter for waitid.
@@ -432,11 +438,91 @@ pub(crate) fn wait_for_exit_without_reaping(pid: u32) -> io::Result<()> {
             )
         };
         if rc == 0 {
-            return Ok(());
+            return Ok(agent_end(&info));
         }
         let error = io::Error::last_os_error();
         if error.kind() != io::ErrorKind::Interrupted {
             return Err(error);
+        }
+    }
+}
+
+/// How an agent ended, as `waitid` reported it before the reap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentEnd {
+    /// A normal exit with this code.
+    Exited(i32),
+    /// A death by this signal.
+    Signalled(i32),
+    /// Not read on this target.
+    Unknown,
+}
+
+#[cfg(target_os = "linux")]
+fn agent_end(info: &libc::siginfo_t) -> AgentEnd {
+    // SAFETY: `waitid` returned 0 for a WEXITED wait, so `info` describes a child's
+    // exit and its `si_status` is set.
+    let status = unsafe { info.si_status() };
+    match info.si_code {
+        libc::CLD_EXITED => AgentEnd::Exited(status),
+        libc::CLD_KILLED | libc::CLD_DUMPED => AgentEnd::Signalled(status),
+        _ => AgentEnd::Unknown,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn agent_end(_info: &libc::siginfo_t) -> AgentEnd {
+    AgentEnd::Unknown
+}
+
+/// How long the runner waits, after its agent ended the way a stop ends it, for its own
+/// stop signal to arrive before it classifies the stage (D-04b). Under
+/// `KillMode=control-group` systemd SIGTERMs the agent and the runner together, so the
+/// agent may end first.
+const STOP_SIGNAL_GRACE: Duration = Duration::from_millis(500);
+
+/// The exit code of an agent that traps SIGTERM and exits as the shell convention says.
+const SIGTERM_EXIT_CODE: i32 = 128 + libc::SIGTERM;
+/// The exit code of an agent that traps SIGINT and exits as the shell convention says.
+const SIGINT_EXIT_CODE: i32 = 128 + libc::SIGINT;
+
+/// Whether `end` is how a stop's SIGTERM or SIGINT ends an agent: a death by either, or a
+/// normal exit with `128 +` either (review r2 codex-4: an agent that traps the signal).
+fn looks_like_a_stop(end: AgentEnd) -> bool {
+    match end {
+        AgentEnd::Signalled(signal) => signal == libc::SIGTERM || signal == libc::SIGINT,
+        AgentEnd::Exited(code) => code == SIGTERM_EXIT_CODE || code == SIGINT_EXIT_CODE,
+        AgentEnd::Unknown => false,
+    }
+}
+
+/// Under the owner lock: request the stop for a signal the handler caught that the
+/// dispatcher has not turned into one yet, and say whether a stop is requested. The
+/// handler stores the signal number before it writes the pipe byte, so this sees a
+/// signal the dispatcher has not read.
+fn adopt_caught_stop(token: &StopToken) -> bool {
+    let mut state = token.lock();
+    if !state.stop_requested
+        && let Some(signal) = caught_stop_signal()
+    {
+        request_stop_locked(&mut state, StopSource::Signal(signal));
+    }
+    state.stop_requested
+}
+
+/// Drain-then-classify (D-04b): before the exit decision, take this process's own
+/// pending stop signal, and when the agent ended the way a stop ends it, wait up to
+/// [`STOP_SIGNAL_GRACE`] for that signal. An agent that ends this way with no stop
+/// arriving in the grace is classified as it ended.
+fn take_a_pending_stop(token: &StopToken, end: AgentEnd) {
+    if adopt_caught_stop(token) || !looks_like_a_stop(end) {
+        return;
+    }
+    let deadline = std::time::Instant::now() + STOP_SIGNAL_GRACE;
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(crate::agent::TERMINATE_VERIFY_POLL);
+        if adopt_caught_stop(token) {
+            return;
         }
     }
 }
@@ -613,13 +699,16 @@ fn cloexec_nonblocking_pipe() -> io::Result<[libc::c_int; 2]> {
 }
 
 /// [`Supervisor::wait_agent`] for an agent no supervisor serves: block until `child`,
-/// which leads its own group `pgid`, exits, then decide and reap it under `token`.
+/// which leads its own group `pgid`, exits, take a pending stop of this process's own
+/// ([`take_a_pending_stop`]), then decide and reap it under `token`. The wait runs on the
+/// caller's thread.
 pub(crate) fn wait_owned_agent(
     token: &StopToken,
     pgid: u32,
     child: &mut std::process::Child,
 ) -> io::Result<AgentOutcome> {
-    wait_for_exit_without_reaping(child.id())?;
+    let end = wait_without_reaping(child.id())?;
+    take_a_pending_stop(token, end);
     observe_agent_exit(token, pgid, child)
 }
 
