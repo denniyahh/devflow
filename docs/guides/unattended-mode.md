@@ -32,6 +32,26 @@ specifically to resolve a `blocking-human` gate after a human has approved the
 parked preflight gate. A phase whose plans declare one is otherwise refused
 before it starts — see the next section.
 
+## Walking away: the run is a user unit
+
+`devflow start` launches the run as a systemd user unit named from the project
+and the phase, and returns once the unit is ready, so closing your shell does
+not end the run. Watch it with `devflow logs --phase N -f` and `devflow
+status`, answer its gates with `devflow gate approve` or `devflow gate reject`
+from any shell, and end it with `devflow stop --phase N`, which stops the
+unit.
+
+Two conditions on the host decide whether a run can outlive your session:
+
+- **Lingering.** Without lingering, systemd ends your user manager when you
+  log out, and the run ends with it. `start` and `resume` warn when lingering
+  is off and launch anyway. Run `loginctl enable-linger` before a run you mean
+  to leave past logout.
+- **A user manager.** On a host where no systemd user manager runs for you, or
+  where this shell cannot reach it (`XDG_RUNTIME_DIR` unset or not your own),
+  `start` and `resume` refuse with systemctl's error and write nothing. There
+  is no fallback launch.
+
 ## Before you start: what the preflight checks
 
 An unattended launch is checked before any agent is spawned. Three conditions
