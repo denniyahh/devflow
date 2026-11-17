@@ -16,8 +16,8 @@ pi install npm:@bacnh85/pi-subagent
 This makes a `subagent` tool available to Pi sessions. The extension is
 synchronous and in-process: its `execute()` awaits its children, so the parent
 `pi -p --no-approve` process stays alive until subagents finish, then emits the
-`DEVFLOW_RESULT` marker and exits. `MonitorLaunch::Legacy` process-exit
-supervision observes it — **no drain gate, no `PipeOwning`**.
+`DEVFLOW_RESULT` marker and exits. Pi's stage runs in the capture shape, and
+DevFlow observes that process's exit, with **no drain gate**.
 
 ## Capability detection
 

@@ -136,7 +136,7 @@ gate wait (D-08):
   not measured: two socket probes at 8 s, or a 6 s probe that finds a dead group, the
   2 s wait for a supervisor exiting, then an 8 s probe. A missing or unloadable state
   instead probes each socket left for the phase, up to 8 s each. The file is never replaced or removed, because a `flock`
-  belongs to an inode. Repair verbs (`devflow stop`, `devflow recover --clean`)
+  belongs to an inode. Repair verbs (`devflow recover --clean`)
   wait at most `WRITE_LOCK_REPAIR_WAIT` (10 s), then name the holder and write
   nothing, so a hold that long costs them a refusal, not a hang.
 - **Launch reservation** (`state.pending_supervisor` and
@@ -150,9 +150,11 @@ gate wait (D-08):
   few file operations at a time (at most `GATE_LOCK_WAIT`, 5 s) and is never
   removed.
 - **Foreground holder** (`.devflow/.holder-{phase:02}`, `liveness.rs`) — held for
-  its lifetime by a `start`/`resume` before its spawn or a hand-run
-  `devflow advance`, recording its pid and start time. It is the only pid
-  `devflow stop` signals, and only when the holder's start time still matches.
+  its lifetime by a foreground verb (`start` and `resume` until `systemd-run`
+  returns, `discard`, a hand-run `devflow advance`), recording its pid and start
+  time, so no two of them act on the phase at once. It installs no stop handler:
+  `devflow stop` never signals it, and refuses while it is held and no runner is
+  live.
 - **Runner lock** (`.devflow/.runner-{phase:02}`, `liveness.rs`) — the foreground
   runner (`devflow runner`, registered as the hidden `__runner` subcommand, which a
   `systemd-run --user` unit runs) takes it before anything else and holds it for its
@@ -246,8 +248,8 @@ stop at least once a second, one of two ways:
   on the gate. A stop accepted in the same second as an answer wins.
 - **Anywhere else** (no stop token: the hidden `devflow advance` run from a
   shell, or a gate a foreground command fires): the foreground holder's stop flag
-  is checked instead, so `devflow stop`'s signal ends the wait the same way (safe
-  point 4).
+  is checked instead (safe point 4). `devflow stop` signals no holder; it stops
+  the run's unit ([Runner unit](#runner-unit)).
 
 A file in the slot that does not bind to the gate is set aside and the wait goes
 on with the time left. Either wait ends when a bound answer appears or
@@ -261,6 +263,33 @@ fields, never its note: `abort: true` is `Abort(reason)`, an approval is
 `Advance`, and any other rejection is `LoopBack(Code)`. `devflow gate list`
 (`Gates::list_open()`) enumerates requests with no answer bound to them yet,
 skipping unparsable entries rather than failing.
+
+## Runner unit
+
+Every run is one systemd user unit, `devflow-<digest>-NN.service`
+(`service::unit_name`; the digest is `registry::path_digest` over the canonical
+project root), and that unit replaces the detached supervisor for launching and
+stopping a run. `devflow start` and `devflow resume` check that the user
+manager answers (`service::manager_available`), hold the phase's foreground
+holder through the launch, and run `systemd-run --user`
+(`service::launch_runner_unit`). The unit is `Type=notify` with
+`KillMode=control-group` and `TimeoutStopSec=10s`, and is collected when it
+ends. It runs the hidden `__runner` subcommand in the project root, with the
+caller's environment passed by name (`--setenv NAME`, so no value reaches a
+command line). `systemd-run` returns once the runner holds its runner lock and
+has sent `READY=1`; a failed start names the unit and `systemd-run`'s stderr.
+The runner runs each stage's agent through `monitor::run_stage`, waits at gates
+and advances in-process until the run finishes, stops or fails.
+
+`devflow stop` (`commands::stop`) stops the unit with `systemctl --user stop`.
+The manager signals the unit's whole control group, so the agent ends with the
+runner, and the runner records `stopped` itself; `stop` then reads the state to
+say how the run ended (`commands::stop_outcome`). It signals no pid and writes
+no state. Without lingering (`service::lingering_enabled`) the user manager,
+and every unit under it, ends at logout: `start` and `resume` warn and launch
+anyway. With no answering user manager neither launches, and there is no
+fallback launch without a unit (D-03). The per-stage supervisor that the
+section below describes is what this unit replaced for launch and stop.
 
 ## Monitor daemon
 
@@ -340,7 +369,7 @@ them; integrating the branch is the operator's step. `finish_run()` takes a
 `FinishPermit`, which only `can_finish` makes: GSD's fresh status is `passed`
 and the run's Validate agent PASS is recorded on the current commit over a
 clean tree (D-45, D-46). A permitted finish wins over a late `devflow stop`,
-which the supervisor answers `already_finished`.
+which then reports that the run had already finished.
 
 ## Configuration
 
