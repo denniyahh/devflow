@@ -787,6 +787,33 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.243: A Stale, Empty Worktree `index.lock` Blocks `git add` During Phase Work (BACKLOG)
+
+**Found:** 2026-11-17, Phase 52.2 (52.2-15's executor once; the review-fix pass twice).
+**Defect:** a 0-byte `.git/worktrees/phase-52.2/index.lock` appeared during agent edits and stayed with no git process
+holding it (about 80 seconds in the first case), so `git add` failed until it was deleted by hand.
+**Not established:** what creates it. Guesses, unverified: the operator's graphify auto-refresh post-commit hook, or an
+editor/LSP git integration racing the agent's commit.
+**Bypass used:** the agent deleted the lock after confirming no git process ran (recorded in 52.2-15-SUMMARY and the
+review-fix report). **Fix shape (not decided):** reproduce with `inotifywait` on the lock path during a commit to find the
+writer, then fix that writer. **Owner:** a fix branch, or the hooks research after 52.1.
+
+### Phase 999.242: `service_e2e` Fails Intermittently: a Stopped Unit Reads `failed` (BACKLOG)
+
+**Found:** 2026-11-17, Phase 52.2 close-out, during `scripts/check.sh service` after the review fixes.
+**Defect:** `service_e2e::stop_on_a_live_unit_records_stopped` intermittently sees the unit `failed` instead of `inactive`
+after `stop` (`service_e2e.rs:855`, "the unit is not inactive after stop"). Once,
+`discard_waits_for_a_straggler_in_a_deactivating_unit` failed in the same suite (its failure text was not kept); alone it
+passed 3/3.
+**Evidence:** whole-suite runs (`cargo nextest run -p devflow --test service_e2e --run-ignored only --retries 0`): at
+494ee11 (before the review fixes) 5 of 6 passed, the failure being this test; at bf0baca (after them) 8 of 10 passed.
+So it predates the fixes; 16 runs cannot rule out a change in rate.
+**Not established:** why the runner unit ends `failed`, e.g. the runner's exit status on SIGTERM racing
+`SuccessExitStatus`, or the stop landing before the runner installs its handler.
+**Fix shape (not decided):** record the unit's `Result`/`ExecMainStatus` in the assertion message, reproduce under a
+repeat loop, then fix the exit-status path or the unit's `SuccessExitStatus`. **Owner:** the next fix branch, before
+dogfooding relies on `stop`.
+
 ### Phase 999.241: `start` Should Warn or Refuse Up Front When GSD's Derived Files Are Not Ignored (BACKLOG)
 
 **Found:** 2026-11-17, Phase 52.2 plan 52.2-19, from 999.238 (enhancement, not a defect in shipped behaviour).
