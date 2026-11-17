@@ -459,13 +459,9 @@ impl StartFixture {
         .is_ok_and(|held| held == devflow_core::liveness::Held::Live)
     }
 
-    /// Whether the state names no reservation: absent, or loaded with none.
+    /// Whether no launch reservation is left: no `.devflow/supervisor-*.live` file.
     fn reservation_free(&self) -> bool {
-        match devflow_core::workflow::load_state(&self.root, self.phase) {
-            Ok(state) => state.pending_supervisor.is_none(),
-            Err(devflow_core::workflow::WorkflowError::MissingState(_)) => true,
-            Err(_) => false,
-        }
+        common::no_reservation_file(&self.root)
     }
 }
 

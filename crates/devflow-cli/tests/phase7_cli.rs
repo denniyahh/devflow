@@ -119,46 +119,6 @@ fn run_devflow(home: &common::HermeticHome, root: &Path, fake_bin: &Path, args: 
     output
 }
 
-/// Suite-level registry of monitor PIDs the tests' `MonitorReapGuard`s are
-/// responsible for (41-02 Task 1, codex-4).
-///
-/// Populated by [`MonitorReapGuard::after_launch`] (the pid the guard will
-/// reap — the SETTLED-state monitor, not the first-stage one), and drained by
-/// the guard's `Drop` after the verified reap. The suite audit asserts the
-/// registry is EMPTY once every bound guard has dropped — so an empty
-/// registry means "every monitor a test was responsible for was verified
-/// reaped", which is the claim HYG-01 makes. An unguarded test registers
-/// nothing and is therefore not what the registry detects; what it does
-/// detect is a guard that bound but failed to reap (its pid stays registered
-/// and alive), which `registered_monitors_alive` proves it can see.
-static REGISTRY: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u32>>> =
-    std::sync::OnceLock::new();
-
-fn registry() -> &'static std::sync::Mutex<std::collections::HashSet<u32>> {
-    REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
-}
-
-/// Count of bound-but-not-yet-dropped `MonitorReapGuard`s — the suite audit's
-/// ordering barrier: the audit waits for this to reach 0 so it cannot race a
-/// still-running test into a false empty.
-static ACTIVE_GUARDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// Count of verified reaps performed by the suite's guards. The audit requires
-/// this to be > 0 so an empty registry cannot be a vacuous "nothing ran" pass.
-static REAPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// The suite-audit detection helper (codex-4): which registered PIDs are
-/// still alive? Pure over the registry so it can be unit-tested to FAIL
-/// against a deliberately-alive registered PID — the audit must be able to
-/// redden, or a per-test guard that can never be wrong proves nothing.
-fn registered_monitors_alive(registry: &std::collections::HashSet<u32>) -> Vec<u32> {
-    registry
-        .iter()
-        .copied()
-        .filter(|pid| devflow_core::agent::agent_running(*pid))
-        .collect()
-}
-
 fn wait_for(path: &Path) {
     for _ in 0..200 {
         if path.exists() {
@@ -190,21 +150,6 @@ fn wait_for_pid(path: &Path) -> u32 {
 /// then becomes `sleep`, so the recorded pid is the hung agent process itself.
 fn recording_sleeper(pid_path: &Path) -> String {
     format!("echo $$ > '{}'\nexec sleep 30\n", pid_path.display())
-}
-
-/// The runner pid the fake `systemd-run` recorded for `phase`'s unit under
-/// `home`. The unit name is derived from the canonical root, as the binary does
-/// (`service::unit_name`).
-fn recorded_runner_pid(home: &common::HermeticHome, root: &Path, phase: PhaseId) -> Option<u32> {
-    let root = root.canonicalize().ok()?;
-    let unit = format!(
-        "devflow-{:016x}-{}.service",
-        devflow_core::registry::path_digest(&root),
-        phase.padded()
-    );
-    fs::read_to_string(home.service_bin().join(format!("{unit}.pid")))
-        .ok()
-        .and_then(|text| text.trim().parse().ok())
 }
 
 /// Wait until a phase's persisted state is cleared (the run was aborted and
@@ -306,11 +251,8 @@ fn start_defaults_to_worktree() {
         "expected worktree_path to be Some(_) by default, got {:?}",
         state.worktree_path
     );
-    // Bind the guard to the SETTLED state: the chain advances through the
-    // supervise stages and blocks at the Validate gate; that last monitor is
-    // the one this test must reap (HYG-01).
-    let settled = wait_for_settled(root, PhaseId::new(11));
-    let _reap = MonitorReapGuard::after_launch(&settled);
+    // Wait for the run to settle at the Validate gate before the reaper ends it.
+    wait_for_settled(root, PhaseId::new(11));
 }
 
 /// WR-10 (13-REVIEW.md): the pre-start divergence check must not inspect the
@@ -376,10 +318,8 @@ fn start_worktree_mode_ignores_main_checkout_divergence() {
     wait_for(&root.join(".worktrees/phase-13"));
     assert!(root.join(".worktrees/phase-13").is_dir());
 
-    // Bind the guard to the SETTLED state (the chain blocks at the Validate
-    // gate in supervise mode — that last monitor is this test's to reap).
-    let settled = wait_for_settled(root, PhaseId::new(13));
-    let _reap = MonitorReapGuard::after_launch(&settled);
+    // Wait for the run to settle at the Validate gate before the reaper ends it.
+    wait_for_settled(root, PhaseId::new(13));
 }
 
 #[test]
@@ -493,18 +433,10 @@ fn start_until_plan_halts_cleanly() {
          before the halt — not that the pipeline stopped before Plan ever launched"
     );
     assert!(state.stopped, "stop marker must be set");
-    assert_eq!(
-        state.supervisor, None,
-        "the stop path must clear the supervisor record so no monitor is left behind"
-    );
     assert!(
         state.stop_reason.is_some(),
         "a human-readable stop_reason must be recorded"
     );
-    // The stop path cleared the supervisor record; the guard still binds (no-op) so
-    // every monitor-spawning test in this file follows the same teardown
-    // shape (41-02 Task 1 systematic pass).
-    let _reap = MonitorReapGuard::after_launch(&state);
 }
 
 /// [`init_repo`]'s committed GSD config as GSD's `config-set` rewrites it the
@@ -559,8 +491,7 @@ fn start_phase_44_in_place(home: &common::HermeticHome, root: &Path) -> String {
         ],
     );
     let _reaper = common::LaunchedRunReaper::for_home(home, root, PhaseId::new(44));
-    let settled = wait_for_settled(root, PhaseId::new(44));
-    let _reap = MonitorReapGuard::after_launch(&settled);
+    wait_for_settled(root, PhaseId::new(44));
     format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -1526,13 +1457,6 @@ esac
         "the Code launch must have run the delivery canary and confirmed it\n{events}"
     );
 
-    // HYG-01 (41-02 review finding): `start --phase 8` spawned a monitor that
-    // now blocks at the Validate gate. Bind a guard so the monitor is
-    // verified-reaped on EVERY exit path — the `gate abort` teardown below is
-    // the happy path, not a substitute for the guard.
-    let settled = load_state(root, PhaseId::new(8)).expect("load state");
-    let _reap = MonitorReapGuard::after_launch(&settled);
-
     run_devflow(
         &home,
         root,
@@ -1610,9 +1534,8 @@ fn start_codex_without_context_fails_preflight() {
 /// design — `Liveness::Unknown` with `agent_alive == false` sails straight
 /// through the live-agent refusal, so an ordinary `devflow cleanup` (no
 /// `--force`) must not delete the worktree of a phase the operator parked
-/// for a later `devflow resume`. `doctor`'s `check_dead_agent`/
-/// `check_dead_monitor` were already taught about `facts.stopped` in this
-/// same phase; `cleanup` must recognize `state.stopped` too.
+/// for a later `devflow resume`. `doctor`'s runner check skips a stopped
+/// phase too; `cleanup` must recognize `state.stopped`.
 #[test]
 fn cleanup_keeps_worktree_for_until_stopped_phase_without_force() {
     let home = common::HermeticHome::new();
@@ -2158,8 +2081,7 @@ fn cleanup_is_idempotent_when_worktree_already_removed() {
         .join(format!("phase-{padded}", padded = phase.padded()));
     devflow_core::worktree::add(root, &wt_path, &branch, &branch, false).unwrap();
 
-    // Dead agent, dead monitor (a supervisor record whose socket does not
-    // exist, so the probe reads GONE) — a genuinely dead phase, safe for
+    // No runner holds the phase's runner lock: a genuinely dead phase, safe for
     // cleanup to proceed.
     let mut state = devflow_core::state::State::new(
         phase,
@@ -2168,13 +2090,6 @@ fn cleanup_is_idempotent_when_worktree_already_removed() {
         root.to_path_buf(),
     );
     state.worktree_path = Some(wt_path.clone());
-    state.supervisor = Some(devflow_core::state::SupervisorRecord::new(
-        root.join("dead-monitor-never-bound.sock"),
-        "deadmonitor00000".to_string(),
-        0x7FFF_FFFE,
-        1,
-        String::new(),
-    ));
     devflow_core::workflow::save_state(&state).unwrap();
 
     let fake_bin = fake_bin_dir(&[]);
@@ -2228,10 +2143,7 @@ fn pi_stub(launch: &str) -> String {
 /// detached monitor chain advances asynchronously.
 /// Wait until a phase's chain settles in a state the tests can reap from:
 /// either the never-silent gate fired (`gate_pending`) or the machine
-/// stopped (`--until` / completion). Returns that state — whose
-/// `supervisor` record names the LAST monitor the chain spawned, the one a
-/// `MonitorReapGuard` must capture (a guard bound to an early state read
-/// reaps an already-exited pid and leaks the gate-waiting monitor, HYG-01).
+/// stopped (`--until` / completion). Returns that state.
 fn wait_for_settled(root: &Path, phase: PhaseId) -> devflow_core::state::State {
     for _ in 0..400 {
         if let Ok(state) = load_state(root, phase)
@@ -2291,7 +2203,6 @@ fn pi_marker_less_run_does_not_advance() {
         "a marker-less run must not advance past the commit-gated Plan stage"
     );
     assert!(state.gate_pending, "the never-silent gate must have fired");
-    let _reap = MonitorReapGuard::after_launch(&state);
 }
 
 /// A Pi run that exits non-zero must not advance its stage: the failed exit is
@@ -2327,7 +2238,6 @@ fn pi_nonzero_exit_does_not_advance() {
         "a non-zero-exit run must not advance its stage"
     );
     assert!(state.gate_pending, "the never-silent gate must have fired");
-    let _reap = MonitorReapGuard::after_launch(&state);
 }
 
 /// A hung Pi process (never exits) is surfaced as alive by monitor liveness —
@@ -2394,7 +2304,6 @@ fn pi_hung_process_is_detected_not_left_running() {
         Stage::Plan,
         "a hung-then-killed run must not advance its stage"
     );
-    let _reap = MonitorReapGuard::after_launch(&gated);
 }
 
 // ---------------------------------------------------------------------------
@@ -2461,83 +2370,6 @@ enum StubMode {
     InitOnly,
 }
 
-/// Reap the detached `__monitor` wrapper a `devflow start` run left behind
-/// (phase 41 Task 8, antigravity notice (a)): the integration-suite analogue
-/// of the binary crate's `ReapMonitorOnDrop`, built on the PUBLIC
-/// `devflow_core::agent` surface (integration tests cannot reach
-/// `devflow-cli`'s test_support). TERM->KILL escalation with VERIFIED death,
-/// keyed to the pid of the supervisor `state.supervisor` records (read from
-/// its socket by [`live_supervisor_pid`]), bound strictly after the final
-/// `&mut State` use. 41-02 Task 1 turns this into the systematic pass.
-struct MonitorReapGuard {
-    pid: Option<u32>,
-}
-
-/// The pid of the supervisor `state` records, from its socket's ping reply.
-/// The state carries no monitor pid (50-22); before that field went, it held
-/// this same pid. `None` when the state has no record or its socket does not
-/// answer as alive: nothing is left for a guard to reap.
-fn live_supervisor_pid(state: &devflow_core::state::State) -> Option<u32> {
-    let record = state.supervisor.as_ref()?;
-    match devflow_core::supervisor::probe(&record.socket_path) {
-        Ok(devflow_core::supervisor::Liveness::Alive(reply)) => Some(reply.supervisor_pid),
-        _ => None,
-    }
-}
-
-impl MonitorReapGuard {
-    fn after_launch(state: &devflow_core::state::State) -> Self {
-        // Register the pid THIS guard is responsible for (the settled-state
-        // monitor it will reap), and mark a guard in flight for the audit's
-        // ordering barrier. `state` must be the SETTLED state
-        // (`wait_for_settled` / `wait_for_gate`), whose supervisor record
-        // names the chain's LAST monitor — the one that would leak if not
-        // reaped.
-        let pid = live_supervisor_pid(state);
-        if let Some(pid) = pid {
-            registry().lock().unwrap().insert(pid);
-            ACTIVE_GUARDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-        Self { pid }
-    }
-}
-
-impl Drop for MonitorReapGuard {
-    fn drop(&mut self) {
-        let Some(pid) = self.pid else {
-            return;
-        };
-        devflow_core::agent::terminate_and_verify(
-            pid,
-            devflow_core::agent::TERMINATE_VERIFY_WAIT,
-            devflow_core::agent::TERMINATE_VERIFY_POLL,
-        );
-        // Deregister after the verified reap: the suite audit's empty-registry
-        // assertion then means "every monitor a guard was responsible for was
-        // verified reaped".
-        registry().lock().unwrap().remove(&pid);
-        // Ordering-barrier bookkeeping, regardless of the reap verdict: the
-        // guard is no longer in flight, and a reap was attempted.
-        ACTIVE_GUARDS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        REAPED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if devflow_core::agent::agent_running(pid) {
-            if std::thread::panicking() {
-                use std::io::Write as _;
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "MonitorReapGuard: monitor wrapper pid {pid} still alive after reap \
-                     during an unwind — not re-panicking because a panic is already in flight"
-                );
-            } else {
-                panic!(
-                    "monitor wrapper pid {pid}, spawned by this test's own start run, must be \
-                     verified dead after reaping — not merely assumed dead"
-                );
-            }
-        }
-    }
-}
-
 /// ANTG-03: a stubbed `agy` that exits 0 with no stream events must not
 /// advance a COMMIT-GATED stage. Plan — a commit-gated stage — produces no
 /// marker and no commits, so it gates instead of advancing to Code.
@@ -2566,7 +2398,6 @@ fn marker_less_antigravity_never_advances() {
     let _reaper = common::LaunchedRunReaper::for_home(&home, root, PhaseId::new(7));
 
     let state = wait_for_gate(root, PhaseId::new(7));
-    let _reap = MonitorReapGuard::after_launch(&state);
     assert_eq!(
         state.stage,
         Stage::Plan,
@@ -2607,7 +2438,6 @@ fn antigravity_parses_devflow_result_from_stream() {
     let _reaper = common::LaunchedRunReaper::for_home(&home, root, PhaseId::new(7));
 
     let state = wait_for_stopped(root, PhaseId::new(7));
-    let _reap = MonitorReapGuard::after_launch(&state);
     assert_eq!(
         state.stage,
         Stage::Plan,
@@ -2647,127 +2477,12 @@ fn antigravity_init_without_marker_gates_at_plan() {
     let _reaper = common::LaunchedRunReaper::for_home(&home, root, PhaseId::new(7));
 
     let state = wait_for_gate(root, PhaseId::new(7));
-    let _reap = MonitorReapGuard::after_launch(&state);
     assert_eq!(
         state.stage,
         Stage::Plan,
         "a stream with events but no marker must not advance past Plan"
     );
     assert!(state.gate_pending);
-}
-
-// ---------------------------------------------------------------------------
-// Phase 41 41-02 Task 1 (HYG-01, codex-4): the suite-level registered-PID
-// audit. Per-test Drop guards cannot detect an unguarded test; the registry
-// + audit make the leak provable, and the intentional opt-out proves the
-// gate can fail.
-// ---------------------------------------------------------------------------
-
-/// The suite audit: after every monitor-spawning test has run (and reaped,
-/// or seen its monitor exit naturally), the registry must DRAIN. Polls
-/// bounded so a slow legitimate test does not flake; a genuinely leaked
-/// monitor keeps the registry non-empty and the audit panics naming the pid.
-///
-/// The audit reads process-wide counters the other tests in this binary bump,
-/// so it only means something when they share its process, as under
-/// `cargo test` (what `scripts/check.sh` runs). cargo-nextest runs every test
-/// in its own process and sets `NEXTEST`, where `REAPED` is always 0 and the
-/// audit could only time out; there it returns without asserting.
-#[test]
-fn suite_reap_audit() {
-    if std::env::var_os("NEXTEST").is_some() {
-        return;
-    }
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    // Ordering barrier: wait for a SUSTAINED clean state, not a single empty
-    // poll. A clean state means: no guard in flight (ACTIVE_GUARDS == 0), at
-    // least one reap has happened (so an empty registry is not a vacuous
-    // "nothing ran" pass), and the registry is empty with no registered pid
-    // alive. The state must hold continuously for a quiescence window, so the
-    // audit cannot race a still-running test into a false pass (a test whose
-    // guard has bound but not yet dropped keeps ACTIVE_GUARDS > 0).
-    let mut clean_since = None;
-    loop {
-        let in_flight = ACTIVE_GUARDS.load(std::sync::atomic::Ordering::SeqCst);
-        let reaped = REAPED.load(std::sync::atomic::Ordering::SeqCst);
-        // Scope the registry lock to the read only — do not hold it across the
-        // sleep below, or the audit serializes against every guard's bind/drop.
-        let (alive, registered) = {
-            let reg = registry().lock().unwrap();
-            (registered_monitors_alive(&reg), reg.len())
-        };
-        let clean = in_flight == 0 && reaped > 0 && registered == 0 && alive.is_empty();
-        if clean {
-            match clean_since {
-                None => clean_since = Some(std::time::Instant::now()),
-                Some(t)
-                    if std::time::Instant::now().duration_since(t) >= Duration::from_secs(2) =>
-                {
-                    return;
-                }
-                Some(_) => {}
-            }
-        } else {
-            clean_since = None;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "monitor(s) leaked after the suite: alive={alive:?}, in_flight={in_flight}, \
-             registered={registered}"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
-/// codex-4: a run process the suite cannot account for is DETECTABLE. A start
-/// leaves its runner ALIVE while its agent hangs; the test registers that pid
-/// by hand, as a guard would have, proves the detection helper FAILS against it
-/// (the gate can redden), then deregisters it and lets the reaper end the
-/// runner.
-#[test]
-fn unguarded_monitor_is_detected_by_the_registry() {
-    let home = common::HermeticHome::new();
-    let repo = tempfile::tempdir().unwrap();
-    let root = repo.path();
-    init_repo(root);
-    // A HANGING pi keeps the runner's Plan stage alive past the launch — the
-    // "leaked" shape this control must be able to see.
-    let fake_bin = fake_bin_dir(&[("pi", &pi_stub("exec sleep 30\n"))]);
-
-    let _reaper = common::LaunchedRunReaper::for_home(&home, root, PhaseId::new(7));
-    run_devflow(
-        &home,
-        root,
-        &fake_bin.path,
-        &[
-            "start",
-            "--phase",
-            "07",
-            "--agent",
-            "pi",
-            "--mode",
-            "supervise",
-        ],
-    );
-
-    let pid = recorded_runner_pid(&home, root, PhaseId::new(7))
-        .expect("start launched a runner the fake systemd-run recorded");
-    assert!(
-        common::runs_the_runner_verb(pid),
-        "premise: the runner stays alive while its agent hangs — nothing reaps it"
-    );
-
-    // Simulate what a guard's after_launch would have registered (the leak).
-    registry().lock().unwrap().insert(pid);
-    // The detection helper MUST see it — the audit can fail.
-    let alive = registered_monitors_alive(&registry().lock().unwrap());
-    assert!(
-        alive.contains(&pid),
-        "a live registered runner must be detected: {alive:?}"
-    );
-
-    // Deregister; the reaper ends the runner when the test returns.
-    registry().lock().unwrap().remove(&pid);
 }
 
 // ---------------------------------------------------------------------------
@@ -2826,7 +2541,6 @@ fn hermes_marker_less_run_does_not_advance() {
         "a marker-less hermes run must not advance past the commit-gated Plan stage"
     );
     assert!(state.gate_pending, "the never-silent gate must have fired");
-    let _reap = MonitorReapGuard::after_launch(&state);
 }
 
 /// HRMS-03: a Hermes run that exits non-zero must not advance its stage.
@@ -2864,7 +2578,6 @@ fn hermes_nonzero_exit_does_not_advance() {
         "a non-zero-exit hermes run must not advance its stage"
     );
     assert!(state.gate_pending, "the never-silent gate must have fired");
-    let _reap = MonitorReapGuard::after_launch(&state);
 }
 
 /// HRMS-03: a hung Hermes process is detected as alive by monitor liveness,
@@ -2927,7 +2640,6 @@ fn hermes_hung_process_is_detected_not_left_running() {
         Stage::Plan,
         "a hung-then-killed hermes run must not advance its stage"
     );
-    let _reap = MonitorReapGuard::after_launch(&gated);
 }
 
 /// A finished run, as [`cleanup_fixture`]'s `shape`.
@@ -3713,117 +3425,6 @@ impl Drop for RunnerLockHolder {
     }
 }
 
-/// A STALE supervisor socket named for `root` (canonical) and `phase`, with no
-/// sidecar beside it, in the hermetic cache: what the stateless sweep finds for a
-/// supervisor no state names, and counts as possibly live. Returns the socket's path.
-fn plant_swept_socket(home: &common::HermeticHome, root: &Path, phase: PhaseId) -> PathBuf {
-    let cache = home.cache_dir();
-    fs::create_dir_all(devflow_core::registry::socket_dir_in(&cache)).unwrap();
-    let socket = devflow_core::supervisor::SocketPath::for_launch(
-        &cache,
-        root,
-        phase,
-        &devflow_core::supervisor::new_launch_id(),
-    )
-    .expect("a socket path that fits");
-    drop(std::os::unix::net::UnixListener::bind(socket.as_path()).expect("bind the socket"));
-    socket.as_path().to_path_buf()
-}
-
-/// A launch liveness lock in `root`'s `.devflow/`, taken by this test process: what a
-/// supervisor holds from before it publishes its socket. It reads live for as long as
-/// the returned hold is kept, and the launch has no socket and no sidecar. Returns the
-/// launch id with the hold.
-fn hold_launch_lock(root: &Path) -> (String, devflow_core::liveness::Hold) {
-    let launch_id = devflow_core::supervisor::new_launch_id();
-    let path = devflow_core::liveness::launch_liveness_path(root, &launch_id)
-        .expect("a launch id of the launch-id format");
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let hold = devflow_core::liveness::Hold::take(&path).expect("take the liveness lock");
-    assert_eq!(
-        devflow_core::liveness::probe(&path).unwrap(),
-        devflow_core::liveness::Held::Live,
-        "premise: the launch's liveness lock reads live"
-    );
-    (launch_id, hold)
-}
-
-/// The lock decides, not the file: a launch liveness file that nothing holds is an
-/// abandoned reservation, so with no state discard still removes the worktree and the
-/// branch, and leaves that file alone.
-#[test]
-fn discard_ignores_a_launch_lock_nothing_holds() {
-    let case = discard_case();
-    let phase = PhaseId::new(60);
-    full_phase(&case.root, phase, true, finished);
-    fs::remove_file(devflow_core::workflow::state_path(&case.root, phase)).unwrap();
-    let (_, hold) = hold_launch_lock(&case.root);
-    let lock = hold.path().to_path_buf();
-    drop(hold);
-    assert_eq!(
-        devflow_core::liveness::probe(&lock).unwrap(),
-        devflow_core::liveness::Held::Abandoned,
-        "premise: the liveness file exists and nothing holds it"
-    );
-
-    let out = run_discard(&case.home, &case.root, phase, &[]);
-    let (_, text) = discard_text(&out);
-    assert!(out.status.success(), "{text}");
-    assert_eq!(
-        phase_items(&case.root, phase),
-        PhaseItems::NONE,
-        "the worktree and the branch are gone: {text}"
-    );
-    assert!(lock.exists(), "the unheld liveness file is left in place");
-}
-
-/// A held lock that another phase's loadable state records is that phase's launch, not
-/// this one's: with no state of its own, the phase is still discarded, and the other
-/// phase is left as it was.
-#[test]
-fn discard_ignores_a_launch_lock_another_phases_state_records() {
-    let case = discard_case();
-    let phase = PhaseId::new(61);
-    full_phase(&case.root, phase, true, finished);
-    fs::remove_file(devflow_core::workflow::state_path(&case.root, phase)).unwrap();
-    let (launch_id, hold) = hold_launch_lock(&case.root);
-    let socket = devflow_core::supervisor::SocketPath::for_launch(
-        &case.home.cache_dir(),
-        &case.root,
-        BYSTANDER_PHASE,
-        &launch_id,
-    )
-    .expect("a socket path that fits");
-    let pending = devflow_core::state::PendingSupervisor::new(
-        launch_id,
-        socket.as_path().to_path_buf(),
-        hold.path().to_path_buf(),
-    );
-    add_phase(&case.root, BYSTANDER_PHASE, false, |state| {
-        state.pending_supervisor = Some(pending);
-    });
-    let other = phase_items(&case.root, BYSTANDER_PHASE);
-    assert!(
-        other.worktree.is_some() && other.state.is_some() && other.branch_tip.is_some(),
-        "premise: the other phase has a worktree, a state and a branch"
-    );
-
-    let out = run_discard(&case.home, &case.root, phase, &[]);
-    let (_, text) = discard_text(&out);
-    assert!(out.status.success(), "{text}");
-    assert_eq!(
-        phase_items(&case.root, phase),
-        PhaseItems::NONE,
-        "the worktree and the branch are gone: {text}"
-    );
-    assert_eq!(
-        phase_items(&case.root, BYSTANDER_PHASE),
-        other,
-        "the phase that records the launch is untouched: {text}"
-    );
-    assert!(hold.path().exists(), "the liveness lock is left in place");
-}
-
 /// D-20: discard is the way out of a state that does not load. It removes that file
 /// with the worktree and the branch, and keeps no copy of it.
 #[test]
@@ -3834,16 +3435,10 @@ fn discard_removes_a_state_that_does_not_load() {
     let state_file = devflow_core::workflow::state_path(&case.root, phase);
     fs::write(&state_file, "not json").unwrap();
     let bystanders = add_bystanders(&case.root);
-    // Another phase's socket is not this phase's: the sweep must not refuse on it.
-    let other_socket = plant_swept_socket(&case.home, &case.root, BYSTANDER_PHASE);
 
     let out = run_discard(&case.home, &case.root, phase, &[]);
     let (stdout, text) = discard_text(&out);
     assert!(out.status.success(), "{text}");
-    assert!(
-        other_socket.exists(),
-        "another phase's socket is left in place: {text}"
-    );
     assert!(
         listing_has(&stdout, "run state"),
         "the listing names the state file: {text}"
