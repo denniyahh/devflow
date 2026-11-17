@@ -4313,8 +4313,6 @@ pub(crate) struct PhaseFacts {
     pub(crate) finished: bool,
     /// The `start` to run instead of `resume` when [`run_never_prepared`] holds.
     pub(crate) unprepared_restart: Option<String>,
-    /// The launch id of the reservation `state.pending_supervisor` names, if any.
-    pub(crate) pending: Option<String>,
     /// The state write lock, read once without waiting (R-03).
     pub(crate) write_lock: workflow::WriteLockStatus,
     /// Why [`PhaseFacts::write_lock`] could not be read; it then reads free.
@@ -4447,25 +4445,6 @@ fn check_runner(facts: &PhaseFacts) -> Option<PhaseFinding> {
     })
 }
 
-/// A reservation the state names (D-02) with no live runner: it blocks nothing, so it
-/// is a note with no repair of its own. While the runner is live it is not reported.
-fn check_pending_launch(facts: &PhaseFacts) -> Option<PhaseFinding> {
-    let phase = facts.phase;
-    let launch_id = facts.pending.as_ref()?;
-    if !matches!(facts.runner, Ok(RunnerLiveness::NotLive)) {
-        return None;
-    }
-    Some(PhaseFinding {
-        phase,
-        severity: Severity::Warn,
-        detail: format!(
-            "phase {phase}: launch reservation {launch_id} is abandoned (no runner runs the \
-             phase); the next launch clears it"
-        ),
-        repair: None,
-    })
-}
-
 /// A held state write lock (R-03), from one reading that did not wait; a lock that could
 /// not be read is named too. A `Warn`, because a single reading cannot tell a brief hold
 /// from a stuck one: [`WRITE_LOCK_HOLD_NOTE`] says how to judge it.
@@ -4558,7 +4537,6 @@ fn reconcile_phase(facts: &PhaseFacts) -> Vec<PhaseFinding> {
         check_open_gate_without_waiter(facts),
         check_orphan_gate(facts),
         check_runner(facts),
-        check_pending_launch(facts),
         check_stage_event_drift(facts),
         check_missing_branch(facts),
         check_write_lock(facts),
@@ -4603,10 +4581,6 @@ fn build_phase_facts(
     let unprepared_restart = run_never_prepared(&state).then(|| restart_verb(&state));
     let (waiter, waiter_gate) = phase_gate_waiter(project_root, phase, open_gates);
     let runner = runner_liveness(project_root, phase);
-    let pending = state
-        .pending_supervisor
-        .as_ref()
-        .map(|pending| pending.launch_id.clone());
     let (write_lock, write_lock_error) = match workflow::write_lock_status(project_root, phase) {
         Ok(status) => (status, None),
         Err(error) => (workflow::WriteLockStatus::Free, Some(error.to_string())),
@@ -4641,7 +4615,6 @@ fn build_phase_facts(
         stopped,
         finished: state.finished,
         unprepared_restart,
-        pending,
         write_lock,
         write_lock_error,
     }
@@ -4844,9 +4817,8 @@ fn render_reconciliation_json(facts: &[PhaseFacts]) -> serde_json::Value {
 }
 
 /// A phase's runner facts for `doctor --json` (D-07, D-12a): its liveness label
-/// (`live`, `stopping`, `not_live` or `error`), the runner's pid when its record
-/// reads, and the reservation's launch id (`null` when there is none). Never a path
-/// (T-18-01).
+/// (`live`, `stopping`, `not_live` or `error`) and the runner's pid when its record
+/// reads. Never a path (T-18-01).
 fn runner_json(facts: &PhaseFacts) -> serde_json::Value {
     let (liveness, pid) = match &facts.runner {
         Ok(RunnerLiveness::Live { pid }) => ("live", *pid),
@@ -4857,7 +4829,6 @@ fn runner_json(facts: &PhaseFacts) -> serde_json::Value {
     serde_json::json!({
         "liveness": liveness,
         "pid": pid,
-        "pending": facts.pending,
     })
 }
 
@@ -6153,7 +6124,6 @@ mod tests {
         let mut prepared = fresh.clone();
         prepared.stage = Stage::Plan;
         prepared.verification_baseline_captured = true;
-        assert!(prepared.supervisor.is_none());
         assert!(
             !run_never_prepared(&prepared),
             "control: a prepared Plan run with no supervisor is not never-launched"
@@ -8035,70 +8005,14 @@ mod tests {
         assert!(!agent::agent_running(u32::MAX));
     }
 
-    /// 18b: persisting the supervisor record for one phase must not disturb
-    /// a concurrently-active sibling phase's record (concurrency edge).
-    #[test]
-    fn supervisor_record_persisted_for_one_phase_does_not_disturb_a_sibling() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-
-        let mut phase7 = State::new(
-            PhaseId::new(7),
-            AgentKind::Claude,
-            Mode::Auto,
-            root.to_path_buf(),
-        );
-        let record7 = devflow_core::state::SupervisorRecord::new(
-            root.join("seven.sock"),
-            "seven00000000000".to_string(),
-            111,
-            1,
-            String::new(),
-        );
-        phase7.supervisor = Some(record7.clone());
-        workflow::save_state(&phase7).unwrap();
-
-        let mut phase8 = State::new(
-            PhaseId::new(8),
-            AgentKind::Claude,
-            Mode::Auto,
-            root.to_path_buf(),
-        );
-        let record8 = devflow_core::state::SupervisorRecord::new(
-            root.join("eight.sock"),
-            "eight00000000000".to_string(),
-            222,
-            2,
-            String::new(),
-        );
-        phase8.supervisor = Some(record8.clone());
-        workflow::save_state(&phase8).unwrap();
-
-        let reloaded7 = workflow::load_state(root, PhaseId::new(7)).unwrap();
-        let reloaded8 = workflow::load_state(root, PhaseId::new(8)).unwrap();
-        assert_eq!(reloaded7.supervisor, Some(record7));
-        assert_eq!(reloaded8.supervisor, Some(record8));
-    }
-
     /// 18b (idempotency edge): running `devflow status` twice must produce
-    /// byte-identical `.devflow/` state — the supervisor liveness probe is
-    /// purely a read, same as the existing agent liveness probe it sits
-    /// beside. The planted record names a socket that does not exist and the
-    /// `u32::MAX` boundary agent group (precision edge), so the probe can
-    /// only read it GONE, never a false ALIVE.
+    /// byte-identical `.devflow/` state — its liveness reads are purely reads.
     #[test]
     fn status_reading_monitor_liveness_writes_no_state_and_no_event() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(66);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.supervisor = Some(devflow_core::state::SupervisorRecord::new(
-            root.join("never-bound.sock"),
-            "statusidem000000".to_string(),
-            u32::MAX,
-            1,
-            String::new(),
-        ));
+        let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         workflow::save_state(&state).unwrap();
 
         let state_path = workflow::state_path(root, phase);
@@ -9841,9 +9755,6 @@ mod tests {
     mod doctor_reconciliation {
         use super::*;
 
-        /// The launch id every fixture's supervisor record carries.
-        const SUPERVISOR_LAUNCH_ID: &str = "0123456789abcdef";
-
         /// A path a damaged gate file could name where its gate id belongs.
         const PATH_AS_GATE_ID: &str = "/home/someone/.devflow/gates/x";
 
@@ -9862,8 +9773,8 @@ mod tests {
         }
 
         /// D-07, D-12a (T-18-01): `doctor --json` phase facts carry the runner's
-        /// liveness label, its pid and the reservation's launch id, and no string in
-        /// the reconciliation section holds a path.
+        /// liveness label and its pid, no reservation key, and no string in the
+        /// reconciliation section holds a path.
         #[test]
         fn doctor_json_reports_the_runner_liveness_without_paths() {
             let gate_id = GateId::new().to_string();
@@ -9874,7 +9785,6 @@ mod tests {
                 },
                 PhaseFacts {
                     runner: Err("its runner lock /home/someone/x could not be probed".to_string()),
-                    pending: Some(SUPERVISOR_LAUNCH_ID.to_string()),
                     ..agreeing_facts(PhaseId::new(28))
                 },
                 PhaseFacts {
@@ -9889,13 +9799,12 @@ mod tests {
             let live = &entries[0]["runner"];
             assert_eq!(live["liveness"], "live", "{body}");
             assert_eq!(live["pid"], 4242, "{body}");
-            assert!(live["pending"].is_null(), "{body}");
+            assert!(live.get("pending").is_none(), "no reservation key: {body}");
             let failed = &entries
                 .iter()
                 .find(|entry| entry["phase"] == 28)
                 .expect("phase 28's finding")["runner"];
             assert_eq!(failed["liveness"], "error", "{body}");
-            assert_eq!(failed["pending"], SUPERVISOR_LAUNCH_ID, "{body}");
             assert!(failed["pid"].is_null(), "{body}");
             let mut strings = Vec::new();
             strings_in(&body, &mut strings);
@@ -9971,7 +9880,6 @@ mod tests {
                 feature_branch_exists: true,
                 stopped: false,
                 finished: false,
-                pending: None,
                 write_lock: workflow::WriteLockStatus::Free,
                 write_lock_error: None,
             }
@@ -10196,33 +10104,6 @@ mod tests {
                 };
                 assert!(check_runner(&ended).is_none(), "control: a {case} run");
             }
-        }
-
-        /// D-12a: a reservation the state names with no live runner is a `Warn` note
-        /// naming its launch id; while the runner may be live it is not reported.
-        #[test]
-        fn check_pending_launch_reports_a_reservation_only_with_no_runner() {
-            let abandoned = check_pending_launch(&PhaseFacts {
-                runner: Ok(RunnerLiveness::NotLive),
-                pending: Some(SUPERVISOR_LAUNCH_ID.to_string()),
-                ..agreeing_facts(PhaseId::new(27))
-            })
-            .expect("an abandoned reservation is a note");
-            assert_eq!(abandoned.severity, Severity::Warn);
-            assert!(abandoned.repair.is_none());
-            assert!(
-                abandoned.detail.contains(SUPERVISOR_LAUNCH_ID),
-                "{}",
-                abandoned.detail
-            );
-            let live = PhaseFacts {
-                pending: Some(SUPERVISOR_LAUNCH_ID.to_string()),
-                ..agreeing_facts(PhaseId::new(27))
-            };
-            assert!(
-                check_pending_launch(&live).is_none(),
-                "control: a live runner"
-            );
         }
 
         #[test]

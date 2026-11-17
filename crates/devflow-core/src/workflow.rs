@@ -60,23 +60,6 @@ pub enum WorkflowError {
         /// the recorded start time.
         holder: Option<u32>,
     },
-    /// A launch tried to write a state that does not record it as the supervisor.
-    #[error(
-        "phase {phase}: launch {ours} does not own the state, which records {}{}",
-        recorded.as_deref().unwrap_or("no supervisor"),
-        if *pending_only { "; this launch is only pending" } else { "" }
-    )]
-    NotOwner {
-        /// The phase whose state was to be written.
-        phase: PhaseId,
-        /// The launch that tried to write.
-        ours: String,
-        /// The launch the state records as its supervisor.
-        recorded: Option<String>,
-        /// Whether `ours` is the state's pending supervisor, and so may still
-        /// become the recorded one.
-        pending_only: bool,
-    },
 }
 
 /// A timed-out wait's description of who holds the lock.
@@ -218,8 +201,7 @@ pub fn state_path(project_root: &Path, phase: PhaseId) -> PathBuf {
 /// Write `state` to `.devflow/state-{NN}.json`, keyed by `state.phase`, as a test
 /// fixture: a whole snapshot with no write lock and no re-read, overwriting whatever
 /// is on disk. Compiled only for tests and the `test-support` feature, never for
-/// production. Production writes go through [`update_state`], [`update_state_with`]
-/// or [`update_owned_state`].
+/// production. Production writes go through [`update_state`] or [`update_state_with`].
 #[cfg(any(test, feature = "test-support"))]
 pub fn save_state(state: &State) -> Result<(), WorkflowError> {
     debug!("saving state: phase={} stage={}", state.phase, state.stage);
@@ -278,10 +260,9 @@ pub const WRITE_LOCK_POLL: Duration = Duration::from_millis(10);
 
 /// The wait a repair verb gives the write lock by default: longer than a closure spends
 /// unless something it waits on is stalled, and short enough that a repair verb always
-/// answers. Stalled, a closure can outlast it: 10 s for a fenced gate answer, 13 s for a
-/// recovery decision (`recover::a_recover_decisions_worst_case_is_counted_on_its_real_paths`)
-/// and, by reading, 16 s for a reservation whose two socket probes, each bounded by
-/// the socket protocol's I/O timeout, both stall on both connects. The verb then names the holder and writes nothing.
+/// answers. A recovery decision's one gate wait fits it
+/// (`recover::a_recover_decisions_worst_case_is_counted_on_its_real_paths`). A closure
+/// stalled past it makes the verb name the holder and write nothing.
 pub const WRITE_LOCK_REPAIR_WAIT: Duration = Duration::from_secs(10);
 
 /// The file the phase's state write lock lives on: `.devflow/.state-NN.lock`.
@@ -580,113 +561,6 @@ pub fn write_lock_is_free(project_root: &Path, phase: PhaseId) -> bool {
     }
 }
 
-/// How a state stands to one launch id.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Ownership {
-    /// The state records this launch as its supervisor.
-    Recorded,
-    /// This launch is the pending supervisor, not yet the recorded one.
-    PendingOnly,
-    /// The state names this launch nowhere.
-    Superseded {
-        /// The launch the state records instead, if any.
-        recorded: Option<String>,
-    },
-}
-
-/// How `state` stands to `launch_id`. A launch that is only pending may yet become
-/// the recorded one, so a caller can wait for its publish (D-15); a superseded one
-/// never will.
-pub fn ownership(state: &State, launch_id: &str) -> Ownership {
-    let recorded = state.supervisor.as_ref().map(|record| &record.launch_id);
-    if recorded.is_some_and(|recorded| recorded == launch_id) {
-        return Ownership::Recorded;
-    }
-    let pending = state.pending_supervisor.as_ref();
-    if pending.is_some_and(|pending| pending.launch_id == launch_id) {
-        return Ownership::PendingOnly;
-    }
-    Ownership::Superseded {
-        recorded: recorded.cloned(),
-    }
-}
-
-/// The refusal for a launch `state` does not record, or `None` when it records it.
-fn not_owner(state: &State, phase: PhaseId, launch_id: &str) -> Option<WorkflowError> {
-    let (recorded, pending_only) = match ownership(state, launch_id) {
-        Ownership::Recorded => return None,
-        Ownership::PendingOnly => (state.supervisor.as_ref().map(|r| r.launch_id.clone()), true),
-        Ownership::Superseded { recorded } => (recorded, false),
-    };
-    Some(WorkflowError::NotOwner {
-        phase,
-        ours: launch_id.to_string(),
-        recorded,
-        pending_only,
-    })
-}
-
-/// [`update_state`] fenced to the launch the state records (D-03): unless the
-/// state records `launch_id` as its supervisor, this returns
-/// [`WorkflowError::NotOwner`] with `apply` not run and nothing written. The check
-/// is made under the write lock, on the state as it is on disk now.
-pub fn update_owned_state<T, E: From<WorkflowError>>(
-    project_root: &Path,
-    phase: PhaseId,
-    launch_id: &str,
-    apply: impl FnOnce(&mut State) -> Result<T, E>,
-) -> Result<(State, T), E> {
-    update_state(project_root, phase, |state| {
-        match not_owner(state, phase, launch_id) {
-            None => apply(state),
-            Some(refusal) => Err(refusal.into()),
-        }
-    })
-}
-
-/// Run `f` while the state records `launch_id`, sharing one hold of the write lock
-/// between the check and `f` (D-03, R-09). A launch the state does not record gets
-/// [`WorkflowError::NotOwner`] with `f` not called. It writes no state.
-///
-/// There is no window between the check and `f`: a supersession is itself a state
-/// write under this lock, so it lands wholly before the check or wholly after `f`.
-///
-/// This takes the lock in its blocking form, as every workflow writer does. `f` must
-/// be a bounded file operation. It never waits on a human or an agent (D-08). The only
-/// lock it may take is the gate lock, a bounded wait the operator's D-08 ruling of
-/// 2026-10-26 allows inside the write lock: gate-lock holders run only file operations
-/// and never take the state write lock, so the order is always write lock, then gate
-/// lock, and each wait is capped by `gates::GATE_LOCK_WAIT`, below
-/// [`WRITE_LOCK_REPAIR_WAIT`]. `gates::tests::gates_never_takes_the_state_write_lock`
-/// and `gates::tests::the_gate_lock_wait_stays_below_the_write_lock_repair_wait` pin
-/// both rules. A fenced `Gates::answer` makes two waits, 10 s in all, which reaches
-/// [`WRITE_LOCK_REPAIR_WAIT`] if a holder stalls both: a repair verb then gives up and
-/// names this lock's holder, and nothing hangs
-/// (`gates::tests::a_fenced_answers_two_gate_waits_reach_the_write_lock_repair_wait`).
-///
-/// Not reentrant: this must not be called inside an [`update_state`],
-/// [`update_state_with`], [`update_owned_state`] or [`clear_state_if_owned`] closure
-/// or another `while_owner` closure, and `f` must not call any of them. A second
-/// `flock` on the write-lock file from one process is a second open file description,
-/// so the blocking form waits forever.
-///
-/// # Errors
-/// [`WorkflowError::NotOwner`], the state's load error, an error taking the lock, or
-/// whatever `f` returns.
-pub fn while_owner<T, E: From<WorkflowError>>(
-    project_root: &Path,
-    phase: PhaseId,
-    launch_id: &str,
-    f: impl FnOnce() -> Result<T, E>,
-) -> Result<T, E> {
-    let _lock = lock_for_write(project_root, phase, None)?;
-    let state = load_state(project_root, phase)?;
-    if let Some(refusal) = not_owner(&state, phase, launch_id) {
-        return Err(refusal.into());
-    }
-    f()
-}
-
 /// What [`clear_state_if`] did.
 #[derive(Debug)]
 pub(crate) struct Cleared {
@@ -769,31 +643,7 @@ pub fn state_file_phases(project_root: &Path) -> Vec<PhaseId> {
 /// Takes the write lock, so a removal never interleaves with an update. This blocks
 /// while the lock is held, for the same callers as [`update_state`].
 pub fn clear_state(project_root: &Path, phase: PhaseId) -> Result<bool, WorkflowError> {
-    let (removed, result) =
-        clear_state_with_partial_result_impl(project_root, phase, None, false, None);
-    result.map(|()| removed)
-}
-
-/// [`clear_state`] for a supervisor (D-03): unless the state records `launch_id`, this
-/// returns [`WorkflowError::NotOwner`] and removes nothing. The check and the removal
-/// share one hold of the write lock. Returns whether a file was removed.
-///
-/// Not reentrant, under the rule [`while_owner`] states: this must not be called inside
-/// an [`update_state`], [`update_state_with`], [`update_owned_state`] or `while_owner`
-/// closure, because a second `flock` on the write-lock file from one process blocks
-/// forever. The D-08 ruling of 2026-10-26 on the gate lock does not reach here: nothing
-/// in this removal takes another lock.
-///
-/// # Errors
-/// [`WorkflowError::NotOwner`], the state's load error, an error taking the lock, or a
-/// failed removal.
-pub fn clear_state_if_owned(
-    project_root: &Path,
-    phase: PhaseId,
-    launch_id: &str,
-) -> Result<bool, WorkflowError> {
-    let (removed, result) =
-        clear_state_with_partial_result_impl(project_root, phase, None, false, Some(launch_id));
+    let (removed, result) = clear_state_with_partial_result_impl(project_root, phase, None, false);
     result.map(|()| removed)
 }
 
@@ -806,14 +656,13 @@ pub fn clear_state_within(
     wait: Duration,
 ) -> Result<bool, WorkflowError> {
     let (removed, result) =
-        clear_state_with_partial_result_impl(project_root, phase, Some(wait), false, None);
+        clear_state_with_partial_result_impl(project_root, phase, Some(wait), false);
     result.map(|()| removed)
 }
 
 /// Decide on a fresh read of the state and remove it, in one hold of the write lock
 /// (R-07), so a `start` or `resume` whose reservation needs that lock lands wholly
-/// before the read or wholly after the removal. The general form of
-/// [`clear_state_if_owned`], which stays as it is.
+/// before the read or wholly after the removal.
 ///
 /// `decide` gets what is on disk: `Ok(false)` keeps it, `Ok(true)` removes the state and
 /// its orphaned write temps, and `Err` removes nothing and is returned as it is. With
@@ -822,16 +671,13 @@ pub fn clear_state_within(
 ///
 /// `decide` may not take this lock: a second `flock` on the file from this process is
 /// a second open file description and blocks on the first. So it never calls
-/// [`update_state`], [`update_state_with`], [`update_owned_state`], [`clear_state`],
-/// [`while_owner`] or [`clear_state_if_owned`].
+/// [`update_state`], [`update_state_with`] or [`clear_state`].
 ///
 /// A gate operation in `decide` waits for the gate lock inside this one, the bounded wait
 /// the operator's D-08 ruling of 2026-10-26 allows: write lock, then gate lock, never the
 /// reverse, and `gates::GATE_LOCK_WAIT` is below [`WRITE_LOCK_REPAIR_WAIT`].
 /// `recover::a_recover_decisions_worst_case_is_counted_on_its_real_paths` counts what one
-/// recovery decision can wait for: two socket probes and one gate wait, 13 s when both
-/// sockets die mid-ping and the gate lock is wedged, which outlasts the 10 s of
-/// [`WRITE_LOCK_REPAIR_WAIT`]; a repair verb then names the holder and writes nothing.
+/// recovery decision can wait for: one gate wait, which fits [`WRITE_LOCK_REPAIR_WAIT`].
 /// That leaves fsync-bound file operations on a slow disk unmeasured, and a SIGSTOPped
 /// caller outside the bound, as for every writer.
 pub(crate) fn clear_state_if<E: From<WorkflowError>>(
@@ -856,7 +702,6 @@ fn clear_state_with_partial_result_impl(
     phase: PhaseId,
     wait: Option<Duration>,
     report_temp_removal_failure: bool,
-    owner: Option<&str>,
 ) -> (bool, Result<(), WorkflowError>) {
     // Nothing to remove, so no lock file to leave behind in a project DevFlow has
     // not touched.
@@ -867,14 +712,6 @@ fn clear_state_with_partial_result_impl(
         Ok(lock) => lock,
         Err(error) => return (false, Err(error)),
     };
-    if let Some(launch_id) = owner {
-        let refusal = load_state(project_root, phase)
-            .map(|state| not_owner(&state, phase, launch_id))
-            .unwrap_or_else(Some);
-        if let Some(refusal) = refusal {
-            return (false, Err(refusal));
-        }
-    }
     remove_state_files(project_root, phase, report_temp_removal_failure)
 }
 
@@ -1558,161 +1395,6 @@ mod tests {
         );
     }
 
-    fn supervisor_record(launch_id: &str) -> crate::state::SupervisorRecord {
-        crate::state::SupervisorRecord::new(
-            PathBuf::from(format!("/c/sock/{launch_id}.sock")),
-            launch_id.to_string(),
-            4242,
-            123_456,
-            "boot-id".to_string(),
-        )
-    }
-
-    fn pending_supervisor(launch_id: &str) -> crate::state::PendingSupervisor {
-        crate::state::PendingSupervisor::new(
-            launch_id.to_string(),
-            PathBuf::from(format!("/c/sock/{launch_id}.sock")),
-            PathBuf::from(format!("/c/supervisor-{launch_id}.live")),
-        )
-    }
-
-    #[test]
-    fn ownership_tells_recorded_pending_and_superseded_apart() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut state = state_in(dir.path(), PhaseId::new(50), Stage::Code);
-        assert_eq!(
-            ownership(&state, "X"),
-            Ownership::Superseded { recorded: None }
-        );
-
-        state.supervisor = Some(supervisor_record("X"));
-        assert_eq!(ownership(&state, "X"), Ownership::Recorded);
-        assert_eq!(
-            ownership(&state, "Y"),
-            Ownership::Superseded {
-                recorded: Some("X".to_string())
-            }
-        );
-
-        state.pending_supervisor = Some(pending_supervisor("Y"));
-        assert_eq!(ownership(&state, "Y"), Ownership::PendingOnly);
-        assert_eq!(ownership(&state, "X"), Ownership::Recorded);
-        assert_eq!(
-            ownership(&state, "Z"),
-            Ownership::Superseded {
-                recorded: Some("X".to_string())
-            },
-            "a third launch is named nowhere"
-        );
-    }
-
-    #[test]
-    fn update_owned_state_refuses_a_launch_the_state_does_not_record() {
-        let dir = tempfile::tempdir().unwrap();
-        let (root, phase) = (dir.path(), PhaseId::new(50));
-        let path = state_path(root, phase);
-        let mut state = state_in(root, phase, Stage::Code);
-        state.supervisor = Some(supervisor_record("X"));
-        save_state(&state).unwrap();
-        let before = std::fs::read(&path).unwrap();
-        let ran = std::cell::Cell::new(false);
-        let write_as = |launch_id: &str| {
-            update_owned_state(root, phase, launch_id, |state| {
-                ran.set(true);
-                state.stopped = true;
-                Ok::<(), WorkflowError>(())
-            })
-        };
-
-        let error = write_as("Y").unwrap_err();
-        assert!(
-            matches!(
-                &error,
-                WorkflowError::NotOwner { phase: refused, ours, recorded, pending_only: false }
-                    if *refused == phase && ours == "Y" && recorded.as_deref() == Some("X")
-            ),
-            "got {error}"
-        );
-        let message = error.to_string();
-        assert!(message.contains('X') && message.contains('Y'), "{message}");
-        assert!(!ran.get(), "a superseded launch must not reach its closure");
-        assert_eq!(std::fs::read(&path).unwrap(), before);
-
-        state.pending_supervisor = Some(pending_supervisor("Y"));
-        save_state(&state).unwrap();
-        let before = std::fs::read(&path).unwrap();
-        let error = write_as("Y").unwrap_err();
-        assert!(
-            matches!(
-                &error,
-                WorkflowError::NotOwner { ours, recorded, pending_only: true, .. }
-                    if ours == "Y" && recorded.as_deref() == Some("X")
-            ),
-            "got {error}"
-        );
-        assert!(!ran.get(), "a pending launch must not reach its closure");
-        assert_eq!(std::fs::read(&path).unwrap(), before);
-
-        let (committed, ()) = write_as("X").expect("the recorded launch writes");
-        assert!(ran.get());
-        assert!(committed.stopped);
-        assert!(load_state(root, phase).unwrap().stopped);
-    }
-
-    /// R-09's check-to-side-effect gap: the closure runs only for the recorded launch,
-    /// inside the one hold of the lock the check made, and nothing is written.
-    #[test]
-    fn while_owner_runs_its_closure_only_for_the_recorded_launch_under_the_write_lock() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(1901);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.supervisor = Some(crate::state::SupervisorRecord::new(
-            root.join("x.sock"),
-            "xxxx".to_string(),
-            4_294_967_000,
-            1,
-            String::new(),
-        ));
-        save_state(&state).unwrap();
-        let path = state_path(root, phase);
-        let before = std::fs::read(&path).unwrap();
-
-        let mut called = false;
-        let refused = while_owner(root, phase, "yyyy", || {
-            called = true;
-            Ok::<(), WorkflowError>(())
-        });
-        assert!(
-            matches!(
-                refused,
-                Err(WorkflowError::NotOwner { ref ours, ref recorded, pending_only: false, .. })
-                    if ours == "yyyy" && recorded.as_deref() == Some("xxxx")
-            ),
-            "{refused:?}"
-        );
-        assert!(!called, "a launch the state does not record runs nothing");
-
-        let held = while_owner(root, phase, "xxxx", || write_lock_status(root, phase));
-        assert_eq!(
-            held.unwrap(),
-            WriteLockStatus::Held {
-                pid: Some(std::process::id())
-            },
-            "the closure runs inside the check's hold of the lock"
-        );
-        // Another test's fork can keep the released lock busy until its exec.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while write_lock_status(root, phase).unwrap() != WriteLockStatus::Free {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "control: the probe reads the lock free once the hold ends"
-            );
-            std::thread::sleep(WRITE_LOCK_POLL);
-        }
-        assert_eq!(std::fs::read(&path).unwrap(), before, "it writes no state");
-    }
-
     /// R-07's primitive: the decision sees what is on disk with the lock held, and the
     /// removal shares that hold.
     #[test]
@@ -1793,36 +1475,6 @@ mod tests {
         assert!(cleared.removed);
         assert!(cleared.result.is_ok());
         assert!(!path.exists(), "an `Ok(true)` decision removes the state");
-    }
-
-    #[test]
-    fn clear_state_if_owned_refuses_a_launch_the_state_does_not_record() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(1902);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.supervisor = Some(crate::state::SupervisorRecord::new(
-            root.join("x.sock"),
-            "xxxx".to_string(),
-            4_294_967_000,
-            1,
-            String::new(),
-        ));
-        save_state(&state).unwrap();
-        let path = state_path(root, phase);
-
-        let refused = clear_state_if_owned(root, phase, "yyyy");
-        assert!(
-            matches!(refused, Err(WorkflowError::NotOwner { .. })),
-            "{refused:?}"
-        );
-        assert!(path.exists(), "a refused clear leaves the file");
-
-        assert!(
-            clear_state_if_owned(root, phase, "xxxx").unwrap(),
-            "control: the recorded launch's clear removes it"
-        );
-        assert!(!path.exists(), "control: the file is gone");
     }
 
     #[test]
