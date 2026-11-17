@@ -476,7 +476,6 @@ where
     match outcome {
         canary::CanaryOutcome::Confirmed => Ok(()),
         canary::CanaryOutcome::Absent => refuse_launch(
-            state,
             "background-task notification delivery is ABSENT: a token DevFlow planted in a \
              throwaway startup task did not come back inside a top-level `result` event.\n\
              \n\
@@ -490,10 +489,8 @@ where
              `.devflow/delivery-canary.jsonl`."
                 .to_string(),
         ),
-        canary::CanaryOutcome::Unverified(reason) => refuse_launch(
-            state,
-            format!(
-                "the delivery canary COULD NOT RUN, so background-task notification \
+        canary::CanaryOutcome::Unverified(reason) => refuse_launch(format!(
+            "the delivery canary COULD NOT RUN, so background-task notification \
                  delivery is unverified for this run. This is not a report that the \
                  behaviour is gone — the guard reached no conclusion either way.\n\
                  \n\
@@ -501,8 +498,7 @@ where
                  \n\
                  Refusing to launch: the multi-plan wave guarantee depends on that \
                  behaviour and this run has no evidence about it."
-            ),
-        ),
+        )),
     }
 }
 
@@ -529,29 +525,10 @@ pub(crate) fn recorded_canary_refusal(state: &State) -> Option<String> {
     }
 }
 
-/// Abort a launch the canary refused, leaving no half-launched stage behind.
-///
-/// Clearing `supervisor` applies WR-04's rationale to an aborted launch:
-/// `transition()` has already
-/// advanced `state.stage` and saved it by the time this runs, so a refusal that
-/// left the PREVIOUS stage's supervisor record standing would read as a run
-/// gone while active and send the operator to `devflow resume`, after the
-/// wrong problem entirely. With no record, the run reads not launched, and the
-/// right remedy is the message below.
-///
-/// One exception: a failover relaunch ([`FailoverRelaunchGuard`] engaged) keeps the
-/// record. WR-04's premise does not hold there, since that relaunch runs the same
-/// stage again after a handoff. Keeping the record lets the failover's never-silent
-/// end (the infra gate, or the abort at the infra ceiling) be written by the
-/// supervisor the state records, which then waits at the gate as the run's owner. The
-/// exemption lasts for the failover relaunch's `launch_stage` call. That call includes
-/// `run_preflight`, so a preflight gate opened inside it, and the launch that gate's
-/// answer starts, keep the record too. A launch the failover's own infra gate starts
-/// later runs unguarded and clears the record on failure as WR-04 says.
-fn refuse_launch(state: &mut State, message: String) -> Result<(), CliError> {
-    if !in_failover_relaunch() {
-        commit(state, |s| s.supervisor = None)?;
-    }
+/// Abort a launch the canary refused, leaving no half-launched stage behind: the
+/// stage is not launched, and the refusal names why. The state records no launch, so
+/// there is nothing to clear.
+fn refuse_launch(message: String) -> Result<(), CliError> {
     Err(CliError::Message(message))
 }
 
@@ -901,12 +878,10 @@ pub(crate) const ADVANCE_STOP_REASON: &str = "stopped through the supervisor dur
 pub(crate) const HOLDER_STOP_REASON: &str = "stopped by devflow stop at a foreground safe point";
 
 /// What an advance reads on this thread (50-13): its stop token, for the advance's
-/// safe points, and its launch id, for the ownership fence (D-03). The foreground
-/// runner's slot carries no launch id ([`StopTokenGuard::engage_token`]): it records no
-/// supervisor, so its writes stay unfenced.
+/// safe points. One runner per phase holds the runner lock for the whole run (D-07),
+/// so its state writes need no fence.
 struct EngagedAdvance {
     token: StopToken,
-    launch_id: Option<String>,
 }
 
 thread_local! {
@@ -927,16 +902,11 @@ pub(crate) struct StopTokenGuard {
 }
 
 impl StopTokenGuard {
-    /// Engage the foreground runner's run-long token with no launch id (D-05): the safe
-    /// points, the gate wait and the test holds read `token`, and the fenced writes run
-    /// unfenced, because the runner records no supervisor the fence could check.
+    /// Engage the foreground runner's run-long token (D-05): the safe points, the gate
+    /// wait and the test holds read `token`.
     pub(crate) fn engage_token(token: StopToken) -> Self {
-        Self::engage_slot(token, None)
-    }
-
-    fn engage_slot(token: StopToken, launch_id: Option<String>) -> Self {
         ENGAGED_ADVANCE.with(|slot| {
-            *slot.borrow_mut() = Some(EngagedAdvance { token, launch_id });
+            *slot.borrow_mut() = Some(EngagedAdvance { token });
         });
         Self {
             _not_send: std::marker::PhantomData,
@@ -957,89 +927,14 @@ fn with_stop_token<R>(f: impl FnOnce(&StopToken) -> R) -> Option<R> {
     token.map(|token| f(&token))
 }
 
-/// The launch id of the supervisor whose advance runs on this thread, or `None` for
-/// any other advance (the foreground runner's, which stays unfenced).
-fn engaged_launch_id() -> Option<String> {
-    ENGAGED_ADVANCE.with(|slot| slot.borrow().as_ref().and_then(|e| e.launch_id.clone()))
-}
-
-/// [`workflow::update_state`], fenced to the engaged supervisor's launch id inside a
-/// supervisor's advance (D-03): a supervisor the state no longer records gets
-/// [`workflow::WorkflowError::NotOwner`] and writes nothing.
-fn update_engaged_state<T>(
-    project_root: &Path,
-    phase: PhaseId,
-    apply: impl FnOnce(&mut State) -> Result<T, CliError>,
-) -> Result<(State, T), CliError> {
-    match engaged_launch_id() {
-        Some(launch_id) => workflow::update_owned_state(project_root, phase, &launch_id, apply),
-        None => workflow::update_state(project_root, phase, apply),
-    }
-}
-
-/// Whether `err` is the ownership fence's refusal (D-03).
-pub(crate) fn is_not_owner(err: &CliError) -> bool {
-    matches!(
-        err,
-        CliError::Workflow(workflow::WorkflowError::NotOwner { .. })
-    )
-}
-
-/// Run a gate side effect under the ownership fence (D-03, R-09). Inside a supervisor's
-/// advance this is [`workflow::while_owner`], so the check and `op` share one hold of the
-/// state write lock: a supersession is itself a state write under that lock, and lands
-/// wholly before the check (`op` is refused with `NotOwner`) or wholly after `op`.
-/// Outside one (the foreground runner's advance) it is `op`.
-///
-/// `op` is a bounded file operation that calls `Gates::*` directly. The gate lock is the
-/// only lock it may take, as the D-08 ruling of 2026-10-26 allows (see
-/// [`workflow::while_owner`]).
-///
-/// Not reentrant: engaged, this takes the state write lock, so it must not be called
-/// inside an `update_state`, `update_state_with`, `update_owned_state`,
-/// `clear_state_if_owned` or `while_owner` closure, and `op` must not call `fenced`,
-/// [`close_gate`] or [`commit`]. A second `flock` on the write-lock file from one process
-/// blocks forever. A site that needs a gate side effect and a state write does them one
-/// after the other, each under its own hold.
-pub(crate) fn fenced<T>(
-    project_root: &Path,
-    phase: PhaseId,
-    op: impl FnOnce() -> Result<T, CliError>,
-) -> Result<T, CliError> {
-    match engaged_launch_id() {
-        Some(launch_id) => workflow::while_owner(project_root, phase, &launch_id, op),
-        None => op(),
-    }
-}
-
-/// Refuse with `NotOwner` a supervisor the state no longer records, before a side effect
-/// the fence cannot hold its lock across (D-08), such as a checkout hook that merges, tags
-/// and pushes. A check, not a fence: a supersession landing after it is not seen until the
-/// next fenced step. It writes nothing, and passes outside a supervisor's advance.
-pub(crate) fn ensure_still_recorded(project_root: &Path, phase: PhaseId) -> Result<(), CliError> {
-    fenced(project_root, phase, || Ok(()))
-}
-
-/// `Gates::close` under the ownership fence ([`fenced`], and its non-reentrancy rule: this
-/// must not be called inside a state-write or `while_owner` closure). `commands::start`
-/// keeps its direct `Gates::close`: it runs before any supervisor exists.
+/// `Gates::close` for a stage of the run. It takes the gate lock, so it must not be
+/// called inside a state-write closure.
 pub(crate) fn close_gate(
     project_root: &Path,
     phase: PhaseId,
     stage: Stage,
 ) -> Result<CloseReport, CliError> {
-    fenced(project_root, phase, || {
-        Ok(Gates::close(project_root, phase, stage)?)
-    })
-}
-
-/// Remove the run's state: as the engaged supervisor when there is one
-/// ([`workflow::clear_state_if_owned`]), unfenced otherwise.
-pub(crate) fn clear_run_state(project_root: &Path, phase: PhaseId) -> Result<bool, CliError> {
-    Ok(match engaged_launch_id() {
-        Some(launch_id) => workflow::clear_state_if_owned(project_root, phase, &launch_id)?,
-        None => workflow::clear_state(project_root, phase)?,
-    })
+    Ok(Gates::close(project_root, phase, stage)?)
 }
 
 /// Commit one write site's change to the phase's state (D-08), and replace the
@@ -1054,16 +949,12 @@ pub(crate) fn clear_run_state(project_root: &Path, phase: PhaseId) -> Result<boo
 /// replace. That is on purpose: a field a site forgot to commit shows up in its
 /// tests rather than reaching disk by luck through a later write.
 ///
-/// Inside a supervisor's advance this is an owned write (D-03): a supervisor the state
-/// no longer records gets [`workflow::WorkflowError::NotOwner`] and writes nothing. The
-/// foreground runner's advance stays unfenced.
-///
 /// `apply` runs under the state write lock, so it never spawns a process, runs
 /// hooks, waits on a gate or takes another lock.
 pub(crate) fn commit(state: &mut State, apply: impl FnOnce(&mut State)) -> Result<(), CliError> {
-    let (committed, ()) = update_engaged_state(&state.project_root, state.phase, |s| {
+    let (committed, ()) = workflow::update_state(&state.project_root, state.phase, |s| {
         apply(s);
-        Ok(())
+        Ok::<_, CliError>(())
     })?;
     *state = committed;
     Ok(())
@@ -1236,14 +1127,12 @@ fn await_bound_answer(
         let left = timeout_secs.saturating_sub(started.elapsed().as_secs());
         match Gates::await_answer(project_root, phase, stage, gate_id, left, &cancel) {
             AwaitOutcome::Unbound { reason } => {
-                fenced(project_root, phase, || {
-                    Gates::set_aside_unbound(project_root, phase, stage, gate_id).map_err(|err| {
-                        CliError::Message(format!(
-                            "phase {phase}: the wait for {stage} gate {gate_id} ended: the file \
-                             in its answer slot does not bind to it ({reason}) and was not set \
-                             aside: {err}"
-                        ))
-                    })
+                Gates::set_aside_unbound(project_root, phase, stage, gate_id).map_err(|err| {
+                    CliError::Message(format!(
+                        "phase {phase}: the wait for {stage} gate {gate_id} ended: the file in \
+                         its answer slot does not bind to it ({reason}) and was not set aside: \
+                         {err}"
+                    ))
                 })?;
             }
             AwaitOutcome::Answered(answer) => return Ok(Some(answer)),
@@ -1362,8 +1251,6 @@ pub(crate) fn run_runner(project_root: &Path, phase: PhaseId) -> Result<i32, Cli
             "the runner could not report ready to systemd: {err}"
         ))
     })?;
-    // No launch id in the slot: the runner records no supervisor, so a fenced write
-    // would read NotOwner.
     let _token_slot = StopTokenGuard::engage_token(token.clone());
     let mut state = workflow::load_state(project_root, phase)?;
     let first = runner_first_step(&mut state);
@@ -1762,45 +1649,6 @@ pub(crate) fn launch_cache_dir() -> Result<PathBuf, CliError> {
                     .to_string(),
             )
         })
-}
-
-thread_local! {
-    /// Set only while a [`FailoverRelaunchGuard`] is alive. Per thread, like
-    /// [`ENGAGED_ADVANCE`]: the relaunch it covers runs on the advance's thread, and
-    /// parallel in-crate tests never share it.
-    static FAILOVER_RELAUNCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Marks the launch running on this thread as a failover relaunch (SUPV-02, D-04),
-/// for as long as the guard lives (RAII: an early return or a panic cannot leave it
-/// set). While it is engaged, [`refuse_launch`] keeps `state.supervisor`, so the
-/// never-silent end that follows a failed relaunch is a set of owned writes by the
-/// supervisor the state records (Phase 50 D-03 unchanged).
-/// Engaged only around the `launch_stage` call in [`fail_over_on_rate_limit`], which
-/// includes its `run_preflight` and any launch a preflight gate's answer starts there.
-struct FailoverRelaunchGuard {
-    /// Keeps the guard on the thread whose flag it set.
-    _not_send: std::marker::PhantomData<*const ()>,
-}
-
-impl FailoverRelaunchGuard {
-    fn engage() -> Self {
-        FAILOVER_RELAUNCH.with(|engaged| engaged.set(true));
-        Self {
-            _not_send: std::marker::PhantomData,
-        }
-    }
-}
-
-impl Drop for FailoverRelaunchGuard {
-    fn drop(&mut self) {
-        FAILOVER_RELAUNCH.with(|engaged| engaged.set(false));
-    }
-}
-
-/// Whether a [`FailoverRelaunchGuard`] is engaged on this thread.
-fn in_failover_relaunch() -> bool {
-    FAILOVER_RELAUNCH.with(std::cell::Cell::get)
 }
 
 /// The rate-limit handoff a [`StageLaunch`] relaunches the stage after (SUPV-02), so a
@@ -2331,11 +2179,7 @@ fn hand_off_agent(
 /// error, then [`handle_infra_outcome`] bumps `infra_failures` once and opens the
 /// never-silent gate, or aborts at the ceiling. Not the rate-limit gate: a refused
 /// canary stays recorded and refuses every later launch, so a resume after the
-/// reset could not succeed, and a successor whose shutdown was not confirmed may still run. The
-/// relaunch runs under [`FailoverRelaunchGuard`], so its failure keeps the
-/// supervisor record and those writes stay owned. A `NotOwner` from the relaunch
-/// means another launch owns the run: it is returned unchanged and nothing more
-/// is written.
+/// reset could not succeed, and a successor whose shutdown was not confirmed may still run.
 fn fail_over_on_rate_limit(
     project_root: &Path,
     state: &mut State,
@@ -2353,10 +2197,7 @@ fn fail_over_on_rate_limit(
                 to,
                 rate_limit: reason,
             };
-            let relaunched = {
-                let _keep_record = FailoverRelaunchGuard::engage();
-                launch_stage(state, None, Some(stage))
-            };
+            let relaunched = launch_stage(state, None, Some(stage));
             match relaunched {
                 // Inside the runner the launch comes back here: it carries the handoff,
                 // so a start the runner cannot make names it (`failed_start`).
@@ -2365,7 +2206,6 @@ fn fail_over_on_rate_limit(
                     Ok(Some(launch))
                 }
                 Ok(None) => Ok(None),
-                Err(err) if is_not_owner(&err) => Err(err),
                 Err(err) => {
                     let (event, payload, infra_reason) =
                         failed_start(stage, state.agent, Some(&relaunch), &err.to_string());
@@ -3188,7 +3028,6 @@ mod tests {
     use devflow_core::gates::Gates;
     use devflow_core::mode::Mode;
     use devflow_core::state::AgentKind;
-    use devflow_core::state::SupervisorRecord;
     use devflow_core::test_support::{answer_open_gate, gate_answer_files, preanswer_gate};
 
     macro_rules! enter_agent_free_child {
@@ -4885,8 +4724,7 @@ mod tests {
     }
 
     /// D-01 (re-arm, supervisor gone): a run whose supervisor exited without
-    /// stopping it is not stopped, and still names that supervisor.
-    /// `resume --fallback-agent` re-arms it all the same.
+    /// stopping it is not stopped. `resume --fallback-agent` re-arms it all the same.
     #[test]
     fn resume_with_a_fallback_agent_rearms_a_consumed_fallback_on_a_run_whose_supervisor_exited() {
         const NAME: &str = "pipeline_launch::tests::\
@@ -4912,25 +4750,10 @@ mod tests {
         // A stub `claude` cannot answer the stream launch's canary; a recorded outcome
         // is reused, never re-run.
         state.canary = Some(canary::CanaryOutcome::Confirmed);
-        // The record of a supervisor that exited without stopping the run: it is
-        // left behind, and its socket is gone.
-        const EXITED_LAUNCH: &str = "exited-launch";
-        state.supervisor = Some(SupervisorRecord::new(
-            root.join("gone.sock"),
-            EXITED_LAUNCH.to_string(),
-            1,
-            0,
-            "boot".to_string(),
-        ));
         workflow::save_state(&state).unwrap();
 
         let paused = workflow::load_state(root, phase).unwrap();
         assert!(!paused.stopped, "the run is not stopped");
-        assert_eq!(
-            paused.supervisor.as_ref().map(|r| r.launch_id.as_str()),
-            Some(EXITED_LAUNCH),
-            "the exited supervisor's record is left behind"
-        );
 
         let result = resume_with_fallback(root, phase, None, Some(AgentKind::Codex));
         let _runners = crate::service::double::LaunchedRunners;
@@ -5021,16 +4844,10 @@ mod tests {
         assert_eq!(reloaded.fallback_agent, Some(AgentKind::Codex));
         assert!(!reloaded.fallback_consumed);
         assert!(reloaded.stopped);
-        assert_eq!(reloaded.supervisor, None, "nothing launched");
-        assert_eq!(
-            reloaded.pending_supervisor, None,
-            "the reservation is given back"
-        );
     }
 
     /// D-02 through `resume --fallback-agent`: a fallback equal to the run's agent is
-    /// refused before any write, the notify command included (review B-3). The
-    /// reservation `reserve_launch` writes first is the one write, and it is given back.
+    /// refused before any write, the notify command included (review B-3).
     #[test]
     fn resume_refuses_a_fallback_equal_to_the_run_agent_before_any_write() {
         const NAME: &str = "pipeline_launch::tests::\
@@ -5071,11 +4888,6 @@ mod tests {
         assert_eq!(reloaded.fallback_agent, None);
         assert!(!reloaded.fallback_consumed);
         assert!(reloaded.stopped);
-        assert_eq!(reloaded.supervisor, None, "nothing launched");
-        assert_eq!(
-            reloaded.pending_supervisor, None,
-            "the reservation is given back"
-        );
     }
 
     /// Regression for 44-CORE-REVIEW-FINDINGS.md finding 2a: `resume` clears
@@ -5111,7 +4923,6 @@ mod tests {
                 "a failed resume must leave the phase marked stopped, not a false-active zombie"
             );
             assert!(reloaded.stop_reason.is_some_and(|r| r.contains("claude")));
-            assert!(reloaded.supervisor.is_none());
             return;
         }
 
@@ -5211,55 +5022,6 @@ mod tests {
             )
             .unwrap();
         });
-    }
-
-    /// WR-04 (18-fix, 50-23): an early failure in `launch_stage_inner` —
-    /// before `monitor::run_stage` ever runs — must not leave the
-    /// PREVIOUS stage's supervisor record behind. Pre-fix, the state still
-    /// named the previous stage's (now-dead) monitor after the launch
-    /// returned early via `?`, and `status`/`doctor` then misreported it as
-    /// gone while active, naming `devflow resume` — the wrong remedy for
-    /// what is actually a launch failure.
-    ///
-    /// Which early failure this reaches (checked by hand mutants, 50-22): the
-    /// child's PATH holds only `git` and an `exit 0` stub `claude`, so for an
-    /// `Auto` Code launch the delivery canary reads `Absent` and the launch
-    /// ends in [`refuse_launch`], before `ensure_agent_binary` runs. The
-    /// other early-failure path, [`record_failed_launch`], is pinned by
-    /// `a_failed_monitor_spawn_clears_the_supervisor_record`.
-    #[test]
-    fn launch_stage_inner_clears_the_supervisor_record_on_early_failure() {
-        const NAME: &str = "pipeline_launch::tests::\
-                            launch_stage_inner_clears_the_supervisor_record_on_early_failure";
-        enter_agent_free_child!(NAME, "claude");
-        let _guard = env_lock();
-
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(93);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Code;
-        // 50-23: the prior stage's supervisor record, which must be cleared,
-        // not carried forward into the new stage, or `status` reads
-        // GONE-while-active and names `devflow resume`.
-        state.supervisor = Some(fabricated_prior_record(root));
-        workflow::save_state(&state).unwrap();
-
-        let result = launch_stage_inner(&mut state, None, None);
-
-        assert!(
-            result.is_err(),
-            "the launch must fail early: the stub `claude` cannot confirm the canary"
-        );
-        assert_eq!(
-            state.supervisor, None,
-            "an early launch failure must clear the prior supervisor record in memory"
-        );
-        let reloaded = workflow::load_state(root, phase).unwrap();
-        assert_eq!(
-            reloaded.supervisor, None,
-            "the supervisor record clear must be persisted to state.json"
-        );
     }
 
     /// D-10: `advance_evaluated` emits `status` via `AgentStatus::as_wire_str()`
@@ -5743,9 +5505,6 @@ mod tests {
 
         let phase = PhaseId::new(122);
         let mut state = canary_state(root, phase);
-        // The previous stage's supervisor record, as `transition()` would
-        // leave it (50-23).
-        state.supervisor = Some(fabricated_prior_record(root));
         workflow::save_state(&state).unwrap();
 
         let calls = std::cell::Cell::new(0usize);
@@ -5767,16 +5526,7 @@ mod tests {
              got: {message}"
         );
 
-        assert_eq!(
-            state.supervisor, None,
-            "a refused launch must not leave the previous stage's supervisor record standing: \
-             it reads GONE-while-active and sends the operator to `devflow resume`"
-        );
         let reloaded = workflow::load_state(root, phase).unwrap();
-        assert_eq!(
-            reloaded.supervisor, None,
-            "the cleared supervisor record must be persisted, not only cleared in memory"
-        );
         assert_eq!(
             reloaded.canary,
             Some(canary::CanaryOutcome::Absent),
@@ -6023,10 +5773,6 @@ mod tests {
             "the launch path must surface the guard's own diagnosis, got: {message}"
         );
         assert_eq!(state.canary, Some(canary::CanaryOutcome::Absent));
-        assert!(
-            state.supervisor.is_none(),
-            "a refused launch must record no supervisor"
-        );
         assert_eq!(
             stage_launched_count(root, phase),
             0,
@@ -9014,18 +8760,6 @@ mod tests {
 
     // ---- 50-23: every launch failure path has a defined end state ----
 
-    /// A previous stage's supervisor record whose socket does not exist and
-    /// whose agent pgid does not fit `pid_t`, so no reaper can signal it.
-    fn fabricated_prior_record(dir: &Path) -> SupervisorRecord {
-        SupervisorRecord::new(
-            dir.join("prior-stage-never-bound.sock"),
-            "priorstage0000000000".to_string(),
-            4_294_967_000,
-            1,
-            String::new(),
-        )
-    }
-
     /// `source`'s non-test lines: the part before the first line that is
     /// exactly `mod tests {`, without its whole-line `//` comments. A
     /// trailing comment stays, as part of its code line.
@@ -9035,21 +8769,6 @@ mod tests {
             .take_while(|line| *line != "mod tests {")
             .filter(|line| !line.trim_start().starts_with("//"))
             .collect()
-    }
-
-    /// The lines of the item whose header line starts with `header`, through
-    /// the next line starting with `closing`; `None` when no line starts with
-    /// `header`.
-    fn item_lines<'a>(lines: &[&'a str], header: &str, closing: &str) -> Option<Vec<&'a str>> {
-        let start = lines.iter().position(|line| line.starts_with(header))?;
-        let mut item = vec![lines[start]];
-        for line in &lines[start + 1..] {
-            item.push(*line);
-            if line.starts_with(closing) {
-                break;
-            }
-        }
-        Some(item)
     }
 
     /// `line`'s code part: the text before its first `//` that lies outside a
@@ -9071,115 +8790,6 @@ mod tests {
             index += 1;
         }
         line
-    }
-
-    const CLEAR_REFUSE_NOT_FOUND: &str =
-        "refuse_launch not found in the non-test code (or under 3 lines)";
-    const CLEAR_REFUSE_NO_CLEAR: &str = "refuse_launch does not clear the supervisor record";
-    const CLEAR_GUARD_OUTSIDE_FAILOVER: &str =
-        "FailoverRelaunchGuard::engage( is called outside fail_over_on_rate_limit";
-
-    /// 50-13's rule as a pure scan over `source` (R6-G4): in the non-test,
-    /// comment-stripped code, `refuse_launch` clears the record. And (51-06) every
-    /// line whose code part engages `FailoverRelaunchGuard` lies inside
-    /// `fail_over_on_rate_limit`, the one relaunch allowed to keep the record.
-    fn launch_record_clear_violations(source: &str) -> Vec<String> {
-        let lines = non_test_code_lines(source);
-        let has = |item: &[&str], needle: &str| item.iter().any(|line| line.contains(needle));
-        let mut violations = Vec::new();
-        match item_lines(&lines, "fn refuse_launch(", "}").filter(|item| item.len() >= 3) {
-            None => violations.push(CLEAR_REFUSE_NOT_FOUND.to_string()),
-            Some(item) if !has(&item, "supervisor = None") => {
-                violations.push(CLEAR_REFUSE_NO_CLEAR.to_string());
-            }
-            Some(_) => {}
-        }
-        const FAILOVER_HEADER: &str = "fn fail_over_on_rate_limit(";
-        let failover = lines
-            .iter()
-            .position(|line| line.starts_with(FAILOVER_HEADER))
-            .map(|start| {
-                let len =
-                    item_lines(&lines[start..], FAILOVER_HEADER, "}").map_or(0, |item| item.len());
-                start..start + len
-            });
-        for (index, line) in lines.iter().enumerate() {
-            if code_part(line).contains("FailoverRelaunchGuard::engage(")
-                && !failover.as_ref().is_some_and(|span| span.contains(&index))
-            {
-                violations.push(CLEAR_GUARD_OUTSIDE_FAILOVER.to_string());
-            }
-        }
-        violations
-    }
-
-    /// T-50-62 (permanent source scan, R6-G4): the supervisor record is
-    /// cleared only on a launch failure path. The real file yields no
-    /// violation; planted sources, each padded to the floors so it carries
-    /// one defect, yield exactly that defect's violation.
-    #[test]
-    fn the_supervisor_record_is_cleared_only_on_launch_failure_paths() {
-        let real = launch_record_clear_violations(include_str!("pipeline_launch.rs"));
-        assert!(real.is_empty(), "pipeline_launch.rs: {real:?}");
-
-        let pad = |n: usize| "    let _filler = 0;\n".repeat(n);
-        let refuse = |body: &str| {
-            format!(
-                "fn refuse_launch(state: &mut State) {{\n{}{body}}}\n",
-                pad(2)
-            )
-        };
-        let good_refuse = refuse("    state.supervisor = None;\n");
-        let only = |violation: &str| vec![violation.to_string()];
-
-        assert_eq!(
-            launch_record_clear_violations(&good_refuse),
-            Vec::<String>::new(),
-            "a correct layout"
-        );
-        assert_eq!(
-            launch_record_clear_violations(&refuse("")),
-            only(CLEAR_REFUSE_NO_CLEAR)
-        );
-        assert_eq!(
-            launch_record_clear_violations(&format!("mod tests {{\n{good_refuse}")),
-            only(CLEAR_REFUSE_NOT_FOUND),
-            "functions only after the test-module cut are not found"
-        );
-
-        // The failover guard keeps the record through one relaunch only, so it is
-        // engaged in `fail_over_on_rate_limit` and nowhere else. Only a line's code
-        // part counts: the text before its first `//` outside a string literal.
-        let good = good_refuse.clone();
-        let engage = "FailoverRelaunchGuard::engage(";
-        assert_eq!(
-            launch_record_clear_violations(&format!(
-                "{good}fn fail_over_on_rate_limit(\n    let _keep = {engage});\n}}\n"
-            )),
-            Vec::<String>::new(),
-            "the one sanctioned site"
-        );
-        assert_eq!(
-            launch_record_clear_violations(&format!(
-                "{good}fn other() {{\n    let _keep = {engage});\n}}\n"
-            )),
-            only(CLEAR_GUARD_OUTSIDE_FAILOVER),
-            "an engage call in another fn"
-        );
-        assert_eq!(
-            launch_record_clear_violations(&format!(
-                "{good}fn other() {{\n    let u = \"http://x\"; {engage});\n}}\n"
-            )),
-            only(CLEAR_GUARD_OUTSIDE_FAILOVER),
-            "a `//` inside a string literal does not end the code part"
-        );
-        assert_eq!(
-            launch_record_clear_violations(&format!(
-                "{good}fn other() {{\n    let x = 1; // {engage} stays in failover\n}}\n"
-            )),
-            Vec::<String>::new(),
-            "a trailing comment is not a call"
-        );
     }
 
     /// Resume a stopped Code run of `phase` at `root` under Codex whose Code pass
@@ -11102,36 +10712,6 @@ mod tests {
                 assert_the_timer_answers(root, &row);
             }
         }
-    }
-
-    /// Review r2 agy-1: the runner's token-only slot engages the token for the safe
-    /// points with no launch id, so the fenced writes run unfenced. Control: a slot
-    /// written with a launch id (as a supervisor's engage wrote it) reads that id back,
-    /// so `engaged_launch_id` reads the slot.
-    #[test]
-    fn the_runner_slot_engages_the_token_without_a_launch_id() {
-        let token = StopToken::for_run();
-        {
-            let _slot = StopTokenGuard::engage_token(token.clone());
-            assert!(
-                with_stop_token(|_| ()).is_some(),
-                "the runner slot engages no token"
-            );
-            assert_eq!(
-                engaged_launch_id(),
-                None,
-                "the runner slot carries a launch id"
-            );
-        }
-        ENGAGED_ADVANCE.with(|slot| {
-            *slot.borrow_mut() = Some(EngagedAdvance {
-                token,
-                launch_id: Some("L1".into()),
-            });
-        });
-        let read = engaged_launch_id();
-        ENGAGED_ADVANCE.with(|slot| slot.borrow_mut().take());
-        assert_eq!(read.as_deref(), Some("L1"), "engage lost its launch id");
     }
 
     // ---- 52.2-05: the carried stop orderings, on the runner ----

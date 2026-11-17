@@ -145,11 +145,10 @@ How the other verbs use it:
   and a phase no runner runs that is neither stopped nor finished (repair
   `devflow resume --phase N`, or the `devflow start` line a run its `start`
   never prepared needs). A live or stopping runner, and a stopped or finished
-  run, are not findings; a launch reservation the state names while no runner
-  runs is a note. No repair names `resume` while the runner may be live.
+  run, are not findings. No repair names `resume` while the runner may be live.
   `doctor --json` gives each finding a `runner` object: `liveness` (`live`,
-  `stopping`, `not_live` or `error`), the runner's `pid` when its record reads,
-  and the reservation's launch id as `pending`. It also warns about a held
+  `stopping`, `not_live` or `error`) and the runner's `pid` when its record
+  reads. It also warns about a held
   state write lock, naming its holder, and lists set-aside gate answers.
 - **`devflow stop`** stops the unit; see its row under [Commands](#commands).
 

@@ -21,10 +21,7 @@
 
 use crate::CliError;
 use crate::config_parse::gate_timeout_secs;
-use crate::pipeline_launch::{
-    GateWaitEnd, StageLaunch, clear_run_state, close_gate, commit, ensure_still_recorded, fenced,
-    is_not_owner, launch_stage,
-};
+use crate::pipeline_launch::{GateWaitEnd, StageLaunch, close_gate, commit, launch_stage};
 use crate::pipeline_outcomes::{Answer, FinishPermit, truncate_reason};
 use devflow_core::gates::{self, Claim, GateAction, GateFile, GateId, GateKind, GateLabel, Gates};
 use devflow_core::mode;
@@ -80,13 +77,8 @@ pub(crate) fn transition(
         commit(state, |s| {
             s.stopped = true;
             s.stop_reason = Some(format!("stopped after {from} completed (--until {from})"));
-            // T-20-03b / doctor gap (D-09): clear the supervisor record and
-            // gate_pending so neither check_dead_agent nor check_dead_monitor
-            // misreports this intentional stop as a crashed agent or dead
-            // monitor (50-13): the supervisor running this advance finishes
-            // once it returns, so the record would otherwise name a socket
-            // that is gone.
-            s.supervisor = None;
+            // T-20-03b / doctor gap (D-09): clear gate_pending so doctor does
+            // not misreport this intentional stop as a gate with no waiter.
             s.gate_pending = false;
             // D-09: a run halted after its stage is no longer mid-fix, and the
             // fix pass's note goes with it.
@@ -121,7 +113,6 @@ pub(crate) fn transition(
         return Ok(None);
     }
 
-    ensure_still_recorded(project_root, state.phase)?;
     commit(state, |s| {
         s.stage = to;
         // GATE-03 / D-09: the move from Validate to Plan is the gap-closure
@@ -189,16 +180,14 @@ pub(crate) fn finish_run(
     // Operator decision (2026-11-11): a permitted finish wins over a late
     // stop. A stop taken during the advance that reached this finish (after
     // the Validate gate was approved, or while an auto pass advanced) is not
-    // honoured here: the run is recorded finished, and the supervisor answers
-    // that stop `already_finished` (`run_monitor` marks the run finished), so
-    // `devflow stop` reports the finish, never a hand-off. A stop that lands
+    // honoured here: the run is recorded finished, so `devflow stop` reports
+    // the finish, never a hand-off. A stop that lands
     // where no finish is permitted keeps its handling at the next safe point.
     let _ = close_gate(project_root, state.phase, state.stage);
     commit(state, |s| {
         s.stopped = true;
         s.finished = true;
         s.stop_reason = Some(FINISHED_STOP_REASON.to_string());
-        s.supervisor = None;
         s.gate_pending = false;
         s.code_fix = None;
         s.code_fix_note = None;
@@ -612,14 +601,7 @@ fn answer_as_rate_limit_timer(
     gate_id: &GateId,
 ) -> Result<bool, CliError> {
     commit(state, |s| s.rate_limit_auto_relaunch_used = true)?;
-    let written = fenced(project_root, state.phase, || {
-        Ok(Gates::rate_limit_timer_answer(
-            project_root,
-            state.phase,
-            stage,
-            gate_id,
-        ))
-    })?;
+    let written = Gates::rate_limit_timer_answer(project_root, state.phase, stage, gate_id);
     let outcome = match written {
         Ok(_) => {
             println!(
@@ -751,15 +733,8 @@ fn open_and_await(
     loop {
         // A crash inside this call before the publish leaves `gate_pending` with no
         // gate file, which `doctor`'s `check_gate_pending_without_gate` reports.
-        let (opened, registration) = fenced(project_root, state.phase, || {
-            Ok(Gates::open_registered(
-                project_root,
-                state.phase,
-                stage,
-                label,
-                &context,
-            )?)
-        })?;
+        let (opened, registration) =
+            Gates::open_registered(project_root, state.phase, stage, label, &context)?;
         let gate_id = &opened.gate_id;
         println!(
             "gate written: .devflow/gates/{}-{stage}.json — awaiting response",
@@ -839,17 +814,7 @@ fn open_and_await(
                     event_context = refused_answer_context(&refusal, question_event);
                     continue;
                 }
-                let claim = fenced(project_root, state.phase, || {
-                    Ok(Gates::claim(project_root, state.phase, stage, gate_id))
-                });
-                let claim = match claim {
-                    Ok(claim) => claim,
-                    // D-03: not the recorded supervisor, so nothing was claimed.
-                    Err(err) => {
-                        registration.finish();
-                        return Err(err);
-                    }
-                };
+                let claim = Gates::claim(project_root, state.phase, stage, gate_id);
                 #[cfg(test)]
                 note_claim(&claim);
                 match claim {
@@ -983,13 +948,8 @@ fn refused_answer_context(refusal: &crate::pipeline_outcomes::Refusal, question:
 /// Abort the workflow with a reason, clearing state.
 pub(crate) fn abort(project_root: &Path, state: &State, reason: &str) -> Result<(), CliError> {
     // See CR-01: an answer for this phase+stage must not outlive the run. An unused
-    // one is set aside, never deleted. D-03: a superseded supervisor ends nothing, so its
-    // refusal goes up instead of the rest of the abort.
-    // A supervisor's stderr is `/dev/null`, so each failure is an event too.
+    // one is set aside, never deleted. Each failure is an event too.
     if let Err(err) = close_gate(project_root, state.phase, state.stage) {
-        if is_not_owner(&err) {
-            return Err(err);
-        }
         eprintln!(
             "warning: phase {} abort could not close its {} gate: {err}",
             state.phase, state.stage
@@ -1001,10 +961,7 @@ pub(crate) fn abort(project_root: &Path, state: &State, reason: &str) -> Result<
             serde_json::json!({ "stage": state.stage.to_string(), "error": err.to_string() }),
         );
     }
-    if let Err(err) = clear_run_state(project_root, state.phase) {
-        if is_not_owner(&err) {
-            return Err(err);
-        }
+    if let Err(err) = devflow_core::workflow::clear_state(project_root, state.phase) {
         events::emit(
             project_root,
             state.phase,
@@ -1156,36 +1113,6 @@ mod tests {
             devflow_core::events::last_event_of_kind_for_phase(root, phase, "workflow_finished")
                 .expect("the --until clean stop emits workflow_finished");
         assert_eq!(finished["reason"], "stopped_at", "{finished}");
-    }
-
-    /// 50-13: the `--until` stop clears the supervisor record, because the
-    /// supervisor running this advance finishes once the advance returns.
-    /// The record is set first, so a stop that leaves it standing fails here.
-    #[test]
-    fn until_stop_clears_the_supervisor_record() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(1313);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Plan;
-        state.stop_until = Some(Stage::Plan);
-        state.supervisor = Some(devflow_core::state::SupervisorRecord::new(
-            root.join("until.sock"),
-            "until00000000000".to_string(),
-            4242,
-            1,
-            String::new(),
-        ));
-        workflow::save_state(&state).unwrap();
-
-        transition(root, &mut state, Stage::Code).unwrap();
-
-        let reloaded = workflow::load_state(root, phase).unwrap();
-        assert!(reloaded.stopped, "the --until stop marks the run stopped");
-        assert_eq!(
-            reloaded.supervisor, None,
-            "the --until stop clears the supervisor record"
-        );
     }
 
     /// An `abort` whose state cannot be removed says so, on the event a supervisor's
