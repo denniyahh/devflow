@@ -22,8 +22,9 @@ mod common;
 
 use common::HermeticPath;
 use devflow_core::phase_id::PhaseId;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -307,6 +308,135 @@ fn a_hermetic_child_resolves_the_fake_service_manager_first() {
     assert!(
         message.contains("hermetic_devflow"),
         "the refusal must name hermetic_devflow; it said {message:?}"
+    );
+}
+
+/// Text the planted stand-in for a developer's real agent CLI prints.
+const REAL_AGENT_TEXT: &str = "the developer's real agent ran";
+
+/// Text a test's own working stub prints.
+const OWN_STUB_TEXT: &str = "the test's own stub ran";
+
+/// A dir holding an executable `name` per entry of `names`, each with `body`.
+fn dir_of_programs(names: &[&str], body: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("create a program dir");
+    for name in names {
+        let path = dir.path().join(name);
+        fs::write(&path, body).expect("write a planted program");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+            .expect("make a planted program executable");
+    }
+    dir
+}
+
+/// `program` resolved and run on exactly `path`, the way DevFlow launches an
+/// agent by name. The one PATH override in this file: it runs a planted
+/// program, never `devflow`, on a PATH built from temp dirs only.
+fn run_on_path(program: &str, path: &OsStr) -> std::process::Output {
+    Command::new(program)
+        .env("PATH", path)
+        .output()
+        .unwrap_or_else(|err| panic!("run {program} on PATH {path:?}: {err}"))
+}
+
+fn joined(dirs: &[&Path]) -> OsString {
+    std::env::join_paths(dirs).expect("temp dirs hold no ':'")
+}
+
+#[test]
+fn a_hermetic_path_never_falls_through_to_a_real_agent_cli() {
+    let home = common::HermeticHome::new();
+    let service_bin = home.service_bin();
+    let programs = common::agent_programs();
+    for registry_name in ["claude", "codex", "opencode", "pi", "agy", "hermes"] {
+        assert!(
+            programs.contains(&registry_name),
+            "agent_programs() must name {registry_name}; it is {programs:?}"
+        );
+    }
+
+    // Stand-in for the developer's PATH: a working fake of every agent name.
+    let real = dir_of_programs(
+        &programs,
+        &format!("#!/bin/sh\necho \"{REAL_AGENT_TEXT}\"\n"),
+    );
+    let parent = joined(&[real.path()]);
+    // A test stub whose interpreter is missing: exec fails with ENOENT.
+    let broken = dir_of_programs(&["codex"], "#!/nonexistent/interpreter\n");
+    let own = dir_of_programs(
+        &["codex"],
+        &format!("#!/bin/sh\necho \"{OWN_STUB_TEXT}\"\n"),
+    );
+
+    // Control: without the guard, the broken stub falls through to the real CLI.
+    let unguarded = run_on_path("codex", &joined(&[broken.path(), real.path()]));
+    assert!(
+        String::from_utf8_lossy(&unguarded.stdout).contains(REAL_AGENT_TEXT),
+        "the control must reach the planted real codex past the broken stub, or this \
+         test cannot fail; it printed {unguarded:?}"
+    );
+
+    // Guarded: the same PATH stops at the guard, loudly, for every agent name.
+    let guarded = common::guarded_path(
+        &service_bin,
+        &joined(&[broken.path(), real.path()]),
+        &parent,
+    );
+    for program in &programs {
+        let output = run_on_path(program, &guarded);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.code() == Some(common::NO_STUB_EXIT)
+                && stderr.contains(&format!("fake {program}{}", common::NO_STUB_TEXT))
+                && !String::from_utf8_lossy(&output.stdout).contains(REAL_AGENT_TEXT),
+            "{program} on the guarded PATH {guarded:?} must stop at the guard; it \
+             exited {} with stdout {:?} and stderr {stderr:?}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    // A test's own working stub still wins over the guard.
+    let with_stub =
+        common::guarded_path(&service_bin, &joined(&[own.path(), real.path()]), &parent);
+    let output = run_on_path("codex", &with_stub);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        OWN_STUB_TEXT,
+        "the test's own stub must answer first on {with_stub:?}; got {output:?}"
+    );
+
+    // The real builder and helper put the guard right after the fake service
+    // dir, before everything inherited from this process's PATH.
+    let mut command = common::hermetic_devflow(&home);
+    let second = |command: &Command| std::env::split_paths(&env_set_by(command, "PATH")).nth(1);
+    assert_eq!(
+        second(&command).as_deref(),
+        Some(home.agent_guard().as_path()),
+        "hermetic_devflow must put the agent guard second on PATH"
+    );
+    let stub_then_inherited = format!(
+        "{}:{}",
+        own.path().display(),
+        std::env::var_os("PATH")
+            .unwrap_or_default()
+            .to_string_lossy()
+    );
+    command.hermetic_path(&stub_then_inherited);
+    let path = env_set_by(&command, "PATH");
+    let entries: Vec<PathBuf> = std::env::split_paths(&path).collect();
+    assert_eq!(
+        entries.get(..3),
+        Some(
+            &[
+                service_bin.clone(),
+                own.path().to_path_buf(),
+                home.agent_guard()
+            ][..]
+        ),
+        "hermetic_path must keep the fake dir, then the test's own dir, then the guard; \
+         PATH is {}",
+        path.display()
     );
 }
 
