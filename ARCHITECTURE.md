@@ -150,7 +150,7 @@ gate wait (D-08):
   removed.
 - **Foreground holder** (`.devflow/.holder-{phase:02}`, `liveness.rs`) — held for
   its lifetime by a foreground verb (`start` and `resume` until `systemd-run`
-  returns, `discard`, a hand-run `devflow advance`), recording its pid and start
+  returns, `discard`), recording its pid and start
   time, so no two of them act on the phase at once. It installs no stop handler:
   `devflow stop` never signals it, and refuses while it is held and no runner is
   live.
@@ -237,16 +237,14 @@ which holds no write lock and waits through `Gates::await_answer()`. That reads
 the gate's answer slot with a backoff (1s → 2s → … capped at 60s) and checks for a
 stop at least once a second, one of two ways:
 
-- **Inside a supervisor's advance** (its stop token is engaged, 50-13): the
-  run's owner reads `gate_wait` in a `ping` reply for the length of the wait,
-  and the stop token is what is checked. A stop — a `shutdown` request on the
-  supervisor's socket, or SIGTERM/SIGINT to the supervisor — ends the wait within
-  about a second: the gate is closed, `stopped` is recorded in the state, which is
-  kept for `devflow resume` (not an abort), and the advance unwinds without acting
-  on the gate. A stop accepted in the same second as an answer wins.
-- **Anywhere else** (no stop token: the hidden `devflow advance` run from a
-  shell, or a gate a foreground command fires): the foreground holder's stop flag
-  is checked instead (safe point 4). `devflow stop` signals no holder; it stops
+- **Inside the runner's advance** (its run-long stop token is engaged, D-05): the
+  stop token is what is checked. A stop — SIGTERM/SIGINT to the runner, which
+  `devflow stop` sends by stopping the run's unit — ends the wait within about a
+  second: the gate is closed, `stopped` is recorded in the state, which is kept
+  for `devflow resume` (not an abort), and the advance unwinds without acting on
+  the gate. A stop accepted in the same second as an answer wins.
+- **Anywhere else** (no stop token: a gate a foreground command fires): the
+  foreground holder's stop flag is checked instead (safe point 4). `devflow stop` signals no holder; it stops
   the run's unit ([Runner unit](#runner-unit)).
 
 A file in the slot that does not bind to the gate is set aside and the wait goes

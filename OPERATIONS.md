@@ -49,25 +49,12 @@ Plan → Code → Validate
 | `devflow discard --phase N [PROJECT] [--delete-unmerged-branch BRANCH]` | Remove one phase's worktree (`.worktrees/phase-NN`, with everything in it: uncommitted and ignored files too), its run state (`.devflow/state-NN.json`) and its feature branch (`feature/phase-NN`). It first lists what it will remove: the worktree with its count of uncommitted changes, the state file, and the branch with whether it is merged into the base (the base the run recorded, else the project's). Each of the three is listed and removed only if it exists, so it also clears a leftover branch or worktree that has no state, and a state file that does not load. It also lists and removes the debris a killed run leaves (D-06): the phase's files under `.devflow/gates/` (gate requests, answers, claims, unheld waiter registrations and write temps), each stage's through its gate close, which sets an unclaimed answer aside rather than deleting it; and the phase's `*.hold-tmp` temps whose creator has exited, through the orphan sweep, which then also removes any other orphan temp in `.devflow/` and `.devflow/gates/` and names each. A temp whose creator still runs is kept and named. So a phase with nothing but gate files or temps is discarded too. Nothing else under `.devflow/` is removed (never `.holder-NN`, `.runner-NN` or a set-aside answer), and no other phase or branch is touched. **Refuses, removing nothing:** a live run (a running agent, or an ALIVE or pending supervisor), a STALE supervisor or a failed probe, and any supervisor socket of this project and phase that may still run and that the state does not name, whether the state is missing, does not load, or loads and names another launch or none, as a finished run's does while its supervisor is still exiting (or a socket directory that cannot be listed): each names `devflow stop --phase N`. Also when the state is missing or does not load, a held launch liveness lock (`.devflow/supervisor-<launch>.live`) that no other phase's state records: it may be this phase's supervisor before it publishes its socket, which no socket sweep shows and `devflow stop` cannot signal, so the refusal names the lock and its holder, and discard is run again once that launch has published or exited. A gate of the phase whose waiter registration is held, or cannot be probed: something may still wait on it. A phase another foreground DevFlow process holds. A branch with commits not merged into the base, unless `--delete-unmerged-branch` names it: the value must be exactly `feature/phase-NN`, and a different name is refused. A branch whose merge state cannot be read. A branch checked out in the primary checkout (`start --no-worktree`): it names `git switch <base>` and never switches itself. A branch checked out in any other worktree than the phase's own. A directory at `.worktrees/phase-NN` that git does not list as a worktree. A phase worktree that is not on `feature/phase-NN` (another branch, or a detached HEAD, whose commits no branch may keep). A phase worktree whose status cannot be read (after its directory was deleted by hand, run `git worktree prune` first). A phase with no state, worktree, branch, gate file or hold temp. It holds the phase's foreground holder from its first check to its last removal, so a `start` cannot begin in between. A removal that fails prints a `warning:` line and the exit is non-zero |
 | `devflow doctor [--json]` | Environment audit (agents installed, versions, RUST_LOG) plus per-phase reconciliation, including each phase's supervisor liveness and a read-only sweep for orphan supervisor sockets (see [Run liveness](#run-liveness)); `--json` emits one object with the keys `environment`, `reconciliation`, `planning_doc_staleness`, `stray_processes`, `orphan_supervisors` and `orphan_supervisor_sweep_error` |
 
-(`devflow advance` is internal and takes `--phase N`. A supervisor does not
-run it as a command; it advances in-process. `devflow status` does not suggest
-it, because answering a gate and then running it sets the answer aside, and a
-hand-run advance refuses while a supervisor of the phase is live.)
-
-(`devflow monitor` is internal and registered as the hidden `__monitor`
-subcommand — it is the stage supervisor's own process body. Every stage
-launch re-execs it detached, in its own process group, in one of two launch
-shapes: **capture** (agent stdin `/dev/null`, stdout and stderr to the phase
-capture files) for adapters other than Claude and Antigravity (such as `codex`
-and `opencode`) and a checkpoint resume; or **stream** (the
-supervisor owns the agent's stdin and stdout pipes and applies the idle
-timeout) for a Claude or Antigravity `stream-json` launch. Both shapes run the
-same Rust supervisor: it starts the agent in the agent's own process group,
-records its pid and exit code, answers on a per-launch socket (see [Run
-liveness](#run-liveness)), and when the agent exits runs the advance
-in-process; the next stage's supervisor publishes its socket before this one
-removes its own. Never run it by hand: it expects to own the agent and writes
-the phase's capture, exit-code and agent-pid files as it goes.)
+(`devflow runner` is internal and registered as the hidden `__runner`
+subcommand: it is the command of a phase's user unit, which `devflow start`
+and `devflow resume` launch through `systemd-run` ([Run shape](#run-shape)).
+It takes the phase's runner lock, reports ready to systemd, and runs every
+stage of the phase in its own process, each stage's agent its child, waiting
+at each gate until it is answered from any shell. Never run it by hand.)
 
 ## Run shape
 
@@ -687,7 +674,7 @@ gate show <phase>` prints all of it.
 
 The command is saved in the run's state file (`gate_notify_cmd` in
 `.devflow/state-NN.json`), so gates fired by the run's unit use it
-without your shell's environment. `devflow start`, `resume` and `advance`
+without your shell's environment. `devflow start` and `resume`
 update the saved command from the variable: unset keeps it, a new value
 replaces it, and an empty value (`DEVFLOW_GATE_NOTIFY_CMD= devflow resume …`)
 turns notification off for the run.
@@ -714,7 +701,7 @@ command. The coding agent never receives the variable.
 | `DEVFLOW_CLAUDE_IDLE_TIMEOUT_SECS` | 120 | How long the pipe-owning Claude monitor waits with NO output on the child's stream before recording an `idle_timeout` verdict and terminating it. Clamped to a 120s floor: a lower value is raised and the clamp is printed loudly at `devflow start`. The floor is 4x the CLI's measured `tool_progress` keepalive interval (a fixed 30.00s, measured 2026-08-03 over five workload-controlled trials on CLI 2.1.220), so it survives three consecutive missed keepalives; the earlier 30s floor sat exactly ON the keepalive interval and would have killed healthy stages running any tool call longer than ~30s, including `cargo test --workspace`. Every stream line resets the window, so a healthy long-running stage is never bounded by wall clock |
 | `RUST_LOG` | `off` | Tracing verbosity (stderr). Unset or empty prints no tracing lines; set a level such as `info` or `debug` to see them |
 | `DEVFLOW_LOG_FORMAT` | plain | `json` for machine-readable log lines |
-| `DEVFLOW_E2E_CHILD_TIMEOUT_SECS` | 90 | Test-only: bounds `gate_sweep_e2e.rs`'s patience with a spawned `devflow advance` child so CI cannot hang indefinitely; not read by any production code path |
+| `DEVFLOW_E2E_CHILD_TIMEOUT_SECS` | 90 | Test-only: bounds `gate_sweep_e2e.rs`'s patience with a spawned `devflow __runner` child so CI cannot hang indefinitely; not read by any production code path |
 
 ## `.devflow/` file inventory
 
@@ -723,7 +710,7 @@ command. The coding agent never receives the variable.
 | `state-NN.json` | A phase's persisted stage-machine state (per phase since 14a) |
 | `.state-NN.lock` | The phase's short state write lock: held for one state write, usually milliseconds and never across a gate wait, and never removed |
 | `.gates-NN.lock` | The per-phase gate lock: held for a few file operations, never removed |
-| `.holder-NN` | D-17 foreground holder: held by a foreground verb for its lifetime (a `start` or `resume` until its unit is launched, a `discard`, a hand-run `advance`), recording its pid and start time. `stop` refuses while it is held and no runner is live, and never signals it; never removed by `discard` |
+| `.holder-NN` | D-17 foreground holder: held by a foreground verb for its lifetime (a `start` or `resume` until its unit is launched, a `discard`), recording its pid and start time. `stop` refuses while it is held and no runner is live, and never signals it; never removed by `discard` |
 | `supervisor-<launch_id>.live` | Launch reservation: its lock is taken before the pending record is saved and held by the spawned supervisor for life. No DevFlow verb removes an abandoned one (D-06) |
 | `*.hold-tmp` | A hold being taken, here or under `gates/`. An orphan is removed by `devflow discard --phase N` when phase N has one |
 | `phase-NN-stdout` / `phase-NN-stderr.log` | Agent capture files (what `logs` tails) |
