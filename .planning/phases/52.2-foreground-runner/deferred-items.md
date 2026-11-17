@@ -1,9 +1,10 @@
 ## Deferred Items
 
 - A failed agent spawn in the runner reads "failed to spawn monitor"
-  status: open
+  status: resolved (52.2-11, commits cc9b4a9 and a807948)
   **What:** `MonitorError::Io`'s text (`crates/devflow-core/src/monitor.rs:38`, `failed to spawn monitor: {0}`) is what `stage_launch_failed`'s `error` carries when `monitor::run_stage` cannot exec the agent inside the runner, although no monitor is spawned there. Seen in 52.2-02's `runner_e2e::a_stage_the_runner_cannot_start_opens_the_infra_gate_with_an_event` (`failed to spawn monitor: No such file or directory (os error 2)`).
   **Why deferred:** devflow-core's error text is outside 52.2-02's files; changing a `pub` error's Display is a devflow-core change. 52.2-11, which deletes the old monitor path, is the natural owner.
+  **Resolution:** the runner's `run_one_stage` maps `MonitorError::Io` to `could not spawn the agent: <io error>`, so `stage_launch_failed`'s `error` reads `could not spawn the agent: No such file or directory (os error 2)` (`runner_e2e::a_stage_the_runner_cannot_start_opens_the_infra_gate_with_an_event` checks it names the spawn). devflow-core's `MonitorError` Display is unchanged (no published-API change); `spawn_monitor`, which that text describes, has no CLI caller left.
 
 - A hermetic test child can reach a real agent CLI on the developer's PATH
   status: resolved (52.2-21, commit 9ffbfdb)
@@ -42,3 +43,8 @@
   status: resolved (52.2-10, commit c478ef5)
   **What:** `no_waiter_repair` (`crates/devflow-cli/src/commands.rs`), printed when `gate approve|reject|abort` finds no live waiter, told the operator to run `devflow recover --clean --phase N`. Noted by 52.2-09 under Issues Encountered; the verb's removal (D-06) made it a repair that no longer parses.
   **Resolution:** it now names `devflow resume --phase N` to continue the run or `devflow discard --phase N` to remove it; `gate_wedge_e2e::start_wedge_arm_interrupted_start_leaves_a_plan_gate_nothing_answers` asserts the discard line, and `commands::tests::no_production_string_names_the_removed_recover_verb` fails on any production line naming the verb.
+
+- `service_e2e`'s `UnitGuard` teardown can read the unit as still `loaded`
+  status: open
+  **What:** `service_e2e::start_launches_a_unit_and_returns_with_the_run_live` (host-only, `--run-ignored only`) fails in its `UnitGuard` drop with `unit devflow-<digest>-81.service was not removed` (`left: "loaded"`, `right: "not-found"`): the guard runs `systemctl --user stop`, then `reset-failed`, then reads `LoadState` once, and the transient unit is sometimes not yet collected. Seen by 52.2-11 in 2 of 6 runs at its head and in 2 of 8 runs at the plan's base `34febac` (built in a scratch worktree), so it predates 52.2-11. The test body's own assertions passed in every run.
+  **Why deferred:** found by 52.2-11 outside its files and its subject. Fix shape: poll `LoadState` for `not-found` with a short bound in the guard's drop instead of reading it once. Owner: 52.2-17, the one remaining plan whose files_modified lists `crates/devflow-cli/tests/service_e2e.rs`, else a 999.x entry at phase close.

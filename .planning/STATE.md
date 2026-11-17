@@ -5,16 +5,16 @@ milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: "52.2"
 current_phase_name: Foreground Runner
 status: executing
-stopped_at: Completed 52.2-10-PLAN.md
-last_updated: "2026-11-17T11:40:08.693Z"
+stopped_at: Completed 52.2-11-PLAN.md
+last_updated: "2026-11-17T12:35:23.708Z"
 last_activity: 2026-11-16
 last_activity_desc: Phase 52.2 execution started
-state_head: c478ef5a6e06709c7ec6dd697ec08e8e1e63888c
+state_head: a80794844243000db400bca5f67e99ad11a7d989
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 66
-  completed_plans: 53
+  completed_plans: 54
   percent: 17
 ---
 
@@ -172,7 +172,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 52.2 (Foreground Runner) — EXECUTING
-Plan: 14 of 26
+Plan: 15 of 26
 Status: Ready to execute
 Last activity: 2026-11-16 — Phase 52.2 execution started
 
@@ -971,6 +971,8 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 52.2]: 52.2-10: a held or unprobeable gate waiter refuses the whole discard before any removal
 - [Phase 52.2]: 52.2-10: discard sweeps orphan hold temps directory-wide via remove_orphan_hold_temps and names each removed path
 - [Phase 52.2]: 52.2-10: the recycled agent-pid repair names the pid file, since discard reads it too
+- [Phase 52.2]: 52.2-11: the runner test's preflight control is supervise mode; a committed CONTEXT.md does not clear Codex's auto-mode unattended-launch refusal at Plan
+- [Phase 52.2]: 52.2-11: launch_stage resolves run_preflight's PreflightOutcome through launch_after_preflight; an approval launches launch_stage_inner(state, None, None) in the runner
 
 ## Roadmap Evolution
 
@@ -1135,11 +1137,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 52.2 P22 | 15min | 2 tasks | 7 files |
 | Phase 52.2 P09 | 30 min | 3 tasks | 2 files |
 | Phase 52.2 P10 | 18 min | 3 tasks | 14 files |
+| Phase 52.2 P11 | 47 min | 3 tasks | 14 files |
 
 ## Session
 
-**Last session:** 2026-11-17T11:40:07.827Z
-**Stopped at:** Completed 52.2-10-PLAN.md
+**Last session:** 2026-11-17T12:35:22.810Z
+**Stopped at:** Completed 52.2-11-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
