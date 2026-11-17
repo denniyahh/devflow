@@ -9,6 +9,7 @@
 
 mod common;
 
+use common::HermeticPath;
 use devflow_core::liveness;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::state::{PendingSupervisor, State};
@@ -194,7 +195,7 @@ impl Fixture {
             .args(extra)
             .arg(&self.root)
             .current_dir(&self.root)
-            .env("PATH", path)
+            .hermetic_path(path)
             .env(HOLD_ENV, self.hold.spec(hold_stage));
         command
     }
