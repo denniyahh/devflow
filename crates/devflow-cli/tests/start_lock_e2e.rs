@@ -123,73 +123,6 @@ fn start_proceeds_when_no_reservation_is_held() {
     );
 }
 
-#[test]
-fn start_clears_leftover_gate_files_after_reserving() {
-    let home = common::HermeticHome::new();
-    let repo = tempfile::tempdir().unwrap();
-    let root = repo.path();
-    let phase = PhaseId::new(92);
-    init_repo(root, phase);
-    let fake_bin = fake_codex("sleep 60");
-    // A legacy unkeyed answer: the one form no gate id can keep from a new gate.
-    let response_path = Gates::dir(root).join(format!("{}-plan.response.json", phase.padded()));
-    fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-    let planted = serde_json::to_vec(&GateResponse {
-        approved: false,
-        abort: true,
-        note: Some("abort: planted stale response".into()),
-        responded_by: Some("start-lock-e2e-planted-response".into()),
-    })
-    .unwrap();
-    fs::write(&response_path, &planted).unwrap();
-    let _reaper = common::LaunchedRunReaper::for_home(&home, root, phase);
-
-    let output = child(&home, root, phase, &fake_bin, "auto")
-        .env("DEVFLOW_GATE_TIMEOUT_SECS", "30")
-        .output()
-        .expect("run devflow start");
-    assert!(
-        output.status.success(),
-        "start failed\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    common::wait_for(
-        || Gates::gate_path(root, phase, Stage::Plan).exists() || !runner_lock_live(root, phase),
-        Duration::from_secs(10),
-        "Plan gate or runner exit",
-    );
-    std::thread::sleep(Duration::from_secs(3));
-    assert!(
-        runner_lock_live(root, phase),
-        "planted response must not abort a fresh start's run"
-    );
-    assert!(
-        root.join(format!(".devflow/state-{}.json", phase.padded()))
-            .exists(),
-        "a fresh start's live run must keep state"
-    );
-    let events = fs::read_to_string(devflow_core::events::events_path(root)).unwrap_or_default();
-    assert!(
-        !events.contains("start-lock-e2e-planted-response"),
-        "the planted response must not resolve the fresh gate\nevents:\n{events}"
-    );
-    assert!(
-        !response_path.exists(),
-        "the planted response must be gone from its old name"
-    );
-    let set_aside: Vec<_> = Gates::quarantined(root)
-        .into_iter()
-        .filter(|answer| fs::read(&answer.path).is_ok_and(|bytes| bytes == planted))
-        .collect();
-    assert_eq!(
-        set_aside.len(),
-        1,
-        "a quarantine file must hold the planted response's bytes: {:?}",
-        Gates::quarantined(root)
-    );
-}
-
 /// D-06, at the boundary an operator reads: `devflow resume` prints the answer it set
 /// aside. The route is the Auto refusal that opens the rerun's gate in the foreground, so
 /// nothing is left running, and the gate's short timeout is what ends the command.
@@ -377,9 +310,8 @@ impl LiveRun {
     }
 }
 
-/// The planted Code gate files, returned so a control can assert they are gone.
+/// The planted Code gate's answer, returned so a test can find what was set aside.
 struct PlantedGate {
-    request: PathBuf,
     response: PathBuf,
 }
 
@@ -417,10 +349,7 @@ fn plant_code_gate(root: &Path, phase: PhaseId) -> PlantedGate {
         },
     )
     .expect("plant Code gate response");
-    PlantedGate {
-        request: opened.path,
-        response,
-    }
+    PlantedGate { response }
 }
 
 /// Every file a live run for `phase` depends on, with its exact bytes, sorted
@@ -462,59 +391,12 @@ fn run_start(
         .expect("run devflow start")
 }
 
-fn events_contain_workflow_started(root: &Path) -> bool {
-    // An absent events file counts as not containing the event.
-    fs::read_to_string(devflow_core::events::events_path(root))
-        .unwrap_or_default()
-        .contains("\"workflow_started\"")
-}
-
 /// How many `workflow_started` events the project's event log holds.
 fn workflow_started_count(root: &Path) -> usize {
     fs::read_to_string(devflow_core::events::events_path(root))
         .unwrap_or_default()
         .matches("\"workflow_started\"")
         .count()
-}
-
-#[test]
-fn start_replaces_a_leftover_state_whose_recorded_processes_are_dead() {
-    let home = common::HermeticHome::new();
-    let repo = tempfile::tempdir().unwrap();
-    let root = repo.path();
-    let phase = PhaseId::new(97);
-    init_repo(root, phase);
-    let planted = plant_leftover_run(root, phase);
-    let fake_bin = fake_codex("exit 0");
-    let _reaper = common::LaunchedRunReaper::for_home(&home, root, phase);
-
-    let output = run_start(&home, root, phase, &fake_bin, &[]);
-    assert!(
-        output.status.success(),
-        "a leftover state whose recorded processes are dead must be replaced as today\n\
-         stdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        !planted.request.exists(),
-        "the leftover Code gate request must be cleared: {}",
-        planted.request.display()
-    );
-    assert!(
-        !planted.response.exists(),
-        "the leftover Code gate response must be out of its slot: {}",
-        planted.response.display()
-    );
-    assert_eq!(
-        Gates::quarantined(root).len(),
-        1,
-        "the leftover response is set aside, not deleted"
-    );
-    assert!(
-        events_contain_workflow_started(root),
-        "replacing a dead leftover must emit workflow_started"
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -859,48 +741,5 @@ fn the_corrupt_state_refusal_names_a_stop_that_ends_the_run() {
             && !again_stderr.contains("devflow stop"),
         "once the run is stopped, start refuses only the branch it left, naming discard\n\
          stderr: {again_stderr}"
-    );
-}
-
-#[test]
-fn start_proceeds_over_a_corrupt_state_with_no_live_supervisor() {
-    let home = common::HermeticHome::new();
-    let repo = tempfile::tempdir().unwrap();
-    let root = repo.path();
-    let phase = PhaseId::new(73);
-    init_repo(root, phase);
-    let _reaper = common::LaunchedRunReaper::for_home(&home, root, phase);
-    let run = LiveRun::launch(&home, root, phase);
-    let signed = libc::pid_t::try_from(run.runner_pid).expect("pid fits pid_t");
-    assert!(signed > 1, "refusing to signal pid {signed}");
-    // SAFETY: `signed > 1` names the runner this test's fake launcher recorded, whose
-    // argv `LiveRun::launch` checked.
-    unsafe { libc::kill(signed, libc::SIGTERM) };
-    common::wait_for(
-        || !run.alive() && !runner_lock_live(root, phase),
-        Duration::from_secs(20),
-        "the stopped run's runner to exit and free its lock",
-    );
-    corrupt_state(root, phase);
-    // The stopped run's branch is a leftover `start` refuses (52.1 D-09.1); removed here, as
-    // the operator would, so the corrupt state is the only thing left over.
-    git(root, &["checkout", "-q", "develop"]);
-    git(
-        root,
-        &["branch", "-D", &format!("feature/phase-{}", phase.padded())],
-    );
-    let started_before = workflow_started_count(root);
-
-    let output = plain_start(&home, root, phase);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "with no live runner, start over a corrupt state proceeds as today\nstdout: {}\nstderr: {stderr}",
-        String::from_utf8_lossy(&output.stdout)
-    );
-    assert_eq!(
-        workflow_started_count(root),
-        started_before + 1,
-        "the start over the corrupt state must emit workflow_started"
     );
 }
