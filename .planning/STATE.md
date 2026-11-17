@@ -5,16 +5,16 @@ milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: "52.2"
 current_phase_name: Foreground Runner
 status: executing
-stopped_at: Completed 52.2-09-PLAN.md
-last_updated: "2026-11-17T11:11:42.065Z"
+stopped_at: Completed 52.2-10-PLAN.md
+last_updated: "2026-11-17T11:40:08.693Z"
 last_activity: 2026-11-16
 last_activity_desc: Phase 52.2 execution started
-state_head: 7bf32760011e7edf990147d6230c289e2d85205e
+state_head: c478ef5a6e06709c7ec6dd697ec08e8e1e63888c
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 66
-  completed_plans: 52
+  completed_plans: 53
   percent: 17
 ---
 
@@ -172,7 +172,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 52.2 (Foreground Runner) — EXECUTING
-Plan: 13 of 26
+Plan: 14 of 26
 Status: Ready to execute
 Last activity: 2026-11-16 — Phase 52.2 execution started
 
@@ -968,6 +968,9 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 52.2]: 52.2-09: reservation-only = state loads and run_never_prepared holds, read after runner_liveness is not live; status shows it as idle naming start
 - [Phase 52.2]: 52.2-09: status lists phases from .runner-NN, gate request and state file names; a free runner lock alone is history and gets no row
 - [Phase 52.2]: 52.2-09: logs -f prints the run's state line on stderr once the runner leaves the followed stage (60 s bound), or when a quiescent poll finds the runner NotLive
+- [Phase 52.2]: 52.2-10: a held or unprobeable gate waiter refuses the whole discard before any removal
+- [Phase 52.2]: 52.2-10: discard sweeps orphan hold temps directory-wide via remove_orphan_hold_temps and names each removed path
+- [Phase 52.2]: 52.2-10: the recycled agent-pid repair names the pid file, since discard reads it too
 
 ## Roadmap Evolution
 
@@ -1131,11 +1134,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 52.2 P08 | 28 min | 3 tasks | 7 files |
 | Phase 52.2 P22 | 15min | 2 tasks | 7 files |
 | Phase 52.2 P09 | 30 min | 3 tasks | 2 files |
+| Phase 52.2 P10 | 18 min | 3 tasks | 14 files |
 
 ## Session
 
-**Last session:** 2026-11-17T11:11:41.186Z
-**Stopped at:** Completed 52.2-09-PLAN.md
+**Last session:** 2026-11-17T11:40:07.827Z
+**Stopped at:** Completed 52.2-10-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps

@@ -23,9 +23,10 @@
   **Partial resolution (52.2-22, commit 7d81e4a):** OPERATIONS.md's stop row no longer has `--launch`, and the doctor orphan paragraph says the printed repair names the removed flag and no longer parses. When 52.2-23 deletes the orphan findings, that paragraph (inside `## Run liveness`, which 52.2-26 rewrites) goes with them; no doc_check test would flag it, since `documented_flags` also accepts any `launch:` field in source.
 
 - `devflow recover --clean` deletes the state of a live runner unit
-  status: open
+  status: resolved (52.2-10, commit 29aaf01)
   **What:** ported onto a run `start` launched as a runner unit (fake `systemd-run`, runner lock held, agent running), `devflow recover --clean --phase 149` exited 0 and printed `cleaned up workflow state for phase 149` while the runner still ran; before 52.2-06 it refused a live supervisor naming `devflow stop --phase N`. Found by 52.2-07 porting `stop_e2e::recover_clean_refuses_while_the_supervisor_is_alive`. Its live-run check reads the supervisor socket and the agent pid file, neither of which a runner unit has; it does not read the runner lock. Not established: whether the deletion also breaks the live runner's next state write.
   **Why deferred:** `recover` and its live check are production code outside 52.2-07's files, and D-06 removes the verb in 52.2-10 (wave 7), whose plan already gives this test a `successor` row (run_liveness_e2e::discard_refuses_while_the_runner_lock_is_held_and_the_state_names_no_launch). 52.2-07 took that row early. Until 52.2-10 lands, the head between waves 5 and 7 carries a `recover --clean` that can delete a live run's state. Fix shape: 52.2-10 deletes the verb as planned; if 52.2-10 slips, a guard on `liveness::runner_lock_path` in recover's live check. Owner: 52.2-10.
+  **Resolution:** 52.2-10 removed the `recover` verb (commit 29aaf01); `devflow recover` now exits 2 with clap's unrecognized-subcommand error, so no verb deletes a phase's state without `discard`'s live-run checks, which read the runner lock first (`run_liveness_e2e::discard_refuses_while_the_runner_lock_is_held_and_the_state_names_no_launch`).
 
 - `phase7_cli::cleanup_worktree_cli_flow` races the runner's exit under load
   status: open
@@ -36,3 +37,8 @@
   status: open
   **What:** since 52.2-09 each phase's first line is its liveness row (`phase N: crashed — …`), but `status_run_lines` still prints `run: active` and `active_phases_line` still lists the phase under `active phases:` whenever the state is neither finished, stopped nor missing its worktree (`run_kind`, `crates/devflow-cli/src/commands.rs`). So a crashed run reads `crashed` on its row and `active` two lines below. Seen in 52.2-09's own e2e output, not asserted by any test.
   **Why deferred:** the plan rewrote the row and the removed agent-pid/supervisor lines; `run_kind` feeds OPS-02's worktree-missing wording and three unit tests (`status_prints_the_stop_reason_and_fallback_state`, `status_does_not_report_a_run_with_a_missing_worktree_as_active`), so changing its words is a separate wording decision. Fix shape: drop `run:` (keep the worktree-missing line) and build the header from `RunStatus::Live`, updating those tests. Owner: 52.2-23 (status/doctor cleanup) or a 999.x entry at phase close.
+
+- The gate-answer refusal names `recover --clean`
+  status: resolved (52.2-10, commit c478ef5)
+  **What:** `no_waiter_repair` (`crates/devflow-cli/src/commands.rs`), printed when `gate approve|reject|abort` finds no live waiter, told the operator to run `devflow recover --clean --phase N`. Noted by 52.2-09 under Issues Encountered; the verb's removal (D-06) made it a repair that no longer parses.
+  **Resolution:** it now names `devflow resume --phase N` to continue the run or `devflow discard --phase N` to remove it; `gate_wedge_e2e::start_wedge_arm_interrupted_start_leaves_a_plan_gate_nothing_answers` asserts the discard line, and `commands::tests::no_production_string_names_the_removed_recover_verb` fails on any production line naming the verb.
