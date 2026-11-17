@@ -11,6 +11,7 @@
 
 mod common;
 
+use common::HermeticPath;
 use devflow_core::gates::{GateResponse, Gates};
 use devflow_core::mode::Mode;
 use devflow_core::phase_id::PhaseId;
@@ -86,7 +87,7 @@ fn child(
         ])
         .arg(root)
         .current_dir(root)
-        .env("PATH", path);
+        .hermetic_path(path);
     command
 }
 
@@ -285,7 +286,7 @@ fn resume_prints_the_answer_it_set_aside() {
         .args(["resume", "--phase", &phase.to_string()])
         .arg(root)
         .current_dir(root)
-        .env("PATH", path)
+        .hermetic_path(path)
         .env("DEVFLOW_GATE_TIMEOUT_SECS", "1")
         .output()
         .expect("run devflow resume");
@@ -1031,7 +1032,7 @@ fn resume_command(
         .args(["resume", "--phase", &phase.to_string()])
         .arg(root)
         .current_dir(root)
-        .env("PATH", path)
+        .hermetic_path(path)
         .env("DEVFLOW_GATE_TIMEOUT_SECS", GATE_TIMEOUT_SECS);
     command
 }

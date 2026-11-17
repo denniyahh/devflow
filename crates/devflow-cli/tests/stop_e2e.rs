@@ -12,6 +12,7 @@
 
 mod common;
 
+use common::HermeticPath;
 use devflow_core::gates::{GateId, GateResponse, Gates};
 use devflow_core::mode::Mode;
 use devflow_core::phase_id::PhaseId;
@@ -1638,7 +1639,7 @@ impl LiveRun {
             ])
             .arg(&root)
             .current_dir(&root)
-            .env("PATH", path)
+            .hermetic_path(path)
             .output()
             .expect("run devflow start");
         assert!(

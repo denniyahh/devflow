@@ -15,6 +15,7 @@
 
 mod common;
 
+use common::HermeticPath;
 use devflow_core::gsd_reader::GsdStatus;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::supervisor::{self, Liveness, ShutdownOutcome};
@@ -161,7 +162,7 @@ fn run_start_with(
         .args(extra)
         .arg(root)
         .current_dir(root)
-        .env("PATH", path)
+        .hermetic_path(path)
         .output()
         .expect("run devflow start")
 }
@@ -811,7 +812,7 @@ fn spawn_start(
         ])
         .arg(root)
         .current_dir(root)
-        .env("PATH", path)
+        .hermetic_path(path)
         .env("DEVFLOW_GATE_TIMEOUT_SECS", RACE_GATE_TIMEOUT_SECS)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1590,7 +1591,7 @@ impl FinishRig {
             .args(extra)
             .arg(&self.root)
             .current_dir(&self.root)
-            .env("PATH", path)
+            .hermetic_path(path)
             .env("DEVFLOW_GATE_NOTIFY_CMD", notify_cmd)
             .output()
             .expect("run devflow start");
@@ -1898,7 +1899,7 @@ fn a_finished_run_is_kept_by_cleanup_and_refused_by_resume() {
         .args(["resume", "--phase", &phase.to_string()])
         .arg(&rig.root)
         .current_dir(&rig.root)
-        .env("PATH", path)
+        .hermetic_path(path)
         .output()
         .expect("run devflow resume");
     let stderr = String::from_utf8_lossy(&resume.stderr).to_string();
