@@ -3795,6 +3795,12 @@ fn sweep_one_gate(
 /// `systemctl --user stop` on the unit, which returns once the unit is down
 /// (`TimeoutStopSec`, then SIGKILL), and prints [`stop_outcome`]'s line.
 pub(crate) fn stop(project_root: &Path, phase: PhaseId) -> Result<(), CliError> {
+    println!("{}", stop_report(project_root, phase)?);
+    Ok(())
+}
+
+/// [`stop`]'s work (D-05): the line it prints when it exits 0, or its refusal or failure.
+pub(crate) fn stop_report(project_root: &Path, phase: PhaseId) -> Result<String, CliError> {
     let runner = runner_liveness(project_root, phase).map_err(|why| {
         CliError::Message(format!("stop: phase {phase}: {why}; nothing was stopped"))
     })?;
@@ -3817,8 +3823,9 @@ pub(crate) fn stop(project_root: &Path, phase: PhaseId) -> Result<(), CliError> 
             Ok(None) => {}
         }
         if runner == RunnerLiveness::NotLive {
-            println!("stop: phase {phase} has no live run; nothing to stop");
-            return Ok(());
+            return Ok(format!(
+                "stop: phase {phase} has no live run; nothing to stop"
+            ));
         }
     }
     let unit = crate::service::unit_name(project_root, phase).map_err(|err| {
@@ -3830,8 +3837,7 @@ pub(crate) fn stop(project_root: &Path, phase: PhaseId) -> Result<(), CliError> 
         .map_err(|why| CliError::Message(format!("stop: unit {unit} was not stopped: {why}")))?;
     let (line, clean) = stop_outcome(phase, workflow::load_state(project_root, phase));
     if clean {
-        println!("{line}");
-        Ok(())
+        Ok(line)
     } else {
         Err(CliError::Message(line))
     }
@@ -12282,6 +12288,452 @@ mod tests {
             None,
             FallbackSource::FlagOrConfig(fallback),
         )
+    }
+
+    /// The lock a holder child of `every_verb_follows_the_lock_and_state_table` takes:
+    /// `runner` (the runner lock) or `holder` (the phase holder).
+    const VERB_TABLE_HOLD_ENV: &str = "VERB_TABLE_HOLD";
+    /// The project root that child holds a lock of.
+    const VERB_TABLE_ROOT_ENV: &str = "VERB_TABLE_ROOT";
+    /// The dir that child writes `held` into and waits for `release` in.
+    const VERB_TABLE_MARKS_ENV: &str = "VERB_TABLE_MARKS";
+
+    /// A verb of D-07's table.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum TableVerb {
+        Start,
+        Resume,
+        Discard,
+        Stop,
+        Cleanup,
+        Status,
+    }
+
+    /// Which lock a cell holds, each in a child process of its own.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum TableLock {
+        /// The runner lock is held: a live run.
+        RunnerHeld,
+        /// Neither lock is held.
+        Free,
+        /// The phase holder is held and the runner lock is free: a verb in progress.
+        HolderHeld,
+    }
+
+    /// The state a cell plants.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum TableState {
+        None,
+        ReservationOnly,
+        Running,
+        Stopped,
+        Finished,
+        Unloadable,
+    }
+
+    /// What a cell expects. Every arm but `Launch` and `Removes` also expects the state
+    /// file's bytes unchanged; every arm but `Launch` expects no launch, and every arm but
+    /// `Stop` no `stop_unit` call.
+    #[derive(Debug)]
+    enum Expect {
+        /// The verb returns an error carrying every `needles` text and no `absent` one.
+        Refuse {
+            needles: Vec<String>,
+            absent: Vec<String>,
+        },
+        /// The verb returns Ok and launched one runner unit.
+        Launch,
+        /// The verb returns Ok and the state file is gone.
+        Removes,
+        /// The verb returns Ok and touched nothing.
+        Keeps,
+        /// `status` returns Ok and the phase's row names this word (`None`: no row).
+        Word(Option<&'static str>),
+        /// `stop` exits 0 (`ok`) or not with a line carrying every `needles` text and
+        /// no `absent` one, after `stop_calls` calls of `stop_unit`.
+        Stop {
+            ok: bool,
+            needles: Vec<String>,
+            absent: Vec<String>,
+            stop_calls: usize,
+        },
+    }
+
+    /// What a cell did.
+    #[derive(Debug)]
+    struct Observed {
+        /// The verb's Ok text (stop's line, status's word) or its error.
+        result: Result<String, String>,
+        launched: usize,
+        stop_calls: usize,
+        state_before: Option<Vec<u8>>,
+        state_after: Option<Vec<u8>>,
+        /// Whether the runner lock reads held once the verb returned.
+        runner_live_after: bool,
+    }
+
+    /// A child process holding one of a cell's locks. Dropping it releases and reaps the
+    /// child, unless the service double was given it to stop.
+    struct TableHolder {
+        child: Option<std::process::Child>,
+        pid: u32,
+        marks: tempfile::TempDir,
+    }
+
+    impl Drop for TableHolder {
+        fn drop(&mut self) {
+            let _ = std::fs::write(self.marks.path().join("release"), "");
+            if let Some(mut child) = self.child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    /// Start a child of `name` that holds `kind`'s lock of `root`'s `phase` and wait
+    /// until it holds it.
+    fn hold_in_a_child(name: &str, root: &Path, kind: &str, path_dir: &Path) -> TableHolder {
+        let marks = tempfile::tempdir().unwrap();
+        let child = devflow_core::test_support::spawn_test_in_child(
+            name,
+            path_dir,
+            &[
+                (VERB_TABLE_HOLD_ENV, std::ffi::OsStr::new(kind)),
+                (VERB_TABLE_ROOT_ENV, root.as_os_str()),
+                (VERB_TABLE_MARKS_ENV, marks.path().as_os_str()),
+            ],
+        );
+        let pid = child.id();
+        let holder = TableHolder {
+            child: Some(child),
+            pid,
+            marks,
+        };
+        assert!(
+            wait_for_file(&holder.marks.path().join("held")),
+            "the {kind} holder child never took its lock"
+        );
+        holder
+    }
+
+    /// The child side of [`hold_in_a_child`]: `true` when this process is one.
+    fn hold_if_a_table_holder(phase: PhaseId) -> bool {
+        let Ok(kind) = std::env::var(VERB_TABLE_HOLD_ENV) else {
+            return false;
+        };
+        let root = PathBuf::from(std::env::var_os(VERB_TABLE_ROOT_ENV).unwrap());
+        let marks = PathBuf::from(std::env::var_os(VERB_TABLE_MARKS_ENV).unwrap());
+        let _hold = if kind == "runner" {
+            liveness::claim_runner_lock(&root, phase).expect("hold the runner lock")
+        } else {
+            liveness::claim_phase_holder(&root, phase).expect("hold the phase holder")
+        };
+        std::fs::write(marks.join("held"), "").unwrap();
+        assert!(
+            wait_for_file(&marks.join("release")),
+            "the holder was never released"
+        );
+        true
+    }
+
+    /// Plant `state` for `phase` under `root`, as a Codex Supervise run.
+    fn plant_table_state(root: &Path, phase: PhaseId, state: TableState) {
+        let mut planted = State::new(phase, AgentKind::Codex, Mode::Supervise, root.into());
+        match state {
+            TableState::None => return,
+            TableState::Unloadable => {
+                std::fs::create_dir_all(root.join(".devflow")).unwrap();
+                std::fs::write(workflow::state_path(root, phase), "{ not json").unwrap();
+                return;
+            }
+            TableState::ReservationOnly => {}
+            TableState::Running => {
+                planted.verification_baseline_captured = true;
+                planted.stage = Stage::Code;
+            }
+            TableState::Stopped => {
+                planted.verification_baseline_captured = true;
+                planted.stage = Stage::Code;
+                planted.stopped = true;
+                planted.stop_reason = Some("operator stop".to_string());
+            }
+            TableState::Finished => {
+                planted.verification_baseline_captured = true;
+                planted.stage = Stage::Validate;
+                planted.stopped = true;
+                planted.finished = true;
+            }
+        }
+        workflow::save_state(&planted).unwrap();
+    }
+
+    /// The outcome D-07's table gives `verb` over `lock` and `state`; `holder_pid` is
+    /// the pid of the child holding the phase holder in a `HolderHeld` cell.
+    fn table_expectation(
+        verb: TableVerb,
+        lock: TableLock,
+        state: TableState,
+        phase: PhaseId,
+        holder_pid: u32,
+    ) -> Expect {
+        use TableState as S;
+        let stop = format!("devflow stop --phase {phase}");
+        let resume = format!("devflow resume --phase {phase}");
+        let discard = format!("devflow discard --phase {phase}");
+        let start = format!("devflow start --phase {phase}");
+        let refuse = |needles: &[&str]| Expect::Refuse {
+            needles: needles.iter().map(|n| (*n).to_string()).collect(),
+            absent: Vec::new(),
+        };
+        let stopped =
+            |ok: bool, needles: &[&str], absent: &[&str], stop_calls: usize| Expect::Stop {
+                ok,
+                needles: needles.iter().map(|n| (*n).to_string()).collect(),
+                absent: absent.iter().map(|n| (*n).to_string()).collect(),
+                stop_calls,
+            };
+        match (verb, lock) {
+            (TableVerb::Stop, TableLock::HolderHeld) => stopped(
+                false,
+                &[&format!(
+                    "another DevFlow verb holds phase {phase} (pid {holder_pid}) and is in \
+                     progress"
+                )],
+                &[],
+                0,
+            ),
+            (_, TableLock::HolderHeld) => unreachable!("only stop has holder-held cells"),
+            (TableVerb::Start, TableLock::RunnerHeld) => refuse(&[&stop, "refusing to start"]),
+            (TableVerb::Resume, TableLock::RunnerHeld) => refuse(&[&stop, "refusing to resume"]),
+            (TableVerb::Discard, TableLock::RunnerHeld) => refuse(&[&stop]),
+            (TableVerb::Cleanup, TableLock::RunnerHeld) => refuse(&["may still be live"]),
+            (TableVerb::Status, TableLock::RunnerHeld) => Expect::Word(Some("live")),
+            (TableVerb::Stop, TableLock::RunnerHeld) => match state {
+                S::None | S::ReservationOnly => {
+                    stopped(true, &["stopped during launch"], &["crashed"], 1)
+                }
+                S::Stopped => stopped(true, &["stopped (operator stop)"], &[], 1),
+                S::Finished => stopped(true, &["had already finished"], &[], 1),
+                S::Running => stopped(false, &["crashed", &resume, &discard], &[], 1),
+                S::Unloadable => stopped(false, &["does not load", &discard], &[&resume], 1),
+            },
+            (TableVerb::Stop, TableLock::Free) => stopped(true, &["has no live run"], &[], 0),
+            (TableVerb::Start, TableLock::Free) => match state {
+                S::None | S::ReservationOnly => Expect::Launch,
+                S::Running | S::Stopped => refuse(&["incomplete run", &resume, &discard]),
+                S::Finished => refuse(&["finished", &discard]),
+                S::Unloadable => refuse(&["does not load", &discard]),
+            },
+            (TableVerb::Resume, TableLock::Free) => match state {
+                S::None => refuse(&["nothing to resume", &start]),
+                S::ReservationOnly => refuse(&["never finished preparing", &start]),
+                S::Running | S::Stopped => Expect::Launch,
+                S::Finished => refuse(&["nothing to resume", &discard]),
+                S::Unloadable => refuse(&["does not load", &discard]),
+            },
+            (TableVerb::Discard, TableLock::Free) => match state {
+                S::None => refuse(&["nothing to discard"]),
+                _ => Expect::Removes,
+            },
+            (TableVerb::Cleanup, TableLock::Free) => match state {
+                S::ReservationOnly => Expect::Removes,
+                _ => Expect::Keeps,
+            },
+            (TableVerb::Status, TableLock::Free) => Expect::Word(match state {
+                S::None => None,
+                S::ReservationOnly => Some("idle"),
+                S::Running => Some("crashed"),
+                S::Stopped => Some("stopped"),
+                S::Finished => Some("finished"),
+                S::Unloadable => Some("unloadable"),
+            }),
+        }
+    }
+
+    /// Run `verb` over `root`'s `phase` as the CLI does, through its library function.
+    fn run_table_verb(verb: TableVerb, root: &Path, phase: PhaseId) -> Result<String, String> {
+        let text = |result: Result<(), CliError>| {
+            result
+                .map(|()| String::new())
+                .map_err(|err| err.to_string())
+        };
+        match verb {
+            TableVerb::Start => start_for_test(root, phase).map(|()| String::new()),
+            TableVerb::Resume => text(crate::pipeline_launch::resume(root, phase, None)),
+            TableVerb::Discard => text(discard(root, phase, None)),
+            TableVerb::Stop => stop_report(root, phase).map_err(|err| err.to_string()),
+            TableVerb::Cleanup => text(cleanup(root)),
+            TableVerb::Status => {
+                text(status(root))?;
+                Ok(run_status(root, phase, &existing_state(root, phase))
+                    .map_or("no row", |status| status.word())
+                    .to_string())
+            }
+        }
+    }
+
+    /// Build one cell's fixture in a scratch root, run its verb and say what it did.
+    fn run_table_cell(
+        name: &str,
+        verb: TableVerb,
+        lock: TableLock,
+        state: TableState,
+        phase: PhaseId,
+        path_dir: &Path,
+    ) -> (Observed, u32) {
+        use crate::service::double;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_start_repo(root, phase);
+        plant_table_state(root, phase, state);
+        let state_file = workflow::state_path(root, phase);
+        let mut holder = match lock {
+            TableLock::Free => None,
+            TableLock::RunnerHeld => Some(hold_in_a_child(name, root, "runner", path_dir)),
+            TableLock::HolderHeld => Some(hold_in_a_child(name, root, "holder", path_dir)),
+        };
+        let holder_pid = holder.as_ref().map_or(0, |holder| holder.pid);
+        if let (TableVerb::Stop, Some(holder)) = (verb, holder.as_mut())
+            && lock == TableLock::RunnerHeld
+        {
+            let unit = crate::service::unit_name(root, phase).unwrap();
+            double::register_stop_target(&unit, holder.child.take().unwrap());
+        }
+        let state_before = std::fs::read(&state_file).ok();
+        let (launches, stops) = (double::launched_units().len(), double::stop_calls());
+        let result = run_table_verb(verb, root, phase);
+        let observed = Observed {
+            result,
+            launched: double::launched_units().len() - launches,
+            stop_calls: double::stop_calls() - stops,
+            state_before,
+            state_after: std::fs::read(&state_file).ok(),
+            runner_live_after: liveness::probe(&liveness::runner_lock_path(root, phase))
+                .is_ok_and(|held| held == liveness::Held::Live),
+        };
+        double::end_runners(None, crate::service::TIMEOUT_STOP_SEC);
+        drop(holder);
+        (observed, holder_pid)
+    }
+
+    /// Why `observed` does not meet `expect`, or `None` when it does.
+    fn table_mismatch(expect: &Expect, observed: &Observed, lock: TableLock) -> Option<String> {
+        let unchanged = observed.state_before == observed.state_after;
+        let carries = |text: &str, needles: &[String], absent: &[String]| {
+            needles.iter().all(|needle| text.contains(needle.as_str()))
+                && !absent.iter().any(|gone| text.contains(gone.as_str()))
+        };
+        let stop_calls = match expect {
+            Expect::Stop { stop_calls, .. } => *stop_calls,
+            _ => 0,
+        };
+        let launched = usize::from(matches!(expect, Expect::Launch));
+        let met = observed.launched == launched
+            && observed.stop_calls == stop_calls
+            && match expect {
+                Expect::Refuse { needles, absent } => {
+                    unchanged
+                        && observed
+                            .result
+                            .as_ref()
+                            .is_err_and(|err| carries(err, needles, absent))
+                }
+                Expect::Launch => observed.result.is_ok(),
+                Expect::Removes => {
+                    observed.result.is_ok()
+                        && observed.state_before.is_some()
+                        && observed.state_after.is_none()
+                }
+                Expect::Keeps => unchanged && observed.result.is_ok(),
+                Expect::Word(word) => {
+                    unchanged && observed.result.as_deref() == Ok(word.unwrap_or("no row"))
+                }
+                Expect::Stop {
+                    ok,
+                    needles,
+                    absent,
+                    ..
+                } => {
+                    let line = match &observed.result {
+                        Ok(line) | Err(line) => line,
+                    };
+                    unchanged
+                        && observed.result.is_ok() == *ok
+                        && carries(line, needles, absent)
+                        && !(lock == TableLock::RunnerHeld && observed.runner_live_after)
+                }
+            };
+        (!met).then(|| format!("expected {expect:?}, got {observed:?}"))
+    }
+
+    /// D-07 / 999.237: every verb x lock (held, free) x state (none, reservation-only,
+    /// running, stopped, finished, unloadable), 72 cells, plus 6 `stop` cells with the
+    /// phase holder held and the runner lock free (review pi-10), walked in one test. Each
+    /// lock is held by a child process (Pitfall 5), in a process of its own; no cell
+    /// reaches a real user manager (D-07b). Held/none and held/unloadable refuse for every
+    /// mutating verb. Controls: each `start`/`resume` act cell records exactly one launch
+    /// and each refusal none; the lock-free `stop` cells answer "no live run" with exit 0,
+    /// against the holder-held cells' non-zero refusal; the running and unloadable cells of
+    /// a stop under a held lock say crashed and unloadable, against the absent and
+    /// reservation-only cells' `stopped during launch`.
+    #[test]
+    fn every_verb_follows_the_lock_and_state_table() {
+        const NAME: &str = "commands::tests::every_verb_follows_the_lock_and_state_table";
+        let phase = PhaseId::new(5171);
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = crate::test_support::go_waiting_agent_dir("codex");
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        if hold_if_a_table_holder(phase) {
+            return;
+        }
+        let _runners = crate::service::double::LaunchedRunners;
+        let path_dir = PathBuf::from(std::env::var_os("PATH").expect("the child's PATH"));
+        let verbs = [
+            TableVerb::Start,
+            TableVerb::Resume,
+            TableVerb::Discard,
+            TableVerb::Stop,
+            TableVerb::Cleanup,
+            TableVerb::Status,
+        ];
+        let states = [
+            TableState::None,
+            TableState::ReservationOnly,
+            TableState::Running,
+            TableState::Stopped,
+            TableState::Finished,
+            TableState::Unloadable,
+        ];
+        let mut cells = Vec::new();
+        for verb in verbs {
+            for lock in [TableLock::RunnerHeld, TableLock::Free] {
+                for state in states {
+                    cells.push((verb, lock, state));
+                }
+            }
+        }
+        for state in states {
+            cells.push((TableVerb::Stop, TableLock::HolderHeld, state));
+        }
+        assert_eq!(cells.len(), 78, "the table's cells");
+        let mut failures = Vec::new();
+        for (verb, lock, state) in cells {
+            let (observed, holder_pid) = run_table_cell(NAME, verb, lock, state, phase, &path_dir);
+            let expect = table_expectation(verb, lock, state, phase, holder_pid);
+            if let Some(why) = table_mismatch(&expect, &observed, lock) {
+                failures.push(format!("{verb:?} x {lock:?} x {state:?}: {why}"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} of 78 cells broke the table:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
     }
 
     /// D-01: `start --fallback-agent` persists the fallback, unused, in the run state the
