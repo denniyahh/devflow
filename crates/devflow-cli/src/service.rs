@@ -55,9 +55,12 @@ fn is_valid_env_name(name: &str) -> bool {
 /// (`^[A-Za-z_][A-Za-z0-9_]*$`) except [`MANAGER_OWNED_ENV`]. A name it would refuse
 /// (bash's exported `BASH_FUNC_x%%`, a non-UTF-8 name) is dropped, since one such name
 /// fails the whole `systemd-run`.
-#[expect(
-    dead_code,
-    reason = "`start` launches the runner unit from plan 52.2-06"
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "`start` launches the runner unit from plan 52.2-06"
+    )
 )]
 pub(crate) fn passable_env_names(names: impl IntoIterator<Item = OsString>) -> Vec<String> {
     let mut passable: Vec<String> = names
@@ -77,9 +80,12 @@ pub(crate) fn passable_env_names(names: impl IntoIterator<Item = OsString>) -> V
 ///
 /// # Errors
 /// The project root cannot be canonicalised.
-#[expect(
-    dead_code,
-    reason = "`start` launches the runner unit from plan 52.2-06"
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "`start` launches the runner unit from plan 52.2-06"
+    )
 )]
 pub(crate) fn runner_unit_argv(
     project_root: &Path,
@@ -141,4 +147,98 @@ pub(crate) fn notify_ready() -> std::io::Result<()> {
     UnixDatagram::unbound()?
         .send_to_addr(b"READY=1", &addr)
         .map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The arguments in `argv` that carry a value after `--setenv`: `--setenv NAME=v`
+    /// or `--setenv=NAME=v`. A by-name argument (`--setenv NAME`) carries none.
+    fn setenv_values(argv: &[OsString]) -> Vec<String> {
+        let argv: Vec<String> = argv
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let mut valued = Vec::new();
+        for (at, arg) in argv.iter().enumerate() {
+            if let Some(inline) = arg.strip_prefix("--setenv=") {
+                valued.push(inline.to_string());
+            } else if arg == "--setenv"
+                && let Some(next) = argv.get(at + 1)
+                && next.contains('=')
+            {
+                valued.push(next.clone());
+            }
+        }
+        valued
+    }
+
+    /// D-04, Pitfall 1: a name systemd would refuse, or one the manager owns, never
+    /// reaches `--setenv`.
+    #[test]
+    fn passable_env_names_drops_invalid_and_manager_owned_names() {
+        let names = [
+            "BASH_FUNC_x%%",
+            "1BAD",
+            "NOTIFY_SOCKET",
+            "INVOCATION_ID",
+            "PATH",
+            "DEVFLOW_GATE_NOTIFY_CMD",
+        ]
+        .map(OsString::from);
+        let passable = passable_env_names(names);
+        assert!(
+            !passable.iter().any(|name| name.starts_with("BASH_FUNC_")),
+            "kept BASH_FUNC_x%%: {passable:?}"
+        );
+        for dropped in ["1BAD", "NOTIFY_SOCKET", "INVOCATION_ID"] {
+            assert!(
+                !passable.iter().any(|name| name == dropped),
+                "kept {dropped}: {passable:?}"
+            );
+        }
+        assert_eq!(
+            passable,
+            ["DEVFLOW_GATE_NOTIFY_CMD", "PATH"],
+            "control: valid caller names are kept"
+        );
+    }
+
+    /// D-04, T-52.2-01: the unit argv passes environment by name only, so no value is
+    /// on a command line `/proc` shows every user.
+    #[test]
+    fn runner_unit_argv_carries_env_by_name_only() {
+        let dir = tempfile::tempdir().expect("create a temp dir");
+        let names = ["PATH".to_string(), "DEVFLOW_GATE_NOTIFY_CMD".to_string()];
+        let argv = runner_unit_argv(
+            dir.path(),
+            PhaseId::new(3),
+            Path::new("/usr/bin/devflow"),
+            &names,
+        )
+        .expect("build the argv");
+        let valued = setenv_values(&argv);
+        assert!(
+            valued.is_empty(),
+            "value on the command line after --setenv: {valued:?} in {argv:?}"
+        );
+        let by_name: Vec<String> = argv
+            .windows(2)
+            .filter(|pair| pair[0] == "--setenv")
+            .map(|pair| pair[1].to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            by_name, names,
+            "control: each name is passed after --setenv"
+        );
+
+        let mut planted = argv.clone();
+        planted.insert(1, "--setenv=X=1".into());
+        assert_eq!(
+            setenv_values(&planted),
+            ["X=1"],
+            "control: a planted value after --setenv is detected"
+        );
+    }
 }
