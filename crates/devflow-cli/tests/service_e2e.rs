@@ -754,3 +754,180 @@ fn a_stopped_run_resumes_as_a_unit_and_finishes() {
     );
 }
 
+/// Whether a process or process group answers signal 0 (`target` < 0 is a group).
+fn signal_zero_finds(target: libc::pid_t) -> bool {
+    // SAFETY: signal 0 delivers nothing; it only checks for existence.
+    unsafe { libc::kill(target, 0) == 0 }
+}
+
+/// The pid the stub agent wrote to `file`.
+fn recorded_pid(file: &Path) -> libc::pid_t {
+    fs::read_to_string(file)
+        .expect("the agent recorded its pid")
+        .trim()
+        .parse()
+        .expect("a pid")
+}
+
+/// D-05: `devflow stop` on a live unit exits 0, prints stopped, the state reads
+/// stopped and the unit inactive.
+#[test]
+#[ignore = "needs a systemd user manager; run by scripts/check.sh service"]
+fn stop_on_a_live_unit_records_stopped() {
+    assert_manager_answers();
+    let phase = PhaseId::new(85);
+    let fixture = StartFixture::new(phase, "sleep 120");
+    let guard = UnitGuard::named(fixture.unit());
+    let out = fixture.start(
+        common::host_service_devflow(&fixture.home),
+        &fixture.path(None),
+    );
+    assert!(out.status.success(), "start failed:\n{}", text(&out));
+    let argv_log = fixture.logs.path().join(common::AGENT_ARGV_LOG);
+    wait_until(
+        || argv_log.is_file(),
+        &guard.unit,
+        "the agent never started",
+    );
+
+    let number = phase.to_string();
+    let root = fixture.root.display().to_string();
+    let stopped = devflow_in(&fixture, &["stop", "--phase", &number, &root]);
+    assert!(
+        stopped.status.success() && String::from_utf8_lossy(&stopped.stdout).contains("stopped"),
+        "state not stopped: stop failed:\n{}\njournal:\n{}",
+        text(&stopped),
+        journal_of(&guard.unit)
+    );
+    let state = devflow_core::workflow::load_state(&fixture.root, phase).unwrap();
+    assert!(
+        state.stopped && !state.finished,
+        "state not stopped: {state:?}\njournal:\n{}",
+        journal_of(&guard.unit)
+    );
+    assert_eq!(
+        unit_property(&guard.unit, "ActiveState"),
+        "inactive",
+        "the unit is not inactive after stop"
+    );
+}
+
+/// D-08: SIGKILL to the unit's MainPID leaves no member of the agent's group, and the
+/// unit inactive: the manager's control-group kill ends the agent. No orphan-agent
+/// check is involved.
+#[test]
+#[ignore = "needs a systemd user manager; run by scripts/check.sh service"]
+fn a_hard_killed_runner_leaves_no_agent_and_the_unit_inactive() {
+    assert_manager_answers();
+    let probe = tempfile::tempdir().unwrap();
+    let agent_pid = probe.path().join("agent.pid");
+    let tail = format!("echo $$ > '{}'\nsleep 120", agent_pid.display());
+    let phase = PhaseId::new(86);
+    let fixture = StartFixture::new(phase, &tail);
+    let guard = UnitGuard::named(fixture.unit());
+    let out = fixture.start(
+        common::host_service_devflow(&fixture.home),
+        &fixture.path(None),
+    );
+    assert!(out.status.success(), "start failed:\n{}", text(&out));
+    wait_until(
+        || agent_pid.is_file(),
+        &guard.unit,
+        "the agent never started",
+    );
+    let agent = recorded_pid(&agent_pid);
+    assert!(
+        signal_zero_finds(-agent),
+        "the agent's group is not running"
+    );
+
+    let main_pid: libc::pid_t = unit_property(&guard.unit, "MainPID")
+        .parse()
+        .expect("a MainPID");
+    assert!(main_pid > 1, "the unit has no main process");
+    // SAFETY: the unit's main process, read from the manager just now.
+    unsafe { libc::kill(main_pid, libc::SIGKILL) };
+
+    if let Err(state) = wait_inactive(&guard.unit) {
+        panic!(
+            "unit still {state} after the hard kill\njournal:\n{}",
+            journal_of(&guard.unit)
+        );
+    }
+    wait_until(
+        || !signal_zero_finds(-agent),
+        &guard.unit,
+        "agent survived the hard kill",
+    );
+}
+
+/// D-07a: a stub agent leaves a SIGTERM-ignoring child, so after `devflow stop` sends
+/// SIGTERM the unit reads deactivating until the manager's SIGKILL. A `devflow discard`
+/// started meanwhile removes nothing until the unit reads inactive, then removes the
+/// run's state.
+#[test]
+#[ignore = "needs a systemd user manager; run by scripts/check.sh service"]
+fn discard_waits_for_a_straggler_in_a_deactivating_unit() {
+    assert_manager_answers();
+    let tail = "setsid sh -c 'trap \"\" TERM; sleep 60' </dev/null >/dev/null 2>&1 &\nsleep 120";
+    let phase = PhaseId::new(87);
+    let fixture = StartFixture::new(phase, tail);
+    let guard = UnitGuard::named(fixture.unit());
+    // In a worktree, so discard can remove the branch: `--no-worktree` checks it out in
+    // the main checkout, which discard refuses.
+    let out = fixture.start_with(
+        common::host_service_devflow(&fixture.home),
+        &fixture.path(None),
+        &[],
+    );
+    assert!(out.status.success(), "start failed:\n{}", text(&out));
+    let argv_log = fixture.logs.path().join(common::AGENT_ARGV_LOG);
+    wait_until(
+        || argv_log.is_file(),
+        &guard.unit,
+        "the agent never started",
+    );
+    std::thread::sleep(Duration::from_millis(500));
+
+    let number = phase.to_string();
+    let root = fixture.root.display().to_string();
+    let mut stop = common::host_service_devflow(&fixture.home)
+        .env("PATH", fixture.path(None))
+        .args(["stop", "--phase", &number, &root])
+        .current_dir(&fixture.root)
+        .spawn()
+        .expect("spawn devflow stop");
+    wait_until(
+        || unit_property(&guard.unit, "ActiveState") == "deactivating",
+        &guard.unit,
+        "the unit never read deactivating",
+    );
+    let state_file = devflow_core::workflow::state_path(&fixture.root, phase);
+    let mut discard = common::host_service_devflow(&fixture.home)
+        .env("PATH", fixture.path(None))
+        .args(["discard", "--phase", &number, &root])
+        .current_dir(&fixture.root)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn devflow discard");
+    while unit_property(&guard.unit, "ActiveState") == "deactivating" {
+        assert!(
+            state_file.is_file(),
+            "discard acted while deactivating: the state is gone"
+        );
+        std::thread::sleep(UNIT_POLL);
+    }
+    let _ = stop.wait();
+    let deadline = Instant::now() + UNIT_FINISH_WAIT;
+    while discard.try_wait().expect("poll discard").is_none() {
+        assert!(Instant::now() < deadline, "discard never returned");
+        std::thread::sleep(UNIT_POLL);
+    }
+    let discarded = discard.wait_with_output().expect("discard's output");
+    assert!(
+        discarded.status.success() && !state_file.exists(),
+        "discard did not complete once the unit read inactive:\n{}",
+        text(&discarded)
+    );
+}

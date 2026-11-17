@@ -43,8 +43,12 @@ pub const FAKE_TOOL_PREFIX: &str = "fake ";
 /// The fake `systemctl`. It handles `--user show -p Version --value`
 /// (`version.fail` in its own dir: exit 1 with the error `systemctl` prints when it
 /// cannot reach a user manager), `--user show -p ActiveState --value U` (`U.fail` in its own dir: exit 1
-/// with a bus error; `U.deactivating`: deactivating; otherwise inactive) and
-/// `--user reset-failed U`.
+/// with a bus error; `U.deactivating`: deactivating; `U.activating`: activating;
+/// otherwise inactive), `--user reset-failed U` and `--user stop U`. The stop writes
+/// `U.stop-called`, removes `U.activating`, and ends the pid the fake `systemd-run`
+/// recorded in `U.pid`: SIGKILL at once with a `U.kill` marker, else SIGTERM, a bounded
+/// wait, then SIGKILL, as the manager does at `TimeoutStopSec`. With no recorded pid it
+/// exits 0.
 const FAKE_SYSTEMCTL_CALLS: &str = r#"if [ "$#" -eq 5 ] && [ "$1 $2 $3 $4 $5" = "--user show -p Version --value" ]; then
   if [ -e "$dir/version.fail" ]; then
     echo "Failed to connect to bus: No medium found" >&2; exit 1
@@ -55,10 +59,34 @@ if [ "$#" -eq 6 ] && [ "$1 $2 $3 $4 $5" = "--user show -p ActiveState --value" ]
   if [ -e "$dir/$6.fail" ]; then
     echo "Failed to get properties: Transport endpoint is not connected" >&2; exit 1
   fi
-  if [ -e "$dir/$6.deactivating" ]; then echo deactivating; else echo inactive; fi
+  if [ -e "$dir/$6.deactivating" ]; then echo deactivating
+  elif [ -e "$dir/$6.activating" ]; then echo activating
+  else echo inactive; fi
   exit 0
 fi
 if [ "$#" -eq 3 ] && [ "$1 $2" = "--user reset-failed" ]; then exit 0; fi
+if [ "$#" -eq 3 ] && [ "$1 $2" = "--user stop" ]; then
+  : >"$dir/$3.stop-called"
+  @RM@ -f "$dir/$3.activating"
+  [ -e "$dir/$3.pid" ] || exit 0
+  read -r pid rest <"$dir/$3.pid"
+  alive() {
+    s=""
+    if [ -r "/proc/$pid/stat" ]; then read -r a b s rest <"/proc/$pid/stat"; fi
+    [ -n "$s" ] && [ "$s" != Z ]
+  }
+  if [ -e "$dir/$3.kill" ]; then
+    kill -KILL "$pid" 2>/dev/null
+  else
+    kill -TERM "$pid" 2>/dev/null
+    tries=0
+    while [ "$tries" -lt 200 ] && alive; do tries=$((tries + 1)); @SLEEP@ 0.05; done
+    alive && kill -KILL "$pid" 2>/dev/null
+  fi
+  tries=0
+  while [ "$tries" -lt 100 ] && alive; do tries=$((tries + 1)); @SLEEP@ 0.05; done
+  exit 0
+fi
 "#;
 
 /// What the fake `systemd-run` prints on stderr when the runner it started exits
@@ -143,6 +171,11 @@ fn resolve_on_path(program: &str) -> PathBuf {
 
 /// [`FAKE_SYSTEMD_RUN_CALLS`] with its tool paths written in.
 fn fake_systemd_run_calls() -> String {
+    with_tool_paths(FAKE_SYSTEMD_RUN_CALLS).replace("@FAILED@", FAKE_START_FAILED)
+}
+
+/// `calls` with `@SETSID@`, `@SLEEP@` and `@RM@` replaced by their absolute paths.
+fn with_tool_paths(calls: &str) -> String {
     let path_of = |program: &str| {
         let path = resolve_on_path(program);
         let text = path.to_str().expect("a UTF-8 tool path").to_string();
@@ -152,11 +185,10 @@ fn fake_systemd_run_calls() -> String {
         );
         text
     };
-    FAKE_SYSTEMD_RUN_CALLS
+    calls
         .replace("@SETSID@", &path_of("setsid"))
         .replace("@SLEEP@", &path_of("sleep"))
         .replace("@RM@", &path_of("rm"))
-        .replace("@FAILED@", FAKE_START_FAILED)
 }
 
 /// What every [`HermeticHome::agent_guard`] fake prints, after `fake <name>`,
@@ -267,7 +299,8 @@ impl HermeticHome {
         let home = Self { dir };
         let service_bin = home.service_bin();
         fs::create_dir(&service_bin).expect("create the fake service-manager dir");
-        let systemctl_calls = FAKE_SYSTEMCTL_CALLS.replace("@VERSION@", FAKE_SYSTEMD_VERSION);
+        let systemctl_calls =
+            with_tool_paths(FAKE_SYSTEMCTL_CALLS).replace("@VERSION@", FAKE_SYSTEMD_VERSION);
         let systemd_run_calls = fake_systemd_run_calls();
         for tool in SERVICE_TOOLS {
             let calls = match tool {
