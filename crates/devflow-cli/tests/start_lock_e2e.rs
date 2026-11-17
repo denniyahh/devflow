@@ -16,8 +16,7 @@ use devflow_core::gates::{GateResponse, Gates};
 use devflow_core::mode::Mode;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
-use devflow_core::state::{AgentKind, PendingSupervisor, State};
-use devflow_core::test_support::gate_answer_files;
+use devflow_core::state::{AgentKind, State};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output};
@@ -88,82 +87,6 @@ fn child(
         .current_dir(root)
         .hermetic_path(path);
     command
-}
-
-#[test]
-fn start_refuses_while_another_launcher_holds_the_phases_reservation() {
-    const LAUNCH_ID: &str = "aaaa0000aaaa0090";
-    let home = common::HermeticHome::new();
-    let repo = tempfile::tempdir().unwrap();
-    let root = repo.path();
-    let phase = PhaseId::new(90);
-    init_repo(root, phase);
-    let fake_bin = fake_codex("exit 0");
-    let liveness_path = devflow_core::liveness::launch_liveness_path(root, LAUNCH_ID).unwrap();
-    fs::create_dir_all(liveness_path.parent().unwrap()).unwrap();
-    let holder = devflow_core::liveness::Hold::take(&liveness_path).expect("test holds the lock");
-    let mut reserved = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
-    reserved.pending_supervisor = Some(PendingSupervisor::new(
-        LAUNCH_ID.to_string(),
-        root.join(".devflow/never-published.sock"),
-        liveness_path,
-    ));
-    devflow_core::workflow::save_state(&reserved).unwrap();
-    let state_before = fs::read(devflow_core::workflow::state_path(root, phase)).unwrap();
-    let worktrees_before = devflow_core::test_support::git_command(root)
-        .args(["worktree", "list", "--porcelain"])
-        .output()
-        .expect("list baseline worktrees");
-    assert!(worktrees_before.status.success());
-
-    let output = child(&home, root, phase, &fake_bin, "supervise")
-        .output()
-        .expect("run devflow start");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !output.status.success(),
-        "start must refuse a held reservation\nstdout: {}\nstderr: {stderr}",
-        String::from_utf8_lossy(&output.stdout)
-    );
-    for expected in [
-        format!("devflow stop --phase {phase}"),
-        LAUNCH_ID.to_string(),
-    ] {
-        assert!(stderr.contains(&expected), "missing {expected:?}: {stderr}");
-    }
-    assert!(
-        !stderr.contains("devflow resume"),
-        "no resume hint while the reservation's lock is held: {stderr}"
-    );
-    assert_eq!(
-        fs::read(devflow_core::workflow::state_path(root, phase)).unwrap(),
-        state_before,
-        "a refused start must not write phase state"
-    );
-    assert_eq!(
-        liveness_files(root),
-        vec![format!("supervisor-{LAUNCH_ID}.live")],
-        "a refused start must leave no liveness file of its own"
-    );
-    let worktrees = devflow_core::test_support::git_command(root)
-        .args(["worktree", "list", "--porcelain"])
-        .output()
-        .expect("list worktrees");
-    assert!(worktrees.status.success());
-    assert_eq!(
-        worktrees.stdout, worktrees_before.stdout,
-        "a refused start must not add a worktree"
-    );
-    let branches = devflow_core::test_support::git_command(root)
-        .args([
-            "branch",
-            "--list",
-            &format!("feature/phase-{padded}", padded = phase.padded()),
-        ])
-        .output()
-        .expect("list phase branch");
-    assert!(String::from_utf8_lossy(&branches.stdout).trim().is_empty());
-    drop(holder);
 }
 
 #[test]
@@ -584,24 +507,6 @@ fn pending_launch(root: &Path, phase: PhaseId) -> Option<String> {
         .map(|pending| pending.launch_id)
 }
 
-/// The names of the liveness files under `root`'s `.devflow/`.
-fn liveness_files(root: &Path) -> Vec<String> {
-    let mut names: Vec<String> = fs::read_dir(root.join(".devflow"))
-        .map(|entries| {
-            entries
-                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-                .filter(|name| name.starts_with("supervisor-") && name.ends_with(".live"))
-                .collect()
-        })
-        .unwrap_or_default();
-    names.sort();
-    names
-}
-
-fn snapshot_paths(snapshot: &[(PathBuf, Vec<u8>)]) -> Vec<&Path> {
-    snapshot.iter().map(|(path, _)| path.as_path()).collect()
-}
-
 fn run_start(
     home: &common::HermeticHome,
     root: &Path,
@@ -623,208 +528,12 @@ fn events_contain_workflow_started(root: &Path) -> bool {
         .contains("\"workflow_started\"")
 }
 
-/// Sentences the live-run refusals carried for the deleted shell monitor, or
-/// that 50-14's `stop` made false. Each must be gone, not merely joined by
-/// new text, from every arm of both the start and the resume refusal.
-fn removed_refusal_sentences(phase: PhaseId) -> Vec<String> {
-    vec![
-        "would only mark the state stopped".to_string(),
-        "it signals nothing and does not end this run".to_string(),
-        "monitor pid".to_string(),
-        "an `sh -c` script".to_string(),
-        format!("`.devflow/phase-{}-`", phase.padded()),
-        "send SIGTERM to the confirmed monitor first".to_string(),
-        "signalling the agent first lets the monitor launch the next stage".to_string(),
-        "may be running `devflow advance` as a foreground child".to_string(),
-        "`ps -ww -o pid=,args= --ppid <monitor pid>`".to_string(),
-        "once it takes the lock after this refusal".to_string(),
-    ]
-}
-
-/// The fragments a refusal must carry for a live agent its pid file names.
-/// Every sentence that keeps the operator from signalling the wrong process
-/// or launching a second agent is pinned, not only the repair commands
-/// (T-48-19-06, T-48-19-07).
-fn agent_arm_fragments(phase: PhaseId, pid: u32) -> Vec<String> {
-    vec![
-        format!("agent pid {pid} alive"),
-        "`devflow stop` never signals a pid from the agent pid file".to_string(),
-        "Check each pid before signalling it".to_string(),
-        // Identity, not the bare executable name `ps -p` prints (48-REVIEW
-        // CR-01); `-ww` keeps a long `args` from being cut.
-        "`ps -p` shows only the executable name".to_string(),
-        format!("agent pid {pid}: ps -ww -o pid=,lstart=,args= -p {pid}"),
-        "`__monitor`".to_string(),
-        format!("`--phase {phase}`"),
-        "`ps -o ppid= -p <pid>`".to_string(),
-        "an agent whose supervisor has exited cannot be tied to this phase that way".to_string(),
-        "so do not signal it on the pid alone".to_string(),
-        "Do neither while this phase's processes are live".to_string(),
-        "a later `start` would launch a second agent beside it".to_string(),
-    ]
-}
-
-/// Drives `start` against a live run and asserts the refusal plus the
-/// absence of every side effect. `present` and `absent` are the arm's own
-/// fragments; the verb's common fragments and every removed sentence are
-/// checked here. `refusal` is the first assertion's message and names the
-/// arm.
-fn assert_start_refuses_live_run(
-    home: &common::HermeticHome,
-    root: &Path,
-    phase: PhaseId,
-    extra: &[&str],
-    (present, absent): (&[String], &[String]),
-    refusal: &str,
-) {
-    let fake_bin = fake_codex("exit 0");
-    let liveness_before = liveness_files(root);
-    let before = phase_file_snapshot(root, phase);
-    // Negative control on the snapshot itself: it must cover the planted
-    // state and both planted gate files, or byte-identity would prove nothing.
-    let answers = gate_answer_files(root, phase, Stage::Code);
-    assert_eq!(answers.len(), 1, "the planted answer: {answers:?}");
-    for required in [
-        devflow_core::workflow::state_path(root, phase),
-        Gates::gate_path(root, phase, Stage::Code),
-        answers[0].clone(),
-    ] {
-        assert!(
-            snapshot_paths(&before).contains(&required.as_path()),
-            "fixture snapshot must cover {}; it has {:?}",
-            required.display(),
-            snapshot_paths(&before)
-        );
-    }
-    let branches_before = phase_branches(root, phase);
-    let started_before = workflow_started_count(root);
-
-    let output = run_start(home, root, phase, &fake_bin, extra);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !output.status.success(),
-        "{refusal}\nstdout: {stdout}\nstderr: {stderr}"
-    );
-
-    let common = [
-        phase.to_string(),
-        "refusing to start; nothing was written".to_string(),
-        "Once every supervisor and process named above is gone, run `devflow start` again."
-            .to_string(),
-    ];
-    for fragment in common.iter().chain(present) {
-        assert!(
-            stderr.contains(fragment.as_str()),
-            "refusal must contain {fragment:?}\nstderr: {stderr}"
-        );
-    }
-    // The superseded guidance must be gone, not merely joined by new text.
-    for stale in removed_refusal_sentences(phase)
-        .into_iter()
-        .chain([
-            "ps -p ".to_string(),
-            "or after `ps -p` shows they are no longer this phase's processes".to_string(),
-            "(stop does end a run that holds the lock, for example one parked at a gate.)"
-                .to_string(),
-        ])
-        .chain(absent.iter().cloned())
-    {
-        assert!(
-            !stderr.contains(&stale),
-            "refusal must not contain superseded guidance {stale:?}\nstderr: {stderr}"
-        );
-    }
-
-    let after = phase_file_snapshot(root, phase);
-    assert!(
-        after == before,
-        "a refused start must leave the phase's state, agent pid and gate files \
-         byte-identical\nbefore: {:?}\nafter:  {:?}",
-        snapshot_paths(&before),
-        snapshot_paths(&after)
-    );
-    assert_eq!(
-        pending_launch(root, phase),
-        None,
-        "a refused start must leave no reservation"
-    );
-    assert_eq!(
-        liveness_files(root),
-        liveness_before,
-        "a refused start must leave no liveness file of its own"
-    );
-    assert_eq!(
-        phase_branches(root, phase),
-        branches_before,
-        "a refused start must not create or change the phase branch"
-    );
-    assert_eq!(
-        workflow_started_count(root),
-        started_before,
-        "a refused start must not emit workflow_started"
-    );
-}
-
-/// `git branch --list feature/phase-<padded>`'s output.
-fn phase_branches(root: &Path, phase: PhaseId) -> String {
-    let branches = devflow_core::test_support::git_command(root)
-        .args([
-            "branch",
-            "--list",
-            &format!("feature/phase-{padded}", padded = phase.padded()),
-        ])
-        .output()
-        .expect("list phase branch");
-    assert!(branches.status.success());
-    String::from_utf8_lossy(&branches.stdout).into_owned()
-}
-
 /// How many `workflow_started` events the project's event log holds.
 fn workflow_started_count(root: &Path) -> usize {
     fs::read_to_string(devflow_core::events::events_path(root))
         .unwrap_or_default()
         .matches("\"workflow_started\"")
         .count()
-}
-
-#[test]
-fn start_refuses_a_phase_whose_recorded_agent_is_alive() {
-    let home = common::HermeticHome::new();
-    let repo = tempfile::tempdir().unwrap();
-    let root = repo.path();
-    let phase = PhaseId::new(96);
-    init_repo(root, phase);
-    let agent = LiveProcess::spawn();
-    plant_leftover_run(root, phase, Some(agent.pid()));
-    let mut present = agent_arm_fragments(phase, agent.pid());
-    present.extend([
-        // A live recycled pid refuses start again, and discard too; removing the pid
-        // file, then discard, then start gets past it (48-REVIEW WR-01).
-        "If a named pid is live but is not this phase's process (a recycled pid), `start` refuses again"
-            .to_string(),
-        format!(
-            "remove .devflow/phase-{}-agent-pid, then run `devflow discard --phase {phase}` (it removes the phase's state, worktree and branch) and `devflow start`",
-            phase.padded()
-        ),
-    ]);
-
-    assert_start_refuses_live_run(
-        &home,
-        root,
-        phase,
-        &["--force"],
-        (
-            &present,
-            &[
-                "supervisor launch".to_string(),
-                format!("devflow stop --phase {phase} --launch"),
-                "devflow recover".to_string(),
-                "recover --clean".to_string(),
-            ],
-        ),
-        "start must refuse a phase whose recorded agent is alive",
-    );
 }
 
 #[test]
@@ -864,36 +573,6 @@ fn start_replaces_a_leftover_state_whose_recorded_processes_are_dead() {
     assert!(
         events_contain_workflow_started(root),
         "replacing a dead leftover must emit workflow_started"
-    );
-}
-
-#[test]
-fn start_proceeds_when_no_state_exists_even_if_the_agent_pid_file_names_a_live_process() {
-    let home = common::HermeticHome::new();
-    let repo = tempfile::tempdir().unwrap();
-    let root = repo.path();
-    let phase = PhaseId::new(98);
-    init_repo(root, phase);
-    let agent = LiveProcess::spawn();
-    write_agent_pid(root, phase, agent.pid());
-    assert!(
-        !devflow_core::workflow::state_path(root, phase).exists(),
-        "the carve-out fixture must have no phase state"
-    );
-    let fake_bin = fake_codex("exit 0");
-    let _reaper = common::LaunchedRunReaper::for_home(&home, root, phase);
-
-    let output = run_start(&home, root, phase, &fake_bin, &[]);
-    assert!(
-        output.status.success(),
-        "without phase state, start must proceed even if the agent pid file names a live process\n\
-         stdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        events_contain_workflow_started(root),
-        "the no-state carve-out must emit workflow_started"
     );
 }
 
@@ -943,124 +622,12 @@ fn resume_command(
     command
 }
 
-struct RefusalCase {
-    required: Vec<PathBuf>,
-    /// The arm's own fragments.
-    present: Vec<String>,
-    /// Text this arm must not contain.
-    absent: Vec<String>,
-    /// A live agent pid the refusal must leave running.
-    spared_agent: Option<u32>,
-    refusal: &'static str,
-}
-
-fn assert_resume_refuses_live_run(
-    home: &common::HermeticHome,
-    root: &Path,
-    phase: PhaseId,
-    fake_bin: &common::FakeBin,
-    case: &RefusalCase,
-) {
-    let liveness_before = liveness_files(root);
-    let before = phase_file_snapshot(root, phase);
-    for required in &case.required {
-        assert!(
-            snapshot_paths(&before).contains(&required.as_path()),
-            "fixture snapshot must cover {}; it has {:?}",
-            required.display(),
-            snapshot_paths(&before)
-        );
-    }
-    let launched_before = stage_launched_count(root);
-
-    let output = resume_command(home, root, phase, fake_bin)
-        .output()
-        .expect("run devflow resume");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !output.status.success(),
-        "{}\nstdout: {stdout}\nstderr: {stderr}",
-        case.refusal
-    );
-
-    let common = [
-        "refusing to resume; nothing was written".to_string(),
-        format!(
-            "Once every supervisor and process named above is gone, run `devflow resume --phase {phase}` again."
-        ),
-    ];
-    for fragment in common.iter().chain(&case.present) {
-        assert!(
-            stderr.contains(fragment.as_str()),
-            "refusal must contain {fragment:?}\nstderr: {stderr}"
-        );
-    }
-    for stale in removed_refusal_sentences(phase)
-        .into_iter()
-        .chain([
-            "refusing to start".to_string(),
-            "run `devflow start` again".to_string(),
-            "as soon as this start exits".to_string(),
-            "ps -p ".to_string(),
-        ])
-        .chain(case.absent.iter().cloned())
-    {
-        assert!(
-            !stderr.contains(&stale),
-            "refusal must not contain start-only or superseded text {stale:?}\nstderr: {stderr}"
-        );
-    }
-
-    let after = phase_file_snapshot(root, phase);
-    assert_eq!(
-        after, before,
-        "a refused resume must leave phase files byte-identical"
-    );
-    assert_eq!(
-        pending_launch(root, phase),
-        None,
-        "a refused resume must leave no reservation"
-    );
-    assert_eq!(
-        liveness_files(root),
-        liveness_before,
-        "a refused resume must leave no liveness file of its own"
-    );
-    assert_eq!(
-        stage_launched_count(root),
-        launched_before,
-        "a refused resume must not emit stage_launched"
-    );
-    if let Some(pid) = case.spared_agent {
-        assert!(
-            devflow_core::agent::agent_running(pid),
-            "a refused resume must not signal the recorded agent {pid}"
-        );
-    }
-}
-
 /// How many `stage_launched` events the project's event log holds.
 fn stage_launched_count(root: &Path) -> usize {
     fs::read_to_string(devflow_core::events::events_path(root))
         .unwrap_or_default()
         .matches("\"stage_launched\"")
         .count()
-}
-
-/// The resume agent arm's fragments beyond [`agent_arm_fragments`].
-fn resume_agent_fragments(phase: PhaseId) -> Vec<String> {
-    vec![
-        "A state already marked stopped does not mean these processes have exited".to_string(),
-        "with no live supervisor, `devflow status` names a live agent's pid and the manual kill".to_string(),
-        "resume refuses until every named process has exited".to_string(),
-        "If a named pid is live but is not this phase's process (a recycled pid), `resume` refuses again".to_string(),
-        "and so does `devflow discard`, which reads the same pid file; no DevFlow verb clears a recorded pid".to_string(),
-        format!(
-            "remove .devflow/phase-{}-agent-pid; `devflow discard --phase {phase}` then removes the phase's state, worktree and branch, after which `devflow start` begins again",
-            phase.padded()
-        ),
-    ]
 }
 
 /// `resume` over a phase whose runner is live refuses, names `devflow stop`, leaves the
@@ -1110,45 +677,6 @@ fn resume_refuses_a_phase_whose_recorded_monitor_is_alive() {
     assert!(
         run.alive(),
         "a refused resume must leave the live runner running"
-    );
-}
-
-#[test]
-fn resume_refuses_a_stopped_phase_whose_recorded_agent_is_alive() {
-    let repo = tempfile::tempdir().unwrap();
-    let home = common::HermeticHome::new();
-    let root = repo.path();
-    let phase = PhaseId::new(86);
-    init_repo(root, phase);
-    let agent = LiveProcess::spawn();
-    let fake_bin = fake_codex("exec sleep 60");
-    let _reaper = common::LaunchedRunReaper::for_home(&home, root, phase);
-    plant_resumable_run(root, phase, Some(agent.pid()), true);
-    let mut present = agent_arm_fragments(phase, agent.pid());
-    present.extend(resume_agent_fragments(phase));
-    let case = RefusalCase {
-        required: vec![
-            devflow_core::workflow::state_path(root, phase),
-            devflow_core::agent_result::agent_pid_path(root, phase),
-        ],
-        present,
-        absent: vec![
-            "supervisor launch".to_string(),
-            format!("devflow stop --phase {phase} --launch"),
-            "devflow recover".to_string(),
-            "recover --clean".to_string(),
-        ],
-        spared_agent: Some(agent.pid()),
-        refusal: "resume must refuse a phase whose recorded agent is alive",
-    };
-
-    assert_resume_refuses_live_run(&home, root, phase, &fake_bin, &case);
-    assert_resume_refuses_live_run(&home, root, phase, &fake_bin, &case);
-    assert!(
-        devflow_core::workflow::load_state(root, phase)
-            .expect("load planted state")
-            .stopped,
-        "the stop mark must survive a refused resume"
     );
 }
 

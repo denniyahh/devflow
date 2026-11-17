@@ -223,6 +223,18 @@ fn wait_for_state_cleared(root: &Path, phase: PhaseId) {
     panic!("timed out waiting for phase {phase} state to clear (pipeline never finished)");
 }
 
+/// Wait until no process holds a phase's runner lock: the runner has exited.
+fn wait_for_runner_lock_free(root: &Path, phase: PhaseId) {
+    let lock = devflow_core::liveness::runner_lock_path(root, phase);
+    for _ in 0..400 {
+        if devflow_core::liveness::probe(&lock).unwrap() != devflow_core::liveness::Held::Live {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!("timed out waiting for phase {phase}'s runner to let go of its runner lock");
+}
+
 /// Wait until a phase's persisted state has `stopped == true` (20c: a
 /// `--until`-halted phase). Polls rather than reading once, since the fake
 /// agent + monitor chain advances asynchronously.
@@ -1538,6 +1550,9 @@ esac
         ],
     );
     wait_for_state_cleared(root, PhaseId::new(8));
+    // The runner clears the state before it exits and lets go of its lock, and
+    // cleanup refuses while the lock is held (D-07), so wait for the lock too.
+    wait_for_runner_lock_free(root, PhaseId::new(8));
 
     // cleanup — removes worktrees
     let out = run_devflow(&home, root, &fake_bin.path, &["cleanup", "--force"]);
@@ -1587,152 +1602,6 @@ fn start_codex_without_context_fails_preflight() {
     assert!(
         !root.join(".worktrees/phase-42").exists(),
         "pre-flight failure must not create a worktree"
-    );
-}
-
-/// 20b instance 1 (D-06, review: Codex HIGH fail-closed-on-live-agent):
-/// `cleanup --force` must refuse to remove a worktree whose agent pid is
-/// genuinely alive, even when the persisted `State` carries no supervisor
-/// record — a run with no addressable monitor, NOT a healthy one.
-/// A guard that only refuses on `Healthy`/`BetweenStages` would still delete
-/// this worktree out from under a live agent. Against unmodified `cleanup`
-/// (no liveness check at all today) this test FAILS: cleanup removes the
-/// worktree unconditionally and exits 0.
-#[test]
-fn cleanup_force_refuses_on_live_agent_unknown_monitor() {
-    let home = common::HermeticHome::new();
-    let repo = tempfile::tempdir().unwrap();
-    let root = repo.path();
-    init_repo(root);
-    let phase = PhaseId::new(8);
-    let branch = format!("feature/phase-{padded}", padded = phase.padded());
-    seed_feature_branch(root, phase);
-
-    let wt_path = root
-        .join(".worktrees")
-        .join(format!("phase-{padded}", padded = phase.padded()));
-    devflow_core::worktree::add(root, &wt_path, &branch, &branch, false).unwrap();
-
-    // The agent pid file holds a genuinely alive pid — the test process
-    // itself, trivially alive for the test's duration.
-    let pid_path = devflow_core::agent_result::agent_pid_path(root, phase);
-    fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
-    fs::write(&pid_path, std::process::id().to_string()).unwrap();
-
-    // Persist a State with no supervisor record (no addressable monitor) and
-    // worktree_path pointing at the created worktree (the worktree->phase
-    // join key, review: Codex MEDIUM).
-    let mut state = devflow_core::state::State::new(
-        phase,
-        devflow_core::state::AgentKind::Claude,
-        devflow_core::mode::Mode::Auto,
-        root.to_path_buf(),
-    );
-    state.worktree_path = Some(wt_path.clone());
-    devflow_core::workflow::save_state(&state).unwrap();
-
-    let fake_bin = fake_bin_dir(&[]);
-    let output = common::hermetic_devflow(&home)
-        .args(["cleanup", "--force"])
-        .arg(root)
-        .hermetic_path(path_with_fake_bin(&fake_bin.path))
-        .current_dir(root)
-        .output()
-        .expect("run devflow cleanup");
-
-    assert!(
-        !output.status.success(),
-        "cleanup --force must refuse to remove a live agent's worktree even \
-         with no supervisor record"
-    );
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    // 50-14: `stop` ends a live run; `resume` refuses while one is live.
-    assert!(
-        combined.contains("run `devflow stop --phase 8`") && !combined.contains("devflow resume"),
-        "refusal must name `devflow stop --phase 8` (not `devflow resume`) as the \
-         unblocking action, got:\n{combined}"
-    );
-    assert!(
-        wt_path.is_dir(),
-        "worktree must NOT have been removed while the agent is alive"
-    );
-}
-
-/// 20b instance 1 (D-06, review: Codex HIGH fail-closed-on-live-agent),
-/// case (b): a dead monitor (`Stuck` liveness) must NOT be treated as
-/// "safe to proceed" when the agent it was watching is still alive — the
-/// guard keys on agent liveness, not on the monitor's Healthy/BetweenStages
-/// classification alone.
-#[test]
-fn cleanup_force_refuses_on_dead_monitor_live_agent() {
-    let home = common::HermeticHome::new();
-    let repo = tempfile::tempdir().unwrap();
-    let root = repo.path();
-    init_repo(root);
-    let phase = PhaseId::new(9);
-    let branch = format!("feature/phase-{padded}", padded = phase.padded());
-    seed_feature_branch(root, phase);
-
-    let wt_path = root
-        .join(".worktrees")
-        .join(format!("phase-{padded}", padded = phase.padded()));
-    devflow_core::worktree::add(root, &wt_path, &branch, &branch, false).unwrap();
-
-    // Agent pid file holds a genuinely alive pid (the test process itself).
-    let pid_path = devflow_core::agent_result::agent_pid_path(root, phase);
-    fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
-    fs::write(&pid_path, std::process::id().to_string()).unwrap();
-
-    // Persist a State whose supervisor record names a socket that does not
-    // exist (a dead monitor: the probe reads GONE), plus worktree_path.
-    let mut state = devflow_core::state::State::new(
-        phase,
-        devflow_core::state::AgentKind::Claude,
-        devflow_core::mode::Mode::Auto,
-        root.to_path_buf(),
-    );
-    state.worktree_path = Some(wt_path.clone());
-    state.supervisor = Some(devflow_core::state::SupervisorRecord::new(
-        root.join("dead-monitor-never-bound.sock"),
-        "deadmonitor00000".to_string(),
-        0x7FFF_FFFE, // essentially never a live process group
-        1,
-        String::new(),
-    ));
-    devflow_core::workflow::save_state(&state).unwrap();
-
-    let fake_bin = fake_bin_dir(&[]);
-    let output = common::hermetic_devflow(&home)
-        .args(["cleanup", "--force"])
-        .arg(root)
-        .hermetic_path(path_with_fake_bin(&fake_bin.path))
-        .current_dir(root)
-        .output()
-        .expect("run devflow cleanup");
-
-    assert!(
-        !output.status.success(),
-        "cleanup --force must refuse to remove a worktree whose agent is \
-         alive even when its monitor is dead (Stuck liveness)"
-    );
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    // 50-14: `stop` ends a live run; `resume` refuses while one is live.
-    assert!(
-        combined.contains("run `devflow stop --phase 9`") && !combined.contains("devflow resume"),
-        "refusal must name `devflow stop --phase 9` (not `devflow resume`) as the \
-         unblocking action, got:\n{combined}"
-    );
-    assert!(
-        wt_path.is_dir(),
-        "worktree must NOT have been removed while the agent is alive"
     );
 }
 
@@ -1917,8 +1786,8 @@ const UNTIL_PLAN_REASON: &str = "stopped after plan completed (--until plan)";
 /// OPS-02 / D-35: `cleanup` says why it keeps a worktree, and each case names only
 /// its own reason: a finished run gives its stop reason and `--force` (never
 /// `resume`, which refuses a finished run); an `--until plan` halt gives that halt's
-/// reason and `resume`; a live run is refused with a non-zero exit naming that a run
-/// is live and `devflow stop`.
+/// reason and `resume`; a live run, whose runner lock another process holds, is
+/// refused with a non-zero exit naming the runner and `devflow stop`.
 #[test]
 fn cleanup_names_why_it_keeps_a_worktree() {
     // A finished run.
@@ -1939,7 +1808,7 @@ fn cleanup_names_why_it_keeps_a_worktree() {
         text.contains(FINISHED_REASON) && text.contains("--force"),
         "names the finished run's reason and --force: {text}"
     );
-    for other in ["devflow resume", "--until", "a run is live"] {
+    for other in ["devflow resume", "--until", "runner holds"] {
         assert!(!text.contains(other), "finished names {other:?}: {text}");
     }
 
@@ -1961,33 +1830,43 @@ fn cleanup_names_why_it_keeps_a_worktree() {
         text.contains(UNTIL_PLAN_REASON) && text.contains("devflow resume --phase 22"),
         "names the halt's reason and resume: {text}"
     );
-    for other in ["finished", "a run is live"] {
+    for other in ["finished", "runner holds"] {
         assert!(!text.contains(other), "the halt names {other:?}: {text}");
     }
 
-    // A live run: the agent pid file holds this test process's own pid.
+    // A live run (D-07, D-12a): another process holds the phase's runner lock. It is
+    // refused with and without `--force`.
     let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let phase = PhaseId::new(23);
     let wt = cleanup_fixture(repo.path(), phase, false, |_| {});
-    let pid_path = devflow_core::agent_result::agent_pid_path(repo.path(), phase);
-    fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
-    fs::write(&pid_path, std::process::id().to_string()).unwrap();
-    let out = run_cleanup(&home, repo.path(), &[]);
-    let text =
-        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
-    assert!(!out.status.success(), "a live run is refused: {text}");
-    assert!(wt.is_dir(), "a live run's worktree is kept: {text}");
-    assert!(
-        text.contains("a run is live") && text.contains("devflow stop --phase 23"),
-        "names the live run and stop: {text}"
-    );
-    for other in ["finished", "--until", "devflow resume"] {
+    let holder = RunnerLockHolder::hold(repo.path(), phase);
+    for args in [&[][..], &["--force"][..]] {
+        let out = run_cleanup(&home, repo.path(), args);
+        let text = String::from_utf8_lossy(&out.stdout).to_string()
+            + &String::from_utf8_lossy(&out.stderr);
         assert!(
-            !text.contains(other),
-            "the live refusal names {other:?}: {text}"
+            !out.status.success(),
+            "{args:?}: a live run is refused: {text}"
         );
+        assert!(
+            wt.is_dir(),
+            "{args:?}: a live run's worktree is kept: {text}"
+        );
+        assert!(
+            text.contains("its runner holds the runner lock")
+                && text.contains(&format!("(pid {})", holder.pid()))
+                && text.contains("devflow stop --phase 23"),
+            "{args:?}: names the live runner and stop: {text}"
+        );
+        for other in ["finished", "--until", "devflow resume"] {
+            assert!(
+                !text.contains(other),
+                "{args:?}: the live refusal names {other:?}: {text}"
+            );
+        }
     }
+    drop(holder);
 }
 
 /// OPS-02 (999.213): `cleanup --force` removes the run's state file together with
@@ -3700,17 +3579,15 @@ fn discard_refuses_a_listed_worktree_whose_directory_is_gone() {
     );
 }
 
-/// A live run is never discarded: with the phase's agent running, discard refuses
-/// with cleanup's liveness refusal, naming `devflow stop`, and removes nothing.
+/// A live run is never discarded (D-07, D-12a): with the phase's runner lock held by
+/// another process, discard refuses naming the runner and `devflow stop`, and removes
+/// nothing.
 #[test]
 fn discard_refuses_a_live_run() {
     let case = discard_case();
     let phase = PhaseId::new(47);
     full_phase(&case.root, phase, true, |_| {});
-    // The agent pid file holds a live pid: this test process's own.
-    let pid_path = devflow_core::agent_result::agent_pid_path(&case.root, phase);
-    fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
-    fs::write(&pid_path, std::process::id().to_string()).unwrap();
+    let holder = RunnerLockHolder::hold(&case.root, phase);
     let before = phase_items(&case.root, phase);
 
     let out = run_discard(&case.home, &case.root, phase, &[]);
@@ -3720,94 +3597,120 @@ fn discard_refuses_a_live_run() {
         phase,
         &before,
         &[
-            "a run is live",
-            "its agent is running",
+            "its runner holds the runner lock",
+            &format!("(pid {})", holder.pid()),
             "devflow stop --phase 47",
             "nothing was removed",
         ],
     );
+    drop(holder);
 }
 
-/// A supervisor record whose socket is `name` in the hermetic cache's `sock`
-/// directory. With `stale`, a listener is bound there and dropped, so the socket
-/// probes STALE; otherwise a regular file is written there, so the probe fails. The
-/// recorded agent group is one that cannot exist: nothing here assesses it.
-fn recorded_supervisor(
-    home: &common::HermeticHome,
-    name: &str,
-    stale: bool,
-) -> devflow_core::state::SupervisorRecord {
-    let sock_dir = devflow_core::registry::socket_dir_in(&home.cache_dir());
-    fs::create_dir_all(&sock_dir).unwrap();
-    let socket = sock_dir.join(name);
-    if stale {
-        drop(std::os::unix::net::UnixListener::bind(&socket).expect("bind the socket"));
-    } else {
-        fs::write(&socket, "a regular file\n").unwrap();
+/// The variables [`runner_lock_holder_entry`] reads: the project root and phase whose
+/// runner lock it holds, and the directory it signals through.
+const HOLDER_ROOT_ENV: &str = "RUNNER_LOCK_HOLDER_ROOT";
+const HOLDER_PHASE_ENV: &str = "RUNNER_LOCK_HOLDER_PHASE";
+const HOLDER_SIGNAL_ENV: &str = "RUNNER_LOCK_HOLDER_SIGNAL";
+
+/// The bound on each wait between a [`RunnerLockHolder`] and its child.
+const HOLDER_WAIT: Duration = Duration::from_secs(30);
+
+/// Whether `path` exists within [`HOLDER_WAIT`].
+fn appears_within(path: &Path) -> bool {
+    let deadline = std::time::Instant::now() + HOLDER_WAIT;
+    while std::time::Instant::now() < deadline {
+        if path.exists() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
-    devflow_core::state::SupervisorRecord::new(
-        socket,
-        "aaaa0000aaaa0007".to_string(),
-        u32::MAX,
-        0,
-        "no-such-boot".to_string(),
-    )
+    path.exists()
 }
 
-/// D-09.3: a STALE supervisor may have left its agent group running, so discard
-/// refuses, names the supervisor as STALE and `devflow stop`, and removes nothing.
+/// Not a test of its own: the child process [`RunnerLockHolder`] runs. Holds the
+/// phase's runner lock through `claim_runner_lock`, as a runner does, writes `held`,
+/// and lets go once `release` appears in its signal directory. Without the variables
+/// it does nothing.
 #[test]
-fn discard_refuses_a_stale_supervisor_naming_stop() {
-    let case = discard_case();
-    let phase = PhaseId::new(48);
-    let record = recorded_supervisor(&case.home, "stale.sock", true);
-    let socket = record.socket_path.clone();
-    full_phase(&case.root, phase, true, |state| {
-        finished(state);
-        state.supervisor = Some(record);
-    });
-    let before = phase_items(&case.root, phase);
-
-    let out = run_discard(&case.home, &case.root, phase, &[]);
-    assert_discard_refused(
-        &out,
-        &case.root,
-        phase,
-        &before,
-        &[
-            "its supervisor is STALE",
-            "devflow stop --phase 48",
-            "nothing was removed",
-        ],
+#[ignore = "the runner-lock holder process RunnerLockHolder spawns, not a test"]
+fn runner_lock_holder_entry() {
+    let (Some(root), Some(phase), Some(signal)) = (
+        std::env::var_os(HOLDER_ROOT_ENV),
+        std::env::var_os(HOLDER_PHASE_ENV),
+        std::env::var_os(HOLDER_SIGNAL_ENV),
+    ) else {
+        return;
+    };
+    let phase = PhaseId::new(phase.to_str().unwrap().parse().unwrap());
+    let signal = PathBuf::from(signal);
+    let _hold = devflow_core::liveness::claim_runner_lock(Path::new(&root), phase)
+        .expect("hold the runner lock");
+    fs::write(signal.join("held"), "").unwrap();
+    assert!(
+        appears_within(&signal.join("release")),
+        "the holder was never released"
     );
-    assert!(socket.exists(), "the recorded socket is left in place");
 }
 
-/// D-09.3: a supervisor that cannot be probed proves nothing either way, so discard
-/// refuses, says the probe failed, names `devflow stop`, and removes nothing.
-#[test]
-fn discard_refuses_an_unprobeable_supervisor_naming_stop() {
-    let case = discard_case();
-    let phase = PhaseId::new(49);
-    let record = recorded_supervisor(&case.home, "not-a-socket.sock", false);
-    full_phase(&case.root, phase, true, |state| {
-        finished(state);
-        state.supervisor = Some(record);
-    });
-    let before = phase_items(&case.root, phase);
+/// A child process holding a phase's runner lock, as a live runner does. Dropping it
+/// releases the lock and reaps the child, on a failed assertion too.
+struct RunnerLockHolder {
+    child: std::process::Child,
+    signal: tempfile::TempDir,
+}
 
-    let out = run_discard(&case.home, &case.root, phase, &[]);
-    assert_discard_refused(
-        &out,
-        &case.root,
-        phase,
-        &before,
-        &[
-            "the probe failed",
-            "devflow stop --phase 49",
-            "nothing was removed",
-        ],
-    );
+impl RunnerLockHolder {
+    /// Spawn this test binary's [`runner_lock_holder_entry`] for `(root, phase)` and
+    /// wait until it holds the lock.
+    fn hold(root: &Path, phase: PhaseId) -> Self {
+        let signal = tempfile::tempdir().unwrap();
+        let child = Command::new(std::env::current_exe().expect("this test binary"))
+            .args([
+                "--exact",
+                "runner_lock_holder_entry",
+                "--ignored",
+                "--quiet",
+            ])
+            .env(HOLDER_ROOT_ENV, root)
+            .env(HOLDER_PHASE_ENV, phase.to_string())
+            .env(HOLDER_SIGNAL_ENV, signal.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the runner-lock holder");
+        let holder = RunnerLockHolder { child, signal };
+        assert!(
+            appears_within(&holder.signal.path().join("held")),
+            "the holder never took the runner lock"
+        );
+        assert_eq!(
+            devflow_core::liveness::probe(&devflow_core::liveness::runner_lock_path(root, phase))
+                .unwrap(),
+            devflow_core::liveness::Held::Live,
+            "premise: the runner lock reads held"
+        );
+        holder
+    }
+
+    /// The holder's pid, which the lock's record names.
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+}
+
+impl Drop for RunnerLockHolder {
+    fn drop(&mut self) {
+        let _ = fs::write(self.signal.path().join("release"), "");
+        let deadline = std::time::Instant::now() + HOLDER_WAIT;
+        while std::time::Instant::now() < deadline {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 /// A STALE supervisor socket named for `root` (canonical) and `phase`, with no
@@ -3827,104 +3730,6 @@ fn plant_swept_socket(home: &common::HermeticHome, root: &Path, phase: PhaseId) 
     socket.as_path().to_path_buf()
 }
 
-/// With a state that does not load there is no supervisor record to probe, so
-/// discard sweeps for this phase's sockets and refuses on one that may still run.
-/// The control with no socket is `discard_removes_a_state_that_does_not_load`.
-#[test]
-fn discard_refuses_a_swept_live_supervisor_when_the_state_does_not_load() {
-    let case = discard_case();
-    let phase = PhaseId::new(50);
-    full_phase(&case.root, phase, true, finished);
-    fs::write(
-        devflow_core::workflow::state_path(&case.root, phase),
-        "not json",
-    )
-    .unwrap();
-    let socket = plant_swept_socket(&case.home, &case.root, phase);
-    let before = phase_items(&case.root, phase);
-    assert_eq!(
-        before.state.as_deref(),
-        Some(b"not json".as_slice()),
-        "premise: the state file does not load"
-    );
-
-    let out = run_discard(&case.home, &case.root, phase, &[]);
-    assert_discard_refused(
-        &out,
-        &case.root,
-        phase,
-        &before,
-        &[
-            "its state does not load",
-            &socket.display().to_string(),
-            "devflow stop --phase 50",
-            "nothing was removed",
-        ],
-    );
-    assert!(socket.exists(), "the swept socket is left in place");
-}
-
-/// With no state there is no supervisor record to probe either: the same sweep
-/// refuses. The control with no socket is
-/// `discard_removes_a_worktree_and_branch_with_no_state`.
-#[test]
-fn discard_refuses_a_swept_live_supervisor_when_no_state_exists() {
-    let case = discard_case();
-    let phase = PhaseId::new(51);
-    full_phase(&case.root, phase, true, finished);
-    fs::remove_file(devflow_core::workflow::state_path(&case.root, phase)).unwrap();
-    let socket = plant_swept_socket(&case.home, &case.root, phase);
-    let before = phase_items(&case.root, phase);
-    assert!(
-        before.worktree.is_some() && before.state.is_none() && before.branch_tip.is_some(),
-        "premise: a worktree and a branch with no state"
-    );
-
-    let out = run_discard(&case.home, &case.root, phase, &[]);
-    assert_discard_refused(
-        &out,
-        &case.root,
-        phase,
-        &before,
-        &[
-            "its state is missing",
-            &socket.display().to_string(),
-            "devflow stop --phase 51",
-            "nothing was removed",
-        ],
-    );
-    assert!(socket.exists(), "the swept socket is left in place");
-}
-
-/// A socket directory that cannot be listed cannot rule a live supervisor out, so
-/// with no state discard refuses and removes nothing.
-#[test]
-fn discard_refuses_when_the_socket_directory_cannot_be_listed() {
-    let case = discard_case();
-    let phase = PhaseId::new(55);
-    full_phase(&case.root, phase, true, finished);
-    fs::remove_file(devflow_core::workflow::state_path(&case.root, phase)).unwrap();
-    // A regular file where the socket directory belongs: listing it fails.
-    let sock_dir = devflow_core::registry::socket_dir_in(&case.home.cache_dir());
-    fs::create_dir_all(sock_dir.parent().unwrap()).unwrap();
-    fs::write(&sock_dir, "not a directory\n").unwrap();
-    let before = phase_items(&case.root, phase);
-
-    let out = run_discard(&case.home, &case.root, phase, &[]);
-    assert_discard_refused(
-        &out,
-        &case.root,
-        phase,
-        &before,
-        &[
-            &sock_dir.display().to_string(),
-            "cannot be listed",
-            "a live supervisor cannot be ruled out",
-            "nothing was removed",
-        ],
-    );
-}
-
 /// A launch liveness lock in `root`'s `.devflow/`, taken by this test process: what a
 /// supervisor holds from before it publishes its socket. It reads live for as long as
 /// the returned hold is kept, and the launch has no socket and no sidecar. Returns the
@@ -3941,76 +3746,6 @@ fn hold_launch_lock(root: &Path) -> (String, devflow_core::liveness::Hold) {
         "premise: the launch's liveness lock reads live"
     );
     (launch_id, hold)
-}
-
-/// A supervisor that has not published its socket is in no sweep: only its held
-/// liveness lock shows it. With no state to name that launch, discard refuses on the
-/// lock, names it and `devflow stop`, and removes nothing. The control with a lock
-/// nothing holds is `discard_ignores_a_launch_lock_nothing_holds`.
-#[test]
-fn discard_refuses_an_unpublished_launch_when_no_state_exists() {
-    let case = discard_case();
-    let phase = PhaseId::new(58);
-    full_phase(&case.root, phase, true, finished);
-    fs::remove_file(devflow_core::workflow::state_path(&case.root, phase)).unwrap();
-    let (_, hold) = hold_launch_lock(&case.root);
-    let before = phase_items(&case.root, phase);
-    assert!(
-        before.worktree.is_some() && before.state.is_none() && before.branch_tip.is_some(),
-        "premise: a worktree and a branch with no state"
-    );
-
-    let out = run_discard(&case.home, &case.root, phase, &[]);
-    assert_discard_refused(
-        &out,
-        &case.root,
-        phase,
-        &before,
-        &[
-            "its state is missing",
-            &hold.path().display().to_string(),
-            "is held",
-            "devflow stop",
-            "nothing was removed",
-        ],
-    );
-    assert!(hold.path().exists(), "the liveness lock is left in place");
-}
-
-/// A state that does not load names no launch either: the same held lock refuses.
-#[test]
-fn discard_refuses_an_unpublished_launch_when_the_state_does_not_load() {
-    let case = discard_case();
-    let phase = PhaseId::new(59);
-    full_phase(&case.root, phase, true, finished);
-    fs::write(
-        devflow_core::workflow::state_path(&case.root, phase),
-        "not json",
-    )
-    .unwrap();
-    let (_, hold) = hold_launch_lock(&case.root);
-    let before = phase_items(&case.root, phase);
-    assert_eq!(
-        before.state.as_deref(),
-        Some(b"not json".as_slice()),
-        "premise: the state file does not load"
-    );
-
-    let out = run_discard(&case.home, &case.root, phase, &[]);
-    assert_discard_refused(
-        &out,
-        &case.root,
-        phase,
-        &before,
-        &[
-            "its state does not load",
-            &hold.path().display().to_string(),
-            "is held",
-            "devflow stop",
-            "nothing was removed",
-        ],
-    );
-    assert!(hold.path().exists(), "the liveness lock is left in place");
 }
 
 /// The lock decides, not the file: a launch liveness file that nothing holds is an
@@ -4087,201 +3822,6 @@ fn discard_ignores_a_launch_lock_another_phases_state_records() {
         "the phase that records the launch is untouched: {text}"
     );
     assert!(hold.path().exists(), "the liveness lock is left in place");
-}
-
-/// A state that loads names at most its latest launch, and a finished run's names
-/// none: the supervisor clears its record and then fires the notify command before it
-/// exits. A socket of this project and phase that the state does not name may be a
-/// supervisor that still runs, so discard sweeps for one beside a loaded state too,
-/// refuses, and removes nothing. The control is
-/// `discard_removes_a_run_whose_recorded_supervisor_left_only_its_sidecar`.
-#[test]
-fn discard_refuses_a_swept_live_supervisor_a_loaded_state_does_not_name() {
-    let case = discard_case();
-    let phase = PhaseId::new(62);
-    full_phase(&case.root, phase, true, finished);
-    let socket = plant_swept_socket(&case.home, &case.root, phase);
-    let state = load_state(&case.root, phase).expect("premise: the state loads");
-    assert!(
-        state.supervisor.is_none() && state.pending_supervisor.is_none(),
-        "premise: the state names no supervisor"
-    );
-    let before = phase_items(&case.root, phase);
-
-    let out = run_discard(&case.home, &case.root, phase, &[]);
-    assert_discard_refused(
-        &out,
-        &case.root,
-        phase,
-        &before,
-        &[
-            "its state does not name",
-            &socket.display().to_string(),
-            "devflow stop --phase 62",
-            "nothing was removed",
-        ],
-    );
-    assert!(socket.exists(), "the swept socket is left in place");
-}
-
-/// The sweep beside a loaded state fails closed as the stateless one does: a socket
-/// directory that cannot be listed cannot rule out a supervisor the state does not
-/// name, so discard refuses and removes nothing.
-#[test]
-fn discard_refuses_an_unlistable_socket_directory_beside_a_loaded_state() {
-    let case = discard_case();
-    let phase = PhaseId::new(63);
-    full_phase(&case.root, phase, true, finished);
-    // A regular file where the socket directory belongs: listing it fails.
-    let sock_dir = devflow_core::registry::socket_dir_in(&case.home.cache_dir());
-    fs::create_dir_all(sock_dir.parent().unwrap()).unwrap();
-    fs::write(&sock_dir, "not a directory\n").unwrap();
-    let before = phase_items(&case.root, phase);
-    assert!(
-        load_state(&case.root, phase).is_ok(),
-        "premise: the state loads"
-    );
-
-    let out = run_discard(&case.home, &case.root, phase, &[]);
-    assert_discard_refused(
-        &out,
-        &case.root,
-        phase,
-        &before,
-        &[
-            &sock_dir.display().to_string(),
-            "cannot be listed",
-            "a live supervisor cannot be ruled out",
-            "nothing was removed",
-        ],
-    );
-}
-
-/// The socket path of a launch of `phase` in `root`, in the hermetic cache: a name the
-/// sweep attributes to that project and phase.
-fn launch_socket(
-    home: &common::HermeticHome,
-    root: &Path,
-    phase: PhaseId,
-    launch_id: &str,
-) -> devflow_core::supervisor::SocketPath {
-    let cache = home.cache_dir();
-    fs::create_dir_all(devflow_core::registry::socket_dir_in(&cache)).unwrap();
-    devflow_core::supervisor::SocketPath::for_launch(&cache, root, phase, launch_id)
-        .expect("a socket path that fits")
-}
-
-/// The sweep beside a loaded state turns no supervisor the state names into a second
-/// refusal. A supervisor that exited leaves its sidecar behind, so the sweep sees an
-/// entry for the launch the state records: its socket is gone, and the run is discarded.
-/// Another phase's socket does not refuse either.
-#[test]
-fn discard_removes_a_run_whose_recorded_supervisor_left_only_its_sidecar() {
-    let case = discard_case();
-    let phase = PhaseId::new(64);
-    let launch_id = devflow_core::supervisor::new_launch_id();
-    let socket = launch_socket(&case.home, &case.root, phase, &launch_id);
-    let sidecar = serde_json::json!({
-        "launch_id": launch_id,
-        "project_root": case.root,
-        "phase": phase,
-        "stage": null,
-        "agent": "claude",
-        "launch": "capture",
-        "agent_pid": u32::MAX,
-        "agent_pgid": u32::MAX,
-        "agent_start_time": 0,
-        "boot_id": "no-such-boot",
-        "supervisor_pid": u32::MAX,
-        "supervisor_start_time": 0,
-        "created_at": "2026-01-01T00:00:00Z",
-    });
-    fs::write(socket.sidecar_path(), sidecar.to_string()).unwrap();
-    let record = devflow_core::state::SupervisorRecord::new(
-        socket.as_path().to_path_buf(),
-        launch_id,
-        u32::MAX,
-        0,
-        "no-such-boot".to_string(),
-    );
-    full_phase(&case.root, phase, true, |state| {
-        finished(state);
-        state.supervisor = Some(record);
-    });
-    let swept = devflow_core::supervisor::sweep_for_in(&case.home.cache_dir(), &case.root, phase);
-    assert!(
-        matches!(swept.as_slice(), [entry] if entry.sidecar.is_some() && !entry.socket_present),
-        "premise: the sweep sees the recorded launch's sidecar and no socket: {swept:?}"
-    );
-    let bystanders = add_bystanders(&case.root);
-    let other_socket = plant_swept_socket(&case.home, &case.root, BYSTANDER_PHASE);
-
-    let out = run_discard(&case.home, &case.root, phase, &[]);
-    let (_, text) = discard_text(&out);
-    assert!(out.status.success(), "{text}");
-    assert_eq!(
-        phase_items(&case.root, phase),
-        PhaseItems::NONE,
-        "the worktree, the state and the branch are gone: {text}"
-    );
-    assert!(
-        other_socket.exists(),
-        "another phase's socket is left in place: {text}"
-    );
-    bystanders.assert_untouched(&case.root, &text);
-}
-
-/// A STALE supervisor the state records is refused once, as the recorded supervisor,
-/// even when its socket has a name the sweep attributes to this project and phase: the
-/// refusal is the recorded one, and the socket is not listed a second time as a
-/// supervisor the state does not name.
-#[test]
-fn discard_refuses_a_recorded_stale_supervisor_once_when_the_sweep_would_find_it() {
-    let case = discard_case();
-    let phase = PhaseId::new(65);
-    let launch_id = devflow_core::supervisor::new_launch_id();
-    let socket = launch_socket(&case.home, &case.root, phase, &launch_id);
-    drop(std::os::unix::net::UnixListener::bind(socket.as_path()).expect("bind the socket"));
-    let record = devflow_core::state::SupervisorRecord::new(
-        socket.as_path().to_path_buf(),
-        launch_id,
-        u32::MAX,
-        0,
-        "no-such-boot".to_string(),
-    );
-    full_phase(&case.root, phase, true, |state| {
-        finished(state);
-        state.supervisor = Some(record);
-    });
-    let swept = devflow_core::supervisor::sweep_for_in(&case.home.cache_dir(), &case.root, phase);
-    assert!(
-        matches!(swept.as_slice(), [entry] if entry.socket_present),
-        "premise: the sweep sees the recorded supervisor's socket: {swept:?}"
-    );
-    let before = phase_items(&case.root, phase);
-
-    let out = run_discard(&case.home, &case.root, phase, &[]);
-    assert_discard_refused(
-        &out,
-        &case.root,
-        phase,
-        &before,
-        &[
-            "its supervisor is STALE",
-            "devflow stop --phase 65",
-            "nothing was removed",
-        ],
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        !stderr.contains("its state does not name")
-            && !stderr.contains(&socket.as_path().display().to_string()),
-        "the recorded supervisor is not listed again as a swept socket: {stderr}"
-    );
-    assert!(
-        socket.as_path().exists(),
-        "the recorded socket is left in place"
-    );
 }
 
 /// D-20: discard is the way out of a state that does not load. It removes that file

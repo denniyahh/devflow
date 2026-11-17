@@ -17,11 +17,9 @@ use std::path::{Path, PathBuf};
 /// Suites migrated to the hermetic builder whose spawn sites this scan pins.
 const HERMETIC_SUITES: &[&str] = &["auto_chain_flag_e2e.rs", "help_snapshot.rs"];
 
-/// The only files under `tests/` (paths relative to it, `/`-separated) whose
-/// code may name the binary's env var. `common/mod.rs` is the one legitimate
-/// site. `recover_clean_e2e.rs` is 50-04's migration and is tolerated so the
-/// scan holds whichever of 50-04 and 50-21 lands first.
-const BINARY_NAMERS: &[&str] = &["common/mod.rs", "recover_clean_e2e.rs"];
+/// The only file under `tests/` (paths relative to it, `/`-separated) whose
+/// code may name the binary's env var: `common/mod.rs`.
+const BINARY_NAMERS: &[&str] = &["common/mod.rs"];
 
 /// `crates/devflow-cli/tests`.
 fn tests_dir() -> PathBuf {
