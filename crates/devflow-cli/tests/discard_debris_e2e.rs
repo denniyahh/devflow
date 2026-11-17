@@ -147,7 +147,7 @@ fn discard_removes_the_orphan_gate_files_of_a_gate_only_phase() {
     let out = case.discard();
     assert!(out.status.success(), "discard refused:\n{}", text(&out));
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let listing = stdout.split("removed").next().unwrap_or_default();
+    let listing = stdout.split("\nremoved ").next().unwrap_or_default();
     assert!(
         listing.contains(&request.display().to_string()),
         "the listing names the gate request before any removal:\n{}",
