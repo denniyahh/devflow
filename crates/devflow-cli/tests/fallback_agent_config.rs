@@ -225,7 +225,7 @@ fn config_key_alone_is_persisted_in_the_run_state() {
     init_repo(&root, phase);
     fs::write(root.join("devflow.toml"), "fallback_agent = \"codex\"\n").unwrap();
     let fake = stub_dir(&[("claude", WAITING_CLAUDE), ("codex", AGENT_STUB)]);
-    let _reaper = common::LaunchedRunReaper::new(&root, phase, vec![]);
+    let _reaper = common::LaunchedRunReaper::for_home(&home, &root, phase);
     let state_path = devflow_core::workflow::state_path(&root, phase);
     assert!(!state_path.exists(), "no state may exist before start");
 
