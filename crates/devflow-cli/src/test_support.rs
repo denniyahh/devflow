@@ -17,7 +17,7 @@ use devflow_core::agents;
 use devflow_core::gates::{GateFile, GateId, GateResponse, Gates};
 use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
-use devflow_core::state::{State, SupervisorRecord};
+use devflow_core::state::State;
 use devflow_core::workflow;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -140,21 +140,13 @@ pub(crate) static ENV_MUTEX: Mutex<()> = Mutex::new(());
 /// half-mutated state. The data this mutex guards is not the `()` payload — it
 /// is the process environment, and every mutation of it in this crate's tests
 /// is restored on the unwinding path by an RAII guard rather than by a trailing
-/// statement:
-///
-/// - [`ReapMonitorOnDrop`] reaps the detached monitor wrapper in its `Drop`,
-///   with a `std::thread::panicking()` interlock so it cannot double-panic into
-///   an `abort()` during the very unwind it is cleaning up after.
-///
-/// `Drop` runs during unwinding, so by the time the poisoned guard is handed to
+/// statement. `Drop` runs during unwinding, so by the time the poisoned guard is handed to
 /// the next test, the state that poisoning would warn about has already been
 /// restored. That is the whole argument, and it is conditional:
 ///
 /// **Without those guards this accessor WOULD be unsound.** It is stated
 /// plainly because the failure is silent — a future author who replaces
-/// unwind-safe cleanup with a trailing restoration call, or drops a
-/// `ReapMonitorOnDrop` in favour of a trailing `reap_spawned_monitor` call, will
-/// see no compiler error and no failing test. They will instead hand the next
+/// unwind-safe cleanup with a trailing restoration call will see no compiler error and no failing test. They will instead hand the next
 /// test half-restored process-global state. If you are removing an unwind-safe
 /// guard, you are changing this function's premise.
 ///
@@ -348,7 +340,7 @@ pub(crate) fn agent_free_git_only_path_dir() -> tempfile::TempDir {
 /// exit path of that scope — including a path on which a later assertion
 /// panics (WR-05).
 ///
-/// Same reasoning as [`ReapMonitorOnDrop`], applied to a different resource:
+/// Same reasoning as [`env_lock`]'s RAII premise, applied to a different resource:
 /// a plain trailing `set_var("PATH", original)` only runs on the success path,
 /// since Rust abandons the rest of a function's statements the instant a panic
 /// begins unwinding, so it is the language's own `Drop` guarantee — not a call
@@ -614,243 +606,6 @@ pub(crate) fn stage_launched_count(root: &Path, phase: PhaseId) -> usize {
         .count()
 }
 
-/// How long a reaper waits for a supervisor's final shutdown line.
-const REAP_SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
-
-/// The single reap mechanism (D-07): end a launched run through its
-/// supervisor's socket, then return a VERIFIED answer about its agent group.
-///
-/// 1. `supervisor::request_shutdown` on the recorded socket, bounded by
-///    [`REAP_SHUTDOWN_WAIT`]. A supervisor that answers ends its agent group
-///    itself.
-/// 2. If the recorded agent group's leader is still the process the record
-///    names (`agent::is_same_process` against its start time), SIGKILL the
-///    whole group. This covers a socket that does not answer (a SIGKILLed
-///    supervisor, or a record whose socket never existed); the identity
-///    check keeps a recycled pid from ever being signalled.
-/// 3. Poll until the leader is gone (a zombie counts as gone) or
-///    `agent::TERMINATE_VERIFY_WAIT` passes.
-///
-/// Asserts nothing and panics on no path — the caller decides what a `false`
-/// means. This matters because one of its callers ([`ReapMonitorOnDrop::drop`])
-/// may run during a stack unwind, where a panic would call `abort()` and kill
-/// the whole test binary instead of merely failing the one test in flight.
-fn reap_supervised_run(record: &SupervisorRecord) -> bool {
-    let _ = devflow_core::supervisor::request_shutdown(&record.socket_path, REAP_SHUTDOWN_WAIT);
-    let leader = record.agent_pgid;
-    let alive = || {
-        devflow_core::agent::agent_running(leader)
-            && devflow_core::agent::is_same_process(leader, record.agent_start_time)
-    };
-    if alive() {
-        signal_group(leader, libc::SIGKILL);
-    }
-    let deadline = std::time::Instant::now() + devflow_core::agent::TERMINATE_VERIFY_WAIT;
-    while alive() && std::time::Instant::now() < deadline {
-        std::thread::sleep(devflow_core::agent::TERMINATE_VERIFY_POLL);
-    }
-    !alive()
-}
-
-/// Send `signal` to process group `pgid`. Refuses pgid 0 or 1, a value that
-/// does not fit `pid_t`, and this process's own group.
-fn signal_group(pgid: u32, signal: libc::c_int) {
-    let Ok(signed) = libc::pid_t::try_from(pgid) else {
-        return;
-    };
-    // SAFETY: getpgrp has no preconditions and cannot fail.
-    if signed > 1 && signed != unsafe { libc::getpgrp() } {
-        // SAFETY: `signed > 1` and not our own group: this names one process
-        // group whose leader the caller has just identity-checked.
-        unsafe { libc::kill(-signed, signal) };
-    }
-}
-
-/// Reap the supervised run a real `launch_stage_inner` call just launched,
-/// verifying its agent group's end rather than assuming it (WR-03, 999.46).
-///
-/// This plain-call form runs ONLY if every preceding statement in its caller
-/// returned normally — a panic anywhere between the launch and this call
-/// skips it entirely, since Rust abandons the remaining statements of a
-/// function the moment a panic begins unwinding. [`ReapMonitorOnDrop`] is
-/// therefore the default for any test with assertions between the launch and
-/// teardown; this function is for the narrow case where a guard cannot be
-/// bound. Its only caller after G-25-2 (25-17) is
-/// `tests::trailing_reap_call_is_skipped_when_a_later_assertion_panics`,
-/// which exists precisely to demonstrate this failure mode.
-///
-/// Any test that drives a real `launch_stage_inner` causes it to start a
-/// detached supervisor that is DESIGNED to outlive the call that started it;
-/// the TEST is the only thing that ever could end it, so the test owns
-/// reaping it.
-///
-/// The handle comes from `state.supervisor` on the same `&State` the caller
-/// handed to the launch (`spawn_agent_and_record` records the ping-confirmed
-/// record there). This function never scans `/proc`, never guesses, and
-/// signals only the group that record names, after its identity check.
-///
-/// Must be called BEFORE the caller's `TempDir` guard drops. Tolerates a
-/// state with no supervisor record by returning quietly: an early-failing
-/// launch never recorded one, and a teardown helper that panics on that path
-/// would mask the launch's own failure.
-pub(crate) fn reap_spawned_monitor(state: &State) {
-    let Some(record) = state.supervisor.as_ref() else {
-        return;
-    };
-    assert!(
-        reap_supervised_run(record),
-        "agent group {}, launched by this test's own launch_stage_inner call, must be \
-         verified gone after reaping through {} — not merely assumed gone",
-        record.agent_pgid,
-        record.socket_path.display()
-    );
-}
-
-/// RAII guard that reaps a launched run on EVERY exit path of the scope it
-/// is bound in — including a path on which a later assertion panics. This is
-/// the fix for G-25-2 / WINDOWS.md item 3: a plain trailing call to
-/// [`reap_spawned_monitor`] only runs on the success path, since Rust
-/// abandons the rest of a function's statements the instant a panic begins
-/// unwinding, so it is the language's own `Drop` guarantee — not a call
-/// ordering convention — that makes the reap unconditional.
-pub(crate) struct ReapMonitorOnDrop {
-    record: Option<SupervisorRecord>,
-}
-
-impl ReapMonitorOnDrop {
-    /// Capture `state.supervisor` BY VALUE, not `&'a State`, so the guard
-    /// stays independent of the `State` binding's own scope.
-    ///
-    /// Named `after_launch`, not `new`: bound before the launch call
-    /// returns, it captures `None` and silently does nothing — the
-    /// constructor name carries the ordering requirement to the call site
-    /// rather than leaving it to a doc comment alone.
-    pub(crate) fn after_launch(state: &State) -> Self {
-        Self {
-            record: state.supervisor.clone(),
-        }
-    }
-}
-
-impl Drop for ReapMonitorOnDrop {
-    fn drop(&mut self) {
-        let Some(record) = self.record.as_ref() else {
-            return;
-        };
-        if !reap_supervised_run(record) {
-            // The check below is the double-panic interlock — the ONLY
-            // thing standing between "an assertion failed" and "the whole
-            // test binary aborted". A `Drop` that panics while an unwind is
-            // already in flight calls `abort()`, which would turn one
-            // legible failing assertion into a crashed test binary that
-            // reports nothing about any of the other ~694 tests in the
-            // process. On that path we still attempted the reap above —
-            // only the complaint is downgraded to stderr, since the panic
-            // already in flight is the more informative failure.
-            if std::thread::panicking() {
-                // NOT `eprintln!`: that macro routes through `std::io::_eprint`,
-                // which panics ("failed printing to stderr") if the underlying
-                // write fails. On this branch a panic is already unwinding, so
-                // that second panic would `abort()` — the very outcome the
-                // `panicking()` check exists to avoid. Write directly and
-                // discard the result: if we cannot even report the leak, the
-                // in-flight panic is still the more informative failure.
-                use std::io::Write as _;
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "ReapMonitorOnDrop: agent group {} still alive after reap \
-                     during an unwind — not re-panicking because a panic is already in flight",
-                    record.agent_pgid
-                );
-            } else {
-                panic!(
-                    "agent group {}, launched by this test's own launch call, must be \
-                     verified gone after reaping through {} — not merely assumed gone",
-                    record.agent_pgid,
-                    record.socket_path.display()
-                );
-            }
-        }
-    }
-}
-
-/// Parse the `__monitor` argv a [`MonitorExec::HarnessEntry`] re-exec put in
-/// [`MONITOR_ARGV_ENV`] and run it as `main` dispatches `__monitor`, with or
-/// without the advance tail. Returns without doing anything when the variable
-/// is absent, so a run of ignored tests that reaches an entry is a no-op.
-///
-/// [`MonitorExec::HarnessEntry`]: devflow_core::monitor::MonitorExec::HarnessEntry
-/// [`MONITOR_ARGV_ENV`]: devflow_core::monitor::MONITOR_ARGV_ENV
-fn run_monitor_harness_entry(advance: bool) {
-    use clap::Parser as _;
-    let Some(encoded) = std::env::var_os(devflow_core::monitor::MONITOR_ARGV_ENV) else {
-        return;
-    };
-    let encoded = encoded
-        .into_string()
-        .expect("the monitor argv must be UTF-8 JSON");
-    let after_subcommand: Vec<String> =
-        serde_json::from_str(&encoded).expect("the monitor argv must be a JSON array of strings");
-    let argv = ["devflow", "__monitor"]
-        .into_iter()
-        .map(str::to_string)
-        .chain(after_subcommand);
-    let cli = crate::Cli::try_parse_from(argv).expect("the monitor argv must parse as __monitor");
-    let crate::Command::Monitor {
-        project,
-        phase,
-        stage,
-        workdir,
-        agent,
-        launch,
-        socket,
-        launch_id,
-        liveness_fd,
-        keep_env,
-        prompt_file,
-        idle_timeout_secs,
-        argv,
-    } = cli.command
-    else {
-        panic!("the monitor argv parsed as a command other than __monitor");
-    };
-    let invocation = crate::pipeline_launch::MonitorInvocation {
-        project_root: crate::project_root(project).expect("monitor project root"),
-        phase,
-        stage,
-        workdir,
-        agent,
-        launch,
-        socket,
-        launch_id,
-        liveness_fd,
-        keep_env,
-        prompt_file,
-        idle_timeout_secs,
-        argv,
-    };
-    crate::pipeline_launch::run_monitor(&invocation, advance)
-        .expect("the harness-entry monitor must supervise its agent");
-}
-
-/// The test build's full monitor entry (50-10): `run_monitor` exactly as the
-/// `__monitor` subcommand runs it, advance tail included. Selected by
-/// `pipeline_launch::launch_context` when `DEVFLOW_TEST_MONITOR_FULL=1`.
-#[test]
-#[ignore = "monitor re-exec entry; run only by spawn_monitor under cfg(test)"]
-fn monitor_entry_full() {
-    run_monitor_harness_entry(true);
-}
-
-/// The test build's default monitor entry (50-10): `run_monitor`'s
-/// supervision without its advance tail, so an in-crate launch supervises its
-/// fake agent and leaves the stage machine where the test put it.
-#[test]
-#[ignore = "monitor re-exec entry; run only by spawn_monitor under cfg(test)"]
-fn monitor_entry_supervise_only() {
-    run_monitor_harness_entry(false);
-}
-
 /// The child-process seam for GSD's home (52-22): a test that runs stages in
 /// spawned supervisor processes passes a stub home to its child through this
 /// variable, and every process the child starts inherits it. Read only by the
@@ -1026,10 +781,6 @@ pub(crate) fn every_gate_kind() -> Vec<Option<devflow_core::gates::GateKind>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use devflow_core::mode::Mode;
-    use devflow_core::state::AgentKind;
-    use std::panic::AssertUnwindSafe;
-    use std::process::Command;
 
     /// NC-1 (35-VALIDATION.md), relocated into a CHILD PROCESS by 46-06
     /// (review finding C-01), and the reason it is load-bearing rather than
@@ -1123,146 +874,6 @@ mod tests {
             std::env::var_os("PATH"),
             path_before,
             "the parent's PATH must be byte-identical across the child run"
-        );
-    }
-
-    /// Owns a real, deterministically long-lived child process (`sleep
-    /// 300`) so these tests have a subject whose liveness is a deterministic
-    /// question. WR-05 established that the stubbed agent wrapper's own
-    /// exit is a timing accident (the stub exits in under a millisecond and
-    /// its trailing `devflow advance` resolves to the test binary, which
-    /// rejects the argument shape and exits immediately) — "is it still
-    /// alive?" would not reliably discriminate anything against it. It must
-    /// be deterministic here, or neither test below proves what it claims
-    /// to.
-    ///
-    /// `Drop` kills then waits, ignoring both results and panicking on no
-    /// path: these tests police process leaks and must not leave a zombie
-    /// of their own behind.
-    struct ChildGuard(std::process::Child);
-
-    impl ChildGuard {
-        fn spawn() -> Self {
-            use std::os::unix::process::CommandExt as _;
-            // Its own process group, as a launched agent is (R-3), so the
-            // reapers' identity-confirmed group fallback has a real subject.
-            Self(
-                Command::new("sleep")
-                    .arg("300")
-                    .process_group(0)
-                    .spawn()
-                    .expect("sleep must be spawnable to run this test"),
-            )
-        }
-
-        fn pid(&self) -> u32 {
-            self.0.id()
-        }
-    }
-
-    impl Drop for ChildGuard {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-
-    /// A `State` whose only relevant field is `supervisor`: a record whose
-    /// socket does not exist, naming `pid` (its own group leader) with its
-    /// real start time, so the reapers' shutdown finds nothing to ask and
-    /// they reach the identity-confirmed group fallback. No I/O occurs
-    /// beyond reading `pid`'s start time and boot id.
-    fn state_holding(pid: u32) -> State {
-        let mut state = State::new(
-            PhaseId::new(0),
-            AgentKind::Claude,
-            Mode::Auto,
-            PathBuf::from("/nonexistent"),
-        );
-        state.supervisor = Some(SupervisorRecord::new(
-            PathBuf::from("/nonexistent/reap-fixture.sock"),
-            "reapfixture00000".to_string(),
-            pid,
-            devflow_core::agent::process_start_time(pid).expect("the subject's start time"),
-            devflow_core::supervisor::boot_id().unwrap_or_default(),
-        ));
-        state
-    }
-
-    /// Proves the guard reaps during a REAL unwind: bind it inside a closure
-    /// whose body then fails an assertion, and confirm the subject is dead
-    /// after `catch_unwind` returns `Err`.
-    ///
-    /// `cargo test` captures the resulting panic output and prints it only
-    /// for a FAILING test, so a passing run here is quiet — no panic hook is
-    /// installed (installing one would be process-global and would swallow
-    /// output from unrelated tests running in parallel).
-    #[test]
-    fn reap_guard_reaps_the_monitor_when_a_later_assertion_panics() {
-        let child = ChildGuard::spawn();
-        let pid = child.pid();
-        let state = state_holding(pid);
-
-        assert!(
-            devflow_core::agent::agent_running(pid),
-            "precondition: a test whose subject is already dead proves nothing"
-        );
-
-        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
-            assert_eq!(
-                std::hint::black_box(1_u32),
-                2,
-                "deliberate failing assertion"
-            );
-        }));
-
-        assert!(result.is_err(), "the closure must have panicked");
-        assert!(
-            !devflow_core::agent::agent_running(pid),
-            "the guard did not reap the monitor during the unwind"
-        );
-    }
-
-    /// CONTROL: identical setup, but the closure calls the plain trailing
-    /// helper AFTER a failing assertion instead of binding the guard. Proves
-    /// the pair discriminates rather than being vacuous — a trailing
-    /// statement cannot run during an unwind, so the subject here must
-    /// still be ALIVE after `catch_unwind` returns `Err`, unlike the test
-    /// above.
-    ///
-    /// The outer `ReapMonitorOnDrop` is this test's OWN unwind-safe cleanup
-    /// (bound before the closure so it drops after it, killing the survivor
-    /// the control just proved the trailing call could not reach); declaring
-    /// `ChildGuard` before it means drop order is closure-locals, then the
-    /// outer guard (kills), then `ChildGuard` (waits, clearing the zombie).
-    #[test]
-    fn trailing_reap_call_is_skipped_when_a_later_assertion_panics() {
-        let child = ChildGuard::spawn();
-        let pid = child.pid();
-        let state = state_holding(pid);
-
-        assert!(
-            devflow_core::agent::agent_running(pid),
-            "precondition: a test whose subject is already dead proves nothing"
-        );
-
-        let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
-
-        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            assert_eq!(
-                std::hint::black_box(1_u32),
-                2,
-                "deliberate failing assertion"
-            );
-            reap_spawned_monitor(&state);
-        }));
-
-        assert!(result.is_err(), "the closure must have panicked");
-        assert!(
-            devflow_core::agent::agent_running(pid),
-            "this proves the trailing call form does NOT run during an unwind — the reason the \
-             guard test above is not vacuous"
         );
     }
 }

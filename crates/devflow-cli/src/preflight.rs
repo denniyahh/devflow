@@ -1409,7 +1409,7 @@ pub(crate) fn run_preflight(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline_launch::launch_stage;
+    use crate::pipeline_launch::launch_after_preflight;
     use crate::test_support::*;
     use devflow_core::gates::Gates;
     use devflow_core::test_support::preanswer_gate;
@@ -1627,10 +1627,11 @@ mod tests {
         );
 
         let adapter = agents::driver_for(AgentKind::Codex);
-        let should_continue = run_preflight(root, &mut state, adapter.as_ref()).unwrap();
+        let outcome = run_preflight(root, &mut state, adapter.as_ref()).unwrap();
 
-        assert!(
-            !should_continue,
+        assert_eq!(
+            outcome,
+            PreflightOutcome::Stop,
             "an aborted preflight must tell its caller not to continue launch_stage"
         );
         assert!(
@@ -1673,10 +1674,11 @@ mod tests {
             .unwrap(),
         );
 
-        let should_continue = run_preflight(root, &mut state, &AlwaysFailAdapter).unwrap();
+        let outcome = run_preflight(root, &mut state, &AlwaysFailAdapter).unwrap();
 
-        assert!(
-            !should_continue,
+        assert_eq!(
+            outcome,
+            PreflightOutcome::Stop,
             "an aborted preflight must tell its caller not to continue launch_stage"
         );
         assert!(workflow::load_state(root, phase).is_err());
@@ -1691,12 +1693,11 @@ mod tests {
 
     /// CR-01 regression (Advance arm, 17-08 gap closure): a preflight
     /// failure resolved by `GateAction::Advance` must launch the agent
-    /// exactly once. `run_preflight` returns `Ok(false)` when the recursive
-    /// retry it just ran already spawned the agent — the call site (main.rs
-    /// call site inside `launch_stage`) must not run any more launch steps
-    /// in that case. This mirrors the call site's exact contract: only run
-    /// the explicit `launch_stage(&mut state, None, None)` continuation when
-    /// `run_preflight` says to.
+    /// exactly once. `run_preflight` launches nothing itself and returns
+    /// [`PreflightOutcome::Approved`]; `launch_stage` turns that outcome into
+    /// one launch through [`launch_after_preflight`], which this test calls the
+    /// same way, so the approved stage is resolved exactly once and nothing is
+    /// spawned outside the runner (D-02).
     #[test]
     fn run_preflight_advance_gate_launches_agent_exactly_once() {
         const NAME: &str =
@@ -1718,9 +1719,7 @@ mod tests {
         // through the Advance arm (CR-01's double-launch defect), not which
         // launch path is taken, and a Claude launch at Validate would take the
         // stream path, where `canary_gate` invokes the real
-        // `ClaudeCanaryLauncher`. The `launches == 1` and
-        // `supervisor.is_some()` assertions below are untouched, so a launch
-        // must still genuinely happen.
+        // `ClaudeCanaryLauncher`.
         workflow::save_state(&state).unwrap();
 
         preanswer_gate(
@@ -1731,43 +1730,33 @@ mod tests {
         );
 
         let adapter = FailOnceAdapter::new();
-        let preflight = run_preflight(root, &mut state, &adapter);
-        let continuation = match &preflight {
-            Ok(true) => launch_stage(&mut state, None, None),
-            _ => Ok(()),
-        };
-
-        // WR-05 / 999.44: `run_preflight`'s `Advance` arm calls
-        // `launch_stage_inner` directly (`:943`), which spawns a real
-        // detached monitor wrapper and records its pid on this same
-        // `&mut State` — reached indirectly, through recursion, rather than
-        // through this test's own explicit `launch_stage` call above. The
-        // guard must bind here, the first line after the final `&mut state`
-        // use, because every line below is a panic site, including
-        // unwrapping `preflight` itself: that call can spawn the monitor and
-        // then still fail a later `?`. The wrapper must die before `dir`
-        // unlinks the project root out from under it.
-        let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
-
-        let should_continue = preflight.unwrap();
-        continuation.unwrap();
-
-        assert!(
-            !should_continue,
-            "an Advance-resolved preflight failure must tell its caller not \
-             to continue launch_stage — the recursive retry already did"
-        );
-        let launches = stage_launched_count(root, phase);
+        let outcome = run_preflight(root, &mut state, &adapter).unwrap();
         assert_eq!(
-            launches, 1,
-            "a preflight failure resolved by Advance must launch the agent \
-             exactly once, not {launches}"
+            outcome,
+            PreflightOutcome::Approved,
+            "an Advance-resolved preflight failure must report the approval, and \
+             launch nothing itself"
         );
-        assert!(
-            state.supervisor.is_some(),
-            "this test is expected to drive a real monitor::spawn_monitor \
-             through run_preflight's Advance arm — None here means WR-05's \
-             premise was wrong and the guard above reaped nothing"
+        let launches: Vec<_> = launch_after_preflight(&mut state, outcome, None, None)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(
+            launches.len(),
+            1,
+            "a preflight failure resolved by Advance must launch the agent \
+             exactly once, not {}",
+            launches.len()
+        );
+        assert_eq!(
+            launches[0].state.stage,
+            Stage::Validate,
+            "the approved launch is the gated stage's"
+        );
+        assert_eq!(
+            stage_launched_count(root, phase),
+            0,
+            "the preflight spawned a stage of its own"
         );
     }
 
@@ -1798,7 +1787,7 @@ mod tests {
     /// the SAME deterministic `preflight_interactivity_check` failure would
     /// fire again on the retry, write a SECOND gate nobody answers (only
     /// one response is ever seeded here), and `run_preflight` would return
-    /// `Err` (a bounded gate-timeout error) instead of `Ok(false)` — that
+    /// `Err` (a bounded gate-timeout error) instead of `Ok(Approved)` — that
     /// bounded `Err` is the RED signal this test would observe pre-fix,
     /// confirmed manually before restoring the fix. `DEVFLOW_GATE_TIMEOUT_SECS`
     /// is bounded under `ENV_MUTEX` so a regression here fails fast instead
@@ -1841,20 +1830,11 @@ mod tests {
         );
 
         let result = run_preflight(root, &mut state, &AlwaysFailAdapter);
-
-        // WR-05 / 999.44 (residual finding, 25-18 verification step 6): the
-        // "approved" response here drives run_preflight's GateAction::Advance
-        // arm, which calls launch_stage_inner UNCONDITIONALLY — skipping the
-        // just-adjudicated check is the entire point of this test, so there
-        // is no recursive re-check to fail first. With a working `codex` +
-        // `sh` stub on PATH (`agent_free_dir_with_agent_stub`), this spawns a
-        // REAL detached monitor wrapper — confirmed empirically while
-        // re-deriving this plan's verification-step-6 enumeration, a leak
-        // this plan's originally-declared scope (the two `_exactly_once`
-        // tests) did not name. The guard must bind here, the first line
-        // after the final `&mut state` use, ahead of every panicking
-        // checkpoint below, for the same reason as the two conversions above.
-        let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
+        // The approval resolves its launch with no re-check, as `launch_stage` does.
+        let launch = match &result {
+            Ok(outcome) => launch_after_preflight(&mut state, *outcome, None, None),
+            Err(_) => Ok(None),
+        };
 
         // SAFETY: still serialized under ENV_MUTEX from above.
         unsafe {
@@ -1865,9 +1845,9 @@ mod tests {
         }
 
         assert!(
-            matches!(result, Ok(false)),
+            matches!(result, Ok(PreflightOutcome::Approved)),
             "Advance on a preflight gate must skip the just-adjudicated \
-             check and return Ok(false), not {result:?}"
+             check and return Approved, not {result:?}"
         );
         assert!(
             !Gates::gate_path(root, phase, Stage::Plan).exists(),
@@ -1877,12 +1857,11 @@ mod tests {
             state.preflight_retries, 0,
             "a human Advance must reset the retry counter"
         );
-        assert!(
-            state.supervisor.is_some(),
-            "this test's Advance arm is expected to drive a real \
-             monitor::spawn_monitor via launch_stage_inner — None here means \
-             this residual finding's premise was wrong and the guard above \
-             reaped nothing"
+        let launch = launch.expect("the approved launch resolves");
+        assert_eq!(
+            launch.map(|launch| launch.state.stage),
+            Some(Stage::Plan),
+            "the approval must resolve the gated Plan launch, with no second gate"
         );
     }
 
@@ -1890,7 +1869,7 @@ mod tests {
     /// refused, so a failed check is checked again only by a later
     /// `run_preflight` call, and the ceiling is checked before any gate opens.
     /// With `preflight_retries` at `MAX_PREFLIGHT_RETRIES`, no answer and an
-    /// always-failing adapter, the call returns `Ok(false)`, writes no gate,
+    /// always-failing adapter, the call returns `Ok(Stop)`, writes no gate,
     /// and the event log holds `preflight_retry_ceiling_reached` followed by
     /// `workflow_aborted`, each asserted on its own.
     #[test]
@@ -1913,7 +1892,7 @@ mod tests {
         let result = run_preflight(root, &mut state, &AlwaysFailAdapter);
 
         assert!(
-            matches!(result, Ok(false)),
+            matches!(result, Ok(PreflightOutcome::Stop)),
             "the ceiling must abort cleanly, not error out, got {result:?}"
         );
         assert!(
@@ -2076,7 +2055,7 @@ mod tests {
         let adapter = agents::driver_for(AgentKind::Claude);
         let result = run_preflight(root, &mut state, adapter.as_ref());
         assert!(
-            matches!(result, Ok(true)),
+            matches!(result, Ok(PreflightOutcome::Proceed)),
             "this fixture must PASS preflight to reach the recording path, got {result:?}"
         );
 
@@ -2184,7 +2163,6 @@ mod tests {
             &mut approve_state,
             agents::driver_for(AgentKind::Claude).as_ref(),
         );
-        let _reap_guard = ReapMonitorOnDrop::after_launch(&approve_state);
 
         // SAFETY: still serialized under ENV_MUTEX from above.
         unsafe {
@@ -2195,8 +2173,8 @@ mod tests {
         }
 
         assert!(
-            matches!(approve_result, Ok(false)),
-            "an approved refusal gate returns Ok(false) after relaunching, got {approve_result:?}"
+            matches!(approve_result, Ok(PreflightOutcome::Approved)),
+            "an approved refusal gate returns Approved, got {approve_result:?}"
         );
         let expected = CheckpointApproval::Recorded(vec![ApprovedCheckpoint {
             plan_file: format!("{padded}-01-PLAN.md", padded = approve_phase.padded()),
@@ -2310,9 +2288,9 @@ mod tests {
         }
         let gates = writer.join().unwrap();
 
-        // The abort of the reopened gate ends the run: `Ok(false)`.
+        // The abort of the reopened gate ends the run: `Stop`.
         assert!(
-            matches!(loopback_result, Ok(false)),
+            matches!(loopback_result, Ok(PreflightOutcome::Stop)),
             "the refused reject, then the abort: {loopback_result:?}"
         );
         assert_eq!(gates.len(), 2, "the refused reject reopened the gate");
@@ -2349,8 +2327,11 @@ mod tests {
             CheckpointApproval::Pending,
             "a refused reject widens nothing (T-48-15-03)"
         );
+        let outcome = loopback_result.expect("the loop-back outcome");
         assert!(
-            loopback_state.supervisor.is_none(),
+            launch_after_preflight(&mut loopback_state, outcome, None, None)
+                .expect("a stopped preflight resolves")
+                .is_none(),
             "a refused reject launches nothing: {loopback_state:?}"
         );
     }
@@ -2444,9 +2425,8 @@ mod tests {
 
         let adapter = FailOnceAdapter::new();
         let approved = run_preflight(root, &mut state, &adapter);
-        let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
         assert!(
-            matches!(approved, Ok(false)),
+            matches!(approved, Ok(PreflightOutcome::Approved)),
             "the refusal gate must have fired and been approved, got {approved:?}"
         );
         let baseline = verify::phase_checkpoint_declarations(&worktree, phase);
@@ -2478,7 +2458,7 @@ mod tests {
         // A later Code evaluation passes (the driver check fails only once).
         let passed = run_preflight(root, &mut state, &adapter);
         assert!(
-            matches!(passed, Ok(true)),
+            matches!(passed, Ok(PreflightOutcome::Proceed)),
             "the second evaluation must pass, got {passed:?}"
         );
         let current = verify::phase_checkpoint_declarations(&worktree, phase);
@@ -2532,10 +2512,9 @@ mod tests {
 
         let adapter = FailOnceAdapter::new();
         let result = run_preflight(root, &mut state, &adapter);
-        let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
 
         assert!(
-            matches!(result, Ok(false)),
+            matches!(result, Ok(PreflightOutcome::Approved)),
             "the refusal gate must have fired and been approved, got {result:?}"
         );
         assert_eq!(
@@ -2591,7 +2570,7 @@ mod tests {
         let adapter = agents::driver_for(AgentKind::Claude);
         let result = run_preflight(root, &mut state, adapter.as_ref());
         assert!(
-            matches!(result, Ok(true)),
+            matches!(result, Ok(PreflightOutcome::Proceed)),
             "this fixture must PASS preflight, got {result:?}"
         );
         assert_eq!(
@@ -2656,7 +2635,6 @@ mod tests {
             &mut refusal_state,
             agents::driver_for(AgentKind::Claude).as_ref(),
         );
-        let _refusal_reap = ReapMonitorOnDrop::after_launch(&refusal_state);
         // SAFETY: still serialized under the same ENV_MUTEX guard.
         unsafe {
             match &saved_timeout {
@@ -2666,8 +2644,8 @@ mod tests {
         }
 
         assert!(
-            matches!(refusal_result, Ok(false)),
-            "the refusal gate must be approved and relaunch, got {refusal_result:?}"
+            matches!(refusal_result, Ok(PreflightOutcome::Approved)),
+            "the refusal gate must be approved, got {refusal_result:?}"
         );
         assert_eq!(
             refusal_state.checkpoint_approval,
@@ -2699,8 +2677,8 @@ mod tests {
         let result = run_preflight(root, &mut state, adapter.as_ref());
 
         assert!(
-            matches!(result, Ok(true)),
-            "a passing preflight must return Ok(true), got {result:?}"
+            matches!(result, Ok(PreflightOutcome::Proceed)),
+            "a passing preflight must return Proceed, got {result:?}"
         );
         assert_eq!(
             state.preflight_retries, 0,

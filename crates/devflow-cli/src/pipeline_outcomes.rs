@@ -6492,8 +6492,7 @@ mod tests {
     }
 
     /// D45-4: an agent PASS is recorded with the evidence root's HEAD, in the
-    /// state on disk, and survives a stop, a transition and a supervisor
-    /// takeover's publish write. An agent FAIL, an ambiguous verdict and a HEAD
+    /// state on disk, and survives a stop and a transition. An agent FAIL, an ambiguous verdict and a HEAD
     /// that cannot be read record `None`; the last also opens a never-silent
     /// gate naming the HEAD read. Control: two PASS rows on two commits record
     /// two different shas.
@@ -6555,36 +6554,6 @@ mod tests {
             "premise: the transition was written"
         );
         assert_eq!(raw_head(root, phase), first, "a transition keeps the PASS");
-
-        // A supervisor takeover: a second launch's record published over the
-        // first, through the publish's own save.
-        let mut taken = workflow::load_state(root, phase).unwrap();
-        let next = devflow_core::state::SupervisorRecord::new(
-            root.join("next.sock"),
-            "nextlaunch0000000000".into(),
-            4_294_967_001,
-            1,
-            String::new(),
-        );
-        taken.supervisor = Some(next.clone());
-        workflow::update_state(root, phase, |s| {
-            s.supervisor = Some(devflow_core::state::SupervisorRecord::new(
-                root.join("prior.sock"),
-                "nextlaunch0000000000".into(),
-                4_294_967_000,
-                1,
-                String::new(),
-            ));
-            Ok::<_, workflow::WorkflowError>(())
-        })
-        .unwrap();
-        crate::pipeline_launch::save_publish_fields(&taken).expect("the publish save");
-        assert_eq!(
-            workflow::load_state(root, phase).unwrap().supervisor,
-            Some(next),
-            "premise: the takeover's record was published"
-        );
-        assert_eq!(raw_head(root, phase), first, "a takeover keeps the PASS");
 
         // An agent FAIL on the same HEAD records none (gaps_found: auto loops).
         let mut state = workflow::load_state(root, phase).unwrap();

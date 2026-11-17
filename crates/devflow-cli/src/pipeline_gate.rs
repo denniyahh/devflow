@@ -2210,12 +2210,14 @@ mod tests {
         let moved_phase = PhaseId::new(5174);
         let mut state = code_state(moved_root, moved_phase);
         workflow::save_state(&state).unwrap();
-        let result = transition(moved_root, &mut state, Stage::Validate);
+        let launch = transition(moved_root, &mut state, Stage::Validate).unwrap();
         let moved = workflow::load_state(moved_root, moved_phase).unwrap();
-        let _reap_guard = ReapMonitorOnDrop::after_launch(&moved);
-        result.unwrap();
         assert_eq!(moved.stage, Stage::Validate);
-        assert!(moved.supervisor.is_some(), "Validate was launched");
+        assert_eq!(
+            launch.map(|launch| launch.state.stage),
+            Some(Stage::Validate),
+            "Validate was launched"
+        );
         assert_eq!(
             moved.code_fix, None,
             "the transition out of Code clears the fix pass"
@@ -2318,7 +2320,6 @@ mod tests {
             workflow::save_state(&state).unwrap();
             let result = transition(dir.path(), &mut state, to);
             let moved = workflow::load_state(dir.path(), phase).unwrap();
-            let _reap_guard = ReapMonitorOnDrop::after_launch(&moved);
             result.unwrap();
             assert_eq!(moved.stage, to);
             assert_eq!(
@@ -2341,7 +2342,6 @@ mod tests {
         workflow::save_state(&state).unwrap();
         let result = transition(dir.path(), &mut state, Stage::Plan);
         let moved = workflow::load_state(dir.path(), phase).unwrap();
-        let _reap_gap = ReapMonitorOnDrop::after_launch(&moved);
         result.unwrap();
         assert_eq!(moved.stage, Stage::Plan);
         assert_eq!(
@@ -2425,7 +2425,6 @@ mod tests {
         workflow::save_state(&state).unwrap();
         let result = crate::pipeline_launch::resume(dir.path(), phase, None);
         let resumed = workflow::load_state(dir.path(), phase).unwrap();
-        let _reap_resumed = ReapMonitorOnDrop::after_launch(&resumed);
         result.unwrap();
         assert_eq!(resumed.stage, Stage::Plan);
         assert_eq!(
