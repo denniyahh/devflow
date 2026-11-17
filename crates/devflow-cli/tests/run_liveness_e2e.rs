@@ -13,7 +13,12 @@ use devflow_core::liveness;
 use devflow_core::phase_id::PhaseId;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Output;
+use std::process::{Output, Stdio};
+use std::time::{Duration, Instant};
+
+/// How long a waiting discard is watched before the test lets its unit go: long
+/// enough for several of its 200 ms unit reads.
+const WAIT_OBSERVED: Duration = Duration::from_millis(1500);
 
 fn git(root: &Path, args: &[&str]) {
     let output = devflow_core::test_support::git_command(root)
@@ -241,4 +246,294 @@ fn start_refuses_while_the_runner_lock_is_held() {
         text(&out)
     );
     drop(hold);
+}
+/// The phase's unit name as the binary derives it (`service::unit_name`).
+fn unit_name(root: &Path, phase: PhaseId) -> String {
+    format!(
+        "devflow-{:016x}-{}.service",
+        devflow_core::registry::path_digest(root),
+        phase.padded()
+    )
+}
+
+impl Case {
+    /// The phase's unit name.
+    fn unit(&self) -> String {
+        unit_name(&self.root, self.phase)
+    }
+
+    /// Make the fake `systemctl` report the phase's unit `deactivating`.
+    fn mark_unit_deactivating(&self) -> PathBuf {
+        let marker = self
+            .home
+            .service_bin()
+            .join(format!("{}.deactivating", self.unit()));
+        fs::write(&marker, "").unwrap();
+        marker
+    }
+
+    /// Make the fake `systemctl`'s Version probe fail, as with no reachable manager.
+    fn mark_manager_unanswering(&self) {
+        fs::write(self.home.service_bin().join("version.fail"), "").unwrap();
+    }
+
+    /// `devflow discard --phase N` with `adjust` applied to the command first.
+    fn discard_with(&self, adjust: impl FnOnce(&mut std::process::Command)) -> Output {
+        let stubs = tempfile::tempdir().unwrap();
+        let mut command = self.devflow(
+            &["discard", "--phase", &self.phase.to_string()],
+            stubs.path(),
+        );
+        adjust(&mut command);
+        command.output().expect("run devflow discard")
+    }
+}
+
+/// A spawned devflow child, killed and reaped by its recorded pid on drop.
+struct ChildGuard(Option<std::process::Child>);
+
+impl ChildGuard {
+    fn child(&mut self) -> &mut std::process::Child {
+        self.0.as_mut().expect("the child is still owned")
+    }
+
+    /// Wait for the child to exit within `within`, returning its output.
+    fn output_within(mut self, within: Duration) -> Output {
+        let deadline = Instant::now() + within;
+        while self.child().try_wait().expect("poll the child").is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "the child did not exit within {within:?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        self.0
+            .take()
+            .unwrap()
+            .wait_with_output()
+            .expect("collect the child's output")
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// D-07a: with the runner lock free and the unit `deactivating`, discard waits under
+/// its holder and removes nothing until the unit reads inactive; then it completes.
+#[test]
+fn discard_waits_for_a_deactivating_unit_before_removing_anything() {
+    let case = Case::finished(PhaseId::new(63));
+    let marker = case.mark_unit_deactivating();
+    let stubs = tempfile::tempdir().unwrap();
+    let mut guard = ChildGuard(Some(
+        case.devflow(
+            &["discard", "--phase", &case.phase.to_string()],
+            stubs.path(),
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn devflow discard"),
+    ));
+
+    std::thread::sleep(WAIT_OBSERVED);
+    let still_waiting = guard.child().try_wait().expect("poll discard").is_none();
+    assert!(
+        case.worktree_and_state_remain(),
+        "removed before the unit read inactive"
+    );
+    assert!(
+        still_waiting,
+        "discard exited while the unit read deactivating"
+    );
+
+    fs::remove_file(&marker).unwrap();
+    let out = guard.output_within(Duration::from_secs(30));
+    assert!(
+        out.status.success(),
+        "discard completes once the unit reads inactive:\n{}",
+        text(&out)
+    );
+    assert!(
+        !case.worktree().exists() && !case.state_file().exists(),
+        "discard removed the worktree and the state after the wait:\n{}",
+        text(&out)
+    );
+}
+
+/// D-07a: a unit that never reads inactive makes discard refuse after its bound,
+/// naming the unit and its state, with nothing removed.
+#[test]
+fn discard_refuses_when_the_unit_never_reads_inactive() {
+    let case = Case::finished(PhaseId::new(64));
+    case.mark_unit_deactivating();
+
+    let out = case.discard();
+    assert!(
+        !out.status.success(),
+        "no refusal after the bound:\n{}",
+        text(&out)
+    );
+    assert!(
+        case.worktree_and_state_remain(),
+        "discard removed something:\n{}",
+        text(&out)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&case.unit()) && stderr.contains("deactivating"),
+        "the refusal names the unit and its state:\n{}",
+        text(&out)
+    );
+}
+
+/// D-07, agy-6: a failed unit read once the manager answers is an error, never
+/// inactive: discard refuses, names the user manager and prints systemctl's stderr.
+/// Control: without the failure discard proceeds.
+#[test]
+fn a_systemctl_error_reads_as_an_error_never_inactive() {
+    let case = Case::finished(PhaseId::new(65));
+    let marker = case
+        .home
+        .service_bin()
+        .join(format!("{}.fail", case.unit()));
+    fs::write(&marker, "").unwrap();
+
+    let out = case.discard();
+    assert!(
+        !out.status.success() && case.worktree_and_state_remain(),
+        "systemctl error read as inactive:\n{}",
+        text(&out)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("systemd user manager"),
+        "the refusal names the user manager:\n{}",
+        text(&out)
+    );
+    assert!(
+        stderr.contains("Transport endpoint is not connected"),
+        "systemctl stderr missing from the refusal:\n{}",
+        text(&out)
+    );
+
+    fs::remove_file(&marker).unwrap();
+    let out = case.discard();
+    assert!(
+        out.status.success(),
+        "control: discard proceeds:\n{}",
+        text(&out)
+    );
+}
+
+/// D-07, review r3 codex-1/pi-5: an unanswering manager under a runtime dir that is not
+/// this user's `/run/user/<uid>` is unreachable, not absent, so discard refuses beside
+/// a deactivating unit rather than checking the lock alone.
+#[test]
+fn discard_refuses_a_deactivating_unit_when_the_runtime_dir_is_not_the_users_own() {
+    let case = Case::finished(PhaseId::new(66));
+    case.mark_unit_deactivating();
+    case.mark_manager_unanswering();
+    let runtime = tempfile::tempdir().unwrap();
+
+    let out = case.discard_with(|command| {
+        command.env("XDG_RUNTIME_DIR", runtime.path());
+    });
+    assert!(
+        case.worktree_and_state_remain(),
+        "discard acted on a runtime dir that is not the user's own:\n{}",
+        text(&out)
+    );
+    assert!(!out.status.success(), "discard exited 0:\n{}", text(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("XDG_RUNTIME_DIR") && stderr.contains("/run/user/"),
+        "XDG_RUNTIME_DIR not named in the refusal:\n{}",
+        text(&out)
+    );
+}
+
+/// D-07: the runner lock is read before the manager, so with no reachable manager a
+/// held lock still refuses, naming `devflow stop`.
+#[test]
+fn discard_without_a_user_manager_still_refuses_a_held_runner_lock() {
+    let case = Case::finished(PhaseId::new(67));
+    case.mark_manager_unanswering();
+    let runtime = tempfile::tempdir().unwrap();
+    let _hold = liveness::claim_runner_lock(&case.root, case.phase).expect("hold the runner lock");
+
+    let out = case.discard_with(|command| {
+        command.env("XDG_RUNTIME_DIR", runtime.path());
+    });
+    assert!(
+        case.worktree_and_state_remain() && !out.status.success(),
+        "discard acted under a held runner lock:\n{}",
+        text(&out)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains(&format!("devflow stop --phase {}", case.phase)),
+        "the refusal names `devflow stop --phase`:\n{}",
+        text(&out)
+    );
+}
+
+/// D-07, review codex-2/pi-8: a manager whose socket exists but which does not answer
+/// is not "no manager": discard refuses beside a deactivating unit and prints
+/// systemctl's stderr.
+#[test]
+fn discard_refuses_a_deactivating_unit_behind_a_manager_that_does_not_answer() {
+    let case = Case::finished(PhaseId::new(68));
+    case.mark_unit_deactivating();
+    case.mark_manager_unanswering();
+    let runtime = tempfile::tempdir().unwrap();
+    fs::create_dir(runtime.path().join("systemd")).unwrap();
+    fs::write(runtime.path().join("systemd").join("private"), "").unwrap();
+
+    let out = case.discard_with(|command| {
+        command.env("XDG_RUNTIME_DIR", runtime.path());
+    });
+    assert!(
+        case.worktree_and_state_remain() && !out.status.success(),
+        "discard acted while the user manager did not answer:\n{}",
+        text(&out)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("systemd user manager") && stderr.contains("No medium found"),
+        "systemctl stderr missing from the refusal:\n{}",
+        text(&out)
+    );
+}
+
+/// D-07, review codex-2: with neither `XDG_RUNTIME_DIR` nor `DBUS_SESSION_BUS_ADDRESS`
+/// set the user bus cannot be located: discard refuses naming both, nothing removed.
+#[test]
+fn discard_refuses_when_the_user_bus_cannot_be_located() {
+    let case = Case::finished(PhaseId::new(69));
+    case.mark_unit_deactivating();
+    case.mark_manager_unanswering();
+
+    let out = case.discard_with(|command| {
+        command
+            .env_remove("XDG_RUNTIME_DIR")
+            .env_remove("DBUS_SESSION_BUS_ADDRESS");
+    });
+    assert!(
+        case.worktree_and_state_remain() && !out.status.success(),
+        "discard acted with no locatable user bus:\n{}",
+        text(&out)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("XDG_RUNTIME_DIR") && stderr.contains("DBUS_SESSION_BUS_ADDRESS"),
+        "bus variables not named:\n{}",
+        text(&out)
+    );
 }

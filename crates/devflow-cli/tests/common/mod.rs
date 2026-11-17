@@ -40,11 +40,15 @@ pub const FAKE_SYSTEMD_VERSION: &str = "256-fake";
 /// tells [`HermeticPath::hermetic_path`] a directory holds the fakes.
 pub const FAKE_TOOL_PREFIX: &str = "fake ";
 
-/// The fake `systemctl`. It handles `--user show -p Version --value`,
-/// `--user show -p ActiveState --value U` (`U.fail` in its own dir: exit 1
+/// The fake `systemctl`. It handles `--user show -p Version --value`
+/// (`version.fail` in its own dir: exit 1 with the error `systemctl` prints when it
+/// cannot reach a user manager), `--user show -p ActiveState --value U` (`U.fail` in its own dir: exit 1
 /// with a bus error; `U.deactivating`: deactivating; otherwise inactive) and
 /// `--user reset-failed U`.
 const FAKE_SYSTEMCTL_CALLS: &str = r#"if [ "$#" -eq 5 ] && [ "$1 $2 $3 $4 $5" = "--user show -p Version --value" ]; then
+  if [ -e "$dir/version.fail" ]; then
+    echo "Failed to connect to bus: No medium found" >&2; exit 1
+  fi
   echo "@VERSION@"; exit 0
 fi
 if [ "$#" -eq 6 ] && [ "$1 $2 $3 $4 $5" = "--user show -p ActiveState --value" ]; then
