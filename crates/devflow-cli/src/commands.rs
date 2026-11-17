@@ -2893,8 +2893,8 @@ pub(crate) fn orphaned_agent_line(phase: PhaseId, agent: &LiveAgent) -> String {
 /// How to judge one reading of the state write lock, which `status` and `doctor` take
 /// once and do not time. The bounds are the holds D-08 allows (R2-12).
 const WRITE_LOCK_HOLD_NOTE: &str = "a state write usually takes milliseconds, but a stalled gate \
-     lock or a socket dying mid-ping can stretch it to about 10 s in a gate answer, 13 s while \
-     `recover` decides a phase and 16 s in a reservation; a hold past 20 s is the fault";
+     lock or a socket dying mid-ping can stretch it to about 10 s in a gate answer and 16 s in a \
+     reservation; a hold past 20 s is the fault";
 
 /// `status`'s line for a held state write lock (R-03); `None` when it is free.
 pub(crate) fn write_lock_line(status: &workflow::WriteLockStatus) -> Option<String> {
@@ -3786,7 +3786,8 @@ fn waiter_is_live(project_root: &Path, phase: PhaseId, stage: Stage, observed: &
 
 fn no_waiter_repair(phase: PhaseId) -> String {
     format!(
-        "run `devflow resume --phase {phase}` or `devflow recover --clean --phase {phase}` to establish recovery"
+        "run `devflow resume --phase {phase}` to continue the run, or `devflow discard --phase \
+         {phase}` to remove it (its state, gate files, worktree and branch)"
     )
 }
 
@@ -4996,6 +4997,9 @@ fn live_run_refusal(
 /// `stop` never signals that pid, so the operator confirms its identity
 /// before signalling it, and a recycled pid has its own repair per verb.
 fn agent_refusal_guidance(phase: PhaseId, verb: LaunchVerb, pid: u32) -> String {
+    // Relative to the project root, as the operator types it there.
+    let pid_file = agent_result::agent_pid_path(Path::new(""), phase);
+    let pid_file = pid_file.display();
     let stopped_note = match verb {
         LaunchVerb::Start => "",
         LaunchVerb::Resume => {
@@ -5007,16 +5011,17 @@ fn agent_refusal_guidance(phase: PhaseId, verb: LaunchVerb, pid: u32) -> String 
     let recycled = match verb {
         LaunchVerb::Start => format!(
             "If a named pid is live but is not this phase's process (a recycled pid), `start` \
-             refuses again: run `devflow recover --clean --phase {phase}` first, then \
+             refuses again, and so does `devflow discard`, which reads the same pid file: once \
+             the pid is confirmed not this phase's, remove {pid_file}, then run `devflow discard \
+             --phase {phase}` (it removes the phase's state, worktree and branch) and \
              `devflow start`."
         ),
         LaunchVerb::Resume => format!(
             "If a named pid is live but is not this phase's process (a recycled pid), `resume` \
-             refuses again, and no DevFlow verb clears a recorded pid while keeping the phase's \
-             work: `devflow recover --clean --phase {phase}` removes the phase state, after \
-             which `resume` has nothing to resume, and `devflow start` refuses while the \
-             phase's worktree or branch exists; `devflow start --force` recreates them from \
-             the base and discards the phase's work."
+             refuses again, and so does `devflow discard`, which reads the same pid file; no \
+             DevFlow verb clears a recorded pid. Once the pid is confirmed not this phase's, \
+             remove {pid_file}; `devflow discard --phase {phase}` then removes the phase's \
+             state, worktree and branch, after which `devflow start` begins again."
         ),
     };
     format!(
@@ -5029,8 +5034,8 @@ fn agent_refusal_guidance(phase: PhaseId, verb: LaunchVerb, pid: u32) -> String 
          and `--phase {phase}` in its args, as its parent (`ps -o ppid= -p <pid>`); an agent \
          whose supervisor has exited cannot be tied to this phase that way, so do not signal it \
          on the pid alone. {recycled} Do neither while this phase's processes are live: \
-         `recover --clean` clears state even while an agent runs, and a later `start` would \
-         launch a second agent beside it."
+         without the pid file `start` and `discard` cannot see a running agent, and a later \
+         `start` would launch a second agent beside it."
     )
 }
 
@@ -5738,7 +5743,7 @@ fn check_write_lock(facts: &PhaseFacts) -> Option<PhaseFinding> {
         let workflow::WriteLockStatus::Held { pid } = facts.write_lock else {
             return None;
         };
-        let give_up = "`devflow stop` and `devflow recover --clean` give up after 10 s naming it";
+        let give_up = "`devflow discard` gives up after 10 s naming it";
         match pid {
             Some(pid) => (
                 format!(
@@ -15816,7 +15821,6 @@ mod tests {
         for expected in [
             format!("pid {pid}"),
             "about 10 s in a gate answer".to_string(),
-            "13 s while".to_string(),
             "16 s in a reservation".to_string(),
             "past 20 s".to_string(),
         ] {
