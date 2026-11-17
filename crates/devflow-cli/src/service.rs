@@ -674,6 +674,38 @@ pub(crate) fn launch_runner_unit(project_root: &Path, phase: PhaseId) -> Result<
     }
 }
 
+/// D-05: stop `unit` with `systemctl --user stop`, which returns once the unit is down:
+/// the runner's own stop, or the manager's SIGKILL at [`TIMEOUT_STOP_SEC`]. Bounded by
+/// [`UNIT_STOP_WAIT`] plus [`SYSTEMCTL_CALL_BOUND`].
+///
+/// # Errors
+/// systemctl failed, exited non-zero or did not return within its bound.
+#[cfg(not(test))]
+pub(crate) fn stop_unit(unit: &str) -> Result<(), String> {
+    let mut command = tool("systemctl");
+    command.args(["--user", "stop", unit]);
+    match run_bounded(command, UNIT_STOP_WAIT + SYSTEMCTL_CALL_BOUND) {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => Err(format!(
+            "`systemctl --user stop {unit}` failed ({}); systemctl: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+        Err(error) => Err(format!(
+            "`systemctl --user stop {unit}` did not return: {error}"
+        )),
+    }
+}
+
+/// The cfg(test) build: end the runner child the cfg(test) [`launch_runner_unit`]
+/// recorded for `unit`, SIGTERM, a wait of [`TIMEOUT_STOP_SEC`], then SIGKILL, as the
+/// manager does. Never reaches [`tool`].
+#[cfg(test)]
+pub(crate) fn stop_unit(unit: &str) -> Result<(), String> {
+    double::end_runners(Some(unit), TIMEOUT_STOP_SEC);
+    Ok(())
+}
+
 /// D-04c: whether lingering is on for this user
 /// (`loginctl show-user <uid> -p Linger --value`). Without it the user manager, and
 /// every run under it, ends at logout.

@@ -13,7 +13,7 @@ Commands:
   status   Show current workflow state
   recover  Recover or inspect stale/abandoned workflow state
   doctor   Audit the environment and report what's installed, missing, or broken
-  stop     End a running phase cleanly: answers its open gate with a rejection when a live waiter holds it; otherwise addresses the run's supervisor socket — `shutdown` when ALIVE, the guarded backstop when STALE. When no socket answers, it signals the phase's foreground holder (a `start` or `resume` before its spawn, a hand-run `advance`) once its identity is confirmed. `--launch <id>` tears down only the socket with that launch id (the form `devflow doctor` prints for an orphan). Never signals a pid recorded in state. Idempotent: safe to run against an already-stopped, never-started, or already-dead phase
+  stop     Stop the phase's DevFlow user service and report how the run ended
   help     Print this message or the help of the given subcommand(s)
 
 Options:

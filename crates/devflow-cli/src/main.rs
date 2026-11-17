@@ -25,7 +25,7 @@ mod service;
 mod commands;
 use commands::{
     GateAnswerKind, cleanup, discard, doctor, gate_list, gate_respond, gate_show, gate_sweep,
-    history_cmd, logs, recover_cmd, start, status, stop, stop_launch,
+    history_cmd, logs, recover_cmd, start, status, stop,
 };
 use devflow_core::phase_id::PhaseId;
 
@@ -285,24 +285,16 @@ enum Command {
         #[arg(default_value = ".")]
         project: PathBuf,
     },
-    /// End a running phase cleanly: answers its open gate with a rejection
-    /// when a live waiter holds it; otherwise addresses the run's supervisor
-    /// socket — `shutdown` when ALIVE, the guarded backstop when STALE. When
-    /// no socket answers, it signals the phase's foreground holder (a `start`
-    /// or `resume` before its spawn, a hand-run `advance`) once its identity
-    /// is confirmed. `--launch <id>` tears down only the
-    /// socket with that launch id (the form `devflow doctor` prints for an
-    /// orphan). Never signals a pid recorded in state. Idempotent: safe to
-    /// run against an already-stopped, never-started, or already-dead
-    /// phase.
+    /// Stop the phase's DevFlow user service and report how the run ended.
+    ///
+    /// Stops the phase's systemd user unit (`systemctl --user stop`), which ends its
+    /// runner and the agent, then reports from the run state: stopped, finished, stopped
+    /// during launch, or crashed. With no live run it does nothing; while another DevFlow
+    /// verb holds the phase it stops nothing and says so.
     Stop {
         /// Phase to stop.
         #[arg(long)]
         phase: PhaseId,
-        /// Tear down only the supervisor socket with this launch id; answers
-        /// no gate, signals no holder and writes no state.
-        #[arg(long)]
-        launch: Option<String>,
         /// Project root. Overrides the positional argument when supplied.
         #[arg(long)]
         root: Option<PathBuf>,
@@ -658,16 +650,9 @@ fn run() -> Result<(), CliError> {
         Command::Doctor { json, project } => doctor(&project_root(project)?, json),
         Command::Stop {
             phase,
-            launch,
             root,
             project,
-        } => {
-            let root = project_root(root.unwrap_or(project))?;
-            match launch {
-                Some(launch_id) => stop_launch(&root, phase, &launch_id),
-                None => stop(&root, phase),
-            }
-        }
+        } => stop(&project_root(root.unwrap_or(project))?, phase),
     }
 }
 
