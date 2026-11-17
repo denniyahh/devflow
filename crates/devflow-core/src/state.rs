@@ -129,10 +129,10 @@ pub struct State {
     /// It is NOT touched by the stage transition (`transition_resets_*` has no
     /// say over it), matching how [`Self::preflight_retries`] and
     /// [`Self::checkpoint_resumes`] are handled, because it is a per-phase
-    /// total rather than a per-streak counter. It is also carried across a
-    /// forced restart: `commands::start()` reads any persisted state for the
+    /// total rather than a per-streak counter. It is also carried into a new
+    /// start: `commands::start()` reads any persisted state for the
     /// same phase and copies this one field into the fresh `State`, because a
-    /// bound a `devflow start --force` resets does not bound the unattended
+    /// bound a new `devflow start` resets does not bound the unattended
     /// case D-07 exists for. Exactly three events reset it to zero (the
     /// third is a `start` over a state recorded `finished`: that run passed
     /// Validate, so the next one begins at zero, operator decision

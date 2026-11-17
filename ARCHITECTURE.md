@@ -370,9 +370,13 @@ optional minimal `devflow.toml` contains only reliability knobs:
 | `--phase N` | Phase number to work on |
 | `--agent claude\|codex\|opencode` | Agent to launch |
 | `--mode auto\|supervise` | `auto` runs unattended and finishes on a passing Validate (gating only on repeated Validate failure, plus never-silent failure gates); `supervise` also gates every Validate |
-| `--force` | Recreate the phase worktree and feature branch from the base if they exist; refused, with nothing removed, while the branch has commits not merged into the base |
 | `--no-worktree` | Run in the primary checkout instead of an isolated worktree |
 | `--dry-run` | Print the pipeline that would run without launching anything |
+
+`start` removes nothing: over a leftover phase worktree, branch or run state it
+refuses, naming `devflow discard --phase N`, which lists what it removes first and
+refuses a branch with commits not merged into the base unless you name it; the
+refusal over an incomplete run also names `devflow resume --phase N`.
 
 Runtime state lives under `.devflow/` (git-ignored), keyed per-phase —
 `state-{phase:02}.json` (see [Per-phase state and

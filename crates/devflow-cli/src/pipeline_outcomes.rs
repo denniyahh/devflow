@@ -1425,7 +1425,7 @@ fn validate_gate_context(
 /// next real measurement is compared against the last real observation. A
 /// single transient fault can no longer buy a reset. What is still NOT claimed
 /// is anything about the run boundary: `State::new` zeroes both the counter
-/// and the baseline on every `devflow start`, `--force` included.
+/// and the baseline on every new `devflow start`.
 ///
 /// CR-01: the two root-consuming reads in this function are on deliberately
 /// **different** roots, and must stay that way. The `{N}-VERIFICATION.md`
@@ -3571,8 +3571,8 @@ mod tests {
     /// to sibling tests.
     ///
     /// **What this does NOT establish.** A forced-run boundary. `State::new`
-    /// zeroes both `consecutive_failures` and the baseline on every `devflow
-    /// start --force`; the save/load control below covers the child boundary,
+    /// zeroes both `consecutive_failures` and the baseline on every new `devflow
+    /// start`; the save/load control below covers the child boundary,
     /// not an entirely new run.
     #[test]
     fn validate_failure_with_unmeasurable_count_accumulates_the_streak() {
