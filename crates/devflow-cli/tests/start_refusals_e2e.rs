@@ -370,3 +370,124 @@ fn start_refuses_a_finished_phase_naming_close_out_or_discard() {
         "refusal does not name discard: {text}"
     );
 }
+
+/// 52.1 D-09.1: `start` over an incomplete run refuses and names
+/// `devflow resume --phase N`; the state is left byte-identical.
+#[test]
+fn start_refuses_an_incomplete_phase_naming_resume() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    save_phase_state(root, |state| {
+        state.verification_baseline_captured = true;
+        state.stage = devflow_core::stage::Stage::Code;
+    });
+    let before = state_bytes(root);
+
+    let (out, _reaper) = start_phase(&home, root, &[]);
+    assert!(
+        !out.status.success(),
+        "an incomplete phase restarted: {}",
+        combined(&out)
+    );
+    let text = assert_refused_leaving_the_state(root, &out, &before);
+    assert!(
+        text.contains(&format!("devflow resume --phase {PHASE}")),
+        "the incomplete-run refusal does not name resume: {text}"
+    );
+}
+
+/// Bytes no state deserializes.
+const UNLOADABLE_STATE: &[u8] = b"{ this is not a state";
+
+/// 52.1 D-20: a state file that does not load makes `start` refuse naming
+/// `devflow discard --phase N`; the file stays as it was and no copy of it is written.
+#[test]
+fn start_refuses_an_unloadable_state_naming_discard_and_leaves_it_in_place() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let state_file = devflow_core::workflow::state_path(root, PhaseId::new(PHASE));
+    fs::create_dir_all(state_file.parent().unwrap()).unwrap();
+    fs::write(&state_file, UNLOADABLE_STATE).unwrap();
+
+    let (out, _reaper) = start_phase(&home, root, &[]);
+    assert!(
+        !out.status.success(),
+        "start replaced an unloadable state: {}",
+        combined(&out)
+    );
+    let text = assert_refused_leaving_the_state(root, &out, UNLOADABLE_STATE);
+    assert!(
+        text.contains(&format!("devflow discard --phase {PHASE}")),
+        "the unloadable-state refusal does not name discard: {text}"
+    );
+    let copies: Vec<String> = fs::read_dir(root.join(".devflow"))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("unloadable-state-"))
+        .collect();
+    assert!(
+        copies.is_empty(),
+        "a copy of the state was written: {copies:?}\n{text}"
+    );
+}
+
+/// 52.1 D-20: a state that only a killed `start`'s reservation left (it never prepared
+/// the run) counts as no run, so `start` proceeds and prepares a new one.
+#[test]
+fn start_proceeds_over_a_reservation_only_state() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    save_phase_state(root, |state| {
+        assert!(
+            !state.verification_baseline_captured,
+            "premise: a fresh state is reservation-only"
+        );
+    });
+
+    let (out, _reaper) = start_phase(&home, root, &[]);
+    let text = combined(&out);
+    assert!(
+        out.status.success(),
+        "start refused a reservation-only state: {text}"
+    );
+    let state = devflow_core::workflow::load_state(root, PhaseId::new(PHASE))
+        .expect("the new run's state loads");
+    assert!(
+        state.verification_baseline_captured,
+        "the start did not prepare a new run over the reservation: {text}"
+    );
+    wait_for_settled(root);
+}
+
+/// D-09a: gate files with no run make `start` refuse naming `devflow discard --phase N`;
+/// the gate file is left in place and no run state is written.
+#[test]
+fn start_refuses_orphan_gate_files_naming_discard() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let gate = devflow_core::gates::Gates::open_gate(
+        root,
+        PhaseId::new(PHASE),
+        devflow_core::stage::Stage::Code,
+        devflow_core::gates::GateKind::StageFailure,
+        "planted orphan Code gate",
+    )
+    .expect("plant an orphan gate");
+
+    let (out, _reaper) = start_phase(&home, root, &[]);
+    assert_refused_naming_discard(root, &out);
+    assert!(
+        gate.path.is_file(),
+        "the orphan gate file was removed: {}",
+        combined(&out)
+    );
+}
