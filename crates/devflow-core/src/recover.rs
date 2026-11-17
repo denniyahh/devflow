@@ -2426,7 +2426,7 @@ mod tests {
         std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
         let write_unloadable = || std::fs::write(&state_path, "{\"stage\":").unwrap();
         write_unloadable();
-        let launch_id = crate::supervisor::new_launch_id();
+        let launch_id = crate::liveness::new_launch_id();
         let lock = crate::liveness::launch_liveness_path(root, &launch_id).unwrap();
         let hold = crate::liveness::Hold::take(&lock).unwrap();
 

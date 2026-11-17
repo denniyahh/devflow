@@ -29,8 +29,8 @@
 use super::protocol::{self, PingReply, Reply, Request, ShutdownAccepted, ShutdownStopped};
 use super::{PublishError, Sidecar, SocketPath};
 use crate::stop::{
-    SIGNAL_READ_FD, drain_signal_pipe, kill_group_unless_exit_observed, observe_agent_exit,
-    request_stop_locked, signal_group,
+    SIGNAL_READ_FD, drain_signal_pipe, end_group_while_running, kill_group_unless_exit_observed,
+    observe_agent_exit, request_stop_locked, signal_group, wait_for_exit_without_reaping,
 };
 use std::cell::Cell;
 use std::io;
@@ -41,18 +41,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-#[cfg(test)]
-pub(crate) use crate::stop::exit_code;
 /// The runner's stop primitives, at the path they had before they moved to
 /// [`crate::stop`]. Kept until the supervisor module is removed.
 pub use crate::stop::{
     AgentGroupEnd, AgentOutcome, OwnerPhase, STOPPED_EXIT_CODE, SafePoint, SignalDispatcher,
     StopAction, StopSource, StopToken, at_safe_point, caught_stop_signal, install_signal_pipe,
     on_agent_exit, on_stop_request, spawn_signal_dispatcher,
-};
-/// The crate-internal stop items, at their old path, for importers not yet repointed.
-pub(crate) use crate::stop::{
-    end_group_while_running, wait_for_exit_without_reaping, wait_owned_agent,
 };
 
 /// The final `stopped` reply. `group_signalled` is what the run's owner state recorded.
@@ -464,6 +458,7 @@ impl Control {
 mod tests {
     use super::*;
     use crate::phase_id::PhaseId;
+    use crate::stop::exit_code;
     use crate::stop::tests::{forbidden_calls, needles};
     use crate::supervisor::{Liveness, ShutdownOutcome, new_launch_id, probe, request_shutdown};
     use crate::test_support::{assert_child_ran_exactly_one_passing_test, spawn_test_in_child};
@@ -579,7 +574,7 @@ mod tests {
             agent_pid,
             agent_pgid: agent_pid,
             agent_start_time: crate::agent::process_start_time(agent_pid).unwrap_or(0),
-            boot_id: crate::supervisor::boot_id().unwrap_or_default(),
+            boot_id: crate::liveness::boot_id().unwrap_or_default(),
             supervisor_pid: std::process::id(),
             supervisor_start_time: crate::agent::process_start_time(std::process::id())
                 .unwrap_or(0),

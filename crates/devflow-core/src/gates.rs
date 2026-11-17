@@ -375,7 +375,7 @@ impl GateId {
     /// A fresh gate id.
     #[must_use]
     pub fn new() -> Self {
-        Self(crate::supervisor::new_launch_id())
+        Self(crate::liveness::new_launch_id())
     }
 
     /// Check an id read from elsewhere; anything [`is_gate_id`] refuses is
@@ -411,7 +411,7 @@ impl std::fmt::Display for GateId {
 /// this: the id in an answer body is untrusted input.
 #[must_use]
 pub fn is_gate_id(id: &str) -> bool {
-    crate::supervisor::is_launch_id(id)
+    crate::liveness::is_launch_id(id)
 }
 
 /// A gate [`Gates::open_gate`] opened.

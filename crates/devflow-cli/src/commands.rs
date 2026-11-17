@@ -12595,7 +12595,7 @@ mod tests {
         let root = dir.path();
         let phase = PhaseId::new(5036);
         std::fs::create_dir_all(root.join(".devflow")).unwrap();
-        let lock = liveness::launch_liveness_path(root, &supervisor::new_launch_id()).unwrap();
+        let lock = liveness::launch_liveness_path(root, &liveness::new_launch_id()).unwrap();
         drop(liveness::Hold::take(&lock).unwrap());
 
         reserve_over_an_unloadable_state(root, phase).expect("a released lock refuses nothing");
