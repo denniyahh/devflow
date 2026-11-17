@@ -284,6 +284,19 @@ impl StopToken {
         self.lock().group_signalled = true;
     }
 
+    /// Give up on the agent [`StopToken::begin_agent`] re-armed for, when its stage failed
+    /// before its exit was observed. Under the owner lock: mark the exit observed (waking
+    /// a thread that waits for it), leave the phase at `Advancing`, and run `reap`, which
+    /// kills and reaps the agent. A stop after this signals no group (R-13), since the
+    /// reaped leader's number may name anyone's group.
+    pub(crate) fn abandon(&self, reap: impl FnOnce()) {
+        let mut state = self.lock();
+        state.agent_exited = true;
+        state.phase = OwnerPhase::Advancing;
+        self.owner.exited.notify_all();
+        reap();
+    }
+
     /// The main thread's exit decision. Under the owner lock: mark the exit
     /// observed (waking a thread that waits for it), run `reap` with the stop flag,
     /// decide with [`on_agent_exit`], and leave the phase at `Advancing` for
@@ -1176,6 +1189,37 @@ pub(crate) mod tests {
         assert!(
             token.stop_requested(),
             "control: it is a stop, so the agent's exit never advances"
+        );
+    }
+
+    /// A stage that fails after `begin_agent` kills and reaps its agent through
+    /// `StopToken::abandon`. A stop signal after that must signal nothing: the recorded
+    /// number here names an unrelated live group, as a recycled pid would. Control: the
+    /// same signal with the agent still running ends the recorded group
+    /// (`end_group_while_running_never_signals_a_pgid_after_its_leader_is_reaped`).
+    #[test]
+    fn stop_after_an_abandoned_agent_signals_no_group() {
+        let (_u_child, _u_guard, unrelated) = unrelated_group();
+        let mut agent = Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .expect("spawn the agent the failed stage abandons");
+        let token = StopToken::for_run();
+        assert!(!token.begin_agent(unrelated), "no stop is pending");
+        token.abandon(|| {
+            let _ = agent.kill();
+            let _ = agent.wait();
+        });
+        stop_on_signal(&token, libc::SIGTERM);
+        std::thread::sleep(Duration::from_secs(1));
+        assert!(
+            group_exists(unrelated),
+            "a stop after an abandoned stage signalled the reaped agent's recorded group"
+        );
+        assert!(
+            token.stop_requested(),
+            "the signal is still taken as a stop"
         );
     }
 
