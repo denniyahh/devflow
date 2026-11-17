@@ -4003,6 +4003,13 @@ fn render_gate_show(gate: &OpenGate) -> String {
     )
 }
 
+/// How long `logs -f` waits, once the agent's exit file is there, for the runner to
+/// leave the followed stage before it prints the run's state line anyway.
+const POST_EXIT_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How often `logs -f` polls the capture and, at its end, the run.
+const FOLLOW_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Print (or follow) a phase's captured agent output.
 pub(crate) fn logs(
     project_root: &Path,
@@ -4026,43 +4033,139 @@ pub(crate) fn logs(
         )));
     }
     eprintln!("== phase {phase}: {} ==", path.display());
-    let mut offset = print_capture_from(&path, 0)?;
+    let offset = print_capture_from(&path, 0)?;
     if !follow {
         return Ok(());
     }
-    // Follow until the agent's exit code lands AND one further quiescent
-    // poll produced no new bytes — the natural end of a run. (An operator
-    // can always Ctrl-C sooner.)
+    follow_capture(project_root, phase, &path, offset)
+}
+
+/// The stage the phase's state names, `None` when it does not load.
+fn state_stage(project_root: &Path, phase: PhaseId) -> Option<Stage> {
+    workflow::load_state(project_root, phase)
+        .ok()
+        .map(|state| state.stage)
+}
+
+/// `logs -f`'s loop. It ends, printing what comes next, when the agent's exit code has
+/// landed and a further poll is quiescent (D-10: then the run's state line once the
+/// runner has left the stage, [`post_exit_line`]); when the state is gone; or when a
+/// quiescent poll finds the runner NotLive, which is how a hard-killed runner that
+/// wrote no exit file looks (review codex-9). A liveness read error ends it with that
+/// error. An operator can always Ctrl-C sooner.
+fn follow_capture(
+    project_root: &Path,
+    phase: PhaseId,
+    path: &Path,
+    mut offset: u64,
+) -> Result<(), CliError> {
     let exit_path = agent_result::exit_code_path(project_root, phase);
     let state_path = workflow::state_path(project_root, phase);
+    let mut followed_stage = state_stage(project_root, phase);
     loop {
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        std::thread::sleep(FOLLOW_POLL);
         let state_exists = state_path.exists();
         // 14-CR-03: a stage transition archives and recreates the capture
         // file (launch_stage → archive_phase_files), so a shrunken file
         // means the next stage started — reset to the top instead of
         // seeking past EOF forever and silently skipping its output.
-        let base = rollover_offset(&path, offset);
+        let base = rollover_offset(path, offset);
         if base != offset {
             eprintln!("== capture restarted (next stage) — following from the top ==");
+            followed_stage = state_stage(project_root, phase);
         }
-        let new_offset = print_capture_from(&path, base)?;
+        let new_offset = print_capture_from(path, base)?;
         // Quiescent only if no rollover happened AND no new bytes appeared.
-        if exit_path.exists() && base == offset && new_offset == offset {
+        let quiescent = base == offset && new_offset == offset;
+        if exit_path.exists() && quiescent {
             if let Ok(code) = std::fs::read_to_string(&exit_path) {
                 eprintln!("== agent exited with code {} ==", code.trim());
             }
+            if let Some(stage) = followed_stage {
+                let line = post_exit_line(project_root, phase, stage, POST_EXIT_WAIT)?;
+                eprintln!("== phase {phase}: {line} ==");
+            }
             return Ok(());
         }
-        // A supervisor whose state vanished writes no exit file (D-03) and has no
-        // successor, so none will come. A state that was gone before the first poll is
-        // the same case: every launch saves its state before it spawns (D-01), so there
-        // is no run still to start here.
-        if !state_exists && base == offset && new_offset == offset {
+        // A runner whose state vanished writes no exit file (D-03) and has no successor,
+        // so none will come. A state that was gone before the first poll is the same
+        // case: every launch saves its state before it spawns (D-01), so there is no run
+        // still to start here.
+        if !state_exists && quiescent {
             eprintln!("== phase {phase}'s state is gone and no exit code was recorded ==");
             return Ok(());
         }
+        if quiescent {
+            let liveness = runner_liveness(project_root, phase).map_err(|why| {
+                CliError::Message(format!(
+                    "phase {phase}: whether its run is live could not be read: {why}"
+                ))
+            })?;
+            if liveness == RunnerLiveness::NotLive {
+                eprintln!("== phase {phase}: {} ==", run_line(project_root, phase)?);
+                return Ok(());
+            }
+        }
         offset = new_offset;
+    }
+}
+
+/// The state line for a phase with nothing left on disk: no state, no gate file, the
+/// runner lock free and the unit inactive.
+const NO_RUN_LINE: &str = "no run — its state is gone and nothing runs it";
+
+/// The phase's [`RunStatus`] line now, or [`NO_RUN_LINE`].
+///
+/// # Errors
+/// [`runner_liveness`] could not answer.
+fn run_line(project_root: &Path, phase: PhaseId) -> Result<String, CliError> {
+    match run_status(project_root, phase, &existing_state(project_root, phase)) {
+        Some(RunStatus::Error(why)) => Err(CliError::Message(format!(
+            "phase {phase}: whether its run is live could not be read: {why}"
+        ))),
+        Some(status) => Ok(status.line(phase)),
+        None => Ok(NO_RUN_LINE.to_string()),
+    }
+}
+
+/// D-10 (review r2 codex-7): the run's state line once the agent's exit file is there.
+/// The exit file is written before the runner advances, so the state read that moment
+/// can still name `followed_stage` as running. This polls [`run_status`] every
+/// [`FOLLOW_POLL`] until the run is no longer live at `followed_stage` with no gate
+/// pending (the state names another stage, a gate is pending, the run finished or
+/// stopped, the state is gone, or the runner reads NotLive) and returns that line. At
+/// `bound` it returns the line as it stands, naming the live stage, so it never polls
+/// forever.
+///
+/// # Errors
+/// [`runner_liveness`] could not answer.
+pub(crate) fn post_exit_line(
+    project_root: &Path,
+    phase: PhaseId,
+    followed_stage: Stage,
+    bound: std::time::Duration,
+) -> Result<String, CliError> {
+    let deadline = std::time::Instant::now() + bound;
+    loop {
+        let status = run_status(project_root, phase, &existing_state(project_root, phase));
+        let waiting = match &status {
+            Some(RunStatus::Error(why)) => {
+                return Err(CliError::Message(format!(
+                    "phase {phase}: whether its run is live could not be read: {why}"
+                )));
+            }
+            Some(RunStatus::Live {
+                stage,
+                gate_pending,
+                ..
+            }) => !gate_pending && *stage == Some(followed_stage),
+            Some(RunStatus::Stopping { .. }) => true,
+            _ => false,
+        };
+        if !waiting || std::time::Instant::now() >= deadline {
+            return Ok(status.map_or_else(|| NO_RUN_LINE.to_string(), |status| status.line(phase)));
+        }
+        std::thread::sleep(FOLLOW_POLL);
     }
 }
 
@@ -6911,7 +7014,10 @@ mod tests {
             for verb in verbs {
                 assert!(line.contains(verb), "row `{label}` lacks {verb}: {line}");
             }
-            assert!(!line.contains("recover"), "row `{label}` names recover: {line}");
+            assert!(
+                !line.contains("recover"),
+                "row `{label}` names recover: {line}"
+            );
         };
 
         let hold = liveness::claim_runner_lock(root, phase).expect("hold the runner lock");
@@ -6919,7 +7025,12 @@ mod tests {
         let gate = format!("`devflow gate approve {phase}`");
         let at_gate = loaded(&|state| state.gate_pending = true);
         row("held at a gate", &at_gate, "live", &[&gate, &stop]);
-        row("held, no state", &workflow::Existing::Missing, "live", &[&stop]);
+        row(
+            "held, no state",
+            &workflow::Existing::Missing,
+            "live",
+            &[&stop],
+        );
         drop(hold);
 
         double::set_unit_state(Ok("deactivating"));
@@ -6934,9 +7045,19 @@ mod tests {
         row("stopped", &stopped, "stopped", &[&resume, &discard]);
         row("crashed", &loaded(&|_| {}), "crashed", &[&resume, &discard]);
         let crashed_at_gate = loaded(&|state| state.gate_pending = true);
-        row("crashed at a gate", &crashed_at_gate, "crashed", &[&resume, &discard]);
+        row(
+            "crashed at a gate",
+            &crashed_at_gate,
+            "crashed",
+            &[&resume, &discard],
+        );
         let reserved = loaded(&|state| state.verification_baseline_captured = false);
-        row("reservation-only", &reserved, "idle", &["devflow start --phase"]);
+        row(
+            "reservation-only",
+            &reserved,
+            "idle",
+            &["devflow start --phase"],
+        );
 
         assert_eq!(
             run_status(root, phase, &workflow::Existing::Missing),
@@ -6951,7 +7072,12 @@ mod tests {
             "left behind",
         )
         .unwrap();
-        row("orphan gates", &workflow::Existing::Missing, "debris", &[&discard]);
+        row(
+            "orphan gates",
+            &workflow::Existing::Missing,
+            "debris",
+            &[&discard],
+        );
 
         let state_file = workflow::state_path(root, phase);
         std::fs::write(&state_file, "{ not json").unwrap();
@@ -6997,7 +7123,10 @@ mod tests {
 
         let waiter = Gates::register_waiter(root, phase, Stage::Code, &gate_id).unwrap();
         let banner = render_pending_gate_banner(root, &open, 10_000).unwrap();
-        assert!(banner.contains(&approve), "no approve with a live waiter: {banner}");
+        assert!(
+            banner.contains(&approve),
+            "no approve with a live waiter: {banner}"
+        );
         assert!(banner.contains("devflow gate reject"), "{banner}");
         assert!(!banner.contains(&discard), "{banner}");
         drop(waiter);
@@ -7009,7 +7138,90 @@ mod tests {
         );
         assert!(banner.contains("debris"), "{banner}");
         assert!(banner.contains(&discard), "{banner}");
-        assert!(banner.contains("stage code failed"), "the context stays: {banner}");
+        assert!(
+            banner.contains("stage code failed"),
+            "the context stays: {banner}"
+        );
+    }
+
+    /// D-10 (review r2 codex-7), in a process of its own: a runner held between its
+    /// agent's exit and its advance. The exit file alone does not end
+    /// [`post_exit_line`]'s wait; the advance that commits a pending gate does, with the
+    /// gate line. Controls: the runner gone with the state still running Plan returns the
+    /// crashed line, and with nothing changing the wait returns the live line at its
+    /// bound, so it never hangs.
+    #[test]
+    fn logs_follow_waits_past_the_exit_file_until_the_runner_advances() {
+        const NAME: &str =
+            "commands::tests::logs_follow_waits_past_the_exit_file_until_the_runner_advances";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_runner_liveness_child(NAME, &[]);
+            return;
+        }
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().to_path_buf();
+        let phase = PhaseId::new(4405);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Supervise, root.clone());
+        state.verification_baseline_captured = true;
+        state.stage = Stage::Plan;
+        workflow::save_state(&state).unwrap();
+        let exit = agent_result::exit_code_path(&root, phase);
+        std::fs::write(&exit, "0").unwrap();
+        let wait_on = |unit_state: &'static str, bound: std::time::Duration| {
+            let (sent, received) = std::sync::mpsc::channel();
+            let root = root.clone();
+            std::thread::spawn(move || {
+                crate::service::double::set_unit_state(Ok(unit_state));
+                let _ = sent.send(post_exit_line(&root, phase, Stage::Plan, bound));
+            });
+            received
+        };
+        let within = std::time::Duration::from_secs(2);
+
+        let hold = liveness::claim_runner_lock(&root, phase).expect("hold the runner lock");
+        let waiting = wait_on("active", std::time::Duration::from_secs(10));
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        assert!(
+            waiting.try_recv().is_err(),
+            "follow ended on the exit file before the advance"
+        );
+        let mut advanced = state.clone();
+        advanced.gate_pending = true;
+        workflow::save_state(&advanced).unwrap();
+        let line = waiting
+            .recv_timeout(within)
+            .expect("no gate line after the advance")
+            .unwrap();
+        assert!(
+            line.contains(&format!("`devflow gate approve {phase}`")),
+            "no gate line after the advance: {line}"
+        );
+
+        workflow::save_state(&state).unwrap();
+        let waiting = wait_on("inactive", std::time::Duration::from_secs(10));
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        drop(hold);
+        let line = waiting
+            .recv_timeout(within)
+            .expect("no crashed line after the runner went")
+            .unwrap();
+        assert!(
+            line.starts_with("crashed")
+                && line.contains(&format!("`devflow resume --phase {phase}`"))
+                && line.contains(&format!("`devflow discard --phase {phase}`")),
+            "no crashed line after the runner went: {line}"
+        );
+
+        let _hold = liveness::claim_runner_lock(&root, phase).expect("hold the lock again");
+        let waiting = wait_on("active", std::time::Duration::from_secs(1));
+        let line = waiting
+            .recv_timeout(within)
+            .expect("post_exit_line did not return at its bound")
+            .unwrap();
+        assert!(
+            line.starts_with("live") && line.contains("in plan"),
+            "post_exit_line did not return the live line at its bound: {line}"
+        );
     }
 
     /// D-07: runner_liveness's answers, one row each, in a process of its own (the
@@ -14633,7 +14845,10 @@ mod tests {
         ] {
             let row = not_live_row(state);
             assert!(row.starts_with("idle"), "{case}: {row}");
-            assert!(row.contains(&format!("run `{start_verb}`")), "{case}: {row}");
+            assert!(
+                row.contains(&format!("run `{start_verb}`")),
+                "{case}: {row}"
+            );
             assert!(!row.contains("devflow resume"), "{case}: {row}");
         }
         let findings = reconcile_phase(&facts_for(root, &killed));

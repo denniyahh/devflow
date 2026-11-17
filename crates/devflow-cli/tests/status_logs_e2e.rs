@@ -230,7 +230,11 @@ fn status_shows_a_running_unit_as_live_naming_stop_and_logs() {
 /// `.devflow/`: its stdout, after asserting it exited 0.
 fn status_over(home: &common::HermeticHome, root: &Path) -> String {
     let output = status_of(home, root);
-    assert!(output.status.success(), "status failed: {}", describe(&output));
+    assert!(
+        output.status.success(),
+        "status failed: {}",
+        describe(&output)
+    );
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
@@ -247,8 +251,8 @@ fn status_lists_an_unloadable_state_as_unloadable_naming_discard() {
     std::fs::write(&state, "{ not json").unwrap();
 
     let stdout = status_over(&home, &root);
-    let row = phase_row(&stdout, phase)
-        .unwrap_or_else(|| panic!("phase missing from status: {stdout}"));
+    let row =
+        phase_row(&stdout, phase).unwrap_or_else(|| panic!("phase missing from status: {stdout}"));
     assert!(
         !stdout.contains("stage: idle"),
         "status printed idle over a phase: {stdout}"
@@ -281,8 +285,8 @@ fn status_lists_gate_files_with_no_state_as_debris_naming_discard() {
     .unwrap();
 
     let stdout = status_over(&home, &root);
-    let row = phase_row(&stdout, phase)
-        .unwrap_or_else(|| panic!("phase missing from status: {stdout}"));
+    let row =
+        phase_row(&stdout, phase).unwrap_or_else(|| panic!("phase missing from status: {stdout}"));
     assert!(
         !stdout.contains("stage: idle"),
         "status printed idle over a phase: {stdout}"
@@ -305,8 +309,8 @@ fn status_lists_a_held_runner_lock_with_no_state_as_live() {
     let _hold = devflow_core::liveness::claim_runner_lock(&root, phase).expect("hold the lock");
 
     let stdout = status_over(&home, &root);
-    let row = phase_row(&stdout, phase)
-        .unwrap_or_else(|| panic!("phase missing from status: {stdout}"));
+    let row =
+        phase_row(&stdout, phase).unwrap_or_else(|| panic!("phase missing from status: {stdout}"));
     assert!(
         !stdout.contains("stage: idle"),
         "status printed idle over a phase: {stdout}"
@@ -351,7 +355,11 @@ const FAILS: &str = r#"printf 'stage failed on purpose\nDEVFLOW_RESULT: {"status
 exit 1"#;
 
 /// `devflow logs --phase N -f ROOT` spawned under `home`, its output piped.
-fn spawn_logs_follow(home: &common::HermeticHome, root: &Path, phase: PhaseId) -> std::process::Child {
+fn spawn_logs_follow(
+    home: &common::HermeticHome,
+    root: &Path,
+    phase: PhaseId,
+) -> std::process::Child {
     common::hermetic_devflow(home)
         .args(["logs", "--phase", &phase.to_string(), "-f"])
         .arg(root)
@@ -397,7 +405,11 @@ fn logs_follow_ends_with_the_runs_state_line() {
 
     let output = logs_output(logs, "logs -f did not end after the agent exited");
     let last = last_stderr_line(&output);
-    assert!(output.status.success(), "logs -f failed: {}", describe(&output));
+    assert!(
+        output.status.success(),
+        "logs -f failed: {}",
+        describe(&output)
+    );
     assert!(
         last.contains("gate") && last.contains(&format!("devflow gate approve {phase}`")),
         "no state line after follow ended: {}",
@@ -429,14 +441,22 @@ fn logs_follow_on_a_finished_run_ends_with_finished() {
         "validate output\n",
     )
     .unwrap();
-    std::fs::write(devflow_core::agent_result::exit_code_path(&root, phase), "0").unwrap();
+    std::fs::write(
+        devflow_core::agent_result::exit_code_path(&root, phase),
+        "0",
+    )
+    .unwrap();
 
     let output = logs_output(
         spawn_logs_follow(&home, &root, phase),
         "logs -f did not end on a finished run",
     );
     let last = last_stderr_line(&output);
-    assert!(output.status.success(), "logs -f failed: {}", describe(&output));
+    assert!(
+        output.status.success(),
+        "logs -f failed: {}",
+        describe(&output)
+    );
     assert!(
         last.contains("finished"),
         "no state line after follow ended: {}",
@@ -451,7 +471,10 @@ fn logs_follow_on_a_finished_run_ends_with_finished() {
 #[test]
 fn logs_follow_ends_with_crashed_after_a_hard_kill_with_no_exit_file() {
     let phase = PhaseId::new(188);
-    let rig = Rig::launch(phase, "echo $$ > \"$(dirname \"$0\")/agent.pid\"\nwhile :; do sleep 0.1; done");
+    let rig = Rig::launch(
+        phase,
+        "echo $$ > \"$(dirname \"$0\")/agent.pid\"\nwhile :; do sleep 0.1; done",
+    );
     rig.release();
     let agent_pid_file = rig._fake_bin.path.join("agent.pid");
     common::wait_for(
