@@ -133,3 +133,8 @@
   status: open
   **What:** ARCHITECTURE.md's `devflow start` flag table (`## Configuration`) reads "Print the pipeline that would run without launching anything" for `--dry-run`, while docs/guides/configuration.md's row and OPERATIONS.md's start row say the dry run checks, read-only, what a real start would refuse and names the checks it skips (52.1 D-26, D-27). Found by 52.2-17 while replacing the `--force` row in the same table.
   **Why deferred:** 52.2-17's action names only the `--force` rows; the carried 52.1-12 plan's `--dry-run` rewrite is not in 52.2-17's plan. Fix shape: copy configuration.md's row into ARCHITECTURE.md. Owner: the phase's docs pass, else a 999.x entry at phase close.
+
+- 52.2-18 Task 2's push of the green commit is refused by the repo's own pre-push hook on every branch name
+  status: open
+  **What:** the plan pushes the green head to `feature/phase-52.2`. `scripts/hooks/pre-push` refuses `.planning/` (and other workspace-only paths) on `feature/*`, `fix/*`, `chore/*`, `release/*`, `develop`, `main`; and its divergence check runs on any ref whose pushed commit carries `.workspace-divergence`, so a push of 9de8b28 to `workspace/phase-52.2` was refused too (undeclared develop-file changes and workspace-only scripts). No ref accepts the phase head with hooks on. Found by 52.2-18's executor (feature push) and the orchestrator (workspace push), 2026-11-17.
+  **Why deferred:** a plan-text defect; the route to CI is the operator's call. Fix shape: plans that need CI on a phase head push a `scripts/cut-pr-branch.sh` cut and record that SHA as the green commit. Owner: a 999.x entry at phase close.
