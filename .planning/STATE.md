@@ -5,16 +5,16 @@ milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: "52.2"
 current_phase_name: Foreground Runner
 status: executing
-stopped_at: Phase 52.2 context gathered
-last_updated: "2026-11-17T03:21:22.463Z"
+stopped_at: Completed 52.2-01-PLAN.md
+last_updated: "2026-11-17T03:53:38.798Z"
 last_activity: 2026-11-16
 last_activity_desc: Phase 52.2 execution started
-state_head: 6bcdf8f0ca9b2901ea16256a1883b6249b285bc4
+state_head: cb4c3739e423d7f3bcd2b4d1d93ba8cae5c03394
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 66
-  completed_plans: 40
+  completed_plans: 41
   percent: 17
 ---
 
@@ -172,8 +172,8 @@ change earns 2.0.
 ## Current Position
 
 Phase: 52.2 (Foreground Runner) — EXECUTING
-Plan: 1 of 26
-Status: Executing Phase 52.2
+Plan: 2 of 26
+Status: Ready to execute
 Last activity: 2026-11-16 — Phase 52.2 execution started
 
 
@@ -936,6 +936,9 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 52.1]: 52.1-07: a --delete-unmerged-branch value that is not the phase branch is refused whatever the branch merge state
 - [Phase 52.1]: 52.1-07: the live-run refusal runs before discard reads the items, so a run that may be live is refused before nothing-to-discard
 - [Phase 52.1]: 52.1-07: discard removes a loadable and an unloadable state the same way, with workflow::clear_state, and nothing else under .devflow/
+- [Phase 52.2]: 52.2-01: launch_stage_inner keeps its default_stage_prompt render and delegates to prepare_stage_launch; launch_stage_next renders again after preflight
+- [Phase 52.2]: 52.2-01: run_runner engages AutoChainGuard around a stream-shape run_stage and drops it before the advance, as run_monitor does
+- [Phase 52.2]: 52.2-01: service.rs items not yet called carry cfg_attr(not(test), expect(dead_code)) naming 52.2-06, which errors once they are called
 
 ## Roadmap Evolution
 
@@ -1087,12 +1090,13 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 52.1 P04 | 23 min | 2 tasks | 5 files |
 | Phase 52.1 P06 | 23 min | 2 tasks | 3 files |
 | Phase 52.1 P07 | 50 min | 3 tasks | 5 files |
+| Phase 52.2 P01 | 30 min | 2 tasks | 10 files |
 
 ## Session
 
-**Last session:** 2026-11-16T13:06:50.573Z
-**Stopped at:** Phase 52.2 context gathered
-**Resume file:** .planning/phases/52.2-foreground-runner/52.2-CONTEXT.md
+**Last session:** 2026-11-17T03:53:37.814Z
+**Stopped at:** Completed 52.2-01-PLAN.md
+**Resume file:** None
 
 ## Operator Next Steps
 
