@@ -50,22 +50,28 @@ fn stop_line(help: &str) -> &str {
         .expect("the help lists stop")
 }
 
-/// Whether a `stop` help line names the holder `stop` signals, and not the per-phase lock
-/// that D-17 replaced.
-fn names_the_foreground_holder(line: &str) -> bool {
-    line.contains("foreground holder") && !line.contains("per-phase lock holder")
+/// Whether a `stop` help line names the user service `stop` stops (D-05), and neither
+/// the supervisor socket nor `--launch`, both gone with the detached supervisor.
+fn names_the_user_service_stop(line: &str) -> bool {
+    line.contains("user service")
+        && !line.contains("supervisor socket")
+        && !line.contains("--launch")
 }
 
 #[test]
-fn stop_help_names_the_foreground_holder_not_the_phase_lock() {
+fn stop_help_names_the_user_service_not_the_supervisor_socket() {
     /// The line as it stood before the holder arm replaced the lock.
     const LINE_AS_IT_STOOD: &str = "  stop       End a running phase cleanly: answers its open gate with a rejection when a live waiter holds it; otherwise addresses the run's supervisor socket — `shutdown` when ALIVE, the guarded backstop when STALE, the per-phase lock holder when GONE. `--launch <id>` tears down only the socket with that launch id (the form `devflow doctor` prints for an orphan). Never signals a pid recorded in state. Idempotent: safe to run against an already-stopped, never-started, or already-dead phase";
-    assert!(
-        !names_the_foreground_holder(LINE_AS_IT_STOOD),
-        "control: the check fails on the old line"
-    );
+    /// The line before the user-service stop (52.2-05's snapshot).
+    const LINE_BEFORE_THE_USER_SERVICE: &str = "  stop     End a running phase cleanly: answers its open gate with a rejection when a live waiter holds it; otherwise addresses the run's supervisor socket — `shutdown` when ALIVE, the guarded backstop when STALE. When no socket answers, it signals the phase's foreground holder (a `start` or `resume` before its spawn, a hand-run `advance`) once its identity is confirmed. `--launch <id>` tears down only the socket with that launch id (the form `devflow doctor` prints for an orphan). Never signals a pid recorded in state. Idempotent: safe to run against an already-stopped, never-started, or already-dead phase";
+    for control in [LINE_AS_IT_STOOD, LINE_BEFORE_THE_USER_SERVICE] {
+        assert!(
+            !names_the_user_service_stop(control),
+            "control: the check fails on an old line: {control}"
+        );
+    }
     let line = stop_line(include_str!("snapshots/devflow-help.txt"));
-    assert!(names_the_foreground_holder(line), "{line}");
+    assert!(names_the_user_service_stop(line), "{line}");
 }
 
 /// Help terms for surface v4.0 removed (D-01, D-03): the Ship and Define stages, and the

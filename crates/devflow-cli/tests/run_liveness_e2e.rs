@@ -822,3 +822,172 @@ fn start_refuses_when_the_unit_read_fails_printing_systemctls_error() {
         text(&out)
     );
 }
+
+impl Case {
+    /// `devflow stop --phase N` on the repository.
+    fn stop(&self) -> Output {
+        let stubs = tempfile::tempdir().unwrap();
+        self.devflow(&["stop", "--phase", &self.phase.to_string()], stubs.path())
+            .output()
+            .expect("run devflow stop")
+    }
+
+    /// The fake `systemctl`'s record that `stop` was called on the phase's unit.
+    fn stop_called(&self) -> bool {
+        self.home
+            .service_bin()
+            .join(format!("{}.stop-called", self.unit()))
+            .exists()
+    }
+}
+
+/// Ends, on drop, the process group whose leader's pid the stub agent wrote to `file`,
+/// so an agent a SIGKILLed runner could not end does not outlive the test.
+struct AgentGroupGuard(PathBuf);
+
+impl Drop for AgentGroupGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = fs::read_to_string(&self.0)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+        {
+            common::signal_group(pid, libc::SIGKILL);
+        }
+    }
+}
+
+/// D-05: `stop` on a phase with no run is a no-op that exits 0 and says so.
+#[test]
+fn stop_on_a_phase_with_no_run_is_a_no_op() {
+    let case = Case::new(PhaseId::new(85));
+    let out = case.stop();
+    assert!(out.status.success(), "no-op stop failed:\n{}", text(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("no live run"),
+        "no-op stop failed to say there is no live run:\n{}",
+        text(&out)
+    );
+    assert!(!case.stop_called(), "stop stopped a unit with no run");
+}
+
+/// D-05, T-52.2-15: a runner the manager has to SIGKILL records no stop, so `stop`
+/// reports it crashed, names `devflow resume` and `devflow discard`, and exits non-zero.
+#[test]
+fn stop_reports_crashed_when_the_runner_was_killed() {
+    let case = Case::new(PhaseId::new(86));
+    let logs = tempfile::tempdir().unwrap();
+    let agent_pid = logs.path().join("agent.pid");
+    let stubs = common::capture_agent_bin_then(
+        logs.path(),
+        &format!("echo $$ > '{}'\nsleep 120", agent_pid.display()),
+    );
+    let _agent = AgentGroupGuard(agent_pid.clone());
+    let _reaper = common::LaunchedRunReaper::for_home(&case.home, &case.root, case.phase);
+    let started = case
+        .start_command(&stubs)
+        .output()
+        .expect("run devflow start");
+    assert!(
+        started.status.success(),
+        "start failed:\n{}",
+        text(&started)
+    );
+    common::wait_for(
+        || agent_pid.is_file(),
+        START_RETURNS_WITHIN,
+        "the stub agent to start",
+    );
+    fs::write(
+        case.home
+            .service_bin()
+            .join(format!("{}.kill", case.unit())),
+        "",
+    )
+    .unwrap();
+
+    let out = case.stop();
+    let stdout_and_stderr = text(&out);
+    assert!(
+        !out.status.success(),
+        "crashed run reported stopped: stop exited 0:\n{stdout_and_stderr}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("crashed")
+            && stderr.contains(&format!("devflow resume --phase {}", case.phase))
+            && stderr.contains(&format!("devflow discard --phase {}", case.phase)),
+        "crashed run reported stopped:\n{stdout_and_stderr}"
+    );
+}
+
+/// D-05, D-07, review pi-10, pi-5: with the runner lock free and the phase holder held,
+/// `stop` stops nothing, says another verb holds the phase, naming its pid and that it
+/// is in progress, and exits non-zero.
+#[test]
+fn stop_while_another_verb_holds_the_phase_holder_says_it_is_in_progress() {
+    let case = Case::new(PhaseId::new(87));
+    let _holder =
+        liveness::claim_phase_holder(&case.root, case.phase).expect("hold the phase holder");
+
+    let out = case.stop();
+    assert!(
+        !out.status.success(),
+        "stop answered no live run while the holder was held:\n{}",
+        text(&out)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("another DevFlow verb holds phase") && stderr.contains("in progress"),
+        "stop answered no live run while the holder was held:\n{}",
+        text(&out)
+    );
+    assert!(
+        stderr.contains(&format!("pid {}", std::process::id())),
+        "holder pid missing from the refusal:\n{}",
+        text(&out)
+    );
+    assert!(
+        !case.stop_called(),
+        "stop stopped a unit while the holder was held"
+    );
+}
+
+/// D-05, review agy-10: a unit stopped while activating, before its runner recorded
+/// anything, leaves only the reservation's state: `stop` says it stopped during launch,
+/// exits 0, and never says crashed. `stop_reports_crashed_when_the_runner_was_killed`
+/// is the control on a prepared state.
+#[test]
+fn stop_of_a_unit_stopped_before_the_runner_recorded_anything_says_stopped_during_launch() {
+    let case = Case::new(PhaseId::new(88));
+    let state = devflow_core::state::State::new(
+        case.phase,
+        devflow_core::state::AgentKind::Codex,
+        devflow_core::mode::Mode::Supervise,
+        case.root.clone(),
+    );
+    assert!(
+        !state.verification_baseline_captured,
+        "the fixture is a state only a reservation wrote"
+    );
+    devflow_core::workflow::save_state(&state).unwrap();
+    fs::write(
+        case.home
+            .service_bin()
+            .join(format!("{}.activating", case.unit())),
+        "",
+    )
+    .unwrap();
+
+    let out = case.stop();
+    assert!(
+        out.status.success(),
+        "launch-window stop reported crashed: stop failed:\n{}",
+        text(&out)
+    );
+    let all = text(&out);
+    assert!(
+        all.contains("stopped during launch") && !all.contains("crashed"),
+        "launch-window stop reported crashed:\n{all}"
+    );
+    assert!(case.stop_called(), "stop did not stop the activating unit");
+}
