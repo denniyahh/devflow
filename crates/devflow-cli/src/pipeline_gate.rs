@@ -920,7 +920,7 @@ fn open_and_await(
                 crate::pipeline_launch::record_advance_stop(state, 4)?;
                 return Err(CliError::Message(format!(
                     "the gate wait for stage {stage} ended: {}",
-                    crate::pipeline_launch::safe_point_stop_reason()
+                    crate::pipeline_launch::ADVANCE_STOP_REASON
                 )));
             }
             GateWaitEnd::TimedOut => {
