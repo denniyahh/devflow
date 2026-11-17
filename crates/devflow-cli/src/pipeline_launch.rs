@@ -12589,16 +12589,19 @@ mod tests {
             .map_or_else(|error| format!("<{error}>"), |code| code.trim().to_string())
     }
 
-    /// `stop`'s success line for a final `stopped` reply. A missing field panics.
-    fn stop_line_for(run: &HandoffRun, last: &serde_json::Value) -> String {
-        crate::commands::stopped_line(
-            &format!("phase {}", run.phase),
-            i32::try_from(last["exit_code"].as_i64().expect("exit_code")).unwrap(),
-            last["advance_suppressed"]
-                .as_bool()
-                .expect("advance_suppressed"),
-            last["group_signalled"].as_bool().expect("group_signalled"),
-        )
+    /// What `devflow stop` reports for `run`'s state once its unit is down: the line
+    /// [`crate::commands::stop_outcome`] prints and whether it exits 0.
+    fn stop_report_for(run: &HandoffRun) -> (String, bool) {
+        crate::commands::stop_outcome(run.phase, Ok(run.state()))
+    }
+
+    /// Assert [`stop_report_for`] reads `run` as stopped: the stopped line, exit 0.
+    fn assert_stop_reports_stopped(run: &HandoffRun) {
+        let (line, clean) = stop_report_for(run);
+        assert!(
+            clean && line.contains(&format!("phase {} stopped (", run.phase)),
+            "{line}"
+        );
     }
 
     /// V-28 (D-16): an agent that completed with `0`, stopped while its supervisor advances.
@@ -12631,9 +12634,7 @@ mod tests {
         let state = run.state();
         assert!(state.stopped, "{state:?}");
         assert_eq!(state.stop_reason.as_deref(), Some(ADVANCE_STOP_REASON));
-        let line = stop_line_for(&run, &last);
-        assert!(line.contains("honoured at an advance safe point"), "{line}");
-        assert!(!line.contains("agent group ended"), "{line}");
+        assert_stop_reports_stopped(&run);
         assert_eq!(
             exit_file_of(&run),
             "143",
@@ -12807,10 +12808,10 @@ mod tests {
                 state.stop_reason.as_deref(),
                 Some(crate::pipeline_gate::FINISHED_STOP_REASON)
             );
-            let line = crate::commands::already_finished_line(&format!("phase {}", run.phase));
+            let (line, clean) = stop_report_for(&run);
             assert!(
-                line.contains("already finished") && !line.contains("handed"),
-                "{line}"
+                clean && line.contains("finished") && !line.contains("stopped ("),
+                "a finished run reads finished, not stopped: {line}"
             );
         } else {
             // Control: no finish permit, so the stop keeps its handling.
@@ -12818,8 +12819,7 @@ mod tests {
             assert!(finished.is_empty(), "{}", run.events());
             let stopped = events_named(&run.root, "advance_stopped");
             assert_eq!(stopped.len(), 1, "{}", run.events());
-            let line = stop_line_for(&run, &last);
-            assert!(line.contains("honoured at an advance safe point"), "{line}");
+            assert_stop_reports_stopped(&run);
             assert!(state.stopped && !state.finished, "{state:?}");
         }
     }
@@ -12843,8 +12843,7 @@ mod tests {
         let stopped = events_named(&run.root, "advance_stopped");
         assert_eq!(stopped.len(), 1, "{}", run.events());
         assert_eq!(stopped[0]["safe_point"], 4, "{}", stopped[0]);
-        let line = stop_line_for(&run, &last);
-        assert!(line.contains("honoured at an advance safe point"), "{line}");
+        assert_stop_reports_stopped(&run);
         assert_eq!(exit_file_of(&run), "143", "{}", run.events());
         assert!(
             answer_open_gate(
