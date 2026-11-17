@@ -799,11 +799,14 @@ fn start_refuses_a_phase_whose_recorded_agent_is_alive() {
     plant_leftover_run(root, phase, Some(agent.pid()));
     let mut present = agent_arm_fragments(phase, agent.pid());
     present.extend([
-        // A live recycled pid refuses start again; only recover --clean
-        // then start gets past it (48-REVIEW WR-01).
+        // A live recycled pid refuses start again, and discard too; removing the pid
+        // file, then discard, then start gets past it (48-REVIEW WR-01).
         "If a named pid is live but is not this phase's process (a recycled pid), `start` refuses again"
             .to_string(),
-        format!("run `devflow recover --clean --phase {phase}` first, then `devflow start`"),
+        format!(
+            "remove .devflow/phase-{}-agent-pid, then run `devflow discard --phase {phase}` (it removes the phase's state, worktree and branch) and `devflow start`",
+            phase.padded()
+        ),
     ]);
 
     assert_start_refuses_live_run(
@@ -816,6 +819,8 @@ fn start_refuses_a_phase_whose_recorded_agent_is_alive() {
             &[
                 "supervisor launch".to_string(),
                 format!("devflow stop --phase {phase} --launch"),
+                "devflow recover".to_string(),
+                "recover --clean".to_string(),
             ],
         ),
         "start must refuse a phase whose recorded agent is alive",
@@ -1050,9 +1055,11 @@ fn resume_agent_fragments(phase: PhaseId) -> Vec<String> {
         "with no live supervisor, `devflow status` names a live agent's pid and the manual kill".to_string(),
         "resume refuses until every named process has exited".to_string(),
         "If a named pid is live but is not this phase's process (a recycled pid), `resume` refuses again".to_string(),
-        "no DevFlow verb clears a recorded pid while keeping the phase's work".to_string(),
-        format!("`devflow recover --clean --phase {phase}` removes the phase state, after which `resume` has nothing to resume, and `devflow start` refuses while the phase's worktree or branch exists"),
-        "`devflow start --force` recreates them from the base and discards the phase's work".to_string(),
+        "and so does `devflow discard`, which reads the same pid file; no DevFlow verb clears a recorded pid".to_string(),
+        format!(
+            "remove .devflow/phase-{}-agent-pid; `devflow discard --phase {phase}` then removes the phase's state, worktree and branch, after which `devflow start` begins again",
+            phase.padded()
+        ),
     ]
 }
 
@@ -1128,6 +1135,8 @@ fn resume_refuses_a_stopped_phase_whose_recorded_agent_is_alive() {
         absent: vec![
             "supervisor launch".to_string(),
             format!("devflow stop --phase {phase} --launch"),
+            "devflow recover".to_string(),
+            "recover --clean".to_string(),
         ],
         spared_agent: Some(agent.pid()),
         refusal: "resume must refuse a phase whose recorded agent is alive",

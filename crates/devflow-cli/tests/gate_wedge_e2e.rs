@@ -1093,7 +1093,7 @@ fn start_wedge_arm_interrupted_start_leaves_a_plan_gate_nothing_answers() {
         output_text.contains("no registered waiter"),
         "reject must say no registered waiter: {output_text}"
     );
-    let recovery_hint = format!("devflow recover --clean --phase {phase}");
+    let recovery_hint = format!("devflow discard --phase {phase}");
     assert!(
         output_text.contains(&recovery_hint),
         "reject must name `{recovery_hint}`: {output_text}"

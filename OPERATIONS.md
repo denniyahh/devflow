@@ -46,8 +46,7 @@ Plan → Code → Validate
 | `devflow gate sweep [--max-age-secs N] [--dry-run] [--root PATH]` | Answer or report aged, unattended gates across every registered root (or one `--root`) — bounds an abandoned run's lifetime without `kill(1)`. On-demand only; nothing schedules it. Never writes an approval |
 | `devflow stop --phase N [PROJECT] [--root PATH]` | End a phase's run by stopping its user unit ([Run shape](#run-shape)) with `systemctl --user stop`, which returns once the unit is down: the manager sends SIGTERM to every process in the unit, the runner and the agent alike, and SIGKILL to any still there after 10 s. The runner records `stopped` and its stop reason; a run waiting at a gate has that gate closed and stays resumable. `stop` then reports how the run ended, from the state: **stopped**, quoting the stop reason and naming `devflow resume --phase N`; **already finished**; **stopped during launch**, when the runner had recorded nothing yet, naming `devflow start --phase N` (these three exit 0); **crashed**, when the runner ended without recording a stop, naming `devflow resume --phase N` and `devflow discard --phase N`; or a state that does not load, naming `devflow discard --phase N` (these two exit non-zero). With no live run it says there is nothing to stop and exits 0. When no runner is live but another DevFlow verb holds the phase (such as a `start` or `resume` before its unit is launched, or a `discard`), it stops nothing, names that verb's pid and exits non-zero: run it again once that verb returns. `stop` signals no pid itself, answers no gate and writes no state; the runner records its own stop. `--root` overrides the positional project root. `stop` adds no exit codes |
 | `devflow cleanup [--force]` | Remove phase worktrees + their feature branches, then delete branches merged into the base. **Keeps a worktree, and says why:** a stopped or finished run (the line quotes the run's recorded stop reason; a stopped run is offered `devflow resume --phase N` or `--force`, a finished run only `--force`, since `resume` refuses it), a STALE supervisor or a failed probe (`--force` removes it). A live run (a running agent, or an ALIVE or pending supervisor) is refused with a non-zero exit even with `--force`, naming that a run is live and `devflow stop --phase N`. `--force` also removes the run's `.devflow/state-NN.json` once its worktree is gone; another phase's state is untouched. `--force` never deletes a feature branch with commits not merged into the base: it keeps the branch and prints one line naming it, its unmerged commit count and `git branch -D feature/phase-NN` to delete it yourself. A merged branch that a kept worktree (or any checkout) still has checked out is never deleted |
-| `devflow discard --phase N [PROJECT] [--delete-unmerged-branch BRANCH]` | Remove one phase's worktree (`.worktrees/phase-NN`, with everything in it: uncommitted and ignored files too), its run state (`.devflow/state-NN.json`) and its feature branch (`feature/phase-NN`). It first lists what it will remove: the worktree with its count of uncommitted changes, the state file, and the branch with whether it is merged into the base (the base the run recorded, else the project's). Each of the three is listed and removed only if it exists, so it also clears a leftover branch or worktree that has no state, and a state file that does not load. Nothing else under `.devflow/` is removed, and no other phase or branch is touched. **Refuses, removing nothing:** a live run (a running agent, or an ALIVE or pending supervisor), a STALE supervisor or a failed probe, and any supervisor socket of this project and phase that may still run and that the state does not name, whether the state is missing, does not load, or loads and names another launch or none, as a finished run's does while its supervisor is still exiting (or a socket directory that cannot be listed): each names `devflow stop --phase N`. Also when the state is missing or does not load, a held launch liveness lock (`.devflow/supervisor-<launch>.live`) that no other phase's state records: it may be this phase's supervisor before it publishes its socket, which no socket sweep shows and `devflow stop` cannot signal, so the refusal names the lock and its holder, and discard is run again once that launch has published or exited. A phase another foreground DevFlow process holds. A branch with commits not merged into the base, unless `--delete-unmerged-branch` names it: the value must be exactly `feature/phase-NN`, and a different name is refused. A branch whose merge state cannot be read. A branch checked out in the primary checkout (`start --no-worktree`): it names `git switch <base>` and never switches itself. A branch checked out in any other worktree than the phase's own. A directory at `.worktrees/phase-NN` that git does not list as a worktree. A phase worktree that is not on `feature/phase-NN` (another branch, or a detached HEAD, whose commits no branch may keep). A phase worktree whose status cannot be read (after its directory was deleted by hand, run `git worktree prune` first). A phase with no state, worktree or branch. It holds the phase's foreground holder from its first check to its last removal, so a `start` cannot begin in between. A removal that fails prints a `warning:` line and the exit is non-zero |
-| `devflow recover [--clean] [--phase N]` | Inspect state; `--clean` sweeps stale phases only; `--clean --phase N` clears one phase. Either form keeps a phase whose recorded or pending supervisor, gate waiter or foreground holder may be live, deciding on a fresh read under the state write lock, so a run that starts while it works is kept. It waits at most 10 s for that lock, then keeps the phase and names the holder. The `--clean` sweep also removes abandoned `supervisor-*.live` and `*.waiter` markers and orphan `*.hold-tmp` temps, and lists set-aside gate answers as kept. Neither ever removes `.holder-NN`, `.state-NN.lock`, `.gates-NN.lock` or a set-aside answer |
+| `devflow discard --phase N [PROJECT] [--delete-unmerged-branch BRANCH]` | Remove one phase's worktree (`.worktrees/phase-NN`, with everything in it: uncommitted and ignored files too), its run state (`.devflow/state-NN.json`) and its feature branch (`feature/phase-NN`). It first lists what it will remove: the worktree with its count of uncommitted changes, the state file, and the branch with whether it is merged into the base (the base the run recorded, else the project's). Each of the three is listed and removed only if it exists, so it also clears a leftover branch or worktree that has no state, and a state file that does not load. It also lists and removes the debris a killed run leaves (D-06): the phase's files under `.devflow/gates/` (gate requests, answers, claims, unheld waiter registrations and write temps), each stage's through its gate close, which sets an unclaimed answer aside rather than deleting it; and the phase's `*.hold-tmp` temps whose creator has exited, through the orphan sweep, which then also removes any other orphan temp in `.devflow/` and `.devflow/gates/` and names each. A temp whose creator still runs is kept and named. So a phase with nothing but gate files or temps is discarded too. Nothing else under `.devflow/` is removed (never `.holder-NN`, `.runner-NN` or a set-aside answer), and no other phase or branch is touched. **Refuses, removing nothing:** a live run (a running agent, or an ALIVE or pending supervisor), a STALE supervisor or a failed probe, and any supervisor socket of this project and phase that may still run and that the state does not name, whether the state is missing, does not load, or loads and names another launch or none, as a finished run's does while its supervisor is still exiting (or a socket directory that cannot be listed): each names `devflow stop --phase N`. Also when the state is missing or does not load, a held launch liveness lock (`.devflow/supervisor-<launch>.live`) that no other phase's state records: it may be this phase's supervisor before it publishes its socket, which no socket sweep shows and `devflow stop` cannot signal, so the refusal names the lock and its holder, and discard is run again once that launch has published or exited. A gate of the phase whose waiter registration is held, or cannot be probed: something may still wait on it. A phase another foreground DevFlow process holds. A branch with commits not merged into the base, unless `--delete-unmerged-branch` names it: the value must be exactly `feature/phase-NN`, and a different name is refused. A branch whose merge state cannot be read. A branch checked out in the primary checkout (`start --no-worktree`): it names `git switch <base>` and never switches itself. A branch checked out in any other worktree than the phase's own. A directory at `.worktrees/phase-NN` that git does not list as a worktree. A phase worktree that is not on `feature/phase-NN` (another branch, or a detached HEAD, whose commits no branch may keep). A phase worktree whose status cannot be read (after its directory was deleted by hand, run `git worktree prune` first). A phase with no state, worktree, branch, gate file or hold temp. It holds the phase's foreground holder from its first check to its last removal, so a `start` cannot begin in between. A removal that fails prints a `warning:` line and the exit is non-zero |
 | `devflow doctor [--json]` | Environment audit (agents installed, versions, RUST_LOG) plus per-phase reconciliation, including each phase's supervisor liveness and a read-only sweep for orphan supervisor sockets (see [Run liveness](#run-liveness)); `--json` emits one object with the keys `environment`, `reconciliation`, `planning_doc_staleness`, `stray_processes`, `orphan_supervisors` and `orphan_supervisor_sweep_error` |
 
 (`devflow advance` is internal and takes `--phase N`. A supervisor does not
@@ -115,7 +114,7 @@ started phase 15 in supervise mode as user service devflow-<digest>-15.service
 Whether a phase's run is alive is answered from its supervisor socket, never
 from a pid. Each launch records its socket's path in `.devflow/state-NN.json`
 (the `supervisor` record); `devflow status`, `doctor`, `stop`, `cleanup`,
-`recover --clean`, `start` and `resume` probe that recorded path (a connect
+`start` and `resume` probe that recorded path (a connect
 and one `ping`) and get one of three answers:
 
 | State | Meaning | Repair |
@@ -158,20 +157,6 @@ How each command shows them:
   first with `devflow stop --phase N`, the line its refusal names, or wait
   for it. It keeps a STALE run's worktree, or one whose probe failed, unless
   `--force`.
-- **`devflow recover --clean --phase N`** refuses, deleting nothing, while
-  the phase's supervisor may still run, by the same rule as `start`: an ALIVE
-  socket, a STALE one unless the backstop's checks prove its agent group
-  gone, or a probe that fails, searching the socket directory when the state
-  file is missing or does not load (and refusing when that directory exists
-  but cannot be listed). It does not read the agent pid file. The refusal
-  names a `devflow stop` line for each such socket. It then decides again on a
-  fresh read under the state write lock, and that decision keeps any STALE
-  socket, even one this guard lets through, printing `kept phase N` with
-  `run \`devflow stop --phase N\` first` and exiting non-zero. So for a STALE
-  socket, `stop` comes first: it removes the socket. When the state file is
-  missing or does not load, it also keeps the phase while a launch liveness
-  file (`supervisor-<id>.live`) is held that no other phase's state records,
-  naming its holder pid: that may be the phase's supervisor before it publishes.
 - **`devflow start` / `devflow resume`** refuse while a run is live: an ALIVE
   socket, a STALE one unless the backstop's checks prove its agent group gone,
   or a probe that fails. When the state file is missing or does not load,
@@ -405,8 +390,7 @@ and moves on. The first process to publish that claim consumes the answer.
 unparsable one, a legacy unkeyed `NN-<stage>.response.json`, or one left unused
 when its gate closes is never consumed or deleted. It is set aside as
 `NN-{stage}.{gate_id|noid}.{secs}.{pid}.{seq}.quarantined.json` and logged as
-`gate_answer_quarantined` with its reason. `status`, `doctor` and
-`recover --clean` list it. A set-aside file persists until removed by hand:
+`gate_answer_quarantined` with its reason. `status` and `doctor` list it. A set-aside file persists until removed by hand:
 nothing in DevFlow deletes it, so remove it once read.
 
 **A late answer.** `DEVFLOW_GATE_TIMEOUT_SECS` ends the wait, not the gate, and
@@ -739,21 +723,21 @@ command. The coding agent never receives the variable.
 | `state-NN.json` | A phase's persisted stage-machine state (per phase since 14a) |
 | `.state-NN.lock` | The phase's short state write lock: held for one state write, usually milliseconds and never across a gate wait, and never removed |
 | `.gates-NN.lock` | The per-phase gate lock: held for a few file operations, never removed |
-| `.holder-NN` | D-17 foreground holder: held by a foreground verb for its lifetime (a `start` or `resume` until its unit is launched, a `discard`, a hand-run `advance`), recording its pid and start time. `stop` refuses while it is held and no runner is live, and never signals it; never removed by `recover --clean` |
-| `supervisor-<launch_id>.live` | Launch reservation: its lock is taken before the pending record is saved and held by the spawned supervisor for life. An abandoned one is removed by `recover --clean` |
-| `*.hold-tmp` | A hold being taken, here or under `gates/`. An orphan is removed by `recover --clean` |
+| `.holder-NN` | D-17 foreground holder: held by a foreground verb for its lifetime (a `start` or `resume` until its unit is launched, a `discard`, a hand-run `advance`), recording its pid and start time. `stop` refuses while it is held and no runner is live, and never signals it; never removed by `discard` |
+| `supervisor-<launch_id>.live` | Launch reservation: its lock is taken before the pending record is saved and held by the spawned supervisor for life. No DevFlow verb removes an abandoned one (D-06) |
+| `*.hold-tmp` | A hold being taken, here or under `gates/`. An orphan is removed by `devflow discard --phase N` when phase N has one |
 | `phase-NN-stdout` / `phase-NN-stderr.log` | Agent capture files (what `logs` tails) |
 | `phase-NN-exit` / `phase-NN-agent-pid` | Exit code + PID the supervisor records |
 | `gates/NN-<stage>.json` | Gate request, naming its `gate_id` |
 | `gates/NN-{stage}.{gate_id}.response.json` | The answer to that one gate |
 | `gates/NN-{stage}.{gate_id}.ack.json` | The claim: the first process to publish it consumes the answer |
-| `gates/NN-{stage}.{gate_id}.waiter` | The waiter's registration: its held lock says something waits on that gate. An abandoned one is removed by `recover --clean` |
+| `gates/NN-{stage}.{gate_id}.waiter` | The waiter's registration: its held lock says something waits on that gate. An abandoned one is removed by the stage's next gate close, and so by `devflow discard --phase N` |
 | `gates/NN-{stage}.{gate_id\|noid}.{secs}.{pid}.{seq}.quarantined.json` | An answer set aside. It persists until removed by hand |
 | `events.jsonl` | Append-only event log (schema v1, one JSON object per line, phase id on every line) — tail it from any tool |
 | `history/phase-NN/` | Bounded archive of prior stage stdout/exit captures |
 
 Everything under `.devflow/` and `.worktrees/` is runtime state
-(git-ignored); `devflow recover --clean` is the sanctioned reset.
+(git-ignored); `devflow discard --phase N` is the sanctioned reset of one phase.
 
 ## A typical dogfood session
 
@@ -770,8 +754,9 @@ devflow status                       # finished — worktree and branch kept
 To end a run early, `devflow stop --phase 15` stops its unit, and
 `devflow resume --phase 15` later continues it from its saved stage.
 
-When something wedges: `devflow recover` to inspect,
-`devflow recover --clean` (stale phases, plus gate files whose phase has no
-state; exits non-zero if anything could not be removed) or
-`devflow recover --clean --phase N` to reset one phase, then re-`start`. Both
-keep a phase that may still be live, and name `devflow stop --phase N` first.
+When something wedges: `devflow status` to see each phase's state and the verb
+that repairs it, then `devflow resume --phase N` to continue the run, or
+`devflow discard --phase N` to remove it (its worktree, state, branch, gate
+files and hold temps; exits non-zero if anything could not be removed), then
+re-`start`. `discard` refuses a run that may still be live, and names
+`devflow stop --phase N` first.

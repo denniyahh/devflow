@@ -136,7 +136,7 @@ Rate-limit detection: if an agent's stdout contains rate-limit messages (429), D
 
 | Command | Description |
 |---|---|
-| `devflow recover` | Inspect or clean up stale/abandoned workflow state |
+| `devflow discard --phase N` | Remove a phase's worktree, run state, branch, and the gate files and hold temps a killed run left, after listing them; refuses a live run |
 | `devflow doctor` | Check that required tools and agents are installed |
 
 ## Configuration
@@ -162,7 +162,7 @@ Key flags:
 | `--mode auto\|supervise` | `auto` runs unattended and finishes on a passing Validate; `supervise` also gates at Validate for human review |
 | `--no-worktree` | Run directly in the primary checkout instead of an isolated worktree (worktree is the default) |
 
-Gate responses and unattended-run notifications are file-based: a fired gate writes `.devflow/gates/NN-{stage}.json`, which names the gate's `gate_id`, and (if `DEVFLOW_GATE_NOTIFY_CMD` is set) runs that command with `DEVFLOW_GATE_PHASE`/`DEVFLOW_GATE_STAGE`/`DEVFLOW_GATE_CONTEXT` in its environment. `devflow gate approve|reject` fill the answer in for you (`--gate-id <ID>` binds it to the gate `gate list` or `gate show` displayed), first moving aside an answer in that gate's own slot that does not bind to it. To answer by hand, copy `gate_id` from the gate file and publish `.devflow/gates/NN-{stage}.{gate_id}.response.json` with `{"gate_id": "...", "approved": true, "note": "..."}` (`approved` is `true` or `false`, `note` is optional), writing it under another name and renaming it into place, because a partly written file is set aside. An answer with a missing or other id is never consumed or deleted: it is set aside as `NN-{stage}.{gate_id|noid}.{secs}.{pid}.{seq}.quarantined.json`, listed by `devflow status`, `devflow doctor` and `devflow recover --clean`, and stays until you remove it by hand.
+Gate responses and unattended-run notifications are file-based: a fired gate writes `.devflow/gates/NN-{stage}.json`, which names the gate's `gate_id`, and (if `DEVFLOW_GATE_NOTIFY_CMD` is set) runs that command with `DEVFLOW_GATE_PHASE`/`DEVFLOW_GATE_STAGE`/`DEVFLOW_GATE_CONTEXT` in its environment. `devflow gate approve|reject` fill the answer in for you (`--gate-id <ID>` binds it to the gate `gate list` or `gate show` displayed), first moving aside an answer in that gate's own slot that does not bind to it. To answer by hand, copy `gate_id` from the gate file and publish `.devflow/gates/NN-{stage}.{gate_id}.response.json` with `{"gate_id": "...", "approved": true, "note": "..."}` (`approved` is `true` or `false`, `note` is optional), writing it under another name and renaming it into place, because a partly written file is set aside. An answer with a missing or other id is never consumed or deleted: it is set aside as `NN-{stage}.{gate_id|noid}.{secs}.{pid}.{seq}.quarantined.json`, listed by `devflow status` and `devflow doctor`, and stays until you remove it by hand.
 
 The poll timeout defaults to 3 days and is configurable via `DEVFLOW_GATE_TIMEOUT_SECS`; it bounds how long a run waits at the gate, not how long you have to answer, and the run holds no lock while it waits. The gate file never expires, but past the timeout the run has ended at that gate: `devflow resume` reruns the stage and asks again, setting any unused answer aside and reporting it. See [OPERATIONS.md](OPERATIONS.md#answering-gates).
 
