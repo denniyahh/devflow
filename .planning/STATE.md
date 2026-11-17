@@ -5,16 +5,16 @@ milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: "52.2"
 current_phase_name: Foreground Runner
 status: executing
-stopped_at: Completed 52.2-05-PLAN.md
-last_updated: "2026-11-17T07:43:33.719Z"
+stopped_at: Completed 52.2-06-PLAN.md
+last_updated: "2026-11-17T09:01:33.326Z"
 last_activity: 2026-11-16
 last_activity_desc: Phase 52.2 execution started
-state_head: 7d9626f16d8a1dc3a0c65211e19f8ed27a8124f6
+state_head: c476ff7def189877ac7974b7f2c6b15073ab3dc6
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 66
-  completed_plans: 47
+  completed_plans: 48
   percent: 17
 ---
 
@@ -172,7 +172,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 52.2 (Foreground Runner) — EXECUTING
-Plan: 8 of 26
+Plan: 9 of 26
 Status: Ready to execute
 Last activity: 2026-11-16 — Phase 52.2 execution started
 
@@ -685,6 +685,7 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
     `deferred-items.md` records it RESOLVED by the child-process migration (46-06, 46-07), and
     `46-VERIFICATION.md` re-ran the failing test 4/4 green under a real `taskset -c 0,1`. The stale
     bullet was still making `smart-entry` report `situation: blocked`.
+- 52.2 wave-4 gate: cargo test hangs on stop_e2e::stop_prints_that_an_unconfirmed_accepted_stop_is_pending (server.join waits for a connection the new stop never makes); run the gate with a timeout or port that test (52.2-07) first
 
 ## Decisions
 
@@ -952,6 +953,11 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 52.2]: 52.2-05: the runner's signal dispatcher thread is the only reader of the signal pipe; one SIGTERM/SIGINT handler per process, the holder flag reads its atomic
 - [Phase 52.2]: 52.2-05: StopToken::begin_agent re-arms the run-long token per stage; a runner-recorded stop writes stop_reason 'stopped by SIGTERM to the runner' and a runner_stopped event
 - [Phase 52.2]: 52.2-05: run_runner settles each advance result finished -> stop -> Err -> next, and re-reads finished/stop after a failed-advance recovery
+- [Phase 52.2]: A failed unit launch in start clears the run state (WR-11) so start can run again; resume re-marks the run stopped with the launch error
+- [Phase 52.2]: resume checks the agent binary right before launching the unit
+- [Phase 52.2]: The runner's first step refuses a state still reading gate_pending, naming devflow resume
+- [Phase 52.2]: The cfg(test) runner harness only holds the runner lock unless double::set_full_runner(true)
+- [Phase 52.2]: stop refuses non-zero, naming the holder's pid, while another verb holds the phase with the runner lock free
 
 ## Roadmap Evolution
 
@@ -1110,11 +1116,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 52.2 P21 | 25min | 3 tasks | 10 files |
 | Phase 52.2 P04 | 22 min | 3 tasks | 5 files |
 | Phase 52.2 P05 | 26 min | 3 tasks | 5 files |
+| Phase 52.2 P06 | 60min | 3 tasks | 9 files |
 
 ## Session
 
-**Last session:** 2026-11-17T07:43:32.096Z
-**Stopped at:** Completed 52.2-05-PLAN.md
+**Last session:** 2026-11-17T09:01:32.241Z
+**Stopped at:** Completed 52.2-06-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
