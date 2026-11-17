@@ -5,16 +5,16 @@ milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: "52.2"
 current_phase_name: Foreground Runner
 status: executing
-stopped_at: Completed 52.2-04-PLAN.md
-last_updated: "2026-11-17T07:14:38.315Z"
+stopped_at: Completed 52.2-05-PLAN.md
+last_updated: "2026-11-17T07:43:33.719Z"
 last_activity: 2026-11-16
 last_activity_desc: Phase 52.2 execution started
-state_head: 65b24435f6630c08a2c420dceaad7fd1c87cb407
+state_head: 7d9626f16d8a1dc3a0c65211e19f8ed27a8124f6
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 66
-  completed_plans: 46
+  completed_plans: 47
   percent: 17
 ---
 
@@ -172,7 +172,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 52.2 (Foreground Runner) — EXECUTING
-Plan: 7 of 26
+Plan: 8 of 26
 Status: Ready to execute
 Last activity: 2026-11-16 — Phase 52.2 execution started
 
@@ -949,6 +949,9 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 52.2]: 52.2-04: TIMEOUT_STOP_SEC is a Duration (name kept); UNIT_STOP_WAIT = TIMEOUT_STOP_SEC + 5 s is the D-07a wait bound
 - [Phase 52.2]: 52.2-04: an unanswered Version probe reads Absent only under the user's own /run/user/<uid> with no systemd/private; a timed-out probe is Failed
 - [Phase 52.2]: 52.2-04: libc moved from dev-dependencies to dependencies for getuid (no new crate)
+- [Phase 52.2]: 52.2-05: the runner's signal dispatcher thread is the only reader of the signal pipe; one SIGTERM/SIGINT handler per process, the holder flag reads its atomic
+- [Phase 52.2]: 52.2-05: StopToken::begin_agent re-arms the run-long token per stage; a runner-recorded stop writes stop_reason 'stopped by SIGTERM to the runner' and a runner_stopped event
+- [Phase 52.2]: 52.2-05: run_runner settles each advance result finished -> stop -> Err -> next, and re-reads finished/stop after a failed-advance recovery
 
 ## Roadmap Evolution
 
@@ -1106,11 +1109,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 52.2 P03 | 41 min | 2 tasks | 8 files |
 | Phase 52.2 P21 | 25min | 3 tasks | 10 files |
 | Phase 52.2 P04 | 22 min | 3 tasks | 5 files |
+| Phase 52.2 P05 | 26 min | 3 tasks | 5 files |
 
 ## Session
 
-**Last session:** 2026-11-17T07:14:37.319Z
-**Stopped at:** Completed 52.2-04-PLAN.md
+**Last session:** 2026-11-17T07:43:32.096Z
+**Stopped at:** Completed 52.2-05-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps

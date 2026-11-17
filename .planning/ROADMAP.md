@@ -208,7 +208,7 @@ D-08 and D-15 in `52.1-CONTEXT.md`. Plan 08 (D-21, D-25, D-09.3: an exit for an 
 supervisor) has no object once the supervisor is gone; 999.223, which plan 08 also carried, closes with the
 supervisor's removal. Also owned here: 999.237, `discard` and `start` refusing over a live run. Evidence and spike results: `.planning/audits/2026-11-15-new-direction-brief.md`.
 **Depends on:** Phase 52.1
-**Plans:** 6/26 plans executed
+**Plans:** 7/26 plans executed
 
 Plans:
 **Wave 1**
@@ -222,7 +222,7 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2 completion)*
 - [x] 52.2-04-PLAN.md
-- [ ] 52.2-05-PLAN.md
+- [x] 52.2-05-PLAN.md
 
 **Wave 4** *(blocked on Wave 3 completion)*
 - [ ] 52.2-06-PLAN.md
@@ -556,7 +556,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 51 | 13/13 | Complete | 2026-11-08 |
 | 52 | 33/33 | Executed — verification stale | 2026-11-11 |
 | 52.1 | 7/7 | Executed — closed at plan 07 (operator, 2026-11-15) | 2026-11-15 |
-| 52.2 | 6/26 | In Progress | — |
+| 52.2 | 7/26 | In Progress | — |
 | 53 | 0/? | Not started | — |
 | 54 | 0/? | Not started | — |
 | 55 | 0/? | Not started | — |
