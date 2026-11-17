@@ -1326,6 +1326,14 @@ pub(crate) fn cleanup(project_root: &Path) -> Result<(), CliError> {
     }
     for phase in workflow::state_file_phases(project_root) {
         if !seen.contains(&phase) {
+            seen.push(phase);
+            outcomes.push(cleanup_phase(project_root, phase, None));
+        }
+    }
+    // D-07: a held runner lock is a live run whether or not a state names it, so its
+    // phase is kept and makes the exit non-zero rather than being passed over.
+    for phase in runner_lock_phases_not_free(project_root) {
+        if !seen.contains(&phase) {
             outcomes.push(cleanup_phase(project_root, phase, None));
         }
     }
@@ -1346,6 +1354,33 @@ pub(crate) fn cleanup(project_root: &Path) -> Result<(), CliError> {
         )));
     }
     Ok(())
+}
+
+/// The phases whose `.devflow/.runner-NN` file does not probe free: held, or a probe
+/// that failed. A free lock file is left by every run that ended, so it names no phase.
+fn runner_lock_phases_not_free(project_root: &Path) -> Vec<PhaseId> {
+    let Ok(entries) = std::fs::read_dir(project_root.join(".devflow")) else {
+        return Vec::new();
+    };
+    let mut phases: Vec<PhaseId> = entries
+        .flatten()
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .to_str()?
+                .strip_prefix(".runner-")?
+                .parse::<PhaseId>()
+                .ok()
+        })
+        .filter(|&phase| {
+            !matches!(
+                liveness::probe(&liveness::runner_lock_path(project_root, phase)),
+                Ok(liveness::Held::Abandoned | liveness::Held::Missing)
+            )
+        })
+        .collect();
+    phases.sort();
+    phases
 }
 
 /// Delete the branches merged into the trunk. A merged branch that a kept worktree (or
@@ -1401,11 +1436,13 @@ fn cleanup_phase(
     phase: PhaseId,
     wt: Option<&worktree::WorktreeInfo>,
 ) -> CleanupOutcome {
+    let state_file = workflow::state_path(project_root, phase);
     let what = match wt {
         Some(wt) => format!("worktree {}", wt.path.display()),
+        None if state_file.exists() => format!("run state {}", state_file.display()),
         None => format!(
-            "run state {}",
-            workflow::state_path(project_root, phase).display()
+            "runner lock {}",
+            liveness::runner_lock_path(project_root, phase).display()
         ),
     };
     let unsettled = |why: String| {
@@ -1425,11 +1462,11 @@ fn cleanup_phase(
         Ok(existing) => existing,
         Err(err) => return unsettled(format!("its run state could not be read ({err})")),
     };
-    if wt.is_none() && matches!(existing, workflow::Existing::Missing) {
-        return CleanupOutcome::Untouched;
-    }
     if let Err(why) = cleanup_liveness(project_root, phase) {
         return unsettled(why);
+    }
+    if wt.is_none() && matches!(existing, workflow::Existing::Missing) {
+        return CleanupOutcome::Untouched;
     }
     match wt {
         Some(wt) => cleanup_phase_worktree(project_root, phase, wt, &existing),
@@ -12366,8 +12403,8 @@ mod tests {
         result: Result<String, String>,
         launched: usize,
         stop_calls: usize,
-        state_before: Option<Vec<u8>>,
-        state_after: Option<Vec<u8>>,
+        state_before: Option<String>,
+        state_after: Option<String>,
         /// Whether the runner lock reads held once the verb returned.
         runner_live_after: bool,
     }
@@ -12599,7 +12636,7 @@ mod tests {
             let unit = crate::service::unit_name(root, phase).unwrap();
             double::register_stop_target(&unit, holder.child.take().unwrap());
         }
-        let state_before = std::fs::read(&state_file).ok();
+        let state_before = std::fs::read_to_string(&state_file).ok();
         let (launches, stops) = (double::launched_units().len(), double::stop_calls());
         let result = run_table_verb(verb, root, phase);
         let observed = Observed {
@@ -12607,7 +12644,7 @@ mod tests {
             launched: double::launched_units().len() - launches,
             stop_calls: double::stop_calls() - stops,
             state_before,
-            state_after: std::fs::read(&state_file).ok(),
+            state_after: std::fs::read_to_string(&state_file).ok(),
             runner_live_after: liveness::probe(&liveness::runner_lock_path(root, phase))
                 .is_ok_and(|held| held == liveness::Held::Live),
         };
