@@ -437,12 +437,13 @@ pub(crate) fn start(
     // D-07: hold the phase across the guards, the state write and the launch, until
     // systemd-run returns. The phase holder is what keeps a second launcher out.
     let phase_holder = claim_foreground_holder(project_root, phase)?;
-    // D-07a, D-12: a unit still stopping is waited out before any guard reads liveness.
-    wait_out_a_stopping_unit(project_root, phase, LaunchVerb::Start)?;
+    // D-07a, D-12: the guards' facts are read under the holder, before the write lock; a
+    // unit still stopping is waited out there before liveness is read.
+    let facts = gather_guard_facts(project_root, phase, LaunchVerb::Start)?;
 
     // D-01, D-08: the guards run before any gate cleanup, git mutation or run state,
     // so a refusal changes nothing.
-    let reserved = reserve_launch(project_root, phase, LaunchVerb::Start, Some(&state))?;
+    let reserved = reserve_launch(project_root, phase, LaunchVerb::Start, facts, Some(&state))?;
     let mut created = reserved.created;
     #[cfg(test)]
     crate::pipeline_launch::launch_test_hold("holder_claimed");
@@ -895,18 +896,149 @@ pub(crate) struct Reserved {
     pub(crate) state: State,
 }
 
-/// Run a launch's guards in one write-lock closure (D-01): the live-run guard and the
-/// finished-run guard, then, for `start`, write `fresh` when no state loads. The phase
+/// A runner holding the phase's runner lock (D-07), as the launch guards read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LiveRunner {
+    /// The runner's recorded pid, `None` when its record does not read.
+    pub(crate) pid: Option<u32>,
+}
+
+/// The phase's run state as the launch guards read it under the write lock (52.1 D-20).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) enum StateFact {
+    /// No state file.
+    #[default]
+    Missing,
+    /// Only what a killed `start`'s guard write left ([`run_never_prepared`]): no run.
+    ReservationOnly,
+    /// A prepared run that has not finished.
+    Incomplete {
+        /// The stage it is at.
+        stage: Stage,
+    },
+    /// A run that finished (its Validate passed).
+    Finished,
+    /// A state file that does not load.
+    Unloadable {
+        /// The state file.
+        path: PathBuf,
+        /// Why it does not load.
+        error: String,
+    },
+}
+
+impl StateFact {
+    /// What `existing`, read from `state_file`, is to the guards. Finished is read
+    /// before reservation-only, and both before incomplete.
+    fn of(existing: &workflow::Existing, state_file: &Path) -> Self {
+        match existing {
+            workflow::Existing::Missing => StateFact::Missing,
+            workflow::Existing::Loaded(state) if state.finished => StateFact::Finished,
+            workflow::Existing::Loaded(state) if run_never_prepared(state) => {
+                StateFact::ReservationOnly
+            }
+            workflow::Existing::Loaded(state) => StateFact::Incomplete { stage: state.stage },
+            workflow::Existing::Unloadable(error) => StateFact::Unloadable {
+                path: state_file.to_path_buf(),
+                error: error.to_string(),
+            },
+        }
+    }
+}
+
+/// Everything [`launch_guards`] decides on (D-12, D-26), read before the state write
+/// lock by [`gather_guard_facts`] except `state`, which [`reserve_launch`]'s closure
+/// fills from the state it holds. It carries no unit state: a unit still stopping is
+/// waited out before the facts are read (D-07a, review agy-1), so only a held runner
+/// lock is a live run.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct GuardFacts {
+    /// The runner holding the phase's runner lock, `None` when the lock is free.
+    pub(crate) live_runner: Option<LiveRunner>,
+    /// The phase's run state.
+    pub(crate) state: StateFact,
+}
+
+impl GuardFacts {
+    /// The facts one liveness read gives. [`RunnerLiveness::Stopping`] reads as no live
+    /// runner, because the caller waited it out first ([`wait_out_a_stopping_unit`]),
+    /// which never returns it.
+    pub(crate) fn from_liveness(liveness: &RunnerLiveness) -> Self {
+        let live_runner = match liveness {
+            RunnerLiveness::Live { pid } => Some(LiveRunner { pid: *pid }),
+            RunnerLiveness::Stopping { .. } | RunnerLiveness::NotLive => None,
+        };
+        GuardFacts {
+            live_runner,
+            ..GuardFacts::default()
+        }
+    }
+}
+
+/// Read what `verb`'s guards decide on, under the caller's phase holder and before the
+/// state write lock, so no process is spawned under that lock (D-08): first
+/// [`wait_out_a_stopping_unit`], whose liveness read gives the live row.
+///
+/// # Errors
+/// A liveness read that failed, or a unit still not inactive after the bound.
+pub(crate) fn gather_guard_facts(
+    project_root: &Path,
+    phase: PhaseId,
+    verb: LaunchVerb,
+) -> Result<GuardFacts, CliError> {
+    let liveness = wait_out_a_stopping_unit(project_root, phase, verb)?;
+    Ok(GuardFacts::from_liveness(&liveness))
+}
+
+/// `start`'s one guard sequence (D-12, D-26), pure over `facts`: live, then finished.
+/// The first refusal wins, and each names the verb that applies (52.1 D-09.1).
+pub(crate) fn launch_guards(phase: PhaseId, facts: &GuardFacts) -> Result<(), CliError> {
+    refuse_a_live_runner(phase, LaunchVerb::Start, facts)?;
+    match &facts.state {
+        StateFact::Finished => Err(CliError::Message(format!(
+            "phase {phase} finished (its Validate passed), and `start` runs only a new phase \
+             — refusing to start; nothing was written. To end it, close the phase out, then remove \
+             its run with `devflow discard --phase {phase}`"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// The guard sequence's first row (D-07, D-12): a held runner lock refuses `verb`,
+/// naming `devflow stop`. A lock-free unit never reaches here as live.
+fn refuse_a_live_runner(
+    phase: PhaseId,
+    verb: LaunchVerb,
+    facts: &GuardFacts,
+) -> Result<(), CliError> {
+    let Some(runner) = facts.live_runner else {
+        return Ok(());
+    };
+    Err(CliError::Message(format!(
+        "phase {phase}: its runner holds the runner lock{} — refusing to {}; nothing was \
+         written. Run `devflow stop --phase {phase}` or wait for it to finish, then run `{}` \
+         again.",
+        runner_pid_note(runner.pid),
+        verb.label(),
+        verb.rerun(phase)
+    )))
+}
+
+/// Run a launch's guards in one write-lock closure (D-01): [`launch_guards`] for
+/// `start`, the live row and the finished-run guard for `resume`, then, for `start`,
+/// write `fresh` when no state loads. `facts` were read before the lock
+/// ([`gather_guard_facts`]); the closure fills in the state it holds. The phase
 /// holder the caller holds across the guards, the state write and the unit launch keeps
 /// a second launcher out (D-07). `resume` passes `None` and gets its missing-state or
 /// load error once the guard has passed.
 ///
-/// A refused launch changes no state. The closure's only I/O is the guard's bounded
-/// probes: no spawn, hook or gate wait happens under the write lock (D-08).
+/// A refused launch changes no state. No spawn, hook or gate wait happens under the
+/// write lock (D-08).
 pub(crate) fn reserve_launch(
     project_root: &Path,
     phase: PhaseId,
     verb: LaunchVerb,
+    facts: GuardFacts,
     fresh: Option<&State>,
 ) -> Result<Reserved, CliError> {
     let kept_unloadable_path = project_root.join(".devflow").join(format!(
@@ -915,11 +1047,18 @@ pub(crate) fn reserve_launch(
         liveness::new_launch_id()
     ));
     let outcome = workflow::update_state_with(project_root, phase, |existing| {
-        refuse_launch_over_a_live_run(project_root, phase, verb)?;
+        let state_file = workflow::state_path(project_root, phase);
+        let facts = GuardFacts {
+            state: StateFact::of(&existing, &state_file),
+            ..facts
+        };
+        match verb {
+            LaunchVerb::Start => launch_guards(phase, &facts)?,
+            LaunchVerb::Resume => refuse_a_live_runner(phase, verb, &facts)?,
+        }
         refuse_resume_of_a_finished_run(phase, verb, &existing)?;
         #[cfg(test)]
         crate::pipeline_launch::launch_test_hold("guarded");
-        let state_file = workflow::state_path(project_root, phase);
         let (next, created, replaced) = match (existing, fresh) {
             (workflow::Existing::Loaded(state), _) => (state, false, false),
             (workflow::Existing::Missing, Some(fresh)) => (fresh.clone(), true, false),
@@ -3801,39 +3940,6 @@ impl LaunchVerb {
     }
 }
 
-/// The shared start/resume guard (D-07, D-12, 999.237): one read of
-/// [`runner_liveness`]. A held runner lock refuses, naming `devflow stop`, and a read
-/// that failed refuses too (fail closed); a unit still stopping does not, because the
-/// verb waited it out under its phase holder before this ran
-/// ([`wait_out_a_stopping_unit`]). The agent pid file and the supervisor sockets are
-/// not read (D-12a).
-///
-/// Runs on the state [`reserve_launch`]'s closure read, before any gate cleanup, git
-/// mutation or state write, so a refusal writes nothing. `--force` does not bypass it.
-/// This check says nothing about a gate waiter.
-fn refuse_launch_over_a_live_run(
-    project_root: &Path,
-    phase: PhaseId,
-    verb: LaunchVerb,
-) -> Result<(), CliError> {
-    match runner_liveness(project_root, phase) {
-        Err(why) => Err(CliError::Message(format!(
-            "phase {phase}: {why}, so a live runner cannot be ruled out — refusing to {}; \
-             nothing was written",
-            verb.label()
-        ))),
-        Ok(RunnerLiveness::Live { pid }) => Err(CliError::Message(format!(
-            "phase {phase}: its runner holds the runner lock{} — refusing to {}; nothing was \
-             written. Run `devflow stop --phase {phase}` or wait for it to finish, then run `{}` \
-             again.",
-            runner_pid_note(pid),
-            verb.label(),
-            verb.rerun(phase)
-        ))),
-        Ok(RunnerLiveness::Stopping { .. } | RunnerLiveness::NotLive) => Ok(()),
-    }
-}
-
 /// D-35: `resume` refuses a run that finished, because its last stage already
 /// passed and there is nothing left to continue. Runs on the state
 /// [`reserve_launch`]'s closure read, so the refusal writes nothing and
@@ -5858,7 +5964,10 @@ mod tests {
         let phase = PhaseId::new(4401);
         crate::service::double::set_unit_state(Ok("deactivating"));
 
-        let launch = refuse_launch_over_a_live_run(root, phase, LaunchVerb::Start);
+        let launch_facts = |root: &Path| {
+            GuardFacts::from_liveness(&runner_liveness(root, phase).expect("liveness reads"))
+        };
+        let launch = launch_guards(phase, &launch_facts(root));
         assert!(
             launch.is_ok(),
             "the launch guard returned a refusal for a lock-free deactivating unit: {launch:?}"
@@ -5877,7 +5986,7 @@ mod tests {
 
         let _hold = liveness::claim_runner_lock(root, phase).expect("hold the runner lock");
         let stop = format!("devflow stop --phase {phase}");
-        let launch = refuse_launch_over_a_live_run(root, phase, LaunchVerb::Start)
+        let launch = launch_guards(phase, &launch_facts(root))
             .expect_err("control: the launch guard refuses under a held runner lock");
         assert!(launch.to_string().contains(&stop), "control: {launch}");
         let discard = refuse_discard_of_a_live_run(phase, phase_run_liveness(root, phase))
@@ -11839,9 +11948,15 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "{ this is not a state").unwrap();
         let fresh = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        reserve_launch(root, phase, LaunchVerb::Start, Some(&fresh))
-            .map(|_reserved| ())
-            .map_err(|err| err.to_string())
+        reserve_launch(
+            root,
+            phase,
+            LaunchVerb::Start,
+            GuardFacts::default(),
+            Some(&fresh),
+        )
+        .map(|_reserved| ())
+        .map_err(|err| err.to_string())
     }
 
     /// The control: with no live lock, or only a released one left by an older build, a
@@ -12001,7 +12116,14 @@ mod tests {
     /// [`state_of_a_start_killed_during_preparation`] for a start in `mode`.
     fn state_of_a_start_killed_in_mode(root: &Path, phase: PhaseId, mode: Mode) -> State {
         let fresh = State::new(phase, AgentKind::Claude, mode, root.to_path_buf());
-        reserve_launch(root, phase, LaunchVerb::Start, Some(&fresh)).unwrap();
+        reserve_launch(
+            root,
+            phase,
+            LaunchVerb::Start,
+            GuardFacts::default(),
+            Some(&fresh),
+        )
+        .unwrap();
         workflow::load_state(root, phase).unwrap()
     }
 
@@ -12530,8 +12652,14 @@ mod tests {
             "with no state, none is created"
         );
 
-        let reserved = reserve_launch(empty, phase, LaunchVerb::Start, Some(&dead))
-            .unwrap_or_else(|err| panic!("the control's guards pass: {err}"));
+        let reserved = reserve_launch(
+            empty,
+            phase,
+            LaunchVerb::Start,
+            GuardFacts::default(),
+            Some(&dead),
+        )
+        .unwrap_or_else(|err| panic!("the control's guards pass: {err}"));
         assert!(
             workflow::state_path(empty, phase).exists(),
             "control: the guard write creates a state while the holder is held"

@@ -2292,8 +2292,9 @@ pub(crate) fn resume_with_fallback(
     // D-07: the holder covers the guards, every state write and the launch, until
     // systemd-run returns, so it keeps a second launcher out.
     let phase_holder = crate::commands::claim_foreground_holder(project_root, phase)?;
-    // D-07a, review agy-1: a unit still stopping after a stop is waited out, not refused.
-    crate::commands::wait_out_a_stopping_unit(
+    // D-07a, review agy-1: a unit still stopping after a stop is waited out, not refused,
+    // and the liveness read after it is the live row's fact.
+    let liveness = crate::commands::wait_out_a_stopping_unit(
         project_root,
         phase,
         crate::commands::LaunchVerb::Resume,
@@ -2302,6 +2303,7 @@ pub(crate) fn resume_with_fallback(
         project_root,
         phase,
         crate::commands::LaunchVerb::Resume,
+        crate::commands::GuardFacts::from_liveness(&liveness),
         None,
     )?;
     #[cfg(test)]
