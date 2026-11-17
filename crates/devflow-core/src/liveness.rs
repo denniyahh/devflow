@@ -1,20 +1,16 @@
-//! Per-launch liveness: a `flock` a launcher takes before it saves a pending
-//! record, and a spawned supervisor inherits and holds for life, so a pending
-//! supervisor is probeable before its socket exists.
+//! Liveness locks: a `flock` its holder keeps for as long as it lives, so a
+//! probe tells a live holder from an abandoned file with no pid read. A launch
+//! reservation ([`launch_liveness_path`]), the phase holder
+//! ([`phase_holder_path`]) and the runner lock ([`runner_lock_path`]) are each
+//! a [`Hold`].
 //!
-//! D-01's two cases are told apart by the lock alone, with no pid read:
-//! a supervisor spawned but not yet published holds the lock, so the file
-//! reads [`Held::Live`]; a reservation whose launcher died before spawning
-//! anything holds nothing, so it reads [`Held::Abandoned`].
+//! D-01's two cases are told apart by the lock alone: a reservation whose
+//! launcher still runs reads [`Held::Live`]; one whose launcher died holds
+//! nothing, so it reads [`Held::Abandoned`].
 //!
-//! Two traps, both pinned by this module's tests:
-//!
-//! - `dup2(3, 3)` is a no-op that leaves close-on-exec set, so a descriptor
-//!   that already is fd 3 would lose the lock at exec. `pass_to_child`
-//!   clears the flag in that case.
-//! - A `flock` belongs to the open file description, so `unlock()` on any
-//!   duplicate releases the lock a child inherited. Dropping a [`Hold`] is the
-//!   only release.
+//! A `flock` belongs to the open file description, so `unlock()` on any
+//! duplicate releases it. Dropping a [`Hold`] is the only release (pinned by
+//! this module's tests).
 //!
 //! The identity record a hold writes (pid and start time) is advisory, not state,
 //! and stays outside D-09's durable helpers and their scan: the lock, not its
@@ -415,26 +411,10 @@ pub fn claim_runner_lock(project_root: &Path, phase: PhaseId) -> Result<Hold, Ru
     }
 }
 
-/// Turn SIGTERM and SIGINT into a stop flag for this process (D-18), once per process,
-/// with `SA_RESTART` and an empty mask: a foreground process `stop` signals ends at its
-/// next safe point instead of wherever the signal lands. It reads the flag through
-/// [`holder_stop_signal`].
-///
-/// It installs the process's one SIGTERM/SIGINT handler,
-/// [`crate::stop::install_signal_pipe`], so a holder and a supervisor or
-/// runner in one process never replace each other's handler. No signal is blocked,
-/// because a blocked mask would be inherited by every child. A caught signal goes back to
-/// its default at exec, so the supervisors, agents and hooks a holder spawns are
-/// unaffected.
-///
-/// # Errors
-/// The pipe or `sigaction` failed. The result of the one attempt is cached.
-pub fn install_holder_stop_handler() -> std::io::Result<()> {
-    crate::stop::install_signal_pipe()
-}
-
-/// The signal [`install_holder_stop_handler`]'s handler caught, if one has arrived. A
-/// later signal replaces an earlier one.
+/// The signal the process's one SIGTERM/SIGINT handler
+/// ([`crate::stop::install_signal_pipe`]) caught, if one has arrived (D-18): a
+/// foreground process reads it at its next safe point. A later signal replaces an
+/// earlier one.
 pub fn holder_stop_signal() -> Option<i32> {
     crate::stop::caught_stop_signal()
 }
@@ -817,7 +797,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn run_handler_child(install: bool) -> ! {
         if install {
-            install_holder_stop_handler().expect("install the handler");
+            crate::stop::install_signal_pipe().expect("install the handler");
             let bits = (1u64 << (libc::SIGTERM - 1)) | (1u64 << (libc::SIGINT - 1));
             assert_eq!(own_signal_mask("SigCgt") & bits, bits, "both are caught");
             assert_eq!(own_signal_mask("SigBlk") & bits, 0, "neither is blocked");

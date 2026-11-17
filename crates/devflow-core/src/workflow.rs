@@ -280,9 +280,8 @@ pub const WRITE_LOCK_POLL: Duration = Duration::from_millis(10);
 /// unless something it waits on is stalled, and short enough that a repair verb always
 /// answers. Stalled, a closure can outlast it: 10 s for a fenced gate answer, 13 s for a
 /// recovery decision (`recover::a_recover_decisions_worst_case_is_counted_on_its_real_paths`)
-/// and, by reading, 16 s for a reservation whose two
-/// [`crate::supervisor::protocol::IO_TIMEOUT`]-bounded socket probes both stall on both
-/// connects. The verb then names the holder and writes nothing.
+/// and, by reading, 16 s for a reservation whose two socket probes, each bounded by
+/// the socket protocol's I/O timeout, both stall on both connects. The verb then names the holder and writes nothing.
 pub const WRITE_LOCK_REPAIR_WAIT: Duration = Duration::from_secs(10);
 
 /// The file the phase's state write lock lives on: `.devflow/.state-NN.lock`.

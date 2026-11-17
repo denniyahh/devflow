@@ -557,8 +557,8 @@ extern "C" fn on_stop_signal(signo: libc::c_int) {
 /// and requests the stop. The caught signal's number is also kept for
 /// [`caught_stop_signal`].
 ///
-/// This is the process's one SIGTERM/SIGINT handler: a foreground holder's
-/// `liveness::install_holder_stop_handler` installs it too and reads the number.
+/// This is the process's one SIGTERM/SIGINT handler: a foreground process reads the
+/// caught number through `liveness::holder_stop_signal`.
 ///
 /// Call it at runner entry, before the agent is spawned. It installs
 /// process-global signal state, so only a process that owns a run calls it, and it

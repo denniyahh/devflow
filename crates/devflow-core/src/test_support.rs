@@ -155,8 +155,7 @@ pub fn in_child_test(test_name: &str) -> bool {
 /// by PID 1. A GitHub Actions job container's PID 1 is `tail -f /dev/null`,
 /// which never reaps, so there a killed agent's orphaned children stay
 /// zombies for the life of the job and `kill(-pgid, 0)` keeps reporting the
-/// group. "Is the group gone?" must ask this, never `kill(-pgid, 0)`. It is
-/// the rule `supervisor::backstop`'s census applies.
+/// group. "Is the group gone?" must ask this, never `kill(-pgid, 0)`.
 pub fn live_group_members(pgid: u32) -> Vec<u32> {
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return Vec::new();
