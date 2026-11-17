@@ -38,8 +38,8 @@ use std::time::Duration;
 /// failure cannot leave an immortal monitor.
 const GATE_TIMEOUT_SECS: &str = "15";
 
-/// How long a launched run may take to record its agent pid.
-const AGENT_PID_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a launched run's runner may take to hold its runner lock.
+const RUNNER_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn git(root: &Path, args: &[&str]) {
     let output = devflow_core::test_support::git_command(root)
@@ -109,15 +109,17 @@ fn env_set_by(command: &Command, name: &str) -> PathBuf {
     PathBuf::from(value)
 }
 
-/// Runs `command` (a `start` built by the caller), reaps the run it launches,
-/// and returns every file under `roots` afterwards.
+/// Runs `command` (a `start` built by the caller, whose fake service manager is
+/// `home`'s), reaps the runner it launches, and returns every file under `roots`
+/// afterwards.
 fn run_start_and_list(
     mut command: Command,
+    home: &common::HermeticHome,
     root: &Path,
     phase: PhaseId,
     roots: &Path,
 ) -> Vec<PathBuf> {
-    let _reaper = common::LaunchedRunReaper::new(root, phase, vec![]);
+    let _reaper = common::LaunchedRunReaper::for_home(home, root, phase);
     let output = command.output().expect("run devflow start");
     assert!(
         output.status.success(),
@@ -125,13 +127,16 @@ fn run_start_and_list(
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    // Wait for the agent pid so the reaper can end the agent as well as the
-    // monitor.
-    let agent_pid = devflow_core::agent_result::agent_pid_path(root, phase);
+    // Wait for the runner to hold its lock, so the run is live when the files
+    // are listed and the reaper ends a runner that is past its launch.
+    let runner_lock = devflow_core::liveness::runner_lock_path(root, phase);
     common::wait_for(
-        || agent_pid.exists(),
-        AGENT_PID_TIMEOUT,
-        "the launched agent's pid file",
+        || {
+            devflow_core::liveness::probe(&runner_lock)
+                .is_ok_and(|held| held == devflow_core::liveness::Held::Live)
+        },
+        RUNNER_LOCK_TIMEOUT,
+        "the launched run's runner lock",
     );
     common::entries_under(roots)
 }
@@ -169,7 +174,7 @@ fn a_child_writing_outside_its_tempdir_home_fails() {
         );
     }
     let hermetic_roots = home.cache_dir().join("roots");
-    let entries = run_start_and_list(hermetic, repo.path(), phase, &hermetic_roots);
+    let entries = run_start_and_list(hermetic, &home, repo.path(), phase, &hermetic_roots);
     assert!(
         !entries.is_empty(),
         "the hermetic run must register under {}; it holds nothing",
@@ -201,7 +206,7 @@ fn a_child_writing_outside_its_tempdir_home_fails() {
     common::with_fake_service_manager(&mut plain, &home);
     add_start_args(&mut plain, repo2.path(), phase, &fake_bin);
     let control_roots = real_home.path().join(".cache/devflow/roots");
-    let entries = run_start_and_list(plain, repo2.path(), phase, &control_roots);
+    let entries = run_start_and_list(plain, &home, repo2.path(), phase, &control_roots);
     assert!(
         !entries.is_empty(),
         "the plain-Command control must populate {}; it holds nothing, so the \
