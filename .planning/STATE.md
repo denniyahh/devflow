@@ -4,17 +4,17 @@ milestone: v4.0
 milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: "52.2"
 current_phase_name: Foreground Runner
-status: executing
-stopped_at: Completed 52.2-18-PLAN.md
-last_updated: "2026-11-17T20:56:02.176Z"
+status: verifying
+stopped_at: Completed 52.2-19-PLAN.md
+last_updated: "2026-11-17T22:03:12.159Z"
 last_activity: 2026-11-16
 last_activity_desc: Phase 52.2 execution started
-state_head: 2d5764fdae2837f592016e6014c9df8fefa960d8
+state_head: 290f61a03b9e77489a4920f2cf3f2d1489408d39
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 66
-  completed_plans: 65
+  completed_plans: 66
   percent: 17
 ---
 
@@ -173,7 +173,7 @@ change earns 2.0.
 
 Phase: 52.2 (Foreground Runner) — EXECUTING
 Plan: 26 of 26
-Status: Ready to execute
+Status: Phase complete — ready for verification
 Last activity: 2026-11-16 — Phase 52.2 execution started
 
 
@@ -997,6 +997,9 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 52.2]: 52.2-17: the removed --force surface is guarded by two scans in crates/devflow-cli/tests/removed_surface_scan.rs (CLI code lines outside test modules, and the scoped docs), each with planted controls
 - [Phase 52.2]: 52.2-18: the green commit CI saw is d3be8c7 on feature/phase-52.2-pr, the cut-pr-branch.sh replay of 9de8b28, because the pre-push hook refuses .planning/ on feature/* (operator chose the filtered-branch route)
 - [Phase 52.2]: 52.2-18: 999.222's repeat row uses gsd_reader::tests::a_gaps_found_report_reads_as_gaps_found, the test that failed in 52-24
+- [Phase 52.2]: 52.2-19: operator chose fix (a) for 999.238: the proof fixture commits .gitignore lines for GSD's derived files
+- [Phase 52.2]: 52.2-19: operator: use attempt 1 as the dirty-tree control; 52.1 D-15's premise (the committed _auto_chain_active key keeps the tree clean) did not hold on attempt 2
+- [Phase 52.2]: 52.2-19: operator approved all 342 subject removed test-ledger rows
 
 ## Roadmap Evolution
 
@@ -1173,11 +1176,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 52.2 P16 | 26 min | 3 tasks | 7 files |
 | Phase 52.2 P17 | 27 min | 3 tasks | 10 files |
 | Phase 52.2 P18 | 133 min | 3 tasks | 2 files |
+| Phase 52.2 P19 | 66 min | 3 tasks | 3 files |
 
 ## Session
 
-**Last session:** 2026-11-17T20:56:01.138Z
-**Stopped at:** Completed 52.2-18-PLAN.md
+**Last session:** 2026-11-17T22:03:10.571Z
+**Stopped at:** Completed 52.2-19-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
