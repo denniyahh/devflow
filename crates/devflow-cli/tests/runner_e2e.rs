@@ -36,8 +36,9 @@ fn git(root: &Path, args: &[&str]) {
     );
 }
 
-/// A `develop`-only repo carrying `phase`'s CONTEXT.md and one PLAN.md, and a GSD config.
-fn init_repo(root: &Path, phase: PhaseId) {
+/// A `develop`-only repo carrying one PLAN.md for `phase`, its CONTEXT.md when
+/// `with_context`, and a GSD config.
+fn init_repo_with(root: &Path, phase: PhaseId, with_context: bool) {
     git(root, &["init", "-q"]);
     git(root, &["config", "user.email", "devflow@example.com"]);
     git(root, &["config", "user.name", "DevFlow Tests"]);
@@ -48,7 +49,9 @@ fn init_repo(root: &Path, phase: PhaseId) {
     let padded = phase.padded();
     let dir = root.join(format!(".planning/phases/{padded}-test"));
     fs::create_dir_all(&dir).unwrap();
-    fs::write(dir.join(format!("{padded}-CONTEXT.md")), "ctx\n").unwrap();
+    if with_context {
+        fs::write(dir.join(format!("{padded}-CONTEXT.md")), "ctx\n").unwrap();
+    }
     fs::write(dir.join(format!("{padded}-01-PLAN.md")), "plan\n").unwrap();
     fs::write(
         root.join(".planning/config.json"),
@@ -95,15 +98,33 @@ impl RunnerFixture {
         stop_until: Option<Stage>,
         agent: impl FnOnce(&Path) -> String,
     ) -> Self {
+        Self::with_mode(
+            phase,
+            stop_until,
+            devflow_core::mode::Mode::Supervise,
+            true,
+            agent,
+        )
+    }
+
+    /// [`Self::with_agent`] in `mode`, with `phase`'s CONTEXT.md committed on `develop`
+    /// only when `context_on_base`.
+    fn with_mode(
+        phase: PhaseId,
+        stop_until: Option<Stage>,
+        mode: devflow_core::mode::Mode,
+        context_on_base: bool,
+        agent: impl FnOnce(&Path) -> String,
+    ) -> Self {
         let repo = tempfile::tempdir().unwrap();
         // The binary canonicalizes `--project`, so the fixture must too.
         let root = repo.path().canonicalize().unwrap();
-        init_repo(&root, phase);
+        init_repo_with(&root, phase, context_on_base);
         let fake_bin = common::fake_bin_dir_for("codex", &agent(&root));
         let mut state = devflow_core::state::State::new(
             phase,
             devflow_core::state::AgentKind::Codex,
-            devflow_core::mode::Mode::Supervise,
+            mode,
             root.clone(),
         );
         state.stage = Stage::Plan;
@@ -1209,5 +1230,130 @@ fn a_stop_at_a_pending_gate_closes_it_and_keeps_the_run_resumable() {
         output.status.code(),
         state.infra_failures,
         shown(&output)
+    );
+}
+
+/// A `codex` stub for the preflight runs: appends `$PPID` to a `ppids` file beside
+/// itself and reports a passing Plan turn (the base already holds the phase's PLAN.md).
+const PREFLIGHT_CODEX: &str = r#"here=$(dirname "$0")
+printf '%s\n' "$PPID" >> "$here/ppids"
+printf 'DEVFLOW_RESULT: {"status":"success"}\n'"#;
+
+/// A Codex run at Plan in `mode`, halting after Plan, whose recorded base branch
+/// (`develop`) holds the phase's CONTEXT.md only when `context_on_base`.
+fn preflight_fixture(
+    phase: PhaseId,
+    mode: devflow_core::mode::Mode,
+    context_on_base: bool,
+) -> RunnerFixture {
+    let fixture = RunnerFixture::with_mode(phase, Some(Stage::Plan), mode, context_on_base, |_| {
+        PREFLIGHT_CODEX.to_string()
+    });
+    let mut state = fixture.state().expect("the fixture's state");
+    state.base_branch = Some("develop".to_string());
+    devflow_core::workflow::save_state(&state).unwrap();
+    fixture
+}
+
+/// The `gate_fired` events for Plan.
+fn plan_gates_fired(fixture: &RunnerFixture) -> Vec<serde_json::Value> {
+    fixture
+        .events_of("gate_fired")
+        .into_iter()
+        .filter(|event| event["stage"] == "plan")
+        .collect()
+}
+
+/// Run `fixture`'s runner to its exit, approving a Plan gate from a second process
+/// (`devflow gate approve N`) if one opens first. The runner's pid, its output, and
+/// whether a gate was approved.
+fn run_approving_a_plan_gate(fixture: &RunnerFixture) -> (u32, Output, bool) {
+    let mut runner = fixture.spawn_runner();
+    let runner_pid = runner.pid;
+    common::wait_for(
+        || fixture.gate_open(Stage::Plan) || !runner.running(),
+        RUNNER_WAIT,
+        "the Plan preflight gate or the runner's exit",
+    );
+    let approved = fixture.gate_open(Stage::Plan);
+    if approved {
+        assert!(
+            fixture.lines_beside_agent("ppids").is_empty(),
+            "the Plan agent ran before its preflight gate was answered"
+        );
+        fixture.gate(&["approve", &fixture.phase.to_string()]);
+    }
+    let output = runner.wait();
+    // A stage that ran outside the runner (a detached `__monitor`) is ended here.
+    end_recorded_non_runner_parents(runner_pid, &fixture.lines_beside_agent("ppids"));
+    (runner_pid, output, approved)
+}
+
+/// D-02 (T-52.2-65): a Codex Plan in auto mode with no CONTEXT.md on the recorded base
+/// opens a preflight gate; once a second process approves it, the same runner runs the
+/// Plan agent as its own child and records Plan's verdict. Control: the same run with
+/// the refusing check negated opens no gate.
+#[test]
+fn an_approved_preflight_gate_runs_its_stage_in_the_same_runner() {
+    use devflow_core::mode::Mode;
+    let phase = PhaseId::new(96);
+    let fixture = preflight_fixture(phase, Mode::Auto, false);
+    assert!(
+        !fixture.beside_agent("ppids").exists(),
+        "a ppids file exists before the runner starts"
+    );
+    let (runner_pid, output, approved) = run_approving_a_plan_gate(&fixture);
+    let fired = plan_gates_fired(&fixture);
+    assert!(
+        approved && fired.len() == 1,
+        "no single Plan preflight gate opened: {fired:?}\n{}",
+        shown(&output)
+    );
+    assert_eq!(
+        fixture.lines_beside_agent("ppids"),
+        vec![runner_pid.to_string()],
+        "the approved Plan agent is not the runner's own child (runner pid {runner_pid})\n{}",
+        shown(&output)
+    );
+    assert!(
+        exited_zero(output.status),
+        "runner failed: {}",
+        shown(&output)
+    );
+    let launched = fixture.events_of("stage_launched");
+    assert!(
+        launched.len() == 1 && launched[0]["stage"] == "plan",
+        "expected exactly one stage_launched, for Plan: {launched:?}"
+    );
+    let evaluated = fixture.events_of("advance_evaluated");
+    assert!(
+        evaluated
+            .iter()
+            .any(|event| event["stage"] == "plan" && event["status"] == "success"),
+        "no Plan verdict recorded: {evaluated:?}"
+    );
+    let state = fixture
+        .state()
+        .expect("the state is kept after an --until halt");
+    assert_eq!(
+        (state.stage, state.stopped, state.gate_pending),
+        (Stage::Plan, true, false),
+        "the run does not record Plan's verdict and halt: {state:?}"
+    );
+
+    // Control: the refusing check negated, every other field the same.
+    let control = preflight_fixture(PhaseId::new(97), Mode::Auto, true);
+    let (control_pid, control_output, control_approved) = run_approving_a_plan_gate(&control);
+    assert!(
+        !control_approved && plan_gates_fired(&control).is_empty(),
+        "the control opened a Plan gate: {:?}\n{}",
+        plan_gates_fired(&control),
+        shown(&control_output)
+    );
+    assert_eq!(
+        control.lines_beside_agent("ppids"),
+        vec![control_pid.to_string()],
+        "the control's Plan agent did not run under its runner\n{}",
+        shown(&control_output)
     );
 }
