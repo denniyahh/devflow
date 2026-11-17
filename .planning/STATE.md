@@ -5,16 +5,16 @@ milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: "52.2"
 current_phase_name: Foreground Runner
 status: executing
-stopped_at: Completed 52.2-07-PLAN.md
-last_updated: "2026-11-17T09:42:56.845Z"
+stopped_at: Completed 52.2-08-PLAN.md
+last_updated: "2026-11-17T10:14:02.830Z"
 last_activity: 2026-11-16
 last_activity_desc: Phase 52.2 execution started
-state_head: 4b47bd27ed5153061ea5c5d658a775860df285c8
+state_head: 0914c293be4bf91e8e8c7c9f93f1ef83aa53cdfa
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 66
-  completed_plans: 49
+  completed_plans: 50
   percent: 17
 ---
 
@@ -172,7 +172,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 52.2 (Foreground Runner) — EXECUTING
-Plan: 10 of 26
+Plan: 11 of 26
 Status: Ready to execute
 Last activity: 2026-11-16 — Phase 52.2 execution started
 
@@ -961,6 +961,9 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 52.2]: 52.2-07: held-stdout tests (WR-03 E1, E2) run __runner directly over the seeded Code state; E3's socket stop at safe point 1 is retired
 - [Phase 52.2]: 52.2-07: stop's outcome, positional-root, flag-precedence and cleanup tests port onto live runner units, since stop over a seeded state is a no-op
 - [Phase 52.2]: 52.2-07: recover_clean_refuses_while_the_supervisor_is_alive retired with 52.2-10's successor row; recover --clean deletes a live runner's state until 52.2-10 removes the verb
+- [Phase 52.2]: Ported tests that asserted the driver exited 0 after an abort now assert the runner exits 1, its designed exit for an unfinished run (52.2-02)
+- [Phase 52.2]: gate_notify_persist_e2e advance arms run through resume: a bare __runner fires the notify command but saves nothing; committing the variable is start and resume's job
+- [Phase 52.2]: Two auto_chain_flag_e2e supervisor-record tests retired with ledger rows; the runner lock leaves no second run to supersede
 
 ## Roadmap Evolution
 
@@ -1121,11 +1124,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 52.2 P05 | 26 min | 3 tasks | 5 files |
 | Phase 52.2 P06 | 60min | 3 tasks | 9 files |
 | Phase 52.2 P07 | 32 min | 3 tasks | 9 files |
+| Phase 52.2 P08 | 28 min | 3 tasks | 7 files |
 
 ## Session
 
-**Last session:** 2026-11-17T09:42:56.011Z
-**Stopped at:** Completed 52.2-07-PLAN.md
+**Last session:** 2026-11-17T10:14:01.907Z
+**Stopped at:** Completed 52.2-08-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
