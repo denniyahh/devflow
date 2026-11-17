@@ -3438,6 +3438,10 @@ thread_local! {
 /// adjudicated for this one relaunch, not granting a standing bypass
 /// (T-18-28: the skip must never leak beyond the single stage a human
 /// approved).
+///
+/// Test-only since 52.2-06: `start` and `resume` launch the runner's unit, whose
+/// [`run_runner`] runs [`launch_stage_next`] itself.
+#[cfg(test)]
 pub(crate) fn launch_stage(
     state: &mut State,
     prompt_override: Option<String>,
@@ -3822,7 +3826,17 @@ pub(crate) fn resume_with_fallback(
         eprintln!("{warning}");
     }
 
-    let _phase_holder = crate::commands::claim_foreground_holder(project_root, phase)?;
+    // D-03: no launch without an answering user manager, and no fallback launch.
+    crate::commands::refuse_without_a_user_manager(phase, crate::commands::LaunchVerb::Resume)?;
+    // D-07: the holder covers the guards, the reservation, every state write and the
+    // launch, until systemd-run returns.
+    let phase_holder = crate::commands::claim_foreground_holder(project_root, phase)?;
+    // D-07a, review agy-1: a unit still stopping after a stop is waited out, not refused.
+    crate::commands::wait_out_a_stopping_unit(
+        project_root,
+        phase,
+        crate::commands::LaunchVerb::Resume,
+    )?;
     let reserved = crate::commands::reserve_launch(
         project_root,
         phase,
@@ -3835,7 +3849,37 @@ pub(crate) fn resume_with_fallback(
     launch_test_hold("holder_claimed");
     let result = resume_loaded(project_root, phase, reserved.state, agent, fallback_agent);
     abandon_reservation(project_root, phase, reserved.created);
-    result
+    let mut state = result?;
+    // The runner checks the agent binary again at each launch; checked here too, so a
+    // resume that cannot run its agent fails now, re-marked stopped below, rather than
+    // in a unit nobody watches.
+    let launched =
+        crate::preflight::ensure_agent_binary(crate::preflight::agent_program(state.agent))
+            .map_err(|err| err.to_string())
+            .and_then(|()| crate::service::launch_runner_unit(project_root, phase));
+    match launched {
+        Ok(unit) => {
+            drop(phase_holder);
+            crate::commands::print_runner_launched(
+                phase,
+                &format!("resumed phase {phase} at its {} stage", state.stage),
+                &unit,
+            );
+            Ok(())
+        }
+        Err(why) => {
+            let err = CliError::Message(format!("resume: phase {phase} was not launched: {why}"));
+            // The commit above cleared `stopped` so a reload mid-launch reads the run
+            // active; a launch that failed outright makes that a lie (44-CORE finding 2a),
+            // so the run is marked stopped again, naming what failed. Best effort: the
+            // launch error is what the caller needs either way.
+            let _ = commit(&mut state, |s| {
+                s.stopped = true;
+                s.stop_reason = Some(format!("resume launch failed: {err}"));
+            });
+            Err(err)
+        }
+    }
 }
 
 /// The label field of a quarantine file's name, `NN-{stage}.{label}.{secs}.{pid}.{seq}.quarantined.json`.
@@ -3966,15 +4010,17 @@ fn close_gates_for_resume(
     lines
 }
 
-/// [`resume_with_fallback`] after its reservation: `state` is the copy that wrote, which may already
-/// be behind the file.
+/// [`resume_with_fallback`] after its reservation, up to the launch: every refusal and
+/// every state write (gate closing, notes, the handoff, the fallback re-arm) under the
+/// caller's phase holder. `state` is the copy that wrote, which may already be behind the
+/// file; the committed copy is returned for the caller to launch.
 fn resume_loaded(
     project_root: &Path,
     phase: PhaseId,
     mut state: State,
     agent: Option<AgentKind>,
     fallback_agent: Option<AgentKind>,
-) -> Result<(), CliError> {
+) -> Result<State, CliError> {
     crate::commands::refuse_unprepared_run(&state)?;
     // D-01, D-02, D-03: every fallback check runs here, BEFORE `commit_notify_env`
     // below, so a refused resume commits nothing at all (review B-3).
@@ -4054,30 +4100,7 @@ fn resume_loaded(
     if let Some(fallback) = fallback_agent {
         print_fallback_notice(fallback, state.agent);
     }
-    match launch_stage(&mut state, None, None) {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            // `state.stopped` was just persisted as `false` above (needed so
-            // a reload mid-relaunch already sees the phase as active — D-15/
-            // 999.60, see the doc comment above). If `launch_stage` then
-            // fails outright (as opposed to routing through its own gate,
-            // which returns `Ok(())`), that save is now a lie: the state
-            // file claims an active, running phase, but nothing launched.
-            // `check_dead_agent`/`check_dead_monitor` both skip a phase
-            // marked `stopped` (commands.rs), so this "zombie" combination
-            // is exactly the one case those checks cannot flag
-            // (44-CORE-REVIEW-FINDINGS.md finding 2a). Re-mark the phase
-            // stopped, with a reason naming what failed, so it is visible
-            // and actionable again rather than silently stalled. Best-effort
-            // save — the original launch error is what the caller needs to
-            // see either way.
-            let _ = commit(&mut state, |s| {
-                s.stopped = true;
-                s.stop_reason = Some(format!("resume launch failed: {err}"));
-            });
-            Err(err)
-        }
-    }
+    Ok(state)
 }
 
 /// Refuse a `resume` the run's recorded delivery canary would refuse, before it writes
@@ -5682,19 +5705,7 @@ mod tests {
 
         let result = resume(root, phase, None);
 
-        // `resume()` loads its own `State` from the state file and never writes the
-        // spawned pid back into this test's local `state`, so binding the guard from
-        // that local binding would capture `None` and silently reap nothing. Read the
-        // pid back from disk. `ReapMonitorOnDrop` captures `Option<u32>` by value, so
-        // the guard does not borrow the temporary it is built from.
-        //
-        // Bound here, ahead of `result.unwrap()` below: a `resume()` that spawned the
-        // monitor and then failed a later `?` leaves `result` as `Err` with the pid
-        // nonetheless live.
-        let reloaded_for_reap = workflow::load_state(root, phase).ok();
-        let _reap_guard = reloaded_for_reap
-            .as_ref()
-            .map(ReapMonitorOnDrop::after_launch);
+        let _runners = crate::service::double::LaunchedRunners;
 
         result.unwrap();
 
@@ -5712,11 +5723,10 @@ mod tests {
             "resume must clear stop_until so the phase does not immediately re-stop \
              the next time it advances past Plan"
         );
-        assert!(
-            reloaded.supervisor.is_some(),
-            "resume() must have spawned a monitor whose supervisor is recorded in state — if this \
-             fails, the reap guard above is silently reaping nothing and this test has \
-             stopped covering the launch path it was written to cover"
+        assert_eq!(
+            crate::service::double::launched_units().len(),
+            1,
+            "resume launched the runner unit"
         );
     }
 
@@ -5829,10 +5839,7 @@ mod tests {
             seed_code_gate_with_pending_answer(root, phase, Mode::Supervise);
 
         let result = resume(root, phase, None);
-        let reloaded_for_reap = workflow::load_state(root, phase).ok();
-        let _reap_guard = reloaded_for_reap
-            .as_ref()
-            .map(ReapMonitorOnDrop::after_launch);
+        let _runners = crate::service::double::LaunchedRunners;
         result.unwrap();
 
         // (a) the saved stage was relaunched.
@@ -5842,14 +5849,10 @@ mod tests {
             Stage::Code,
             "resume must relaunch the saved stage"
         );
-        assert!(
-            reloaded.supervisor.is_some(),
-            "resume must have spawned a monitor for the saved stage"
-        );
         assert_eq!(
-            stage_launched_count(root, phase),
+            crate::service::double::launched_units().len(),
             1,
-            "resume must launch the saved stage exactly once"
+            "resume must launch the saved stage exactly once, as the runner's unit"
         );
 
         // (b) the pending answer was set aside whole, and nothing consumed it.
@@ -5898,10 +5901,7 @@ mod tests {
         let (gate, answer) = seed_code_gate_with_pending_answer(root, phase, Mode::Supervise);
 
         let result = resume(root, phase, None);
-        let reloaded_for_reap = workflow::load_state(root, phase).ok();
-        let _reap_guard = reloaded_for_reap
-            .as_ref()
-            .map(ReapMonitorOnDrop::after_launch);
+        let _runners = crate::service::double::LaunchedRunners;
         result.unwrap();
 
         let quarantined = Gates::quarantined(root);
@@ -5909,11 +5909,14 @@ mod tests {
         assert_eq!(std::fs::read(&quarantined[0].path).unwrap(), answer);
         assert!(!Gates::gate_path(root, phase, Stage::Code).exists());
         assert!(!workflow::load_state(root, phase).unwrap().gate_pending);
+        // The relaunch is the runner's unit (52.2-06), launched after `resume_loaded`
+        // returned: the idle test runner has run no stage, so the set-aside is in the log
+        // and no stage launch is.
         let order = event_order(root);
-        let set_aside = order.iter().position(|e| e == "gate_answer_quarantined");
-        let launched = order.iter().position(|e| e == "stage_launched");
         assert!(
-            set_aside.is_some() && launched.is_some() && set_aside < launched,
+            order.iter().any(|e| e == "gate_answer_quarantined")
+                && !order.iter().any(|e| e == "stage_launched")
+                && crate::service::double::launched_units().len() == 1,
             "the gate closes before the relaunch: {order:?}"
         );
         assert!(
@@ -6065,11 +6068,9 @@ mod tests {
     }
 
     /// D-06 (V-17): an answer whose waiter was killed before it consumed the answer
-    /// never decides the gate a `resume` reaches next. Mode::Auto at Code with the legacy
-    /// launch forced is refused by `preflight_unattended_launch_check`, so the
-    /// rerun opens the same stage's gate in this process. It opens under a new id, the
-    /// old answer is set aside, and the new gate waits: its short timeout is what ends
-    /// this test.
+    /// never decides the gate a `resume` reaches next. `resume` closes the old gate and
+    /// sets its answer aside before it launches the runner's unit (52.2-06), so the
+    /// gate the rerun opens there, under its own id, has nothing in its answer slots.
     #[test]
     fn resume_quarantines_an_unused_gate_answer_and_opens_a_new_gate_id() {
         const NAME: &str = "pipeline_launch::tests::resume_quarantines_an_unused_gate_answer_and_opens_a_new_gate_id";
@@ -6092,34 +6093,22 @@ mod tests {
         let (old_gate, old_answer) = seed_code_gate_with_pending_answer(root, phase, Mode::Auto);
 
         let result = resume(root, phase, None);
-        let reloaded_for_reap = workflow::load_state(root, phase).ok();
-        let _reap_guard = reloaded_for_reap
-            .as_ref()
-            .map(ReapMonitorOnDrop::after_launch);
+        let _runners = crate::service::double::LaunchedRunners;
+        result.expect("the resume launches the runner unit");
 
         assert!(
             events_of_kind(root, "gate_resolved").is_empty(),
             "the killed waiter's answer must not decide the rerun's gate: {:?}",
             events_of_kind(root, "gate_resolved")
         );
-        let err = result.expect_err("the rerun's gate has no answer, so its wait times out");
         assert!(
-            err.to_string().contains("timed out awaiting a response"),
-            "{err}"
+            !Gates::gate_path(root, phase, Stage::Code).exists(),
+            "the old gate is closed, so the rerun's gate opens under its own id"
         );
-        assert_eq!(events_of_kind(root, "gate_timeout").len(), 1);
         assert_eq!(
-            stage_launched_count(root, phase),
-            0,
-            "a refused preflight with an unanswered gate launches nothing"
-        );
-
-        let new_gate = live_gate_id(root, phase, Stage::Code);
-        assert_ne!(new_gate, old_gate, "the rerun's gate has its own id");
-        assert_eq!(
-            Gates::read_answer(root, phase, Stage::Code, &new_gate),
-            devflow_core::gates::AnswerRead::None,
-            "nothing answers the rerun's gate"
+            crate::service::double::launched_units().len(),
+            1,
+            "the rerun is the runner unit"
         );
         assert_eq!(
             gate_answer_files(root, phase, Stage::Code),
@@ -6190,14 +6179,7 @@ mod tests {
 
         let result = resume(root, phase, None);
 
-        // Same reap-before-unwrap ordering as the sibling test above: read
-        // the pid back from disk, since `resume()` loads its own `State`
-        // internally and never writes the spawned pid into this test's
-        // local `state` binding.
-        let reloaded_for_reap = workflow::load_state(root, phase).ok();
-        let _reap_guard = reloaded_for_reap
-            .as_ref()
-            .map(ReapMonitorOnDrop::after_launch);
+        let _runners = crate::service::double::LaunchedRunners;
 
         result.unwrap();
 
@@ -6212,9 +6194,10 @@ mod tests {
             !reloaded.stopped,
             "an unfired cap must not itself flip stopped to true — resume only relaunches"
         );
-        assert!(
-            reloaded.supervisor.is_some(),
-            "resume() must still have spawned a monitor whose supervisor is recorded in state"
+        assert_eq!(
+            crate::service::double::launched_units().len(),
+            1,
+            "resume launched the runner unit"
         );
     }
 
@@ -6255,10 +6238,7 @@ mod tests {
 
         let result = resume(root, phase, None);
 
-        let reloaded_for_reap = workflow::load_state(root, phase).ok();
-        let _reap_guard = reloaded_for_reap
-            .as_ref()
-            .map(ReapMonitorOnDrop::after_launch);
+        let _runners = crate::service::double::LaunchedRunners;
 
         result.unwrap();
 
@@ -6269,9 +6249,10 @@ mod tests {
         );
         assert!(!reloaded.stopped);
         assert_eq!(reloaded.stop_reason, None);
-        assert!(
-            reloaded.supervisor.is_some(),
-            "resume() must still relaunch and record a supervisor with no cap present"
+        assert_eq!(
+            crate::service::double::launched_units().len(),
+            1,
+            "resume launched the runner unit"
         );
     }
 
@@ -6301,15 +6282,16 @@ mod tests {
         workflow::save_state(&state).unwrap();
 
         let result = resume(root, phase, Some(AgentKind::Codex));
-        let reloaded_for_reap = workflow::load_state(root, phase).ok();
-        let _reap_guard = reloaded_for_reap
-            .as_ref()
-            .map(ReapMonitorOnDrop::after_launch);
+        let _runners = crate::service::double::LaunchedRunners;
         result.unwrap();
 
         let reloaded = workflow::load_state(root, phase).unwrap();
         assert_eq!(reloaded.agent, AgentKind::Codex);
-        assert!(reloaded.supervisor.is_some());
+        assert_eq!(
+            crate::service::double::launched_units().len(),
+            1,
+            "resume launched the runner unit"
+        );
         let events = std::fs::read_to_string(devflow_core::events::events_path(root)).unwrap();
         let handoff = events
             .lines()
@@ -6529,23 +6511,17 @@ mod tests {
         workflow::save_state(&state).unwrap();
         let mut before = serde_json::to_value(&state).unwrap();
         let result = resume(root, phase, Some(AgentKind::Codex));
-        let reloaded_for_reap = workflow::load_state(root, phase).ok();
-        let _reap_guard = reloaded_for_reap
-            .as_ref()
-            .map(ReapMonitorOnDrop::after_launch);
+        let _runners = crate::service::double::LaunchedRunners;
         result.unwrap();
         let mut after = serde_json::to_value(workflow::load_state(root, phase).unwrap()).unwrap();
 
-        // 48-07 (D-07): `checkpoint_approval` is the third field a handoff
-        // legitimately writes, and it is asserted BELOW rather than merely
+        // 48-07 (D-07): `checkpoint_approval` is asserted BELOW rather than merely
         // excluded — dropping a field from a tripwire without replacing its
         // coverage is how a whole-state check quietly stops checking.
         //
-        // The write is intended. A handoff re-enters `launch_stage` for the
-        // Code stage, which is a Code evaluation: the moment DevFlow looks at
-        // the plan files before handing them to an agent — here, a DIFFERENT
-        // agent than the one that stopped. Recording what it saw is the whole
-        // mechanism CHKPT-02 relies on.
+        // Since 52.2-06 `resume` launches the runner's unit and the runner's own Code
+        // launch records the set it saw (CHKPT-02), so `resume` itself leaves the field
+        // as the handoff found it.
         let approval_before = before
             .as_object_mut()
             .unwrap()
@@ -6563,13 +6539,11 @@ mod tests {
         );
         assert_eq!(
             approval_after,
-            serde_json::json!({ "recorded": [] }),
-            "the handoff's Code preflight must record the set it saw — this fixture has no \
-             plan files, so the set is legitimately empty"
+            serde_json::json!("pending"),
+            "resume writes no checkpoint approval: the runner's Code launch records it"
         );
 
-        // 50-11: the relaunch also records its ping-confirmed supervisor,
-        // asserted rather than merely excluded for the same reason.
+        // D-01: the relaunch is the runner's unit, which records no supervisor.
         let supervisor_before = before
             .as_object_mut()
             .unwrap()
@@ -6577,10 +6551,15 @@ mod tests {
             .unwrap();
         let supervisor_after = after.as_object_mut().unwrap().remove("supervisor").unwrap();
         assert_eq!(supervisor_before, serde_json::Value::Null);
-        assert!(
-            supervisor_after["socket_path"].is_string()
-                && supervisor_after["launch_id"].is_string(),
-            "the relaunch must record its published supervisor: {supervisor_after}"
+        assert_eq!(
+            supervisor_after,
+            serde_json::Value::Null,
+            "resume recorded a supervisor"
+        );
+        assert_eq!(
+            crate::service::double::launched_units().len(),
+            1,
+            "resume launched the runner unit"
         );
 
         for value in [&mut before, &mut after] {
@@ -6617,15 +6596,16 @@ mod tests {
         state.stop_reason = Some("rate limited".to_string());
         workflow::save_state(&state).unwrap();
         let result = resume(root, phase, Some(AgentKind::Codex));
-        let reloaded_for_reap = workflow::load_state(root, phase).ok();
-        let _reap_guard = reloaded_for_reap
-            .as_ref()
-            .map(ReapMonitorOnDrop::after_launch);
+        let _runners = crate::service::double::LaunchedRunners;
         result.unwrap();
         let reloaded = workflow::load_state(root, phase).unwrap();
         assert_eq!(reloaded.agent, AgentKind::Codex);
         assert!(!reloaded.stopped);
-        assert!(reloaded.supervisor.is_some());
+        assert_eq!(
+            crate::service::double::launched_units().len(),
+            1,
+            "resume launched the runner unit"
+        );
     }
 
     /// Run the test `name` in a hermetic child whose `PATH` holds `claude` and `codex`
@@ -6692,17 +6672,18 @@ mod tests {
         save_stopped_code_run(root, phase, Some(AgentKind::Codex), true);
 
         let result = resume_with_fallback(root, phase, None, Some(AgentKind::Codex));
-        let reloaded_for_reap = workflow::load_state(root, phase).ok();
-        let _reap_guard = reloaded_for_reap
-            .as_ref()
-            .map(ReapMonitorOnDrop::after_launch);
+        let _runners = crate::service::double::LaunchedRunners;
         result.unwrap();
 
         let reloaded = workflow::load_state(root, phase).unwrap();
         assert!(!reloaded.fallback_consumed, "the spent mark is cleared");
         assert_eq!(reloaded.fallback_agent, Some(AgentKind::Codex));
         assert!(!reloaded.stopped);
-        assert!(reloaded.supervisor.is_some(), "the run relaunched");
+        assert_eq!(
+            crate::service::double::launched_units().len(),
+            1,
+            "resume launched the runner unit"
+        );
     }
 
     /// D-01 (re-arm, supervisor gone): a run whose supervisor exited without
@@ -6754,23 +6735,17 @@ mod tests {
         );
 
         let result = resume_with_fallback(root, phase, None, Some(AgentKind::Codex));
-        let reloaded_for_reap = workflow::load_state(root, phase).ok();
-        let _reap_guard = reloaded_for_reap
-            .as_ref()
-            .filter(|state| {
-                state.supervisor.as_ref().map(|r| r.launch_id.as_str()) != Some(EXITED_LAUNCH)
-            })
-            .map(ReapMonitorOnDrop::after_launch);
+        let _runners = crate::service::double::LaunchedRunners;
         result.unwrap();
 
         let reloaded = workflow::load_state(root, phase).unwrap();
         assert!(!reloaded.fallback_consumed, "the spent mark is cleared");
         assert_eq!(reloaded.fallback_agent, Some(AgentKind::Codex));
         assert_eq!(reloaded.agent, AgentKind::Claude);
-        let relaunched = reloaded.supervisor.expect("the run relaunched");
-        assert_ne!(
-            relaunched.launch_id, EXITED_LAUNCH,
-            "a new supervisor replaced the exited one's record"
+        assert_eq!(
+            crate::service::double::launched_units().len(),
+            1,
+            "the run relaunched as the runner unit"
         );
     }
 
@@ -6788,16 +6763,17 @@ mod tests {
         save_stopped_code_run(root, phase, Some(AgentKind::Codex), true);
 
         let result = resume(root, phase, None);
-        let reloaded_for_reap = workflow::load_state(root, phase).ok();
-        let _reap_guard = reloaded_for_reap
-            .as_ref()
-            .map(ReapMonitorOnDrop::after_launch);
+        let _runners = crate::service::double::LaunchedRunners;
         result.unwrap();
 
         let reloaded = workflow::load_state(root, phase).unwrap();
         assert!(reloaded.fallback_consumed, "a plain resume does not re-arm");
         assert_eq!(reloaded.fallback_agent, Some(AgentKind::Codex));
-        assert!(reloaded.supervisor.is_some(), "the run relaunched");
+        assert_eq!(
+            crate::service::double::launched_units().len(),
+            1,
+            "resume launched the runner unit"
+        );
     }
 
     /// The notify command a refusal test saves, and the different one its child's
@@ -12482,9 +12458,9 @@ mod tests {
         );
         assert!(!run.state().gate_pending);
         assert_eq!(
-            stage_launched_count(&run.root, run.phase),
-            2,
-            "the rerun launched: {}",
+            crate::service::double::launched_units().len(),
+            1,
+            "the rerun launched as the runner unit: {}",
             run.events()
         );
     }
@@ -12507,7 +12483,9 @@ mod tests {
         assert_eq!(state.stage, Stage::Plan);
         kill_supervisor_until_stale(&run);
 
-        resume(&run.root, run.phase, None).unwrap();
+        let resumed = resume(&run.root, run.phase, None);
+        let _runners = crate::service::double::LaunchedRunners;
+        resumed.unwrap();
 
         assert_resume_reported_the_claimed_approval(&run, &gate);
         let removed = events_named(&run.root, "gate_claimed_answer_removed");
@@ -12541,7 +12519,9 @@ mod tests {
         );
         kill_supervisor_until_stale(&run);
 
-        resume(&run.root, run.phase, None).unwrap();
+        let resumed = resume(&run.root, run.phase, None);
+        let _runners = crate::service::double::LaunchedRunners;
+        resumed.unwrap();
 
         assert_resume_reported_the_claimed_approval(&run, &gate);
     }
@@ -13419,15 +13399,17 @@ mod tests {
         );
 
         let result = resume(&run.root, run.phase, None);
-        let after = run.state();
-        let _reap = ReapMonitorOnDrop::after_launch(&after);
+        let _runners = crate::service::double::LaunchedRunners;
         result.expect("an abandoned reservation blocks nothing");
-        let recorded = after.supervisor.expect("the resume's launch is recorded");
-        assert_ne!(recorded.launch_id, pending.launch_id);
-        assert_ne!(recorded.launch_id, run.n.launch_id);
+        let after = run.state();
+        assert_eq!(
+            crate::service::double::launched_units().len(),
+            1,
+            "the resume launched the runner unit"
+        );
         assert_eq!(
             after.pending_supervisor, None,
-            "the resume's own is promoted"
+            "the resume gave its own reservation back once the unit was launched"
         );
         assert!(
             !pending.liveness_path.exists(),
@@ -13937,12 +13919,12 @@ mod tests {
 
     /// Resume a stopped Code run of `phase` at `root` under Codex whose Code pass
     /// was entered with `fix`, and return the argv the spawned `codex` received
-    /// and a reaper for its monitor. Codex takes the prompt in argv.
+    /// and the guard that ends its runner. Codex takes the prompt in argv.
     fn resume_code_run(
         root: &Path,
         phase: PhaseId,
         fix: Option<prompt::FixType>,
-    ) -> (Vec<String>, ReapMonitorOnDrop) {
+    ) -> (Vec<String>, crate::service::double::LaunchedRunners) {
         resume_code_run_with_note(root, phase, fix, None)
     }
 
@@ -13953,7 +13935,7 @@ mod tests {
         phase: PhaseId,
         fix: Option<prompt::FixType>,
         note: Option<&str>,
-    ) -> (Vec<String>, ReapMonitorOnDrop) {
+    ) -> (Vec<String>, crate::service::double::LaunchedRunners) {
         init_repo(root);
         let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
         state.verification_baseline_captured = true;
@@ -13964,12 +13946,13 @@ mod tests {
         state.stop_reason = Some("rate limited".to_string());
         workflow::save_state(&state).unwrap();
 
+        crate::service::double::set_full_runner(true);
         let result = resume(root, phase, None);
-        let reloaded = workflow::load_state(root, phase).unwrap();
-        let reap = ReapMonitorOnDrop::after_launch(&reloaded);
+        let runners = crate::service::double::LaunchedRunners;
         result.unwrap();
+        let reloaded = workflow::load_state(root, phase).unwrap();
         assert_eq!(reloaded.code_fix, fix, "a resume keeps the fix pass");
-        (recorded_argv(root, "codex"), reap)
+        (recorded_argv(root, "codex"), runners)
     }
 
     /// D-09: a `devflow resume` in the middle of a gaps-only pass relaunches that pass, asserted on the argv the spawned
@@ -14026,14 +14009,14 @@ mod tests {
     /// Resume a stopped Codex run of `phase` at `root` at `stage`, with the
     /// gap-closure marker `gap_pass` and the fix pass `code_fix`, stopped as
     /// `devflow stop` leaves it. Returns the argv the spawned `codex` received,
-    /// the state on disk after the resume and a reaper for its monitor.
+    /// the state on disk after the resume and the guard that ends its runner.
     fn resume_gap_pass_run(
         root: &Path,
         phase: PhaseId,
         stage: Stage,
         gap_pass: bool,
         code_fix: Option<prompt::FixType>,
-    ) -> (Vec<String>, State, ReapMonitorOnDrop) {
+    ) -> (Vec<String>, State, crate::service::double::LaunchedRunners) {
         init_repo(root);
         let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
         state.verification_baseline_captured = true;
@@ -14044,11 +14027,12 @@ mod tests {
         state.stop_reason = Some("stopped by `devflow stop`".to_string());
         workflow::save_state(&state).unwrap();
 
+        crate::service::double::set_full_runner(true);
         let result = resume(root, phase, None);
-        let reloaded = workflow::load_state(root, phase).unwrap();
-        let reap = ReapMonitorOnDrop::after_launch(&reloaded);
+        let runners = crate::service::double::LaunchedRunners;
         result.unwrap();
-        (recorded_argv(root, "codex"), reloaded, reap)
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        (recorded_argv(root, "codex"), reloaded, runners)
     }
 
     /// Review C6 (GATE-03): a gaps Plan pass that was stopped and is resumed
@@ -15404,13 +15388,17 @@ mod tests {
         );
 
         let resumed = resume(&run.root, run.phase, None);
-        let state = run.state();
-        let _reap = ReapMonitorOnDrop::after_launch(&state);
+        let _runners = crate::service::double::LaunchedRunners;
         resumed.expect("resume clears the abandoned reservation and proceeds");
-        assert_ne!(
-            state.supervisor.as_ref().map(|r| r.launch_id.as_str()),
-            Some(run.n.launch_id.as_str()),
-            "resume launched a new supervisor"
+        assert_eq!(
+            crate::service::double::launched_units().len(),
+            1,
+            "resume launched the runner unit"
+        );
+        assert_eq!(
+            run.state().pending_supervisor,
+            None,
+            "resume cleared the abandoned reservation"
         );
     }
 
@@ -16828,10 +16816,6 @@ mod tests {
         .unwrap();
 
         let result = resume_loaded(root, phase, state, None, None);
-        let reloaded_for_reap = workflow::load_state(root, phase).ok();
-        let _reap_guard = reloaded_for_reap
-            .as_ref()
-            .map(ReapMonitorOnDrop::after_launch);
         result.unwrap();
 
         let after = workflow::load_state(root, phase).unwrap();
@@ -16843,7 +16827,10 @@ mod tests {
         assert!(!after.stopped);
         assert_eq!(after.stop_reason, None);
         assert_eq!(after.stop_until, None);
-        assert!(after.supervisor.is_some(), "the resume launched the stage");
+        assert!(
+            crate::service::double::launched_units().is_empty(),
+            "resume_loaded launches nothing: its caller launches the runner unit"
+        );
     }
 
     /// Whether `line` names `save_state` as a whole identifier: an occurrence with no
@@ -17482,19 +17469,12 @@ mod tests {
         let gone = sockets.path().join("gone.sock");
         save_rate_limit_paused(root, code_run_recording(root, baseline, &gone));
         let result = resume(root, baseline, None);
-        let reloaded_for_reap = workflow::load_state(root, baseline).ok();
-        let _reap_guard = reloaded_for_reap
-            .as_ref()
-            .map(ReapMonitorOnDrop::after_launch);
+        let _runners = crate::service::double::LaunchedRunners;
         result.unwrap_or_else(|err| panic!("baseline: a GONE recorded socket resumes: {err}"));
-        let reloaded = workflow::load_state(root, baseline).unwrap();
-        assert!(
-            reloaded
-                .supervisor
-                .as_ref()
-                .is_some_and(|record| record.socket_path != gone),
-            "baseline: the resume recorded its own supervisor: {:?}",
-            reloaded.supervisor
+        assert_eq!(
+            crate::service::double::launched_units().len(),
+            1,
+            "baseline: the resume launched the runner unit"
         );
     }
 
@@ -18778,27 +18758,21 @@ mod tests {
         workflow::save_state(&state).unwrap();
     }
 
-    /// The baseline: `resume` of the paused run `state` builds at `phase` launches and
-    /// records its own supervisor (reaped on drop).
+    /// The baseline: `resume` of the paused run `state` builds at `phase` launches the
+    /// runner's unit (ended on drop).
     fn resume_launches(phase: PhaseId, state: impl FnOnce(&Path) -> State, recorded: &Path) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let state = state(root);
         save_rate_limit_paused(root, state);
         let result = resume(root, phase, None);
-        let reloaded_for_reap = workflow::load_state(root, phase).ok();
-        let _reap_guard = reloaded_for_reap
-            .as_ref()
-            .map(ReapMonitorOnDrop::after_launch);
+        let _runners = crate::service::double::LaunchedRunners;
         result.unwrap_or_else(|err| panic!("baseline phase {phase}: resume refused: {err}"));
-        let reloaded = workflow::load_state(root, phase).unwrap();
-        assert!(
-            reloaded
-                .supervisor
-                .as_ref()
-                .is_some_and(|record| record.socket_path != recorded),
-            "baseline phase {phase}: the resume recorded its own supervisor: {:?}",
-            reloaded.supervisor
+        assert_eq!(
+            crate::service::double::launched_units().len(),
+            1,
+            "baseline phase {phase}: the resume launched the runner unit (recorded socket {})",
+            recorded.display()
         );
     }
 
@@ -19081,18 +19055,15 @@ mod tests {
                 state.stop_reason = Some("stopped by devflow stop".to_string());
                 workflow::save_state(&state).unwrap();
             }
+            // The resumed stage's denial and gate happen in the runner the resume launches.
+            crate::service::double::set_full_runner(true);
             let result = resume(root, phase, None);
-            let reloaded_for_reap = workflow::load_state(root, phase).ok();
-            let _reap_guard = reloaded_for_reap
-                .as_ref()
-                .map(ReapMonitorOnDrop::after_launch);
+            let _runners = crate::service::double::LaunchedRunners;
             result.unwrap();
             if used {
                 assert_waits_with_no_timer(root, phase, 1, &row);
             } else {
                 assert_the_timer_answers(root, &row);
-                let relaunched = workflow::load_state(root, phase).ok();
-                let _relaunch_reap = relaunched.as_ref().map(ReapMonitorOnDrop::after_launch);
             }
         }
     }
@@ -19652,6 +19623,43 @@ mod tests {
                     .map(move |name| format!("{file}: {name}"))
             })
             .collect()
+    }
+
+    /// D-01, D-02: the runner has one production entry point, the `__runner` verb's arm
+    /// in main.rs. `exactly_one_call_site_runs_a_stage` stays at one even if `start` ran
+    /// the runner in-process, which this scan rules out. Control: a planted second call
+    /// is listed.
+    #[test]
+    fn run_runner_has_one_caller_the_runner_verb() {
+        let planted = "fn run() {\n    match cli.command {\n        Command::Runner { project, phase } \
+                       => run_runner(&root, phase),\n    }\n}\n\
+                       pub(crate) fn start(\n    root: &Path,\n) {\n    let _ = \
+                       crate::pipeline_launch::run_runner(root, phase);\n}\n\
+                       // run_runner(commented)\nmod tests {\n    run_runner(x);\n}\n";
+        assert_eq!(
+            call_sites(planted, "run_runner("),
+            ["run", "start"],
+            "planted control: a second run_runner( call is listed"
+        );
+        assert_eq!(
+            cli_call_sites("run_runner("),
+            ["main.rs: run"],
+            "production run_runner( sites"
+        );
+        let main = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+            .expect("read main.rs");
+        let arm = main
+            .find("Command::Runner {")
+            .and_then(|at| main[at..].find("run_runner(").map(|call| at + call))
+            .expect("main.rs's Command::Runner arm calls run_runner(");
+        let next_arm = main[main.find("Command::Runner {").unwrap()..]
+            .find("Command::Resume {")
+            .map(|at| at + main.find("Command::Runner {").unwrap())
+            .expect("an arm after Command::Runner");
+        assert!(
+            arm < next_arm,
+            "the one run_runner( call is not inside main.rs's Command::Runner arm"
+        );
     }
 
     /// T-52.2-05, T-52.2-67 (MemPalace T-50.1-97): exactly one production call site runs

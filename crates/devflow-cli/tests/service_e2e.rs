@@ -646,3 +646,111 @@ fn start_with_a_runner_path_that_no_longer_exists_fails_naming_the_unit_and_the_
     let _ = &fixture.logs;
 }
 
+/// Run `devflow <args>` in `fixture`'s root under the real user manager, with the
+/// stubs first on `PATH`.
+fn devflow_in(fixture: &StartFixture, args: &[&str]) -> Output {
+    common::host_service_devflow(&fixture.home)
+        .env("PATH", fixture.path(None))
+        .args(args)
+        .current_dir(&fixture.root)
+        .output()
+        .expect("run devflow")
+}
+
+/// Wait until `ready` holds, at most [`UNIT_FINISH_WAIT`], panicking with `what` and
+/// `unit`'s journal otherwise.
+fn wait_until(mut ready: impl FnMut() -> bool, unit: &str, what: &str) {
+    let deadline = Instant::now() + UNIT_FINISH_WAIT;
+    while !ready() {
+        assert!(
+            Instant::now() < deadline,
+            "{what} after {UNIT_FINISH_WAIT:?}\njournal:\n{}",
+            journal_of(unit)
+        );
+        std::thread::sleep(UNIT_POLL);
+    }
+}
+
+/// D-01, D-05: a run stopped with `systemctl --user stop` records stopped; `devflow
+/// resume` launches it as a new unit, which runs Plan, Code and Validate and finishes
+/// once the Validate gate is approved.
+#[test]
+#[ignore = "needs a systemd user manager; run by scripts/check.sh service"]
+fn a_stopped_run_resumes_as_a_unit_and_finishes() {
+    assert_manager_answers();
+    let release = tempfile::tempdir().unwrap();
+    let released = release.path().join("released");
+    let tail = format!(
+        "if [ -e '{released}' ]; then\n\
+         git commit -q --allow-empty -m \"stub stage work\"\n\
+         printf 'DEVFLOW_RESULT: {{\"status\":\"success\",\"commits\":1,\"verdict\":\"pass\"}}\\n'\n\
+         else sleep 120; fi",
+        released = released.display()
+    );
+    let phase = PhaseId::new(84);
+    let fixture = StartFixture::new(phase, &tail);
+    let passed =
+        devflow_core::test_support::gsd_status_json(devflow_core::gsd_reader::GsdStatus::Passed);
+    let gsd_logs = tempfile::tempdir().unwrap();
+    common::stub_gsd_run(&fixture.home, &[passed; 16], gsd_logs.path());
+    let guard = UnitGuard::named(fixture.unit());
+
+    let out = fixture.start(
+        common::host_service_devflow(&fixture.home),
+        &fixture.path(None),
+    );
+    assert!(out.status.success(), "start failed:\n{}", text(&out));
+    let argv_log = fixture.logs.path().join(common::AGENT_ARGV_LOG);
+    wait_until(
+        || argv_log.is_file(),
+        &guard.unit,
+        "the Plan agent never started",
+    );
+    let stopped = systemctl(&["stop", &guard.unit]);
+    assert!(
+        stopped.status.success(),
+        "systemctl stop failed: {}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    let state = devflow_core::workflow::load_state(&fixture.root, phase).unwrap();
+    assert!(
+        state.stopped && !state.finished,
+        "the stopped unit did not record stopped: {state:?}\njournal:\n{}",
+        journal_of(&guard.unit)
+    );
+
+    fs::write(&released, "").unwrap();
+    let number = phase.to_string();
+    let root = fixture.root.display().to_string();
+    let resumed = devflow_in(&fixture, &["resume", "--phase", &number, &root]);
+    assert!(
+        resumed.status.success() && String::from_utf8_lossy(&resumed.stdout).contains(&guard.unit),
+        "resume did not launch a unit:\n{}",
+        text(&resumed)
+    );
+    let gate = devflow_core::gates::Gates::gate_path(&fixture.root, phase, Stage::Validate);
+    wait_until(
+        || gate.exists(),
+        &guard.unit,
+        "resumed run did not finish: no Validate gate",
+    );
+    let approved = devflow_in(&fixture, &["gate", "approve", &number, "--project", &root]);
+    assert!(
+        approved.status.success(),
+        "gate approve failed:\n{}",
+        text(&approved)
+    );
+    if let Err(state) = wait_inactive(&guard.unit) {
+        panic!(
+            "resumed run did not finish: unit still {state}\njournal:\n{}",
+            journal_of(&guard.unit)
+        );
+    }
+    let state = devflow_core::workflow::load_state(&fixture.root, phase).unwrap();
+    assert!(
+        state.finished,
+        "resumed run did not finish: {state:?}\njournal:\n{}",
+        journal_of(&guard.unit)
+    );
+}
+
