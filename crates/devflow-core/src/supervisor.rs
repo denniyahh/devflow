@@ -121,8 +121,7 @@ impl SocketPath {
     }
 }
 
-/// [`crate::liveness`]'s launch-id check, at its old path, for importers not yet repointed.
-pub(crate) use crate::liveness::is_launch_id;
+use crate::liveness::is_launch_id;
 /// The launch-id and boot-id helpers, at the path they had before they moved to
 /// [`crate::liveness`]. Kept until this module is removed.
 pub use crate::liveness::{boot_id, new_launch_id};

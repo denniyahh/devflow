@@ -41,7 +41,7 @@ use devflow_core::phase_id::PhaseId;
 use devflow_core::prompt;
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, ApprovedCheckpoint, CheckpointApproval, State};
-use devflow_core::supervisor::runtime::{
+use devflow_core::stop::{
     AgentOutcome, OwnerPhase, STOPPED_EXIT_CODE, SafePoint, StopSource, StopToken,
 };
 use devflow_core::verify::CheckpointDeclaration;
@@ -1328,7 +1328,7 @@ fn launch_label(launch: &monitor::MonitorLaunch) -> &'static str {
 /// and flags a stop the advance's safe points and gate wait read. The run then records
 /// `stopped` and returns [`STOPPED_EXIT_CODE`] ([`settle_advance`]).
 pub(crate) fn run_runner(project_root: &Path, phase: PhaseId) -> Result<i32, CliError> {
-    devflow_core::supervisor::runtime::install_signal_pipe().map_err(|err| {
+    devflow_core::stop::install_signal_pipe().map_err(|err| {
         CliError::Message(format!(
             "the runner could not install its stop handling: {err}"
         ))
@@ -1337,12 +1337,11 @@ pub(crate) fn run_runner(project_root: &Path, phase: PhaseId) -> Result<i32, Cli
         .map_err(|err| CliError::Message(format!("phase {phase}: {err}")))?;
     let token = StopToken::for_run();
     // The signal pipe's only reader, from before READY until this returns.
-    let _signals = devflow_core::supervisor::runtime::spawn_signal_dispatcher(token.clone())
-        .map_err(|err| {
-            CliError::Message(format!(
-                "the runner could not start its signal dispatcher: {err}"
-            ))
-        })?;
+    let _signals = devflow_core::stop::spawn_signal_dispatcher(token.clone()).map_err(|err| {
+        CliError::Message(format!(
+            "the runner could not start its signal dispatcher: {err}"
+        ))
+    })?;
     crate::service::notify_ready().map_err(|err| {
         CliError::Message(format!(
             "the runner could not report ready to systemd: {err}"
@@ -1705,7 +1704,7 @@ fn runner_stage_spec(launch: StageLaunch) -> Result<monitor::StageSpec, CliError
         monitor::MonitorLaunch::Legacy => monitor::StageIo::Capture,
     };
     let ctx = launch_context()?;
-    let launch_id = devflow_core::supervisor::new_launch_id();
+    let launch_id = devflow_core::liveness::new_launch_id();
     let socket = devflow_core::supervisor::SocketPath::for_launch(
         &ctx.cache_dir,
         &state.project_root,

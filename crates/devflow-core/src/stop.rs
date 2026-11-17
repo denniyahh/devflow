@@ -16,7 +16,7 @@
 //! and turns each byte into [`StopToken::request_stop`].
 //!
 //! **Waiting.** The agent's exit is observed with `waitid(WNOWAIT)`
-//! ([`wait_for_exit_without_reaping`]), which does not reap, so the zombie leader
+//! (`wait_for_exit_without_reaping`), which does not reap, so the zombie leader
 //! still holds the agent's process group while leftover members are killed. Only then
 //! is it reaped.
 
@@ -73,7 +73,7 @@ pub enum StopSource {
     Ownership,
 }
 
-/// What ending the agent's process group did ([`end_group_while_running`]).
+/// What ending the agent's process group did (`end_group_while_running`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AgentGroupEnd {

@@ -469,7 +469,7 @@ pub fn claim_runner_lock(project_root: &Path, phase: PhaseId) -> Result<Hold, Ru
 /// [`holder_stop_signal`].
 ///
 /// It installs the process's one SIGTERM/SIGINT handler,
-/// [`crate::supervisor::runtime::install_signal_pipe`], so a holder and a supervisor or
+/// [`crate::stop::install_signal_pipe`], so a holder and a supervisor or
 /// runner in one process never replace each other's handler. No signal is blocked,
 /// because a blocked mask would be inherited by every child. A caught signal goes back to
 /// its default at exec, so the supervisors, agents and hooks a holder spawns are

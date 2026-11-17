@@ -19,8 +19,9 @@ use crate::git::hermetic_command;
 use crate::phase_id::PhaseId;
 use crate::stage::Stage;
 use crate::state::{AgentKind, State};
+use crate::stop::{AgentGroupEnd, AgentOutcome};
 use crate::supervisor::SocketPath;
-use crate::supervisor::runtime::{AgentGroupEnd, AgentOutcome, Supervisor};
+use crate::supervisor::runtime::Supervisor;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -446,7 +447,7 @@ impl Reservation {
         project_root: &Path,
         phase: PhaseId,
     ) -> Result<Self, MonitorError> {
-        let launch_id = crate::supervisor::new_launch_id();
+        let launch_id = crate::liveness::new_launch_id();
         let socket = SocketPath::for_launch(&ctx.cache_dir, project_root, phase, &launch_id)?;
         let path = liveness_path_of(project_root, &launch_id)?;
         let failed = |err: std::io::Error| liveness_error(&launch_id, err);
@@ -1380,7 +1381,7 @@ fn drive_stream_io(
     let watch_tx = event_tx;
     let agent_pid = child.id();
     let exit_watch = std::thread::spawn(move || {
-        if let Err(err) = crate::supervisor::runtime::wait_for_exit_without_reaping(agent_pid) {
+        if let Err(err) = crate::stop::wait_for_exit_without_reaping(agent_pid) {
             debug!("exit watch on agent {agent_pid} ended with {err}; treating it as exited");
         }
         let _ = watch_tx.send(StreamEvent::AgentExited);
@@ -1653,7 +1654,7 @@ const RECORDED_WARN_INTERVAL: Duration = Duration::from_secs(60);
 /// supervision shape, and return once the agent has exited.
 ///
 /// The order is the contract:
-/// 1. [`install_signal_pipe`](crate::supervisor::runtime::install_signal_pipe),
+/// 1. [`install_signal_pipe`](crate::stop::install_signal_pipe),
 ///    so SIGTERM and SIGINT to this process become stop events, never a
 ///    death that orphans the agent (D-05, 999.134). Then adopt the inherited
 ///    liveness descriptor ([`StageSpec::liveness_fd`]), which marks it
@@ -1724,7 +1725,7 @@ const RECORDED_WARN_INTERVAL: Duration = Duration::from_secs(60);
 /// advances only on [`AgentOutcome::Completed`] with [`Promotion::Recorded`] when a
 /// watch ran.
 pub fn run_supervised_stage(spec: StageSpec) -> Result<StageRun, MonitorError> {
-    crate::supervisor::runtime::install_signal_pipe()?;
+    crate::stop::install_signal_pipe()?;
     let liveness = adopt_liveness(&spec)?;
     #[cfg(any(test, feature = "test-support"))]
     agent_spawn_test_hold(&spec);
@@ -1747,9 +1748,9 @@ pub fn run_supervised_stage(spec: StageSpec) -> Result<StageRun, MonitorError> {
 /// exists only because a supervisor is its own process: no liveness adoption, no agent
 /// pid file, no sidecar, no socket and no promotion watch. The caller installs the
 /// signal handling and owns `token` across stages. Once the agent leads its own group,
-/// [`StopToken::begin_agent`](crate::supervisor::runtime::StopToken::begin_agent)
+/// [`StopToken::begin_agent`](crate::stop::StopToken::begin_agent)
 /// re-arms the token for it (the run enters
-/// [`OwnerPhase::AgentRunning`](crate::supervisor::runtime::OwnerPhase::AgentRunning)),
+/// [`OwnerPhase::AgentRunning`](crate::stop::OwnerPhase::AgentRunning)),
 /// and a stop already requested ends the new group at once; the run leaves that phase
 /// as the exit decides.
 ///
@@ -1758,7 +1759,7 @@ pub fn run_supervised_stage(spec: StageSpec) -> Result<StageRun, MonitorError> {
 /// be written.
 pub fn run_stage(
     spec: StageSpec,
-    token: &crate::supervisor::runtime::StopToken,
+    token: &crate::stop::StopToken,
 ) -> Result<AgentOutcome, MonitorError> {
     run_stage_agent(&spec, Some(token)).map(|end| end.outcome)
 }
@@ -1778,7 +1779,7 @@ struct StageEnd {
 /// it does none of those and waits for the agent under that token.
 fn run_stage_agent(
     spec: &StageSpec,
-    runner: Option<&crate::supervisor::runtime::StopToken>,
+    runner: Option<&crate::stop::StopToken>,
 ) -> Result<StageEnd, MonitorError> {
     let stdout_file = crate::agent_result::stdout_path(&spec.project_root, spec.phase);
     let exit_file = crate::agent_result::exit_code_path(&spec.project_root, spec.phase);
@@ -1802,7 +1803,7 @@ fn run_stage_agent(
             // One token spans the whole run: re-arm it for this stage's agent. A stop
             // that arrived while the stage was launched ends the new group at once.
             if token.begin_agent(pid) {
-                crate::supervisor::runtime::end_group_while_running(token, pid);
+                crate::stop::end_group_while_running(token, pid);
             }
             (None, None, token.clone())
         }
@@ -1850,7 +1851,7 @@ fn run_stage_agent(
 
     let waited = match &supervisor {
         Some(supervisor) => supervisor.wait_agent(&mut child),
-        None => crate::supervisor::runtime::wait_owned_agent(&token, pid, &mut child),
+        None => crate::stop::wait_owned_agent(&token, pid, &mut child),
     };
     let outcome = match waited {
         Ok(outcome) => outcome,
@@ -1862,7 +1863,7 @@ fn run_stage_agent(
     };
     let code = match outcome {
         AgentOutcome::Completed(code) => code,
-        AgentOutcome::Stopped => crate::supervisor::runtime::STOPPED_EXIT_CODE,
+        AgentOutcome::Stopped => crate::stop::STOPPED_EXIT_CODE,
     };
     // The verdict comes first: a supervisor the state does not record leaves the file to
     // whichever run does (D-03).
@@ -1909,7 +1910,7 @@ impl PromotionWatch {
     fn start(
         spec: &StageSpec,
         wait: Duration,
-        token: crate::supervisor::runtime::StopToken,
+        token: crate::stop::StopToken,
         pgid: u32,
     ) -> Result<Self, std::io::Error> {
         let quit = Arc::new(AtomicBool::new(false));
@@ -1937,9 +1938,9 @@ impl PromotionWatch {
                 // The leader is unreaped while the agent runs, so this reaches only its
                 // group (R-13). A verdict reached after the agent exited signals nothing.
                 let group_end = match promotion {
-                    Some(Promotion::Superseded { .. } | Promotion::OrphanedPending) => Some(
-                        crate::supervisor::runtime::end_group_while_running(&token, pgid),
-                    ),
+                    Some(Promotion::Superseded { .. } | Promotion::OrphanedPending) => {
+                        Some(crate::stop::end_group_while_running(&token, pgid))
+                    }
                     _ => None,
                 };
                 (promotion, group_end)
@@ -1953,7 +1954,7 @@ impl PromotionWatch {
     /// The watch's result once it has one. A stop tells a watch without a verdict to quit.
     /// A watch past `Recorded` has already ended, or ends within one [`PROMOTION_POLL`]: it
     /// ends at the exit [`Supervisor::wait_agent`] observed before this is called.
-    fn finish(mut self, token: &crate::supervisor::runtime::StopToken) -> PromotionEnd {
+    fn finish(mut self, token: &crate::stop::StopToken) -> PromotionEnd {
         let Some(thread) = self.thread.take() else {
             return (None, None);
         };
@@ -2025,15 +2026,13 @@ fn watch_recorded(
     project_root: &Path,
     phase: PhaseId,
     launch_id: &str,
-    token: &crate::supervisor::runtime::StopToken,
+    token: &crate::stop::StopToken,
     quit: &AtomicBool,
 ) -> Promotion {
     let mut next_read = std::time::Instant::now() + RECORDED_READ_INTERVAL;
     let mut last_warned = None;
     let mut absent_since = None;
-    while !quit.load(Ordering::Acquire)
-        && token.phase() == crate::supervisor::runtime::OwnerPhase::AgentRunning
-    {
+    while !quit.load(Ordering::Acquire) && token.phase() == crate::stop::OwnerPhase::AgentRunning {
         let now = std::time::Instant::now();
         if now >= next_read {
             next_read = now + RECORDED_READ_INTERVAL;
@@ -2190,7 +2189,7 @@ const STREAM_WAIT_HOLD_WAIT: Duration = Duration::from_secs(60);
 /// together with its one call; a release build compiles neither (pinned by
 /// `monitor::tests::the_stream_wait_hold_is_test_only_and_read_literally`).
 #[cfg(any(test, feature = "test-support"))]
-fn stream_wait_test_hold(token: &crate::supervisor::runtime::StopToken) {
+fn stream_wait_test_hold(token: &crate::stop::StopToken) {
     let Some(release) = std::env::var_os("DEVFLOW_TEST_STREAM_WAIT_HOLD") else {
         return;
     };
@@ -2339,7 +2338,7 @@ fn stage_sidecar(spec: &StageSpec, agent_pid: u32) -> crate::supervisor::Sidecar
         agent_pid,
         agent_pgid: agent_pid,
         agent_start_time: crate::agent::process_start_time(agent_pid).unwrap_or(0),
-        boot_id: crate::supervisor::boot_id().unwrap_or_default(),
+        boot_id: crate::liveness::boot_id().unwrap_or_default(),
         supervisor_pid,
         supervisor_start_time: crate::agent::process_start_time(supervisor_pid).unwrap_or(0),
         created_at: crate::supervisor::rfc3339_now(),
@@ -4860,7 +4859,7 @@ kill -9 $$
         let threads = drive_stream_io(&mut child, capture, agent, prompt, idle_timeout, || {
             fire_idle_timeout(project_root, phase, workdir, pid, idle_timeout);
         })?;
-        let code = crate::supervisor::runtime::exit_code(child.wait()?);
+        let code = crate::stop::exit_code(child.wait()?);
         std::fs::write(
             crate::agent_result::exit_code_path(project_root, phase),
             format!("{code}\n"),
@@ -6129,7 +6128,7 @@ exit 0
             fixture.cache.path(),
             &fixture.root,
             STAGE_PHASE,
-            &crate::supervisor::new_launch_id(),
+            &crate::liveness::new_launch_id(),
         )
         .expect("socket path fits sun_path");
         let outcome = fixture.path("outcome");
@@ -7157,7 +7156,7 @@ exit 0
             fixture.cache.path(),
             &fixture.root,
             STAGE_PHASE,
-            &crate::supervisor::new_launch_id(),
+            &crate::liveness::new_launch_id(),
         )
         .expect("socket path fits sun_path");
         let mut spec = StageSpec::new(
@@ -7386,7 +7385,7 @@ exit 0
     fn a_liveness_descriptor_that_cannot_be_adopted_ends_the_stage_before_any_agent() {
         if crate::test_support::in_child_test(CLOSED_FD_TEST) {
             let (result, agent_ran) =
-                supervise_with_liveness(&crate::supervisor::new_launch_id(), -1);
+                supervise_with_liveness(&crate::liveness::new_launch_id(), -1);
             assert!(
                 matches!(&result, Err(MonitorError::Liveness { .. })),
                 "got {result:?}"
@@ -7729,7 +7728,7 @@ exit 0
         let bad_cache = fixture.path("bad-cache");
         std::fs::create_dir(&bad_cache).expect("create the bad cache dir");
         std::os::unix::fs::symlink(&elsewhere, bad_cache.join("sock")).expect("plant sock/");
-        let launch_id = crate::supervisor::new_launch_id();
+        let launch_id = crate::liveness::new_launch_id();
         let socket = SocketPath::for_launch(&bad_cache, &fixture.root, STAGE_PHASE, &launch_id)
             .expect("socket path fits sun_path");
         let log = fixture.path("fail.log");
@@ -7759,7 +7758,7 @@ exit 0
         // Control: a plain cache dir publishes, and the helper returns the
         // reply and leaves the supervisor and its agent running.
         let fixture = StageFixture::new();
-        let launch_id = crate::supervisor::new_launch_id();
+        let launch_id = crate::liveness::new_launch_id();
         let socket =
             SocketPath::for_launch(fixture.cache.path(), &fixture.root, STAGE_PHASE, &launch_id)
                 .expect("socket path fits sun_path");
@@ -7886,7 +7885,7 @@ exit 0
         fixture: &StageFixture,
         tamper: impl FnOnce(&SocketPath, &crate::supervisor::Sidecar),
     ) -> KilledRun {
-        let launch_id = crate::supervisor::new_launch_id();
+        let launch_id = crate::liveness::new_launch_id();
         let socket =
             SocketPath::for_launch(fixture.cache.path(), &fixture.root, STAGE_PHASE, &launch_id)
                 .expect("socket path fits sun_path");
