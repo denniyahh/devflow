@@ -131,14 +131,26 @@ impl ManagerUnavailable {
     /// for [`ManagerUnavailableKind::Absent`], else the refusal's reason. Each carries
     /// systemctl's stderr (agy-6).
     pub(crate) fn describe(&self, phase: PhaseId) -> String {
+        match self.kind {
+            ManagerUnavailableKind::Absent => format!(
+                "note: {}; phase {phase} checked by its runner lock only",
+                self.reason()
+            ),
+            ManagerUnavailableKind::Unreachable | ManagerUnavailableKind::Failed => self.reason(),
+        }
+    }
+
+    /// Why no manager answered, systemctl's stderr included (agy-6): what [`Self::describe`]
+    /// prints, without the Absent note's runner-lock-only part.
+    pub(crate) fn reason(&self) -> String {
         let runtime = self
             .runtime_dir
             .as_deref()
             .map(|dir| Path::new(dir).display().to_string());
         match self.kind {
             ManagerUnavailableKind::Absent => format!(
-                "note: no systemd user manager runs for this user (no {}/systemd/private; \
-                 systemctl: {}); phase {phase} checked by its runner lock only",
+                "no systemd user manager runs for this user (no {}/systemd/private; \
+                 systemctl: {})",
                 runtime.unwrap_or_default(),
                 self.stderr
             ),
@@ -320,6 +332,10 @@ pub(crate) mod double {
         unit_state: Result<String, String>,
         /// How many times the unit was read.
         unit_reads: usize,
+        /// Whether a launch runs the whole runner rather than an idle lock holder.
+        full_runner: bool,
+        /// Every runner launch on this thread: the unit and its runner child.
+        launches: Vec<(String, std::process::Child)>,
     }
 
     thread_local! {
@@ -327,7 +343,82 @@ pub(crate) mod double {
             manager: Ok(()),
             unit_state: Ok("inactive".to_string()),
             unit_reads: 0,
+            full_runner: false,
+            launches: Vec::new(),
         });
+    }
+
+    /// Make later launches on this thread run the whole runner (`true`), or only hold
+    /// the runner lock (`false`, the default).
+    pub(crate) fn set_full_runner(full: bool) {
+        DOUBLE.with_borrow_mut(|double| double.full_runner = full);
+    }
+
+    pub(super) fn full_runner() -> bool {
+        DOUBLE.with_borrow(|double| double.full_runner)
+    }
+
+    pub(super) fn record_launch(unit: &str, child: std::process::Child) {
+        DOUBLE.with_borrow_mut(|double| double.launches.push((unit.to_string(), child)));
+    }
+
+    /// The units launched on this thread, in order.
+    pub(crate) fn launched_units() -> Vec<String> {
+        DOUBLE.with_borrow(|double| {
+            double
+                .launches
+                .iter()
+                .map(|(unit, _)| unit.clone())
+                .collect()
+        })
+    }
+
+    /// Whether the launched runner child `pid` has not exited (reaping it if it has).
+    pub(super) fn runner_running(pid: u32) -> bool {
+        DOUBLE.with_borrow_mut(|double| {
+            double
+                .launches
+                .iter_mut()
+                .find(|(_, child)| child.id() == pid)
+                .is_some_and(|(_, child)| matches!(child.try_wait(), Ok(None)))
+        })
+    }
+
+    /// End every runner child launched on this thread for `unit` (every unit when
+    /// `None`): SIGTERM, a bounded wait for its exit, then SIGKILL, then reap.
+    pub(crate) fn end_runners(unit: Option<&str>, wait: std::time::Duration) {
+        DOUBLE.with_borrow_mut(|double| {
+            for (launched, child) in &mut double.launches {
+                if unit.is_some_and(|unit| unit != launched) {
+                    continue;
+                }
+                if !matches!(child.try_wait(), Ok(None)) {
+                    continue;
+                }
+                if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+                    // SAFETY: `pid` is this thread's own unreaped child.
+                    unsafe { libc::kill(pid, libc::SIGTERM) };
+                }
+                let deadline = std::time::Instant::now() + wait;
+                while matches!(child.try_wait(), Ok(None)) && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                if matches!(child.try_wait(), Ok(None)) {
+                    let _ = child.kill();
+                }
+                let _ = child.wait();
+            }
+        });
+    }
+
+    /// Ends this thread's launched runners when dropped. Bind it after the test's
+    /// tempdirs, so it drops first and no runner writes under a removed root.
+    pub(crate) struct LaunchedRunners;
+
+    impl Drop for LaunchedRunners {
+        fn drop(&mut self) {
+            end_runners(None, super::TIMEOUT_STOP_SEC);
+        }
     }
 
     /// Make the manager on this thread answer (`None`) or not, sorted as `kind`.
@@ -396,13 +487,6 @@ fn is_valid_env_name(name: &str) -> bool {
 /// (`^[A-Za-z_][A-Za-z0-9_]*$`) except [`MANAGER_OWNED_ENV`]. A name it would refuse
 /// (bash's exported `BASH_FUNC_x%%`, a non-UTF-8 name) is dropped, since one such name
 /// fails the whole `systemd-run`.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "`start` launches the runner unit from plan 52.2-06"
-    )
-)]
 pub(crate) fn passable_env_names(names: impl IntoIterator<Item = OsString>) -> Vec<String> {
     let mut passable: Vec<String> = names
         .into_iter()
@@ -421,13 +505,6 @@ pub(crate) fn passable_env_names(names: impl IntoIterator<Item = OsString>) -> V
 ///
 /// # Errors
 /// The project root cannot be canonicalised.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "`start` launches the runner unit from plan 52.2-06"
-    )
-)]
 pub(crate) fn runner_unit_argv(
     project_root: &Path,
     phase: PhaseId,
@@ -468,6 +545,166 @@ pub(crate) fn runner_unit_argv(
     Ok(argv)
 }
 
+/// How long the cfg(test) [`launch_runner_unit`] waits for its runner child to hold
+/// the runner lock: the unit's `TimeoutStartSec`.
+#[cfg(test)]
+const TEST_RUNNER_READY_WAIT: Duration = Duration::from_secs(30);
+
+/// Launch `devflow __runner` for `phase` of `project_root` as the phase's user unit
+/// (D-01): [`runner_unit_argv`] with every [`passable_env_names`] name of this
+/// process's environment, run by `systemd-run`, which under `Type=notify` returns once
+/// the runner holds its lock and reports ready, or once the start failed (D-04a).
+///
+/// # Errors
+/// The unit name, the executable or the argv could not be built, `systemd-run` could
+/// not run, or it exited non-zero: text naming the unit and carrying systemd-run's
+/// stderr.
+#[cfg(not(test))]
+pub(crate) fn launch_runner_unit(project_root: &Path, phase: PhaseId) -> Result<String, String> {
+    let unit = unit_name(project_root, phase)
+        .map_err(|error| format!("phase {phase}'s unit name could not be derived ({error})"))?;
+    let exe = std::env::current_exe().map_err(|error| {
+        format!("unit {unit}: the devflow executable could not be resolved ({error})")
+    })?;
+    let names = passable_env_names(std::env::vars_os().map(|(name, _)| name));
+    let argv = runner_unit_argv(project_root, phase, &exe, &names).map_err(|error| {
+        format!("unit {unit}: the systemd-run argv could not be built ({error})")
+    })?;
+    let output = tool("systemd-run")
+        .args(argv)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("unit {unit}: systemd-run could not run ({error})"))?;
+    if output.status.success() {
+        return Ok(unit);
+    }
+    Err(format!(
+        "systemd-run could not start unit {unit} ({}); systemd-run: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
+}
+
+/// The variable the cfg(test) [`launch_runner_unit`] passes its runner child the
+/// project root and phase in, as a JSON `[root, phase]` pair.
+#[cfg(test)]
+const RUNNER_HARNESS_ARGS_ENV: &str = "DF_TEST_RUNNER_ARGS";
+
+/// `1` on the runner child when [`double::set_full_runner`] asked for the whole runner.
+#[cfg(test)]
+const RUNNER_HARNESS_FULL_ENV: &str = "DF_TEST_RUNNER_FULL";
+
+/// The libtest name of the runner harness entry the cfg(test) launch runs.
+#[cfg(test)]
+pub(crate) const RUNNER_HARNESS_ENTRY: &str = "service::tests::runner_harness::entry";
+
+/// The cfg(test) build (D-07b): run [`RUNNER_HARNESS_ENTRY`] as a direct child with no
+/// `systemd-run`, record the launch and the child in the [`double`], and wait, as
+/// `Type=notify` does, until the runner lock names the child. By default the child takes
+/// the runner lock and runs no stage, as a unit whose runner has just started, so a test
+/// reads what the launching verb wrote with nothing racing it; after
+/// [`double::set_full_runner`] it runs `run_runner`. The child gets SIGTERM if the
+/// launching thread exits first.
+///
+/// # Errors
+/// The child could not be spawned, it exited before it held the lock, or it did not
+/// hold it within [`TEST_RUNNER_READY_WAIT`].
+#[cfg(test)]
+pub(crate) fn launch_runner_unit(project_root: &Path, phase: PhaseId) -> Result<String, String> {
+    use std::os::unix::process::CommandExt as _;
+    let unit = unit_name(project_root, phase)
+        .map_err(|error| format!("phase {phase}'s unit name could not be derived ({error})"))?;
+    let root = project_root
+        .canonicalize()
+        .map_err(|error| format!("unit {unit}: {error}"))?;
+    let exe = std::env::current_exe().map_err(|error| format!("unit {unit}: {error}"))?;
+    let args = serde_json::json!([root, phase.to_string()]).to_string();
+    let mut command = Command::new(exe);
+    command
+        .args([
+            "--exact",
+            RUNNER_HARNESS_ENTRY,
+            "--ignored",
+            "--test-threads=1",
+        ])
+        .env(RUNNER_HARNESS_ARGS_ENV, args)
+        .env(
+            RUNNER_HARNESS_FULL_ENV,
+            if double::full_runner() { "1" } else { "0" },
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: prctl is async-signal-safe and touches no memory of the parent.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = command
+        .spawn()
+        .map_err(|error| format!("unit {unit}: the runner child could not start ({error})"))?;
+    let pid = child.id();
+    double::record_launch(&unit, child);
+    let lock = devflow_core::liveness::runner_lock_path(&root, phase);
+    let deadline = Instant::now() + TEST_RUNNER_READY_WAIT;
+    loop {
+        if devflow_core::liveness::live_holder(&lock)
+            .ok()
+            .flatten()
+            .is_some_and(|(holder, _)| holder == pid)
+        {
+            return Ok(unit);
+        }
+        if !double::runner_running(pid) {
+            return Err(format!(
+                "unit {unit}: the runner exited before it held its runner lock"
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "unit {unit}: the runner did not hold its runner lock within {} s",
+                TEST_RUNNER_READY_WAIT.as_secs()
+            ));
+        }
+        std::thread::sleep(BOUNDED_CALL_POLL);
+    }
+}
+
+/// D-04c: whether lingering is on for this user
+/// (`loginctl show-user <uid> -p Linger --value`). Without it the user manager, and
+/// every run under it, ends at logout.
+///
+/// # Errors
+/// loginctl failed, exited non-zero or timed out: its stderr or the failure.
+#[cfg(not(test))]
+pub(crate) fn lingering_enabled() -> Result<bool, String> {
+    // SAFETY: getuid takes no arguments, cannot fail and touches no memory.
+    let uid = unsafe { libc::getuid() };
+    let mut command = tool("loginctl");
+    command.args(["show-user", &uid.to_string(), "-p", "Linger", "--value"]);
+    match run_bounded(command, SYSTEMCTL_CALL_BOUND) {
+        Ok(output) if output.status.success() => {
+            Ok(String::from_utf8_lossy(&output.stdout).trim() == "yes")
+        }
+        Ok(output) => Err(format!(
+            "loginctl failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+        Err(error) => Err(format!("loginctl did not answer: {error}")),
+    }
+}
+
+/// The cfg(test) build: lingering reads on, so no unit test prints the logout warning.
+#[cfg(test)]
+pub(crate) fn lingering_enabled() -> Result<bool, String> {
+    Ok(true)
+}
+
 /// Tell systemd this unit is ready (D-04a). The runner calls it only once it holds its
 /// runner lock, so a `Type=notify` start succeeds only over a runner that has the lock.
 /// A no-op when `NOTIFY_SOCKET` is unset: the runner verb run outside a unit.
@@ -493,6 +730,39 @@ pub(crate) fn notify_ready() -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The libtest entry the cfg(test) [`launch_runner_unit`] runs for the root and phase
+    /// in [`RUNNER_HARNESS_ARGS_ENV`]: `run_runner`, exiting with its code, when
+    /// [`RUNNER_HARNESS_FULL_ENV`] is `1`; otherwise it takes the runner lock and holds it
+    /// until it is signalled. A no-op without the variable, so a run of ignored tests that
+    /// reaches it does nothing.
+    mod runner_harness {
+        #[test]
+        #[ignore = "runner re-exec entry; run only by the cfg(test) launch_runner_unit"]
+        fn entry() {
+            let Some(args) = std::env::var_os(super::super::RUNNER_HARNESS_ARGS_ENV) else {
+                return;
+            };
+            let (root, phase): (std::path::PathBuf, String) =
+                serde_json::from_str(&args.to_string_lossy()).expect("the runner harness args");
+            let phase = phase.parse().expect("the runner harness phase");
+            if std::env::var_os(super::super::RUNNER_HARNESS_FULL_ENV).is_some_and(|v| v == "1") {
+                let code = match crate::pipeline_launch::run_runner(&root, phase) {
+                    Ok(code) => code,
+                    Err(error) => {
+                        eprintln!("{error}");
+                        1
+                    }
+                };
+                std::process::exit(code);
+            }
+            let _lock = devflow_core::liveness::claim_runner_lock(&root, phase)
+                .expect("the test runner takes its lock");
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        }
+    }
 
     /// The arguments in `argv` that carry a value after `--setenv`: `--setenv NAME=v`
     /// or `--setenv=NAME=v`. A by-name argument (`--setenv NAME`) carries none.

@@ -1739,7 +1739,7 @@ pub(crate) fn run_runner(project_root: &Path, phase: PhaseId) -> Result<i32, Cli
     // every fenced write would read NotOwner.
     let _token_slot = StopTokenGuard::engage_token(token.clone());
     let mut state = workflow::load_state(project_root, phase)?;
-    let first = launch_stage_next(&mut state, None, None);
+    let first = runner_first_step(&mut state);
     let mut settled = settle_advance(project_root, phase, &token, first)?;
     loop {
         let launch = match settled {
@@ -1754,6 +1754,27 @@ pub(crate) fn run_runner(project_root: &Path, phase: PhaseId) -> Result<i32, Cli
             test_hold("before_runner_stage");
         }
     }
+}
+
+/// The runner's first step, from the saved state (D-02): the launch of `state.stage`,
+/// handed back for [`run_runner`]'s loop to run (its [`RunnerLoop`] is engaged first,
+/// so a launch a preflight gate's answer starts comes back the same way and is never
+/// spawned under a supervisor). `None` when the launch resolved without one.
+///
+/// A state that still reads `gate_pending` refuses: `start` writes a fresh state and
+/// `resume` clears the flag and closes the phase's gates under its holder before it
+/// launches, so a pending gate here was left by no launcher, and the runner, which
+/// cannot rebuild the dead waiter's question, names `devflow resume`.
+fn runner_first_step(state: &mut State) -> Result<Option<StageLaunch>, CliError> {
+    if state.gate_pending {
+        return Err(CliError::Message(format!(
+            "phase {phase}: the saved state still waits on a {stage} gate no runner holds; \
+             run `devflow resume --phase {phase}` to rerun the stage",
+            phase = state.phase,
+            stage = state.stage
+        )));
+    }
+    launch_stage_next(state, None, None)
 }
 
 /// What the runner does after an advance result: run the next stage, or exit with a code.
@@ -10378,135 +10399,21 @@ mod tests {
         );
     }
 
-    /// Names a holder-test child's project root and which arm it runs. Not DevFlow
-    /// settings, so they carry no `DEVFLOW_` prefix the doc check would require documented.
-    const HOLDER_ROOT_ENV: &str = "P50_1_29_ROOT";
-    const HOLDER_CASE_ENV: &str = "P50_1_29_CASE";
-    const FOREGROUND_GATE_PHASE: PhaseId = PhaseId::new(2901);
-
-    /// One foreground gate wait in a child process, signalled once its gate file exists:
-    /// how it ended, reaped, with its output.
-    fn signalled_foreground_gate_wait(name: &str, root: &Path, case: &str) -> std::process::Output {
-        let phase = FOREGROUND_GATE_PHASE;
-        workflow::save_state(&State::new(
-            phase,
-            AgentKind::Claude,
-            Mode::Supervise,
-            root.to_path_buf(),
-        ))
-        .unwrap();
-        let path_dir = tempfile::tempdir().unwrap();
-        let mut child = devflow_core::test_support::spawn_test_in_child(
-            name,
-            path_dir.path(),
-            &[
-                (HOLDER_ROOT_ENV, root.as_os_str()),
-                (HOLDER_CASE_ENV, std::ffi::OsStr::new(case)),
-            ],
-        );
-        let gate = Gates::gate_path(root, phase, Stage::Code);
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        while !gate.exists() {
-            if std::time::Instant::now() > deadline || child.try_wait().unwrap().is_some() {
-                let _ = child.kill();
-                panic!(
-                    "{case}: the child never opened its gate: {:?}",
-                    child.wait_with_output()
-                );
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(devflow_core::agent::terminate(child.id()), "{case}: signal");
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while child.try_wait().unwrap().is_none() {
-            if std::time::Instant::now() > deadline {
-                let _ = child.kill();
-                panic!(
-                    "{case}: the child did not end within 10 s of the signal: {:?}",
-                    child.wait_with_output()
-                );
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        child.wait_with_output().unwrap()
-    }
-
-    /// D-18: a foreground gate wait ends at safe point 4 when its holder is signalled: the
-    /// gate closes and the stop is recorded. The control has no handler: it dies and
-    /// leaves its gate open, the outcome D-18 removes.
-    #[test]
-    fn a_holder_stop_ends_a_foreground_gate_wait_at_safe_point_4() {
-        use std::os::unix::process::ExitStatusExt;
-        const NAME: &str =
-            "pipeline_launch::tests::a_holder_stop_ends_a_foreground_gate_wait_at_safe_point_4";
-        let phase = FOREGROUND_GATE_PHASE;
-        if devflow_core::test_support::in_child_test(NAME) {
-            let root = PathBuf::from(std::env::var_os(HOLDER_ROOT_ENV).unwrap());
-            let _hold = if std::env::var(HOLDER_CASE_ENV).unwrap() == "handler" {
-                crate::commands::claim_foreground_holder(&root, phase).unwrap()
-            } else {
-                devflow_core::liveness::claim_phase_holder(&root, phase).unwrap()
-            };
-            let mut state = workflow::load_state(&root, phase).unwrap();
-            let end = crate::pipeline_gate::run_gate_with_timeout(
-                &root,
-                &mut state,
-                Stage::Code,
-                devflow_core::gates::GateKind::StageFailure,
-                "a foreground gate",
-                300,
-            );
-            let error = end.expect_err("a stopped wait is an error").to_string();
-            assert!(error.contains(HOLDER_STOP_REASON), "{error}");
-            return;
-        }
-
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let output = signalled_foreground_gate_wait(NAME, root, "handler");
-        eprintln!("handler: {:?}", output.status);
-        assert_eq!(output.status.signal(), None, "{output:?}");
-        devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
-        assert!(
-            !Gates::gate_path(root, phase, Stage::Code).exists(),
-            "the gate closes with the wait"
-        );
-        let state = workflow::load_state(root, phase).unwrap();
-        assert!(state.stopped, "the stop is recorded");
-        assert!(!state.gate_pending, "and the gate no longer pending");
-        assert_eq!(state.stop_reason.as_deref(), Some(HOLDER_STOP_REASON));
-        let stopped = events_named(root, "advance_stopped");
-        assert_eq!(stopped.len(), 1, "{stopped:?}");
-        assert_eq!(stopped[0]["safe_point"], 4, "{}", stopped[0]);
-        assert_eq!(stopped[0]["source"], "foreground_holder", "{}", stopped[0]);
-
-        let control = tempfile::tempdir().unwrap();
-        let root = control.path();
-        let output = signalled_foreground_gate_wait(NAME, root, "no-handler");
-        eprintln!("no handler: {:?}", output.status);
-        assert_eq!(output.status.signal(), Some(libc::SIGTERM), "{output:?}");
-        assert!(
-            Gates::gate_path(root, phase, Stage::Code).exists(),
-            "control: a holder the signal ends leaves its gate open"
-        );
-        assert!(
-            workflow::load_state(root, phase).unwrap().gate_pending,
-            "control: and still pending"
-        );
-    }
-
-    /// The refusal a process meets when another foreground process holds the phase: it
-    /// names the holder's pid and `stop`, never `resume`.
+    /// The refusal a process meets when another foreground process holds the phase
+    /// (D-12): it names the holder's pid and that another verb is in progress, and never
+    /// `resume` or `stop`, which refuses while the holder is held.
     fn assert_refused_by_the_holder(error: &str, phase: PhaseId) {
         assert!(
             error.contains(&format!("(pid {})", std::process::id())),
             "the refusal names the holder's pid: {error}"
         );
         assert!(
-            error.contains(&format!("devflow stop --phase {phase}")),
+            error.contains(&format!("another DevFlow verb holds phase {phase}"))
+                && error.contains("in progress"),
             "{error}"
         );
         assert!(!error.contains("devflow resume"), "{error}");
+        assert!(!error.contains("devflow stop"), "{error}");
     }
 
     /// D-17 (V-31): a hand-run `advance` refuses while another process holds the phase,

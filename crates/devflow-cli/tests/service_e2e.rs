@@ -99,6 +99,13 @@ impl UnitGuard {
     }
 }
 
+impl UnitGuard {
+    /// A guard for `unit`, the name `start` derives for a phase (`service::unit_name`).
+    fn named(unit: String) -> Self {
+        Self { unit }
+    }
+}
+
 impl Drop for UnitGuard {
     fn drop(&mut self) {
         let _ = systemctl(&["stop", &self.unit]);
@@ -367,3 +374,275 @@ fn a_runner_that_cannot_take_its_lock_fails_the_unit_start() {
         "a runner without its lock launched a stage"
     );
 }
+
+/// The phase's unit name as the binary derives it (`service::unit_name`).
+fn derived_unit_name(root: &Path, phase: PhaseId) -> String {
+    format!(
+        "devflow-{:016x}-{}.service",
+        devflow_core::registry::path_digest(root),
+        phase.padded()
+    )
+}
+
+/// A repository with no run state for `phase`, a codex stub whose body is `agent_tail`
+/// after it logs its argv, and the scratch home `devflow start` runs under.
+struct StartFixture {
+    root: PathBuf,
+    phase: PhaseId,
+    stubs: common::FakeBin,
+    logs: tempfile::TempDir,
+    _repo: tempfile::TempDir,
+    /// Declared last so it drops after the rest of the fixture.
+    home: common::HermeticHome,
+}
+
+impl StartFixture {
+    fn new(phase: PhaseId, agent_tail: &str) -> Self {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        init_repo(&root, phase);
+        let logs = tempfile::tempdir().unwrap();
+        let stubs = common::capture_agent_bin_then(logs.path(), agent_tail);
+        Self {
+            root,
+            phase,
+            stubs,
+            logs,
+            _repo: repo,
+            home: common::HermeticHome::new(),
+        }
+    }
+
+    /// The phase's derived unit name.
+    fn unit(&self) -> String {
+        derived_unit_name(&self.root, self.phase)
+    }
+
+    /// `PATH` for a `start` child: `first` (when given), the stubs, then the system dirs.
+    fn path(&self, first: Option<&Path>) -> String {
+        let mut dirs: Vec<String> = first.iter().map(|dir| dir.display().to_string()).collect();
+        dirs.push(self.stubs.path.display().to_string());
+        dirs.push("/usr/bin:/bin".to_string());
+        dirs.join(":")
+    }
+
+    /// `devflow start` (codex, supervise, no worktree) from `command`.
+    fn start(&self, command: Command, path: &str) -> Output {
+        self.start_with(command, path, &["--no-worktree"])
+    }
+
+    /// `devflow start` (codex, supervise) from `command`, with `extra` arguments.
+    fn start_with(&self, mut command: Command, path: &str, extra: &[&str]) -> Output {
+        command
+            .env("PATH", path)
+            .args([
+                "start",
+                "--phase",
+                &self.phase.to_string(),
+                "--agent",
+                "codex",
+                "--mode",
+                "supervise",
+            ])
+            .args(extra)
+            .arg(&self.root)
+            .current_dir(&self.root)
+            .output()
+            .expect("run devflow start")
+    }
+
+    /// Whether the runner lock probes Live.
+    fn runner_lock_live(&self) -> bool {
+        devflow_core::liveness::probe(&devflow_core::liveness::runner_lock_path(
+            &self.root, self.phase,
+        ))
+        .is_ok_and(|held| held == devflow_core::liveness::Held::Live)
+    }
+
+    /// Whether the state names no reservation: absent, or loaded with none.
+    fn reservation_free(&self) -> bool {
+        match devflow_core::workflow::load_state(&self.root, self.phase) {
+            Ok(state) => state.pending_supervisor.is_none(),
+            Err(devflow_core::workflow::WorkflowError::MissingState(_)) => true,
+            Err(_) => false,
+        }
+    }
+}
+
+/// stdout and stderr of `out`, for failure messages.
+fn text(out: &Output) -> String {
+    format!(
+        "status {:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+/// D-01: `devflow start` launches the phase's unit through the real `systemd-run`,
+/// prints the unit name and the `devflow status` and `devflow logs --phase N -f` lines,
+/// and returns with the runner lock held.
+#[test]
+#[ignore = "needs a systemd user manager; run by scripts/check.sh service"]
+fn start_launches_a_unit_and_returns_with_the_run_live() {
+    assert_manager_answers();
+    let fixture = StartFixture::new(PhaseId::new(81), "sleep 120");
+    let guard = UnitGuard::named(fixture.unit());
+
+    let out = fixture.start(
+        common::host_service_devflow(&fixture.home),
+        &fixture.path(None),
+    );
+    assert!(
+        out.status.success(),
+        "start failed:\n{}\njournal:\n{}",
+        text(&out),
+        journal_of(&guard.unit)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(&guard.unit)
+            && stdout.contains("devflow status")
+            && stdout.contains(&format!("devflow logs --phase {} -f", fixture.phase)),
+        "start did not print the unit, status and logs lines:\n{}",
+        text(&out)
+    );
+    assert!(
+        fixture.runner_lock_live(),
+        "lock not held after start returned:\n{}\njournal:\n{}",
+        text(&out),
+        journal_of(&guard.unit)
+    );
+}
+
+/// D-04, review pi-2: a caller-only `PATH` entry and `DEVFLOW_TEST_ENV_PROBE` reach the
+/// agent; `DEVFLOW_GATE_NOTIFY_CMD` reaches the runner and not the agent; a name
+/// systemd would refuse is dropped and the launch still succeeds.
+#[test]
+#[ignore = "needs a systemd user manager; run by scripts/check.sh service"]
+fn the_agent_sees_the_callers_path_and_devflow_variables_but_not_an_invalid_name() {
+    assert_manager_answers();
+    let probe = tempfile::tempdir().unwrap();
+    let env_file = probe.path().join("agent-env");
+    let tail = format!(
+        "env > '{file}.tmp' && mv '{file}.tmp' '{file}'\nsleep 120",
+        file = env_file.display()
+    );
+    let fixture = StartFixture::new(PhaseId::new(82), &tail);
+    let guard = UnitGuard::named(fixture.unit());
+    let extra = tempfile::tempdir().unwrap();
+    let notify = "true devflow-notify-probe";
+
+    let mut command = common::host_service_devflow(&fixture.home);
+    command
+        .env("DEVFLOW_TEST_ENV_PROBE", "probe-value")
+        .env("DEVFLOW_GATE_NOTIFY_CMD", notify)
+        .env("BAD%NAME", "bad-value");
+    let out = fixture.start(command, &fixture.path(Some(extra.path())));
+    assert!(
+        out.status.success(),
+        "start failed:\n{}\njournal:\n{}",
+        text(&out),
+        journal_of(&guard.unit)
+    );
+    let deadline = Instant::now() + UNIT_FINISH_WAIT;
+    while !env_file.is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "the agent never recorded its env\njournal:\n{}",
+            journal_of(&guard.unit)
+        );
+        std::thread::sleep(UNIT_POLL);
+    }
+    let agent_env = fs::read_to_string(&env_file).unwrap();
+    let lines: Vec<&str> = agent_env.lines().collect();
+    let extra_dir = extra.path().display().to_string();
+    assert!(
+        lines.iter().any(|line| line.starts_with("PATH=")
+            && line["PATH=".len()..].split(':').any(|dir| dir == extra_dir)),
+        "agent missing PATH entry {extra_dir}:\n{agent_env}"
+    );
+    assert!(
+        lines.contains(&"DEVFLOW_TEST_ENV_PROBE=probe-value"),
+        "probe variable missing from the agent:\n{agent_env}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.starts_with("DEVFLOW_GATE_NOTIFY_CMD=")),
+        "notify command reached the agent:\n{agent_env}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.starts_with("BAD%NAME=")),
+        "invalid name reached the agent:\n{agent_env}"
+    );
+    let main_pid = unit_property(&guard.unit, "MainPID");
+    let environ = fs::read(format!("/proc/{main_pid}/environ")).unwrap_or_default();
+    let wanted = format!("DEVFLOW_GATE_NOTIFY_CMD={notify}");
+    assert!(
+        environ
+            .split(|byte| *byte == 0)
+            .any(|entry| entry == wanted.as_bytes()),
+        "notify command missing from the runner (MainPID {main_pid})"
+    );
+}
+
+/// D-04a's control against the real systemd-run (RESEARCH B3): `start` run from a copy
+/// of devflow that is deleted before the launch exits non-zero naming the unit and
+/// systemd-run's `Failed to find executable`, creates no unit and leaves no reservation.
+#[test]
+#[ignore = "needs a systemd user manager; run by scripts/check.sh service"]
+fn start_with_a_runner_path_that_no_longer_exists_fails_naming_the_unit_and_the_error() {
+    assert_manager_answers();
+    let fixture = StartFixture::new(PhaseId::new(83), "sleep 120");
+    let guard = UnitGuard::named(fixture.unit());
+    let scratch = tempfile::tempdir().unwrap();
+    let copy = scratch.path().join("devflow");
+    fs::copy(common::devflow_bin(), &copy).expect("copy the devflow binary");
+    let wrapper = scratch.path().join("wrapper");
+    fs::create_dir(&wrapper).unwrap();
+    let real_systemctl = ["/usr/bin/systemctl", "/bin/systemctl"]
+        .into_iter()
+        .find(|path| Path::new(path).is_file())
+        .expect("a real systemctl");
+    let script = wrapper.join("systemctl");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n/usr/bin/rm -f '{}'\nexec {real_systemctl} \"$@\"\n",
+            copy.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let out = fixture.start(
+        common::host_service_devflow_from(&fixture.home, &copy),
+        &fixture.path(Some(&wrapper)),
+    );
+    assert!(
+        !out.status.success(),
+        "missing runner path not reported: start exited 0:\n{}",
+        text(&out)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&guard.unit) && stderr.contains("Failed to find executable"),
+        "missing runner path not reported:\n{}",
+        text(&out)
+    );
+    assert_eq!(
+        unit_property(&guard.unit, "LoadState"),
+        "not-found",
+        "a unit was created:\n{}",
+        text(&out)
+    );
+    assert!(
+        fixture.reservation_free(),
+        "reservation left after a failed start:\n{}",
+        text(&out)
+    );
+    let _ = &fixture.logs;
+}
+
