@@ -20,6 +20,7 @@
 
 mod common;
 
+use common::HermeticPath;
 use devflow_core::phase_id::PhaseId;
 use std::ffi::OsStr;
 use std::fs;
@@ -69,7 +70,8 @@ fn init_repo(root: &Path, phase: PhaseId) {
     git(root, &["commit", "-q", "-m", "base"]);
 }
 
-/// Adds the `start` arguments and the fake-agent `PATH` to `command`.
+/// Adds the `start` arguments and the fake-agent `PATH` to `command`, behind
+/// the fake service manager already first on its `PATH`.
 fn add_start_args(command: &mut Command, root: &Path, phase: PhaseId, fake_bin: &common::FakeBin) {
     let existing = std::env::var_os("PATH").unwrap_or_default();
     let path = format!("{}:{}", fake_bin.path.display(), existing.to_string_lossy());
@@ -86,7 +88,7 @@ fn add_start_args(command: &mut Command, root: &Path, phase: PhaseId, fake_bin: 
         ])
         .arg(root)
         .current_dir(root)
-        .env("PATH", path)
+        .hermetic_path(path)
         .env("DEVFLOW_GATE_TIMEOUT_SECS", GATE_TIMEOUT_SECS);
 }
 
@@ -190,6 +192,7 @@ fn a_child_writing_outside_its_tempdir_home_fails() {
     {
         plain.env_remove(name);
     }
+    common::with_fake_service_manager(&mut plain, &home);
     add_start_args(&mut plain, repo2.path(), phase, &fake_bin);
     let control_roots = real_home.path().join(".cache/devflow/roots");
     let entries = run_start_and_list(plain, repo2.path(), phase, &control_roots);
@@ -198,6 +201,112 @@ fn a_child_writing_outside_its_tempdir_home_fails() {
         "the plain-Command control must populate {}; it holds nothing, so the \
          hermetic assertion cannot fail",
         control_roots.display()
+    );
+}
+
+/// `program` with `args`, run to completion.
+fn run_tool(program: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(program)
+        .args(args)
+        .output()
+        .unwrap_or_else(|err| panic!("run {}: {err}", program.display()))
+}
+
+/// What a fake `systemctl` reports for `unit`'s `ActiveState`.
+fn fake_active_state(systemctl: &Path, unit: &str) -> std::process::Output {
+    run_tool(
+        systemctl,
+        &["--user", "show", "-p", "ActiveState", "--value", unit],
+    )
+}
+
+fn stdout_line(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+#[test]
+fn a_hermetic_child_resolves_the_fake_service_manager_first() {
+    let home = common::HermeticHome::new();
+    let service_bin = home.service_bin();
+
+    // The builder's PATH starts with the fake dir.
+    let mut command = common::hermetic_devflow(&home);
+    let path = env_set_by(&command, "PATH");
+    let first = std::env::split_paths(&path).next();
+    assert_eq!(
+        first.as_deref(),
+        Some(service_bin.as_path()),
+        "fake dir not first: the hermetic PATH is {}",
+        path.display()
+    );
+
+    // The fake answers the calls it handles.
+    let systemctl = service_bin.join("systemctl");
+    let version = run_tool(&systemctl, &["--user", "show", "-p", "Version", "--value"]);
+    assert!(
+        version.status.success() && stdout_line(&version) == common::FAKE_SYSTEMD_VERSION,
+        "the fake systemctl must print its version; it printed {:?} ({})",
+        stdout_line(&version),
+        version.status
+    );
+    let unit = "devflow-test.service";
+    assert_eq!(
+        stdout_line(&fake_active_state(&systemctl, unit)),
+        "inactive"
+    );
+    fs::write(service_bin.join(format!("{unit}.deactivating")), "").unwrap();
+    assert_eq!(
+        stdout_line(&fake_active_state(&systemctl, unit)),
+        "deactivating"
+    );
+    fs::write(service_bin.join(format!("{unit}.fail")), "").unwrap();
+    let failed = fake_active_state(&systemctl, unit);
+    assert_eq!(
+        failed.status.code(),
+        Some(1),
+        "a .fail marker must fail the call"
+    );
+    let reset = run_tool(&systemctl, &["--user", "reset-failed", unit]);
+    assert!(reset.status.success(), "reset-failed must succeed");
+
+    // Every fake fails an unplanned call loudly, naming itself.
+    for (tool, args) in [
+        ("systemctl", &["--user", "frobnicate"][..]),
+        ("systemd-run", &["--user", "true"][..]),
+        ("loginctl", &["show-user"][..]),
+    ] {
+        let output = run_tool(&service_bin.join(tool), args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.code() == Some(1) && stderr.contains(&format!("fake {tool}: unhandled:")),
+            "unhandled call passed: {tool} {args:?} exited {} with stderr {stderr:?}",
+            output.status
+        );
+    }
+
+    // A suite's own PATH entries go behind the fake dir.
+    let extra = home.home().join("extra-bin");
+    command.hermetic_path(&extra);
+    let expected = format!("{}:{}", service_bin.display(), extra.display());
+    assert_eq!(
+        env_set_by(&command, "PATH"),
+        PathBuf::from(&expected),
+        "hermetic_path must keep the fake dir first"
+    );
+
+    // Control: a command the builder did not make is refused, by name.
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        Command::new("true").hermetic_path(&extra);
+    }));
+    let payload = refused.expect_err("hermetic_path accepted a raw command");
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or_default();
+    assert!(
+        message.contains("hermetic_devflow"),
+        "the refusal must name hermetic_devflow; it said {message:?}"
     );
 }
 

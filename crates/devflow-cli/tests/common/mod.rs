@@ -19,11 +19,58 @@
 )]
 
 use devflow_core::phase_id::PhaseId;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
+
+/// The service-manager tools DevFlow runs by name, each faked in
+/// [`HermeticHome::service_bin`].
+pub const SERVICE_TOOLS: [&str; 3] = ["systemctl", "systemd-run", "loginctl"];
+
+/// What the fake `systemctl --user show -p Version --value` prints.
+pub const FAKE_SYSTEMD_VERSION: &str = "256-fake";
+
+/// What every fake service tool prints, followed by its name and
+/// `: unhandled: <args>`, on a call it does not handle. Also the marker that
+/// tells [`HermeticPath::hermetic_path`] a directory holds the fakes.
+pub const FAKE_TOOL_PREFIX: &str = "fake ";
+
+/// The fake `systemctl`. It handles `--user show -p Version --value`,
+/// `--user show -p ActiveState --value U` (`U.fail` in its own dir: exit 1
+/// with a bus error; `U.deactivating`: deactivating; otherwise inactive) and
+/// `--user reset-failed U`.
+const FAKE_SYSTEMCTL_CALLS: &str = r#"if [ "$#" -eq 5 ] && [ "$1 $2 $3 $4 $5" = "--user show -p Version --value" ]; then
+  echo "@VERSION@"; exit 0
+fi
+if [ "$#" -eq 6 ] && [ "$1 $2 $3 $4 $5" = "--user show -p ActiveState --value" ]; then
+  if [ -e "$dir/$6.fail" ]; then
+    echo "Failed to get properties: Transport endpoint is not connected" >&2; exit 1
+  fi
+  if [ -e "$dir/$6.deactivating" ]; then echo deactivating; else echo inactive; fi
+  exit 0
+fi
+if [ "$#" -eq 3 ] && [ "$1 $2" = "--user reset-failed" ]; then exit 0; fi
+"#;
+
+/// Write the fake `tool` into `dir`: `calls` (shell lines that exit on each
+/// call they handle, with `$dir` naming `dir`), then exit 1 naming the call.
+fn write_fake_service_tool(dir: &Path, tool: &str, calls: &str) {
+    let dir_text = dir.to_str().expect("a UTF-8 service-bin path");
+    assert!(
+        !dir_text.contains('\''),
+        "the service-bin path is single-quoted in the fakes: {dir_text}"
+    );
+    let script = format!(
+        "#!/bin/sh\ndir='{dir_text}'\n{calls}echo \"{FAKE_TOOL_PREFIX}{tool}: unhandled: $*\" >&2\nexit 1\n"
+    );
+    let path = dir.join(tool);
+    fs::write(&path, script).expect("write a fake service tool");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+        .expect("make a fake service tool executable");
+}
 
 /// The compiled `devflow` binary under test. The only place in `tests/` that
 /// names Cargo's binary path variable once migration completes.
@@ -41,18 +88,39 @@ pub struct HermeticHome {
 }
 
 impl HermeticHome {
-    /// Create a fresh, empty home under `/tmp`.
+    /// Create a fresh home under `/tmp`, holding only the fake service
+    /// manager in [`Self::service_bin`].
     pub fn new() -> Self {
         let dir = tempfile::Builder::new()
             .prefix("dfh")
             .tempdir_in("/tmp")
             .expect("create hermetic HOME under /tmp");
-        Self { dir }
+        let home = Self { dir };
+        let service_bin = home.service_bin();
+        fs::create_dir(&service_bin).expect("create the fake service-manager dir");
+        let systemctl_calls = FAKE_SYSTEMCTL_CALLS.replace("@VERSION@", FAKE_SYSTEMD_VERSION);
+        for tool in SERVICE_TOOLS {
+            let calls = if tool == "systemctl" {
+                systemctl_calls.as_str()
+            } else {
+                ""
+            };
+            write_fake_service_tool(&service_bin, tool, calls);
+        }
+        home
     }
 
     /// The home directory itself (the child's `HOME`).
     pub fn home(&self) -> &Path {
         self.dir.path()
+    }
+
+    /// The dir holding the fake `systemctl`, `systemd-run` and `loginctl`,
+    /// first on the `PATH` of every [`hermetic_devflow`] child. A marker file
+    /// `<unit>.fail` or `<unit>.deactivating` here sets what the fake
+    /// `systemctl` reports for that unit's `ActiveState`.
+    pub fn service_bin(&self) -> PathBuf {
+        self.home().join("service-bin")
     }
 
     /// The child's DevFlow cache dir (`home/.cache/devflow`), where its
@@ -75,9 +143,82 @@ impl Default for HermeticHome {
 
 /// A `devflow` command whose `HOME`, `XDG_CACHE_HOME`, `XDG_CONFIG_HOME` and
 /// `DEVFLOW_CACHE_DIR` all point inside `home`, with every repo-local and
-/// repo-redirecting `GIT_*` variable removed. `home` must outlive the child
-/// and any monitor it launches.
+/// repo-redirecting `GIT_*` variable removed, and whose `PATH` is
+/// [`HermeticHome::service_bin`] followed by this process's `PATH`, so the
+/// child never reaches the real user manager (D-07b). Add `PATH` entries with
+/// [`HermeticPath::hermetic_path`], never `.env("PATH", ...)`. `home` must
+/// outlive the child and any monitor it launches.
 pub fn hermetic_devflow(home: &HermeticHome) -> Command {
+    let mut command = scrubbed_devflow(home);
+    with_fake_service_manager(&mut command, home);
+    command
+}
+
+/// [`hermetic_devflow`] without the fake service manager: `PATH`,
+/// `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` stay this process's, so
+/// the child reaches the real user manager. Only `service_e2e.rs` may use it,
+/// because that suite runs under `scripts/check.sh service` against a real
+/// manager; every other suite runs where there is none.
+pub fn host_service_devflow(home: &HermeticHome) -> Command {
+    scrubbed_devflow(home)
+}
+
+/// Put `home`'s fake service manager first on `command`'s `PATH`, followed by
+/// this process's `PATH`. Touches no other variable, so the R-13 plain-Command
+/// control keeps its own `HOME` and cache variables.
+pub fn with_fake_service_manager(command: &mut Command, home: &HermeticHome) {
+    let parent = std::env::var_os("PATH").unwrap_or_default();
+    command.env("PATH", path_after(&home.service_bin(), &parent));
+}
+
+/// `first`, then `rest` when it is not empty, joined with `:`.
+fn path_after(first: &Path, rest: &OsStr) -> OsString {
+    let mut path = first.as_os_str().to_os_string();
+    if !rest.is_empty() {
+        path.push(":");
+        path.push(rest);
+    }
+    path
+}
+
+/// Setting a child's `PATH` without dropping the fake service manager.
+pub trait HermeticPath {
+    /// Set `PATH` to the fake service-manager dir this command already has
+    /// first on its `PATH`, followed by `path`. Panics when the command's
+    /// `PATH` does not start with that dir, that is, when
+    /// [`hermetic_devflow`] (or [`with_fake_service_manager`]) did not build
+    /// it.
+    fn hermetic_path(&mut self, path: impl AsRef<OsStr>) -> &mut Command;
+}
+
+impl HermeticPath for Command {
+    fn hermetic_path(&mut self, path: impl AsRef<OsStr>) -> &mut Command {
+        let service_bin = fake_service_dir_first_on_path(self).unwrap_or_else(|| {
+            panic!(
+                "hermetic_path needs a command built by common::hermetic_devflow: its PATH \
+                 does not start with the fake service-manager dir"
+            )
+        });
+        self.env("PATH", path_after(&service_bin, path.as_ref()))
+    }
+}
+
+/// The first entry of the `PATH` that `command` sets, when it is a dir
+/// holding a fake `systemctl`.
+fn fake_service_dir_first_on_path(command: &Command) -> Option<PathBuf> {
+    let (_, value) = command
+        .get_envs()
+        .find(|(key, _)| *key == OsStr::new("PATH"))?;
+    let first = std::env::split_paths(value?).next()?;
+    let systemctl = fs::read_to_string(first.join("systemctl")).ok()?;
+    systemctl
+        .contains(&format!("{FAKE_TOOL_PREFIX}systemctl: unhandled"))
+        .then_some(first)
+}
+
+/// [`hermetic_devflow`]'s `HOME`, XDG, cache and `GIT_*` isolation, with the
+/// caller's `PATH`.
+fn scrubbed_devflow(home: &HermeticHome) -> Command {
     let mut command = Command::new(devflow_bin());
     command
         .env("HOME", home.home())
