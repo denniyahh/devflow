@@ -22,6 +22,8 @@
 - workflow's ownership fence: `Ownership`, `ownership`, `update_owned_state`, `while_owner`,
   `clear_state_if_owned` and `WorkflowError::NotOwner` (52.2-25)
 - `OwnerPhase::HandedOff` (52.2-24)
+- `GitFlow::divergence_from_develop`, whose one caller was `start --no-worktree`'s removed stale-base check
+  (52.2-13)
 
 ## 3.0.0 — 2026-11-03
 
