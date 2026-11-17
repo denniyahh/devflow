@@ -18,7 +18,9 @@
     reason = "each test target uses a different subset of the shared helpers"
 )]
 
+use devflow_core::agents::driver_for;
 use devflow_core::phase_id::PhaseId;
+use devflow_core::state::AgentKind;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
@@ -55,6 +57,70 @@ fi
 if [ "$#" -eq 3 ] && [ "$1 $2" = "--user reset-failed" ]; then exit 0; fi
 "#;
 
+/// What every [`HermeticHome::agent_guard`] fake prints, after `fake <name>`,
+/// before it exits [`NO_STUB_EXIT`].
+pub const NO_STUB_TEXT: &str = ": no stub installed for this test";
+
+/// The exit status of an agent-guard fake: the shell's "command not found".
+pub const NO_STUB_EXIT: i32 = 127;
+
+/// Agent CLI names the registry does not launch but a developer's host may
+/// carry: `antigravity` (the [`AgentKind`] name, whose CLI is `agy`) and
+/// `gemini`.
+const UNLAUNCHED_AGENT_NAMES: [&str; 2] = ["antigravity", "gemini"];
+
+/// Every [`AgentKind`]. [`listed_agent_kind`] matches on the enum
+/// exhaustively, so a new variant fails to compile there until it is added
+/// here too.
+const AGENT_KINDS: [AgentKind; 6] = [
+    AgentKind::Claude,
+    AgentKind::Codex,
+    AgentKind::OpenCode,
+    AgentKind::Pi,
+    AgentKind::Antigravity,
+    AgentKind::Hermes,
+];
+
+fn listed_agent_kind(kind: AgentKind) -> AgentKind {
+    match kind {
+        AgentKind::Claude
+        | AgentKind::Codex
+        | AgentKind::OpenCode
+        | AgentKind::Pi
+        | AgentKind::Antigravity
+        | AgentKind::Hermes => kind,
+    }
+}
+
+/// Every agent program name a hermetic child must never resolve on the
+/// developer's `PATH`: each registry driver's launch program (from
+/// `driver_for(kind).build_command`) plus [`UNLAUNCHED_AGENT_NAMES`].
+pub fn agent_programs() -> Vec<&'static str> {
+    let mut programs: Vec<&'static str> = AGENT_KINDS
+        .map(listed_agent_kind)
+        .iter()
+        .map(|kind| driver_for(*kind).build_command(PhaseId::new(0), "", &[]).0)
+        .chain(UNLAUNCHED_AGENT_NAMES)
+        .collect();
+    programs.sort_unstable();
+    programs.dedup();
+    programs
+}
+
+/// Write one agent-guard fake per [`agent_programs`] name into `dir`.
+fn write_agent_guard(dir: &Path) {
+    fs::create_dir(dir).expect("create the agent-guard dir");
+    for program in agent_programs() {
+        let script = format!(
+            "#!/bin/sh\necho \"{FAKE_TOOL_PREFIX}{program}{NO_STUB_TEXT}\" >&2\nexit {NO_STUB_EXIT}\n"
+        );
+        let path = dir.join(program);
+        fs::write(&path, script).expect("write an agent-guard fake");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+            .expect("make an agent-guard fake executable");
+    }
+}
+
 /// Write the fake `tool` into `dir`: `calls` (shell lines that exit on each
 /// call they handle, with `$dir` naming `dir`), then exit 1 naming the call.
 fn write_fake_service_tool(dir: &Path, tool: &str, calls: &str) {
@@ -89,7 +155,8 @@ pub struct HermeticHome {
 
 impl HermeticHome {
     /// Create a fresh home under `/tmp`, holding only the fake service
-    /// manager in [`Self::service_bin`].
+    /// manager in [`Self::service_bin`] and the agent fakes in
+    /// [`Self::agent_guard`].
     pub fn new() -> Self {
         let dir = tempfile::Builder::new()
             .prefix("dfh")
@@ -107,6 +174,7 @@ impl HermeticHome {
             };
             write_fake_service_tool(&service_bin, tool, calls);
         }
+        write_agent_guard(&home.agent_guard());
         home
     }
 
@@ -121,6 +189,16 @@ impl HermeticHome {
     /// `systemctl` reports for that unit's `ActiveState`.
     pub fn service_bin(&self) -> PathBuf {
         self.home().join("service-bin")
+    }
+
+    /// The dir holding one fake per [`agent_programs`] name, each printing
+    /// `fake <name>`[`NO_STUB_TEXT`] and exiting [`NO_STUB_EXIT`]. A hermetic
+    /// `PATH` puts it after the test's own dirs and before the first dir
+    /// inherited from this process's `PATH` (see [`guarded_path`]), so an
+    /// agent the test did not stub, or whose stub fails to exec, stops here
+    /// instead of reaching the developer's real agent CLI.
+    pub fn agent_guard(&self) -> PathBuf {
+        agent_guard_beside(&self.service_bin())
     }
 
     /// The child's DevFlow cache dir (`home/.cache/devflow`), where its
@@ -144,8 +222,9 @@ impl Default for HermeticHome {
 /// A `devflow` command whose `HOME`, `XDG_CACHE_HOME`, `XDG_CONFIG_HOME` and
 /// `DEVFLOW_CACHE_DIR` all point inside `home`, with every repo-local and
 /// repo-redirecting `GIT_*` variable removed, and whose `PATH` is
-/// [`HermeticHome::service_bin`] followed by this process's `PATH`, so the
-/// child never reaches the real user manager (D-07b). Add `PATH` entries with
+/// [`HermeticHome::service_bin`], then [`HermeticHome::agent_guard`], then
+/// this process's `PATH`, so the child never reaches the real user manager
+/// (D-07b) or a real agent CLI. Add `PATH` entries with
 /// [`HermeticPath::hermetic_path`], never `.env("PATH", ...)`. `home` must
 /// outlive the child and any monitor it launches.
 pub fn hermetic_devflow(home: &HermeticHome) -> Command {
@@ -163,12 +242,35 @@ pub fn host_service_devflow(home: &HermeticHome) -> Command {
     scrubbed_devflow(home)
 }
 
-/// Put `home`'s fake service manager first on `command`'s `PATH`, followed by
-/// this process's `PATH`. Touches no other variable, so the R-13 plain-Command
-/// control keeps its own `HOME` and cache variables.
+/// Put `home`'s fake service manager first on `command`'s `PATH`, then its
+/// agent guard, then this process's `PATH`. Touches no other variable, so the
+/// R-13 plain-Command control keeps its own `HOME` and cache variables.
 pub fn with_fake_service_manager(command: &mut Command, home: &HermeticHome) {
     let parent = std::env::var_os("PATH").unwrap_or_default();
-    command.env("PATH", path_after(&home.service_bin(), &parent));
+    command.env("PATH", guarded_path(&home.service_bin(), &parent, &parent));
+}
+
+/// The agent-guard dir that sits beside the fake service-manager dir
+/// `service_bin`.
+fn agent_guard_beside(service_bin: &Path) -> PathBuf {
+    service_bin.with_file_name("agent-guard")
+}
+
+/// A hermetic `PATH`: `service_bin` first, then `test_path` with the agent
+/// guard beside `service_bin` put just before `test_path`'s first entry that
+/// is also on `parent` (the developer's `PATH`). The test's own leading dirs
+/// still answer first; anything they do not answer stops at the guard. With
+/// no `parent` entry in `test_path` the guard is left out, because nothing
+/// past the test's own dirs could answer and an agent the test left out must
+/// stay unresolvable.
+pub fn guarded_path(service_bin: &Path, test_path: &OsStr, parent: &OsStr) -> OsString {
+    let inherited: Vec<PathBuf> = std::env::split_paths(parent).collect();
+    let mut entries: Vec<PathBuf> = std::env::split_paths(test_path).collect();
+    if let Some(index) = entries.iter().position(|entry| inherited.contains(entry)) {
+        entries.insert(index, agent_guard_beside(service_bin));
+    }
+    let rest = std::env::join_paths(entries).expect("PATH entries hold no ':'");
+    path_after(service_bin, &rest)
 }
 
 /// `first`, then `rest` when it is not empty, joined with `:`.
@@ -184,7 +286,8 @@ fn path_after(first: &Path, rest: &OsStr) -> OsString {
 /// Setting a child's `PATH` without dropping the fake service manager.
 pub trait HermeticPath {
     /// Set `PATH` to the fake service-manager dir this command already has
-    /// first on its `PATH`, followed by `path`. Panics when the command's
+    /// first on its `PATH`, followed by `path` with the agent guard put before
+    /// its first entry from this process's `PATH` ([`guarded_path`]). Panics when the command's
     /// `PATH` does not start with that dir, that is, when
     /// [`hermetic_devflow`] (or [`with_fake_service_manager`]) did not build
     /// it.
@@ -199,7 +302,8 @@ impl HermeticPath for Command {
                  does not start with the fake service-manager dir"
             )
         });
-        self.env("PATH", path_after(&service_bin, path.as_ref()))
+        let parent = std::env::var_os("PATH").unwrap_or_default();
+        self.env("PATH", guarded_path(&service_bin, path.as_ref(), &parent))
     }
 }
 
