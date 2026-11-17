@@ -352,6 +352,15 @@ impl HermeticHome {
     }
 }
 
+impl Drop for HermeticHome {
+    /// End every runner the fake `systemd-run` started under this home before the home
+    /// is removed, whichever reaper the suite holds: a runner left running would write
+    /// under a removed root and outlive the test.
+    fn drop(&mut self) {
+        LaunchedRunReaper::end_recorded_runners(&self.service_bin());
+    }
+}
+
 impl Default for HermeticHome {
     fn default() -> Self {
         Self::new()
