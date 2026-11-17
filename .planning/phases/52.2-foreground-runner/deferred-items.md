@@ -49,10 +49,11 @@
   **Resolution:** it now names `devflow resume --phase N` to continue the run or `devflow discard --phase N` to remove it; `gate_wedge_e2e::start_wedge_arm_interrupted_start_leaves_a_plan_gate_nothing_answers` asserts the discard line, and `commands::tests::no_production_string_names_the_removed_recover_verb` fails on any production line naming the verb.
 
 - `service_e2e`'s `UnitGuard` teardown can read the unit as still `loaded`
-  status: open
+  status: resolved (52.2-17, commit 84884d6)
   **What:** `service_e2e::start_launches_a_unit_and_returns_with_the_run_live` (host-only, `--run-ignored only`) fails in its `UnitGuard` drop with `unit devflow-<digest>-81.service was not removed` (`left: "loaded"`, `right: "not-found"`): the guard runs `systemctl --user stop`, then `reset-failed`, then reads `LoadState` once, and the transient unit is sometimes not yet collected. Seen by 52.2-11 in 2 of 6 runs at its head and in 2 of 8 runs at the plan's base `34febac` (built in a scratch worktree), so it predates 52.2-11. The test body's own assertions passed in every run.
   **Why deferred:** found by 52.2-11 outside its files and its subject. Fix shape: poll `LoadState` for `not-found` with a short bound in the guard's drop instead of reading it once. Owner: 52.2-17, the one remaining plan whose files_modified lists `crates/devflow-cli/tests/service_e2e.rs`, else a 999.x entry at phase close.
   **Seen again (52.2-25):** 2 of 8 runs of `start_launches_a_unit_and_returns_with_the_run_live` during Task 1's gate failed in the guard's drop with the same `was not removed` assertion; the body's assertions passed in every run.
+  **Resolution:** the guard's drop reads `LoadState` every 200 ms until it reads `not-found`, for up to 10 s (`UNIT_COLLECT_WAIT`), before asserting. After it, 8 of 8 runs of `start_launches_a_unit_and_returns_with_the_run_live` passed on the host (3 of them took about 200 ms longer, consistent with one extra read; not otherwise measured), and `scripts/check.sh service` passed 10 of 10.
 
 - The unattended-launch shape refusal still names a supervisor
   status: resolved (52.2-15, commit dcd450e: the refusal says the runner engages the chain-flag guard only for a stream launch; the pinning test is `unattended_launch_shape_refusal_names_the_runners_stream_only_guard`)
@@ -126,3 +127,9 @@
   status: open
   **What:** 52.2-15's executor ran fallback_agent_config, gate_sweep_e2e, gate_wedge_e2e and phase7_cli at the same time; this test (a real `start`) failed once because the fake systemd-run failed. It passed alone, in a one-at-a-time run, and in the orchestrator's post-wave-16 workspace nextest gate (1844/1844 at 23a52fc). Found by 52.2-15; logged by the orchestrator.
   **Why deferred:** not reproduced; one failure in one concurrent run, cause not established (a shared fake-systemd-run path or PATH race is a guess). Fix shape: rerun the four suites concurrently N times to measure the rate, then isolate the fake systemd-run per test. Owner: 52.2-17 (it owns the service_e2e teardown flake) if it touches the fake, else a 999.x entry at phase close.
+  **Not taken (52.2-17):** 52.2-17 did not touch the fake systemd-run (`crates/devflow-cli/tests/common/mod.rs`); its new run_liveness_e2e tests drive it unchanged. Owner: a 999.x entry at phase close.
+
+- ARCHITECTURE.md's `--dry-run` row still says only that it prints the pipeline
+  status: open
+  **What:** ARCHITECTURE.md's `devflow start` flag table (`## Configuration`) reads "Print the pipeline that would run without launching anything" for `--dry-run`, while docs/guides/configuration.md's row and OPERATIONS.md's start row say the dry run checks, read-only, what a real start would refuse and names the checks it skips (52.1 D-26, D-27). Found by 52.2-17 while replacing the `--force` row in the same table.
+  **Why deferred:** 52.2-17's action names only the `--force` rows; the carried 52.1-12 plan's `--dry-run` rewrite is not in 52.2-17's plan. Fix shape: copy configuration.md's row into ARCHITECTURE.md. Owner: the phase's docs pass, else a 999.x entry at phase close.
