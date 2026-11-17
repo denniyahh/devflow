@@ -303,6 +303,7 @@ pub fn idle_timeout_setting_for(agent: AgentKind) -> IdleTimeoutSetting {
 /// exit-code and agent-pid files under `.devflow/`, and advances the stage
 /// machine in-process once the agent completes (D-02). The arm only selects
 /// how the agent's stdio is wired.
+#[derive(Debug)]
 pub enum MonitorLaunch {
     /// The stream shape ([`StageIo::Stream`]): the supervisor owns BOTH of
     /// the agent's pipes, delivers `prompt` as a JSON user turn on its stdin,
@@ -385,7 +386,7 @@ impl LaunchContext {
 
 /// Remove `DEVFLOW_GATE_NOTIFY_CMD` from a child's environment (49-REVIEW.md
 /// WR-07): the command may carry a credential such as a webhook token, and it
-/// never reaches an agent's environment.
+/// never reaches an agent's environment. `NOTIFY_SOCKET` goes too (D-04a).
 ///
 /// Called from `spawn_monitor`, `spawn_stage_agent` and `run_stream_canary`.
 ///
@@ -402,7 +403,13 @@ impl LaunchContext {
 /// variable for the gates it fires.
 pub(crate) fn strip_notify_env(child_cmd: &mut std::process::Command) {
     child_cmd.env_remove(crate::gates::GATE_NOTIFY_CMD_ENV);
+    // A runner unit's notify socket is systemd's (D-04a): no child is meant to report
+    // readiness, and `NotifyAccess=main` ignores one that tries.
+    child_cmd.env_remove(NOTIFY_SOCKET_ENV);
 }
+
+/// The variable systemd names a `Type=notify` unit's notify socket in.
+const NOTIFY_SOCKET_ENV: &str = "NOTIFY_SOCKET";
 
 /// A launch's reservation (D-01): the launch id, socket path and held liveness
 /// file a launcher creates before it spawns anything, so the launch can be
@@ -1721,7 +1728,55 @@ pub fn run_supervised_stage(spec: StageSpec) -> Result<StageRun, MonitorError> {
     let liveness = adopt_liveness(&spec)?;
     #[cfg(any(test, feature = "test-support"))]
     agent_spawn_test_hold(&spec);
+    let end = run_stage_agent(&spec, None)?;
+    let supervisor = end
+        .supervisor
+        .expect("a supervised stage serves its supervisor before the agent is waited for");
+    Ok(StageRun {
+        outcome: end.outcome,
+        supervisor,
+        liveness,
+        promotion: end.promotion,
+        agent_group_end: end.agent_group_end,
+    })
+}
 
+/// Run one stage's agent in this process, under `token`, and return once it has
+/// exited: the foreground runner's stage (D-02). The same spawn, process-group check,
+/// stream drive, exit file and stream drain as [`run_supervised_stage`], without what
+/// exists only because a supervisor is its own process: no liveness adoption, no agent
+/// pid file, no sidecar, no socket and no promotion watch. The caller installs the
+/// signal handling and owns `token` across stages; the run enters
+/// [`OwnerPhase::AgentRunning`](crate::supervisor::runtime::OwnerPhase::AgentRunning)
+/// once the agent leads its own group, and leaves it as the exit decides.
+///
+/// # Errors
+/// The agent could not be spawned, did not lead its own group, or its files could not
+/// be written.
+pub fn run_stage(
+    spec: StageSpec,
+    token: &crate::supervisor::runtime::StopToken,
+) -> Result<AgentOutcome, MonitorError> {
+    run_stage_agent(&spec, Some(token)).map(|end| end.outcome)
+}
+
+/// What [`run_stage_agent`] ended with.
+struct StageEnd {
+    outcome: AgentOutcome,
+    /// The served supervisor: `Some` exactly when no runner token was given.
+    supervisor: Option<Supervisor>,
+    promotion: Option<Promotion>,
+    agent_group_end: Option<AgentGroupEnd>,
+}
+
+/// The body [`run_supervised_stage`] and [`run_stage`] share (steps 2 to 7 of the
+/// former's contract). With `runner` `None` it writes the agent pid file and the
+/// sidecar, serves a [`Supervisor`] and runs the promotion watch; with a runner token
+/// it does none of those and waits for the agent under that token.
+fn run_stage_agent(
+    spec: &StageSpec,
+    runner: Option<&crate::supervisor::runtime::StopToken>,
+) -> Result<StageEnd, MonitorError> {
     let stdout_file = crate::agent_result::stdout_path(&spec.project_root, spec.phase);
     let exit_file = crate::agent_result::exit_code_path(&spec.project_root, spec.phase);
     let pid_file = crate::agent_result::agent_pid_path(&spec.project_root, spec.phase);
@@ -1729,7 +1784,7 @@ pub fn run_supervised_stage(spec: StageSpec) -> Result<StageRun, MonitorError> {
         crate::workflow::ensure_devflow_dir(parent)?;
     }
 
-    let (mut child, stream_capture) = spawn_stage_agent(&spec)?;
+    let (mut child, stream_capture) = spawn_stage_agent(spec)?;
     let pid = child.id();
 
     if let Err(pgid) = confirm_own_group(pid) {
@@ -1739,17 +1794,27 @@ pub fn run_supervised_stage(spec: StageSpec) -> Result<StageRun, MonitorError> {
     // Armed only now: before the pgid check the agent's pid may not number
     // its group. Until `serve` succeeds, any error or panic ends the group.
     let guard = AgentGroupGuard::arm(child);
-    std::fs::write(&pid_file, format!("{pid}\n"))?;
-    let sidecar = stage_sidecar(&spec, pid);
-    crate::supervisor::write_sidecar(&spec.socket, &sidecar)?;
-    #[cfg(test)]
-    monitor_test_hold("after_sidecar");
-    let supervisor = Supervisor::serve_written(spec.socket.clone(), sidecar)?;
-    // Before the disarm, so a watch that cannot start still ends the agent's group.
-    let watch = spec
-        .promotion_wait
-        .map(|wait| PromotionWatch::start(&spec, wait, supervisor.token(), pid))
-        .transpose()?;
+    let (supervisor, watch, token) = match runner {
+        Some(token) => {
+            token.enter(crate::supervisor::runtime::OwnerPhase::AgentRunning);
+            (None, None, token.clone())
+        }
+        None => {
+            std::fs::write(&pid_file, format!("{pid}\n"))?;
+            let sidecar = stage_sidecar(spec, pid);
+            crate::supervisor::write_sidecar(&spec.socket, &sidecar)?;
+            #[cfg(test)]
+            monitor_test_hold("after_sidecar");
+            let supervisor = Supervisor::serve_written(spec.socket.clone(), sidecar)?;
+            // Before the disarm, so a watch that cannot start still ends the agent's group.
+            let watch = spec
+                .promotion_wait
+                .map(|wait| PromotionWatch::start(spec, wait, supervisor.token(), pid))
+                .transpose()?;
+            let token = supervisor.token();
+            (Some(supervisor), watch, token)
+        }
+    };
     let mut child = guard.disarm();
 
     let threads = match (&spec.io, stream_capture) {
@@ -1776,7 +1841,11 @@ pub fn run_supervised_stage(spec: StageSpec) -> Result<StageRun, MonitorError> {
         _ => None,
     };
 
-    let outcome = match supervisor.wait_agent(&mut child) {
+    let waited = match &supervisor {
+        Some(supervisor) => supervisor.wait_agent(&mut child),
+        None => crate::supervisor::runtime::wait_owned_agent(&token, pid, &mut child),
+    };
+    let outcome = match waited {
         Ok(outcome) => outcome,
         Err(err) => {
             drop(watch);
@@ -1790,9 +1859,7 @@ pub fn run_supervised_stage(spec: StageSpec) -> Result<StageRun, MonitorError> {
     };
     // The verdict comes first: a supervisor the state does not record leaves the file to
     // whichever run does (D-03).
-    let (promotion, agent_group_end) = watch
-        .map(|watch| watch.finish(&supervisor.token()))
-        .unwrap_or_default();
+    let (promotion, agent_group_end) = watch.map(|watch| watch.finish(&token)).unwrap_or_default();
     if !matches!(
         promotion,
         Some(Promotion::Superseded { .. } | Promotion::OrphanedPending)
@@ -1803,17 +1870,16 @@ pub fn run_supervised_stage(spec: StageSpec) -> Result<StageRun, MonitorError> {
         // Test-only (50-26): park here, after the exit file and before the
         // stream threads are waited for. Compiled out of release builds.
         #[cfg(any(test, feature = "test-support"))]
-        stream_wait_test_hold(&supervisor.token());
+        stream_wait_test_hold(&token);
         finish_stream_threads(threads, &spec.project_root, spec.phase, spec.stage);
     }
     info!(
         "supervised {} agent {pid} ended: {outcome:?}",
         spec.io.label()
     );
-    Ok(StageRun {
+    Ok(StageEnd {
         outcome,
         supervisor,
-        liveness,
         promotion,
         agent_group_end,
     })

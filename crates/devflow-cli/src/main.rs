@@ -20,6 +20,8 @@ mod pipeline_gate;
 
 mod phase_worktree;
 
+mod service;
+
 mod commands;
 use commands::{
     GateAnswerKind, cleanup, discard, doctor, gate_list, gate_respond, gate_show, gate_sweep,
@@ -154,6 +156,20 @@ enum Command {
         /// The supervised child's program and arguments, after `--`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         argv: Vec<String>,
+    },
+    /// Internal: the foreground runner a phase's user unit runs (D-02).
+    ///
+    /// Takes the phase's runner lock (`.devflow/.runner-NN`) before anything else and
+    /// holds it for its whole life, reports ready to systemd once it holds it, then runs
+    /// the phase's stages in this process. Hidden: a user unit runs it, never an operator.
+    #[command(name = "__runner", hide = true)]
+    Runner {
+        /// Project root whose phase this runner drives.
+        #[arg(long)]
+        project: PathBuf,
+        /// Phase to run.
+        #[arg(long)]
+        phase: PhaseId,
     },
     /// Resume a phase from its saved stage after a rate limit or infrastructure pause.
     ///
@@ -545,6 +561,9 @@ fn run() -> Result<(), CliError> {
             },
             true,
         ),
+        Command::Runner { project, phase } => {
+            pipeline_launch::run_runner(&project_root(project)?, phase)
+        }
         Command::Resume {
             phase,
             agent,

@@ -163,6 +163,19 @@ pub(crate) fn launch_stage_inner(
 ) -> Result<(), CliError> {
     let driver = agents::driver_for(state.agent);
     let prompt = prompt_override.unwrap_or_else(|| default_stage_prompt(state, driver.as_ref()));
+    let launch = prepare_stage_launch(state, prompt, archived_stage)?;
+    spawn_supervised(state, launch)
+}
+
+/// The part of [`launch_stage_inner`] after the prompt is rendered, up to the spawn: the
+/// canary gate, the launch shape, the checkpoint-resume reset, and the [`StageLaunch`]
+/// that either spawn path runs.
+fn prepare_stage_launch(
+    state: &mut State,
+    prompt: String,
+    archived_stage: Option<Stage>,
+) -> Result<StageLaunch, CliError> {
+    let driver = agents::driver_for(state.agent);
     // In worktree mode the agent's cwd is the linked worktree, but git
     // metadata for commits lives under the main repo's `.git/` — sandboxed
     // agents need it (and the worktree admin dir, which Codex read-only-
@@ -228,7 +241,7 @@ pub(crate) fn launch_stage_inner(
     // commit — no extra save needed here.
     state.checkpoint_resumes = 0;
 
-    spawn_agent_and_record(
+    stage_launch(
         state,
         program,
         &args,
@@ -1661,6 +1674,145 @@ pub(crate) fn run_monitor(invocation: &MonitorInvocation, advance: bool) -> Resu
     result
 }
 
+/// The label a launch shape carries in `stage_launched` and on stdout.
+fn launch_label(launch: &monitor::MonitorLaunch) -> &'static str {
+    match launch {
+        monitor::MonitorLaunch::PipeOwning { .. } => "stream",
+        monitor::MonitorLaunch::Legacy => "capture",
+    }
+}
+
+/// The foreground runner (D-02): `devflow __runner`, what a phase's user unit runs.
+///
+/// It takes the phase's runner lock before anything else and holds it until it
+/// returns (D-07), and only then reports ready to systemd (D-04a), so a runner that
+/// cannot take the lock fails the unit's start. It never takes the phase holder. It then
+/// runs the saved stage in this process ([`monitor::run_stage`], under one
+/// [`StopToken`] for the whole run), advances, and runs each stage the advance hands
+/// back, until there is none. Any error ends the runner non-zero with the error on
+/// stderr. No agent is spawned and no gate is waited on inside a state-write closure.
+pub(crate) fn run_runner(project_root: &Path, phase: PhaseId) -> Result<(), CliError> {
+    devflow_core::supervisor::runtime::install_signal_pipe().map_err(|err| {
+        CliError::Message(format!(
+            "the runner could not install its stop handling: {err}"
+        ))
+    })?;
+    let _runner_lock = devflow_core::liveness::claim_runner_lock(project_root, phase)
+        .map_err(|err| CliError::Message(format!("phase {phase}: {err}")))?;
+    crate::service::notify_ready().map_err(|err| {
+        CliError::Message(format!(
+            "the runner could not report ready to systemd: {err}"
+        ))
+    })?;
+    let token = StopToken::for_run();
+    let mut state = workflow::load_state(project_root, phase)?;
+    let mut next = launch_stage_next(&mut state, None, None)?;
+    while let Some(launch) = next {
+        begin_runner_stage(&launch)?;
+        let stage = launch.state.stage;
+        let auto_chain_guard = match launch.launch {
+            monitor::MonitorLaunch::PipeOwning { .. } => Some(AutoChainGuard::engage(
+                launch
+                    .state
+                    .worktree_path
+                    .as_deref()
+                    .unwrap_or(&launch.state.project_root),
+                auto_chain_flag_eligible(stage, launch.state.mode),
+            )),
+            monitor::MonitorLaunch::Legacy => None,
+        };
+        let spec = runner_stage_spec(launch)?;
+        let outcome = monitor::run_stage(spec, &token).map_err(|err| {
+            CliError::Message(format!("phase {phase}: stage {stage} did not run: {err}"))
+        })?;
+        // Before the advance, as `run_monitor` drops it: the flag lives as long as the
+        // agent does.
+        drop(auto_chain_guard);
+        if outcome == AgentOutcome::Stopped {
+            eprintln!("phase {phase}: stage {stage} was stopped; nothing advances");
+            return Ok(());
+        }
+        next = advance_for_stage_next(project_root, phase, Some(stage))?;
+    }
+    Ok(())
+}
+
+/// What the runner does before each [`monitor::run_stage`], in place of what the
+/// supervised path's launch does around its spawn: archive the previous capture
+/// ([`archive_prior_capture`]), register the phase (best effort, as a supervised
+/// launch does), and emit `stage_launched` with this runner's pid.
+fn begin_runner_stage(launch: &StageLaunch) -> Result<(), CliError> {
+    let state = &launch.state;
+    archive_prior_capture(state, launch.archived_stage)?;
+    let ctx = launch_context()?;
+    let _ = devflow_core::registry::register_in(&ctx.cache_dir, &state.project_root, state.phase);
+    let label = launch_label(&launch.launch);
+    let runner_pid = std::process::id();
+    events::emit(
+        &state.project_root,
+        state.phase,
+        "stage_launched",
+        serde_json::json!({
+            "stage": state.stage.to_string(),
+            "agent": state.agent.to_string(),
+            "launch": label,
+            "runner_pid": runner_pid,
+        }),
+    );
+    println!(
+        "stage {} → launched {} (runner pid {runner_pid}, {label})",
+        state.stage,
+        agents::driver_for(state.agent).name()
+    );
+    Ok(())
+}
+
+/// The [`monitor::StageSpec`] the runner runs `launch` with. Its socket and launch id
+/// satisfy the spec's shape only: [`monitor::run_stage`] publishes no socket.
+fn runner_stage_spec(launch: StageLaunch) -> Result<monitor::StageSpec, CliError> {
+    let StageLaunch {
+        state,
+        program,
+        args,
+        extra_env,
+        launch,
+        ..
+    } = launch;
+    let io = match launch {
+        monitor::MonitorLaunch::PipeOwning { prompt } => monitor::StageIo::Stream {
+            prompt,
+            idle_timeout: monitor::idle_timeout_setting_for(state.agent).timeout,
+        },
+        monitor::MonitorLaunch::Legacy => monitor::StageIo::Capture,
+    };
+    let ctx = launch_context()?;
+    let launch_id = devflow_core::supervisor::new_launch_id();
+    let socket = devflow_core::supervisor::SocketPath::for_launch(
+        &ctx.cache_dir,
+        &state.project_root,
+        state.phase,
+        &launch_id,
+    )
+    .map_err(|err| CliError::Message(format!("runner stage socket path refused: {err}")))?;
+    let mut spec = monitor::StageSpec::new(
+        state.project_root.clone(),
+        state.phase,
+        state.agent,
+        program,
+        io,
+        socket,
+        launch_id,
+    );
+    spec.stage = Some(state.stage);
+    spec.workdir = state
+        .worktree_path
+        .clone()
+        .unwrap_or_else(|| state.project_root.clone());
+    spec.args = args;
+    spec.envs = extra_env;
+    Ok(spec)
+}
+
 /// D-16: a stop honoured after the agent completed leaves the exit file with the agent's own
 /// code, or none once the next stage's launch archived it, beside a reply saying 143. Record
 /// the stop outcome before `finish` sends that reply. A run handed off wrote nothing here,
@@ -2169,16 +2321,67 @@ fn spawn_agent_and_record(
     archived_stage: Option<Stage>,
     launch: monitor::MonitorLaunch,
 ) -> Result<(), CliError> {
-    // Persist the caller's launch bookkeeping (`launch_stage_inner`'s
-    // `checkpoint_resumes` reset) before
-    // anything is spawned, as this save always has. It once also cleared
-    // the previous stage's monitor pid (WR-04, 18-fix); that field is gone
-    // from the CLI (50-22), and the record keeps its own rule below.
+    let launch = stage_launch(state, program, args, extra_env, archived_stage, launch)?;
+    spawn_supervised(state, launch)
+}
+
+/// One stage launch, resolved and not yet spawned: exactly what
+/// [`spawn_agent_and_record`] receives, with the state as committed. The supervised
+/// path spawns it through [`spawn_supervised`]; the foreground runner runs it in its own
+/// process ([`run_runner`]).
+#[derive(Debug)]
+pub(crate) struct StageLaunch {
+    /// The state the launch was resolved from, as committed.
+    pub(crate) state: State,
+    /// The agent program.
+    pub(crate) program: String,
+    /// The agent's argv after the program.
+    pub(crate) args: Vec<String>,
+    /// The adapter environment.
+    pub(crate) extra_env: Vec<(String, String)>,
+    /// The stage whose capture this launch archives, when it is not `state.stage`.
+    pub(crate) archived_stage: Option<Stage>,
+    /// The supervision shape.
+    pub(crate) launch: monitor::MonitorLaunch,
+}
+
+/// Persist the caller's launch bookkeeping (`launch_stage_inner`'s `checkpoint_resumes`
+/// reset) before anything is spawned, as this save always has, and return the launch.
+/// It once also cleared the previous stage's monitor pid (WR-04, 18-fix); that field is
+/// gone from the CLI (50-22), and the record keeps its own rule in [`spawn_supervised`].
+fn stage_launch(
+    state: &mut State,
+    program: &str,
+    args: &[String],
+    extra_env: &[(String, String)],
+    archived_stage: Option<Stage>,
+    launch: monitor::MonitorLaunch,
+) -> Result<StageLaunch, CliError> {
     let checkpoint_resumes = state.checkpoint_resumes;
     commit(state, |s| {
         s.checkpoint_resumes = checkpoint_resumes;
     })?;
+    Ok(StageLaunch {
+        state: state.clone(),
+        program: program.to_string(),
+        args: args.to_vec(),
+        extra_env: extra_env.to_vec(),
+        archived_stage,
+        launch,
+    })
+}
 
+/// The supervised tail of [`spawn_agent_and_record`]: spawn `launch` under a detached
+/// `__monitor` and record it.
+fn spawn_supervised(state: &mut State, launch: StageLaunch) -> Result<(), CliError> {
+    let StageLaunch {
+        program,
+        args,
+        extra_env,
+        archived_stage,
+        launch,
+        ..
+    } = launch;
     // WR-04 (18-fix, 50-23 T-50-62): every error before the publish save
     // ends the launch with no supervisor record (see `record_failed_launch`),
     // so a failed relaunch never leaves `state.stage` advanced beside a
@@ -2193,7 +2396,7 @@ fn spawn_agent_and_record(
         reservation,
         ctx,
         launch_label,
-    } = match spawn_next_supervisor(state, program, args, extra_env, archived_stage, launch) {
+    } = match spawn_next_supervisor(state, &program, &args, &extra_env, archived_stage, launch) {
         Ok(Some(spawned)) => spawned,
         // A stop honoured at safe point 2 or 3 (50-13), already recorded.
         Ok(None) => return Ok(()),
@@ -2560,37 +2763,9 @@ fn spawn_next_supervisor(
     // past every stage boundary instead of being re-blocked at each one. See
     // `commands::start` for the new call site and its accompanying D-04/D-05
     // trade-off notes.
-    if let Some(stamp) = agent_result::archive_phase_files(
-        &state.project_root,
-        state
-            .worktree_path
-            .as_deref()
-            .unwrap_or(&state.project_root),
-        state.phase,
-        capture_retention(&state.project_root),
-    )
-    .map_err(|err| {
-        CliError::Message(format!(
-            "could not archive phase {} capture before rollover: {err}",
-            state.phase
-        ))
-    })? {
-        events::emit(
-            &state.project_root,
-            state.phase,
-            "capture_archived",
-            serde_json::json!({
-                "stage": archived_stage.unwrap_or(state.stage).to_string(),
-                "to_stage": state.stage.to_string(),
-                "stamp": stamp,
-            }),
-        );
-    }
+    archive_prior_capture(state, archived_stage)?;
     let ctx = launch_context()?;
-    let launch_label = match &launch {
-        monitor::MonitorLaunch::PipeOwning { .. } => "stream",
-        monitor::MonitorLaunch::Legacy => "capture",
-    };
+    let launch_label = launch_label(&launch);
     #[cfg(test)]
     test_hold("before_spawn");
     // Safe point 2 (50-13): a stop taken during the advance ends it before
@@ -2638,6 +2813,40 @@ fn spawn_next_supervisor(
         ctx,
         launch_label,
     }))
+}
+
+/// Archive the previous launch's capture before this launch overwrites it: `-stdout`
+/// and `-exit` move into history and `-idle-timeout` and `-agent-pid` are removed
+/// ([`agent_result::archive_phase_files`]), with a `capture_archived` event when
+/// anything was archived.
+fn archive_prior_capture(state: &State, archived_stage: Option<Stage>) -> Result<(), CliError> {
+    if let Some(stamp) = agent_result::archive_phase_files(
+        &state.project_root,
+        state
+            .worktree_path
+            .as_deref()
+            .unwrap_or(&state.project_root),
+        state.phase,
+        capture_retention(&state.project_root),
+    )
+    .map_err(|err| {
+        CliError::Message(format!(
+            "could not archive phase {} capture before rollover: {err}",
+            state.phase
+        ))
+    })? {
+        events::emit(
+            &state.project_root,
+            state.phase,
+            "capture_archived",
+            serde_json::json!({
+                "stage": archived_stage.unwrap_or(state.stage).to_string(),
+                "to_stage": state.stage.to_string(),
+                "stamp": stamp,
+            }),
+        );
+    }
+    Ok(())
 }
 
 /// Record a launch that no `start` or `resume` reserved, a stage handoff above all, as
@@ -2872,6 +3081,19 @@ pub(crate) fn launch_stage(
     prompt_override: Option<String>,
     archived_stage: Option<Stage>,
 ) -> Result<(), CliError> {
+    match launch_stage_next(state, prompt_override, archived_stage)? {
+        Some(launch) => spawn_supervised(state, launch),
+        None => Ok(()),
+    }
+}
+
+/// [`launch_stage`]'s body up to the spawn: the [`StageLaunch`] for `state.stage`, or
+/// `None` when the preflight gate already resolved the launch (CR-01 below).
+pub(crate) fn launch_stage_next(
+    state: &mut State,
+    prompt_override: Option<String>,
+    archived_stage: Option<Stage>,
+) -> Result<Option<StageLaunch>, CliError> {
     #[cfg(test)]
     LAUNCH_PROBE.with_borrow_mut(|probe| {
         if let Some(launches) = probe {
@@ -2900,10 +3122,13 @@ pub(crate) fn launch_stage(
     // or the agent gets spawned a second time for the same stage.
     let project_root = state.project_root.clone();
     if !run_preflight(&project_root, state, driver.as_ref())? {
-        return Ok(());
+        return Ok(None);
     }
 
-    launch_stage_inner(state, prompt_override, archived_stage)
+    // Rendered again after the preflight, as `launch_stage_inner` always has: the gate
+    // can change what the default prompt says.
+    let prompt = prompt_override.unwrap_or_else(|| default_stage_prompt(state, driver.as_ref()));
+    prepare_stage_launch(state, prompt, archived_stage).map(Some)
 }
 
 /// Route an `Ambiguous` outcome from the PRIMARY advance() monitor loop
@@ -3662,6 +3887,18 @@ pub(crate) fn advance_for_stage(
 ) -> Result<(), CliError> {
     let phase = resolve_advance_phase(project_root, phase)?;
     advance_with(project_root, phase, stage)
+}
+
+/// [`advance_for_stage`] for the foreground runner: the next [`StageLaunch`] the advance
+/// hands back for the runner to run, or `None` when the run has nothing more to launch.
+/// The launches inside [`advance_with`]'s chain still spawn through the supervised path,
+/// so this is `None` whenever the advance returns.
+pub(crate) fn advance_for_stage_next(
+    project_root: &Path,
+    phase: PhaseId,
+    stage: Option<Stage>,
+) -> Result<Option<StageLaunch>, CliError> {
+    advance_with(project_root, phase, stage).map(|()| None)
 }
 
 pub(crate) fn advance_with(
@@ -10209,7 +10446,7 @@ mod tests {
         sup_next.finish();
     }
 
-    /// The RV-04 order rule, as a pure scan over `src`: `spawn_agent_and_record`
+    /// The RV-04 order rule, as a pure scan over `src`: `spawn_supervised`
     /// records N+1 as the successor and never marks N handed off, and
     /// `run_monitor` takes the successor and marks the hand-off. Each function
     /// is its comment-stripped lines from the column-0 line starting with its
@@ -10232,7 +10469,7 @@ mod tests {
         }
         let has = |lines: &[&str], needle: &str| lines.iter().any(|line| line.contains(needle));
         let mut violations = Vec::new();
-        match body(src, "fn spawn_agent_and_record(", 40) {
+        match body(src, "fn spawn_supervised(", 40) {
             None => violations.push(SCAN_SPAWN_NOT_FOUND.to_string()),
             Some(lines) => {
                 if has(&lines, "OwnerPhase::HandedOff") {
@@ -10258,16 +10495,16 @@ mod tests {
     }
 
     const SCAN_SPAWN_NOT_FOUND: &str =
-        "spawn_agent_and_record not found (or under 40 comment-stripped lines)";
-    const SCAN_SPAWN_HANDS_OFF: &str = "spawn_agent_and_record enters the handed-off phase";
-    const SCAN_SPAWN_NO_SUCCESSOR: &str = "spawn_agent_and_record never calls record_successor";
+        "spawn_supervised not found (or under 40 comment-stripped lines)";
+    const SCAN_SPAWN_HANDS_OFF: &str = "spawn_supervised enters the handed-off phase";
+    const SCAN_SPAWN_NO_SUCCESSOR: &str = "spawn_supervised never calls record_successor";
     const SCAN_RUN_NOT_FOUND: &str = "run_monitor not found (or under 10 comment-stripped lines)";
     const SCAN_RUN_NO_HAND_OFF: &str = "run_monitor never enters the handed-off phase";
     const SCAN_RUN_NO_TAKE: &str = "run_monitor never calls take_successor";
 
     /// RV-04 (permanent source scan): N is marked handed off only in
     /// `run_monitor`, after its advance returned and only when the advance
-    /// recorded a successor; `spawn_agent_and_record` records the successor
+    /// recorded a successor; `spawn_supervised` records the successor
     /// and leaves N `Advancing`. Planted controls prove the scan can flag
     /// each violation and passes a correct layout.
     #[test]
@@ -10276,7 +10513,7 @@ mod tests {
         assert!(real.is_empty(), "pipeline_launch.rs: {real:?}");
 
         let pad = |n: usize| "    let _filler = 0;\n".repeat(n);
-        let spawn = |extra: &str| format!("fn spawn_agent_and_record(\n{}{extra}}}\n", pad(40));
+        let spawn = |extra: &str| format!("fn spawn_supervised(\n{}{extra}}}\n", pad(40));
         let run = |extra: &str| format!("pub(crate) fn run_monitor(\n{}{extra}}}\n", pad(10));
         let good_spawn = spawn("    record_successor(record);\n");
         let good_run = run(
@@ -10334,7 +10571,7 @@ mod tests {
         );
         assert_eq!(
             handoff_order_violations(&format!(
-                "fn spawn_agent_and_record(\n{}    record_successor(record);\n}}\n{good_run}",
+                "fn spawn_supervised(\n{}    record_successor(record);\n}}\n{good_run}",
                 pad(5)
             )),
             only(SCAN_SPAWN_NOT_FOUND),
@@ -13286,10 +13523,10 @@ mod tests {
     }
 
     const CLEAR_SPAWN_NOT_FOUND: &str =
-        "spawn_agent_and_record not found in the non-test code (or under 40 lines)";
+        "spawn_supervised not found in the non-test code (or under 40 lines)";
     const CLEAR_SPAWN_CLEARS: &str =
-        "spawn_agent_and_record clears the supervisor record in its own body";
-    const CLEAR_SPAWN_NO_HELPER: &str = "spawn_agent_and_record never calls record_failed_launch";
+        "spawn_supervised clears the supervisor record in its own body";
+    const CLEAR_SPAWN_NO_HELPER: &str = "spawn_supervised never calls record_failed_launch";
     const CLEAR_REFUSE_NOT_FOUND: &str =
         "refuse_launch not found in the non-test code (or under 3 lines)";
     const CLEAR_REFUSE_NO_CLEAR: &str = "refuse_launch does not clear the supervisor record";
@@ -13297,7 +13534,7 @@ mod tests {
         "FailoverRelaunchGuard::engage( is called outside fail_over_on_rate_limit";
 
     /// 50-13's rule as a pure scan over `source` (R6-G4): in the non-test,
-    /// comment-stripped code, `spawn_agent_and_record` never clears the
+    /// comment-stripped code, `spawn_supervised` never clears the
     /// supervisor record itself (only its failure helper does) and calls
     /// `record_failed_launch`, and `refuse_launch` clears the record. And
     /// (51-06) every line whose code part engages `FailoverRelaunchGuard` lies
@@ -13306,8 +13543,7 @@ mod tests {
         let lines = non_test_code_lines(source);
         let has = |item: &[&str], needle: &str| item.iter().any(|line| line.contains(needle));
         let mut violations = Vec::new();
-        match item_lines(&lines, "fn spawn_agent_and_record(", "}").filter(|item| item.len() >= 40)
-        {
+        match item_lines(&lines, "fn spawn_supervised(", "}").filter(|item| item.len() >= 40) {
             None => violations.push(CLEAR_SPAWN_NOT_FOUND.to_string()),
             Some(item) => {
                 if has(&item, "supervisor = None") {
@@ -13354,7 +13590,7 @@ mod tests {
         assert!(real.is_empty(), "pipeline_launch.rs: {real:?}");
 
         let pad = |n: usize| "    let _filler = 0;\n".repeat(n);
-        let spawn = |body: &str| format!("fn spawn_agent_and_record(\n{}{body}}}\n", pad(40));
+        let spawn = |body: &str| format!("fn spawn_supervised(\n{}{body}}}\n", pad(40));
         let refuse = |body: &str| {
             format!(
                 "fn refuse_launch(state: &mut State) {{\n{}{body}}}\n",
@@ -13407,7 +13643,7 @@ mod tests {
         );
         assert_eq!(
             launch_record_clear_violations(&format!(
-                "fn spawn_agent_and_record(\n{}    record_failed_launch(state)?;\n}}\n{good_refuse}",
+                "fn spawn_supervised(\n{}    record_failed_launch(state)?;\n}}\n{good_refuse}",
                 pad(5)
             )),
             only(CLEAR_SPAWN_NOT_FOUND),
@@ -14003,7 +14239,8 @@ mod tests {
     const DEFAULT_RENDER_OUTSIDE: &str = "a default intent is built outside default_stage_prompt";
     const DEFAULT_RENDER_INNER_BYPASS: &str =
         "launch_stage_inner does not call default_stage_prompt";
-    const DEFAULT_RENDER_OUTER_BYPASS: &str = "launch_stage does not call default_stage_prompt";
+    const DEFAULT_RENDER_OUTER_BYPASS: &str =
+        "launch_stage_next does not call default_stage_prompt";
 
     /// The fn named on a top-level line holding `fn <name>(` or `fn <name><`.
     fn top_level_fn_name(line: &str) -> Option<&str> {
@@ -14038,7 +14275,7 @@ mod tests {
     /// `mod tests {` line with comment lines and trailing comments stripped: the
     /// default stage intent is built exactly once, inside `default_stage_prompt`,
     /// and both `launch_stage_inner` (whose prompt the agent receives) and
-    /// `launch_stage` (which resolves the program from it) call that fn.
+    /// `launch_stage_next` (which resolves the program from it) call that fn.
     fn default_render_violations(source: &str) -> Vec<String> {
         let lines = non_test_code_lines(source);
         let owners = enclosing_top_level_fns(&lines);
@@ -14060,7 +14297,7 @@ mod tests {
         }
         for (caller, violation) in [
             ("launch_stage_inner", DEFAULT_RENDER_INNER_BYPASS),
-            ("launch_stage", DEFAULT_RENDER_OUTER_BYPASS),
+            ("launch_stage_next", DEFAULT_RENDER_OUTER_BYPASS),
         ] {
             let calls = lines.iter().zip(&owners).any(|(line, owner)| {
                 *owner == Some(caller) && code_part(line).contains("default_stage_prompt(")
@@ -14083,7 +14320,7 @@ mod tests {
         let caller = |header: &str, body: &str| format!("{header}\n{body}}}\n");
         let calls = "    let prompt = default_stage_prompt(state, driver.as_ref());\n";
         let inner = caller("pub(crate) fn launch_stage_inner(", calls);
-        let outer = caller("pub(crate) fn launch_stage(", calls);
+        let outer = caller("pub(crate) fn launch_stage_next(", calls);
         let strings = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
 
         assert_eq!(
@@ -14114,7 +14351,7 @@ mod tests {
             default_render_violations(&format!(
                 "{default_fn}{inner}{}",
                 caller(
-                    "pub(crate) fn launch_stage(",
+                    "pub(crate) fn launch_stage_next(",
                     "    let x = 1; // default_stage_prompt(\n"
                 )
             )),
