@@ -661,41 +661,15 @@ fn start_reserved(
         );
     }
 
-    // Pre-start divergence check: runs on current HEAD before any git
-    // mutation. WR-10 (13-REVIEW.md): only meaningful for the --no-worktree
-    // (branch-in-place) flow, where `start` actually branches from the main
-    // checkout's current HEAD. In worktree mode (the default) the agent's
-    // work always forks fresh from the resolved base via `worktree::add`, independent
-    // of whatever happens to be checked out in the main repo — checking the
-    // main checkout's divergence there is unrelated to what's about to
-    // happen and can either hard-fail on a stale unrelated branch or
-    // silently no-op if the main checkout happens to be on develop.
-    // CR-45-03: `for_project` reads `devflow.toml` / the environment AGAIN,
-    // which is a second resolution of a value this function already resolved
-    // fail-hard at the top and persisted onto `State`. The two can disagree
-    // — `git_flow_for_project` falls SOFT to `develop` where `base_branch`
-    // fails hard — and the message below interpolates `{base}` from the first
-    // resolution while the number came from the second, so an operator could
-    // be told how far behind `workspace/x` they are from a count taken
-    // against `develop`. One resolution, reused.
+    // CR-45-03: the `--no-worktree` fork below uses the base resolved once at the top
+    // and persisted onto `State`, never a second read of `devflow.toml` / the
+    // environment, which falls soft to `develop` where `base_branch` fails hard.
+    // 52.1 D-24: no check of how far the primary checkout is behind the base runs
+    // here: `feature_start` cuts the phase branch from the base whatever is checked out.
     let resolved_git_flow = devflow_core::config::GitFlowConfig {
         develop: resolved_base.value.clone(),
         ..devflow_core::config::GitFlowConfig::default()
     };
-    if !worktree
-        && let Ok((_ahead, behind)) =
-            GitFlow::with_config(project_root, resolved_git_flow.clone()).divergence_from_develop()
-    {
-        if behind > 50 {
-            return Err(CliError::Message(format!(
-                "{base} is {behind} commits ahead — your branch is too far behind. \
-                 Rebase onto {base} first."
-            )));
-        }
-        if behind > 10 {
-            println!("warning: {base} is {behind} commits ahead — consider rebasing first");
-        }
-    }
 
     if worktree {
         let wt = ensure_phase_worktree(project_root, phase, base)?;
@@ -712,7 +686,7 @@ fn start_reserved(
         // `develop` anyway. Both fork paths now agree, and (CR-45-03) they
         // agree on the value resolved ONCE above and persisted onto `State`,
         // not on a fresh read that can differ from it.
-        let git = GitFlow::with_config(project_root, resolved_git_flow.clone());
+        let git = GitFlow::with_config(project_root, resolved_git_flow);
         // 52.1 D-09.1, D-10: a leftover branch is refused before `feature_start`, which
         // would switch the primary checkout to the base before failing on it.
         let branch = format!("{FEATURE_PREFIX}phase-{padded}", padded = phase.padded());
