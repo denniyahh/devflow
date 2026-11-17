@@ -1461,6 +1461,7 @@ pub(crate) fn discard(
         &existing,
         registry::cache_dir().as_deref(),
     );
+    let liveness = wait_out_a_stopping_unit(project_root, phase, &existing, liveness)?;
     refuse_discard_of_a_live_run(phase, &existing, liveness)?;
     let items = discard_items(project_root, phase, &existing, &git, base)?;
     if items.worktree.is_none() && items.state.is_none() && items.unmerged.is_none() {
@@ -1473,6 +1474,39 @@ pub(crate) fn discard(
     refuse_discard_of_a_checked_out_branch(phase, &items)?;
     refuse_discard_of_branch(phase, &items, delete_unmerged_branch)?;
     remove_discarded(project_root, phase, &git, &items)
+}
+
+/// D-07a: a unit that is not yet inactive while the runner lock is free is waited on,
+/// under discard's phase holder, for [`crate::service::UNIT_STOP_WAIT`]; then the
+/// liveness is read again and that answer is acted on. A wait that fails refuses
+/// naming the unit and its last state, and so does a unit that reads stopping again.
+fn wait_out_a_stopping_unit(
+    project_root: &Path,
+    phase: PhaseId,
+    existing: &workflow::Existing,
+    liveness: PhaseRunLiveness,
+) -> Result<PhaseRunLiveness, CliError> {
+    let PhaseRunLiveness::RunnerStopping { unit, .. } = liveness else {
+        return Ok(liveness);
+    };
+    let refusal = |why: String| {
+        CliError::Message(format!(
+            "refusing to discard phase {phase} — {why}; run `devflow stop --phase {phase}` or \
+             wait for it to finish; nothing was removed"
+        ))
+    };
+    crate::service::wait_unit_inactive(&unit, crate::service::UNIT_STOP_WAIT).map_err(refusal)?;
+    match phase_run_liveness(
+        project_root,
+        phase,
+        existing,
+        registry::cache_dir().as_deref(),
+    ) {
+        PhaseRunLiveness::RunnerStopping { unit, state } => Err(refusal(format!(
+            "unit {unit} reads {state} again after it read inactive"
+        ))),
+        again => Ok(again),
+    }
 }
 
 /// The base discard counts "merged" against (D-10), and a [`GitFlow`] whose trunk is
@@ -1640,8 +1674,10 @@ pub(crate) enum RunnerLiveness {
     NotLive,
 }
 
-/// D-07: read [`liveness::runner_lock_path`] first, then, with the lock free, the
-/// phase's unit. Only [`RunnerLiveness::Live`] is a live-run refusal (D-12 as
+/// D-07: read [`liveness::runner_lock_path`] first, then, with the lock free, whether
+/// the user manager answers ([`crate::service::manager_available`]), then the phase's
+/// unit. An Absent manager prints the runner-lock-only note and reads no unit;
+/// Unreachable and Failed are errors. Only [`RunnerLiveness::Live`] is a live-run refusal (D-12 as
 /// corrected): a stopping unit is waited on, never refused before the wait.
 ///
 /// # Errors
@@ -1667,6 +1703,16 @@ pub(crate) fn runner_liveness(
             return Ok(RunnerLiveness::Live { pid });
         }
         Ok(liveness::Held::Abandoned | liveness::Held::Missing) => {}
+    }
+    // D-03, agy-2: with no manager there is no unit to read; only positive evidence
+    // of that (Absent) lets the lock answer alone, and the verb says so.
+    match crate::service::manager_available() {
+        Ok(()) => {}
+        Err(unavailable) if unavailable.kind == crate::service::ManagerUnavailableKind::Absent => {
+            eprintln!("{}", unavailable.describe(phase));
+            return Ok(RunnerLiveness::NotLive);
+        }
+        Err(unavailable) => return Err(unavailable.describe(phase)),
     }
     let unit = crate::service::unit_name(project_root, phase)
         .map_err(|error| format!("its unit name could not be derived ({error})"))?;
