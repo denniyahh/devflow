@@ -1149,7 +1149,7 @@ pub fn run_stage(
             match driven {
                 Ok(threads) => Some(threads),
                 Err(err) => {
-                    abandon_agent(&mut child);
+                    token.abandon(|| abandon_agent(&mut child));
                     return Err(err);
                 }
             }
@@ -1160,7 +1160,7 @@ pub fn run_stage(
     let outcome = match crate::stop::wait_owned_agent(token, pid, &mut child) {
         Ok(outcome) => outcome,
         Err(err) => {
-            abandon_agent(&mut child);
+            token.abandon(|| abandon_agent(&mut child));
             return Err(err.into());
         }
     };
