@@ -5,16 +5,16 @@ milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: "52.2"
 current_phase_name: Foreground Runner
 status: executing
-stopped_at: Completed 52.2-03-PLAN.md
-last_updated: "2026-11-17T05:31:53.001Z"
+stopped_at: Completed 52.2-21-PLAN.md
+last_updated: "2026-11-17T06:38:41.543Z"
 last_activity: 2026-11-16
 last_activity_desc: Phase 52.2 execution started
-state_head: 23abb6814cf6e804f63397b69530a677db155ab2
+state_head: 37fe2005acb9049104c80ebea9ff6997c7856113
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 66
-  completed_plans: 44
+  completed_plans: 45
   percent: 17
 ---
 
@@ -172,7 +172,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 52.2 (Foreground Runner) — EXECUTING
-Plan: 5 of 26
+Plan: 6 of 26
 Status: Ready to execute
 Last activity: 2026-11-16 — Phase 52.2 execution started
 
@@ -944,6 +944,8 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 52.2]: 52.2-02: fail_over_on_rate_limit keeps FailoverRelaunchGuard around launch_stage_next only; a handed-back relaunch carries HandoffRelaunch so a failed start names the handoff
 - [Phase 52.2]: 52.2-03: scripts/check.sh service treats the user manager as present only when systemctl --user show -p Version --value exits 0 AND prints a version (digit first); the pinned image's systemctl shim exits 0
 - [Phase 52.2]: 52.2-03: the CI service job is advisory until 52.2-18 sees it green on GitHub
+- [Phase 52.2]: Agent guard is its own dir after the test's own PATH entries and before the inherited PATH; service-bin entries would shadow test stubs
+- [Phase 52.2]: Agent-guard names come from driver_for(kind).build_command for every AgentKind, plus antigravity and gemini
 
 ## Roadmap Evolution
 
@@ -1099,11 +1101,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 52.2 P20 | 10 min | 2 tasks | 7 files |
 | Phase 52.2 P02 | 30 min | 3 tasks | 5 files |
 | Phase 52.2 P03 | 41 min | 2 tasks | 8 files |
+| Phase 52.2 P21 | 25min | 3 tasks | 10 files |
 
 ## Session
 
-**Last session:** 2026-11-17T05:31:51.764Z
-**Stopped at:** Completed 52.2-03-PLAN.md
+**Last session:** 2026-11-17T06:38:40.652Z
+**Stopped at:** Completed 52.2-21-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
