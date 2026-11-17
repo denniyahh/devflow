@@ -429,15 +429,30 @@ pub(crate) fn start(
         }
         Err(why) => {
             // WR-11's rule: a run that never launched leaves no state behind, so
-            // `devflow status` reports no phantom run and `start` can run again.
+            // `devflow status` reports no phantom run. Its worktree and branch stay, and
+            // the next `start` refuses them (52.1 D-09.1), so the line names `discard`.
             if let Err(clear_err) = workflow::clear_state(project_root, phase) {
                 eprintln!("warning: could not clear state after the failed launch: {clear_err}");
             }
-            Err(CliError::Message(format!(
-                "start: phase {phase} was not launched: {why}"
+            Err(CliError::Message(failed_launch_message(
+                phase, worktree, &why,
             )))
         }
     }
+}
+
+/// What `start` prints when its unit launch failed: the reason, what the start created
+/// and kept, and the verb that removes it before the next start.
+fn failed_launch_message(phase: PhaseId, worktree: bool, why: &str) -> String {
+    let kept = if worktree {
+        "its worktree and branch were created and are kept"
+    } else {
+        "its branch was created and is kept"
+    };
+    format!(
+        "start: phase {phase} was not launched: {why}; {kept}: run \
+         `devflow discard --phase {phase}` before starting it again"
+    )
 }
 
 /// `start --dry-run` (52.1 D-26, D-27): the real start's guard sequence, read-only and
@@ -6787,6 +6802,26 @@ mod tests {
         assert!(
             line.starts_with("live") && line.contains("in plan"),
             "post_exit_line did not return the live line at its bound: {line}"
+        );
+    }
+
+    /// A start whose unit launch failed names what it created and kept, and the verb that
+    /// removes it, since the next `start` refuses a leftover worktree or branch. Control:
+    /// a start without a worktree names only the branch.
+    #[test]
+    fn a_failed_launch_names_what_it_kept_and_discard() {
+        let phase = PhaseId::new(4405);
+        let with_worktree = failed_launch_message(phase, true, "systemd-run failed");
+        assert!(
+            with_worktree.contains("systemd-run failed")
+                && with_worktree.contains("worktree and branch")
+                && with_worktree.contains("devflow discard --phase 4405"),
+            "the failed-launch line does not name what was kept and discard: {with_worktree}"
+        );
+        let branch_only = failed_launch_message(phase, false, "systemd-run failed");
+        assert!(
+            branch_only.contains("its branch") && !branch_only.contains("worktree"),
+            "control: a start without a worktree names only its branch: {branch_only}"
         );
     }
 
