@@ -671,7 +671,7 @@ fn ensure_base_ref_current_to(
 
 // ---------------------------------------------------------------------------
 // 17c: preflight readiness gate (D-13-D-16) — generic universal checks +
-// adapter hook, run from `launch_stage` before `monitor::spawn_monitor` so a
+// adapter hook, run from `launch_stage` before `spawn_agent_and_record` so a
 // readiness failure is caught before any agent time is spent.
 // ---------------------------------------------------------------------------
 
@@ -844,10 +844,10 @@ fn unattended_config_condition(launch_root: &Path) -> ConditionState {
 /// C2: the Code stage would launch on the pipe-owning arm AND the driver has
 /// a real dogfooded run (round-3 F5/D-04).
 ///
-/// The chain-flag guard is engaged by the stage supervisor (`run_monitor`)
-/// for a stream launch only, the one shape that bounds the flag's lifetime to
-/// the agent's. Since 50-11 a capture launch runs under the same Rust
-/// supervisor but never engages it (before that the legacy arm was a detached
+/// The chain-flag guard is engaged by the runner (`run_one_stage`) for a
+/// stream launch only, the one shape that bounds the flag's lifetime to the
+/// agent's. A capture launch runs in the same runner but never engages it
+/// (before 50-11 the legacy arm was a detached
 /// shell script with no frame to hang a `Drop` on, `35.1-RESEARCH.md`
 /// Pitfall 4). This turns that accepted gap from a silent stall hours into an
 /// unattended run into a refusal before the first agent is spawned.
@@ -883,8 +883,8 @@ fn unattended_launch_shape_condition(state: &State) -> ConditionState {
     // The reason names the CAUSE that applied, and then the consequence in
     // terms true of every cause.
     ConditionState::DoesNotHold(format!(
-        "{} — so Code would launch on the capture shape, whose supervisor never engages the \
-         chain-flag guard (only a stream-shape supervisor does)",
+        "{} — so Code would launch on the capture shape, and the runner engages the \
+         chain-flag guard only for a stream launch",
         causes.join(" and ")
     ))
 }
@@ -1595,13 +1595,13 @@ mod tests {
     }
 
     /// A failing preflight check routes through the never-silent gate and,
-    /// on Abort, never reaches `monitor::spawn_monitor` — no `stage_launched`
+    /// on Abort, never reaches `spawn_agent_and_record` — no `stage_launched`
     /// event is ever recorded. The Abort response is pre-seeded so
     /// `run_gate`'s poll resolves immediately.
     #[test]
-    fn run_preflight_failing_check_gates_and_never_reaches_spawn_monitor() {
+    fn run_preflight_failing_check_gates_and_never_spawns_the_agent() {
         const NAME: &str =
-            "preflight::tests::run_preflight_failing_check_gates_and_never_reaches_spawn_monitor";
+            "preflight::tests::run_preflight_failing_check_gates_and_never_spawns_the_agent";
         enter_path_isolated_child!(NAME, agent_free_git_only_path_dir());
         assert!(
             std::env::var_os(devflow_core::test_support::CHILD_TEST_ENV).is_some(),
@@ -1636,7 +1636,7 @@ mod tests {
         );
         assert!(
             workflow::load_state(root, phase).is_err(),
-            "abort() must clear state — spawn_monitor was never reached"
+            "abort() must clear state — spawn_agent_and_record was never reached"
         );
         let last = devflow_core::events::last_event_for_phase(root, phase)
             .expect("gate_fired/gate_resolved must have been recorded");
@@ -4199,12 +4199,12 @@ mod tests {
         );
     }
 
-    /// Since 50-11 both launch shapes run under the same Rust supervisor,
-    /// and only a stream launch engages the chain-flag guard. The refusal
+    /// Both launch shapes run in the same runner, and only a stream launch
+    /// engages the chain-flag guard. The refusal
     /// says so, for every cause, and no longer says the capture shape
     /// "never starts" a pipe-owning monitor.
     #[test]
-    fn unattended_launch_shape_refusal_names_the_capture_supervisor() {
+    fn unattended_launch_shape_refusal_names_the_runners_stream_only_guard() {
         let dir = tempfile::tempdir().unwrap();
         let pi = State::new(
             PhaseId::new(43),
@@ -4225,8 +4225,8 @@ mod tests {
             };
             assert!(
                 reason.ends_with(
-                    " — so Code would launch on the capture shape, whose supervisor never \
-                     engages the chain-flag guard (only a stream-shape supervisor does)"
+                    " — so Code would launch on the capture shape, and the runner engages the \
+                     chain-flag guard only for a stream launch"
                 ),
                 "{reason}"
             );
