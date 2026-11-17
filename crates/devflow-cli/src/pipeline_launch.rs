@@ -1532,7 +1532,9 @@ fn run_one_stage(
     let ran = runner_stage_spec(launch).and_then(|spec| {
         monitor::run_stage(spec, token).map_err(|err| match err {
             // `MonitorError::Io`'s text names a monitor spawn; here the agent is spawned.
-            monitor::MonitorError::Io(io) => CliError::Message(io.to_string()),
+            monitor::MonitorError::Io(io) => {
+                CliError::Message(format!("could not spawn the agent: {io}"))
+            }
             other => CliError::Message(other.to_string()),
         })
     });
