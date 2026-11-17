@@ -703,10 +703,10 @@ fn corrupt_state(root: &Path, phase: PhaseId) -> Vec<u8> {
     CORRUPT_JSON.to_vec()
 }
 
-/// `devflow start --force` for `phase`, as the 48-19 refusal tests run it.
-fn force_start(home: &common::HermeticHome, root: &Path, phase: PhaseId) -> Output {
+/// `devflow start` for `phase`, as the 48-19 refusal tests run it.
+fn plain_start(home: &common::HermeticHome, root: &Path, phase: PhaseId) -> Output {
     let fake_bin = fake_codex("exit 0");
-    run_start(home, root, phase, &fake_bin, &["--force"])
+    run_start(home, root, phase, &fake_bin, &[])
 }
 
 /// Run `launch` (a `start` or `resume` over a corrupt state) and assert it is
@@ -782,7 +782,7 @@ fn run_printed_stop(home: &common::HermeticHome, root: &Path, words: &[String]) 
         .expect("run the printed devflow stop")
 }
 
-/// D-07: a live runner refuses `start --force` whatever the state names, here a state
+/// D-07: a live runner refuses `start` whatever the state names, here a state
 /// that will not load; the refusal names `devflow stop` and the runner keeps running.
 #[test]
 fn start_refuses_over_a_live_supervisor_when_the_state_will_not_load() {
@@ -796,7 +796,7 @@ fn start_refuses_over_a_live_supervisor_when_the_state_will_not_load() {
     corrupt_state(root, phase);
 
     let stderr =
-        assert_refused_over_a_corrupt_state(&home, root, phase, || force_start(&home, root, phase));
+        assert_refused_over_a_corrupt_state(&home, root, phase, || plain_start(&home, root, phase));
     assert!(
         stderr.contains(&format!("devflow stop --phase {phase}")),
         "the refusal names `devflow stop --phase {phase}`\nstderr: {stderr}"
@@ -810,7 +810,8 @@ fn start_refuses_over_a_live_supervisor_when_the_state_will_not_load() {
 /// The refusal over a live run whose state will not load prints a `devflow stop` that,
 /// run as printed, ends the run: the unit's runner is gone, the corrupt state bytes are
 /// unchanged, and `stop` says the state does not load, naming `devflow discard`. Once the
-/// run is gone, `start --force` proceeds.
+/// run is gone, `start` no longer refuses a live run: it refuses only the branch the run
+/// left, naming `devflow discard` (52.1 D-09.1).
 #[test]
 fn the_corrupt_state_refusal_names_a_stop_that_ends_the_run() {
     let home = common::HermeticHome::new();
@@ -822,7 +823,7 @@ fn the_corrupt_state_refusal_names_a_stop_that_ends_the_run() {
     let run = LiveRun::launch(&home, root, phase);
     let corrupt = corrupt_state(root, phase);
     let stderr =
-        assert_refused_over_a_corrupt_state(&home, root, phase, || force_start(&home, root, phase));
+        assert_refused_over_a_corrupt_state(&home, root, phase, || plain_start(&home, root, phase));
     let words = printed_stop_command(&stderr, phase);
     assert_eq!(
         words,
@@ -850,11 +851,14 @@ fn the_corrupt_state_refusal_names_a_stop_that_ends_the_run() {
         "stop must leave the corrupt state bytes unchanged"
     );
 
-    let again = force_start(&home, root, phase);
+    let again = plain_start(&home, root, phase);
+    let again_stderr = String::from_utf8_lossy(&again.stderr);
     assert!(
-        again.status.success(),
-        "once the run is stopped, start must not refuse over it\nstderr: {}",
-        String::from_utf8_lossy(&again.stderr)
+        !again.status.success()
+            && again_stderr.contains(&format!("devflow discard --phase {phase}"))
+            && !again_stderr.contains("devflow stop"),
+        "once the run is stopped, start refuses only the branch it left, naming discard\n\
+         stderr: {again_stderr}"
     );
 }
 
@@ -878,9 +882,16 @@ fn start_proceeds_over_a_corrupt_state_with_no_live_supervisor() {
         "the stopped run's runner to exit and free its lock",
     );
     corrupt_state(root, phase);
+    // The stopped run's branch is a leftover `start` refuses (52.1 D-09.1); removed here, as
+    // the operator would, so the corrupt state is the only thing left over.
+    git(root, &["checkout", "-q", "develop"]);
+    git(
+        root,
+        &["branch", "-D", &format!("feature/phase-{}", phase.padded())],
+    );
     let started_before = workflow_started_count(root);
 
-    let output = force_start(&home, root, phase);
+    let output = plain_start(&home, root, phase);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),

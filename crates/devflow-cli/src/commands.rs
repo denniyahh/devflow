@@ -13,9 +13,7 @@
 use crate::CliError;
 use crate::config_parse;
 use crate::config_parse::GATE_ESCALATION_THRESHOLD_SECS;
-use crate::phase_worktree::{
-    ensure_phase_worktree, refuse_force_over_unmerged_branch, unmerged_commits,
-};
+use crate::phase_worktree::{ensure_phase_worktree, leftover_refusal, unmerged_commits};
 use crate::pipeline_gate::print_dry_run;
 use crate::pipeline_launch::single_active_phase;
 use crate::pipeline_outcomes::render_gate_context;
@@ -192,8 +190,8 @@ pub(crate) fn ensure_base_is_a_local_branch(
 /// SAME phase (999.78/A-11, D-07).
 ///
 /// **Why exactly one field is treated differently from every other counter.**
-/// `State::new` zeroes all of them, and `start()` calls it unconditionally —
-/// `--force` included. A plain `State` field is therefore per-RUN, while D-07
+/// `State::new` zeroes all of them, and `start()` calls it unconditionally.
+/// A plain `State` field is therefore per-RUN, while D-07
 /// specifies a per-PHASE bound, and those are different lifetimes: a bound a
 /// restart resets does not bound the unattended case the bound was built for.
 /// Everything else on `State` genuinely is per-run and must keep starting at
@@ -359,7 +357,6 @@ pub(crate) fn start(
     phase: PhaseId,
     agent: AgentKind,
     mode: Mode,
-    force: bool,
     worktree: bool,
     dry_run: bool,
     until: Option<Stage>,
@@ -449,7 +446,7 @@ pub(crate) fn start(
     let mut created = reserved.created;
     #[cfg(test)]
     crate::pipeline_launch::launch_test_hold("holder_claimed");
-    let result = start_reserved(project_root, state, force, worktree, &mut created);
+    let result = start_reserved(project_root, state, worktree, &mut created);
     crate::pipeline_launch::abandon_reservation(project_root, phase, created);
     let mode = result?;
     match crate::service::launch_runner_unit(project_root, phase) {
@@ -556,7 +553,6 @@ pub(crate) fn print_runner_launched(phase: PhaseId, headline: &str, unit: &str) 
 fn start_reserved(
     project_root: &Path,
     mut state: State,
-    force: bool,
     worktree: bool,
     created: &mut bool,
 ) -> Result<Mode, CliError> {
@@ -693,7 +689,7 @@ fn start_reserved(
         if behind > 50 {
             return Err(CliError::Message(format!(
                 "{base} is {behind} commits ahead — your branch is too far behind. \
-                 Rebase onto {base} first, or use --force to override."
+                 Rebase onto {base} first."
             )));
         }
         if behind > 10 {
@@ -702,7 +698,7 @@ fn start_reserved(
     }
 
     if worktree {
-        let wt = ensure_phase_worktree(project_root, phase, force, base)?;
+        let wt = ensure_phase_worktree(project_root, phase, base)?;
         println!(
             "created worktree: {} (branch {FEATURE_PREFIX}phase-{padded})",
             wt.display(),
@@ -717,26 +713,14 @@ fn start_reserved(
         // agree on the value resolved ONCE above and persisted onto `State`,
         // not on a fresh read that can differ from it.
         let git = GitFlow::with_config(project_root, resolved_git_flow.clone());
-        let result = if force {
-            // `feature_start_force` resets the branch to the base in place,
-            // which loses commits not merged into it as surely as `-D`.
-            let branch = format!("{FEATURE_PREFIX}phase-{padded}", padded = phase.padded());
-            refuse_force_over_unmerged_branch(&git, &branch, base, None)?;
-            git.feature_start_force(phase)
-        } else {
-            git.feature_start(phase)
-        };
-        match result {
-            Ok(branch) => println!("created feature branch: {branch}"),
-            Err(err) => {
-                if !force {
-                    return Err(CliError::Message(format!(
-                        "{err}\nUse --force to overwrite the existing branch."
-                    )));
-                }
-                return Err(err.into());
-            }
+        // 52.1 D-09.1, D-10: a leftover branch is refused before `feature_start`, which
+        // would switch the primary checkout to the base before failing on it.
+        let branch = format!("{FEATURE_PREFIX}phase-{padded}", padded = phase.padded());
+        if git.branch_exists(&branch) {
+            return Err(leftover_refusal(phase, &format!("branch `{branch}`"), base));
         }
+        let branch = git.feature_start(phase)?;
+        println!("created feature branch: {branch}");
     }
 
     // 35.1 D-01, `start`'s half: repair a leaked
@@ -866,8 +850,9 @@ pub(crate) fn run_never_prepared(state: &State) -> bool {
 }
 
 /// The `start` that prepares what [`run_never_prepared`] says is missing. A worktree already
-/// at the phase's path makes a plain `start` refuse, so that case names `--force`, with what
-/// it costs after a `#` so the line still pastes into a shell.
+/// at the phase's path makes `start` refuse (52.1 D-09.1), so that case names
+/// `devflow discard` first, with what it removes after a `#` so the line still pastes into a
+/// shell.
 fn restart_verb(state: &State) -> String {
     let verb = format!(
         "devflow start --phase {} --agent {} --mode {}",
@@ -876,8 +861,9 @@ fn restart_verb(state: &State) -> String {
     let worktree_path = worktree::phase_path(&state.project_root, state.phase);
     if worktree_path.exists() {
         format!(
-            "{verb} --force  # recreates {} from the base, discarding what is in it; \
-             refused while its branch has commits not merged into the base",
+            "devflow discard --phase {} && {verb}  # discard removes {}, its branch and this \
+             state, and refuses a branch with commits not merged into the base unless you name it",
+            state.phase,
             worktree_path.display()
         )
     } else {
@@ -6341,7 +6327,6 @@ mod tests {
                 Mode::Supervise,
                 false,
                 false,
-                false,
                 None,
                 FallbackSource::FlagOrConfig(None),
             )
@@ -7872,8 +7857,8 @@ mod tests {
     }
 
     /// 999.78/A-11, reset event ZERO — the one that must NOT happen. The
-    /// per-phase Validate-failure total survives a `devflow start --force`
-    /// restart of the same phase, because a bound a restart resets does not
+    /// per-phase Validate-failure total survives a new `devflow start` of
+    /// the same phase, because a bound a restart resets does not
     /// bound the unattended case D-07 exists for.
     ///
     /// Exercises the function `start()` itself calls, not a reimplementation
@@ -11692,7 +11677,6 @@ mod tests {
             Mode::Supervise,
             false,
             false,
-            false,
             None,
             FallbackSource::FlagOrConfig(None),
         )
@@ -11726,7 +11710,6 @@ mod tests {
             phase,
             agent,
             mode,
-            false,
             false,
             false,
             None,
@@ -12100,13 +12083,12 @@ mod tests {
 
     /// A real `start` of what a killed one's refusal names, over `root`: a worktree start
     /// in Supervise mode with a stub `codex`, which returns once it has launched.
-    fn start_as_refusal_names(root: &Path, phase: PhaseId, force: bool) -> Result<(), String> {
+    fn start_as_refusal_names(root: &Path, phase: PhaseId) -> Result<(), String> {
         start(
             root,
             phase,
             AgentKind::Codex,
             Mode::Supervise,
-            force,
             true,
             false,
             None,
@@ -12140,16 +12122,16 @@ mod tests {
             "{err}"
         );
 
-        let result = start_as_refusal_names(root, phase, false);
+        let result = start_as_refusal_names(root, phase);
         result.expect("the start the refusal names launches");
     }
 
-    /// With a worktree already there, a plain `start` refuses, so the refusal and the hints
-    /// name `--force` and say what it discards, and that start launches.
+    /// With a worktree already there, `start` refuses naming `devflow discard` (52.1
+    /// D-09.1), so the refusal and the hints name discard and then `start`, and that pair
+    /// launches.
     #[test]
-    fn a_killed_start_with_a_worktree_names_a_force_start_that_launches() {
-        const NAME: &str =
-            "commands::tests::a_killed_start_with_a_worktree_names_a_force_start_that_launches";
+    fn a_killed_start_with_a_worktree_names_discard_then_a_start_that_launches() {
+        const NAME: &str = "commands::tests::a_killed_start_with_a_worktree_names_discard_then_a_start_that_launches";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = crate::test_support::go_waiting_agent_dir("codex");
             let output =
@@ -12161,22 +12143,29 @@ mod tests {
         let (root, phase) = (dir.path(), PhaseId::new(5305));
         init_start_repo(root, phase);
         let killed = state_of_a_start_killed_in_mode(root, phase, Mode::Supervise);
-        let worktree_path = ensure_phase_worktree(root, phase, false, DEVELOP).unwrap();
+        let worktree_path = ensure_phase_worktree(root, phase, DEVELOP).unwrap();
 
         let err = refuse_unprepared_run(&killed).unwrap_err().to_string();
-        let verb = format!("devflow start --phase {phase} --agent claude --mode supervise --force");
+        let verb = format!(
+            "devflow discard --phase {phase} && devflow start --phase {phase} --agent claude \
+             --mode supervise"
+        );
         assert!(err.contains(&format!("run `{verb}")), "{err}");
-        assert!(err.contains("discard"), "{err}");
         assert!(err.contains(&*worktree_path.to_string_lossy()), "{err}");
+        assert!(!err.contains("--force"), "{err}");
         assert!(!err.contains("no worktree"), "{err}");
         let row = not_live_row(&killed);
         assert!(row.starts_with("idle"), "{row}");
         assert!(row.contains(&format!("run `{verb}")), "{row}");
 
-        let refused = start_as_refusal_names(root, phase, false).unwrap_err();
-        assert!(refused.contains("use --force"), "{refused}");
+        let refused = start_as_refusal_names(root, phase).unwrap_err();
+        assert!(
+            refused.contains(&format!("devflow discard --phase {phase}")),
+            "{refused}"
+        );
 
-        let result = start_as_refusal_names(root, phase, true);
+        discard(root, phase, None).expect("the discard the refusal names runs");
+        let result = start_as_refusal_names(root, phase);
         result.expect("the start the refusal names launches");
     }
 
