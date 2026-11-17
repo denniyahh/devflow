@@ -37,12 +37,11 @@ use devflow_core::git::{GitFlow, git_command};
 use devflow_core::history;
 use devflow_core::liveness;
 use devflow_core::mode::Mode;
-use devflow_core::monitor;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::recover;
 use devflow_core::registry;
 use devflow_core::stage::Stage;
-use devflow_core::state::{AgentKind, PendingSupervisor, State};
+use devflow_core::state::{AgentKind, State};
 use devflow_core::workflow;
 use devflow_core::worktree;
 use std::collections::{BTreeSet, HashSet};
@@ -404,7 +403,7 @@ pub(crate) fn start(
 
     // D-01, D-02, D-03: the fallback is checked against the state as combined above
     // (agent and mode) and set before `dry_run`, the holder and the
-    // reservation, so a refused fallback changes nothing and a dry run shows it.
+    // guards, so a refused fallback changes nothing and a dry run shows it.
     if let Some(fallback) = fallback_agent {
         // D-02 and D-03 apply to the key's value exactly as to the flag's; a refusal
         // of a key-supplied fallback also names the key and how to override it.
@@ -439,28 +438,19 @@ pub(crate) fn start(
     // D-03: no launch without an answering user manager, and no fallback launch.
     refuse_without_a_user_manager(phase, LaunchVerb::Start)?;
 
-    // D-07: hold the phase across the guards, the reservation and the launch, until
-    // systemd-run returns. A launcher refused here has reserved nothing.
+    // D-07: hold the phase across the guards, the state write and the launch, until
+    // systemd-run returns. The phase holder is what keeps a second launcher out.
     let phase_holder = claim_foreground_holder(project_root, phase)?;
     // D-07a, D-12: a unit still stopping is waited out before any guard reads liveness.
     wait_out_a_stopping_unit(project_root, phase, LaunchVerb::Start)?;
 
-    // D-01, D-08: the reservation excludes a second launcher. Its guard runs before
-    // any gate cleanup, git mutation or run state, so a refusal changes nothing.
+    // D-01, D-08: the guards run before any gate cleanup, git mutation or run state,
+    // so a refusal changes nothing.
     let reserved = reserve_launch(project_root, phase, LaunchVerb::Start, Some(&state))?;
-    let launch_id = reserved.reservation.launch_id().to_string();
     let mut created = reserved.created;
-    crate::pipeline_launch::hold_reservation(reserved.reservation);
     #[cfg(test)]
     crate::pipeline_launch::launch_test_hold("holder_claimed");
-    let result = start_reserved(
-        project_root,
-        state,
-        force,
-        worktree,
-        &launch_id,
-        &mut created,
-    );
+    let result = start_reserved(project_root, state, force, worktree, &mut created);
     crate::pipeline_launch::abandon_reservation(project_root, phase, created);
     let mode = result?;
     match crate::service::launch_runner_unit(project_root, phase) {
@@ -558,16 +548,17 @@ pub(crate) fn print_runner_launched(phase: PhaseId, headline: &str, unit: &str) 
     }
 }
 
-/// [`start`] after its reservation: everything that can fail or return without
-/// launching, so `start` gives the reservation back whichever way this ends.
-/// `created` goes `false` once the state file holds this run, not only the
-/// reservation.
+/// [`start`] after its guards: everything that can fail or return without launching,
+/// so `start` gives the phase back whichever way this ends ([`abandon_reservation`]).
+/// `created` goes `false` once the state file holds this run, not only what the
+/// guard write left.
+///
+/// [`abandon_reservation`]: crate::pipeline_launch::abandon_reservation
 fn start_reserved(
     project_root: &Path,
     mut state: State,
     force: bool,
     worktree: bool,
-    launch_id: &str,
     created: &mut bool,
 ) -> Result<Mode, CliError> {
     let (phase, agent, mode) = (state.phase, state.agent, state.mode);
@@ -781,7 +772,7 @@ fn start_reserved(
 
     // Mark the run prepared, after the `if worktree { ... }` fork, where
     // `state.worktree_path` holds its final value. `run_never_prepared` reads
-    // this flag to tell this run from a state only the reservation wrote.
+    // this flag to tell this run from a state only the guard write left.
     // Persisted by `create_run_state` below rather than by a second write.
     state.verification_baseline_captured = true;
 
@@ -835,7 +826,7 @@ fn start_reserved(
     // WR-11 (13-REVIEW.md), revised: the state is on disk before the runner unit
     // exists, because the runner's first step loads it. If the launch then fails,
     // `start` clears it, so `devflow status` reports no phantom run.
-    create_run_state(project_root, phase, &mut state, launch_id)?;
+    create_run_state(project_root, phase, &state)?;
     *created = false;
     events::emit(
         project_root,
@@ -864,7 +855,7 @@ fn start_requires_phase_context(driver: &dyn agents::AgentDriver) -> bool {
     driver.interactivity_mode(Stage::Plan) == agents::InteractivityMode::RequiresExistingArtifact
 }
 
-/// Whether `state` is only what a `start`'s reservation wrote: that `start` died before
+/// Whether `state` is only what a `start`'s guard write left: that `start` died before
 /// preparing the run, so no worktree was forked, no base resolved and none of its guards
 /// passed. Every prepared run sets `verification_baseline_captured` in [`start_reserved`], and
 /// nothing resets it. `worktree_path` cannot say this, because `--no-worktree` leaves it
@@ -911,34 +902,17 @@ pub(crate) fn refuse_unprepared_run(state: &State) -> Result<(), CliError> {
 }
 
 /// Write a fresh run's state for `start`, under the write lock, over the state its
-/// reservation left. This is the one documented write of a whole state: it replaces
-/// what is on disk, keeping the reservation, and only while the state still names
-/// `launch_id`. If it no longer does, the reservation was cleared, and nothing launches.
-fn create_run_state(
-    project_root: &Path,
-    phase: PhaseId,
-    state: &mut State,
-    launch_id: &str,
-) -> Result<(), CliError> {
-    workflow::update_state_with(project_root, phase, |existing| {
-        let pending = match existing {
-            workflow::Existing::Loaded(reserved) => reserved.pending_supervisor,
-            _ => None,
-        }
-        .filter(|pending| pending.launch_id == launch_id);
-        if pending.is_none() {
-            return Err(CliError::Message(format!(
-                "phase {phase}: launch reservation {launch_id} was cleared while `start` \
-                 prepared the run — nothing was launched"
-            )));
-        }
-        state.pending_supervisor = pending;
+/// guard write left. This is the one documented write of a whole state: it replaces
+/// what is on disk. The phase holder `start` holds keeps every other launcher out, so
+/// nothing else wrote the phase's state in between (D-07).
+fn create_run_state(project_root: &Path, phase: PhaseId, state: &State) -> Result<(), CliError> {
+    workflow::update_state_with(project_root, phase, |_existing| {
         Ok::<_, CliError>((Some(state.clone()), ()))
     })
 }
 
-/// Copy a state file that does not load aside before a reservation replaces it, since a
-/// refused `start` then removes what the reservation wrote. A copy that cannot be made
+/// Copy a state file that does not load aside before the guard write replaces it, since a
+/// refused `start` then removes what that write left. A copy that cannot be made
 /// refuses the launch. Its name does not read as a state ([`workflow::list_states`]).
 fn keep_unloadable_state(state_file: &Path, kept: &Path) -> Result<(), CliError> {
     std::fs::copy(state_file, kept)
@@ -953,52 +927,41 @@ fn keep_unloadable_state(state_file: &Path, kept: &Path) -> Result<(), CliError>
         })
 }
 
-/// A launch's reservation, made at the top of `start` and `resume`.
+/// What a launch's guard write left, at the top of `start` and `resume`.
 pub(crate) struct Reserved {
-    /// The launch id and held liveness lock the supervisor will take over.
-    pub(crate) reservation: monitor::Reservation,
-    /// Whether the reservation's write created the state file, so that giving the
-    /// reservation back removes it.
+    /// Whether the guard write created the state file, so that giving the phase back
+    /// removes it.
     pub(crate) created: bool,
-    /// The state as the reservation wrote it.
+    /// The state as the guard write left it.
     pub(crate) state: State,
 }
 
-/// Record the launch before its supervisor exists (D-01): take a reservation, then
-/// in one write-lock closure run the live-run guard and write
-/// `state.pending_supervisor`, so two launchers cannot both pass the guard (V-05).
-/// `fresh` is `start`'s new state, written when none loads; `resume` passes `None`
-/// and gets its missing-state or load error once the guard has passed.
+/// Run a launch's guards in one write-lock closure (D-01): the live-run guard and the
+/// finished-run guard, then, for `start`, write `fresh` when no state loads. The phase
+/// holder the caller holds across the guards, the state write and the unit launch keeps
+/// a second launcher out (D-07). `resume` passes `None` and gets its missing-state or
+/// load error once the guard has passed.
 ///
-/// A refused launch gives the reservation back, so it leaves no liveness file and
-/// changes no state. The closure's only I/O is the guard's bounded probes: no spawn,
-/// hook or gate wait happens under the write lock (D-08).
+/// A refused launch changes no state. The closure's only I/O is the guard's bounded
+/// probes: no spawn, hook or gate wait happens under the write lock (D-08).
 pub(crate) fn reserve_launch(
     project_root: &Path,
     phase: PhaseId,
     verb: LaunchVerb,
     fresh: Option<&State>,
 ) -> Result<Reserved, CliError> {
-    let cache_dir = crate::pipeline_launch::launch_cache_dir()?;
-    let reservation =
-        monitor::Reservation::for_phase(&cache_dir, project_root, phase).map_err(|err| {
-            CliError::Message(format!(
-                "could not reserve a launch of phase {phase}: {err}"
-            ))
-        })?;
-    let pending = reservation.pending_record();
     let kept_unloadable_path = project_root.join(".devflow").join(format!(
         "unloadable-state-{}-{}.json",
         phase.padded(),
-        reservation.launch_id()
+        liveness::new_launch_id()
     ));
-    let written = workflow::update_state_with(project_root, phase, |existing| {
+    let outcome = workflow::update_state_with(project_root, phase, |existing| {
         refuse_launch_over_a_live_run(project_root, phase, verb)?;
         refuse_resume_of_a_finished_run(phase, verb, &existing)?;
         #[cfg(test)]
         crate::pipeline_launch::launch_test_hold("guarded");
         let state_file = workflow::state_path(project_root, phase);
-        let (mut next, created, replaced) = match (existing, fresh) {
+        let (next, created, replaced) = match (existing, fresh) {
             (workflow::Existing::Loaded(state), _) => (state, false, false),
             (workflow::Existing::Missing, Some(fresh)) => (fresh.clone(), true, false),
             (workflow::Existing::Unloadable(_), Some(fresh)) => {
@@ -1010,41 +973,24 @@ pub(crate) fn reserve_launch(
             }
             (workflow::Existing::Unloadable(error), None) => return Err(error.into()),
         };
-        // The guard has passed, so a reservation still here is abandoned.
-        let abandoned = next.pending_supervisor.replace(pending);
-        if let Some(abandoned) = &abandoned {
-            remove_abandoned_liveness_file(project_root, abandoned);
-        }
         let outcome = ReserveOutcome {
             state: next.clone(),
             created,
             replaced: replaced.then(|| (state_file, kept_unloadable_path.clone())),
-            abandoned: abandoned.map(|abandoned| abandoned.launch_id),
         };
-        Ok::<_, CliError>((Some(next), outcome))
-    });
-    let outcome = match written {
-        Ok(outcome) => outcome,
-        Err(err) => {
-            reservation.discard();
-            return Err(err);
-        }
-    };
+        Ok::<_, CliError>((created.then_some(next), outcome))
+    })?;
     if let Some((path, kept)) = outcome.replaced {
         println!(
             "note: replaced the state file {}, which did not load, with this launch's \
-             reservation; its bytes are kept at {}",
+             state; its bytes are kept at {}",
             path.display(),
             kept.display()
         );
     }
-    if let Some(launch_id) = outcome.abandoned {
-        println!("cleared an abandoned launch reservation {launch_id}");
-    }
     #[cfg(test)]
     crate::pipeline_launch::launch_test_hold("reserved");
     Ok(Reserved {
-        reservation,
         created: outcome.created,
         state: outcome.state,
     })
@@ -1054,30 +1000,9 @@ pub(crate) fn reserve_launch(
 struct ReserveOutcome {
     state: State,
     created: bool,
-    /// The state file a reservation replaced because it did not load, and the copy of
-    /// its bytes.
+    /// The state file the guard write replaced because it did not load, and the copy
+    /// of its bytes.
     replaced: Option<(PathBuf, PathBuf)>,
-    /// The launch id of the abandoned reservation this one replaced.
-    abandoned: Option<String>,
-}
-
-/// Remove an abandoned reservation's liveness file, best effort: `recover --clean`
-/// sweeps one left behind. Only the path this project's launch id derives to, and only
-/// while nothing holds it, because the path was read from a state file. An unheld hold
-/// file can never read live again, so removing it races no holder.
-pub(crate) fn remove_abandoned_liveness_file(project_root: &Path, abandoned: &PendingSupervisor) {
-    let path = &abandoned.liveness_path;
-    if liveness::launch_liveness_path(project_root, &abandoned.launch_id).as_ref() != Some(path)
-        || !matches!(liveness::probe(path), Ok(liveness::Held::Abandoned))
-    {
-        return;
-    }
-    if let Err(err) = std::fs::remove_file(path) {
-        eprintln!(
-            "warning: could not remove the abandoned liveness file {}: {err}",
-            path.display()
-        );
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -7330,7 +7255,7 @@ mod tests {
             "nothing held"
         );
 
-        let live_path = liveness::launch_liveness_path(&root, "aaaa0000aaaa5015").unwrap();
+        let live_path = root.join(".devflow/supervisor-aaaa0000aaaa5015.live");
         std::fs::create_dir_all(live_path.parent().unwrap()).unwrap();
         let reservation = liveness::Hold::take(&live_path).unwrap();
         assert!(registry_reachable_pids(roots).contains(&pid), "reservation");
@@ -11783,20 +11708,20 @@ mod tests {
         );
     }
 
-    /// What a `start`'s reservation does over a state file that does not load. On success
-    /// the reservation's lock is released and the state it wrote stays.
+    /// What a `start`'s guard write does over a state file that does not load. On success
+    /// the state it wrote stays.
     fn reserve_over_an_unloadable_state(root: &Path, phase: PhaseId) -> Result<(), String> {
         let path = workflow::state_path(root, phase);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "{ this is not a state").unwrap();
         let fresh = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         reserve_launch(root, phase, LaunchVerb::Start, Some(&fresh))
-            .map(|reserved| reserved.reservation.discard())
+            .map(|_reserved| ())
             .map_err(|err| err.to_string())
     }
 
-    /// The control: with no live lock, or only a released one, a `start` still replaces a
-    /// state file that does not load, the repair the reservation's note names.
+    /// The control: with no live lock, or only a released one left by an older build, a
+    /// `start` still replaces a state file that does not load, the repair its note names.
     #[test]
     fn a_start_replaces_an_unloadable_state_beside_a_released_lock() {
         const NAME: &str =
@@ -11812,21 +11737,23 @@ mod tests {
         let root = dir.path();
         let phase = PhaseId::new(5036);
         std::fs::create_dir_all(root.join(".devflow")).unwrap();
-        let lock = liveness::launch_liveness_path(root, &liveness::new_launch_id()).unwrap();
+        let lock = root
+            .join(".devflow")
+            .join(format!("supervisor-{}.live", liveness::new_launch_id()));
         drop(liveness::Hold::take(&lock).unwrap());
 
         reserve_over_an_unloadable_state(root, phase).expect("a released lock refuses nothing");
 
         assert!(
             workflow::load_state(root, phase).is_ok(),
-            "the reservation replaced the state file"
+            "the guard write replaced the state file"
         );
     }
 
-    /// A `start` that fails after reserving gives the reservation back: a state it
-    /// created is gone, an earlier run's state is as it was, and no liveness file is
-    /// left. The hold shows the reservation was really made, or a start that never
-    /// reserved would pass every check after it.
+    /// A `start` that fails after its guards gives the phase back: a state its guard
+    /// write created is gone, an earlier run's state is as it was, and no liveness file
+    /// is left. The hold shows the guard write was really made, or a start that never
+    /// wrote would pass every check after it.
     #[test]
     fn a_start_that_fails_after_reserving_gives_the_reservation_back() {
         const NAME: &str =
@@ -11874,7 +11801,7 @@ mod tests {
         });
 
         let observed = observed.expect("start returned without reaching its reservation hold");
-        assert!(observed.pending_supervisor.is_some(), "the start reserved");
+        assert_eq!(observed.phase, phase, "the state loaded at the hold");
         let err = result.expect_err("no agent binary resolves");
         assert!(err.contains("not found"), "{err}");
         assert_eq!(
@@ -11941,8 +11868,8 @@ mod tests {
             .unwrap();
     }
 
-    /// The state a `start` leaves when it is killed during preparation: its real
-    /// reservation, with the lock released as a dead process's is.
+    /// The state a `start` leaves when it is killed during preparation: what its real
+    /// guard write left.
     fn state_of_a_start_killed_during_preparation(root: &Path, phase: PhaseId) -> State {
         state_of_a_start_killed_in_mode(root, phase, Mode::Auto)
     }
@@ -11950,8 +11877,7 @@ mod tests {
     /// [`state_of_a_start_killed_during_preparation`] for a start in `mode`.
     fn state_of_a_start_killed_in_mode(root: &Path, phase: PhaseId, mode: Mode) -> State {
         let fresh = State::new(phase, AgentKind::Claude, mode, root.to_path_buf());
-        let reserved = reserve_launch(root, phase, LaunchVerb::Start, Some(&fresh)).unwrap();
-        reserved.reservation.discard();
+        reserve_launch(root, phase, LaunchVerb::Start, Some(&fresh)).unwrap();
         workflow::load_state(root, phase).unwrap()
     }
 
@@ -11976,7 +11902,10 @@ mod tests {
         let root = dir.path();
         let phase = PhaseId::new(5301);
         let killed = state_of_a_start_killed_during_preparation(root, phase);
-        assert!(killed.pending_supervisor.is_some(), "the start reserved");
+        assert!(
+            run_never_prepared(&killed),
+            "the start's guard write left it"
+        );
 
         let err = crate::pipeline_launch::resume(root, phase, None)
             .unwrap_err()
@@ -11990,7 +11919,6 @@ mod tests {
         );
         let after = workflow::load_state(root, phase).unwrap();
         assert_eq!(after.stage, Stage::Plan);
-        assert!(after.supervisor.is_none());
         assert!(!after.stopped, "the refusal marks nothing");
 
         let prepared = PhaseId::new(5302);
@@ -12094,17 +12022,17 @@ mod tests {
         let phase = PhaseId::new(5303);
         let start_verb = format!("devflow start --phase {phase} --agent claude --mode supervise");
         let resume_verb = format!("devflow resume --phase {phase}");
-        let killed = state_with_pending(root, phase, false);
+        let killed = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        workflow::save_state(&killed).unwrap();
         let mut stopped = killed.clone();
         stopped.stopped = true;
-        let mut unreserved = killed.clone();
-        unreserved.pending_supervisor = None;
 
-        for (case, state) in [
-            ("killed", &killed),
-            ("stopped after", &stopped),
-            ("a refused resume after", &unreserved),
-        ] {
+        for (case, state) in [("killed", &killed), ("stopped after", &stopped)] {
             let row = not_live_row(state);
             assert!(row.starts_with("idle"), "{case}: {row}");
             assert!(
@@ -12140,8 +12068,8 @@ mod tests {
     }
 
     /// A `start` refused during preparation, over a state file that does not load, leaves
-    /// that file's bytes on disk. Nothing else keeps them: its reservation replaced the file,
-    /// and giving the reservation back removes what it wrote.
+    /// that file's bytes on disk. Nothing else keeps them: its guard write replaced the file,
+    /// and giving the phase back removes what it wrote.
     #[test]
     fn a_start_refused_during_preparation_keeps_an_unloadable_states_bytes() {
         const NAME: &str =
@@ -12188,78 +12116,6 @@ mod tests {
         );
     }
 
-    /// V-03: a reservation whose lock nothing holds, or whose file is gone, is
-    /// abandoned. It blocks nothing, and the next launch replaces it and says so.
-    #[test]
-    fn an_abandoned_reservation_does_not_block_start() {
-        const NAME: &str = "commands::tests::an_abandoned_reservation_does_not_block_start";
-        const ABANDONED: &str = "aaaa0000aaaa5020";
-        if !devflow_core::test_support::in_child_test(NAME) {
-            let path_dir = crate::test_support::agent_free_git_only_path_dir();
-            for case in ["unheld", "missing"] {
-                let output = crate::test_support::run_hermetic_test_in_child(
-                    NAME,
-                    path_dir.path(),
-                    &[
-                        (RESERVE_CASE_ENV, std::ffi::OsStr::new(case)),
-                        // libtest would otherwise swallow the line this test is about.
-                        ("RUST_TEST_NOCAPTURE", std::ffi::OsStr::new("1")),
-                    ],
-                );
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                assert!(
-                    output.status.success() && stdout.contains("1 passed"),
-                    "{case}: {stdout}\n{}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                let line = format!("cleared an abandoned launch reservation {ABANDONED}");
-                assert!(stdout.contains(&line), "{case}: {stdout}");
-            }
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(5020);
-        let liveness_path = liveness::launch_liveness_path(root, ABANDONED).unwrap();
-        std::fs::create_dir_all(liveness_path.parent().unwrap()).unwrap();
-        let unheld = std::env::var(RESERVE_CASE_ENV).unwrap() == "unheld";
-        if unheld {
-            drop(liveness::Hold::take(&liveness_path).unwrap());
-        }
-        let mut abandoned = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        abandoned.stage = Stage::Code;
-        abandoned.pending_supervisor = Some(devflow_core::state::PendingSupervisor::new(
-            ABANDONED.to_string(),
-            root.join("never-published.sock"),
-            liveness_path.clone(),
-        ));
-        workflow::save_state(&abandoned).unwrap();
-        let fresh = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-
-        let reserved = reserve_launch(root, phase, LaunchVerb::Start, Some(&fresh))
-            .unwrap_or_else(|err| panic!("an abandoned reservation blocks nothing: {err}"));
-
-        let on_disk = workflow::load_state(root, phase).unwrap();
-        assert_eq!(
-            on_disk
-                .pending_supervisor
-                .as_ref()
-                .map(|p| p.launch_id.as_str()),
-            Some(reserved.reservation.launch_id()),
-            "the new reservation replaces the abandoned one"
-        );
-        assert_eq!(
-            on_disk.stage,
-            Stage::Code,
-            "the earlier run's state is kept"
-        );
-        assert!(
-            !liveness_path.exists(),
-            "the abandoned liveness file is gone"
-        );
-        reserved.reservation.discard();
-    }
-
     /// `start` writes a fresh run's state only while holding the write lock: with
     /// another writer holding it, the create returns after that writer is done.
     #[test]
@@ -12269,15 +12125,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(4902);
-        let launch_id = "aaaa0000aaaa4902";
-        let mut reserved = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        reserved.pending_supervisor = Some(devflow_core::state::PendingSupervisor::new(
-            launch_id.to_string(),
-            root.join("reserved.sock"),
-            root.join("reserved.live"),
-        ));
-        workflow::save_state(&reserved).unwrap();
-        let mut fresh = State::new(
+        let guarded = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        workflow::save_state(&guarded).unwrap();
+        let fresh = State::new(
             phase,
             AgentKind::Claude,
             Mode::Supervise,
@@ -12289,7 +12139,7 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         std::thread::scope(|scope| {
             let log = &log;
-            let fresh = &mut fresh;
+            let fresh = &fresh;
             let holder = scope.spawn(move || {
                 workflow::update_state_with(root, phase, |_existing| {
                     entered_tx.send(()).unwrap();
@@ -12301,7 +12151,7 @@ mod tests {
             });
             entered_rx.recv_timeout(HOLDER_ENTERS_WITHIN).unwrap();
             let creator = scope.spawn(move || {
-                create_run_state(root, phase, fresh, launch_id).unwrap();
+                create_run_state(root, phase, fresh).unwrap();
                 log.lock().unwrap().push(CREATE_RETURNS);
             });
             std::thread::sleep(BLOCKED_WRITER_GRACE);
@@ -12321,72 +12171,10 @@ mod tests {
         );
         assert_eq!(fresh.mode, Mode::Supervise, "the fresh state replaced it");
         assert_eq!(
-            fresh.pending_supervisor, reserved.pending_supervisor,
-            "the fresh state keeps the reservation"
+            guarded.mode,
+            Mode::Auto,
+            "control: what was on disk differed"
         );
-    }
-
-    /// The reservation was cleared while `start` prepared the run: the create refuses
-    /// and writes nothing, for a state naming another launch and for no state at all.
-    #[test]
-    fn a_fresh_run_is_refused_once_its_reservation_was_cleared() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(4903);
-        let mut fresh = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-
-        let err = create_run_state(root, phase, &mut fresh, "aaaa0000aaaa4903").unwrap_err();
-        assert!(err.to_string().contains("was cleared"), "{err}");
-        assert!(!workflow::state_path(root, phase).exists());
-
-        let mut other = fresh.clone();
-        other.pending_supervisor = Some(devflow_core::state::PendingSupervisor::new(
-            "bbbb0000bbbb4903".to_string(),
-            root.join("other.sock"),
-            root.join("other.live"),
-        ));
-        workflow::save_state(&other).unwrap();
-        let before = std::fs::read(workflow::state_path(root, phase)).unwrap();
-        let err = create_run_state(root, phase, &mut fresh, "aaaa0000aaaa4903").unwrap_err();
-        assert!(err.to_string().contains("was cleared"), "{err}");
-        assert_eq!(
-            std::fs::read(workflow::state_path(root, phase)).unwrap(),
-            before
-        );
-    }
-
-    // ---- 50.1-18: status, doctor and stop see the pending supervisor (D-02) ----
-
-    const PENDING_LAUNCH: &str = "bbbb0000bbbb5018";
-
-    /// A saved, not-stopped state naming `PENDING_LAUNCH` as pending, its socket never
-    /// published and its liveness file not yet created. With `recorded`, it also names
-    /// a supervisor whose socket does not exist (GONE).
-    fn state_with_pending(root: &Path, phase: PhaseId, recorded: bool) -> State {
-        let mut state = State::new(
-            phase,
-            AgentKind::Claude,
-            Mode::Supervise,
-            root.to_path_buf(),
-        );
-        if recorded {
-            state.supervisor = Some(devflow_core::state::SupervisorRecord::new(
-                root.join("gone.sock"),
-                "aaaa0000aaaa5018".to_string(),
-                1,
-                0,
-                "boot".to_string(),
-            ));
-        }
-        let liveness_path = liveness::launch_liveness_path(root, PENDING_LAUNCH).unwrap();
-        std::fs::create_dir_all(liveness_path.parent().unwrap()).unwrap();
-        state.pending_supervisor = Some(PendingSupervisor::new(
-            PENDING_LAUNCH.to_string(),
-            root.join("never-published.sock"),
-            liveness_path,
-        ));
-        workflow::save_state(&state).unwrap();
-        state
     }
 
     /// The row and the write-lock line `status` prints for `state`'s phase.
@@ -12467,7 +12255,7 @@ mod tests {
     }
 
     /// OPS-02: a run whose recorded worktree no longer exists is never reported
-    /// active, however live its supervisor record and agent pid look, and the output
+    /// active, however live its agent pid looks, and the output
     /// names the missing worktree. Control: the same state with the directory present
     /// is reported active.
     #[test]
@@ -12483,13 +12271,6 @@ mod tests {
             root.to_path_buf(),
         );
         state.worktree_path = Some(worktree.clone());
-        state.supervisor = Some(devflow_core::state::SupervisorRecord::new(
-            root.join("sup.sock"),
-            "aaaa0000aaaa5256".to_string(),
-            std::process::id(),
-            0,
-            "boot".to_string(),
-        ));
         workflow::save_state(&state).unwrap();
         let pid_file = agent_result::agent_pid_path(root, phase);
         std::fs::create_dir_all(pid_file.parent().unwrap()).unwrap();
@@ -12554,9 +12335,9 @@ mod tests {
         hold
     }
 
-    /// D-17 (V-31): `start` refuses while another process holds the phase, before it
-    /// reserves. The control is the same fixture through `reserve_launch` alone: the
-    /// reservation write the byte comparison would see from a `start` that claimed late.
+    /// D-17 (V-31): `start` refuses while another process holds the phase, before its
+    /// guards. The control is the no-state fixture through `reserve_launch` alone: the
+    /// guard write the absence check would see from a `start` that claimed late.
     #[test]
     fn start_refuses_while_another_process_holds_the_phase_before_reserving() {
         const NAME: &str =
@@ -12606,12 +12387,6 @@ mod tests {
             before,
             "byte-identical"
         );
-        assert_eq!(
-            workflow::load_state(root, phase)
-                .unwrap()
-                .pending_supervisor,
-            None
-        );
         assert!(liveness_files(root).is_empty(), "no liveness file is made");
 
         let no_state = tempfile::tempdir().unwrap();
@@ -12625,23 +12400,17 @@ mod tests {
             "with no state, none is created"
         );
 
-        let reserved = reserve_launch(root, phase, LaunchVerb::Start, Some(&dead))
-            .unwrap_or_else(|err| panic!("the control reserves: {err}"));
-        assert_ne!(
-            std::fs::read(&state_file).unwrap(),
-            before,
-            "control: a reservation changes the file, so the comparison would see one"
-        );
+        let reserved = reserve_launch(empty, phase, LaunchVerb::Start, Some(&dead))
+            .unwrap_or_else(|err| panic!("the control's guards pass: {err}"));
         assert!(
-            workflow::load_state(root, phase)
-                .unwrap()
-                .pending_supervisor
-                .is_some(),
-            "control: the reservation is written while the holder is held"
+            workflow::state_path(empty, phase).exists(),
+            "control: the guard write creates a state while the holder is held"
         );
-        let created = reserved.created;
-        crate::pipeline_launch::hold_reservation(reserved.reservation);
-        crate::pipeline_launch::abandon_reservation(root, phase, created);
+        crate::pipeline_launch::abandon_reservation(empty, phase, reserved.created);
+        assert!(
+            !workflow::state_path(empty, phase).exists(),
+            "control: giving the phase back removes it"
+        );
     }
 
     /// R-03: `status` and `doctor` read the write lock without waiting and name a held

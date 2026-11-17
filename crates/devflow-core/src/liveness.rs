@@ -1,12 +1,11 @@
 //! Liveness locks: a `flock` its holder keeps for as long as it lives, so a
-//! probe tells a live holder from an abandoned file with no pid read. A launch
-//! reservation ([`launch_liveness_path`]), the phase holder
-//! ([`phase_holder_path`]) and the runner lock ([`runner_lock_path`]) are each
-//! a [`Hold`].
+//! probe tells a live holder from an abandoned file with no pid read. The phase
+//! holder ([`phase_holder_path`]) and the runner lock ([`runner_lock_path`]) are
+//! each a [`Hold`].
 //!
-//! D-01's two cases are told apart by the lock alone: a reservation whose
-//! launcher still runs reads [`Held::Live`]; one whose launcher died holds
-//! nothing, so it reads [`Held::Abandoned`].
+//! D-01's two cases are told apart by the lock alone: a lock whose holder still
+//! runs reads [`Held::Live`]; one whose holder died holds nothing, so it reads
+//! [`Held::Abandoned`].
 //!
 //! A `flock` belongs to the open file description, so `unlock()` on any
 //! duplicate releases it. Dropping a [`Hold`] is the only release (pinned by
@@ -254,17 +253,6 @@ pub(crate) fn read_boot_id(path: &Path) -> Option<String> {
     let contents = std::fs::read_to_string(path).ok()?;
     let trimmed = contents.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
-}
-
-/// The liveness file of launch `launch_id`: `.devflow/supervisor-{launch_id}.live`.
-/// `None` unless the id has [`new_launch_id`]'s format, so a
-/// launch id read from disk never builds a path outside `.devflow/`.
-pub fn launch_liveness_path(project_root: &Path, launch_id: &str) -> Option<PathBuf> {
-    is_launch_id(launch_id).then(|| {
-        project_root
-            .join(".devflow")
-            .join(format!("supervisor-{launch_id}.live"))
-    })
 }
 
 /// The per-phase holder file (D-17): `.devflow/.holder-{padded}`.
@@ -956,17 +944,6 @@ mod tests {
         assert_eq!(
             production_lines_containing(source, ".write_all("),
             Vec::<String>::new()
-        );
-    }
-
-    #[test]
-    fn launch_liveness_path_refuses_an_invalid_launch_id() {
-        let root = Path::new("/project/root");
-        assert_eq!(launch_liveness_path(root, "../x"), None);
-        let launch_id = new_launch_id();
-        assert_eq!(
-            launch_liveness_path(root, &launch_id),
-            Some(root.join(format!(".devflow/supervisor-{launch_id}.live")))
         );
     }
 

@@ -329,39 +329,14 @@ fn remove_orphan_gate_files(
 }
 
 /// Why `state`'s run may still be live, or `None` when nothing says so. A probe that
-/// cannot finish counts as live (fail closed, Phase 50 T-50-40), and a STALE socket is
-/// not resolved through the backstop here: `devflow stop` does that.
-///
-/// It reads its socket probes in order and ends at the first that keeps the phase, so
-/// the two [`SOCKET_PROBES_PER_DECISION`] are all a decision makes.
+/// cannot finish counts as live (fail closed, Phase 50 T-50-40). The state records no
+/// launch, so only the phase's own activity can keep it.
 fn phase_may_be_live(project_root: &Path, state: &State) -> Option<String> {
-    if let Some(record) = &state.supervisor {
-        if let Some(reason) = socket_may_be_live("supervisor", &record.socket_path) {
-            return Some(reason);
-        }
-        // A supervisor holds this for its whole life, so it outlives a socket file that
-        // something outside DevFlow removed.
-        if let Some(path) = crate::liveness::launch_liveness_path(project_root, &record.launch_id) {
-            let held = crate::liveness::probe(&path);
-            if let Some(reason) = hold_may_be_live("supervisor", &path, held) {
-                return Some(reason);
-            }
-        }
-    }
-    if let Some(pending) = &state.pending_supervisor {
-        if let Some(reason) = socket_may_be_live("pending supervisor", &pending.socket_path) {
-            return Some(reason);
-        }
-        let held = crate::liveness::probe(&pending.liveness_path);
-        if let Some(reason) = hold_may_be_live("pending supervisor", &pending.liveness_path, held) {
-            return Some(reason);
-        }
-    }
     phase_activity_may_be_live(project_root, state.phase)
 }
 
-/// A held launch liveness file (`.devflow/supervisor-<id>.live`) that no other phase's
-/// loadable state records, so it may be a phase's supervisor before it publishes (D-01).
+/// A held launch liveness file (`.devflow/supervisor-<id>.live`), which no state can
+/// record, so it may be a phase's supervisor before it publishes (D-01).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct UnrecordedLiveLaunch {
@@ -378,15 +353,15 @@ impl UnrecordedLiveLaunch {
     pub fn describe(&self) -> String {
         match self.holder_pid {
             Some(pid) => format!(
-                "launch {}'s liveness lock {} is held by pid {pid} and no other phase's state \
-                 records it, so it may be this phase's supervisor before it publishes (inspect \
-                 it with `ps -o pid,lstart,args -p {pid}`)",
+                "launch {}'s liveness lock {} is held by pid {pid}, so it may be this phase's \
+                 supervisor before it publishes (inspect it with `ps -o pid,lstart,args -p \
+                 {pid}`)",
                 self.launch_id,
                 self.path.display()
             ),
             None => format!(
-                "launch {}'s liveness lock {} is held and no other phase's state records it, so \
-                 it may be this phase's supervisor before it publishes",
+                "launch {}'s liveness lock {} is held, so it may be this phase's supervisor \
+                 before it publishes",
                 self.launch_id,
                 self.path.display()
             ),
@@ -397,17 +372,15 @@ impl UnrecordedLiveLaunch {
 /// Every [`UnrecordedLiveLaunch`] in `project_root` but `own_launch_id`, for a `phase`
 /// whose own state is missing or does not load and so cannot name its launch.
 ///
-/// A launch the state of another phase records, as its supervisor or its pending
-/// launch, is that phase's. One no loadable state records is counted, whoever it
-/// belongs to: a state that does not load cannot clear it, and a launcher between its
-/// reservation and its record shows here for that moment. A lock that cannot be probed
-/// counts as held.
+/// No state records a launch, so every held one is counted, whoever it belongs to: a
+/// state that does not load cannot clear it. A lock that cannot be probed counts as
+/// held.
 ///
 /// # Errors
 /// `.devflow/` exists but cannot be listed.
 pub fn unrecorded_live_launches(
     project_root: &Path,
-    phase: PhaseId,
+    _phase: PhaseId,
     own_launch_id: Option<&str>,
 ) -> std::io::Result<Vec<UnrecordedLiveLaunch>> {
     let dir = project_root.join(".devflow");
@@ -416,15 +389,6 @@ pub fn unrecorded_live_launches(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
-    let recorded: Vec<String> = workflow::list_states(project_root)
-        .into_iter()
-        .filter(|state| state.phase != phase)
-        .flat_map(|state| {
-            let supervisor = state.supervisor.map(|record| record.launch_id);
-            let pending = state.pending_supervisor.map(|pending| pending.launch_id);
-            supervisor.into_iter().chain(pending)
-        })
-        .collect();
     let mut live = Vec::new();
     for entry in entries {
         let entry = entry?;
@@ -433,7 +397,7 @@ pub fn unrecorded_live_launches(
             .to_str()
             .and_then(|name| name.strip_prefix("supervisor-"))
             .and_then(|name| name.strip_suffix(".live"))
-            .filter(|id| Some(*id) != own_launch_id && !recorded.iter().any(|r| r == id))
+            .filter(|id| Some(*id) != own_launch_id)
         else {
             continue;
         };
@@ -496,23 +460,6 @@ fn phase_activity_may_be_live(project_root: &Path, phase: PhaseId) -> Option<Str
     }
 }
 
-/// Why a socket's probe keeps a phase, or `None` for a GONE socket.
-fn socket_may_be_live(what: &str, socket: &Path) -> Option<String> {
-    let socket_text = socket.display();
-    match probe_socket(socket) {
-        Ok(crate::supervisor::Liveness::Gone) => None,
-        Ok(crate::supervisor::Liveness::Alive(_)) => {
-            Some(format!("its {what} answers on socket {socket_text}"))
-        }
-        Ok(crate::supervisor::Liveness::Stale) => Some(format!(
-            "its {what}'s socket {socket_text} is STALE, so its agent may still run"
-        )),
-        Err(error) => Some(format!(
-            "its {what}'s socket {socket_text} could not be probed ({error})"
-        )),
-    }
-}
-
 /// Why a liveness file's probe keeps a phase, or `None` for an abandoned or missing one.
 fn hold_may_be_live(
     what: &str,
@@ -534,8 +481,8 @@ fn hold_may_be_live(
 /// it is gone from the live gate files.
 ///
 /// It takes the gate lock once for the whole phase (R2-03). It runs inside a
-/// [`workflow::clear_state_if`] decision, so that one wait, added to the decision's
-/// socket probes, is what a write-lock hold is made of: see the test
+/// [`workflow::clear_state_if`] decision, so that one wait is what a write-lock hold is
+/// made of: see the test
 /// `a_recover_decisions_worst_case_is_counted_on_its_real_paths`.
 fn remove_gate_files(
     project_root: &Path,
@@ -549,50 +496,8 @@ fn remove_gate_files(
     (removed, result)
 }
 
-/// How many socket probes one decision makes: `phase_may_be_live` probes the recorded
-/// and the pending socket, and nothing else in a decision probes a socket.
-#[cfg(test)]
-const SOCKET_PROBES_PER_DECISION: u32 = 2;
-
-/// [`crate::supervisor::probe`], counted in a test build.
-fn probe_socket(path: &Path) -> Result<crate::supervisor::Liveness, crate::supervisor::ProbeError> {
-    #[cfg(test)]
-    SOCKET_PROBES.with(|count| count.set(count.get() + 1));
-    crate::supervisor::probe(path)
-}
-
-/// `IO_TIMEOUT`s a socket probe that reads GONE can wait for: its connect and its ping's
-/// reply, which closes as the socket goes, so the probe's second look at the path is
-/// immediate. Only GONE lets a decision go on.
-#[cfg(test)]
-const IO_WAITS_PER_GONE_PROBE: u32 = 2;
-
-/// `IO_TIMEOUT`s a socket probe that keeps the phase can wait for: a connect and a reply
-/// on each of its two connects. A decision ends there, with no gate wait.
-#[cfg(test)]
-const IO_WAITS_PER_KEEPING_PROBE: u32 = 4;
-
-/// The longest one decision can hold the write lock for, from its waits alone: every
-/// probe reading GONE and then the gate waits, or all but the last reading GONE and the
-/// last keeping the phase, whichever is longer. Liveness-file probes take no wait.
-#[cfg(test)]
-fn decision_worst_case(
-    io_timeout: Duration,
-    gate_lock_wait: Duration,
-    socket_probes: u32,
-    gate_waits: u32,
-) -> Duration {
-    let gate_reached =
-        io_timeout * (socket_probes * IO_WAITS_PER_GONE_PROBE) + gate_lock_wait * gate_waits;
-    let kept =
-        io_timeout * ((socket_probes - 1) * IO_WAITS_PER_GONE_PROBE + IO_WAITS_PER_KEEPING_PROBE);
-    gate_reached.max(kept)
-}
-
 #[cfg(test)]
 thread_local! {
-    /// How many socket probes this thread has made through [`probe_socket`].
-    static SOCKET_PROBES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// What [`recover_test_hook`] runs on this thread.
     static RECOVER_HOOK: std::cell::RefCell<Option<RecoverHook>> =
         const { std::cell::RefCell::new(None) };
@@ -1668,92 +1573,6 @@ mod tests {
         body()
     }
 
-    /// A socket answering pings as a live supervisor does, until dropped, when its file
-    /// goes too: a probe then reads GONE.
-    struct TestSupervisor {
-        // Under /tmp: a socket path has to fit `sun_path`.
-        dir: tempfile::TempDir,
-        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-        server: Option<std::thread::JoinHandle<()>>,
-    }
-
-    impl TestSupervisor {
-        fn start() -> Self {
-            use crate::supervisor::protocol::{PingReply, Reply, read_request, write_reply};
-            let dir = tempfile::Builder::new()
-                .prefix("dfr")
-                .tempdir_in("/tmp")
-                .unwrap();
-            let listener = std::os::unix::net::UnixListener::bind(dir.path().join("s")).unwrap();
-            listener.set_nonblocking(true).unwrap();
-            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let stopping = stop.clone();
-            let server = std::thread::spawn(move || {
-                while !stopping.load(std::sync::atomic::Ordering::Relaxed) {
-                    let Ok((stream, _)) = listener.accept() else {
-                        std::thread::sleep(Duration::from_millis(5));
-                        continue;
-                    };
-                    stream.set_nonblocking(false).unwrap();
-                    if read_request(&stream).is_ok() {
-                        let reply = PingReply {
-                            launch_id: "aaaa0000aaaa2101".to_string(),
-                            phase: "2101".to_string(),
-                            stage: "code".to_string(),
-                            launch: "stream".to_string(),
-                            owner: "advancing".to_string(),
-                            agent_pid: 1,
-                            agent_pgid: 1,
-                            agent_start_time: 0,
-                            boot_id: None,
-                            supervisor_pid: std::process::id(),
-                        };
-                        let _ = write_reply(&stream, &Reply::Ping(reply));
-                    }
-                }
-            });
-            Self {
-                dir,
-                stop,
-                server: Some(server),
-            }
-        }
-
-        fn socket(&self) -> std::path::PathBuf {
-            self.dir.path().join("s")
-        }
-    }
-
-    impl Drop for TestSupervisor {
-        fn drop(&mut self) {
-            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-            if let Some(server) = self.server.take() {
-                let _ = server.join();
-            }
-            let _ = std::fs::remove_file(self.socket());
-        }
-    }
-
-    fn supervisor_record(socket: std::path::PathBuf) -> crate::state::SupervisorRecord {
-        crate::state::SupervisorRecord::new(
-            socket,
-            "aaaa0000aaaa2101".to_string(),
-            4_294_967_000,
-            1,
-            String::new(),
-        )
-    }
-
-    /// A reservation whose socket does not exist, with its liveness file named for the
-    /// caller to hold or not.
-    fn pending_record(root: &Path, id: &str) -> crate::state::PendingSupervisor {
-        crate::state::PendingSupervisor::new(
-            id.to_string(),
-            root.join("no-such.sock"),
-            root.join(format!(".devflow/supervisor-{id}.live")),
-        )
-    }
-
     /// Save a stale state (old, its agent pid dead) after `edit` has changed it.
     fn save_stale(root: &Path, phase: PhaseId, edit: impl FnOnce(&mut State)) {
         let mut state =
@@ -1781,132 +1600,9 @@ mod tests {
         }
     }
 
-    /// 999.166 item 2: with the agent gone and the run old, only the recorded socket
-    /// says the supervisor lives, between its agent's exit and its advance.
+    /// A held gate registration alone keeps a phase, with its own reason.
     #[test]
-    fn clean_without_a_phase_keeps_a_phase_whose_supervisor_is_live() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(2101);
-        let supervisor = TestSupervisor::start();
-        let socket = supervisor.socket();
-        save_stale(root, phase, |state| {
-            state.supervisor = Some(supervisor_record(socket.clone()));
-        });
-        let gate = Gates::write_gate(
-            root,
-            phase,
-            Stage::Code,
-            crate::gates::GateKind::StageFailure,
-            "left open",
-        )
-        .unwrap();
-        let state_path = workflow::state_path(root, phase);
-        let (state_before, gate_before) = (
-            std::fs::read(&state_path).unwrap(),
-            std::fs::read(&gate).unwrap(),
-        );
-
-        let report = clean_report(root).expect("clean");
-
-        assert_eq!(
-            std::fs::read(&state_path).ok(),
-            Some(state_before),
-            "a live supervisor's state must be byte-identical"
-        );
-        assert_eq!(std::fs::read(&gate).ok(), Some(gate_before));
-        assert!(report.cleared.is_empty(), "{:?}", report.cleared);
-        let socket_text = socket.display().to_string();
-        assert!(
-            report.warnings.iter().any(|w| w.contains(&socket_text)
-                && w.contains(&format!("devflow stop --phase {phase}"))),
-            "the warning names the socket and the repair: {:?}",
-            report.warnings
-        );
-
-        // Control: its supervisor shut down, the socket is GONE and the sweep clears.
-        drop(supervisor);
-        let report = clean_report(root).expect("clean");
-        assert_eq!(report.cleared, vec![phase], "{:?}", report.warnings);
-        assert!(!state_path.exists());
-        assert!(!gate.exists());
-    }
-
-    /// D-13 item 2 fails closed: a STALE socket is not resolved through the backstop here,
-    /// and a path that cannot be probed cannot say the supervisor is gone. Each keeps the
-    /// phase, naming the socket. `clean_without_a_phase_keeps_a_phase_whose_supervisor_is_live`
-    /// has the GONE control.
-    #[test]
-    fn clean_keeps_a_phase_whose_recorded_socket_is_stale_or_cannot_be_probed() {
-        let sockets = tempfile::Builder::new()
-            .prefix("dfr")
-            .tempdir_in("/tmp")
-            .unwrap();
-        let stale = sockets.path().join("stale");
-        drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
-        let unprobeable = sockets.path().join("file");
-        std::fs::write(&unprobeable, "not a socket").unwrap();
-
-        for (socket, expected) in [(stale, "STALE"), (unprobeable, "could not be probed")] {
-            let dir = tempfile::tempdir().unwrap();
-            let root = dir.path();
-            let phase = PhaseId::new(2107);
-            let record = supervisor_record(socket.clone());
-            save_stale(root, phase, |state| state.supervisor = Some(record));
-            let state_path = workflow::state_path(root, phase);
-            let before = std::fs::read(&state_path).unwrap();
-
-            let report = clean_report(root).expect("clean");
-
-            assert_eq!(std::fs::read(&state_path).ok(), Some(before), "{expected}");
-            assert!(
-                report.warnings.iter().any(|w| w.contains(expected)
-                    && w.contains(&socket.display().to_string())
-                    && w.contains(&format!("devflow stop --phase {phase}"))),
-                "{expected}: {:?}",
-                report.warnings
-            );
-            assert!(report.cleared.is_empty());
-        }
-    }
-
-    /// 50.1-16's refusal over a live pending supervisor had no test; each of a held
-    /// reservation and a held registration is enough on its own, with its own reason.
-    #[test]
-    fn clean_keeps_a_phase_with_a_live_pending_supervisor_or_a_registered_waiter() {
-        // A held pending liveness lock, with no socket yet.
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(2102);
-        let pending = pending_record(root, "aaaa0000aaaa2102");
-        let liveness_path = pending.liveness_path.clone();
-        save_stale(root, phase, |state| {
-            state.pending_supervisor = Some(pending)
-        });
-        let hold = crate::liveness::Hold::take(&liveness_path).unwrap();
-        let state_path = workflow::state_path(root, phase);
-        let before = std::fs::read(&state_path).unwrap();
-
-        let report = clean_report(root).expect("clean");
-
-        assert_eq!(
-            std::fs::read(&state_path).ok(),
-            Some(before),
-            "the phase's state must be byte-identical"
-        );
-        assert!(
-            report
-                .warnings
-                .iter()
-                .any(|w| w.contains("pending supervisor")
-                    && w.contains(&liveness_path.display().to_string())
-                    && w.contains(&format!("devflow stop --phase {phase}"))),
-            "{:?}",
-            report.warnings
-        );
-        drop(hold);
-        sweep_until_cleared(root, phase);
-
+    fn clean_keeps_a_phase_with_a_registered_waiter() {
         // A held gate registration alone.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1983,23 +1679,12 @@ mod tests {
     }
 
     /// R2-03: what one write-lock hold can wait for, counted on both paths and then
-    /// summed on the shipped constants.
-    ///
-    /// The probe's cost comes from `supervisor::probe`, whose step 5 reads a second time
-    /// after a closed ping: `probe_can_read_gone_after_a_slow_connect_and_a_closed_ping`
-    /// measures that path. With both sockets dying that way and a wedged gate lock, the
-    /// hold outlasts [`workflow::WRITE_LOCK_REPAIR_WAIT`], so a concurrent repair verb gets
-    /// a refusal naming the holder, not a hang. Every other reading ends sooner.
-    /// Not established: fsync-bound file operations on a slow disk, a peer dripping its
-    /// reply a byte at a time (the timeout is per read), or a `recover` process that is
-    /// itself SIGSTOPped.
+    /// summed on the shipped constants. A decision probes no socket, so its one gate
+    /// wait is all a hold is made of, and it fits [`workflow::WRITE_LOCK_REPAIR_WAIT`].
     #[test]
     fn a_recover_decisions_worst_case_is_counted_on_its_real_paths() {
         let phase_with_every_gate = |root: &Path, phase: PhaseId| {
-            save_stale(root, phase, |state| {
-                state.supervisor = Some(supervisor_record(root.join("gone.sock")));
-                state.pending_supervisor = Some(pending_record(root, "aaaa0000aaaa2105"));
-            });
+            save_stale(root, phase, |_| {});
             for stage in crate::gates::STAGES {
                 Gates::write_gate(
                     root,
@@ -2011,69 +1696,32 @@ mod tests {
                 .unwrap();
             }
         };
-        let counts = || {
-            (
-                SOCKET_PROBES.with(std::cell::Cell::get),
-                crate::gates::gate_lock_acquisitions(),
-            )
-        };
         let phase = PhaseId::new(2105);
 
         let dir = tempfile::tempdir().unwrap();
         phase_with_every_gate(dir.path(), phase);
-        let before = counts();
+        let before = crate::gates::gate_lock_acquisitions();
         let report = clean_report(dir.path()).expect("clean");
-        let after = counts();
+        let after = crate::gates::gate_lock_acquisitions();
         assert_eq!(report.cleared, vec![phase], "{:?}", report.warnings);
-        assert_eq!(
-            after.0 - before.0,
-            SOCKET_PROBES_PER_DECISION,
-            "sweep probes"
-        );
-        assert_eq!(after.1 - before.1, 1, "sweep gate-lock acquisitions");
+        assert_eq!(after - before, 1, "sweep gate-lock acquisitions");
 
         let dir = tempfile::tempdir().unwrap();
         phase_with_every_gate(dir.path(), phase);
-        let before = counts();
+        let before = crate::gates::gate_lock_acquisitions();
         clean_phase_report(dir.path(), phase).expect("explicit clean");
-        let after = counts();
+        let after = crate::gates::gate_lock_acquisitions();
         assert!(!workflow::state_path(dir.path(), phase).exists());
-        assert_eq!(
-            after.0 - before.0,
-            SOCKET_PROBES_PER_DECISION,
-            "explicit probes"
-        );
-        assert_eq!(after.1 - before.1, 1, "explicit gate-lock acquisitions");
+        assert_eq!(after - before, 1, "explicit gate-lock acquisitions");
 
-        let (io, gate, repair) = (
-            crate::supervisor::protocol::IO_TIMEOUT,
+        let (gate, repair) = (
             crate::gates::GATE_LOCK_WAIT,
             workflow::WRITE_LOCK_REPAIR_WAIT,
         );
-        let worst = decision_worst_case(io, gate, SOCKET_PROBES_PER_DECISION, 1);
-        assert_eq!(
-            worst,
-            Duration::from_secs(13),
-            "the figure ARCHITECTURE.md and `status` state"
-        );
-        assert!(
-            worst >= repair,
-            "{worst:?} fits {repair:?}: the docs saying a repair verb can give up are stale"
-        );
-        // Sockets that read GONE at once leave the gate wait alone, which does fit.
         assert!(gate < repair, "{gate:?} must fit {repair:?}");
-        // Control: one gate wait per stage, the shape before R2-03, is far longer.
-        let per_stage = decision_worst_case(
-            io,
-            gate,
-            SOCKET_PROBES_PER_DECISION,
-            crate::gates::STAGES.len() as u32,
-        );
-        let extra_gate_waits = crate::gates::STAGES.len() as u32 - 1;
-        assert!(
-            per_stage >= worst + gate * extra_gate_waits,
-            "{per_stage:?} against {worst:?}"
-        );
+        // Control: one gate wait per stage, the shape before R2-03, does not fit.
+        let per_stage = gate * crate::gates::STAGES.len() as u32;
+        assert!(per_stage >= repair, "{per_stage:?} against {repair:?}");
     }
 
     /// R-07: run A is stale when the sweep lists it, and run B has replaced it by the
@@ -2096,7 +1744,7 @@ mod tests {
             .unwrap();
         }
         let gate = Gates::gate_path(&root, replaced, Stage::Code);
-        // Kept alive to the end of the test: B's reservation and registration.
+        // Kept alive to the end of the test: B's registration.
         let held = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let run_b = std::rc::Rc::new(std::cell::RefCell::new(None));
         let (hook_root, hook_held, hook_run_b) = (root.clone(), held.clone(), run_b.clone());
@@ -2109,11 +1757,8 @@ mod tests {
                 }
                 fired = true;
                 let root = hook_root.as_path();
-                let pending = pending_record(root, "bbbb0000bbbb2110");
-                let hold = crate::liveness::Hold::take(&pending.liveness_path).unwrap();
                 workflow::update_state_with(root, phase, |_| {
-                    let mut run_b = state_aged_phase(root, phase, 0, None);
-                    run_b.pending_supervisor = Some(pending);
+                    let run_b = state_aged_phase(root, phase, 0, None);
                     Ok::<_, WorkflowError>((Some(run_b), ()))
                 })
                 .unwrap();
@@ -2130,7 +1775,7 @@ mod tests {
                     std::fs::read(&opened.path).unwrap(),
                     Gates::waiter_path(root, phase, Stage::Code, &opened.gate_id),
                 ));
-                hook_held.borrow_mut().push((hold, registration));
+                hook_held.borrow_mut().push(registration);
             },
             || clean_report(&root).expect("clean"),
         );
@@ -2287,93 +1932,6 @@ mod tests {
         assert!(!opened.path.exists());
     }
 
-    /// 50.1-16: an explicit clean must not delete a launch whose supervisor holds its
-    /// reservation, even with no socket yet. The CLI refuses first through its own guard;
-    /// this is the decision under the lock, which a `start` racing that guard reaches.
-    #[test]
-    fn explicit_clean_refuses_a_live_pending_supervisor() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(2123);
-        let pending = pending_record(root, "aaaa0000aaaa2123");
-        let liveness_path = pending.liveness_path.clone();
-        let mut state = state_aged_phase(root, phase, 0, None);
-        state.pending_supervisor = Some(pending);
-        workflow::save_state(&state).unwrap();
-        let hold = crate::liveness::Hold::take(&liveness_path).unwrap();
-        let state_path = workflow::state_path(root, phase);
-        let before = std::fs::read(&state_path).unwrap();
-
-        let report = clean_phase_report(root, phase).expect("a keep is reported, not an error");
-
-        assert_eq!(std::fs::read(&state_path).ok(), Some(before));
-        assert!(report.removal_failed);
-        assert!(
-            report
-                .warnings
-                .iter()
-                .any(|w| w.contains("pending supervisor")
-                    && w.contains(&liveness_path.display().to_string())),
-            "{:?}",
-            report.warnings
-        );
-
-        drop(hold);
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while state_path.exists() {
-            let report = clean_phase_report(root, phase).expect("explicit clean");
-            assert!(
-                std::time::Instant::now() < deadline,
-                "{:?}",
-                report.warnings
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
-
-    /// A supervisor whose socket file vanished still holds its launch's liveness file, so
-    /// an explicit clean keeps its state. Control: the same record once the lock is
-    /// released is cleaned, so a GONE socket alone was never what kept it.
-    #[test]
-    fn explicit_clean_refuses_a_recorded_supervisor_holding_its_lock_with_its_socket_gone() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(2131);
-        let record = supervisor_record(root.join("vanished.sock"));
-        let liveness_path = crate::liveness::launch_liveness_path(root, &record.launch_id).unwrap();
-        let mut state = state_aged_phase(root, phase, 0, None);
-        state.supervisor = Some(record);
-        workflow::save_state(&state).unwrap();
-        let hold = crate::liveness::Hold::take(&liveness_path).unwrap();
-        let state_path = workflow::state_path(root, phase);
-
-        let report = clean_phase_report(root, phase).expect("a keep is reported, not an error");
-
-        assert!(state_path.exists(), "{:?}", report.warnings);
-        assert!(report.removal_failed);
-        assert!(
-            report
-                .warnings
-                .iter()
-                .any(|w| w.contains("supervisor")
-                    && w.contains(&liveness_path.display().to_string())),
-            "{:?}",
-            report.warnings
-        );
-
-        drop(hold);
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while state_path.exists() {
-            let report = clean_phase_report(root, phase).expect("explicit clean");
-            assert!(
-                std::time::Instant::now() < deadline,
-                "{:?}",
-                report.warnings
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
-
     /// With no state to read, a state that does not parse, or both, a live waiter or
     /// holder still keeps the files: the lock this replaced refused whatever the state.
     #[test]
@@ -2416,7 +1974,7 @@ mod tests {
     /// A supervisor that has not published shows only through its held liveness file, and
     /// a state that does not load names no launch: an explicit clean must keep that state,
     /// or a later `start` over the missing state launches a second supervisor beside it.
-    /// Controls: the same lock recorded by another phase's state, or released, keeps nothing.
+    /// Control: the same lock, released, keeps nothing.
     #[test]
     fn explicit_clean_keeps_an_unloadable_state_beside_an_unrecorded_live_launch() {
         let dir = tempfile::tempdir().unwrap();
@@ -2427,7 +1985,9 @@ mod tests {
         let write_unloadable = || std::fs::write(&state_path, "{\"stage\":").unwrap();
         write_unloadable();
         let launch_id = crate::liveness::new_launch_id();
-        let lock = crate::liveness::launch_liveness_path(root, &launch_id).unwrap();
+        let lock = root
+            .join(".devflow")
+            .join(format!("supervisor-{launch_id}.live"));
         let hold = crate::liveness::Hold::take(&lock).unwrap();
 
         let report = clean_phase_report(root, phase).expect("a keep is reported, not an error");
@@ -2447,21 +2007,6 @@ mod tests {
             "the keep names the launch and its holder pid: {:?}",
             report.warnings
         );
-
-        let other = PhaseId::new(2127);
-        let mut recorder = state_aged_phase(root, other, 0, None);
-        recorder.pending_supervisor = Some(crate::state::PendingSupervisor::new(
-            launch_id.clone(),
-            root.join("unused.sock"),
-            lock.clone(),
-        ));
-        workflow::save_state(&recorder).unwrap();
-        clean_phase_report(root, phase).expect("explicit clean");
-        assert!(
-            !state_path.exists(),
-            "control: a live launch another phase records keeps nothing"
-        );
-        workflow::clear_state(root, other).unwrap();
 
         write_unloadable();
         drop(hold);

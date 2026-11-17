@@ -11,7 +11,7 @@ use crate::agent_result::{
 use crate::git::hermetic_command;
 use crate::phase_id::PhaseId;
 use crate::stage::Stage;
-use crate::state::{AgentKind, State};
+use crate::state::AgentKind;
 use crate::stop::AgentOutcome;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::process::CommandExt;
@@ -50,15 +50,6 @@ pub enum MonitorError {
     /// A supervision shape that this build cannot run yet.
     #[error("supervision shape not ready: {0}")]
     NotReady(String),
-    /// This launch's liveness lock could not be taken or adopted (D-01), so
-    /// the launch ended before any agent existed.
-    #[error("liveness lock of launch {launch_id}: {reason}")]
-    Liveness {
-        /// The launch's id, as it was given.
-        launch_id: String,
-        /// What went wrong.
-        reason: String,
-    },
 }
 
 /// Idle-timeout default in seconds (D-02): the measured constraint-8 floor.
@@ -302,115 +293,6 @@ pub(crate) fn strip_notify_env(child_cmd: &mut std::process::Command) {
 
 /// The variable systemd names a `Type=notify` unit's notify socket in.
 const NOTIFY_SOCKET_ENV: &str = "NOTIFY_SOCKET";
-
-/// A launch's reservation (D-01): the launch id, socket path and held liveness
-/// file `start` and `resume` create before they launch the runner, recorded as
-/// the state's pending record.
-///
-/// No process binds the socket path: it is the name a launch's socket had,
-/// kept so the pending record keeps its shape. Dropping the reservation is the
-/// only release of its liveness lock.
-#[derive(Debug)]
-pub struct Reservation {
-    launch_id: String,
-    socket: PathBuf,
-    liveness: crate::liveness::Hold,
-}
-
-impl Reservation {
-    /// Create a launch id for `state`'s phase and take its liveness lock under
-    /// the project's `.devflow/`.
-    ///
-    /// # Errors
-    /// The lock could not be taken.
-    pub fn new(cache_dir: &Path, state: &State) -> Result<Self, MonitorError> {
-        Self::for_phase(cache_dir, &state.project_root, state.phase)
-    }
-
-    /// [`Reservation::new`] for a launcher that has no state yet: it reserves
-    /// before it reads one (D-01).
-    ///
-    /// # Errors
-    /// The lock could not be taken.
-    pub fn for_phase(
-        cache_dir: &Path,
-        project_root: &Path,
-        phase: PhaseId,
-    ) -> Result<Self, MonitorError> {
-        let launch_id = crate::liveness::new_launch_id();
-        let socket = crate::registry::socket_dir_in(cache_dir).join(format!(
-            "{digest:016x}-{padded}-{launch_id}.sock",
-            digest = crate::registry::path_digest(project_root),
-            padded = phase.padded()
-        ));
-        let path = liveness_path_of(project_root, &launch_id)?;
-        let failed = |err: std::io::Error| liveness_error(&launch_id, err);
-        if let Some(dir) = path.parent() {
-            crate::workflow::ensure_devflow_dir(dir).map_err(failed)?;
-        }
-        let liveness = crate::liveness::Hold::take(&path).map_err(failed)?;
-        Ok(Self {
-            launch_id,
-            socket,
-            liveness,
-        })
-    }
-
-    /// The launch id the pending record names.
-    pub fn launch_id(&self) -> &str {
-        &self.launch_id
-    }
-
-    /// The socket path the pending record names; nothing binds it.
-    pub fn socket_path(&self) -> &Path {
-        &self.socket
-    }
-
-    /// The liveness file this reservation holds.
-    pub fn liveness_path(&self) -> &Path {
-        self.liveness.path()
-    }
-
-    /// This reservation as the record a launcher saves before it spawns.
-    pub fn pending_record(&self) -> crate::state::PendingSupervisor {
-        crate::state::PendingSupervisor::new(
-            self.launch_id.clone(),
-            self.socket_path().to_path_buf(),
-            self.liveness_path().to_path_buf(),
-        )
-    }
-
-    /// Give back a reservation nothing was launched from: remove its liveness file,
-    /// then drop the hold. Never `unlock()`: only dropping releases the lock.
-    pub fn discard(self) {
-        if let Err(err) = std::fs::remove_file(self.liveness_path())
-            && err.kind() != std::io::ErrorKind::NotFound
-        {
-            warn!(
-                "could not remove the liveness file {}: {err}",
-                self.liveness_path().display()
-            );
-        }
-    }
-}
-
-/// `launch_id`'s liveness file under `project_root`; an id that is not a launch
-/// id never builds a path.
-fn liveness_path_of(project_root: &Path, launch_id: &str) -> Result<PathBuf, MonitorError> {
-    crate::liveness::launch_liveness_path(project_root, launch_id).ok_or_else(|| {
-        MonitorError::Liveness {
-            launch_id: launch_id.to_string(),
-            reason: "not a launch id".to_string(),
-        }
-    })
-}
-
-fn liveness_error(launch_id: &str, err: std::io::Error) -> MonitorError {
-    MonitorError::Liveness {
-        launch_id: launch_id.to_string(),
-        reason: err.to_string(),
-    }
-}
 
 /// Constraint 4's close rule as a pure, line-fed state machine: stdin may be
 /// released only once a `DEVFLOW_RESULT` marker has appeared inside a
