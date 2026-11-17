@@ -36,6 +36,21 @@ use devflow_core::{events, registry, reset_time};
 use std::path::Path;
 use tracing::info;
 
+/// The stop reason [`transition`] records when the `--until` cap halts the run after
+/// `stage` completed.
+pub(crate) fn until_halt_reason(stage: Stage) -> String {
+    format!("stopped after {stage} completed (--until {stage})")
+}
+
+/// Whether `state` is stopped because its own `--until` cap fired. An operator stop
+/// during the capped stage leaves the same `stopped`, `stage` and `stop_until`; only
+/// the reason [`transition`] writes ([`until_halt_reason`]) tells the two apart.
+pub(crate) fn until_cap_fired(state: &State) -> bool {
+    state.stopped
+        && state.stop_until == Some(state.stage)
+        && state.stop_reason.as_deref() == Some(until_halt_reason(state.stage).as_str())
+}
+
 /// Persist the new stage `to` and launch its agent.
 ///
 /// `infra_failures` resets unconditionally on every successful transition
@@ -76,7 +91,7 @@ pub(crate) fn transition(
     if state.stop_until == Some(from) && from != Stage::Validate {
         commit(state, |s| {
             s.stopped = true;
-            s.stop_reason = Some(format!("stopped after {from} completed (--until {from})"));
+            s.stop_reason = Some(until_halt_reason(from));
             // T-20-03b / doctor gap (D-09): clear gate_pending so doctor does
             // not misreport this intentional stop as a gate with no waiter.
             s.gate_pending = false;

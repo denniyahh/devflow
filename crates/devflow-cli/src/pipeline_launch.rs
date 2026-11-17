@@ -2265,7 +2265,9 @@ pub(crate) fn resume(
 /// operator is overriding it" (clear it, per the 20c paragraph above) and
 /// "the cap is still pending" (leave it alone, or the run silently sails
 /// past a boundary the operator named). The save/relaunch ordering is
-/// unchanged either way.
+/// unchanged either way. A stopped run clears the cap only when the cap itself
+/// stopped it ([`crate::pipeline_gate::until_cap_fired`]): an operator `devflow stop`
+/// during the capped stage leaves `stopped` too, and keeps its cap through the resume.
 ///
 /// The reservation at the top (D-01, D-08) runs [`crate::commands::resume_guards`] under
 /// the write lock: it refuses a live run, a finished run, no state and a state that
@@ -2544,9 +2546,11 @@ fn resume_loaded(
     }
     commit(&mut state, |s| {
         if s.stopped {
+            if crate::pipeline_gate::until_cap_fired(s) {
+                s.stop_until = None;
+            }
             s.stopped = false;
             s.stop_reason = None;
-            s.stop_until = None;
         }
         s.gate_pending = false;
         // D-01's re-arm, in the commit every resume makes, so it applies to a stopped
@@ -4245,6 +4249,62 @@ mod tests {
         assert!(
             !reloaded.stopped,
             "an unfired cap must not itself flip stopped to true — resume only relaunches"
+        );
+        assert_eq!(
+            crate::service::double::launched_units().len(),
+            1,
+            "resume launched the runner unit"
+        );
+    }
+
+    /// A run capped with `--until plan` that the operator stops in the middle of Plan
+    /// reads `stopped` with `stage == Plan` and `stop_until == Some(Plan)`, the same
+    /// shape the cap's own halt writes; only the stop reason differs. The cap has not
+    /// fired, so `resume` keeps it and the resumed run still halts after Plan.
+    /// `resume_clears_stop_marker_and_advances_past_stop_point` is the control: a run
+    /// the cap halted has it cleared.
+    #[test]
+    fn resume_keeps_until_cap_after_an_operator_stop() {
+        const NAME: &str = "pipeline_launch::tests::resume_keeps_until_cap_after_an_operator_stop";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_dir_with_agent_stub("codex");
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = PhaseId::new(69);
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
+        state.verification_baseline_captured = true;
+        state.stage = Stage::Plan;
+        state.stop_until = Some(Stage::Plan);
+        state.stopped = true;
+        state.stop_reason = Some(runner_stop_reason(Some(StopSource::Signal(libc::SIGTERM))));
+        workflow::save_state(&state).unwrap();
+
+        let result = resume(root, phase, None);
+
+        let _runners = crate::service::double::LaunchedRunners;
+
+        result.unwrap();
+
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        assert_eq!(
+            reloaded.stop_until,
+            Some(Stage::Plan),
+            "an operator stop during the capped stage is not the cap firing: resume \
+             must keep --until plan, or the resumed run goes on into Code"
+        );
+        assert!(!reloaded.stopped, "resume clears the operator's stop");
+        assert_eq!(
+            reloaded.stop_reason, None,
+            "resume clears the stop's reason"
         );
         assert_eq!(
             crate::service::double::launched_units().len(),
