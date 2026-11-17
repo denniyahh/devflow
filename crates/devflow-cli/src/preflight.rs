@@ -1,28 +1,24 @@
 //! Agent preflight readiness gate (17c, D-13-D-16, shaped by 18-06/18f):
 //! generic universal checks (unattended launch, interactivity) plus an adapter-
-//! specific hook, run from [`crate::pipeline_launch::launch_stage`] before
-//! `monitor::spawn_monitor` so a readiness failure is caught before any
-//! agent time is spent. Extracted mechanically (19-07, D-09 pure move) out
-//! of `main.rs` — every function below is byte-identical to its pre-move
-//! body modulo an added `pub(crate)` and adjusted `use` paths.
+//! specific hook, run from [`crate::pipeline_launch::launch_stage`] before the
+//! launch is resolved, so a readiness failure is caught before any agent time
+//! is spent. Extracted mechanically (19-07, D-09 pure move) out of `main.rs`.
 //!
-//! **This module and `pipeline_launch`'s functions call each other
-//! directly, and that is intentional (D-18f, 18-07, repointed 19-08):**
-//! [`run_preflight`]'s `GateAction::Advance` arm calls
-//! [`crate::pipeline_launch::launch_stage_inner`] directly so it skips the
-//! just-adjudicated check on the retry, while
-//! [`crate::pipeline_launch::launch_stage`] calls [`run_preflight`] on the
-//! way in. Rust permits cyclic module references (only the crate
-//! dependency graph must be acyclic), so this compiles cleanly; a reviewer
-//! should expect to see this file's diff alongside `pipeline_launch.rs` for
-//! any future change to either side of the pair.
+//! [`run_preflight`] launches nothing (D-02): it returns a [`PreflightOutcome`],
+//! and [`crate::pipeline_launch::launch_stage`] turns an approval of the
+//! preflight gate into the one launch the runner's loop runs, resolved through
+//! `launch_stage_inner` so the just-adjudicated check is skipped on that launch
+//! only (D-18f). This module still imports `pipeline_launch`'s gate and commit
+//! helpers, and `pipeline_launch` calls [`run_preflight`] on the way in; Rust
+//! permits cyclic module references (only the crate dependency graph must be
+//! acyclic), so a reviewer should expect to see this file's diff alongside
+//! `pipeline_launch.rs` for any future change to either side of the pair.
 
 use crate::CliError;
 use crate::commands::phase_artifact_on_base;
 use crate::pipeline_gate::{abort, run_gate};
 use crate::pipeline_launch::close_gate;
 use crate::pipeline_launch::commit;
-use crate::pipeline_launch::launch_stage_inner;
 use crate::pipeline_launch::stream_launch_enabled;
 use crate::pipeline_outcomes::truncate_reason;
 use crate::pipeline_outcomes::{Answer, ApproveRoute, StatusLessStep};
@@ -1242,21 +1238,32 @@ pub(crate) fn preflight_gate_context(phase: PhaseId, stage: Stage, reason: &str)
     )
 }
 
+/// How [`run_preflight`] ended, for [`crate::pipeline_launch::launch_stage`] to turn
+/// into the launch. The preflight itself launches nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreflightOutcome {
+    /// Every check passed: launch with the caller's prompt and archived stage.
+    Proceed,
+    /// A check failed and a human approved its preflight gate: launch once with no
+    /// prompt override and no archived stage, skipping the re-check (D-18f, T-18-28).
+    Approved,
+    /// The gate was aborted or the retry ceiling was reached: launch nothing.
+    Stop,
+}
+
 /// Gate a stage launch on readiness (17c, D-13-D-16): the generic universal
 /// checks (D-14) plus the adapter-specific hook, called from `launch_stage`
-/// BEFORE `monitor::spawn_monitor` so a readiness failure is caught before
+/// before the launch is resolved, so a readiness failure is caught before
 /// any agent time is spent. A failing check is NEVER a hard exit — it
 /// surfaces as a named preflight gate + notify (WR-11 idiom, D-15), mirroring
 /// `handle_stage_failure`'s dispatch shape exactly.
 ///
-/// Returns `Ok(true)` when the caller should continue the rest of
-/// `launch_stage` (preflight passed). Returns `Ok(false)` when a failing
-/// check was resolved via a gate that ALREADY completed a full retried
-/// launch (the approve's override), reached the retry ceiling, or aborted —
-/// the caller must not run any more launch steps for this invocation
-/// (CR-01, 17-08 gap closure: the old `Result<(), CliError>` return
-/// couldn't distinguish these cases, so the caller always continued and
-/// spawned the agent a second time).
+/// Launches nothing (D-02): it returns [`PreflightOutcome::Proceed`] when the
+/// checks pass, [`PreflightOutcome::Approved`] when a human approved the gate a
+/// failing check opened, and [`PreflightOutcome::Stop`] for an abort or the retry
+/// ceiling. `launch_stage` turns the first two into the one launch the runner's
+/// loop runs, in the runner's own process, and returns no launch for the third
+/// (CR-01, 17-08 gap closure: the agent is resolved once per invocation).
 ///
 /// 18f (D-18f): `GateAction::Advance` on a preflight gate is an explicit
 /// override — the check has already been adjudicated by a human, and every
@@ -1268,8 +1275,9 @@ pub(crate) fn preflight_gate_context(phase: PhaseId, stage: Stage, reason: &str)
 /// `?`-short-circuits (CR-01, 25-08): every applicable check has actually
 /// been evaluated and its reason shown to the human before the gate opens,
 /// so skipping the re-check on `Advance` cannot silently skip a check that
-/// never ran once.** The `Advance` arm therefore relaunches via
-/// [`launch_stage_inner`] directly, SKIPPING this function entirely on the
+/// never ran once.** An approval therefore returns
+/// [`PreflightOutcome::Approved`], which `launch_stage` resolves through
+/// `launch_stage_inner` directly, SKIPPING this function entirely on the
 /// retry. A reject is not an answer to this gate (D-39, 52-29): the answer
 /// screen refuses it before its claim and reopens the gate, so the only
 /// answers that reach here are approve and abort. A failed check is checked
@@ -1282,7 +1290,7 @@ pub(crate) fn run_preflight(
     project_root: &Path,
     state: &mut State,
     driver: &dyn agents::AgentDriver,
-) -> Result<bool, CliError> {
+) -> Result<PreflightOutcome, CliError> {
     let stage = state.stage;
     if let Err(reason) =
         generic_preflight_checks(project_root, state).and_then(|()| driver.health(state))
@@ -1307,14 +1315,14 @@ pub(crate) fn run_preflight(
                 }),
             );
             abort(project_root, state, &ceiling_reason)?;
-            return Ok(false);
+            return Ok(PreflightOutcome::Stop);
         }
         commit(state, |s| {
             s.preflight_retries = s.preflight_retries.saturating_add(1)
         })?;
 
         let context = preflight_gate_context(state.phase, stage, &reason);
-        match run_gate(project_root, state, stage, GateKind::Preflight, &context)? {
+        return match run_gate(project_root, state, stage, GateKind::Preflight, &context)? {
             Answer::Approve(ApproveRoute::StatusLess(StatusLessStep::PreflightOverride)) => {
                 // D-18f: approval is an explicit override — skip the
                 // just-adjudicated check on the retry (see the function
@@ -1324,7 +1332,7 @@ pub(crate) fn run_preflight(
                 // launch whose plans declare a human-only checkpoint is
                 // REFUSED, so the pass path below never runs for it. THIS is
                 // where that run's pre-agent set is recorded — consuming
-                // `Pending` before `launch_stage_inner` starts the agent, in
+                // `Pending` before the approved launch starts the agent, in
                 // every mode, or the agent would run with `Pending` still in
                 // place and the next passing evaluation would record what it
                 // wrote.
@@ -1353,21 +1361,21 @@ pub(crate) fn run_preflight(
                         fill_pending_approval(s, approval);
                     }
                 })?;
-                launch_stage_inner(state, None, None)?;
+                Ok(PreflightOutcome::Approved)
             }
-            Answer::Abort(reason) => abort(project_root, state, &reason)?,
+            Answer::Abort(reason) => {
+                abort(project_root, state, &reason)?;
+                Ok(PreflightOutcome::Stop)
+            }
             // D-39 (52-29): a reject is not an answer to this gate. The answer
             // screen refuses it before its claim and reopens the gate, so no
             // other route reaches here.
-            other => {
-                return Err(CliError::Message(format!(
-                    "phase {}: the preflight gate's answer has no route here: {}",
-                    state.phase,
-                    other.resolved_fields()
-                )));
-            }
-        }
-        return Ok(false);
+            other => Err(CliError::Message(format!(
+                "phase {}: the preflight gate's answer has no route here: {}",
+                state.phase,
+                other.resolved_fields()
+            ))),
+        };
     }
 
     // D-07 (CHKPT-02): a Code evaluation that PASSED is the moment DevFlow
@@ -1395,7 +1403,7 @@ pub(crate) fn run_preflight(
     if state.preflight_retries != 0 {
         commit(state, |s| s.preflight_retries = 0)?;
     }
-    Ok(true)
+    Ok(PreflightOutcome::Proceed)
 }
 
 #[cfg(test)]

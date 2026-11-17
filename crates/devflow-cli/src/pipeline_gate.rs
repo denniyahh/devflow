@@ -23,7 +23,7 @@ use crate::CliError;
 use crate::config_parse::gate_timeout_secs;
 use crate::pipeline_launch::{
     GateWaitEnd, StageLaunch, clear_run_state, close_gate, commit, ensure_still_recorded, fenced,
-    is_not_owner, launch_stage_next,
+    is_not_owner, launch_stage,
 };
 use crate::pipeline_outcomes::{Answer, FinishPermit, truncate_reason};
 use devflow_core::gates::{self, Claim, GateAction, GateFile, GateId, GateKind, GateLabel, Gates};
@@ -152,7 +152,7 @@ pub(crate) fn transition(
             "to": to.to_string(),
         }),
     );
-    launch_stage_next(state, None, Some(from))
+    launch_stage(state, None, Some(from))
 }
 
 /// The stop reason a run records when its Validate passes (D-35).
@@ -301,7 +301,7 @@ pub(crate) fn loop_back_to_code(
     let from = state.stage;
     let prompt =
         prepare_loop_back_to_code(project_root, state, fix, note, reverify_report, reason)?;
-    launch_stage_next(state, Some(prompt), Some(from))
+    launch_stage(state, Some(prompt), Some(from))
 }
 
 /// The state-mutating half of `loop_back_to_code`, split out so it's

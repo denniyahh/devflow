@@ -1291,8 +1291,13 @@ fn run_approving_a_plan_gate(fixture: &RunnerFixture) -> (u32, Output, bool) {
 
 /// D-02 (T-52.2-65): a Codex Plan in auto mode with no CONTEXT.md on the recorded base
 /// opens a preflight gate; once a second process approves it, the same runner runs the
-/// Plan agent as its own child and records Plan's verdict. Control: the same run with
-/// the refusing check negated opens no gate.
+/// Plan agent as its own child and records Plan's verdict.
+///
+/// Control: the same run in supervise mode, every other field the same, opens no gate.
+/// Committing the CONTEXT.md does not negate the refusal for Codex in auto mode: the
+/// unattended-launch check also refuses any agent but claude or antigravity at Plan
+/// (`unattended_launch_shape_condition`), and supervise mode is what turns both
+/// refusals into a report.
 #[test]
 fn an_approved_preflight_gate_runs_its_stage_in_the_same_runner() {
     use devflow_core::mode::Mode;
@@ -1305,8 +1310,13 @@ fn an_approved_preflight_gate_runs_its_stage_in_the_same_runner() {
     let (runner_pid, output, approved) = run_approving_a_plan_gate(&fixture);
     let fired = plan_gates_fired(&fixture);
     assert!(
-        approved && fired.len() == 1,
-        "no single Plan preflight gate opened: {fired:?}\n{}",
+        approved
+            && fired.len() == 1
+            && fired[0]["gate_kind"] == "preflight"
+            && fired[0]["context"]
+                .as_str()
+                .is_some_and(|context| context.contains("has no -CONTEXT.md on `develop`")),
+        "no single Plan preflight gate naming the missing CONTEXT.md: {fired:?}\n{}",
         shown(&output)
     );
     assert_eq!(
@@ -1341,8 +1351,8 @@ fn an_approved_preflight_gate_runs_its_stage_in_the_same_runner() {
         "the run does not record Plan's verdict and halt: {state:?}"
     );
 
-    // Control: the refusing check negated, every other field the same.
-    let control = preflight_fixture(PhaseId::new(97), Mode::Auto, true);
+    // Control: supervise mode, every other field the same.
+    let control = preflight_fixture(PhaseId::new(97), Mode::Supervise, false);
     let (control_pid, control_output, control_approved) = run_approving_a_plan_gate(&control);
     assert!(
         !control_approved && plan_gates_fired(&control).is_empty(),
