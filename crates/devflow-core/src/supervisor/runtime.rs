@@ -177,6 +177,9 @@ struct OwnerState {
     ended_stopped: bool,
     /// A stop signalled the agent's process group: the final `stopped` reply says so.
     group_signalled: bool,
+    /// The process group of the agent the run's current stage spawned, for the runner's
+    /// signal dispatcher ([`spawn_signal_dispatcher`]). Set by [`StopToken::begin_agent`].
+    agent_pgid: Option<u32>,
 }
 
 /// The owner mutex and the condition variable the control thread waits on
@@ -206,6 +209,7 @@ impl StopToken {
                     agent_exited: false,
                     ended_stopped: false,
                     group_signalled: false,
+                    agent_pgid: None,
                 }),
                 exited: Condvar::new(),
             }),
@@ -240,6 +244,26 @@ impl StopToken {
     /// Move the run to `phase`, e.g. `GateWait` around a gate poll.
     pub fn enter(&self, phase: OwnerPhase) {
         self.lock().phase = phase;
+    }
+
+    /// Re-arm a run-long token for the agent a new stage just spawned, which leads its
+    /// own process group `pgid` and is unreaped. Under the owner lock: the phase becomes
+    /// [`OwnerPhase::AgentRunning`], the previous stage's observed exit and group signal
+    /// are cleared, and `pgid` is recorded for [`spawn_signal_dispatcher`]. A stop already
+    /// requested is kept, with its source, and is returned: `true` means the caller must
+    /// end the new group at once, because the stop arrived while the stage was launched.
+    pub fn begin_agent(&self, pgid: u32) -> bool {
+        let mut state = self.lock();
+        state.phase = OwnerPhase::AgentRunning;
+        state.agent_exited = false;
+        state.group_signalled = false;
+        state.agent_pgid = Some(pgid);
+        state.stop_requested
+    }
+
+    /// Where the first stop request came from, if one has been taken.
+    pub fn stop_source(&self) -> Option<StopSource> {
+        self.lock().stop_source
     }
 
     /// Take a stop request and return what it does. A request in
@@ -467,13 +491,17 @@ static SIGNAL_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
 /// The pid that installed the handler. A forked child that has not exec'd
 /// yet runs the inherited handler under another pid and writes nothing.
 static SUPERVISOR_PID: AtomicI32 = AtomicI32::new(0);
+/// The last SIGTERM/SIGINT the handler caught, `0` for none. Stored before the
+/// pipe byte is written, so a reader that finds no byte yet still sees it.
+static CAUGHT_SIGNAL: AtomicI32 = AtomicI32::new(0);
 
-/// The SIGTERM/SIGINT handler: the pid check and a one-byte `write`, both
-/// async-signal-safe, and nothing else. The control thread turns the byte
-/// into a stop.
+/// The SIGTERM/SIGINT handler: the pid check, an atomic store and a one-byte
+/// `write`, all async-signal-safe, and nothing else. The control thread (or the
+/// runner's signal dispatcher) turns the byte into a stop.
 extern "C" fn on_stop_signal(signo: libc::c_int) {
     // SAFETY: getpid is async-signal-safe and has no preconditions.
     if unsafe { libc::getpid() } == SUPERVISOR_PID.load(Ordering::Relaxed) {
+        CAUGHT_SIGNAL.store(signo, Ordering::SeqCst);
         let byte = signo as u8;
         // SAFETY: write is async-signal-safe; `byte` is a live one-byte
         // buffer. A full pipe drops the byte, which is harmless: the first
@@ -491,7 +519,12 @@ extern "C" fn on_stop_signal(signo: libc::c_int) {
 /// Turn SIGTERM and SIGINT into stop events for this process's supervisor:
 /// once per process, create a close-on-exec, non-blocking pipe and install
 /// [`on_stop_signal`] with `SA_RESTART` for both signals. The control thread
-/// [`Supervisor::serve`] starts reads the pipe and requests the stop.
+/// [`Supervisor::serve`] starts reads the pipe and requests the stop; in the
+/// foreground runner [`spawn_signal_dispatcher`]'s thread does. The caught signal's
+/// number is also kept for [`caught_stop_signal`].
+///
+/// This is the process's one SIGTERM/SIGINT handler: a foreground holder's
+/// `liveness::install_holder_stop_handler` installs it too and reads the number.
 ///
 /// Call it at supervisor-process entry, before the agent is spawned. It
 /// installs process-global signal state, so only a supervisor process calls
@@ -503,6 +536,15 @@ pub fn install_signal_pipe() -> io::Result<()> {
         .get_or_init(|| install_once().map_err(|error| (error.kind(), error.to_string())))
         .clone()
         .map_err(|(kind, message)| io::Error::new(kind, message))
+}
+
+/// The last SIGTERM or SIGINT [`install_signal_pipe`]'s handler caught in this
+/// process, if one has arrived. A later signal replaces an earlier one.
+pub fn caught_stop_signal() -> Option<i32> {
+    match CAUGHT_SIGNAL.load(Ordering::SeqCst) {
+        0 => None,
+        signal => Some(signal),
+    }
 }
 
 fn install_once() -> io::Result<()> {
@@ -782,6 +824,83 @@ fn drain_signal_pipe(fd: libc::c_int) -> Vec<i32> {
         }
         signals.extend(buf[..read].iter().map(|&byte| i32::from(byte)));
     }
+}
+
+/// The foreground runner's signal consumer for its whole run (D-05): a thread that
+/// turns each caught SIGTERM/SIGINT into a stop on the run's token. Dropping it tells
+/// the thread to quit and joins it.
+#[derive(Debug)]
+pub struct SignalDispatcher {
+    quit: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Drop for SignalDispatcher {
+    fn drop(&mut self) {
+        self.quit.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Start the runner's one reader of the signal pipe ([`install_signal_pipe`] must have
+/// run). The thread, `runner-signals`, polls the pipe every
+/// [`crate::agent::TERMINATE_VERIFY_POLL`] and requests a stop on `token` for each
+/// signal. While an agent runs ([`StopAction::KillAgentGroup`]) it SIGTERMs the group
+/// [`StopToken::begin_agent`] recorded, under the owner lock and only while the agent's
+/// exit is unobserved, then SIGKILLs it if the exit is not observed within
+/// [`crate::agent::TERMINATE_VERIFY_WAIT`]. During an advance or a gate wait the stop
+/// flag is the whole effect: the gate poll and the next safe point read it.
+///
+/// # Errors
+/// The thread could not be spawned.
+pub fn spawn_signal_dispatcher(token: StopToken) -> io::Result<SignalDispatcher> {
+    let quit = Arc::new(AtomicBool::new(false));
+    let thread_quit = Arc::clone(&quit);
+    let thread = std::thread::Builder::new()
+        .name("runner-signals".to_string())
+        .spawn(move || dispatch_signals(&token, &thread_quit))?;
+    Ok(SignalDispatcher {
+        quit,
+        thread: Some(thread),
+    })
+}
+
+/// [`spawn_signal_dispatcher`]'s loop: [`Control::run`]'s poll on the signal pipe alone.
+fn dispatch_signals(token: &StopToken, quit: &AtomicBool) {
+    let tick = libc::c_int::try_from(crate::agent::TERMINATE_VERIFY_POLL.as_millis())
+        .unwrap_or(libc::c_int::MAX);
+    while !quit.load(Ordering::Acquire) {
+        // A negative fd (no pipe installed) is ignored by poll.
+        let mut fd = libc::pollfd {
+            fd: SIGNAL_READ_FD.load(Ordering::SeqCst),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `fd` is one live, initialized pollfd.
+        let ready = unsafe { libc::poll(&raw mut fd, 1, tick) };
+        if ready <= 0 || fd.revents & libc::POLLIN == 0 {
+            continue;
+        }
+        for signal in drain_signal_pipe(fd.fd) {
+            stop_on_signal(token, signal);
+        }
+    }
+}
+
+/// One caught signal's stop, as [`Control::stop`] takes a stop without a connection.
+fn stop_on_signal(token: &StopToken, signal: i32) {
+    let mut state = token.lock();
+    let action = request_stop_locked(&mut state, StopSource::Signal(signal));
+    let pgid = match (action, state.agent_exited, state.agent_pgid) {
+        (StopAction::KillAgentGroup, false, Some(pgid)) => pgid,
+        _ => return,
+    };
+    tracing::info!("stop requested by signal {signal}: terminating agent group {pgid}");
+    state.group_signalled |= signal_group(pgid, libc::SIGTERM);
+    drop(state);
+    kill_group_unless_exit_observed(token, pgid);
 }
 
 /// How long the control thread first waits after a persistent `accept` error.

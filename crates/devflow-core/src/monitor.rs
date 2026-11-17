@@ -1746,9 +1746,12 @@ pub fn run_supervised_stage(spec: StageSpec) -> Result<StageRun, MonitorError> {
 /// stream drive, exit file and stream drain as [`run_supervised_stage`], without what
 /// exists only because a supervisor is its own process: no liveness adoption, no agent
 /// pid file, no sidecar, no socket and no promotion watch. The caller installs the
-/// signal handling and owns `token` across stages; the run enters
-/// [`OwnerPhase::AgentRunning`](crate::supervisor::runtime::OwnerPhase::AgentRunning)
-/// once the agent leads its own group, and leaves it as the exit decides.
+/// signal handling and owns `token` across stages. Once the agent leads its own group,
+/// [`StopToken::begin_agent`](crate::supervisor::runtime::StopToken::begin_agent)
+/// re-arms the token for it (the run enters
+/// [`OwnerPhase::AgentRunning`](crate::supervisor::runtime::OwnerPhase::AgentRunning)),
+/// and a stop already requested ends the new group at once; the run leaves that phase
+/// as the exit decides.
 ///
 /// # Errors
 /// The agent could not be spawned, did not lead its own group, or its files could not
@@ -1796,7 +1799,11 @@ fn run_stage_agent(
     let guard = AgentGroupGuard::arm(child);
     let (supervisor, watch, token) = match runner {
         Some(token) => {
-            token.enter(crate::supervisor::runtime::OwnerPhase::AgentRunning);
+            // One token spans the whole run: re-arm it for this stage's agent. A stop
+            // that arrived while the stage was launched ends the new group at once.
+            if token.begin_agent(pid) {
+                crate::supervisor::runtime::end_group_while_running(token, pid);
+            }
             (None, None, token.clone())
         }
         None => {

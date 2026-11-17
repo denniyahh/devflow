@@ -25,8 +25,7 @@ use std::fs::{File, OpenOptions, TryLockError};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::phase_id::PhaseId;
@@ -428,64 +427,28 @@ pub fn claim_runner_lock(project_root: &Path, phase: PhaseId) -> Result<Hold, Ru
     }
 }
 
-/// The signal [`on_holder_stop_signal`] stored, 0 for none.
-static HOLDER_STOP_SIGNAL: AtomicI32 = AtomicI32::new(0);
-
-/// The holder's SIGTERM/SIGINT handler. An atomic store is async-signal-safe, and it is
-/// the only thing this does: no allocation, no lock, no I/O.
-extern "C" fn on_holder_stop_signal(signo: libc::c_int) {
-    HOLDER_STOP_SIGNAL.store(signo, Ordering::Relaxed);
-}
-
 /// Turn SIGTERM and SIGINT into a stop flag for this process (D-18), once per process,
 /// with `SA_RESTART` and an empty mask: a foreground process `stop` signals ends at its
 /// next safe point instead of wherever the signal lands. It reads the flag through
 /// [`holder_stop_signal`].
 ///
-/// No signal is blocked, because a blocked mask would be inherited by every child. A
-/// caught signal goes back to its default at exec, so the supervisors, agents and hooks a
-/// holder spawns are unaffected.
-///
-/// A supervisor process never calls this: it installs
-/// [`crate::supervisor::runtime::install_signal_pipe`], which this would replace, and
-/// claims no holder (D-17).
+/// It installs the process's one SIGTERM/SIGINT handler,
+/// [`crate::supervisor::runtime::install_signal_pipe`], so a holder and a supervisor or
+/// runner in one process never replace each other's handler. No signal is blocked,
+/// because a blocked mask would be inherited by every child. A caught signal goes back to
+/// its default at exec, so the supervisors, agents and hooks a holder spawns are
+/// unaffected.
 ///
 /// # Errors
-/// `sigaction` failed. The result of the one attempt is cached.
+/// The pipe or `sigaction` failed. The result of the one attempt is cached.
 pub fn install_holder_stop_handler() -> std::io::Result<()> {
-    static INSTALLED: OnceLock<Result<(), (std::io::ErrorKind, String)>> = OnceLock::new();
-    INSTALLED
-        .get_or_init(|| {
-            install_holder_handler_once().map_err(|error| (error.kind(), error.to_string()))
-        })
-        .clone()
-        .map_err(|(kind, message)| std::io::Error::new(kind, message))
-}
-
-fn install_holder_handler_once() -> std::io::Result<()> {
-    for signal in [libc::SIGTERM, libc::SIGINT] {
-        // SAFETY: an all-zero sigaction is valid; the fields that matter are set below.
-        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
-        action.sa_sigaction =
-            on_holder_stop_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
-        action.sa_flags = libc::SA_RESTART;
-        // SAFETY: `action.sa_mask` is a live sigset_t.
-        unsafe { libc::sigemptyset(&raw mut action.sa_mask) };
-        // SAFETY: `action` is a fully initialized sigaction; the old action is not wanted.
-        if unsafe { libc::sigaction(signal, &raw const action, std::ptr::null_mut()) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-    }
-    Ok(())
+    crate::supervisor::runtime::install_signal_pipe()
 }
 
 /// The signal [`install_holder_stop_handler`]'s handler caught, if one has arrived. A
 /// later signal replaces an earlier one.
 pub fn holder_stop_signal() -> Option<i32> {
-    match HOLDER_STOP_SIGNAL.load(Ordering::Relaxed) {
-        0 => None,
-        signal => Some(signal),
-    }
+    crate::supervisor::runtime::caught_stop_signal()
 }
 
 /// Whose lock this is: the pid and start time the holder recorded, while the

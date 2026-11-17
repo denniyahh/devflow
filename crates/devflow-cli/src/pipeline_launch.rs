@@ -44,7 +44,7 @@ use devflow_core::stage::Stage;
 use devflow_core::state::SupervisorRecord;
 use devflow_core::state::{AgentKind, ApprovedCheckpoint, CheckpointApproval, State};
 use devflow_core::supervisor::runtime::{
-    AgentGroupEnd, AgentOutcome, OwnerPhase, STOPPED_EXIT_CODE, SafePoint, StopToken,
+    AgentGroupEnd, AgentOutcome, OwnerPhase, STOPPED_EXIT_CODE, SafePoint, StopSource, StopToken,
 };
 use devflow_core::verify::CheckpointDeclaration;
 use devflow_core::{
@@ -985,10 +985,12 @@ pub(crate) const SUPERVISOR_STOP_WAIT: Duration =
 
 /// What a supervisor's advance reads on this thread (50-13): its stop token,
 /// for the advance's safe points, its launch id, for the ownership fence (D-03),
-/// and the successor the advance recorded.
+/// and the successor the advance recorded. The foreground runner's slot carries no
+/// launch id ([`StopTokenGuard::engage_token`]): it records no supervisor, so its
+/// writes stay unfenced.
 struct EngagedAdvance {
     token: StopToken,
-    launch_id: String,
+    launch_id: Option<String>,
     successor: Option<SupervisorRecord>,
 }
 
@@ -1012,7 +1014,19 @@ pub(crate) struct StopTokenGuard {
 }
 
 impl StopTokenGuard {
+    /// Engage a supervisor's token, fenced to its `launch_id` (D-03).
     pub(crate) fn engage(token: StopToken, launch_id: String) -> Self {
+        Self::engage_slot(token, Some(launch_id))
+    }
+
+    /// Engage the foreground runner's run-long token with no launch id (D-05): the safe
+    /// points, the gate wait and the test holds read `token`, and the fenced writes run
+    /// unfenced, because the runner records no supervisor the fence could check.
+    pub(crate) fn engage_token(token: StopToken) -> Self {
+        Self::engage_slot(token, None)
+    }
+
+    fn engage_slot(token: StopToken, launch_id: Option<String>) -> Self {
         ENGAGED_ADVANCE.with(|slot| {
             *slot.borrow_mut() = Some(EngagedAdvance {
                 token,
@@ -1040,9 +1054,10 @@ fn with_stop_token<R>(f: impl FnOnce(&StopToken) -> R) -> Option<R> {
 }
 
 /// The launch id of the supervisor whose advance runs on this thread, or `None` for
-/// any other advance (a hand-run `devflow advance`, which stays unfenced).
+/// any other advance (a hand-run `devflow advance` or the foreground runner's, which
+/// stay unfenced).
 fn engaged_launch_id() -> Option<String> {
-    ENGAGED_ADVANCE.with(|slot| slot.borrow().as_ref().map(|e| e.launch_id.clone()))
+    ENGAGED_ADVANCE.with(|slot| slot.borrow().as_ref().and_then(|e| e.launch_id.clone()))
 }
 
 /// [`workflow::update_state`], fenced to the engaged supervisor's launch id inside a
@@ -1691,6 +1706,11 @@ fn launch_label(launch: &monitor::MonitorLaunch) -> &'static str {
 /// [`StopToken`] for the whole run), advances, and runs each stage the advance hands
 /// back, until there is none. Any error ends the runner non-zero with the error on
 /// stderr. No agent is spawned and no gate is waited on inside a state-write closure.
+///
+/// A SIGTERM or SIGINT (D-05) reaches the run's token through one signal dispatcher,
+/// started before READY and kept until this returns: it ends a running agent's group,
+/// and flags a stop the advance's safe points and gate wait read. The run then records
+/// `stopped` and returns [`STOPPED_EXIT_CODE`] ([`settle_advance`]).
 pub(crate) fn run_runner(project_root: &Path, phase: PhaseId) -> Result<i32, CliError> {
     devflow_core::supervisor::runtime::install_signal_pipe().map_err(|err| {
         CliError::Message(format!(
@@ -1699,6 +1719,14 @@ pub(crate) fn run_runner(project_root: &Path, phase: PhaseId) -> Result<i32, Cli
     })?;
     let _runner_lock = devflow_core::liveness::claim_runner_lock(project_root, phase)
         .map_err(|err| CliError::Message(format!("phase {phase}: {err}")))?;
+    let token = StopToken::for_run();
+    // The signal pipe's only reader, from before READY until this returns.
+    let _signals = devflow_core::supervisor::runtime::spawn_signal_dispatcher(token.clone())
+        .map_err(|err| {
+            CliError::Message(format!(
+                "the runner could not start its signal dispatcher: {err}"
+            ))
+        })?;
     crate::service::notify_ready().map_err(|err| {
         CliError::Message(format!(
             "the runner could not report ready to systemd: {err}"
@@ -1707,36 +1735,135 @@ pub(crate) fn run_runner(project_root: &Path, phase: PhaseId) -> Result<i32, Cli
     // Before the first launch, for the runner's whole life: every launch the chain
     // resolves comes back here instead of spawning a detached `__monitor`.
     let _runner_loop = RunnerLoop::engage();
-    let token = StopToken::for_run();
+    // Never `StopTokenGuard::engage(token, id)`: the runner records no supervisor, so
+    // every fenced write would read NotOwner.
+    let _token_slot = StopTokenGuard::engage_token(token.clone());
     let mut state = workflow::load_state(project_root, phase)?;
     let first = launch_stage_next(&mut state, None, None);
-    let mut next = settle_advance(project_root, phase, first)?;
-    while let Some(launch) = next {
+    let mut settled = settle_advance(project_root, phase, &token, first)?;
+    loop {
+        let launch = match settled {
+            Settled::Next(launch) => *launch,
+            Settled::Exit(code) => return Ok(code),
+        };
         let result = run_one_stage(project_root, phase, launch, &token)?;
-        next = settle_advance(project_root, phase, result)?;
+        settled = settle_advance(project_root, phase, &token, result)?;
+        // After the hand-back, before the next stage begins.
+        #[cfg(test)]
+        if matches!(settled, Settled::Next(_)) {
+            test_hold("before_runner_stage");
+        }
     }
-    Ok(runner_exit_code(
-        workflow::load_state(project_root, phase).ok().as_ref(),
-    ))
+}
+
+/// What the runner does after an advance result: run the next stage, or exit with a code.
+enum Settled {
+    Next(Box<StageLaunch>),
+    Exit(i32),
 }
 
 /// Read one advance result in the runner's fixed order (review r3 codex-2 + agy-2): a
-/// state on disk that reads finished ends the loop and writes nothing, since a permitted
-/// finish wins over a late stop ([`runner_exit_code`] then reads 0); then (from 52.2-05)
-/// a stop requested on the run's token; then an `Err` is a failed advance
-/// ([`recover_failed_advance`]); otherwise the result feeds the loop.
+/// state on disk that reads finished ends the run with 0 and writes nothing, since a
+/// permitted finish wins over a late stop; then a stop requested on the run's token is
+/// recorded ([`record_runner_stop`]) and ends it with [`STOPPED_EXIT_CODE`], after an
+/// `Ok` or an `Err` alike, so a gate wait a stop ended never reaches the failed-advance
+/// route; then an `Err` is a failed advance ([`recover_failed_advance`]), whose result is
+/// read in the same order; otherwise `Some` runs the next stage and `None` ends the run
+/// with [`runner_exit_code`].
 fn settle_advance(
     project_root: &Path,
     phase: PhaseId,
+    token: &StopToken,
     result: Result<Option<StageLaunch>, CliError>,
-) -> Result<Option<StageLaunch>, CliError> {
+) -> Result<Settled, CliError> {
+    if let Some(settled) = settled_by_finish_or_stop(project_root, phase, token) {
+        return Ok(settled);
+    }
+    let next = match result {
+        Ok(next) => next,
+        Err(err) => {
+            let recovered = recover_failed_advance(project_root, phase, &err);
+            if let Some(settled) = settled_by_finish_or_stop(project_root, phase, token) {
+                return Ok(settled);
+            }
+            recovered?
+        }
+    };
+    Ok(match next {
+        Some(launch) => Settled::Next(Box::new(launch)),
+        None => Settled::Exit(runner_exit_code(
+            workflow::load_state(project_root, phase).ok().as_ref(),
+        )),
+    })
+}
+
+/// The first two steps of [`settle_advance`]'s order: a finished state, then a stop.
+fn settled_by_finish_or_stop(
+    project_root: &Path,
+    phase: PhaseId,
+    token: &StopToken,
+) -> Option<Settled> {
     if workflow::load_state(project_root, phase).is_ok_and(|state| state.finished) {
-        return Ok(None);
+        return Some(Settled::Exit(0));
     }
-    match result {
-        Ok(next) => Ok(next),
-        Err(err) => recover_failed_advance(project_root, phase, &err),
+    if token.stop_requested() {
+        record_runner_stop(project_root, phase, token.stop_source());
+        return Some(Settled::Exit(STOPPED_EXIT_CODE));
     }
+    None
+}
+
+/// The stop reason the runner records for a stop from `source` (D-05).
+fn runner_stop_reason(source: Option<StopSource>) -> String {
+    match source {
+        Some(StopSource::Signal(signal)) if signal == libc::SIGTERM => {
+            "stopped by SIGTERM to the runner".to_string()
+        }
+        Some(StopSource::Signal(signal)) if signal == libc::SIGINT => {
+            "stopped by SIGINT to the runner".to_string()
+        }
+        Some(source) => format!("stopped by the runner ({source:?})"),
+        None => "stopped by the runner".to_string(),
+    }
+}
+
+/// Record a stop the runner's token took (D-05): `stopped` with
+/// [`runner_stop_reason`], and a `runner_stopped` event. A state that already reads
+/// stopped (a safe point's [`record_advance_stop`] wrote it) keeps its reason, and an
+/// absent state is not written. Logged, never an error: the runner exits stopped either
+/// way.
+fn record_runner_stop(project_root: &Path, phase: PhaseId, source: Option<StopSource>) {
+    let reason = runner_stop_reason(source);
+    let stage = match workflow::load_state(project_root, phase) {
+        Ok(state) if state.stopped => {
+            info!(
+                "phase {phase}: the stop is already recorded ({:?})",
+                state.stop_reason
+            );
+            return;
+        }
+        Ok(state) => state.stage,
+        Err(err) => {
+            info!("phase {phase}: no state to record the stop in ({err})");
+            return;
+        }
+    };
+    let written = workflow::update_state(project_root, phase, |state| {
+        state.stopped = true;
+        state.stop_reason = Some(reason.clone());
+        Ok::<(), CliError>(())
+    });
+    if let Err(err) = written {
+        warn!("phase {phase}: `stopped` was not recorded: {err}");
+        return;
+    }
+    events::emit(
+        project_root,
+        phase,
+        "runner_stopped",
+        serde_json::json!({ "stage": stage.to_string(), "reason": reason }),
+    );
+    eprintln!("phase {phase}: {reason}");
 }
 
 /// Run one handed-back stage in this process and advance past it: the advance's result,
@@ -1748,6 +1875,10 @@ fn run_one_stage(
     launch: StageLaunch,
     token: &StopToken,
 ) -> Result<Result<Option<StageLaunch>, CliError>, CliError> {
+    // A stop that arrived during the hand-back starts no stage.
+    if token.stop_requested() {
+        return Ok(Ok(None));
+    }
     if let Err(err) = begin_runner_stage(&launch) {
         return Ok(Err(err));
     }
@@ -19138,6 +19269,32 @@ mod tests {
             crate::pipeline_gate::rate_limit_timer_deadline(&unspent, &gate),
             gate.not_before,
             "control: the same gate over an unspent flag is armed"
+        );
+    }
+
+    /// Review r2 agy-1: the runner's token-only slot engages the token for the safe
+    /// points with no launch id, so the fenced writes run unfenced. Control: a
+    /// supervisor's two-argument engage keeps its launch id.
+    #[test]
+    fn the_runner_slot_engages_the_token_without_a_launch_id() {
+        let token = StopToken::for_run();
+        {
+            let _slot = StopTokenGuard::engage_token(token.clone());
+            assert!(
+                with_stop_token(|_| ()).is_some(),
+                "the runner slot engages no token"
+            );
+            assert_eq!(
+                engaged_launch_id(),
+                None,
+                "the runner slot carries a launch id"
+            );
+        }
+        let _slot = StopTokenGuard::engage(token, "L1".to_string());
+        assert_eq!(
+            engaged_launch_id().as_deref(),
+            Some("L1"),
+            "engage lost its launch id"
         );
     }
 
