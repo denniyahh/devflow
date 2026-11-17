@@ -1,160 +1,33 @@
 {
   "version": "1.0",
-  "timestamp": "2026-11-15T23:59:00.000Z",
-  "phase": "52.1",
-  "phase_name": "Stabilize for Dogfooding",
-  "phase_dir": ".planning/phases/52.1-stabilize-for-dogfooding",
-  "plan": 7,
-  "task": 7,
-  "total_tasks": 15,
-  "status": "halted",
+  "timestamp": "2026-11-17T15:19:07.814Z",
+  "phase": "52.2",
+  "phase_name": "Foreground Runner",
+  "phase_dir": ".planning/phases/52.2-foreground-runner",
+  "plan": 24,
+  "task": 1,
+  "total_tasks": 26,
+  "status": "paused",
   "completed_tasks": [
-    {
-      "id": 1,
-      "name": "52.1-01: fork-race flakes",
-      "status": "done",
-      "commit": "see its SUMMARY"
-    },
-    {
-      "id": 2,
-      "name": "52.1-02: truthful launch lines (with addendum)",
-      "status": "done",
-      "commit": "see its SUMMARY"
-    },
-    {
-      "id": 3,
-      "name": "52.1-03: close-out script stops dropping work (with addendum)",
-      "status": "done",
-      "commit": "see its SUMMARY"
-    },
-    {
-      "id": 4,
-      "name": "52.1-05: proof-run fixture, on GSD 1.21.0",
-      "status": "done",
-      "commit": "see its SUMMARY"
-    },
-    {
-      "id": 5,
-      "name": "52.1-04: push-time divergence check",
-      "status": "done",
-      "commit": "see its SUMMARY"
-    },
-    {
-      "id": 6,
-      "name": "52.1-06: the 999.221 flake",
-      "status": "done",
-      "commit": "see its SUMMARY"
-    },
-    {
-      "id": 7,
-      "name": "52.1-07: devflow discard, plus its liveness follow-up",
-      "status": "done",
-      "commit": "see its SUMMARY and addendum"
-    }
+    {"id": 1, "name": "waves 1-12: plans 01,20,02,03,21,04,05,06,07,08,22,09,10,11,26,12,23,25", "status": "done", "commit": "f33faf5"}
   ],
   "remaining_tasks": [
-    {
-      "id": 8,
-      "name": "52.1-08",
-      "status": "not_started"
-    },
-    {
-      "id": 9,
-      "name": "52.1-09",
-      "status": "not_started"
-    },
-    {
-      "id": 10,
-      "name": "52.1-10",
-      "status": "not_started"
-    },
-    {
-      "id": 11,
-      "name": "52.1-15",
-      "status": "not_started"
-    },
-    {
-      "id": 12,
-      "name": "52.1-11",
-      "status": "not_started"
-    },
-    {
-      "id": 13,
-      "name": "52.1-12",
-      "status": "not_started"
-    },
-    {
-      "id": 14,
-      "name": "52.1-13",
-      "status": "not_started"
-    },
-    {
-      "id": 15,
-      "name": "52.1-14",
-      "status": "not_started"
-    }
+    {"id": 2, "name": "wave 13: 52.2-24", "status": "not_started"},
+    {"id": 3, "name": "waves 14-18: 52.2-13..17", "status": "not_started"},
+    {"id": 4, "name": "wave 19: 52.2-18 (autonomous:false, checkpoints)", "status": "not_started"},
+    {"id": 5, "name": "wave 20: 52.2-19 (autonomous:false, checkpoints; signs off subject-removed ledger rows)", "status": "not_started"},
+    {"id": 6, "name": "verify_phase_goal: code review, regression gate, verifier, update_roadmap", "status": "not_started"}
   ],
-  "blockers": [
-    {
-      "description": "Phase halted by the operator pending a new direction",
-      "type": "human_action",
-      "workaround": "none; see the brief"
-    }
-  ],
+  "blockers": [],
   "async_jobs": [],
   "human_actions_pending": [
-    {
-      "action": "Say whether to resume execution",
-      "context": "A new session must not continue the phase on this file alone",
-      "blocking": true
-    },
-    {
-      "action": "Plan 52.1-14: run the live supervised proof run",
-      "context": "Operator's shell, outside any agent worktree, DevFlow built from the phase head installed (installed is 3.0.0)",
-      "blocking": false
-    },
-    {
-      "action": "Confirm or narrow the uncommitted-config notice",
-      "context": "It also prints for the layout-only row with no flag in either copy; orchestrator's choice, reported, unanswered",
-      "blocking": false
-    },
-    {
-      "action": "Start the hooks research in ~/Github/wsx",
-      "context": "Brief at .planning/research/AGENT-HOOKS-UNIFICATION-BRIEF.md there; three wsx planning files are uncommitted",
-      "blocking": false
-    },
-    {
-      "action": "Renew the Claude Code sign-in",
-      "context": "Ends between 2026-11-22 and 2026-11-25",
-      "blocking": false
-    }
+    {"action": "Make the CI `service` job a required check", "context": "after plan 52.2-18 shows it green on a hosted runner", "blocking": false}
   ],
   "decisions": [
-    {
-      "decision": "HEAD false + working copy without the auto-chain key: commit nothing, print a notice",
-      "rationale": "Operator 2026-11-15: DevFlow does not commit a change it cannot attribute",
-      "phase": "52.1"
-    },
-    {
-      "decision": "Semver gate in plans 08 and 13 uses the merge-base baseline as a minor release",
-      "rationale": "The bare command ran 0 checks under the 4.0.0-alpha.1 bump",
-      "phase": "52.1"
-    },
-    {
-      "decision": "Plan 05 proceeds on GSD 1.21.0",
-      "rationale": "Its facts were re-measured unchanged; orchestrator under the standing delegation",
-      "phase": "52.1"
-    },
-    {
-      "decision": "Agent hooks belong to wsx, not devflow",
-      "rationale": "Operator 2026-11-15",
-      "phase": "52.1"
-    }
+    {"decision": "Post-wave test gate runs cargo nextest with a per-test limit (slow-timeout 60s, terminate-after 3, fail-fast false) instead of plain cargo test", "rationale": "a planned-red test hung forever in server.join() at wave 4; a hang must read as a failure", "phase": "52.2"},
+    {"decision": "Operator Option A: plan 21 blocks hermetic tests from reaching real agent CLIs (agent-guard)", "rationale": "operator answer 'yes'", "phase": "52.2"}
   ],
-  "uncommitted_files": {
-    "main_checkout": [],
-    "phase_worktree": []
-  },
-  "next_action": "Read .planning/audits/2026-11-15-new-direction-brief.md, then ask the operator which spike to run, if any. Do not resume Phase 52.1's plans.",
-  "context_notes": "Phase 52.1 halted by the operator after plan 07; direction under consideration is a foreground runner. Evidence so far is from stand-in scripts only."
+  "uncommitted_files": [" M .planning/user/errors/state-stale.json (pre-existing, not ours; never stage)"],
+  "next_action": "/gsd-execute-phase 52.2 in .worktrees/phase-52.2: run key-link check for 52.2-24, dispatch its executor with the standard prompt (see .continue-here.md)",
+  "context_notes": "Wave 12 gate green at f33faf5: build 0, nextest 1926/1926, clippy -D warnings 0, schema drift none, no devflow-* units or __runner processes."
 }
