@@ -163,15 +163,14 @@ enum Command {
         #[arg(default_value = ".")]
         project: PathBuf,
     },
-    /// Remove phase worktrees and their feature branches.
+    /// Remove what is safe to remove: a finished run, a dead start's reservation, or
+    /// a worktree with no run state, once its branch is merged into the base, its
+    /// worktree is clean and no run is live. Says why it keeps the rest, and names
+    /// `devflow discard` (or `devflow resume` for an incomplete run).
     Cleanup {
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
-        /// Force-remove dirty and kept worktrees. A branch with commits not
-        /// merged into the base is still kept.
-        #[arg(long)]
-        force: bool,
     },
     /// Remove a phase's worktree, its uncommitted changes, its run state, its
     /// feature branch, and the gate files and hold temps a killed run left,
@@ -509,7 +508,7 @@ fn run() -> Result<(), CliError> {
             project,
         } => logs(&project_root(project)?, phase, follow, stderr),
         Command::History { phase, project } => history_cmd(&project_root(project)?, phase),
-        Command::Cleanup { project, force } => cleanup(&project_root(project)?, force),
+        Command::Cleanup { project } => cleanup(&project_root(project)?),
         Command::Discard {
             phase,
             delete_unmerged_branch,
