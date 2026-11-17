@@ -1815,72 +1815,17 @@ pub(crate) struct HandoffRelaunch {
     pub(crate) rate_limit: Option<String>,
 }
 
-thread_local! {
-    /// The reservation `start` or `resume` made at its top, until the launch that
-    /// spawns from it takes it ([`take_held_reservation`]). Per thread because a
-    /// launcher runs on one thread and a test may run two launchers in one process.
-    static HELD_RESERVATION: std::cell::RefCell<Option<monitor::Reservation>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// Hand `reservation` to the launch this thread runs next.
-pub(crate) fn hold_reservation(reservation: monitor::Reservation) {
-    HELD_RESERVATION.with_borrow_mut(|held| *held = Some(reservation));
-}
-
-/// The reservation [`hold_reservation`] was given, if nothing has taken it yet.
-fn take_held_reservation() -> Option<monitor::Reservation> {
-    HELD_RESERVATION.with_borrow_mut(Option::take)
-}
-
-/// Give back the reservation this thread still holds: a launch that failed, or that
-/// returned without spawning from it. A no-op once a launch has taken it.
-///
-/// The state stops naming it, and a state the reservation itself `created` (no run
-/// was ever written into it) is removed. The liveness lock is released last, so no
-/// other launcher can reserve this phase in between. A failure here is only warned
-/// about: what is left reads abandoned, and the next launch clears it.
+/// Give the phase back after a `start` that failed, or returned without launching: a
+/// state its own guard write `created` (no run was ever written into it) is removed,
+/// and otherwise nothing changes. The phase holder the caller still holds keeps every
+/// other launcher out until then (D-07). A failure here is only warned about.
 pub(crate) fn abandon_reservation(project_root: &Path, phase: PhaseId, created: bool) {
-    let Some(reservation) = take_held_reservation() else {
+    if !created {
         return;
-    };
-    if let Err(err) = clear_reservation(project_root, phase, reservation.launch_id(), created) {
-        eprintln!(
-            "warning: could not clear launch reservation {} from phase {phase}'s state: {err}",
-            reservation.launch_id()
-        );
     }
-    reservation.discard();
-}
-
-/// The state half of [`abandon_reservation`].
-fn clear_reservation(
-    project_root: &Path,
-    phase: PhaseId,
-    launch_id: &str,
-    created: bool,
-) -> Result<(), CliError> {
-    let remove_state = workflow::update_state_with(project_root, phase, |existing| {
-        let workflow::Existing::Loaded(mut state) = existing else {
-            return Ok::<_, CliError>((None, false));
-        };
-        let names_it = state
-            .pending_supervisor
-            .as_ref()
-            .is_some_and(|pending| pending.launch_id == launch_id);
-        if !names_it {
-            return Ok((None, false));
-        }
-        if created {
-            return Ok((None, true));
-        }
-        state.pending_supervisor = None;
-        Ok((Some(state), false))
-    })?;
-    if remove_state {
-        workflow::clear_state(project_root, phase)?;
+    if let Err(err) = workflow::clear_state(project_root, phase) {
+        eprintln!("warning: could not remove phase {phase}'s unlaunched state: {err}");
     }
-    Ok(())
 }
 
 /// The tail of [`launch_stage_inner`]: validate the agent binary, archive
@@ -2504,8 +2449,8 @@ pub(crate) fn resume_with_fallback(
 
     // D-03: no launch without an answering user manager, and no fallback launch.
     crate::commands::refuse_without_a_user_manager(phase, crate::commands::LaunchVerb::Resume)?;
-    // D-07: the holder covers the guards, the reservation, every state write and the
-    // launch, until systemd-run returns.
+    // D-07: the holder covers the guards, every state write and the launch, until
+    // systemd-run returns, so it keeps a second launcher out.
     let phase_holder = crate::commands::claim_foreground_holder(project_root, phase)?;
     // D-07a, review agy-1: a unit still stopping after a stop is waited out, not refused.
     crate::commands::wait_out_a_stopping_unit(
@@ -2519,12 +2464,9 @@ pub(crate) fn resume_with_fallback(
         crate::commands::LaunchVerb::Resume,
         None,
     )?;
-    hold_reservation(reserved.reservation);
     #[cfg(test)]
     launch_test_hold("holder_claimed");
-    let result = resume_loaded(project_root, phase, reserved.state, agent, fallback_agent);
-    abandon_reservation(project_root, phase, reserved.created);
-    let mut state = result?;
+    let mut state = resume_loaded(project_root, phase, reserved.state, agent, fallback_agent)?;
     // The runner checks the agent binary again at each launch; checked here too, so a
     // resume that cannot run its agent fails now, re-marked stopped below, rather than
     // in a unit nobody watches.
