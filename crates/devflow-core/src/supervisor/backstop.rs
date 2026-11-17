@@ -39,7 +39,6 @@
 
 use super::{Liveness, Sidecar, SocketPath};
 use crate::agent::ProcStat;
-use crate::state::SupervisorRecord;
 use std::io;
 
 /// How long to wait for the group to empty after SIGKILL. SIGKILL cannot be
@@ -63,10 +62,11 @@ pub struct GroupMember {
     pub cmdline: String,
 }
 
-/// The identity a launch recorded, read from its sidecar or its state
-/// record.
+/// The identity a launch recorded, read from its sidecar. Public because the
+/// backstop's public functions take one as the state's record; its fields stay
+/// crate-visible.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RecordedIdentity {
+pub struct RecordedIdentity {
     pub(crate) launch_id: String,
     pub(crate) pgid: u32,
     pub(crate) start_time: u64,
@@ -80,15 +80,6 @@ impl RecordedIdentity {
             pgid: sidecar.agent_pgid,
             start_time: sidecar.agent_start_time,
             boot_id: sidecar.boot_id.clone(),
-        }
-    }
-
-    fn of_record(record: &SupervisorRecord) -> Self {
-        Self {
-            launch_id: record.launch_id.clone(),
-            pgid: record.agent_pgid,
-            start_time: record.agent_start_time,
-            boot_id: record.boot_id.clone(),
         }
     }
 }
@@ -355,10 +346,10 @@ fn caller_pgrp() -> i32 {
 
 /// Facts with nothing read about any process: the shape every platform
 /// starts from, and the whole answer off Linux.
-fn unread_facts(sidecar: &Sidecar, state_record: Option<&SupervisorRecord>) -> BackstopFacts {
+fn unread_facts(sidecar: &Sidecar, state_record: Option<&RecordedIdentity>) -> BackstopFacts {
     BackstopFacts {
         recorded: RecordedIdentity::of_sidecar(sidecar),
-        state_record: state_record.map(RecordedIdentity::of_record),
+        state_record: state_record.cloned(),
         caller_pgrp: caller_pgrp(),
         current_boot_id: None,
         leader: None,
@@ -369,7 +360,7 @@ fn unread_facts(sidecar: &Sidecar, state_record: Option<&SupervisorRecord>) -> B
 
 /// Gather the facts [`classify`] needs. An unsafe target reads nothing.
 #[cfg(target_os = "linux")]
-fn gather(sidecar: &Sidecar, state_record: Option<&SupervisorRecord>) -> BackstopFacts {
+fn gather(sidecar: &Sidecar, state_record: Option<&RecordedIdentity>) -> BackstopFacts {
     let mut facts = unread_facts(sidecar, state_record);
     let Some(pgid) = safe_target(facts.recorded.pgid, facts.caller_pgrp) else {
         return facts;
@@ -389,7 +380,7 @@ fn gather(sidecar: &Sidecar, state_record: Option<&SupervisorRecord>) -> Backsto
 /// (backlog 999.158, 999.159), so nothing is read and identity is
 /// unprovable: [`classify`] answers `RefuseIdentityUnavailable` (MAC-2).
 #[cfg(not(target_os = "linux"))]
-fn gather(sidecar: &Sidecar, state_record: Option<&SupervisorRecord>) -> BackstopFacts {
+fn gather(sidecar: &Sidecar, state_record: Option<&RecordedIdentity>) -> BackstopFacts {
     unread_facts(sidecar, state_record)
 }
 
@@ -455,7 +446,7 @@ pub(crate) fn group_members(pgid: libc::pid_t) -> Option<Vec<GroupMember>> {
 
 /// Decide what the backstop would do for this launch, without acting: for
 /// read-only callers (doctor, the launch guard) that classify a STALE socket.
-pub fn assess(sidecar: &Sidecar, state_record: Option<&SupervisorRecord>) -> BackstopDecision {
+pub fn assess(sidecar: &Sidecar, state_record: Option<&RecordedIdentity>) -> BackstopDecision {
     classify(&gather(sidecar, state_record))
 }
 
@@ -470,7 +461,7 @@ pub fn assess(sidecar: &Sidecar, state_record: Option<&SupervisorRecord>) -> Bac
 pub fn teardown_stale(
     socket: &SocketPath,
     sidecar: &Sidecar,
-    state_record: Option<&SupervisorRecord>,
+    state_record: Option<&RecordedIdentity>,
 ) -> Result<BackstopOutcome, BackstopError> {
     match super::probe(socket.as_path()) {
         Ok(Liveness::Stale) => {}
@@ -528,7 +519,7 @@ enum GroupSignal {
 fn kill_group(
     socket: &SocketPath,
     sidecar: &Sidecar,
-    state_record: Option<&SupervisorRecord>,
+    state_record: Option<&RecordedIdentity>,
     facts: &BackstopFacts,
 ) -> Result<BackstopOutcome, BackstopError> {
     let recorded = &facts.recorded;
