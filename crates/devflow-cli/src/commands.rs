@@ -5522,6 +5522,235 @@ mod tests {
         );
     }
 
+    /// Every `.rs` file under the CLI's `src/` and, recursively, devflow-core's `src/`,
+    /// but devflow-core's `doc_check.rs`: lib.rs declares it under `#[cfg(test)]`, so it
+    /// is never in a build, and its fixtures quote removed names.
+    fn both_crates_rust_sources() -> Vec<PathBuf> {
+        let cli = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let core = Path::new(env!("CARGO_MANIFEST_DIR")).join("../devflow-core/src");
+        let mut files = rust_sources(&cli);
+        files.extend(
+            rust_sources(&core)
+                .into_iter()
+                .filter(|path| path.file_name().is_none_or(|name| name != "doc_check.rs")),
+        );
+        assert!(
+            files.len() > 40
+                && files.iter().any(|path| path.ends_with("src/commands.rs"))
+                && files
+                    .iter()
+                    .any(|path| path.ends_with("src/agents/claude.rs")),
+            "the scan read too few sources: {files:?}"
+        );
+        files
+    }
+
+    /// Each line `keep` keeps from each of `files`, with the file's path. `keep` gets the
+    /// whole source and decides which part counts (a test-module cut, a comment filter).
+    fn kept_lines_with_paths(
+        files: &[PathBuf],
+        keep: impl Fn(&str) -> Vec<String>,
+    ) -> Vec<(PathBuf, String)> {
+        files
+            .iter()
+            .flat_map(|path| {
+                let source = std::fs::read_to_string(path)
+                    .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+                keep(&source)
+                    .into_iter()
+                    .map(|line| (path.clone(), line))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// The names of the State supervisor records 52.2-25 removed.
+    const REMOVED_STATE_RECORD_NAMES: [&str; 3] = [
+        "pending_supervisor",
+        "PendingSupervisor",
+        "SupervisorRecord",
+    ];
+
+    /// The lines of `source` before its first `mod tests {` line, comments kept, that
+    /// name a removed State record.
+    fn lines_naming_a_removed_state_record(source: &str) -> Vec<String> {
+        source
+            .lines()
+            .take_while(|line| !line.contains("mod tests {"))
+            .filter(|line| {
+                REMOVED_STATE_RECORD_NAMES
+                    .iter()
+                    .any(|name| line.contains(name))
+            })
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Whether `source`'s `pub struct State {` block, through the first line that is
+    /// exactly `}`, declares a field named `supervisor`.
+    fn state_struct_has_a_supervisor_field(source: &str) -> bool {
+        source
+            .lines()
+            .skip_while(|line| !line.starts_with("pub struct State {"))
+            .take_while(|line| *line != "}")
+            .any(|line| {
+                let field = line.trim_start();
+                field
+                    .strip_prefix("pub ")
+                    .unwrap_or(field)
+                    .starts_with("supervisor:")
+            })
+    }
+
+    /// D-01, D-07: no source of either crate names a removed State supervisor record,
+    /// comments included, outside its test module, and `State` has no `supervisor`
+    /// field. Controls: a planted line counts 1, the same line after a `mod tests {`
+    /// line counts 0, and a planted `State` block with the field is found while one
+    /// without it is not.
+    #[test]
+    fn no_source_names_a_removed_state_supervisor_item() {
+        let planted = "    let pending = state.pending_supervisor.take();";
+        assert_eq!(
+            lines_naming_a_removed_state_record(&format!("fn f() {{\n{planted}\n}}\n")).len(),
+            1,
+            "planted control: a production line counts 1"
+        );
+        assert_eq!(
+            lines_naming_a_removed_state_record(&format!(
+                "fn f() {{}}\nmod tests {{\n{planted}\n}}\n"
+            ))
+            .len(),
+            0,
+            "planted control: a line inside the test module does not count"
+        );
+        assert!(
+            state_struct_has_a_supervisor_field(
+                "pub struct State {\n    pub supervisor: Option<Record>,\n}\n"
+            ),
+            "planted control: a State field named supervisor is found"
+        );
+        assert!(
+            !state_struct_has_a_supervisor_field(
+                "pub struct State {\n    pub phase: PhaseId,\n}\n"
+            ),
+            "planted control: a State without it is not"
+        );
+
+        let found: Vec<String> = kept_lines_with_paths(
+            &both_crates_rust_sources(),
+            lines_naming_a_removed_state_record,
+        )
+        .into_iter()
+        .map(|(path, line)| format!("{}: {line}", path.display()))
+        .collect();
+        assert_eq!(
+            found,
+            Vec::<String>::new(),
+            "sources name a removed State supervisor record"
+        );
+        let state_rs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../devflow-core/src/state.rs");
+        let state_source = std::fs::read_to_string(&state_rs).unwrap();
+        assert!(
+            state_source.contains("pub struct State {"),
+            "state.rs no longer declares `pub struct State {{`, so the field check reads nothing"
+        );
+        assert!(
+            !state_struct_has_a_supervisor_field(&state_source),
+            "State still declares a `supervisor` field"
+        );
+    }
+
+    /// The supervisor module's paths, split so this file holds neither as contiguous
+    /// source text: the module scan reads this file too.
+    const SUPERVISOR_MODULE_NEEDLES: [&str; 2] = [
+        concat!("crate::", "supervisor"),
+        concat!("devflow_core::", "supervisor"),
+    ];
+
+    /// The code lines of `source` (whole file, test modules included, lines whose
+    /// trimmed start is `//` dropped) that name the supervisor module.
+    fn code_lines_naming_the_supervisor_module(source: &str) -> Vec<String> {
+        source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .filter(|line| {
+                SUPERVISOR_MODULE_NEEDLES
+                    .iter()
+                    .any(|needle| line.contains(needle))
+            })
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Whether `path` is the supervisor module's own source: devflow-core's
+    /// `supervisor.rs`, or any file under a `supervisor/` directory.
+    fn in_the_supervisor_module(path: &Path) -> bool {
+        path.ends_with("src/supervisor.rs")
+            || path.parent().is_some_and(|dir| {
+                dir.components()
+                    .any(|part| part.as_os_str() == "supervisor")
+            })
+    }
+
+    /// Plan check revision 3, warning 4: no code line of either crate, tests included,
+    /// names the supervisor module outside its own files, so 52.2-24 can delete it
+    /// without touching another file. Controls: a planted `use` line counts 1, a planted
+    /// doc line naming it counts 0, and a planted code line in a file under a
+    /// `supervisor/` path is skipped.
+    #[test]
+    fn no_code_outside_the_supervisor_module_names_it() {
+        let [crate_needle, _] = SUPERVISOR_MODULE_NEEDLES;
+        let planted_use = format!("use {crate_needle}::SocketPath;");
+        assert_eq!(
+            code_lines_naming_the_supervisor_module(&format!("{planted_use}\nfn f() {{}}\n")),
+            vec![planted_use.clone()],
+            "planted control: a code line counts 1"
+        );
+        assert_eq!(
+            code_lines_naming_the_supervisor_module(&format!(
+                "/// [`{crate_needle}::probe`]\nfn f() {{}}\n"
+            ))
+            .len(),
+            0,
+            "planted control: a doc line does not count"
+        );
+        let inside = Path::new("/repo/crates/devflow-core/src/supervisor/backstop.rs");
+        let outside = Path::new("/repo/crates/devflow-core/src/stop.rs");
+        let planted_files = [inside.to_path_buf(), outside.to_path_buf()];
+        let kept: Vec<&PathBuf> = planted_files
+            .iter()
+            .filter(|path| !in_the_supervisor_module(path))
+            .collect();
+        assert_eq!(
+            kept,
+            vec![&outside.to_path_buf()],
+            "planted control: a file under supervisor/ is skipped, another is read"
+        );
+        assert!(
+            in_the_supervisor_module(Path::new("/repo/crates/devflow-core/src/supervisor.rs")),
+            "planted control: the module root file is skipped"
+        );
+
+        let files: Vec<PathBuf> = both_crates_rust_sources()
+            .into_iter()
+            .filter(|path| !in_the_supervisor_module(path))
+            .collect();
+        assert!(
+            files.iter().any(|path| path.ends_with("src/commands.rs")),
+            "the scan must read this file, its own needles included"
+        );
+        let found: Vec<String> =
+            kept_lines_with_paths(&files, code_lines_naming_the_supervisor_module)
+                .into_iter()
+                .map(|(path, line)| format!("{}: {line}", path.display()))
+                .collect();
+        assert_eq!(
+            found,
+            Vec::<String>::new(),
+            "code outside the supervisor module names it"
+        );
+    }
+
     /// Whether `path` exists within 30 s, polled every 20 ms.
     fn wait_for_file(path: &Path) -> bool {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);

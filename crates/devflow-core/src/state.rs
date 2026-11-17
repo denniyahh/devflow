@@ -1425,6 +1425,62 @@ mod tests {
         );
     }
 
+    /// D-01: a state file an older build wrote, with its `supervisor` and
+    /// `pending_supervisor` records, still loads: `State` denies no unknown field, so
+    /// the removed keys are ignored, and a round trip writes neither back. Control:
+    /// the same file without the required `phase` fails to load, so the load is real.
+    #[test]
+    fn a_state_file_with_the_removed_supervisor_fields_still_loads() {
+        let with_records = |phase: &str| {
+            format!(
+                r#"{{
+            "stage": "code",
+            {phase}
+            "agent": "claude",
+            "mode": "auto",
+            "started_at": "0",
+            "project_root": "/repo",
+            "supervisor": {{
+                "socket_path": "/c/sock/0123456789abcdef-50-00000000000000ab.sock",
+                "launch_id": "00000000000000ab",
+                "agent_pgid": 4242,
+                "agent_start_time": 123456,
+                "boot_id": "boot-id"
+            }},
+            "pending_supervisor": {{
+                "launch_id": "00000000000000ac",
+                "socket_path": "/c/sock/0123456789abcdef-50-00000000000000ac.sock",
+                "liveness_path": "/repo/.devflow/supervisor-00000000000000ac.live"
+            }}
+        }}"#
+            )
+        };
+        let loaded: State = serde_json::from_str(&with_records(r#""phase": 50,"#))
+            .expect("an older state file with the removed records loads");
+        assert_eq!(loaded.phase, PhaseId::new(50));
+        assert_eq!(loaded.stage, Stage::Code);
+        let written = serde_json::to_value(&loaded).unwrap();
+        let keys = written.as_object().expect("a state is an object");
+        assert!(
+            keys.contains_key("phase"),
+            "the round trip wrote: {written}"
+        );
+        for removed in ["supervisor", "pending_supervisor"] {
+            assert!(
+                !keys.contains_key(removed),
+                "the round trip wrote the removed `{removed}` key back: {written}"
+            );
+        }
+        let reloaded: State = serde_json::from_value(written).expect("the round trip loads");
+        assert_eq!(reloaded.phase, loaded.phase);
+
+        let missing_phase = serde_json::from_str::<State>(&with_records(""));
+        assert!(
+            missing_phase.is_err(),
+            "control: a file without the required `phase` must fail to load"
+        );
+    }
+
     /// `session_id` round-trips through serde as an exact `Option<String>`
     /// (D-04, 28-02) — mirrors the `supervisor` round-trip above.
     #[test]
