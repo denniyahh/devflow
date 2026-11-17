@@ -4,11 +4,12 @@
 //! ends a run, whatever its note says, and that `gate abort` does.
 //!
 //! The file pins both drivers:
-//! - the `start_*` arms cover criterion 4's shape: a foreground `devflow
-//!   start` parked at its Plan preflight gate holds no lock-NN. It is that
-//!   gate's registered waiter, and it holds its launch reservation;
-//! - the `advance_*` arms cover a foreground `devflow advance` parked at a
-//!   Code gate.
+//! - the `start_*` arms cover criterion 4's shape after D-11: `devflow start`
+//!   returns once it has launched the runner unit, and the runner, parked at its
+//!   Plan preflight gate, is that gate's registered waiter and holds its runner
+//!   lock;
+//! - the `advance_*` arms cover a `devflow __runner` parked at the Code gate
+//!   its failed Code stage opened.
 
 mod common;
 
@@ -90,50 +91,82 @@ fn wait_for(mut predicate: impl FnMut() -> bool, what: &str) {
     }
 }
 
-fn spawn_gated_advance(home: &common::HermeticHome, root: &Path, phase: PhaseId) -> Child {
-    spawn_gated_advance_with_path(home, root, phase, None)
+/// The stub `claude` a gated runner launches when the test brings none: it
+/// answers `--version` (the launch's health check) and exits 1 with no result,
+/// so its Code stage fails and the runner opens the Code stage-failure gate.
+const FAILING_CLAUDE: &str =
+    "if [ \"$1\" = \"--version\" ]; then echo \"2.1.220 (Claude Code)\"; exit 0; fi\nexit 1";
+
+fn spawn_gated_runner(home: &common::HermeticHome, root: &Path, phase: PhaseId) -> GatedRunner {
+    let stub = common::fake_bin_dir(FAILING_CLAUDE);
+    spawn_gated_runner_as(home, root, phase, &stub.path, AgentKind::Claude, |_| {}).with_stub(stub)
 }
 
-/// [`spawn_gated_advance`], with `bin_first` (when given) put first on the
-/// child's PATH, so any agent the advance launches after its gate is a stub.
-fn spawn_gated_advance_with_path(
+/// A `devflow __runner` started directly over a saved Code-stage state, parked
+/// at its Code gate, and the stub dir its agent came from. Dropped, it SIGKILLs
+/// and reaps the runner if it still runs.
+struct GatedRunner {
+    child: Child,
+    _stub: Option<common::FakeBin>,
+}
+
+impl GatedRunner {
+    fn with_stub(mut self, stub: common::FakeBin) -> Self {
+        self._stub = Some(stub);
+        self
+    }
+}
+
+impl Drop for GatedRunner {
+    fn drop(&mut self) {
+        common::kill_and_reap(&mut self.child);
+    }
+}
+
+/// Start `devflow __runner` for a run of `agent` saved at Code, with `bin_first`
+/// first on its PATH so the Code agent it launches is that dir's stub, and
+/// `seed` applied to the saved state first. The stub's Code stage fails, so the
+/// runner opens the Code stage-failure gate; this returns once the runner is that
+/// gate's registered, live waiter. The repo must be launchable
+/// ([`init_launchable_repo`]) so the Code preflight passes.
+fn spawn_gated_runner_as(
     home: &common::HermeticHome,
     root: &Path,
     phase: PhaseId,
-    bin_first: Option<&Path>,
-) -> Child {
-    spawn_gated_advance_as(home, root, phase, bin_first, AgentKind::Claude, |_| {})
-}
-
-/// [`spawn_gated_advance_with_path`] for a run of `agent`, with `seed` applied
-/// to the saved state before the advance starts.
-fn spawn_gated_advance_as(
-    home: &common::HermeticHome,
-    root: &Path,
-    phase: PhaseId,
-    bin_first: Option<&Path>,
+    bin_first: &Path,
     agent: AgentKind,
     seed: impl FnOnce(&mut State),
-) -> Child {
+) -> GatedRunner {
     let mut state = State::new(phase, agent, Mode::Auto, root.to_path_buf());
     state.verification_baseline_captured = true;
     state.stage = Stage::Code;
+    // A recorded, confirmed delivery canary: the Code launch runs no canary of its
+    // own, so the stub's first turn is the Code stage's.
+    state.canary = Some(devflow_core::canary::CanaryOutcome::Confirmed);
     seed(&mut state);
     devflow_core::workflow::save_state(&state).unwrap();
+    let existing = std::env::var_os("PATH").unwrap_or_default();
     let mut command = common::hermetic_devflow(home);
     command
-        .args(["advance", "--phase", &phase.to_string()])
-        .arg(root)
-        .env("DEVFLOW_GATE_TIMEOUT_SECS", "15");
-    if let Some(bin_first) = bin_first {
-        let existing = std::env::var_os("PATH").unwrap_or_default();
-        command.hermetic_path(format!(
+        .hermetic_path(format!(
             "{}:{}",
             bin_first.display(),
             existing.to_string_lossy()
-        ));
-    }
-    let child = command.spawn().expect("spawn foreground advance");
+        ))
+        .env_remove("NOTIFY_SOCKET")
+        .env("DEVFLOW_GATE_TIMEOUT_SECS", "15")
+        .current_dir(root)
+        .arg("__runner")
+        .arg("--project")
+        .arg(root)
+        .arg("--phase")
+        .arg(phase.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null());
+    let runner = GatedRunner {
+        child: command.spawn().expect("spawn devflow __runner"),
+        _stub: None,
+    };
     wait_for(
         || Gates::gate_path(root, phase, Stage::Code).exists(),
         "Code gate",
@@ -142,18 +175,18 @@ fn spawn_gated_advance_as(
         &Gates::list_open(root)
             .into_iter()
             .find(|gate| gate.phase == phase && gate.stage == Stage::Code)
-            .expect("the advance's Code gate is listed")
+            .expect("the runner's Code gate is listed")
             .gate_id,
     )
-    .expect("the advance's gate has a gate id");
+    .expect("the runner's gate has a gate id");
     wait_for(
         || {
             Gates::waiter_status(root, phase, Stage::Code, &gate)
                 .is_ok_and(|status| status == WaiterStatus::Live)
         },
-        "the advance's registration at its Code gate",
+        "the runner's registration at its Code gate",
     );
-    child
+    runner
 }
 
 /// End the run at the phase's Code gate with `devflow gate abort`.
@@ -202,7 +235,7 @@ fn events_named(root: &Path, event: &str) -> Vec<serde_json::Value> {
 }
 
 /// A rejection is never an abort, whatever its note says: a note reading "do
-/// not abort, fix the test" resolves the live advance's Code gate as a
+/// not abort, fix the test" resolves the live runner's Code gate as a
 /// loop-back, and the run is not aborted.
 #[test]
 fn a_note_saying_do_not_abort_keeps_the_run_alive() {
@@ -210,17 +243,11 @@ fn a_note_saying_do_not_abort_keeps_the_run_alive() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(4821);
-    init_repo(root, phase);
-    // The loop-back relaunches Code: the agent it finds is a stub that exits at
-    // once, never a real one, and the reaper ends any supervisor it started.
-    let _reaper = common::LaunchedRunReaper::new(root, phase, Vec::new());
-    let fake_bin = common::fake_bin_dir("exit 1");
-    let _child = ReapOnDrop(spawn_gated_advance_with_path(
-        &home,
-        root,
-        phase,
-        Some(&fake_bin.path),
-    ));
+    init_launchable_repo(root, phase);
+    // The loop-back relaunches Code in the runner: the agent it finds is the
+    // same failing stub, never a real one.
+    let _reaper = common::LaunchedRunReaper::for_home(&home, root, phase);
+    let _runner = spawn_gated_runner(&home, root, phase);
 
     let output = answer_code_gate(&home, root, phase, "reject", "do not abort, fix the test");
     assert!(
@@ -231,7 +258,7 @@ fn a_note_saying_do_not_abort_keeps_the_run_alive() {
     common::wait_for(
         || !events_named(root, "gate_resolved").is_empty(),
         Duration::from_secs(20),
-        "the advance to resolve its Code gate",
+        "the runner to resolve its Code gate",
     );
     let resolved = events_named(root, "gate_resolved");
     assert_eq!(
@@ -296,8 +323,8 @@ fn state_json(root: &Path, phase: PhaseId) -> serde_json::Value {
         .expect("the state file is JSON")
 }
 
-/// GATE-01 / D-14 on the stream shape: a gated Code advance on Claude, whose
-/// Code stage-failure gate is rejected with [`REJECTION_NOTE`], relaunches
+/// GATE-01 / D-14 on the stream shape: a runner's failed Code stage on Claude,
+/// whose Code stage-failure gate is rejected with [`REJECTION_NOTE`], relaunches
 /// Code with the note in the prompt the agent reads on stdin, byte for byte.
 /// The note is the operator's word for that relaunch, so the state holds it as
 /// `relaunch_note`, and never as the fix request's `code_fix_note`.
@@ -309,18 +336,24 @@ fn a_rejection_note_reaches_the_stream_prompt_verbatim() {
     let logs = tempfile::tempdir().unwrap();
     let phase = PhaseId::new(4824);
     init_launchable_repo(root, phase);
-    let _reaper = common::LaunchedRunReaper::new(root, phase, Vec::new());
+    let _reaper = common::LaunchedRunReaper::for_home(&home, root, phase);
     let fake_bin = stream_agent_logging_stdin(logs.path());
-    // A recorded, confirmed delivery canary: the stream relaunch runs no canary
-    // of its own, so the only turn the fake logs is the relaunch's.
-    let _child = ReapOnDrop(spawn_gated_advance_as(
+    // The fake logs one turn per launch: the first Code launch's, then the
+    // relaunch's.
+    let _runner = spawn_gated_runner_as(
         &home,
         root,
         phase,
-        Some(&fake_bin.path),
+        &fake_bin.path,
         AgentKind::Claude,
-        |state| state.canary = Some(devflow_core::canary::CanaryOutcome::Confirmed),
-    ));
+        |_| {},
+    );
+    let first_launch = logged_stream_prompts(logs.path());
+    assert_eq!(
+        first_launch.len(),
+        1,
+        "the first Code launch logged one turn"
+    );
 
     let output = answer_code_gate(&home, root, phase, "reject", REJECTION_NOTE);
     assert!(
@@ -329,15 +362,20 @@ fn a_rejection_note_reaches_the_stream_prompt_verbatim() {
         String::from_utf8_lossy(&output.stderr)
     );
     common::wait_for(
-        || !logged_stream_prompts(logs.path()).is_empty(),
+        || logged_stream_prompts(logs.path()).len() > 1,
         Duration::from_secs(20),
         "the relaunched Code agent to read its stdin turn",
     );
     let prompts = logged_stream_prompts(logs.path());
     assert!(
-        prompts[0].contains(REJECTION_NOTE),
+        !first_launch[0].contains(REJECTION_NOTE),
+        "control: the first launch's prompt holds no note:\n{}",
+        first_launch[0]
+    );
+    assert!(
+        prompts[1].contains(REJECTION_NOTE),
         "the relaunched agent's prompt must hold the note byte for byte:\n{}",
-        prompts[0]
+        prompts[1]
     );
     let state = state_json(root, phase);
     assert_eq!(
@@ -361,20 +399,22 @@ fn a_rejection_note_reaches_the_capture_prompt_verbatim() {
     let logs = tempfile::tempdir().unwrap();
     let phase = PhaseId::new(4825);
     init_launchable_repo(root, phase);
-    let _reaper = common::LaunchedRunReaper::new(root, phase, Vec::new());
-    // The relaunched Code stage logs its argv and stdin, then fails again, so
-    // nothing more is launched.
+    let _reaper = common::LaunchedRunReaper::for_home(&home, root, phase);
+    // Each Code launch logs its argv and stdin, then fails, so the runner opens
+    // its stage-failure gate after the first and again after the relaunch.
     let fake_bin = common::capture_agent_bin_then(logs.path(), "exit 1");
-    let _child = ReapOnDrop(spawn_gated_advance_as(
+    let _runner = spawn_gated_runner_as(
         &home,
         root,
         phase,
-        Some(&fake_bin.path),
+        &fake_bin.path,
         AgentKind::Codex,
         // Supervise: auto mode refuses an unattended Code stage on the capture
         // shape before any agent starts.
         |state| state.mode = Mode::Supervise,
-    ));
+    );
+    let argv_log = logs.path().join(common::AGENT_ARGV_LOG);
+    let first_launch = fs::read_to_string(&argv_log).expect("the first launch logged its argv");
 
     let output = answer_code_gate(&home, root, phase, "reject", REJECTION_NOTE);
     assert!(
@@ -382,13 +422,19 @@ fn a_rejection_note_reaches_the_capture_prompt_verbatim() {
         "reject failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let argv_log = logs.path().join(common::AGENT_ARGV_LOG);
     common::wait_for(
-        || fs::read_to_string(&argv_log).is_ok_and(|argv| argv.contains("execute-phase")),
+        || {
+            fs::read_to_string(&argv_log)
+                .is_ok_and(|argv| argv[first_launch.len()..].contains("execute-phase"))
+        },
         Duration::from_secs(20),
         "the relaunched Code agent to log its argv",
     );
-    let argv = fs::read_to_string(&argv_log).unwrap();
+    let argv = fs::read_to_string(&argv_log).unwrap()[first_launch.len()..].to_string();
+    assert!(
+        !first_launch.contains(REJECTION_NOTE),
+        "control: the first launch's argv holds no note:\n{first_launch}"
+    );
     assert!(
         argv.contains(REJECTION_NOTE),
         "the relaunched agent's argv must hold the note byte for byte:\n{argv}"
@@ -412,7 +458,7 @@ fn a_rate_limit_rejection_note_reaches_the_capture_prompt_verbatim() {
     let logs = tempfile::tempdir().unwrap();
     let phase = PhaseId::new(4827);
     init_launchable_repo(root, phase);
-    let _reaper = common::LaunchedRunReaper::new(root, phase, Vec::new());
+    let _reaper = common::LaunchedRunReaper::for_home(&home, root, phase);
     let logs_path = logs.path().to_str().expect("a UTF-8 logs path");
     // The first launch reports a usage limit with no reset time; the relaunch
     // fails, so nothing more is launched after it.
@@ -427,27 +473,15 @@ fn a_rate_limit_rejection_note_reaches_the_capture_prompt_verbatim() {
              exit 1"
         ),
     );
-    // Plan has finished (its capture is a successful codex turn), so the advance
-    // moves to Code and launches codex there: the first launch.
-    let stdout = devflow_core::agent_result::stdout_path(root, phase);
-    fs::create_dir_all(stdout.parent().unwrap()).unwrap();
-    let plan_capture = Command::new("sh")
-        .arg("-c")
-        .arg(common::CODEX_SUCCESS_EVENTS)
-        .output()
-        .expect("render the codex success events");
-    fs::write(&stdout, &plan_capture.stdout).unwrap();
-    let _child = ReapOnDrop(spawn_gated_advance_as(
+    // The runner launches codex for the saved Code stage: the first launch.
+    let _runner = spawn_gated_runner_as(
         &home,
         root,
         phase,
-        Some(&fake_bin.path),
+        &fake_bin.path,
         AgentKind::Codex,
-        |state| {
-            state.mode = Mode::Supervise;
-            state.stage = Stage::Plan;
-        },
-    ));
+        |state| state.mode = Mode::Supervise,
+    );
     let gate: GateFile = serde_json::from_str(
         &fs::read_to_string(Gates::gate_path(root, phase, Stage::Code)).unwrap(),
     )
@@ -530,17 +564,18 @@ fn gate_abort_writes_an_answer_with_the_abort_field_set() {
     assert_eq!(answer["note"], "operator stop", "{answer}");
 }
 
-/// `devflow gate abort` ends a live advance parked at its Code gate: the
-/// advance resolves the gate as an abort and records `workflow_aborted`.
+/// `devflow gate abort` ends a live runner parked at its Code gate: the
+/// runner resolves the gate as an abort, records `workflow_aborted`, and exits 1,
+/// its exit for a run that did not finish.
 #[test]
 fn gate_abort_ends_the_run() {
     let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(4822);
-    init_repo(root, phase);
-    let _reaper = common::LaunchedRunReaper::new(root, phase, Vec::new());
-    let mut child = ReapOnDrop(spawn_gated_advance(&home, root, phase));
+    init_launchable_repo(root, phase);
+    let _reaper = common::LaunchedRunReaper::for_home(&home, root, phase);
+    let mut runner = spawn_gated_runner(&home, root, phase);
 
     let output = answer_code_gate(&home, root, phase, "abort", "operator stop");
     assert!(
@@ -550,18 +585,19 @@ fn gate_abort_ends_the_run() {
     );
     let before = Instant::now();
     let status = loop {
-        if let Some(status) = child.0.try_wait().expect("poll advance") {
+        if let Some(status) = runner.child.try_wait().expect("poll the runner") {
             break status;
         }
         assert!(
             before.elapsed() < Duration::from_secs(20),
-            "the live advance did not act on the abort within 20s"
+            "the live runner did not act on the abort within 20s"
         );
         std::thread::sleep(Duration::from_millis(20));
     };
-    assert!(
-        status.success(),
-        "the advance must abort cleanly: {status:?}"
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "the runner must exit on the abort, with its unfinished-run code: {status:?}"
     );
     let resolved = events_named(root, "gate_resolved");
     assert_eq!(resolved.len(), 1, "{resolved:?}");
@@ -651,46 +687,79 @@ fn start_child(
     command
 }
 
-/// Owns a spawned `devflow start` so a panicking assertion never leaks a
-/// parked process for the length of its gate timeout.
-struct ReapOnDrop(Child);
-
-impl Drop for ReapOnDrop {
-    fn drop(&mut self) {
-        if matches!(self.0.try_wait(), Ok(None)) {
-            let _ = self.0.kill();
-        }
-        let _ = self.0.wait();
-    }
+/// The phase's unit name as the binary derives it (`service::unit_name`).
+fn unit_name(root: &Path, phase: PhaseId) -> String {
+    format!(
+        "devflow-{:016x}-{}.service",
+        devflow_core::registry::path_digest(root),
+        phase.padded()
+    )
 }
 
-/// Spawns `start` (owned by `ReapOnDrop` from the moment it exists) and waits
-/// up to 20 s for it to park at the Plan preflight gate.
-fn spawn_parked_start(
+/// The runner pid the fake `systemd-run` recorded for `phase`'s unit under `home`.
+fn recorded_runner_pid(home: &common::HermeticHome, root: &Path, phase: PhaseId) -> u32 {
+    let record = home
+        .service_bin()
+        .join(format!("{}.pid", unit_name(root, phase)));
+    fs::read_to_string(&record)
+        .unwrap_or_else(|error| panic!("read the runner pid at {}: {error}", record.display()))
+        .trim()
+        .parse()
+        .expect("the recorded runner pid parses")
+}
+
+/// Runs `start` to its return (D-11: it launches the runner unit through the fake
+/// `systemd-run` and exits 0), then waits up to 20 s for the runner to park at the
+/// Plan preflight gate as its registered, live waiter. Returns the runner's pid.
+fn start_parked_runner(
     home: &common::HermeticHome,
     root: &Path,
     phase: PhaseId,
     fake_bin: &FakeBin,
     gate_timeout_secs: &str,
-) -> ReapOnDrop {
-    let mut start = ReapOnDrop(
-        start_child(home, root, phase, fake_bin)
-            .env("DEVFLOW_GATE_TIMEOUT_SECS", gate_timeout_secs)
-            .spawn()
-            .expect("spawn foreground start"),
+) -> u32 {
+    let start = start_child(home, root, phase, fake_bin)
+        .env("DEVFLOW_GATE_TIMEOUT_SECS", gate_timeout_secs)
+        .output()
+        .expect("run start");
+    assert!(
+        start.status.success(),
+        "start must launch the runner and return 0\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&start.stdout),
+        String::from_utf8_lossy(&start.stderr)
     );
+    let runner = recorded_runner_pid(home, root, phase);
     let waited = Instant::now();
-    while !Gates::gate_path(root, phase, Stage::Plan).exists() {
-        if let Some(status) = start.0.try_wait().expect("poll start child") {
-            panic!("start exited ({status:?}) before parking at its Plan gate");
+    loop {
+        let parked = Gates::gate_path(root, phase, Stage::Plan).exists()
+            && Gates::live_waiter_holders(root)
+                .iter()
+                .any(|(pid, _)| *pid == runner);
+        if parked {
+            return runner;
         }
         assert!(
+            common::runs_the_runner_verb(runner),
+            "the runner (pid {runner}) exited before parking at its Plan gate"
+        );
+        assert!(
             waited.elapsed() < Duration::from_secs(20),
-            "timed out after 20s waiting for start's Plan gate"
+            "timed out after 20s waiting for the runner's Plan gate"
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    start
+}
+
+/// Whether `pid` has stopped running the runner verb within `within`.
+fn runner_exited_within(pid: u32, within: Duration) -> bool {
+    let waited = Instant::now();
+    while common::runs_the_runner_verb(pid) {
+        if waited.elapsed() >= within {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    true
 }
 
 /// End the run at the phase's Plan gate with `devflow gate abort`.
@@ -744,10 +813,11 @@ fn advance_wedge_arm_killed_advance_leaves_a_code_gate_that_reject_reports_hones
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(4816);
-    init_repo(root, phase);
-    let mut child = spawn_gated_advance(&home, root, phase);
-    child.kill().expect("kill foreground advance");
-    child.wait().expect("reap foreground advance");
+    init_launchable_repo(root, phase);
+    let _reaper = common::LaunchedRunReaper::for_home(&home, root, phase);
+    let mut runner = spawn_gated_runner(&home, root, phase);
+    runner.child.kill().expect("kill the runner");
+    runner.child.wait().expect("reap the runner");
 
     let output = abort_code_gate(&home, root, phase);
     assert!(
@@ -817,8 +887,9 @@ fn advance_self_resolving_arm_live_advance_consumes_the_code_rejection() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(4817);
-    init_repo(root, phase);
-    let mut child = spawn_gated_advance(&home, root, phase);
+    init_launchable_repo(root, phase);
+    let _reaper = common::LaunchedRunReaper::for_home(&home, root, phase);
+    let mut runner = spawn_gated_runner(&home, root, phase);
     let before = Instant::now();
     let output = abort_code_gate(&home, root, phase);
     assert!(
@@ -827,20 +898,27 @@ fn advance_self_resolving_arm_live_advance_consumes_the_code_rejection() {
         String::from_utf8_lossy(&output.stderr)
     );
     let status = loop {
-        if let Some(status) = child.try_wait().expect("poll advance") {
+        if let Some(status) = runner.child.try_wait().expect("poll the runner") {
             break status;
         }
         assert!(
             before.elapsed() < Duration::from_secs(20),
-            "live advance did not consume rejection"
+            "the live runner did not consume the answer"
         );
         std::thread::sleep(Duration::from_millis(20));
     };
     let pickup_ms = before.elapsed().as_millis();
-    println!("advance_pickup_ms={pickup_ms}");
-    assert!(
-        status.success(),
-        "advance must abort cleanly after pickup: {status:?}"
+    println!("runner_pickup_ms={pickup_ms}");
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "the runner must exit after consuming the abort, with its unfinished-run code: \
+         {status:?}"
+    );
+    assert_eq!(
+        events_named(root, "workflow_aborted").len(),
+        1,
+        "the runner ran its own abort path"
     );
     assert!(
         !Gates::gate_path(root, phase, Stage::Code).exists(),
@@ -945,30 +1023,27 @@ fn plan_gate_id(root: &Path, phase: PhaseId) -> GateId {
     GateId::parse(&gate.gate_id).expect("the Plan gate has a gate id")
 }
 
-/// The parked start is the Plan gate's registered waiter, at once: every gate
-/// wait registers before it publishes, so `gate reject` will find it. The
-/// reservation is asserted beside that, never instead of it: it predates the gate.
-fn assert_parked_start_is_the_plan_gates_waiter(root: &Path, phase: PhaseId, start_pid: u32) {
+/// The parked runner is the Plan gate's registered waiter: every gate wait
+/// registers before it publishes, so `gate reject` will find it. The runner lock
+/// is asserted beside that, never instead of it: the runner takes it first.
+fn assert_parked_runner_is_the_plan_gates_waiter(root: &Path, phase: PhaseId, runner_pid: u32) {
     let gate_id = plan_gate_id(root, phase);
     assert_eq!(
         Gates::waiter_status(root, phase, Stage::Plan, &gate_id).unwrap(),
         WaiterStatus::Live,
-        "the parked start must be registered on its Plan gate"
+        "the parked runner must be registered on its Plan gate"
     );
     assert!(
         Gates::live_waiter_holders(root)
             .iter()
-            .any(|(pid, _)| *pid == start_pid),
-        "the Plan gate's waiter must be the parked start, pid {start_pid}"
+            .any(|(pid, _)| *pid == runner_pid),
+        "the Plan gate's waiter must be the parked runner, pid {runner_pid}"
     );
-    let pending = devflow_core::workflow::load_state(root, phase)
-        .unwrap()
-        .pending_supervisor
-        .expect("the parked start holds its reservation");
     assert_eq!(
-        devflow_core::liveness::probe(&pending.liveness_path).unwrap(),
+        devflow_core::liveness::probe(&devflow_core::liveness::runner_lock_path(root, phase))
+            .unwrap(),
         devflow_core::liveness::Held::Live,
-        "the parked start holds its reservation's lock"
+        "the parked runner holds its runner lock"
     );
 }
 
@@ -980,16 +1055,22 @@ fn start_wedge_arm_interrupted_start_leaves_a_plan_gate_nothing_answers() {
     let phase = PhaseId::new(93);
     init_start_repo(root, phase);
     let fake_bin = fake_bin_dir("sleep 60");
-    let mut start = spawn_parked_start(&home, root, phase, &fake_bin, "30");
+    let _reaper = common::LaunchedRunReaper::for_home(&home, root, phase);
+    let runner = start_parked_runner(&home, root, phase, &fake_bin, "30");
 
-    assert_parked_start_is_the_plan_gates_waiter(root, phase, start.0.id());
+    assert_parked_runner_is_the_plan_gates_waiter(root, phase, runner);
     let gate_id = plan_gate_id(root, phase);
 
-    start.0.kill().expect("kill foreground start");
-    start.0.wait().expect("reap foreground start");
+    // SAFETY: `runner` is the pid the fake launcher recorded for this test's unit,
+    // and it was just seen running the runner verb.
+    unsafe { libc::kill(libc::pid_t::try_from(runner).unwrap(), libc::SIGKILL) };
+    assert!(
+        runner_exited_within(runner, Duration::from_secs(10)),
+        "the SIGKILLed runner (pid {runner}) is gone"
+    );
     assert!(
         Gates::gate_path(root, phase, Stage::Plan).exists(),
-        "the interrupted start must leave its Plan gate behind"
+        "the interrupted runner must leave its Plan gate behind"
     );
 
     let output = abort_plan_gate(&home, root, phase);
@@ -1000,7 +1081,7 @@ fn start_wedge_arm_interrupted_start_leaves_a_plan_gate_nothing_answers() {
     );
     assert!(
         !output.status.success(),
-        "reject against an interrupted start unexpectedly succeeded: {output_text}"
+        "reject against an interrupted runner unexpectedly succeeded: {output_text}"
     );
     assert!(
         output_text.contains("no registered waiter"),
@@ -1052,21 +1133,20 @@ fn start_wedge_arm_interrupted_start_leaves_a_plan_gate_nothing_answers() {
     assert_eq!(
         Gates::waiter_status(root, phase, Stage::Plan, &gate_id).unwrap(),
         WaiterStatus::Absent,
-        "precondition: the killed start's registration must be unheld"
+        "precondition: the killed runner's registration must be unheld"
     );
-    assert!(
-        devflow_core::workflow::load_state(root, phase)
-            .unwrap()
-            .pending_supervisor
-            .is_some(),
-        "precondition: the killed start must leave its reservation in the state"
+    assert_eq!(
+        devflow_core::liveness::probe(&devflow_core::liveness::runner_lock_path(root, phase))
+            .unwrap(),
+        devflow_core::liveness::Held::Abandoned,
+        "precondition: the killed runner no longer holds its runner lock"
     );
 
     let recovery = common::hermetic_devflow(&home)
         .args(["recover", "--clean", "--phase", &phase.to_string()])
         .arg(root)
         .output()
-        .expect("recover interrupted start");
+        .expect("recover the interrupted run");
     assert!(
         recovery.status.success(),
         "recover --clean failed\nstdout: {}\nstderr: {}",
@@ -1075,7 +1155,7 @@ fn start_wedge_arm_interrupted_start_leaves_a_plan_gate_nothing_answers() {
     );
     assert!(
         !state_path.exists(),
-        "recovery must remove the interrupted start's state"
+        "recovery must remove the interrupted run's state"
     );
     let gates_left = phase_gate_entries(root, phase);
     assert!(
@@ -1100,9 +1180,10 @@ fn start_self_resolving_arm_live_start_consumes_the_plan_rejection() {
     let phase = PhaseId::new(94);
     init_start_repo(root, phase);
     let fake_bin = fake_bin_dir("sleep 60");
-    let mut start = spawn_parked_start(&home, root, phase, &fake_bin, "60");
+    let _reaper = common::LaunchedRunReaper::for_home(&home, root, phase);
+    let runner = start_parked_runner(&home, root, phase, &fake_bin, "60");
 
-    assert_parked_start_is_the_plan_gates_waiter(root, phase, start.0.id());
+    assert_parked_runner_is_the_plan_gates_waiter(root, phase, runner);
 
     let before = Instant::now();
     let output = abort_plan_gate(&home, root, phase);
@@ -1112,10 +1193,10 @@ fn start_self_resolving_arm_live_start_consumes_the_plan_rejection() {
         "live reject failed\nstdout: {stdout}\nstderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    // `gate_respond` re-checks the waiter after publishing: a start that has
+    // `gate_respond` re-checks the waiter after publishing: a runner that has
     // already consumed the answer and finished its registration yields the no-waiter
-    // wording. That is accepted only because the start must then be seen to
-    // exit successfully below.
+    // wording. That is accepted only because the runner must then be seen to
+    // record the abort and exit below.
     let reject_wording = if stdout.contains("a registered waiter may pick up this response") {
         "live"
     } else if stdout.contains("response was written, but no registered waiter will act") {
@@ -1125,25 +1206,20 @@ fn start_self_resolving_arm_live_start_consumes_the_plan_rejection() {
     };
     println!("reject_wording={reject_wording}");
 
-    let status = loop {
-        if let Some(status) = start.0.try_wait().expect("poll start child") {
-            break status;
-        }
-        assert!(
-            before.elapsed() < Duration::from_secs(30),
-            "live start did not consume the rejection"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    assert!(
+        runner_exited_within(runner, Duration::from_secs(30)),
+        "the live runner did not consume the abort"
+    );
     let pickup_ms = before.elapsed().as_millis();
     println!("pickup_ms={pickup_ms}");
-    assert!(
-        status.success(),
-        "start must exit cleanly after consuming the rejection: {status:?}"
+    assert_eq!(
+        events_named(root, "workflow_aborted").len(),
+        1,
+        "the runner must run its own abort path after consuming the answer"
     );
     assert!(
         !devflow_core::workflow::state_path(root, phase).exists(),
-        "the rejected start must clear its state"
+        "the aborted run must clear its state"
     );
     assert!(
         !Gates::gate_path(root, phase, Stage::Plan).exists(),
@@ -1170,10 +1246,10 @@ fn long_failure_reason() -> String {
 }
 
 /// GATE-04 (999.206): a stage failure whose reason is longer than the display
-/// bound reaches `devflow gate show` whole, end to end. A gated Code advance on
-/// Claude is rejected, the relaunched agent fails with a 1000-character
-/// reason, and the failure gate it leaves prints that reason in full in `gate
-/// show`. `gate list` still shows a bounded line that leads with the way-on
+/// bound reaches `devflow gate show` whole, end to end. A runner's Code stage on
+/// Claude fails with a 1000-character reason and its gate is rejected; the
+/// relaunched agent fails with the same reason, and the failure gate it leaves
+/// prints that reason in full in `gate show`. `gate list` still shows a bounded line that leads with the way-on
 /// sentence, so the display cut is unchanged: it is the control that the
 /// marker's presence in `gate show` is not a display that never cuts.
 #[test]
@@ -1183,7 +1259,7 @@ fn a_long_failure_reason_reaches_gate_show_whole() {
     let root = dir.path();
     let phase = PhaseId::new(4826);
     init_launchable_repo(root, phase);
-    let _reaper = common::LaunchedRunReaper::new(root, phase, Vec::new());
+    let _reaper = common::LaunchedRunReaper::for_home(&home, root, phase);
     let reason = long_failure_reason();
     // A stream-shape `claude`: it answers `--version`, reads the one stdin
     // turn, reports an error result carrying the long reason, and exits 1.
@@ -1193,14 +1269,14 @@ fn a_long_failure_reason_reaches_gate_show_whole() {
          printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"result\":\"{reason}\"}}'\n\
          exit 1"
     ));
-    let _child = ReapOnDrop(spawn_gated_advance_as(
+    let _runner = spawn_gated_runner_as(
         &home,
         root,
         phase,
-        Some(&fake_bin.path),
+        &fake_bin.path,
         AgentKind::Claude,
-        |state| state.canary = Some(devflow_core::canary::CanaryOutcome::Confirmed),
-    ));
+        |_| {},
+    );
 
     let output = answer_code_gate(&home, root, phase, "reject", "relaunch it");
     assert!(
