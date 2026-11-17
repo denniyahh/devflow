@@ -47,11 +47,6 @@ reason = "Test-only: carries the __monitor argv to the CLI #[cfg(test)] monitor 
 
 [[exceptions]]
 kind = "source_to_docs"
-token = "DEVFLOW_TEST_MONITOR_FULL"
-reason = "Test-only: selects the advance-running monitor harness entry for #[cfg(test)] stage launches in the CLI own unit tests; no release build reads it, so it is not an operator setting (Phase 50, plan 50-10)."
-
-[[exceptions]]
-kind = "source_to_docs"
 token = "DEVFLOW_TEST_HOLD"
 reason = "Test-only: #[cfg(test)] hold points in the devflow-core monitor (50-24) and the CLI stage handoff (50-13, 50-23) wait while it names <point>:<path> and that path does not exist, so tests can land a fault in a chosen window; compiled out of release builds, so it is not an operator setting."
 
@@ -84,11 +79,6 @@ reason = "Test-only: under the devflow-core test-support feature, run_supervised
 kind = "source_to_docs"
 token = "DEVFLOW_TEST_WITHHOLD_PUBLISH_PROBE"
 reason = "Test-only: under the devflow-core test-support feature, spawn_monitor's one publish wait treats every probe of the new supervisor as unanswered while it names <agent>:<stage> for the launch being spawned, so the Phase 51 SUPV-01 experiment can withhold one launch's publish (a failover relaunch, or an ordinary Code launch) and watch the real expiry path; compiled out of release builds, so it is not an operator setting (Phase 51, plan 51-10)."
-
-[[exceptions]]
-kind = "source_to_docs"
-token = "DEVFLOW_TEST_WITHHOLD_SUCCESSOR_PROBE"
-reason = "Test-only: a #[cfg(test)] seam in the CLI's publish_record answers the post-save successor probe Gone, without probing, while it names <agent>:<stage>:<marker-path> for the launch being published, and writes the marker, so the Phase 51 SUPV-01 experiment can watch the run be recorded stopped while its successor still runs; compiled out of release builds, so it is not an operator setting (Phase 51, plan 51-13)."
 
 [[exceptions]]
 kind = "source_to_docs"

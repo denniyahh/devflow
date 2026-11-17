@@ -739,13 +739,18 @@ fn missing_fragments<'a>(text: &str, fragments: &[&'a str]) -> Vec<&'a str> {
         .collect()
 }
 
-/// Fragments OPERATIONS.md must hold, compared as written (50-17).
+/// Fragments OPERATIONS.md must hold, compared as written (50-17; D-07, D-09): the
+/// runner lock, the answers `status` gives that the other verbs act on, the verbs
+/// they name, and the cache directory's override.
 const RUN_LIVENESS_FRAGMENTS: &[&str] = &[
-    "GONE",
-    "STALE",
-    "ALIVE",
+    "runner lock",
+    "`live (stopping)`",
+    "`crashed`",
+    "`stopped`",
+    "`finished`",
     "devflow stop --phase N",
     "devflow resume --phase N",
+    "devflow discard --phase N",
     "DEVFLOW_CACHE_DIR",
 ];
 
@@ -753,30 +758,31 @@ const RUN_LIVENESS_FRAGMENTS: &[&str] = &[
 /// `source_devflow_env_vars_and_subcommands_are_documented` compares (RV-06).
 const INTERNAL_SUBCOMMAND_FRAGMENTS: &[&str] = &["devflow runner"];
 
-/// 50-17 (R6-G4): OPERATIONS.md documents run liveness as the supervisor
-/// socket answers it (GONE / STALE / ALIVE and the repair verbs), the socket
-/// location's override, and the internal runner verb (D-02), outside HTML comments.
+/// 50-17 (R6-G4; D-07, D-09): OPERATIONS.md documents run liveness as the runner
+/// lock answers it (the answers and the verbs they name), the cache directory's
+/// override, and the internal runner verb (D-02), outside HTML comments.
 #[test]
 fn operations_md_documents_run_liveness_and_the_stop_arms() {
     let every: String = RUN_LIVENESS_FRAGMENTS.join("\n");
-    let all_but_stale = every.replace("STALE", "");
+    let all_but_crashed = every.replace("`crashed`", "");
     assert_eq!(
-        missing_fragments(&all_but_stale, RUN_LIVENESS_FRAGMENTS),
-        vec!["STALE"],
-        "planted control: a text missing only STALE must report exactly STALE"
+        missing_fragments(&all_but_crashed, RUN_LIVENESS_FRAGMENTS),
+        vec!["`crashed`"],
+        "planted control: a text missing only `crashed` must report exactly it"
     );
-    let gone_only_in_a_comment = every.replace("GONE", "<!-- GONE -->");
+    let lock_only_in_a_comment = every.replace("runner lock", "<!-- runner lock -->");
     assert!(
-        missing_fragments(&gone_only_in_a_comment, RUN_LIVENESS_FRAGMENTS).is_empty(),
-        "planted control: before stripping, the commented GONE still counts"
+        missing_fragments(&lock_only_in_a_comment, RUN_LIVENESS_FRAGMENTS).is_empty(),
+        "planted control: before stripping, the commented runner lock still counts"
     );
     assert_eq!(
         missing_fragments(
-            &strip_html_comments(&gone_only_in_a_comment),
+            &strip_html_comments(&lock_only_in_a_comment),
             RUN_LIVENESS_FRAGMENTS
         ),
-        vec!["GONE"],
-        "planted control: a GONE only inside an HTML comment must be missing after stripping"
+        vec!["runner lock"],
+        "planted control: a runner lock only inside an HTML comment must be missing after \
+         stripping"
     );
     assert_eq!(
         strip_html_comments("kept <!-- dropped"),
@@ -970,10 +976,10 @@ fn claims_macos_support(text: &str) -> bool {
     })
 }
 
-/// What ARCHITECTURE.md's `## Monitor daemon` section gets wrong about the
-/// supervisor (50-17, D-02/D-03): too short to describe it, not naming its
-/// socket or its in-process advance, or still naming the forked `advance`
-/// command or a `sh -c` runner.
+/// What ARCHITECTURE.md's `## Monitor daemon` section gets wrong about how a stage
+/// runs (50-17; D-02, D-07): too short to describe it, not naming the runner or its
+/// in-process stages, or still naming the forked `advance` command or a `sh -c`
+/// wrapper.
 fn monitor_section_problems(section: &str) -> Vec<String> {
     const MIN_LINES: usize = 8;
     let mut problems = Vec::new();
@@ -981,7 +987,7 @@ fn monitor_section_problems(section: &str) -> Vec<String> {
     if lines < MIN_LINES {
         problems.push(format!("spans {lines} lines, fewer than {MIN_LINES}"));
     }
-    for required in ["in-process", "socket"] {
+    for required in ["in-process", "runner"] {
         if !section.contains(required) {
             problems.push(format!("does not name `{required}`"));
         }
@@ -1027,15 +1033,14 @@ fn read_doc(relative: &str) -> String {
     strip_html_comments(&text)
 }
 
-/// 50-17 (R6-G4, T-50-44, T-50-66): the docs describe the socket supervisor
-/// as built and claim nothing unestablished. OPERATIONS.md carries the macOS
-/// caveat and D-20's install rule; no operator doc claims macOS support;
-/// ARCHITECTURE.md's `## Monitor daemon` section describes the socket and the
-/// in-process advance, not a forked `advance` command; the unattended-mode
-/// guide gives the capture shape, not a shell monitor, as the reason for its
-/// refusals.
+/// 50-17 (R6-G4, T-50-44, T-50-66; D-02, D-07): the docs describe the runner as
+/// built and claim nothing unestablished. OPERATIONS.md carries the macOS caveat
+/// and D-20's install rule; no operator doc claims macOS support; ARCHITECTURE.md's
+/// `## Monitor daemon` section describes the runner and its in-process stages, not a
+/// forked `advance` command; the unattended-mode guide gives the capture shape, not
+/// a shell monitor, as the reason for its refusals.
 #[test]
-fn docs_describe_the_socket_supervisor_not_the_shell_monitor() {
+fn docs_describe_the_runner_not_the_shell_monitor() {
     // Planted controls, through the same helpers as the real checks.
     let two_sections = "# Title\n## First\none\ntwo\n## Second\nthree\n";
     assert_eq!(
@@ -1046,7 +1051,7 @@ fn docs_describe_the_socket_supervisor_not_the_shell_monitor() {
     let planted_section = [
         "## Monitor daemon",
         "",
-        "The supervisor publishes a socket and advances in-process.",
+        "The runner runs each stage and advances in-process.",
         "",
         "Then it runs `devflow advance <project> --phase N`.",
         "",
@@ -1059,6 +1064,20 @@ fn docs_describe_the_socket_supervisor_not_the_shell_monitor() {
         monitor_section_problems(&planted_section),
         vec!["still names `devflow advance`".to_string()],
         "planted control: a section naming the forked advance must fail"
+    );
+    let socket_section = planted_section
+        .replace(
+            "The runner runs each stage",
+            "The supervisor publishes a socket",
+        )
+        .replace(
+            "Then it runs `devflow advance <project> --phase N`.",
+            "It answers.",
+        );
+    assert_eq!(
+        monitor_section_problems(&socket_section),
+        vec!["does not name `runner`".to_string()],
+        "planted control: a section describing the socket supervisor, not the runner, must fail"
     );
     assert!(mentions_shell_monitor("a detached shell\n  monitor"));
     assert!(!mentions_shell_monitor("the capture shape"));
@@ -1101,7 +1120,7 @@ fn docs_describe_the_socket_supervisor_not_the_shell_monitor() {
     let problems = monitor_section_problems(section);
     assert!(
         problems.is_empty(),
-        "ARCHITECTURE.md's `## Monitor daemon` section does not describe the socket supervisor:\n{}",
+        "ARCHITECTURE.md's `## Monitor daemon` section does not describe the runner:\n{}",
         problems.join("\n")
     );
 

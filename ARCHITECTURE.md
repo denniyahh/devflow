@@ -284,59 +284,52 @@ say how the run ended (`commands::stop_outcome`). It signals no pid and writes
 no state. Without lingering (`service::lingering_enabled`) the user manager,
 and every unit under it, ends at logout: `start` and `resume` warn and launch
 anyway. With no answering user manager neither launches, and there is no
-fallback launch without a unit (D-03). The per-stage supervisor that the
-section below describes is what this unit replaced for launch and stop.
+fallback launch without a unit (D-03). The section below describes how the
+runner runs each stage.
 
 ## Monitor daemon
 
-`crates/devflow-core/src/monitor.rs` is the core automation primitive — no
-cron, no scheduler, no agent cooperation. `spawn_monitor()` re-execs the CLI
-as its hidden `__monitor` subcommand, **a detached supervisor process in its
-own process group that owns the agent**, for both launch shapes:
+`crates/devflow-core/src/monitor.rs` holds the stage primitive the runner
+calls — no cron, no scheduler, no agent cooperation. `monitor::run_stage` runs
+one stage's agent in the runner's own process and returns once the agent has
+exited. No separate monitor or supervisor process exists: the runner owns each
+agent as its child, and every stage of a run, its gate waits and its advance
+run in-process in that one runner ([Runner unit](#runner-unit)). A stage
+launches in one of two shapes:
 
-- **capture** (`MonitorLaunch::Legacy`): the agent's stdin is `/dev/null` and
-  its stdout and stderr go straight to the phase capture files (stderr is kept
-  out of the stdout capture so it can never corrupt the `DEVFLOW_RESULT`
-  parse). Adapters other than Claude and Antigravity, and a checkpoint resume,
-  use it.
-- **stream** (`MonitorLaunch::PipeOwning`): the supervisor owns the agent's
-  stdin and stdout pipes, delivers the prompt as the first turn and applies the
-  idle timeout. Claude and Antigravity `stream-json` launches use it.
+- **capture**: the agent's stdin is `/dev/null` and its stdout and stderr go
+  straight to the phase capture files (stderr is kept out of the stdout
+  capture so it can never corrupt the `DEVFLOW_RESULT` parse). Adapters other
+  than Claude and Antigravity, and a checkpoint resume, use it.
+- **stream**: the runner owns the agent's stdin and stdout pipes, delivers the
+  prompt as the first turn and applies the idle timeout. Claude and Antigravity
+  `stream-json` launches use it.
 
-The supervisor (`run_supervised_stage()`):
+For each stage the runner:
 
-1. Spawns the agent (`program` + `args`) in the agent's own process group and
-   records its PID.
-2. Publishes a per-launch Unix socket under `registry::cache_dir()/sock/`,
-   with a JSON sidecar beside it naming the launch (project root, phase,
-   agent process group, start time, boot id). The socket path is recorded in
-   the phase's `state.json` as `state.supervisor`; liveness (ALIVE / STALE /
-   GONE) is answered by probing that path, never from a pid.
-3. Answers `ping` and `shutdown` on the socket, and treats SIGTERM and SIGINT
-   sent to it as a `shutdown`: the agent's group is ended and no advance runs.
-4. Waits for the agent to exit and records its exit code to
-   `.devflow/phase-NN-exit`. A stream supervisor's reader keeps draining the
+1. Spawns the agent (`program` + `args`) in the agent's own process group, and
+   fails the stage if the agent does not lead that group.
+2. Waits for the agent to exit and records its exit code to
+   `.devflow/phase-NN-exit`. A stream stage's reader keeps draining the
    agent's stdout until the pipe closes, and a process the agent started can
-   hold that stdout open after the agent exits. The supervisor then waits up
-   to `READER_DRAIN_WAIT` (3 s) for its pipe threads, then takes the capture
-   file from the reader, within one more `READER_DRAIN_WAIT` when a capture
-   write is blocked, so at most 6 s in all (plus a poll interval per wait). A
-   write still blocked after that keeps the capture file. It detaches the
-   unfinished threads, records a `stream_wait_bounded` event, and signals
-   nothing. The detached reader keeps draining the pipe, discarding what it
-   reads, until the supervisor exits.
-5. On the agent's natural exit, runs the advance in-process. The phase is
-   threaded in at spawn time, so the advance's identity never depends on a
-   shared state singleton — with several phases running, each phase's supervisor
-   advances exactly its own stage. When the advance launches the next stage,
-   that stage's supervisor publishes its socket before this one unlinks its
-   own, so the hand-off leaves no gap with neither socket published.
+   hold that stdout open after the agent exits. The runner then waits up to
+   `READER_DRAIN_WAIT` (3 s) for its pipe threads, then takes the capture file
+   from the reader, within one more `READER_DRAIN_WAIT` when a capture write is
+   blocked, so at most 6 s in all (plus a poll interval per wait). A write
+   still blocked after that keeps the capture file. It detaches the unfinished
+   threads, records a `stream_wait_bounded` event, and signals nothing. The
+   detached reader keeps draining the pipe, discarding what it reads, until
+   the runner exits.
+3. Hands the exit back to the runner loop, which judges the stage and then
+   opens a gate, launches the next stage in the same process, or ends the run.
+   The phase is threaded in at launch, so a stage's identity never depends on
+   a shared state singleton: with several phases running, each phase's runner
+   advances exactly its own stages.
 
-`spawn_monitor()` returns once the new supervisor answers a ping with this
-launch's id. Because the supervisor outlives the CLI process that launched
-it, agent stdout keeps flowing into the capture file and the exit code is
-still reaped after that process returns. `spawn_monitor()` is the single way
-an agent process is spawned (23d).
+A stop reaches a stage through the runner's stop token: a SIGTERM or SIGINT
+that the unit's manager sends ends the agent's group, and no next stage is
+launched. Whether a run is live is the runner lock, never a pid or a socket
+(OPERATIONS.md, `## Run liveness`).
 
 ## Worktree model
 
