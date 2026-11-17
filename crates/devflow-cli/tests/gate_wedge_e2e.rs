@@ -12,6 +12,7 @@
 
 mod common;
 
+use common::HermeticPath;
 use devflow_core::gates::{GateFile, GateId, Gates, WaiterStatus};
 use devflow_core::mode::Mode;
 use devflow_core::phase_id::PhaseId;
@@ -126,10 +127,11 @@ fn spawn_gated_advance_as(
         .env("DEVFLOW_GATE_TIMEOUT_SECS", "15");
     if let Some(bin_first) = bin_first {
         let existing = std::env::var_os("PATH").unwrap_or_default();
-        command.env(
-            "PATH",
-            format!("{}:{}", bin_first.display(), existing.to_string_lossy()),
-        );
+        command.hermetic_path(format!(
+            "{}:{}",
+            bin_first.display(),
+            existing.to_string_lossy()
+        ));
     }
     let child = command.spawn().expect("spawn foreground advance");
     wait_for(
@@ -645,7 +647,7 @@ fn start_child(
         ])
         .arg(root)
         .current_dir(root)
-        .env("PATH", path);
+        .hermetic_path(path);
     command
 }
 
