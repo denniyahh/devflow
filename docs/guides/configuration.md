@@ -24,9 +24,13 @@ OPERATIONS.md's rate-limit failover section for what the fallback does.
 | `--phase N` | Phase number to execute |
 | `--agent claude\|codex\|opencode\|pi` | Agent to launch |
 | `--mode auto\|supervise` | `auto` runs unattended and finishes on a passing Validate (gating only on repeated Validate failure, plus never-silent failure gates); `supervise` also gates every Validate for human review |
-| `--force` | Recreate the phase worktree and feature branch from the base if they exist; refused, with nothing removed, while the branch has commits not merged into the base |
 | `--no-worktree` | Run directly in the primary checkout instead of an isolated worktree (worktree is the default) |
 | `--dry-run` | Check, read-only, what a real start would refuse, then print the pipeline that would run; launches and writes nothing and names the start checks it skips |
+
+`start` removes nothing: over a leftover phase worktree, branch or run state it
+refuses, naming `devflow discard --phase N`, which lists what it removes first and
+refuses a branch with commits not merged into the base unless you name it; the
+refusal over an incomplete run also names `devflow resume --phase N`.
 
 ```bash
 devflow start --phase 3 --agent claude --mode auto
