@@ -588,8 +588,8 @@ fn marked_processes(marker: &str) -> Vec<(u32, String, Vec<String>)> {
     found
 }
 
-/// Approve the parked Plan gate, wait for the monitor chain to launch the
-/// fake agent, and return the agent's environment from `/proc`. Every marked
+/// Approve the parked Plan gate, wait for the runner to launch the fake agent,
+/// and return the agent's environment from `/proc`. Every marked
 /// process is killed before returning.
 fn agent_environment_after_plan_gate(
     home: &common::HermeticHome,
@@ -625,7 +625,7 @@ fn agent_environment_after_plan_gate(
         }
         assert!(
             waited.elapsed() < Duration::from_secs(20),
-            "timed out waiting for the monitor chain to launch the agent"
+            "timed out waiting for the runner to launch the agent"
         );
         std::thread::sleep(Duration::from_millis(20));
     };
@@ -643,9 +643,9 @@ fn assert_chain_has_no_notify_variable(agent: &str) {
     let phase = PhaseId::new(96);
     init_start_repo(root, phase);
     let fake_bin = fake_bin_dir();
-    // Left for 52.2-11 with the argv-scan reaper: approving the Plan preflight
-    // gate below ends the runner while a detached `__monitor` runs the stage.
-    let _run_reaper = common::LaunchedRunReaper::new(root, phase, Vec::new());
+    // Approving the Plan preflight gate below runs the stage in the same runner
+    // (52.2-11), so the runners the fake `systemd-run` recorded are all there is to end.
+    let _run_reaper = common::LaunchedRunReaper::for_home(&home, root, phase);
     spawn_parked_start_with(
         &home,
         root,
