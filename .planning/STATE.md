@@ -5,16 +5,16 @@ milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: "52.2"
 current_phase_name: Foreground Runner
 status: executing
-stopped_at: Completed 52.2-21-PLAN.md
-last_updated: "2026-11-17T06:38:41.543Z"
+stopped_at: Completed 52.2-04-PLAN.md
+last_updated: "2026-11-17T07:14:38.315Z"
 last_activity: 2026-11-16
 last_activity_desc: Phase 52.2 execution started
-state_head: 37fe2005acb9049104c80ebea9ff6997c7856113
+state_head: 65b24435f6630c08a2c420dceaad7fd1c87cb407
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 66
-  completed_plans: 45
+  completed_plans: 46
   percent: 17
 ---
 
@@ -172,7 +172,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 52.2 (Foreground Runner) — EXECUTING
-Plan: 6 of 26
+Plan: 7 of 26
 Status: Ready to execute
 Last activity: 2026-11-16 — Phase 52.2 execution started
 
@@ -946,6 +946,9 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 52.2]: 52.2-03: the CI service job is advisory until 52.2-18 sees it green on GitHub
 - [Phase 52.2]: Agent guard is its own dir after the test's own PATH entries and before the inherited PATH; service-bin entries would shadow test stubs
 - [Phase 52.2]: Agent-guard names come from driver_for(kind).build_command for every AgentKind, plus antigravity and gemini
+- [Phase 52.2]: 52.2-04: TIMEOUT_STOP_SEC is a Duration (name kept); UNIT_STOP_WAIT = TIMEOUT_STOP_SEC + 5 s is the D-07a wait bound
+- [Phase 52.2]: 52.2-04: an unanswered Version probe reads Absent only under the user's own /run/user/<uid> with no systemd/private; a timed-out probe is Failed
+- [Phase 52.2]: 52.2-04: libc moved from dev-dependencies to dependencies for getuid (no new crate)
 
 ## Roadmap Evolution
 
@@ -1102,11 +1105,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 52.2 P02 | 30 min | 3 tasks | 5 files |
 | Phase 52.2 P03 | 41 min | 2 tasks | 8 files |
 | Phase 52.2 P21 | 25min | 3 tasks | 10 files |
+| Phase 52.2 P04 | 22 min | 3 tasks | 5 files |
 
 ## Session
 
-**Last session:** 2026-11-17T06:38:40.652Z
-**Stopped at:** Completed 52.2-21-PLAN.md
+**Last session:** 2026-11-17T07:14:37.319Z
+**Stopped at:** Completed 52.2-04-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
