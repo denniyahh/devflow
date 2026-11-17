@@ -8000,6 +8000,156 @@ mod tests {
         assert!(discard.to_string().contains(&stop), "control: {discard}");
     }
 
+    /// Run the in-crate test `name` alone in a child process, with an empty `PATH` and
+    /// `extra_env`, and return its output once it has passed.
+    fn run_runner_liveness_child(name: &str, extra_env: &[(&str, &std::ffi::OsStr)]) -> String {
+        let path_dir = tempfile::tempdir().unwrap();
+        let output =
+            crate::test_support::run_hermetic_test_in_child(name, path_dir.path(), extra_env);
+        crate::test_support::assert_child_ran_exactly_one_passing_test(&output, name);
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    }
+
+    /// D-07: runner_liveness's answers, one row each, in a process of its own (the
+    /// runner lock is held and probed here). A held lock is Live whatever the unit
+    /// reads; with the lock free a deactivating unit is Stopping and an inactive one
+    /// NotLive; an Absent manager is NotLive and Unreachable or Failed an error, none
+    /// of the three reading the unit (agy-2, codex-2/pi-8); an unprobeable lock is an
+    /// error (control).
+    #[test]
+    fn runner_liveness_reads_live_stopping_and_not_live() {
+        const NAME: &str = "commands::tests::runner_liveness_reads_live_stopping_and_not_live";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_runner_liveness_child(NAME, &[]);
+            return;
+        }
+        use crate::service::{ManagerUnavailableKind, double};
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        let phase = PhaseId::new(4402);
+        let row = |label: &str,
+                   manager: Option<ManagerUnavailableKind>,
+                   unit: &str,
+                   expected: Result<RunnerLiveness, ()>,
+                   unit_read: bool| {
+            double::set_manager(manager);
+            double::set_unit_state(Ok(unit));
+            let reads = double::unit_reads();
+            let answer = runner_liveness(root, phase);
+            assert_eq!(
+                answer.as_ref().map_err(|_| ()),
+                expected.as_ref().map_err(|_| ()),
+                "row `{label}`: runner_liveness answered {answer:?}"
+            );
+            assert_eq!(
+                double::unit_reads() - reads,
+                usize::from(unit_read),
+                "row `{label}`: unit reads"
+            );
+        };
+
+        let hold = liveness::claim_runner_lock(root, phase).expect("hold the runner lock");
+        row(
+            "lock held",
+            None,
+            "deactivating",
+            Ok(RunnerLiveness::Live {
+                pid: Some(std::process::id()),
+            }),
+            false,
+        );
+        drop(hold);
+        let unit = crate::service::unit_name(root, phase).unwrap();
+        row(
+            "lock free, deactivating",
+            None,
+            "deactivating",
+            Ok(RunnerLiveness::Stopping {
+                unit,
+                state: "deactivating".to_string(),
+            }),
+            true,
+        );
+        row(
+            "lock free, inactive",
+            None,
+            "inactive",
+            Ok(RunnerLiveness::NotLive),
+            true,
+        );
+        row(
+            "manager absent",
+            Some(ManagerUnavailableKind::Absent),
+            "deactivating",
+            Ok(RunnerLiveness::NotLive),
+            false,
+        );
+        row(
+            "manager unreachable",
+            Some(ManagerUnavailableKind::Unreachable),
+            "deactivating",
+            Err(()),
+            false,
+        );
+        row(
+            "manager failed",
+            Some(ManagerUnavailableKind::Failed),
+            "deactivating",
+            Err(()),
+            false,
+        );
+
+        let unprobeable = tempfile::tempdir().unwrap();
+        std::fs::write(unprobeable.path().join(".devflow"), "not a dir\n").unwrap();
+        double::set_manager(None);
+        let answer = runner_liveness(unprobeable.path(), phase);
+        assert!(
+            answer
+                .as_ref()
+                .is_err_and(|why| why.contains("could not be probed")),
+            "row `unprobeable lock`: runner_liveness answered {answer:?}"
+        );
+    }
+
+    /// D-03, agy-2: with no user manager (positive evidence, Absent) the runner lock
+    /// alone answers: NotLive, no unit read, and a note on stderr saying so. Runs in a
+    /// child, whose stderr libtest does not capture, so the parent can read the note.
+    /// The held-lock row of `runner_liveness_reads_live_stopping_and_not_live` is its
+    /// control.
+    #[test]
+    fn an_absent_user_manager_reads_the_lock_alone_and_says_why() {
+        const NAME: &str =
+            "commands::tests::an_absent_user_manager_reads_the_lock_alone_and_says_why";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let stderr = run_runner_liveness_child(
+                NAME,
+                &[("RUST_TEST_NOCAPTURE", std::ffi::OsStr::new("1"))],
+            );
+            assert!(
+                stderr.contains("no systemd user manager runs")
+                    && stderr.contains("runner lock only"),
+                "no runner-lock-only note on the child's stderr:\n{stderr}"
+            );
+            return;
+        }
+        use crate::service::{ManagerUnavailableKind, double};
+        let repo = tempfile::tempdir().unwrap();
+        double::set_manager(Some(ManagerUnavailableKind::Absent));
+        double::set_unit_state(Ok("deactivating"));
+        let reads = double::unit_reads();
+        let answer = runner_liveness(repo.path(), PhaseId::new(4403));
+        assert_eq!(
+            answer,
+            Ok(RunnerLiveness::NotLive),
+            "an absent manager did not read NotLive"
+        );
+        assert_eq!(
+            double::unit_reads(),
+            reads,
+            "the unit was read with no manager"
+        );
+    }
+
     #[test]
     fn gate_response_message_does_not_claim_pickup_after_the_waiter_goes() {
         let live = response_pickup_message(WaiterStatus::Live);

@@ -515,6 +515,122 @@ mod tests {
         valued
     }
 
+    /// The kind [`classify_unanswered`] gives `runtime_dir` with `own` as this user's
+    /// runtime dir.
+    fn kind_of(runtime_dir: Option<&OsStr>, own: &Path) -> ManagerUnavailableKind {
+        classify_unanswered(runtime_dir, own, String::new()).kind
+    }
+
+    /// Review codex-2/pi-8, r3 codex-1/pi-5: an unanswered Version probe reads Absent
+    /// only under this user's own runtime dir with no `systemd/private`. The wrong-dir
+    /// row W is round 3's control (round 2's rule read it Absent); the socket row and
+    /// the ENOTDIR row are the controls for absence (a sort reading any failed stat as
+    /// absence fails them).
+    #[test]
+    fn an_unanswered_manager_reads_absent_only_without_its_socket() {
+        use ManagerUnavailableKind::{Absent, Failed, Unreachable};
+        let own = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let own_path = own.path();
+        let mut trailing = own_path.as_os_str().to_os_string();
+        trailing.push("/");
+        let rows: [(&str, Option<&OsStr>, ManagerUnavailableKind); 5] = [
+            ("unset", None, Unreachable),
+            ("relative", Some(OsStr::new("run/user/1000")), Unreachable),
+            ("own", Some(own_path.as_os_str()), Absent),
+            ("own with a trailing /", Some(trailing.as_os_str()), Absent),
+            (
+                "W: another empty absolute dir",
+                Some(other.path().as_os_str()),
+                Unreachable,
+            ),
+        ];
+        for (label, runtime_dir, expected) in rows {
+            assert_eq!(kind_of(runtime_dir, own_path), expected, "row `{label}`");
+        }
+
+        std::fs::create_dir(own_path.join("systemd")).unwrap();
+        std::fs::write(own_path.join("systemd").join("private"), "").unwrap();
+        assert_eq!(
+            kind_of(Some(own_path.as_os_str()), own_path),
+            Failed,
+            "row `own holding systemd/private`"
+        );
+        let file = tempfile::NamedTempFile::new().unwrap();
+        assert_eq!(
+            kind_of(Some(file.path().as_os_str()), file.path()),
+            Failed,
+            "row `a regular file, whose socket stat fails ENOTDIR`"
+        );
+    }
+
+    /// D-07b, the seam's control: a CLI unit test that builds a service tool panics,
+    /// naming the tool and the double, so a cfg(test) path that reached a real tool
+    /// fails rather than passes.
+    #[test]
+    fn a_unit_test_that_reaches_a_service_tool_panics() {
+        let panic = std::panic::catch_unwind(|| tool("systemctl"))
+            .expect_err("tool(\"systemctl\") returned a Command in a unit test");
+        let text = panic
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| panic.downcast_ref::<&str>().map(|text| (*text).to_string()))
+            .unwrap_or_default();
+        assert!(
+            text.contains("systemctl") && text.contains("service test double"),
+            "the panic names the tool and the double: {text:?}"
+        );
+    }
+
+    /// Codex-7: a child still running at its deadline is killed and reaped, and the
+    /// call is a TimedOut error.
+    #[test]
+    fn a_bounded_call_kills_and_reaps_a_child_past_its_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("echo $$ > \"$1\"; exec sleep 30")
+            .arg("sh")
+            .arg(&pid_file);
+        let started = Instant::now();
+        let error = run_bounded(command, Duration::from_millis(200))
+            .expect_err("child outlived its deadline: run_bounded returned its output");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut, "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "child outlived its deadline: the call took {:?}",
+            started.elapsed()
+        );
+        let pid: libc::pid_t = std::fs::read_to_string(&pid_file)
+            .expect("the child recorded its pid")
+            .trim()
+            .parse()
+            .expect("a pid");
+        // SAFETY: signal 0 only checks that `pid` exists; nothing is delivered.
+        let found = unsafe { libc::kill(pid, 0) };
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        assert!(
+            found == -1 && errno == Some(libc::ESRCH),
+            "child not reaped: kill({pid}, 0) returned {found} (errno {errno:?})"
+        );
+    }
+
+    /// The control for the kill: a child that exits in time keeps its output.
+    #[test]
+    fn a_bounded_call_returns_the_output_of_a_child_that_exits_in_time() {
+        let mut command = Command::new("echo");
+        command.arg("inactive");
+        let output = run_bounded(command, Duration::from_secs(5)).expect("in-time output lost");
+        assert!(output.status.success(), "in-time output lost: {output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "inactive",
+            "in-time output lost"
+        );
+    }
+
     /// D-04, Pitfall 1: a name systemd would refuse, or one the manager owns, never
     /// reaches `--setenv`.
     #[test]
