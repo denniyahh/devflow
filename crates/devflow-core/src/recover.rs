@@ -31,50 +31,6 @@ pub enum RecoverError {
     Gate(#[from] crate::gates::GateError),
 }
 
-/// Result of inspecting an existing workflow state.
-#[derive(Debug)]
-pub struct RecoveryStatus {
-    /// The loaded workflow state.
-    pub state: State,
-    /// Whether the agent process is still running.
-    pub agent_running: bool,
-    /// Whether the state is considered stale (>24h without agent).
-    pub is_stale: bool,
-    /// Human-readable age of the state.
-    pub age: String,
-    /// Why the run may still be live, or `None` when nothing says so.
-    pub live: Option<String>,
-}
-
-/// Inspect every active phase state, producing one recovery status per phase
-/// (sorted by phase number). Errors with [`RecoverError::NothingToRecover`]
-/// when no phase has persisted state.
-pub fn inspect_all(project_root: &Path) -> Result<Vec<RecoveryStatus>, RecoverError> {
-    let states = workflow::list_states(project_root);
-    if states.is_empty() {
-        return Err(RecoverError::NothingToRecover);
-    }
-    Ok(states
-        .into_iter()
-        .map(|state| inspect_state(project_root, state))
-        .collect())
-}
-
-fn inspect_state(project_root: &Path, state: State) -> RecoveryStatus {
-    let agent_running = agent_pid_for(&state).is_some_and(crate::agent::agent_running);
-    let is_stale = is_stale_state(&state);
-    let age = format_age(state.started_at.as_str());
-    let live = phase_may_be_live(project_root, &state);
-
-    RecoveryStatus {
-        state,
-        agent_running,
-        is_stale,
-        age,
-        live,
-    }
-}
-
 /// Clean up stale or abandoned workflow state.
 ///
 /// 14-CR-01: only STALE phases are swept — a phase whose agent is still
@@ -971,33 +927,6 @@ mod tests {
         assert!(ago(7200).ends_with("h ago"));
         assert!(ago(2 * 86400).ends_with("d ago"));
         assert_eq!(format_age("garbage"), "unknown");
-    }
-
-    #[test]
-    fn inspect_all_missing_state_reports_nothing_to_recover() {
-        let dir = std::env::temp_dir().join(format!("devflow-recover-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        let err = inspect_all(&dir).expect_err("should have no state");
-        assert!(matches!(err, RecoverError::NothingToRecover));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// 13-DEFERRED-CR-03 acceptance: recover must enumerate ALL active
-    /// phases, not just the last one started.
-    #[test]
-    fn inspect_all_enumerates_every_active_phase() {
-        let dir = tempfile::tempdir().unwrap();
-        workflow::save_state(&state_aged(dir.path(), 60, None)).unwrap();
-        let mut other = state_aged(dir.path(), 60, None);
-        other.phase = PhaseId::new(2);
-        workflow::save_state(&other).unwrap();
-
-        let statuses = inspect_all(dir.path()).expect("two phases active");
-        assert_eq!(
-            statuses.iter().map(|s| s.state.phase).collect::<Vec<_>>(),
-            vec![PhaseId::new(1), PhaseId::new(2)]
-        );
     }
 
     /// 14-CR-01: `recover --clean` must never delete a phase whose agent is
@@ -2302,37 +2231,6 @@ mod tests {
     /// Bound on a test's holder of the write lock, so that a clean which fails to give
     /// up fails its assertion instead of hanging.
     const WRITE_LOCK_HOLD_BOUND: Duration = Duration::from_secs(15);
-
-    #[test]
-    fn inspect_reports_why_a_phase_may_be_live() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let (held, idle) = (PhaseId::new(2120), PhaseId::new(2121));
-        let pending = pending_record(root, "aaaa0000aaaa2120");
-        let liveness_path = pending.liveness_path.clone();
-        save_stale(root, held, |state| state.pending_supervisor = Some(pending));
-        save_stale(root, idle, |_| {});
-        let _hold = crate::liveness::Hold::take(&liveness_path).unwrap();
-
-        let statuses = inspect_all(root).expect("two phases");
-
-        let live: Vec<_> = statuses
-            .iter()
-            .map(|s| (s.state.phase, s.live.clone()))
-            .collect();
-        assert_eq!(live.len(), 2);
-        assert_eq!(live[0].0, held);
-        let reason = live[0]
-            .1
-            .as_deref()
-            .expect("a held pending lock is a reason");
-        assert!(
-            reason.contains("pending supervisor")
-                && reason.contains(&liveness_path.display().to_string()),
-            "{reason}"
-        );
-        assert_eq!(live[1], (idle, None), "nothing is live for the other phase");
-    }
 
     #[test]
     fn explicit_clean_refuses_a_phase_with_a_registered_waiter() {
