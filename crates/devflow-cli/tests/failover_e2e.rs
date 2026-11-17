@@ -21,6 +21,7 @@
 
 mod common;
 
+use common::HermeticPath;
 use devflow_core::canary::CanaryOutcome;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::state::{AgentKind, State};
@@ -369,7 +370,8 @@ impl Rig {
             self.fake_bin.path.display(),
             existing.to_string_lossy()
         );
-        let output = common::hermetic_devflow(&self.home)
+        let mut command = common::hermetic_devflow(&self.home);
+        command
             .args([
                 "start",
                 "--phase",
@@ -384,10 +386,15 @@ impl Rig {
             .args(extra)
             .arg(&self.root)
             .current_dir(&self.root)
-            .env("PATH", path)
-            .envs(env.iter().copied())
-            .output()
-            .expect("run devflow start");
+            .hermetic_path(path);
+        for (name, value) in env {
+            assert_ne!(
+                *name, "PATH",
+                "set PATH with hermetic_path, not through env"
+            );
+            command.env(name, value);
+        }
+        let output = command.output().expect("run devflow start");
         assert!(
             output.status.success(),
             "start failed\nstdout: {}\nstderr: {}",
@@ -855,7 +862,7 @@ fn after_the_refused_relaunch_status_and_resume_lead_to_another_agent() {
             .args(extra)
             .arg(&rig.root)
             .current_dir(&rig.root)
-            .env("PATH", &path)
+            .hermetic_path(&path)
             .output()
             .expect("run devflow resume")
     };

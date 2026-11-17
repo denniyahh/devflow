@@ -13,9 +13,14 @@
 //! process's environment. A suite is covered as soon as it declares
 //! `mod common;`, without editing this file.
 //!
+//! `suites_using_common_set_path_only_through_hermetic_path` scans the same
+//! suites for a child `PATH` set any way but `common::HermeticPath`, which
+//! keeps the fake service manager and the agent guard in front.
+//!
 //! Every scanned token is spelled through `concat!` split inside the token, so
 //! this file's own source holds a raw spawn token exactly once: at the
-//! negative-control spawn. Nothing here reads the operator's real
+//! negative-control spawn, and a `PATH` override exactly once: in
+//! `run_on_path`. Nothing here reads the operator's real
 //! `~/.cache/devflow`.
 
 mod common;
@@ -589,6 +594,22 @@ fn env_mutations(code: &str) -> usize {
         .sum()
 }
 
+/// Child `PATH` overrides in comment-stripped `code`: `.env("PATH",`,
+/// `.env_remove("PATH")`, `.env_clear()` and `.envs(`. Whitespace is removed
+/// first, so a call rustfmt wrapped across lines still counts.
+fn path_overrides(code: &str) -> usize {
+    let compact: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    [
+        concat!(".env(\"PA", "TH\","),
+        concat!(".env_remove(\"PA", "TH\")"),
+        concat!(".env_", "clear()"),
+        concat!(".en", "vs("),
+    ]
+    .iter()
+    .map(|token| compact.matches(token).count())
+    .sum()
+}
+
 fn read_source(path: &Path) -> String {
     fs::read_to_string(path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()))
 }
@@ -682,4 +703,90 @@ fn suites_using_common_never_spawn_devflow_raw_or_mutate_the_environment() {
             path.display()
         );
     }
+}
+
+#[test]
+fn suites_using_common_set_path_only_through_hermetic_path() {
+    // (1) Planted controls: both override forms are flagged once, a call
+    // rustfmt wrapped is still flagged, and the look-alikes pass.
+    let planted_env = concat!("command.env(\"PA", "TH\", x);");
+    assert_eq!(
+        path_overrides(&code_only(planted_env)),
+        1,
+        "a planted PATH override must be flagged"
+    );
+    let planted_envs = concat!("command.en", "vs(pairs);");
+    assert_eq!(
+        path_overrides(&code_only(planted_envs)),
+        1,
+        "a planted envs call must be flagged"
+    );
+    let planted_wrapped = concat!(
+        "command\n    .env(\n        \"PA",
+        "TH\",\n        x,\n    );"
+    );
+    assert_eq!(
+        path_overrides(&code_only(planted_wrapped)),
+        1,
+        "a wrapped PATH override must be flagged"
+    );
+    let planted_paths = concat!("command.env(\"PA", "THS\", x);");
+    assert_eq!(
+        path_overrides(&code_only(planted_paths)),
+        0,
+        "a PATHS variable must pass"
+    );
+    let commented = format!("// {planted_env}\n");
+    assert_eq!(
+        path_overrides(&code_only(&commented)),
+        0,
+        "a commented-out override must pass"
+    );
+
+    // (2) Every suite but service_e2e.rs sets PATH only through
+    // hermetic_path; this file keeps exactly its run_on_path helper.
+    let tests_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let suites = suites_using_common(&tests_dir);
+    let is_service_suite = |path: &Path| path.ends_with("service_e2e.rs");
+    assert!(
+        suites.iter().any(|(path, _)| is_service_suite(path)),
+        "service_e2e.rs must declare `mod common;` for its exemption to mean anything"
+    );
+    let mut offenders = Vec::new();
+    for (path, code) in suites.iter().filter(|(path, _)| !is_service_suite(path)) {
+        let found = path_overrides(code);
+        let allowed = usize::from(path.ends_with("test_home_isolation.rs"));
+        if found != allowed {
+            offenders.push(format!(
+                "{} has {found} PATH override(s), not {allowed}",
+                path.display()
+            ));
+        }
+        if code.contains(concat!("host_service_", "devflow(")) {
+            offenders.push(format!(
+                "{} uses the real-PATH builder, which only service_e2e.rs may use",
+                path.display()
+            ));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "set PATH with common::HermeticPath::hermetic_path, so the fake service manager and \
+         the agent guard stay in front (test_home_isolation.rs keeps exactly its run_on_path \
+         helper):\n{}",
+        offenders.join("\n")
+    );
+
+    // (3) service_e2e.rs is exempt because it is the host-only suite that
+    // `scripts/check.sh service` runs against the real user manager: every
+    // test in it must be ignored, so no default run reaches that manager.
+    let service = code_only(&read_source(&tests_dir.join("service_e2e.rs")));
+    let tests = service.matches("#[test]").count();
+    let ignored = service.matches("#[ignore").count();
+    assert!(tests > 0, "service_e2e.rs holds no #[test]");
+    assert_eq!(
+        tests, ignored,
+        "service_e2e.rs has {tests} #[test] but {ignored} #[ignore]: every test there must be \
+         ignored so only scripts/check.sh service runs it"
+    );
 }

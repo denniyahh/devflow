@@ -22,6 +22,7 @@
 
 mod common;
 
+use common::HermeticPath;
 use devflow_core::mode::Mode;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
@@ -334,7 +335,7 @@ impl Fixture {
             .arg("--phase")
             .arg(self.phase.to_string())
             .arg(&self.root)
-            .env("PATH", git_only_path)
+            .hermetic_path(git_only_path)
             .output()
             .expect("spawn devflow resume")
     }
