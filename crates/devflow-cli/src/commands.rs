@@ -1031,6 +1031,33 @@ fn refuse_an_existing_run(phase: PhaseId, state: &StateFact) -> Result<(), CliEr
     }
 }
 
+/// `resume`'s guards (52.1 D-09.1), pure over `facts`: [`launch_guards`]' live row,
+/// then the states `resume` does not continue, each naming the one verb that applies:
+/// a finished run (the close-out or `discard`), no state (`start`), and a state that
+/// does not load (`discard`). A reservation-only state is refused after the guard
+/// write, by [`refuse_unprepared_run`].
+pub(crate) fn resume_guards(phase: PhaseId, facts: &GuardFacts) -> Result<(), CliError> {
+    refuse_a_live_runner(phase, LaunchVerb::Resume, facts)?;
+    let why = match &facts.state {
+        StateFact::Finished => format!(
+            "phase {phase} finished (its Validate passed), so there is nothing to resume; \
+             nothing was written. To end it, close the phase out, then remove its run with \
+             `devflow discard --phase {phase}`"
+        ),
+        StateFact::Missing => format!(
+            "phase {phase} has no active DevFlow state, so there is nothing to resume; nothing \
+             was written. Run `devflow start --phase {phase}` to start a run"
+        ),
+        StateFact::Unloadable { path, error } => format!(
+            "phase {phase}: its state file {} does not load ({error}), so there is nothing to \
+             resume; nothing was written. Remove it with `devflow discard --phase {phase}`",
+            path.display()
+        ),
+        StateFact::ReservationOnly | StateFact::Incomplete { .. } => return Ok(()),
+    };
+    Err(CliError::Message(format!("resume refused: {why}")))
+}
+
 /// The guard sequence's first row (D-07, D-12): a held runner lock refuses `verb`,
 /// naming `devflow stop`. A lock-free unit never reaches here as live.
 fn refuse_a_live_runner(
@@ -1059,7 +1086,7 @@ fn refuse_a_live_runner(
 }
 
 /// Run a launch's guards in one write-lock closure (D-01): [`launch_guards`] for
-/// `start`, the live row and the finished-run guard for `resume`, then, for `start`,
+/// `start`, [`resume_guards`] for `resume`, then, for `start`,
 /// write `fresh` when no state loads. `facts` were read before the lock
 /// ([`gather_guard_facts`]); the closure fills in the state it holds. The phase
 /// holder the caller holds across the guards, the state write and the unit launch keeps
@@ -1083,9 +1110,8 @@ pub(crate) fn reserve_launch(
         };
         match verb {
             LaunchVerb::Start => launch_guards(phase, &facts)?,
-            LaunchVerb::Resume => refuse_a_live_runner(phase, verb, &facts)?,
+            LaunchVerb::Resume => resume_guards(phase, &facts)?,
         }
-        refuse_resume_of_a_finished_run(phase, verb, &existing)?;
         #[cfg(test)]
         crate::pipeline_launch::launch_test_hold("guarded");
         let (next, created) = match (existing, fresh) {
@@ -3960,27 +3986,6 @@ impl LaunchVerb {
             LaunchVerb::Start => "devflow start".to_string(),
             LaunchVerb::Resume => format!("devflow resume --phase {phase}"),
         }
-    }
-}
-
-/// D-35: `resume` refuses a run that finished, because its last stage already
-/// passed and there is nothing left to continue. Runs on the state
-/// [`reserve_launch`]'s closure read, so the refusal writes nothing and
-/// launches nothing. `start` is not refused: a new run replaces the state.
-fn refuse_resume_of_a_finished_run(
-    phase: PhaseId,
-    verb: LaunchVerb,
-    existing: &workflow::Existing,
-) -> Result<(), CliError> {
-    match (verb, existing) {
-        (LaunchVerb::Resume, workflow::Existing::Loaded(state)) if state.finished => {
-            Err(CliError::Message(format!(
-                "resume refused: phase {phase} finished (its Validate passed), so there is \
-                 nothing to resume; its worktree and branch are kept. Run `devflow start \
-                 --phase {phase}` to start a new run"
-            )))
-        }
-        _ => Ok(()),
     }
 }
 

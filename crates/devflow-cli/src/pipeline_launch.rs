@@ -2267,9 +2267,10 @@ pub(crate) fn resume(
 /// past a boundary the operator named). The save/relaunch ordering is
 /// unchanged either way.
 ///
-/// The reservation at the top (D-01, D-08) refuses to resume while the phase's
-/// supervisor or agent remains live, and writes the pending record in one step with
-/// that check; see [`crate::commands::reserve_launch`]. A resume that fails, or
+/// The reservation at the top (D-01, D-08) runs [`crate::commands::resume_guards`] under
+/// the write lock: it refuses a live run, a finished run, no state and a state that
+/// does not load, each naming the one verb that applies (52.1 D-09.1); see
+/// [`crate::commands::reserve_launch`]. A resume that fails, or
 /// returns without spawning from it, gives the reservation back. The phase's holder is
 /// claimed first (D-17), so a resume another foreground process refuses reserves nothing.
 ///

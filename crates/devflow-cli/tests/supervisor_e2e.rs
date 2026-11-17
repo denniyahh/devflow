@@ -1412,8 +1412,8 @@ fn an_until_validate_run_that_passes_finishes_as_finished() {
 }
 
 /// D-35: a finished run stays inspectable. `cleanup` without `--force` keeps
-/// its worktree, and `resume` refuses it, naming `devflow start`, without
-/// launching a stage that already passed.
+/// its worktree, and `resume` refuses it, naming `devflow discard` and not
+/// `devflow start` (52.1 D-09.1), without launching a stage that already passed.
 #[test]
 fn a_finished_run_is_kept_by_cleanup_and_refused_by_resume() {
     let phase = PhaseId::new(84);
@@ -1468,9 +1468,15 @@ fn a_finished_run_is_kept_by_cleanup_and_refused_by_resume() {
         "resume refuses a finished run\nstdout: {}\nstderr: {stderr}",
         String::from_utf8_lossy(&resume.stdout)
     );
+    // 52.1 D-09.1: nothing re-runs a finished phase, so the refusal names the close-out
+    // and `discard`, never `start`.
     assert!(
-        stderr.contains("devflow start"),
-        "the refusal names `devflow start`: {stderr}"
+        stderr.contains(&format!("devflow discard --phase {phase}")),
+        "the refusal names `devflow discard`: {stderr}"
+    );
+    assert!(
+        !stderr.contains("devflow start"),
+        "the refusal names `devflow start`, which refuses a finished phase: {stderr}"
     );
     assert_eq!(
         stage_launched_count(&rig.root, phase),
