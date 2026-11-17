@@ -212,6 +212,14 @@ impl StopToken {
         }
     }
 
+    /// The token of one foreground run (D-02): the runner owns every stage's agent in
+    /// its own process, so one token spans the whole run. It starts in
+    /// [`OwnerPhase::Advancing`]; [`crate::monitor::run_stage`] moves it to
+    /// [`OwnerPhase::AgentRunning`] while an agent runs.
+    pub fn for_run() -> StopToken {
+        StopToken::new(OwnerPhase::Advancing)
+    }
+
     fn lock(&self) -> MutexGuard<'_, OwnerState> {
         self.owner
             .state
@@ -562,6 +570,35 @@ fn cloexec_nonblocking_pipe() -> io::Result<[libc::c_int; 2]> {
     Ok(fds)
 }
 
+/// [`Supervisor::wait_agent`] for an agent no supervisor serves: block until `child`,
+/// which leads its own group `pgid`, exits, then decide and reap it under `token`.
+pub(crate) fn wait_owned_agent(
+    token: &StopToken,
+    pgid: u32,
+    child: &mut std::process::Child,
+) -> io::Result<AgentOutcome> {
+    wait_for_exit_without_reaping(child.id())?;
+    observe_agent_exit(token, pgid, child)
+}
+
+/// The exit decision for an agent already seen to exit, unreaped: under the owner
+/// lock, SIGKILL the group's leftover members on a stop, while the unreaped leader
+/// still holds the pgid (RESEARCH Pitfall 9), then reap it.
+fn observe_agent_exit(
+    token: &StopToken,
+    pgid: u32,
+    child: &mut std::process::Child,
+) -> io::Result<AgentOutcome> {
+    token.observe_exit(|stop_requested| {
+        if stop_requested {
+            // The zombie leader still holds the pgid, so this reaches
+            // only the agent's own leftover members.
+            signal_group(pgid, libc::SIGKILL);
+        }
+        child.wait().map(exit_code)
+    })
+}
+
 /// A running supervisor: its published socket, its sidecar and its control
 /// thread. Dropping it without [`finish`](Self::finish) still stops the
 /// thread and removes the launch files.
@@ -645,15 +682,7 @@ impl Supervisor {
         // builds.
         #[cfg(any(test, feature = "test-support"))]
         stopped_outcome_test_hold(self.token.stop_requested());
-        let pgid = self.agent_pgid;
-        self.token.observe_exit(|stop_requested| {
-            if stop_requested {
-                // The zombie leader still holds the pgid, so this reaches
-                // only the agent's own leftover members.
-                signal_group(pgid, libc::SIGKILL);
-            }
-            child.wait().map(exit_code)
-        })
+        observe_agent_exit(&self.token, self.agent_pgid, child)
     }
 
     /// End the agent's process group if the agent still runs, under the identity rule

@@ -291,6 +291,9 @@ pub fn phase_holder_path(project_root: &Path, phase: PhaseId) -> PathBuf {
         .join(format!(".holder-{}", phase.padded()))
 }
 
+/// A holder's recorded pid and start time, as [`live_holder`] reads them.
+type HolderIdentity = (u32, Option<u64>);
+
 /// Why [`claim_phase_holder`] did not claim.
 #[derive(Debug)]
 pub enum HolderError {
@@ -340,8 +343,17 @@ impl From<std::io::Error> for HolderError {
 /// [`HolderError::Held`] when another open holds the lock; [`HolderError::Io`] when the
 /// file could not be created, locked or written.
 pub fn claim_phase_holder(project_root: &Path, phase: PhaseId) -> Result<Hold, HolderError> {
-    let path = phase_holder_path(project_root, phase);
     crate::workflow::ensure_devflow_dir(&project_root.join(".devflow"))?;
+    match claim_lock_file(phase_holder_path(project_root, phase))? {
+        Ok(hold) => Ok(hold),
+        Err(holder) => Err(HolderError::Held { holder }),
+    }
+}
+
+/// Open `path` (created owner-only, never truncated), take its exclusive lock past a
+/// probe's momentary shared lock, and record this process in it. The inner `Err` is
+/// another holder's recorded identity, `None` when its record does not read.
+fn claim_lock_file(path: PathBuf) -> std::io::Result<Result<Hold, Option<HolderIdentity>>> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -351,15 +363,69 @@ pub fn claim_phase_holder(project_root: &Path, phase: PhaseId) -> Result<Hold, H
         .open(&path)?;
     match try_lock_past_probes(&file) {
         Ok(()) => {}
-        Err(TryLockError::WouldBlock) => {
-            return Err(HolderError::Held {
-                holder: live_holder(&path).ok().flatten(),
-            });
-        }
-        Err(TryLockError::Error(error)) => return Err(HolderError::Io(error)),
+        Err(TryLockError::WouldBlock) => return Ok(Err(live_holder(&path).ok().flatten())),
+        Err(TryLockError::Error(error)) => return Err(error),
     }
     write_identity_record(&file)?;
-    Ok(Hold { file, path })
+    Ok(Ok(Hold { file, path }))
+}
+
+/// The per-phase runner lock (D-07): `.devflow/.runner-{padded}`.
+pub fn runner_lock_path(project_root: &Path, phase: PhaseId) -> PathBuf {
+    project_root
+        .join(".devflow")
+        .join(format!(".runner-{}", phase.padded()))
+}
+
+/// Why [`claim_runner_lock`] did not claim.
+#[derive(Debug)]
+pub enum RunnerLockError {
+    /// Another runner holds the phase's runner lock. `holder` is its recorded pid and
+    /// start time, or `None` when the record does not read.
+    Held { holder: Option<(u32, Option<u64>)> },
+    /// The file could not be created, locked or written.
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for RunnerLockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RunnerLockError::Held {
+                holder: Some((pid, _)),
+            } => write!(f, "the runner lock is held by another runner (pid {pid})"),
+            RunnerLockError::Held { holder: None } => write!(
+                f,
+                "the runner lock is held by another runner whose record does not read"
+            ),
+            RunnerLockError::Io(error) => write!(f, "the runner lock: {error}"),
+        }
+    }
+}
+
+impl From<std::io::Error> for RunnerLockError {
+    fn from(error: std::io::Error) -> Self {
+        RunnerLockError::Io(error)
+    }
+}
+
+/// Claim `phase`'s runner lock for this process (D-07): an exclusive lock on
+/// [`runner_lock_path`], held until the returned [`Hold`] drops, whose record names this
+/// process. `devflow runner` takes it before anything else and holds it for its whole
+/// life, so the lock alone says whether a runner is alive for the phase.
+///
+/// Same invariants as [`claim_phase_holder`]: the file is never removed, replaced or
+/// `unlock()`ed, it is created mode 0o600, and its record is advisory. The descriptor is
+/// close-on-exec, so the agent a runner spawns never keeps the lock held.
+///
+/// # Errors
+/// [`RunnerLockError::Held`] when another open holds the lock; [`RunnerLockError::Io`]
+/// when the file could not be created, locked or written.
+pub fn claim_runner_lock(project_root: &Path, phase: PhaseId) -> Result<Hold, RunnerLockError> {
+    crate::workflow::ensure_devflow_dir(&project_root.join(".devflow"))?;
+    match claim_lock_file(runner_lock_path(project_root, phase))? {
+        Ok(hold) => Ok(hold),
+        Err(holder) => Err(RunnerLockError::Held { holder }),
+    }
 }
 
 /// The signal [`on_holder_stop_signal`] stored, 0 for none.

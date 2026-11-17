@@ -88,12 +88,12 @@ pub fn entry_path_in(cache_dir: &Path, project_root: &Path, phase: PhaseId) -> P
     ))
 }
 
-/// Inline FNV-1a 64-bit hash over `path`'s OS-string bytes, used only to
-/// derive a stable per-entry filename. `std::collections::hash_map::
+/// Inline FNV-1a 64-bit hash over `path`'s OS-string bytes, used to derive a
+/// stable per-entry filename and the CLI's per-phase unit name. `std::collections::hash_map::
 /// DefaultHasher` is deliberately not used here: its output is explicitly
 /// not guaranteed stable across Rust releases, and an unstable filename
 /// would orphan every existing entry on a toolchain bump.
-pub(crate) fn path_digest(path: &Path) -> u64 {
+pub fn path_digest(path: &Path) -> u64 {
     use std::os::unix::ffi::OsStrExt;
     const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;

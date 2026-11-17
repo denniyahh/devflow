@@ -153,6 +153,13 @@ gate wait (D-08):
   its lifetime by a `start`/`resume` before its spawn or a hand-run
   `devflow advance`, recording its pid and start time. It is the only pid
   `devflow stop` signals, and only when the holder's start time still matches.
+- **Runner lock** (`.devflow/.runner-{phase:02}`, `liveness.rs`) — the foreground
+  runner (`devflow runner`, registered as the hidden `__runner` subcommand, which a
+  `systemd-run --user` unit runs) takes it before anything else and holds it for its
+  whole life, recording its pid and start time. It is opened close-on-exec, so the
+  agent the runner spawns never holds it, and the runner never takes the phase's
+  foreground holder. Under `Type=notify` the runner sends `READY=1` only once the
+  lock is held, so a runner that cannot take it fails the unit's start.
 
 State and gate files are written through the durable helpers in
 `crates/devflow-core/src/durable.rs` (D-09), and a source scan
@@ -162,7 +169,7 @@ loss itself is not tested: the fsyncs are covered in code, not proven against a
 real power cut.
 
 That scope covers state and gate files only. `supervisor-*.live`, `*.waiter`,
-`.holder-NN`, `.state-NN.lock`, `.gates-NN.lock`, `*.hold-tmp` and
+`.holder-NN`, `.runner-NN`, `.state-NN.lock`, `.gates-NN.lock`, `*.hold-tmp` and
 `.devflow/.gitignore` are each an advisory marker deliberately outside D-09: no
 state lives in them, a held lock rather than the file's presence decides liveness,
 and no holder survives a power loss, so a marker a crash resurrects or loses reads
