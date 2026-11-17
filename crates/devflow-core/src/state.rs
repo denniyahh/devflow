@@ -25,8 +25,7 @@ use crate::stage::Stage;
 ///
 /// This exists because `State` accumulates a field roughly every phase that
 /// adds a run-scoped concept (`worktree_path`, `stop_until`, in
-/// phase 28 `session_id` and `checkpoint_resumes`, and in phase 50
-/// `supervisor`).
+/// phase 28 `session_id` and `checkpoint_resumes`).
 /// Without `non_exhaustive`, each of those additions is a semver-breaking
 /// change for any consumer that used a struct literal, which would force a
 /// major bump for what is really an internal bookkeeping change. Paying that
@@ -181,25 +180,6 @@ pub struct State {
     /// always live under the main `project_root`; only the agent's cwd changes.
     #[serde(default)]
     pub worktree_path: Option<PathBuf>,
-    /// The published, ping-confirmed address of the supervisor that owns the
-    /// current stage (D-04): its socket path, launch id, and the agent
-    /// identity the stale-socket backstop validates. Written by the launcher,
-    /// under the write lock ([`crate::workflow::update_state`]), in one save that
-    /// replaces the previous record; it is never cleared ahead of that save.
-    /// `None` means no supervisor has been published for this state, OR the state
-    /// was written by a binary predating this field. The socket path is the only handle a
-    /// liveness question starts from: it is passed to
-    /// [`crate::supervisor::probe`] as recorded, never re-derived.
-    #[serde(default)]
-    pub supervisor: Option<SupervisorRecord>,
-    /// The launch that has reserved this phase and has not published yet. It is
-    /// separate from [`State::supervisor`] because both may be live at a stage
-    /// handoff (D-01). A launcher writes it under the write lock
-    /// ([`crate::workflow::update_state_with`]) before it spawns, and promotes it to
-    /// `supervisor` after the publish. `None` means none is pending, which is also
-    /// what a state file predating this field reads as.
-    #[serde(default)]
-    pub pending_supervisor: Option<PendingSupervisor>,
     /// The Claude session id captured from the most recent captured stdout
     /// envelope for this phase's current stage (D-04, 28-02), read via
     /// [`crate::agent_result::session_id_from_capture`]. `None` means EITHER
@@ -454,72 +434,6 @@ pub struct State {
     pub gap_closure_pass: bool,
 }
 
-/// The persisted handle on a launch's supervisor ([`State::supervisor`]).
-///
-/// The socket path is where [`crate::supervisor::probe`] asks; the launch id,
-/// agent process group, agent start time and boot id are what the
-/// stale-socket backstop checks before it may act, so a record from another
-/// launch or another boot never authorizes a signal.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct SupervisorRecord {
-    /// The published socket, `cache_dir/sock/<stem>.sock`.
-    pub socket_path: PathBuf,
-    /// The per-launch id, also the last segment of the socket's file name.
-    pub launch_id: String,
-    /// The agent's process group id.
-    pub agent_pgid: u32,
-    /// The agent's start time in clock ticks since boot.
-    pub agent_start_time: u64,
-    /// The kernel boot id at launch.
-    pub boot_id: String,
-}
-
-impl SupervisorRecord {
-    /// Build a record; the only way other crates can, since the struct is
-    /// `#[non_exhaustive]`.
-    pub fn new(
-        socket_path: PathBuf,
-        launch_id: String,
-        agent_pgid: u32,
-        agent_start_time: u64,
-        boot_id: String,
-    ) -> Self {
-        Self {
-            socket_path,
-            launch_id,
-            agent_pgid,
-            agent_start_time,
-            boot_id,
-        }
-    }
-}
-
-/// A launch's reservation ([`State::pending_supervisor`]). Its socket and liveness
-/// paths are probed as recorded, never re-derived.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct PendingSupervisor {
-    /// The per-launch id.
-    pub launch_id: String,
-    /// The socket this launch's supervisor will publish.
-    pub socket_path: PathBuf,
-    /// The liveness file this launch's supervisor holds.
-    pub liveness_path: PathBuf,
-}
-
-impl PendingSupervisor {
-    /// Build a reservation; the only way other crates can, since the struct is
-    /// `#[non_exhaustive]`.
-    pub fn new(launch_id: String, socket_path: PathBuf, liveness_path: PathBuf) -> Self {
-        Self {
-            launch_id,
-            socket_path,
-            liveness_path,
-        }
-    }
-}
-
 /// One human-only checkpoint recorded as seen for this run.
 ///
 /// Stores the declaration's own text rather than a hash: a hash would make
@@ -671,8 +585,6 @@ impl State {
             started_at: timestamp_now(),
             project_root,
             worktree_path: None,
-            supervisor: None,
-            pending_supervisor: None,
             session_id: None,
             checkpoint_resumes: 0,
             stop_until: None,
@@ -764,7 +676,6 @@ mod tests {
         assert_eq!(state.preflight_retries, 0);
         assert_eq!(state.phase_validate_failures, 0);
         assert!(!state.started_at.is_empty());
-        assert_eq!(state.supervisor, None);
         assert_eq!(state.stop_until, None);
         assert!(!state.stopped);
         assert_eq!(state.stop_reason, None);
@@ -1306,123 +1217,30 @@ mod tests {
         assert_eq!(loaded_absent.preflight_retries, 0);
     }
 
-    /// The persisted JSON carries the `supervisor` record and no key for the
-    /// monitor pid field 50-16 removed (R-9): the socket record is the only
-    /// liveness source a state file holds. The removed key is built from
-    /// pieces so this file holds no quoted copy of it (T-50-43).
+    /// The persisted JSON carries no `supervisor` record (52.2-25) and no key for the
+    /// monitor pid field 50-16 removed (R-9): the runner lock, not the state file, answers
+    /// liveness. The removed keys are built from pieces so this file holds no quoted
+    /// copy of them (T-50-43). Control: a key the state does carry is found.
     #[test]
-    fn persisted_state_carries_the_supervisor_and_no_monitor_pid_key() {
-        let mut state = State::new(
+    fn persisted_state_carries_no_supervisor_or_monitor_pid_key() {
+        let state = State::new(
             PhaseId::new(1),
             AgentKind::Claude,
             Mode::Auto,
             PathBuf::from("/repo"),
         );
-        let record = SupervisorRecord::new(
-            PathBuf::from("/c/sock/0123456789abcdef-1-00000000000000ab.sock"),
-            "00000000000000ab".to_string(),
-            4242,
-            123_456,
-            "boot-id".to_string(),
-        );
-        state.supervisor = Some(record.clone());
         let json = serde_json::to_string(&state).unwrap();
         assert!(
-            json.contains("\"supervisor\""),
-            "the supervisor key must appear in persisted JSON"
+            json.contains("\"project_root\""),
+            "control: a carried key must appear in persisted JSON: {json}"
         );
-        let removed_key = ["\"", concat!("monitor", "_pid"), "\""].concat();
-        assert!(
-            !json.contains(&removed_key),
-            "the removed monitor pid key must not appear in persisted JSON: {json}"
-        );
-        let loaded: State = serde_json::from_str(&json).unwrap();
-        assert_eq!(
-            loaded.supervisor,
-            Some(record),
-            "the supervisor record must round-trip through serde"
-        );
-    }
-
-    /// `supervisor` survives a real save and load, and a state file without
-    /// the key (an older binary's) loads with `None` (D-04, 50-06).
-    #[test]
-    fn supervisor_record_round_trips_and_absent_reads_as_none() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let phase = PhaseId::new(50);
-        let mut state = State::new(
-            phase,
-            AgentKind::Claude,
-            Mode::Auto,
-            dir.path().to_path_buf(),
-        );
-        assert_eq!(state.supervisor, None, "a new state has no supervisor");
-        let record = SupervisorRecord::new(
-            PathBuf::from("/c/sock/0123456789abcdef-50-00000000000000ab.sock"),
-            "00000000000000ab".to_string(),
-            4242,
-            123_456,
-            "boot-id".to_string(),
-        );
-        state.supervisor = Some(record.clone());
-        crate::workflow::save_state(&state).expect("save the state");
-        let loaded = crate::workflow::load_state(dir.path(), phase).expect("load the state");
-        assert_eq!(
-            loaded.supervisor,
-            Some(record),
-            "the supervisor record must survive a save and load"
-        );
-
-        let absent = r#"{
-            "stage": "code",
-            "phase": 50,
-            "agent": "claude",
-            "mode": "auto",
-            "started_at": "0",
-            "project_root": "/repo"
-        }"#;
-        let loaded: State = serde_json::from_str(absent).expect("an older state file loads");
-        assert_eq!(loaded.supervisor, None, "an absent key reads as None");
-    }
-
-    #[test]
-    fn a_state_without_a_pending_supervisor_parses_and_one_round_trips() {
-        let absent = r#"{
-            "stage": "code",
-            "phase": 50,
-            "agent": "claude",
-            "mode": "auto",
-            "started_at": "0",
-            "project_root": "/repo"
-        }"#;
-        let loaded: State = serde_json::from_str(absent).expect("an older state file loads");
-        assert_eq!(
-            loaded.pending_supervisor, None,
-            "an absent key reads as None"
-        );
-
-        let dir = tempfile::tempdir().unwrap();
-        let phase = PhaseId::new(50);
-        let mut state = State::new(
-            phase,
-            AgentKind::Claude,
-            Mode::Auto,
-            dir.path().to_path_buf(),
-        );
-        assert_eq!(state.pending_supervisor, None, "a new state has none");
-        let pending = PendingSupervisor::new(
-            "00000000000000ab".to_string(),
-            PathBuf::from("/c/sock/0123456789abcdef-50-00000000000000ab.sock"),
-            PathBuf::from("/c/supervisor-00000000000000ab.live"),
-        );
-        state.pending_supervisor = Some(pending.clone());
-        crate::workflow::save_state(&state).expect("save the state");
-        let loaded = crate::workflow::load_state(dir.path(), phase).expect("load the state");
-        assert_eq!(
-            loaded.pending_supervisor,
-            Some(pending),
-            "all three fields must survive a save and load"
-        );
+        for removed in [concat!("super", "visor"), concat!("monitor", "_pid")] {
+            let removed_key = ["\"", removed, "\""].concat();
+            assert!(
+                !json.contains(&removed_key),
+                "the removed {removed} key must not appear in persisted JSON: {json}"
+            );
+        }
     }
 
     /// D-01: a state file an older build wrote, with its `supervisor` and
@@ -1482,7 +1300,7 @@ mod tests {
     }
 
     /// `session_id` round-trips through serde as an exact `Option<String>`
-    /// (D-04, 28-02) — mirrors the `supervisor` round-trip above.
+    /// (D-04, 28-02).
     #[test]
     fn session_id_round_trips_through_serde() {
         let mut state = State::new(

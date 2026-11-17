@@ -659,7 +659,7 @@ command. The coding agent never receives the variable.
 | `.state-NN.lock` | The phase's short state write lock: held for one state write, usually milliseconds and never across a gate wait, and never removed |
 | `.gates-NN.lock` | The per-phase gate lock: held for a few file operations, never removed |
 | `.holder-NN` | D-17 foreground holder: held by a foreground verb for its lifetime (a `start` or `resume` until its unit is launched, a `discard`), recording its pid and start time. `stop` refuses while it is held and no runner is live, and never signals it; never removed by `discard` |
-| `supervisor-<launch_id>.live` | Launch reservation: its lock is taken before the pending record is saved and held by the spawned supervisor for life. No DevFlow verb removes an abandoned one (D-06) |
+| `supervisor-<launch_id>.live` | An older build's launch reservation; no current build writes one, since a launch takes no reservation (D-07). No DevFlow verb removes an abandoned one (D-06) |
 | `*.hold-tmp` | A hold being taken, here or under `gates/`. An orphan is removed by `devflow discard --phase N` when phase N has one |
 | `phase-NN-stdout` / `phase-NN-stderr.log` | Agent capture files (what `logs` tails) |
 | `phase-NN-exit` / `phase-NN-agent-pid` | Exit code + PID the supervisor records |

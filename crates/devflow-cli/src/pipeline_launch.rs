@@ -4580,18 +4580,10 @@ mod tests {
             "resume writes no checkpoint approval: the runner's Code launch records it"
         );
 
-        // D-01: the relaunch is the runner's unit, which records no supervisor.
-        let supervisor_before = before
-            .as_object_mut()
-            .unwrap()
-            .remove("supervisor")
-            .unwrap();
-        let supervisor_after = after.as_object_mut().unwrap().remove("supervisor").unwrap();
-        assert_eq!(supervisor_before, serde_json::Value::Null);
-        assert_eq!(
-            supervisor_after,
-            serde_json::Value::Null,
-            "resume recorded a supervisor"
+        // D-01: the relaunch is the runner's unit; the state records no launch.
+        assert!(
+            after.get("supervisor").is_none(),
+            "resume recorded a supervisor: {after}"
         );
         assert_eq!(
             crate::service::double::launched_units().len(),

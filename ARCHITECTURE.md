@@ -130,19 +130,17 @@ gate wait (D-08):
 
 - **State write lock** (`.devflow/.state-{phase:02}.lock`, `workflow.rs`) — a
   `flock` taken for one read-modify-write of the state file, so it is short:
-  usually milliseconds. A stalled gate lock or a socket dying mid-ping can stretch
-  it to about 10 s in a gate answer and 16 s in a reservation that loads a state. The 16 s is counted from the code's timeouts,
-  not measured: two socket probes at 8 s, or a 6 s probe that finds a dead group, the
-  2 s wait for a supervisor exiting, then an 8 s probe. A missing or unloadable state
-  instead probes each socket left for the phase, up to 8 s each. The file is never replaced or removed, because a `flock`
+  usually milliseconds. A closure that waits on the gate lock inside it waits at
+  most `GATE_LOCK_WAIT` (5 s) for each acquisition. The file is never replaced or removed, because a `flock`
   belongs to an inode. Repair verbs (`devflow discard`)
   wait at most `WRITE_LOCK_REPAIR_WAIT` (10 s), then name the holder and write
   nothing, so a hold that long costs them a refusal, not a hang.
-- **Launch reservation** (`state.pending_supervisor` and
-  `.devflow/supervisor-<launch_id>.live`, `liveness.rs`) — a launcher takes the
-  `flock` before it saves the pending record, and the spawned supervisor inherits
-  and holds it for life, so a pending supervisor is probeable before its socket
-  exists. A reservation whose launcher died holds nothing and reads abandoned.
+- **Phase holder and runner lock** (`.devflow/.holder-{phase:02}` and
+  `.devflow/.runner-{phase:02}`, `liveness.rs`) — a launch takes no reservation
+  and the state records no launch. `start` and `resume` hold the phase holder across
+  their guards, the state write and the unit launch, which keeps a second launcher
+  out (D-07), and the runner holds the runner lock for the whole run, which is what
+  answers liveness.
 - **Gate registration** (`.devflow/gates/{phase:02}-{stage}.{gate_id}.waiter`,
   `gates.rs`) — a `flock` a waiter holds for the length of its wait, which is what
   "something waits on this gate" means. `.devflow/.gates-{phase:02}.lock` guards a
