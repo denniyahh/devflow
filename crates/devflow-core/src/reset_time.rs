@@ -198,6 +198,7 @@ pub(crate) fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
 
 /// The proleptic-Gregorian `(year, month, day)` of the day `days` after
 /// 1970-01-01.
+#[cfg(test)]
 pub(crate) fn civil_from_days(days: i64) -> (i32, u32, u32) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);

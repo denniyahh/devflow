@@ -26,6 +26,12 @@ field liveness_fd of struct StageSpec,
 field promotion_wait of struct StageSpec,
 field supervisor of struct StageRun,
 field liveness of struct StageRun,
+# 52.2-23 printed forms added by the rule above: constants print without their module path, the constructor's parameter change prints as a sentence, and LaunchContext and StageSpec's launch_id go with MonitorExec and the sidecar (its PLAN.md, Task 1)
+MONITOR_ARGV_ENV in file
+INHERITED_FD in file
+devflow_core::monitor::StageSpec::new takes 7 parameters
+devflow_core::monitor::LaunchContext,
+field launch_id of struct StageSpec,
 
 # 52.2-25: the State supervisor records, the launch reservation and the ownership fence
 field supervisor of struct State,

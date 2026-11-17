@@ -304,9 +304,9 @@ impl agents::AgentDriver for FailOnceAdapter {
 }
 
 /// Create a harmless, always-succeeding executable named `name` in a
-/// fresh tempdir — used to satisfy `ensure_agent_binary` and let
-/// `monitor::spawn_monitor`'s backgrounded `"$@"` exec safely resolve to
-/// a no-op instead of a real agent CLI. This host has real
+/// fresh tempdir — used to satisfy `ensure_agent_binary` and let a
+/// stage's agent spawn safely resolve to a no-op instead of a real agent
+/// CLI. This host has real
 /// `claude`/`codex`/`opencode` binaries on PATH (the identical concern
 /// documented on `transition_resets_infra_failures`), so any real
 /// `launch_stage` completion here — both the recursive retry inside
@@ -527,7 +527,7 @@ pub(crate) fn assert_child_ran_exactly_one_passing_test(
 }
 
 /// [`agent_free_git_only_path_dir`], extended with a real `sh` symlink
-/// (needed by `monitor::spawn_monitor`'s backgrounding script) and a
+/// (for fixtures whose stubs are shell scripts) and a
 /// harmless no-op stub for `program` (needed by `ensure_agent_binary`),
 /// so a preflight-resolved relaunch through `launch_stage`/
 /// `launch_stage_inner` can run to completion under a REPLACED PATH
@@ -607,7 +607,7 @@ pub(crate) fn stage_launched_count(root: &Path, phase: PhaseId) -> usize {
 }
 
 /// The child-process seam for GSD's home (52-22): a test that runs stages in
-/// spawned supervisor processes passes a stub home to its child through this
+/// spawned child processes passes a stub home to its child through this
 /// variable, and every process the child starts inherits it. Read only by the
 /// test build; a release build reads `HOME`.
 pub(crate) const TEST_GSD_HOME_ENV: &str = "DEVFLOW_TEST_GSD_HOME";
