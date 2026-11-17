@@ -359,8 +359,8 @@ pub enum GateError {
 }
 
 /// How long one acquisition waits for the phase's gate lock before giving up. It
-/// sits below [`crate::workflow::WRITE_LOCK_REPAIR_WAIT`], so a fenced side effect
-/// with one wait, stuck behind a stopped gate-lock holder, releases the state write
+/// sits below [`crate::workflow::WRITE_LOCK_REPAIR_WAIT`], so a side effect run under
+/// the state write lock with one wait, stuck behind a stopped gate-lock holder, releases the state write
 /// lock before a repair verb's bounded wait gives up. [`Gates::answer`] acquires
 /// twice, around its publish: a holder that stalls both reaches the repair wait,
 /// and the repair verb then names the write lock's holder and writes nothing.
@@ -4345,7 +4345,7 @@ mod tests {
     }
 
     /// D-08 operator ruling (2026-10-26): one wait stays below the repair verbs' bound.
-    /// A fenced answer can make two: see the next test.
+    /// An answer makes two: see the next test.
     #[test]
     fn the_gate_lock_wait_stays_below_the_write_lock_repair_wait() {
         let repair = crate::workflow::WRITE_LOCK_REPAIR_WAIT;
@@ -4355,9 +4355,8 @@ mod tests {
         );
     }
 
-    /// A fenced answer holds the write lock across both of its gate-lock acquisitions,
-    /// so a holder stalling both uses up the repair verbs' whole bound. The docs on
-    /// `GATE_LOCK_WAIT` and `workflow::while_owner` say so. Counted on the real path, and
+    /// An answer takes the gate lock twice, so a holder stalling both uses up the repair
+    /// verbs' whole bound, as the doc on `GATE_LOCK_WAIT` says. Counted on the real path, and
     /// a third acquisition or a constant change that makes the sum fit fails here.
     #[test]
     fn a_fenced_answers_two_gate_waits_reach_the_write_lock_repair_wait() {
@@ -4441,7 +4440,7 @@ mod tests {
             1
         );
         assert_eq!(
-            state_lock_paths("use crate::workflow::update_owned_state;\n").len(),
+            state_lock_paths("use crate::workflow::update_state_with;\n").len(),
             1
         );
         assert_eq!(state_lock_paths("use crate::workflow::{a, b};\n").len(), 1);
