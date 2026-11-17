@@ -28,6 +28,9 @@
 #     prerequisite has somewhere to hold `workflow._auto_chain_active`; the
 #     default mode commits that key as false, in GSD's own serialization, with
 #     the stage-gate keys whose reasons sit above its writer)
+#   - a `.gitignore` for DevFlow's runtime directories and GSD's derived files
+#     (`.planning/state.json`, `.planning/milestone.lock`), so the phase
+#     worktree stays clean for Validate (999.238)
 #   - one phase directory carrying a trivial, already-written plan with no
 #     `checkpoint:*` task, so Plan has a real target instead of inventing
 #     scope, and a pre-written `01-VALIDATION.md` mapping the plan's one
@@ -273,8 +276,9 @@ st_control_head_on_main() {
 # so they are deterministic where commit SHAs are not.
 # Re-measured 2026-11-15 for the GSD-serialized config and the pre-written
 # 01-VALIDATION.md (Phase 52.1, D-15); one appended byte to config.json gives
-# c5b1f181… instead.
-DEFAULT_TREE=59948ed7026f3adffc3c88246bcd5ca2dffa54cc
+# c5b1f181… instead. Re-measured 2026-11-17 for the default .gitignore
+# (999.238).
+DEFAULT_TREE=0ea749dec4fd0b6008cf979dc6cf235eaea7285d
 
 st_default_tree() {
     local name="default mode: tree hash unchanged"
@@ -387,6 +391,37 @@ st_default_hook_controls() {
         case_ok "$name"
     else
         case_fail "$name" "probe failed or no drift hook resolved"
+    fi
+}
+
+# GSD's derived files must not dirty the default scaffold. Control in the same
+# case: a copy whose .gitignore lacks the state.json line shows it untracked.
+st_default_gsd_files_ignored() {
+    local name="default: GSD's state.json and milestone.lock leave the tree clean"
+    local dflt="$ST_TMP/dflt" copy="$ST_TMP/dflt-noignore" status
+    if [ ! -d "$dflt/.git" ]; then
+        case_fail "$name" "precondition: no default scaffold at $dflt"
+        return
+    fi
+    cp -a "$dflt" "$copy"
+    printf '{}\n' >"$dflt/.planning/state.json"
+    printf '{}\n' >"$dflt/.planning/milestone.lock"
+    status="$(git -C "$dflt" status --porcelain)"
+    rm -f "$dflt/.planning/state.json" "$dflt/.planning/milestone.lock"
+    if [ -n "$status" ]; then
+        case_fail "$name" "status after the GSD writes: $status"
+        return
+    fi
+    case_ok "$name"
+    name="control: without the ignore line GSD's state.json shows untracked"
+    sed -i '/^\.planning\/state\.json$/d' "$copy/.gitignore"
+    git -C "$copy" commit -q -am "chore: drop the state.json ignore line for the control"
+    printf '{}\n' >"$copy/.planning/state.json"
+    status="$(git -C "$copy" status --porcelain)"
+    if [ "$status" = "?? .planning/state.json" ]; then
+        case_ok "$name"
+    else
+        case_fail "$name" "status was '$status', want '?? .planning/state.json'"
     fi
 }
 
@@ -652,6 +687,7 @@ run_selftest() {
     st_control_default_no_chain_flag
     st_default_hook_controls
     st_default_validation
+    st_default_gsd_files_ignored
     st_default_branches
     st_guard_probe "control: refuses a destination inside this checkout" "$REPO_ROOT"
     # The main checkout, computed here independently of the guard's own
@@ -1487,6 +1523,19 @@ cat > "$DEST_ABS/.planning/config.json" <<'EOF'
   },
   "model_profile": "budget"
 }
+EOF
+
+# GSD 1.21.0 republishes `.planning/state.json` at every step boundary
+# (gsd-core state-contract.cjs, #3227) and holds `.planning/milestone.lock`
+# while it runs; neither is meant to be committed, and this repository's own
+# .gitignore ignores both. Without these lines the phase worktree is dirty at
+# Validate, so no Validate pass counts and every approve loops back into
+# Validate (999.238). `.devflow/` and `.worktrees/` as in --live-payload.
+cat > "$DEST_ABS/.gitignore" <<'EOF'
+.devflow/
+.worktrees/
+.planning/state.json
+.planning/milestone.lock
 EOF
 
 git -C "$DEST_ABS" add -A
