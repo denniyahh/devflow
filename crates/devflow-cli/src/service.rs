@@ -31,11 +31,19 @@ pub(crate) const TIMEOUT_STOP_SEC: Duration = Duration::from_secs(10);
 /// [`TIMEOUT_STOP_SEC`] plus 5 s, so the manager's own SIGKILL lands inside the wait.
 pub(crate) const UNIT_STOP_WAIT: Duration = Duration::from_secs(TIMEOUT_STOP_SEC.as_secs() + 5);
 
-/// How long the manager waits for the runner's `READY=1` before it fails the start.
-pub(crate) const TIMEOUT_START_SEC: &str = "30s";
+/// How long the manager waits for the runner's `READY=1` before it fails the start
+/// (`TimeoutStartSec`).
+pub(crate) const TIMEOUT_START: Duration = Duration::from_secs(30);
 
 /// The deadline of one `systemctl` call made on its own, outside a wait (codex-7).
 pub(crate) const SYSTEMCTL_CALL_BOUND: Duration = Duration::from_secs(30);
+
+/// The deadline of the `systemd-run` launch: the unit's [`TIMEOUT_START`], which bounds
+/// only the unit's start, plus [`SYSTEMCTL_CALL_BOUND`] for `systemd-run`'s own wait on
+/// the bus and the manager.
+#[cfg(not(test))]
+const LAUNCH_CALL_BOUND: Duration =
+    Duration::from_secs(TIMEOUT_START.as_secs() + SYSTEMCTL_CALL_BOUND.as_secs());
 
 /// How often [`run_bounded`] checks whether its child has exited.
 const BOUNDED_CALL_POLL: Duration = Duration::from_millis(50);
@@ -615,7 +623,7 @@ pub(crate) fn runner_unit_argv(
         "-p".into(),
         format!("TimeoutStopSec={}s", TIMEOUT_STOP_SEC.as_secs()).into(),
         "-p".into(),
-        format!("TimeoutStartSec={TIMEOUT_START_SEC}").into(),
+        format!("TimeoutStartSec={}s", TIMEOUT_START.as_secs()).into(),
         "--expand-environment=no".into(),
     ];
     let mut working = OsString::from("--working-directory=");
@@ -647,8 +655,9 @@ const TEST_RUNNER_READY_WAIT: Duration = Duration::from_secs(30);
 ///
 /// # Errors
 /// The unit name, the executable or the argv could not be built, `systemd-run` could
-/// not run, or it exited non-zero: text naming the unit and carrying systemd-run's
-/// stderr.
+/// not run, it did not return within [`LAUNCH_CALL_BOUND`] (killed; the unit's state is
+/// then unknown), or it exited non-zero: text naming the unit and carrying
+/// systemd-run's stderr.
 #[cfg(not(test))]
 pub(crate) fn launch_runner_unit(project_root: &Path, phase: PhaseId) -> Result<String, String> {
     let unit = unit_name(project_root, phase)
@@ -660,11 +669,18 @@ pub(crate) fn launch_runner_unit(project_root: &Path, phase: PhaseId) -> Result<
     let argv = runner_unit_argv(project_root, phase, &exe, &names).map_err(|error| {
         format!("unit {unit}: the systemd-run argv could not be built ({error})")
     })?;
-    let output = tool("systemd-run")
-        .args(argv)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| format!("unit {unit}: systemd-run could not run ({error})"))?;
+    let mut command = tool("systemd-run");
+    command.args(argv);
+    let output = run_bounded(command, LAUNCH_CALL_BOUND).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::TimedOut {
+            format!(
+                "unit {unit}: {error}; whether the unit started is unknown, see \
+                 `devflow status`"
+            )
+        } else {
+            format!("unit {unit}: systemd-run could not run ({error})")
+        }
+    })?;
     if output.status.success() {
         return Ok(unit);
     }
