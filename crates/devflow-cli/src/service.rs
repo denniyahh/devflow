@@ -225,19 +225,65 @@ fn own_runtime_dir() -> PathBuf {
     PathBuf::from(format!("/run/user/{uid}"))
 }
 
+/// Whether `stdout` of a Version probe that exited 0 is a manager's answer: a version,
+/// which starts with an ASCII digit. The pinned devcontainer's `systemctl` shim exits 0
+/// with a "systemd is not running" notice, so exit 0 alone is not an answer
+/// (`scripts/check.sh`'s `run_service` applies the same rule).
+pub(crate) fn is_version_answer(stdout: &str) -> bool {
+    stdout
+        .trim_start()
+        .starts_with(|c: char| c.is_ascii_digit())
+}
+
+/// The systemd `ActiveState` values (`systemctl --state=help`).
+const ACTIVE_STATES: &[&str] = &[
+    "active",
+    "reloading",
+    "inactive",
+    "failed",
+    "activating",
+    "deactivating",
+    "maintenance",
+    "refreshing",
+];
+
+/// `unit`'s `ActiveState` from the trimmed `stdout` of a `show` that exited 0.
+///
+/// # Errors
+/// `stdout` is not one of systemd's `ActiveState` values (a shim's notice, say): a
+/// read error naming the unit, never a state.
+pub(crate) fn active_state_reading(unit: &str, stdout: &str) -> Result<String, String> {
+    let state = stdout.trim();
+    if ACTIVE_STATES.contains(&state) {
+        Ok(state.to_string())
+    } else {
+        Err(format!(
+            "`systemctl --user show -p ActiveState {unit}` printed {state:?}, not a systemd \
+             ActiveState"
+        ))
+    }
+}
+
 /// D-03: whether the systemd user manager answers
 /// `systemctl --user show -p Version --value` (never `is-system-running`).
 ///
 /// # Errors
-/// It did not answer: [`classify_unanswered`]'s sort of `XDG_RUNTIME_DIR`. A probe
-/// that timed out is [`ManagerUnavailableKind::Failed`], never Absent.
+/// It did not answer, or exited 0 without a version ([`is_version_answer`]):
+/// [`classify_unanswered`]'s sort of `XDG_RUNTIME_DIR`. A probe that timed out is
+/// [`ManagerUnavailableKind::Failed`], never Absent.
 #[cfg(not(test))]
 pub(crate) fn manager_available() -> Result<(), ManagerUnavailable> {
     let mut command = tool("systemctl");
     command.args(["--user", "show", "-p", "Version", "--value"]);
     let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR");
     let stderr = match run_bounded(command, SYSTEMCTL_CALL_BOUND) {
-        Ok(output) if output.status.success() => return Ok(()),
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if is_version_answer(&stdout) {
+                return Ok(());
+            }
+            format!("exited 0 but printed no version: {}", stdout.trim())
+        }
         Ok(output) => String::from_utf8_lossy(&output.stderr).trim().to_string(),
         Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
             return Err(ManagerUnavailable {
@@ -268,14 +314,15 @@ pub(crate) fn manager_available() -> Result<(), ManagerUnavailable> {
 ///
 /// # Errors
 /// The call failed, exited non-zero or timed out: a description naming the unit and
-/// carrying systemctl's stderr, never "inactive".
+/// carrying systemctl's stderr, never "inactive". An answer outside systemd's
+/// `ActiveState` set is an error too ([`active_state_reading`]).
 #[cfg(not(test))]
 pub(crate) fn unit_active_state(unit: &str, bound: Duration) -> Result<String, String> {
     let mut command = tool("systemctl");
     command.args(["--user", "show", "-p", "ActiveState", "--value", unit]);
     match run_bounded(command, bound) {
         Ok(output) if output.status.success() => {
-            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+            active_state_reading(unit, &String::from_utf8_lossy(&output.stdout))
         }
         Ok(output) => Err(format!(
             "`systemctl --user show -p ActiveState {unit}` failed ({}); systemctl: {}",
@@ -844,6 +891,45 @@ mod tests {
             }
         }
         valued
+    }
+
+    /// A Version probe that exits 0 answers only with a version. The devcontainer's
+    /// shim notice is no answer; a real manager's version is the control.
+    #[test]
+    fn a_version_probe_answers_only_with_a_version() {
+        assert!(
+            !is_version_answer(
+                "System has not been booted with systemd as init system (PID 1). Can't operate.\n"
+            ),
+            "an exit-0 notice with no version was read as a manager's answer"
+        );
+        assert!(!is_version_answer(""), "empty output was read as an answer");
+        assert!(
+            is_version_answer("257.9-1.fc45\n"),
+            "control: a manager's version is an answer"
+        );
+    }
+
+    /// An `ActiveState` read that exits 0 with text outside systemd's set is a read
+    /// error, never a state. `inactive` and `deactivating` are the controls.
+    #[test]
+    fn an_active_state_outside_systemds_set_is_a_read_error() {
+        let unit = "devflow-test.service";
+        let notice = active_state_reading(unit, "systemd is not running\n");
+        assert!(
+            notice.as_ref().is_err_and(|why| why.contains(unit)),
+            "a shim notice was read as ActiveState: {notice:?}"
+        );
+        assert_eq!(
+            active_state_reading(unit, "inactive\n"),
+            Ok("inactive".to_string()),
+            "control: inactive is a state"
+        );
+        assert_eq!(
+            active_state_reading(unit, "deactivating"),
+            Ok("deactivating".to_string()),
+            "control: deactivating is a state"
+        );
     }
 
     /// The kind [`classify_unanswered`] gives `runtime_dir` with `own` as this user's
