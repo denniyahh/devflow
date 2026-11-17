@@ -1,0 +1,51 @@
+# devflow-core semver: accept-break (operator, 2026-11-16, per 52.2-CONTEXT.md); no deprecated stubs
+# Matching rule: each non-comment, non-blank line is a fixed string; an item that `cargo semver-checks` lists under `Failed in:` is planned when its line contains one of them. A module group ends in `::`; an exact item ends in `,` so that it cannot match a longer name.
+# Rule for later plans: when a run lists an item that no pattern matches, a plan adds the item's exact printed form under its own comment line only if its own PLAN.md names the removal (by item, or as a variant or field of a type it changes), and says so in its SUMMARY. Fields, variants and methods print without their module path, so this happens. Any other listed item is a stop: report it as an unplanned removal and do not add it.
+
+# 52.2-10: recover verb (already removed)
+devflow_core::recover::inspect_all,
+devflow_core::recover::RecoveryStatus,
+
+# 52.2-23: the supervised stage path, inherited liveness, install_holder_stop_handler
+devflow_core::monitor::spawn_monitor,
+devflow_core::monitor::run_supervised_stage,
+devflow_core::monitor::MonitorLaunch,
+devflow_core::monitor::MonitorExec,
+devflow_core::monitor::Promotion,
+devflow_core::monitor::Published,
+devflow_core::monitor::MONITOR_ARGV_ENV,
+devflow_core::monitor::wait_for_agent_pid,
+devflow_core::monitor::StageRun,
+devflow_core::liveness::INHERITED_FD,
+devflow_core::liveness::adopt_inherited,
+devflow_core::liveness::install_holder_stop_handler,
+variant MonitorError::SocketPath,
+variant MonitorError::Publish,
+field socket of struct StageSpec,
+field liveness_fd of struct StageSpec,
+field promotion_wait of struct StageSpec,
+field supervisor of struct StageRun,
+field liveness of struct StageRun,
+
+# 52.2-25: the State supervisor records, the launch reservation and the ownership fence
+field supervisor of struct State,
+field pending_supervisor of struct State,
+devflow_core::state::SupervisorRecord,
+devflow_core::state::PendingSupervisor,
+devflow_core::monitor::Reservation,
+variant MonitorError::Liveness,
+devflow_core::liveness::launch_liveness_path,
+devflow_core::workflow::Ownership,
+devflow_core::workflow::ownership,
+devflow_core::workflow::update_owned_state,
+devflow_core::workflow::while_owner,
+devflow_core::workflow::clear_state_if_owned,
+variant WorkflowError::NotOwner,
+
+# 52.2-24: the supervisor module (with 52.2-12's pub use re-exports at the old paths), recover's verb-only items (format_age moves to the CLI), OwnerPhase::HandedOff
+devflow_core::supervisor::
+devflow_core::recover::
+variant OwnerPhase::HandedOff,
+
+# 52.2-13: divergence_from_develop
+GitFlow::divergence_from_develop
