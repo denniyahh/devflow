@@ -89,12 +89,20 @@ run_deps() {
 run_service() {
     # Not part of `all`: the pinned devcontainer has no systemd user manager, so
     # these tests can only run on a host or a VM (D-07b). A missing manager is a
-    # hard error, never a skip. The probe sits inside `if !` because under
+    # hard error, never a skip. The probe sits inside `if` because under
     # `set -e` a bare failing substitution would end the script before the
-    # message below is printed.
-    local out
-    if ! out=$(systemctl --user show -p Version --value 2>&1); then
-        echo "error: no systemd user manager answers (systemctl --user show -p Version failed); scripts/check.sh service needs one" >&2
+    # message below is printed. Exit 0 alone is not an answer: the pinned
+    # devcontainer image ships a /usr/local/bin/systemctl shim that prints a
+    # "systemd is not running" notice and exits 0. A manager prints its
+    # version, which starts with a digit.
+    local out answered=0
+    if out=$(systemctl --user show -p Version --value 2>&1); then
+        case "$out" in
+            [0-9]*) answered=1 ;;
+        esac
+    fi
+    if [ "$answered" != 1 ]; then
+        echo "error: no systemd user manager answers (systemctl --user show -p Version failed or printed no version); scripts/check.sh service needs one" >&2
         echo "$out" >&2
         exit 1
     fi
