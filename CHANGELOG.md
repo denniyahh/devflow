@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+### Removed
+
+`devflow-core` is a published library; these public items are removed outright, with no deprecated stubs
+(accept-break, Phase 52.2):
+
+- `recover::inspect_all` and `RecoveryStatus`, with the `devflow recover` verb (52.2-10)
+- the `supervisor::` paths of the stop primitives and identity helpers, which moved to `devflow_core::stop` and
+  `devflow_core::liveness` (52.2-12)
+- monitor's supervised stage path (`spawn_monitor`, `run_supervised_stage`, `MonitorLaunch`, `MonitorExec`)
+  and `wait_for_agent_pid`, with `StageSpec::socket` and `MonitorError::{SocketPath, Publish}` (52.2-23)
+- liveness's inherited-liveness items (`INHERITED_FD`, `adopt_inherited`) and `install_holder_stop_handler`
+  (52.2-23)
+- the `supervisor` module: the socket, its sidecar and probe, the socket-serving `Supervisor` and the orphan
+  backstop (52.2-24)
+- the `recover` module; `format_age` moved into the CLI (52.2-24)
+- `State::{supervisor, pending_supervisor}` and their types `SupervisorRecord` and `PendingSupervisor` (52.2-25)
+- monitor's `Reservation` with `MonitorError::Liveness`, and liveness's `launch_liveness_path` (52.2-25)
+- workflow's ownership fence: `Ownership`, `ownership`, `update_owned_state`, `while_owner`,
+  `clear_state_if_owned` and `WorkflowError::NotOwner` (52.2-25)
+- `OwnerPhase::HandedOff` (52.2-24)
+
 ## 3.0.0 — 2026-11-03
 
 The first release since 2.12.0, collecting Phases 46 through 50.1. A run's liveness is now read from a

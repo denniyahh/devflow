@@ -5523,19 +5523,24 @@ mod tests {
 
     /// How many production lines of `source` read the agent pid file: `source` is cut
     /// at its first `mod tests {` line, and a line whose trimmed start is `//` is not
-    /// counted.
+    /// counted. Neither is the declaration (`fn agent_pid_path(`) nor archive's
+    /// stale-file cleanup (`remove_file(agent_pid_path(`), which deletes and reads nothing.
     fn agent_pid_readers(source: &str) -> usize {
         source
             .lines()
             .take_while(|line| !line.contains("mod tests {"))
             .filter(|line| !line.trim_start().starts_with("//"))
             .filter(|line| line.contains("agent_pid_path("))
+            .filter(|line| {
+                !line.contains("fn agent_pid_path(")
+                    && !line.contains("remove_file(agent_pid_path(")
+            })
             .count()
     }
 
-    /// D-12a: no production code of the CLI reads the agent pid file; liveness is the
-    /// runner lock ([`runner_liveness`]). Control: a planted source with one reader
-    /// counts 1.
+    /// D-12a: no production code of either crate reads the agent pid file; liveness is
+    /// the runner lock ([`runner_liveness`]). Controls: a planted source with one reader
+    /// counts 1, and one holding only the declaration and the cleanup counts 0.
     #[test]
     fn no_production_reader_of_the_agent_pid_file_remains() {
         let planted = "fn f() {\n    let path = agent_result::agent_pid_path(root, phase);\n}\n\
@@ -5545,12 +5550,20 @@ mod tests {
             1,
             "planted control: one production reader counts 1"
         );
-        let cli = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let files = rust_sources(&cli);
-        assert!(
-            files.len() >= 10 && files.iter().any(|path| path.ends_with("src/commands.rs")),
-            "the scan read too few sources: {files:?}"
+        let reader = "    let pid = std::fs::read_to_string(agent_pid_path(root, phase));\n";
+        assert_eq!(
+            agent_pid_readers(reader),
+            1,
+            "planted control: the read_to_string reader counts 1"
         );
+        let declaration_and_cleanup = "pub fn agent_pid_path(project_root: &Path, phase: PhaseId) -> PathBuf {\n\
+                                       }\n    let _ = std::fs::remove_file(agent_pid_path(project_root, phase));\n";
+        assert_eq!(
+            agent_pid_readers(declaration_and_cleanup),
+            0,
+            "planted control: the declaration and the stale-file cleanup are not readers"
+        );
+        let files = both_crates_rust_sources();
         let found: Vec<String> = files
             .iter()
             .filter_map(|path| {

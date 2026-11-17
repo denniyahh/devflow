@@ -52,6 +52,16 @@ variant WorkflowError::NotOwner,
 devflow_core::supervisor::
 devflow_core::recover::
 variant OwnerPhase::HandedOff,
+# 52.2-24 printed forms added by the rule above: the two modules print as `mod <path>,`, and their constants print without their module path; each constant name below is declared in the baseline only inside supervisor.rs, supervisor/ or recover.rs (its PLAN.md, Tasks 1 and 2, deletes both modules)
+mod devflow_core::supervisor,
+mod devflow_core::recover,
+SUN_PATH_MAX_MACOS in file
+SUN_PATH_MAX_LINUX in file
+SUN_PATH_MAX in file
+STOPPED_EXIT_CODE in file
+IO_TIMEOUT in file
+MAX_LINE in file
+STALE_THRESHOLD in file
 
 # 52.2-13: divergence_from_develop
 GitFlow::divergence_from_develop

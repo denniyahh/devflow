@@ -73,26 +73,42 @@
   **Resolution (52.2-25):** `transition`'s `--until` stop no longer clears a supervisor record, and the comment that explained the clear (naming `check_dead_agent` and `check_dead_monitor`) now says only why `gate_pending` is cleared. `rg -n check_dead_agent crates` exits 1.
 
 - The stop primitives' own unit tests still live in `supervisor/runtime.rs`
-  status: open
+  status: resolved (52.2-24, commit 137b40c)
   **What:** 52.2-12 moved the stop primitives to `crates/devflow-core/src/stop.rs` and moved the forbidden signal/exit source scan with them (`stop::tests::stop_source_has_none_of_the_forbidden_signal_or_exit_calls`; runtime.rs keeps its own scan over runtime.rs). The tests whose subject is a moved item stayed in `supervisor/runtime.rs`'s `mod tests`: `every_owner_phase_has_exactly_one_stop_decision`, `exit_and_safe_point_decisions_cover_every_input`, `a_stop_racing_natural_completion_never_advances`, `natural_completion_without_a_stop_advances`, and the signal-pipe tests that run a child (`sigterm_is_delivered_as_a_stop_event_not_handled_in_the_handler`, `a_term_ignoring_group_member_is_killed_after_the_leader_exits`). Deleting the module would delete coverage of code that stays.
   **Why deferred:** 52.2-12's task is the move of production items, and its prohibition is on public removals; moving those tests (several drive a child supervisor through the socket) is a test restructure the plan does not name. Fix shape: 52.2-24, which deletes `supervisor/`, ports each test whose subject is in `stop.rs` into `stop::tests` (a child that installs the signal pipe and waits under a `StopToken`, no socket) or gives it a `successor` ledger row; only socket-subject tests get `subject removed`. Owner: 52.2-24.
+  **Resolution:** the four decision tests and `a_term_ignoring_group_member_is_killed_after_the_leader_exits` are in `stop::tests` (the last in process, through `stop_on_signal` and `wait_owned_agent`, no socket; with `observe_agent_exit`'s SIGKILL removed it fails with `the TERM-ignoring member must be gone within the grace window`); `end_agent_group_never_signals_a_pgid_after_its_leader_is_reaped` is renamed `stop::tests::end_group_while_running_never_signals_a_pgid_after_its_leader_is_reaped`; `sigterm_is_delivered_as_a_stop_event_not_handled_in_the_handler` has a `successor` row naming two monitor tests. 52.2-24-SUMMARY.md's test ledger lists each.
 
 - Comments outside 52.2-23's files still name the deleted `spawn_monitor` and `MonitorLaunch`
-  status: open
+  status: open (`agent.rs` and `agent_result.rs` resolved by 52.2-24; `staleness.rs` and `preflight.rs` remain)
   **What:** after 52.2-23, `crates/devflow-core/src/agent_result.rs` (:3428 `MonitorLaunch::PipeOwning`, :3575 and :3584 `spawn_monitor`), `agent.rs:297`, `crates/devflow-cli/src/staleness.rs:406` and `preflight.rs` (:674, :1598, :1639, and the test name `run_preflight_failing_check_gates_and_never_reaches_spawn_monitor`) still name items 52.2-23 deleted. Comments and one test name only; no code reads them. Found by 52.2-23.
   **Why deferred:** outside 52.2-23's files. Owner: 52.2-15 for `preflight.rs` (rename the test with its doc), 52.2-24 for `agent.rs` (its Task 2 edits that file), else a 999.x entry at phase close for `agent_result.rs` and `staleness.rs`.
+  **Partial (52.2-24, commits 137b40c and the Task 3 commit):** `agent.rs` names no `spawn_monitor`, `__monitor` socket finding or `--launch`, and `agent_result.rs` names no `spawn_monitor` or `MonitorLaunch`. `staleness.rs:406` keeps its 999.x owner, `preflight.rs` 52.2-15.
 
 - `agent_result::prompt_path` and `monitor_log_path` have no production writer
-  status: open
+  status: open (doc comments reworded by 52.2-24; removal reassigned to a 999.x entry at phase close)
   **What:** 52.2-23 stopped writing `.devflow/phase-NN-prompt` and `phase-NN-monitor.log` (D-09). Both path functions are still public in `crates/devflow-core/src/agent_result.rs`; `monitor_log_path` is read only by monitor tests that assert the file is absent, and `prompt_path` by nothing. Removing them is a published-API removal. Found by 52.2-23.
   **Why deferred:** `agent_result.rs` is outside 52.2-23's files and the two functions are in no group of 52.2-SEMVER-REMOVALS.txt. Owner: 52.2-24 (which already edits devflow-core's remaining per-run file readers), else a 999.x entry at phase close.
+  **Partial (52.2-24):** both doc comments now say nothing writes the file since 4.0. 52.2-24's PLAN.md does not name their removal, and 52.2-SEMVER-REMOVALS.txt's rule forbids adding an item a plan does not name, so their removal needs a plan that names it (999.x at phase close).
 
 - A gates.rs test still describes the deleted ownership fence
-  status: open
+  status: resolved (52.2-24, Task 3 commit)
   **What:** after 52.2-25 deleted `workflow::while_owner` and the CLI's `fenced` wrapper, `crates/devflow-core/src/gates.rs`'s `a_fenced_answers_two_gate_waits_reach_the_write_lock_repair_wait` (its doc comment, ~:4386, names `workflow::while_owner` and says a fenced answer holds the write lock across its two gate waits) describes a hold no code makes any more; the test itself still passes, because it counts `Gates::answer`'s two gate-lock acquisitions. The `state_lock_paths("use crate::workflow::update_owned_state;\n")` fixture at ~:4472 is a string, not a call, and still works as a planted control. Found by 52.2-25.
   **Why deferred:** `gates.rs` is outside 52.2-25's files. Fix shape: reword the doc (or rename the test) to say what it pins now, two gate waits per answer against `WRITE_LOCK_REPAIR_WAIT`, and swap the fixture's item name for one that exists. Owner: 52.2-24, else a 999.x entry at phase close.
+  **Resolution:** the test's doc and its neighbour's say an answer takes the gate lock twice, `GATE_LOCK_WAIT`'s doc no longer says "fenced", and the fixture names `update_state_with`. The test keeps its name.
 
 - Two readers of `.devflow/supervisor-<id>.live` remain with no writer
-  status: open
+  status: resolved (52.2-24, commit f1df2f3)
   **What:** since 52.2-25 no build writes a launch reservation file, but `commands.rs`'s `held_launch_and_phase_holders` (doctor's stray-process check) still counts a held `supervisor-*.live` file's holder as reachable, and `recover::unrecorded_live_launches` (verb-only code) still lists them. Both only read leftovers an older build left; neither is wrong. OPERATIONS.md's `.devflow/` table row says no current build writes one. Found by 52.2-25.
   **Why deferred:** removing the commands.rs reader is outside 52.2-25's named items, and recover.rs's verb-only code is 52.2-24's to delete. Fix shape: 52.2-24 deletes `unrecorded_live_launches` with recover's verb-only code, and drops the `supervisor-` arm of `held_launch_and_phase_holders` (its test `registry_reachable_pids_includes_held_reservation_and_waiter_holders` loses its reservation case), then the OPERATIONS.md row. Else a 999.x entry at phase close.
+  **Resolution:** `unrecorded_live_launches` went with recover.rs; `held_launch_and_phase_holders` is now `held_phase_holders` and reads `.holder-*` only; its test is renamed `registry_reachable_pids_includes_held_waiter_and_holder_files_only` and asserts a held `supervisor-*.live` is not a holder; OPERATIONS.md's row says no verb reads or removes one.
+
+- Public stop and registry items with no use left after the supervisor delete
+  status: open
+  **What:** after 52.2-24 deleted `supervisor/`, `stop::StopAction::ReplyHandedOff` is produced by no `OwnerPhase` (its doc says so), `stop::StopSource::Socket` and `StopToken::note_group_signalled` have no caller in either crate, and `registry::socket_dir_in` names a directory no build creates. All are public devflow-core items. Found by 52.2-24.
+  **Why deferred:** 52.2-24's PLAN.md names only `OwnerPhase::HandedOff` among them, and 52.2-SEMVER-REMOVALS.txt's rule forbids adding an item a plan does not name. Fix shape: a plan that names their removal adds them to the list and deletes them. Owner: a 999.x entry at phase close.
+
+- 52.2-24's Task 2 acceptance `rg -n 'HandedOff' crates` cannot exit 1
+  status: open
+  **What:** the check also matches `stop::StopAction::ReplyHandedOff` (kept, entry above) and the CLI's unrelated `HandoffOutcome::HandedOff` (`crates/devflow-cli/src/pipeline_launch.rs`, an agent handoff in `resume`). 52.2-24 checked the variant it removes with `rg -n -w 'OwnerPhase::HandedOff' crates` (exit 1) and `rg -n 'HandedOff' crates/devflow-core`, which prints only `ReplyHandedOff`. Found by 52.2-24.
+  **Why deferred:** a plan-text defect; renaming an unrelated CLI variant to satisfy it would be out of scope. Fix shape: the verifier reads the narrower check. Owner: phase verification.
+

@@ -3425,7 +3425,7 @@ fn reconcile_layer0_verdict(
 /// gates depending on whether a stale Layer 1 success happened to be present.
 ///
 /// Note the `ResourceKilled` arm is currently **unreachable via the
-/// `MonitorLaunch::PipeOwning` path**: `run_pipe_owning_monitor` records
+/// pipe-owning path**: `run_pipe_owning_monitor` records
 /// `status.code().unwrap_or(-1)`, so a SIGKILLed child writes `-1`, not `137`.
 /// Recorded rather than silently relabelling a real OOM as `Failed` — the arm
 /// is still reachable from the `Legacy` arm's `sh` monitor, whose `$?` does
@@ -3561,7 +3561,8 @@ pub fn exit_code_path(project_root: &Path, phase: PhaseId) -> PathBuf {
     devflow_dir(project_root).join(format!("phase-{}-exit", phase.padded()))
 }
 
-/// Path to the file where the monitor records the launched agent's PID.
+/// Path to the file where a 3.x monitor recorded the launched agent's PID. Nothing
+/// writes it since 4.0; [`archive_phase_files`] removes a stale one.
 pub fn agent_pid_path(project_root: &Path, phase: PhaseId) -> PathBuf {
     devflow_dir(project_root).join(format!("phase-{}-agent-pid", phase.padded()))
 }
@@ -3572,16 +3573,16 @@ pub fn agent_pid_path(project_root: &Path, phase: PhaseId) -> PathBuf {
 /// agent, and the backgrounded agent child checks for it just before its
 /// `exec`. A TERM that the child loses (dash discards one that lands before
 /// its post-fork trap reset) is therefore always followed by a check that
-/// sees the marker, so the agent never starts unsupervised. `spawn_monitor`
-/// removes a stale marker before every Legacy launch.
+/// sees the marker, so the agent never starts unsupervised. The 3.x monitor
+/// spawn removed a stale marker before every Legacy launch.
 pub fn stop_marker_path(project_root: &Path, phase: PhaseId) -> PathBuf {
     devflow_dir(project_root).join(format!("phase-{}-monitor-stop", phase.padded()))
 }
 
-/// Path to the file holding the stage prompt handed to the pipe-owning
-/// monitor (Phase 31).
+/// Path to the file that held the stage prompt handed to the 3.x pipe-owning
+/// monitor (Phase 31). Nothing writes it since 4.0 (D-09).
 ///
-/// The prompt travels `spawn_monitor` → detached monitor process as a FILE,
+/// The prompt travelled from the CLI to the detached monitor process as a FILE,
 /// never as argv: DevFlow stage prompts are large and argv has a hard length
 /// ceiling, so a prompt passed positionally would fail on exactly the
 /// context-heavy stages that matter most.
@@ -3589,9 +3590,10 @@ pub fn prompt_path(project_root: &Path, phase: PhaseId) -> PathBuf {
     devflow_dir(project_root).join(format!("phase-{}-prompt", phase.padded()))
 }
 
-/// Path to the pipe-owning monitor's own log for a phase (Phase 31).
+/// Path to the 3.x pipe-owning monitor's own log for a phase (Phase 31). Nothing
+/// writes it since 4.0 (D-09); monitor tests assert it stays absent.
 ///
-/// The monitor is a detached process whose stdio is not the operator's
+/// The monitor was a detached process whose stdio is not the operator's
 /// terminal — anything it prints to its own stdout goes nowhere. Every "log
 /// loudly" obligation in this phase (the D-04 idle-timeout clamp, the D-11
 /// opt-out notice) writes here instead, so a loud message is actually
