@@ -9,6 +9,7 @@
 mod common;
 
 use common::HermeticPath;
+use devflow_core::gsd_reader::GsdStatus;
 use devflow_core::liveness::{self, Held};
 use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
@@ -71,6 +72,7 @@ struct RunnerFixture {
     root: PathBuf,
     phase: PhaseId,
     fake_bin: common::FakeBin,
+    gsd_logs: tempfile::TempDir,
     _repo: tempfile::TempDir,
     /// Declared last so it drops after the rest of the fixture.
     home: common::HermeticHome,
@@ -95,13 +97,54 @@ impl RunnerFixture {
         state.stop_until = stop_until;
         state.stopped = false;
         devflow_core::workflow::save_state(&state).unwrap();
-        Self {
+        let fixture = Self {
             root,
             phase,
             fake_bin,
+            gsd_logs: tempfile::tempdir().unwrap(),
             _repo: repo,
             home: common::HermeticHome::new(),
-        }
+        };
+        // Validate passes only when GSD reports `passed` too (52-22).
+        let passed = devflow_core::test_support::gsd_status_json(GsdStatus::Passed);
+        common::stub_gsd_run(&fixture.home, &[passed; 16], fixture.gsd_logs.path());
+        fixture
+    }
+
+    /// A file the stub agent writes beside itself.
+    fn beside_agent(&self, name: &str) -> PathBuf {
+        self.fake_bin.path.join(name)
+    }
+
+    /// The lines of [`Self::beside_agent`]`(name)`, empty when it does not exist.
+    fn lines_beside_agent(&self, name: &str) -> Vec<String> {
+        fs::read_to_string(self.beside_agent(name))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// `devflow gate <args>` as a separate process in the fixture root; asserts it
+    /// exited 0.
+    fn gate(&self, args: &[&str]) -> Output {
+        let output = self
+            .devflow()
+            .arg("gate")
+            .args(args)
+            .output()
+            .expect("run devflow gate");
+        assert!(
+            output.status.success(),
+            "devflow gate {args:?} failed: {}",
+            shown(&output)
+        );
+        output
+    }
+
+    /// Whether `stage`'s gate file is open.
+    fn gate_open(&self, stage: Stage) -> bool {
+        devflow_core::gates::Gates::gate_path(&self.root, self.phase, stage).exists()
     }
 
     /// A hermetic devflow child in the fixture root, with the stub agent's dir on its
@@ -322,5 +365,179 @@ fn a_second_runner_refuses_while_the_first_holds_the_lock() {
             .iter()
             .any(|event| event["stage"] == "plan" && event["status"] == "success"),
         "no Plan verdict recorded for the first runner: {evaluated:?}"
+    );
+}
+
+/// A `codex` stub for a full run: on every stage it appends `$PPID` to a `ppids` file
+/// beside itself, commits its "work" and reports a passing turn.
+const FULL_RUN_CODEX: &str = r#"here=$(dirname "$0")
+printf '%s\n' "$PPID" >> "$here/ppids"
+git commit -q --allow-empty -m "stub stage work"
+printf 'DEVFLOW_RESULT: {"status":"success","commits":1,"verdict":"pass"}\n'"#;
+
+/// The indexes of `lines` (one recorded agent parent pid per line) that name a process
+/// other than `runner_pid`: the stages that ran outside the runner.
+fn runs_outside_the_runner(runner_pid: u32, lines: &[String]) -> Vec<usize> {
+    let runner = runner_pid.to_string();
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.trim() != runner)
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// End every pid `lines` names other than `runner_pid` (a detached `__monitor` a stage
+/// ran under), by the recorded pid.
+fn end_recorded_non_runner_parents(runner_pid: u32, lines: &[String]) {
+    for index in runs_outside_the_runner(runner_pid, lines) {
+        if let Ok(pid) = lines[index].trim().parse::<i32>() {
+            // SAFETY: a plain kill(2) on a pid this test's own run recorded.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+/// Run the full-run fixture up to its Validate gate: the runner child, once the gate
+/// file is open. The wait does not end when the runner exits: a stage launched outside
+/// the runner can still open the gate, and the caller's parent-pid check reports it.
+fn run_to_the_validate_gate(fixture: &RunnerFixture) -> RunnerChild {
+    let runner = fixture.spawn_runner();
+    let deadline = Instant::now() + RUNNER_WAIT;
+    while !fixture.gate_open(Stage::Validate) {
+        if Instant::now() >= deadline {
+            let pid = runner.pid;
+            let lines = fixture.lines_beside_agent("ppids");
+            end_recorded_non_runner_parents(pid, &lines);
+            panic!("gate never opened (ppids {lines:?}, runner pid {pid})");
+        }
+        std::thread::sleep(RUNNER_POLL);
+    }
+    runner
+}
+
+/// D-02, D-11, D-07: one runner runs Plan, Code and Validate as its own children, waits
+/// at the Validate gate without taking the phase holder, and finishes once a second
+/// process approves the gate with the positional `devflow gate approve N`.
+#[test]
+fn a_runner_drives_plan_code_validate_and_finishes_after_a_gate_approve_from_a_second_process() {
+    let phase = PhaseId::new(83);
+    let fixture = RunnerFixture::new(phase, None, FULL_RUN_CODEX);
+    let mut runner = run_to_the_validate_gate(&fixture);
+    let runner_pid = runner.pid;
+
+    let lines = fixture.lines_beside_agent("ppids");
+    let outside = runs_outside_the_runner(runner_pid, &lines);
+    if !outside.is_empty() {
+        end_recorded_non_runner_parents(runner_pid, &lines);
+    }
+    assert_eq!(
+        (lines.len(), outside.clone()),
+        (3, vec![]),
+        "a stage ran outside the runner: ppids {lines:?}, runner pid {runner_pid}, outside {outside:?}"
+    );
+    // Control: a non-runner parent in the Code line is reported.
+    let sleeper = Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleep");
+    let mut sleeper = scopeguard_child(sleeper);
+    let mut planted = lines.clone();
+    planted[1] = sleeper.id().to_string();
+    let reported = runs_outside_the_runner(runner_pid, &planted);
+    common::kill_and_reap(&mut sleeper);
+    assert_eq!(
+        reported,
+        vec![1],
+        "the planted non-runner parent was not reported"
+    );
+
+    assert_eq!(
+        liveness::probe(&fixture.runner_lock()).expect("probe the runner lock"),
+        Held::Live,
+        "the runner does not hold its lock at the gate"
+    );
+    let holder = liveness::phase_holder_path(&fixture.root, phase);
+    assert_ne!(
+        liveness::probe(&holder).expect("probe the phase holder"),
+        Held::Live,
+        "runner holds the phase holder"
+    );
+
+    let number = phase.to_string();
+    fixture.gate(&["approve", &number]);
+    let output = runner.wait();
+    assert!(
+        exited_zero(output.status),
+        "runner did not finish: {}",
+        shown(&output)
+    );
+    let state = fixture.state().expect("a finished run keeps its state");
+    assert!(state.finished, "runner did not finish: state {state:?}");
+    assert_eq!(
+        fixture.events_of("stage_launched").len(),
+        3,
+        "three stage_launched events"
+    );
+    assert_eq!(
+        fixture.events_of("workflow_finished").len(),
+        1,
+        "one workflow_finished event"
+    );
+
+    // Control: a held phase holder probes Live through the same probe.
+    let _held = liveness::claim_phase_holder(&fixture.root, phase).expect("claim the holder");
+    assert_eq!(
+        liveness::probe(&holder).expect("probe the phase holder"),
+        Held::Live,
+        "holder probe missed a held holder"
+    );
+}
+
+/// A child process, reaped by [`common::kill_and_reap`] by its caller.
+fn scopeguard_child(child: Child) -> Child {
+    child
+}
+
+/// D-11, the control for the approve case: a `devflow gate reject N --note TEXT` from a
+/// second process does not finish the run; the runner loops back and waits again.
+#[test]
+fn a_runner_at_a_rejected_gate_does_not_finish() {
+    let phase = PhaseId::new(84);
+    let fixture = RunnerFixture::new(phase, None, FULL_RUN_CODEX);
+    let mut runner = run_to_the_validate_gate(&fixture);
+    let number = phase.to_string();
+    let fired = |fixture: &RunnerFixture| {
+        fixture
+            .events_of("gate_fired")
+            .iter()
+            .filter(|event| event["stage"] == "validate")
+            .count()
+    };
+    assert_eq!(fired(&fixture), 1, "one Validate gate before the reject");
+
+    fixture.gate(&["reject", &number, "--note", "fix the thing"]);
+    common::wait_for(
+        || fired(&fixture) >= 2 || !runner.running(),
+        RUNNER_WAIT,
+        "the Validate gate after the reject",
+    );
+    let state = fixture.state().expect("a rejected run keeps its state");
+    assert!(!state.finished, "rejected run read finished: {state:?}");
+    assert!(runner.running(), "the runner ended after a reject");
+
+    fixture.gate(&["abort", &number]);
+    let output = runner.wait();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "an aborted run's runner exits 1: {}",
+        shown(&output)
+    );
+    assert!(
+        fixture.state().is_none_or(|state| !state.finished),
+        "rejected run read finished after the abort"
     );
 }
