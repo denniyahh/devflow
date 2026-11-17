@@ -986,3 +986,192 @@ fn stop_of_a_unit_stopped_before_the_runner_recorded_anything_says_stopped_durin
     );
     assert!(case.stop_called(), "stop did not stop the activating unit");
 }
+
+impl Case {
+    /// The `<unit>.pid` files the fake `systemd-run` wrote: one per launch it ran.
+    fn recorded_unit_pid_files(&self) -> Vec<PathBuf> {
+        let mut files: Vec<PathBuf> = fs::read_dir(self.home.service_bin())
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| {
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| name.ends_with(".service.pid"))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        files.sort();
+        files
+    }
+
+    /// `devflow start` for this case in worktree mode (codex, supervise).
+    fn start_in_a_worktree(&self, stubs: &common::FakeBin) -> Output {
+        let phase = self.phase.to_string();
+        self.devflow(
+            &[
+                "start",
+                "--phase",
+                &phase,
+                "--agent",
+                "codex",
+                "--mode",
+                "supervise",
+            ],
+            &stubs.path,
+        )
+        .output()
+        .expect("run devflow start")
+    }
+}
+
+/// The refusal a verb prints while `pid` holds `phase`'s phase holder.
+fn holder_refusal(phase: PhaseId, pid: u32) -> String {
+    format!("another DevFlow verb holds phase {phase} (pid {pid})")
+}
+
+/// D-07: the phase holder keeps a second `start` out. While this test holds it (a first
+/// start inside its holder window), `start` refuses naming this process's pid and
+/// launches nothing. Once it is dropped, `start` launches, and a third `start` refuses
+/// over the held runner lock naming `devflow stop`, leaving the one launch.
+#[test]
+fn two_concurrent_starts_launch_one_run_and_refuse_the_other() {
+    let case = Case::new(PhaseId::new(91));
+    let logs = tempfile::tempdir().unwrap();
+    let stubs = common::waiting_capture_agent_bin(logs.path());
+    let _reaper = common::LaunchedRunReaper::for_home(&case.home, &case.root, case.phase);
+
+    let hold = liveness::claim_phase_holder(&case.root, case.phase).expect("hold the phase holder");
+    let refused = case
+        .start_command(&stubs)
+        .output()
+        .expect("run devflow start");
+    assert!(
+        !refused.status.success(),
+        "start launched while the test held the phase holder:\n{}",
+        text(&refused)
+    );
+    assert!(
+        case.recorded_unit_pid_files().is_empty(),
+        "start launched while the test held the phase holder:\n{}",
+        text(&refused)
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .contains(&holder_refusal(case.phase, std::process::id())),
+        "holder pid missing from the refusal:\n{}",
+        text(&refused)
+    );
+    drop(hold);
+
+    let launched = case
+        .start_command(&stubs)
+        .output()
+        .expect("run devflow start");
+    assert!(
+        launched.status.success(),
+        "start did not launch once the holder was free:\n{}",
+        text(&launched)
+    );
+    let runner = case.recorded_runner_pid();
+    assert!(
+        runner.is_some() && case.runner_lock_live(),
+        "start did not launch a live run:\n{}",
+        text(&launched)
+    );
+
+    let second = case
+        .start_command(&stubs)
+        .output()
+        .expect("run devflow start");
+    assert!(
+        !second.status.success(),
+        "two runs launched: a start over a live run exited 0:\n{}",
+        text(&second)
+    );
+    assert!(
+        String::from_utf8_lossy(&second.stderr)
+            .contains(&format!("devflow stop --phase {}", case.phase)),
+        "the refusal over a live run names `devflow stop --phase`:\n{}",
+        text(&second)
+    );
+    assert_eq!(
+        (
+            case.recorded_unit_pid_files().len(),
+            case.recorded_runner_pid()
+        ),
+        (1, runner),
+        "two runs launched:\n{}",
+        text(&second)
+    );
+}
+
+/// D-07: `discard` never removes a launched run's worktree. While this test holds the
+/// phase holder (a start mid-launch) `discard` refuses naming its pid. Once `start` has
+/// launched in a worktree, `discard` refuses over the held runner lock naming
+/// `devflow stop`, and, with the holder held again, refuses naming the holder; the
+/// worktree and state remain each time.
+#[test]
+fn start_racing_discard_never_leaves_a_run_without_its_worktree() {
+    let case = Case::new(PhaseId::new(92));
+    let logs = tempfile::tempdir().unwrap();
+    let stubs = common::waiting_capture_agent_bin(logs.path());
+    let _reaper = common::LaunchedRunReaper::for_home(&case.home, &case.root, case.phase);
+    let holder = holder_refusal(case.phase, std::process::id());
+
+    let hold = liveness::claim_phase_holder(&case.root, case.phase).expect("hold the phase holder");
+    let out = case.discard();
+    assert!(
+        !out.status.success(),
+        "discard exited 0 mid-launch:\n{}",
+        text(&out)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(&holder),
+        "holder pid missing from the refusal:\n{}",
+        text(&out)
+    );
+    drop(hold);
+
+    let launched = case.start_in_a_worktree(&stubs);
+    assert!(
+        launched.status.success() && case.runner_lock_live(),
+        "start did not launch in a worktree:\n{}",
+        text(&launched)
+    );
+    assert!(
+        case.worktree_and_state_remain(),
+        "start left no worktree and state:\n{}",
+        text(&launched)
+    );
+
+    let out = case.discard();
+    assert!(
+        case.worktree_and_state_remain(),
+        "worktree removed under a launched run:\n{}",
+        text(&out)
+    );
+    assert!(!out.status.success(), "discard exited 0:\n{}", text(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains(&format!("devflow stop --phase {}", case.phase)),
+        "the refusal names `devflow stop --phase`:\n{}",
+        text(&out)
+    );
+
+    let hold = liveness::claim_phase_holder(&case.root, case.phase).expect("hold the phase holder");
+    let out = case.discard();
+    drop(hold);
+    assert!(
+        case.worktree_and_state_remain(),
+        "worktree removed under a launched run:\n{}",
+        text(&out)
+    );
+    assert!(
+        !out.status.success() && String::from_utf8_lossy(&out.stderr).contains(&holder),
+        "holder pid missing from the refusal:\n{}",
+        text(&out)
+    );
+}
