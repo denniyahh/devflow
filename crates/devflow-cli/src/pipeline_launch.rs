@@ -19235,4 +19235,131 @@ mod tests {
             "plain launch named a handoff: {event} {payload} {reason}"
         );
     }
+
+    /// The name of the `fn` `line` declares, if it declares one.
+    fn declared_fn(line: &str) -> Option<&str> {
+        let at = line.find("fn ")?;
+        let before = &line[..at];
+        if !(before.trim().is_empty()
+            || before.ends_with(' ') && !before.trim_end().ends_with(['.', ':', '=']))
+        {
+            return None;
+        }
+        let rest = &line[at + 3..];
+        let end = rest.find(|c: char| !(c.is_alphanumeric() || c == '_'))?;
+        (end > 0 && rest[end..].starts_with(['(', '<'])).then(|| &rest[..end])
+    }
+
+    /// Each production call of `needle` (a path ending in `(`, matched at a word
+    /// boundary) in `source`, as the name of the `fn` it is in. Production is the source
+    /// up to its first `mod tests {` line, with `//` lines dropped; a line declaring the
+    /// called `fn` itself is not a call.
+    fn call_sites(source: &str, needle: &str) -> Vec<String> {
+        let called = needle
+            .trim_end_matches('(')
+            .rsplit("::")
+            .next()
+            .unwrap_or(needle);
+        let mut enclosing = String::new();
+        let mut sites = Vec::new();
+        for line in source
+            .lines()
+            .take_while(|line| !line.starts_with("mod tests {"))
+            .filter(|line| !line.trim_start().starts_with("//"))
+        {
+            if let Some(name) = declared_fn(line) {
+                enclosing = name.to_string();
+                if name == called {
+                    continue;
+                }
+            }
+            for (at, _) in line.match_indices(needle) {
+                let boundary = line[..at]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+                if boundary {
+                    sites.push(enclosing.clone());
+                }
+            }
+        }
+        sites
+    }
+
+    /// [`call_sites`] of `needle` across every CLI source file, as `file: fn`.
+    fn cli_call_sites(needle: &str) -> Vec<String> {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+        let mut files: Vec<_> = std::fs::read_dir(dir)
+            .unwrap_or_else(|err| panic!("read {dir}: {err}"))
+            .map(|entry| entry.expect("a src entry").path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+            .collect();
+        files.sort();
+        assert!(
+            files.len() > 10,
+            "the scan read too few CLI sources: {files:?}"
+        );
+        files
+            .iter()
+            .flat_map(|path| {
+                let source = std::fs::read_to_string(path)
+                    .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+                let file = path.file_name().unwrap().to_string_lossy().to_string();
+                call_sites(&source, needle)
+                    .into_iter()
+                    .map(move |name| format!("{file}: {name}"))
+            })
+            .collect()
+    }
+
+    /// T-52.2-05, T-52.2-67 (MemPalace T-50.1-97): exactly one production call site runs
+    /// a stage, the runner loop's `monitor::run_stage(` (in `run_one_stage`, which only
+    /// `run_runner` calls); the only production `spawn_monitor(` is the old path's, in
+    /// `spawn_next_supervisor` (52.2-11 deletes it); and only `run_runner` engages
+    /// [`RunnerLoop`]. Planted controls run through the same helper.
+    #[test]
+    fn exactly_one_call_site_runs_a_stage() {
+        let planted_twice = "fn run_one_stage() {\n    monitor::run_stage(spec, token);\n}\n\
+                             fn transition() {\n    let _ = monitor::run_stage(spec, token);\n}\n\
+                             // monitor::run_stage(commented)\nmod tests {\n    monitor::run_stage(x);\n}\n";
+        assert_eq!(
+            call_sites(planted_twice, "run_stage("),
+            ["run_one_stage", "transition"],
+            "planted control: a second run_stage( call is listed"
+        );
+        let planted_spawn = "fn spawn_next_supervisor() {\n    monitor::spawn_monitor(a);\n}\n\
+                             pub(crate) fn transition(\n    s: &mut State,\n) {\n    \
+                             monitor::spawn_monitor(b);\n}\n";
+        let spawn_sites = call_sites(planted_spawn, "spawn_monitor(");
+        let outside: Vec<&String> = spawn_sites
+            .iter()
+            .filter(|name| *name != "spawn_next_supervisor")
+            .collect();
+        assert_eq!(
+            outside,
+            [&"transition".to_string()],
+            "planted control: a spawn_monitor( in transition is reported"
+        );
+
+        assert_eq!(
+            cli_call_sites("run_stage("),
+            ["pipeline_launch.rs: run_one_stage"],
+            "production run_stage( sites"
+        );
+        assert_eq!(
+            cli_call_sites("run_one_stage("),
+            ["pipeline_launch.rs: run_runner"],
+            "production run_one_stage( sites"
+        );
+        assert_eq!(
+            cli_call_sites("spawn_monitor("),
+            ["pipeline_launch.rs: spawn_next_supervisor"],
+            "production spawn_monitor( sites"
+        );
+        assert_eq!(
+            cli_call_sites("RunnerLoop::engage("),
+            ["pipeline_launch.rs: run_runner"],
+            "production RunnerLoop::engage( sites"
+        );
+    }
 }
