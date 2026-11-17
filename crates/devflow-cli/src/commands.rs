@@ -14521,8 +14521,9 @@ mod tests {
         (state, hold)
     }
 
-    /// A supervisor whose state vanished ends with no exit file and no successor, so a
-    /// follower must end too, saying why. Control: while the state exists it keeps following.
+    /// A runner whose state vanished ends with no exit file and no successor, so a
+    /// follower must end too, saying why. Control: while the state exists and its runner
+    /// holds the lock it keeps following (with the lock free it would end at once, D-10).
     #[test]
     fn logs_follow_ends_when_the_followed_state_is_gone_and_no_exit_file_will_come() {
         const WAIT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -14531,6 +14532,7 @@ mod tests {
         let phase = PhaseId::new(5306);
         let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.clone());
         workflow::save_state(&state).unwrap();
+        let _runner = liveness::claim_runner_lock(&root, phase).expect("hold the runner lock");
 
         let (sender, receiver) = std::sync::mpsc::channel();
         let follower_root = root.clone();
