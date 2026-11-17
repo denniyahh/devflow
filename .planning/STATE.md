@@ -5,16 +5,16 @@ milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: "52.2"
 current_phase_name: Foreground Runner
 status: executing
-stopped_at: Completed 52.2-20-PLAN.md
-last_updated: "2026-11-17T04:05:51.877Z"
+stopped_at: Completed 52.2-02-PLAN.md
+last_updated: "2026-11-17T04:47:10.715Z"
 last_activity: 2026-11-16
 last_activity_desc: Phase 52.2 execution started
-state_head: cf66133be68bbcc89c976a2f9f60fd4eff904898
+state_head: 32860c9ec29e47fd0c63eb1f05ad6d54790fc9fe
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 66
-  completed_plans: 42
+  completed_plans: 43
   percent: 17
 ---
 
@@ -172,7 +172,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 52.2 (Foreground Runner) — EXECUTING
-Plan: 3 of 26
+Plan: 4 of 26
 Status: Ready to execute
 Last activity: 2026-11-16 — Phase 52.2 execution started
 
@@ -940,6 +940,8 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 52.2]: 52.2-01: run_runner engages AutoChainGuard around a stream-shape run_stage and drops it before the advance, as run_monitor does
 - [Phase 52.2]: 52.2-01: service.rs items not yet called carry cfg_attr(not(test), expect(dead_code)) naming 52.2-06, which errors once they are called
 - [Phase 52.2]: 52.2-20: the fake service manager lives in each HermeticHome's service-bin/ and is first on every hermetic_devflow PATH; suites add PATH entries only via HermeticPath::hermetic_path
+- [Phase 52.2]: 52.2-02: the runner's monitor::run_stage call lives in run_one_stage, which only run_runner calls; the call-site scan asserts both
+- [Phase 52.2]: 52.2-02: fail_over_on_rate_limit keeps FailoverRelaunchGuard around launch_stage_next only; a handed-back relaunch carries HandoffRelaunch so a failed start names the handoff
 
 ## Roadmap Evolution
 
@@ -1093,11 +1095,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 52.1 P07 | 50 min | 3 tasks | 5 files |
 | Phase 52.2 P01 | 30 min | 2 tasks | 10 files |
 | Phase 52.2 P20 | 10 min | 2 tasks | 7 files |
+| Phase 52.2 P02 | 30 min | 3 tasks | 5 files |
 
 ## Session
 
-**Last session:** 2026-11-17T04:05:50.911Z
-**Stopped at:** Completed 52.2-20-PLAN.md
+**Last session:** 2026-11-17T04:47:09.814Z
+**Stopped at:** Completed 52.2-02-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
