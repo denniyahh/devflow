@@ -491,3 +491,104 @@ fn start_refuses_orphan_gate_files_naming_discard() {
         combined(&out)
     );
 }
+
+/// `devflow resume --phase 12` over `root`, with the fake agent on `PATH` and a reaper
+/// bound before it, so a resume that does launch has its run ended when the test ends.
+fn resume_phase(home: &common::HermeticHome, root: &Path) -> (Output, common::LaunchedRunReaper) {
+    let reaper = common::LaunchedRunReaper::for_home(home, root, PhaseId::new(PHASE));
+    let fake_bin = fake_codex();
+    let parent = std::env::var_os("PATH").unwrap_or_default();
+    let output = common::hermetic_devflow(home)
+        .args(["resume", "--phase", &PHASE.to_string()])
+        .arg(root)
+        .hermetic_path(format!(
+            "{}:{}",
+            fake_bin.path.display(),
+            parent.to_string_lossy()
+        ))
+        .env("DEVFLOW_TEST_ROOT", root)
+        .env("DEVFLOW_GATE_TIMEOUT_SECS", "60")
+        .current_dir(root)
+        .output()
+        .expect("run devflow resume");
+    (output, reaper)
+}
+
+/// Assert a refusal names only verbs that exist: no `--force` and no removed `recover`.
+fn assert_no_removed_verb(text: &str) {
+    assert!(
+        !text.contains("--force"),
+        "the refusal offers --force: {text}"
+    );
+    assert!(
+        !text.contains("devflow recover"),
+        "the refusal names the removed recover: {text}"
+    );
+}
+
+/// 52.1 D-09.1: `resume` over a finished run refuses, saying the phase finished and
+/// naming the close-out and `devflow discard --phase N`, not `start`; the state is left
+/// byte-identical.
+#[test]
+fn resume_refuses_a_finished_run_naming_close_out_or_discard() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    save_phase_state(root, |state| {
+        state.verification_baseline_captured = true;
+        state.finished = true;
+    });
+    let before = state_bytes(root);
+
+    let (out, _reaper) = resume_phase(&home, root);
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "resume relaunched a finished run: {text}"
+    );
+    assert_eq!(
+        state_bytes(root),
+        before,
+        "a refused resume changed the state: {text}"
+    );
+    assert_no_removed_verb(&text);
+    assert!(
+        text.contains("close the phase out"),
+        "the refusal does not name the close-out: {text}"
+    );
+    assert!(
+        text.contains(&format!("devflow discard --phase {PHASE}")),
+        "the refusal does not name discard: {text}"
+    );
+    assert!(
+        !text.contains("devflow start"),
+        "the refusal names start, which refuses a finished phase: {text}"
+    );
+}
+
+/// 52.1 D-09.1: `resume` with no run state refuses, naming `devflow start --phase N`,
+/// and writes no state.
+#[test]
+fn resume_with_no_state_names_start() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+
+    let (out, _reaper) = resume_phase(&home, root);
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "resume with no state succeeded: {text}"
+    );
+    assert_no_removed_verb(&text);
+    assert!(
+        text.contains(&format!("devflow start --phase {PHASE}")),
+        "the refusal does not name start: {text}"
+    );
+    assert!(
+        !devflow_core::workflow::state_path(root, PhaseId::new(PHASE)).exists(),
+        "a refused resume wrote a state: {text}"
+    );
+}
