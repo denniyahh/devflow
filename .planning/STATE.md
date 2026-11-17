@@ -5,16 +5,16 @@ milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: "52.2"
 current_phase_name: Foreground Runner
 status: executing
-stopped_at: Completed 52.2-13-PLAN.md
-last_updated: "2026-11-17T16:33:22.151Z"
+stopped_at: Completed 52.2-14-PLAN.md
+last_updated: "2026-11-17T17:07:50.307Z"
 last_activity: 2026-11-16
 last_activity_desc: Phase 52.2 execution started
-state_head: 51c24971a15ad73cc5ad2710139e543f9d0445c6
+state_head: 547e57343bbab592b2a63b8fe6b283f6455deca3
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 66
-  completed_plans: 60
+  completed_plans: 61
   percent: 17
 ---
 
@@ -172,7 +172,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 52.2 (Foreground Runner) — EXECUTING
-Plan: 21 of 26
+Plan: 22 of 26
 Status: Ready to execute
 Last activity: 2026-11-16 — Phase 52.2 execution started
 
@@ -985,6 +985,9 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 52.2]: 52.2-24: unused public stop/registry/agent_result items kept (ReplyHandedOff, StopSource::Socket, note_group_signalled, socket_dir_in, prompt_path, monitor_log_path): the PLAN does not name their removal
 - [Phase 52.2]: 52.2-13: start refuses a leftover phase branch before feature_start, so the --no-worktree arm never switches the primary checkout; worktree mode refuses a leftover branch with no worktree the same way
 - [Phase 52.2]: 52.2-13: GitFlow::feature_start_force stays as an uncalled public item: the PLAN does not name its removal (deferred-items.md)
+- [Phase 52.2]: 52.2-14: start takes every refusal from one pure launch_guards over GuardFacts gathered under the phase holder before the write lock; order live, finished, incomplete, unloadable, orphan gate files, leftover worktree or branch
+- [Phase 52.2]: 52.2-14: reservation-only = loads, not finished, run_never_prepared; start proceeds over it; an unloadable state stays in place and start names discard
+- [Phase 52.2]: 52.2-14: resume_guards refuse a live run, a finished run (close-out or discard), no state (start) and an unloadable state (discard)
 
 ## Roadmap Evolution
 
@@ -1156,11 +1159,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 52.2 P25 | 37min | 3 tasks | 12 files |
 | Phase 52.2 P24 | 28min | 3 tasks | 22 files |
 | Phase 52.2 P13 | 16 min | 2 tasks | 9 files |
+| Phase 52.2 P14 | 28 min | 3 tasks | 8 files |
 
 ## Session
 
-**Last session:** 2026-11-17T16:33:20.360Z
-**Stopped at:** Completed 52.2-13-PLAN.md
+**Last session:** 2026-11-17T17:07:49.325Z
+**Stopped at:** Completed 52.2-14-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
