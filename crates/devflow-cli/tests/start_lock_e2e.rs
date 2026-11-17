@@ -17,7 +17,6 @@ use devflow_core::mode::Mode;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, PendingSupervisor, State};
-use devflow_core::supervisor::{self, Liveness, ShutdownOutcome};
 use devflow_core::test_support::gate_answer_files;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -175,7 +174,7 @@ fn start_proceeds_when_no_reservation_is_held() {
     let phase = PhaseId::new(91);
     init_repo(root, phase);
     let fake_bin = fake_codex("exit 0");
-    let _reaper = common::LaunchedRunReaper::new(root, phase, vec![]);
+    let _reaper = common::LaunchedRunReaper::for_home(&home, root, phase);
 
     let output = child(&home, root, phase, &fake_bin, "supervise")
         .output()
@@ -221,29 +220,32 @@ fn start_clears_leftover_gate_files_after_reserving() {
     })
     .unwrap();
     fs::write(&response_path, &planted).unwrap();
-    let _reaper = common::LaunchedRunReaper::new(root, phase, vec![]);
+    let _reaper = common::LaunchedRunReaper::for_home(&home, root, phase);
 
-    let mut process = child(&home, root, phase, &fake_bin, "auto")
+    let output = child(&home, root, phase, &fake_bin, "auto")
         .env("DEVFLOW_GATE_TIMEOUT_SECS", "30")
-        .spawn()
-        .expect("spawn devflow start");
+        .output()
+        .expect("run devflow start");
+    assert!(
+        output.status.success(),
+        "start failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     common::wait_for(
-        || {
-            Gates::gate_path(root, phase, Stage::Plan).exists()
-                || process.try_wait().expect("poll start child").is_some()
-        },
+        || Gates::gate_path(root, phase, Stage::Plan).exists() || !runner_lock_live(root, phase),
         Duration::from_secs(10),
-        "Plan gate or start exit",
+        "Plan gate or runner exit",
     );
     std::thread::sleep(Duration::from_secs(3));
     assert!(
-        process.try_wait().expect("poll start child").is_none(),
-        "planted response must not abort a fresh start"
+        runner_lock_live(root, phase),
+        "planted response must not abort a fresh start's run"
     );
     assert!(
         root.join(format!(".devflow/state-{}.json", phase.padded()))
             .exists(),
-        "a fresh start parked at Plan must keep state"
+        "a fresh start's live run must keep state"
     );
     let events = fs::read_to_string(devflow_core::events::events_path(root)).unwrap_or_default();
     assert!(
@@ -264,7 +266,6 @@ fn start_clears_leftover_gate_files_after_reserving() {
         "a quarantine file must hold the planted response's bytes: {:?}",
         Gates::quarantined(root)
     );
-    common::kill_and_reap(&mut process);
 }
 
 /// D-06, at the boundary an operator reads: `devflow resume` prints the answer it set
@@ -420,21 +421,38 @@ impl Drop for LiveProcess {
 const SLEEPING_CODEX: &str =
     "if [ \"$1\" = \"--version\" ]; then echo \"codex-cli 0.0.0-fake\"; exit 0; fi\nexec sleep 120";
 
-/// How long [`LiveRun`]'s drop waits for its supervisor's final shutdown line.
-const LIVE_RUN_SHUTDOWN_WAIT: Duration = Duration::from_secs(15);
+/// The phase's unit name as the binary derives it (`service::unit_name`).
+fn unit_name(root: &Path, phase: PhaseId) -> String {
+    format!(
+        "devflow-{:016x}-{}.service",
+        devflow_core::registry::path_digest(root),
+        phase.padded()
+    )
+}
 
-/// A run a real `devflow start` launched (capture shape, supervise mode) with
-/// a sleeping fake agent: its supervisor answers ALIVE on `socket`, and
-/// `sidecar` is what it published, read before any test corrupts it.
-///
-/// Dropping it ends the run through that socket, then SIGKILLs the agent
-/// group and the supervisor if each is still the process the sidecar names
-/// (`agent::is_same_process`), so a run whose state or sidecar a test
-/// corrupted is still reaped. Bind a `LaunchedRunReaper` before
-/// [`LiveRun::launch`] as the backstop for a panic inside it.
+/// The runner pid the fake `systemd-run` recorded for `phase`'s unit under `home`.
+fn recorded_runner_pid(home: &common::HermeticHome, root: &Path, phase: PhaseId) -> Option<u32> {
+    fs::read_to_string(
+        home.service_bin()
+            .join(format!("{}.pid", unit_name(root, phase))),
+    )
+    .ok()
+    .and_then(|text| text.trim().parse().ok())
+}
+
+/// Whether `phase`'s runner lock under `root` probes Live.
+fn runner_lock_live(root: &Path, phase: PhaseId) -> bool {
+    devflow_core::liveness::probe(&devflow_core::liveness::runner_lock_path(root, phase))
+        .is_ok_and(|held| held == devflow_core::liveness::Held::Live)
+}
+
+/// A run a real `devflow start` launched as a runner unit through `home`'s fake
+/// `systemd-run` (capture shape, supervise mode) with a sleeping fake agent:
+/// `runner_pid` is the runner the fake recorded, and it holds the runner lock.
+/// Bind a `LaunchedRunReaper::for_home` before [`LiveRun::launch`]: it ends the
+/// runner, which ends its agent's group.
 struct LiveRun {
-    socket: PathBuf,
-    sidecar: supervisor::Sidecar,
+    runner_pid: u32,
     _fake_bin: common::FakeBin,
 }
 
@@ -451,69 +469,25 @@ impl LiveRun {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        let record = devflow_core::workflow::load_state(root, phase)
-            .expect("the fixture's start saved its state")
-            .supervisor
-            .expect("the fixture's start recorded state.supervisor");
-        let sidecar = supervisor::read_sidecar(&record.socket_path.with_extension("json"))
-            .expect("read the fixture's sidecar");
-        let run = Self {
-            socket: record.socket_path,
-            sidecar,
-            _fake_bin: fake_bin,
-        };
-        assert_eq!(run.sidecar.launch_id, record.launch_id, "sidecar launch id");
+        let runner_pid = recorded_runner_pid(home, root, phase)
+            .expect("the fixture's start launched a runner through the fake systemd-run");
         assert!(
-            matches!(supervisor::probe(&run.socket), Ok(Liveness::Alive(_))),
-            "the fixture's supervisor must answer ALIVE"
+            common::runs_the_runner_verb(runner_pid),
+            "the fixture's recorded pid {runner_pid} runs the runner verb"
         );
-        let pid_file = devflow_core::agent_result::agent_pid_path(root, phase);
-        common::wait_for(
-            || pid_file.exists(),
-            Duration::from_secs(10),
-            "the fixture's agent pid file",
+        assert!(
+            runner_lock_live(root, phase),
+            "the fixture's runner holds the runner lock"
         );
-        run
-    }
-
-    fn launch_id(&self) -> &str {
-        &self.sidecar.launch_id
-    }
-
-    fn sidecar_path(&self) -> PathBuf {
-        self.socket.with_extension("json")
-    }
-
-    /// Remove the agent pid file, so the guard's pid half sees nothing and
-    /// only the supervisor socket can name this run: 999.139's shape, where
-    /// the pid half let `start --force` launch a second agent.
-    fn hide_agent_pid_file(&self, root: &Path, phase: PhaseId) {
-        fs::remove_file(devflow_core::agent_result::agent_pid_path(root, phase))
-            .expect("remove the fixture's agent pid file");
-    }
-}
-
-impl Drop for LiveRun {
-    fn drop(&mut self) {
-        // No `expect` here: a panic inside drop during unwinding aborts.
-        let _ = supervisor::request_shutdown(&self.socket, LIVE_RUN_SHUTDOWN_WAIT);
-        let group = (self.sidecar.agent_pgid, self.sidecar.agent_start_time);
-        if devflow_core::agent::agent_running(group.0)
-            && devflow_core::agent::is_same_process(group.0, group.1)
-        {
-            common::signal_group(group.0, libc::SIGKILL);
+        Self {
+            runner_pid,
+            _fake_bin: fake_bin,
         }
-        let monitor = (
-            self.sidecar.supervisor_pid,
-            self.sidecar.supervisor_start_time,
-        );
-        if devflow_core::agent::agent_running(monitor.0)
-            && devflow_core::agent::is_same_process(monitor.0, monitor.1)
-            && let Ok(pid) = libc::pid_t::try_from(monitor.0)
-        {
-            // SAFETY: one process, identity-checked against its start time.
-            unsafe { libc::kill(pid, libc::SIGKILL) };
-        }
+    }
+
+    /// Whether the fixture's runner still runs.
+    fn alive(&self) -> bool {
+        common::runs_the_runner_verb(self.runner_pid)
     }
 }
 
@@ -526,7 +500,7 @@ struct PlantedGate {
 /// A leftover Code-stage state with no supervisor record, an optional agent
 /// pid file, and a planted Code gate. The launch guard reads no
 /// `monitor_pid` (50-15), so none is planted; a test that needs a live
-/// supervisor launches one with [`LiveRun::launch`].
+/// run launches one with [`LiveRun::launch`].
 fn plant_leftover_run(root: &Path, phase: PhaseId, agent_pid: Option<u32>) -> PlantedGate {
     let mut state = State::new(phase, AgentKind::Codex, Mode::Auto, root.to_path_buf());
     state.verification_baseline_captured = true;
@@ -664,23 +638,6 @@ fn removed_refusal_sentences(phase: PhaseId) -> Vec<String> {
         "may be running `devflow advance` as a foreground child".to_string(),
         "`ps -ww -o pid=,args= --ppid <monitor pid>`".to_string(),
         "once it takes the lock after this refusal".to_string(),
-    ]
-}
-
-/// The fragments a refusal must carry for a live supervisor socket that
-/// `stop --launch` can address: its launch id and liveness, its socket, and
-/// the exact repair line (50-14's `--launch` form works whether or not the
-/// state loads).
-fn supervisor_arm_fragments(phase: PhaseId, run: &LiveRun) -> Vec<String> {
-    let id = run.launch_id();
-    vec![
-        format!("supervisor launch {id} ALIVE"),
-        format!("socket {}", run.socket.display()),
-        format!("run `devflow stop --phase {phase} --launch {id}` first"),
-        "`devflow stop` ends a supervisor through its socket, whether or not the state file loads"
-            .to_string(),
-        "on a STALE socket it signals the agent group only after proving that group is this launch's"
-            .to_string(),
     ]
 }
 
@@ -832,37 +789,6 @@ fn workflow_started_count(root: &Path) -> usize {
 }
 
 #[test]
-fn start_refuses_a_phase_whose_recorded_monitor_is_alive() {
-    let home = common::HermeticHome::new();
-    let repo = tempfile::tempdir().unwrap();
-    let root = repo.path();
-    let phase = PhaseId::new(95);
-    init_repo(root, phase);
-    let _reaper = common::LaunchedRunReaper::new(root, phase, vec![]);
-    let run = LiveRun::launch(&home, root, phase);
-    // Only the supervisor can refuse: the agent pid file is gone.
-    run.hide_agent_pid_file(root, phase);
-    plant_code_gate(root, phase);
-    assert_eq!(workflow_started_count(root), 1, "the live run's own start");
-
-    assert_start_refuses_live_run(
-        &home,
-        root,
-        phase,
-        &[],
-        (
-            &supervisor_arm_fragments(phase, &run),
-            &["agent pid".to_string()],
-        ),
-        "start must refuse a phase whose recorded supervisor is alive",
-    );
-    assert!(
-        matches!(supervisor::probe(&run.socket), Ok(Liveness::Alive(_))),
-        "a refused start must leave the live supervisor running"
-    );
-}
-
-#[test]
 fn start_refuses_a_phase_whose_recorded_agent_is_alive() {
     let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
@@ -905,7 +831,7 @@ fn start_replaces_a_leftover_state_whose_recorded_processes_are_dead() {
     init_repo(root, phase);
     let planted = plant_leftover_run(root, phase, Some(NEVER_LIVE_PID));
     let fake_bin = fake_codex("exit 0");
-    let _reaper = common::LaunchedRunReaper::new(root, phase, vec![]);
+    let _reaper = common::LaunchedRunReaper::for_home(&home, root, phase);
 
     let output = run_start(&home, root, phase, &fake_bin, &[]);
     assert!(
@@ -950,7 +876,7 @@ fn start_proceeds_when_no_state_exists_even_if_the_agent_pid_file_names_a_live_p
         "the carve-out fixture must have no phase state"
     );
     let fake_bin = fake_codex("exit 0");
-    let _reaper = common::LaunchedRunReaper::new(root, phase, vec![agent.pid()]);
+    let _reaper = common::LaunchedRunReaper::for_home(&home, root, phase);
 
     let output = run_start(&home, root, phase, &fake_bin, &[]);
     assert!(
@@ -969,31 +895,6 @@ fn start_proceeds_when_no_state_exists_even_if_the_agent_pid_file_names_a_live_p
 // ---------------------------------------------------------------------------
 // 48-20 (criterion 2, D-01, D-02): `resume` must not overwrite a live run.
 // ---------------------------------------------------------------------------
-
-/// The whole start refusal for a live run at phase 94 whose state loads: its
-/// supervisor answers ALIVE and its agent pid file names its live agent.
-/// `{launch}`, `{socket}` and `{pid}` are that run's.
-const START_REFUSAL_GOLDEN_PHASE_94: &str = concat!(
-    "phase 94: a run is still live (supervisor launch {launch} ALIVE, agent pid {pid} alive) — ",
-    "refusing to start; nothing was written\n",
-    "`devflow stop` ends a supervisor through its socket, whether or not the state file loads; ",
-    "on a STALE socket it signals the agent group only after proving that group is this ",
-    "launch's. Run each line below first:\n",
-    "  launch {launch} (ALIVE, socket {socket}): run `devflow stop --phase 94 --launch {launch}` first\n",
-    "The agent pid file names a live process, and `devflow stop` never signals a pid from the ",
-    "agent pid file. Check each pid before signalling it. `ps -p` shows only the executable name, ",
-    "which cannot tell phases apart; `-ww` keeps a long command line from being cut at the ",
-    "terminal width:\n",
-    "  agent pid {pid}: ps -ww -o pid=,lstart=,args= -p {pid}\n",
-    "This phase's agent has its supervisor, a `__monitor` process with this project's path and ",
-    "`--phase 94` in its args, as its parent (`ps -o ppid= -p <pid>`); an agent whose supervisor ",
-    "has exited cannot be tied to this phase that way, so do not signal it on the pid alone. ",
-    "If a named pid is live but is not this phase's process (a recycled pid), `start` refuses ",
-    "again: run `devflow recover --clean --phase 94` first, then `devflow start`. Do neither ",
-    "while this phase's processes are live: `recover --clean` clears state even while an agent ",
-    "runs, and a later `start` would launch a second agent beside it.\n",
-    "Once every supervisor and process named above is gone, run `devflow start` again.",
-);
 
 fn events_contain(root: &Path, event: &str) -> bool {
     fs::read_to_string(devflow_core::events::events_path(root))
@@ -1155,6 +1056,8 @@ fn resume_agent_fragments(phase: PhaseId) -> Vec<String> {
     ]
 }
 
+/// `resume` over a phase whose runner is live refuses, names `devflow stop`, leaves the
+/// phase's state byte-identical, launches nothing and leaves the runner running.
 #[test]
 fn resume_refuses_a_phase_whose_recorded_monitor_is_alive() {
     let repo = tempfile::tempdir().unwrap();
@@ -1163,27 +1066,43 @@ fn resume_refuses_a_phase_whose_recorded_monitor_is_alive() {
     let phase = PhaseId::new(85);
     init_repo(root, phase);
     let fake_bin = fake_codex("exec sleep 60");
-    let _reaper = common::LaunchedRunReaper::new(root, phase, vec![]);
+    let _reaper = common::LaunchedRunReaper::for_home(&home, root, phase);
     let run = LiveRun::launch(&home, root, phase);
-    // Only the supervisor can refuse: the agent pid file is gone.
-    run.hide_agent_pid_file(root, phase);
+    let state_file = devflow_core::workflow::state_path(root, phase);
+    let state_before = fs::read(&state_file).expect("read the live run's state");
+    let launched_before = stage_launched_count(root);
 
-    assert_resume_refuses_live_run(
-        &home,
-        root,
-        phase,
-        &fake_bin,
-        &RefusalCase {
-            required: vec![devflow_core::workflow::state_path(root, phase)],
-            present: supervisor_arm_fragments(phase, &run),
-            absent: vec!["agent pid".to_string()],
-            spared_agent: None,
-            refusal: "resume must refuse a phase whose recorded supervisor is alive",
-        },
+    let output = resume_command(&home, root, phase, &fake_bin)
+        .output()
+        .expect("run devflow resume");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "resume must refuse a phase whose runner is live\nstdout: {stdout}\nstderr: {stderr}"
     );
     assert!(
-        matches!(supervisor::probe(&run.socket), Ok(Liveness::Alive(_))),
-        "a refused resume must leave the live supervisor running"
+        stderr.contains(&format!("devflow stop --phase {phase}")),
+        "the refusal names `devflow stop --phase {phase}`\nstderr: {stderr}"
+    );
+    assert_eq!(
+        fs::read(&state_file).expect("read the state after the refusal"),
+        state_before,
+        "a refused resume must leave the state byte-identical"
+    );
+    assert_eq!(
+        stage_launched_count(root),
+        launched_before,
+        "a refused resume must not emit stage_launched"
+    );
+    assert_eq!(
+        recorded_runner_pid(&home, root, phase),
+        Some(run.runner_pid),
+        "a refused resume must launch no second runner"
+    );
+    assert!(
+        run.alive(),
+        "a refused resume must leave the live runner running"
     );
 }
 
@@ -1196,7 +1115,7 @@ fn resume_refuses_a_stopped_phase_whose_recorded_agent_is_alive() {
     init_repo(root, phase);
     let agent = LiveProcess::spawn();
     let fake_bin = fake_codex("exec sleep 60");
-    let _reaper = common::LaunchedRunReaper::new(root, phase, vec![agent.pid()]);
+    let _reaper = common::LaunchedRunReaper::for_home(&home, root, phase);
     plant_resumable_run(root, phase, Some(agent.pid()), true);
     let mut present = agent_arm_fragments(phase, agent.pid());
     present.extend(resume_agent_fragments(phase));
@@ -1232,7 +1151,7 @@ fn resume_relaunches_a_phase_whose_recorded_processes_are_dead() {
         let root = repo.path();
         init_repo(root, phase);
         let fake_bin = fake_codex("exec sleep 60");
-        let _reaper = common::LaunchedRunReaper::new(root, phase, vec![]);
+        let _reaper = common::LaunchedRunReaper::for_home(&home, root, phase);
         plant_resumable_run(root, phase, Some(NEVER_LIVE_PID), stopped);
 
         let output = resume_command(&home, root, phase, &fake_bin)
@@ -1246,13 +1165,16 @@ fn resume_relaunches_a_phase_whose_recorded_processes_are_dead() {
         );
         let state = devflow_core::workflow::load_state(root, phase).expect("load relaunched state");
         assert!(!state.stopped, "resume must clear the stop mark");
+        let runner = recorded_runner_pid(&home, root, phase)
+            .unwrap_or_else(|| panic!("the relaunch must launch a runner unit: {state:?}"));
         assert!(
-            state.supervisor.is_some(),
-            "the relaunch must record its supervisor: {state:?}"
+            common::runs_the_runner_verb(runner),
+            "the relaunched unit runs the runner verb (pid {runner})"
         );
-        assert!(
-            events_contain(root, "stage_launched"),
-            "a resumed dead leftover must emit stage_launched"
+        common::wait_for(
+            || events_contain(root, "stage_launched"),
+            Duration::from_secs(30),
+            "a resumed dead leftover to emit stage_launched",
         );
     }
 }
@@ -1291,50 +1213,6 @@ fn resume_without_phase_state_reports_the_missing_state_not_a_live_run() {
     assert!(!events_contain(root, "stage_launched"));
 }
 
-#[test]
-fn start_refusal_text_stays_byte_identical_for_a_live_monitor() {
-    let home = common::HermeticHome::new();
-    let repo = tempfile::tempdir().unwrap();
-    let root = repo.path();
-    let phase = PhaseId::new(94);
-    init_repo(root, phase);
-    let _reaper = common::LaunchedRunReaper::new(root, phase, vec![]);
-    let run = LiveRun::launch(&home, root, phase);
-    let agent = run.sidecar.agent_pid;
-    let fake_bin = fake_codex("exit 0");
-
-    let output = run_start(&home, root, phase, &fake_bin, &[]);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !output.status.success(),
-        "start must still refuse a phase whose recorded supervisor is alive\nstderr: {stderr}"
-    );
-    let expected = format!(
-        "error: {}\n",
-        START_REFUSAL_GOLDEN_PHASE_94
-            .replace("{launch}", run.launch_id())
-            .replace("{socket}", &run.socket.display().to_string())
-            .replace("{pid}", &agent.to_string())
-    );
-    assert!(
-        stderr.contains(&expected),
-        "the start refusal must match the golden byte for byte\nexpected: {expected}\nstderr: {stderr}"
-    );
-    assert!(
-        !stderr.contains(&expected.replacen("refusing to start", "refusing to resume", 1)),
-        "the golden comparison must be sensitive to the launch verb\nstderr: {stderr}"
-    );
-    for placeholder in ["{launch}", "{socket}", "{pid}"] {
-        assert!(
-            START_REFUSAL_GOLDEN_PHASE_94.contains(placeholder),
-            "the golden must carry {placeholder}, or the substitution proves nothing"
-        );
-    }
-    assert!(START_REFUSAL_GOLDEN_PHASE_94.ends_with(
-        "Once every supervisor and process named above is gone, run `devflow start` again."
-    ));
-}
-
 // ---------------------------------------------------------------------------
 // 50-15 (D-09, R-12, 999.139): a state file that will not load must not hide
 // a live run from `start` or `resume`. Each fixture is a real launched run
@@ -1355,20 +1233,6 @@ fn corrupt_state(root: &Path, phase: PhaseId) -> Vec<u8> {
     CORRUPT_JSON.to_vec()
 }
 
-/// Every `.sock` file under `home`'s socket directory, sorted.
-fn sockets_under(home: &common::HermeticHome) -> Vec<PathBuf> {
-    let mut sockets: Vec<PathBuf> = fs::read_dir(home.cache_dir().join("sock"))
-        .map(|entries| {
-            entries
-                .map(|entry| entry.expect("read sock dir entry").path())
-                .filter(|path| path.extension().is_some_and(|ext| ext == "sock"))
-                .collect()
-        })
-        .unwrap_or_default();
-    sockets.sort();
-    sockets
-}
-
 /// `devflow start --force` for `phase`, as the 48-19 refusal tests run it.
 fn force_start(home: &common::HermeticHome, root: &Path, phase: PhaseId) -> Output {
     let fake_bin = fake_codex("exit 0");
@@ -1376,9 +1240,9 @@ fn force_start(home: &common::HermeticHome, root: &Path, phase: PhaseId) -> Outp
 }
 
 /// Run `launch` (a `start` or `resume` over a corrupt state) and assert it is
-/// refused with no side effect: no new socket, the corrupt state bytes
-/// unchanged, no `workflow_started` or `stage_launched` appended. Returns
-/// its stderr.
+/// refused with no side effect: no second runner launched, the corrupt state
+/// bytes unchanged, no `workflow_started` or `stage_launched` appended.
+/// Returns its stderr.
 fn assert_refused_over_a_corrupt_state(
     home: &common::HermeticHome,
     root: &Path,
@@ -1387,7 +1251,7 @@ fn assert_refused_over_a_corrupt_state(
 ) -> String {
     let state_file = devflow_core::workflow::state_path(root, phase);
     let state_before = fs::read(&state_file).expect("read the corrupt state");
-    let sockets_before = sockets_under(home);
+    let runner_before = recorded_runner_pid(home, root, phase);
     let started_before = workflow_started_count(root);
     let launched_before = stage_launched_count(root);
 
@@ -1399,9 +1263,9 @@ fn assert_refused_over_a_corrupt_state(
         String::from_utf8_lossy(&output.stdout)
     );
     assert_eq!(
-        sockets_under(home),
-        sockets_before,
-        "a refused launch must publish no second socket\nstderr: {stderr}"
+        recorded_runner_pid(home, root, phase),
+        runner_before,
+        "a refused launch must launch no second runner\nstderr: {stderr}"
     );
     assert_eq!(
         fs::read(&state_file).expect("read the state after the refusal"),
@@ -1448,13 +1312,8 @@ fn run_printed_stop(home: &common::HermeticHome, root: &Path, words: &[String]) 
         .expect("run the printed devflow stop")
 }
 
-/// Whether process group `pgid` has no live member left. Zombies do not
-/// count: a CI job container's PID 1 never reaps an orphaned one
-/// (`test_support::live_group_members`).
-fn group_is_gone(pgid: u32) -> bool {
-    devflow_core::test_support::live_group_members(pgid).is_empty()
-}
-
+/// D-07: a live runner refuses `start --force` whatever the state names, here a state
+/// that will not load; the refusal names `devflow stop` and the runner keeps running.
 #[test]
 fn start_refuses_over_a_live_supervisor_when_the_state_will_not_load() {
     let home = common::HermeticHome::new();
@@ -1462,34 +1321,26 @@ fn start_refuses_over_a_live_supervisor_when_the_state_will_not_load() {
     let root = repo.path();
     let phase = PhaseId::new(70);
     init_repo(root, phase);
-    let _reaper = common::LaunchedRunReaper::new(root, phase, vec![]);
+    let _reaper = common::LaunchedRunReaper::for_home(&home, root, phase);
     let run = LiveRun::launch(&home, root, phase);
-    run.hide_agent_pid_file(root, phase);
     corrupt_state(root, phase);
 
     let stderr =
         assert_refused_over_a_corrupt_state(&home, root, phase, || force_start(&home, root, phase));
-    let id = run.launch_id();
-    for fragment in [
-        "refusing to start; nothing was written".to_string(),
-        format!("supervisor launch {id} ALIVE"),
-        format!("run `devflow stop --phase {phase} --launch {id}` first"),
-    ] {
-        assert!(
-            stderr.contains(&fragment),
-            "refusal must contain {fragment:?}\nstderr: {stderr}"
-        );
-    }
     assert!(
-        !stderr.contains("agent pid"),
-        "only the socket may refuse here (the pid file is gone)\nstderr: {stderr}"
+        stderr.contains(&format!("devflow stop --phase {phase}")),
+        "the refusal names `devflow stop --phase {phase}`\nstderr: {stderr}"
     );
     assert!(
-        matches!(supervisor::probe(&run.socket), Ok(Liveness::Alive(_))),
-        "a refused start must leave the live supervisor running"
+        run.alive(),
+        "a refused start must leave the live runner running"
     );
 }
 
+/// The refusal over a live run whose state will not load prints a `devflow stop` that,
+/// run as printed, ends the run: the unit's runner is gone, the corrupt state bytes are
+/// unchanged, and `stop` says the state does not load, naming `devflow discard`. Once the
+/// run is gone, `start --force` proceeds.
 #[test]
 fn the_corrupt_state_refusal_names_a_stop_that_ends_the_run() {
     let home = common::HermeticHome::new();
@@ -1497,41 +1348,31 @@ fn the_corrupt_state_refusal_names_a_stop_that_ends_the_run() {
     let root = repo.path();
     let phase = PhaseId::new(71);
     init_repo(root, phase);
-    let _reaper = common::LaunchedRunReaper::new(root, phase, vec![]);
+    let _reaper = common::LaunchedRunReaper::for_home(&home, root, phase);
     let run = LiveRun::launch(&home, root, phase);
-    run.hide_agent_pid_file(root, phase);
     let corrupt = corrupt_state(root, phase);
     let stderr =
         assert_refused_over_a_corrupt_state(&home, root, phase, || force_start(&home, root, phase));
     let words = printed_stop_command(&stderr, phase);
     assert_eq!(
         words,
-        [
-            "stop",
-            "--phase",
-            &phase.to_string(),
-            "--launch",
-            run.launch_id()
-        ],
-        "the refusal must print the `--launch` form\nstderr: {stderr}"
+        ["stop", "--phase", &phase.to_string()],
+        "the refusal must print the plain stop form\nstderr: {stderr}"
     );
 
     let stop = run_printed_stop(&home, root, &words);
+    let stop_stderr = String::from_utf8_lossy(&stop.stderr);
     assert!(
-        stop.status.success(),
-        "the printed stop must end the run\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&stop.stdout),
-        String::from_utf8_lossy(&stop.stderr)
+        stop_stderr.contains("the unit is down")
+            && stop_stderr.contains(&format!("devflow discard --phase {phase}")),
+        "the printed stop must end the unit and name `devflow discard` for the state that \
+         does not load\nstdout: {}\nstderr: {stop_stderr}",
+        String::from_utf8_lossy(&stop.stdout)
     );
     common::wait_for(
-        || matches!(supervisor::probe(&run.socket), Ok(Liveness::Gone)),
+        || !run.alive(),
         Duration::from_secs(5),
-        "the stopped supervisor's socket to probe Gone",
-    );
-    common::wait_for(
-        || group_is_gone(run.sidecar.agent_pgid),
-        Duration::from_secs(5),
-        "the stopped run's agent group to be gone",
+        "the stopped run's runner to be gone",
     );
     assert_eq!(
         fs::read(devflow_core::workflow::state_path(root, phase)).unwrap(),
@@ -1540,45 +1381,10 @@ fn the_corrupt_state_refusal_names_a_stop_that_ends_the_run() {
     );
 
     let again = force_start(&home, root, phase);
-    let again_stderr = String::from_utf8_lossy(&again.stderr);
     assert!(
-        !again_stderr.contains("a run is still live"),
-        "once the run is stopped, start must not refuse over it\nstderr: {again_stderr}"
-    );
-}
-
-#[test]
-fn resume_refuses_over_a_live_supervisor_when_the_state_will_not_load() {
-    let home = common::HermeticHome::new();
-    let repo = tempfile::tempdir().unwrap();
-    let root = repo.path();
-    let phase = PhaseId::new(72);
-    init_repo(root, phase);
-    let _reaper = common::LaunchedRunReaper::new(root, phase, vec![]);
-    let run = LiveRun::launch(&home, root, phase);
-    run.hide_agent_pid_file(root, phase);
-    corrupt_state(root, phase);
-    let fake_bin = fake_codex("exec sleep 60");
-
-    let stderr = assert_refused_over_a_corrupt_state(&home, root, phase, || {
-        resume_command(&home, root, phase, &fake_bin)
-            .output()
-            .expect("run devflow resume")
-    });
-    let id = run.launch_id();
-    for fragment in [
-        "refusing to resume; nothing was written".to_string(),
-        format!("supervisor launch {id} ALIVE"),
-        format!("run `devflow stop --phase {phase} --launch {id}` first"),
-    ] {
-        assert!(
-            stderr.contains(&fragment),
-            "refusal must contain {fragment:?}\nstderr: {stderr}"
-        );
-    }
-    assert!(
-        matches!(supervisor::probe(&run.socket), Ok(Liveness::Alive(_))),
-        "a refused resume must leave the live supervisor running"
+        again.status.success(),
+        "once the run is stopped, start must not refuse over it\nstderr: {}",
+        String::from_utf8_lossy(&again.stderr)
     );
 }
 
@@ -1589,19 +1395,17 @@ fn start_proceeds_over_a_corrupt_state_with_no_live_supervisor() {
     let root = repo.path();
     let phase = PhaseId::new(73);
     init_repo(root, phase);
-    let _reaper = common::LaunchedRunReaper::new(root, phase, vec![]);
+    let _reaper = common::LaunchedRunReaper::for_home(&home, root, phase);
     let run = LiveRun::launch(&home, root, phase);
-    run.hide_agent_pid_file(root, phase);
-    match supervisor::request_shutdown(&run.socket, LIVE_RUN_SHUTDOWN_WAIT)
-        .expect("shut the fixture's run down")
-    {
-        ShutdownOutcome::Stopped { .. } => {}
-        other => panic!("the fixture's shutdown must stop the run, got {other:?}"),
-    }
+    let signed = libc::pid_t::try_from(run.runner_pid).expect("pid fits pid_t");
+    assert!(signed > 1, "refusing to signal pid {signed}");
+    // SAFETY: `signed > 1` names the runner this test's fake launcher recorded, whose
+    // argv `LiveRun::launch` checked.
+    unsafe { libc::kill(signed, libc::SIGTERM) };
     common::wait_for(
-        || !run.socket.exists() && !run.sidecar_path().exists(),
-        Duration::from_secs(5),
-        "the shut-down run's socket and sidecar to be removed",
+        || !run.alive() && !runner_lock_live(root, phase),
+        Duration::from_secs(20),
+        "the stopped run's runner to exit and free its lock",
     );
     corrupt_state(root, phase);
     let started_before = workflow_started_count(root);
@@ -1610,117 +1414,12 @@ fn start_proceeds_over_a_corrupt_state_with_no_live_supervisor() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "with no live supervisor, start over a corrupt state proceeds as today\nstdout: {}\nstderr: {stderr}",
+        "with no live runner, start over a corrupt state proceeds as today\nstdout: {}\nstderr: {stderr}",
         String::from_utf8_lossy(&output.stdout)
-    );
-    assert!(
-        !stderr.contains("a run is still live"),
-        "no refusal over a dead run\nstderr: {stderr}"
     );
     assert_eq!(
         workflow_started_count(root),
         started_before + 1,
         "the start over the corrupt state must emit workflow_started"
     );
-}
-
-#[test]
-fn start_refuses_when_the_state_and_the_live_sidecar_both_will_not_load() {
-    let home = common::HermeticHome::new();
-    let repo = tempfile::tempdir().unwrap();
-    let root = repo.path();
-    let phase = PhaseId::new(74);
-    init_repo(root, phase);
-    let _reaper = common::LaunchedRunReaper::new(root, phase, vec![]);
-    let run = LiveRun::launch(&home, root, phase);
-    run.hide_agent_pid_file(root, phase);
-    let (pgid, started) = (run.sidecar.agent_pgid, run.sidecar.agent_start_time);
-    corrupt_state(root, phase);
-    fs::write(run.sidecar_path(), CORRUPT_JSON).expect("corrupt the live sidecar");
-    assert!(supervisor::read_sidecar(&run.sidecar_path()).is_err());
-
-    let stderr =
-        assert_refused_over_a_corrupt_state(&home, root, phase, || force_start(&home, root, phase));
-    for fragment in [
-        "refusing to start; nothing was written".to_string(),
-        format!("socket {} (ALIVE", run.socket.display()),
-        format!("launch {}", run.launch_id()),
-        "does not parse".to_string(),
-        format!("run `devflow stop --phase {phase}` first"),
-        "one that does not answer cannot be validated without its sidecar".to_string(),
-    ] {
-        assert!(
-            stderr.contains(&fragment),
-            "refusal must contain {fragment:?}\nstderr: {stderr}"
-        );
-    }
-    assert!(
-        !stderr.contains("--launch"),
-        "a socket with no usable sidecar is not addressed by `--launch`\nstderr: {stderr}"
-    );
-    let words = printed_stop_command(&stderr, phase);
-    assert_eq!(words, ["stop", "--phase", &phase.to_string()]);
-
-    assert!(
-        devflow_core::agent::is_same_process(pgid, started),
-        "the agent group's leader must still be the launched agent before the stop"
-    );
-    let stop = run_printed_stop(&home, root, &words);
-    assert!(
-        stop.status.success(),
-        "the printed stop must end the run\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&stop.stdout),
-        String::from_utf8_lossy(&stop.stderr)
-    );
-    common::wait_for(
-        || matches!(supervisor::probe(&run.socket), Ok(Liveness::Gone)),
-        Duration::from_secs(5),
-        "the stopped supervisor's socket to probe Gone",
-    );
-    common::wait_for(
-        || group_is_gone(pgid),
-        Duration::from_secs(5),
-        "the stopped run's agent group to be gone",
-    );
-}
-
-#[test]
-fn a_live_socket_named_for_another_root_does_not_block_a_corrupt_state_start() {
-    let home = common::HermeticHome::new();
-    let repo = tempfile::tempdir().unwrap();
-    let root = repo.path();
-    let other_repo = tempfile::tempdir().unwrap();
-    let other = other_repo.path();
-    let phase = PhaseId::new(75);
-    init_repo(root, phase);
-    init_repo(other, phase);
-    let _reaper = common::LaunchedRunReaper::new(root, phase, vec![]);
-    let _other_reaper = common::LaunchedRunReaper::new(other, phase, vec![]);
-    let run = LiveRun::launch(&home, root, phase);
-    run.hide_agent_pid_file(root, phase);
-    corrupt_state(root, phase);
-    fs::write(run.sidecar_path(), CORRUPT_JSON).expect("corrupt the live sidecar");
-    fs::create_dir_all(other.join(".devflow")).unwrap();
-    corrupt_state(other, phase);
-
-    let output = force_start(&home, other, phase);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !stderr.contains("devflow stop --phase"),
-        "a socket named for another root must not refuse this root's start\nstderr: {stderr}"
-    );
-    assert!(
-        !stderr.contains("a run is still live"),
-        "no live-run refusal for another root's socket\nstderr: {stderr}"
-    );
-    assert!(
-        matches!(supervisor::probe(&run.socket), Ok(Liveness::Alive(_))),
-        "the other root's start must leave this root's supervisor running"
-    );
-    match supervisor::request_shutdown(&run.socket, LIVE_RUN_SHUTDOWN_WAIT)
-        .expect("shut this root's run down")
-    {
-        ShutdownOutcome::Stopped { .. } => {}
-        other => panic!("the shutdown must stop the run, got {other:?}"),
-    }
 }
