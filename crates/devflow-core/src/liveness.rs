@@ -250,11 +250,47 @@ pub(crate) fn pass_to_child(cmd: &mut std::process::Command, hold: &Hold) {
     }
 }
 
+/// A fresh launch id: 16 lowercase hex characters from this process's pid,
+/// the current time in nanoseconds and a process-wide counter. Uniqueness is
+/// also enforced where an id names a file, which refuses an existing name.
+pub fn new_launch_id() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos() as u64);
+    let mixed = u64::from(std::process::id()) ^ nanos ^ count.rotate_left(48);
+    format!("{mixed:016x}")
+}
+
+/// Whether `id` has [`new_launch_id`]'s format: 16 lowercase hex digits. A
+/// launch id read from disk is built into paths and printed into copy-paste
+/// lines, so this is the one rule every reader applies before trusting one.
+pub(crate) fn is_launch_id(id: &str) -> bool {
+    const LAUNCH_ID_LEN: usize = 16;
+    id.len() == LAUNCH_ID_LEN
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// The kernel boot id, trimmed, or `None` where it cannot be read.
+pub fn boot_id() -> Option<String> {
+    read_boot_id(Path::new("/proc/sys/kernel/random/boot_id"))
+}
+
+/// [`boot_id`] against an explicit file, for tests.
+pub(crate) fn read_boot_id(path: &Path) -> Option<String> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let trimmed = contents.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
 /// The liveness file of launch `launch_id`: `.devflow/supervisor-{launch_id}.live`.
-/// `None` unless the id has [`crate::supervisor::new_launch_id`]'s format, so a
+/// `None` unless the id has [`new_launch_id`]'s format, so a
 /// launch id read from disk never builds a path outside `.devflow/`.
 pub fn launch_liveness_path(project_root: &Path, launch_id: &str) -> Option<PathBuf> {
-    crate::supervisor::is_launch_id(launch_id).then(|| {
+    is_launch_id(launch_id).then(|| {
         project_root
             .join(".devflow")
             .join(format!("supervisor-{launch_id}.live"))
@@ -442,13 +478,13 @@ pub fn claim_runner_lock(project_root: &Path, phase: PhaseId) -> Result<Hold, Ru
 /// # Errors
 /// The pipe or `sigaction` failed. The result of the one attempt is cached.
 pub fn install_holder_stop_handler() -> std::io::Result<()> {
-    crate::supervisor::runtime::install_signal_pipe()
+    crate::stop::install_signal_pipe()
 }
 
 /// The signal [`install_holder_stop_handler`]'s handler caught, if one has arrived. A
 /// later signal replaces an earlier one.
 pub fn holder_stop_signal() -> Option<i32> {
-    crate::supervisor::runtime::caught_stop_signal()
+    crate::stop::caught_stop_signal()
 }
 
 /// Whose lock this is: the pid and start time the holder recorded, while the
@@ -1206,7 +1242,7 @@ mod tests {
     fn launch_liveness_path_refuses_an_invalid_launch_id() {
         let root = Path::new("/project/root");
         assert_eq!(launch_liveness_path(root, "../x"), None);
-        let launch_id = crate::supervisor::new_launch_id();
+        let launch_id = new_launch_id();
         assert_eq!(
             launch_liveness_path(root, &launch_id),
             Some(root.join(format!(".devflow/supervisor-{launch_id}.live")))

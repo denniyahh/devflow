@@ -121,30 +121,11 @@ impl SocketPath {
     }
 }
 
-/// A fresh launch id: 16 lowercase hex characters from this process's pid,
-/// the current time in nanoseconds and a process-wide counter. Uniqueness is
-/// also enforced at publish time, which refuses an existing name.
-pub fn new_launch_id() -> String {
-    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_nanos() as u64);
-    let mixed = u64::from(std::process::id()) ^ nanos ^ count.rotate_left(48);
-    format!("{mixed:016x}")
-}
-
-/// Whether `id` has [`new_launch_id`]'s format: 16 lowercase hex digits. A
-/// launch id read from disk (a sidecar, a socket name) is printed into
-/// copy-paste `devflow stop --launch <id>` lines, so this is the one rule
-/// every reader applies before trusting one.
-pub(crate) fn is_launch_id(id: &str) -> bool {
-    const LAUNCH_ID_LEN: usize = 16;
-    id.len() == LAUNCH_ID_LEN
-        && id
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
+/// [`crate::liveness`]'s launch-id check, at its old path, for importers not yet repointed.
+pub(crate) use crate::liveness::is_launch_id;
+/// The launch-id and boot-id helpers, at the path they had before they moved to
+/// [`crate::liveness`]. Kept until this module is removed.
+pub use crate::liveness::{boot_id, new_launch_id};
 
 /// Deserialize [`Sidecar::launch_id`], refusing any id [`is_launch_id`]
 /// rejects, so such a sidecar reads as one that does not parse.
@@ -160,18 +141,6 @@ fn deserialize_launch_id<'de, D: serde::Deserializer<'de>>(
             "the launch id is not 16 lowercase hex digits",
         ))
     }
-}
-
-/// The kernel boot id, trimmed, or `None` where it cannot be read.
-pub fn boot_id() -> Option<String> {
-    read_boot_id(Path::new("/proc/sys/kernel/random/boot_id"))
-}
-
-/// [`boot_id`] against an explicit file, for tests.
-pub(crate) fn read_boot_id(path: &Path) -> Option<String> {
-    let contents = std::fs::read_to_string(path).ok()?;
-    let trimmed = contents.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 /// Why a socket could not be published.
