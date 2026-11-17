@@ -208,6 +208,24 @@ fn all_eight_devflow_constructors_produce_the_gitignore() {
     );
 }
 
+/// `liveness::claim_runner_lock` creates `.devflow/.runner-NN` (D-07), so it is a
+/// `.devflow/` constructor like the holder in case 7 of
+/// `all_eight_devflow_constructors_produce_the_gitignore`.
+#[test]
+fn claim_runner_lock_produces_the_gitignore() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    assert!(
+        !gitignore_is_star(root),
+        "gitignore present before the claim on a fresh root"
+    );
+    let _hold = liveness::claim_runner_lock(root, PhaseId::new(1)).expect("claim_runner_lock");
+    assert!(
+        gitignore_is_star(root),
+        "claim_runner_lock did not produce a .devflow/.gitignore"
+    );
+}
+
 /// Small helper so a failing `archive_phase_files` reports through the same
 /// accumulate-then-assert shape as the other sites, instead of panicking
 /// mid-test via `.expect()` and hiding which site regressed.

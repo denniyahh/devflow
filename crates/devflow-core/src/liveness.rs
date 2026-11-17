@@ -789,6 +789,69 @@ mod tests {
         );
     }
 
+    /// D-07: the agent a runner spawns must not keep the runner lock, or the run would
+    /// read live after its runner died.
+    #[test]
+    fn a_runner_lock_is_not_inherited_by_a_spawned_child() {
+        in_own_process(
+            "liveness::tests::a_runner_lock_is_not_inherited_by_a_spawned_child",
+            || {
+                let dir = tempfile::tempdir().expect("create a temp dir");
+                let root = dir.path();
+                let phase = PhaseId::new(9);
+                let path = runner_lock_path(root, phase);
+                assert_eq!(path, root.join(".devflow/.runner-09"));
+
+                let hold = claim_runner_lock(root, phase).expect("claim");
+                let child = ReapOnDrop(sleep_command().spawn().expect("spawn the child"));
+                drop(hold);
+                assert_eq!(
+                    probe(&path).expect("probe"),
+                    Held::Abandoned,
+                    "child kept the runner lock after the runner dropped it"
+                );
+                drop(child);
+
+                let hold = claim_runner_lock(root, phase).expect("claim again");
+                clear_close_on_exec(hold.as_raw_fd());
+                let child = ReapOnDrop(sleep_command().spawn().expect("spawn the child"));
+                drop(hold);
+                assert_eq!(
+                    probe(&path).expect("probe"),
+                    Held::Live,
+                    "control: with close-on-exec cleared the child keeps the lock"
+                );
+                drop(child);
+            },
+        );
+    }
+
+    /// D-07: a probe that cannot read the runner lock is an error, never a free lock, so
+    /// no caller relaunches over a runner it could not see.
+    #[test]
+    fn a_runner_lock_probe_error_reads_as_an_error_not_free() {
+        in_own_process(
+            "liveness::tests::a_runner_lock_probe_error_reads_as_an_error_not_free",
+            || {
+                let dir = tempfile::tempdir().expect("create a temp dir");
+                let root = dir.path();
+                let phase = PhaseId::new(10);
+                assert_eq!(
+                    probe(&runner_lock_path(root, phase)).expect("probe a missing lock"),
+                    Held::Missing,
+                    "control: a missing lock file reads Missing"
+                );
+
+                std::fs::write(root.join(".devflow"), "a regular file").expect("plant the file");
+                let probed = probe(&runner_lock_path(root, phase));
+                assert!(
+                    probed.is_err(),
+                    "probe error read as free: a lock under a regular file read {probed:?}"
+                );
+            },
+        );
+    }
+
     /// Clears `FD_CLOEXEC` on `fd`, so a spawned child inherits it.
     fn clear_close_on_exec(fd: RawFd) {
         // SAFETY: fcntl reads and sets a flag of a descriptor the caller owns.

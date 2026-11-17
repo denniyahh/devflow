@@ -337,3 +337,33 @@ fn a_runner_unit_runs_plan_and_ends_inactive_with_the_lock_free() {
         "expected one stage_launched for plan, with its runner_pid: {launched:?}"
     );
 }
+
+/// D-04a, the negative control for the tracer above: with the runner lock already held
+/// (by this test process, through the same claim the runner makes), the runner exits
+/// before READY, so `systemd-run` under `Type=notify` reports the unit's start failed.
+#[test]
+#[ignore = "needs a systemd user manager; run by scripts/check.sh service"]
+fn a_runner_that_cannot_take_its_lock_fails_the_unit_start() {
+    assert_manager_answers();
+    let phase = PhaseId::new(72);
+    let fixture = RunnerFixture::new(phase);
+    let guard = UnitGuard::for_phase(phase);
+    let _held = devflow_core::liveness::claim_runner_lock(&fixture.root, phase)
+        .expect("the test takes the runner lock first");
+
+    let started = fixture.start_unit(&guard.unit);
+    let stderr = String::from_utf8_lossy(&started.stderr);
+    assert!(
+        !started.status.success(),
+        "systemd-run reported success over a runner without its lock: {stderr}\njournal:\n{}",
+        journal_of(&guard.unit)
+    );
+    assert!(
+        stderr.contains(&guard.unit) && stderr.contains("failed"),
+        "systemd-run's stderr names the unit failing: {stderr}"
+    );
+    assert!(
+        events_of(&fixture.root, "stage_launched").is_empty(),
+        "a runner without its lock launched a stage"
+    );
+}
