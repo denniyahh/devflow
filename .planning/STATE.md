@@ -5,16 +5,16 @@ milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: "52.2"
 current_phase_name: Foreground Runner
 status: executing
-stopped_at: Completed 52.2-12-PLAN.md
-last_updated: "2026-11-17T13:44:02.319Z"
+stopped_at: Completed 52.2-23-PLAN.md
+last_updated: "2026-11-17T14:30:46.141Z"
 last_activity: 2026-11-16
 last_activity_desc: Phase 52.2 execution started
-state_head: 18f40472a72771faaab06b87088eb212bbaaff97
+state_head: c1a95c5d16e7228e08f3dba823d787b26bf7b567
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 66
-  completed_plans: 56
+  completed_plans: 57
   percent: 17
 ---
 
@@ -172,7 +172,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 52.2 (Foreground Runner) — EXECUTING
-Plan: 17 of 26
+Plan: 18 of 26
 Status: Ready to execute
 Last activity: 2026-11-16 — Phase 52.2 execution started
 
@@ -977,6 +977,9 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 52.2]: a launch reservation is a doctor note only while no runner runs; its liveness lock is no longer read (D-07)
 - [Phase 52.2]: 52.2-12: devflow-core semver accept-break recorded in 52.2-SEMVER-REMOVALS.txt; scripts/semver-planned-removals.sh gates every later removal plan (guards baseline items only)
 - [Phase 52.2]: 52.2-12: stop primitives live in devflow_core::stop, launch-id/boot-id helpers in devflow_core::liveness; old supervisor paths are pub use re-exports until 52.2-24
+- [Phase 52.2]: 52.2-23: doctor socket sweep (orphan_supervisors, orphan_supervisor_sweep_error) deleted with the CLI last supervisor:: reader; doctor --json has five keys
+- [Phase 52.2]: 52.2-23: Reservation keeps an unbound socket path for its pending record, built from registry::socket_dir_in and path_digest; 52.2-25 deletes the reservation
+- [Phase 52.2]: 52.2-23: stage tests that drove run_supervised_stage in a child now drive monitor::run_stage under a run token there, keeping their names
 
 ## Roadmap Evolution
 
@@ -1144,11 +1147,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 52.2 P11 | 47 min | 3 tasks | 14 files |
 | Phase 52.2 P26 | 34 min | 3 tasks | 10 files |
 | Phase 52.2 P12 | 19 min | 3 tasks | 13 files |
+| Phase 52.2 P23 | 38 min | 3 tasks | 21 files |
 
 ## Session
 
-**Last session:** 2026-11-17T13:44:01.039Z
-**Stopped at:** Completed 52.2-12-PLAN.md
+**Last session:** 2026-11-17T14:30:45.277Z
+**Stopped at:** Completed 52.2-23-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps

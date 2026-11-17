@@ -18,11 +18,12 @@
   **Why deferred:** pre-existing doc drift beside 52.2-03's CONTRIBUTING edit, not caused by it. Fix shape: point the sentence at the file that holds the guards. Owner: the phase's docs pass or any CONTRIBUTING change.
 
 - Repair lines still name `devflow stop --launch`, which 52.2-06 removed
-  status: open (the OPERATIONS.md half resolved by 52.2-22; the code half is 52.2-23's)
+  status: resolved (52.2-23, commit 4187dd9)
   **What:** `devflow doctor`'s orphan-supervisor finding (`crates/devflow-cli/src/commands.rs`, `repair: Some(format!("devflow stop --phase {phase} --launch {launch_id}"))`), the launch guard's leftover-socket refusal (`` `devflow stop --phase {phase} --launch {id}` first ``) and OPERATIONS.md's stop row still print or document `--launch`. 52.2-06 removed the flag with `stop_launch` (D-05), so following one of those lines now fails clap's argument parse.
   **Why deferred:** both code paths read the detached supervisor's sockets (`possibly_live_sockets`, `socket_live_socket`), which 52.2-06 keeps for 52.2-23 to delete with their other callers; a `start` or `resume` since 52.2-06 creates no such socket, so only a run from an older binary reaches them. OPERATIONS.md is 52.2-22's. Fix shape: 52.2-23 deletes the socket findings and refusals with those helpers; 52.2-22 rewrites the stop row.
   **Partial resolution (52.2-26, commit c6b1090):** the launch guard's leftover-socket refusal is deleted with the guard's socket reads (`LiveSocket::repair_line`); only `devflow doctor`'s orphan-supervisor finding still prints `--launch`, and OPERATIONS.md's rewritten `## Run liveness` keeps the sentence saying so.
   **Partial resolution (52.2-22, commit 7d81e4a):** OPERATIONS.md's stop row no longer has `--launch`, and the doctor orphan paragraph says the printed repair names the removed flag and no longer parses. When 52.2-23 deletes the orphan findings, that paragraph (inside `## Run liveness`, which 52.2-26 rewrites) goes with them; no doc_check test would flag it, since `documented_flags` also accepts any `launch:` field in source.
+  **Resolution:** 52.2-23 deleted `devflow doctor`'s supervisor socket sweep (`collect_orphan_supervisors` and its finding, text and `orphan_supervisors` / `orphan_supervisor_sweep_error` JSON keys) with the CLI's last `supervisor::` reads, and OPERATIONS.md's "Orphan sockets" paragraph and the two keys in the doctor row with it. `rg -n -- '--launch' crates/devflow-cli/src` exits 1.
 
 - `devflow recover --clean` deletes the state of a live runner unit
   status: resolved (52.2-10, commit 29aaf01)
@@ -37,9 +38,10 @@
   **Resolution:** 52.2-26's commit c6b1090 made `cleanup`'s liveness read the runner lock alone, and with the supervisor reads gone the race became deterministic: the test failed alone, `its runner holds the runner lock (pid …)`. Commit b9e367d waits (bounded, 10 s) for the runner lock to be free after the state clears and before `cleanup --force`, the fix shape above; the whole `phase7_cli` suite passed after it. 52.2-26 owns `phase7_cli.rs`, so it took the fix rather than leave a red test for 52.2-23.
 
 - `status` still prints the state record's `run: active` and `active phases:` beside the liveness row
-  status: open
+  status: open (reassigned by 52.2-23 to a 999.x entry at phase close)
   **What:** since 52.2-09 each phase's first line is its liveness row (`phase N: crashed — …`), but `status_run_lines` still prints `run: active` and `active_phases_line` still lists the phase under `active phases:` whenever the state is neither finished, stopped nor missing its worktree (`run_kind`, `crates/devflow-cli/src/commands.rs`). So a crashed run reads `crashed` on its row and `active` two lines below. Seen in 52.2-09's own e2e output, not asserted by any test.
   **Why deferred:** the plan rewrote the row and the removed agent-pid/supervisor lines; `run_kind` feeds OPS-02's worktree-missing wording and three unit tests (`status_prints_the_stop_reason_and_fallback_state`, `status_does_not_report_a_run_with_a_missing_worktree_as_active`), so changing its words is a separate wording decision. Fix shape: drop `run:` (keep the worktree-missing line) and build the header from `RunStatus::Live`, updating those tests. Owner: 52.2-23 (status/doctor cleanup) or a 999.x entry at phase close.
+  **Reassigned (52.2-23):** 52.2-23 removes supervisor items and does not change `status`'s wording; a 999.x entry at phase close takes it.
 
 - The gate-answer refusal names `recover --clean`
   status: resolved (52.2-10, commit c478ef5)
@@ -57,16 +59,29 @@
   **Why deferred:** wording only, outside 52.2-11's subject. Owner: 52.2-15, the one remaining plan whose files_modified lists `preflight.rs`; rename the pinning test with the text. Else a 999.x entry at phase close.
 
 - `run_liveness_e2e.rs` still calls `LaunchedRunReaper::new`
-  status: open
+  status: resolved (52.2-23, commit c1a95c5)
   **What:** `crates/devflow-cli/tests/run_liveness_e2e.rs:209` (`start_refuses_while_the_runner_lock_is_held`) builds `common::LaunchedRunReaper::new(&case.root, case.phase, Vec::new())`. 52.2-11 reported it as 52.2-26's file; it is not in 52.2-26's files_modified, and the test passes at 52.2-26's head.
   **Why deferred:** outside 52.2-26's files. Owner: 52.2-23, whose Task 3 removes the remaining `LaunchedRunReaper::new` callers (switch it to `for_home`, or drop the reaper if the test launches nothing).
+  **Resolution:** the test binds `LaunchedRunReaper::for_home`, and `LaunchedRunReaper::new`, `supervisors_exited_within` and the `__monitor` argv scan are deleted (`rg -n -w -e 'LaunchedRunReaper::new' -e supervisors_exited_within crates/devflow-cli/tests` exits 1).
 
 - Tests and comments still plant or name the agent pid file and `check_dead_agent`
-  status: open
+  status: open (the start_lock_e2e and pipeline_launch.rs halves resolved by 52.2-23, commit c1a95c5; `pipeline_gate.rs:84` remains)
   **What:** after 52.2-26 no verb reads `.devflow/phase-NN-agent-pid` (D-12a), but `start_lock_e2e.rs` still plants it in `plant_leftover_run`, `plant_resumable_run` and `resume_without_phase_state_reports_the_missing_state_not_a_live_run` (inert now: those tests pass on the runner lock and the state alone), and its `50-15` section comment says a fixture's "supervisor socket" refuses. `pipeline_launch.rs:5168` and `pipeline_gate.rs:84` comments name `check_dead_agent`, which 52.2-26 deleted. Found by 52.2-26.
   **Why deferred:** comments and inert fixture writes, no wrong behaviour; `start_lock_e2e.rs` names are 52.2-23 Task 3's (supervisor items in passing tests), and the two source comments are outside 52.2-26's files. Owner: 52.2-23 (its files include `start_lock_e2e.rs` and `pipeline_launch.rs`); `pipeline_gate.rs`'s comment to whichever plan next edits that file, else a 999.x entry at phase close.
+  **Partial resolution (52.2-23):** `start_lock_e2e.rs` plants no agent pid file and its section comment names the runner lock; the `pipeline_launch.rs` and `phase7_cli.rs` comments no longer name `check_dead_agent`. `pipeline_gate.rs:84` is outside 52.2-23's files and keeps its owner above.
 
 - The stop primitives' own unit tests still live in `supervisor/runtime.rs`
   status: open
   **What:** 52.2-12 moved the stop primitives to `crates/devflow-core/src/stop.rs` and moved the forbidden signal/exit source scan with them (`stop::tests::stop_source_has_none_of_the_forbidden_signal_or_exit_calls`; runtime.rs keeps its own scan over runtime.rs). The tests whose subject is a moved item stayed in `supervisor/runtime.rs`'s `mod tests`: `every_owner_phase_has_exactly_one_stop_decision`, `exit_and_safe_point_decisions_cover_every_input`, `a_stop_racing_natural_completion_never_advances`, `natural_completion_without_a_stop_advances`, and the signal-pipe tests that run a child (`sigterm_is_delivered_as_a_stop_event_not_handled_in_the_handler`, `a_term_ignoring_group_member_is_killed_after_the_leader_exits`). Deleting the module would delete coverage of code that stays.
   **Why deferred:** 52.2-12's task is the move of production items, and its prohibition is on public removals; moving those tests (several drive a child supervisor through the socket) is a test restructure the plan does not name. Fix shape: 52.2-24, which deletes `supervisor/`, ports each test whose subject is in `stop.rs` into `stop::tests` (a child that installs the signal pipe and waits under a `StopToken`, no socket) or gives it a `successor` ledger row; only socket-subject tests get `subject removed`. Owner: 52.2-24.
+
+- Comments outside 52.2-23's files still name the deleted `spawn_monitor` and `MonitorLaunch`
+  status: open
+  **What:** after 52.2-23, `crates/devflow-core/src/agent_result.rs` (:3428 `MonitorLaunch::PipeOwning`, :3575 and :3584 `spawn_monitor`), `agent.rs:297`, `crates/devflow-cli/src/staleness.rs:406` and `preflight.rs` (:674, :1598, :1639, and the test name `run_preflight_failing_check_gates_and_never_reaches_spawn_monitor`) still name items 52.2-23 deleted. Comments and one test name only; no code reads them. Found by 52.2-23.
+  **Why deferred:** outside 52.2-23's files. Owner: 52.2-15 for `preflight.rs` (rename the test with its doc), 52.2-24 for `agent.rs` (its Task 2 edits that file), else a 999.x entry at phase close for `agent_result.rs` and `staleness.rs`.
+
+- `agent_result::prompt_path` and `monitor_log_path` have no production writer
+  status: open
+  **What:** 52.2-23 stopped writing `.devflow/phase-NN-prompt` and `phase-NN-monitor.log` (D-09). Both path functions are still public in `crates/devflow-core/src/agent_result.rs`; `monitor_log_path` is read only by monitor tests that assert the file is absent, and `prompt_path` by nothing. Removing them is a published-API removal. Found by 52.2-23.
+  **Why deferred:** `agent_result.rs` is outside 52.2-23's files and the two functions are in no group of 52.2-SEMVER-REMOVALS.txt. Owner: 52.2-24 (which already edits devflow-core's remaining per-run file readers), else a 999.x entry at phase close.
+
