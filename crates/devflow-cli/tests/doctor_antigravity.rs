@@ -9,6 +9,7 @@
 
 mod common;
 
+use common::HermeticPath;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
@@ -38,7 +39,7 @@ fn doctor_reports_antigravity_present_with_stub_on_path() {
     let out = common::hermetic_devflow(&home)
         .arg("doctor")
         .arg(root)
-        .env("PATH", &bin)
+        .hermetic_path(&bin)
         .output()
         .expect("spawn devflow doctor");
     assert!(
@@ -66,7 +67,7 @@ fn doctor_reports_antigravity_absent_without_agy() {
     let out = common::hermetic_devflow(&home)
         .arg("doctor")
         .arg(root)
-        .env("PATH", &empty)
+        .hermetic_path(&empty)
         .output()
         .expect("spawn devflow doctor");
     assert!(
