@@ -3,8 +3,8 @@
 //! and the runner's readiness report.
 
 use devflow_core::phase_id::PhaseId;
-use std::ffi::OsString;
-use std::path::Path;
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
@@ -26,6 +26,10 @@ pub(crate) const MANAGER_OWNED_ENV: &[&str] = &[
 /// cgroup (`TimeoutStopSec`): about twice the runner's own SIGTERM-then-SIGKILL path
 /// for its agent.
 pub(crate) const TIMEOUT_STOP_SEC: Duration = Duration::from_secs(10);
+
+/// How long a verb waits for a stopping unit to read inactive (D-07a):
+/// [`TIMEOUT_STOP_SEC`] plus 5 s, so the manager's own SIGKILL lands inside the wait.
+pub(crate) const UNIT_STOP_WAIT: Duration = Duration::from_secs(TIMEOUT_STOP_SEC.as_secs() + 5);
 
 /// How long the manager waits for the runner's `READY=1` before it fails the start.
 pub(crate) const TIMEOUT_START_SEC: &str = "30s";
@@ -94,6 +98,158 @@ pub(crate) fn run_bounded(mut command: Command, deadline: Duration) -> std::io::
     }
 }
 
+/// How a user manager that did not answer the Version probe is sorted (D-03, review
+/// codex-2/pi-8, r3 codex-1/pi-5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManagerUnavailableKind {
+    /// Positive evidence that no manager runs for this user: `XDG_RUNTIME_DIR` is the
+    /// user's own `/run/user/<uid>` and has no `systemd/private`. No unit can exist.
+    Absent,
+    /// This shell cannot reach the manager: `XDG_RUNTIME_DIR` is unset, empty,
+    /// relative or another path, so a missing socket there says nothing about it.
+    Unreachable,
+    /// The socket exists, or its stat failed some other way, and the manager did not
+    /// answer.
+    Failed,
+}
+
+/// Why [`manager_available`] found no answering user manager.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManagerUnavailable {
+    /// How the failure is sorted.
+    pub(crate) kind: ManagerUnavailableKind,
+    /// The `XDG_RUNTIME_DIR` the probe ran under.
+    pub(crate) runtime_dir: Option<OsString>,
+    /// This user's own runtime dir, `/run/user/<uid>`.
+    pub(crate) own_runtime_dir: PathBuf,
+    /// What `systemctl` printed on stderr, or why it could not run.
+    pub(crate) stderr: String,
+}
+
+impl ManagerUnavailable {
+    /// The line a verb prints for this answer about `phase`: the runner-lock-only note
+    /// for [`ManagerUnavailableKind::Absent`], else the refusal's reason. Each carries
+    /// systemctl's stderr (agy-6).
+    pub(crate) fn describe(&self, phase: PhaseId) -> String {
+        let runtime = self
+            .runtime_dir
+            .as_deref()
+            .map(|dir| Path::new(dir).display().to_string());
+        match self.kind {
+            ManagerUnavailableKind::Absent => format!(
+                "note: no systemd user manager runs for this user (no {}/systemd/private; \
+                 systemctl: {}); phase {phase} checked by its runner lock only",
+                runtime.unwrap_or_default(),
+                self.stderr
+            ),
+            ManagerUnavailableKind::Unreachable => {
+                let shown = match &runtime {
+                    None => "unset".to_string(),
+                    Some(dir) if dir.is_empty() => "empty".to_string(),
+                    Some(dir) if Path::new(dir).is_relative() => format!("relative (\"{dir}\")"),
+                    Some(dir) => format!("\"{dir}\""),
+                };
+                let bus = if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some() {
+                    "set"
+                } else {
+                    "unset"
+                };
+                format!(
+                    "cannot reach the systemd user manager from this shell: XDG_RUNTIME_DIR is \
+                     {shown} and not this user's {} (DBUS_SESSION_BUS_ADDRESS {bus}); \
+                     systemctl: {}",
+                    self.own_runtime_dir.display(),
+                    self.stderr
+                )
+            }
+            ManagerUnavailableKind::Failed => format!(
+                "the systemd user manager did not answer; systemctl: {}",
+                self.stderr
+            ),
+        }
+    }
+}
+
+/// Sort a Version probe that got no answer (review codex-2/pi-8, r3 codex-1/pi-5).
+/// [`ManagerUnavailableKind::Absent`] only when `runtime_dir` equals `own_runtime_dir`
+/// by path components (a trailing `/` matches; a symlink or any other spelling does
+/// not) and `<runtime_dir>/systemd/private`, the socket `systemctl --user` connects to,
+/// is NotFound. Unset, empty, relative or any other dir is Unreachable; anything else
+/// is Failed. Never canonicalised: a component compare can only read more cases as
+/// Unreachable, which refuses.
+pub(crate) fn classify_unanswered(
+    runtime_dir: Option<&OsStr>,
+    own_runtime_dir: &Path,
+    stderr: String,
+) -> ManagerUnavailable {
+    let kind = match runtime_dir.map(Path::new) {
+        None => ManagerUnavailableKind::Unreachable,
+        Some(dir) if dir.as_os_str().is_empty() || dir.is_relative() => {
+            ManagerUnavailableKind::Unreachable
+        }
+        Some(dir) if !dir.components().eq(own_runtime_dir.components()) => {
+            ManagerUnavailableKind::Unreachable
+        }
+        Some(dir) => match std::fs::symlink_metadata(dir.join("systemd").join("private")) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ManagerUnavailableKind::Absent
+            }
+            Ok(_) | Err(_) => ManagerUnavailableKind::Failed,
+        },
+    };
+    ManagerUnavailable {
+        kind,
+        runtime_dir: runtime_dir.map(OsStr::to_os_string),
+        own_runtime_dir: own_runtime_dir.to_path_buf(),
+        stderr,
+    }
+}
+
+/// This user's runtime dir as pam_systemd sets it: `/run/user/<uid>`.
+#[cfg(not(test))]
+fn own_runtime_dir() -> PathBuf {
+    // SAFETY: getuid takes no arguments, cannot fail and touches no memory.
+    let uid = unsafe { libc::getuid() };
+    PathBuf::from(format!("/run/user/{uid}"))
+}
+
+/// D-03: whether the systemd user manager answers
+/// `systemctl --user show -p Version --value` (never `is-system-running`).
+///
+/// # Errors
+/// It did not answer: [`classify_unanswered`]'s sort of `XDG_RUNTIME_DIR`. A probe
+/// that timed out is [`ManagerUnavailableKind::Failed`], never Absent.
+#[cfg(not(test))]
+pub(crate) fn manager_available() -> Result<(), ManagerUnavailable> {
+    let mut command = tool("systemctl");
+    command.args(["--user", "show", "-p", "Version", "--value"]);
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR");
+    let stderr = match run_bounded(command, SYSTEMCTL_CALL_BOUND) {
+        Ok(output) if output.status.success() => return Ok(()),
+        Ok(output) => String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+            return Err(ManagerUnavailable {
+                kind: ManagerUnavailableKind::Failed,
+                runtime_dir,
+                own_runtime_dir: own_runtime_dir(),
+                stderr: error.to_string(),
+            });
+        }
+        Err(error) => format!("could not run systemctl: {error}"),
+    };
+    Err(classify_unanswered(
+        runtime_dir.as_deref(),
+        &own_runtime_dir(),
+        stderr,
+    ))
+}
+
+/// The cfg(test) build: the manager answer the [`double`] holds.
+#[cfg(test)]
+pub(crate) fn manager_available() -> Result<(), ManagerUnavailable> {
+    double::manager()
+}
+
 /// The `ActiveState` text of `unit` (`inactive`, `deactivating`, `active`, ...), read
 /// with `systemctl --user show -p ActiveState --value` within `bound`. Never an exit
 /// code: `is-active` exits 3 for both deactivating and inactive.
@@ -158,6 +314,8 @@ pub(crate) mod double {
 
     /// What the double reports.
     struct Double {
+        /// The manager's answer to the Version probe.
+        manager: Result<(), super::ManagerUnavailable>,
         /// The unit's `ActiveState`, or the read error.
         unit_state: Result<String, String>,
         /// How many times the unit was read.
@@ -166,9 +324,28 @@ pub(crate) mod double {
 
     thread_local! {
         static DOUBLE: RefCell<Double> = RefCell::new(Double {
+            manager: Ok(()),
             unit_state: Ok("inactive".to_string()),
             unit_reads: 0,
         });
+    }
+
+    /// Make the manager on this thread answer (`None`) or not, sorted as `kind`.
+    pub(crate) fn set_manager(kind: Option<super::ManagerUnavailableKind>) {
+        DOUBLE.with_borrow_mut(|double| {
+            double.manager = kind.map_or(Ok(()), |kind| {
+                Err(super::ManagerUnavailable {
+                    kind,
+                    runtime_dir: Some("/run/user/0".into()),
+                    own_runtime_dir: "/run/user/0".into(),
+                    stderr: "Failed to connect to bus: No medium found (test double)".to_string(),
+                })
+            });
+        });
+    }
+
+    pub(super) fn manager() -> Result<(), super::ManagerUnavailable> {
+        DOUBLE.with_borrow(|double| double.manager.clone())
     }
 
     /// Make every later unit read on this thread answer `state`.
