@@ -60,9 +60,16 @@ cargo install devflow
 cd your-project
 devflow start --phase 3 --agent claude --mode auto
 
-# Check status anytime
+# Check status and watch the agent, from any shell
 devflow status
+devflow logs --phase 3 -f
+
+# Answer a gate, or stop the run
+devflow gate approve 3 --note "lgtm"
+devflow stop --phase 3
 ```
+
+Each run is a systemd user unit named from the project and the phase: `start` and `resume` launch it and return once it is ready, and the run keeps going after the shell exits. With lingering off (`loginctl enable-linger` turns it on) the run ends at logout, and on a host without a systemd user manager `start` refuses to launch. See [OPERATIONS.md](OPERATIONS.md#run-shape).
 
 ## Pipeline
 
@@ -84,7 +91,7 @@ crates/
 
 - **Opinionated, not universal** — Claude Code, Codex, OpenCode, and Pi are supported today through the modular `AgentDriver` contract, but DevFlow is built around specific workflow decisions, not a lowest-common-denominator abstraction over every agent. Adding a supported agent follows a small checklist — see [ARCHITECTURE.md](ARCHITECTURE.md#extension-points--adding-an-agent).
 - **Worktree isolation by default** — agents run in isolated git worktrees (`.worktrees/phase-NN/`) unless `--no-worktree` is passed, preventing cross-phase contamination.
-- **Monitor daemon** — optional background process detects agent completion and auto-advances the state machine. No cron, no polling, no tmux.
+- **One user unit per run** — a runner under the systemd user manager runs the stages, waits at gates and auto-advances the state machine; `devflow stop` stops the unit. No cron, no polling, no tmux.
 - **Four-layer evaluation** — operator-declared external post-conditions can fail a stage before agent-controlled signals; ordinary work then uses `DEVFLOW_RESULT`, exit code + commit count, and the final commit heuristic.
 - **Per-stage prompts** — a `StageIntent` carries each stage's data (phase, fix kind) with no agent-specific syntax; each driver's `render_prompt` turns it into its own instruction (Claude/OpenCode render the legacy slash-command text; Codex/Pi render a workflow-file reference).
 
@@ -115,11 +122,13 @@ Rate-limit detection: if an agent's stdout contains rate-limit messages (429), D
 
 | Command | Description |
 |---|---|
-| `devflow start --phase N --agent X [--mode auto\|supervise] [--no-worktree]` | Begin a phase: branch/worktree → launch agent → monitor pipeline |
+| `devflow start --phase N --agent X [--mode auto\|supervise] [--no-worktree]` | Begin a phase: branch/worktree → launch the run as a user unit → return once it is ready |
 | `devflow status` | Show current stage, phase, agent, PID, age |
 | `devflow gate list` | List gates awaiting a response |
 | `devflow gate approve\|reject <phase> [--stage STAGE] [--note "..."] [--gate-id ID]` | Answer a human gate — the pause points where the workflow waits for approval |
-| `devflow logs [--phase N] [--follow] [--stderr]` | Print or follow an agent's captured output for a phase |
+| `devflow logs [--phase N] [--follow] [--stderr]` | Print or follow (`-f`) an agent's captured output for a phase |
+| `devflow resume --phase N` | Continue a stopped or paused run from its saved stage, as a new unit |
+| `devflow stop --phase N [PROJECT]` | Stop the phase's run by stopping its user unit; `resume` continues it |
 | `devflow history [N]` | Correlate a phase's events with retained capture and review evidence |
 | `devflow cleanup` | Remove phase worktrees and their feature branches |
 
@@ -176,6 +185,7 @@ Agents must be installed separately. Run `devflow doctor` to verify availability
 - **git** 2.30+
 - **gh CLI** 2.0+ (`devflow doctor` checks for it; no DevFlow command runs it since the Ship stage was removed)
 - **A POSIX shell** (sh/bash)
+- **A systemd user manager** (`systemctl --user`) to launch runs; lingering keeps a run alive past logout
 
 Agents (Claude Code, Codex, OpenCode) must be installed separately. See [DEPENDENCIES.md](DEPENDENCIES.md) for the full matrix.
 

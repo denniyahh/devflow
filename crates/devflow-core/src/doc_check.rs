@@ -746,7 +746,6 @@ const RUN_LIVENESS_FRAGMENTS: &[&str] = &[
     "ALIVE",
     "devflow stop --phase N",
     "devflow resume --phase N",
-    "ps -o pid,pgid,sid,lstart,args -p \"$(pgrep -d, -g",
     "DEVFLOW_CACHE_DIR",
 ];
 
@@ -755,10 +754,8 @@ const RUN_LIVENESS_FRAGMENTS: &[&str] = &[
 const INTERNAL_SUBCOMMAND_FRAGMENTS: &[&str] = &["devflow monitor", "devflow advance"];
 
 /// 50-17 (R6-G4): OPERATIONS.md documents run liveness as the supervisor
-/// socket answers it (GONE / STALE / ALIVE and the repair verbs), `devflow
-/// stop`'s arms including the backstop's refusal and its inspection command,
-/// the socket location's override, and both internal subcommands, outside
-/// HTML comments.
+/// socket answers it (GONE / STALE / ALIVE and the repair verbs), the socket
+/// location's override, and both internal subcommands, outside HTML comments.
 #[test]
 fn operations_md_documents_run_liveness_and_the_stop_arms() {
     let every: String = RUN_LIVENESS_FRAGMENTS.join("\n");
