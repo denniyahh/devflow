@@ -50,7 +50,9 @@ Two conditions on the host decide whether a run can outlive your session:
 - **A user manager.** On a host where no systemd user manager runs for you, or
   where this shell cannot reach it (`XDG_RUNTIME_DIR` unset or not your own),
   `start` and `resume` refuse with systemctl's error and write nothing. There
-  is no fallback launch.
+  is no fallback launch. The manager must be systemd 254 or later, the first
+  release whose `systemd-run` has `--expand-environment=no`; under an older one
+  `start` and `resume` refuse, name its version, and write nothing.
 
 ## Before you start: what the preflight checks
 
