@@ -2281,8 +2281,12 @@ pub(crate) fn resume_with_fallback(
     // The runner checks the agent binary again at each launch; checked here too, so a
     // resume that cannot run its agent fails now, re-marked stopped below, rather than
     // in a unit nobody watches.
+    // The stopped stage's capture is archived here, under the holder, as the runner's
+    // stage start would: until then `logs -f` would read its exit file as the resumed
+    // stage's.
     let launched =
         crate::preflight::ensure_agent_binary(crate::preflight::agent_program(state.agent))
+            .and_then(|()| archive_prior_capture(&state, None))
             .map_err(|err| err.to_string())
             .and_then(|()| crate::service::launch_runner_unit(project_root, phase));
     match launched {
@@ -4276,6 +4280,56 @@ mod tests {
             crate::service::double::launched_units().len(),
             1,
             "resume launched the runner unit"
+        );
+    }
+
+    /// `resume` archives the stopped stage's capture before it launches, so a
+    /// `devflow logs -f` started right after it never reads the old stage's exit code
+    /// as the resumed stage's. The archive is the one stage rollovers make: it is
+    /// recorded as a `capture_archived` event.
+    #[test]
+    fn resume_archives_the_stopped_stages_capture_before_launch() {
+        const NAME: &str =
+            "pipeline_launch::tests::resume_archives_the_stopped_stages_capture_before_launch";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_dir_with_agent_stub("codex");
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = PhaseId::new(70);
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
+        state.verification_baseline_captured = true;
+        state.stage = Stage::Plan;
+        state.stopped = true;
+        state.stop_reason = Some(runner_stop_reason(Some(StopSource::Signal(libc::SIGTERM))));
+        workflow::save_state(&state).unwrap();
+        let exit_file = agent_result::exit_code_path(root, phase);
+        std::fs::write(agent_result::stdout_path(root, phase), "old plan output\n").unwrap();
+        std::fs::write(&exit_file, "143\n").unwrap();
+
+        let result = resume(root, phase, None);
+
+        let _runners = crate::service::double::LaunchedRunners;
+
+        result.unwrap();
+
+        assert!(
+            !exit_file.exists(),
+            "resume left the stopped stage's exit file, which logs -f reads as the resumed \
+             stage's exit"
+        );
+        assert_eq!(
+            events_named(root, "capture_archived").len(),
+            1,
+            "the old capture was archived, not deleted"
         );
     }
 
