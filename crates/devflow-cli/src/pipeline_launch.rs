@@ -873,10 +873,6 @@ impl Drop for AutoChainGuard {
 /// (50-13, R-2).
 pub(crate) const ADVANCE_STOP_REASON: &str = "stopped through the supervisor during advance";
 
-/// The stop reason a foreground holder records when it stops at a safe point because
-/// `devflow stop` signalled it (D-18).
-pub(crate) const HOLDER_STOP_REASON: &str = "stopped by devflow stop at a foreground safe point";
-
 /// What an advance reads on this thread (50-13): its stop token, for the advance's
 /// safe points. One runner per phase holds the runner lock for the whole run (D-07),
 /// so its state writes need no fence.
@@ -888,7 +884,7 @@ thread_local! {
     /// Set only while [`StopTokenGuard`] is alive. Thread-local, not a
     /// process-global static, so parallel in-crate tests never share it; an
     /// advance run outside the runner (a test calling `advance_with` directly) sees
-    /// `None`, and its safe points read the holder's stop flag instead (D-18).
+    /// `None`, and its safe points never stop.
     static ENGAGED_ADVANCE: std::cell::RefCell<Option<EngagedAdvance>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -1003,40 +999,19 @@ fn stopped_at_safe_point(state: &mut State, safe_point: u8) -> Result<bool, CliE
 
 /// The test half of an advance safe point, for a caller that must clear
 /// something before it calls [`record_advance_stop`]: `true` when the
-/// engaged supervisor's stop has been requested (the run is then marked
-/// ended as a stop), or, outside a supervisor's advance, when this foreground holder
-/// caught a stop signal (D-18). `false` with neither.
+/// engaged token's stop has been requested (the run is then marked ended as a stop).
+/// A thread with no engaged token never stops here: the runner, the one process that
+/// catches stop signals, engages its token before its first advance.
 pub(crate) fn stop_requested_at_safe_point() -> bool {
-    with_stop_token(StopToken::safe_point) == Some(SafePoint::StopHere) || holder_stop_requested()
-}
-
-/// Whether this thread runs outside a supervisor's advance in a process whose D-18
-/// handler caught a stop signal. A supervisor's own token always decides inside its
-/// advance.
-fn holder_stop_requested() -> bool {
-    with_stop_token(|_| ()).is_none() && devflow_core::liveness::holder_stop_signal().is_some()
-}
-
-/// The reason a stop at a safe point on this thread records: [`ADVANCE_STOP_REASON`]
-/// inside a supervisor's advance, [`HOLDER_STOP_REASON`] anywhere else (D-18).
-pub(crate) fn safe_point_stop_reason() -> &'static str {
-    if with_stop_token(|_| ()).is_some() {
-        ADVANCE_STOP_REASON
-    } else {
-        HOLDER_STOP_REASON
-    }
+    with_stop_token(StopToken::safe_point) == Some(SafePoint::StopHere)
 }
 
 /// Persist a stop an advance honoured at `safe_point`: `stopped` with
-/// [`safe_point_stop_reason`] and `gate_pending` cleared in one write, and an
-/// `advance_stopped` event naming the point and whose stop it was.
+/// [`ADVANCE_STOP_REASON`] and `gate_pending` cleared in one write, and an
+/// `advance_stopped` event naming the point.
 pub(crate) fn record_advance_stop(state: &mut State, safe_point: u8) -> Result<(), CliError> {
-    let reason = safe_point_stop_reason();
-    let source = if with_stop_token(|_| ()).is_some() {
-        "supervisor"
-    } else {
-        "foreground_holder"
-    };
+    let reason = ADVANCE_STOP_REASON;
+    let source = "supervisor";
     commit(state, |s| {
         s.stopped = true;
         s.stop_reason = Some(reason.to_string());
@@ -1071,8 +1046,8 @@ pub(crate) enum GateWaitEnd {
 /// (D-04, D-05). It holds no write lock. Inside a supervisor's advance the run is
 /// `GateWait` for the wait and `Advancing` again after it, and the wait is cancelled
 /// by the supervisor's stop token, so a SIGTERM/SIGINT or socket stop ends it within
-/// about a second as [`GateWaitEnd::Stopped`]. Anywhere else (the hidden `devflow
-/// advance`, a foreground gate) the holder's stop flag cancels it the same way (D-18).
+/// about a second as [`GateWaitEnd::Stopped`]. With no engaged token no stop cancels
+/// it: only the runner catches stop signals, and it engages its token first.
 ///
 /// # Errors
 /// A file in this gate's slot that does not bind to it could not be set aside, because
@@ -1089,18 +1064,9 @@ pub(crate) fn wait_for_gate_response(
     if let Some(token) = &token {
         token.enter(OwnerPhase::GateWait);
     }
-    let outcome =
-        await_bound_answer(
-            project_root,
-            phase,
-            stage,
-            gate_id,
-            timeout_secs,
-            || match &token {
-                Some(token) => token.stop_requested(),
-                None => devflow_core::liveness::holder_stop_signal().is_some(),
-            },
-        );
+    let outcome = await_bound_answer(project_root, phase, stage, gate_id, timeout_secs, || {
+        token.as_ref().is_some_and(StopToken::stop_requested)
+    });
     if let Some(token) = &token {
         token.enter(OwnerPhase::Advancing);
     }
