@@ -10,7 +10,7 @@ set -euo pipefail
 
 usage() {
     cat >&2 <<'EOF'
-usage: scripts/check.sh [all|fmt|clippy|test|build|deps]
+usage: scripts/check.sh [all|fmt|clippy|test|build|deps|service]
 
   all     fmt + clippy + test   (default)
   build   compile workspace and tests only
@@ -19,6 +19,9 @@ usage: scripts/check.sh [all|fmt|clippy|test|build|deps]
   test    cargo test --workspace
   deps    cargo deny check + cargo machete (not in `all`; install the tools
           with scripts/install-dep-tools.sh)
+  service the host-only systemd user-unit tests (service_e2e, --run-ignored
+          only; not in `all`; needs a running systemd user manager and
+          cargo-nextest, and fails rather than skips without either)
 
 Run inside the pinned devcontainer for CI parity:
   scripts/check-in-container.sh [target]
@@ -83,6 +86,27 @@ run_deps() {
     cargo machete
 }
 
+run_service() {
+    # Not part of `all`: the pinned devcontainer has no systemd user manager, so
+    # these tests can only run on a host or a VM (D-07b). A missing manager is a
+    # hard error, never a skip. The probe sits inside `if !` because under
+    # `set -e` a bare failing substitution would end the script before the
+    # message below is printed.
+    local out
+    if ! out=$(systemctl --user show -p Version --value 2>&1); then
+        echo "error: no systemd user manager answers (systemctl --user show -p Version failed); scripts/check.sh service needs one" >&2
+        echo "$out" >&2
+        exit 1
+    fi
+    if ! command -v cargo-nextest >/dev/null 2>&1; then
+        echo "error: cargo-nextest is not installed; scripts/check.sh service needs it (cargo install --locked cargo-nextest)" >&2
+        exit 1
+    fi
+    # --no-tests=fail: a filter that matches nothing must not read as a pass.
+    echo "==> cargo nextest run -p devflow --test service_e2e --run-ignored only --no-tests=fail"
+    cargo nextest run -p devflow --test service_e2e --run-ignored only --no-tests=fail
+}
+
 case "$TARGET" in
     all)
         # Cheapest first: fail on formatting before paying for a compile.
@@ -95,6 +119,7 @@ case "$TARGET" in
     test) run_test ;;
     build) run_build ;;
     deps) run_deps ;;
+    service) run_service ;;
     -h | --help | help) usage ;;
     *)
         echo "error: unknown target '$TARGET'" >&2

@@ -299,6 +299,13 @@ warnings` does not compile test targets, so lints inside `#[cfg(test)]`
 modules pass it and then fail CI. Regression guards for this live in
 `crates/devflow-cli/tests/devcontainer_ci_failfast.rs`.
 
+`scripts/check.sh service` runs the host-only tests that start real systemd
+user units (`crates/devflow-cli/tests/service_e2e.rs`, which are `#[ignore]`
+so the container suite skips them). It is not part of `all`, because the
+pinned container has no user manager. It needs a running systemd user manager
+and `cargo-nextest`, and fails, naming what is missing, when either is absent:
+it never skips.
+
 Ordinary code contributions need no agent credentials or API keys — the build
 and the full test suite run offline. Agent CLIs (Claude, Codex, OpenCode) are
 only needed to exercise `devflow start` against a live agent, not to build,
