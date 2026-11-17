@@ -1493,18 +1493,21 @@ fn remove_run_state_with_worktree(project_root: &Path, state: &State, removed: &
     }
 }
 
-/// `devflow discard --phase N`: remove the phase's worktree, its run state and its
-/// feature branch, after listing them.
+/// `devflow discard --phase N`: remove the phase's worktree, its run state, its
+/// feature branch, and the debris a killed run can leave (its gate files and hold
+/// temps, D-06), after listing them.
 ///
 /// The worktree and the state are the derived `.worktrees/phase-NN` and
 /// `.devflow/state-NN.json`, never a path read from the state, and the branch is the
 /// derived `feature/phase-NN`. The phase's foreground holder is held from the first
-/// check to the last removal, so a `start` cannot begin in between.
+/// check to the last removal, so a `start` cannot begin in between. The lock files
+/// `.holder-NN` and `.runner-NN` are never removed.
 ///
 /// Every refusal comes before the first removal: a run that is live or may be
-/// ([`phase_run_liveness`]), whatever [`discard_items`] cannot account for, a phase
-/// with nothing to discard, a branch another checkout holds, and an unmerged branch
-/// that `delete_unmerged_branch` does not name.
+/// ([`phase_run_liveness`]), whatever [`discard_items`] cannot account for, a gate
+/// whose waiter is live ([`discard_debris`]), a phase with nothing to discard, a
+/// branch another checkout holds, and an unmerged branch that `delete_unmerged_branch`
+/// does not name.
 pub(crate) fn discard(
     project_root: &Path,
     phase: PhaseId,
@@ -1527,16 +1530,210 @@ pub(crate) fn discard(
     let liveness = discard_waits_out_a_stopping_unit(project_root, phase, &existing, liveness)?;
     refuse_discard_of_a_live_run(phase, &existing, liveness)?;
     let items = discard_items(project_root, phase, &existing, &git, base)?;
-    if items.worktree.is_none() && items.state.is_none() && items.unmerged.is_none() {
+    let debris = discard_debris(project_root, phase)?;
+    if items.worktree.is_none()
+        && items.state.is_none()
+        && items.unmerged.is_none()
+        && debris.is_empty()
+    {
         return Err(CliError::Message(format!(
-            "discard refused: phase {phase} has no run state, worktree or branch; nothing to \
-             discard"
+            "discard refused: phase {phase} has no run state, worktree or branch, and no gate \
+             file or hold temp; nothing to discard"
         )));
     }
-    print_discard_listing(phase, &items);
+    print_discard_listing(phase, &items, &debris);
     refuse_discard_of_a_checked_out_branch(phase, &items)?;
     refuse_discard_of_branch(phase, &items, delete_unmerged_branch)?;
-    remove_discarded(project_root, phase, &git, &items)
+    let removed = remove_discarded(project_root, phase, &git, &items);
+    let debris_removed = remove_discarded_debris(project_root, phase, &debris);
+    removed.and(debris_removed)
+}
+
+/// The suffix of a gate's waiter registration, `NN-{stage}.{gate_id}.waiter`: the
+/// name `devflow_core::gates` gives it.
+const GATE_WAITER_SUFFIX: &str = ".waiter";
+
+/// The suffix of an answer set aside rather than consumed or deleted. A close keeps
+/// every one (D-05), so discard neither lists nor removes one.
+const GATE_QUARANTINED_SUFFIX: &str = ".quarantined.json";
+
+/// What a killed run can leave for a phase beside its worktree, state and branch
+/// (D-06), each removed by [`remove_discarded_debris`].
+#[derive(Default)]
+struct DiscardDebris {
+    /// The stages with gate files, each closed through [`Gates::close`].
+    gate_stages: Vec<Stage>,
+    /// The phase's files in the gates directory: requests, answers, claims, unheld
+    /// waiter registrations and write temps. Set-aside answers are not among them.
+    gate_files: Vec<PathBuf>,
+    /// The phase's hold temps in `.devflow/` and in the gates directory.
+    hold_temps: Vec<PathBuf>,
+}
+
+impl DiscardDebris {
+    fn is_empty(&self) -> bool {
+        self.gate_files.is_empty() && self.hold_temps.is_empty()
+    }
+}
+
+/// Read the phase's gate files and hold temps, removing nothing. Refuses a gate whose
+/// waiter registration is held, or cannot be probed: something may still wait on it
+/// (T-52.2-22). The lock files `.holder-NN` and `.runner-NN` are never listed.
+fn discard_debris(project_root: &Path, phase: PhaseId) -> Result<DiscardDebris, CliError> {
+    let gates = Gates::dir(project_root);
+    let gate_prefix = format!("{}-", phase.padded());
+    let mut debris = DiscardDebris::default();
+    for name in file_names(&gates)? {
+        let path = gates.join(&name);
+        if let Some(final_name) = hold_temp_final_name(&name) {
+            if final_name.starts_with(&gate_prefix) {
+                debris.hold_temps.push(path);
+            }
+            continue;
+        }
+        let Some(rest) = name
+            .strip_prefix('.')
+            .unwrap_or(&name)
+            .strip_prefix(&gate_prefix)
+        else {
+            continue;
+        };
+        let Some(stage) = rest.split('.').next().and_then(|s| s.parse::<Stage>().ok()) else {
+            continue;
+        };
+        if name.ends_with(GATE_QUARANTINED_SUFFIX) {
+            continue;
+        }
+        if name.ends_with(GATE_WAITER_SUFFIX) {
+            refuse_discard_of_a_live_waiter(phase, stage, &path)?;
+        }
+        if !debris.gate_stages.contains(&stage) {
+            debris.gate_stages.push(stage);
+        }
+        debris.gate_files.push(path);
+    }
+    let devflow = workflow::devflow_dir(project_root);
+    let locks = [
+        liveness::phase_holder_path(project_root, phase),
+        liveness::runner_lock_path(project_root, phase),
+    ];
+    for name in file_names(&devflow)? {
+        let Some(final_name) = hold_temp_final_name(&name) else {
+            continue;
+        };
+        if locks
+            .iter()
+            .any(|lock| lock.file_name().is_some_and(|lock| lock == final_name))
+        {
+            debris.hold_temps.push(devflow.join(&name));
+        }
+    }
+    debris.gate_files.sort();
+    debris.hold_temps.sort();
+    Ok(debris)
+}
+
+/// The final name a hold temp `.{final_name}.{pid}.{seq}.hold-tmp` is taken for;
+/// `None` for any other name.
+fn hold_temp_final_name(name: &str) -> Option<&str> {
+    let mut fields = name
+        .strip_suffix(liveness::HOLD_TEMP_SUFFIX)?
+        .rsplitn(3, '.');
+    fields.next()?;
+    fields.next()?;
+    fields.next()?.strip_prefix('.')
+}
+
+/// Refuse discard when the waiter registration at `path` is held, or cannot be probed.
+fn refuse_discard_of_a_live_waiter(
+    phase: PhaseId,
+    stage: Stage,
+    path: &Path,
+) -> Result<(), CliError> {
+    let why = match liveness::probe(path) {
+        Ok(liveness::Held::Live) => "a live waiter".to_string(),
+        Ok(liveness::Held::Abandoned | liveness::Held::Missing) => return Ok(()),
+        Err(error) => format!("a waiter registration that could not be probed ({error})"),
+    };
+    Err(CliError::Message(format!(
+        "refusing to discard phase {phase} — its {stage} gate has {why} ({}), so something \
+         may still wait on it; run `devflow status` to see the run and end it, then run \
+         `devflow discard --phase {phase}` again; nothing was removed",
+        path.display()
+    )))
+}
+
+/// Remove what [`discard_debris`] found: each stage's gate files through
+/// [`Gates::close`], then the hold temps whose creator died through
+/// [`liveness::remove_orphan_hold_temps`]. A `removed` line for each file gone, a
+/// `warning:` line for each failure, and an error when any failed. A hold temp whose
+/// creator may still run is kept and named; that is not a failure.
+fn remove_discarded_debris(
+    project_root: &Path,
+    phase: PhaseId,
+    debris: &DiscardDebris,
+) -> Result<(), CliError> {
+    let mut failed = false;
+    for stage in &debris.gate_stages {
+        match Gates::close(project_root, phase, *stage) {
+            Ok(report) => {
+                for moved in report.quarantined {
+                    println!(
+                        "set aside an unclaimed answer of phase {phase} {stage} as {}; \
+                         set-aside answers are kept",
+                        moved.display()
+                    );
+                }
+            }
+            Err(err) => {
+                failed = true;
+                println!(
+                    "warning: could not remove the {stage} gate files of phase {phase}: {err}"
+                );
+            }
+        }
+    }
+    for path in &debris.gate_files {
+        if path.exists() {
+            failed = true;
+            println!("warning: the gate file {} is still there", path.display());
+        } else {
+            println!("removed gate file {}", path.display());
+        }
+    }
+    if !debris.hold_temps.is_empty() {
+        for dir in [
+            workflow::devflow_dir(project_root),
+            Gates::dir(project_root),
+        ] {
+            match liveness::remove_orphan_hold_temps(&dir) {
+                Ok(removed) => {
+                    for path in removed {
+                        println!("removed hold temp {}", path.display());
+                    }
+                }
+                Err(err) => {
+                    failed = true;
+                    println!(
+                        "warning: could not sweep the hold temps in {}: {err}",
+                        dir.display()
+                    );
+                }
+            }
+        }
+    }
+    for path in debris.hold_temps.iter().filter(|path| path.exists()) {
+        println!(
+            "kept hold temp {}: its creator may still run or it is held",
+            path.display()
+        );
+    }
+    if failed {
+        return Err(CliError::Message(format!(
+            "discard could not remove every gate file of phase {phase} — see the warnings above"
+        )));
+    }
+    Ok(())
 }
 
 /// D-07a: a unit that is not yet inactive while the runner lock is free is waited on,
@@ -2261,7 +2458,7 @@ fn same_path(left: &Path, right: &Path) -> bool {
 }
 
 /// Discard's listing of what it will remove (D-09.2), printed before any removal.
-fn print_discard_listing(phase: PhaseId, items: &DiscardItems) {
+fn print_discard_listing(phase: PhaseId, items: &DiscardItems, debris: &DiscardDebris) {
     println!("discard: phase {phase} — to be removed:");
     if let Some((path, uncommitted)) = &items.worktree {
         let changes = match uncommitted {
@@ -2283,6 +2480,15 @@ fn print_discard_listing(phase: PhaseId, items: &DiscardItems) {
             count => unmerged_commits(count, &items.base),
         };
         println!("  branch {} ({merged})", items.branch);
+    }
+    for path in &debris.gate_files {
+        println!("  gate file {}", path.display());
+    }
+    for path in &debris.hold_temps {
+        println!(
+            "  hold temp {} (kept if its creator still runs)",
+            path.display()
+        );
     }
 }
 
