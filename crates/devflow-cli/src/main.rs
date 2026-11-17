@@ -562,7 +562,14 @@ fn run() -> Result<(), CliError> {
             true,
         ),
         Command::Runner { project, phase } => {
-            pipeline_launch::run_runner(&project_root(project)?, phase)
+            match pipeline_launch::run_runner(&project_root(project)?, phase)? {
+                0 => Ok(()),
+                code => {
+                    use std::io::Write as _;
+                    let _ = std::io::stdout().flush();
+                    std::process::exit(code)
+                }
+            }
         }
         Command::Resume {
             phase,

@@ -1691,7 +1691,7 @@ fn launch_label(launch: &monitor::MonitorLaunch) -> &'static str {
 /// [`StopToken`] for the whole run), advances, and runs each stage the advance hands
 /// back, until there is none. Any error ends the runner non-zero with the error on
 /// stderr. No agent is spawned and no gate is waited on inside a state-write closure.
-pub(crate) fn run_runner(project_root: &Path, phase: PhaseId) -> Result<(), CliError> {
+pub(crate) fn run_runner(project_root: &Path, phase: PhaseId) -> Result<i32, CliError> {
     devflow_core::supervisor::runtime::install_signal_pipe().map_err(|err| {
         CliError::Message(format!(
             "the runner could not install its stop handling: {err}"
@@ -1704,37 +1704,187 @@ pub(crate) fn run_runner(project_root: &Path, phase: PhaseId) -> Result<(), CliE
             "the runner could not report ready to systemd: {err}"
         ))
     })?;
+    // Before the first launch, for the runner's whole life: every launch the chain
+    // resolves comes back here instead of spawning a detached `__monitor`.
+    let _runner_loop = RunnerLoop::engage();
     let token = StopToken::for_run();
     let mut state = workflow::load_state(project_root, phase)?;
-    let mut next = launch_stage_next(&mut state, None, None)?;
+    let first = launch_stage_next(&mut state, None, None);
+    let mut next = settle_advance(project_root, phase, first)?;
     while let Some(launch) = next {
-        begin_runner_stage(&launch)?;
-        let stage = launch.state.stage;
-        let auto_chain_guard = match launch.launch {
-            monitor::MonitorLaunch::PipeOwning { .. } => Some(AutoChainGuard::engage(
-                launch
-                    .state
-                    .worktree_path
-                    .as_deref()
-                    .unwrap_or(&launch.state.project_root),
-                auto_chain_flag_eligible(stage, launch.state.mode),
-            )),
-            monitor::MonitorLaunch::Legacy => None,
-        };
-        let spec = runner_stage_spec(launch)?;
-        let outcome = monitor::run_stage(spec, &token).map_err(|err| {
-            CliError::Message(format!("phase {phase}: stage {stage} did not run: {err}"))
-        })?;
-        // Before the advance, as `run_monitor` drops it: the flag lives as long as the
-        // agent does.
-        drop(auto_chain_guard);
-        if outcome == AgentOutcome::Stopped {
-            eprintln!("phase {phase}: stage {stage} was stopped; nothing advances");
-            return Ok(());
-        }
-        next = advance_for_stage_next(project_root, phase, Some(stage))?;
+        let result = run_one_stage(project_root, phase, launch, &token)?;
+        next = settle_advance(project_root, phase, result)?;
     }
-    Ok(())
+    Ok(runner_exit_code(
+        workflow::load_state(project_root, phase).ok().as_ref(),
+    ))
+}
+
+/// Read one advance result in the runner's fixed order (review r3 codex-2 + agy-2): a
+/// state on disk that reads finished ends the loop and writes nothing, since a permitted
+/// finish wins over a late stop ([`runner_exit_code`] then reads 0); then (from 52.2-05)
+/// a stop requested on the run's token; then an `Err` is a failed advance
+/// ([`recover_failed_advance`]); otherwise the result feeds the loop.
+fn settle_advance(
+    project_root: &Path,
+    phase: PhaseId,
+    result: Result<Option<StageLaunch>, CliError>,
+) -> Result<Option<StageLaunch>, CliError> {
+    if workflow::load_state(project_root, phase).is_ok_and(|state| state.finished) {
+        return Ok(None);
+    }
+    match result {
+        Ok(next) => Ok(next),
+        Err(err) => recover_failed_advance(project_root, phase, &err),
+    }
+}
+
+/// Run one handed-back stage in this process and advance past it: the advance's result,
+/// or, when the stage could not be started, the result of routing that failure through
+/// [`handle_infra_outcome`] after [`failed_start`]'s event (never silent, W-2).
+fn run_one_stage(
+    project_root: &Path,
+    phase: PhaseId,
+    launch: StageLaunch,
+    token: &StopToken,
+) -> Result<Result<Option<StageLaunch>, CliError>, CliError> {
+    if let Err(err) = begin_runner_stage(&launch) {
+        return Ok(Err(err));
+    }
+    let stage = launch.state.stage;
+    let agent = launch.state.agent;
+    let relaunch = launch.relaunch.clone();
+    let auto_chain_guard = match launch.launch {
+        monitor::MonitorLaunch::PipeOwning { .. } => Some(AutoChainGuard::engage(
+            launch
+                .state
+                .worktree_path
+                .as_deref()
+                .unwrap_or(&launch.state.project_root),
+            auto_chain_flag_eligible(stage, launch.state.mode),
+        )),
+        monitor::MonitorLaunch::Legacy => None,
+    };
+    let ran = runner_stage_spec(launch).and_then(|spec| {
+        monitor::run_stage(spec, token).map_err(|err| CliError::Message(err.to_string()))
+    });
+    // Before the advance, as `run_monitor` drops it: the flag lives as long as the
+    // agent does.
+    drop(auto_chain_guard);
+    let outcome = match ran {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            let (event, payload, reason) =
+                failed_start(stage, agent, relaunch.as_ref(), &err.to_string());
+            events::emit(project_root, phase, event, payload);
+            let mut state = workflow::load_state(project_root, phase)?;
+            return Ok(handle_infra_outcome(
+                project_root,
+                &mut state,
+                stage,
+                Some(reason),
+            ));
+        }
+    };
+    if outcome == AgentOutcome::Stopped {
+        eprintln!("phase {phase}: stage {stage} was stopped; nothing advances");
+        return Ok(Ok(None));
+    }
+    Ok(advance_for_stage_next(project_root, phase, Some(stage)))
+}
+
+/// Route an `Err` out of a launch preparation or an advance (a missing agent binary at
+/// the next stage, say) through [`failed_advance`]'s event and [`handle_infra_outcome`]
+/// for the stage the state on disk now records (review r2 codex-6). Its result feeds the
+/// loop; an `Err` from it, or a state that no longer reads, ends the runner non-zero.
+fn recover_failed_advance(
+    project_root: &Path,
+    phase: PhaseId,
+    err: &CliError,
+) -> Result<Option<StageLaunch>, CliError> {
+    let mut state = workflow::load_state(project_root, phase).map_err(|load_err| {
+        CliError::Message(format!(
+            "phase {phase}: {err}; the runner could not read the state to gate it: {load_err}"
+        ))
+    })?;
+    let stage = state.stage;
+    let (event, payload, reason) = failed_advance(phase, stage, state.agent, &err.to_string());
+    events::emit(project_root, phase, event, payload);
+    handle_infra_outcome(project_root, &mut state, stage, Some(reason))
+}
+
+/// The event, its payload and the infra reason for a stage the runner could not start
+/// (W-2). With `relaunch` it is the handoff's `agent_handoff_relaunch_failed`, with the
+/// keys and reason text [`fail_over_on_rate_limit`] has always written, so the two paths
+/// cannot drift; without one it is `stage_launch_failed`.
+fn failed_start(
+    stage: Stage,
+    agent: AgentKind,
+    relaunch: Option<&HandoffRelaunch>,
+    error: &str,
+) -> (&'static str, serde_json::Value, String) {
+    match relaunch {
+        Some(HandoffRelaunch {
+            from,
+            to,
+            rate_limit,
+        }) => {
+            let rate_limit = rate_limit.as_deref().unwrap_or("no reason given");
+            (
+                "agent_handoff_relaunch_failed",
+                serde_json::json!({
+                    "stage": stage.to_string(),
+                    "from_agent": from.to_string(),
+                    "to_agent": to.to_string(),
+                    "reason": error,
+                }),
+                format!(
+                    "the handoff to {to} could not relaunch the {stage} stage: {error} \
+                     (after the rate limit: {rate_limit})"
+                ),
+            )
+        }
+        None => (
+            "stage_launch_failed",
+            serde_json::json!({
+                "stage": stage.to_string(),
+                "agent": agent.to_string(),
+                "error": error,
+            }),
+            format!("the runner could not start the {stage} agent: {error}"),
+        ),
+    }
+}
+
+/// The event, its payload and the infra reason for a launch preparation or advance the
+/// runner could not complete (review r2 codex-6): `runner_advance_failed`.
+fn failed_advance(
+    phase: PhaseId,
+    stage: Stage,
+    agent: AgentKind,
+    error: &str,
+) -> (&'static str, serde_json::Value, String) {
+    (
+        "runner_advance_failed",
+        serde_json::json!({
+            "stage": stage.to_string(),
+            "agent": agent.to_string(),
+            "error": error,
+        }),
+        format!("the runner could not advance phase {phase} at the {stage} stage: {error}"),
+    )
+}
+
+/// The runner's exit code for the state on disk after its loop (review r2 agy-3): 0 for
+/// a run that reads finished, or stopped at its `--until` stage (transition's clean stop
+/// leaves `stage` at the stage that completed, with `stop_until == Some(stage)`); 1 when
+/// the state is absent (an abort cleared it), stopped any other way, or anything else.
+fn runner_exit_code(state: Option<&State>) -> i32 {
+    match state {
+        Some(state) if state.finished => 0,
+        Some(state) if state.stopped && state.stop_until == Some(state.stage) => 0,
+        _ => 1,
+    }
 }
 
 /// What the runner does before each [`monitor::run_stage`], in place of what the
@@ -2207,7 +2357,7 @@ thread_local! {
 /// set). While it is engaged, [`refuse_launch`] and [`record_failed_launch`] keep
 /// `state.supervisor`, so the never-silent end that follows a failed relaunch is a
 /// set of owned writes by the supervisor the state records (Phase 50 D-03 unchanged).
-/// Engaged only around the `launch_stage` call in [`fail_over_on_rate_limit`], which
+/// Engaged only around the `launch_stage_next` call in [`fail_over_on_rate_limit`], which
 /// includes its `run_preflight` and any launch a preflight gate's answer starts there.
 struct FailoverRelaunchGuard {
     /// Keeps the guard on the thread whose flag it set.
@@ -2232,6 +2382,62 @@ impl Drop for FailoverRelaunchGuard {
 /// Whether a [`FailoverRelaunchGuard`] is engaged on this thread.
 fn in_failover_relaunch() -> bool {
     FAILOVER_RELAUNCH.with(std::cell::Cell::get)
+}
+
+thread_local! {
+    /// Set while [`run_runner`]'s loop drives this thread ([`RunnerLoop`]).
+    static RUNNER_LOOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Marks this thread as the foreground runner's loop for as long as the guard lives
+/// (RAII, shaped like [`FailoverRelaunchGuard`]). While it is engaged,
+/// [`hand_back_or_spawn`] hands every resolved launch back up the chain to
+/// [`run_runner`] instead of spawning a detached `__monitor` (D-02, RESEARCH Pattern 5).
+/// Only [`run_runner`] engages it, before its first launch, for its whole life.
+struct RunnerLoop {
+    /// Keeps the guard on the thread whose flag it set.
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl RunnerLoop {
+    fn engage() -> Self {
+        RUNNER_LOOP.with(|engaged| engaged.set(true));
+        Self {
+            _not_send: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for RunnerLoop {
+    fn drop(&mut self) {
+        RUNNER_LOOP.with(|engaged| engaged.set(false));
+    }
+}
+
+/// Where every resolved launch in the advance chain ends: handed back as
+/// `Some(launch)` while a [`RunnerLoop`] is engaged, so the runner runs it in its own
+/// process; otherwise spawned under a detached `__monitor` through [`spawn_supervised`]
+/// exactly as before, and `None` is returned.
+fn hand_back_or_spawn(
+    state: &mut State,
+    launch: StageLaunch,
+) -> Result<Option<StageLaunch>, CliError> {
+    if RUNNER_LOOP.with(std::cell::Cell::get) {
+        return Ok(Some(launch));
+    }
+    spawn_supervised(state, launch).map(|()| None)
+}
+
+/// The rate-limit handoff a [`StageLaunch`] relaunches the stage after (SUPV-02), so a
+/// runner that cannot start it names the handoff ([`failed_start`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HandoffRelaunch {
+    /// The agent that hit the rate limit.
+    pub(crate) from: AgentKind,
+    /// The fallback the stage was handed to.
+    pub(crate) to: AgentKind,
+    /// The rate-limit reason the handoff followed, when the outcome gave one.
+    pub(crate) rate_limit: Option<String>,
 }
 
 thread_local! {
@@ -2320,9 +2526,9 @@ fn spawn_agent_and_record(
     extra_env: &[(String, String)],
     archived_stage: Option<Stage>,
     launch: monitor::MonitorLaunch,
-) -> Result<(), CliError> {
+) -> Result<Option<StageLaunch>, CliError> {
     let launch = stage_launch(state, program, args, extra_env, archived_stage, launch)?;
-    spawn_supervised(state, launch)
+    hand_back_or_spawn(state, launch)
 }
 
 /// One stage launch, resolved and not yet spawned: exactly what
@@ -2343,6 +2549,9 @@ pub(crate) struct StageLaunch {
     pub(crate) archived_stage: Option<Stage>,
     /// The supervision shape.
     pub(crate) launch: monitor::MonitorLaunch,
+    /// The rate-limit handoff this launch relaunches the stage after, set only by
+    /// [`fail_over_on_rate_limit`].
+    pub(crate) relaunch: Option<HandoffRelaunch>,
 }
 
 /// Persist the caller's launch bookkeeping (`launch_stage_inner`'s `checkpoint_resumes`
@@ -2368,6 +2577,7 @@ fn stage_launch(
         extra_env: extra_env.to_vec(),
         archived_stage,
         launch,
+        relaunch: None,
     })
 }
 
@@ -3009,7 +3219,7 @@ pub(crate) fn recorded_approval(current: &[CheckpointDeclaration]) -> Checkpoint
 pub(crate) fn relaunch_checkpoint_session(
     state: &mut State,
     session_id: &str,
-) -> Result<(), CliError> {
+) -> Result<Option<StageLaunch>, CliError> {
     state.checkpoint_resumes = state.checkpoint_resumes.saturating_add(1);
     let instruction = prompt::checkpoint_auto_decide_prompt(state.phase);
 
@@ -3087,8 +3297,9 @@ pub(crate) fn launch_stage(
     }
 }
 
-/// [`launch_stage`]'s body up to the spawn: the [`StageLaunch`] for `state.stage`, or
-/// `None` when the preflight gate already resolved the launch (CR-01 below).
+/// [`launch_stage`]'s body: the [`StageLaunch`] for `state.stage`, handed back while a
+/// [`RunnerLoop`] is engaged ([`hand_back_or_spawn`]); `None` once it was spawned outside
+/// one, or when the preflight gate already resolved the launch (CR-01 below).
 pub(crate) fn launch_stage_next(
     state: &mut State,
     prompt_override: Option<String>,
@@ -3128,7 +3339,8 @@ pub(crate) fn launch_stage_next(
     // Rendered again after the preflight, as `launch_stage_inner` always has: the gate
     // can change what the default prompt says.
     let prompt = prompt_override.unwrap_or_else(|| default_stage_prompt(state, driver.as_ref()));
-    prepare_stage_launch(state, prompt, archived_stage).map(Some)
+    let launch = prepare_stage_launch(state, prompt, archived_stage)?;
+    hand_back_or_spawn(state, launch)
 }
 
 /// Route an `Ambiguous` outcome from the PRIMARY advance() monitor loop
@@ -3148,7 +3360,7 @@ pub(crate) fn handle_ambiguous_outcome(
     state: &mut State,
     stage: Stage,
     reason: Option<String>,
-) -> Result<(), CliError> {
+) -> Result<Option<StageLaunch>, CliError> {
     commit(state, |s| {
         s.infra_failures = s.infra_failures.saturating_add(1)
     })?;
@@ -3171,7 +3383,7 @@ pub(crate) fn handle_ambiguous_outcome(
     // stage prompt, re-archives the prior (torn) capture, and spawns a fresh
     // monitor for `state.stage` — unchanged, since this outcome did not
     // advance. `Some(stage)` names the archived capture correctly.
-    launch_stage(state, None, Some(stage))
+    launch_stage_next(state, None, Some(stage))
 }
 
 /// The agent a rate limit at `stage` hands off to (SUPV-02), or `None` when the
@@ -3354,41 +3566,34 @@ fn fail_over_on_rate_limit(
     stage: Stage,
     to: AgentKind,
     reason: Option<String>,
-) -> Result<(), CliError> {
+) -> Result<Option<StageLaunch>, CliError> {
     match hand_off_agent(project_root, state, to, HandoffReason::RateLimited)? {
         HandoffOutcome::HandedOff { from } => {
             #[cfg(test)]
             test_hold("after_failover_commit");
+            let relaunch = HandoffRelaunch {
+                from,
+                to,
+                rate_limit: reason,
+            };
             let relaunched = {
                 let _keep_record = FailoverRelaunchGuard::engage();
-                launch_stage(state, None, Some(stage))
+                launch_stage_next(state, None, Some(stage))
             };
             match relaunched {
-                Ok(()) => Ok(()),
+                // Inside the runner the launch comes back here: it carries the handoff,
+                // so a start the runner cannot make names it (`failed_start`).
+                Ok(Some(mut launch)) => {
+                    launch.relaunch = Some(relaunch);
+                    Ok(Some(launch))
+                }
+                Ok(None) => Ok(None),
                 Err(err) if is_not_owner(&err) => Err(err),
                 Err(err) => {
-                    let error = err.to_string();
-                    events::emit(
-                        project_root,
-                        phase,
-                        "agent_handoff_relaunch_failed",
-                        serde_json::json!({
-                            "stage": stage.to_string(),
-                            "from_agent": from.to_string(),
-                            "to_agent": to.to_string(),
-                            "reason": error,
-                        }),
-                    );
-                    let rate_limit = reason.as_deref().unwrap_or("no reason given");
-                    handle_infra_outcome(
-                        project_root,
-                        state,
-                        stage,
-                        Some(format!(
-                            "the handoff to {to} could not relaunch the {stage} stage: {error} \
-                             (after the rate limit: {rate_limit})"
-                        )),
-                    )
+                    let (event, payload, infra_reason) =
+                        failed_start(stage, state.agent, Some(&relaunch), &err.to_string());
+                    events::emit(project_root, phase, event, payload);
+                    handle_infra_outcome(project_root, state, stage, Some(infra_reason))
                 }
             }
         }
@@ -3886,26 +4091,33 @@ pub(crate) fn advance_for_stage(
     stage: Option<Stage>,
 ) -> Result<(), CliError> {
     let phase = resolve_advance_phase(project_root, phase)?;
-    advance_with(project_root, phase, stage)
+    match advance_with(project_root, phase, stage)? {
+        // Only a [`RunnerLoop`] hands a launch back, and none is engaged on this path;
+        // a launch that does come back is spawned as every launch here always was.
+        Some(launch) => {
+            let mut state = launch.state.clone();
+            spawn_supervised(&mut state, launch)
+        }
+        None => Ok(()),
+    }
 }
 
 /// [`advance_for_stage`] for the foreground runner: the next [`StageLaunch`] the advance
-/// hands back for the runner to run, or `None` when the run has nothing more to launch.
-/// The launches inside [`advance_with`]'s chain still spawn through the supervised path,
-/// so this is `None` whenever the advance returns.
+/// hands back for the runner to run, or `None` when the run has nothing more to launch
+/// (it finished, halted, aborted, or waits on nothing).
 pub(crate) fn advance_for_stage_next(
     project_root: &Path,
     phase: PhaseId,
     stage: Option<Stage>,
 ) -> Result<Option<StageLaunch>, CliError> {
-    advance_with(project_root, phase, stage).map(|()| None)
+    advance_with(project_root, phase, stage)
 }
 
 pub(crate) fn advance_with(
     project_root: &Path,
     phase: PhaseId,
     stage: Option<Stage>,
-) -> Result<(), CliError> {
+) -> Result<Option<StageLaunch>, CliError> {
     // No long lock (D-08): a fresh supervisor's advance is ordered behind its launcher's
     // publish by the promotion wait, and each write takes the state write lock for
     // itself. A duplicate advance of this phase is refused by stage binding below once
@@ -3914,7 +4126,7 @@ pub(crate) fn advance_with(
     // Safe point 1 (50-13): a stop taken while this supervisor waited for
     // its promotion ends the advance before it evaluates anything.
     if stopped_at_safe_point(&mut state, 1)? {
-        return Ok(());
+        return Ok(None);
     }
     #[cfg(test)]
     test_hold("after_safe_point_1");
@@ -4148,7 +4360,7 @@ pub(crate) fn advance_with(
                                 // cleanup, state clearing and deregistration
                                 // all happen exactly once and identically.
                                 crate::pipeline_outcomes::Answer::Abort(note) => {
-                                    return abort(project_root, &state, &note);
+                                    return abort(project_root, &state, &note).map(|()| None);
                                 }
                                 // T-48-15-03, D-39 (52-29): a reject is not an
                                 // answer to this gate and records nothing. The
@@ -14012,7 +14224,7 @@ mod tests {
         root: &Path,
         state: &mut State,
         note: &str,
-        fail: impl FnOnce(&Path, &mut State) -> Result<(), CliError>,
+        fail: impl FnOnce(&Path, &mut State) -> Result<Option<StageLaunch>, CliError>,
     ) -> (State, ReapMonitorOnDrop) {
         preanswer_gate_response(
             root,
@@ -18926,6 +19138,101 @@ mod tests {
             crate::pipeline_gate::rate_limit_timer_deadline(&unspent, &gate),
             gate.not_before,
             "control: the same gate over an unspent flag is armed"
+        );
+    }
+
+    /// Review r2 agy-3: the runner exits 0 only for a run that reads finished or stopped
+    /// at its `--until` stage. Every other row, including an absent state (an abort
+    /// cleared it), exits 1.
+    #[test]
+    fn the_runner_exit_code_is_zero_only_for_a_finished_or_until_halted_run() {
+        let root = std::path::PathBuf::from("/nonexistent/runner-exit-code");
+        let at = |stage: Stage, edit: &dyn Fn(&mut State)| {
+            let mut state = State::new(
+                PhaseId::new(1),
+                AgentKind::Codex,
+                Mode::Supervise,
+                root.clone(),
+            );
+            state.stage = stage;
+            edit(&mut state);
+            state
+        };
+        let finished = at(Stage::Validate, &|s| {
+            s.stopped = true;
+            s.finished = true;
+        });
+        let until_halt = at(Stage::Code, &|s| {
+            s.stopped = true;
+            s.stop_until = Some(Stage::Code);
+        });
+        let stopped_no_until = at(Stage::Code, &|s| s.stopped = true);
+        let stopped_other_until = at(Stage::Code, &|s| {
+            s.stopped = true;
+            s.stop_until = Some(Stage::Plan);
+        });
+        let gate_pending = at(Stage::Validate, &|s| s.gate_pending = true);
+        let running = at(Stage::Code, &|_| {});
+        let rows: [(&str, Option<&State>, i32); 7] = [
+            ("no state (an abort cleared it)", None, 1),
+            ("finished", Some(&finished), 0),
+            ("stopped at its --until stage", Some(&until_halt), 0),
+            ("stopped with no --until", Some(&stopped_no_until), 1),
+            (
+                "stopped with --until another stage",
+                Some(&stopped_other_until),
+                1,
+            ),
+            ("gate pending", Some(&gate_pending), 1),
+            ("running", Some(&running), 1),
+        ];
+        for (row, state, expected) in rows {
+            assert_eq!(
+                runner_exit_code(state),
+                expected,
+                "runner_exit_code row `{row}`"
+            );
+        }
+    }
+
+    /// W-2: a failed start names the handoff (`agent_handoff_relaunch_failed`, with the
+    /// keys and reason fail_over_on_rate_limit writes) only when the launch is a failover
+    /// relaunch; a plain launch's failed start is `stage_launch_failed`.
+    #[test]
+    fn a_failed_start_names_the_handoff_only_for_a_failover_relaunch() {
+        let relaunch = HandoffRelaunch {
+            from: AgentKind::Claude,
+            to: AgentKind::Codex,
+            rate_limit: Some("rate limited until 17:00".to_string()),
+        };
+        let (event, payload, reason) = failed_start(
+            Stage::Code,
+            AgentKind::Codex,
+            Some(&relaunch),
+            "spawn refused",
+        );
+        assert!(
+            event == "agent_handoff_relaunch_failed"
+                && payload["stage"] == "code"
+                && payload["from_agent"] == "claude"
+                && payload["to_agent"] == "codex"
+                && payload["reason"] == "spawn refused"
+                && reason
+                    == "the handoff to codex could not relaunch the code stage: spawn refused \
+                        (after the rate limit: rate limited until 17:00)",
+            "failover relaunch not named: {event} {payload} {reason}"
+        );
+
+        let (event, payload, reason) =
+            failed_start(Stage::Code, AgentKind::Codex, None, "spawn refused");
+        assert!(
+            event == "stage_launch_failed"
+                && payload["stage"] == "code"
+                && payload["agent"] == "codex"
+                && payload["error"] == "spawn refused"
+                && payload.get("from_agent").is_none()
+                && reason == "the runner could not start the code agent: spawn refused",
+            "plain launch named a handoff: {event} {payload} {reason}"
         );
     }
 }
