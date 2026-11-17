@@ -342,3 +342,150 @@ fn status_omits_a_free_runner_lock_with_nothing_else() {
     );
     assert!(stdout.contains("stage: idle"), "{stdout}");
 }
+
+/// How long a `logs -f` child may take to end once its run has.
+const LOGS_END_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// A stage turn that fails, so a supervised run opens its stage-failure gate.
+const FAILS: &str = r#"printf 'stage failed on purpose\nDEVFLOW_RESULT: {"status":"failed"}\n'
+exit 1"#;
+
+/// `devflow logs --phase N -f ROOT` spawned under `home`, its output piped.
+fn spawn_logs_follow(home: &common::HermeticHome, root: &Path, phase: PhaseId) -> std::process::Child {
+    common::hermetic_devflow(home)
+        .args(["logs", "--phase", &phase.to_string(), "-f"])
+        .arg(root)
+        .current_dir(root)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn devflow logs -f")
+}
+
+/// Wait for a `logs -f` child to exit within [`LOGS_END_WAIT`]; on timeout kill it and
+/// panic with `what`, never hang. Its output once it has exited.
+fn logs_output(mut child: std::process::Child, what: &str) -> std::process::Output {
+    let started = std::time::Instant::now();
+    while child.try_wait().expect("poll logs -f").is_none() {
+        if started.elapsed() > LOGS_END_WAIT {
+            common::kill_and_reap(&mut child);
+            panic!("{what}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    child.wait_with_output().expect("collect logs -f output")
+}
+
+/// The last non-empty line of a command's stderr, where `logs` prints its `==` lines.
+fn last_stderr_line(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// D-10: `logs -f` on a run whose agent exits at a failed stage ends with the run's
+/// state line, naming the pending gate and the positional `devflow gate approve N`.
+#[test]
+fn logs_follow_ends_with_the_runs_state_line() {
+    let rig = Rig::launch(PhaseId::new(186), FAILS);
+    let phase = rig.phase;
+    let logs = spawn_logs_follow(&rig.home, &rig.root, phase);
+    rig.release();
+
+    let output = logs_output(logs, "logs -f did not end after the agent exited");
+    let last = last_stderr_line(&output);
+    assert!(output.status.success(), "logs -f failed: {}", describe(&output));
+    assert!(
+        last.contains("gate") && last.contains(&format!("devflow gate approve {phase}`")),
+        "no state line after follow ended: {}",
+        describe(&output)
+    );
+}
+
+/// D-10, control on another row: `logs -f` over a finished run's capture and exit file
+/// ends with the finished line.
+#[test]
+fn logs_follow_on_a_finished_run_ends_with_finished() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    let phase = PhaseId::new(187);
+    let mut state = devflow_core::state::State::new(
+        phase,
+        devflow_core::state::AgentKind::Claude,
+        devflow_core::mode::Mode::Supervise,
+        root.clone(),
+    );
+    state.verification_baseline_captured = true;
+    state.stage = devflow_core::stage::Stage::Validate;
+    state.stopped = true;
+    state.finished = true;
+    devflow_core::workflow::save_state(&state).unwrap();
+    std::fs::write(
+        devflow_core::agent_result::stdout_path(&root, phase),
+        "validate output\n",
+    )
+    .unwrap();
+    std::fs::write(devflow_core::agent_result::exit_code_path(&root, phase), "0").unwrap();
+
+    let output = logs_output(
+        spawn_logs_follow(&home, &root, phase),
+        "logs -f did not end on a finished run",
+    );
+    let last = last_stderr_line(&output);
+    assert!(output.status.success(), "logs -f failed: {}", describe(&output));
+    assert!(
+        last.contains("finished"),
+        "no state line after follow ended: {}",
+        describe(&output)
+    );
+}
+
+/// D-10 (review codex-9): a runner SIGKILLed with its agent group writes no exit file,
+/// and `logs -f` still ends within a bound once its output is quiescent and the runner
+/// reads NotLive, its last line naming crashed with `devflow resume` and `devflow
+/// discard`.
+#[test]
+fn logs_follow_ends_with_crashed_after_a_hard_kill_with_no_exit_file() {
+    let phase = PhaseId::new(188);
+    let rig = Rig::launch(phase, "echo $$ > \"$(dirname \"$0\")/agent.pid\"\nwhile :; do sleep 0.1; done");
+    rig.release();
+    let agent_pid_file = rig._fake_bin.path.join("agent.pid");
+    common::wait_for(
+        || {
+            std::fs::read_to_string(&agent_pid_file)
+                .is_ok_and(|text| text.trim().parse::<u32>().is_ok())
+        },
+        std::time::Duration::from_secs(20),
+        "the agent's pid file",
+    );
+    let agent_pid: u32 = std::fs::read_to_string(&agent_pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let logs = spawn_logs_follow(&rig.home, &rig.root, phase);
+    std::thread::sleep(std::time::Duration::from_millis(700));
+
+    // SAFETY: the runner pid the fake systemd-run recorded for this test's own unit.
+    unsafe { libc::kill(rig.runner_pid as libc::pid_t, libc::SIGKILL) };
+    // Stands in for KillMode=control-group, which the fake manager does not apply.
+    common::signal_group(agent_pid, libc::SIGKILL);
+
+    let output = logs_output(logs, "logs -f did not end after a hard kill");
+    let last = last_stderr_line(&output);
+    assert!(
+        last.contains("crashed")
+            && last.contains(&format!("devflow resume --phase {phase}"))
+            && last.contains(&format!("devflow discard --phase {phase}")),
+        "no crashed line after a hard kill: {}",
+        describe(&output)
+    );
+    assert!(
+        !devflow_core::agent_result::exit_code_path(&rig.root, phase).exists(),
+        "an exit file exists for the stage"
+    );
+}
