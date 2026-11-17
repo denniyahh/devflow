@@ -21,6 +21,7 @@
   status: open (the OPERATIONS.md half resolved by 52.2-22; the code half is 52.2-23's)
   **What:** `devflow doctor`'s orphan-supervisor finding (`crates/devflow-cli/src/commands.rs`, `repair: Some(format!("devflow stop --phase {phase} --launch {launch_id}"))`), the launch guard's leftover-socket refusal (`` `devflow stop --phase {phase} --launch {id}` first ``) and OPERATIONS.md's stop row still print or document `--launch`. 52.2-06 removed the flag with `stop_launch` (D-05), so following one of those lines now fails clap's argument parse.
   **Why deferred:** both code paths read the detached supervisor's sockets (`possibly_live_sockets`, `socket_live_socket`), which 52.2-06 keeps for 52.2-23 to delete with their other callers; a `start` or `resume` since 52.2-06 creates no such socket, so only a run from an older binary reaches them. OPERATIONS.md is 52.2-22's. Fix shape: 52.2-23 deletes the socket findings and refusals with those helpers; 52.2-22 rewrites the stop row.
+  **Partial resolution (52.2-26, commit c6b1090):** the launch guard's leftover-socket refusal is deleted with the guard's socket reads (`LiveSocket::repair_line`); only `devflow doctor`'s orphan-supervisor finding still prints `--launch`, and OPERATIONS.md's rewritten `## Run liveness` keeps the sentence saying so.
   **Partial resolution (52.2-22, commit 7d81e4a):** OPERATIONS.md's stop row no longer has `--launch`, and the doctor orphan paragraph says the printed repair names the removed flag and no longer parses. When 52.2-23 deletes the orphan findings, that paragraph (inside `## Run liveness`, which 52.2-26 rewrites) goes with them; no doc_check test would flag it, since `documented_flags` also accepts any `launch:` field in source.
 
 - `devflow recover --clean` deletes the state of a live runner unit
@@ -30,9 +31,10 @@
   **Resolution:** 52.2-10 removed the `recover` verb (commit 29aaf01); `devflow recover` now exits 2 with clap's unrecognized-subcommand error, so no verb deletes a phase's state without `discard`'s live-run checks, which read the runner lock first (`run_liveness_e2e::discard_refuses_while_the_runner_lock_is_held_and_the_state_names_no_launch`).
 
 - `phase7_cli::cleanup_worktree_cli_flow` races the runner's exit under load
-  status: open
+  status: resolved (52.2-26, commit b9e367d)
   **What:** in both of 52.2-22's workspace nextest runs (2113 tests each, per-test limit config) it failed: `cleanup --force` refused with `its runner holds the runner lock (pid …); run devflow stop --phase 8 or wait for it to finish`. The test aborts the Validate gate, waits only for the state to be cleared (`wait_for_state_cleared`), then runs `cleanup`; the runner clears the state before it exits and releases its lock, so under load `cleanup` can land in that gap. Alone it passed 5 of 5 runs, and the whole `phase7_cli` suite passed (75 of 75), so it fails only under workspace load. 52.2-22 cannot reach it: its one code change is in `doc_check.rs`, a `#[cfg(test)]` module of devflow-core's own test binary, so the devflow binary and the `phase7_cli` test binary are built from the same source as at 52.2-08's head. Not established: whether it also failed under load at 52.2-08's head (the 2113-green run reported after 52.2-08 says not, under whatever load that run had).
   **Why deferred:** the test is outside 52.2-22's files (52.2-08 ported it, commit 7b0a5e3). Fix shape: after the state clears, wait for the runner lock to be free (or for `LaunchedRunReaper` to see the runner gone) before `cleanup`. Owner: 52.2-23 (its files include `crates/devflow-cli/tests/phase7_cli.rs`); a 999.x entry at phase close if it is still open. Seen 2 of 2 full runs at 52.2-22, 0 of 1 in the wave 5 gate.
+  **Resolution:** 52.2-26's commit c6b1090 made `cleanup`'s liveness read the runner lock alone, and with the supervisor reads gone the race became deterministic: the test failed alone, `its runner holds the runner lock (pid …)`. Commit b9e367d waits (bounded, 10 s) for the runner lock to be free after the state clears and before `cleanup --force`, the fix shape above; the whole `phase7_cli` suite passed after it. 52.2-26 owns `phase7_cli.rs`, so it took the fix rather than leave a red test for 52.2-23.
 
 - `status` still prints the state record's `run: active` and `active phases:` beside the liveness row
   status: open
@@ -53,3 +55,13 @@
   status: open
   **What:** `unattended_launch_shape_condition` (`crates/devflow-cli/src/preflight.rs`) refuses a non-claude, non-antigravity agent in auto mode with "Code would launch on the capture shape, whose supervisor never engages the chain-flag guard". The refusal itself is intended (D-07, fail-closed, pinned by `unattended_launch_shape_refusal_names_the_capture_supervisor`), but no supervisor exists after 52.2-11: the text should name the runner. Found by 52.2-11 (orchestrator follow-up).
   **Why deferred:** wording only, outside 52.2-11's subject. Owner: 52.2-15, the one remaining plan whose files_modified lists `preflight.rs`; rename the pinning test with the text. Else a 999.x entry at phase close.
+
+- `run_liveness_e2e.rs` still calls `LaunchedRunReaper::new`
+  status: open
+  **What:** `crates/devflow-cli/tests/run_liveness_e2e.rs:209` (`start_refuses_while_the_runner_lock_is_held`) builds `common::LaunchedRunReaper::new(&case.root, case.phase, Vec::new())`. 52.2-11 reported it as 52.2-26's file; it is not in 52.2-26's files_modified, and the test passes at 52.2-26's head.
+  **Why deferred:** outside 52.2-26's files. Owner: 52.2-23, whose Task 3 removes the remaining `LaunchedRunReaper::new` callers (switch it to `for_home`, or drop the reaper if the test launches nothing).
+
+- Tests and comments still plant or name the agent pid file and `check_dead_agent`
+  status: open
+  **What:** after 52.2-26 no verb reads `.devflow/phase-NN-agent-pid` (D-12a), but `start_lock_e2e.rs` still plants it in `plant_leftover_run`, `plant_resumable_run` and `resume_without_phase_state_reports_the_missing_state_not_a_live_run` (inert now: those tests pass on the runner lock and the state alone), and its `50-15` section comment says a fixture's "supervisor socket" refuses. `pipeline_launch.rs:5168` and `pipeline_gate.rs:84` comments name `check_dead_agent`, which 52.2-26 deleted. Found by 52.2-26.
+  **Why deferred:** comments and inert fixture writes, no wrong behaviour; `start_lock_e2e.rs` names are 52.2-23 Task 3's (supervisor items in passing tests), and the two source comments are outside 52.2-26's files. Owner: 52.2-23 (its files include `start_lock_e2e.rs` and `pipeline_launch.rs`); `pipeline_gate.rs`'s comment to whichever plan next edits that file, else a 999.x entry at phase close.

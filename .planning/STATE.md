@@ -5,16 +5,16 @@ milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: "52.2"
 current_phase_name: Foreground Runner
 status: executing
-stopped_at: Completed 52.2-11-PLAN.md
-last_updated: "2026-11-17T12:35:23.708Z"
+stopped_at: Completed 52.2-26-PLAN.md
+last_updated: "2026-11-17T13:17:57.437Z"
 last_activity: 2026-11-16
 last_activity_desc: Phase 52.2 execution started
-state_head: a80794844243000db400bca5f67e99ad11a7d989
+state_head: 8d76ff291b36bc16a84442e23e9371da1d3d53c1
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 66
-  completed_plans: 54
+  completed_plans: 55
   percent: 17
 ---
 
@@ -172,7 +172,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 52.2 (Foreground Runner) — EXECUTING
-Plan: 15 of 26
+Plan: 16 of 26
 Status: Ready to execute
 Last activity: 2026-11-16 — Phase 52.2 execution started
 
@@ -973,6 +973,8 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 52.2]: 52.2-10: the recycled agent-pid repair names the pid file, since discard reads it too
 - [Phase 52.2]: 52.2-11: the runner test's preflight control is supervise mode; a committed CONTEXT.md does not clear Codex's auto-mode unattended-launch refusal at Plan
 - [Phase 52.2]: 52.2-11: launch_stage resolves run_preflight's PreflightOutcome through launch_after_preflight; an approval launches launch_stage_inner(state, None, None) in the runner
+- [Phase 52.2]: doctor reports a phase no runner runs that is neither stopped nor finished as a Problem (resume, or start for an unprepared run); an unreadable runner is a path-free Problem pointing at devflow status
+- [Phase 52.2]: a launch reservation is a doctor note only while no runner runs; its liveness lock is no longer read (D-07)
 
 ## Roadmap Evolution
 
@@ -1138,11 +1140,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 52.2 P09 | 30 min | 3 tasks | 2 files |
 | Phase 52.2 P10 | 18 min | 3 tasks | 14 files |
 | Phase 52.2 P11 | 47 min | 3 tasks | 14 files |
+| Phase 52.2 P26 | 34 min | 3 tasks | 10 files |
 
 ## Session
 
-**Last session:** 2026-11-17T12:35:22.810Z
-**Stopped at:** Completed 52.2-11-PLAN.md
+**Last session:** 2026-11-17T13:17:56.546Z
+**Stopped at:** Completed 52.2-26-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
