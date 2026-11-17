@@ -440,10 +440,12 @@ pub(crate) fn start(
     }
 }
 
-/// `start --dry-run` (52.1 D-26): the real start's guard sequence, read-only and in its
-/// order, then the pipeline preview. The manager probe comes first, as in [`start`]
-/// (D-03); the facts are read without the phase holder, the write lock or a
-/// reservation, and the state is read without the lock, so nothing is written.
+/// `start --dry-run` (52.1 D-26, D-27): the real start's guard sequence, read-only and
+/// in its order, then the agent-binary check and the base's resolution, then the line
+/// naming what it skipped and the pipeline preview. The manager probe comes first, as
+/// in [`start`] (D-03); the facts are read without the phase holder, the write lock or
+/// a reservation, and the state is read without the lock, so nothing is written. Never
+/// [`crate::preflight::ensure_base_ref_current`], which fetches and may fast-forward.
 fn start_dry_run(project_root: &Path, state: &State) -> Result<(), CliError> {
     let phase = state.phase;
     refuse_without_a_user_manager(phase, LaunchVerb::Start)?;
@@ -459,8 +461,22 @@ fn start_dry_run(project_root: &Path, state: &State) -> Result<(), CliError> {
         ..facts
     };
     launch_guards(phase, &facts)?;
+    // 52.1 D-27: the two local checks, at the real start's position after its guards.
+    ensure_agent_binary(agent_program(state.agent))?;
+    let base = crate::preflight::resolve_start_base(project_root)?.value;
+    println!("{}", dry_run_not_checked_line(phase, &base));
     print_dry_run(state);
     Ok(())
+}
+
+/// The start checks a dry run skips (52.1 D-27): each reads the remote or the base's
+/// tree, and the first may fast-forward the base, so only a real start runs them.
+fn dry_run_not_checked_line(phase: PhaseId, base: &str) -> String {
+    format!(
+        "not checked by the dry run: base currency (`{base}` against its remote), phase \
+         reachability (phase {phase} on `{base}`), and the CONTEXT.md/PLAN.md checks on \
+         `{base}`; a real start runs them after these checks"
+    )
 }
 
 /// D-03 (review codex-2, agy-6): refuse `verb` when the systemd user manager does not
@@ -556,23 +572,12 @@ fn start_reserved(
 
     // 45-01 / D-01 / AUTO-01: resolve the project's integration trunk once,
     // here, and use the SAME value for every guard and both fork paths below.
-    // Resolved before anything is spawned or mutated.
-    //
-    // The resolver is fail-hard on an explicitly supplied value (see its own
-    // doc comment): a `main`, blank or flag-shaped base is refused here
-    // rather than silently falling back to `develop`, which would make the
-    // refusal unobservable for the most direct way to configure it.
-    let resolved_base = config::base_branch(project_root).map_err(CliError::Message)?;
+    // Resolved before anything is spawned or mutated. A `main`, blank or
+    // flag-shaped base is refused rather than silently falling back to
+    // `develop`, and a configured base must be a local branch: a commit-ish
+    // that is not one would be forwarded raw to `git worktree add` (46-02, D-07).
+    let resolved_base = crate::preflight::resolve_start_base(project_root)?;
     let base = resolved_base.value.as_str();
-    if resolved_base.source != config::BaseBranchSource::Default {
-        // A commit-ish that is not a local branch is forwarded raw to
-        // `git worktree add`, so the base is checked with `show-ref --verify`
-        // — a ref lookup, not the revision parser that let suffix syntax
-        // through (46-02, D-07). Still scoped to an explicitly configured
-        // base so the default path's existing fall-open for a clone with no
-        // local `develop` is untouched.
-        ensure_base_is_a_local_branch(project_root, base)?;
-    }
     // CR-02 (45-REVIEW.md): persist the resolved trunk before
     // `create_run_state`, because `advance`, `resume` and the checkout hooks
     // that merge this phase branch all run in SEPARATE processes whose
