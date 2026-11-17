@@ -695,3 +695,133 @@ fn a_dry_run_writes_nothing() {
     );
     assert_ne!(started.1, before.1, "control: a real start wrote no ref");
 }
+
+/// `devflow start --phase 12 --agent codex --mode supervise` plus `extra` over `root`,
+/// with `path` after the fake service manager on `PATH` and `envs` set.
+fn start_phase_on_path(
+    home: &common::HermeticHome,
+    root: &Path,
+    extra: &[&str],
+    path: &std::ffi::OsStr,
+    envs: &[(&str, &str)],
+) -> (Output, common::LaunchedRunReaper) {
+    let reaper = common::LaunchedRunReaper::for_home(home, root, PhaseId::new(PHASE));
+    let output = common::hermetic_devflow(home)
+        .args(["start", "--phase", &PHASE.to_string()])
+        .args(["--agent", "codex", "--mode", "supervise"])
+        .args(extra)
+        .arg(root)
+        .hermetic_path(path)
+        .envs(envs.iter().copied())
+        .env("DEVFLOW_TEST_ROOT", root)
+        .env("DEVFLOW_GATE_TIMEOUT_SECS", "60")
+        .current_dir(root)
+        .output()
+        .expect("run devflow start");
+    (output, reaper)
+}
+
+/// A `PATH` dir holding only a `git` link: no agent binary.
+fn git_only_dir() -> tempfile::TempDir {
+    let parent = std::env::var_os("PATH").unwrap_or_default();
+    let git = std::env::split_paths(&parent)
+        .map(|dir| dir.join("git"))
+        .find(|path| path.is_file())
+        .expect("git on PATH");
+    let dir = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(git, dir.path().join("git")).unwrap();
+    dir
+}
+
+/// Assert `dry` failed with `real`'s stderr, naming `check` when it did not.
+fn assert_same_refusal(check: &str, real: &Output, dry: &Output) {
+    assert!(
+        !real.status.success(),
+        "premise: start refuses on the {check}: {}",
+        combined(real)
+    );
+    assert!(
+        !dry.status.success(),
+        "the {check} text differs: the dry run passed what start refuses\nstart:\n{}\ndry run:\n{}",
+        combined(real),
+        combined(dry)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&dry.stderr),
+        String::from_utf8_lossy(&real.stderr),
+        "the {check} text differs between the dry run and start"
+    );
+}
+
+/// 52.1 D-27: with no agent binary on `PATH`, the dry run refuses as `start` does.
+#[test]
+fn a_dry_run_refuses_a_missing_agent_binary_like_start() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let path_dir = git_only_dir();
+
+    let path = path_dir.path().as_os_str();
+    let (real, _reaper) = start_phase_on_path(&home, root, &[], path, &[]);
+    let (dry, _dry_reaper) = start_phase_on_path(&home, root, &["--dry-run"], path, &[]);
+    assert_same_refusal("agent binary check", &real, &dry);
+    assert!(
+        String::from_utf8_lossy(&dry.stderr).contains("agent binary `codex` not found"),
+        "the agent binary check text is missing: {}",
+        combined(&dry)
+    );
+}
+
+/// 52.1 D-27: a configured base that is not a local branch refuses the dry run as it
+/// refuses `start`.
+#[test]
+fn a_dry_run_refuses_an_unresolvable_base_like_start() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let fake_bin = fake_codex();
+    let parent = std::env::var_os("PATH").unwrap_or_default();
+    let path = format!("{}:{}", fake_bin.path.display(), parent.to_string_lossy());
+    let envs = [("DEVFLOW_BASE_BRANCH", "nonexistent-base-xyz")];
+
+    let (real, _reaper) = start_phase_on_path(&home, root, &[], path.as_ref(), &envs);
+    let (dry, _dry_reaper) = start_phase_on_path(&home, root, &["--dry-run"], path.as_ref(), &envs);
+    assert_same_refusal("base resolution", &real, &dry);
+    assert!(
+        String::from_utf8_lossy(&dry.stderr).contains("nonexistent-base-xyz"),
+        "the base resolution text does not name the base: {}",
+        combined(&dry)
+    );
+}
+
+/// 52.1 D-27: a dry run that passes prints one line naming every start check it skipped.
+#[test]
+fn a_dry_run_names_every_check_it_skipped() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+
+    let (dry, _reaper) = start_phase(&home, root, &["--dry-run"]);
+    let text = combined(&dry);
+    assert!(dry.status.success(), "premise: the dry run passes: {text}");
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|line| line.contains("not checked"))
+        .collect();
+    assert_eq!(lines.len(), 1, "no one skipped-checks line: {text}");
+    for check in [
+        "base currency",
+        "phase reachability",
+        "CONTEXT.md",
+        "PLAN.md",
+    ] {
+        assert!(
+            lines[0].contains(check),
+            "the skipped line does not name {check}: {}",
+            lines[0]
+        );
+    }
+}
