@@ -1,6 +1,7 @@
 //! `devflow start`'s refusals over work an earlier run left (52.1 D-09.1, D-10, D-11):
 //! `start` has no `--force`, removes nothing, and names `devflow discard --phase N`
-//! for a leftover phase worktree or branch.
+//! for a leftover phase worktree or branch. Every refusal comes from one guard sequence
+//! (D-12, D-26): live, finished, incomplete, unloadable, orphan gate files, leftovers.
 
 mod common;
 
@@ -300,4 +301,72 @@ fn start_no_worktree_far_behind_the_base_cuts_the_branch_from_the_base() {
         "branch tip differs from base: {text}"
     );
     wait_for_settled(root);
+}
+
+/// Save phase 12's state in `root`, as `edit` leaves it over a fresh one.
+fn save_phase_state(root: &Path, edit: impl FnOnce(&mut devflow_core::state::State)) {
+    let mut state = devflow_core::state::State::new(
+        PhaseId::new(PHASE),
+        devflow_core::state::AgentKind::Codex,
+        devflow_core::mode::Mode::Supervise,
+        root.to_path_buf(),
+    );
+    edit(&mut state);
+    devflow_core::workflow::save_state(&state).expect("save the planted state");
+}
+
+/// Phase 12's state file bytes; the state must exist.
+fn state_bytes(root: &Path) -> Vec<u8> {
+    fs::read(devflow_core::workflow::state_path(
+        root,
+        PhaseId::new(PHASE),
+    ))
+    .expect("read the state file")
+}
+
+/// Assert `start` refused, offered no `--force`, and left phase 12's state file with
+/// `before`'s bytes; returns the refusal text.
+fn assert_refused_leaving_the_state(root: &Path, out: &Output, before: &[u8]) -> String {
+    let text = combined(out);
+    assert!(
+        !text.contains("--force"),
+        "the refusal offers --force: {text}"
+    );
+    assert_eq!(
+        state_bytes(root),
+        before,
+        "a refused start changed the state file: {text}"
+    );
+    text
+}
+
+/// 52.1 D-09.1: `start` over a finished run refuses, says the phase finished and names
+/// the close-out and `devflow discard --phase N`; the state is left byte-identical.
+#[test]
+fn start_refuses_a_finished_phase_naming_close_out_or_discard() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    save_phase_state(root, |state| {
+        state.verification_baseline_captured = true;
+        state.finished = true;
+    });
+    let before = state_bytes(root);
+
+    let (out, _reaper) = start_phase(&home, root, &[]);
+    assert!(
+        !out.status.success(),
+        "finished phase restarted: {}",
+        combined(&out)
+    );
+    let text = assert_refused_leaving_the_state(root, &out, &before);
+    assert!(
+        text.contains("finished") && text.contains("close the phase out"),
+        "the refusal does not say the phase finished and name the close-out: {text}"
+    );
+    assert!(
+        text.contains(&format!("devflow discard --phase {PHASE}")),
+        "refusal does not name discard: {text}"
+    );
 }
