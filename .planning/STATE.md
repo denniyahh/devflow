@@ -5,16 +5,16 @@ milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: "52.2"
 current_phase_name: Foreground Runner
 status: executing
-stopped_at: Completed 52.2-25-PLAN.md
-last_updated: "2026-11-17T15:14:13.421Z"
+stopped_at: Completed 52.2-24-PLAN.md
+last_updated: "2026-11-17T16:11:21.114Z"
 last_activity: 2026-11-16
 last_activity_desc: Phase 52.2 execution started
-state_head: 298b455f77d6649a4e37e8f54f3e7f710ba80a1f
+state_head: c6bdecedd6e272ee901dbbd1473a32562fd34fb3
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 66
-  completed_plans: 58
+  completed_plans: 59
   percent: 17
 ---
 
@@ -172,7 +172,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 52.2 (Foreground Runner) — EXECUTING
-Plan: 19 of 26
+Plan: 20 of 26
 Status: Ready to execute
 Last activity: 2026-11-16 — Phase 52.2 execution started
 
@@ -981,6 +981,8 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 52.2]: 52.2-23: Reservation keeps an unbound socket path for its pending record, built from registry::socket_dir_in and path_digest; 52.2-25 deletes the reservation
 - [Phase 52.2]: 52.2-23: stage tests that drove run_supervised_stage in a child now drive monitor::run_stage under a run token there, keeping their names
 - [Phase 52.2]: 52.2-25: a launch takes no reservation and State records no launch; the phase holder keeps a second launcher out (D-07) and the ownership fence is deleted (accept-break). An old state file with supervisor/pending_supervisor still loads (keys ignored).
+- [Phase 52.2]: 52.2-24: recover.rs deleted whole; format_age and state_age_secs moved to commands.rs with their tests
+- [Phase 52.2]: 52.2-24: unused public stop/registry/agent_result items kept (ReplyHandedOff, StopSource::Socket, note_group_signalled, socket_dir_in, prompt_path, monitor_log_path): the PLAN does not name their removal
 
 ## Roadmap Evolution
 
@@ -1150,11 +1152,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 52.2 P12 | 19 min | 3 tasks | 13 files |
 | Phase 52.2 P23 | 38 min | 3 tasks | 21 files |
 | Phase 52.2 P25 | 37min | 3 tasks | 12 files |
+| Phase 52.2 P24 | 28min | 3 tasks | 22 files |
 
 ## Session
 
-**Last session:** 2026-11-17T15:14:12.469Z
-**Stopped at:** Completed 52.2-25-PLAN.md
+**Last session:** 2026-11-17T16:11:20.163Z
+**Stopped at:** Completed 52.2-24-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
