@@ -206,7 +206,7 @@ fn discard_refuses_while_the_runner_lock_is_held_and_the_state_names_no_launch()
 fn start_refuses_while_the_runner_lock_is_held() {
     let case = Case::new(PhaseId::new(62));
     let hold = liveness::claim_runner_lock(&case.root, case.phase).expect("hold the runner lock");
-    let _reaper = common::LaunchedRunReaper::new(&case.root, case.phase, Vec::new());
+    let _reaper = common::LaunchedRunReaper::for_home(&case.home, &case.root, case.phase);
     let stubs = tempfile::tempdir().unwrap();
 
     let out = case
@@ -572,14 +572,9 @@ impl Case {
             .and_then(|text| text.trim().parse().ok())
     }
 
-    /// Whether the phase's state names no reservation: it is absent, or it loads
-    /// with no `pending_supervisor`.
+    /// Whether no launch reservation is left: no `.devflow/supervisor-*.live` file.
     fn reservation_free(&self) -> bool {
-        match devflow_core::workflow::load_state(&self.root, self.phase) {
-            Ok(state) => state.pending_supervisor.is_none(),
-            Err(devflow_core::workflow::WorkflowError::MissingState(_)) => true,
-            Err(_) => false,
-        }
+        common::no_reservation_file(&self.root)
     }
 
     /// Whether the runner lock probes Live.

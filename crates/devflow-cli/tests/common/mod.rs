@@ -629,70 +629,31 @@ pub fn kill_and_reap(child: &mut Child) {
     let _ = child.wait();
 }
 
-/// How long [`LaunchedRunReaper`] waits for a supervisor's final shutdown line.
-const REAP_SHUTDOWN_WAIT: Duration = Duration::from_secs(15);
-
-/// How long [`LaunchedRunReaper`] waits for the phase's supervisors to exit on
-/// their own before it ends the ones still alive.
-const REAP_EXIT_WAIT: Duration = Duration::from_secs(15);
-
-/// Ends, on drop, the run recorded in the phase state, through its
-/// supervisor's socket (D-07): a `shutdown` request first; then, if the
-/// recorded agent group's leader is still the process the record names
-/// (`agent::is_same_process` against its start time), a SIGKILL to that
-/// group. Only when the state holds no `supervisor` record does it fall back
-/// to the agent named in the agent-pid file. A pid in `spare` is never
-/// signalled. Bind it before (or right after) the spawn that launches a run,
-/// and keep the run's [`HermeticHome`] alive until this has dropped.
-///
-/// It then waits, bounded by [`REAP_EXIT_WAIT`], until no `devflow
-/// __monitor` whose argv names this root and phase is alive, and ends any
-/// still alive after that wait. The state cannot name every one: a stop that
-/// lands while an advance is launching the next stage leaves that next
-/// supervisor spawned but never recorded, with the stop flagged. It records
-/// its own stop under the state write lock a moment later, and taking that lock
-/// recreates `<root>/.devflow/` when the root's `TempDir` has already been
-/// removed, leaving `/tmp/.tmpXXXXXX/.devflow/.state-NN.lock` behind.
-///
-/// [`LaunchedRunReaper::for_home`] is the runner-era form: it ends the pids the fake
-/// `systemd-run` recorded and does none of the above.
+/// Ends, on drop, the runs launched through a [`HermeticHome`]'s fake
+/// `systemd-run`: it SIGTERMs each runner pid the fake recorded (`<unit>.pid` in
+/// [`HermeticHome::service_bin`]) whose argv still holds `__runner`, waits for it to
+/// exit, and SIGKILLs one still alive after [`REAP_RUNNER_TERM_WAIT`]. It never scans
+/// other processes' argv. Bind it before (or right after) the spawn that launches a
+/// run, and keep the run's [`HermeticHome`] alive until this has dropped.
 pub struct LaunchedRunReaper {
-    root: PathBuf,
-    phase: PhaseId,
-    spare: Vec<u32>,
-    /// The fake service-manager dir whose `*.pid` records name the runners to end,
-    /// for a reaper built by [`LaunchedRunReaper::for_home`].
-    recorded_in: Option<PathBuf>,
+    /// The fake service-manager dir whose `*.pid` records name the runners to end.
+    recorded_in: PathBuf,
 }
 
-/// How long [`LaunchedRunReaper::for_home`] waits for a SIGTERMed runner to end its
-/// agent's group and exit before it SIGKILLs it.
+/// How long [`LaunchedRunReaper`] waits for a SIGTERMed runner to end its agent's
+/// group and exit before it SIGKILLs it.
 const REAP_RUNNER_TERM_WAIT: Duration = Duration::from_secs(20);
 
 /// How long it waits for a SIGKILLed runner to be gone.
 const REAP_RUNNER_KILL_WAIT: Duration = Duration::from_secs(5);
 
 impl LaunchedRunReaper {
-    pub fn new(root: &Path, phase: PhaseId, spare: Vec<u32>) -> Self {
+    /// A reaper for the runs of phase `phase` under `root` that `home`'s fake
+    /// `systemd-run` launches. The runner pids it records name them, so `root` and
+    /// `phase` only say which run the call site means.
+    pub fn for_home(home: &HermeticHome, _root: &Path, _phase: PhaseId) -> Self {
         Self {
-            root: root.to_path_buf(),
-            phase,
-            spare,
-            recorded_in: None,
-        }
-    }
-
-    /// A reaper for runs launched through `home`'s fake `systemd-run`: on drop it
-    /// SIGTERMs each runner pid the fake recorded (`<unit>.pid` in
-    /// [`HermeticHome::service_bin`]) whose argv still holds `__runner`, waits for it
-    /// to exit, and SIGKILLs one still alive after [`REAP_RUNNER_TERM_WAIT`]. It never
-    /// scans other processes' argv.
-    pub fn for_home(home: &HermeticHome, root: &Path, phase: PhaseId) -> Self {
-        Self {
-            root: root.to_path_buf(),
-            phase,
-            spare: Vec::new(),
-            recorded_in: Some(home.service_bin()),
+            recorded_in: home.service_bin(),
         }
     }
 
@@ -728,127 +689,25 @@ impl LaunchedRunReaper {
             }
         }
     }
-
-    /// Every live `devflow __monitor` whose argv names this root (as given or
-    /// canonicalized) after `--project` and this phase after `--phase`, with
-    /// its start time: each supervisor this run started, recorded or not.
-    fn live_supervisors(&self) -> Vec<(u32, u64)> {
-        use std::os::unix::ffi::OsStrExt as _;
-        let canonical = fs::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone());
-        let roots = [
-            self.root.as_os_str().as_bytes(),
-            canonical.as_os_str().as_bytes(),
-        ];
-        let Ok(entries) = fs::read_dir("/proc") else {
-            return Vec::new();
-        };
-        entries
-            .flatten()
-            .filter_map(|entry| {
-                let pid = entry.file_name().to_str()?.parse::<u32>().ok()?;
-                let cmdline = fs::read(entry.path().join("cmdline")).ok()?;
-                let args: Vec<&[u8]> = cmdline.split(|byte| *byte == 0).collect();
-                let value_after = |flag: &str| {
-                    args.windows(2)
-                        .find(|pair| pair[0] == flag.as_bytes())
-                        .map(|pair| pair[1])
-                };
-                let phase = value_after("--phase")
-                    .and_then(|value| std::str::from_utf8(value).ok())
-                    .and_then(|value| value.parse::<PhaseId>().ok());
-                let ours = args.contains(&b"__monitor".as_slice())
-                    && value_after("--project").is_some_and(|value| roots.contains(&value))
-                    && phase == Some(self.phase);
-                if !ours {
-                    return None;
-                }
-                let start = devflow_core::agent::process_start_time(pid)?;
-                devflow_core::agent::agent_running(pid).then_some((pid, start))
-            })
-            .collect()
-    }
-
-    /// Whether every supervisor this run started has exited on its own within
-    /// `within`. Ends nothing: a run that is still live reads `false`, so a
-    /// caller can count a run's events only once nothing can add to them.
-    pub fn supervisors_exited_within(&self, within: Duration) -> bool {
-        let deadline = Instant::now() + within;
-        loop {
-            if self.live_supervisors().is_empty() {
-                return true;
-            }
-            if Instant::now() >= deadline {
-                return false;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-
-    /// Wait for this phase's supervisors to exit, then end any left, so none
-    /// of them writes under the root once this returns.
-    fn wait_for_supervisors_to_exit(&self) {
-        let deadline = Instant::now() + REAP_EXIT_WAIT;
-        while Instant::now() < deadline {
-            if self.live_supervisors().is_empty() {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        for (pid, start) in self.live_supervisors() {
-            if !self.spare.contains(&pid) && devflow_core::agent::is_same_process(pid, start) {
-                let _ = devflow_core::agent::terminate_and_verify(
-                    pid,
-                    devflow_core::agent::TERMINATE_VERIFY_WAIT,
-                    devflow_core::agent::TERMINATE_VERIFY_POLL,
-                );
-            }
-        }
-    }
-
-    /// The shutdown described on [`LaunchedRunReaper`]: the recorded
-    /// supervisor, else the agent in the agent-pid file.
-    fn end_recorded_run(&self) {
-        let record = devflow_core::workflow::load_state(&self.root, self.phase)
-            .ok()
-            .and_then(|state| state.supervisor);
-        if let Some(record) = record {
-            let _ =
-                devflow_core::supervisor::request_shutdown(&record.socket_path, REAP_SHUTDOWN_WAIT);
-            let leader = record.agent_pgid;
-            if !self.spare.contains(&leader)
-                && devflow_core::agent::agent_running(leader)
-                && devflow_core::agent::is_same_process(leader, record.agent_start_time)
-            {
-                signal_group(leader, libc::SIGKILL);
-            }
-            return;
-        }
-        let agent = fs::read_to_string(devflow_core::agent_result::agent_pid_path(
-            &self.root, self.phase,
-        ))
-        .ok()
-        .and_then(|pid| pid.trim().parse::<u32>().ok());
-        if let Some(pid) = agent
-            && !self.spare.contains(&pid)
-            && devflow_core::agent::agent_running(pid)
-        {
-            let _ = devflow_core::agent::terminate_and_verify(
-                pid,
-                devflow_core::agent::TERMINATE_VERIFY_WAIT,
-                devflow_core::agent::TERMINATE_VERIFY_POLL,
-            );
-        }
-    }
 }
 
 impl Drop for LaunchedRunReaper {
     fn drop(&mut self) {
-        if let Some(dir) = &self.recorded_in {
-            Self::end_recorded_runners(dir);
-            return;
-        }
-        self.end_recorded_run();
-        self.wait_for_supervisors_to_exit();
+        Self::end_recorded_runners(&self.recorded_in);
+    }
+}
+
+/// Whether `root/.devflow` holds no launch reservation's liveness file
+/// (`supervisor-<launch id>.live`): a launch that failed left none behind. An
+/// absent `.devflow/` holds none; one that cannot be listed reads `false`.
+pub fn no_reservation_file(root: &Path) -> bool {
+    match fs::read_dir(root.join(".devflow")) {
+        Ok(entries) => !entries.flatten().any(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("supervisor-") && name.ends_with(".live")
+        }),
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
     }
 }
 

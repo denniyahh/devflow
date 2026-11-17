@@ -5142,10 +5142,9 @@ mod tests {
     /// phase as active — D-15/999.60). If `launch_stage` then fails outright
     /// — here, the agent binary is simply missing — that save must not be
     /// left standing: a state file claiming `stopped: false` with nothing
-    /// actually running is a zombie invisible to `check_dead_agent`/
-    /// `check_dead_monitor`, which both skip any phase already marked
-    /// `stopped`. `resume` must re-mark the phase `stopped` (with a reason)
-    /// on this failure path, not leave it looking falsely active.
+    /// actually running reads as a run that never stopped. `resume` must
+    /// re-mark the phase `stopped` (with a reason) on this failure path, not
+    /// leave it looking falsely active.
     ///
     /// The unrunnable-agent window runs in a CHILD process
     /// ([`run_test_without_git`], 46-06 / review finding C-01) so the emptied

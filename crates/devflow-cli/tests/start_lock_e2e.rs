@@ -19,7 +19,7 @@ use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output};
+use std::process::{Command, Output};
 use std::time::Duration;
 
 fn git(root: &Path, args: &[&str]) {
@@ -117,9 +117,8 @@ fn start_proceeds_when_no_reservation_is_held() {
                 .contains("\"workflow_started\""),
         "an uncontended start must write state or its workflow_started event"
     );
-    assert_eq!(
-        pending_launch(root, phase),
-        None,
+    assert!(
+        common::no_reservation_file(root),
         "a finished start leaves no reservation"
     );
 }
@@ -202,7 +201,7 @@ fn resume_prints_the_answer_it_set_aside() {
     let phase = PhaseId::new(93);
     init_repo(root, phase);
     let fake_bin = fake_codex("exit 0");
-    let planted = plant_leftover_run(root, phase, None);
+    let planted = plant_leftover_run(root, phase);
     let existing = std::env::var_os("PATH").unwrap_or_default();
     let path = format!("{}:{}", fake_bin.path.display(), existing.to_string_lossy());
 
@@ -295,49 +294,13 @@ fn status_and_doctor_name_a_set_aside_answer_on_stdout() {
 // ---------------------------------------------------------------------------
 // 48-19 (criterion 2, D-01, D-02): `start` must not overwrite a live run.
 //
-// Each arm plants the same leftover run (Code-stage state, a Code gate request
-// and response, optionally an agent pid file) and differs from the others only
-// in whether the recorded pids name a live process, plus `--force` on the agent
-// arm. The live process is a test-owned `sleep`, reaped in `Drop` so a failing
-// assertion leaks nothing.
+// Each arm plants the same leftover run (a Code-stage state and a Code gate
+// request and response); a live run is a launched runner (`LiveRun::launch`).
 // ---------------------------------------------------------------------------
-
-/// Existing never-live pid idiom (phase7_cli.rs): above Linux's maximum
-/// `pid_max` of 2^22, so no process can hold it.
-const NEVER_LIVE_PID: u32 = 0x7FFF_FFFE;
 
 /// Bounds any gate a launched monitor parks at, so a start that proceeds
 /// (every control, and the refusal arms at RED) leaves no immortal monitor.
 const GATE_TIMEOUT_SECS: &str = "15";
-
-/// A test-owned live process whose pid the fixtures record as a monitor or
-/// agent. Killed and waited on drop, including while a failed assertion
-/// unwinds.
-struct LiveProcess {
-    child: Child,
-}
-
-impl LiveProcess {
-    fn spawn() -> Self {
-        let child = Command::new("sleep")
-            .arg("60")
-            .spawn()
-            .expect("spawn test-owned live process");
-        Self { child }
-    }
-
-    fn pid(&self) -> u32 {
-        self.child.id()
-    }
-}
-
-impl Drop for LiveProcess {
-    fn drop(&mut self) {
-        // No `expect` here: a panic inside drop during unwinding aborts.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
 
 /// A fake `codex` that answers `--version` and otherwise sleeps until it is
 /// ended, so a launched run stays live for the whole test.
@@ -420,18 +383,14 @@ struct PlantedGate {
     response: PathBuf,
 }
 
-/// A leftover Code-stage state with no supervisor record, an optional agent
-/// pid file, and a planted Code gate. The launch guard reads no
-/// `monitor_pid` (50-15), so none is planted; a test that needs a live
-/// run launches one with [`LiveRun::launch`].
-fn plant_leftover_run(root: &Path, phase: PhaseId, agent_pid: Option<u32>) -> PlantedGate {
+/// A leftover Code-stage state and a planted Code gate. The launch guard reads
+/// only the runner lock, so a test that needs a live run launches one with
+/// [`LiveRun::launch`].
+fn plant_leftover_run(root: &Path, phase: PhaseId) -> PlantedGate {
     let mut state = State::new(phase, AgentKind::Codex, Mode::Auto, root.to_path_buf());
     state.verification_baseline_captured = true;
     state.stage = Stage::Code;
     devflow_core::workflow::save_state(&state).expect("plant leftover state");
-    if let Some(pid) = agent_pid {
-        write_agent_pid(root, phase, pid);
-    }
     plant_code_gate(root, phase)
 }
 
@@ -464,21 +423,11 @@ fn plant_code_gate(root: &Path, phase: PhaseId) -> PlantedGate {
     }
 }
 
-fn write_agent_pid(root: &Path, phase: PhaseId, pid: u32) {
-    let path = devflow_core::agent_result::agent_pid_path(root, phase);
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(&path, pid.to_string()).expect("write agent pid file");
-}
-
 /// Every file a live run for `phase` depends on, with its exact bytes, sorted
-/// by path: the state file, the agent pid file, and each gate-directory entry
-/// named `{padded}-…`. Only existing files are listed, so a deleted file shows
+/// by path: the state file and each gate-directory entry named `{padded}-…`. Only existing files are listed, so a deleted file shows
 /// up as a different snapshot rather than a read panic.
 fn phase_file_snapshot(root: &Path, phase: PhaseId) -> Vec<(PathBuf, Vec<u8>)> {
-    let mut paths = vec![
-        devflow_core::workflow::state_path(root, phase),
-        devflow_core::agent_result::agent_pid_path(root, phase),
-    ];
+    let mut paths = vec![devflow_core::workflow::state_path(root, phase)];
     let prefix = format!("{}-", phase.padded());
     if let Ok(entries) = fs::read_dir(Gates::dir(root)) {
         for entry in entries {
@@ -497,14 +446,6 @@ fn phase_file_snapshot(root: &Path, phase: PhaseId) -> Vec<(PathBuf, Vec<u8>)> {
             (path, bytes)
         })
         .collect()
-}
-
-/// The launch id the phase's state names as pending, if its state loads.
-fn pending_launch(root: &Path, phase: PhaseId) -> Option<String> {
-    devflow_core::workflow::load_state(root, phase)
-        .ok()?
-        .pending_supervisor
-        .map(|pending| pending.launch_id)
 }
 
 fn run_start(
@@ -543,7 +484,7 @@ fn start_replaces_a_leftover_state_whose_recorded_processes_are_dead() {
     let root = repo.path();
     let phase = PhaseId::new(97);
     init_repo(root, phase);
-    let planted = plant_leftover_run(root, phase, Some(NEVER_LIVE_PID));
+    let planted = plant_leftover_run(root, phase);
     let fake_bin = fake_codex("exit 0");
     let _reaper = common::LaunchedRunReaper::for_home(&home, root, phase);
 
@@ -586,10 +527,8 @@ fn events_contain(root: &Path, event: &str) -> bool {
         .contains(&format!("\"{event}\""))
 }
 
-/// A resumable Code-stage state with no supervisor record and an optional
-/// agent pid file. No `monitor_pid` is planted: the launch guard reads none
-/// (50-15).
-fn plant_resumable_run(root: &Path, phase: PhaseId, agent_pid: Option<u32>, stopped: bool) {
+/// A resumable Code-stage state. The launch guard reads only the runner lock.
+fn plant_resumable_run(root: &Path, phase: PhaseId, stopped: bool) {
     let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
     state.verification_baseline_captured = true;
     state.stage = Stage::Code;
@@ -597,9 +536,6 @@ fn plant_resumable_run(root: &Path, phase: PhaseId, agent_pid: Option<u32>, stop
     state.stop_reason =
         stopped.then(|| "planted: marked stopped by devflow stop while the run was live".into());
     devflow_core::workflow::save_state(&state).expect("plant resumable state");
-    if let Some(pid) = agent_pid {
-        write_agent_pid(root, phase, pid);
-    }
 }
 
 /// `devflow resume` for `phase`; its `DEVFLOW_CACHE_DIR` is `home`'s cache dir,
@@ -689,7 +625,7 @@ fn resume_relaunches_a_phase_whose_recorded_processes_are_dead() {
         init_repo(root, phase);
         let fake_bin = fake_codex("exec sleep 60");
         let _reaper = common::LaunchedRunReaper::for_home(&home, root, phase);
-        plant_resumable_run(root, phase, Some(NEVER_LIVE_PID), stopped);
+        plant_resumable_run(root, phase, stopped);
 
         let output = resume_command(&home, root, phase, &fake_bin)
             .output()
@@ -723,9 +659,7 @@ fn resume_without_phase_state_reports_the_missing_state_not_a_live_run() {
     let root = repo.path();
     let phase = PhaseId::new(84);
     init_repo(root, phase);
-    let agent = LiveProcess::spawn();
     let fake_bin = fake_codex("exec sleep 60");
-    write_agent_pid(root, phase, agent.pid());
     assert!(
         !devflow_core::workflow::state_path(root, phase).exists(),
         "the carve-out fixture must have no phase state"
@@ -746,14 +680,13 @@ fn resume_without_phase_state_reports_the_missing_state_not_a_live_run() {
         "without phase state, resume must report the missing state, not a live run\nstderr: {stderr}"
     );
     assert_eq!(phase_file_snapshot(root, phase), before);
-    assert!(devflow_core::agent::agent_running(agent.pid()));
     assert!(!events_contain(root, "stage_launched"));
 }
 
 // ---------------------------------------------------------------------------
 // 50-15 (D-09, R-12, 999.139): a state file that will not load must not hide
-// a live run from `start` or `resume`. Each fixture is a real launched run
-// whose agent pid file is removed, so only its supervisor socket can refuse.
+// a live run from `start` or `resume`. Each fixture is a real launched run, so
+// its runner lock is what refuses.
 // ---------------------------------------------------------------------------
 
 /// Bytes no `State` deserializes.

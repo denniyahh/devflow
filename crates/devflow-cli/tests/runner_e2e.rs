@@ -924,7 +924,7 @@ fn a_stage_the_runner_cannot_start_opens_the_infra_gate_with_an_event() {
 const STOP_WAIT: Duration = Duration::from_secs(20);
 
 /// The exit code of a runner that recorded a stop.
-const STOPPED_EXIT_CODE: i32 = devflow_core::supervisor::runtime::STOPPED_EXIT_CODE;
+const STOPPED_EXIT_CODE: i32 = devflow_core::stop::STOPPED_EXIT_CODE;
 
 /// A `codex` stub that, after `prelude`, writes its pid (`$$`, its group's pgid) to a
 /// `pid` file beside itself and waits in a short-sleep loop (bounded, about 60 s).
