@@ -751,11 +751,11 @@ const RUN_LIVENESS_FRAGMENTS: &[&str] = &[
 
 /// Fragments OPERATIONS.md must hold, compared lowercased the way
 /// `source_devflow_env_vars_and_subcommands_are_documented` compares (RV-06).
-const INTERNAL_SUBCOMMAND_FRAGMENTS: &[&str] = &["devflow monitor", "devflow advance"];
+const INTERNAL_SUBCOMMAND_FRAGMENTS: &[&str] = &["devflow runner"];
 
 /// 50-17 (R6-G4): OPERATIONS.md documents run liveness as the supervisor
 /// socket answers it (GONE / STALE / ALIVE and the repair verbs), the socket
-/// location's override, and both internal subcommands, outside HTML comments.
+/// location's override, and the internal runner verb (D-02), outside HTML comments.
 #[test]
 fn operations_md_documents_run_liveness_and_the_stop_arms() {
     let every: String = RUN_LIVENESS_FRAGMENTS.join("\n");
@@ -786,6 +786,14 @@ fn operations_md_documents_run_liveness_and_the_stop_arms() {
     assert!(
         missing_fragments(&every, RUN_LIVENESS_FRAGMENTS).is_empty(),
         "planted control: a text holding every fragment reports none"
+    );
+    assert_eq!(
+        missing_fragments(
+            "`devflow monitor` and `devflow advance` are internal",
+            INTERNAL_SUBCOMMAND_FRAGMENTS
+        ),
+        vec!["devflow runner"],
+        "planted control: a text naming only the removed verbs misses the runner verb"
     );
 
     let path = workspace_root().join("OPERATIONS.md");
