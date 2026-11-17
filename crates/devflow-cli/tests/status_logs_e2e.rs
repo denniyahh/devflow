@@ -225,3 +225,120 @@ fn status_shows_a_running_unit_as_live_naming_stop_and_logs() {
         "supervisor probe line still printed: {stdout}"
     );
 }
+
+/// `status` over a bare directory with nothing but what the test plants under
+/// `.devflow/`: its stdout, after asserting it exited 0.
+fn status_over(home: &common::HermeticHome, root: &Path) -> String {
+    let output = status_of(home, root);
+    assert!(output.status.success(), "status failed: {}", describe(&output));
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// D-09 (review codex-8): a state file that does not parse is listed as unloadable
+/// naming `devflow discard`, not dropped into `stage: idle`.
+#[test]
+fn status_lists_an_unloadable_state_as_unloadable_naming_discard() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    let phase = PhaseId::new(182);
+    let state = devflow_core::workflow::state_path(&root, phase);
+    std::fs::create_dir_all(state.parent().unwrap()).unwrap();
+    std::fs::write(&state, "{ not json").unwrap();
+
+    let stdout = status_over(&home, &root);
+    let row = phase_row(&stdout, phase)
+        .unwrap_or_else(|| panic!("phase missing from status: {stdout}"));
+    assert!(
+        !stdout.contains("stage: idle"),
+        "status printed idle over a phase: {stdout}"
+    );
+    assert!(
+        row.starts_with(&format!("phase {phase}: unloadable")),
+        "{row}"
+    );
+    assert!(
+        row.contains(&format!("devflow discard --phase {phase}")),
+        "{row}"
+    );
+}
+
+/// D-09a (review codex-8): a gate request file with no state is debris naming
+/// `devflow discard`.
+#[test]
+fn status_lists_gate_files_with_no_state_as_debris_naming_discard() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    let phase = PhaseId::new(183);
+    devflow_core::gates::Gates::write_gate(
+        &root,
+        phase,
+        devflow_core::stage::Stage::Plan,
+        devflow_core::gates::GateKind::StageFailure,
+        "a gate its run left behind",
+    )
+    .unwrap();
+
+    let stdout = status_over(&home, &root);
+    let row = phase_row(&stdout, phase)
+        .unwrap_or_else(|| panic!("phase missing from status: {stdout}"));
+    assert!(
+        !stdout.contains("stage: idle"),
+        "status printed idle over a phase: {stdout}"
+    );
+    assert!(row.starts_with(&format!("phase {phase}: debris")), "{row}");
+    assert!(
+        row.contains(&format!("devflow discard --phase {phase}")),
+        "{row}"
+    );
+}
+
+/// D-09 (review codex-8): a held runner lock with no state is a live run naming
+/// `devflow stop`.
+#[test]
+fn status_lists_a_held_runner_lock_with_no_state_as_live() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    let phase = PhaseId::new(184);
+    let _hold = devflow_core::liveness::claim_runner_lock(&root, phase).expect("hold the lock");
+
+    let stdout = status_over(&home, &root);
+    let row = phase_row(&stdout, phase)
+        .unwrap_or_else(|| panic!("phase missing from status: {stdout}"));
+    assert!(
+        !stdout.contains("stage: idle"),
+        "status printed idle over a phase: {stdout}"
+    );
+    assert!(row.starts_with(&format!("phase {phase}: live")), "{row}");
+    assert!(
+        row.contains(&format!("devflow stop --phase {phase}")),
+        "{row}"
+    );
+}
+
+/// The history rule's control: a runner lock file nobody holds, with no state, no gate
+/// file and no `.devflow/gates/` directory, is not listed, and `status` exits 0 with
+/// `stage: idle` (review r3 agy-3: a missing gates directory is an empty set).
+#[test]
+fn status_omits_a_free_runner_lock_with_nothing_else() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    let phase = PhaseId::new(185);
+    drop(devflow_core::liveness::claim_runner_lock(&root, phase).expect("claim the lock"));
+    let lock = devflow_core::liveness::runner_lock_path(&root, phase);
+    assert!(lock.exists(), "the lock file outlives its holder");
+    assert!(
+        !devflow_core::gates::Gates::dir(&root).exists(),
+        "no gates directory"
+    );
+
+    let stdout = status_over(&home, &root);
+    assert!(
+        phase_row(&stdout, phase).is_none(),
+        "a free runner lock was listed: {stdout}"
+    );
+    assert!(stdout.contains("stage: idle"), "{stdout}");
+}
