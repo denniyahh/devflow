@@ -706,18 +706,20 @@ fn start_phase_on_path(
     envs: &[(&str, &str)],
 ) -> (Output, common::LaunchedRunReaper) {
     let reaper = common::LaunchedRunReaper::for_home(home, root, PhaseId::new(PHASE));
-    let output = common::hermetic_devflow(home)
+    let mut command = common::hermetic_devflow(home);
+    command
         .args(["start", "--phase", &PHASE.to_string()])
         .args(["--agent", "codex", "--mode", "supervise"])
         .args(extra)
         .arg(root)
         .hermetic_path(path)
-        .envs(envs.iter().copied())
         .env("DEVFLOW_TEST_ROOT", root)
         .env("DEVFLOW_GATE_TIMEOUT_SECS", "60")
-        .current_dir(root)
-        .output()
-        .expect("run devflow start");
+        .current_dir(root);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let output = command.output().expect("run devflow start");
     (output, reaper)
 }
 
