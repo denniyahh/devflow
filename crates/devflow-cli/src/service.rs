@@ -225,14 +225,21 @@ fn own_runtime_dir() -> PathBuf {
     PathBuf::from(format!("/run/user/{uid}"))
 }
 
-/// Whether `stdout` of a Version probe that exited 0 is a manager's answer: a version,
-/// which starts with an ASCII digit. The pinned devcontainer's `systemctl` shim exits 0
-/// with a "systemd is not running" notice, so exit 0 alone is not an answer
-/// (`scripts/check.sh`'s `run_service` applies the same rule).
-pub(crate) fn is_version_answer(stdout: &str) -> bool {
-    stdout
-        .trim_start()
-        .starts_with(|c: char| c.is_ascii_digit())
+/// The oldest systemd user manager the unit launch runs under: `systemd-run
+/// --expand-environment=no` first shipped in systemd 254.
+pub(crate) const MIN_SYSTEMD_VERSION: u32 = 254;
+
+/// The major version in `stdout` of a Version probe that exited 0, when it is a
+/// manager's answer: a version, which starts with ASCII digits (`257.9-1.fc45` is 257).
+/// The pinned devcontainer's `systemctl` shim exits 0 with a "systemd is not running"
+/// notice, so exit 0 alone is not an answer (`scripts/check.sh`'s `run_service` applies
+/// the same rule).
+pub(crate) fn manager_major_version(stdout: &str) -> Option<u32> {
+    let trimmed = stdout.trim_start();
+    let digits = trimmed
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    trimmed[..digits].parse().ok()
 }
 
 /// The systemd `ActiveState` values (`systemctl --state=help`).
@@ -265,22 +272,23 @@ pub(crate) fn active_state_reading(unit: &str, stdout: &str) -> Result<String, S
 }
 
 /// D-03: whether the systemd user manager answers
-/// `systemctl --user show -p Version --value` (never `is-system-running`).
+/// `systemctl --user show -p Version --value` (never `is-system-running`), and its
+/// major version when it does.
 ///
 /// # Errors
-/// It did not answer, or exited 0 without a version ([`is_version_answer`]):
+/// It did not answer, or exited 0 without a version ([`manager_major_version`]):
 /// [`classify_unanswered`]'s sort of `XDG_RUNTIME_DIR`. A probe that timed out is
 /// [`ManagerUnavailableKind::Failed`], never Absent.
 #[cfg(not(test))]
-pub(crate) fn manager_available() -> Result<(), ManagerUnavailable> {
+pub(crate) fn manager_available() -> Result<u32, ManagerUnavailable> {
     let mut command = tool("systemctl");
     command.args(["--user", "show", "-p", "Version", "--value"]);
     let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR");
     let stderr = match run_bounded(command, SYSTEMCTL_CALL_BOUND) {
         Ok(output) if output.status.success() => {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            if is_version_answer(&stdout) {
-                return Ok(());
+            if let Some(version) = manager_major_version(&stdout) {
+                return Ok(version);
             }
             format!("exited 0 but printed no version: {}", stdout.trim())
         }
@@ -304,7 +312,7 @@ pub(crate) fn manager_available() -> Result<(), ManagerUnavailable> {
 
 /// The cfg(test) build: the manager answer the [`double`] holds.
 #[cfg(test)]
-pub(crate) fn manager_available() -> Result<(), ManagerUnavailable> {
+pub(crate) fn manager_available() -> Result<u32, ManagerUnavailable> {
     double::manager()
 }
 
@@ -371,10 +379,13 @@ pub(crate) fn wait_unit_inactive(unit: &str, bound: Duration) -> Result<(), Stri
 pub(crate) mod double {
     use std::cell::RefCell;
 
+    /// The version an answering double manager reports.
+    const DOUBLE_MANAGER_VERSION: u32 = 257;
+
     /// What the double reports.
     struct Double {
-        /// The manager's answer to the Version probe.
-        manager: Result<(), super::ManagerUnavailable>,
+        /// The manager's answer to the Version probe: its major version.
+        manager: Result<u32, super::ManagerUnavailable>,
         /// The unit's `ActiveState`, or the read error.
         unit_state: Result<String, String>,
         /// How many times the unit was read.
@@ -391,7 +402,7 @@ pub(crate) mod double {
 
     thread_local! {
         static DOUBLE: RefCell<Double> = RefCell::new(Double {
-            manager: Ok(()),
+            manager: Ok(DOUBLE_MANAGER_VERSION),
             unit_state: Ok("inactive".to_string()),
             unit_reads: 0,
             full_runner: false,
@@ -498,7 +509,7 @@ pub(crate) mod double {
     /// Make the manager on this thread answer (`None`) or not, sorted as `kind`.
     pub(crate) fn set_manager(kind: Option<super::ManagerUnavailableKind>) {
         DOUBLE.with_borrow_mut(|double| {
-            double.manager = kind.map_or(Ok(()), |kind| {
+            double.manager = kind.map_or(Ok(DOUBLE_MANAGER_VERSION), |kind| {
                 Err(super::ManagerUnavailable {
                     kind,
                     runtime_dir: Some("/run/user/0".into()),
@@ -509,8 +520,13 @@ pub(crate) mod double {
         });
     }
 
-    pub(super) fn manager() -> Result<(), super::ManagerUnavailable> {
+    pub(super) fn manager() -> Result<u32, super::ManagerUnavailable> {
         DOUBLE.with_borrow(|double| double.manager.clone())
+    }
+
+    /// Make the manager on this thread answer with major version `version`.
+    pub(crate) fn set_manager_version(version: u32) {
+        DOUBLE.with_borrow_mut(|double| double.manager = Ok(version));
     }
 
     /// Make every later unit read on this thread answer `state`.
@@ -897,15 +913,21 @@ mod tests {
     /// shim notice is no answer; a real manager's version is the control.
     #[test]
     fn a_version_probe_answers_only_with_a_version() {
-        assert!(
-            !is_version_answer(
+        assert_eq!(
+            manager_major_version(
                 "System has not been booted with systemd as init system (PID 1). Can't operate.\n"
             ),
+            None,
             "an exit-0 notice with no version was read as a manager's answer"
         );
-        assert!(!is_version_answer(""), "empty output was read as an answer");
-        assert!(
-            is_version_answer("257.9-1.fc45\n"),
+        assert_eq!(
+            manager_major_version(""),
+            None,
+            "empty output was read as an answer"
+        );
+        assert_eq!(
+            manager_major_version("257.9-1.fc45\n"),
+            Some(257),
             "control: a manager's version is an answer"
         );
     }

@@ -480,14 +480,25 @@ fn dry_run_not_checked_line(phase: PhaseId, base: &str) -> String {
 }
 
 /// D-03 (review codex-2, agy-6): refuse `verb` when the systemd user manager does not
-/// answer, with no fallback launch. The refusal carries systemctl's stderr and names
-/// what is missing; only an Absent manager gets the lingering hint.
+/// answer, or answers with a version older than [`crate::service::MIN_SYSTEMD_VERSION`],
+/// with no fallback launch. The refusal carries systemctl's stderr and names what is
+/// missing; only an Absent manager gets the lingering hint.
 pub(crate) fn refuse_without_a_user_manager(
     phase: PhaseId,
     verb: LaunchVerb,
 ) -> Result<(), CliError> {
-    let Err(unavailable) = crate::service::manager_available() else {
-        return Ok(());
+    let unavailable = match crate::service::manager_available() {
+        Ok(version) if version < crate::service::MIN_SYSTEMD_VERSION => {
+            return Err(CliError::Message(format!(
+                "{} refused for phase {phase}: systemd user manager {version} is older than \
+                 {}, which DevFlow's unit launch needs (systemd-run --expand-environment=no); \
+                 nothing was written",
+                verb.label(),
+                crate::service::MIN_SYSTEMD_VERSION
+            )));
+        }
+        Ok(_) => return Ok(()),
+        Err(unavailable) => unavailable,
     };
     let hint = if unavailable.kind == crate::service::ManagerUnavailableKind::Absent {
         "; unattended runs need one: loginctl enable-linger, or see \
@@ -2127,7 +2138,7 @@ pub(crate) fn runner_liveness(
     // D-03, agy-2: with no manager there is no unit to read; only positive evidence
     // of that (Absent) lets the lock answer alone, and the verb says so.
     match crate::service::manager_available() {
-        Ok(()) => {}
+        Ok(_) => {}
         Err(unavailable) if unavailable.kind == crate::service::ManagerUnavailableKind::Absent => {
             eprintln!("{}", unavailable.describe(phase));
             return Ok(RunnerLiveness::NotLive);
@@ -6777,6 +6788,29 @@ mod tests {
             line.starts_with("live") && line.contains("in plan"),
             "post_exit_line did not return the live line at its bound: {line}"
         );
+    }
+
+    /// A launch refuses, before anything is written, under a user manager older than
+    /// systemd 254, whose `systemd-run` lacks `--expand-environment=no`. Control: 254
+    /// itself launches.
+    #[test]
+    fn a_user_manager_older_than_254_refuses_a_launch() {
+        use crate::service::double;
+        let phase = PhaseId::new(4404);
+        double::set_manager_version(253);
+        let refused = refuse_without_a_user_manager(phase, LaunchVerb::Start);
+        assert!(
+            matches!(&refused, Err(CliError::Message(why))
+                if why.contains("253 is older than 254") && why.contains("nothing was written")),
+            "a systemd 253 user manager did not refuse the launch: {refused:?}"
+        );
+        double::set_manager_version(crate::service::MIN_SYSTEMD_VERSION);
+        let launched = refuse_without_a_user_manager(phase, LaunchVerb::Resume);
+        assert!(
+            launched.is_ok(),
+            "control: systemd 254 launches: {launched:?}"
+        );
+        double::set_manager(None);
     }
 
     /// D-07: runner_liveness's answers, one row each, in a process of its own (the

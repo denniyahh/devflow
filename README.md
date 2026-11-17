@@ -185,7 +185,7 @@ Agents must be installed separately. Run `devflow doctor` to verify availability
 - **git** 2.30+
 - **gh CLI** 2.0+ (`devflow doctor` checks for it; no DevFlow command runs it since the Ship stage was removed)
 - **A POSIX shell** (sh/bash)
-- **A systemd user manager** (`systemctl --user`) to launch runs; lingering keeps a run alive past logout
+- **A systemd user manager** (`systemctl --user`), systemd 254 or later, to launch runs; lingering keeps a run alive past logout
 
 Agents (Claude Code, Codex, OpenCode) must be installed separately. See [DEPENDENCIES.md](DEPENDENCIES.md) for the full matrix.
 
