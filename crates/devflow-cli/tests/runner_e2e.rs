@@ -1164,3 +1164,50 @@ fn an_agent_exiting_143_without_a_stop_is_a_stage_failure() {
         shown(&output)
     );
 }
+
+/// D-05 carried (review r3 agy-2): a stop at a pending gate closes the gate and keeps
+/// the run resumable. No Abort answer is recorded, the state reads stopped and not
+/// finished, and the Err the stopped gate wait returns never reaches the failed-advance
+/// route: the runner exits with STOPPED_EXIT_CODE, no `runner_advance_failed` event is
+/// written, `infra_failures` is unchanged and no gate is left open.
+#[test]
+fn a_stop_at_a_pending_gate_closes_it_and_keeps_the_run_resumable() {
+    let phase = PhaseId::new(95);
+    let fixture = RunnerFixture::new(phase, None, FULL_RUN_CODEX);
+    let mut runner = run_to_the_validate_gate(&fixture);
+    let infra_before = fixture
+        .state()
+        .expect("the state at the gate")
+        .infra_failures;
+
+    signal_runner(&runner, libc::SIGTERM);
+    let output = wait_stopped(&mut runner, "a stop at a pending gate");
+
+    let state = fixture.state().expect("a stopped run keeps its state");
+    assert!(
+        state.stopped && !state.finished,
+        "state not stopped: {state:?}"
+    );
+    let aborts: Vec<_> = fixture
+        .events_of("gate_resolved")
+        .into_iter()
+        .filter(|event| event["action"] == "abort")
+        .collect();
+    assert!(aborts.is_empty(), "gate answered Abort: {aborts:?}");
+    let open: Vec<Stage> = [Stage::Plan, Stage::Code, Stage::Validate]
+        .into_iter()
+        .filter(|stage| fixture.gate_open(*stage))
+        .collect();
+    let routed = fixture.events_of("runner_advance_failed");
+    assert!(
+        output.status.code() == Some(STOPPED_EXIT_CODE)
+            && routed.is_empty()
+            && state.infra_failures == infra_before
+            && open.is_empty(),
+        "a stop at a gate was routed as a failed advance: exit {:?}, runner_advance_failed \
+         {routed:?}, infra_failures {} (was {infra_before}), open gates {open:?}\n{}",
+        output.status.code(),
+        state.infra_failures,
+        shown(&output)
+    );
+}

@@ -19298,6 +19298,284 @@ mod tests {
         );
     }
 
+    // ---- 52.2-05: the carried stop orderings, on the runner ----
+
+    /// The `claude` stub a runner stop-ordering child runs: it answers `--version` and
+    /// otherwise prints `marker` and exits 0.
+    fn runner_claude_dir(marker: &str) -> tempfile::TempDir {
+        let path_dir = agent_free_dir_with_agent_stub("claude");
+        std::fs::write(
+            path_dir.path().join("claude"),
+            format!(
+                "#!/bin/sh\ncase \"$1\" in --version) exit 0 ;; esac\nprintf '%s\\n' '{marker}'\n"
+            ),
+        )
+        .unwrap();
+        path_dir
+    }
+
+    /// The repo a runner stop-ordering child runs in: `repo` beside its hold's release
+    /// file, which the parent owns.
+    fn runner_child_root() -> PathBuf {
+        let release = HandoffRun::release_path().expect("the parent names the hold");
+        release.parent().expect("a hold dir").join("repo")
+    }
+
+    /// The child half of a runner stop-ordering test: a Claude/Supervise state at `stage`
+    /// in [`runner_child_root`], run by [`run_runner`], which must return `expected`.
+    fn run_runner_in_stop_child(phase: PhaseId, stage: Stage, expected: i32, what: &str) {
+        let _guard = env_lock();
+        let root = runner_child_root();
+        std::fs::create_dir_all(&root).unwrap();
+        init_repo(&root);
+        std::fs::write(root.join(".gitignore"), ".devflow/\n").unwrap();
+        let git = |args: &[&str]| {
+            let output = devflow_core::test_support::git_command(&root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+        };
+        git(&["add", ".gitignore"]);
+        git(&["commit", "-q", "-m", "runner stop fixture"]);
+        crate::test_support::phase_dir_fixture(&root, phase);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Supervise, root.clone());
+        state.stage = stage;
+        state.verification_baseline_captured = true;
+        // A stub `claude` cannot answer the stream launch's canary.
+        state.canary = Some(canary::CanaryOutcome::Confirmed);
+        state.stop_until = None;
+        workflow::save_state(&state).unwrap();
+        let code = run_runner(&root, phase).expect("the runner returns an exit code");
+        let events =
+            std::fs::read_to_string(devflow_core::events::events_path(&root)).unwrap_or_default();
+        assert_eq!(
+            code, expected,
+            "{what}: the runner's exit code; events:\n{events}"
+        );
+    }
+
+    /// The parent half of a runner stop-ordering test: run `name` in a hermetic child
+    /// whose `claude` prints `marker`, with GSD answering `gsd` and `DEVFLOW_TEST_HOLD` at
+    /// `hold`. With `approve`, approve the Validate gate once it opens. Once the hold is
+    /// reached, SIGTERM the child (the runner) and release it; return the hold dir and
+    /// the child's repo root once the child passed.
+    fn run_runner_stop_child(
+        name: &str,
+        hold: &str,
+        marker: &str,
+        gsd: &[devflow_core::gsd_reader::GsdStatus],
+        approve: Option<PhaseId>,
+    ) -> (tempfile::TempDir, PathBuf) {
+        let path_dir = runner_claude_dir(marker);
+        let hold_dir = tempfile::Builder::new()
+            .prefix("dfh")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let release = hold_dir.path().join("release");
+        let root = hold_dir.path().join("repo");
+        let gsd_dir = tempfile::tempdir().unwrap();
+        let home = gsd_dir.path().join("home");
+        let replies: Vec<&str> = gsd.iter().map(|status| gsd_says(*status)).collect();
+        devflow_core::test_support::plant_gsd_run_stub(
+            &home,
+            &replies,
+            &gsd_dir.path().join("logs"),
+        );
+        let cache = hermetic_cache_dir();
+        let hold_value = std::ffi::OsString::from(format!("{hold}:{}", release.display()));
+        let env: [(&str, &std::ffi::OsStr); 4] = [
+            ("DEVFLOW_CACHE_DIR", cache.path().as_os_str()),
+            (HOLD_ENV, hold_value.as_os_str()),
+            ("DEVFLOW_GATE_TIMEOUT_SECS", std::ffi::OsStr::new("120")),
+            (crate::test_support::TEST_GSD_HOME_ENV, home.as_os_str()),
+        ];
+        let mut child =
+            devflow_core::test_support::spawn_test_in_child(name, path_dir.path(), &env);
+        let events = || {
+            std::fs::read_to_string(devflow_core::events::events_path(&root)).unwrap_or_default()
+        };
+        let fail = |child: &mut std::process::Child, why: String| -> ! {
+            let _ = child.kill();
+            let output = killed_child_output(child);
+            panic!("{why}; events:\n{}\n{output}", events());
+        };
+        if let Some(phase) = approve {
+            let gate = devflow_core::gates::Gates::gate_path(&root, phase, Stage::Validate);
+            if !poll_until(HANDOFF_STEP_WAIT, || gate.exists()) {
+                fail(&mut child, "the Validate gate never opened".to_string());
+            }
+            answer_open_gate(&root, phase, Stage::Validate, &gate_response(true, None)).unwrap();
+        }
+        let held = hold_dir.path().join("release.held");
+        if !poll_until(TEST_HOLD_WAIT, || held.exists()) {
+            fail(&mut child, format!("the hold was never reached: {hold}"));
+        }
+        let pid = libc::pid_t::try_from(child.id()).expect("a pid_t");
+        // SAFETY: a plain kill(2) on the child this test spawned and has not reaped.
+        assert_eq!(
+            unsafe { libc::kill(pid, libc::SIGTERM) },
+            0,
+            "SIGTERM the runner"
+        );
+        std::fs::write(&release, "").unwrap();
+        if !poll_until(HANDOFF_STEP_WAIT, || {
+            child.try_wait().is_ok_and(|status| status.is_some())
+        }) {
+            fail(
+                &mut child,
+                "the runner did not exit after the stop".to_string(),
+            );
+        }
+        let output = child
+            .wait_with_output()
+            .expect("collect the child's output");
+        devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, name);
+        (hold_dir, root)
+    }
+
+    /// A killed child's output, for a failure message.
+    fn killed_child_output(child: &mut std::process::Child) -> String {
+        use std::io::Read as _;
+        let _ = child.wait();
+        let mut text = String::new();
+        if let Some(stdout) = child.stdout.as_mut() {
+            let _ = stdout.read_to_string(&mut text);
+        }
+        if let Some(stderr) = child.stderr.as_mut() {
+            let _ = stderr.read_to_string(&mut text);
+        }
+        text
+    }
+
+    /// The marker a Validate stub prints: a passing turn with a PASS verdict.
+    const RUNNER_PASS_MARKER: &str = r#"DEVFLOW_RESULT: {"status":"success","verdict":"pass"}"#;
+
+    /// D-05, carried from `a_stop_after_a_gate_answer_loses_to_a_permitted_finish`'s
+    /// control: a stop that lands at `after_commit`, the Validate approve committed and
+    /// not applied, when the approve's fresh read permits no finish (`gaps_found`),
+    /// stops the run unfinished: one stop event, no further stage launched, and the
+    /// runner exits with STOPPED_EXIT_CODE.
+    #[test]
+    fn a_stop_after_gate_approval_is_recorded_as_stopped() {
+        const NAME: &str =
+            "pipeline_launch::tests::a_stop_after_gate_approval_is_recorded_as_stopped";
+        let phase = PhaseId::new(5051);
+        if devflow_core::test_support::in_child_test(NAME) {
+            run_runner_in_stop_child(
+                phase,
+                Stage::Validate,
+                STOPPED_EXIT_CODE,
+                "stop not recorded",
+            );
+            return;
+        }
+        use devflow_core::gsd_reader::GsdStatus;
+        let (_hold, root) = run_runner_stop_child(
+            NAME,
+            "after_commit",
+            RUNNER_PASS_MARKER,
+            &[GsdStatus::Passed, GsdStatus::GapsFound],
+            Some(phase),
+        );
+        let state = workflow::load_state(&root, phase).expect("a stopped run keeps its state");
+        assert!(
+            state.stopped && !state.finished,
+            "stop not recorded: {state:?}"
+        );
+        assert!(
+            events_named(&root, "workflow_finished").is_empty(),
+            "stop not recorded: the run finished"
+        );
+        let stops = events_named(&root, "advance_stopped").len()
+            + events_named(&root, "runner_stopped").len();
+        assert_eq!(
+            (stops, stage_launched_count(&root, phase)),
+            (1, 1),
+            "stop not recorded once, or a stage launched after it; events:\n{}",
+            std::fs::read_to_string(devflow_core::events::events_path(&root)).unwrap_or_default()
+        );
+    }
+
+    /// D-05, carried from `a_stop_after_a_gate_answer_loses_to_a_permitted_finish`: the
+    /// same late stop at `after_commit` on a Validate approve whose finish is permitted
+    /// (a fresh `passed`) loses to the finish. The run reads finished with the finish's
+    /// reason, one `workflow_finished` `{"reason":"finished","shipped":false}`, no stop is
+    /// written, and the runner exits 0.
+    #[test]
+    fn a_permitted_finish_wins_over_a_late_stop() {
+        const NAME: &str = "pipeline_launch::tests::a_permitted_finish_wins_over_a_late_stop";
+        let phase = PhaseId::new(5052);
+        if devflow_core::test_support::in_child_test(NAME) {
+            run_runner_in_stop_child(phase, Stage::Validate, 0, "finished run read stopped");
+            return;
+        }
+        use devflow_core::gsd_reader::GsdStatus;
+        let (_hold, root) = run_runner_stop_child(
+            NAME,
+            "after_commit",
+            RUNNER_PASS_MARKER,
+            &[GsdStatus::Passed, GsdStatus::Passed],
+            Some(phase),
+        );
+        let state = workflow::load_state(&root, phase).expect("a finished run keeps its state");
+        assert!(
+            state.stopped && state.finished,
+            "finished run read stopped: {state:?}"
+        );
+        assert_eq!(
+            state.stop_reason.as_deref(),
+            Some(crate::pipeline_gate::FINISHED_STOP_REASON),
+            "finished run read stopped"
+        );
+        let finished = events_named(&root, "workflow_finished");
+        assert_eq!(finished.len(), 1, "{finished:?}");
+        assert_eq!(finished[0]["reason"], "finished", "{}", finished[0]);
+        assert_eq!(finished[0]["shipped"], false, "{}", finished[0]);
+        assert!(
+            events_named(&root, "advance_stopped").is_empty()
+                && events_named(&root, "runner_stopped").is_empty(),
+            "finished run read stopped: a stop was written"
+        );
+    }
+
+    /// D-05, carried from `a_stop_during_advance_stops_at_the_next_safe_point_and_launches_nothing`:
+    /// a stop that lands at `before_runner_stage`, after Plan's advance handed Code back and
+    /// before the runner begins it, starts no Code agent (no second `stage_launched`), and
+    /// the run reads stopped.
+    #[test]
+    fn a_stop_during_the_next_stage_launch_is_recorded_as_stopped() {
+        const NAME: &str =
+            "pipeline_launch::tests::a_stop_during_the_next_stage_launch_is_recorded_as_stopped";
+        let phase = PhaseId::new(5053);
+        if devflow_core::test_support::in_child_test(NAME) {
+            run_runner_in_stop_child(phase, Stage::Plan, STOPPED_EXIT_CODE, "stop not recorded");
+            return;
+        }
+        let (_hold, root) = run_runner_stop_child(
+            NAME,
+            "before_runner_stage",
+            SUCCESS_MARKER,
+            &[devflow_core::gsd_reader::GsdStatus::Passed; 4],
+            None,
+        );
+        assert_eq!(
+            stage_launched_count(&root, phase),
+            1,
+            "the next stage launched after a stop"
+        );
+        let state = workflow::load_state(&root, phase).expect("a stopped run keeps its state");
+        assert!(
+            state.stopped && !state.finished,
+            "stop not recorded: {state:?}"
+        );
+        assert_eq!(
+            events_named(&root, "runner_stopped").len(),
+            1,
+            "stop not recorded: no runner_stopped event"
+        );
+    }
+
     /// Review r2 agy-3: the runner exits 0 only for a run that reads finished or stopped
     /// at its `--until` stage. Every other row, including an absent state (an abort
     /// cleared it), exits 1.
