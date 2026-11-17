@@ -1264,6 +1264,31 @@ pub(crate) fn cleanup(project_root: &Path, force: bool) -> Result<(), CliError> 
             )));
         }
 
+        // D-07: a held runner lock is live whatever the state names, and a unit that
+        // is not yet inactive may still run its agent. cleanup holds no phase holder,
+        // so it has nowhere to wait (52.2-16 adds the wait): it refuses both, and a
+        // read it cannot make, fail-closed.
+        if let Some(phase) = phase {
+            let runner = match runner_liveness(project_root, phase) {
+                Ok(RunnerLiveness::NotLive) => None,
+                Ok(RunnerLiveness::Live { pid }) => Some(format!(
+                    "its runner holds the runner lock{}",
+                    runner_pid_note(pid)
+                )),
+                Ok(RunnerLiveness::Stopping { unit, state }) => {
+                    Some(format!("its unit {unit} still reads {state}"))
+                }
+                Err(why) => Some(format!("{why}, so a live runner cannot be ruled out")),
+            };
+            if let Some(found) = runner {
+                return Err(CliError::Message(format!(
+                    "refusing to remove worktree {} for phase {phase} — {found}; run `devflow \
+                     stop --phase {phase}` or wait for it to finish",
+                    wt.path.display(),
+                )));
+            }
+        }
+
         // 50-12: a STALE supervisor may have left its agent group running,
         // and a failed probe proves nothing either way: keep the worktree
         // unless `--force`, and name the verb that ends the orphaned run.
@@ -1476,6 +1501,22 @@ fn discard_base(project_root: &Path, existing: &workflow::Existing) -> (String, 
 enum PhaseRunLiveness {
     /// Nothing says a run is live.
     NotLive,
+    /// D-07, 999.237: the phase's runner lock is held, whatever the state names.
+    Runner {
+        /// The runner's recorded pid, `None` when its record does not read.
+        pid: Option<u32>,
+    },
+    /// D-07a: the runner lock is free, nothing else says a run is live, and the
+    /// phase's unit is not yet inactive. Not a refusal: `discard` waits on it.
+    RunnerStopping {
+        /// The phase's unit.
+        unit: String,
+        /// Its `ActiveState`.
+        state: String,
+    },
+    /// The runner lock or the unit could not be read, so a live runner cannot be
+    /// ruled out: [`runner_liveness`]'s text.
+    RunnerUnreadable(String),
     /// `cleanup`'s live-run test: the agent is running, or the supervisor answers, is
     /// a live pending launch, or still holds its liveness lock with its socket gone.
     Live {
@@ -1515,7 +1556,35 @@ enum PhaseRunLiveness {
 /// file and [`probe_phase`]) misses two things: a STALE or unprobeable supervisor,
 /// which `cleanup` handles in a separate block, and a supervisor the state does not
 /// name, where there is no record to probe ([`unnamed_supervisor_liveness`]).
+///
+/// [`runner_liveness`] is read first (D-07, 999.237): a held runner lock is live and a
+/// read error refuses whatever the state names; a unit that is not yet inactive is
+/// [`PhaseRunLiveness::RunnerStopping`] only when nothing else says a run is live.
 fn phase_run_liveness(
+    project_root: &Path,
+    phase: PhaseId,
+    existing: &workflow::Existing,
+    cache_dir: Option<&Path>,
+) -> PhaseRunLiveness {
+    let runner = match runner_liveness(project_root, phase) {
+        Err(why) => return PhaseRunLiveness::RunnerUnreadable(why),
+        Ok(RunnerLiveness::Live { pid }) => return PhaseRunLiveness::Runner { pid },
+        Ok(runner) => runner,
+    };
+    match (
+        supervisor_run_liveness(project_root, phase, existing, cache_dir),
+        runner,
+    ) {
+        (PhaseRunLiveness::NotLive, RunnerLiveness::Stopping { unit, state }) => {
+            PhaseRunLiveness::RunnerStopping { unit, state }
+        }
+        (liveness, _) => liveness,
+    }
+}
+
+/// The supervisor half of [`phase_run_liveness`]: the four checks that predate the
+/// runner.
+fn supervisor_run_liveness(
     project_root: &Path,
     phase: PhaseId,
     existing: &workflow::Existing,
@@ -1548,6 +1617,70 @@ fn phase_run_liveness(
         return PhaseRunLiveness::Orphaned(supervisor);
     }
     unnamed_supervisor_liveness(project_root, phase, existing, cache_dir)
+}
+
+/// D-07: what the phase's runner says about a run. One runner lock answers for every
+/// launch, so it is read whatever the state names (999.237).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RunnerLiveness {
+    /// The runner lock is held: a runner is alive.
+    Live {
+        /// The runner's recorded pid, `None` when its record does not read.
+        pid: Option<u32>,
+    },
+    /// The lock is free and the phase's unit is neither `inactive` nor `failed`: a
+    /// runner that has let go of its lock and is still exiting (D-07a).
+    Stopping {
+        /// The phase's unit.
+        unit: String,
+        /// Its `ActiveState`.
+        state: String,
+    },
+    /// The lock is free and the unit is gone.
+    NotLive,
+}
+
+/// D-07: read [`liveness::runner_lock_path`] first, then, with the lock free, the
+/// phase's unit. Only [`RunnerLiveness::Live`] is a live-run refusal (D-12 as
+/// corrected): a stopping unit is waited on, never refused before the wait.
+///
+/// # Errors
+/// The lock could not be probed, or the unit's state could not be read: text naming
+/// what failed, systemctl's stderr included. Never read as free or inactive.
+pub(crate) fn runner_liveness(
+    project_root: &Path,
+    phase: PhaseId,
+) -> Result<RunnerLiveness, String> {
+    let lock = liveness::runner_lock_path(project_root, phase);
+    match liveness::probe(&lock) {
+        Err(error) => {
+            return Err(format!(
+                "its runner lock {} could not be probed ({error})",
+                lock.display()
+            ));
+        }
+        Ok(liveness::Held::Live) => {
+            let pid = liveness::live_holder(&lock)
+                .ok()
+                .flatten()
+                .map(|(pid, _)| pid);
+            return Ok(RunnerLiveness::Live { pid });
+        }
+        Ok(liveness::Held::Abandoned | liveness::Held::Missing) => {}
+    }
+    let unit = crate::service::unit_name(project_root, phase)
+        .map_err(|error| format!("its unit name could not be derived ({error})"))?;
+    let state = crate::service::unit_active_state(&unit, crate::service::SYSTEMCTL_CALL_BOUND)
+        .map_err(|why| format!("the systemd user manager could not read unit {unit}: {why}"))?;
+    Ok(match state.as_str() {
+        "inactive" | "failed" => RunnerLiveness::NotLive,
+        _ => RunnerLiveness::Stopping { unit, state },
+    })
+}
+
+/// ` (pid N)` for a runner whose record reads, else nothing.
+fn runner_pid_note(pid: Option<u32>) -> String {
+    pid.map(|pid| format!(" (pid {pid})")).unwrap_or_default()
 }
 
 /// A supervisor of this phase that `existing` does not name, once the one it names
@@ -1613,7 +1746,16 @@ fn refuse_discard_of_a_live_run(
         workflow::Existing::Missing | workflow::Existing::Loaded(_) => "is missing",
     };
     let text = match liveness {
-        PhaseRunLiveness::NotLive => return Ok(()),
+        PhaseRunLiveness::NotLive | PhaseRunLiveness::RunnerStopping { .. } => return Ok(()),
+        PhaseRunLiveness::Runner { pid } => format!(
+            "refusing to discard phase {phase} — its runner holds the runner lock{}; run \
+             `devflow stop --phase {phase}` or wait for it to finish; nothing was removed",
+            runner_pid_note(pid)
+        ),
+        PhaseRunLiveness::RunnerUnreadable(why) => format!(
+            "refusing to discard phase {phase} — {why}, so a live runner cannot be ruled out; \
+             nothing was removed"
+        ),
         PhaseRunLiveness::Live {
             agent_alive,
             supervisor,
@@ -5175,6 +5317,26 @@ fn refuse_launch_over_a_live_run(
     existing: &workflow::Existing,
     cache_dir: Option<&Path>,
 ) -> Result<(), CliError> {
+    match runner_liveness(project_root, phase) {
+        Err(why) => {
+            return Err(CliError::Message(format!(
+                "phase {phase}: {why}, so a live runner cannot be ruled out — refusing to {}; \
+                 nothing was written",
+                verb.label()
+            )));
+        }
+        Ok(RunnerLiveness::Live { pid }) => {
+            return Err(CliError::Message(format!(
+                "phase {phase}: its runner holds the runner lock{} — refusing to {}; nothing \
+                 was written. Run `devflow stop --phase {phase}` or wait for it to finish, then \
+                 run `{}` again.",
+                runner_pid_note(pid),
+                verb.label(),
+                verb.rerun(phase)
+            )));
+        }
+        Ok(RunnerLiveness::Stopping { .. } | RunnerLiveness::NotLive) => {}
+    }
     let state_file = workflow::state_path(project_root, phase);
     let state = match existing {
         workflow::Existing::Loaded(state) => Some(state),
@@ -7748,6 +7910,49 @@ mod tests {
     use clap::Parser;
     use devflow_core::gates::WaiterRegistration;
     use devflow_core::test_support::{gate_answer_files, with_answer_before_publish};
+
+    /// D-07 / D-12 as corrected (review agy-1): with the runner lock free, a unit that
+    /// still reads `deactivating` is not a live-run refusal for the launch guard or for
+    /// discard's liveness read; discard waits on it instead. Control: with the lock
+    /// held both refuse, naming `devflow stop`.
+    #[test]
+    fn a_lock_free_stopping_unit_is_not_a_live_run_refusal() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        let phase = PhaseId::new(4401);
+        crate::service::double::set_unit_state(Ok("deactivating"));
+        let existing = workflow::Existing::Missing;
+
+        let launch = refuse_launch_over_a_live_run(root, phase, LaunchVerb::Start, &existing, None);
+        assert!(
+            launch.is_ok(),
+            "the launch guard returned a refusal for a lock-free deactivating unit: {launch:?}"
+        );
+        let liveness = phase_run_liveness(root, phase, &existing, None);
+        assert!(
+            matches!(liveness, PhaseRunLiveness::RunnerStopping { ref state, .. } if state == "deactivating"),
+            "a lock-free deactivating unit reads RunnerStopping"
+        );
+        let discard = refuse_discard_of_a_live_run(phase, &existing, liveness);
+        assert!(
+            discard.is_ok(),
+            "discard's liveness read returned a refusal for a lock-free deactivating unit: \
+             {discard:?}"
+        );
+
+        let _hold = liveness::claim_runner_lock(root, phase).expect("hold the runner lock");
+        let stop = format!("devflow stop --phase {phase}");
+        let launch = refuse_launch_over_a_live_run(root, phase, LaunchVerb::Start, &existing, None)
+            .expect_err("control: the launch guard refuses under a held runner lock");
+        assert!(launch.to_string().contains(&stop), "control: {launch}");
+        let discard = refuse_discard_of_a_live_run(
+            phase,
+            &existing,
+            phase_run_liveness(root, phase, &existing, None),
+        )
+        .expect_err("control: discard refuses under a held runner lock");
+        assert!(discard.to_string().contains(&stop), "control: {discard}");
+    }
 
     #[test]
     fn gate_response_message_does_not_claim_pickup_after_the_waiter_goes() {
