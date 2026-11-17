@@ -77,12 +77,12 @@ Phase 51 (Rate-Limit Agent Failover) closed v3.0.0 on 2026-11-08: see `.planning
 
 ## Project Reference
 
-See: `.planning/PROJECT.md` (updated 2026-11-08)
+See: `.planning/PROJECT.md` (updated 2026-11-17)
 
 **Core value:** a coding session that outlives any one agent — the session is the repository, so another agent
 continues the same work when one runs out of quota or budget, and the run asks a human only for the decisions nothing
 else can make (restated by the operator 2026-11-08).
-**Current focus:** Phase 52.2 — Foreground Runner
+**Current focus:** Phase 53 — The Question Channel
 
 ## Operator Next Steps
 
@@ -685,7 +685,6 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
     `deferred-items.md` records it RESOLVED by the child-process migration (46-06, 46-07), and
     `46-VERIFICATION.md` re-ran the failing test 4/4 green under a real `taskset -c 0,1`. The stale
     bullet was still making `smart-entry` report `situation: blocked`.
-- 52.2 wave-4 gate: cargo test hangs on stop_e2e::stop_prints_that_an_unconfirmed_accepted_stop_is_pending (server.join waits for a connection the new stop never makes); run the gate with a timeout or port that test (52.2-07) first
 
 ## Decisions
 
@@ -1000,6 +999,9 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 52.2]: 52.2-19: operator chose fix (a) for 999.238: the proof fixture commits .gitignore lines for GSD's derived files
 - [Phase 52.2]: 52.2-19: operator: use attempt 1 as the dirty-tree control; 52.1 D-15's premise (the committed _auto_chain_active key keeps the tree clean) did not hold on attempt 2
 - [Phase 52.2]: 52.2-19: operator approved all 342 subject removed test-ledger rows
+- [Phase 52.2]: CONTEXT D-01 (operator): every run is a systemd user service; start/resume return once the runner holds its lock; no --foreground
+- [Phase 52.2]: CONTEXT D-07 (operator): the per-phase runner lock is the only liveness signal (999.237 fixed); recover removed (D-06)
+- [Phase 52.2]: CONTEXT (operator, 2026-11-16): devflow-core semver accept-break under 4.0.0, no deprecated stubs
 
 ## Roadmap Evolution
 
@@ -1180,7 +1182,7 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 
 ## Session
 
-**Last session:** 2026-11-17T22:03:10.571Z
+**Last session:** 2026-11-17T23:28:56.813Z
 **Stopped at:** Phase 52.2 complete, ready to plan Phase 53
 **Resume file:** None
 
