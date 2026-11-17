@@ -61,6 +61,104 @@ fi
 if [ "$#" -eq 3 ] && [ "$1 $2" = "--user reset-failed" ]; then exit 0; fi
 "#;
 
+/// What the fake `systemd-run` prints on stderr when the runner it started exits
+/// before it holds its runner lock: the text `systemd-run` prints for a `Type=notify`
+/// unit whose main process exits before `READY=1`.
+pub const FAKE_START_FAILED: &str = "failed because the control process exited with error code.";
+
+/// The fake `systemd-run`'s marker file: when present in its own dir, the next
+/// launch prints the file's text on stderr and exits 1, starting nothing.
+pub const FAKE_FAIL_NEXT: &str = "fail-next";
+
+/// The fake `systemd-run`. It handles a launch (`... --unit=U ...
+/// --working-directory=D ... -- PROGRAM ARGS`): it changes to D, starts the command
+/// in its own session with stdin from `/dev/null` and stdout and stderr to `U.out` in
+/// its own dir, so the caller's output capture reaches EOF when this script exits, and
+/// records the command's pid as `U.pid`. It exits 0 once a `D/.devflow/.runner-*`
+/// record's first field is that pid, and exits 1 with systemd's text when the command
+/// dies first. A `fail-next` marker makes the launch print the marker's text and
+/// exit 1 instead. `@SETSID@`, `@SLEEP@` and `@RM@` are absolute paths written in
+/// when the fake is written, because the devflow child's `PATH` can be stub-only.
+const FAKE_SYSTEMD_RUN_CALLS: &str = r#"all="$*"
+unit=""; wd=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --) shift; break ;;
+    --unit=*) unit=${1#--unit=} ;;
+    --working-directory=*) wd=${1#--working-directory=} ;;
+    -p|--setenv) shift ;;
+  esac
+  [ "$#" -gt 0 ] && shift
+done
+if [ -n "$unit" ] && [ -n "$wd" ] && [ "$#" -gt 0 ]; then
+  if [ -e "$dir/fail-next" ]; then
+    while IFS= read -r line; do echo "$line" >&2; done <"$dir/fail-next"
+    @RM@ -f "$dir/fail-next"
+    exit 1
+  fi
+  cd "$wd" || exit 1
+  @SETSID@ "$@" </dev/null >"$dir/$unit.out" 2>&1 &
+  pid=$!
+  echo "$pid" >"$dir/$unit.pid"
+  tries=0
+  while [ "$tries" -lt 600 ]; do
+    for lock in "$wd"/.devflow/.runner-*; do
+      if [ -f "$lock" ]; then
+        first=""
+        read -r first rest <"$lock"
+        if [ "$first" = "$pid" ]; then exit 0; fi
+      fi
+    done
+    state=""
+    if [ -r "/proc/$pid/stat" ]; then read -r p comm state rest <"/proc/$pid/stat"; fi
+    if [ -z "$state" ] || [ "$state" = Z ]; then
+      echo "Job for $unit @FAILED@" >&2
+      exit 1
+    fi
+    tries=$((tries + 1))
+    @SLEEP@ 0.05
+  done
+  echo "Job for $unit failed because a timeout was exceeded." >&2
+  exit 1
+fi
+set -- $all
+"#;
+
+/// The fake `loginctl`. It handles `show-user USER -p Linger --value`: `no` when a
+/// `linger.no` marker is in its own dir, otherwise `yes`.
+const FAKE_LOGINCTL_CALLS: &str = r#"if [ "$#" -eq 5 ] && [ "$1" = show-user ] && [ "$3 $4 $5" = "-p Linger --value" ]; then
+  if [ -e "$dir/linger.no" ]; then echo no; else echo yes; fi
+  exit 0
+fi
+"#;
+
+/// The absolute path of `program` on this test process's `PATH`.
+fn resolve_on_path(program: &str) -> PathBuf {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(program))
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| panic!("{program} is not on this test process's PATH"))
+}
+
+/// [`FAKE_SYSTEMD_RUN_CALLS`] with its tool paths written in.
+fn fake_systemd_run_calls() -> String {
+    let path_of = |program: &str| {
+        let path = resolve_on_path(program);
+        let text = path.to_str().expect("a UTF-8 tool path").to_string();
+        assert!(
+            !text.contains(char::is_whitespace),
+            "{program}'s path is written unquoted into the fake: {text}"
+        );
+        text
+    };
+    FAKE_SYSTEMD_RUN_CALLS
+        .replace("@SETSID@", &path_of("setsid"))
+        .replace("@SLEEP@", &path_of("sleep"))
+        .replace("@RM@", &path_of("rm"))
+        .replace("@FAILED@", FAKE_START_FAILED)
+}
+
 /// What every [`HermeticHome::agent_guard`] fake prints, after `fake <name>`,
 /// before it exits [`NO_STUB_EXIT`].
 pub const NO_STUB_TEXT: &str = ": no stub installed for this test";
@@ -170,11 +268,13 @@ impl HermeticHome {
         let service_bin = home.service_bin();
         fs::create_dir(&service_bin).expect("create the fake service-manager dir");
         let systemctl_calls = FAKE_SYSTEMCTL_CALLS.replace("@VERSION@", FAKE_SYSTEMD_VERSION);
+        let systemd_run_calls = fake_systemd_run_calls();
         for tool in SERVICE_TOOLS {
-            let calls = if tool == "systemctl" {
-                systemctl_calls.as_str()
-            } else {
-                ""
+            let calls = match tool {
+                "systemctl" => systemctl_calls.as_str(),
+                "systemd-run" => systemd_run_calls.as_str(),
+                "loginctl" => FAKE_LOGINCTL_CALLS,
+                _ => "",
             };
             write_fake_service_tool(&service_bin, tool, calls);
         }
@@ -190,7 +290,9 @@ impl HermeticHome {
     /// The dir holding the fake `systemctl`, `systemd-run` and `loginctl`,
     /// first on the `PATH` of every [`hermetic_devflow`] child. A marker file
     /// `<unit>.fail` or `<unit>.deactivating` here sets what the fake
-    /// `systemctl` reports for that unit's `ActiveState`.
+    /// `systemctl` reports for that unit's `ActiveState`; [`FAKE_FAIL_NEXT`]
+    /// fails the next launch; `linger.no` makes lingering read off. The fake
+    /// `systemd-run` writes `<unit>.pid` and `<unit>.out` here.
     pub fn service_bin(&self) -> PathBuf {
         self.home().join("service-bin")
     }
@@ -244,6 +346,12 @@ pub fn hermetic_devflow(home: &HermeticHome) -> Command {
 /// manager; every other suite runs where there is none.
 pub fn host_service_devflow(home: &HermeticHome) -> Command {
     scrubbed_devflow(home)
+}
+
+/// [`host_service_devflow`] running `program`, a copy of [`devflow_bin`], instead
+/// of the built binary. Only `service_e2e.rs` may use it.
+pub fn host_service_devflow_from(home: &HermeticHome, program: &Path) -> Command {
+    scrubbed(Command::new(program), home)
 }
 
 /// Put `home`'s fake service manager first on `command`'s `PATH`, then its
@@ -327,7 +435,11 @@ fn fake_service_dir_first_on_path(command: &Command) -> Option<PathBuf> {
 /// [`hermetic_devflow`]'s `HOME`, XDG, cache and `GIT_*` isolation, with the
 /// caller's `PATH`.
 fn scrubbed_devflow(home: &HermeticHome) -> Command {
-    let mut command = Command::new(devflow_bin());
+    scrubbed(Command::new(devflow_bin()), home)
+}
+
+/// `command` with [`scrubbed_devflow`]'s isolation.
+fn scrubbed(mut command: Command, home: &HermeticHome) -> Command {
     command
         .env("HOME", home.home())
         .env("XDG_CACHE_HOME", home.home().join(".cache"))
@@ -499,11 +611,24 @@ const REAP_EXIT_WAIT: Duration = Duration::from_secs(15);
 /// its own stop under the state write lock a moment later, and taking that lock
 /// recreates `<root>/.devflow/` when the root's `TempDir` has already been
 /// removed, leaving `/tmp/.tmpXXXXXX/.devflow/.state-NN.lock` behind.
+///
+/// [`LaunchedRunReaper::for_home`] is the runner-era form: it ends the pids the fake
+/// `systemd-run` recorded and does none of the above.
 pub struct LaunchedRunReaper {
     root: PathBuf,
     phase: PhaseId,
     spare: Vec<u32>,
+    /// The fake service-manager dir whose `*.pid` records name the runners to end,
+    /// for a reaper built by [`LaunchedRunReaper::for_home`].
+    recorded_in: Option<PathBuf>,
 }
+
+/// How long [`LaunchedRunReaper::for_home`] waits for a SIGTERMed runner to end its
+/// agent's group and exit before it SIGKILLs it.
+const REAP_RUNNER_TERM_WAIT: Duration = Duration::from_secs(20);
+
+/// How long it waits for a SIGKILLed runner to be gone.
+const REAP_RUNNER_KILL_WAIT: Duration = Duration::from_secs(5);
 
 impl LaunchedRunReaper {
     pub fn new(root: &Path, phase: PhaseId, spare: Vec<u32>) -> Self {
@@ -511,6 +636,54 @@ impl LaunchedRunReaper {
             root: root.to_path_buf(),
             phase,
             spare,
+            recorded_in: None,
+        }
+    }
+
+    /// A reaper for runs launched through `home`'s fake `systemd-run`: on drop it
+    /// SIGTERMs each runner pid the fake recorded (`<unit>.pid` in
+    /// [`HermeticHome::service_bin`]) whose argv still holds `__runner`, waits for it
+    /// to exit, and SIGKILLs one still alive after [`REAP_RUNNER_TERM_WAIT`]. It never
+    /// scans other processes' argv.
+    pub fn for_home(home: &HermeticHome, root: &Path, phase: PhaseId) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            phase,
+            spare: Vec::new(),
+            recorded_in: Some(home.service_bin()),
+        }
+    }
+
+    /// The runner pids the fake `systemd-run` recorded in `dir`.
+    fn recorded_runner_pids(dir: &Path) -> Vec<u32> {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "pid"))
+            .filter_map(|entry| fs::read_to_string(entry.path()).ok())
+            .filter_map(|text| text.trim().parse::<u32>().ok())
+            .collect()
+    }
+
+    /// End each recorded runner still running `__runner`, TERM first, then KILL.
+    fn end_recorded_runners(dir: &Path) {
+        for pid in Self::recorded_runner_pids(dir) {
+            if !runs_the_runner_verb(pid) {
+                continue;
+            }
+            let Ok(signed) = libc::pid_t::try_from(pid) else {
+                continue;
+            };
+            // SAFETY: `pid` is a process this test's fake launcher started, and its
+            // argv was just checked to still be the runner's.
+            unsafe { libc::kill(signed, libc::SIGTERM) };
+            if !exited_within(pid, REAP_RUNNER_TERM_WAIT) {
+                // SAFETY: as above.
+                unsafe { libc::kill(signed, libc::SIGKILL) };
+                let _ = exited_within(pid, REAP_RUNNER_KILL_WAIT);
+            }
         }
     }
 
@@ -628,8 +801,44 @@ impl LaunchedRunReaper {
 
 impl Drop for LaunchedRunReaper {
     fn drop(&mut self) {
+        if let Some(dir) = &self.recorded_in {
+            Self::end_recorded_runners(dir);
+            return;
+        }
         self.end_recorded_run();
         self.wait_for_supervisors_to_exit();
+    }
+}
+
+/// Whether `pid`'s argv holds a `__runner` argument.
+pub fn runs_the_runner_verb(pid: u32) -> bool {
+    process_args(pid).iter().any(|arg| arg == "__runner")
+}
+
+/// `pid`'s argv, empty when it cannot be read.
+pub fn process_args(pid: u32) -> Vec<String> {
+    fs::read(format!("/proc/{pid}/cmdline"))
+        .map(|cmdline| {
+            cmdline
+                .split(|byte| *byte == 0)
+                .filter(|arg| !arg.is_empty())
+                .map(|arg| String::from_utf8_lossy(arg).into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether `pid` is gone (or a zombie) within `within`.
+fn exited_within(pid: u32, within: Duration) -> bool {
+    let deadline = Instant::now() + within;
+    loop {
+        if !devflow_core::agent::agent_running(pid) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
