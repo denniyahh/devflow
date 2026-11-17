@@ -336,6 +336,10 @@ pub(crate) mod double {
         full_runner: bool,
         /// Every runner launch on this thread: the unit and its runner child.
         launches: Vec<(String, std::process::Child)>,
+        /// Children [`register_stop_target`] gave a unit without a launch.
+        stop_targets: Vec<(String, std::process::Child)>,
+        /// How many times the cfg(test) [`super::stop_unit`] ran on this thread.
+        stop_calls: usize,
     }
 
     thread_local! {
@@ -345,6 +349,8 @@ pub(crate) mod double {
             unit_reads: 0,
             full_runner: false,
             launches: Vec::new(),
+            stop_targets: Vec::new(),
+            stop_calls: 0,
         });
     }
 
@@ -384,11 +390,32 @@ pub(crate) mod double {
         })
     }
 
-    /// End every runner child launched on this thread for `unit` (every unit when
-    /// `None`): SIGTERM, a bounded wait for its exit, then SIGKILL, then reap.
+    /// Record `child` as a process the cfg(test) [`super::stop_unit`] of `unit` ends, as
+    /// it ends a launched runner, without counting a launch: [`launched_units`] is
+    /// unchanged. For a test whose lock-holding child stands in for a unit's runner.
+    pub(crate) fn register_stop_target(unit: &str, child: std::process::Child) {
+        DOUBLE.with_borrow_mut(|double| double.stop_targets.push((unit.to_string(), child)));
+    }
+
+    pub(super) fn record_stop() {
+        DOUBLE.with_borrow_mut(|double| double.stop_calls += 1);
+    }
+
+    /// How many times the cfg(test) [`super::stop_unit`] ran on this thread.
+    pub(crate) fn stop_calls() -> usize {
+        DOUBLE.with_borrow(|double| double.stop_calls)
+    }
+
+    /// End every runner child launched, or registered by [`register_stop_target`], on
+    /// this thread for `unit` (every unit when `None`): SIGTERM, a bounded wait for its
+    /// exit, then SIGKILL, then reap.
     pub(crate) fn end_runners(unit: Option<&str>, wait: std::time::Duration) {
         DOUBLE.with_borrow_mut(|double| {
-            for (launched, child) in &mut double.launches {
+            let children = double
+                .launches
+                .iter_mut()
+                .chain(double.stop_targets.iter_mut());
+            for (launched, child) in children {
                 if unit.is_some_and(|unit| unit != launched) {
                     continue;
                 }
@@ -697,11 +724,13 @@ pub(crate) fn stop_unit(unit: &str) -> Result<(), String> {
     }
 }
 
-/// The cfg(test) build: end the runner child the cfg(test) [`launch_runner_unit`]
-/// recorded for `unit`, SIGTERM, a wait of [`TIMEOUT_STOP_SEC`], then SIGKILL, as the
-/// manager does. Never reaches [`tool`].
+/// The cfg(test) build: count the call, then end the runner child the cfg(test)
+/// [`launch_runner_unit`] recorded for `unit` (or a child
+/// [`double::register_stop_target`] gave it), SIGTERM, a wait of [`TIMEOUT_STOP_SEC`],
+/// then SIGKILL, as the manager does. Never reaches [`tool`].
 #[cfg(test)]
 pub(crate) fn stop_unit(unit: &str) -> Result<(), String> {
+    double::record_stop();
     double::end_runners(Some(unit), TIMEOUT_STOP_SEC);
     Ok(())
 }
