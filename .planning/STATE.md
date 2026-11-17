@@ -5,16 +5,16 @@ milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: "52.2"
 current_phase_name: Foreground Runner
 status: executing
-stopped_at: Completed 52.2-15-PLAN.md
-last_updated: "2026-11-17T17:30:36.117Z"
+stopped_at: Completed 52.2-16-PLAN.md
+last_updated: "2026-11-17T18:03:16.698Z"
 last_activity: 2026-11-16
 last_activity_desc: Phase 52.2 execution started
-state_head: 65ea7ff547aee532d11d2c4ce1f214369e27c1d0
+state_head: b7daf2ed27b0cfb88e09aad5713ffb98cb1e72ce
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 66
-  completed_plans: 62
+  completed_plans: 63
   percent: 17
 ---
 
@@ -172,7 +172,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 52.2 (Foreground Runner) — EXECUTING
-Plan: 23 of 26
+Plan: 24 of 26
 Status: Ready to execute
 Last activity: 2026-11-16 — Phase 52.2 execution started
 
@@ -989,6 +989,10 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 52.2]: 52.2-14: reservation-only = loads, not finished, run_never_prepared; start proceeds over it; an unloadable state stays in place and start names discard
 - [Phase 52.2]: 52.2-14: resume_guards refuse a live run, a finished run (close-out or discard), no state (start) and an unloadable state (discard)
 - [Phase 52.2]: 52.2-15: start --dry-run runs the real guard sequence (manager probe, launch_guards over facts read without holder, lock or reservation), then ensure_agent_binary and preflight::resolve_start_base, and prints one line naming the skipped checks
+- [Phase 52.2]: 52.2-16: a stopped state counts as an incomplete run even when no start prepared it, so cleanup keeps it naming resume and discard; only a state that neither stopped nor finished and was never prepared is a dead start's reservation
+- [Phase 52.2]: 52.2-16: a held runner lock keeps that phase and cleanup goes on to the next phase, exiting non-zero at the end, instead of aborting the whole pass
+- [Phase 52.2]: 52.2-16: a phase worktree cleanup decided to remove but git refused makes the exit non-zero; a .worktrees/ entry no phase owns is handled as before
+- [Phase 52.2]: 52.2-16: cleanup counts merged against the base the run recorded, else the project's, through discard_base, so cleanup and discard agree
 
 ## Roadmap Evolution
 
@@ -1162,11 +1166,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 52.2 P13 | 16 min | 2 tasks | 9 files |
 | Phase 52.2 P14 | 28 min | 3 tasks | 8 files |
 | Phase 52.2 P15 | 17 min | 3 tasks | 8 files |
+| Phase 52.2 P16 | 26 min | 3 tasks | 7 files |
 
 ## Session
 
-**Last session:** 2026-11-17T17:30:34.288Z
-**Stopped at:** Completed 52.2-15-PLAN.md
+**Last session:** 2026-11-17T18:03:15.742Z
+**Stopped at:** Completed 52.2-16-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
