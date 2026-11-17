@@ -1055,3 +1055,112 @@ fn a_stop_in_the_second_stage_ends_a_term_ignoring_agent_and_records_stopped() {
         shown(&output)
     );
 }
+
+/// The longest gap a stop test leaves between signalling the agent's group and the
+/// runner: under the runner's grace for a stop that reaches the agent first.
+const RUNNER_SIGNAL_LAG: Duration = Duration::from_millis(100);
+
+/// The `advance_evaluated` events whose status is `failed`: a stage recorded failed.
+fn stage_failures(fixture: &RunnerFixture) -> Vec<serde_json::Value> {
+    fixture
+        .events_of("advance_evaluated")
+        .into_iter()
+        .filter(|event| event["status"] == "failed")
+        .collect()
+}
+
+/// D-04b's order under `KillMode=control-group`: SIGTERM the agent's group first, then
+/// the runner within [`RUNNER_SIGNAL_LAG`]. Returns the runner's output.
+fn stop_agent_first(fixture: &RunnerFixture, runner: &mut RunnerChild, what: &str) -> Output {
+    let pgid = agent_pid(fixture, "pid", runner);
+    let _reaper = GroupReaper(vec![pgid]);
+    common::signal_group(pgid, libc::SIGTERM);
+    std::thread::sleep(RUNNER_SIGNAL_LAG);
+    signal_runner(runner, libc::SIGTERM);
+    wait_stopped(runner, what)
+}
+
+/// D-04b: a stop whose SIGTERM reaches the agent before the runner (the agent dies by
+/// SIGTERM) still records `stopped`, and no stage-failure event is written.
+#[test]
+fn a_stop_whose_sigterm_reaches_the_agent_first_records_stopped() {
+    let fixture = RunnerFixture::new(PhaseId::new(92), None, &codex_waiting_with_pid(""));
+    let mut runner = fixture.spawn_runner();
+    let output = stop_agent_first(&fixture, &mut runner, "agent first");
+    let failures = stage_failures(&fixture);
+    assert!(
+        failures.is_empty(),
+        "stage_failed after a stop: {failures:?}\n{}",
+        shown(&output)
+    );
+    let state = fixture.state().expect("a stopped run keeps its state");
+    assert!(
+        state.stopped && !state.finished,
+        "state not stopped: {state:?}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(STOPPED_EXIT_CODE),
+        "the runner's exit code: {}",
+        shown(&output)
+    );
+}
+
+/// D-04b (review r2 codex-4): an agent that traps SIGTERM and exits 143 (a normal exit,
+/// not a death by signal) during a stop that reaches it first still records `stopped`,
+/// and no stage-failure event is written.
+#[test]
+fn an_agent_that_traps_term_and_exits_143_during_a_stop_records_stopped() {
+    let fixture = RunnerFixture::new(
+        PhaseId::new(93),
+        None,
+        &codex_waiting_with_pid("trap 'exit 143' TERM"),
+    );
+    let mut runner = fixture.spawn_runner();
+    let output = stop_agent_first(&fixture, &mut runner, "trapped exit 143");
+    let failures = stage_failures(&fixture);
+    assert!(
+        failures.is_empty(),
+        "a trapped exit 143 during a stop read as a failure: {failures:?}\n{}",
+        shown(&output)
+    );
+    let state = fixture.state().expect("a stopped run keeps its state");
+    assert!(
+        state.stopped && !state.finished,
+        "state not stopped: {state:?}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(STOPPED_EXIT_CODE),
+        "the runner's exit code: {}",
+        shown(&output)
+    );
+}
+
+/// D-04b, the control for the two tests above: an agent that exits 143 by itself, with
+/// no stop requested within the runner's grace, is a stage failure, not `stopped`.
+#[test]
+fn an_agent_exiting_143_without_a_stop_is_a_stage_failure() {
+    let phase = PhaseId::new(94);
+    let fixture = RunnerFixture::new(phase, None, "exit 143");
+    let mut runner = fixture.spawn_runner();
+    wait_for_exit_or_gate(&fixture, &mut runner);
+    let failures = stage_failures(&fixture);
+    let state = fixture.state();
+    assert!(
+        failures.iter().any(|event| event["stage"] == "plan")
+            && state.as_ref().is_some_and(|state| !state.stopped),
+        "143 without a stop read as stopped: failures {failures:?}, state {state:?}, events {:?}",
+        all_events(&fixture)
+    );
+    if runner.running() {
+        fixture.gate(&["abort", &phase.to_string()]);
+    }
+    let output = runner.wait();
+    assert_ne!(
+        output.status.code(),
+        Some(STOPPED_EXIT_CODE),
+        "143 without a stop read as stopped: {}",
+        shown(&output)
+    );
+}
