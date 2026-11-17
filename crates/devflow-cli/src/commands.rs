@@ -233,44 +233,12 @@ pub(crate) fn fresh_state_carrying_phase_failures(
 ) -> State {
     let mut state = State::new(phase, agent, mode, project_root.to_path_buf());
     let loaded = workflow::load_state(project_root, phase);
-    if let Some(notice) = replaced_state_notice(phase, &loaded) {
-        println!("{notice}");
-    }
     let (carried, warning) = carried_phase_failures(phase, loaded);
     state.phase_validate_failures = carried;
     if let Some(warning) = warning {
         println!("{warning}");
     }
     state
-}
-
-/// The line `start` prints when the phase already has a state it replaces (OPS-02,
-/// D-35), naming which: a finished run, a stopped run with its recorded stop
-/// reason, or a state file that does not load. `None` for no state, or for a
-/// state whose run has not stopped (the live-run guard decides that case).
-/// Printed where `start` first loads the state, so `--dry-run` shows it too.
-fn replaced_state_notice(
-    phase: PhaseId,
-    loaded: &Result<State, workflow::WorkflowError>,
-) -> Option<String> {
-    match loaded {
-        Ok(state) if state.stopped => {
-            let kind = if state.finished {
-                "finished"
-            } else {
-                "stopped"
-            };
-            Some(format!(
-                "note: phase {phase}: this start replaces the state of a {kind} run (stop reason: \
-                 {})",
-                state.stop_reason.as_deref().unwrap_or("none recorded")
-            ))
-        }
-        Ok(_) | Err(workflow::WorkflowError::MissingState(_)) => None,
-        Err(err) => Some(format!(
-            "note: phase {phase}: this start replaces an unreadable state ({err})"
-        )),
-    }
 }
 
 /// The three-way carry-forward decision, split from its I/O so each case can
@@ -871,22 +839,6 @@ fn create_run_state(project_root: &Path, phase: PhaseId, state: &State) -> Resul
     })
 }
 
-/// Copy a state file that does not load aside before the guard write replaces it, since a
-/// refused `start` then removes what that write left. A copy that cannot be made
-/// refuses the launch. Its name does not read as a state ([`workflow::list_states`]).
-fn keep_unloadable_state(state_file: &Path, kept: &Path) -> Result<(), CliError> {
-    std::fs::copy(state_file, kept)
-        .map(|_| ())
-        .map_err(|error| {
-            CliError::Message(format!(
-                "could not keep a copy of the state file {} at {}, which does not load, so it was \
-             not replaced: {error}",
-                state_file.display(),
-                kept.display()
-            ))
-        })
-}
-
 /// What a launch's guard write left, at the top of `start` and `resume`.
 pub(crate) struct Reserved {
     /// Whether the guard write created the state file, so that giving the phase back
@@ -957,6 +909,15 @@ pub(crate) struct GuardFacts {
     pub(crate) live_runner: Option<LiveRunner>,
     /// The phase's run state.
     pub(crate) state: StateFact,
+    /// The phase's gate files ([`phase_gate_files`]): orphans once no run is left to
+    /// answer them (D-09a).
+    pub(crate) orphan_gate_files: Vec<PathBuf>,
+    /// The phase worktree's path, when it exists.
+    pub(crate) leftover_worktree: Option<PathBuf>,
+    /// The phase branch, when it exists.
+    pub(crate) leftover_branch: Option<String>,
+    /// The base the leftover refusal names; resolved only when a leftover was found.
+    pub(crate) base: String,
 }
 
 impl GuardFacts {
@@ -977,24 +938,90 @@ impl GuardFacts {
 
 /// Read what `verb`'s guards decide on, under the caller's phase holder and before the
 /// state write lock, so no process is spawned under that lock (D-08): first
-/// [`wait_out_a_stopping_unit`], whose liveness read gives the live row.
+/// [`wait_out_a_stopping_unit`], whose liveness read gives the live row, then the
+/// phase's gate files, then whether its worktree and branch exist (`git`).
 ///
 /// # Errors
-/// A liveness read that failed, or a unit still not inactive after the bound.
+/// A liveness read that failed, a unit still not inactive after the bound, an
+/// unreadable gates directory, or, with a leftover found, a base that does not resolve.
 pub(crate) fn gather_guard_facts(
     project_root: &Path,
     phase: PhaseId,
     verb: LaunchVerb,
 ) -> Result<GuardFacts, CliError> {
     let liveness = wait_out_a_stopping_unit(project_root, phase, verb)?;
-    Ok(GuardFacts::from_liveness(&liveness))
+    let orphan_gate_files = phase_gate_files(project_root, phase)?;
+    let worktree_path = worktree::phase_path(project_root, phase);
+    let leftover_worktree = worktree_path.exists().then_some(worktree_path);
+    let branch = format!("{FEATURE_PREFIX}phase-{}", phase.padded());
+    let leftover_branch = GitFlow::for_project(project_root)
+        .branch_exists(&branch)
+        .then_some(branch);
+    let base = if leftover_worktree.is_some() || leftover_branch.is_some() {
+        config::base_branch(project_root)
+            .map_err(CliError::Message)?
+            .value
+    } else {
+        String::new()
+    };
+    Ok(GuardFacts {
+        orphan_gate_files,
+        leftover_worktree,
+        leftover_branch,
+        base,
+        ..GuardFacts::from_liveness(&liveness)
+    })
 }
 
-/// `start`'s one guard sequence (D-12, D-26), pure over `facts`: live, then finished.
-/// The first refusal wins, and each names the verb that applies (52.1 D-09.1).
+/// `start`'s one guard sequence (D-12, D-26), pure over `facts`: live, finished,
+/// incomplete, unloadable, orphan gate files, leftover worktree or branch. The first
+/// refusal wins, and each names the verb that applies (52.1 D-09.1). A missing or
+/// reservation-only state is no run (52.1 D-20), so only the last two rows see it.
 pub(crate) fn launch_guards(phase: PhaseId, facts: &GuardFacts) -> Result<(), CliError> {
     refuse_a_live_runner(phase, LaunchVerb::Start, facts)?;
-    match &facts.state {
+    refuse_an_existing_run(phase, &facts.state)?;
+    if !facts.orphan_gate_files.is_empty() {
+        let files: Vec<String> = facts
+            .orphan_gate_files
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
+        return Err(CliError::Message(format!(
+            "phase {phase}: gate files are left with no run to answer them ({}) — refusing to \
+             start; nothing was written. Remove them with `devflow discard --phase {phase}`, \
+             then run this start again",
+            files.join(", ")
+        )));
+    }
+    if let Some(path) = &facts.leftover_worktree {
+        let what = format!("the phase worktree {}", path.display());
+        return Err(leftover_refusal(phase, &what, &facts.base));
+    }
+    if let Some(branch) = &facts.leftover_branch {
+        return Err(leftover_refusal(
+            phase,
+            &format!("branch `{branch}`"),
+            &facts.base,
+        ));
+    }
+    Ok(())
+}
+
+/// `start`'s state rows: a finished, incomplete or unloadable state refuses, each
+/// naming the verb that acts on it.
+fn refuse_an_existing_run(phase: PhaseId, state: &StateFact) -> Result<(), CliError> {
+    match state {
+        StateFact::Incomplete { stage } => Err(CliError::Message(format!(
+            "phase {phase} has an incomplete run at its {stage} stage, and `start` runs only a \
+             new phase — refusing to start; nothing was written. Continue it with \
+             `devflow resume --phase {phase}`, or remove it with `devflow discard --phase {phase}`"
+        ))),
+        StateFact::Unloadable { path, error } => Err(CliError::Message(format!(
+            "phase {phase}: its state file {} does not load ({error}), and `start` replaces \
+             nothing — refusing to start; nothing was written. Remove it with \
+             `devflow discard --phase {phase}`, then run this start again",
+            path.display()
+        ))),
         StateFact::Finished => Err(CliError::Message(format!(
             "phase {phase} finished (its Validate passed), and `start` runs only a new phase \
              — refusing to start; nothing was written. To end it, close the phase out, then remove \
@@ -1014,13 +1041,20 @@ fn refuse_a_live_runner(
     let Some(runner) = facts.live_runner else {
         return Ok(());
     };
+    // 52.1 D-26 clarification: after the stop, the verb that acts on what it leaves.
+    let then = match facts.state {
+        StateFact::Incomplete { .. } => format!("devflow resume --phase {phase}"),
+        StateFact::Finished | StateFact::Unloadable { .. } => {
+            format!("devflow discard --phase {phase}")
+        }
+        StateFact::Missing | StateFact::ReservationOnly => verb.rerun(phase),
+    };
     Err(CliError::Message(format!(
         "phase {phase}: its runner holds the runner lock{} — refusing to {}; nothing was \
-         written. Run `devflow stop --phase {phase}` or wait for it to finish, then run `{}` \
-         again.",
+         written. Run `devflow stop --phase {phase}` or wait for it to finish, then run \
+         `{then}`.",
         runner_pid_note(runner.pid),
         verb.label(),
-        verb.rerun(phase)
     )))
 }
 
@@ -1041,12 +1075,7 @@ pub(crate) fn reserve_launch(
     facts: GuardFacts,
     fresh: Option<&State>,
 ) -> Result<Reserved, CliError> {
-    let kept_unloadable_path = project_root.join(".devflow").join(format!(
-        "unloadable-state-{}-{}.json",
-        phase.padded(),
-        liveness::new_launch_id()
-    ));
-    let outcome = workflow::update_state_with(project_root, phase, |existing| {
+    let reserved = workflow::update_state_with(project_root, phase, |existing| {
         let state_file = workflow::state_path(project_root, phase);
         let facts = GuardFacts {
             state: StateFact::of(&existing, &state_file),
@@ -1059,48 +1088,24 @@ pub(crate) fn reserve_launch(
         refuse_resume_of_a_finished_run(phase, verb, &existing)?;
         #[cfg(test)]
         crate::pipeline_launch::launch_test_hold("guarded");
-        let (next, created, replaced) = match (existing, fresh) {
-            (workflow::Existing::Loaded(state), _) => (state, false, false),
-            (workflow::Existing::Missing, Some(fresh)) => (fresh.clone(), true, false),
-            (workflow::Existing::Unloadable(_), Some(fresh)) => {
-                keep_unloadable_state(&state_file, &kept_unloadable_path)?;
-                (fresh.clone(), true, true)
-            }
+        let (next, created) = match (existing, fresh) {
+            (workflow::Existing::Loaded(state), _) => (state, false),
+            (workflow::Existing::Missing, Some(fresh)) => (fresh.clone(), true),
             (workflow::Existing::Missing, None) => {
                 return Err(workflow::WorkflowError::MissingState(state_file).into());
             }
-            (workflow::Existing::Unloadable(error), None) => return Err(error.into()),
+            // 52.1 D-20: `start`'s guards refused it above; nothing replaces it.
+            (workflow::Existing::Unloadable(error), _) => return Err(error.into()),
         };
-        let outcome = ReserveOutcome {
+        let reserved = Reserved {
             state: next.clone(),
             created,
-            replaced: replaced.then(|| (state_file, kept_unloadable_path.clone())),
         };
-        Ok::<_, CliError>((created.then_some(next), outcome))
+        Ok::<_, CliError>((created.then_some(next), reserved))
     })?;
-    if let Some((path, kept)) = outcome.replaced {
-        println!(
-            "note: replaced the state file {}, which did not load, with this launch's \
-             state; its bytes are kept at {}",
-            path.display(),
-            kept.display()
-        );
-    }
     #[cfg(test)]
     crate::pipeline_launch::launch_test_hold("reserved");
-    Ok(Reserved {
-        created: outcome.created,
-        state: outcome.state,
-    })
-}
-
-/// What [`reserve_launch`]'s write-lock closure hands back to print and return.
-struct ReserveOutcome {
-    state: State,
-    created: bool,
-    /// The state file the guard write replaced because it did not load, and the copy
-    /// of its bytes.
-    replaced: Option<(PathBuf, PathBuf)>,
+    Ok(reserved)
 }
 
 // ---------------------------------------------------------------------------
@@ -1501,19 +1506,9 @@ fn discard_debris(project_root: &Path, phase: PhaseId) -> Result<DiscardDebris, 
             }
             continue;
         }
-        let Some(rest) = name
-            .strip_prefix('.')
-            .unwrap_or(&name)
-            .strip_prefix(&gate_prefix)
-        else {
+        let Some(stage) = phase_gate_file_stage(&name, &gate_prefix) else {
             continue;
         };
-        let Some(stage) = rest.split('.').next().and_then(|s| s.parse::<Stage>().ok()) else {
-            continue;
-        };
-        if name.ends_with(GATE_QUARANTINED_SUFFIX) {
-            continue;
-        }
         if name.ends_with(GATE_WAITER_SUFFIX) {
             refuse_discard_of_a_live_waiter(phase, stage, &path)?;
         }
@@ -1541,6 +1536,34 @@ fn discard_debris(project_root: &Path, phase: PhaseId) -> Result<DiscardDebris, 
     debris.gate_files.sort();
     debris.hold_temps.sort();
     Ok(debris)
+}
+
+/// The stage of `name` in the gates directory when it is one of a phase's gate files
+/// (`gate_prefix` is `NN-`): a request, answer, claim, waiter registration or write
+/// temp. `None` for any other name, a set-aside answer and a hold temp.
+fn phase_gate_file_stage(name: &str, gate_prefix: &str) -> Option<Stage> {
+    if hold_temp_final_name(name).is_some() || name.ends_with(GATE_QUARANTINED_SUFFIX) {
+        return None;
+    }
+    let rest = name
+        .strip_prefix('.')
+        .unwrap_or(name)
+        .strip_prefix(gate_prefix)?;
+    rest.split('.').next().and_then(|s| s.parse::<Stage>().ok())
+}
+
+/// The phase's gate files, sorted, as [`phase_gate_file_stage`] names them; removes
+/// nothing.
+fn phase_gate_files(project_root: &Path, phase: PhaseId) -> Result<Vec<PathBuf>, CliError> {
+    let gates = Gates::dir(project_root);
+    let gate_prefix = format!("{}-", phase.padded());
+    let mut files: Vec<PathBuf> = file_names(&gates)?
+        .into_iter()
+        .filter(|name| phase_gate_file_stage(name, &gate_prefix).is_some())
+        .map(|name| gates.join(name))
+        .collect();
+    files.sort();
+    Ok(files)
 }
 
 /// The final name a hold temp `.{final_name}.{pid}.{seq}.hold-tmp` is taken for;
@@ -5992,6 +6015,206 @@ mod tests {
         let discard = refuse_discard_of_a_live_run(phase, phase_run_liveness(root, phase))
             .expect_err("control: discard refuses under a held runner lock");
         assert!(discard.to_string().contains(&stop), "control: {discard}");
+    }
+
+    /// D-12, D-26: each of `start`'s guard rows alone refuses with its own text and
+    /// verb; facts that carry several rows get the earliest one; facts that carry none
+    /// pass. The live row fires only for a held runner lock: with no live runner (a
+    /// lock-free stopping unit reads so) and every other row empty, the guards pass.
+    #[test]
+    fn launch_guards_refuse_in_order() {
+        let phase = PhaseId::new(4402);
+        let discard = format!("devflow discard --phase {phase}");
+        let stop = format!("devflow stop --phase {phase}");
+        let resume = format!("devflow resume --phase {phase}");
+        let live = Some(LiveRunner { pid: Some(4242) });
+        let incomplete = StateFact::Incomplete { stage: Stage::Code };
+        let unloadable = StateFact::Unloadable {
+            path: PathBuf::from("/repo/.devflow/state-4402.json"),
+            error: "not json".to_string(),
+        };
+        let gates = vec![PathBuf::from("/repo/.devflow/gates/4402-code.json")];
+        let worktree = Some(PathBuf::from("/repo/.worktrees/phase-4402"));
+        let branch = Some("feature/phase-4402".to_string());
+        let base = "develop".to_string();
+        let refusal = |facts: &GuardFacts| match launch_guards(phase, facts) {
+            Ok(()) => panic!("no refusal for {facts:?}"),
+            Err(err) => err.to_string(),
+        };
+        const LIVE: &str = "holds the runner lock";
+        const FINISHED: &str = "finished (its Validate passed)";
+        const INCOMPLETE: &str = "has an incomplete run at its code stage";
+        const UNLOADABLE: &str = "does not load (not json)";
+        const GATES: &str = "gate files are left with no run to answer them";
+        const WORKTREE: &str = "the phase worktree /repo/.worktrees/phase-4402";
+        const BRANCH: &str = "branch `feature/phase-4402`";
+
+        let alone = [
+            (
+                "live",
+                GuardFacts {
+                    live_runner: live,
+                    ..GuardFacts::default()
+                },
+                LIVE,
+                &stop,
+            ),
+            (
+                "finished",
+                GuardFacts {
+                    state: StateFact::Finished,
+                    ..GuardFacts::default()
+                },
+                FINISHED,
+                &discard,
+            ),
+            (
+                "incomplete",
+                GuardFacts {
+                    state: incomplete.clone(),
+                    ..GuardFacts::default()
+                },
+                INCOMPLETE,
+                &resume,
+            ),
+            (
+                "unloadable",
+                GuardFacts {
+                    state: unloadable.clone(),
+                    ..GuardFacts::default()
+                },
+                UNLOADABLE,
+                &discard,
+            ),
+            (
+                "orphan gate files",
+                GuardFacts {
+                    orphan_gate_files: gates.clone(),
+                    ..GuardFacts::default()
+                },
+                GATES,
+                &discard,
+            ),
+            (
+                "leftover worktree",
+                GuardFacts {
+                    leftover_worktree: worktree.clone(),
+                    base: base.clone(),
+                    ..GuardFacts::default()
+                },
+                WORKTREE,
+                &discard,
+            ),
+            (
+                "leftover branch",
+                GuardFacts {
+                    leftover_branch: branch.clone(),
+                    base: base.clone(),
+                    ..GuardFacts::default()
+                },
+                BRANCH,
+                &discard,
+            ),
+        ];
+        for (row, facts, marker, verb) in &alone {
+            let text = refusal(facts);
+            assert!(
+                text.contains(marker),
+                "row {row}: refusal lacks {marker:?}: {text}"
+            );
+            assert!(
+                text.contains(verb.as_str()),
+                "row {row}: refusal does not name {verb}: {text}"
+            );
+            assert!(
+                !text.contains("--force"),
+                "row {row}: refusal offers --force: {text}"
+            );
+        }
+
+        // Several rows: the earliest wins. Each case drops the row before it.
+        let every_row = GuardFacts {
+            live_runner: live,
+            state: incomplete.clone(),
+            orphan_gate_files: gates.clone(),
+            leftover_worktree: worktree.clone(),
+            leftover_branch: branch.clone(),
+            base: base.clone(),
+        };
+        let live_text = refusal(&every_row);
+        assert!(live_text.contains(LIVE), "live is first: {live_text}");
+        assert!(
+            live_text.contains(&resume),
+            "52.1 D-26: the live refusal over an incomplete run names resume after stop: {live_text}"
+        );
+        let after_live = GuardFacts {
+            live_runner: None,
+            ..every_row.clone()
+        };
+        let text = refusal(&after_live);
+        assert!(
+            text.contains(INCOMPLETE),
+            "incomplete precedes gates: {text}"
+        );
+        assert!(!text.contains(GATES), "only the earliest row: {text}");
+        let finished = GuardFacts {
+            state: StateFact::Finished,
+            ..after_live.clone()
+        };
+        assert!(
+            refusal(&finished).contains(FINISHED),
+            "finished precedes gates"
+        );
+        let unloadable_and_more = GuardFacts {
+            state: unloadable,
+            ..after_live.clone()
+        };
+        assert!(
+            refusal(&unloadable_and_more).contains(UNLOADABLE),
+            "unloadable precedes gates"
+        );
+        let after_state = GuardFacts {
+            state: StateFact::ReservationOnly,
+            ..after_live.clone()
+        };
+        let text = refusal(&after_state);
+        assert!(
+            text.contains(GATES),
+            "a reservation-only state is no run: {text}"
+        );
+        assert!(!text.contains(WORKTREE), "only the earliest row: {text}");
+        let after_gates = GuardFacts {
+            orphan_gate_files: Vec::new(),
+            ..after_state
+        };
+        let text = refusal(&after_gates);
+        assert!(
+            text.contains(WORKTREE),
+            "the worktree precedes the branch: {text}"
+        );
+        assert!(!text.contains(BRANCH), "only the earliest row: {text}");
+
+        // No row: the guards pass.
+        assert!(
+            launch_guards(phase, &GuardFacts::default()).is_ok(),
+            "an empty set passes"
+        );
+        let reservation_only = GuardFacts {
+            state: StateFact::ReservationOnly,
+            ..GuardFacts::default()
+        };
+        assert!(
+            launch_guards(phase, &reservation_only).is_ok(),
+            "52.1 D-20: reservation-only is no run"
+        );
+        let stopping = GuardFacts::from_liveness(&RunnerLiveness::Stopping {
+            unit: "devflow-x-4402.service".to_string(),
+            state: "deactivating".to_string(),
+        });
+        assert!(
+            launch_guards(phase, &stopping).is_ok(),
+            "the live row fired for a lock-free stopping unit"
+        );
     }
 
     /// Run the in-crate test `name` alone in a child process, with an empty `PATH` and
@@ -11941,54 +12164,6 @@ mod tests {
         );
     }
 
-    /// What a `start`'s guard write does over a state file that does not load. On success
-    /// the state it wrote stays.
-    fn reserve_over_an_unloadable_state(root: &Path, phase: PhaseId) -> Result<(), String> {
-        let path = workflow::state_path(root, phase);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, "{ this is not a state").unwrap();
-        let fresh = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        reserve_launch(
-            root,
-            phase,
-            LaunchVerb::Start,
-            GuardFacts::default(),
-            Some(&fresh),
-        )
-        .map(|_reserved| ())
-        .map_err(|err| err.to_string())
-    }
-
-    /// The control: with no live lock, or only a released one left by an older build, a
-    /// `start` still replaces a state file that does not load, the repair its note names.
-    #[test]
-    fn a_start_replaces_an_unloadable_state_beside_a_released_lock() {
-        const NAME: &str =
-            "commands::tests::a_start_replaces_an_unloadable_state_beside_a_released_lock";
-        if !devflow_core::test_support::in_child_test(NAME) {
-            let path_dir = crate::test_support::go_waiting_agent_dir("codex");
-            let output =
-                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
-            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(5036);
-        std::fs::create_dir_all(root.join(".devflow")).unwrap();
-        let lock = root
-            .join(".devflow")
-            .join(format!("supervisor-{}.live", liveness::new_launch_id()));
-        drop(liveness::Hold::take(&lock).unwrap());
-
-        reserve_over_an_unloadable_state(root, phase).expect("a released lock refuses nothing");
-
-        assert!(
-            workflow::load_state(root, phase).is_ok(),
-            "the guard write replaced the state file"
-        );
-    }
-
     /// A `start` that fails after its guards gives the phase back: a state its guard
     /// write created is gone, an earlier run's state is as it was, and no liveness file
     /// is left. The hold shows the guard write was really made, or a start that never
@@ -12316,55 +12491,6 @@ mod tests {
                 .iter()
                 .any(|finding| finding.repair.as_deref() == Some(resume_verb.as_str())),
             "control: a prepared run names resume"
-        );
-    }
-
-    /// A `start` refused during preparation, over a state file that does not load, leaves
-    /// that file's bytes on disk. Nothing else keeps them: its guard write replaced the file,
-    /// and giving the phase back removes what it wrote.
-    #[test]
-    fn a_start_refused_during_preparation_keeps_an_unloadable_states_bytes() {
-        const NAME: &str =
-            "commands::tests::a_start_refused_during_preparation_keeps_an_unloadable_states_bytes";
-        const BYTES: &[u8] = b"{ damaged by hand";
-        if !devflow_core::test_support::in_child_test(NAME) {
-            // No `claude` on this PATH, so `ensure_agent_binary` refuses the start.
-            let path_dir = crate::test_support::agent_free_git_only_path_dir();
-            let output =
-                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
-            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(5308);
-        let state_file = workflow::state_path(root, phase);
-        std::fs::create_dir_all(state_file.parent().unwrap()).unwrap();
-        std::fs::write(&state_file, BYTES).unwrap();
-
-        let err = start_for_test(root, phase).expect_err("no agent binary resolves");
-        assert!(err.contains("not found"), "{err}");
-
-        let kept: Vec<Vec<u8>> = std::fs::read_dir(state_file.parent().unwrap())
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .filter(|path| {
-                path.file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .contains("unloadable")
-            })
-            .map(|path| std::fs::read(path).unwrap())
-            .collect();
-        assert_eq!(
-            kept,
-            vec![BYTES.to_vec()],
-            "the bytes survive under one name"
-        );
-        assert_eq!(
-            workflow::list_states(root).len(),
-            0,
-            "the copy is not a state"
         );
     }
 
