@@ -106,14 +106,26 @@ impl UnitGuard {
     }
 }
 
+/// How long [`UnitGuard`]'s drop waits for a stopped transient unit to be collected.
+const UNIT_COLLECT_WAIT: Duration = Duration::from_secs(10);
+
 impl Drop for UnitGuard {
     fn drop(&mut self) {
         let _ = systemctl(&["stop", &self.unit]);
         let _ = systemctl(&["reset-failed", &self.unit]);
-        let load_state = systemctl(&["show", "-p", "LoadState", "--value", &self.unit]);
-        let load_state = String::from_utf8_lossy(&load_state.stdout)
-            .trim()
-            .to_string();
+        // The manager collects a stopped transient unit a moment after `stop` returns, so
+        // one read can still see it `loaded`.
+        let load_state = || {
+            let out = systemctl(&["show", "-p", "LoadState", "--value", &self.unit]);
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let deadline = Instant::now() + UNIT_COLLECT_WAIT;
+        let mut load_state_now = load_state();
+        while load_state_now != "not-found" && Instant::now() < deadline {
+            std::thread::sleep(UNIT_POLL);
+            load_state_now = load_state();
+        }
+        let load_state = load_state_now;
         if std::thread::panicking() {
             if load_state != "not-found" {
                 eprintln!("unit {} left with LoadState={load_state}", self.unit);
@@ -508,6 +520,45 @@ fn start_launches_a_unit_and_returns_with_the_run_live() {
         "lock not held after start returned:\n{}\njournal:\n{}",
         text(&out),
         journal_of(&guard.unit)
+    );
+}
+
+/// D-07: `devflow status` reads the run live right after `start` returned with the
+/// phase's unit running.
+#[test]
+#[ignore = "needs a systemd user manager; run by scripts/check.sh service"]
+fn status_reads_live_for_a_service_run_after_start_returned() {
+    assert_manager_answers();
+    let fixture = StartFixture::new(PhaseId::new(89), "sleep 120");
+    let guard = UnitGuard::named(fixture.unit());
+
+    let out = fixture.start(
+        common::host_service_devflow(&fixture.home),
+        &fixture.path(None),
+    );
+    assert!(
+        out.status.success(),
+        "start failed:\n{}\njournal:\n{}",
+        text(&out),
+        journal_of(&guard.unit)
+    );
+    let status = devflow_in(&fixture, &["status"]);
+    let row = format!("phase {}: live", fixture.phase);
+    assert!(
+        status.status.success() && String::from_utf8_lossy(&status.stdout).contains(&row),
+        "status not live:\n{}\njournal:\n{}",
+        text(&status),
+        journal_of(&guard.unit)
+    );
+
+    // Control: once the unit is stopped the same read no longer says live.
+    let stopped = systemctl(&["stop", &guard.unit]);
+    assert!(stopped.status.success(), "{}", text(&stopped));
+    let status = devflow_in(&fixture, &["status"]);
+    assert!(
+        !String::from_utf8_lossy(&status.stdout).contains(&row),
+        "control: status reads live after the unit stopped:\n{}",
+        text(&status)
     );
 }
 
