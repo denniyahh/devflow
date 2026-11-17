@@ -18,8 +18,7 @@ use crate::pipeline_gate::{
     transition,
 };
 use crate::pipeline_launch::{
-    StageLaunch, close_gate, commit, launch_stage_next, record_relaunch_note,
-    recorded_canary_refusal,
+    StageLaunch, close_gate, commit, launch_stage, record_relaunch_note, recorded_canary_refusal,
 };
 pub(crate) use devflow_core::gates::render_gate_context;
 use devflow_core::gates::{GateAction, GateFile, GateKind, GateLabel, GateResponse};
@@ -1699,14 +1698,14 @@ fn run_status_less_step(
     state.gate_pending = false;
     match step {
         StatusLessStep::RetryStage | StatusLessStep::RelaunchNow => {
-            launch_stage_next(state, None, Some(stage))
+            launch_stage(state, None, Some(stage))
         }
         StatusLessStep::RelaunchWithNote(note) => {
             // GATE-01 / D-39: the note is the operator's word for this
             // relaunch, committed before the launch. It is never the fix
             // request, so `code_fix` and `code_fix_note` are left alone.
             record_relaunch_note(state, Some(note))?;
-            launch_stage_next(state, None, Some(stage))
+            launch_stage(state, None, Some(stage))
         }
         StatusLessStep::RelaunchRefused { refusal, note } => {
             // 52-26: a reject's note is kept for the `devflow resume --agent
@@ -2308,7 +2307,7 @@ fn relaunch_or_refuse(
 ) -> Result<Option<StageLaunch>, CliError> {
     match recorded_canary_refusal(state) {
         Some(refusal) => refuse_relaunch(project_root, state, stage, &refusal).map(|()| None),
-        None => launch_stage_next(state, None, Some(stage)),
+        None => launch_stage(state, None, Some(stage)),
     }
 }
 

@@ -4598,58 +4598,6 @@ fn refuse_resume_of_a_finished_run(
     }
 }
 
-/// What a foreground process's live-supervisor check found: the phase's recorded and
-/// pending supervisors, read as [`refuse_launch_over_a_live_run`] reads them, as refusal
-/// text and launch ids. `None` when none is live. A socket directory that cannot be listed
-/// cannot rule one out, so it refuses too (fail closed). It only reads: the
-/// abandoned-reservation clearing stays in [`reserve_launch`], and it reads no agent pid
-/// file, because the property here is "no live supervisor".
-fn find_live_supervisors(project_root: &Path, phase: PhaseId) -> Option<(String, Vec<String>)> {
-    let state = workflow::load_state(project_root, phase).ok();
-    let cache_dir = registry::cache_dir();
-    match possibly_live_sockets(project_root, phase, state.as_ref(), cache_dir.as_deref()) {
-        Ok(sockets) if sockets.is_empty() => None,
-        Ok(sockets) => {
-            let listed: Vec<String> = sockets
-                .iter()
-                .map(|socket| format!("launch {} ({})", socket.launch_id, socket.liveness))
-                .collect();
-            Some((
-                format!("has a live supervisor ({})", listed.join(", ")),
-                sockets.into_iter().map(|socket| socket.launch_id).collect(),
-            ))
-        }
-        Err((dir, why)) => Some((
-            format!(
-                "may have a live supervisor: the socket directory {} could not be listed ({why})",
-                dir.display()
-            ),
-            Vec::new(),
-        )),
-    }
-}
-
-/// D-08, D-17: a hand-run `devflow advance` refuses beside a live supervisor of its phase.
-/// The long advance lock gave this exclusion until it was deleted. It writes no state.
-pub(crate) fn refuse_advance_over_a_live_supervisor(
-    project_root: &Path,
-    phase: PhaseId,
-) -> Result<(), CliError> {
-    let Some((found, launch_ids)) = find_live_supervisors(project_root, phase) else {
-        return Ok(());
-    };
-    events::emit(
-        project_root,
-        phase,
-        "advance_failed",
-        serde_json::json!({ "reason": "live supervisor", "launch_ids": launch_ids }),
-    );
-    Err(CliError::Message(format!(
-        "advance refused: phase {phase} {found}; a hand-run advance would run beside it. Run \
-         `devflow stop --phase {phase}` to end it"
-    )))
-}
-
 /// The supervisor half of [`refuse_launch_over_a_live_run`]: the sockets of
 /// this root and phase that may still run. `state` is the loaded state, or
 /// `None` when it is missing or does not load, which sweeps the socket
