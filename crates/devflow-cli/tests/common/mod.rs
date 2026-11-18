@@ -44,7 +44,8 @@ pub const FAKE_TOOL_PREFIX: &str = "fake ";
 /// (`version.fail` in its own dir: exit 1 with the error `systemctl` prints when it
 /// cannot reach a user manager), `--user show -p ActiveState --value U` (`U.fail` in its own dir: exit 1
 /// with a bus error; `U.deactivating`: deactivating; `U.activating`: activating;
-/// otherwise inactive), `--user reset-failed U` and `--user stop U`. The stop writes
+/// `U.failed`: failed; otherwise inactive), `--user reset-failed U` (appends
+/// `reset-failed U` to [`FAKE_CALL_LOG`] and removes `U.failed`) and `--user stop U`. The stop writes
 /// `U.stop-called`, removes `U.activating`, and ends the pid the fake `systemd-run`
 /// recorded in `U.pid`: SIGKILL at once with a `U.kill` marker, else SIGTERM, a bounded
 /// wait, then SIGKILL, as the manager does at `TimeoutStopSec`. With no recorded pid it
@@ -61,10 +62,15 @@ if [ "$#" -eq 6 ] && [ "$1 $2 $3 $4 $5" = "--user show -p ActiveState --value" ]
   fi
   if [ -e "$dir/$6.deactivating" ]; then echo deactivating
   elif [ -e "$dir/$6.activating" ]; then echo activating
+  elif [ -e "$dir/$6.failed" ]; then echo failed
   else echo inactive; fi
   exit 0
 fi
-if [ "$#" -eq 3 ] && [ "$1 $2" = "--user reset-failed" ]; then exit 0; fi
+if [ "$#" -eq 3 ] && [ "$1 $2" = "--user reset-failed" ]; then
+  echo "reset-failed $3" >>"$dir/calls.log"
+  @RM@ -f "$dir/$3.failed"
+  exit 0
+fi
 if [ "$#" -eq 3 ] && [ "$1 $2" = "--user stop" ]; then
   : >"$dir/$3.stop-called"
   @RM@ -f "$dir/$3.activating"
@@ -94,6 +100,11 @@ fi
 /// unit whose main process exits before `READY=1`.
 pub const FAKE_START_FAILED: &str = "failed because the control process exited with error code.";
 
+/// The file in the fakes' dir that the fake `systemctl --user reset-failed U` and the
+/// fake `systemd-run` launch append one line each to, in call order: `reset-failed U`
+/// and `systemd-run U`.
+pub const FAKE_CALL_LOG: &str = "calls.log";
+
 /// The fake `systemd-run`'s marker file: when present in its own dir, the next
 /// launch prints the file's text on stderr and exits 1, starting nothing.
 pub const FAKE_FAIL_NEXT: &str = "fail-next";
@@ -105,7 +116,9 @@ pub const FAKE_FAIL_NEXT: &str = "fail-next";
 /// records the command's pid as `U.pid`. It exits 0 once a `D/.devflow/.runner-*`
 /// record's first field is that pid, and exits 1 with systemd's text when the command
 /// dies first. A `fail-next` marker makes the launch print the marker's text and
-/// exit 1 instead. `@SETSID@`, `@SLEEP@` and `@RM@` are absolute paths written in
+/// exit 1 instead. A `U.failed` marker (the fake `systemctl` reads the unit `failed`)
+/// makes it refuse as systemd refuses a unit still loaded: it prints that text and
+/// exits 1. Each launch first appends `systemd-run U` to [`FAKE_CALL_LOG`]. `@SETSID@`, `@SLEEP@` and `@RM@` are absolute paths written in
 /// when the fake is written, because the devflow child's `PATH` can be stub-only.
 const FAKE_SYSTEMD_RUN_CALLS: &str = r#"all="$*"
 unit=""; wd=""
@@ -119,6 +132,11 @@ while [ "$#" -gt 0 ]; do
   [ "$#" -gt 0 ] && shift
 done
 if [ -n "$unit" ] && [ -n "$wd" ] && [ "$#" -gt 0 ]; then
+  echo "systemd-run $unit" >>"$dir/calls.log"
+  if [ -e "$dir/$unit.failed" ]; then
+    echo "Failed to start transient service unit: Unit $unit was already loaded or has a fragment file." >&2
+    exit 1
+  fi
   if [ -e "$dir/fail-next" ]; then
     while IFS= read -r line; do echo "$line" >&2; done <"$dir/fail-next"
     @RM@ -f "$dir/fail-next"

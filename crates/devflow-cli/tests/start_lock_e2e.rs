@@ -123,6 +123,77 @@ fn start_proceeds_when_no_reservation_is_held() {
     );
 }
 
+/// The lines `home`'s fake service tools logged in [`common::FAKE_CALL_LOG`], in call order.
+fn service_calls(home: &common::HermeticHome) -> Vec<String> {
+    fs::read_to_string(home.service_bin().join(common::FAKE_CALL_LOG))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// A unit systemd still holds `failed` after its last run (it stays loaded until
+/// `--collect` unloads it) is reset with `systemctl --user reset-failed` before
+/// `systemd-run` launches it, so the launch does not collide with it.
+#[test]
+fn start_resets_a_failed_unit_before_launching_it() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let phase = PhaseId::new(72);
+    init_repo(root, phase);
+    let fake_bin = fake_codex("exit 0");
+    let _reaper = common::LaunchedRunReaper::for_home(&home, root, phase);
+    let unit = unit_name(root, phase);
+    fs::write(home.service_bin().join(format!("{unit}.failed")), "").unwrap();
+
+    let output = child(&home, root, phase, &fake_bin, "supervise")
+        .output()
+        .expect("run devflow start");
+    assert!(
+        output.status.success(),
+        "start over a failed unit failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        service_calls(&home),
+        [
+            format!("reset-failed {unit}"),
+            format!("systemd-run {unit}")
+        ],
+        "reset-failed runs once, before the launch"
+    );
+}
+
+/// Control for the test above: an inactive unit is launched with no reset-failed call.
+#[test]
+fn start_launches_an_inactive_unit_without_reset_failed() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let phase = PhaseId::new(73);
+    init_repo(root, phase);
+    let fake_bin = fake_codex("exit 0");
+    let _reaper = common::LaunchedRunReaper::for_home(&home, root, phase);
+    let unit = unit_name(root, phase);
+
+    let output = child(&home, root, phase, &fake_bin, "supervise")
+        .output()
+        .expect("run devflow start");
+    assert!(
+        output.status.success(),
+        "start failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        service_calls(&home),
+        [format!("systemd-run {unit}")],
+        "an inactive unit gets no reset-failed call"
+    );
+}
+
 /// D-06, at the boundary an operator reads: `devflow resume` prints the answer it set
 /// aside. The route is the Auto refusal that opens the rerun's gate in the foreground, so
 /// nothing is left running, and the gate's short timeout is what ends the command.
