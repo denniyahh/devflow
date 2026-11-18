@@ -207,6 +207,10 @@ None (`todo.match-phase 53` returned 0 matches).
   1. D-01: the MCP-consumption spike was not run in this discuss. Run it before `devflow start --until plan`
      (matches the roadmap), or let Plan schedule it as the phase's first plan?
   2. D-17: DevFlow has no discuss stage, so how should the closing run produce "real GSD discuss questions"?
+- **Operator answers (2026-11-18), recorded verbatim as operator decisions:**
+  - D-01: "1 spike now" — the spike runs before `devflow start`. Result: `53-MCP-SPIKE.md`.
+  - D-17: "2 a" — the closing run is `devflow start --until plan` on a throwaway non-DevFlow project with no
+    CONTEXT.md.
 
 ---
 
