@@ -787,6 +787,38 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.247: The Fake Service Manager Never Reports `active`, and Its Launch Can Take a Stale Lock as Ready (BACKLOG)
+
+**Found:** 2026-11-18, PR #239 external review X7 (codex, agy), confirmed against the source.
+**Defect:** the fake `systemctl` in `crates/devflow-cli/tests/common/mod.rs` reads a unit `inactive`, `activating`,
+`deactivating` or (since the X2 fix) `failed`, never `active`, so no e2e test drives the `active` arm of
+`runner_liveness` through the binary. The fake `systemd-run` exits 0 once any `.devflow/.runner-*` record's first field
+equals its child's pid, so a stale record naming a reused pid could pass as readiness.
+**Not established:** that any current test passes because of either gap; not reproduced.
+**Fix shape (not decided):** add a `U.active` marker (or read `active` while the recorded pid lives), and match the
+runner lock for the launched phase only, checking the lock is held, not just its record. **Owner:** the next fix branch.
+
+### Phase 999.246: `stop` Reloads the State Without the Phase Holder, So a Concurrent `resume` Can Make It Report "crashed" (BACKLOG)
+
+**Found:** 2026-11-18, PR #239 external review X5 (codex), confirmed against the source.
+**Defect:** `stop` calls `stop_unit` and then `stop_outcome(load_state)` without holding the phase's foreground holder
+between them (`crates/devflow-cli/src/commands.rs`, stop path), so a `resume` that starts a new runner in that window
+can be read as the stopped run and reported "crashed".
+**Not established:** not reproduced; needs a `resume` to land between the unit stop and the reload.
+**Fix shape (not decided):** hold the phase holder across `stop_unit` and the reload, as `discard` and `cleanup` do, or
+compare the reloaded state's run identity with the one read before the stop. **Owner:** the next fix branch.
+
+### Phase 999.245: A Timed-Out Launch Whose Unit Reads Not Live Clears a Run That May Have Finished a Stage (BACKLOG)
+
+**Found:** 2026-11-18, PR #239 external review X3 (codex), confirmed against the source.
+**Defect:** 999.244's `TimedOutLaunch::NotLive` arm (`crates/devflow-cli/src/commands.rs`, `clear_after_failed_launch`)
+clears the state after a timed-out launch without checking that the run never ran. A runner that finished a short stage
+and exited inside the 60 s launch bound (`TIMEOUT_START` 30 s + `SYSTEMCTL_CALL_BOUND` 30 s) would lose its recorded
+progress.
+**Not established:** needs a stage to finish in under 60 s while `systemd-run` is still waiting; not reproduced.
+**Fix shape (not decided):** on that arm, clear only when the state is unchanged from what `start` wrote (no stage
+progress, no history), else keep it and name `devflow status` and `discard`. **Owner:** the next fix branch.
+
 ### Phase 999.244: A Timed-Out `systemd-run` Makes `start` Clear the State of a Runner That May Be Live (RESOLVED 2026-11-18 — 517854b, 917af52)
 
 **Found:** 2026-11-18, PR #239 (Phase 52.2 close-out), Graphify review P2 on 307db0f, confirmed against the source.
@@ -832,6 +864,10 @@ So it predates the fixes; 16 runs cannot rule out a change in rate.
 **Fix shape (not decided):** record the unit's `Result`/`ExecMainStatus` in the assertion message, reproduce under a
 repeat loop, then fix the exit-status path or the unit's `SuccessExitStatus`. **Owner:** the next fix branch, before
 dogfooding relies on `stop`.
+**Suspected cause (PR #239 external review X4, pi; not reproduced):** the test reads `ActiveState` once right after
+`stop` (`service_e2e.rs:855`), and a unit can sit `failed` before `--collect` unloads it (pi measured about 120 ms on
+systemd 262, the window X2 is about), so the assertion races the collection. If so, the fix is in the test: wait for
+`inactive` or gone, and assert the unit's `Result` separately.
 
 ### Phase 999.241: `start` Should Warn or Refuse Up Front When GSD's Derived Files Are Not Ignored (BACKLOG)
 
