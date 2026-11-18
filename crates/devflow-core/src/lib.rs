@@ -63,28 +63,24 @@ pub mod events;
 pub mod gates;
 pub mod git;
 pub mod gsd_config;
+pub mod gsd_reader;
 pub mod history;
-pub mod hooks;
 pub mod liveness;
-pub mod lock;
 pub mod mode;
 pub mod monitor;
 pub mod outcome_policy;
 pub mod phase_id;
 pub mod prompt;
-pub mod recover;
 pub mod registry;
-pub mod ship;
-pub mod ship_evidence;
+pub mod reset_time;
 pub mod stage;
 pub mod state;
-pub mod supervisor;
+pub mod stop;
 /// Test-only helpers, also available to other crates' test targets via the
 /// `test-support` feature. Never compiled into a normal build.
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 pub mod verify;
-pub mod version;
 pub mod workflow;
 pub mod worktree;
 

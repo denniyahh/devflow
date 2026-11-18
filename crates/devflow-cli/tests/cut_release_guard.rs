@@ -104,3 +104,42 @@ fn deterministic_override_is_preserved() {
          in-code `git -c user.signingkey=` override"
     );
 }
+
+/// The body of the shell function `name` in `source`: from its `name() {`
+/// line to the first line that is exactly `}`.
+fn function_body<'a>(source: &'a str, name: &str) -> &'a str {
+    let header = format!("{name}() {{\n");
+    let start = source
+        .find(&header)
+        .unwrap_or_else(|| panic!("cut-release.sh must define {name}()"))
+        + header.len();
+    let len = source[start..]
+        .find("\n}\n")
+        .unwrap_or_else(|| panic!("{name}() in cut-release.sh has no closing brace"));
+    &source[start..start + len]
+}
+
+/// The release preflight left the runner in v4 (Phase 52, D-01/D-02): the
+/// script's `check` and `verify` steps run the unpublished
+/// `tools/release-preflight` workspace tool, and nothing in the script may
+/// call the removed `devflow release --check`/`--verify` again.
+#[test]
+fn cut_release_runs_the_release_preflight_tool() {
+    let source = script();
+
+    assert!(
+        function_body(&source, "step_check").contains("cargo run -q -p release-preflight -- check"),
+        "step_check must run `cargo run -q -p release-preflight -- check`"
+    );
+    assert!(
+        function_body(&source, "step_verify")
+            .contains("cargo run -q -p release-preflight -- verify"),
+        "step_verify must run `cargo run -q -p release-preflight -- verify`"
+    );
+    for removed in ["release --check", "release --verify"] {
+        assert!(
+            !source.contains(removed),
+            "cut-release.sh must not call the removed `devflow {removed}`"
+        );
+    }
+}

@@ -130,7 +130,18 @@ if [ "$staged" -eq 1 ]; then
     # destinations. DELETED plans remain deliberately excluded: they have no
     # index blob to scan, and listing them would turn an intentional zero-file
     # scan into a read failure.
+    # Archived plans are skipped. A milestone close moves every finished phase's
+    # PLAN.md under `.planning/milestones/<version>-phases/`, which stages the
+    # whole history as renamed destinations; those plans were written before
+    # this rule existed and no executor will ever run them, so refusing them
+    # would only block the archive commit (the v3.0.0 close, 2026-11-08, staged
+    # 120 such files with 1,788 flags). The rule is a PATH-PREFIX rule, not a
+    # filename rule: the same plan under `.planning/phases/` is still scanned,
+    # and `crates/devflow-cli/tests/plan_bashism_scanner.rs` pins both halves.
     while IFS= read -r -d '' path; do
+        case "$path" in
+            .planning/milestones/*) continue ;;
+        esac
         case "${path##*/}" in
             *PLAN.md) files+=("$path") ;;
         esac

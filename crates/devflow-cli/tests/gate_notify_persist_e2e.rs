@@ -3,14 +3,18 @@
 //!
 //! - `start_*` arms: `devflow start` captures `DEVFLOW_GATE_NOTIFY_CMD` into the
 //!   state file, and an empty value captures nothing.
-//! - `advance_*` arms: a gate fired by `devflow advance` runs the persisted
-//!   command when the variable is unset, an empty variable disables it, and a
-//!   set variable overrides it; each also checks what is saved afterwards.
-//! - `resume_*` arms: `devflow resume` replaces or clears the saved command.
-//! - `agent_*` arms: the coding agent never receives the variable. The legacy
-//!   arm reaches the agent through the detached `sh` monitor, so it also shows
-//!   that chain does not carry it; the default (pipe-owning) arm reaches the
-//!   first agent process `start` launches, which is the delivery canary.
+//! - `advance_*` arms: a gate fired by the runner `devflow resume` launches runs
+//!   the persisted command when the variable is unset, an empty variable
+//!   disables it, and a set variable overrides it; each also checks what is
+//!   saved afterwards.
+//! - `resume_*` arms: `devflow resume` replaces or clears the saved command,
+//!   and keeps it when the variable is unset (read after the first
+//!   `stage_launched` event, with an empty-variable control on that waiter).
+//! - `agent_*` arms: the coding agent never receives the variable. The capture
+//!   arm (`codex`) reaches the agent through the detached monitor, so it also
+//!   shows that chain does not carry it; the default (pipe-owning, `claude`) arm
+//!   reaches the first agent process `start` launches, which is the delivery
+//!   canary.
 //!
 //! Not covered here: the pipe-owning `__monitor` re-exec and its agent spawn
 //! (reached only after the canary, which this fixture's agent never answers)
@@ -23,6 +27,7 @@
 
 mod common;
 
+use common::HermeticPath;
 use devflow_core::gates::{GATE_NOTIFY_CMD_ENV, Gates};
 use devflow_core::mode::Mode;
 use devflow_core::phase_id::PhaseId;
@@ -56,7 +61,7 @@ fn base_repo(root: &Path) {
 }
 
 /// A `develop`-only repo whose ROADMAP names `phase` and which has no
-/// `.planning/config.json`, so `start --mode auto` parks at its Define
+/// `.planning/config.json`, so `start --mode auto` parks at its Plan
 /// preflight gate. Same shape as gate_wedge_e2e.rs `init_start_repo`.
 fn init_start_repo(root: &Path, phase: PhaseId) {
     base_repo(root);
@@ -67,12 +72,17 @@ fn init_start_repo(root: &Path, phase: PhaseId) {
         format!("# Roadmap\n\n### Phase {phase}: notify fixture\n"),
     )
     .unwrap();
-    git(root, &["add", "README.md", ".planning/ROADMAP.md"]);
+    let context = common::write_phase_context(root, phase);
+    git(
+        root,
+        &["add", "README.md", ".planning/ROADMAP.md", &context],
+    );
     git(root, &["commit", "-q", "-m", "base"]);
 }
 
-/// A repo on the phase branch with one agent commit, so `advance` from Code
-/// parks at a Code gate. Same shape as gate_wedge_e2e.rs `init_repo`.
+/// A repo on the phase branch with one agent commit and no `.planning/config.json`,
+/// so a runner resumed at Code parks at the Code preflight gate. Same shape as
+/// gate_wedge_e2e.rs `init_repo`.
 fn init_advance_repo(root: &Path, phase: PhaseId) {
     base_repo(root);
     fs::write(root.join("README.md"), "base\n").unwrap();
@@ -85,18 +95,29 @@ fn init_advance_repo(root: &Path, phase: PhaseId) {
     git(root, &["commit", "-q", "-m", "agent work"]);
 }
 
+/// The agent a run launches in the capture shape: codex gets its prompt as
+/// argv.
+const CAPTURE_AGENT: &str = "codex";
+
+/// The agent a run launches in the stream shape, through the delivery canary.
+const STREAM_AGENT: &str = "claude";
+
 struct FakeBin {
     _dir: tempfile::TempDir,
     path: PathBuf,
 }
 
+/// A fake `codex` (the capture-shape agent) and a fake `claude` (the stream
+/// shape), each of which sleeps.
 fn fake_bin_dir() -> FakeBin {
     let dir = tempfile::tempdir().unwrap();
-    let claude = dir.path().join("claude");
-    fs::write(&claude, "#!/bin/sh\nsleep 60\n").unwrap();
-    let mut permissions = fs::metadata(&claude).unwrap().permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&claude, permissions).unwrap();
+    for agent in [CAPTURE_AGENT, STREAM_AGENT] {
+        let script = dir.path().join(agent);
+        fs::write(&script, "#!/bin/sh\nsleep 60\n").unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+    }
     for program in ["git", "sh"] {
         symlink(format!("/usr/bin/{program}"), dir.path().join(program)).unwrap();
     }
@@ -133,20 +154,6 @@ fn apply_notify_env(command: &mut Command, notify: NotifyEnv<'_>) {
     };
 }
 
-fn wait_until_parked(child: &mut ParkedChild, gate: &Path, what: &str) {
-    let waited = Instant::now();
-    while !gate.exists() {
-        if let Some(status) = child.0.try_wait().expect("poll child") {
-            panic!("{what} exited ({status:?}) before parking at its gate");
-        }
-        assert!(
-            waited.elapsed() < Duration::from_secs(20),
-            "timed out after 20s waiting for {what}'s gate"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
 /// `notify_fired` is emitted after the hook has run (it runs synchronously),
 /// so once the event is on disk a sentinel the hook would create must exist.
 fn wait_for_notify_fired(root: &Path) {
@@ -165,14 +172,17 @@ fn wait_for_notify_fired(root: &Path) {
     }
 }
 
+/// Runs `start` to its return (D-11: it launches the runner unit through the fake
+/// `systemd-run` and exits 0), then waits for the runner to park at its Plan
+/// preflight gate. The caller binds a [`common::LaunchedRunReaper`] first.
 fn spawn_parked_start(
     home: &common::HermeticHome,
     root: &Path,
     phase: PhaseId,
     fake_bin: &FakeBin,
     notify: NotifyEnv<'_>,
-) -> ParkedChild {
-    spawn_parked_start_with(home, root, phase, fake_bin, notify, true)
+) {
+    spawn_parked_start_with(home, root, phase, fake_bin, notify, CAPTURE_AGENT);
 }
 
 fn spawn_parked_start_with(
@@ -181,8 +191,8 @@ fn spawn_parked_start_with(
     phase: PhaseId,
     fake_bin: &FakeBin,
     notify: NotifyEnv<'_>,
-    legacy_launch: bool,
-) -> ParkedChild {
+    agent: &str,
+) {
     let existing = std::env::var_os("PATH").unwrap_or_default();
     let path = format!("{}:{}", fake_bin.path.display(), existing.to_string_lossy());
     let mut command = common::hermetic_devflow(home);
@@ -192,51 +202,72 @@ fn spawn_parked_start_with(
             "--phase",
             &phase.to_string(),
             "--agent",
-            "claude",
+            agent,
             "--mode",
             "auto",
             "--no-worktree",
         ])
-        .args(legacy_launch.then_some("--legacy-claude-launch"))
         .arg(root)
         .current_dir(root)
-        .env("PATH", path)
+        .hermetic_path(path)
         .env("DEVFLOW_GATE_TIMEOUT_SECS", "30")
         .env(TEST_MARKER_ENV, root);
     apply_notify_env(&mut command, notify);
-    let mut start = ParkedChild(command.spawn().expect("spawn foreground start"));
-    wait_until_parked(
-        &mut start,
-        &Gates::gate_path(root, phase, Stage::Define),
-        "start",
+    let start = command.output().expect("run start");
+    assert!(
+        start.status.success(),
+        "start must launch the runner and return 0\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&start.stdout),
+        String::from_utf8_lossy(&start.stderr)
     );
-    start
+    common::wait_for(
+        || Gates::gate_path(root, phase, Stage::Plan).exists(),
+        Duration::from_secs(20),
+        "the runner's Plan gate",
+    );
 }
 
-fn spawn_parked_advance(
+/// `devflow resume` of a run saved at Code with `persisted` as its notify command,
+/// with `notify` applied to the `resume` child only. `resume` commits the variable
+/// to the state and launches the runner unit through the fake `systemd-run`, which
+/// inherits `resume`'s environment, and returns (D-11). The repo has no
+/// `.planning/config.json`, so the runner's Code launch parks at its preflight gate
+/// before any agent starts; this returns once that gate exists, with the reaper
+/// that ends the runner.
+fn resume_to_a_parked_runner(
     home: &common::HermeticHome,
     root: &Path,
     phase: PhaseId,
     persisted: Option<&str>,
     notify: NotifyEnv<'_>,
-) -> ParkedChild {
+) -> common::LaunchedRunReaper {
     let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+    state.verification_baseline_captured = true;
     state.stage = Stage::Code;
+    state.stopped = true;
     state.gate_notify_cmd = persisted.map(str::to_owned);
     devflow_core::workflow::save_state(&state).unwrap();
+    let reaper = common::LaunchedRunReaper::for_home(home, root, phase);
     let mut command = common::hermetic_devflow(home);
     command
-        .args(["advance", "--phase", &phase.to_string()])
+        .args(["resume", "--phase", &phase.to_string()])
         .arg(root)
+        .current_dir(root)
         .env("DEVFLOW_GATE_TIMEOUT_SECS", "30");
     apply_notify_env(&mut command, notify);
-    let mut advance = ParkedChild(command.spawn().expect("spawn foreground advance"));
-    wait_until_parked(
-        &mut advance,
-        &Gates::gate_path(root, phase, Stage::Code),
-        "advance",
+    let resumed = command.output().expect("run resume");
+    assert!(
+        resumed.status.success(),
+        "resume must launch the runner and return 0\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&resumed.stdout),
+        String::from_utf8_lossy(&resumed.stderr)
     );
-    advance
+    common::wait_for(
+        || Gates::gate_path(root, phase, Stage::Code).exists(),
+        Duration::from_secs(20),
+        "the runner's Code gate",
+    );
+    reaper
 }
 
 fn persisted_cmd(root: &Path, phase: PhaseId) -> Option<String> {
@@ -255,8 +286,9 @@ fn start_persists_the_notify_command_from_the_environment() {
     let sentinel = tempfile::tempdir().unwrap();
     let cmd = format!("touch {}", sentinel.path().join("fired").display());
     let fake_bin = fake_bin_dir();
+    let _run_reaper = common::LaunchedRunReaper::for_home(&home, root, phase);
 
-    let _start = spawn_parked_start(&home, root, phase, &fake_bin, NotifyEnv::Set(&cmd));
+    spawn_parked_start(&home, root, phase, &fake_bin, NotifyEnv::Set(&cmd));
 
     assert_eq!(persisted_cmd(root, phase).as_deref(), Some(cmd.as_str()));
 }
@@ -269,8 +301,9 @@ fn start_with_an_empty_notify_variable_persists_nothing() {
     let phase = PhaseId::new(94);
     init_start_repo(root, phase);
     let fake_bin = fake_bin_dir();
+    let _run_reaper = common::LaunchedRunReaper::for_home(&home, root, phase);
 
-    let _start = spawn_parked_start(&home, root, phase, &fake_bin, NotifyEnv::Set(""));
+    spawn_parked_start(&home, root, phase, &fake_bin, NotifyEnv::Set(""));
 
     assert_eq!(persisted_cmd(root, phase), None);
 }
@@ -286,7 +319,7 @@ fn advance_gate_runs_the_persisted_command_when_the_variable_is_unset() {
     let sentinel = sentinel_dir.path().join("fired");
     let cmd = format!("touch {}", sentinel.display());
 
-    let _advance = spawn_parked_advance(&home, root, phase, Some(&cmd), NotifyEnv::Unset);
+    let _runner = resume_to_a_parked_runner(&home, root, phase, Some(&cmd), NotifyEnv::Unset);
     wait_for_notify_fired(root);
 
     assert!(sentinel.exists(), "the persisted notify command must run");
@@ -310,7 +343,7 @@ fn advance_gate_prefers_a_set_variable_over_the_persisted_command() {
     let persisted_hook = format!("touch {}", persisted.display());
     let override_cmd = format!("touch {}", overriding.display());
 
-    let _advance = spawn_parked_advance(
+    let _runner = resume_to_a_parked_runner(
         &home,
         root,
         phase,
@@ -342,7 +375,7 @@ fn advance_gate_with_an_empty_variable_skips_the_persisted_command() {
     let sentinel = sentinel_dir.path().join("fired");
     let cmd = format!("touch {}", sentinel.display());
 
-    let _advance = spawn_parked_advance(&home, root, phase, Some(&cmd), NotifyEnv::Set(""));
+    let _runner = resume_to_a_parked_runner(&home, root, phase, Some(&cmd), NotifyEnv::Set(""));
     wait_for_notify_fired(root);
 
     assert!(
@@ -356,54 +389,133 @@ fn advance_gate_with_an_empty_variable_skips_the_persisted_command() {
     );
 }
 
-/// CR-03 (49-REVIEW.md): `devflow resume` applies the variable to the run's
-/// persisted command, so a command exported (or emptied) after `start`
-/// reaches the chain it launches.
-fn resume_with(notify: NotifyEnv<'_>) -> Option<String> {
+/// The shared `devflow resume` fixture: a run saved in `mode` with
+/// `gate_notify_cmd = Some("old")` and `stopped == false`, resumed with
+/// `notify` applied to the spawned child only. `observe` runs while the child,
+/// its launched run and every marked process are still owned, and its result
+/// is returned once they are reaped.
+///
+/// In `Mode::Auto` this fixture (no `.planning/config.json`, capture launch)
+/// parks at the Plan preflight gate (D-07) before any stage is launched; in
+/// `Mode::Supervise` the same preflight reports and proceeds (D-08), so the
+/// stage launches and `stage_launched` is emitted.
+fn with_spawned_resume<T>(
+    mode: Mode,
+    notify: NotifyEnv<'_>,
+    observe: impl FnOnce(&Path, PhaseId, &mut ParkedChild) -> T,
+) -> T {
     let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(97);
     init_start_repo(root, phase);
-    let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+    let mut state = State::new(phase, AgentKind::Codex, mode, root.to_path_buf());
     state.gate_notify_cmd = Some("old".to_string());
     state.verification_baseline_captured = true;
     devflow_core::workflow::save_state(&state).unwrap();
+    // The post-commit waiter's marker must not be stale: nothing in the
+    // fixture has launched a stage before `resume` is spawned.
+    assert_eq!(
+        stage_launched_events(root),
+        0,
+        "the fixture must hold no stage_launched event before resume is spawned"
+    );
     let fake_bin = fake_bin_dir();
     let _reaper = MarkedReaper(root.to_string_lossy().into_owned());
     let existing = std::env::var_os("PATH").unwrap_or_default();
     let path = format!("{}:{}", fake_bin.path.display(), existing.to_string_lossy());
     let mut command = common::hermetic_devflow(&home);
     command
-        .args([
-            "resume",
-            "--phase",
-            &phase.to_string(),
-            "--legacy-claude-launch",
-        ])
+        .args(["resume", "--phase", &phase.to_string()])
         .arg(root)
         .current_dir(root)
-        .env("PATH", path)
+        .hermetic_path(path)
         .env("DEVFLOW_GATE_TIMEOUT_SECS", "30")
         .env(TEST_MARKER_ENV, root);
     apply_notify_env(&mut command, notify);
+    let _run_reaper = common::LaunchedRunReaper::for_home(&home, root, phase);
     let mut resume = ParkedChild(command.spawn().expect("spawn resume"));
-    let _run_reaper = common::LaunchedRunReaper::new(root, phase, Vec::new());
+    observe(root, phase, &mut resume)
+}
+
+/// CR-03 (49-REVIEW.md): `devflow resume` applies the variable to the run's
+/// persisted command, so a command exported (or emptied) after `start`
+/// reaches the chain it launches.
+fn resume_with(notify: NotifyEnv<'_>) -> Option<String> {
+    with_spawned_resume(Mode::Auto, notify, |root, phase, resume| {
+        let waited = Instant::now();
+        loop {
+            let saved = persisted_cmd(root, phase);
+            if saved.as_deref() != Some("old") {
+                return saved;
+            }
+            if let Some(status) = resume.0.try_wait().expect("poll resume") {
+                // The save may land just before the exit; read once more.
+                let saved = persisted_cmd(root, phase);
+                if saved.as_deref() != Some("old") {
+                    return saved;
+                }
+                panic!("resume exited ({status:?}) without updating the persisted command");
+            }
+            assert!(
+                waited.elapsed() < Duration::from_secs(20),
+                "timed out waiting for resume to update the persisted command"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    })
+}
+
+/// The `stage_launched` events in the run's event log (none when the log does
+/// not exist yet).
+fn stage_launched_events(root: &Path) -> usize {
+    let events = root.join(".devflow").join("events.jsonl");
+    let Ok(text) = fs::read_to_string(&events) else {
+        return 0;
+    };
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|line| line["event"] == "stage_launched")
+        .count()
+}
+
+/// Waits (bounded, 20 s) for the first `stage_launched` event. The runner
+/// `resume` launched emits it when it starts the stage, after `resume` has passed
+/// `commit_notify_env` and returned (D-11), so a read after this returns sees
+/// whatever `resume` saved. A `resume` that exits non-zero, or an event that never
+/// appears, panics with the event log.
+fn wait_for_first_stage_launched(root: &Path, resume: &mut ParkedChild) {
+    let events = root.join(".devflow").join("events.jsonl");
+    let log = || fs::read_to_string(&events).unwrap_or_else(|err| format!("<unreadable: {err}>"));
     let waited = Instant::now();
     loop {
-        let saved = persisted_cmd(root, phase);
-        if saved.as_deref() != Some("old") {
-            return saved;
+        if stage_launched_events(root) > 0 {
+            return;
         }
-        if let Some(status) = resume.0.try_wait().expect("poll resume") {
-            panic!("resume exited ({status:?}) without updating the persisted command");
+        if let Some(status) = resume.0.try_wait().expect("poll resume")
+            && !status.success()
+        {
+            panic!(
+                "resume exited ({status:?}) before any stage_launched event; events:\n{}",
+                log()
+            );
         }
         assert!(
             waited.elapsed() < Duration::from_secs(20),
-            "timed out waiting for resume to update the persisted command"
+            "timed out after 20s waiting for stage_launched; events:\n{}",
+            log()
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// The saved notify command, read once `resume` has launched its stage (in
+/// supervise mode, so the fixture's Plan stage launches rather than parks).
+fn saved_after_first_stage_launched(notify: NotifyEnv<'_>) -> Option<String> {
+    with_spawned_resume(Mode::Supervise, notify, |root, phase, resume| {
+        wait_for_first_stage_launched(root, resume);
+        persisted_cmd(root, phase)
+    })
 }
 
 #[test]
@@ -414,6 +526,24 @@ fn resume_replaces_the_persisted_command_with_a_set_variable() {
 #[test]
 fn resume_with_an_empty_variable_clears_the_persisted_command() {
     assert_eq!(resume_with(NotifyEnv::Set("")), None);
+}
+
+/// 49-REVIEW.md WR-13: the arm a scheduled rate-limit resume takes. With the
+/// variable unset, `resume` keeps the run's saved command.
+#[test]
+fn resume_with_the_variable_unset_keeps_the_saved_command() {
+    assert_eq!(
+        saved_after_first_stage_launched(NotifyEnv::Unset).as_deref(),
+        Some("old"),
+        "resume with DEVFLOW_GATE_NOTIFY_CMD unset must keep the saved notify command"
+    );
+}
+
+/// Control for the waiter above: the same waiter sees an empty variable's
+/// clear, so it reads after `resume`'s save rather than before it.
+#[test]
+fn resume_with_an_empty_variable_is_seen_cleared_by_the_post_commit_waiter() {
+    assert_eq!(saved_after_first_stage_launched(NotifyEnv::Set("")), None);
 }
 
 /// Set on every spawned `start` to the fixture root, so the processes that
@@ -458,17 +588,19 @@ fn marked_processes(marker: &str) -> Vec<(u32, String, Vec<String>)> {
     found
 }
 
-/// Approve the parked Define gate, wait for the monitor chain to launch the
-/// fake agent, and return the agent's environment from `/proc`. Every marked
+/// Approve the parked Plan gate, wait for the runner to launch the fake agent,
+/// and return the agent's environment from `/proc`. Every marked
 /// process is killed before returning.
-fn agent_environment_after_define(
+fn agent_environment_after_plan_gate(
     home: &common::HermeticHome,
     root: &Path,
     phase: PhaseId,
     fake_bin: &FakeBin,
+    agent: &str,
 ) -> Vec<String> {
     let approve = common::hermetic_devflow(home)
-        .args(["gate", "approve", &phase.to_string(), "define"])
+        .args(["gate", "approve", &phase.to_string(), "--stage", "plan"])
+        .arg("--project")
         .arg(root)
         .output()
         .expect("run gate approve");
@@ -482,7 +614,7 @@ fn agent_environment_after_define(
     );
     let marker = root.to_string_lossy().into_owned();
     let _reaper = MarkedReaper(marker.clone());
-    let agent = fake_bin.path.join("claude").to_string_lossy().into_owned();
+    let agent = fake_bin.path.join(agent).to_string_lossy().into_owned();
     let waited = Instant::now();
     let environment = loop {
         if let Some((_, _, entries)) = marked_processes(&marker)
@@ -493,7 +625,7 @@ fn agent_environment_after_define(
         }
         assert!(
             waited.elapsed() < Duration::from_secs(20),
-            "timed out waiting for the monitor chain to launch the agent"
+            "timed out waiting for the runner to launch the agent"
         );
         std::thread::sleep(Duration::from_millis(20));
     };
@@ -504,24 +636,26 @@ fn agent_environment_after_define(
     environment
 }
 
-fn assert_chain_has_no_notify_variable(legacy_launch: bool) {
+fn assert_chain_has_no_notify_variable(agent: &str) {
     let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(96);
     init_start_repo(root, phase);
     let fake_bin = fake_bin_dir();
-    let _start = spawn_parked_start_with(
+    // Approving the Plan preflight gate below runs the stage in the same runner
+    // (52.2-11), so the runners the fake `systemd-run` recorded are all there is to end.
+    let _run_reaper = common::LaunchedRunReaper::for_home(&home, root, phase);
+    spawn_parked_start_with(
         &home,
         root,
         phase,
         &fake_bin,
         NotifyEnv::Set("touch /nonexistent/notify-sentinel"),
-        legacy_launch,
+        agent,
     );
-    let _run_reaper = common::LaunchedRunReaper::new(root, phase, Vec::new());
 
-    let environment = agent_environment_after_define(&home, root, phase, &fake_bin);
+    let environment = agent_environment_after_plan_gate(&home, root, phase, &fake_bin, agent);
 
     // Control: a variable set on `start` the same way does reach the agent,
     // so an absent entry below means stripped, not unread.
@@ -540,10 +674,10 @@ fn assert_chain_has_no_notify_variable(legacy_launch: bool) {
 
 #[test]
 fn agent_via_legacy_monitor_never_receives_the_notify_variable() {
-    assert_chain_has_no_notify_variable(true);
+    assert_chain_has_no_notify_variable(CAPTURE_AGENT);
 }
 
 #[test]
 fn agent_via_default_launch_canary_never_receives_the_notify_variable() {
-    assert_chain_has_no_notify_variable(false);
+    assert_chain_has_no_notify_variable(STREAM_AGENT);
 }

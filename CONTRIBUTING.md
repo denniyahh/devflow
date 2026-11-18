@@ -50,10 +50,13 @@ Two things this hook does that are load-bearing:
   `DEVFLOW_ALLOW_OFF_WORKTREE=1` when that is intended). It does nothing
   without a `.planning/STATE.md`. `scripts/phase-worktree.sh <N>` creates the
   worktree from your workspace branch.
-- `pre-push` also runs `scripts/check-workspace-divergence.sh` in a checkout
-  that carries `.workspace-divergence` (Workflow B): every difference from
-  `develop` must be declared there, and every hook and top-level script must be
-  committed executable.
+- `pre-push` also runs `scripts/check-workspace-divergence.sh` for each pushed
+  commit that carries a `.workspace-divergence` file (Workflow B), against that
+  commit and not against the checkout the push comes from: every difference
+  from `develop` must be declared there, and every hook and top-level script
+  must be committed executable. A delete and a commit with no such file are
+  skipped. The hook runs the copy of the script beside itself, so a
+  `core.hooksPath` shared by several worktrees runs one version of both.
 - `pre-commit` and `pre-push` each run any executables in
   `scripts/hooks/pre-commit.d/` and `scripts/hooks/pre-push.d/`, in name order,
   with the hook's arguments; the first failure fails the hook. `develop` ships
@@ -231,7 +234,7 @@ If you use AI agent harnesses (Claude Code, Codex, Antigravity, Hermes), custom 
    # Cuts a pristine feature/my-feature branch off origin/develop,
    # cherry-picks code commits, and strips personal/planning artifacts.
    ```
-   On a DevFlow phase branch (`feature/phase-N`) it runs in phase mode: it replays the commits scoped to that phase (`feat(N-07): ...`), wherever they were committed, onto `feature/phase-N-pr`. It ends with a fidelity report; review any path it lists as differing from your branch.
+   On a DevFlow phase branch (`feature/phase-N`) it runs in phase mode: it replays the commits scoped to that phase (`feat(N-07): ...`), wherever they were committed, onto `feature/phase-N-pr`. Before replaying, it lists on stderr every commit outside the phase's scope that touches a file which would reach `develop` (`skipped <short-sha> <subject>`); read that listing, and replay a commit that belongs in the PR with `--include <sha>` (repeatable). It ends with a fidelity report; review any path it lists as differing from your branch.
 5. Test, push, and submit the clean PR:
    ```bash
    git checkout feature/my-feature
@@ -289,12 +292,20 @@ crates/
 - `cargo fmt --check`
 - `Build + test in devcontainer`
 
-`devflow test` runs these checks locally, and
+`scripts/check.sh all` runs these checks locally, and
 [`scripts/hooks/pre-push`](scripts/hooks/pre-push) runs them before a push.
 The `--all-targets` scope is load-bearing: the narrower `cargo clippy -- -D
 warnings` does not compile test targets, so lints inside `#[cfg(test)]`
 modules pass it and then fail CI. Regression guards for this live in
 `crates/devflow-cli/tests/devcontainer_ci_failfast.rs`.
+
+`scripts/check.sh service` runs the host-only tests that start real systemd
+user units (`crates/devflow-cli/tests/service_e2e.rs`, which are `#[ignore]`
+so the container suite skips them). It is not part of `all`, because the
+pinned container has no user manager. It needs a running systemd user manager
+and `cargo-nextest`, and fails, naming what is missing, when either is absent:
+it never skips. The pre-push hook runs it on the host after the container
+gate, and CI's advisory `service` job runs it on a hosted VM.
 
 Ordinary code contributions need no agent credentials or API keys — the build
 and the full test suite run offline. Agent CLIs (Claude, Codex, OpenCode) are
@@ -330,9 +341,8 @@ does any of the following:
 4. Greps implementation text as a substitute for a runtime contract that
    could have been asserted directly.
 
-Enforcement lives at the existing review-before-Ship gate:
-`/gsd-code-review` runs before Ship and refuses to ship on Critical findings
-— this contract is applied there, not aspirational.
+Enforcement lives at code review: `/gsd-code-review` applies this contract to
+each change, so it is applied, not aspirational.
 
 The single source of truth for this contract is
 [`.claude/skills/ai-change-acceptance/`](.claude/skills/ai-change-acceptance/),
@@ -355,6 +365,13 @@ through a PR.
 > the fix is `git switch -c <branch>` first. This makes step 2's "put the work
 > on a branch" mandatory at the commit level rather than a convention an
 > inattentive release cut can skip.
+
+`scripts/cut-release.sh` runs the steps below in order. Its read-only checks
+come from the unpublished workspace tool in `tools/release-preflight`:
+`scripts/cut-release.sh check` (self-pin, `develop`/`main` divergence,
+crates.io publish order, changelog version) before the cut, and
+`scripts/cut-release.sh verify` (the tag is on `main`, the `main`→`develop`
+sync ran) after it. Both read already-fetched refs; the script fetches first.
 
 1. Bump the version in **two** places in the root `Cargo.toml`: `version`
    under `[workspace.package]`, **and** `devflow-core`'s `version` under
@@ -489,7 +506,7 @@ info!(before = %current, after = %next, phase = state.phase, "step_entered");
 
 | Variable | Purpose |
 |---|---|
-| `RUST_LOG` | Controls verbosity. Set to `error`, `warn`, `info`, `debug`, or `trace`. Use targeted directives like `devflow_core=debug,devflow=info` to filter by crate. |
+| `RUST_LOG` | Controls verbosity. Unset or empty means `off`: no tracing lines. Set to `error`, `warn`, `info`, `debug`, or `trace`. Use targeted directives like `devflow_core=debug,devflow=info` to filter by crate. |
 | `DEVFLOW_LOG_FORMAT` | Set to `json` for machine-readable JSON output (one JSON object per line on stderr). |
 
 ### Do's and Don'ts

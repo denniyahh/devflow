@@ -5,12 +5,14 @@
 //! (`crates/devflow-cli/src/main.rs`) by building an `EnvFilter` from
 //! `RUST_LOG` on both branches.
 //!
-//! This test drives `devflow recover --clean --phase 1` against a project
-//! holding `.devflow/state-01.json`. Before it deletes anything, the command
-//! loads the phase's state to refuse a live supervisor, and `workflow::load_state`
-//! emits `debug!("loading state from ...")`, giving a real DEBUG-level log line to
-//! assert on — not just "the binary didn't crash". (`devflow status` reads through
-//! `list_states`, which logs nothing at DEBUG, so it cannot serve here.)
+//! This test drives `devflow discard --phase 1` against a git repository
+//! holding `.devflow/state-01.json` and nothing else for the phase. Before it
+//! removes anything, the command loads the phase's state under the write lock
+//! (`workflow::update_state_with_within`, whose read calls `workflow::load_state`),
+//! and `load_state` emits `debug!("loading state from ...")`, giving a real
+//! DEBUG-level log line to assert on — not just "the binary didn't crash".
+//! (`devflow status` reads through `list_states`, which logs nothing at DEBUG, so
+//! it cannot serve here.)
 //!
 //! Regression guard for CR-02 (15-REVIEW.md, third round): `lib.rs` documents
 //! that "log output goes to stderr so stdout remains available for agent
@@ -32,13 +34,24 @@ use std::path::PathBuf;
 /// The DEBUG line `workflow::load_state` emits for the fixture's phase.
 const DEBUG_LINE: &str = "loading state from";
 
-/// What `recover --clean --phase 1` prints once it has cleared the fixture's state,
-/// so a test can tell "the line was filtered" from "the command never got there".
-const CLEANED_LINE: &str = "cleaned up workflow state for phase 1";
+/// What `discard --phase 1` prints once it has removed the fixture's state, so a
+/// test can tell "the line was filtered" from "the command never got there".
+const REMOVED_LINE: &str = "removed run state";
 
-/// Set up a project dir holding the per-phase state file for phase 1.
+/// Set up a git repository holding the per-phase state file for phase 1, and no
+/// worktree or branch for it. `discard` lists the repository's worktrees, so the
+/// project must be a repository.
 fn project_with_phase_state() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("create tempdir");
+    let init = devflow_core::test_support::git_command(dir.path())
+        .args(["init", "-q"])
+        .output()
+        .expect("spawn git init");
+    assert!(
+        init.status.success(),
+        "git init failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
 
     // `State` is `#[non_exhaustive]`, so a downstream crate (this one) builds it
     // via `State::new` and overrides only what this fixture actually depends on.
@@ -50,21 +63,21 @@ fn project_with_phase_state() -> tempfile::TempDir {
         Mode::Auto,
         dir.path().to_path_buf(),
     );
-    state.stage = Stage::Code; // `new` starts at Define; this fixture needs Code
+    state.stage = Stage::Code; // `new` starts at Plan; this fixture needs Code
     state.started_at = "0".to_string(); // fixed, not `timestamp_now()`, so the fixture is deterministic
     devflow_core::workflow::save_state(&state).expect("save the phase's state");
 
     dir
 }
 
-fn run_recover_clean(
+fn run_discard(
     home: &common::HermeticHome,
     dir: &PathBuf,
     log_format: Option<&str>,
     rust_log: Option<&str>,
 ) -> (String, String) {
     let mut cmd = common::hermetic_devflow(home);
-    cmd.args(["recover", "--clean", "--phase", "1"]).arg(dir);
+    cmd.args(["discard", "--phase", "1"]).arg(dir);
 
     // Start from a clean env so ambient RUST_LOG/DEVFLOW_LOG_FORMAT from the
     // test runner's shell can't leak in and mask the behavior under test.
@@ -81,7 +94,7 @@ fn run_recover_clean(
     // `.with_writer(std::io::stderr)` — CR-02 fix), separate from the CLI's
     // own `println!` output on stdout. Return both streams so callers can
     // assert log lines land on stderr and never leak onto stdout.
-    let output = cmd.output().expect("run devflow recover --clean");
+    let output = cmd.output().expect("run devflow discard");
     (
         String::from_utf8_lossy(&output.stdout).to_string(),
         String::from_utf8_lossy(&output.stderr).to_string(),
@@ -92,7 +105,7 @@ fn run_recover_clean(
 fn rust_log_debug_is_honored_under_json_log_format() {
     let home = common::HermeticHome::new();
     let dir = project_with_phase_state();
-    let (stdout, stderr) = run_recover_clean(
+    let (stdout, stderr) = run_discard(
         &home,
         &dir.path().to_path_buf(),
         Some("json"),
@@ -121,13 +134,13 @@ fn rust_log_debug_is_honored_under_json_log_format() {
 fn rust_log_default_suppresses_debug_under_json_log_format() {
     let home = common::HermeticHome::new();
     let dir = project_with_phase_state();
-    // No RUST_LOG set — main.rs falls back to INFO, so this DEBUG line must NOT
+    // No RUST_LOG set — the default filter is `off`, so this DEBUG line must NOT
     // appear. If it does, RUST_LOG is being ignored (i.e. a fixed, too-verbose
     // level is hardcoded again), the exact WR-01 bug class.
-    let (stdout, stderr) = run_recover_clean(&home, &dir.path().to_path_buf(), Some("json"), None);
+    let (stdout, stderr) = run_discard(&home, &dir.path().to_path_buf(), Some("json"), None);
 
     assert!(
-        stdout.contains(CLEANED_LINE),
+        stdout.contains(REMOVED_LINE),
         "the command must have gone through the load that logs the line, or its \
          absence below proves nothing.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
@@ -144,31 +157,44 @@ fn rust_log_default_suppresses_debug_under_json_log_format() {
     );
 }
 
-/// Regression guard for CR-01 (15-REVIEW.md, third round, commit `50db857`):
-/// `main.rs` previously built its `EnvFilter` with the bare
-/// `EnvFilter::from_default_env()`, which defaults to ERROR-only when
-/// `RUST_LOG` is unset. Fixed by falling back to `EnvFilter::new("info")`
-/// via `try_from_default_env().unwrap_or_else(...)` on both branches, so
-/// `devflow` now logs at INFO level by default with no env var set at all.
-///
-/// This drives `devflow gate approve` against a project with a single open
-/// gate — `Gates::answer` emits `info!("gate answer written for phase {phase}
-/// {stage} gate {gate}: approved=...")` as an unconditional side effect of a
-/// successful approval, giving a real INFO-level log line to assert on. If
-/// commit 50db857 were reverted (back to the bare `from_default_env()`),
-/// this line would default to being suppressed and this test would fail.
-fn project_with_open_gate(phase: PhaseId, stage: Stage) -> tempfile::TempDir {
+/// An open gate with a registered waiter, so `devflow gate approve` writes an
+/// answer and `Gates::answer` emits its `info!("gate answer written for phase
+/// {phase} {stage} gate {gate}: approved=...")` line: a real INFO-level tracing
+/// line whose presence or absence the tests below assert. (With no waiter the
+/// approval writes nothing and logs nothing.)
+fn project_with_open_gate(
+    phase: PhaseId,
+    stage: Stage,
+) -> (tempfile::TempDir, devflow_core::gates::WaiterRegistration) {
     let dir = tempfile::tempdir().expect("create tempdir");
-    Gates::write_gate(dir.path(), phase, stage, "test gate").expect("write gate");
-    dir
+    let (_, registration) = Gates::open_registered(
+        dir.path(),
+        phase,
+        stage,
+        devflow_core::gates::GateKind::StageFailure,
+        "test gate",
+    )
+    .expect("open gate");
+    (dir, registration)
 }
 
-#[test]
-fn rust_log_unset_still_shows_info_level_logs_by_default() {
+/// What one `devflow gate approve` run printed, and the tracing line its
+/// approval logs.
+struct ApproveRun {
+    stdout: String,
+    stderr: String,
+    logged: String,
+}
+
+/// Approve phase 15's one open Validate gate with `RUST_LOG` set to `rust_log`
+/// (`None` removes it) and `DEVFLOW_LOG_FORMAT` to `log_format`. Every variable
+/// is set on the child, never on this process. Asserts the approval succeeded,
+/// so a quiet stderr below means "filtered", not "never got there".
+fn approve_one_gate(rust_log: Option<&str>, log_format: Option<&str>) -> ApproveRun {
     let home = common::HermeticHome::new();
-    let dir = project_with_open_gate(PhaseId::new(15), Stage::Ship);
+    let (dir, registration) = project_with_open_gate(PhaseId::new(15), Stage::Validate);
     let gate_id = Gates::list_open(dir.path())[0].gate_id.clone();
-    let logged = format!("gate answer written for phase 15 ship gate {gate_id}: approved=true");
+    let logged = format!("gate answer written for phase 15 validate gate {gate_id}: approved=true");
 
     let mut cmd = common::hermetic_devflow(&home);
     cmd.arg("gate")
@@ -176,27 +202,101 @@ fn rust_log_unset_still_shows_info_level_logs_by_default() {
         .arg("15")
         .arg("--project")
         .arg(dir.path());
-    // No RUST_LOG, no DEVFLOW_LOG_FORMAT — exercise the true CLI default.
     cmd.env_remove("RUST_LOG");
     cmd.env_remove("DEVFLOW_LOG_FORMAT");
+    if let Some(level) = rust_log {
+        cmd.env("RUST_LOG", level);
+    }
+    if let Some(format) = log_format {
+        cmd.env("DEVFLOW_LOG_FORMAT", format);
+    }
 
     let output = cmd.output().expect("run devflow gate approve");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     assert!(
         output.status.success(),
         "devflow gate approve should succeed against a single open gate\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
-        stderr.contains(&logged),
-        "with RUST_LOG unset, an INFO-level tracing log should still reach stderr \
-         by default (CR-01 / commit 50db857 — default level is INFO, not \
-         ERROR-only), but it did not appear.\nstderr:\n{stderr}"
+        stdout.contains("response was written"),
+        "the approval must have been written, or a quiet stderr proves nothing\nstdout:\n{stdout}"
+    );
+    registration.finish();
+    ApproveRun {
+        stdout,
+        stderr,
+        logged,
+    }
+}
+
+/// The stderr lines that came from the `tracing` subscriber: a plain-format
+/// line carries a level marker word, a json-format line is an object with a
+/// `level` key.
+fn tracing_lines(stderr: &str) -> Vec<&str> {
+    const LEVELS: [&str; 5] = ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"];
+    stderr
+        .lines()
+        .filter(|line| {
+            let is_json_record = serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .is_some_and(|value| value.get("level").is_some());
+            let has_level_word = line
+                .split(|c: char| !c.is_ascii_alphabetic())
+                .any(|word| LEVELS.contains(&word));
+            is_json_record || has_level_word
+        })
+        .collect()
+}
+
+#[test]
+fn rust_log_unset_prints_no_tracing_lines() {
+    let run = approve_one_gate(None, None);
+    assert!(
+        tracing_lines(&run.stderr).is_empty() && !run.stderr.contains(&run.logged),
+        "with RUST_LOG unset, no tracing line may reach stderr (the default filter is \
+         `off`).\nstderr:\n{}",
+        run.stderr
+    );
+}
+
+#[test]
+fn rust_log_unset_prints_no_json_tracing_objects() {
+    let run = approve_one_gate(None, Some("json"));
+    assert!(
+        tracing_lines(&run.stderr).is_empty() && !run.stderr.contains(&run.logged),
+        "with RUST_LOG unset, the json branch must print no tracing object either.\n\
+         stderr:\n{}",
+        run.stderr
+    );
+}
+
+#[test]
+fn an_empty_rust_log_prints_no_tracing_lines() {
+    let run = approve_one_gate(Some(""), None);
+    assert!(
+        tracing_lines(&run.stderr).is_empty() && !run.stderr.contains(&run.logged),
+        "an empty RUST_LOG must behave as unset: no tracing lines.\nstderr:\n{}",
+        run.stderr
+    );
+}
+
+/// Control for the three tests above: with `RUST_LOG=info` the same approval's
+/// tracing line does reach stderr, and `tracing_lines` recognizes it, so their
+/// empty result is the filter at work, not a detector that sees nothing.
+#[test]
+fn rust_log_info_still_prints_the_tracing_line() {
+    let run = approve_one_gate(Some("info"), None);
+    let lines = tracing_lines(&run.stderr);
+    assert!(
+        lines.iter().any(|line| line.contains(&run.logged)),
+        "with RUST_LOG=info the approval's INFO line must reach stderr and be \
+         recognized as a tracing line.\nstderr:\n{}",
+        run.stderr
     );
     assert!(
-        !stdout.contains(&logged),
-        "the tracing log line must not leak onto stdout (CR-02) — only the CLI's \
-         own printed confirmation message belongs there.\nstdout:\n{stdout}"
+        !run.stdout.contains(&run.logged),
+        "tracing lines never leak onto stdout (CR-02).\nstdout:\n{}",
+        run.stdout
     );
 }

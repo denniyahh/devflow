@@ -703,3 +703,54 @@ fn command_shapes_in_prose_are_accepted() {
          <verify>\n  <automated>cargo fmt --check</automated>\n</verify>\n",
     );
 }
+
+/// A milestone close moves every finished phase's PLAN.md under
+/// `.planning/milestones/<version>-phases/`, staging the whole history as
+/// renamed destinations. Those plans predate the rule and no executor runs an
+/// archived plan, so `--staged` skips the archive prefix: the scan must report
+/// zero files and exit 0 even though the destination blob carries the bashism.
+#[test]
+fn archived_plan_is_skipped_by_the_staged_scan() {
+    let repo = disposable_repo();
+    let root = repo.path();
+    let active = ".planning/phases/46-ci-load-shape/46-01-PLAN.md";
+    let archived = ".planning/milestones/v3.0.0-phases/46-ci-load-shape/46-01-PLAN.md";
+    let bad = fixture_text("comment-bypass-PLAN.md");
+
+    commit_plan(root, active, &bad);
+    fs::create_dir_all(root.join(archived).parent().expect("archive dir"))
+        .expect("create the archive directory");
+    git_ok(root, &["mv", active, archived]);
+    assert!(
+        String::from_utf8(index_blob(root, archived)).expect("index plan is UTF-8") == bad,
+        "fixture precondition: the staged archive destination must hold the violating plan"
+    );
+
+    let out = run_staged(root);
+    assert_staged_zero_scan(&out);
+}
+
+/// The negative control for the archive rule: it is a path-prefix rule, not a
+/// filename rule. The same violating bytes staged under `.planning/phases/` are
+/// still refused, and when both are staged at once the scan selects exactly the
+/// active plan (`scanned 1 file(s)`) and names only it.
+#[test]
+fn the_same_plan_under_phases_is_still_refused() {
+    let repo = disposable_repo();
+    let root = repo.path();
+    let active = ".planning/phases/52-subtract/52-01-PLAN.md";
+    let archived = ".planning/milestones/v3.0.0-phases/51-failover/51-01-PLAN.md";
+    let bad = fixture_text("comment-bypass-PLAN.md");
+
+    write_plan(root, archived, &bad);
+    write_plan(root, active, &bad);
+    git_ok(root, &["add", archived, active]);
+
+    let out = run_staged(root);
+    assert_staged_refusal(&out, active);
+    let text = combined(&out);
+    assert!(
+        !text.contains(archived),
+        "the refusal must not name the archived plan.\n--- output ---\n{text}"
+    );
+}

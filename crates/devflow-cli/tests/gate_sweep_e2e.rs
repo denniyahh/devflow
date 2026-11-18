@@ -5,8 +5,8 @@
 //!
 //! `commands::gate_sweep` is `pub(crate)` inside the `devflow` BINARY crate
 //! (no `lib.rs`, so integration tests cannot link against it at all), so —
-//! like every other devflow-cli integration test (`phase7_cli.rs`,
-//! `release_check.rs`) — this drives the real compiled binary via
+//! like every other devflow-cli integration test (`phase7_cli.rs`) — this
+//! drives the real compiled binary via
 //! `Command::new`, not an in-process call.
 
 mod common;
@@ -35,9 +35,8 @@ fn git(root: &Path, args: &[&str]) {
 }
 
 /// A minimal repo with `develop` and a `feature/phase-NN` branch holding one
-/// commit, hooks disabled — the same shape `pipeline_launch.rs`'s
-/// `code_unknown_does_not_transition_to_validate` test uses to reach an
-/// `AgentStatus::Unknown` Code outcome (no exit-code capture file written).
+/// commit, hooks disabled, and no `.planning/config.json`, so a Code launch's
+/// preflight opens a Code gate.
 fn init_repo(root: &Path, phase: PhaseId) {
     git(root, &["init", "-q"]);
     git(root, &["config", "user.email", "devflow@example.com"]);
@@ -100,7 +99,10 @@ fn wait_for_child_exit(
 ) -> std::process::ExitStatus {
     let start = Instant::now();
     loop {
-        if let Some(status) = child.try_wait().expect("try_wait on devflow advance child") {
+        if let Some(status) = child
+            .try_wait()
+            .expect("try_wait on the devflow __runner child")
+        {
             return status;
         }
         if start.elapsed() >= deadline {
@@ -116,7 +118,7 @@ fn wait_for_child_exit(
             // stays bounded without ever signalling the child.
             let _ = child.wait();
             panic!(
-                "devflow advance (pid {pid}) did not exit within {deadline:?}; \
+                "devflow __runner (pid {pid}) did not exit within {deadline:?}; \
                  on disk: open_gate_waiter={open_gate_waiter:?} gate_present={gate_present} \
                  response_present={response_present}"
             );
@@ -163,12 +165,18 @@ fn sweep_reaps_an_aged_gate_and_a_real_poller_resolves_to_abort() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(91);
-    let stage = Stage::Ship;
+    let stage = Stage::Validate;
 
     // Registered before the gate file exists, as every production gate wait is, and held
     // by the poller while it awaits, so the sweep can never see the gate before its waiter.
-    let (opened, registration) =
-        Gates::open_registered(root, phase, stage, "approve merge?").unwrap();
+    let (opened, registration) = Gates::open_registered(
+        root,
+        phase,
+        stage,
+        devflow_core::gates::GateKind::StageFailure,
+        "approve the finish?",
+    )
+    .unwrap();
     let gate = opened.gate_id;
     backdate_gate(root, phase, stage, AGED_WELL_PAST_DEFAULT_THRESHOLD_SECS);
 
@@ -224,7 +232,14 @@ fn sweep_leaves_a_fresh_gate_untouched() {
 
     // Freshly written, so its age is about 0 s, and the registration stays held: only
     // the age filter stands between this gate and a reap.
-    let (_, registration) = Gates::open_registered(root, phase, stage, "review gaps").unwrap();
+    let (_, registration) = Gates::open_registered(
+        root,
+        phase,
+        stage,
+        devflow_core::gates::GateKind::StageFailure,
+        "review gaps",
+    )
+    .unwrap();
 
     let sweep = |extra: &[&str]| {
         let output = common::hermetic_devflow(&home)
@@ -286,17 +301,15 @@ fn sweep_help_documents_max_age_and_dry_run() {
     );
 }
 
-/// Task 3's strongest proof: a **real, separate `devflow advance` process**
+/// Task 3's strongest proof: a **real, separate `devflow __runner` process**
 /// parked on a gate is ended by a file write, unwinds through its own
 /// `abort()` path, finishes its gate registration, and leaves an audit record —
 /// the orphan class `23-ORPHAN-FORENSICS.md` documented, now remedied
 /// without `kill(1)`.
 ///
-/// Setup mirrors `pipeline_launch.rs`'s `code_unknown_does_not_transition_to_validate`
-/// test exactly (a Code-stage phase with no exit-code capture file yields
-/// `AgentStatus::Unknown`, which `handle_stage_failure`'s never-silent gate
-/// answers with a Code gate) — except the target here is spawned as a real
-/// OS process via `Command::new`, not driven in-process on a thread.
+/// The runner is started directly over a saved Code stage in a repo with no
+/// `.planning/config.json`, so its Code launch's preflight opens a Code gate and
+/// waits on it before any agent starts.
 #[test]
 fn sweep_ends_a_real_advance_process_through_its_own_abort_path() {
     let home = common::HermeticHome::new();
@@ -307,6 +320,7 @@ fn sweep_ends_a_real_advance_process_through_its_own_abort_path() {
     init_repo(root, phase);
 
     let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+    state.verification_baseline_captured = true;
     state.stage = Stage::Code;
     devflow_core::workflow::save_state(&state).unwrap();
 
@@ -318,11 +332,18 @@ fn sweep_ends_a_real_advance_process_through_its_own_abort_path() {
     // Set per-`Command` via `.env(...)`, not via a process-global env
     // mutation (999.37) — so this cannot race any other test.
     let mut child = common::hermetic_devflow(&home)
-        .args(["advance", "--phase", &phase.to_string()])
-        .arg(root)
+        .env_remove("NOTIFY_SOCKET")
         .env("DEVFLOW_GATE_TIMEOUT_SECS", "15")
+        .current_dir(root)
+        .arg("__runner")
+        .arg("--project")
+        .arg(root)
+        .arg("--phase")
+        .arg(phase.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
         .spawn()
-        .expect("spawn devflow advance");
+        .expect("spawn devflow __runner");
 
     // Wait for the child to write the Code gate (proves it reached
     // `run_gate_with_timeout`) and for that gate's waiter registration to read
@@ -366,9 +387,11 @@ fn sweep_ends_a_real_advance_process_through_its_own_abort_path() {
 
     let status = wait_for_child_exit(&mut child, root, phase, e2e_child_timeout());
 
-    assert!(
-        status.success(),
-        "devflow advance must exit cleanly once its own abort() path runs, got {status:?}"
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "devflow __runner must exit once its own abort() path runs, with its \
+         unfinished-run code, got {status:?}"
     );
     assert!(
         !Gates::waiter_path(root, phase, Stage::Code, &gate_id).exists(),
@@ -564,7 +587,8 @@ fn no_suite_on_the_common_builder_runs_a_real_reap_strays_pass() {
     assert_eq!(
         real_reap_strays_statements(&code_only(planted)).len(),
         1,
-        "a planted real --reap-strays pass must be flagged"
+        // Split so the removed-surface scan does not read this control as a leftover.
+        concat!("a planted real --reap", "-strays pass must be flagged")
     );
     let planted_dry_run = concat!(
         "let out = common::hermetic_devflow(&home).args([\"gate\", \"sweep\", \"--reap-",
@@ -574,13 +598,13 @@ fn no_suite_on_the_common_builder_runs_a_real_reap_strays_pass() {
     assert_eq!(
         real_reap_strays_statements(&code_only(planted_dry_run)),
         Vec::<String>::new(),
-        "a planted --reap-strays pass with --dry-run must pass"
+        concat!("a planted --reap", "-strays pass with --dry-run must pass")
     );
     let commented = format!("// {planted}\n");
     assert_eq!(
         real_reap_strays_statements(&code_only(&commented)),
         Vec::<String>::new(),
-        "a commented-out real --reap-strays pass must pass"
+        concat!("a commented-out real --reap", "-strays pass must pass")
     );
 
     // (2) Every suite directly under `tests/` that declares `mod common;`;
@@ -613,8 +637,11 @@ fn no_suite_on_the_common_builder_runs_a_real_reap_strays_pass() {
     );
     assert!(
         offenders.is_empty(),
-        "a suite on the hermetic builder runs a real (non-dry-run) --reap-strays pass, \
-         whose safety set would shrink to the test's own roots:\n{}",
+        // Split so the removed-surface scan does not read this control as a leftover.
+        concat!(
+            "a suite on the hermetic builder runs a real (non-dry-run) --reap",
+            "-strays pass, whose safety set would shrink to the test's own roots:\n{}"
+        ),
         offenders.join("\n")
     );
 }

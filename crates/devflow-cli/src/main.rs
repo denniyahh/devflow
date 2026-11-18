@@ -12,21 +12,20 @@ mod staleness;
 mod preflight;
 
 mod pipeline_launch;
-use pipeline_launch::{resume, run_monitor};
+use pipeline_launch::resume_with_fallback;
 
 mod pipeline_outcomes;
 
 mod pipeline_gate;
-use pipeline_gate::ship_override;
 
-mod parallel;
-use parallel::parallel;
+mod phase_worktree;
+
+mod service;
 
 mod commands;
 use commands::{
-    cleanup, doctor, evidence, gate_list, gate_respond, gate_show, gate_sweep, history_cmd, list,
-    logs, recover_cmd, reference, release_check, release_verify, resolve_gate_target, start,
-    status, stop, stop_launch, test_cmd,
+    GateAnswerKind, cleanup, discard, doctor, gate_list, gate_respond, gate_show, gate_sweep,
+    history_cmd, logs, start, status, stop,
 };
 use devflow_core::phase_id::PhaseId;
 
@@ -35,7 +34,7 @@ mod config_parse;
 #[derive(Debug, Parser)]
 #[command(
     name = "devflow",
-    version,
+    version = build_version(),
     about = "An opinionated, GSD-native take on AI-driven development automation"
 )]
 struct Cli {
@@ -45,7 +44,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Begin the workflow for a phase: Define → Plan → Code → Validate → Ship.
+    /// Begin the workflow for a phase: Plan → Code → Validate.
     Start {
         /// Phase number to work on.
         #[arg(long)]
@@ -53,137 +52,62 @@ enum Command {
         /// Agent to launch.
         #[arg(long, default_value = "claude")]
         agent: AgentKind,
-        /// Pipeline mode: `auto` runs to Ship unattended; `supervise` gates at Validate.
+        /// Pipeline mode: `auto` runs unattended and finishes on a passing
+        /// Validate; `supervise` gates at Validate.
         #[arg(long)]
         mode: Mode,
-        /// Overwrite the feature branch if it already exists.
-        #[arg(long)]
-        force: bool,
-        /// Deprecated: a worktree is now created by default; this flag is a
-        /// no-op kept for one release for backward compatibility.
-        #[arg(long, hide = true)]
-        worktree: bool,
         /// Run the agent directly in the primary checkout instead of an
         /// isolated worktree (not recommended for unattended runs).
         #[arg(long)]
         no_worktree: bool,
-        /// Print the pipeline that would run without launching anything.
+        /// Check, read-only, what a real start would refuse, then print the
+        /// pipeline that would run; launches and writes nothing and names the
+        /// start checks it skips.
         #[arg(long)]
         dry_run: bool,
         /// Run the pipeline through `<stage>` and halt cleanly before
-        /// advancing further (e.g. `--until plan` runs Define+Plan then
-        /// stops before Code). `ship` is rejected — the pipeline already
-        /// stops there.
+        /// advancing further (e.g. `--until plan` runs Plan then stops
+        /// before Code).
         #[arg(long)]
         until: Option<Stage>,
-        /// Pre-authorize the Ship gate so this run can reach a completed
-        /// Ship stage unattended (D-04/D-05/D-06, 23-09; provenance widened
-        /// by D-12, `28-CONTEXT.md`). The Ship gate still fires and is
-        /// still answered through the normal gate protocol — this only
-        /// supplies the approval automatically, attributed to `--yes-ship`
-        /// in the gate ledger. This flag ORs with a standing `yes_ship =
-        /// true` in `devflow.toml` (or `DEVFLOW_YES_SHIP`) rather than
-        /// replacing it — passing it here always wins, and a run whose
-        /// authorization came from config instead prints a notice naming
-        /// `devflow.toml` as the source, so a persisted default is never a
-        /// silent one.
+        /// A second agent that takes over the Code stage once if the agent is
+        /// rate-limited there (D-01, `51-CONTEXT.md`). Failover happens only at
+        /// Code; at any other stage a rate limit waits at the stage's gate.
+        ///
+        /// Persisted in the run state (`state-NN.json`) before the first
+        /// supervisor spawns, and checked here as far as launch can tell: it
+        /// must differ from `--agent`, its binary must be installed and its
+        /// driver healthy, and in `--mode auto` it must be `claude` or
+        /// `antigravity` (the unattended launch shape). The full preflight runs
+        /// again at the handoff itself.
+        ///
+        /// Overrides a `fallback_agent` key in `devflow.toml` when both are
+        /// given. No environment variable selects it.
         #[arg(long)]
-        yes_ship: bool,
-        /// Force the pre-31 single-document Claude launch: the prompt
-        /// positionally in argv, `--output-format json`, and the capture-shape
-        /// supervisor (D-11, `31-CONTEXT.md`). Off by default.
-        ///
-        /// It exists so an operator can recover from a defect in the
-        /// `stream-json` transport without waiting for a release. Its use is
-        /// logged loudly — on stdout, in the phase's monitor log, and as a
-        /// `claude_legacy_launch_forced` event in `.devflow/events.jsonl` —
-        /// because an escape hatch used routinely erodes what it protects.
-        ///
-        /// Understand what it gives up: the legacy path cannot deliver
-        /// background-task notifications, so a multi-plan wave may orphan
-        /// delegated work. That is 999.64, the defect Phase 31 exists to fix.
-        ///
-        /// ORs with the environment override `DEVFLOW_CLAUDE_LEGACY_LAUNCH`
-        /// (parsed as a bool — `=false` does NOT enable it) rather than
-        /// replacing it; a run authorized by the environment alone prints a
-        /// notice naming that source. Once set for a run it is never cleared by
-        /// `devflow resume`; edit `.devflow/state-NN.json` to turn it off.
-        #[arg(long)]
-        legacy_claude_launch: bool,
+        fallback_agent: Option<AgentKind>,
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
     },
-    /// Internal: advance the stage machine after a monitored agent exits.
-    #[command(hide = true)]
-    Advance {
-        /// Project root.
-        #[arg(default_value = ".")]
-        project: PathBuf,
-        /// Phase whose stage machine to advance. Recorded by the monitor at
-        /// spawn time so advance never depends on a shared state singleton.
-        #[arg(long)]
-        phase: Option<PhaseId>,
-        /// Stage the monitor launched; omitted only by monitors from older binaries.
-        #[arg(long)]
-        stage: Option<Stage>,
-    },
-    /// Internal: the stage supervisor's own process entry point (50-11).
+    /// Internal: the foreground runner a phase's user unit runs (D-02).
     ///
-    /// `monitor::spawn_monitor` re-execs this binary as this subcommand,
-    /// detached and in its own process group, for both launch shapes.
-    /// Everything after `--` is the supervised agent's program and argv.
-    /// Hidden for the same reason `advance` is: it is an implementation
-    /// detail of the monitor chain, never an operator verb.
-    #[command(name = "__monitor", hide = true)]
-    Monitor {
-        /// Project root whose `.devflow/` capture files this monitor writes.
+    /// Takes the phase's runner lock (`.devflow/.runner-NN`) before anything else and
+    /// holds it for its whole life, reports ready to systemd once it holds it, then runs
+    /// the phase's stages in this process. Hidden: a user unit runs it, never an operator.
+    #[command(name = "__runner", hide = true)]
+    Runner {
+        /// Project root whose phase this runner drives.
         #[arg(long)]
         project: PathBuf,
-        /// Phase whose stage machine to advance once the child is reaped.
+        /// Phase to run.
         #[arg(long)]
         phase: PhaseId,
-        /// Stage the monitor launched; passed to advance after the child exits.
-        #[arg(long)]
-        stage: Option<Stage>,
-        /// Directory the supervised child runs in (the phase worktree when
-        /// worktree mode is active, else the project root).
-        #[arg(long)]
-        workdir: PathBuf,
-        /// Which agent's transport the monitor supervises (selects the
-        /// first-turn schema and the close-rule marker predicate).
-        #[arg(long)]
-        agent: AgentKind,
-        /// Supervision shape: `capture` (stdin null, stdout to the capture file) or `stream`.
-        #[arg(long, value_enum)]
-        launch: pipeline_launch::LaunchShape,
-        /// Socket path this supervisor publishes, under the DevFlow cache dir.
-        #[arg(long)]
-        socket: PathBuf,
-        /// Per-launch id the launcher waits to see in this supervisor's ping reply.
-        #[arg(long)]
-        launch_id: String,
-        /// The inherited descriptor holding this launch's liveness lock.
-        #[arg(long)]
-        liveness_fd: Option<i32>,
-        /// Adapter env var NAME to re-apply to the agent (repeatable; the value stays off argv).
-        #[arg(long = "keep-env")]
-        keep_env: Vec<String>,
-        /// File holding the stage prompt (stream shape; a file, not argv, for length).
-        #[arg(long)]
-        prompt_file: Option<PathBuf>,
-        /// Seconds of stream silence before the idle timeout fires (stream shape).
-        #[arg(long)]
-        idle_timeout_secs: Option<u64>,
-        /// The supervised child's program and arguments, after `--`.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
-        argv: Vec<String>,
     },
     /// Resume a phase from its saved stage after a rate limit or infrastructure pause.
     ///
     /// Unlike `start`, this loads the persisted per-phase state and
     /// relaunches its saved stage — it does NOT create a new branch/worktree
-    /// or reset the workflow to Define (review consensus #5); agent and mode
+    /// or reset the workflow to Plan (review consensus #5); agent and mode
     /// come from the saved state.
     Resume {
         /// Phase to resume.
@@ -192,13 +116,19 @@ enum Command {
         /// Hand the saved run to a different agent driver; omit to keep its saved agent.
         #[arg(long)]
         agent: Option<AgentKind>,
-        /// Force the pre-31 single-document Claude launch for the rest of this
-        /// run (D-11, `31-CONTEXT.md`). Same semantics as `devflow start
-        /// --legacy-claude-launch`, offered here so a run already in flight can
-        /// be moved onto the legacy path without restarting it. Never cleared
-        /// by a later plain `devflow resume`.
+        /// Re-arm the run's one-hop fallback for the Code stage (D-01,
+        /// `51-CONTEXT.md`): sets it to this agent and clears a spent mark, so a
+        /// run whose fallback was used can fail over once more. Accepted on a run
+        /// that is not live (stopped, or whose supervisor has ended);
+        /// refused over a live run like any resume.
+        ///
+        /// Checked as on `devflow start`: it must differ from the agent the run
+        /// resumes under, its binary must be installed and its driver healthy, and
+        /// in `--mode auto` it must be `claude` or `antigravity`. Omit it to keep
+        /// the saved fallback as it is, spent or not. `resume` does not re-read the
+        /// `devflow.toml` key; only `start` does.
         #[arg(long)]
-        legacy_claude_launch: bool,
+        fallback_agent: Option<AgentKind>,
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
@@ -233,73 +163,33 @@ enum Command {
         #[arg(default_value = ".")]
         project: PathBuf,
     },
-    /// Run multiple phases concurrently, each in its own worktree + monitor.
-    Parallel {
-        /// Comma-separated phase numbers, e.g. `7,8`.
-        #[arg(long)]
-        phases: String,
-        /// Comma-separated agents matched positionally to phases (default claude).
-        #[arg(long)]
-        agents: Option<String>,
-        /// Pipeline mode for every phase.
-        #[arg(long, default_value = "auto")]
-        mode: Mode,
-        /// Recreate worktrees if they already exist.
-        #[arg(long)]
-        force: bool,
-        /// Project root.
-        #[arg(default_value = ".")]
-        project: PathBuf,
-    },
-    /// Create or refresh a static reference worktree at `.worktrees/reference/`.
-    Reference {
-        /// Branch to check out (defaults to develop).
-        #[arg(long)]
-        branch: Option<String>,
-        /// Update an existing reference snapshot in place.
-        #[arg(long)]
-        refresh: bool,
-        /// Project root.
-        #[arg(default_value = ".")]
-        project: PathBuf,
-    },
-    /// Remove phase worktrees and their feature branches.
+    /// Remove what is safe to remove: a finished run, a dead start's reservation, or
+    /// a worktree with no run state, once its branch is merged into the base, its
+    /// worktree is clean and no run is live. Says why it keeps the rest, and names
+    /// `devflow discard` (or `devflow resume` for an incomplete run).
     Cleanup {
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
-        /// Also remove the reference worktree and force-remove dirty worktrees.
+    },
+    /// Remove a phase's worktree, its uncommitted changes, its run state, its
+    /// feature branch, and the gate files and hold temps a killed run left,
+    /// after listing them. Refuses a live run or a gate something still waits
+    /// on; refuses an unmerged branch unless `--delete-unmerged-branch` names it.
+    Discard {
+        /// Phase to discard.
         #[arg(long)]
-        force: bool,
+        phase: PhaseId,
+        /// Also delete the phase's feature branch when it has commits not
+        /// merged into the base. The value must be that branch's name.
+        #[arg(long, value_name = "BRANCH")]
+        delete_unmerged_branch: Option<String>,
+        /// Project root.
+        #[arg(default_value = ".")]
+        project: PathBuf,
     },
     /// Show current workflow state.
     Status {
-        /// Project root.
-        #[arg(default_value = ".")]
-        project: PathBuf,
-    },
-    /// List all feature branches with divergence from develop.
-    List {
-        /// Project root.
-        #[arg(default_value = ".")]
-        project: PathBuf,
-    },
-    /// Recover or inspect stale/abandoned workflow state.
-    Recover {
-        /// Project root.
-        #[arg(default_value = ".")]
-        project: PathBuf,
-        /// Clean up stale state instead of just inspecting. Only stale
-        /// phases are swept; combine with --phase to clear a specific
-        /// phase regardless of staleness.
-        #[arg(long)]
-        clean: bool,
-        /// Restrict the command to one phase.
-        #[arg(long)]
-        phase: Option<PhaseId>,
-    },
-    /// Run local quality checks: cargo test, clippy, and fmt --check.
-    Test {
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
@@ -313,94 +203,22 @@ enum Command {
         #[arg(default_value = ".")]
         project: PathBuf,
     },
-    /// Read-only release-cut preflight: self-pin, develop/main divergence,
-    /// crates.io publish order, and changelog-version agreement.
+    /// Stop the phase's DevFlow user service and report how the run ended.
     ///
-    /// Ceiling is `--check` only (20d) — this command never runs the actual
-    /// merge/tag/sync/publish sequence, which is a deferred, not-yet-built
-    /// executor (DEN-50).
-    Release {
-        /// Run the read-only preflight checks. Required: a bare `devflow
-        /// release` (omitted `--check`) is rejected rather than silently
-        /// treated as a valid run.
-        #[arg(long)]
-        check: bool,
-        /// Run the read-only POST-cut verification: the release tag points
-        /// at `origin/main`, and the `main`→`develop` sync has been run.
-        /// Mutually exclusive with `--check` (pre-cut vs post-cut).
-        #[arg(long)]
-        verify: bool,
-        /// Project root.
-        #[arg(default_value = ".")]
-        project: PathBuf,
-    },
-    /// Manually drive a phase through Ship when the monitor that would have
-    /// consumed its already-written Ship gate response is dead.
-    ///
-    /// A second, out-of-process trigger of the SAME terminal effect
-    /// (`finish_workflow`) the live poll loop would have run (20e, D-01) —
-    /// requires `state.stage == Stage::Ship` and an open Ship gate holding an
-    /// answer bound to it, not yet claimed; `--force` never skips an earlier
-    /// stage, the foreground holder, the refusal while a supervisor of the
-    /// phase is live, the answer claim, or those existence checks (D-02).
-    Ship {
-        /// Phase to ship.
-        #[arg(long)]
-        phase: PhaseId,
-        /// Accepted for explicit, auditable operator intent. Does NOT skip
-        /// the stage, holder, live-supervisor, gate-existence, or answer-claim
-        /// checks (D-02) — see `pipeline_gate::ship_override`'s doc comment for
-        /// exact scope.
-        #[arg(long)]
-        force: bool,
-        /// Project root.
-        #[arg(default_value = ".")]
-        project: PathBuf,
-    },
-    /// End a running phase cleanly: answers its open gate with a rejection
-    /// when a live waiter holds it (a Ship gate with no waiter stores the
-    /// rejection for `devflow ship`); otherwise addresses the run's supervisor
-    /// socket — `shutdown` when ALIVE, the guarded backstop when STALE. When
-    /// no socket answers, it signals the phase's foreground holder (a `start`
-    /// or `resume` before its spawn, `devflow ship`, a hand-run `advance`)
-    /// once its identity is confirmed. `--launch <id>` tears down only the
-    /// socket with that launch id (the form `devflow doctor` prints for an
-    /// orphan). Never signals a pid recorded in state. Idempotent: safe to
-    /// run against an already-stopped, never-started, or already-dead
-    /// phase.
+    /// Stops the phase's systemd user unit (`systemctl --user stop`), which ends its
+    /// runner and the agent, then reports from the run state: stopped, finished, stopped
+    /// during launch, or crashed. With no live run it does nothing; while another DevFlow
+    /// verb holds the phase it stops nothing and says so.
     Stop {
         /// Phase to stop.
         #[arg(long)]
         phase: PhaseId,
-        /// Tear down only the supervisor socket with this launch id; answers
-        /// no gate, signals no holder and writes no state.
-        #[arg(long)]
-        launch: Option<String>,
         /// Project root. Overrides the positional argument when supplied.
         #[arg(long)]
         root: Option<PathBuf>,
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
-    },
-    /// Report DevFlow's own structural record of whether a phase shipped
-    /// (23-06) — a read-only oracle sourced from the append-only event log,
-    /// not from any agent-authored attestation document. See
-    /// `devflow_core::ship_evidence` for the full contract.
-    Evidence {
-        /// Phase to report on.
-        #[arg(long)]
-        phase: PhaseId,
-        /// Output as JSON.
-        #[arg(long)]
-        json: bool,
-        /// Exit non-zero unless DevFlow's own record shows this phase
-        /// shipped — declarable as a Layer 0 `external_verify` probe.
-        #[arg(long)]
-        require_shipped: bool,
-        /// Project root.
-        #[arg(long)]
-        root: Option<PathBuf>,
     },
 }
 
@@ -421,17 +239,10 @@ enum GateCmd {
     Approve {
         /// Phase whose gate to approve.
         phase: PhaseId,
-        /// Optional stage or legacy project path (`approve 15 ship` or
-        /// `approve 15 /repo`).
-        #[arg(value_name = "STAGE_OR_PROJECT")]
-        stage: Option<String>,
-        /// Legacy positional project path when a stage precedes it.
-        #[arg(value_name = "PROJECT")]
-        legacy_project: Option<PathBuf>,
         /// Stage of the gate (auto-resolved when the phase has exactly one
         /// open gate).
         #[arg(long = "stage")]
-        stage_option: Option<Stage>,
+        stage: Option<Stage>,
         /// Optional free-text note recorded with the approval.
         #[arg(long)]
         note: Option<String>,
@@ -443,24 +254,16 @@ enum GateCmd {
         #[arg(long, default_value = ".")]
         project: PathBuf,
     },
-    /// Reject an open gate — loops back to Code, or aborts the phase when
-    /// the note contains "abort".
+    /// Reject an open gate — the stage is fixed and relaunched. A rejection
+    /// never ends the run, whatever its note says: use `gate abort` for that.
     Reject {
         /// Phase whose gate to reject.
         phase: PhaseId,
-        /// Optional stage or legacy project path (`reject 15 ship` or
-        /// `reject 15 /repo`).
-        #[arg(value_name = "STAGE_OR_PROJECT")]
-        stage: Option<String>,
-        /// Legacy positional project path when a stage precedes it.
-        #[arg(value_name = "PROJECT")]
-        legacy_project: Option<PathBuf>,
         /// Stage of the gate (auto-resolved when the phase has exactly one
         /// open gate).
         #[arg(long = "stage")]
-        stage_option: Option<Stage>,
-        /// Required note explaining the rejection (include "abort" to end
-        /// the phase instead of looping back to Code).
+        stage: Option<Stage>,
+        /// Required note explaining what to fix.
         #[arg(long)]
         note: String,
         /// The gate id `gate list` showed. Without it the command answers the
@@ -471,8 +274,27 @@ enum GateCmd {
         #[arg(long, default_value = ".")]
         project: PathBuf,
     },
+    /// Abort the run at an open gate — the only answer that ends the run.
+    Abort {
+        /// Phase whose gate to answer with an abort.
+        phase: PhaseId,
+        /// Stage of the gate (auto-resolved when the phase has exactly one
+        /// open gate).
+        #[arg(long = "stage")]
+        stage: Option<Stage>,
+        /// Optional free-text note recorded as the abort's reason.
+        #[arg(long)]
+        note: Option<String>,
+        /// The gate id `gate list` showed. Without it the command answers the
+        /// gate open now; with it, a gate opened since is refused.
+        #[arg(long = "gate-id")]
+        gate_id: Option<String>,
+        /// Project root.
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+    },
     /// Print an open gate's full, untruncated context (21a) — `gate list`
-    /// truncates context to 100 chars for the table view; this reads it in
+    /// truncates context to 300 chars, as the gate banner does; this reads it in
     /// full, control-char sanitized.
     Show {
         /// Phase whose gate to show.
@@ -499,31 +321,9 @@ enum GateCmd {
         #[arg(long)]
         dry_run: bool,
         /// Restrict the sweep to one project root instead of every root
-        /// this machine has registered (`registry::load_roots`). Does NOT
-        /// scope `--reap-strays`: that pass is machine-wide by construction
-        /// (a stray has no project root to scope by), and the
-        /// reachability safety filter it uses is likewise always
-        /// machine-wide regardless of this flag (CR-01, 25-15).
+        /// this machine has registered (`registry::load_roots`).
         #[arg(long)]
         root: Option<PathBuf>,
-        /// Also discover and clear devflow 2.x processes shaped like a
-        /// monitor wrapper or an `advance` child (999.44), by scanning the OS
-        /// process table directly rather than trusting a record the
-        /// process itself wrote. Both shapes are 2.x only: a 3.x binary
-        /// starts neither, so this never matches a 3.x supervisor, which
-        /// `devflow doctor` reports through its socket and
-        /// `devflow stop --phase N --launch <id>` ends. Matches only two
-        /// structural argv shapes, owned by the calling user, older than the
-        /// minimum age, and NOT named by any registered root's state file or
-        /// held by one of its live liveness, gate-registration or foreground-holder files
-        /// (CR-01, 25-15) — a pid a live registry entry still
-        /// reaches is never touched. Discovery itself stays
-        /// registry-independent, so this still catches a 2.x process whose
-        /// project root no longer exists on disk (`devflow stop`/the default
-        /// sweep above cannot see either). Off by default: preview with
-        /// `--dry-run` before authorising it for real.
-        #[arg(long)]
-        reap_strays: bool,
     },
 }
 
@@ -532,24 +332,52 @@ pub(crate) enum CliError {
     #[error(transparent)]
     Workflow(#[from] devflow_core::workflow::WorkflowError),
     #[error(transparent)]
-    Recover(#[from] devflow_core::recover::RecoverError),
-    #[error(transparent)]
     Git(#[from] devflow_core::git::GitError),
     #[error(transparent)]
     Worktree(#[from] devflow_core::worktree::WorktreeError),
     #[error(transparent)]
     Gate(#[from] devflow_core::gates::GateError),
-    #[error(transparent)]
-    Ship(#[from] devflow_core::ship::ShipError),
     #[error("{0}")]
     Message(String),
 }
 
+/// `--version`'s text after the binary name: the package version, then the
+/// commit `build.rs` embedded and whether the tree was dirty. A build without
+/// git embeds an empty commit, which reads `unknown`; any dirty flag other
+/// than `true` reads `clean`, matching how the staleness check reads it.
+fn version_label(version: &str, commit: &str, dirty: &str) -> String {
+    let commit = if commit.is_empty() { "unknown" } else { commit };
+    let tree = if dirty == "true" { "dirty" } else { "clean" };
+    format!("{version} ({commit}, {tree})")
+}
+
+/// [`version_label`] for this binary's own build, built once: clap needs a
+/// `'static` string.
+fn build_version() -> &'static str {
+    static LABEL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    LABEL.get_or_init(|| {
+        version_label(
+            env!("CARGO_PKG_VERSION"),
+            env!("DEVFLOW_BUILD_COMMIT"),
+            env!("DEVFLOW_BUILD_DIRTY"),
+        )
+    })
+}
+
+/// Tracing is off unless `RUST_LOG` names a filter: an unset or empty value
+/// prints no tracing lines, so a command's output is its own sentences. A
+/// value that does not parse keeps the `info` fallback, and `doctor` reports
+/// it as invalid. Both log-format branches build the same filter.
 fn main() {
     match std::env::var("DEVFLOW_LOG_FORMAT").as_deref() {
         Ok("json") => {
-            let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+            let filter = match std::env::var("RUST_LOG") {
+                Ok(value) if !value.is_empty() => {
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+                }
+                _ => tracing_subscriber::EnvFilter::new("off"),
+            };
             tracing_subscriber::fmt()
                 .json()
                 .with_writer(std::io::stderr)
@@ -557,8 +385,13 @@ fn main() {
                 .init();
         }
         _ => {
-            let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+            let filter = match std::env::var("RUST_LOG") {
+                Ok(value) if !value.is_empty() => {
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+                }
+                _ => tracing_subscriber::EnvFilter::new("off"),
+            };
             tracing_subscriber::fmt()
                 .with_writer(std::io::stderr)
                 .with_env_filter(filter)
@@ -578,122 +411,85 @@ fn run() -> Result<(), CliError> {
             phase,
             agent,
             mode,
-            force,
-            worktree: _worktree,
             no_worktree,
             dry_run,
             until,
-            yes_ship,
-            legacy_claude_launch,
+            fallback_agent,
             project,
         } => {
-            // Worktree is now the default; the deprecated `--worktree` flag is
-            // an intentionally ignored no-op (see field doc comment above).
-            // `--no-worktree` is the only switch that changes behavior.
+            // Worktree is the default; `--no-worktree` is the only switch.
             let worktree = !no_worktree;
-            // D-07: `--until ship` is a semantic no-op — `handle_ship_outcome`
-            // calls `finish_workflow` directly and never calls `transition`,
-            // so the pipeline already stops at Ship today regardless of this
-            // flag. Reject before any stage runs rather than silently
-            // accepting a flag that would never actually intercept anything.
-            if until == Some(Stage::Ship) {
-                return Err(CliError::Message(
-                    "--until ship is a no-op: Ship is already the pipeline's terminal \
-                     stage and never advances further"
-                        .to_string(),
-                ));
-            }
             start(
                 &project_root(project)?,
                 phase,
                 agent,
                 mode,
-                force,
                 worktree,
                 dry_run,
                 until,
-                yes_ship,
-                legacy_claude_launch,
+                commands::FallbackSource::FlagOrConfig(fallback_agent),
             )
         }
-        Command::Advance {
-            project,
-            phase,
-            stage,
-        } => pipeline_launch::advance_command(&project_root(project)?, phase, stage),
-        Command::Monitor {
-            project,
-            phase,
-            stage,
-            workdir,
-            agent,
-            launch,
-            socket,
-            launch_id,
-            liveness_fd,
-            keep_env,
-            prompt_file,
-            idle_timeout_secs,
-            argv,
-        } => run_monitor(
-            &pipeline_launch::MonitorInvocation {
-                project_root: project_root(project)?,
-                phase,
-                stage,
-                workdir,
-                agent,
-                launch,
-                socket,
-                launch_id,
-                liveness_fd,
-                keep_env,
-                prompt_file,
-                idle_timeout_secs,
-                argv,
-            },
-            true,
-        ),
+        Command::Runner { project, phase } => {
+            match pipeline_launch::run_runner(&project_root(project)?, phase)? {
+                0 => Ok(()),
+                code => {
+                    use std::io::Write as _;
+                    let _ = std::io::stdout().flush();
+                    std::process::exit(code)
+                }
+            }
+        }
         Command::Resume {
             phase,
             agent,
-            legacy_claude_launch,
+            fallback_agent,
             project,
-        } => resume(&project_root(project)?, phase, agent, legacy_claude_launch),
+        } => resume_with_fallback(&project_root(project)?, phase, agent, fallback_agent),
         Command::Gate { action } => match action {
             GateCmd::List { all_roots, project } => gate_list(&project_root(project)?, all_roots),
             GateCmd::Approve {
                 phase,
                 stage,
-                legacy_project,
-                stage_option,
                 note,
                 gate_id,
                 project,
-            } => {
-                let (stage, project) =
-                    resolve_gate_target(stage, legacy_project, stage_option, project)?;
-                gate_respond(&project_root(project)?, phase, stage, true, note, gate_id)
-            }
+            } => gate_respond(
+                &project_root(project)?,
+                phase,
+                stage,
+                GateAnswerKind::Approve,
+                note,
+                gate_id,
+            ),
             GateCmd::Reject {
                 phase,
                 stage,
-                legacy_project,
-                stage_option,
                 note,
                 gate_id,
                 project,
-            } => {
-                let (stage, project) =
-                    resolve_gate_target(stage, legacy_project, stage_option, project)?;
-                gate_respond(
-                    &project_root(project)?,
-                    phase,
-                    stage,
-                    false,
-                    Some(note),
-                    gate_id,
-                )
-            }
+            } => gate_respond(
+                &project_root(project)?,
+                phase,
+                stage,
+                GateAnswerKind::Reject,
+                Some(note),
+                gate_id,
+            ),
+            GateCmd::Abort {
+                phase,
+                stage,
+                note,
+                gate_id,
+                project,
+            } => gate_respond(
+                &project_root(project)?,
+                phase,
+                stage,
+                GateAnswerKind::Abort,
+                note,
+                gate_id,
+            ),
             GateCmd::Show {
                 phase,
                 stage,
@@ -703,8 +499,7 @@ fn run() -> Result<(), CliError> {
                 max_age_secs,
                 dry_run,
                 root,
-                reap_strays,
-            } => gate_sweep(max_age_secs, dry_run, root, reap_strays),
+            } => gate_sweep(max_age_secs, dry_run, root),
         },
         Command::Logs {
             phase,
@@ -713,86 +508,23 @@ fn run() -> Result<(), CliError> {
             project,
         } => logs(&project_root(project)?, phase, follow, stderr),
         Command::History { phase, project } => history_cmd(&project_root(project)?, phase),
-        Command::Parallel {
-            phases,
-            agents,
-            mode,
-            force,
+        Command::Cleanup { project } => cleanup(&project_root(project)?),
+        Command::Discard {
+            phase,
+            delete_unmerged_branch,
             project,
-        } => parallel(
+        } => discard(
             &project_root(project)?,
-            &phases,
-            agents.as_deref(),
-            mode,
-            force,
+            phase,
+            delete_unmerged_branch.as_deref(),
         ),
-        Command::Reference {
-            branch,
-            refresh,
-            project,
-        } => reference(&project_root(project)?, branch, refresh),
-        Command::Cleanup { project, force } => cleanup(&project_root(project)?, force),
         Command::Status { project } => status(&project_root(project)?),
-        Command::List { project } => list(&project_root(project)?),
-        Command::Recover {
-            project,
-            clean,
-            phase,
-        } => recover_cmd(&project_root(project)?, clean, phase),
-        Command::Test { project } => test_cmd(&project_root(project)?),
         Command::Doctor { json, project } => doctor(&project_root(project)?, json),
-        Command::Release {
-            check,
-            verify,
-            project,
-        } => {
-            // D-03 / Codex MEDIUM: a bare `devflow release` is never silently
-            // treated as a valid run. This phase ships only the read-only
-            // preflight (--check) and post-cut verification (--verify), never
-            // the release-cut executor (merge/tag/sync/publish) — that command
-            // is a deferred backlog item (DEN-50).
-            match (check, verify) {
-                (true, false) => release_check(&project_root(project)?),
-                (false, true) => release_verify(&project_root(project)?),
-                (true, true) => Err(CliError::Message(
-                    "devflow release accepts exactly one of --check or --verify".to_string(),
-                )),
-                (false, false) => Err(CliError::Message(
-                    "devflow release requires --check (pre-cut preflight) or --verify \
-                     (post-cut verification) — the release-cut executor \
-                     (merge/tag/sync/publish) is deferred (DEN-50) and not yet built."
-                        .to_string(),
-                )),
-            }
-        }
-        Command::Ship {
-            phase,
-            force,
-            project,
-        } => ship_override(&project_root(project)?, phase, force),
         Command::Stop {
             phase,
-            launch,
             root,
             project,
-        } => {
-            let root = project_root(root.unwrap_or(project))?;
-            match launch {
-                Some(launch_id) => stop_launch(&root, phase, &launch_id),
-                None => stop(&root, phase),
-            }
-        }
-        Command::Evidence {
-            phase,
-            json,
-            require_shipped,
-            root,
-        } => evidence(
-            &project_root(root.unwrap_or_else(|| PathBuf::from(".")))?,
-            phase,
-            json,
-            require_shipped,
-        ),
+        } => stop(&project_root(root.unwrap_or(project))?, phase),
     }
 }
 
@@ -824,6 +556,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn version_label_renders_an_empty_commit_as_unknown() {
+        assert_eq!(
+            version_label("4.0.0", "", "false"),
+            "4.0.0 (unknown, clean)"
+        );
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        let dirty = version_label("4.0.0", commit, "true");
+        assert_eq!(dirty, format!("4.0.0 ({commit}, dirty)"));
+        assert!(dirty.ends_with(", dirty)"));
+    }
+
+    #[test]
     fn project_root_walks_up_to_nearest_devflow_ancestor() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("project");
@@ -843,5 +587,82 @@ mod tests {
         let missing = dir.path().join("missing");
         let error = project_root(missing).unwrap_err().to_string();
         assert!(error.contains("project path does not exist"));
+    }
+
+    /// The `fallback_agent` a `devflow start` command line parses to.
+    fn start_fallback(args: &[&str]) -> Result<Option<AgentKind>, clap::Error> {
+        let cli = Cli::try_parse_from(args)?;
+        let Command::Start { fallback_agent, .. } = cli.command else {
+            panic!(
+                "`devflow start` parsed to another command: {:?}",
+                cli.command
+            );
+        };
+        Ok(fallback_agent)
+    }
+
+    #[test]
+    fn resume_accepts_a_fallback_agent_flag() {
+        let parse = |extra: &[&'static str]| {
+            let mut args = vec!["devflow", "resume", "--phase", "51"];
+            args.extend_from_slice(extra);
+            let cli = Cli::try_parse_from(args)?;
+            let Command::Resume { fallback_agent, .. } = cli.command else {
+                panic!(
+                    "`devflow resume` parsed to another command: {:?}",
+                    cli.command
+                );
+            };
+            Ok::<_, clap::Error>(fallback_agent)
+        };
+        assert_eq!(
+            parse(&["--fallback-agent", "antigravity"]).expect("a known agent parses"),
+            Some(AgentKind::Antigravity)
+        );
+        assert!(
+            parse(&["--fallback-agent", ""]).is_err(),
+            "an empty fallback is a parse error"
+        );
+        assert_eq!(
+            parse(&[]).expect("the flag is optional"),
+            None,
+            "omitting the flag re-arms nothing"
+        );
+    }
+
+    #[test]
+    fn start_accepts_a_fallback_agent_flag() {
+        let base = [
+            "devflow",
+            "start",
+            "--phase",
+            "51",
+            "--agent",
+            "claude",
+            "--mode",
+            "supervise",
+        ];
+        let with = |extra: &[&'static str]| {
+            let mut args = base.to_vec();
+            args.extend_from_slice(extra);
+            start_fallback(&args)
+        };
+        assert_eq!(
+            with(&["--fallback-agent", "codex"]).expect("a known agent parses"),
+            Some(AgentKind::Codex)
+        );
+        assert!(
+            with(&["--fallback-agent", ""]).is_err(),
+            "an empty fallback is a parse error"
+        );
+        assert!(
+            with(&["--fallback-agent", "nosuch"]).is_err(),
+            "an unknown fallback is a parse error"
+        );
+        assert_eq!(
+            with(&[]).expect("the flag is optional"),
+            None,
+            "omitting the flag leaves no fallback"
+        );
     }
 }

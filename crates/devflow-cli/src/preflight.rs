@@ -1,39 +1,35 @@
 //! Agent preflight readiness gate (17c, D-13-D-16, shaped by 18-06/18f):
-//! generic universal checks (interactivity, `gh auth`) plus an adapter-
-//! specific hook, run from [`crate::pipeline_launch::launch_stage`] before
-//! `monitor::spawn_monitor` so a readiness failure is caught before any
-//! agent time is spent. Extracted mechanically (19-07, D-09 pure move) out
-//! of `main.rs` — every function below is byte-identical to its pre-move
-//! body modulo an added `pub(crate)` and adjusted `use` paths.
+//! generic universal checks (unattended launch, interactivity) plus an adapter-
+//! specific hook, run from [`crate::pipeline_launch::launch_stage`] before the
+//! launch is resolved, so a readiness failure is caught before any agent time
+//! is spent. Extracted mechanically (19-07, D-09 pure move) out of `main.rs`.
 //!
-//! **This module and `pipeline_launch`'s functions call each other
-//! directly, and that is intentional (D-18f, 18-07, repointed 19-08):**
-//! [`run_preflight`]'s `GateAction::Advance` arm calls
-//! [`crate::pipeline_launch::launch_stage_inner`] directly so it skips the
-//! just-adjudicated check on the retry, while
-//! [`crate::pipeline_launch::launch_stage`] calls [`run_preflight`] on the
-//! way in. Rust permits cyclic module references (only the crate
-//! dependency graph must be acyclic), so this compiles cleanly; a reviewer
-//! should expect to see this file's diff alongside `pipeline_launch.rs` for
-//! any future change to either side of the pair.
+//! [`run_preflight`] launches nothing (D-02): it returns a [`PreflightOutcome`],
+//! and [`crate::pipeline_launch::launch_stage`] turns an approval of the
+//! preflight gate into the one launch the runner's loop runs, resolved through
+//! `launch_stage_inner` so the just-adjudicated check is skipped on that launch
+//! only (D-18f). This module still imports `pipeline_launch`'s gate and commit
+//! helpers, and `pipeline_launch` calls [`run_preflight`] on the way in; Rust
+//! permits cyclic module references (only the crate dependency graph must be
+//! acyclic), so a reviewer should expect to see this file's diff alongside
+//! `pipeline_launch.rs` for any future change to either side of the pair.
 
 use crate::CliError;
 use crate::commands::phase_artifact_on_base;
 use crate::pipeline_gate::{abort, run_gate};
 use crate::pipeline_launch::close_gate;
 use crate::pipeline_launch::commit;
-use crate::pipeline_launch::launch_stage;
-use crate::pipeline_launch::launch_stage_inner;
 use crate::pipeline_launch::stream_launch_enabled;
 use crate::pipeline_outcomes::truncate_reason;
-use devflow_core::gates::GateAction;
+use crate::pipeline_outcomes::{Answer, ApproveRoute, StatusLessStep};
+use devflow_core::gates::GateKind;
 use devflow_core::git::git_command;
 use devflow_core::gsd_config::{self, GsdConfigError};
 use devflow_core::mode::{self, Mode};
 use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, CheckpointApproval, State};
-use devflow_core::{agents, events, verify, version};
+use devflow_core::{agents, events, verify};
 use std::path::{Path, PathBuf};
 
 /// The sandbox writable roots a worktree-hosted agent needs to commit: the
@@ -96,6 +92,23 @@ pub(crate) fn ensure_agent_binary(program: &str) -> Result<(), CliError> {
     Err(CliError::Message(format!(
         "agent binary `{program}` not found — is it installed? (run `devflow doctor`)"
     )))
+}
+
+/// The integration trunk `start` forks from (45-01 / D-01), resolved once: the resolver
+/// is fail-hard on an explicitly supplied value, and a configured base must also be a
+/// local branch ([`ensure_base_is_a_local_branch`]). The default path keeps its
+/// fall-open for a clone with no local `develop`. Shared by `start` and its dry run
+/// (52.1 D-27), so both refuse the same base the same way.
+///
+/// [`ensure_base_is_a_local_branch`]: crate::commands::ensure_base_is_a_local_branch
+pub(crate) fn resolve_start_base(
+    project_root: &Path,
+) -> Result<devflow_core::config::ResolvedBaseBranch, CliError> {
+    let resolved = devflow_core::config::base_branch(project_root).map_err(CliError::Message)?;
+    if resolved.source != devflow_core::config::BaseBranchSource::Default {
+        crate::commands::ensure_base_is_a_local_branch(project_root, &resolved.value)?;
+    }
+    Ok(resolved)
 }
 
 // ---------------------------------------------------------------------------
@@ -370,7 +383,17 @@ pub(crate) enum BaseRefCurrency {
 /// whatever the remote-tracking ref currently holds (Phase 24's inherited
 /// D-06 precedent — a new code path must not introduce a false hard-block
 /// on correct work, and an offline machine is correct work).
+#[cfg(test)]
 pub(crate) fn base_ref_currency(project_root: &Path, base: &str) -> BaseRefCurrency {
+    base_ref_currency_to(&mut std::io::stdout(), project_root, base)
+}
+
+/// [`base_ref_currency`] with its operator output sent to `out`.
+fn base_ref_currency_to(
+    out: &mut dyn std::io::Write,
+    project_root: &Path,
+    base: &str,
+) -> BaseRefCurrency {
     let remote_ref = format!("{ORIGIN}/{base}");
 
     let fetch_ok = git_command(project_root)
@@ -379,7 +402,8 @@ pub(crate) fn base_ref_currency(project_root: &Path, base: &str) -> BaseRefCurre
         .map(|out| out.status.success())
         .unwrap_or(false);
     if !fetch_ok {
-        println!(
+        let _ = writeln!(
+            out,
             "warning: could not fetch `{ORIGIN} {base}` — comparing `{base}` against \
              whatever `{remote_ref}` currently resolves to locally, which may be stale"
         );
@@ -521,8 +545,37 @@ pub(crate) fn undeterminable_currency_warning(base: &str) -> String {
     )
 }
 
+/// The one line [`ensure_base_ref_current`] prints when the project has no
+/// `origin` remote at all (OPS-03). It replaces the fetch-failure line and
+/// the undeterminable-currency warning, which would both follow from that
+/// single cause.
+fn missing_remote_line(base: &str) -> String {
+    format!(
+        "warning: no `{ORIGIN}` remote is configured — skipping the check that `{base}` \
+         is current with `{ORIGIN}/{base}` (fail-open)"
+    )
+}
+
+/// Whether the repository at `project_root` has a remote named `origin`:
+/// `Some(false)` only when `git remote` ran and did not list it. `None` when
+/// git could not answer, so the caller keeps its existing fetch-and-compare
+/// path rather than guessing that the remote is missing.
+fn origin_is_configured(project_root: &Path) -> Option<bool> {
+    let output = git_command(project_root).args(["remote"]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|name| name.trim() == ORIGIN),
+    )
+}
+
 /// Refuse before `devflow start` forks anything when `base` is stale
-/// relative to its remote. `Current`, `Ahead` and `Undeterminable` all
+/// relative to its remote. A project with no `origin` remote at all gets
+/// one line saying so and proceeds (OPS-03); a remote that exists but cannot
+/// be fetched is a different cause and keeps its own lines. `Current`, `Ahead` and `Undeterminable` all
 /// return `Ok(())` (the last with a warning — the guard fails open where it
 /// cannot see, mirroring [`ensure_phase_reachable_on_base`]).
 ///
@@ -556,7 +609,21 @@ pub(crate) fn undeterminable_currency_warning(base: &str) -> String {
 /// `Diverged` always refuses — a divergent base is never silently forked
 /// from.
 pub(crate) fn ensure_base_ref_current(project_root: &Path, base: &str) -> Result<(), CliError> {
-    match base_ref_currency(project_root, base) {
+    ensure_base_ref_current_to(&mut std::io::stdout(), project_root, base)
+}
+
+/// [`ensure_base_ref_current`] with its operator output sent to `out`, so a
+/// test can assert the lines an operator sees.
+fn ensure_base_ref_current_to(
+    out: &mut dyn std::io::Write,
+    project_root: &Path,
+    base: &str,
+) -> Result<(), CliError> {
+    if origin_is_configured(project_root) == Some(false) {
+        let _ = writeln!(out, "{}", missing_remote_line(base));
+        return Ok(());
+    }
+    match base_ref_currency_to(out, project_root, base) {
         BaseRefCurrency::Current | BaseRefCurrency::Ahead => Ok(()),
         // FAIL DIRECTION: OPEN. This arm is what allows a local-only
         // planning branch — one with no `origin/<base>` tracking ref, the
@@ -568,10 +635,9 @@ pub(crate) fn ensure_base_ref_current(project_root: &Path, base: &str) -> Result
         // (the classification) and
         // `ensure_base_ref_current_fails_open_for_a_local_only_planning_branch`
         // (the disposition); the WARNING's own text is guarded separately by
-        // `undeterminable_currency_warning_names_the_branch_and_its_disposition`,
-        // because a bare `println!` here is unobservable from a unit test.
+        // `undeterminable_currency_warning_names_the_branch_and_its_disposition`.
         BaseRefCurrency::Undeterminable => {
-            println!("{}", undeterminable_currency_warning(base));
+            let _ = writeln!(out, "{}", undeterminable_currency_warning(base));
             Ok(())
         }
         BaseRefCurrency::Diverged => {
@@ -603,7 +669,8 @@ pub(crate) fn ensure_base_ref_current(project_root: &Path, base: &str) -> Result
                     let fast_forwarded =
                         fast_forward_base_ref(project_root, base, &local_sha, &remote_sha);
                     if fast_forwarded {
-                        println!(
+                        let _ = writeln!(
+                            out,
                             "advanced `{base}` to `{remote_ref}` ({count} commit(s) fast-forwarded)"
                         );
                         return Ok(());
@@ -621,16 +688,16 @@ pub(crate) fn ensure_base_ref_current(project_root: &Path, base: &str) -> Result
 
 // ---------------------------------------------------------------------------
 // 17c: preflight readiness gate (D-13-D-16) — generic universal checks +
-// adapter hook, run from `launch_stage` before `monitor::spawn_monitor` so a
+// adapter hook, run from `launch_stage` before `spawn_agent_and_record` so a
 // readiness failure is caught before any agent time is spent.
 // ---------------------------------------------------------------------------
 
 /// The driver-driven interactivity gate (999.106): whether `stage` can run
 /// headless is declared by the driver's `interactivity_mode`, not a hardcoded
-/// `agent == Codex` check. `RequiresExistingArtifact` gates **Define only**
-/// (CONTEXT.md must already be on develop in auto mode — a pre-existing input);
-/// Plan is deliberately un-gated because PLAN.md is an *output* the phase
-/// itself produces. `HeadlessSafe` is never refused; `RequiresTypedSubagents`
+/// `agent == Codex` check. `RequiresExistingArtifact` gates **the first stage
+/// only**, Plan (CONTEXT.md must already be on develop in auto mode — a
+/// pre-existing input, since no stage runs the discussion); no PLAN.md is
+/// required, because PLAN.md is an *output* the phase itself produces. `HeadlessSafe` is never refused; `RequiresTypedSubagents`
 /// / `InteractiveOnly` have no headless path at all. Routes the failure
 /// through the preflight gate (D-15) rather than a hard error.
 pub(crate) fn preflight_interactivity_check(
@@ -662,7 +729,7 @@ pub(crate) fn preflight_interactivity_check(
                     .unwrap_or_else(|_| devflow_core::config::DEVELOP.to_string())
             });
             if state.mode == Mode::Auto
-                && state.stage == Stage::Define
+                && state.stage == Stage::Plan
                 && !phase_artifact_on_base(project_root, state.phase, "-CONTEXT.md", &base)
             {
                 return Err(format!(
@@ -684,222 +751,6 @@ pub(crate) fn preflight_interactivity_check(
     }
 }
 
-/// D-14 (universal, generic layer): whether the gh-auth credential probe
-/// applies to `stage` — hardcoded to `Stage::Ship` rather than a dynamic
-/// hook-scan (review Plan 05 MEDIUM, Codex+OpenCode): Ship's terminal hooks
-/// (`hooks::hooks_after_ship()` = Merge/VersionBump/ChangelogAppend/BranchCleanup,
-/// `hooks.rs:99-106`) are the only hooks that push to a remote. Split out as
-/// its own pure predicate so "does not run for a non-Ship stage" is directly
-/// unit-testable without shelling out to `gh`.
-fn gh_auth_check_applies(stage: Stage) -> bool {
-    stage == Stage::Ship
-}
-
-/// D-14 (universal, generic layer): external credential validity via `gh
-/// auth status`, run ONLY when [`gh_auth_check_applies`] (Ship). Fails soft
-/// to a warning when the `gh` binary itself is absent — a missing optional
-/// tool must not hard-fail the pipeline (T-17-14). Fails preflight only when
-/// `gh` is present and reports unauthenticated. Records only a boolean
-/// pass/fail plus a short reason string — raw `gh auth status` stdout/stderr
-/// is NEVER captured or logged (T-17-13, Information Disclosure).
-fn preflight_gh_auth_check(state: &State) -> Result<(), String> {
-    if !gh_auth_check_applies(state.stage) {
-        return Ok(());
-    }
-    match std::process::Command::new("gh")
-        .args(["auth", "status"])
-        .output()
-    {
-        Ok(output) if output.status.success() => Ok(()),
-        Ok(_) => Err("gh auth status reports not authenticated".to_string()),
-        Err(_) => {
-            println!(
-                "warning: `gh` binary not found — cannot verify GitHub credential validity \
-                 before Ship (fail-soft, not a preflight failure)"
-            );
-            Ok(())
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// D-09 (999.49 / DEN-74, second half): a major version bump must never ship
-// unattended. `hooks_after_ship` runs Merge -> VersionBump -> ChangelogAppend
-// -> BranchCleanup as a fail-fast batch with **no rollback** once Merge has
-// committed (`merge_feature`'s own doc comment, `devflow-core/src/hooks.rs`)
-// — a gate opening inside `VersionBump` itself would open AFTER the merge to
-// `develop` had already landed. **Placement here, at preflight, is
-// load-bearing, not cosmetic:** this is what makes the gate meaningful — it
-// is evaluated strictly before `hooks_after_ship` runs at all.
-//
-// D-18f's `Advance` semantics apply exactly as they do to the sibling
-// generic checks above: a human `Advance` on this gate relaunches via
-// `launch_stage_inner` directly and skips the re-check, which is correct
-// here because the classification is a deterministic idempotent predicate —
-// a gate approval cannot change what the commit range classifies to, so
-// re-running it would fail identically.
-//
-// **This check cannot be auto-approved.** `run_gate_with_timeout` (see its
-// doc comment in `pipeline_gate.rs`) deliberately does not derive
-// auto-approval from `state.yes_ship`, and forbids a future refactor from
-// folding it in. This check inherits that property rather than
-// re-implementing it — it performs no `yes_ship` handling of its own.
-//
-// **25-RESEARCH.md Open Question 1 is resolved here, not carried forward as
-// an open risk:** the Ship-stage agent's own commits (the code-review
-// report, and the ship-workflow's state-file commit) are both `docs`-typed
-// under D-08's classifier and so contribute no bump — no breaking-change
-// commit can land between this gate and `hooks_after_ship` running. No
-// second classification immediately before `Merge` is added.
-// ---------------------------------------------------------------------------
-
-/// D-09: whether the major-bump preflight check applies to `stage` —
-/// hardcoded to `Stage::Ship`, exactly the way [`gh_auth_check_applies`] is
-/// hardcoded, and split out as its own pure predicate for the same reason:
-/// so "does not run for a non-Ship stage" is directly unit-testable without
-/// any git fixture.
-fn major_bump_check_applies(stage: Stage) -> bool {
-    stage == Stage::Ship
-}
-
-/// D-09: a major bump opens a `[never-silent]` gate before `hooks_after_ship`
-/// runs, run ONLY when [`major_bump_check_applies`] (Ship). Classifies the
-/// SAME range [`version::compute_version`] will classify, by calling the
-/// same helpers it calls — [`version::highest_semver_tag`],
-/// [`version::reachable_semver_baseline`], [`version::release_range_start`],
-/// [`version::classify_range_bump`] — so this check and `VersionBump`'s
-/// later evaluation can never disagree.
-///
-/// A derivation error, including D-10's unreachable-baseline refusal, is
-/// surfaced as a preflight failure rather than silently treated as "no major
-/// bump": a version derivation that cannot be trusted must not proceed into
-/// the no-rollback batch (T-25-54).
-///
-/// The `Err` string names the classified bump kind, the baseline tag, and
-/// the resulting version, plus (for the major case) the deciding commits'
-/// subjects so a human can adjudicate — passed through [`truncate_reason`]
-/// (T-25-52), since commit subjects are attacker-influenced text and this
-/// reason reaches a persisted gate file and operator output. It contains no
-/// absolute filesystem path (WR-02).
-///
-/// CR-02 (`25-REVIEW.md`, 25-08): classification runs against
-/// `execution_root = state.worktree_path.as_deref().unwrap_or(project_root)`
-/// — the phase's worktree when `state.worktree_path` is set, else
-/// `project_root` — exactly the idiom `staleness.rs::enforce_build_staleness`
-/// established for the identical distinction. In `devflow start`'s default
-/// (worktree) execution mode, the phase's own commits live only on the
-/// worktree's feature branch and are unreachable from `project_root`'s HEAD
-/// until `hooks_after_ship`'s Merge step, which runs AFTER this preflight —
-/// evaluating against `project_root` alone would make a `feat!:` commit
-/// invisible to this gate.
-fn preflight_major_bump_check(project_root: &Path, state: &State) -> Result<(), String> {
-    if !major_bump_check_applies(state.stage) {
-        return Ok(());
-    }
-    let execution_root = state.worktree_path.as_deref().unwrap_or(project_root);
-
-    let highest = version::highest_semver_tag(execution_root).map_err(|err| err.to_string())?;
-    let baseline =
-        version::reachable_semver_baseline(execution_root).map_err(|err| err.to_string())?;
-
-    // D-10: refuse rather than proceed when the true highest tag exists but
-    // is not reachable from HEAD — mirrors `compute_version`'s own refusal
-    // exactly, since this check must never disagree with it.
-    if let Some(highest) = &highest {
-        let unreachable = match &baseline {
-            Some(reachable) => highest > reachable,
-            None => true,
-        };
-        if unreachable {
-            return Err(truncate_reason(&format!(
-                "version derivation refused: highest semver tag `v{highest}` is not reachable \
-                 from HEAD (D-10) — a major-bump classification cannot be trusted here, so \
-                 preflight refuses rather than proceed toward a no-rollback ship batch"
-            )));
-        }
-    }
-
-    let baseline_tag = baseline.as_ref().map(|tag| format!("v{tag}"));
-    let range_start = match &baseline_tag {
-        Some(tag) => {
-            version::release_range_start(execution_root, tag).map_err(|err| err.to_string())?
-        }
-        None => String::new(),
-    };
-    let bump = version::classify_range_bump(execution_root, &range_start)
-        .map_err(|err| err.to_string())?;
-
-    if bump != version::Bump::Major {
-        return Ok(());
-    }
-
-    let baseline_display = baseline_tag.as_deref().unwrap_or("(none)").to_string();
-    let baseline_major = baseline.as_ref().map(|v| v.major).unwrap_or(0);
-    let resulting_major = baseline_major + 1;
-    let subjects = breaking_commit_subjects(execution_root, &range_start);
-    let subjects_display = if subjects.is_empty() {
-        String::new()
-    } else {
-        format!(" — deciding commit(s): {}", subjects.join("; "))
-    };
-
-    Err(truncate_reason(&format!(
-        "classified bump is MAJOR — baseline `{baseline_display}`, resulting version \
-         `v{resulting_major}.0.0`; a major version bump never ships unattended (D-09){subjects_display}"
-    )))
-}
-
-/// D-09 diagnostic aid: the deciding commit subjects for a major-bump gate's
-/// `Err` message — re-scans the same range [`version::classify_range_bump`]
-/// classified, using the identical `%H%x1f%B%x1e` git-log idiom, so a human
-/// reviewing the gate can see which commit(s) carry a breaking marker
-/// without re-deriving the range themselves. Best-effort: a git spawn
-/// failure or non-zero exit yields an empty list rather than propagating an
-/// error — this is a diagnostic aid for the message, not part of the
-/// classification itself.
-///
-/// CR-02 (25-08): `execution_root` (the phase's worktree when set, else
-/// `project_root`) — see [`preflight_major_bump_check`]'s doc comment — so
-/// this diagnostic scan agrees with the classification it explains.
-fn breaking_commit_subjects(execution_root: &Path, range_start: &str) -> Vec<String> {
-    let range = if range_start.is_empty() {
-        "HEAD".to_string()
-    } else {
-        format!("{range_start}..HEAD")
-    };
-    let Ok(output) = git_command(execution_root)
-        .args(["log", "--no-merges", &range, "--format=%H%x1f%B%x1e"])
-        .output()
-    else {
-        return Vec::new();
-    };
-    if !output.status.success() {
-        return Vec::new();
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut subjects = Vec::new();
-    for record in stdout.split('\u{1e}') {
-        let record = record.trim_matches('\n');
-        if record.is_empty() {
-            continue;
-        }
-        let Some((_hash, message)) = record.split_once('\u{1f}') else {
-            continue;
-        };
-        let message = message.trim();
-        let subject = message.lines().next().unwrap_or_default();
-        let is_breaking = subject
-            .split_once(':')
-            .is_some_and(|(prefix, _)| prefix.contains('!'))
-            || message.contains("BREAKING CHANGE:")
-            || message.contains("BREAKING-CHANGE:");
-        if is_breaking {
-            subjects.push(subject.to_string());
-        }
-    }
-    subjects
-}
-
 // ---------------------------------------------------------------------------
 // D-07 (35.1-03): refuse an unattended launch, before any agent time is spent,
 // when the conditions that let it FINISH do not hold.
@@ -911,15 +762,16 @@ fn breaking_commit_subjects(execution_root: &Path, range_start: &str) -> Vec<Str
 
 /// The four states one unattended-launch prerequisite can be in.
 ///
-/// The fourth variant is not a nicety (F-12, C3): at Define a phase genuinely
+/// The fourth variant is not a nicety (F-12, C3): at Plan a phase genuinely
 /// has no plans yet, and folding that into [`Self::Undetermined`] would refuse
 /// every unattended launch ever started.
 ///
-/// Reasons are kept SHORT on purpose. [`run_preflight`] passes the joined
-/// refusal string through [`truncate_reason`] — a hard 300-character cap that
-/// includes a 39-character truncation marker — and three verbose reasons would
-/// not survive it. The unbounded detail lives in the printed report instead,
-/// which is exactly the split [`truncate_reason`]'s own doc comment describes.
+/// Reasons are kept SHORT on purpose. [`run_preflight`] stores the joined
+/// refusal string whole (up to [`truncate_reason`]'s bound), but the banner,
+/// `gate list` and the notify hook show only the start of the gate context,
+/// cut with a 39-character truncation marker, and three verbose reasons would
+/// not survive that cut. The unbounded detail lives in the printed report
+/// instead.
 #[derive(Debug)]
 enum ConditionState {
     /// Observed to hold.
@@ -962,16 +814,15 @@ impl ConditionState {
     }
 }
 
-/// D-07: whether the unattended-launch check applies to `stage` — `Define` and
-/// `Code`, split out as its own pure predicate exactly the way
-/// [`gh_auth_check_applies`] and [`major_bump_check_applies`] are, so "does not
-/// run for a non-applicable stage" is unit-testable with no fixture at all.
+/// D-07: whether the unattended-launch check applies to `stage` — `Plan` and
+/// `Code`, split out as its own pure predicate so "does not run for a
+/// non-applicable stage" is unit-testable with no fixture at all.
 ///
-/// `Define` is the earliest stage `devflow start` launches, so a refusal there
+/// `Plan` is the earliest stage `devflow start` launches, so a refusal there
 /// costs zero agent time. `Code` is where C3 first becomes determinable and
 /// where the mechanism is actually used.
 fn unattended_launch_check_applies(stage: Stage) -> bool {
-    matches!(stage, Stage::Define | Stage::Code)
+    matches!(stage, Stage::Plan | Stage::Code)
 }
 
 /// C1: the GSD config at the launch root exists, parses, and can hold the flag.
@@ -982,7 +833,7 @@ fn unattended_launch_check_applies(stage: Stage) -> bool {
 /// Absent and unreadable are reported as DIFFERENT states on purpose. A file
 /// that is not there is a different fact from a file that cannot be read, and
 /// collapsing them is the "unreachable is not absent" error this project
-/// already has a rule about (see [`preflight_major_bump_check`]'s D-10 branch).
+/// already has a rule about.
 ///
 /// T-35.1-16: no reason below embeds the absolute config path.
 /// [`gsd_config::GsdConfigError::Missing`] carries a `PathBuf` and renders it,
@@ -1010,10 +861,10 @@ fn unattended_config_condition(launch_root: &Path) -> ConditionState {
 /// C2: the Code stage would launch on the pipe-owning arm AND the driver has
 /// a real dogfooded run (round-3 F5/D-04).
 ///
-/// The chain-flag guard is engaged by the stage supervisor (`run_monitor`)
-/// for a stream launch only, the one shape that bounds the flag's lifetime to
-/// the agent's. Since 50-11 a capture launch runs under the same Rust
-/// supervisor but never engages it (before that the legacy arm was a detached
+/// The chain-flag guard is engaged by the runner (`run_one_stage`) for a
+/// stream launch only, the one shape that bounds the flag's lifetime to the
+/// agent's. A capture launch runs in the same runner but never engages it
+/// (before 50-11 the legacy arm was a detached
 /// shell script with no frame to hang a `Drop` on, `35.1-RESEARCH.md`
 /// Pitfall 4). This turns that accepted gap from a silent stall hours into an
 /// unattended run into a refusal before the first agent is spawned.
@@ -1029,15 +880,12 @@ fn unattended_config_condition(launch_root: &Path) -> ConditionState {
 /// Phase 42 has validated Antigravity with `DEVFLOW_ANTIGRAVITY_IDLE_TIMEOUT_SECS=300`.
 /// Antigravity joins Claude on the stream-json unattended launch path.
 fn unattended_launch_shape_condition(state: &State) -> ConditionState {
-    if stream_launch_enabled(state.agent, Stage::Code, state.legacy_claude_launch)
+    if stream_launch_enabled(state.agent, Stage::Code)
         && (state.agent == AgentKind::Claude || state.agent == AgentKind::Antigravity)
     {
         return ConditionState::Holds;
     }
     let mut causes = Vec::new();
-    if state.legacy_claude_launch {
-        causes.push("the legacy launch opt-out is active".to_string());
-    }
     if state.agent != AgentKind::Claude && state.agent != AgentKind::Antigravity {
         causes.push(format!(
             "the agent is `{}`, not claude or antigravity",
@@ -1052,10 +900,82 @@ fn unattended_launch_shape_condition(state: &State) -> ConditionState {
     // The reason names the CAUSE that applied, and then the consequence in
     // terms true of every cause.
     ConditionState::DoesNotHold(format!(
-        "{} — so Code would launch on the capture shape, whose supervisor never engages the \
-         chain-flag guard (only a stream-shape supervisor does)",
+        "{} — so Code would launch on the capture shape, and the runner engages the \
+         chain-flag guard only for a stream launch",
         causes.join(" and ")
     ))
+}
+
+/// D-03's auto-mode half: the refusal detail when `fallback` could not take over the
+/// Code stage of an unattended run, `None` when it could or the run is not unattended.
+///
+/// Failover happens only at Code (R-2), so the question is the Code-stage launch
+/// shape: [`unattended_launch_shape_condition`] evaluated for a candidate whose agent
+/// is `fallback`. Only `--mode auto` asks it; a supervised run has no chain flag to
+/// guard. Deliberately not widened: the condition is the one `run_preflight` and
+/// `hand_off_agent` apply, so launch and handoff cannot disagree.
+pub(crate) fn fallback_launch_shape_refusal(state: &State, fallback: AgentKind) -> Option<String> {
+    if state.mode != Mode::Auto {
+        return None;
+    }
+    let mut candidate = state.clone();
+    candidate.agent = fallback;
+    let condition = unattended_launch_shape_condition(&candidate);
+    condition
+        .refuses()
+        .then(|| condition.detail().unwrap_or("no detail").to_string())
+}
+
+/// The launch-time checks on a fallback agent (D-02, D-03), shared by `start` and
+/// `resume`. `state` is the run as it would launch: its `agent` is the primary the
+/// fallback stands behind.
+///
+/// In order: the fallback must differ from the agent (D-02); in `--mode auto` it must
+/// hold the Code-stage launch shape ([`fallback_launch_shape_refusal`]); its binary
+/// must be installed; its driver must report healthy. Best effort by decision (D-03):
+/// stage-dependent preflight conditions cannot be evaluated at launch, and the full
+/// bundle runs again at the handoff.
+///
+/// Reads nothing from disk and writes nothing, so a caller can run it before any
+/// commit and a refusal leaves the run as it was.
+pub(crate) fn validate_fallback_agent(state: &State, fallback: AgentKind) -> Result<(), CliError> {
+    if fallback == state.agent {
+        return Err(CliError::Message(format!(
+            "--fallback-agent {fallback} is the run's own agent ({agent}); a fallback must be a \
+             different agent",
+            agent = state.agent
+        )));
+    }
+    if let Some(detail) = fallback_launch_shape_refusal(state, fallback) {
+        return Err(CliError::Message(format!(
+            "--fallback-agent {fallback} cannot take over an unattended (--mode auto) Code \
+             stage: the unattended launch shape does not hold for it ({detail})"
+        )));
+    }
+    ensure_agent_binary(agent_program(fallback))?;
+    let mut candidate = state.clone();
+    candidate.agent = fallback;
+    agents::driver_for(fallback)
+        .health(&candidate)
+        .map_err(|err| {
+            CliError::Message(format!("--fallback-agent {fallback} is not ready: {err}"))
+        })
+}
+
+/// Print the line `start` and `resume` show when they arm a fallback (T-51-11): it
+/// names the fallback and the agent it stands behind.
+///
+/// Written to [`std::io::stdout`] directly, as the unattended-launch report of
+/// [`preflight_unattended_launch_check`] is, not through `println!`: libtest captures
+/// `println!` from a test thread, and the tests that pin this line read it from a child
+/// test process's stdout. A failed write is ignored: the fallback is already in the run
+/// state, which is the record that counts.
+pub(crate) fn print_fallback_notice(fallback: AgentKind, agent: AgentKind) {
+    use std::io::Write as _;
+    let _ = writeln!(
+        std::io::stdout(),
+        "fallback agent: {fallback} takes over the Code stage once if {agent} is rate-limited"
+    );
 }
 
 /// C3: no plan for this phase declares a checkpoint GSD never auto-approves.
@@ -1065,13 +985,13 @@ fn unattended_launch_shape_condition(state: &State) -> ConditionState {
 /// phase builds.
 ///
 /// "No plans yet" is deliberately read differently at the two applicable
-/// stages: pending at Define (the phase is not planned yet — normal), and
+/// stages: pending at Plan (the phase is not planned yet — normal), and
 /// undetermined at Code (plans should exist by then, and their absence is an
 /// anomaly, not a pass).
 fn unattended_planned_checkpoint_condition(launch_root: &Path, state: &State) -> ConditionState {
     if verify::phase_plan_files(launch_root, state.phase).is_empty() {
         let reason = "the phase has no plan files yet".to_string();
-        return if state.stage == Stage::Define {
+        return if state.stage == Stage::Plan {
             ConditionState::NotYetApplicable(format!("{reason} — re-evaluated at Code"))
         } else {
             ConditionState::Undetermined(format!("{reason}, but Code expects them"))
@@ -1105,8 +1025,6 @@ fn unattended_planned_checkpoint_condition(launch_root: &Path, state: &State) ->
 /// **D-09: there is no override, and its absence is a decision, not an
 /// oversight.** No flag, no environment variable, no config key, and no
 /// parameter beyond `(&Path, &State)` turns this refusal into a warning.
-/// `state.yes_ship` authorizes the Ship gate and nothing else; that
-/// non-interaction is pinned by `unattended_check_is_not_bypassed_by_yes_ship`.
 /// **Both external review lanes objected to this on record** — a false-positive
 /// refusal has no in-product recovery — and the operator heard the objection
 /// and let the decision stand (registered as T-35.1-15, disposition `accept`).
@@ -1127,7 +1045,7 @@ fn unattended_planned_checkpoint_condition(launch_root: &Path, state: &State) ->
 /// **Where the report is actually seen (F-16).** [`run_preflight`] runs from
 /// `launch_stage`, which runs in the operator's own `devflow start` process for
 /// the FIRST stage and in the detached `__monitor` process for every later one.
-/// The Define-stage report therefore prints to the operator's TERMINAL — which
+/// The Plan-stage report therefore prints to the operator's TERMINAL — which
 /// is what makes D-08's rehearsal useful — and the Code-stage report prints to
 /// the MONITOR LOG. Nobody should later "fix" a report they could not find.
 ///
@@ -1229,7 +1147,7 @@ fn unattended_launch_check_reporting_to(
 /// The generic (universal) preflight checks (D-14) — the adapter-specific
 /// hook is composed separately in [`run_preflight`].
 ///
-/// CR-01 (`25-REVIEW.md`, 25-08): runs all three checks unconditionally and
+/// CR-01 (`25-REVIEW.md`, 25-08): runs every check unconditionally and
 /// aggregates every `Err` into one reason, rather than `?`-short-circuiting
 /// on the first failure. `run_preflight`'s `GateAction::Advance` arm
 /// relaunches via `launch_stage_inner` directly and never re-runs this
@@ -1237,53 +1155,38 @@ fn unattended_launch_check_reporting_to(
 /// (because an earlier check in the chain failed first) would never run at
 /// all for that stage launch, and a human approving that earlier gate would
 /// never have been shown the unrun check's reason. Aggregation closes that
-/// hole for every check in this chain, not just the major-bump check that
-/// surfaced it (`25-VERIFICATION.md`'s named fix, `25-REVIEW.md`'s option
+/// hole for every check in this chain, not just the (since removed) Ship
+/// check that surfaced it (`25-VERIFICATION.md`'s named fix, `25-REVIEW.md`'s option
 /// (a); option (b), special-casing the `Advance` arm instead, was
 /// deliberately not taken — it would not close the same hole for a future
 /// check added to this chain).
 ///
-/// Reasons are ordered by consequence, **major-bump FIRST**, then
-/// interactivity, then gh-auth — load-bearing, not cosmetic:
-/// `run_preflight` passes the joined string through [`truncate_reason`] (a
-/// hard 300-character cap) before it reaches the gate context, and the
-/// major-bump reason is both the longest of the three and the only one
-/// whose loss would silently re-open the unattended-ship hole D-09 exists
-/// to close.
+/// Reasons are ordered by consequence, **unattended launch FIRST**, then
+/// interactivity — load-bearing, not cosmetic: the joined string reaches the
+/// gate context, whose start is all the banner, `gate list` and the notify
+/// hook show, so a later reason is the one their cut elides.
 ///
 /// The adapter-specific hook (composed by [`run_preflight`] via
 /// `.and_then`) is deliberately NOT folded into this aggregation —
-/// `25-VERIFICATION.md`'s gap-closure scope names only these three generic
-/// checks; this is a scope boundary, not an oversight.
+/// `25-VERIFICATION.md`'s gap-closure scope names only the generic checks;
+/// this is a scope boundary, not an oversight.
 pub(crate) fn generic_preflight_checks(project_root: &Path, state: &State) -> Result<(), String> {
     let mut reasons = Vec::new();
-    if let Err(reason) = preflight_major_bump_check(project_root, state) {
-        reasons.push(reason);
-    }
-    // D-07 (35.1-03) sits SECOND, and the position was chosen rather than
-    // defaulted to. It can never co-occur with the major-bump or gh-auth
-    // reasons — those apply only at `Stage::Ship`, and
-    // `unattended_launch_check_applies` covers only Define and Code — so
-    // second is effectively FIRST on every launch where this reason exists at
-    // all, and `truncate_reason`'s 300-character cap cannot elide it.
+    // D-07 (35.1-03) sits FIRST, and the position was chosen rather than
+    // defaulted to, so the display cut of the gate context cannot elide it.
     //
     // The one check it CAN co-occur with is interactivity (Codex, Auto,
-    // Define), and it outranks that deliberately: interactivity reports a
+    // Plan), and it outranks that deliberately: interactivity reports a
     // symptom this check's C2 also reports, with more actionable detail and a
     // per-condition breakdown. Losing the shorter, more-redundant reason to
     // truncation costs less than losing this one.
     //
     // Aggregated with `if let Err`, never `?` — see this function's CR-01 doc
-    // comment above. A `?` here would mean a human approving the major-bump
-    // gate at some future Ship-and-Code-composing stage never sees why the
-    // unattended launch was refused.
+    // comment above.
     if let Err(reason) = preflight_unattended_launch_check(project_root, state) {
         reasons.push(reason);
     }
     if let Err(reason) = preflight_interactivity_check(project_root, state) {
-        reasons.push(reason);
-    }
-    if let Err(reason) = preflight_gh_auth_check(state) {
         reasons.push(reason);
     }
     if reasons.is_empty() {
@@ -1337,47 +1240,74 @@ fn fill_pending_approval(state: &mut State, approval: CheckpointApproval) {
     }
 }
 
+/// The context of the preflight gate for a refusal at `stage` of `phase`: the
+/// way-on sentence the routers render for a preflight gate (GATE-04, D-39),
+/// then the refusal's `reason`, bounded by [`truncate_reason`].
+pub(crate) fn preflight_gate_context(phase: PhaseId, stage: Stage, reason: &str) -> String {
+    crate::pipeline_outcomes::lead_with_way_on(
+        GateKind::Preflight,
+        (phase, stage),
+        None,
+        &format!(
+            "[never-silent] preflight failed for stage {stage}: {}",
+            truncate_reason(reason)
+        ),
+    )
+}
+
+/// How [`run_preflight`] ended, for [`crate::pipeline_launch::launch_stage`] to turn
+/// into the launch. The preflight itself launches nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreflightOutcome {
+    /// Every check passed: launch with the caller's prompt and archived stage.
+    Proceed,
+    /// A check failed and a human approved its preflight gate: launch once with no
+    /// prompt override and no archived stage, skipping the re-check (D-18f, T-18-28).
+    Approved,
+    /// The gate was aborted or the retry ceiling was reached: launch nothing.
+    Stop,
+}
+
 /// Gate a stage launch on readiness (17c, D-13-D-16): the generic universal
 /// checks (D-14) plus the adapter-specific hook, called from `launch_stage`
-/// BEFORE `monitor::spawn_monitor` so a readiness failure is caught before
+/// before the launch is resolved, so a readiness failure is caught before
 /// any agent time is spent. A failing check is NEVER a hard exit — it
 /// surfaces as a named preflight gate + notify (WR-11 idiom, D-15), mirroring
 /// `handle_stage_failure`'s dispatch shape exactly.
 ///
-/// Returns `Ok(true)` when the caller should continue the rest of
-/// `launch_stage` (preflight passed). Returns `Ok(false)` when a failing
-/// check was resolved via a gate that ALREADY completed a full retried
-/// launch (Advance/LoopBack), reached the retry ceiling, or aborted —
-/// the caller must not run any more launch steps for this invocation
-/// (CR-01, 17-08 gap closure: the old `Result<(), CliError>` return
-/// couldn't distinguish these cases, so the caller always continued and
-/// spawned the agent a second time).
+/// Launches nothing (D-02): it returns [`PreflightOutcome::Proceed`] when the
+/// checks pass, [`PreflightOutcome::Approved`] when a human approved the gate a
+/// failing check opened, and [`PreflightOutcome::Stop`] for an abort or the retry
+/// ceiling. `launch_stage` turns the first two into the one launch the runner's
+/// loop runs, in the runner's own process, and returns no launch for the third
+/// (CR-01, 17-08 gap closure: the agent is resolved once per invocation).
 ///
 /// 18f (D-18f): `GateAction::Advance` on a preflight gate is an explicit
 /// override — the check has already been adjudicated by a human, and every
-/// generic check (`preflight_major_bump_check`,
-/// `preflight_interactivity_check`, `preflight_gh_auth_check`) is a
+/// generic check (`preflight_unattended_launch_check`,
+/// `preflight_interactivity_check`) is a
 /// deterministic idempotent predicate a gate approval cannot change, so
 /// re-running them is guaranteed to fail identically. **This justification
 /// is sound only because [`generic_preflight_checks`] aggregates rather than
 /// `?`-short-circuits (CR-01, 25-08): every applicable check has actually
 /// been evaluated and its reason shown to the human before the gate opens,
 /// so skipping the re-check on `Advance` cannot silently skip a check that
-/// never ran once.** The `Advance` arm therefore relaunches via
-/// [`launch_stage_inner`] directly, SKIPPING this function entirely on the
-/// retry. `GateAction::LoopBack` still calls the full [`launch_stage`]
-/// (re-entering this function), because that path means the operator will
-/// fix the condition and retry, and the state may genuinely have changed.
-/// Either arm's recursion is bounded by `state.preflight_retries` /
-/// [`mode::MAX_PREFLIGHT_RETRIES`]: the ceiling is checked BEFORE writing
-/// another gate, so reaching it aborts with a logged
+/// never ran once.** An approval therefore returns
+/// [`PreflightOutcome::Approved`], which `launch_stage` resolves through
+/// `launch_stage_inner` directly, SKIPPING this function entirely on the
+/// retry. A reject is not an answer to this gate (D-39, 52-29): the answer
+/// screen refuses it before its claim and reopens the gate, so the only
+/// answers that reach here are approve and abort. A failed check is checked
+/// again only by a later `run_preflight` call, which `state.preflight_retries` /
+/// [`mode::MAX_PREFLIGHT_RETRIES`] bounds: the ceiling is checked BEFORE
+/// writing another gate, so reaching it aborts with a logged
 /// `preflight_retry_ceiling_reached` event instead of polling a second
 /// 7-day gate timeout nobody will ever answer (T-18-27, T-18-30).
 pub(crate) fn run_preflight(
     project_root: &Path,
     state: &mut State,
     driver: &dyn agents::AgentDriver,
-) -> Result<bool, CliError> {
+) -> Result<PreflightOutcome, CliError> {
     let stage = state.stage;
     if let Err(reason) =
         generic_preflight_checks(project_root, state).and_then(|()| driver.health(state))
@@ -1402,19 +1332,15 @@ pub(crate) fn run_preflight(
                 }),
             );
             abort(project_root, state, &ceiling_reason)?;
-            return Ok(false);
+            return Ok(PreflightOutcome::Stop);
         }
         commit(state, |s| {
             s.preflight_retries = s.preflight_retries.saturating_add(1)
         })?;
 
-        let context = format!(
-            "[never-silent] preflight failed for stage {stage}: {} — human review needed \
-             (retry, loop-to-code, or abort)",
-            truncate_reason(&reason)
-        );
-        match run_gate(project_root, state, stage, &context)? {
-            GateAction::Advance => {
+        let context = preflight_gate_context(state.phase, stage, &reason);
+        return match run_gate(project_root, state, stage, GateKind::Preflight, &context)? {
+            Answer::Approve(ApproveRoute::StatusLess(StatusLessStep::PreflightOverride)) => {
                 // D-18f: approval is an explicit override — skip the
                 // just-adjudicated check on the retry (see the function
                 // doc comment above).
@@ -1423,7 +1349,7 @@ pub(crate) fn run_preflight(
                 // launch whose plans declare a human-only checkpoint is
                 // REFUSED, so the pass path below never runs for it. THIS is
                 // where that run's pre-agent set is recorded — consuming
-                // `Pending` before `launch_stage_inner` starts the agent, in
+                // `Pending` before the approved launch starts the agent, in
                 // every mode, or the agent would run with `Pending` still in
                 // place and the next passing evaluation would record what it
                 // wrote.
@@ -1452,17 +1378,21 @@ pub(crate) fn run_preflight(
                         fill_pending_approval(s, approval);
                     }
                 })?;
-                launch_stage_inner(state, None, None)?;
+                Ok(PreflightOutcome::Approved)
             }
-            GateAction::LoopBack(_) => {
-                // D-18f: "I will fix it, then retry" — re-check deliberately,
-                // bounded by the ceiling above.
-                let _ = close_gate(project_root, state.phase, stage);
-                launch_stage(state, None, None)?;
+            Answer::Abort(reason) => {
+                abort(project_root, state, &reason)?;
+                Ok(PreflightOutcome::Stop)
             }
-            GateAction::Abort(reason) => abort(project_root, state, &reason)?,
-        }
-        return Ok(false);
+            // D-39 (52-29): a reject is not an answer to this gate. The answer
+            // screen refuses it before its claim and reopens the gate, so no
+            // other route reaches here.
+            other => Err(CliError::Message(format!(
+                "phase {}: the preflight gate's answer has no route here: {}",
+                state.phase,
+                other.resolved_fields()
+            ))),
+        };
     }
 
     // D-07 (CHKPT-02): a Code evaluation that PASSED is the moment DevFlow
@@ -1490,12 +1420,13 @@ pub(crate) fn run_preflight(
     if state.preflight_retries != 0 {
         commit(state, |s| s.preflight_retries = 0)?;
     }
-    Ok(true)
+    Ok(PreflightOutcome::Proceed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline_launch::launch_after_preflight;
     use crate::test_support::*;
     use devflow_core::gates::Gates;
     use devflow_core::test_support::preanswer_gate;
@@ -1538,13 +1469,13 @@ mod tests {
     // -----------------------------------------------------------------
 
     /// D-14/999.106 interactivity check: the gate is driver-driven — Codex
-    /// declares Define `RequiresExistingArtifact`, so a headless Auto-mode
-    /// Codex Define run without CONTEXT.md on develop is flagged. Supervise
-    /// mode, a non-Define stage (Plan is un-gated — PLAN.md is an output), a
+    /// declares Plan `RequiresExistingArtifact`, so a headless Auto-mode
+    /// Codex Plan run (the first stage) without CONTEXT.md on develop is
+    /// flagged. Supervise mode, a stage that is not the first one (Code), a
     /// non-Codex agent (Claude declares HeadlessSafe), and a CONTEXT.md that
     /// does exist are all unaffected.
     #[test]
-    fn preflight_interactivity_check_flags_auto_define_without_context_md() {
+    fn preflight_interactivity_check_flags_auto_plan_without_context_md() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
@@ -1555,21 +1486,24 @@ mod tests {
             Mode::Auto,
             root.to_path_buf(),
         );
-        state.stage = Stage::Define;
+        state.stage = Stage::Plan;
         assert!(preflight_interactivity_check(root, &state).is_err());
 
         state.mode = Mode::Supervise;
         assert!(preflight_interactivity_check(root, &state).is_ok());
 
         state.mode = Mode::Auto;
-        state.stage = Stage::Plan;
-        assert!(preflight_interactivity_check(root, &state).is_ok());
+        state.stage = Stage::Code;
+        assert!(
+            preflight_interactivity_check(root, &state).is_ok(),
+            "only the first stage, Plan, needs CONTEXT.md on the base"
+        );
 
-        state.stage = Stage::Define;
+        state.stage = Stage::Plan;
         state.agent = AgentKind::Claude;
         assert!(
             preflight_interactivity_check(root, &state).is_ok(),
-            "Claude declares Define HeadlessSafe — not flagged"
+            "Claude declares Plan HeadlessSafe — not flagged"
         );
         state.agent = AgentKind::Codex;
 
@@ -1589,7 +1523,7 @@ mod tests {
         git(&["add", "-A"]);
         git(&["commit", "-q", "-m", "context"]);
 
-        state.stage = Stage::Define;
+        state.stage = Stage::Plan;
         assert!(preflight_interactivity_check(root, &state).is_ok());
     }
 
@@ -1644,7 +1578,7 @@ mod tests {
             Mode::Auto,
             root.to_path_buf(),
         );
-        state.stage = Stage::Define;
+        state.stage = Stage::Plan;
 
         // NEGATIVE CONTROL, asserted FIRST so the positive case cannot be
         // satisfied by a check that passes unconditionally: with nothing
@@ -1677,440 +1611,14 @@ mod tests {
         );
     }
 
-    /// D-14 gh-auth scope: hardcoded to Stage::Ship, not a dynamic hook-scan.
-    #[test]
-    fn gh_auth_check_applies_only_to_ship_stage() {
-        assert!(gh_auth_check_applies(Stage::Ship));
-        for stage in [Stage::Define, Stage::Plan, Stage::Code, Stage::Validate] {
-            assert!(!gh_auth_check_applies(stage));
-        }
-    }
-
-    // -----------------------------------------------------------------
-    // D-09 (999.49/DEN-74): major-bump preflight check.
-    // -----------------------------------------------------------------
-
-    /// D-09 scope: hardcoded to Stage::Ship, mirroring `gh_auth_check_applies`.
-    #[test]
-    fn major_bump_check_applies_only_to_ship_stage() {
-        assert!(major_bump_check_applies(Stage::Ship));
-        for stage in [Stage::Define, Stage::Plan, Stage::Code, Stage::Validate] {
-            assert!(!major_bump_check_applies(stage));
-        }
-    }
-
-    fn commit_msg(root: &Path, name: &str, message: &str) {
-        std::fs::write(root.join(name), name).unwrap();
-        run_git(root, &["add", "."]);
-        run_git(root, &["commit", "-q", "-m", message]);
-    }
-
-    fn tag(root: &Path, name: &str) {
-        run_git(root, &["tag", name]);
-    }
-
-    /// A minimal repo with `v1.0.0` tagged at the initial commit — the
-    /// baseline every major-bump fixture below builds on.
-    fn major_bump_fixture() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        run_git(root, &["init", "-q"]);
-        run_git(root, &["config", "user.email", "t@e.st"]);
-        run_git(root, &["config", "user.name", "t"]);
-        run_git(root, &["config", "commit.gpgsign", "false"]);
-        run_git(root, &["config", "tag.gpgsign", "false"]);
-        run_git(root, &["config", "core.hooksPath", "/dev/null"]);
-        commit_msg(root, "a.txt", "chore: init");
-        tag(root, "v1.0.0");
-        dir
-    }
-
-    /// A non-Ship stage returns `Ok(())` without ever shelling out to git —
-    /// the fixture directory is not even a git repository, so a git spawn
-    /// or exit failure would surface as `Err` were the check to ever reach
-    /// the git-shelling branch. `Ok(())` here is evidence of the early
-    /// return in `major_bump_check_applies`.
-    #[test]
-    fn major_bump_short_circuits_for_non_ship_stage() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let mut state = State::new(
-            PhaseId::new(70),
-            AgentKind::Claude,
-            Mode::Auto,
-            root.to_path_buf(),
-        );
-        for stage in [Stage::Define, Stage::Plan, Stage::Code, Stage::Validate] {
-            state.stage = stage;
-            assert!(
-                preflight_major_bump_check(root, &state).is_ok(),
-                "stage {stage} must short-circuit before ever shelling out to git"
-            );
-        }
-    }
-
-    /// A range classifying to patch or minor passes silently at Ship.
-    #[test]
-    fn major_bump_ok_for_patch_or_minor_bump_at_ship() {
-        let dir = major_bump_fixture();
-        let root = dir.path();
-        commit_msg(root, "b.txt", "fix(x): correct off-by-one");
-
-        let mut state = State::new(
-            PhaseId::new(71),
-            AgentKind::Claude,
-            Mode::Auto,
-            root.to_path_buf(),
-        );
-        state.stage = Stage::Ship;
-        assert!(preflight_major_bump_check(root, &state).is_ok());
-
-        commit_msg(root, "c.txt", "feat(x): add capability");
-        assert!(preflight_major_bump_check(root, &state).is_ok());
-    }
-
-    /// A breaking-change commit at Ship fails, naming the bump kind, the
-    /// baseline tag, the resulting version, and the deciding commit subject.
-    #[test]
-    fn major_bump_errs_naming_bump_baseline_and_version_for_major_at_ship() {
-        let dir = major_bump_fixture();
-        let root = dir.path();
-        commit_msg(root, "b.txt", "feat(scope)!: drop legacy api");
-
-        let mut state = State::new(
-            PhaseId::new(72),
-            AgentKind::Claude,
-            Mode::Auto,
-            root.to_path_buf(),
-        );
-        state.stage = Stage::Ship;
-        let err = preflight_major_bump_check(root, &state).unwrap_err();
-        assert!(err.contains("MAJOR"), "{err}");
-        assert!(err.contains("v1.0.0"), "{err}");
-        assert!(err.contains("v2.0.0"), "{err}");
-        assert!(err.contains("drop legacy api"), "{err}");
-    }
-
-    /// D-10: an unreachable highest tag is surfaced as a preflight failure
-    /// (never a silent pass) — mirrors `version.rs`'s own
-    /// `unreachable_highest_tag_refuses_rather_than_falling_back` fixture.
-    #[test]
-    fn major_bump_surfaces_unreachable_baseline_refusal() {
-        let dir = major_bump_fixture();
-        let root = dir.path();
-        let main_branch = {
-            let out = devflow_core::test_support::git_command(root)
-                .args(["symbolic-ref", "--short", "HEAD"])
-                .output()
-                .unwrap();
-            assert!(out.status.success());
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        };
-
-        run_git(root, &["checkout", "--orphan", "orphan-release"]);
-        run_git(
-            root,
-            &["commit", "--allow-empty", "-q", "-m", "chore: orphan"],
-        );
-        tag(root, "v9.9.9");
-        run_git(root, &["checkout", &main_branch]);
-
-        let mut state = State::new(
-            PhaseId::new(73),
-            AgentKind::Claude,
-            Mode::Auto,
-            root.to_path_buf(),
-        );
-        state.stage = Stage::Ship;
-        let err = preflight_major_bump_check(root, &state).unwrap_err();
-        assert!(err.contains("v9.9.9"), "{err}");
-        assert!(err.contains("not reachable"), "{err}");
-    }
-
-    /// CR-02 (`25-REVIEW.md`): a real `git worktree add` fixture proving the
-    /// D-09 major-bump gate must classify the WORKTREE's HEAD, not
-    /// `project_root`'s, in `devflow start`'s default (worktree) execution
-    /// mode. Mirrors `staleness.rs::worktree_staleness_fixture`'s
-    /// construction exactly: `project_root` and `worktree_path` are SIBLING
-    /// directories under one outer tempdir (never nested — a nested worktree
-    /// path would contain `project_root`'s path as a string prefix, making
-    /// path-discriminating assertions mutually exclusive), `git init -q -b
-    /// develop` plus the same five config lines `major_bump_fixture` uses,
-    /// one `chore: init` commit tagged `v1.0.0` on `develop`, then `git
-    /// worktree add -b feature/phase-90 <worktree_path> develop` from
-    /// `project_root`. Exactly ONE commit is made, and made ONLY inside
-    /// `worktree_path`, with the message `feat(scope)!: drop legacy api` —
-    /// the identical breaking-marker shape and message
-    /// `major_bump_errs_naming_bump_baseline_and_version_for_major_at_ship`
-    /// uses, so a classification difference cannot be attributed to message
-    /// shape. `project_root`'s HEAD (`develop`) never moves.
-    ///
-    /// Tags live in the shared object database, so `v1.0.0` is visible and
-    /// reachable from the worktree's HEAD (`git tag --merged HEAD` run in the
-    /// worktree returns it) — this is the property that makes the fixture
-    /// meaningful: the baseline resolves identically from either root, only
-    /// the classified range differs.
-    ///
-    /// Returns `(tempdir_guard, worktree_path)`. `project_root` is
-    /// `tempdir_guard.path().join("project")`, matching
-    /// `worktree_staleness_fixture`'s return contract. The guard must be kept
-    /// alive for the duration of the test.
-    fn major_bump_worktree_fixture() -> (tempfile::TempDir, PathBuf) {
-        let outer = tempfile::tempdir().unwrap();
-        let project_root = outer.path().join("project");
-        std::fs::create_dir_all(&project_root).unwrap();
-        let worktree_path = outer.path().join("worktree");
-
-        run_git(&project_root, &["init", "-q", "-b", "develop"]);
-        run_git(&project_root, &["config", "user.email", "t@e.st"]);
-        run_git(&project_root, &["config", "user.name", "t"]);
-        run_git(&project_root, &["config", "commit.gpgsign", "false"]);
-        run_git(&project_root, &["config", "tag.gpgsign", "false"]);
-        run_git(&project_root, &["config", "core.hooksPath", "/dev/null"]);
-        commit_msg(&project_root, "a.txt", "chore: init");
-        tag(&project_root, "v1.0.0");
-
-        run_git(
-            &project_root,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                "feature/phase-90",
-                worktree_path.to_str().unwrap(),
-                "develop",
-            ],
-        );
-
-        // ONE commit made ONLY inside the worktree — project_root's HEAD
-        // (develop) never moves. This asymmetry is exactly CR-02's mechanism.
-        commit_msg(&worktree_path, "b.txt", "feat(scope)!: drop legacy api");
-
-        (outer, worktree_path)
-    }
-
-    /// CR-02 (`25-REVIEW.md`): `preflight_major_bump_check` must classify the
-    /// tree the phase's code actually lives in. Before Task 2's fix, this
-    /// check always shells git against `project_root`, so a breaking commit
-    /// that exists ONLY on the worktree's feature branch (the default
-    /// `devflow start` execution mode) is invisible — this test is RED until
-    /// Task 2 lands. Both halves are asserted in one test, exactly as
-    /// `embedded_commit_is_stale_uses_worktree_head` does, because a single
-    /// assertion would pass for the wrong reason if the fixture were built
-    /// incorrectly.
-    #[test]
-    fn preflight_major_bump_check_fires_against_the_worktree_head() {
-        let _guard = env_lock();
-
-        let (outer, worktree_path) = major_bump_worktree_fixture();
-        let project_root = outer.path().join("project");
-
-        let mut state = State::new(
-            PhaseId::new(76),
-            AgentKind::Claude,
-            Mode::Auto,
-            project_root.clone(),
-        );
-        state.stage = Stage::Ship;
-        state.worktree_path = Some(worktree_path.clone());
-
-        let err = preflight_major_bump_check(&project_root, &state).unwrap_err();
-        assert!(err.contains("MAJOR"), "{err}");
-        assert!(err.contains("v1.0.0"), "{err}");
-        assert!(err.contains("v2.0.0"), "{err}");
-        assert!(err.contains("drop legacy api"), "{err}");
-
-        // Negative half: with no worktree set, the SAME call classifies
-        // project_root's HEAD (develop), where the breaking commit does not
-        // exist — proving the fixture discriminates on execution root and
-        // that the positive assertion above is not passing for an unrelated
-        // reason.
-        state.worktree_path = None;
-        assert!(
-            preflight_major_bump_check(&project_root, &state).is_ok(),
-            "with no worktree set, the check must classify project_root's own HEAD, which \
-             never received the breaking commit"
-        );
-    }
-
-    /// D-09 integration (mirrors `run_preflight_failing_check_gates_and_never_
-    /// reaches_spawn_monitor`): a breaking-commit range at Stage::Ship drives
-    /// `run_preflight` into the never-silent gate rather than continuing
-    /// toward `hooks_after_ship`, and never reaches `monitor::spawn_monitor`.
-    /// The child runs with a `git`-only PATH so `gh` never resolves — this
-    /// test's outcome must not depend on whether the host running the suite
-    /// happens to have `gh` installed and authenticated, which would
-    /// otherwise make `preflight_gh_auth_check` (composed earlier in the same
-    /// chain) the check that actually fails instead of this one.
-    #[test]
-    fn run_preflight_major_bump_gates_and_never_ships_unattended() {
-        const NAME: &str =
-            "preflight::tests::run_preflight_major_bump_gates_and_never_ships_unattended";
-        enter_path_isolated_child!(NAME, agent_free_git_only_path_dir());
-        assert!(
-            std::env::var_os(devflow_core::test_support::CHILD_TEST_ENV).is_some(),
-            "abort-fixture test must run in a child with an agent-free PATH (999.80)"
-        );
-        let _guard = env_lock();
-
-        let dir = major_bump_fixture();
-        let root = dir.path();
-        commit_msg(root, "b.txt", "feat(scope)!: drop legacy api");
-
-        let phase = PhaseId::new(74);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Ship;
-        state.yes_ship = true;
-        workflow::save_state(&state).unwrap();
-
-        preanswer_gate(
-            root,
-            phase,
-            Stage::Ship,
-            &serde_json::from_str(
-                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
-            )
-            .unwrap(),
-        );
-
-        let adapter = agents::driver_for(AgentKind::Claude);
-        let should_continue = run_preflight(root, &mut state, adapter.as_ref()).unwrap();
-
-        assert!(
-            !should_continue,
-            "a major bump at Ship must gate rather than tell its caller to continue launch_stage"
-        );
-        assert!(
-            workflow::load_state(root, phase).is_err(),
-            "abort() must clear state — spawn_monitor was never reached"
-        );
-        let last = devflow_core::events::last_event_for_phase(root, phase)
-            .expect("gate_fired/gate_resolved must have been recorded");
-        assert_ne!(last["event"], "stage_launched");
-    }
-
-    /// D-09/T-25-51: `state.yes_ship` must never auto-approve this gate.
-    /// `run_preflight`'s gate call (`run_gate`, which always passes `None`
-    /// for the auto-response — see that parameter's doc comment in
-    /// `pipeline_gate.rs`) structurally cannot read `state.yes_ship` at all,
-    /// and this test is the concrete proof: with `yes_ship` set and NO
-    /// response ever written, the gate poll must block for the full bounded
-    /// timeout and then surface a gate-timeout `Err` — an (incorrect)
-    /// auto-approval would instead resolve immediately, well inside the
-    /// timeout window. `DEVFLOW_GATE_TIMEOUT_SECS` is bounded under
-    /// `ENV_MUTEX` so a regression here fails fast instead of hanging the
-    /// suite for 7 days (mirrors
-    /// `run_preflight_advance_skips_recheck_on_idempotently_failing_check`).
-    #[test]
-    // D-09 (48-09): mutates `DEVFLOW_GATE_TIMEOUT_SECS` process-wide.
-    // Deferred deliberately, not overlooked: THIS process reads the value, so
-    // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
-    // race and the value is restored on every exit path, unwinding included.
-    #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
-    fn run_preflight_major_bump_gate_not_auto_approved_by_yes_ship() {
-        const NAME: &str =
-            "preflight::tests::run_preflight_major_bump_gate_not_auto_approved_by_yes_ship";
-        enter_path_isolated_child!(NAME, agent_free_git_only_path_dir());
-        let _guard = env_lock();
-        let original_gate_timeout = std::env::var_os("DEVFLOW_GATE_TIMEOUT_SECS");
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("DEVFLOW_GATE_TIMEOUT_SECS", "1");
-        }
-
-        let dir = major_bump_fixture();
-        let root = dir.path();
-        commit_msg(root, "b.txt", "feat(scope)!: drop legacy api");
-
-        let phase = PhaseId::new(75);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Ship;
-        state.yes_ship = true;
-        workflow::save_state(&state).unwrap();
-
-        let adapter = agents::driver_for(AgentKind::Claude);
-        let result = run_preflight(root, &mut state, adapter.as_ref());
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_gate_timeout {
-                Some(value) => std::env::set_var("DEVFLOW_GATE_TIMEOUT_SECS", value),
-                None => std::env::remove_var("DEVFLOW_GATE_TIMEOUT_SECS"),
-            }
-        }
-
-        assert!(
-            result.is_err(),
-            "yes_ship must never auto-approve this gate — an unattended \
-             Ok(_) within the bounded timeout would mean it did, got {result:?}"
-        );
-    }
-
-    /// [`agent_free_git_only_path_dir`], extended with an executable `gh`
-    /// stub that always exits 1 — makes [`preflight_gh_auth_check`] take its
-    /// hard `Err` branch (`gh` present, reports unauthenticated) rather than
-    /// its fail-soft binary-absent branch, which is the only way to compose
-    /// a gh-auth failure with a major-bump failure at the same stage. Mirrors
-    /// `agent_free_dir_with_agent_stub`'s stub-writing construction (content
-    /// plus `PermissionsExt` mode `0o755`).
-    fn git_only_path_dir_with_failing_gh() -> tempfile::TempDir {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = agent_free_git_only_path_dir();
-        let path = dir.path().join("gh");
-        std::fs::write(&path, "#!/bin/sh\nexit 1\n").unwrap();
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).unwrap();
-        dir
-    }
-
-    /// CR-01 (`25-REVIEW.md`, 25-08): `generic_preflight_checks` must not
-    /// `?`-short-circuit — a gh-auth failure must not hide a major-bump
-    /// failure that also applies at the same stage. Composes Task 1's
-    /// worktree fixture (Task 2's fix) with a failing `gh` stub, so the two
-    /// defects this plan closes are exercised together, exactly as they
-    /// compose in production.
-    #[test]
-    fn generic_preflight_checks_reports_major_bump_even_when_gh_auth_fails_first() {
-        const NAME: &str = "preflight::tests::generic_preflight_checks_reports_major_bump_even_when_gh_auth_fails_first";
-        enter_path_isolated_child!(NAME, git_only_path_dir_with_failing_gh());
-        let _guard = env_lock();
-
-        let (outer, worktree_path) = major_bump_worktree_fixture();
-        let project_root = outer.path().join("project");
-        let mut state = State::new(
-            PhaseId::new(77),
-            AgentKind::Claude,
-            Mode::Auto,
-            project_root.clone(),
-        );
-        state.stage = Stage::Ship;
-        state.worktree_path = Some(worktree_path);
-
-        let err = generic_preflight_checks(&project_root, &state).unwrap_err();
-
-        assert!(err.contains("MAJOR"), "{err}");
-        assert!(err.contains("drop legacy api"), "{err}");
-        assert!(err.contains("not authenticated"), "{err}");
-
-        // T-25-08-03: the 300-character truncation cap cannot elide the
-        // highest-consequence reason — proven by ordering the major-bump
-        // reason first in generic_preflight_checks.
-        assert!(
-            truncate_reason(&err).contains("MAJOR"),
-            "{}",
-            truncate_reason(&err)
-        );
-    }
-
     /// A failing preflight check routes through the never-silent gate and,
-    /// on Abort, never reaches `monitor::spawn_monitor` — no `stage_launched`
+    /// on Abort, never reaches `spawn_agent_and_record` — no `stage_launched`
     /// event is ever recorded. The Abort response is pre-seeded so
     /// `run_gate`'s poll resolves immediately.
     #[test]
-    fn run_preflight_failing_check_gates_and_never_reaches_spawn_monitor() {
+    fn run_preflight_failing_check_gates_and_never_spawns_the_agent() {
         const NAME: &str =
-            "preflight::tests::run_preflight_failing_check_gates_and_never_reaches_spawn_monitor";
+            "preflight::tests::run_preflight_failing_check_gates_and_never_spawns_the_agent";
         enter_path_isolated_child!(NAME, agent_free_git_only_path_dir());
         assert!(
             std::env::var_os(devflow_core::test_support::CHILD_TEST_ENV).is_some(),
@@ -2122,29 +1630,30 @@ mod tests {
 
         let phase = PhaseId::new(61);
         let mut state = State::new(phase, AgentKind::Codex, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Define;
+        state.stage = Stage::Plan;
         workflow::save_state(&state).unwrap();
 
         preanswer_gate(
             root,
             phase,
-            Stage::Define,
+            Stage::Plan,
             &serde_json::from_str(
-                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                r#"{"approved":false,"abort":true,"note":"abort: test cleanup","responded_by":"test"}"#,
             )
             .unwrap(),
         );
 
         let adapter = agents::driver_for(AgentKind::Codex);
-        let should_continue = run_preflight(root, &mut state, adapter.as_ref()).unwrap();
+        let outcome = run_preflight(root, &mut state, adapter.as_ref()).unwrap();
 
-        assert!(
-            !should_continue,
+        assert_eq!(
+            outcome,
+            PreflightOutcome::Stop,
             "an aborted preflight must tell its caller not to continue launch_stage"
         );
         assert!(
             workflow::load_state(root, phase).is_err(),
-            "abort() must clear state — spawn_monitor was never reached"
+            "abort() must clear state — spawn_agent_and_record was never reached"
         );
         let last = devflow_core::events::last_event_for_phase(root, phase)
             .expect("gate_fired/gate_resolved must have been recorded");
@@ -2166,26 +1675,27 @@ mod tests {
         let root = dir.path();
 
         let phase = PhaseId::new(62);
-        // Plan is unaffected by the interactivity/gh-auth generic checks, so
+        // Validate is unaffected by the interactivity/unattended generic checks, so
         // only the adapter hook can be the source of this failure.
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Plan;
+        state.stage = Stage::Validate;
         workflow::save_state(&state).unwrap();
 
         preanswer_gate(
             root,
             phase,
-            Stage::Plan,
+            Stage::Validate,
             &serde_json::from_str(
-                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                r#"{"approved":false,"abort":true,"note":"abort: test cleanup","responded_by":"test"}"#,
             )
             .unwrap(),
         );
 
-        let should_continue = run_preflight(root, &mut state, &AlwaysFailAdapter).unwrap();
+        let outcome = run_preflight(root, &mut state, &AlwaysFailAdapter).unwrap();
 
-        assert!(
-            !should_continue,
+        assert_eq!(
+            outcome,
+            PreflightOutcome::Stop,
             "an aborted preflight must tell its caller not to continue launch_stage"
         );
         assert!(workflow::load_state(root, phase).is_err());
@@ -2200,17 +1710,16 @@ mod tests {
 
     /// CR-01 regression (Advance arm, 17-08 gap closure): a preflight
     /// failure resolved by `GateAction::Advance` must launch the agent
-    /// exactly once. `run_preflight` returns `Ok(false)` when the recursive
-    /// retry it just ran already spawned the agent — the call site (main.rs
-    /// call site inside `launch_stage`) must not run any more launch steps
-    /// in that case. This mirrors the call site's exact contract: only run
-    /// the explicit `launch_stage(&mut state, None, None)` continuation when
-    /// `run_preflight` says to.
+    /// exactly once. `run_preflight` launches nothing itself and returns
+    /// [`PreflightOutcome::Approved`]; `launch_stage` turns that outcome into
+    /// one launch through [`launch_after_preflight`], which this test calls the
+    /// same way, so the approved stage is resolved exactly once and nothing is
+    /// spawned outside the runner (D-02).
     #[test]
     fn run_preflight_advance_gate_launches_agent_exactly_once() {
         const NAME: &str =
             "preflight::tests::run_preflight_advance_gate_launches_agent_exactly_once";
-        enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("claude"));
+        enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("codex"));
         let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
@@ -2218,157 +1727,63 @@ mod tests {
         init_repo(root);
 
         let phase = PhaseId::new(63);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        // Plan is unaffected by the interactivity/gh-auth generic checks
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Auto, root.to_path_buf());
+        // Validate is unaffected by the interactivity/unattended generic checks
         // (D-14) — only the injected adapter's `preflight` fails; the real
-        // Claude adapter's default (Ok) preflight passes every other check.
-        state.stage = Stage::Plan;
-        // Premise moved off `STREAM_JSON_STAGES` membership deliberately
-        // (34-06); do not "simplify" this away. The subject is the launch
-        // COUNT through the Advance arm (CR-01's double-launch defect), not
-        // which launch path is taken. Stage::Plan was incidentally absent
-        // from the constant; 34-05's widening puts it on the stream path,
-        // where `canary_gate` invokes the real `ClaudeCanaryLauncher` and the
-        // launch fails on a delivery refusal unrelated to launch counting.
-        // The `launches == 1` and `supervisor.is_some()` assertions below
-        // are untouched, so a launch must still genuinely happen.
-        state.legacy_claude_launch = true;
+        // Codex adapter's default (Ok) preflight passes every other check.
+        state.stage = Stage::Validate;
+        // Codex, a capture-shape agent: the subject is the launch COUNT
+        // through the Advance arm (CR-01's double-launch defect), not which
+        // launch path is taken, and a Claude launch at Validate would take the
+        // stream path, where `canary_gate` invokes the real
+        // `ClaudeCanaryLauncher`.
         workflow::save_state(&state).unwrap();
 
         preanswer_gate(
             root,
             phase,
-            Stage::Plan,
+            Stage::Validate,
             &serde_json::from_str(r#"{"approved":true,"responded_by":"test"}"#).unwrap(),
         );
 
         let adapter = FailOnceAdapter::new();
-        let preflight = run_preflight(root, &mut state, &adapter);
-        let continuation = match &preflight {
-            Ok(true) => launch_stage(&mut state, None, None),
-            _ => Ok(()),
-        };
-
-        // WR-05 / 999.44: `run_preflight`'s `Advance` arm calls
-        // `launch_stage_inner` directly (`:943`), which spawns a real
-        // detached monitor wrapper and records its pid on this same
-        // `&mut State` — reached indirectly, through recursion, rather than
-        // through this test's own explicit `launch_stage` call above. The
-        // guard must bind here, the first line after the final `&mut state`
-        // use, because every line below is a panic site, including
-        // unwrapping `preflight` itself: that call can spawn the monitor and
-        // then still fail a later `?`. The wrapper must die before `dir`
-        // unlinks the project root out from under it.
-        let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
-
-        let should_continue = preflight.unwrap();
-        continuation.unwrap();
-
-        assert!(
-            !should_continue,
-            "an Advance-resolved preflight failure must tell its caller not \
-             to continue launch_stage — the recursive retry already did"
-        );
-        let launches = stage_launched_count(root, phase);
+        let outcome = run_preflight(root, &mut state, &adapter).unwrap();
         assert_eq!(
-            launches, 1,
+            outcome,
+            PreflightOutcome::Approved,
+            "an Advance-resolved preflight failure must report the approval, and \
+             launch nothing itself"
+        );
+        let launches: Vec<_> = launch_after_preflight(&mut state, outcome, None, None)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(
+            launches.len(),
+            1,
             "a preflight failure resolved by Advance must launch the agent \
-             exactly once, not {launches}"
+             exactly once, not {}",
+            launches.len()
         );
-        assert!(
-            state.supervisor.is_some(),
-            "this test is expected to drive a real monitor::spawn_monitor \
-             through run_preflight's Advance arm — None here means WR-05's \
-             premise was wrong and the guard above reaped nothing"
-        );
-    }
-
-    /// CR-01 regression (LoopBack arm, 17-08 gap closure): same defect as
-    /// the Advance arm above, but through `GateAction::LoopBack` — per
-    /// `GateAction::from_response` (gates.rs:69-78) a rejection whose note
-    /// doesn't mention "abort" yields `LoopBack(Stage::Code)`, which
-    /// `run_preflight` routes through the identical recursive-relaunch code
-    /// path as Advance.
-    #[test]
-    fn run_preflight_loopback_gate_launches_agent_exactly_once() {
-        const NAME: &str =
-            "preflight::tests::run_preflight_loopback_gate_launches_agent_exactly_once";
-        enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("claude"));
-        let _guard = env_lock();
-
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        init_repo(root);
-
-        let phase = PhaseId::new(64);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Plan;
-        // Premise moved off `STREAM_JSON_STAGES` membership deliberately
-        // (34-06); do not "simplify" this away. Same reasoning as the Advance
-        // arm's sibling above: the subject is the launch COUNT through the
-        // LoopBack arm, not which launch path is taken, and the `launches == 1`
-        // and `supervisor.is_some()` assertions below are untouched.
-        state.legacy_claude_launch = true;
-        workflow::save_state(&state).unwrap();
-
-        preanswer_gate(
-            root,
-            phase,
-            Stage::Plan,
-            &serde_json::from_str(r#"{"approved":false,"note":"retry","responded_by":"test"}"#)
-                .unwrap(),
-        );
-
-        let adapter = FailOnceAdapter::new();
-        let preflight = run_preflight(root, &mut state, &adapter);
-        let continuation = match &preflight {
-            Ok(true) => launch_stage(&mut state, None, None),
-            _ => Ok(()),
-        };
-
-        // WR-05 / 999.44: this test's spawn arrives through the
-        // `GateAction::LoopBack(_)` arm (`preflight.rs:945-950`), which calls
-        // `launch_stage` at `:949`. That re-resolves the REAL Claude adapter
-        // (whose default preflight passes), re-runs `run_preflight` against
-        // it, and falls through to the same `launch_stage_inner` and the
-        // same `monitor::spawn_monitor` — one spawn, on the same
-        // `&mut State`, reached by a longer road than the Advance arm above.
-        // The guard must bind here, the first line after the final
-        // `&mut state` use, because every line below is a panic site,
-        // including unwrapping `preflight` itself: that call can spawn the
-        // monitor and then still fail a later `?`. The wrapper must die
-        // before `dir` unlinks the project root out from under it.
-        let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
-
-        let should_continue = preflight.unwrap();
-        continuation.unwrap();
-
-        assert!(
-            !should_continue,
-            "a LoopBack-resolved preflight failure must tell its caller not \
-             to continue launch_stage — the recursive retry already did"
-        );
-        let launches = stage_launched_count(root, phase);
         assert_eq!(
-            launches, 1,
-            "a preflight failure resolved by LoopBack must launch the agent \
-             exactly once, not {launches}"
+            launches[0].state.stage,
+            Stage::Validate,
+            "the approved launch is the gated stage's"
         );
-        assert!(
-            state.supervisor.is_some(),
-            "this test is expected to drive a real monitor::spawn_monitor \
-             through run_preflight's LoopBack arm — None here means WR-05's \
-             premise was wrong and the guard above reaped nothing"
+        assert_eq!(
+            stage_launched_count(root, phase),
+            0,
+            "the preflight spawned a stage of its own"
         );
     }
 
     // -----------------------------------------------------------------
     // 18f (D-18f): approving a preflight gate must not re-run the just-
-    // adjudicated check, LoopBack's re-check must be bounded, and the
-    // bound's reset must persist.
+    // adjudicated check, the retry ceiling must be checked before a gate,
+    // and the bound's reset must persist.
     //
     // These three tests deliberately fail via `preflight_interactivity_check`
-    // (Codex + Auto + Define + no CONTEXT.md on develop), NOT via
+    // (Codex + Auto + Plan + no CONTEXT.md on develop), NOT via
     // `AlwaysFailAdapter`'s adapter hook. `AlwaysFailAdapter` is still
     // passed as the `adapter` argument (defense in depth — it would also
     // fail were it ever reached), but it structurally CANNOT be what
@@ -2381,8 +1796,7 @@ mod tests {
     // passes every other check"). The generic checks, by contrast, are a
     // pure function of `state` alone and so fail IDENTICALLY on every
     // invocation — exactly the property CONTEXT.md attributes to
-    // `preflight_interactivity_check`/`preflight_gh_auth_check` in its
-    // description of the wedge.
+    // `preflight_interactivity_check` in its description of the wedge.
     // -----------------------------------------------------------------
 
     /// D-18f: `GateAction::Advance` must skip the just-adjudicated check
@@ -2390,7 +1804,7 @@ mod tests {
     /// the SAME deterministic `preflight_interactivity_check` failure would
     /// fire again on the retry, write a SECOND gate nobody answers (only
     /// one response is ever seeded here), and `run_preflight` would return
-    /// `Err` (a bounded gate-timeout error) instead of `Ok(false)` — that
+    /// `Err` (a bounded gate-timeout error) instead of `Ok(Approved)` — that
     /// bounded `Err` is the RED signal this test would observe pre-fix,
     /// confirmed manually before restoring the fix. `DEVFLOW_GATE_TIMEOUT_SECS`
     /// is bounded under `ENV_MUTEX` so a regression here fails fast instead
@@ -2417,36 +1831,27 @@ mod tests {
         init_repo(root);
 
         let phase = PhaseId::new(620);
-        // Codex + Auto + Define + no `.planning/phases/620-*/620-CONTEXT.md`
+        // Codex + Auto + Plan + no `.planning/phases/620-*/620-CONTEXT.md`
         // on `develop` deterministically fails `preflight_interactivity_check`
         // — see the section doc comment above for why this (not the adapter
         // hook) is what actually reproduces the wedge across a relaunch.
         let mut state = State::new(phase, AgentKind::Codex, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Define;
+        state.stage = Stage::Plan;
         workflow::save_state(&state).unwrap();
 
         preanswer_gate(
             root,
             phase,
-            Stage::Define,
+            Stage::Plan,
             &serde_json::from_str(r#"{"approved":true,"responded_by":"test"}"#).unwrap(),
         );
 
         let result = run_preflight(root, &mut state, &AlwaysFailAdapter);
-
-        // WR-05 / 999.44 (residual finding, 25-18 verification step 6): the
-        // "approved" response here drives run_preflight's GateAction::Advance
-        // arm, which calls launch_stage_inner UNCONDITIONALLY — skipping the
-        // just-adjudicated check is the entire point of this test, so there
-        // is no recursive re-check to fail first. With a working `codex` +
-        // `sh` stub on PATH (`agent_free_dir_with_agent_stub`), this spawns a
-        // REAL detached monitor wrapper — confirmed empirically while
-        // re-deriving this plan's verification-step-6 enumeration, a leak
-        // this plan's originally-declared scope (the two `_exactly_once`
-        // tests) did not name. The guard must bind here, the first line
-        // after the final `&mut state` use, ahead of every panicking
-        // checkpoint below, for the same reason as the two conversions above.
-        let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
+        // The approval resolves its launch with no re-check, as `launch_stage` does.
+        let launch = match &result {
+            Ok(outcome) => launch_after_preflight(&mut state, *outcome, None, None),
+            Err(_) => Ok(None),
+        };
 
         // SAFETY: still serialized under ENV_MUTEX from above.
         unsafe {
@@ -2457,53 +1862,39 @@ mod tests {
         }
 
         assert!(
-            matches!(result, Ok(false)),
+            matches!(result, Ok(PreflightOutcome::Approved)),
             "Advance on a preflight gate must skip the just-adjudicated \
-             check and return Ok(false), not {result:?}"
+             check and return Approved, not {result:?}"
         );
         assert!(
-            !Gates::gate_path(root, phase, Stage::Define).exists(),
+            !Gates::gate_path(root, phase, Stage::Plan).exists(),
             "no second gate should ever be written once Advance skips the recheck"
         );
         assert_eq!(
             state.preflight_retries, 0,
             "a human Advance must reset the retry counter"
         );
-        assert!(
-            state.supervisor.is_some(),
-            "this test's Advance arm is expected to drive a real \
-             monitor::spawn_monitor via launch_stage_inner — None here means \
-             this residual finding's premise was wrong and the guard above \
-             reaped nothing"
+        let launch = launch.expect("the approved launch resolves");
+        assert_eq!(
+            launch.map(|launch| launch.state.stage),
+            Some(Stage::Plan),
+            "the approval must resolve the gated Plan launch, with no second gate"
         );
     }
 
-    /// D-18f backstop: `GateAction::LoopBack` deliberately keeps re-running
-    /// the check (unlike Advance), so the recursion must be bounded
-    /// separately. `state.preflight_retries` starts one below the ceiling —
-    /// exercising the bound via a REAL recursive `run_preflight` call
-    /// (through `launch_stage`) rather than simulating multiple cycles: with
-    /// only ONE gate response ever seeded, and the gate wait
-    /// blocking synchronously in this same thread, nothing could seed a
-    /// SECOND response file mid-recursion inside one call stack — deferring
-    /// to the ceiling on the very next cycle instead genuinely exercises
-    /// "one retry short of the ceiling" → "ceiling reached" without a racy
-    /// background writer.
+    /// D-18f backstop, after D-39 (52-29): a reject on a preflight gate is
+    /// refused, so a failed check is checked again only by a later
+    /// `run_preflight` call, and the ceiling is checked before any gate opens.
+    /// With `preflight_retries` at `MAX_PREFLIGHT_RETRIES`, no answer and an
+    /// always-failing adapter, the call returns `Ok(Stop)`, writes no gate,
+    /// and the event log holds `preflight_retry_ceiling_reached` followed by
+    /// `workflow_aborted`, each asserted on its own.
     #[test]
-    // D-09 (48-09): mutates `DEVFLOW_GATE_TIMEOUT_SECS` process-wide.
-    // Deferred deliberately, not overlooked: THIS process reads the value, so
-    // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
-    // race and the value is restored on every exit path, unwinding included.
-    #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
-    fn run_preflight_loopback_bounds_recursion() {
-        const NAME: &str = "preflight::tests::run_preflight_loopback_bounds_recursion";
+    fn run_preflight_at_the_retry_ceiling_aborts_before_opening_a_gate() {
+        const NAME: &str =
+            "preflight::tests::run_preflight_at_the_retry_ceiling_aborts_before_opening_a_gate";
         enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("codex"));
         let _guard = env_lock();
-        let original_gate_timeout = std::env::var_os("DEVFLOW_GATE_TIMEOUT_SECS");
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("DEVFLOW_GATE_TIMEOUT_SECS", "2");
-        }
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -2511,42 +1902,39 @@ mod tests {
 
         let phase = PhaseId::new(621);
         let mut state = State::new(phase, AgentKind::Codex, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Define;
-        state.preflight_retries = mode::MAX_PREFLIGHT_RETRIES - 1;
+        state.stage = Stage::Plan;
+        state.preflight_retries = mode::MAX_PREFLIGHT_RETRIES;
         workflow::save_state(&state).unwrap();
-
-        preanswer_gate(
-            root,
-            phase,
-            Stage::Define,
-            &serde_json::from_str(r#"{"approved":false,"note":"retry","responded_by":"test"}"#)
-                .unwrap(),
-        );
 
         let result = run_preflight(root, &mut state, &AlwaysFailAdapter);
 
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_gate_timeout {
-                Some(value) => std::env::set_var("DEVFLOW_GATE_TIMEOUT_SECS", value),
-                None => std::env::remove_var("DEVFLOW_GATE_TIMEOUT_SECS"),
-            }
-        }
-
         assert!(
-            matches!(result, Ok(false)),
+            matches!(result, Ok(PreflightOutcome::Stop)),
             "the ceiling must abort cleanly, not error out, got {result:?}"
         );
         assert!(
-            workflow::load_state(root, phase).is_err(),
-            "the ceiling must abort() and clear state, not leave it gate_pending forever"
+            !Gates::gate_path(root, phase, Stage::Plan).exists(),
+            "the ceiling is checked before any gate opens"
         );
-        let last = devflow_core::events::last_event_for_phase(root, phase)
-            .expect("a ceiling or abort event must have been recorded");
+        let events: Vec<String> = std::fs::read_to_string(devflow_core::events::events_path(root))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|event| phase.matches_json(event.get("phase")))
+            .filter_map(|event| event["event"].as_str().map(str::to_string))
+            .collect();
+        let ceiling = events
+            .iter()
+            .position(|event| event == "preflight_retry_ceiling_reached")
+            .unwrap_or_else(|| panic!("the ceiling event is recorded: {events:?}"));
+        let aborted = events
+            .iter()
+            .position(|event| event == "workflow_aborted")
+            .unwrap_or_else(|| panic!("the abort is recorded: {events:?}"));
+        assert!(ceiling < aborted, "the ceiling, then the abort: {events:?}");
         assert!(
-            last["event"] == "preflight_retry_ceiling_reached"
-                || last["event"] == "workflow_aborted",
-            "expected a ceiling or abort event, got {last:?}"
+            !events.iter().any(|event| event == "gate_fired"),
+            "no gate fired: {events:?}"
         );
     }
 
@@ -2684,7 +2072,7 @@ mod tests {
         let adapter = agents::driver_for(AgentKind::Claude);
         let result = run_preflight(root, &mut state, adapter.as_ref());
         assert!(
-            matches!(result, Ok(true)),
+            matches!(result, Ok(PreflightOutcome::Proceed)),
             "this fixture must PASS preflight to reach the recording path, got {result:?}"
         );
 
@@ -2724,8 +2112,10 @@ mod tests {
     /// - `Advance` records the current EXECUTION-root set (T-48-15-02: from
     ///   the worktree, not the project root, or recording and comparison
     ///   would disagree and every worktree run would gate forever).
-    /// - `LoopBack` records NOTHING — "I will fix it and retry" is not
-    ///   approval, and treating it as approval is the repudiation path.
+    /// - A reject records NOTHING — "I will fix it and retry" is not
+    ///   approval, and treating it as approval is the repudiation path. Since
+    ///   52-29 (D-39) it is refused before its claim and the gate reopens;
+    ///   a bounded writer aborts the reopened gate.
     #[test]
     // D-09 (48-09): mutates `DEVFLOW_GATE_TIMEOUT_SECS` process-wide.
     // Deferred deliberately, not overlooked: THIS process reads the value, so
@@ -2790,7 +2180,6 @@ mod tests {
             &mut approve_state,
             agents::driver_for(AgentKind::Claude).as_ref(),
         );
-        let _reap_guard = ReapMonitorOnDrop::after_launch(&approve_state);
 
         // SAFETY: still serialized under ENV_MUTEX from above.
         unsafe {
@@ -2801,8 +2190,8 @@ mod tests {
         }
 
         assert!(
-            matches!(approve_result, Ok(false)),
-            "an approved refusal gate returns Ok(false) after relaunching, got {approve_result:?}"
+            matches!(approve_result, Ok(PreflightOutcome::Approved)),
+            "an approved refusal gate returns Approved, got {approve_result:?}"
         );
         let expected = CheckpointApproval::Recorded(vec![ApprovedCheckpoint {
             plan_file: format!("{padded}-01-PLAN.md", padded = approve_phase.padded()),
@@ -2849,27 +2238,64 @@ mod tests {
         loopback_state.canary = Some(devflow_core::canary::CanaryOutcome::Confirmed);
         workflow::save_state(&loopback_state).unwrap();
 
-        // Not approved, and the note does NOT say "abort" — LoopBack.
-        preanswer_gate(
-            loopback_root,
-            loopback_phase,
-            Stage::Code,
-            &serde_json::from_str(
+        // Not approved and not an abort: a reject, refused before its claim
+        // (52-29, D-39). A bounded writer answers the first gate with it and
+        // the reopened gate with an abort; it records the state at each gate.
+        let writer_root = loopback_root.to_path_buf();
+        let writer = std::thread::spawn(move || {
+            let gate_path = Gates::gate_path(&writer_root, loopback_phase, Stage::Code);
+            let reject = serde_json::from_str::<devflow_core::gates::GateResponse>(
                 r#"{"approved":false,"note":"I will fix the plan first","responded_by":"test"}"#,
             )
-            .unwrap(),
-        );
+            .unwrap();
+            let abort = serde_json::from_str::<devflow_core::gates::GateResponse>(
+                r#"{"approved":false,"abort":true,"note":"test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap();
+            let mut seen: Vec<(serde_json::Value, State)> = Vec::new();
+            for answer in [reject, abort] {
+                let started = std::time::Instant::now();
+                let gate = loop {
+                    let gate = std::fs::read_to_string(&gate_path)
+                        .ok()
+                        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+                    if let Some(gate) = gate
+                        && seen
+                            .last()
+                            .is_none_or(|(last, _)| last["gate_id"] != gate["gate_id"])
+                    {
+                        break gate;
+                    }
+                    assert!(
+                        started.elapsed() < std::time::Duration::from_secs(30),
+                        "gate {} did not open",
+                        seen.len() + 1
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                };
+                let at_gate = workflow::load_state(&writer_root, loopback_phase).unwrap();
+                devflow_core::test_support::answer_open_gate(
+                    &writer_root,
+                    loopback_phase,
+                    Stage::Code,
+                    &answer,
+                )
+                .unwrap();
+                seen.push((gate, at_gate));
+            }
+            seen
+        });
 
-        // SAFETY: serialized under ENV_MUTEX (the guard is still held).
+        // SAFETY: serialized under ENV_MUTEX (the guard is still held). The
+        // writer answers both gates, so no wait reaches this bound.
         unsafe {
-            std::env::set_var("DEVFLOW_GATE_TIMEOUT_SECS", "2");
+            std::env::set_var("DEVFLOW_GATE_TIMEOUT_SECS", "20");
         }
         let loopback_result = run_preflight(
             loopback_root,
             &mut loopback_state,
             agents::driver_for(AgentKind::Claude).as_ref(),
         );
-        let _loopback_reap = ReapMonitorOnDrop::after_launch(&loopback_state);
         // SAFETY: still serialized under ENV_MUTEX.
         unsafe {
             match &original_gate_timeout {
@@ -2877,19 +2303,53 @@ mod tests {
                 None => std::env::remove_var("DEVFLOW_GATE_TIMEOUT_SECS"),
             }
         }
+        let gates = writer.join().unwrap();
 
-        // The terminus is deliberately NOT asserted as Ok. LoopBack re-enters
-        // `run_preflight`, which refuses again; its own `Gates::close` has
-        // removed the one seeded response, so the next cycle's gate reaches
-        // the bounded 2s timeout and that Err propagates. Which terminus the
-        // recursion reaches is `run_preflight_loopback_bounds_recursion`'s
-        // subject, not this test's. What matters here is that NO arm along
-        // that path recorded a set.
-        let _ = loopback_result;
+        // The abort of the reopened gate ends the run: `Stop`.
+        assert!(
+            matches!(loopback_result, Ok(PreflightOutcome::Stop)),
+            "the refused reject, then the abort: {loopback_result:?}"
+        );
+        assert_eq!(gates.len(), 2, "the refused reject reopened the gate");
+        // GATE-04: the live preflight writer leads with the routers' sentence.
+        let sentence = crate::pipeline_outcomes::way_on_sentence(
+            GateKind::Preflight,
+            loopback_phase,
+            Stage::Code,
+            None,
+        );
+        let first = gates[0].0["context"].as_str().unwrap_or_default();
+        assert!(
+            first.starts_with(&format!("[never-silent] {sentence} preflight failed")),
+            "the preflight gate leads with its way on: {first}"
+        );
+        let first_id =
+            devflow_core::gates::GateId::parse(gates[0].0["gate_id"].as_str().unwrap()).unwrap();
+        assert!(
+            !Gates::claim_path(loopback_root, loopback_phase, Stage::Code, &first_id).exists(),
+            "the refused reject was never claimed"
+        );
+        assert_eq!(gates[1].0["gate_kind"], "preflight", "{}", gates[1].0);
+        assert!(
+            gates[1].1.gate_pending,
+            "gate_pending stays set at the reopened gate"
+        );
+        assert_eq!(
+            gates[1].1.checkpoint_approval,
+            CheckpointApproval::Pending,
+            "a refused reject is not approval and records nothing"
+        );
         assert_eq!(
             loopback_state.checkpoint_approval,
             CheckpointApproval::Pending,
-            "a LoopBack answer is not approval and must record nothing"
+            "a refused reject widens nothing (T-48-15-03)"
+        );
+        let outcome = loopback_result.expect("the loop-back outcome");
+        assert!(
+            launch_after_preflight(&mut loopback_state, outcome, None, None)
+                .expect("a stopped preflight resolves")
+                .is_none(),
+            "a refused reject launches nothing: {loopback_state:?}"
         );
     }
 
@@ -2907,7 +2367,7 @@ mod tests {
     fn approving_a_non_code_preflight_refusal_records_nothing() {
         const NAME: &str =
             "preflight::tests::approving_a_non_code_preflight_refusal_records_nothing";
-        enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("claude"));
+        enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("codex"));
         let _guard = env_lock();
         assert_approving_a_refusal_never_widens_a_recorded_set(
             Stage::Validate,
@@ -2922,7 +2382,7 @@ mod tests {
     fn approving_a_supervise_code_preflight_refusal_records_nothing() {
         const NAME: &str =
             "preflight::tests::approving_a_supervise_code_preflight_refusal_records_nothing";
-        enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("claude"));
+        enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("codex"));
         let _guard = env_lock();
         assert_approving_a_refusal_never_widens_a_recorded_set(
             Stage::Code,
@@ -2931,14 +2391,14 @@ mod tests {
         );
     }
 
-    /// Auto refuses on the checkpoint condition, but the gate text is capped
-    /// at 300 characters and the condition is joined last, so even here the
-    /// approver may never have seen it.
+    /// Auto refuses on the checkpoint condition, but the gate text is cut for
+    /// display and the condition is joined last, so even here the approver may
+    /// never have seen it.
     #[test]
     fn approving_an_auto_code_preflight_refusal_never_widens_a_recorded_set() {
         const NAME: &str = "preflight::tests::\
                             approving_an_auto_code_preflight_refusal_never_widens_a_recorded_set";
-        enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("claude"));
+        enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("codex"));
         let _guard = env_lock();
         assert_approving_a_refusal_never_widens_a_recorded_set(
             Stage::Code,
@@ -2955,7 +2415,7 @@ mod tests {
     fn a_supervise_code_refusal_approval_records_the_pre_agent_set_once() {
         const NAME: &str =
             "preflight::tests::a_supervise_code_refusal_approval_records_the_pre_agent_set_once";
-        enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("claude"));
+        enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("codex"));
         let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
@@ -2967,15 +2427,9 @@ mod tests {
         // The planner's checkpoint, present before any Code agent runs.
         write_human_only_plan(&worktree, phase);
 
-        let mut state = State::new(
-            phase,
-            AgentKind::Claude,
-            Mode::Supervise,
-            root.to_path_buf(),
-        );
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
         state.stage = Stage::Code;
         state.worktree_path = Some(worktree.clone());
-        state.legacy_claude_launch = true;
         assert_eq!(state.checkpoint_approval, CheckpointApproval::Pending);
         workflow::save_state(&state).unwrap();
 
@@ -2988,9 +2442,8 @@ mod tests {
 
         let adapter = FailOnceAdapter::new();
         let approved = run_preflight(root, &mut state, &adapter);
-        let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
         assert!(
-            matches!(approved, Ok(false)),
+            matches!(approved, Ok(PreflightOutcome::Approved)),
             "the refusal gate must have fired and been approved, got {approved:?}"
         );
         let baseline = verify::phase_checkpoint_declarations(&worktree, phase);
@@ -3022,7 +2475,7 @@ mod tests {
         // A later Code evaluation passes (the driver check fails only once).
         let passed = run_preflight(root, &mut state, &adapter);
         assert!(
-            matches!(passed, Ok(true)),
+            matches!(passed, Ok(PreflightOutcome::Proceed)),
             "the second evaluation must pass, got {passed:?}"
         );
         let current = verify::phase_checkpoint_declarations(&worktree, phase);
@@ -3061,13 +2514,10 @@ mod tests {
              would leave the set unchanged and nothing would be tested"
         );
 
-        let mut state = State::new(phase, AgentKind::Claude, mode, root.to_path_buf());
+        let mut state = State::new(phase, AgentKind::Codex, mode, root.to_path_buf());
         state.stage = stage;
         state.worktree_path = Some(worktree);
         state.checkpoint_approval = CheckpointApproval::Recorded(vec![]);
-        // Same launch path as `run_preflight_advance_gate_launches_agent_exactly_once`:
-        // the subject is what the Advance arm records, not the relaunch.
-        state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
 
         preanswer_gate(
@@ -3079,10 +2529,9 @@ mod tests {
 
         let adapter = FailOnceAdapter::new();
         let result = run_preflight(root, &mut state, &adapter);
-        let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
 
         assert!(
-            matches!(result, Ok(false)),
+            matches!(result, Ok(PreflightOutcome::Approved)),
             "the refusal gate must have fired and been approved, got {result:?}"
         );
         assert_eq!(
@@ -3138,7 +2587,7 @@ mod tests {
         let adapter = agents::driver_for(AgentKind::Claude);
         let result = run_preflight(root, &mut state, adapter.as_ref());
         assert!(
-            matches!(result, Ok(true)),
+            matches!(result, Ok(PreflightOutcome::Proceed)),
             "this fixture must PASS preflight, got {result:?}"
         );
         assert_eq!(
@@ -3203,7 +2652,6 @@ mod tests {
             &mut refusal_state,
             agents::driver_for(AgentKind::Claude).as_ref(),
         );
-        let _refusal_reap = ReapMonitorOnDrop::after_launch(&refusal_state);
         // SAFETY: still serialized under the same ENV_MUTEX guard.
         unsafe {
             match &saved_timeout {
@@ -3213,8 +2661,8 @@ mod tests {
         }
 
         assert!(
-            matches!(refusal_result, Ok(false)),
-            "the refusal gate must be approved and relaunch, got {refusal_result:?}"
+            matches!(refusal_result, Ok(PreflightOutcome::Approved)),
+            "the refusal gate must be approved, got {refusal_result:?}"
         );
         assert_eq!(
             refusal_state.checkpoint_approval,
@@ -3234,11 +2682,11 @@ mod tests {
         let root = dir.path();
 
         let phase = PhaseId::new(622);
-        // Plan + Claude bypasses the generic checks and the real Claude
+        // Validate + Claude bypasses the generic checks and the real Claude
         // adapter's default preflight passes — the same "unaffected" shape
         // used by `run_preflight_adapter_hook_override_fires` above.
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Plan;
+        state.stage = Stage::Validate;
         state.preflight_retries = 2;
         workflow::save_state(&state).unwrap();
 
@@ -3246,8 +2694,8 @@ mod tests {
         let result = run_preflight(root, &mut state, adapter.as_ref());
 
         assert!(
-            matches!(result, Ok(true)),
-            "a passing preflight must return Ok(true), got {result:?}"
+            matches!(result, Ok(PreflightOutcome::Proceed)),
+            "a passing preflight must return Proceed, got {result:?}"
         );
         assert_eq!(
             state.preflight_retries, 0,
@@ -3363,8 +2811,8 @@ mod tests {
         assert!(
             ensure_phase_reachable_on_base(root, PhaseId::new(24), "develop").is_ok(),
             "a present ROADMAP heading with no phase directory is the legitimate \
-             bootstrap state — Define has not run yet, and running it is what \
-             creates that directory. The guard must not refuse it (999.63)."
+             bootstrap state — `/gsd-discuss-phase` has not run yet, and running it \
+             is what creates that directory. The guard must not refuse it (999.63)."
         );
     }
 
@@ -4207,6 +3655,67 @@ mod tests {
         );
     }
 
+    /// OPS-03: a project with no remote at all gets one line saying so, not
+    /// the fetch failure followed by the undeterminable-currency warning —
+    /// both of which follow from the same single cause.
+    #[test]
+    fn a_project_without_a_remote_prints_one_missing_remote_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let remotes = devflow_core::test_support::git_command(root)
+            .args(["remote"])
+            .output()
+            .unwrap();
+        assert!(remotes.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&remotes.stdout).trim(),
+            "",
+            "fixture must have no remote at all"
+        );
+
+        let mut out = Vec::new();
+        assert!(
+            ensure_base_ref_current_to(&mut out, root, "develop").is_ok(),
+            "a missing remote must never refuse"
+        );
+        let printed = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = printed.lines().collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "a missing remote must produce exactly one line: {printed:?}"
+        );
+        assert!(
+            lines[0].contains("no `origin` remote"),
+            "the one line must name the missing remote: {printed:?}"
+        );
+    }
+
+    /// Control for the line above: a remote that exists and is ahead of the
+    /// checked-out base still gets its currency refusal, unchanged, and no
+    /// missing-remote line.
+    #[test]
+    fn a_remote_that_is_behind_still_warns() {
+        let (remote, local) = currency_fixture();
+        let local_root = local.path();
+        advance_remote(remote.path(), "f2.txt");
+
+        let mut out = Vec::new();
+        let err = ensure_base_ref_current_to(&mut out, local_root, "develop")
+            .expect_err("a checked-out base behind its remote must refuse");
+        assert_eq!(
+            err.to_string(),
+            stale_base_message("develop", "origin/develop", 1),
+            "the behind-remote currency message must be unchanged"
+        );
+        let printed = String::from_utf8(out).unwrap();
+        assert!(
+            !printed.contains("no `origin` remote"),
+            "a configured remote must not be reported missing: {printed:?}"
+        );
+    }
+
     /// The fetch subprocess failing must not itself fail the check — the
     /// comparison proceeds against whatever the remote-tracking ref
     /// currently resolves to locally (here, still `Current` from the
@@ -4270,8 +3779,8 @@ mod tests {
         std::fs::write(dir.join(format!("{padded}-01-PLAN.md")), body).unwrap();
     }
 
-    /// A wholly VIABLE fixture: a parsing GSD config, Claude with no legacy
-    /// opt-out, and a plan declaring only an ordinary blocking checkpoint.
+    /// A wholly VIABLE fixture: a parsing GSD config, Claude (the stream shape),
+    /// and a plan declaring only an ordinary blocking checkpoint.
     /// Every test below starts from this and breaks exactly one thing, so a
     /// refusal is attributable to the condition under test.
     fn viable_unattended_fixture(phase: PhaseId) -> (tempfile::TempDir, State) {
@@ -4288,17 +3797,14 @@ mod tests {
         (dir, state)
     }
 
-    /// D-07 scope: Define and Code only, mirroring `gh_auth_check_applies` and
-    /// `major_bump_check_applies`. Stages named explicitly rather than
-    /// iterated, so adding a `Stage` variant surfaces here as a compile-time
-    /// prompt to decide rather than as a silently-widened set.
+    /// D-07 scope: Plan (the first stage) and Code only. Stages named explicitly
+    /// rather than iterated, so adding a `Stage` variant surfaces here as a
+    /// compile-time prompt to decide rather than as a silently-widened set.
     #[test]
-    fn unattended_check_does_not_apply_outside_define_and_code() {
-        assert!(unattended_launch_check_applies(Stage::Define));
+    fn unattended_check_does_not_apply_outside_plan_and_code() {
+        assert!(unattended_launch_check_applies(Stage::Plan));
         assert!(unattended_launch_check_applies(Stage::Code));
-        assert!(!unattended_launch_check_applies(Stage::Plan));
         assert!(!unattended_launch_check_applies(Stage::Validate));
-        assert!(!unattended_launch_check_applies(Stage::Ship));
 
         // A wholly NOT-viable fixture parked at a non-applicable stage still
         // passes — the early return is what is being measured, so the fixture
@@ -4310,14 +3816,11 @@ mod tests {
             Mode::Auto,
             dir.path().to_path_buf(),
         );
-        state.legacy_claude_launch = true;
-        for stage in [Stage::Plan, Stage::Validate, Stage::Ship] {
-            state.stage = stage;
-            assert!(
-                preflight_unattended_launch_check(dir.path(), &state).is_ok(),
-                "stage {stage} must return before evaluating any condition"
-            );
-        }
+        state.stage = Stage::Validate;
+        assert!(
+            preflight_unattended_launch_check(dir.path(), &state).is_ok(),
+            "Validate must return before evaluating any condition"
+        );
         state.stage = Stage::Code;
         assert!(
             preflight_unattended_launch_check(dir.path(), &state).is_err(),
@@ -4332,7 +3835,7 @@ mod tests {
     #[test]
     fn unattended_check_reports_every_condition_in_both_modes() {
         let (dir, mut state) = viable_unattended_fixture(PhaseId::new(81));
-        state.legacy_claude_launch = true; // one condition failing, two holding
+        state.agent = AgentKind::Codex; // one condition failing, two holding
 
         let mut auto_report = Vec::new();
         let auto = unattended_launch_check_reporting_to(dir.path(), &state, &mut auto_report);
@@ -4430,18 +3933,9 @@ mod tests {
     /// accepted gap becoming a refusal. Every arm that cannot host the
     /// chain-flag guard is walked, then the viable arm is restored.
     #[test]
-    fn unattended_check_refuses_a_legacy_or_non_claude_launch_shape() {
+    fn unattended_check_refuses_a_non_stream_launch_shape() {
         let (dir, mut state) = viable_unattended_fixture(PhaseId::new(85));
 
-        state.legacy_claude_launch = true;
-        let err = preflight_unattended_launch_check(dir.path(), &state).unwrap_err();
-        assert!(err.contains("legacy launch opt-out"), "{err}");
-        assert!(
-            err.contains("Code would launch on the pipe-owning arm"),
-            "{err}"
-        );
-
-        state.legacy_claude_launch = false;
         for agent in [AgentKind::Codex, AgentKind::OpenCode] {
             state.agent = agent;
             let err = preflight_unattended_launch_check(dir.path(), &state).unwrap_err();
@@ -4449,12 +3943,16 @@ mod tests {
                 err.contains(&format!("the agent is `{agent}`")),
                 "agent {agent} must be named in its own refusal: {err}"
             );
+            assert!(
+                err.contains("Code would launch on the pipe-owning arm"),
+                "{err}"
+            );
         }
 
         state.agent = AgentKind::Claude;
         assert!(
             preflight_unattended_launch_check(dir.path(), &state).is_ok(),
-            "claude with the opt-out clear is the one viable shape and must pass"
+            "claude on the stream shape is a viable shape and must pass"
         );
     }
 
@@ -4495,15 +3993,15 @@ mod tests {
     /// refuse every launch made before the phase was planned, and the check
     /// would be unusable at the stage where refusing is cheapest.
     #[test]
-    fn unattended_check_treats_an_unplanned_phase_as_pending_at_define_and_undetermined_at_code() {
+    fn unattended_check_treats_an_unplanned_phase_as_pending_at_plan_and_undetermined_at_code() {
         let phase = PhaseId::new(87);
         let (dir, mut state) = viable_unattended_fixture(phase);
         std::fs::remove_dir_all(dir.path().join(".planning/phases")).unwrap();
 
-        state.stage = Stage::Define;
+        state.stage = Stage::Plan;
         assert!(
             preflight_unattended_launch_check(dir.path(), &state).is_ok(),
-            "an unplanned phase at Define is pending, not failing"
+            "an unplanned phase at Plan is pending, not failing"
         );
 
         state.stage = Stage::Code;
@@ -4524,7 +4022,7 @@ mod tests {
         let (dir, mut state) = viable_unattended_fixture(phase);
         std::fs::remove_file(dir.path().join(".planning/config.json")).unwrap();
         std::fs::remove_dir_all(dir.path().join(".planning/phases")).unwrap();
-        state.legacy_claude_launch = true;
+        state.agent = AgentKind::Codex;
 
         let err = preflight_unattended_launch_check(dir.path(), &state).unwrap_err();
         assert!(err.contains("GSD config can hold the chain flag"), "{err}");
@@ -4545,34 +4043,12 @@ mod tests {
         );
     }
 
-    /// F-13 / D-09. `state.yes_ship` authorizes the Ship gate and NOTHING else.
-    /// A launch-prerequisite bypass arriving through it would be D-09's
-    /// prohibition through a side door, so the non-interaction is pinned here
-    /// rather than left to the reader of `run_gate`'s signature. Mirrors
-    /// `run_preflight_major_bump_gate_not_auto_approved_by_yes_ship`.
-    #[test]
-    fn unattended_check_is_not_bypassed_by_yes_ship() {
-        let (dir, mut state) = viable_unattended_fixture(PhaseId::new(89));
-        std::fs::remove_file(dir.path().join(".planning/config.json")).unwrap();
-
-        assert!(
-            preflight_unattended_launch_check(dir.path(), &state).is_err(),
-            "precondition: the fixture must refuse before yes_ship is involved"
-        );
-        state.yes_ship = true;
-        assert!(
-            preflight_unattended_launch_check(dir.path(), &state).is_err(),
-            "yes_ship must not convert a refusal into a pass — it authorizes the \
-             Ship gate and nothing else (F-13)"
-        );
-    }
-
     /// CR-01's property, extended to this check: an earlier failing check must
     /// not hide this one. That is what makes `run_preflight`'s `Advance` arm
     /// safe to skip the re-check — the human approving the gate has already
     /// been shown every applicable reason.
     ///
-    /// The fixture fails BOTH: Codex at Define with no CONTEXT.md on develop
+    /// The fixture fails BOTH: Codex at Plan with no CONTEXT.md on develop
     /// trips `preflight_interactivity_check`, and Codex also trips this check's
     /// C2 (no non-Claude agent can host the chain-flag guard).
     #[test]
@@ -4589,11 +4065,11 @@ mod tests {
             "---\nphase: probe\n---\n\n<task type=\"auto\">\n</task>\n",
         );
         let mut state = State::new(phase, AgentKind::Codex, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Define;
+        state.stage = Stage::Plan;
 
         let err = generic_preflight_checks(root, &state).unwrap_err();
         assert!(
-            err.contains("cannot run the define stage headlessly"),
+            err.contains("cannot run the plan stage headlessly"),
             "the interactivity reason must survive aggregation: {err}"
         );
         assert!(
@@ -4602,12 +4078,15 @@ mod tests {
         );
 
         // The unattended reason is ordered ahead of interactivity precisely so
-        // the 300-character cap cannot elide it (see the placement comment in
+        // the display cut cannot elide it (see the placement comment in
         // `generic_preflight_checks`).
+        let shown = crate::pipeline_outcomes::render_gate_context(
+            &err,
+            crate::commands::GATE_CONTEXT_DISPLAY_CHARS,
+        );
         assert!(
-            truncate_reason(&err).contains("Code would launch on the pipe-owning arm"),
-            "{}",
-            truncate_reason(&err)
+            shown.contains("Code would launch on the pipe-owning arm"),
+            "{shown}"
         );
     }
 
@@ -4648,10 +4127,55 @@ mod tests {
         );
     }
 
+    /// D-03: a fallback is held to the Code-stage launch shape in `--mode auto` only, and
+    /// the check refuses exactly what `unattended_launch_shape_condition` refuses.
+    #[test]
+    fn the_fallback_launch_shape_check_refuses_only_in_auto_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |agent, mode| State::new(PhaseId::new(51), agent, mode, dir.path().to_path_buf());
+
+        let refusal =
+            fallback_launch_shape_refusal(&run(AgentKind::Claude, Mode::Auto), AgentKind::Codex)
+                .expect("codex cannot take over an unattended Code stage");
+        assert!(
+            refusal.contains("codex"),
+            "the refusal names the fallback: {refusal}"
+        );
+        assert!(
+            refusal.contains("not claude or antigravity"),
+            "the refusal names the launch-shape cause: {refusal}"
+        );
+
+        assert_eq!(
+            fallback_launch_shape_refusal(
+                &run(AgentKind::Claude, Mode::Auto),
+                AgentKind::Antigravity
+            ),
+            None,
+            "antigravity holds the unattended launch shape"
+        );
+        assert_eq!(
+            fallback_launch_shape_refusal(
+                &run(AgentKind::Claude, Mode::Supervise),
+                AgentKind::Codex
+            ),
+            None,
+            "a supervised run is not held to the unattended launch shape"
+        );
+        assert_eq!(
+            fallback_launch_shape_refusal(
+                &run(AgentKind::Antigravity, Mode::Auto),
+                AgentKind::Claude
+            ),
+            None,
+            "claude holds the unattended launch shape"
+        );
+    }
+
     #[test]
     fn unattended_launch_shape_condition_claude_unchanged() {
         let dir = tempfile::tempdir().unwrap();
-        let mut state = State::new(
+        let state = State::new(
             PhaseId::new(41),
             AgentKind::Claude,
             Mode::Auto,
@@ -4665,16 +4189,6 @@ mod tests {
                 ConditionState::Holds
             ),
             "claude must hold on the stream path"
-        );
-
-        // Claude under the legacy opt-out still refuses with the legacy cause.
-        state.legacy_claude_launch = true;
-        let ConditionState::DoesNotHold(reason) = unattended_launch_shape_condition(&state) else {
-            panic!("claude + legacy opt-out must refuse");
-        };
-        assert!(
-            reason.contains("legacy launch opt-out"),
-            "the legacy cause must survive: {reason}"
         );
     }
 
@@ -4702,35 +4216,34 @@ mod tests {
         );
     }
 
-    /// Since 50-11 both launch shapes run under the same Rust supervisor,
-    /// and only a stream launch engages the chain-flag guard. The refusal
+    /// Both launch shapes run in the same runner, and only a stream launch
+    /// engages the chain-flag guard. The refusal
     /// says so, for every cause, and no longer says the capture shape
     /// "never starts" a pipe-owning monitor.
     #[test]
-    fn unattended_launch_shape_refusal_names_the_capture_supervisor() {
+    fn unattended_launch_shape_refusal_names_the_runners_stream_only_guard() {
         let dir = tempfile::tempdir().unwrap();
-        let mut legacy = State::new(
+        let pi = State::new(
             PhaseId::new(43),
-            AgentKind::Claude,
+            AgentKind::Pi,
             Mode::Auto,
             dir.path().to_path_buf(),
         );
-        legacy.legacy_claude_launch = true;
         let codex = State::new(
             PhaseId::new(44),
             AgentKind::Codex,
             Mode::Auto,
             dir.path().to_path_buf(),
         );
-        for state in [legacy, codex] {
+        for state in [pi, codex] {
             let ConditionState::DoesNotHold(reason) = unattended_launch_shape_condition(&state)
             else {
                 panic!("{} --mode auto must be refused", state.agent);
             };
             assert!(
                 reason.ends_with(
-                    " — so Code would launch on the capture shape, whose supervisor never \
-                     engages the chain-flag guard (only a stream-shape supervisor does)"
+                    " — so Code would launch on the capture shape, and the runner engages the \
+                     chain-flag guard only for a stream launch"
                 ),
                 "{reason}"
             );

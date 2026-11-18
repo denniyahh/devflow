@@ -5,7 +5,7 @@
 //!
 //! **Deliberately a separate file from `auto_chain_flag_e2e.rs` (D-02).** That
 //! suite owns the in-stage-error path — `guard_clears_the_flag_when_the_
-//! supervised_child_fails`, driven through `run_monitor`'s `?` early-return.
+//! supervised_child_fails`, an agent that never runs in the runner's Code stage.
 //! This one owns the kill path. Two mechanisms, two separately-named tests, so
 //! a regression in either is attributable rather than masked by the other.
 //! Neither is a combined test.
@@ -22,6 +22,7 @@
 
 mod common;
 
+use common::HermeticPath;
 use devflow_core::mode::Mode;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
@@ -29,7 +30,6 @@ use devflow_core::state::{AgentKind, State};
 use devflow_core::workflow::save_state;
 use std::cell::RefCell;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output};
 use std::time::{Duration, Instant};
@@ -122,16 +122,10 @@ fn real_shape_config(active: bool) -> String {
     )
 }
 
-fn write_executable(path: &Path, contents: &str) {
-    fs::write(path, contents).unwrap();
-    let mut perms = fs::metadata(path).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(path, perms).unwrap();
-}
-
-/// The supervised child: record its own pid, then become `sleep` so it holds
-/// the monitor open long enough for this test to kill the monitor out from
-/// under it.
+/// The body of the fake stream-shape `claude` the runner launches for Code: it
+/// answers `--version`, then records its own pid and becomes `sleep`, so it holds
+/// the runner's Code stage open long enough for this test to kill the runner out
+/// from under it.
 ///
 /// `exec` rather than a plain `sleep` call is what keeps the recorded pid
 /// meaningful: without it, `$$` names the shell and `sleep` is a grandchild
@@ -141,9 +135,10 @@ fn write_executable(path: &Path, contents: &str) {
 /// The 30s ceiling is a backstop, not the mechanism — the teardown below kills
 /// this process explicitly. It exists so a test that dies before its teardown
 /// still cannot leave something sleeping indefinitely.
-fn sleeper_script(pid_path: &Path) -> String {
+fn sleeper_body(pid_path: &Path) -> String {
     format!(
-        "#!/bin/sh\nprintf '%s' \"$$\" > '{pid}'\nexec sleep 30\n",
+        "if [ \"$1\" = \"--version\" ]; then echo \"2.1.220 (Claude Code)\"; exit 0; fi\n\
+         printf '%s' \"$$\" > '{pid}'\nexec sleep 30",
         pid = pid_path.display()
     )
 }
@@ -151,9 +146,8 @@ fn sleeper_script(pid_path: &Path) -> String {
 /// Kills every registered pid on the way out, whether the test passed, failed
 /// an assertion, or panicked partway.
 ///
-/// This project already carries `reap_strays_e2e.rs` because leaked processes
-/// from tests are a real failure class here; a sleeping child left behind by a
-/// failed assertion would wedge the whole suite.
+/// Leaked processes from tests are a real failure class here; a sleeping
+/// child left behind by a failed assertion would wedge the whole suite.
 #[derive(Default)]
 struct Reaper {
     pids: RefCell<Vec<u32>>,
@@ -199,12 +193,13 @@ struct Fixture {
     root: PathBuf,
     phase: PhaseId,
     config: PathBuf,
-    prompt_file: PathBuf,
-    script: PathBuf,
+    /// The fake `claude` (the sleeper) a runner from [`Fixture::spawn_runner`]
+    /// launches.
+    agent_bin: common::FakeBin,
     child_pid_file: PathBuf,
     reaper: Reaper,
     /// Every `devflow` child's `HOME` and cache. Declared last so it drops
-    /// after `reaper` has reaped the monitor.
+    /// after `reaper` has reaped the runner.
     home: common::HermeticHome,
 }
 
@@ -224,17 +219,14 @@ impl Fixture {
         fs::write(&config, real_shape_config(flag_before)).unwrap();
 
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.clone());
+        state.verification_baseline_captured = true;
         state.stage = Stage::Code;
         state.stop_until = Some(Stage::Code);
         state.stopped = false;
         save_state(&state).unwrap();
 
-        let script = aux.path().join("agent.sh");
         let child_pid_file = aux.path().join("child.pid");
-        write_executable(&script, &sleeper_script(&child_pid_file));
-
-        let prompt_file = aux.path().join("prompt.txt");
-        fs::write(&prompt_file, "run the code stage\n").unwrap();
+        let agent_bin = common::fake_bin_dir(&sleeper_body(&child_pid_file));
 
         Self {
             _repo: repo,
@@ -242,68 +234,59 @@ impl Fixture {
             root,
             phase,
             config,
-            prompt_file,
-            script,
+            agent_bin,
             child_pid_file,
             reaper: Reaper::default(),
             home: common::HermeticHome::new(),
         }
     }
 
-    /// Spawn the REAL binary's hidden `__monitor` subcommand supervising the
-    /// sleeper, as a child of this test process so it can be signalled
-    /// directly.
-    fn spawn_monitor(&self) -> Child {
-        // The 3.x `__monitor` argv (50-11): a per-launch id and a socket
-        // under the hermetic cache dir this file's child process gets.
-        let launch_id = devflow_core::supervisor::new_launch_id();
-        let socket = devflow_core::supervisor::SocketPath::for_launch(
-            &self.home.cache_dir(),
-            &self.root,
-            self.phase,
-            &launch_id,
+    /// Commit what an unattended Code launch's preflight reads (one plan with no
+    /// checkpoint) and record a confirmed delivery canary, so a runner over the saved
+    /// Code stage starts its agent instead of stopping at a preflight gate or running
+    /// a canary first.
+    fn make_launchable(&self) {
+        let padded = self.phase.padded();
+        let plan = format!(".planning/phases/{padded}-fixture/{padded}-01-PLAN.md");
+        fs::create_dir_all(self.root.join(format!(".planning/phases/{padded}-fixture"))).unwrap();
+        fs::write(
+            self.root.join(&plan),
+            format!(
+                "---\nphase: {padded}-fixture\nplan: 01\ntype: execute\nautonomous: true\n---\n\n<tasks>\n<task type=\"auto\"><name>stub</name></task>\n</tasks>\n"
+            ),
         )
-        .expect("the hermetic socket path fits sun_path");
-        // The state must record this launch, as a launcher's publish does: this monitor
-        // has no launcher to promote it (D-15).
+        .unwrap();
+        git(&self.root, &["add", &plan]);
+        git(&self.root, &["commit", "-q", "-m", "plan"]);
         devflow_core::workflow::update_state(&self.root, self.phase, |state| {
-            state.supervisor = Some(devflow_core::state::SupervisorRecord::new(
-                socket.as_path().to_path_buf(),
-                launch_id.clone(),
-                4_294_967_000,
-                1,
-                String::new(),
-            ));
+            state.canary = Some(devflow_core::canary::CanaryOutcome::Confirmed);
             Ok::<(), devflow_core::workflow::WorkflowError>(())
         })
         .unwrap();
+    }
+
+    /// Spawn the REAL binary's hidden `__runner` subcommand over the saved Code
+    /// stage, with [`Fixture::agent_bin`] first on its PATH so the Code agent it
+    /// launches is the sleeper, as a child of this test process so it can be
+    /// signalled directly.
+    fn spawn_runner(&self) -> Child {
+        let existing = std::env::var_os("PATH").unwrap_or_default();
         let child = common::hermetic_devflow(&self.home)
-            .arg("__monitor")
+            .hermetic_path(format!(
+                "{}:{}",
+                self.agent_bin.path.display(),
+                existing.to_string_lossy()
+            ))
+            .env_remove("NOTIFY_SOCKET")
+            .current_dir(&self.root)
+            .arg("__runner")
             .arg("--project")
             .arg(&self.root)
             .arg("--phase")
             .arg(self.phase.to_string())
-            .arg("--workdir")
-            .arg(&self.root)
-            .arg("--prompt-file")
-            .arg(&self.prompt_file)
-            .arg("--idle-timeout-secs")
-            // Comfortably above the sleeper's own 30s ceiling, so the idle
-            // timeout can never be what ends this run — the kill below is.
-            .arg("120")
-            .arg("--agent")
-            .arg("claude")
-            .arg("--launch")
-            .arg("stream")
-            .arg("--launch-id")
-            .arg(&launch_id)
-            .arg("--socket")
-            .arg(socket.as_path())
-            .arg("--")
-            .arg("sh")
-            .arg(&self.script)
+            .stdin(std::process::Stdio::null())
             .spawn()
-            .expect("spawn devflow __monitor");
+            .expect("spawn devflow __runner");
         self.reaper.watch(child.id());
         child
     }
@@ -334,7 +317,7 @@ impl Fixture {
             .arg("--phase")
             .arg(self.phase.to_string())
             .arg(&self.root)
-            .env("PATH", git_only_path)
+            .hermetic_path(git_only_path)
             .output()
             .expect("spawn devflow resume")
     }
@@ -409,8 +392,10 @@ fn auto_chain_flag_survives_sigkill_and_is_repaired_on_the_next_start() {
     let fixture = Fixture::new(false);
     let path_dir = git_only_path();
 
-    let mut monitor = fixture.spawn_monitor();
-    let _run_reaper = common::LaunchedRunReaper::new(&fixture.root, fixture.phase, Vec::new());
+    fixture.make_launchable();
+    let _run_reaper =
+        common::LaunchedRunReaper::for_home(&fixture.home, &fixture.root, fixture.phase);
+    let mut runner = fixture.spawn_runner();
 
     // The fixture must actually engage the guard before anything downstream
     // means anything. A timeout here is "the fixture never set the flag", which
@@ -426,15 +411,15 @@ fn auto_chain_flag_survives_sigkill_and_is_repaired_on_the_next_start() {
     wait_for(
         || fixture.child_pid().is_some(),
         Duration::from_secs(30),
-        "the monitor to spawn the sleeper after setting the chain flag — resume now refuses \
-         over a live recorded agent, so the orphan must be known and terminated before resume",
+        "the runner to spawn the sleeper after setting the chain flag — the orphan must be \
+         known so it can be terminated before resume",
     );
     let child_pid = fixture.child_pid();
 
-    // A real SIGKILL: `Child::kill` sends SIGKILL on Unix. The monitor dies
+    // A real SIGKILL: `Child::kill` sends SIGKILL on Unix. The runner dies
     // with its guard still engaged and no opportunity to run `Drop`.
-    monitor.kill().expect("SIGKILL the monitor");
-    monitor.wait().expect("reap the killed monitor");
+    runner.kill().expect("SIGKILL the runner");
+    runner.wait().expect("reap the killed runner");
 
     // ==================== NEGATIVE CONTROL ====================
     // THE load-bearing assertion of this plan. It proves the leak is real and
@@ -445,7 +430,7 @@ fn auto_chain_flag_survives_sigkill_and_is_repaired_on_the_next_start() {
     assert_eq!(
         fixture.flag_now(),
         "true",
-        "a SIGKILLed monitor must LEAVE the chain flag set — the in-process \
+        "a SIGKILLed runner must LEAVE the chain flag set — the in-process \
          guard's Drop cannot run on a kill, which is the entire reason the \
          force-clear repair exists (35.1 D-01)"
     );
@@ -461,15 +446,6 @@ fn auto_chain_flag_survives_sigkill_and_is_repaired_on_the_next_start() {
             Duration::from_millis(20),
         );
     }
-
-    // The killed monitor's record is only this fixture's way to let it serve (D-15). It
-    // would make `resume` refuse over the STALE socket, which is not what this test is
-    // about, so it goes before the resume.
-    devflow_core::workflow::update_state(&fixture.root, fixture.phase, |state| {
-        state.supervisor = None;
-        Ok::<(), devflow_core::workflow::WorkflowError>(())
-    })
-    .unwrap();
 
     let output = fixture.run_resume(path_dir.path());
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -566,4 +542,354 @@ fn a_leak_that_reached_the_branch_tip_is_repaired_in_the_commit_too() {
     assert_eq!(events.len(), 1, "exactly one repair event: {events:?}");
     assert_eq!(events[0]["committed_tree_repaired"], true);
     assert_eq!(events[0]["entry_point"], "resume");
+    assert!(
+        !printed(&output).contains(LEFT_UNCOMMITTED_NOTE),
+        "a repaired leak leaves nothing uncommitted\nprinted:\n{}",
+        printed(&output)
+    );
+}
+
+/// 52.1 D-22, at the binary level: GSD's first `config-set` writes
+/// `workflow._auto_chain_active: false` into a project whose committed config
+/// never had the key. Nothing leaked, so the next real `devflow resume` records
+/// the write under an accurate commit and names no killed run on either channel.
+///
+/// The working copy is GSD's own serialization (`JSON.stringify(config, null,
+/// 2)` plus one newline), which is the shape [`real_shape_config`] is written in.
+#[test]
+fn gsds_first_false_write_is_recorded_without_a_killed_run_notice() {
+    let fixture = Fixture::new(false);
+    let path_dir = git_only_path();
+
+    let gsd_false = fs::read_to_string(&fixture.config).unwrap();
+    let without_key = gsd_false.replace("    \"_auto_chain_active\": false,\n", "");
+    assert_ne!(
+        without_key, gsd_false,
+        "the fixture must actually drop the key from the committed copy"
+    );
+    fs::write(&fixture.config, &without_key).unwrap();
+    git(&fixture.root, &["add", ".planning/config.json"]);
+    git(
+        &fixture.root,
+        &[
+            "commit",
+            "-q",
+            "-m",
+            "docs: add gsd config without the chain flag",
+        ],
+    );
+    assert_eq!(
+        fixture.flag_at_head(),
+        "null",
+        "premise: the committed config lacks the key"
+    );
+    fs::write(&fixture.config, &gsd_false).unwrap();
+
+    let output = fixture.run_resume(path_dir.path());
+    let printed = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(
+        fixture.flag_at_head(),
+        "false",
+        "the branch tip must carry GSD's false after the resume\nprinted:\n{printed}"
+    );
+    assert_eq!(
+        git_output(&fixture.root, &["log", "-1", "--format=%s"]).trim_end(),
+        "chore(gsd): record GSD's workflow._auto_chain_active: false",
+        "the commit must say what it records"
+    );
+    let events = fixture.repair_events();
+    assert!(
+        events.is_empty(),
+        "recording GSD's false is not a repair and writes no repair event: {events:?}"
+    );
+    assert!(
+        printed.contains("recorded GSD's workflow._auto_chain_active: false"),
+        "the recording must be announced, or the absent killed-run notice below \
+         proves nothing\nprinted:\n{printed}"
+    );
+    assert!(
+        !printed.contains("was killed before it could clear it"),
+        "nothing leaked, so no killed run may be named\nprinted:\n{printed}"
+    );
+    assert!(
+        !printed.contains(LEFT_UNCOMMITTED_NOTE),
+        "a recorded false leaves nothing uncommitted\nprinted:\n{printed}"
+    );
+}
+
+/// The words only the left-uncommitted note uses.
+const LEFT_UNCOMMITTED_NOTE: &str = "left .planning/config.json uncommitted";
+
+/// How `resume` refuses once it reaches the launch under [`git_only_path`].
+const MISSING_AGENT_REFUSAL: &str = "agent binary `claude` not found";
+
+/// Everything a spawned `devflow` printed: stdout, then stderr.
+fn printed(output: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+/// Commits the fixture's `.planning/config.json` as it stands.
+fn commit_config(fixture: &Fixture, subject: &str) {
+    git(&fixture.root, &["add", ".planning/config.json"]);
+    git(&fixture.root, &["commit", "-q", "-m", subject]);
+}
+
+/// Operator ruling 2026-11-15, at the binary level: the branch tip holds GSD's
+/// `false` and the key is gone from the working copy. No copy holds `true` and
+/// there is no `false` to record, so the next real `devflow resume` commits
+/// nothing, writes no repair event, and says in one foreground line that the
+/// file is left uncommitted and what that costs.
+#[test]
+fn a_config_change_devflow_cannot_attribute_is_left_uncommitted_and_said() {
+    let fixture = Fixture::new(false);
+    let path_dir = git_only_path();
+
+    commit_config(&fixture, "docs: add gsd config holding false");
+    assert_eq!(
+        fixture.flag_at_head(),
+        "false",
+        "premise: the committed config holds false"
+    );
+    let head_before = git_output(&fixture.root, &["rev-parse", "HEAD"]);
+    let with_false = fs::read_to_string(&fixture.config).unwrap();
+    let without_key = with_false.replace("    \"_auto_chain_active\": false,\n", "");
+    assert_ne!(
+        without_key, with_false,
+        "the fixture must actually drop the key from the working copy"
+    );
+    fs::write(&fixture.config, &without_key).unwrap();
+
+    let output = fixture.run_resume(path_dir.path());
+    let printed = printed(&output);
+
+    assert_eq!(
+        git_output(&fixture.root, &["rev-parse", "HEAD"]),
+        head_before,
+        "resume must commit nothing in this row\nprinted:\n{printed}"
+    );
+    let status = git_output(&fixture.root, &["status", "--porcelain"]);
+    assert!(
+        status
+            .lines()
+            .any(|line| line == " M .planning/config.json"),
+        "the file stays modified and uncommitted, got status {status:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&fixture.config).unwrap(),
+        without_key,
+        "the working copy must be left byte for byte as it was"
+    );
+    let events = fixture.repair_events();
+    assert!(
+        events.is_empty(),
+        "nothing was repaired, so no repair event may be written: {events:?}"
+    );
+    let notes: Vec<&str> = printed
+        .lines()
+        .filter(|line| line.contains(LEFT_UNCOMMITTED_NOTE))
+        .collect();
+    assert_eq!(
+        notes.len(),
+        1,
+        "resume must say in exactly one line that the file is left uncommitted\nprinted:\n{printed}"
+    );
+    assert!(
+        notes[0].starts_with(
+            "note: devflow resume left .planning/config.json uncommitted for phase 78"
+        ),
+        "the line must name the entry point, the file and the phase: {}",
+        notes[0]
+    );
+    assert!(
+        notes[0].contains("DevFlow cannot attribute the change"),
+        "the line must say why nothing was committed: {}",
+        notes[0]
+    );
+    assert!(
+        notes[0].contains("Validate will not record a pass until it is committed"),
+        "the line must say what the uncommitted file costs: {}",
+        notes[0]
+    );
+    assert!(
+        !printed.contains("was killed before it could clear it"),
+        "nothing leaked, so no killed run may be named\nprinted:\n{printed}"
+    );
+}
+
+/// The control for the row above: a committed config the working copy agrees
+/// with. `resume` reaches the launch and says nothing about the config.
+#[test]
+fn a_clean_resume_prints_no_left_uncommitted_note() {
+    let fixture = Fixture::new(false);
+    let path_dir = git_only_path();
+    commit_config(&fixture, "docs: add gsd config holding false");
+
+    let output = fixture.run_resume(path_dir.path());
+    let printed = printed(&output);
+
+    assert!(
+        printed.contains(MISSING_AGENT_REFUSAL),
+        "premise: resume ran past the launch repair and refused at the launch\nprinted:\n{printed}"
+    );
+    assert!(
+        !printed.contains(LEFT_UNCOMMITTED_NOTE),
+        "a clean config has nothing left uncommitted\nprinted:\n{printed}"
+    );
+    assert!(
+        !printed.contains("note: devflow resume"),
+        "a clean launch has no repair note at all\nprinted:\n{printed}"
+    );
+}
+
+/// Puts the fixture in the row the recording commit serves: the branch tip
+/// lacks the chain flag and the working copy holds GSD's `false`.
+fn hold_gsds_first_false(fixture: &Fixture) {
+    let gsd_false = fs::read_to_string(&fixture.config).unwrap();
+    let without_key = gsd_false.replace("    \"_auto_chain_active\": false,\n", "");
+    assert_ne!(
+        without_key, gsd_false,
+        "the fixture must actually drop the key from the committed copy"
+    );
+    fs::write(&fixture.config, &without_key).unwrap();
+    commit_config(fixture, "docs: add gsd config without the chain flag");
+    fs::write(&fixture.config, &gsd_false).unwrap();
+}
+
+/// Installs `body` as the fixture repository's `name` hook, so the recording
+/// commit `devflow` makes runs it. [`init_repo`] turns hooks off; this turns
+/// them back on for one hook.
+fn install_hook(fixture: &Fixture, name: &str, body: &str) {
+    let hooks = fixture.root.join(".git/test-hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    devflow_core::test_support::write_executable(
+        &hooks.join(name),
+        &format!("#!/bin/sh\n{body}\n"),
+    );
+    git(
+        &fixture.root,
+        &["config", "core.hooksPath", hooks.to_str().unwrap()],
+    );
+}
+
+/// The opening of every warning about a recording commit that was refused.
+const RECORD_REFUSAL_WARNING: &str =
+    "warning: the commit recording GSD's workflow._auto_chain_active: false";
+
+/// What a refused recording commit must never print: the recording note (no
+/// commit was confirmed) or the killed-run notice (nothing leaked).
+fn assert_no_recording_or_killed_run_note(printed: &str) {
+    assert!(
+        !printed.contains("note: devflow resume recorded"),
+        "a refused recording commit must not be announced as recorded\nprinted:\n{printed}"
+    );
+    assert!(
+        !printed.contains("was killed before it could clear it"),
+        "nothing leaked, so no killed run may be named\nprinted:\n{printed}"
+    );
+}
+
+/// The recording commit fails (a pre-commit hook rejects it). `resume` warns
+/// in the foreground, naming the recording commit and git's own reason.
+#[test]
+fn a_recording_commit_that_fails_is_warned_about_at_resume() {
+    let fixture = Fixture::new(false);
+    let path_dir = git_only_path();
+    hold_gsds_first_false(&fixture);
+    install_hook(
+        &fixture,
+        "pre-commit",
+        "echo 'the hook says no' >&2\nexit 1",
+    );
+
+    let output = fixture.run_resume(path_dir.path());
+    let printed = printed(&output);
+
+    assert_eq!(
+        fixture.flag_at_head(),
+        "null",
+        "premise: the hook stopped the recording commit\nprinted:\n{printed}"
+    );
+    let warning = printed
+        .lines()
+        .find(|line| line.starts_with(RECORD_REFUSAL_WARNING))
+        .unwrap_or_else(|| panic!("resume must warn about the failed commit\nprinted:\n{printed}"));
+    assert!(
+        warning.contains("could not be made (") && warning.contains("the hook says no"),
+        "the warning must carry git's own reason: {warning}"
+    );
+    assert_no_recording_or_killed_run_note(&printed);
+}
+
+/// The recording commit lands and the file then differs from the branch tip
+/// again (a post-commit hook rewrites it). `resume` warns; it does not say the
+/// write was recorded.
+#[test]
+fn a_recording_commit_the_reprobe_contradicts_is_warned_about_at_resume() {
+    let fixture = Fixture::new(false);
+    let path_dir = git_only_path();
+    hold_gsds_first_false(&fixture);
+    install_hook(&fixture, "post-commit", "echo >> .planning/config.json");
+
+    let output = fixture.run_resume(path_dir.path());
+    let printed = printed(&output);
+
+    assert_eq!(
+        git_output(&fixture.root, &["log", "-1", "--format=%s"]).trim_end(),
+        "chore(gsd): record GSD's workflow._auto_chain_active: false",
+        "premise: the recording commit landed\nprinted:\n{printed}"
+    );
+    assert!(
+        printed.lines().any(|line| line
+            == format!(
+                "{RECORD_REFUSAL_WARNING} reported success but .planning/config.json still \
+                 differs from HEAD — the file stays uncommitted; nothing was leaked"
+            )),
+        "resume must warn that the file still differs from HEAD\nprinted:\n{printed}"
+    );
+    assert_no_recording_or_killed_run_note(&printed);
+}
+
+/// The recording commit lands and the branch tip then cannot be read (a
+/// post-commit hook points `HEAD` at a branch with no commits). `resume` warns
+/// that the commit could not be confirmed and claims no leak.
+#[test]
+fn a_recording_commit_that_cannot_be_confirmed_is_warned_about_at_resume() {
+    let fixture = Fixture::new(false);
+    let path_dir = git_only_path();
+    hold_gsds_first_false(&fixture);
+    install_hook(
+        &fixture,
+        "post-commit",
+        "git symbolic-ref HEAD refs/heads/no-commits-yet",
+    );
+
+    let output = fixture.run_resume(path_dir.path());
+    let printed = printed(&output);
+
+    assert_eq!(
+        git_output(
+            &fixture.root,
+            &["log", "-1", "--format=%s", "feature/phase-78"]
+        )
+        .trim_end(),
+        "chore(gsd): record GSD's workflow._auto_chain_active: false",
+        "premise: the recording commit landed on the phase branch\nprinted:\n{printed}"
+    );
+    assert!(
+        printed.lines().any(|line| line.starts_with(&format!(
+            "{RECORD_REFUSAL_WARNING} could not be confirmed at HEAD; nothing was leaked \
+             (could not compare .planning/config.json against HEAD"
+        ))),
+        "resume must warn that the commit could not be confirmed\nprinted:\n{printed}"
+    );
+    assert_no_recording_or_killed_run_note(&printed);
 }

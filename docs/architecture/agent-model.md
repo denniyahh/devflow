@@ -40,13 +40,13 @@ Each agent has a dedicated driver file under `crates/devflow-core/src/agents/`:
 
 ## Driver-owned prompts
 
-There is no shared prompt. A `StageIntent` carries the stage's data (phase, fix kind, review
-angles) with no agent-specific syntax; each driver's `render_prompt` turns it into its own
+There is no shared prompt. A `StageIntent` carries the stage's data (phase, fix kind) with no
+agent-specific syntax; each driver's `render_prompt` turns it into its own
 instruction. Claude/OpenCode render the legacy slash-command text byte-for-byte; Codex/Pi render a
 workflow-file reference.
 
 Every prompt asks the agent to finish with a `DEVFLOW_RESULT` JSON marker. Validate additionally
-requires a `pass` or `gaps` verdict; Ship requires a review-before-ship decision.
+requires a `pass` or `gaps` verdict.
 
 ## Completion Evaluation
 

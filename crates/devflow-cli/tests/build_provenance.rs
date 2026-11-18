@@ -7,6 +7,8 @@
 //! removed entirely (CR-02, 17-11 gap closure). See the regression test
 //! below for why.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 
 #[test]
@@ -33,6 +35,39 @@ fn build_commit_is_empty_or_a_full_hex_sha() {
         "DEVFLOW_BUILD_COMMIT must be empty (no-git build, D-20) or a \
          40-char hex SHA, got {commit:?}"
     );
+}
+
+/// `devflow --version` names the build: the package version, the commit
+/// `build.rs` embedded (or `unknown` for a no-git build) and whether the tree
+/// was dirty. The expected text is built from the same `env!` values the
+/// binary was compiled with, never from a stored commit or hash: `build.rs`
+/// re-embeds them on every build.
+#[test]
+fn version_prints_the_embedded_commit_and_dirty_flag() {
+    let commit = env!("DEVFLOW_BUILD_COMMIT");
+    let commit = if commit.is_empty() { "unknown" } else { commit };
+    let dirty = if env!("DEVFLOW_BUILD_DIRTY") == "true" {
+        "dirty"
+    } else {
+        "clean"
+    };
+    let expected = format!(
+        "devflow {} ({commit}, {dirty})\n",
+        env!("CARGO_PKG_VERSION")
+    );
+
+    let home = common::HermeticHome::new();
+    let output = common::hermetic_devflow(&home)
+        .arg("--version")
+        .output()
+        .expect("run devflow --version");
+
+    assert!(
+        output.status.success(),
+        "devflow --version failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
 }
 
 // ---------------------------------------------------------------------------

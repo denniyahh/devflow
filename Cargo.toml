@@ -3,10 +3,11 @@ resolver = "2"
 members = [
     "crates/devflow-core",
     "crates/devflow-cli",
+    "tools/release-preflight",
 ]
 
 [workspace.package]
-version = "3.0.0"
+version = "4.0.0-alpha.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/denniyahh/devflow"
@@ -17,7 +18,7 @@ keywords = ["cli", "workflow", "automation", "git", "devops"]
 categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
-devflow-core = { path = "crates/devflow-core", version = "3.0.0" }
+devflow-core = { path = "crates/devflow-core", version = "4.0.0-alpha.1" }
 serde = { version = "1", features = ["derive"] }
 # `preserve_order` is load-bearing, not a preference: `devflow_core::gsd_config`
 # round-trips the operator's `.planning/config.json` through `serde_json::Value`

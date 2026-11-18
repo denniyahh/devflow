@@ -23,7 +23,6 @@ use devflow_core::gates::Gates;
 use devflow_core::liveness;
 use devflow_core::monitor;
 use devflow_core::phase_id::PhaseId;
-use devflow_core::ship;
 use devflow_core::workflow;
 use devflow_core::{AgentKind, Mode, Stage, State};
 use std::path::Path;
@@ -35,38 +34,14 @@ fn gitignore_is_star(root: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Every one of the 7 production `.devflow/`-creating entry points, driven
-/// through its real public API (not `ensure_devflow_dir` directly — that
-/// would prove nothing about whether the site was actually converted),
-/// against its own fresh temp project root. Failures accumulate into a
-/// vector so one regressed site doesn't hide another (mirrors the
+/// Every one of the seven production `.devflow/`-creating entry points this
+/// test covers, driven through its real public API (not `ensure_devflow_dir`
+/// directly — that would prove nothing about whether the site was actually
+/// converted), against its own fresh temp project root. Failures accumulate
+/// into a vector so one regressed site doesn't hide another (mirrors the
 /// accumulate-then-assert shape `gitignore_coverage.rs` already uses).
-/// The launch context case 3 passes `spawn_monitor` (50-11): a monitor
-/// executable that exits at once (a 0755 `#!/bin/sh` / `exit 0` script) and
-/// a short cache dir under `/tmp`, both in a tempdir the case owns.
-struct ExitingMonitor {
-    _dir: tempfile::TempDir,
-    context: monitor::LaunchContext,
-}
-
-fn launch_context() -> ExitingMonitor {
-    use std::os::unix::fs::PermissionsExt;
-    let dir = tempfile::Builder::new()
-        .prefix("dfs")
-        .tempdir_in("/tmp")
-        .expect("create a short monitor tempdir under /tmp");
-    let exe = dir.path().join("monitor");
-    std::fs::write(&exe, "#!/bin/sh\nexit 0\n").unwrap();
-    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let context = monitor::LaunchContext::new(
-        dir.path().join("cache"),
-        monitor::MonitorExec::Subcommand { exe },
-    );
-    ExitingMonitor { _dir: dir, context }
-}
-
 #[test]
-fn all_seven_devflow_constructors_produce_the_gitignore() {
+fn every_devflow_constructor_produces_the_gitignore() {
     let mut failures: Vec<&str> = Vec::new();
 
     // 1. workflow::save_state -> workflow.rs write_state_atomic
@@ -89,56 +64,38 @@ fn all_seven_devflow_constructors_produce_the_gitignore() {
     {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        Gates::write_gate(root, PhaseId::new(1), Stage::Validate, "context").expect("write_gate");
+        Gates::write_gate(
+            root,
+            PhaseId::new(1),
+            Stage::Validate,
+            devflow_core::gates::GateKind::StageFailure,
+            "context",
+        )
+        .expect("write_gate");
         if !gitignore_is_star(root) {
             failures.push("gates::Gates::write_gate (gates.rs)");
         }
     }
 
-    // 3. monitor::spawn_monitor -> monitor.rs capture dir (a spawn path that
-    //    creates the capture directory without going through save_state —
-    //    the state passed here is synthetic and never persisted, D-14).
-    //
-    //    The monitor executable is a `#!/bin/sh` script that exits at once:
-    //    a core test binary has no `__monitor` subcommand to re-exec, so no
-    //    supervisor can publish here. `spawn_monitor` therefore reports
-    //    `NotReady` once the script has exited, and the case proves the
-    //    capture directory (and its `.gitignore`) was created BEFORE the
-    //    spawn, so it exists even when the launch fails.
+    // 3. monitor::run_stage -> monitor.rs capture dir (a stage that creates
+    //    the capture directory without going through save_state — no state
+    //    exists here, D-14). The agent exits at once, under a fresh run token.
     {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let state = State::new(
-            PhaseId::new(1),
-            AgentKind::Claude,
-            Mode::Auto,
+        let mut spec = monitor::StageSpec::new(
             root.to_path_buf(),
+            PhaseId::new(1),
+            AgentKind::Codex,
+            "sh".to_string(),
+            monitor::StageIo::Capture,
         );
-        let ctx = launch_context();
-        // The reservation creates `.devflow/` too, so its `.gitignore` goes
-        // before the spawn: this case stays about `spawn_monitor`'s own write.
-        let reservation =
-            monitor::Reservation::new(&ctx.context, &state).expect("take the reservation");
+        spec.args = vec!["-c".to_string(), "exit 0".to_string()];
+        let outcome = monitor::run_stage(spec, &devflow_core::stop::StopToken::for_run())
+            .expect("run a stage whose agent exits at once");
+        assert_eq!(outcome, devflow_core::stop::AgentOutcome::Completed(0));
         if !gitignore_is_star(root) {
-            failures.push("monitor::Reservation::new (monitor.rs)");
-        }
-        std::fs::remove_file(root.join(".devflow").join(".gitignore")).unwrap();
-        let result = monitor::spawn_monitor(
-            &state,
-            "sh",
-            &["-c".to_string(), "exit 0".to_string()],
-            &[],
-            monitor::MonitorLaunch::Legacy,
-            &ctx.context,
-            &reservation,
-        );
-        assert!(
-            matches!(result, Err(monitor::MonitorError::NotReady(_))),
-            "a monitor executable that exits at once must be reported NotReady, got {result:?}"
-        );
-
-        if !gitignore_is_star(root) {
-            failures.push("monitor::spawn_monitor (monitor.rs)");
+            failures.push("monitor::run_stage (monitor.rs)");
         }
     }
 
@@ -170,22 +127,7 @@ fn all_seven_devflow_constructors_produce_the_gitignore() {
         }
     }
 
-    // 6. ship::write_cron_instructions -> ship.rs write_cron_instructions
-    {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let instructions = ship::build_single_agent_cron_instructions(
-            root,
-            PhaseId::new(1),
-            "2026-01-01T00:00:00Z",
-        );
-        ship::write_cron_instructions(root, &instructions).expect("write_cron_instructions");
-        if !gitignore_is_star(root) {
-            failures.push("ship::write_cron_instructions (ship.rs)");
-        }
-    }
-
-    // 7. workflow::update_state_with -> workflow.rs lock_for_write, whose lock file
+    // 6. workflow::update_state_with -> workflow.rs lock_for_write, whose lock file
     // `.devflow/.state-NN.lock` it creates before any state exists.
     {
         let dir = tempfile::tempdir().unwrap();
@@ -199,7 +141,7 @@ fn all_seven_devflow_constructors_produce_the_gitignore() {
         }
     }
 
-    // 8. liveness::claim_phase_holder -> liveness.rs, `.devflow/.holder-NN` (D-17)
+    // 7. liveness::claim_phase_holder -> liveness.rs, `.devflow/.holder-NN` (D-17)
     {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -216,9 +158,27 @@ fn all_seven_devflow_constructors_produce_the_gitignore() {
     );
 }
 
+/// `liveness::claim_runner_lock` creates `.devflow/.runner-NN` (D-07), so it is a
+/// `.devflow/` constructor like the holder in case 7 of
+/// `every_devflow_constructor_produces_the_gitignore`.
+#[test]
+fn claim_runner_lock_produces_the_gitignore() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    assert!(
+        !gitignore_is_star(root),
+        "gitignore present before the claim on a fresh root"
+    );
+    let _hold = liveness::claim_runner_lock(root, PhaseId::new(1)).expect("claim_runner_lock");
+    assert!(
+        gitignore_is_star(root),
+        "claim_runner_lock did not produce a .devflow/.gitignore"
+    );
+}
+
 /// Small helper so a failing `archive_phase_files` reports through the same
-/// accumulate-then-assert shape as the other 6 sites, instead of panicking
-/// mid-test via `.expect()` and hiding which of the 7 sites regressed.
+/// accumulate-then-assert shape as the other sites, instead of panicking
+/// mid-test via `.expect()` and hiding which site regressed.
 fn archive_phase_files_or_panic(root: &Path, phase: PhaseId) {
     agent_result::archive_phase_files(root, root, phase, 5).expect("archive_phase_files");
 }

@@ -2,18 +2,16 @@
 //! workspace member by `path` must carry a `version` equal to
 //! `[workspace.package] version`.
 //!
-//! `version::write_version` (the engine behind the `VersionBump` ship hook)
-//! rewrites exactly one dotted field — `field_for()` returns
-//! `"workspace.package.version"` for a workspace `Cargo.toml`, and
-//! `replace_version_in_contents` rewrites that field alone. But this workspace
-//! states its version in *two* places: `[workspace.package] version`, and the
+//! A version bump that rewrites only `[workspace.package] version` (as the
+//! removed `VersionBump` ship hook did) misses half of it, because this
+//! workspace states its version in *two* places: `[workspace.package] version`, and the
 //! `devflow-core` self-pin under `[workspace.dependencies]`, which cannot use
 //! `version.workspace = true` (Cargo has no interpolation for dependency
 //! versions) and cannot be omitted either (a path dependency of a *published*
 //! crate requires an explicit version).
 //!
-//! So `VersionBump` silently leaves the pin on the previous release's version.
-//! This has now shipped broken twice:
+//! So such a bump silently leaves the pin on the previous release's version.
+//! This has shipped broken twice:
 //!
 //! - v1.5.0 — fixed after the fact by `7ad260c`
 //! - v1.6.0 — fixed by the release-prep PR (#15) that this guard accompanies
@@ -28,8 +26,6 @@
 //! A guard asserting only "the pin is *some* valid semver" would not catch
 //! this; the stale pin is always valid semver. The assertion has to be
 //! equality against `[workspace.package] version`.
-//!
-//! Tracked for a proper fix in `VersionBump` as backlog 999.24 / DEN-49.
 
 use std::path::PathBuf;
 
@@ -52,8 +48,7 @@ fn strip_comment(line: &str) -> &str {
 
 /// Extract the value of a `key = "value"` pair from a TOML fragment.
 ///
-/// Deliberately literal rather than a full TOML parse: this project hand-rolls
-/// its version TOML handling (see `version.rs`), and pulling a TOML parser in
+/// Deliberately literal rather than a full TOML parse: pulling a TOML parser in
 /// as a dev-dependency just for one guard is not worth it.
 fn value_of<'a>(fragment: &'a str, key: &str) -> Option<&'a str> {
     let at = fragment.find(key)?;
@@ -140,7 +135,7 @@ fn workspace_member_pins_match_the_workspace_version() {
             pinned, &workspace_version,
             "`{name}` is pinned to \"{pinned}\" under [workspace.dependencies], but \
              [workspace.package] version is \"{workspace_version}\".\n\n\
-             `VersionBump` rewrites only [workspace.package] version, so this pin has to be \
+             A bump of [workspace.package] version alone misses this pin, so it has to be \
              bumped alongside it. Leaving it stale builds, tests, and lints clean — a `path` \
              dependency ignores the `version` field locally — and then fails at `cargo publish` \
              with a duplicate-version rejection, on release day, after the tag is cut.\n\n\

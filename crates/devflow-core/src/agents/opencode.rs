@@ -1498,9 +1498,11 @@ mod tests {
         );
         crate::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
         let pid = hanging_stub_child_pid(&stub_dir);
-        assert!(
-            !crate::agent::agent_running(pid),
-            "the timed-out health probe's sleep descendant must be dead: pid {pid}"
+        // SIGKILL returning does not mean the target is gone yet (999.232).
+        crate::test_support::wait_until(
+            std::time::Duration::from_secs(2),
+            &format!("the timed-out health probe's sleep descendant {pid} to be gone"),
+            || !crate::agent::agent_running(pid),
         );
     }
 

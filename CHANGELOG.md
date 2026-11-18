@@ -1,5 +1,51 @@
 # Changelog
 
+## 4.0.0-alpha.1 — 2026-11-18
+
+A pre-release of the v4.0 line, collecting Phases 51 through 52.2. A run is now Plan → Code → Validate and ends as
+finished after Validate: Define, Ship and `devflow ship` are gone. Each stage runs in the foreground of a runner
+that `devflow start` launches as a systemd user service, replacing the detached supervisor and its socket
+liveness. No migration from 3.x: a 3.x state file is not migrated.
+
+### Added
+
+- Phase 51, rate-limit failover: `--fallback-agent <agent>` on `start` and `resume` (or `fallback_agent` in
+  `devflow.toml`) names one agent that takes over a rate-limited Code stage in the same worktree on the same branch
+- Phases 52.1–52.2: `devflow start` and `resume` run the phase as a user service unit and return once it is ready;
+  `devflow stop` ends the unit; `devflow discard --phase N` removes one phase's worktree, state, branch and
+  leftover gate files, refusing over a live run
+
+### Changed — breaking
+
+- Phase 52: the Define and Ship stages, the after-ship hooks, the cron-resume file and `devflow ship` are removed;
+  `--until define` and `--until ship` are rejected. In supervise mode a rejection note reaches the relaunched
+  agent verbatim
+- Phases 52.1–52.2: `start` runs only a new phase and removes or replaces nothing, naming `stop`, `resume` or
+  `discard` instead; the run's liveness is read from the runner lock, not a supervisor socket
+
+### Removed
+
+`devflow-core` is a published library; these public items are removed outright, with no deprecated stubs
+(accept-break, Phase 52.2):
+
+- `recover::inspect_all` and `RecoveryStatus`, with the `devflow recover` verb (52.2-10)
+- the `supervisor::` paths of the stop primitives and identity helpers, which moved to `devflow_core::stop` and
+  `devflow_core::liveness` (52.2-12)
+- monitor's supervised stage path (`spawn_monitor`, `run_supervised_stage`, `MonitorLaunch`, `MonitorExec`)
+  and `wait_for_agent_pid`, with `StageSpec::socket` and `MonitorError::{SocketPath, Publish}` (52.2-23)
+- liveness's inherited-liveness items (`INHERITED_FD`, `adopt_inherited`) and `install_holder_stop_handler`
+  (52.2-23)
+- the `supervisor` module: the socket, its sidecar and probe, the socket-serving `Supervisor` and the orphan
+  backstop (52.2-24)
+- the `recover` module; `format_age` moved into the CLI (52.2-24)
+- `State::{supervisor, pending_supervisor}` and their types `SupervisorRecord` and `PendingSupervisor` (52.2-25)
+- monitor's `Reservation` with `MonitorError::Liveness`, and liveness's `launch_liveness_path` (52.2-25)
+- workflow's ownership fence: `Ownership`, `ownership`, `update_owned_state`, `while_owner`,
+  `clear_state_if_owned` and `WorkflowError::NotOwner` (52.2-25)
+- `OwnerPhase::HandedOff` (52.2-24)
+- `GitFlow::divergence_from_develop`, whose one caller was `start --no-worktree`'s removed stale-base check
+  (52.2-13)
+
 ## 3.0.0 — 2026-11-03
 
 The first release since 2.12.0, collecting Phases 46 through 50.1. A run's liveness is now read from a

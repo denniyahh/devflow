@@ -26,9 +26,6 @@
 //!   scope is asserted — plus a check that the workflow really does delegate
 //!   to the script, without which the scope guard would be guarding a file
 //!   CI no longer runs.
-//!
-//! * **WR-10 (17-REVIEW.md).** `devflow test` is documented as the local
-//!   mirror of CI, so its clippy scope must match. Unchanged.
 
 use std::path::{Path, PathBuf};
 
@@ -206,6 +203,7 @@ fn ci_workflow_delegates_to_the_shared_check_script() {
         "scripts/check.sh clippy",
         "scripts/check.sh fmt",
         "scripts/check.sh deps",
+        "scripts/check.sh service",
     ] {
         assert!(
             workflow.contains(target),
@@ -382,28 +380,6 @@ fn scheduled_deps_workflow_runs_the_pinned_image() {
     assert!(
         lines.iter().any(|l| l.trim() == "schedule:"),
         "scheduled-deps.yml must run on a schedule"
-    );
-}
-
-/// `devflow test` is documented as the local mirror of CI's quality gates,
-/// so its clippy invocation must match the workflows' scope. It ran the
-/// narrow pre-Phase-17 form until this fix (17-REVIEW.md WR-10), which made
-/// a local green weaker than a CI green — a false-green generator.
-#[test]
-fn devflow_test_clippy_matches_ci_scope() {
-    // 19-09: `test_cmd` (the `devflow test` handler) moved from `main.rs`
-    // into `commands.rs` as part of the main.rs decomposition — this
-    // regression guard's target path moved with it.
-    let path = repo_root().join("crates/devflow-cli/src/commands.rs");
-    let src = read(&path);
-
-    let has_narrow_form = src.contains("\"cargo clippy -- -D warnings\"");
-    assert!(
-        !has_narrow_form,
-        "`devflow test` must not use the narrow `cargo clippy -- -D warnings` \
-         form — it does not compile test targets, making a local green weaker \
-         than a CI green (17-REVIEW.md WR-10). See {}",
-        path.display()
     );
 }
 
@@ -706,10 +682,10 @@ fn container_jobs_using_bash_syntax_declare_a_bash_shell() {
 // 46-04 / 46-REVIEWS.md C-02: a job-scoped, fixture-driven parity recogniser.
 // ---------------------------------------------------------------------------
 
-/// The five real jobs in `.github/workflows/ci.yml`. `push` and
+/// The six real jobs in `.github/workflows/ci.yml`, in file order. `push` and
 /// `pull_request` are deliberately absent — they are keys under the top-level
 /// `on:` block, and the pre-46-04 splitter counted them as jobs.
-const LIVE_CI_JOB_KEYS: [&str; 5] = ["test", "clippy", "fmt", "sequential", "deps"];
+const LIVE_CI_JOB_KEYS: [&str; 6] = ["test", "clippy", "fmt", "sequential", "deps", "service"];
 
 /// The argv prefix the pinned suite step expands. `cpu_pin_prefix` in
 /// `scripts/lib/ci-cpus.sh` sets `CPU_PIN` to `(taskset -c "$CPUS")`, or to an
@@ -942,7 +918,7 @@ fn job_splitter_finds_exactly_the_live_ci_jobs() {
             .iter()
             .map(|k| k.to_string())
             .collect::<Vec<_>>(),
-        "the splitter must return exactly the five real jobs. Got: {keys:?}"
+        "the splitter must return exactly the six real jobs. Got: {keys:?}"
     );
 }
 

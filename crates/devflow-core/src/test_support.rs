@@ -155,8 +155,7 @@ pub fn in_child_test(test_name: &str) -> bool {
 /// by PID 1. A GitHub Actions job container's PID 1 is `tail -f /dev/null`,
 /// which never reaps, so there a killed agent's orphaned children stay
 /// zombies for the life of the job and `kill(-pgid, 0)` keeps reporting the
-/// group. "Is the group gone?" must ask this, never `kill(-pgid, 0)`. It is
-/// the rule `supervisor::backstop`'s census applies.
+/// group. "Is the group gone?" must ask this, never `kill(-pgid, 0)`.
 pub fn live_group_members(pgid: u32) -> Vec<u32> {
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return Vec::new();
@@ -350,6 +349,262 @@ pub fn with_answer_before_publish<R>(hook: impl FnOnce() + 'static, body: impl F
     body()
 }
 
+/// The file under a GSD stub's `logs` dir that holds one line per call: the
+/// call's physical working directory, a tab, then its arguments joined by
+/// spaces.
+pub const GSD_RUN_LOG: &str = "gsd-run.log";
+
+/// The version the stub launcher answers `runtime-identity --raw` with.
+pub const GSD_STUB_VERSION: &str = "0.0.0-stub";
+
+/// Plant a stub GSD launcher at `<home>/.claude/gsd-core/bin/gsd_run`, the first
+/// place [`crate::gsd_reader::locate_launcher`] looks, so no test reaches a real
+/// GSD install.
+///
+/// Every call appends its working directory and argv to `logs/`[`GSD_RUN_LOG`].
+/// `runtime-identity` answers [`GSD_STUB_VERSION`] and consumes nothing.
+/// `query verification status <dir>` answers `missing` when `<dir>` is not a
+/// directory, consuming nothing. Every other call prints the next of
+/// `responses`, in order, one per call; once they are used up the stub prints
+/// an error and exits 97, so a test that reads more often than it scripted sees
+/// a reader failure, never a repeated answer.
+///
+/// The script uses shell builtins only, so it runs under an agent-free `PATH`.
+pub fn plant_gsd_run_stub(home: &std::path::Path, responses: &[&str], logs: &std::path::Path) {
+    std::fs::create_dir_all(logs).expect("create the GSD stub's logs dir");
+    let logs_text = logs.to_str().expect("a UTF-8 logs path");
+    assert!(
+        !logs_text.contains('\''),
+        "the logs path is single-quoted in the stub: {logs_text}"
+    );
+    for (index, response) in responses.iter().enumerate() {
+        std::fs::write(
+            logs.join(format!("gsd-response-{}", index + 1)),
+            format!("{response}\n"),
+        )
+        .expect("write a scripted GSD reply");
+    }
+    let launcher = home.join(".claude/gsd-core/bin/gsd_run");
+    std::fs::create_dir_all(launcher.parent().expect("a launcher dir"))
+        .expect("create the launcher dir");
+    let script = format!(
+        r#"#!/bin/sh
+logs='{logs_text}'
+printf '%s\t%s\n' "$(pwd -P)" "$*" >> "$logs/{GSD_RUN_LOG}"
+if [ "$1" = "runtime-identity" ]; then
+  printf '%s\n' '{{"packageName":"@opengsd/gsd-core","version":"{GSD_STUB_VERSION}"}}'
+  exit 0
+fi
+if [ "$1 $2 $3" = "query verification status" ] && [ ! -d "$4" ]; then
+  printf '%s\n' '{{"status":"missing","next_action":"No verification report found.","next_command":"","route":"execute-phase"}}'
+  exit 0
+fi
+n=1
+if [ -f "$logs/gsd-next" ]; then read -r n < "$logs/gsd-next"; fi
+if [ ! -f "$logs/gsd-response-$n" ]; then
+  printf 'gsd_run stub: no scripted reply %s\n' "$n" >&2
+  exit 97
+fi
+printf '%s\n' "$((n + 1))" > "$logs/gsd-next"
+while IFS= read -r line || [ -n "$line" ]; do printf '%s\n' "$line"; done < "$logs/gsd-response-$n"
+"#
+    );
+    write_executable(&launcher, &script);
+}
+
+/// The calls a stub from [`plant_gsd_run_stub`] logged, as
+/// `(working directory, argv joined by spaces)`, in call order.
+pub fn gsd_run_calls(logs: &std::path::Path) -> Vec<(std::path::PathBuf, String)> {
+    std::fs::read_to_string(logs.join(GSD_RUN_LOG))
+        .unwrap_or_default()
+        .lines()
+        .map(|line| {
+            let (cwd, argv) = line.split_once('\t').expect("a cwd<TAB>argv log line");
+            (std::path::PathBuf::from(cwd), argv.to_string())
+        })
+        .collect()
+}
+
+/// GSD's `query verification status` JSON for `status` (gsd-core 1.20.1's
+/// shapes, as `gsd_reader`'s own tests record them).
+pub fn gsd_status_json(status: crate::gsd_reader::GsdStatus) -> &'static str {
+    use crate::gsd_reader::GsdStatus;
+    match status {
+        GsdStatus::Passed => {
+            r#"{"status":"passed","next_action":"Verification passed — continue.","next_command":"","route":""}"#
+        }
+        GsdStatus::GapsFound => {
+            r#"{"status":"gaps_found","next_action":"Gaps found. Plan the fixes, then re-run execute-phase before shipping.","next_command":"/gsd-plan-phase 01 --gaps","route":"plan-phase"}"#
+        }
+        GsdStatus::HumanNeeded => {
+            r#"{"status":"human_needed","next_action":"Human verification required.","next_command":"/gsd-verify-work 01","route":"verify-work"}"#
+        }
+        GsdStatus::Stale => {
+            r#"{"status":"stale","next_action":"Verification is stale — covered source files changed after the verifier last ran.","next_command":"/gsd-execute-phase 01","route":"execute-phase","moved_files":["a.txt"]}"#
+        }
+        GsdStatus::Missing => {
+            r#"{"status":"missing","next_action":"No verification report found — the verify step never completed.","next_command":"/gsd-execute-phase 01","route":"execute-phase"}"#
+        }
+    }
+}
+
+/// A child forked from this process and parked before any `exec`.
+///
+/// Until it is released it holds a duplicate of **every** descriptor that was
+/// open in this process at the fork, close-on-exec ones included: `O_CLOEXEC`
+/// closes a descriptor at `exec`, and this child never execs. That is the
+/// state a sibling test's `fork` leaves for the instant before its own `exec`
+/// (999.221, 999.222), held for as long as a test needs it. An audit for
+/// descriptors missing `O_CLOEXEC` therefore proves nothing about that window
+/// (52.1 D-05).
+///
+/// [`ForkHeldBeforeExec::release`] lets the child exit and reaps it. Dropping
+/// the guard does the same, so a panicking test never leaves a parked child.
+///
+/// The hold covers the whole process, not only the calling test: in an
+/// in-process `cargo test` run the child also holds every sibling test's
+/// descriptors. Keep the hold as short as the check needs, and run a test that
+/// must hold it for long in its own process ([`run_test_in_child`]).
+pub struct ForkHeldBeforeExec {
+    pid: libc::pid_t,
+    release_write: libc::c_int,
+}
+
+impl ForkHeldBeforeExec {
+    /// Let the parked child exit and reap it. Every descriptor the child held
+    /// is closed when this returns.
+    pub fn release(self) {
+        drop(self);
+    }
+}
+
+impl Drop for ForkHeldBeforeExec {
+    fn drop(&mut self) {
+        let byte = 0_u8;
+        // SAFETY: `release_write` is the pipe write end this guard owns and
+        // closes exactly once, here; `byte` outlives the one-byte write. `pid`
+        // is this guard's own unreaped child, so `waitpid` cannot name another
+        // process. Nothing here panics: a drop may already be unwinding.
+        unsafe {
+            // A byte, not only the close: any other copy of the write end (a
+            // sibling test's fork before its exec) would hold EOF back.
+            libc::write(self.release_write, (&raw const byte).cast(), 1);
+            libc::close(self.release_write);
+            let mut status = 0;
+            while libc::waitpid(self.pid, &raw mut status, 0) == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+            {}
+        }
+    }
+}
+
+/// Fork a child that parks before any `exec` and holds every descriptor open
+/// in this process right now. See [`ForkHeldBeforeExec`].
+pub fn fork_held_before_exec() -> ForkHeldBeforeExec {
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: `pipe2` writes two descriptors into the two-element `fds`.
+    let piped = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    assert_eq!(
+        piped,
+        0,
+        "pipe2 for the held fork: {}",
+        std::io::Error::last_os_error()
+    );
+    let (read_end, write_end) = (fds[0], fds[1]);
+    // SAFETY: this process is multi-threaded, so the child may call only
+    // async-signal-safe functions: it calls `close`, `read` and `_exit`, and
+    // touches no allocator, lock or formatter.
+    let pid = unsafe { libc::fork() };
+    assert!(
+        pid >= 0,
+        "fork for the held child: {}",
+        std::io::Error::last_os_error()
+    );
+    if pid == 0 {
+        let mut byte = 0_u8;
+        // SAFETY: as above. The child closes its own copy of the write end
+        // first, so it also reads EOF, and exits, if this process dies without
+        // releasing it.
+        unsafe {
+            libc::close(write_end);
+            libc::read(read_end, (&raw mut byte).cast(), 1);
+            libc::_exit(0);
+        }
+    }
+    // SAFETY: closes this process's copy of the read end, once; the child
+    // keeps its own.
+    unsafe { libc::close(read_end) };
+    ForkHeldBeforeExec {
+        pid,
+        release_write: write_end,
+    }
+}
+
+/// How often [`wait_until`] checks its predicate.
+const WAIT_UNTIL_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Wait until `predicate` is true, checking it every [`WAIT_UNTIL_POLL`] for
+/// at most `timeout`. `what` names the awaited state in the timeout message.
+///
+/// The one bounded poll for this crate's unit tests; integration tests use
+/// their own `common::wait_for`, which fails with the same text.
+///
+/// # Panics
+/// With `timed out after {timeout:?} waiting for {what}` when `predicate` is
+/// still false once `timeout` has passed.
+pub fn wait_until(timeout: std::time::Duration, what: &str, mut predicate: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + timeout;
+    while !predicate() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out after {timeout:?} waiting for {what}"
+        );
+        std::thread::sleep(WAIT_UNTIL_POLL);
+    }
+}
+
+/// Write `contents` to `path` and make it executable, without this process
+/// ever holding a write descriptor on the file.
+///
+/// A short-lived `/bin/sh` writes the file with its `printf` builtin. A test
+/// process is multi-threaded, and a sibling test's `fork` holds a copy of
+/// every descriptor open at that instant until its own `exec`, close-on-exec
+/// or not; had this process opened the file for writing, an `exec` of it in
+/// that window would fail with `ETXTBSY` (999.222). With no write descriptor
+/// here there is nothing for a fork to inherit. That holds by construction; no
+/// test can aim a fork at the inside of a write to show the difference.
+///
+/// The mode is set by path (`chmod(2)` opens nothing), in this process and
+/// not by the shell, so nothing here is looked up on `PATH`.
+///
+/// # Panics
+/// Naming `path`, when the shell cannot be started (with the spawn error: a
+/// fork refused under load is not retried, it must be seen), when it exits
+/// non-zero (with its status and stderr), or when the mode cannot be set.
+pub fn write_executable(path: &std::path::Path, contents: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let written = std::process::Command::new("/bin/sh")
+        .args(["-c", r#"printf "%s" "$1" > "$2""#, "sh"])
+        .arg(contents)
+        .arg(path)
+        .output()
+        .unwrap_or_else(|error| {
+            panic!(
+                "write the executable {}: the writing shell did not start: {error}",
+                path.display()
+            )
+        });
+    assert!(
+        written.status.success(),
+        "write the executable {}: the writing shell ended with {}: {}",
+        path.display(),
+        written.status,
+        String::from_utf8_lossy(&written.stderr)
+    );
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .unwrap_or_else(|error| panic!("make {} executable: {error}", path.display()));
+}
+
 // ## Why there is no in-process absent-`git` harness in THIS crate
 //
 // 35-01 planned one empty-`PATH` guard per crate, so that criterion 6's tests
@@ -361,8 +616,8 @@ pub fn with_answer_before_publish<R>(hook: impl FnOnce() + 'static, body: impl F
 //
 // A `PATH`-replacing guard mutates process-global state, and `cargo test` runs
 // this crate's whole suite as threads in ONE process. `devflow-core` shells out
-// to `git` from eight modules (`git`, `version`, `worktree`, `agent_result`,
-// `monitor`, `ship_evidence`, `hooks`, and this one), and — decisively — its
+// to `git` from several modules (`git`, `worktree`, `agent_result`, `monitor`,
+// `gsd_config`, and this one), and — decisively — its
 // tests reach `git` by calling PRODUCTION code that spawns it, not only through
 // fixture helpers. So no fixture-level lock can cover them: serializing this
 // module's own `git()` helper still left
@@ -415,6 +670,7 @@ mod tests {
     fn approved() -> GateResponse {
         GateResponse {
             approved: true,
+            abort: false,
             note: None,
             responded_by: Some("human".into()),
         }
@@ -427,15 +683,28 @@ mod tests {
 
     fn close_and_open(root: &std::path::Path) {
         Gates::close(root, PHASE, STAGE).unwrap();
-        Gates::open_gate(root, PHASE, STAGE, "next").unwrap();
+        Gates::open_gate(
+            root,
+            PHASE,
+            STAGE,
+            crate::gates::GateKind::StageFailure,
+            "next",
+        )
+        .unwrap();
     }
 
     #[test]
     fn with_answer_before_publish_runs_between_the_check_and_the_publish() {
         let dir = tempfile::tempdir().unwrap();
-        let first = Gates::open_gate(dir.path(), PHASE, STAGE, "first")
-            .unwrap()
-            .gate_id;
+        let first = Gates::open_gate(
+            dir.path(),
+            PHASE,
+            STAGE,
+            crate::gates::GateKind::StageFailure,
+            "first",
+        )
+        .unwrap()
+        .gate_id;
         let root = dir.path().to_path_buf();
         let runs = Rc::new(Cell::new(0));
         let hook_runs = runs.clone();
@@ -465,9 +734,15 @@ mod tests {
         // The control: run just before `answer`, the same step fails its id check,
         // so the hook above ran after that check.
         let before = tempfile::tempdir().unwrap();
-        let observed = Gates::open_gate(before.path(), PHASE, STAGE, "first")
-            .unwrap()
-            .gate_id;
+        let observed = Gates::open_gate(
+            before.path(),
+            PHASE,
+            STAGE,
+            crate::gates::GateKind::StageFailure,
+            "first",
+        )
+        .unwrap()
+        .gate_id;
         close_and_open(before.path());
         let refused = Gates::answer(before.path(), PHASE, STAGE, &observed, &approved());
         assert!(
@@ -479,9 +754,15 @@ mod tests {
     #[test]
     fn with_answer_before_publish_runs_its_hook_once_and_never_after_its_body() {
         let dir = tempfile::tempdir().unwrap();
-        let gate = Gates::open_gate(dir.path(), PHASE, STAGE, "ctx")
-            .unwrap()
-            .gate_id;
+        let gate = Gates::open_gate(
+            dir.path(),
+            PHASE,
+            STAGE,
+            crate::gates::GateKind::StageFailure,
+            "ctx",
+        )
+        .unwrap()
+        .gate_id;
         let runs = Rc::new(Cell::new(0));
         let counted = |runs: &Rc<Cell<i32>>| {
             let runs = runs.clone();
@@ -505,9 +786,15 @@ mod tests {
     #[test]
     fn with_answer_before_publish_also_runs_inside_reap_answer() {
         let dir = tempfile::tempdir().unwrap();
-        let gate = Gates::open_gate(dir.path(), PHASE, STAGE, "ctx")
-            .unwrap()
-            .gate_id;
+        let gate = Gates::open_gate(
+            dir.path(),
+            PHASE,
+            STAGE,
+            crate::gates::GateKind::StageFailure,
+            "ctx",
+        )
+        .unwrap()
+        .gate_id;
         let runs = Rc::new(Cell::new(0));
         let hook_runs = runs.clone();
 
@@ -522,9 +809,15 @@ mod tests {
     #[test]
     fn gate_answer_files_lists_keyed_and_legacy_answers() {
         let dir = tempfile::tempdir().unwrap();
-        let gate = Gates::open_gate(dir.path(), PHASE, STAGE, "ctx")
-            .unwrap()
-            .gate_id;
+        let gate = Gates::open_gate(
+            dir.path(),
+            PHASE,
+            STAGE,
+            crate::gates::GateKind::StageFailure,
+            "ctx",
+        )
+        .unwrap()
+        .gate_id;
         let keyed = Gates::answer(dir.path(), PHASE, STAGE, &gate, &approved()).unwrap();
         let legacy = Gates::dir(dir.path()).join("07-code.response.json");
         std::fs::write(&legacy, "{}").unwrap();
@@ -548,7 +841,14 @@ mod tests {
             "{refused:?}"
         );
 
-        Gates::write_gate(dir.path(), PHASE, STAGE, "ctx").unwrap();
+        Gates::write_gate(
+            dir.path(),
+            PHASE,
+            STAGE,
+            crate::gates::GateKind::StageFailure,
+            "ctx",
+        )
+        .unwrap();
         let live = live_gate(dir.path());
         let path = answer_open_gate(dir.path(), PHASE, STAGE, &approved()).unwrap();
 
@@ -782,5 +1082,182 @@ mod tests {
         );
         assert!(!process_is_live(pid), "a zombie is not live");
         child.wait().expect("reap the sleeper");
+    }
+
+    /// How long a test waits for a pipe's end-of-file once the last writer
+    /// this test knows of is gone. A sibling test's fork can hold a copy of
+    /// the write end for the instant before its own exec.
+    const PIPE_EOF_WAIT_MS: libc::c_int = 5_000;
+
+    /// One non-blocking one-byte read of `fd`: the byte count, or the errno.
+    fn read_one_byte(fd: libc::c_int) -> Result<isize, i32> {
+        let mut byte = 0_u8;
+        // SAFETY: `fd` is the caller's open descriptor and `byte` is a
+        // one-byte buffer that outlives the call.
+        let read = unsafe { libc::read(fd, (&raw mut byte).cast(), 1) };
+        if read >= 0 {
+            Ok(read)
+        } else {
+            Err(std::io::Error::last_os_error()
+                .raw_os_error()
+                .expect("an errno"))
+        }
+    }
+
+    /// A descriptor open at the fork stays open in the parked child after this
+    /// process closes its own copy, close-on-exec or not, and is closed once
+    /// the child is released.
+    #[test]
+    fn a_fork_held_before_exec_keeps_an_inherited_pipe_open_until_released() {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `pipe2` writes two descriptors into the two-element `fds`.
+        let piped = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) };
+        assert_eq!(piped, 0, "pipe2: {}", std::io::Error::last_os_error());
+        let (read_end, write_end) = (fds[0], fds[1]);
+
+        let held = fork_held_before_exec();
+        // SAFETY: closes this process's own copy of the write end, once.
+        assert_eq!(unsafe { libc::close(write_end) }, 0);
+        assert_eq!(
+            read_one_byte(read_end),
+            Err(libc::EAGAIN),
+            "the parked child holds the close-on-exec write end, so the pipe has no end-of-file yet"
+        );
+
+        held.release();
+        let mut poll = libc::pollfd {
+            fd: read_end,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `poll` reads and writes the one `pollfd` it is given.
+        let ready = unsafe { libc::poll(&raw mut poll, 1, PIPE_EOF_WAIT_MS) };
+        assert_eq!(
+            ready, 1,
+            "no end-of-file within {PIPE_EOF_WAIT_MS} ms of the release"
+        );
+        assert_eq!(
+            read_one_byte(read_end),
+            Ok(0),
+            "the released child closed its copy, so the pipe is at end-of-file"
+        );
+        // SAFETY: closes this test's read end, once.
+        unsafe { libc::close(read_end) };
+    }
+
+    /// The predicate kills the sleeper on its first call, so no timer decides
+    /// what this test sees: a `wait_until` that never polls leaves a `sleep
+    /// 60` running, however threads are scheduled.
+    #[test]
+    fn wait_until_passes_a_process_that_exits_late() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn the sleeper");
+        let pid = child.id();
+        let mut polls = 0_u32;
+
+        wait_until(
+            std::time::Duration::from_secs(2),
+            "the killed sleep to be gone",
+            || {
+                if polls == 0 {
+                    child.kill().expect("SIGKILL the sleeper");
+                }
+                polls += 1;
+                !crate::agent::agent_running(pid)
+            },
+        );
+
+        let running_after_the_wait = crate::agent::agent_running(pid);
+        let _ = child.kill();
+        child.wait().expect("reap the sleeper");
+        assert!(polls >= 1, "wait_until never called its predicate");
+        assert!(
+            !running_after_the_wait,
+            "wait_until returned while the sleeper was still running"
+        );
+    }
+
+    /// Control: a state that never arrives fails with `wait_until`'s own
+    /// timeout text, within its bound. It does not hang and does not pass.
+    #[test]
+    fn wait_until_times_out_on_a_process_that_never_exits() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn the sleeper");
+        let pid = child.id();
+
+        let waited = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            wait_until(
+                std::time::Duration::from_secs(2),
+                "the sleep to exit",
+                || !crate::agent::agent_running(pid),
+            );
+        }));
+
+        child.kill().expect("SIGKILL the sleeper");
+        child.wait().expect("reap the sleeper");
+        let payload = waited.expect_err("wait_until returned although the sleep never exited");
+        let message = payload
+            .downcast_ref::<String>()
+            .expect("a formatted panic message");
+        assert!(
+            message.contains("timed out after 2s waiting for the sleep to exit"),
+            "the timeout names its bound and what it waited for: {message}"
+        );
+    }
+
+    /// The script both stub-writer tests plant.
+    const STUB_SCRIPT: &str = "#!/bin/sh\nexit 0\n";
+
+    /// Control: a stub this process wrote itself cannot be executed while a
+    /// fork taken during the write still holds the write descriptor (999.222).
+    #[test]
+    fn a_held_fork_makes_a_parent_written_stub_text_busy() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("stub");
+        let mut file = std::fs::File::create(&stub).expect("create the stub");
+        file.write_all(STUB_SCRIPT.as_bytes())
+            .expect("write the stub");
+        let held = fork_held_before_exec();
+        drop(file);
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("make the stub executable");
+
+        let ran = std::process::Command::new(&stub).status();
+
+        held.release();
+        let error = ran.expect_err("exec must fail while a fork holds the stub's write descriptor");
+        assert_eq!(
+            error.raw_os_error(),
+            Some(libc::ETXTBSY),
+            "the failure is Text file busy: {error}"
+        );
+    }
+
+    /// A stub from `write_executable` holds exactly `contents` and runs at
+    /// once beside a parked fork: this process never had a write descriptor on
+    /// it for a fork to inherit.
+    #[test]
+    fn a_stub_written_by_write_executable_execs_beside_a_held_fork() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("stub");
+        write_executable(&stub, STUB_SCRIPT);
+        let held = fork_held_before_exec();
+
+        let ran = std::process::Command::new(&stub).status();
+
+        held.release();
+        let status = ran.expect("exec the stub beside a held fork");
+        assert!(status.success(), "the stub exits 0: {status:?}");
+        assert_eq!(
+            std::fs::read_to_string(&stub).expect("read the stub back"),
+            STUB_SCRIPT,
+            "the stub holds exactly the contents it was given"
+        );
     }
 }

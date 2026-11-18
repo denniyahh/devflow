@@ -1,20 +1,15 @@
-//! Per-launch liveness: a `flock` a launcher takes before it saves a pending
-//! record, and a spawned supervisor inherits and holds for life, so a pending
-//! supervisor is probeable before its socket exists.
+//! Liveness locks: a `flock` its holder keeps for as long as it lives, so a
+//! probe tells a live holder from an abandoned file with no pid read. The phase
+//! holder ([`phase_holder_path`]) and the runner lock ([`runner_lock_path`]) are
+//! each a [`Hold`].
 //!
-//! D-01's two cases are told apart by the lock alone, with no pid read:
-//! a supervisor spawned but not yet published holds the lock, so the file
-//! reads [`Held::Live`]; a reservation whose launcher died before spawning
-//! anything holds nothing, so it reads [`Held::Abandoned`].
+//! D-01's two cases are told apart by the lock alone: a lock whose holder still
+//! runs reads [`Held::Live`]; one whose holder died holds nothing, so it reads
+//! [`Held::Abandoned`].
 //!
-//! Two traps, both pinned by this module's tests:
-//!
-//! - `dup2(3, 3)` is a no-op that leaves close-on-exec set, so a descriptor
-//!   that already is fd 3 would lose the lock at exec. `pass_to_child`
-//!   clears the flag in that case.
-//! - A `flock` belongs to the open file description, so `unlock()` on any
-//!   duplicate releases the lock a child inherited. Dropping a [`Hold`] is the
-//!   only release.
+//! A `flock` belongs to the open file description, so `unlock()` on any
+//! duplicate releases it. Dropping a [`Hold`] is the only release (pinned by
+//! this module's tests).
 //!
 //! The identity record a hold writes (pid and start time) is advisory, not state,
 //! and stays outside D-09's durable helpers and their scan: the lock, not its
@@ -22,17 +17,13 @@
 //! only names the holder for an operator.
 
 use std::fs::{File, OpenOptions, TryLockError};
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::phase_id::PhaseId;
-
-/// The descriptor number a hold has in the child `pass_to_child` spawns.
-pub const INHERITED_FD: RawFd = 3;
 
 /// The suffix of the temporary name a hold is locked under before it is
 /// published: `.{final_file_name}.{pid}.{seq}.hold-tmp`, beside the final name.
@@ -228,60 +219,40 @@ pub fn probe(path: &Path) -> std::io::Result<Held> {
     }
 }
 
-/// Have `cmd`'s child inherit `hold` at [`INHERITED_FD`], so it holds the lock
-/// after this process drops its copy.
-pub(crate) fn pass_to_child(cmd: &mut std::process::Command, hold: &Hold) {
-    let raw = hold.as_raw_fd();
-    // SAFETY: the callback only calls `fcntl` and `dup2`, both
-    // async-signal-safe, and reads errno. It allocates nothing and takes no
-    // locks. When the descriptor already is fd 3, `dup2` would be a no-op that
-    // leaves close-on-exec set, so that case clears the flag instead.
-    unsafe {
-        std::os::unix::process::CommandExt::pre_exec(cmd, move || {
-            let result = if raw == INHERITED_FD {
-                libc::fcntl(INHERITED_FD, libc::F_SETFD, 0)
-            } else {
-                libc::dup2(raw, INHERITED_FD)
-            };
-            if result == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+/// A fresh launch id: 16 lowercase hex characters from this process's pid,
+/// the current time in nanoseconds and a process-wide counter. Uniqueness is
+/// also enforced where an id names a file, which refuses an existing name.
+pub fn new_launch_id() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos() as u64);
+    let mixed = u64::from(std::process::id()) ^ nanos ^ count.rotate_left(48);
+    format!("{mixed:016x}")
 }
 
-/// The liveness file of launch `launch_id`: `.devflow/supervisor-{launch_id}.live`.
-/// `None` unless the id has [`crate::supervisor::new_launch_id`]'s format, so a
-/// launch id read from disk never builds a path outside `.devflow/`.
-pub fn launch_liveness_path(project_root: &Path, launch_id: &str) -> Option<PathBuf> {
-    crate::supervisor::is_launch_id(launch_id).then(|| {
-        project_root
-            .join(".devflow")
-            .join(format!("supervisor-{launch_id}.live"))
-    })
+/// Whether `id` has [`new_launch_id`]'s format: 16 lowercase hex digits. A
+/// launch id read from disk is built into paths and printed into copy-paste
+/// lines, so this is the one rule every reader applies before trusting one.
+pub(crate) fn is_launch_id(id: &str) -> bool {
+    const LAUNCH_ID_LEN: usize = 16;
+    id.len() == LAUNCH_ID_LEN
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-/// The supervisor's side of `pass_to_child`: take ownership of the inherited
-/// descriptor `fd` on `path`, mark it close-on-exec so an agent this process
-/// spawns never inherits it, and record this process as the holder.
-///
-/// # Errors
-/// `fd` is not an open descriptor, or the record could not be written.
-pub fn adopt_inherited(fd: RawFd, path: PathBuf) -> std::io::Result<Hold> {
-    // SAFETY: fcntl on a descriptor number reads and sets its flags and touches
-    // no memory; a closed number fails with EBADF.
-    unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFD);
-        if flags == -1 || libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) == -1 {
-            return Err(std::io::Error::last_os_error());
-        }
-    }
-    // SAFETY: the descriptor is open (checked above) and was handed to this
-    // process for exclusive ownership; nothing else here uses it.
-    let file = unsafe { File::from_raw_fd(fd) };
-    write_identity_record(&file)?;
-    Ok(Hold { file, path })
+/// The kernel boot id, trimmed, or `None` where it cannot be read.
+pub fn boot_id() -> Option<String> {
+    read_boot_id(Path::new("/proc/sys/kernel/random/boot_id"))
+}
+
+/// [`boot_id`] against an explicit file, for tests.
+pub(crate) fn read_boot_id(path: &Path) -> Option<String> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let trimmed = contents.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 /// The per-phase holder file (D-17): `.devflow/.holder-{padded}`.
@@ -290,6 +261,9 @@ pub fn phase_holder_path(project_root: &Path, phase: PhaseId) -> PathBuf {
         .join(".devflow")
         .join(format!(".holder-{}", phase.padded()))
 }
+
+/// A holder's recorded pid and start time, as [`live_holder`] reads them.
+type HolderIdentity = (u32, Option<u64>);
 
 /// Why [`claim_phase_holder`] did not claim.
 #[derive(Debug)]
@@ -340,8 +314,17 @@ impl From<std::io::Error> for HolderError {
 /// [`HolderError::Held`] when another open holds the lock; [`HolderError::Io`] when the
 /// file could not be created, locked or written.
 pub fn claim_phase_holder(project_root: &Path, phase: PhaseId) -> Result<Hold, HolderError> {
-    let path = phase_holder_path(project_root, phase);
     crate::workflow::ensure_devflow_dir(&project_root.join(".devflow"))?;
+    match claim_lock_file(phase_holder_path(project_root, phase))? {
+        Ok(hold) => Ok(hold),
+        Err(holder) => Err(HolderError::Held { holder }),
+    }
+}
+
+/// Open `path` (created owner-only, never truncated), take its exclusive lock past a
+/// probe's momentary shared lock, and record this process in it. The inner `Err` is
+/// another holder's recorded identity, `None` when its record does not read.
+fn claim_lock_file(path: PathBuf) -> std::io::Result<Result<Hold, Option<HolderIdentity>>> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -351,75 +334,77 @@ pub fn claim_phase_holder(project_root: &Path, phase: PhaseId) -> Result<Hold, H
         .open(&path)?;
     match try_lock_past_probes(&file) {
         Ok(()) => {}
-        Err(TryLockError::WouldBlock) => {
-            return Err(HolderError::Held {
-                holder: live_holder(&path).ok().flatten(),
-            });
-        }
-        Err(TryLockError::Error(error)) => return Err(HolderError::Io(error)),
+        Err(TryLockError::WouldBlock) => return Ok(Err(live_holder(&path).ok().flatten())),
+        Err(TryLockError::Error(error)) => return Err(error),
     }
     write_identity_record(&file)?;
-    Ok(Hold { file, path })
+    Ok(Ok(Hold { file, path }))
 }
 
-/// The signal [`on_holder_stop_signal`] stored, 0 for none.
-static HOLDER_STOP_SIGNAL: AtomicI32 = AtomicI32::new(0);
-
-/// The holder's SIGTERM/SIGINT handler. An atomic store is async-signal-safe, and it is
-/// the only thing this does: no allocation, no lock, no I/O.
-extern "C" fn on_holder_stop_signal(signo: libc::c_int) {
-    HOLDER_STOP_SIGNAL.store(signo, Ordering::Relaxed);
+/// The per-phase runner lock (D-07): `.devflow/.runner-{padded}`.
+pub fn runner_lock_path(project_root: &Path, phase: PhaseId) -> PathBuf {
+    project_root
+        .join(".devflow")
+        .join(format!(".runner-{}", phase.padded()))
 }
 
-/// Turn SIGTERM and SIGINT into a stop flag for this process (D-18), once per process,
-/// with `SA_RESTART` and an empty mask: a foreground process `stop` signals ends at its
-/// next safe point instead of wherever the signal lands. It reads the flag through
-/// [`holder_stop_signal`].
-///
-/// No signal is blocked, because a blocked mask would be inherited by every child. A
-/// caught signal goes back to its default at exec, so the supervisors, agents and hooks a
-/// holder spawns are unaffected.
-///
-/// A supervisor process never calls this: it installs
-/// [`crate::supervisor::runtime::install_signal_pipe`], which this would replace, and
-/// claims no holder (D-17).
-///
-/// # Errors
-/// `sigaction` failed. The result of the one attempt is cached.
-pub fn install_holder_stop_handler() -> std::io::Result<()> {
-    static INSTALLED: OnceLock<Result<(), (std::io::ErrorKind, String)>> = OnceLock::new();
-    INSTALLED
-        .get_or_init(|| {
-            install_holder_handler_once().map_err(|error| (error.kind(), error.to_string()))
-        })
-        .clone()
-        .map_err(|(kind, message)| std::io::Error::new(kind, message))
+/// Why [`claim_runner_lock`] did not claim.
+#[derive(Debug)]
+pub enum RunnerLockError {
+    /// Another runner holds the phase's runner lock. `holder` is its recorded pid and
+    /// start time, or `None` when the record does not read.
+    Held { holder: Option<(u32, Option<u64>)> },
+    /// The file could not be created, locked or written.
+    Io(std::io::Error),
 }
 
-fn install_holder_handler_once() -> std::io::Result<()> {
-    for signal in [libc::SIGTERM, libc::SIGINT] {
-        // SAFETY: an all-zero sigaction is valid; the fields that matter are set below.
-        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
-        action.sa_sigaction =
-            on_holder_stop_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
-        action.sa_flags = libc::SA_RESTART;
-        // SAFETY: `action.sa_mask` is a live sigset_t.
-        unsafe { libc::sigemptyset(&raw mut action.sa_mask) };
-        // SAFETY: `action` is a fully initialized sigaction; the old action is not wanted.
-        if unsafe { libc::sigaction(signal, &raw const action, std::ptr::null_mut()) } != 0 {
-            return Err(std::io::Error::last_os_error());
+impl std::fmt::Display for RunnerLockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RunnerLockError::Held {
+                holder: Some((pid, _)),
+            } => write!(f, "the runner lock is held by another runner (pid {pid})"),
+            RunnerLockError::Held { holder: None } => write!(
+                f,
+                "the runner lock is held by another runner whose record does not read"
+            ),
+            RunnerLockError::Io(error) => write!(f, "the runner lock: {error}"),
         }
     }
-    Ok(())
 }
 
-/// The signal [`install_holder_stop_handler`]'s handler caught, if one has arrived. A
-/// later signal replaces an earlier one.
-pub fn holder_stop_signal() -> Option<i32> {
-    match HOLDER_STOP_SIGNAL.load(Ordering::Relaxed) {
-        0 => None,
-        signal => Some(signal),
+impl From<std::io::Error> for RunnerLockError {
+    fn from(error: std::io::Error) -> Self {
+        RunnerLockError::Io(error)
     }
+}
+
+/// Claim `phase`'s runner lock for this process (D-07): an exclusive lock on
+/// [`runner_lock_path`], held until the returned [`Hold`] drops, whose record names this
+/// process. `devflow runner` takes it before anything else and holds it for its whole
+/// life, so the lock alone says whether a runner is alive for the phase.
+///
+/// Same invariants as [`claim_phase_holder`]: the file is never removed, replaced or
+/// `unlock()`ed, it is created mode 0o600, and its record is advisory. The descriptor is
+/// close-on-exec, so the agent a runner spawns never keeps the lock held.
+///
+/// # Errors
+/// [`RunnerLockError::Held`] when another open holds the lock; [`RunnerLockError::Io`]
+/// when the file could not be created, locked or written.
+pub fn claim_runner_lock(project_root: &Path, phase: PhaseId) -> Result<Hold, RunnerLockError> {
+    crate::workflow::ensure_devflow_dir(&project_root.join(".devflow"))?;
+    match claim_lock_file(runner_lock_path(project_root, phase))? {
+        Ok(hold) => Ok(hold),
+        Err(holder) => Err(RunnerLockError::Held { holder }),
+    }
+}
+
+/// The signal the process's one SIGTERM/SIGINT handler
+/// ([`crate::stop::install_signal_pipe`]) caught, if one has arrived (D-18): a
+/// foreground process reads it at its next safe point. A later signal replaces an
+/// earlier one.
+pub fn holder_stop_signal() -> Option<i32> {
+    crate::stop::caught_stop_signal()
 }
 
 /// Whose lock this is: the pid and start time the holder recorded, while the
@@ -469,8 +454,8 @@ pub(crate) fn take_with_hook(
 
 /// Remove the hold temps in `dir` that a creator died leaving: a name of
 /// [`HOLD_TEMP_SUFFIX`]'s shape, unheld, whose creator pid is not a live process.
-/// Returns the paths removed. `recover --clean` (50.1-21) calls this for
-/// `.devflow/` and the gates directory.
+/// Returns the paths removed. `devflow discard` calls this for `.devflow/` and the
+/// gates directory.
 ///
 /// A temp is never a hold. Removing an unheld temp of a dead creator is safe
 /// because the hold, if it was ever published, lives on under its final name,
@@ -566,7 +551,6 @@ mod tests {
         assert_child_ran_exactly_one_passing_test, in_child_test, run_test_in_child,
         spawn_test_in_child,
     };
-    use std::os::unix::process::CommandExt;
     use std::process::{Child, Command, Stdio};
 
     /// Run `body` in a child test process of its own, with no other test
@@ -604,72 +588,6 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         command
-    }
-
-    /// Establish that fd 3 is free: anything the harness left there is moved
-    /// aside, not closed, so it stays open until this process exits.
-    fn free_fd_3() {
-        // SAFETY: fcntl and close on a descriptor number; this process runs
-        // one test (`in_own_process`), and the moved copy keeps the file open.
-        unsafe {
-            if libc::fcntl(INHERITED_FD, libc::F_GETFD) == -1 {
-                eprintln!("fd 3 was free");
-                return;
-            }
-            let moved = libc::fcntl(INHERITED_FD, libc::F_DUPFD_CLOEXEC, 64);
-            assert_ne!(moved, -1, "move fd 3 aside");
-            assert_eq!(libc::close(INHERITED_FD), 0, "close fd 3 after moving it");
-            eprintln!("fd 3 was open; moved aside to {moved}");
-        }
-    }
-
-    /// Put `file` at fd 3 with close-on-exec set. With fd 3 free, a file
-    /// opened since may already be there; otherwise the copy lands there and
-    /// the original closes, and any lock stays, since both refer to one open
-    /// file description.
-    fn place_at_fd_3(file: File) -> File {
-        if file.as_raw_fd() == INHERITED_FD {
-            return file;
-        }
-        // SAFETY: fcntl on a descriptor `file` owns; the result is a new
-        // descriptor nothing else owns, checked to be fd 3 before it is wrapped.
-        unsafe {
-            let placed = libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, INHERITED_FD);
-            assert_eq!(placed, INHERITED_FD, "fd 3 must have been free");
-            File::from_raw_fd(placed)
-        }
-    }
-
-    fn hold_at_fd_3(hold: Hold) -> Hold {
-        let Hold { file, path } = hold;
-        let hold = Hold {
-            file: place_at_fd_3(file),
-            path,
-        };
-        assert_eq!(hold.as_raw_fd(), INHERITED_FD);
-        // SAFETY: F_GETFD reads a flag of a descriptor `hold` owns.
-        let flags = unsafe { libc::fcntl(INHERITED_FD, libc::F_GETFD) };
-        assert_ne!(
-            flags & libc::FD_CLOEXEC,
-            0,
-            "the trap needs close-on-exec set on fd 3"
-        );
-        hold
-    }
-
-    /// The variant Pitfall 1 describes: `dup2` alone, which is a no-op when
-    /// the descriptor already is fd 3 and leaves close-on-exec set.
-    fn pass_to_child_naively(cmd: &mut Command, hold: &Hold) {
-        let raw = hold.as_raw_fd();
-        // SAFETY: only `dup2`, which is async-signal-safe.
-        unsafe {
-            cmd.pre_exec(move || {
-                if libc::dup2(raw, INHERITED_FD) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
     }
 
     /// The D-17 holder: one claim at a time, its record names the claimer, and the file
@@ -719,6 +637,69 @@ mod tests {
                     "a new claim rewrites the record"
                 );
                 drop(again);
+            },
+        );
+    }
+
+    /// D-07: the agent a runner spawns must not keep the runner lock, or the run would
+    /// read live after its runner died.
+    #[test]
+    fn a_runner_lock_is_not_inherited_by_a_spawned_child() {
+        in_own_process(
+            "liveness::tests::a_runner_lock_is_not_inherited_by_a_spawned_child",
+            || {
+                let dir = tempfile::tempdir().expect("create a temp dir");
+                let root = dir.path();
+                let phase = PhaseId::new(9);
+                let path = runner_lock_path(root, phase);
+                assert_eq!(path, root.join(".devflow/.runner-09"));
+
+                let hold = claim_runner_lock(root, phase).expect("claim");
+                let child = ReapOnDrop(sleep_command().spawn().expect("spawn the child"));
+                drop(hold);
+                assert_eq!(
+                    probe(&path).expect("probe"),
+                    Held::Abandoned,
+                    "child kept the runner lock after the runner dropped it"
+                );
+                drop(child);
+
+                let hold = claim_runner_lock(root, phase).expect("claim again");
+                clear_close_on_exec(hold.as_raw_fd());
+                let child = ReapOnDrop(sleep_command().spawn().expect("spawn the child"));
+                drop(hold);
+                assert_eq!(
+                    probe(&path).expect("probe"),
+                    Held::Live,
+                    "control: with close-on-exec cleared the child keeps the lock"
+                );
+                drop(child);
+            },
+        );
+    }
+
+    /// D-07: a probe that cannot read the runner lock is an error, never a free lock, so
+    /// no caller relaunches over a runner it could not see.
+    #[test]
+    fn a_runner_lock_probe_error_reads_as_an_error_not_free() {
+        in_own_process(
+            "liveness::tests::a_runner_lock_probe_error_reads_as_an_error_not_free",
+            || {
+                let dir = tempfile::tempdir().expect("create a temp dir");
+                let root = dir.path();
+                let phase = PhaseId::new(10);
+                assert_eq!(
+                    probe(&runner_lock_path(root, phase)).expect("probe a missing lock"),
+                    Held::Missing,
+                    "control: a missing lock file reads Missing"
+                );
+
+                std::fs::write(root.join(".devflow"), "a regular file").expect("plant the file");
+                let probed = probe(&runner_lock_path(root, phase));
+                assert!(
+                    probed.is_err(),
+                    "probe error read as free: a lock under a regular file read {probed:?}"
+                );
             },
         );
     }
@@ -804,7 +785,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn run_handler_child(install: bool) -> ! {
         if install {
-            install_holder_stop_handler().expect("install the handler");
+            crate::stop::install_signal_pipe().expect("install the handler");
             let bits = (1u64 << (libc::SIGTERM - 1)) | (1u64 << (libc::SIGINT - 1));
             assert_eq!(own_signal_mask("SigCgt") & bits, bits, "both are caught");
             assert_eq!(own_signal_mask("SigBlk") & bits, 0, "neither is blocked");
@@ -882,77 +863,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_inherited_liveness_lock_survives_the_launcher_when_it_is_fd_3() {
-        in_own_process(
-            "liveness::tests::an_inherited_liveness_lock_survives_the_launcher_when_it_is_fd_3",
-            || {
-                free_fd_3();
-                let dir = tempfile::tempdir().expect("create a temp dir");
-
-                let held = dir.path().join("x.live");
-                let hold = hold_at_fd_3(Hold::take(&held).expect("take a hold"));
-                let mut command = sleep_command();
-                pass_to_child(&mut command, &hold);
-                let child = ReapOnDrop(command.spawn().expect("spawn the child"));
-                drop(hold);
-                assert_eq!(
-                    probe(&held).expect("probe"),
-                    Held::Live,
-                    "the child at fd 3 must hold the lock after the parent's drop"
-                );
-                drop(child);
-                assert_eq!(
-                    probe(&held).expect("probe"),
-                    Held::Abandoned,
-                    "the lock must end with the child"
-                );
-
-                let naive = dir.path().join("naive.live");
-                let hold = hold_at_fd_3(Hold::take(&naive).expect("take a hold"));
-                let mut command = sleep_command();
-                pass_to_child_naively(&mut command, &hold);
-                let child = ReapOnDrop(command.spawn().expect("spawn the child"));
-                drop(hold);
-                assert_eq!(
-                    probe(&naive).expect("probe"),
-                    Held::Abandoned,
-                    "dup2 alone must lose the lock at exec, or the raw == 3 branch keeps nothing"
-                );
-                drop(child);
-            },
-        );
-    }
-
-    #[test]
-    fn an_inherited_liveness_lock_survives_the_launcher_when_it_is_not_fd_3() {
-        in_own_process(
-            "liveness::tests::an_inherited_liveness_lock_survives_the_launcher_when_it_is_not_fd_3",
-            || {
-                free_fd_3();
-                let dir = tempfile::tempdir().expect("create a temp dir");
-                let other = File::create(dir.path().join("other")).expect("create a file");
-                let other = place_at_fd_3(other);
-                assert_eq!(other.as_raw_fd(), INHERITED_FD);
-
-                let held = dir.path().join("x.live");
-                let hold = Hold::take(&held).expect("take a hold");
-                assert_ne!(hold.as_raw_fd(), INHERITED_FD, "fd 3 is taken");
-                let mut command = sleep_command();
-                pass_to_child(&mut command, &hold);
-                let child = ReapOnDrop(command.spawn().expect("spawn the child"));
-                drop(hold);
-                assert_eq!(
-                    probe(&held).expect("probe"),
-                    Held::Live,
-                    "the dup2 branch must keep the lock in the child"
-                );
-                drop(child);
-                assert_eq!(probe(&held).expect("probe"), Held::Abandoned);
-            },
-        );
-    }
-
     /// This process's identity as a hold records it.
     fn this_process() -> (u32, Option<u64>) {
         let pid = std::process::id();
@@ -975,33 +885,6 @@ mod tests {
 
                 drop(hold);
                 assert_eq!(probe(&path).expect("probe"), Held::Abandoned);
-            },
-        );
-    }
-
-    #[test]
-    fn unlock_on_a_duplicate_releases_the_inherited_lock() {
-        in_own_process(
-            "liveness::tests::unlock_on_a_duplicate_releases_the_inherited_lock",
-            || {
-                let dir = tempfile::tempdir().expect("create a temp dir");
-                let path = dir.path().join("x.live");
-                let hold = Hold::take(&path).expect("take a hold");
-                let mut command = sleep_command();
-                pass_to_child(&mut command, &hold);
-                let mut child = ReapOnDrop(command.spawn().expect("spawn the child"));
-                assert_eq!(probe(&path).expect("probe"), Held::Live);
-
-                hold.file.unlock().expect("unlock the parent's copy");
-                assert_eq!(
-                    probe(&path).expect("probe"),
-                    Held::Abandoned,
-                    "unlock on a duplicate must release the lock the child inherited"
-                );
-                assert!(
-                    child.0.try_wait().expect("poll the child").is_none(),
-                    "the child still runs, and no longer holds anything"
-                );
             },
         );
     }
@@ -1061,63 +944,6 @@ mod tests {
         assert_eq!(
             production_lines_containing(source, ".write_all("),
             Vec::<String>::new()
-        );
-    }
-
-    #[test]
-    fn adopting_the_inherited_descriptor_marks_it_close_on_exec_and_records_the_adopter() {
-        in_own_process(
-            "liveness::tests::adopting_the_inherited_descriptor_marks_it_close_on_exec_and_records_the_adopter",
-            || {
-                let dir = tempfile::tempdir().expect("create a temp dir");
-                let path = dir.path().join("a.live");
-                let file = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create_new(true)
-                    .open(&path)
-                    .expect("create the file");
-                file.try_lock().expect("lock the file");
-                // SAFETY: fcntl on a descriptor `file` owns; the result is owned
-                // by the adoption below.
-                let fd = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, 10) };
-                assert_ne!(fd, -1);
-                drop(file);
-                // SAFETY: F_GETFD reads a flag of the descriptor just made.
-                let before = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-                assert_eq!(
-                    before & libc::FD_CLOEXEC,
-                    0,
-                    "the fixture hands over an inheritable fd"
-                );
-
-                let hold = adopt_inherited(fd, path.clone()).expect("adopt the descriptor");
-                // SAFETY: F_GETFD reads a flag of a descriptor `hold` owns.
-                let after = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-                assert_ne!(after & libc::FD_CLOEXEC, 0, "an agent must not inherit it");
-                assert_eq!(
-                    live_holder(&path).expect("read the holder"),
-                    Some(this_process())
-                );
-
-                drop(hold);
-                assert_eq!(live_holder(&path).expect("read the holder"), None);
-                assert!(
-                    adopt_inherited(fd, path).is_err(),
-                    "a closed descriptor must be refused"
-                );
-            },
-        );
-    }
-
-    #[test]
-    fn launch_liveness_path_refuses_an_invalid_launch_id() {
-        let root = Path::new("/project/root");
-        assert_eq!(launch_liveness_path(root, "../x"), None);
-        let launch_id = crate::supervisor::new_launch_id();
-        assert_eq!(
-            launch_liveness_path(root, &launch_id),
-            Some(root.join(format!(".devflow/supervisor-{launch_id}.live")))
         );
     }
 
@@ -1191,80 +1017,6 @@ mod tests {
                 "record {record:?} must be refused, got {refused:?}"
             );
         }
-    }
-
-    /// Take a hold on `path` and return a duplicate of its descriptor that is
-    /// not close-on-exec and shares its open file description, with the shared
-    /// offset past the record, where any cursor write leaves it. The hold's
-    /// drop closes only its own copy, so the duplicate keeps the lock.
-    fn duplicate_with_an_advanced_offset(path: &Path) -> (RawFd, usize) {
-        let hold = Hold::take(path).expect("take a hold");
-        // SAFETY: fcntl and lseek on a descriptor `hold` owns and on its new
-        // duplicate, which the caller owns.
-        unsafe {
-            let duplicate = libc::fcntl(hold.as_raw_fd(), libc::F_DUPFD, 10);
-            assert_ne!(duplicate, -1);
-            let offset = libc::lseek(duplicate, 0, libc::SEEK_END);
-            assert!(offset > 0, "the shared offset must have moved");
-            (duplicate, usize::try_from(offset).expect("a small offset"))
-        }
-    }
-
-    /// The rewrite `write_identity_record` replaced.
-    fn rewrite_through_the_cursor(file: &File) {
-        use std::io::Write;
-        let (pid, start) = this_process();
-        file.set_len(0).expect("truncate");
-        let start = start.expect("a start time");
-        let mut writer = file;
-        writer
-            .write_all(format!("{pid} {start}\n").as_bytes())
-            .expect("write through the cursor");
-    }
-
-    #[test]
-    fn adopting_a_descriptor_take_wrote_through_keeps_the_record_intact() {
-        in_own_process(
-            "liveness::tests::adopting_a_descriptor_take_wrote_through_keeps_the_record_intact",
-            || {
-                let dir = tempfile::tempdir().expect("create a temp dir");
-                let (pid, start) = this_process();
-
-                let adopted = dir.path().join("a.live");
-                let (duplicate, _) = duplicate_with_an_advanced_offset(&adopted);
-                let _hold = adopt_inherited(duplicate, adopted.clone()).expect("adopt");
-                let bytes = std::fs::read(&adopted).expect("read the record");
-                assert!(
-                    !bytes.contains(&0),
-                    "the record has a NUL hole: {bytes:?}; live_holder reads {:?}",
-                    live_holder(&adopted)
-                );
-                assert!(bytes.starts_with(format!("{pid} ").as_bytes()));
-                assert_eq!(
-                    live_holder(&adopted).expect("read the holder"),
-                    Some((pid, start))
-                );
-
-                let cursor = dir.path().join("b.live");
-                let (duplicate, offset) = duplicate_with_an_advanced_offset(&cursor);
-                // SAFETY: the caller owns the duplicate, and nothing else uses it.
-                let file = unsafe { File::from_raw_fd(duplicate) };
-                rewrite_through_the_cursor(&file);
-                let bytes = std::fs::read(&cursor).expect("read the record");
-                assert_eq!(
-                    bytes.iter().take_while(|&&byte| byte == 0).count(),
-                    offset,
-                    "a cursor write lands past a hole as long as the offset: {bytes:?}"
-                );
-                let unreadable = live_holder(&cursor);
-                assert!(
-                    unreadable
-                        .as_ref()
-                        .is_err_and(|error| error.kind() == std::io::ErrorKind::InvalidData),
-                    "a live holder would go unnamed, got {unreadable:?}"
-                );
-            },
-        );
     }
 
     /// The sweep a remover runs: orphaned temps, then every `*.live` that
@@ -1516,74 +1268,6 @@ mod tests {
         assert!(
             live_holder(dir.path()).is_err(),
             "a held file with an unreadable record must not read as unheld"
-        );
-    }
-
-    #[test]
-    fn a_handoff_that_cannot_place_the_descriptor_fails_the_spawn() {
-        in_own_process(
-            "liveness::tests::a_handoff_that_cannot_place_the_descriptor_fails_the_spawn",
-            || {
-                free_fd_3();
-                let dir = tempfile::tempdir().expect("create a temp dir");
-                let other = File::create(dir.path().join("other")).expect("create a file");
-                let _other = place_at_fd_3(other);
-                let hold = Hold::take(&dir.path().join("x.live")).expect("take a hold");
-                assert_ne!(hold.as_raw_fd(), INHERITED_FD);
-
-                let mut limit = libc::rlimit {
-                    rlim_cur: 0,
-                    rlim_max: 0,
-                };
-                // SAFETY: getrlimit writes only into the struct it is given.
-                assert_eq!(
-                    unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
-                    0
-                );
-                limit.rlim_cur = 3;
-                let mut command = sleep_command();
-                // SAFETY: only `setrlimit`, in the child, on its stack-local
-                // copy. Closures run in order, so `dup2(raw, 3)` below then
-                // fails EBADF: fd 3 is outside the allowed range.
-                unsafe {
-                    command.pre_exec(move || {
-                        if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) == -1 {
-                            return Err(std::io::Error::last_os_error());
-                        }
-                        Ok(())
-                    });
-                }
-                pass_to_child(&mut command, &hold);
-
-                let spawned = command.spawn().map(ReapOnDrop);
-                assert_eq!(
-                    spawned
-                        .as_ref()
-                        .err()
-                        .and_then(std::io::Error::raw_os_error),
-                    Some(libc::EBADF),
-                    "a child that does not hold the lock must not start"
-                );
-            },
-        );
-    }
-
-    #[test]
-    fn adopting_a_close_on_exec_descriptor_keeps_it_close_on_exec() {
-        in_own_process(
-            "liveness::tests::adopting_a_close_on_exec_descriptor_keeps_it_close_on_exec",
-            || {
-                let dir = tempfile::tempdir().expect("create a temp dir");
-                let path = dir.path().join("a.live");
-                let hold = Hold::take(&path).expect("take a hold");
-                let Hold { file, path } = hold;
-                let fd = std::os::fd::IntoRawFd::into_raw_fd(file);
-
-                let _adopted = adopt_inherited(fd, path).expect("adopt the descriptor");
-                // SAFETY: F_GETFD reads a flag of a descriptor `_adopted` owns.
-                let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-                assert_ne!(flags & libc::FD_CLOEXEC, 0);
-            },
         );
     }
 

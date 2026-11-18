@@ -23,20 +23,30 @@ devflow start --phase 3 --agent claude --mode auto
 ```
 
 This creates a feature branch (in its own git worktree by default), launches
-the agent, and persists that phase's progress to
-`.devflow/state-03.json` (state is per-phase, not a single shared file).
+the run as a systemd user unit named from the project and the phase, and
+persists that phase's progress to `.devflow/state-03.json` (state is
+per-phase, not a single shared file). `start` returns once the unit is ready;
+the run keeps going after your shell exits. With lingering off it ends when
+you log out (`loginctl enable-linger` turns lingering on), and a host without
+a systemd user manager cannot launch a run.
 
-## Check Status
+## Watch and Stop
+
+From any shell:
 
 ```bash
 devflow status
+devflow logs --phase 3 -f      # follow the agent's output
+devflow stop --phase 3         # stop the run's unit
+devflow resume --phase 3       # continue a stopped run as a new unit
 ```
 
-## Shipping
+## Finishing
 
-Shipping is not a separate command you run — Ship is the pipeline's final
-stage, driven automatically once Validate passes. It always pauses at a
-human gate before merging:
+A passing Validate ends the run. DevFlow keeps the worktree and the
+`feature/phase-NN` branch and does not merge, tag or open a pull request:
+integrating the branch is your step. In `--mode supervise` the run pauses at
+a human gate before it finishes:
 
 ```bash
 devflow gate list
@@ -50,8 +60,9 @@ for the full gate-answering reference.
 
 - **Rust** stable (build from source)
 - **git** 2.30+
-- **gh CLI** 2.0+ (for PR creation)
+- **gh CLI** 2.0+ (`devflow doctor` checks for it; no DevFlow command runs it)
 - An installed AI agent (Claude Code, Codex, or OpenCode)
+- A systemd user manager (`systemctl --user`), which runs each run's unit
 
 Verify your setup:
 
