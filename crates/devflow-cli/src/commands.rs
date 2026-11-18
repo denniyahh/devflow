@@ -1497,13 +1497,20 @@ fn runner_lock_phases_not_free(project_root: &Path) -> Vec<PhaseId> {
 }
 
 /// Delete the branches merged into the trunk. A merged branch that a kept worktree (or
-/// any other checkout) still has checked out is skipped, not left to git to refuse.
+/// any other checkout) still has checked out is skipped, not left to git to refuse, and
+/// so is the derived branch of every phase whose state file is still on disk after the
+/// per-phase pass: a kept run, or a state that does not load.
 fn sweep_merged_branches(project_root: &Path, git: &GitFlow) -> Result<(), CliError> {
-    let checked_out: Vec<String> = worktree::list(project_root)?
+    let mut keep: Vec<String> = worktree::list(project_root)?
         .into_iter()
         .filter_map(|wt| wt.branch)
         .collect();
-    match git.cleanup_merged_keeping(&checked_out) {
+    keep.extend(
+        workflow::state_file_phases(project_root)
+            .into_iter()
+            .map(phase_branch),
+    );
+    match git.cleanup_merged_keeping(&keep) {
         Ok(merged) => {
             for branch in merged {
                 println!("deleted merged branch {branch}");
@@ -1512,6 +1519,11 @@ fn sweep_merged_branches(project_root: &Path, git: &GitFlow) -> Result<(), CliEr
         Err(err) => println!("warning: could not prune merged branches: {err}"),
     }
     Ok(())
+}
+
+/// The derived `feature/phase-NN` of `phase`.
+fn phase_branch(phase: PhaseId) -> String {
+    format!("{FEATURE_PREFIX}phase-{padded}", padded = phase.padded())
 }
 
 /// A `.worktrees/` entry no phase owns: removed as before 52.1 D-09.5, through
@@ -2528,7 +2540,7 @@ fn discard_items(
     git: &GitFlow,
     base: String,
 ) -> Result<DiscardItems, CliError> {
-    let branch = format!("{FEATURE_PREFIX}phase-{padded}", padded = phase.padded());
+    let branch = phase_branch(phase);
     let worktrees = worktree::list(project_root).map_err(|err| {
         CliError::Message(format!(
             "discard refused: this repository's worktrees could not be listed ({err}); \
