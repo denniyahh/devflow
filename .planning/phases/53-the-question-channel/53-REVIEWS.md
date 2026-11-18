@@ -69,3 +69,10 @@ Per Tier B, CRITICAL and MAJOR findings are folded once; MINOR findings are back
 
 - pi F-12 (53-03 edits prompt.rs/agent_result.rs doc links outside its files_modified), pi F-13 (53-10 misses `launch_stage_inner_resets_checkpoint_resumes_counter`),
   pi S-3 (hermes test deletion justification), pi S-4 (unmeasured 300 s runtime).
+
+## Hand-run stage (dogfooding exception)
+
+The replan from this review ran by hand in an agent session on 2026-11-18 (`/gsd-plan-phase 53 --reviews`), not under DevFlow,
+because DevFlow's Plan stage has no reviews mode (project rule). Planner pass, checker iteration 1 (1 blocker, 5 warnings; the
+blocker settled by operator answer "(a)": hold the live codex proof past the 900 s cap), one revision, checker iteration 2 passed.
+Result: 14 plans in 8 waves, committed d7abbe0. Not run: the plan:post MemPalace step hook (no MemPalace write was asked for).
