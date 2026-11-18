@@ -684,41 +684,80 @@ const TEST_RUNNER_READY_WAIT: Duration = Duration::from_secs(30);
 /// The unit name, the executable or the argv could not be built, `systemd-run` could
 /// not run, it did not return within [`LAUNCH_CALL_BOUND`] (killed; the unit's state is
 /// then unknown), or it exited non-zero: text naming the unit and carrying
-/// systemd-run's stderr.
+/// systemd-run's stderr. The timeout is [`LaunchError::Unknown`], every other failure
+/// [`LaunchError::Failed`].
 #[cfg(not(test))]
-pub(crate) fn launch_runner_unit(project_root: &Path, phase: PhaseId) -> Result<String, String> {
-    let unit = unit_name(project_root, phase)
-        .map_err(|error| format!("phase {phase}'s unit name could not be derived ({error})"))?;
+pub(crate) fn launch_runner_unit(
+    project_root: &Path,
+    phase: PhaseId,
+) -> Result<String, LaunchError> {
+    let unit = unit_name(project_root, phase).map_err(|error| {
+        LaunchError::Failed(format!(
+            "phase {phase}'s unit name could not be derived ({error})"
+        ))
+    })?;
     let exe = std::env::current_exe().map_err(|error| {
-        format!("unit {unit}: the devflow executable could not be resolved ({error})")
+        LaunchError::Failed(format!(
+            "unit {unit}: the devflow executable could not be resolved ({error})"
+        ))
     })?;
     let names = passable_env_names(std::env::vars_os().map(|(name, _)| name));
     let argv = runner_unit_argv(project_root, phase, &exe, &names).map_err(|error| {
-        format!("unit {unit}: the systemd-run argv could not be built ({error})")
+        LaunchError::Failed(format!(
+            "unit {unit}: the systemd-run argv could not be built ({error})"
+        ))
     })?;
     let mut command = tool("systemd-run");
     command.args(argv);
     let output = run_bounded(command, LAUNCH_CALL_BOUND).map_err(|error| {
         if error.kind() == std::io::ErrorKind::TimedOut {
-            launch_timeout_text(&unit, &error.to_string())
+            launch_timeout_error(&unit, &error.to_string())
         } else {
-            format!("unit {unit}: systemd-run could not run ({error})")
+            LaunchError::Failed(format!("unit {unit}: systemd-run could not run ({error})"))
         }
     })?;
     if output.status.success() {
         return Ok(unit);
     }
-    Err(format!(
+    Err(LaunchError::Failed(format!(
         "systemd-run could not start unit {unit} ({}); systemd-run: {}",
         output.status,
         String::from_utf8_lossy(&output.stderr).trim()
-    ))
+    )))
 }
 
 /// What a launch whose `systemd-run` outlived [`LAUNCH_CALL_BOUND`] says: `error` and
 /// that whether `unit` started is unknown.
-fn launch_timeout_text(unit: &str, error: &str) -> String {
-    format!("unit {unit}: {error}; whether the unit started is unknown, see `devflow status`")
+fn launch_timeout_error(unit: &str, error: &str) -> LaunchError {
+    LaunchError::Unknown {
+        unit: unit.to_string(),
+        why: format!(
+            "unit {unit}: {error}; whether the unit started is unknown, see `devflow status`"
+        ),
+    }
+}
+
+/// Why [`launch_runner_unit`] did not report a started unit (999.244).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LaunchError {
+    /// `systemd-run` outlived [`LAUNCH_CALL_BOUND`] and was killed: the manager may have
+    /// accepted the unit, so its runner may be live.
+    Unknown {
+        /// The phase's unit.
+        unit: String,
+        /// The text naming the unit and the timeout.
+        why: String,
+    },
+    /// The unit was not started: text naming what failed.
+    Failed(String),
+}
+
+impl std::fmt::Display for LaunchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unknown { why, .. } | Self::Failed(why) => f.write_str(why),
+        }
+    }
 }
 
 /// The variable the cfg(test) [`launch_runner_unit`] passes its runner child the
@@ -746,27 +785,34 @@ pub(crate) const RUNNER_HARNESS_ENTRY: &str = "service::tests::runner_harness::e
 /// The child could not be spawned, it exited before it held the lock, or it did not
 /// hold it within [`TEST_RUNNER_READY_WAIT`].
 #[cfg(test)]
-pub(crate) fn launch_runner_unit(project_root: &Path, phase: PhaseId) -> Result<String, String> {
+pub(crate) fn launch_runner_unit(
+    project_root: &Path,
+    phase: PhaseId,
+) -> Result<String, LaunchError> {
     use std::os::unix::process::CommandExt as _;
-    let unit = unit_name(project_root, phase)
-        .map_err(|error| format!("phase {phase}'s unit name could not be derived ({error})"))?;
-    let timed_out = |unit: &str| launch_timeout_text(unit, "systemd-run (test double) timed out");
+    let unit = unit_name(project_root, phase).map_err(|error| {
+        LaunchError::Failed(format!(
+            "phase {phase}'s unit name could not be derived ({error})"
+        ))
+    })?;
+    let timed_out = |unit: &str| launch_timeout_error(unit, "systemd-run (test double) timed out");
     match double::launch_end() {
         double::LaunchEnd::TimedOutLeaving(state) => {
             double::set_unit_state(state);
             return Err(timed_out(&unit));
         }
         double::LaunchEnd::Failed => {
-            return Err(format!(
+            return Err(LaunchError::Failed(format!(
                 "systemd-run could not start unit {unit} (test double); systemd-run: refused"
-            ));
+            )));
         }
         double::LaunchEnd::Started | double::LaunchEnd::TimedOutAfterStart => {}
     }
     let root = project_root
         .canonicalize()
-        .map_err(|error| format!("unit {unit}: {error}"))?;
-    let exe = std::env::current_exe().map_err(|error| format!("unit {unit}: {error}"))?;
+        .map_err(|error| LaunchError::Failed(format!("unit {unit}: {error}")))?;
+    let exe = std::env::current_exe()
+        .map_err(|error| LaunchError::Failed(format!("unit {unit}: {error}")))?;
     let args = serde_json::json!([root, phase.to_string()]).to_string();
     let mut command = Command::new(exe);
     command
@@ -793,9 +839,11 @@ pub(crate) fn launch_runner_unit(project_root: &Path, phase: PhaseId) -> Result<
             Ok(())
         });
     }
-    let child = command
-        .spawn()
-        .map_err(|error| format!("unit {unit}: the runner child could not start ({error})"))?;
+    let child = command.spawn().map_err(|error| {
+        LaunchError::Failed(format!(
+            "unit {unit}: the runner child could not start ({error})"
+        ))
+    })?;
     let pid = child.id();
     double::record_launch(&unit, child);
     let lock = devflow_core::liveness::runner_lock_path(&root, phase);
@@ -812,15 +860,15 @@ pub(crate) fn launch_runner_unit(project_root: &Path, phase: PhaseId) -> Result<
             return Ok(unit);
         }
         if !double::runner_running(pid) {
-            return Err(format!(
+            return Err(LaunchError::Failed(format!(
                 "unit {unit}: the runner exited before it held its runner lock"
-            ));
+            )));
         }
         if Instant::now() >= deadline {
-            return Err(format!(
+            return Err(LaunchError::Failed(format!(
                 "unit {unit}: the runner did not hold its runner lock within {} s",
                 TEST_RUNNER_READY_WAIT.as_secs()
-            ));
+            )));
         }
         std::thread::sleep(BOUNDED_CALL_POLL);
     }
