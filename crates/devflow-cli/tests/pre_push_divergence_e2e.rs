@@ -29,14 +29,21 @@ const MANIFEST: &str = ".workspace-divergence";
 const DIVERGENCE_SCRIPT: &str = "scripts/check-workspace-divergence.sh";
 /// A script the workspace branch adds, whose committed mode the check reads.
 const ADDED_SCRIPT: &str = "scripts/x.sh";
+/// The host check script the hook runs, as `scripts/check.sh service`, after
+/// the container gate.
+const CHECK_SCRIPT: &str = "scripts/check.sh";
 /// The scripts `develop` carries in the scratch repository. The hook runs the
-/// container script from the working directory as its last step.
-const BASE_SCRIPTS: [&str; 3] = [
+/// container script and then the host service target from the working
+/// directory as its last steps.
+const BASE_SCRIPTS: [&str; 4] = [
     "scripts/cut-pr-branch.sh",
     DIVERGENCE_SCRIPT,
     "scripts/check-in-container.sh",
+    CHECK_SCRIPT,
 ];
 const PASSING_STUB: &str = "#!/bin/sh\nexit 0\n";
+/// A check script that names its arguments on stderr and fails.
+const FAILING_CHECK_STUB: &str = "#!/bin/sh\necho \"check.sh stub failed: $*\" >&2\nexit 1\n";
 /// The two modes git records for a regular file.
 const EXECUTABLE: &str = "100755";
 const NOT_EXECUTABLE: &str = "100644";
@@ -107,7 +114,7 @@ impl Fixture {
         fixture
     }
 
-    /// Commits `develop`'s base: a README and the three scripts, each
+    /// Commits `develop`'s base: a README and the four scripts, each
     /// committed executable, then points `origin/develop` at it.
     fn commit_base(&self) {
         self.write("README.md", "base\n");
@@ -118,6 +125,7 @@ impl Fixture {
         );
         self.add_executable(DIVERGENCE_SCRIPT, &real_script(DIVERGENCE_SCRIPT));
         self.add_executable("scripts/check-in-container.sh", PASSING_STUB);
+        self.add_executable(CHECK_SCRIPT, PASSING_STUB);
         self.git(&["commit", "-q", "-m", "chore: base"]);
 
         let not_executable: Vec<&str> = BASE_SCRIPTS
@@ -458,6 +466,36 @@ fn a_pushed_commit_is_judged_by_its_own_manifest_and_built_in_list() {
     assert!(
         String::from_utf8_lossy(&out.stdout).contains(EVERY_DIFFERENCE_DECLARED),
         "the check must have run and passed, not been skipped: {}",
+        describe(&out)
+    );
+}
+
+#[test]
+fn a_failing_service_target_refuses_the_push() {
+    let fixture = Fixture::new();
+    fixture.git(&["checkout", "-q", "-b", "feature/y", "develop"]);
+    fixture.write("notes.txt", "a new file\n");
+    fixture.git(&["add", "--", "notes.txt"]);
+    let sha = fixture.commit("feat: a new file");
+    // The push a_clean_pr_branch_pushed_from_a_workspace_checkout_passes
+    // accepts, with only the checkout's host check script now failing.
+    write_executable(&fixture.repo().join(CHECK_SCRIPT), FAILING_CHECK_STUB);
+
+    let out = fixture.push(&first_push_of(FEATURE_REF, &sha));
+
+    assert!(
+        !out.status.success(),
+        "a failing `scripts/check.sh service` must refuse the push: {}",
+        describe(&out)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("pre-push: scripts/check.sh service"),
+        "the hook must announce the service target: {}",
+        describe(&out)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("check.sh stub failed: service"),
+        "the hook must run `scripts/check.sh service` itself: {}",
         describe(&out)
     );
 }

@@ -59,7 +59,7 @@ replies (Telegram and similar) are a later milestone (REMOTE-01/02 under `REQUIR
 |---|---|---|---|---|
 | 52 | Subtract and Stabilize | CUT-01, CUT-02, CUT-03, CUT-04, GATE-01, GATE-02, GATE-03, GATE-04, OPS-01, OPS-02, OPS-03, OPS-04 | — (Phase 51, v3.0.0, merged) | Executed — verification stale |
 | 52.1 | Stabilize for Dogfooding (INSERTED) | backlog 999.221, 999.222, 999.223, 999.232, 999.224, 999.219, 999.229, 999.230, 999.231, 999.167 (no REQ IDs; plans bind to D-01..D-27) | 52 | Complete    |
-| 52.2 | Foreground Runner (INSERTED) | none (carries 52.1's D-11, D-09.1, D-09.5, D-20, D-24, D-26, D-27, D-08, D-15) | 52.1 | Not started |
+| 52.2 | Foreground Runner (INSERTED) | none (carries 52.1's D-11, D-09.1, D-09.5, D-20, D-24, D-26, D-27, D-08, D-15) | 52.1 | Complete    |
 | 53 | The Question Channel | ASK-01, ASK-02, ASK-03, ASK-04, ASK-05 | 52.2 (and through it 52.1 and 52 — the stage set must be final) | Not started |
 | 54 | Decision Triage | TRIAGE-01, TRIAGE-02, TRIAGE-03, TRIAGE-04 | 53 (its recorded questions are the bake-off corpus) | Not started |
 | 55 | Failover Generalized | FAIL-01, FAIL-02, FAIL-03, FAIL-04, FAIL-05, FAIL-06 | 52 (independent of 53-54; sequenced last) | Not started |
@@ -208,74 +208,74 @@ D-08 and D-15 in `52.1-CONTEXT.md`. Plan 08 (D-21, D-25, D-09.3: an exit for an 
 supervisor) has no object once the supervisor is gone; 999.223, which plan 08 also carried, closes with the
 supervisor's removal. Also owned here: 999.237, `discard` and `start` refusing over a live run. Evidence and spike results: `.planning/audits/2026-11-15-new-direction-brief.md`.
 **Depends on:** Phase 52.1
-**Plans:** 0/26 plans executed
+**Plans:** 26/26 plans complete
 
 Plans:
 **Wave 1**
-- [ ] 52.2-01-PLAN.md
-- [ ] 52.2-20-PLAN.md
+- [x] 52.2-01-PLAN.md
+- [x] 52.2-20-PLAN.md
 
 **Wave 2** *(blocked on Wave 1 completion)*
-- [ ] 52.2-02-PLAN.md
-- [ ] 52.2-03-PLAN.md
-- [ ] 52.2-21-PLAN.md
+- [x] 52.2-02-PLAN.md
+- [x] 52.2-03-PLAN.md
+- [x] 52.2-21-PLAN.md
 
 **Wave 3** *(blocked on Wave 2 completion)*
-- [ ] 52.2-04-PLAN.md
-- [ ] 52.2-05-PLAN.md
+- [x] 52.2-04-PLAN.md
+- [x] 52.2-05-PLAN.md
 
 **Wave 4** *(blocked on Wave 3 completion)*
-- [ ] 52.2-06-PLAN.md
+- [x] 52.2-06-PLAN.md
 
 **Wave 5** *(blocked on Wave 4 completion)*
-- [ ] 52.2-07-PLAN.md
-- [ ] 52.2-08-PLAN.md
-- [ ] 52.2-22-PLAN.md
+- [x] 52.2-07-PLAN.md
+- [x] 52.2-08-PLAN.md
+- [x] 52.2-22-PLAN.md
 
 **Wave 6** *(blocked on Wave 5 completion)*
-- [ ] 52.2-09-PLAN.md
+- [x] 52.2-09-PLAN.md
 
 **Wave 7** *(blocked on Wave 6 completion)*
-- [ ] 52.2-10-PLAN.md
+- [x] 52.2-10-PLAN.md
 
 **Wave 8** *(blocked on Wave 7 completion)*
-- [ ] 52.2-11-PLAN.md
+- [x] 52.2-11-PLAN.md
 
 **Wave 9** *(blocked on Wave 8 completion)*
-- [ ] 52.2-26-PLAN.md
+- [x] 52.2-26-PLAN.md
 
 **Wave 10** *(blocked on Wave 9 completion)*
-- [ ] 52.2-12-PLAN.md
+- [x] 52.2-12-PLAN.md
 
 **Wave 11** *(blocked on Wave 10 completion)*
-- [ ] 52.2-23-PLAN.md
+- [x] 52.2-23-PLAN.md
 
 **Wave 12** *(blocked on Wave 11 completion)*
-- [ ] 52.2-25-PLAN.md
+- [x] 52.2-25-PLAN.md
 
 **Wave 13** *(blocked on Wave 12 completion)*
-- [ ] 52.2-24-PLAN.md
+- [x] 52.2-24-PLAN.md
 
 **Wave 14** *(blocked on Wave 13 completion)*
-- [ ] 52.2-13-PLAN.md
+- [x] 52.2-13-PLAN.md
 
 **Wave 15** *(blocked on Wave 14 completion)*
-- [ ] 52.2-14-PLAN.md
+- [x] 52.2-14-PLAN.md
 
 **Wave 16** *(blocked on Wave 15 completion)*
-- [ ] 52.2-15-PLAN.md
+- [x] 52.2-15-PLAN.md
 
 **Wave 17** *(blocked on Wave 16 completion)*
-- [ ] 52.2-16-PLAN.md
+- [x] 52.2-16-PLAN.md
 
 **Wave 18** *(blocked on Wave 17 completion)*
-- [ ] 52.2-17-PLAN.md
+- [x] 52.2-17-PLAN.md
 
 **Wave 19** *(blocked on Wave 18 completion)*
-- [ ] 52.2-18-PLAN.md
+- [x] 52.2-18-PLAN.md
 
 **Wave 20** *(blocked on Wave 19 completion)*
-- [ ] 52.2-19-PLAN.md
+- [x] 52.2-19-PLAN.md
 
 ### Phase 53: The Question Channel
 
@@ -556,7 +556,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 51 | 13/13 | Complete | 2026-11-08 |
 | 52 | 33/33 | Executed — verification stale | 2026-11-11 |
 | 52.1 | 7/7 | Executed — closed at plan 07 (operator, 2026-11-15) | 2026-11-15 |
-| 52.2 | 0/26 | Planned     | — |
+| 52.2 | 26/26 | In Progress | — |
 | 53 | 0/? | Not started | — |
 | 54 | 0/? | Not started | — |
 | 55 | 0/? | Not started | — |
@@ -786,6 +786,143 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
+
+### Phase 999.247: The Fake Service Manager Never Reports `active`, and Its Launch Can Take a Stale Lock as Ready (BACKLOG)
+
+**Found:** 2026-11-18, PR #239 external review X7 (codex, agy), confirmed against the source.
+**Defect:** the fake `systemctl` in `crates/devflow-cli/tests/common/mod.rs` reads a unit `inactive`, `activating`,
+`deactivating` or (since the X2 fix) `failed`, never `active`, so no e2e test drives the `active` arm of
+`runner_liveness` through the binary. The fake `systemd-run` exits 0 once any `.devflow/.runner-*` record's first field
+equals its child's pid, so a stale record naming a reused pid could pass as readiness.
+**Not established:** that any current test passes because of either gap; not reproduced.
+**Fix shape (not decided):** add a `U.active` marker (or read `active` while the recorded pid lives), and match the
+runner lock for the launched phase only, checking the lock is held, not just its record. **Owner:** the next fix branch.
+
+### Phase 999.246: `stop` Reloads the State Without the Phase Holder, So a Concurrent `resume` Can Make It Report "crashed" (BACKLOG)
+
+**Found:** 2026-11-18, PR #239 external review X5 (codex), confirmed against the source.
+**Defect:** `stop` calls `stop_unit` and then `stop_outcome(load_state)` without holding the phase's foreground holder
+between them (`crates/devflow-cli/src/commands.rs`, stop path), so a `resume` that starts a new runner in that window
+can be read as the stopped run and reported "crashed".
+**Not established:** not reproduced; needs a `resume` to land between the unit stop and the reload.
+**Fix shape (not decided):** hold the phase holder across `stop_unit` and the reload, as `discard` and `cleanup` do, or
+compare the reloaded state's run identity with the one read before the stop. **Owner:** the next fix branch.
+
+### Phase 999.245: A Timed-Out Launch Whose Unit Reads Not Live Clears a Run That May Have Finished a Stage (BACKLOG)
+
+**Found:** 2026-11-18, PR #239 external review X3 (codex), confirmed against the source.
+**Defect:** 999.244's `TimedOutLaunch::NotLive` arm (`crates/devflow-cli/src/commands.rs`, `clear_after_failed_launch`)
+clears the state after a timed-out launch without checking that the run never ran. A runner that finished a short stage
+and exited inside the 60 s launch bound (`TIMEOUT_START` 30 s + `SYSTEMCTL_CALL_BOUND` 30 s) would lose its recorded
+progress.
+**Not established:** needs a stage to finish in under 60 s while `systemd-run` is still waiting; not reproduced.
+**Fix shape (not decided):** on that arm, clear only when the state is unchanged from what `start` wrote (no stage
+progress, no history), else keep it and name `devflow status` and `discard`. **Owner:** the next fix branch.
+
+### Phase 999.244: A Timed-Out `systemd-run` Makes `start` Clear the State of a Runner That May Be Live (RESOLVED 2026-11-18 — 517854b, 917af52)
+
+**Found:** 2026-11-18, PR #239 (Phase 52.2 close-out), Graphify review P2 on 307db0f, confirmed against the source.
+**Defect:** since WR-06 (8c9ee28) bounds the unit launch with `LAUNCH_CALL_BOUND`, `launch_runner_unit` can return a timeout
+whose text says "whether the unit started is unknown". `start`'s launch-error arm (`crates/devflow-cli/src/commands.rs`, after
+`launch_runner_unit`) still calls `workflow::clear_state` and prints "was not launched". If the manager accepted the unit, the
+runner (which takes its lock and sends READY=1 before `workflow::load_state`) can find no state, or lose its later writes.
+**Not established:** how often `systemd-run` exceeds the bound after acceptance; not reproduced.
+**Fix shape (not decided):** on the timeout arm, keep the state, release the holder, and read `runner_liveness` once: live → report
+the run as started; not live → clear as today; unknown → keep the state and name `devflow status` and `discard`. Same review for
+`resume`'s launch-error arm. **Owner:** decided by the operator at PR #239 (fix before merge, or the next fix branch).
+**Resolution (operator: fix before merging PR #239):** `launch_runner_unit` returns a typed `LaunchError` (`Unknown` on the
+timeout, `Failed` otherwise). On `Unknown`, `start` and `resume` read `runner_liveness` once under the phase holder, which the
+runner never takes: a held runner lock reports the run started plus a note; an `inactive`/`failed` unit clears the state
+(`start`) or re-marks it stopped (`resume`) as before; a unit still activating or stopping, or a read error, keeps the state
+and names `devflow status` and `devflow discard --phase N`, exit non-zero. RED 517854b (five of nine new tests failed on the
+old code), GREEN 917af52. `devflow status` takes no `--phase`, so the message names it bare. Still not reproduced against a
+real `systemd-run` that exceeds the bound: the timeout is simulated by the service double.
+
+### Phase 999.243: A Stale, Empty Worktree `index.lock` Blocks `git add` During Phase Work (BACKLOG)
+
+**Found:** 2026-11-17, Phase 52.2 (52.2-15's executor once; the review-fix pass twice).
+**Defect:** a 0-byte `.git/worktrees/phase-52.2/index.lock` appeared during agent edits and stayed with no git process
+holding it (about 80 seconds in the first case), so `git add` failed until it was deleted by hand.
+**Not established:** what creates it. Guesses, unverified: the operator's graphify auto-refresh post-commit hook, or an
+editor/LSP git integration racing the agent's commit.
+**Bypass used:** the agent deleted the lock after confirming no git process ran (recorded in 52.2-15-SUMMARY and the
+review-fix report). **Fix shape (not decided):** reproduce with `inotifywait` on the lock path during a commit to find the
+writer, then fix that writer. **Owner:** a fix branch, or the hooks research after 52.1.
+
+### Phase 999.242: `service_e2e` Fails Intermittently: a Stopped Unit Reads `failed` (BACKLOG)
+
+**Found:** 2026-11-17, Phase 52.2 close-out, during `scripts/check.sh service` after the review fixes.
+**Defect:** `service_e2e::stop_on_a_live_unit_records_stopped` intermittently sees the unit `failed` instead of `inactive`
+after `stop` (`service_e2e.rs:855`, "the unit is not inactive after stop"). Once,
+`discard_waits_for_a_straggler_in_a_deactivating_unit` failed in the same suite (its failure text was not kept); alone it
+passed 3/3.
+**Evidence:** whole-suite runs (`cargo nextest run -p devflow --test service_e2e --run-ignored only --retries 0`): at
+494ee11 (before the review fixes) 5 of 6 passed, the failure being this test; at bf0baca (after them) 8 of 10 passed.
+So it predates the fixes; 16 runs cannot rule out a change in rate.
+**Not established:** why the runner unit ends `failed`, e.g. the runner's exit status on SIGTERM racing
+`SuccessExitStatus`, or the stop landing before the runner installs its handler.
+**Fix shape (not decided):** record the unit's `Result`/`ExecMainStatus` in the assertion message, reproduce under a
+repeat loop, then fix the exit-status path or the unit's `SuccessExitStatus`. **Owner:** the next fix branch, before
+dogfooding relies on `stop`.
+**Suspected cause (PR #239 external review X4, pi; not reproduced):** the test reads `ActiveState` once right after
+`stop` (`service_e2e.rs:855`), and a unit can sit `failed` before `--collect` unloads it (pi measured about 120 ms on
+systemd 262, the window X2 is about), so the assertion races the collection. If so, the fix is in the test: wait for
+`inactive` or gone, and assert the unit's `Result` separately.
+
+### Phase 999.241: `start` Should Warn or Refuse Up Front When GSD's Derived Files Are Not Ignored (BACKLOG)
+
+**Found:** 2026-11-17, Phase 52.2 plan 52.2-19, from 999.238 (enhancement, not a defect in shipped behaviour).
+**Gap:** a project that does not ignore GSD's derived files (`.planning/state.json`, `.planning/milestone.lock`) runs
+through Plan and Code and only then stops at Validate, where the clean-tree rule counts no pass and each approve loops
+back into Validate. **Evidence:** 52.2-PROOF-RUN.md attempt 1, gate text "[never-silent] the tree has uncommitted changes
+(.planning/state.json); a Validate pass counts only on a clean tree. No Validate pass counts on this commit."
+**Fix shape (not decided):** `devflow start` and `start --dry-run` check `git check-ignore` for each derived path on the
+base and warn or refuse before launching, naming the `.gitignore` lines to add. **Owner:** a later phase.
+
+### Phase 999.240: The Post-Commit Stale-State Marker Leaves the Phase Worktree Dirty, So an Installed Build Reads `dirty` (BACKLOG)
+
+**Found:** 2026-11-17, Phase 52.2 plan 52.2-19 Task 1, before the install.
+**Defect:** `scripts/hooks/post-commit` rewrites the tracked `.planning/user/errors/state-stale.json` after a SUMMARY
+commit and leaves the change uncommitted. `crates/devflow-cli/build.rs` sets `DEVFLOW_BUILD_DIRTY` from the whole
+`git status --porcelain`, `.planning/` included, so `cargo install --path crates/devflow-cli` from the phase worktree
+prints `(<sha>, dirty)` and the plan's installed-head gate refuses it, while the same gate excludes `.planning/` from its
+own source-change check.
+**Evidence:** `git diff` of the marker (`stale_since_commit` 24ae442 -> 3aec579); 52.2-PROOF-RUN.md, Task 1.
+**Bypass used:** built from a clean detached checkout of the same commit (`git worktree add --detach`).
+**Not established:** whether the marker is meant to be committed by the executor (earlier plans did, as
+`chore(...): refresh the stale-state marker`).
+**Fix shape (not decided):** either the hook commits or ignores its marker, or build.rs's dirty flag excludes `.planning/`
+as the proof gate does. **Owner:** Phase 52.2 close-out or the next fix branch.
+
+### Phase 999.239: The Runner's Stop Reason Still Names the Removed Supervisor (BACKLOG)
+
+**Found:** 2026-11-17, Phase 52.2 plan 52.2-19 Task 1, by `devflow stop --phase 1` on the proof fixture.
+**Defect:** with no supervisor left (52.2), `stop` prints `stopped through the supervisor during advance` and the
+runner writes `{"event":"advance_stopped",...,"source":"supervisor"}`. Source: `pipeline_launch.rs`
+`ADVANCE_STOP_REASON` and the `"supervisor"` source label beside it.
+**Not established:** whether other stop paths carry the same stale label.
+**Fix shape:** name the runner (or the unit stop) in the reason and the event source, with a test on the printed text.
+**Owner:** Phase 52.2 (wording of a verb it rewrote) or the next fix branch.
+
+### Phase 999.238: A GSD 1.21.0 Project That Does Not Ignore `.planning/state.json` Can Never Finish a Run (BACKLOG)
+
+**Found:** 2026-11-17, Phase 52.2 plan 52.2-19 Task 1, the proof run on `scripts/scratch-dogfood-repo.sh`'s fixture.
+**Defect:** GSD 1.21.0 publishes `.planning/state.json` at step boundaries (gsd-core `bin/lib/state-contract.cjs`
+`publishStateContract`, #3227). The fixture has no `.gitignore`, so the file is untracked in the phase worktree; DevFlow
+counts no Validate pass on a dirty tree (52-CONTEXT D-46). The Validate gate fired `clean_pass` with "the tree has
+uncommitted changes (.planning/state.json) ... No Validate pass counts on this commit"; `gate approve 1` routed
+`validate_again` (`next_step`, `Trigger::Approve`, `can_finish` false), and Validate fired the same gate again. Nothing
+removes the file, so every approve loops. DevFlow's own repo ignores it (`.gitignore`, `.planning/state.json`).
+**Evidence:** 52.2-PROOF-RUN.md (events, both gate requests, `git status --porcelain` = `?? .planning/state.json`).
+**Not established:** whether GSD's own project setup adds the ignore line for new projects; whether any other GSD
+runtime file (`.planning/milestone.lock`) also appears during a run.
+**Fix shape (not decided, operator's choice):** (a) the fixture commits a `.gitignore` with `.planning/state.json` and
+`.planning/milestone.lock` (a `scripts/` change, so reinstall and rerun the proof); or (b) DevFlow's clean-tree rule
+ignores GSD's derived files, or preflight refuses a project that does not ignore them, naming the line to add.
+**Owner:** Phase 52.2: it blocks the proof run (52.2-19).
+**Fixture cause fixed (operator chose (a), 2026-11-17):** commit 84bb59d makes `scripts/scratch-dogfood-repo.sh`'s
+default mode commit a `.gitignore` with `.devflow/`, `.worktrees/`, `.planning/state.json` and
+`.planning/milestone.lock`. The product side (a project that does not ignore them) is 999.241.
 
 ### Phase 999.237: `discard` and `start` Do Not Look for a Held Launch Lock a Loadable State Does Not Name (BACKLOG)
 

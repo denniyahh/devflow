@@ -1,10 +1,14 @@
 name: CI
 
-# Every job runs inside the SAME pinned image the devcontainer uses, and
-# invokes the SAME scripts/check.sh a developer runs via
-# scripts/check-in-container.sh. Host OS, libc, and toolchain are therefore
-# identical between a local check and a CI check — the divergence that made
-# 999.47 cost hours to chase.
+# Every job except `service` runs inside the SAME pinned image the
+# devcontainer uses, and invokes the SAME scripts/check.sh a developer runs
+# via scripts/check-in-container.sh. Host OS, libc, and toolchain are
+# therefore identical between a local check and a CI check — the divergence
+# that made 999.47 cost hours to chase.
+#
+# `service` is the one job outside the pinned image: it runs on the hosted
+# VM because the image has no systemd user manager, and the user-unit tests
+# it runs (scripts/check.sh service) need one (52.2 D-07b).
 #
 # BOTH `main` and `develop` require FOUR status contexts: `Test`, `Clippy`
 # and `Format` from this file, plus `Build + test in devcontainer` from
@@ -208,3 +212,74 @@ jobs:
       - name: Install the pinned dependency tools
         run: scripts/install-dep-tools.sh
       - run: scripts/check.sh deps
+
+  # ADVISORY for now, not among the four required contexts in the header:
+  # making it required is an operator step once it is seen green on GitHub
+  # (52.2-18). Last job on purpose: ci_parity_guards'
+  # job_splitter_finds_exactly_the_live_ci_jobs compares the keys in file order.
+  service:
+    name: Service tests (host user manager)
+    runs-on: ubuntu-24.04
+    # No `container:`: see the header. The hosted image's rustup installs the
+    # toolchain rust-toolchain.toml pins on the first cargo call.
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    # REQUIRED: the steps below use `set -euo pipefail`
+    # (container_jobs_using_bash_syntax_declare_a_bash_shell).
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install cargo-nextest
+        # 0.9.152 is what `cargo nextest --version` printed on the developer
+        # host when this job was written (52.2-03).
+        run: |
+          set -euo pipefail
+          cargo install --locked cargo-nextest --version 0.9.152
+      - name: Negative control (target fails with the user bus unset)
+        # A PROXY for an unreachable user manager, not a missing one: unsetting
+        # the bus variables leaves `systemctl --user` nothing to connect
+        # through, but the manager itself is not removed. It proves the target
+        # fails, naming the manager, instead of skipping.
+        run: |
+          set -euo pipefail
+          control_err="$RUNNER_TEMP/service-control.err"
+          if env -u XDG_RUNTIME_DIR -u DBUS_SESSION_BUS_ADDRESS scripts/check.sh service 2>"$control_err"; then
+            echo "error: scripts/check.sh service passed with the user bus variables unset" >&2
+            exit 1
+          fi
+          if ! grep -q "no systemd user manager answers" "$control_err"; then
+            echo "error: the failure did not name the missing user manager:" >&2
+            cat "$control_err" >&2
+            exit 1
+          fi
+          echo "negative control OK: the service target failed naming the user manager"
+      - name: Bring up the user manager and run the service target
+        # ONE step on purpose: an `export` does not reach a later step unless
+        # written to $GITHUB_ENV. Whether a hosted VM runs a user manager is
+        # unverified until this job is seen green on GitHub (52.2-18).
+        run: |
+          set -euo pipefail
+          uid="$(id -u)"
+          sudo loginctl enable-linger "$USER"
+          export XDG_RUNTIME_DIR="/run/user/$uid"
+          waited=0
+          until systemctl --user show -p Version --value >/dev/null 2>&1; do
+            if [ "$waited" -ge 60 ]; then
+              echo "error: no systemd user manager (user@$uid.service) answered within 60 s; XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" >&2
+              systemctl --user show -p Version --value >&2 || true
+              exit 1
+            fi
+            if [ "$waited" -eq 10 ]; then
+              echo "no answer after 10 s; starting user@$uid.service"
+              sudo systemctl start "user@$uid.service" || echo "warning: starting user@$uid.service failed" >&2
+            fi
+            sleep 1
+            waited=$((waited + 1))
+          done
+          if [ -S "$XDG_RUNTIME_DIR/bus" ]; then
+            export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+          fi
+          scripts/check.sh service

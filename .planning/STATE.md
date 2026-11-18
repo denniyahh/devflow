@@ -2,19 +2,18 @@
 gsd_state_version: "1.0"
 milestone: v4.0
 milestone_name: milestone (ACTIVE — Session Continuity)
-current_phase: "52.2"
-current_phase_name: Foreground Runner
-status: executing
-stopped_at: Phase 52.2 context gathered
-last_updated: "2026-11-16T21:46:19.967Z"
-last_activity: 2026-11-15
-last_activity_desc: Phase 52.1 complete, transitioned to Phase 52.2
-state_head: 00d8b3c1b286f9bb0d9a4077eaf0161d873dac01
+current_phase: 53
+current_phase_name: The Question Channel
+status: planning
+stopped_at: Phase 52.2 complete, ready to plan Phase 53
+last_updated: "2026-11-17T23:33:43.237Z"
+last_activity: 2026-11-17
+state_head: 4e6263fd41ba2a18f34c8e2375dbd1007db0aa82
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 66
-  completed_plans: 40
+  completed_plans: 66
   percent: 17
 ---
 
@@ -77,12 +76,12 @@ Phase 51 (Rate-Limit Agent Failover) closed v3.0.0 on 2026-11-08: see `.planning
 
 ## Project Reference
 
-See: `.planning/PROJECT.md` (updated 2026-11-08)
+See: `.planning/PROJECT.md` (updated 2026-11-17)
 
 **Core value:** a coding session that outlives any one agent — the session is the repository, so another agent
 continues the same work when one runs out of quota or budget, and the run asks a human only for the decisions nothing
 else can make (restated by the operator 2026-11-08).
-**Current focus:** Phase 52.1 — Stabilize for Dogfooding
+**Current focus:** Phase 53 — The Question Channel
 
 ## Operator Next Steps
 
@@ -171,10 +170,10 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 52.2 (Foreground Runner) — READY TO EXECUTE
+Phase: 53 — The Question Channel
 Plan: Not started
-Status: Ready to execute
-Last activity: 2026-11-15 — Phase 52.1 complete, transitioned to Phase 52.2
+Status: Ready to plan
+Last activity: 2026-11-17
 
 
 ## Recently Shipped
@@ -936,6 +935,72 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 52.1]: 52.1-07: a --delete-unmerged-branch value that is not the phase branch is refused whatever the branch merge state
 - [Phase 52.1]: 52.1-07: the live-run refusal runs before discard reads the items, so a run that may be live is refused before nothing-to-discard
 - [Phase 52.1]: 52.1-07: discard removes a loadable and an unloadable state the same way, with workflow::clear_state, and nothing else under .devflow/
+- [Phase 52.2]: 52.2-01: launch_stage_inner keeps its default_stage_prompt render and delegates to prepare_stage_launch; launch_stage_next renders again after preflight
+- [Phase 52.2]: 52.2-01: run_runner engages AutoChainGuard around a stream-shape run_stage and drops it before the advance, as run_monitor does
+- [Phase 52.2]: 52.2-01: service.rs items not yet called carry cfg_attr(not(test), expect(dead_code)) naming 52.2-06, which errors once they are called
+- [Phase 52.2]: 52.2-20: the fake service manager lives in each HermeticHome's service-bin/ and is first on every hermetic_devflow PATH; suites add PATH entries only via HermeticPath::hermetic_path
+- [Phase 52.2]: 52.2-02: the runner's monitor::run_stage call lives in run_one_stage, which only run_runner calls; the call-site scan asserts both
+- [Phase 52.2]: 52.2-02: fail_over_on_rate_limit keeps FailoverRelaunchGuard around launch_stage_next only; a handed-back relaunch carries HandoffRelaunch so a failed start names the handoff
+- [Phase 52.2]: 52.2-03: scripts/check.sh service treats the user manager as present only when systemctl --user show -p Version --value exits 0 AND prints a version (digit first); the pinned image's systemctl shim exits 0
+- [Phase 52.2]: 52.2-03: the CI service job is advisory until 52.2-18 sees it green on GitHub
+- [Phase 52.2]: Agent guard is its own dir after the test's own PATH entries and before the inherited PATH; service-bin entries would shadow test stubs
+- [Phase 52.2]: Agent-guard names come from driver_for(kind).build_command for every AgentKind, plus antigravity and gemini
+- [Phase 52.2]: 52.2-04: TIMEOUT_STOP_SEC is a Duration (name kept); UNIT_STOP_WAIT = TIMEOUT_STOP_SEC + 5 s is the D-07a wait bound
+- [Phase 52.2]: 52.2-04: an unanswered Version probe reads Absent only under the user's own /run/user/<uid> with no systemd/private; a timed-out probe is Failed
+- [Phase 52.2]: 52.2-04: libc moved from dev-dependencies to dependencies for getuid (no new crate)
+- [Phase 52.2]: 52.2-05: the runner's signal dispatcher thread is the only reader of the signal pipe; one SIGTERM/SIGINT handler per process, the holder flag reads its atomic
+- [Phase 52.2]: 52.2-05: StopToken::begin_agent re-arms the run-long token per stage; a runner-recorded stop writes stop_reason 'stopped by SIGTERM to the runner' and a runner_stopped event
+- [Phase 52.2]: 52.2-05: run_runner settles each advance result finished -> stop -> Err -> next, and re-reads finished/stop after a failed-advance recovery
+- [Phase 52.2]: A failed unit launch in start clears the run state (WR-11) so start can run again; resume re-marks the run stopped with the launch error
+- [Phase 52.2]: resume checks the agent binary right before launching the unit
+- [Phase 52.2]: The runner's first step refuses a state still reading gate_pending, naming devflow resume
+- [Phase 52.2]: The cfg(test) runner harness only holds the runner lock unless double::set_full_runner(true)
+- [Phase 52.2]: stop refuses non-zero, naming the holder's pid, while another verb holds the phase with the runner lock free
+- [Phase 52.2]: 52.2-07: held-stdout tests (WR-03 E1, E2) run __runner directly over the seeded Code state; E3's socket stop at safe point 1 is retired
+- [Phase 52.2]: 52.2-07: stop's outcome, positional-root, flag-precedence and cleanup tests port onto live runner units, since stop over a seeded state is a no-op
+- [Phase 52.2]: 52.2-07: recover_clean_refuses_while_the_supervisor_is_alive retired with 52.2-10's successor row; recover --clean deletes a live runner's state until 52.2-10 removes the verb
+- [Phase 52.2]: Ported tests that asserted the driver exited 0 after an abort now assert the runner exits 1, its designed exit for an unfinished run (52.2-02)
+- [Phase 52.2]: gate_notify_persist_e2e advance arms run through resume: a bare __runner fires the notify command but saves nothing; committing the variable is start and resume's job
+- [Phase 52.2]: Two auto_chain_flag_e2e supervisor-record tests retired with ledger rows; the runner lock leaves no second run to supersede
+- [Phase 52.2]: 52.2-22: OPERATIONS.md's doctor orphan paragraph keeps its place for 52.2-26 but says its printed repair names stop's removed --launch flag and no longer parses; the code that prints it is 52.2-23's
+- [Phase 52.2]: 52.2-09: reservation-only = state loads and run_never_prepared holds, read after runner_liveness is not live; status shows it as idle naming start
+- [Phase 52.2]: 52.2-09: status lists phases from .runner-NN, gate request and state file names; a free runner lock alone is history and gets no row
+- [Phase 52.2]: 52.2-09: logs -f prints the run's state line on stderr once the runner leaves the followed stage (60 s bound), or when a quiescent poll finds the runner NotLive
+- [Phase 52.2]: 52.2-10: a held or unprobeable gate waiter refuses the whole discard before any removal
+- [Phase 52.2]: 52.2-10: discard sweeps orphan hold temps directory-wide via remove_orphan_hold_temps and names each removed path
+- [Phase 52.2]: 52.2-10: the recycled agent-pid repair names the pid file, since discard reads it too
+- [Phase 52.2]: 52.2-11: the runner test's preflight control is supervise mode; a committed CONTEXT.md does not clear Codex's auto-mode unattended-launch refusal at Plan
+- [Phase 52.2]: 52.2-11: launch_stage resolves run_preflight's PreflightOutcome through launch_after_preflight; an approval launches launch_stage_inner(state, None, None) in the runner
+- [Phase 52.2]: doctor reports a phase no runner runs that is neither stopped nor finished as a Problem (resume, or start for an unprepared run); an unreadable runner is a path-free Problem pointing at devflow status
+- [Phase 52.2]: a launch reservation is a doctor note only while no runner runs; its liveness lock is no longer read (D-07)
+- [Phase 52.2]: 52.2-12: devflow-core semver accept-break recorded in 52.2-SEMVER-REMOVALS.txt; scripts/semver-planned-removals.sh gates every later removal plan (guards baseline items only)
+- [Phase 52.2]: 52.2-12: stop primitives live in devflow_core::stop, launch-id/boot-id helpers in devflow_core::liveness; old supervisor paths are pub use re-exports until 52.2-24
+- [Phase 52.2]: 52.2-23: doctor socket sweep (orphan_supervisors, orphan_supervisor_sweep_error) deleted with the CLI last supervisor:: reader; doctor --json has five keys
+- [Phase 52.2]: 52.2-23: Reservation keeps an unbound socket path for its pending record, built from registry::socket_dir_in and path_digest; 52.2-25 deletes the reservation
+- [Phase 52.2]: 52.2-23: stage tests that drove run_supervised_stage in a child now drive monitor::run_stage under a run token there, keeping their names
+- [Phase 52.2]: 52.2-25: a launch takes no reservation and State records no launch; the phase holder keeps a second launcher out (D-07) and the ownership fence is deleted (accept-break). An old state file with supervisor/pending_supervisor still loads (keys ignored).
+- [Phase 52.2]: 52.2-24: recover.rs deleted whole; format_age and state_age_secs moved to commands.rs with their tests
+- [Phase 52.2]: 52.2-24: unused public stop/registry/agent_result items kept (ReplyHandedOff, StopSource::Socket, note_group_signalled, socket_dir_in, prompt_path, monitor_log_path): the PLAN does not name their removal
+- [Phase 52.2]: 52.2-13: start refuses a leftover phase branch before feature_start, so the --no-worktree arm never switches the primary checkout; worktree mode refuses a leftover branch with no worktree the same way
+- [Phase 52.2]: 52.2-13: GitFlow::feature_start_force stays as an uncalled public item: the PLAN does not name its removal (deferred-items.md)
+- [Phase 52.2]: 52.2-14: start takes every refusal from one pure launch_guards over GuardFacts gathered under the phase holder before the write lock; order live, finished, incomplete, unloadable, orphan gate files, leftover worktree or branch
+- [Phase 52.2]: 52.2-14: reservation-only = loads, not finished, run_never_prepared; start proceeds over it; an unloadable state stays in place and start names discard
+- [Phase 52.2]: 52.2-14: resume_guards refuse a live run, a finished run (close-out or discard), no state (start) and an unloadable state (discard)
+- [Phase 52.2]: 52.2-15: start --dry-run runs the real guard sequence (manager probe, launch_guards over facts read without holder, lock or reservation), then ensure_agent_binary and preflight::resolve_start_base, and prints one line naming the skipped checks
+- [Phase 52.2]: 52.2-16: a stopped state counts as an incomplete run even when no start prepared it, so cleanup keeps it naming resume and discard; only a state that neither stopped nor finished and was never prepared is a dead start's reservation
+- [Phase 52.2]: 52.2-16: a held runner lock keeps that phase and cleanup goes on to the next phase, exiting non-zero at the end, instead of aborting the whole pass
+- [Phase 52.2]: 52.2-16: a phase worktree cleanup decided to remove but git refused makes the exit non-zero; a .worktrees/ entry no phase owns is handled as before
+- [Phase 52.2]: 52.2-16: cleanup counts merged against the base the run recorded, else the project's, through discard_base, so cleanup and discard agree
+- [Phase 52.2]: 52.2-17: cleanup visits every phase whose .devflow/.runner-NN does not probe free, so a held runner lock with no state keeps its phase and makes the exit non-zero; a free lock file names no phase
+- [Phase 52.2]: 52.2-17: the removed --force surface is guarded by two scans in crates/devflow-cli/tests/removed_surface_scan.rs (CLI code lines outside test modules, and the scoped docs), each with planted controls
+- [Phase 52.2]: 52.2-18: the green commit CI saw is d3be8c7 on feature/phase-52.2-pr, the cut-pr-branch.sh replay of 9de8b28, because the pre-push hook refuses .planning/ on feature/* (operator chose the filtered-branch route)
+- [Phase 52.2]: 52.2-18: 999.222's repeat row uses gsd_reader::tests::a_gaps_found_report_reads_as_gaps_found, the test that failed in 52-24
+- [Phase 52.2]: 52.2-19: operator chose fix (a) for 999.238: the proof fixture commits .gitignore lines for GSD's derived files
+- [Phase 52.2]: 52.2-19: operator: use attempt 1 as the dirty-tree control; 52.1 D-15's premise (the committed _auto_chain_active key keeps the tree clean) did not hold on attempt 2
+- [Phase 52.2]: 52.2-19: operator approved all 342 subject removed test-ledger rows
+- [Phase 52.2]: CONTEXT D-01 (operator): every run is a systemd user service; start/resume return once the runner holds its lock; no --foreground
+- [Phase 52.2]: CONTEXT D-07 (operator): the per-phase runner lock is the only liveness signal (999.237 fixed); recover removed (D-06)
+- [Phase 52.2]: CONTEXT (operator, 2026-11-16): devflow-core semver accept-break under 4.0.0, no deprecated stubs
 
 ## Roadmap Evolution
 
@@ -1087,12 +1152,38 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 52.1 P04 | 23 min | 2 tasks | 5 files |
 | Phase 52.1 P06 | 23 min | 2 tasks | 3 files |
 | Phase 52.1 P07 | 50 min | 3 tasks | 5 files |
+| Phase 52.2 P01 | 30 min | 2 tasks | 10 files |
+| Phase 52.2 P20 | 10 min | 2 tasks | 7 files |
+| Phase 52.2 P02 | 30 min | 3 tasks | 5 files |
+| Phase 52.2 P03 | 41 min | 2 tasks | 8 files |
+| Phase 52.2 P21 | 25min | 3 tasks | 10 files |
+| Phase 52.2 P04 | 22 min | 3 tasks | 5 files |
+| Phase 52.2 P05 | 26 min | 3 tasks | 5 files |
+| Phase 52.2 P06 | 60min | 3 tasks | 9 files |
+| Phase 52.2 P07 | 32 min | 3 tasks | 9 files |
+| Phase 52.2 P08 | 28 min | 3 tasks | 7 files |
+| Phase 52.2 P22 | 15min | 2 tasks | 7 files |
+| Phase 52.2 P09 | 30 min | 3 tasks | 2 files |
+| Phase 52.2 P10 | 18 min | 3 tasks | 14 files |
+| Phase 52.2 P11 | 47 min | 3 tasks | 14 files |
+| Phase 52.2 P26 | 34 min | 3 tasks | 10 files |
+| Phase 52.2 P12 | 19 min | 3 tasks | 13 files |
+| Phase 52.2 P23 | 38 min | 3 tasks | 21 files |
+| Phase 52.2 P25 | 37min | 3 tasks | 12 files |
+| Phase 52.2 P24 | 28min | 3 tasks | 22 files |
+| Phase 52.2 P13 | 16 min | 2 tasks | 9 files |
+| Phase 52.2 P14 | 28 min | 3 tasks | 8 files |
+| Phase 52.2 P15 | 17 min | 3 tasks | 8 files |
+| Phase 52.2 P16 | 26 min | 3 tasks | 7 files |
+| Phase 52.2 P17 | 27 min | 3 tasks | 10 files |
+| Phase 52.2 P18 | 133 min | 3 tasks | 2 files |
+| Phase 52.2 P19 | 66 min | 3 tasks | 3 files |
 
 ## Session
 
-**Last session:** 2026-11-16T13:06:50.573Z
-**Stopped at:** Phase 52.2 context gathered
-**Resume file:** .planning/phases/52.2-foreground-runner/52.2-CONTEXT.md
+**Last session:** 2026-11-17T23:28:56.813Z
+**Stopped at:** Phase 52.2 complete, ready to plan Phase 53
+**Resume file:** None
 
 ## Operator Next Steps
 

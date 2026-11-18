@@ -236,6 +236,11 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
   - Runs the **full CI-equivalent check inside the pinned container** (§5), not host tools —
     `scripts/check-in-container.sh all`, with `DEVFLOW_SKIP_CONTAINER_CHECK=1` as an explicit,
     loudly-non-equivalent escape hatch.
+  - Then, on the host and on both branches, runs `scripts/check.sh service` (Phase 52.2, D-07b):
+    the `#[ignore]` user-unit tests in `service_e2e.rs`, which need a running **systemd user
+    manager** (the pinned container has none) and `cargo-nextest`. The target is not in `all`, and
+    it fails, naming the manager, instead of skipping when `systemctl --user show -p Version` gets
+    no answer. A push from a host or session with no user bus is therefore refused.
 - [ ] **[PROJECT]** `scripts/hooks/pre-push` **runs `scripts/check-workspace-divergence.sh` once for
   each pushed commit that carries `.workspace-divergence`, against that commit** (Phase 52.1,
   999.231). The script takes `[BASE_REF] [SHA]` and reads the manifest, the diff against
@@ -254,8 +259,10 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
   - `git ls-tree` refuses glob pathspec magic, and a `done < <(git ...)` loop does not see git
     fail: it reads nothing and passes. The mode check lists all of `scripts/` and filters in bash,
     and every listing is captured before it is read.
-  - Verify: `cargo nextest run -p devflow --test pre_push_divergence_e2e --no-tests=fail` (6 tests,
-    each running a byte copy of the hook and the script against a scratch repository).
+  - Verify: `cargo nextest run -p devflow --test pre_push_divergence_e2e --no-tests=fail` (7 tests,
+    each running a byte copy of the hook and the script against a scratch repository). The
+    fixture commits a passing `scripts/check.sh` stub, and `a_failing_service_target_refuses_the_push`
+    shows a failing one refuses the push.
 - [ ] **[PROJECT]** `scripts/hooks/post-commit`: warns (never auto-edits) when a `*-SUMMARY.md`
   lands but `STATE.md`'s authored prose wasn't updated to match. Only a summary directly inside a
   phase directory counts; a nested one (a plan review's `52-plan-review-N/SUMMARY.md`) does not.
@@ -275,10 +282,11 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
 
 ## 4. GitHub Actions CI
 
-- [ ] **[PROJECT]** `.github/workflows/ci.yml` — **five** jobs, each running **inside the exact
+- [ ] **[PROJECT]** `.github/workflows/ci.yml` — **six** jobs. Five run **inside the exact
   same pinned container image** the devcontainer and the pre-push hook use (§5) — the whole point
-  being zero host/CI drift. Three (`Test`, `Clippy`, `Format`) are **required** status contexts;
-  `Sequential 2-CPU check` and `Dependency checks` are deliberately **advisory**. The **fourth required
+  being zero host/CI drift; the sixth, `service`, runs on the hosted VM (below). Three (`Test`,
+  `Clippy`, `Format`) are **required** status contexts; `Sequential 2-CPU check`, `Dependency
+  checks` and `Service tests (host user manager)` are **advisory**. The **fourth required
   context is `Build + test in devcontainer`, which lives in `devcontainer.yml`, not here** — so
   the required set spans two workflow files, and reading only this one under-counts it.
 - [ ] **[PROJECT]** `Dependency checks` runs `scripts/check.sh deps`: `cargo deny check` plus
@@ -288,6 +296,19 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
   rather than on a finding. `check.sh deps` refuses loudly when a tool is missing instead of
   skipping. Advisory because `cargo deny` reads the live RustSec advisory database, so a newly
   published advisory can turn it red on a PR that changed nothing.
+- [ ] **[PROJECT]** `Service tests (host user manager)` (job `service`, last in `ci.yml`, Phase 52.2
+  D-07b) runs `scripts/check.sh service` on the `ubuntu-24.04` hosted VM with **no `container:`**,
+  because the pinned image has no systemd user manager. It installs `cargo-nextest` 0.9.152 with
+  `cargo install --locked` (the version on the developer host when the job was written). A
+  negative-control step first runs the target with `XDG_RUNTIME_DIR` and
+  `DBUS_SESSION_BUS_ADDRESS` unset and requires it to fail naming the manager; that is a **proxy**
+  for an unreachable manager, not a removed one. One step then enables **user lingering**
+  (`sudo loginctl enable-linger "$USER"`), exports `XDG_RUNTIME_DIR=/run/user/$UID`, waits up to
+  60 s for the user manager (starting `user@$UID.service` after 10 s), and runs the target.
+  Whether a hosted VM runs a user manager is **unverified** until the job is seen green on GitHub;
+  making it a required check is the operator step in plan 52.2-18. Locally, a host user manager
+  needs nothing extra for an interactive session; lingering (`loginctl enable-linger`) is only
+  needed where no login session keeps the manager running.
 - [ ] **[PROJECT]** `.github/workflows/scheduled-deps.yml` runs the same `scripts/check.sh deps` every
   Monday and on demand (`workflow_dispatch`), so a new advisory surfaces without a push (PR #228,
   2026-10-23). GitHub runs schedules only from the **default branch** (`develop`, §2); a manual run on

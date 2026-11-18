@@ -4,14 +4,13 @@
 
 DevFlow is a Rust CLI that automates the mechanical workflow steps an AI
 coding agent needs to drive a development phase end-to-end: branch creation,
-agent launch, completion detection, gated human checkpoints, versioning,
-docs/changelog updates, and cleanup. It runs a 5-stage pipeline
-(Define → Plan → Code → Validate → Ship), today against six supported
+agent launch, completion detection, gated human checkpoints, and cleanup. It runs a
+3-stage pipeline (Plan → Code → Validate; Define and Ship removed in Phase 52), today against six supported
 agents (Claude Code, OpenAI Codex, OpenCode, Pi, Antigravity, Hermes) through the modular
 `AgentDriver` contract — opinionated by design,
 not a universal agent platform — in either `auto` (unattended) or
-`supervise` (gated) mode. Since v3.0.0 each stage runs under a socket-addressed
-supervisor whose liveness is answerable without a PID, every state write takes one
+`supervise` (gated) mode. Since Phase 52.2 (unreleased, 4.0.0) every run is a systemd user service
+(`systemd-run --user`) whose runner holds one per-phase lifetime lock, the only liveness signal; every state write takes one
 short lock, a gate answer decides only the gate it names, and a Code stage that hits a
 quota denial continues under a configured fallback agent in the same worktree.
 
@@ -500,6 +499,7 @@ seven of the ten (#174, #204, #206, 999.115, 999.116, 999.118, #200), plus 999.1
 **v4.0 Session Continuity** — declared 2026-11-08. Requirement IDs in `REQUIREMENTS.md`.
 
 - [x] Subtract and stabilize (CUT, GATE, OPS) — Phase 52, complete 2026-11-11 (verification and UAT passed; unreleased: ships as 4.0.0)
+- [x] Foreground runner replaces the detached supervisor (inserted, no REQ IDs; carries 52.1's plans 09-15) — Phase 52.2, complete 2026-11-17 (verification passed 8/8; unreleased: ships as 4.0.0)
 - [ ] The question channel: an MCP ask tool with an operator-gate answer path (ASK)
 - [ ] Decision triage with a calibrated model and a decision ledger (TRIAGE)
 - [ ] Failover generalized to any stage with rotation and utilization-aware routing (FAIL)
@@ -631,7 +631,7 @@ close), confirming the fix. See `.planning/milestones/gsd-hygiene-ROADMAP.md`.)*
 | 999.139 (an unloadable state file hides a live monitor from `start`) is outside Phase 48's criterion 2 (operator ruling 2026-09-23) | The hole needs a dead agent beside a live monitor — the agent-exit → `advance` window already deferred as 999.136 | — Pending (backlog) |
 | TDD commit-shape audit overridden for Phase 48's sequential-worktree plans (operator, 2026-09-19, `48-TDD-OVERRIDE.md`) | The #4799 workaround made the orchestrator commit after verification, so the `test(…)`→`feat(…)` grep cannot see the recorded RED/GREEN evidence | ✓ Accepted; applies to the commit-shape gate only |
 | The live unattended run uses a throwaway GSD project in a private throwaway repo with one human-action checkpoint per attempt (Phase 49 re-scope, operator 2026-09-28) | The first 18-plan design bent GSD's own checkpoint semantics; the operator's principle is to operate within GSD's confines and analyse post hoc | ✓ Good — attempt 3 shipped; the same scaffold ran the 2026-11-08 failover probe |
-| Supervisor liveness comes from a per-launch socket, never a pid read (Phase 50, D-01) | A pid is recyclable and says nothing about who holds the pipe; a socket answers ALIVE/STALE/GONE and names the repair | ✓ Good — 12 live launches, 0 superseded |
+| Supervisor liveness comes from a per-launch socket, never a pid read (Phase 50, D-01) | A pid is recyclable and says nothing about who holds the pipe; a socket answers ALIVE/STALE/GONE and names the repair | ✓ Good — 12 live launches, 0 superseded; superseded in Phase 52.2 by the runner lock (D-07) |
 | One short OS lock per state write with a re-read; gate answers bound to fresh gate ids (Phase 50.1) | A held lock across a gate wait and an id-less answer were the two ways a run lost an operator's decision | ✓ Good — verified 12/12; live attempt 2 shipped |
 | Failover is Code-only and one hop per run; a Plan-stage rate limit takes the cron arm (Phase 51, R-2) | Keep the first delivery narrow; Plan continuation dropped from scope | ⚠️ Revisit — v4.0 generalizes to any stage with rotation (operator, 2026-11-08) |
 | A torn final capture line outranks a parsed quota denial everywhere; the stage ends at a gate (Phase 51, X-01 option B, operator 2026-11-08) | A torn line may be a later event that replaced the denial; a wrong failover is worse than a gate | ✓ Good — residuals 999.207/999.209 filed |
@@ -642,6 +642,11 @@ close), confirming the fix. See `.planning/milestones/gsd-hygiene-ROADMAP.md`.)*
 | A `start` over a finished run resets the per-phase Validate-failure total to zero; a stopped unfinished run carries it (operator, 2026-11-11) | A finished run passed Validate, so its old failures say nothing about the next run | ✓ Good — 96f90b1 |
 | An ambiguous Validate verdict always gates, in every GSD status and mode, touching no counter (operator, 2026-11-11, code review CR-01) | Routing it by GSD's status in auto mode let a run loop with no ceiling | ✓ Good — bc88f9a |
 | No `--force` deletes an unmerged phase branch; the overloaded `--force` flags are to be replaced by named actions (operator, 2026-11-11, code review CR-02) | In v4 a finished run's branch is the only copy of its work until close-out; one flag authorised several unrelated destructive actions | ✓ Interim fix 3f0714f — redesign is backlog 999.224 |
+| Every run is a user service: `start`/`resume` launch the runner with `systemd-run --user` and return; no terminal-held run, no `--foreground` (operator, Phase 52.2 D-01) | A held terminal accepts no DevFlow commands and only shows progress lines, so it is a log tail, not a run type | ✓ Good — 52.2 verification passed 8/8 |
+| `devflow stop --phase N [PROJECT]` stops the named run's unit; the runner traps SIGTERM, ends the agent's group and records `stopped` (operator, Phase 52.2 D-05) | Stopping a unit with `systemctl` by hand is unacceptable UX | ✓ Good |
+| `devflow recover` removed; `discard` takes over orphan gate files and hold temps (operator, Phase 52.2 D-06) | Its listing duplicated `status` and its state deletion duplicated `discard` | ✓ Good |
+| One per-phase lifetime lock (`.devflow/.runner-NN`) is the only liveness signal, asked through one function by every verb; deleting or relaunching verbs also wait, bounded, for the unit to read inactive (operator, Phase 52.2 D-07; D-07a 2026-11-16) | Fixes 999.237: several liveness sources disagreed | ✓ Good |
+| `devflow-core` semver `accept-break`: the supervisor's public items are removed under 4.0.0 with no deprecated stubs (operator, 2026-11-16, Phase 52.2) | The CLI is 4.0.0-alpha.1 and unpublished; the major bump already breaks | ✓ Accepted |
 
 ## Key Files
 
@@ -702,6 +707,8 @@ and SUPV-03/04/05 moved to Validated (their footers had claimed it without writi
 `/gsd-new-milestone` v4.0.*
 
 ---
+*Last updated: 2026-11-17 after Phase 52.2 (Foreground Runner, inserted) — 26/26 plans; verification passed 8/8. Every run is a systemd user service whose runner holds one per-phase lifetime lock, the only liveness signal (999.237); `recover`, the socket supervisor and `stop --launch` are gone, and `devflow-core` takes a breaking change under 4.0.0. Unreleased. Next: Phase 53 (The Question Channel).*
+
 *Last updated: 2026-11-08 after Phase 51 (Rate-Limit Agent Failover) — 13/13 plans (51-08 dropped by operator ruling); verification passed 114/114. A Code-stage rate limit continues under the configured fallback agent; SUPV-02 validated. Last phase of v3.0.0; no live failover run yet. Backlog 999.183-187 holds what stays open.*
 
 *Last updated: 2026-11-02 after Phase 50.1 (Split-Lock State-Handling Overhaul) — 30/30 plans; verification passed 12/12. Every state write takes one short lock and is durable, and a gate answer decides only the gate it names. SUPV-03, SUPV-04, SUPV-05, SURV-03 and SURV-04 validated. Live attempt 2 shipped on the final production source but was not unattended: the operator answered two extra Code gates. Backlog 999.172-177 holds what stays open, including 999.175 and 999.176, which can stop a headless run short of Ship.*

@@ -21,6 +21,7 @@
 
 mod common;
 
+use common::HermeticPath;
 use devflow_core::canary::CanaryOutcome;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::state::{AgentKind, State};
@@ -369,7 +370,8 @@ impl Rig {
             self.fake_bin.path.display(),
             existing.to_string_lossy()
         );
-        let output = common::hermetic_devflow(&self.home)
+        let mut command = common::hermetic_devflow(&self.home);
+        command
             .args([
                 "start",
                 "--phase",
@@ -384,10 +386,15 @@ impl Rig {
             .args(extra)
             .arg(&self.root)
             .current_dir(&self.root)
-            .env("PATH", path)
-            .envs(env.iter().copied())
-            .output()
-            .expect("run devflow start");
+            .hermetic_path(path);
+        for (name, value) in env {
+            assert_ne!(
+                *name, "PATH",
+                "set PATH with hermetic_path, not through env"
+            );
+            command.env(name, value);
+        }
+        let output = command.output().expect("run devflow start");
         assert!(
             output.status.success(),
             "start failed\nstdout: {}\nstderr: {}",
@@ -549,7 +556,7 @@ fn position(events: &[Value], name: &str, log: &str) -> usize {
 fn a_rate_limited_claude_run_in_auto_mode_hands_off_to_antigravity_and_completes_code() {
     let phase = PhaseId::new(5121);
     let rig = Rig::new(phase, AgyCanary::ReturnsToken);
-    let _reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+    let _reaper = common::LaunchedRunReaper::for_home(&rig.home, &rig.root, phase);
 
     rig.start(&["--fallback-agent", "antigravity"]);
     let branch = git_out(&rig.root, &["rev-parse", "--abbrev-ref", "HEAD"]);
@@ -636,7 +643,7 @@ fn a_rate_limited_claude_run_in_auto_mode_hands_off_to_antigravity_and_completes
 fn a_handoff_to_antigravity_that_fails_its_canary_ends_at_a_gate() {
     let phase = PhaseId::new(5123);
     let rig = Rig::new(phase, AgyCanary::WithholdsToken);
-    let _reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+    let _reaper = common::LaunchedRunReaper::for_home(&rig.home, &rig.root, phase);
 
     rig.start(&["--fallback-agent", "antigravity"]);
     rig.wait_for_any(&[
@@ -788,7 +795,7 @@ fn assert_the_relaunch_was_refused_loudly(rig: &Rig, events: &[Value], log: &str
 fn approving_the_failed_canary_gate_stops_the_run_and_names_the_way_on() {
     let phase = PhaseId::new(5124);
     let rig = Rig::new(phase, AgyCanary::WithholdsToken);
-    let _reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+    let _reaper = common::LaunchedRunReaper::for_home(&rig.home, &rig.root, phase);
     let (events, log) = answer_the_failed_canary_gate(&rig, &["approve"]);
     assert_the_relaunch_was_refused_loudly(&rig, &events, &log);
 }
@@ -798,7 +805,7 @@ fn approving_the_failed_canary_gate_stops_the_run_and_names_the_way_on() {
 fn rejecting_the_failed_canary_gate_stops_the_run_and_names_the_way_on() {
     let phase = PhaseId::new(5125);
     let rig = Rig::new(phase, AgyCanary::WithholdsToken);
-    let _reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+    let _reaper = common::LaunchedRunReaper::for_home(&rig.home, &rig.root, phase);
     let (events, log) = answer_the_failed_canary_gate(&rig, &["reject", "--note", "try again"]);
     assert_the_relaunch_was_refused_loudly(&rig, &events, &log);
 }
@@ -813,7 +820,7 @@ fn rejecting_the_failed_canary_gate_stops_the_run_and_names_the_way_on() {
 fn after_the_refused_relaunch_status_and_resume_lead_to_another_agent() {
     let phase = PhaseId::new(5126);
     let rig = Rig::new(phase, AgyCanary::WithholdsToken);
-    let _reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+    let _reaper = common::LaunchedRunReaper::for_home(&rig.home, &rig.root, phase);
     let (events, log) = answer_the_failed_canary_gate(&rig, &["approve"]);
     assert_the_relaunch_was_refused_loudly(&rig, &events, &log);
 
@@ -855,7 +862,7 @@ fn after_the_refused_relaunch_status_and_resume_lead_to_another_agent() {
             .args(extra)
             .arg(&rig.root)
             .current_dir(&rig.root)
-            .env("PATH", &path)
+            .hermetic_path(&path)
             .output()
             .expect("run devflow resume")
     };
@@ -951,7 +958,7 @@ fn a_rate_limited_claude_run_without_a_fallback_waits_at_a_gate() {
     let phase = PhaseId::new(5122);
     let resets_at = now_epoch() + 3600;
     let rig = Rig::with_reset(phase, Some(resets_at));
-    let _reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+    let _reaper = common::LaunchedRunReaper::for_home(&rig.home, &rig.root, phase);
 
     rig.start(&[]);
     rig.wait_for_any(&[
@@ -1065,7 +1072,7 @@ fn wait_for_gates(rig: &Rig, count: usize) {
 fn a_passed_reset_relaunches_once_and_a_second_denial_waits() {
     let phase = PhaseId::new(5127);
     let rig = Rig::with_reset(phase, Some(now_epoch() - 3600));
-    let _reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+    let _reaper = common::LaunchedRunReaper::for_home(&rig.home, &rig.root, phase);
 
     rig.start(&[]);
     wait_for_gates(&rig, 2);
@@ -1155,7 +1162,7 @@ fn a_future_reset_outlives_the_gate_timeout() {
     const GATE_TIMEOUT_SECS: u64 = 2;
     let phase = PhaseId::new(5128);
     let rig = Rig::with_reset(phase, a_future_reset());
-    let _reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+    let _reaper = common::LaunchedRunReaper::for_home(&rig.home, &rig.root, phase);
 
     rig.start_with_timeout(GATE_TIMEOUT_SECS);
     wait_for_gates(&rig, 1);
@@ -1192,7 +1199,7 @@ fn a_reset_earlier_than_the_gate_timeout_relaunches_at_the_reset() {
     let phase = PhaseId::new(5129);
     let resets_at = now_epoch() - MARGIN + 5;
     let rig = Rig::with_reset(phase, Some(resets_at));
-    let _reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+    let _reaper = common::LaunchedRunReaper::for_home(&rig.home, &rig.root, phase);
 
     rig.start_with_timeout(GATE_TIMEOUT_SECS);
     wait_for_code_launches(&rig, 2, RELAUNCH_WITHIN);
@@ -1230,7 +1237,7 @@ fn a_reset_later_than_the_gate_timeout_relaunches_at_the_reset() {
     let phase = PhaseId::new(5130);
     let resets_at = now_epoch() - MARGIN + 6;
     let rig = Rig::with_reset(phase, Some(resets_at));
-    let _reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+    let _reaper = common::LaunchedRunReaper::for_home(&rig.home, &rig.root, phase);
 
     rig.start_with_timeout(GATE_TIMEOUT_SECS);
     wait_for_code_launches(&rig, 2, RELAUNCH_WITHIN);
@@ -1277,7 +1284,7 @@ fn a_reset_later_than_the_gate_timeout_relaunches_at_the_reset() {
 fn a_denial_without_a_reset_time_is_a_plain_gate() {
     let phase = PhaseId::new(5131);
     let rig = Rig::with_reset(phase, None);
-    let _reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+    let _reaper = common::LaunchedRunReaper::for_home(&rig.home, &rig.root, phase);
 
     rig.start(&[]);
     wait_for_gates(&rig, 1);
@@ -1330,7 +1337,7 @@ fn answer_and_wait_for_the_relaunch(rig: &Rig, verb: &str, extra: &[&str]) {
 fn approving_a_rate_limit_gate_relaunches_the_same_stage_on_the_same_agent() {
     let phase = PhaseId::new(5132);
     let rig = Rig::with_reset(phase, a_future_reset());
-    let _reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+    let _reaper = common::LaunchedRunReaper::for_home(&rig.home, &rig.root, phase);
 
     rig.start(&[]);
     wait_for_gates(&rig, 1);
@@ -1363,7 +1370,7 @@ fn rejecting_a_rate_limit_gate_relaunches_the_same_stage_with_the_note() {
     const NOTE: &str = "wait for the quota,\n\tthen rerun \"cargo test\" and 'nothing else'";
     let phase = PhaseId::new(5133);
     let rig = Rig::with_reset(phase, a_future_reset());
-    let _reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+    let _reaper = common::LaunchedRunReaper::for_home(&rig.home, &rig.root, phase);
 
     rig.start(&[]);
     wait_for_gates(&rig, 1);
@@ -1410,7 +1417,7 @@ fn rejecting_a_rate_limit_gate_relaunches_the_same_stage_with_the_note() {
 fn a_handoff_inside_a_phase_worktree_keeps_the_tree_branch_and_uncommitted_work() {
     let phase = PhaseId::new(5124);
     let rig = Rig::with_uncommitted_work(phase);
-    let _reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
+    let _reaper = common::LaunchedRunReaper::for_home(&rig.home, &rig.root, phase);
 
     rig.start_in_worktree(&["--fallback-agent", "antigravity"]);
     rig.wait_for_any(&[

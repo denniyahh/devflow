@@ -12,7 +12,7 @@ mod staleness;
 mod preflight;
 
 mod pipeline_launch;
-use pipeline_launch::{resume_with_fallback, run_monitor};
+use pipeline_launch::resume_with_fallback;
 
 mod pipeline_outcomes;
 
@@ -20,10 +20,12 @@ mod pipeline_gate;
 
 mod phase_worktree;
 
+mod service;
+
 mod commands;
 use commands::{
     GateAnswerKind, cleanup, discard, doctor, gate_list, gate_respond, gate_show, gate_sweep,
-    history_cmd, logs, recover_cmd, start, status, stop, stop_launch,
+    history_cmd, logs, start, status, stop,
 };
 use devflow_core::phase_id::PhaseId;
 
@@ -54,16 +56,13 @@ enum Command {
         /// Validate; `supervise` gates at Validate.
         #[arg(long)]
         mode: Mode,
-        /// Recreate the phase worktree and feature branch from the base if
-        /// they exist. Refused, with nothing removed, while the branch has
-        /// commits not merged into the base.
-        #[arg(long)]
-        force: bool,
         /// Run the agent directly in the primary checkout instead of an
         /// isolated worktree (not recommended for unattended runs).
         #[arg(long)]
         no_worktree: bool,
-        /// Print the pipeline that would run without launching anything.
+        /// Check, read-only, what a real start would refuse, then print the
+        /// pipeline that would run; launches and writes nothing and names the
+        /// start checks it skips.
         #[arg(long)]
         dry_run: bool,
         /// Run the pipeline through `<stage>` and halt cleanly before
@@ -90,70 +89,19 @@ enum Command {
         #[arg(default_value = ".")]
         project: PathBuf,
     },
-    /// Internal: advance the stage machine after a monitored agent exits.
-    #[command(hide = true)]
-    Advance {
-        /// Project root.
-        #[arg(default_value = ".")]
-        project: PathBuf,
-        /// Phase whose stage machine to advance. Recorded by the monitor at
-        /// spawn time so advance never depends on a shared state singleton.
-        #[arg(long)]
-        phase: Option<PhaseId>,
-        /// Stage the monitor launched; omitted only by monitors from older binaries.
-        #[arg(long)]
-        stage: Option<Stage>,
-    },
-    /// Internal: the stage supervisor's own process entry point (50-11).
+    /// Internal: the foreground runner a phase's user unit runs (D-02).
     ///
-    /// `monitor::spawn_monitor` re-execs this binary as this subcommand,
-    /// detached and in its own process group, for both launch shapes.
-    /// Everything after `--` is the supervised agent's program and argv.
-    /// Hidden for the same reason `advance` is: it is an implementation
-    /// detail of the monitor chain, never an operator verb.
-    #[command(name = "__monitor", hide = true)]
-    Monitor {
-        /// Project root whose `.devflow/` capture files this monitor writes.
+    /// Takes the phase's runner lock (`.devflow/.runner-NN`) before anything else and
+    /// holds it for its whole life, reports ready to systemd once it holds it, then runs
+    /// the phase's stages in this process. Hidden: a user unit runs it, never an operator.
+    #[command(name = "__runner", hide = true)]
+    Runner {
+        /// Project root whose phase this runner drives.
         #[arg(long)]
         project: PathBuf,
-        /// Phase whose stage machine to advance once the child is reaped.
+        /// Phase to run.
         #[arg(long)]
         phase: PhaseId,
-        /// Stage the monitor launched; passed to advance after the child exits.
-        #[arg(long)]
-        stage: Option<Stage>,
-        /// Directory the supervised child runs in (the phase worktree when
-        /// worktree mode is active, else the project root).
-        #[arg(long)]
-        workdir: PathBuf,
-        /// Which agent's transport the monitor supervises (selects the
-        /// first-turn schema and the close-rule marker predicate).
-        #[arg(long)]
-        agent: AgentKind,
-        /// Supervision shape: `capture` (stdin null, stdout to the capture file) or `stream`.
-        #[arg(long, value_enum)]
-        launch: pipeline_launch::LaunchShape,
-        /// Socket path this supervisor publishes, under the DevFlow cache dir.
-        #[arg(long)]
-        socket: PathBuf,
-        /// Per-launch id the launcher waits to see in this supervisor's ping reply.
-        #[arg(long)]
-        launch_id: String,
-        /// The inherited descriptor holding this launch's liveness lock.
-        #[arg(long)]
-        liveness_fd: Option<i32>,
-        /// Adapter env var NAME to re-apply to the agent (repeatable; the value stays off argv).
-        #[arg(long = "keep-env")]
-        keep_env: Vec<String>,
-        /// File holding the stage prompt (stream shape; a file, not argv, for length).
-        #[arg(long)]
-        prompt_file: Option<PathBuf>,
-        /// Seconds of stream silence before the idle timeout fires (stream shape).
-        #[arg(long)]
-        idle_timeout_secs: Option<u64>,
-        /// The supervised child's program and arguments, after `--`.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
-        argv: Vec<String>,
     },
     /// Resume a phase from its saved stage after a rate limit or infrastructure pause.
     ///
@@ -215,19 +163,19 @@ enum Command {
         #[arg(default_value = ".")]
         project: PathBuf,
     },
-    /// Remove phase worktrees and their feature branches.
+    /// Remove what is safe to remove: a finished run, a dead start's reservation, or
+    /// a worktree with no run state, once its branch is merged into the base, its
+    /// worktree is clean and no run is live. Says why it keeps the rest, and names
+    /// `devflow discard` (or `devflow resume` for an incomplete run).
     Cleanup {
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
-        /// Force-remove dirty and kept worktrees. A branch with commits not
-        /// merged into the base is still kept.
-        #[arg(long)]
-        force: bool,
     },
-    /// Remove a phase's worktree, its uncommitted changes, its run state and
-    /// its feature branch, after listing them. Refuses a live run; refuses an
-    /// unmerged branch unless `--delete-unmerged-branch` names it.
+    /// Remove a phase's worktree, its uncommitted changes, its run state, its
+    /// feature branch, and the gate files and hold temps a killed run left,
+    /// after listing them. Refuses a live run or a gate something still waits
+    /// on; refuses an unmerged branch unless `--delete-unmerged-branch` names it.
     Discard {
         /// Phase to discard.
         #[arg(long)]
@@ -246,20 +194,6 @@ enum Command {
         #[arg(default_value = ".")]
         project: PathBuf,
     },
-    /// Recover or inspect stale/abandoned workflow state.
-    Recover {
-        /// Project root.
-        #[arg(default_value = ".")]
-        project: PathBuf,
-        /// Clean up stale state instead of just inspecting. Only stale
-        /// phases are swept; combine with --phase to clear a specific
-        /// phase regardless of staleness.
-        #[arg(long)]
-        clean: bool,
-        /// Restrict the command to one phase.
-        #[arg(long)]
-        phase: Option<PhaseId>,
-    },
     /// Audit the environment and report what's installed, missing, or broken.
     Doctor {
         /// Output as JSON.
@@ -269,24 +203,16 @@ enum Command {
         #[arg(default_value = ".")]
         project: PathBuf,
     },
-    /// End a running phase cleanly: answers its open gate with a rejection
-    /// when a live waiter holds it; otherwise addresses the run's supervisor
-    /// socket — `shutdown` when ALIVE, the guarded backstop when STALE. When
-    /// no socket answers, it signals the phase's foreground holder (a `start`
-    /// or `resume` before its spawn, a hand-run `advance`) once its identity
-    /// is confirmed. `--launch <id>` tears down only the
-    /// socket with that launch id (the form `devflow doctor` prints for an
-    /// orphan). Never signals a pid recorded in state. Idempotent: safe to
-    /// run against an already-stopped, never-started, or already-dead
-    /// phase.
+    /// Stop the phase's DevFlow user service and report how the run ended.
+    ///
+    /// Stops the phase's systemd user unit (`systemctl --user stop`), which ends its
+    /// runner and the agent, then reports from the run state: stopped, finished, stopped
+    /// during launch, or crashed. With no live run it does nothing; while another DevFlow
+    /// verb holds the phase it stops nothing and says so.
     Stop {
         /// Phase to stop.
         #[arg(long)]
         phase: PhaseId,
-        /// Tear down only the supervisor socket with this launch id; answers
-        /// no gate, signals no holder and writes no state.
-        #[arg(long)]
-        launch: Option<String>,
         /// Project root. Overrides the positional argument when supplied.
         #[arg(long)]
         root: Option<PathBuf>,
@@ -406,8 +332,6 @@ pub(crate) enum CliError {
     #[error(transparent)]
     Workflow(#[from] devflow_core::workflow::WorkflowError),
     #[error(transparent)]
-    Recover(#[from] devflow_core::recover::RecoverError),
-    #[error(transparent)]
     Git(#[from] devflow_core::git::GitError),
     #[error(transparent)]
     Worktree(#[from] devflow_core::worktree::WorktreeError),
@@ -487,7 +411,6 @@ fn run() -> Result<(), CliError> {
             phase,
             agent,
             mode,
-            force,
             no_worktree,
             dry_run,
             until,
@@ -501,50 +424,22 @@ fn run() -> Result<(), CliError> {
                 phase,
                 agent,
                 mode,
-                force,
                 worktree,
                 dry_run,
                 until,
                 commands::FallbackSource::FlagOrConfig(fallback_agent),
             )
         }
-        Command::Advance {
-            project,
-            phase,
-            stage,
-        } => pipeline_launch::advance_command(&project_root(project)?, phase, stage),
-        Command::Monitor {
-            project,
-            phase,
-            stage,
-            workdir,
-            agent,
-            launch,
-            socket,
-            launch_id,
-            liveness_fd,
-            keep_env,
-            prompt_file,
-            idle_timeout_secs,
-            argv,
-        } => run_monitor(
-            &pipeline_launch::MonitorInvocation {
-                project_root: project_root(project)?,
-                phase,
-                stage,
-                workdir,
-                agent,
-                launch,
-                socket,
-                launch_id,
-                liveness_fd,
-                keep_env,
-                prompt_file,
-                idle_timeout_secs,
-                argv,
-            },
-            true,
-        ),
+        Command::Runner { project, phase } => {
+            match pipeline_launch::run_runner(&project_root(project)?, phase)? {
+                0 => Ok(()),
+                code => {
+                    use std::io::Write as _;
+                    let _ = std::io::stdout().flush();
+                    std::process::exit(code)
+                }
+            }
+        }
         Command::Resume {
             phase,
             agent,
@@ -613,7 +508,7 @@ fn run() -> Result<(), CliError> {
             project,
         } => logs(&project_root(project)?, phase, follow, stderr),
         Command::History { phase, project } => history_cmd(&project_root(project)?, phase),
-        Command::Cleanup { project, force } => cleanup(&project_root(project)?, force),
+        Command::Cleanup { project } => cleanup(&project_root(project)?),
         Command::Discard {
             phase,
             delete_unmerged_branch,
@@ -624,24 +519,12 @@ fn run() -> Result<(), CliError> {
             delete_unmerged_branch.as_deref(),
         ),
         Command::Status { project } => status(&project_root(project)?),
-        Command::Recover {
-            project,
-            clean,
-            phase,
-        } => recover_cmd(&project_root(project)?, clean, phase),
         Command::Doctor { json, project } => doctor(&project_root(project)?, json),
         Command::Stop {
             phase,
-            launch,
             root,
             project,
-        } => {
-            let root = project_root(root.unwrap_or(project))?;
-            match launch {
-                Some(launch_id) => stop_launch(&root, phase, &launch_id),
-                None => stop(&root, phase),
-            }
-        }
+        } => stop(&project_root(root.unwrap_or(project))?, phase),
     }
 }
 

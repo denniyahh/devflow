@@ -21,7 +21,7 @@ flowchart LR
 |---|---|---|
 | State and control | `state`, `stage`, `workflow` | Persist and safely advance each phase |
 | Agent execution | `agents`, `prompt`, `monitor`, `agent_result` | Build prompts, launch agents, capture and evaluate outcomes |
-| Reliability | `verify`, `history`, `events`, `gates`, `recover`, `reset_time` | External probes, durable evidence, operations visibility, recovery, rate-limit reset times |
+| Reliability | `verify`, `history`, `events`, `gates`, `reset_time` | External probes, durable evidence, operations visibility, rate-limit reset times |
 | Git lifecycle | `git`, `worktree` | Branches and worktrees |
 | Configuration | `config` | Minimal `devflow.toml` reliability knobs |
 

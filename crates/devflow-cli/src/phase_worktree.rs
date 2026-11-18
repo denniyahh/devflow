@@ -22,47 +22,30 @@ use crate::CliError;
 pub(crate) fn ensure_phase_worktree(
     project_root: &Path,
     phase: PhaseId,
-    force: bool,
     base: &str,
 ) -> Result<PathBuf, CliError> {
     let wt = worktree::phase_path(project_root, phase);
     let branch = format!("{FEATURE_PREFIX}phase-{padded}", padded = phase.padded());
-
-    if force {
-        // Project-resolved: `delete_branch`'s protected-branch list, and the
-        // trunk the merged check counts against, must name the configured
-        // trunk, which is `base`, not the default one.
-        let git = GitFlow::with_config(
-            project_root,
-            GitFlowConfig {
-                develop: base.to_string(),
-                ..GitFlowConfig::default()
-            },
-        );
-        // Checked before anything is removed: a refusal leaves the worktree too.
-        refuse_force_over_unmerged_branch(
-            &git,
-            &branch,
-            base,
-            wt.exists().then_some(wt.as_path()),
-        )?;
-        if wt.exists() {
-            worktree::remove(project_root, &wt, true)?;
-        }
-        if git.branch_exists(&branch) {
-            git.delete_branch(&branch, true)?;
-        }
+    let git = GitFlow::with_config(
+        project_root,
+        GitFlowConfig {
+            develop: base.to_string(),
+            ..GitFlowConfig::default()
+        },
+    );
+    // 52.1 D-09.1, D-10: `start` removes nothing an earlier run left, so a leftover
+    // branch is refused here rather than by `git worktree add -b`'s own error.
+    if !wt.exists() && git.branch_exists(&branch) {
+        return Err(leftover_refusal(phase, &format!("branch `{branch}`"), base));
     }
 
     match worktree::add(project_root, &wt, &branch, base, true) {
         Ok(()) => Ok(wt),
-        Err(devflow_core::worktree::WorktreeError::Exists(path)) => {
-            Err(CliError::Message(format!(
-                "worktree already exists at {} — use --force to recreate it (refused while \
-                 its branch has commits not merged into `{base}`)",
-                path.display()
-            )))
-        }
+        Err(devflow_core::worktree::WorktreeError::Exists(path)) => Err(leftover_refusal(
+            phase,
+            &format!("the phase worktree {}", path.display()),
+            base,
+        )),
         Err(err) => Err(err.into()),
     }
 }
@@ -74,40 +57,16 @@ pub(crate) fn unmerged_commits(count: usize, base: &str) -> String {
     format!("{count} {noun} not merged into `{base}`")
 }
 
-/// Refuse a `--force` start that would delete or reset `branch` while it holds commits
-/// not merged into `git`'s trunk (`base`). Since there is no Ship stage, a finished
-/// run's branch holds the only copy of its work until the operator closes it out, and
-/// `git branch -D` would lose it. An absent branch, or one whose every commit is merged,
-/// passes; a branch whose merge state cannot be read is refused, never assumed merged.
-/// `worktree` is the phase worktree that has the branch checked out, when one exists:
-/// git refuses to delete a branch a worktree has checked out, so the command the
-/// refusal names removes that worktree first.
-pub(crate) fn refuse_force_over_unmerged_branch(
-    git: &GitFlow,
-    branch: &str,
-    base: &str,
-    worktree: Option<&Path>,
-) -> Result<(), CliError> {
-    if !git.branch_exists(branch) {
-        return Ok(());
-    }
-    let why = match git.commits_not_in_develop(branch) {
-        Ok(0) => return Ok(()),
-        Ok(count) => format!("has {}", unmerged_commits(count, base)),
-        Err(err) => format!("could not be checked for commits not merged into `{base}` ({err})"),
-    };
-    let delete = match worktree {
-        Some(path) => format!(
-            "git worktree remove --force {} && git branch -D {branch}",
-            path.display()
-        ),
-        None => format!("git branch -D {branch}"),
-    };
-    Err(CliError::Message(format!(
-        "refusing --force: branch `{branch}` {why}, and recreating it from `{base}` would \
-         delete them. Nothing was removed. Close out or merge the branch into `{base}` first, \
-         or delete it yourself with `{delete}` and run this start again"
-    )))
+/// `start`'s refusal over `what` (a phase worktree or branch) that an earlier run of
+/// `phase` left. `start` removes nothing (52.1 D-09.1, D-10): `devflow discard` is the
+/// verb that removes a phase's worktree, branch and run state, and it lists them first.
+pub(crate) fn leftover_refusal(phase: PhaseId, what: &str, base: &str) -> CliError {
+    CliError::Message(format!(
+        "phase {phase}: {what} is left from an earlier run, and `start` removes nothing. \
+         Run `devflow discard --phase {phase}` to remove the phase's worktree, branch and run \
+         state (it lists them first, and refuses a branch with commits not merged into \
+         `{base}` unless you name it), then run this start again"
+    ))
 }
 
 #[cfg(test)]
@@ -152,7 +111,7 @@ mod tests {
         git(&["commit", "-q", "-m", "planning"]);
         git(&["checkout", "-q", "develop"]);
 
-        let wt = ensure_phase_worktree(root, PhaseId::new(45), false, "workspace/example")
+        let wt = ensure_phase_worktree(root, PhaseId::new(45), "workspace/example")
             .expect("worktree off the configured base");
         assert!(
             wt.join(".planning/config.json").exists(),
@@ -161,68 +120,11 @@ mod tests {
 
         // NEGATIVE CONTROL: the same call against `develop` must NOT see it.
         let wt_default =
-            ensure_phase_worktree(root, PhaseId::new(46), false, devflow_core::config::DEVELOP)
+            ensure_phase_worktree(root, PhaseId::new(46), devflow_core::config::DEVELOP)
                 .expect("worktree off develop");
         assert!(
             !wt_default.join(".planning/config.json").exists(),
             "a worktree forked from develop must not carry the planning branch's files"
-        );
-    }
-
-    /// `--force` still recreates the phase worktree, from the base, when every commit on
-    /// its branch is merged into the base: the old worktree's files are gone and the
-    /// branch is re-forked at the base's tip.
-    #[test]
-    fn force_recreates_a_worktree_whose_branch_is_merged() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let git = |args: &[&str]| -> String {
-            let out = devflow_core::test_support::git_command(root)
-                .args(args)
-                .output()
-                .expect("spawn git");
-            assert!(
-                out.status.success(),
-                "git {args:?} failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        };
-        git(&["init", "-q", "-b", "develop"]);
-        git(&["config", "user.email", "t@e.st"]);
-        git(&["config", "user.name", "t"]);
-        git(&["config", "commit.gpgsign", "false"]);
-        git(&["config", "core.hooksPath", "/dev/null"]);
-        std::fs::write(root.join("README.md"), "x").unwrap();
-        git(&["add", "-A"]);
-        git(&["commit", "-q", "-m", "init"]);
-
-        let phase = PhaseId::new(47);
-        let wt = ensure_phase_worktree(root, phase, false, "develop").expect("first worktree");
-        std::fs::write(wt.join("phase-work.txt"), "work").unwrap();
-        devflow_core::test_support::git_command(&wt)
-            .args(["add", "-A"])
-            .status()
-            .expect("spawn git add");
-        let committed = devflow_core::test_support::git_command(&wt)
-            .args(["commit", "-q", "-m", "phase work"])
-            .status()
-            .expect("spawn git commit");
-        assert!(committed.success(), "premise: the phase commit lands");
-        git(&["merge", "-q", "--ff-only", "feature/phase-47"]);
-        std::fs::write(wt.join("scratch.txt"), "left in the old worktree").unwrap();
-
-        let recreated = ensure_phase_worktree(root, phase, true, "develop")
-            .expect("--force recreates a worktree whose branch is merged");
-        assert_eq!(recreated, wt);
-        assert!(
-            !recreated.join("scratch.txt").exists(),
-            "the old worktree was removed"
-        );
-        assert_eq!(
-            git(&["rev-parse", "feature/phase-47"]),
-            git(&["rev-parse", "develop"]),
-            "the branch is re-forked at the base's tip"
         );
     }
 }
