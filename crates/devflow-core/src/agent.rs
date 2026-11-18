@@ -232,9 +232,10 @@ pub fn process_start_time(pid: u32) -> Option<u64> {
     rest.split_whitespace().nth(19)?.parse::<u64>().ok()
 }
 
-/// The `/proc/<pid>/stat` fields the stale-socket backstop decides on
-/// ([`crate::supervisor::backstop`]): one read gives state, process group,
-/// session and start time together, so they describe the same instant.
+/// The `/proc/<pid>/stat` fields of one process, from one read, so state, process
+/// group, session and start time describe the same instant. Test support reads them
+/// (`test_support::live_group_members`).
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ProcStat {
     /// Field 3, the one-letter state (`R`, `S`, `Z`, ...).
@@ -251,6 +252,7 @@ pub(crate) struct ProcStat {
 /// Read [`ProcStat`] for `pid` from one read of `/proc/<pid>/stat`. `None`
 /// when the file cannot be read or parsed (the process is gone, or this is
 /// not Linux): the fail-closed direction, as for [`process_start_time`].
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn process_stat_fields(pid: u32) -> Option<ProcStat> {
     parse_stat_fields(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
 }
@@ -258,6 +260,7 @@ pub(crate) fn process_stat_fields(pid: u32) -> Option<ProcStat> {
 /// [`process_stat_fields`]'s parser. Splits after the FINAL `)`, because
 /// field 2 (comm) may contain spaces and parentheses; after that point field
 /// 3 is index 0, so field 5 is 2, field 6 is 3 and field 22 is 19.
+#[cfg(any(test, feature = "test-support"))]
 fn parse_stat_fields(stat: &str) -> Option<ProcStat> {
     let rest = &stat[stat.rfind(')')? + 1..];
     let fields: Vec<&str> = rest.split_whitespace().collect();
@@ -288,14 +291,11 @@ pub fn is_same_process(pid: u32, expected_start: u64) -> bool {
 ///
 /// Both layers are 2.x process shapes, and a 3.x binary starts neither
 /// (50-11 deleted the `sh` monitor wrapper and its `devflow advance` child):
-/// the census is kept for 2.x leftovers only. A 3.x supervisor is a
-/// `devflow __monitor` process that this census never matches; `doctor`
-/// finds it through its socket (its supervisor findings), and `devflow stop
-/// --phase N --launch <id>` ends it.
+/// the census is kept for 2.x leftovers only. A 3.x supervisor (`devflow
+/// __monitor`) and a 4.x runner are processes this census never matches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StrayLayer {
-    /// The monitor wrapper shell spawned by `monitor::spawn_monitor` — the
-    /// `sh -c <script>` process that owns the agent and, on exit, runs
+    /// The 2.x monitor wrapper shell — the `sh -c <script>` process that owns the agent and, on exit, runs
     /// `devflow advance`.
     MonitorWrapper,
     /// The trailing `devflow advance` invocation the wrapper's script runs
@@ -345,13 +345,7 @@ const ADVANCE_SUBCOMMAND: &str = "advance";
 /// **2.x-only.** Both matchers name 2.x process shapes (the `sh -c` monitor
 /// wrapper and its trailing `devflow advance` child) that 50-11 deleted, so
 /// this census never matches a process a 3.x binary starts. It is kept for
-/// 2.x leftovers (D-20 keeps none live at install). A 3.x supervisor is
-/// found through its socket instead — `doctor`'s supervisor findings,
-/// including the deleted-root class this census used to cover — and ended
-/// with `devflow stop --phase N --launch <id>`. Do not add a `__monitor`
-/// matcher: a live supervisor's pid is in no reachability safety set, since
-/// the state records no monitor pid (50-22, 50-16), so `doctor` would report
-/// every live run as a stray.
+/// 2.x leftovers (D-20 keeps none live at install).
 ///
 /// This is a pure, read-only survey: it never signals a process. Deciding
 /// whether to act on a result, and re-confirming identity immediately

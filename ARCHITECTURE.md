@@ -130,29 +130,35 @@ gate wait (D-08):
 
 - **State write lock** (`.devflow/.state-{phase:02}.lock`, `workflow.rs`) — a
   `flock` taken for one read-modify-write of the state file, so it is short:
-  usually milliseconds. A stalled gate lock or a socket dying mid-ping can stretch
-  it to about 10 s in a gate answer, 13 s while `recover` decides a phase and 16 s
-  in a reservation that loads a state. The 16 s is counted from the code's timeouts,
-  not measured: two socket probes at 8 s, or a 6 s probe that finds a dead group, the
-  2 s wait for a supervisor exiting, then an 8 s probe. A missing or unloadable state
-  instead probes each socket left for the phase, up to 8 s each. The file is never replaced or removed, because a `flock`
-  belongs to an inode. Repair verbs (`devflow stop`, `devflow recover --clean`)
+  usually milliseconds. A closure that waits on the gate lock inside it waits at
+  most `GATE_LOCK_WAIT` (5 s) for each acquisition. The file is never replaced or removed, because a `flock`
+  belongs to an inode. Repair verbs (`devflow discard`)
   wait at most `WRITE_LOCK_REPAIR_WAIT` (10 s), then name the holder and write
   nothing, so a hold that long costs them a refusal, not a hang.
-- **Launch reservation** (`state.pending_supervisor` and
-  `.devflow/supervisor-<launch_id>.live`, `liveness.rs`) — a launcher takes the
-  `flock` before it saves the pending record, and the spawned supervisor inherits
-  and holds it for life, so a pending supervisor is probeable before its socket
-  exists. A reservation whose launcher died holds nothing and reads abandoned.
+- **Phase holder and runner lock** (`.devflow/.holder-{phase:02}` and
+  `.devflow/.runner-{phase:02}`, `liveness.rs`) — a launch takes no reservation
+  and the state records no launch. `start` and `resume` hold the phase holder across
+  their guards, the state write and the unit launch, which keeps a second launcher
+  out (D-07), and the runner holds the runner lock for the whole run, which is what
+  answers liveness.
 - **Gate registration** (`.devflow/gates/{phase:02}-{stage}.{gate_id}.waiter`,
   `gates.rs`) — a `flock` a waiter holds for the length of its wait, which is what
   "something waits on this gate" means. `.devflow/.gates-{phase:02}.lock` guards a
   few file operations at a time (at most `GATE_LOCK_WAIT`, 5 s) and is never
   removed.
 - **Foreground holder** (`.devflow/.holder-{phase:02}`, `liveness.rs`) — held for
-  its lifetime by a `start`/`resume` before its spawn or a hand-run
-  `devflow advance`, recording its pid and start time. It is the only pid
-  `devflow stop` signals, and only when the holder's start time still matches.
+  its lifetime by a foreground verb (`start` and `resume` until `systemd-run`
+  returns, `discard`), recording its pid and start
+  time, so no two of them act on the phase at once. It installs no stop handler:
+  `devflow stop` never signals it, and refuses while it is held and no runner is
+  live.
+- **Runner lock** (`.devflow/.runner-{phase:02}`, `liveness.rs`) — the foreground
+  runner (`devflow runner`, registered as the hidden `__runner` subcommand, which a
+  `systemd-run --user` unit runs) takes it before anything else and holds it for its
+  whole life, recording its pid and start time. It is opened close-on-exec, so the
+  agent the runner spawns never holds it, and the runner never takes the phase's
+  foreground holder. Under `Type=notify` the runner sends `READY=1` only once the
+  lock is held, so a runner that cannot take it fails the unit's start.
 
 State and gate files are written through the durable helpers in
 `crates/devflow-core/src/durable.rs` (D-09), and a source scan
@@ -162,7 +168,7 @@ loss itself is not tested: the fsyncs are covered in code, not proven against a
 real power cut.
 
 That scope covers state and gate files only. `supervisor-*.live`, `*.waiter`,
-`.holder-NN`, `.state-NN.lock`, `.gates-NN.lock`, `*.hold-tmp` and
+`.holder-NN`, `.runner-NN`, `.state-NN.lock`, `.gates-NN.lock`, `*.hold-tmp` and
 `.devflow/.gitignore` are each an advisory marker deliberately outside D-09: no
 state lives in them, a held lock rather than the file's presence decides liveness,
 and no holder survives a power loss, so a marker a crash resurrects or loses reads
@@ -212,8 +218,7 @@ written durably):
   — an answer set aside rather than consumed or deleted (`Gates::quarantined()`):
   a missing or other id, an unparsable body, a legacy unkeyed
   `{phase:02}-{stage}.response.json`, or one left unused when its gate closed. It
-  stays until removed by hand, and `devflow status`, `devflow doctor` and
-  `devflow recover --clean` list it.
+  stays until removed by hand, and `devflow status` and `devflow doctor` list it.
 
 `devflow gate approve|reject` answer the gate open now, or with `--gate-id <ID>`
 the one `gate list` or `gate show` displayed, and first move aside an answer in
@@ -230,17 +235,15 @@ which holds no write lock and waits through `Gates::await_answer()`. That reads
 the gate's answer slot with a backoff (1s → 2s → … capped at 60s) and checks for a
 stop at least once a second, one of two ways:
 
-- **Inside a supervisor's advance** (its stop token is engaged, 50-13): the
-  run's owner reads `gate_wait` in a `ping` reply for the length of the wait,
-  and the stop token is what is checked. A stop — a `shutdown` request on the
-  supervisor's socket, or SIGTERM/SIGINT to the supervisor — ends the wait within
-  about a second: the gate is closed, `stopped` is recorded in the state, which is
-  kept for `devflow resume` (not an abort), and the advance unwinds without acting
-  on the gate. A stop accepted in the same second as an answer wins.
-- **Anywhere else** (no stop token: the hidden `devflow advance` run from a
-  shell, or a gate a foreground command fires): the foreground holder's stop flag
-  is checked instead, so `devflow stop`'s signal ends the wait the same way (safe
-  point 4).
+- **Inside the runner's advance** (its run-long stop token is engaged, D-05): the
+  stop token is what is checked. A stop — SIGTERM/SIGINT to the runner, which
+  `devflow stop` sends by stopping the run's unit — ends the wait within about a
+  second: the gate is closed, `stopped` is recorded in the state, which is kept
+  for `devflow resume` (not an abort), and the advance unwinds without acting on
+  the gate. A stop accepted in the same second as an answer wins.
+- **Anywhere else** (no stop token: a gate a foreground command fires): the
+  foreground holder's stop flag is checked instead (safe point 4). `devflow stop` signals no holder; it stops
+  the run's unit ([Runner unit](#runner-unit)).
 
 A file in the slot that does not bind to the gate is set aside and the wait goes
 on with the time left. Either wait ends when a bound answer appears or
@@ -255,56 +258,76 @@ fields, never its note: `abort: true` is `Abort(reason)`, an approval is
 (`Gates::list_open()`) enumerates requests with no answer bound to them yet,
 skipping unparsable entries rather than failing.
 
+## Runner unit
+
+Every run is one systemd user unit, `devflow-<digest>-NN.service`
+(`service::unit_name`; the digest is `registry::path_digest` over the canonical
+project root), and that unit replaces the detached supervisor for launching and
+stopping a run. `devflow start` and `devflow resume` check that the user
+manager answers (`service::manager_available`), hold the phase's foreground
+holder through the launch, and run `systemd-run --user`
+(`service::launch_runner_unit`). The unit is `Type=notify` with
+`KillMode=control-group` and `TimeoutStopSec=10s`, and is collected when it
+ends. It runs the hidden `__runner` subcommand in the project root, with the
+caller's environment passed by name (`--setenv NAME`, so no value reaches a
+command line). `systemd-run` returns once the runner holds its runner lock and
+has sent `READY=1`; a failed start names the unit and `systemd-run`'s stderr.
+The runner runs each stage's agent through `monitor::run_stage`, waits at gates
+and advances in-process until the run finishes, stops or fails.
+
+`devflow stop` (`commands::stop`) stops the unit with `systemctl --user stop`.
+The manager signals the unit's whole control group, so the agent ends with the
+runner, and the runner records `stopped` itself; `stop` then reads the state to
+say how the run ended (`commands::stop_outcome`). It signals no pid and writes
+no state. Without lingering (`service::lingering_enabled`) the user manager,
+and every unit under it, ends at logout: `start` and `resume` warn and launch
+anyway. With no answering user manager neither launches, and there is no
+fallback launch without a unit (D-03). The section below describes how the
+runner runs each stage.
+
 ## Monitor daemon
 
-`crates/devflow-core/src/monitor.rs` is the core automation primitive — no
-cron, no scheduler, no agent cooperation. `spawn_monitor()` re-execs the CLI
-as its hidden `__monitor` subcommand, **a detached supervisor process in its
-own process group that owns the agent**, for both launch shapes:
+`crates/devflow-core/src/monitor.rs` holds the stage primitive the runner
+calls — no cron, no scheduler, no agent cooperation. `monitor::run_stage` runs
+one stage's agent in the runner's own process and returns once the agent has
+exited. No separate monitor or supervisor process exists: the runner owns each
+agent as its child, and every stage of a run, its gate waits and its advance
+run in-process in that one runner ([Runner unit](#runner-unit)). A stage
+launches in one of two shapes:
 
-- **capture** (`MonitorLaunch::Legacy`): the agent's stdin is `/dev/null` and
-  its stdout and stderr go straight to the phase capture files (stderr is kept
-  out of the stdout capture so it can never corrupt the `DEVFLOW_RESULT`
-  parse). Adapters other than Claude and Antigravity, and a checkpoint resume,
-  use it.
-- **stream** (`MonitorLaunch::PipeOwning`): the supervisor owns the agent's
-  stdin and stdout pipes, delivers the prompt as the first turn and applies the
-  idle timeout. Claude and Antigravity `stream-json` launches use it.
+- **capture**: the agent's stdin is `/dev/null` and its stdout and stderr go
+  straight to the phase capture files (stderr is kept out of the stdout
+  capture so it can never corrupt the `DEVFLOW_RESULT` parse). Adapters other
+  than Claude and Antigravity, and a checkpoint resume, use it.
+- **stream**: the runner owns the agent's stdin and stdout pipes, delivers the
+  prompt as the first turn and applies the idle timeout. Claude and Antigravity
+  `stream-json` launches use it.
 
-The supervisor (`run_supervised_stage()`):
+For each stage the runner:
 
-1. Spawns the agent (`program` + `args`) in the agent's own process group and
-   records its PID.
-2. Publishes a per-launch Unix socket under `registry::cache_dir()/sock/`,
-   with a JSON sidecar beside it naming the launch (project root, phase,
-   agent process group, start time, boot id). The socket path is recorded in
-   the phase's `state.json` as `state.supervisor`; liveness (ALIVE / STALE /
-   GONE) is answered by probing that path, never from a pid.
-3. Answers `ping` and `shutdown` on the socket, and treats SIGTERM and SIGINT
-   sent to it as a `shutdown`: the agent's group is ended and no advance runs.
-4. Waits for the agent to exit and records its exit code to
-   `.devflow/phase-NN-exit`. A stream supervisor's reader keeps draining the
+1. Spawns the agent (`program` + `args`) in the agent's own process group, and
+   fails the stage if the agent does not lead that group.
+2. Waits for the agent to exit and records its exit code to
+   `.devflow/phase-NN-exit`. A stream stage's reader keeps draining the
    agent's stdout until the pipe closes, and a process the agent started can
-   hold that stdout open after the agent exits. The supervisor then waits up
-   to `READER_DRAIN_WAIT` (3 s) for its pipe threads, then takes the capture
-   file from the reader, within one more `READER_DRAIN_WAIT` when a capture
-   write is blocked, so at most 6 s in all (plus a poll interval per wait). A
-   write still blocked after that keeps the capture file. It detaches the
-   unfinished threads, records a `stream_wait_bounded` event, and signals
-   nothing. The detached reader keeps draining the pipe, discarding what it
-   reads, until the supervisor exits.
-5. On the agent's natural exit, runs the advance in-process. The phase is
-   threaded in at spawn time, so the advance's identity never depends on a
-   shared state singleton — with several phases running, each phase's supervisor
-   advances exactly its own stage. When the advance launches the next stage,
-   that stage's supervisor publishes its socket before this one unlinks its
-   own, so the hand-off leaves no gap with neither socket published.
+   hold that stdout open after the agent exits. The runner then waits up to
+   `READER_DRAIN_WAIT` (3 s) for its pipe threads, then takes the capture file
+   from the reader, within one more `READER_DRAIN_WAIT` when a capture write is
+   blocked, so at most 6 s in all (plus a poll interval per wait). A write
+   still blocked after that keeps the capture file. It detaches the unfinished
+   threads, records a `stream_wait_bounded` event, and signals nothing. The
+   detached reader keeps draining the pipe, discarding what it reads, until
+   the runner exits.
+3. Hands the exit back to the runner loop, which judges the stage and then
+   opens a gate, launches the next stage in the same process, or ends the run.
+   The phase is threaded in at launch, so a stage's identity never depends on
+   a shared state singleton: with several phases running, each phase's runner
+   advances exactly its own stages.
 
-`spawn_monitor()` returns once the new supervisor answers a ping with this
-launch's id. Because the supervisor outlives the CLI process that launched
-it, agent stdout keeps flowing into the capture file and the exit code is
-still reaped after that process returns. `spawn_monitor()` is the single way
-an agent process is spawned (23d).
+A stop reaches a stage through the runner's stop token: a SIGTERM or SIGINT
+that the unit's manager sends ends the agent's group, and no next stage is
+launched. Whether a run is live is the runner lock, never a pid or a socket
+(OPERATIONS.md, `## Run liveness`).
 
 ## Worktree model
 
@@ -333,7 +356,7 @@ them; integrating the branch is the operator's step. `finish_run()` takes a
 `FinishPermit`, which only `can_finish` makes: GSD's fresh status is `passed`
 and the run's Validate agent PASS is recorded on the current commit over a
 clean tree (D-45, D-46). A permitted finish wins over a late `devflow stop`,
-which the supervisor answers `already_finished`.
+which then reports that the run had already finished.
 
 ## Configuration
 
@@ -347,9 +370,13 @@ optional minimal `devflow.toml` contains only reliability knobs:
 | `--phase N` | Phase number to work on |
 | `--agent claude\|codex\|opencode` | Agent to launch |
 | `--mode auto\|supervise` | `auto` runs unattended and finishes on a passing Validate (gating only on repeated Validate failure, plus never-silent failure gates); `supervise` also gates every Validate |
-| `--force` | Recreate the phase worktree and feature branch from the base if they exist; refused, with nothing removed, while the branch has commits not merged into the base |
 | `--no-worktree` | Run in the primary checkout instead of an isolated worktree |
 | `--dry-run` | Print the pipeline that would run without launching anything |
+
+`start` removes nothing: over a leftover phase worktree, branch or run state it
+refuses, naming `devflow discard --phase N`, which lists what it removes first and
+refuses a branch with commits not merged into the base unless you name it; the
+refusal over an incomplete run also names `devflow resume --phase N`.
 
 Runtime state lives under `.devflow/` (git-ignored), keyed per-phase —
 `state-{phase:02}.json` (see [Per-phase state and

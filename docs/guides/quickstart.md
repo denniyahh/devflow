@@ -23,13 +23,22 @@ devflow start --phase 3 --agent claude --mode auto
 ```
 
 This creates a feature branch (in its own git worktree by default), launches
-the agent, and persists that phase's progress to
-`.devflow/state-03.json` (state is per-phase, not a single shared file).
+the run as a systemd user unit named from the project and the phase, and
+persists that phase's progress to `.devflow/state-03.json` (state is
+per-phase, not a single shared file). `start` returns once the unit is ready;
+the run keeps going after your shell exits. With lingering off it ends when
+you log out (`loginctl enable-linger` turns lingering on), and a host without
+a systemd user manager cannot launch a run.
 
-## Check Status
+## Watch and Stop
+
+From any shell:
 
 ```bash
 devflow status
+devflow logs --phase 3 -f      # follow the agent's output
+devflow stop --phase 3         # stop the run's unit
+devflow resume --phase 3       # continue a stopped run as a new unit
 ```
 
 ## Finishing
@@ -53,6 +62,7 @@ for the full gate-answering reference.
 - **git** 2.30+
 - **gh CLI** 2.0+ (`devflow doctor` checks for it; no DevFlow command runs it)
 - An installed AI agent (Claude Code, Codex, or OpenCode)
+- A systemd user manager (`systemctl --user`), which runs each run's unit
 
 Verify your setup:
 

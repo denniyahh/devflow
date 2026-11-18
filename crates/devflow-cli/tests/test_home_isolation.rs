@@ -13,16 +13,23 @@
 //! process's environment. A suite is covered as soon as it declares
 //! `mod common;`, without editing this file.
 //!
+//! `suites_using_common_set_path_only_through_hermetic_path` scans the same
+//! suites for a child `PATH` set any way but `common::HermeticPath`, which
+//! keeps the fake service manager and the agent guard in front.
+//!
 //! Every scanned token is spelled through `concat!` split inside the token, so
 //! this file's own source holds a raw spawn token exactly once: at the
-//! negative-control spawn. Nothing here reads the operator's real
+//! negative-control spawn, and a `PATH` override exactly once: in
+//! `run_on_path`. Nothing here reads the operator's real
 //! `~/.cache/devflow`.
 
 mod common;
 
+use common::HermeticPath;
 use devflow_core::phase_id::PhaseId;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -31,8 +38,8 @@ use std::time::Duration;
 /// failure cannot leave an immortal monitor.
 const GATE_TIMEOUT_SECS: &str = "15";
 
-/// How long a launched run may take to record its agent pid.
-const AGENT_PID_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a launched run's runner may take to hold its runner lock.
+const RUNNER_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn git(root: &Path, args: &[&str]) {
     let output = devflow_core::test_support::git_command(root)
@@ -69,7 +76,8 @@ fn init_repo(root: &Path, phase: PhaseId) {
     git(root, &["commit", "-q", "-m", "base"]);
 }
 
-/// Adds the `start` arguments and the fake-agent `PATH` to `command`.
+/// Adds the `start` arguments and the fake-agent `PATH` to `command`, behind
+/// the fake service manager already first on its `PATH`.
 fn add_start_args(command: &mut Command, root: &Path, phase: PhaseId, fake_bin: &common::FakeBin) {
     let existing = std::env::var_os("PATH").unwrap_or_default();
     let path = format!("{}:{}", fake_bin.path.display(), existing.to_string_lossy());
@@ -86,7 +94,7 @@ fn add_start_args(command: &mut Command, root: &Path, phase: PhaseId, fake_bin: 
         ])
         .arg(root)
         .current_dir(root)
-        .env("PATH", path)
+        .hermetic_path(path)
         .env("DEVFLOW_GATE_TIMEOUT_SECS", GATE_TIMEOUT_SECS);
 }
 
@@ -101,15 +109,17 @@ fn env_set_by(command: &Command, name: &str) -> PathBuf {
     PathBuf::from(value)
 }
 
-/// Runs `command` (a `start` built by the caller), reaps the run it launches,
-/// and returns every file under `roots` afterwards.
+/// Runs `command` (a `start` built by the caller, whose fake service manager is
+/// `home`'s), reaps the runner it launches, and returns every file under `roots`
+/// afterwards.
 fn run_start_and_list(
     mut command: Command,
+    home: &common::HermeticHome,
     root: &Path,
     phase: PhaseId,
     roots: &Path,
 ) -> Vec<PathBuf> {
-    let _reaper = common::LaunchedRunReaper::new(root, phase, vec![]);
+    let _reaper = common::LaunchedRunReaper::for_home(home, root, phase);
     let output = command.output().expect("run devflow start");
     assert!(
         output.status.success(),
@@ -117,13 +127,16 @@ fn run_start_and_list(
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    // Wait for the agent pid so the reaper can end the agent as well as the
-    // monitor.
-    let agent_pid = devflow_core::agent_result::agent_pid_path(root, phase);
+    // Wait for the runner to hold its lock, so the run is live when the files
+    // are listed and the reaper ends a runner that is past its launch.
+    let runner_lock = devflow_core::liveness::runner_lock_path(root, phase);
     common::wait_for(
-        || agent_pid.exists(),
-        AGENT_PID_TIMEOUT,
-        "the launched agent's pid file",
+        || {
+            devflow_core::liveness::probe(&runner_lock)
+                .is_ok_and(|held| held == devflow_core::liveness::Held::Live)
+        },
+        RUNNER_LOCK_TIMEOUT,
+        "the launched run's runner lock",
     );
     common::entries_under(roots)
 }
@@ -161,7 +174,7 @@ fn a_child_writing_outside_its_tempdir_home_fails() {
         );
     }
     let hermetic_roots = home.cache_dir().join("roots");
-    let entries = run_start_and_list(hermetic, repo.path(), phase, &hermetic_roots);
+    let entries = run_start_and_list(hermetic, &home, repo.path(), phase, &hermetic_roots);
     assert!(
         !entries.is_empty(),
         "the hermetic run must register under {}; it holds nothing",
@@ -190,14 +203,250 @@ fn a_child_writing_outside_its_tempdir_home_fails() {
     {
         plain.env_remove(name);
     }
+    common::with_fake_service_manager(&mut plain, &home);
     add_start_args(&mut plain, repo2.path(), phase, &fake_bin);
     let control_roots = real_home.path().join(".cache/devflow/roots");
-    let entries = run_start_and_list(plain, repo2.path(), phase, &control_roots);
+    let entries = run_start_and_list(plain, &home, repo2.path(), phase, &control_roots);
     assert!(
         !entries.is_empty(),
         "the plain-Command control must populate {}; it holds nothing, so the \
          hermetic assertion cannot fail",
         control_roots.display()
+    );
+}
+
+/// `program` with `args`, run to completion.
+fn run_tool(program: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(program)
+        .args(args)
+        .output()
+        .unwrap_or_else(|err| panic!("run {}: {err}", program.display()))
+}
+
+/// What a fake `systemctl` reports for `unit`'s `ActiveState`.
+fn fake_active_state(systemctl: &Path, unit: &str) -> std::process::Output {
+    run_tool(
+        systemctl,
+        &["--user", "show", "-p", "ActiveState", "--value", unit],
+    )
+}
+
+fn stdout_line(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+#[test]
+fn a_hermetic_child_resolves_the_fake_service_manager_first() {
+    let home = common::HermeticHome::new();
+    let service_bin = home.service_bin();
+
+    // The builder's PATH starts with the fake dir.
+    let mut command = common::hermetic_devflow(&home);
+    let path = env_set_by(&command, "PATH");
+    let first = std::env::split_paths(&path).next();
+    assert_eq!(
+        first.as_deref(),
+        Some(service_bin.as_path()),
+        "fake dir not first: the hermetic PATH is {}",
+        path.display()
+    );
+
+    // The fake answers the calls it handles.
+    let systemctl = service_bin.join("systemctl");
+    let version = run_tool(&systemctl, &["--user", "show", "-p", "Version", "--value"]);
+    assert!(
+        version.status.success() && stdout_line(&version) == common::FAKE_SYSTEMD_VERSION,
+        "the fake systemctl must print its version; it printed {:?} ({})",
+        stdout_line(&version),
+        version.status
+    );
+    let unit = "devflow-test.service";
+    assert_eq!(
+        stdout_line(&fake_active_state(&systemctl, unit)),
+        "inactive"
+    );
+    fs::write(service_bin.join(format!("{unit}.deactivating")), "").unwrap();
+    assert_eq!(
+        stdout_line(&fake_active_state(&systemctl, unit)),
+        "deactivating"
+    );
+    fs::write(service_bin.join(format!("{unit}.fail")), "").unwrap();
+    let failed = fake_active_state(&systemctl, unit);
+    assert_eq!(
+        failed.status.code(),
+        Some(1),
+        "a .fail marker must fail the call"
+    );
+    let reset = run_tool(&systemctl, &["--user", "reset-failed", unit]);
+    assert!(reset.status.success(), "reset-failed must succeed");
+
+    // Every fake fails an unplanned call loudly, naming itself.
+    for (tool, args) in [
+        ("systemctl", &["--user", "frobnicate"][..]),
+        ("systemd-run", &["--user", "true"][..]),
+        ("loginctl", &["show-user"][..]),
+    ] {
+        let output = run_tool(&service_bin.join(tool), args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.code() == Some(1) && stderr.contains(&format!("fake {tool}: unhandled:")),
+            "unhandled call passed: {tool} {args:?} exited {} with stderr {stderr:?}",
+            output.status
+        );
+    }
+
+    // A suite's own PATH entries go behind the fake dir.
+    let extra = home.home().join("extra-bin");
+    command.hermetic_path(&extra);
+    let expected = format!("{}:{}", service_bin.display(), extra.display());
+    assert_eq!(
+        env_set_by(&command, "PATH"),
+        PathBuf::from(&expected),
+        "hermetic_path must keep the fake dir first"
+    );
+
+    // Control: a command the builder did not make is refused, by name.
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        Command::new("true").hermetic_path(&extra);
+    }));
+    let payload = refused.expect_err("hermetic_path accepted a raw command");
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or_default();
+    assert!(
+        message.contains("hermetic_devflow"),
+        "the refusal must name hermetic_devflow; it said {message:?}"
+    );
+}
+
+/// Text the planted stand-in for a developer's real agent CLI prints.
+const REAL_AGENT_TEXT: &str = "the developer's real agent ran";
+
+/// Text a test's own working stub prints.
+const OWN_STUB_TEXT: &str = "the test's own stub ran";
+
+/// A dir holding an executable `name` per entry of `names`, each with `body`.
+fn dir_of_programs(names: &[&str], body: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("create a program dir");
+    for name in names {
+        let path = dir.path().join(name);
+        fs::write(&path, body).expect("write a planted program");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+            .expect("make a planted program executable");
+    }
+    dir
+}
+
+/// `program` resolved and run on exactly `path`, the way DevFlow launches an
+/// agent by name. The one PATH override in this file: it runs a planted
+/// program, never `devflow`, on a PATH built from temp dirs only.
+fn run_on_path(program: &str, path: &OsStr) -> std::process::Output {
+    Command::new(program)
+        .env("PATH", path)
+        .output()
+        .unwrap_or_else(|err| panic!("run {program} on PATH {path:?}: {err}"))
+}
+
+fn joined(dirs: &[&Path]) -> OsString {
+    std::env::join_paths(dirs).expect("temp dirs hold no ':'")
+}
+
+#[test]
+fn a_hermetic_path_never_falls_through_to_a_real_agent_cli() {
+    let home = common::HermeticHome::new();
+    let service_bin = home.service_bin();
+    let programs = common::agent_programs();
+    for registry_name in ["claude", "codex", "opencode", "pi", "agy", "hermes"] {
+        assert!(
+            programs.contains(&registry_name),
+            "agent_programs() must name {registry_name}; it is {programs:?}"
+        );
+    }
+
+    // Stand-in for the developer's PATH: a working fake of every agent name.
+    let real = dir_of_programs(
+        &programs,
+        &format!("#!/bin/sh\necho \"{REAL_AGENT_TEXT}\"\n"),
+    );
+    let parent = joined(&[real.path()]);
+    // A test stub whose interpreter is missing: exec fails with ENOENT.
+    let broken = dir_of_programs(&["codex"], "#!/nonexistent/interpreter\n");
+    let own = dir_of_programs(
+        &["codex"],
+        &format!("#!/bin/sh\necho \"{OWN_STUB_TEXT}\"\n"),
+    );
+
+    // Control: without the guard, the broken stub falls through to the real CLI.
+    let unguarded = run_on_path("codex", &joined(&[broken.path(), real.path()]));
+    assert!(
+        String::from_utf8_lossy(&unguarded.stdout).contains(REAL_AGENT_TEXT),
+        "the control must reach the planted real codex past the broken stub, or this \
+         test cannot fail; it printed {unguarded:?}"
+    );
+
+    // Guarded: the same PATH stops at the guard, loudly, for every agent name.
+    let guarded = common::guarded_path(
+        &service_bin,
+        &joined(&[broken.path(), real.path()]),
+        &parent,
+    );
+    for program in &programs {
+        let output = run_on_path(program, &guarded);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.code() == Some(common::NO_STUB_EXIT)
+                && stderr.contains(&format!("fake {program}{}", common::NO_STUB_TEXT))
+                && !String::from_utf8_lossy(&output.stdout).contains(REAL_AGENT_TEXT),
+            "{program} on the guarded PATH {guarded:?} must stop at the guard; it \
+             exited {} with stdout {:?} and stderr {stderr:?}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    // A test's own working stub still wins over the guard.
+    let with_stub =
+        common::guarded_path(&service_bin, &joined(&[own.path(), real.path()]), &parent);
+    let output = run_on_path("codex", &with_stub);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        OWN_STUB_TEXT,
+        "the test's own stub must answer first on {with_stub:?}; got {output:?}"
+    );
+
+    // The real builder and helper put the guard right after the fake service
+    // dir, before everything inherited from this process's PATH.
+    let mut command = common::hermetic_devflow(&home);
+    let second = |command: &Command| std::env::split_paths(&env_set_by(command, "PATH")).nth(1);
+    assert_eq!(
+        second(&command).as_deref(),
+        Some(home.agent_guard().as_path()),
+        "hermetic_devflow must put the agent guard second on PATH"
+    );
+    let stub_then_inherited = format!(
+        "{}:{}",
+        own.path().display(),
+        std::env::var_os("PATH")
+            .unwrap_or_default()
+            .to_string_lossy()
+    );
+    command.hermetic_path(&stub_then_inherited);
+    let path = env_set_by(&command, "PATH");
+    let entries: Vec<PathBuf> = std::env::split_paths(&path).collect();
+    assert_eq!(
+        entries.get(..3),
+        Some(
+            &[
+                service_bin.clone(),
+                own.path().to_path_buf(),
+                home.agent_guard()
+            ][..]
+        ),
+        "hermetic_path must keep the fake dir, then the test's own dir, then the guard; \
+         PATH is {}",
+        path.display()
     );
 }
 
@@ -350,6 +599,22 @@ fn env_mutations(code: &str) -> usize {
         .sum()
 }
 
+/// Child `PATH` overrides in comment-stripped `code`: `.env("PATH",`,
+/// `.env_remove("PATH")`, `.env_clear()` and `.envs(`. Whitespace is removed
+/// first, so a call rustfmt wrapped across lines still counts.
+fn path_overrides(code: &str) -> usize {
+    let compact: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    [
+        concat!(".env(\"PA", "TH\","),
+        concat!(".env_remove(\"PA", "TH\")"),
+        concat!(".env_", "clear()"),
+        concat!(".en", "vs("),
+    ]
+    .iter()
+    .map(|token| compact.matches(token).count())
+    .sum()
+}
+
 fn read_source(path: &Path) -> String {
     fs::read_to_string(path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()))
 }
@@ -443,4 +708,90 @@ fn suites_using_common_never_spawn_devflow_raw_or_mutate_the_environment() {
             path.display()
         );
     }
+}
+
+#[test]
+fn suites_using_common_set_path_only_through_hermetic_path() {
+    // (1) Planted controls: both override forms are flagged once, a call
+    // rustfmt wrapped is still flagged, and the look-alikes pass.
+    let planted_env = concat!("command.env(\"PA", "TH\", x);");
+    assert_eq!(
+        path_overrides(&code_only(planted_env)),
+        1,
+        "a planted PATH override must be flagged"
+    );
+    let planted_envs = concat!("command.en", "vs(pairs);");
+    assert_eq!(
+        path_overrides(&code_only(planted_envs)),
+        1,
+        "a planted envs call must be flagged"
+    );
+    let planted_wrapped = concat!(
+        "command\n    .env(\n        \"PA",
+        "TH\",\n        x,\n    );"
+    );
+    assert_eq!(
+        path_overrides(&code_only(planted_wrapped)),
+        1,
+        "a wrapped PATH override must be flagged"
+    );
+    let planted_paths = concat!("command.env(\"PA", "THS\", x);");
+    assert_eq!(
+        path_overrides(&code_only(planted_paths)),
+        0,
+        "a PATHS variable must pass"
+    );
+    let commented = format!("// {planted_env}\n");
+    assert_eq!(
+        path_overrides(&code_only(&commented)),
+        0,
+        "a commented-out override must pass"
+    );
+
+    // (2) Every suite but service_e2e.rs sets PATH only through
+    // hermetic_path; this file keeps exactly its run_on_path helper.
+    let tests_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let suites = suites_using_common(&tests_dir);
+    let is_service_suite = |path: &Path| path.ends_with("service_e2e.rs");
+    assert!(
+        suites.iter().any(|(path, _)| is_service_suite(path)),
+        "service_e2e.rs must declare `mod common;` for its exemption to mean anything"
+    );
+    let mut offenders = Vec::new();
+    for (path, code) in suites.iter().filter(|(path, _)| !is_service_suite(path)) {
+        let found = path_overrides(code);
+        let allowed = usize::from(path.ends_with("test_home_isolation.rs"));
+        if found != allowed {
+            offenders.push(format!(
+                "{} has {found} PATH override(s), not {allowed}",
+                path.display()
+            ));
+        }
+        if code.contains(concat!("host_service_", "devflow(")) {
+            offenders.push(format!(
+                "{} uses the real-PATH builder, which only service_e2e.rs may use",
+                path.display()
+            ));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "set PATH with common::HermeticPath::hermetic_path, so the fake service manager and \
+         the agent guard stay in front (test_home_isolation.rs keeps exactly its run_on_path \
+         helper):\n{}",
+        offenders.join("\n")
+    );
+
+    // (3) service_e2e.rs is exempt because it is the host-only suite that
+    // `scripts/check.sh service` runs against the real user manager: every
+    // test in it must be ignored, so no default run reaches that manager.
+    let service = code_only(&read_source(&tests_dir.join("service_e2e.rs")));
+    let tests = service.matches("#[test]").count();
+    let ignored = service.matches("#[ignore").count();
+    assert!(tests > 0, "service_e2e.rs holds no #[test]");
+    assert_eq!(
+        tests, ignored,
+        "service_e2e.rs has {tests} #[test] but {ignored} #[ignore]: every test there must be \
+         ignored so only scripts/check.sh service runs it"
+    );
 }

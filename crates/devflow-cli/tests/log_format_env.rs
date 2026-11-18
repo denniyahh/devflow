@@ -5,12 +5,14 @@
 //! (`crates/devflow-cli/src/main.rs`) by building an `EnvFilter` from
 //! `RUST_LOG` on both branches.
 //!
-//! This test drives `devflow recover --clean --phase 1` against a project
-//! holding `.devflow/state-01.json`. Before it deletes anything, the command
-//! loads the phase's state to refuse a live supervisor, and `workflow::load_state`
-//! emits `debug!("loading state from ...")`, giving a real DEBUG-level log line to
-//! assert on — not just "the binary didn't crash". (`devflow status` reads through
-//! `list_states`, which logs nothing at DEBUG, so it cannot serve here.)
+//! This test drives `devflow discard --phase 1` against a git repository
+//! holding `.devflow/state-01.json` and nothing else for the phase. Before it
+//! removes anything, the command loads the phase's state under the write lock
+//! (`workflow::update_state_with_within`, whose read calls `workflow::load_state`),
+//! and `load_state` emits `debug!("loading state from ...")`, giving a real
+//! DEBUG-level log line to assert on — not just "the binary didn't crash".
+//! (`devflow status` reads through `list_states`, which logs nothing at DEBUG, so
+//! it cannot serve here.)
 //!
 //! Regression guard for CR-02 (15-REVIEW.md, third round): `lib.rs` documents
 //! that "log output goes to stderr so stdout remains available for agent
@@ -32,13 +34,24 @@ use std::path::PathBuf;
 /// The DEBUG line `workflow::load_state` emits for the fixture's phase.
 const DEBUG_LINE: &str = "loading state from";
 
-/// What `recover --clean --phase 1` prints once it has cleared the fixture's state,
-/// so a test can tell "the line was filtered" from "the command never got there".
-const CLEANED_LINE: &str = "cleaned up workflow state for phase 1";
+/// What `discard --phase 1` prints once it has removed the fixture's state, so a
+/// test can tell "the line was filtered" from "the command never got there".
+const REMOVED_LINE: &str = "removed run state";
 
-/// Set up a project dir holding the per-phase state file for phase 1.
+/// Set up a git repository holding the per-phase state file for phase 1, and no
+/// worktree or branch for it. `discard` lists the repository's worktrees, so the
+/// project must be a repository.
 fn project_with_phase_state() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("create tempdir");
+    let init = devflow_core::test_support::git_command(dir.path())
+        .args(["init", "-q"])
+        .output()
+        .expect("spawn git init");
+    assert!(
+        init.status.success(),
+        "git init failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
 
     // `State` is `#[non_exhaustive]`, so a downstream crate (this one) builds it
     // via `State::new` and overrides only what this fixture actually depends on.
@@ -57,14 +70,14 @@ fn project_with_phase_state() -> tempfile::TempDir {
     dir
 }
 
-fn run_recover_clean(
+fn run_discard(
     home: &common::HermeticHome,
     dir: &PathBuf,
     log_format: Option<&str>,
     rust_log: Option<&str>,
 ) -> (String, String) {
     let mut cmd = common::hermetic_devflow(home);
-    cmd.args(["recover", "--clean", "--phase", "1"]).arg(dir);
+    cmd.args(["discard", "--phase", "1"]).arg(dir);
 
     // Start from a clean env so ambient RUST_LOG/DEVFLOW_LOG_FORMAT from the
     // test runner's shell can't leak in and mask the behavior under test.
@@ -81,7 +94,7 @@ fn run_recover_clean(
     // `.with_writer(std::io::stderr)` — CR-02 fix), separate from the CLI's
     // own `println!` output on stdout. Return both streams so callers can
     // assert log lines land on stderr and never leak onto stdout.
-    let output = cmd.output().expect("run devflow recover --clean");
+    let output = cmd.output().expect("run devflow discard");
     (
         String::from_utf8_lossy(&output.stdout).to_string(),
         String::from_utf8_lossy(&output.stderr).to_string(),
@@ -92,7 +105,7 @@ fn run_recover_clean(
 fn rust_log_debug_is_honored_under_json_log_format() {
     let home = common::HermeticHome::new();
     let dir = project_with_phase_state();
-    let (stdout, stderr) = run_recover_clean(
+    let (stdout, stderr) = run_discard(
         &home,
         &dir.path().to_path_buf(),
         Some("json"),
@@ -124,10 +137,10 @@ fn rust_log_default_suppresses_debug_under_json_log_format() {
     // No RUST_LOG set — the default filter is `off`, so this DEBUG line must NOT
     // appear. If it does, RUST_LOG is being ignored (i.e. a fixed, too-verbose
     // level is hardcoded again), the exact WR-01 bug class.
-    let (stdout, stderr) = run_recover_clean(&home, &dir.path().to_path_buf(), Some("json"), None);
+    let (stdout, stderr) = run_discard(&home, &dir.path().to_path_buf(), Some("json"), None);
 
     assert!(
-        stdout.contains(CLEANED_LINE),
+        stdout.contains(REMOVED_LINE),
         "the command must have gone through the load that logs the line, or its \
          absence below proves nothing.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );

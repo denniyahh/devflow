@@ -35,9 +35,8 @@ fn git(root: &Path, args: &[&str]) {
 }
 
 /// A minimal repo with `develop` and a `feature/phase-NN` branch holding one
-/// commit, hooks disabled — the same shape `pipeline_launch.rs`'s
-/// `code_unknown_does_not_transition_to_validate` test uses to reach an
-/// `AgentStatus::Unknown` Code outcome (no exit-code capture file written).
+/// commit, hooks disabled, and no `.planning/config.json`, so a Code launch's
+/// preflight opens a Code gate.
 fn init_repo(root: &Path, phase: PhaseId) {
     git(root, &["init", "-q"]);
     git(root, &["config", "user.email", "devflow@example.com"]);
@@ -100,7 +99,10 @@ fn wait_for_child_exit(
 ) -> std::process::ExitStatus {
     let start = Instant::now();
     loop {
-        if let Some(status) = child.try_wait().expect("try_wait on devflow advance child") {
+        if let Some(status) = child
+            .try_wait()
+            .expect("try_wait on the devflow __runner child")
+        {
             return status;
         }
         if start.elapsed() >= deadline {
@@ -116,7 +118,7 @@ fn wait_for_child_exit(
             // stays bounded without ever signalling the child.
             let _ = child.wait();
             panic!(
-                "devflow advance (pid {pid}) did not exit within {deadline:?}; \
+                "devflow __runner (pid {pid}) did not exit within {deadline:?}; \
                  on disk: open_gate_waiter={open_gate_waiter:?} gate_present={gate_present} \
                  response_present={response_present}"
             );
@@ -299,17 +301,15 @@ fn sweep_help_documents_max_age_and_dry_run() {
     );
 }
 
-/// Task 3's strongest proof: a **real, separate `devflow advance` process**
+/// Task 3's strongest proof: a **real, separate `devflow __runner` process**
 /// parked on a gate is ended by a file write, unwinds through its own
 /// `abort()` path, finishes its gate registration, and leaves an audit record —
 /// the orphan class `23-ORPHAN-FORENSICS.md` documented, now remedied
 /// without `kill(1)`.
 ///
-/// Setup mirrors `pipeline_launch.rs`'s `code_unknown_does_not_transition_to_validate`
-/// test exactly (a Code-stage phase with no exit-code capture file yields
-/// `AgentStatus::Unknown`, which `handle_stage_failure`'s never-silent gate
-/// answers with a Code gate) — except the target here is spawned as a real
-/// OS process via `Command::new`, not driven in-process on a thread.
+/// The runner is started directly over a saved Code stage in a repo with no
+/// `.planning/config.json`, so its Code launch's preflight opens a Code gate and
+/// waits on it before any agent starts.
 #[test]
 fn sweep_ends_a_real_advance_process_through_its_own_abort_path() {
     let home = common::HermeticHome::new();
@@ -332,11 +332,18 @@ fn sweep_ends_a_real_advance_process_through_its_own_abort_path() {
     // Set per-`Command` via `.env(...)`, not via a process-global env
     // mutation (999.37) — so this cannot race any other test.
     let mut child = common::hermetic_devflow(&home)
-        .args(["advance", "--phase", &phase.to_string()])
-        .arg(root)
+        .env_remove("NOTIFY_SOCKET")
         .env("DEVFLOW_GATE_TIMEOUT_SECS", "15")
+        .current_dir(root)
+        .arg("__runner")
+        .arg("--project")
+        .arg(root)
+        .arg("--phase")
+        .arg(phase.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
         .spawn()
-        .expect("spawn devflow advance");
+        .expect("spawn devflow __runner");
 
     // Wait for the child to write the Code gate (proves it reached
     // `run_gate_with_timeout`) and for that gate's waiter registration to read
@@ -380,9 +387,11 @@ fn sweep_ends_a_real_advance_process_through_its_own_abort_path() {
 
     let status = wait_for_child_exit(&mut child, root, phase, e2e_child_timeout());
 
-    assert!(
-        status.success(),
-        "devflow advance must exit cleanly once its own abort() path runs, got {status:?}"
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "devflow __runner must exit once its own abort() path runs, with its \
+         unfinished-run code, got {status:?}"
     );
     assert!(
         !Gates::waiter_path(root, phase, Stage::Code, &gate_id).exists(),

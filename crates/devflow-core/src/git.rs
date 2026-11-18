@@ -405,28 +405,6 @@ impl GitFlow {
         }
     }
 
-    /// Return divergence from develop: (ahead, behind) commit counts.
-    ///
-    /// If currently on the develop branch, returns (0, 0).
-    /// `ahead` = commits on current branch not yet on develop.
-    /// `behind` = commits on develop not yet on current branch.
-    pub fn divergence_from_develop(&self) -> Result<(usize, usize), GitError> {
-        let current = self
-            .git_output(["rev-parse", "--abbrev-ref", "HEAD"])?
-            .trim()
-            .to_string();
-        if current == self.config.develop {
-            return Ok((0, 0));
-        }
-        let ahead = self
-            .rev_count(&format!("{}..{current}", self.config.develop))
-            .unwrap_or(0);
-        let behind = self
-            .rev_count(&format!("{current}..{}", self.config.develop))
-            .unwrap_or(0);
-        Ok((ahead, behind))
-    }
-
     /// List all feature branches with divergence from develop.
     ///
     /// Returns branches matching `feature/phase-*` with ahead/behind counts

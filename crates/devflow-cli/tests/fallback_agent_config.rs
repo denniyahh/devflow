@@ -3,8 +3,8 @@
 //! `devflow.toml`. The flag wins when given; the key applies when the flag is
 //! absent, and a key-only fallback names `devflow.toml` as its source.
 //!
-//! Most cases run through `--dry-run`, which returns before the run is
-//! persisted, so `config_key_alone_is_persisted_in_the_run_state` is the one
+//! Most cases run through `--dry-run`, which makes start's checks read-only and
+//! persists nothing, so `config_key_alone_is_persisted_in_the_run_state` is the one
 //! real launch: it reads what `start` saved.
 //!
 //! Every `devflow` child is built by `common::hermetic_devflow`, with its
@@ -14,6 +14,7 @@
 
 mod common;
 
+use common::HermeticPath;
 use devflow_core::phase_id::PhaseId;
 use std::fs;
 use std::path::Path;
@@ -109,13 +110,21 @@ fn run_start(
         .args(extra)
         .arg(root)
         .current_dir(root)
-        .env("PATH", path)
+        .hermetic_path(path)
         .output()
         .expect("run devflow start")
 }
 
-/// A `--dry-run` start whose `PATH` is only `fake`; returns the output.
+/// A `--dry-run` start whose `PATH` is only `fake` plus a `claude` stub; returns the
+/// output. The dry run checks the primary agent's binary as `start` does (52.1 D-27),
+/// so `fake` gets one when it has none.
 fn dry_run(root: &Path, phase: PhaseId, fake: &common::FakeBin, extra: &[&str]) -> Output {
+    let primary = fake.path.join("claude");
+    if !primary.exists() {
+        fs::write(&primary, format!("#!/bin/sh\n{AGENT_STUB}\n")).unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&primary, fs::Permissions::from_mode(0o755)).unwrap();
+    }
     // `--dry-run` launches nothing, so the home only has to outlive `output()`.
     let home = common::HermeticHome::new();
     let mut args = extra.to_vec();
@@ -224,7 +233,7 @@ fn config_key_alone_is_persisted_in_the_run_state() {
     init_repo(&root, phase);
     fs::write(root.join("devflow.toml"), "fallback_agent = \"codex\"\n").unwrap();
     let fake = stub_dir(&[("claude", WAITING_CLAUDE), ("codex", AGENT_STUB)]);
-    let _reaper = common::LaunchedRunReaper::new(&root, phase, vec![]);
+    let _reaper = common::LaunchedRunReaper::for_home(&home, &root, phase);
     let state_path = devflow_core::workflow::state_path(&root, phase);
     assert!(!state_path.exists(), "no state may exist before start");
 

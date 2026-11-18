@@ -359,8 +359,8 @@ pub enum GateError {
 }
 
 /// How long one acquisition waits for the phase's gate lock before giving up. It
-/// sits below [`crate::workflow::WRITE_LOCK_REPAIR_WAIT`], so a fenced side effect
-/// with one wait, stuck behind a stopped gate-lock holder, releases the state write
+/// sits below [`crate::workflow::WRITE_LOCK_REPAIR_WAIT`], so a side effect run under
+/// the state write lock with one wait, stuck behind a stopped gate-lock holder, releases the state write
 /// lock before a repair verb's bounded wait gives up. [`Gates::answer`] acquires
 /// twice, around its publish: a holder that stalls both reaches the repair wait,
 /// and the repair verb then names the write lock's holder and writes nothing.
@@ -375,7 +375,7 @@ impl GateId {
     /// A fresh gate id.
     #[must_use]
     pub fn new() -> Self {
-        Self(crate::supervisor::new_launch_id())
+        Self(crate::liveness::new_launch_id())
     }
 
     /// Check an id read from elsewhere; anything [`is_gate_id`] refuses is
@@ -411,7 +411,7 @@ impl std::fmt::Display for GateId {
 /// this: the id in an answer body is untrusted input.
 #[must_use]
 pub fn is_gate_id(id: &str) -> bool {
-    crate::supervisor::is_launch_id(id)
+    crate::liveness::is_launch_id(id)
 }
 
 /// A gate [`Gates::open_gate`] opened.
@@ -1277,34 +1277,6 @@ impl Gates {
     /// existing hold name, so the probe and the removal cannot race a waiter. A live
     /// one is never removed here: only its owner does that, through
     /// [`WaiterRegistration::finish`] (R-06).
-    /// Every waiter registration file of `phase`, live or not. No directory lists as
-    /// no files.
-    ///
-    /// # Errors
-    /// The gates directory exists and could not be read.
-    pub(crate) fn waiter_files(
-        project_root: &Path,
-        phase: PhaseId,
-    ) -> std::io::Result<Vec<PathBuf>> {
-        let entries = match std::fs::read_dir(Self::dir(project_root)) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(error),
-        };
-        let prefix = format!("{}-", phase.padded());
-        let mut files = Vec::new();
-        for entry in entries {
-            let entry = entry?;
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            if name.starts_with(&prefix) && name.ends_with(WAITER_SUFFIX) {
-                files.push(entry.path());
-            }
-        }
-        files.sort();
-        Ok(files)
-    }
-
     fn remove_abandoned_waiters(
         project_root: &Path,
         phase: PhaseId,
@@ -4373,7 +4345,7 @@ mod tests {
     }
 
     /// D-08 operator ruling (2026-10-26): one wait stays below the repair verbs' bound.
-    /// A fenced answer can make two: see the next test.
+    /// An answer makes two: see the next test.
     #[test]
     fn the_gate_lock_wait_stays_below_the_write_lock_repair_wait() {
         let repair = crate::workflow::WRITE_LOCK_REPAIR_WAIT;
@@ -4383,9 +4355,8 @@ mod tests {
         );
     }
 
-    /// A fenced answer holds the write lock across both of its gate-lock acquisitions,
-    /// so a holder stalling both uses up the repair verbs' whole bound. The docs on
-    /// `GATE_LOCK_WAIT` and `workflow::while_owner` say so. Counted on the real path, and
+    /// An answer takes the gate lock twice, so a holder stalling both uses up the repair
+    /// verbs' whole bound, as the doc on `GATE_LOCK_WAIT` says. Counted on the real path, and
     /// a third acquisition or a constant change that makes the sum fit fails here.
     #[test]
     fn a_fenced_answers_two_gate_waits_reach_the_write_lock_repair_wait() {
@@ -4469,7 +4440,7 @@ mod tests {
             1
         );
         assert_eq!(
-            state_lock_paths("use crate::workflow::update_owned_state;\n").len(),
+            state_lock_paths("use crate::workflow::update_state_with;\n").len(),
             1
         );
         assert_eq!(state_lock_paths("use crate::workflow::{a, b};\n").len(), 1);
