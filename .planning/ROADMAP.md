@@ -787,6 +787,33 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.249: A Stage That Ends Needing an Operator Decision Gets a "Stage Failed" Gate Whose Answer Is "Reject" (BACKLOG)
+
+**Found:** 2026-11-18, Phase 53 dogfood run, Plan stage (enhancement, not a defect).
+**Gap:** the Plan agent stopped because it needed two operator decisions; DevFlow can only read that as a failed stage, so
+the gate (`stage_failure`) offers "approve: retries the plan stage", and the way to give the answers is
+`devflow gate reject 53 --note …` ("relaunches the plan stage with the note"). Answering by rejecting reads backwards.
+**Evidence:** `.devflow/events.jsonl` phase 53, `advance_evaluated` reason "Planning needs two operator decisions…", then
+`gate_fired` kind `stage_failure`, then `gate_resolved` route `relaunch_with_note` (2026-11-18).
+**Not established:** how often this happens once Phase 53's `devflow_ask` lands; it should be only the fallback when the
+tool call fails.
+**Fix shape (not decided):** when the agent's failure reason asks for operator decisions, say so in the gate text and name
+`reject --note` as the answer path; or route the fallback through Phase 53's question gate. **Owner:** after Phase 53
+(operator 2026-11-18: log for later).
+
+### Phase 999.248: MCP Registrations for opencode, pi, hermes and antigravity (BACKLOG)
+
+**Found:** 2026-11-18, Phase 53 planning (research C5). Operator chose to refuse these four agents' launches with a named
+message until they have a registration (2026-11-18, "2a").
+**Gap:** Phase 53 registers `devflow_ask` per launch for claude (`--mcp-config`) and codex (`-c mcp_servers…`) only
+(53-MCP-SPIKE.md). The other four CLIs show only persistent `mcp add/list/remove` subcommands in their help, which write
+the user's own config (ruled out by 53-CONTEXT D-01).
+**Not established:** whether any of the four has a per-launch route (an env-var config override, hermes
+`--ignore-user-config`, a project-scoped pi config). Nothing was run against them.
+**Fix shape:** a spike per agent like 53-MCP-SPIKE.md (about 3 launches each: per-launch registration, discovery and call,
+long hold, tool error), then a driver registration and conformance test for each that has a clean route. Estimate (a
+guess): 1–3 hours for all four. **Owner:** before Phase 55, whose rotation could want more than claude and codex.
+
 ### Phase 999.247: The Fake Service Manager Never Reports `active`, and Its Launch Can Take a Stale Lock as Ready (BACKLOG)
 
 **Found:** 2026-11-18, PR #239 external review X7 (codex, agy), confirmed against the source.
