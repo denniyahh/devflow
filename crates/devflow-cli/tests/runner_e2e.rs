@@ -177,9 +177,18 @@ impl RunnerFixture {
         output
     }
 
-    /// Whether `stage`'s gate file is open.
+    /// Whether `stage`'s gate is open: its file exists and its `gate_fired` is in the
+    /// log. The runner publishes the file just before it records the event, so a test
+    /// that read the log on the file alone could miss the event.
     fn gate_open(&self, stage: Stage) -> bool {
+        let for_stage = |kind: &str| {
+            self.events_of(kind)
+                .iter()
+                .filter(|event| event["stage"] == stage.to_string())
+                .count()
+        };
         devflow_core::gates::Gates::gate_path(&self.root, self.phase, stage).exists()
+            && for_stage("gate_fired") > for_stage("gate_resolved")
     }
 
     /// A hermetic devflow child in the fixture root, with the stub agent's dir on its
