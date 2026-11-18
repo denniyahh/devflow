@@ -539,6 +539,54 @@ fn cleanup_keeps_an_incomplete_stopped_run_even_when_merged_naming_resume_and_di
     );
 }
 
+/// A phase whose state cleanup keeps (here an incomplete stopped run with no worktree)
+/// keeps its merged branch through the merged-branch sweep, though no checkout holds it.
+#[test]
+fn cleanup_keeps_the_merged_branch_of_a_kept_state_only_run() {
+    let case = Case::new(PhaseId::new(79));
+    git(&case.root, &["branch", &case.branch(), "develop"]);
+    case.save_state(|state| {
+        state.stopped = true;
+        state.stop_reason = Some(UNTIL_PLAN_REASON.to_string());
+    });
+    let tip = case.tip();
+
+    let out = case.cleanup();
+    assert!(
+        case.state_file().is_file(),
+        "premise: cleanup keeps the stopped run's state:\n{}",
+        text(&out)
+    );
+    assert_eq!(
+        case.tip_of(&case.branch()),
+        Some(tip),
+        "the kept run's merged branch was swept:\n{}",
+        text(&out)
+    );
+}
+
+/// Control for the test above: the same merged branch with no state is swept.
+#[test]
+fn cleanup_sweeps_the_same_merged_branch_when_no_state_names_it() {
+    let case = Case::new(PhaseId::new(80));
+    git(&case.root, &["branch", &case.branch(), "develop"]);
+
+    let out = case.cleanup();
+    assert!(out.status.success(), "cleanup failed:\n{}", text(&out));
+    assert_eq!(
+        case.tip_of(&case.branch()),
+        None,
+        "the merged branch was kept:\n{}",
+        text(&out)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout)
+            .contains(&format!("deleted merged branch {}", case.branch())),
+        "the sweep names the branch it deleted:\n{}",
+        text(&out)
+    );
+}
+
 /// D-07a: with the runner lock free and the unit `deactivating`, cleanup waits and
 /// removes nothing of the phase until the unit reads inactive; then it removes it.
 #[test]
