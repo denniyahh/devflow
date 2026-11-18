@@ -36,6 +36,15 @@ Per Tier B, CRITICAL and MAJOR findings are folded once; MINOR findings are back
   "e2e test that drives the real binary with a stub agent for the other launch shapes" and ASK-01's "every supported agent" are no longer met as written,
   and `--mode auto` loses its only non-claude fallback (antigravity).
 
+### Operator answers (2026-11-18, in session, verbatim: "1 b. 2 register pi as the 2nd registration.")
+
+- **OD-1 → (b):** codex holds the call up to a short cap (about 15 min), then returns `pending` and the agent calls again (D-06 fallback after the cap).
+- **OD-2 → register pi in Phase 53** as the second non-claude/codex registration; opencode, hermes and antigravity stay refused (999.248).
+  Facts checked on the installed pi 1.5.2 (`pi --help`, `pi mcp --help`): pi has built-in MCP support, reads `~/.pi/agent/mcp.json` and,
+  in trusted projects, `.pi/mcp.json`; it has no per-launch MCP config flag (`--no-mcp` and `--tools 'mcp__<server>__*'` exist).
+  Not established: how project trust is granted headless, and how pi treats a long-held tool call — the plan must spike both before building.
+  Not changed by this answer: `--mode auto` accepts only claude or antigravity as a fallback, so auto still loses its non-claude fallback.
+
 ## To fold (CRITICAL/MAJOR, verified or plausible against source)
 
 1. **Stage-wide gate close can delete the runner's replacement failure gate** (codex 1; `Gates::close` takes no gate id, gates.rs:1022). Identity-checked close; control: replacement gate survives a late server cleanup.
