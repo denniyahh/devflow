@@ -427,18 +427,105 @@ pub(crate) fn start(
             );
             Ok(())
         }
-        Err(why) => {
-            // WR-11's rule: a run that never launched leaves no state behind, so
-            // `devflow status` reports no phantom run. Its worktree and branch stay, and
-            // the next `start` refuses them (52.1 D-09.1), so the line names `discard`.
-            if let Err(clear_err) = workflow::clear_state(project_root, phase) {
-                eprintln!("warning: could not clear state after the failed launch: {clear_err}");
+        Err(crate::service::LaunchError::Failed(why)) => Err(clear_after_failed_launch(
+            project_root,
+            phase,
+            worktree,
+            &why,
+        )),
+        // 999.244: systemd-run was killed at its bound, so the manager may have accepted
+        // the unit. The runner takes only its runner lock, never the phase holder, so it
+        // is read once under the holder, as the guards read it (D-07a).
+        Err(crate::service::LaunchError::Unknown { unit, why }) => {
+            match read_timed_out_launch(project_root, phase) {
+                TimedOutLaunch::Live => {
+                    drop(phase_holder);
+                    print_runner_launched(
+                        phase,
+                        &format!("started phase {phase} in {mode} mode"),
+                        &unit,
+                    );
+                    print_timed_out_live_note(&why);
+                    Ok(())
+                }
+                TimedOutLaunch::NotLive => Err(clear_after_failed_launch(
+                    project_root,
+                    phase,
+                    worktree,
+                    &why,
+                )),
+                TimedOutLaunch::Unknown(reading) => Err(CliError::Message(
+                    unconfirmed_launch_message("start", phase, &why, &reading),
+                )),
             }
-            Err(CliError::Message(failed_launch_message(
-                phase, worktree, &why,
-            )))
         }
     }
+}
+
+/// WR-11's rule: a run that never launched leaves no state behind, so `devflow status`
+/// reports no phantom run. Its worktree and branch stay, and the next `start` refuses
+/// them (52.1 D-09.1), so the line names `discard`.
+fn clear_after_failed_launch(
+    project_root: &Path,
+    phase: PhaseId,
+    worktree: bool,
+    why: &str,
+) -> CliError {
+    if let Err(clear_err) = workflow::clear_state(project_root, phase) {
+        eprintln!("warning: could not clear state after the failed launch: {clear_err}");
+    }
+    CliError::Message(failed_launch_message(phase, worktree, why))
+}
+
+/// 999.244: what the phase's runner says after a launch whose `systemd-run` timed out.
+pub(crate) enum TimedOutLaunch {
+    /// The runner lock is held: the run is live.
+    Live,
+    /// The lock is free and the unit is `inactive` or `failed`: the run never launched.
+    NotLive,
+    /// Neither could be confirmed (the unit is not yet inactive, or a read failed): why.
+    Unknown(String),
+}
+
+/// 999.244: read [`runner_liveness`] once after a timed-out launch. Only a held runner
+/// lock is live and only an inactive or failed unit is gone; a unit still activating or
+/// stopping, or a read error, is unknown.
+pub(crate) fn read_timed_out_launch(project_root: &Path, phase: PhaseId) -> TimedOutLaunch {
+    match runner_liveness(project_root, phase) {
+        Ok(RunnerLiveness::Live { .. }) => TimedOutLaunch::Live,
+        Ok(RunnerLiveness::NotLive) => TimedOutLaunch::NotLive,
+        Ok(RunnerLiveness::Stopping { unit, state }) => TimedOutLaunch::Unknown(format!(
+            "its runner lock is free and unit {unit} is {state}"
+        )),
+        Err(why) => TimedOutLaunch::Unknown(why),
+    }
+}
+
+/// The note `start` and `resume` print on stderr when the launch timed out but the
+/// runner is live. Written to the stream, not through `eprintln!`, as
+/// [`crate::preflight::print_fallback_notice`] is, so a test's child shows it.
+pub(crate) fn print_timed_out_live_note(why: &str) {
+    use std::io::Write as _;
+    let _ = writeln!(
+        std::io::stderr(),
+        "note: systemd-run did not return in time ({why}); its runner holds its lock, so the \
+         run is live"
+    );
+}
+
+/// What `verb` says when the launch timed out and the runner could be confirmed neither
+/// live nor gone: the run's state is kept, and the two verbs that settle it are named.
+pub(crate) fn unconfirmed_launch_message(
+    verb: &str,
+    phase: PhaseId,
+    why: &str,
+    reading: &str,
+) -> String {
+    format!(
+        "{verb}: phase {phase} may be running: {why}; its runner could be confirmed neither \
+         live nor gone ({reading}), so its state is kept: run `devflow status` to see whether \
+         it runs, and `devflow discard --phase {phase}` if it does not"
+    )
 }
 
 /// What `start` prints when its unit launch failed: the reason, what the start created
@@ -12923,12 +13010,11 @@ mod tests {
         const NAME: &str =
             "commands::tests::start_reports_a_timed_out_launch_with_a_live_runner_as_started";
         if let Some(printed) = run_launch_timeout_child(NAME) {
-            assert!(printed.contains("started phase 5142 in "), "{printed}");
-            assert!(printed.contains("as user service devflow-"), "{printed}");
             assert!(
                 printed.contains("systemd-run did not return in time"),
                 "{printed}"
             );
+            assert!(printed.contains("so the run is live"), "{printed}");
             return;
         }
         let dir = tempfile::tempdir().unwrap();

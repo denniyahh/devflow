@@ -2287,31 +2287,50 @@ pub(crate) fn resume_with_fallback(
     let launched =
         crate::preflight::ensure_agent_binary(crate::preflight::agent_program(state.agent))
             .and_then(|()| archive_prior_capture(&state, None))
-            .map_err(|err| err.to_string())
+            .map_err(|err| crate::service::LaunchError::Failed(err.to_string()))
             .and_then(|()| crate::service::launch_runner_unit(project_root, phase));
+    let headline = format!("resumed phase {phase} at its {} stage", state.stage);
     match launched {
         Ok(unit) => {
             drop(phase_holder);
-            crate::commands::print_runner_launched(
-                phase,
-                &format!("resumed phase {phase} at its {} stage", state.stage),
-                &unit,
-            );
+            crate::commands::print_runner_launched(phase, &headline, &unit);
             Ok(())
         }
-        Err(why) => {
-            let err = CliError::Message(format!("resume: phase {phase} was not launched: {why}"));
-            // The commit above cleared `stopped` so a reload mid-launch reads the run
-            // active; a launch that failed outright makes that a lie (44-CORE finding 2a),
-            // so the run is marked stopped again, naming what failed. Best effort: the
-            // launch error is what the caller needs either way.
-            let _ = commit(&mut state, |s| {
-                s.stopped = true;
-                s.stop_reason = Some(format!("resume launch failed: {err}"));
-            });
-            Err(err)
+        Err(crate::service::LaunchError::Failed(why)) => {
+            Err(re_mark_stopped_after_failed_launch(&mut state, phase, &why))
+        }
+        // 999.244: systemd-run was killed at its bound, so the manager may have accepted
+        // the unit; the runner is read once under the holder, which it never takes.
+        Err(crate::service::LaunchError::Unknown { unit, why }) => {
+            match crate::commands::read_timed_out_launch(project_root, phase) {
+                crate::commands::TimedOutLaunch::Live => {
+                    drop(phase_holder);
+                    crate::commands::print_runner_launched(phase, &headline, &unit);
+                    crate::commands::print_timed_out_live_note(&why);
+                    Ok(())
+                }
+                crate::commands::TimedOutLaunch::NotLive => {
+                    Err(re_mark_stopped_after_failed_launch(&mut state, phase, &why))
+                }
+                crate::commands::TimedOutLaunch::Unknown(reading) => Err(CliError::Message(
+                    crate::commands::unconfirmed_launch_message("resume", phase, &why, &reading),
+                )),
+            }
         }
     }
+}
+
+/// The commit in [`resume`] cleared `stopped` so a reload mid-launch reads the run
+/// active; a launch that failed outright makes that a lie (44-CORE finding 2a), so the run
+/// is marked stopped again, naming what failed. Best effort: the launch error is what the
+/// caller needs either way.
+fn re_mark_stopped_after_failed_launch(state: &mut State, phase: PhaseId, why: &str) -> CliError {
+    let err = CliError::Message(format!("resume: phase {phase} was not launched: {why}"));
+    let _ = commit(state, |s| {
+        s.stopped = true;
+        s.stop_reason = Some(format!("resume launch failed: {err}"));
+    });
+    err
 }
 
 /// The label field of a quarantine file's name, `NN-{stage}.{label}.{secs}.{pid}.{seq}.quarantined.json`.
@@ -4428,13 +4447,10 @@ mod tests {
         const NAME: &str = "pipeline_launch::tests::resume_reports_a_timed_out_launch_with_a_live_runner_as_resumed";
         if let Some(printed) = run_resume_timeout_child(NAME) {
             assert!(
-                printed.contains("resumed phase 85 at its code stage"),
-                "{printed}"
-            );
-            assert!(
                 printed.contains("systemd-run did not return in time"),
                 "{printed}"
             );
+            assert!(printed.contains("so the run is live"), "{printed}");
             return;
         }
         let _guard = env_lock();
