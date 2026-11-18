@@ -34,7 +34,8 @@ Gate each requirement on one named test: `cargo nextest run -p <pkg> <--lib|--bi
 
 - **After every task commit:** the task's named test(s), plus the quick run command for the touched package
 - **After every plan wave:** `scripts/check.sh all`
-- **Before `/gsd-verify-work`:** Full suite must be green, container parity, live proofs (claude + codex) and the closing run
+- **Before DevFlow's Validate stage (`/gsd-validate-phase 53`):** Full suite must be green, container parity
+- **After Validate passes, at close-out (agent session, before `scripts/cut-pr-branch.sh`):** the Manual-Only live proofs (claude + codex) and the D-17 closing run below
 - **Max feedback latency:** 300 seconds
 
 ---
@@ -71,9 +72,25 @@ Filled by the planner per task. Requirement → test map from research:
 
 ## Manual-Only Verifications
 
-| Behavior | Requirement | Why Manual | Test Instructions |
-|----------|-------------|------------|-------------------|
-| Live claude and codex sessions call `devflow_ask` and continue after an answer | ASK-01, ASK-05 | needs real agent CLIs and an operator answer | dogfood run per CONTEXT.md; answer with `devflow gate answer` |
+These are not a PLAN: DevFlow's Code stage runs `/gsd-execute-phase 53` over every `*-PLAN.md`, on the pre-phase
+binary, which has no question channel (a blocking checkpoint reached there is the 999.57 defect this phase closes).
+So they run **after DevFlow's Validate for phase 53 has passed**, in an agent session at close-out, with the operator
+answering the gates, before the PR is cut. They make four or more paid agent launches. Evidence goes to
+`.planning/phases/53-the-question-channel/53-PROOF-RUN.md`. Run M1 to M4 in order.
+
+Rules for every row: no `/gsd-*` command, no hand edit of `.devflow/` and no hand-run stage is used to make a run
+pass; a DevFlow defect found is filed as a 999.x entry and reported, not routed around (CLAUDE.md dogfooding rule,
+2026-11-08). Every PASS line cites the events, history or command output it rests on (T-53-31).
+
+| ID | Behavior | Requirement | Why Manual | Test Instructions |
+|----|----------|-------------|------------|-------------------|
+| M1 | The runs use the installed binary built from the phase head | CLAUDE.md dogfooding | `cargo install` of the head, outside any DevFlow run | Precondition: `devflow status` in the DevFlow checkout shows no live runner for phase 53 (halt and say so if one is live), the tree is clean, and every phase plan's SUMMARY (53-01 to 53-13) is committed. Note `git rev-parse HEAD`, then run `cargo install --path crates/devflow-cli --locked --force` **before creating 53-PROOF-RUN.md or any other proof file**: `build.rs` sets the dirty flag from `git status --porcelain`, which counts untracked files, so a proof file created first makes the binary read `dirty`. Then create 53-PROOF-RUN.md and record `installed-head: <sha>`; check `test "$(devflow --version)" = "devflow 4.0.0-alpha.1 ($(git rev-parse HEAD), clean)"` exits 0; record `devflow --version`, `claude --version`, `codex --version`; record the full output of `cargo semver-checks check-release -p devflow-core --baseline-rev origin/develop --release-type minor` and list its major items against the removals planned in 53-01, 53-03, 53-06 and 53-10 (an unplanned item is a defect to report); record `codex-config-before: <sha256 of ~/.codex/config.toml>` (T-53-30). |
+| M2 | Live claude: the fixture's `blocking-human` checkpoint is asked through `devflow_ask`, held, answered at a gate, and Code continues in the same session | ASK-01, ASK-02, ASK-04, ASK-05 (roadmap criterion 1) | needs a real agent CLI and an operator answer | Build a fresh fixture with `scripts/scratch-dogfood-repo.sh --live-payload`; in it run `devflow start --phase 1 --agent claude --mode supervise`. When `devflow gate list` shows a `question` gate, `devflow gate show 1` must list the fixture's budget options. Hold the question at least 180 s after its `question_asked` before answering: DevFlow's stream idle monitor fires after 120 s of agent silence unless background tasks are open (`crates/devflow-core/src/monitor.rs` 64-121 and 941-985), and a held MCP call is silent, so an answer inside 120 s does not test it. Answer with `devflow gate answer 1 --gate-id <id> --option <id>`, then approve the later Validate gate as usual. Record the `gate list`/`gate show` output, the answer command, the seconds held, the events showing exactly one Code `stage_launched`, a `question_asked` and its `question_answered`, that no idle timeout was recorded for the stage, and the `devflow history 1` excerpt showing the question, its options, the answer, policy `operator_via_gate`, the operator and the time. Write `claude-live: PASS` only when all of these hold; otherwise `claude-live: FAIL` with the reason and a 999.x entry (an idle-monitor kill of the held call is such a defect). |
+| M3 | Live codex: the same, on the D-06 main path (block with a raised `tool_timeout_sec`) | ASK-01, ASK-02, ASK-04, ASK-05 (roadmap criterion 1) | needs a real agent CLI and an operator answer | As M2 with `--agent codex` on a fresh fixture, with the same 180 s hold. Also record the input tokens from codex's JSON usage and the seconds between `question_asked` and `question_answered` (the measurement a later pending/re-call choice would rest on), then `codex-config-after: <sha256>`, which must equal `codex-config-before` (T-53-30). Write `codex-live: PASS` or `codex-live: FAIL` by M2's rule. |
+| M4 | D-17 closing run (operator answer "2 a"): a real GSD plan-phase run on a project that is not DevFlow sends its questions through the channel, and they are recorded | ASK-04, D-17 | live run on a throwaway project; feeds Phase 54's corpus | Create a throwaway git project under the session scratch directory that is not DevFlow, with a GSD `.planning/` holding a one-phase ROADMAP and no CONTEXT.md. Run `devflow start --phase 1 --agent claude --mode supervise --until plan`. Answer each `question` gate with `devflow gate answer 1 --gate-id <id> (--option <id> | --text <answer>)`. Record each question's text and options, the answers, whether any was a real GSD discuss question (observed, not assumed), the `devflow history 1` output, and the run's token use from claude's result `usage`. Write `closing-run: PASS` only when every question asked appears in `devflow history` with its answer and policy; if the run asked nothing, write `closing-run: NO-QUESTIONS` with the history excerpt and report it to the operator rather than counting it as a pass. Remove the scratch project afterwards and say so. |
+
+Done when 53-PROOF-RUN.md holds `installed-head:`, `claude-live: PASS`, `codex-live: PASS`, matching codex config
+hashes, and `closing-run: PASS` (or a reported `NO-QUESTIONS`).
 
 ---
 

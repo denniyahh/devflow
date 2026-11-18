@@ -319,7 +319,31 @@ closing this phase.
      record — the history view distinguishes "not yet answered" from an empty answer, and a run that asked nothing
      shows no question rows. (ASK-04)
 
-**Plans**: TBD
+**Plans**: 0/13 plans executed
+**Wave 1**
+- [ ] 53-01-PLAN.md
+- [ ] 53-02-PLAN.md
+- [ ] 53-03-PLAN.md
+- [ ] 53-12-PLAN.md
+
+**Wave 2** *(blocked on Wave 1 completion)*
+- [ ] 53-04-PLAN.md
+- [ ] 53-05-PLAN.md
+- [ ] 53-06-PLAN.md
+
+**Wave 3** *(blocked on Wave 2 completion)*
+- [ ] 53-07-PLAN.md
+- [ ] 53-08-PLAN.md
+
+**Wave 4** *(blocked on Wave 3 completion)*
+- [ ] 53-09-PLAN.md
+
+**Wave 5** *(blocked on Wave 4 completion)*
+- [ ] 53-10-PLAN.md
+
+**Wave 6** *(blocked on Wave 5 completion)*
+- [ ] 53-11-PLAN.md
+- [ ] 53-13-PLAN.md
 **UI hint**: no
 
 ### Phase 54: Decision Triage
@@ -557,7 +581,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 52 | 33/33 | Executed — verification stale | 2026-11-11 |
 | 52.1 | 7/7 | Executed — closed at plan 07 (operator, 2026-11-15) | 2026-11-15 |
 | 52.2 | 26/26 | In Progress | — |
-| 53 | 0/? | Not started | — |
+| 53 | 0/13 | Planned     | — |
 | 54 | 0/? | Not started | — |
 | 55 | 0/? | Not started | — |
 

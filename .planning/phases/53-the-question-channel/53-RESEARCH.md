@@ -516,24 +516,34 @@ server reads the extra key back from the slot after `Answered`. Same trick for t
 | A8 | Adding a defaulted method to the pub `AgentDriver` trait is not flagged major by cargo-semver-checks | Pattern 2 | Another semver note; the release is major anyway (Open Question 1) |
 | A9 | cargo-semver-checks flags a variant added to the exhaustive pub `GateKind` and removal of pub fns as major | Open Q 1 | None for design; confirm by running the CLAUDE.md command |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
-1. **Semver: the phase is a breaking change to `devflow-core` whatever is chosen.** `GateKind::Question` on an
+1. **(RESOLVED) Semver: the phase is a breaking change to `devflow-core` whatever is chosen.** `GateKind::Question` on an
    exhaustive pub enum (D-09, which also rules out a wildcard) and removing `pub fn checkpoint_auto_decide_prompt`,
    `pub const GATE_RESOLUTION_RULE`, `pub fn verify::phase_has_blocking_human_checkpoint` (D-12). The workspace is at
    `4.0.0-alpha.1` and 4.0.0 is unpublished (CLAUDE.md). Recommendation: accept it for 4.0.0, record the
    `cargo semver-checks check-release -p devflow-core --baseline-rev origin/develop --release-type minor` output in
    the phase notes, and still use the additive answer/gate-file extension (Code Example 3) to avoid ~70 literal edits.
    Operator decision.
-2. **C3: may the pinned package-verification/gate-rule text be replaced by "call `devflow_ask`"?** Recommendation:
+   **Resolution (planner remit, per the orchestrator; not an operator decision):** accepted for unpublished 4.0.0;
+   each plan that changes devflow-core's pub API (53-01, 53-03, 53-06, 53-08, 53-10) records the semver-checks output in its
+   SUMMARY, and 53-VALIDATION.md Manual-Only M1 checks the phase-head output against the planned removals.
+2. **(RESOLVED) C3: may the pinned package-verification/gate-rule text be replaced by "call `devflow_ask`"?** Recommendation:
    yes — the operator still decides; the agent still never self-resolves. Needs the operator's explicit word.
-3. **Codex long holds: block (one contract) or `pending` + re-call held ~240 s?** Recommendation: block for both in
+   **Resolution (operator answer 1, 2026-11-18):** YES; the report-it text stays as the fallback when the tool call
+   fails, and the pin test is rewritten to the new text (53-06).
+3. **(RESOLVED) Codex long holds: block (one contract) or `pending` + re-call held ~240 s?** Recommendation: block for both in
    this phase (simplest, D-06 main path, raises `tool_timeout_sec`), and measure tokens on the closing run; revisit in
    Phase 55 if codex runs unattended for hours.
-4. **C5: what happens to `--agent opencode|pi|hermes|antigravity` launches?** Recommendation: refuse with a named
+   **Resolution (planner remit, per the orchestrator):** block, with `tool_timeout_sec` raised to the gate timeout
+   + 60 s (53-08); codex's input tokens and hold seconds are measured on the live codex proof (53-VALIDATION.md M3).
+4. **(RESOLVED) C5: what happens to `--agent opencode|pi|hermes|antigravity` launches?** Recommendation: refuse with a named
    message (D-02 as written) and log a 999.x for their registrations, since the rotation needs only claude and codex.
    Operator decision because it removes a working launch.
-5. **C4 abort mechanism** — inside planner remit (recommend the State field route); listed so it is not lost.
+   **Resolution (operator answer 2, 2026-11-18):** REFUSE with a named message (D-02 as written; 53-08); their
+   registrations are backlog, filed as one 999.x entry by 53-08 Task 3.
+5. **(RESOLVED) C4 abort mechanism** — inside planner remit (recommend the State field route); listed so it is not lost.
+   **Resolution (planner remit, per the orchestrator):** the State field route, `State::abort_requested` (53-09).
 
 ## Environment Availability
 
