@@ -4388,6 +4388,166 @@ mod tests {
         );
     }
 
+    /// Run `name` in a hermetic child with a Codex stub on `PATH`, as the launch-timeout
+    /// tests of `resume` run: in the parent, the child's stdout then stderr once it
+    /// passed; in the child, `None`.
+    fn run_resume_timeout_child(name: &str) -> Option<String> {
+        if devflow_core::test_support::in_child_test(name) {
+            return None;
+        }
+        let path_dir = agent_free_dir_with_agent_stub("codex");
+        let output = crate::test_support::run_hermetic_test_in_child(name, path_dir.path(), &[]);
+        devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, name);
+        Some(format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+
+    /// A stopped-at-Code Codex run of `phase` saved in `root`, resumed with its launch
+    /// ending as `end`.
+    fn resume_with_launch_end(
+        root: &Path,
+        phase: PhaseId,
+        end: crate::service::double::LaunchEnd,
+    ) -> Result<(), CliError> {
+        init_repo(root);
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
+        state.verification_baseline_captured = true;
+        state.stage = Stage::Code;
+        workflow::save_state(&state).unwrap();
+        crate::service::double::set_launch_end(end);
+        resume(root, phase, None)
+    }
+
+    /// 999.244: a resume whose systemd-run timed out after the runner took its lock
+    /// reports the run resumed, says systemd-run timed out, and leaves it active.
+    #[test]
+    fn resume_reports_a_timed_out_launch_with_a_live_runner_as_resumed() {
+        const NAME: &str = "pipeline_launch::tests::resume_reports_a_timed_out_launch_with_a_live_runner_as_resumed";
+        if let Some(printed) = run_resume_timeout_child(NAME) {
+            assert!(
+                printed.contains("resumed phase 85 at its code stage"),
+                "{printed}"
+            );
+            assert!(
+                printed.contains("systemd-run did not return in time"),
+                "{printed}"
+            );
+            return;
+        }
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(85);
+        let result = resume_with_launch_end(
+            dir.path(),
+            phase,
+            crate::service::double::LaunchEnd::TimedOutAfterStart,
+        );
+        let _runners = crate::service::double::LaunchedRunners;
+        result.expect("a timed-out launch whose runner is live is a resumed run");
+        assert!(
+            !workflow::load_state(dir.path(), phase).unwrap().stopped,
+            "the live run is not re-marked stopped"
+        );
+    }
+
+    /// 999.244: a resume whose systemd-run timed out with no runner and an inactive unit
+    /// re-marks the run stopped, as a failed launch does.
+    #[test]
+    fn resume_re_marks_stopped_a_timed_out_launch_whose_runner_is_not_live() {
+        const NAME: &str = "pipeline_launch::tests::\
+             resume_re_marks_stopped_a_timed_out_launch_whose_runner_is_not_live";
+        if run_resume_timeout_child(NAME).is_some() {
+            return;
+        }
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(86);
+        let error = resume_with_launch_end(
+            dir.path(),
+            phase,
+            crate::service::double::LaunchEnd::TimedOutLeaving(Ok("inactive")),
+        )
+        .expect_err("a launch with no live runner fails")
+        .to_string();
+        assert!(
+            error.contains("resume: phase 86 was not launched"),
+            "{error}"
+        );
+        let state = workflow::load_state(dir.path(), phase).unwrap();
+        assert!(state.stopped, "the run is re-marked stopped");
+        assert!(
+            state
+                .stop_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("resume launch failed")),
+            "{:?}",
+            state.stop_reason
+        );
+    }
+
+    /// 999.244: a resume whose systemd-run timed out while the unit is still activating
+    /// leaves the run active and names `status` and `discard`: the runner may yet start.
+    #[test]
+    fn resume_keeps_the_state_of_a_timed_out_launch_whose_unit_is_activating() {
+        const NAME: &str = "pipeline_launch::tests::\
+             resume_keeps_the_state_of_a_timed_out_launch_whose_unit_is_activating";
+        if run_resume_timeout_child(NAME).is_some() {
+            return;
+        }
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(87);
+        let error = resume_with_launch_end(
+            dir.path(),
+            phase,
+            crate::service::double::LaunchEnd::TimedOutLeaving(Ok("activating")),
+        )
+        .expect_err("an unconfirmed launch is not reported as resumed")
+        .to_string();
+        assert!(error.contains("is activating"), "{error}");
+        assert!(error.contains("its state is kept"), "{error}");
+        assert!(error.contains("`devflow status`"), "{error}");
+        assert!(error.contains("`devflow discard --phase 87`"), "{error}");
+        assert!(!error.contains("was not launched"), "{error}");
+        assert!(
+            !workflow::load_state(dir.path(), phase).unwrap().stopped,
+            "a run that may be live is not re-marked stopped"
+        );
+    }
+
+    /// 999.244 control: a resume whose systemd-run failed outright re-marks the run
+    /// stopped, without reading the runner.
+    #[test]
+    fn resume_re_marks_stopped_a_launch_that_failed_outright() {
+        const NAME: &str =
+            "pipeline_launch::tests::resume_re_marks_stopped_a_launch_that_failed_outright";
+        if run_resume_timeout_child(NAME).is_some() {
+            return;
+        }
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(88);
+        let error =
+            resume_with_launch_end(dir.path(), phase, crate::service::double::LaunchEnd::Failed)
+                .expect_err("a failed launch fails")
+                .to_string();
+        assert!(
+            error.contains("resume: phase 88 was not launched"),
+            "{error}"
+        );
+        assert!(
+            error.contains("systemd-run could not start unit"),
+            "{error}"
+        );
+        assert!(
+            workflow::load_state(dir.path(), phase).unwrap().stopped,
+            "the run is re-marked stopped"
+        );
+    }
+
     #[test]
     fn resume_with_agent_hands_off_and_relaunches_under_the_new_driver() {
         const NAME: &str = "pipeline_launch::tests::resume_with_agent_hands_off_and_relaunches_under_the_new_driver";

@@ -12888,6 +12888,176 @@ mod tests {
         );
     }
 
+    /// Run `name` in a hermetic child with a Codex stub on `PATH`, as the launch-timeout
+    /// tests of `start` run: in the parent, the child's stdout then stderr once it passed;
+    /// in the child, `None`.
+    fn run_launch_timeout_child(name: &str) -> Option<String> {
+        if devflow_core::test_support::in_child_test(name) {
+            return None;
+        }
+        let path_dir = crate::test_support::go_waiting_agent_dir("codex");
+        let output = crate::test_support::run_hermetic_test_in_child(name, path_dir.path(), &[]);
+        devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, name);
+        Some(format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+
+    /// `start` in a fresh repo for `phase`, its launch ending as `end`.
+    fn start_with_launch_end(
+        root: &Path,
+        phase: PhaseId,
+        end: crate::service::double::LaunchEnd,
+    ) -> Result<(), String> {
+        init_start_repo(root, phase);
+        crate::service::double::set_launch_end(end);
+        start_for_test(root, phase)
+    }
+
+    /// 999.244: a start whose systemd-run timed out after the runner took its lock reports
+    /// the run started, says systemd-run timed out, and keeps the run's state.
+    #[test]
+    fn start_reports_a_timed_out_launch_with_a_live_runner_as_started() {
+        const NAME: &str =
+            "commands::tests::start_reports_a_timed_out_launch_with_a_live_runner_as_started";
+        if let Some(printed) = run_launch_timeout_child(NAME) {
+            assert!(printed.contains("started phase 5142 in "), "{printed}");
+            assert!(printed.contains("as user service devflow-"), "{printed}");
+            assert!(
+                printed.contains("systemd-run did not return in time"),
+                "{printed}"
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(5142);
+        let result = start_with_launch_end(
+            dir.path(),
+            phase,
+            crate::service::double::LaunchEnd::TimedOutAfterStart,
+        );
+        let _runners = crate::service::double::LaunchedRunners;
+        result.expect("a timed-out launch whose runner is live is a started run");
+        assert!(
+            workflow::load_state(dir.path(), phase).is_ok(),
+            "the live run's state is kept"
+        );
+    }
+
+    /// 999.244: a start whose systemd-run timed out with no runner and an inactive unit
+    /// clears its state and names `discard`, as a failed launch does.
+    #[test]
+    fn start_clears_a_timed_out_launch_whose_runner_is_not_live() {
+        const NAME: &str =
+            "commands::tests::start_clears_a_timed_out_launch_whose_runner_is_not_live";
+        if run_launch_timeout_child(NAME).is_some() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(5143);
+        let error = start_with_launch_end(
+            dir.path(),
+            phase,
+            crate::service::double::LaunchEnd::TimedOutLeaving(Ok("inactive")),
+        )
+        .expect_err("a launch with no live runner fails");
+        assert!(error.contains("phase 5143 was not launched"), "{error}");
+        assert!(error.contains("devflow discard --phase 5143"), "{error}");
+        assert!(
+            matches!(
+                workflow::load_state(dir.path(), phase),
+                Err(workflow::WorkflowError::MissingState(_))
+            ),
+            "the state of a run that never launched is cleared"
+        );
+    }
+
+    /// 999.244: a start whose systemd-run timed out while the unit is still activating
+    /// keeps its state and names `status` and `discard`: the runner may yet start.
+    #[test]
+    fn start_keeps_the_state_of_a_timed_out_launch_whose_unit_is_activating() {
+        const NAME: &str =
+            "commands::tests::start_keeps_the_state_of_a_timed_out_launch_whose_unit_is_activating";
+        if run_launch_timeout_child(NAME).is_some() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(5144);
+        let error = start_with_launch_end(
+            dir.path(),
+            phase,
+            crate::service::double::LaunchEnd::TimedOutLeaving(Ok("activating")),
+        )
+        .expect_err("an unconfirmed launch is not reported as started");
+        assert!(error.contains("is activating"), "{error}");
+        assert!(error.contains("its state is kept"), "{error}");
+        assert!(error.contains("`devflow status`"), "{error}");
+        assert!(error.contains("`devflow discard --phase 5144`"), "{error}");
+        assert!(!error.contains("was not launched"), "{error}");
+        assert!(
+            workflow::load_state(dir.path(), phase).is_ok(),
+            "the state of a run that may be live is kept"
+        );
+    }
+
+    /// 999.244: a start whose systemd-run timed out and whose unit cannot be read keeps
+    /// its state and names `status` and `discard`.
+    #[test]
+    fn start_keeps_the_state_of_a_timed_out_launch_whose_unit_does_not_read() {
+        const NAME: &str =
+            "commands::tests::start_keeps_the_state_of_a_timed_out_launch_whose_unit_does_not_read";
+        if run_launch_timeout_child(NAME).is_some() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(5145);
+        let error = start_with_launch_end(
+            dir.path(),
+            phase,
+            crate::service::double::LaunchEnd::TimedOutLeaving(Err("bus gone (test double)")),
+        )
+        .expect_err("an unconfirmed launch is not reported as started");
+        assert!(error.contains("bus gone (test double)"), "{error}");
+        assert!(error.contains("its state is kept"), "{error}");
+        assert!(error.contains("`devflow status`"), "{error}");
+        assert!(error.contains("`devflow discard --phase 5145`"), "{error}");
+        assert!(
+            workflow::load_state(dir.path(), phase).is_ok(),
+            "the state of a run that may be live is kept"
+        );
+    }
+
+    /// 999.244 control: a start whose systemd-run failed outright clears its state and
+    /// names `discard`, without reading the runner.
+    #[test]
+    fn start_clears_the_state_of_a_launch_that_failed_outright() {
+        const NAME: &str =
+            "commands::tests::start_clears_the_state_of_a_launch_that_failed_outright";
+        if run_launch_timeout_child(NAME).is_some() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(5146);
+        let error =
+            start_with_launch_end(dir.path(), phase, crate::service::double::LaunchEnd::Failed)
+                .expect_err("a failed launch fails");
+        assert!(error.contains("phase 5146 was not launched"), "{error}");
+        assert!(
+            error.contains("systemd-run could not start unit"),
+            "{error}"
+        );
+        assert!(error.contains("devflow discard --phase 5146"), "{error}");
+        assert!(
+            matches!(
+                workflow::load_state(dir.path(), phase),
+                Err(workflow::WorkflowError::MissingState(_))
+            ),
+            "the state of a run that never launched is cleared"
+        );
+    }
+
     /// Run the test `name` in a hermetic child whose `PATH` holds no agent binary, returning
     /// `true` in the parent, whose work is done, and `false` in the child. A refusal test
     /// runs there so that, were its refusal ever lost, the start it drives would stop at a
