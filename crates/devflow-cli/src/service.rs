@@ -406,6 +406,23 @@ pub(crate) mod double {
         stop_targets: Vec<(String, std::process::Child)>,
         /// How many times the cfg(test) [`super::stop_unit`] ran on this thread.
         stop_calls: usize,
+        /// How the next cfg(test) [`super::launch_runner_unit`] on this thread ends.
+        launch_end: LaunchEnd,
+    }
+
+    /// How the cfg(test) [`super::launch_runner_unit`] ends, standing in for the ways
+    /// `systemd-run` returns.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum LaunchEnd {
+        /// The runner holds its lock and the launch succeeds (the default).
+        Started,
+        /// The runner holds its lock, then the launch reports systemd-run's timeout.
+        TimedOutAfterStart,
+        /// No runner starts, the unit reads as given from then on, and the launch reports
+        /// systemd-run's timeout.
+        TimedOutLeaving(Result<&'static str, &'static str>),
+        /// No runner starts and the launch reports systemd-run's definite failure.
+        Failed,
     }
 
     thread_local! {
@@ -417,6 +434,7 @@ pub(crate) mod double {
             launches: Vec::new(),
             stop_targets: Vec::new(),
             stop_calls: 0,
+            launch_end: LaunchEnd::Started,
         });
     }
 
@@ -461,6 +479,15 @@ pub(crate) mod double {
     /// unchanged. For a test whose lock-holding child stands in for a unit's runner.
     pub(crate) fn register_stop_target(unit: &str, child: std::process::Child) {
         DOUBLE.with_borrow_mut(|double| double.stop_targets.push((unit.to_string(), child)));
+    }
+
+    /// Make later launches on this thread end as `end`.
+    pub(crate) fn set_launch_end(end: LaunchEnd) {
+        DOUBLE.with_borrow_mut(|double| double.launch_end = end);
+    }
+
+    pub(super) fn launch_end() -> LaunchEnd {
+        DOUBLE.with_borrow(|double| double.launch_end)
     }
 
     pub(super) fn record_stop() {
@@ -673,10 +700,7 @@ pub(crate) fn launch_runner_unit(project_root: &Path, phase: PhaseId) -> Result<
     command.args(argv);
     let output = run_bounded(command, LAUNCH_CALL_BOUND).map_err(|error| {
         if error.kind() == std::io::ErrorKind::TimedOut {
-            format!(
-                "unit {unit}: {error}; whether the unit started is unknown, see \
-                 `devflow status`"
-            )
+            launch_timeout_text(&unit, &error.to_string())
         } else {
             format!("unit {unit}: systemd-run could not run ({error})")
         }
@@ -689,6 +713,12 @@ pub(crate) fn launch_runner_unit(project_root: &Path, phase: PhaseId) -> Result<
         output.status,
         String::from_utf8_lossy(&output.stderr).trim()
     ))
+}
+
+/// What a launch whose `systemd-run` outlived [`LAUNCH_CALL_BOUND`] says: `error` and
+/// that whether `unit` started is unknown.
+fn launch_timeout_text(unit: &str, error: &str) -> String {
+    format!("unit {unit}: {error}; whether the unit started is unknown, see `devflow status`")
 }
 
 /// The variable the cfg(test) [`launch_runner_unit`] passes its runner child the
@@ -720,6 +750,19 @@ pub(crate) fn launch_runner_unit(project_root: &Path, phase: PhaseId) -> Result<
     use std::os::unix::process::CommandExt as _;
     let unit = unit_name(project_root, phase)
         .map_err(|error| format!("phase {phase}'s unit name could not be derived ({error})"))?;
+    let timed_out = |unit: &str| launch_timeout_text(unit, "systemd-run (test double) timed out");
+    match double::launch_end() {
+        double::LaunchEnd::TimedOutLeaving(state) => {
+            double::set_unit_state(state);
+            return Err(timed_out(&unit));
+        }
+        double::LaunchEnd::Failed => {
+            return Err(format!(
+                "systemd-run could not start unit {unit} (test double); systemd-run: refused"
+            ));
+        }
+        double::LaunchEnd::Started | double::LaunchEnd::TimedOutAfterStart => {}
+    }
     let root = project_root
         .canonicalize()
         .map_err(|error| format!("unit {unit}: {error}"))?;
@@ -763,6 +806,9 @@ pub(crate) fn launch_runner_unit(project_root: &Path, phase: PhaseId) -> Result<
             .flatten()
             .is_some_and(|(holder, _)| holder == pid)
         {
+            if double::launch_end() == double::LaunchEnd::TimedOutAfterStart {
+                return Err(timed_out(&unit));
+            }
             return Ok(unit);
         }
         if !double::runner_running(pid) {
