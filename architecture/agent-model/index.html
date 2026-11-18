@@ -14,14 +14,14 @@
         <link rel="prev" href="../state-machine/">
       
       
-        <link rel="next" href="../git-ship/">
+        <link rel="next" href="../../diagrams/system/">
       
       
         
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.0">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.1">
     
     
       
@@ -390,8 +390,6 @@
       
         
       
-        
-      
     
     
     
@@ -635,34 +633,6 @@
 
               
             
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../git-ship/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Git & Ship Model
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
           </ul>
         </nav>
       
@@ -678,8 +648,6 @@
   
     
     
-      
-        
       
         
       
@@ -773,34 +741,6 @@
     
   
     Agent Lifecycle
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../diagrams/ship-flow/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Ship Flow
   
 
     
@@ -1203,12 +1143,12 @@ the modular <code>AgentDriver</code> contract (999.31).</p>
 <li><code>mod.rs</code> — <code>AgentDriver</code> trait definition + <code>driver_for()</code> factory + conformance suite</li>
 </ul>
 <h2 id="driver-owned-prompts">Driver-owned prompts<a class="headerlink" href="#driver-owned-prompts" title="Permanent link">&para;</a></h2>
-<p>There is no shared prompt. A <code>StageIntent</code> carries the stage's data (phase, fix kind, review
-angles) with no agent-specific syntax; each driver's <code>render_prompt</code> turns it into its own
+<p>There is no shared prompt. A <code>StageIntent</code> carries the stage's data (phase, fix kind) with no
+agent-specific syntax; each driver's <code>render_prompt</code> turns it into its own
 instruction. Claude/OpenCode render the legacy slash-command text byte-for-byte; Codex/Pi render a
 workflow-file reference.</p>
 <p>Every prompt asks the agent to finish with a <code>DEVFLOW_RESULT</code> JSON marker. Validate additionally
-requires a <code>pass</code> or <code>gaps</code> verdict; Ship requires a review-before-ship decision.</p>
+requires a <code>pass</code> or <code>gaps</code> verdict.</p>
 <h2 id="completion-evaluation">Completion Evaluation<a class="headerlink" href="#completion-evaluation" title="Permanent link">&para;</a></h2>
 <p>See <a href="../../diagrams/agent-lifecycle/">Agent Lifecycle diagram</a> for the full evaluation flow.</p>
 <ol>
@@ -1277,7 +1217,7 @@ requires a <code>pass</code> or <code>gaps</code> verdict; Ship requires a revie
       <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.tabs", "navigation.indexes", "navigation.top", "search.suggest", "search.highlight", "content.code.copy"], "search": "../../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../../assets/javascripts/bundle.c21346df.min.js"></script>
+      <script src="../../assets/javascripts/bundle.a5f9d56c.min.js"></script>
       
         <script src="../../assets/extra.js"></script>
       

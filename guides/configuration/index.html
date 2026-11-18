@@ -21,7 +21,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.0">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.1">
     
     
       
@@ -388,8 +388,6 @@
       
         
       
-        
-      
     
     
     
@@ -517,34 +515,6 @@
 
               
             
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../architecture/git-ship/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Git & Ship Model
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
           </ul>
         </nav>
       
@@ -560,8 +530,6 @@
   
     
     
-      
-        
       
         
       
@@ -655,34 +623,6 @@
     
   
     Agent Lifecycle
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../diagrams/ship-flow/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Ship Flow
   
 
     
@@ -1101,9 +1041,15 @@
 flags to <code>devflow start</code>; an optional minimal <code>devflow.toml</code> controls only
 reliability knobs.</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="n">capture_retention</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span>
-<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="n">review_angles</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"doc accuracy"</span><span class="p">,</span><span class="w"> </span><span class="s2">"security"</span><span class="p">,</span><span class="w"> </span><span class="s2">"CI correctness"</span><span class="p">,</span><span class="w"> </span><span class="s2">"external state"</span><span class="p">]</span>
-<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="n">external_verify_enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="n">external_verify_enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="n">fallback_agent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"antigravity"</span><span class="w">   </span><span class="c1"># optional: the rate-limit fallback for the Code stage</span>
 </code></pre></div>
+<p><code>fallback_agent</code> is armed by <code>devflow start</code> only, as the run's one-hop
+Code-stage fallback when <code>--fallback-agent</code> is not given; the flag overrides
+its value, <code>devflow resume</code> does not read it, and no environment variable sets
+it. A key that names no agent, or a <code>devflow.toml</code> that does not
+parse, still refuses <code>devflow start</code> even when <code>--fallback-agent</code> is given. See
+OPERATIONS.md's rate-limit failover section for what the fallback does.</p>
 <h2 id="devflow-start-flags"><code>devflow start</code> flags<a class="headerlink" href="#devflow-start-flags" title="Permanent link">&para;</a></h2>
 <table>
 <thead>
@@ -1123,11 +1069,7 @@ reliability knobs.</p>
 </tr>
 <tr>
 <td><code>--mode auto\|supervise</code></td>
-<td><code>auto</code> advances through Ship unattended (gating only at Ship, plus never-silent failure gates); <code>supervise</code> also gates every Validate for human review</td>
-</tr>
-<tr>
-<td><code>--force</code></td>
-<td>Overwrite the feature branch if it already exists</td>
+<td><code>auto</code> runs unattended and finishes on a passing Validate (gating only on repeated Validate failure, plus never-silent failure gates); <code>supervise</code> also gates every Validate for human review</td>
 </tr>
 <tr>
 <td><code>--no-worktree</code></td>
@@ -1135,10 +1077,14 @@ reliability knobs.</p>
 </tr>
 <tr>
 <td><code>--dry-run</code></td>
-<td>Print the pipeline that would run without launching anything</td>
+<td>Check, read-only, what a real start would refuse, then print the pipeline that would run; launches and writes nothing and names the start checks it skips</td>
 </tr>
 </tbody>
 </table>
+<p><code>start</code> removes nothing: over a leftover phase worktree, branch or run state it
+refuses, naming <code>devflow discard --phase N</code>, which lists what it removes first and
+refuses a branch with commits not merged into the base unless you name it; the
+refusal over an incomplete run also names <code>devflow resume --phase N</code>.</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>devflow<span class="w"> </span>start<span class="w"> </span>--phase<span class="w"> </span><span class="m">3</span><span class="w"> </span>--agent<span class="w"> </span>claude<span class="w"> </span>--mode<span class="w"> </span>auto
 </code></pre></div>
 <h2 id="environment-variables">Environment variables<a class="headerlink" href="#environment-variables" title="Permanent link">&para;</a></h2>
@@ -1169,24 +1115,9 @@ environment variables, not config file fields:</p>
 <td>Age threshold <code>devflow gate sweep</code> uses to call a gate abandoned. Held equal to <code>DEVFLOW_GATE_TIMEOUT_SECS</code>, never shorter</td>
 </tr>
 <tr>
-<td><code>DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS</code></td>
-<td>60</td>
-<td>How long <code>devflow ship --phase</code>'s foreground manual override waits for a reopened Ship gate before failing fast, instead of <code>DEVFLOW_GATE_TIMEOUT_SECS</code>'s multi-day default</td>
-</tr>
-<tr>
-<td><code>DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS</code></td>
-<td>120</td>
-<td>How long to wait on the shared-checkout lock before skipping the hook batch rather than running it unserialized</td>
-</tr>
-<tr>
 <td><code>DEVFLOW_CAPTURE_RETENTION</code></td>
 <td>5</td>
 <td>Override capture generations retained per phase</td>
-</tr>
-<tr>
-<td><code>DEVFLOW_REVIEW_ANGLES</code></td>
-<td>built-in list</td>
-<td>Override Ship review angles with a comma-separated list</td>
 </tr>
 <tr>
 <td><code>DEVFLOW_EXTERNAL_VERIFY_ENABLED</code></td>
@@ -1200,8 +1131,8 @@ environment variables, not config file fields:</p>
 </tr>
 <tr>
 <td><code>RUST_LOG</code></td>
-<td><code>info</code></td>
-<td>Log verbosity (stderr)</td>
+<td><code>off</code></td>
+<td>Tracing verbosity (stderr). Unset or empty prints no tracing lines; set a level such as <code>info</code> or <code>debug</code> to see them</td>
 </tr>
 <tr>
 <td><code>DEVFLOW_LOG_FORMAT</code></td>
@@ -1286,7 +1217,7 @@ inventory, and a worked dogfood session — see
       <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.tabs", "navigation.indexes", "navigation.top", "search.suggest", "search.highlight", "content.code.copy"], "search": "../../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../../assets/javascripts/bundle.c21346df.min.js"></script>
+      <script src="../../assets/javascripts/bundle.a5f9d56c.min.js"></script>
       
         <script src="../../assets/extra.js"></script>
       

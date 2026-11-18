@@ -6,10 +6,10 @@
 <meta charset="utf-8"/>
 <meta content="width=device-width,initial-scale=1" name="viewport"/>
 <meta content="Agent-agnostic development workflow automation — architecture, guides, and API reference" name="description"/>
-<link href="../../architecture/git-ship/" rel="prev"/>
+<link href="../../architecture/agent-model/" rel="prev"/>
 <link href="../agent-lifecycle/" rel="next"/>
 <link href="../../assets/images/favicon.png" rel="icon"/>
-<meta content="mkdocs-1.6.1, mkdocs-material-9.8.0" name="generator"/>
+<meta content="mkdocs-1.6.1, mkdocs-material-9.8.1" name="generator"/>
 <title>System Architecture - DevFlow Documentation</title>
 <link href="../../assets/stylesheets/main.57a0d79d.min.css" rel="stylesheet"/>
 <link href="../../assets/stylesheets/palette.fb2fffe2.min.css" rel="stylesheet"/>
@@ -249,18 +249,6 @@
   </span>
 </a>
 </li>
-<li class="md-nav__item">
-<a class="md-nav__link" href="../../architecture/git-ship/">
-<span class="md-ellipsis">
-    
-  
-    Git &amp; Ship Model
-  
-
-    
-  </span>
-</a>
-</li>
 </ul>
 </nav>
 </li>
@@ -343,18 +331,6 @@
     
   
     Agent Lifecycle
-  
-
-    
-  </span>
-</a>
-</li>
-<li class="md-nav__item">
-<a class="md-nav__link" href="../ship-flow/">
-<span class="md-ellipsis">
-    
-  
-    Ship Flow
   
 
     
@@ -513,7 +489,7 @@
     MON --&gt; ADV[Advance phase]
     ADV --&gt; GATE[Durable gate files]
     U --&gt; GATE
-    CORE --&gt; GIT[Git branches and tags]
+    CORE --&gt; GIT[Git branches]
 </code></pre>
 <div class="panzoom-info-box panzoom-info-box-bottom panzoom-hidden">
 Hold "Alt" / "Option" to enable pan &amp; zoom
@@ -534,7 +510,7 @@ Hold "Alt" / "Option" to enable pan &amp; zoom
 </tr>
 <tr>
 <td><code>devflow-core</code></td>
-<td>State, prompts, adapters, result evaluation, Git operations, hooks, history, and recovery</td>
+<td>State, prompts, adapters, result evaluation, Git operations, history, and recovery</td>
 </tr>
 <tr>
 <td>Detached monitor</td>
@@ -550,8 +526,8 @@ Hold "Alt" / "Option" to enable pan &amp; zoom
 </tr>
 </tbody>
 </table>
-<p>The primary checkout owns workflow state and terminal Git mutations. The
-worktree is the execution location for an agent, not a second source of truth.</p>
+<p>The primary checkout owns workflow state. The worktree is the execution
+location for an agent, not a second source of truth.</p>
 <h2 id="data-flow">Data Flow<a class="headerlink" href="#data-flow" title="Permanent link">¶</a></h2>
 <div class="panzoom-box" data-key="alt" id="panzoom0" oncontextmenu="return false;">
 <nav class="panzoom-nav">
@@ -608,7 +584,7 @@ Hold "Alt" / "Option" to enable pan &amp; zoom
 <div class="md-dialog__inner md-typeset"></div>
 </div>
 <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.tabs", "navigation.indexes", "navigation.top", "search.suggest", "search.highlight", "content.code.copy"], "search": "../../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
-<script src="../../assets/javascripts/bundle.c21346df.min.js"></script>
+<script src="../../assets/javascripts/bundle.a5f9d56c.min.js"></script>
 <script src="../../assets/extra.js"></script>
 <script src="../../assets/javascripts/panzoom.min.js"></script>
 <script src="../../assets/javascripts/zoompan.js"></script>

@@ -21,7 +21,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.0">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.1">
     
     
       
@@ -390,8 +390,6 @@
       
         
       
-        
-      
     
     
     
@@ -602,34 +600,6 @@
 
               
             
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../git-ship/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Git & Ship Model
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
           </ul>
         </nav>
       
@@ -645,8 +615,6 @@
   
     
     
-      
-        
       
         
       
@@ -740,34 +708,6 @@
     
   
     Agent Lifecycle
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../diagrams/ship-flow/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Ship Flow
   
 
     
@@ -1091,7 +1031,7 @@ agent implementation itself.</p>
 <tr>
 <td><code>devflow-core</code></td>
 <td>Library</td>
-<td>State, agent adapters/results, Git/worktrees, gates, evidence history, hooks, recovery, configuration</td>
+<td>State, agent adapters/results, Git/worktrees, gates, evidence history, recovery, configuration</td>
 </tr>
 <tr>
 <td><code>devflow-cli</code></td>
@@ -1103,18 +1043,17 @@ agent implementation itself.</p>
 <p>The split keeps workflow logic testable and independent of both the CLI surface and any individual coding agent. All terminal formatting lives in the binary; the library returns structured data.</p>
 <h2 id="key-principles">Key Principles<a class="headerlink" href="#key-principles" title="Permanent link">&para;</a></h2>
 <ol>
-<li><strong>Five explicit stages</strong> — <code>Define → Plan → Code → Validate → Ship</code>; no hidden release stage can claim success without evidence.</li>
+<li><strong>Three explicit stages</strong> — <code>Plan → Code → Validate</code>; no stage can claim success without evidence, and only a <code>pass</code> verdict from Validate finishes a run.</li>
 <li><strong>Worktree isolation by default</strong> — agents run in <code>.worktrees/phase-NN/</code> while state and captures remain in the primary checkout.</li>
 <li><strong>Detached monitoring</strong> — a monitor owns the agent process, writes its captures and exit code, then invokes the next transition.</li>
 <li><strong>Layered completion evidence</strong> — configured external probes run before agent-controlled markers, exit codes, and Git heuristics.</li>
 <li><strong>Human gates are files</strong> — a durable request/response/ack protocol allows a workflow to survive terminal restarts and notify other tools.</li>
-<li><strong>Terminal truth</strong> — Ship must prove the feature branch was merged before version and tag bookkeeping can complete.</li>
+<li><strong>The operator integrates</strong> — a passing Validate ends the run and keeps the worktree and the <code>feature/phase-NN</code> branch; DevFlow does not merge, tag, or open a pull request.</li>
 </ol>
 <h2 id="see-also">See Also<a class="headerlink" href="#see-also" title="Permanent link">&para;</a></h2>
 <ul>
 <li><a href="../state-machine/">State Machine</a> — Step transitions and serialization</li>
 <li><a href="../agent-model/">Agent Model</a> — Agent trait, adapters, and evaluation</li>
-<li><a href="../git-ship/">Git &amp; Ship Model</a> — Git-flow orchestration</li>
 </ul>
 
 
@@ -1174,7 +1113,7 @@ agent implementation itself.</p>
       <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.tabs", "navigation.indexes", "navigation.top", "search.suggest", "search.highlight", "content.code.copy"], "search": "../../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../../assets/javascripts/bundle.c21346df.min.js"></script>
+      <script src="../../assets/javascripts/bundle.a5f9d56c.min.js"></script>
       
         <script src="../../assets/extra.js"></script>
       

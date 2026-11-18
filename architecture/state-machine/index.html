@@ -9,7 +9,7 @@
 <link href="../overview/" rel="prev"/>
 <link href="../agent-model/" rel="next"/>
 <link href="../../assets/images/favicon.png" rel="icon"/>
-<meta content="mkdocs-1.6.1, mkdocs-material-9.8.0" name="generator"/>
+<meta content="mkdocs-1.6.1, mkdocs-material-9.8.1" name="generator"/>
 <title>State Machine - DevFlow Documentation</title>
 <link href="../../assets/stylesheets/main.57a0d79d.min.css" rel="stylesheet"/>
 <link href="../../assets/stylesheets/palette.fb2fffe2.min.css" rel="stylesheet"/>
@@ -278,18 +278,6 @@
   </span>
 </a>
 </li>
-<li class="md-nav__item">
-<a class="md-nav__link" href="../git-ship/">
-<span class="md-ellipsis">
-    
-  
-    Git &amp; Ship Model
-  
-
-    
-  </span>
-</a>
-</li>
 </ul>
 </nav>
 </li>
@@ -334,18 +322,6 @@
     
   
     Agent Lifecycle
-  
-
-    
-  </span>
-</a>
-</li>
-<li class="md-nav__item">
-<a class="md-nav__link" href="../../diagrams/ship-flow/">
-<span class="md-ellipsis">
-    
-  
-    Ship Flow
   
 
     
@@ -486,14 +462,11 @@
 </button>
 </nav>
 <pre class="mermaid"><code>stateDiagram-v2
-    [*] --&gt; Define: devflow start
-    Define --&gt; Plan
+    [*] --&gt; Plan: devflow start
     Plan --&gt; Code
     Code --&gt; Validate
-    Validate --&gt; Ship: verdict pass
+    Validate --&gt; [*]: verdict pass
     Validate --&gt; Code: verdict gaps
-    Ship --&gt; [*]: approval and terminal hooks pass
-    Ship --&gt; Code: rejection or review failure
 </code></pre>
 <div class="panzoom-info-box panzoom-info-box-bottom panzoom-hidden">
 Hold "Alt" / "Option" to enable pan &amp; zoom
@@ -509,11 +482,6 @@ Hold "Alt" / "Option" to enable pan &amp; zoom
 </thead>
 <tbody>
 <tr>
-<td><code>Define</code></td>
-<td>Context artifact</td>
-<td>Failure opens a gate</td>
-</tr>
-<tr>
 <td><code>Plan</code></td>
 <td>Plan artifacts</td>
 <td>Failure opens a gate</td>
@@ -526,12 +494,7 @@ Hold "Alt" / "Option" to enable pan &amp; zoom
 <tr>
 <td><code>Validate</code></td>
 <td><code>DEVFLOW_RESULT</code> with <code>verdict: "pass"</code> or <code>"gaps"</code></td>
-<td><code>supervise</code> mode gates before advance; gaps return to Code</td>
-</tr>
-<tr>
-<td><code>Ship</code></td>
-<td>Review with no Critical finding, then GSD ship work</td>
-<td>Always pauses for merge approval</td>
+<td><code>supervise</code> mode gates every Validate; gaps return to Code; repeated failure opens a gate</td>
 </tr>
 </tbody>
 </table>
@@ -539,8 +502,10 @@ Hold "Alt" / "Option" to enable pan &amp; zoom
 <p>State lives at <code>.devflow/state-NN.json</code>; an old single <code>.devflow/state.json</code>
 is not read. The file records the current stage, phase, selected
 agent, mode, gate status, start time, project root, and optional worktree.</p>
-<p><code>auto</code> gates at Ship and on unexpected failures. <code>supervise</code> adds a Validate
-gate. Neither mode can bypass the terminal Ship approval.</p>
+<p><code>auto</code> runs unattended and finishes on a passing Validate, gating only on
+repeated Validate failure and on unexpected failures. <code>supervise</code> also gates
+every Validate. A finished run keeps the worktree and the <code>feature/phase-NN</code>
+branch; integrating the branch is the operator's step.</p>
 </article>
 </div>
 <script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
@@ -569,7 +534,7 @@ gate. Neither mode can bypass the terminal Ship approval.</p>
 <div class="md-dialog__inner md-typeset"></div>
 </div>
 <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.tabs", "navigation.indexes", "navigation.top", "search.suggest", "search.highlight", "content.code.copy"], "search": "../../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
-<script src="../../assets/javascripts/bundle.c21346df.min.js"></script>
+<script src="../../assets/javascripts/bundle.a5f9d56c.min.js"></script>
 <script src="../../assets/extra.js"></script>
 <script src="../../assets/javascripts/panzoom.min.js"></script>
 <script src="../../assets/javascripts/zoompan.js"></script>

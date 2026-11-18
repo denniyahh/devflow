@@ -6,10 +6,10 @@
 <meta charset="utf-8"/>
 <meta content="width=device-width,initial-scale=1" name="viewport"/>
 <meta content="Agent-agnostic development workflow automation — architecture, guides, and API reference" name="description"/>
-<link href="../ship-flow/" rel="prev"/>
+<link href="../agent-lifecycle/" rel="prev"/>
 <link href="../../guides/quickstart/" rel="next"/>
 <link href="../../assets/images/favicon.png" rel="icon"/>
-<meta content="mkdocs-1.6.1, mkdocs-material-9.8.0" name="generator"/>
+<meta content="mkdocs-1.6.1, mkdocs-material-9.8.1" name="generator"/>
 <title>Module Map - DevFlow Documentation</title>
 <link href="../../assets/stylesheets/main.57a0d79d.min.css" rel="stylesheet"/>
 <link href="../../assets/stylesheets/palette.fb2fffe2.min.css" rel="stylesheet"/>
@@ -249,18 +249,6 @@
   </span>
 </a>
 </li>
-<li class="md-nav__item">
-<a class="md-nav__link" href="../../architecture/git-ship/">
-<span class="md-ellipsis">
-    
-  
-    Git &amp; Ship Model
-  
-
-    
-  </span>
-</a>
-</li>
 </ul>
 </nav>
 </li>
@@ -305,18 +293,6 @@
     
   
     Agent Lifecycle
-  
-
-    
-  </span>
-</a>
-</li>
-<li class="md-nav__item">
-<a class="md-nav__link" href="../ship-flow/">
-<span class="md-ellipsis">
-    
-  
-    Ship Flow
   
 
     
@@ -445,17 +421,14 @@
 <pre class="mermaid"><code>flowchart LR
     CLI[devflow-cli] --&gt; WF[workflow and state]
     CLI --&gt; PROMPT[prompt]
-    CLI --&gt; HOOKS[hooks]
     WF --&gt; RESULT[agent_result]
     RESULT --&gt; VERIFY[verify]
     WF --&gt; GATES[gates]
     WF --&gt; MONITOR[monitor]
     MONITOR --&gt; AGENTS[agents]
     WF --&gt; HISTORY[history]
-    HOOKS --&gt; GIT[git]
-    HOOKS --&gt; VERSION[version]
+    WF --&gt; GIT[git]
     GIT --&gt; WORKTREE[worktree]
-    WF --&gt; LOCK[lock]
     WF --&gt; EVENTS[events]
 </code></pre>
 <div class="panzoom-info-box panzoom-info-box-bottom panzoom-hidden">
@@ -473,7 +446,7 @@ Hold "Alt" / "Option" to enable pan &amp; zoom
 <tbody>
 <tr>
 <td>State and control</td>
-<td><code>state</code>, <code>stage</code>, <code>workflow</code>, <code>lock</code></td>
+<td><code>state</code>, <code>stage</code>, <code>workflow</code></td>
 <td>Persist and safely advance each phase</td>
 </tr>
 <tr>
@@ -483,13 +456,13 @@ Hold "Alt" / "Option" to enable pan &amp; zoom
 </tr>
 <tr>
 <td>Reliability</td>
-<td><code>verify</code>, <code>history</code>, <code>events</code>, <code>gates</code>, <code>recover</code></td>
-<td>External probes, durable evidence, operations visibility, recovery</td>
+<td><code>verify</code>, <code>history</code>, <code>events</code>, <code>gates</code>, <code>reset_time</code></td>
+<td>External probes, durable evidence, operations visibility, rate-limit reset times</td>
 </tr>
 <tr>
 <td>Git lifecycle</td>
-<td><code>git</code>, <code>worktree</code>, <code>hooks</code>, <code>version</code>, <code>ship</code></td>
-<td>Branches, worktrees, terminal hooks, versioning, and rate-limit metadata</td>
+<td><code>git</code>, <code>worktree</code></td>
+<td>Branches and worktrees</td>
 </tr>
 <tr>
 <td>Configuration</td>
@@ -528,7 +501,7 @@ owns terminal-facing command parsing and presentation.</p>
 <div class="md-dialog__inner md-typeset"></div>
 </div>
 <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.tabs", "navigation.indexes", "navigation.top", "search.suggest", "search.highlight", "content.code.copy"], "search": "../../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
-<script src="../../assets/javascripts/bundle.c21346df.min.js"></script>
+<script src="../../assets/javascripts/bundle.a5f9d56c.min.js"></script>
 <script src="../../assets/extra.js"></script>
 <script src="../../assets/javascripts/panzoom.min.js"></script>
 <script src="../../assets/javascripts/zoompan.js"></script>

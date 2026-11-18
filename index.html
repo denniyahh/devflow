@@ -8,7 +8,7 @@
 <meta content="Agent-agnostic development workflow automation — architecture, guides, and API reference" name="description"/>
 <link href="architecture/overview/" rel="next"/>
 <link href="assets/images/favicon.png" rel="icon"/>
-<meta content="mkdocs-1.6.1, mkdocs-material-9.8.0" name="generator"/>
+<meta content="mkdocs-1.6.1, mkdocs-material-9.8.1" name="generator"/>
 <title>DevFlow Documentation</title>
 <link href="assets/stylesheets/main.57a0d79d.min.css" rel="stylesheet"/>
 <link href="assets/stylesheets/palette.fb2fffe2.min.css" rel="stylesheet"/>
@@ -304,18 +304,6 @@
   </span>
 </a>
 </li>
-<li class="md-nav__item">
-<a class="md-nav__link" href="architecture/git-ship/">
-<span class="md-ellipsis">
-    
-  
-    Git &amp; Ship Model
-  
-
-    
-  </span>
-</a>
-</li>
 </ul>
 </nav>
 </li>
@@ -360,18 +348,6 @@
     
   
     Agent Lifecycle
-  
-
-    
-  </span>
-</a>
-</li>
-<li class="md-nav__item">
-<a class="md-nav__link" href="diagrams/ship-flow/">
-<span class="md-ellipsis">
-    
-  
-    Ship Flow
   
 
     
@@ -526,8 +502,8 @@
 <article class="md-content__inner md-typeset">
 <h1 id="devflow">DevFlow<a class="headerlink" href="#devflow" title="Permanent link">¶</a></h1>
 <p><strong>A durable execution loop for AI-assisted development.</strong> DevFlow runs a
-phase through planning, implementation, validation, and human-approved
-shipping while preserving the evidence needed to understand what happened.</p>
+phase through planning, implementation, and validation while preserving the
+evidence needed to understand what happened.</p>
 <h2 id="pipeline-overview">Pipeline Overview<a class="headerlink" href="#pipeline-overview" title="Permanent link">¶</a></h2>
 <div class="panzoom-box" data-key="alt" id="panzoom0" oncontextmenu="return false;">
 <nav class="panzoom-nav">
@@ -542,24 +518,25 @@ shipping while preserving the evidence needed to understand what happened.</p>
 </button>
 </nav>
 <pre class="mermaid"><code>flowchart LR
-    D[Define] --&gt; P[Plan] --&gt; C[Code] --&gt; V[Validate] --&gt; S[Ship]
+    P[Plan] --&gt; C[Code] --&gt; V[Validate]
     V --&gt;|gaps| C
-    S --&gt;|approved| M[Merge and tag]
-    S --&gt;|rejected| C
+    V --&gt;|pass| F[Run finishes, branch kept]
 </code></pre>
 <div class="panzoom-info-box panzoom-info-box-bottom panzoom-hidden">
 Hold "Alt" / "Option" to enable pan &amp; zoom
 </div>
 </div>
-<p>Define, Plan, and Code launch an agent in an isolated worktree. Validate
-requires an explicit pass verdict. Ship runs review and always pauses for a
-human decision before DevFlow performs terminal Git operations.</p>
+<p>Plan and Code launch an agent in an isolated worktree. Validate requires an
+explicit pass verdict; a <code>gaps</code> verdict loops back to Code. Failures open a
+gate, repeated Validate failure opens a gate, and <code>--mode supervise</code> also
+gates every Validate. A passing Validate ends the run and keeps the worktree
+and the <code>feature/phase-NN</code> branch: DevFlow does not merge, tag, or open a pull
+request, so integrating the branch is the operator's step.</p>
 <h2 id="quick-links">Quick Links<a class="headerlink" href="#quick-links" title="Permanent link">¶</a></h2>
 <ul>
 <li><a href="diagrams/system/">System Architecture</a> — Runtime components and boundaries</li>
 <li><a href="architecture/state-machine/">State Machine</a> — Stages, verdicts, and gates</li>
 <li><a href="architecture/agent-model/">Agent Model</a> — Adapters and completion evidence</li>
-<li><a href="diagrams/ship-flow/">Ship Flow</a> — Review, approval, and terminal hooks</li>
 <li><a href="guides/quickstart/">Quick Start</a> — Install and operate DevFlow</li>
 </ul>
 <h2 id="supported-agents">Supported Agents<a class="headerlink" href="#supported-agents" title="Permanent link">¶</a></h2>
@@ -625,7 +602,7 @@ human decision before DevFlow performs terminal Git operations.</p>
 <div class="md-dialog__inner md-typeset"></div>
 </div>
 <script id="__config" type="application/json">{"annotate": null, "base": ".", "features": ["navigation.instant", "navigation.tracking", "navigation.tabs", "navigation.indexes", "navigation.top", "search.suggest", "search.highlight", "content.code.copy"], "search": "assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
-<script src="assets/javascripts/bundle.c21346df.min.js"></script>
+<script src="assets/javascripts/bundle.a5f9d56c.min.js"></script>
 <script src="assets/extra.js"></script>
 <script src="assets/javascripts/panzoom.min.js"></script>
 <script src="assets/javascripts/zoompan.js"></script>

@@ -21,7 +21,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.0">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.1">
     
     
       
@@ -388,8 +388,6 @@
       
         
       
-        
-      
     
     
     
@@ -517,34 +515,6 @@
 
               
             
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../architecture/git-ship/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Git & Ship Model
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
           </ul>
         </nav>
       
@@ -560,8 +530,6 @@
   
     
     
-      
-        
       
         
       
@@ -655,34 +623,6 @@
     
   
     Agent Lifecycle
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../diagrams/ship-flow/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Ship Flow
   
 
     
@@ -885,10 +825,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#check-status" class="md-nav__link">
+  <a href="#watch-and-stop" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Check Status
+        Watch and Stop
       
     </span>
   </a>
@@ -896,10 +836,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#shipping" class="md-nav__link">
+  <a href="#finishing" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Shipping
+        Finishing
       
     </span>
   </a>
@@ -1066,10 +1006,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#check-status" class="md-nav__link">
+  <a href="#watch-and-stop" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Check Status
+        Watch and Stop
       
     </span>
   </a>
@@ -1077,10 +1017,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#shipping" class="md-nav__link">
+  <a href="#finishing" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Shipping
+        Finishing
       
     </span>
   </a>
@@ -1134,15 +1074,24 @@ from your project root:</p>
 <a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>devflow<span class="w"> </span>start<span class="w"> </span>--phase<span class="w"> </span><span class="m">3</span><span class="w"> </span>--agent<span class="w"> </span>claude<span class="w"> </span>--mode<span class="w"> </span>auto
 </code></pre></div>
 <p>This creates a feature branch (in its own git worktree by default), launches
-the agent, and persists that phase's progress to
-<code>.devflow/state-03.json</code> (state is per-phase, not a single shared file).</p>
-<h2 id="check-status">Check Status<a class="headerlink" href="#check-status" title="Permanent link">&para;</a></h2>
+the run as a systemd user unit named from the project and the phase, and
+persists that phase's progress to <code>.devflow/state-03.json</code> (state is
+per-phase, not a single shared file). <code>start</code> returns once the unit is ready;
+the run keeps going after your shell exits. With lingering off it ends when
+you log out (<code>loginctl enable-linger</code> turns lingering on), and a host without
+a systemd user manager cannot launch a run.</p>
+<h2 id="watch-and-stop">Watch and Stop<a class="headerlink" href="#watch-and-stop" title="Permanent link">&para;</a></h2>
+<p>From any shell:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>devflow<span class="w"> </span>status
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>devflow<span class="w"> </span>logs<span class="w"> </span>--phase<span class="w"> </span><span class="m">3</span><span class="w"> </span>-f<span class="w">      </span><span class="c1"># follow the agent's output</span>
+<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>devflow<span class="w"> </span>stop<span class="w"> </span>--phase<span class="w"> </span><span class="m">3</span><span class="w">         </span><span class="c1"># stop the run's unit</span>
+<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>devflow<span class="w"> </span>resume<span class="w"> </span>--phase<span class="w"> </span><span class="m">3</span><span class="w">       </span><span class="c1"># continue a stopped run as a new unit</span>
 </code></pre></div>
-<h2 id="shipping">Shipping<a class="headerlink" href="#shipping" title="Permanent link">&para;</a></h2>
-<p>Shipping is not a separate command you run — Ship is the pipeline's final
-stage, driven automatically once Validate passes. It always pauses at a
-human gate before merging:</p>
+<h2 id="finishing">Finishing<a class="headerlink" href="#finishing" title="Permanent link">&para;</a></h2>
+<p>A passing Validate ends the run. DevFlow keeps the worktree and the
+<code>feature/phase-NN</code> branch and does not merge, tag or open a pull request:
+integrating the branch is your step. In <code>--mode supervise</code> the run pauses at
+a human gate before it finishes:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>devflow<span class="w"> </span>gate<span class="w"> </span>list
 <a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>devflow<span class="w"> </span>gate<span class="w"> </span>approve<span class="w"> </span><span class="m">3</span><span class="w"> </span>--note<span class="w"> </span><span class="s2">"lgtm"</span>
 </code></pre></div>
@@ -1152,8 +1101,9 @@ for the full gate-answering reference.</p>
 <ul>
 <li><strong>Rust</strong> stable (build from source)</li>
 <li><strong>git</strong> 2.30+</li>
-<li><strong>gh CLI</strong> 2.0+ (for PR creation)</li>
+<li><strong>gh CLI</strong> 2.0+ (<code>devflow doctor</code> checks for it; no DevFlow command runs it)</li>
 <li>An installed AI agent (Claude Code, Codex, or OpenCode)</li>
+<li>A systemd user manager (<code>systemctl --user</code>), which runs each run's unit</li>
 </ul>
 <p>Verify your setup:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>devflow<span class="w"> </span>doctor
@@ -1216,7 +1166,7 @@ for the full gate-answering reference.</p>
       <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.tabs", "navigation.indexes", "navigation.top", "search.suggest", "search.highlight", "content.code.copy"], "search": "../../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../../assets/javascripts/bundle.c21346df.min.js"></script>
+      <script src="../../assets/javascripts/bundle.a5f9d56c.min.js"></script>
       
         <script src="../../assets/extra.js"></script>
       
