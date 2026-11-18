@@ -63,7 +63,11 @@ Every run is a systemd user unit named from the project and the phase,
 the canonical project root. One project's phase therefore always names the same
 unit, and systemd refuses a second active one. `devflow start` and `devflow
 resume` launch it with `systemd-run --user` and return once the unit's runner
-holds the phase's run lock and has reported ready. The unit runs the hidden
+holds the phase's run lock and has reported ready. A unit whose last run
+failed stays loaded, reading `failed`, until systemd collects it, and
+systemd-run refuses a unit still loaded, so the launch first runs
+`systemctl --user reset-failed` on a unit that reads `failed` (a reset that
+fails is warned about and the launch goes on). The unit runs the hidden
 `__runner` subcommand in the project root: it runs the stages, waits at gates
 and advances. It receives the caller's environment variables by name, so no
 value appears on a command line. A launch that fails names the unit and

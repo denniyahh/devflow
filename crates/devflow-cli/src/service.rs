@@ -707,6 +707,7 @@ pub(crate) fn launch_runner_unit(
             "unit {unit}: the systemd-run argv could not be built ({error})"
         ))
     })?;
+    reset_a_failed_unit(&unit);
     let mut command = tool("systemd-run");
     command.args(argv);
     let output = run_bounded(command, LAUNCH_CALL_BOUND).map_err(|error| {
@@ -724,6 +725,32 @@ pub(crate) fn launch_runner_unit(
         output.status,
         String::from_utf8_lossy(&output.stderr).trim()
     )))
+}
+
+/// Reset `unit` with `systemctl --user reset-failed` when it reads `failed`: a unit
+/// whose run failed stays loaded until `--collect` unloads it, and `systemd-run`
+/// refuses a unit still loaded. A reset that fails is only warned about, since the
+/// collection unloads the unit anyway. Each call is bounded by [`SYSTEMCTL_CALL_BOUND`].
+#[cfg(not(test))]
+fn reset_a_failed_unit(unit: &str) {
+    if !matches!(unit_active_state(unit, SYSTEMCTL_CALL_BOUND), Ok(state) if state == "failed") {
+        return;
+    }
+    let mut command = tool("systemctl");
+    command.args(["--user", "reset-failed", unit]);
+    match run_bounded(command, SYSTEMCTL_CALL_BOUND) {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => eprintln!(
+            "warning: unit {unit} reads failed and `systemctl --user reset-failed {unit}` \
+             failed ({}); systemctl: {}; launching anyway",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(error) => eprintln!(
+            "warning: unit {unit} reads failed and `systemctl --user reset-failed {unit}` \
+             did not return ({error}); launching anyway"
+        ),
+    }
 }
 
 /// What a launch whose `systemd-run` outlived [`LAUNCH_CALL_BOUND`] says: `error` and
