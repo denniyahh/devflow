@@ -553,6 +553,13 @@ fn a_runner_at_a_rejected_gate_does_not_finish() {
             .filter(|event| event["stage"] == "validate")
             .count()
     };
+    // The runner publishes the gate file just before it records `gate_fired`, so the
+    // open file alone does not mean the event is in the log yet.
+    common::wait_for(
+        || fired(&fixture) >= 1,
+        RUNNER_WAIT,
+        "the Validate gate_fired event",
+    );
     assert_eq!(fired(&fixture), 1, "one Validate gate before the reject");
 
     fixture.gate(&["reject", &number, "--note", "fix the thing"]);
