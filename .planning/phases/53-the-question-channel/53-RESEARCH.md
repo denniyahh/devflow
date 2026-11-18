@@ -526,7 +526,7 @@ server reads the extra key back from the slot after `Answered`. Same trick for t
    the phase notes, and still use the additive answer/gate-file extension (Code Example 3) to avoid ~70 literal edits.
    Operator decision.
    **Resolution (planner remit, per the orchestrator; not an operator decision):** accepted for unpublished 4.0.0;
-   each plan that changes devflow-core's pub API (53-01, 53-03, 53-06, 53-08, 53-10) records the semver-checks output in its
+   each plan that changes devflow-core's pub API (53-01, 53-02, 53-03, 53-05, 53-06, 53-07, 53-08, 53-09, 53-10, 53-13, and 53-14 on its BUILD verdict) records the semver-checks output in its
    SUMMARY, and 53-VALIDATION.md Manual-Only M1 checks the phase-head output against the planned removals.
 2. **(RESOLVED) C3: may the pinned package-verification/gate-rule text be replaced by "call `devflow_ask`"?** Recommendation:
    yes — the operator still decides; the agent still never self-resolves. Needs the operator's explicit word.
@@ -535,13 +535,19 @@ server reads the extra key back from the slot after `Answered`. Same trick for t
 3. **(RESOLVED) Codex long holds: block (one contract) or `pending` + re-call held ~240 s?** Recommendation: block for both in
    this phase (simplest, D-06 main path, raises `tool_timeout_sec`), and measure tokens on the closing run; revisit in
    Phase 55 if codex runs unattended for hours.
-   **Resolution (planner remit, per the orchestrator):** block, with `tool_timeout_sec` raised to the gate timeout
-   + 60 s (53-08); codex's input tokens and hold seconds are measured on the live codex proof (53-VALIDATION.md M3).
+   **Resolution (operator answer OD-1 (b), 2026-11-18, 53-REVIEWS.md; it replaces the earlier planner-remit "block"):**
+   codex holds a call up to `ASK_HOLD_CAP_SECS` (900 s), then the server returns `pending` and codex re-calls with the
+   same `question_id` (53-13); codex's `tool_timeout_sec` is 960 s, the cap + 60 s (53-08 writes the registration,
+   53-13 sets the cap). The live codex proof (53-VALIDATION.md M3, operator decision (a), 2026-11-18) holds the
+   question past the cap, requires one `pending` and a re-call with the same `question_id` before the answer, and
+   records codex's input tokens and the seconds held.
 4. **(RESOLVED) C5: what happens to `--agent opencode|pi|hermes|antigravity` launches?** Recommendation: refuse with a named
    message (D-02 as written) and log a 999.x for their registrations, since the rotation needs only claude and codex.
    Operator decision because it removes a working launch.
-   **Resolution (operator answer 2, 2026-11-18):** REFUSE with a named message (D-02 as written; 53-08); their
-   registrations are backlog, filed as one 999.x entry by 53-08 Task 3.
+   **Resolution (operator answer 2, 2026-11-18, then operator answer OD-2 the same day, 53-REVIEWS.md):** REFUSE with a
+   named message (D-02 as written; 53-08) for opencode, hermes and antigravity; pi is registered in this phase by
+   53-14 when its spike verdict is BUILD, and stays refused on REFUSE. The backlog entry for the refused registrations
+   already exists as 999.248 (filed in 1662a8e on workspace/denniyahh), so 53-08 files none.
 5. **(RESOLVED) C4 abort mechanism** — inside planner remit (recommend the State field route); listed so it is not lost.
    **Resolution (planner remit, per the orchestrator):** the State field route, `State::abort_requested` (53-09).
 

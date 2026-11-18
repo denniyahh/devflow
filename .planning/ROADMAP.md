@@ -319,7 +319,7 @@ closing this phase.
      record — the history view distinguishes "not yet answered" from an empty answer, and a run that asked nothing
      shows no question rows. (ASK-04)
 
-**Plans**: 0/13 plans executed
+**Plans**: 0/14 plans executed
 **Wave 1**
 - [ ] 53-01-PLAN.md
 - [ ] 53-02-PLAN.md
@@ -333,17 +333,22 @@ closing this phase.
 
 **Wave 3** *(blocked on Wave 2 completion)*
 - [ ] 53-07-PLAN.md
-- [ ] 53-08-PLAN.md
 
 **Wave 4** *(blocked on Wave 3 completion)*
-- [ ] 53-09-PLAN.md
+- [ ] 53-08-PLAN.md
 
 **Wave 5** *(blocked on Wave 4 completion)*
-- [ ] 53-10-PLAN.md
+- [ ] 53-09-PLAN.md
 
 **Wave 6** *(blocked on Wave 5 completion)*
+- [ ] 53-10-PLAN.md
+
+**Wave 7** *(blocked on Wave 6 completion)*
 - [ ] 53-11-PLAN.md
 - [ ] 53-13-PLAN.md
+
+**Wave 8** *(blocked on Wave 7 completion)*
+- [ ] 53-14-PLAN.md
 **UI hint**: no
 
 ### Phase 54: Decision Triage
