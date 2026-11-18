@@ -787,6 +787,18 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.244: A Timed-Out `systemd-run` Makes `start` Clear the State of a Runner That May Be Live (BACKLOG)
+
+**Found:** 2026-11-18, PR #239 (Phase 52.2 close-out), Graphify review P2 on 307db0f, confirmed against the source.
+**Defect:** since WR-06 (8c9ee28) bounds the unit launch with `LAUNCH_CALL_BOUND`, `launch_runner_unit` can return a timeout
+whose text says "whether the unit started is unknown". `start`'s launch-error arm (`crates/devflow-cli/src/commands.rs`, after
+`launch_runner_unit`) still calls `workflow::clear_state` and prints "was not launched". If the manager accepted the unit, the
+runner (which takes its lock and sends READY=1 before `workflow::load_state`) can find no state, or lose its later writes.
+**Not established:** how often `systemd-run` exceeds the bound after acceptance; not reproduced.
+**Fix shape (not decided):** on the timeout arm, keep the state, release the holder, and read `runner_liveness` once: live → report
+the run as started; not live → clear as today; unknown → keep the state and name `devflow status` and `discard`. Same review for
+`resume`'s launch-error arm. **Owner:** decided by the operator at PR #239 (fix before merge, or the next fix branch).
+
 ### Phase 999.243: A Stale, Empty Worktree `index.lock` Blocks `git add` During Phase Work (BACKLOG)
 
 **Found:** 2026-11-17, Phase 52.2 (52.2-15's executor once; the review-fix pass twice).
