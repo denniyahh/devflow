@@ -80,7 +80,7 @@ Evidence paths: `commands.rs`, `ask_server.rs`, `pipeline_launch.rs`, `pipeline_
 | T-53-48 | 53-14 | Info disclosure | medium | mitigate | superseded by 53-14 deviation 1: file is .devflow/ask-NN.mcp.ts (pi.rs:33), removed on discard | closed |
 | T-53-49 | 53-14 | Tampering | medium | mitigate | pi.rs:106 config via serde_json::to_string; quote test pi.rs:302 | closed |
 | T-53-50 | 53-14 | Info disclosure | medium | mitigate | superseded by 53-14 deviation 1, does not arise: nothing written outside .devflow/ (`*` .gitignore, workflow.rs:144) | closed |
-| T-53-SC | 53-01 … 53-14 (13 plans) | Tampering | low | accept | see Accepted Risks | closed |
+| T-53-SC | 53-01 … 53-14 (14 plans) | Tampering | low | accept | see Accepted Risks | closed |
 
 *Status: open · closed · open — below high threshold (non-blocking)*
 *Severity: critical > high > medium > low — only open threats at or above workflow.security_block_on count toward threats_open*
@@ -97,7 +97,7 @@ Evidence paths: `commands.rs`, `ask_server.rs`, `pipeline_launch.rs`, `pipeline_
 | AR-53-03 | T-53-41 | global MCP servers left unchanged; the `devflow` server name is reserved (OPERATIONS.md) | planner (53-08) | 2026-11-18 |
 | AR-53-04 | T-53-28 | removed gate kind gets no state migration: no users (operator no-migration rule, 2026-10-12) | operator rule | 2026-10-12 |
 | AR-53-05 | T-53-44 | OD-1 (b) hold cap chosen; per-hold token cost documented in OPERATIONS.md | operator (OD-1, 2026-11-18) | 2026-11-18 |
-| AR-53-06 | T-53-SC (13 plans) | no package installed; Cargo.toml/Cargo.lock unchanged vs origin/develop | planner (each plan) | 2026-11-18 |
+| AR-53-06 | T-53-SC (14 plans) | no package installed; Cargo.toml/Cargo.lock unchanged vs origin/develop | planner (each plan) | 2026-11-18 |
 
 *Accepted risks do not resurface in future audit runs.*
 
