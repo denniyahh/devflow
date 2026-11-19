@@ -1,8 +1,8 @@
 //! Read-only per-phase attempt history assembled from existing DevFlow stores.
 
 use crate::phase_id::PhaseId;
-use crate::{agent_result, events};
-use std::collections::BTreeMap;
+use crate::{agent_result, events, gates};
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -96,6 +96,8 @@ pub fn render_timeline(timeline: &AttemptTimeline) -> String {
         return format!("no attempts recorded for phase {}", timeline.phase);
     }
 
+    let resolved = resolved_question_ids(timeline);
+    let mut resolved_so_far = HashSet::new();
     let mut rendered = format!("attempt history for phase {}\n", timeline.phase);
     for entry in &timeline.entries {
         let summary = entry
@@ -104,6 +106,9 @@ pub fn render_timeline(timeline: &AttemptTimeline) -> String {
             .map(events::describe)
             .unwrap_or_else(|| "retained artifact".into());
         rendered.push_str(&format!("[{}] {summary}\n", entry.timestamp));
+        if let Some(event) = &entry.event {
+            rendered.push_str(&question_rows(event, &resolved, &mut resolved_so_far));
+        }
         for capture in &entry.capture_files {
             rendered.push_str(&format!("  capture: {}\n", capture.display()));
         }
@@ -112,6 +117,116 @@ pub fn render_timeline(timeline: &AttemptTimeline) -> String {
         }
     }
     rendered.trim_end().to_string()
+}
+
+/// What history prints for a field an event did not record.
+const MISSING_FIELD: &str = "<missing field>";
+
+/// The `question_id`s some `question_answered` or `question_closed` event
+/// resolves: an asked question outside this set is still open.
+fn resolved_question_ids(timeline: &AttemptTimeline) -> HashSet<&str> {
+    timeline
+        .entries
+        .iter()
+        .filter_map(|entry| entry.event.as_ref())
+        .filter(|event| {
+            matches!(
+                event.get("event").and_then(|kind| kind.as_str()),
+                Some(events::QUESTION_ANSWERED | events::QUESTION_CLOSED)
+            )
+        })
+        .filter_map(|event| event.get("question_id").and_then(|id| id.as_str()))
+        .collect()
+}
+
+/// The indented sub-lines for a question event (D-16); empty for any other
+/// event. Only the first answer or close recorded for a `question_id` is
+/// applied; a later one is shown as ignored.
+fn question_rows<'a>(
+    event: &'a serde_json::Value,
+    resolved: &HashSet<&str>,
+    resolved_so_far: &mut HashSet<&'a str>,
+) -> String {
+    let key = event.get("question_id").and_then(|id| id.as_str());
+    let id = text_field(event, "question_id");
+    match event.get("event").and_then(|kind| kind.as_str()) {
+        Some(events::QUESTION_ASKED) => {
+            let mut rows = format!("  question {id}: {}\n", text_field(event, "question"));
+            rows.push_str(&format!("  options: {}\n", options_line(event)));
+            if event.get("recommended").is_none() {
+                rows.push_str(&format!("  recommended: {MISSING_FIELD}\n"));
+            }
+            if !key.is_some_and(|key| resolved.contains(key)) {
+                rows.push_str("  answer: not yet answered\n");
+            }
+            rows
+        }
+        Some(events::QUESTION_ANSWERED | events::QUESTION_CLOSED)
+            if key.is_some_and(|key| !resolved_so_far.insert(key)) =>
+        {
+            format!("  ignored {id}: already answered or closed by an earlier event\n")
+        }
+        Some(events::QUESTION_ANSWERED) => format!(
+            "  answer {id}: {} by {} via {}\n",
+            answer_text(event),
+            text_field(event, "answered_by"),
+            text_field(event, "policy")
+        ),
+        Some(events::QUESTION_CLOSED) => {
+            format!("  closed {id}: {}\n", text_field(event, "reason"))
+        }
+        _ => String::new(),
+    }
+}
+
+/// `<id> "<label>"[ (recommended)]` per option, in payload order.
+fn options_line(event: &serde_json::Value) -> String {
+    let Some(serde_json::Value::Array(options)) = event.get("options") else {
+        return text_field(event, "options");
+    };
+    if options.is_empty() {
+        return "(none)".into();
+    }
+    let recommended = event.get("recommended").and_then(|id| id.as_str());
+    options
+        .iter()
+        .map(|option| {
+            let is_recommended = recommended
+                .is_some_and(|rec| option.get("id").and_then(|id| id.as_str()) == Some(rec));
+            let mark = if is_recommended { " (recommended)" } else { "" };
+            let label = text_field(option, "label");
+            format!("{} \"{label}\"{mark}", text_field(option, "id"))
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+/// `option <id>` or `text "<text>"`, marking an empty text answer so it never
+/// reads as an open question; any other shape is shown as recorded.
+fn answer_text(event: &serde_json::Value) -> String {
+    match event.get("answer") {
+        Some(answer) if answer.get("option_id").is_some() => {
+            format!("option {}", text_field(answer, "option_id"))
+        }
+        Some(answer) if answer.get("text").is_some() => {
+            let text = text_field(answer, "text");
+            let empty = if text.is_empty() { " (empty)" } else { "" };
+            format!("text \"{text}\"{empty}")
+        }
+        _ => text_field(event, "answer"),
+    }
+}
+
+/// A field as terminal-safe text, never truncated (D-16 keeps the full
+/// text): a string as is, any other value as JSON, an absent one as
+/// [`MISSING_FIELD`].
+fn text_field(value: &serde_json::Value, key: &str) -> String {
+    let raw = match value.get(key) {
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(other) => other.to_string(),
+        None => return MISSING_FIELD.into(),
+    };
+    gates::render_gate_context(&raw, usize::MAX)
 }
 
 struct CaptureGeneration {
@@ -280,10 +395,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = events::events_path(dir.path());
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let lines: String = events
-            .iter()
-            .map(|event| format!("{event}\n"))
-            .collect();
+        let lines: String = events.iter().map(|event| format!("{event}\n")).collect();
         std::fs::write(path, lines).unwrap();
         render_timeline(&attempt_timeline(dir.path(), PhaseId::new(53)))
     }
@@ -318,9 +430,10 @@ mod tests {
         })
     }
 
-    const QUESTION_ROW_PREFIXES: [&str; 6] = [
+    const QUESTION_ROW_PREFIXES: [&str; 7] = [
         "  question ",
         "  options: ",
+        "  recommended: ",
         "  answer: ",
         "  answer ",
         "  closed ",
@@ -342,7 +455,10 @@ mod tests {
             ),
             "{rendered}"
         );
-        assert!(rendered.contains("  answer: not yet answered"), "{rendered}");
+        assert!(
+            rendered.contains("  answer: not yet answered"),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -368,7 +484,10 @@ mod tests {
         assert!(rendered.contains("gate_fired (validate)"), "{rendered}");
         for line in rendered.lines() {
             for prefix in QUESTION_ROW_PREFIXES {
-                assert!(!line.starts_with(prefix), "question row {line:?} in {rendered}");
+                assert!(
+                    !line.starts_with(prefix),
+                    "question row {line:?} in {rendered}"
+                );
             }
         }
     }
