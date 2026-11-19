@@ -127,6 +127,10 @@ enum Command {
         /// The launching run's `started_at`.
         #[arg(long)]
         run_started_at: String,
+        /// The longest one call is held, in seconds, before it replies
+        /// `pending`; absent holds a call until its question ends.
+        #[arg(long)]
+        hold_cap_secs: Option<u64>,
     },
     /// Resume a phase from its saved stage after a rate limit or infrastructure pause.
     ///
@@ -501,6 +505,7 @@ fn run() -> Result<(), CliError> {
             stage,
             timeout_secs,
             run_started_at,
+            hold_cap_secs,
         } => {
             let code = ask_server::serve(ask_server::AskArgs {
                 project,
@@ -508,6 +513,7 @@ fn run() -> Result<(), CliError> {
                 stage,
                 timeout_secs,
                 run_started_at,
+                hold_cap_secs,
             });
             use std::io::Write as _;
             let _ = std::io::stdout().flush();

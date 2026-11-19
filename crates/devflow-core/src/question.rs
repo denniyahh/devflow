@@ -142,6 +142,29 @@ impl QuestionSpec {
     }
 }
 
+impl QuestionSpec {
+    /// The question a `devflow_ask` call's `args` ask, as [`Self::from_arguments`]
+    /// reads it, beside the `question_id` a re-call carries to continue a
+    /// question it was told is still pending. The id is optional and must have
+    /// a question id's form (16 lowercase hex digits); whether it names a
+    /// question is for the server that issued it to say.
+    pub fn from_call_arguments(
+        args: &Value,
+    ) -> Result<(QuestionSpec, Option<String>), QuestionError> {
+        let spec = Self::from_arguments(args)?;
+        let recall_id = optional_text(args.get("question_id"), "question_id")?;
+        if let Some(id) = recall_id
+            && !crate::gates::is_gate_id(id)
+        {
+            return Err(QuestionError::WrongType {
+                field: "question_id".to_string(),
+                expected: "a question id of 16 lowercase hex digits",
+            });
+        }
+        Ok((spec, recall_id.map(str::to_string)))
+    }
+}
+
 /// `value` as text: `None` when absent or `null`, refused when not a string.
 fn optional_text<'a>(
     value: Option<&'a Value>,
@@ -449,6 +472,24 @@ mod tests {
                 "case `{case}`: the refusal `{refused}` names `{field_name}`"
             );
         }
+    }
+
+    #[test]
+    fn a_recall_question_id_is_returned_beside_the_spec_and_its_form_checked() {
+        let (_, absent) = QuestionSpec::from_call_arguments(&well_formed()).expect("parses");
+        assert_eq!(absent, None, "a first call carries no question id");
+        let id = "0123456789abcdef";
+        let (spec, recall) =
+            QuestionSpec::from_call_arguments(&with("question_id", Some(id.into())))
+                .expect("a well-formed question id parses");
+        assert_eq!(recall.as_deref(), Some(id));
+        assert_ne!(spec.question_id, id, "the spec still gets a fresh id");
+        let refused = QuestionSpec::from_call_arguments(&with("question_id", Some("Q-1".into())))
+            .expect_err("a malformed question id is refused");
+        assert!(
+            refused.to_string().contains("`question_id`"),
+            "the refusal names the field: {refused}"
+        );
     }
 
     #[test]
