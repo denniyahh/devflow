@@ -3184,13 +3184,14 @@ pub(crate) fn gate_list(project_root: &Path, all_roots: bool) -> Result<(), CliE
         return Ok(());
     }
     println!("{}", render_gate_list(&open));
-    println!(
-        "\nanswer with: devflow gate approve <phase> [--gate-id <id>] [--note ...] | \
-         devflow gate reject <phase> [--gate-id <id>] --note ... (fix and relaunch) | \
-         devflow gate abort <phase> [--gate-id <id>] [--note ...] (ends the run)"
-    );
+    println!("\n{GATE_LIST_ANSWERS}");
     Ok(())
 }
+
+/// The footer under [`gate_list`]'s table: every verb that answers a gate.
+const GATE_LIST_ANSWERS: &str = "answer with: devflow gate approve <phase> [--gate-id <id>] \
+     [--note ...] | devflow gate reject <phase> [--gate-id <id>] --note ... (fix and relaunch) | \
+     devflow gate abort <phase> [--gate-id <id>] [--note ...] (ends the run)";
 
 /// Pure render of [`gate_list`]'s table, so what it shows is testable without
 /// capturing process stdout.
@@ -4218,7 +4219,8 @@ pub(crate) fn gate_show(
                 "no open gate for phase {phase} stage {stage} — see `devflow gate list`"
             ))
         })?;
-    println!("{}", render_gate_show(&gate));
+    let question = Gates::read_question(project_root, phase, stage)?;
+    println!("{}", render_gate_show(&gate, question.as_ref()));
     Ok(())
 }
 
@@ -4227,7 +4229,10 @@ pub(crate) fn gate_show(
 /// `gate_list`'s `render_gate_context(.., GATE_CONTEXT_DISPLAY_CHARS)`). Factored out of `gate_show`
 /// so the untruncated-context guarantee is unit-testable without capturing
 /// process stdout.
-fn render_gate_show(gate: &OpenGate) -> String {
+fn render_gate_show(
+    gate: &OpenGate,
+    _question: Option<&devflow_core::question::QuestionSpec>,
+) -> String {
     format!(
         "phase {} {} ({})\ngate id: {}\n{}",
         gate.phase,
@@ -7840,6 +7845,180 @@ mod tests {
         registration.finish();
     }
 
+    /// D-10: approve and reject on a question gate are refused naming the
+    /// `gate answer` line for this phase and gate id, and write nothing.
+    #[test]
+    fn gate_approve_on_a_question_gate_is_refused_naming_gate_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, stage) = (PhaseId::new(5345), Stage::Code);
+        let (opened, registration) = open_budget_question(root, phase, stage);
+        let line = format!("devflow gate answer {phase} --gate-id {}", opened.gate_id);
+
+        for (kind, note) in [
+            (GateAnswerKind::Approve, None),
+            (GateAnswerKind::Reject, Some("take the other option".to_string())),
+        ] {
+            let err = gate_respond_report(
+                root,
+                phase,
+                Some(stage),
+                kind,
+                note,
+                Some(opened.gate_id.to_string()),
+            )
+            .expect_err("an approve or a reject on a question gate is refused")
+            .to_string();
+            assert!(err.contains(&line), "{err}");
+            assert!(gate_answer_files(root, phase, stage).is_empty(), "{err}");
+        }
+        registration.finish();
+    }
+
+    /// D-10: abort still ends the run from a question gate.
+    #[test]
+    fn gate_abort_on_a_question_gate_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, stage) = (PhaseId::new(5346), Stage::Code);
+        let (opened, registration) = open_budget_question(root, phase, stage);
+
+        gate_respond_report(
+            root,
+            phase,
+            Some(stage),
+            GateAnswerKind::Abort,
+            None,
+            Some(opened.gate_id.to_string()),
+        )
+        .expect("an abort on a question gate is accepted");
+
+        assert!(
+            matches!(
+                Gates::read_answer(root, phase, stage, &opened.gate_id),
+                AnswerRead::Bound(answer) if answer.response.abort
+            ),
+            "the abort is written for the question gate's id"
+        );
+        registration.finish();
+    }
+
+    /// D-09, ASK-01 ordering: `gate show` prints the question, its context and
+    /// each option in payload order, the recommended one marked. Control: a
+    /// stage-failure gate has no options block.
+    #[test]
+    fn gate_show_prints_a_questions_options_and_recommended_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, stage) = (PhaseId::new(5347), Stage::Code);
+        let (_opened, registration) = open_budget_question(root, phase, stage);
+        let open = Gates::list_open(root);
+        let question = Gates::read_question(root, phase, stage).unwrap();
+
+        let show = render_gate_show(&open[0], question.as_ref());
+
+        let at = |needle: &str| {
+            show.find(needle)
+                .unwrap_or_else(|| panic!("`{needle}` missing from: {show}"))
+        };
+        let order = [
+            at("question: Pick a budget"),
+            at("context: the probe needs a bound"),
+            at("options:"),
+            at("  budget-30: 30 s"),
+            at("  budget-120: 120 s (recommended)"),
+            at("  budget-300: 300 s"),
+            at("    the slow path"),
+        ];
+        assert!(order.is_sorted(), "out of order: {show}");
+        registration.finish();
+
+        let control = tempfile::tempdir().unwrap();
+        Gates::write_gate(
+            control.path(),
+            phase,
+            stage,
+            devflow_core::gates::GateKind::StageFailure,
+            "the stage failed",
+        )
+        .unwrap();
+        let open = Gates::list_open(control.path());
+        let show = render_gate_show(&open[0], None);
+        assert!(show.contains("the stage failed"), "{show}");
+        assert!(!show.contains("options:"), "{show}");
+    }
+
+    /// D-09: `gate list` shows the question line, and its footer names
+    /// `gate answer`.
+    #[test]
+    fn gate_list_names_gate_answer_for_a_question_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, stage) = (PhaseId::new(5348), Stage::Code);
+        let (_opened, registration) = open_budget_question(root, phase, stage);
+
+        let table = render_gate_list(&Gates::list_open(root));
+
+        assert!(table.contains("Pick a budget"), "{table}");
+        assert!(
+            GATE_LIST_ANSWERS.contains("devflow gate answer <phase> --gate-id <id>"),
+            "{GATE_LIST_ANSWERS}"
+        );
+        registration.finish();
+    }
+
+    /// A question gate's waiter is the `__ask` server, so `gate_pending` is
+    /// legitimately false: `doctor` does not call it orphaned. Control: a
+    /// stage-failure gate in the same shape still is.
+    #[test]
+    fn doctor_does_not_report_a_live_question_gate_as_orphaned() {
+        let facts_at = |root: &Path, phase: PhaseId| {
+            let mut state = State::new(phase, AgentKind::Claude, Mode::Supervise, root.into());
+            state.stage = Stage::Code;
+            assert!(!state.gate_pending);
+            build_phase_facts(
+                root,
+                state,
+                &mut std::collections::HashMap::new(),
+                &Gates::list_open(root),
+            )
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(5349);
+        let (_opened, registration) = open_budget_question(dir.path(), phase, Stage::Code);
+        let facts = facts_at(dir.path(), phase);
+        assert_eq!(facts.waiter, WaiterStatus::Live);
+        let finding = check_orphan_gate(&facts);
+        assert!(
+            finding.is_none(),
+            "a live question gate is not orphaned: {:?}",
+            finding.map(|f| f.detail)
+        );
+        registration.finish();
+
+        let control = tempfile::tempdir().unwrap();
+        let (_opened, registration) = Gates::open_registered(
+            control.path(),
+            phase,
+            Stage::Code,
+            devflow_core::gates::GateKind::StageFailure,
+            "g",
+        )
+        .unwrap();
+        let finding = check_orphan_gate(&facts_at(control.path(), phase))
+            .expect("control: a live stage-failure gate with gate_pending false is orphaned");
+        assert_eq!(finding.severity, Severity::Problem);
+        assert!(
+            finding
+                .repair
+                .as_deref()
+                .is_some_and(|repair| repair.starts_with("devflow gate approve")),
+            "{:?}",
+            finding.repair
+        );
+        registration.finish();
+    }
+
     /// T-50.1-42: a malformed `--gate-id` is refused before it can name a path.
     #[test]
     fn gate_respond_refuses_a_malformed_gate_id_before_touching_anything() {
@@ -8099,7 +8278,7 @@ mod tests {
         let open = Gates::list_open(root);
 
         let list = render_gate_list(&open);
-        let show = render_gate_show(&open[0]);
+        let show = render_gate_show(&open[0], None);
 
         assert!(list.contains(opened.gate_id.as_str()), "{list}");
         assert!(
@@ -9173,7 +9352,7 @@ mod tests {
             .find(|g| g.phase == PhaseId::new(15))
             .unwrap();
 
-        let rendered = render_gate_show(&gate);
+        let rendered = render_gate_show(&gate, None);
 
         assert!(rendered.contains(&"x".repeat(150)));
         assert!(!rendered.contains("[truncated"));
