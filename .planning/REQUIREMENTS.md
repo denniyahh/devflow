@@ -70,7 +70,7 @@ requirement closes a backlog entry, the entry is named; `.planning/user/V4-CUT-I
       and GSD discuss questions instead of self-resolving them positionally or stopping with a report.
 - [x] **ASK-04**: Every question and its answer are recorded in the event log with the answering policy or operator
       and the time, and `devflow history` shows them.
-- [ ] **ASK-05**: A `blocking-human` checkpoint reached under a one-shot launch is answered through the channel and the
+- [x] **ASK-05**: A `blocking-human` checkpoint reached under a one-shot launch is answered through the channel and the
       stage continues in the same session. Closes 999.57, 999.127.
 
 ### Decision triage (TRIAGE)
@@ -146,7 +146,7 @@ Populated during roadmap creation (2026-11-08). Phase order and dependencies: RO
 | ASK-02 | Phase 53 — The Question Channel | Complete |
 | ASK-03 | Phase 53 — The Question Channel | Pending |
 | ASK-04 | Phase 53 — The Question Channel | Complete |
-| ASK-05 | Phase 53 — The Question Channel | Pending |
+| ASK-05 | Phase 53 — The Question Channel | Complete |
 | TRIAGE-01 | Phase 54 — Decision Triage | Pending |
 | TRIAGE-02 | Phase 54 — Decision Triage | Pending |
 | TRIAGE-03 | Phase 54 — Decision Triage | Pending |
