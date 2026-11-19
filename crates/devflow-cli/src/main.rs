@@ -318,8 +318,15 @@ enum GateCmd {
         #[arg(long, default_value = ".")]
         project: PathBuf,
     },
-    /// Answer a question gate with one of the options it offers. Approve and
-    /// reject are refused on a question gate; abort still ends the run.
+    /// Answer a question gate with one of the options it offers, or with free
+    /// text. Approve and reject are refused on a question gate; abort still
+    /// ends the run.
+    #[command(group(
+        clap::ArgGroup::new("choice")
+            .required(true)
+            .multiple(false)
+            .args(["option", "text"])
+    ))]
     Answer {
         /// Phase whose question gate to answer.
         phase: PhaseId,
@@ -331,9 +338,12 @@ enum GateCmd {
         /// it names.
         #[arg(long = "gate-id")]
         gate_id: String,
-        /// The id of the chosen option.
+        /// The id of the chosen option, matched exactly.
         #[arg(long)]
-        option: String,
+        option: Option<String>,
+        /// A free-text answer; an empty text is an answer.
+        #[arg(long)]
+        text: Option<String>,
         /// Project root.
         #[arg(long, default_value = ".")]
         project: PathBuf,
@@ -558,13 +568,14 @@ fn run() -> Result<(), CliError> {
                 stage,
                 gate_id,
                 option,
+                text,
                 project,
             } => commands::gate_answer(
                 &project_root(project)?,
                 phase,
                 stage,
                 &gate_id,
-                &devflow_core::question::QuestionChoice::Option { option_id: option },
+                &answer_choice(option, text)?,
             ),
             GateCmd::Show {
                 phase,
@@ -624,6 +635,22 @@ fn project_root(project: PathBuf) -> Result<PathBuf, CliError> {
             Some(parent) => probe = parent,
             None => return Ok(start),
         }
+    }
+}
+
+/// The choice `gate answer`'s `--option` / `--text` group names. The group
+/// requires exactly one, so the last arm only guards a parser change.
+fn answer_choice(
+    option: Option<String>,
+    text: Option<String>,
+) -> Result<devflow_core::question::QuestionChoice, CliError> {
+    use devflow_core::question::QuestionChoice;
+    match (option, text) {
+        (Some(option_id), None) => Ok(QuestionChoice::Option { option_id }),
+        (None, Some(text)) => Ok(QuestionChoice::Text { text }),
+        _ => Err(CliError::Message(
+            "`gate answer` takes exactly one of `--option <id>` or `--text <answer>`".into(),
+        )),
     }
 }
 
