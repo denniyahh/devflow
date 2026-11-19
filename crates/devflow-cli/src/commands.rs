@@ -28,8 +28,8 @@ use devflow_core::agents;
 use devflow_core::config::{self, DEVELOP, FEATURE_PREFIX, MAIN};
 use devflow_core::events;
 use devflow_core::gates::{
-    GateError, GateFile, GateId, GateResponse, Gates, OpenGate, QuarantinedAnswer, WaiterStatus,
-    is_gate_id,
+    GateError, GateFile, GateId, GateKind, GateResponse, Gates, OpenGate, QuarantinedAnswer,
+    WaiterStatus, is_gate_id,
 };
 use devflow_core::git::{GitFlow, git_command};
 use devflow_core::history;
@@ -3448,6 +3448,106 @@ pub(crate) fn gate_respond_report(
         report.push('\n');
     }
     Ok(report)
+}
+
+/// Answer the question gate `gate_id` names with the option `option` (D-10).
+pub(crate) fn gate_answer(
+    project_root: &Path,
+    phase: PhaseId,
+    stage: Option<Stage>,
+    gate_id: &str,
+    option: &str,
+) -> Result<(), CliError> {
+    let report = gate_answer_report(project_root, phase, stage, gate_id, option)?;
+    print!("{report}");
+    Ok(())
+}
+
+/// [`gate_answer`]'s work, returning what it prints. The checks run in
+/// [`gate_respond_report`]'s order, and everything is refused before anything
+/// is written: a malformed id, a gate the id does not name, a gate with no
+/// waiter, a gate that is not a question, and an option the question did not
+/// offer (exact string equality).
+pub(crate) fn gate_answer_report(
+    project_root: &Path,
+    phase: PhaseId,
+    stage: Option<Stage>,
+    gate_id: &str,
+    option: &str,
+) -> Result<String, CliError> {
+    let observed = GateId::parse(gate_id)?;
+    let open = Gates::list_open(project_root);
+    let stage = match stage {
+        Some(stage) => stage,
+        None => resolve_single_open_gate_stage(&open, phase)?,
+    };
+    require_gate_file_names(project_root, phase, stage, &observed)?;
+    refuse_a_gate_with_no_waiter(project_root, phase, stage, &observed)?;
+    let responded_by = std::env::var("USER")
+        .ok()
+        .filter(|user| !user.is_empty())
+        .unwrap_or_else(|| "devflow-cli".into());
+    let gate =
+        crate::pipeline_gate::read_gate_file(project_root, phase, stage).ok_or_else(|| {
+            CliError::Message(format!(
+                "phase {phase} {stage}'s gate file could not be read, so DevFlow cannot tell                  what this answer would run; no response was written"
+            ))
+        })?;
+    if gate.gate_kind != Some(GateKind::Question) {
+        return Err(CliError::Message(format!(
+            "phase {phase} {stage}'s gate is not a question gate, so `gate answer` cannot answer              it; no response was written. Answer it with `devflow gate approve`, `devflow gate              reject --note <text>` or `devflow gate abort`"
+        )));
+    }
+    let spec = Gates::read_question(project_root, phase, stage)?.ok_or_else(|| {
+        CliError::Message(format!(
+            "phase {phase} {stage}'s question gate carries no question; no response was written"
+        ))
+    })?;
+    if !spec.options.iter().any(|offered| offered.id == option) {
+        let offered: Vec<&str> = spec.options.iter().map(|o| o.id.as_str()).collect();
+        return Err(CliError::Message(format!(
+            "`{option}` is not an option of phase {phase} {stage}'s question; no response was              written. The options offered: {}",
+            offered.join(", ")
+        )));
+    }
+    let choice = devflow_core::question::QuestionChoice::Option {
+        option_id: option.to_string(),
+    };
+    let path = Gates::answer_question(
+        project_root,
+        phase,
+        stage,
+        &observed,
+        &choice,
+        &responded_by,
+    )
+    .map_err(gate_answer_error)?;
+    events::emit(
+        project_root,
+        phase,
+        "gate_response_written",
+        serde_json::json!({
+            "stage": stage.to_string(),
+            "gate_id": observed.as_str(),
+            "approved": true,
+            "abort": false,
+            "option_id": option,
+            "via": "cli",
+        }),
+    );
+    let pickup = if waiter_is_live(project_root, phase, stage, &observed) {
+        response_pickup_message(WaiterStatus::Live).to_owned()
+    } else {
+        format!(
+            "response was written, but no registered waiter will act. {}",
+            no_waiter_repair(phase)
+        )
+    };
+    Ok(format!(
+        "answered the question gate for phase {phase} {stage} with option `{option}` — {pickup} \
+         (response at {})\n",
+        path.display()
+    ))
 }
 
 /// The route a written answer runs, as `gate approve`, `gate reject` and

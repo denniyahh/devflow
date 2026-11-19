@@ -88,32 +88,92 @@ where
     R: BufRead,
     W: Write + Send + 'static,
 {
-    let _ = mpsc::channel::<()>;
+    let (calls, queued) = mpsc::channel::<(Value, Value)>();
+    let worker_output = Arc::clone(&output);
+    let worker = std::thread::Builder::new()
+        .name("ask-worker".to_string())
+        .spawn(move || {
+            for (id, params) in queued {
+                let result = call(&params);
+                write_message(&worker_output, &response(&id, result));
+            }
+        });
+    if let Err(error) = worker {
+        eprintln!("devflow __ask: could not start the worker thread: {error}");
+        return 1;
+    }
     for line in input.lines() {
-        let Ok(line) = line else { break };
+        let line = match line {
+            Ok(line) => line,
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                write_message(
+                    &output,
+                    &error_response(&Value::Null, PARSE_ERROR, "parse error"),
+                );
+                continue;
+            }
+            Err(error) => {
+                eprintln!("devflow __ask: stdin read failed: {error}");
+                break;
+            }
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
         match handle_line(&line) {
             Dispatch::Reply(message) => write_message(&output, &message),
             Dispatch::Call { id, params } => {
-                let result = call(&params);
-                write_message(&output, &response(&id, result));
+                if calls.send((id, params)).is_err() {
+                    eprintln!("devflow __ask: the worker thread is gone");
+                    return 1;
+                }
             }
             Dispatch::Nothing => {}
         }
     }
+    // Stdin ended. A call still held is not waited for: what an ended client
+    // leaves behind is 53-07's cleanup.
     0
 }
 
-/// Route one input line.
+/// Route one input line: reply now, hand a `tools/call` to the worker, or
+/// nothing for a notification or a client's response.
 pub(crate) fn handle_line(line: &str) -> Dispatch {
     let Ok(message) = serde_json::from_str::<Value>(line) else {
+        return Dispatch::Reply(error_response(&Value::Null, PARSE_ERROR, "parse error"));
+    };
+    let id = message.get("id").filter(|id| !id.is_null()).cloned();
+    let params = message.get("params").cloned().unwrap_or(Value::Null);
+    let Some(method) = message.get("method").and_then(Value::as_str) else {
         return Dispatch::Nothing;
     };
-    match message.get("method").and_then(Value::as_str) {
-        Some("tools/call") => Dispatch::Call {
-            id: message.get("id").cloned().unwrap_or(Value::Null),
-            params: message.get("params").cloned().unwrap_or(Value::Null),
+    let Some(id) = id else {
+        // A notification: `notifications/initialized` and any other get no reply.
+        return Dispatch::Nothing;
+    };
+    match method {
+        "initialize" => {
+            let requested = params["protocolVersion"].as_str().unwrap_or("");
+            Dispatch::Reply(response(
+                &id,
+                json!({
+                    "protocolVersion": negotiate(requested),
+                    "capabilities": { "tools": {} },
+                    "serverInfo": { "name": "devflow", "version": env!("CARGO_PKG_VERSION") },
+                }),
+            ))
+        }
+        "ping" => Dispatch::Reply(response(&id, json!({}))),
+        "tools/list" => Dispatch::Reply(response(&id, json!({ "tools": [ask_tool_definition()] }))),
+        "tools/call" => match params["name"].as_str() {
+            Some(ASK_TOOL) => Dispatch::Call { id, params },
+            other => Dispatch::Reply(error_response(
+                &id,
+                INVALID_PARAMS,
+                &format!("unknown tool `{}`", other.unwrap_or_default()),
+            )),
         },
-        _ => Dispatch::Nothing,
+        _ => Dispatch::Reply(error_response(&id, METHOD_NOT_FOUND, "method not found")),
     }
 }
 

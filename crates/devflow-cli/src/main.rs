@@ -105,6 +105,29 @@ enum Command {
         #[arg(long)]
         phase: PhaseId,
     },
+    /// Internal: the stdio MCP server an agent DevFlow launched spawns (D-03).
+    ///
+    /// Speaks newline-delimited JSON-RPC on stdin and stdout and offers one tool,
+    /// `devflow_ask`, whose call opens a question gate and returns the operator's
+    /// `gate answer`. Hidden: an agent's MCP registration runs it, never an operator.
+    #[command(name = "__ask", hide = true)]
+    Ask {
+        /// Project root of the launching run.
+        #[arg(long)]
+        project: PathBuf,
+        /// Phase of the launching run.
+        #[arg(long)]
+        phase: PhaseId,
+        /// Stage whose gate a question opens.
+        #[arg(long)]
+        stage: Stage,
+        /// How long a question waits for its answer, in seconds.
+        #[arg(long)]
+        timeout_secs: u64,
+        /// The launching run's `started_at`.
+        #[arg(long)]
+        run_started_at: String,
+    },
     /// Resume a phase from its saved stage after a rate limit or infrastructure pause.
     ///
     /// Unlike `start`, this loads the persisted per-phase state and
@@ -295,6 +318,26 @@ enum GateCmd {
         #[arg(long, default_value = ".")]
         project: PathBuf,
     },
+    /// Answer a question gate with one of the options it offers. Approve and
+    /// reject are refused on a question gate; abort still ends the run.
+    Answer {
+        /// Phase whose question gate to answer.
+        phase: PhaseId,
+        /// Stage of the gate (auto-resolved when the phase has exactly one
+        /// open gate).
+        #[arg(long = "stage")]
+        stage: Option<Stage>,
+        /// The gate id `gate list` showed: one answer decides only the gate
+        /// it names.
+        #[arg(long = "gate-id")]
+        gate_id: String,
+        /// The id of the chosen option.
+        #[arg(long)]
+        option: String,
+        /// Project root.
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+    },
     /// Print an open gate's full, untruncated context (21a) — `gate list`
     /// truncates context to 300 chars, as the gate banner does; this reads it in
     /// full, control-char sanitized.
@@ -442,6 +485,24 @@ fn run() -> Result<(), CliError> {
                 }
             }
         }
+        Command::Ask {
+            project,
+            phase,
+            stage,
+            timeout_secs,
+            run_started_at,
+        } => {
+            let code = ask_server::serve(ask_server::AskArgs {
+                project,
+                phase,
+                stage,
+                timeout_secs,
+                run_started_at,
+            });
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+            std::process::exit(code)
+        }
         Command::Resume {
             phase,
             agent,
@@ -492,6 +553,13 @@ fn run() -> Result<(), CliError> {
                 note,
                 gate_id,
             ),
+            GateCmd::Answer {
+                phase,
+                stage,
+                gate_id,
+                option,
+                project,
+            } => commands::gate_answer(&project_root(project)?, phase, stage, &gate_id, &option),
             GateCmd::Show {
                 phase,
                 stage,
