@@ -45,6 +45,48 @@ DEVFLOW_RESULT: {\"status\": \"failed\", \"reason\": \"specific explanation\"}\n
 Anything else your final message must contain, such as the reasoning for a decision, goes above the DEVFLOW_RESULT line. \
 DevFlow reads this line to decide whether the stage succeeded. Output nothing after it.";
 
+/// The question policy every stage prompt carries (ASK-03, 53-CONTEXT.md D-12):
+/// every question an agent meets goes to the operator through the `devflow_ask`
+/// tool, and the agent never answers one itself. A macro for the same `concat!`
+/// reason as [`checkpoint_declaration`]; [`ASK_POLICY`] is its one expansion,
+/// and each stage builder places it just before the completion contract.
+///
+/// The tool names are the ones each client showed in the 53-MCP-SPIKE.md Item 2
+/// transcripts: Claude Code called `mcp__devflow__devflow_ask`, codex called
+/// tool `devflow_ask` of server `devflow`. The `pending` re-call is operator
+/// answer OD-1 (b) (53-REVIEWS.md, 2026-11-18); the server side is 53-13.
+macro_rules! ask_policy {
+    () => {
+        "\
+## Questions go to the operator\n\
+\n\
+When you reach a decision checkpoint, a `blocking-human` gate, a package-verification \
+checkpoint, or a question a GSD workflow would ask the user (including a discuss \
+question), call the `devflow_ask` tool from the `devflow` MCP server. Clients namespace \
+it: Claude Code lists it as `mcp__devflow__devflow_ask`, and codex as tool `devflow_ask` \
+of server `devflow`; call the name your tool list shows for that server's `devflow_ask`. \
+Pass the question, every option as `{id, label, description}`, the context the operator \
+needs, `kind` (`decision`, `blocking-human` or `discuss`), and `recommended` if one option \
+is recommended. Wait for the answer and apply exactly that answer. Do not choose an option \
+yourself, do not choose by position, and do not stop with a report instead of asking. When \
+a GSD subagent you ran stops at such a point, you ask and pass the answer on. Record the \
+question and the answer you received in your final message.\n\
+\n\
+A result whose `status` is `pending` is not an answer: no answer has come yet and the \
+question stays open for the operator. Call `devflow_ask` again with the same arguments \
+plus the `question_id` that result gave, and keep doing so until you receive an answer or \
+a `devflow_ask closed:` result. On a result starting `devflow_ask refused:`, fix the \
+payload and call again. On a result starting `devflow_ask closed:` (the run was stopped, \
+aborted or timed out), end the stage and put that text in your final line's reason. If \
+the call itself fails or the tool is not available, do not resolve the question \
+yourself; report it instead.\n\
+\n"
+    };
+}
+
+/// [`ask_policy`]'s one expansion, interpolated into every stage prompt.
+const ASK_POLICY: &str = ask_policy!();
+
 /// The single definition of who may resolve a `blocking-human` gate
 /// (47-CONTEXT.md D-04). It is a macro and not only a `const` because
 /// `CODE_STAGE_POLICY` is assembled with `concat!`, which accepts literals and
@@ -1570,16 +1612,213 @@ mod tests {
     /// baseline is re-blessed, and in phase review.
     #[test]
     fn package_verification_prohibition_is_unconditional() {
-        const PINNED_SECTION: &str = "This authority never extends to a package-verification checkpoint: do not self-resolve or approve one under any circumstances, and report it instead. A blocking-human gate is human-only, with one exception: if DevFlow resumed you specifically to resolve that gate, resolve it yourself and record your reasoning in your final message; otherwise report it instead.";
-        const PINNED_GATE_RULE: &str = "A blocking-human gate is human-only, with one exception: if DevFlow resumed you specifically to resolve that gate, resolve it yourself and record your reasoning in your final message; otherwise report it instead.";
+        const PINNED_SECTION: &str = "A package-verification checkpoint and a blocking-human gate are the operator's: ask through devflow_ask and apply the answer you receive. If the devflow_ask call itself fails, do not self-resolve or approve one under any circumstances, and report it instead.";
+        const FALLBACK: &str =
+            "do not self-resolve or approve one under any circumstances, and report it instead";
 
+        assert!(
+            PINNED_SECTION.contains(FALLBACK),
+            "the pinned section must keep the no-self-resolve fallback (operator answer 1)"
+        );
         assert!(
             CODE_STAGE_POLICY.contains(PINNED_SECTION),
             "CODE_STAGE_POLICY no longer carries the pinned gate-rule section verbatim"
         );
-        assert_eq!(
-            GATE_RESOLUTION_RULE, PINNED_GATE_RULE,
-            "GATE_RESOLUTION_RULE must equal the pinned section's second sentence exactly"
+    }
+
+    // ---- ASK-03 / D-12: every question goes through devflow_ask ----
+
+    /// The text that starts the completion contract of every stage, the
+    /// ordinary protocol and Validate's verdict contract alike.
+    const COMPLETION_HEADING: &str = "## Completion Protocol (REQUIRED)";
+
+    /// Every intent a stage can be launched with, none carrying a note, so the
+    /// shortest prompt of each arm is the one walked. Code's fix arms are
+    /// walked through an exhaustive `match` on `FixType`, so a new variant is a
+    /// compile error here until it is linked into the chain.
+    fn every_intent(phase: PhaseId) -> Vec<StageIntent> {
+        fn next_fix(fix: Option<FixType>) -> Option<Option<FixType>> {
+            match fix {
+                None => Some(Some(FixType::GapsOnly)),
+                Some(FixType::GapsOnly) => Some(Some(FixType::FullExecute)),
+                Some(FixType::FullExecute) => Some(Some(FixType::StaleReverify)),
+                Some(FixType::StaleReverify) => Some(Some(FixType::Quick)),
+                Some(FixType::Quick) => None,
+            }
+        }
+        let mut intents = vec![
+            StageIntent::Plan {
+                phase,
+                relaunch_note: None,
+            },
+            StageIntent::PlanGaps {
+                phase,
+                relaunch_note: None,
+            },
+            StageIntent::Validate {
+                phase,
+                relaunch_note: None,
+            },
+        ];
+        let mut fix = Some(None);
+        while let Some(current) = fix {
+            intents.push(StageIntent::Code {
+                phase,
+                fix: current,
+                fix_note: None,
+                relaunch_note: None,
+                reverify_report: None,
+            });
+            fix = next_fix(current);
+        }
+        intents
+    }
+
+    /// Every agent kind, walked through an exhaustive `match` as in
+    /// `policy_carrying_full_execute_fix_prompt_snapshots`.
+    fn every_agent_kind() -> Vec<crate::state::AgentKind> {
+        use crate::state::AgentKind;
+        fn next_kind(kind: AgentKind) -> Option<AgentKind> {
+            match kind {
+                AgentKind::Claude => Some(AgentKind::Codex),
+                AgentKind::Codex => Some(AgentKind::OpenCode),
+                AgentKind::OpenCode => Some(AgentKind::Pi),
+                AgentKind::Pi => Some(AgentKind::Antigravity),
+                AgentKind::Antigravity => Some(AgentKind::Hermes),
+                AgentKind::Hermes => None,
+            }
+        }
+        let mut kinds = Vec::new();
+        let mut next = Some(AgentKind::Claude);
+        while let Some(kind) = next {
+            kinds.push(kind);
+            next = next_kind(kind);
+        }
+        kinds
+    }
+
+    /// Every stage prompt every driver renders, labelled with its driver and
+    /// intent for failure messages.
+    fn every_rendered_prompt() -> Vec<(String, String)> {
+        let mut prompts = Vec::new();
+        for kind in every_agent_kind() {
+            for intent in every_intent(PhaseId::new(53)) {
+                let label = format!("{kind:?} {intent:?}");
+                prompts.push((
+                    label,
+                    crate::agents::driver_for(kind).render_prompt(&intent),
+                ));
+            }
+        }
+        prompts
+    }
+
+    /// The phrases of the removed positional self-resolution policy found in
+    /// `text`. Each needle is split mid-word so this test source does not hold
+    /// the phrase it searches for.
+    fn positional_self_resolution_findings(text: &str) -> Vec<&'static str> {
+        const NEEDLES: [&str; 5] = [
+            concat!("Unattended decision check", "points"),
+            concat!("resolve it rather than pau", "sing"),
+            concat!("nobody is com", "ing"),
+            concat!("positional proce", "dure"),
+            concat!("if DevFlow resumed you specific", "ally"),
+        ];
+        NEEDLES
+            .into_iter()
+            .filter(|needle| text.contains(needle))
+            .collect()
+    }
+
+    #[test]
+    fn every_stage_prompt_routes_questions_through_devflow_ask() {
+        let prompts = every_rendered_prompt();
+        assert_eq!(prompts.len(), 6 * 8, "six drivers times eight intents");
+        let mut wrong = Vec::new();
+        for (label, prompt) in &prompts {
+            let completion = prompt
+                .find(COMPLETION_HEADING)
+                .unwrap_or_else(|| panic!("{label}: no completion contract:\n{prompt}"));
+            match (prompt.matches(ASK_POLICY).count(), prompt.find(ASK_POLICY)) {
+                (1, Some(at)) if at < completion => {}
+                (1, Some(_)) => {
+                    wrong.push(format!("{label}: ask policy after the completion contract"))
+                }
+                (count, _) => wrong.push(format!("{label}: ask policy present {count} times")),
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    #[test]
+    fn no_prompt_template_carries_positional_self_resolution() {
+        let source = include_str!("prompt.rs");
+        let non_test_source = source
+            .split("\nmod tests {")
+            .next()
+            .expect("split yields at least one part");
+        assert!(
+            non_test_source.len() < source.len(),
+            "precondition: the source holds a `mod tests {{` line to cut at"
+        );
+        let mut found = Vec::new();
+        for (label, prompt) in every_rendered_prompt() {
+            for needle in positional_self_resolution_findings(&prompt) {
+                found.push(format!("{label}: {needle}"));
+            }
+        }
+        for needle in positional_self_resolution_findings(non_test_source) {
+            found.push(format!("prompt.rs non-test source: {needle}"));
+        }
+        assert!(found.is_empty(), "{found:#?}");
+    }
+
+    #[test]
+    fn the_positional_scan_trips_on_a_planted_copy() {
+        let planted = concat!(
+            "## Unattended decision check",
+            "points\n\nWhen you reach a `decision` checkpoint and no operator is available, \
+             resolve it rather than pau",
+            "sing: this run is unattended and nobody is com",
+            "ing."
+        );
+        let findings = positional_self_resolution_findings(planted);
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.contains("Unattended decision checkpoints")),
+            "{findings:?}"
+        );
+    }
+
+    /// The fragments the ask policy must carry: the namespaced tool name, the
+    /// server name and the `pending` re-call with its `question_id`.
+    fn missing_ask_policy_fragments(policy: &str) -> Vec<&'static str> {
+        [
+            "mcp__devflow__devflow_ask",
+            "server `devflow`",
+            "pending",
+            "question_id",
+        ]
+        .into_iter()
+        .filter(|fragment| !policy.contains(fragment))
+        .collect()
+    }
+
+    #[test]
+    fn the_ask_policy_names_the_namespaced_tool_and_the_pending_recall() {
+        assert_eq!(missing_ask_policy_fragments(ASK_POLICY), Vec::<&str>::new());
+
+        // Control: the policy with its `pending` sentence removed loses the
+        // re-call, and the check reports it.
+        let pending_sentence = ASK_POLICY
+            .split(". ")
+            .find(|sentence| sentence.contains("question_id"))
+            .expect("the policy has a sentence naming question_id");
+        let without_recall = ASK_POLICY.replace(pending_sentence, "");
+        assert!(
+            missing_ask_policy_fragments(&without_recall).contains(&"question_id"),
+            "{without_recall}"
         );
     }
 
