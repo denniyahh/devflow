@@ -673,6 +673,7 @@ impl Gates {
             &GateId::new(),
             label.into(),
             context,
+            None,
         )
     }
 
@@ -718,13 +719,14 @@ impl Gates {
         let gate_id = GateId::new();
         let registration = Self::register_waiter(project_root, phase, stage, &gate_id)?;
         before_publish();
-        let opened = match Self::open_gate_as(project_root, phase, stage, &gate_id, kind, context) {
-            Ok(opened) => opened,
-            Err(error) => {
-                registration.finish();
-                return Err(error);
-            }
-        };
+        let opened =
+            match Self::open_gate_as(project_root, phase, stage, &gate_id, kind, context, None) {
+                Ok(opened) => opened,
+                Err(error) => {
+                    registration.finish();
+                    return Err(error);
+                }
+            };
         after_publish();
         Ok((opened, registration))
     }
@@ -749,6 +751,7 @@ impl Gates {
             &gate_id,
             GateKind::StageFailure.into(),
             context,
+            None,
         )?;
         after_publish();
         let registration = Self::register_waiter(project_root, phase, stage, &gate_id)?;
@@ -757,7 +760,7 @@ impl Gates {
 
     /// [`open_gate`](Self::open_gate) under the id the caller chose. The disposal
     /// never touches a `.waiter` file: the registration for the gate being opened may
-    /// already exist.
+    /// already exist. A `question` is published in the gate file's own write.
     fn open_gate_as(
         project_root: &Path,
         phase: PhaseId,
@@ -765,12 +768,14 @@ impl Gates {
         gate_id: &GateId,
         kind: GateLabel,
         context: &str,
+        question: Option<&QuestionSpec>,
     ) -> Result<OpenedGate, GateError> {
         let _lock = gate_lock(project_root, phase)?;
         let (_, _, disposal) =
             Self::set_aside_stage_answers(project_root, phase, stage, &mut |_| {});
         disposal?;
-        let opened = Self::write_gate_file(project_root, phase, stage, gate_id, kind, context)?;
+        let opened =
+            Self::write_gate_file(project_root, phase, stage, gate_id, kind, context, question)?;
         consume_preanswer(project_root, phase, stage, gate_id)?;
         Ok(opened)
     }
@@ -785,14 +790,25 @@ impl Gates {
         stage: Stage,
         spec: &QuestionSpec,
     ) -> Result<(OpenedGate, WaiterRegistration), GateError> {
-        let _ = spec;
-        Self::open_registered(
+        let gate_id = GateId::new();
+        let registration = Self::register_waiter(project_root, phase, stage, &gate_id)?;
+        let context = crate::question::render_question_context(spec);
+        let opened = match Self::open_gate_as(
             project_root,
             phase,
             stage,
-            GateKind::Question,
-            &crate::question::render_question_context(spec),
-        )
+            &gate_id,
+            GateKind::Question.into(),
+            &context,
+            Some(spec),
+        ) {
+            Ok(opened) => opened,
+            Err(error) => {
+                registration.finish();
+                return Err(error);
+            }
+        };
+        Ok((opened, registration))
     }
 
     /// The question spec the stage's gate file carries, or `None` when there is
@@ -802,8 +818,11 @@ impl Gates {
         phase: PhaseId,
         stage: Stage,
     ) -> Result<Option<QuestionSpec>, GateError> {
-        let _ = (project_root, phase, stage);
-        Ok(None)
+        match std::fs::read_to_string(Self::gate_path(project_root, phase, stage)) {
+            Ok(contents) => Ok(serde_json::from_str::<QuestionKey>(&contents)?.question),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Answer the question gate the caller observed with `choice`: the same
@@ -817,14 +836,21 @@ impl Gates {
         choice: &QuestionChoice,
         responded_by: &str,
     ) -> Result<PathBuf, GateError> {
-        let _ = choice;
         let response = GateResponse {
             approved: true,
             abort: false,
             note: None,
             responded_by: Some(responded_by.to_string()),
         };
-        Self::answer(project_root, phase, stage, observed, &response)
+        Self::publish_answer_with_hook(
+            project_root,
+            phase,
+            stage,
+            observed,
+            &response,
+            Some(choice),
+            || {},
+        )
     }
 
     /// The choice in `gate`'s answer slot, or `None` when the slot holds no
@@ -835,8 +861,16 @@ impl Gates {
         stage: Stage,
         gate: &GateId,
     ) -> Result<Option<QuestionChoice>, GateError> {
-        let _ = (project_root, phase, stage, gate);
-        Ok(None)
+        let path = Self::answer_path(project_root, phase, stage, gate);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if classify_answer(&bytes, gate.as_str()).is_err() {
+            return Ok(None);
+        }
+        Ok(serde_json::from_slice::<ChoiceKey>(&bytes)?.choice)
     }
 
     /// Register as `gate`'s waiter by taking a lock on its `.waiter` file, held until
@@ -1403,6 +1437,28 @@ impl Gates {
         response: &GateResponse,
         before_publish: impl FnOnce(),
     ) -> Result<PathBuf, GateError> {
+        Self::publish_answer_with_hook(
+            project_root,
+            phase,
+            stage,
+            observed,
+            response,
+            None,
+            before_publish,
+        )
+    }
+
+    /// [`answer_with_hook`](Self::answer_with_hook), with a question's `choice`
+    /// under its own top-level key of the published body when there is one.
+    fn publish_answer_with_hook(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        observed: &GateId,
+        response: &GateResponse,
+        choice: Option<&QuestionChoice>,
+        before_publish: impl FnOnce(),
+    ) -> Result<PathBuf, GateError> {
         if response.approved && response.abort {
             return Err(GateError::ApprovedAndAborted { phase, stage });
         }
@@ -1421,7 +1477,11 @@ impl Gates {
             gate_id: observed.to_string(),
             response: response.clone(),
         };
-        publish_response_exclusive(&path, &serde_json::to_string_pretty(&answer)?, phase, stage)?;
+        let body = WithChoice {
+            answer: &answer,
+            choice,
+        };
+        publish_response_exclusive(&path, &serde_json::to_string_pretty(&body)?, phase, stage)?;
         info!(
             "gate answer written for phase {phase} {stage} gate {observed}: approved={}",
             response.approved
@@ -1664,7 +1724,8 @@ impl Gates {
         Self::open_gate(project_root, phase, stage, kind, context).map(|gate| gate.path)
     }
 
-    /// Write a gate file under `gate_id`. Disposes of nothing.
+    /// Write a gate file under `gate_id`, with `question` under its own top-level
+    /// key when there is one. Disposes of nothing.
     fn write_gate_file(
         project_root: &Path,
         phase: PhaseId,
@@ -1672,6 +1733,7 @@ impl Gates {
         gate_id: &GateId,
         label: GateLabel,
         context: &str,
+        question: Option<&QuestionSpec>,
     ) -> Result<OpenedGate, GateError> {
         let gate = GateFile {
             phase,
@@ -1685,7 +1747,11 @@ impl Gates {
         };
         let path = Self::gate_path(project_root, phase, stage);
         info!("writing gate {} for phase {phase}", stage);
-        write_atomic(&path, &serde_json::to_string_pretty(&gate)?)?;
+        let body = WithQuestion {
+            gate: &gate,
+            question,
+        };
+        write_atomic(&path, &serde_json::to_string_pretty(&body)?)?;
         Ok(OpenedGate {
             gate_id: gate_id.clone(),
             path,
@@ -2298,6 +2364,40 @@ const REASON_GATE_CLOSED: &str = "gate_closed";
 const REASON_LEGACY_UNKEYED: &str = "legacy_unkeyed";
 /// The label of a quarantined body that names no usable gate id.
 const NO_GATE_ID_LABEL: &str = "noid";
+
+/// A gate file as written: the [`GateFile`], plus a question gate's spec under
+/// its own key. A reader of [`GateFile`] ignores the extra key.
+#[derive(Serialize)]
+struct WithQuestion<'a> {
+    #[serde(flatten)]
+    gate: &'a GateFile,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    question: Option<&'a QuestionSpec>,
+}
+
+/// The `question` key of a gate file, read on its own.
+#[derive(Deserialize)]
+struct QuestionKey {
+    #[serde(default)]
+    question: Option<QuestionSpec>,
+}
+
+/// An answer body as published: the [`GateAnswer`], plus a question's choice
+/// under its own key. A reader of [`GateAnswer`] ignores the extra key.
+#[derive(Serialize)]
+struct WithChoice<'a> {
+    #[serde(flatten)]
+    answer: &'a GateAnswer,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    choice: Option<&'a QuestionChoice>,
+}
+
+/// The `choice` key of an answer body, read on its own.
+#[derive(Deserialize)]
+struct ChoiceKey {
+    #[serde(default)]
+    choice: Option<QuestionChoice>,
+}
 
 /// Whether a file in the answer slot of gate `slot_id` binds to that gate: its body
 /// parses as a [`GateAnswer`] naming `slot_id`. Otherwise, why not.

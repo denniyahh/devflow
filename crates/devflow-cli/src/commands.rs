@@ -9452,6 +9452,7 @@ mod tests {
                 }
                 AnswerFamily::Preflight
                 | AnswerFamily::CheckpointDeclaration
+                | AnswerFamily::Question
                 | AnswerFamily::Unclassified => {
                     let refused = reject(root, phase, stage, NOTE).expect_err(&row);
                     assert!(
@@ -9609,7 +9610,7 @@ mod tests {
                 AnswerFamily::RateLimit => Some("route: relaunch_now"),
                 AnswerFamily::Preflight => Some("route: preflight_override"),
                 AnswerFamily::CheckpointDeclaration => Some("route: record_checkpoint_set"),
-                AnswerFamily::Unclassified => None,
+                AnswerFamily::Question | AnswerFamily::Unclassified => None,
             };
             match expected {
                 Some(route) => {

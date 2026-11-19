@@ -556,6 +556,9 @@ pub(crate) enum AnswerFamily {
     Preflight,
     /// A human-only checkpoint declaration at Code (D-39).
     CheckpointDeclaration,
+    /// A question an agent asked (Phase 53, D-10): only `devflow gate answer`
+    /// answers it, and an abort still ends the run.
+    Question,
     /// A gate file with no kind: only a 3.x or hand-written file.
     Unclassified,
 }
@@ -577,7 +580,7 @@ pub(crate) fn answer_family(kind: Option<GateKind>) -> AnswerFamily {
         Some(GateKind::RateLimit) => AnswerFamily::RateLimit,
         Some(GateKind::Preflight) => AnswerFamily::Preflight,
         Some(GateKind::CheckpointDeclaration) => AnswerFamily::CheckpointDeclaration,
-        Some(GateKind::Question) => AnswerFamily::CheckpointDeclaration,
+        Some(GateKind::Question) => AnswerFamily::Question,
         None => AnswerFamily::Unclassified,
     }
 }
@@ -659,6 +662,15 @@ const UNEXPECTED_RELAUNCH: Refusal = Refusal {
     applies: "`devflow gate abort`",
 };
 
+/// An approve or a reject on a question gate (D-10): one verb, one job.
+fn question_refusal(answer: &'static str) -> Refusal {
+    Refusal {
+        answer,
+        why: "a question gate is answered with one of the options it offers",
+        applies: "`devflow gate answer <phase> --gate-id <id> --option <id>` or `devflow gate abort`",
+    }
+}
+
 /// Any answer but abort on a gate file with no kind (a 3.x or hand-written
 /// file).
 fn unclassified(answer: &'static str) -> Refusal {
@@ -711,6 +723,8 @@ pub(crate) fn status_less_step(
         (AnswerFamily::Preflight, Reject(_)) => Err(REJECT_NOT_AN_ANSWER),
         (AnswerFamily::CheckpointDeclaration, Approve) => Ok(StatusLessStep::RecordCheckpointSet),
         (AnswerFamily::CheckpointDeclaration, Reject(_)) => Err(REJECT_NOT_AN_ANSWER),
+        (AnswerFamily::Question, Approve) => Err(question_refusal("approve")),
+        (AnswerFamily::Question, Reject(_)) => Err(question_refusal("reject")),
         (AnswerFamily::Unclassified, Approve) => Err(unclassified("approve")),
         (AnswerFamily::Unclassified, Reject(_)) => Err(unclassified("reject")),
         // Not status-less: the verification family goes through `next_step`.
@@ -777,6 +791,7 @@ pub(crate) fn approve_route_by_kind(
         | AnswerFamily::RateLimit
         | AnswerFamily::Preflight
         | AnswerFamily::CheckpointDeclaration
+        | AnswerFamily::Question
         | AnswerFamily::Unclassified) => {
             match status_less_step(family, StatusLessAnswer::Approve, canary_refusal) {
                 Ok(step) => ApproveRoute::StatusLess(step),
@@ -810,6 +825,7 @@ pub(crate) fn reject_route_by_kind(
         | AnswerFamily::RateLimit
         | AnswerFamily::Preflight
         | AnswerFamily::CheckpointDeclaration
+        | AnswerFamily::Question
         | AnswerFamily::Unclassified) => {
             match status_less_step(family, StatusLessAnswer::Reject(note), canary_refusal) {
                 Ok(step) => RejectRoute::StatusLess(step),
@@ -894,6 +910,7 @@ pub(crate) fn way_on_sentence(
         | AnswerFamily::RateLimit
         | AnswerFamily::Preflight
         | AnswerFamily::CheckpointDeclaration
+        | AnswerFamily::Question
         | AnswerFamily::Unclassified => {
             // A status-less approve reads no evidence (D-39): the closure is
             // never called for these families.
@@ -974,6 +991,7 @@ pub(crate) fn screen_answer(
         GateAction::Relaunch { .. } => Err(UNEXPECTED_RELAUNCH),
         GateAction::Advance => match family {
             AnswerFamily::Unclassified => Err(unclassified("approve")),
+            AnswerFamily::Question => Err(question_refusal("approve")),
             AnswerFamily::Verification
             | AnswerFamily::StageFailure
             | AnswerFamily::RateLimit
@@ -989,6 +1007,7 @@ pub(crate) fn screen_answer(
                 | AnswerFamily::RateLimit
                 | AnswerFamily::Preflight
                 | AnswerFamily::CheckpointDeclaration
+                | AnswerFamily::Question
                 | AnswerFamily::Unclassified => {
                     status_less_step(family, StatusLessAnswer::Reject(&note), None).map(|_| ())
                 }
