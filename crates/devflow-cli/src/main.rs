@@ -559,7 +559,13 @@ fn run() -> Result<(), CliError> {
                 gate_id,
                 option,
                 project,
-            } => commands::gate_answer(&project_root(project)?, phase, stage, &gate_id, &option),
+            } => commands::gate_answer(
+                &project_root(project)?,
+                phase,
+                stage,
+                &gate_id,
+                &devflow_core::question::QuestionChoice::Option { option_id: option },
+            ),
             GateCmd::Show {
                 phase,
                 stage,
@@ -635,6 +641,29 @@ mod tests {
         let dirty = version_label("4.0.0", commit, "true");
         assert_eq!(dirty, format!("4.0.0 ({commit}, dirty)"));
         assert!(dirty.ends_with(", dirty)"));
+    }
+
+    /// D-10: `gate answer` takes exactly one of `--option` and `--text`; an
+    /// empty text is an answer.
+    #[test]
+    fn gate_answer_requires_exactly_one_of_option_and_text() {
+        let parse = |extra: &[&'static str]| {
+            let mut args = vec!["devflow", "gate", "answer", "1", "--gate-id", "g"];
+            args.extend_from_slice(extra);
+            Cli::try_parse_from(args).map(|_| ())
+        };
+        assert_eq!(
+            parse(&[]).expect_err("neither is refused").kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        assert_eq!(
+            parse(&["--option", "a", "--text", "b"])
+                .expect_err("both are refused")
+                .kind(),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+        assert!(parse(&["--option", "a"]).is_ok(), "an option alone parses");
+        assert!(parse(&["--text", ""]).is_ok(), "an empty text alone parses");
     }
 
     #[test]

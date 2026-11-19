@@ -36,6 +36,7 @@ use devflow_core::history;
 use devflow_core::liveness;
 use devflow_core::mode::Mode;
 use devflow_core::phase_id::PhaseId;
+use devflow_core::question::QuestionChoice;
 use devflow_core::registry;
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
@@ -3450,15 +3451,16 @@ pub(crate) fn gate_respond_report(
     Ok(report)
 }
 
-/// Answer the question gate `gate_id` names with the option `option` (D-10).
+/// Answer the question gate `gate_id` names with `choice`: an offered option or
+/// free text (D-10).
 pub(crate) fn gate_answer(
     project_root: &Path,
     phase: PhaseId,
     stage: Option<Stage>,
     gate_id: &str,
-    option: &str,
+    choice: &QuestionChoice,
 ) -> Result<(), CliError> {
-    let report = gate_answer_report(project_root, phase, stage, gate_id, option)?;
+    let report = gate_answer_report(project_root, phase, stage, gate_id, choice)?;
     print!("{report}");
     Ok(())
 }
@@ -3473,8 +3475,12 @@ pub(crate) fn gate_answer_report(
     phase: PhaseId,
     stage: Option<Stage>,
     gate_id: &str,
-    option: &str,
+    choice: &QuestionChoice,
 ) -> Result<String, CliError> {
+    let QuestionChoice::Option { option_id } = choice else {
+        return Err(CliError::Message("text answers are not built yet".into()));
+    };
+    let option = option_id.as_str();
     let observed = GateId::parse(gate_id)?;
     let open = Gates::list_open(project_root);
     let stage = match stage {
@@ -3510,18 +3516,8 @@ pub(crate) fn gate_answer_report(
             offered.join(", ")
         )));
     }
-    let choice = devflow_core::question::QuestionChoice::Option {
-        option_id: option.to_string(),
-    };
-    let path = Gates::answer_question(
-        project_root,
-        phase,
-        stage,
-        &observed,
-        &choice,
-        &responded_by,
-    )
-    .map_err(gate_answer_error)?;
+    let path = Gates::answer_question(project_root, phase, stage, &observed, choice, &responded_by)
+        .map_err(gate_answer_error)?;
     events::emit(
         project_root,
         phase,
@@ -7687,6 +7683,154 @@ mod tests {
         };
         assert_eq!(answer.gate_id, g2.as_str());
         assert!(answer.response.approved);
+        registration.finish();
+    }
+
+    /// A question gate at `stage` offering `budget-30`, `budget-120` (recommended)
+    /// and `budget-300`, in that order, with its waiter registration held.
+    fn open_budget_question(
+        root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+    ) -> (devflow_core::gates::OpenedGate, WaiterRegistration) {
+        use devflow_core::question::{QuestionKind, QuestionOption, QuestionSpec};
+        let option = |id: &str, label: &str, description: Option<&str>| QuestionOption {
+            id: id.to_string(),
+            label: label.to_string(),
+            description: description.map(str::to_string),
+        };
+        let spec = QuestionSpec {
+            question_id: devflow_core::question::new_question_id(),
+            question: "Pick a budget".to_string(),
+            options: vec![
+                option("budget-30", "30 s", None),
+                option("budget-120", "120 s", None),
+                option("budget-300", "300 s", Some("the slow path")),
+            ],
+            context: Some("the probe needs a bound".to_string()),
+            kind: QuestionKind::Decision,
+            recommended: Some("budget-120".to_string()),
+        };
+        Gates::open_question_registered(root, phase, stage, &spec).unwrap()
+    }
+
+    fn option_choice(option_id: &str) -> QuestionChoice {
+        QuestionChoice::Option {
+            option_id: option_id.to_string(),
+        }
+    }
+
+    /// ASK-02 adjacency: an answer naming another gate id is refused, writes no
+    /// slot for either id and leaves the question open; the right id answers it.
+    #[test]
+    fn gate_answer_with_another_gate_id_leaves_the_question_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, stage) = (PhaseId::new(5341), Stage::Code);
+        let (opened, registration) = open_budget_question(root, phase, stage);
+        let other = GateId::new();
+        let choice = option_choice("budget-120");
+
+        let err = gate_answer_report(root, phase, Some(stage), other.as_str(), &choice)
+            .expect_err("another gate's id must be refused")
+            .to_string();
+
+        assert!(gate_answer_files(root, phase, stage).is_empty(), "{err}");
+        assert_eq!(
+            Gates::read_question_choice(root, phase, stage, &opened.gate_id).unwrap(),
+            None,
+            "{err}"
+        );
+        assert!(Gates::gate_path(root, phase, stage).exists(), "{err}");
+        gate_answer_report(root, phase, Some(stage), opened.gate_id.as_str(), &choice)
+            .expect("control: the open question's id answers it");
+        assert_eq!(
+            Gates::read_question_choice(root, phase, stage, &opened.gate_id).unwrap(),
+            Some(choice)
+        );
+        registration.finish();
+    }
+
+    /// ASK-02 encoding: option ids match by exact string equality, and the
+    /// refusal lists the offered ids in payload order.
+    #[test]
+    fn gate_answer_refuses_an_option_not_offered() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, stage) = (PhaseId::new(5342), Stage::Code);
+        let (opened, registration) = open_budget_question(root, phase, stage);
+
+        let err = gate_answer_report(
+            root,
+            phase,
+            Some(stage),
+            opened.gate_id.as_str(),
+            &option_choice("Budget-120"),
+        )
+        .expect_err("a case-folded option id must be refused")
+        .to_string();
+
+        assert!(err.contains("budget-30, budget-120, budget-300"), "{err}");
+        assert!(gate_answer_files(root, phase, stage).is_empty(), "{err}");
+        registration.finish();
+    }
+
+    /// D-10: `gate answer` on a gate that is not a question names the verbs
+    /// that answer it, and writes nothing.
+    #[test]
+    fn gate_answer_on_a_non_question_gate_is_refused_naming_approve() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, stage) = (PhaseId::new(5343), Stage::Code);
+        let (opened, registration) = Gates::open_registered(
+            root,
+            phase,
+            stage,
+            devflow_core::gates::GateKind::StageFailure,
+            "g",
+        )
+        .unwrap();
+
+        let err = gate_answer_report(
+            root,
+            phase,
+            Some(stage),
+            opened.gate_id.as_str(),
+            &option_choice("budget-120"),
+        )
+        .expect_err("a stage-failure gate is not answered with `gate answer`")
+        .to_string();
+
+        assert!(err.contains("devflow gate approve"), "{err}");
+        assert!(err.contains("devflow gate reject"), "{err}");
+        assert!(gate_answer_files(root, phase, stage).is_empty(), "{err}");
+        registration.finish();
+    }
+
+    /// ASK-02 empty: `--text ""` is an answer, recorded as an empty text, and
+    /// distinct from an unanswered question.
+    #[test]
+    fn gate_answer_records_an_empty_text_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, stage) = (PhaseId::new(5344), Stage::Code);
+        let (opened, registration) = open_budget_question(root, phase, stage);
+        assert_eq!(
+            Gates::read_question_choice(root, phase, stage, &opened.gate_id).unwrap(),
+            None,
+            "unanswered before the answer"
+        );
+        let empty = QuestionChoice::Text {
+            text: String::new(),
+        };
+
+        gate_answer_report(root, phase, Some(stage), opened.gate_id.as_str(), &empty)
+            .expect("an empty text is an answer");
+
+        assert_eq!(
+            Gates::read_question_choice(root, phase, stage, &opened.gate_id).unwrap(),
+            Some(empty)
+        );
         registration.finish();
     }
 
