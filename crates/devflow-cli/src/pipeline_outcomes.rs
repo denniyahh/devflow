@@ -666,8 +666,9 @@ const UNEXPECTED_RELAUNCH: Refusal = Refusal {
 fn question_refusal(answer: &'static str) -> Refusal {
     Refusal {
         answer,
-        why: "a question gate is answered with one of the options it offers",
-        applies: "`devflow gate answer <phase> --gate-id <id> --option <id>` or `devflow gate abort`",
+        why: "a question gate is answered with one of the options it offers or with text",
+        applies: "`devflow gate answer <phase> --gate-id <id> (--option <id> | --text <answer>)` \
+                  or `devflow gate abort`",
     }
 }
 
