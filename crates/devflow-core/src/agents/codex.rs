@@ -189,4 +189,74 @@ mod tests {
         let roots = vec![PathBuf::from(raw)];
         let _ = CodexDriver.build_command(PhaseId::new(7), "prompt", &roots);
     }
+
+    fn ask_registration(project_root: &str) -> crate::agents::AskRegistration {
+        crate::agents::AskRegistration {
+            exe: PathBuf::from("/opt/bin/devflow"),
+            project_root: PathBuf::from(project_root),
+            phase: PhaseId::new(7),
+            stage: crate::stage::Stage::Code,
+            timeout_secs: 120,
+            run_started_at: "2026-11-18T00:00:00Z".into(),
+            config_path: PathBuf::from("/unused/.devflow/ask-07.mcp.json"),
+        }
+    }
+
+    /// The value of the `-c` override for `key`, or a panic naming the key.
+    fn override_value<'a>(args: &'a [String], key: &str) -> &'a str {
+        let prefix = format!("mcp_servers.devflow.{key}=");
+        args.windows(2)
+            .find(|w| w[0] == "-c" && w[1].starts_with(&prefix))
+            .map(|w| &w[1][prefix.len()..])
+            .unwrap_or_else(|| panic!("no -c {prefix}… in {args:?}"))
+    }
+
+    /// D-03: codex gets the server through `-c mcp_servers.devflow.*` overrides
+    /// placed before the prompt: the command, its args, a tool timeout of the
+    /// gate timeout plus the margin, approval without a prompt, and enabled.
+    /// Every value is a TOML string escaped like the writable roots.
+    #[test]
+    fn launch_args_set_tool_timeout_and_approval_before_the_prompt() {
+        let wiring = CodexDriver
+            .ask_wiring(&ask_registration("/work/project"))
+            .expect("codex registers the server");
+        assert_eq!(wiring.placement, crate::agents::ArgPlacement::BeforeLast);
+        assert_eq!(wiring.file, None, "codex writes no file");
+        let args = &wiring.args;
+        assert_eq!(args.len(), 10, "five -c pairs: {args:?}");
+        assert_eq!(override_value(args, "command"), "\"/opt/bin/devflow\"");
+        assert_eq!(
+            override_value(args, "args"),
+            "[\"__ask\",\"--project\",\"/work/project\",\"--phase\",\"7\",\"--stage\",\
+             \"code\",\"--timeout-secs\",\"120\",\"--run-started-at\",\"2026-11-18T00:00:00Z\"]"
+        );
+        assert_eq!(override_value(args, "tool_timeout_sec"), "180");
+        assert_eq!(
+            override_value(args, "default_tools_approval_mode"),
+            "\"approve\""
+        );
+        assert_eq!(override_value(args, "enabled"), "true");
+
+        let hostile = CodexDriver
+            .ask_wiring(&ask_registration("/work/a\"b"))
+            .expect("codex registers the server");
+        let value = override_value(&hostile.args, "args");
+        assert!(
+            value.contains(r#""/work/a\"b""#),
+            "the quote in the project path is escaped: {value}"
+        );
+    }
+
+    /// A non-UTF-8 project root is refused with an error, never a panic.
+    #[cfg(unix)]
+    #[test]
+    fn ask_wiring_refuses_a_non_utf8_project_root() {
+        use std::os::unix::ffi::OsStringExt;
+        let mut reg = ask_registration("/work/project");
+        reg.project_root = PathBuf::from(std::ffi::OsString::from_vec(vec![b'/', 0xFF]));
+        let refused = CodexDriver
+            .ask_wiring(&reg)
+            .expect_err("non-UTF-8 is refused");
+        assert!(refused.contains("not UTF-8"), "{refused}");
+    }
 }
