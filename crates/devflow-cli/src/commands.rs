@@ -8085,6 +8085,97 @@ mod tests {
         registration.finish();
     }
 
+    /// Review concern 10: the `__ask` server opens a question gate, so
+    /// `gate_pending` stays false; `status` still names the question and the
+    /// verb that answers it, and prints none of the agent's text. Controls: no
+    /// gate reads `gate: none`; `gate_pending` reads `gate: pending`.
+    #[test]
+    fn status_reports_an_open_question_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5350);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Supervise, root.into());
+        state.stage = Stage::Code;
+        let none = status_state_lines(root, &state, None).join("\n");
+        assert!(none.contains("gate: none"), "control: {none}");
+
+        let (opened, registration) = open_budget_question(root, phase, Stage::Code);
+        let lines = status_state_lines(root, &state, None).join("\n");
+
+        assert!(
+            lines.contains(&format!("gate: question {}", opened.gate_id)),
+            "{lines}"
+        );
+        assert!(
+            lines.contains(&format!(
+                "answer: devflow gate answer {phase} --gate-id {}",
+                opened.gate_id
+            )),
+            "{lines}"
+        );
+        assert!(!lines.contains("Pick a budget"), "no agent text: {lines}");
+        state.gate_pending = true;
+        let pending = status_state_lines(root, &state, None).join("\n");
+        assert!(pending.contains("gate: pending"), "control: {pending}");
+        registration.finish();
+    }
+
+    /// Review concern 11: the sweep leaves a question gate to its own bound,
+    /// whatever its age. Control: a stage-failure gate in the same shape (live
+    /// waiter, same age) is reaped.
+    #[test]
+    fn gate_sweep_leaves_a_question_gate_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (question_phase, control_phase, stage) =
+            (PhaseId::new(5351), PhaseId::new(5352), Stage::Code);
+        let age = aged_past_threshold();
+        let (question, question_registration) = open_budget_question(root, question_phase, stage);
+        backdate_gate(root, question_phase, stage, age);
+        let (control, control_registration) = Gates::open_registered(
+            root,
+            control_phase,
+            stage,
+            devflow_core::gates::GateKind::StageFailure,
+            "g",
+        )
+        .unwrap();
+        backdate_gate(root, control_phase, stage, age);
+        let listed = |phase: PhaseId| {
+            Gates::list_open(root)
+                .into_iter()
+                .find(|gate| gate.phase == phase)
+                .unwrap()
+        };
+
+        assert_eq!(
+            sweep_one_gate(root, &listed(question_phase), age, 0, false, now_secs()).unwrap(),
+            SweepStep::LeftAlone
+        );
+        assert_eq!(
+            Gates::read_answer(root, question_phase, stage, &question.gate_id),
+            AnswerRead::None
+        );
+        assert!(gate_answer_files(root, question_phase, stage).is_empty());
+        assert!(
+            devflow_core::events::last_event_for_phase(root, question_phase)
+                .is_none_or(|event| event["event"] != "gate_reaped"),
+            "no gate_reaped for the question gate"
+        );
+
+        assert_eq!(
+            sweep_one_gate(root, &listed(control_phase), age, 0, false, now_secs()).unwrap(),
+            SweepStep::Reaped,
+            "control: a live stage-failure gate is reaped"
+        );
+        assert!(matches!(
+            Gates::read_answer(root, control_phase, stage, &control.gate_id),
+            AnswerRead::Bound(answer) if answer.response.abort
+        ));
+        question_registration.finish();
+        control_registration.finish();
+    }
+
     /// T-50.1-42: a malformed `--gate-id` is refused before it can name a path.
     #[test]
     fn gate_respond_refuses_a_malformed_gate_id_before_touching_anything() {
