@@ -275,6 +275,155 @@ mod tests {
         .unwrap();
     }
 
+    /// Render the timeline of phase 53 from these event lines, in order.
+    fn render_events(events: &[serde_json::Value]) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let path = events::events_path(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let lines: String = events
+            .iter()
+            .map(|event| format!("{event}\n"))
+            .collect();
+        std::fs::write(path, lines).unwrap();
+        render_timeline(&attempt_timeline(dir.path(), PhaseId::new(53)))
+    }
+
+    fn asked(ts: u64, question_id: &str, question: &str) -> serde_json::Value {
+        serde_json::json!({
+            "v": 1, "ts": ts, "phase": 53, "event": events::QUESTION_ASKED,
+            "stage": "code", "question_id": question_id, "gate_id": "g-1",
+            "kind": "decision", "question": question,
+            "options": [
+                {"id": "keep", "label": "Keep the cache"},
+                {"id": "drop", "label": "Drop the cache", "description": "slower"},
+            ],
+            "context": null, "recommended": "keep",
+        })
+    }
+
+    fn answered(ts: u64, question_id: &str, answer: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "v": 1, "ts": ts, "phase": 53, "event": events::QUESTION_ANSWERED,
+            "stage": "code", "question_id": question_id, "gate_id": "g-1",
+            "answer": answer, "policy": events::ANSWERING_POLICY_OPERATOR_VIA_GATE,
+            "answered_by": "operator",
+        })
+    }
+
+    fn closed(ts: u64, question_id: &str, reason: &str) -> serde_json::Value {
+        serde_json::json!({
+            "v": 1, "ts": ts, "phase": 53, "event": events::QUESTION_CLOSED,
+            "stage": "code", "question_id": question_id, "gate_id": "g-1",
+            "reason": reason, "closed_by": null,
+        })
+    }
+
+    const QUESTION_ROW_PREFIXES: [&str; 6] = [
+        "  question ",
+        "  options: ",
+        "  answer: ",
+        "  answer ",
+        "  closed ",
+        "  ignored ",
+    ];
+
+    #[test]
+    fn an_open_question_renders_not_yet_answered() {
+        let rendered = render_events(&[asked(10, "q-1", "Keep the cache?")]);
+
+        assert!(rendered.contains("question_asked (code)"), "{rendered}");
+        assert!(
+            rendered.contains("  question q-1: Keep the cache?"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                r#"  options: keep "Keep the cache" (recommended) | drop "Drop the cache""#
+            ),
+            "{rendered}"
+        );
+        assert!(rendered.contains("  answer: not yet answered"), "{rendered}");
+    }
+
+    #[test]
+    fn an_empty_text_answer_renders_distinct_from_not_yet_answered() {
+        let rendered = render_events(&[
+            asked(10, "q-1", "Anything to add?"),
+            answered(11, "q-1", serde_json::json!({"text": ""})),
+        ]);
+
+        assert!(
+            rendered.contains(r#"  answer q-1: text "" (empty) by operator via operator_via_gate"#),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("not yet answered"), "{rendered}");
+    }
+
+    #[test]
+    fn a_run_with_no_questions_has_no_question_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_event_log(dir.path());
+        let rendered = render_timeline(&attempt_timeline(dir.path(), PhaseId::new(16)));
+
+        assert!(rendered.contains("gate_fired (validate)"), "{rendered}");
+        for line in rendered.lines() {
+            for prefix in QUESTION_ROW_PREFIXES {
+                assert!(!line.starts_with(prefix), "question row {line:?} in {rendered}");
+            }
+        }
+    }
+
+    #[test]
+    fn question_rows_pair_by_question_id_not_position() {
+        let rendered = render_events(&[
+            asked(10, "q-1", "First?"),
+            asked(11, "q-2", "Second?"),
+            answered(12, "q-2", serde_json::json!({"option_id": "drop"})),
+            answered(13, "q-1", serde_json::json!({"option_id": "keep"})),
+        ]);
+
+        assert!(
+            rendered.contains("  answer q-2: option drop by operator via operator_via_gate"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("  answer q-1: option keep by operator via operator_via_gate"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("not yet answered"), "{rendered}");
+    }
+
+    #[test]
+    fn question_text_is_rendered_terminal_safe() {
+        let rendered = render_events(&[asked(10, "q-1", "Clear\u{1b}[2Jthe screen?")]);
+
+        assert!(
+            rendered.contains("  question q-1: Clear [2Jthe screen?"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains('\u{1b}'), "{rendered:?}");
+    }
+
+    #[test]
+    fn a_second_resolution_for_one_question_is_shown_but_not_applied() {
+        let rendered = render_events(&[
+            asked(10, "q-1", "Keep the cache?"),
+            answered(11, "q-1", serde_json::json!({"option_id": "keep"})),
+            closed(12, "q-1", "timed_out"),
+        ]);
+
+        assert!(
+            rendered.contains("  answer q-1: option keep by operator via operator_via_gate"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("question_closed (code)"), "{rendered}");
+        assert!(!rendered.contains("  closed q-1:"), "{rendered}");
+        assert!(
+            rendered.contains("  ignored q-1: already answered or closed by an earlier event"),
+            "{rendered}"
+        );
+    }
+
     #[test]
     fn timeline_orders_events_and_correlates_retained_captures() {
         let dir = tempfile::tempdir().unwrap();
