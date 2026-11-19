@@ -66,7 +66,7 @@ requirement closes a backlog entry, the entry is named; `.planning/user/V4-CUT-I
 - [x] **ASK-02**: The policy "operator via gate" turns each question into a gate the operator answers from the shell
       (`devflow gate answer <phase> --gate-id <id> --option <id>` or a free-text answer), with the notify hook firing
       as for any gate.
-- [ ] **ASK-03**: Every stage prompt tells the agent to call the tool for decision checkpoints, `blocking-human` gates
+- [x] **ASK-03**: Every stage prompt tells the agent to call the tool for decision checkpoints, `blocking-human` gates
       and GSD discuss questions instead of self-resolving them positionally or stopping with a report.
 - [x] **ASK-04**: Every question and its answer are recorded in the event log with the answering policy or operator
       and the time, and `devflow history` shows them.
@@ -144,7 +144,7 @@ Populated during roadmap creation (2026-11-08). Phase order and dependencies: RO
 | OPS-04 | Phase 52 — Subtract and Stabilize | Complete |
 | ASK-01 | Phase 53 — The Question Channel | Complete |
 | ASK-02 | Phase 53 — The Question Channel | Complete |
-| ASK-03 | Phase 53 — The Question Channel | Pending |
+| ASK-03 | Phase 53 — The Question Channel | Complete |
 | ASK-04 | Phase 53 — The Question Channel | Complete |
 | ASK-05 | Phase 53 — The Question Channel | Complete |
 | TRIAGE-01 | Phase 54 — Decision Triage | Pending |
