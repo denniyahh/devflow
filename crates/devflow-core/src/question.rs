@@ -21,6 +21,7 @@ pub struct QuestionOption {
 /// What kind of question the agent asks (D-07). Its wire values are
 /// `decision`, `blocking-human` and `discuss`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum QuestionKind {
     /// A choice between options the agent can name.
     Decision,
