@@ -232,6 +232,29 @@ printf '%s\n' '{{"event":"result","result":{{"status":"SUCCESS","response":"DEVF
     }
 
     #[test]
+    fn a_marker_less_or_init_only_stream_is_not_a_success() {
+        // The stage-turn output of the retired `agy` e2e stub: its quiet
+        // mode printed nothing, its init-only mode printed init and a step
+        // update with no result. Neither carries a marker, so neither may
+        // classify as Success.
+        let quiet = "";
+        let init_only = concat!(
+            "{\"event\":\"init\",\"model\":\"stub\",\"inputFormat\":\"stream-json\",\"outputFormat\":\"stream-json\"}\n",
+            "{\"event\":\"step_update\",\"index\":0,\"text_delta\":\"working\"}\n",
+        );
+        for (name, stream) in [("quiet", quiet), ("init-only", init_only)] {
+            let status = AntigravityDriver
+                .parse_completion(stream)
+                .map(|result| result.status);
+            assert_ne!(
+                status,
+                Some(AgentStatus::Success),
+                "the {name} stream must not be a Success"
+            );
+        }
+    }
+
+    #[test]
     fn antigravity_driver_name_is_correct() {
         assert_eq!(AntigravityDriver.name(), "Antigravity");
     }
