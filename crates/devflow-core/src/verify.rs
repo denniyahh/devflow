@@ -31,7 +31,7 @@ fn parse_external_verification_approval(value: &str) -> Option<Vec<String>> {
 /// unreadable — never panics, never errors.
 ///
 /// Shared by [`external_verify_commands`] and
-/// [`phase_has_blocking_human_checkpoint`] so PLAN.md discovery lives in
+/// [`phase_checkpoint_declarations`] so PLAN.md discovery lives in
 /// exactly one place; a second, slightly-different implementation would
 /// drift the moment one is updated and the other isn't.
 pub fn phase_plan_files(project_root: &Path, phase: PhaseId) -> Vec<PathBuf> {
@@ -106,32 +106,6 @@ fn command_from_frontmatter(contents: &str) -> Option<String> {
         return command.filter(|command| !command.trim().is_empty());
     }
     None
-}
-
-/// Return `true` if any plan declared for `phase` carries a task with the
-/// human-blocking checkpoint gate attribute.
-///
-/// Reads declared plan content only — never any runtime capture or agent
-/// output (D-02: no re-implementation of "what does the agent mean"). This
-/// is the PRIMARY gate for the auto-decide path added in plan 28-03: an
-/// agent cannot route itself into that path for a phase whose plans never
-/// declared a `gate="blocking-human"` checkpoint, because this scan runs
-/// first and is read from `.planning/phases/`. Those files are agent-writable
-/// during Code, but that is the SAME trust boundary [`external_verify_commands`]
-/// already documents and accepts — reused, not newly introduced.
-///
-/// **The CALLER is responsible for passing the root the phase's plans actually
-/// live under** — the execution root (the worktree) in worktree mode, the
-/// project root otherwise. `.planning/` is tracked content, so an in-flight
-/// phase's `{N}-PLAN.md` sits on `feature/phase-{N}` inside the worktree and
-/// is absent from the main checkout; a caller passing the main checkout gets a
-/// silent `false` rather than an error (999.76, ROADMAP criterion 6). The
-/// caller that does this correctly is `pipeline_launch.rs`'s
-/// `Action::GateReview` arm, which resolves `state.worktree_path` first.
-pub fn phase_has_blocking_human_checkpoint(project_root: &Path, phase: PhaseId) -> bool {
-    phase_checkpoint_declarations(project_root, phase)
-        .into_iter()
-        .any(|declaration| declaration.blocking_human)
 }
 
 /// The two checkpoint markers GSD will not auto-approve in ANY mode, each
@@ -372,8 +346,7 @@ fn task_opening_line(line: &str) -> bool {
 /// to tell them apart asks [`phase_plan_files`] separately rather than reading a
 /// third state out of one bit.
 ///
-/// **The CALLER owns root resolution**, exactly as for
-/// [`phase_has_blocking_human_checkpoint`]: in worktree mode the phase's plans
+/// **The CALLER owns root resolution**: in worktree mode the phase's plans
 /// live on the feature branch inside the worktree and are absent from the main
 /// checkout (999.76).
 pub fn phase_has_human_only_checkpoint(project_root: &Path, phase: PhaseId) -> bool {
@@ -498,159 +471,19 @@ mod tests {
     /// (`checkpoints.md` rule 5: "human-action still stops").
     const HUMAN_ACTION_TYPE_VALUE: &str = "checkpoint:human-action";
 
+    /// Whether any plan of `phase` declares the `blocking-human` gate: the
+    /// `blocking_human` half of the parsed declarations, beside
+    /// [`phase_has_human_only_checkpoint`]'s union.
+    fn blocking_human_declared(root: &std::path::Path, phase: PhaseId) -> bool {
+        phase_checkpoint_declarations(root, phase)
+            .into_iter()
+            .any(|declaration| declaration.blocking_human)
+    }
+
     fn write_phase_file(root: &std::path::Path, phase_dir: &str, file_name: &str, contents: &str) {
         let dir = root.join(".planning/phases").join(phase_dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(file_name), contents).unwrap();
-    }
-
-    #[test]
-    fn phase_has_blocking_human_checkpoint_detects_declared_gate() {
-        let dir = tempfile::tempdir().unwrap();
-        let body = format!(
-            "---\nphase: 91\n---\n\n<task type=\"checkpoint:human-verify\" gate=\"{HUMAN_GATE_VALUE}\">\n</task>\n"
-        );
-        write_phase_file(dir.path(), "91-probe", "91-01-PLAN.md", &body);
-
-        assert!(phase_has_blocking_human_checkpoint(
-            dir.path(),
-            PhaseId::new(91)
-        ));
-    }
-
-    #[test]
-    fn phase_has_blocking_human_checkpoint_false_for_plain_blocking_gate() {
-        let dir = tempfile::tempdir().unwrap();
-        let body = format!(
-            "---\nphase: 91\n---\n\n<task type=\"checkpoint:decision\" gate=\"{PLAIN_GATE_VALUE}\">\n</task>\n"
-        );
-        write_phase_file(dir.path(), "91-probe", "91-01-PLAN.md", &body);
-
-        assert!(
-            !phase_has_blocking_human_checkpoint(dir.path(), PhaseId::new(91)),
-            "the plain `blocking` gate (no -human suffix) must not match — Phase 26 near-miss distinction"
-        );
-    }
-
-    #[test]
-    fn phase_has_blocking_human_checkpoint_false_when_no_gate_attribute() {
-        let dir = tempfile::tempdir().unwrap();
-        write_phase_file(
-            dir.path(),
-            "91-probe",
-            "91-01-PLAN.md",
-            "---\nphase: 91\n---\n\n<task type=\"auto\">\n</task>\n",
-        );
-
-        assert!(!phase_has_blocking_human_checkpoint(
-            dir.path(),
-            PhaseId::new(91)
-        ));
-    }
-
-    #[test]
-    fn phase_has_blocking_human_checkpoint_false_for_missing_phase_directory() {
-        let dir = tempfile::tempdir().unwrap();
-
-        assert!(!phase_has_blocking_human_checkpoint(
-            dir.path(),
-            PhaseId::new(404)
-        ));
-    }
-
-    #[test]
-    fn phase_has_blocking_human_checkpoint_true_when_only_second_plan_carries_attribute() {
-        let dir = tempfile::tempdir().unwrap();
-        write_phase_file(
-            dir.path(),
-            "91-probe",
-            "91-01-PLAN.md",
-            "---\nphase: 91\n---\n\n<task type=\"auto\">\n</task>\n",
-        );
-        let body = format!(
-            "---\nphase: 91\n---\n\n<task type=\"checkpoint:human-verify\" gate=\"{HUMAN_GATE_VALUE}\">\n</task>\n"
-        );
-        write_phase_file(dir.path(), "91-probe", "91-02-PLAN.md", &body);
-
-        assert!(
-            phase_has_blocking_human_checkpoint(dir.path(), PhaseId::new(91)),
-            "every plan must be inspected, not just the first"
-        );
-    }
-
-    #[test]
-    fn phase_has_blocking_human_checkpoint_ignores_non_plan_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let body = format!(
-            "---\nphase: 91\n---\n\nRecorded checkpoint gate=\"{HUMAN_GATE_VALUE}\" in the executor return.\n"
-        );
-        write_phase_file(dir.path(), "91-probe", "91-01-SUMMARY.md", &body);
-
-        assert!(
-            !phase_has_blocking_human_checkpoint(dir.path(), PhaseId::new(91)),
-            "only *-PLAN.md files are scanned, not SUMMARY/RESEARCH files"
-        );
-    }
-
-    /// 999.76 (ROADMAP criterion 6), the second call site.
-    ///
-    /// This function reads whatever root it is handed, so the CALLER decides
-    /// whether it can see the phase's plans at all. `pipeline_launch.rs`'s
-    /// `Action::GateReview` arm passed `project_root` unconditionally; in
-    /// worktree mode the phase's `{N}-PLAN.md` lives on `feature/phase-{N}`
-    /// inside the worktree and is absent from the main checkout, so this
-    /// returned `false` and the plan-28-03 checkpoint auto-decide path was
-    /// silently dead for the phase's whole duration.
-    ///
-    /// This test and its mirror below pin the property that makes the caller's
-    /// choice matter: the answer DEPENDS on the root. Each carries the
-    /// opposite-root assertion, because a pair that returned `true` for both
-    /// roots would only be measuring that a PLAN exists somewhere.
-    #[test]
-    fn phase_has_blocking_human_checkpoint_reads_the_execution_root_in_worktree_mode() {
-        let dir = tempfile::tempdir().unwrap();
-        let worktree = dir.path().join("phase-worktree");
-        std::fs::create_dir_all(&worktree).unwrap();
-        let body = format!(
-            "---\nphase: 91\n---\n\n<task type=\"checkpoint:human-verify\" gate=\"{HUMAN_GATE_VALUE}\">\n</task>\n"
-        );
-        // The PLAN exists ONLY inside the worktree — the project root's own
-        // `.planning/phases/` is deliberately never created.
-        write_phase_file(&worktree, "91-probe", "91-01-PLAN.md", &body);
-
-        assert!(
-            phase_has_blocking_human_checkpoint(&worktree, PhaseId::new(91)),
-            "the execution root holds the PLAN, so the declaration must be found"
-        );
-        assert!(
-            !phase_has_blocking_human_checkpoint(dir.path(), PhaseId::new(91)),
-            "opposite-result case: the project root has no PLAN and must return false — \
-             if both roots returned true, this pair would be measuring the presence of a \
-             file somewhere rather than which root is read"
-        );
-    }
-
-    /// The main-checkout mirror of the test above: with no worktree the two
-    /// roots coincide, so 999.76's call-site change leaves this path untouched.
-    #[test]
-    fn phase_has_blocking_human_checkpoint_still_reads_the_project_root_without_a_worktree() {
-        let dir = tempfile::tempdir().unwrap();
-        let empty_sibling = dir.path().join("phase-worktree");
-        std::fs::create_dir_all(&empty_sibling).unwrap();
-        let body = format!(
-            "---\nphase: 91\n---\n\n<task type=\"checkpoint:human-verify\" gate=\"{HUMAN_GATE_VALUE}\">\n</task>\n"
-        );
-        write_phase_file(dir.path(), "91-probe", "91-01-PLAN.md", &body);
-
-        assert!(
-            phase_has_blocking_human_checkpoint(dir.path(), PhaseId::new(91)),
-            "without a worktree the execution root IS the project root"
-        );
-        assert!(
-            !phase_has_blocking_human_checkpoint(&empty_sibling, PhaseId::new(91)),
-            "opposite-result case: a root without the PLAN must return false, so the \
-             assertion above is about which root is read and not about the file existing"
-        );
     }
 
     // -----------------------------------------------------------------
@@ -771,7 +604,7 @@ mod tests {
         write_phase_file(dir.path(), "93-probe", "93-01-PLAN.md", &body);
 
         assert!(
-            !phase_has_blocking_human_checkpoint(dir.path(), PhaseId::new(93)),
+            !blocking_human_declared(dir.path(), PhaseId::new(93)),
             "a marker discussed in prose must not arm the auto-decide resume route"
         );
     }
@@ -793,7 +626,7 @@ mod tests {
             blocking_dir.path(),
             PhaseId::new(93)
         ));
-        assert!(phase_has_blocking_human_checkpoint(
+        assert!(blocking_human_declared(
             blocking_dir.path(),
             PhaseId::new(93)
         ));
@@ -814,7 +647,7 @@ mod tests {
             PhaseId::new(94)
         ));
         assert!(
-            !phase_has_blocking_human_checkpoint(action_dir.path(), PhaseId::new(94)),
+            !blocking_human_declared(action_dir.path(), PhaseId::new(94)),
             "human-action is preflight-only; it must not arm resume"
         );
     }
@@ -837,7 +670,7 @@ mod tests {
             "a complete example inside a closed fence is not a declaration"
         );
         assert!(
-            !phase_has_blocking_human_checkpoint(dir.path(), PhaseId::new(92)),
+            !blocking_human_declared(dir.path(), PhaseId::new(92)),
             "a complete example inside a closed fence must not arm resume"
         );
     }
@@ -855,10 +688,7 @@ mod tests {
             dir.path(),
             PhaseId::new(93)
         ));
-        assert!(phase_has_blocking_human_checkpoint(
-            dir.path(),
-            PhaseId::new(93)
-        ));
+        assert!(blocking_human_declared(dir.path(), PhaseId::new(93)));
     }
 
     #[test]
@@ -875,10 +705,7 @@ mod tests {
             dir.path(),
             PhaseId::new(93)
         ));
-        assert!(!phase_has_blocking_human_checkpoint(
-            dir.path(),
-            PhaseId::new(93)
-        ));
+        assert!(!blocking_human_declared(dir.path(), PhaseId::new(93)));
     }
 
     #[test]
@@ -895,10 +722,7 @@ mod tests {
             dir.path(),
             PhaseId::new(93)
         ));
-        assert!(!phase_has_blocking_human_checkpoint(
-            dir.path(),
-            PhaseId::new(93)
-        ));
+        assert!(!blocking_human_declared(dir.path(), PhaseId::new(93)));
     }
 
     #[test]
@@ -915,10 +739,7 @@ mod tests {
             dir.path(),
             PhaseId::new(93)
         ));
-        assert!(!phase_has_blocking_human_checkpoint(
-            dir.path(),
-            PhaseId::new(93)
-        ));
+        assert!(!blocking_human_declared(dir.path(), PhaseId::new(93)));
     }
 
     #[test]
@@ -934,10 +755,7 @@ mod tests {
             dir.path(),
             PhaseId::new(93)
         ));
-        assert!(!phase_has_blocking_human_checkpoint(
-            dir.path(),
-            PhaseId::new(93)
-        ));
+        assert!(!blocking_human_declared(dir.path(), PhaseId::new(93)));
     }
 
     #[test]
@@ -1074,10 +892,7 @@ mod tests {
             dir.path(),
             PhaseId::new(404)
         ));
-        assert!(!phase_has_blocking_human_checkpoint(
-            dir.path(),
-            PhaseId::new(404)
-        ));
+        assert!(!blocking_human_declared(dir.path(), PhaseId::new(404)));
 
         write_phase_file(
             dir.path(),
@@ -1090,10 +905,7 @@ mod tests {
             dir.path(),
             PhaseId::new(93)
         ));
-        assert!(!phase_has_blocking_human_checkpoint(
-            dir.path(),
-            PhaseId::new(93)
-        ));
+        assert!(!blocking_human_declared(dir.path(), PhaseId::new(93)));
     }
 
     /// "No plans at all" and "plans that declare no such checkpoint" are
