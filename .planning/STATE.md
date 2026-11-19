@@ -5,16 +5,16 @@ milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: 53
 current_phase_name: The Question Channel
 status: executing
-stopped_at: Completed 53-13-PLAN.md
-last_updated: "2026-11-19T17:55:09.441Z"
+stopped_at: Completed 53-14-PLAN.md
+last_updated: "2026-11-19T18:23:14.992Z"
 last_activity: 2026-11-19
 last_activity_desc: Phase 53 execution started
-state_head: 0dcf604fafd206f5de532dc1009a1717d93234c3
+state_head: 28013b779aeb7fcb11a5c1ed18a2e2aa95d34977
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 80
-  completed_plans: 79
+  completed_plans: 80
   percent: 17
 ---
 
@@ -172,7 +172,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 53 (The Question Channel) — EXECUTING
-Plan: 13 of 14
+Plan: 14 of 14
 Status: Ready to execute
 Last activity: 2026-11-19 — Phase 53 execution started
 
@@ -1030,6 +1030,9 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 53]: 53-11: all ten relaunch-surface tokens kept (no legitimate occurrence left); removed-surface count is 39
 - [Phase 53]: 53-13: a re-call's question_id is parsed by the additive QuestionSpec::from_call_arguments; from_arguments and QuestionError are unchanged
 - [Phase 53]: 53-13: the idle guard bounds continuous silence at 960 s while the stage's question gate is open (planner/orchestrator decision tied to operator answer OD-1 (b), review concern 13)
+- [Phase 53]: 53-14: pi registers devflow_ask through a per-launch -e .devflow/ask-NN.mcp.ts extension calling pi.registerMcpServer, keeping --no-approve (spike verdict BUILD)
+- [Phase 53]: 53-14: pi holds one call at most 900 s (ASK_HOLD_CAP_SECS) with a 960 s per-server timeout; pi cancels at its 60 s default
+- [Phase 53]: 53-14: owned-file rule for registrations outside .devflow/ not built; no driver writes one
 
 ## Roadmap Evolution
 
@@ -1220,11 +1223,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 53 P10 | 12 min | 1 tasks | 9 files |
 | Phase 53 P11 | 15 min | 2 tasks | 2 files |
 | Phase 53 P13 | 19 min | 3 tasks | 10 files |
+| Phase 53 P14 | 26min | 3 tasks | 12 files |
 
 ## Session
 
-**Last session:** 2026-11-19T17:55:08.204Z
-**Stopped at:** Completed 53-13-PLAN.md
+**Last session:** 2026-11-19T18:23:13.695Z
+**Stopped at:** Completed 53-14-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
