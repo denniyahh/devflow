@@ -94,6 +94,14 @@ pub(crate) fn ensure_agent_binary(program: &str) -> Result<(), CliError> {
     )))
 }
 
+/// D-02, operator answer (2): refuse an agent that cannot see `devflow_ask`
+/// before any agent process starts. Asks the driver's support query, which
+/// builds no registration; the one `ask_wiring` call is the stage launch's.
+#[allow(dead_code)] // RED stub; wired in the GREEN commit
+pub(crate) fn ensure_ask_registration(_agent: AgentKind) -> Result<(), CliError> {
+    Ok(())
+}
+
 /// The integration trunk `start` forks from (45-01 / D-01), resolved once: the resolver
 /// is fail-hard on an explicitly supplied value, and a configured base must also be a
 /// local branch ([`ensure_base_is_a_local_branch`]). The default path keeps its
@@ -1434,6 +1442,35 @@ mod tests {
     // Named only by the recording assertions below; importing it at module
     // scope would be an unused import in a non-test build.
     use devflow_core::state::ApprovedCheckpoint;
+
+    /// Operator answer (2): opencode, pi, hermes and antigravity are refused by
+    /// name, each message naming the agent and `devflow_ask`; claude and codex
+    /// pass.
+    #[test]
+    fn an_agent_without_an_ask_registration_is_refused_by_name() {
+        for agent in [
+            AgentKind::OpenCode,
+            AgentKind::Pi,
+            AgentKind::Hermes,
+            AgentKind::Antigravity,
+        ] {
+            let refused = ensure_ask_registration(agent)
+                .expect_err(&format!("{agent} has no registration and is refused"))
+                .to_string();
+            assert!(
+                refused.contains(&agent.to_string()),
+                "the refusal does not name {agent}: {refused}"
+            );
+            assert!(
+                refused.contains("devflow_ask"),
+                "the refusal does not name devflow_ask: {refused}"
+            );
+        }
+        for agent in [AgentKind::Claude, AgentKind::Codex] {
+            let admitted = ensure_ask_registration(agent);
+            assert!(admitted.is_ok(), "{agent} is admitted: {admitted:?}");
+        }
+    }
 
     macro_rules! enter_path_isolated_child {
         ($name:expr, $path_dir:expr) => {
