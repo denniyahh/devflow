@@ -1359,7 +1359,6 @@ mod tests {
     fn an_agent_without_an_ask_registration_is_refused_by_name() {
         for agent in [
             AgentKind::OpenCode,
-            AgentKind::Pi,
             AgentKind::Hermes,
             AgentKind::Antigravity,
         ] {
@@ -1375,7 +1374,7 @@ mod tests {
                 "the refusal does not name devflow_ask: {refused}"
             );
         }
-        for agent in [AgentKind::Claude, AgentKind::Codex] {
+        for agent in [AgentKind::Claude, AgentKind::Codex, AgentKind::Pi] {
             let admitted = ensure_ask_registration(agent);
             assert!(admitted.is_ok(), "{agent} is admitted: {admitted:?}");
         }

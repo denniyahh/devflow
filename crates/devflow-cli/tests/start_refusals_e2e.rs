@@ -903,12 +903,12 @@ fn assert_refused_without_registration(home: &common::HermeticHome, out: &Output
     );
 }
 
-/// Operator answer (2): `start` refuses pi, antigravity, hermes and opencode, each with
-/// its program stubbed so only the ask check can refuse, before any unit starts.
+/// Operator answers (2) and OD-2: `start` refuses antigravity, hermes and opencode,
+/// each with its program stubbed so only the ask check can refuse, before any unit
+/// starts.
 #[test]
 fn start_refuses_an_agent_without_an_ask_registration() {
     for (agent, program) in [
-        ("pi", "pi"),
         ("antigravity", "agy"),
         ("hermes", "hermes"),
         ("opencode", "opencode"),
