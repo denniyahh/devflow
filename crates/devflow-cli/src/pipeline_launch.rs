@@ -7797,6 +7797,182 @@ mod tests {
         assert!(!events_of_kind(root, "gate_fired").is_empty());
     }
 
+    // ---- D-13 fallback: a declared checkpoint opens the failure gate (53-03) ----
+
+    /// What one failed stage left after [`advance_failed_stage`] ran its advance.
+    struct FailedStageAdvance {
+        dir: tempfile::TempDir,
+        phase: PhaseId,
+        launch: Option<StageLaunch>,
+        launches: Vec<(Stage, AgentKind)>,
+    }
+
+    impl FailedStageAdvance {
+        /// The `gate_fired` events this advance recorded for `stage`.
+        fn gates_at(&self, stage: Stage) -> Vec<serde_json::Value> {
+            events_of_kind(self.dir.path(), "gate_fired")
+                .into_iter()
+                .filter(|event| event["stage"] == stage.to_string())
+                .collect()
+        }
+
+        /// The `stage_launched` events on record for `stage`.
+        fn launches_recorded_at(&self, stage: Stage) -> usize {
+            events_of_kind(self.dir.path(), "stage_launched")
+                .iter()
+                .filter(|event| event["stage"] == stage.to_string())
+                .count()
+        }
+    }
+
+    /// Advance a fresh `agent` run whose `stage` just exited failed, with or
+    /// without the final marker's `checkpoint: blocking-human` declaration.
+    /// The phase's plans declare that checkpoint and a session id is on record,
+    /// so the removed relaunch had every input it ever read. The runner's
+    /// `stage_launched` for the stage is on record and the gate's abort answer is
+    /// pre-written, so the advance returns instead of waiting. Validate starts one
+    /// failure below the ceiling, so a failure the fix loop counts gates instead
+    /// of relaunching Code.
+    fn advance_failed_stage(
+        agent: AgentKind,
+        stage: Stage,
+        declared: bool,
+        phase: PhaseId,
+    ) -> FailedStageAdvance {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_declared_checkpoint_plan(root, phase);
+        if declared {
+            write_marker_declared_checkpoint_capture(root, phase);
+        } else {
+            write_unreported_failure_capture(root, phase);
+        }
+        let mut state = State::new(phase, agent, Mode::Auto, root.to_path_buf());
+        state.stage = stage;
+        state.session_id = Some("sess-declared-checkpoint".to_string());
+        if stage == Stage::Validate {
+            state.consecutive_failures = mode::MAX_CONSECUTIVE_FAILURES - 1;
+            state.last_validate_failure_commit_count = Some(0);
+        }
+        workflow::save_state(&state).unwrap();
+        events::emit(
+            root,
+            phase,
+            "stage_launched",
+            serde_json::json!({"stage": stage.to_string(), "agent": agent.to_string()}),
+        );
+        write_abort_gate_response(root, phase, stage);
+
+        LAUNCH_PROBE.set(Some(Vec::new()));
+        let launch = advance_for_stage(root, phase, Some(stage)).unwrap();
+        let launches = LAUNCH_PROBE.take().expect("the probe was set");
+        FailedStageAdvance {
+            dir,
+            phase,
+            launch,
+            launches,
+        }
+    }
+
+    const UNASKED_CHECKPOINT_TEXT: &str = "could not ask through devflow_ask";
+
+    /// D-13: a Code stage that declares a blocking-human checkpoint on its final
+    /// result opens the never-silent stage failure gate naming it, for Claude
+    /// and Codex alike, and nothing relaunches the session.
+    #[test]
+    fn a_declared_checkpoint_opens_the_failure_gate_without_a_relaunch() {
+        const NAME: &str =
+            "pipeline_launch::tests::a_declared_checkpoint_opens_the_failure_gate_without_a_relaunch";
+        enter_agent_free_child!(NAME, "claude");
+        for (number, agent) in [(5301, AgentKind::Claude), (5302, AgentKind::Codex)] {
+            let run = advance_failed_stage(agent, Stage::Code, true, PhaseId::new(number));
+            let gates = run.gates_at(Stage::Code);
+            assert_eq!(gates.len(), 1, "{agent}: one gate at Code: {gates:?}");
+            assert_eq!(gates[0]["gate_kind"], "stage_failure", "{agent}: {gates:?}");
+            let context = gates[0]["context"].as_str().expect("the gate's context");
+            assert!(
+                context.contains(UNASKED_CHECKPOINT_TEXT),
+                "{agent}: the failure gate must name the unasked checkpoint: {context}"
+            );
+            assert!(run.launch.is_none(), "{agent}: the advance handed back a launch");
+            assert!(run.launches.is_empty(), "{agent}: relaunched {:?}", run.launches);
+            assert_eq!(
+                run.launches_recorded_at(Stage::Code),
+                1,
+                "{agent}: exactly the one stage_launched the runner recorded"
+            );
+        }
+    }
+
+    /// Control for the D-13 sentence: the same Code failure with no declaration
+    /// opens the same gate kind, and its context does not name a checkpoint.
+    #[test]
+    fn a_failure_without_a_declaration_has_no_checkpoint_sentence() {
+        const NAME: &str =
+            "pipeline_launch::tests::a_failure_without_a_declaration_has_no_checkpoint_sentence";
+        enter_agent_free_child!(NAME, "claude");
+        let run = advance_failed_stage(AgentKind::Claude, Stage::Code, false, PhaseId::new(5303));
+        let gates = run.gates_at(Stage::Code);
+        assert_eq!(gates.len(), 1, "one gate at Code: {gates:?}");
+        assert_eq!(gates[0]["gate_kind"], "stage_failure", "{gates:?}");
+        let context = gates[0]["context"].as_str().expect("the gate's context");
+        assert!(
+            !context.contains(UNASKED_CHECKPOINT_TEXT),
+            "an undeclared failure must not name a checkpoint: {context}"
+        );
+        assert!(run.launch.is_none() && run.launches.is_empty());
+    }
+
+    /// Review concern 12: a Validate failure that declares the checkpoint opens
+    /// the stage failure gate, not the Code↔Validate fix loop, which would
+    /// relaunch Code on a question the operator never saw and count it as a
+    /// validation failure. Control in the same test: the same Validate failure
+    /// without the declaration still takes the fix loop, which reads GSD's
+    /// verification, counts the failure and gates at the ceiling.
+    #[test]
+    fn a_declared_checkpoint_at_validate_opens_the_failure_gate_not_the_fix_loop() {
+        const NAME: &str = "pipeline_launch::tests::a_declared_checkpoint_at_validate_opens_the_failure_gate_not_the_fix_loop";
+        enter_agent_free_child!(NAME, "claude");
+        let declared =
+            advance_failed_stage(AgentKind::Claude, Stage::Validate, true, PhaseId::new(5304));
+        let gates = declared.gates_at(Stage::Validate);
+        assert_eq!(gates.len(), 1, "one gate at Validate: {gates:?}");
+        assert_eq!(gates[0]["gate_kind"], "stage_failure", "{gates:?}");
+        let context = gates[0]["context"].as_str().expect("the gate's context");
+        assert!(context.contains(UNASKED_CHECKPOINT_TEXT), "{context}");
+        let state = workflow::load_state(declared.dir.path(), declared.phase).unwrap();
+        assert_eq!(state.stage, Stage::Validate);
+        assert_eq!(
+            state.consecutive_failures,
+            mode::MAX_CONSECUTIVE_FAILURES - 1,
+            "a declared checkpoint is not a validation failure"
+        );
+        assert!(
+            events_of_kind(declared.dir.path(), "gsd_verification").is_empty(),
+            "the fix loop's verification read must not run"
+        );
+        assert!(declared.launch.is_none() && declared.launches.is_empty());
+        assert_eq!(declared.launches_recorded_at(Stage::Validate), 1);
+        assert_eq!(declared.launches_recorded_at(Stage::Code), 0);
+
+        let undeclared =
+            advance_failed_stage(AgentKind::Claude, Stage::Validate, false, PhaseId::new(5305));
+        let gates = undeclared.gates_at(Stage::Validate);
+        assert_eq!(gates.len(), 1, "control: one gate at Validate: {gates:?}");
+        assert_ne!(gates[0]["gate_kind"], "stage_failure", "control: {gates:?}");
+        let state = workflow::load_state(undeclared.dir.path(), undeclared.phase).unwrap();
+        assert_eq!(
+            state.consecutive_failures,
+            mode::MAX_CONSECUTIVE_FAILURES,
+            "control: the fix loop counts the failure"
+        );
+        assert_eq!(
+            events_of_kind(undeclared.dir.path(), "gsd_verification").len(),
+            1,
+            "control: the fix loop reads GSD's verification"
+        );
+    }
+
     // ---- launch-shape selection (D-11's opt-out was removed in Phase 52) ----
 
     /// D-03 (47-03): a resumed Claude session receives the gate rule in two
