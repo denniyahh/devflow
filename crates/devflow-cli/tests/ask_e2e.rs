@@ -227,3 +227,163 @@ fn a_call_offering_a_recommended_id_not_in_options_is_refused() {
     );
     assert_refused_naming(&reply, "recommended");
 }
+
+/// A gate notify command that writes the hook's `DEVFLOW_GATE_CONTEXT` to
+/// `marker`.
+fn marker_hook(marker: &std::path::Path) -> String {
+    format!("printf '%s' \"$DEVFLOW_GATE_CONTEXT\" > '{}'", marker.display())
+}
+
+/// Wait until `event` is on the fixture's log, returning its lines.
+fn wait_for_event(fixture: &AskFixture, event: &str) -> Vec<Value> {
+    let started = Instant::now();
+    loop {
+        let found = fixture.events_named(event);
+        if !found.is_empty() {
+            return found;
+        }
+        assert!(
+            started.elapsed() < REPLY_WAIT,
+            "no `{event}` on events.jsonl within {REPLY_WAIT:?}: {:?}",
+            fixture.events()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// The index of the first `event` line on the fixture's log.
+fn position_of(fixture: &AskFixture, event: &str) -> usize {
+    fixture
+        .events()
+        .iter()
+        .position(|line| line["event"] == event)
+        .unwrap_or_else(|| panic!("no `{event}` on events.jsonl"))
+}
+
+#[test]
+fn a_question_fires_the_notify_hook_and_records_notify_fired() {
+    let scratch = tempfile::tempdir().expect("scratch dir");
+    let marker = scratch.path().join("notified");
+    let fixture = AskFixture::new(Stage::Code);
+    fixture.edit_state(|state| state.gate_notify_cmd = Some(marker_hook(&marker)));
+    let mut client = AskClient::spawn(&fixture);
+    client.handshake();
+    client.ask(CALL_ID, "Pick a budget", &OPTIONS);
+    fixture.wait_for_gate_id();
+    let started = Instant::now();
+    while !marker.exists() && started.elapsed() < REPLY_WAIT {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let notified = std::fs::read_to_string(&marker).expect("notify marker written by the hook");
+    assert!(
+        notified.contains("Pick a budget"),
+        "the notify marker holds the question: {notified:?}"
+    );
+    let fired = wait_for_event(&fixture, "gate_fired");
+    assert_eq!(fired[0]["gate_kind"], "question", "gate_kind: {fired:?}");
+    wait_for_event(&fixture, "notify_fired");
+    assert!(
+        position_of(&fixture, "gate_fired") < position_of(&fixture, "notify_fired"),
+        "gate_fired precedes notify_fired: {:?}",
+        fixture.events()
+    );
+    drop(client);
+
+    // Control: with no notify command the hook writes nothing, and both
+    // events are still recorded.
+    let scratch = tempfile::tempdir().expect("scratch dir");
+    let marker = scratch.path().join("notified");
+    let control = AskFixture::new(Stage::Code);
+    let mut client = AskClient::spawn(&control);
+    client.handshake();
+    client.ask(CALL_ID, "Pick a budget", &OPTIONS);
+    control.wait_for_gate_id();
+    wait_for_event(&control, "gate_fired");
+    wait_for_event(&control, "notify_fired");
+    assert!(!marker.exists(), "no hook ran, so no notify marker");
+}
+
+#[test]
+fn question_events_record_the_question_and_its_answer() {
+    let fixture = AskFixture::new(Stage::Code);
+    let mut client = AskClient::spawn(&fixture);
+    client.handshake();
+    client.ask(CALL_ID, "Pick a budget", &OPTIONS);
+    let gate_id = fixture.wait_for_gate_id();
+    gate(
+        &fixture,
+        &["answer", "1", "--gate-id", &gate_id, "--option", "budget-120"],
+    );
+    assert_eq!(chosen_option(&client), "budget-120");
+
+    let asked = wait_for_event(&fixture, "question_asked");
+    assert_eq!(asked.len(), 1, "one question_asked: {asked:?}");
+    let question_id = asked[0]["question_id"].as_str().expect("a question_id");
+    let offered: Vec<&str> = asked[0]["options"]
+        .as_array()
+        .expect("options is an array")
+        .iter()
+        .map(|option| option["id"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(offered, OPTIONS, "option order as in the payload: {asked:?}");
+    assert_eq!(asked[0]["gate_id"], gate_id.as_str(), "{asked:?}");
+    assert_eq!(asked[0]["kind"], "decision", "{asked:?}");
+
+    let answered = wait_for_event(&fixture, "question_answered");
+    assert_eq!(answered.len(), 1, "one question_answered: {answered:?}");
+    assert_eq!(answered[0]["question_id"], question_id, "{answered:?}");
+    assert_eq!(answered[0]["policy"], "operator_via_gate", "policy: {answered:?}");
+    assert_eq!(answered[0]["answer"]["option_id"], "budget-120", "{answered:?}");
+    assert!(
+        answered[0]["answered_by"]
+            .as_str()
+            .is_some_and(|by| !by.is_empty()),
+        "answered_by: {answered:?}"
+    );
+    let closed: Vec<Value> = fixture
+        .events_named("question_closed")
+        .into_iter()
+        .filter(|line| line["question_id"] == question_id)
+        .collect();
+    assert!(
+        closed.is_empty(),
+        "question_closed recorded for an answered question: {closed:?}"
+    );
+}
+
+#[test]
+fn a_hook_that_never_exits_does_not_delay_the_question() {
+    let scratch = tempfile::tempdir().expect("scratch dir");
+    let marker = scratch.path().join("hook-started");
+    let fixture = AskFixture::new(Stage::Code);
+    fixture.edit_state(|state| {
+        state.gate_notify_cmd = Some(format!("printf started > '{}'; sleep 600", marker.display()));
+    });
+    let mut client = AskClient::spawn(&fixture);
+    client.handshake();
+    let asked_at = Instant::now();
+    client.ask(CALL_ID, "Pick a budget", &OPTIONS);
+    let gate_id = fixture.wait_for_gate_id();
+    assert!(
+        asked_at.elapsed() < Duration::from_secs(5),
+        "the gate took {:?} to appear",
+        asked_at.elapsed()
+    );
+    let started = Instant::now();
+    while !marker.exists() && started.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(marker.exists(), "the notify hook was started");
+
+    gate(
+        &fixture,
+        &["answer", "1", "--gate-id", &gate_id, "--option", "budget-30"],
+    );
+    let answered_at = Instant::now();
+    let reply = client.reply(CALL_ID, Duration::from_secs(5));
+    assert!(
+        reply.is_some(),
+        "a call not resolved while the hook still sleeps (waited {:?})",
+        answered_at.elapsed()
+    );
+}
