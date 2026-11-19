@@ -2662,6 +2662,14 @@ pub(crate) fn advance_with(
         Some(_) => {}
     }
 
+    // D-10: an operator's abort at a question ends the run once its agent has
+    // exited. The question server recorded it; the abort removes the state file,
+    // which consumes it. The stage outcome is never routed in that case.
+    if let Some(note) = state.abort_requested.clone() {
+        crate::pipeline_gate::abort(project_root, &state, &note)?;
+        return Ok(None);
+    }
+
     // Project-resolved (45-01): `evaluate_agent_result`'s Layer 2 counts
     // commits in a `{trunk}..{feature}` range, so a defaulted trunk
     // over- or under-reports the agent's work.

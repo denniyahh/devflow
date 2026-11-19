@@ -409,7 +409,7 @@ pub struct State {
     /// the run itself, so the runner reads this after the agent exits and
     /// aborts the run as any gate abort does. The abort removes the state file,
     /// which consumes it, so no later `start` or `resume` aborts again.
-    #[serde(skip)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub abort_requested: Option<String>,
     /// The commit a Validate agent PASS was recorded on (52-22, D-45 rule 1's
     /// input): the evidence root's HEAD, read when the Validate outcome was
