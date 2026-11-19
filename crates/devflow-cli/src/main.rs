@@ -18,6 +18,8 @@ mod pipeline_outcomes;
 
 mod pipeline_gate;
 
+mod ask_server;
+
 mod phase_worktree;
 
 mod service;
