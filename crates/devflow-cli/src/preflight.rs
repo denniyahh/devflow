@@ -688,7 +688,7 @@ fn ensure_base_ref_current_to(
 
 // ---------------------------------------------------------------------------
 // 17c: preflight readiness gate (D-13-D-16) — generic universal checks +
-// adapter hook, run from `launch_stage` before `spawn_agent_and_record` so a
+// adapter hook, run from `launch_stage` before the agent is spawned so a
 // readiness failure is caught before any agent time is spent.
 // ---------------------------------------------------------------------------
 
@@ -1612,7 +1612,7 @@ mod tests {
     }
 
     /// A failing preflight check routes through the never-silent gate and,
-    /// on Abort, never reaches `spawn_agent_and_record` — no `stage_launched`
+    /// on Abort, never reaches the agent's spawn — no `stage_launched`
     /// event is ever recorded. The Abort response is pre-seeded so
     /// `run_gate`'s poll resolves immediately.
     #[test]
@@ -1653,7 +1653,7 @@ mod tests {
         );
         assert!(
             workflow::load_state(root, phase).is_err(),
-            "abort() must clear state — spawn_agent_and_record was never reached"
+            "abort() must clear state — the agent's spawn was never reached"
         );
         let last = devflow_core::events::last_event_for_phase(root, phase)
             .expect("gate_fired/gate_resolved must have been recorded");

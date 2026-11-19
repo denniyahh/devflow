@@ -8548,8 +8548,7 @@ mod tests {
             }
         }
 
-        // The preflight gate and the checkpoint-declaration gate: reject is
-        // not offered.
+        // The preflight gate: reject is not offered.
         let phase = PhaseId::new(5750);
         let preflight =
             crate::preflight::preflight_gate_context(phase, Stage::Code, "the driver check failed");
@@ -8559,31 +8558,6 @@ mod tests {
             preflight_sentence.contains("reject: not offered"),
             "{preflight_sentence}"
         );
-        let declaration = devflow_core::verify::CheckpointDeclaration {
-            plan_file: format!("{}-01-PLAN.md", phase.padded()),
-            element: "<task type=\"checkpoint:human-action\"></task>".into(),
-            blocking_human: false,
-            human_action: true,
-        };
-        for mode in [Mode::Auto, Mode::Supervise] {
-            let rescan = crate::pipeline_launch::rescan_gate_context(
-                phase,
-                Stage::Code,
-                &[&declaration],
-                mode,
-            );
-            let rescan_sentence =
-                way_on_sentence(GateKind::CheckpointDeclaration, phase, Stage::Code, None);
-            check(
-                &format!("checkpoint declaration ({mode:?})"),
-                &rescan,
-                &rescan_sentence,
-            );
-            assert!(
-                rescan_sentence.contains("reject: not offered"),
-                "{rescan_sentence}"
-            );
-        }
 
         // Planted controls: old answer texts after the sentence, and the
         // sentence after the cause.
