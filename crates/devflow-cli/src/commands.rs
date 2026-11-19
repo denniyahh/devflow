@@ -3191,7 +3191,8 @@ pub(crate) fn gate_list(project_root: &Path, all_roots: bool) -> Result<(), CliE
 /// The footer under [`gate_list`]'s table: every verb that answers a gate.
 const GATE_LIST_ANSWERS: &str = "answer with: devflow gate approve <phase> [--gate-id <id>] \
      [--note ...] | devflow gate reject <phase> [--gate-id <id>] --note ... (fix and relaunch) | \
-     devflow gate abort <phase> [--gate-id <id>] [--note ...] (ends the run)";
+     devflow gate abort <phase> [--gate-id <id>] [--note ...] (ends the run) | a question gate: \
+     devflow gate answer <phase> --gate-id <id> (--option <id> | --text <answer>)";
 
 /// Pure render of [`gate_list`]'s table, so what it shows is testable without
 /// capturing process stdout.
@@ -3406,10 +3407,19 @@ pub(crate) fn gate_respond_report(
             ))
         })?;
     if let Err(refusal) = crate::pipeline_outcomes::screen_answer(gate.gate_kind, &response) {
+        // A question gate's refusal names the exact line that answers it (D-10).
+        let applies = if gate.gate_kind == Some(GateKind::Question) {
+            format!(
+                "`{}` or `devflow gate abort {phase} --gate-id {observed}`",
+                question_answer_line(phase, &observed)
+            )
+        } else {
+            refusal.applies.to_string()
+        };
         return Err(CliError::Message(format!(
             "the {} on phase {phase} {stage}'s gate is refused: {}; no response was written. \
-             The answers that apply: {}",
-            refusal.answer, refusal.why, refusal.applies
+             The answers that apply: {applies}",
+            refusal.answer, refusal.why
         )));
     }
     let path = Gates::answer(project_root, phase, stage, &observed, &response)
@@ -3464,6 +3474,11 @@ pub(crate) fn gate_answer(
     let report = gate_answer_report(project_root, phase, stage, gate_id, choice)?;
     print!("{report}");
     Ok(())
+}
+
+/// The command that answers the question gate `gate_id` at `phase`.
+fn question_answer_line(phase: PhaseId, gate_id: &GateId) -> String {
+    format!("devflow gate answer {phase} --gate-id {gate_id} (--option <id> | --text <answer>)")
 }
 
 /// [`gate_answer`]'s work, returning what it prints. The checks run in
@@ -4231,16 +4246,51 @@ pub(crate) fn gate_show(
 /// process stdout.
 fn render_gate_show(
     gate: &OpenGate,
-    _question: Option<&devflow_core::question::QuestionSpec>,
+    question: Option<&devflow_core::question::QuestionSpec>,
 ) -> String {
-    format!(
-        "phase {} {} ({})\ngate id: {}\n{}",
+    let header = format!(
+        "phase {} {} ({})\ngate id: {}",
         gate.phase,
         gate.stage,
         format_age(&gate.timestamp),
         printable_gate_id(gate),
-        render_gate_context(&gate.context, usize::MAX),
-    )
+    );
+    match question {
+        Some(spec) => format!("{header}\n{}", render_question_block(spec)),
+        None => format!(
+            "{header}\n{}",
+            render_gate_context(&gate.context, usize::MAX)
+        ),
+    }
+}
+
+/// A question gate's `gate show` body (D-09): the question, its context, then
+/// each option in payload order with the recommended one marked and its
+/// description under it. Every string is agent-authored, so each is sanitized
+/// through `render_gate_context` and none is truncated (T-53-10).
+fn render_question_block(spec: &devflow_core::question::QuestionSpec) -> String {
+    let safe = |text: &str| render_gate_context(text, usize::MAX);
+    let mut lines = vec![format!("question: {}", safe(&spec.question))];
+    if let Some(context) = &spec.context {
+        lines.push(format!("context: {}", safe(context)));
+    }
+    lines.push("options:".to_string());
+    for option in &spec.options {
+        let marker = if spec.recommended.as_deref() == Some(option.id.as_str()) {
+            " (recommended)"
+        } else {
+            ""
+        };
+        lines.push(format!(
+            "  {}: {}{marker}",
+            safe(&option.id),
+            safe(&option.label)
+        ));
+        if let Some(description) = &option.description {
+            lines.push(format!("    {}", safe(description)));
+        }
+    }
+    lines.join("\n")
 }
 
 /// How long `logs -f` waits, once the agent's exit file is there, for the runner to
@@ -4950,6 +5000,9 @@ pub(crate) struct PhaseFacts {
     /// when the last event recorded for this phase is not a launch.
     pub(crate) last_launched_stage: Option<Stage>,
     pub(crate) open_gate_stages: Vec<Stage>,
+    /// The stages among [`PhaseFacts::open_gate_stages`] whose gate is a question
+    /// gate: its waiter is the `__ask` server, so `gate_pending` stays false.
+    pub(crate) question_gate_stages: Vec<Stage>,
     pub(crate) feature_branch_exists: bool,
     /// Whether this phase was intentionally halted (`State.stopped`): a stopped phase
     /// with no runner is expected, not a crash, so [`check_runner`] reports nothing.
@@ -5037,13 +5090,17 @@ fn check_open_gate_without_waiter(facts: &PhaseFacts) -> Option<PhaseFinding> {
 }
 
 /// An open gate file exists but `gate_pending` is false — an unanswered
-/// operator question that `status`/`doctor` isn't surfacing as pending.
+/// operator question that `status`/`doctor` isn't surfacing as pending. A
+/// question gate is not one: the `__ask` server waits on it, not the runner,
+/// and `status` names it.
 fn check_orphan_gate(facts: &PhaseFacts) -> Option<PhaseFinding> {
-    if facts.gate_pending || facts.open_gate_stages.is_empty() || facts.waiter != WaiterStatus::Live
-    {
+    if facts.gate_pending || facts.waiter != WaiterStatus::Live {
         return None;
     }
-    let gate_stage = facts.open_gate_stages[0];
+    let gate_stage = *facts
+        .open_gate_stages
+        .iter()
+        .find(|stage| !facts.question_gate_stages.contains(stage))?;
     Some(PhaseFinding {
         phase: facts.phase,
         severity: Severity::Problem,
@@ -5237,10 +5294,18 @@ fn build_phase_facts(
         .and_then(|e| e.get("event"))
         .and_then(|e| e.as_str())
         .map(str::to_string);
-    let open_gate_stages = open_gates
+    let open_gate_stages: Vec<Stage> = open_gates
         .iter()
         .filter(|g| g.phase == phase)
         .map(|g| g.stage)
+        .collect();
+    let question_gate_stages = open_gate_stages
+        .iter()
+        .copied()
+        .filter(|&stage| {
+            crate::pipeline_gate::read_gate_file(project_root, phase, stage)
+                .is_some_and(|gate| gate.gate_kind == Some(GateKind::Question))
+        })
         .collect();
     let branch_ref = format!("refs/heads/feature/phase-{padded}", padded = phase.padded());
     let feature_branch_exists =
@@ -5256,6 +5321,7 @@ fn build_phase_facts(
         last_event: last_event_name,
         last_launched_stage,
         open_gate_stages,
+        question_gate_stages,
         feature_branch_exists,
         stopped,
         finished: state.finished,
@@ -11355,6 +11421,7 @@ mod tests {
                 last_event: Some("stage_launched".into()),
                 last_launched_stage: Some(Stage::Code),
                 open_gate_stages: Vec::new(),
+                question_gate_stages: Vec::new(),
                 unprepared_restart: None,
                 feature_branch_exists: true,
                 stopped: false,
