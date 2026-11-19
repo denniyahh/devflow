@@ -895,6 +895,9 @@ fn consume(
             "devflow_ask could not read the answer's choice: {error}"
         ))
     })?;
+    if answer.response.abort {
+        record_abort_request(args, spec, answer);
+    }
     match Gates::claim(root, phase, stage, gate_id) {
         Ok(Claim::Claimed) => {}
         Ok(Claim::AlreadyConsumed) => {
@@ -931,6 +934,33 @@ fn consume(
             .unwrap_or_else(|| "unknown".to_string()),
         answered_at: unix_now(),
     })
+}
+
+/// Commit the operator's abort as the run's `abort_requested` (D-10), before
+/// the answer is claimed, the gate closed or the reply sent, so a server killed
+/// at any later point leaves the request for the runner to apply. A failed
+/// commit is logged: the reply still tells the agent to stop.
+fn record_abort_request(args: &AskArgs, spec: &QuestionSpec, answer: &GateAnswer) {
+    let note = abort_note(answer.response.note.as_deref(), &spec.question_id);
+    let committed = workflow::update_state(&args.project, args.phase, |state| {
+        state.abort_requested = Some(note);
+        Ok::<(), workflow::WorkflowError>(())
+    });
+    if let Err(error) = committed {
+        eprintln!(
+            "devflow __ask: phase {}: the operator's abort was not recorded in the run state,              so the runner will not end the run on it: {error}",
+            args.phase
+        );
+    }
+}
+
+/// The note an abort from a question records: the operator's own, or one naming
+/// the question.
+pub(crate) fn abort_note(note: Option<&str>, question_id: &str) -> String {
+    note.map_or_else(
+        || format!("aborted from question {question_id}"),
+        str::to_string,
+    )
 }
 
 /// Now, as Unix epoch seconds.
