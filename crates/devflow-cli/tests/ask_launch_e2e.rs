@@ -68,6 +68,28 @@ exit 0"#
     )
 }
 
+/// A `codex` stub that asks as [`codex_asking_stub`] does, then reports a failed stage
+/// when the server's reply carries `aborted_by_operator` (marking it in
+/// `aborted.txt`), and success otherwise.
+fn codex_abort_aware_stub() -> String {
+    const SUCCESS_TAIL: &str = "printf 'DEVFLOW_RESULT: {\"status\":\"success\"}\\n'\nexit 0";
+    let asking = codex_asking_stub();
+    assert!(
+        asking.ends_with(SUCCESS_TAIL),
+        "precondition: the asking stub ends with its success report: {asking}"
+    );
+    asking.replace(
+        SUCCESS_TAIL,
+        r#"if grep -q '"isError":true' "$out" && grep -q 'aborted_by_operator' "$out"; then
+  : > "$here/aborted.txt"
+  printf 'DEVFLOW_RESULT: {"status":"failed","reason":"the operator aborted at the question"}\n'
+  exit 0
+fi
+printf 'DEVFLOW_RESULT: {"status":"success"}\n'
+exit 0"#,
+    )
+}
+
 /// A `claude` stub: answers `--version` and the delivery canary as the supervisor
 /// suite's `FINISHING_CLAUDE` does; for a stage turn it records its argv, takes the
 /// value after `--mcp-config`, reads the server's command and args from that one-line
@@ -455,5 +477,83 @@ printf 'DEVFLOW_RESULT: {"status":"success"}\n'"#;
     assert!(
         fixture.events_of("stage_launched").is_empty(),
         "a refused agent was launched"
+    );
+}
+
+/// D-10: `gate abort` on a stage agent's question ends the run. The server replies
+/// `isError` naming `aborted_by_operator`, the stub reports a failed stage, and the
+/// runner then aborts the run instead of routing that failure: one
+/// `workflow_aborted`, no saved state, no further launch and no stage-failure gate.
+/// The aborted question has a `question_closed` and no `question_answered`.
+#[test]
+fn gate_abort_on_a_question_ends_the_run() {
+    let fixture = Fixture::new(AgentKind::Codex, "codex", &codex_abort_aware_stub());
+    let mut runner = fixture.spawn_runner();
+    let question_gate = fixture.wait_for_gate_id(&mut runner);
+    fixture.gate(&[
+        "abort",
+        &fixture.phase.to_string(),
+        "--gate-id",
+        &question_gate,
+        "--note",
+        "stop",
+    ]);
+    let deadline = Instant::now() + RUNNER_WAIT;
+    while runner.running() {
+        if let Ok(text) = fs::read_to_string(fixture.gate_path())
+            && let Ok(gate) = serde_json::from_str::<serde_json::Value>(&text)
+            && gate["gate_id"] != question_gate.as_str()
+        {
+            panic!("the run did not abort: a gate opened after the question: {text}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the runner did not exit within {RUNNER_WAIT:?}"
+        );
+        std::thread::sleep(POLL);
+    }
+    let output = runner.wait();
+
+    assert!(
+        fixture.beside_agent("aborted.txt").exists(),
+        "the stub did not get an isError reply naming aborted_by_operator; server said: {}\n{}",
+        fs::read_to_string(fixture.beside_agent("server.out")).unwrap_or_default(),
+        shown(&output)
+    );
+    let aborted = fixture.events_of("workflow_aborted");
+    assert_eq!(
+        aborted.len(),
+        1,
+        "one abort event expected: {aborted:?}\n{}",
+        shown(&output)
+    );
+    assert!(
+        matches!(
+            devflow_core::workflow::load_state(&fixture.root, fixture.phase),
+            Err(devflow_core::workflow::WorkflowError::MissingState(_))
+        ),
+        "an aborted run leaves no saved state, as `gate abort` leaves one"
+    );
+    let launched = fixture.events_of("stage_launched");
+    assert_eq!(
+        launched.len(),
+        1,
+        "a stage launched after the abort: {launched:?}"
+    );
+    let closed: Vec<_> = fixture
+        .events_of("question_closed")
+        .into_iter()
+        .filter(|event| event["gate_id"] == question_gate.as_str())
+        .collect();
+    assert!(
+        closed.len() == 1 && closed[0]["reason"] == "aborted_by_operator",
+        "one question_closed{{aborted_by_operator}} expected: {closed:?}"
+    );
+    assert!(
+        fixture
+            .events_of("question_answered")
+            .iter()
+            .all(|event| event["gate_id"] != question_gate.as_str()),
+        "question_answered recorded for an aborted question"
     );
 }

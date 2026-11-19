@@ -7232,6 +7232,64 @@ mod tests {
         }
     }
 
+    /// D-10, review concern 5: an advance over a state carrying a question's
+    /// abort request aborts the run before it routes the stage outcome, and the
+    /// abort consumes the request: the state file is gone, so no later `start`
+    /// or `resume` reads it, and exactly one `workflow_aborted` is recorded.
+    /// Control: the same state with no request routes its outcome (here to its
+    /// `--until plan` stop) and records no abort.
+    #[test]
+    fn the_abort_request_is_consumed_by_the_abort() {
+        let _guard = env_lock();
+        for requested in [Some("stop"), None] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = PhaseId::new(1308);
+            let mut state = State::new(
+                phase,
+                AgentKind::Claude,
+                Mode::Supervise,
+                root.to_path_buf(),
+            );
+            state.stop_until = Some(Stage::Plan);
+            state.abort_requested = requested.map(str::to_string);
+            workflow::save_state(&state).unwrap();
+            assert_eq!(
+                workflow::load_state(root, phase).unwrap().abort_requested,
+                state.abort_requested,
+                "precondition: the saved state carries the request"
+            );
+            write_success_capture(root, phase);
+
+            let launch = advance_with(root, phase, Some(Stage::Plan)).expect("the advance");
+            assert!(launch.is_none(), "no further stage is launched");
+            let aborted = events_named(root, "workflow_aborted");
+            if requested.is_some() {
+                assert_eq!(aborted.len(), 1, "exactly one abort event: {aborted:?}");
+                assert_eq!(aborted[0]["reason"], "stop", "{}", aborted[0]);
+                assert!(
+                    events_named(root, "advance_evaluated").is_empty(),
+                    "an aborted advance routes no stage outcome"
+                );
+                assert!(
+                    matches!(
+                        workflow::load_state(root, phase),
+                        Err(workflow::WorkflowError::MissingState(_))
+                    ),
+                    "the abort consumes the request with the state"
+                );
+            } else {
+                assert!(aborted.is_empty(), "control: no abort: {aborted:?}");
+                assert_eq!(events_named(root, "advance_evaluated").len(), 1);
+                assert_eq!(
+                    events_named(root, "workflow_finished").len(),
+                    1,
+                    "control reaches its --until stop"
+                );
+            }
+        }
+    }
+
     // ---- D-16 (999.166 item 6): the exit file records a safe-point stop ----
 
     // ---- 50.1-17: the stage handoff records its next supervisor first (D-01) ----

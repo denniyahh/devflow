@@ -402,6 +402,15 @@ pub struct State {
     /// fix pass rather than the stage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relaunch_note: Option<String>,
+    /// The operator's abort of the run from a question gate (D-10): the abort's
+    /// note, committed by the `devflow __ask` server before it closes the gate
+    /// or replies, or by the runner when it finds an abort bound to a question
+    /// gate its agent left behind. The server is not the runner and cannot end
+    /// the run itself, so the runner reads this after the agent exits and
+    /// aborts the run as any gate abort does. The abort removes the state file,
+    /// which consumes it, so no later `start` or `resume` aborts again.
+    #[serde(skip)]
+    pub abort_requested: Option<String>,
     /// The commit a Validate agent PASS was recorded on (52-22, D-45 rule 1's
     /// input): the evidence root's HEAD, read when the Validate outcome was
     /// classified. Written only by the CLI's `handle_validate_outcome`, on every
@@ -606,6 +615,7 @@ impl State {
             code_fix_note: None,
             code_fix_report: None,
             relaunch_note: None,
+            abort_requested: None,
             validate_pass_head: None,
             gap_closure_pass: false,
         }
@@ -1025,6 +1035,46 @@ mod tests {
         assert!(
             !unset.contains("code_fix"),
             "a state with no fix pass writes no code_fix key: {unset}"
+        );
+    }
+
+    /// A question's abort request is persisted under its own key and reads as
+    /// `None` from a state written before the field existed.
+    #[test]
+    fn abort_requested_round_trips_and_defaults_to_none() {
+        let mut state = State::new(
+            PhaseId::new(1),
+            AgentKind::Claude,
+            Mode::Auto,
+            PathBuf::from("/repo"),
+        );
+        state.abort_requested = Some("note".to_string());
+        let json = serde_json::to_string(&state).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value.get("abort_requested"),
+            Some(&serde_json::json!("note")),
+            "abort_requested must be persisted under its own key: {json}"
+        );
+        let loaded: State = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.abort_requested.as_deref(), Some("note"));
+
+        let predating = r#"{
+            "stage": "code",
+            "phase": 1,
+            "agent": "claude",
+            "mode": "auto",
+            "started_at": "0",
+            "project_root": "/repo"
+        }"#;
+        let loaded: State = serde_json::from_str(predating).unwrap();
+        assert_eq!(loaded.abort_requested, None, "an older state asks no abort");
+
+        state.abort_requested = None;
+        let unset = serde_json::to_string(&state).unwrap();
+        assert!(
+            !unset.contains("abort_requested"),
+            "a state with no abort request writes no abort_requested key: {unset}"
         );
     }
 
