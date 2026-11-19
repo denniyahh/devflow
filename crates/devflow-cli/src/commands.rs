@@ -1930,13 +1930,16 @@ struct DiscardDebris {
     gate_files: Vec<PathBuf>,
     /// The phase's hold temps in `.devflow/` and in the gates directory.
     hold_temps: Vec<PathBuf>,
-    /// The phase's `devflow_ask` registration file, when a stage launch left one.
-    ask_registration: Option<PathBuf>,
+    /// The phase's `devflow_ask` registration files a stage launch left: the
+    /// `--mcp-config` file and pi's `-e` extension.
+    ask_registrations: Vec<PathBuf>,
 }
 
 impl DiscardDebris {
     fn is_empty(&self) -> bool {
-        self.gate_files.is_empty() && self.hold_temps.is_empty() && self.ask_registration.is_none()
+        self.gate_files.is_empty()
+            && self.hold_temps.is_empty()
+            && self.ask_registrations.is_empty()
     }
 }
 
@@ -1985,10 +1988,11 @@ fn discard_debris(project_root: &Path, phase: PhaseId) -> Result<DiscardDebris, 
     debris.gate_files.sort();
     debris.hold_temps.sort();
     let registration = crate::pipeline_launch::ask_registration_path(project_root, phase);
-    debris.ask_registration = registration
-        .symlink_metadata()
-        .is_ok()
-        .then_some(registration);
+    let extension = devflow_core::agents::pi::ask_extension_path(&registration);
+    debris.ask_registrations = [registration, extension]
+        .into_iter()
+        .filter(|path| path.symlink_metadata().is_ok())
+        .collect();
     Ok(debris)
 }
 
@@ -2115,7 +2119,7 @@ fn remove_discarded_debris(
             path.display()
         );
     }
-    if let Some(path) = &debris.ask_registration {
+    for path in &debris.ask_registrations {
         match std::fs::remove_file(path) {
             Ok(()) => println!("removed devflow_ask registration {}", path.display()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -2692,7 +2696,7 @@ fn print_discard_listing(phase: PhaseId, items: &DiscardItems, debris: &DiscardD
             path.display()
         );
     }
-    if let Some(path) = &debris.ask_registration {
+    for path in &debris.ask_registrations {
         println!("  devflow_ask registration {}", path.display());
     }
 }
@@ -14148,34 +14152,43 @@ mod tests {
         result.expect("the start the refusal names launches");
     }
 
-    /// Review concern 9: `discard` removes the phase's `devflow_ask` registration
-    /// file with its other debris. Control: another phase's registration stays.
+    /// Review concern 9 and OD-2: `discard` removes the phase's `devflow_ask`
+    /// registration files, the `--mcp-config` file and pi's `-e` extension, with its
+    /// other debris. Control: another phase's registrations stay.
     #[test]
     fn discard_removes_the_ask_registration_file() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let (phase, other) = (PhaseId::new(5381), PhaseId::new(5382));
         init_start_repo(root, phase);
-        let state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
+        let state = State::new(phase, AgentKind::Pi, Mode::Supervise, root.to_path_buf());
         workflow::save_state(&state).unwrap();
-        let ours = crate::pipeline_launch::ask_registration_path(root, phase);
-        let theirs = crate::pipeline_launch::ask_registration_path(root, other);
-        for path in [&ours, &theirs] {
+        let registrations = |phase| {
+            let config = crate::pipeline_launch::ask_registration_path(root, phase);
+            let extension = devflow_core::agents::pi::ask_extension_path(&config);
+            [config, extension]
+        };
+        let (ours, theirs) = (registrations(phase), registrations(other));
+        for path in ours.iter().chain(&theirs) {
             std::fs::write(path, "{}\n").unwrap();
         }
 
         discard(root, phase, None).expect("discard runs");
 
-        assert!(
-            !ours.exists(),
-            "a registration file left after discard: {}",
-            ours.display()
-        );
-        assert!(
-            theirs.exists(),
-            "control: another phase's registration was removed: {}",
-            theirs.display()
-        );
+        for path in &ours {
+            assert!(
+                !path.exists(),
+                "a registration file left after discard: {}",
+                path.display()
+            );
+        }
+        for path in &theirs {
+            assert!(
+                path.exists(),
+                "control: another phase's registration was removed: {}",
+                path.display()
+            );
+        }
     }
 
     /// With a worktree already there, `start` refuses naming `devflow discard` (52.1

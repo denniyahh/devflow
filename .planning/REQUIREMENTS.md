@@ -61,7 +61,8 @@ requirement closes a backlog entry, the entry is named; `.planning/user/V4-CUT-I
 
 ### Question channel (ASK)
 
-- [x] **ASK-01**: DevFlow serves an MCP tool (`devflow_ask`) over stdio that every supported agent can call with a
+- [x] **ASK-01**: DevFlow serves an MCP tool (`devflow_ask`) over stdio that
+      every supported agent (claude, codex and pi; opencode, hermes and antigravity are refused by name until they have a registration, 999.248) can call with a
       question, typed options and context; the call blocks until an answer exists and returns it to the agent.
 - [x] **ASK-02**: The policy "operator via gate" turns each question into a gate the operator answers from the shell
       (`devflow gate answer <phase> --gate-id <id> --option <id>` or a free-text answer), with the notify hook firing

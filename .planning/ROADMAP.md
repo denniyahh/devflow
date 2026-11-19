@@ -298,10 +298,13 @@ closing this phase.
 **Success Criteria** (what must be TRUE):
 
   1. An agent launched by DevFlow calls `devflow_ask` over stdio with a question, typed options and context; the call
-     blocks until an answer exists and the answer comes back to the same agent session — proven live for the two
-     agents already proven live (claude, codex) and by an e2e test that drives the real binary with a stub agent for
-     the other launch shapes. **Control:** a call with a malformed payload (no options, or an option id the question
-     did not offer) is refused with a typed error and the agent is not left blocked. (ASK-01)
+     blocks until an answer exists and the answer comes back to the same agent session — proven live for claude and
+     codex (53-PROOF-RUN.md), for pi by its registration spike against a stub MCP server (53-MCP-SPIKE.md, pi
+     addendum), and by e2e tests that drive the real binary with stub claude, codex and pi agents; opencode, hermes
+     and antigravity launches are refused by name until each has a registration (999.248), so `--mode auto`, which
+     accepts only claude or antigravity as a fallback, has no usable non-claude fallback until then. **Control:** a
+     call with a malformed payload (no options, or an option id the question did not offer) is refused with a typed
+     error and the agent is not left blocked. (ASK-01)
   2. Under "operator via gate", an asked question appears in `devflow gate list` and `gate show` with its options;
      `devflow gate answer <phase> --gate-id <id> --option <id>` (or a free-text answer) resolves it; the notify hook
      fires and `notify_fired` is recorded exactly as for an approve/reject gate. **Control:** an answer addressed to a

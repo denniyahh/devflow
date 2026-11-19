@@ -65,9 +65,9 @@ tool, `devflow_ask`. A call opens a `question` gate at the stage's
 
 ## How a stage agent reaches `devflow_ask`
 
-Every stage launch (Plan, Code, Validate) of claude or codex registers the
-server for that launch only. DevFlow never writes `~/.claude.json` or
-`~/.codex/config.toml`. The server is the runner's own binary, run as
+Every stage launch (Plan, Code, Validate) of claude, codex or pi registers the
+server for that launch only. DevFlow never writes `~/.claude.json`,
+`~/.codex/config.toml` or anything under `~/.pi/agent/`. The server is the runner's own binary, run as
 `__ask --project <root> --phase <N> --stage <stage> --timeout-secs <T>
 --run-started-at <started_at>`, where `T` is the gate timeout
 (`DEVFLOW_GATE_TIMEOUT_SECS`, three days by default).
@@ -79,14 +79,22 @@ server for that launch only. DevFlow never writes `~/.claude.json` or
   flags above plus `--hold-cap-secs 900`), `.tool_timeout_sec=960`,
   `.default_tools_approval_mode="approve"` and `.enabled=true` before the
   prompt, each value escaped as a TOML string.
+- **pi**: pi has no per-launch MCP config flag, and its project `.pi/mcp.json`
+  loads only under `--approve`, which DevFlow never passes. So DevFlow writes
+  `.devflow/ask-NN.mcp.ts`, a one-line pi extension that registers the stdio
+  server `devflow` (the flags above plus `--hold-cap-secs 900`, `exposure:
+  "direct"`, `timeout: 960`), and passes `-e <that file>` before the prompt;
+  `--no-approve` stays, so the project's own `.pi/` resources still do not load.
+  pi lists the tool as `mcp__devflow__devflow_ask`.
 
 The client waits 60 s longer than the server holds a call, so the server's
 result arrives first. claude holds its call until the question is answered or
-the gate timeout `T` ends it. codex holds one call 15 minutes (900 s) at most:
-the call then returns a `pending` result naming the question id, and codex
-calls `devflow_ask` again with that id, while the question stays open at its
-gate the whole time. codex's client timeout is therefore 16 minutes (960 s),
-not `T + 60`. `T` still counts from the question's first call: a question
+the gate timeout `T` ends it. codex and pi hold one call 15 minutes (900 s) at
+most: the call then returns a `pending` result naming the question id, and the
+agent calls `devflow_ask` again with that id, while the question stays open at
+its gate the whole time. Their client timeout is therefore 16 minutes (960 s),
+not `T + 60`; pi's own default (60 s) would cancel the call. How pi's model
+answers a `pending` result has not been observed. `T` still counts from the question's first call: a question
 unanswered for `T` is closed as `timed_out` whether or not a call holds it.
 
 Token cost: the cap bounds each held codex call, not codex's polling. While it
@@ -94,7 +102,8 @@ waits, codex polls the held call about every 21 s; one 15-minute hold was
 measured once at 1,346,920 input tokens (1,306,880 of them cached). So an
 unanswered codex question costs at least that per 15 minutes held, re-calls
 included, until it is answered or `T` ends it. Nothing past 15 minutes was
-measured. claude made no model request while waiting. Neither launch passes `--strict-mcp-config` or
+measured. claude made no model request while waiting, and neither did pi over
+one 15-minute hold (the same two model turns as an instant call). No launch passes `--strict-mcp-config` or
 turns off a global server: your own MCP servers stay on, and DevFlow adds one
 server and removes none. The server name `devflow` is reserved for DevFlow; do
 not give one of your own servers that name. A global server that fails to start
@@ -105,11 +114,12 @@ is live can leave the binary path pointing at a removed or changed file. The
 tool is then unavailable, and the agent falls back to reporting the checkpoint
 in its result.
 
-opencode, pi, hermes and antigravity have no registration yet, so `devflow
+opencode, hermes and antigravity have no registration yet, so `devflow
 start`, `resume`, a fallback handoff and every stage launch refuse them before
 any agent process starts, with a message naming the agent and `devflow_ask`.
-Their registrations are backlog 999.248. `devflow discard --phase N` removes the
-phase's `.devflow/ask-NN.mcp.json`.
+Their registrations are backlog 999.248. Every registration file DevFlow writes
+is under `.devflow/`, never in the project tree. `devflow discard --phase N`
+removes the phase's `.devflow/ask-NN.mcp.json` and `.devflow/ask-NN.mcp.ts`.
 
 ## Question events
 
@@ -289,7 +299,7 @@ worktree, a feature branch, or `.devflow/` state):
 | Check | Condition | Operator action |
 |---|---|---|
 | Agent binary present | The agent's executable (`claude`/`codex`/`opencode`) is not found on `PATH` | Install the agent, or run `devflow doctor` |
-| Agent can see `devflow_ask` (Phase 53) | `--agent` or `--fallback-agent` is opencode, pi, hermes or antigravity, which have no MCP registration (backlog 999.248) | Use `--agent claude` or `--agent codex` |
+| Agent can see `devflow_ask` (Phase 53) | `--agent` or `--fallback-agent` is opencode, hermes or antigravity, which have no MCP registration (backlog 999.248) | Use `--agent claude`, `--agent codex` or `--agent pi` |
 | Phase reachable from `develop` (23f) | Phase N's `### Phase N:` ROADMAP heading or its `.planning/phases/NN-*/` directory is missing from `develop` — skipped entirely if `develop` has no `.planning/ROADMAP.md` at all | Merge the branch carrying the phase's planning artifacts into `develop`, then re-run |
 | Codex headless Plan | `--agent codex` and phase N has no `-CONTEXT.md` on `develop` — Codex's `exec` mode cannot run the discuss-phase interview headlessly, so its Plan stage needs CONTEXT.md to exist | Run `/gsd-discuss-phase N` interactively first (any agent), or use `--agent claude` |
 
@@ -785,6 +795,7 @@ command. The coding agent never receives the variable.
 | `.holder-NN` | D-17 foreground holder: held by a foreground verb for its lifetime (a `start` or `resume` until its unit is launched, a `discard`), recording its pid and start time. `stop` refuses while it is held and no runner is live, and never signals it; never removed by `discard` |
 | `supervisor-<launch_id>.live` | An older build's launch reservation; no current build writes one, since a launch takes no reservation (D-07). No DevFlow verb reads or removes an abandoned one (D-06) |
 | `ask-NN.mcp.json` | The phase's claude `devflow_ask` registration, rewritten at each stage launch; removed by `devflow discard --phase N` |
+| `ask-NN.mcp.ts` | The phase's pi `devflow_ask` registration (a pi extension), rewritten at each stage launch; removed by `devflow discard --phase N` |
 | `.ask-NN-<stage>` | The stage's ask lock: held by an `__ask` server while one question of the stage is open, so two servers never open questions on the same stage at once; never removed |
 | `*.hold-tmp` | A hold being taken, here or under `gates/`. An orphan is removed by `devflow discard --phase N` when phase N has one |
 | `phase-NN-stdout` / `phase-NN-stderr.log` | Agent capture files (what `logs` tails) |
