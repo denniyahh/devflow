@@ -41,6 +41,9 @@ const IDLE_POLL: Duration = Duration::from_millis(100);
 /// How often a held call re-reads the run state and probes the runner lock.
 const RUN_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How often a call retries the stage's ask lock while another question holds it.
+const ASK_LOCK_RETRY: Duration = Duration::from_millis(250);
+
 /// The MCP protocol versions this server speaks, newest first. A client asking
 /// for another gets the first (the spec's rule for an unsupported request).
 pub(crate) const SUPPORTED_PROTOCOL_VERSIONS: [&str; 3] =
@@ -148,6 +151,8 @@ struct PendingCall {
     id_text: String,
     /// The request's params.
     params: Value,
+    /// When the reader read it: the call's timeout runs from here.
+    arrived: Instant,
 }
 
 /// What the reader thread and the worker share.
@@ -180,6 +185,8 @@ fn caught_signal() -> Option<i32> {
 pub(crate) struct CallControl<'a> {
     flags: &'a CallFlags,
     id_text: &'a str,
+    /// When the call arrived, so queue time counts against its timeout.
+    arrived: Instant,
 }
 
 impl CallControl<'_> {
@@ -266,6 +273,7 @@ where
         let control = CallControl {
             flags: &flags,
             id_text: &pending.id_text,
+            arrived: pending.arrived,
         };
         let result = call(&pending.params, &control);
         // After stdin's end the client is gone: nothing more goes to stdout.
@@ -297,9 +305,17 @@ fn next_call(flags: &CallFlags) -> Option<PendingCall> {
     }
 }
 
-/// Record a client's cancel of `request_id`.
+/// Record a client's cancel of `request_id`. A call still queued is removed,
+/// so it opens no gate, records no event and gets no reply; a call already
+/// taken by the worker sees its id in the cancelled set.
 fn cancel(flags: &CallFlags, request_id: &Value) {
-    lock(&flags.cancelled).insert(request_id.to_string());
+    let id_text = request_id.to_string();
+    let mut queue = lock(&flags.queue);
+    let queued = queue.len();
+    queue.retain(|pending| pending.id_text != id_text);
+    if queue.len() == queued {
+        lock(&flags.cancelled).insert(id_text);
+    }
 }
 
 /// The reader thread: answer what the reader answers, queue each call, record
@@ -331,6 +347,7 @@ fn read_lines<R: BufRead, W: Write>(input: R, output: &Mutex<W>, flags: &CallFla
                     id,
                     id_text,
                     params,
+                    arrived: Instant::now(),
                 });
                 flags.wake.notify_all();
             }
@@ -477,6 +494,8 @@ enum Unanswered {
         /// Who closed it, when an operator did.
         closed_by: Option<String>,
     },
+    /// The call ended before its gate opened: no gate, no question event.
+    NotAsked(Ending),
     /// The question could not be served; the text is the reply.
     Failed(String),
 }
@@ -505,16 +524,25 @@ fn ask(args: &AskArgs, params: &Value, control: &CallControl<'_>) -> Option<Valu
     }
     match ask_gate(args, &spec, control) {
         Ok(answer) => Some(answered_result(&answer)),
-        Err(Unanswered::Closed {
-            ending: Ending::CancelledByClient,
-            ..
-        }) => None,
-        Err(Unanswered::Closed { ending, detail, .. }) => Some(tool_error(&format!(
-            "devflow_ask closed: {} — {detail}",
-            ending.reason()
-        ))),
+        Err(
+            Unanswered::Closed {
+                ending: Ending::CancelledByClient,
+                ..
+            }
+            | Unanswered::NotAsked(Ending::CancelledByClient),
+        ) => None,
+        Err(Unanswered::Closed { ending, detail, .. }) => Some(closed_error(ending, &detail)),
+        Err(Unanswered::NotAsked(ending)) => Some(closed_error(ending, ending.sentence())),
         Err(Unanswered::Failed(why)) => Some(tool_error(&why)),
     }
+}
+
+/// The tool result for a question that ended without an answer.
+fn closed_error(ending: Ending, detail: &str) -> Value {
+    tool_error(&format!(
+        "devflow_ask closed: {} — {detail}",
+        ending.reason()
+    ))
 }
 
 /// The tool result for an answered question.
@@ -563,16 +591,19 @@ fn check_run_binding(args: &AskArgs) -> Result<(), String> {
     }
 }
 
-/// The gate half of [`ask`]: open, wait, read the choice, claim, finish the
-/// registration and close the question's own gate. The registration is
-/// finished and the gate closed on every exit path; the close is identity
-/// checked, so a gate that replaced this one survives.
+/// The gate half of [`ask`]: take the stage's ask lock, open, wait, read the
+/// choice, claim, finish the registration and close the question's own gate.
+/// The registration is finished and the gate closed on every exit path; the
+/// close is identity checked, so a gate that replaced this one survives. The
+/// ask lock is held until the question has closed.
 fn ask_gate(
     args: &AskArgs,
     spec: &QuestionSpec,
     control: &CallControl<'_>,
 ) -> Result<AskAnswer, Unanswered> {
     let (root, phase, stage) = (args.project.as_path(), args.phase, args.stage);
+    let watch = RunWatch::new(args, control);
+    let _ask_lock = take_ask_lock(args, spec, &watch)?;
     let (opened, registration) = Gates::open_question_registered(root, phase, stage, spec)
         .map_err(|error| {
             Unanswered::Failed(format!(
@@ -587,7 +618,6 @@ fn ask_gate(
     );
     let notifier = Notifier::spawn(args, spec);
     emit_question_asked(args, spec, &gate_id);
-    let watch = RunWatch::new(args, control);
     let result = match await_bound_answer(args, &gate_id, &watch) {
         Ok(Some(answer)) => consume(args, &gate_id, spec, &answer),
         Ok(None) => Err(Unanswered::closed(
@@ -605,9 +635,45 @@ fn ask_gate(
         Err(Unanswered::Closed {
             ending, closed_by, ..
         }) => emit_question_closed(args, spec, &gate_id, *ending, closed_by.as_deref()),
-        Err(Unanswered::Failed(_)) => {}
+        Err(Unanswered::NotAsked(_) | Unanswered::Failed(_)) => {}
     }
     result
+}
+
+/// Take the stage's ask lock, retrying every [`ASK_LOCK_RETRY`] while another
+/// question holds it, until the call ends or its time (counted from arrival)
+/// runs out. A call that ends here opened no gate, so no question event is
+/// recorded; a timed-out one logs its question id to stderr.
+fn take_ask_lock(
+    args: &AskArgs,
+    spec: &QuestionSpec,
+    watch: &RunWatch<'_>,
+) -> Result<liveness::Hold, Unanswered> {
+    let (root, phase, stage) = (args.project.as_path(), args.phase, args.stage);
+    loop {
+        if watch.ended() {
+            return Err(Unanswered::NotAsked(
+                watch.ending.get().unwrap_or(Ending::TimedOut),
+            ));
+        }
+        let left = watch.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            eprintln!(
+                "devflow __ask: question {} timed out before its gate opened",
+                spec.question_id
+            );
+            return Err(Unanswered::NotAsked(Ending::TimedOut));
+        }
+        match liveness::claim_ask_lock(root, phase, stage) {
+            Ok(Ok(hold)) => return Ok(hold),
+            Ok(Err(_held)) => std::thread::sleep(ASK_LOCK_RETRY.min(left)),
+            Err(error) => {
+                return Err(Unanswered::Failed(format!(
+                    "devflow_ask could not take phase {phase} {stage}'s ask lock: {error}"
+                )));
+            }
+        }
+    }
 }
 
 /// What ends a held question from outside, polled on every cancel check of the
@@ -616,6 +682,8 @@ fn ask_gate(
 struct RunWatch<'a> {
     args: &'a AskArgs,
     control: &'a CallControl<'a>,
+    /// The call's arrival plus `--timeout-secs`.
+    deadline: Instant,
     last_run_check: Cell<Option<Instant>>,
     ending: Cell<Option<Ending>>,
 }
@@ -625,6 +693,7 @@ impl<'a> RunWatch<'a> {
         Self {
             args,
             control,
+            deadline: control.arrived + Duration::from_secs(args.timeout_secs),
             last_run_check: Cell::new(None),
             ending: Cell::new(None),
         }
@@ -784,7 +853,7 @@ fn emit_question_closed(
     );
 }
 
-/// [`Gates::await_answer`] with the time left, setting aside each file in the
+/// [`Gates::await_answer`] with the time left before the call's deadline, setting aside each file in the
 /// slot that does not bind to `gate_id`. `None` on a timeout or on an ending
 /// `watch` saw (kept in it).
 fn await_bound_answer(
@@ -793,11 +862,11 @@ fn await_bound_answer(
     watch: &RunWatch<'_>,
 ) -> Result<Option<GateAnswer>, String> {
     let (root, phase, stage) = (args.project.as_path(), args.phase, args.stage);
-    let started = Instant::now();
     loop {
-        let left = args
-            .timeout_secs
-            .saturating_sub(started.elapsed().as_secs());
+        // The time left before the call's deadline, to the nearest whole second.
+        let left = (watch.deadline.saturating_duration_since(Instant::now())
+            + Duration::from_millis(500))
+        .as_secs();
         match Gates::await_answer(root, phase, stage, gate_id, left, || watch.ended()) {
             AwaitOutcome::Unbound { reason } => {
                 Gates::set_aside_unbound(root, phase, stage, gate_id).map_err(|error| {

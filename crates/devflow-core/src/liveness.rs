@@ -263,8 +263,8 @@ pub fn phase_holder_path(project_root: &Path, phase: PhaseId) -> PathBuf {
         .join(format!(".holder-{}", phase.padded()))
 }
 
-/// A holder's recorded pid and start time, as [`live_holder`] reads them.
-type HolderIdentity = (u32, Option<u64>);
+/// A lock holder's recorded pid and process start time, as its lock file records them.
+pub type HolderIdentity = (u32, Option<u64>);
 
 /// Why [`claim_phase_holder`] did not claim.
 #[derive(Debug)]
@@ -407,17 +407,26 @@ pub fn ask_lock_path(project_root: &Path, phase: PhaseId, stage: Stage) -> PathB
         .join(format!(".ask-{}-{stage}", phase.padded()))
 }
 
-/// Claim the ask lock of `phase`'s `stage`.
+/// Claim `phase`'s `stage` ask lock for this process: an exclusive lock on
+/// [`ask_lock_path`], held until the returned [`Hold`] drops. `devflow __ask` holds it
+/// while one question of the stage is open, so two servers never open questions on the
+/// same stage at once.
+///
+/// Same invariants as [`claim_runner_lock`]: the file is never removed, replaced or
+/// `unlock()`ed, it is created mode 0o600, its record is advisory, and the descriptor is
+/// close-on-exec. A holder killed without cleanup leaves the file unheld, and the next
+/// claim takes its flock: there is no remove-and-retry step two contenders could both win.
 ///
 /// # Errors
-/// Always, until it is built.
+/// The file could not be created, locked or written. The inner `Err` is the current
+/// holder's recorded identity, `None` when its record does not read.
 pub fn claim_ask_lock(
     project_root: &Path,
     phase: PhaseId,
     stage: Stage,
-) -> std::io::Result<Result<Hold, Option<(u32, Option<u64>)>>> {
-    let _ = (project_root, phase, stage);
-    Err(std::io::Error::other("claim_ask_lock is not built yet"))
+) -> std::io::Result<Result<Hold, Option<HolderIdentity>>> {
+    crate::workflow::ensure_devflow_dir(&project_root.join(".devflow"))?;
+    claim_lock_file(ask_lock_path(project_root, phase, stage))
 }
 
 /// The signal the process's one SIGTERM/SIGINT handler
