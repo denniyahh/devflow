@@ -97,9 +97,10 @@ pub(crate) fn ensure_agent_binary(program: &str) -> Result<(), CliError> {
 /// D-02, operator answer (2): refuse an agent that cannot see `devflow_ask`
 /// before any agent process starts. Asks the driver's support query, which
 /// builds no registration; the one `ask_wiring` call is the stage launch's.
-#[allow(dead_code)] // RED stub; wired in the GREEN commit
-pub(crate) fn ensure_ask_registration(_agent: AgentKind) -> Result<(), CliError> {
-    Ok(())
+pub(crate) fn ensure_ask_registration(agent: AgentKind) -> Result<(), CliError> {
+    agents::driver_for(agent)
+        .ask_support()
+        .map_err(|why| CliError::Message(format!("refusing to launch `{agent}`: {why}")))
 }
 
 /// The integration trunk `start` forks from (45-01 / D-01), resolved once: the resolver
@@ -961,6 +962,7 @@ pub(crate) fn validate_fallback_agent(state: &State, fallback: AgentKind) -> Res
         )));
     }
     ensure_agent_binary(agent_program(fallback))?;
+    ensure_ask_registration(fallback)?;
     let mut candidate = state.clone();
     candidate.agent = fallback;
     agents::driver_for(fallback)

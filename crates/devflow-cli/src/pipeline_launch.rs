@@ -183,6 +183,7 @@ fn prepare_stage_launch(
         &roots,
         stream_launch,
     );
+    let args = wire_ask_registration(state, driver.as_ref(), args)?;
 
     // 28-03: every fresh stage launch zeroes the checkpoint-resume counter.
     // Nothing increments it since the checkpoint relaunch was removed (53-03);
@@ -202,15 +203,73 @@ fn prepare_stage_launch(
 /// The phase's `devflow_ask` registration file, `.devflow/ask-NN.mcp.json`: written
 /// by each stage launch whose driver registers through a file (claude), removed by
 /// `discard`.
-#[allow(dead_code)] // RED stub; wired in the GREEN commit
 pub(crate) fn ask_registration_path(project_root: &Path, phase: PhaseId) -> PathBuf {
     workflow::devflow_dir(project_root).join(format!("ask-{}.mcp.json", phase.padded()))
 }
 
 /// Put a driver's ask arguments into its launch argv where the driver says.
-#[allow(dead_code)] // RED stub; wired in the GREEN commit
-fn splice_ask_args(args: Vec<String>, _wiring: &agents::AskWiring) -> Vec<String> {
+fn splice_ask_args(mut args: Vec<String>, wiring: &agents::AskWiring) -> Vec<String> {
+    let at = match wiring.placement {
+        agents::ArgPlacement::Append => args.len(),
+        agents::ArgPlacement::BeforeLast => args.len().saturating_sub(1),
+    };
+    args.splice(at..at, wiring.args.iter().cloned());
     args
+}
+
+/// D-03: register the `devflow` MCP server for this stage launch: build the
+/// registration, ask the driver for its wiring, write its file atomically when it
+/// has one, and splice its arguments into `args`. A driver that cannot register is
+/// refused here, before the launch. Nothing outside `.devflow/` is written.
+fn wire_ask_registration(
+    state: &State,
+    driver: &dyn agents::AgentDriver,
+    args: Vec<String>,
+) -> Result<Vec<String>, CliError> {
+    let exe = std::env::current_exe().map_err(|err| {
+        CliError::Message(format!(
+            "the devflow_ask server cannot be registered: this runner's own executable \
+             cannot be resolved ({err})"
+        ))
+    })?;
+    let reg = agents::AskRegistration {
+        exe,
+        project_root: state.project_root.clone(),
+        phase: state.phase,
+        stage: state.stage,
+        timeout_secs: crate::config_parse::gate_timeout_secs(),
+        run_started_at: state.started_at.clone(),
+        config_path: ask_registration_path(&state.project_root, state.phase),
+    };
+    let wiring = driver
+        .ask_wiring(&reg)
+        .map_err(|why| CliError::Message(format!("refusing to launch `{}`: {why}", state.agent)))?;
+    if let Some((path, text)) = &wiring.file {
+        write_ask_registration(path, text)?;
+    }
+    Ok(splice_ask_args(args, &wiring))
+}
+
+/// Write the registration file through a temp beside it and a rename, so the agent
+/// never reads a half-written file. The temp `.ask-NN.mcp.json.tmp` is covered by
+/// the ask lock's `.gitignore` pattern.
+fn write_ask_registration(path: &Path, text: &str) -> Result<(), CliError> {
+    let failed = |err: std::io::Error| {
+        CliError::Message(format!(
+            "could not write the devflow_ask registration {}: {err}",
+            path.display()
+        ))
+    };
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let temp = path.with_file_name(format!(".{name}.tmp"));
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(failed)?;
+    }
+    std::fs::write(&temp, format!("{text}\n")).map_err(failed)?;
+    std::fs::rename(&temp, path).map_err(failed)
 }
 
 /// How a stage's agent is launched, before the runner builds its
@@ -1760,6 +1819,7 @@ pub(crate) fn launch_stage(
         .unwrap_or_default();
     let (program, _args) = driver.build_command(state.phase, &prompt, &roots);
     ensure_agent_binary(program)?;
+    crate::preflight::ensure_ask_registration(state.agent)?;
 
     // 17c (Task 1, D-13-D-16): a scoped readiness gate runs before any agent
     // time is spent — a failing check surfaces as a named preflight gate +
@@ -1934,7 +1994,9 @@ fn hand_off_agent(
     if let Err(why) = generic_preflight_checks(project_root, &candidate) {
         return Ok(HandoffOutcome::Refused(HandoffRefusal::Preflight(why)));
     }
-    if let Err(err) = ensure_agent_binary(agent_program(to)) {
+    if let Err(err) = ensure_agent_binary(agent_program(to))
+        .and_then(|()| crate::preflight::ensure_ask_registration(to))
+    {
         return Ok(HandoffOutcome::Refused(HandoffRefusal::Unavailable(
             err.to_string(),
         )));
@@ -2144,6 +2206,7 @@ pub(crate) fn resume_with_fallback(
     // stage's.
     let launched =
         crate::preflight::ensure_agent_binary(crate::preflight::agent_program(state.agent))
+            .and_then(|()| crate::preflight::ensure_ask_registration(state.agent))
             .and_then(|()| archive_prior_capture(&state, None))
             .map_err(|err| crate::service::LaunchError::Failed(err.to_string()))
             .and_then(|()| crate::service::launch_runner_unit(project_root, phase));
@@ -9646,7 +9709,8 @@ mod tests {
 
     /// D-02, T-53-21: the registration reaches only a real stage launch. Across
     /// both crates' non-test source, `ask_wiring(` is called in
-    /// `prepare_stage_launch` and nowhere else that launches; the one other call is
+    /// `wire_ask_registration`, which only `prepare_stage_launch` calls, and nowhere
+    /// else that launches; the one other call is
     /// the driver conformance case, which launches nothing. The canary and
     /// preflight launches carry none, and the start/resume/handoff refusal asks
     /// `ask_support`. Control: a planted extra call site is reported.
@@ -9670,10 +9734,15 @@ mod tests {
         assert_eq!(
             sites,
             [
-                "devflow-cli/src/pipeline_launch.rs: prepare_stage_launch",
+                "devflow-cli/src/pipeline_launch.rs: wire_ask_registration",
                 "devflow-core/src/agents/mod.rs: ask_declarations_agree",
             ],
             "production ask_wiring( call sites"
+        );
+        assert_eq!(
+            cli_call_sites("wire_ask_registration("),
+            ["pipeline_launch.rs: prepare_stage_launch"],
+            "production wire_ask_registration( call sites"
         );
     }
 
