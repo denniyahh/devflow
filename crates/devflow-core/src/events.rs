@@ -213,14 +213,14 @@ pub fn has_event_for_phase(project_root: &Path, phase: PhaseId, event: &str) -> 
 ///   `cancelled_by_client`, `client_disconnected`, `terminated`,
 ///   `run_stopped`, `runner_gone`, `timed_out`, `aborted_by_operator`,
 ///   `agent_exited`, `closed_on_resume`), `closed_by` (string or null).
-pub const QUESTION_ASKED: &str = "";
+pub const QUESTION_ASKED: &str = "question_asked";
 /// A question was answered; fields under [`QUESTION_ASKED`].
-pub const QUESTION_ANSWERED: &str = "";
+pub const QUESTION_ANSWERED: &str = "question_answered";
 /// A question ended without an answer; fields under [`QUESTION_ASKED`].
-pub const QUESTION_CLOSED: &str = "";
+pub const QUESTION_CLOSED: &str = "question_closed";
 /// The `policy` value of a `question_answered` event: the operator answered
 /// the question gate.
-pub const ANSWERING_POLICY_OPERATOR_VIA_GATE: &str = "";
+pub const ANSWERING_POLICY_OPERATOR_VIA_GATE: &str = "operator_via_gate";
 
 /// Render an event as a short human-readable summary ("gate_fired (ship)").
 pub fn describe(event: &serde_json::Value) -> String {
