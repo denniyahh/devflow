@@ -75,12 +75,26 @@ server for that launch only. DevFlow never writes `~/.claude.json` or
 - **claude**: DevFlow writes `.devflow/ask-NN.mcp.json`, one line holding one
   stdio server named `devflow`, and appends `--mcp-config <that file>` as the
   last two arguments. The server's `timeout` is `(T + 60) * 1000` ms.
-- **codex**: DevFlow passes `-c mcp_servers.devflow.command`, `.args`,
-  `.tool_timeout_sec=<T + 60>`, `.default_tools_approval_mode="approve"` and
-  `.enabled=true` before the prompt, each value escaped as a TOML string.
+- **codex**: DevFlow passes `-c mcp_servers.devflow.command`, `.args` (the
+  flags above plus `--hold-cap-secs 900`), `.tool_timeout_sec=960`,
+  `.default_tools_approval_mode="approve"` and `.enabled=true` before the
+  prompt, each value escaped as a TOML string.
 
-The client waits 60 s longer than the server holds a question, so the server's
-`timed_out` result arrives first. Neither launch passes `--strict-mcp-config` or
+The client waits 60 s longer than the server holds a call, so the server's
+result arrives first. claude holds its call until the question is answered or
+the gate timeout `T` ends it. codex holds one call 15 minutes (900 s) at most:
+the call then returns a `pending` result naming the question id, and codex
+calls `devflow_ask` again with that id, while the question stays open at its
+gate the whole time. codex's client timeout is therefore 16 minutes (960 s),
+not `T + 60`. `T` still counts from the question's first call: a question
+unanswered for `T` is closed as `timed_out` whether or not a call holds it.
+
+Token cost: the cap bounds each held codex call, not codex's polling. While it
+waits, codex polls the held call about every 21 s; one 15-minute hold was
+measured once at 1,346,920 input tokens (1,306,880 of them cached). So an
+unanswered codex question costs at least that per 15 minutes held, re-calls
+included, until it is answered or `T` ends it. Nothing past 15 minutes was
+measured. claude made no model request while waiting. Neither launch passes `--strict-mcp-config` or
 turns off a global server: your own MCP servers stay on, and DevFlow adds one
 server and removes none. The server name `devflow` is reserved for DevFlow; do
 not give one of your own servers that name. A global server that fails to start

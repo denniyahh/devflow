@@ -67,6 +67,13 @@ pub enum DriverHealth {
 /// client gives up on the call (Phase 53, D-03).
 pub const ASK_CLIENT_TIMEOUT_MARGIN_SECS: u64 = 60;
 
+/// The longest codex is held on one `devflow_ask` call, in seconds, before the
+/// server replies `pending` and codex calls again with the question's id
+/// (operator answer OD-1 (b), 2026-11-18: "about 15 min"). The spike measured
+/// codex polling a held call, so each held call costs tokens; claude made no
+/// model request while waiting and has no cap.
+pub const ASK_HOLD_CAP_SECS: u64 = 900;
+
 /// What one stage launch registers as the `devflow` MCP server (Phase 53, D-03):
 /// the runner's own binary, run as `__ask` for this run's phase and stage.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -584,6 +591,65 @@ mod tests {
                 "{name}: the conformance case disagrees"
             );
         }
+    }
+
+    /// OD-1 (b): of the drivers that register the server, only codex passes
+    /// `--hold-cap-secs`; claude's server gets the five `__ask` flags alone.
+    #[test]
+    fn only_codex_carries_a_hold_cap() {
+        let reg = AskRegistration {
+            exe: PathBuf::from("/usr/bin/devflow"),
+            project_root: PathBuf::from("/project"),
+            phase: PhaseId::new(7),
+            stage: Stage::Code,
+            timeout_secs: 120,
+            run_started_at: "2026-11-18T00:00:00Z".into(),
+            config_path: PathBuf::from("/project/.devflow/ask-07.mcp.json"),
+        };
+        let mut registered = Vec::new();
+        for kind in [
+            AgentKind::Claude,
+            AgentKind::Codex,
+            AgentKind::OpenCode,
+            AgentKind::Pi,
+            AgentKind::Antigravity,
+            AgentKind::Hermes,
+        ] {
+            let driver = driver_for(kind);
+            let Ok(wiring) = driver.ask_wiring(&reg) else {
+                continue;
+            };
+            registered.push(kind);
+            let file_text = wiring
+                .file
+                .as_ref()
+                .map(|(_, text)| text.as_str())
+                .unwrap_or("");
+            let carries_cap = wiring
+                .args
+                .iter()
+                .any(|arg| arg.contains("--hold-cap-secs"))
+                || file_text.contains("--hold-cap-secs");
+            assert_eq!(
+                carries_cap,
+                kind == AgentKind::Codex,
+                "{}: hold cap present = {carries_cap}: {wiring:?}",
+                driver.name()
+            );
+            if kind == AgentKind::Claude {
+                let config: serde_json::Value =
+                    serde_json::from_str(file_text).expect("claude's registration is JSON");
+                let args: Vec<String> =
+                    serde_json::from_value(config["mcpServers"]["devflow"]["args"].clone())
+                        .expect("claude's server args are strings");
+                assert_eq!(args, reg.server_args(), "claude's server args");
+            }
+        }
+        assert_eq!(
+            registered,
+            [AgentKind::Claude, AgentKind::Codex],
+            "the drivers that register the server"
+        );
     }
 
     #[test]
