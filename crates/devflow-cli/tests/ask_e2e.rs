@@ -628,3 +628,221 @@ fn a_late_server_cleanup_leaves_the_runners_replacement_gate() {
         "the replacement gate removed or replaced"
     );
 }
+
+/// The id of a second `devflow_ask` call.
+const SECOND_ID: u64 = 4;
+
+/// The id of a `ping` sent to order a test after the lines before it.
+const PING_ID: u64 = 9;
+
+/// The stage's open gate id, if its gate file exists.
+fn open_gate_id(fixture: &AskFixture) -> Option<String> {
+    let text = std::fs::read_to_string(fixture.gate_path()).ok()?;
+    let gate: Value = serde_json::from_str(&text).ok()?;
+    gate["gate_id"].as_str().map(str::to_string)
+}
+
+/// Answer the question gate `gate_id` with `option`.
+fn answer(fixture: &AskFixture, gate_id: &str, option: &str) {
+    gate(
+        fixture,
+        &["answer", "1", "--gate-id", gate_id, "--option", option],
+    );
+}
+
+/// The option `reply` carries.
+fn option_of(reply: &Value) -> &str {
+    reply["result"]["structuredContent"]["answer"]["option_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no option_id in the reply: {reply}"))
+}
+
+/// Watch for `NO_REPLY_WATCH` that the stage's gate stays `first` and only one
+/// question has been asked.
+fn assert_only_the_first_gate_stays(fixture: &AskFixture, first: &str) {
+    let started = Instant::now();
+    while started.elapsed() < NO_REPLY_WATCH {
+        let open = open_gate_id(fixture);
+        assert_eq!(
+            open.as_deref(),
+            Some(first),
+            "second gate opened early: the stage's gate is now {open:?}"
+        );
+        let asked = fixture.events_named("question_asked").len();
+        assert_eq!(asked, 1, "two gates open: {asked} question_asked events");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Wait for a gate other than `previous` to open, and return its id.
+fn wait_for_next_gate_id(fixture: &AskFixture, previous: &str) -> String {
+    let started = Instant::now();
+    loop {
+        if let Some(open) = open_gate_id(fixture)
+            && open != previous
+        {
+            return open;
+        }
+        assert!(
+            started.elapsed() < ENDING_WAIT,
+            "no gate opened after `{previous}` closed"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Answer the queued question's gate and check each reply carries its own answer.
+fn answer_both_in_turn(fixture: &AskFixture, first: &str, replies: [(&AskClient, u64); 2]) {
+    answer(fixture, first, "budget-120");
+    let [(first_client, first_id), (second_client, second_id)] = replies;
+    let reply = first_client
+        .reply(first_id, REPLY_WAIT)
+        .expect("the first call replies once answered");
+    assert_eq!(option_of(&reply), "budget-120", "{reply}");
+    let second = wait_for_next_gate_id(fixture, first);
+    assert_ne!(second, first, "a reused gate id");
+    answer(fixture, &second, "budget-300");
+    let reply = second_client
+        .reply(second_id, REPLY_WAIT)
+        .expect("the second call replies once answered");
+    assert_eq!(option_of(&reply), "budget-300", "{reply}");
+}
+
+#[test]
+fn a_second_call_waits_for_the_first_question_to_close() {
+    let fixture = AskFixture::new(Stage::Code);
+    let mut client = AskClient::spawn(&fixture);
+    client.handshake();
+    client.ask(CALL_ID, "First question", &OPTIONS);
+    let first = fixture.wait_for_gate_id();
+    client.ask(SECOND_ID, "Second question", &OPTIONS);
+    assert_only_the_first_gate_stays(&fixture, &first);
+    answer_both_in_turn(&fixture, &first, [(&client, CALL_ID), (&client, SECOND_ID)]);
+}
+
+#[test]
+fn a_second_server_on_the_same_stage_waits_for_the_ask_lock() {
+    let fixture = AskFixture::new(Stage::Code);
+    let mut first_client = AskClient::spawn(&fixture);
+    first_client.handshake();
+    first_client.ask(CALL_ID, "First question", &OPTIONS);
+    let first = fixture.wait_for_gate_id();
+    let mut second_client = AskClient::spawn(&fixture);
+    second_client.handshake();
+    second_client.ask(CALL_ID, "Second question", &OPTIONS);
+    assert_only_the_first_gate_stays(&fixture, &first);
+    answer_both_in_turn(
+        &fixture,
+        &first,
+        [(&first_client, CALL_ID), (&second_client, CALL_ID)],
+    );
+}
+
+#[test]
+fn a_cancelled_queued_call_never_opens_a_gate() {
+    let fixture = AskFixture::new(Stage::Code);
+    let mut client = AskClient::spawn(&fixture);
+    client.handshake();
+    client.ask(CALL_ID, "First question", &OPTIONS);
+    let first = fixture.wait_for_gate_id();
+    client.ask(SECOND_ID, "Second question", &OPTIONS);
+    client.cancel(json!(SECOND_ID));
+    // The reader handles lines in order: once the ping is answered, the cancel was read.
+    client.request(PING_ID, "ping", json!({}));
+    client
+        .reply(PING_ID, ENDING_WAIT)
+        .expect("the ping is answered");
+    answer(&fixture, &first, "budget-120");
+    let reply = client
+        .reply(CALL_ID, REPLY_WAIT)
+        .expect("the first call replies once answered");
+    assert_eq!(option_of(&reply), "budget-120", "{reply}");
+    assert!(
+        client.reply(SECOND_ID, NO_REPLY_WATCH).is_none(),
+        "a reply sent for the cancelled queued call"
+    );
+    let asked = fixture.events_named("question_asked");
+    assert_eq!(
+        asked.len(),
+        1,
+        "a question_asked for the cancelled queued call: {asked:?}"
+    );
+    assert!(
+        !fixture.gate_path().exists(),
+        "the cancelled queued call opened a gate"
+    );
+}
+
+#[test]
+fn a_queued_call_whose_time_runs_out_opens_no_gate() {
+    let fixture = AskFixture::new(Stage::Code);
+    let mut client = AskClient::spawn_with(
+        &fixture,
+        AskOverrides {
+            timeout_secs: Some(2),
+            ..AskOverrides::default()
+        },
+    );
+    client.handshake();
+    let sent = Instant::now();
+    client.ask(CALL_ID, "First question", &OPTIONS);
+    client.ask(SECOND_ID, "Second question", &OPTIONS);
+    for id in [CALL_ID, SECOND_ID] {
+        let reply = client.reply(id, ENDING_WAIT).expect("each call replies");
+        let text = error_text(&reply);
+        assert!(
+            text.starts_with("devflow_ask closed: timed_out"),
+            "call {id}: the `devflow_ask closed:` prefix: {text}"
+        );
+    }
+    let elapsed = sent.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "a queued call still waiting after its deadline: both replies took {elapsed:?}"
+    );
+    let asked = fixture.events_named("question_asked");
+    assert_eq!(
+        asked.len(),
+        1,
+        "a question_asked for the timed-out queued call: {asked:?}"
+    );
+    assert!(!fixture.gate_path().exists(), "a second gate file appeared");
+}
+
+#[test]
+fn a_call_waiting_on_another_servers_ask_lock_times_out() {
+    let fixture = AskFixture::new(Stage::Code);
+    let mut first_client = AskClient::spawn(&fixture);
+    first_client.handshake();
+    first_client.ask(CALL_ID, "First question", &OPTIONS);
+    let first = fixture.wait_for_gate_id();
+    let mut second_client = AskClient::spawn_with(
+        &fixture,
+        AskOverrides {
+            timeout_secs: Some(2),
+            ..AskOverrides::default()
+        },
+    );
+    second_client.handshake();
+    let sent = Instant::now();
+    second_client.ask(CALL_ID, "Second question", &OPTIONS);
+    let reply = second_client
+        .reply(CALL_ID, Duration::from_secs(4))
+        .unwrap_or_else(|| panic!("no reply within 4 s ({:?})", sent.elapsed()));
+    let text = error_text(&reply);
+    assert!(
+        text.starts_with("devflow_ask closed: timed_out"),
+        "the `devflow_ask closed:` prefix: {text}"
+    );
+    assert_eq!(
+        open_gate_id(&fixture).as_deref(),
+        Some(first.as_str()),
+        "the waiting call opened a gate"
+    );
+    let asked = fixture.events_named("question_asked");
+    assert_eq!(
+        asked.len(),
+        1,
+        "a question_asked for the call that never got the ask lock: {asked:?}"
+    );
+}
