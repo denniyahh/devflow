@@ -5,16 +5,16 @@ milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: 53
 current_phase_name: The Question Channel
 status: executing
-stopped_at: Completed 53-03-PLAN.md
-last_updated: "2026-11-19T13:57:58.462Z"
+stopped_at: Completed 53-12-PLAN.md
+last_updated: "2026-11-19T14:13:09.288Z"
 last_activity: 2026-11-19
 last_activity_desc: Phase 53 execution started
-state_head: 61f1e9df1a781351134c34cdc30d140554366050
+state_head: 9e155ced06aeccee0be2ca38589b0288773a37df
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 80
-  completed_plans: 69
+  completed_plans: 70
   percent: 17
 ---
 
@@ -172,7 +172,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 53 (The Question Channel) — EXECUTING
-Plan: 4 of 14
+Plan: 5 of 14
 Status: Ready to execute
 Last activity: 2026-11-19 — Phase 53 execution started
 
@@ -1008,6 +1008,8 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 53]: 53-02: a second answer or close for one question_id is shown as ignored in devflow history; only the first resolution applies
 - [Phase 53]: 53-03: a failed stage declaring checkpoint: blocking-human opens the stage failure gate naming devflow_ask, for every agent and stage; Validate bypasses the fix loop (D-13, review concern 12)
 - [Phase 53]: 53-03: checkpoint auto-decide relaunch and its four devflow-core readers deleted (D-12); rescan_gate_context deleted too, CheckpointDeclaration gate kind still goes in 53-10
+- [Phase 53]: 53-12: failover_e2e handoff tests run supervised on claude and codex; the fixture commits a CONTEXT.md so a codex primary passes the codex interactivity preflight
+- [Phase 53]: 53-12: deleted hermes and antigravity e2e launch tests; their properties are pinned by the codex capture-shape tests and agents::antigravity driver tests
 
 ## Roadmap Evolution
 
@@ -1188,11 +1190,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 53 P01 | 28min | 3 tasks | 13 files |
 | Phase 53 P02 | 6min | 2 tasks | 2 files |
 | Phase 53 P03 | 78min | 2 tasks | 8 files |
+| Phase 53 P12 | 13min | 2 tasks | 4 files |
 
 ## Session
 
-**Last session:** 2026-11-19T13:57:57.251Z
-**Stopped at:** Completed 53-03-PLAN.md
+**Last session:** 2026-11-19T14:13:07.964Z
+**Stopped at:** Completed 53-12-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
