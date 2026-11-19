@@ -58,7 +58,7 @@ Filled by the planner per task. Requirement → test map from research:
 | ASK-02 | notify fires, `notify_fired` recorded | e2e | `ask_e2e::a_question_fires_the_notify_hook_and_records_notify_fired` | notify disabled → no marker | ✅ | ✅ green |
 | ASK-03 | positional self-resolution gone; prompts name `devflow_ask` | unit (core) | `prompt::tests::no_prompt_template_carries_positional_self_resolution`, `prompt::tests::every_stage_prompt_routes_questions_through_devflow_ask` | planted copy must trip with the intended message | ✅ | ✅ green |
 | ASK-04 | events + history rows | e2e / unit (core) | inside ASK-01 e2e; `history::tests::an_open_question_renders_not_yet_answered` | run with no questions has no rows | ✅ | ✅ green |
-| ASK-05 | blocking-human checkpoint answered in same session; runner backstop | e2e / unit (cli) | `ask_e2e::a_blocking_human_checkpoint_continues_in_the_same_session`, `pipeline_launch::tests::an_agent_exit_closes_its_stage_question_gate` | one Code `stage_launched`, zero `checkpoint_auto_decided` | ✅ | ✅ green |
+| ASK-05 | blocking-human checkpoint answered in same session; runner backstop | e2e / unit (cli) | `ask_checkpoint_e2e::a_blocking_human_checkpoint_continues_in_the_same_session`, `pipeline_launch::tests::an_agent_exit_closes_its_stage_question_gate` | one Code `stage_launched`, zero `checkpoint_auto_decided` | ✅ | ✅ green |
 
 *Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky*
 
@@ -107,7 +107,7 @@ pi has no row here: on 53-14's BUILD verdict its proof is the registration spike
 - [x] Feedback latency < 300s
 - [x] `nyquist_compliant: true` set in frontmatter
 
-**Approval:** validated 2026-11-19 by /gsd-validate-phase 53 (all 13 map rows green: 50 tests in one `cargo nextest run --workspace --no-tests=fail` run, 50 passed; M1 to M4 stay manual-only for close-out)
+**Approval:** validated 2026-11-19 by /gsd-validate-phase 53 (all 13 map rows green; re-run at the phase head: the 25 named map tests, 25 passed, the checkpoint test run under its real binary `ask_checkpoint_e2e`; M1 to M4 stay manual-only for close-out)
 
 ## Validation Audit 2026-11-19
 
@@ -116,3 +116,12 @@ pi has no row here: on 53-14's BUILD verdict its proof is the registration spike
 | Gaps found | 0 |
 | Resolved | 0 |
 | Escalated | 0 |
+
+## Validation Audit 2026-11-19
+
+| Metric | Count |
+|---|---|
+| Gaps found | 0 |
+| Resolved | 0 |
+| Escalated | 0 |
+| Map corrections | 1 |
