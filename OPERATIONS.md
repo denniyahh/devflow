@@ -97,6 +97,56 @@ any agent process starts, with a message naming the agent and `devflow_ask`.
 Their registrations are backlog 999.248. `devflow discard --phase N` removes the
 phase's `.devflow/ask-NN.mcp.json`.
 
+## Question events
+
+Each question leaves its record in `.devflow/events.jsonl`. Every line has the
+usual `v`, `ts`, `phase` and `event` fields, and these:
+
+| Event | When | Fields |
+|---|---|---|
+| `question_asked` | the question's gate opened | `stage`, `question_id`, `gate_id`, `kind` (`decision`, `blocking-human` or `discuss`), `question`, `options` (each `{id, label, description?}`), `context`, `recommended` |
+| `question_answered` | `gate answer` reached the agent | `stage`, `question_id`, `gate_id`, `answer` (`{option_id}` or `{text}`), `policy` (always `operator_via_gate`), `answered_by` |
+| `question_closed` | the question ended without an answer | `stage`, `question_id`, `gate_id`, `reason`, `closed_by` (the responder for `aborted_by_operator`, otherwise null) |
+
+The `question_closed` reasons:
+
+- `cancelled_by_client`: the agent cancelled the call.
+- `client_disconnected`: the agent's connection to the server ended.
+- `terminated`: the server was sent SIGTERM or SIGINT.
+- `run_stopped`: the run was stopped.
+- `runner_gone`: the run's runner was no longer live.
+- `timed_out`: no answer came within the gate timeout.
+- `aborted_by_operator`: `gate abort`.
+- `agent_exited`: the runner closed a question gate the stage's agent left
+  open.
+- `closed_on_resume`: `devflow resume` closed a leftover question gate.
+
+A question has a `question_answered` or a `question_closed`, never both, so an
+aborted question has a `question_closed` and no `question_answered`. `devflow
+history` pairs the three events by `question_id`, and shows `not yet answered`
+for a question that is still open.
+
+**Abort.** `gate abort` on a question ends the run. The question server records
+the abort in the run state (`abort_requested`) before it closes the gate, then
+tells the agent the question closed with `aborted_by_operator`. Once the agent
+exits, the runner ends the run the way any gate abort does: one
+`workflow_aborted` event, no saved state left, and no further stage launched.
+The abort removes the state file, so no later `start` or `resume` aborts
+again.
+
+**A question its agent left open.** A killed server cannot close its gate.
+After every agent exit, the runner closes a question gate still open at the
+stage and records `question_closed` with `agent_exited`. If you answered that
+gate with `gate abort` before the server read it, the runner applies the abort
+instead: it records `aborted_by_operator` and ends the run. `devflow resume`
+records `closed_on_resume` for a leftover question gate before it closes it,
+and reports any answer it sets aside; the rerun asks again. Neither path
+touches a gate of any other kind.
+
+**What is stored.** `question_asked` keeps each question's full text, options
+and context in `.devflow/events.jsonl`. That file stays on this machine,
+in the project's `.devflow/` directory. It is also the record Phase 54 reads its question corpus from.
+
 ## Run shape
 
 Every run is a systemd user unit named from the project and the phase,
