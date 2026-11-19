@@ -5,16 +5,16 @@ milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: 53
 current_phase_name: The Question Channel
 status: executing
-stopped_at: Completed 53-05-PLAN.md
-last_updated: "2026-11-19T14:51:03.512Z"
+stopped_at: Completed 53-06-PLAN.md
+last_updated: "2026-11-19T15:05:20.056Z"
 last_activity: 2026-11-19
 last_activity_desc: Phase 53 execution started
-state_head: fe5ebffab9e9b94c7be650b83bcfe0dff79e1cd5
+state_head: c14bc94650c0c27499280a7ef4df784369db6d37
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 80
-  completed_plans: 72
+  completed_plans: 73
   percent: 17
 ---
 
@@ -172,7 +172,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 53 (The Question Channel) — EXECUTING
-Plan: 7 of 14
+Plan: 8 of 14
 Status: Ready to execute
 Last activity: 2026-11-19 — Phase 53 execution started
 
@@ -1015,6 +1015,8 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 53]: 53-05: a JSON null optional field (context, recommended, description) reads as absent; a wrong-typed one is refused naming the field
 - [Phase 53]: 53-05: whitespace-only option ids are refused like a blank question; recommended has no own bound since it must equal an offered id
 - [Phase 53]: 53-05: kind is parsed through QuestionKind's serde wire names so accepted strings track the enum
+- [Phase 53]: 53-06: pinned checkpoint sentences moved under a new '## Operator-only checkpoints' heading; the old 'must not pause' sentence deleted as contradicting devflow_ask
+- [Phase 53]: 53-06: checkpoint declaration closes with 'not for a gate the operator answered'
 
 ## Roadmap Evolution
 
@@ -1198,11 +1200,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 53 P12 | 13min | 2 tasks | 4 files |
 | Phase 53 P04 | 19min | 3 tasks | 4 files |
 | Phase 53 P05 | 70min | 2 tasks | 3 files |
+| Phase 53 P06 | 11min | 2 tasks | 8 files |
 
 ## Session
 
-**Last session:** 2026-11-19T14:51:02.242Z
-**Stopped at:** Completed 53-05-PLAN.md
+**Last session:** 2026-11-19T15:05:18.835Z
+**Stopped at:** Completed 53-06-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
