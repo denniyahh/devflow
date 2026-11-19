@@ -63,6 +63,40 @@ tool, `devflow_ask`. A call opens a `question` gate at the stage's
 `.devflow/gates/NN-<stage>.json` and returns once the operator answers it with
 `devflow gate answer`. Never run it by hand.)
 
+## How a stage agent reaches `devflow_ask`
+
+Every stage launch (Plan, Code, Validate) of claude or codex registers the
+server for that launch only. DevFlow never writes `~/.claude.json` or
+`~/.codex/config.toml`. The server is the runner's own binary, run as
+`__ask --project <root> --phase <N> --stage <stage> --timeout-secs <T>
+--run-started-at <started_at>`, where `T` is the gate timeout
+(`DEVFLOW_GATE_TIMEOUT_SECS`, three days by default).
+
+- **claude**: DevFlow writes `.devflow/ask-NN.mcp.json`, one line holding one
+  stdio server named `devflow`, and appends `--mcp-config <that file>` as the
+  last two arguments. The server's `timeout` is `(T + 60) * 1000` ms.
+- **codex**: DevFlow passes `-c mcp_servers.devflow.command`, `.args`,
+  `.tool_timeout_sec=<T + 60>`, `.default_tools_approval_mode="approve"` and
+  `.enabled=true` before the prompt, each value escaped as a TOML string.
+
+The client waits 60 s longer than the server holds a question, so the server's
+`timed_out` result arrives first. Neither launch passes `--strict-mcp-config` or
+turns off a global server: your own MCP servers stay on, and DevFlow adds one
+server and removes none. The server name `devflow` is reserved for DevFlow; do
+not give one of your own servers that name. A global server that fails to start
+is the agent's own startup error, as it is outside DevFlow.
+
+Because the server is the runner's own binary, reinstalling DevFlow while a run
+is live can leave the binary path pointing at a removed or changed file. The
+tool is then unavailable, and the agent falls back to reporting the checkpoint
+in its result.
+
+opencode, pi, hermes and antigravity have no registration yet, so `devflow
+start`, `resume`, a fallback handoff and every stage launch refuse them before
+any agent process starts, with a message naming the agent and `devflow_ask`.
+Their registrations are backlog 999.248. `devflow discard --phase N` removes the
+phase's `.devflow/ask-NN.mcp.json`.
+
 ## Run shape
 
 Every run is a systemd user unit named from the project and the phase,
@@ -191,6 +225,7 @@ worktree, a feature branch, or `.devflow/` state):
 | Check | Condition | Operator action |
 |---|---|---|
 | Agent binary present | The agent's executable (`claude`/`codex`/`opencode`) is not found on `PATH` | Install the agent, or run `devflow doctor` |
+| Agent can see `devflow_ask` (Phase 53) | `--agent` or `--fallback-agent` is opencode, pi, hermes or antigravity, which have no MCP registration (backlog 999.248) | Use `--agent claude` or `--agent codex` |
 | Phase reachable from `develop` (23f) | Phase N's `### Phase N:` ROADMAP heading or its `.planning/phases/NN-*/` directory is missing from `develop` — skipped entirely if `develop` has no `.planning/ROADMAP.md` at all | Merge the branch carrying the phase's planning artifacts into `develop`, then re-run |
 | Codex headless Plan | `--agent codex` and phase N has no `-CONTEXT.md` on `develop` — Codex's `exec` mode cannot run the discuss-phase interview headlessly, so its Plan stage needs CONTEXT.md to exist | Run `/gsd-discuss-phase N` interactively first (any agent), or use `--agent claude` |
 
@@ -687,6 +722,8 @@ command. The coding agent never receives the variable.
 | `.gates-NN.lock` | The per-phase gate lock: held for a few file operations, never removed |
 | `.holder-NN` | D-17 foreground holder: held by a foreground verb for its lifetime (a `start` or `resume` until its unit is launched, a `discard`), recording its pid and start time. `stop` refuses while it is held and no runner is live, and never signals it; never removed by `discard` |
 | `supervisor-<launch_id>.live` | An older build's launch reservation; no current build writes one, since a launch takes no reservation (D-07). No DevFlow verb reads or removes an abandoned one (D-06) |
+| `ask-NN.mcp.json` | The phase's claude `devflow_ask` registration, rewritten at each stage launch; removed by `devflow discard --phase N` |
+| `.ask-NN-<stage>` | The stage's ask lock: held by an `__ask` server while one question of the stage is open, so two servers never open questions on the same stage at once; never removed |
 | `*.hold-tmp` | A hold being taken, here or under `gates/`. An orphan is removed by `devflow discard --phase N` when phase N has one |
 | `phase-NN-stdout` / `phase-NN-stderr.log` | Agent capture files (what `logs` tails) |
 | `phase-NN-exit` / `phase-NN-agent-pid` | Exit code + PID the supervisor records |
