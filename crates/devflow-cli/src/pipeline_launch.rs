@@ -42,7 +42,6 @@ use devflow_core::stop::{
 };
 use devflow_core::{agent_result, agents, canary, events, gsd_config, mode, monitor, workflow};
 use std::path::{Path, PathBuf};
-#[cfg(test)]
 use std::time::Duration;
 use tracing::{info, warn};
 
@@ -1611,6 +1610,11 @@ fn runner_stage_spec(launch: StageLaunch) -> monitor::StageSpec {
         .unwrap_or_else(|| state.project_root.clone());
     spec.args = args;
     spec.envs = extra_env;
+    // An open question holds the idle window for at most one capped call plus
+    // its client margin of silence (OD-1 (b), review concern 13).
+    spec.question_wait = Some(Duration::from_secs(
+        agents::ASK_HOLD_CAP_SECS + agents::ASK_CLIENT_TIMEOUT_MARGIN_SECS,
+    ));
     spec
 }
 
@@ -10104,5 +10108,36 @@ mod tests {
             Vec::<String>::new(),
             "production spawn_monitor( sites"
         );
+    }
+
+    /// OD-1 (b), production value: every runner stage lets an open question
+    /// hold the idle window for 960 s of silence, the codex cap plus its margin.
+    #[test]
+    fn the_runner_bounds_a_question_hold_by_the_hold_cap() {
+        let root = Path::new("/work/project");
+        for stage in [Stage::Plan, Stage::Code, Stage::Validate] {
+            let mut state = State::new(
+                PhaseId::new(7),
+                AgentKind::Claude,
+                Mode::Auto,
+                root.to_path_buf(),
+            );
+            state.stage = stage;
+            let spec = runner_stage_spec(StageLaunch {
+                state,
+                program: "claude".to_string(),
+                args: Vec::new(),
+                extra_env: Vec::new(),
+                archived_stage: None,
+                launch: StageShape::Capture,
+                relaunch: None,
+            });
+            assert_eq!(spec.stage, Some(stage), "{stage}");
+            assert_eq!(
+                spec.question_wait,
+                Some(Duration::from_secs(960)),
+                "{stage}: the question hold's bound"
+            );
+        }
     }
 }
