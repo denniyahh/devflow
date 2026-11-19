@@ -179,4 +179,59 @@ mod tests {
              would leave the sequencing gate with no pre-31 shape: {args:?}"
         );
     }
+
+    fn ask_registration() -> crate::agents::AskRegistration {
+        crate::agents::AskRegistration {
+            exe: std::path::PathBuf::from("/opt/bin/devflow"),
+            project_root: std::path::PathBuf::from("/work/project"),
+            phase: PhaseId::new(7),
+            stage: crate::stage::Stage::Code,
+            timeout_secs: 120,
+            run_started_at: "2026-11-18T00:00:00Z".into(),
+            config_path: std::path::PathBuf::from("/work/project/.devflow/ask-07.mcp.json"),
+        }
+    }
+
+    /// D-03: claude reads the server from a per-launch `--mcp-config` file
+    /// appended last, whose one server `devflow` runs the runner's own binary
+    /// as `__ask` and lets a call wait the gate timeout plus the margin.
+    #[test]
+    fn launch_args_name_the_ask_registration() {
+        let reg = ask_registration();
+        let wiring = ClaudeDriver
+            .ask_wiring(&reg)
+            .expect("claude registers the server");
+        assert_eq!(
+            wiring.args,
+            ["--mcp-config", "/work/project/.devflow/ask-07.mcp.json"]
+        );
+        assert_eq!(wiring.placement, crate::agents::ArgPlacement::Append);
+        let (path, text) = wiring.file.expect("claude writes a registration file");
+        assert_eq!(path, reg.config_path);
+        assert!(!text.contains('\n'), "one line: {text}");
+        let config: serde_json::Value = serde_json::from_str(&text).expect("the file is JSON");
+        let servers = config["mcpServers"].as_object().expect("mcpServers");
+        assert_eq!(servers.len(), 1, "one server: {text}");
+        let server = &servers["devflow"];
+        assert_eq!(server["type"], "stdio", "{text}");
+        assert_eq!(server["command"], "/opt/bin/devflow", "{text}");
+        assert_eq!(
+            server["args"],
+            serde_json::json!([
+                "__ask",
+                "--project",
+                "/work/project",
+                "--phase",
+                "7",
+                "--stage",
+                "code",
+                "--timeout-secs",
+                "120",
+                "--run-started-at",
+                "2026-11-18T00:00:00Z"
+            ]),
+            "{text}"
+        );
+        assert_eq!(server["timeout"], (120 + 60) * 1000, "timeout ms: {text}");
+    }
 }
