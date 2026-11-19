@@ -3064,18 +3064,30 @@ fn status_state_lines(
     state: &State,
     summary: Option<events::PhaseEventSummary>,
 ) -> Vec<String> {
-    let gate = if state.gate_pending {
-        "pending"
+    let question = if state.gate_pending {
+        None
     } else {
-        "none"
+        open_question_gate_id(project_root, state.phase, state.stage)
     };
-    let mut lines = vec![
-        format!(
-            "  stage: {} | mode: {} | gate: {gate}",
-            state.stage, state.mode
-        ),
-        format!("  agent: {}", agents::driver_for(state.agent).name()),
-    ];
+    let gate = match (state.gate_pending, &question) {
+        (true, _) => "pending".to_string(),
+        (false, Some(gate_id)) => format!("question {gate_id}"),
+        (false, None) => "none".to_string(),
+    };
+    let mut lines = vec![format!(
+        "  stage: {} | mode: {} | gate: {gate}",
+        state.stage, state.mode
+    )];
+    if let Some(gate_id) = &question {
+        lines.push(format!(
+            "  answer: {}",
+            question_answer_line(state.phase, gate_id)
+        ));
+    }
+    lines.push(format!(
+        "  agent: {}",
+        agents::driver_for(state.agent).name()
+    ));
     if state.consecutive_failures > 0 {
         lines.push(format!(
             "  validate failures: {}",
@@ -3106,6 +3118,28 @@ fn status_state_lines(
         ));
     }
     lines
+}
+
+/// The id of the question gate open at `phase`'s `stage`, if one is (review
+/// concern 10): the `__ask` server opens it, so `gate_pending` stays false. A
+/// gate file that cannot be read as a question reads as none, with a warning.
+fn open_question_gate_id(project_root: &Path, phase: PhaseId, stage: Stage) -> Option<GateId> {
+    let gate = Gates::list_open(project_root)
+        .into_iter()
+        .find(|gate| gate.phase == phase && gate.stage == stage)?;
+    match Gates::read_question(project_root, phase, stage) {
+        Ok(Some(_)) => GateId::parse(&gate.gate_id).ok(),
+        Ok(None) => None,
+        Err(error) => {
+            tracing::warn!(
+                %phase,
+                %stage,
+                %error,
+                "the open gate could not be read as a question gate; status shows gate: none"
+            );
+            None
+        }
+    }
 }
 
 /// The characters of a gate's context the pending-gate banner, `devflow gate
@@ -4003,6 +4037,26 @@ fn sweep_one_gate(
             return Ok(SweepStep::Skipped);
         }
     };
+    // Review concern 11: a question gate ends at the `__ask` server's own
+    // timeout, by `gate answer` or by `gate abort`; a sweep abort would end the
+    // run on a question the operator may still answer.
+    match Gates::read_question(project_root, phase, stage) {
+        Ok(Some(_)) => {
+            println!(
+                "left phase {phase} {stage} alone at {at} — a question gate; it ends at its own \
+                 timeout, by gate answer or by gate abort"
+            );
+            return Ok(SweepStep::LeftAlone);
+        }
+        Ok(None) => {}
+        Err(err) => {
+            println!(
+                "left phase {phase} {stage} alone at {at} — its gate file could not be read as a \
+                 question gate ({err}); not reaped"
+            );
+            return Ok(SweepStep::LeftAlone);
+        }
+    }
     let waiter_live = waiter_is_live(project_root, phase, stage, &observed);
     if waiter_live && rate_limit_gate_still_waits(gate.not_before, now) {
         println!(
@@ -7923,7 +7977,10 @@ mod tests {
 
         for (kind, note) in [
             (GateAnswerKind::Approve, None),
-            (GateAnswerKind::Reject, Some("take the other option".to_string())),
+            (
+                GateAnswerKind::Reject,
+                Some("take the other option".to_string()),
+            ),
         ] {
             let err = gate_respond_report(
                 root,
@@ -10473,9 +10530,11 @@ mod tests {
             .unwrap()
             .as_secs();
         let path = Gates::gate_path(root, phase, stage);
-        let mut gate: GateFile =
+        // Through a JSON value, so keys `GateFile` does not name (a question
+        // gate's `question`) survive the rewrite.
+        let mut gate: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        gate.timestamp = now.saturating_sub(age_secs).to_string();
+        gate["timestamp"] = serde_json::Value::from(now.saturating_sub(age_secs).to_string());
         std::fs::write(path, serde_json::to_string_pretty(&gate).unwrap()).unwrap();
     }
 
