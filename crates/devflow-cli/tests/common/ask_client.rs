@@ -100,6 +100,31 @@ impl AskFixture {
         Gates::gate_path(self.root(), self.phase, self.stage)
     }
 
+    /// Load the saved state, apply `edit` and save it again.
+    pub fn edit_state(&self, edit: impl FnOnce(&mut State)) {
+        let mut state = devflow_core::workflow::load_state(self.root(), self.phase)
+            .expect("load the fixture's run state");
+        edit(&mut state);
+        devflow_core::workflow::save_state(&state).expect("save the fixture's run state");
+    }
+
+    /// Every line of the project's `events.jsonl`, parsed.
+    pub fn events(&self) -> Vec<Value> {
+        std::fs::read_to_string(devflow_core::events::events_path(self.root()))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("every event line is JSON"))
+            .collect()
+    }
+
+    /// The events named `event`, in log order.
+    pub fn events_named(&self, event: &str) -> Vec<Value> {
+        self.events()
+            .into_iter()
+            .filter(|line| line["event"] == event)
+            .collect()
+    }
+
     /// The id of the stage's open gate, waiting for its file to appear.
     pub fn wait_for_gate_id(&self) -> String {
         wait_for(
@@ -154,6 +179,8 @@ impl AskClient {
             .args(["--stage", &fixture.stage().to_string()])
             .args(["--timeout-secs", &timeout_secs.to_string()])
             .args(["--run-started-at", &run_started_at])
+            // The hook a test means comes from the saved state alone.
+            .env_remove(devflow_core::gates::GATE_NOTIFY_CMD_ENV)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())

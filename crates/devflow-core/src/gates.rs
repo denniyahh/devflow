@@ -2030,9 +2030,15 @@ fn run_notify_command(cmd: &str, phase: PhaseId, stage: Stage, context: &str, un
         stage,
         context,
         unexpected,
+        NOTIFY_HOOK_TIMEOUT,
+        &|| false,
         &mut std::io::stderr(),
     );
 }
+
+/// How long one run of the gate notify hook may take before DevFlow kills its
+/// process group: no hook can hold up a gate or a question.
+pub const NOTIFY_HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// [`run_notify_command`], writing the line for a failed hook to `err`: a
 /// failing hook is the operator's notification channel going quiet.
@@ -2042,6 +2048,8 @@ fn run_notify_command_to(
     stage: Stage,
     context: &str,
     unexpected: bool,
+    _timeout: Duration,
+    _cancel: &dyn Fn() -> bool,
     err: &mut dyn std::io::Write,
 ) {
     let output = Command::new("sh")
@@ -3640,6 +3648,8 @@ mod tests {
             Stage::Validate,
             "ctx",
             false,
+            NOTIFY_HOOK_TIMEOUT,
+            &|| false,
             &mut sink,
         );
         let text = String::from_utf8(sink).unwrap();
@@ -3660,9 +3670,133 @@ mod tests {
             Stage::Validate,
             "ctx",
             false,
+            NOTIFY_HOOK_TIMEOUT,
+            &|| false,
             &mut sink,
         );
         assert!(sink.is_empty());
+    }
+
+    /// A hook that backgrounds a `sleep` and waits on it, recording the
+    /// sleep's pid in `pidfile`.
+    fn never_exiting_hook(pidfile: &Path) -> String {
+        format!("sleep 600 & echo $! > '{}'; wait", pidfile.display())
+    }
+
+    /// Run `hook` with `timeout` and `cancel` on a thread, returning what it
+    /// wrote to its error sink, or `None` when it has not returned within
+    /// `within`. On `None` the backgrounded sleep in `pidfile` is killed, so a
+    /// failing run does not leave it behind.
+    fn run_hook_within(
+        hook: String,
+        timeout: Duration,
+        cancel: impl Fn() -> bool + Send + 'static,
+        within: Duration,
+        pidfile: &Path,
+    ) -> Option<String> {
+        let (sent, returned) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut sink = Vec::new();
+            run_notify_command_to(
+                &hook,
+                PhaseId::new(11),
+                Stage::Code,
+                "ctx",
+                false,
+                timeout,
+                &cancel,
+                &mut sink,
+            );
+            let _ = sent.send(String::from_utf8(sink).unwrap());
+        });
+        let text = returned.recv_timeout(within).ok();
+        if text.is_none() {
+            if let Some(pid) = read_pid(pidfile) {
+                // SAFETY: kill has no memory preconditions; the pid is the
+                // test's own backgrounded sleep.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        }
+        text
+    }
+
+    fn read_pid(pidfile: &Path) -> Option<i32> {
+        std::fs::read_to_string(pidfile).ok()?.trim().parse().ok()
+    }
+
+    /// Whether `pid` is gone or a zombie: a CI job container's PID 1 never
+    /// reaps, so a killed orphan may stay as `Z`.
+    fn gone_or_zombie(pid: i32) -> bool {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => true,
+            Ok(stat) => stat
+                .rsplit_once(')')
+                .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')),
+        }
+    }
+
+    #[test]
+    fn a_notify_hook_that_never_exits_is_killed_at_its_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("sleep.pid");
+        let text = run_hook_within(
+            never_exiting_hook(&pidfile),
+            Duration::from_secs(1),
+            || false,
+            Duration::from_secs(3),
+            &pidfile,
+        )
+        .expect("the hook runner returned within 3 s of a 1 s bound");
+        assert!(
+            text.contains("did not finish within 1 s"),
+            "the failure line names the timeout: {text:?}"
+        );
+        let pid = read_pid(&pidfile).expect("the hook recorded its sleep's pid");
+        let started = std::time::Instant::now();
+        while !gone_or_zombie(pid) && started.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            gone_or_zombie(pid),
+            "the hook's backgrounded sleep {pid} is still alive"
+        );
+
+        // Control: a hook that exits at once, under the same bound.
+        let started = std::time::Instant::now();
+        let control = run_hook_within(
+            "true".to_string(),
+            Duration::from_secs(1),
+            || false,
+            Duration::from_secs(3),
+            &pidfile,
+        )
+        .expect("a hook that exits returns");
+        assert!(
+            started.elapsed() < Duration::from_millis(900),
+            "a hook that exits returns at once, not at the bound"
+        );
+        assert!(control.is_empty(), "no failure line: {control:?}");
+    }
+
+    #[test]
+    fn a_cancelled_notify_hook_is_killed_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("sleep.pid");
+        let started = std::time::Instant::now();
+        let text = run_hook_within(
+            never_exiting_hook(&pidfile),
+            Duration::from_secs(30),
+            move || started.elapsed() >= Duration::from_millis(500),
+            Duration::from_secs(2),
+            &pidfile,
+        )
+        .expect("a cancelled hook runner returned within 2 s");
+        assert!(text.contains("cancel"), "the line names the cancel: {text:?}");
+    }
+
+    #[test]
+    fn the_notify_hook_bound_is_thirty_seconds() {
+        assert_eq!(NOTIFY_HOOK_TIMEOUT, Duration::from_secs(30));
     }
 
     #[test]
