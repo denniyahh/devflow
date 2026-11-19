@@ -14131,6 +14131,36 @@ mod tests {
         result.expect("the start the refusal names launches");
     }
 
+    /// Review concern 9: `discard` removes the phase's `devflow_ask` registration
+    /// file with its other debris. Control: another phase's registration stays.
+    #[test]
+    fn discard_removes_the_ask_registration_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, other) = (PhaseId::new(5381), PhaseId::new(5382));
+        init_start_repo(root, phase);
+        let state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
+        workflow::save_state(&state).unwrap();
+        let ours = crate::pipeline_launch::ask_registration_path(root, phase);
+        let theirs = crate::pipeline_launch::ask_registration_path(root, other);
+        for path in [&ours, &theirs] {
+            std::fs::write(path, "{}\n").unwrap();
+        }
+
+        discard(root, phase, None).expect("discard runs");
+
+        assert!(
+            !ours.exists(),
+            "a registration file left after discard: {}",
+            ours.display()
+        );
+        assert!(
+            theirs.exists(),
+            "control: another phase's registration was removed: {}",
+            theirs.display()
+        );
+    }
+
     /// With a worktree already there, `start` refuses naming `devflow discard` (52.1
     /// D-09.1), so the refusal and the hints name discard and then `start`, and that pair
     /// launches.

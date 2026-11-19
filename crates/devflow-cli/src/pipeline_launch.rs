@@ -199,6 +199,20 @@ fn prepare_stage_launch(
     )
 }
 
+/// The phase's `devflow_ask` registration file, `.devflow/ask-NN.mcp.json`: written
+/// by each stage launch whose driver registers through a file (claude), removed by
+/// `discard`.
+#[allow(dead_code)] // RED stub; wired in the GREEN commit
+pub(crate) fn ask_registration_path(project_root: &Path, phase: PhaseId) -> PathBuf {
+    workflow::devflow_dir(project_root).join(format!("ask-{}.mcp.json", phase.padded()))
+}
+
+/// Put a driver's ask arguments into its launch argv where the driver says.
+#[allow(dead_code)] // RED stub; wired in the GREEN commit
+fn splice_ask_args(args: Vec<String>, _wiring: &agents::AskWiring) -> Vec<String> {
+    args
+}
+
 /// How a stage's agent is launched, before the runner builds its
 /// [`monitor::StageIo`]: the stream shape delivers `prompt` as the first turn
 /// on the agent's stdin and keeps the pipes; the capture shape gives the agent
@@ -6560,27 +6574,23 @@ mod tests {
     }
 
     /// D-04: delivery-canary evidence is per agent. The handoff commit clears the
-    /// recorded canary and Claude session id, so an Antigravity fallback whose own
-    /// canary reads `Absent` is refused, after exactly one canary run, instead of
-    /// launching on Claude's `Confirmed`. Control first: with no handoff, the same
-    /// recorded `Confirmed` admits an Antigravity launch without running a canary,
-    /// so the refusal below is the handoff's doing.
+    /// recorded canary and session id, so a Claude fallback whose own canary reads
+    /// `Absent` is refused, after exactly one canary run, instead of launching on
+    /// the primary's `Confirmed`. Control first: with no handoff, the same recorded
+    /// `Confirmed` admits a Claude launch without running a canary, so the refusal
+    /// below is the handoff's doing. (A codex run handed to claude since operator
+    /// answer (2) refuses antigravity, which has no `devflow_ask` registration.)
     #[test]
     fn a_handoff_reruns_the_delivery_canary_for_the_new_agent() {
         const NAME: &str =
             "pipeline_launch::tests::a_handoff_reruns_the_delivery_canary_for_the_new_agent";
-        enter_agent_free_child!(NAME, "agy");
+        enter_agent_free_child!(NAME, "claude");
         let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
         let phase = PhaseId::new(5161);
-        let mut state = State::new(
-            phase,
-            AgentKind::Claude,
-            Mode::Supervise,
-            root.to_path_buf(),
-        );
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Supervise, root.to_path_buf());
         state.stage = Stage::Code;
         state.canary = Some(canary::CanaryOutcome::Confirmed);
         state.session_id = Some("s1".to_string());
@@ -6588,7 +6598,7 @@ mod tests {
 
         let calls = std::cell::Cell::new(0usize);
         let mut without_handoff = state.clone();
-        without_handoff.agent = AgentKind::Antigravity;
+        without_handoff.agent = AgentKind::Claude;
         canary_gate(
             &mut without_handoff,
             true,
@@ -6604,18 +6614,18 @@ mod tests {
         let outcome = hand_off_agent(
             root,
             &mut state,
-            AgentKind::Antigravity,
+            AgentKind::Claude,
             HandoffReason::RateLimited,
         )
         .unwrap();
         assert_eq!(
             outcome,
             HandoffOutcome::HandedOff {
-                from: AgentKind::Claude
+                from: AgentKind::Codex
             }
         );
         let mut reloaded = workflow::load_state(root, phase).unwrap();
-        assert_eq!(reloaded.agent, AgentKind::Antigravity);
+        assert_eq!(reloaded.agent, AgentKind::Claude);
         assert_eq!(
             reloaded.canary, None,
             "the primary's canary evidence does not cross the hop"
@@ -9573,6 +9583,98 @@ mod tests {
                     .map(move |name| format!("{file}: {name}"))
             })
             .collect()
+    }
+
+    /// D-03: codex's overrides go before the prompt, claude's flag after
+    /// everything; an argv of the prompt alone keeps the prompt last.
+    #[test]
+    fn splice_ask_args_places_codex_wiring_before_the_prompt() {
+        let wiring = |placement| agents::AskWiring {
+            args: vec!["-c".into(), "x".into()],
+            placement,
+            file: None,
+        };
+        let argv = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            splice_ask_args(
+                argv(&["exec", "--json", "PROMPT"]),
+                &wiring(agents::ArgPlacement::BeforeLast)
+            ),
+            argv(&["exec", "--json", "-c", "x", "PROMPT"])
+        );
+        assert_eq!(
+            splice_ask_args(
+                argv(&["-p", "--verbose"]),
+                &wiring(agents::ArgPlacement::Append)
+            ),
+            argv(&["-p", "--verbose", "-c", "x"])
+        );
+        assert_eq!(
+            splice_ask_args(argv(&["PROMPT"]), &wiring(agents::ArgPlacement::BeforeLast)),
+            argv(&["-c", "x", "PROMPT"])
+        );
+    }
+
+    /// [`call_sites`] of `needle` in every `.rs` file under `dir`, recursively, as
+    /// `<path under crates/>: fn`.
+    fn crate_call_sites(dir: &Path, needle: &str, sites: &mut Vec<String>) {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .unwrap_or_else(|err| panic!("read {}: {err}", dir.display()))
+            .map(|entry| entry.expect("a src entry").path())
+            .collect();
+        entries.sort();
+        let crates = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
+        for path in entries {
+            if path.is_dir() {
+                crate_call_sites(&path, needle, sites);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let source = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+                let file = path
+                    .strip_prefix(crates)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string();
+                sites.extend(
+                    call_sites(&source, needle)
+                        .into_iter()
+                        .map(|name| format!("{file}: {name}")),
+                );
+            }
+        }
+    }
+
+    /// D-02, T-53-21: the registration reaches only a real stage launch. Across
+    /// both crates' non-test source, `ask_wiring(` is called in
+    /// `prepare_stage_launch` and nowhere else that launches; the one other call is
+    /// the driver conformance case, which launches nothing. The canary and
+    /// preflight launches carry none, and the start/resume/handoff refusal asks
+    /// `ask_support`. Control: a planted extra call site is reported.
+    #[test]
+    fn only_a_stage_launch_carries_the_ask_registration() {
+        let planted = "fn prepare_stage_launch() {\n    let w = driver.ask_wiring(&reg);\n}\n\
+                       fn run_delivery_canary() {\n    let w = driver.ask_wiring(&reg);\n}\n\
+                       mod tests {\n    fn t() { driver.ask_wiring(&reg); }\n}\n";
+        assert_eq!(
+            call_sites(planted, "ask_wiring("),
+            ["prepare_stage_launch", "run_delivery_canary"],
+            "planted control: a second call site is reported"
+        );
+        let mut sites = Vec::new();
+        for krate in ["devflow-cli", "devflow-core"] {
+            let src = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/.."))
+                .join(krate)
+                .join("src");
+            crate_call_sites(&src, "ask_wiring(", &mut sites);
+        }
+        assert_eq!(
+            sites,
+            [
+                "devflow-cli/src/pipeline_launch.rs: prepare_stage_launch",
+                "devflow-core/src/agents/mod.rs: ask_declarations_agree",
+            ],
+            "production ask_wiring( call sites"
+        );
     }
 
     /// D-01, D-02: the runner has one production entry point, the `__runner` verb's arm
