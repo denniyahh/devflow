@@ -1,0 +1,549 @@
+From c2b85a3788465e068a049c834c172742f4049c54 Mon Sep 17 00:00:00 2001
+From: Dennis Kim <d10475u5@outlook.com>
+Date: Thu, 19 Nov 2026 13:06:22 -0500
+Subject: [PATCH] test(spike): save the uncommitted foreground-runner spike
+ work
+
+Supervisor e2e test, pipeline_launch and monitor changes left uncommitted
+in the spike worktree since 2026-11-15; saved before removing the worktree.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/devflow-cli/src/pipeline_launch.rs  |  71 ++++
+ crates/devflow-cli/tests/supervisor_e2e.rs | 410 +++++++++++++++++++++
+ crates/devflow-core/src/monitor.rs         |  12 +
+ 3 files changed, 493 insertions(+)
+
+diff --git a/crates/devflow-cli/src/pipeline_launch.rs b/crates/devflow-cli/src/pipeline_launch.rs
+index b4dbd6f..532c4d1 100644
+--- a/crates/devflow-cli/src/pipeline_launch.rs
++++ b/crates/devflow-cli/src/pipeline_launch.rs
+@@ -2161,6 +2161,73 @@ fn clear_reservation(
+ /// checkpoint resume is distinguished from an ordinary launch by its own
+ /// separate `checkpoint_auto_decided` event, emitted by the caller BEFORE
+ /// this function ever runs, not by mutating either event's shape here.
++/// SPIKE (throwaway branch, never merged): run the stage's agent in this
++/// process, with no detached supervisor, no pending or published record and no
++/// promotion watch, then advance in this process.
++fn spike_run_in_foreground(
++    state: &mut State,
++    program: &str,
++    args: &[String],
++    extra_env: &[(String, String)],
++    launch: monitor::MonitorLaunch,
++) -> Result<(), CliError> {
++    let spike_err = |what: &str, err: String| CliError::Message(format!("spike: {what}: {err}"));
++    let ctx = launch_context()?;
++    let reservation = monitor::Reservation::new(&ctx, state)
++        .map_err(|err| spike_err("reservation", err.to_string()))?;
++    let is_stream = matches!(launch, monitor::MonitorLaunch::PipeOwning { .. });
++    let io = match launch {
++        monitor::MonitorLaunch::PipeOwning { prompt } => monitor::StageIo::Stream {
++            prompt,
++            idle_timeout: monitor::idle_timeout_setting_for(state.agent).timeout,
++        },
++        monitor::MonitorLaunch::Legacy => monitor::StageIo::Capture,
++    };
++    let socket = devflow_core::supervisor::SocketPath::new(reservation.socket_path().to_path_buf())
++        .map_err(|err| spike_err("socket path", err.to_string()))?;
++    let (project_root, phase, stage) = (state.project_root.clone(), state.phase, state.stage);
++    let mut spec = monitor::StageSpec::new(
++        project_root.clone(),
++        phase,
++        state.agent,
++        program.to_string(),
++        io,
++        socket,
++        reservation.launch_id().to_string(),
++    );
++    spec.stage = Some(stage);
++    spec.workdir = state
++        .worktree_path
++        .clone()
++        .unwrap_or_else(|| project_root.clone());
++    spec.args = args.to_vec();
++    spec.envs = extra_env.to_vec();
++    println!(
++        "spike: stage {stage} running in the foreground (pid {})",
++        std::process::id()
++    );
++    let guard = is_stream.then(|| {
++        AutoChainGuard::engage(&spec.workdir, auto_chain_flag_eligible(stage, state.mode))
++    });
++    let run = monitor::run_supervised_stage(spec)
++        .map_err(|err| spike_err("stage supervisor", err.to_string()))?;
++    drop(guard);
++    let outcome = run.outcome;
++    run.supervisor.finish();
++    reservation.discard();
++    println!("spike: agent ended: {outcome:?}");
++    match outcome {
++        AgentOutcome::Completed(_) => advance_for_stage(&project_root, Some(phase), Some(stage)),
++        _ => {
++            commit(state, |s| {
++                s.stopped = true;
++                s.stop_reason = Some("spike: interrupted in the foreground".to_string());
++            })?;
++            Ok(())
++        }
++    }
++}
++
+ fn spawn_agent_and_record(
+     state: &mut State,
+     program: &str,
+@@ -2179,6 +2246,10 @@ fn spawn_agent_and_record(
+         s.checkpoint_resumes = checkpoint_resumes;
+     })?;
+ 
++    if std::env::var_os("DEVFLOW_SPIKE_FOREGROUND").is_some() {
++        return spike_run_in_foreground(state, program, args, extra_env, launch);
++    }
++
+     // WR-04 (18-fix, 50-23 T-50-62): every error before the publish save
+     // ends the launch with no supervisor record (see `record_failed_launch`),
+     // so a failed relaunch never leaves `state.stage` advanced beside a
+diff --git a/crates/devflow-cli/tests/supervisor_e2e.rs b/crates/devflow-cli/tests/supervisor_e2e.rs
+index 238eb73..83ca6c0 100644
+--- a/crates/devflow-cli/tests/supervisor_e2e.rs
++++ b/crates/devflow-cli/tests/supervisor_e2e.rs
+@@ -2810,3 +2810,413 @@ fn a_no_worktree_run_that_passes_validate_finishes_the_same_way() {
+         "the finished phase is deregistered"
+     );
+ }
++
++/// SPIKE (throwaway): one Plan stage run in the foreground by `devflow start`
++/// itself, with a stand-in agent. Every assertion is made the moment `start`
++/// returns, with no wait.
++#[test]
++fn spike_start_runs_one_stage_in_the_foreground() {
++    let phase = PhaseId::new(68);
++    let home = common::HermeticHome::new();
++    let repo = tempfile::tempdir().unwrap();
++    let root = repo.path().canonicalize().unwrap();
++    init_repo(&root, phase);
++    let logs = tempfile::tempdir().unwrap();
++    let fake_bin = Shape::Capture.fake_bin(logs.path(), AgentRun::Finishing);
++    let _reaper = common::LaunchedRunReaper::new(&root, phase, vec![]);
++
++    let existing = std::env::var_os("PATH").unwrap_or_default();
++    let path = format!("{}:{}", fake_bin.path.display(), existing.to_string_lossy());
++    let started = Instant::now();
++    let output = common::hermetic_devflow(&home)
++        .args(["start", "--phase", &phase.to_string(), "--agent", "codex"])
++        .args(["--mode", "supervise", "--no-worktree", "--until", "plan"])
++        .arg(&root)
++        .current_dir(&root)
++        .env("PATH", path)
++        .env("DEVFLOW_SPIKE_FOREGROUND", "1")
++        .output()
++        .expect("run devflow start");
++    let stdout = String::from_utf8_lossy(&output.stdout);
++    let stderr = String::from_utf8_lossy(&output.stderr);
++    eprintln!(
++        "SPIKE exit={:?} elapsed={:?}\n--- stdout\n{stdout}\n--- stderr\n{stderr}",
++        output.status.code(),
++        started.elapsed()
++    );
++    let events = fs::read_to_string(devflow_core::events::events_path(&root)).unwrap_or_default();
++    eprintln!("--- events\n{events}");
++    let state = devflow_core::workflow::load_state(&root, phase).expect("state");
++    eprintln!("--- state\n{state:#?}");
++
++    assert!(output.status.success(), "start failed");
++    assert!(stdout.contains("spike: stage plan running in the foreground"));
++    assert!(state.stopped, "the run is stopped at --until plan on return");
++    assert!(state.supervisor.is_none(), "no supervisor was recorded");
++    assert!(state.pending_supervisor.is_none(), "no launch is pending");
++    assert!(
++        !events.contains("\"stage_launched\""),
++        "no detached launch happened"
++    );
++    assert!(
++        events
++            .lines()
++            .any(|line| line.contains("\"advance_evaluated\"")
++                && line.contains("\"status\":\"success\"")),
++        "the in-process advance evaluated the stage as success"
++    );
++    let exit = fs::read_to_string(devflow_core::agent_result::exit_code_path(&root, phase))
++        .expect("exit file");
++    assert_eq!(exit.trim(), "0");
++    let agent_pid: u32 =
++        fs::read_to_string(devflow_core::agent_result::agent_pid_path(&root, phase))
++            .expect("agent pid file")
++            .trim()
++            .parse()
++            .expect("a pid");
++    assert!(
++        !devflow_core::agent::agent_running(agent_pid),
++        "the agent is gone when start returns"
++    );
++}
++
++// ---- SPIKE (throwaway): the Claude-shaped stand-in in the foreground ----
++
++/// A `devflow <args> <root>` command with the spike switch on and the rig's
++/// fake `claude` first on PATH, its output appended to `out`.
++fn spike_cmd(rig: &FinishRig, args: &[&str], out: &Path) -> std::process::Command {
++    let existing = std::env::var_os("PATH").unwrap_or_default();
++    let path = format!(
++        "{}:{}",
++        rig.fake_bin.path.display(),
++        existing.to_string_lossy()
++    );
++    let file = fs::OpenOptions::new()
++        .create(true)
++        .append(true)
++        .open(out)
++        .unwrap();
++    let mut command = common::hermetic_devflow(&rig.home);
++    command
++        .args(args)
++        .arg(&rig.root)
++        .current_dir(&rig.root)
++        .env("PATH", path)
++        .env("DEVFLOW_SPIKE_FOREGROUND", "1")
++        .stdin(std::process::Stdio::null())
++        .stdout(file.try_clone().unwrap())
++        .stderr(file);
++    command
++}
++
++fn spike_wait(child: &mut std::process::Child, within: Duration) -> Option<i32> {
++    let mut code = None;
++    holds_within(within, || match child.try_wait().unwrap() {
++        Some(status) => {
++            code = Some(status.code().unwrap_or(-1));
++            true
++        }
++        None => false,
++    });
++    code
++}
++
++fn spike_dump(label: &str, rig: &FinishRig, out: &Path) {
++    eprintln!(
++        "=== {label}\n--- output\n{}\n--- events\n{}\n--- state\n{:#?}",
++        fs::read_to_string(out).unwrap_or_default(),
++        rig.events_text(),
++        devflow_core::workflow::load_state(&rig.root, rig.phase)
++    );
++}
++
++/// The rig's passing agent, which waits (up to 120 s) while `<dir>/finish` is absent.
++fn spike_waiting_claude(dir: &Path) -> String {
++    passing_claude().replace(
++        "git commit -q",
++        &format!(
++            "if [ ! -e '{}/finish' ]; then sleep 120; fi\ngit commit -q",
++            dir.display()
++        ),
++    )
++}
++
++/// Wait for the foreground Plan agent and return its pid (its group's id).
++fn spike_wait_for_agent(rig: &FinishRig, out: &Path) -> u32 {
++    let pid_file = devflow_core::agent_result::agent_pid_path(&rig.root, rig.phase);
++    let mut pid = 0;
++    let found = holds_within(RUN_WAIT, || {
++        let announced = fs::read_to_string(out)
++            .unwrap_or_default()
++            .contains("spike: stage plan running");
++        pid = fs::read_to_string(&pid_file)
++            .ok()
++            .and_then(|text| text.trim().parse().ok())
++            .unwrap_or(0);
++        announced && pid > 1 && devflow_core::agent::agent_running(pid)
++    });
++    if !found {
++        spike_dump("agent never appeared", rig, out);
++        panic!("the foreground Plan agent never appeared");
++    }
++    pid
++}
++
++#[test]
++fn spike_claude_shape_runs_three_stages_and_takes_a_gate_answer_from_a_second_process() {
++    let phase = PhaseId::new(69);
++    let rig = FinishRig::new(phase);
++    rig.stub_gsd(&vec![devflow_core::test_support::gsd_status_json(GsdStatus::Passed); 12]);
++    let _reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
++    let out = rig.notify.path().join("start.out");
++    let number = phase.to_string();
++    let mut child = spike_cmd(
++        &rig,
++        &["start", "--phase", &number, "--agent", "claude", "--mode", "supervise"],
++        &out,
++    )
++    .spawn()
++    .unwrap();
++    let gated = holds_within(RUN_WAIT, || {
++        rig.validate_gates() >= 1 || child.try_wait().unwrap().is_some()
++    });
++    let running_at_gate = child.try_wait().unwrap().is_none();
++    spike_dump("at the gate", &rig, &out);
++    assert!(gated && rig.validate_gates() == 1, "one Validate gate fired");
++    assert!(running_at_gate, "start is still running while the gate waits");
++    rig.answer_validate("approve");
++    let code = spike_wait(&mut child, RUN_WAIT);
++    spike_dump("after the answer", &rig, &out);
++    if code.is_none() {
++        let _ = child.kill();
++        let _ = child.wait();
++    }
++    assert_eq!(code, Some(0), "start exits 0 after the approval");
++    assert!(rig.state().finished, "the run is finished");
++    assert!(rig.positions("stage_launched").is_empty(), "no detached launch");
++    let evaluated: Vec<String> = rig
++        .events()
++        .iter()
++        .filter(|event| event["event"] == "advance_evaluated")
++        .map(|event| format!("{}:{}", event["stage"], event["status"]))
++        .collect();
++    eprintln!("evaluated: {evaluated:?}");
++}
++
++#[test]
++fn spike_interrupt_to_the_foreground_group_ends_the_agent_and_records_a_stop() {
++    use std::os::unix::process::CommandExt as _;
++    let phase = PhaseId::new(70);
++    let rig = FinishRig::with_claude(phase, spike_waiting_claude);
++    let _reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
++    let out = rig.notify.path().join("start.out");
++    let number = phase.to_string();
++    let mut child = spike_cmd(
++        &rig,
++        &["start", "--phase", &number, "--agent", "claude", "--mode", "auto"],
++        &out,
++    )
++    .process_group(0)
++    .spawn()
++    .unwrap();
++    let agent = spike_wait_for_agent(&rig, &out);
++    eprintln!(
++        "runner group {} members {:?}; agent group {agent} members {:?}",
++        child.id(),
++        group_members(child.id()),
++        group_members(agent)
++    );
++    // What a terminal's Ctrl-C does: SIGINT to the foreground process group.
++    common::signal_group(child.id(), libc::SIGINT);
++    let code = spike_wait(&mut child, Duration::from_secs(30));
++    let left = group_members(agent);
++    spike_dump("after SIGINT", &rig, &out);
++    eprintln!("exit code {code:?}; agent group members left {left:?}");
++    if code.is_none() {
++        let _ = child.kill();
++        let _ = child.wait();
++    }
++    common::signal_group(agent, libc::SIGKILL);
++    assert!(code.is_some(), "start exits after the interrupt");
++    assert!(left.is_empty(), "the agent group is gone");
++    assert!(rig.state().stopped, "the state records a stop");
++}
++
++#[test]
++fn spike_hard_kill_of_the_foreground_runner_then_resume() {
++    let phase = PhaseId::new(71);
++    let rig = FinishRig::with_claude(phase, spike_waiting_claude);
++    let _reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
++    let out = rig.notify.path().join("start.out");
++    let number = phase.to_string();
++    let mut child = spike_cmd(
++        &rig,
++        &["start", "--phase", &number, "--agent", "claude", "--mode", "auto"],
++        &out,
++    )
++    .spawn()
++    .unwrap();
++    let agent = spike_wait_for_agent(&rig, &out);
++    child.kill().unwrap();
++    let _ = child.wait();
++    std::thread::sleep(Duration::from_secs(2));
++    let left = group_members(agent);
++    spike_dump("after SIGKILL of the runner", &rig, &out);
++    eprintln!("agent group members 2 s after the kill: {left:?}");
++    eprintln!("--- status\n{}", run_status(&rig.home, &rig.root));
++    common::signal_group(agent, libc::SIGKILL);
++    assert!(
++        holds_within(Duration::from_secs(10), || group_members(agent).is_empty()),
++        "cleanup: the agent group ends"
++    );
++    fs::write(rig.notify.path().join("finish"), "").unwrap();
++    let resume_out = rig.notify.path().join("resume.out");
++    let mut resume = spike_cmd(&rig, &["resume", "--phase", &number], &resume_out)
++        .spawn()
++        .unwrap();
++    let code = spike_wait(&mut resume, RUN_WAIT);
++    spike_dump("after resume", &rig, &resume_out);
++    eprintln!("resume exit code {code:?}; agent orphaned by the kill: {}", !left.is_empty());
++    if code.is_none() {
++        let _ = resume.kill();
++        let _ = resume.wait();
++    }
++    assert_eq!(code, Some(0), "resume exits 0");
++    assert!(rig.state().finished, "the resumed run finished");
++}
++
++#[test]
++fn spike_hard_kill_with_the_parent_death_guard() {
++    let phase = PhaseId::new(72);
++    let rig = FinishRig::with_claude(phase, spike_waiting_claude);
++    let _reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
++    let out = rig.notify.path().join("start.out");
++    let number = phase.to_string();
++    let mut child = spike_cmd(
++        &rig,
++        &["start", "--phase", &number, "--agent", "claude", "--mode", "auto"],
++        &out,
++    )
++    .env("DEVFLOW_SPIKE_PDEATHSIG", "1")
++    .spawn()
++    .unwrap();
++    let agent = spike_wait_for_agent(&rig, &out);
++    let before = group_members(agent);
++    child.kill().unwrap();
++    let _ = child.wait();
++    std::thread::sleep(Duration::from_secs(2));
++    let left = group_members(agent);
++    eprintln!("GUARD agent {agent}: before {before:?}, 2 s after the kill {left:?}");
++    common::signal_group(agent, libc::SIGKILL);
++    assert!(!left.contains(&agent), "the agent itself is gone");
++    assert!(left.is_empty(), "the agent's children are gone too");
++}
++
++// ---- SPIKE (throwaway): the foreground runner as a transient user service ----
++
++fn spike_systemctl(args: &[&str]) -> String {
++    let output = std::process::Command::new("systemctl")
++        .arg("--user")
++        .args(args)
++        .output()
++        .expect("run systemctl");
++    String::from_utf8_lossy(&output.stdout).trim().to_string()
++}
++
++/// Start the rig's run as a transient user service and return (unit, agent pid).
++fn spike_start_as_service(rig: &FinishRig) -> (String, u32) {
++    let unit = format!("devflow-spike-{}-{}", std::process::id(), rig.phase);
++    let existing = std::env::var_os("PATH").unwrap_or_default();
++    let path = format!(
++        "{}:{}",
++        rig.fake_bin.path.display(),
++        existing.to_string_lossy()
++    );
++    let home = rig.home.home();
++    let started = std::process::Command::new("systemd-run")
++        .args(["--user", "--collect", "--quiet", "-p", "KillMode=control-group"])
++        .arg(format!("--unit={unit}"))
++        .arg(format!("--working-directory={}", rig.root.display()))
++        .arg(format!("--setenv=HOME={}", home.display()))
++        .arg(format!("--setenv=XDG_CACHE_HOME={}", home.join(".cache").display()))
++        .arg(format!("--setenv=XDG_CONFIG_HOME={}", rig.home.config_dir().display()))
++        .arg(format!("--setenv=DEVFLOW_CACHE_DIR={}", rig.home.cache_dir().display()))
++        .arg(format!("--setenv=PATH={path}"))
++        .arg("--setenv=DEVFLOW_SPIKE_FOREGROUND=1")
++        .arg(common::devflow_bin())
++        .args(["start", "--phase", &rig.phase.to_string()])
++        .args(["--agent", "claude", "--mode", "auto"])
++        .arg(&rig.root)
++        .output()
++        .expect("run systemd-run");
++    assert!(
++        started.status.success(),
++        "systemd-run failed: {}",
++        String::from_utf8_lossy(&started.stderr)
++    );
++    let pid_file = devflow_core::agent_result::agent_pid_path(&rig.root, rig.phase);
++    let mut agent = 0;
++    let found = holds_within(RUN_WAIT, || {
++        agent = fs::read_to_string(&pid_file)
++            .ok()
++            .and_then(|text| text.trim().parse().ok())
++            .unwrap_or(0);
++        agent > 1 && group_members(agent).len() >= 2
++    });
++    if !found {
++        eprintln!(
++            "service state: {}\nevents:\n{}",
++            spike_systemctl(&["status", &unit]),
++            rig.events_text()
++        );
++        let _ = spike_systemctl(&["stop", &unit]);
++        panic!("the service's Plan agent never appeared");
++    }
++    (unit, agent)
++}
++
++#[test]
++fn spike_service_hard_kill_takes_the_agent_tree_down() {
++    let phase = PhaseId::new(73);
++    let rig = FinishRig::with_claude(phase, spike_waiting_claude);
++    let _reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
++    let (unit, agent) = spike_start_as_service(&rig);
++    let before = group_members(agent);
++    let active_before = spike_systemctl(&["is-active", &unit]);
++    let main_pid: i32 = spike_systemctl(&["show", "-p", "MainPID", "--value", &unit])
++        .parse()
++        .expect("MainPID");
++    assert!(main_pid > 1, "refusing to signal pid {main_pid}");
++    // SAFETY: `main_pid > 1` is the service's main process, read just above.
++    assert_eq!(unsafe { libc::kill(main_pid, libc::SIGKILL) }, 0);
++    std::thread::sleep(Duration::from_secs(2));
++    let left = group_members(agent);
++    let active_after = spike_systemctl(&["is-active", &unit]);
++    eprintln!(
++        "SERVICE-KILL active before {active_before:?}; agent group before {before:?}; \
++         2 s after the kill {left:?}; active after {active_after:?}"
++    );
++    let _ = spike_systemctl(&["stop", &unit]);
++    common::signal_group(agent, libc::SIGKILL);
++    assert_eq!(active_before, "active");
++    assert!(left.is_empty(), "the whole agent group is gone");
++    assert_ne!(active_after, "active");
++}
++
++#[test]
++fn spike_service_stop_ends_the_agent_and_records_a_stop() {
++    let phase = PhaseId::new(74);
++    let rig = FinishRig::with_claude(phase, spike_waiting_claude);
++    let _reaper = common::LaunchedRunReaper::new(&rig.root, phase, vec![]);
++    let (unit, agent) = spike_start_as_service(&rig);
++    let _ = spike_systemctl(&["stop", &unit]);
++    let left = group_members(agent);
++    let state = rig.state();
++    eprintln!(
++        "SERVICE-STOP agent group after stop {left:?}; stopped {} reason {:?}",
++        state.stopped, state.stop_reason
++    );
++    common::signal_group(agent, libc::SIGKILL);
++    assert!(left.is_empty(), "the agent group is gone");
++    assert!(state.stopped, "the stop is recorded");
++}
+diff --git a/crates/devflow-core/src/monitor.rs b/crates/devflow-core/src/monitor.rs
+index 3cb7294..51a6102 100644
+--- a/crates/devflow-core/src/monitor.rs
++++ b/crates/devflow-core/src/monitor.rs
+@@ -2199,6 +2199,18 @@ fn spawn_stage_agent(
+             Some(capture)
+         }
+     };
++    // SPIKE (throwaway): the kernel kills the agent when this process dies.
++    if std::env::var_os("DEVFLOW_SPIKE_PDEATHSIG").is_some() {
++        // SAFETY: prctl is async-signal-safe and touches only the child.
++        unsafe {
++            agent_cmd.pre_exec(|| {
++                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
++                    return Err(std::io::Error::last_os_error());
++                }
++                Ok(())
++            });
++        }
++    }
+     Ok((agent_cmd.spawn()?, stream_capture))
+ }
+ 
+-- 
+2.56.1
+
