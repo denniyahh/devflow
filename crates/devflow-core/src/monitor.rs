@@ -18,7 +18,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, PoisonError, TryLockError, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 /// Errors produced by monitor operations.
@@ -800,6 +800,7 @@ fn drive_stream_io(
     agent: AgentKind,
     prompt: &str,
     idle_timeout: Duration,
+    question_hold: Option<QuestionHold<'_>>,
     on_idle_timeout: impl FnOnce(),
 ) -> Result<StreamThreads, MonitorError> {
     let mut child_stdin = child
@@ -895,10 +896,12 @@ fn drive_stream_io(
     let mut rule = CloseRule::for_agent(agent);
     let mut close_signalled = false;
     let mut idle_extensions: u32 = 0;
+    let mut silence_started = Instant::now();
 
     loop {
         match event_rx.recv_timeout(idle_timeout) {
             Ok(StreamEvent::Line(line)) => {
+                silence_started = Instant::now();
                 if close_signalled {
                     continue;
                 }
@@ -958,6 +961,34 @@ fn drive_stream_io(
                 // drain gate should have covered this and could not: it reads
                 // `background_tasks_changed`, which production never emits.
                 //
+                // An agent held on a `devflow_ask` call is silent while the
+                // operator decides (Phase 53, review concern 13). A healthy hold
+                // is never silent for long: codex's call ends at its hold cap
+                // and its re-call writes lines, and claude streams
+                // `tool_progress` lines while a call is held. So an open
+                // question holds the window only for a bounded CONTINUOUS
+                // silence, never for the gate's age; past the bound, or once the
+                // gate is gone, the checks below apply as before.
+                if let Some(hold) = &question_hold
+                    && let Some(gate_id) = hold.open_gate_id()
+                {
+                    let silence = silence_started.elapsed();
+                    if silence < hold.bound {
+                        info!(
+                            "no output for {idle_timeout:?}, but question gate {gate_id} is open \
+                             — holding the idle window ({}s of {}s)",
+                            silence.as_secs(),
+                            hold.bound.as_secs()
+                        );
+                        continue;
+                    }
+                    warn!(
+                        "the agent has been silent {}s with question gate {gate_id} open, past \
+                         the question bound of {}s — treating as a hang",
+                        silence.as_secs(),
+                        hold.bound.as_secs()
+                    );
+                }
                 // So consult the task state before firing. While work is known
                 // to be outstanding, silence is expected and this arm extends
                 // instead of killing. The extension is BOUNDED — a subagent
@@ -1029,6 +1060,36 @@ impl StageIo {
     }
 }
 
+/// The question gate that may hold a stream stage's idle window: the stage's
+/// gate slot, and the longest continuous silence it holds it for.
+struct QuestionHold<'a> {
+    project_root: &'a Path,
+    phase: PhaseId,
+    stage: Stage,
+    bound: Duration,
+}
+
+impl QuestionHold<'_> {
+    /// The hold `spec` asks for: only when it names both a stage and a bound.
+    fn for_spec(spec: &StageSpec) -> Option<QuestionHold<'_>> {
+        Some(QuestionHold {
+            project_root: &spec.project_root,
+            phase: spec.phase,
+            stage: spec.stage?,
+            bound: spec.question_wait?,
+        })
+    }
+
+    /// The id of the stage's open question gate. A missing or unparsable gate
+    /// file, or a gate of another kind, holds nothing.
+    fn open_gate_id(&self) -> Option<String> {
+        let path = crate::gates::Gates::gate_path(self.project_root, self.phase, self.stage);
+        let text = std::fs::read_to_string(path).ok()?;
+        let gate: crate::gates::GateFile = serde_json::from_str(&text).ok()?;
+        (gate.gate_kind == Some(crate::gates::GateKind::Question)).then_some(gate.gate_id)
+    }
+}
+
 /// Everything [`run_stage`] needs to supervise one stage's agent.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -1053,6 +1114,10 @@ pub struct StageSpec {
     pub agent: AgentKind,
     /// The supervision shape.
     pub io: StageIo,
+    /// The longest continuous silence, measured from the agent's last stream
+    /// line, that an open question gate for `stage` holds the idle window for
+    /// (Phase 53, review concern 13). `None` holds nothing.
+    pub question_wait: Option<Duration>,
 }
 
 impl StageSpec {
@@ -1075,6 +1140,7 @@ impl StageSpec {
             envs: Vec::new(),
             agent,
             io,
+            question_wait: None,
         }
     }
 }
@@ -1095,7 +1161,7 @@ const PGID_SETTLE_WAIT: Duration = Duration::from_millis(100);
 ///    stop already requested ends the new group at once; the run leaves that phase
 ///    as the exit decides.
 /// 3. The stream shape only: drive the agent's pipes through `drive_stream_io`
-///    (first turn, capture tee, close rule, idle timeout), which also ends when the
+///    (first turn, capture tee, close rule, idle timeout and its question hold), which also ends when the
 ///    agent process exits, even while a process it started still holds its stdout
 ///    (WR-03). An idle-timeout group kill is a natural outcome, `Completed(128 + n)`
 ///    with the idle-timeout verdict file, never a stop.
@@ -1143,9 +1209,11 @@ pub fn run_stage(
             Some(capture),
         ) => {
             let idle = *idle_timeout;
-            let driven = drive_stream_io(&mut child, capture, spec.agent, prompt, idle, || {
-                fire_idle_timeout(&spec.project_root, spec.phase, &spec.workdir, pid, idle);
-            });
+            let hold = QuestionHold::for_spec(&spec);
+            let driven =
+                drive_stream_io(&mut child, capture, spec.agent, prompt, idle, hold, || {
+                    fire_idle_timeout(&spec.project_root, spec.phase, &spec.workdir, pid, idle);
+                });
             match driven {
                 Ok(threads) => Some(threads),
                 Err(err) => {
@@ -2713,6 +2781,192 @@ exit 0
             crate::agent_result::idle_timeout_path(root, phase).exists(),
             "silence with no outstanding work must still be recorded as a hang; \
              if this never fires, the idle guard has been removed, not fixed"
+        );
+    }
+
+    /// Open a question gate for `phase`'s Code stage, as `__ask` does, and
+    /// return its id with the waiter registration the test holds.
+    fn open_code_question_gate(
+        root: &Path,
+        phase: PhaseId,
+    ) -> (crate::gates::GateId, crate::gates::WaiterRegistration) {
+        let spec = crate::question::QuestionSpec::from_arguments(&serde_json::json!({
+            "question": "Pick a budget",
+            "options": [{ "id": "budget-30", "label": "30 s" }],
+            "kind": "decision",
+        }))
+        .expect("a well-formed question");
+        let (opened, registration) =
+            crate::gates::Gates::open_question_registered(root, phase, Stage::Code, &spec)
+                .expect("the question gate opens");
+        (opened.gate_id, registration)
+    }
+
+    /// A stub that prints its first line, stays silent `silent_secs`, then
+    /// prints `final_line` and its result and exits 0.
+    fn quiet_stub(silent_secs: u64, final_line: &str) -> String {
+        format!(
+            r#"
+set -u
+IFS= read -r _turn || exit 91
+printf '%s\n' '{INIT_LINE}'
+sleep {silent_secs}
+printf '%s\n' '{final_line}'
+printf '%s\n' '{RESULT_WITH_MARKER}'
+exit 0
+"#
+        )
+    }
+
+    /// [`supervise_stream_child`] for `phase`'s Code stage with a question
+    /// bound of `question_wait`, running `script` under `sh -c`.
+    fn supervise_with_question_wait(
+        root: &Path,
+        phase: PhaseId,
+        idle_timeout: Duration,
+        question_wait: Duration,
+        script: String,
+    ) -> i32 {
+        let mut spec = StageSpec::new(
+            root.to_path_buf(),
+            phase,
+            AgentKind::Claude,
+            "sh".to_string(),
+            StageIo::Stream {
+                prompt: "prompt".to_string(),
+                idle_timeout,
+            },
+        );
+        spec.stage = Some(Stage::Code);
+        spec.question_wait = Some(question_wait);
+        spec.args = vec!["-c".to_string(), script];
+        let token = crate::stop::StopToken::for_run();
+        match run_stage(spec, &token).expect("the monitor supervises the stub") {
+            AgentOutcome::Completed(code) => code,
+            AgentOutcome::Stopped => crate::stop::STOPPED_EXIT_CODE,
+        }
+    }
+
+    /// Phase 53, review concern 13: an agent held on `devflow_ask` is silent
+    /// while the operator decides; inside the question bound that silence is
+    /// not a hang.
+    #[test]
+    fn idle_timeout_does_not_fire_while_the_stages_question_gate_is_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(61);
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        let (_gate_id, registration) = open_code_question_gate(root, phase);
+
+        let code = supervise_with_question_wait(
+            root,
+            phase,
+            Duration::from_secs(1),
+            Duration::from_secs(60),
+            silent_stub(false),
+        );
+
+        assert_eq!(code, 0, "the stub was killed while its question was open");
+        assert!(
+            !crate::agent_result::idle_timeout_path(root, phase).exists(),
+            "an idle-timeout record was written while the stage's question gate was open \
+             and the silence was inside the question bound"
+        );
+        registration.finish();
+    }
+
+    /// Negative control for the test above: the same spec and stub with no
+    /// gate file for the stage still times out after the 1 s idle window.
+    #[test]
+    fn idle_timeout_still_fires_with_no_open_question_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(62);
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+
+        let _ = supervise_with_question_wait(
+            root,
+            phase,
+            Duration::from_secs(1),
+            Duration::from_secs(60),
+            silent_stub(false),
+        );
+
+        let raw = std::fs::read_to_string(crate::agent_result::idle_timeout_path(root, phase))
+            .expect("silence with no question gate must still be recorded as an idle timeout");
+        let record: serde_json::Value = serde_json::from_str(&raw).expect("record must parse");
+        let idle_secs = record
+            .as_object()
+            .expect("the record is a JSON object")
+            .get("idle_secs")
+            .unwrap_or_else(|| panic!("record has no \"idle_secs\" key: {raw}"));
+        assert_eq!(idle_secs.as_u64(), Some(1), "idle_secs: {raw}");
+    }
+
+    /// The question bound holds: a silence past it trips the idle timeout even
+    /// with the question still open, so a wedged agent cannot hold its stage
+    /// for the gate timeout.
+    #[test]
+    fn a_silence_longer_than_the_question_bound_still_trips_the_idle_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(63);
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        let (_gate_id, registration) = open_code_question_gate(root, phase);
+        let final_line = "FINAL-LINE-AFTER-THE-QUESTION-BOUND";
+
+        let _ = supervise_with_question_wait(
+            root,
+            phase,
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            quiet_stub(8, final_line),
+        );
+
+        assert!(
+            crate::agent_result::idle_timeout_path(root, phase).exists(),
+            "a silence past the question bound was not recorded as an idle timeout"
+        );
+        let capture =
+            std::fs::read_to_string(crate::agent_result::stdout_path(root, phase)).unwrap();
+        assert!(
+            !capture.contains(final_line),
+            "the stub outlived the question bound and printed its final line: {capture}"
+        );
+        registration.finish();
+    }
+
+    /// Review concern 13, second half: once the question is answered (its gate
+    /// gone), the silence that follows counts toward the normal idle window.
+    #[test]
+    fn a_question_answered_mid_silence_returns_to_the_normal_idle_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let phase = PhaseId::new(64);
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        let (gate_id, registration) = open_code_question_gate(&root, phase);
+        let closer = std::thread::spawn({
+            let root = root.clone();
+            move || {
+                std::thread::sleep(Duration::from_secs(1));
+                crate::gates::Gates::close_if_current(&root, phase, Stage::Code, &gate_id)
+                    .expect("the question gate closes");
+                registration.finish();
+            }
+        });
+
+        let _ = supervise_with_question_wait(
+            &root,
+            phase,
+            Duration::from_secs(1),
+            Duration::from_secs(60),
+            quiet_stub(6, "FINAL-LINE-AFTER-THE-ANSWER"),
+        );
+        closer.join().expect("the closer thread");
+
+        assert!(
+            crate::agent_result::idle_timeout_path(&root, phase).exists(),
+            "the silence after the question's gate closed was not counted as idle"
         );
     }
 
