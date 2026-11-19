@@ -566,6 +566,7 @@ fn start_dry_run(project_root: &Path, state: &State) -> Result<(), CliError> {
     launch_guards(phase, &facts)?;
     // 52.1 D-27: the two local checks, at the real start's position after its guards.
     ensure_agent_binary(agent_program(state.agent))?;
+    crate::preflight::ensure_ask_registration(state.agent)?;
     let base = crate::preflight::resolve_start_base(project_root)?.value;
     println!("{}", dry_run_not_checked_line(phase, &base));
     print_dry_run(state);
@@ -683,6 +684,7 @@ fn start_reserved(
     // 14-CR-05: fail on a missing agent binary BEFORE any branch/worktree is
     // scaffolded (launch_stage re-checks for the advance-time launch paths).
     ensure_agent_binary(agent_program(agent))?;
+    crate::preflight::ensure_ask_registration(agent)?;
 
     // 45-01 / D-01 / AUTO-01: resolve the project's integration trunk once,
     // here, and use the SAME value for every guard and both fork paths below.
@@ -1928,11 +1930,13 @@ struct DiscardDebris {
     gate_files: Vec<PathBuf>,
     /// The phase's hold temps in `.devflow/` and in the gates directory.
     hold_temps: Vec<PathBuf>,
+    /// The phase's `devflow_ask` registration file, when a stage launch left one.
+    ask_registration: Option<PathBuf>,
 }
 
 impl DiscardDebris {
     fn is_empty(&self) -> bool {
-        self.gate_files.is_empty() && self.hold_temps.is_empty()
+        self.gate_files.is_empty() && self.hold_temps.is_empty() && self.ask_registration.is_none()
     }
 }
 
@@ -1980,6 +1984,11 @@ fn discard_debris(project_root: &Path, phase: PhaseId) -> Result<DiscardDebris, 
     }
     debris.gate_files.sort();
     debris.hold_temps.sort();
+    let registration = crate::pipeline_launch::ask_registration_path(project_root, phase);
+    debris.ask_registration = registration
+        .symlink_metadata()
+        .is_ok()
+        .then_some(registration);
     Ok(debris)
 }
 
@@ -2105,6 +2114,19 @@ fn remove_discarded_debris(
             "kept hold temp {}: its creator may still run or it is held",
             path.display()
         );
+    }
+    if let Some(path) = &debris.ask_registration {
+        match std::fs::remove_file(path) {
+            Ok(()) => println!("removed devflow_ask registration {}", path.display()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                failed = true;
+                println!(
+                    "warning: could not remove the devflow_ask registration {}: {err}",
+                    path.display()
+                );
+            }
+        }
     }
     if failed {
         return Err(CliError::Message(format!(
@@ -2669,6 +2691,9 @@ fn print_discard_listing(phase: PhaseId, items: &DiscardItems, debris: &DiscardD
             "  hold temp {} (kept if its creator still runs)",
             path.display()
         );
+    }
+    if let Some(path) = &debris.ask_registration {
+        println!("  devflow_ask registration {}", path.display());
     }
 }
 
