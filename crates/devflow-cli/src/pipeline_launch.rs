@@ -2342,6 +2342,9 @@ fn close_gates_for_resume(
     phase: PhaseId,
     current_stage: Stage,
 ) -> Vec<String> {
+    for stage in [Stage::Plan, Stage::Code, Stage::Validate] {
+        record_leftover_question(project_root, phase, stage);
+    }
     // Read before the close, which removes the files that name them.
     let gate_ids = [Stage::Plan, Stage::Code, Stage::Validate].map(|stage| {
         let gate_id = crate::commands::gate_file_id(project_root, phase, stage)
@@ -2381,6 +2384,13 @@ fn close_gates_for_resume(
     }
     lines
 }
+
+/// Close a question gate open at `stage` after its agent exited (C1 backstop).
+fn close_question_gate(_project_root: &Path, _phase: PhaseId, _stage: Stage) {}
+
+/// Record `question_closed{closed_on_resume}` for a question gate `resume` is about
+/// to close.
+fn record_leftover_question(_project_root: &Path, _phase: PhaseId, _stage: Stage) {}
 
 /// [`resume_with_fallback`] after its reservation, up to the launch: every refusal and
 /// every state write (gate closing, notes, the handoff, the fallback re-arm) under the
@@ -2661,6 +2671,12 @@ pub(crate) fn advance_with(
         ),
         Some(_) => {}
     }
+
+    // C1 backstop: a question gate the stage's agent left behind (its server was
+    // killed) is closed now, applying an abort bound to it, so the check below sees
+    // the abort and no question gate outlives its agent.
+    close_question_gate(project_root, phase, state.stage);
+    state = workflow::load_state(project_root, phase)?;
 
     // D-10: an operator's abort at a question ends the run once its agent has
     // exited. The question server recorded it; the abort removes the state file,
@@ -7296,6 +7312,198 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A question a test opens at `stage`, with its registration dropped unfinished
+    /// as a SIGKILLed server leaves it: the spec and the gate id.
+    fn open_abandoned_question(
+        root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+    ) -> (devflow_core::question::QuestionSpec, GateId) {
+        let (spec, gate_id, registration) = open_held_question(root, phase, stage);
+        drop(registration);
+        (spec, gate_id)
+    }
+
+    /// A question a test opens at `stage` with its waiter registration held.
+    fn open_held_question(
+        root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+    ) -> (
+        devflow_core::question::QuestionSpec,
+        GateId,
+        devflow_core::gates::WaiterRegistration,
+    ) {
+        let spec = devflow_core::question::QuestionSpec::from_arguments(&serde_json::json!({
+            "question": "Pick a budget",
+            "options": [{ "id": "a", "label": "A" }, { "id": "b", "label": "B" }],
+            "kind": "decision",
+        }))
+        .unwrap();
+        let (opened, registration) =
+            Gates::open_question_registered(root, phase, stage, &spec).unwrap();
+        (spec, opened.gate_id, registration)
+    }
+
+    /// C1 backstop: after its agent exits, a question gate left at the stage (its
+    /// waiter gone) is removed and records `question_closed{agent_exited}` with
+    /// the spec's question id. Control: a stage-failure gate at the stage is left
+    /// in place and records no question event.
+    #[test]
+    fn an_agent_exit_closes_its_stage_question_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(1309);
+        let (spec, gate_id) = open_abandoned_question(root, phase, Stage::Code);
+
+        close_question_gate(root, phase, Stage::Code);
+
+        assert!(
+            !Gates::gate_path(root, phase, Stage::Code).exists(),
+            "the question gate is still present"
+        );
+        let closed = events_named(root, "question_closed");
+        assert_eq!(closed.len(), 1, "one question_closed: {closed:?}");
+        assert_eq!(closed[0]["reason"], "agent_exited", "{}", closed[0]);
+        assert_eq!(closed[0]["question_id"], spec.question_id, "{}", closed[0]);
+        assert_eq!(closed[0]["gate_id"], gate_id.as_str(), "{}", closed[0]);
+        assert_eq!(closed[0]["stage"], "code", "{}", closed[0]);
+        assert!(closed[0]["closed_by"].is_null(), "{}", closed[0]);
+
+        let control = tempfile::tempdir().unwrap();
+        let control_root = control.path();
+        Gates::open_gate(
+            control_root,
+            phase,
+            Stage::Code,
+            devflow_core::gates::GateKind::StageFailure,
+            "a failure",
+        )
+        .unwrap();
+        close_question_gate(control_root, phase, Stage::Code);
+        assert!(
+            Gates::gate_path(control_root, phase, Stage::Code).exists(),
+            "control: the stage-failure gate was removed"
+        );
+        assert!(
+            events_named(control_root, "question_closed").is_empty(),
+            "control: a stage-failure gate was given a question event"
+        );
+    }
+
+    /// Review concern 4: an abort the operator published to a question just before
+    /// its server died still ends the run. The advance records
+    /// `question_closed{aborted_by_operator}` with the answer's responder, aborts with
+    /// the abort's note (one `workflow_aborted`, no state left), removes the gate and
+    /// launches nothing. Control: the same shape with no answer records
+    /// `agent_exited` and no abort, and routes its outcome to its `--until` stop.
+    #[test]
+    fn an_abort_published_before_the_server_died_still_ends_the_run() {
+        let _guard = env_lock();
+        for answered in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = PhaseId::new(1310);
+            let mut state = State::new(
+                phase,
+                AgentKind::Claude,
+                Mode::Supervise,
+                root.to_path_buf(),
+            );
+            state.stop_until = Some(Stage::Plan);
+            workflow::save_state(&state).unwrap();
+            write_success_capture(root, phase);
+            let (_spec, gate_id, registration) = open_held_question(root, phase, Stage::Plan);
+            if answered {
+                Gates::answer(
+                    root,
+                    phase,
+                    Stage::Plan,
+                    &gate_id,
+                    &devflow_core::gates::GateResponse {
+                        approved: false,
+                        abort: true,
+                        note: Some("stop".into()),
+                        responded_by: Some("operator".into()),
+                    },
+                )
+                .unwrap();
+            }
+            drop(registration);
+
+            let launch = advance_with(root, phase, Some(Stage::Plan)).expect("the advance");
+
+            assert!(launch.is_none(), "no further stage is launched");
+            assert!(
+                !Gates::gate_path(root, phase, Stage::Plan).exists(),
+                "the question gate is still present"
+            );
+            let closed = events_named(root, "question_closed");
+            assert_eq!(closed.len(), 1, "one question_closed: {closed:?}");
+            assert_eq!(closed[0]["gate_id"], gate_id.as_str(), "{}", closed[0]);
+            let aborted = events_named(root, "workflow_aborted");
+            if answered {
+                assert_eq!(closed[0]["reason"], "aborted_by_operator", "{}", closed[0]);
+                assert_eq!(closed[0]["closed_by"], "operator", "{}", closed[0]);
+                assert_eq!(
+                    aborted.len(),
+                    1,
+                    "the published abort did not end the run: {aborted:?}"
+                );
+                assert_eq!(aborted[0]["reason"], "stop", "{}", aborted[0]);
+                assert!(
+                    matches!(
+                        workflow::load_state(root, phase),
+                        Err(workflow::WorkflowError::MissingState(_))
+                    ),
+                    "the abort consumes the request with the state"
+                );
+            } else {
+                assert_eq!(closed[0]["reason"], "agent_exited", "{}", closed[0]);
+                assert!(aborted.is_empty(), "control: no abort: {aborted:?}");
+                assert_eq!(
+                    events_named(root, "workflow_finished").len(),
+                    1,
+                    "control reaches its --until stop"
+                );
+            }
+        }
+    }
+
+    /// `resume` closing a leftover question gate records
+    /// `question_closed{closed_on_resume}` for it; a non-question gate it closes as
+    /// before, with no question event.
+    #[test]
+    fn resume_records_question_closed_for_a_leftover_question_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(1311);
+        let (spec, gate_id) = open_abandoned_question(root, phase, Stage::Code);
+        Gates::open_gate(
+            root,
+            phase,
+            Stage::Plan,
+            devflow_core::gates::GateKind::StageFailure,
+            "a failure",
+        )
+        .unwrap();
+
+        close_gates_for_resume(root, phase, Stage::Code);
+
+        for stage in [Stage::Plan, Stage::Code] {
+            assert!(
+                !Gates::gate_path(root, phase, stage).exists(),
+                "resume left the {stage} gate"
+            );
+        }
+        let closed = events_named(root, "question_closed");
+        assert_eq!(closed.len(), 1, "one question_closed: {closed:?}");
+        assert_eq!(closed[0]["reason"], "closed_on_resume", "{}", closed[0]);
+        assert_eq!(closed[0]["question_id"], spec.question_id, "{}", closed[0]);
+        assert_eq!(closed[0]["gate_id"], gate_id.as_str(), "{}", closed[0]);
+        assert_eq!(closed[0]["stage"], "code", "{}", closed[0]);
     }
 
     // ---- D-16 (999.166 item 6): the exit file records a safe-point stop ----
