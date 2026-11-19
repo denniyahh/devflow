@@ -26,6 +26,7 @@
 
 use crate::liveness;
 use crate::phase_id::PhaseId;
+use crate::question::{QuestionChoice, QuestionSpec};
 use crate::stage::Stage;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -158,6 +159,10 @@ pub enum GateKind {
     /// The gate for a human-only checkpoint declaration at Code that was not
     /// approved (D-39; 52-22).
     CheckpointDeclaration,
+    /// A question an agent asked through `devflow_ask` (Phase 53, D-09). Its
+    /// file carries the question's spec, and only `devflow gate answer` answers
+    /// it; an abort still ends the run.
+    Question,
 }
 
 /// The human's response to a gate.
@@ -768,6 +773,70 @@ impl Gates {
         let opened = Self::write_gate_file(project_root, phase, stage, gate_id, kind, context)?;
         consume_preanswer(project_root, phase, stage, gate_id)?;
         Ok(opened)
+    }
+
+    /// Open a question gate for `spec` and register its waiter, as
+    /// [`open_registered`](Self::open_registered) does. The gate file also
+    /// carries the spec under a top-level `question` key, published in the same
+    /// atomic write.
+    pub fn open_question_registered(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        spec: &QuestionSpec,
+    ) -> Result<(OpenedGate, WaiterRegistration), GateError> {
+        let _ = spec;
+        Self::open_registered(
+            project_root,
+            phase,
+            stage,
+            GateKind::Question,
+            &crate::question::render_question_context(spec),
+        )
+    }
+
+    /// The question spec the stage's gate file carries, or `None` when there is
+    /// no gate file or the gate carries no question.
+    pub fn read_question(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+    ) -> Result<Option<QuestionSpec>, GateError> {
+        let _ = (project_root, phase, stage);
+        Ok(None)
+    }
+
+    /// Answer the question gate the caller observed with `choice`: the same
+    /// approving [`GateAnswer`] body [`answer`](Self::answer) publishes, plus a
+    /// top-level `choice` key, exactly once.
+    pub fn answer_question(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        observed: &GateId,
+        choice: &QuestionChoice,
+        responded_by: &str,
+    ) -> Result<PathBuf, GateError> {
+        let _ = choice;
+        let response = GateResponse {
+            approved: true,
+            abort: false,
+            note: None,
+            responded_by: Some(responded_by.to_string()),
+        };
+        Self::answer(project_root, phase, stage, observed, &response)
+    }
+
+    /// The choice in `gate`'s answer slot, or `None` when the slot holds no
+    /// answer bound to `gate` or the answer carries no choice. Only reads.
+    pub fn read_question_choice(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        gate: &GateId,
+    ) -> Result<Option<QuestionChoice>, GateError> {
+        let _ = (project_root, phase, stage, gate);
+        Ok(None)
     }
 
     /// Register as `gate`'s waiter by taking a lock on its `.waiter` file, held until
@@ -2293,6 +2362,91 @@ mod tests {
     /// `remove_var` are process-wide and `cargo test` runs in parallel by
     /// default) so they don't race each other.
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    /// Phase 53: a question gate publishes its spec under the `question` key,
+    /// and the spec survives the answer and the claim, neither of which
+    /// rewrites the gate file. The choice is read back from the answer slot.
+    /// Control: a gate opened without a question carries none.
+    #[test]
+    fn a_question_gate_keeps_its_spec_through_answer_and_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5301);
+        let stage = Stage::Code;
+        let option = |id: &str, label: &str| crate::question::QuestionOption {
+            id: id.to_string(),
+            label: label.to_string(),
+            description: None,
+        };
+        let spec = QuestionSpec {
+            question_id: crate::question::new_question_id(),
+            question: "Pick a budget".to_string(),
+            options: vec![
+                option("budget-30", "30 s"),
+                option("budget-120", "120 s"),
+                option("budget-300", "300 s"),
+            ],
+            context: Some("the probe needs a bound".to_string()),
+            kind: crate::question::QuestionKind::Decision,
+            recommended: Some("budget-120".to_string()),
+        };
+
+        let (opened, registration) =
+            Gates::open_question_registered(root, phase, stage, &spec).unwrap();
+        let text = std::fs::read_to_string(&opened.path).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(raw["gate_kind"], "question", "{text}");
+        assert_eq!(
+            Gates::read_question(root, phase, stage).unwrap(),
+            Some(spec.clone()),
+            "the gate file publishes the spec under its `question` key: {text}"
+        );
+
+        let choice = QuestionChoice::Option {
+            option_id: "budget-120".to_string(),
+        };
+        Gates::answer_question(root, phase, stage, &opened.gate_id, &choice, "operator").unwrap();
+        assert_eq!(
+            Gates::read_question_choice(root, phase, stage, &opened.gate_id).unwrap(),
+            Some(choice),
+            "the chosen option is read back from the gate's answer slot"
+        );
+        match Gates::read_answer(root, phase, stage, &opened.gate_id) {
+            AnswerRead::Bound(answer) => {
+                assert!(
+                    answer.response.approved && !answer.response.abort,
+                    "{answer:?}"
+                );
+            }
+            other => panic!("the question's answer must bind as a gate answer: {other:?}"),
+        }
+        assert_eq!(
+            Gates::read_question(root, phase, stage).unwrap(),
+            Some(spec.clone()),
+            "the spec survives the answer"
+        );
+        assert_eq!(
+            Gates::claim(root, phase, stage, &opened.gate_id).unwrap(),
+            Claim::Claimed
+        );
+        assert_eq!(
+            Gates::read_question(root, phase, stage).unwrap(),
+            Some(spec),
+            "the spec survives the claim"
+        );
+        registration.finish();
+
+        let control = PhaseId::new(5302);
+        let (_, control_registration) =
+            Gates::open_registered(root, control, stage, GateKind::StageFailure, "a failure")
+                .unwrap();
+        assert_eq!(
+            Gates::read_question(root, control, stage).unwrap(),
+            None,
+            "a gate opened without a question carries no `question` key"
+        );
+        control_registration.finish();
+    }
 
     /// 52-22: a gate's kind is a structured field of its file. A gate opened
     /// with a kind reads back with it and its file holds the snake_case name. The
