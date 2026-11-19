@@ -1621,12 +1621,11 @@ mod tests {
     /// as a `.snap` diff in review instead of drifting unnoticed — the failure
     /// that produced Phase 47.
     ///
-    /// The committed baseline is DELIBERATELY the pre-fix capture: it carries the
-    /// `/gsd-execute-phase` fix command and no unattended decision-policy
-    /// section. That absence is the DECN-02 defect recorded as a reviewed
-    /// artifact; DECN-02's fix must drift this snapshot and re-bless it with the
-    /// content change asserted. Do not re-bless it to make a failure go away —
-    /// read the diff. `scripts/check.sh test` unsets `INSTA_FORCE_UPDATE` and
+    /// The DECN-02 pre-fix baseline is retired (53-06): the decision policy it
+    /// lacked is replaced by the question policy every stage prompt carries, so
+    /// the baseline now pins the `/gsd-execute-phase` fix command, the Code
+    /// policy and the question policy. Do not re-bless it to make a failure go
+    /// away — read the diff. `scripts/check.sh test` unsets `INSTA_FORCE_UPDATE` and
     /// pins `INSTA_UPDATE=no`, so a mismatch fails there rather than rewriting
     /// the baseline.
     #[test]
