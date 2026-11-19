@@ -319,7 +319,7 @@ closing this phase.
      record — the history view distinguishes "not yet answered" from an empty answer, and a run that asked nothing
      shows no question rows. (ASK-04)
 
-**Plans**: 8/14 plans executed
+**Plans**: 9/14 plans executed
 **Wave 1**
 - [x] 53-01-PLAN.md
 - [x] 53-02-PLAN.md
@@ -335,7 +335,7 @@ closing this phase.
 - [x] 53-07-PLAN.md
 
 **Wave 4** *(blocked on Wave 3 completion)*
-- [ ] 53-08-PLAN.md
+- [x] 53-08-PLAN.md
 
 **Wave 5** *(blocked on Wave 4 completion)*
 - [ ] 53-09-PLAN.md
@@ -586,7 +586,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 52 | 33/33 | Executed — verification stale | 2026-11-11 |
 | 52.1 | 7/7 | Executed — closed at plan 07 (operator, 2026-11-15) | 2026-11-15 |
 | 52.2 | 26/26 | In Progress | — |
-| 53 | 8/14 | In Progress | — |
+| 53 | 9/14 | In Progress | — |
 | 54 | 0/? | Not started | — |
 | 55 | 0/? | Not started | — |
 

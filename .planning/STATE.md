@@ -5,16 +5,16 @@ milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: 53
 current_phase_name: The Question Channel
 status: executing
-stopped_at: Completed 53-07-PLAN.md
-last_updated: "2026-11-19T16:26:53.792Z"
+stopped_at: Completed 53-08-PLAN.md
+last_updated: "2026-11-19T16:51:00.791Z"
 last_activity: 2026-11-19
 last_activity_desc: Phase 53 execution started
-state_head: 56e9a6b736098490957d9f78eaf547dd5d3f9020
+state_head: 98b69fe24121185302fd3b50d7e88679fa717e06
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 80
-  completed_plans: 74
+  completed_plans: 75
   percent: 17
 ---
 
@@ -172,7 +172,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 53 (The Question Channel) — EXECUTING
-Plan: 8 of 14
+Plan: 9 of 14
 Status: Ready to execute
 Last activity: 2026-11-19 — Phase 53 execution started
 
@@ -1021,6 +1021,8 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 53]: 53-07: non-D-06 failures (gate open, unreadable answer, lost claim) reply isError with no question_closed
 - [Phase 53]: 53-07: nothing is written to stdout after stdin EOF; on SIGTERM/SIGINT the server replies closed: terminated and exits 128+signal
 - [Phase 53]: 53-07: a call ending while waiting for the ask lock opens no gate and records no question event
+- [Phase 53]: 53-08: the conformance case ask_declarations_agree is the one allowed non-launch ask_wiring caller; the launch site is wire_ask_registration, called only by prepare_stage_launch
+- [Phase 53]: 53-08: refusal text is prefixed 'refusing to launch `<agent>`:' so it names the CLI agent name and devflow_ask
 
 ## Roadmap Evolution
 
@@ -1206,11 +1208,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 53 P05 | 70min | 2 tasks | 3 files |
 | Phase 53 P06 | 11min | 2 tasks | 8 files |
 | Phase 53 P07 | 72min | 3 tasks | 7 files |
+| Phase 53 P08 | 30min | 3 tasks | 11 files |
 
 ## Session
 
-**Last session:** 2026-11-19T16:26:52.051Z
-**Stopped at:** Completed 53-07-PLAN.md
+**Last session:** 2026-11-19T16:50:59.480Z
+**Stopped at:** Completed 53-08-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
