@@ -577,6 +577,7 @@ pub(crate) fn answer_family(kind: Option<GateKind>) -> AnswerFamily {
         Some(GateKind::RateLimit) => AnswerFamily::RateLimit,
         Some(GateKind::Preflight) => AnswerFamily::Preflight,
         Some(GateKind::CheckpointDeclaration) => AnswerFamily::CheckpointDeclaration,
+        Some(GateKind::Question) => AnswerFamily::CheckpointDeclaration,
         None => AnswerFamily::Unclassified,
     }
 }
@@ -1363,7 +1364,8 @@ fn validate_gate_context(
         | GateKind::StageFailure
         | GateKind::RateLimit
         | GateKind::Preflight
-        | GateKind::CheckpointDeclaration => "",
+        | GateKind::CheckpointDeclaration
+        | GateKind::Question => "",
     });
     // WR-04 (35-REVIEW): the ceiling clause belongs on every Validate gate that
     // fired at the ceiling, a passing one included, or an operator running
@@ -2367,6 +2369,40 @@ mod tests {
     use devflow_core::state::AgentKind;
     use devflow_core::test_support::{answer_open_gate, gate_answer_files, preanswer_gate};
     use devflow_core::workflow;
+
+    /// D-10: approve and reject on a question gate are refused by the screen,
+    /// before anything is written, each refusal naming `devflow gate answer`.
+    /// Control: an abort on the same kind is accepted.
+    #[test]
+    fn approve_and_reject_on_a_question_gate_are_refused_naming_gate_answer() {
+        let kind = Some(GateKind::Question);
+        let response = |approved: bool, abort: bool, note: Option<&str>| GateResponse {
+            approved,
+            abort,
+            note: note.map(str::to_string),
+            responded_by: Some("test".to_string()),
+        };
+        for (answer, given) in [
+            ("approve", response(true, false, None)),
+            (
+                "reject",
+                response(false, false, Some("take the other option")),
+            ),
+        ] {
+            let refusal = screen_answer(kind, &given)
+                .expect_err("an approve or a reject on a question gate is refused");
+            assert_eq!(refusal.answer, answer, "{refusal:?}");
+            assert!(
+                refusal.applies.contains("devflow gate answer"),
+                "the {answer} refusal names `devflow gate answer`: {refusal:?}"
+            );
+        }
+        assert_eq!(
+            screen_answer(kind, &response(false, true, None)),
+            Ok(()),
+            "an abort on a question gate is accepted"
+        );
+    }
 
     /// Reaching `MAX_CONSECUTIVE_FAILURES` on a failed Validate must force a
     /// gate (even in Auto mode, which otherwise auto-loops), and an `abort`
@@ -8579,6 +8615,8 @@ mod tests {
         RateLimit,
         /// A gate whose reject is refused (preflight, checkpoint declaration).
         RejectRefused,
+        /// A question gate: approve and reject are both refused.
+        Question,
         /// A file with no kind.
         NoKind,
     }
@@ -8601,6 +8639,7 @@ mod tests {
             Some(GateKind::Preflight) | Some(GateKind::CheckpointDeclaration) => {
                 ParityCase::RejectRefused
             }
+            Some(GateKind::Question) => ParityCase::Question,
             None => ParityCase::NoKind,
         }
     }
@@ -8956,7 +8995,7 @@ mod tests {
                         assert_eq!(resolved[0]["route"], "relaunch_with_note", "{row}");
                     }
                 }
-                ParityCase::RejectRefused => {
+                ParityCase::RejectRefused | ParityCase::Question => {
                     let kind = kind.expect("a kind");
                     let route = reject_route(
                         &parity_gate(PhaseId::new(number), Stage::Code, Some(kind)),
@@ -9393,6 +9432,18 @@ mod tests {
                     );
                     assert!(
                         matches!(&route, ApproveRoute::StatusLess(step) if *step == expected),
+                        "{row}: {route:?}"
+                    );
+                }
+                ParityCase::Question => {
+                    let route = approve_route(
+                        &parity_gate(PhaseId::new(number), Stage::Code, kind),
+                        None,
+                        || panic!("{row}: a question approve reads no GSD status"),
+                    );
+                    assert!(
+                        matches!(&route, ApproveRoute::Refused(refusal)
+                            if refusal.applies.contains("devflow gate answer")),
                         "{row}: {route:?}"
                     );
                 }
