@@ -13,17 +13,24 @@
 //! end, SIGTERM or SIGINT, the run stopped, its runner lock no longer live, or
 //! the timeout (D-06). Every ending other than an answer closes the call's own
 //! gate (never a gate that replaced it) and records `question_closed`.
+//!
+//! With `--hold-cap-secs` (operator answer OD-1 (b)) a call is held at most
+//! that long: at the cap it replies `pending` with its `question_id` and the
+//! question stays open at its gate, and a re-call carrying that id continues
+//! it. The timeout counts from the question's first call, held or not.
 
 use crate::pipeline_gate::fire_gate_notify_events;
-use devflow_core::gates::{AwaitOutcome, Claim, GateAnswer, GateId, GateKind, Gates};
-use devflow_core::liveness::{self, Held};
+use devflow_core::gates::{
+    AwaitOutcome, Claim, GateAnswer, GateId, GateKind, Gates, WaiterRegistration,
+};
+use devflow_core::liveness;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::question::{AskAnswer, QuestionChoice, QuestionSpec, render_question_context};
 use devflow_core::stage::Stage;
 use devflow_core::{events, workflow};
 use serde_json::{Value, json};
 use std::cell::Cell;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -73,6 +80,9 @@ pub(crate) struct AskArgs {
     /// The launching run's `started_at`; a call is refused unless the saved
     /// state still carries it.
     pub(crate) run_started_at: String,
+    /// The longest one call is held, in seconds; `None` holds it until the
+    /// question ends.
+    pub(crate) hold_cap_secs: Option<u64>,
 }
 
 /// What the reader does with one line.
@@ -217,9 +227,7 @@ pub(crate) fn serve(args: AskArgs) -> i32 {
     }
     let input = std::io::BufReader::new(std::io::stdin());
     let output = Arc::new(Mutex::new(std::io::stdout()));
-    run_server(input, output, move |params, control| {
-        ask(&args, params, control)
-    })
+    run_worker(input, output, AskServer::new(args))
 }
 
 /// Record SIGTERM and SIGINT in [`CAUGHT_SIGNAL`] instead of dying, so a held
@@ -244,16 +252,48 @@ fn install_stop_handler() -> std::io::Result<()> {
     Ok(())
 }
 
-/// The server loop over any input and output, so tests drive it without stdio.
-/// A reader thread reads `input`; the calling thread is the worker, running
-/// `call` on each `tools/call`'s params in arrival order. `call` returns the
-/// tool result, or `None` to send no reply (a cancelled call). The loop ends at
-/// stdin's end or a caught signal, after the call in hand has cleaned up.
+/// What the server loop's worker thread runs.
+pub(crate) trait Worker {
+    /// One `tools/call`'s params: the tool result, or `None` to send no reply
+    /// (a cancelled call).
+    fn call(&mut self, params: &Value, control: &CallControl<'_>) -> Option<Value>;
+    /// No call is held: end what has run out. Called about every [`IDLE_POLL`].
+    fn idle(&mut self) {}
+    /// The loop is ending, at stdin's end or a caught signal.
+    fn shut_down(&mut self, _ending: Ending) {}
+}
+
+/// A worker that only answers calls.
+#[cfg(test)]
+struct CallFn<F>(F);
+
+#[cfg(test)]
+impl<F: FnMut(&Value, &CallControl<'_>) -> Option<Value>> Worker for CallFn<F> {
+    fn call(&mut self, params: &Value, control: &CallControl<'_>) -> Option<Value> {
+        (self.0)(params, control)
+    }
+}
+
+/// [`run_worker`] with a worker that only answers calls.
+#[cfg(test)]
 pub(crate) fn run_server<R, W>(
     input: R,
     output: Arc<Mutex<W>>,
-    mut call: impl FnMut(&Value, &CallControl<'_>) -> Option<Value>,
+    call: impl FnMut(&Value, &CallControl<'_>) -> Option<Value>,
 ) -> i32
+where
+    R: BufRead + Send + 'static,
+    W: Write + Send + 'static,
+{
+    run_worker(input, output, CallFn(call))
+}
+
+/// The server loop over any input and output, so tests drive it without stdio.
+/// A reader thread reads `input`; the calling thread is the worker, running
+/// each `tools/call`'s params in arrival order and idling between calls. The
+/// loop ends at stdin's end or a caught signal, after the call in hand has
+/// cleaned up; the worker then shuts down with that ending.
+pub(crate) fn run_worker<R, W>(input: R, output: Arc<Mutex<W>>, mut worker: impl Worker) -> i32
 where
     R: BufRead + Send + 'static,
     W: Write + Send + 'static,
@@ -269,13 +309,13 @@ where
         eprintln!("devflow __ask: could not start the reader thread: {error}");
         return 1;
     }
-    while let Some(pending) = next_call(&flags) {
+    while let Some(pending) = next_call(&flags, &mut worker) {
         let control = CallControl {
             flags: &flags,
             id_text: &pending.id_text,
             arrived: pending.arrived,
         };
-        let result = call(&pending.params, &control);
+        let result = worker.call(&pending.params, &control);
         // After stdin's end the client is gone: nothing more goes to stdout.
         if let Some(result) = result
             && !flags.eof.load(Ordering::SeqCst)
@@ -284,11 +324,17 @@ where
         }
         lock(&flags.cancelled).remove(&pending.id_text);
     }
-    caught_signal().map_or(0, |signal| 128 + signal)
+    let signal = caught_signal();
+    worker.shut_down(if signal.is_some() {
+        Ending::Terminated
+    } else {
+        Ending::ClientDisconnected
+    });
+    signal.map_or(0, |signal| 128 + signal)
 }
 
 /// The next queued call, or `None` once stdin has ended or a signal arrived.
-fn next_call(flags: &CallFlags) -> Option<PendingCall> {
+fn next_call(flags: &CallFlags, worker: &mut impl Worker) -> Option<PendingCall> {
     let mut queue = lock(&flags.queue);
     loop {
         if flags.eof.load(Ordering::SeqCst) || caught_signal().is_some() {
@@ -296,6 +342,12 @@ fn next_call(flags: &CallFlags) -> Option<PendingCall> {
         }
         if let Some(pending) = queue.pop_front() {
             return Some(pending);
+        }
+        drop(queue);
+        worker.idle();
+        queue = lock(&flags.queue);
+        if !queue.is_empty() {
+            continue;
         }
         queue = flags
             .wake
@@ -444,7 +496,8 @@ fn ask_tool_definition() -> Value {
     json!({
         "name": ASK_TOOL,
         "description": "Ask the operator a question and wait for their answer. The call \
-            returns the option the operator chose.",
+            returns the option the operator chose, or a `pending` result naming a question_id \
+            to call again with while the question stays open.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -464,7 +517,12 @@ fn ask_tool_definition() -> Value {
                 },
                 "context": { "type": "string" },
                 "kind": { "type": "string", "enum": ["decision", "blocking-human", "discuss"] },
-                "recommended": { "type": "string", "description": "An offered option's id." }
+                "recommended": { "type": "string", "description": "An offered option's id." },
+                "question_id": {
+                    "type": "string",
+                    "description": "Only on a re-call: the question_id of a pending reply, \
+                        to keep waiting on that same question."
+                }
             },
             "required": ["question", "options", "kind"]
         }
@@ -476,11 +534,13 @@ fn tool_error(why: &str) -> Value {
     json!({ "content": [{ "type": "text", "text": why }], "isError": true })
 }
 
-/// The question a call asks, under a fresh question id, or why it was refused
-/// (D-07, D-08). A refusal is returned before any gate is touched, so it blocks
-/// neither this call nor the calls queued behind it.
-fn parse_ask_arguments(arguments: &Value) -> Result<QuestionSpec, String> {
-    QuestionSpec::from_arguments(arguments).map_err(|error| format!("devflow_ask refused: {error}"))
+/// The question a call asks, under a fresh question id, beside the
+/// `question_id` a re-call carries, or why it was refused (D-07, D-08). A
+/// refusal is returned before any gate is touched, so it blocks neither this
+/// call nor the calls queued behind it.
+fn parse_ask_arguments(arguments: &Value) -> Result<(QuestionSpec, Option<String>), String> {
+    QuestionSpec::from_call_arguments(arguments)
+        .map_err(|error| format!("devflow_ask refused: {error}"))
 }
 
 /// How a question gate ended without an answer the agent can use.
@@ -511,18 +571,189 @@ impl Unanswered {
     }
 }
 
-/// One `devflow_ask` call: check it binds to its run, open the question gate,
-/// wait for its answer, and return the operator's choice as the tool result.
-/// `None` for a call the client cancelled, which gets no reply.
-fn ask(args: &AskArgs, params: &Value, control: &CallControl<'_>) -> Option<Value> {
-    let spec = match parse_ask_arguments(params.get("arguments").unwrap_or(&Value::Null)) {
-        Ok(spec) => spec,
-        Err(why) => return Some(tool_error(&why)),
-    };
-    if let Err(why) = check_run_binding(args) {
-        return Some(tool_error(&why));
+/// A question this server opened: its gate, held until the question ends,
+/// across every call that holds it (operator answer OD-1 (b)).
+struct OpenGate {
+    gate_id: GateId,
+    registration: WaiterRegistration,
+    notifier: Notifier,
+    /// The stage's ask lock, released once the question has closed.
+    ask_lock: liveness::Hold,
+}
+
+/// A question asked and not yet ended. A capped call that reaches its cap
+/// leaves it here, and a re-call carrying its `question_id` takes it back.
+struct OpenQuestion {
+    spec: QuestionSpec,
+    /// The first call's arrival plus `--timeout-secs` (T counts from there).
+    deadline: Instant,
+    /// `None` while the question waits for the stage's ask lock.
+    gate: Option<OpenGate>,
+}
+
+/// The `devflow_ask` worker: each call, and the questions left open between
+/// calls by a hold cap.
+struct AskServer {
+    args: AskArgs,
+    /// The questions no call holds, by question id.
+    open: HashMap<String, OpenQuestion>,
+    /// The reply each question this server ended gave, by question id, which
+    /// a later re-call of that id gets again.
+    finished: HashMap<String, Value>,
+    /// When the idle worker last read the run state and the runner lock.
+    last_run_check: Option<Instant>,
+}
+
+/// What became of a call's hold on its question.
+enum CallOutcome {
+    /// The question ended; this is its result.
+    Ended(Result<AskAnswer, Unanswered>),
+    /// The call's cap came first; the question stays open.
+    Pending,
+}
+
+impl Worker for AskServer {
+    fn call(&mut self, params: &Value, control: &CallControl<'_>) -> Option<Value> {
+        let (spec, recall_id) =
+            match parse_ask_arguments(params.get("arguments").unwrap_or(&Value::Null)) {
+                Ok(parsed) => parsed,
+                Err(why) => return Some(tool_error(&why)),
+            };
+        if let Err(why) = check_run_binding(&self.args) {
+            return Some(tool_error(&why));
+        }
+        let question = match recall_id {
+            None => OpenQuestion {
+                spec,
+                deadline: control.arrived + Duration::from_secs(self.args.timeout_secs),
+                gate: None,
+            },
+            Some(id) => match self.open.remove(&id) {
+                Some(question) => question,
+                None => {
+                    return Some(self.finished.get(&id).cloned().unwrap_or_else(|| {
+                        tool_error(&format!(
+                            "devflow_ask refused: question_id `{id}` names no question this \
+                             server asked; call without a question_id to ask a new question"
+                        ))
+                    }));
+                }
+            },
+        };
+        self.hold(question, control)
     }
-    match ask_gate(args, &spec, control) {
+
+    fn idle(&mut self) {
+        if self.open.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let timed_out: Vec<String> = self
+            .open
+            .iter()
+            .filter(|(_, question)| question.deadline <= now)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in timed_out {
+            self.close_unheld(&id, Ending::TimedOut);
+        }
+        if self
+            .last_run_check
+            .is_some_and(|checked| checked.elapsed() < RUN_CHECK_INTERVAL)
+        {
+            return;
+        }
+        self.last_run_check = Some(now);
+        if let Some(ending) = run_ending(&self.args) {
+            self.close_all(ending);
+        }
+    }
+
+    fn shut_down(&mut self, ending: Ending) {
+        self.close_all(ending);
+    }
+}
+
+impl AskServer {
+    fn new(args: AskArgs) -> Self {
+        Self {
+            args,
+            open: HashMap::new(),
+            finished: HashMap::new(),
+            last_run_check: None,
+        }
+    }
+
+    /// Hold `question` for this call: open its gate if it has none, wait for
+    /// its answer until its T or this call's cap, and reply. `None` for a call
+    /// the client cancelled, which gets no reply.
+    fn hold(&mut self, mut question: OpenQuestion, control: &CallControl<'_>) -> Option<Value> {
+        let cap = self
+            .args
+            .hold_cap_secs
+            .map(|cap| control.arrived + Duration::from_secs(cap));
+        let hold_until = cap.map_or(question.deadline, |cap| cap.min(question.deadline));
+        let watch = RunWatch::new(&self.args, control, hold_until);
+        let held = hold_question(&self.args, &mut question, &watch);
+        let id = question.spec.question_id.clone();
+        let reply = match held {
+            CallOutcome::Pending => {
+                let reply = pending_result(&id, question.gate.is_some());
+                self.open.insert(id, question);
+                return Some(reply);
+            }
+            CallOutcome::Ended(result) => {
+                if let Some(gate) = question.gate.take() {
+                    close_gate(&self.args, &question.spec, gate, &result);
+                }
+                ended_reply(result)
+            }
+        };
+        self.finished.insert(
+            id,
+            reply.clone().unwrap_or_else(|| {
+                closed_error(
+                    Ending::CancelledByClient,
+                    Ending::CancelledByClient.sentence(),
+                )
+            }),
+        );
+        reply
+    }
+
+    /// End the open question `id`, which no call holds, with `ending`.
+    fn close_unheld(&mut self, id: &str, ending: Ending) {
+        let Some(mut question) = self.open.remove(id) else {
+            return;
+        };
+        match question.gate.take() {
+            Some(gate) => close_gate(
+                &self.args,
+                &question.spec,
+                gate,
+                &Err(Unanswered::closed(ending)),
+            ),
+            None => eprintln!(
+                "devflow __ask: question {id} ended ({}) before its gate opened",
+                ending.reason()
+            ),
+        }
+        self.finished
+            .insert(id.to_string(), closed_error(ending, ending.sentence()));
+    }
+
+    /// End every open question no call holds with `ending`.
+    fn close_all(&mut self, ending: Ending) {
+        let ids: Vec<String> = self.open.keys().cloned().collect();
+        for id in ids {
+            self.close_unheld(&id, ending);
+        }
+    }
+}
+
+/// The reply for a question that ended, `None` for one the client cancelled.
+fn ended_reply(result: Result<AskAnswer, Unanswered>) -> Option<Value> {
+    match result {
         Ok(answer) => Some(answered_result(&answer)),
         Err(
             Unanswered::Closed {
@@ -535,6 +766,26 @@ fn ask(args: &AskArgs, params: &Value, control: &CallControl<'_>) -> Option<Valu
         Err(Unanswered::NotAsked(ending)) => Some(closed_error(ending, ending.sentence())),
         Err(Unanswered::Failed(why)) => Some(tool_error(&why)),
     }
+}
+
+/// The reply at a call's cap: not an error, naming the question id the
+/// re-call carries. `asked` says whether the question's gate is open yet.
+fn pending_result(question_id: &str, asked: bool) -> Value {
+    let text = if asked {
+        format!(
+            "No answer yet. Call devflow_ask again with the same arguments and question_id \
+             {question_id}; the question stays open for the operator."
+        )
+    } else {
+        format!(
+            "Not asked yet: another question holds this stage. Call devflow_ask again with \
+             the same arguments and question_id {question_id}."
+        )
+    };
+    json!({
+        "content": [{ "type": "text", "text": text }],
+        "structuredContent": { "status": "pending", "question_id": question_id },
+    })
 }
 
 /// The tool result for a question that ended without an answer.
@@ -580,8 +831,8 @@ fn check_run_binding(args: &AskArgs) -> Result<(), String> {
         ));
     }
     match liveness::probe(&liveness::runner_lock_path(&args.project, phase)) {
-        Ok(Held::Live) => Ok(()),
-        Ok(Held::Abandoned | Held::Missing) => Err(format!(
+        Ok(liveness::Held::Live) => Ok(()),
+        Ok(liveness::Held::Abandoned | liveness::Held::Missing) => Err(format!(
             "devflow_ask refused: phase {phase}'s runner is not live, so no one would read \
              the question"
         )),
@@ -591,53 +842,91 @@ fn check_run_binding(args: &AskArgs) -> Result<(), String> {
     }
 }
 
-/// The gate half of [`ask`]: take the stage's ask lock, open, wait, read the
-/// choice, claim, finish the registration and close the question's own gate.
-/// The registration is finished and the gate closed on every exit path; the
-/// close is identity checked, so a gate that replaced this one survives. The
-/// ask lock is held until the question has closed.
-fn ask_gate(
+/// One call's hold on `question`: take the stage's ask lock and open the gate
+/// if the question has none, then wait for its answer and read the choice.
+/// The call's time ends at `watch.deadline`: the question's T, or the call's
+/// cap when that comes first, in which case the question is left open.
+fn hold_question(args: &AskArgs, question: &mut OpenQuestion, watch: &RunWatch<'_>) -> CallOutcome {
+    let (root, phase, stage) = (args.project.as_path(), args.phase, args.stage);
+    let spec = &question.spec;
+    let capped =
+        |watch: &RunWatch<'_>| watch.ending.get().is_none() && Instant::now() < question.deadline;
+    if question.gate.is_none() {
+        let ask_lock = match take_ask_lock(args, spec, watch) {
+            Ok(hold) => hold,
+            Err(Unanswered::NotAsked(Ending::TimedOut)) if capped(watch) => {
+                return CallOutcome::Pending;
+            }
+            Err(unanswered) => return CallOutcome::Ended(Err(unanswered)),
+        };
+        let (opened, registration) = match Gates::open_question_registered(root, phase, stage, spec)
+        {
+            Ok(opened) => opened,
+            Err(error) => {
+                return CallOutcome::Ended(Err(Unanswered::Failed(format!(
+                    "devflow_ask could not open the question gate: {error}"
+                ))));
+            }
+        };
+        let gate_id = opened.gate_id;
+        eprintln!(
+            "devflow __ask: question gate .devflow/gates/{}-{stage}.json written (gate {gate_id}); \
+             awaiting `devflow gate answer`",
+            phase.padded()
+        );
+        let notifier = Notifier::spawn(args, spec);
+        emit_question_asked(args, spec, &gate_id);
+        question.gate = Some(OpenGate {
+            gate_id,
+            registration,
+            notifier,
+            ask_lock,
+        });
+    }
+    let Some(gate_id) = question.gate.as_ref().map(|gate| gate.gate_id.clone()) else {
+        return CallOutcome::Ended(Err(Unanswered::Failed(
+            "devflow_ask: the question has no open gate".into(),
+        )));
+    };
+    match await_bound_answer(args, &gate_id, watch) {
+        Ok(Some(answer)) => CallOutcome::Ended(consume(args, &gate_id, &question.spec, &answer)),
+        Ok(None) if capped(watch) => CallOutcome::Pending,
+        Ok(None) => CallOutcome::Ended(Err(Unanswered::closed(
+            watch.ending.get().unwrap_or(Ending::TimedOut),
+        ))),
+        Err(why) => CallOutcome::Ended(Err(Unanswered::Failed(why))),
+    }
+}
+
+/// End a question's gate: finish the registration, close the question's own
+/// gate (identity checked, so a gate that replaced it survives), stop its
+/// notifier, record how it ended, and release the stage's ask lock last.
+fn close_gate(
     args: &AskArgs,
     spec: &QuestionSpec,
-    control: &CallControl<'_>,
-) -> Result<AskAnswer, Unanswered> {
+    gate: OpenGate,
+    result: &Result<AskAnswer, Unanswered>,
+) {
     let (root, phase, stage) = (args.project.as_path(), args.phase, args.stage);
-    let watch = RunWatch::new(args, control);
-    let _ask_lock = take_ask_lock(args, spec, &watch)?;
-    let (opened, registration) = Gates::open_question_registered(root, phase, stage, spec)
-        .map_err(|error| {
-            Unanswered::Failed(format!(
-                "devflow_ask could not open the question gate: {error}"
-            ))
-        })?;
-    let gate_id = opened.gate_id;
-    eprintln!(
-        "devflow __ask: question gate .devflow/gates/{}-{stage}.json written (gate {gate_id}); \
-         awaiting `devflow gate answer`",
-        phase.padded()
-    );
-    let notifier = Notifier::spawn(args, spec);
-    emit_question_asked(args, spec, &gate_id);
-    let result = match await_bound_answer(args, &gate_id, &watch) {
-        Ok(Some(answer)) => consume(args, &gate_id, spec, &answer),
-        Ok(None) => Err(Unanswered::closed(
-            watch.ending.get().unwrap_or(Ending::TimedOut),
-        )),
-        Err(why) => Err(Unanswered::Failed(why)),
-    };
+    let OpenGate {
+        gate_id,
+        registration,
+        notifier,
+        ask_lock,
+    } = gate;
     registration.finish();
     if let Err(error) = Gates::close_if_current(root, phase, stage, &gate_id) {
         eprintln!("devflow __ask: could not close phase {phase} {stage}'s gate {gate_id}: {error}");
     }
     notifier.finish();
-    match &result {
+    match result {
         Ok(answer) => emit_question_answered(args, &gate_id, answer),
         Err(Unanswered::Closed {
             ending, closed_by, ..
         }) => emit_question_closed(args, spec, &gate_id, *ending, closed_by.as_deref()),
         Err(Unanswered::NotAsked(_) | Unanswered::Failed(_)) => {}
     }
-    result
+    drop(ask_lock);
 }
 
 /// Take the stage's ask lock, retrying every [`ASK_LOCK_RETRY`] while another
@@ -659,7 +948,7 @@ fn take_ask_lock(
         let left = watch.deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             eprintln!(
-                "devflow __ask: question {} timed out before its gate opened",
+                "devflow __ask: question {} reached its time before its gate opened",
                 spec.question_id
             );
             return Err(Unanswered::NotAsked(Ending::TimedOut));
@@ -676,24 +965,40 @@ fn take_ask_lock(
     }
 }
 
-/// What ends a held question from outside, polled on every cancel check of the
+/// The run stopped, or its runner lock no longer held, if either is so now.
+fn run_ending(args: &AskArgs) -> Option<Ending> {
+    let (root, phase) = (args.project.as_path(), args.phase);
+    if workflow::load_state(root, phase).is_ok_and(|state| state.stopped) {
+        return Some(Ending::RunStopped);
+    }
+    match liveness::probe(&liveness::runner_lock_path(root, phase)) {
+        Ok(liveness::Held::Live) => None,
+        Ok(liveness::Held::Abandoned | liveness::Held::Missing) => Some(Ending::RunnerGone),
+        Err(error) => {
+            eprintln!("devflow __ask: could not probe phase {phase}'s runner lock: {error}");
+            None
+        }
+    }
+}
+
+/// What ends a held call from outside, polled on every cancel check of the
 /// answer wait: the client's endings at once, the run's state and runner lock
 /// at most once per [`RUN_CHECK_INTERVAL`]. The first ending seen is kept.
 struct RunWatch<'a> {
     args: &'a AskArgs,
     control: &'a CallControl<'a>,
-    /// The call's arrival plus `--timeout-secs`.
+    /// When this call's hold ends: the question's T, or the call's cap.
     deadline: Instant,
     last_run_check: Cell<Option<Instant>>,
     ending: Cell<Option<Ending>>,
 }
 
 impl<'a> RunWatch<'a> {
-    fn new(args: &'a AskArgs, control: &'a CallControl<'a>) -> Self {
+    fn new(args: &'a AskArgs, control: &'a CallControl<'a>, deadline: Instant) -> Self {
         Self {
             args,
             control,
-            deadline: control.arrived + Duration::from_secs(args.timeout_secs),
+            deadline,
             last_run_check: Cell::new(None),
             ending: Cell::new(None),
         }
@@ -718,18 +1023,7 @@ impl<'a> RunWatch<'a> {
             return None;
         }
         self.last_run_check.set(Some(Instant::now()));
-        let (root, phase) = (self.args.project.as_path(), self.args.phase);
-        if workflow::load_state(root, phase).is_ok_and(|state| state.stopped) {
-            return Some(Ending::RunStopped);
-        }
-        match liveness::probe(&liveness::runner_lock_path(root, phase)) {
-            Ok(Held::Live) => None,
-            Ok(Held::Abandoned | Held::Missing) => Some(Ending::RunnerGone),
-            Err(error) => {
-                eprintln!("devflow __ask: could not probe phase {phase}'s runner lock: {error}");
-                None
-            }
-        }
+        run_ending(self.args)
     }
 }
 

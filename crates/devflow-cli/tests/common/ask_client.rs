@@ -153,6 +153,8 @@ pub struct AskOverrides {
     pub run_started_at: Option<String>,
     /// A `--timeout-secs` other than [`ASK_TIMEOUT_SECS`].
     pub timeout_secs: Option<u64>,
+    /// A `--hold-cap-secs`, which the fixture's server otherwise has none of.
+    pub hold_cap_secs: Option<u64>,
 }
 
 /// A running `devflow __ask` and the lines it has written to stdout.
@@ -184,6 +186,13 @@ impl AskClient {
             .args(["--stage", &fixture.stage().to_string()])
             .args(["--timeout-secs", &timeout_secs.to_string()])
             .args(["--run-started-at", &run_started_at])
+            .args(
+                overrides
+                    .hold_cap_secs
+                    .map(|cap| ["--hold-cap-secs".to_string(), cap.to_string()])
+                    .into_iter()
+                    .flatten(),
+            )
             // The hook a test means comes from the saved state alone.
             .env_remove(devflow_core::gates::GATE_NOTIFY_CMD_ENV)
             .stdin(Stdio::piped())

@@ -846,3 +846,194 @@ fn a_call_waiting_on_another_servers_ask_lock_times_out() {
         "a question_asked for the call that never got the ask lock: {asked:?}"
     );
 }
+
+/// The id of a re-call of a question that came back `pending`.
+const RECALL_ID: u64 = 4;
+
+/// The arguments [`AskClient::ask`] sends for `OPTIONS`, with `question_id`
+/// added when given.
+fn ask_arguments(question_id: Option<&str>) -> Value {
+    let options: Vec<Value> = OPTIONS
+        .iter()
+        .map(|option| json!({ "id": option, "label": format!("label of {option}") }))
+        .collect();
+    let mut arguments =
+        json!({ "question": "Pick a budget", "options": options, "kind": "decision" });
+    if let Some(question_id) = question_id {
+        arguments["question_id"] = json!(question_id);
+    }
+    arguments
+}
+
+/// Call `devflow_ask` under `id` with the arguments of the first call plus `question_id`.
+fn recall(client: &mut AskClient, id: u64, question_id: &str) {
+    client.request(
+        id,
+        "tools/call",
+        json!({ "name": "devflow_ask", "arguments": ask_arguments(Some(question_id)) }),
+    );
+}
+
+/// A capped server for the fixture's run.
+fn capped_client(fixture: &AskFixture, hold_cap_secs: u64, timeout_secs: u64) -> AskClient {
+    AskClient::spawn_with(
+        fixture,
+        AskOverrides {
+            hold_cap_secs: Some(hold_cap_secs),
+            timeout_secs: Some(timeout_secs),
+            ..AskOverrides::default()
+        },
+    )
+}
+
+/// The question id of a `pending` reply, asserting it is a non-error pending result.
+fn pending_question_id(reply: &Value) -> String {
+    assert_ne!(
+        reply["result"]["isError"], true,
+        "a pending reply is not an error: {reply}"
+    );
+    let structured = &reply["result"]["structuredContent"];
+    assert_eq!(structured["status"], "pending", "status: {reply}");
+    structured["question_id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| panic!("no question_id in the pending reply: {reply}"))
+        .to_string()
+}
+
+#[test]
+fn a_capped_call_returns_pending_and_a_recall_gets_the_answer() {
+    let fixture = AskFixture::new(Stage::Code);
+    let mut client = capped_client(&fixture, 2, 60);
+    client.handshake();
+    let sent = Instant::now();
+    client.ask(CALL_ID, "Pick a budget", &OPTIONS);
+    let gate_id = fixture.wait_for_gate_id();
+    let pending = client
+        .reply(CALL_ID, Duration::from_secs(10))
+        .expect("a capped call replies at its cap");
+    let waited = sent.elapsed();
+    assert!(
+        waited >= Duration::from_millis(1500),
+        "the pending reply came before the 2 s cap: {waited:?}"
+    );
+    let question_id = pending_question_id(&pending);
+    assert_eq!(
+        open_gate_id(&fixture).as_deref(),
+        Some(gate_id.as_str()),
+        "the question's gate changed or closed at the cap"
+    );
+
+    // The operator answers while no call is held.
+    answer(&fixture, &gate_id, "budget-120");
+    let recalled = Instant::now();
+    recall(&mut client, RECALL_ID, &question_id);
+    let reply = client
+        .reply(RECALL_ID, REPLY_WAIT)
+        .expect("the re-call replies with the answer");
+    let took = recalled.elapsed();
+    assert!(
+        took < Duration::from_secs(5),
+        "the re-call waited for an answer already given: {took:?}"
+    );
+    assert_eq!(option_of(&reply), "budget-120", "{reply}");
+    assert_eq!(
+        reply["result"]["structuredContent"]["question_id"],
+        question_id.as_str(),
+        "the answer is for the same question: {reply}"
+    );
+    let count = |event: &str| fixture.events_named(event).len();
+    assert_eq!(count("question_asked"), 1, "question_asked events");
+    assert_eq!(count("gate_fired"), 1, "gate_fired events");
+    assert_eq!(count("question_answered"), 1, "question_answered events");
+    assert_eq!(
+        count("question_closed"),
+        0,
+        "a question_closed for an answered question"
+    );
+}
+
+#[test]
+fn a_pending_question_times_out_without_a_held_call() {
+    let fixture = AskFixture::new(Stage::Code);
+    let mut client = capped_client(&fixture, 1, 3);
+    client.handshake();
+    let sent = Instant::now();
+    client.ask(CALL_ID, "Pick a budget", &OPTIONS);
+    fixture.wait_for_gate_id();
+    let pending = client
+        .reply(CALL_ID, Duration::from_secs(3))
+        .expect("a capped call replies at its cap");
+    let question_id = pending_question_id(&pending);
+
+    while fixture.gate_path().exists() {
+        assert!(
+            sent.elapsed() < Duration::from_secs(5),
+            "a pending question still open 5 s after its first call (T is 3 s)"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    wait_for_closed_reason(&fixture, "timed_out");
+
+    recall(&mut client, RECALL_ID, &question_id);
+    let reply = client
+        .reply(RECALL_ID, ENDING_WAIT)
+        .expect("a re-call of a closed question replies");
+    let text = error_text(&reply);
+    assert!(
+        text.starts_with("devflow_ask closed: timed_out"),
+        "the `devflow_ask closed:` prefix: {text}"
+    );
+}
+
+#[test]
+fn a_recall_with_an_unknown_question_id_is_refused() {
+    let fixture = AskFixture::new(Stage::Code);
+    let mut client = capped_client(&fixture, 2, 60);
+    client.handshake();
+    let unknown = "0123456789abcdef";
+    recall(&mut client, RECALL_ID, unknown);
+    let reply = client
+        .reply(RECALL_ID, ENDING_WAIT)
+        .expect("a re-call with an unknown id replies");
+    let text = error_text(&reply);
+    assert!(
+        text.starts_with("devflow_ask refused:"),
+        "the `devflow_ask refused:` prefix: {text}"
+    );
+    assert!(text.contains(unknown), "the refusal names the id: {text}");
+    assert!(!fixture.gate_path().exists(), "an unknown id opened a gate");
+    assert!(
+        fixture.events_named("question_asked").is_empty(),
+        "an unknown id recorded a question"
+    );
+}
+
+#[test]
+fn an_uncapped_call_holds_past_a_cap_value() {
+    let fixture = AskFixture::new(Stage::Code);
+    let mut client = AskClient::spawn_with(
+        &fixture,
+        AskOverrides {
+            timeout_secs: Some(60),
+            ..AskOverrides::default()
+        },
+    );
+    client.handshake();
+    client.ask(CALL_ID, "Pick a budget", &OPTIONS);
+    let gate_id = fixture.wait_for_gate_id();
+    assert!(
+        client.reply(CALL_ID, Duration::from_secs(4)).is_none(),
+        "an uncapped call replied before its question was answered"
+    );
+    assert_eq!(
+        open_gate_id(&fixture).as_deref(),
+        Some(gate_id.as_str()),
+        "the question is still open"
+    );
+    answer(&fixture, &gate_id, "budget-300");
+    let reply = client
+        .reply(CALL_ID, REPLY_WAIT)
+        .expect("the held call replies once answered");
+    assert_eq!(option_of(&reply), "budget-300", "{reply}");
+}
