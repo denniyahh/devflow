@@ -58,6 +58,7 @@ Thumbs.db
 .devflow/history/
 # Phase 53: the per-launch devflow_ask registration and the per-stage ask lock
 .devflow/ask-*.mcp.json
+.devflow/ask-*.mcp.ts
 .devflow/.ask-*
 
 # Per-checkout DevFlow configuration (`base_branch` and other `devflow.toml`

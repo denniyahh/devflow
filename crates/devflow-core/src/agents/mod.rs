@@ -161,7 +161,7 @@ pub struct AskWiring {
 /// The refusal of a driver that has no `devflow_ask` registration.
 fn no_ask_registration(name: &str) -> String {
     format!(
-        "{name} has no MCP registration for devflow_ask; launch with --agent claude or --agent codex"
+        "{name} has no MCP registration for devflow_ask; launch with --agent claude, --agent codex or --agent pi"
     )
 }
 
@@ -576,7 +576,7 @@ mod tests {
             let name = driver.name();
             let support = driver.ask_support();
             let wiring = driver.ask_wiring(&reg);
-            if matches!(kind, AgentKind::Claude | AgentKind::Codex) {
+            if matches!(kind, AgentKind::Claude | AgentKind::Codex | AgentKind::Pi) {
                 assert_eq!(support, Ok(()), "{name} registers the server");
                 assert!(wiring.is_ok(), "{name} registers the server: {wiring:?}");
             } else {
@@ -585,6 +585,10 @@ mod tests {
                 assert_eq!(support, wiring, "{name}: the two declarations differ");
                 assert!(support.contains(name), "{name}: {support}");
                 assert!(support.contains("devflow_ask"), "{name}: {support}");
+                assert!(
+                    support.contains("--agent claude, --agent codex or --agent pi"),
+                    "{name}: {support}"
+                );
             }
             assert!(
                 ask_declarations_agree(driver.as_ref()),
@@ -593,10 +597,10 @@ mod tests {
         }
     }
 
-    /// OD-1 (b): of the drivers that register the server, only codex passes
+    /// OD-1 (b) and OD-2: of the drivers that register the server, codex and pi pass
     /// `--hold-cap-secs`; claude's server gets the five `__ask` flags alone.
     #[test]
-    fn only_codex_carries_a_hold_cap() {
+    fn only_codex_and_pi_carry_a_hold_cap() {
         let reg = AskRegistration {
             exe: PathBuf::from("/usr/bin/devflow"),
             project_root: PathBuf::from("/project"),
@@ -632,7 +636,7 @@ mod tests {
                 || file_text.contains("--hold-cap-secs");
             assert_eq!(
                 carries_cap,
-                kind == AgentKind::Codex,
+                matches!(kind, AgentKind::Codex | AgentKind::Pi),
                 "{}: hold cap present = {carries_cap}: {wiring:?}",
                 driver.name()
             );
@@ -647,7 +651,7 @@ mod tests {
         }
         assert_eq!(
             registered,
-            [AgentKind::Claude, AgentKind::Codex],
+            [AgentKind::Claude, AgentKind::Codex, AgentKind::Pi],
             "the drivers that register the server"
         );
     }

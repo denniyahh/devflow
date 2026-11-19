@@ -19,9 +19,20 @@
 //! never begin with `-`, so the leading-dash hazard (a markdown `- [ ]` list) is
 //! a Phase 37 concern, not something a `--` can guard here.
 
-use super::AgentDriver;
+use super::{
+    ASK_CLIENT_TIMEOUT_MARGIN_SECS, ASK_HOLD_CAP_SECS, AgentDriver, ArgPlacement, AskRegistration,
+    AskWiring,
+};
 use crate::phase_id::PhaseId;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// Where pi's `devflow_ask` registration is written for a launch whose registration
+/// file is `config_path` (`.devflow/ask-NN.mcp.json`): the same name ending `.ts`,
+/// because pi loads an `-e` extension by its file extension and refuses a `.json`
+/// one (53-MCP-SPIKE.md, pi addendum).
+pub fn ask_extension_path(config_path: &Path) -> PathBuf {
+    config_path.with_extension("ts")
+}
 
 /// The modular driver for Pi (37-03): print-mode `-p` launch, `pi auth check`
 /// health, and the de-Claude-ified workflow-reference prompt. NO JSON unwrapper
@@ -61,6 +72,46 @@ impl AgentDriver for PiDriver {
             "pi",
             vec!["-p".into(), "--no-approve".into(), prompt.to_string()],
         )
+    }
+
+    fn ask_support(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Operator answer OD-2: pi has no per-launch MCP config flag, and its project
+    /// `.pi/mcp.json` loads only under `--approve`, which this driver never passes.
+    /// So the registration is a one-line extension under `.devflow/`, passed with
+    /// `-e` before the prompt, that calls `pi.registerMcpServer("devflow", …)`; an
+    /// explicit `-e` loads under `--no-approve` (53-MCP-SPIKE.md, pi addendum).
+    /// `exposure: "direct"` declares the tool to the model. pi cancels a call at its
+    /// per-request `timeout` (default 60 s, observed), so the server holds one call
+    /// at most [`ASK_HOLD_CAP_SECS`] and pi's timeout is the cap plus the margin, as
+    /// for codex. The config is JSON, a valid JavaScript expression, so every value
+    /// is escaped by the serializer.
+    fn ask_wiring(&self, reg: &AskRegistration) -> Result<AskWiring, String> {
+        let (exe, _root) = reg.utf8_paths()?;
+        let path = ask_extension_path(&reg.config_path);
+        let path_text = path
+            .to_str()
+            .ok_or_else(|| format!("the registration path {} is not UTF-8", path.display()))?
+            .to_string();
+        let mut server_args = reg.server_args();
+        server_args.extend(["--hold-cap-secs".to_string(), ASK_HOLD_CAP_SECS.to_string()]);
+        let config = serde_json::json!({
+            "command": exe,
+            "args": server_args,
+            "exposure": "direct",
+            "timeout": ASK_HOLD_CAP_SECS + ASK_CLIENT_TIMEOUT_MARGIN_SECS,
+        });
+        let config = serde_json::to_string(&config).map_err(|err| err.to_string())?;
+        let text = format!(
+            "export default function (pi: any) {{ pi.registerMcpServer(\"devflow\", {config}); }}"
+        );
+        Ok(AskWiring {
+            args: vec!["-e".into(), path_text],
+            placement: ArgPlacement::BeforeLast,
+            file: Some((path, text)),
+        })
     }
 
     fn health(&self, _state: &crate::state::State) -> Result<(), String> {
@@ -193,6 +244,70 @@ mod tests {
         let (program, args) = PiDriver.build_command(PhaseId::new(1), "do the thing", &[]);
         assert_eq!(program, "pi");
         assert_eq!(args, vec!["-p", "--no-approve", "do the thing"]);
+    }
+
+    fn ask_registration(project_root: &str) -> AskRegistration {
+        AskRegistration {
+            exe: PathBuf::from("/opt/bin/devflow"),
+            project_root: PathBuf::from(project_root),
+            phase: PhaseId::new(7),
+            stage: crate::stage::Stage::Code,
+            timeout_secs: 120,
+            run_started_at: "2026-11-18T00:00:00Z".into(),
+            config_path: PathBuf::from("/work/project/.devflow/ask-07.mcp.json"),
+        }
+    }
+
+    /// The `registerMcpServer` config in pi's extension text, or a panic showing it.
+    fn registered_config(text: &str) -> serde_json::Value {
+        let config = text
+            .strip_prefix("export default function (pi: any) { pi.registerMcpServer(\"devflow\", ")
+            .and_then(|rest| rest.strip_suffix("); }"))
+            .unwrap_or_else(|| panic!("not a devflow registration extension: {text}"));
+        serde_json::from_str(config).unwrap_or_else(|err| panic!("{err}: {config}"))
+    }
+
+    /// OD-2: pi gets the server through `-e <.devflow/ask-NN.mcp.ts>` before the
+    /// prompt, keeping `--no-approve`; the extension registers `devflow` with the
+    /// five `__ask` flags plus the hold cap, direct exposure, and a request timeout
+    /// of the cap plus the margin. A quote in the project path stays a quote.
+    #[test]
+    fn launch_args_carry_the_pi_registration() {
+        let reg = ask_registration("/work/project");
+        let wiring = PiDriver.ask_wiring(&reg).expect("pi registers the server");
+        let path = PathBuf::from("/work/project/.devflow/ask-07.mcp.ts");
+        assert_eq!(wiring.args, ["-e", "/work/project/.devflow/ask-07.mcp.ts"]);
+        assert_eq!(wiring.placement, ArgPlacement::BeforeLast);
+        let (file, text) = wiring.file.expect("pi writes its extension");
+        assert_eq!(file, path);
+        let config = registered_config(&text);
+        let mut args = reg.server_args();
+        args.extend(["--hold-cap-secs".to_string(), "900".to_string()]);
+        assert_eq!(
+            config,
+            serde_json::json!({
+                "command": "/opt/bin/devflow",
+                "args": args,
+                "exposure": "direct",
+                "timeout": 960,
+            })
+        );
+        let (program, launch) = PiDriver.build_command(PhaseId::new(7), "prompt", &[]);
+        assert_eq!(program, "pi");
+        assert!(
+            launch.contains(&"--no-approve".to_string()),
+            "trust stays declined: {launch:?}"
+        );
+
+        let hostile = PiDriver
+            .ask_wiring(&ask_registration("/work/a\"b"))
+            .expect("pi registers the server");
+        let (_, text) = hostile.file.expect("pi writes its extension");
+        assert!(
+            text.contains(r#""/work/a\"b""#),
+            "the quote in the project path is escaped: {text}"
+        );
+        assert_eq!(registered_config(&text)["args"][2], "/work/a\"b");
     }
 
     #[test]
