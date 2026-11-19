@@ -244,18 +244,11 @@ fn tool_error(why: &str) -> Value {
     json!({ "content": [{ "type": "text", "text": why }], "isError": true })
 }
 
-/// The question a call asks, under a fresh question id (any id the agent sent
-/// is replaced). A pass-through deserialization; 53-05 adds the payload's
-/// validation here.
+/// The question a call asks, under a fresh question id, or why it was refused
+/// (D-07, D-08). A refusal is returned before any gate is touched, so it blocks
+/// neither this call nor the calls queued behind it.
 fn parse_ask_arguments(arguments: &Value) -> Result<QuestionSpec, String> {
-    let mut given = arguments.clone();
-    if let Some(fields) = given.as_object_mut() {
-        fields.insert(
-            "question_id".to_string(),
-            json!(devflow_core::question::new_question_id()),
-        );
-    }
-    serde_json::from_value(given).map_err(|error| format!("devflow_ask refused: {error}"))
+    QuestionSpec::from_arguments(arguments).map_err(|error| format!("devflow_ask refused: {error}"))
 }
 
 /// One `devflow_ask` call: open the question gate, wait for its answer, and
