@@ -7,7 +7,8 @@ mod common;
 use common::ask_client::{AskClient, AskFixture};
 use devflow_core::gates::{GateId, Gates};
 use devflow_core::stage::Stage;
-use std::time::Duration;
+use serde_json::{Value, json};
+use std::time::{Duration, Instant};
 
 /// How long a reply that must not come is watched for after the gate opens.
 const NO_REPLY_WATCH: Duration = Duration::from_secs(2);
@@ -140,4 +141,89 @@ fn gate_approve_on_a_question_gate_is_refused_and_writes_no_answer() {
         ],
     );
     assert_eq!(chosen_option(&client), "budget-30");
+}
+
+/// Send a `devflow_ask` call with `arguments` and return its reply, asserting
+/// at every poll until the reply that no gate file has appeared.
+fn refused_call(fixture: &AskFixture, client: &mut AskClient, arguments: Value) -> Value {
+    client.request(
+        CALL_ID,
+        "tools/call",
+        json!({ "name": "devflow_ask", "arguments": arguments }),
+    );
+    let gates_dir = fixture
+        .gate_path()
+        .parent()
+        .expect("a gates dir")
+        .to_path_buf();
+    let started = Instant::now();
+    loop {
+        let entries: Vec<_> = std::fs::read_dir(&gates_dir)
+            .map(|dir| {
+                dir.filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            entries.is_empty(),
+            "a gate file appeared for a malformed call: {entries:?}"
+        );
+        if let Some(reply) = client.reply(CALL_ID, Duration::ZERO) {
+            return reply;
+        }
+        assert!(
+            started.elapsed() < REPLY_WAIT,
+            "no reply to a malformed call within {REPLY_WAIT:?}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Assert `reply` is a tool result with `isError: true` whose text names `field`.
+fn assert_refused_naming(reply: &Value, field: &str) {
+    assert_eq!(reply["result"]["isError"], true, "isError: {reply}");
+    let text = reply["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no text in the refusal: {reply}"));
+    assert!(text.contains(field), "the refusal names `{field}`: {text}");
+}
+
+#[test]
+fn a_malformed_call_returns_is_error_and_opens_no_gate() {
+    let fixture = AskFixture::new(Stage::Code);
+    let mut client = AskClient::spawn(&fixture);
+    client.handshake();
+    let reply = refused_call(
+        &fixture,
+        &mut client,
+        json!({ "question": "Pick a budget", "options": [], "kind": "decision" }),
+    );
+    assert_refused_naming(&reply, "options");
+
+    client.request(4, "ping", json!({}));
+    let ping = client.reply(4, REPLY_WAIT);
+    assert!(ping.is_some(), "ping not answered after a refusal");
+
+    // Control: the same call with one option opens a gate.
+    client.ask(5, "Pick a budget", &OPTIONS[..1]);
+    fixture.wait_for_gate_id();
+}
+
+#[test]
+fn a_call_offering_a_recommended_id_not_in_options_is_refused() {
+    let fixture = AskFixture::new(Stage::Code);
+    let mut client = AskClient::spawn(&fixture);
+    client.handshake();
+    let reply = refused_call(
+        &fixture,
+        &mut client,
+        json!({
+            "question": "Pick a budget",
+            "options": [{ "id": "budget-30", "label": "thirty" }],
+            "kind": "decision",
+            "recommended": "budget-999",
+        }),
+    );
+    assert_refused_naming(&reply, "recommended");
 }
