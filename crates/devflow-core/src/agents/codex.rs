@@ -5,7 +5,7 @@
 //! verified against the installed CLI (a `codex exec -a never` placement is
 //! rejected as an unknown argument).
 
-use super::{AgentDriver, InteractivityMode};
+use super::{AgentDriver, ArgPlacement, AskRegistration, AskWiring, InteractivityMode};
 use crate::phase_id::PhaseId;
 use std::path::PathBuf;
 
@@ -86,6 +86,41 @@ impl AgentDriver for CodexDriver {
             ("GIT_CONFIG_KEY_1".into(), "tag.gpgsign".into()),
             ("GIT_CONFIG_VALUE_1".into(), "false".into()),
         ]
+    }
+
+    fn ask_support(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// D-03: five `-c mcp_servers.devflow.*` overrides before the prompt. The
+    /// operator's own servers stay on (as for claude); the tool timeout is the
+    /// gate timeout plus the margin and the tool is approved without a prompt.
+    /// Every string value is escaped like the writable roots.
+    fn ask_wiring(&self, reg: &AskRegistration) -> Result<AskWiring, String> {
+        let (exe, _root) = reg.utf8_paths()?;
+        let quoted = |value: &str| format!("\"{}\"", escape_toml_basic_string(value));
+        let server_args = reg
+            .server_args()
+            .iter()
+            .map(|arg| quoted(arg))
+            .collect::<Vec<_>>()
+            .join(",");
+        let overrides = [
+            format!("command={}", quoted(exe)),
+            format!("args=[{server_args}]"),
+            format!("tool_timeout_sec={}", reg.client_timeout_secs()),
+            format!("default_tools_approval_mode={}", quoted("approve")),
+            "enabled=true".to_string(),
+        ];
+        let args = overrides
+            .into_iter()
+            .flat_map(|value| ["-c".to_string(), format!("mcp_servers.devflow.{value}")])
+            .collect();
+        Ok(AskWiring {
+            args,
+            placement: ArgPlacement::BeforeLast,
+            file: None,
+        })
     }
 
     fn interactivity_mode(&self, stage: crate::stage::Stage) -> InteractivityMode {

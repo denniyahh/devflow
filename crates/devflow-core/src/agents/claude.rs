@@ -5,7 +5,7 @@
 //! back on stdout one JSON object per line. Claude runs headless — no trust
 //! dialogs, no user prompts.
 
-use super::AgentDriver;
+use super::{AgentDriver, ArgPlacement, AskRegistration, AskWiring};
 use crate::phase_id::PhaseId;
 
 /// The modular driver for Claude (37-02): owns the `stream-json` launch,
@@ -55,6 +55,40 @@ impl AgentDriver for ClaudeDriver {
                 "--dangerously-skip-permissions".into(),
             ],
         )
+    }
+
+    fn ask_support(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// D-03: one stdio server `devflow` in a per-launch `--mcp-config` file,
+    /// appended last. No `--strict-mcp-config`: the operator's own servers stay.
+    /// The per-server `timeout` (ms) is the gate timeout plus the margin.
+    fn ask_wiring(&self, reg: &AskRegistration) -> Result<AskWiring, String> {
+        let (exe, _root) = reg.utf8_paths()?;
+        let config_path = reg.config_path.to_str().ok_or_else(|| {
+            format!(
+                "the registration path {} is not UTF-8",
+                reg.config_path.display()
+            )
+        })?;
+        let timeout_ms = reg.client_timeout_secs().saturating_mul(1000);
+        let config = serde_json::json!({
+            "mcpServers": {
+                "devflow": {
+                    "type": "stdio",
+                    "command": exe,
+                    "args": reg.server_args(),
+                    "timeout": timeout_ms,
+                }
+            }
+        });
+        let text = serde_json::to_string(&config).map_err(|err| err.to_string())?;
+        Ok(AskWiring {
+            args: vec!["--mcp-config".into(), config_path.to_string()],
+            placement: ArgPlacement::Append,
+            file: Some((reg.config_path.clone(), text)),
+        })
     }
 }
 
