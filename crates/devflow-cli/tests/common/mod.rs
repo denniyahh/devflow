@@ -18,6 +18,8 @@
     reason = "each test target uses a different subset of the shared helpers"
 )]
 
+pub mod ask_client;
+
 use devflow_core::agents::driver_for;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::state::AgentKind;
