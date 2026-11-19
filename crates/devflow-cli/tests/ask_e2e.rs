@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::ask_client::{AskClient, AskFixture};
+use common::ask_client::{AskClient, AskFixture, AskOverrides};
 use devflow_core::gates::{GateId, Gates};
 use devflow_core::stage::Stage;
 use serde_json::{Value, json};
@@ -414,5 +414,217 @@ fn a_hook_that_never_exits_does_not_delay_the_question() {
         reply.is_some(),
         "a call not resolved while the hook still sleeps (waited {:?})",
         answered_at.elapsed()
+    );
+}
+
+/// How long an ending has to be observed after its trigger.
+const ENDING_WAIT: Duration = Duration::from_secs(5);
+
+/// Wait until the fixture's gate file is gone.
+fn wait_for_gate_gone(fixture: &AskFixture) {
+    let started = Instant::now();
+    while fixture.gate_path().exists() {
+        assert!(
+            started.elapsed() < ENDING_WAIT,
+            "the gate file still present {ENDING_WAIT:?} after the ending's trigger"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// The `question_closed` reasons recorded so far.
+fn closed_reasons(fixture: &AskFixture) -> Vec<String> {
+    fixture
+        .events_named("question_closed")
+        .iter()
+        .map(|line| line["reason"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// Wait until a `question_closed` with `reason` is recorded.
+fn wait_for_closed_reason(fixture: &AskFixture, reason: &str) {
+    let started = Instant::now();
+    while !closed_reasons(fixture).iter().any(|found| found == reason) {
+        assert!(
+            started.elapsed() < ENDING_WAIT,
+            "no question_closed reason `{reason}`; recorded: {:?}",
+            closed_reasons(fixture)
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// The text of `reply`'s tool result, asserting it is an error.
+fn error_text(reply: &Value) -> String {
+    assert_eq!(reply["result"]["isError"], true, "isError: {reply}");
+    reply["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no text in the reply: {reply}"))
+        .to_string()
+}
+
+#[test]
+fn a_cancelled_call_closes_its_gate_and_records_question_closed() {
+    let fixture = AskFixture::new(Stage::Code);
+    let mut client = AskClient::spawn(&fixture);
+    client.handshake();
+    client.ask(CALL_ID, "Pick a budget", &OPTIONS);
+    fixture.wait_for_gate_id();
+
+    // Control: a string id is another request, so the numeric call stays held.
+    client.cancel(json!("3"));
+    assert!(
+        client.reply(CALL_ID, NO_REPLY_WATCH).is_none(),
+        "a string-id cancel ended the numeric call"
+    );
+    assert!(
+        fixture.gate_path().exists(),
+        "a string-id cancel closed the numeric call's gate"
+    );
+
+    client.cancel(json!(CALL_ID));
+    wait_for_gate_gone(&fixture);
+    wait_for_closed_reason(&fixture, "cancelled_by_client");
+    assert!(
+        client.reply(CALL_ID, NO_REPLY_WATCH).is_none(),
+        "a reply sent for a cancelled id"
+    );
+}
+
+#[test]
+fn stdin_eof_closes_the_gate() {
+    let fixture = AskFixture::new(Stage::Code);
+    let mut client = AskClient::spawn(&fixture);
+    client.handshake();
+    client.ask(CALL_ID, "Pick a budget", &OPTIONS);
+    fixture.wait_for_gate_id();
+    client.close_stdin();
+    wait_for_gate_gone(&fixture);
+    wait_for_closed_reason(&fixture, "client_disconnected");
+    let status = client
+        .wait_exit(ENDING_WAIT)
+        .expect("the server exits once its stdin ends");
+    assert!(status.success(), "a non-zero server exit on EOF: {status}");
+}
+
+#[test]
+fn a_timed_out_call_returns_closed_timed_out() {
+    let fixture = AskFixture::new(Stage::Code);
+    let mut client = AskClient::spawn_with(
+        &fixture,
+        AskOverrides {
+            timeout_secs: Some(2),
+            ..AskOverrides::default()
+        },
+    );
+    client.handshake();
+    client.ask(CALL_ID, "Pick a budget", &OPTIONS);
+    fixture.wait_for_gate_id();
+    let reply = client
+        .reply(CALL_ID, ENDING_WAIT)
+        .expect("a timed-out call replies");
+    let text = error_text(&reply);
+    assert!(
+        text.starts_with("devflow_ask closed: timed_out"),
+        "the `devflow_ask closed:` prefix: {text}"
+    );
+    assert!(!fixture.gate_path().exists(), "the gate file still present");
+    wait_for_closed_reason(&fixture, "timed_out");
+}
+
+#[test]
+fn a_stopped_run_closes_the_question() {
+    let fixture = AskFixture::new(Stage::Code);
+    let mut client = AskClient::spawn(&fixture);
+    client.handshake();
+    client.ask(CALL_ID, "Pick a budget", &OPTIONS);
+    fixture.wait_for_gate_id();
+    fixture.edit_state(|state| state.stopped = true);
+    let reply = client
+        .reply(CALL_ID, ENDING_WAIT)
+        .expect("a stopped run's question replies");
+    let text = error_text(&reply);
+    assert!(
+        text.starts_with("devflow_ask closed: run_stopped"),
+        "the `devflow_ask closed:` prefix: {text}"
+    );
+    wait_for_gate_gone(&fixture);
+    wait_for_closed_reason(&fixture, "run_stopped");
+}
+
+#[test]
+fn sigterm_closes_the_gate_and_records_terminated() {
+    let fixture = AskFixture::new(Stage::Code);
+    let mut client = AskClient::spawn(&fixture);
+    client.handshake();
+    client.ask(CALL_ID, "Pick a budget", &OPTIONS);
+    fixture.wait_for_gate_id();
+    client.signal(libc::SIGTERM);
+    wait_for_gate_gone(&fixture);
+    wait_for_closed_reason(&fixture, "terminated");
+}
+
+#[test]
+fn a_call_with_no_live_runner_is_refused_and_opens_no_gate() {
+    let mut fixture = AskFixture::new(Stage::Code);
+    fixture.release_runner_lock();
+    let mut client = AskClient::spawn(&fixture);
+    client.handshake();
+    let arguments = json!({ "question": "Pick a budget",
+        "options": [{ "id": "budget-30", "label": "30 s" }], "kind": "decision" });
+    let text = error_text(&refused_call(&fixture, &mut client, arguments.clone()));
+    assert!(
+        text.starts_with("devflow_ask refused:") && text.contains("runner"),
+        "the `devflow_ask refused:` prefix, naming the runner: {text}"
+    );
+    drop(client);
+
+    // A client bound to another run's started_at is refused the same way.
+    let fixture = AskFixture::new(Stage::Code);
+    let mut client = AskClient::spawn_with(
+        &fixture,
+        AskOverrides {
+            run_started_at: Some("1".to_string()),
+            ..AskOverrides::default()
+        },
+    );
+    client.handshake();
+    let text = error_text(&refused_call(&fixture, &mut client, arguments));
+    assert!(
+        text.starts_with("devflow_ask refused:"),
+        "the `devflow_ask refused:` prefix: {text}"
+    );
+    drop(client);
+
+    // Control: the fixture's own started_at and live runner open a gate.
+    let control = AskFixture::new(Stage::Code);
+    let mut client = AskClient::spawn(&control);
+    client.handshake();
+    client.ask(CALL_ID, "Pick a budget", &OPTIONS);
+    control.wait_for_gate_id();
+}
+
+#[test]
+fn a_late_server_cleanup_leaves_the_runners_replacement_gate() {
+    let fixture = AskFixture::new(Stage::Code);
+    let mut client = AskClient::spawn(&fixture);
+    client.handshake();
+    client.ask(CALL_ID, "Pick a budget", &OPTIONS);
+    fixture.wait_for_gate_id();
+    let (failure, _waiter) = Gates::open_registered(
+        fixture.root(),
+        fixture.phase(),
+        fixture.stage(),
+        devflow_core::gates::GateKind::StageFailure,
+        "the agent exited",
+    )
+    .expect("open the runner's failure gate");
+    client.close_stdin();
+    wait_for_closed_reason(&fixture, "client_disconnected");
+    client.wait_exit(ENDING_WAIT).expect("the server exits");
+    assert_eq!(
+        fixture.wait_for_gate_id(),
+        failure.gate_id.as_str(),
+        "the replacement gate removed or replaced"
     );
 }

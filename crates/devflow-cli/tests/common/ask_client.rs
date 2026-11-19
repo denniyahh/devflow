@@ -39,7 +39,7 @@ pub struct AskFixture {
     phase: PhaseId,
     stage: Stage,
     started_at: String,
-    _runner_lock: liveness::Hold,
+    runner_lock: Option<liveness::Hold>,
 }
 
 impl AskFixture {
@@ -64,8 +64,13 @@ impl AskFixture {
             phase,
             stage,
             started_at: state.started_at,
-            _runner_lock: runner_lock,
+            runner_lock: Some(runner_lock),
         }
+    }
+
+    /// Release the runner lock, as a runner that has exited leaves it.
+    pub fn release_runner_lock(&mut self) {
+        self.runner_lock = None;
     }
 
     /// The project root.
@@ -201,6 +206,41 @@ impl AskClient {
             stdin,
             lines,
         }
+    }
+
+    /// Close the server's stdin, as a client that has gone leaves it.
+    pub fn close_stdin(&mut self) {
+        drop(self.stdin.take());
+    }
+
+    /// Send `signal` to the server.
+    pub fn signal(&self, signal: i32) {
+        let pid = libc::pid_t::try_from(self.child.id()).expect("a pid fits pid_t");
+        // SAFETY: kill has no memory preconditions; the pid is this client's
+        // own unreaped child.
+        assert_eq!(unsafe { libc::kill(pid, signal) }, 0, "signal the server");
+    }
+
+    /// The server's exit status, waiting at most `wait` for it to exit.
+    pub fn wait_exit(&mut self, wait: Duration) -> Option<std::process::ExitStatus> {
+        let started = Instant::now();
+        loop {
+            if let Some(status) = self.child.try_wait().expect("poll the server") {
+                return Some(status);
+            }
+            if started.elapsed() >= wait {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    /// Send `notifications/cancelled` for `request_id`.
+    pub fn cancel(&mut self, request_id: Value) {
+        self.send(
+            &json!({ "jsonrpc": "2.0", "method": "notifications/cancelled",
+                           "params": { "requestId": request_id, "reason": "test" } }),
+        );
     }
 
     /// Write `message` as one line.
