@@ -27,7 +27,7 @@ result: [pending]
 ### 3. Decide whether to accept the 53-10 deviation: verify::phase_checkpoint_declarations and verify::CheckpointDeclaration were kept, not deleted
 expected: Operator accepts an override (they back verify::phase_has_human_only_checkpoint, the unattended-launch refusal at crates/devflow-cli/src/preflight.rs:1010), or asks for that refusal to be redesigned
 result: pass
-resolution: "Decided by the execute-phase orchestrator from the evidence (2026-11-19T20:33:49Z). 53-10-PLAN's action deletes these two items only if nothing else uses them; verify::phase_has_human_only_checkpoint (crates/devflow-core/src/verify.rs:352) still reads them for the unattended-launch refusal at crates/devflow-cli/src/preflight.rs:1010, so keeping them follows the action. The must_have line that listed them as deleted was inconsistent with its own action. Operator may reopen by asking for the refusal to be redesigned."
+resolution: "Override accepted by the operator (denniyahh, 2026-11-19T20:41Z), on the evidence below, which the session checked against crates/devflow-cli/src/preflight.rs:1010. First decided by the execute-phase orchestrator from the evidence (2026-11-19T20:33:49Z). 53-10-PLAN's action deletes these two items only if nothing else uses them; verify::phase_has_human_only_checkpoint (crates/devflow-core/src/verify.rs:352) still reads them for the unattended-launch refusal at crates/devflow-cli/src/preflight.rs:1010, so keeping them follows the action. The must_have line that listed them as deleted was inconsistent with its own action. Operator may reopen by asking for the refusal to be redesigned."
 
 ## Summary
 
