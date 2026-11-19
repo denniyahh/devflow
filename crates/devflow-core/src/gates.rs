@@ -1131,15 +1131,27 @@ impl Gates {
         result.map(|()| report)
     }
 
-    /// Close the stage's gate only while its gate file still names `gate`.
+    /// Close the stage's gate, as [`close`](Self::close) does, only while its
+    /// gate file still names `gate`: the check and the close are one gate-lock
+    /// critical section. `Ok(None)` when the stage has no gate file or its file
+    /// names another gate; then nothing is touched, so a waiter cleaning up late
+    /// never removes the gate that replaced its own, nor that gate's answers.
     pub fn close_if_current(
         project_root: &Path,
         phase: PhaseId,
         stage: Stage,
         gate: &GateId,
     ) -> Result<Option<CloseReport>, GateError> {
-        let _ = gate;
-        Self::close(project_root, phase, stage).map(Some)
+        if !Self::dir(project_root).is_dir() {
+            return Ok(None);
+        }
+        let lock = gate_lock(project_root, phase)?;
+        if Self::current_gate_id(project_root, phase, stage)?.as_deref() != Some(gate.as_str()) {
+            return Ok(None);
+        }
+        let (report, result) =
+            Self::close_stage_locked(project_root, phase, stage, &lock, &mut |_| {});
+        result.map(|()| Some(report))
     }
 
     /// [`close`](Self::close), retaining what happened before an error.
@@ -3871,12 +3883,12 @@ mod tests {
             let _ = sent.send(String::from_utf8(sink).unwrap());
         });
         let text = returned.recv_timeout(within).ok();
-        if text.is_none() {
-            if let Some(pid) = read_pid(pidfile) {
-                // SAFETY: kill has no memory preconditions; the pid is the
-                // test's own backgrounded sleep.
-                unsafe { libc::kill(pid, libc::SIGKILL) };
-            }
+        if text.is_none()
+            && let Some(pid) = read_pid(pidfile)
+        {
+            // SAFETY: kill has no memory preconditions; the pid is the
+            // test's own backgrounded sleep.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
         }
         text
     }
