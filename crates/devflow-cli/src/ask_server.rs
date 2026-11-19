@@ -9,13 +9,16 @@
 //! and replies with the operator's choice. Only JSON-RPC lines reach stdout;
 //! every log line goes to stderr.
 
-use devflow_core::gates::{AwaitOutcome, Claim, GateAnswer, Gates};
+use crate::pipeline_gate::fire_gate_notify_events;
+use devflow_core::gates::{AwaitOutcome, Claim, GateAnswer, GateId, GateKind, Gates};
 use devflow_core::phase_id::PhaseId;
-use devflow_core::question::{AskAnswer, QuestionChoice, QuestionSpec};
+use devflow_core::question::{AskAnswer, QuestionChoice, QuestionSpec, render_question_context};
 use devflow_core::stage::Stage;
+use devflow_core::{events, workflow};
 use serde_json::{Value, json};
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use tracing::info;
 
@@ -288,6 +291,8 @@ fn ask_gate(args: &AskArgs, spec: &QuestionSpec) -> Result<AskAnswer, String> {
          awaiting `devflow gate answer`",
         phase.padded()
     );
+    let notifier = Notifier::spawn(args, spec);
+    emit_question_asked(args, spec, &gate_id);
     let outcome = await_bound_answer(args, &gate_id);
     let result = match outcome {
         Ok(Some(answer)) => consume(args, &gate_id, spec, &answer),
@@ -301,15 +306,114 @@ fn ask_gate(args: &AskArgs, spec: &QuestionSpec) -> Result<AskAnswer, String> {
     if let Err(error) = Gates::close(root, phase, stage) {
         eprintln!("devflow __ask: could not close phase {phase} {stage}'s gate: {error}");
     }
+    notifier.finish();
+    if let Ok(answer) = &result {
+        emit_question_answered(args, &gate_id, answer);
+    }
     result
+}
+
+/// The notify thread of one question: the gate's `gate_fired`, notify hook and
+/// `notify_fired`, run off the worker thread so a slow hook never delays the
+/// answer wait (D-11).
+struct Notifier {
+    /// Set once the question has ended; the hook run is then killed.
+    ended: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Notifier {
+    /// Start notifying for `spec`'s just-opened gate, with the run's persisted
+    /// notify command.
+    fn spawn(args: &AskArgs, spec: &QuestionSpec) -> Self {
+        let ended = Arc::new(AtomicBool::new(false));
+        let notify_cmd = match workflow::load_state(&args.project, args.phase) {
+            Ok(state) => state.gate_notify_cmd,
+            Err(error) => {
+                eprintln!(
+                    "devflow __ask: could not read the run state for its notify command: {error}"
+                );
+                None
+            }
+        };
+        let (project, phase, stage) = (args.project.clone(), args.phase, args.stage);
+        let context = render_question_context(spec);
+        let thread_ended = Arc::clone(&ended);
+        let thread = std::thread::Builder::new()
+            .name("ask-notify".to_string())
+            .spawn(move || {
+                // A question is an expected stop for an answer in every mode,
+                // never a failure, so it is not an unexpected gate.
+                fire_gate_notify_events(
+                    &project,
+                    phase,
+                    stage,
+                    &context,
+                    &context,
+                    GateKind::Question,
+                    false,
+                    notify_cmd.as_deref(),
+                    &|| thread_ended.load(Ordering::SeqCst),
+                );
+            })
+            .map_err(|error| {
+                eprintln!("devflow __ask: could not start the notify thread: {error}");
+            })
+            .ok();
+        Self { ended, thread }
+    }
+
+    /// The question has ended: kill a hook still running and wait for the
+    /// thread, which returns within one hook poll.
+    fn finish(mut self) {
+        self.ended.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            eprintln!("devflow __ask: the notify thread panicked");
+        }
+    }
+}
+
+/// Record `question_asked` for `spec`'s open gate (D-15).
+fn emit_question_asked(args: &AskArgs, spec: &QuestionSpec, gate_id: &GateId) {
+    events::emit(
+        &args.project,
+        args.phase,
+        events::QUESTION_ASKED,
+        json!({
+            "stage": args.stage.to_string(),
+            "question_id": spec.question_id,
+            "gate_id": gate_id.as_str(),
+            "kind": spec.kind,
+            "question": spec.question,
+            "options": spec.options,
+            "context": spec.context,
+            "recommended": spec.recommended,
+        }),
+    );
+}
+
+/// Record `question_answered` for `answer` (D-15).
+fn emit_question_answered(args: &AskArgs, gate_id: &GateId, answer: &AskAnswer) {
+    events::emit(
+        &args.project,
+        args.phase,
+        events::QUESTION_ANSWERED,
+        json!({
+            "stage": args.stage.to_string(),
+            "question_id": answer.question_id,
+            "gate_id": gate_id.as_str(),
+            "answer": answer.answer,
+            "policy": events::ANSWERING_POLICY_OPERATOR_VIA_GATE,
+            "answered_by": answer.answered_by,
+        }),
+    );
 }
 
 /// [`Gates::await_answer`] with the time left, setting aside each file in the
 /// slot that does not bind to `gate_id`. `None` on a timeout or a cancel.
-fn await_bound_answer(
-    args: &AskArgs,
-    gate_id: &devflow_core::gates::GateId,
-) -> Result<Option<GateAnswer>, String> {
+fn await_bound_answer(args: &AskArgs, gate_id: &GateId) -> Result<Option<GateAnswer>, String> {
     let (root, phase, stage) = (args.project.as_path(), args.phase, args.stage);
     let started = std::time::Instant::now();
     loop {
@@ -334,7 +438,7 @@ fn await_bound_answer(
 /// Read the answered gate's choice and claim the answer.
 fn consume(
     args: &AskArgs,
-    gate_id: &devflow_core::gates::GateId,
+    gate_id: &GateId,
     spec: &QuestionSpec,
     answer: &GateAnswer,
 ) -> Result<AskAnswer, String> {

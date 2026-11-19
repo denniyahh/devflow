@@ -231,7 +231,10 @@ fn a_call_offering_a_recommended_id_not_in_options_is_refused() {
 /// A gate notify command that writes the hook's `DEVFLOW_GATE_CONTEXT` to
 /// `marker`.
 fn marker_hook(marker: &std::path::Path) -> String {
-    format!("printf '%s' \"$DEVFLOW_GATE_CONTEXT\" > '{}'", marker.display())
+    format!(
+        "printf '%s' \"$DEVFLOW_GATE_CONTEXT\" > '{}'",
+        marker.display()
+    )
 }
 
 /// Wait until `event` is on the fixture's log, returning its lines.
@@ -312,7 +315,14 @@ fn question_events_record_the_question_and_its_answer() {
     let gate_id = fixture.wait_for_gate_id();
     gate(
         &fixture,
-        &["answer", "1", "--gate-id", &gate_id, "--option", "budget-120"],
+        &[
+            "answer",
+            "1",
+            "--gate-id",
+            &gate_id,
+            "--option",
+            "budget-120",
+        ],
     );
     assert_eq!(chosen_option(&client), "budget-120");
 
@@ -325,15 +335,24 @@ fn question_events_record_the_question_and_its_answer() {
         .iter()
         .map(|option| option["id"].as_str().unwrap_or_default())
         .collect();
-    assert_eq!(offered, OPTIONS, "option order as in the payload: {asked:?}");
+    assert_eq!(
+        offered, OPTIONS,
+        "option order as in the payload: {asked:?}"
+    );
     assert_eq!(asked[0]["gate_id"], gate_id.as_str(), "{asked:?}");
     assert_eq!(asked[0]["kind"], "decision", "{asked:?}");
 
     let answered = wait_for_event(&fixture, "question_answered");
     assert_eq!(answered.len(), 1, "one question_answered: {answered:?}");
     assert_eq!(answered[0]["question_id"], question_id, "{answered:?}");
-    assert_eq!(answered[0]["policy"], "operator_via_gate", "policy: {answered:?}");
-    assert_eq!(answered[0]["answer"]["option_id"], "budget-120", "{answered:?}");
+    assert_eq!(
+        answered[0]["policy"], "operator_via_gate",
+        "policy: {answered:?}"
+    );
+    assert_eq!(
+        answered[0]["answer"]["option_id"], "budget-120",
+        "{answered:?}"
+    );
     assert!(
         answered[0]["answered_by"]
             .as_str()
@@ -357,7 +376,10 @@ fn a_hook_that_never_exits_does_not_delay_the_question() {
     let marker = scratch.path().join("hook-started");
     let fixture = AskFixture::new(Stage::Code);
     fixture.edit_state(|state| {
-        state.gate_notify_cmd = Some(format!("printf started > '{}'; sleep 600", marker.display()));
+        state.gate_notify_cmd = Some(format!(
+            "printf started > '{}'; sleep 600",
+            marker.display()
+        ));
     });
     let mut client = AskClient::spawn(&fixture);
     client.handshake();
@@ -377,7 +399,14 @@ fn a_hook_that_never_exits_does_not_delay_the_question() {
 
     gate(
         &fixture,
-        &["answer", "1", "--gate-id", &gate_id, "--option", "budget-30"],
+        &[
+            "answer",
+            "1",
+            "--gate-id",
+            &gate_id,
+            "--option",
+            "budget-30",
+        ],
     );
     let answered_at = Instant::now();
     let reply = client.reply(CALL_ID, Duration::from_secs(5));
