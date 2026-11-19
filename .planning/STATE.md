@@ -5,16 +5,16 @@ milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: 53
 current_phase_name: The Question Channel
 status: executing
-stopped_at: Completed 53-06-PLAN.md
-last_updated: "2026-11-19T15:05:20.056Z"
+stopped_at: Completed 53-07-PLAN.md
+last_updated: "2026-11-19T16:26:53.792Z"
 last_activity: 2026-11-19
 last_activity_desc: Phase 53 execution started
-state_head: c14bc94650c0c27499280a7ef4df784369db6d37
+state_head: 56e9a6b736098490957d9f78eaf547dd5d3f9020
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 80
-  completed_plans: 73
+  completed_plans: 74
   percent: 17
 ---
 
@@ -1017,6 +1017,10 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 53]: 53-05: kind is parsed through QuestionKind's serde wire names so accepted strings track the enum
 - [Phase 53]: 53-06: pinned checkpoint sentences moved under a new '## Operator-only checkpoints' heading; the old 'must not pause' sentence deleted as contradicting devflow_ask
 - [Phase 53]: 53-06: checkpoint declaration closes with 'not for a gate the operator answered'
+- [Phase 53]: 53-07: an operator abort records question_closed{aborted_by_operator} with closed_by and replies devflow_ask closed:
+- [Phase 53]: 53-07: non-D-06 failures (gate open, unreadable answer, lost claim) reply isError with no question_closed
+- [Phase 53]: 53-07: nothing is written to stdout after stdin EOF; on SIGTERM/SIGINT the server replies closed: terminated and exits 128+signal
+- [Phase 53]: 53-07: a call ending while waiting for the ask lock opens no gate and records no question event
 
 ## Roadmap Evolution
 
@@ -1201,11 +1205,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 53 P04 | 19min | 3 tasks | 4 files |
 | Phase 53 P05 | 70min | 2 tasks | 3 files |
 | Phase 53 P06 | 11min | 2 tasks | 8 files |
+| Phase 53 P07 | 72min | 3 tasks | 7 files |
 
 ## Session
 
-**Last session:** 2026-11-19T15:05:18.835Z
-**Stopped at:** Completed 53-06-PLAN.md
+**Last session:** 2026-11-19T16:26:52.051Z
+**Stopped at:** Completed 53-07-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
