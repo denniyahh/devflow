@@ -182,19 +182,23 @@ fn fallback_flag_wins_over_the_config_key() {
     let root = repo.path();
     let phase = PhaseId::new(5152);
     init_repo(root, phase);
-    fs::write(root.join("devflow.toml"), "fallback_agent = \"codex\"\n").unwrap();
-    let fake = stub_dir(&[("codex", AGENT_STUB), ("agy", AGENT_STUB)]);
+    fs::write(
+        root.join("devflow.toml"),
+        "fallback_agent = \"antigravity\"\n",
+    )
+    .unwrap();
+    let fake = stub_dir(&[("codex", AGENT_STUB)]);
 
-    let output = dry_run(root, phase, &fake, &["--fallback-agent", "antigravity"]);
+    let output = dry_run(root, phase, &fake, &["--fallback-agent", "codex"]);
 
     assert_success(&output, "a flag-and-key dry run");
     let printed = stdout(&output);
     assert!(
-        printed.contains(&fallback_line("antigravity")),
+        printed.contains(&fallback_line("codex")),
         "the flag's agent is the fallback\nstdout: {printed}"
     );
     assert!(
-        !printed.contains(&fallback_line("codex")),
+        !printed.contains(&fallback_line("antigravity")),
         "the key's agent is not armed when the flag is given\nstdout: {printed}"
     );
     assert!(

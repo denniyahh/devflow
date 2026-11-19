@@ -1767,21 +1767,11 @@ fn cleanup_is_idempotent_when_worktree_already_removed() {
         String::from_utf8_lossy(&second.stderr)
     );
 }
-/// A `pi` stub that answers the preflight health check (`pi auth check` →
-/// `{"status":"ready"}`) and the capability probe (`pi list` → the vetted
-/// `@bacnh85/pi-subagent` package), then runs `launch` for the real
-/// `pi -p --no-approve` stage launch. The health check probes the provider in
-/// the real `~/.pi/agent/settings.json`, so the stub must classify as `ready`
-/// or preflight gates and the stage never runs.
-fn pi_stub(launch: &str) -> String {
-    format!(
-        "#!/bin/sh\n\
-         case \"$1\" in\n\
-           auth) printf '{{\"status\":\"ready\"}}\\n'; exit 0 ;;\n\
-           list) printf 'npm:@bacnh85/pi-subagent (user)\\n'; exit 0 ;;\n\
-         esac\n\
-         {launch}\n"
-    )
+/// A `codex` stub that runs `launch` for the stage launch. Built like the
+/// file's other codex start stubs: codex's launch makes no probe a stub must
+/// answer, so the script is the launch body alone.
+fn codex_stub(launch: &str) -> String {
+    format!("#!/bin/sh\n{launch}\n")
 }
 
 /// Wait until a phase's persisted state reports `gate_pending == true` — the
@@ -1815,17 +1805,20 @@ fn wait_for_gate(root: &Path, phase: PhaseId) -> devflow_core::state::State {
     panic!("timed out waiting for phase {phase} to report gate_pending");
 }
 
-/// A Pi run that exits 0 without emitting a DEVFLOW_RESULT marker must not
+/// A codex run that exits 0 without emitting a DEVFLOW_RESULT marker must not
 /// advance a commit-gated stage. Plan, the first stage and commit-gated,
 /// runs the marker-less stub, which produces no commits and no marker, so it
 /// is `Failed` and gates instead of advancing to Code.
 #[test]
-fn pi_marker_less_run_does_not_advance() {
+fn codex_marker_less_run_does_not_advance() {
     let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
-    let fake_bin = fake_bin_dir(&[("pi", &pi_stub("printf 'fake pi, no marker\\n'\nexit 0\n"))]);
+    let fake_bin = fake_bin_dir(&[(
+        "codex",
+        &codex_stub("printf 'fake codex, no marker\\n'\nexit 0\n"),
+    )]);
 
     run_devflow(
         &home,
@@ -1836,7 +1829,7 @@ fn pi_marker_less_run_does_not_advance() {
             "--phase",
             "07",
             "--agent",
-            "pi",
+            "codex",
             "--mode",
             "supervise",
         ],
@@ -1852,15 +1845,18 @@ fn pi_marker_less_run_does_not_advance() {
     assert!(state.gate_pending, "the never-silent gate must have fired");
 }
 
-/// A Pi run that exits non-zero must not advance its stage: the failed exit is
+/// A codex run that exits non-zero must not advance its stage: the failed exit is
 /// not Success, so the pipeline gates instead of advancing.
 #[test]
-fn pi_nonzero_exit_does_not_advance() {
+fn codex_nonzero_exit_does_not_advance() {
     let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
-    let fake_bin = fake_bin_dir(&[("pi", &pi_stub("printf 'fake pi, no marker\\n'\nexit 1\n"))]);
+    let fake_bin = fake_bin_dir(&[(
+        "codex",
+        &codex_stub("printf 'fake codex, no marker\\n'\nexit 1\n"),
+    )]);
 
     run_devflow(
         &home,
@@ -1871,7 +1867,7 @@ fn pi_nonzero_exit_does_not_advance() {
             "--phase",
             "07",
             "--agent",
-            "pi",
+            "codex",
             "--mode",
             "supervise",
         ],
@@ -1887,18 +1883,18 @@ fn pi_nonzero_exit_does_not_advance() {
     assert!(state.gate_pending, "the never-silent gate must have fired");
 }
 
-/// A hung Pi process (never exits) is surfaced as alive by monitor liveness —
+/// A hung codex process (never exits) is surfaced as alive by monitor liveness —
 /// the stage never advances while it runs (no false Success) — and once killed,
 /// the monitor reaps it and gates (never a silent advance).
 #[test]
-fn pi_hung_process_is_detected_not_left_running() {
+fn codex_hung_process_is_detected_not_left_running() {
     let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
     let aux = tempfile::tempdir().unwrap();
     let pid_path = aux.path().join("agent.pid");
-    let fake_bin = fake_bin_dir(&[("pi", &pi_stub(&recording_sleeper(&pid_path)))]);
+    let fake_bin = fake_bin_dir(&[("codex", &codex_stub(&recording_sleeper(&pid_path)))]);
 
     let _reaper = common::LaunchedRunReaper::for_home(&home, root, PhaseId::new(7));
     run_devflow(
@@ -1910,7 +1906,7 @@ fn pi_hung_process_is_detected_not_left_running() {
             "--phase",
             "07",
             "--agent",
-            "pi",
+            "codex",
             "--mode",
             "supervise",
         ],
@@ -1927,13 +1923,13 @@ fn pi_hung_process_is_detected_not_left_running() {
             .status()
             .unwrap()
             .success(),
-        "the hung pi process must still be alive"
+        "the hung codex process must still be alive"
     );
     let state = load_state(root, PhaseId::new(7)).expect("load state");
     assert_eq!(
         state.stage,
         Stage::Plan,
-        "the stage must not advance while pi is hung"
+        "the stage must not advance while codex is hung"
     );
 
     // Kill the hung process; the monitor reaps it and gates — never advances.
@@ -1943,349 +1939,13 @@ fn pi_hung_process_is_detected_not_left_running() {
             .status()
             .unwrap()
             .success(),
-        "should be able to kill the hung pi process"
+        "should be able to kill the hung codex process"
     );
     let gated = wait_for_gate(root, PhaseId::new(7));
     assert_eq!(
         gated.stage,
         Stage::Plan,
         "a hung-then-killed run must not advance its stage"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Phase 41 Task 8 (ANTG-03, F4, codex-3, antigravity notice (a)): the
-// Antigravity transport, end to end through `devflow start --agent
-// antigravity` with a stubbed `agy` on PATH. The canary-aware stub answers
-// the `DEVFLOW_DELIVERY_CANARY_` turn (AntigravityCanaryLauncher at Plan),
-// schema-checks every turn (codex-3), and then behaves per mode.
-// ---------------------------------------------------------------------------
-
-/// The canary-aware `agy` stub (F4).
-///
-/// Three behaviours, selected by `mode`. EVERY variant first answers a
-/// `*DEVFLOW_DELIVERY_CANARY_*` turn (the common prefix; the enum is named
-/// without it) by echoing the token inside an antigravity-shaped
-/// `event:result.response`, so `run_delivery_canary` reaches `Confirmed` at
-/// Plan; then:
-/// - `MarkerStream`: emits a marker stream for real stage turns — the happy
-///   path.
-/// - `Quiet`: exits 0 with NO events — the marker-less control (ANTG-03).
-/// - `InitOnly`: emits `init` + `step_update` but NO `result` — the
-///   discrimination control (transport alone never advances a commit-gated
-///   stage).
-///
-/// Schema check (codex-3): EVERY turn must parse as an event-key user line
-/// (`"event":"user"`); a Claude `type`-form turn exits 92 with a diagnostic —
-/// an implementation that left the monitor's writer on `user_turn_line`
-/// FAILS here, not just in the unit helper.
-fn antigravity_stub(mode: StubMode) -> String {
-    const SCHEMA_AND_CANARY: &str = r#"#!/bin/sh
-IFS= read -r turn || exit 91
-printf '%s' "$turn" | grep -q '"event":"user"' || { echo 'NON_EVENT_KEY_TURN' >&2; exit 92; }
-case "$turn" in
-  *DEVFLOW_DELIVERY_CANARY_*)
-    token=$(printf '%s' "$turn" | grep -o 'DEVFLOW_DELIVERY_CANARY_[0-9a-f]*' | head -1)
-    printf '%s\n' '{"event":"init","model":"stub"}'
-    printf '%s\n' '{"event":"result","result":{"status":"SUCCESS","response":"canary: '"$token"'\nDEVFLOW_RESULT: {\"status\":\"success\"}"}}'
-    exit 0 ;;
-esac
-"#;
-    let body = match mode {
-        StubMode::MarkerStream => {
-            r#"printf '%s\n' '{"event":"init","model":"stub","inputFormat":"stream-json","outputFormat":"stream-json"}'
-printf '%s\n' '{"event":"step_update","index":0,"text_delta":"working"}'
-printf '%s\n' '{"event":"result","result":{"status":"SUCCESS","response":"DEVFLOW_RESULT: {\"status\":\"success\"}"}}'
-exit 0
-"#
-        }
-        StubMode::Quiet => "exit 0\n",
-        StubMode::InitOnly => {
-            r#"printf '%s\n' '{"event":"init","model":"stub","inputFormat":"stream-json","outputFormat":"stream-json"}'
-printf '%s\n' '{"event":"step_update","index":0,"text_delta":"working"}'
-exit 0
-"#
-        }
-    };
-    format!("{SCHEMA_AND_CANARY}{body}")
-}
-
-#[derive(Clone, Copy)]
-enum StubMode {
-    MarkerStream,
-    Quiet,
-    InitOnly,
-}
-
-/// ANTG-03: a stubbed `agy` that exits 0 with no stream events must not
-/// advance a COMMIT-GATED stage. Plan — a commit-gated stage — produces no
-/// marker and no commits, so it gates instead of advancing to Code.
-#[test]
-fn marker_less_antigravity_never_advances() {
-    let home = common::HermeticHome::new();
-    let repo = tempfile::tempdir().unwrap();
-    let root = repo.path();
-    init_repo(root);
-    let fake_bin = fake_bin_dir(&[("agy", &antigravity_stub(StubMode::Quiet))]);
-
-    run_devflow(
-        &home,
-        root,
-        &fake_bin.path,
-        &[
-            "start",
-            "--phase",
-            "07",
-            "--agent",
-            "antigravity",
-            "--mode",
-            "supervise",
-        ],
-    );
-    let _reaper = common::LaunchedRunReaper::for_home(&home, root, PhaseId::new(7));
-
-    let state = wait_for_gate(root, PhaseId::new(7));
-    assert_eq!(
-        state.stage,
-        Stage::Plan,
-        "a marker-less antigravity run must not advance past the commit-gated Plan stage"
-    );
-    assert!(state.gate_pending, "the never-silent gate must have fired");
-}
-
-/// The happy path: a stubbed `agy` emitting ANTIGRAVITY-shaped events with
-/// the `DEVFLOW_RESULT` marker inside `event:result.response` advances past
-/// the commit gate. `--until plan` halts right after Plan completes, so the
-/// assertion is: Plan RAN (the commit gate passed) and the machine is
-/// stopped, NOT gated.
-#[test]
-fn antigravity_parses_devflow_result_from_stream() {
-    let home = common::HermeticHome::new();
-    let repo = tempfile::tempdir().unwrap();
-    let root = repo.path();
-    init_repo(root);
-    let fake_bin = fake_bin_dir(&[("agy", &antigravity_stub(StubMode::MarkerStream))]);
-
-    run_devflow(
-        &home,
-        root,
-        &fake_bin.path,
-        &[
-            "start",
-            "--phase",
-            "07",
-            "--agent",
-            "antigravity",
-            "--mode",
-            "supervise",
-            "--until",
-            "plan",
-        ],
-    );
-    let _reaper = common::LaunchedRunReaper::for_home(&home, root, PhaseId::new(7));
-
-    let state = wait_for_stopped(root, PhaseId::new(7));
-    assert_eq!(
-        state.stage,
-        Stage::Plan,
-        "the persisted stage must be the COMPLETED target (Plan), proving Plan ran"
-    );
-    assert!(
-        !state.gate_pending,
-        "a marker-bearing antigravity stream must pass the commit gate, not gate"
-    );
-}
-
-/// Discrimination control: a stream that emits `init` + `step_update` but NO
-/// `result`/marker must still gate at Plan — the TRANSPORT alone never
-/// advances a commit-gated stage, only the marker does (ANTG-03).
-#[test]
-fn antigravity_init_without_marker_gates_at_plan() {
-    let home = common::HermeticHome::new();
-    let repo = tempfile::tempdir().unwrap();
-    let root = repo.path();
-    init_repo(root);
-    let fake_bin = fake_bin_dir(&[("agy", &antigravity_stub(StubMode::InitOnly))]);
-
-    run_devflow(
-        &home,
-        root,
-        &fake_bin.path,
-        &[
-            "start",
-            "--phase",
-            "07",
-            "--agent",
-            "antigravity",
-            "--mode",
-            "supervise",
-        ],
-    );
-    let _reaper = common::LaunchedRunReaper::for_home(&home, root, PhaseId::new(7));
-
-    let state = wait_for_gate(root, PhaseId::new(7));
-    assert_eq!(
-        state.stage,
-        Stage::Plan,
-        "a stream with events but no marker must not advance past Plan"
-    );
-    assert!(state.gate_pending);
-}
-
-// ---------------------------------------------------------------------------
-// Phase 42 Task 4 (HRMS-03, D-03): Hermes transport integration tests.
-// ---------------------------------------------------------------------------
-
-fn hermes_stub(launch: &str) -> String {
-    format!(
-        r#"#!/bin/sh
-if [ "$1" = "--version" ]; then
-    printf 'hermes 0.5.0\n'
-    exit 0
-fi
-if [ "$1" = "tools" ] && [ "$2" = "list" ]; then
-    printf 'Available Toolsets:\n  ✓ enabled delegation 👥 Task Delegation\n  ✓ enabled terminal 💻 Terminal Execution\n'
-    exit 0
-fi
-{launch}
-"#
-    )
-}
-
-/// HRMS-03: a stubbed `hermes` that exits 0 with no marker must not advance a
-/// commit-gated stage: Plan gates.
-#[test]
-fn hermes_marker_less_run_does_not_advance() {
-    let home = common::HermeticHome::new();
-    let repo = tempfile::tempdir().unwrap();
-    let root = repo.path();
-    init_repo(root);
-    let fake_bin = fake_bin_dir(&[(
-        "hermes",
-        &hermes_stub("printf 'fake hermes, no marker\\n'\nexit 0\n"),
-    )]);
-
-    run_devflow(
-        &home,
-        root,
-        &fake_bin.path,
-        &[
-            "start",
-            "--phase",
-            "07",
-            "--agent",
-            "hermes",
-            "--mode",
-            "supervise",
-        ],
-    );
-    let _reaper = common::LaunchedRunReaper::for_home(&home, root, PhaseId::new(7));
-
-    let state = wait_for_gate(root, PhaseId::new(7));
-    assert_eq!(
-        state.stage,
-        Stage::Plan,
-        "a marker-less hermes run must not advance past the commit-gated Plan stage"
-    );
-    assert!(state.gate_pending, "the never-silent gate must have fired");
-}
-
-/// HRMS-03: a Hermes run that exits non-zero must not advance its stage.
-#[test]
-fn hermes_nonzero_exit_does_not_advance() {
-    let home = common::HermeticHome::new();
-    let repo = tempfile::tempdir().unwrap();
-    let root = repo.path();
-    init_repo(root);
-    let fake_bin = fake_bin_dir(&[(
-        "hermes",
-        &hermes_stub("printf 'fake hermes error\\n'\nexit 1\n"),
-    )]);
-
-    run_devflow(
-        &home,
-        root,
-        &fake_bin.path,
-        &[
-            "start",
-            "--phase",
-            "07",
-            "--agent",
-            "hermes",
-            "--mode",
-            "supervise",
-        ],
-    );
-    let _reaper = common::LaunchedRunReaper::for_home(&home, root, PhaseId::new(7));
-
-    let state = wait_for_gate(root, PhaseId::new(7));
-    assert_eq!(
-        state.stage,
-        Stage::Plan,
-        "a non-zero-exit hermes run must not advance its stage"
-    );
-    assert!(state.gate_pending, "the never-silent gate must have fired");
-}
-
-/// HRMS-03: a hung Hermes process is detected as alive by monitor liveness,
-/// does not falsely advance, and gates when killed.
-#[test]
-fn hermes_hung_process_is_detected_not_left_running() {
-    let home = common::HermeticHome::new();
-    let repo = tempfile::tempdir().unwrap();
-    let root = repo.path();
-    init_repo(root);
-    let aux = tempfile::tempdir().unwrap();
-    let pid_path = aux.path().join("agent.pid");
-    let fake_bin = fake_bin_dir(&[("hermes", &hermes_stub(&recording_sleeper(&pid_path)))]);
-
-    let _reaper = common::LaunchedRunReaper::for_home(&home, root, PhaseId::new(7));
-    run_devflow(
-        &home,
-        root,
-        &fake_bin.path,
-        &[
-            "start",
-            "--phase",
-            "07",
-            "--agent",
-            "hermes",
-            "--mode",
-            "supervise",
-        ],
-    );
-
-    let pid = wait_for_pid(&pid_path);
-
-    assert!(
-        Command::new("kill")
-            .arg("-0")
-            .arg(pid.to_string())
-            .status()
-            .unwrap()
-            .success(),
-        "the hung hermes process must still be alive"
-    );
-    let state = load_state(root, PhaseId::new(7)).expect("load state");
-    assert_eq!(
-        state.stage,
-        Stage::Plan,
-        "the stage must not advance while hermes is hung"
-    );
-
-    assert!(
-        Command::new("kill")
-            .arg(pid.to_string())
-            .status()
-            .unwrap()
-            .success(),
-        "should be able to kill the hung hermes process"
-    );
-    let gated = wait_for_gate(root, PhaseId::new(7));
-    assert_eq!(
-        gated.stage,
-        Stage::Plan,
-        "a hung-then-killed hermes run must not advance its stage"
     );
 }
 
