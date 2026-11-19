@@ -123,6 +123,34 @@ exit 0"#
     )
 }
 
+/// A `pi` stub: answers `pi auth check` ready and `pi list` empty as preflight asks;
+/// for a stage launch it records its argv, takes the value after `-e`, reads the
+/// server's command and args from that one-line extension, asks through it, and
+/// prints the stage result.
+fn pi_asking_stub() -> String {
+    format!(
+        r#"here=$(dirname "$0")
+case "$1" in
+  auth) printf '{{"status":"ready"}}\n'; exit 0 ;;
+  list) exit 0 ;;
+esac
+: > "$here/argv.txt"
+file=''
+take=''
+for a in "$@"; do
+  printf '%s\n' "$a" >> "$here/argv.txt"
+  if [ -n "$take" ]; then file=$a; take=''; fi
+  case "$a" in -e) take=1 ;; esac
+done
+if [ -z "$file" ]; then echo "no -e registration in argv" >&2; exit 4; fi
+cmd=$(sed -n 's/.*"command":"\([^"]*\)".*/\1/p' "$file")
+args=$(sed -n 's/.*"args":\[\([^]]*\)\].*/\1/p' "$file" | sed 's/"//g; s/,/ /g')
+{MCP_SCRIPT}
+printf 'DEVFLOW_RESULT: {{"status":"success"}}\n'
+exit 0"#
+    )
+}
+
 fn git(root: &Path, args: &[&str]) {
     let output = devflow_core::test_support::git_command(root)
         .args(args)
@@ -438,6 +466,43 @@ fn a_claude_stage_agent_reaches_the_server_through_its_mcp_config_file() {
         argv[argv.len().saturating_sub(2)..],
         ["--mcp-config", &*registration.to_string_lossy()],
         "--mcp-config and its path are not the last two argv entries: {argv:?}"
+    );
+}
+
+/// Operator answer OD-2: a pi stage agent finds `-e <file>` before its prompt, reads
+/// the server from that extension under `.devflow/`, and gets the operator's answer;
+/// nothing is left in the project's `.pi/`. Control: the same stub, run without the
+/// flag, exits non-zero naming it, so a launch without the splice fails this test.
+#[test]
+fn a_pi_stage_agent_asks_through_its_registration_and_finishes() {
+    let fixture = Fixture::new(AgentKind::Pi, "pi", &pi_asking_stub());
+
+    let control = Command::new(fixture.beside_agent("pi"))
+        .args(["-p", "--no-approve", "the prompt"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run the stub without -e");
+    assert!(
+        !control.status.success()
+            && String::from_utf8_lossy(&control.stderr).contains("no -e registration in argv"),
+        "control: the stub without the flag must refuse: {}",
+        shown(&control)
+    );
+
+    let output = fixture.answer_and_finish(fixture.spawn_runner());
+    fixture.assert_answered_in_one_launch(&output);
+    let argv = fs::read_to_string(fixture.beside_agent("argv.txt")).expect("the stub's argv");
+    let argv: Vec<&str> = argv.lines().collect();
+    let extension = devflow_core::workflow::devflow_dir(&fixture.root)
+        .join(format!("ask-{}.mcp.ts", fixture.phase.padded()));
+    assert_eq!(
+        argv.get(..4),
+        Some(&["-p", "--no-approve", "-e", &*extension.to_string_lossy()][..]),
+        "pi's argv: print mode, trust declined, then the extension before the prompt"
+    );
+    assert!(
+        !fixture.root.join(".pi").exists(),
+        "a .pi/ directory was written into the project"
     );
 }
 
