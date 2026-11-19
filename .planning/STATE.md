@@ -5,16 +5,16 @@ milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: 53
 current_phase_name: The Question Channel
 status: executing
-stopped_at: Completed 53-12-PLAN.md
-last_updated: "2026-11-19T14:13:09.288Z"
+stopped_at: Completed 53-04-PLAN.md
+last_updated: "2026-11-19T14:37:38.452Z"
 last_activity: 2026-11-19
 last_activity_desc: Phase 53 execution started
-state_head: 9e155ced06aeccee0be2ca38589b0288773a37df
+state_head: bd7c05700ac071204f9722459ddf4e34155944d5
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 80
-  completed_plans: 70
+  completed_plans: 71
   percent: 17
 ---
 
@@ -172,7 +172,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 53 (The Question Channel) — EXECUTING
-Plan: 5 of 14
+Plan: 6 of 14
 Status: Ready to execute
 Last activity: 2026-11-19 — Phase 53 execution started
 
@@ -1010,6 +1010,8 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 53]: 53-03: checkpoint auto-decide relaunch and its four devflow-core readers deleted (D-12); rescan_gate_context deleted too, CheckpointDeclaration gate kind still goes in 53-10
 - [Phase 53]: 53-12: failover_e2e handoff tests run supervised on claude and codex; the fixture commits a CONTEXT.md so a codex primary passes the codex interactivity preflight
 - [Phase 53]: 53-12: deleted hermes and antigravity e2e launch tests; their properties are pinned by the codex capture-shape tests and agents::antigravity driver tests
+- [Phase 53]: 53-04: the exact gate answer line for a refused approve/reject is rendered in gate_respond_report from the on-disk gate kind; Refusal stays static
+- [Phase 53]: 53-04: gate sweep leaves a question gate alone by kind (also when its question key is unreadable); status names it as gate: question <id>
 
 ## Roadmap Evolution
 
@@ -1191,11 +1193,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 53 P02 | 6min | 2 tasks | 2 files |
 | Phase 53 P03 | 78min | 2 tasks | 8 files |
 | Phase 53 P12 | 13min | 2 tasks | 4 files |
+| Phase 53 P04 | 19min | 3 tasks | 4 files |
 
 ## Session
 
-**Last session:** 2026-11-19T14:13:07.964Z
-**Stopped at:** Completed 53-12-PLAN.md
+**Last session:** 2026-11-19T14:37:37.202Z
+**Stopped at:** Completed 53-04-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
