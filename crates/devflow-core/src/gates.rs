@@ -1131,6 +1131,17 @@ impl Gates {
         result.map(|()| report)
     }
 
+    /// Close the stage's gate only while its gate file still names `gate`.
+    pub fn close_if_current(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        gate: &GateId,
+    ) -> Result<Option<CloseReport>, GateError> {
+        let _ = gate;
+        Self::close(project_root, phase, stage).map(Some)
+    }
+
     /// [`close`](Self::close), retaining what happened before an error.
     pub(crate) fn close_with_partial_result(
         project_root: &Path,
@@ -3945,6 +3956,49 @@ mod tests {
             text.contains("cancel"),
             "the line names the cancel: {text:?}"
         );
+    }
+
+    #[test]
+    fn close_if_current_leaves_a_replacement_gate_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, phase, stage) = (dir.path(), PhaseId::new(5307), Stage::Code);
+        let spec = QuestionSpec::from_arguments(&serde_json::json!({
+            "question": "Pick a budget",
+            "options": [{ "id": "budget-30", "label": "30 s" }],
+            "kind": "decision",
+        }))
+        .unwrap();
+        let (question, question_waiter) =
+            Gates::open_question_registered(root, phase, stage, &spec).unwrap();
+        let (failure, failure_waiter) =
+            Gates::open_registered(root, phase, stage, GateKind::StageFailure, "stage failed")
+                .unwrap();
+        let gate_file = Gates::gate_path(root, phase, stage);
+        let waiter_file = Gates::waiter_path(root, phase, stage, &failure.gate_id);
+
+        let stale = Gates::close_if_current(root, phase, stage, &question.gate_id).unwrap();
+        assert_eq!(
+            stale, None,
+            "a close naming the replaced gate closes nothing"
+        );
+        assert_eq!(
+            Gates::current_gate_id(root, phase, stage)
+                .unwrap()
+                .as_deref(),
+            Some(failure.gate_id.as_str()),
+            "the replacement gate's file is untouched"
+        );
+        assert!(
+            waiter_file.exists(),
+            "the replacement's waiter file is untouched"
+        );
+        question_waiter.finish();
+
+        // Control: the current gate's own id closes it.
+        let current = Gates::close_if_current(root, phase, stage, &failure.gate_id).unwrap();
+        assert!(current.is_some(), "the current gate closes");
+        assert!(!gate_file.exists(), "its gate file is removed");
+        failure_waiter.finish();
     }
 
     #[test]
