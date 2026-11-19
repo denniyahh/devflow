@@ -113,14 +113,157 @@ pub struct QuestionSpec {
 
 impl QuestionSpec {
     /// The question a `devflow_ask` call's `args` ask, under a fresh question
-    /// id. Unknown keys are ignored.
+    /// id (any id the agent sent is not read). Each field is read by name and
+    /// checked; unknown keys are ignored.
     pub fn from_arguments(args: &Value) -> Result<QuestionSpec, QuestionError> {
-        let mut given = args.clone();
-        let fields: &mut Map<String, Value> =
-            given.as_object_mut().ok_or(QuestionError::NotAnObject)?;
-        fields.insert("question_id".to_string(), Value::String(new_question_id()));
-        serde_json::from_value(given).map_err(|_| QuestionError::NotAnObject)
+        let fields = args.as_object().ok_or(QuestionError::NotAnObject)?;
+        let question = required_text(fields.get("question"), "question")?;
+        bounded(question, "question", QUESTION_MAX_CHARS)?;
+        let options = parse_options(fields.get("options"))?;
+        let context = optional_text(fields.get("context"), "context")?;
+        if let Some(context) = context {
+            bounded(context, "context", CONTEXT_MAX_CHARS)?;
+        }
+        let kind = parse_kind(fields.get("kind"))?;
+        let recommended = optional_text(fields.get("recommended"), "recommended")?;
+        if let Some(id) = recommended
+            && !options.iter().any(|option| option.id == id)
+        {
+            return Err(QuestionError::RecommendedNotOffered(id.to_string()));
+        }
+        Ok(QuestionSpec {
+            question_id: new_question_id(),
+            question: question.to_string(),
+            options,
+            context: context.map(str::to_string),
+            kind,
+            recommended: recommended.map(str::to_string),
+        })
     }
+}
+
+/// `value` as text: `None` when absent or `null`, refused when not a string.
+fn optional_text<'a>(
+    value: Option<&'a Value>,
+    field: &str,
+) -> Result<Option<&'a str>, QuestionError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text)),
+        Some(_) => Err(QuestionError::WrongType {
+            field: field.to_string(),
+            expected: "a string",
+        }),
+    }
+}
+
+/// `value` as text that must be present and say something.
+fn required_text<'a>(value: Option<&'a Value>, field: &str) -> Result<&'a str, QuestionError> {
+    let text = optional_text(value, field)?.ok_or_else(|| QuestionError::Missing {
+        field: field.to_string(),
+    })?;
+    if text.trim().is_empty() {
+        return Err(QuestionError::Blank {
+            field: field.to_string(),
+        });
+    }
+    Ok(text)
+}
+
+/// Refuse `text` when it has more than `max` characters.
+fn bounded(text: &str, field: &str, max: usize) -> Result<(), QuestionError> {
+    let chars = text.chars().count();
+    if chars > max {
+        return Err(QuestionError::TooLong {
+            field: field.to_string(),
+            chars,
+            max,
+        });
+    }
+    Ok(())
+}
+
+/// The `options` array: at least one, at most [`MAX_OPTIONS`], ids unique.
+fn parse_options(value: Option<&Value>) -> Result<Vec<QuestionOption>, QuestionError> {
+    let entries = match value {
+        None | Some(Value::Null) => {
+            return Err(QuestionError::Missing {
+                field: "options".to_string(),
+            });
+        }
+        Some(Value::Array(entries)) => entries,
+        Some(_) => {
+            return Err(QuestionError::WrongType {
+                field: "options".to_string(),
+                expected: "an array",
+            });
+        }
+    };
+    if entries.is_empty() {
+        return Err(QuestionError::NoOptions);
+    }
+    if entries.len() > MAX_OPTIONS {
+        return Err(QuestionError::TooManyOptions {
+            count: entries.len(),
+        });
+    }
+    let mut options: Vec<QuestionOption> = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let option = parse_option(entry, index)?;
+        if options.iter().any(|earlier| earlier.id == option.id) {
+            return Err(QuestionError::DuplicateOptionId {
+                field: format!("options[{index}].id"),
+                id: option.id,
+            });
+        }
+        options.push(option);
+    }
+    Ok(options)
+}
+
+/// `options[index]`: an id an operator can type, a label, and an optional description.
+fn parse_option(entry: &Value, index: usize) -> Result<QuestionOption, QuestionError> {
+    let fields: &Map<String, Value> =
+        entry.as_object().ok_or_else(|| QuestionError::WrongType {
+            field: format!("options[{index}]"),
+            expected: "an object",
+        })?;
+    let id_field = format!("options[{index}].id");
+    let id = required_text(fields.get("id"), &id_field)?;
+    bounded(id, &id_field, OPTION_ID_MAX_CHARS)?;
+    if id.chars().any(char::is_control) {
+        return Err(QuestionError::ControlCharacter { field: id_field });
+    }
+    let label_field = format!("options[{index}].label");
+    let label = optional_text(fields.get("label"), &label_field)?.ok_or_else(|| {
+        QuestionError::Missing {
+            field: label_field.clone(),
+        }
+    })?;
+    bounded(label, &label_field, OPTION_LABEL_MAX_CHARS)?;
+    let description_field = format!("options[{index}].description");
+    let description = optional_text(fields.get("description"), &description_field)?;
+    if let Some(description) = description {
+        bounded(
+            description,
+            &description_field,
+            OPTION_DESCRIPTION_MAX_CHARS,
+        )?;
+    }
+    Ok(QuestionOption {
+        id: id.to_string(),
+        label: label.to_string(),
+        description: description.map(str::to_string),
+    })
+}
+
+/// The `kind` field, read through [`QuestionKind`]'s own wire names.
+fn parse_kind(value: Option<&Value>) -> Result<QuestionKind, QuestionError> {
+    let text = optional_text(value, "kind")?.ok_or_else(|| QuestionError::Missing {
+        field: "kind".to_string(),
+    })?;
+    serde_json::from_value(Value::String(text.to_string()))
+        .map_err(|_| QuestionError::UnknownKind(text.to_string()))
 }
 
 /// The operator's answer to a question: an offered option, or free text.
