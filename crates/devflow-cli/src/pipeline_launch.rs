@@ -2385,12 +2385,116 @@ fn close_gates_for_resume(
     lines
 }
 
-/// Close a question gate open at `stage` after its agent exited (C1 backstop).
-fn close_question_gate(_project_root: &Path, _phase: PhaseId, _stage: Stage) {}
+/// The question id and gate id of a `question` gate open at `stage`, or `None` for
+/// no gate, any other kind of gate, or one that cannot be read (logged).
+fn open_question_gate(
+    project_root: &Path,
+    phase: PhaseId,
+    stage: Stage,
+) -> Option<(String, GateId)> {
+    let gate = crate::pipeline_gate::read_gate_file(project_root, phase, stage)?;
+    if gate.gate_kind != Some(devflow_core::gates::GateKind::Question) {
+        return None;
+    }
+    let read = GateId::parse(&gate.gate_id)
+        .map_err(|err| err.to_string())
+        .and_then(
+            |gate_id| match Gates::read_question(project_root, phase, stage) {
+                Ok(Some(spec)) => Ok((spec.question_id, gate_id)),
+                Ok(None) => Err("the question gate carries no question".to_string()),
+                Err(err) => Err(err.to_string()),
+            },
+        );
+    read.map_err(|err| {
+        warn!("phase {phase}: could not read the {stage} question gate: {err}");
+        eprintln!("phase {phase}: could not read the {stage} question gate: {err}");
+    })
+    .ok()
+}
 
-/// Record `question_closed{closed_on_resume}` for a question gate `resume` is about
-/// to close.
-fn record_leftover_question(_project_root: &Path, _phase: PhaseId, _stage: Stage) {}
+/// Record `question_closed` for a question the runner closes.
+fn emit_runner_question_closed(
+    project_root: &Path,
+    phase: PhaseId,
+    stage: Stage,
+    (question_id, gate_id): (&str, &GateId),
+    reason: &str,
+    closed_by: Option<&str>,
+) {
+    events::emit(
+        project_root,
+        phase,
+        events::QUESTION_CLOSED,
+        serde_json::json!({
+            "stage": stage.to_string(),
+            "question_id": question_id,
+            "gate_id": gate_id.as_str(),
+            "reason": reason,
+            "closed_by": closed_by,
+        }),
+    );
+}
+
+/// Close a question gate its agent left open at `stage` (C1 backstop, after any agent
+/// exit). An abort bound to it, which the operator published before the server died,
+/// is applied first: it commits [`State::abort_requested`] and records
+/// `question_closed{aborted_by_operator}`, since the close would set the answer aside.
+/// Otherwise the close records `question_closed{agent_exited}`. Any other gate is left
+/// alone. Errors are logged, never returned.
+fn close_question_gate(project_root: &Path, phase: PhaseId, stage: Stage) {
+    let Some((question_id, gate_id)) = open_question_gate(project_root, phase, stage) else {
+        return;
+    };
+    let question = (question_id.as_str(), &gate_id);
+    match Gates::read_answer(project_root, phase, stage, &gate_id) {
+        devflow_core::gates::AnswerRead::Bound(answer) if answer.response.abort => {
+            let note = crate::ask_server::abort_note(answer.response.note.as_deref(), &question_id);
+            let committed = workflow::update_state(project_root, phase, |state| {
+                state.abort_requested = Some(note);
+                Ok::<(), CliError>(())
+            });
+            if let Err(err) = committed {
+                warn!("phase {phase}: the question's abort was not recorded: {err}");
+                eprintln!(
+                    "phase {phase}: the abort bound to question {question_id} was not recorded: {err}"
+                );
+            }
+            let closed_by = answer.response.responded_by.as_deref();
+            emit_runner_question_closed(
+                project_root,
+                phase,
+                stage,
+                question,
+                "aborted_by_operator",
+                closed_by,
+            );
+        }
+        _ => {
+            emit_runner_question_closed(project_root, phase, stage, question, "agent_exited", None)
+        }
+    }
+    if let Err(err) = Gates::close_if_current(project_root, phase, stage, &gate_id) {
+        warn!("phase {phase}: could not close the {stage} question gate {gate_id}: {err}");
+        eprintln!("phase {phase}: could not close the {stage} question gate {gate_id}: {err}");
+    }
+}
+
+/// Record `question_closed{closed_on_resume}` for a question gate `resume` is about to
+/// close. The close itself is `resume`'s, which reports any answer it sets aside; a
+/// bound abort is not applied, since the operator's `resume` is the later word.
+fn record_leftover_question(project_root: &Path, phase: PhaseId, stage: Stage) {
+    if let Some((question_id, gate_id)) = open_question_gate(project_root, phase, stage) {
+        let question = (question_id.as_str(), &gate_id);
+        emit_runner_question_closed(
+            project_root,
+            phase,
+            stage,
+            question,
+            "closed_on_resume",
+            None,
+        );
+    }
+}
 
 /// [`resume_with_fallback`] after its reservation, up to the launch: every refusal and
 /// every state write (gate closing, notes, the handoff, the fallback re-arm) under the
