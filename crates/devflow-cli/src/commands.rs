@@ -3687,9 +3687,7 @@ fn answer_route_lines(
             StatusLessStep::RetryStage
             | StatusLessStep::RelaunchNow
             | StatusLessStep::RelaunchWithNote(_) => on_agent.as_str(),
-            StatusLessStep::RelaunchRefused { .. }
-            | StatusLessStep::PreflightOverride
-            | StatusLessStep::RecordCheckpointSet => "",
+            StatusLessStep::RelaunchRefused { .. } | StatusLessStep::PreflightOverride => "",
         };
         route_line(
             step.name(),
@@ -9328,7 +9326,6 @@ mod tests {
         persisted.consecutive_failures = 2;
         persisted.infra_failures = 4;
         persisted.preflight_retries = 3;
-        persisted.checkpoint_resumes = 1;
         persisted.last_validate_failure_commit_count = Some(9);
         persisted.stage = Stage::Validate;
         persisted.stop_until = Some(Stage::Code);
@@ -9347,7 +9344,6 @@ mod tests {
         );
         assert_eq!(fresh.infra_failures, 0);
         assert_eq!(fresh.preflight_retries, 0);
-        assert_eq!(fresh.checkpoint_resumes, 0);
         assert_eq!(
             fresh.last_validate_failure_commit_count, None,
             "the commit baseline is per-run; carrying it would compare a new run's count \
@@ -10118,10 +10114,7 @@ mod tests {
                     );
                     assert!(!printed.contains("/gsd-quick"), "{row}: {printed}");
                 }
-                AnswerFamily::Preflight
-                | AnswerFamily::CheckpointDeclaration
-                | AnswerFamily::Question
-                | AnswerFamily::Unclassified => {
+                AnswerFamily::Preflight | AnswerFamily::Question | AnswerFamily::Unclassified => {
                     let refused = reject(root, phase, stage, NOTE).expect_err(&row);
                     assert!(
                         refused.to_string().contains("refused")
@@ -10277,7 +10270,6 @@ mod tests {
                 AnswerFamily::StageFailure => Some("route: retry_stage"),
                 AnswerFamily::RateLimit => Some("route: relaunch_now"),
                 AnswerFamily::Preflight => Some("route: preflight_override"),
-                AnswerFamily::CheckpointDeclaration => Some("route: record_checkpoint_set"),
                 AnswerFamily::Question | AnswerFamily::Unclassified => None,
             };
             match expected {

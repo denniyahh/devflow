@@ -36,11 +36,10 @@ use devflow_core::outcome_policy::{self, Action};
 use devflow_core::phase_id::PhaseId;
 use devflow_core::prompt;
 use devflow_core::stage::Stage;
-use devflow_core::state::{AgentKind, ApprovedCheckpoint, CheckpointApproval, State};
+use devflow_core::state::{AgentKind, State};
 use devflow_core::stop::{
     AgentOutcome, OwnerPhase, STOPPED_EXIT_CODE, SafePoint, StopSource, StopToken,
 };
-use devflow_core::verify::CheckpointDeclaration;
 use devflow_core::{agent_result, agents, canary, events, gsd_config, mode, monitor, workflow};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
@@ -184,11 +183,6 @@ fn prepare_stage_launch(
         stream_launch,
     );
     let args = wire_ask_registration(state, driver.as_ref(), args)?;
-
-    // 28-03: every fresh stage launch zeroes the checkpoint-resume counter.
-    // Nothing increments it since the checkpoint relaunch was removed (53-03);
-    // the field goes in 53-10. Persisted with the launch's committed state.
-    state.checkpoint_resumes = 0;
 
     stage_launch(
         state,
@@ -1698,8 +1692,8 @@ pub(crate) struct StageLaunch {
     pub(crate) relaunch: Option<HandoffRelaunch>,
 }
 
-/// Persist the caller's launch bookkeeping (`launch_stage_inner`'s `checkpoint_resumes`
-/// reset) before anything is spawned, as this save always has, and return the launch.
+/// Commit the state before anything is spawned, as this save always has, so the launch
+/// carries the state on disk, and return the launch.
 /// It once also cleared the previous stage's monitor pid (WR-04, 18-fix); that field is
 /// gone from the CLI (50-22).
 fn stage_launch(
@@ -1710,10 +1704,7 @@ fn stage_launch(
     archived_stage: Option<Stage>,
     launch: StageShape,
 ) -> Result<StageLaunch, CliError> {
-    let checkpoint_resumes = state.checkpoint_resumes;
-    commit(state, |s| {
-        s.checkpoint_resumes = checkpoint_resumes;
-    })?;
+    commit(state, |_| {})?;
     Ok(StageLaunch {
         state: state.clone(),
         program: program.to_string(),
@@ -1757,25 +1748,6 @@ fn archive_prior_capture(state: &State, archived_stage: Option<Stage>) -> Result
         );
     }
     Ok(())
-}
-
-/// The `CheckpointApproval` that records `current`'s human-only declarations.
-///
-/// Shared by the re-scan gate's approval arm and `preflight`'s recording sites
-/// so an approval and a preflight can never disagree about what "the set"
-/// means — a divergence there would gate forever or approve too much, and
-/// neither is visible from a passing test of either site alone.
-pub(crate) fn recorded_approval(current: &[CheckpointDeclaration]) -> CheckpointApproval {
-    CheckpointApproval::Recorded(
-        current
-            .iter()
-            .filter(|declaration| declaration.blocking_human || declaration.human_action)
-            .map(|declaration| ApprovedCheckpoint {
-                plan_file: declaration.plan_file.clone(),
-                element: declaration.element.clone(),
-            })
-            .collect(),
-    )
 }
 
 #[cfg(test)]
@@ -4719,34 +4691,6 @@ mod tests {
         result.unwrap();
         let mut after = serde_json::to_value(workflow::load_state(root, phase).unwrap()).unwrap();
 
-        // 48-07 (D-07): `checkpoint_approval` is asserted BELOW rather than merely
-        // excluded — dropping a field from a tripwire without replacing its
-        // coverage is how a whole-state check quietly stops checking.
-        //
-        // Since 52.2-06 `resume` launches the runner's unit and the runner's own Code
-        // launch records the set it saw (CHKPT-02), so `resume` itself leaves the field
-        // as the handoff found it.
-        let approval_before = before
-            .as_object_mut()
-            .unwrap()
-            .remove("checkpoint_approval")
-            .unwrap();
-        let approval_after = after
-            .as_object_mut()
-            .unwrap()
-            .remove("checkpoint_approval")
-            .unwrap();
-        assert_eq!(
-            approval_before,
-            serde_json::json!("pending"),
-            "the fixture must start from Pending"
-        );
-        assert_eq!(
-            approval_after,
-            serde_json::json!("pending"),
-            "resume writes no checkpoint approval: the runner's Code launch records it"
-        );
-
         // D-01: the relaunch is the runner's unit; the state records no launch.
         assert!(
             after.get("supervisor").is_none(),
@@ -5305,47 +5249,6 @@ mod tests {
         advance_with(root, phase, Some(Stage::Code)).unwrap();
         assert!(events_of_kind(root, "advance_failed").is_empty());
         assert!(events_of_kind(root, "advance_stage_unbound").is_empty());
-    }
-
-    /// 28-03 (Task 2): an ordinary stage launch resets the checkpoint-resume
-    /// budget to zero, including in a state that carried a nonzero count
-    /// from a prior stage's resume attempts — this is what makes the
-    /// ceiling bound one stage's resume budget rather than a phase's entire
-    /// lifetime.
-    #[test]
-    fn launch_stage_inner_resets_checkpoint_resumes_counter() {
-        const NAME: &str =
-            "pipeline_launch::tests::launch_stage_inner_resets_checkpoint_resumes_counter";
-        enter_agent_free_child!(NAME, "claude");
-        let _guard = env_lock();
-
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        init_repo(root);
-
-        let phase = PhaseId::new(87);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Code;
-        state.checkpoint_resumes = 2;
-        // 31-03: Code is the one stage widened to the `stream-json` transport,
-        // so a launch here passes the D-15 delivery-canary gate. Recording an
-        // already-`Confirmed` outcome is what a real run looks like by its
-        // second Code launch, and it keeps this test about the resume counter
-        // rather than about the guard — `launch_stage_inner_refuses_at_code_
-        // when_the_canary_cannot_confirm` covers the guard's own wiring.
-        state.canary = Some(canary::CanaryOutcome::Confirmed);
-        workflow::save_state(&state).unwrap();
-
-        let result = launch_stage_inner(&mut state, None, None);
-
-        result.unwrap();
-
-        assert_eq!(
-            state.checkpoint_resumes, 0,
-            "an ordinary stage launch must reset the checkpoint-resume budget"
-        );
-        let reloaded = workflow::load_state(root, phase).unwrap();
-        assert_eq!(reloaded.checkpoint_resumes, 0);
     }
 
     // ---- D-15 delivery-canary gate (31-03) ------------------------------

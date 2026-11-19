@@ -385,7 +385,6 @@ pass on that commit.
 | `rate_limit` | relaunches the stage now on the same agent | relaunches the stage with the note | ends the run |
 | `stage_failure` on a run whose recorded delivery canary refuses its agent | stops the run; the way on is `devflow resume --phase N --agent <other>` | the same, and the note is kept for that resume | ends the run |
 | `preflight` | relaunches the stage with the failed check overridden | not offered: refused | ends the run |
-| `checkpoint_declaration` | records the checkpoints as seen and relaunches Code | not offered: refused | ends the run |
 | `question` (answered with `devflow gate answer <phase> --gate-id <id> (--option <id> \| --text <answer>)`) | refused, naming `gate answer` | refused, naming `gate answer` | ends the run |
 | a gate file with no `gate_kind` (a 3.x or hand-written file) | refused | refused | ends the run |
 
@@ -645,9 +644,8 @@ What a run records:
   `clean_pass`, `gaps_found`, `reverify_needed`, `reader_failure`,
   `failure_cap`), and the `gate_fired` event carries the same value. Gates
   outside Validate's routes record one too: `stage_failure` for a failed stage
-  at any stage, `rate_limit` for a rate limit no fallback takes, `preflight`
-  for a failed preflight check and `checkpoint_declaration` for an unapproved
-  human-only checkpoint.
+  at any stage, `rate_limit` for a rate limit no fallback takes and `preflight`
+  for a failed preflight check.
   A gate file written by a 3.x binary has no `gate_kind` and still loads.
 - An agent pass is recorded in the state file's `validate_pass_head`, the
   commit the Validate ran on; any other verdict clears it. A commit that cannot

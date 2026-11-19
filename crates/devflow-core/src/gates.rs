@@ -156,9 +156,6 @@ pub enum GateKind {
     RateLimit,
     /// The gate for a failed preflight check before a stage launches (D-39; 52-22).
     Preflight,
-    /// The gate for a human-only checkpoint declaration at Code that was not
-    /// approved (D-39; 52-22).
-    CheckpointDeclaration,
     /// A question an agent asked through `devflow_ask` (Phase 53, D-09). Its
     /// file carries the question's spec, and only `devflow gate answer` answers
     /// it; an abort still ends the run.
