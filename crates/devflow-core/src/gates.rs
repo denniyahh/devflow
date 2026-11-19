@@ -1895,8 +1895,8 @@ fn backoff_wait<T>(
 /// Fire the operator-configured gate notify hook, if any.
 ///
 /// Reads `DEVFLOW_GATE_NOTIFY_CMD`; if unset or empty, this is a silent no-op
-/// (no notify command configured). Otherwise delegates to
-/// [`run_notify_command`]. `unexpected` marks a gate fired on a stage the
+/// (no notify command configured). Otherwise runs the hook as
+/// [`run_notify_command_to`] does. `unexpected` marks a gate fired on a stage the
 /// active [`crate::mode::Mode`] would not normally gate (e.g. a Plan/Code
 /// failure in Auto mode) — a never-silent gate per WR-11.
 ///
@@ -1917,11 +1917,40 @@ pub fn fire_gate_notify_with_fallback(
     unexpected: bool,
     fallback_cmd: Option<&str>,
 ) {
+    fire_gate_notify_with_fallback_cancellable(
+        phase,
+        stage,
+        context,
+        unexpected,
+        fallback_cmd,
+        &|| false,
+    );
+}
+
+/// [`fire_gate_notify_with_fallback`], whose hook run is also killed as soon
+/// as `cancel` answers `true`. Every run is bounded by [`NOTIFY_HOOK_TIMEOUT`].
+pub fn fire_gate_notify_with_fallback_cancellable(
+    phase: PhaseId,
+    stage: Stage,
+    context: &str,
+    unexpected: bool,
+    fallback_cmd: Option<&str>,
+    cancel: &dyn Fn() -> bool,
+) {
     let env = std::env::var_os(GATE_NOTIFY_CMD_ENV);
     let Some(cmd) = resolve_gate_notify_cmd(env.as_deref(), fallback_cmd) else {
         return;
     };
-    run_notify_command(&cmd, phase, stage, context, unexpected);
+    run_notify_command_to(
+        &cmd,
+        phase,
+        stage,
+        context,
+        unexpected,
+        NOTIFY_HOOK_TIMEOUT,
+        cancel,
+        &mut std::io::stderr(),
+    );
 }
 
 /// The environment variable that configures the gate notify hook.
@@ -2022,7 +2051,9 @@ pub fn resolve_gate_notify_cmd(
 /// [`GATE_CONTEXT_DISPLAY_CHARS`] characters (GATE-04, Pitfall 6): the gate
 /// file keeps the whole context, the notification only its start. Fail-soft: a non-zero exit or spawn error is logged via
 /// `warn!` and otherwise ignored — this must never propagate an error that
-/// could abort `run_gate`.
+/// could abort `run_gate`. Tests call it; DevFlow runs hooks through
+/// [`fire_gate_notify_with_fallback_cancellable`].
+#[cfg(test)]
 fn run_notify_command(cmd: &str, phase: PhaseId, stage: Stage, context: &str, unexpected: bool) {
     run_notify_command_to(
         cmd,
@@ -2042,17 +2073,25 @@ pub const NOTIFY_HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// [`run_notify_command`], writing the line for a failed hook to `err`: a
 /// failing hook is the operator's notification channel going quiet.
+///
+/// The hook runs bounded: `sh -c cmd` in its own process group, stdin and
+/// stdout to null, stderr drained on a thread so a chatty hook cannot fill the
+/// pipe. At `timeout`, or as soon as `cancel` answers `true`, the whole group is
+/// killed and the shell reaped, and the line on `err` names the bound or the
+/// cancel. So no hook, nor anything it backgrounds, can hold up a gate.
+#[allow(clippy::too_many_arguments)]
 fn run_notify_command_to(
     cmd: &str,
     phase: PhaseId,
     stage: Stage,
     context: &str,
     unexpected: bool,
-    _timeout: Duration,
-    _cancel: &dyn Fn() -> bool,
+    timeout: Duration,
+    cancel: &dyn Fn() -> bool,
     err: &mut dyn std::io::Write,
 ) {
-    let output = Command::new("sh")
+    use std::os::unix::process::CommandExt;
+    let spawned = Command::new("sh")
         .arg("-c")
         .arg(cmd)
         .env("DEVFLOW_GATE_PHASE", phase.to_string())
@@ -2065,17 +2104,40 @@ fn run_notify_command_to(
             "DEVFLOW_NON_SILENT_GATE",
             if unexpected { "1" } else { "0" },
         )
-        .output();
-    match output {
-        Ok(out) if out.status.success() => {
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0)
+        .spawn();
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(error) => {
+            warn!("gate notify hook could not be spawned: {error}");
+            return;
+        }
+    };
+    let (stderr_sent, stderr_read) = std::sync::mpsc::channel::<Vec<u8>>();
+    if let Some(mut pipe) = child.stderr.take() {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut pipe, &mut bytes);
+            let _ = stderr_sent.send(bytes);
+        });
+    }
+    let started = std::time::Instant::now();
+    let end = await_hook(&mut child, &stderr_read, started, timeout, cancel);
+    if !matches!(end, HookEnd::Exited(..)) {
+        kill_hook_group(&mut child);
+    }
+    match end {
+        HookEnd::Exited(status, _) if status.success() => {
             debug!("gate notify hook ran successfully");
         }
-        Ok(out) => {
-            let status = out
-                .status
+        HookEnd::Exited(status, hook_stderr) => {
+            let status = status
                 .code()
                 .map_or_else(|| "a signal".to_string(), |code| code.to_string());
-            let hook_stderr = String::from_utf8_lossy(&out.stderr);
+            let hook_stderr = String::from_utf8_lossy(&hook_stderr);
             warn!("gate notify hook exited with status {status}: {hook_stderr}");
             let _ = writeln!(
                 err,
@@ -2083,8 +2145,96 @@ fn run_notify_command_to(
                 hook_stderr.trim()
             );
         }
-        Err(err) => warn!("gate notify hook could not be spawned: {err}"),
+        HookEnd::TimedOut => {
+            warn!("gate notify hook did not finish within {timeout:?}; killed");
+            let _ = writeln!(
+                err,
+                "warning: the gate notify hook did not finish within {} s \
+                 (NOTIFY_HOOK_TIMEOUT); its process group was killed",
+                timeout.as_secs()
+            );
+        }
+        HookEnd::Cancelled => {
+            warn!("gate notify hook cancelled; killed");
+            let _ = writeln!(
+                err,
+                "warning: the gate notify hook was killed on a cancel: the wait it \
+                 notified for ended first"
+            );
+        }
+        HookEnd::WaitFailed(error) => {
+            warn!("gate notify hook could not be waited for: {error}; killed");
+            let _ = writeln!(
+                err,
+                "warning: the gate notify hook could not be waited for ({error}); its \
+                 process group was killed"
+            );
+        }
     }
+}
+
+/// How a bounded notify hook run ended.
+enum HookEnd {
+    /// The shell exited and its stderr reached end of file.
+    Exited(std::process::ExitStatus, Vec<u8>),
+    /// The bound ran out first.
+    TimedOut,
+    /// The cancel answered `true` first.
+    Cancelled,
+    /// Waiting for the shell failed.
+    WaitFailed(std::io::Error),
+}
+
+/// How often a bounded notify hook is polled for its exit and its cancel.
+const NOTIFY_HOOK_POLL: Duration = Duration::from_millis(100);
+
+/// Poll `child` until it has exited and its stderr has ended, the bound runs
+/// out, or `cancel` answers `true`. A shell that exited while something it
+/// backgrounded still holds its stderr is waited for under the same bound.
+fn await_hook(
+    child: &mut std::process::Child,
+    stderr: &std::sync::mpsc::Receiver<Vec<u8>>,
+    started: std::time::Instant,
+    timeout: Duration,
+    cancel: &dyn Fn() -> bool,
+) -> HookEnd {
+    let mut exited = None;
+    loop {
+        if exited.is_none() {
+            match child.try_wait() {
+                Ok(status) => exited = status,
+                Err(error) => return HookEnd::WaitFailed(error),
+            }
+        }
+        if let Some(status) = exited {
+            match stderr.try_recv() {
+                Ok(bytes) => return HookEnd::Exited(status, bytes),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return HookEnd::Exited(status, Vec::new());
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if cancel() {
+            return HookEnd::Cancelled;
+        }
+        let waited = started.elapsed();
+        if waited >= timeout {
+            return HookEnd::TimedOut;
+        }
+        std::thread::sleep(NOTIFY_HOOK_POLL.min(timeout - waited));
+    }
+}
+
+/// Kill a notify hook's whole process group and reap its shell.
+fn kill_hook_group(child: &mut std::process::Child) {
+    if let Ok(pgid) = libc::pid_t::try_from(child.id()) {
+        // SAFETY: killpg has no memory preconditions. The group is the hook's
+        // own (`process_group(0)` made the shell its leader), and the shell is
+        // not reaped yet, so the id cannot name another group.
+        unsafe { libc::killpg(pgid, libc::SIGKILL) };
+    }
+    let _ = child.wait();
 }
 
 /// The point inside a close's disposal that a kill-point fixture stops at.
@@ -3791,7 +3941,10 @@ mod tests {
             &pidfile,
         )
         .expect("a cancelled hook runner returned within 2 s");
-        assert!(text.contains("cancel"), "the line names the cancel: {text:?}");
+        assert!(
+            text.contains("cancel"),
+            "the line names the cancel: {text:?}"
+        );
     }
 
     #[test]

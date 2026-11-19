@@ -635,6 +635,11 @@ Env provided to the hook: `DEVFLOW_GATE_PHASE`, `DEVFLOW_GATE_STAGE`,
 `DEVFLOW_GATE_CONTEXT`, `DEVFLOW_NON_SILENT_GATE` (`1` when the gate exists
 only because a stage failed unexpectedly).
 
+Each hook run is bounded by `NOTIFY_HOOK_TIMEOUT` (30 s): at the bound, or on
+a cancel (the gate's wait ended first), DevFlow kills and reaps the hook's
+process group and writes a failure line naming the timeout or the cancel, so
+no hook can hold up a gate.
+
 `DEVFLOW_GATE_CONTEXT` holds the first 450 characters of the gate's context,
 the same start the pending-gate banner and `devflow gate list` show; a longer
 context ends in `… [truncated; full output in .devflow/]`. Every context leads
@@ -660,7 +665,7 @@ command. The coding agent never receives the variable.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `DEVFLOW_GATE_NOTIFY_CMD` | unset | Shell command fired when a gate is written, and once when a run ends |
+| `DEVFLOW_GATE_NOTIFY_CMD` | unset | Shell command fired when a gate is written, and once when a run ends; each run is bounded by `NOTIFY_HOOK_TIMEOUT` (30 s) |
 | `DEVFLOW_GATE_TIMEOUT_SECS` | 259200 (3d) | How long a monitor waits at a gate, holding its gate registration rather than a lock. Not a deadline for answering: the gate request and phase state are files that never expire, and timing out is a clean resumable stop. Past it the run has ended at that gate: `devflow resume` reruns the stage and asks again, setting any unused answer aside |
 | `DEVFLOW_GATE_MAX_UNATTENDED_AGE_SECS` | 259200 (3d) | Age threshold `devflow gate sweep` uses to decide a gate is abandoned. Held **equal to** `DEVFLOW_GATE_TIMEOUT_SECS`, never shorter: `gate sweep` writes an abort response, so a threshold below the poll timeout lets a sweep reap gates a live monitor is still polling — turning a clean resumable timeout into an `abort()` that clears state, machine-wide across every registered root. An unparsable value or explicit `0` falls back to the default rather than reaping every gate on the machine |
 | `DEVFLOW_CACHE_DIR` | unset (falls back to `$XDG_CACHE_HOME/devflow`, then `$HOME/.cache/devflow`) | Test/override hook for the machine-global registry directory (`devflow gate list --all-roots`) |
