@@ -3469,7 +3469,8 @@ pub(crate) fn gate_answer(
 /// [`gate_respond_report`]'s order, and everything is refused before anything
 /// is written: a malformed id, a gate the id does not name, a gate with no
 /// waiter, a gate that is not a question, and an option the question did not
-/// offer (exact string equality).
+/// offer (exact string equality). A text answer, empty included, skips the
+/// option check.
 pub(crate) fn gate_answer_report(
     project_root: &Path,
     phase: PhaseId,
@@ -3477,10 +3478,6 @@ pub(crate) fn gate_answer_report(
     gate_id: &str,
     choice: &QuestionChoice,
 ) -> Result<String, CliError> {
-    let QuestionChoice::Option { option_id } = choice else {
-        return Err(CliError::Message("text answers are not built yet".into()));
-    };
-    let option = option_id.as_str();
     let observed = GateId::parse(gate_id)?;
     let open = Gates::list_open(project_root);
     let stage = match stage {
@@ -3496,12 +3493,15 @@ pub(crate) fn gate_answer_report(
     let gate =
         crate::pipeline_gate::read_gate_file(project_root, phase, stage).ok_or_else(|| {
             CliError::Message(format!(
-                "phase {phase} {stage}'s gate file could not be read, so DevFlow cannot tell                  what this answer would run; no response was written"
+                "phase {phase} {stage}'s gate file could not be read, so DevFlow cannot tell what \
+                 this answer would run; no response was written"
             ))
         })?;
     if gate.gate_kind != Some(GateKind::Question) {
         return Err(CliError::Message(format!(
-            "phase {phase} {stage}'s gate is not a question gate, so `gate answer` cannot answer              it; no response was written. Answer it with `devflow gate approve`, `devflow gate              reject --note <text>` or `devflow gate abort`"
+            "phase {phase} {stage}'s gate is not a question gate, so `gate answer` cannot answer \
+             it; no response was written. Answer it with `devflow gate approve`, `devflow gate \
+             reject --note <text>` or `devflow gate abort`"
         )));
     }
     let spec = Gates::read_question(project_root, phase, stage)?.ok_or_else(|| {
@@ -3509,28 +3509,34 @@ pub(crate) fn gate_answer_report(
             "phase {phase} {stage}'s question gate carries no question; no response was written"
         ))
     })?;
-    if !spec.options.iter().any(|offered| offered.id == option) {
+    // A text answer is not checked against the options (ASK-02 empty).
+    if let QuestionChoice::Option { option_id } = choice
+        && !spec.options.iter().any(|offered| offered.id == *option_id)
+    {
         let offered: Vec<&str> = spec.options.iter().map(|o| o.id.as_str()).collect();
         return Err(CliError::Message(format!(
-            "`{option}` is not an option of phase {phase} {stage}'s question; no response was              written. The options offered: {}",
+            "`{option_id}` is not an option of phase {phase} {stage}'s question; no response was \
+             written. The options offered: {}",
             offered.join(", ")
         )));
     }
     let path = Gates::answer_question(project_root, phase, stage, &observed, choice, &responded_by)
         .map_err(gate_answer_error)?;
-    events::emit(
-        project_root,
-        phase,
-        "gate_response_written",
-        serde_json::json!({
-            "stage": stage.to_string(),
-            "gate_id": observed.as_str(),
-            "approved": true,
-            "abort": false,
-            "option_id": option,
-            "via": "cli",
-        }),
-    );
+    let (choice_key, choice_value, answered_with) = match choice {
+        QuestionChoice::Option { option_id } => {
+            ("option_id", option_id, format!("option `{option_id}`"))
+        }
+        QuestionChoice::Text { text } => ("text", text, format!("the text answer {text:?}")),
+    };
+    let mut written = serde_json::json!({
+        "stage": stage.to_string(),
+        "gate_id": observed.as_str(),
+        "approved": true,
+        "abort": false,
+        "via": "cli",
+    });
+    written[choice_key] = serde_json::Value::from(choice_value.as_str());
+    events::emit(project_root, phase, "gate_response_written", written);
     let pickup = if waiter_is_live(project_root, phase, stage, &observed) {
         response_pickup_message(WaiterStatus::Live).to_owned()
     } else {
@@ -3540,7 +3546,7 @@ pub(crate) fn gate_answer_report(
         )
     };
     Ok(format!(
-        "answered the question gate for phase {phase} {stage} with option `{option}` — {pickup} \
+        "answered the question gate for phase {phase} {stage} with {answered_with} — {pickup} \
          (response at {})\n",
         path.display()
     ))
