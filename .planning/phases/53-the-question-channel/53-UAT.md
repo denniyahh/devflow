@@ -1,18 +1,14 @@
 ---
-status: testing
+status: complete
 phase: 53-the-question-channel
 source: [53-VERIFICATION.md]
 started: 2026-11-19T20:33:49Z
-updated: 2026-11-19T20:33:49Z
+updated: "2026-11-20T11:05:28Z"
 ---
 
 ## Current Test
 
-number: 1
-name: "53-VALIDATION.md M1-M3: install the phase head, then run the live claude (M2) and live codex (M3, held past the 900 s cap, pending then re-call) proofs and record them in 53-PROOF-RUN.md"
-expected: |
-  53-PROOF-RUN.md holds installed-head, claude-live: PASS, codex-live: PASS and matching codex-config-before/after hashes
-awaiting: user response
+[testing complete]
 
 ## Tests
 
@@ -34,9 +30,9 @@ resolution: "Override accepted by the operator (denniyahh, 2026-11-19T20:41Z), o
 ## Summary
 
 total: 3
-passed: 1
+passed: 3
 issues: 0
-pending: 2
+pending: 0
 skipped: 0
 blocked: 0
 
