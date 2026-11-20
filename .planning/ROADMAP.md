@@ -298,10 +298,13 @@ closing this phase.
 **Success Criteria** (what must be TRUE):
 
   1. An agent launched by DevFlow calls `devflow_ask` over stdio with a question, typed options and context; the call
-     blocks until an answer exists and the answer comes back to the same agent session — proven live for the two
-     agents already proven live (claude, codex) and by an e2e test that drives the real binary with a stub agent for
-     the other launch shapes. **Control:** a call with a malformed payload (no options, or an option id the question
-     did not offer) is refused with a typed error and the agent is not left blocked. (ASK-01)
+     blocks until an answer exists and the answer comes back to the same agent session — proven live for claude and
+     codex (53-PROOF-RUN.md), for pi by its registration spike against a stub MCP server (53-MCP-SPIKE.md, pi
+     addendum), and by e2e tests that drive the real binary with stub claude, codex and pi agents; opencode, hermes
+     and antigravity launches are refused by name until each has a registration (999.248), so `--mode auto`, which
+     accepts only claude or antigravity as a fallback, has no usable non-claude fallback until then. **Control:** a
+     call with a malformed payload (no options, or an option id the question did not offer) is refused with a typed
+     error and the agent is not left blocked. (ASK-01)
   2. Under "operator via gate", an asked question appears in `devflow gate list` and `gate show` with its options;
      `devflow gate answer <phase> --gate-id <id> --option <id>` (or a free-text answer) resolves it; the notify hook
      fires and `notify_fired` is recorded exactly as for an approve/reject gate. **Control:** an answer addressed to a
@@ -319,7 +322,36 @@ closing this phase.
      record — the history view distinguishes "not yet answered" from an empty answer, and a run that asked nothing
      shows no question rows. (ASK-04)
 
-**Plans**: TBD
+**Plans**: 14/14 plans executed
+**Wave 1**
+- [x] 53-01-PLAN.md
+- [x] 53-02-PLAN.md
+- [x] 53-03-PLAN.md
+- [x] 53-12-PLAN.md
+
+**Wave 2** *(blocked on Wave 1 completion)*
+- [x] 53-04-PLAN.md
+- [x] 53-05-PLAN.md
+- [x] 53-06-PLAN.md
+
+**Wave 3** *(blocked on Wave 2 completion)*
+- [x] 53-07-PLAN.md
+
+**Wave 4** *(blocked on Wave 3 completion)*
+- [x] 53-08-PLAN.md
+
+**Wave 5** *(blocked on Wave 4 completion)*
+- [x] 53-09-PLAN.md
+
+**Wave 6** *(blocked on Wave 5 completion)*
+- [x] 53-10-PLAN.md
+
+**Wave 7** *(blocked on Wave 6 completion)*
+- [x] 53-11-PLAN.md
+- [x] 53-13-PLAN.md
+
+**Wave 8** *(blocked on Wave 7 completion)*
+- [x] 53-14-PLAN.md
 **UI hint**: no
 
 ### Phase 54: Decision Triage
@@ -557,7 +589,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 52 | 33/33 | Executed — verification stale | 2026-11-11 |
 | 52.1 | 7/7 | Executed — closed at plan 07 (operator, 2026-11-15) | 2026-11-15 |
 | 52.2 | 26/26 | In Progress | — |
-| 53 | 0/? | Not started | — |
+| 53 | 14/14 | In Progress | — |
 | 54 | 0/? | Not started | — |
 | 55 | 0/? | Not started | — |
 

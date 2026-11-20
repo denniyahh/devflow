@@ -62,6 +62,109 @@ pub enum DriverHealth {
     HeadlessCapable,
 }
 
+/// How much longer an agent's MCP client waits on a `devflow_ask` call than the
+/// server holds it, so the server's typed `timed_out` result arrives before the
+/// client gives up on the call (Phase 53, D-03).
+pub const ASK_CLIENT_TIMEOUT_MARGIN_SECS: u64 = 60;
+
+/// The longest codex is held on one `devflow_ask` call, in seconds, before the
+/// server replies `pending` and codex calls again with the question's id
+/// (operator answer OD-1 (b), 2026-11-18: "about 15 min"). The spike measured
+/// codex polling a held call, so each held call costs tokens; claude made no
+/// model request while waiting and has no cap.
+pub const ASK_HOLD_CAP_SECS: u64 = 900;
+
+/// What one stage launch registers as the `devflow` MCP server (Phase 53, D-03):
+/// the runner's own binary, run as `__ask` for this run's phase and stage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AskRegistration {
+    /// The runner's own executable, run as the server.
+    pub exe: PathBuf,
+    /// The project root the server serves.
+    pub project_root: PathBuf,
+    /// The run's phase.
+    pub phase: PhaseId,
+    /// The stage being launched.
+    pub stage: crate::stage::Stage,
+    /// How long the server holds a question open, in seconds.
+    pub timeout_secs: u64,
+    /// The run's `started_at`, which binds a call to this run.
+    pub run_started_at: String,
+    /// Where a driver that registers through a file writes it.
+    pub config_path: PathBuf,
+}
+
+impl AskRegistration {
+    /// The server's argv after the program: the `__ask` flag contract (53-01).
+    pub fn server_args(&self) -> Vec<String> {
+        vec![
+            "__ask".into(),
+            "--project".into(),
+            self.project_root.to_string_lossy().into_owned(),
+            "--phase".into(),
+            self.phase.to_string(),
+            "--stage".into(),
+            self.stage.to_string(),
+            "--timeout-secs".into(),
+            self.timeout_secs.to_string(),
+            "--run-started-at".into(),
+            self.run_started_at.clone(),
+        ]
+    }
+
+    /// How long the agent's MCP client waits on one call, in seconds.
+    pub fn client_timeout_secs(&self) -> u64 {
+        self.timeout_secs
+            .saturating_add(ASK_CLIENT_TIMEOUT_MARGIN_SECS)
+    }
+
+    /// The executable and project root as UTF-8, or the refusal naming the one
+    /// that is not: both are written into config text, which is UTF-8 only.
+    pub fn utf8_paths(&self) -> Result<(&str, &str), String> {
+        Ok((
+            utf8_path(&self.exe, "devflow executable")?,
+            utf8_path(&self.project_root, "project root")?,
+        ))
+    }
+}
+
+/// `path` as UTF-8, or the refusal naming it as `what`.
+fn utf8_path<'a>(path: &'a std::path::Path, what: &str) -> Result<&'a str, String> {
+    path.to_str().ok_or_else(|| {
+        format!(
+            "the {what} {} is not UTF-8; it cannot be written into the devflow_ask registration",
+            path.display()
+        )
+    })
+}
+
+/// Where a driver's ask arguments go in its launch argv.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArgPlacement {
+    /// After every other argument.
+    Append,
+    /// Before the last argument (the prompt).
+    BeforeLast,
+}
+
+/// How a driver registers the `devflow` MCP server for one launch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AskWiring {
+    /// The arguments to add to the launch argv.
+    pub args: Vec<String>,
+    /// Where they go.
+    pub placement: ArgPlacement,
+    /// A file to write before the launch, as `(path, contents)`.
+    pub file: Option<(PathBuf, String)>,
+}
+
+/// The refusal of a driver that has no `devflow_ask` registration.
+fn no_ask_registration(name: &str) -> String {
+    format!(
+        "{name} has no MCP registration for devflow_ask; launch with --agent claude, --agent codex or --agent pi"
+    )
+}
+
 /// The modular driver contract (999.31): each agent owns its prompt rendering,
 /// command building, completion parsing, and health/capability discovery —
 /// instead of that logic being scattered across `prompt.rs`, `agents/*.rs`,
@@ -129,6 +232,18 @@ pub trait AgentDriver {
         "$HOME/.codex/gsd-core/workflows".to_string()
     }
 
+    /// Whether this driver can register the `devflow` MCP server at all; the
+    /// question start, resume and handoff ask before any agent process starts.
+    fn ask_support(&self) -> Result<(), String> {
+        Err(no_ask_registration(self.name()))
+    }
+
+    /// How this driver registers the `devflow` MCP server for one stage launch
+    /// (Phase 53, D-03), or the refusal of a driver that cannot.
+    fn ask_wiring(&self, _reg: &AskRegistration) -> Result<AskWiring, String> {
+        Err(no_ask_registration(self.name()))
+    }
+
     /// Classify this driver's health (the pass/fail [`AgentDriver::health`]
     /// mapped onto the richer [`DriverHealth`]).
     fn health_classification(&self, state: &crate::state::State) -> DriverHealth {
@@ -164,7 +279,32 @@ fn contract_checks<D: AgentDriver + ?Sized>(driver: &D) -> Vec<ContractResult> {
         name: "build_command names a program",
         passed: !program.is_empty(),
     });
+    checks.push(ContractResult {
+        name: "ask_support and ask_wiring declare the same registration",
+        passed: ask_declarations_agree(driver),
+    });
     checks
+}
+
+/// Whether `driver`'s `ask_support` and `ask_wiring` agree: both `Ok`, or both
+/// the same refusal naming the driver and `devflow_ask`.
+fn ask_declarations_agree<D: AgentDriver + ?Sized>(driver: &D) -> bool {
+    let reg = AskRegistration {
+        exe: PathBuf::from("/usr/bin/devflow"),
+        project_root: PathBuf::from("/project"),
+        phase: PhaseId::new(1),
+        stage: crate::stage::Stage::Code,
+        timeout_secs: 120,
+        run_started_at: "2026-11-18T00:00:00Z".into(),
+        config_path: PathBuf::from("/project/.devflow/ask-01.mcp.json"),
+    };
+    match (driver.ask_support(), driver.ask_wiring(&reg)) {
+        (Ok(()), Ok(_)) => true,
+        (Err(support), Err(wiring)) => {
+            support == wiring && support.contains(driver.name()) && support.contains("devflow_ask")
+        }
+        _ => false,
+    }
 }
 
 /// Return the driver for a configured agent kind.
@@ -327,8 +467,8 @@ mod tests {
         let results = antigravity.test_contract();
         assert_eq!(
             results.len(),
-            5,
-            "1 name + 3 per-stage DEVFLOW_RESULT prompts + 1 program"
+            6,
+            "1 name + 3 per-stage DEVFLOW_RESULT prompts + 1 program + 1 ask declaration"
         );
         for result in &results {
             assert!(
@@ -367,8 +507,8 @@ mod tests {
         let results = hermes.test_contract();
         assert_eq!(
             results.len(),
-            5,
-            "1 name + 3 per-stage DEVFLOW_RESULT prompts + 1 program"
+            6,
+            "1 name + 3 per-stage DEVFLOW_RESULT prompts + 1 program + 1 ask declaration"
         );
         for result in &results {
             assert!(
@@ -407,6 +547,113 @@ mod tests {
         ) -> (&'static str, Vec<String>) {
             ("", Vec::new())
         }
+    }
+
+    /// D-02: every driver's ask declaration is part of the conformance suite.
+    /// claude and codex register the server; the other four refuse, with the
+    /// same text from the support query and the wiring, naming the driver and
+    /// `devflow_ask`.
+    #[test]
+    fn every_driver_declares_its_ask_registration() {
+        let reg = AskRegistration {
+            exe: PathBuf::from("/usr/bin/devflow"),
+            project_root: PathBuf::from("/project"),
+            phase: PhaseId::new(7),
+            stage: Stage::Plan,
+            timeout_secs: 120,
+            run_started_at: "2026-11-18T00:00:00Z".into(),
+            config_path: PathBuf::from("/project/.devflow/ask-07.mcp.json"),
+        };
+        for kind in [
+            AgentKind::Claude,
+            AgentKind::Codex,
+            AgentKind::OpenCode,
+            AgentKind::Pi,
+            AgentKind::Antigravity,
+            AgentKind::Hermes,
+        ] {
+            let driver = driver_for(kind);
+            let name = driver.name();
+            let support = driver.ask_support();
+            let wiring = driver.ask_wiring(&reg);
+            if matches!(kind, AgentKind::Claude | AgentKind::Codex | AgentKind::Pi) {
+                assert_eq!(support, Ok(()), "{name} registers the server");
+                assert!(wiring.is_ok(), "{name} registers the server: {wiring:?}");
+            } else {
+                let support = support.expect_err(&format!("{name} has no registration"));
+                let wiring = wiring.expect_err(&format!("{name} has no registration"));
+                assert_eq!(support, wiring, "{name}: the two declarations differ");
+                assert!(support.contains(name), "{name}: {support}");
+                assert!(support.contains("devflow_ask"), "{name}: {support}");
+                assert!(
+                    support.contains("--agent claude, --agent codex or --agent pi"),
+                    "{name}: {support}"
+                );
+            }
+            assert!(
+                ask_declarations_agree(driver.as_ref()),
+                "{name}: the conformance case disagrees"
+            );
+        }
+    }
+
+    /// OD-1 (b) and OD-2: of the drivers that register the server, codex and pi pass
+    /// `--hold-cap-secs`; claude's server gets the five `__ask` flags alone.
+    #[test]
+    fn only_codex_and_pi_carry_a_hold_cap() {
+        let reg = AskRegistration {
+            exe: PathBuf::from("/usr/bin/devflow"),
+            project_root: PathBuf::from("/project"),
+            phase: PhaseId::new(7),
+            stage: Stage::Code,
+            timeout_secs: 120,
+            run_started_at: "2026-11-18T00:00:00Z".into(),
+            config_path: PathBuf::from("/project/.devflow/ask-07.mcp.json"),
+        };
+        let mut registered = Vec::new();
+        for kind in [
+            AgentKind::Claude,
+            AgentKind::Codex,
+            AgentKind::OpenCode,
+            AgentKind::Pi,
+            AgentKind::Antigravity,
+            AgentKind::Hermes,
+        ] {
+            let driver = driver_for(kind);
+            let Ok(wiring) = driver.ask_wiring(&reg) else {
+                continue;
+            };
+            registered.push(kind);
+            let file_text = wiring
+                .file
+                .as_ref()
+                .map(|(_, text)| text.as_str())
+                .unwrap_or("");
+            let carries_cap = wiring
+                .args
+                .iter()
+                .any(|arg| arg.contains("--hold-cap-secs"))
+                || file_text.contains("--hold-cap-secs");
+            assert_eq!(
+                carries_cap,
+                matches!(kind, AgentKind::Codex | AgentKind::Pi),
+                "{}: hold cap present = {carries_cap}: {wiring:?}",
+                driver.name()
+            );
+            if kind == AgentKind::Claude {
+                let config: serde_json::Value =
+                    serde_json::from_str(file_text).expect("claude's registration is JSON");
+                let args: Vec<String> =
+                    serde_json::from_value(config["mcpServers"]["devflow"]["args"].clone())
+                        .expect("claude's server args are strings");
+                assert_eq!(args, reg.server_args(), "claude's server args");
+            }
+        }
+        assert_eq!(
+            registered,
+            [AgentKind::Claude, AgentKind::Codex, AgentKind::Pi],
+            "the drivers that register the server"
+        );
     }
 
     #[test]

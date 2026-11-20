@@ -61,16 +61,17 @@ requirement closes a backlog entry, the entry is named; `.planning/user/V4-CUT-I
 
 ### Question channel (ASK)
 
-- [ ] **ASK-01**: DevFlow serves an MCP tool (`devflow_ask`) over stdio that every supported agent can call with a
+- [x] **ASK-01**: DevFlow serves an MCP tool (`devflow_ask`) over stdio that
+      every supported agent (claude, codex and pi; opencode, hermes and antigravity are refused by name until they have a registration, 999.248) can call with a
       question, typed options and context; the call blocks until an answer exists and returns it to the agent.
-- [ ] **ASK-02**: The policy "operator via gate" turns each question into a gate the operator answers from the shell
+- [x] **ASK-02**: The policy "operator via gate" turns each question into a gate the operator answers from the shell
       (`devflow gate answer <phase> --gate-id <id> --option <id>` or a free-text answer), with the notify hook firing
       as for any gate.
-- [ ] **ASK-03**: Every stage prompt tells the agent to call the tool for decision checkpoints, `blocking-human` gates
+- [x] **ASK-03**: Every stage prompt tells the agent to call the tool for decision checkpoints, `blocking-human` gates
       and GSD discuss questions instead of self-resolving them positionally or stopping with a report.
-- [ ] **ASK-04**: Every question and its answer are recorded in the event log with the answering policy or operator
+- [x] **ASK-04**: Every question and its answer are recorded in the event log with the answering policy or operator
       and the time, and `devflow history` shows them.
-- [ ] **ASK-05**: A `blocking-human` checkpoint reached under a one-shot launch is answered through the channel and the
+- [x] **ASK-05**: A `blocking-human` checkpoint reached under a one-shot launch is answered through the channel and the
       stage continues in the same session. Closes 999.57, 999.127.
 
 ### Decision triage (TRIAGE)
@@ -142,11 +143,11 @@ Populated during roadmap creation (2026-11-08). Phase order and dependencies: RO
 | OPS-02 | Phase 52 — Subtract and Stabilize | Complete |
 | OPS-03 | Phase 52 — Subtract and Stabilize | Complete |
 | OPS-04 | Phase 52 — Subtract and Stabilize | Complete |
-| ASK-01 | Phase 53 — The Question Channel | Pending |
-| ASK-02 | Phase 53 — The Question Channel | Pending |
-| ASK-03 | Phase 53 — The Question Channel | Pending |
-| ASK-04 | Phase 53 — The Question Channel | Pending |
-| ASK-05 | Phase 53 — The Question Channel | Pending |
+| ASK-01 | Phase 53 — The Question Channel | Complete |
+| ASK-02 | Phase 53 — The Question Channel | Complete |
+| ASK-03 | Phase 53 — The Question Channel | Complete |
+| ASK-04 | Phase 53 — The Question Channel | Complete |
+| ASK-05 | Phase 53 — The Question Channel | Complete |
 | TRIAGE-01 | Phase 54 — Decision Triage | Pending |
 | TRIAGE-02 | Phase 54 — Decision Triage | Pending |
 | TRIAGE-03 | Phase 54 — Decision Triage | Pending |

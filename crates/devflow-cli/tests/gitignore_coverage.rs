@@ -35,6 +35,9 @@ const RUNTIME_PATHS: &[&str] = &[
     ".devflow/events.jsonl",
     ".devflow/gates/probe.json",
     ".devflow/history/phase-01-state.json",
+    ".devflow/ask-07.mcp.json",
+    ".devflow/ask-07.mcp.ts",
+    ".devflow/.ask-07-code",
 ];
 
 #[test]

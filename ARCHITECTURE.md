@@ -275,6 +275,12 @@ has sent `READY=1`; a failed start names the unit and `systemd-run`'s stderr.
 The runner runs each stage's agent through `monitor::run_stage`, waits at gates
 and advances in-process until the run finishes, stops or fails.
 
+An agent's question takes the same gate protocol. The ask server (`devflow ask`,
+registered as the hidden `__ask` subcommand, `ask_server.rs`) is the stdio MCP
+server an agent spawns; each `devflow_ask` call opens a `question` gate through
+`Gates::open_question_registered`, so the server is that gate's waiter, and it
+returns the option `devflow gate answer` wrote once it has claimed the answer.
+
 `devflow stop` (`commands::stop`) stops the unit with `systemctl --user stop`.
 The manager signals the unit's whole control group, so the agent ends with the
 runner, and the runner records `stopped` itself; `stop` then reads the state to

@@ -756,7 +756,7 @@ pub(crate) fn every_gate_kind() -> Vec<Option<devflow_core::gates::GateKind>> {
         GateKind::StageFailure,
         GateKind::RateLimit,
         GateKind::Preflight,
-        GateKind::CheckpointDeclaration,
+        GateKind::Question,
     ];
     let listed = |kind: GateKind| match kind {
         GateKind::CleanPass
@@ -772,7 +772,7 @@ pub(crate) fn every_gate_kind() -> Vec<Option<devflow_core::gates::GateKind>> {
         | GateKind::StageFailure
         | GateKind::RateLimit
         | GateKind::Preflight
-        | GateKind::CheckpointDeclaration => all.contains(&kind),
+        | GateKind::Question => all.contains(&kind),
     };
     assert!(all.iter().all(|kind| listed(*kind)));
     all.into_iter().map(Some).chain([None]).collect()

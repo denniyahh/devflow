@@ -125,3 +125,88 @@ Not established: how either agent behaves on an error with a richer prompt (a GS
   Two inputs it does not cover: claude's 30-min stdio idle abort applies unless the registration raises it, and codex's
   model polls a pending call about every 21 s, so a long block on codex costs tokens for its whole duration — this bears
   on whether codex should use the `pending`/re-call fallback rather than a long block (a choice for planning or the operator).
+
+## Addendum — pi 1.5.2 (Phase 53, operator answer OD-2)
+
+Run 2026-11-19 by the 53-14 executor in the phase worktree session. Client: pi 1.5.2 on its own configured model
+(`settings.json` `defaultProvider` litellm, `defaultModel` deepseek-flash). Server: the same stdlib-only Python stdio
+server as above (one tool `devflow_ask`; `HOLD`, `MODE`, `LOG` env; echoes `protocolVersion`; `-32601` for any other
+request; `python3 -I`), with each `tools/call` answered from a thread so a `notifications/cancelled` is logged when it
+arrives. Same prompt as above. Scratch (`$S`) was a session scratch directory outside the repository, deleted after
+the spike. 9 pi launches in total.
+
+pi's docs (`docs/mcp.md`, `docs/security.md`, `docs/extensions.md` in the installed package) say: servers come from
+`~/.pi/agent/mcp.json` and, only after project trust, `.pi/mcp.json`; there is no per-launch MCP config flag or
+environment variable; `--approve` trusts *all* project-local resources for one run (settings, `.pi/extensions`, skills,
+prompts, `.pi/mcp.json`); an extension can call `pi.registerMcpServer(name, config)` with an `mcpServers`-entry
+config for the current session; a CLI `-e <path>` extension loads without project trust; each server has a
+per-request `timeout` in seconds (default 60) that progress notifications reset; `exposure: "direct"` declares a
+server's tools to the model (the default `codemode` does not).
+
+### Commands
+
+Registration file `$S/<tag>.ext.ts` (route 1: a per-launch flag pointing at a file):
+
+```
+export default function (pi: any) {
+  pi.registerMcpServer("devflow", {"command":"python3","args":["-I","$S/server.py"],
+    "env":{"HOLD":"…","MODE":"…","LOG":"…"},"exposure":"direct"[,"timeout":<secs>]});
+}
+```
+
+```
+cd $S/work && timeout <N> pi -p --no-approve --no-session --mode json [-e $S/<tag>.ext.ts] "<prompt>" < /dev/null
+```
+
+Launches: pi-ctrl (no `-e`), pi-call (HOLD 0), pi-err (`MODE=error`), pi-knob30 (HOLD 60, `"timeout":30`), pi-900
+(HOLD 900, pi's default timeout), pi-knob (HOLD 900, `"timeout":960`), pi-shape (HOLD 0, `"timeout":960`, the exact
+one-line text `PiDriver::ask_wiring` writes, at `$S/shape/.devflow/ask-07.mcp.ts`), and one load check of the same
+extension named `*.mcp.json`. pi-900 and pi-knob ran in the background and were polled; their PIDs were recorded and
+both had exited on their own before cleanup. `--no-session` kept the launches from writing session files under
+`~/.pi/agent/sessions/`. Route 2 (`.pi/mcp.json` under `--approve`) was not tried, because route 1 worked first; it
+would also have needed `--approve`, which DevFlow's pi launch never passes (pi.rs: it loads project extensions that run
+unsandboxed).
+
+### Item 1 — registration without global config
+
+| Case | Observed | Evidence |
+|---|---|---|
+| pi-ctrl | No `devflow` server, answered `NO_TOOL`. 4 s. | no server log; final assistant text `NO_TOOL`, no `tool_execution_start` event |
+| pi-call | `-e` extension under `--no-approve` spawned the server; pi listed and called the tool, printed `a`. 4 s. | log: `initialize` (`protocolVersion "2025-11-25"`, clientInfo `pi 1.5.2`, capabilities `roots`) → `notifications/initialized` → `tools/list` → `tools/call` with `_meta.progressToken 3`; event `tool_execution_end … "toolName":"mcp__devflow__devflow_ask"`, result `a`; final text `a` |
+| pi-shape | The one-line text DevFlow writes, named `ask-07.mcp.ts` under a `.devflow/`, loads and calls the tool. | final text `a` |
+| `.json` name | pi refuses an extension named `*.mcp.json` and exits 1 (it parses it as JSON). | stderr `Failed to load extension … is not valid JSON`; exit 1 |
+
+No `--tools`, approval flag or setting was needed: pi has no per-call approval, and the tool was declared directly
+(`exposure: "direct"`). `~/.pi/agent/`: sha256 of all 1,361 files before and after; no file changed or was removed, and
+one file was added, `sessions/--tmp-claude-1000--var-home-denniyahh-Github-wsx-…-scratchpad-review-snapshot--/2026-11-19T18-12-02-823Z_….jsonl`,
+a session of a pi run whose working directory was another project's review snapshot (pi names a session directory
+after its working directory). Every spike launch ran in `$S/work` or `$S/shape` with `--no-session`, so the added file
+is not from the spike.
+
+### Item 2 — held call
+
+| Case | Observed | Evidence |
+|---|---|---|
+| pi-900 (default timeout) | Cancelled at 60.0 s, no retry; the agent continued and printed the error. 63 s. | log: `tools/call` …111.681, `notifications/cancelled {"requestId":3,"reason":"Request timed out"}` …171.693 (60.01 s); tool result `MCP request timed out after 60000ms`, `isError` |
+| pi-knob30 (`timeout` 30, HOLD 60) | Cancelled at 30.0 s, no retry (knob control). | log: `tools/call` …118.704, `notifications/cancelled` …148.703 (30.00 s); `MCP request timed out after 30000ms` |
+| pi-knob (`timeout` 960, HOLD 900) | Waited the full 900 s and printed `a`. Run 901.9 s. | log: `call_start` 1795111111.686, `call_end` 1795112011.687 (900.0 s); one `tools/call`; final text `a` |
+
+Cost: pi made no model request while the call was held. pi-knob had 2 assistant turns with the same usage as the
+instant pi-call (395 + 223 input, 26,624 + 26,880 cache read, 72 output tokens).
+
+### Item 3 — tool error
+
+| Case | Observed | Evidence |
+|---|---|---|
+| pi-err | `isError: true` reached the model as an error tool result; no retry; printed it and ended. 3 s. | event `tool_execution_end … "isError":true`, text `devflow_ask failed: run stopped (spike error mode)`; one `tools/call` in the log; final `TOOL_ERROR: devflow_ask failed: run stopped (spike error mode)` |
+
+**pi registration without global config:** PASS — a one-line extension `.devflow/ask-NN.mcp.ts` calling `pi.registerMcpServer("devflow", {command, args, exposure: "direct", timeout})`, passed per launch with `-e <path>` before the prompt; no trust is granted: `--no-approve` stays, and an explicit `-e` extension loads without project trust
+**pi hold:** held 900 s — per-server `timeout` (seconds) in the registration, set to 960; pi's default 60 s cancels at 60.0 s
+**pi tool name:** mcp__devflow__devflow_ask
+**pi tool error:** `isError: true` arrives as an error tool result; the agent is not blocked, makes no retry, prints the error and ends
+**pi verdict:** BUILD — per-launch `-e .devflow/ask-NN.mcp.ts` extension calling `pi.registerMcpServer`, under `--no-approve`; held 900 s
+
+Not established: how pi's model treats the server's `pending` reply after a 900 s hold (53-13's re-call by
+`question_id`); no pi launch received one. No live DevFlow run on pi was made. A server named `devflow` in the
+operator's `~/.pi/agent/mcp.json` would take precedence over the extension's registration (pi docs; not run). pi's
+behaviour past 15 min, and with an exposure other than `direct`, was not run.

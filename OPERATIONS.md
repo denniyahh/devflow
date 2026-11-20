@@ -43,7 +43,8 @@ Plan → Code → Validate
 | `devflow gate approve <phase> [--stage S] [--note ...] [--gate-id ID]` | Approve a gate — the workflow advances |
 | `devflow gate reject <phase> --note ... [--stage S] [--gate-id ID]` | Reject — the stage is fixed and relaunched; the run stays alive, whatever the note says |
 | `devflow gate abort <phase> [--note ...] [--stage S] [--gate-id ID]` | Abort — the only answer that ends the run |
-| `devflow gate sweep [--max-age-secs N] [--dry-run] [--root PATH]` | Answer or report aged, unattended gates across every registered root (or one `--root`) — bounds an abandoned run's lifetime without `kill(1)`. On-demand only; nothing schedules it. Never writes an approval |
+| `devflow gate answer <phase> --gate-id <id> (--option <id> \| --text <answer>) [--stage S]` | Answer a question gate with one of the options it offers, or with free text; the agent's `devflow_ask` call returns that answer. `--gate-id` is required, exactly one of `--option` and `--text` is given, an option id must match an offered id exactly (no case folding), and `--text ""` is an empty answer, not an unanswered question. `gate approve` and `gate reject` are refused on a question gate; `gate abort` still ends the run |
+| `devflow gate sweep [--max-age-secs N] [--dry-run] [--root PATH]` | Answer or report aged, unattended gates across every registered root (or one `--root`) — bounds an abandoned run's lifetime without `kill(1)`. On-demand only; nothing schedules it. Never writes an approval, and leaves a question gate alone at any age: it ends at its own timeout, by `gate answer` or by `gate abort` |
 | `devflow stop --phase N [PROJECT] [--root PATH]` | End a phase's run by stopping its user unit ([Run shape](#run-shape)) with `systemctl --user stop`, which returns once the unit is down: the manager sends SIGTERM to every process in the unit, the runner and the agent alike, and SIGKILL to any still there after 10 s. The runner records `stopped` and its stop reason; a run waiting at a gate has that gate closed and stays resumable. `stop` then reports how the run ended, from the state: **stopped**, quoting the stop reason and naming `devflow resume --phase N`; **already finished**; **stopped during launch**, when the runner had recorded nothing yet, naming `devflow start --phase N` (these three exit 0); **crashed**, when the runner ended without recording a stop, naming `devflow resume --phase N` and `devflow discard --phase N`; or a state that does not load, naming `devflow discard --phase N` (these two exit non-zero). With no live run it says there is nothing to stop and exits 0. When no runner is live but another DevFlow verb holds the phase (such as a `start` or `resume` before its unit is launched, or a `discard`), it stops nothing, names that verb's pid and exits non-zero: run it again once that verb returns. `stop` signals no pid itself, answers no gate and writes no state; the runner records its own stop. `--root` overrides the positional project root. `stop` adds no exit codes |
 | `devflow cleanup [PROJECT]` | Remove, phase by phase, only what is safe to remove, and say why it keeps the rest (52.1 D-09.5). A finished run's worktree and its `.devflow/state-NN.json`, a worktree with no run state or one that does not load, and a dead start's reservation (a state whose `start` never prepared the run) are removed only when the branch is merged into the base (the base the run recorded, else the project's), the worktree is clean (untracked files count) and no run is live; a removed worktree's merged `feature/phase-NN` branch is deleted with it. Everything else is kept, with one line naming what keeps it and the verb that removes it: a branch with commits not merged into the base, or uncommitted changes, name `devflow discard --phase N`; a run that stopped or did not complete is kept whatever its branch, naming `devflow resume --phase N` and `devflow discard --phase N`; a run state with no worktree, other than a dead start's reservation, names `devflow discard --phase N`. No cleanup path deletes a branch with commits not merged into the base: only `discard --delete-unmerged-branch feature/phase-NN` does. Each phase is handled under its foreground holder, after its liveness read: a unit still stopping is waited out, for up to 15 s, as `discard` does; a held runner lock (also on a phase with no run state or worktree), or a liveness answer that cannot be read (with systemctl's stderr), keeps that phase and names `devflow stop --phase N`, the pass goes on to the next phase, and cleanup exits non-zero at the end. It then deletes the branches merged into the base that no checkout has checked out. `.devflow/.holder-NN` and `.devflow/.runner-NN` are never removed |
 | `devflow discard --phase N [PROJECT] [--delete-unmerged-branch BRANCH]` | Remove one phase's worktree (`.worktrees/phase-NN`, with everything in it: uncommitted and ignored files too), its run state (`.devflow/state-NN.json`) and its feature branch (`feature/phase-NN`). It first lists what it will remove: the worktree with its count of uncommitted changes, the state file, and the branch with whether it is merged into the base (the base the run recorded, else the project's). Each of the three is listed and removed only if it exists, so it also clears a leftover branch or worktree that has no state, and a state file that does not load. It also lists and removes the debris a killed run leaves (D-06): the phase's files under `.devflow/gates/` (gate requests, answers, claims, unheld waiter registrations and write temps), each stage's through its gate close, which sets an unclaimed answer aside rather than deleting it; and the phase's `*.hold-tmp` temps whose creator has exited, through the orphan sweep, which then also removes any other orphan temp in `.devflow/` and `.devflow/gates/` and names each. A temp whose creator still runs is kept and named. So a phase with nothing but gate files or temps is discarded too. Nothing else under `.devflow/` is removed (never `.holder-NN`, `.runner-NN` or a set-aside answer), and no other phase or branch is touched. **Refuses, removing nothing:** a live run, whatever the state names: its runner lock is held, or whether it is cannot be read (a unit still stopping is waited out first; see [Run liveness](#run-liveness)), each naming `devflow stop --phase N`. A gate of the phase whose waiter registration is held, or cannot be probed: something may still wait on it. A phase another foreground DevFlow process holds. A branch with commits not merged into the base, unless `--delete-unmerged-branch` names it: the value must be exactly `feature/phase-NN`, and a different name is refused. A branch whose merge state cannot be read. A branch checked out in the primary checkout (`start --no-worktree`): it names `git switch <base>` and never switches itself. A branch checked out in any other worktree than the phase's own. A directory at `.worktrees/phase-NN` that git does not list as a worktree. A phase worktree that is not on `feature/phase-NN` (another branch, or a detached HEAD, whose commits no branch may keep). A phase worktree whose status cannot be read (after its directory was deleted by hand, run `git worktree prune` first). A phase with no state, worktree, branch, gate file or hold temp. It holds the phase's foreground holder from its first check to its last removal, so a `start` cannot begin in between. A removal that fails prints a `warning:` line and the exit is non-zero |
@@ -55,6 +56,120 @@ and `devflow resume` launch through `systemd-run` ([Run shape](#run-shape)).
 It takes the phase's runner lock, reports ready to systemd, and runs every
 stage of the phase in its own process, each stage's agent its child, waiting
 at each gate until it is answered from any shell. Never run it by hand.)
+
+(`devflow ask` is internal and registered as the hidden `__ask` subcommand: an
+agent DevFlow launched spawns it as its MCP server (stdio) and calls its one
+tool, `devflow_ask`. A call opens a `question` gate at the stage's
+`.devflow/gates/NN-<stage>.json` and returns once the operator answers it with
+`devflow gate answer`. Never run it by hand.)
+
+## How a stage agent reaches `devflow_ask`
+
+Every stage launch (Plan, Code, Validate) of claude, codex or pi registers the
+server for that launch only. DevFlow never writes `~/.claude.json`,
+`~/.codex/config.toml` or anything under `~/.pi/agent/`. The server is the runner's own binary, run as
+`__ask --project <root> --phase <N> --stage <stage> --timeout-secs <T>
+--run-started-at <started_at>`, where `T` is the gate timeout
+(`DEVFLOW_GATE_TIMEOUT_SECS`, three days by default).
+
+- **claude**: DevFlow writes `.devflow/ask-NN.mcp.json`, one line holding one
+  stdio server named `devflow`, and appends `--mcp-config <that file>` as the
+  last two arguments. The server's `timeout` is `(T + 60) * 1000` ms.
+- **codex**: DevFlow passes `-c mcp_servers.devflow.command`, `.args` (the
+  flags above plus `--hold-cap-secs 900`), `.tool_timeout_sec=960`,
+  `.default_tools_approval_mode="approve"` and `.enabled=true` before the
+  prompt, each value escaped as a TOML string.
+- **pi**: pi has no per-launch MCP config flag, and its project `.pi/mcp.json`
+  loads only under `--approve`, which DevFlow never passes. So DevFlow writes
+  `.devflow/ask-NN.mcp.ts`, a one-line pi extension that registers the stdio
+  server `devflow` (the flags above plus `--hold-cap-secs 900`, `exposure:
+  "direct"`, `timeout: 960`), and passes `-e <that file>` before the prompt;
+  `--no-approve` stays, so the project's own `.pi/` resources still do not load.
+  pi lists the tool as `mcp__devflow__devflow_ask`.
+
+The client waits 60 s longer than the server holds a call, so the server's
+result arrives first. claude holds its call until the question is answered or
+the gate timeout `T` ends it. codex and pi hold one call 15 minutes (900 s) at
+most: the call then returns a `pending` result naming the question id, and the
+agent calls `devflow_ask` again with that id, while the question stays open at
+its gate the whole time. Their client timeout is therefore 16 minutes (960 s),
+not `T + 60`; pi's own default (60 s) would cancel the call. How pi's model
+answers a `pending` result has not been observed. `T` still counts from the question's first call: a question
+unanswered for `T` is closed as `timed_out` whether or not a call holds it.
+
+Token cost: the cap bounds each held codex call, not codex's polling. While it
+waits, codex polls the held call about every 21 s; one 15-minute hold was
+measured once at 1,346,920 input tokens (1,306,880 of them cached). So an
+unanswered codex question costs at least that per 15 minutes held, re-calls
+included, until it is answered or `T` ends it. Nothing past 15 minutes was
+measured. claude made no model request while waiting, and neither did pi over
+one 15-minute hold (the same two model turns as an instant call). No launch passes `--strict-mcp-config` or
+turns off a global server: your own MCP servers stay on, and DevFlow adds one
+server and removes none. The server name `devflow` is reserved for DevFlow; do
+not give one of your own servers that name. A global server that fails to start
+is the agent's own startup error, as it is outside DevFlow.
+
+Because the server is the runner's own binary, reinstalling DevFlow while a run
+is live can leave the binary path pointing at a removed or changed file. The
+tool is then unavailable, and the agent falls back to reporting the checkpoint
+in its result.
+
+opencode, hermes and antigravity have no registration yet, so `devflow
+start`, `resume`, a fallback handoff and every stage launch refuse them before
+any agent process starts, with a message naming the agent and `devflow_ask`.
+Their registrations are backlog 999.248. Every registration file DevFlow writes
+is under `.devflow/`, never in the project tree. `devflow discard --phase N`
+removes the phase's `.devflow/ask-NN.mcp.json` and `.devflow/ask-NN.mcp.ts`.
+
+## Question events
+
+Each question leaves its record in `.devflow/events.jsonl`. Every line has the
+usual `v`, `ts`, `phase` and `event` fields, and these:
+
+| Event | When | Fields |
+|---|---|---|
+| `question_asked` | the question's gate opened | `stage`, `question_id`, `gate_id`, `kind` (`decision`, `blocking-human` or `discuss`), `question`, `options` (each `{id, label, description?}`), `context`, `recommended` |
+| `question_answered` | `gate answer` reached the agent | `stage`, `question_id`, `gate_id`, `answer` (`{option_id}` or `{text}`), `policy` (always `operator_via_gate`), `answered_by` |
+| `question_closed` | the question ended without an answer | `stage`, `question_id`, `gate_id`, `reason`, `closed_by` (the responder for `aborted_by_operator`, otherwise null) |
+
+The `question_closed` reasons:
+
+- `cancelled_by_client`: the agent cancelled the call.
+- `client_disconnected`: the agent's connection to the server ended.
+- `terminated`: the server was sent SIGTERM or SIGINT.
+- `run_stopped`: the run was stopped.
+- `runner_gone`: the run's runner was no longer live.
+- `timed_out`: no answer came within the gate timeout.
+- `aborted_by_operator`: `gate abort`.
+- `agent_exited`: the runner closed a question gate the stage's agent left
+  open.
+- `closed_on_resume`: `devflow resume` closed a leftover question gate.
+
+A question has a `question_answered` or a `question_closed`, never both, so an
+aborted question has a `question_closed` and no `question_answered`. `devflow
+history` pairs the three events by `question_id`, and shows `not yet answered`
+for a question that is still open.
+
+**Abort.** `gate abort` on a question ends the run. The question server records
+the abort in the run state (`abort_requested`) before it closes the gate, then
+tells the agent the question closed with `aborted_by_operator`. Once the agent
+exits, the runner ends the run the way any gate abort does: one
+`workflow_aborted` event, no saved state left, and no further stage launched.
+The abort removes the state file, so no later `start` or `resume` aborts
+again.
+
+**A question its agent left open.** A killed server cannot close its gate.
+After every agent exit, the runner closes a question gate still open at the
+stage and records `question_closed` with `agent_exited`. If you answered that
+gate with `gate abort` before the server read it, the runner applies the abort
+instead: it records `aborted_by_operator` and ends the run. `devflow resume`
+records `closed_on_resume` for a leftover question gate before it closes it,
+and reports any answer it sets aside; the rerun asks again. Neither path
+touches a gate of any other kind.
+
+**What is stored.** `question_asked` keeps each question's full text, options
+and context in `.devflow/events.jsonl`. That file stays on this machine,
+in the project's `.devflow/` directory. It is also the record Phase 54 reads its question corpus from.
 
 ## Run shape
 
@@ -184,6 +299,7 @@ worktree, a feature branch, or `.devflow/` state):
 | Check | Condition | Operator action |
 |---|---|---|
 | Agent binary present | The agent's executable (`claude`/`codex`/`opencode`) is not found on `PATH` | Install the agent, or run `devflow doctor` |
+| Agent can see `devflow_ask` (Phase 53) | `--agent` or `--fallback-agent` is opencode, hermes or antigravity, which have no MCP registration (backlog 999.248) | Use `--agent claude`, `--agent codex` or `--agent pi` |
 | Phase reachable from `develop` (23f) | Phase N's `### Phase N:` ROADMAP heading or its `.planning/phases/NN-*/` directory is missing from `develop` — skipped entirely if `develop` has no `.planning/ROADMAP.md` at all | Merge the branch carrying the phase's planning artifacts into `develop`, then re-run |
 | Codex headless Plan | `--agent codex` and phase N has no `-CONTEXT.md` on `develop` — Codex's `exec` mode cannot run the discuss-phase interview headlessly, so its Plan stage needs CONTEXT.md to exist | Run `/gsd-discuss-phase N` interactively first (any agent), or use `--agent claude` |
 
@@ -293,7 +409,7 @@ pass on that commit.
 | `rate_limit` | relaunches the stage now on the same agent | relaunches the stage with the note | ends the run |
 | `stage_failure` on a run whose recorded delivery canary refuses its agent | stops the run; the way on is `devflow resume --phase N --agent <other>` | the same, and the note is kept for that resume | ends the run |
 | `preflight` | relaunches the stage with the failed check overridden | not offered: refused | ends the run |
-| `checkpoint_declaration` | records the checkpoints as seen and relaunches Code | not offered: refused | ends the run |
+| `question` (answered with `devflow gate answer <phase> --gate-id <id> (--option <id> \| --text <answer>)`) | refused, naming `gate answer` | refused, naming `gate answer` | ends the run |
 | a gate file with no `gate_kind` (a 3.x or hand-written file) | refused | refused | ends the run |
 
 `--stage` is only needed when one phase somehow has several open gates.
@@ -552,9 +668,8 @@ What a run records:
   `clean_pass`, `gaps_found`, `reverify_needed`, `reader_failure`,
   `failure_cap`), and the `gate_fired` event carries the same value. Gates
   outside Validate's routes record one too: `stage_failure` for a failed stage
-  at any stage, `rate_limit` for a rate limit no fallback takes, `preflight`
-  for a failed preflight check and `checkpoint_declaration` for an unapproved
-  human-only checkpoint.
+  at any stage, `rate_limit` for a rate limit no fallback takes and `preflight`
+  for a failed preflight check.
   A gate file written by a 3.x binary has no `gate_kind` and still loads.
 - An agent pass is recorded in the state file's `validate_pass_head`, the
   commit the Validate ran on; any other verdict clears it. A commit that cannot
@@ -627,6 +742,11 @@ Env provided to the hook: `DEVFLOW_GATE_PHASE`, `DEVFLOW_GATE_STAGE`,
 `DEVFLOW_GATE_CONTEXT`, `DEVFLOW_NON_SILENT_GATE` (`1` when the gate exists
 only because a stage failed unexpectedly).
 
+Each hook run is bounded by `NOTIFY_HOOK_TIMEOUT` (30 s): at the bound, or on
+a cancel (the gate's wait ended first), DevFlow kills and reaps the hook's
+process group and writes a failure line naming the timeout or the cancel, so
+no hook can hold up a gate.
+
 `DEVFLOW_GATE_CONTEXT` holds the first 450 characters of the gate's context,
 the same start the pending-gate banner and `devflow gate list` show; a longer
 context ends in `… [truncated; full output in .devflow/]`. Every context leads
@@ -652,15 +772,15 @@ command. The coding agent never receives the variable.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `DEVFLOW_GATE_NOTIFY_CMD` | unset | Shell command fired when a gate is written, and once when a run ends |
+| `DEVFLOW_GATE_NOTIFY_CMD` | unset | Shell command fired when a gate is written, and once when a run ends; each run is bounded by `NOTIFY_HOOK_TIMEOUT` (30 s) |
 | `DEVFLOW_GATE_TIMEOUT_SECS` | 259200 (3d) | How long a monitor waits at a gate, holding its gate registration rather than a lock. Not a deadline for answering: the gate request and phase state are files that never expire, and timing out is a clean resumable stop. Past it the run has ended at that gate: `devflow resume` reruns the stage and asks again, setting any unused answer aside |
 | `DEVFLOW_GATE_MAX_UNATTENDED_AGE_SECS` | 259200 (3d) | Age threshold `devflow gate sweep` uses to decide a gate is abandoned. Held **equal to** `DEVFLOW_GATE_TIMEOUT_SECS`, never shorter: `gate sweep` writes an abort response, so a threshold below the poll timeout lets a sweep reap gates a live monitor is still polling — turning a clean resumable timeout into an `abort()` that clears state, machine-wide across every registered root. An unparsable value or explicit `0` falls back to the default rather than reaping every gate on the machine |
 | `DEVFLOW_CACHE_DIR` | unset (falls back to `$XDG_CACHE_HOME/devflow`, then `$HOME/.cache/devflow`) | Test/override hook for the machine-global registry directory (`devflow gate list --all-roots`) |
 | `DEVFLOW_CAPTURE_RETENTION` | 5 | Capture generations retained per phase; overrides `devflow.toml` |
 | `DEVFLOW_EXTERNAL_VERIFY_ENABLED` | true | Enable PLAN-declared external post-condition probes; overrides `devflow.toml`. Accepts `true` or `false`; an invalid value prints a `warning:` line at `start` and `resume` and falls back to `devflow.toml` or the default |
 | `DEVFLOW_BASE_BRANCH` | `develop` | The branch phase worktrees fork **from** and phase work merges back **into** (D-01, `45-CONTEXT.md`); overrides `devflow.toml`'s `base_branch` key. Set it when your `.planning/` artifacts live on a branch other than `develop` — a worktree forked from `develop` does not carry a `.planning/config.json` that exists only on a planning branch, and the unattended preflight then refuses every launch (999.110/AUTO-01). **An explicitly supplied value that is `main`, blank, or begins with `-` is a hard error, not a silent fallback to `develop`**, and the value must name an existing local branch — a remote-tracking name, a `refs/heads/` path, `HEAD` or a commit SHA is refused. A resolved base other than `develop` is announced at `devflow start`, naming the source |
-| `DEVFLOW_ANTIGRAVITY_IDLE_TIMEOUT_SECS` | 120 | The per-agent idle timeout for the pipe-owning Antigravity monitor (phase 41, D-08): how long the monitor waits with NO output on the child's `stream-json` stream before recording an `idle_timeout` verdict and terminating it. Same 120s floor and clamp semantics as `DEVFLOW_CLAUDE_IDLE_TIMEOUT_SECS`. The default is a DECIDED starting point, not a silent inheritance of the Claude-measured floor — it is to be revisited after the first real Antigravity cadence measurement. Claude's variable is never read for Antigravity and vice versa |
-| `DEVFLOW_CLAUDE_IDLE_TIMEOUT_SECS` | 120 | How long the pipe-owning Claude monitor waits with NO output on the child's stream before recording an `idle_timeout` verdict and terminating it. Clamped to a 120s floor: a lower value is raised and the clamp is printed loudly at `devflow start`. The floor is 4x the CLI's measured `tool_progress` keepalive interval (a fixed 30.00s, measured 2026-08-03 over five workload-controlled trials on CLI 2.1.220), so it survives three consecutive missed keepalives; the earlier 30s floor sat exactly ON the keepalive interval and would have killed healthy stages running any tool call longer than ~30s, including `cargo test --workspace`. Every stream line resets the window, so a healthy long-running stage is never bounded by wall clock |
+| `DEVFLOW_ANTIGRAVITY_IDLE_TIMEOUT_SECS` | 120 | The per-agent idle timeout for the pipe-owning Antigravity monitor (phase 41, D-08): how long the monitor waits with NO output on the child's `stream-json` stream before recording an `idle_timeout` verdict and terminating it. Same 120s floor and clamp semantics as `DEVFLOW_CLAUDE_IDLE_TIMEOUT_SECS`. The default is a DECIDED starting point, not a silent inheritance of the Claude-measured floor — it is to be revisited after the first real Antigravity cadence measurement. Claude's variable is never read for Antigravity and vice versa. While the stage's question gate is open, a silence of up to 16 minutes (960 s, the codex hold cap plus its client margin) does not count toward the idle timeout; a longer silence, or silence after the question is answered, does |
+| `DEVFLOW_CLAUDE_IDLE_TIMEOUT_SECS` | 120 | How long the pipe-owning Claude monitor waits with NO output on the child's stream before recording an `idle_timeout` verdict and terminating it. Clamped to a 120s floor: a lower value is raised and the clamp is printed loudly at `devflow start`. The floor is 4x the CLI's measured `tool_progress` keepalive interval (a fixed 30.00s, measured 2026-08-03 over five workload-controlled trials on CLI 2.1.220), so it survives three consecutive missed keepalives; the earlier 30s floor sat exactly ON the keepalive interval and would have killed healthy stages running any tool call longer than ~30s, including `cargo test --workspace`. Every stream line resets the window, so a healthy long-running stage is never bounded by wall clock. While the stage's question gate is open, a silence of up to 16 minutes (960 s, the codex hold cap plus its client margin) does not count toward the idle timeout; a longer silence, or silence after the question is answered, does |
 | `RUST_LOG` | `off` | Tracing verbosity (stderr). Unset or empty prints no tracing lines; set a level such as `info` or `debug` to see them |
 | `DEVFLOW_LOG_FORMAT` | plain | `json` for machine-readable log lines |
 | `DEVFLOW_E2E_CHILD_TIMEOUT_SECS` | 90 | Test-only: bounds `gate_sweep_e2e.rs`'s patience with a spawned `devflow __runner` child so CI cannot hang indefinitely; not read by any production code path |
@@ -674,6 +794,9 @@ command. The coding agent never receives the variable.
 | `.gates-NN.lock` | The per-phase gate lock: held for a few file operations, never removed |
 | `.holder-NN` | D-17 foreground holder: held by a foreground verb for its lifetime (a `start` or `resume` until its unit is launched, a `discard`), recording its pid and start time. `stop` refuses while it is held and no runner is live, and never signals it; never removed by `discard` |
 | `supervisor-<launch_id>.live` | An older build's launch reservation; no current build writes one, since a launch takes no reservation (D-07). No DevFlow verb reads or removes an abandoned one (D-06) |
+| `ask-NN.mcp.json` | The phase's claude `devflow_ask` registration, rewritten at each stage launch; removed by `devflow discard --phase N` |
+| `ask-NN.mcp.ts` | The phase's pi `devflow_ask` registration (a pi extension), rewritten at each stage launch; removed by `devflow discard --phase N` |
+| `.ask-NN-<stage>` | The stage's ask lock: held by an `__ask` server while one question of the stage is open, so two servers never open questions on the same stage at once; never removed |
 | `*.hold-tmp` | A hold being taken, here or under `gates/`. An orphan is removed by `devflow discard --phase N` when phase N has one |
 | `phase-NN-stdout` / `phase-NN-stderr.log` | Agent capture files (what `logs` tails) |
 | `phase-NN-exit` / `phase-NN-agent-pid` | Exit code + PID the supervisor records |
