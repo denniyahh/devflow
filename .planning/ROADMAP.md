@@ -799,6 +799,9 @@ The doc comment calls the log-only path deliberate.
 **Fix shape:** have `record_abort_request` return its result; on Err, `consume` returns `Unanswered::Failed` without
 claiming, so the gate stays open and the runner's backstop applies the abort. Add a test that injects a state-write
 failure. **Owner:** decided by the operator for PR #245.
+**Fixed (2026-11-20):** fixed on PR #245 before merge (operator chose fix-first). On a failed save, `consume` returns
+`AbortUnsaved`, which leaves the answer unclaimed and the gate open. Test
+`ask_server::tests::an_abort_the_state_cannot_save_stays_unclaimed_on_its_gate`, which fails on the old behaviour.
 
 ### Phase 999.257: `a_question_fires_the_notify_hook_and_records_notify_fired` Can Read the Marker Before the Hook Writes It (BACKLOG)
 
