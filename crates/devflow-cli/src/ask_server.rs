@@ -558,6 +558,11 @@ enum Unanswered {
     NotAsked(Ending),
     /// The question could not be served; the text is the reply.
     Failed(String),
+    /// The operator aborted, but the abort could not be saved as the run's
+    /// `abort_requested`. The answer is left unclaimed on its open gate, so the
+    /// runner's question-gate backstop still applies it; the text is the
+    /// reply's detail, which tells the agent to stop.
+    AbortUnsaved(String),
 }
 
 impl Unanswered {
@@ -765,6 +770,9 @@ fn ended_reply(result: Result<AskAnswer, Unanswered>) -> Option<Value> {
         Err(Unanswered::Closed { ending, detail, .. }) => Some(closed_error(ending, &detail)),
         Err(Unanswered::NotAsked(ending)) => Some(closed_error(ending, ending.sentence())),
         Err(Unanswered::Failed(why)) => Some(tool_error(&why)),
+        Err(Unanswered::AbortUnsaved(detail)) => {
+            Some(closed_error(Ending::AbortedByOperator, &detail))
+        }
     }
 }
 
@@ -915,7 +923,9 @@ fn close_gate(
         ask_lock,
     } = gate;
     registration.finish();
-    if let Err(error) = Gates::close_if_current(root, phase, stage, &gate_id) {
+    if !keeps_gate_open(result)
+        && let Err(error) = Gates::close_if_current(root, phase, stage, &gate_id)
+    {
         eprintln!("devflow __ask: could not close phase {phase} {stage}'s gate {gate_id}: {error}");
     }
     notifier.finish();
@@ -924,9 +934,15 @@ fn close_gate(
         Err(Unanswered::Closed {
             ending, closed_by, ..
         }) => emit_question_closed(args, spec, &gate_id, *ending, closed_by.as_deref()),
-        Err(Unanswered::NotAsked(_) | Unanswered::Failed(_)) => {}
+        Err(Unanswered::NotAsked(_) | Unanswered::Failed(_) | Unanswered::AbortUnsaved(_)) => {}
     }
     drop(ask_lock);
+}
+
+/// Whether a question's end leaves its gate open: only an abort that could not
+/// be saved, whose unclaimed answer the runner's backstop applies.
+fn keeps_gate_open(result: &Result<AskAnswer, Unanswered>) -> bool {
+    matches!(result, Err(Unanswered::AbortUnsaved(_)))
 }
 
 /// Take the stage's ask lock, retrying every [`ASK_LOCK_RETRY`] while another
@@ -1189,8 +1205,13 @@ fn consume(
             "devflow_ask could not read the answer's choice: {error}"
         ))
     })?;
-    if answer.response.abort {
-        record_abort_request(args, spec, answer);
+    if answer.response.abort
+        && let Err(error) = record_abort_request(args, spec, answer)
+    {
+        return Err(Unanswered::AbortUnsaved(format!(
+            "the operator aborted the run at this question, but the abort could not be saved \
+             ({error}); it stays on the open gate for the runner to apply; stop work"
+        )));
     }
     match Gates::claim(root, phase, stage, gate_id) {
         Ok(Claim::Claimed) => {}
@@ -1233,19 +1254,25 @@ fn consume(
 /// Commit the operator's abort as the run's `abort_requested` (D-10), before
 /// the answer is claimed, the gate closed or the reply sent, so a server killed
 /// at any later point leaves the request for the runner to apply. A failed
-/// commit is logged: the reply still tells the agent to stop.
-fn record_abort_request(args: &AskArgs, spec: &QuestionSpec, answer: &GateAnswer) {
+/// commit is returned: the caller leaves the answer unclaimed on its open gate.
+fn record_abort_request(
+    args: &AskArgs,
+    spec: &QuestionSpec,
+    answer: &GateAnswer,
+) -> Result<(), workflow::WorkflowError> {
     let note = abort_note(answer.response.note.as_deref(), &spec.question_id);
     let committed = workflow::update_state(&args.project, args.phase, |state| {
         state.abort_requested = Some(note);
         Ok::<(), workflow::WorkflowError>(())
     });
-    if let Err(error) = committed {
+    if let Err(error) = &committed {
         eprintln!(
-            "devflow __ask: phase {}: the operator's abort was not recorded in the run state,              so the runner will not end the run on it: {error}",
+            "devflow __ask: phase {}: the operator's abort was not saved in the run state; \
+             it stays on the open question gate for the runner to apply: {error}",
             args.phase
         );
     }
+    committed.map(|_| ())
 }
 
 /// The note an abort from a question records: the operator's own, or one naming
@@ -1417,5 +1444,91 @@ mod tests {
             0,
             "a call for another tool never reaches the worker, so it opens no gate"
         );
+    }
+
+    /// An abort the run state cannot save is left unclaimed on its still-open
+    /// gate, for the runner's question-gate backstop, and the agent is still
+    /// told to stop. Control: with the state saved, the same abort is recorded
+    /// and its answer claimed.
+    #[test]
+    fn an_abort_the_state_cannot_save_stays_unclaimed_on_its_gate() {
+        use devflow_core::gates::GateResponse;
+        use devflow_core::mode::Mode;
+        use devflow_core::state::{AgentKind, State};
+        let _guard = crate::test_support::env_lock();
+        for saved in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let (phase, stage) = (PhaseId::new(1311), Stage::Plan);
+            if saved {
+                let state = State::new(
+                    phase,
+                    AgentKind::Claude,
+                    Mode::Supervise,
+                    root.to_path_buf(),
+                );
+                workflow::save_state(&state).unwrap();
+            }
+            let spec = QuestionSpec::from_arguments(&json!({
+                "question": "Pick a budget",
+                "options": [{ "id": "a", "label": "A" }, { "id": "b", "label": "B" }],
+                "kind": "decision",
+            }))
+            .unwrap();
+            let (opened, _registration) =
+                Gates::open_question_registered(root, phase, stage, &spec).unwrap();
+            let response = GateResponse {
+                approved: false,
+                abort: true,
+                note: Some("stop".into()),
+                responded_by: Some("operator".into()),
+            };
+            Gates::answer(root, phase, stage, &opened.gate_id, &response).unwrap();
+            let answer = GateAnswer {
+                gate_id: opened.gate_id.as_str().to_string(),
+                response,
+            };
+            let args = AskArgs {
+                project: root.to_path_buf(),
+                phase,
+                stage,
+                timeout_secs: 60,
+                run_started_at: String::new(),
+                hold_cap_secs: None,
+            };
+
+            let result = consume(&args, &opened.gate_id, &spec, &answer);
+
+            let claimed = Gates::claim_path(root, phase, stage, &opened.gate_id).exists();
+            if saved {
+                assert!(
+                    matches!(
+                        result,
+                        Err(Unanswered::Closed {
+                            ending: Ending::AbortedByOperator,
+                            ..
+                        })
+                    ),
+                    "a saved abort closes as aborted: {result:?}"
+                );
+                assert!(claimed, "a saved abort claims its answer");
+                assert!(!keeps_gate_open(&result), "a saved abort closes its gate");
+                let state = workflow::load_state(root, phase).unwrap();
+                assert_eq!(state.abort_requested.as_deref(), Some("stop"));
+            } else {
+                let Err(Unanswered::AbortUnsaved(detail)) = &result else {
+                    panic!("an unsaved abort must stay on its gate: {result:?}");
+                };
+                assert!(
+                    detail.contains("stop work"),
+                    "the reply still says stop: {detail}"
+                );
+                assert!(!claimed, "an unsaved abort must leave its answer unclaimed");
+                assert!(
+                    keeps_gate_open(&result),
+                    "an unsaved abort must keep its gate open"
+                );
+            }
+        }
     }
 }
