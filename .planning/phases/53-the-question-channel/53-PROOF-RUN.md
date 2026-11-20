@@ -261,3 +261,20 @@ Run end: `advance_evaluated` plan success 1795144905, `workflow_finished` stoppe
 (thinking 1,072); cost $2.92 list; duration 5,198 s (most of it the two question holds).
 
 closing-run: PASS
+
+## Run exceptions (dogfooding notes)
+
+Steps taken outside the normal DevFlow path, each on the operator's word:
+
+- **Proof binary.** M1–M4 ran the phase-head build from a separate install root, not the installed release binary,
+  because the Phase 53 runner was live at its Validate gate and reinstalling would have replaced its binary under it
+  (operator chose this, option 1, 2026-11-19; 999.254).
+- **Plan replan.** The `/gsd-plan-phase 53 --reviews` replan ran by hand; recorded in 53-REVIEWS.md.
+- **TDD review.** GSD's TDD review deviations were accepted by an operator note, because its override flag is not
+  implemented (999.252).
+- **53-10 override.** Accepted by the operator; recorded in 53-UAT.md item 3.
+- **M3 fixture.** A `01-CONTEXT.md` was added to the `--live-payload` fixture so codex could start (999.255).
+
+No stage was run by hand to clear Validate. The gate was rejected with a note that DevFlow's own quick-task route
+carried out (`/gsd-quick` marked the UAT and verification passed). Validate then passed on that commit, and the
+operator approved the final gate, 2026-11-20.
