@@ -2,3 +2,7 @@
 # Phase worktrees fork from the branch that tracks .planning/;
 # scripts/cut-pr-branch.sh carries finished work to develop.
 base_branch = "workspace/denniyahh"
+
+# Standing Code-stage rate-limit fallback (operator, 2026-11-20): pi, which runs
+# its own default model (litellm/deepseek-flash, from ~/.pi/agent/settings.json).
+fallback_agent = "pi"
