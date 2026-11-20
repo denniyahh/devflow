@@ -18,11 +18,13 @@ awaiting: user response
 
 ### 1. 53-VALIDATION.md M1-M3: install the phase head, then run the live claude (M2) and live codex (M3, held past the 900 s cap, pending then re-call) proofs and record them in 53-PROOF-RUN.md
 expected: 53-PROOF-RUN.md holds installed-head, claude-live: PASS, codex-live: PASS and matching codex-config-before/after hashes
-result: [pending]
+result: pass
+resolution: "Run by the session on the operator's word ('run the live proofs now', option 1, 2026-11-19/20); evidence in 53-PROOF-RUN.md: installed-head d74a788 (separate install root, 999.254), claude-live: PASS (held 16,306 s, one Code launch), codex-live: PASS (pending at the 900 s cap, re-call by question_id carried the answer, held 1,078 s), codex-config-before == after."
 
 ### 2. 53-VALIDATION.md M4 (D-17 closing run): devflow start --phase 1 --agent claude --mode supervise --until plan on a throwaway non-DevFlow GSD project with no CONTEXT.md; answer each question gate
 expected: closing-run: PASS in 53-PROOF-RUN.md, every asked question in devflow history with its answer and policy (or NO-QUESTIONS reported to the operator)
-result: [pending]
+result: pass
+resolution: "Run by the session on the operator's word; evidence in 53-PROOF-RUN.md M4: two GSD plan-phase questions asked through devflow_ask, both in devflow history with answer and policy operator_via_gate; no discuss-phase question observed; scratch project removed."
 
 ### 3. Decide whether to accept the 53-10 deviation: verify::phase_checkpoint_declarations and verify::CheckpointDeclaration were kept, not deleted
 expected: Operator accepts an override (they back verify::phase_has_human_only_checkpoint, the unattended-launch refusal at crates/devflow-cli/src/preflight.rs:1010), or asks for that refusal to be redesigned
