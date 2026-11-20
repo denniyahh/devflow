@@ -554,8 +554,9 @@ pub(crate) enum AnswerFamily {
     RateLimit,
     /// A failed preflight check (D-39, D-18f).
     Preflight,
-    /// A human-only checkpoint declaration at Code (D-39).
-    CheckpointDeclaration,
+    /// A question an agent asked (Phase 53, D-10): only `devflow gate answer`
+    /// answers it, and an abort still ends the run.
+    Question,
     /// A gate file with no kind: only a 3.x or hand-written file.
     Unclassified,
 }
@@ -576,7 +577,7 @@ pub(crate) fn answer_family(kind: Option<GateKind>) -> AnswerFamily {
         Some(GateKind::StageFailure) => AnswerFamily::StageFailure,
         Some(GateKind::RateLimit) => AnswerFamily::RateLimit,
         Some(GateKind::Preflight) => AnswerFamily::Preflight,
-        Some(GateKind::CheckpointDeclaration) => AnswerFamily::CheckpointDeclaration,
+        Some(GateKind::Question) => AnswerFamily::Question,
         None => AnswerFamily::Unclassified,
     }
 }
@@ -602,8 +603,6 @@ pub(crate) enum StatusLessStep {
     },
     /// The D-18f override: relaunch with the adjudicated check skipped.
     PreflightOverride,
-    /// Record the scanned checkpoint set as seen and relaunch.
-    RecordCheckpointSet,
 }
 
 impl StatusLessStep {
@@ -615,7 +614,6 @@ impl StatusLessStep {
             StatusLessStep::RelaunchWithNote(_) => "relaunch_with_note",
             StatusLessStep::RelaunchRefused { .. } => "relaunch_refused",
             StatusLessStep::PreflightOverride => "preflight_override",
-            StatusLessStep::RecordCheckpointSet => "record_checkpoint_set",
         }
     }
 }
@@ -657,6 +655,16 @@ const UNEXPECTED_RELAUNCH: Refusal = Refusal {
     why: "a relaunch action arrived where only an approve, a reject or an abort is read",
     applies: "`devflow gate abort`",
 };
+
+/// An approve or a reject on a question gate (D-10): one verb, one job.
+fn question_refusal(answer: &'static str) -> Refusal {
+    Refusal {
+        answer,
+        why: "a question gate is answered with one of the options it offers or with text",
+        applies: "`devflow gate answer <phase> --gate-id <id> (--option <id> | --text <answer>)` \
+                  or `devflow gate abort`",
+    }
+}
 
 /// Any answer but abort on a gate file with no kind (a 3.x or hand-written
 /// file).
@@ -708,8 +716,8 @@ pub(crate) fn status_less_step(
         }
         (AnswerFamily::Preflight, Approve) => Ok(StatusLessStep::PreflightOverride),
         (AnswerFamily::Preflight, Reject(_)) => Err(REJECT_NOT_AN_ANSWER),
-        (AnswerFamily::CheckpointDeclaration, Approve) => Ok(StatusLessStep::RecordCheckpointSet),
-        (AnswerFamily::CheckpointDeclaration, Reject(_)) => Err(REJECT_NOT_AN_ANSWER),
+        (AnswerFamily::Question, Approve) => Err(question_refusal("approve")),
+        (AnswerFamily::Question, Reject(_)) => Err(question_refusal("reject")),
         (AnswerFamily::Unclassified, Approve) => Err(unclassified("approve")),
         (AnswerFamily::Unclassified, Reject(_)) => Err(unclassified("reject")),
         // Not status-less: the verification family goes through `next_step`.
@@ -775,7 +783,7 @@ pub(crate) fn approve_route_by_kind(
         family @ (AnswerFamily::StageFailure
         | AnswerFamily::RateLimit
         | AnswerFamily::Preflight
-        | AnswerFamily::CheckpointDeclaration
+        | AnswerFamily::Question
         | AnswerFamily::Unclassified) => {
             match status_less_step(family, StatusLessAnswer::Approve, canary_refusal) {
                 Ok(step) => ApproveRoute::StatusLess(step),
@@ -808,7 +816,7 @@ pub(crate) fn reject_route_by_kind(
         family @ (AnswerFamily::StageFailure
         | AnswerFamily::RateLimit
         | AnswerFamily::Preflight
-        | AnswerFamily::CheckpointDeclaration
+        | AnswerFamily::Question
         | AnswerFamily::Unclassified) => {
             match status_less_step(family, StatusLessAnswer::Reject(note), canary_refusal) {
                 Ok(step) => RejectRoute::StatusLess(step),
@@ -856,9 +864,6 @@ pub(crate) fn status_less_phrase(step: &StatusLessStep, phase: PhaseId, stage: S
         StatusLessStep::PreflightOverride => {
             format!("relaunches the {stage} stage with the failed check overridden")
         }
-        StatusLessStep::RecordCheckpointSet => {
-            format!("records the checkpoints as seen and relaunches the {stage} stage")
-        }
     }
 }
 
@@ -892,7 +897,7 @@ pub(crate) fn way_on_sentence(
         AnswerFamily::StageFailure
         | AnswerFamily::RateLimit
         | AnswerFamily::Preflight
-        | AnswerFamily::CheckpointDeclaration
+        | AnswerFamily::Question
         | AnswerFamily::Unclassified => {
             // A status-less approve reads no evidence (D-39): the closure is
             // never called for these families.
@@ -973,11 +978,11 @@ pub(crate) fn screen_answer(
         GateAction::Relaunch { .. } => Err(UNEXPECTED_RELAUNCH),
         GateAction::Advance => match family {
             AnswerFamily::Unclassified => Err(unclassified("approve")),
+            AnswerFamily::Question => Err(question_refusal("approve")),
             AnswerFamily::Verification
             | AnswerFamily::StageFailure
             | AnswerFamily::RateLimit
-            | AnswerFamily::Preflight
-            | AnswerFamily::CheckpointDeclaration => Ok(()),
+            | AnswerFamily::Preflight => Ok(()),
         },
         GateAction::LoopBack { note, .. } => {
             let note = note.unwrap_or_default();
@@ -987,7 +992,7 @@ pub(crate) fn screen_answer(
                 AnswerFamily::StageFailure
                 | AnswerFamily::RateLimit
                 | AnswerFamily::Preflight
-                | AnswerFamily::CheckpointDeclaration
+                | AnswerFamily::Question
                 | AnswerFamily::Unclassified => {
                     status_less_step(family, StatusLessAnswer::Reject(&note), None).map(|_| ())
                 }
@@ -1363,7 +1368,7 @@ fn validate_gate_context(
         | GateKind::StageFailure
         | GateKind::RateLimit
         | GateKind::Preflight
-        | GateKind::CheckpointDeclaration => "",
+        | GateKind::Question => "",
     });
     // WR-04 (35-REVIEW): the ceiling clause belongs on every Validate gate that
     // fired at the ceiling, a passing one included, or an operator running
@@ -1715,13 +1720,11 @@ fn run_status_less_step(
             }
             refuse_relaunch(project_root, state, stage, &refusal).map(|()| None)
         }
-        StatusLessStep::PreflightOverride | StatusLessStep::RecordCheckpointSet => {
-            Err(CliError::Message(format!(
-                "phase {}: the {} step is run by its own gate's site, not at {stage}",
-                state.phase,
-                step.name()
-            )))
-        }
+        StatusLessStep::PreflightOverride => Err(CliError::Message(format!(
+            "phase {}: the {} step is run by its own gate's site, not at {stage}",
+            state.phase,
+            step.name()
+        ))),
     }
 }
 
@@ -2367,6 +2370,40 @@ mod tests {
     use devflow_core::state::AgentKind;
     use devflow_core::test_support::{answer_open_gate, gate_answer_files, preanswer_gate};
     use devflow_core::workflow;
+
+    /// D-10: approve and reject on a question gate are refused by the screen,
+    /// before anything is written, each refusal naming `devflow gate answer`.
+    /// Control: an abort on the same kind is accepted.
+    #[test]
+    fn approve_and_reject_on_a_question_gate_are_refused_naming_gate_answer() {
+        let kind = Some(GateKind::Question);
+        let response = |approved: bool, abort: bool, note: Option<&str>| GateResponse {
+            approved,
+            abort,
+            note: note.map(str::to_string),
+            responded_by: Some("test".to_string()),
+        };
+        for (answer, given) in [
+            ("approve", response(true, false, None)),
+            (
+                "reject",
+                response(false, false, Some("take the other option")),
+            ),
+        ] {
+            let refusal = screen_answer(kind, &given)
+                .expect_err("an approve or a reject on a question gate is refused");
+            assert_eq!(refusal.answer, answer, "{refusal:?}");
+            assert!(
+                refusal.applies.contains("devflow gate answer"),
+                "the {answer} refusal names `devflow gate answer`: {refusal:?}"
+            );
+        }
+        assert_eq!(
+            screen_answer(kind, &response(false, true, None)),
+            Ok(()),
+            "an abort on a question gate is accepted"
+        );
+    }
 
     /// Reaching `MAX_CONSECUTIVE_FAILURES` on a failed Validate must force a
     /// gate (even in Auto mode, which otherwise auto-loops), and an `abort`
@@ -8493,8 +8530,7 @@ mod tests {
             }
         }
 
-        // The preflight gate and the checkpoint-declaration gate: reject is
-        // not offered.
+        // The preflight gate: reject is not offered.
         let phase = PhaseId::new(5750);
         let preflight =
             crate::preflight::preflight_gate_context(phase, Stage::Code, "the driver check failed");
@@ -8504,31 +8540,6 @@ mod tests {
             preflight_sentence.contains("reject: not offered"),
             "{preflight_sentence}"
         );
-        let declaration = devflow_core::verify::CheckpointDeclaration {
-            plan_file: format!("{}-01-PLAN.md", phase.padded()),
-            element: "<task type=\"checkpoint:human-action\"></task>".into(),
-            blocking_human: false,
-            human_action: true,
-        };
-        for mode in [Mode::Auto, Mode::Supervise] {
-            let rescan = crate::pipeline_launch::rescan_gate_context(
-                phase,
-                Stage::Code,
-                &[&declaration],
-                mode,
-            );
-            let rescan_sentence =
-                way_on_sentence(GateKind::CheckpointDeclaration, phase, Stage::Code, None);
-            check(
-                &format!("checkpoint declaration ({mode:?})"),
-                &rescan,
-                &rescan_sentence,
-            );
-            assert!(
-                rescan_sentence.contains("reject: not offered"),
-                "{rescan_sentence}"
-            );
-        }
 
         // Planted controls: old answer texts after the sentence, and the
         // sentence after the cause.
@@ -8579,6 +8590,8 @@ mod tests {
         RateLimit,
         /// A gate whose reject is refused (preflight, checkpoint declaration).
         RejectRefused,
+        /// A question gate: approve and reject are both refused.
+        Question,
         /// A file with no kind.
         NoKind,
     }
@@ -8598,9 +8611,8 @@ mod tests {
             Some(GateKind::NoGapClosurePlan) => ParityCase::Verification(Stage::Plan),
             Some(GateKind::StageFailure) => ParityCase::StageFailure,
             Some(GateKind::RateLimit) => ParityCase::RateLimit,
-            Some(GateKind::Preflight) | Some(GateKind::CheckpointDeclaration) => {
-                ParityCase::RejectRefused
-            }
+            Some(GateKind::Preflight) => ParityCase::RejectRefused,
+            Some(GateKind::Question) => ParityCase::Question,
             None => ParityCase::NoKind,
         }
     }
@@ -8956,7 +8968,7 @@ mod tests {
                         assert_eq!(resolved[0]["route"], "relaunch_with_note", "{row}");
                     }
                 }
-                ParityCase::RejectRefused => {
+                ParityCase::RejectRefused | ParityCase::Question => {
                     let kind = kind.expect("a kind");
                     let route = reject_route(
                         &parity_gate(PhaseId::new(number), Stage::Code, Some(kind)),
@@ -8976,8 +8988,6 @@ mod tests {
                     );
                     state.stage = Stage::Code;
                     workflow::save_state(&state).unwrap();
-                    let approval_before =
-                        serde_json::to_string(&state.checkpoint_approval).unwrap();
                     let gates = at_the_gates_with(
                         root,
                         phase,
@@ -9003,11 +9013,6 @@ mod tests {
                         Stage::Code,
                         &gates,
                         (name, "reject", &reopened),
-                    );
-                    assert_eq!(
-                        serde_json::to_string(&state.checkpoint_approval).unwrap(),
-                        approval_before,
-                        "{row}: a refused reject widens nothing (T-48-15-03)"
                     );
                 }
                 ParityCase::NoKind => {
@@ -9382,10 +9387,7 @@ mod tests {
                     rate_limit_approve_launches_once(&row, number + 2);
                 }
                 ParityCase::RejectRefused => {
-                    let expected = match kind {
-                        Some(GateKind::Preflight) => StatusLessStep::PreflightOverride,
-                        _ => StatusLessStep::RecordCheckpointSet,
-                    };
+                    let expected = StatusLessStep::PreflightOverride;
                     let route = approve_route(
                         &parity_gate(PhaseId::new(number), Stage::Code, kind),
                         None,
@@ -9393,6 +9395,18 @@ mod tests {
                     );
                     assert!(
                         matches!(&route, ApproveRoute::StatusLess(step) if *step == expected),
+                        "{row}: {route:?}"
+                    );
+                }
+                ParityCase::Question => {
+                    let route = approve_route(
+                        &parity_gate(PhaseId::new(number), Stage::Code, kind),
+                        None,
+                        || panic!("{row}: a question approve reads no GSD status"),
+                    );
+                    assert!(
+                        matches!(&route, ApproveRoute::Refused(refusal)
+                            if refusal.applies.contains("devflow gate answer")),
                         "{row}: {route:?}"
                     );
                 }
@@ -9959,9 +9973,6 @@ mod tests {
             }
             (PropTrigger::Reject(_), Some(GateKind::RateLimit)) => "relaunch_with_note",
             (PropTrigger::Approve, Some(GateKind::Preflight)) => "preflight_override",
-            (PropTrigger::Approve, Some(GateKind::CheckpointDeclaration)) => {
-                "record_checkpoint_set"
-            }
             _ => "refused",
         }
         .to_string()

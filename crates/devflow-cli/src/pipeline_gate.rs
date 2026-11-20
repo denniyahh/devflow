@@ -25,7 +25,6 @@ use crate::pipeline_launch::{GateWaitEnd, StageLaunch, close_gate, commit, launc
 use crate::pipeline_outcomes::{Answer, FinishPermit, truncate_reason};
 use devflow_core::gates::{self, Claim, GateAction, GateFile, GateId, GateKind, GateLabel, Gates};
 use devflow_core::mode;
-#[cfg(test)]
 use devflow_core::phase_id::PhaseId;
 use devflow_core::prompt::{FixType, ReverifyReport};
 use devflow_core::stage::Stage;
@@ -720,6 +719,45 @@ pub(crate) fn run_gate_with_timeout(
     )
 }
 
+/// Notify the operator of an opened gate, the one way every gate does (D-11):
+/// emit `gate_fired`, run the notify hook (`notify_cmd` unless
+/// `DEVFLOW_GATE_NOTIFY_CMD` overrides it), then emit `notify_fired`. The
+/// hook run is bounded by [`gates::NOTIFY_HOOK_TIMEOUT`] and killed as soon as
+/// `cancel` answers `true`. The runner and the `__ask` server both call it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fire_gate_notify_events(
+    project_root: &Path,
+    phase: PhaseId,
+    stage: Stage,
+    context: &str,
+    event_context: &str,
+    kind: GateKind,
+    unexpected: bool,
+    notify_cmd: Option<&str>,
+    cancel: &dyn Fn() -> bool,
+) {
+    events::emit(
+        project_root,
+        phase,
+        "gate_fired",
+        serde_json::json!({
+            "stage": stage.to_string(),
+            "unexpected": unexpected,
+            "context": event_context,
+            "gate_kind": kind,
+        }),
+    );
+    gates::fire_gate_notify_with_fallback_cancellable(
+        phase, stage, context, unexpected, notify_cmd, cancel,
+    );
+    events::emit(
+        project_root,
+        phase,
+        "notify_fired",
+        serde_json::json!({ "stage": stage.to_string(), "unexpected": unexpected }),
+    );
+}
+
 /// The body [`run_gate_with_timeout`] and [`run_gate_with_event_context`] share.
 /// `contexts` is the gate's context and the one its `gate_fired` event carries.
 /// The gate's `label` is required, so no gate opens without a kind (D-39), and
@@ -769,29 +807,16 @@ fn open_and_await(
                 state.mode
             );
         }
-        events::emit(
+        fire_gate_notify_events(
             project_root,
-            state.phase,
-            "gate_fired",
-            serde_json::json!({
-                "stage": stage.to_string(),
-                "unexpected": unexpected,
-                "context": event_context,
-                "gate_kind": label.kind,
-            }),
-        );
-        gates::fire_gate_notify_with_fallback(
             state.phase,
             stage,
             &context,
+            &event_context,
+            label.kind,
             unexpected,
             state.gate_notify_cmd.as_deref(),
-        );
-        events::emit(
-            project_root,
-            state.phase,
-            "notify_fired",
-            serde_json::json!({ "stage": stage.to_string(), "unexpected": unexpected }),
+            &|| false,
         );
         let wait_end =
             match wait_with_rate_limit_timer(project_root, state, stage, gate_id, timeout_secs) {

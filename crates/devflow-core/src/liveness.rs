@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::phase_id::PhaseId;
+use crate::stage::Stage;
 
 /// The suffix of the temporary name a hold is locked under before it is
 /// published: `.{final_file_name}.{pid}.{seq}.hold-tmp`, beside the final name.
@@ -262,8 +263,8 @@ pub fn phase_holder_path(project_root: &Path, phase: PhaseId) -> PathBuf {
         .join(format!(".holder-{}", phase.padded()))
 }
 
-/// A holder's recorded pid and start time, as [`live_holder`] reads them.
-type HolderIdentity = (u32, Option<u64>);
+/// A lock holder's recorded pid and process start time, as its lock file records them.
+pub type HolderIdentity = (u32, Option<u64>);
 
 /// Why [`claim_phase_holder`] did not claim.
 #[derive(Debug)]
@@ -397,6 +398,35 @@ pub fn claim_runner_lock(project_root: &Path, phase: PhaseId) -> Result<Hold, Ru
         Ok(hold) => Ok(hold),
         Err(holder) => Err(RunnerLockError::Held { holder }),
     }
+}
+
+/// The per-stage ask lock: `.devflow/.ask-{padded}-{stage}`.
+pub fn ask_lock_path(project_root: &Path, phase: PhaseId, stage: Stage) -> PathBuf {
+    project_root
+        .join(".devflow")
+        .join(format!(".ask-{}-{stage}", phase.padded()))
+}
+
+/// Claim `phase`'s `stage` ask lock for this process: an exclusive lock on
+/// [`ask_lock_path`], held until the returned [`Hold`] drops. `devflow __ask` holds it
+/// while one question of the stage is open, so two servers never open questions on the
+/// same stage at once.
+///
+/// Same invariants as [`claim_runner_lock`]: the file is never removed, replaced or
+/// `unlock()`ed, it is created mode 0o600, its record is advisory, and the descriptor is
+/// close-on-exec. A holder killed without cleanup leaves the file unheld, and the next
+/// claim takes its flock: there is no remove-and-retry step two contenders could both win.
+///
+/// # Errors
+/// The file could not be created, locked or written. The inner `Err` is the current
+/// holder's recorded identity, `None` when its record does not read.
+pub fn claim_ask_lock(
+    project_root: &Path,
+    phase: PhaseId,
+    stage: Stage,
+) -> std::io::Result<Result<Hold, Option<HolderIdentity>>> {
+    crate::workflow::ensure_devflow_dir(&project_root.join(".devflow"))?;
+    claim_lock_file(ask_lock_path(project_root, phase, stage))
 }
 
 /// The signal the process's one SIGTERM/SIGINT handler
@@ -588,6 +618,51 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         command
+    }
+
+    /// Two claimers released together on an ask lock a killed holder left behind:
+    /// the flock alone decides, so each round has exactly one owner and the file stays.
+    #[test]
+    fn two_contenders_for_an_abandoned_ask_lock_get_one_owner() {
+        const ROUNDS: usize = 50;
+        in_own_process(
+            "liveness::tests::two_contenders_for_an_abandoned_ask_lock_get_one_owner",
+            || {
+                let dir = tempfile::tempdir().expect("create a temp dir");
+                let (root, phase, stage) = (dir.path(), PhaseId::new(7), Stage::Code);
+                let path = ask_lock_path(root, phase, stage);
+                // As a SIGKILLed holder leaves it: the file exists and nothing holds it.
+                drop(
+                    claim_ask_lock(root, phase, stage)
+                        .expect("claim the ask lock")
+                        .expect("an unheld ask lock is claimed"),
+                );
+                assert_eq!(probe(&path).expect("probe the ask lock"), Held::Abandoned);
+                for round in 0..ROUNDS {
+                    let barrier = std::sync::Barrier::new(2);
+                    let claims: Vec<_> = std::thread::scope(|scope| {
+                        let contenders: Vec<_> = (0..2)
+                            .map(|_| {
+                                scope.spawn(|| {
+                                    barrier.wait();
+                                    claim_ask_lock(root, phase, stage).expect("claim the ask lock")
+                                })
+                            })
+                            .collect();
+                        contenders
+                            .into_iter()
+                            .map(|contender| contender.join().expect("a contender panicked"))
+                            .collect()
+                    });
+                    let owners = claims.iter().filter(|claim| claim.is_ok()).count();
+                    assert_eq!(owners, 1, "round {round}: {owners} owners of the ask lock");
+                    assert!(
+                        path.exists(),
+                        "round {round}: the ask lock file was removed"
+                    );
+                }
+            },
+        );
     }
 
     /// The D-17 holder: one claim at a time, its record names the claimer, and the file

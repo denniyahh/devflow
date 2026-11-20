@@ -5,12 +5,11 @@
 //! back on stdout one JSON object per line. Claude runs headless — no trust
 //! dialogs, no user prompts.
 
-use super::AgentDriver;
+use super::{AgentDriver, ArgPlacement, AskRegistration, AskWiring};
 use crate::phase_id::PhaseId;
 
 /// The modular driver for Claude (37-02): owns the `stream-json` launch,
-/// legacy prompt rendering, the pre-31 single-document builder, and the
-/// checkpoint-resume relaunch command.
+/// legacy prompt rendering, and the pre-31 single-document builder.
 pub struct ClaudeDriver;
 
 impl AgentDriver for ClaudeDriver {
@@ -57,6 +56,40 @@ impl AgentDriver for ClaudeDriver {
             ],
         )
     }
+
+    fn ask_support(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// D-03: one stdio server `devflow` in a per-launch `--mcp-config` file,
+    /// appended last. No `--strict-mcp-config`: the operator's own servers stay.
+    /// The per-server `timeout` (ms) is the gate timeout plus the margin.
+    fn ask_wiring(&self, reg: &AskRegistration) -> Result<AskWiring, String> {
+        let (exe, _root) = reg.utf8_paths()?;
+        let config_path = reg.config_path.to_str().ok_or_else(|| {
+            format!(
+                "the registration path {} is not UTF-8",
+                reg.config_path.display()
+            )
+        })?;
+        let timeout_ms = reg.client_timeout_secs().saturating_mul(1000);
+        let config = serde_json::json!({
+            "mcpServers": {
+                "devflow": {
+                    "type": "stdio",
+                    "command": exe,
+                    "args": reg.server_args(),
+                    "timeout": timeout_ms,
+                }
+            }
+        });
+        let text = serde_json::to_string(&config).map_err(|err| err.to_string())?;
+        Ok(AskWiring {
+            args: vec!["--mcp-config".into(), config_path.to_string()],
+            placement: ArgPlacement::Append,
+            file: Some((reg.config_path.clone(), text)),
+        })
+    }
 }
 
 impl ClaudeDriver {
@@ -87,47 +120,6 @@ impl ClaudeDriver {
             vec![
                 "-p".into(),
                 prompt.to_string(),
-                "--output-format".into(),
-                "json".into(),
-                "--dangerously-skip-permissions".into(),
-            ],
-        )
-    }
-
-    /// Build the resume relaunch command for a confirmed checkpoint
-    /// auto-decide (D-03/D-04, 28-03). Not a trait method — `--resume` is a
-    /// Claude-CLI-specific, documented feature (D-05: Claude-only, no Codex/OpenCode
-    /// accommodation).
-    ///
-    /// Argv order (RESEARCH.md § "Architecture Patterns / Pattern 4",
-    /// confirmed): the print flag, the instruction, the resume flag
-    /// immediately followed by the session id (so the id is parsed as the
-    /// flag's value, not a positional argument), the output-format flag with
-    /// its JSON value, and the permission-bypass flag.
-    ///
-    /// **Pitfall 1 (RESEARCH.md, T-28-02) — load-bearing, do not "clean up":**
-    /// a `claude --resume`d session restores NEITHER the permission mode NOR
-    /// the output format from the original launch. Both are re-passed here
-    /// explicitly even though they look redundant with `exec_command`'s
-    /// launch above. Omitting either reintroduces the exact headless hang
-    /// this phase exists to close: the resumed session halts on a
-    /// permission prompt with no operator present to answer it, and the
-    /// prompt is not guaranteed to even reach the captured stdout.
-    /// `resume_command_includes_permission_bypass` is the named regression
-    /// test guarding this specifically — do not delete it as "obviously
-    /// redundant" with the launch-contract tests above; it guards a DIFFERENT
-    /// command construction path. Note the resume argv keeps `--output-format
-    /// json` and a POSITIONAL instruction even though `exec_command` no longer
-    /// does: a resumed session is a single-document relaunch, not a
-    /// stream-json one.
-    pub fn exec_resume_command(session_id: &str, instruction: &str) -> (&'static str, Vec<String>) {
-        (
-            "claude",
-            vec![
-                "-p".into(),
-                instruction.to_string(),
-                "--resume".into(),
-                session_id.to_string(),
                 "--output-format".into(),
                 "json".into(),
                 "--dangerously-skip-permissions".into(),
@@ -222,55 +214,58 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resume_command_names_claude_program() {
-        let (program, _args) = ClaudeDriver::exec_resume_command("sess", "instr");
-        assert_eq!(program, "claude");
+    fn ask_registration() -> crate::agents::AskRegistration {
+        crate::agents::AskRegistration {
+            exe: std::path::PathBuf::from("/opt/bin/devflow"),
+            project_root: std::path::PathBuf::from("/work/project"),
+            phase: PhaseId::new(7),
+            stage: crate::stage::Stage::Code,
+            timeout_secs: 120,
+            run_started_at: "2026-11-18T00:00:00Z".into(),
+            config_path: std::path::PathBuf::from("/work/project/.devflow/ask-07.mcp.json"),
+        }
     }
 
+    /// D-03: claude reads the server from a per-launch `--mcp-config` file
+    /// appended last, whose one server `devflow` runs the runner's own binary
+    /// as `__ask` and lets a call wait the gate timeout plus the margin.
     #[test]
-    fn resume_command_carries_print_flag_and_instruction() {
-        let (_program, args) = ClaudeDriver::exec_resume_command("sess", "do the thing");
-        assert!(args.iter().any(|a| a == "-p"));
-        assert!(args.iter().any(|a| a == "do the thing"));
-    }
-
-    #[test]
-    fn resume_command_resume_flag_immediately_precedes_session_id() {
-        let (_program, args) = ClaudeDriver::exec_resume_command("sess-abc", "instr");
-        let resume_idx = args
-            .iter()
-            .position(|a| a == "--resume")
-            .expect("--resume flag must be present");
+    fn launch_args_name_the_ask_registration() {
+        let reg = ask_registration();
+        let wiring = ClaudeDriver
+            .ask_wiring(&reg)
+            .expect("claude registers the server");
         assert_eq!(
-            args.get(resume_idx + 1).map(String::as_str),
-            Some("sess-abc"),
-            "the session id must immediately follow --resume so it is parsed \
-             as the flag's value, not a positional argument: {args:?}"
+            wiring.args,
+            ["--mcp-config", "/work/project/.devflow/ask-07.mcp.json"]
         );
-    }
-
-    /// Pitfall 1 (RESEARCH.md, T-28-02): the single highest-consequence
-    /// regression this phase can ship is a resume relaunch that omits either
-    /// the permission-bypass flag or the JSON output-format flag — a resumed
-    /// Claude session restores neither, so omitting them reintroduces a
-    /// silent headless hang on a permission prompt nobody can answer.
-    #[test]
-    fn resume_command_includes_permission_bypass() {
-        let (program, args) = ClaudeDriver::exec_resume_command("sess-123", "do the thing");
-        assert_eq!(program, "claude");
-        assert!(
-            args.iter().any(|a| a == "--dangerously-skip-permissions"),
-            "a resumed Claude session restores neither the permission mode \
-             nor the output format (RESEARCH Pitfall 1) — omitting this flag \
-             reintroduces a silent headless hang with nobody able to answer \
-             the resulting permission prompt: {args:?}"
+        assert_eq!(wiring.placement, crate::agents::ArgPlacement::Append);
+        let (path, text) = wiring.file.expect("claude writes a registration file");
+        assert_eq!(path, reg.config_path);
+        assert!(!text.contains('\n'), "one line: {text}");
+        let config: serde_json::Value = serde_json::from_str(&text).expect("the file is JSON");
+        let servers = config["mcpServers"].as_object().expect("mcpServers");
+        assert_eq!(servers.len(), 1, "one server: {text}");
+        let server = &servers["devflow"];
+        assert_eq!(server["type"], "stdio", "{text}");
+        assert_eq!(server["command"], "/opt/bin/devflow", "{text}");
+        assert_eq!(
+            server["args"],
+            serde_json::json!([
+                "__ask",
+                "--project",
+                "/work/project",
+                "--phase",
+                "7",
+                "--stage",
+                "code",
+                "--timeout-secs",
+                "120",
+                "--run-started-at",
+                "2026-11-18T00:00:00Z"
+            ]),
+            "{text}"
         );
-        assert!(
-            args.windows(2)
-                .any(|w| w[0] == "--output-format" && w[1] == "json"),
-            "the JSON output-format flag must also be re-passed explicitly, \
-             for the same reason as the permission-bypass flag: {args:?}"
-        );
+        assert_eq!(server["timeout"], (120 + 60) * 1000, "timeout ms: {text}");
     }
 }

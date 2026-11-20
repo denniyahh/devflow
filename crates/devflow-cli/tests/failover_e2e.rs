@@ -1,23 +1,25 @@
-//! End-to-end proof of the one rate-limit failover pair `--mode auto` admits,
-//! Claude → Antigravity at the Code stage (Phase 51, SUPV-02, D-11), through
-//! the real `devflow` binary.
+//! End-to-end proof of the rate-limit failover at the Code stage (Phase 51,
+//! SUPV-02, D-11) through the real `devflow` binary, on the two agents that
+//! stay launchable: Claude and Codex.
 //!
-//! `devflow start --mode auto --until code` drives Plan and Code under
-//! a stub `claude` on the stream shape. The stub is rate-limited on its Code
-//! turn; the supervisor hands the stage to a stub `agy`, which must pass its
-//! OWN delivery canary inside the supervisor before its stage turn runs. A
-//! refused canary ends at the never-silent Code gate (R2-D1), and a run with
-//! no fallback waits at that gate without ever invoking `agy`.
+//! `devflow start --until code` drives Plan and Code under stub agents. The
+//! primary is rate-limited on its Code turn and the supervisor hands the stage
+//! to the fallback. A Claude fallback must pass its OWN delivery canary inside
+//! the supervisor before its stage turn runs; a refused canary ends at the
+//! never-silent Code gate (R2-D1). The handoff runs use `--mode supervise`,
+//! because in `--mode auto` a fallback must hold the unattended launch shape,
+//! which Codex does not. A run with no fallback waits at that gate without
+//! ever invoking the Codex stub on PATH.
 //!
 //! Every `devflow` child is built by `common::hermetic_devflow`, so its
 //! registry entries and sockets live under a tempdir `HOME`. The stubs log to
 //! a directory outside the repository, so their logs never dirty the tree the
 //! pipeline inspects.
 //!
-//! What these tests do not establish: the stubs' event shapes are copied from
-//! DevFlow's own tests, not from a live Claude or Antigravity CLI; the Claude
-//! stub exits after its rate-limit event, so the stream path's idle-timeout
-//! route is not exercised; the Plan turn only commits a stub plan and prints success.
+//! What these tests do not establish: the stubs' output shapes are copied from
+//! DevFlow's own tests, not from a live Claude or Codex CLI; the Claude stub
+//! exits after its rate-limit event, so the stream path's idle-timeout route is
+//! not exercised; the Plan turn only commits a stub plan and prints success.
 
 mod common;
 
@@ -49,21 +51,14 @@ const CLAUDE_REJECTED_RATE_LIMIT_EVENT: &str = r#"{"type":"rate_limit_event","ra
 /// A Claude stream `result` carrying the success marker.
 const CLAUDE_SUCCESS_RESULT: &str = r#"{"type":"result","subtype":"success","is_error":false,"session_id":"559fef4d-2053-459e-b7a7-f3200c3b3790","result":"DEVFLOW_RESULT: {\"status\":\"success\"}"}"#;
 
-/// The Antigravity `init` event, copied from `ANTG_INIT` in
-/// `devflow-core/src/agent_result.rs`.
-const ANTIGRAVITY_INIT_EVENT: &str = r#"{"event":"init","model":"gemini-3.7-flash-high","inputFormat":"stream-json","outputFormat":"stream-json","printTimeout":"60m"}"#;
-
-/// The Antigravity success result, copied from `ANTG_RESULT_MARKER` in
-/// `devflow-core/src/agent_result.rs` (`antigravity_event_result_extracts_marker_from_live_shape`).
-const ANTIGRAVITY_SUCCESS_RESULT: &str = r#"{"event":"result","result":{"status":"SUCCESS","response":"DEVFLOW_RESULT: {\"status\":\"success\"}\n"}}"#;
-
 /// The `claude` stub. Each invocation appends one line to `claude.log`:
 /// `health` for `--version`, `canary` for the delivery canary, and
 /// `stage plan|code` for a stage turn, told apart by the stage prompt
 /// (`render_claude_style`: Code runs `/gsd-execute-phase`, Plan
 /// `/gsd-plan-phase`), and `unexpected turn` for any other turn, so a sequence
 /// assertion sees it. It also appends each invocation's stdin turn (one JSON
-/// line) to `claude-stdin.log`, in the same order. Plan commits a minimal plan file with no
+/// line) to `claude-stdin.log`, in the same order. The canary answer is
+/// `@CLAUDE_CANARY_ANSWER@`. Plan commits a minimal plan file with no
 /// checkpoint; Code commits once, records that commit, runs `@CODE_TURN_DIRT@`
 /// (empty unless the rig leaves uncommitted work), then reports a quota denial
 /// and exits.
@@ -75,7 +70,7 @@ case "$turn" in
   *DEVFLOW_DELIVERY_CANARY_*)
     echo canary >> "$log"
     token=$(printf '%s' "$turn" | grep -o 'DEVFLOW_DELIVERY_CANARY_[0-9a-f]*' | head -1)
-    printf '{"type":"result","subtype":"success","is_error":false,"session_id":"s-fake","result":"%s"}\n' "$token"
+    @CLAUDE_CANARY_ANSWER@
     exit 0
     ;;
   *gsd-execute-phase*)
@@ -103,40 +98,57 @@ printf '%s\n' '@CLAUDE_INIT@'
 printf '%s\n' '@CLAUDE_SUCCESS@'
 exit 0"#;
 
-/// The `agy` stub. Each invocation appends one line to `agy.log`: `health`
-/// for `--version`, `canary` for the delivery canary, `stage` otherwise. The
-/// canary answer is `@CANARY_ANSWER@`; the stage turn runs `@STAGE_PROBE@`
-/// (empty unless the rig records what the fallback inherited), commits once,
-/// records that commit and reports success in the Antigravity shape.
-const AGY_STUB: &str = r#"#!/bin/sh
-log='@LOGS@/agy.log'
-if [ "$1" = "--version" ]; then echo health >> "$log"; echo "agy 0.0.0-stub"; exit 0; fi
-IFS= read -r turn
-case "$turn" in
-  *DEVFLOW_DELIVERY_CANARY_*)
-    echo canary >> "$log"
-    token=$(printf '%s' "$turn" | grep -o 'DEVFLOW_DELIVERY_CANARY_[0-9a-f]*' | head -1)
-    printf '%s\n' '@ANTIGRAVITY_INIT@'
-    @CANARY_ANSWER@
-    exit 0
-    ;;
-esac
-echo stage >> "$log"
-@STAGE_PROBE@
-git commit -q --allow-empty -m 'antigravity code work' || exit 1
-git rev-parse HEAD > '@LOGS@/agy-code-commit'
-printf '%s\n' '@ANTIGRAVITY_INIT@'
-printf '%s\n' '@ANTIGRAVITY_SUCCESS@'
-exit 0"#;
-
-/// The canary answer in the Antigravity shape the trust predicate accepts:
-/// the token inside `event: "result"`'s `result.response`
-/// (`canary_antigravity_confirmed_when_token_returns_in_event_result_response`).
-const AGY_CANARY_RETURNS_TOKEN: &str =
-    r#"printf '{"event":"result","result":{"status":"SUCCESS","response":"%s"}}\n' "$token""#;
+/// The canary answer in the Claude shape the trust predicate accepts: the
+/// token as a top-level `type: "result"` event's `result`.
+const CLAUDE_CANARY_RETURNS_TOKEN: &str = r#"printf '{"type":"result","subtype":"success","is_error":false,"session_id":"s-fake","result":"%s"}\n' "$token""#;
 
 /// A canary answer that completes the turn but withholds the token.
-const AGY_CANARY_WITHHOLDS_TOKEN: &str = r#"printf '%s\n' '{"event":"result","result":{"status":"SUCCESS","response":"The turn completed without the token."}}'"#;
+const CLAUDE_CANARY_WITHHOLDS_TOKEN: &str = r#"printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"session_id":"s-fake","result":"The turn completed without the token."}'"#;
+
+/// The `codex` stub. Each invocation appends one line to `codex.log`:
+/// `health` for `--version`, and `stage plan|code` for a stage turn, told
+/// apart by the GSD workflow file its prompt names (the last argument,
+/// `render_workflow_style`), and `unexpected turn` for any other turn. Plan
+/// commits a minimal plan file with no checkpoint; Code runs
+/// `@CODEX_CODE_TURN@`. A turn that does not exit early prints the success
+/// marker.
+const CODEX_STUB: &str = r#"#!/bin/sh
+log='@LOGS@/codex.log'
+if [ "$1" = "--version" ]; then echo health >> "$log"; echo "codex-cli 0.0.0-stub"; exit 0; fi
+for prompt; do :; done
+case "$prompt" in
+  *execute-phase.md*)
+    echo 'stage code' >> "$log"
+@CODEX_CODE_TURN@
+    ;;
+  *plan-phase.md*)
+    echo 'stage plan' >> "$log"
+    dir='.planning/phases/@PADDED@-failover'
+    mkdir -p "$dir" || exit 1
+    printf '%s\n' '---' 'phase: @PADDED@-failover' 'plan: 01' 'type: execute' 'autonomous: true' '---' '' '<tasks>' '<task type="auto"><name>stub</name></task>' '</tasks>' > "$dir/@PADDED@-01-PLAN.md"
+    git add "$dir/@PADDED@-01-PLAN.md" || exit 1
+    git commit -q -m 'plan' || exit 1
+    ;;
+  *)
+    echo 'unexpected turn' >> "$log"
+    ;;
+esac
+printf '%s\n' 'DEVFLOW_RESULT: {"status":"success"}'
+exit 0"#;
+
+/// A primary Codex Code turn: it commits once, records that commit, then
+/// reports a quota denial in the plain-text form `detect_codex_rate_limit`
+/// reads ("Rate limit exceeded. Try again at ...") and exits.
+const CODEX_CODE_TURN_IS_RATE_LIMITED: &str = r#"    git commit -q --allow-empty -m 'codex code-turn work' || exit 1
+    git rev-parse HEAD > '@LOGS@/codex-code-commit'
+    printf '%s\n' 'Rate limit exceeded. Try again at 17:00.'
+    exit 0"#;
+
+/// A fallback Codex Code turn: it runs `@STAGE_PROBE@` (empty unless the rig
+/// records what the fallback inherited), commits once and records that commit.
+const CODEX_CODE_TURN_COMPLETES: &str = r#"@STAGE_PROBE@
+    git commit -q --allow-empty -m 'codex code work' || exit 1
+    git rev-parse HEAD > '@LOGS@/codex-code-commit'"#;
 
 /// Uncommitted work the primary leaves in the tree when its Code turn is
 /// rate-limited: a staged new file, an unstaged edit to a tracked file and an
@@ -150,14 +162,14 @@ const CODE_TURN_LEAVES_UNCOMMITTED_WORK: &str = r#"    printf 'staged by claude\
 /// it inherited: its working directory, branch, `git status --porcelain`, the
 /// staged blob, the two working-tree files, and `.planning/config.json` both
 /// as committed and as on disk.
-const AGY_RECORDS_WHAT_IT_INHERITED: &str = r#"pwd -P > '@LOGS@/agy-cwd'
-git rev-parse --abbrev-ref HEAD > '@LOGS@/agy-branch'
-git status --porcelain --untracked-files=all > '@LOGS@/agy-status'
-git show :staged.txt > '@LOGS@/agy-index-staged'
-cat README.md > '@LOGS@/agy-readme'
-cat untracked.txt > '@LOGS@/agy-untracked'
-git show HEAD:.planning/config.json > '@LOGS@/agy-config-head'
-cat .planning/config.json > '@LOGS@/agy-config-worktree'"#;
+const CODEX_RECORDS_WHAT_IT_INHERITED: &str = r#"    pwd -P > '@LOGS@/codex-cwd'
+    git rev-parse --abbrev-ref HEAD > '@LOGS@/codex-branch'
+    git status --porcelain --untracked-files=all > '@LOGS@/codex-status'
+    git show :staged.txt > '@LOGS@/codex-index-staged'
+    cat README.md > '@LOGS@/codex-readme'
+    cat untracked.txt > '@LOGS@/codex-untracked'
+    git show HEAD:.planning/config.json > '@LOGS@/codex-config-head'
+    cat .planning/config.json > '@LOGS@/codex-config-worktree'"#;
 
 /// Hermetic `git` for fixture setup (999.37), never a bare `Command::new("git")`.
 fn git(root: &Path, args: &[&str]) {
@@ -203,7 +215,15 @@ fn init_repo(root: &Path, phase: PhaseId) {
     git(root, &["config", "commit.gpgsign", "false"]);
     git(root, &["config", "core.hooksPath", "/dev/null"]);
     git(root, &["checkout", "-q", "-b", "develop"]);
-    fs::create_dir_all(root.join(".planning")).unwrap();
+    // A CONTEXT.md on `develop`, which a Codex Plan needs (the codex
+    // interactivity preflight).
+    let phase_dir = root.join(format!(".planning/phases/{}-failover", phase.padded()));
+    fs::create_dir_all(&phase_dir).unwrap();
+    fs::write(
+        phase_dir.join(format!("{}-CONTEXT.md", phase.padded())),
+        "ctx\n",
+    )
+    .unwrap();
     fs::write(root.join("README.md"), "base\n").unwrap();
     fs::write(
         root.join(".planning/ROADMAP.md"),
@@ -222,17 +242,61 @@ fn init_repo(root: &Path, phase: PhaseId) {
             "README.md",
             ".planning/ROADMAP.md",
             ".planning/config.json",
+            ".planning/phases",
         ],
     );
     git(root, &["commit", "-q", "-m", "base"]);
 }
 
-/// How the `agy` stub answers its delivery canary.
+/// How the `claude` stub answers its delivery canary.
 #[derive(Debug, Clone, Copy)]
-enum AgyCanary {
+enum ClaudeCanary {
     ReturnsToken,
     WithholdsToken,
 }
+
+/// What the `codex` stub's Code turn does.
+#[derive(Debug, Clone, Copy)]
+enum CodexCode {
+    /// The primary's turn: [`CODEX_CODE_TURN_IS_RATE_LIMITED`].
+    IsRateLimited,
+    /// The fallback's turn: [`CODEX_CODE_TURN_COMPLETES`].
+    Completes,
+}
+
+/// Which agent starts the run, in which mode, and how the stubs behave.
+#[derive(Debug, Clone, Copy)]
+struct Shape {
+    primary: &'static str,
+    mode: &'static str,
+    canary: ClaudeCanary,
+    codex_code: CodexCode,
+}
+
+/// A Claude primary in `--mode auto`: the no-fallback rate-limit gate runs.
+const CLAUDE_AUTO: Shape = Shape {
+    primary: "claude",
+    mode: "auto",
+    canary: ClaudeCanary::ReturnsToken,
+    codex_code: CodexCode::Completes,
+};
+
+/// A Claude primary handing off to a Codex fallback, supervised.
+const CLAUDE_TO_CODEX: Shape = Shape {
+    primary: "claude",
+    mode: "supervise",
+    canary: ClaudeCanary::ReturnsToken,
+    codex_code: CodexCode::Completes,
+};
+
+/// A Codex primary handing off to a Claude fallback whose canary withholds
+/// the token, supervised.
+const CODEX_TO_A_FAILED_CLAUDE_CANARY: Shape = Shape {
+    primary: "codex",
+    mode: "supervise",
+    canary: ClaudeCanary::WithholdsToken,
+    codex_code: CodexCode::IsRateLimited,
+};
 
 /// One phase's fixture: a hermetic home, a repository, the two stubs on a
 /// fake-bin dir and a log dir outside the repository. Bind a
@@ -242,6 +306,7 @@ struct Rig {
     _repo: tempfile::TempDir,
     root: PathBuf,
     phase: PhaseId,
+    shape: Shape,
     fake_bin: common::FakeBin,
     logs: tempfile::TempDir,
 }
@@ -264,32 +329,32 @@ fn a_future_reset() -> Option<i64> {
 }
 
 impl Rig {
-    fn new(phase: PhaseId, canary: AgyCanary) -> Self {
-        Self::build(phase, canary, "", "", a_future_reset())
+    fn new(phase: PhaseId, shape: Shape) -> Self {
+        Self::build(phase, shape, "", "", a_future_reset())
     }
 
-    /// A rig whose Claude denial names `resets_at` (epoch seconds), or no reset
-    /// time at all for `None`.
+    /// A Claude auto-mode rig whose Claude denial names `resets_at` (epoch
+    /// seconds), or no reset time at all for `None`.
     fn with_reset(phase: PhaseId, resets_at: Option<i64>) -> Self {
-        Self::build(phase, AgyCanary::ReturnsToken, "", "", resets_at)
+        Self::build(phase, CLAUDE_AUTO, "", "", resets_at)
     }
 
-    /// A rig whose Claude Code turn leaves uncommitted work behind
-    /// ([`CODE_TURN_LEAVES_UNCOMMITTED_WORK`]) and whose `agy` stage turn
-    /// records what it inherited ([`AGY_RECORDS_WHAT_IT_INHERITED`]).
+    /// A Claude-to-Codex rig whose Claude Code turn leaves uncommitted work
+    /// behind ([`CODE_TURN_LEAVES_UNCOMMITTED_WORK`]) and whose `codex` stage
+    /// turn records what it inherited ([`CODEX_RECORDS_WHAT_IT_INHERITED`]).
     fn with_uncommitted_work(phase: PhaseId) -> Self {
         Self::build(
             phase,
-            AgyCanary::ReturnsToken,
+            CLAUDE_TO_CODEX,
             CODE_TURN_LEAVES_UNCOMMITTED_WORK,
-            AGY_RECORDS_WHAT_IT_INHERITED,
+            CODEX_RECORDS_WHAT_IT_INHERITED,
             a_future_reset(),
         )
     }
 
     fn build(
         phase: PhaseId,
-        canary: AgyCanary,
+        shape: Shape,
         code_turn_dirt: &str,
         stage_probe: &str,
         resets_at: Option<i64>,
@@ -304,6 +369,13 @@ impl Rig {
 
         let claude = CLAUDE_STUB
             .replace("@CODE_TURN_DIRT@", code_turn_dirt)
+            .replace(
+                "@CLAUDE_CANARY_ANSWER@",
+                match shape.canary {
+                    ClaudeCanary::ReturnsToken => CLAUDE_CANARY_RETURNS_TOKEN,
+                    ClaudeCanary::WithholdsToken => CLAUDE_CANARY_WITHHOLDS_TOKEN,
+                },
+            )
             .replace("@LOGS@", &logs_path)
             .replace("@PADDED@", &padded)
             .replace("@CLAUDE_INIT@", CLAUDE_INIT_EVENT)
@@ -315,29 +387,29 @@ impl Rig {
             .replace("@CLAUDE_SUCCESS@", CLAUDE_SUCCESS_RESULT);
         let fake_bin = common::fake_bin_dir_for("claude", &claude);
 
-        let answer = match canary {
-            AgyCanary::ReturnsToken => AGY_CANARY_RETURNS_TOKEN,
-            AgyCanary::WithholdsToken => AGY_CANARY_WITHHOLDS_TOKEN,
+        let codex_code_turn = match shape.codex_code {
+            CodexCode::IsRateLimited => CODEX_CODE_TURN_IS_RATE_LIMITED,
+            CodexCode::Completes => CODEX_CODE_TURN_COMPLETES,
         };
-        let agy = AGY_STUB
+        let codex = CODEX_STUB
+            .replace("@CODEX_CODE_TURN@", codex_code_turn)
             .replace("@STAGE_PROBE@", stage_probe)
             .replace("@LOGS@", &logs_path)
-            .replace("@CANARY_ANSWER@", answer)
-            .replace("@ANTIGRAVITY_INIT@", ANTIGRAVITY_INIT_EVENT)
-            .replace("@ANTIGRAVITY_SUCCESS@", ANTIGRAVITY_SUCCESS_RESULT);
-        write_executable(&fake_bin.path.join("agy"), &agy);
+            .replace("@PADDED@", &padded);
+        write_executable(&fake_bin.path.join("codex"), &codex);
 
         Self {
             home,
             _repo: repo,
             root,
             phase,
+            shape,
             fake_bin,
             logs,
         }
     }
 
-    /// `devflow start --phase N --agent claude --mode auto --no-worktree
+    /// `devflow start --phase N --agent <primary> --mode <mode> --no-worktree
     /// --until code`, plus `extra`, with the stubs first on PATH. Asserts the
     /// start itself succeeded.
     fn start(&self, extra: &[&str]) {
@@ -377,9 +449,9 @@ impl Rig {
                 "--phase",
                 &self.phase.to_string(),
                 "--agent",
-                "claude",
+                self.shape.primary,
                 "--mode",
-                "auto",
+                self.shape.mode,
                 "--until",
                 "code",
             ])
@@ -548,22 +620,22 @@ fn position(events: &[Value], name: &str, log: &str) -> usize {
         .unwrap_or_else(|| panic!("no {name} event; events:\n{log}"))
 }
 
-/// D-11 / criterion 1 at Code (R-2) for the pair auto mode admits: a Claude
-/// run rate-limited at Code continues under Antigravity in the same tree on
-/// the same branch, after Antigravity's own delivery canary (D-04), and the
-/// Code stage completes. Negative control: no resume is scheduled.
+/// D-11 / criterion 1 at Code (R-2): a Claude run rate-limited at Code
+/// continues under Codex in the same tree on the same branch, and the Code
+/// stage completes. Codex has no delivery canary, so the only canary is
+/// Claude's at Plan. Negative control: no resume is scheduled.
 #[test]
-fn a_rate_limited_claude_run_in_auto_mode_hands_off_to_antigravity_and_completes_code() {
+fn a_rate_limited_claude_run_hands_off_to_codex_and_completes_code() {
     let phase = PhaseId::new(5121);
-    let rig = Rig::new(phase, AgyCanary::ReturnsToken);
+    let rig = Rig::new(phase, CLAUDE_TO_CODEX);
     let _reaper = common::LaunchedRunReaper::for_home(&rig.home, &rig.root, phase);
 
-    rig.start(&["--fallback-agent", "antigravity"]);
+    rig.start(&["--fallback-agent", "codex"]);
     let branch = git_out(&rig.root, &["rev-parse", "--abbrev-ref", "HEAD"]);
     assert_eq!(branch, format!("feature/phase-{}", phase.padded()));
     assert_eq!(
         rig.state().fallback_agent,
-        Some(AgentKind::Antigravity),
+        Some(AgentKind::Codex),
         "start persisted the fallback"
     );
 
@@ -580,16 +652,15 @@ fn a_rate_limited_claude_run_in_auto_mode_hands_off_to_antigravity_and_completes
     let handoff = &handoffs[0];
     assert_eq!(handoff["stage"], "code", "{handoff}");
     assert_eq!(handoff["from_agent"], "claude", "{handoff}");
-    assert_eq!(handoff["to_agent"], "antigravity", "{handoff}");
+    assert_eq!(handoff["to_agent"], "codex", "{handoff}");
     assert_eq!(handoff["reason"], "rate_limited", "{handoff}");
 
     let claude_canary = position(&events, "claude_delivery_canary_confirmed", &log);
     let handed = position(&events, "agent_handoff", &log);
-    let antigravity_canary = position(&events, "antigravity_delivery_canary_confirmed", &log);
     let finished = position(&events, "workflow_finished", &log);
     assert!(
-        claude_canary < handed && handed < antigravity_canary && antigravity_canary < finished,
-        "Claude's canary, the handoff, Antigravity's own canary, then the finish; events:\n{log}"
+        claude_canary < handed && handed < finished,
+        "Claude's canary, the handoff, then the finish; events:\n{log}"
     );
     assert_eq!(
         events[finished]["reason"], "stopped_at",
@@ -602,17 +673,17 @@ fn a_rate_limited_claude_run_in_auto_mode_hands_off_to_antigravity_and_completes
         "Claude ran its canary, then Plan and Code"
     );
     assert_eq!(
-        rig.invocations("agy"),
-        ["canary", "stage"],
-        "Antigravity ran its own canary before its stage turn"
+        rig.invocations("codex"),
+        ["stage code"],
+        "Codex ran the Code stage turn only"
     );
 
     let state = rig.state();
-    assert_eq!(state.agent, AgentKind::Antigravity);
+    assert_eq!(state.agent, AgentKind::Codex);
     assert!(state.fallback_consumed, "the one hop is spent");
 
     let claude_commit = rig.recorded_commit("claude-code-commit");
-    let agy_commit = rig.recorded_commit("agy-code-commit");
+    let codex_commit = rig.recorded_commit("codex-code-commit");
     assert_eq!(
         git_out(&rig.root, &["rev-parse", "--abbrev-ref", "HEAD"]),
         branch,
@@ -620,7 +691,7 @@ fn a_rate_limited_claude_run_in_auto_mode_hands_off_to_antigravity_and_completes
     );
     assert_eq!(
         git_out(&rig.root, &["rev-parse", "HEAD"]),
-        agy_commit,
+        codex_commit,
         "the fallback's commit is the branch tip"
     );
     assert_eq!(
@@ -640,12 +711,12 @@ fn a_rate_limited_claude_run_in_auto_mode_hands_off_to_antigravity_and_completes
 /// cron arm. Also the control that the canary-order assertion above can fail:
 /// without the in-supervisor canary, this run would complete Code.
 #[test]
-fn a_handoff_to_antigravity_that_fails_its_canary_ends_at_a_gate() {
+fn a_handoff_to_claude_that_fails_its_canary_ends_at_a_gate() {
     let phase = PhaseId::new(5123);
-    let rig = Rig::new(phase, AgyCanary::WithholdsToken);
+    let rig = Rig::new(phase, CODEX_TO_A_FAILED_CLAUDE_CANARY);
     let _reaper = common::LaunchedRunReaper::for_home(&rig.home, &rig.root, phase);
 
-    rig.start(&["--fallback-agent", "antigravity"]);
+    rig.start(&["--fallback-agent", "claude"]);
     rig.wait_for_any(&[
         "gate_fired",
         "workflow_finished",
@@ -663,16 +734,12 @@ fn a_handoff_to_antigravity_that_fails_its_canary_ends_at_a_gate() {
     );
     assert_eq!(events[handed]["stage"], "code", "{}", events[handed]);
     assert_eq!(events[failed]["stage"], "code", "{}", events[failed]);
-    assert_eq!(
-        events[failed]["to_agent"], "antigravity",
-        "{}",
-        events[failed]
-    );
+    assert_eq!(events[failed]["to_agent"], "claude", "{}", events[failed]);
     assert_eq!(events[gated]["stage"], "code", "{}", events[gated]);
     let context = events[gated]["context"].as_str().unwrap_or_default();
     let body = context.strip_prefix("[never-silent] ").unwrap_or(context);
     let way_on = body.find(&format!("`devflow resume --phase {phase} --agent <other>`"));
-    let cause = body.find("the handoff to antigravity could not relaunch the code stage");
+    let cause = body.find("the handoff to claude could not relaunch the code stage");
     assert!(
         matches!((way_on, cause), (Some(way_on), Some(cause)) if way_on < cause),
         "the gate names the way on before the cause: {}",
@@ -696,13 +763,13 @@ fn a_handoff_to_antigravity_that_fails_its_canary_ends_at_a_gate() {
     );
 
     assert_eq!(
-        rig.invocations("agy"),
+        rig.invocations("claude"),
         ["canary"],
-        "Antigravity ran its canary and no stage turn"
+        "Claude ran its canary and no stage turn"
     );
 
     let state = rig.state();
-    assert_eq!(state.agent, AgentKind::Antigravity);
+    assert_eq!(state.agent, AgentKind::Claude);
     assert!(state.fallback_consumed, "the one hop is spent");
     assert_eq!(state.canary, Some(CanaryOutcome::Absent));
     assert!(state.gate_pending, "the never-silent gate is open");
@@ -713,7 +780,7 @@ fn a_handoff_to_antigravity_that_fails_its_canary_ends_at_a_gate() {
 /// supervisor's response. Returns the event log, parsed and as text.
 fn answer_the_failed_canary_gate(rig: &Rig, answer: &[&str]) -> (Vec<Value>, String) {
     let phase = rig.phase;
-    rig.start(&["--fallback-agent", "antigravity"]);
+    rig.start(&["--fallback-agent", "claude"]);
     rig.wait_for_any(&[
         "gate_fired",
         "workflow_finished",
@@ -749,11 +816,7 @@ fn answer_the_failed_canary_gate(rig: &Rig, answer: &[&str]) -> (Vec<Value>, Str
 fn assert_the_relaunch_was_refused_loudly(rig: &Rig, events: &[Value], log: &str) {
     let refused = position(events, "gate_relaunch_refused", log);
     assert_eq!(events[refused]["stage"], "code", "{}", events[refused]);
-    assert_eq!(
-        events[refused]["agent"], "antigravity",
-        "{}",
-        events[refused]
-    );
+    assert_eq!(events[refused]["agent"], "claude", "{}", events[refused]);
     assert!(
         events[refused]["reason"]
             .as_str()
@@ -776,13 +839,13 @@ fn assert_the_relaunch_was_refused_loudly(rig: &Rig, events: &[Value], log: &str
         "the stop reason names the way on: {reason}"
     );
     assert!(
-        reason.contains("the code stage cannot relaunch under antigravity"),
+        reason.contains("the code stage cannot relaunch under claude"),
         "the stop reason names the stage and the agent: {reason}"
     );
     assert!(!state.gate_pending, "no gate is left open");
     assert_eq!(state.canary, Some(CanaryOutcome::Absent));
     assert_eq!(
-        rig.invocations("agy"),
+        rig.invocations("claude"),
         ["canary"],
         "the refused relaunch spawned no second canary and no stage turn"
     );
@@ -794,7 +857,7 @@ fn assert_the_relaunch_was_refused_loudly(rig: &Rig, events: &[Value], log: &str
 #[test]
 fn approving_the_failed_canary_gate_stops_the_run_and_names_the_way_on() {
     let phase = PhaseId::new(5124);
-    let rig = Rig::new(phase, AgyCanary::WithholdsToken);
+    let rig = Rig::new(phase, CODEX_TO_A_FAILED_CLAUDE_CANARY);
     let _reaper = common::LaunchedRunReaper::for_home(&rig.home, &rig.root, phase);
     let (events, log) = answer_the_failed_canary_gate(&rig, &["approve"]);
     assert_the_relaunch_was_refused_loudly(&rig, &events, &log);
@@ -804,7 +867,7 @@ fn approving_the_failed_canary_gate_stops_the_run_and_names_the_way_on() {
 #[test]
 fn rejecting_the_failed_canary_gate_stops_the_run_and_names_the_way_on() {
     let phase = PhaseId::new(5125);
-    let rig = Rig::new(phase, AgyCanary::WithholdsToken);
+    let rig = Rig::new(phase, CODEX_TO_A_FAILED_CLAUDE_CANARY);
     let _reaper = common::LaunchedRunReaper::for_home(&rig.home, &rig.root, phase);
     let (events, log) = answer_the_failed_canary_gate(&rig, &["reject", "--note", "try again"]);
     assert_the_relaunch_was_refused_loudly(&rig, &events, &log);
@@ -813,13 +876,13 @@ fn rejecting_the_failed_canary_gate_stops_the_run_and_names_the_way_on() {
 /// The way on after the refused relaunch, as an operator would take it. Once the
 /// supervisor has ended, `devflow status` names `resume --agent <other>`; a plain
 /// `devflow resume` is refused by the recorded canary and leaves the stop reason that
-/// names the way on as it was; `devflow resume --agent claude` hands off, which clears
-/// the recorded canary, and relaunches Code after Claude's own canary. Negative control
-/// for the plain resume: Antigravity ran no second canary or stage turn.
+/// names the way on as it was; `devflow resume --agent codex` hands off, which clears
+/// the recorded canary, and relaunches Code under Codex. Negative control for the plain
+/// resume: Claude ran no second canary or stage turn.
 #[test]
 fn after_the_refused_relaunch_status_and_resume_lead_to_another_agent() {
     let phase = PhaseId::new(5126);
-    let rig = Rig::new(phase, AgyCanary::WithholdsToken);
+    let rig = Rig::new(phase, CODEX_TO_A_FAILED_CLAUDE_CANARY);
     let _reaper = common::LaunchedRunReaper::for_home(&rig.home, &rig.root, phase);
     let (events, log) = answer_the_failed_canary_gate(&rig, &["approve"]);
     assert_the_relaunch_was_refused_loudly(&rig, &events, &log);
@@ -886,15 +949,15 @@ fn after_the_refused_relaunch_status_and_resume_lead_to_another_agent() {
     );
     assert_eq!(after_plain.canary, Some(CanaryOutcome::Absent));
     assert_eq!(
-        rig.invocations("agy"),
+        rig.invocations("claude"),
         ["canary"],
         "the refused resume launched nothing"
     );
 
-    let handed = resume(&["--agent", "claude"]);
+    let handed = resume(&["--agent", "codex"]);
     assert!(
         handed.status.success(),
-        "resume --agent claude failed\nstdout: {}\nstderr: {}",
+        "resume --agent codex failed\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&handed.stdout),
         String::from_utf8_lossy(&handed.stderr)
     );
@@ -930,20 +993,19 @@ fn after_the_refused_relaunch_status_and_resume_lead_to_another_agent() {
         2,
         "the failover, then the resume's handoff; events:\n{log}"
     );
-    assert_eq!(handoffs[1]["from_agent"], "antigravity", "{}", handoffs[1]);
-    assert_eq!(handoffs[1]["to_agent"], "claude", "{}", handoffs[1]);
+    assert_eq!(handoffs[1]["from_agent"], "claude", "{}", handoffs[1]);
+    assert_eq!(handoffs[1]["to_agent"], "codex", "{}", handoffs[1]);
     assert_eq!(handoffs[1]["reason"], "resume --agent", "{}", handoffs[1]);
     assert_eq!(
-        rig.invocations("claude"),
-        ["canary", "stage plan", "stage code", "canary", "stage code"],
-        "Claude ran its own canary again, then relaunched Code"
+        rig.invocations("codex"),
+        ["stage plan", "stage code", "stage code"],
+        "Codex relaunched Code"
     );
     let state = rig.state();
-    assert_eq!(state.agent, AgentKind::Claude);
+    assert_eq!(state.agent, AgentKind::Codex);
     assert_eq!(
-        state.canary,
-        Some(CanaryOutcome::Confirmed),
-        "the handoff cleared the recorded refusal and Claude's canary passed"
+        state.canary, None,
+        "the handoff cleared the recorded refusal, and Codex has no canary to record"
     );
 }
 
@@ -951,8 +1013,8 @@ fn after_the_refused_relaunch_status_and_resume_lead_to_another_agent() {
 /// Claude rate limit at Code waits at the never-silent Code gate, which names
 /// the resume command and the reset time from the denial. Both directions in
 /// one fixture: the cron-instructions file the old arm wrote is absent, and
-/// the gate is present. Negative control: no handoff, and the `agy` stub on
-/// PATH is never launched for a canary or a stage.
+/// the gate is present. Negative control: no handoff, and the `codex` stub on
+/// PATH is never launched for a stage.
 #[test]
 fn a_rate_limited_claude_run_without_a_fallback_waits_at_a_gate() {
     let phase = PhaseId::new(5122);
@@ -1029,9 +1091,9 @@ fn a_rate_limited_claude_run_without_a_fallback_waits_at_a_gate() {
         "no fallback, no handoff; events:\n{log}"
     );
     assert_eq!(
-        rig.invocations("agy"),
+        rig.invocations("codex"),
         Vec::<String>::new(),
-        "agy is on PATH and never launched for a canary or a stage"
+        "codex is on PATH and never launched for a stage"
     );
 
     let state = rig.state();
@@ -1410,7 +1472,7 @@ fn rejecting_a_rate_limit_gate_relaunches_the_same_stage_with_the_note() {
 
 /// Criterion 1 on the worktree arm (D-10): a run in its phase worktree whose
 /// Claude Code turn is rate-limited with a staged file, an unstaged edit and an
-/// untracked file in the tree hands off to Antigravity, which launches in the
+/// untracked file in the tree hands off to Codex, which launches in the
 /// SAME worktree on the phase branch and finds all three exactly as Claude
 /// left them: nothing reset, stashed, cleaned or checked out.
 #[test]
@@ -1419,7 +1481,7 @@ fn a_handoff_inside_a_phase_worktree_keeps_the_tree_branch_and_uncommitted_work(
     let rig = Rig::with_uncommitted_work(phase);
     let _reaper = common::LaunchedRunReaper::for_home(&rig.home, &rig.root, phase);
 
-    rig.start_in_worktree(&["--fallback-agent", "antigravity"]);
+    rig.start_in_worktree(&["--fallback-agent", "codex"]);
     rig.wait_for_any(&[
         "workflow_finished",
         "gate_fired",
@@ -1451,48 +1513,34 @@ fn a_handoff_inside_a_phase_worktree_keeps_the_tree_branch_and_uncommitted_work(
             .unwrap_or_else(|err| panic!("the fallback did not record {name}: {err}"))
     };
     assert_eq!(
-        PathBuf::from(recorded("agy-cwd").trim()),
+        PathBuf::from(recorded("codex-cwd").trim()),
         worktree,
         "the fallback launched in the phase worktree"
     );
     assert_eq!(
-        recorded("agy-branch").trim(),
+        recorded("codex-branch").trim(),
         branch,
         "the fallback launched on the phase branch"
     );
-    let inherited: Vec<String> = recorded("agy-status").lines().map(str::to_string).collect();
+    let inherited: Vec<String> = recorded("codex-status")
+        .lines()
+        .map(str::to_string)
+        .collect();
     assert_eq!(
         inherited,
-        [
-            " M .planning/config.json",
-            " M README.md",
-            "A  staged.txt",
-            "?? untracked.txt"
-        ],
-        "the staged, unstaged and untracked changes are all still there, as they were, \
-         beside DevFlow's own config write"
+        [" M README.md", "A  staged.txt", "?? untracked.txt"],
+        "the staged, unstaged and untracked changes are all still there, as they were"
     );
-    // The config change is DevFlow's auto-chain flag write
-    // (`gsd_config::set_auto_chain_active`) and nothing else: with that one
-    // key removed, the on-disk config equals the committed one.
-    let without_auto_chain_flag = |name: &str| {
-        let mut config: Value = serde_json::from_str(&recorded(name))
-            .unwrap_or_else(|err| panic!("{name} is not JSON: {err}"));
-        let shown = config.to_string();
-        config["workflow"]
-            .as_object_mut()
-            .unwrap_or_else(|| panic!("{name} has no workflow object: {shown}"))
-            .remove("_auto_chain_active");
-        config
-    };
+    // A supervised run writes no auto-chain flag, so `.planning/config.json`
+    // on disk is the committed one.
     assert_eq!(
-        without_auto_chain_flag("agy-config-worktree"),
-        without_auto_chain_flag("agy-config-head"),
-        "`.planning/config.json` changed beyond the auto-chain flag"
+        recorded("codex-config-worktree"),
+        recorded("codex-config-head"),
+        "`.planning/config.json` is unchanged"
     );
-    assert_eq!(recorded("agy-index-staged"), "staged by claude\n");
-    assert_eq!(recorded("agy-readme"), "base\nunstaged edit by claude\n");
-    assert_eq!(recorded("agy-untracked"), "untracked by claude\n");
+    assert_eq!(recorded("codex-index-staged"), "staged by claude\n");
+    assert_eq!(recorded("codex-readme"), "base\nunstaged edit by claude\n");
+    assert_eq!(recorded("codex-untracked"), "untracked by claude\n");
 
     assert!(
         rig.events_named("workflow_finished")
@@ -1500,7 +1548,7 @@ fn a_handoff_inside_a_phase_worktree_keeps_the_tree_branch_and_uncommitted_work(
             .any(|event| event["reason"] == "stopped_at"),
         "Code completed under the fallback; events:\n{log}"
     );
-    assert_eq!(rig.invocations("agy"), ["canary", "stage"]);
+    assert_eq!(rig.invocations("codex"), ["stage code"]);
 
     assert_eq!(
         git_out(&worktree, &["rev-parse", "HEAD^"]),

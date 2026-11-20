@@ -45,72 +45,85 @@ DEVFLOW_RESULT: {\"status\": \"failed\", \"reason\": \"specific explanation\"}\n
 Anything else your final message must contain, such as the reasoning for a decision, goes above the DEVFLOW_RESULT line. \
 DevFlow reads this line to decide whether the stage succeeded. Output nothing after it.";
 
-/// The single definition of who may resolve a `blocking-human` gate
-/// (47-CONTEXT.md D-04). It is a macro and not only a `const` because
-/// `CODE_STAGE_POLICY` is assembled with `concat!`, which accepts literals and
-/// macro expansions but rejects a `const` name (`error: expected a literal`).
-/// `GATE_RESOLUTION_RULE` and `CODE_STAGE_POLICY` both expand this one literal.
+/// The question policy every stage prompt carries (ASK-03, 53-CONTEXT.md D-12):
+/// every question an agent meets goes to the operator through the `devflow_ask`
+/// tool, and the agent never answers one itself. A macro for the same `concat!`
+/// reason as [`checkpoint_declaration`]; [`ASK_POLICY`] is its one expansion,
+/// and each stage builder places it just before the completion contract.
 ///
-/// A line continuation drops the newline AND the next line's leading
-/// whitespace, so the space between two words sits before each `\`.
-macro_rules! gate_resolution_rule {
+/// The tool names are the ones each client showed in the 53-MCP-SPIKE.md Item 2
+/// transcripts: Claude Code called `mcp__devflow__devflow_ask`, codex called
+/// tool `devflow_ask` of server `devflow`. The `pending` re-call is operator
+/// answer OD-1 (b) (53-REVIEWS.md, 2026-11-18); the server side is 53-13.
+macro_rules! ask_policy {
     () => {
-        "A blocking-human gate is human-only, with one exception: if DevFlow \
-        resumed you specifically to resolve that gate, resolve it yourself and \
-        record your reasoning in your final message; otherwise report it instead."
+        "\
+## Questions go to the operator\n\
+\n\
+When you reach a decision checkpoint, a `blocking-human` gate, a package-verification \
+checkpoint, or a question a GSD workflow would ask the user (including a discuss \
+question), call the `devflow_ask` tool from the `devflow` MCP server. Clients namespace \
+it: Claude Code lists it as `mcp__devflow__devflow_ask`, and codex as tool `devflow_ask` \
+of server `devflow`; call the name your tool list shows for that server's `devflow_ask`. \
+Pass the question, every option as `{id, label, description}`, the context the operator \
+needs, `kind` (`decision`, `blocking-human` or `discuss`), and `recommended` if one option \
+is recommended. Wait for the answer and apply exactly that answer. Do not choose an option \
+yourself, do not choose by position, and do not stop with a report instead of asking. When \
+a GSD subagent you ran stops at such a point, you ask and pass the answer on. Record the \
+question and the answer you received in your final message.\n\
+\n\
+A result whose `status` is `pending` is not an answer: no answer has come yet and the \
+question stays open for the operator. Call `devflow_ask` again with the same arguments \
+plus the `question_id` that result gave, and keep doing so until you receive an answer or \
+a `devflow_ask closed:` result. On a result starting `devflow_ask refused:`, fix the \
+payload and call again. On a result starting `devflow_ask closed:` (the run was stopped, \
+aborted or timed out), end the stage and put that text in your final line's reason. If \
+the call itself fails or the tool is not available, do not resolve the question \
+yourself; report it instead.\n\
+\n"
     };
 }
 
-/// Who may resolve a `blocking-human` gate: a prohibition with one named
-/// condition (47-CONTEXT.md D-01, D-02, D-04). `CODE_STAGE_POLICY` includes this
-/// sentence verbatim through `gate_resolution_rule!()`, and
-/// [`checkpoint_auto_decide_prompt`] states the SAME condition in the
-/// affirmative — it is only ever sent when DevFlow has resumed the agent to
-/// resolve such a gate. The two texts differ in grammatical mood, never in the
-/// condition.
-///
-/// `pub` deliberately: the cross-crate delivery test in `devflow-cli`
-/// (`pipeline_launch.rs`) asserts against this definition, not a re-typed copy.
-/// The carve-out covers `blocking-human` gates ONLY. Package-verification
-/// checkpoints keep an unconditional prohibition in `CODE_STAGE_POLICY` (D-02,
-/// settled by the operator 2026-09-10; the section text is pinned by
-/// `package_verification_prohibition_is_unconditional`, operator decision
-/// 2026-09-11). Do not widen it without a new decision.
-pub const GATE_RESOLUTION_RULE: &str = gate_resolution_rule!();
+/// [`ask_policy`]'s one expansion, interpolated into every stage prompt.
+const ASK_POLICY: &str = ask_policy!();
 
-/// How an agent reports a `blocking-human` gate it is not resolving: the
-/// `checkpoint` field on its final marker, which the pipeline reads through
+/// How an agent reports a `blocking-human` gate when its `devflow_ask` call
+/// failed (53-CONTEXT.md D-13): the `checkpoint` field on its final marker,
+/// which the pipeline reads through
 /// [`crate::agent_result::AgentResult::declares_blocking_human_checkpoint`]
 /// (49-REVIEW CR-01). It names a subagent's halt too, because under GSD the
 /// executor subagent stops and the orchestrator writes the marker.
 ///
-/// It lives in [`CODE_STAGE_POLICY`] and not in [`COMPLETION_PROTOCOL`] for two
-/// reasons. Only the Code stage runs plans, so only Code may declare (the
-/// pipeline ignores the field elsewhere), and the auto-decide resume prompt,
-/// which carries only the protocol, does not re-offer it. The example sits
-/// inside a sentence, never at the start of a line, so an echoed prompt cannot
-/// parse as a declaring marker. A macro for the same `concat!` reason as
-/// [`gate_resolution_rule`].
+/// It lives in [`CODE_STAGE_POLICY`] and not in [`COMPLETION_PROTOCOL`]
+/// because only the Code stage runs plans, so only Code may declare (the
+/// pipeline ignores the field elsewhere). The example sits inside a sentence,
+/// never at the start of a line, so an echoed prompt cannot parse as a
+/// declaring marker. A macro because `CODE_STAGE_POLICY` is assembled with
+/// `concat!`, which accepts literals and macro expansions but rejects a
+/// `const` name (`error: expected a literal`).
+///
+/// A line continuation drops the newline AND the next line's leading
+/// whitespace, so the space between two words sits before each `\`.
 macro_rules! checkpoint_declaration {
     () => {
-        "When you report a blocking-human gate that you or a subagent you ran \
-        stopped at, say so on your final line with the checkpoint field, for \
-        example `DEVFLOW_RESULT: {\"status\": \"failed\", \"checkpoint\": \
-        \"blocking-human\", \"reason\": \"which gate stopped and the decision it \
-        needs\"}`. Use the checkpoint field for nothing else: not for a gate you \
-        resolved, and not for any other failure."
+        "When devflow_ask fails and you report a blocking-human gate that you or \
+        a subagent you ran stopped at, say so on your final line with the \
+        checkpoint field, for example `DEVFLOW_RESULT: {\"status\": \"failed\", \
+        \"checkpoint\": \"blocking-human\", \"reason\": \"which gate stopped and \
+        the decision it needs\"}`. Use the checkpoint field for nothing else: not \
+        for a gate the operator answered, and not for any other failure."
     };
 }
 #[cfg(test)]
 const CHECKPOINT_DECLARATION: &str = checkpoint_declaration!();
 
-/// Shared policy for full-execute Code prompts. This advises the agent during
-/// one-shot Code execution, while [`checkpoint_auto_decide_prompt`] is injected
-/// into a resumed session after DevFlow's own human-blocking gate finds no
-/// operator. They are complementary, not duplicates; neither should replace or
-/// be deleted as the other. Both state the gate rule through
-/// [`GATE_RESOLUTION_RULE`], so a resumed session that has seen both is never
-/// handed two different conditions (47-CONTEXT.md D-04).
+/// Shared policy for full-execute Code prompts: the advisory self-review, and
+/// the operator-only checkpoints. The checkpoint section is pinned by
+/// `package_verification_prohibition_is_unconditional` (operator answer (1),
+/// 2026-11-18, recorded on the `devflow gate reject 53 --note` event in
+/// `.devflow/events.jsonl`): both checkpoints go to `devflow_ask`, and the
+/// no-self-resolve rule stays as the fallback when that call fails. Every
+/// stage prompt carries [`ASK_POLICY`] beside it; this text does not repeat it.
 const CODE_STAGE_POLICY: &str = concat!(
     "\
 ## Advisory incremental self-review\n\
@@ -121,27 +134,13 @@ external-state claims. Record any drift in the working output and \
 continue execution; this self-check is not the authoritative review of the phase. \
 This check must not pause execution or request human input.\n\
 \n\
-## Unattended decision checkpoints\n\
+## Operator-only checkpoints\n\
 \n\
-When you reach a `decision` checkpoint and no operator is available, resolve \
-it rather than pausing: this run is unattended and nobody is coming. Compare \
-the presented options against the phase goal and constraints, and do not choose \
-an option merely because it is the first option in the list. The GSD workflow \
-being invoked describes selecting the first option; this instruction supersedes \
-that positional procedure for merit-based choices.\n\
-\n\
-An option marked recommended is evidence to weigh, not an automatically \
-decisive answer. In your final message, record the reasoning and comparison that \
-produced the choice: which options you considered and why the chosen one won, \
-not merely a sentence asserting the choice. The final message is the only record \
-of the decision.\n\
-\n\
-This authority never extends to a package-verification checkpoint: do not \
-self-resolve or approve one under any circumstances, and report it instead. ",
-    gate_resolution_rule!(),
-    " ",
-    checkpoint_declaration!(),
-    " This policy must not pause execution or request human input."
+A package-verification checkpoint and a blocking-human gate are the operator's: \
+ask through devflow_ask and apply the answer you receive. If the devflow_ask call \
+itself fails, do not self-resolve or approve one under any circumstances, and \
+report it instead. ",
+    checkpoint_declaration!()
 );
 
 /// The data a stage wants rendered, with NO agent-specific syntax.
@@ -424,7 +423,7 @@ Output nothing after it.";
 fn validate_stage_prompt(phase: PhaseId, notes: &str) -> String {
     let command = gsd_command_for(Stage::Validate, phase);
     format!(
-        "Run the GSD workflow command for this stage:\n\n    {command}\n\n{notes}{VALIDATE_VERDICT_CONTRACT}"
+        "Run the GSD workflow command for this stage:\n\n    {command}\n\n{ASK_POLICY}{notes}{VALIDATE_VERDICT_CONTRACT}"
     )
 }
 
@@ -459,7 +458,7 @@ fn idempotent_stage_prompt(phase: PhaseId, notes: &str) -> String {
         \n\
         \x20   {command}\n\
         \n\
-        {notes}{COMPLETION_PROTOCOL}"
+        {ASK_POLICY}{notes}{COMPLETION_PROTOCOL}"
     )
 }
 
@@ -473,7 +472,7 @@ fn gaps_plan_prompt(phase: PhaseId, notes: &str) -> String {
     let command = format!("{} --gaps", gsd_command_for(Stage::Plan, phase));
     format!(
         "Validation reported gaps. Plan their closure with the GSD workflow command for \
-        this stage:\n\n    {command}\n\n{notes}{COMPLETION_PROTOCOL}"
+        this stage:\n\n    {command}\n\n{ASK_POLICY}{notes}{COMPLETION_PROTOCOL}"
     )
 }
 
@@ -497,7 +496,7 @@ fn code_stage_prompt(phase: PhaseId, notes: &str) -> String {
         "Run the GSD workflow command for this stage:\n\n    {command}\n\n\
         {CODE_STAGE_POLICY}\n\
         \n\
-        {notes}{COMPLETION_PROTOCOL}"
+        {ASK_POLICY}{notes}{COMPLETION_PROTOCOL}"
     )
 }
 
@@ -622,7 +621,7 @@ fn workflow_plan_prompt(phase: PhaseId, workflow_root: &str, notes: &str) -> Str
         - If it does NOT exist: read and follow the GSD workflow file at \
         {workflow_root}/plan-phase.md for phase {phase}.\n\
         \n\
-        {notes}{COMPLETION_PROTOCOL}"
+        {ASK_POLICY}{notes}{COMPLETION_PROTOCOL}"
     )
 }
 
@@ -633,7 +632,7 @@ fn workflow_gaps_plan_prompt(phase: PhaseId, workflow_root: &str, notes: &str) -
         "Validation reported gaps. Read and follow the GSD workflow file at \
         {workflow_root}/plan-phase.md for phase {phase} --gaps, to plan their closure. The \
         `--gaps` flag is part of the workflow invocation and must be preserved verbatim.\n\n\
-        {notes}{COMPLETION_PROTOCOL}"
+        {ASK_POLICY}{notes}{COMPLETION_PROTOCOL}"
     )
 }
 
@@ -733,64 +732,17 @@ fn workflow_code_prompt(
             "{instruction}\n\n\
             {CODE_STAGE_POLICY}\n\
             \n\
-            {notes}{COMPLETION_PROTOCOL}"
+            {ASK_POLICY}{notes}{COMPLETION_PROTOCOL}"
         )
     } else {
-        format!("{instruction}\n\n{notes}{COMPLETION_PROTOCOL}")
+        format!("{instruction}\n\n{ASK_POLICY}{notes}{COMPLETION_PROTOCOL}")
     }
 }
 
 fn workflow_validate_prompt(phase: PhaseId, workflow_root: &str, notes: &str) -> String {
     format!(
         "Read and follow the GSD workflow file at {workflow_root}/validate-phase.md for \
-        phase {phase}.\n\n{notes}{VALIDATE_VERDICT_CONTRACT}"
-    )
-}
-
-/// The synthesized instruction sent into a resumed Claude session when a
-/// confirmed `blocking-human` gate has nobody available to answer it
-/// (D-03, 28-CONTEXT.md): DevFlow's default, unconditional policy — no flag,
-/// no config toggle — is for the agent to resolve the checkpoint itself,
-/// using its own judgment, and record why.
-///
-/// 47-03 (47-CONTEXT.md D-02, D-04): the text names `blocking-human` because
-/// the only trigger for this resume, `verify::phase_has_blocking_human_checkpoint`,
-/// matches `gate="blocking-human"` and nothing else. It states the SAME
-/// condition as [`GATE_RESOLUTION_RULE`], in the affirmative: DevFlow resumed
-/// you specifically to resolve that gate, so resolve it and record your
-/// reasoning in your final message. It grants nothing beyond that gate —
-/// package-verification checkpoints are never routed through this injection.
-///
-/// The resume wording tells the agent to name the resolved gate in prose rather
-/// than copy the checkpoint's declaration line. A failed resume capture is
-/// re-read by `agent_result::latest_stated_outcome`, so a copied declaration
-/// line could read as a new checkpoint. A checkpoint is reported only by a
-/// `**Gate:**`-labeled line with no marker after it, or by a final
-/// `DEVFLOW_RESULT` that declares `"checkpoint": "blocking-human"`
-/// ([`CODE_STAGE_POLICY`] offers that field only for a gate being reported
-/// rather than resolved, and this prompt does not offer it). The wording of a
-/// failure reason is never read (49-REVIEW CR-01). The
-/// `resume_prompt_does_not_read_as_a_blocking_human_checkpoint` test pins that
-/// boundary and rejects prose such as `Resolved gate: blocking-human`.
-///
-/// Deliberately deterministic: no timestamp, no random content, no varying
-/// state. Two calls for the same `phase` produce byte-identical strings, so
-/// the `checkpoint_auto_decided` audit event (D-07, plan 28-03) can quote
-/// this exact instruction without churning on every resume. `phase` is
-/// included only for operator legibility in the captured stdout — the
-/// instruction's meaning does not depend on it.
-pub fn checkpoint_auto_decide_prompt(phase: PhaseId) -> String {
-    format!(
-        "This is phase {phase} of a headless DevFlow run. You previously \
-        stopped at a blocking-human gate, but no human operator is \
-        available to answer it — this run is unattended, and none is \
-        coming. DevFlow resumed you specifically to resolve that gate: \
-        resolve it yourself, using your own best judgment, and continue the \
-        work. You MUST record your reasoning for the decision you made in \
-        your final message, so the decision is auditable after the fact. \
-        In that reasoning, refer to the gate you resolved in plain prose and do not copy the gate-declaration line from the checkpoint, because DevFlow can mistake a copied declaration line for a new checkpoint.\n\
-        \n\
-        {COMPLETION_PROTOCOL}"
+        phase {phase}.\n\n{ASK_POLICY}{notes}{VALIDATE_VERDICT_CONTRACT}"
     )
 }
 
@@ -808,7 +760,7 @@ pub fn checkpoint_auto_decide_prompt(phase: PhaseId) -> String {
 /// `--`-prefixed tokens position-independently
 /// (`references/phase-argument-parsing.md`).
 ///
-/// **The unattended decision policy (DECN-02; D-05 and D-06, 47-CONTEXT.md).**
+/// **The Code policy (DECN-02; D-05 and D-06, 47-CONTEXT.md).**
 /// The `FullExecute` arm carries `CODE_STAGE_POLICY`, laid out as
 /// `code_stage_prompt` lays it out: command, policy, then the completion
 /// protocol last. Before Phase 47 it did not. Because `render_claude_style` is
@@ -870,10 +822,10 @@ fn fix_prompt_with_notes(
             "{lead}\n\n    {command}\n\n\
             {CODE_STAGE_POLICY}\n\
             \n\
-            {notes}{COMPLETION_PROTOCOL}"
+            {ASK_POLICY}{notes}{COMPLETION_PROTOCOL}"
         )
     } else {
-        format!("{lead}\n\n    {command}\n\n{notes}{COMPLETION_PROTOCOL}")
+        format!("{lead}\n\n    {command}\n\n{ASK_POLICY}{notes}{COMPLETION_PROTOCOL}")
     }
 }
 
@@ -929,45 +881,25 @@ mod tests {
             assert!(prompt.contains(angle), "Code prompt missing angle: {angle}");
         }
         assert!(
-            prompt.contains("Unattended decision checkpoints"),
-            "Code prompt must carry the unattended decision policy"
+            prompt.contains("## Questions go to the operator"),
+            "Code prompt must carry the question policy"
+        );
+        assert!(
+            prompt.contains("## Operator-only checkpoints"),
+            "Code prompt must carry the operator-only checkpoint section"
         );
         assert!(!prompt.contains("AskUserQuestion"));
         assert!(!prompt.contains("request_user_input"));
     }
 
-    // These tests prove policy delivery in the rendered prompt, not model compliance.
-    // They also do not modify the GSD workflow file, whose decision branch remains positional.
-
+    // This proves policy delivery in the rendered prompt, not model compliance.
     #[test]
-    fn code_policy_forbids_positional_option_selection() {
-        let code_prompt = stage_prompt(Stage::Code, PhaseId::new(45)).to_lowercase();
-        let validate_prompt = stage_prompt(Stage::Validate, PhaseId::new(45)).to_lowercase();
-        let code_has_positional_policy = code_prompt.contains("do not choose")
-            && code_prompt.contains("first option")
-            && code_prompt.contains("merit");
-        let validate_has_positional_policy = validate_prompt.contains("do not choose")
-            && validate_prompt.contains("first option")
-            && validate_prompt.contains("merit");
-
+    fn code_prompt_requires_the_question_and_answer_to_be_recorded() {
+        let prompt = stage_prompt(Stage::Code, PhaseId::new(45));
         assert!(
-            code_has_positional_policy,
-            "the policy must explicitly contradict GSD's first-option procedure; otherwise it \
-             adds nothing"
-        );
-        assert!(
-            !validate_has_positional_policy,
-            "the negative control must not find the Code policy on an unrelated prompt"
-        );
-    }
-
-    #[test]
-    fn code_policy_requires_the_reasoning_to_be_recorded() {
-        let prompt = stage_prompt(Stage::Code, PhaseId::new(45)).to_lowercase();
-        assert!(
-            prompt.contains("record") && prompt.contains("reasoning"),
-            "the final message is the only record of what was decided, so the policy must \
-             require recorded reasoning"
+            prompt
+                .contains("Record the question and the answer you received in your final message."),
+            "the final message is the agent's record of what was asked and answered"
         );
     }
 
@@ -1065,8 +997,8 @@ mod tests {
     }
 
     /// D-07 / DECN-02 (47-CONTEXT.md): a Validate loop-back that dispatches
-    /// `Code { fix: Some(FullExecute) }` must deliver the unattended decision
-    /// policy on every adapter, not only on the first Code pass.
+    /// `Code { fix: Some(FullExecute) }` must deliver the Code policy on every
+    /// adapter, not only on the first Code pass.
     ///
     /// Kinds are enumerated by an exhaustive `match` over `AgentKind`, NOT an
     /// array literal. This workspace has no `AgentKind::ALL`, and an array loop
@@ -1084,7 +1016,7 @@ mod tests {
         use crate::agents::driver_for;
         use crate::state::AgentKind;
 
-        const POLICY_HEADING: &str = "## Unattended decision checkpoints";
+        const POLICY_HEADING: &str = "## Operator-only checkpoints";
 
         #[derive(Clone, Copy, PartialEq)]
         enum Render {
@@ -1165,7 +1097,7 @@ mod tests {
         );
         assert!(
             claude_style_missing.is_empty(),
-            "the FullExecute fix arm omits the unattended decision policy on \
+            "the FullExecute fix arm omits the Code policy on \
              {claude_style_missing:?} (render_claude_style): a Validate loop-back never \
              delivers it to those adapters"
         );
@@ -1388,17 +1320,6 @@ mod tests {
         assert!(plan.contains("/gsd-plan-phase 11"));
     }
 
-    /// D-03/D-07 (28-03): the audit event quotes this instruction verbatim,
-    /// so it must be byte-identical across calls for the same phase — no
-    /// timestamp, no random content that would churn the recorded string.
-    #[test]
-    fn checkpoint_auto_decide_prompt_is_deterministic() {
-        assert_eq!(
-            checkpoint_auto_decide_prompt(PhaseId::new(28)),
-            checkpoint_auto_decide_prompt(PhaseId::new(28))
-        );
-    }
-
     /// 49-REVIEW CR-01: the Code policy's checkpoint example is exactly what
     /// the parser accepts as a declaration, so the prompt and `AgentResult`
     /// cannot drift apart. The sentence is pinned verbatim, so a widening such
@@ -1410,10 +1331,10 @@ mod tests {
             "the Code policy must carry the declaration sentence"
         );
         assert!(CHECKPOINT_DECLARATION.starts_with(
-            "When you report a blocking-human gate that you or a subagent you ran stopped at,"
+            "When devflow_ask fails and you report a blocking-human gate that you or a subagent you ran stopped at,"
         ));
         assert!(CHECKPOINT_DECLARATION.ends_with(
-            "Use the checkpoint field for nothing else: not for a gate you resolved, and not for any other failure."
+            "Use the checkpoint field for nothing else: not for a gate the operator answered, and not for any other failure."
         ));
         let example = CHECKPOINT_DECLARATION
             .split('`')
@@ -1457,13 +1378,10 @@ mod tests {
         }
     }
 
-    /// Only Code may declare. The resume prompt and every non-Code stage
-    /// prompt carry no checkpoint form, so a resumed agent is not re-offered
-    /// it and Plan and Validate are not invited to use it.
+    /// Only Code may declare. Every non-Code stage prompt carries no
+    /// checkpoint form, so Plan and Validate are not invited to use it.
     #[test]
     fn checkpoint_declaration_is_offered_only_to_the_code_stage() {
-        let resume = checkpoint_auto_decide_prompt(PhaseId::new(47));
-        assert!(!resume.contains("\"checkpoint\""), "{resume}");
         assert!(!COMPLETION_PROTOCOL.contains("checkpoint"));
         for stage in [Stage::Plan, Stage::Validate] {
             let prompt = stage_prompt(stage, PhaseId::new(47));
@@ -1471,115 +1389,230 @@ mod tests {
         }
     }
 
-    #[test]
-    fn checkpoint_auto_decide_prompt_terminates_with_completion_protocol() {
-        let prompt = checkpoint_auto_decide_prompt(PhaseId::new(28));
-        assert!(
-            prompt.ends_with(COMPLETION_PROTOCOL),
-            "the resumed session's exit must still be parseable by the same \
-             Layer 1 path as any other stage"
-        );
-        assert!(prompt.contains("DEVFLOW_RESULT"));
-    }
-
-    #[test]
-    fn checkpoint_auto_decide_prompt_states_no_operator_judgment_and_record_reasoning() {
-        let prompt = checkpoint_auto_decide_prompt(PhaseId::new(28)).to_lowercase();
-        assert!(
-            prompt.contains("no human operator") || prompt.contains("nobody"),
-            "must state plainly that no operator is available"
-        );
-        assert!(
-            prompt.contains("judgment") || prompt.contains("judgement"),
-            "must instruct the agent to use its own judgment"
-        );
-        assert!(
-            prompt.contains("record") && prompt.contains("reasoning"),
-            "must require recording the reasoning in the final message, since \
-             this is the ONLY record of what was decided (D-07)"
-        );
-    }
-
-    #[test]
-    fn checkpoint_auto_decide_prompt_substitutes_phase_for_legibility() {
-        assert!(checkpoint_auto_decide_prompt(PhaseId::new(42)).contains("phase 42"));
-    }
-
-    /// D-03/D-04 (47-03), constant level. A resumed Claude session sees
-    /// `CODE_STAGE_POLICY` in its first turn and `checkpoint_auto_decide_prompt`
-    /// in a later one, so the two texts must state one rule about who may
-    /// resolve a `blocking-human` gate: the policy may not forbid it outright
-    /// while the resume instruction, which names a different class, says to
-    /// resolve it.
-    ///
-    /// Controls: the policy must still name `package-verification` (D-02 keeps
-    /// that prohibition unconditional, so a fix that deletes the sentence instead
-    /// of splitting it fails here), and the resume prompt must end with the
-    /// completion protocol, so an absent `blocking-human` means the prose lacks
-    /// it rather than that the prompt is empty. The rule checks are collected so
-    /// a red run reports every half that is wrong, not only the first.
-    #[test]
-    fn the_gate_rule_has_one_definition_site() {
-        let resume = checkpoint_auto_decide_prompt(PhaseId::new(47));
-        assert!(
-            CODE_STAGE_POLICY.contains("package-verification"),
-            "D-02: the package-verification prohibition must survive the split, not be deleted"
-        );
-        assert!(
-            resume.ends_with(COMPLETION_PROTOCOL),
-            "precondition: the resume instruction must be a real rendered prompt"
-        );
-
-        let mut contradictions = Vec::new();
-        if CODE_STAGE_POLICY.contains("gate or a package-verification checkpoint") {
-            contradictions.push(
-                "CODE_STAGE_POLICY still forbids a blocking-human gate unconditionally, \
-                 in the same sentence as package verification",
-            );
-        }
-        if !resume.contains("blocking-human") {
-            contradictions.push(
-                "checkpoint_auto_decide_prompt does not name the blocking-human gate \
-                 class it resumes the agent to resolve",
-            );
-        }
-        // Strengthened once the shared constant existed (47-03 Task 3): the
-        // policy must carry the one definition, not merely lack the old sentence.
-        if !CODE_STAGE_POLICY.contains(GATE_RESOLUTION_RULE) {
-            contradictions.push("CODE_STAGE_POLICY does not carry GATE_RESOLUTION_RULE");
-        }
-        assert!(
-            contradictions.is_empty(),
-            "the two gate-rule texts disagree: {contradictions:#?}"
-        );
-    }
-
-    /// D-02 enforcement (47-03, operator decision 2026-09-11): the gate-rule
-    /// section of `CODE_STAGE_POLICY` is PINNED character for character. Word
+    /// D-02 enforcement (47-03, operator decision 2026-09-11; rewritten under
+    /// operator answer (1), 2026-11-18): the gate-rule section of
+    /// `CODE_STAGE_POLICY` is PINNED character for character. Word
     /// lists failed review three times; an exact pin cannot be paraphrased
     /// around, so ANY change to this section fails here — a synonym, a
     /// restructure, a waiver added inside it, or a space lost before a line
     /// continuation.
     ///
     /// The expected text is this test's own literal and is never assembled from
-    /// `GATE_RESOLUTION_RULE` or `CODE_STAGE_POLICY`: building it from the
-    /// constants under test would widen the expectation along with them.
+    /// `CODE_STAGE_POLICY`: building it from the constant under test would
+    /// widen the expectation along with it.
     ///
     /// NOT covered: an authorization added elsewhere in the policy, outside this
     /// section. That is caught only by reading the snapshot diff when the
     /// baseline is re-blessed, and in phase review.
     #[test]
     fn package_verification_prohibition_is_unconditional() {
-        const PINNED_SECTION: &str = "This authority never extends to a package-verification checkpoint: do not self-resolve or approve one under any circumstances, and report it instead. A blocking-human gate is human-only, with one exception: if DevFlow resumed you specifically to resolve that gate, resolve it yourself and record your reasoning in your final message; otherwise report it instead.";
-        const PINNED_GATE_RULE: &str = "A blocking-human gate is human-only, with one exception: if DevFlow resumed you specifically to resolve that gate, resolve it yourself and record your reasoning in your final message; otherwise report it instead.";
+        const PINNED_SECTION: &str = "A package-verification checkpoint and a blocking-human gate are the operator's: ask through devflow_ask and apply the answer you receive. If the devflow_ask call itself fails, do not self-resolve or approve one under any circumstances, and report it instead.";
+        const FALLBACK: &str =
+            "do not self-resolve or approve one under any circumstances, and report it instead";
 
+        assert!(
+            PINNED_SECTION.contains(FALLBACK),
+            "the pinned section must keep the no-self-resolve fallback (operator answer 1)"
+        );
         assert!(
             CODE_STAGE_POLICY.contains(PINNED_SECTION),
             "CODE_STAGE_POLICY no longer carries the pinned gate-rule section verbatim"
         );
-        assert_eq!(
-            GATE_RESOLUTION_RULE, PINNED_GATE_RULE,
-            "GATE_RESOLUTION_RULE must equal the pinned section's second sentence exactly"
+    }
+
+    // ---- ASK-03 / D-12: every question goes through devflow_ask ----
+
+    /// The text that starts the completion contract of every stage, the
+    /// ordinary protocol and Validate's verdict contract alike.
+    const COMPLETION_HEADING: &str = "## Completion Protocol (REQUIRED)";
+
+    /// Every intent a stage can be launched with, none carrying a note, so the
+    /// shortest prompt of each arm is the one walked. Code's fix arms are
+    /// walked through an exhaustive `match` on `FixType`, so a new variant is a
+    /// compile error here until it is linked into the chain.
+    fn every_intent(phase: PhaseId) -> Vec<StageIntent> {
+        fn next_fix(fix: Option<FixType>) -> Option<Option<FixType>> {
+            match fix {
+                None => Some(Some(FixType::GapsOnly)),
+                Some(FixType::GapsOnly) => Some(Some(FixType::FullExecute)),
+                Some(FixType::FullExecute) => Some(Some(FixType::StaleReverify)),
+                Some(FixType::StaleReverify) => Some(Some(FixType::Quick)),
+                Some(FixType::Quick) => None,
+            }
+        }
+        let mut intents = vec![
+            StageIntent::Plan {
+                phase,
+                relaunch_note: None,
+            },
+            StageIntent::PlanGaps {
+                phase,
+                relaunch_note: None,
+            },
+            StageIntent::Validate {
+                phase,
+                relaunch_note: None,
+            },
+        ];
+        let mut fix = Some(None);
+        while let Some(current) = fix {
+            intents.push(StageIntent::Code {
+                phase,
+                fix: current,
+                fix_note: None,
+                relaunch_note: None,
+                reverify_report: None,
+            });
+            fix = next_fix(current);
+        }
+        intents
+    }
+
+    /// Every agent kind, walked through an exhaustive `match` as in
+    /// `policy_carrying_full_execute_fix_prompt_snapshots`.
+    fn every_agent_kind() -> Vec<crate::state::AgentKind> {
+        use crate::state::AgentKind;
+        fn next_kind(kind: AgentKind) -> Option<AgentKind> {
+            match kind {
+                AgentKind::Claude => Some(AgentKind::Codex),
+                AgentKind::Codex => Some(AgentKind::OpenCode),
+                AgentKind::OpenCode => Some(AgentKind::Pi),
+                AgentKind::Pi => Some(AgentKind::Antigravity),
+                AgentKind::Antigravity => Some(AgentKind::Hermes),
+                AgentKind::Hermes => None,
+            }
+        }
+        let mut kinds = Vec::new();
+        let mut next = Some(AgentKind::Claude);
+        while let Some(kind) = next {
+            kinds.push(kind);
+            next = next_kind(kind);
+        }
+        kinds
+    }
+
+    /// Every stage prompt every driver renders, labelled with its driver and
+    /// intent for failure messages.
+    fn every_rendered_prompt() -> Vec<(String, String)> {
+        let mut prompts = Vec::new();
+        for kind in every_agent_kind() {
+            for intent in every_intent(PhaseId::new(53)) {
+                let label = format!("{kind:?} {intent:?}");
+                prompts.push((
+                    label,
+                    crate::agents::driver_for(kind).render_prompt(&intent),
+                ));
+            }
+        }
+        prompts
+    }
+
+    /// The phrases of the removed positional self-resolution policy found in
+    /// `text`. Each needle is split mid-word so this test source does not hold
+    /// the phrase it searches for.
+    fn positional_self_resolution_findings(text: &str) -> Vec<&'static str> {
+        const NEEDLES: [&str; 5] = [
+            concat!("Unattended decision check", "points"),
+            concat!("resolve it rather than pau", "sing"),
+            concat!("nobody is com", "ing"),
+            concat!("positional proce", "dure"),
+            concat!("if DevFlow resumed you specific", "ally"),
+        ];
+        NEEDLES
+            .into_iter()
+            .filter(|needle| text.contains(needle))
+            .collect()
+    }
+
+    #[test]
+    fn every_stage_prompt_routes_questions_through_devflow_ask() {
+        let prompts = every_rendered_prompt();
+        assert_eq!(prompts.len(), 6 * 8, "six drivers times eight intents");
+        let mut wrong = Vec::new();
+        for (label, prompt) in &prompts {
+            let completion = prompt
+                .find(COMPLETION_HEADING)
+                .unwrap_or_else(|| panic!("{label}: no completion contract:\n{prompt}"));
+            match (prompt.matches(ASK_POLICY).count(), prompt.find(ASK_POLICY)) {
+                (1, Some(at)) if at < completion => {}
+                (1, Some(_)) => {
+                    wrong.push(format!("{label}: ask policy after the completion contract"))
+                }
+                (count, _) => wrong.push(format!("{label}: ask policy present {count} times")),
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    #[test]
+    fn no_prompt_template_carries_positional_self_resolution() {
+        let source = include_str!("prompt.rs");
+        let non_test_source = source
+            .split("\nmod tests {")
+            .next()
+            .expect("split yields at least one part");
+        assert!(
+            non_test_source.len() < source.len(),
+            "precondition: the source holds a `mod tests {{` line to cut at"
+        );
+        let mut found = Vec::new();
+        for (label, prompt) in every_rendered_prompt() {
+            for needle in positional_self_resolution_findings(&prompt) {
+                found.push(format!("{label}: {needle}"));
+            }
+        }
+        for needle in positional_self_resolution_findings(non_test_source) {
+            found.push(format!("prompt.rs non-test source: {needle}"));
+        }
+        assert!(found.is_empty(), "{found:#?}");
+    }
+
+    #[test]
+    fn the_positional_scan_trips_on_a_planted_copy() {
+        let planted = concat!(
+            "## Unattended decision check",
+            "points\n\nWhen you reach a `decision` checkpoint and no operator is available, \
+             resolve it rather than pau",
+            "sing: this run is unattended and nobody is com",
+            "ing."
+        );
+        let findings = positional_self_resolution_findings(planted);
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.contains("Unattended decision checkpoints")),
+            "{findings:?}"
+        );
+    }
+
+    /// The fragments the ask policy must carry: the namespaced tool name, the
+    /// server name and the `pending` re-call with its `question_id`.
+    fn missing_ask_policy_fragments(policy: &str) -> Vec<&'static str> {
+        [
+            "mcp__devflow__devflow_ask",
+            "server `devflow`",
+            "pending",
+            "question_id",
+        ]
+        .into_iter()
+        .filter(|fragment| !policy.contains(fragment))
+        .collect()
+    }
+
+    #[test]
+    fn the_ask_policy_names_the_namespaced_tool_and_the_pending_recall() {
+        assert_eq!(missing_ask_policy_fragments(ASK_POLICY), Vec::<&str>::new());
+
+        // Control: the policy with its `pending` sentence removed loses the
+        // re-call, and the check reports it.
+        let pending_sentence = ASK_POLICY
+            .split(". ")
+            .find(|sentence| sentence.contains("question_id"))
+            .expect("the policy has a sentence naming question_id");
+        let without_recall = ASK_POLICY.replace(pending_sentence, "");
+        assert!(
+            missing_ask_policy_fragments(&without_recall).contains(&"question_id"),
+            "{without_recall}"
         );
     }
 
@@ -1588,12 +1621,11 @@ mod tests {
     /// as a `.snap` diff in review instead of drifting unnoticed — the failure
     /// that produced Phase 47.
     ///
-    /// The committed baseline is DELIBERATELY the pre-fix capture: it carries the
-    /// `/gsd-execute-phase` fix command and no unattended decision-policy
-    /// section. That absence is the DECN-02 defect recorded as a reviewed
-    /// artifact; DECN-02's fix must drift this snapshot and re-bless it with the
-    /// content change asserted. Do not re-bless it to make a failure go away —
-    /// read the diff. `scripts/check.sh test` unsets `INSTA_FORCE_UPDATE` and
+    /// The DECN-02 pre-fix baseline is retired (53-06): the decision policy it
+    /// lacked is replaced by the question policy every stage prompt carries, so
+    /// the baseline now pins the `/gsd-execute-phase` fix command, the Code
+    /// policy and the question policy. Do not re-bless it to make a failure go
+    /// away — read the diff. `scripts/check.sh test` unsets `INSTA_FORCE_UPDATE` and
     /// pins `INSTA_UPDATE=no`, so a mismatch fails there rather than rewriting
     /// the baseline.
     #[test]
@@ -1903,11 +1935,11 @@ mod tests {
                 "Validation reported issues. Run the fix command for this loop:\n\n    {command}\n\n\
                 {CODE_STAGE_POLICY}\n\
                 \n\
-                {COMPLETION_PROTOCOL}"
+                {ASK_POLICY}{COMPLETION_PROTOCOL}"
             )
         } else {
             format!(
-                "Validation reported issues. Run the fix command for this loop:\n\n    {command}\n\n{COMPLETION_PROTOCOL}"
+                "Validation reported issues. Run the fix command for this loop:\n\n    {command}\n\n{ASK_POLICY}{COMPLETION_PROTOCOL}"
             )
         }
     }

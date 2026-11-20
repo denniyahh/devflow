@@ -71,6 +71,7 @@ pub mod monitor;
 pub mod outcome_policy;
 pub mod phase_id;
 pub mod prompt;
+pub mod question;
 pub mod registry;
 pub mod reset_time;
 pub mod stage;

@@ -5,7 +5,10 @@
 //! verified against the installed CLI (a `codex exec -a never` placement is
 //! rejected as an unknown argument).
 
-use super::{AgentDriver, InteractivityMode};
+use super::{
+    ASK_CLIENT_TIMEOUT_MARGIN_SECS, ASK_HOLD_CAP_SECS, AgentDriver, ArgPlacement, AskRegistration,
+    AskWiring, InteractivityMode,
+};
 use crate::phase_id::PhaseId;
 use std::path::PathBuf;
 
@@ -86,6 +89,48 @@ impl AgentDriver for CodexDriver {
             ("GIT_CONFIG_KEY_1".into(), "tag.gpgsign".into()),
             ("GIT_CONFIG_VALUE_1".into(), "false".into()),
         ]
+    }
+
+    fn ask_support(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// D-03: five `-c mcp_servers.devflow.*` overrides before the prompt. The
+    /// operator's own servers stay on (as for claude) and the tool is approved
+    /// without a prompt. OD-1 (b): the server holds one call at most
+    /// [`ASK_HOLD_CAP_SECS`], then replies `pending`, so the tool timeout is
+    /// the cap plus the margin (the spike saw codex cancel a held call at its
+    /// 300 s default, so its client must outlast the cap). Every string value
+    /// is escaped like the writable roots.
+    fn ask_wiring(&self, reg: &AskRegistration) -> Result<AskWiring, String> {
+        let (exe, _root) = reg.utf8_paths()?;
+        let quoted = |value: &str| format!("\"{}\"", escape_toml_basic_string(value));
+        let mut server_args = reg.server_args();
+        server_args.extend(["--hold-cap-secs".to_string(), ASK_HOLD_CAP_SECS.to_string()]);
+        let server_args = server_args
+            .iter()
+            .map(|arg| quoted(arg))
+            .collect::<Vec<_>>()
+            .join(",");
+        let overrides = [
+            format!("command={}", quoted(exe)),
+            format!("args=[{server_args}]"),
+            format!(
+                "tool_timeout_sec={}",
+                ASK_HOLD_CAP_SECS + ASK_CLIENT_TIMEOUT_MARGIN_SECS
+            ),
+            format!("default_tools_approval_mode={}", quoted("approve")),
+            "enabled=true".to_string(),
+        ];
+        let args = overrides
+            .into_iter()
+            .flat_map(|value| ["-c".to_string(), format!("mcp_servers.devflow.{value}")])
+            .collect();
+        Ok(AskWiring {
+            args,
+            placement: ArgPlacement::BeforeLast,
+            file: None,
+        })
     }
 
     fn interactivity_mode(&self, stage: crate::stage::Stage) -> InteractivityMode {
@@ -188,5 +233,99 @@ mod tests {
         let raw = std::ffi::OsString::from_vec(vec![b'/', b'r', b'e', b'p', b'o', 0xFF, b'x']);
         let roots = vec![PathBuf::from(raw)];
         let _ = CodexDriver.build_command(PhaseId::new(7), "prompt", &roots);
+    }
+
+    fn ask_registration(project_root: &str) -> crate::agents::AskRegistration {
+        crate::agents::AskRegistration {
+            exe: PathBuf::from("/opt/bin/devflow"),
+            project_root: PathBuf::from(project_root),
+            phase: PhaseId::new(7),
+            stage: crate::stage::Stage::Code,
+            timeout_secs: 120,
+            run_started_at: "2026-11-18T00:00:00Z".into(),
+            config_path: PathBuf::from("/unused/.devflow/ask-07.mcp.json"),
+        }
+    }
+
+    /// The value of the `-c` override for `key`, or a panic naming the key.
+    fn override_value<'a>(args: &'a [String], key: &str) -> &'a str {
+        let prefix = format!("mcp_servers.devflow.{key}=");
+        args.windows(2)
+            .find(|w| w[0] == "-c" && w[1].starts_with(&prefix))
+            .map(|w| &w[1][prefix.len()..])
+            .unwrap_or_else(|| panic!("no -c {prefix}… in {args:?}"))
+    }
+
+    /// D-03: codex gets the server through `-c mcp_servers.devflow.*` overrides
+    /// placed before the prompt: the command, its args with the hold cap, a
+    /// tool timeout of the cap plus the margin, approval without a prompt, and
+    /// enabled.
+    /// Every value is a TOML string escaped like the writable roots.
+    #[test]
+    fn launch_args_set_tool_timeout_and_approval_before_the_prompt() {
+        let wiring = CodexDriver
+            .ask_wiring(&ask_registration("/work/project"))
+            .expect("codex registers the server");
+        assert_eq!(wiring.placement, crate::agents::ArgPlacement::BeforeLast);
+        assert_eq!(wiring.file, None, "codex writes no file");
+        let args = &wiring.args;
+        assert_eq!(args.len(), 10, "five -c pairs: {args:?}");
+        assert_eq!(override_value(args, "command"), "\"/opt/bin/devflow\"");
+        assert_eq!(
+            override_value(args, "args"),
+            "[\"__ask\",\"--project\",\"/work/project\",\"--phase\",\"7\",\"--stage\",\
+             \"code\",\"--timeout-secs\",\"120\",\"--run-started-at\",\"2026-11-18T00:00:00Z\",\
+             \"--hold-cap-secs\",\"900\"]"
+        );
+        assert_eq!(override_value(args, "tool_timeout_sec"), "960");
+        assert_eq!(
+            override_value(args, "default_tools_approval_mode"),
+            "\"approve\""
+        );
+        assert_eq!(override_value(args, "enabled"), "true");
+
+        let hostile = CodexDriver
+            .ask_wiring(&ask_registration("/work/a\"b"))
+            .expect("codex registers the server");
+        let value = override_value(&hostile.args, "args");
+        assert!(
+            value.contains(r#""/work/a\"b""#),
+            "the quote in the project path is escaped: {value}"
+        );
+    }
+
+    /// OD-1 (b), production values: codex is held 900 s at most per call and its
+    /// client waits 960 s, so the server's `pending` reaches it first.
+    #[test]
+    fn codex_holds_up_to_the_cap_and_its_client_waits_longer() {
+        assert_eq!(ASK_HOLD_CAP_SECS, 900, "the hold cap");
+        assert_eq!(ASK_CLIENT_TIMEOUT_MARGIN_SECS, 60, "the client margin");
+        let client_timeout = ASK_HOLD_CAP_SECS + ASK_CLIENT_TIMEOUT_MARGIN_SECS;
+        assert!(
+            ASK_HOLD_CAP_SECS < client_timeout,
+            "the client outlasts the cap"
+        );
+        let wiring = CodexDriver
+            .ask_wiring(&ask_registration("/work/project"))
+            .expect("codex registers the server");
+        let args = override_value(&wiring.args, "args");
+        assert!(
+            args.ends_with(",\"--hold-cap-secs\",\"900\"]"),
+            "the server args carry the cap: {args}"
+        );
+        assert_eq!(override_value(&wiring.args, "tool_timeout_sec"), "960");
+    }
+
+    /// A non-UTF-8 project root is refused with an error, never a panic.
+    #[cfg(unix)]
+    #[test]
+    fn ask_wiring_refuses_a_non_utf8_project_root() {
+        use std::os::unix::ffi::OsStringExt;
+        let mut reg = ask_registration("/work/project");
+        reg.project_root = PathBuf::from(std::ffi::OsString::from_vec(vec![b'/', 0xFF]));
+        let refused = CodexDriver
+            .ask_wiring(&reg)
+            .expect_err("non-UTF-8 is refused");
+        assert!(refused.contains("not UTF-8"), "{refused}");
     }
 }

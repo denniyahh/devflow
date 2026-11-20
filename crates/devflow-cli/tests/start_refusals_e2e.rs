@@ -827,3 +827,114 @@ fn a_dry_run_names_every_check_it_skipped() {
         );
     }
 }
+
+/// A dir holding one success-reporting stub per program in `programs`.
+fn fake_agents(programs: &[&str]) -> FakeBin {
+    let dir = tempfile::tempdir().unwrap();
+    for program in programs {
+        let path = dir.path().join(program);
+        fs::write(&path, SUCCESS_AGENT).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = dir.path().to_path_buf();
+    FakeBin { _dir: dir, path }
+}
+
+/// `devflow start --phase 12 --mode supervise` plus `args` over `root`, with stubs of
+/// `programs` on the hermetic `PATH`.
+fn start_with_agents(
+    home: &common::HermeticHome,
+    root: &Path,
+    programs: &[&str],
+    args: &[&str],
+) -> (Output, common::LaunchedRunReaper) {
+    let reaper = common::LaunchedRunReaper::for_home(home, root, PhaseId::new(PHASE));
+    let fake_bin = fake_agents(programs);
+    let parent = std::env::var_os("PATH").unwrap_or_default();
+    let output = common::hermetic_devflow(home)
+        .args([
+            "start",
+            "--phase",
+            &PHASE.to_string(),
+            "--mode",
+            "supervise",
+        ])
+        .args(args)
+        .arg(root)
+        .hermetic_path(format!(
+            "{}:{}",
+            fake_bin.path.display(),
+            parent.to_string_lossy()
+        ))
+        .env("DEVFLOW_TEST_ROOT", root)
+        .env("DEVFLOW_GATE_TIMEOUT_SECS", "60")
+        .current_dir(root)
+        .output()
+        .expect("run devflow start");
+    (output, reaper)
+}
+
+/// Whether the fake service manager launched any unit for `home`.
+fn no_unit_started(home: &common::HermeticHome) -> bool {
+    !common::entries_under(&home.service_bin())
+        .iter()
+        .any(|path| path.extension().is_some_and(|ext| ext == "pid"))
+}
+
+/// Assert `out` refused naming `agent` and `devflow_ask`, not as a missing binary, and
+/// that no unit started.
+fn assert_refused_without_registration(home: &common::HermeticHome, out: &Output, agent: &str) {
+    let text = combined(out);
+    assert!(
+        !out.status.success(),
+        "start with {agent} must refuse: {text}"
+    );
+    assert!(
+        text.contains(agent) && text.contains("devflow_ask"),
+        "the refusal does not name {agent} and devflow_ask: {text}"
+    );
+    assert!(
+        !text.contains("not found — is it installed?"),
+        "the missing-binary refusal fired first for {agent}: {text}"
+    );
+    assert!(
+        no_unit_started(home),
+        "a unit was started for {agent}: {text}"
+    );
+}
+
+/// Operator answers (2) and OD-2: `start` refuses antigravity, hermes and opencode,
+/// each with its program stubbed so only the ask check can refuse, before any unit
+/// starts.
+#[test]
+fn start_refuses_an_agent_without_an_ask_registration() {
+    for (agent, program) in [
+        ("antigravity", "agy"),
+        ("hermes", "hermes"),
+        ("opencode", "opencode"),
+    ] {
+        let home = common::HermeticHome::new();
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        init_repo(root);
+        let (out, _reaper) = start_with_agents(&home, root, &[program], &["--agent", agent]);
+        assert_refused_without_registration(&home, &out, agent);
+    }
+}
+
+/// Operator answer (2): a fallback agent without a registration is refused at `start`
+/// (`validate_fallback_agent`), before any unit starts.
+#[test]
+fn start_refuses_a_fallback_agent_without_an_ask_registration() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let (out, _reaper) = start_with_agents(
+        &home,
+        root,
+        &["codex", "agy"],
+        &["--agent", "codex", "--fallback-agent", "antigravity"],
+    );
+    assert_refused_without_registration(&home, &out, "antigravity");
+}
