@@ -354,6 +354,16 @@ closing this phase.
 - [x] 53-14-PLAN.md
 **UI hint**: no
 
+### Phase 53.1: Phase 53 remediation (INSERTED)
+
+**Goal:** Fix the DevFlow defects found while dogfooding Phase 53 and in the PR #245 review, plus the backlog items earmarked for this phase (operator, 2026-11-19), so the next dogfooded phase runs without the workarounds Phase 53 needed. In scope: 999.250, 999.251, 999.252, 999.253, 999.254, 999.255, 999.257, 999.258 (from the Phase 53 run and review), and 999.240, 999.249, 999.219, 999.213, 999.206, 999.202, 999.201, 999.193, 999.189 (earmarked backlog). Some of the earmarked items may already be fixed by Phases 52–53; discuss checks each one against the current code and drops or narrows those, with the evidence.
+**Requirements**: TBD (one per in-scope 999.x item, set in discuss)
+**Depends on:** Phase 53
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (run /gsd-plan-phase 53.1 to break down)
+
 ### Phase 54: Decision Triage
 
 **Goal**: DevFlow answers the questions a calibrated model can answer and escalates the rest. A decision model (Jev or
@@ -592,6 +602,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 53 | 14/14 | In Progress | — |
 | 54 | 0/? | Not started | — |
 | 55 | 0/? | Not started | — |
+| 53.1. Phase 53 remediation | 0/0 | Not started | - |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
 
@@ -843,6 +854,21 @@ creates the file before `printf` writes to it, so the read can return an empty s
 **Not established:** no failure has been seen yet. It is a candidate for unexplained flakes (see .planning/user/CI-FAILURES.md).
 **Fix shape:** have the hook write to a temp file and `mv` it into place, or poll until the content contains the question.
 **Owner:** the remediation phase after 53.
+
+### Phase 999.259: A Finished DevFlow Run Leaves the Phase "In Progress" in GSD, and a Post-Validate Fix Makes Its Verification Stale (BACKLOG)
+
+**Earmarked (session 2026-11-20):** Phase 53.1, if the operator agrees.
+
+**What happened:** Phase 53's run ended as finished (Validate passed, GSD verification `passed`). But GSD's `phase.complete` never
+ran, so STATE.md still read `current_phase: 53` / `status: executing` and the ROADMAP progress row still read In Progress.
+execute-phase runs `phase.complete` only on a passing verification. Under DevFlow the first verification was `human_needed`,
+and the `/gsd-quick` route that later marked it `passed` does not run it. Running `phase.complete 53` by hand after
+close-out was refused: "Verification is stale — covered source files changed after the verifier last ran". The PR-review fix
+(999.256) changed ask_server.rs after Validate.
+**Not established:** whether DevFlow or GSD should own the completion step.
+**Fix shape:** have DevFlow's finish route run GSD's `phase.complete` (or route to the GSD step that does). Give close-out a
+documented way to re-verify after a review fix, e.g. run the fix on the phase branch through the run's Validate before finish.
+**Owner:** Phase 53.1.
 
 ### Phase 999.258: Minor Findings From the PR #245 Review (BACKLOG)
 
