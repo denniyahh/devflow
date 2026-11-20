@@ -787,6 +787,41 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.256: A Failed Abort Save in devflow_ask Still Closes the Question Gate, So the Run Can Miss the Abort (BACKLOG)
+
+**Source:** graphify-labs review of PR #245 (head f2c8349), confirmed against the source 2026-11-20.
+**What happens:** `consume` (crates/devflow-cli/src/ask_server.rs:1192) calls `record_abort_request` (:1237). If
+`workflow::update_state` fails there, the failure is only logged. `consume` still claims the answer and returns
+`AbortedByOperator`, and the server then closes the gate. The runner's backstop for leftover question gates reads open
+gates only, so when the state write failed, `abort_requested` is never set and the stage result is routed as normal.
+The doc comment calls the log-only path deliberate.
+**Not established:** no run has hit a failed state write; this was found by reading the code, not reproduced.
+**Fix shape:** have `record_abort_request` return its result; on Err, `consume` returns `Unanswered::Failed` without
+claiming, so the gate stays open and the runner's backstop applies the abort. Add a test that injects a state-write
+failure. **Owner:** decided by the operator for PR #245.
+
+### Phase 999.257: `a_question_fires_the_notify_hook_and_records_notify_fired` Can Read the Marker Before the Hook Writes It (BACKLOG)
+
+**Source:** graphify-labs review of PR #245 (unconfirmed lead), confirmed by reading crates/devflow-cli/tests/ask_e2e.rs:266-285.
+**What happens:** the test waits for `marker.exists()`, then reads the file. The hook's shell redirection
+creates the file before `printf` writes to it, so the read can return an empty string and the `contains` assertion fails.
+**Not established:** no failure has been seen yet. It is a candidate for unexplained flakes (see .planning/user/CI-FAILURES.md).
+**Fix shape:** have the hook write to a temp file and `mv` it into place, or poll until the content contains the question.
+**Owner:** the remediation phase after 53.
+
+### Phase 999.258: Minor Findings From the PR #245 Review (BACKLOG)
+
+**Source:** graphify-labs review of PR #245. Each finding was checked against source (triage in
+.planning/audits/2026-11-20-graphify-review-triage-pr245.md).
+- `open_question_gate_id` (crates/devflow-cli/src/commands.rs:3160) drops an unparsable gate id with `.ok()` and gives no
+  warning, while the other failure paths warn. Fix: match on the result and `tracing::warn!` on Err.
+- `cancel` in ask_server.rs (:365-370) records a late cancel for an id that has already finished, and nothing removes it.
+  A later call that reuses the id then gets no reply. This is minor, because JSON-RPC ids are meant to be unique. Fix:
+  record a cancel only for an id that is queued or in flight.
+- The doc comment at crates/devflow-cli/src/preflight.rs:1355 says pi is refused `devflow_ask`, but pi is now admitted
+  (agents/pi.rs:77). Correct the comment.
+**Owner:** the remediation phase after 53.
+
 ### Phase 999.255: The `--live-payload` Fixture Has No CONTEXT.md, So a Codex Proof Run Cannot Start (BACKLOG)
 
 **Earmarked (operator 2026-11-19):** the remediation phase directly after Phase 53.
