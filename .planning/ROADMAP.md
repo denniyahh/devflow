@@ -60,7 +60,7 @@ replies (Telegram and similar) are a later milestone (REMOTE-01/02 under `REQUIR
 | 52 | Subtract and Stabilize | CUT-01, CUT-02, CUT-03, CUT-04, GATE-01, GATE-02, GATE-03, GATE-04, OPS-01, OPS-02, OPS-03, OPS-04 | — (Phase 51, v3.0.0, merged) | Executed — verification stale |
 | 52.1 | Stabilize for Dogfooding (INSERTED) | backlog 999.221, 999.222, 999.223, 999.232, 999.224, 999.219, 999.229, 999.230, 999.231, 999.167 (no REQ IDs; plans bind to D-01..D-27) | 52 | Complete    |
 | 52.2 | Foreground Runner (INSERTED) | none (carries 52.1's D-11, D-09.1, D-09.5, D-20, D-24, D-26, D-27, D-08, D-15) | 52.1 | Complete    |
-| 53 | The Question Channel | ASK-01, ASK-02, ASK-03, ASK-04, ASK-05 | 52.2 (and through it 52.1 and 52 — the stage set must be final) | Not started |
+| 53 | The Question Channel | ASK-01, ASK-02, ASK-03, ASK-04, ASK-05 | 52.2 (and through it 52.1 and 52 — the stage set must be final) | Complete    |
 | 54 | Decision Triage | TRIAGE-01, TRIAGE-02, TRIAGE-03, TRIAGE-04 | 53 (its recorded questions are the bake-off corpus) | Not started |
 | 55 | Failover Generalized | FAIL-01, FAIL-02, FAIL-03, FAIL-04, FAIL-05, FAIL-06 | 52 (independent of 53-54; sequenced last) | Not started |
 
@@ -322,7 +322,7 @@ closing this phase.
      record — the history view distinguishes "not yet answered" from an empty answer, and a run that asked nothing
      shows no question rows. (ASK-04)
 
-**Plans**: 14/14 plans executed
+**Plans**: 14/14 plans complete
 **Wave 1**
 - [x] 53-01-PLAN.md
 - [x] 53-02-PLAN.md
@@ -933,14 +933,14 @@ tree. **Owner:** next fix branch.
 
 **Found:** 2026-11-19, Phase 53 dogfood run, Code stage (GSD gap, outside DevFlow).
 **What happened:** after all 14 plans committed, execute-phase's TDD review blocked completion (53-11 test-only, no
-RED commit; 53-13 RED not committed apart from the code). The workflow names `/gsd-execute-phase {phase} --n` as the
-override and itself calls it "documented, not-yet-implemented" (`~/.claude/gsd-core/workflows`), so the only path is an
+RED commit; 53-13 RED not committed apart from the code). The workflow names `/gsd-execute-phase {phase} --force-mvp-gate` as
+the override and itself calls it "the documented, not-yet-implemented escape hatch" (`workflows/execute-phase/steps/verify-phase-goal.md`), so the only path is an
 operator gate. DevFlow read it as `stage_failure` (the 999.249 shape).
 **Evidence:** `.devflow/events.jsonl` phase 53 `advance_evaluated` failed at 1795112717; 53-11-SUMMARY line 69 (mutation
 controls show the failing direction); 53-13-SUMMARY line 66 (RED observed before each change, not committed).
 **Not established:** whether a relaunch with an accepting note gets past the review, or blocks again.
 **Fix shape (not decided):** upstream: implement the override, or let the review accept a SUMMARY-recorded RED and a
-test-only plan whose controls fail. **Owner:** upstream gsd-core issue; DevFlow side rides 999.249.
+test-only plan whose controls fail. **Owner:** upstream open-gsd/gsd-core#6451 (filed 2026-11-20); DevFlow side rides 999.249.
 
 ### Phase 999.251: `devflow resume` After an `--until` Stop Re-Runs the Stage That Already Finished (BACKLOG)
 

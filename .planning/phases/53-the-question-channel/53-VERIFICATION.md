@@ -4,7 +4,7 @@ verified: 2026-11-19T19:30:00Z
 status: passed
 score: 4/4 must-haves verified
 covered_files: [".gitignore",".planning/phases/53-the-question-channel/53-01-PLAN.md",".planning/phases/53-the-question-channel/53-01-SUMMARY.md",".planning/phases/53-the-question-channel/53-02-PLAN.md",".planning/phases/53-the-question-channel/53-02-SUMMARY.md",".planning/phases/53-the-question-channel/53-03-PLAN.md",".planning/phases/53-the-question-channel/53-03-SUMMARY.md",".planning/phases/53-the-question-channel/53-04-PLAN.md",".planning/phases/53-the-question-channel/53-04-SUMMARY.md",".planning/phases/53-the-question-channel/53-05-PLAN.md",".planning/phases/53-the-question-channel/53-05-SUMMARY.md",".planning/phases/53-the-question-channel/53-06-PLAN.md",".planning/phases/53-the-question-channel/53-06-SUMMARY.md",".planning/phases/53-the-question-channel/53-07-PLAN.md",".planning/phases/53-the-question-channel/53-07-SUMMARY.md",".planning/phases/53-the-question-channel/53-08-PLAN.md",".planning/phases/53-the-question-channel/53-08-SUMMARY.md",".planning/phases/53-the-question-channel/53-09-PLAN.md",".planning/phases/53-the-question-channel/53-09-SUMMARY.md",".planning/phases/53-the-question-channel/53-10-PLAN.md",".planning/phases/53-the-question-channel/53-10-SUMMARY.md",".planning/phases/53-the-question-channel/53-11-PLAN.md",".planning/phases/53-the-question-channel/53-11-SUMMARY.md",".planning/phases/53-the-question-channel/53-12-PLAN.md",".planning/phases/53-the-question-channel/53-12-SUMMARY.md",".planning/phases/53-the-question-channel/53-13-PLAN.md",".planning/phases/53-the-question-channel/53-13-SUMMARY.md",".planning/phases/53-the-question-channel/53-14-PLAN.md",".planning/phases/53-the-question-channel/53-14-SUMMARY.md","ARCHITECTURE.md","OPERATIONS.md","crates/devflow-cli/src/ask_server.rs","crates/devflow-cli/src/commands.rs","crates/devflow-cli/src/main.rs","crates/devflow-cli/src/pipeline_gate.rs","crates/devflow-cli/src/pipeline_launch.rs","crates/devflow-cli/src/pipeline_outcomes.rs","crates/devflow-cli/src/preflight.rs","crates/devflow-cli/src/test_support.rs","crates/devflow-cli/tests/ask_checkpoint_e2e.rs","crates/devflow-cli/tests/ask_e2e.rs","crates/devflow-cli/tests/ask_launch_e2e.rs","crates/devflow-cli/tests/common/ask_client.rs","crates/devflow-cli/tests/common/mod.rs","crates/devflow-cli/tests/failover_e2e.rs","crates/devflow-cli/tests/fallback_agent_config.rs","crates/devflow-cli/tests/gitignore_coverage.rs","crates/devflow-cli/tests/phase7_cli.rs","crates/devflow-cli/tests/start_refusals_e2e.rs","crates/devflow-core/src/agent_result.rs","crates/devflow-core/src/agents/antigravity.rs","crates/devflow-core/src/agents/claude.rs","crates/devflow-core/src/agents/codex.rs","crates/devflow-core/src/agents/mod.rs","crates/devflow-core/src/agents/pi.rs","crates/devflow-core/src/doc_check.rs","crates/devflow-core/src/events.rs","crates/devflow-core/src/gates.rs","crates/devflow-core/src/history.rs","crates/devflow-core/src/lib.rs","crates/devflow-core/src/liveness.rs","crates/devflow-core/src/mode.rs","crates/devflow-core/src/monitor.rs","crates/devflow-core/src/prompt.rs","crates/devflow-core/src/question.rs","crates/devflow-core/src/snapshots/devflow_core__prompt__tests__claude_style_full_execute_fix_prompt_snapshot.snap","crates/devflow-core/src/snapshots/devflow_core__prompt__tests__full_execute_fix_prompt_antigravity.snap","crates/devflow-core/src/snapshots/devflow_core__prompt__tests__full_execute_fix_prompt_claude.snap","crates/devflow-core/src/snapshots/devflow_core__prompt__tests__full_execute_fix_prompt_codex.snap","crates/devflow-core/src/snapshots/devflow_core__prompt__tests__full_execute_fix_prompt_hermes.snap","crates/devflow-core/src/snapshots/devflow_core__prompt__tests__full_execute_fix_prompt_opencode.snap","crates/devflow-core/src/snapshots/devflow_core__prompt__tests__full_execute_fix_prompt_pi.snap","crates/devflow-core/src/state.rs","crates/devflow-core/src/verify.rs","scripts/hooks/post-commit"]
-covered_digest: "v4:sha256:d1e9013f664cf5249530a2606f33722282e8bb2f81817d22debc752b073a5ed6"
+covered_digest: "v4:sha256:8f4df38554d4c30fc8966722984903b34455d82ce7b052e0c538b28207560ef8"
 behavior_unverified: 0
 overrides_applied: 1
 overrides:
@@ -143,3 +143,18 @@ No blocking gap found. The channel, the operator-via-gate policy, the prompts, t
 
 _Verified: 2026-11-19T19:30:00Z_
 _Verifier: Claude (gsd-verifier)_
+
+## Post-verification change (hand correction, 2026-11-20)
+
+The verifier did not re-run after the change below. The operator chose to refresh `covered_digest` by hand rather than
+re-run execute-phase, because the re-run would only re-confirm what the change's own test already shows, and
+execute-phase's TDD review blocks before the verifier (`--force-mvp-gate` is not implemented upstream). The digest was
+recomputed with `gsd-tools query verification.fingerprint` over the unchanged `covered_files` list. Logged in
+`~/.config/agents/gsd-manual-fix-incidents.md` (2026-11-20, phase 53 digest refresh).
+
+Covered files changed after the verifier ran:
+- cddcc58 `fix(53): keep an abort the run state cannot save on its open gate` (PR #245 review, 999.256):
+  `crates/devflow-cli/src/ask_server.rs`. Its test `ask_server::tests::an_abort_the_state_cannot_save_stays_unclaimed_on_its_gate`
+  failed on the old code with "an unsaved abort must stay on its gate" (negative control) and passes on the fix; the
+  merged PR #245 passed CI.
+- c8b2880 and 53ac5c1: phase-directory notes only (53-PROOF-RUN.md run exceptions, the validation re-audit). No code.
