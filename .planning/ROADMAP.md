@@ -787,7 +787,103 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.255: The `--live-payload` Fixture Has No CONTEXT.md, So a Codex Proof Run Cannot Start (BACKLOG)
+
+**Earmarked (operator 2026-11-19):** the remediation phase directly after Phase 53.
+
+**Found:** 2026-11-20, Phase 53 proof run M3 (gap in the fixture and in 53-VALIDATION's M3 text).
+**What happened:** M3 says "as M2 with `--agent codex` on a fresh fixture". `devflow start --agent codex` refuses: "phase 1
+has no CONTEXT.md on `integration`, and OpenAI Codex cannot run an interactive discussion headless"
+(`crates/devflow-cli/src/commands.rs:760`, the driver's `RequiresExistingArtifact` pre-flight). The refusal is correct;
+`scripts/scratch-dogfood-repo.sh --live-payload` writes no `01-CONTEXT.md`, so only claude can start on it.
+**Path taken:** the session committed a short fixture `01-CONTEXT.md` on the fixture's `integration` branch and started
+again (recorded in 53-PROOF-RUN.md).
+**Fix shape:** have `--live-payload` write a minimal CONTEXT.md (and pin it in `--selftest`), or give the script a
+`--for-agent` switch. **Owner:** the remediation phase after 53.
+
+### Phase 999.254: A Validate Gate Whose Sign-Offs Can Only Run After the Run Ends Has No Way to Finish (BACKLOG)
+
+**Earmarked (operator 2026-11-19):** the remediation phase directly after Phase 53.
+
+**Found:** 2026-11-19, Phase 53 dogfood run, Validate gate (gap).
+**What happened:** GSD's verifier left `human_needed` items (53-VALIDATION M1–M4) whose own precondition is "no live runner
+for the phase". Approving a `human_needed` gate reads GSD again and reopens the gate (pipeline_outcomes.rs tests near
+7628, 8253), so the run finishes only once the proofs pass, and the proofs wait for the run to end. Abort ends it as
+aborted, not finished.
+**Evidence:** `gate_fired` validate kind `human_needed` at 1795120536; 53-VALIDATION.md M1 precondition.
+**Path taken:** operator option 1 (2026-11-19): the phase head was installed to a separate root in the session scratch
+and the proofs run with it while the runner waits; recorded in the phase notes.
+**Fix shape (not decided):** let a plan's post-run proofs be declared as such (the verifier does not hold Validate on
+them), or a gate answer that ends the run as "finished, sign-offs pending". **Owner:** the remediation phase after 53.
+
+### Phase 999.253: The Post-Commit Hook Rewrites a Tracked File, So a Phase Tree Is Never Clean for Validate (BACKLOG)
+
+**Earmarked (operator 2026-11-19):** the remediation phase directly after Phase 53.
+
+**Duplicate of 999.240** (same marker, same dirty tree); kept for the Validate-gate evidence.
+**Found:** 2026-11-19, Phase 53 dogfood run, Validate gate (defect in repo tooling, outside the phase).
+**What happened:** `.planning/user/errors/state-stale.json` is tracked and rewritten after commits (new
+`stale_since_commit`, `summaries_landed`), so the worktree is dirty after the last plan's commit. Validate's gate then
+says "a Validate pass counts only on a clean tree". The same dirty file was left in the 52.1 and 52.2 worktrees; 52.1
+committed it by hand twice (`9ff41ba`, `4a46f7c`).
+**Evidence:** `gate_fired` validate phase 53 at 1795120536; `git -C .worktrees/phase-53 diff` of that file.
+**Not established:** which hook writes it (`scripts/hooks/post-commit` is the first suspect, not read).
+**Fix shape (not decided):** untrack the marker (gitignore it) or have the writer commit nothing and keep it outside the
+tree. **Owner:** next fix branch.
+
+### Phase 999.252: GSD's End-of-Phase TDD Review Blocks With No Working Override (BACKLOG)
+
+**Earmarked (operator 2026-11-19):** the remediation phase directly after Phase 53.
+
+**Found:** 2026-11-19, Phase 53 dogfood run, Code stage (GSD gap, outside DevFlow).
+**What happened:** after all 14 plans committed, execute-phase's TDD review blocked completion (53-11 test-only, no
+RED commit; 53-13 RED not committed apart from the code). The workflow names `/gsd-execute-phase {phase} --n` as the
+override and itself calls it "documented, not-yet-implemented" (`~/.claude/gsd-core/workflows`), so the only path is an
+operator gate. DevFlow read it as `stage_failure` (the 999.249 shape).
+**Evidence:** `.devflow/events.jsonl` phase 53 `advance_evaluated` failed at 1795112717; 53-11-SUMMARY line 69 (mutation
+controls show the failing direction); 53-13-SUMMARY line 66 (RED observed before each change, not committed).
+**Not established:** whether a relaunch with an accepting note gets past the review, or blocks again.
+**Fix shape (not decided):** upstream: implement the override, or let the review accept a SUMMARY-recorded RED and a
+test-only plan whose controls fail. **Owner:** upstream gsd-core issue; DevFlow side rides 999.249.
+
+### Phase 999.251: `devflow resume` After an `--until` Stop Re-Runs the Stage That Already Finished (BACKLOG)
+
+**Earmarked (operator 2026-11-19):** the remediation phase directly after Phase 53.
+
+**Found:** 2026-11-19, Phase 53 dogfood run, `devflow resume --phase 53` after `--until plan` (defect).
+**What happened:** the `--until` halt in `crates/devflow-cli/src/pipeline_gate.rs` (`state.stop_until == Some(from)`)
+stops the run without `s.stage = to`, so the saved stage stays `plan`. `resume` relaunches the saved stage, so it
+launched a full Plan stage again before moving to Code.
+**Evidence:** `.devflow/events.jsonl` phase 53: `workflow_finished` reason `stopped_at` stage plan (1795034067), then on
+resume `stage_launched` plan (1795092796) → `advance_evaluated` success (1795092806) → `transition` plan→code. The
+capture `.devflow/history/phase-53/1795092806316369043-1-stdout`: 2 turns, 6.8 s, $0.38, one tool call
+(`ls .planning/phases/53-*/53-*PLAN.md`), result `success`.
+**Impact:** harmless this time because the agent saw the plans and stopped. A Plan agent that did replan would
+overwrite the hand-run `--reviews` replan the dogfood procedure puts between `--until plan` and `resume`.
+**Not established:** whether GSD plan-phase always short-circuits on existing plans (it did once here).
+**Fix shape (not decided):** record the halt as "stopped before <next stage>" (set `stage = to` with `stopped`), or have
+`resume` on a `stopped_at` run start at the next stage. **Owner:** next fix branch after Phase 53.
+
+### Phase 999.250: A Rate-Limit Gate Offers "Approve: Relaunches Now" When the Limit Resets Days Later (BACKLOG)
+
+**Earmarked (operator 2026-11-19):** the remediation phase directly after Phase 53.
+
+**Found:** 2026-11-19, Phase 53 dogfood run, Code stage (enhancement, not a defect).
+**Gap:** Claude hit its weekly limit mid-Code; with no fallback set, the gate offered "approve: relaunches the code stage
+now on the same agent" while its own text gave a reset 2¼ days out. Approving before the reset relaunches into the same
+limit. The reset is shown only as a raw epoch (`1795294800`), and the gate does not name `devflow resume --agent` as the
+way to continue on another agent.
+**Evidence:** `devflow status` 2026-11-19 15:29 UTC, pending gate "rate limited with no usable fallback … the limit resets
+at 1795294800"; stdout capture `api_error: usage_limit_reached`, "resets Nov 21, 4pm (America/New_York)". The operator
+reset the limit by hand and approved at 15:56 UTC; the stage relaunched about 50 s after `gate_response_written`.
+**Not established:** whether approve before the reset re-fails at once or burns a launch first (not run).
+**Fix shape (not decided):** print the reset as a UTC time and its distance; when it is beyond a threshold, put
+`devflow gate abort` + `devflow resume --phase N --agent <other>` (or `--fallback-agent`) ahead of approve.
+**Owner:** with or after Phase 53, alongside 999.249's gate-text work.
+
 ### Phase 999.249: A Stage That Ends Needing an Operator Decision Gets a "Stage Failed" Gate Whose Answer Is "Reject" (BACKLOG)
+
+**Earmarked (operator 2026-11-19):** the remediation phase directly after Phase 53.
 
 **Found:** 2026-11-18, Phase 53 dogfood run, Plan stage (enhancement, not a defect).
 **Gap:** the Plan agent stopped because it needed two operator decisions; DevFlow can only read that as a failed stage, so
@@ -907,6 +1003,8 @@ back into Validate. **Evidence:** 52.2-PROOF-RUN.md attempt 1, gate text "[never
 base and warn or refuse before launching, naming the `.gitignore` lines to add. **Owner:** a later phase.
 
 ### Phase 999.240: The Post-Commit Stale-State Marker Leaves the Phase Worktree Dirty, So an Installed Build Reads `dirty` (BACKLOG)
+
+**Earmarked (operator 2026-11-19):** the remediation phase directly after Phase 53.
 
 **Found:** 2026-11-17, Phase 52.2 plan 52.2-19 Task 1, before the install.
 **Defect:** `scripts/hooks/post-commit` rewrites the tracked `.planning/user/errors/state-stale.json` after a SUMMARY
@@ -1266,6 +1364,8 @@ so this is needed only before the next real cut: take it at the v4.0 milestone c
 
 ### Phase 999.219: `devflow resume` (and `start --no-worktree`) Commits GSD's First Chain-Flag Write as a "Killed Run" Leak Repair (BACKLOG)
 
+**Earmarked (operator 2026-11-19):** the remediation phase directly after Phase 53.
+
 **Found:** 2026-11-10, Phase 52 plan check after the round-5 review (`52-plan-review-5`), from source; not
 reproduced live. A project whose committed `.planning/config.json` has no `workflow._auto_chain_active` key gets
 `"_auto_chain_active": false` added, uncommitted, by GSD's own `/gsd-plan-phase` (`plan-phase/steps/auto-advance-check.md`
@@ -1362,6 +1462,8 @@ never runs discuss there (D-14, `define_stage_prompt`), and the dry run still cl
 removes a stage that costs money and time and can only fail. Stability phase.
 
 ### Phase 999.213: `devflow cleanup` Misreports a Stopped Run as "Halted via --until", Contradicts Itself, and `--force` Leaves the State Behind (BACKLOG)
+
+**Earmarked (operator 2026-11-19):** the remediation phase directly after Phase 53.
 
 **Found:** 2026-11-08, live failover probe on the merged Phase 51 build (`fad00ff`), throwaway project; report `.planning/audits/2026-11-08-live-failover-probe.md`.
 After `devflow stop --phase 1`, `devflow cleanup` printed: "keeping worktree … halted via --until; run `devflow resume`
@@ -1507,6 +1609,8 @@ plant the old order as a failing control. OPERATIONS.md's residual sentence is c
 
 ### Phase 999.206: A Failure Gate Keeps Only 300 Characters of the Reason, and `gate show` Cannot Show the Rest (BACKLOG)
 
+**Earmarked (operator 2026-11-19):** the remediation phase directly after Phase 53.
+
 **Found:** 2026-11-08, Phase 51, Code failure gate `18e6265d44ff61fa`. The Code agent's reason was about 480 characters.
 `truncate_reason` (`pipeline_outcomes.rs`) capped it at 300 before it entered the `advance_evaluated` event, the gate
 context and the notification. The cut-off part was the actionable half: "execute-phase cannot close the new gap: it needs
@@ -1574,6 +1678,8 @@ a planted off-by-N citation as a failing control. Phase 52.
 
 ### Phase 999.202: `devflow status` Shows Nothing About an Armed or Spent Fallback Agent (BACKLOG — enhancement)
 
+**Earmarked (operator 2026-11-19):** the remediation phase directly after Phase 53.
+
 **Found:** 2026-11-08, Phase 51 external adversarial review (DeepSeek lane). `fallback_agent` / `fallback_consumed` in
 state have no reader outside the failover path, so an operator cannot tell from `status` whether a fallback is armed or
 already used. Adjacent to 999.190 (status never shows `stop_reason`).
@@ -1581,6 +1687,8 @@ already used. Adjacent to 999.190 (status never shows `stop_reason`).
 **Fix shape:** one `status` line, e.g. `fallback: antigravity (armed)` / `(used)`; take together with 999.190.
 
 ### Phase 999.201: A Stream `result` With `subtype: error_rate_limit` Is Classified Failed, Not RateLimited (BACKLOG — suspected)
+
+**Earmarked (operator 2026-11-19):** the remediation phase directly after Phase 53.
 
 **Found:** 2026-11-08, Phase 51 external adversarial review (codex lane, with a parser probe). The same result line
 returns `RateLimited` as a single document but `Failed` once a stream init event precedes it: the stream path reads
@@ -1670,6 +1778,8 @@ an explicit re-check), and make `--agent <same>` say what it did instead of noth
 
 ### Phase 999.193: The Validate Gate Says "Validation Passed — Approve to Ship?" While the Phase's Verification Reports `gaps_found` (BACKLOG)
 
+**Earmarked (operator 2026-11-19):** the remediation phase directly after Phase 53.
+
 **Found:** 2026-11-08, Phase 51 re-validate after the review fix round. The Code stage's `/gsd-execute-phase` re-ran the
 verifier, which committed `51-VERIFICATION.md` with `status: gaps_found` (`fe1971a`: README.md:110 over-promises after
 the `devflow parallel` fix). Validate then ran `/gsd-validate-phase 51`, returned `verdict: pass` (it audits test coverage,
@@ -1745,6 +1855,8 @@ run; no test covers `devflow resume --agent` after the WR-02 stop.
 test asserts the WR-02 reason text appears. Small; fits the next fix branch or Phase 52.
 
 ### Phase 999.189: A Gate Rejection's Note Never Reaches the Fix Pass, and Any Note Containing "abort" Aborts the Run (BACKLOG)
+
+**Earmarked (operator 2026-11-19):** the remediation phase directly after Phase 53.
 
 **Found:** 2026-11-08, Phase 51 Validate gate, by reading v3.0.0 before answering it.
 
