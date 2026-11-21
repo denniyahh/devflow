@@ -43,7 +43,11 @@ pub fn rate_limit_wait_bound(now: i64, reset_at: i64, gate_timeout_secs: u64) ->
 /// the rate-limit gate shows its reset in (D-04). Seconds are dropped, not
 /// rounded.
 pub fn format_utc(epoch_secs: i64) -> String {
-    epoch_secs.to_string()
+    let (year, month, day) = civil_from_days(epoch_secs.div_euclid(SECS_PER_DAY));
+    let secs_of_day = epoch_secs.rem_euclid(SECS_PER_DAY);
+    let hour = secs_of_day / SECS_PER_HOUR;
+    let minute = secs_of_day % SECS_PER_HOUR / SECS_PER_MINUTE;
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02} UTC")
 }
 
 /// The exact UTC instant, in Unix epoch seconds, that `input` names.
@@ -205,7 +209,6 @@ pub(crate) fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
 
 /// The proleptic-Gregorian `(year, month, day)` of the day `days` after
 /// 1970-01-01.
-#[cfg(test)]
 pub(crate) fn civil_from_days(days: i64) -> (i32, u32, u32) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);

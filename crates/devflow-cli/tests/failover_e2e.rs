@@ -1061,7 +1061,7 @@ fn a_rate_limited_claude_run_without_a_fallback_waits_at_a_gate() {
         String::from_utf8_lossy(&shown.stderr)
     );
     assert!(
-        shown_text.contains(&resets_at.to_string()),
+        shown_text.contains(&devflow_core::reset_time::format_utc(resets_at)),
         "the gate names the reset time from the denial: {shown_text}"
     );
     assert!(
