@@ -5458,6 +5458,53 @@ mod tests {
         );
     }
 
+    /// 999.206 (D-02): a failure reason past the stored bound is cut with a
+    /// suffix naming the phase's own capture file, and the stored reason stays
+    /// within the bound. Control: a 1000-character reason is stored whole.
+    #[test]
+    fn a_cut_failure_reason_names_the_phase_capture_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(5234);
+        let state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Auto,
+            dir.path().to_path_buf(),
+        );
+        let stored_reason = |context: &str| -> String {
+            let note = decisions_note_sentence(phase, Stage::Code, None);
+            let (_, after) = context
+                .split_once(" stage code failed: ")
+                .expect("the failure marker");
+            after
+                .strip_suffix(&note)
+                .expect("the decisions sentence trails")
+                .to_string()
+        };
+        let long = "r".repeat(5000);
+        let context = failure_gate_context(&state, Stage::Code, Some(long));
+        let reason = stored_reason(&context);
+        let suffix = format!(
+            "… [truncated; full output in .devflow/phase-{}-stdout]",
+            phase.padded()
+        );
+        let tail: String = reason.chars().rev().take(80).collect::<Vec<_>>().into_iter().rev().collect();
+        assert!(
+            reason.ends_with(&suffix),
+            "the cut names the capture file, last 80: {tail}"
+        );
+        assert!(
+            reason.chars().count() <= GATE_CONTEXT_STORED_MAX_CHARS,
+            "the stored reason stays within the bound: {}",
+            reason.chars().count()
+        );
+
+        let short = "s".repeat(1000);
+        let context = failure_gate_context(&state, Stage::Code, Some(short.clone()));
+        assert_eq!(stored_reason(&context), short, "control: stored whole");
+        assert!(!context.contains("[truncated"), "control: no cut");
+    }
+
     /// The stored bound's edges, counted in characters, never bytes: a reason
     /// of exactly [`GATE_CONTEXT_STORED_MAX_CHARS`] characters, multi-byte ones
     /// among them, is stored unchanged; one character more, with multi-byte
