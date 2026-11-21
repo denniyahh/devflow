@@ -139,17 +139,19 @@ fn rate_limit_gate_context(
     reason: Option<String>,
     now: i64,
 ) -> String {
-    let _ = now;
     let agent = if state.agent == AgentKind::Claude {
         String::new()
     } else {
         format!(" --agent {}", state.agent)
     };
     let retry_after = retry_after_from_reason(reason.as_deref());
-    let reset = if reset_time::parse_reset_time(&retry_after).is_some() {
-        format!("the limit resets at {retry_after}")
-    } else {
-        "the denial carried no reset time".to_string()
+    let reset = match reset_time::parse_reset_time(&retry_after) {
+        Some(at) => format!(
+            "the limit resets at {}, {}",
+            reset_time::format_utc(at),
+            reset_distance(at, now)
+        ),
+        None => "the denial carried no reset time".to_string(),
     };
     let lead = format!(
         "rate limited with no usable fallback; once this waiting supervisor has ended, \
@@ -161,6 +163,27 @@ fn rate_limit_gate_context(
         None,
         &stage_failure_context(stage, &lead, reason),
     )
+}
+
+/// How far `reset` lies past `now`, in the two largest whole units that fit
+/// (D-04): `in 2 d 5 h`, `in 1 h 5 m`, `in 4 m`, `in under a minute`, or
+/// `already passed` once `reset` is not after `now`.
+fn reset_distance(reset: i64, now: i64) -> String {
+    const MINUTE: i64 = 60;
+    const HOUR: i64 = 60 * MINUTE;
+    const DAY: i64 = 24 * HOUR;
+    let left = reset.saturating_sub(now);
+    if left <= 0 {
+        "already passed".to_string()
+    } else if left >= DAY {
+        format!("in {} d {} h", left / DAY, left % DAY / HOUR)
+    } else if left >= HOUR {
+        format!("in {} h {} m", left / HOUR, left % HOUR / MINUTE)
+    } else if left >= MINUTE {
+        format!("in {} m", left / MINUTE)
+    } else {
+        "in under a minute".to_string()
+    }
 }
 
 /// The three-way outcome of a Validate stage evaluation (18e, D-18e).
@@ -5806,6 +5829,7 @@ mod tests {
             },
             |_| {},
         );
+        let reset = epoch_now_for_test() + 3600;
 
         let at_gate = state_on_disk_at_gate(root, phase, Stage::Code, || {
             handle_rate_limited_outcome(
@@ -5813,7 +5837,7 @@ mod tests {
                 &mut state,
                 phase,
                 Stage::Code,
-                Some("rate limited until 2099-06-18T15:45:30Z".into()),
+                Some(format!("rate limited until {reset}")),
             )
             .unwrap();
         });
@@ -5832,7 +5856,10 @@ mod tests {
             .find(&format!("`devflow resume --phase {phase}`"))
             .expect("the context names the resume command");
         let reset = context
-            .find("the limit resets at 2099-06-18T15:45:30Z")
+            .find(&format!(
+                "the limit resets at {}",
+                reset_time::format_utc(reset)
+            ))
             .expect("the context names the reset time");
         let cause = context
             .find("Cause: rate limited until")
@@ -5879,6 +5906,18 @@ mod tests {
             context.contains("the denial carried no reset time"),
             "control: {context}"
         );
+    }
+
+    /// The current time in epoch seconds, the base a test's reset is
+    /// computed from, so no fixed epoch ages from future to past.
+    fn epoch_now_for_test() -> i64 {
+        i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -8446,13 +8485,14 @@ mod tests {
             state.stage = stage;
             state.canary = Some(devflow_core::canary::CanaryOutcome::Absent);
             workflow::save_state(&state).unwrap();
+            let reset_at = epoch_now_for_test() + 3600;
             let (gate, _) = at_the_gate(root, phase, stage, &abort_answer(), || {
                 let _ = handle_rate_limited_outcome(
                     root,
                     &mut state,
                     phase,
                     stage,
-                    Some("rate limited until 2099-06-18T15:45:30Z".into()),
+                    Some(format!("rate limited until {reset_at}")),
                 );
             });
             assert_eq!(gate["gate_kind"], "rate_limit", "{row}: {gate}");
@@ -8478,7 +8518,7 @@ mod tests {
             // (with `--agent`, the run is on codex) and the reset time, both
             // inside the shared display cut the banner and notify hook show.
             let resume = format!("`devflow resume --phase {phase} --agent codex`");
-            let reset = "the limit resets at 2099-06-18T15:45:30Z";
+            let reset = format!("the limit resets at {}", reset_time::format_utc(reset_at));
             let shown_after_sentence = |context: &str| {
                 let shown: String = context
                     .chars()
@@ -8489,7 +8529,7 @@ mod tests {
                     let rest = &shown[after..];
                     rest.starts_with(&format!(" stage {stage} failed: "))
                         && rest.contains(&resume)
-                        && rest.contains(reset)
+                        && rest.contains(&reset)
                 })
             };
             assert!(
