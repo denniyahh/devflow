@@ -5,16 +5,16 @@ milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: "53.1"
 current_phase_name: Phase 53 remediation
 status: executing
-stopped_at: Completed 53.1-03-PLAN.md
-last_updated: "2026-11-21T20:05:31.079Z"
+stopped_at: Completed 53.1-04-PLAN.md
+last_updated: "2026-11-21T20:12:28.928Z"
 last_activity: 2026-11-21
 last_activity_desc: Phase 53.1 execution started
-state_head: ca76a8a397064b589b1f13c1db34a117aa807b56
+state_head: 1eb26fc8e9a60763c16fcd25196f65f406f31e06
 progress:
   total_phases: 7
   completed_phases: 1
   total_plans: 88
-  completed_plans: 83
+  completed_plans: 84
   percent: 14
 ---
 
@@ -172,7 +172,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 53.1 (Phase 53 remediation) — EXECUTING
-Plan: 4 of 8
+Plan: 5 of 8
 Status: Ready to execute
 Last activity: 2026-11-21 — Phase 53.1 execution started
 
@@ -1045,6 +1045,8 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 53.1]: 53.1-02: a far gate names the run's fallback only when it is spent; otherwise <other>, since resume --agent onto an unused fallback is refused
 - [Phase 53.1]: resume past a fired --until cap advances via the shared pipeline_gate::enter_stage, judged on a never-written clone before any write; transition is recorded before agent_handoff (999.251)
 - [Phase 53.1]: ask_server records a cancel only for the in-flight id, read under the queue lock; a cancel for an id neither queued nor in flight is dropped (999.258)
+- [Phase 53.1]: cleanup prints 'removed nothing; kept N' when it removed nothing but kept N; 'no worktrees to clean up' only when nothing was kept
+- [Phase 53.1]: an unparsable question gate id warns with phase, stage, gate id and error, and still reads as no question gate
 
 ## Roadmap Evolution
 
@@ -1239,11 +1241,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 53.1 P01 | 25min | 2 tasks | 2 files |
 | Phase 53.1 P02 | 14 min | 2 tasks | 4 files |
 | Phase 53.1 P03 | 11min | 2 tasks | 4 files |
+| Phase 53.1 P04 | 7min | 2 tasks | 2 files |
 
 ## Session
 
-**Last session:** 2026-11-21T20:05:29.548Z
-**Stopped at:** Completed 53.1-03-PLAN.md
+**Last session:** 2026-11-21T20:12:27.430Z
+**Stopped at:** Completed 53.1-04-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
