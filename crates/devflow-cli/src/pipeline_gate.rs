@@ -181,15 +181,20 @@ pub(crate) const FINISHED_STOP_REASON: &str =
 /// [`FINISHED_STOP_REASON`], and the supervisor record and `gate_pending` are
 /// cleared, as `transition`'s `--until` halt does, so `doctor` never reads the
 /// finished run as a crashed one. The phase leaves the machine-global gate
-/// registry. Nothing else is touched: no git call, no hook, no merge, push,
-/// tag or branch deletion, so the operator gets the tree as Validate left it.
+/// registry. It then has GSD mark the phase complete and commit the files GSD
+/// wrote, through
+/// [`crate::pipeline_outcomes::record_gsd_phase_complete`] (D-10), which
+/// records `gsd_phase_complete` and never fails the finish. Nothing else is
+/// touched: no merge, push, tag or branch deletion, so apart from GSD's
+/// commit the operator gets the tree as Validate left it.
 ///
 /// It takes a [`FinishPermit`] by value, which only
 /// [`crate::pipeline_outcomes::can_finish`] makes (D-45 rule 1), so no run is
 /// recorded finished without a fresh `passed` and a Validate pass on HEAD.
 ///
 /// It emits `workflow_finished` with `{"reason":"finished","shipped":false}`,
-/// then fires the notify command once and records `notify_fired`. It does not
+/// then runs GSD's completion, then fires the notify command once and records
+/// `notify_fired`. It does not
 /// read `stop_until`: with `--until validate` a passing Validate is a finish,
 /// not a halt, because Validate is the last stage.
 pub(crate) fn finish_run(
