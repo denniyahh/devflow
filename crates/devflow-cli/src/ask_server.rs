@@ -368,13 +368,17 @@ fn next_call(flags: &CallFlags, worker: &mut impl Worker) -> Option<PendingCall>
 
 /// Record a client's cancel of `request_id`. A call still queued is removed,
 /// so it opens no gate, records no event and gets no reply; a call already
-/// taken by the worker sees its id in the cancelled set.
+/// taken by the worker sees its id in the cancelled set. A cancel for an id
+/// neither queued nor in flight is dropped (D-12): JSON-RPC ids may be reused,
+/// and a recorded id nothing would remove would silence the next call with it.
+/// Both reads happen under the queue lock, so a pop between them cannot drop a
+/// real cancel.
 fn cancel(flags: &CallFlags, request_id: &Value) {
     let id_text = request_id.to_string();
     let mut queue = lock(&flags.queue);
     let queued = queue.len();
     queue.retain(|pending| pending.id_text != id_text);
-    if queue.len() == queued {
+    if queue.len() == queued && lock(&flags.in_flight).as_deref() == Some(id_text.as_str()) {
         lock(&flags.cancelled).insert(id_text);
     }
 }
