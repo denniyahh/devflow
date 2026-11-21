@@ -5,16 +5,16 @@ milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: "53.1"
 current_phase_name: Phase 53 remediation
 status: executing
-stopped_at: Completed 53.1-04-PLAN.md
-last_updated: "2026-11-21T20:12:28.928Z"
+stopped_at: Completed 53.1-05-PLAN.md
+last_updated: "2026-11-21T20:18:54.170Z"
 last_activity: 2026-11-21
 last_activity_desc: Phase 53.1 execution started
-state_head: 1eb26fc8e9a60763c16fcd25196f65f406f31e06
+state_head: 5df26d28e3692e6b0b58a4c68e68f42b25659f08
 progress:
   total_phases: 7
   completed_phases: 1
   total_plans: 88
-  completed_plans: 84
+  completed_plans: 85
   percent: 14
 ---
 
@@ -172,7 +172,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 53.1 (Phase 53 remediation) — EXECUTING
-Plan: 5 of 8
+Plan: 6 of 8
 Status: Ready to execute
 Last activity: 2026-11-21 — Phase 53.1 execution started
 
@@ -1047,6 +1047,7 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 53.1]: ask_server records a cancel only for the in-flight id, read under the queue lock; a cancel for an id neither queued nor in flight is dropped (999.258)
 - [Phase 53.1]: cleanup prints 'removed nothing; kept N' when it removed nothing but kept N; 'no worktrees to clean up' only when nothing was kept
 - [Phase 53.1]: an unparsable question gate id warns with phase, stage, gate id and error, and still reads as no question gate
+- [Phase 53.1]: 53.1-05: post-commit stale-state marker lives in the per-worktree git dir (git rev-parse --git-path devflow-stale-state.json); old path ignored by .planning/user/errors/.gitignore while the main checkout runs the old hook
 
 ## Roadmap Evolution
 
@@ -1242,11 +1243,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 53.1 P02 | 14 min | 2 tasks | 4 files |
 | Phase 53.1 P03 | 11min | 2 tasks | 4 files |
 | Phase 53.1 P04 | 7min | 2 tasks | 2 files |
+| Phase 53.1 P05 | 25min | 3 tasks | 10 files |
 
 ## Session
 
-**Last session:** 2026-11-21T20:12:27.430Z
-**Stopped at:** Completed 53.1-04-PLAN.md
+**Last session:** 2026-11-21T20:18:52.644Z
+**Stopped at:** Completed 53.1-05-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps

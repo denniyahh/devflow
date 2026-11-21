@@ -359,7 +359,7 @@ closing this phase.
 **Goal:** Fix the DevFlow defects found while dogfooding Phase 53 and in the PR #245 review, plus the backlog items earmarked for this phase (operator, 2026-11-19), so the next dogfooded phase runs without the workarounds Phase 53 needed. In scope: 999.250, 999.251, 999.252, 999.253, 999.254, 999.255, 999.257, 999.258 (from the Phase 53 run and review), and 999.240, 999.249, 999.219, 999.213, 999.206, 999.202, 999.201, 999.193, 999.189 (earmarked backlog). Some of the earmarked items may already be fixed by Phases 52–53; discuss checks each one against the current code and drops or narrows those, with the evidence.
 **Requirements**: TBD (one per in-scope 999.x item, set in discuss)
 **Depends on:** Phase 53
-**Plans:** 4/8 plans executed
+**Plans:** 5/8 plans executed
 
 Plans:
 **Wave 1**
@@ -367,7 +367,7 @@ Plans:
 - [x] 53.1-02-PLAN.md — rate-limit gate: reset as UTC time and distance, far reset leads with stop then `resume --agent` (999.250) (wave 1)
 - [x] 53.1-03-PLAN.md — resume after `--until` starts the next stage (999.251); late cancel and pi comment (999.258) (wave 1)
 - [x] 53.1-04-PLAN.md — cleanup of a stopped run stops contradicting itself (999.213); unparsable question gate id warns (999.258) (wave 1)
-- [ ] 53.1-05-PLAN.md — post-commit marker out of the tree (999.240/253), live-payload CONTEXT.md (999.255), atomic notify marker (999.257) (wave 1)
+- [x] 53.1-05-PLAN.md — post-commit marker out of the tree (999.240/253), live-payload CONTEXT.md (999.255), atomic notify marker (999.257) (wave 1)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 - [ ] 53.1-06-PLAN.md — stage-failure decisions note (999.249), capture-file suffix and gate show pin (999.206), post-run sign-off route (999.254) (wave 2)
@@ -616,7 +616,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 53 | 14/14 | In Progress | — |
 | 54 | 0/? | Not started | — |
 | 55 | 0/? | Not started | — |
-| 53.1. Phase 53 remediation | 4/8 | In Progress | - |
+| 53.1. Phase 53 remediation | 5/8 | In Progress | - |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
 
