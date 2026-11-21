@@ -77,12 +77,12 @@ Phase 51 (Rate-Limit Agent Failover) closed v3.0.0 on 2026-11-08: see `.planning
 
 ## Project Reference
 
-See: `.planning/PROJECT.md` (updated 2026-11-17)
+See: `.planning/PROJECT.md` (updated 2026-11-21)
 
 **Core value:** a coding session that outlives any one agent — the session is the repository, so another agent
 continues the same work when one runs out of quota or budget, and the run asks a human only for the decisions nothing
 else can make (restated by the operator 2026-11-08).
-**Current focus:** Phase 53.1 — Phase 53 remediation
+**Current focus:** Phase 54 — Decision Triage
 
 ## Operator Next Steps
 
