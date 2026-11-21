@@ -9686,6 +9686,43 @@ mod tests {
         assert!(!rendered.contains('\u{1b}'));
     }
 
+    /// 999.206: `gate show` prints a 1000-character failure reason whole, as
+    /// the failure gate stored it.
+    #[test]
+    fn gate_show_prints_a_long_failure_reason_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(5235);
+        let state = State::new(phase, AgentKind::Claude, Mode::Auto, dir.path().to_path_buf());
+        let cause: String = "a check kept failing; "
+            .chars()
+            .cycle()
+            .take(950)
+            .chain("x".repeat(49).chars())
+            .chain(std::iter::once('Z'))
+            .collect();
+        assert_eq!(cause.chars().count(), 1000);
+        let context =
+            crate::pipeline_outcomes::failure_gate_context(&state, Stage::Code, Some(cause.clone()));
+        Gates::write_gate(
+            dir.path(),
+            phase,
+            Stage::Code,
+            devflow_core::gates::GateKind::StageFailure,
+            &context,
+        )
+        .unwrap();
+        let gate = Gates::list_open(dir.path())
+            .into_iter()
+            .find(|g| g.phase == phase)
+            .unwrap();
+
+        let rendered = render_gate_show(&gate, None);
+
+        let tail: String = cause.chars().skip(950).collect();
+        assert!(rendered.contains(&tail), "the cause's last 50: {rendered}");
+        assert!(!rendered.contains("[truncated"), "{rendered}");
+    }
+
     #[test]
     fn gate_show_errors_naming_gate_list_when_no_open_gate() {
         let dir = tempfile::tempdir().unwrap();
