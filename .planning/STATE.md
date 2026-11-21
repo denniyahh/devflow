@@ -5,16 +5,16 @@ milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: "53.1"
 current_phase_name: Phase 53 remediation
 status: executing
-stopped_at: Completed 53.1-01-PLAN.md
-last_updated: "2026-11-21T19:36:02.560Z"
+stopped_at: Completed 53.1-02-PLAN.md
+last_updated: "2026-11-21T19:52:14.570Z"
 last_activity: 2026-11-21
 last_activity_desc: Phase 53.1 execution started
-state_head: 2ae724010681f997d34eb4717560261a2e1de6db
+state_head: 49e780ecc73d2ae8e81f17635ec94012f37ccaae
 progress:
   total_phases: 7
   completed_phases: 1
   total_plans: 88
-  completed_plans: 81
+  completed_plans: 82
   percent: 14
 ---
 
@@ -172,7 +172,7 @@ change earns 2.0.
 ## Current Position
 
 Phase: 53.1 (Phase 53 remediation) — EXECUTING
-Plan: 2 of 8
+Plan: 3 of 8
 Status: Ready to execute
 Last activity: 2026-11-21 — Phase 53.1 execution started
 
@@ -1040,6 +1040,9 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 53]: 53-14: pi holds one call at most 900 s (ASK_HOLD_CAP_SECS) with a 960 s per-server timeout; pi cancels at its 60 s default
 - [Phase 53]: 53-14: owned-file rule for registrations outside .devflow/ not built; no driver writes one
 - [Phase 53.1]: 53.1-01: stream rate-limit detector reads rate_limit_event then the final top-level result subtype, each read returning None from every exit
+- [Phase 53.1]: 53.1-02: RATE_LIMIT_FAR_RESET_SECS is 6 h, a constant with no env var
+- [Phase 53.1]: 53.1-02: a far rate-limit gate names the route (stop, then resume --agent) before the reset so it survives the 450-char display cut
+- [Phase 53.1]: 53.1-02: a far gate names the run's fallback only when it is spent; otherwise <other>, since resume --agent onto an unused fallback is refused
 
 ## Roadmap Evolution
 
@@ -1232,11 +1235,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 53 P13 | 19 min | 3 tasks | 10 files |
 | Phase 53 P14 | 26min | 3 tasks | 12 files |
 | Phase 53.1 P01 | 25min | 2 tasks | 2 files |
+| Phase 53.1 P02 | 14 min | 2 tasks | 4 files |
 
 ## Session
 
-**Last session:** 2026-11-21T19:36:01.002Z
-**Stopped at:** Completed 53.1-01-PLAN.md
+**Last session:** 2026-11-21T19:52:12.883Z
+**Stopped at:** Completed 53.1-02-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
