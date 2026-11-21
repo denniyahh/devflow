@@ -2325,25 +2325,44 @@ fn stage_failure_context(stage: Stage, lead: &str, reason: Option<String>) -> St
 /// `canary_refusal` input, says so and names `devflow resume --phase N --agent
 /// <other>`. It leads, before the reason, because the notify hook carries this
 /// context to an operator who decides from it alone, and the banner and
-/// `gate list` show only its start.
+/// `gate list` show only its start. The context ends with
+/// [`decisions_note_sentence`], rendered from the same `canary_refusal`: it
+/// trails the reason so the leading part inside the display cut, and the
+/// idle-timeout clause's 23 characters of slack in it, stay as they were;
+/// `gate show` prints the whole context.
 pub(crate) fn failure_gate_context(state: &State, stage: Stage, reason: Option<String>) -> String {
     let canary_refusal = recorded_canary_refusal(state);
-    lead_with_way_on(
+    let context = lead_with_way_on(
         GateKind::StageFailure,
         (state.phase, stage),
         canary_refusal.as_deref(),
         &stage_failure_context(stage, "", reason),
-    )
+    );
+    let note = decisions_note_sentence(state.phase, stage, canary_refusal.as_deref());
+    format!("{context}{note}")
 }
 
-/// The sentence a stage-failure gate ends with for a stage that stopped for
-/// operator decisions (D-05, 999.249).
-fn decisions_note_sentence(
-    _phase: PhaseId,
-    _stage: Stage,
-    _canary_refusal: Option<&str>,
-) -> String {
-    String::new()
+/// The sentence a stage-failure gate ends with (D-05, 999.249): a stage agent
+/// that stopped for operator decisions is answered with `devflow gate reject
+/// N --note "<decisions>"`, and the note reaches the relaunched stage agent's
+/// prompt. It names `gate reject`, never a bare `--note`, because `gate
+/// approve` also takes `--note` and a stage-failure approve retries the stage
+/// without it. Under a recorded delivery canary refusal (`canary_refusal`) the
+/// reject stops the run instead, so the note is kept for the `devflow resume
+/// --phase N --agent <other>` that relaunches the stage. Its one answer word
+/// is that command's `reject`, a route this gate runs (C2).
+fn decisions_note_sentence(phase: PhaseId, stage: Stage, canary_refusal: Option<&str>) -> String {
+    let answer = format!(
+        " If the agent asks for operator decisions, answer with `devflow gate reject {phase} \
+         --note \"<decisions>\"`: the note "
+    );
+    match canary_refusal {
+        None => format!("{answer}reaches the relaunched {stage} agent's prompt."),
+        Some(_) => format!(
+            "{answer}is kept for the `devflow resume --phase {phase} --agent <other>` that \
+             relaunches the {stage} stage."
+        ),
+    }
 }
 
 /// Fire the never-silent failure gate with [`failure_gate_context`].
@@ -5428,9 +5447,10 @@ mod tests {
             .collect::<String>();
         assert_eq!(cause.chars().count(), 1000);
         let context = failure_gate_context(&state, Stage::Code, Some(cause.clone()));
+        let note = decisions_note_sentence(state.phase, Stage::Code, None);
         assert!(
-            context.ends_with(&format!(" stage code failed: {cause}")),
-            "the whole cause is stored, last: {context}"
+            context.contains(&format!(" stage code failed: {cause}{note}")),
+            "the whole cause is stored, then the decisions sentence: {context}"
         );
         assert!(
             context.chars().count() > crate::commands::GATE_CONTEXT_DISPLAY_CHARS,
@@ -5485,9 +5505,10 @@ mod tests {
         );
         let sentence = way_on_sentence(GateKind::StageFailure, phase, Stage::Code, None);
         let context = failure_gate_context(&state, Stage::Code, Some("the build broke".into()));
+        let note = decisions_note_sentence(phase, Stage::Code, None);
         assert_eq!(
             context,
-            format!("[never-silent] {sentence} stage code failed: the build broke")
+            format!("[never-silent] {sentence} stage code failed: the build broke{note}")
         );
         assert_eq!(
             lead_with_way_on(GateKind::StageFailure, (phase, Stage::Code), None, ""),
@@ -8847,6 +8868,27 @@ mod tests {
                 let admitting = way_on_sentence(GateKind::StageFailure, phase, stage, None);
                 let refusing = way_on_sentence(GateKind::StageFailure, phase, stage, Some(refusal));
                 let resume = format!("`devflow resume --phase {phase} --agent <other>`");
+                // D-05: the one answer word admitted after the way-on is the
+                // `reject` of the decisions sentence, on a gate whose reject
+                // route is offered.
+                let canary_refusal = refuses.then_some(refusal);
+                assert!(
+                    !matches!(
+                        reject_route_by_kind(
+                            Some(GateKind::StageFailure),
+                            canary_refusal,
+                            RENDERED_NOTE
+                        ),
+                        RejectRoute::Refused(_)
+                    ),
+                    "{row}: the reject route is offered"
+                );
+                let note = decisions_note_sentence(phase, stage, canary_refusal);
+                let check = |row: &str, context: &str, sentence: &str| {
+                    if let Err(why) = leads_with_only_allowing(context, sentence, &note) {
+                        panic!("{row}: {why}");
+                    }
+                };
                 if refuses {
                     check(&row, context, &refusing);
                     assert!(
@@ -8857,7 +8899,7 @@ mod tests {
                     // Control: the admitting sentence on a refusing run fails.
                     let planted = context.replacen(&refusing, &admitting, 1);
                     assert!(
-                        leads_with_only(&planted, &refusing).is_err(),
+                        leads_with_only_allowing(&planted, &refusing, &note).is_err(),
                         "{row}: control: {planted}"
                     );
                 } else {
