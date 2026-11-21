@@ -671,6 +671,19 @@ or the re-verify pass on its own. A gate context quotes GSD's status as GSD prin
 and says `passed` only when GSD reported `passed`, apart from the way-on
 sentence that leads every verification gate, whose finish rule names `passed`.
 
+Sign-offs that can only run after the run ends. A `human_needed` report can
+ask for proofs that need the parked run to be over, such as a live run of the
+build the phase made. The `human_needed` gate, and the gate an approve reopens
+over a fresh `human_needed`, name the route: install the phase head to a
+separate root while the gate waits, `cargo install --path crates/devflow-cli
+--locked --root <scratch>`, and run `<scratch>/bin/devflow` for the proofs,
+while the parked run keeps the installed binary. Then answer with
+`devflow gate reject N --note "<sign-offs done and results>"`, which runs
+`/gsd-quick` with the note and Validate again. Name `gate reject`: `gate
+approve` also takes `--note`, and an approve reads GSD again and reopens the
+gate without it. DevFlow does not judge the sign-offs itself (Phase 52
+D-45/D-46): GSD's next read decides.
+
 What a run records:
 
 - Each Validate read is one `gsd_verification` event: the agent's verdict and

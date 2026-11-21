@@ -1356,6 +1356,23 @@ fn emit_verification_read(
 /// verbatim, and says `passed` only when GSD did (GATE-03). Both lead with the
 /// way-on sentence the routers render (GATE-04, C2); the cause after it names
 /// no answer.
+/// The route a `human_needed` gate names for sign-offs that can only run
+/// after the run ends (D-06, 999.254), the Phase 53 close-out route: run them
+/// with a build installed to a separate root while the gate waits, then answer
+/// with `devflow gate reject N --note "<sign-offs done and results>"`, which
+/// runs `/gsd-quick` with the note and Validate again. It names `gate reject`
+/// because `gate approve` also takes `--note` and would reopen the gate
+/// without it; that `reject` is its one answer word, a route these gates run
+/// (C2). Appended to the first `human_needed` gate and to its reopen.
+fn post_run_sign_off_route(phase: PhaseId) -> String {
+    format!(
+        " A sign-off that can only run after this run ends: run it with a build installed to \
+         a separate root while this gate waits (OPERATIONS.md, How Validate decides), then \
+         answer with `devflow gate reject {phase} --note \"<sign-offs done and results>\"`: \
+         `/gsd-quick` records them and Validate runs again."
+    )
+}
+
 fn validate_gate_context(
     kind: GateKind,
     round: (AgentVerdict, &Evidence),
@@ -1434,6 +1451,9 @@ fn validate_gate_context(
         | GateKind::Preflight
         | GateKind::Question => "",
     });
+    if kind == GateKind::HumanNeeded {
+        message.push_str(&post_run_sign_off_route(state.phase));
+    }
     // WR-04 (35-REVIEW): the ceiling clause belongs on every Validate gate that
     // fired at the ceiling, a passing one included, or an operator running
     // unattended Auto cannot tell why it fired. F-6: conditioned on the ceiling
@@ -1874,8 +1894,9 @@ fn reopen_verification_gate(
     let (kind, context, event_context) = match &evidence.read {
         Ok(report) => {
             let context = format!(
-                "GSD verification, read again: {}. GSD still needs a human sign-off.",
-                gsd_status_name(report.status)
+                "GSD verification, read again: {}. GSD still needs a human sign-off.{}",
+                gsd_status_name(report.status),
+                post_run_sign_off_route(state.phase)
             );
             (GateKind::HumanNeeded, context.clone(), context)
         }
@@ -2310,7 +2331,12 @@ pub(crate) fn truncate_reason(reason: &str) -> String {
 /// `reason` stored whole up to [`bound_stage_reason`]'s bound. `lead` goes
 /// before the reason, so it survives the pending-gate banner's and `gate
 /// list`'s display bound whatever the reason's length.
-fn stage_failure_context(phase: PhaseId, stage: Stage, lead: &str, reason: Option<String>) -> String {
+fn stage_failure_context(
+    phase: PhaseId,
+    stage: Stage,
+    lead: &str,
+    reason: Option<String>,
+) -> String {
     format!(
         "[never-silent] stage {stage} failed: {lead}{}",
         bound_stage_reason(
@@ -5512,7 +5538,14 @@ mod tests {
             "… [truncated; full output in .devflow/phase-{}-stdout]",
             phase.padded()
         );
-        let tail: String = reason.chars().rev().take(80).collect::<Vec<_>>().into_iter().rev().collect();
+        let tail: String = reason
+            .chars()
+            .rev()
+            .take(80)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
         assert!(
             reason.ends_with(&suffix),
             "the cut names the capture file, last 80: {tail}"
@@ -6692,12 +6725,13 @@ mod tests {
             }
         }
 
-        // Control: a `gaps_found` gate does not carry the route.
+        // Control: a `gaps_found` gate does not carry the route (Supervise,
+        // since Auto loops a `gaps_found` back to Plan without a gate).
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(5237);
         let _gsd = validate_evidence(root, phase, &[gsd_says(GsdStatus::GapsFound)]);
-        let mut state = validate_state(root, phase, Mode::Auto);
+        let mut state = validate_state(root, phase, Mode::Supervise);
         let (gate, _) = at_the_validate_gate(root, phase, &abort_answer(), || {
             let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Passed);
         });
@@ -8653,6 +8687,24 @@ mod tests {
                 panic!("{row}: {why}");
             }
         };
+        // D-06: on a `human_needed` gate, whose reject route is offered, the
+        // one answer word admitted after the way-on is the `reject` of the
+        // post-run sign-off route.
+        let check_human_needed = |row: &str, context: &str, phase: PhaseId| {
+            assert!(
+                !matches!(
+                    reject_route_by_kind(Some(GateKind::HumanNeeded), None, RENDERED_NOTE),
+                    RejectRoute::Refused(_)
+                ),
+                "{row}: the reject route is offered"
+            );
+            let allowed = post_run_sign_off_route(phase);
+            if let Err(why) =
+                leads_with_only_allowing(context, &verification_sentence(phase), &allowed)
+            {
+                panic!("{row}: {why}");
+            }
+        };
         let mut verification_contexts: Vec<(String, String)> = Vec::new();
 
         // The Validate outcome's verification writers.
@@ -8773,7 +8825,11 @@ mod tests {
             });
             assert_eq!(gate["gate_kind"], kind, "{row}: {gate}");
             let context = gate["context"].as_str().unwrap().to_string();
-            check(&row, &context, &verification_sentence(phase));
+            if kind == "human_needed" {
+                check_human_needed(&row, &context, phase);
+            } else {
+                check(&row, &context, &verification_sentence(phase));
+            }
             verification_contexts.push((kind.to_string(), context));
         }
 
@@ -8802,11 +8858,12 @@ mod tests {
             );
             assert_eq!(gates[1]["gate_kind"], reopened, "{:?}", gates[1]);
             let context = gates[1]["context"].as_str().unwrap();
-            check(
-                &format!("reopen {reopened}"),
-                context,
-                &verification_sentence(phase),
-            );
+            let row = format!("reopen {reopened}");
+            if reopened == "human_needed" {
+                check_human_needed(&row, context, phase);
+            } else {
+                check(&row, context, &verification_sentence(phase));
+            }
         }
 
         // The gaps Plan gates: no new gap plan, at and below the ceiling, and
