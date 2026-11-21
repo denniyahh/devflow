@@ -9692,7 +9692,12 @@ mod tests {
     fn gate_show_prints_a_long_failure_reason_whole() {
         let dir = tempfile::tempdir().unwrap();
         let phase = PhaseId::new(5235);
-        let state = State::new(phase, AgentKind::Claude, Mode::Auto, dir.path().to_path_buf());
+        let state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Auto,
+            dir.path().to_path_buf(),
+        );
         let cause: String = "a check kept failing; "
             .chars()
             .cycle()
@@ -9701,8 +9706,11 @@ mod tests {
             .chain(std::iter::once('Z'))
             .collect();
         assert_eq!(cause.chars().count(), 1000);
-        let context =
-            crate::pipeline_outcomes::failure_gate_context(&state, Stage::Code, Some(cause.clone()));
+        let context = crate::pipeline_outcomes::failure_gate_context(
+            &state,
+            Stage::Code,
+            Some(cause.clone()),
+        );
         Gates::write_gate(
             dir.path(),
             phase,
