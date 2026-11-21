@@ -533,16 +533,47 @@ fn commit_completion(home: &Path, root: &Path, phase: PhaseId, files: &[&str]) -
     }
 }
 
-/// A `phase.complete` that did not run or was refused: printed, and recorded
-/// by its event-safe label. The run stays finished.
+/// A `phase.complete` that did not run or was refused: GSD's full text on
+/// stderr, and an event with the failure's label, GSD's reason code and
+/// GSD's own message made event-safe (D-10). Only GSD's text enters the
+/// event: every other failure class records its label with `message: null`.
+/// No commit runs, and the run stays finished.
 fn completion_refused(
     phase: PhaseId,
     failure: &ReaderFailure,
-    _root: &Path,
-    _home: Option<&Path>,
+    root: &Path,
+    home: Option<&Path>,
 ) -> Value {
     eprintln!("GSD did not mark phase {phase} complete; the run is still finished: {failure}");
-    serde_json::json!({ "ok": false, "failure": failure.label() })
+    let (reason, message) = match failure {
+        ReaderFailure::Exit { message, .. } => gsd_refusal_text(message),
+        ReaderFailure::GsdError { message } => (None, Some(message.clone())),
+        _ => (None, None),
+    };
+    serde_json::json!({
+        "ok": false,
+        "failure": failure.label(),
+        "reason": reason,
+        "message": message.map(|text| event_safe_text(&text, root, home)),
+    })
+}
+
+/// GSD's reason code and message from a `--json-errors` refusal on stderr,
+/// else no reason and the raw stderr text.
+fn gsd_refusal_text(stderr: &str) -> (Option<String>, Option<String>) {
+    match serde_json::from_str::<Value>(stderr) {
+        Ok(Value::Object(refusal)) => (
+            refusal
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            refusal
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        ),
+        _ => (None, Some(stderr.to_owned())),
+    }
 }
 
 /// `text` bounded to [`devflow_core::gates::GATE_CONTEXT_DISPLAY_CHARS`] with
