@@ -3667,6 +3667,190 @@ mod tests {
         );
     }
 
+    /// A run at Plan, stopped with `stop_until = Some(Plan)` and `stop_reason`, saved
+    /// for `resume` to load, with a Plan capture beside it for the resume to archive.
+    fn save_stopped_in_plan(root: &Path, phase: PhaseId, agent: AgentKind, stop_reason: &str) {
+        let mut state = State::new(phase, agent, Mode::Supervise, root.to_path_buf());
+        state.verification_baseline_captured = true;
+        state.stage = Stage::Plan;
+        state.stop_until = Some(Stage::Plan);
+        state.stopped = true;
+        state.stop_reason = Some(stop_reason.to_string());
+        workflow::save_state(&state).unwrap();
+        std::fs::write(agent_result::stdout_path(root, phase), "plan output\n").unwrap();
+        std::fs::write(agent_result::exit_code_path(root, phase), "0\n").unwrap();
+    }
+
+    /// The runner's first step on the reloaded state, with the launches it made.
+    fn first_step_after_resume(root: &Path, phase: PhaseId) -> (State, Vec<(Stage, AgentKind)>) {
+        let mut reloaded = workflow::load_state(root, phase).unwrap();
+        LAUNCH_PROBE.set(Some(Vec::new()));
+        let first = runner_first_step(&mut reloaded);
+        let probe = LAUNCH_PROBE.take().expect("the probe was set");
+        let launch = match first {
+            Ok(Some(launch)) => launch,
+            Ok(None) => panic!("the runner's first step resolved no launch: {probe:?}"),
+            Err(err) => panic!("the runner's first step refused the launch: {err}"),
+        };
+        (launch.state, probe)
+    }
+
+    /// 999.251 (D-02): the dogfood procedure runs a `--reviews` replan between an
+    /// `--until plan` halt and `resume`, so the resume launches Code, the stage after
+    /// the one the cap halted, with the Plan capture archived as Plan's.
+    #[test]
+    fn resume_after_an_until_plan_halt_launches_code() {
+        const NAME: &str = "pipeline_launch::tests::resume_after_an_until_plan_halt_launches_code";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_dir_with_agent_stub("codex");
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(97);
+        save_stopped_in_plan(
+            root,
+            phase,
+            AgentKind::Codex,
+            &crate::pipeline_gate::until_halt_reason(Stage::Plan),
+        );
+
+        let result = resume(root, phase, None);
+        let _runners = crate::service::double::LaunchedRunners;
+        result.unwrap();
+
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        let mut probed = reloaded.clone();
+        LAUNCH_PROBE.set(Some(Vec::new()));
+        let first = runner_first_step(&mut probed);
+        let probe = LAUNCH_PROBE.take().expect("the probe was set");
+        assert_eq!(
+            probe,
+            vec![(Stage::Code, AgentKind::Codex)],
+            "resume after an `--until plan` halt launches Code, not Plan: {probe:?}"
+        );
+        let launch = match first {
+            Ok(Some(launch)) => launch,
+            Ok(None) => panic!("the runner's first step resolved no Code launch"),
+            Err(err) => panic!("the runner's first step refused the Code launch: {err}"),
+        };
+        assert_eq!(launch.state.stage, Stage::Code);
+        assert_eq!(launch.state.agent, AgentKind::Codex);
+        assert_eq!(reloaded.stage, Stage::Code, "the saved state reads Code");
+        let transition = events_named(root, "transition")
+            .pop()
+            .expect("resume recorded a transition");
+        assert_eq!(transition["from"], "plan");
+        assert_eq!(transition["to"], "code");
+        let archived = events_named(root, "capture_archived");
+        let [archived] = archived.as_slice() else {
+            panic!("resume archived one capture: {archived:?}");
+        };
+        let stage = &archived["stage"];
+        assert_eq!(stage, "plan", "the Plan capture was archived as {stage}");
+        assert_eq!(archived["to_stage"], "code");
+    }
+
+    /// Control for 999.251: an operator's `devflow stop` during the capped Plan leaves
+    /// `stop_until = Some(Plan)` too, and its resume reruns Plan, which never finished.
+    #[test]
+    fn resume_after_an_operator_stop_in_plan_reruns_plan() {
+        const NAME: &str =
+            "pipeline_launch::tests::resume_after_an_operator_stop_in_plan_reruns_plan";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_dir_with_agent_stub("codex");
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(98);
+        save_stopped_in_plan(root, phase, AgentKind::Codex, "stopped via `devflow stop`");
+
+        let result = resume(root, phase, None);
+        let _runners = crate::service::double::LaunchedRunners;
+        result.unwrap();
+
+        let (launched, probe) = first_step_after_resume(root, phase);
+        assert_eq!(
+            probe,
+            vec![(Stage::Plan, AgentKind::Codex)],
+            "an operator stop in Plan relaunches Plan: {probe:?}"
+        );
+        assert_eq!(launched.stage, Stage::Plan);
+        assert_eq!(
+            workflow::load_state(root, phase).unwrap().stage,
+            Stage::Plan
+        );
+        assert!(
+            events_named(root, "transition").is_empty(),
+            "an operator stop records no transition"
+        );
+    }
+
+    /// 999.251 with `--agent`: the handoff is judged and recorded at Code, the stage the
+    /// resume launches, after the `transition` that moved the run there.
+    #[test]
+    fn resume_with_agent_after_an_until_plan_halt_hands_off_at_code() {
+        const NAME: &str =
+            "pipeline_launch::tests::resume_with_agent_after_an_until_plan_halt_hands_off_at_code";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_dir_with_agent_stub("codex");
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(99);
+        save_stopped_in_plan(
+            root,
+            phase,
+            AgentKind::Claude,
+            &crate::pipeline_gate::until_halt_reason(Stage::Plan),
+        );
+
+        let result = resume(root, phase, Some(AgentKind::Codex));
+        let _runners = crate::service::double::LaunchedRunners;
+        result.unwrap();
+
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        assert_eq!(reloaded.agent, AgentKind::Codex);
+        let events: Vec<serde_json::Value> =
+            std::fs::read_to_string(devflow_core::events::events_path(root))
+                .unwrap()
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect();
+        let position = |name: &str| events.iter().position(|event| event["event"] == name);
+        let handoff_at = position("agent_handoff").expect("handoff event must exist");
+        let stage = &events[handoff_at]["stage"];
+        assert_eq!(
+            stage, "code",
+            "a resume --agent after an --until plan halt handed off at {stage}"
+        );
+        let transition_at = position("transition").expect("resume recorded a transition");
+        assert_eq!(events[transition_at]["from"], "plan");
+        assert_eq!(events[transition_at]["to"], "code");
+        assert!(
+            transition_at < handoff_at,
+            "the transition is recorded before the handoff"
+        );
+        assert_eq!(reloaded.stage, Stage::Code, "the saved state reads Code");
+    }
+
     /// A phase parked at an open, answered `stage` gate whose waiter was killed before it
     /// consumed the answer: the state says `gate_pending`, the gate file is on disk,
     /// and an unconsumed answer for that gate sits beside it. Returns the gate's id
