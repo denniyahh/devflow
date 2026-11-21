@@ -58,8 +58,10 @@
 # present and false. Every commit is a non-breaking `chore:` and nothing is
 # tagged, so the payload cannot classify as a MAJOR bump (D-21, R-8). DevFlow
 # runs no tests at Validate; it drives /gsd-validate-phase over the payload's
-# own test (R-9), which plan 49-06 adds with the phase directory. Nothing is
-# launched and nothing is pushed.
+# own test (R-9), which plan 49-06 adds with the phase directory. `main` also
+# carries `.planning/phases/01-retry-budget/01-CONTEXT.md`, so `integration`
+# inherits it and `start` finds the phase's context on the base (53.1, D-08).
+# Nothing is launched and nothing is pushed.
 #
 # Pretty-form bridge: jq --indent 2 reproduces DevFlow's REAL_SHAPE fixture;
 # the Rust writer test pins that fixture's round trip. The payload uses only
@@ -190,6 +192,10 @@ st_live_topology() {
     fi
     if git -C "$lp" cat-file -e main:devflow.toml 2>/dev/null; then
         case_fail "$name" "devflow.toml is committed on main; it belongs on integration only"
+        return
+    fi
+    if ! git -C "$lp" cat-file -e integration:.planning/phases/01-retry-budget/01-CONTEXT.md 2>/dev/null; then
+        case_fail "$name" "integration has no 01-CONTEXT.md; start --agent codex refuses the payload"
         return
     fi
     case_ok "$name"
@@ -1259,6 +1265,24 @@ All phase behaviors have automated verification.
 
 **Approval:** pending
 EOF_VALIDATION
+
+    # `start` refuses a base whose phase has no -CONTEXT.md; committed before
+    # `integration` forks so both branches carry it (53.1, D-08).
+    cat > "$DEST_ABS/.planning/phases/01-retry-budget/01-CONTEXT.md" <<'EOF'
+# Phase 1: Retry Budget - Context
+
+## Phase Boundary
+
+Choose the default retry budget for `probe.budget` from the offered values and implement its deadline helper with a test. Nothing outside the one module changes.
+
+## Implementation Decisions
+
+- D-01: the default retry budget is asked of the operator at plan time, not assumed.
+
+## Deferred Ideas
+
+None.
+EOF
 
     # R-8: non-breaking `chore:` messages and no tags, so the MAJOR-bump
     # classifier has nothing to fire on (D-21).
