@@ -539,6 +539,62 @@ fn cleanup_keeps_an_incomplete_stopped_run_even_when_merged_naming_resume_and_di
     );
 }
 
+/// A run stopped with `devflow stop` is kept naming its own stop reason, never
+/// `--until`; its merged branch survives the merged-branch sweep; and cleanup says it
+/// removed nothing and kept one, not that there was nothing to clean up.
+#[test]
+fn cleanup_keeps_a_stopped_run_without_saying_there_was_nothing_to_clean() {
+    const STOP_REASON: &str = "stopped via `devflow stop`";
+    let case = Case::new(PhaseId::new(78));
+    case.add_worktree("develop");
+    case.save_state(|state| {
+        state.stopped = true;
+        state.stop_reason = Some(STOP_REASON.to_string());
+    });
+
+    let out = case.cleanup();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains(STOP_REASON),
+        "the keep line names the stop reason:\n{}",
+        text(&out)
+    );
+    assert!(
+        !stdout.contains("--until") && !stderr.contains("--until"),
+        "a run stopped with `devflow stop` is described as an `--until` halt:\n{}",
+        text(&out)
+    );
+    assert!(
+        !stdout.contains("no worktrees to clean up"),
+        "cleanup kept a worktree and also said there was nothing to clean up:\n{}",
+        text(&out)
+    );
+    assert!(
+        stdout.contains("removed nothing; kept 1"),
+        "the summary counts the kept run:\n{}",
+        text(&out)
+    );
+    assert!(
+        !git(&case.root, &["branch", "--list", &case.branch()]).is_empty(),
+        "the kept run's merged branch was swept:\n{}",
+        text(&out)
+    );
+}
+
+/// Control: with no worktree and no state, cleanup says there was nothing to clean up.
+#[test]
+fn cleanup_with_nothing_to_remove_says_there_was_nothing_to_clean() {
+    let case = Case::new(PhaseId::new(77));
+
+    let out = case.cleanup();
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("no worktrees to clean up"),
+        "an empty project's cleanup does not say there was nothing to clean up:\n{}",
+        text(&out)
+    );
+}
+
 /// A phase whose state cleanup keeps (here an incomplete stopped run with no worktree)
 /// keeps its merged branch through the merged-branch sweep, though no checkout holds it.
 #[test]
