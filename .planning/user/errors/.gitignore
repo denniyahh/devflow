@@ -1,0 +1,2 @@
+# The main checkout's hook, run by every worktree through core.hooksPath, writes this old marker until that checkout carries the new hook.
+state-stale.json

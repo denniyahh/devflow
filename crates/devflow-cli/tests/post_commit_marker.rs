@@ -161,3 +161,18 @@ fn a_summary_commit_leaves_the_tree_clean() {
         "the stale-state marker has no stale_since_commit: {marker}"
     );
 }
+
+#[test]
+fn a_two_summary_commit_writes_a_marker_that_parses_as_json() {
+    let fixture = Fixture::new();
+    fixture.commit_summaries(&[FIRST_SUMMARY, SECOND_SUMMARY]);
+
+    let text = fixture.marker_text();
+    let marker: serde_json::Value = serde_json::from_str(&text)
+        .unwrap_or_else(|error| panic!("the stale-state marker is not JSON: {text} ({error})"));
+    assert_eq!(
+        marker["summaries_landed"],
+        serde_json::json!([FIRST_SUMMARY, SECOND_SUMMARY]),
+        "the stale-state marker does not list both landed summaries: {text}"
+    );
+}
