@@ -3159,13 +3159,26 @@ fn status_state_lines(
 
 /// The id of the question gate open at `phase`'s `stage`, if one is (review
 /// concern 10): the `__ask` server opens it, so `gate_pending` stays false. A
-/// gate file that cannot be read as a question reads as none, with a warning.
+/// gate file that cannot be read as a question, and a question gate whose id does
+/// not parse, each read as none, with a warning.
 fn open_question_gate_id(project_root: &Path, phase: PhaseId, stage: Stage) -> Option<GateId> {
     let gate = Gates::list_open(project_root)
         .into_iter()
         .find(|gate| gate.phase == phase && gate.stage == stage)?;
     match Gates::read_question(project_root, phase, stage) {
-        Ok(Some(_)) => GateId::parse(&gate.gate_id).ok(),
+        Ok(Some(_)) => match GateId::parse(&gate.gate_id) {
+            Ok(id) => Some(id),
+            Err(error) => {
+                tracing::warn!(
+                    %phase,
+                    %stage,
+                    gate_id = %gate.gate_id,
+                    %error,
+                    "the open question gate id could not be parsed; status shows gate: none"
+                );
+                None
+            }
+        },
         Ok(None) => None,
         Err(error) => {
             tracing::warn!(
