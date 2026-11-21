@@ -974,7 +974,7 @@ test-only plan whose controls fail. **Owner:** upstream gsd-core issue; DevFlow 
 
 **Disposition (Phase 53.1, D-03):** GSD upstream; filing an upstream gsd-core issue is the operator's call. No DevFlow change; logged in the GSD incident log. The DevFlow side (the gate text) is 999.249, fixed in Phase 53.1.
 
-### Phase 999.251: `devflow resume` After an `--until` Stop Re-Runs the Stage That Already Finished (BACKLOG)
+### Phase 999.251: `devflow resume` After an `--until` Stop Re-Runs the Stage That Already Finished (RESOLVED 2026-11-21 — Phase 53.1, 53.1-03; residual 999.260)
 
 **Earmarked (operator 2026-11-19):** the remediation phase directly after Phase 53.
 
@@ -991,6 +991,12 @@ overwrite the hand-run `--reviews` replan the dogfood procedure puts between `--
 **Not established:** whether GSD plan-phase always short-circuits on existing plans (it did once here).
 **Fix shape (not decided):** record the halt as "stopped before <next stage>" (set `stage = to` with `stopped`), or have
 `resume` on a `stopped_at` run start at the next stage. **Owner:** next fix branch after Phase 53.
+
+**Resolved (Phase 53.1, D-02):** `resume_loaded` moves a run whose `--until` cap fired to the next stage with a normal
+advance's bookkeeping (53.1-03). Tests: `pipeline_launch::tests::resume_after_an_until_plan_halt_launches_code`,
+`pipeline_launch::tests::resume_with_agent_after_an_until_plan_halt_hands_off_at_code`, and the control
+`pipeline_launch::tests::resume_after_an_operator_stop_in_plan_reruns_plan` (an operator stop still reruns its saved stage).
+The fix covers a halt reached through Plan→Code; a halt reached through Plan→Validate still resumes at Code: 999.260.
 
 ### Phase 999.250: A Rate-Limit Gate Offers "Approve: Relaunches Now" When the Limit Resets Days Later (BACKLOG)
 
@@ -1591,7 +1597,7 @@ never runs discuss there (D-14, `define_stage_prompt`), and the dry run still cl
 **Fix shape:** drop Define from the pipeline (start at Plan), or make it a local check with no agent launch. Either
 removes a stage that costs money and time and can only fail. Stability phase.
 
-### Phase 999.213: `devflow cleanup` Misreports a Stopped Run as "Halted via --until", Contradicts Itself, and `--force` Leaves the State Behind (BACKLOG)
+### Phase 999.213: `devflow cleanup` Misreports a Stopped Run as "Halted via --until", Contradicts Itself, and `--force` Leaves the State Behind (RESOLVED 2026-11-21 — Phase 53.1, 53.1-04)
 
 **Earmarked (operator 2026-11-19):** the remediation phase directly after Phase 53.
 
@@ -1609,6 +1615,14 @@ compose); either way `status` should not show a removed run as active.
 **Fix shape:** name the stop's real cause (`stop_reason`); skip the merged-branch delete for a branch a kept worktree
 uses; `--force` clears the state of the run whose worktree it removed, or `status` marks such a state stale; `start`
 says when it replaces a stale state. Stability phase.
+
+**Resolved (Phase 53.1, D-02):** the contradiction is fixed (53.1-04) and pinned with the stop-reason, `--until` and
+kept-branch points by `cleanup_keeps_a_stopped_run_without_saying_there_was_nothing_to_clean` (cleanup_rules_e2e); the
+merged-branch case by `cleanup_keeps_an_incomplete_stopped_run_even_when_merged_naming_resume_and_discard` and
+`cleanup_keeps_the_merged_branch_of_a_kept_state_only_run`. `--force` no longer exists (`Command::Cleanup { project }`,
+crates/devflow-cli/src/main.rs:604); a kept run is removed with `devflow discard`, which the refusals name, pinned by
+`start_refuses_an_unloadable_state_naming_discard_and_leaves_it_in_place`, `start_refuses_orphan_gate_files_naming_discard`,
+`status_lists_an_unloadable_state_as_unloadable_naming_discard` and `status_lists_gate_files_with_no_state_as_debris_naming_discard`.
 
 ### Phase 999.212: No Real Claude Quota Denial Has Ever Been Captured, and the Denial Fixtures Lag the Live Event Shape (BACKLOG)
 
@@ -1737,7 +1751,7 @@ and, if the answer is now `TornAfterLastEvent`, write the flagged idle-timeout r
 withdrawn. Test with a stub that prints the denial, then a partial line with no newline (`printf '%s'`), then sleeps;
 plant the old order as a failing control. OPERATIONS.md's residual sentence is corrected under 999.209. Phase 52 (operator, 2026-11-08: option A).
 
-### Phase 999.206: A Failure Gate Keeps Only 300 Characters of the Reason, and `gate show` Cannot Show the Rest (BACKLOG)
+### Phase 999.206: A Failure Gate Keeps Only 300 Characters of the Reason, and `gate show` Cannot Show the Rest (RESOLVED 2026-11-21 — Phase 53.1, 53.1-06)
 
 **Earmarked (operator 2026-11-19):** the remediation phase directly after Phase 53.
 
@@ -1759,6 +1773,11 @@ gate file and the event, and have `gate show` print it. Name the exact file in t
 the actionable sentence first in their reason. Phase 52.
 
 **Follow-up (Phase 53.1 research, Open Question 2; operator 2026-11-20, devflow_ask 18edee5ed9f11a33: defer):** asking agents to put the actionable sentence first in a failure reason is not done here; it would change the stage prompts and their insta snapshots. Phase 53.1 fixes the stored bound's suffix and pins gate show (plan 53.1-06).
+
+**Resolved (Phase 53.1, D-02):** the stored bound was already 4096 characters (`GATE_CONTEXT_STORED_MAX_CHARS`,
+crates/devflow-cli/src/pipeline_outcomes.rs:2515). 53.1-06 made a cut reason's suffix name the phase's capture file
+(`pipeline_outcomes::tests::a_cut_failure_reason_names_the_phase_capture_file`) and pinned `gate show` printing a long
+reason whole (`commands::tests::gate_show_prints_a_long_failure_reason_whole`).
 
 ### Phase 999.205: No Validate Loop-Back Plans Gap Closure, So a `gaps_found` Verification Cannot Be Closed by the Run (BACKLOG)
 
