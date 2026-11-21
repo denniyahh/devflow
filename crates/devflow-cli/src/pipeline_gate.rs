@@ -44,6 +44,9 @@ pub(crate) fn until_halt_reason(stage: Stage) -> String {
 /// Whether `state` is stopped because its own `--until` cap fired. An operator stop
 /// during the capped stage leaves the same `stopped`, `stage` and `stop_until`; only
 /// the reason [`transition`] writes ([`until_halt_reason`]) tells the two apart.
+///
+/// A fired cap resumes at [`Stage::next`] of the halted stage (999.251). The halt records
+/// no target, so a halt reached through a Plan->Validate transition also resumes at Code.
 pub(crate) fn until_cap_fired(state: &State) -> bool {
     state.stopped
         && state.stop_until == Some(state.stage)
@@ -127,27 +130,7 @@ pub(crate) fn transition(
         return Ok(None);
     }
 
-    commit(state, |s| {
-        s.stage = to;
-        // GATE-03 / D-09: the move from Validate to Plan is the gap-closure
-        // route, the only way out of Validate through here, so it starts a
-        // gap-closure pass. Nothing in this function clears the marker.
-        if (from, to) == (Stage::Validate, Stage::Plan) {
-            s.gap_closure_pass = true;
-        }
-        if mode::transition_resets_consecutive_failures(from, to, s.gap_closure_pass) {
-            s.consecutive_failures = 0;
-        }
-        s.infra_failures = 0;
-        s.gate_pending = false;
-        // D-09: a fix type lives exactly as long as its Code pass, so a later
-        // plain Code pass never replays a stale one. Its note goes with it.
-        s.code_fix = None;
-        s.code_fix_note = None;
-        s.code_fix_report = None;
-        // U7: a relaunch note is for the stage being left, never the next one.
-        s.relaunch_note = None;
-    })?;
+    commit(state, |s| enter_stage(s, from, to))?;
     events::emit(
         project_root,
         state.phase,
@@ -158,6 +141,31 @@ pub(crate) fn transition(
         }),
     );
     launch_stage(state, None, Some(from))
+}
+
+/// Enter `to` from `from`: the bookkeeping a stage advance makes, shared by
+/// [`transition`] and a resume that advances past a fired `--until` cap, so the
+/// two cannot drift. The caller commits it and records the `transition` event.
+pub(crate) fn enter_stage(state: &mut State, from: Stage, to: Stage) {
+    state.stage = to;
+    // GATE-03 / D-09: the move from Validate to Plan is the gap-closure
+    // route, the only way out of Validate through here, so it starts a
+    // gap-closure pass. Nothing in this function clears the marker.
+    if (from, to) == (Stage::Validate, Stage::Plan) {
+        state.gap_closure_pass = true;
+    }
+    if mode::transition_resets_consecutive_failures(from, to, state.gap_closure_pass) {
+        state.consecutive_failures = 0;
+    }
+    state.infra_failures = 0;
+    state.gate_pending = false;
+    // D-09: a fix type lives exactly as long as its Code pass, so a later
+    // plain Code pass never replays a stale one. Its note goes with it.
+    state.code_fix = None;
+    state.code_fix_note = None;
+    state.code_fix_report = None;
+    // U7: a relaunch note is for the stage being left, never the next one.
+    state.relaunch_note = None;
 }
 
 /// The stop reason a run records when its Validate passes (D-35).
@@ -2514,8 +2522,9 @@ mod tests {
 
     /// U7's sweep pinned (V2): the only production writes of `State.stage`
     /// under `crates/devflow-cli/src` and `crates/devflow-core/src` are
-    /// `transition`'s and `prepare_loop_back_to_code`'s, each of which clears
-    /// the relaunch note in the same commit. A plan that adds a third write
+    /// `enter_stage`'s (the advance `transition` and a resume past a fired
+    /// `--until` cap share) and `prepare_loop_back_to_code`'s, each of which
+    /// clears the relaunch note in the same commit. A plan that adds a third write
     /// fails here and must add that write's clear site. The rule and its limits
     /// are on [`stage_writes_in`]; `State::stage` stays `pub` (published core).
     #[test]
@@ -2569,7 +2578,7 @@ mod tests {
         assert_eq!(
             functions,
             vec![
-                ("src/pipeline_gate.rs", "transition"),
+                ("src/pipeline_gate.rs", "enter_stage"),
                 ("src/pipeline_gate.rs", "prepare_loop_back_to_code"),
             ],
             "every production write of State.stage, each needing a relaunch_note clear: {writes:#?}"
