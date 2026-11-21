@@ -359,7 +359,7 @@ closing this phase.
 **Goal:** Fix the DevFlow defects found while dogfooding Phase 53 and in the PR #245 review, plus the backlog items earmarked for this phase (operator, 2026-11-19), so the next dogfooded phase runs without the workarounds Phase 53 needed. In scope: 999.250, 999.251, 999.252, 999.253, 999.254, 999.255, 999.257, 999.258 (from the Phase 53 run and review), and 999.240, 999.249, 999.219, 999.213, 999.206, 999.202, 999.201, 999.193, 999.189 (earmarked backlog). Some of the earmarked items may already be fixed by Phases 52–53; discuss checks each one against the current code and drops or narrows those, with the evidence.
 **Requirements**: TBD (one per in-scope 999.x item, set in discuss)
 **Depends on:** Phase 53
-**Plans:** 8/8 plans executed
+**Plans:** 8/8 plans complete
 
 Plans:
 **Wave 1**
