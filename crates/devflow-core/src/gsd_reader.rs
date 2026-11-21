@@ -1,4 +1,7 @@
-//! The one seam through which DevFlow asks GSD about a phase's verification.
+//! The one seam through which DevFlow asks GSD about a phase's verification,
+//! reads where GSD writes ([`planning_root`]), and runs GSD's two writers DevFlow
+//! uses at a finish: `phase.complete` ([`phase_complete`]) and GSD's own commit
+//! ([`commit_files`]; D-10).
 //!
 //! **DevFlow does not own the answer.** GSD writes `VERIFICATION.md`, decides
 //! what its frontmatter means and computes whether it is stale. This module
@@ -23,6 +26,10 @@
 //! 3. **No path in an event.** GSD's messages hold absolute paths
 //!    (Pitfall 11). [`ReaderFailure::label`] is the event-safe name; the
 //!    message stays in the variant, for the gate context and stderr only.
+//!    One exception: the finish's `gsd_phase_complete` event carries GSD's
+//!    own refusal text, bounded, with the evidence root and the GSD home
+//!    replaced in their given and canonical forms; no other failure's text
+//!    enters it.
 
 use crate::git::hermetic_command_at;
 use crate::phase_id::PhaseId;

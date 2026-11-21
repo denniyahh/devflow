@@ -707,7 +707,9 @@ What a run records:
 A run records how it ended with one `workflow_finished` event in
 `.devflow/events.jsonl`, followed by one `notify_fired` event carrying the
 same `reason`. The notify command runs once, between the two (see
-[Notify hook](#notify-hook-never-miss-a-gate)).
+[Notify hook](#notify-hook-never-miss-a-gate)). A finish also records one
+`gsd_phase_complete` event between them ([GSD marks the phase
+complete](#gsd-marks-the-phase-complete)).
 
 | `workflow_finished` payload | When | State afterwards |
 |---|---|---|
@@ -733,9 +735,9 @@ permitted (the approve runs Validate again, the gap loop or the re-verify
 pass) is honoured at the next advance safe point as before, and the run ends
 stopped and unfinished.
 
-Finishing never merges, pushes, tags, deletes or resets anything and runs no
-hook: the worktree and the `feature/phase-NN` branch are left as Validate left
-them. The phase is removed from the machine-global gate registry. `cleanup`
+Apart from GSD's completion commit (below), finishing never merges, pushes,
+tags, deletes or resets anything and runs no hook: the worktree and the
+`feature/phase-NN` branch are left as Validate left them. The phase is removed from the machine-global gate registry. `cleanup`
 keeps a finished run's worktree, its state and its branch, naming its stop reason and
 `devflow discard --phase N`, until the branch is merged into the base and the worktree
 is clean; then it removes the worktree and the state. `devflow discard --phase N`
@@ -749,6 +751,48 @@ remove the phase's worktree, branch and run state (it lists them first, and
 refuses a branch with commits not merged into `BASE` unless you name it),
 then run this start again". Close the branch out first (merge it into the
 base) if its work is wanted.
+
+### GSD marks the phase complete
+
+After a finish records `workflow_finished`, DevFlow asks GSD to mark the phase
+complete, in the run's evidence root (the worktree in worktree mode). DevFlow
+edits no planning file itself; it runs GSD's own tools, each bounded to 60 s:
+
+1. `gsd_run query planning.inspect`, to read where GSD will write. A planning
+   directory GSD resolves under a `GSD_PROJECT` or workstream scope is refused
+   before any write, because GSD would update ROADMAP.md and STATE.md there,
+   not in the evidence root's `.planning/`: run
+   `gsd_run query phase.complete N` by hand in that scope.
+2. `gsd_run query phase.complete N --json-errors`, which updates ROADMAP.md,
+   STATE.md and REQUIREMENTS.md and commits nothing.
+3. When GSD reports it updated files, GSD's own commit of exactly those files:
+   `gsd_run query commit "docs(phase-N): complete phase execution" --json-errors --files …`
+   (STATE.md and STATE-ARCHIVE.md as well when GSD's STATE prune ran). The
+   commit runs the repository's git hooks, as any commit does.
+
+None of this can undo the finish: the run stays finished and
+`workflow_finished` stands whatever GSD answers. One line is printed on
+success; a refusal or failure is printed to stderr with GSD's full text. The
+`gsd_phase_complete` event records the outcome:
+
+| `gsd_phase_complete` payload | When |
+|---|---|
+| `{"ok":true,"committed":true,"commit_failure":null}` | GSD marked the phase complete and committed what it wrote |
+| `{"ok":true,"committed":false,"commit_failure":null}` | GSD marked the phase complete but updated no file, or its commit committed nothing |
+| `{"ok":true,"committed":false,"commit_failure":"<label>"}` | GSD marked the phase complete and its commit failed (a hook, signing or a timeout): commit its files by hand |
+| `{"ok":false,"failure":"scoped_planning_dir","reason":null,"message":"<dir>"}` | GSD resolves a scoped planning directory; nothing ran after the read |
+| `{"ok":false,"failure":"<label>","reason":"<GSD's reason or null>","message":"<GSD's text or null>"}` | `phase.complete` refused (for example `phase_verification_incomplete` when the verification went stale), or GSD could not be read; no commit runs |
+
+The `message` is only GSD's own text, cut to 450 characters, with the
+evidence root replaced by `.` and the GSD home by `~` (each as given and as
+its canonical path); every other failure class records its label with
+`message: null`.
+
+**Re-verifying after a post-Validate fix.** A fix committed after Validate
+passed makes GSD's verification stale, so `phase.complete` refuses it. Run
+`/gsd-execute-phase N` by hand (record it as a hand-run stage in the phase
+notes), then `gsd_run query phase.complete N` (D-10). DevFlow has no
+re-verify step of its own.
 
 ## Notify hook (never miss a gate)
 
