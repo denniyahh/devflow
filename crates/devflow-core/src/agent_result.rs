@@ -1391,7 +1391,17 @@ const CLAUDE_STREAM_RATE_LIMIT_DENIAL_STATUSES: &[&str] = &["rejected"];
 /// 2. **Semantic** — only a `status` in
 ///    [`CLAUDE_STREAM_RATE_LIMIT_DENIAL_STATUSES`] classifies. A missing
 ///    `rate_limit_info`, a missing or non-string `status`, or any unrecognised
-///    value returns `None`.
+///    value is not a denial from the event.
+///
+/// **Second read: the final `result`'s `subtype` (D-09).** When no eligible
+/// `rate_limit_event` denies (none present, or every exit above), the final
+/// top-level `result` among the same eligible events is read, and a `subtype`
+/// of exactly `error_rate_limit` classifies, as it does on the single-document
+/// path ([`detect_claude_rate_limit`]). This is still one exact field on one
+/// top-level event, not a shape match: the CLI sets `subtype` itself, the
+/// agent cannot write it, and no nested search runs, so neither the
+/// `overageStatus` trap nor agent-authored JSON in the `result` text can
+/// supply it. Any other `subtype` returns `None`.
 ///
 /// **Deferring is the deliberately safe direction, not an oversight.**
 /// Under-classifying means an unknown denial status falls through to the
@@ -1430,6 +1440,17 @@ fn detect_claude_stream_rate_limit(events: &[serde_json::Value]) -> Option<Strin
         None => events,
     };
 
+    rate_limit_event_denial(eligible, is_top_level_of_type)
+        .or_else(|| error_rate_limit_result_retry(eligible))
+}
+
+/// The `rate_limit_event` read of [`detect_claude_stream_rate_limit`]: the
+/// retry when the last eligible top-level `rate_limit_event` denies, else
+/// `None` from every exit, so the caller still reads the final `result`.
+fn rate_limit_event_denial(
+    eligible: &[serde_json::Value],
+    is_top_level_of_type: impl Fn(&serde_json::Value, &str) -> bool,
+) -> Option<String> {
     // Last eligible top-level event wins, matching the last-`result`-wins
     // convention.
     let event = eligible
@@ -1454,6 +1475,26 @@ fn detect_claude_stream_rate_limit(events: &[serde_json::Value]) -> Option<Strin
         info.get("resetsAt")
             .and_then(json_scalar_to_string)
             .unwrap_or_else(|| status.to_string()),
+    )
+}
+
+/// The `result` read of [`detect_claude_stream_rate_limit`]: the retry when the
+/// final eligible top-level `result` has `subtype` exactly `error_rate_limit`
+/// (D-09). Its top-level `retry_after`, else `"usage limit"`, the
+/// single-document path's last rung. Both fields are read with a direct
+/// [`serde_json::Value::get`] on that one event, never [`json_find_key`]: the
+/// event's `result` text is agent-authored and may nest arbitrary JSON
+/// (T-30-12).
+fn error_rate_limit_result_retry(eligible: &[serde_json::Value]) -> Option<String> {
+    let result = last_top_level_result(eligible)?;
+    if result.get("subtype").and_then(serde_json::Value::as_str) != Some("error_rate_limit") {
+        return None;
+    }
+    Some(
+        result
+            .get("retry_after")
+            .and_then(json_scalar_to_string)
+            .unwrap_or_else(|| "usage limit".to_string()),
     )
 }
 
@@ -6762,12 +6803,11 @@ mod tests {
                 r#"{{"type":"result","subtype":"{subtype}","is_error":true,"retry_after":"2026-06-18T15:45:30Z","result":"limit"}}"#
             )
         };
-        let single = |line: &str| line.to_string();
-        let stream = |line: &str| format!("{V3_INIT_EVENT}\n{line}\n");
-        let paths: [(&str, &dyn Fn(&str) -> String); 2] =
-            [("single document", &single), ("stream", &stream)];
-
-        for (path, wrap) in paths {
+        for path in ["single document", "stream"] {
+            let wrap = |line: &str| match path {
+                "stream" => format!("{V3_INIT_EVENT}\n{line}\n"),
+                _ => line.to_string(),
+            };
             let rate_limited = evaluate(&wrap(&result_line("error_rate_limit")));
             assert_eq!(
                 rate_limited.as_ref().map(|r| r.status),
