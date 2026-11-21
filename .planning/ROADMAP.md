@@ -887,7 +887,7 @@ documented way to re-verify after a review fix, e.g. run the fix on the phase br
 ### Phase 999.260: `devflow resume` After an `--until plan` Halt Reached Through Plan→Validate Starts Code, Not Validate (BACKLOG)
 
 **Found:** 2026-11-21, Phase 53.1 (the residual of the 999.251 fix, 53.1-03).
-**What happened:** after 53.1-03, `resume_loaded` (crates/devflow-cli/src/pipeline_launch.rs:2603) advances a fired `--until`
+**What happened:** after 53.1-03, `resume_loaded` (crates/devflow-cli/src/pipeline_launch.rs:2509, through `resume_advance` at :2627) advances a fired `--until`
 cap to `Stage::next` of the halted stage. The halt commit records no target, so a halt reached when a Plan gate's answer runs
 Validate again resumes at Code, where the answer asked for Validate.
 **Evidence:** the `--until` halt commit (crates/devflow-cli/src/pipeline_gate.rs:93-107) sets `stopped` and the halt reason
