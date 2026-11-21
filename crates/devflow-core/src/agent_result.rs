@@ -6742,6 +6742,95 @@ mod tests {
         );
     }
 
+    /// A Claude `error_rate_limit` result is a rate limit whether it arrives as
+    /// the single-document envelope or as the final top-level `result` of a
+    /// `stream-json` capture, with the same reason text on both paths. Another
+    /// `error_*` subtype stays `Failed`, a subagent's `error_rate_limit` result
+    /// decides nothing, and a routine `allowed` quota event earlier in the
+    /// final turn does not stop the result from being read.
+    #[test]
+    fn an_error_rate_limit_result_is_rate_limited_on_both_paths() {
+        let phase = PhaseId::new(7);
+        let evaluate = |capture: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+            std::fs::write(stdout_path(dir.path(), phase), capture).unwrap();
+            evaluate_layer1(dir.path(), phase)
+        };
+        let result_line = |subtype: &str| {
+            format!(
+                r#"{{"type":"result","subtype":"{subtype}","is_error":true,"retry_after":"2026-06-18T15:45:30Z","result":"limit"}}"#
+            )
+        };
+        let single = |line: &str| line.to_string();
+        let stream = |line: &str| format!("{V3_INIT_EVENT}\n{line}\n");
+        let paths: [(&str, &dyn Fn(&str) -> String); 2] =
+            [("single document", &single), ("stream", &stream)];
+
+        for (path, wrap) in paths {
+            let rate_limited = evaluate(&wrap(&result_line("error_rate_limit")));
+            assert_eq!(
+                rate_limited.as_ref().map(|r| r.status),
+                Some(AgentStatus::RateLimited),
+                "{path} error_rate_limit: want RateLimited, got {rate_limited:?}"
+            );
+            assert_eq!(
+                rate_limited.as_ref().and_then(|r| r.reason.as_deref()),
+                Some("rate limited until 2026-06-18T15:45:30Z"),
+                "{path} error_rate_limit: want the retry_after reason, got {rate_limited:?}"
+            );
+
+            let max_turns = evaluate(&wrap(&result_line("error_max_turns")));
+            assert_eq!(
+                max_turns.as_ref().map(|r| r.status),
+                Some(AgentStatus::Failed),
+                "{path} error_max_turns: want Failed, got {max_turns:?}"
+            );
+
+            let no_retry = evaluate(&wrap(
+                r#"{"type":"result","subtype":"error_rate_limit","is_error":true,"result":"limit"}"#,
+            ));
+            assert_eq!(
+                no_retry.as_ref().map(|r| r.status),
+                Some(AgentStatus::RateLimited),
+                "{path} no-retry error_rate_limit: want RateLimited, got {no_retry:?}"
+            );
+            assert_eq!(
+                no_retry.as_ref().and_then(|r| r.reason.as_deref()),
+                Some("rate limited until usage limit"),
+                "{path} no-retry error_rate_limit: want \"rate limited until usage limit\", got {no_retry:?}"
+            );
+        }
+
+        let subagent_line = r#"{"type":"result","subtype":"error_rate_limit","is_error":true,"retry_after":"2026-06-18T15:45:30Z","result":"limit","parent_tool_use_id":"toolu_1"}"#;
+        let top_level_success =
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"done"}"#;
+        let subagent = evaluate(&format!(
+            "{V3_INIT_EVENT}\n{subagent_line}\n{top_level_success}\n"
+        ));
+        assert_ne!(
+            subagent.as_ref().map(|r| r.status),
+            Some(AgentStatus::RateLimited),
+            "stream subagent error_rate_limit then top-level success: want not RateLimited, got {subagent:?}"
+        );
+
+        let allowed_event = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1795294800}}"#;
+        let after_allowed = evaluate(&format!(
+            "{V3_INIT_EVENT}\n{allowed_event}\n{}\n",
+            result_line("error_rate_limit")
+        ));
+        assert_eq!(
+            after_allowed.as_ref().map(|r| r.status),
+            Some(AgentStatus::RateLimited),
+            "stream routine allowed event then error_rate_limit: want RateLimited, got {after_allowed:?}"
+        );
+        assert_eq!(
+            after_allowed.as_ref().and_then(|r| r.reason.as_deref()),
+            Some("rate limited until 2026-06-18T15:45:30Z"),
+            "stream routine allowed event then error_rate_limit: want the result's retry_after, got {after_allowed:?}"
+        );
+    }
+
     /// CR-01 (13-REVIEW.md) completion: the monitor path writes raw agent
     /// bytes to the stdout file via sh redirection, so evaluate_layer1 must
     /// tolerate invalid UTF-8 rather than silently disabling all Layer-1
