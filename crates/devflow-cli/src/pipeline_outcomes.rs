@@ -127,11 +127,20 @@ pub(crate) fn handle_rate_limited_outcome(
     dispatch_answer(project_root, state, stage, answer, false)
 }
 
+/// How far past `now` a rate-limit reset must lie before the gate leads with
+/// the way to another agent (D-04): beyond it, waiting is the slow way on.
+/// Deliberately a constant: there is no environment variable or config key.
+const RATE_LIMIT_FAR_RESET_SECS: i64 = 6 * 60 * 60;
+
 /// The never-silent gate context for a rate limit no fallback can take. The
 /// routers' way-on sentence first (C2), because the notify hook and the banner
-/// show only the start; then the resume command (with `--agent` when the run
-/// is not on the default agent), the reset time when the denial carried one,
-/// and the cause.
+/// show only the start. A reset more than [`RATE_LIMIT_FAR_RESET_SECS`] away
+/// then names the way to another agent first (`devflow stop`, then `devflow
+/// resume --agent`; D-04), so no variable-length part precedes it inside the
+/// display cut, then the reset as a UTC time and a distance and the same-agent
+/// resume command. A near, past or unreadable reset names the same-agent resume
+/// command (with `--agent` when the run is not on the default agent) first,
+/// then the reset. The cause comes last.
 fn rate_limit_gate_context(
     state: &State,
     phase: PhaseId,
@@ -144,8 +153,8 @@ fn rate_limit_gate_context(
     } else {
         format!(" --agent {}", state.agent)
     };
-    let retry_after = retry_after_from_reason(reason.as_deref());
-    let reset = match reset_time::parse_reset_time(&retry_after) {
+    let reset_at = reset_time::parse_reset_time(&retry_after_from_reason(reason.as_deref()));
+    let reset = match reset_at {
         Some(at) => format!(
             "the limit resets at {}, {}",
             reset_time::format_utc(at),
@@ -153,16 +162,40 @@ fn rate_limit_gate_context(
         ),
         None => "the denial carried no reset time".to_string(),
     };
-    let lead = format!(
-        "rate limited with no usable fallback; once this waiting supervisor has ended, \
-         `devflow resume --phase {phase}{agent}` relaunches the stage; {reset}. Cause: "
-    );
+    let far = reset_at.is_some_and(|at| at.saturating_sub(now) > RATE_LIMIT_FAR_RESET_SECS);
+    let lead = if far {
+        let other = other_agent_for_resume(state);
+        format!(
+            "no usable fallback; for another agent now: `devflow stop --phase {phase}`, then \
+             `devflow resume --phase {phase} --agent {other}`; {reset}; once this waiting \
+             supervisor has ended, `devflow resume --phase {phase}{agent}` relaunches the stage \
+             on the same agent. Cause: "
+        )
+    } else {
+        format!(
+            "rate limited with no usable fallback; once this waiting supervisor has ended, \
+             `devflow resume --phase {phase}{agent}` relaunches the stage; {reset}. Cause: "
+        )
+    };
     lead_with_way_on(
         GateKind::RateLimit,
         (phase, stage),
         None,
         &stage_failure_context(stage, &lead, reason),
     )
+}
+
+/// The agent a far rate-limit gate names for `devflow resume --agent`: the
+/// run's fallback only once it is spent and differs from the run's agent,
+/// because `resume --agent` onto a saved unused fallback is refused; otherwise
+/// the placeholder `<other>`.
+fn other_agent_for_resume(state: &State) -> String {
+    match state.fallback_agent {
+        Some(fallback) if state.fallback_consumed && fallback != state.agent => {
+            fallback.to_string()
+        }
+        _ => "<other>".to_string(),
+    }
 }
 
 /// How far `reset` lies past `now`, in the two largest whole units that fit
@@ -880,9 +913,10 @@ pub(crate) fn step_phrase(step: &Step) -> &'static str {
 pub(crate) fn status_less_phrase(step: &StatusLessStep, phase: PhaseId, stage: Stage) -> String {
     match step {
         StatusLessStep::RetryStage => format!("retries the {stage} stage"),
-        StatusLessStep::RelaunchNow => {
-            format!("relaunches the {stage} stage now on the same agent")
-        }
+        StatusLessStep::RelaunchNow => format!(
+            "relaunches the {stage} stage now on the same agent, into the same limit until it \
+             resets"
+        ),
         StatusLessStep::RelaunchWithNote(_) => {
             format!("relaunches the {stage} stage with the note")
         }
