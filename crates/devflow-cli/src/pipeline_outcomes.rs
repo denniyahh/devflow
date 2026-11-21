@@ -33,6 +33,7 @@ use devflow_core::{
     agent_result::{AgentStatus, Verdict},
     events, reset_time,
 };
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 /// Route a `GateInfra` outcome (ResourceKilled/AgentUnavailable) — bumps
@@ -397,6 +398,172 @@ pub(crate) fn record_gsd_runtime(project_root: &Path, phase: PhaseId) {
         Err(failure) => serde_json::json!({ "version": null, "failure": failure.label() }),
     };
     events::emit(project_root, phase, "gsd_runtime", payload);
+}
+
+/// The files GSD's `phase.complete` writes, by the reply flag that says it
+/// wrote them. `auto_pruned` (its optional STATE prune, GSD 1.22
+/// `lib/phase.cjs`) rewrites STATE.md and writes the archive beside it
+/// (`lib/state.cjs`).
+const GSD_COMPLETION_WRITES: [(&str, &[&str]); 4] = [
+    ("roadmap_updated", &[".planning/ROADMAP.md"]),
+    ("state_updated", &[".planning/STATE.md"]),
+    ("requirements_updated", &[".planning/REQUIREMENTS.md"]),
+    (
+        "auto_pruned",
+        &[".planning/STATE.md", ".planning/STATE-ARCHIVE.md"],
+    ),
+];
+
+/// The files GSD reported writing in a `phase.complete` reply, each once, so
+/// the commit leaves nothing GSD wrote uncommitted. Each flag is indexed as a
+/// boolean: an absent or non-boolean flag is a failure, never `false`.
+fn gsd_written_files(reply: &Value) -> Result<Vec<&'static str>, ReaderFailure> {
+    let mut files = Vec::new();
+    for (key, written) in GSD_COMPLETION_WRITES {
+        let wrote = reply[key]
+            .as_bool()
+            .ok_or_else(|| ReaderFailure::MissingField {
+                key: key.to_owned(),
+            })?;
+        for file in written.iter().filter(|_| wrote) {
+            if !files.contains(file) {
+                files.push(*file);
+            }
+        }
+    }
+    Ok(files)
+}
+
+/// Mark the finished run's phase complete in GSD and commit what GSD wrote
+/// (D-10; the operator's plan-phase answer "commit"), recording one
+/// `gsd_phase_complete` event. DevFlow edits no planning file itself: it runs
+/// GSD's `phase.complete` and GSD's `query commit` in the evidence root,
+/// after checking GSD resolves that root's own `.planning/` (review codex 6).
+/// It never fails: the run is already finished, and a refusal is printed and
+/// recorded.
+pub(crate) fn record_gsd_phase_complete(project_root: &Path, state: &State) {
+    let root = evidence_root(project_root, state);
+    let payload = match gsd_home(&root) {
+        Some(home) => complete_phase_in_gsd(&home, &root, state.phase),
+        None => completion_refused(
+            state.phase,
+            &ReaderFailure::LauncherNotFound {
+                home: PathBuf::from("$HOME (unset)"),
+            },
+            &root,
+            None,
+        ),
+    };
+    events::emit(project_root, state.phase, "gsd_phase_complete", payload);
+}
+
+/// The planning-root check, `phase.complete` and the commit, in that order;
+/// the payload of the `gsd_phase_complete` event.
+fn complete_phase_in_gsd(home: &Path, root: &Path, phase: PhaseId) -> Value {
+    match gsd_reader::planning_root(home, root) {
+        Ok(planning) if !is_own_planning_dir(root, &planning) => {
+            return scoped_planning_refusal(phase, &planning, root, home);
+        }
+        Ok(_) => {}
+        Err(failure) => return completion_refused(phase, &failure, root, Some(home)),
+    }
+    match gsd_reader::phase_complete(home, root, phase).and_then(|reply| gsd_written_files(&reply))
+    {
+        Ok(files) => commit_completion(home, root, phase, &files),
+        Err(failure) => completion_refused(phase, &failure, root, Some(home)),
+    }
+}
+
+/// Whether `planning` is `root`'s own `.planning/`, compared canonically.
+fn is_own_planning_dir(root: &Path, planning: &Path) -> bool {
+    canonical_or_given(planning) == canonical_or_given(&root.join(".planning"))
+}
+
+/// `path` canonicalized, or as given when it cannot be.
+fn canonical_or_given(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Refuse a planning directory GSD resolves under a `GSD_PROJECT` or
+/// workstream scope before any write: GSD would write its ROADMAP.md and
+/// STATE.md there, not at the `.planning/` paths the commit names.
+fn scoped_planning_refusal(phase: PhaseId, planning: &Path, root: &Path, home: &Path) -> Value {
+    eprintln!(
+        "GSD resolves a scoped planning directory ({}); DevFlow marks a phase complete only \
+         for an unscoped .planning/, so it ran no GSD writer: run `gsd_run query phase.complete \
+         {phase}` by hand",
+        planning.display()
+    );
+    serde_json::json!({
+        "ok": false,
+        "failure": "scoped_planning_dir",
+        "reason": null,
+        "message": event_safe_text(&planning.display().to_string(), root, Some(home)),
+    })
+}
+
+/// Commit the files GSD wrote, through GSD's own commit. A failed or empty
+/// commit stays `ok: true`: GSD did mark the phase complete (review agy 9).
+fn commit_completion(home: &Path, root: &Path, phase: PhaseId, files: &[&str]) -> Value {
+    if files.is_empty() {
+        println!("GSD marked phase {phase} complete and updated no file, so nothing was committed");
+        return serde_json::json!({ "ok": true, "committed": false, "commit_failure": null });
+    }
+    let message = format!("docs(phase-{phase}): complete phase execution");
+    match gsd_reader::commit_files(home, root, &message, files) {
+        Ok(reply) => {
+            let committed = reply["committed"] == true;
+            if committed {
+                println!(
+                    "GSD marked phase {phase} complete; committed {}",
+                    reply["hash"].as_str().unwrap_or("(GSD gave no hash)")
+                );
+            } else {
+                println!(
+                    "GSD marked phase {phase} complete; its commit committed nothing: {}",
+                    reply["reason"].as_str().unwrap_or("GSD gave no reason")
+                );
+            }
+            serde_json::json!({ "ok": true, "committed": committed, "commit_failure": null })
+        }
+        Err(failure) => {
+            eprintln!("GSD marked phase {phase} complete, but its commit failed: {failure}");
+            serde_json::json!({ "ok": true, "committed": false, "commit_failure": failure.label() })
+        }
+    }
+}
+
+/// A `phase.complete` that did not run or was refused: printed, and recorded
+/// by its event-safe label. The run stays finished.
+fn completion_refused(
+    phase: PhaseId,
+    failure: &ReaderFailure,
+    _root: &Path,
+    _home: Option<&Path>,
+) -> Value {
+    eprintln!("GSD did not mark phase {phase} complete; the run is still finished: {failure}");
+    serde_json::json!({ "ok": false, "failure": failure.label() })
+}
+
+/// `text` bounded to [`devflow_core::gates::GATE_CONTEXT_DISPLAY_CHARS`] with
+/// the evidence root replaced by `.` and the GSD home by `~`, each in its
+/// given and canonical forms, so no absolute path of either reaches an event
+/// (`gsd_reader` property 3).
+fn event_safe_text(text: &str, root: &Path, home: Option<&Path>) -> String {
+    let mut needles: Vec<(String, &str)> = Vec::new();
+    for (path, replacement) in std::iter::once((root, ".")).chain(home.map(|home| (home, "~"))) {
+        for form in [path.to_path_buf(), canonical_or_given(path)] {
+            needles.push((form.display().to_string(), replacement));
+        }
+    }
+    needles.retain(|(needle, _)| !needle.is_empty());
+    // Longest first, so a path that holds another is replaced whole.
+    needles.sort_by_key(|(needle, _)| std::cmp::Reverse(needle.len()));
+    let mut safe = text.to_owned();
+    for (needle, replacement) in &needles {
+        safe = safe.replace(needle.as_str(), replacement);
+    }
+    render_gate_context(&safe, devflow_core::gates::GATE_CONTEXT_DISPLAY_CHARS)
 }
 
 /// The agent's half of a Validate verdict (D-08): one input of
@@ -7039,6 +7206,9 @@ mod tests {
             .unwrap();
             raw["validate_pass_head"].clone()
         };
+        // Each finish asks GSD for its planning root before `phase.complete`;
+        // this reply has none, so the completion is refused after that one call.
+        const NO_PLANNING_ROOT: &str = r#"{"generated_from":{"planning_root":null}}"#;
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(5250);
@@ -7047,10 +7217,13 @@ mod tests {
             phase,
             &[
                 gsd_says(GsdStatus::Passed),
+                NO_PLANNING_ROOT,
                 gsd_says(GsdStatus::GapsFound),
                 gsd_says(GsdStatus::Passed),
+                NO_PLANNING_ROOT,
                 gsd_says(GsdStatus::Passed),
                 gsd_says(GsdStatus::Passed),
+                NO_PLANNING_ROOT,
             ],
         );
         let first = repo_with_head(root);
@@ -10871,5 +11044,55 @@ mod tests {
                 assert_eq!(finished.len(), 1, "{row}: {:?}", phase_events(root, phase));
             }
         }
+    }
+
+    #[test]
+    fn gsd_written_files_names_every_file_gsd_wrote() {
+        let reply = |roadmap: bool, state: bool, requirements: bool, pruned: bool| {
+            serde_json::json!({
+                "roadmap_updated": roadmap,
+                "state_updated": state,
+                "requirements_updated": requirements,
+                "auto_pruned": pruned,
+            })
+        };
+        let rows: [(&str, Value, Vec<&str>); 4] = [
+            (
+                "roadmap and state",
+                reply(true, true, false, false),
+                vec![".planning/ROADMAP.md", ".planning/STATE.md"],
+            ),
+            (
+                "auto_pruned only",
+                reply(false, false, false, true),
+                vec![".planning/STATE.md", ".planning/STATE-ARCHIVE.md"],
+            ),
+            (
+                "all four, STATE.md once",
+                reply(true, true, true, true),
+                vec![
+                    ".planning/ROADMAP.md",
+                    ".planning/STATE.md",
+                    ".planning/REQUIREMENTS.md",
+                    ".planning/STATE-ARCHIVE.md",
+                ],
+            ),
+            (
+                "all false names nothing",
+                reply(false, false, false, false),
+                vec![],
+            ),
+        ];
+        for (row, value, expected) in rows {
+            assert_eq!(gsd_written_files(&value).expect(row), expected, "{row}");
+        }
+
+        let mut absent = reply(true, true, false, false);
+        absent.as_object_mut().unwrap().remove("auto_pruned");
+        let failure = gsd_written_files(&absent).expect_err("an absent flag is no answer");
+        assert!(
+            matches!(&failure, ReaderFailure::MissingField { key } if key == "auto_pruned"),
+            "auto_pruned absent: {failure:?}"
+        );
     }
 }
