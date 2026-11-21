@@ -224,6 +224,7 @@ pub(crate) fn finish_run(
         "workflow_finished",
         serde_json::json!({ "reason": "finished", "shipped": false }),
     );
+    crate::pipeline_outcomes::record_gsd_phase_complete(project_root, state);
     notify_run_end(
         project_root,
         state,
@@ -2930,6 +2931,62 @@ mod tests {
             last_event_position(root, "workflow_finished")
                 < last_event_position(root, "gsd_phase_complete"),
             "gsd_phase_complete comes after workflow_finished"
+        );
+        assert!(
+            workflow::load_state(root, phase).unwrap().finished,
+            "the run is finished"
+        );
+    }
+
+    /// Review codex 6: a planning directory GSD resolves under a workstream
+    /// scope is refused before any write, so GSD's writer never runs and the
+    /// top-level STATE.md the commit would name is untouched.
+    #[test]
+    fn a_scoped_planning_dir_is_refused_before_phase_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5286);
+        let mut state = noted_state(root, phase, Stage::Validate);
+        std::fs::create_dir_all(root.join(".planning")).unwrap();
+        std::fs::write(root.join(".planning/STATE.md"), "# State\n").unwrap();
+        let git = |args: &[&str]| {
+            let ok = devflow_core::test_support::git_command(root)
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        git(&["add", ".planning/STATE.md"]);
+        git(&["commit", "-q", "-m", "state"]);
+        let committed = std::fs::read(root.join(".planning/STATE.md")).unwrap();
+        workflow::save_state(&state).unwrap();
+        let inspect = planning_inspect_reply(root, &root.join(".planning/workstreams/ws1"));
+        let gsd = GsdStub::answering(root, &[&inspect]);
+
+        finish_run(root, &mut state, test_permit()).unwrap();
+
+        let calls: Vec<String> = gsd.calls().into_iter().map(|(_, argv)| argv).collect();
+        assert_eq!(
+            calls,
+            vec!["query planning.inspect".to_string()],
+            "a scoped planning directory reached GSD's writer"
+        );
+        let event =
+            devflow_core::events::last_event_of_kind_for_phase(root, phase, "gsd_phase_complete")
+                .expect("the finish records gsd_phase_complete");
+        assert_eq!(event["ok"], false, "{event}");
+        assert_eq!(event["failure"], "scoped_planning_dir", "{event}");
+        let message = event["message"].as_str().expect("a message");
+        assert!(message.contains("./.planning/workstreams/ws1"), "{event}");
+        assert!(
+            !message.contains(&root.display().to_string()),
+            "the event carries an absolute path: {event}"
+        );
+        assert_eq!(
+            std::fs::read(root.join(".planning/STATE.md")).unwrap(),
+            committed,
+            "a scoped planning directory reached GSD's writer"
         );
         assert!(
             workflow::load_state(root, phase).unwrap().finished,
