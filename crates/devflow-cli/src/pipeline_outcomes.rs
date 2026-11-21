@@ -111,7 +111,12 @@ pub(crate) fn handle_rate_limited_outcome(
     reason: Option<String>,
 ) -> Result<Option<StageLaunch>, CliError> {
     let reset_at = reset_time::parse_reset_time(&retry_after_from_reason(reason.as_deref()));
-    let context = rate_limit_gate_context(state, phase, stage, reason);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
+        });
+    let context = rate_limit_gate_context(state, phase, stage, reason, now);
     let answer = run_gate(
         project_root,
         state,
@@ -132,7 +137,9 @@ fn rate_limit_gate_context(
     phase: PhaseId,
     stage: Stage,
     reason: Option<String>,
+    now: i64,
 ) -> String {
+    let _ = now;
     let agent = if state.agent == AgentKind::Claude {
         String::new()
     } else {
@@ -5831,6 +5838,47 @@ mod tests {
             .find("Cause: rate limited until")
             .expect("the context names the cause");
         assert!(resume < reset && reset < cause, "way on first: {context}");
+    }
+
+    /// D-04: the rate-limit gate names its reset as a UTC time and how far
+    /// away it is, in epoch and RFC 3339 form alike, and keeps the raw reset
+    /// out of the text before the cause. Control: a reason with no readable
+    /// reset still says the denial carried none.
+    #[test]
+    fn a_rate_limit_gate_shows_its_reset_as_a_utc_time_and_a_distance() {
+        let phase = PhaseId::new(5791);
+        let state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            PathBuf::from("/nonexistent"),
+        );
+        let now = 1_795_102_140;
+        let clause = "the limit resets at 2026-11-19 16:34 UTC, in 1 h 5 m";
+        for reason in [
+            "rate limited until 1795106040",
+            "rate limited until 2026-11-19T16:34:00Z",
+        ] {
+            let context =
+                rate_limit_gate_context(&state, phase, Stage::Code, Some(reason.into()), now);
+            assert!(context.contains(clause), "{reason}: {context}");
+            let lead = &context[..context.find(" Cause: ").expect("a cause")];
+            assert!(
+                !lead.contains("1795106040") && !lead.contains("2026-11-19T16:34:00Z"),
+                "{reason}: the raw reset stays out of the lead: {lead}"
+            );
+        }
+        let context = rate_limit_gate_context(
+            &state,
+            phase,
+            Stage::Code,
+            Some("rate limited until whenever".into()),
+            now,
+        );
+        assert!(
+            context.contains("the denial carried no reset time"),
+            "control: {context}"
+        );
     }
 
     #[test]

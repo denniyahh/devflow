@@ -39,6 +39,13 @@ pub fn rate_limit_wait_bound(now: i64, reset_at: i64, gate_timeout_secs: u64) ->
     gate_timeout_secs.max(u64::try_from(until_wake).unwrap_or(0))
 }
 
+/// `epoch_secs` as a UTC wall-clock time, `YYYY-MM-DD HH:MM UTC`, the form
+/// the rate-limit gate shows its reset in (D-04). Seconds are dropped, not
+/// rounded.
+pub fn format_utc(epoch_secs: i64) -> String {
+    epoch_secs.to_string()
+}
+
 /// The exact UTC instant, in Unix epoch seconds, that `input` names.
 ///
 /// Two forms are read, after trimming surrounding whitespace:
@@ -383,6 +390,15 @@ mod tests {
         for input in ["2026-08-02T00:00:00.4xZ", "2026-08-02T00:00:00.Z"] {
             assert_eq!(parse_reset_time(input), None, "input {input:?}");
         }
+    }
+
+    /// D-04: the Phase 53 reset epoch renders as its UTC wall-clock time.
+    /// Controls: the epoch origin and a leap day render their own dates.
+    #[test]
+    fn format_utc_renders_the_phase_53_reset() {
+        assert_eq!(format_utc(1_795_294_800), "2026-11-21 21:00 UTC");
+        assert_eq!(format_utc(0), "1970-01-01 00:00 UTC");
+        assert_eq!(format_utc(951_782_400), "2000-02-29 00:00 UTC");
     }
 
     /// `civil_from_days` names the right date at the century and 400-year
