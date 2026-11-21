@@ -6654,6 +6654,61 @@ mod tests {
 
     /// `human_needed` after an agent pass gates in auto mode too (D-08), and the
     /// gate names the status.
+    /// D-06 (999.254): the `human_needed` gate and its reopen both name the
+    /// route for sign-offs that can only run after the run ends: `gate reject
+    /// --note`, which `/gsd-quick` records. Control: a `gaps_found` gate does
+    /// not carry it.
+    #[test]
+    fn a_human_needed_gate_names_the_reject_note_route_for_post_run_sign_offs() {
+        if !in_bounded_child(
+            "pipeline_outcomes::tests::a_human_needed_gate_names_the_reject_note_route_for_post_run_sign_offs",
+        ) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5236);
+        let _gsd = validate_evidence(root, phase, &[gsd_says(GsdStatus::HumanNeeded); 2]);
+        let mut state = validate_state(root, phase, Mode::Auto);
+        let gates = at_the_gates(
+            root,
+            phase,
+            Stage::Validate,
+            &[approve_answer(), abort_answer()],
+            || {
+                let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Passed);
+            },
+        );
+        let answer = format!("answer with `devflow gate reject {phase} --note");
+        for (which, gate) in [("first", &gates[0]), ("reopened", &gates[1])] {
+            assert_eq!(gate["gate_kind"], "human_needed", "{which}: {gate}");
+            let context = gate["context"].as_str().unwrap();
+            for needle in [
+                "can only run after this run ends",
+                answer.as_str(),
+                "`/gsd-quick` records them",
+            ] {
+                assert!(context.contains(needle), "{which}: `{needle}`: {context}");
+            }
+        }
+
+        // Control: a `gaps_found` gate does not carry the route.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5237);
+        let _gsd = validate_evidence(root, phase, &[gsd_says(GsdStatus::GapsFound)]);
+        let mut state = validate_state(root, phase, Mode::Auto);
+        let (gate, _) = at_the_validate_gate(root, phase, &abort_answer(), || {
+            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Passed);
+        });
+        assert_eq!(gate["gate_kind"], "gaps_found", "control: {gate}");
+        let context = gate["context"].as_str().unwrap();
+        assert!(
+            !context.contains("can only run after this run ends"),
+            "control: no post-run route on gaps_found: {context}"
+        );
+    }
+
     #[test]
     fn a_human_needed_report_gates_in_auto_mode() {
         if !in_bounded_child("pipeline_outcomes::tests::a_human_needed_report_gates_in_auto_mode") {
