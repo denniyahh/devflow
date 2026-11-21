@@ -5908,6 +5908,114 @@ mod tests {
         );
     }
 
+    /// D-04: a reset two days out (the Phase 53 values) leads, right after the
+    /// way-on sentence, with the way to another agent, and still names the
+    /// reset as a UTC time and a distance inside the display cut; approve
+    /// says it relaunches into the same limit. Controls: a reset an hour out
+    /// keeps the near layout; a spent fallback is named in place of
+    /// `<other>`; an unused fallback, which `resume --agent` refuses, is not.
+    #[test]
+    fn a_rate_limit_gate_two_days_out_leads_with_another_agent() {
+        let phase = PhaseId::with_minor(999, 250);
+        let now = 1_795_102_140;
+        let far = Some("rate limited until 1795294800".to_string());
+        let claude = || {
+            State::new(
+                phase,
+                AgentKind::Claude,
+                Mode::Supervise,
+                PathBuf::from("/nonexistent"),
+            )
+        };
+        let stop = format!("`devflow stop --phase {phase}`");
+        let other = format!("`devflow resume --phase {phase} --agent <other>`");
+        let to_codex = format!("`devflow resume --phase {phase} --agent codex`");
+
+        let context = rate_limit_gate_context(&claude(), phase, Stage::Code, far.clone(), now);
+        let shown = devflow_core::gates::render_gate_context(
+            &context,
+            devflow_core::gates::GATE_CONTEXT_DISPLAY_CHARS,
+        );
+        for wanted in ["2026-11-21 21:00 UTC", "in 2 d 5 h", &stop, &other] {
+            assert!(shown.contains(wanted), "`{wanted}` inside the cut: {shown}");
+        }
+        let lead = &context[..context.find(" Cause: ").expect("a cause")];
+        assert!(
+            !lead.contains("1795294800"),
+            "raw reset in the lead: {lead}"
+        );
+        let sentence = way_on_sentence(GateKind::RateLimit, phase, Stage::Code, None);
+        leads_with_only(&context, &sentence).unwrap();
+        assert!(
+            sentence.contains("into the same limit until it resets"),
+            "{sentence}"
+        );
+
+        let near = Some(format!("rate limited until {}", now + 3600));
+        let context = rate_limit_gate_context(&claude(), phase, Stage::Code, near, now);
+        assert!(
+            !context.contains("devflow stop --phase"),
+            "control: a near reset keeps the near layout: {context}"
+        );
+
+        let mut spent = claude();
+        spent.fallback_agent = Some(AgentKind::Codex);
+        spent.fallback_consumed = true;
+        let context = rate_limit_gate_context(&spent, phase, Stage::Code, far.clone(), now);
+        assert!(
+            context.contains(&to_codex) && !context.contains("<other>"),
+            "a spent fallback is named: {context}"
+        );
+
+        let mut unused = claude();
+        unused.fallback_agent = Some(AgentKind::Codex);
+        unused.fallback_consumed = false;
+        let context = rate_limit_gate_context(&unused, phase, Stage::Code, far, now);
+        assert!(
+            context.contains(&other)
+                && !context.contains("`--agent codex`")
+                && !context.contains(&to_codex),
+            "an unused fallback is not named: {context}"
+        );
+    }
+
+    /// D-04, display cut: at Validate, whose name the text repeats, with the
+    /// longest phase id and the longest agent name, both commands of the far
+    /// route end inside the 450-character cut.
+    #[test]
+    fn a_far_reset_route_survives_the_display_cut_at_validate_with_the_longest_phase_id() {
+        let phase = PhaseId::with_minor(u32::MAX, u32::MAX);
+        let stage = Stage::Validate;
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            PathBuf::from("/nonexistent"),
+        );
+        state.fallback_agent = Some(AgentKind::Antigravity);
+        state.fallback_consumed = true;
+        let context = rate_limit_gate_context(
+            &state,
+            phase,
+            stage,
+            Some("rate limited until 1795294800".into()),
+            1_795_102_140,
+        );
+        let shown = devflow_core::gates::render_gate_context(
+            &context,
+            devflow_core::gates::GATE_CONTEXT_DISPLAY_CHARS,
+        );
+        for wanted in [
+            format!("`devflow stop --phase {phase}`"),
+            format!("`devflow resume --phase {phase} --agent antigravity`"),
+        ] {
+            assert!(
+                shown.contains(&wanted),
+                "`{wanted}` inside the cut at {stage} for phase {phase}: {shown}"
+            );
+        }
+    }
+
     /// The current time in epoch seconds, the base a test's reset is
     /// computed from, so no fixed epoch ages from future to past.
     fn epoch_now_for_test() -> i64 {
