@@ -7880,6 +7880,73 @@ mod tests {
         Gates::open_question_registered(root, phase, stage, &spec).unwrap()
     }
 
+    /// A `std::io::Write` that appends to a buffer shared with the test, for
+    /// capturing what a tracing subscriber writes.
+    #[derive(Clone)]
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `open_question_gate_id` for `phase` and `stage`, and the text the tracing
+    /// events it raised render to.
+    fn open_question_gate_id_logged(
+        root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+    ) -> (Option<GateId>, String) {
+        let log = CapturedLog(Default::default());
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let id = tracing::subscriber::with_default(subscriber, || {
+            open_question_gate_id(root, phase, stage)
+        });
+        let captured = String::from_utf8_lossy(&log.0.lock().unwrap()).into_owned();
+        (id, captured)
+    }
+
+    /// 999.258: a question gate whose id does not parse reads as no question gate
+    /// and is warned about, naming the id; a well-formed one is read without one.
+    #[test]
+    fn an_unparsable_question_gate_id_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, stage) = (PhaseId::new(5343), Stage::Code);
+        let (opened, registration) = open_budget_question(root, phase, stage);
+
+        let (id, captured) = open_question_gate_id_logged(root, phase, stage);
+        assert_eq!(id, Some(opened.gate_id.clone()), "control: {captured:?}");
+        assert!(
+            !captured.contains("could not be parsed"),
+            "control: a well-formed gate id was warned about: {captured:?}"
+        );
+
+        let path = Gates::gate_path(root, phase, stage);
+        let mut gate: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        gate["gate_id"] = serde_json::Value::from("not a gate id");
+        std::fs::write(&path, serde_json::to_string(&gate).unwrap()).unwrap();
+
+        let (id, captured) = open_question_gate_id_logged(root, phase, stage);
+        assert_eq!(id, None, "{captured:?}");
+        assert!(
+            captured.contains("gate id could not be parsed") && captured.contains("not a gate id"),
+            "an unparsable question gate id is dropped without a warning: {captured:?}"
+        );
+        registration.finish();
+    }
+
     fn option_choice(option_id: &str) -> QuestionChoice {
         QuestionChoice::Option {
             option_id: option_id.to_string(),
