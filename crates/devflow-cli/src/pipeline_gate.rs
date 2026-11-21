@@ -2849,4 +2849,91 @@ mod tests {
             timeout_end
         );
     }
+
+    /// GSD 1.22's `phase.complete` reply when it updated ROADMAP.md and
+    /// STATE.md and pruned nothing.
+    const PHASE_COMPLETE_REPLY: &str = r#"{"roadmap_updated":true,"state_updated":true,"requirements_updated":false,"auto_pruned":false}"#;
+
+    /// GSD's `query planning.inspect` reply for `root` resolving its planning
+    /// directory to `planning_root`.
+    fn planning_inspect_reply(root: &Path, planning_root: &Path) -> String {
+        serde_json::json!({
+            "generated_from": { "cwd": root, "planning_root": planning_root }
+        })
+        .to_string()
+    }
+
+    /// The position of the last `name` event in `root`'s event log.
+    fn last_event_position(root: &Path, name: &str) -> Option<usize> {
+        std::fs::read_to_string(devflow_core::events::events_path(root))
+            .unwrap_or_default()
+            .lines()
+            .enumerate()
+            .filter_map(|(index, line)| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .ok()
+                    .map(|event| (index, event))
+            })
+            .filter(|(_, event)| event["event"] == name)
+            .map(|(index, _)| index)
+            .last()
+    }
+
+    /// D-10: a finished run asks GSD to mark the phase complete and commits
+    /// the files GSD reported writing, through GSD's own tools, in the
+    /// evidence root, after `workflow_finished`.
+    #[test]
+    fn a_finish_runs_gsd_phase_complete_in_the_evidence_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5285);
+        let mut state = noted_state(root, phase, Stage::Validate);
+        workflow::save_state(&state).unwrap();
+        let inspect = planning_inspect_reply(root, &root.join(".planning"));
+        let gsd = GsdStub::answering(
+            root,
+            &[
+                &inspect,
+                PHASE_COMPLETE_REPLY,
+                r#"{"committed":true,"hash":"abc1234"}"#,
+            ],
+        );
+
+        finish_run(root, &mut state, test_permit()).unwrap();
+
+        let canonical = root.canonicalize().unwrap();
+        let expected = vec![
+            (canonical.clone(), "query planning.inspect".to_string()),
+            (
+                canonical.clone(),
+                format!("query phase.complete {phase} --json-errors"),
+            ),
+            (
+                canonical,
+                format!(
+                    "query commit docs(phase-{phase}): complete phase execution --json-errors \
+                     --files .planning/ROADMAP.md .planning/STATE.md"
+                ),
+            ),
+        ];
+        assert_eq!(
+            gsd.calls(),
+            expected,
+            "GSD's planning read, phase.complete and commit, in the evidence root"
+        );
+        let event =
+            devflow_core::events::last_event_of_kind_for_phase(root, phase, "gsd_phase_complete")
+                .expect("the finish records gsd_phase_complete");
+        assert_eq!(event["ok"], true, "{event}");
+        assert_eq!(event["committed"], true, "{event}");
+        assert!(
+            last_event_position(root, "workflow_finished")
+                < last_event_position(root, "gsd_phase_complete"),
+            "gsd_phase_complete comes after workflow_finished"
+        );
+        assert!(
+            workflow::load_state(root, phase).unwrap().finished,
+            "the run is finished"
+        );
+    }
 }
