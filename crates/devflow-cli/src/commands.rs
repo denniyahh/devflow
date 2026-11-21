@@ -1456,7 +1456,15 @@ pub(crate) fn cleanup(project_root: &Path) -> Result<(), CliError> {
 
     worktree::prune(project_root)?;
     if !outcomes.contains(&CleanupOutcome::Removed) {
-        println!("no worktrees to clean up");
+        let kept = outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, CleanupOutcome::Kept | CleanupOutcome::Unsettled))
+            .count();
+        if kept == 0 {
+            println!("no worktrees to clean up");
+        } else {
+            println!("removed nothing; kept {kept} (each listed above with its reason)");
+        }
     }
     sweep_merged_branches(project_root, &git)?;
     let unsettled = outcomes
