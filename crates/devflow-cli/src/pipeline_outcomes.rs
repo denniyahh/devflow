@@ -2336,6 +2336,16 @@ pub(crate) fn failure_gate_context(state: &State, stage: Stage, reason: Option<S
     )
 }
 
+/// The sentence a stage-failure gate ends with for a stage that stopped for
+/// operator decisions (D-05, 999.249).
+fn decisions_note_sentence(
+    _phase: PhaseId,
+    _stage: Stage,
+    _canary_refusal: Option<&str>,
+) -> String {
+    String::new()
+}
+
 /// Fire the never-silent failure gate with [`failure_gate_context`].
 pub(crate) fn handle_stage_failure(
     project_root: &Path,
@@ -5496,6 +5506,78 @@ mod tests {
         );
     }
 
+    /// D-05 (999.249): a stage-failure gate ends by naming `gate reject
+    /// --note` as the answer for decisions the agent asks for, and that the
+    /// note reaches the relaunched agent; under a refusing delivery canary it
+    /// says the note is kept for the resume on another agent instead. Nothing
+    /// after the way-on sentence names an answer outside that one sentence.
+    #[test]
+    fn a_stage_failure_gate_names_the_reject_note_as_the_answer_to_decisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(5232);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Auto,
+            dir.path().to_path_buf(),
+        );
+        let reason = "Planning needs two operator decisions: the budget and the attempt cap";
+        let context = failure_gate_context(&state, Stage::Plan, Some(reason.into()));
+        let answer = format!("answer with `devflow gate reject {phase} --note \"<decisions>\"`");
+        assert!(context.contains(&answer), "names the answer: {context}");
+        assert!(
+            context.contains("reaches the relaunched plan agent's prompt"),
+            "says the note reaches the agent: {context}"
+        );
+        let sentence = way_on_sentence(GateKind::StageFailure, phase, Stage::Plan, None);
+        let allowed = decisions_note_sentence(phase, Stage::Plan, None);
+        assert_eq!(
+            leads_with_only_allowing(&context, &sentence, &allowed),
+            Ok(()),
+            "C2 holds with the one allowed sentence"
+        );
+
+        // Control: an answer word outside the allowed sentence still fails.
+        let planted = format!("{context} gate approve");
+        let why = leads_with_only_allowing(&planted, &sentence, &allowed).unwrap_err();
+        assert!(why.contains("`approve`"), "control names approve: {why}");
+
+        // Control: under a refusing canary the note is kept for the resume.
+        state.canary = Some(devflow_core::canary::CanaryOutcome::Absent);
+        let refused = failure_gate_context(&state, Stage::Plan, Some(reason.into()));
+        assert!(
+            refused.contains("is kept for the `devflow resume --phase"),
+            "the note is kept for the resume: {refused}"
+        );
+        assert!(
+            !refused.contains("reaches the relaunched"),
+            "no relaunch under a refusing canary: {refused}"
+        );
+    }
+
+    /// D-05: a decisions reason that itself names an answer word (the agent's
+    /// text, which this test does not police) is stored verbatim and the gate
+    /// still ends with the reject-note sentence.
+    #[test]
+    fn a_decisions_reason_naming_an_answer_word_still_gets_the_reject_note_sentence() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(5233);
+        let state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Auto,
+            dir.path().to_path_buf(),
+        );
+        let reason = "Planning needs two operator decisions: the budget and the retry cap";
+        let context = failure_gate_context(&state, Stage::Plan, Some(reason.into()));
+        assert!(context.contains(reason), "the reason verbatim: {context}");
+        let sentence = decisions_note_sentence(phase, Stage::Plan, None);
+        assert!(
+            !sentence.is_empty() && context.ends_with(&sentence),
+            "ends with the reject-note sentence: {context}"
+        );
+    }
+
     #[test]
     fn gate_context_rendering_neutralizes_all_controls_and_obeys_limit() {
         let rendered = render_gate_context("line 1\n\u{1b}[2J\tline 2\u{7}", 100);
@@ -8355,6 +8437,38 @@ mod tests {
             .strip_prefix(sentence)
             .ok_or_else(|| format!("the context does not start with the sentence: {context}"))?;
         let lower = rest.to_lowercase();
+        match ANSWER_WORDS.iter().find(|word| lower.contains(*word)) {
+            Some(word) => Err(format!(
+                "the text after the sentence names `{word}`: {rest}"
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// [`leads_with_only`], except that the text after the sentence must hold
+    /// `allowed` exactly once, and that one occurrence is removed before the
+    /// answer-word scan: the one exact sentence production renders for a gate
+    /// whose reject route is offered (D-05, D-06).
+    fn leads_with_only_allowing(
+        context: &str,
+        sentence: &str,
+        allowed: &str,
+    ) -> Result<(), String> {
+        let body = context.strip_prefix("[never-silent] ").unwrap_or(context);
+        let rest = body
+            .strip_prefix(sentence)
+            .ok_or_else(|| format!("the context does not start with the sentence: {context}"))?;
+        let count = if allowed.is_empty() {
+            0
+        } else {
+            rest.matches(allowed).count()
+        };
+        if count != 1 {
+            return Err(format!(
+                "the allowed sentence is absent (found {count} times): {rest}"
+            ));
+        }
+        let lower = rest.replacen(allowed, "", 1).to_lowercase();
         match ANSWER_WORDS.iter().find(|word| lower.contains(*word)) {
             Some(word) => Err(format!(
                 "the text after the sentence names `{word}`: {rest}"
