@@ -4,17 +4,17 @@ milestone: v4.0
 milestone_name: milestone (ACTIVE — Session Continuity)
 current_phase: "53.1"
 current_phase_name: Phase 53 remediation
-status: executing
-stopped_at: Completed 53.1-07-PLAN.md
-last_updated: "2026-11-21T20:58:07.152Z"
+status: verifying
+stopped_at: Completed 53.1-08-PLAN.md
+last_updated: "2026-11-21T21:07:43.428Z"
 last_activity: 2026-11-21
 last_activity_desc: Phase 53.1 execution started
-state_head: 10cdf06b82d3d9f9876e7a4314162e9773c6b7d8
+state_head: 5fb43d72989752506dd052c10c02d0553a1ba134
 progress:
   total_phases: 7
   completed_phases: 1
   total_plans: 88
-  completed_plans: 87
+  completed_plans: 88
   percent: 14
 ---
 
@@ -173,7 +173,7 @@ change earns 2.0.
 
 Phase: 53.1 (Phase 53 remediation) — EXECUTING
 Plan: 8 of 8
-Status: Ready to execute
+Status: Phase complete — ready for verification
 Last activity: 2026-11-21 — Phase 53.1 execution started
 
 
@@ -1052,6 +1052,7 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 53.1]: 53.1-06: a cut stage-failure reason is bounded by bound_stage_reason (phase-specific suffix); truncate_reason and the core TRUNCATED display suffix are unchanged
 - [Phase 53.1]: 53.1-07: the planning-root check compares canonical paths (falling back to the given path), so a symlinked evidence root is not read as a scoped planning directory
 - [Phase 53.1]: 53.1-07: a phase.complete reply with all four write flags false commits nothing and records ok true, committed false, commit_failure null
+- [Phase 53.1]: 53.1-08: 999.251's Plan->Validate residual filed as 999.260; the resume row names it
 
 ## Roadmap Evolution
 
@@ -1250,11 +1251,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 53.1 P05 | 25min | 3 tasks | 10 files |
 | Phase 53.1 P06 | 17min | 3 tasks | 3 files |
 | Phase 53.1 P07 | 17min | 3 tasks | 6 files |
+| Phase 53.1 P08 | 8min | 2 tasks | 2 files |
 
 ## Session
 
-**Last session:** 2026-11-21T20:58:05.502Z
-**Stopped at:** Completed 53.1-07-PLAN.md
+**Last session:** 2026-11-21T21:07:41.726Z
+**Stopped at:** Completed 53.1-08-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
