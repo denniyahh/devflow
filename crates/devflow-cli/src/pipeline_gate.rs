@@ -2993,4 +2993,164 @@ mod tests {
             "the run is finished"
         );
     }
+
+    /// The last `gsd_phase_complete` event of `phase` at `root`.
+    fn completion_event(root: &Path, phase: PhaseId) -> serde_json::Value {
+        devflow_core::events::last_event_of_kind_for_phase(root, phase, "gsd_phase_complete")
+            .expect("the finish records gsd_phase_complete")
+    }
+
+    /// D-10: a refused `phase.complete` (stale verification) is printed and
+    /// recorded with GSD's reason and its path-free message, runs no commit
+    /// and leaves the run finished. The repository is reached through a
+    /// symlink while GSD names the canonical path and its home, so both forms
+    /// of each must be replaced (review agy 9).
+    #[test]
+    fn a_refused_phase_complete_does_not_undo_the_finish() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        let link = tmp.path().join("link");
+        std::fs::create_dir_all(real.join(".planning")).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let phase = PhaseId::new(5287);
+        let mut state = noted_state(&link, phase, Stage::Validate);
+        workflow::save_state(&state).unwrap();
+        let canonical = real.canonicalize().unwrap();
+        let inspect = planning_inspect_reply(&canonical, &canonical.join(".planning"));
+        let gsd = GsdStub::answering(&link, &[&inspect, "!exit 1"]);
+        let home = gsd.home();
+        let refusal = serde_json::json!({
+            "ok": false,
+            "reason": "phase_verification_incomplete",
+            "message": format!(
+                "Phase {phase} verification is incomplete: Verification is stale — covered \
+                 source files changed after the verifier last ran: {}/crates/x.rs (GSD at {}/.claude)",
+                canonical.display(),
+                home.display()
+            ),
+        });
+        gsd.script_reply(2, &format!("!exit 1\n{refusal}"));
+
+        finish_run(&link, &mut state, test_permit()).unwrap();
+
+        assert!(
+            workflow::load_state(&link, phase).unwrap().finished,
+            "the run is finished"
+        );
+        assert_eq!(events_named(&link, "workflow_finished").len(), 1);
+        let calls: Vec<String> = gsd.calls().into_iter().map(|(_, argv)| argv).collect();
+        assert_eq!(
+            calls,
+            vec![
+                "query planning.inspect".to_string(),
+                format!("query phase.complete {phase} --json-errors"),
+            ],
+            "no commit after a refusal"
+        );
+        let event = completion_event(&link, phase);
+        assert_eq!(event["ok"], false, "{event}");
+        assert_eq!(event["failure"], "gsd_reader_nonzero_exit", "{event}");
+        assert_eq!(event["reason"], "phase_verification_incomplete", "{event}");
+        let message = event["message"].as_str().expect("GSD's message");
+        assert!(message.contains("verification is incomplete"), "{event}");
+        let text = event.to_string();
+        for path in [
+            &real,
+            &canonical,
+            &link,
+            &home,
+            &home.canonicalize().unwrap(),
+        ] {
+            assert!(
+                !text.contains(&path.display().to_string()),
+                "the event carries an absolute path: {event}"
+            );
+        }
+    }
+
+    /// Review agy 9: a GSD commit that fails after a successful
+    /// `phase.complete` is recorded as not committed, never as a refusal.
+    #[test]
+    fn a_failed_gsd_commit_after_phase_complete_is_recorded_as_not_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5288);
+        let mut state = noted_state(root, phase, Stage::Validate);
+        workflow::save_state(&state).unwrap();
+        let inspect = planning_inspect_reply(root, &root.join(".planning"));
+        let _gsd = GsdStub::answering(
+            root,
+            &[
+                &inspect,
+                PHASE_COMPLETE_REPLY,
+                "!exit 1\n{\"ok\":false,\"reason\":\"commit_outside_worktree\",\"message\":\"refused\"}",
+            ],
+        );
+
+        finish_run(root, &mut state, test_permit()).unwrap();
+
+        assert!(workflow::load_state(root, phase).unwrap().finished);
+        let event = completion_event(root, phase);
+        let reported_as_refusal =
+            format!("a failed commit was reported as a phase.complete refusal: {event}");
+        assert_eq!(event["ok"], true, "{reported_as_refusal}");
+        assert_eq!(event["committed"], false, "{reported_as_refusal}");
+        assert_eq!(
+            event["commit_failure"], "gsd_reader_nonzero_exit",
+            "{reported_as_refusal}"
+        );
+    }
+
+    /// Review agy 9: a GSD commit that commits nothing is `committed: false`
+    /// with no failure label.
+    #[test]
+    fn a_gsd_commit_that_commits_nothing_is_recorded_as_not_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5289);
+        let mut state = noted_state(root, phase, Stage::Validate);
+        workflow::save_state(&state).unwrap();
+        let inspect = planning_inspect_reply(root, &root.join(".planning"));
+        let _gsd = GsdStub::answering(
+            root,
+            &[
+                &inspect,
+                PHASE_COMPLETE_REPLY,
+                r#"{"committed":false,"hash":null,"reason":"nothing_to_commit"}"#,
+            ],
+        );
+
+        finish_run(root, &mut state, test_permit()).unwrap();
+
+        let event = completion_event(root, phase);
+        assert_eq!(event["ok"], true, "{event}");
+        assert_eq!(event["committed"], false, "{event}");
+        assert_eq!(event["commit_failure"], serde_json::Value::Null, "{event}");
+    }
+
+    /// Review agy 9: with no GSD launcher the finish records the failure's
+    /// label and no message, so the home it searched never reaches an event.
+    #[test]
+    fn a_missing_gsd_launcher_at_finish_records_its_label_without_a_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5290);
+        let mut state = noted_state(root, phase, Stage::Validate);
+        workflow::save_state(&state).unwrap();
+
+        finish_run(root, &mut state, test_permit()).unwrap();
+
+        let event = completion_event(root, phase);
+        assert_eq!(event["ok"], false, "{event}");
+        assert_eq!(event["failure"], "gsd_launcher_not_found", "{event}");
+        assert_eq!(event["message"], serde_json::Value::Null, "{event}");
+        let text = event.to_string();
+        assert!(!text.contains("$HOME"), "{event}");
+        if let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) {
+            assert!(
+                !text.contains(&*home.to_string_lossy()),
+                "the event carries the home: {event}"
+            );
+        }
+    }
 }
