@@ -406,7 +406,7 @@ pass on that commit.
 | Gate kind | Approve | Reject with a note | Abort |
 |---|---|---|---|
 | `stage_failure` | retries the stage | relaunches the stage with the note | ends the run |
-| `rate_limit` | relaunches the stage now on the same agent | relaunches the stage with the note | ends the run |
+| `rate_limit` | relaunches the stage now on the same agent, into the same limit until it resets | relaunches the stage with the note | ends the run |
 | `stage_failure` on a run whose recorded delivery canary refuses its agent | stops the run; the way on is `devflow resume --phase N --agent <other>` | the same, and the note is kept for that resume | ends the run |
 | `preflight` | relaunches the stage with the failed check overridden | not offered: refused | ends the run |
 | `question` (answered with `devflow gate answer <phase> --gate-id <id> (--option <id> \| --text <answer>)`) | refused, naming `gate answer` | refused, naming `gate answer` | ends the run |
@@ -480,11 +480,23 @@ A rate-limited stage gets one of two answers.
   fallback can still be refused there (its binary gone, say). The gate shows in
   `devflow gate list` and `devflow gate show`, and fires the notify command.
   It is its own kind of gate (`gate_kind: rate_limit`). Its context leads with
-  the routers' way-on sentence, then `devflow resume --phase N` (with
-  `--agent <agent>` when the run is not on `claude`), then the reset time when
-  the denial carried one (`the limit resets at <time>`, otherwise `the denial
-  carried no reset time`), then the cause. `devflow gate approve N` relaunches
-  the stage now, on the same agent (`relaunch_now`); `devflow gate reject N
+  the routers' way-on sentence. When the denial named a reset more than 6 hours
+  away, the first clause after it is the way to another agent: `devflow stop
+  --phase N`, then `devflow resume --phase N --agent <other>` (the run's
+  fallback in place of `<other>` only once it is spent, since `resume --agent`
+  onto a saved unused fallback is refused), then the reset as `the limit resets
+  at <YYYY-MM-DD HH:MM> UTC, in <distance>`, then `devflow resume --phase N`
+  for the same agent. Within 6 hours, or with a reset already past, it is
+  `devflow resume --phase N` (with `--agent <agent>` when the run is not on
+  `claude`) first, then the reset in the same form (`the denial carried no
+  reset time` when the denial named none), then the cause. `devflow gate abort`
+  ends the run and clears its state, so it is not a way to another agent:
+  `resume` refuses afterwards. On a `--mode auto` run, `devflow resume --agent`
+  admits only an agent with the unattended launch shape (`claude` or
+  `antigravity`), because the handoff is preflighted as an unattended launch
+  and `resume` takes no `--mode`. `devflow gate approve N` relaunches the stage
+  now, on the same agent, into the same limit until it resets
+  (`relaunch_now`); `devflow gate reject N
   --note <text>` relaunches it with the note in the stage's prompt
   (`relaunch_with_note`; an empty note is refused); `devflow gate abort N` ends
   the run. The run's recorded delivery canary does not change these answers.
