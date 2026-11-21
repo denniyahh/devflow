@@ -229,17 +229,20 @@ fn a_call_offering_a_recommended_id_not_in_options_is_refused() {
 }
 
 /// A gate notify command that writes the hook's `DEVFLOW_GATE_CONTEXT` to
-/// `marker`.
+/// `marker`. It writes a temp file beside the marker and renames it into
+/// place, so a reader polling `marker.exists()` never sees it half-written.
 fn marker_hook(marker: &std::path::Path) -> String {
     marker_hook_with_delay(marker, 0)
 }
 
-/// [`marker_hook`] with `delay_secs` of sleep between the marker file's
-/// creation and the write, so a reader can catch it half-written.
+/// [`marker_hook`] with `delay_secs` of sleep between the temp file's
+/// creation and the write, so a reader that could see an unpublished marker
+/// would read it empty.
 fn marker_hook_with_delay(marker: &std::path::Path, delay_secs: u32) -> String {
+    let marker = marker.display();
     format!(
-        "{{ sleep {delay_secs}; printf '%s' \"$DEVFLOW_GATE_CONTEXT\"; }} > '{}'",
-        marker.display()
+        "{{ sleep {delay_secs}; printf '%s' \"$DEVFLOW_GATE_CONTEXT\"; }} > '{marker}.tmp' \
+         && mv '{marker}.tmp' '{marker}'"
     )
 }
 
