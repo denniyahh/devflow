@@ -616,7 +616,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 53 | 14/14 | In Progress | — |
 | 54 | 0/? | Not started | — |
 | 55 | 0/? | Not started | — |
-| 53.1. Phase 53 remediation | 8/8 | In Progress | - |
+| 53.1. Phase 53 remediation | 8/8 | Complete | 2026-11-21 |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
 
