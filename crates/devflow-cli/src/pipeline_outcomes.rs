@@ -181,7 +181,7 @@ fn rate_limit_gate_context(
         GateKind::RateLimit,
         (phase, stage),
         None,
-        &stage_failure_context(stage, &lead, reason),
+        &stage_failure_context(phase, stage, &lead, reason),
     )
 }
 
@@ -2306,15 +2306,39 @@ pub(crate) fn truncate_reason(reason: &str) -> String {
     render_gate_context(reason, GATE_CONTEXT_STORED_MAX_CHARS)
 }
 
-/// The never-silent gate context for a failed `stage`, with its `reason`
-/// stored whole up to [`truncate_reason`]'s bound. `lead` goes before the
-/// reason, so it survives the pending-gate banner's and `gate list`'s display
-/// bound whatever the reason's length.
-fn stage_failure_context(stage: Stage, lead: &str, reason: Option<String>) -> String {
+/// The never-silent gate context for a failed `stage` of `phase`, with its
+/// `reason` stored whole up to [`bound_stage_reason`]'s bound. `lead` goes
+/// before the reason, so it survives the pending-gate banner's and `gate
+/// list`'s display bound whatever the reason's length.
+fn stage_failure_context(phase: PhaseId, stage: Stage, lead: &str, reason: Option<String>) -> String {
     format!(
         "[never-silent] stage {stage} failed: {lead}{}",
-        truncate_reason(&reason.unwrap_or_else(|| "no details available".into()))
+        bound_stage_reason(
+            phase,
+            &reason.unwrap_or_else(|| "no details available".into())
+        )
     )
+}
+
+/// A failure `reason` as a stage-failure gate stores it (999.206, D-02): one
+/// sanitized line of at most [`GATE_CONTEXT_STORED_MAX_CHARS`] characters.
+/// Past the bound it is cut and ends with a suffix naming the phase's own
+/// capture, `.devflow/phase-NN-stdout` (padded as
+/// [`agent_result::stdout_path`] pads it), so the operator knows where the
+/// rest is. That file holds the capture while the gate is open; the next
+/// launch archives it under `.devflow/history/phase-NN/`.
+fn bound_stage_reason(phase: PhaseId, reason: &str) -> String {
+    let sanitized = render_gate_context(reason, usize::MAX);
+    if sanitized.chars().count() <= GATE_CONTEXT_STORED_MAX_CHARS {
+        return sanitized;
+    }
+    let suffix = format!(
+        "… [truncated; full output in .devflow/phase-{}-stdout]",
+        phase.padded()
+    );
+    let keep = GATE_CONTEXT_STORED_MAX_CHARS.saturating_sub(suffix.chars().count());
+    let head: String = sanitized.chars().take(keep).collect();
+    format!("{head}{suffix}")
 }
 
 /// The gate context for a failed stage: the way-on sentence the routers render
@@ -2336,7 +2360,7 @@ pub(crate) fn failure_gate_context(state: &State, stage: Stage, reason: Option<S
         GateKind::StageFailure,
         (state.phase, stage),
         canary_refusal.as_deref(),
-        &stage_failure_context(stage, "", reason),
+        &stage_failure_context(state.phase, stage, "", reason),
     );
     let note = decisions_note_sentence(state.phase, stage, canary_refusal.as_deref());
     format!("{context}{note}")
