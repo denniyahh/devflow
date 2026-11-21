@@ -359,10 +359,21 @@ closing this phase.
 **Goal:** Fix the DevFlow defects found while dogfooding Phase 53 and in the PR #245 review, plus the backlog items earmarked for this phase (operator, 2026-11-19), so the next dogfooded phase runs without the workarounds Phase 53 needed. In scope: 999.250, 999.251, 999.252, 999.253, 999.254, 999.255, 999.257, 999.258 (from the Phase 53 run and review), and 999.240, 999.249, 999.219, 999.213, 999.206, 999.202, 999.201, 999.193, 999.189 (earmarked backlog). Some of the earmarked items may already be fixed by Phases 52–53; discuss checks each one against the current code and drops or narrows those, with the evidence.
 **Requirements**: TBD (one per in-scope 999.x item, set in discuss)
 **Depends on:** Phase 53
-**Plans:** 0 plans
+**Plans:** 7 plans
 
 Plans:
-- [ ] TBD (run /gsd-plan-phase 53.1 to break down)
+**Wave 1**
+- [ ] 53.1-01-PLAN.md — stream `error_rate_limit` classified RateLimited (999.201); close the four fixed entries, 999.252 and 999.206 notes (wave 1)
+- [ ] 53.1-02-PLAN.md — rate-limit gate: reset as UTC time and distance, far reset leads with stop then `resume --agent` (999.250) (wave 1)
+- [ ] 53.1-03-PLAN.md — resume after `--until` starts the next stage (999.251); late cancel and pi comment (999.258) (wave 1)
+- [ ] 53.1-04-PLAN.md — cleanup of a stopped run stops contradicting itself (999.213); unparsable question gate id warns (999.258) (wave 1)
+- [ ] 53.1-05-PLAN.md — post-commit marker out of the tree (999.240/253), live-payload CONTEXT.md (999.255), atomic notify marker (999.257) (wave 1)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+- [ ] 53.1-06-PLAN.md — stage-failure decisions note (999.249), capture-file suffix and gate show pin (999.206), post-run sign-off route (999.254) (wave 2)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+- [ ] 53.1-07-PLAN.md — finish runs GSD's phase.complete and commit (999.259); OPERATIONS docs incl. resume after `--until` (wave 3)
 
 ### Phase 54: Decision Triage
 
