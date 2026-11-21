@@ -884,6 +884,22 @@ close-out was refused: "Verification is stale — covered source files changed a
 documented way to re-verify after a review fix, e.g. run the fix on the phase branch through the run's Validate before finish.
 **Owner:** Phase 53.1.
 
+### Phase 999.260: `devflow resume` After an `--until plan` Halt Reached Through Plan→Validate Starts Code, Not Validate (BACKLOG)
+
+**Found:** 2026-11-21, Phase 53.1 (the residual of the 999.251 fix, 53.1-03).
+**What happened:** after 53.1-03, `resume_loaded` (crates/devflow-cli/src/pipeline_launch.rs:2603) advances a fired `--until`
+cap to `Stage::next` of the halted stage. The halt commit records no target, so a halt reached when a Plan gate's answer runs
+Validate again resumes at Code, where the answer asked for Validate.
+**Evidence:** the `--until` halt commit (crates/devflow-cli/src/pipeline_gate.rs:93-107) sets `stopped` and the halt reason
+but not the target stage; `Step::ValidateAgain` from a stage other than Validate calls `transition(…, Stage::Validate)`
+(crates/devflow-cli/src/pipeline_outcomes.rs:2048-2056), and that transition is the one the cap halts; 53.1-RESEARCH.md
+"999.251" names this residual.
+**Not established:** not seen in a live run; it needs `--until plan` and a verification gate at Plan.
+**Fix shape:** record the halted transition's target in a new persisted `State` field at the halt and resume to it (`State`
+is `#[non_exhaustive]`, crates/devflow-core/src/state.rs:34, so the field is additive), with a test that reaches a Plan
+gate's validate-again under `--until plan`.
+**Owner:** the next DevFlow fix branch or remediation phase, the operator's call.
+
 ### Phase 999.258: Minor Findings From the PR #245 Review (BACKLOG)
 
 **Source:** graphify-labs review of PR #245. Each finding was checked against source (triage in
