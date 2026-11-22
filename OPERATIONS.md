@@ -35,7 +35,7 @@ Plan → Code → Validate
 | Command | Purpose |
 |---|---|
 | `devflow start --phase N --agent claude\|codex\|opencode --mode auto\|supervise [--no-worktree] [--dry-run] [--until plan\|code\|validate] [--fallback-agent <agent>]` | Begin a phase: launches the run as the phase's systemd user unit and returns once the unit is ready ([Run shape](#run-shape)); the unit's runner owns the agent and auto-advances. It runs only a new phase and removes or replaces nothing (52.1 D-09.1, D-20), refusing in this order: a live run (its runner lock is held), naming `devflow stop --phase N`; a finished run, naming the close-out and `devflow discard --phase N`; an incomplete run, naming `devflow resume --phase N`; a state file that does not load, gate files left with no run, or a leftover phase worktree or branch, each naming `devflow discard --phase N`. A state that only a killed `start` left (it never prepared the run) counts as no run, and `start` proceeds over it. `--dry-run` makes the same checks in the same order, read-only: the user-manager probe, these refusals (with no phase holder, write lock or reservation), the agent-binary check and the base branch's resolution, so it prints the refusal a real `start` would print; it never fetches, fast-forwards, creates a worktree or writes under `.devflow/`. A dry run that passes prints one line naming the start checks it skipped (base currency, phase reachability, and the CONTEXT.md/PLAN.md checks on the base), then the pipeline (52.1 D-26, D-27). `--until <stage>` runs through `<stage>` then halts cleanly (no orphaned monitor, no `doctor` false positive) instead of continuing; `--until validate` halts nothing, prints a note saying so and records an `until_noop` event: the run ends as one without `--until` does ([How a run ends](#how-a-run-ends)). `--until define` and `--until ship` are rejected by clap as invalid values: there is no Define or Ship stage. Refuses before scaffolding anything if phase N is not reachable from `develop` (see Preflight refusals below). `--fallback-agent <agent>` names one agent that takes over if the Code stage is rate-limited: one hop per run, at Code only (a rate limit at any other stage waits at the stage's gate), relaunching Code in the same worktree on the same branch. It is saved in `state-NN.json`, and refused when it equals `--agent`, when its binary is missing or its driver unhealthy, and in `--mode auto` unless it is `claude` or `antigravity`. That launch check is best effort: the full preflight runs again at the handoff, a refusal there leaves the run waiting at the Code gate, and a relaunch that fails after the handoff stops at a Code gate (see [Rate-limit failover](#rate-limit-failover)). Without the flag, `start` uses `devflow.toml`'s `fallback_agent` key and prints a note naming it; the flag wins the value, and no environment variable selects a fallback |
-| `devflow resume --phase N [--agent <agent>] [--fallback-agent <agent>]` | Resume a rate-limited or infra-paused phase from its saved stage (loads `state-NN.json`, does not recreate the branch/worktree or reset to Plan) and launches it as a new unit, returning once the unit is ready, as `start` does ([Run shape](#run-shape)) — the command a rate-limit gate names for after the reset. Also clears a `--until`-stopped phase's stop marker, so the phase advances past its old stop point instead of re-stopping immediately. A run that finished (its Validate passed) is refused, naming `devflow start`, and nothing is launched. It reruns the stage, so a pending gate is asked again: it sets any unused answer aside and reports it, and reports an answer that was claimed with no record that it was applied (see [Answering gates](#answering-gates)). `--agent <agent>` hands the run to another agent (an `agent_handoff` event with reason `resume --agent`); naming the run's saved, unused fallback is refused unless `--fallback-agent` names another. `--fallback-agent <agent>` sets the fallback or re-arms a spent one, checked as on `start`; like any resume it is accepted only on a run that is not live. Without it the saved fallback is kept as it is, spent or not: `resume` does not re-read `devflow.toml` |
+| `devflow resume --phase N [--agent <agent>] [--fallback-agent <agent>]` | Resume a rate-limited or infra-paused phase from its saved stage (loads `state-NN.json`, does not recreate the branch/worktree or reset to Plan) and launches it as a new unit, returning once the unit is ready, as `start` does ([Run shape](#run-shape)) — the command a rate-limit gate names for after the reset. A run halted by `--until plan` resumes at Code, with the counters a normal advance resets, and a run the operator stopped resumes at its saved stage; a halt reached through a Plan→Validate move (a Plan gate's answer that runs Validate again) still starts Code, not Validate (999.260). A run that finished (its Validate passed) is refused, naming `devflow start`, and nothing is launched. It reruns the stage, so a pending gate is asked again: it sets any unused answer aside and reports it, and reports an answer that was claimed with no record that it was applied (see [Answering gates](#answering-gates)). `--agent <agent>` hands the run to another agent (an `agent_handoff` event with reason `resume --agent`); naming the run's saved, unused fallback is refused unless `--fallback-agent` names another. `--fallback-agent <agent>` sets the fallback or re-arms a spent one, checked as on `start`; like any resume it is accepted only on a run that is not live. Without it the saved fallback is kept as it is, spent or not: `resume` does not re-read `devflow.toml` |
 | `devflow status` | Every phase with a state: the header lists the active runs and names each other phase's kind (finished, stopped, worktree missing). Per phase: `run: active`, `run: stopped`, `run: finished`, or `run: not active` when its recorded worktree no longer exists (the worktree line is marked `(missing)`); a stopped or finished run's `stop reason:` verbatim; `fallback: armed` (configured, not used), `spent` (already handed off) or `none`; stage, gate state, elapsed, last action. Each phase's first line is its run's liveness answer from the runner lock (`live`, `live (stopping)`, `finished`, `stopped`, `crashed`, …) with the verb that applies; see [Run liveness](#run-liveness). Also shows a held state write lock with its holder, and lists set-aside gate answers |
 | `devflow logs [-f] [--phase N] [--stderr]` | Print/follow a phase's captured agent output |
 | `devflow history [N]` | Show chronological events with retained capture and review evidence for a phase |
@@ -406,7 +406,7 @@ pass on that commit.
 | Gate kind | Approve | Reject with a note | Abort |
 |---|---|---|---|
 | `stage_failure` | retries the stage | relaunches the stage with the note | ends the run |
-| `rate_limit` | relaunches the stage now on the same agent | relaunches the stage with the note | ends the run |
+| `rate_limit` | relaunches the stage now on the same agent, into the same limit until it resets | relaunches the stage with the note | ends the run |
 | `stage_failure` on a run whose recorded delivery canary refuses its agent | stops the run; the way on is `devflow resume --phase N --agent <other>` | the same, and the note is kept for that resume | ends the run |
 | `preflight` | relaunches the stage with the failed check overridden | not offered: refused | ends the run |
 | `question` (answered with `devflow gate answer <phase> --gate-id <id> (--option <id> \| --text <answer>)`) | refused, naming `gate answer` | refused, naming `gate answer` | ends the run |
@@ -480,11 +480,23 @@ A rate-limited stage gets one of two answers.
   fallback can still be refused there (its binary gone, say). The gate shows in
   `devflow gate list` and `devflow gate show`, and fires the notify command.
   It is its own kind of gate (`gate_kind: rate_limit`). Its context leads with
-  the routers' way-on sentence, then `devflow resume --phase N` (with
-  `--agent <agent>` when the run is not on `claude`), then the reset time when
-  the denial carried one (`the limit resets at <time>`, otherwise `the denial
-  carried no reset time`), then the cause. `devflow gate approve N` relaunches
-  the stage now, on the same agent (`relaunch_now`); `devflow gate reject N
+  the routers' way-on sentence. When the denial named a reset more than 6 hours
+  away, the first clause after it is the way to another agent: `devflow stop
+  --phase N`, then `devflow resume --phase N --agent <other>` (the run's
+  fallback in place of `<other>` only once it is spent, since `resume --agent`
+  onto a saved unused fallback is refused), then the reset as `the limit resets
+  at <YYYY-MM-DD HH:MM> UTC, in <distance>`, then `devflow resume --phase N`
+  for the same agent. Within 6 hours, or with a reset already past, it is
+  `devflow resume --phase N` (with `--agent <agent>` when the run is not on
+  `claude`) first, then the reset in the same form (`the denial carried no
+  reset time` when the denial named none), then the cause. `devflow gate abort`
+  ends the run and clears its state, so it is not a way to another agent:
+  `resume` refuses afterwards. On a `--mode auto` run, `devflow resume --agent`
+  admits only an agent with the unattended launch shape (`claude` or
+  `antigravity`), because the handoff is preflighted as an unattended launch
+  and `resume` takes no `--mode`. `devflow gate approve N` relaunches the stage
+  now, on the same agent, into the same limit until it resets
+  (`relaunch_now`); `devflow gate reject N
   --note <text>` relaunches it with the note in the stage's prompt
   (`relaunch_with_note`; an empty note is refused); `devflow gate abort N` ends
   the run. The run's recorded delivery canary does not change these answers.
@@ -659,6 +671,19 @@ or the re-verify pass on its own. A gate context quotes GSD's status as GSD prin
 and says `passed` only when GSD reported `passed`, apart from the way-on
 sentence that leads every verification gate, whose finish rule names `passed`.
 
+Sign-offs that can only run after the run ends. A `human_needed` report can
+ask for proofs that need the parked run to be over, such as a live run of the
+build the phase made. The `human_needed` gate, and the gate an approve reopens
+over a fresh `human_needed`, name the route: install the phase head to a
+separate root while the gate waits, `cargo install --path crates/devflow-cli
+--locked --root <scratch>`, and run `<scratch>/bin/devflow` for the proofs,
+while the parked run keeps the installed binary. Then answer with
+`devflow gate reject N --note "<sign-offs done and results>"`, which runs
+`/gsd-quick` with the note and Validate again. Name `gate reject`: `gate
+approve` also takes `--note`, and an approve reads GSD again and reopens the
+gate without it. DevFlow does not judge the sign-offs itself (Phase 52
+D-45/D-46): GSD's next read decides.
+
 What a run records:
 
 - Each Validate read is one `gsd_verification` event: the agent's verdict and
@@ -682,7 +707,9 @@ What a run records:
 A run records how it ended with one `workflow_finished` event in
 `.devflow/events.jsonl`, followed by one `notify_fired` event carrying the
 same `reason`. The notify command runs once, between the two (see
-[Notify hook](#notify-hook-never-miss-a-gate)).
+[Notify hook](#notify-hook-never-miss-a-gate)). A finish also records one
+`gsd_phase_complete` event between them ([GSD marks the phase
+complete](#gsd-marks-the-phase-complete)).
 
 | `workflow_finished` payload | When | State afterwards |
 |---|---|---|
@@ -708,9 +735,9 @@ permitted (the approve runs Validate again, the gap loop or the re-verify
 pass) is honoured at the next advance safe point as before, and the run ends
 stopped and unfinished.
 
-Finishing never merges, pushes, tags, deletes or resets anything and runs no
-hook: the worktree and the `feature/phase-NN` branch are left as Validate left
-them. The phase is removed from the machine-global gate registry. `cleanup`
+Apart from GSD's completion commit (below), finishing never merges, pushes,
+tags, deletes or resets anything and runs no hook: the worktree and the
+`feature/phase-NN` branch are left as Validate left them. The phase is removed from the machine-global gate registry. `cleanup`
 keeps a finished run's worktree, its state and its branch, naming its stop reason and
 `devflow discard --phase N`, until the branch is merged into the base and the worktree
 is clean; then it removes the worktree and the state. `devflow discard --phase N`
@@ -724,6 +751,48 @@ remove the phase's worktree, branch and run state (it lists them first, and
 refuses a branch with commits not merged into `BASE` unless you name it),
 then run this start again". Close the branch out first (merge it into the
 base) if its work is wanted.
+
+### GSD marks the phase complete
+
+After a finish records `workflow_finished`, DevFlow asks GSD to mark the phase
+complete, in the run's evidence root (the worktree in worktree mode). DevFlow
+edits no planning file itself; it runs GSD's own tools, each bounded to 60 s:
+
+1. `gsd_run query planning.inspect`, to read where GSD will write. A planning
+   directory GSD resolves under a `GSD_PROJECT` or workstream scope is refused
+   before any write, because GSD would update ROADMAP.md and STATE.md there,
+   not in the evidence root's `.planning/`: run
+   `gsd_run query phase.complete N` by hand in that scope.
+2. `gsd_run query phase.complete N --json-errors`, which updates ROADMAP.md,
+   STATE.md and REQUIREMENTS.md and commits nothing.
+3. When GSD reports it updated files, GSD's own commit of exactly those files:
+   `gsd_run query commit "docs(phase-N): complete phase execution" --json-errors --files …`
+   (STATE.md and STATE-ARCHIVE.md as well when GSD's STATE prune ran). The
+   commit runs the repository's git hooks, as any commit does.
+
+None of this can undo the finish: the run stays finished and
+`workflow_finished` stands whatever GSD answers. One line is printed on
+success; a refusal or failure is printed to stderr with GSD's full text. The
+`gsd_phase_complete` event records the outcome:
+
+| `gsd_phase_complete` payload | When |
+|---|---|
+| `{"ok":true,"committed":true,"commit_failure":null}` | GSD marked the phase complete and committed what it wrote |
+| `{"ok":true,"committed":false,"commit_failure":null}` | GSD marked the phase complete but updated no file, or its commit committed nothing |
+| `{"ok":true,"committed":false,"commit_failure":"<label>"}` | GSD marked the phase complete and its commit failed (a hook, signing or a timeout): commit its files by hand |
+| `{"ok":false,"failure":"scoped_planning_dir","reason":null,"message":"<dir>"}` | GSD resolves a scoped planning directory; nothing ran after the read |
+| `{"ok":false,"failure":"<label>","reason":"<GSD's reason or null>","message":"<GSD's text or null>"}` | `phase.complete` refused (for example `phase_verification_incomplete` when the verification went stale), or GSD could not be read; no commit runs |
+
+The `message` is only GSD's own text, cut to 450 characters, with the
+evidence root replaced by `.` and the GSD home by `~` (each as given and as
+its canonical path); every other failure class records its label with
+`message: null`.
+
+**Re-verifying after a post-Validate fix.** A fix committed after Validate
+passed makes GSD's verification stale, so `phase.complete` refuses it. Run
+`/gsd-execute-phase N` by hand (record it as a hand-run stage in the phase
+notes), then `gsd_run query phase.complete N` (D-10). DevFlow has no
+re-verify step of its own.
 
 ## Notify hook (never miss a gate)
 

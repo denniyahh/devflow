@@ -1352,9 +1352,9 @@ mod tests {
     use devflow_core::test_support::preanswer_gate;
     use devflow_core::workflow;
 
-    /// Operator answer (2): opencode, pi, hermes and antigravity are refused by
-    /// name, each message naming the agent and `devflow_ask`; claude and codex
-    /// pass.
+    /// Operator answer (2): opencode, hermes and antigravity are refused by
+    /// name, each message naming the agent and `devflow_ask`; claude, codex and
+    /// pi pass.
     #[test]
     fn an_agent_without_an_ask_registration_is_refused_by_name() {
         for agent in [

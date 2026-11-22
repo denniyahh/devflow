@@ -174,6 +174,10 @@ struct CallFlags {
     eof: AtomicBool,
     /// The calls not yet taken by the worker, in arrival order.
     queue: Mutex<VecDeque<PendingCall>>,
+    /// The id, as its JSON text, of the call the worker has taken and not finished.
+    /// Set and cleared under the `queue` lock, so a cancel that reads both under that
+    /// lock sees a call as queued or in flight, never neither.
+    in_flight: Mutex<Option<String>>,
     /// Signalled on each push and at stdin's end.
     wake: Condvar,
 }
@@ -316,6 +320,10 @@ where
             arrived: pending.arrived,
         };
         let result = worker.call(&pending.params, &control);
+        {
+            let _queue = lock(&flags.queue);
+            *lock(&flags.in_flight) = None;
+        }
         // After stdin's end the client is gone: nothing more goes to stdout.
         if let Some(result) = result
             && !flags.eof.load(Ordering::SeqCst)
@@ -341,6 +349,7 @@ fn next_call(flags: &CallFlags, worker: &mut impl Worker) -> Option<PendingCall>
             return None;
         }
         if let Some(pending) = queue.pop_front() {
+            *lock(&flags.in_flight) = Some(pending.id_text.clone());
             return Some(pending);
         }
         drop(queue);
@@ -359,13 +368,17 @@ fn next_call(flags: &CallFlags, worker: &mut impl Worker) -> Option<PendingCall>
 
 /// Record a client's cancel of `request_id`. A call still queued is removed,
 /// so it opens no gate, records no event and gets no reply; a call already
-/// taken by the worker sees its id in the cancelled set.
+/// taken by the worker sees its id in the cancelled set. A cancel for an id
+/// neither queued nor in flight is dropped (D-12): JSON-RPC ids may be reused,
+/// and a recorded id nothing would remove would silence the next call with it.
+/// Both reads happen under the queue lock, so a pop between them cannot drop a
+/// real cancel.
 fn cancel(flags: &CallFlags, request_id: &Value) {
     let id_text = request_id.to_string();
     let mut queue = lock(&flags.queue);
     let queued = queue.len();
     queue.retain(|pending| pending.id_text != id_text);
-    if queue.len() == queued {
+    if queue.len() == queued && lock(&flags.in_flight).as_deref() == Some(id_text.as_str()) {
         lock(&flags.cancelled).insert(id_text);
     }
 }
@@ -1335,6 +1348,21 @@ mod tests {
         }
     }
 
+    /// How many replies with `id` have been written, waiting at most `wait` for `count`.
+    fn replies_with_id(output: &Mutex<Vec<u8>>, id: u64, count: usize, wait: Duration) -> usize {
+        let started = Instant::now();
+        loop {
+            let seen = replies(output)
+                .iter()
+                .filter(|reply| reply["id"] == id)
+                .count();
+            if seen >= count || started.elapsed() >= wait {
+                return seen;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     fn ask_call(id: u64, tool: &str) -> String {
         request(
             id,
@@ -1422,6 +1450,96 @@ mod tests {
         );
         drop(writer);
         assert_eq!(server.join().unwrap(), 0);
+    }
+
+    /// D-12: JSON-RPC ids may be reused, so a cancel that arrives after its call
+    /// finished must not silence a later call with the same id.
+    #[test]
+    fn a_late_cancel_does_not_silence_a_reused_id() {
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        let output = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let server = std::thread::spawn({
+            let output = Arc::clone(&output);
+            move || {
+                run_server(std::io::BufReader::new(reader), output, |_, control| {
+                    control.ending().is_none().then(|| json!({ "content": [] }))
+                })
+            }
+        });
+        writeln!(writer, "{}", ask_call(7, ASK_TOOL)).unwrap();
+        assert!(
+            reply_with_id(&output, 7, REPLY_WAIT).is_some(),
+            "the first call 7 replies"
+        );
+        // The worker takes 9 only after it finished 7, so 7 is no longer in flight.
+        writeln!(writer, "{}", ask_call(9, ASK_TOOL)).unwrap();
+        assert!(
+            reply_with_id(&output, 9, REPLY_WAIT).is_some(),
+            "call 9 replies"
+        );
+        let late_cancel = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": { "requestId": 7 }
+        });
+        writeln!(writer, "{late_cancel}").unwrap();
+        // The reader handles lines in order, so the ping's reply means the cancel was read.
+        writeln!(writer, "{}", request(10, "ping", json!({}))).unwrap();
+        assert!(
+            reply_with_id(&output, 10, REPLY_WAIT).is_some(),
+            "the ping replies"
+        );
+        writeln!(writer, "{}", ask_call(7, ASK_TOOL)).unwrap();
+        assert_eq!(
+            replies_with_id(&output, 7, 2, REPLY_WAIT),
+            2,
+            "a late cancel for a finished id silenced a later call that reused it"
+        );
+        drop(writer);
+        assert_eq!(server.join().unwrap(), 0);
+    }
+
+    fn pending_call(id: u64) -> PendingCall {
+        PendingCall {
+            id: json!(id),
+            id_text: json!(id).to_string(),
+            params: json!({}),
+            arrived: Instant::now(),
+        }
+    }
+
+    fn no_reply(_: &Value, _: &CallControl<'_>) -> Option<Value> {
+        None
+    }
+
+    #[test]
+    fn a_cancel_records_only_a_queued_or_in_flight_id() {
+        let flags = CallFlags::default();
+        // Control: a queued call is removed by its cancel and not recorded.
+        lock(&flags.queue).push_back(pending_call(8));
+        cancel(&flags, &json!(8));
+        assert!(lock(&flags.queue).is_empty(), "the queued call is removed");
+        assert!(
+            !lock(&flags.cancelled).contains("8"),
+            "a queued call's cancel is not recorded"
+        );
+        // Control: a call the worker has taken is in flight, and its cancel is recorded.
+        lock(&flags.queue).push_back(pending_call(9));
+        let taken = next_call(&flags, &mut CallFn(no_reply)).expect("the call is taken");
+        assert_eq!(taken.id_text, "9");
+        cancel(&flags, &json!(9));
+        assert!(
+            lock(&flags.cancelled).remove("9"),
+            "an in-flight call's cancel is recorded"
+        );
+        *lock(&flags.in_flight) = None;
+        cancel(&flags, &json!(7));
+        let cancelled = lock(&flags.cancelled).clone();
+        assert!(
+            cancelled.is_empty(),
+            "a cancel for an id that is neither queued nor in flight records nothing: \
+             {cancelled:?}"
+        );
     }
 
     #[test]

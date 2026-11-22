@@ -662,6 +662,16 @@ impl GsdStub {
         self.dir.path().join("home")
     }
 
+    /// Replace the stub's `number`th reply (1-based) with `reply`, for a reply
+    /// that must name the stub's own home, known only once the stub exists.
+    pub(crate) fn script_reply(&self, number: usize, reply: &str) {
+        std::fs::write(
+            self.dir.path().join(format!("logs/gsd-response-{number}")),
+            format!("{reply}\n"),
+        )
+        .expect("rewrite a scripted GSD reply");
+    }
+
     /// The calls the stub logged, as `(working directory, argv)`.
     pub(crate) fn calls(&self) -> Vec<(PathBuf, String)> {
         devflow_core::test_support::gsd_run_calls(&self.dir.path().join("logs"))

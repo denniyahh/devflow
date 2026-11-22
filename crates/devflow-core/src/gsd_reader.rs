@@ -1,4 +1,7 @@
-//! The one seam through which DevFlow asks GSD about a phase's verification.
+//! The one seam through which DevFlow asks GSD about a phase's verification,
+//! reads where GSD writes ([`planning_root`]), and runs GSD's two writers DevFlow
+//! uses at a finish: `phase.complete` ([`phase_complete`]) and GSD's own commit
+//! ([`commit_files`]; D-10).
 //!
 //! **DevFlow does not own the answer.** GSD writes `VERIFICATION.md`, decides
 //! what its frontmatter means and computes whether it is stale. This module
@@ -23,6 +26,10 @@
 //! 3. **No path in an event.** GSD's messages hold absolute paths
 //!    (Pitfall 11). [`ReaderFailure::label`] is the event-safe name; the
 //!    message stays in the variant, for the gate context and stderr only.
+//!    One exception: the finish's `gsd_phase_complete` event carries GSD's
+//!    own refusal text, bounded, with the evidence root and the GSD home
+//!    replaced in their given and canonical forms; no other failure's text
+//!    enters it.
 
 use crate::git::hermetic_command_at;
 use crate::phase_id::PhaseId;
@@ -658,6 +665,83 @@ pub fn runtime_version(home: &Path, evidence_root: &Path) -> Result<String, Read
     required_str(&value, "version").map(str::to_owned)
 }
 
+/// GSD's resolved planning directory for `evidence_root`
+/// (`query planning.inspect`'s `generated_from.planning_root`).
+///
+/// GSD's writers write under this directory, which follows `GSD_PROJECT` and
+/// the workstream, so a caller that commits fixed `.planning/` paths checks it
+/// first (review codex 6). An absent, `null` (GSD's value when there is no
+/// `.planning`) or non-string root is a failure, never a default path.
+pub fn planning_root(home: &Path, evidence_root: &Path) -> Result<PathBuf, ReaderFailure> {
+    let args = [OsStr::new("query"), OsStr::new("planning.inspect")];
+    let value = read_json(home, evidence_root, &args, GSD_READER_TIMEOUT)?;
+    refuse_gsd_error(&value)?;
+    value["generated_from"]["planning_root"]
+        .as_str()
+        .map(PathBuf::from)
+        .ok_or_else(|| ReaderFailure::MissingField {
+            key: "generated_from.planning_root".to_owned(),
+        })
+}
+
+/// Mark `phase` complete through GSD's own writer,
+/// `query phase.complete <phase> --json-errors` (D-10): GSD updates
+/// ROADMAP.md, STATE.md and REQUIREMENTS.md and commits nothing; DevFlow
+/// edits none of them. The reply is returned as GSD printed it.
+///
+/// A refusal (for example stale verification) exits 1 with GSD's structured
+/// `{"ok":false,"reason":…,"message":…}` on stderr, which
+/// [`ReaderFailure::Exit`] carries.
+pub fn phase_complete(
+    home: &Path,
+    evidence_root: &Path,
+    phase: PhaseId,
+) -> Result<Value, ReaderFailure> {
+    let phase = phase.to_string();
+    let args = [
+        OsStr::new("query"),
+        OsStr::new("phase.complete"),
+        OsStr::new(&phase),
+        OsStr::new("--json-errors"),
+    ];
+    let value = read_json(home, evidence_root, &args, GSD_READER_TIMEOUT)?;
+    refuse_gsd_error(&value)?;
+    Ok(value)
+}
+
+/// Commit `files` with `message` through GSD's own
+/// `query commit <message> --json-errors --files <files…>` (the operator's
+/// plan-phase answer, 2026-11-20: after `phase.complete`, GSD commits what it
+/// wrote).
+///
+/// `--json-errors` stands before `--files`, so it is never read as a file and
+/// a commit refusal carries GSD's reason. An `error` key (a staging failure
+/// exits 0) is a failure, and so is a reply whose `committed` is not a JSON
+/// boolean.
+pub fn commit_files(
+    home: &Path,
+    evidence_root: &Path,
+    message: &str,
+    files: &[&str],
+) -> Result<Value, ReaderFailure> {
+    let mut args = vec![
+        OsStr::new("query"),
+        OsStr::new("commit"),
+        OsStr::new(message),
+        OsStr::new("--json-errors"),
+        OsStr::new("--files"),
+    ];
+    args.extend(files.iter().map(OsStr::new));
+    let value = read_json(home, evidence_root, &args, GSD_READER_TIMEOUT)?;
+    refuse_gsd_error(&value)?;
+    if !value["committed"].is_boolean() {
+        return Err(ReaderFailure::MissingField {
+            key: "committed".to_owned(),
+        });
+    }
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -736,6 +820,94 @@ mod tests {
                     .trim_end(),
             )
         }
+    }
+
+    #[test]
+    fn phase_complete_runs_gsd_s_writer_by_argv() {
+        let fx = Fixture::new();
+        fx.plant_printing(
+            r#"{"roadmap_updated":true,"state_updated":true,"requirements_updated":false,"auto_pruned":false}"#,
+            0,
+        );
+
+        let reply = phase_complete(&fx.home, &fx.root, PhaseId::with_minor(53, 1))
+            .expect("a completion reply");
+
+        assert_eq!(reply["roadmap_updated"], true);
+        assert_eq!(
+            fx.argv(),
+            vec!["query", "phase.complete", "53.1", "--json-errors"],
+            "GSD's writer by argv"
+        );
+        assert_eq!(
+            fx.cwd(),
+            fx.root.canonicalize().unwrap(),
+            "in the evidence root"
+        );
+    }
+
+    #[test]
+    fn a_commit_reply_without_committed_is_a_failure() {
+        let fx = Fixture::new();
+        fx.plant_printing(r#"{"hash":"abc1234"}"#, 0);
+
+        let failure = commit_files(&fx.home, &fx.root, "docs: m", &[".planning/STATE.md"])
+            .expect_err("no committed boolean is a failure");
+
+        assert!(
+            matches!(&failure, ReaderFailure::MissingField { key } if key == "committed"),
+            "{failure:?}"
+        );
+        assert_eq!(
+            fx.argv(),
+            vec![
+                "query",
+                "commit",
+                "docs: m",
+                "--json-errors",
+                "--files",
+                ".planning/STATE.md"
+            ],
+            "--json-errors stands before --files"
+        );
+
+        // Control: a boolean `committed` is a reply.
+        fx.plant_printing(r#"{"committed":false,"hash":null}"#, 0);
+        let reply = commit_files(&fx.home, &fx.root, "docs: m", &[".planning/STATE.md"])
+            .expect("a boolean committed is a reply");
+        assert_eq!(reply["committed"], false);
+    }
+
+    #[test]
+    fn planning_root_reads_gsd_s_resolved_planning_dir() {
+        let fx = Fixture::new();
+        fx.plant_printing(
+            r#"{"generated_from":{"cwd":"/r","planning_root":"/r/.planning/workstreams/ws1"}}"#,
+            0,
+        );
+
+        let root = planning_root(&fx.home, &fx.root).expect("a planning root");
+
+        assert_eq!(root, PathBuf::from("/r/.planning/workstreams/ws1"));
+        assert_eq!(fx.argv(), vec!["query", "planning.inspect"]);
+        assert_eq!(
+            fx.cwd(),
+            fx.root.canonicalize().unwrap(),
+            "in the evidence root"
+        );
+    }
+
+    #[test]
+    fn a_null_planning_root_is_a_failure() {
+        let fx = Fixture::new();
+        fx.plant_printing(r#"{"generated_from":{"cwd":"/r","planning_root":null}}"#, 0);
+
+        let failure = planning_root(&fx.home, &fx.root).expect_err("a null root is no path");
+
+        assert!(
+            matches!(&failure, ReaderFailure::MissingField { key } if key == "generated_from.planning_root"),
+            "{failure:?}"
+        );
     }
 
     #[test]

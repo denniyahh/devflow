@@ -1359,6 +1359,10 @@ pub(crate) fn event_is_top_level_result_marker(event: &serde_json::Value) -> boo
 /// is the only evidence that settles the vocabulary.
 const CLAUDE_STREAM_RATE_LIMIT_DENIAL_STATUSES: &[&str] = &["rejected"];
 
+/// The retry text of a stream denial whose `rate_limit_info` has no `resetsAt`,
+/// rendered as "rate limited until a reset time the denial did not give".
+const STREAM_DENIAL_WITHOUT_RESET: &str = "a reset time the denial did not give";
+
 /// Detect an explicit quota DENIAL in a Claude `stream-json` capture and return
 /// the retry description, mirroring what [`detect_claude_rate_limit`] returns
 /// for the single-document envelope.
@@ -1391,7 +1395,17 @@ const CLAUDE_STREAM_RATE_LIMIT_DENIAL_STATUSES: &[&str] = &["rejected"];
 /// 2. **Semantic** — only a `status` in
 ///    [`CLAUDE_STREAM_RATE_LIMIT_DENIAL_STATUSES`] classifies. A missing
 ///    `rate_limit_info`, a missing or non-string `status`, or any unrecognised
-///    value returns `None`.
+///    value is not a denial from the event.
+///
+/// **Second read: the final `result`'s `subtype` (D-09).** When no eligible
+/// `rate_limit_event` denies (none present, or every exit above), the final
+/// top-level `result` among the same eligible events is read, and a `subtype`
+/// of exactly `error_rate_limit` classifies, as it does on the single-document
+/// path ([`detect_claude_rate_limit`]). This is still one exact field on one
+/// top-level event, not a shape match: the CLI sets `subtype` itself, the
+/// agent cannot write it, and no nested search runs, so neither the
+/// `overageStatus` trap nor agent-authored JSON in the `result` text can
+/// supply it. Any other `subtype` returns `None`.
 ///
 /// **Deferring is the deliberately safe direction, not an oversight.**
 /// Under-classifying means an unknown denial status falls through to the
@@ -1430,6 +1444,17 @@ fn detect_claude_stream_rate_limit(events: &[serde_json::Value]) -> Option<Strin
         None => events,
     };
 
+    rate_limit_event_denial(eligible, is_top_level_of_type)
+        .or_else(|| error_rate_limit_result_retry(eligible))
+}
+
+/// The `rate_limit_event` read of [`detect_claude_stream_rate_limit`]: the
+/// retry when the last eligible top-level `rate_limit_event` denies, else
+/// `None` from every exit, so the caller still reads the final `result`.
+fn rate_limit_event_denial(
+    eligible: &[serde_json::Value],
+    is_top_level_of_type: impl Fn(&serde_json::Value, &str) -> bool,
+) -> Option<String> {
     // Last eligible top-level event wins, matching the last-`result`-wins
     // convention.
     let event = eligible
@@ -1448,12 +1473,32 @@ fn detect_claude_stream_rate_limit(events: &[serde_json::Value]) -> Option<Strin
     // `AgentStatus::RateLimited` variant alone and the `reason` text is
     // operator-facing. Mirrors `detect_claude_rate_limit`'s `retry_after` →
     // `message` → `error` chain; its final `"usage limit"` default has no
-    // counterpart here because a matched `status` is by construction one of the
-    // non-empty enumerated strings above, so a third rung would be unreachable.
+    // counterpart; a denial without `resetsAt` says so rather than echo its
+    // status word, which would read "rate limited until rejected".
     Some(
         info.get("resetsAt")
             .and_then(json_scalar_to_string)
-            .unwrap_or_else(|| status.to_string()),
+            .unwrap_or_else(|| STREAM_DENIAL_WITHOUT_RESET.to_string()),
+    )
+}
+
+/// The `result` read of [`detect_claude_stream_rate_limit`]: the retry when the
+/// final eligible top-level `result` has `subtype` exactly `error_rate_limit`
+/// (D-09). Its top-level `retry_after`, else `"usage limit"`, the
+/// single-document path's last rung. Both fields are read with a direct
+/// [`serde_json::Value::get`] on that one event, never [`json_find_key`]: the
+/// event's `result` text is agent-authored and may nest arbitrary JSON
+/// (T-30-12).
+fn error_rate_limit_result_retry(eligible: &[serde_json::Value]) -> Option<String> {
+    let result = last_top_level_result(eligible)?;
+    if result.get("subtype").and_then(serde_json::Value::as_str) != Some("error_rate_limit") {
+        return None;
+    }
+    Some(
+        result
+            .get("retry_after")
+            .and_then(json_scalar_to_string)
+            .unwrap_or_else(|| "usage limit".to_string()),
     )
 }
 
@@ -5487,6 +5532,26 @@ mod tests {
         );
     }
 
+    /// A denial without `resetsAt` says the reset time was not given; it does
+    /// not echo the status word as if it were a time.
+    #[test]
+    fn claude_stream_denial_without_resets_at_says_no_reset_time_was_given() {
+        let denial = v3_rate_limit_event("rejected");
+        assert!(
+            denial.contains(r#""resetsAt":1785645600,"#),
+            "fixture lost resetsAt"
+        );
+        let denial = denial.replace(r#""resetsAt":1785645600,"#, "");
+        let capture = stream_capture_of(&[&denial, &v3_result_event(V3_RESULT_TURN1, NO_MARKER)]);
+
+        let result = parse_claude_event_result(&capture).expect("a quota denial is a verdict");
+        assert_eq!(result.status, AgentStatus::RateLimited);
+        assert_eq!(
+            result.reason.as_deref(),
+            Some("rate limited until a reset time the denial did not give")
+        );
+    }
+
     /// Scoping: a denial that predates the final turn cannot outrank the final
     /// turn's own outcome. Rate-limit chatter from an earlier turn must not
     /// decide a stream that later completed — in the real capture the rate
@@ -6739,6 +6804,94 @@ mod tests {
         assert_eq!(
             result.reason.as_deref(),
             Some("rate limited until 2026-06-18T15:45:30Z")
+        );
+    }
+
+    /// A Claude `error_rate_limit` result is a rate limit whether it arrives as
+    /// the single-document envelope or as the final top-level `result` of a
+    /// `stream-json` capture, with the same reason text on both paths. Another
+    /// `error_*` subtype stays `Failed`, a subagent's `error_rate_limit` result
+    /// decides nothing, and a routine `allowed` quota event earlier in the
+    /// final turn does not stop the result from being read.
+    #[test]
+    fn an_error_rate_limit_result_is_rate_limited_on_both_paths() {
+        let phase = PhaseId::new(7);
+        let evaluate = |capture: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+            std::fs::write(stdout_path(dir.path(), phase), capture).unwrap();
+            evaluate_layer1(dir.path(), phase)
+        };
+        let result_line = |subtype: &str| {
+            format!(
+                r#"{{"type":"result","subtype":"{subtype}","is_error":true,"retry_after":"2026-06-18T15:45:30Z","result":"limit"}}"#
+            )
+        };
+        for path in ["single document", "stream"] {
+            let wrap = |line: &str| match path {
+                "stream" => format!("{V3_INIT_EVENT}\n{line}\n"),
+                _ => line.to_string(),
+            };
+            let rate_limited = evaluate(&wrap(&result_line("error_rate_limit")));
+            assert_eq!(
+                rate_limited.as_ref().map(|r| r.status),
+                Some(AgentStatus::RateLimited),
+                "{path} error_rate_limit: want RateLimited, got {rate_limited:?}"
+            );
+            assert_eq!(
+                rate_limited.as_ref().and_then(|r| r.reason.as_deref()),
+                Some("rate limited until 2026-06-18T15:45:30Z"),
+                "{path} error_rate_limit: want the retry_after reason, got {rate_limited:?}"
+            );
+
+            let max_turns = evaluate(&wrap(&result_line("error_max_turns")));
+            assert_eq!(
+                max_turns.as_ref().map(|r| r.status),
+                Some(AgentStatus::Failed),
+                "{path} error_max_turns: want Failed, got {max_turns:?}"
+            );
+
+            let no_retry = evaluate(&wrap(
+                r#"{"type":"result","subtype":"error_rate_limit","is_error":true,"result":"limit"}"#,
+            ));
+            assert_eq!(
+                no_retry.as_ref().map(|r| r.status),
+                Some(AgentStatus::RateLimited),
+                "{path} no-retry error_rate_limit: want RateLimited, got {no_retry:?}"
+            );
+            assert_eq!(
+                no_retry.as_ref().and_then(|r| r.reason.as_deref()),
+                Some("rate limited until usage limit"),
+                "{path} no-retry error_rate_limit: want \"rate limited until usage limit\", got {no_retry:?}"
+            );
+        }
+
+        let subagent_line = r#"{"type":"result","subtype":"error_rate_limit","is_error":true,"retry_after":"2026-06-18T15:45:30Z","result":"limit","parent_tool_use_id":"toolu_1"}"#;
+        let top_level_success =
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"done"}"#;
+        let subagent = evaluate(&format!(
+            "{V3_INIT_EVENT}\n{subagent_line}\n{top_level_success}\n"
+        ));
+        assert_ne!(
+            subagent.as_ref().map(|r| r.status),
+            Some(AgentStatus::RateLimited),
+            "stream subagent error_rate_limit then top-level success: want not RateLimited, got {subagent:?}"
+        );
+
+        let allowed_event = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1795294800}}"#;
+        let after_allowed = evaluate(&format!(
+            "{V3_INIT_EVENT}\n{allowed_event}\n{}\n",
+            result_line("error_rate_limit")
+        ));
+        assert_eq!(
+            after_allowed.as_ref().map(|r| r.status),
+            Some(AgentStatus::RateLimited),
+            "stream routine allowed event then error_rate_limit: want RateLimited, got {after_allowed:?}"
+        );
+        assert_eq!(
+            after_allowed.as_ref().and_then(|r| r.reason.as_deref()),
+            Some("rate limited until 2026-06-18T15:45:30Z"),
+            "stream routine allowed event then error_rate_limit: want the result's retry_after, got {after_allowed:?}"
         );
     }
 
