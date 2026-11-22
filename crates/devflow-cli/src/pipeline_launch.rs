@@ -1965,20 +1965,8 @@ fn hand_off_agent(
     reason: HandoffReason,
 ) -> Result<HandoffOutcome, CliError> {
     let from = state.agent;
-    let mut candidate = state.clone();
-    candidate.agent = to;
-    if let Err(why) = generic_preflight_checks(project_root, &candidate) {
-        return Ok(HandoffOutcome::Refused(HandoffRefusal::Preflight(why)));
-    }
-    if let Err(err) = ensure_agent_binary(agent_program(to))
-        .and_then(|()| crate::preflight::ensure_ask_registration(to))
-    {
-        return Ok(HandoffOutcome::Refused(HandoffRefusal::Unavailable(
-            err.to_string(),
-        )));
-    }
-    if let Err(err) = agents::driver_for(to).health(&candidate) {
-        return Ok(HandoffOutcome::Refused(HandoffRefusal::Unavailable(err)));
+    if let Some(refusal) = handoff_refusal(project_root, state, to) {
+        return Ok(HandoffOutcome::Refused(refusal));
     }
 
     // D-10: what is handed over, measured before the commit and never touched.
@@ -2018,6 +2006,38 @@ fn hand_off_agent(
         }),
     );
     Ok(HandoffOutcome::HandedOff { from })
+}
+
+/// The checks [`hand_off_agent`] makes before it writes anything, on a copy of `state`
+/// naming `to`: the full generic preflight bundle, the target's binary and ask
+/// registration, then its driver's health. `None` when all pass. Reads `state` only, so
+/// a resume can judge a handoff at the stage it is about to launch before any write.
+fn handoff_refusal(project_root: &Path, state: &State, to: AgentKind) -> Option<HandoffRefusal> {
+    let mut candidate = state.clone();
+    candidate.agent = to;
+    if let Err(why) = generic_preflight_checks(project_root, &candidate) {
+        return Some(HandoffRefusal::Preflight(why));
+    }
+    if let Err(err) = ensure_agent_binary(agent_program(to))
+        .and_then(|()| crate::preflight::ensure_ask_registration(to))
+    {
+        return Some(HandoffRefusal::Unavailable(err.to_string()));
+    }
+    agents::driver_for(to)
+        .health(&candidate)
+        .err()
+        .map(HandoffRefusal::Unavailable)
+}
+
+/// The error a resume reports for a handoff to `requested` refused at `stage`, the
+/// stage the resume launches.
+fn resume_handoff_refused(requested: AgentKind, stage: Stage, refusal: HandoffRefusal) -> CliError {
+    CliError::Message(match refusal {
+        HandoffRefusal::Preflight(reason) => format!(
+            "handoff to {requested} refused at the {stage} stage this resume launches: {reason}"
+        ),
+        HandoffRefusal::Unavailable(err) => format!("handoff to {requested} refused: {err}"),
+    })
 }
 
 /// Continue a rate-limited Code stage under the unused fallback `to` (SUPV-02).
@@ -2173,6 +2193,9 @@ pub(crate) fn resume_with_fallback(
     )?;
     #[cfg(test)]
     launch_test_hold("holder_claimed");
+    // 999.251: a resume past a fired `--until` cap archives the halted stage's capture
+    // under that stage, not the one it advances to.
+    let archived_stage = resume_advance(&reserved.state).map(|(from, _)| from);
     let mut state = resume_loaded(project_root, phase, reserved.state, agent, fallback_agent)?;
     // The runner checks the agent binary again at each launch; checked here too, so a
     // resume that cannot run its agent fails now, re-marked stopped below, rather than
@@ -2183,7 +2206,7 @@ pub(crate) fn resume_with_fallback(
     let launched =
         crate::preflight::ensure_agent_binary(crate::preflight::agent_program(state.agent))
             .and_then(|()| crate::preflight::ensure_ask_registration(state.agent))
-            .and_then(|()| archive_prior_capture(&state, None))
+            .and_then(|()| archive_prior_capture(&state, archived_stage))
             .map_err(|err| crate::service::LaunchError::Failed(err.to_string()))
             .and_then(|()| crate::service::launch_runner_unit(project_root, phase));
     let headline = format!("resumed phase {phase} at its {} stage", state.stage);
@@ -2476,6 +2499,13 @@ fn record_leftover_question(project_root: &Path, phase: PhaseId, stage: Stage) {
 /// every state write (gate closing, notes, the handoff, the fallback re-arm) under the
 /// caller's phase holder. `state` is the copy that wrote, which may already be behind the
 /// file; the committed copy is returned for the caller to launch.
+///
+/// 999.251 (D-02): a run its own `--until` cap halted resumes at [`Stage::next`] of the
+/// halted stage, with the bookkeeping a normal advance makes
+/// ([`crate::pipeline_gate::enter_stage`]) and a `transition` event, recorded before any
+/// handoff so `agent_handoff` names the stage launched. Every check before the first
+/// write judges that stage. The halt records no target, so a halt reached through a
+/// Plan->Validate transition also resumes at Code. Any other stop reruns its stage.
 fn resume_loaded(
     project_root: &Path,
     phase: PhaseId,
@@ -2484,16 +2514,47 @@ fn resume_loaded(
     fallback_agent: Option<AgentKind>,
 ) -> Result<State, CliError> {
     crate::commands::refuse_unprepared_run(&state)?;
+    // 999.251 (D-02): a run its own `--until` cap halted resumes at the next stage;
+    // any other stop reruns the stage it stopped in.
+    let saved_stage = state.stage;
+    let advance = resume_advance(&state);
+    // Every check before the first write judges the stage this resume launches, on a
+    // copy that is never written (`commit` applies its closure to the file's copy).
+    let mut judged = state.clone();
+    if let Some((from, to)) = advance {
+        crate::pipeline_gate::enter_stage(&mut judged, from, to);
+    }
     // D-01, D-02, D-03: every fallback check runs here, BEFORE `commit_notify_env`
     // below, so a refused resume commits nothing at all (review B-3).
-    refuse_fallback_for_resume(&state, agent, fallback_agent)?;
-    refuse_recorded_canary_for_resume(&state, agent)?;
+    refuse_fallback_for_resume(&judged, agent, fallback_agent)?;
+    refuse_recorded_canary_for_resume(&judged, agent)?;
+    let handoff_to = agent.filter(|requested| *requested != state.agent);
+    if let Some(requested) = handoff_to
+        && let Some(refusal) = handoff_refusal(project_root, &judged, requested)
+    {
+        return Err(resume_handoff_refused(requested, judged.stage, refusal));
+    }
     // CR-03 (49-REVIEW.md): an exported (or emptied) notify command reaches
     // the chain this resume launches through the state file.
     commit_notify_env(&mut state)?;
-    if let Some(requested) = agent
-        && requested != state.agent
-    {
+    if let Some((from, to)) = advance {
+        // The cap is spent by the advance, so a later plain resume after a raced
+        // handoff refusal below cannot re-halt on it.
+        commit(&mut state, |s| {
+            crate::pipeline_gate::enter_stage(s, from, to);
+            s.stop_until = None;
+        })?;
+        events::emit(
+            project_root,
+            phase,
+            "transition",
+            serde_json::json!({
+                "from": from.to_string(),
+                "to": to.to_string(),
+            }),
+        );
+    }
+    if let Some(requested) = handoff_to {
         // The shared substitution (D-04): every check runs before anything is
         // mutated, so a refusal leaves the state byte-identical.
         match hand_off_agent(
@@ -2503,16 +2564,8 @@ fn resume_loaded(
             HandoffReason::ResumeAgent,
         )? {
             HandoffOutcome::HandedOff { from } => println!("handoff: {from} → {requested}"),
-            HandoffOutcome::Refused(HandoffRefusal::Preflight(reason)) => {
-                return Err(CliError::Message(format!(
-                    "handoff to {requested} refused at saved {} stage: {reason}",
-                    state.stage
-                )));
-            }
-            HandoffOutcome::Refused(HandoffRefusal::Unavailable(err)) => {
-                return Err(CliError::Message(format!(
-                    "handoff to {requested} refused: {err}"
-                )));
+            HandoffOutcome::Refused(refusal) => {
+                return Err(resume_handoff_refused(requested, state.stage, refusal));
             }
         }
     }
@@ -2541,7 +2594,8 @@ fn resume_loaded(
     // D-06: the rerun asks again, so the gate this run abandons is closed before the
     // relaunch and its unused answer set aside. After every refusal above, so a refused
     // resume leaves the gate as it found it.
-    for line in close_gates_for_resume(project_root, phase, state.stage) {
+    // The gate it closes is the halted stage's, so it reads the saved stage.
+    for line in close_gates_for_resume(project_root, phase, saved_stage) {
         println!("{line}");
     }
     commit(&mut state, |s| {
@@ -2565,6 +2619,16 @@ fn resume_loaded(
         print_fallback_notice(fallback, state.agent);
     }
     Ok(state)
+}
+
+/// The advance a resume makes: the halted stage and its [`Stage::next`] when the run's
+/// own `--until` cap stopped it ([`crate::pipeline_gate::until_cap_fired`]), else `None`.
+/// An `--until` halt never happens after Validate, so a fired cap always has a next.
+fn resume_advance(state: &State) -> Option<(Stage, Stage)> {
+    if !crate::pipeline_gate::until_cap_fired(state) {
+        return None;
+    }
+    state.stage.next().map(|to| (state.stage, to))
 }
 
 /// Refuse a `resume` the run's recorded delivery canary would refuse, before it writes
@@ -3665,6 +3729,190 @@ mod tests {
             1,
             "resume launched the runner unit"
         );
+    }
+
+    /// A run at Plan, stopped with `stop_until = Some(Plan)` and `stop_reason`, saved
+    /// for `resume` to load, with a Plan capture beside it for the resume to archive.
+    fn save_stopped_in_plan(root: &Path, phase: PhaseId, agent: AgentKind, stop_reason: &str) {
+        let mut state = State::new(phase, agent, Mode::Supervise, root.to_path_buf());
+        state.verification_baseline_captured = true;
+        state.stage = Stage::Plan;
+        state.stop_until = Some(Stage::Plan);
+        state.stopped = true;
+        state.stop_reason = Some(stop_reason.to_string());
+        workflow::save_state(&state).unwrap();
+        std::fs::write(agent_result::stdout_path(root, phase), "plan output\n").unwrap();
+        std::fs::write(agent_result::exit_code_path(root, phase), "0\n").unwrap();
+    }
+
+    /// The runner's first step on the reloaded state, with the launches it made.
+    fn first_step_after_resume(root: &Path, phase: PhaseId) -> (State, Vec<(Stage, AgentKind)>) {
+        let mut reloaded = workflow::load_state(root, phase).unwrap();
+        LAUNCH_PROBE.set(Some(Vec::new()));
+        let first = runner_first_step(&mut reloaded);
+        let probe = LAUNCH_PROBE.take().expect("the probe was set");
+        let launch = match first {
+            Ok(Some(launch)) => launch,
+            Ok(None) => panic!("the runner's first step resolved no launch: {probe:?}"),
+            Err(err) => panic!("the runner's first step refused the launch: {err}"),
+        };
+        (launch.state, probe)
+    }
+
+    /// 999.251 (D-02): the dogfood procedure runs a `--reviews` replan between an
+    /// `--until plan` halt and `resume`, so the resume launches Code, the stage after
+    /// the one the cap halted, with the Plan capture archived as Plan's.
+    #[test]
+    fn resume_after_an_until_plan_halt_launches_code() {
+        const NAME: &str = "pipeline_launch::tests::resume_after_an_until_plan_halt_launches_code";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_dir_with_agent_stub("codex");
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(97);
+        save_stopped_in_plan(
+            root,
+            phase,
+            AgentKind::Codex,
+            &crate::pipeline_gate::until_halt_reason(Stage::Plan),
+        );
+
+        let result = resume(root, phase, None);
+        let _runners = crate::service::double::LaunchedRunners;
+        result.unwrap();
+
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        let mut probed = reloaded.clone();
+        LAUNCH_PROBE.set(Some(Vec::new()));
+        let first = runner_first_step(&mut probed);
+        let probe = LAUNCH_PROBE.take().expect("the probe was set");
+        assert_eq!(
+            probe,
+            vec![(Stage::Code, AgentKind::Codex)],
+            "resume after an `--until plan` halt launches Code, not Plan: {probe:?}"
+        );
+        let launch = match first {
+            Ok(Some(launch)) => launch,
+            Ok(None) => panic!("the runner's first step resolved no Code launch"),
+            Err(err) => panic!("the runner's first step refused the Code launch: {err}"),
+        };
+        assert_eq!(launch.state.stage, Stage::Code);
+        assert_eq!(launch.state.agent, AgentKind::Codex);
+        assert_eq!(reloaded.stage, Stage::Code, "the saved state reads Code");
+        let transition = events_named(root, "transition")
+            .pop()
+            .expect("resume recorded a transition");
+        assert_eq!(transition["from"], "plan");
+        assert_eq!(transition["to"], "code");
+        let archived = events_named(root, "capture_archived");
+        let [archived] = archived.as_slice() else {
+            panic!("resume archived one capture: {archived:?}");
+        };
+        let stage = &archived["stage"];
+        assert_eq!(stage, "plan", "the Plan capture was archived as {stage}");
+        assert_eq!(archived["to_stage"], "code");
+    }
+
+    /// Control for 999.251: an operator's `devflow stop` during the capped Plan leaves
+    /// `stop_until = Some(Plan)` too, and its resume reruns Plan, which never finished.
+    #[test]
+    fn resume_after_an_operator_stop_in_plan_reruns_plan() {
+        const NAME: &str =
+            "pipeline_launch::tests::resume_after_an_operator_stop_in_plan_reruns_plan";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_dir_with_agent_stub("codex");
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(98);
+        save_stopped_in_plan(root, phase, AgentKind::Codex, "stopped via `devflow stop`");
+
+        let result = resume(root, phase, None);
+        let _runners = crate::service::double::LaunchedRunners;
+        result.unwrap();
+
+        let (launched, probe) = first_step_after_resume(root, phase);
+        assert_eq!(
+            probe,
+            vec![(Stage::Plan, AgentKind::Codex)],
+            "an operator stop in Plan relaunches Plan: {probe:?}"
+        );
+        assert_eq!(launched.stage, Stage::Plan);
+        assert_eq!(
+            workflow::load_state(root, phase).unwrap().stage,
+            Stage::Plan
+        );
+        assert!(
+            events_named(root, "transition").is_empty(),
+            "an operator stop records no transition"
+        );
+    }
+
+    /// 999.251 with `--agent`: the handoff is judged and recorded at Code, the stage the
+    /// resume launches, after the `transition` that moved the run there.
+    #[test]
+    fn resume_with_agent_after_an_until_plan_halt_hands_off_at_code() {
+        const NAME: &str =
+            "pipeline_launch::tests::resume_with_agent_after_an_until_plan_halt_hands_off_at_code";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_dir_with_agent_stub("codex");
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(99);
+        save_stopped_in_plan(
+            root,
+            phase,
+            AgentKind::Claude,
+            &crate::pipeline_gate::until_halt_reason(Stage::Plan),
+        );
+
+        let result = resume(root, phase, Some(AgentKind::Codex));
+        let _runners = crate::service::double::LaunchedRunners;
+        result.unwrap();
+
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        assert_eq!(reloaded.agent, AgentKind::Codex);
+        let events: Vec<serde_json::Value> =
+            std::fs::read_to_string(devflow_core::events::events_path(root))
+                .unwrap()
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect();
+        let position = |name: &str| events.iter().position(|event| event["event"] == name);
+        let handoff_at = position("agent_handoff").expect("handoff event must exist");
+        let stage = &events[handoff_at]["stage"];
+        assert_eq!(
+            stage, "code",
+            "a resume --agent after an --until plan halt handed off at {stage}"
+        );
+        let transition_at = position("transition").expect("resume recorded a transition");
+        assert_eq!(events[transition_at]["from"], "plan");
+        assert_eq!(events[transition_at]["to"], "code");
+        assert!(
+            transition_at < handoff_at,
+            "the transition is recorded before the handoff"
+        );
+        assert_eq!(reloaded.stage, Stage::Code, "the saved state reads Code");
     }
 
     /// A phase parked at an open, answered `stage` gate whose waiter was killed before it

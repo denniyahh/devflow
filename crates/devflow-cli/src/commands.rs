@@ -1456,7 +1456,15 @@ pub(crate) fn cleanup(project_root: &Path) -> Result<(), CliError> {
 
     worktree::prune(project_root)?;
     if !outcomes.contains(&CleanupOutcome::Removed) {
-        println!("no worktrees to clean up");
+        let kept = outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, CleanupOutcome::Kept | CleanupOutcome::Unsettled))
+            .count();
+        if kept == 0 {
+            println!("no worktrees to clean up");
+        } else {
+            println!("removed nothing; kept {kept} (each listed above with its reason)");
+        }
     }
     sweep_merged_branches(project_root, &git)?;
     let unsettled = outcomes
@@ -3151,13 +3159,26 @@ fn status_state_lines(
 
 /// The id of the question gate open at `phase`'s `stage`, if one is (review
 /// concern 10): the `__ask` server opens it, so `gate_pending` stays false. A
-/// gate file that cannot be read as a question reads as none, with a warning.
+/// gate file that cannot be read as a question, and a question gate whose id does
+/// not parse, each read as none, with a warning.
 fn open_question_gate_id(project_root: &Path, phase: PhaseId, stage: Stage) -> Option<GateId> {
     let gate = Gates::list_open(project_root)
         .into_iter()
         .find(|gate| gate.phase == phase && gate.stage == stage)?;
     match Gates::read_question(project_root, phase, stage) {
-        Ok(Some(_)) => GateId::parse(&gate.gate_id).ok(),
+        Ok(Some(_)) => match GateId::parse(&gate.gate_id) {
+            Ok(id) => Some(id),
+            Err(error) => {
+                tracing::warn!(
+                    %phase,
+                    %stage,
+                    gate_id = %gate.gate_id,
+                    %error,
+                    "the open question gate id could not be parsed; status shows gate: none"
+                );
+                None
+            }
+        },
         Ok(None) => None,
         Err(error) => {
             tracing::warn!(
@@ -7872,6 +7893,73 @@ mod tests {
         Gates::open_question_registered(root, phase, stage, &spec).unwrap()
     }
 
+    /// A `std::io::Write` that appends to a buffer shared with the test, for
+    /// capturing what a tracing subscriber writes.
+    #[derive(Clone)]
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `open_question_gate_id` for `phase` and `stage`, and the text the tracing
+    /// events it raised render to.
+    fn open_question_gate_id_logged(
+        root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+    ) -> (Option<GateId>, String) {
+        let log = CapturedLog(Default::default());
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let id = tracing::subscriber::with_default(subscriber, || {
+            open_question_gate_id(root, phase, stage)
+        });
+        let captured = String::from_utf8_lossy(&log.0.lock().unwrap()).into_owned();
+        (id, captured)
+    }
+
+    /// 999.258: a question gate whose id does not parse reads as no question gate
+    /// and is warned about, naming the id; a well-formed one is read without one.
+    #[test]
+    fn an_unparsable_question_gate_id_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, stage) = (PhaseId::new(5343), Stage::Code);
+        let (opened, registration) = open_budget_question(root, phase, stage);
+
+        let (id, captured) = open_question_gate_id_logged(root, phase, stage);
+        assert_eq!(id, Some(opened.gate_id.clone()), "control: {captured:?}");
+        assert!(
+            !captured.contains("could not be parsed"),
+            "control: a well-formed gate id was warned about: {captured:?}"
+        );
+
+        let path = Gates::gate_path(root, phase, stage);
+        let mut gate: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        gate["gate_id"] = serde_json::Value::from("not a gate id");
+        std::fs::write(&path, serde_json::to_string(&gate).unwrap()).unwrap();
+
+        let (id, captured) = open_question_gate_id_logged(root, phase, stage);
+        assert_eq!(id, None, "{captured:?}");
+        assert!(
+            captured.contains("gate id could not be parsed") && captured.contains("not a gate id"),
+            "an unparsable question gate id is dropped without a warning: {captured:?}"
+        );
+        registration.finish();
+    }
+
     fn option_choice(option_id: &str) -> QuestionChoice {
         QuestionChoice::Option {
             option_id: option_id.to_string(),
@@ -9596,6 +9684,51 @@ mod tests {
         assert!(rendered.contains(&"x".repeat(150)));
         assert!(!rendered.contains("[truncated"));
         assert!(!rendered.contains('\u{1b}'));
+    }
+
+    /// 999.206: `gate show` prints a 1000-character failure reason whole, as
+    /// the failure gate stored it.
+    #[test]
+    fn gate_show_prints_a_long_failure_reason_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(5235);
+        let state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Auto,
+            dir.path().to_path_buf(),
+        );
+        let cause: String = "a check kept failing; "
+            .chars()
+            .cycle()
+            .take(950)
+            .chain("x".repeat(49).chars())
+            .chain(std::iter::once('Z'))
+            .collect();
+        assert_eq!(cause.chars().count(), 1000);
+        let context = crate::pipeline_outcomes::failure_gate_context(
+            &state,
+            Stage::Code,
+            Some(cause.clone()),
+        );
+        Gates::write_gate(
+            dir.path(),
+            phase,
+            Stage::Code,
+            devflow_core::gates::GateKind::StageFailure,
+            &context,
+        )
+        .unwrap();
+        let gate = Gates::list_open(dir.path())
+            .into_iter()
+            .find(|g| g.phase == phase)
+            .unwrap();
+
+        let rendered = render_gate_show(&gate, None);
+
+        let tail: String = cause.chars().skip(950).collect();
+        assert!(rendered.contains(&tail), "the cause's last 50: {rendered}");
+        assert!(!rendered.contains("[truncated"), "{rendered}");
     }
 
     #[test]

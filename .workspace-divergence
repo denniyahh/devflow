@@ -10,5 +10,8 @@
 # Personal hook (develop removed its post-commit)
 only scripts/hooks/post-commit
 
+# Tests the personal post-commit hook, which develop does not have
+only crates/devflow-cli/tests/post_commit_marker.rs
+
 # Tracks .planning/ instead of ignoring it, and ignores graphify-out/ wholesale
 modified .gitignore

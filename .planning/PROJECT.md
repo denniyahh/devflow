@@ -707,6 +707,9 @@ and SUPV-03/04/05 moved to Validated (their footers had claimed it without writi
 `/gsd-new-milestone` v4.0.*
 
 ---
+*Last updated: 2026-11-21 after Phase 53.1 (Phase 53 remediation, inserted) — 8/8 plans; verification passed 50/50. A Claude stream rate limit is classified as one, the rate-limit gate names its reset in UTC and how far off it is, `resume` after an `--until plan` halt starts Code, gates say how to answer decisions and post-run sign-offs, and a finished run has GSD mark the phase complete. Unreleased; three review warnings stay open. Next: Phase 54 (Decision Triage).*
+
+---
 *Last updated: 2026-11-17 after Phase 52.2 (Foreground Runner, inserted) — 26/26 plans; verification passed 8/8. Every run is a systemd user service whose runner holds one per-phase lifetime lock, the only liveness signal (999.237); `recover`, the socket supervisor and `stop --launch` are gone, and `devflow-core` takes a breaking change under 4.0.0. Unreleased. Next: Phase 53 (The Question Channel).*
 
 *Last updated: 2026-11-08 after Phase 51 (Rate-Limit Agent Failover) — 13/13 plans (51-08 dropped by operator ruling); verification passed 114/114. A Code-stage rate limit continues under the configured fallback agent; SUPV-02 validated. Last phase of v3.0.0; no live failover run yet. Backlog 999.183-187 holds what stays open.*

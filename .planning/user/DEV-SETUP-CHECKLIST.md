@@ -266,6 +266,12 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
 - [ ] **[PROJECT]** `scripts/hooks/post-commit`: warns (never auto-edits) when a `*-SUMMARY.md`
   lands but `STATE.md`'s authored prose wasn't updated to match. Only a summary directly inside a
   phase directory counts; a nested one (a plan review's `52-plan-review-N/SUMMARY.md`) does not.
+  It records a stale-state marker at `$(git rev-parse --git-path devflow-stale-state.json)`,
+  inside the per-worktree git dir, so it is never tracked and never dirties the tree. The old
+  path `.planning/user/errors/state-stale.json` stays ignored by `.planning/user/errors/.gitignore`
+  while any checkout still runs the old hook (every worktree runs the main checkout's hook
+  through `core.hooksPath`).
+  - Verify: `cargo nextest run -p devflow --test post_commit_marker --no-tests=fail`.
 - [ ] **[PROJECT]** `scripts/hooks/post-commit` also warns when a dev-setup file changes without
   this checklist moving too. Its path lives in one variable, `checklist_path`, at the top of that
   block — **if this file ever moves again, change that variable**. From the move into

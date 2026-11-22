@@ -229,11 +229,20 @@ fn a_call_offering_a_recommended_id_not_in_options_is_refused() {
 }
 
 /// A gate notify command that writes the hook's `DEVFLOW_GATE_CONTEXT` to
-/// `marker`.
+/// `marker`. It writes a temp file beside the marker and renames it into
+/// place, so a reader polling `marker.exists()` never sees it half-written.
 fn marker_hook(marker: &std::path::Path) -> String {
+    marker_hook_with_delay(marker, 0)
+}
+
+/// [`marker_hook`] with `delay_secs` of sleep between the temp file's
+/// creation and the write, so a reader that could see an unpublished marker
+/// would read it empty.
+fn marker_hook_with_delay(marker: &std::path::Path, delay_secs: u32) -> String {
+    let marker = marker.display();
     format!(
-        "printf '%s' \"$DEVFLOW_GATE_CONTEXT\" > '{}'",
-        marker.display()
+        "{{ sleep {delay_secs}; printf '%s' \"$DEVFLOW_GATE_CONTEXT\"; }} > '{marker}.tmp' \
+         && mv '{marker}.tmp' '{marker}'"
     )
 }
 
@@ -1036,4 +1045,27 @@ fn an_uncapped_call_holds_past_a_cap_value() {
         .reply(CALL_ID, REPLY_WAIT)
         .expect("the held call replies once answered");
     assert_eq!(option_of(&reply), "budget-300", "{reply}");
+}
+
+#[test]
+fn the_marker_hook_publishes_the_marker_whole() {
+    let scratch = tempfile::tempdir().expect("scratch dir");
+    let marker = scratch.path().join("notified");
+    let mut hook = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(marker_hook_with_delay(&marker, 1))
+        .env("DEVFLOW_GATE_CONTEXT", "Pick a budget")
+        .spawn()
+        .expect("spawn the marker hook");
+    let started = Instant::now();
+    while !marker.exists() && started.elapsed() < REPLY_WAIT {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let notified = std::fs::read_to_string(&marker).expect("notify marker written by the hook");
+    let status = hook.wait().expect("wait for the marker hook");
+    assert!(status.success(), "the marker hook failed: {status:?}");
+    assert!(
+        notified.contains("Pick a budget"),
+        "the notify marker holds the question: {notified:?}"
+    );
 }

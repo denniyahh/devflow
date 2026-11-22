@@ -359,10 +359,24 @@ closing this phase.
 **Goal:** Fix the DevFlow defects found while dogfooding Phase 53 and in the PR #245 review, plus the backlog items earmarked for this phase (operator, 2026-11-19), so the next dogfooded phase runs without the workarounds Phase 53 needed. In scope: 999.250, 999.251, 999.252, 999.253, 999.254, 999.255, 999.257, 999.258 (from the Phase 53 run and review), and 999.240, 999.249, 999.219, 999.213, 999.206, 999.202, 999.201, 999.193, 999.189 (earmarked backlog). Some of the earmarked items may already be fixed by Phases 52–53; discuss checks each one against the current code and drops or narrows those, with the evidence.
 **Requirements**: TBD (one per in-scope 999.x item, set in discuss)
 **Depends on:** Phase 53
-**Plans:** 0 plans
+**Plans:** 8/8 plans complete
 
 Plans:
-- [ ] TBD (run /gsd-plan-phase 53.1 to break down)
+**Wave 1**
+- [x] 53.1-01-PLAN.md — stream `error_rate_limit` classified RateLimited (999.201); close the four fixed entries, 999.252 and 999.206 notes (wave 1)
+- [x] 53.1-02-PLAN.md — rate-limit gate: reset as UTC time and distance, far reset leads with stop then `resume --agent` (999.250) (wave 1)
+- [x] 53.1-03-PLAN.md — resume after `--until` starts the next stage (999.251); late cancel and pi comment (999.258) (wave 1)
+- [x] 53.1-04-PLAN.md — cleanup of a stopped run stops contradicting itself (999.213); unparsable question gate id warns (999.258) (wave 1)
+- [x] 53.1-05-PLAN.md — post-commit marker out of the tree (999.240/253), live-payload CONTEXT.md (999.255), atomic notify marker (999.257) (wave 1)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+- [x] 53.1-06-PLAN.md — stage-failure decisions note (999.249), capture-file suffix and gate show pin (999.206), post-run sign-off route (999.254) (wave 2)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+- [x] 53.1-07-PLAN.md — finish runs GSD's phase.complete and commit (999.259); OPERATIONS docs on how a run ends (wave 3)
+
+**Wave 4** *(blocked on Wave 3 completion)*
+- [x] 53.1-08-PLAN.md — close the D-02 entries (999.206, 999.213, 999.251), file the resume residual, resume row, phase gate (wave 4)
 
 ### Phase 54: Decision Triage
 
@@ -602,7 +616,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 53 | 14/14 | Complete | 2026-11-20 |
 | 54 | 0/? | Not started | — |
 | 55 | 0/? | Not started | — |
-| 53.1. Phase 53 remediation | 0/0 | Not started | - |
+| 53.1. Phase 53 remediation | 8/8 | Complete | 2026-11-21 |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
 
@@ -870,6 +884,38 @@ close-out was refused: "Verification is stale — covered source files changed a
 documented way to re-verify after a review fix, e.g. run the fix on the phase branch through the run's Validate before finish.
 **Owner:** Phase 53.1.
 
+### Phase 999.261: Small Gate-Text and Doc Defects from the PR 251 Re-Review (RESOLVED 2026-11-22 — Phase 53.1, PR #251: 266af2a, 92169fe)
+
+**Found:** 2026-11-22, Graphify re-review of PR #251 (head 0b882e2), checked against the source (triage:
+.planning/audits/2026-11-22-graphify-review-triage-pr251.md).
+**What happened:** three small defects, none reached in a run:
+1. A system clock before 1970 makes `now` 0 (`map_or(0, …)`, crates/devflow-cli/src/pipeline_outcomes.rs:115-119), so every
+   reset reads as far away and the rate-limit gate leads with the switch-agent advice.
+2. A Claude stream denial with no `resetsAt` falls back to the status string (crates/devflow-core/src/agent_result.rs:1477-1479),
+   so the reason reads "rate limited until rejected" (`rate_limited_result`, :2502).
+3. The `validate_gate_context` doc block sits above `post_run_sign_off_route`'s doc (pipeline_outcomes.rs:1551-1574), so the
+   two read as one comment and `validate_gate_context` has none.
+**Not established:** whether 2 predates Phase 53.1; none was seen live.
+**Fix shape:** 1: treat a clock read failure as "reset distance unknown" and lead with the wait route; 2: say "until an
+unstated time" when no reset time is given, with a test on the rendered reason; 3: move the doc block. One fix branch, or the
+next phase that touches the gate text.
+
+### Phase 999.260: `devflow resume` After an `--until plan` Halt Reached Through Plan→Validate Starts Code, Not Validate (BACKLOG)
+
+**Found:** 2026-11-21, Phase 53.1 (the residual of the 999.251 fix, 53.1-03).
+**What happened:** after 53.1-03, `resume_loaded` (crates/devflow-cli/src/pipeline_launch.rs:2509, through `resume_advance` at :2627) advances a fired `--until`
+cap to `Stage::next` of the halted stage. The halt commit records no target, so a halt reached when a Plan gate's answer runs
+Validate again resumes at Code, where the answer asked for Validate.
+**Evidence:** the `--until` halt commit (crates/devflow-cli/src/pipeline_gate.rs:93-107) sets `stopped` and the halt reason
+but not the target stage; `Step::ValidateAgain` from a stage other than Validate calls `transition(…, Stage::Validate)`
+(crates/devflow-cli/src/pipeline_outcomes.rs:2048-2056), and that transition is the one the cap halts; 53.1-RESEARCH.md
+"999.251" names this residual.
+**Not established:** not seen in a live run; it needs `--until plan` and a verification gate at Plan.
+**Fix shape:** record the halted transition's target in a new persisted `State` field at the halt and resume to it (`State`
+is `#[non_exhaustive]`, crates/devflow-core/src/state.rs:34, so the field is additive), with a test that reaches a Plan
+gate's validate-again under `--until plan`.
+**Owner:** the next DevFlow fix branch or remediation phase, the operator's call.
+
 ### Phase 999.258: Minor Findings From the PR #245 Review (BACKLOG)
 
 **Source:** graphify-labs review of PR #245. Each finding was checked against source (triage in
@@ -942,7 +988,9 @@ controls show the failing direction); 53-13-SUMMARY line 66 (RED observed before
 **Fix shape (not decided):** upstream: implement the override, or let the review accept a SUMMARY-recorded RED and a
 test-only plan whose controls fail. **Owner:** upstream open-gsd/gsd-core#6451 (filed 2026-11-20); DevFlow side rides 999.249.
 
-### Phase 999.251: `devflow resume` After an `--until` Stop Re-Runs the Stage That Already Finished (BACKLOG)
+**Disposition (Phase 53.1, D-03):** GSD upstream; filing an upstream gsd-core issue is the operator's call. No DevFlow change; logged in the GSD incident log. The DevFlow side (the gate text) is 999.249, fixed in Phase 53.1.
+
+### Phase 999.251: `devflow resume` After an `--until` Stop Re-Runs the Stage That Already Finished (RESOLVED 2026-11-21 — Phase 53.1, 53.1-03; residual 999.260)
 
 **Earmarked (operator 2026-11-19):** the remediation phase directly after Phase 53.
 
@@ -959,6 +1007,12 @@ overwrite the hand-run `--reviews` replan the dogfood procedure puts between `--
 **Not established:** whether GSD plan-phase always short-circuits on existing plans (it did once here).
 **Fix shape (not decided):** record the halt as "stopped before <next stage>" (set `stage = to` with `stopped`), or have
 `resume` on a `stopped_at` run start at the next stage. **Owner:** next fix branch after Phase 53.
+
+**Resolved (Phase 53.1, D-02):** `resume_loaded` moves a run whose `--until` cap fired to the next stage with a normal
+advance's bookkeeping (53.1-03). Tests: `pipeline_launch::tests::resume_after_an_until_plan_halt_launches_code`,
+`pipeline_launch::tests::resume_with_agent_after_an_until_plan_halt_hands_off_at_code`, and the control
+`pipeline_launch::tests::resume_after_an_operator_stop_in_plan_reruns_plan` (an operator stop still reruns its saved stage).
+The fix covers a halt reached through Plan→Code; a halt reached through Plan→Validate still resumes at Code: 999.260.
 
 ### Phase 999.250: A Rate-Limit Gate Offers "Approve: Relaunches Now" When the Limit Resets Days Later (BACKLOG)
 
@@ -1458,7 +1512,7 @@ or the next fix branch.
 **Rescheduled:** 2026-11-11. The operator chose not to release at Phase 52 close-out (version `4.0.0-alpha.1`, unpublished),
 so this is needed only before the next real cut: take it at the v4.0 milestone close, before 4.0.0.
 
-### Phase 999.219: `devflow resume` (and `start --no-worktree`) Commits GSD's First Chain-Flag Write as a "Killed Run" Leak Repair (BACKLOG)
+### Phase 999.219: `devflow resume` (and `start --no-worktree`) Commits GSD's First Chain-Flag Write as a "Killed Run" Leak Repair (RESOLVED 2026-11-20 — fixed before Phase 53.1; closed by its discuss, D-01)
 
 **Earmarked (operator 2026-11-19):** the remediation phase directly after Phase 53.
 
@@ -1491,6 +1545,8 @@ working tree `false` → no killed-run notice.
 
 **Disposition (operator, 2026-11-10):** a separate fix branch after Phase 52, not folded into the phase.
 **Taken into Phase 52.1** (operator, 2026-11-11: accepted 52.1-CONTEXT D-02, superseding the line above).
+
+**Resolved:** the 52.1 D-22 resume path records GSD's own `false` as no repair and writes no `auto_chain_flag_repaired` event (`crates/devflow-cli/src/pipeline_launch.rs:371-375`). No plan in Phase 53.1 (D-01).
 
 ### Phase 999.218: The Plan-Bashism Scanner Drops the Finding Text When the File Path Is Long (DUPLICATE of 999.169)
 
@@ -1557,7 +1613,7 @@ never runs discuss there (D-14, `define_stage_prompt`), and the dry run still cl
 **Fix shape:** drop Define from the pipeline (start at Plan), or make it a local check with no agent launch. Either
 removes a stage that costs money and time and can only fail. Stability phase.
 
-### Phase 999.213: `devflow cleanup` Misreports a Stopped Run as "Halted via --until", Contradicts Itself, and `--force` Leaves the State Behind (BACKLOG)
+### Phase 999.213: `devflow cleanup` Misreports a Stopped Run as "Halted via --until", Contradicts Itself, and `--force` Leaves the State Behind (RESOLVED 2026-11-21 — Phase 53.1, 53.1-04)
 
 **Earmarked (operator 2026-11-19):** the remediation phase directly after Phase 53.
 
@@ -1575,6 +1631,14 @@ compose); either way `status` should not show a removed run as active.
 **Fix shape:** name the stop's real cause (`stop_reason`); skip the merged-branch delete for a branch a kept worktree
 uses; `--force` clears the state of the run whose worktree it removed, or `status` marks such a state stale; `start`
 says when it replaces a stale state. Stability phase.
+
+**Resolved (Phase 53.1, D-02):** the contradiction is fixed (53.1-04) and pinned with the stop-reason, `--until` and
+kept-branch points by `cleanup_keeps_a_stopped_run_without_saying_there_was_nothing_to_clean` (cleanup_rules_e2e); the
+merged-branch case by `cleanup_keeps_an_incomplete_stopped_run_even_when_merged_naming_resume_and_discard` and
+`cleanup_keeps_the_merged_branch_of_a_kept_state_only_run`. `--force` no longer exists (`Command::Cleanup { project }`,
+crates/devflow-cli/src/main.rs:604); a kept run is removed with `devflow discard`, which the refusals name, pinned by
+`start_refuses_an_unloadable_state_naming_discard_and_leaves_it_in_place`, `start_refuses_orphan_gate_files_naming_discard`,
+`status_lists_an_unloadable_state_as_unloadable_naming_discard` and `status_lists_gate_files_with_no_state_as_debris_naming_discard`.
 
 ### Phase 999.212: No Real Claude Quota Denial Has Ever Been Captured, and the Denial Fixtures Lag the Live Event Shape (BACKLOG)
 
@@ -1703,7 +1767,7 @@ and, if the answer is now `TornAfterLastEvent`, write the flagged idle-timeout r
 withdrawn. Test with a stub that prints the denial, then a partial line with no newline (`printf '%s'`), then sleeps;
 plant the old order as a failing control. OPERATIONS.md's residual sentence is corrected under 999.209. Phase 52 (operator, 2026-11-08: option A).
 
-### Phase 999.206: A Failure Gate Keeps Only 300 Characters of the Reason, and `gate show` Cannot Show the Rest (BACKLOG)
+### Phase 999.206: A Failure Gate Keeps Only 300 Characters of the Reason, and `gate show` Cannot Show the Rest (RESOLVED 2026-11-21 — Phase 53.1, 53.1-06)
 
 **Earmarked (operator 2026-11-19):** the remediation phase directly after Phase 53.
 
@@ -1723,6 +1787,13 @@ in .devflow/]" suffix names no file.
 line once reached a desktop notification, 13-06), but store the full sanitized reason, bounded (for example 4 KB), in the
 gate file and the event, and have `gate show` print it. Name the exact file in the truncation suffix. Ask agents to put
 the actionable sentence first in their reason. Phase 52.
+
+**Follow-up (Phase 53.1 research, Open Question 2; operator 2026-11-20, devflow_ask 18edee5ed9f11a33: defer):** asking agents to put the actionable sentence first in a failure reason is not done here; it would change the stage prompts and their insta snapshots. Phase 53.1 fixes the stored bound's suffix and pins gate show (plan 53.1-06).
+
+**Resolved (Phase 53.1, D-02):** the stored bound was already 4096 characters (`GATE_CONTEXT_STORED_MAX_CHARS`,
+crates/devflow-cli/src/pipeline_outcomes.rs:2515). 53.1-06 made a cut reason's suffix name the phase's capture file
+(`pipeline_outcomes::tests::a_cut_failure_reason_names_the_phase_capture_file`) and pinned `gate show` printing a long
+reason whole (`commands::tests::gate_show_prints_a_long_failure_reason_whole`).
 
 ### Phase 999.205: No Validate Loop-Back Plans Gap Closure, So a `gaps_found` Verification Cannot Be Closed by the Run (BACKLOG)
 
@@ -1772,7 +1843,7 @@ were re-derived at `b94d356` in the Phase 51 fix round; nothing stops them drift
 **Fix shape:** cite by symbol (or symbol + line) and have the checker assert the named symbol is on the cited line, with
 a planted off-by-N citation as a failing control. Phase 52.
 
-### Phase 999.202: `devflow status` Shows Nothing About an Armed or Spent Fallback Agent (BACKLOG — enhancement)
+### Phase 999.202: `devflow status` Shows Nothing About an Armed or Spent Fallback Agent (RESOLVED 2026-11-20 — fixed before Phase 53.1; closed by its discuss, D-01)
 
 **Earmarked (operator 2026-11-19):** the remediation phase directly after Phase 53.
 
@@ -1781,6 +1852,8 @@ state have no reader outside the failover path, so an operator cannot tell from 
 already used. Adjacent to 999.190 (status never shows `stop_reason`).
 
 **Fix shape:** one `status` line, e.g. `fallback: antigravity (armed)` / `(used)`; take together with 999.190.
+
+**Resolved:** `devflow status` prints `fallback_line`, one of `armed`, `spent` or `none` (`crates/devflow-cli/src/commands.rs:2941-2949`); also seen live on 2026-11-20. No plan in Phase 53.1 (D-01).
 
 ### Phase 999.201: A Stream `result` With `subtype: error_rate_limit` Is Classified Failed, Not RateLimited (BACKLOG — suspected)
 
@@ -1872,7 +1945,7 @@ or hand-editing `.devflow/` state; the Phase 51 remedy text points at `--agent <
 **Fix shape:** a deliberate "re-check the canary" route (e.g. `resume --recheck-canary`, or treat `--agent <same>` as
 an explicit re-check), and make `--agent <same>` say what it did instead of nothing. **Target: Phase 52** (operator, 2026-11-08).
 
-### Phase 999.193: The Validate Gate Says "Validation Passed — Approve to Ship?" While the Phase's Verification Reports `gaps_found` (BACKLOG)
+### Phase 999.193: The Validate Gate Says "Validation Passed — Approve to Ship?" While the Phase's Verification Reports `gaps_found` (RESOLVED 2026-11-20 — fixed before Phase 53.1; closed by its discuss, D-01)
 
 **Earmarked (operator 2026-11-19):** the remediation phase directly after Phase 53.
 
@@ -1892,6 +1965,8 @@ agent's message; with `--yes-ship` or in auto mode nothing would.
 **Fix shape:** at the Validate outcome, read the evidence root's `{N}-VERIFICATION.md` frontmatter `status`; on
 `gaps_found` (or `human_needed` unanswered) treat the verdict as `gaps` or, at least, put the status in the gate context
 and refuse a `--yes-ship` auto-approval. Fits Phase 52 or the next fix branch.
+
+**Resolved:** `validate_gate_kind` maps a pass or fail over `gaps_found` to `GateKind::GapsFound`, not a clean pass (`crates/devflow-cli/src/pipeline_outcomes.rs:409-433`, arms at 428 and 433). No plan in Phase 53.1 (D-01).
 
 ### Phase 999.192: A Verification Report Written During Code Is Read as Inherited, So a Validate Reject Re-Runs the Whole Phase (BACKLOG)
 
@@ -1950,7 +2025,7 @@ run; no test covers `devflow resume --agent` after the WR-02 stop.
 **Fix shape:** `status` (and `doctor`) print the recorded `stop_reason` for a stopped run beside the resume hint; a CLI
 test asserts the WR-02 reason text appears. Small; fits the next fix branch or Phase 52.
 
-### Phase 999.189: A Gate Rejection's Note Never Reaches the Fix Pass, and Any Note Containing "abort" Aborts the Run (BACKLOG)
+### Phase 999.189: A Gate Rejection's Note Never Reaches the Fix Pass, and Any Note Containing "abort" Aborts the Run (RESOLVED 2026-11-20 — fixed before Phase 53.1; closed by its discuss, D-01)
 
 **Earmarked (operator 2026-11-19):** the remediation phase directly after Phase 53.
 
@@ -1969,6 +2044,8 @@ test asserts the WR-02 reason text appears. Small; fits the next fix branch or P
 **Fix shape:** carry the note into the fix pass's prompt (escaped, as `resume` already prints it), and make abort an
 explicit answer (a flag or a field), not a substring of free text. Tell the operator at `gate reject` time which fix
 pass the rejection will run.
+
+**Resolved:** abort is an explicit field on the gate answer, never a note's wording (`crates/devflow-core/src/gates.rs:170-174`, `GateAction::from_response` at 241-251), and the rejection note reaches the fix pass through `fix_prompt` (`crates/devflow-core/src/prompt.rs:775-779`). No plan in Phase 53.1 (D-01).
 
 ### Phase 999.188: The Held-State-Write-Lock Status Test Fails Intermittently Under the Full Suite (BACKLOG)
 

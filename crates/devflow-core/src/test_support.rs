@@ -369,6 +369,10 @@ pub const GSD_STUB_VERSION: &str = "0.0.0-stub";
 /// an error and exits 97, so a test that reads more often than it scripted sees
 /// a reader failure, never a repeated answer.
 ///
+/// A reply whose first line is `!exit <code>` scripts a failing GSD call: the
+/// stub prints the reply's remaining lines to stderr and exits `<code>`, as
+/// GSD's `--json-errors` refusals do.
+///
 /// The script uses shell builtins only, so it runs under an agent-free `PATH`.
 pub fn plant_gsd_run_stub(home: &std::path::Path, responses: &[&str], logs: &std::path::Path) {
     std::fs::create_dir_all(logs).expect("create the GSD stub's logs dir");
@@ -406,7 +410,18 @@ if [ ! -f "$logs/gsd-response-$n" ]; then
   exit 97
 fi
 printf '%s\n' "$((n + 1))" > "$logs/gsd-next"
-while IFS= read -r line || [ -n "$line" ]; do printf '%s\n' "$line"; done < "$logs/gsd-response-$n"
+{{
+  IFS= read -r first || [ -n "$first" ]
+  case "$first" in
+    '!exit '*)
+      code=${{first#!exit }}
+      while IFS= read -r line || [ -n "$line" ]; do printf '%s\n' "$line" >&2; done
+      exit "$code"
+      ;;
+  esac
+  printf '%s\n' "$first"
+  while IFS= read -r line || [ -n "$line" ]; do printf '%s\n' "$line"; done
+}} < "$logs/gsd-response-$n"
 "#
     );
     write_executable(&launcher, &script);

@@ -33,6 +33,7 @@ use devflow_core::{
     agent_result::{AgentStatus, Verdict},
     events, reset_time,
 };
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 /// Route a `GateInfra` outcome (ResourceKilled/AgentUnavailable) — bumps
@@ -111,7 +112,11 @@ pub(crate) fn handle_rate_limited_outcome(
     reason: Option<String>,
 ) -> Result<Option<StageLaunch>, CliError> {
     let reset_at = reset_time::parse_reset_time(&retry_after_from_reason(reason.as_deref()));
-    let context = rate_limit_gate_context(state, phase, stage, reason);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX));
+    let context = rate_limit_gate_context(state, phase, stage, reason, now);
     let answer = run_gate(
         project_root,
         state,
@@ -122,38 +127,108 @@ pub(crate) fn handle_rate_limited_outcome(
     dispatch_answer(project_root, state, stage, answer, false)
 }
 
+/// How far past `now` a rate-limit reset must lie before the gate leads with
+/// the way to another agent (D-04): beyond it, waiting is the slow way on.
+/// Deliberately a constant: there is no environment variable or config key.
+const RATE_LIMIT_FAR_RESET_SECS: i64 = 6 * 60 * 60;
+
 /// The never-silent gate context for a rate limit no fallback can take. The
 /// routers' way-on sentence first (C2), because the notify hook and the banner
-/// show only the start; then the resume command (with `--agent` when the run
-/// is not on the default agent), the reset time when the denial carried one,
-/// and the cause.
+/// show only the start. A reset more than [`RATE_LIMIT_FAR_RESET_SECS`] away
+/// then names the way to another agent first (`devflow stop`, then `devflow
+/// resume --agent`; D-04), so no variable-length part precedes it inside the
+/// display cut, then the reset as a UTC time and a distance and the same-agent
+/// resume command. A near, past or unreadable reset names the same-agent resume
+/// command (with `--agent` when the run is not on the default agent) first,
+/// then the reset. So does any reset when `now` is `None` (the system clock
+/// could not be read): its distance is unknown, so it is never taken as far. The
+/// cause comes last.
 fn rate_limit_gate_context(
     state: &State,
     phase: PhaseId,
     stage: Stage,
     reason: Option<String>,
+    now: Option<i64>,
 ) -> String {
     let agent = if state.agent == AgentKind::Claude {
         String::new()
     } else {
         format!(" --agent {}", state.agent)
     };
-    let retry_after = retry_after_from_reason(reason.as_deref());
-    let reset = if reset_time::parse_reset_time(&retry_after).is_some() {
-        format!("the limit resets at {retry_after}")
-    } else {
-        "the denial carried no reset time".to_string()
+    let reset_at = reset_time::parse_reset_time(&retry_after_from_reason(reason.as_deref()));
+    let reset = match reset_at {
+        Some(at) => match now {
+            Some(now) => format!(
+                "the limit resets at {}, {}",
+                reset_time::format_utc(at),
+                reset_distance(at, now)
+            ),
+            None => format!(
+                "the limit resets at {}; the system clock could not be read, so how far off \
+                 that is is unknown",
+                reset_time::format_utc(at)
+            ),
+        },
+        None => "the denial carried no reset time".to_string(),
     };
-    let lead = format!(
-        "rate limited with no usable fallback; once this waiting supervisor has ended, \
-         `devflow resume --phase {phase}{agent}` relaunches the stage; {reset}. Cause: "
-    );
+    let far = match (reset_at, now) {
+        (Some(at), Some(now)) => at.saturating_sub(now) > RATE_LIMIT_FAR_RESET_SECS,
+        _ => false,
+    };
+    let lead = if far {
+        let other = other_agent_for_resume(state);
+        format!(
+            "no usable fallback; for another agent now: `devflow stop --phase {phase}`, then \
+             `devflow resume --phase {phase} --agent {other}`; {reset}; once this waiting \
+             supervisor has ended, `devflow resume --phase {phase}{agent}` relaunches the stage \
+             on the same agent. Cause: "
+        )
+    } else {
+        format!(
+            "rate limited with no usable fallback; once this waiting supervisor has ended, \
+             `devflow resume --phase {phase}{agent}` relaunches the stage; {reset}. Cause: "
+        )
+    };
     lead_with_way_on(
         GateKind::RateLimit,
         (phase, stage),
         None,
-        &stage_failure_context(stage, &lead, reason),
+        &stage_failure_context(phase, stage, &lead, reason),
     )
+}
+
+/// The agent a far rate-limit gate names for `devflow resume --agent`: the
+/// run's fallback only once it is spent and differs from the run's agent,
+/// because `resume --agent` onto a saved unused fallback is refused; otherwise
+/// the placeholder `<other>`.
+fn other_agent_for_resume(state: &State) -> String {
+    match state.fallback_agent {
+        Some(fallback) if state.fallback_consumed && fallback != state.agent => {
+            fallback.to_string()
+        }
+        _ => "<other>".to_string(),
+    }
+}
+
+/// How far `reset` lies past `now`, in the two largest whole units that fit
+/// (D-04): `in 2 d 5 h`, `in 1 h 5 m`, `in 4 m`, `in under a minute`, or
+/// `already passed` once `reset` is not after `now`.
+fn reset_distance(reset: i64, now: i64) -> String {
+    const MINUTE: i64 = 60;
+    const HOUR: i64 = 60 * MINUTE;
+    const DAY: i64 = 24 * HOUR;
+    let left = reset.saturating_sub(now);
+    if left <= 0 {
+        "already passed".to_string()
+    } else if left >= DAY {
+        format!("in {} d {} h", left / DAY, left % DAY / HOUR)
+    } else if left >= HOUR {
+        format!("in {} h {} m", left / HOUR, left % HOUR / MINUTE)
+    } else if left >= MINUTE {
+        format!("in {} m", left / MINUTE)
+    } else {
+        "in under a minute".to_string()
+    }
 }
 
 /// The three-way outcome of a Validate stage evaluation (18e, D-18e).
@@ -334,6 +409,203 @@ pub(crate) fn record_gsd_runtime(project_root: &Path, phase: PhaseId) {
         Err(failure) => serde_json::json!({ "version": null, "failure": failure.label() }),
     };
     events::emit(project_root, phase, "gsd_runtime", payload);
+}
+
+/// The files GSD's `phase.complete` writes, by the reply flag that says it
+/// wrote them. `auto_pruned` (its optional STATE prune, GSD 1.22
+/// `lib/phase.cjs`) rewrites STATE.md and writes the archive beside it
+/// (`lib/state.cjs`).
+const GSD_COMPLETION_WRITES: [(&str, &[&str]); 4] = [
+    ("roadmap_updated", &[".planning/ROADMAP.md"]),
+    ("state_updated", &[".planning/STATE.md"]),
+    ("requirements_updated", &[".planning/REQUIREMENTS.md"]),
+    (
+        "auto_pruned",
+        &[".planning/STATE.md", ".planning/STATE-ARCHIVE.md"],
+    ),
+];
+
+/// The files GSD reported writing in a `phase.complete` reply, each once, so
+/// the commit leaves nothing GSD wrote uncommitted. Each flag is indexed as a
+/// boolean: an absent or non-boolean flag is a failure, never `false`.
+fn gsd_written_files(reply: &Value) -> Result<Vec<&'static str>, ReaderFailure> {
+    let mut files = Vec::new();
+    for (key, written) in GSD_COMPLETION_WRITES {
+        let wrote = reply[key]
+            .as_bool()
+            .ok_or_else(|| ReaderFailure::MissingField {
+                key: key.to_owned(),
+            })?;
+        for file in written.iter().filter(|_| wrote) {
+            if !files.contains(file) {
+                files.push(*file);
+            }
+        }
+    }
+    Ok(files)
+}
+
+/// Mark the finished run's phase complete in GSD and commit what GSD wrote
+/// (D-10; the operator's plan-phase answer "commit"), recording one
+/// `gsd_phase_complete` event. DevFlow edits no planning file itself: it runs
+/// GSD's `phase.complete` and GSD's `query commit` in the evidence root,
+/// after checking GSD resolves that root's own `.planning/` (review codex 6).
+/// It never fails: the run is already finished, and a refusal is printed and
+/// recorded.
+pub(crate) fn record_gsd_phase_complete(project_root: &Path, state: &State) {
+    let root = evidence_root(project_root, state);
+    let payload = match gsd_home(&root) {
+        Some(home) => complete_phase_in_gsd(&home, &root, state.phase),
+        None => completion_refused(
+            state.phase,
+            &ReaderFailure::LauncherNotFound {
+                home: PathBuf::from("$HOME (unset)"),
+            },
+            &root,
+            None,
+        ),
+    };
+    events::emit(project_root, state.phase, "gsd_phase_complete", payload);
+}
+
+/// The planning-root check, `phase.complete` and the commit, in that order;
+/// the payload of the `gsd_phase_complete` event.
+fn complete_phase_in_gsd(home: &Path, root: &Path, phase: PhaseId) -> Value {
+    match gsd_reader::planning_root(home, root) {
+        Ok(planning) if !is_own_planning_dir(root, &planning) => {
+            return scoped_planning_refusal(phase, &planning, root, home);
+        }
+        Ok(_) => {}
+        Err(failure) => return completion_refused(phase, &failure, root, Some(home)),
+    }
+    match gsd_reader::phase_complete(home, root, phase).and_then(|reply| gsd_written_files(&reply))
+    {
+        Ok(files) => commit_completion(home, root, phase, &files),
+        Err(failure) => completion_refused(phase, &failure, root, Some(home)),
+    }
+}
+
+/// Whether `planning` is `root`'s own `.planning/`, compared canonically.
+fn is_own_planning_dir(root: &Path, planning: &Path) -> bool {
+    canonical_or_given(planning) == canonical_or_given(&root.join(".planning"))
+}
+
+/// `path` canonicalized, or as given when it cannot be.
+fn canonical_or_given(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Refuse a planning directory GSD resolves under a `GSD_PROJECT` or
+/// workstream scope before any write: GSD would write its ROADMAP.md and
+/// STATE.md there, not at the `.planning/` paths the commit names.
+fn scoped_planning_refusal(phase: PhaseId, planning: &Path, root: &Path, home: &Path) -> Value {
+    eprintln!(
+        "GSD resolves a scoped planning directory ({}); DevFlow marks a phase complete only \
+         for an unscoped .planning/, so it ran no GSD writer: run `gsd_run query phase.complete \
+         {phase}` by hand",
+        planning.display()
+    );
+    serde_json::json!({
+        "ok": false,
+        "failure": "scoped_planning_dir",
+        "reason": null,
+        "message": event_safe_text(&planning.display().to_string(), root, Some(home)),
+    })
+}
+
+/// Commit the files GSD wrote, through GSD's own commit. A failed or empty
+/// commit stays `ok: true`: GSD did mark the phase complete (review agy 9).
+fn commit_completion(home: &Path, root: &Path, phase: PhaseId, files: &[&str]) -> Value {
+    if files.is_empty() {
+        println!("GSD marked phase {phase} complete and updated no file, so nothing was committed");
+        return serde_json::json!({ "ok": true, "committed": false, "commit_failure": null });
+    }
+    let message = format!("docs(phase-{phase}): complete phase execution");
+    match gsd_reader::commit_files(home, root, &message, files) {
+        Ok(reply) => {
+            let committed = reply["committed"] == true;
+            if committed {
+                println!(
+                    "GSD marked phase {phase} complete; committed {}",
+                    reply["hash"].as_str().unwrap_or("(GSD gave no hash)")
+                );
+            } else {
+                println!(
+                    "GSD marked phase {phase} complete; its commit committed nothing: {}",
+                    reply["reason"].as_str().unwrap_or("GSD gave no reason")
+                );
+            }
+            serde_json::json!({ "ok": true, "committed": committed, "commit_failure": null })
+        }
+        Err(failure) => {
+            eprintln!("GSD marked phase {phase} complete, but its commit failed: {failure}");
+            serde_json::json!({ "ok": true, "committed": false, "commit_failure": failure.label() })
+        }
+    }
+}
+
+/// A `phase.complete` that did not run or was refused: GSD's full text on
+/// stderr, and an event with the failure's label, GSD's reason code and
+/// GSD's own message made event-safe (D-10). Only GSD's text enters the
+/// event: every other failure class records its label with `message: null`.
+/// No commit runs, and the run stays finished.
+fn completion_refused(
+    phase: PhaseId,
+    failure: &ReaderFailure,
+    root: &Path,
+    home: Option<&Path>,
+) -> Value {
+    eprintln!("GSD did not mark phase {phase} complete; the run is still finished: {failure}");
+    let (reason, message) = match failure {
+        ReaderFailure::Exit { message, .. } => gsd_refusal_text(message),
+        ReaderFailure::GsdError { message } => (None, Some(message.clone())),
+        _ => (None, None),
+    };
+    serde_json::json!({
+        "ok": false,
+        "failure": failure.label(),
+        "reason": reason,
+        "message": message.map(|text| event_safe_text(&text, root, home)),
+    })
+}
+
+/// GSD's reason code and message from a `--json-errors` refusal on stderr,
+/// else no reason and the raw stderr text.
+fn gsd_refusal_text(stderr: &str) -> (Option<String>, Option<String>) {
+    match serde_json::from_str::<Value>(stderr) {
+        Ok(Value::Object(refusal)) => (
+            refusal
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            refusal
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        ),
+        _ => (None, Some(stderr.to_owned())),
+    }
+}
+
+/// `text` bounded to [`devflow_core::gates::GATE_CONTEXT_DISPLAY_CHARS`] with
+/// the evidence root replaced by `.` and the GSD home by `~`, each in its
+/// given and canonical forms, so no absolute path of either reaches an event
+/// (`gsd_reader` property 3).
+fn event_safe_text(text: &str, root: &Path, home: Option<&Path>) -> String {
+    let mut needles: Vec<(String, &str)> = Vec::new();
+    for (path, replacement) in std::iter::once((root, ".")).chain(home.map(|home| (home, "~"))) {
+        for form in [path.to_path_buf(), canonical_or_given(path)] {
+            needles.push((form.display().to_string(), replacement));
+        }
+    }
+    needles.retain(|(needle, _)| !needle.is_empty());
+    // Longest first, so a path that holds another is replaced whole.
+    needles.sort_by_key(|(needle, _)| std::cmp::Reverse(needle.len()));
+    let mut safe = text.to_owned();
+    for (needle, replacement) in &needles {
+        safe = safe.replace(needle.as_str(), replacement);
+    }
+    render_gate_context(&safe, devflow_core::gates::GATE_CONTEXT_DISPLAY_CHARS)
 }
 
 /// The agent's half of a Validate verdict (D-08): one input of
@@ -850,9 +1122,10 @@ pub(crate) fn step_phrase(step: &Step) -> &'static str {
 pub(crate) fn status_less_phrase(step: &StatusLessStep, phase: PhaseId, stage: Stage) -> String {
     match step {
         StatusLessStep::RetryStage => format!("retries the {stage} stage"),
-        StatusLessStep::RelaunchNow => {
-            format!("relaunches the {stage} stage now on the same agent")
-        }
+        StatusLessStep::RelaunchNow => format!(
+            "relaunches the {stage} stage now on the same agent, into the same limit until it \
+             resets"
+        ),
         StatusLessStep::RelaunchWithNote(_) => {
             format!("relaunches the {stage} stage with the note")
         }
@@ -1286,6 +1559,23 @@ fn emit_verification_read(
     events::emit(project_root, phase, "gsd_verification", payload);
 }
 
+/// The route a `human_needed` gate names for sign-offs that can only run
+/// after the run ends (D-06, 999.254), the Phase 53 close-out route: run them
+/// with a build installed to a separate root while the gate waits, then answer
+/// with `devflow gate reject N --note "<sign-offs done and results>"`, which
+/// runs `/gsd-quick` with the note and Validate again. It names `gate reject`
+/// because `gate approve` also takes `--note` and would reopen the gate
+/// without it; that `reject` is its one answer word, a route these gates run
+/// (C2). Appended to the first `human_needed` gate and to its reopen.
+fn post_run_sign_off_route(phase: PhaseId) -> String {
+    format!(
+        " A sign-off that can only run after this run ends: run it with a build installed to \
+         a separate root while this gate waits (OPERATIONS.md, How Validate decides), then \
+         answer with `devflow gate reject {phase} --note \"<sign-offs done and results>\"`: \
+         `/gsd-quick` records them and Validate runs again."
+    )
+}
+
 /// The context of a Validate gate of `kind`, and the one its `gate_fired`
 /// event carries. They differ only for a reader failure, whose detail stays
 /// out of the event. Every context but a reader failure's quotes GSD's status
@@ -1370,6 +1660,9 @@ fn validate_gate_context(
         | GateKind::Preflight
         | GateKind::Question => "",
     });
+    if kind == GateKind::HumanNeeded {
+        message.push_str(&post_run_sign_off_route(state.phase));
+    }
     // WR-04 (35-REVIEW): the ceiling clause belongs on every Validate gate that
     // fired at the ceiling, a passing one included, or an operator running
     // unattended Auto cannot tell why it fired. F-6: conditioned on the ceiling
@@ -1810,8 +2103,9 @@ fn reopen_verification_gate(
     let (kind, context, event_context) = match &evidence.read {
         Ok(report) => {
             let context = format!(
-                "GSD verification, read again: {}. GSD still needs a human sign-off.",
-                gsd_status_name(report.status)
+                "GSD verification, read again: {}. GSD still needs a human sign-off.{}",
+                gsd_status_name(report.status),
+                post_run_sign_off_route(state.phase)
             );
             (GateKind::HumanNeeded, context.clone(), context)
         }
@@ -2242,15 +2536,44 @@ pub(crate) fn truncate_reason(reason: &str) -> String {
     render_gate_context(reason, GATE_CONTEXT_STORED_MAX_CHARS)
 }
 
-/// The never-silent gate context for a failed `stage`, with its `reason`
-/// stored whole up to [`truncate_reason`]'s bound. `lead` goes before the
-/// reason, so it survives the pending-gate banner's and `gate list`'s display
-/// bound whatever the reason's length.
-fn stage_failure_context(stage: Stage, lead: &str, reason: Option<String>) -> String {
+/// The never-silent gate context for a failed `stage` of `phase`, with its
+/// `reason` stored whole up to [`bound_stage_reason`]'s bound. `lead` goes
+/// before the reason, so it survives the pending-gate banner's and `gate
+/// list`'s display bound whatever the reason's length.
+fn stage_failure_context(
+    phase: PhaseId,
+    stage: Stage,
+    lead: &str,
+    reason: Option<String>,
+) -> String {
     format!(
         "[never-silent] stage {stage} failed: {lead}{}",
-        truncate_reason(&reason.unwrap_or_else(|| "no details available".into()))
+        bound_stage_reason(
+            phase,
+            &reason.unwrap_or_else(|| "no details available".into())
+        )
     )
+}
+
+/// A failure `reason` as a stage-failure gate stores it (999.206, D-02): one
+/// sanitized line of at most [`GATE_CONTEXT_STORED_MAX_CHARS`] characters.
+/// Past the bound it is cut and ends with a suffix naming the phase's own
+/// capture, `.devflow/phase-NN-stdout` (padded as
+/// [`agent_result::stdout_path`] pads it), so the operator knows where the
+/// rest is. That file holds the capture while the gate is open; the next
+/// launch archives it under `.devflow/history/phase-NN/`.
+fn bound_stage_reason(phase: PhaseId, reason: &str) -> String {
+    let sanitized = render_gate_context(reason, usize::MAX);
+    if sanitized.chars().count() <= GATE_CONTEXT_STORED_MAX_CHARS {
+        return sanitized;
+    }
+    let suffix = format!(
+        "… [truncated; full output in .devflow/phase-{}-stdout]",
+        phase.padded()
+    );
+    let keep = GATE_CONTEXT_STORED_MAX_CHARS.saturating_sub(suffix.chars().count());
+    let head: String = sanitized.chars().take(keep).collect();
+    format!("{head}{suffix}")
 }
 
 /// The gate context for a failed stage: the way-on sentence the routers render
@@ -2261,15 +2584,44 @@ fn stage_failure_context(stage: Stage, lead: &str, reason: Option<String>) -> St
 /// `canary_refusal` input, says so and names `devflow resume --phase N --agent
 /// <other>`. It leads, before the reason, because the notify hook carries this
 /// context to an operator who decides from it alone, and the banner and
-/// `gate list` show only its start.
+/// `gate list` show only its start. The context ends with
+/// [`decisions_note_sentence`], rendered from the same `canary_refusal`: it
+/// trails the reason so the leading part inside the display cut, and the
+/// idle-timeout clause's 23 characters of slack in it, stay as they were;
+/// `gate show` prints the whole context.
 pub(crate) fn failure_gate_context(state: &State, stage: Stage, reason: Option<String>) -> String {
     let canary_refusal = recorded_canary_refusal(state);
-    lead_with_way_on(
+    let context = lead_with_way_on(
         GateKind::StageFailure,
         (state.phase, stage),
         canary_refusal.as_deref(),
-        &stage_failure_context(stage, "", reason),
-    )
+        &stage_failure_context(state.phase, stage, "", reason),
+    );
+    let note = decisions_note_sentence(state.phase, stage, canary_refusal.as_deref());
+    format!("{context}{note}")
+}
+
+/// The sentence a stage-failure gate ends with (D-05, 999.249): a stage agent
+/// that stopped for operator decisions is answered with `devflow gate reject
+/// N --note "<decisions>"`, and the note reaches the relaunched stage agent's
+/// prompt. It names `gate reject`, never a bare `--note`, because `gate
+/// approve` also takes `--note` and a stage-failure approve retries the stage
+/// without it. Under a recorded delivery canary refusal (`canary_refusal`) the
+/// reject stops the run instead, so the note is kept for the `devflow resume
+/// --phase N --agent <other>` that relaunches the stage. Its one answer word
+/// is that command's `reject`, a route this gate runs (C2).
+fn decisions_note_sentence(phase: PhaseId, stage: Stage, canary_refusal: Option<&str>) -> String {
+    let answer = format!(
+        " If the agent asks for operator decisions, answer with `devflow gate reject {phase} \
+         --note \"<decisions>\"`: the note "
+    );
+    match canary_refusal {
+        None => format!("{answer}reaches the relaunched {stage} agent's prompt."),
+        Some(_) => format!(
+            "{answer}is kept for the `devflow resume --phase {phase} --agent <other>` that \
+             relaunches the {stage} stage."
+        ),
+    }
 }
 
 /// Fire the never-silent failure gate with [`failure_gate_context`].
@@ -5354,14 +5706,69 @@ mod tests {
             .collect::<String>();
         assert_eq!(cause.chars().count(), 1000);
         let context = failure_gate_context(&state, Stage::Code, Some(cause.clone()));
+        let note = decisions_note_sentence(state.phase, Stage::Code, None);
         assert!(
-            context.ends_with(&format!(" stage code failed: {cause}")),
-            "the whole cause is stored, last: {context}"
+            context.contains(&format!(" stage code failed: {cause}{note}")),
+            "the whole cause is stored, then the decisions sentence: {context}"
         );
         assert!(
             context.chars().count() > crate::commands::GATE_CONTEXT_DISPLAY_CHARS,
             "control: the context is longer than what the banner shows"
         );
+    }
+
+    /// 999.206 (D-02): a failure reason past the stored bound is cut with a
+    /// suffix naming the phase's own capture file, and the stored reason stays
+    /// within the bound. Control: a 1000-character reason is stored whole.
+    #[test]
+    fn a_cut_failure_reason_names_the_phase_capture_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(5234);
+        let state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Auto,
+            dir.path().to_path_buf(),
+        );
+        let stored_reason = |context: &str| -> String {
+            let note = decisions_note_sentence(phase, Stage::Code, None);
+            let (_, after) = context
+                .split_once(" stage code failed: ")
+                .expect("the failure marker");
+            after
+                .strip_suffix(&note)
+                .expect("the decisions sentence trails")
+                .to_string()
+        };
+        let long = "r".repeat(5000);
+        let context = failure_gate_context(&state, Stage::Code, Some(long));
+        let reason = stored_reason(&context);
+        let suffix = format!(
+            "… [truncated; full output in .devflow/phase-{}-stdout]",
+            phase.padded()
+        );
+        let tail: String = reason
+            .chars()
+            .rev()
+            .take(80)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        assert!(
+            reason.ends_with(&suffix),
+            "the cut names the capture file, last 80: {tail}"
+        );
+        assert!(
+            reason.chars().count() <= GATE_CONTEXT_STORED_MAX_CHARS,
+            "the stored reason stays within the bound: {}",
+            reason.chars().count()
+        );
+
+        let short = "s".repeat(1000);
+        let context = failure_gate_context(&state, Stage::Code, Some(short.clone()));
+        assert_eq!(stored_reason(&context), short, "control: stored whole");
+        assert!(!context.contains("[truncated"), "control: no cut");
     }
 
     /// The stored bound's edges, counted in characters, never bytes: a reason
@@ -5411,9 +5818,10 @@ mod tests {
         );
         let sentence = way_on_sentence(GateKind::StageFailure, phase, Stage::Code, None);
         let context = failure_gate_context(&state, Stage::Code, Some("the build broke".into()));
+        let note = decisions_note_sentence(phase, Stage::Code, None);
         assert_eq!(
             context,
-            format!("[never-silent] {sentence} stage code failed: the build broke")
+            format!("[never-silent] {sentence} stage code failed: the build broke{note}")
         );
         assert_eq!(
             lead_with_way_on(GateKind::StageFailure, (phase, Stage::Code), None, ""),
@@ -5429,6 +5837,78 @@ mod tests {
             ),
             format!("[never-silent] {sentence}"),
             "a marker with an empty cause yields the marker and the sentence"
+        );
+    }
+
+    /// D-05 (999.249): a stage-failure gate ends by naming `gate reject
+    /// --note` as the answer for decisions the agent asks for, and that the
+    /// note reaches the relaunched agent; under a refusing delivery canary it
+    /// says the note is kept for the resume on another agent instead. Nothing
+    /// after the way-on sentence names an answer outside that one sentence.
+    #[test]
+    fn a_stage_failure_gate_names_the_reject_note_as_the_answer_to_decisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(5232);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Auto,
+            dir.path().to_path_buf(),
+        );
+        let reason = "Planning needs two operator decisions: the budget and the attempt cap";
+        let context = failure_gate_context(&state, Stage::Plan, Some(reason.into()));
+        let answer = format!("answer with `devflow gate reject {phase} --note \"<decisions>\"`");
+        assert!(context.contains(&answer), "names the answer: {context}");
+        assert!(
+            context.contains("reaches the relaunched plan agent's prompt"),
+            "says the note reaches the agent: {context}"
+        );
+        let sentence = way_on_sentence(GateKind::StageFailure, phase, Stage::Plan, None);
+        let allowed = decisions_note_sentence(phase, Stage::Plan, None);
+        assert_eq!(
+            leads_with_only_allowing(&context, &sentence, &allowed),
+            Ok(()),
+            "C2 holds with the one allowed sentence"
+        );
+
+        // Control: an answer word outside the allowed sentence still fails.
+        let planted = format!("{context} gate approve");
+        let why = leads_with_only_allowing(&planted, &sentence, &allowed).unwrap_err();
+        assert!(why.contains("`approve`"), "control names approve: {why}");
+
+        // Control: under a refusing canary the note is kept for the resume.
+        state.canary = Some(devflow_core::canary::CanaryOutcome::Absent);
+        let refused = failure_gate_context(&state, Stage::Plan, Some(reason.into()));
+        assert!(
+            refused.contains("is kept for the `devflow resume --phase"),
+            "the note is kept for the resume: {refused}"
+        );
+        assert!(
+            !refused.contains("reaches the relaunched"),
+            "no relaunch under a refusing canary: {refused}"
+        );
+    }
+
+    /// D-05: a decisions reason that itself names an answer word (the agent's
+    /// text, which this test does not police) is stored verbatim and the gate
+    /// still ends with the reject-note sentence.
+    #[test]
+    fn a_decisions_reason_naming_an_answer_word_still_gets_the_reject_note_sentence() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(5233);
+        let state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Auto,
+            dir.path().to_path_buf(),
+        );
+        let reason = "Planning needs two operator decisions: the budget and the retry cap";
+        let context = failure_gate_context(&state, Stage::Plan, Some(reason.into()));
+        assert!(context.contains(reason), "the reason verbatim: {context}");
+        let sentence = decisions_note_sentence(phase, Stage::Plan, None);
+        assert!(
+            !sentence.is_empty() && context.ends_with(&sentence),
+            "ends with the reject-note sentence: {context}"
         );
     }
 
@@ -5799,6 +6279,7 @@ mod tests {
             },
             |_| {},
         );
+        let reset = epoch_now_for_test() + 3600;
 
         let at_gate = state_on_disk_at_gate(root, phase, Stage::Code, || {
             handle_rate_limited_outcome(
@@ -5806,7 +6287,7 @@ mod tests {
                 &mut state,
                 phase,
                 Stage::Code,
-                Some("rate limited until 2099-06-18T15:45:30Z".into()),
+                Some(format!("rate limited until {reset}")),
             )
             .unwrap();
         });
@@ -5825,12 +6306,211 @@ mod tests {
             .find(&format!("`devflow resume --phase {phase}`"))
             .expect("the context names the resume command");
         let reset = context
-            .find("the limit resets at 2099-06-18T15:45:30Z")
+            .find(&format!(
+                "the limit resets at {}",
+                reset_time::format_utc(reset)
+            ))
             .expect("the context names the reset time");
         let cause = context
             .find("Cause: rate limited until")
             .expect("the context names the cause");
         assert!(resume < reset && reset < cause, "way on first: {context}");
+    }
+
+    /// D-04: the rate-limit gate names its reset as a UTC time and how far
+    /// away it is, in epoch and RFC 3339 form alike, and keeps the raw reset
+    /// out of the text before the cause. Control: a reason with no readable
+    /// reset still says the denial carried none.
+    #[test]
+    fn a_rate_limit_gate_shows_its_reset_as_a_utc_time_and_a_distance() {
+        let phase = PhaseId::new(5791);
+        let state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            PathBuf::from("/nonexistent"),
+        );
+        let now = 1_795_102_140;
+        let clause = "the limit resets at 2026-11-19 16:34 UTC, in 1 h 5 m";
+        for reason in [
+            "rate limited until 1795106040",
+            "rate limited until 2026-11-19T16:34:00Z",
+        ] {
+            let context =
+                rate_limit_gate_context(&state, phase, Stage::Code, Some(reason.into()), Some(now));
+            assert!(context.contains(clause), "{reason}: {context}");
+            let lead = &context[..context.find(" Cause: ").expect("a cause")];
+            assert!(
+                !lead.contains("1795106040") && !lead.contains("2026-11-19T16:34:00Z"),
+                "{reason}: the raw reset stays out of the lead: {lead}"
+            );
+        }
+        let context = rate_limit_gate_context(
+            &state,
+            phase,
+            Stage::Code,
+            Some("rate limited until whenever".into()),
+            Some(now),
+        );
+        assert!(
+            context.contains("the denial carried no reset time"),
+            "control: {context}"
+        );
+    }
+
+    /// D-04: a reset two days out (the Phase 53 values) leads, right after the
+    /// way-on sentence, with the way to another agent, and still names the
+    /// reset as a UTC time and a distance inside the display cut; approve
+    /// says it relaunches into the same limit. Controls: a reset an hour out
+    /// keeps the near layout; a spent fallback is named in place of
+    /// `<other>`; an unused fallback, which `resume --agent` refuses, is not.
+    #[test]
+    fn a_rate_limit_gate_two_days_out_leads_with_another_agent() {
+        let phase = PhaseId::with_minor(999, 250);
+        let now = 1_795_102_140;
+        let far = Some("rate limited until 1795294800".to_string());
+        let claude = || {
+            State::new(
+                phase,
+                AgentKind::Claude,
+                Mode::Supervise,
+                PathBuf::from("/nonexistent"),
+            )
+        };
+        let stop = format!("`devflow stop --phase {phase}`");
+        let other = format!("`devflow resume --phase {phase} --agent <other>`");
+        let to_codex = format!("`devflow resume --phase {phase} --agent codex`");
+
+        let context =
+            rate_limit_gate_context(&claude(), phase, Stage::Code, far.clone(), Some(now));
+        let shown = devflow_core::gates::render_gate_context(
+            &context,
+            devflow_core::gates::GATE_CONTEXT_DISPLAY_CHARS,
+        );
+        for wanted in ["2026-11-21 21:00 UTC", "in 2 d 5 h", &stop, &other] {
+            assert!(shown.contains(wanted), "`{wanted}` inside the cut: {shown}");
+        }
+        let lead = &context[..context.find(" Cause: ").expect("a cause")];
+        assert!(
+            !lead.contains("1795294800"),
+            "raw reset in the lead: {lead}"
+        );
+        let sentence = way_on_sentence(GateKind::RateLimit, phase, Stage::Code, None);
+        leads_with_only(&context, &sentence).unwrap();
+        assert!(
+            sentence.contains("into the same limit until it resets"),
+            "{sentence}"
+        );
+
+        let near = Some(format!("rate limited until {}", now + 3600));
+        let context = rate_limit_gate_context(&claude(), phase, Stage::Code, near, Some(now));
+        assert!(
+            !context.contains("devflow stop --phase"),
+            "control: a near reset keeps the near layout: {context}"
+        );
+
+        let mut spent = claude();
+        spent.fallback_agent = Some(AgentKind::Codex);
+        spent.fallback_consumed = true;
+        let context = rate_limit_gate_context(&spent, phase, Stage::Code, far.clone(), Some(now));
+        assert!(
+            context.contains(&to_codex) && !context.contains("<other>"),
+            "a spent fallback is named: {context}"
+        );
+
+        let mut unused = claude();
+        unused.fallback_agent = Some(AgentKind::Codex);
+        unused.fallback_consumed = false;
+        let context = rate_limit_gate_context(&unused, phase, Stage::Code, far, Some(now));
+        assert!(
+            context.contains(&other)
+                && !context.contains("`--agent codex`")
+                && !context.contains(&to_codex),
+            "an unused fallback is not named: {context}"
+        );
+    }
+
+    /// A clock that cannot be read leaves the reset's distance unknown, so a
+    /// reset two days out keeps the same-agent lead and names the reset time
+    /// without a distance; the same reset with a readable clock is far.
+    #[test]
+    fn a_rate_limit_gate_with_an_unreadable_clock_never_leads_with_another_agent() {
+        let phase = PhaseId::with_minor(999, 261);
+        let state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            PathBuf::from("/nonexistent"),
+        );
+        let far = Some("rate limited until 1795294800".to_string());
+        let stop = format!("`devflow stop --phase {phase}`");
+
+        let context = rate_limit_gate_context(&state, phase, Stage::Code, far.clone(), None);
+        assert!(
+            !context.contains(&stop),
+            "far lead without a clock: {context}"
+        );
+        assert!(
+            context.contains(
+                "the limit resets at 2026-11-21 21:00 UTC; the system clock could not be read"
+            ),
+            "reset time without a distance: {context}"
+        );
+
+        let context = rate_limit_gate_context(&state, phase, Stage::Code, far, Some(1_795_102_140));
+        assert!(
+            context.contains(&stop),
+            "control: a readable clock is far: {context}"
+        );
+    }
+
+    /// D-04, display cut: at Validate, whose name the text repeats, with the
+    /// longest phase id and the longest agent name, both commands of the far
+    /// route end inside the 450-character cut.
+    #[test]
+    fn a_far_reset_route_survives_the_display_cut_at_validate_with_the_longest_phase_id() {
+        let phase = PhaseId::with_minor(u32::MAX, u32::MAX);
+        let stage = Stage::Validate;
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            PathBuf::from("/nonexistent"),
+        );
+        state.fallback_agent = Some(AgentKind::Antigravity);
+        state.fallback_consumed = true;
+        let context = rate_limit_gate_context(
+            &state,
+            phase,
+            stage,
+            Some("rate limited until 1795294800".into()),
+            Some(1_795_102_140),
+        );
+        let shown = devflow_core::gates::render_gate_context(
+            &context,
+            devflow_core::gates::GATE_CONTEXT_DISPLAY_CHARS,
+        );
+        for wanted in [
+            format!("`devflow stop --phase {phase}`"),
+            format!("`devflow resume --phase {phase} --agent antigravity`"),
+        ] {
+            assert!(
+                shown.contains(&wanted),
+                "`{wanted}` inside the cut at {stage} for phase {phase}: {shown}"
+            );
+        }
+    }
+
+    /// The current time in epoch seconds, the base a test's reset is
+    /// computed from, so no fixed epoch ages from future to past.
+    fn epoch_now_for_test() -> i64 {
+        i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -6251,6 +6931,62 @@ mod tests {
 
     /// `human_needed` after an agent pass gates in auto mode too (D-08), and the
     /// gate names the status.
+    /// D-06 (999.254): the `human_needed` gate and its reopen both name the
+    /// route for sign-offs that can only run after the run ends: `gate reject
+    /// --note`, which `/gsd-quick` records. Control: a `gaps_found` gate does
+    /// not carry it.
+    #[test]
+    fn a_human_needed_gate_names_the_reject_note_route_for_post_run_sign_offs() {
+        if !in_bounded_child(
+            "pipeline_outcomes::tests::a_human_needed_gate_names_the_reject_note_route_for_post_run_sign_offs",
+        ) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5236);
+        let _gsd = validate_evidence(root, phase, &[gsd_says(GsdStatus::HumanNeeded); 2]);
+        let mut state = validate_state(root, phase, Mode::Auto);
+        let gates = at_the_gates(
+            root,
+            phase,
+            Stage::Validate,
+            &[approve_answer(), abort_answer()],
+            || {
+                let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Passed);
+            },
+        );
+        let answer = format!("answer with `devflow gate reject {phase} --note");
+        for (which, gate) in [("first", &gates[0]), ("reopened", &gates[1])] {
+            assert_eq!(gate["gate_kind"], "human_needed", "{which}: {gate}");
+            let context = gate["context"].as_str().unwrap();
+            for needle in [
+                "can only run after this run ends",
+                answer.as_str(),
+                "`/gsd-quick` records them",
+            ] {
+                assert!(context.contains(needle), "{which}: `{needle}`: {context}");
+            }
+        }
+
+        // Control: a `gaps_found` gate does not carry the route (Supervise,
+        // since Auto loops a `gaps_found` back to Plan without a gate).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5237);
+        let _gsd = validate_evidence(root, phase, &[gsd_says(GsdStatus::GapsFound)]);
+        let mut state = validate_state(root, phase, Mode::Supervise);
+        let (gate, _) = at_the_validate_gate(root, phase, &abort_answer(), || {
+            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Passed);
+        });
+        assert_eq!(gate["gate_kind"], "gaps_found", "control: {gate}");
+        let context = gate["context"].as_str().unwrap();
+        assert!(
+            !context.contains("can only run after this run ends"),
+            "control: no post-run route on gaps_found: {context}"
+        );
+    }
+
     #[test]
     fn a_human_needed_report_gates_in_auto_mode() {
         if !in_bounded_child("pipeline_outcomes::tests::a_human_needed_report_gates_in_auto_mode") {
@@ -6547,6 +7283,9 @@ mod tests {
             .unwrap();
             raw["validate_pass_head"].clone()
         };
+        // Each finish asks GSD for its planning root before `phase.complete`;
+        // this reply has none, so the completion is refused after that one call.
+        const NO_PLANNING_ROOT: &str = r#"{"generated_from":{"planning_root":null}}"#;
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(5250);
@@ -6555,10 +7294,13 @@ mod tests {
             phase,
             &[
                 gsd_says(GsdStatus::Passed),
+                NO_PLANNING_ROOT,
                 gsd_says(GsdStatus::GapsFound),
                 gsd_says(GsdStatus::Passed),
+                NO_PLANNING_ROOT,
                 gsd_says(GsdStatus::Passed),
                 gsd_says(GsdStatus::Passed),
+                NO_PLANNING_ROOT,
             ],
         );
         let first = repo_with_head(root);
@@ -8134,6 +8876,38 @@ mod tests {
         }
     }
 
+    /// [`leads_with_only`], except that the text after the sentence must hold
+    /// `allowed` exactly once, and that one occurrence is removed before the
+    /// answer-word scan: the one exact sentence production renders for a gate
+    /// whose reject route is offered (D-05, D-06).
+    fn leads_with_only_allowing(
+        context: &str,
+        sentence: &str,
+        allowed: &str,
+    ) -> Result<(), String> {
+        let body = context.strip_prefix("[never-silent] ").unwrap_or(context);
+        let rest = body
+            .strip_prefix(sentence)
+            .ok_or_else(|| format!("the context does not start with the sentence: {context}"))?;
+        let count = if allowed.is_empty() {
+            0
+        } else {
+            rest.matches(allowed).count()
+        };
+        if count != 1 {
+            return Err(format!(
+                "the allowed sentence is absent (found {count} times): {rest}"
+            ));
+        }
+        let lower = rest.replacen(allowed, "", 1).to_lowercase();
+        match ANSWER_WORDS.iter().find(|word| lower.contains(*word)) {
+            Some(word) => Err(format!(
+                "the text after the sentence names `{word}`: {rest}"
+            )),
+            None => Ok(()),
+        }
+    }
+
     /// GATE-04, W3, D-39, C2: every gate writer leads its context with the
     /// sentence `way_on_sentence` renders for that gate from `approve_route`
     /// and `reject_route`, after any `[never-silent]` marker, and names no
@@ -8160,6 +8934,24 @@ mod tests {
             |phase: PhaseId| way_on_sentence(GateKind::CleanPass, phase, Stage::Validate, None);
         let check = |row: &str, context: &str, sentence: &str| {
             if let Err(why) = leads_with_only(context, sentence) {
+                panic!("{row}: {why}");
+            }
+        };
+        // D-06: on a `human_needed` gate, whose reject route is offered, the
+        // one answer word admitted after the way-on is the `reject` of the
+        // post-run sign-off route.
+        let check_human_needed = |row: &str, context: &str, phase: PhaseId| {
+            assert!(
+                !matches!(
+                    reject_route_by_kind(Some(GateKind::HumanNeeded), None, RENDERED_NOTE),
+                    RejectRoute::Refused(_)
+                ),
+                "{row}: the reject route is offered"
+            );
+            let allowed = post_run_sign_off_route(phase);
+            if let Err(why) =
+                leads_with_only_allowing(context, &verification_sentence(phase), &allowed)
+            {
                 panic!("{row}: {why}");
             }
         };
@@ -8283,7 +9075,11 @@ mod tests {
             });
             assert_eq!(gate["gate_kind"], kind, "{row}: {gate}");
             let context = gate["context"].as_str().unwrap().to_string();
-            check(&row, &context, &verification_sentence(phase));
+            if kind == "human_needed" {
+                check_human_needed(&row, &context, phase);
+            } else {
+                check(&row, &context, &verification_sentence(phase));
+            }
             verification_contexts.push((kind.to_string(), context));
         }
 
@@ -8312,11 +9108,12 @@ mod tests {
             );
             assert_eq!(gates[1]["gate_kind"], reopened, "{:?}", gates[1]);
             let context = gates[1]["context"].as_str().unwrap();
-            check(
-                &format!("reopen {reopened}"),
-                context,
-                &verification_sentence(phase),
-            );
+            let row = format!("reopen {reopened}");
+            if reopened == "human_needed" {
+                check_human_needed(&row, context, phase);
+            } else {
+                check(&row, context, &verification_sentence(phase));
+            }
         }
 
         // The gaps Plan gates: no new gap plan, at and below the ceiling, and
@@ -8398,13 +9195,14 @@ mod tests {
             state.stage = stage;
             state.canary = Some(devflow_core::canary::CanaryOutcome::Absent);
             workflow::save_state(&state).unwrap();
+            let reset_at = epoch_now_for_test() + 3600;
             let (gate, _) = at_the_gate(root, phase, stage, &abort_answer(), || {
                 let _ = handle_rate_limited_outcome(
                     root,
                     &mut state,
                     phase,
                     stage,
-                    Some("rate limited until 2099-06-18T15:45:30Z".into()),
+                    Some(format!("rate limited until {reset_at}")),
                 );
             });
             assert_eq!(gate["gate_kind"], "rate_limit", "{row}: {gate}");
@@ -8430,7 +9228,7 @@ mod tests {
             // (with `--agent`, the run is on codex) and the reset time, both
             // inside the shared display cut the banner and notify hook show.
             let resume = format!("`devflow resume --phase {phase} --agent codex`");
-            let reset = "the limit resets at 2099-06-18T15:45:30Z";
+            let reset = format!("the limit resets at {}", reset_time::format_utc(reset_at));
             let shown_after_sentence = |context: &str| {
                 let shown: String = context
                     .chars()
@@ -8441,7 +9239,7 @@ mod tests {
                     let rest = &shown[after..];
                     rest.starts_with(&format!(" stage {stage} failed: "))
                         && rest.contains(&resume)
-                        && rest.contains(reset)
+                        && rest.contains(&reset)
                 })
             };
             assert!(
@@ -8503,6 +9301,27 @@ mod tests {
                 let admitting = way_on_sentence(GateKind::StageFailure, phase, stage, None);
                 let refusing = way_on_sentence(GateKind::StageFailure, phase, stage, Some(refusal));
                 let resume = format!("`devflow resume --phase {phase} --agent <other>`");
+                // D-05: the one answer word admitted after the way-on is the
+                // `reject` of the decisions sentence, on a gate whose reject
+                // route is offered.
+                let canary_refusal = refuses.then_some(refusal);
+                assert!(
+                    !matches!(
+                        reject_route_by_kind(
+                            Some(GateKind::StageFailure),
+                            canary_refusal,
+                            RENDERED_NOTE
+                        ),
+                        RejectRoute::Refused(_)
+                    ),
+                    "{row}: the reject route is offered"
+                );
+                let note = decisions_note_sentence(phase, stage, canary_refusal);
+                let check = |row: &str, context: &str, sentence: &str| {
+                    if let Err(why) = leads_with_only_allowing(context, sentence, &note) {
+                        panic!("{row}: {why}");
+                    }
+                };
                 if refuses {
                     check(&row, context, &refusing);
                     assert!(
@@ -8513,7 +9332,7 @@ mod tests {
                     // Control: the admitting sentence on a refusing run fails.
                     let planted = context.replacen(&refusing, &admitting, 1);
                     assert!(
-                        leads_with_only(&planted, &refusing).is_err(),
+                        leads_with_only_allowing(&planted, &refusing, &note).is_err(),
                         "{row}: control: {planted}"
                     );
                 } else {
@@ -10302,5 +11121,55 @@ mod tests {
                 assert_eq!(finished.len(), 1, "{row}: {:?}", phase_events(root, phase));
             }
         }
+    }
+
+    #[test]
+    fn gsd_written_files_names_every_file_gsd_wrote() {
+        let reply = |roadmap: bool, state: bool, requirements: bool, pruned: bool| {
+            serde_json::json!({
+                "roadmap_updated": roadmap,
+                "state_updated": state,
+                "requirements_updated": requirements,
+                "auto_pruned": pruned,
+            })
+        };
+        let rows: [(&str, Value, Vec<&str>); 4] = [
+            (
+                "roadmap and state",
+                reply(true, true, false, false),
+                vec![".planning/ROADMAP.md", ".planning/STATE.md"],
+            ),
+            (
+                "auto_pruned only",
+                reply(false, false, false, true),
+                vec![".planning/STATE.md", ".planning/STATE-ARCHIVE.md"],
+            ),
+            (
+                "all four, STATE.md once",
+                reply(true, true, true, true),
+                vec![
+                    ".planning/ROADMAP.md",
+                    ".planning/STATE.md",
+                    ".planning/REQUIREMENTS.md",
+                    ".planning/STATE-ARCHIVE.md",
+                ],
+            ),
+            (
+                "all false names nothing",
+                reply(false, false, false, false),
+                vec![],
+            ),
+        ];
+        for (row, value, expected) in rows {
+            assert_eq!(gsd_written_files(&value).expect(row), expected, "{row}");
+        }
+
+        let mut absent = reply(true, true, false, false);
+        absent.as_object_mut().unwrap().remove("auto_pruned");
+        let failure = gsd_written_files(&absent).expect_err("an absent flag is no answer");
+        assert!(
+            matches!(&failure, ReaderFailure::MissingField { key } if key == "auto_pruned"),
+            "auto_pruned absent: {failure:?}"
+        );
     }
 }

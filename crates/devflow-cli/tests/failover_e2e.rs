@@ -339,6 +339,14 @@ impl Rig {
         Self::build(phase, CLAUDE_AUTO, "", "", resets_at)
     }
 
+    /// The no-fallback rate-limit rig for a route that hands off with
+    /// `resume --agent`: the supervised [`CLAUDE_TO_CODEX`] shape (an auto-mode
+    /// run refuses a Codex handoff), started with no fallback, whose Claude
+    /// denial names `resets_at` (epoch seconds), or no reset time for `None`.
+    fn with_reset_supervised(phase: PhaseId, resets_at: Option<i64>) -> Self {
+        Self::build(phase, CLAUDE_TO_CODEX, "", "", resets_at)
+    }
+
     /// A Claude-to-Codex rig whose Claude Code turn leaves uncommitted work
     /// behind ([`CODE_TURN_LEAVES_UNCOMMITTED_WORK`]) and whose `codex` stage
     /// turn records what it inherited ([`CODEX_RECORDS_WHAT_IT_INHERITED`]).
@@ -1061,7 +1069,7 @@ fn a_rate_limited_claude_run_without_a_fallback_waits_at_a_gate() {
         String::from_utf8_lossy(&shown.stderr)
     );
     assert!(
-        shown_text.contains(&resets_at.to_string()),
+        shown_text.contains(&devflow_core::reset_time::format_utc(resets_at)),
         "the gate names the reset time from the denial: {shown_text}"
     );
     assert!(
@@ -1099,6 +1107,102 @@ fn a_rate_limited_claude_run_without_a_fallback_waits_at_a_gate() {
     let state = rig.state();
     assert_eq!(state.agent, AgentKind::Claude);
     assert_eq!(state.fallback_agent, None);
+}
+
+/// D-04, RESEARCH A1: the route a far-reset rate-limit gate names works from
+/// the waiting gate. With a reset two days out and no fallback, the Code gate
+/// names `devflow stop`; `devflow stop` leaves a stopped, unfinished state, and
+/// `devflow resume --agent codex` then hands Code to Codex. Negative control:
+/// Codex runs nothing before the resume.
+#[test]
+fn a_far_rate_limit_gate_routes_to_another_agent_by_stop_then_resume() {
+    let phase = PhaseId::new(5134);
+    let rig = Rig::with_reset_supervised(phase, Some(now_epoch() + 2 * 86_400));
+    let _reaper = common::LaunchedRunReaper::for_home(&rig.home, &rig.root, phase);
+
+    rig.start(&[]);
+    rig.wait_for_any(&["gate_fired", "workflow_finished"]);
+    let log = rig.events_text();
+    let gated = rig.events_named("gate_fired");
+    assert_eq!(gated.len(), 1, "one gate; events:\n{log}");
+    assert_eq!(gated[0]["stage"], "code", "{}", gated[0]);
+
+    let shown = common::hermetic_devflow(&rig.home)
+        .args(["gate", "show", &phase.to_string(), "--stage", "code"])
+        .arg(&rig.root)
+        .output()
+        .expect("run devflow gate show");
+    let shown_text = String::from_utf8_lossy(&shown.stdout);
+    assert!(
+        shown.status.success(),
+        "gate show failed: {}",
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    assert!(
+        shown_text.contains(&format!("`devflow stop --phase {phase}`")),
+        "the far-reset gate names the stop: {shown_text}"
+    );
+
+    let stopped = common::hermetic_devflow(&rig.home)
+        .args(["stop", "--phase", &phase.to_string(), "--root"])
+        .arg(&rig.root)
+        .output()
+        .expect("run devflow stop");
+    assert!(
+        stopped.status.success(),
+        "devflow stop failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&stopped.stdout),
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    common::wait_for(
+        || {
+            let state = rig.state();
+            state.stopped && !state.finished
+        },
+        RUN_WAIT,
+        "a stop at the rate-limit gate left no resumable state",
+    );
+    assert_eq!(
+        rig.invocations("codex"),
+        Vec::<String>::new(),
+        "control: codex ran nothing before the resume"
+    );
+
+    let path = format!(
+        "{}:{}",
+        rig.fake_bin.path.display(),
+        std::env::var_os("PATH")
+            .unwrap_or_default()
+            .to_string_lossy()
+    );
+    let handed = common::hermetic_devflow(&rig.home)
+        .args(["resume", "--phase", &phase.to_string(), "--agent", "codex"])
+        .arg(&rig.root)
+        .current_dir(&rig.root)
+        .hermetic_path(&path)
+        .output()
+        .expect("run devflow resume");
+    assert!(
+        handed.status.success(),
+        "resume --agent codex failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&handed.stdout),
+        String::from_utf8_lossy(&handed.stderr)
+    );
+    common::wait_for(
+        || {
+            rig.events_named("agent_handoff").iter().any(|handoff| {
+                handoff["from_agent"] == "claude"
+                    && handoff["to_agent"] == "codex"
+                    && handoff["reason"] == "resume --agent"
+            }) && !rig.invocations("codex").is_empty()
+                && rig.state().agent == AgentKind::Codex
+        },
+        RUN_WAIT,
+        &format!(
+            "the route the far-reset gate names did not reach codex; events so far:\n{}",
+            rig.events_text()
+        ),
+    );
 }
 
 /// How long a test watches for a launch that must not happen.

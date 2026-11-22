@@ -39,6 +39,17 @@ pub fn rate_limit_wait_bound(now: i64, reset_at: i64, gate_timeout_secs: u64) ->
     gate_timeout_secs.max(u64::try_from(until_wake).unwrap_or(0))
 }
 
+/// `epoch_secs` as a UTC wall-clock time, `YYYY-MM-DD HH:MM UTC`, the form
+/// the rate-limit gate shows its reset in (D-04). Seconds are dropped, not
+/// rounded.
+pub fn format_utc(epoch_secs: i64) -> String {
+    let (year, month, day) = civil_from_days(epoch_secs.div_euclid(SECS_PER_DAY));
+    let secs_of_day = epoch_secs.rem_euclid(SECS_PER_DAY);
+    let hour = secs_of_day / SECS_PER_HOUR;
+    let minute = secs_of_day % SECS_PER_HOUR / SECS_PER_MINUTE;
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02} UTC")
+}
+
 /// The exact UTC instant, in Unix epoch seconds, that `input` names.
 ///
 /// Two forms are read, after trimming surrounding whitespace:
@@ -198,8 +209,7 @@ pub(crate) fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
 
 /// The proleptic-Gregorian `(year, month, day)` of the day `days` after
 /// 1970-01-01.
-#[cfg(test)]
-pub(crate) fn civil_from_days(days: i64) -> (i32, u32, u32) {
+pub(crate) fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z - era * 146_097;
@@ -210,7 +220,7 @@ pub(crate) fn civil_from_days(days: i64) -> (i32, u32, u32) {
     let day = doy - (153 * mp + 2).div_euclid(5) + 1;
     let month = mp + if mp < 10 { 3 } else { -9 };
     let year = year + i64::from(month <= 2);
-    (year as i32, month as u32, day as u32)
+    (year, month as u32, day as u32)
 }
 
 #[cfg(test)]
@@ -385,6 +395,22 @@ mod tests {
         }
     }
 
+    /// D-04: the Phase 53 reset epoch renders as its UTC wall-clock time.
+    /// Controls: the epoch origin and a leap day render their own dates.
+    #[test]
+    fn format_utc_renders_the_phase_53_reset() {
+        assert_eq!(format_utc(1_795_294_800), "2026-11-21 21:00 UTC");
+        assert_eq!(format_utc(0), "1970-01-01 00:00 UTC");
+        assert_eq!(format_utc(951_782_400), "2000-02-29 00:00 UTC");
+    }
+
+    /// The largest epoch the parser accepts still shows its true year, not one
+    /// wrapped to fit 32 bits.
+    #[test]
+    fn format_utc_keeps_the_year_of_the_largest_epoch() {
+        assert_eq!(format_utc(i64::MAX), "292277026596-12-04 15:30 UTC");
+    }
+
     /// `civil_from_days` names the right date at the century and 400-year
     /// boundaries of the Gregorian leap rule (day numbers from Python's
     /// `datetime.date`), where a round trip alone cannot catch a skew.
@@ -400,11 +426,8 @@ mod tests {
             (157_114, (2400, 3, 1)),
         ] {
             assert_eq!(civil_from_days(days), date, "day {days}");
-            assert_eq!(
-                days_from_civil(date.0, date.1, date.2),
-                days,
-                "date {date:?}"
-            );
+            let year = i32::try_from(date.0).expect("test years fit in i32");
+            assert_eq!(days_from_civil(year, date.1, date.2), days, "date {date:?}");
         }
     }
 
@@ -415,6 +438,7 @@ mod tests {
         // branch of the March-based year.
         for days in [-1, 0, 1, 11_016, 19_000, 19_754, 2_932_896] {
             let (year, month, day) = civil_from_days(days);
+            let year = i32::try_from(year).expect("test years fit in i32");
             assert_eq!(days_from_civil(year, month, day), days, "day {days}");
         }
     }

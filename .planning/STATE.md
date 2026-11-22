@@ -2,19 +2,19 @@
 gsd_state_version: "1.0"
 milestone: v4.0
 milestone_name: milestone (ACTIVE — Session Continuity)
-current_phase: "53.1"
-current_phase_name: Phase 53 remediation
+current_phase: 54
+current_phase_name: Decision Triage
 status: planning
-stopped_at: Phase 53 complete, ready to plan Phase 53.1
-last_updated: "2026-11-20T23:44:38.562Z"
-last_activity: 2026-11-20
-last_activity_desc: Phase 53 learnings extracted
-state_head: 06c169475bd5c708430679c6a666e84b57c0cf1c
+stopped_at: Phase 53.1 complete, ready to plan Phase 54
+last_updated: "2026-11-22T03:02:41.931Z"
+last_activity: 2026-11-22
+last_activity_desc: Phase 53.1 learnings extracted
+state_head: 3997dc35f8def8e504b0efdd0228811a78bf4c4e
 progress:
   total_phases: 7
   completed_phases: 1
-  total_plans: 80
-  completed_plans: 80
+  total_plans: 88
+  completed_plans: 88
   percent: 14
 ---
 
@@ -77,12 +77,12 @@ Phase 51 (Rate-Limit Agent Failover) closed v3.0.0 on 2026-11-08: see `.planning
 
 ## Project Reference
 
-See: `.planning/PROJECT.md` (updated 2026-11-17)
+See: `.planning/PROJECT.md` (updated 2026-11-21)
 
 **Core value:** a coding session that outlives any one agent — the session is the repository, so another agent
 continues the same work when one runs out of quota or budget, and the run asks a human only for the decisions nothing
 else can make (restated by the operator 2026-11-08).
-**Current focus:** Phase 53 — The Question Channel
+**Current focus:** Phase 54 — Decision Triage
 
 ## Operator Next Steps
 
@@ -171,10 +171,10 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 53.1 — Phase 53 remediation
+Phase: 54 — Decision Triage
 Plan: Not started
 Status: Ready to plan
-Last activity: 2026-11-20 — Phase 53 learnings extracted
+Last activity: 2026-11-22 — Phase 53.1 learnings extracted
 
 
 ## Recently Shipped
@@ -1039,6 +1039,20 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 53]: 53-14: pi registers devflow_ask through a per-launch -e .devflow/ask-NN.mcp.ts extension calling pi.registerMcpServer, keeping --no-approve (spike verdict BUILD)
 - [Phase 53]: 53-14: pi holds one call at most 900 s (ASK_HOLD_CAP_SECS) with a 960 s per-server timeout; pi cancels at its 60 s default
 - [Phase 53]: 53-14: owned-file rule for registrations outside .devflow/ not built; no driver writes one
+- [Phase 53.1]: 53.1-01: stream rate-limit detector reads rate_limit_event then the final top-level result subtype, each read returning None from every exit
+- [Phase 53.1]: 53.1-02: RATE_LIMIT_FAR_RESET_SECS is 6 h, a constant with no env var
+- [Phase 53.1]: 53.1-02: a far rate-limit gate names the route (stop, then resume --agent) before the reset so it survives the 450-char display cut
+- [Phase 53.1]: 53.1-02: a far gate names the run's fallback only when it is spent; otherwise <other>, since resume --agent onto an unused fallback is refused
+- [Phase 53.1]: resume past a fired --until cap advances via the shared pipeline_gate::enter_stage, judged on a never-written clone before any write; transition is recorded before agent_handoff (999.251)
+- [Phase 53.1]: ask_server records a cancel only for the in-flight id, read under the queue lock; a cancel for an id neither queued nor in flight is dropped (999.258)
+- [Phase 53.1]: cleanup prints 'removed nothing; kept N' when it removed nothing but kept N; 'no worktrees to clean up' only when nothing was kept
+- [Phase 53.1]: an unparsable question gate id warns with phase, stage, gate id and error, and still reads as no question gate
+- [Phase 53.1]: 53.1-05: post-commit stale-state marker lives in the per-worktree git dir (git rev-parse --git-path devflow-stale-state.json); old path ignored by .planning/user/errors/.gitignore while the main checkout runs the old hook
+- [Phase 53.1]: 53.1-06: the decisions sentence and the post-run sign-off route name `devflow gate reject N --note`, never a bare `--note`, because `gate approve` also takes `--note`; C2 admits exactly that rendered sentence on gates whose reject route is offered
+- [Phase 53.1]: 53.1-06: a cut stage-failure reason is bounded by bound_stage_reason (phase-specific suffix); truncate_reason and the core TRUNCATED display suffix are unchanged
+- [Phase 53.1]: 53.1-07: the planning-root check compares canonical paths (falling back to the given path), so a symlinked evidence root is not read as a scoped planning directory
+- [Phase 53.1]: 53.1-07: a phase.complete reply with all four write flags false commits nothing and records ok true, committed false, commit_failure null
+- [Phase 53.1]: 53.1-08: 999.251's Plan->Validate residual filed as 999.260; the resume row names it
 
 ## Roadmap Evolution
 
@@ -1230,12 +1244,20 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 53 P11 | 15 min | 2 tasks | 2 files |
 | Phase 53 P13 | 19 min | 3 tasks | 10 files |
 | Phase 53 P14 | 26min | 3 tasks | 12 files |
+| Phase 53.1 P01 | 25min | 2 tasks | 2 files |
+| Phase 53.1 P02 | 14 min | 2 tasks | 4 files |
+| Phase 53.1 P03 | 11min | 2 tasks | 4 files |
+| Phase 53.1 P04 | 7min | 2 tasks | 2 files |
+| Phase 53.1 P05 | 25min | 3 tasks | 10 files |
+| Phase 53.1 P06 | 17min | 3 tasks | 3 files |
+| Phase 53.1 P07 | 17min | 3 tasks | 6 files |
+| Phase 53.1 P08 | 8min | 2 tasks | 2 files |
 
 ## Session
 
-**Last session:** 2026-11-20T20:06:29.284Z
-**Stopped at:** Phase 53 complete, ready to plan Phase 53.1
-**Resume file:** /var/home/denniyahh/Github/devflow/.planning/phases/53.1-phase-53-remediation/53.1-CONTEXT.md
+**Last session:** 2026-11-21T21:07:41.726Z
+**Stopped at:** Phase 53.1 complete, ready to plan Phase 54
+**Resume file:** None
 
 ## Operator Next Steps
 

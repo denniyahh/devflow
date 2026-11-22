@@ -44,6 +44,9 @@ pub(crate) fn until_halt_reason(stage: Stage) -> String {
 /// Whether `state` is stopped because its own `--until` cap fired. An operator stop
 /// during the capped stage leaves the same `stopped`, `stage` and `stop_until`; only
 /// the reason [`transition`] writes ([`until_halt_reason`]) tells the two apart.
+///
+/// A fired cap resumes at [`Stage::next`] of the halted stage (999.251). The halt records
+/// no target, so a halt reached through a Plan->Validate transition also resumes at Code.
 pub(crate) fn until_cap_fired(state: &State) -> bool {
     state.stopped
         && state.stop_until == Some(state.stage)
@@ -127,27 +130,7 @@ pub(crate) fn transition(
         return Ok(None);
     }
 
-    commit(state, |s| {
-        s.stage = to;
-        // GATE-03 / D-09: the move from Validate to Plan is the gap-closure
-        // route, the only way out of Validate through here, so it starts a
-        // gap-closure pass. Nothing in this function clears the marker.
-        if (from, to) == (Stage::Validate, Stage::Plan) {
-            s.gap_closure_pass = true;
-        }
-        if mode::transition_resets_consecutive_failures(from, to, s.gap_closure_pass) {
-            s.consecutive_failures = 0;
-        }
-        s.infra_failures = 0;
-        s.gate_pending = false;
-        // D-09: a fix type lives exactly as long as its Code pass, so a later
-        // plain Code pass never replays a stale one. Its note goes with it.
-        s.code_fix = None;
-        s.code_fix_note = None;
-        s.code_fix_report = None;
-        // U7: a relaunch note is for the stage being left, never the next one.
-        s.relaunch_note = None;
-    })?;
+    commit(state, |s| enter_stage(s, from, to))?;
     events::emit(
         project_root,
         state.phase,
@@ -158,6 +141,31 @@ pub(crate) fn transition(
         }),
     );
     launch_stage(state, None, Some(from))
+}
+
+/// Enter `to` from `from`: the bookkeeping a stage advance makes, shared by
+/// [`transition`] and a resume that advances past a fired `--until` cap, so the
+/// two cannot drift. The caller commits it and records the `transition` event.
+pub(crate) fn enter_stage(state: &mut State, from: Stage, to: Stage) {
+    state.stage = to;
+    // GATE-03 / D-09: the move from Validate to Plan is the gap-closure
+    // route, the only way out of Validate through here, so it starts a
+    // gap-closure pass. Nothing in this function clears the marker.
+    if (from, to) == (Stage::Validate, Stage::Plan) {
+        state.gap_closure_pass = true;
+    }
+    if mode::transition_resets_consecutive_failures(from, to, state.gap_closure_pass) {
+        state.consecutive_failures = 0;
+    }
+    state.infra_failures = 0;
+    state.gate_pending = false;
+    // D-09: a fix type lives exactly as long as its Code pass, so a later
+    // plain Code pass never replays a stale one. Its note goes with it.
+    state.code_fix = None;
+    state.code_fix_note = None;
+    state.code_fix_report = None;
+    // U7: a relaunch note is for the stage being left, never the next one.
+    state.relaunch_note = None;
 }
 
 /// The stop reason a run records when its Validate passes (D-35).
@@ -173,15 +181,20 @@ pub(crate) const FINISHED_STOP_REASON: &str =
 /// [`FINISHED_STOP_REASON`], and the supervisor record and `gate_pending` are
 /// cleared, as `transition`'s `--until` halt does, so `doctor` never reads the
 /// finished run as a crashed one. The phase leaves the machine-global gate
-/// registry. Nothing else is touched: no git call, no hook, no merge, push,
-/// tag or branch deletion, so the operator gets the tree as Validate left it.
+/// registry. It then has GSD mark the phase complete and commit the files GSD
+/// wrote, through
+/// [`crate::pipeline_outcomes::record_gsd_phase_complete`] (D-10), which
+/// records `gsd_phase_complete` and never fails the finish. Nothing else is
+/// touched: no merge, push, tag or branch deletion, so apart from GSD's
+/// commit the operator gets the tree as Validate left it.
 ///
 /// It takes a [`FinishPermit`] by value, which only
 /// [`crate::pipeline_outcomes::can_finish`] makes (D-45 rule 1), so no run is
 /// recorded finished without a fresh `passed` and a Validate pass on HEAD.
 ///
 /// It emits `workflow_finished` with `{"reason":"finished","shipped":false}`,
-/// then fires the notify command once and records `notify_fired`. It does not
+/// then runs GSD's completion, then fires the notify command once and records
+/// `notify_fired`. It does not
 /// read `stop_until`: with `--until validate` a passing Validate is a finish,
 /// not a halt, because Validate is the last stage.
 pub(crate) fn finish_run(
@@ -216,6 +229,7 @@ pub(crate) fn finish_run(
         "workflow_finished",
         serde_json::json!({ "reason": "finished", "shipped": false }),
     );
+    crate::pipeline_outcomes::record_gsd_phase_complete(project_root, state);
     notify_run_end(
         project_root,
         state,
@@ -2514,8 +2528,9 @@ mod tests {
 
     /// U7's sweep pinned (V2): the only production writes of `State.stage`
     /// under `crates/devflow-cli/src` and `crates/devflow-core/src` are
-    /// `transition`'s and `prepare_loop_back_to_code`'s, each of which clears
-    /// the relaunch note in the same commit. A plan that adds a third write
+    /// `enter_stage`'s (the advance `transition` and a resume past a fired
+    /// `--until` cap share) and `prepare_loop_back_to_code`'s, each of which
+    /// clears the relaunch note in the same commit. A plan that adds a third write
     /// fails here and must add that write's clear site. The rule and its limits
     /// are on [`stage_writes_in`]; `State::stage` stays `pub` (published core).
     #[test]
@@ -2569,7 +2584,7 @@ mod tests {
         assert_eq!(
             functions,
             vec![
-                ("src/pipeline_gate.rs", "transition"),
+                ("src/pipeline_gate.rs", "enter_stage"),
                 ("src/pipeline_gate.rs", "prepare_loop_back_to_code"),
             ],
             "every production write of State.stage, each needing a relaunch_note clear: {writes:#?}"
@@ -2839,5 +2854,308 @@ mod tests {
             gate_lifetime_deadline(OPENED_AT, &other_late, GATE_TIMEOUT),
             timeout_end
         );
+    }
+
+    /// GSD 1.22's `phase.complete` reply when it updated ROADMAP.md and
+    /// STATE.md and pruned nothing.
+    const PHASE_COMPLETE_REPLY: &str = r#"{"roadmap_updated":true,"state_updated":true,"requirements_updated":false,"auto_pruned":false}"#;
+
+    /// GSD's `query planning.inspect` reply for `root` resolving its planning
+    /// directory to `planning_root`.
+    fn planning_inspect_reply(root: &Path, planning_root: &Path) -> String {
+        serde_json::json!({
+            "generated_from": { "cwd": root, "planning_root": planning_root }
+        })
+        .to_string()
+    }
+
+    /// The position of the last `name` event in `root`'s event log.
+    fn last_event_position(root: &Path, name: &str) -> Option<usize> {
+        std::fs::read_to_string(devflow_core::events::events_path(root))
+            .unwrap_or_default()
+            .lines()
+            .enumerate()
+            .filter_map(|(index, line)| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .ok()
+                    .map(|event| (index, event))
+            })
+            .filter(|(_, event)| event["event"] == name)
+            .map(|(index, _)| index)
+            .last()
+    }
+
+    /// D-10: a finished run asks GSD to mark the phase complete and commits
+    /// the files GSD reported writing, through GSD's own tools, in the
+    /// evidence root, after `workflow_finished`.
+    #[test]
+    fn a_finish_runs_gsd_phase_complete_in_the_evidence_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5285);
+        let mut state = noted_state(root, phase, Stage::Validate);
+        workflow::save_state(&state).unwrap();
+        let inspect = planning_inspect_reply(root, &root.join(".planning"));
+        let gsd = GsdStub::answering(
+            root,
+            &[
+                &inspect,
+                PHASE_COMPLETE_REPLY,
+                r#"{"committed":true,"hash":"abc1234"}"#,
+            ],
+        );
+
+        finish_run(root, &mut state, test_permit()).unwrap();
+
+        let canonical = root.canonicalize().unwrap();
+        let expected = vec![
+            (canonical.clone(), "query planning.inspect".to_string()),
+            (
+                canonical.clone(),
+                format!("query phase.complete {phase} --json-errors"),
+            ),
+            (
+                canonical,
+                format!(
+                    "query commit docs(phase-{phase}): complete phase execution --json-errors \
+                     --files .planning/ROADMAP.md .planning/STATE.md"
+                ),
+            ),
+        ];
+        assert_eq!(
+            gsd.calls(),
+            expected,
+            "GSD's planning read, phase.complete and commit, in the evidence root"
+        );
+        let event =
+            devflow_core::events::last_event_of_kind_for_phase(root, phase, "gsd_phase_complete")
+                .expect("the finish records gsd_phase_complete");
+        assert_eq!(event["ok"], true, "{event}");
+        assert_eq!(event["committed"], true, "{event}");
+        assert!(
+            last_event_position(root, "workflow_finished")
+                < last_event_position(root, "gsd_phase_complete"),
+            "gsd_phase_complete comes after workflow_finished"
+        );
+        assert!(
+            workflow::load_state(root, phase).unwrap().finished,
+            "the run is finished"
+        );
+    }
+
+    /// Review codex 6: a planning directory GSD resolves under a workstream
+    /// scope is refused before any write, so GSD's writer never runs and the
+    /// top-level STATE.md the commit would name is untouched.
+    #[test]
+    fn a_scoped_planning_dir_is_refused_before_phase_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5286);
+        let mut state = noted_state(root, phase, Stage::Validate);
+        std::fs::create_dir_all(root.join(".planning")).unwrap();
+        std::fs::write(root.join(".planning/STATE.md"), "# State\n").unwrap();
+        let git = |args: &[&str]| {
+            let ok = devflow_core::test_support::git_command(root)
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        git(&["add", ".planning/STATE.md"]);
+        git(&["commit", "-q", "-m", "state"]);
+        let committed = std::fs::read(root.join(".planning/STATE.md")).unwrap();
+        workflow::save_state(&state).unwrap();
+        let inspect = planning_inspect_reply(root, &root.join(".planning/workstreams/ws1"));
+        let gsd = GsdStub::answering(root, &[&inspect]);
+
+        finish_run(root, &mut state, test_permit()).unwrap();
+
+        let calls: Vec<String> = gsd.calls().into_iter().map(|(_, argv)| argv).collect();
+        assert_eq!(
+            calls,
+            vec!["query planning.inspect".to_string()],
+            "a scoped planning directory reached GSD's writer"
+        );
+        let event =
+            devflow_core::events::last_event_of_kind_for_phase(root, phase, "gsd_phase_complete")
+                .expect("the finish records gsd_phase_complete");
+        assert_eq!(event["ok"], false, "{event}");
+        assert_eq!(event["failure"], "scoped_planning_dir", "{event}");
+        let message = event["message"].as_str().expect("a message");
+        assert!(message.contains("./.planning/workstreams/ws1"), "{event}");
+        assert!(
+            !message.contains(&root.display().to_string()),
+            "the event carries an absolute path: {event}"
+        );
+        assert_eq!(
+            std::fs::read(root.join(".planning/STATE.md")).unwrap(),
+            committed,
+            "a scoped planning directory reached GSD's writer"
+        );
+        assert!(
+            workflow::load_state(root, phase).unwrap().finished,
+            "the run is finished"
+        );
+    }
+
+    /// The last `gsd_phase_complete` event of `phase` at `root`.
+    fn completion_event(root: &Path, phase: PhaseId) -> serde_json::Value {
+        devflow_core::events::last_event_of_kind_for_phase(root, phase, "gsd_phase_complete")
+            .expect("the finish records gsd_phase_complete")
+    }
+
+    /// D-10: a refused `phase.complete` (stale verification) is printed and
+    /// recorded with GSD's reason and its path-free message, runs no commit
+    /// and leaves the run finished. The repository is reached through a
+    /// symlink while GSD names the canonical path and its home, so both forms
+    /// of each must be replaced (review agy 9).
+    #[test]
+    fn a_refused_phase_complete_does_not_undo_the_finish() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        let link = tmp.path().join("link");
+        std::fs::create_dir_all(real.join(".planning")).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let phase = PhaseId::new(5287);
+        let mut state = noted_state(&link, phase, Stage::Validate);
+        workflow::save_state(&state).unwrap();
+        let canonical = real.canonicalize().unwrap();
+        let inspect = planning_inspect_reply(&canonical, &canonical.join(".planning"));
+        let gsd = GsdStub::answering(&link, &[&inspect, "!exit 1"]);
+        let home = gsd.home();
+        let refusal = serde_json::json!({
+            "ok": false,
+            "reason": "phase_verification_incomplete",
+            "message": format!(
+                "Phase {phase} verification is incomplete: Verification is stale — covered \
+                 source files changed after the verifier last ran: {}/crates/x.rs (GSD at {}/.claude)",
+                canonical.display(),
+                home.display()
+            ),
+        });
+        gsd.script_reply(2, &format!("!exit 1\n{refusal}"));
+
+        finish_run(&link, &mut state, test_permit()).unwrap();
+
+        assert!(
+            workflow::load_state(&link, phase).unwrap().finished,
+            "the run is finished"
+        );
+        assert_eq!(events_named(&link, "workflow_finished").len(), 1);
+        let calls: Vec<String> = gsd.calls().into_iter().map(|(_, argv)| argv).collect();
+        assert_eq!(
+            calls,
+            vec![
+                "query planning.inspect".to_string(),
+                format!("query phase.complete {phase} --json-errors"),
+            ],
+            "no commit after a refusal"
+        );
+        let event = completion_event(&link, phase);
+        assert_eq!(event["ok"], false, "{event}");
+        assert_eq!(event["failure"], "gsd_reader_nonzero_exit", "{event}");
+        assert_eq!(event["reason"], "phase_verification_incomplete", "{event}");
+        let message = event["message"].as_str().expect("GSD's message");
+        assert!(message.contains("verification is incomplete"), "{event}");
+        let text = event.to_string();
+        for path in [
+            &real,
+            &canonical,
+            &link,
+            &home,
+            &home.canonicalize().unwrap(),
+        ] {
+            assert!(
+                !text.contains(&path.display().to_string()),
+                "the event carries an absolute path: {event}"
+            );
+        }
+    }
+
+    /// Review agy 9: a GSD commit that fails after a successful
+    /// `phase.complete` is recorded as not committed, never as a refusal.
+    #[test]
+    fn a_failed_gsd_commit_after_phase_complete_is_recorded_as_not_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5288);
+        let mut state = noted_state(root, phase, Stage::Validate);
+        workflow::save_state(&state).unwrap();
+        let inspect = planning_inspect_reply(root, &root.join(".planning"));
+        let _gsd = GsdStub::answering(
+            root,
+            &[
+                &inspect,
+                PHASE_COMPLETE_REPLY,
+                "!exit 1\n{\"ok\":false,\"reason\":\"commit_outside_worktree\",\"message\":\"refused\"}",
+            ],
+        );
+
+        finish_run(root, &mut state, test_permit()).unwrap();
+
+        assert!(workflow::load_state(root, phase).unwrap().finished);
+        let event = completion_event(root, phase);
+        let reported_as_refusal =
+            format!("a failed commit was reported as a phase.complete refusal: {event}");
+        assert_eq!(event["ok"], true, "{reported_as_refusal}");
+        assert_eq!(event["committed"], false, "{reported_as_refusal}");
+        assert_eq!(
+            event["commit_failure"], "gsd_reader_nonzero_exit",
+            "{reported_as_refusal}"
+        );
+    }
+
+    /// Review agy 9: a GSD commit that commits nothing is `committed: false`
+    /// with no failure label.
+    #[test]
+    fn a_gsd_commit_that_commits_nothing_is_recorded_as_not_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5289);
+        let mut state = noted_state(root, phase, Stage::Validate);
+        workflow::save_state(&state).unwrap();
+        let inspect = planning_inspect_reply(root, &root.join(".planning"));
+        let _gsd = GsdStub::answering(
+            root,
+            &[
+                &inspect,
+                PHASE_COMPLETE_REPLY,
+                r#"{"committed":false,"hash":null,"reason":"nothing_to_commit"}"#,
+            ],
+        );
+
+        finish_run(root, &mut state, test_permit()).unwrap();
+
+        let event = completion_event(root, phase);
+        assert_eq!(event["ok"], true, "{event}");
+        assert_eq!(event["committed"], false, "{event}");
+        assert_eq!(event["commit_failure"], serde_json::Value::Null, "{event}");
+    }
+
+    /// Review agy 9: with no GSD launcher the finish records the failure's
+    /// label and no message, so the home it searched never reaches an event.
+    #[test]
+    fn a_missing_gsd_launcher_at_finish_records_its_label_without_a_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5290);
+        let mut state = noted_state(root, phase, Stage::Validate);
+        workflow::save_state(&state).unwrap();
+
+        finish_run(root, &mut state, test_permit()).unwrap();
+
+        let event = completion_event(root, phase);
+        assert_eq!(event["ok"], false, "{event}");
+        assert_eq!(event["failure"], "gsd_launcher_not_found", "{event}");
+        assert_eq!(event["message"], serde_json::Value::Null, "{event}");
+        let text = event.to_string();
+        assert!(!text.contains("$HOME"), "{event}");
+        if let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) {
+            assert!(
+                !text.contains(&*home.to_string_lossy()),
+                "the event carries the home: {event}"
+            );
+        }
     }
 }
