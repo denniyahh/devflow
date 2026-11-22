@@ -15,3 +15,25 @@ helper's evidence for 1 and 5.
 
 CI on the same head failed `the_live_payload_commits_a_context_file_on_integration` (dubious ownership in the CI
 checkout); fixed in this PR and logged in `.planning/user/CI-FAILURES.md`.
+
+## Re-review of head 0b882e2 (15 possible issues, pasted by the operator from the Graphify page)
+
+Checked by a read-only helper agent against the source; the session re-read the code for 1, 2 and 7.
+
+| # | Finding | Verdict |
+|---|---|---|
+| 1 | Reopened verification gate says a sign-off is still needed when the fresh status changed (pipeline_outcomes.rs:2095) | FALSE: Approve reopens only on `HumanNeeded` or an unread status (pipeline_outcomes.rs:795-796) |
+| 2 | Clock before 1970 makes every reset look far (pipeline_outcomes.rs:117) | REAL, low impact: 999.261 |
+| 3 | Refused phase.complete test scripts the wrong reply (pipeline_gate.rs:3037) | FALSE: `script_reply(2, …)` replaces the second call's reply, and the test asserts the refusal reason |
+| 4 | Refused handoff on resume leaves the run advanced (pipeline_launch.rs:2568) | INTENDED: the raced case, 53.1-03-PLAN |
+| 5 | `commit_files` accepts `committed: false` (gsd_reader.rs:737) | FALSE: the caller records "committed nothing" (pipeline_outcomes.rs:513-526) |
+| 6 | Empty `files` passes a bare `--files` (gsd_reader.rs:732) | NIT: the only caller returns early on empty files |
+| 7 | Denial without `resetsAt` reads "until rejected" (agent_result.rs:1477) | REAL, wording: 999.261 |
+| 8 | Cancel of an id both queued and in flight (ask_server.rs:381) | NIT: needs a reused in-flight request id, which JSON-RPC forbids (spec not re-read) |
+| 9 | Gate-reset e2e asserts through `format_utc` (failover_e2e.rs:1072) | NIT: `format_utc` has fixed-value unit tests |
+| 10 | Absent-file check passes when git fails (live_payload_fixture.rs:64) | NIT: the positive check on the same repo fails first |
+| 11 | Merged-branch sweep test passes with a broken sweep (cleanup_rules_e2e.rs:579) | NIT, true for this test: the next test covers a branch no checkout holds |
+| 12 | Notify marker written with literal quotes (ask_e2e.rs:244) | FALSE: the quotes are shell quoting; `printf '%s'` writes the bare value |
+| 13 | Publish-whole test can leave the hook running (ask_e2e.rs:1064) | NIT: the child is `sh` with a 1 s sleep and exits on its own |
+| 14 | `validate_gate_context` lost its doc (pipeline_outcomes.rs:1557) | REAL, cosmetic: 999.261 |
+| 15 | Doc says the commit covers GSD's files but paths are fixed (pipeline_gate.rs:2889) | FALSE: the commit takes the files `phase.complete` reported |

@@ -884,6 +884,22 @@ close-out was refused: "Verification is stale — covered source files changed a
 documented way to re-verify after a review fix, e.g. run the fix on the phase branch through the run's Validate before finish.
 **Owner:** Phase 53.1.
 
+### Phase 999.261: Small Gate-Text and Doc Defects from the PR 251 Re-Review (BACKLOG)
+
+**Found:** 2026-11-22, Graphify re-review of PR #251 (head 0b882e2), checked against the source (triage:
+.planning/audits/2026-11-22-graphify-review-triage-pr251.md).
+**What happened:** three small defects, none reached in a run:
+1. A system clock before 1970 makes `now` 0 (`map_or(0, …)`, crates/devflow-cli/src/pipeline_outcomes.rs:115-119), so every
+   reset reads as far away and the rate-limit gate leads with the switch-agent advice.
+2. A Claude stream denial with no `resetsAt` falls back to the status string (crates/devflow-core/src/agent_result.rs:1477-1479),
+   so the reason reads "rate limited until rejected" (`rate_limited_result`, :2502).
+3. The `validate_gate_context` doc block sits above `post_run_sign_off_route`'s doc (pipeline_outcomes.rs:1551-1574), so the
+   two read as one comment and `validate_gate_context` has none.
+**Not established:** whether 2 predates Phase 53.1; none was seen live.
+**Fix shape:** 1: treat a clock read failure as "reset distance unknown" and lead with the wait route; 2: say "until an
+unstated time" when no reset time is given, with a test on the rendered reason; 3: move the doc block. One fix branch, or the
+next phase that touches the gate text.
+
 ### Phase 999.260: `devflow resume` After an `--until plan` Halt Reached Through Plan→Validate Starts Code, Not Validate (BACKLOG)
 
 **Found:** 2026-11-21, Phase 53.1 (the residual of the 999.251 fix, 53.1-03).
