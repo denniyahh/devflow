@@ -86,6 +86,13 @@ else can make (restated by the operator 2026-11-08).
 
 ## Operator Next Steps
 
+**Next (2026-11-22): Phase 53.2, before Phase 54.** Inserted after 53.1 with its scope in ROADMAP.md (wsx/UDE
+first-use issues #246–#250, six dogfood defects, nine flaky tests; issues live on GitHub only since 2026-11-22). Phase
+54 waits on #246. Steps: `/gsd-discuss-phase 53.2 --auto` in an agent session, then `devflow start --phase 53.2
+--agent claude --mode supervise --until plan` on the installed binary (check `devflow --version` first), then the
+Tier B external review on codex and agy. The frontmatter still names 54 until discuss records 53.2. The text below is
+from Phase 52.1 and is history.
+
 Phase 52.1 is planned (15 plans, 11 waves; review applied in `6d37732`, reconciled in `3f9a430`; plan-checker round 2
 on 2026-11-14: 0 blockers, its one warning closed by recording the pi S7 ruling in CONTEXT D-09.5). In order:
 

@@ -378,6 +378,30 @@ Plans:
 **Wave 4** *(blocked on Wave 3 completion)*
 - [x] 53.1-08-PLAN.md — close the D-02 entries (999.206, 999.213, 999.251), file the resume residual, resume row, phase gate (wave 4)
 
+### Phase 53.2: wsx/UDE first-use and dogfood remediation (INSERTED)
+
+**Goal:** Fix what DevFlow's first use on other projects (wsx phase 7, universal-dev-env phase 3) and its own v4
+dogfood runs exposed, and stabilize the flaky tests, so Phase 54 can run discuss on a project that is not DevFlow.
+Scope (operator-approved 2026-11-22; GitHub issues on denniyahh/devflow):
+- wsx/UDE first use: #246 (no route runs `/gsd-discuss-phase`; blocks Phase 54), #250 (Plan has no `--reviews`
+  route), #248 (status compares against the env/config base, not the run's `base_branch`), #247 (question-gate
+  banner offers approve/reject), #249 (status prints a raw Unix timestamp)
+- Dogfood defects: #281 (resume after an `--until plan` halt via Plan→Validate starts Code), #324 (stop reason
+  names the removed supervisor), #285 (`start` should warn when GSD's derived files are not ignored), #258
+  (timed-out launch clears a run), #297 (`stop` vs concurrent `resume` reports "crashed"), #296 (fake service
+  manager never reports `active`)
+- Flaky tests: #265, #273, #276, #277, #279, #301, #308, #310, #178. #273 (999.257) was claimed fixed by 53.1-05:
+  confirm first.
+- Out: 999.237 (fixed) and 999.233 (obsolete), per `.planning/audits/2026-11-22-backlog-migration.md`.
+Run conventions: discuss `--auto` in session, then `devflow start --phase 53.2 --agent claude --mode supervise
+--until plan`, external review (Tier B), close-out with `scripts/cut-pr-branch.sh`.
+**Requirements**: no REQ IDs; the issues above
+**Depends on:** Phase 53.1
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (run /gsd-plan-phase 53.2 to break down)
+
 ### Phase 54: Decision Triage
 
 **Goal**: DevFlow answers the questions a calibrated model can answer and escalates the rest. A decision model (Jev or
@@ -617,6 +641,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 54 | 0/? | Not started | — |
 | 55 | 0/? | Not started | — |
 | 53.1. Phase 53 remediation | 8/8 | Complete | 2026-11-21 |
+| 53.2. wsx/UDE first-use and dogfood remediation | 0/0 | Not started | - |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
 
@@ -770,4 +795,3 @@ why this differs from the pre-existing `v1.0-ASSESSMENT.md`, an unrelated older 
 
 - **Phase 14 rescoped to Parallel Safety + Observability** — the 2026-07-14 move of Hermes into Phase 14 was a workload-balance call made before the CR-03 parallel-safety flaw was deferred there (2026-07-15), which made 14 the heaviest phase instead of the slimmest. Phase 14 now leads with CR-03 (per-phase state files, phase-threaded monitor advance, coarse lock for main-checkout mutations), keeps the `capture_agent_output()` sync-path decision, and builds observability (`logs`/`events.jsonl`/`status`) on the final per-phase state model — in that order, since the state-file shape dictates what `status`/`logs`/`events.jsonl` enumerate.
 - **Phase 16 (new): Hermes Support** — HermesAgent adapter, skill-file rewrite, and Hermes plugin moved out of 14. Depends on Phase 14 (the plugin's gate watcher consumes `events.jsonl` and the Phase 13 notify hook); sits after Phase 15 so public-facing OSS readiness isn't gated on personal-infrastructure work.
-
