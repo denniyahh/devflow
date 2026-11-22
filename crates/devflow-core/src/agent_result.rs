@@ -1359,6 +1359,10 @@ pub(crate) fn event_is_top_level_result_marker(event: &serde_json::Value) -> boo
 /// is the only evidence that settles the vocabulary.
 const CLAUDE_STREAM_RATE_LIMIT_DENIAL_STATUSES: &[&str] = &["rejected"];
 
+/// The retry text of a stream denial whose `rate_limit_info` has no `resetsAt`,
+/// rendered as "rate limited until a reset time the denial did not give".
+const STREAM_DENIAL_WITHOUT_RESET: &str = "a reset time the denial did not give";
+
 /// Detect an explicit quota DENIAL in a Claude `stream-json` capture and return
 /// the retry description, mirroring what [`detect_claude_rate_limit`] returns
 /// for the single-document envelope.
@@ -1469,12 +1473,12 @@ fn rate_limit_event_denial(
     // `AgentStatus::RateLimited` variant alone and the `reason` text is
     // operator-facing. Mirrors `detect_claude_rate_limit`'s `retry_after` →
     // `message` → `error` chain; its final `"usage limit"` default has no
-    // counterpart here because a matched `status` is by construction one of the
-    // non-empty enumerated strings above, so a third rung would be unreachable.
+    // counterpart; a denial without `resetsAt` says so rather than echo its
+    // status word, which would read "rate limited until rejected".
     Some(
         info.get("resetsAt")
             .and_then(json_scalar_to_string)
-            .unwrap_or_else(|| status.to_string()),
+            .unwrap_or_else(|| STREAM_DENIAL_WITHOUT_RESET.to_string()),
     )
 }
 
@@ -5525,6 +5529,26 @@ mod tests {
         assert_eq!(
             parse_claude_event_result(&single_turn).map(|r| r.status),
             Some(AgentStatus::RateLimited)
+        );
+    }
+
+    /// A denial without `resetsAt` says the reset time was not given; it does
+    /// not echo the status word as if it were a time.
+    #[test]
+    fn claude_stream_denial_without_resets_at_says_no_reset_time_was_given() {
+        let denial = v3_rate_limit_event("rejected");
+        assert!(
+            denial.contains(r#""resetsAt":1785645600,"#),
+            "fixture lost resetsAt"
+        );
+        let denial = denial.replace(r#""resetsAt":1785645600,"#, "");
+        let capture = stream_capture_of(&[&denial, &v3_result_event(V3_RESULT_TURN1, NO_MARKER)]);
+
+        let result = parse_claude_event_result(&capture).expect("a quota denial is a verdict");
+        assert_eq!(result.status, AgentStatus::RateLimited);
+        assert_eq!(
+            result.reason.as_deref(),
+            Some("rate limited until a reset time the denial did not give")
         );
     }
 
