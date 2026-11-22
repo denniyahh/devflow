@@ -36,4 +36,6 @@ Checked by a read-only helper agent against the source; the session re-read the 
 | 12 | Notify marker written with literal quotes (ask_e2e.rs:244) | FALSE: the quotes are shell quoting; `printf '%s'` writes the bare value |
 | 13 | Publish-whole test can leave the hook running (ask_e2e.rs:1064) | NIT: the child is `sh` with a 1 s sleep and exits on its own |
 | 14 | `validate_gate_context` lost its doc (pipeline_outcomes.rs:1557) | REAL, cosmetic: 999.261 |
+
+999.261 (findings 2, 7 and 14) was fixed in this PR on 2026-11-22, each code fix with a test that fails on the old code.
 | 15 | Doc says the commit covers GSD's files but paths are fixed (pipeline_gate.rs:2889) | FALSE: the commit takes the files `phase.complete` reported |

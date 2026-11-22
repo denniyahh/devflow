@@ -884,7 +884,7 @@ close-out was refused: "Verification is stale — covered source files changed a
 documented way to re-verify after a review fix, e.g. run the fix on the phase branch through the run's Validate before finish.
 **Owner:** Phase 53.1.
 
-### Phase 999.261: Small Gate-Text and Doc Defects from the PR 251 Re-Review (BACKLOG)
+### Phase 999.261: Small Gate-Text and Doc Defects from the PR 251 Re-Review (RESOLVED 2026-11-22 — Phase 53.1, PR #251: 266af2a, 92169fe)
 
 **Found:** 2026-11-22, Graphify re-review of PR #251 (head 0b882e2), checked against the source (triage:
 .planning/audits/2026-11-22-graphify-review-triage-pr251.md).
