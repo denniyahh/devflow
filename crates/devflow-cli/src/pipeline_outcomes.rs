@@ -114,9 +114,8 @@ pub(crate) fn handle_rate_limited_outcome(
     let reset_at = reset_time::parse_reset_time(&retry_after_from_reason(reason.as_deref()));
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| {
-            i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
-        });
+        .ok()
+        .map(|elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX));
     let context = rate_limit_gate_context(state, phase, stage, reason, now);
     let answer = run_gate(
         project_root,
@@ -141,13 +140,15 @@ const RATE_LIMIT_FAR_RESET_SECS: i64 = 6 * 60 * 60;
 /// display cut, then the reset as a UTC time and a distance and the same-agent
 /// resume command. A near, past or unreadable reset names the same-agent resume
 /// command (with `--agent` when the run is not on the default agent) first,
-/// then the reset. The cause comes last.
+/// then the reset. So does any reset when `now` is `None` (the system clock
+/// could not be read): its distance is unknown, so it is never taken as far. The
+/// cause comes last.
 fn rate_limit_gate_context(
     state: &State,
     phase: PhaseId,
     stage: Stage,
     reason: Option<String>,
-    now: i64,
+    now: Option<i64>,
 ) -> String {
     let agent = if state.agent == AgentKind::Claude {
         String::new()
@@ -156,14 +157,24 @@ fn rate_limit_gate_context(
     };
     let reset_at = reset_time::parse_reset_time(&retry_after_from_reason(reason.as_deref()));
     let reset = match reset_at {
-        Some(at) => format!(
-            "the limit resets at {}, {}",
-            reset_time::format_utc(at),
-            reset_distance(at, now)
-        ),
+        Some(at) => match now {
+            Some(now) => format!(
+                "the limit resets at {}, {}",
+                reset_time::format_utc(at),
+                reset_distance(at, now)
+            ),
+            None => format!(
+                "the limit resets at {}; the system clock could not be read, so how far off \
+                 that is is unknown",
+                reset_time::format_utc(at)
+            ),
+        },
         None => "the denial carried no reset time".to_string(),
     };
-    let far = reset_at.is_some_and(|at| at.saturating_sub(now) > RATE_LIMIT_FAR_RESET_SECS);
+    let far = match (reset_at, now) {
+        (Some(at), Some(now)) => at.saturating_sub(now) > RATE_LIMIT_FAR_RESET_SECS,
+        _ => false,
+    };
     let lead = if far {
         let other = other_agent_for_resume(state);
         format!(
@@ -1548,12 +1559,6 @@ fn emit_verification_read(
     events::emit(project_root, phase, "gsd_verification", payload);
 }
 
-/// The context of a Validate gate of `kind`, and the one its `gate_fired`
-/// event carries. They differ only for a reader failure, whose detail stays
-/// out of the event. Every context but a reader failure's quotes GSD's status
-/// verbatim, and says `passed` only when GSD did (GATE-03). Both lead with the
-/// way-on sentence the routers render (GATE-04, C2); the cause after it names
-/// no answer.
 /// The route a `human_needed` gate names for sign-offs that can only run
 /// after the run ends (D-06, 999.254), the Phase 53 close-out route: run them
 /// with a build installed to a separate root while the gate waits, then answer
@@ -1571,6 +1576,12 @@ fn post_run_sign_off_route(phase: PhaseId) -> String {
     )
 }
 
+/// The context of a Validate gate of `kind`, and the one its `gate_fired`
+/// event carries. They differ only for a reader failure, whose detail stays
+/// out of the event. Every context but a reader failure's quotes GSD's status
+/// verbatim, and says `passed` only when GSD did (GATE-03). Both lead with the
+/// way-on sentence the routers render (GATE-04, C2); the cause after it names
+/// no answer.
 fn validate_gate_context(
     kind: GateKind,
     round: (AgentVerdict, &Evidence),
@@ -6326,7 +6337,7 @@ mod tests {
             "rate limited until 2026-11-19T16:34:00Z",
         ] {
             let context =
-                rate_limit_gate_context(&state, phase, Stage::Code, Some(reason.into()), now);
+                rate_limit_gate_context(&state, phase, Stage::Code, Some(reason.into()), Some(now));
             assert!(context.contains(clause), "{reason}: {context}");
             let lead = &context[..context.find(" Cause: ").expect("a cause")];
             assert!(
@@ -6339,7 +6350,7 @@ mod tests {
             phase,
             Stage::Code,
             Some("rate limited until whenever".into()),
-            now,
+            Some(now),
         );
         assert!(
             context.contains("the denial carried no reset time"),
@@ -6370,7 +6381,8 @@ mod tests {
         let other = format!("`devflow resume --phase {phase} --agent <other>`");
         let to_codex = format!("`devflow resume --phase {phase} --agent codex`");
 
-        let context = rate_limit_gate_context(&claude(), phase, Stage::Code, far.clone(), now);
+        let context =
+            rate_limit_gate_context(&claude(), phase, Stage::Code, far.clone(), Some(now));
         let shown = devflow_core::gates::render_gate_context(
             &context,
             devflow_core::gates::GATE_CONTEXT_DISPLAY_CHARS,
@@ -6391,7 +6403,7 @@ mod tests {
         );
 
         let near = Some(format!("rate limited until {}", now + 3600));
-        let context = rate_limit_gate_context(&claude(), phase, Stage::Code, near, now);
+        let context = rate_limit_gate_context(&claude(), phase, Stage::Code, near, Some(now));
         assert!(
             !context.contains("devflow stop --phase"),
             "control: a near reset keeps the near layout: {context}"
@@ -6400,7 +6412,7 @@ mod tests {
         let mut spent = claude();
         spent.fallback_agent = Some(AgentKind::Codex);
         spent.fallback_consumed = true;
-        let context = rate_limit_gate_context(&spent, phase, Stage::Code, far.clone(), now);
+        let context = rate_limit_gate_context(&spent, phase, Stage::Code, far.clone(), Some(now));
         assert!(
             context.contains(&to_codex) && !context.contains("<other>"),
             "a spent fallback is named: {context}"
@@ -6409,12 +6421,46 @@ mod tests {
         let mut unused = claude();
         unused.fallback_agent = Some(AgentKind::Codex);
         unused.fallback_consumed = false;
-        let context = rate_limit_gate_context(&unused, phase, Stage::Code, far, now);
+        let context = rate_limit_gate_context(&unused, phase, Stage::Code, far, Some(now));
         assert!(
             context.contains(&other)
                 && !context.contains("`--agent codex`")
                 && !context.contains(&to_codex),
             "an unused fallback is not named: {context}"
+        );
+    }
+
+    /// A clock that cannot be read leaves the reset's distance unknown, so a
+    /// reset two days out keeps the same-agent lead and names the reset time
+    /// without a distance; the same reset with a readable clock is far.
+    #[test]
+    fn a_rate_limit_gate_with_an_unreadable_clock_never_leads_with_another_agent() {
+        let phase = PhaseId::with_minor(999, 261);
+        let state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            PathBuf::from("/nonexistent"),
+        );
+        let far = Some("rate limited until 1795294800".to_string());
+        let stop = format!("`devflow stop --phase {phase}`");
+
+        let context = rate_limit_gate_context(&state, phase, Stage::Code, far.clone(), None);
+        assert!(
+            !context.contains(&stop),
+            "far lead without a clock: {context}"
+        );
+        assert!(
+            context.contains(
+                "the limit resets at 2026-11-21 21:00 UTC; the system clock could not be read"
+            ),
+            "reset time without a distance: {context}"
+        );
+
+        let context = rate_limit_gate_context(&state, phase, Stage::Code, far, Some(1_795_102_140));
+        assert!(
+            context.contains(&stop),
+            "control: a readable clock is far: {context}"
         );
     }
 
@@ -6438,7 +6484,7 @@ mod tests {
             phase,
             stage,
             Some("rate limited until 1795294800".into()),
-            1_795_102_140,
+            Some(1_795_102_140),
         );
         let shown = devflow_core::gates::render_gate_context(
             &context,
