@@ -5,14 +5,18 @@
 //! a payload into a scratch directory outside this checkout and reads the file
 //! from the `integration` branch.
 //!
-//! Every spawned command gets a scratch `HOME` and `XDG_CONFIG_HOME`, no global
-//! or system git config and no inherited repository-local `GIT_*` variable.
+//! Every spawned command gets a scratch `HOME` and `XDG_CONFIG_HOME`, no system
+//! git config, no inherited repository-local `GIT_*` variable, and a scratch
+//! global git config whose only setting trusts every directory: a CI checkout is
+//! owned by another user, and git refuses it as dubious ownership without one.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 const CONTEXT_PATH: &str = ".planning/phases/01-retry-budget/01-CONTEXT.md";
 const ABSENT_PATH: &str = ".planning/phases/01-retry-budget/01-NOPE.md";
+/// The scratch global git config, relative to the scratch `home`.
+const SCRATCH_GITCONFIG: &str = ".gitconfig";
 
 /// Cargo test binaries run with cwd = the crate dir; the script lives at the
 /// repo root.
@@ -39,7 +43,7 @@ fn hermetic(program: &str, cwd: &Path, home: &Path) -> Command {
     cmd.current_dir(cwd)
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("HOME", home)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_GLOBAL", home.join(SCRATCH_GITCONFIG))
         .env("GIT_CONFIG_NOSYSTEM", "1");
     for name in devflow_core::test_support::REPO_LOCAL_GIT_VARS
         .iter()
@@ -65,6 +69,8 @@ fn the_live_payload_commits_a_context_file_on_integration() {
     let scratch = tempfile::tempdir().expect("create scratch dir");
     let home = scratch.path().join("home");
     std::fs::create_dir_all(home.join(".config")).expect("create scratch home");
+    std::fs::write(home.join(SCRATCH_GITCONFIG), "[safe]\n\tdirectory = *\n")
+        .expect("write scratch git config");
     let payload = scratch.path().join("lp");
 
     let out = hermetic("bash", &repo_root(), &home)
