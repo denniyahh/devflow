@@ -118,6 +118,10 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
   `crates/devflow-cli/tests/pre_commit_secret_scan.rs`. On this machine every commit is now scanned
   twice (repo hook + global hook); that is cheap except for the multi-MB `graphify-out/` refreshes on
   `workspace/denniyahh` (the global scan alone took 5m20s on 18.5 MB, 2026-10-23).
+- [ ] **[PROJECT]** Workspace-only drop-in `scripts/hooks/pre-commit.d/10-no-backlog.sh` (declared `only` in
+  `.workspace-divergence`) **refuses a commit that adds a `### Phase 999.` heading or `## Backlog` to
+  `.planning/ROADMAP.md`, or a new `.planning/phases/999.*` directory**: issues live in GitHub Issues only
+  (2026-11-22). The drop-in must be committed `100755` (`git update-index --chmod=+x`).
 - [ ] **[PROJECT]** `scripts/hooks/pre-commit` also **refuses phase source committed outside the
   phase's own worktree**. When `.planning/STATE.md`'s `current_phase` is N and a worktree exists on
   `feature/phase-N`, a commit made from any other branch is refused if it stages `crates/**`, and

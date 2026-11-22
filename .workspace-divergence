@@ -13,5 +13,8 @@ only scripts/hooks/post-commit
 # Tests the personal post-commit hook, which develop does not have
 only crates/devflow-cli/tests/post_commit_marker.rs
 
+# Refuses a commit that re-adds the ROADMAP 999.x backlog: issues live in GitHub only
+only scripts/hooks/pre-commit.d
+
 # Tracks .planning/ instead of ignoring it, and ignores graphify-out/ wholesale
 modified .gitignore
