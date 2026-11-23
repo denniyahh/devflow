@@ -197,6 +197,14 @@ pub struct State {
     /// interception in `transition()`).
     #[serde(default)]
     pub stop_until: Option<Stage>,
+    /// The stage the transition an `--until` halt intercepted was moving to
+    /// (#281, D-09), written by that halt. The resume that advances past the
+    /// halt launches it and clears it as it enters the stage, so no later
+    /// resume reuses it. `None` means no halt recorded a target, OR the state
+    /// was written by a binary predating this field: a resume then advances to
+    /// [`Stage::next`] of the halted stage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until_halt_target: Option<Stage>,
     /// Set by `transition()` when `stop_until` names the stage just
     /// completed — a terminal-but-not-failed halt short of Ship (20c).
     /// `false` for a normal in-flight or completed-to-Ship phase, and for
@@ -470,6 +478,7 @@ impl State {
             worktree_path: None,
             session_id: None,
             stop_until: None,
+            until_halt_target: None,
             stopped: false,
             stop_reason: None,
             finished: false,
