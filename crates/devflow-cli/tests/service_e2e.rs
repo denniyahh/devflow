@@ -297,9 +297,55 @@ struct UnitRead {
     exec_main_status: String,
 }
 
+/// How often [`settle_unit_reads`] takes a read.
+const SETTLE_POLL: Duration = Duration::from_millis(50);
+
+/// How long a stopped unit may take to read `inactive` (#279).
+const STOPPED_UNIT_INACTIVE_WAIT: Duration = Duration::from_secs(10);
+
 /// Poll `next` until a read is `inactive`, for at most `budget` (#279).
-fn settle_unit_reads(_budget: Duration, _next: impl FnMut() -> UnitRead) -> Result<(), String> {
-    Ok(())
+///
+/// A `failed` read is an error at once, with that read's `Result` and `ExecMainStatus`:
+/// a unit that failed and was then collected would otherwise read `inactive` (an unloaded
+/// unit's show reads `inactive` too) and hide its failure. Past the budget, the error
+/// names the budget and the last read.
+fn settle_unit_reads(budget: Duration, mut next: impl FnMut() -> UnitRead) -> Result<(), String> {
+    let deadline = Instant::now() + budget;
+    loop {
+        let read = next();
+        match read.active.as_str() {
+            "inactive" => return Ok(()),
+            "failed" => {
+                return Err(format!(
+                    "unit read failed before inactive: ActiveState=failed, Result={}, ExecMainStatus={}",
+                    read.result, read.exec_main_status
+                ));
+            }
+            _ => {}
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "did not read inactive within {budget:?}: ActiveState={}, Result={}, ExecMainStatus={}",
+                read.active, read.result, read.exec_main_status
+            ));
+        }
+        std::thread::sleep(SETTLE_POLL);
+    }
+}
+
+/// Wait for `unit` to read `inactive` within `budget`.
+///
+/// # Panics
+/// With `unit {unit} ` before [`settle_unit_reads`]'s error.
+fn wait_for_unit_inactive(unit: &str, budget: Duration) {
+    let read = || UnitRead {
+        active: unit_property(unit, "ActiveState"),
+        result: unit_property(unit, "Result"),
+        exec_main_status: unit_property(unit, "ExecMainStatus"),
+    };
+    if let Err(err) = settle_unit_reads(budget, read) {
+        panic!("unit {unit} {err}");
+    }
 }
 
 /// A read of `active`, with the given `Result` and `ExecMainStatus`.
@@ -950,11 +996,42 @@ fn stop_on_a_live_unit_records_stopped() {
         "state not stopped: {state:?}\njournal:\n{}",
         journal_of(&guard.unit)
     );
-    assert_eq!(
-        unit_property(&guard.unit, "ActiveState"),
-        "inactive",
-        "the unit is not inactive after stop"
+    wait_for_unit_inactive(&guard.unit, STOPPED_UNIT_INACTIVE_WAIT);
+}
+
+/// #279 negative control: the stopped-unit wait, run on a live unit that is never
+/// stopped and given a short budget, fails naming the unit, `Result` and `ExecMainStatus`.
+#[test]
+#[ignore = "needs a systemd user manager; run by scripts/check.sh service"]
+fn a_unit_that_never_reads_inactive_fails_naming_result_and_exec_main_status() {
+    assert_manager_answers();
+    let phase = PhaseId::new(88);
+    let fixture = StartFixture::new(phase, "sleep 120");
+    let guard = UnitGuard::named(fixture.unit());
+    let out = fixture.start(
+        common::host_service_devflow(&fixture.home),
+        &fixture.path(None),
     );
+    assert!(out.status.success(), "start failed:\n{}", text(&out));
+    let argv_log = fixture.logs.path().join(common::AGENT_ARGV_LOG);
+    wait_until(
+        || argv_log.is_file(),
+        &guard.unit,
+        "the agent never started",
+    );
+
+    let unit = guard.unit.clone();
+    let payload = std::panic::catch_unwind(|| {
+        wait_for_unit_inactive(&unit, Duration::from_millis(500));
+    })
+    .expect_err("the wait passed on a unit that was never stopped");
+    let message = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .expect("a formatted panic message");
+    assert!(message.contains(&guard.unit), "{message}");
+    assert!(message.contains("Result="), "{message}");
+    assert!(message.contains("ExecMainStatus="), "{message}");
 }
 
 /// D-08: SIGKILL to the unit's MainPID leaves no member of the agent's group, and the
