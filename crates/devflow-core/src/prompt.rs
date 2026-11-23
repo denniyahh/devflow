@@ -643,7 +643,7 @@ pub fn render_workflow_style(intent: &StageIntent, workflow_root: &str) -> Strin
         StageIntent::PlanReviews {
             phase,
             relaunch_note,
-        } => workflow_gaps_plan_prompt(
+        } => workflow_reviews_plan_prompt(
             *phase,
             workflow_root,
             &note_blocks(None, relaunch_note.as_deref()),
@@ -720,6 +720,18 @@ fn workflow_gaps_plan_prompt(phase: PhaseId, workflow_root: &str, notes: &str) -
         "Validation reported gaps. Read and follow the GSD workflow file at \
         {workflow_root}/plan-phase.md for phase {phase} --gaps, to plan their closure. The \
         `--gaps` flag is part of the workflow invocation and must be preserved verbatim.\n\n\
+        {ASK_POLICY}{notes}{COMPLETION_PROTOCOL}"
+    )
+}
+
+/// The workflow-style [`reviews_plan_prompt`]: the same pass, naming the
+/// plan-phase workflow file in its `--reviews` mode instead of a slash command.
+fn workflow_reviews_plan_prompt(phase: PhaseId, workflow_root: &str, notes: &str) -> String {
+    format!(
+        "External review feedback for this phase is in its REVIEWS.md. Read and follow the \
+        GSD workflow file at {workflow_root}/plan-phase.md for phase {phase} --reviews, to \
+        replan the phase incorporating that feedback. The `--reviews` flag is part of the \
+        workflow invocation and must be preserved verbatim.\n\n\
         {ASK_POLICY}{notes}{COMPLETION_PROTOCOL}"
     )
 }
