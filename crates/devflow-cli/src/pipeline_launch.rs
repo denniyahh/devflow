@@ -2224,10 +2224,9 @@ pub(crate) fn resume_with_fallback(
         fallback_agent,
         reviews,
     )?;
-    // #338 WR-01: the state resume committed, read back from disk as start keeps `written`.
-    let written = workflow::load_state(project_root, phase)
-        .ok()
-        .and_then(|loaded| serde_json::to_value(&loaded).ok());
+    // #338 WR-01, F05: the state resume committed (`commit` replaced `state` with it), as
+    // start keeps `written`; not reloaded, so a runner's write cannot pass for resume's.
+    let written = serde_json::to_value(&state).ok();
     // The runner checks the agent binary again at each launch; checked here too, so a
     // resume that cannot run its agent fails now, re-marked stopped below, rather than
     // in a unit nobody watches.
@@ -2286,7 +2285,7 @@ pub(crate) fn resume_with_fallback(
 /// is marked stopped again, naming what failed. A state on disk that already reads
 /// `stopped` was stopped by its runner after that commit (a timed-out launch whose runner
 /// ran, recorded its own stop and exited, #258), so its stop reason is the runner's and is
-/// kept. Best effort: the launch error is what the caller needs either way.
+/// kept, and the error names that stop (F05). Best effort: the launch error is what the caller needs either way.
 ///
 /// A failed `resume --reviews` launch (`reviews`, D-04, review item 8) puts the
 /// `--until plan` halt back, the halt's stop reason and no reviews pass, so
@@ -2306,8 +2305,10 @@ fn re_mark_stopped_after_failed_launch(
 ) -> CliError {
     let err = CliError::Message(format!("resume: phase {phase} was not launched: {why}"));
     let mut kept = false;
+    let mut runner_stop: Option<String> = None;
     let _ = commit(state, |s| {
         if s.stopped {
+            runner_stop = Some(s.stop_reason.clone().unwrap_or_else(|| "no reason".into()));
             return;
         }
         let untouched = written.is_some() && written == serde_json::to_value(&*s).ok().as_ref();
@@ -2320,6 +2321,13 @@ fn re_mark_stopped_after_failed_launch(
             kept = !untouched;
         }
     });
+    if let Some(reason) = runner_stop {
+        return CliError::Message(format!(
+            "resume: phase {phase}'s unit launched, and its runner recorded its own stop \
+             ({reason}) before resume could confirm the launch ({why}): run 'devflow status' \
+             to inspect it, and 'devflow resume --phase {phase}' to resume it"
+        ));
+    }
     if kept {
         return CliError::Message(format!(
             "resume: phase {phase} was not confirmed launched ({why}), and its run state \
@@ -2770,18 +2778,30 @@ fn reviews_resume_refusal(state: &State) -> Option<String> {
 /// D-04: refuse a `resume --reviews` whose run checkout, `launch_root` (the tree the
 /// reviews Plan reads), has no `{padded}-REVIEWS.md` in the phase's directory on disk.
 /// Unlike `start`, which reads the base it forks from, the run's tree already exists.
+/// Two phase directories refuse naming both, as `start --reviews` does on the base (F02),
+/// and a phase directory the reader could not judge refuses with its error.
 fn require_reviews_file_in_checkout(launch_root: &Path, phase: PhaseId) -> Result<(), CliError> {
+    use devflow_core::gsd_reader::ReaderFailure;
     let padded = phase.padded();
-    let present = devflow_core::gsd_reader::phase_dir(launch_root, phase)
-        .is_ok_and(|dir| dir.join(format!("{padded}-REVIEWS.md")).is_file());
-    if present {
-        return Ok(());
+    let location = format!("in the run's checkout {}", launch_root.display());
+    let not_there = || {
+        crate::commands::reviews_file_refusal(crate::commands::LaunchVerb::Resume, phase, &location)
+    };
+    match devflow_core::gsd_reader::phase_dir(launch_root, phase) {
+        Ok(dir) if dir.join(format!("{padded}-REVIEWS.md")).is_file() => Ok(()),
+        Ok(_) | Err(ReaderFailure::PhaseDirNotFound { .. }) => Err(not_there()),
+        Err(ReaderFailure::AmbiguousPhaseDir { matches }) => {
+            Err(crate::commands::ambiguous_phase_dirs_refusal(
+                crate::commands::LaunchVerb::Resume,
+                phase,
+                &location,
+                matches.iter().map(|dir| dir.display().to_string()),
+            ))
+        }
+        Err(error) => Err(CliError::Message(format!(
+            "resume: --reviews could not find phase {phase}'s directory {location}: {error}"
+        ))),
     }
-    Err(crate::commands::reviews_file_refusal(
-        crate::commands::LaunchVerb::Resume,
-        phase,
-        &format!("in the run's checkout {}", launch_root.display()),
-    ))
 }
 
 /// Refuse a `resume` the run's recorded delivery canary would refuse, before it writes
@@ -4100,6 +4120,60 @@ mod tests {
             err.contains(&format!(".planning/phases/{padded}-*/{padded}-REVIEWS.md"))
                 && err.contains(&root.display().to_string()),
             "resume --reviews without a REVIEWS.md was not refused naming the path: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&state_file).unwrap(),
+            before,
+            "a refused resume --reviews changed the state: {err}"
+        );
+    }
+
+    /// D-04 (F02): `resume --reviews` in a run checkout with two `NN-*` phase directories
+    /// is refused naming both, not as a missing REVIEWS.md, and writes no state.
+    #[test]
+    fn resume_with_reviews_and_two_phase_directories_is_refused_naming_both() {
+        const NAME: &str = "pipeline_launch::tests::resume_with_reviews_and_two_phase_directories_is_refused_naming_both";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_dir_with_agent_stub("codex");
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(5396);
+        save_stopped_in_plan(
+            root,
+            phase,
+            AgentKind::Codex,
+            &crate::pipeline_gate::until_halt_reason(Stage::Plan),
+        );
+        let padded = phase.padded();
+        for slug in ["a", "b"] {
+            let phase_dir = root.join(format!(".planning/phases/{padded}-{slug}"));
+            std::fs::create_dir_all(&phase_dir).unwrap();
+            std::fs::write(
+                phase_dir.join(format!("{padded}-REVIEWS.md")),
+                "# reviews\n",
+            )
+            .unwrap();
+        }
+        let state_file = workflow::state_path(root, phase);
+        let before = std::fs::read(&state_file).unwrap();
+
+        let result = resume_with_fallback(root, phase, None, None, true);
+        let _runners = crate::service::double::LaunchedRunners;
+        let err = result.err().map(|err| err.to_string()).unwrap_or_default();
+        assert!(
+            err.contains(&format!("{padded}-a")) && err.contains(&format!("{padded}-b")),
+            "resume --reviews with two phase directories did not name both: {err}"
+        );
+        assert!(
+            !err.contains("it is not there"),
+            "two phase directories read as a missing REVIEWS.md: {err}"
         );
         assert_eq!(
             std::fs::read(&state_file).unwrap(),

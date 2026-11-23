@@ -397,12 +397,6 @@ pub(crate) fn start(
         }
     }
 
-    // #285 (D-13): a warning, never a refusal, said by the dry run and the real start
-    // alike, after every refusal above so a refused start prints none.
-    if let Some(warning) = gsd_derived_paths_warning(project_root) {
-        eprintln!("{warning}");
-    }
-
     if dry_run {
         return start_dry_run(project_root, &state);
     }
@@ -431,6 +425,10 @@ pub(crate) fn start(
     let written = workflow::load_state(project_root, phase)
         .ok()
         .and_then(|state| serde_json::to_value(&state).ok());
+    // F07 (D-11): the phase's last `stage_launched` beside `written`, so a runner that
+    // logged a launch and wrote no state is not read as one that never ran.
+    let launched_before =
+        devflow_core::events::last_event_of_kind_for_phase(project_root, phase, "stage_launched");
     match crate::service::launch_runner_unit(project_root, phase) {
         Ok(unit) => {
             drop(phase_holder);
@@ -468,6 +466,7 @@ pub(crate) fn start(
                     worktree,
                     &why,
                     written.as_ref(),
+                    launched_before.as_ref(),
                 )),
                 TimedOutLaunch::Unknown(reading) => Err(CliError::Message(
                     unconfirmed_launch_message("start", phase, &why, &reading),
@@ -477,9 +476,9 @@ pub(crate) fn start(
     }
 }
 
-/// #285: files GSD writes on every step, as (a path `git check-ignore --no-index` and
-/// `git ls-files --error-unmatch` probe, the `.gitignore` line that ignores it). `.gsd/`
-/// is probed through a file GSD writes there.
+/// #285: files GSD writes on every step, as (a path `git check-ignore --no-index`
+/// probes, the `.gitignore` line that ignores it, which `git ls-files` lists tracked
+/// files under). `.gsd/` is probed through a file GSD writes there.
 const GSD_DERIVED_PATHS: &[(&str, &str)] = &[
     (".planning/state.json", ".planning/state.json"),
     (".planning/milestone.lock", ".planning/milestone.lock"),
@@ -489,10 +488,11 @@ const GSD_DERIVED_PATHS: &[(&str, &str)] = &[
 /// #285 (D-13): the warning naming the `.gitignore` lines to add for each of
 /// [`GSD_DERIVED_PATHS`] no ignore rule covers at `project_root` (`check-ignore
 /// --no-index`, so a tracked file is judged by the rules alone), and, under its own
-/// header, `git rm --cached` for each one git tracks (#338 WR-02), since an ignore rule
-/// does not apply to a tracked file. `None` when all are ignored and untracked or
-/// `project_root` is not a git work tree (start refuses such a root itself). A check git
-/// could not answer is named with its error, never read as a no.
+/// header, `git rm --cached` for each file git tracks under the line (#338 WR-02, F04: every
+/// file under `.gsd/`, not only the probe), since an ignore rule does not apply to a
+/// tracked file. `None` when all are ignored and untracked or `project_root` is not a git
+/// work tree (start refuses such a root itself). A check git could not answer is named with
+/// its error, never read as a no.
 fn gsd_derived_paths_warning(project_root: &Path) -> Option<String> {
     let inside = git_command(project_root)
         .args(["rev-parse", "--is-inside-work-tree"])
@@ -519,51 +519,72 @@ fn gsd_derived_paths_warning(project_root: &Path) -> Option<String> {
             Err(err) => unchecked.push(format!("could not check {probe}: {err}")),
         }
         match git_command(project_root)
-            .args(["ls-files", "--error-unmatch", "--", probe])
+            .args(["ls-files", "-z", "--", line])
             .output()
         {
             Ok(out) if out.status.success() => {
-                untrack.push(format!("untrack it: git rm --cached {probe}"));
+                for path in out
+                    .stdout
+                    .split(|byte| *byte == 0)
+                    .filter(|p| !p.is_empty())
+                {
+                    untrack.push(format!(
+                        "untrack it: git rm --cached {}",
+                        String::from_utf8_lossy(path)
+                    ));
+                }
             }
-            Ok(out) if out.status.code() == Some(1) => {}
             Ok(out) => unchecked.push(format!(
-                "could not check whether git tracks {probe}: {} ({})",
+                "could not check whether git tracks {line}: {} ({})",
                 String::from_utf8_lossy(&out.stderr).trim(),
                 out.status
             )),
             Err(err) => {
-                unchecked.push(format!("could not check whether git tracks {probe}: {err}"));
+                unchecked.push(format!("could not check whether git tracks {line}: {err}"));
             }
         }
     }
-    if to_add.is_empty() && unchecked.is_empty() && untrack.is_empty() {
-        return None;
-    }
+    derived_paths_warning_text(&to_add, &unchecked, &untrack)
+}
+
+/// [`gsd_derived_paths_warning`]'s text: the `.gitignore` lines to add, the checks git
+/// could not answer under their own header (F04: never under "add these lines"), and the
+/// tracked files to untrack. `None` when all three are empty.
+fn derived_paths_warning_text(
+    to_add: &[&str],
+    unchecked: &[String],
+    untrack: &[String],
+) -> Option<String> {
+    let block = |header: &str, items: &[String]| {
+        let mut warning = String::from(header);
+        for item in items {
+            warning.push_str(&format!("\n  {item}"));
+        }
+        warning
+    };
     let mut blocks = Vec::new();
-    if !to_add.is_empty() || !unchecked.is_empty() {
-        let mut warning = String::from(
+    if !to_add.is_empty() {
+        let lines: Vec<String> = to_add.iter().map(|line| (*line).to_string()).collect();
+        blocks.push(block(
             "warning: GSD writes derived files that git does not ignore here; add these lines \
              to .gitignore:",
-        );
-        for line in to_add {
-            warning.push_str(&format!("\n  {line}"));
-        }
-        for line in unchecked {
-            warning.push_str(&format!("\n{line}"));
-        }
-        blocks.push(warning);
+            &lines,
+        ));
+    }
+    if !unchecked.is_empty() {
+        blocks.push(block(
+            "warning: could not check these GSD derived paths here:",
+            unchecked,
+        ));
     }
     if !untrack.is_empty() {
-        let mut warning = String::from(
+        blocks.push(block(
             "warning: git tracks GSD derived files here, and an ignore rule does not apply to \
              a tracked file:",
-        );
-        for advice in untrack {
-            warning.push_str(&format!("\n  {advice}"));
-        }
-        blocks.push(warning);
+            untrack,
+        ));
     }
-    Some(blocks.join("\n"))
+    (!blocks.is_empty()).then(|| blocks.join("\n"))
 }
 
 /// WR-11's rule: a run that never launched leaves no state behind, so `devflow status`
@@ -583,26 +604,60 @@ fn clear_after_failed_launch(
 
 /// #258 (D-11): a timed-out launch whose runner reads not live. The run is cleared, as a
 /// failed launch is, only when its state on disk equals, as JSON, `written` (the state as
-/// `start` wrote it); a state that changed since (a runner that ran, wrote and died), one
-/// that does not load, or no `written` keeps it and names `status` and `discard`.
+/// `start` wrote it) and the phase's last `stage_launched` event is still
+/// `launched_before` (the one `start` read beside `written`, F07): a runner that logged a
+/// stage launch ran, even if it wrote no state. Every other reading keeps the state and
+/// names what was read (F06): a state that changed since, one that is gone (nothing to
+/// clear), one that does not load, or no `written`.
 fn not_live_after_timed_out_launch(
     project_root: &Path,
     phase: PhaseId,
     worktree: bool,
     why: &str,
     written: Option<&serde_json::Value>,
+    launched_before: Option<&serde_json::Value>,
 ) -> CliError {
-    let now = workflow::load_state(project_root, phase)
-        .ok()
-        .and_then(|state| serde_json::to_value(&state).ok());
-    if written.is_some() && now.as_ref() == written {
-        return clear_after_failed_launch(project_root, phase, worktree, why);
+    let inspect = format!(
+        "run `devflow status` to inspect it, and `devflow discard --phase {phase}` to remove it"
+    );
+    let unconfirmed = format!("start: phase {phase} was not confirmed launched ({why})");
+    let Some(written) = written else {
+        return CliError::Message(format!(
+            "{unconfirmed}, and start could not read back the run state it wrote, so it was \
+             kept: {inspect}"
+        ));
+    };
+    let now = match workflow::load_state(project_root, phase) {
+        Ok(state) => serde_json::to_value(&state).ok(),
+        Err(workflow::WorkflowError::MissingState(_)) => {
+            return CliError::Message(format!(
+                "{unconfirmed}, and its run state is no longer on disk, so there is nothing to \
+                 clear: run `devflow status` to inspect the phase, and `devflow discard \
+                 --phase {phase}` to remove what is left of it"
+            ));
+        }
+        Err(error) => {
+            return CliError::Message(format!(
+                "{unconfirmed}, and its run state does not load ({error}), so it was kept: \
+                 {inspect}"
+            ));
+        }
+    };
+    if now.as_ref() != Some(written) {
+        return CliError::Message(format!(
+            "{unconfirmed}, and its run state changed after start wrote it, so it was kept: \
+             {inspect}"
+        ));
     }
-    CliError::Message(format!(
-        "start: phase {phase} was not confirmed launched ({why}), and its run state changed \
-         after start wrote it, so it was kept: run `devflow status` to inspect it, and \
-         `devflow discard --phase {phase}` to remove it"
-    ))
+    let launched_now =
+        devflow_core::events::last_event_of_kind_for_phase(project_root, phase, "stage_launched");
+    if launched_now.as_ref() != launched_before {
+        return CliError::Message(format!(
+            "{unconfirmed}, and its runner logged a stage launch after start wrote the run \
+             state, so it was kept: {inspect}"
+        ));
+    }
+    clear_after_failed_launch(project_root, phase, worktree, why)
 }
 
 /// 999.244: what the phase's runner says after a launch whose `systemd-run` timed out.
@@ -695,6 +750,11 @@ fn start_dry_run(project_root: &Path, state: &State) -> Result<(), CliError> {
     ensure_agent_binary(agent_program(state.agent))?;
     crate::preflight::ensure_ask_registration(state.agent)?;
     let base = crate::preflight::resolve_start_base(project_root)?.value;
+    // #285 (D-13): after the dry run's last refusal. It reads no base tree (52.1 D-27), so
+    // it reads the primary checkout's ignore rules.
+    if let Some(warning) = gsd_derived_paths_warning(project_root) {
+        eprintln!("{warning}");
+    }
     println!(
         "{}",
         dry_run_not_checked_line(phase, &base, state.reviews_pass)
@@ -728,6 +788,90 @@ pub(crate) fn reviews_file_refusal(verb: LaunchVerb, phase: PhaseId, location: &
         "{verb}: --reviews needs the phase's review file, \
          .planning/phases/{padded}-*/{padded}-REVIEWS.md, {location}, and it is not there; \
          run the review and commit its REVIEWS.md first, or {verb} without --reviews"
+    ))
+}
+
+/// D-04 (F02): refuse `start --reviews` unless the phase's review file is on `base`, the
+/// tree the run forks from: exactly one `.planning/phases/{NN}-*` directory there, holding
+/// `{NN}-REVIEWS.md` itself. Unlike [`phase_artifact_on_base`] this fails closed: a base
+/// git cannot list refuses with git's error, and two phase directories refuse naming both,
+/// as `resume --reviews` does in the run's checkout.
+pub(crate) fn require_reviews_file_on_base(
+    project_root: &Path,
+    phase: PhaseId,
+    base: &str,
+) -> Result<(), CliError> {
+    let unreadable = |why: String| {
+        CliError::Message(format!(
+            "start: --reviews could not read .planning/phases/ on {base} ({why}); nothing was \
+             started"
+        ))
+    };
+    let out = git_command(project_root)
+        .args([
+            "ls-tree",
+            "-r",
+            "--name-only",
+            base,
+            "--",
+            ".planning/phases/",
+        ])
+        .output()
+        .map_err(|error| unreadable(error.to_string()))?;
+    if !out.status.success() {
+        return Err(unreadable(format!(
+            "{}, {}",
+            String::from_utf8_lossy(&out.stderr).trim(),
+            out.status
+        )));
+    }
+    let padded = phase.padded();
+    let listing = String::from_utf8_lossy(&out.stdout);
+    let paths: Vec<&str> = listing.lines().collect();
+    let dirs: std::collections::BTreeSet<&str> = paths
+        .iter()
+        .filter_map(|path| {
+            let rest = path.strip_prefix(".planning/phases/")?;
+            let (dir, _) = rest.split_once('/')?;
+            dir.starts_with(&format!("{padded}-")).then_some(dir)
+        })
+        .collect();
+    let not_there = || reviews_file_refusal(LaunchVerb::Start, phase, &format!("on `{base}`"));
+    match dirs.len() {
+        0 => Err(not_there()),
+        1 => {
+            let dir = dirs.first().copied().unwrap_or_default();
+            let wanted = format!(".planning/phases/{dir}/{padded}-REVIEWS.md");
+            if paths.contains(&wanted.as_str()) {
+                Ok(())
+            } else {
+                Err(not_there())
+            }
+        }
+        _ => Err(ambiguous_phase_dirs_refusal(
+            LaunchVerb::Start,
+            phase,
+            &format!("on `{base}`"),
+            dirs.iter().map(|dir| format!(".planning/phases/{dir}")),
+        )),
+    }
+}
+
+/// The refusal of a `--reviews` launch whose phase has more than one `{NN}-*` directory at
+/// `location`: the review file must be in exactly one phase directory (D-04).
+pub(crate) fn ambiguous_phase_dirs_refusal(
+    verb: LaunchVerb,
+    phase: PhaseId,
+    location: &str,
+    dirs: impl Iterator<Item = String>,
+) -> CliError {
+    let verb = verb.label();
+    let dirs: Vec<String> = dirs.collect();
+    CliError::Message(format!(
+        "{verb}: --reviews needs exactly one phase directory for phase {phase} {location}, \
+         and there are {count}: {list}; keep one, or {verb} without --reviews",
+        count = dirs.len(),
+        list = dirs.join(", ")
     ))
 }
 
@@ -916,12 +1060,8 @@ fn start_reserved(
     // tree the run forks from. Probed on the RESOLVED base, as the CONTEXT.md check above
     // is: a worktree, and a `--no-worktree` feature branch, carry the base's tree, not the
     // primary checkout's.
-    if state.reviews_pass && !phase_artifact_on_base(project_root, phase, "-REVIEWS.md", base) {
-        return Err(reviews_file_refusal(
-            LaunchVerb::Start,
-            phase,
-            &format!("on `{base}`"),
-        ));
+    if state.reviews_pass {
+        require_reviews_file_on_base(project_root, phase, base)?;
     }
 
     if driver.interactivity_mode(Stage::Plan) == agents::InteractivityMode::RequiresExistingArtifact
@@ -968,6 +1108,13 @@ fn start_reserved(
         }
         let branch = git.feature_start(phase)?;
         println!("created feature branch: {branch}");
+    }
+    // #285 (D-13): a warning, never a refusal, after every refusal above so a refused start
+    // prints none, and read from the tree the run forks from the base: its worktree, or the
+    // primary checkout the feature branch is now checked out in.
+    let forked_tree = state.worktree_path.as_deref().unwrap_or(project_root);
+    if let Some(warning) = gsd_derived_paths_warning(forked_tree) {
+        eprintln!("{warning}");
     }
 
     // 35.1 D-01, `start`'s half: repair a leaked
@@ -2483,6 +2630,9 @@ pub(crate) enum RunStatus {
         stage: Option<Stage>,
         /// Whether the state records a gate the runner is waiting on.
         gate_pending: bool,
+        /// The question gate open at the state's stage, which the `__ask` server opens
+        /// with `gate_pending` false (F12); `None` with no state or no question.
+        question: Option<GateId>,
     },
     /// The lock is free and the unit is not yet inactive (D-07a).
     Stopping {
@@ -2547,12 +2697,25 @@ impl RunStatus {
                 pid,
                 stage,
                 gate_pending: true,
+                ..
             } => format!(
                 "{word}{runner}, waiting at its {stage} gate — answer it with `devflow gate \
                  approve {phase}` or `devflow gate reject {phase} --note <reason>`; end it with \
                  {stop}",
                 runner = runner_note(*pid),
                 stage = stage.map_or_else(|| "pending".to_string(), |stage| stage.to_string()),
+            ),
+            RunStatus::Live {
+                pid,
+                stage,
+                question: Some(gate_id),
+                ..
+            } => format!(
+                "{word}{runner}, waiting at its {stage} question gate {gate_id} — answer it with \
+                 `{answer}`; end it with {stop}",
+                runner = runner_note(*pid),
+                stage = stage.map_or_else(|| "pending".to_string(), |stage| stage.to_string()),
+                answer = question_answer_line(phase, gate_id),
             ),
             RunStatus::Live { pid, stage, .. } => format!(
                 "{word}{runner}{at} — watch it with `devflow logs --phase {phase} -f`; end it \
@@ -2642,6 +2805,7 @@ pub(crate) fn run_status(
                 pid,
                 stage: loaded.map(|state| state.stage),
                 gate_pending: loaded.is_some_and(|state| state.gate_pending),
+                question: loaded.and_then(|state| open_question_of(project_root, state)),
             });
         }
         Ok(RunnerLiveness::Stopping { unit, state }) => {
@@ -3299,7 +3463,14 @@ pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
         for (phase, _, row) in &rows {
             println!("\nphase {phase}: {}", row.line(*phase));
             if let Some(state) = states.iter().find(|state| state.phase == *phase) {
-                for line in status_state_lines(project_root, state, last_events.remove(phase)) {
+                // The live row already read the open question; read it once per phase.
+                let question = match row {
+                    RunStatus::Live { question, .. } => question.clone(),
+                    _ => open_question_of(project_root, state),
+                };
+                for line in
+                    status_state_lines(project_root, state, question, last_events.remove(phase))
+                {
                     println!("{line}");
                 }
                 current_worktree = current_worktree.or_else(|| state.worktree_path.clone());
@@ -3327,13 +3498,9 @@ pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
 fn status_state_lines(
     project_root: &Path,
     state: &State,
+    question: Option<GateId>,
     summary: Option<events::PhaseEventSummary>,
 ) -> Vec<String> {
-    let question = if state.gate_pending {
-        None
-    } else {
-        open_question_gate_id(project_root, state.phase, state.stage)
-    };
     let gate = match (state.gate_pending, &question) {
         (true, _) => "pending".to_string(),
         (false, Some(gate_id)) => format!("question {gate_id}"),
@@ -3379,6 +3546,15 @@ fn status_state_lines(
         ));
     }
     lines
+}
+
+/// The question gate open at `state`'s stage, read only when no approval gate is pending.
+fn open_question_of(project_root: &Path, state: &State) -> Option<GateId> {
+    if state.gate_pending {
+        None
+    } else {
+        open_question_gate_id(project_root, state.phase, state.stage)
+    }
 }
 
 /// The id of the question gate open at `phase`'s `stage`, if one is (review
@@ -5013,8 +5189,9 @@ fn print_open_branches(project_root: &Path, rows: &[(PhaseId, workflow::Existing
 /// `status`'s lines under "open branches:", one per feature branch (D-07, #248). A
 /// branch of a loaded run that recorded a base is compared against that base; every
 /// other branch against the project's. Each line names the base it was compared
-/// against and whose it is. A base that is not a local branch, or whose branches
-/// cannot be listed, gets one line saying its branches could not be compared.
+/// against and whose it is. A base that is not a local branch lists each of its branches
+/// as not compared (F20); a base whose branches cannot be listed gets one line saying they
+/// could not be compared.
 fn open_branch_lines(
     project_root: &Path,
     rows: &[(PhaseId, workflow::Existing, RunStatus)],
@@ -5049,7 +5226,7 @@ fn open_branch_lines(
                 .filter(|b| owns(&b.name))
                 .collect::<Vec<_>>(),
             Err(error) => {
-                not_compared.push(not_compared_line(base, &error));
+                not_compared.push(not_compared_line(base, source, &error));
                 return;
             }
         };
@@ -5059,7 +5236,12 @@ fn open_branch_lines(
         // `list_feature_branches` counts a failed `rev-list` as 0, so a base that
         // does not resolve would read as an even comparison: check it first.
         if let Err(error) = local_branch_resolves(project_root, base) {
-            not_compared.push(not_compared_line(base, &error));
+            // F20: each branch is still listed by name, so a run whose base is gone is
+            // not dropped from the list.
+            for b in branches {
+                let line = format!("  {} — not compared: base {error} ({source})", b.name);
+                compared.push((b.name, line));
+            }
             return;
         }
         // The base named is the one compared against (45-01).
@@ -5088,23 +5270,25 @@ fn open_branch_lines(
         .collect()
 }
 
-/// The line for a base whose branches could not be compared.
-fn not_compared_line(base: &str, error: &str) -> String {
-    format!("  (branches of runs based on {base} could not be compared: {error})")
+/// The line for a base, `source`'s, whose branches could not be listed.
+fn not_compared_line(base: &str, source: &str, error: &str) -> String {
+    format!("  (branches on {source} {base} could not be compared: {error})")
 }
 
 /// Whether `base` names a local branch of `project_root`'s repository.
 fn local_branch_resolves(project_root: &Path, base: &str) -> Result<(), String> {
+    // F21: `show-ref --verify` names exactly one ref; `rev-parse` would also resolve a
+    // revision such as `develop~1`.
     let status = devflow_core::git::git_command(project_root)
         .args([
-            "rev-parse",
+            "show-ref",
             "--verify",
             "--quiet",
             &format!("refs/heads/{base}"),
         ])
         .stdout(std::process::Stdio::null())
         .status()
-        .map_err(|error| format!("git rev-parse could not run: {error}"))?;
+        .map_err(|error| format!("git show-ref could not run: {error}"))?;
     if status.success() {
         Ok(())
     } else {
@@ -7894,7 +8078,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|line| line.contains("could not be compared") && line.contains("workspace"))
+                .any(|line| line.contains("not compared") && line.contains("workspace"))
                 && !lines
                     .iter()
                     .any(|line| line.contains(&feature) && line.contains("0 ahead, 0 behind")),
@@ -9072,11 +9256,13 @@ mod tests {
         let phase = PhaseId::new(5350);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Supervise, root.into());
         state.stage = Stage::Code;
-        let none = status_state_lines(root, &state, None).join("\n");
+        let none =
+            status_state_lines(root, &state, open_question_of(root, &state), None).join("\n");
         assert!(none.contains("gate: none"), "control: {none}");
 
         let (opened, registration) = open_budget_question(root, phase, Stage::Code);
-        let lines = status_state_lines(root, &state, None).join("\n");
+        let lines =
+            status_state_lines(root, &state, open_question_of(root, &state), None).join("\n");
 
         assert!(
             lines.contains(&format!("gate: question {}", opened.gate_id)),
@@ -9091,7 +9277,8 @@ mod tests {
         );
         assert!(!lines.contains("Pick a budget"), "no agent text: {lines}");
         state.gate_pending = true;
-        let pending = status_state_lines(root, &state, None).join("\n");
+        let pending =
+            status_state_lines(root, &state, open_question_of(root, &state), None).join("\n");
         assert!(pending.contains("gate: pending"), "control: {pending}");
         registration.finish();
     }
@@ -15928,5 +16115,297 @@ mod tests {
             waited_for >= RELEASED_WRITE_LOCK_WAIT,
             "the wait gave up after {waited_for:?}, before its {RELEASED_WRITE_LOCK_WAIT:?} bound"
         );
+    }
+
+    /// Commits `files` (each written with placeholder text) on the checked-out branch.
+    fn commit_files(root: &Path, files: &[&str]) {
+        let git = |args: &[&str]| {
+            let output = devflow_core::git::git_command(root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+        };
+        for path in files {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "text\n").unwrap();
+        }
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "files"]);
+    }
+
+    /// D-04 (F02), in a process of its own: a base git cannot list refuses `start
+    /// --reviews`, naming the base and that the listing could not be read, never as a
+    /// REVIEWS.md that is there.
+    #[test]
+    fn require_reviews_file_on_base_refuses_when_git_cannot_read_the_base() {
+        const NAME: &str =
+            "commands::tests::require_reviews_file_on_base_refuses_when_git_cannot_read_the_base";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_open_branches_child(NAME);
+            return;
+        }
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        crate::test_support::init_repo(root);
+        let err = require_reviews_file_on_base(root, PhaseId::new(12), "no-such-branch")
+            .expect_err("a base git cannot list is refused")
+            .to_string();
+        assert!(
+            err.contains("could not read .planning/phases/ on no-such-branch"),
+            "the refusal does not say the base's listing could not be read: {err}"
+        );
+    }
+
+    /// D-04 (F02), in a process of its own: two `12-*` phase directories on the base refuse
+    /// naming both. Controls: one directory holding `13-REVIEWS.md` is accepted, and one
+    /// holding only `archive/old-REVIEWS.md` is refused as not there.
+    #[test]
+    fn require_reviews_file_on_base_refuses_two_phase_directories() {
+        const NAME: &str =
+            "commands::tests::require_reviews_file_on_base_refuses_two_phase_directories";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_open_branches_child(NAME);
+            return;
+        }
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        crate::test_support::init_repo(root);
+        commit_files(
+            root,
+            &[
+                ".planning/phases/12-a/12-REVIEWS.md",
+                ".planning/phases/12-b/12-REVIEWS.md",
+                ".planning/phases/13-x/13-REVIEWS.md",
+                ".planning/phases/14-y/archive/old-REVIEWS.md",
+            ],
+        );
+        let err = require_reviews_file_on_base(root, PhaseId::new(12), "develop")
+            .expect_err("two phase directories are refused")
+            .to_string();
+        assert!(
+            err.contains(".planning/phases/12-a") && err.contains(".planning/phases/12-b"),
+            "the refusal does not name both phase directories: {err}"
+        );
+        require_reviews_file_on_base(root, PhaseId::new(13), "develop")
+            .expect("the exact REVIEWS.md in one phase directory is accepted");
+        let nested = require_reviews_file_on_base(root, PhaseId::new(14), "develop")
+            .expect_err("a nested REVIEWS.md is refused")
+            .to_string();
+        assert!(nested.contains("it is not there"), "{nested}");
+    }
+
+    /// F04: a check git could not answer is listed under its own header, never under
+    /// `add these lines to .gitignore`. Control: a line to add still gets that header.
+    #[test]
+    fn derived_paths_warning_lists_unchecked_probes_under_their_own_header() {
+        let unchecked = vec!["could not check .gsd/x: fatal (exit status: 128)".to_string()];
+        let text = derived_paths_warning_text(&[], &unchecked, &[]).expect("a warning");
+        assert!(
+            text.contains("could not check these GSD derived paths here:")
+                && text.contains("could not check .gsd/x"),
+            "the unchecked probe is not under its own header: {text}"
+        );
+        assert!(
+            !text.contains("add these lines to .gitignore"),
+            "an unchecked probe was listed as a line to add: {text}"
+        );
+        let with_line = derived_paths_warning_text(&[".gsd/"], &[], &[]).expect("a warning");
+        assert!(
+            with_line.contains("add these lines to .gitignore:\n  .gsd/"),
+            "{with_line}"
+        );
+    }
+
+    /// D-11 (F06): a timed-out start whose run state is gone has nothing to clear, so the
+    /// error does not say the state was kept, and it names `discard`.
+    #[test]
+    fn a_timed_out_start_whose_state_is_gone_does_not_say_it_was_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(5397);
+        let written = serde_json::json!({"phase": 5397});
+        let err = not_live_after_timed_out_launch(
+            dir.path(),
+            phase,
+            true,
+            "systemd-run timed out",
+            Some(&written),
+            None,
+        )
+        .to_string();
+        assert!(
+            !err.contains("so it was kept") && err.contains("no longer on disk"),
+            "a state that is gone read as kept: {err}"
+        );
+        assert!(err.contains("devflow discard --phase 5397"), "{err}");
+    }
+
+    /// D-11 (F07): a timed-out start whose state is unchanged but whose runner logged a
+    /// `stage_launched` after start wrote it keeps the state. Control: with the same last
+    /// `stage_launched` as start read, the state is cleared.
+    #[test]
+    fn a_timed_out_start_whose_runner_logged_stage_launched_keeps_the_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5398);
+        let state = State::new(phase, AgentKind::Claude, Mode::Supervise, root.into());
+        workflow::save_state(&state).unwrap();
+        let written = serde_json::to_value(workflow::load_state(root, phase).unwrap()).unwrap();
+        let before = events::last_event_of_kind_for_phase(root, phase, "stage_launched");
+        events::emit(
+            root,
+            phase,
+            "stage_launched",
+            serde_json::json!({"stage": "plan"}),
+        );
+
+        let err = not_live_after_timed_out_launch(
+            root,
+            phase,
+            false,
+            "systemd-run timed out",
+            Some(&written),
+            before.as_ref(),
+        )
+        .to_string();
+        assert!(
+            workflow::load_state(root, phase).is_ok(),
+            "a run whose runner logged a stage launch was cleared: {err}"
+        );
+        assert!(
+            err.contains("logged a stage launch") && err.contains("devflow status"),
+            "{err}"
+        );
+
+        let after = events::last_event_of_kind_for_phase(root, phase, "stage_launched");
+        let cleared = not_live_after_timed_out_launch(
+            root,
+            phase,
+            false,
+            "systemd-run timed out",
+            Some(&written),
+            after.as_ref(),
+        )
+        .to_string();
+        assert!(
+            matches!(
+                workflow::load_state(root, phase),
+                Err(workflow::WorkflowError::MissingState(_))
+            ),
+            "an unchanged state with no new stage launch was kept: {cleared}"
+        );
+    }
+
+    /// F12: a live run waiting at an open question gate names `gate answer` with the gate
+    /// id. Control: the same live run with no question still says `watch it with`.
+    #[test]
+    fn a_live_line_at_an_open_question_gate_names_gate_answer() {
+        let phase = PhaseId::new(5399);
+        let gate_id = GateId::parse("0123456789abcdef").unwrap();
+        let live = |question| RunStatus::Live {
+            pid: Some(42),
+            stage: Some(Stage::Plan),
+            gate_pending: false,
+            question,
+        };
+        let line = live(Some(gate_id)).line(phase);
+        assert!(
+            line.contains("devflow gate answer 5399 --gate-id 0123456789abcdef"),
+            "a live run at a question gate does not name gate answer: {line}"
+        );
+        let plain = live(None).line(phase);
+        assert!(
+            plain.contains("watch it with") && !plain.contains("gate answer"),
+            "{plain}"
+        );
+    }
+
+    /// F20, in a process of its own: a run branch whose recorded base is gone is still
+    /// listed by name, with that base and `not compared`.
+    #[test]
+    fn open_branches_name_a_run_branch_whose_recorded_base_is_gone() {
+        const NAME: &str =
+            "commands::tests::open_branches_name_a_run_branch_whose_recorded_base_is_gone";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_open_branches_child(NAME);
+            return;
+        }
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        let phase = repo_with_a_branch_off_workspace(root);
+        let rows = rows_for_a_run_based_on(root, phase, "workspace");
+        let deleted = devflow_core::git::git_command(root)
+            .args(["branch", "-q", "-D", "workspace"])
+            .status()
+            .unwrap();
+        assert!(deleted.success());
+
+        let lines = open_branch_lines(root, &rows);
+        let feature = format!("feature/phase-{}", phase.padded());
+        assert!(
+            lines.iter().any(|line| line.contains(&feature)
+                && line.contains("not compared")
+                && line.contains("workspace")),
+            "a run branch whose base is gone was not listed by name: {lines:?}"
+        );
+    }
+
+    /// F21, in a process of its own: a revision such as `develop~1` resolves under
+    /// `refs/heads/` for `rev-parse` but is not a local branch. Control: `develop` is.
+    #[test]
+    fn local_branch_resolves_refuses_a_revision_suffix() {
+        const NAME: &str = "commands::tests::local_branch_resolves_refuses_a_revision_suffix";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_open_branches_child(NAME);
+            return;
+        }
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        crate::test_support::init_repo(root);
+        commit_files(root, &["second.txt"]);
+        assert!(
+            local_branch_resolves(root, "develop~1").is_err(),
+            "develop~1 read as a local branch"
+        );
+        local_branch_resolves(root, "develop").expect("develop is a local branch");
+    }
+
+    /// Runs `name` in a child whose `TZ` is `tz`.
+    fn run_tz_child(name: &str, tz: &str) {
+        let path_dir = crate::test_support::agent_free_git_only_path_dir();
+        let output = crate::test_support::run_hermetic_test_in_child(
+            name,
+            path_dir.path(),
+            &[("TZ", std::ffi::OsStr::new(tz))],
+        );
+        crate::test_support::assert_child_ran_exactly_one_passing_test(&output, name);
+    }
+
+    /// An instant with no daylight-saving question for either test zone.
+    const TZ_TEST_INSTANT: i64 = 1_700_000_000;
+
+    /// F23a, in a process of its own: `local_utc_offset_secs` follows a POSIX `TZ` east
+    /// of UTC (the west test is its control: the two offsets differ).
+    #[test]
+    fn local_utc_offset_follows_a_tz_east_of_utc() {
+        const NAME: &str = "commands::tests::local_utc_offset_follows_a_tz_east_of_utc";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_tz_child(NAME, "IST-5:30");
+            return;
+        }
+        assert_eq!(local_utc_offset_secs(TZ_TEST_INSTANT), Some(19_800));
+    }
+
+    /// F23a, in a process of its own: `local_utc_offset_secs` follows a POSIX `TZ` west
+    /// of UTC.
+    #[test]
+    fn local_utc_offset_follows_a_tz_west_of_utc() {
+        const NAME: &str = "commands::tests::local_utc_offset_follows_a_tz_west_of_utc";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_tz_child(NAME, "EST5");
+            return;
+        }
+        assert_eq!(local_utc_offset_secs(TZ_TEST_INSTANT), Some(-18_000));
     }
 }
