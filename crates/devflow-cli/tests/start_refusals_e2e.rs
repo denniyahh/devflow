@@ -936,3 +936,118 @@ fn start_refuses_a_fallback_agent_without_an_ask_registration() {
     );
     assert_refused_without_registration(&home, &out, "antigravity");
 }
+
+/// The text of `start --reviews`'s refusal when the phase's REVIEWS.md is missing.
+const REVIEWS_REFUSAL: &str = "--reviews needs the phase's review file";
+
+/// D-04 (#250): `start --reviews` probes the base the run forks from, not the primary
+/// checkout: a REVIEWS.md only in the primary checkout's working tree is refused, before
+/// any run state, worktree or phase branch exists.
+#[test]
+fn start_reviews_with_the_reviews_file_only_in_the_primary_checkout_is_refused() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    fs::write(
+        root.join(".planning/phases/12-test/12-REVIEWS.md"),
+        "reviews\n",
+    )
+    .unwrap();
+
+    let (out, _reaper) = start_phase(&home, root, &["--reviews"]);
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "start --reviews accepted a REVIEWS.md the base does not have: {text}"
+    );
+    assert!(
+        text.contains("12-REVIEWS.md") && text.contains("`develop`"),
+        "the refusal does not name 12-REVIEWS.md and the base: {text}"
+    );
+    assert!(
+        !devflow_core::workflow::state_path(root, PhaseId::new(PHASE)).exists(),
+        "a refused start --reviews left run state: {text}"
+    );
+    assert!(
+        !root.join(".worktrees/phase-12").exists(),
+        "a refused start --reviews created a worktree: {text}"
+    );
+    assert_eq!(
+        branch_tip(root, &phase_branch()),
+        None,
+        "a refused start --reviews created the phase branch: {text}"
+    );
+}
+
+/// D-04 control: a REVIEWS.md committed on the base is accepted even when the primary
+/// checkout's working tree lacks it, and the run records the reviews pass.
+#[test]
+fn start_reviews_with_the_reviews_file_only_on_the_base_is_accepted() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    git(root, &["branch", "before-reviews"]);
+    fs::write(
+        root.join(".planning/phases/12-test/12-REVIEWS.md"),
+        "reviews\n",
+    )
+    .unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-q", "-m", "reviews"]);
+    git(root, &["checkout", "-q", "before-reviews"]);
+    assert!(
+        !root.join(".planning/phases/12-test/12-REVIEWS.md").exists(),
+        "premise: the primary checkout lacks the REVIEWS.md"
+    );
+
+    let (out, _reaper) = start_phase(&home, root, &["--reviews"]);
+    let text = combined(&out);
+    assert!(
+        out.status.success() && !text.contains(REVIEWS_REFUSAL),
+        "start --reviews refused a REVIEWS.md that is on the base: {text}"
+    );
+    let state = devflow_core::workflow::load_state(root, PhaseId::new(PHASE))
+        .expect("the run's state loads");
+    assert!(
+        state.reviews_pass,
+        "start --reviews did not record the reviews pass: {text}"
+    );
+    wait_for_settled(root);
+}
+
+/// D-04, 52.1 D-27: the dry run probes no base tree, so with `--reviews` it names the
+/// REVIEWS.md check among those it skips; without the flag its line is unchanged.
+#[test]
+fn dry_run_with_reviews_names_the_reviews_check_as_not_checked() {
+    let not_checked_line = |extra: &[&str]| {
+        let home = common::HermeticHome::new();
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        init_repo(root);
+        let (dry, _reaper) = start_phase(&home, root, extra);
+        let text = combined(&dry);
+        assert!(dry.status.success(), "premise: the dry run passes: {text}");
+        let line = text
+            .lines()
+            .find(|line| line.contains("not checked by the dry run"))
+            .unwrap_or_else(|| panic!("no skipped-checks line: {text}"))
+            .to_string();
+        (line, text)
+    };
+
+    let (line, out) = not_checked_line(&["--dry-run", "--reviews"]);
+    assert!(
+        line.contains("REVIEWS.md check on `develop`"),
+        "the dry run did not say it skips the REVIEWS.md check: {out}"
+    );
+    let (plain, _) = not_checked_line(&["--dry-run"]);
+    assert_eq!(
+        plain,
+        "not checked by the dry run: base currency (`develop` against its remote), phase \
+         reachability (phase 12 on `develop`), and the CONTEXT.md/PLAN.md checks on \
+         `develop`; a real start runs them after these checks",
+        "without --reviews the skipped-checks line changed"
+    );
+}
