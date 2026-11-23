@@ -706,7 +706,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 51 | 13/13 | Complete | 2026-11-08 |
 | 52 | 33/33 | Executed — verification stale | 2026-11-11 |
 | 52.1 | 7/7 | Executed — closed at plan 07 (operator, 2026-11-15) | 2026-11-15 |
-| 52.2 | 26/26 | In Progress | — |
+| 52.2 | 26/26 | Complete | 2026-11-17 |
 | 53 | 14/14 | Complete | 2026-11-20 |
 | 54 | 0/? | Not started | — |
 | 55 | 0/? | Not started | — |
